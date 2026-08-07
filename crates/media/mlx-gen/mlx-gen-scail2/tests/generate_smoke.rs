@@ -82,11 +82,8 @@ fn missing_reference_errors() {
     // extraction runs before any weight load, so an empty request fails fast. Use a per-process
     // empty dir rather than the shared `$TMPDIR` itself, so nothing another concurrent `cargo test`
     // process leaves lying around is ever inside this provider's weights root.
-    let dir = std::env::temp_dir().join(format!(
-        "mlx_gen_scail2_empty_weights_{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir_tmp = tempfile::tempdir().unwrap();
+    let dir = dir_tmp.path().to_path_buf();
     let spec = LoadSpec::new(WeightsSource::Dir(dir));
     let gen = mlx_gen_scail2::provider_registry()
         .unwrap()

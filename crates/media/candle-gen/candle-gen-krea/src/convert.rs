@@ -478,9 +478,8 @@ mod tests {
             .into_iter()
             .filter(|k| k != "model.diffusion_model.first.weight")
             .collect();
-        let path = std::env::temp_dir()
-            .join(format!("sc14022_missing_{}", std::process::id()))
-            .join("variant5.safetensors");
+        let path_tmp = tempfile::tempdir().unwrap();
+        let path = path_tmp.path().join("variant5.safetensors");
         write_native_stub_file(&path, &keys);
 
         let w = Weights::from_native_file(&path, &dev, DType::F32)?;
@@ -504,9 +503,8 @@ mod tests {
         let dev = Device::Cpu;
         let mut keys = variant5_native_keys();
         keys.push("model.diffusion_model.blocks.0.attn.bogus".to_string());
-        let path = std::env::temp_dir()
-            .join(format!("sc14022_foreign_{}", std::process::id()))
-            .join("variant5.safetensors");
+        let path_tmp = tempfile::tempdir().unwrap();
+        let path = path_tmp.path().join("variant5.safetensors");
         write_native_stub_file(&path, &keys);
 
         let w = Weights::from_native_file(&path, &dev, DType::F32)?;
@@ -527,10 +525,8 @@ mod tests {
     fn validate_native_plain_int8_companions_are_exactly_accounted() -> Result<()> {
         let dev = Device::Cpu;
         let keys = variant5_native_keys();
-        let root = std::env::temp_dir().join(format!(
-            "sc14023_plain_int8_native_surface_{}",
-            std::process::id()
-        ));
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         let valid_path = root.join("variant4.safetensors");
         write_plain_int8_native_stub_file(&valid_path, &keys, false);
 
@@ -549,7 +545,6 @@ mod tests {
             "error must flag the foreign tensor: {err}"
         );
 
-        std::fs::remove_dir_all(root).ok();
         Ok(())
     }
 

@@ -1936,7 +1936,8 @@ mod tests {
     /// falling to the dense path (sc-9426, F-073 sibling). GPU-free (only reads a small JSON file).
     #[test]
     fn component_is_packed_detects_quantization_block() {
-        let dir = std::env::temp_dir().join(format!("sc9408_pipe_{}", std::process::id()));
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let packed = dir.join("transformer");
         let dense = dir.join("vae");
         std::fs::create_dir_all(&packed).unwrap();
@@ -1975,14 +1976,12 @@ mod tests {
             format!("{err}").contains("config.json"),
             "the error should name the offending file, got: {err}"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn streamed_sidecar_preparation_preserves_typed_cancellation() {
-        let dir =
-            std::env::temp_dir().join(format!("sc16510_cancel_sidecar_{}", std::process::id()));
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let transformer = dir.join("transformer");
         std::fs::create_dir_all(&transformer).unwrap();
         std::fs::write(
@@ -2013,8 +2012,6 @@ mod tests {
             !transformer.join(".candle-device-format-v1").exists(),
             "pre-cancellation must stop before creating the cache"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Parity anchors against `mlx-gen-z-image`: the distilled 4-step default and the /8 16-channel

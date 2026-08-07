@@ -311,8 +311,12 @@ mod vae_remap_tests {
 /// quantization marker at `bits` — the turnkey shape `needs_load_time_quant` reads — and nothing
 /// else (weight-free). `tag` disambiguates the per-test temp dirs. Callers remove the dir.
 #[cfg(test)]
-pub(crate) fn packed_snapshot_fixture(tag: &str, bits: i32) -> std::path::PathBuf {
-    let root = std::env::temp_dir().join(format!(
+pub(crate) fn packed_snapshot_fixture(
+    tmp: &tempfile::TempDir,
+    tag: &str,
+    bits: i32,
+) -> std::path::PathBuf {
+    let root = tmp.path().join(format!(
         "zimage-packed-{tag}-{}-{:?}",
         std::process::id(),
         std::time::SystemTime::now()
@@ -338,8 +342,8 @@ mod quant_tier_tests {
 
     /// Make a fresh temp snapshot root with `transformer/config.json` = `body` (skip the file when
     /// `body` is `None` — a dense snapshot with no quantization marker).
-    fn snapshot(body: Option<&str>) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!(
+    fn snapshot(tmp: &tempfile::TempDir, body: Option<&str>) -> std::path::PathBuf {
+        let root = tmp.path().join(format!(
             "zimage-tier-{}-{:?}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -356,9 +360,10 @@ mod quant_tier_tests {
 
     #[test]
     fn dense_snapshot_needs_quant_and_warns() {
+        let tmp = tempfile::tempdir().unwrap();
         // No config.json at all, and a config with no `quantization` marker, both read as dense.
         for body in [None, Some("{}"), Some(r#"{"in_channels": 16}"#)] {
-            let root = snapshot(body);
+            let root = snapshot(&tmp, body);
             assert!(
                 needs_load_time_quant(&root, "transformer", 4, "z-image").unwrap(),
                 "dense snapshot must report a load-time quant (→ warn)"
@@ -369,7 +374,11 @@ mod quant_tier_tests {
 
     #[test]
     fn already_packed_at_requested_bits_does_not_warn() {
-        let root = snapshot(Some(r#"{"quantization": {"bits": 4, "group_size": 64}}"#));
+        let tmp = tempfile::tempdir().unwrap();
+        let root = snapshot(
+            &tmp,
+            Some(r#"{"quantization": {"bits": 4, "group_size": 64}}"#),
+        );
         assert!(
             !needs_load_time_quant(&root, "transformer", 4, "z-image").unwrap(),
             "an already-packed Q4 turnkey must NOT report a load-time quant (no warn)"
@@ -379,7 +388,11 @@ mod quant_tier_tests {
 
     #[test]
     fn tier_mismatch_errors() {
-        let root = snapshot(Some(r#"{"quantization": {"bits": 8, "group_size": 64}}"#));
+        let tmp = tempfile::tempdir().unwrap();
+        let root = snapshot(
+            &tmp,
+            Some(r#"{"quantization": {"bits": 8, "group_size": 64}}"#),
+        );
         let err = needs_load_time_quant(&root, "transformer", 4, "z-image").unwrap_err();
         assert!(
             format!("{err}").contains("pre-quantized Q8"),

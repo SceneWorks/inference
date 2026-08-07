@@ -610,7 +610,8 @@ mod tests {
 
         // On-disk-quantized DiT: convert to a temp dir, then reload through the packed path.
         // Per-process scratch dir — a fixed `$TMPDIR` name races a second concurrent `cargo test`.
-        let dst = std::env::temp_dir().join(format!("boogu_e8_q4_convert_{}", std::process::id()));
+        let dst_tmp = tempfile::tempdir().unwrap();
+        let dst = dst_tmp.path().to_path_buf();
         quantize_transformer(&root, &dst, 4).unwrap();
         let w = Weights::from_dir(dst.join("transformer")).unwrap();
         validate_transformer(&w, &cfg).unwrap();
@@ -638,6 +639,5 @@ mod tests {
             c > 0.9999,
             "on-disk Q4 must match load-time Q4 (cosine {c})"
         );
-        let _ = std::fs::remove_dir_all(&dst);
     }
 }

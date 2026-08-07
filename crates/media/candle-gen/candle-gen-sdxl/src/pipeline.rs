@@ -1331,7 +1331,8 @@ mod tests {
     /// for a dense snapshot (no block) — the packed/dense fork the base txt2img load takes. GPU-free.
     #[test]
     fn detect_packed_unet_reads_quantization_block() {
-        let tmp = std::env::temp_dir().join(format!("sc9416_detect_{}", std::process::id()));
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let tmp = tmp_guard.path().to_path_buf();
         let unet_dir = tmp.join("unet");
         std::fs::create_dir_all(&unet_dir).unwrap();
         // A packed config + a (stub) packed weight file at the non-.fp16 name.
@@ -1382,15 +1383,14 @@ mod tests {
             Some(64),
             "bits-only ⇒ packed at the default group 64"
         );
-
-        std::fs::remove_dir_all(&tmp).ok();
     }
 
     /// A packed tier whose group size is not the seam's threaded 64 is rejected loudly (sc-9416 /
     /// sc-9528) rather than silently repacking on the wrong grid.
     #[test]
     fn detect_packed_unet_rejects_non_64_group() {
-        let tmp = std::env::temp_dir().join(format!("sc9416_detect_g32_{}", std::process::id()));
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let tmp = tmp_guard.path().to_path_buf();
         let unet_dir = tmp.join("unet");
         std::fs::create_dir_all(&unet_dir).unwrap();
         std::fs::write(
@@ -1417,7 +1417,6 @@ mod tests {
             pipe.detect_packed_unet().is_err(),
             "a non-64 group_size must be rejected, not silently mis-repacked"
         );
-        std::fs::remove_dir_all(&tmp).ok();
     }
 
     /// sc-10826: an **omitted** sampler must resolve to the curated `ddim` solver — the native

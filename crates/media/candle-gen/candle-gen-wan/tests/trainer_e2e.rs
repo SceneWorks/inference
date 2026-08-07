@@ -267,7 +267,8 @@ fn render_finite_with_pair(high: &Path, low: &Path, kind: AdapterKind) {
 #[test]
 #[ignore = "needs real Wan2.2-T2V-A14B weights + a CUDA GPU; run with --features cuda --release --ignored"]
 fn wan_t2v_14b_trainer_lora_trains_reloads_and_renders() {
-    let tmp = std::env::temp_dir().join("candle_wan_trainer_lora_e2e");
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     // 96 steps ⇒ 48 micro-steps per expert — enough for a clear median fall on each band.
     let out = run(&tmp, "swatch_lora.safetensors", NetworkType::Lora, 96);
     assert_converged_per_expert("wan-lora", &out.losses);
@@ -303,7 +304,8 @@ fn wan_t2v_14b_trainer_lora_trains_reloads_and_renders() {
 #[test]
 #[ignore = "needs real Wan2.2-T2V-A14B weights + a CUDA GPU; run with --features cuda --release --ignored"]
 fn wan_t2v_14b_trainer_lokr_trains_reloads_and_renders() {
-    let tmp = std::env::temp_dir().join("candle_wan_trainer_lokr_e2e");
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     // LoKr's Kronecker reparam descends slower than LoRA, so give each expert more micro-steps.
     let out = run(&tmp, "swatch_lokr.safetensors", NetworkType::Lokr, 160);
     assert_converged_per_expert("wan-lokr", &out.losses);
@@ -325,18 +327,10 @@ fn wan_t2v_14b_trainer_lokr_trains_reloads_and_renders() {
 #[test]
 #[ignore = "needs real Wan2.2-T2V-A14B weights + a CUDA GPU; run with --features cuda --release --ignored"]
 fn wan_t2v_14b_trainer_same_seed_is_reproducible() {
-    let a = run(
-        &std::env::temp_dir().join("candle_wan_trainer_det_a"),
-        "det_a.safetensors",
-        NetworkType::Lora,
-        4,
-    );
-    let b = run(
-        &std::env::temp_dir().join("candle_wan_trainer_det_b"),
-        "det_b.safetensors",
-        NetworkType::Lora,
-        4,
-    );
+    let det_a = tempfile::tempdir().unwrap();
+    let det_b = tempfile::tempdir().unwrap();
+    let a = run(det_a.path(), "det_a.safetensors", NetworkType::Lora, 4);
+    let b = run(det_b.path(), "det_b.safetensors", NetworkType::Lora, 4);
     assert_eq!(
         a.losses, b.losses,
         "same-seed runs should give identical losses"
@@ -387,7 +381,8 @@ fn wan_trainer_emits_preview_samples() {
         eprintln!("skipping: set WAN_T2V_14B_SNAPSHOT (or populate the HF cache)");
         return;
     }
-    let tmp = std::env::temp_dir().join("candle_wan_trainer_samples_e2e");
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let items = make_dataset(&tmp);
     let mut trainer = candle_gen_wan::provider_registry()
         .unwrap()

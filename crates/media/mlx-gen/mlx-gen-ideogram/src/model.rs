@@ -905,11 +905,8 @@ mod tests {
         // model-defining component), not silently fall back to a CFG render.
         // Per-process scratch dir: the "no turbo_lora.safetensors here" premise must not be broken by
         // a second concurrent `cargo test` process writing into the shared `$TMPDIR`.
-        let dir = std::env::temp_dir().join(format!(
-            "ideogram4_turbo_no_lora_test_{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let spec = LoadSpec::new(WeightsSource::Dir(dir.clone()));
         let e = load_turbo(&spec)
             .err()
@@ -919,7 +916,6 @@ mod tests {
             e.contains("turbo_lora.safetensors") || e.contains("TurboTime LoRA not found"),
             "got: {e}"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

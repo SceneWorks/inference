@@ -2141,12 +2141,8 @@ mod tests {
 
         // Per-process scratch dir: the `remove_dir_all` below would otherwise wipe a second
         // concurrent `cargo test` process's fixtures out of the shared `$TMPDIR`.
-        let dir = std::env::temp_dir().join(format!(
-            "mlxgen_anima_resume_roundtrip_{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let stem = "anima_style";
         checkpoint::save_resume(&dir, stem, 4, 2, &opt, &p).unwrap();
 
@@ -2193,7 +2189,6 @@ mod tests {
             m <= 1e-6,
             "restored optimizer's next step diverged: max_rel {m:e}"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The sc-10522 restore assertion. The guard passes when the checkpoint's factor surface matches the

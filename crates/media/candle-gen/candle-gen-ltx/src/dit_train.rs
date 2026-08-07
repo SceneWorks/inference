@@ -720,10 +720,10 @@ mod tests {
         let mut opt = TrainOptimizer::from_config("adamw", set.vars.clone(), 1e-2, 0.0).unwrap();
         opt.step(&grads).unwrap();
 
-        let path = std::env::temp_dir().join(format!(
-            "ltx_infer_lora_roundtrip_{tag}_{}.safetensors",
-            std::process::id()
-        ));
+        let path_tmp = tempfile::tempdir().unwrap();
+        let path = path_tmp
+            .path()
+            .join(format!("ltx_infer_lora_roundtrip_{tag}.safetensors"));
         save_lora_peft(&set, "", &HashMap::new(), &path).unwrap();
         let spec = candle_gen::gen_core::AdapterSpec::new(
             path.clone(),

@@ -42,6 +42,10 @@ serde_json = "1"
 # tests only. Cargo unifies this with the `[dependencies]` entry above but the `testkit` feature stays
 # scoped to dev/test builds, so it never reaches downstream consumers or production.
 [dev-dependencies]
+# RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on
+# `Drop` — including out of a panicking test, which is the only path the old
+# `env::temp_dir().join(..)` + trailing `remove_dir_all` shape ever leaked on.
+tempfile = { workspace = true }
 candle-gen = { path = "../candle-gen", features = ["testkit"] }
 # `tests/preview_real_weights.rs` (sc-16956) writes the frame strip + final render as PNG so a real GPU
 # run can be eyeballed. Not a library dependency (the worker owns asset writes).

@@ -1311,13 +1311,16 @@ mod tests {
     use super::*;
     use mlx_gen::{CancelFlag, TrainingItem};
 
-    fn base_request(items: Vec<TrainingItem>, config: TrainingConfig) -> TrainingRequest {
+    fn base_request(
+        tmp: &tempfile::TempDir,
+        items: Vec<TrainingItem>,
+        config: TrainingConfig,
+    ) -> TrainingRequest {
         TrainingRequest {
             items,
             config,
             // Per-process scratch dir — a fixed `$TMPDIR` name races a second concurrent `cargo test`.
-            output_dir: std::env::temp_dir()
-                .join(format!("mage_trainer_unit_{}", std::process::id())),
+            output_dir: tmp.path().join("mage_trainer_unit"),
             file_name: "lora.safetensors".to_string(),
             trigger_words: vec![],
             cancel: CancelFlag::new(),
@@ -1384,8 +1387,10 @@ mod tests {
 
     #[test]
     fn validate_rejects_empty_dataset_zero_rank_zero_steps() {
-        assert!(validate_request(&base_request(vec![], TrainingConfig::default())).is_err());
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(validate_request(&base_request(&tmp, vec![], TrainingConfig::default())).is_err());
         assert!(validate_request(&base_request(
+            &tmp,
             one_item(),
             TrainingConfig {
                 rank: 0,
@@ -1394,6 +1399,7 @@ mod tests {
         ))
         .is_err());
         assert!(validate_request(&base_request(
+            &tmp,
             one_item(),
             TrainingConfig {
                 steps: 0,
@@ -1405,17 +1411,20 @@ mod tests {
 
     #[test]
     fn validate_rejects_unknown_optimizer_and_sampler_and_loss() {
+        let tmp = tempfile::tempdir().unwrap();
         let bad = |f: fn(&mut TrainingConfig)| {
             let mut c = TrainingConfig::default();
             f(&mut c);
-            validate_request(&base_request(one_item(), c)).is_err()
+            validate_request(&base_request(&tmp, one_item(), c)).is_err()
         };
         assert!(bad(|c| c.optimizer = "nope".into()));
         assert!(bad(|c| c.timestep_type = "gaussian".into()));
         assert!(bad(|c| c.timestep_bias = "sideways".into()));
         assert!(bad(|c| c.loss_type = "huber".into()));
         // The defaults (adamw / sigmoid / balanced / mse) pass.
-        assert!(validate_request(&base_request(one_item(), TrainingConfig::default())).is_ok());
+        assert!(
+            validate_request(&base_request(&tmp, one_item(), TrainingConfig::default())).is_ok()
+        );
     }
 
     /// sc-14055 convergence smoke test — a real short training on the fixed weights. Gradient
@@ -1552,8 +1561,10 @@ mod tests {
     /// would not prove `validate` routes through the floor at all.
     #[test]
     fn validate_routes_through_the_full_finetune_floor() {
+        let tmp = tempfile::tempdir().unwrap();
         let desc = trainer_descriptor();
         let req = base_request(
+            &tmp,
             one_item(),
             TrainingConfig {
                 full_finetune: true,
@@ -1587,9 +1598,11 @@ mod tests {
 
     #[test]
     fn validate_full_finetune_ignores_rank_but_keeps_the_other_guards() {
+        let tmp = tempfile::tempdir().unwrap();
         // A full base fine-tune trains dense weights, so `rank` is irrelevant — a `0` is not an error
         // (it IS for the adapter path). The dataset/steps/optimizer/sampler/loss guards still apply.
         assert!(validate_request(&base_request(
+            &tmp,
             one_item(),
             TrainingConfig {
                 full_finetune: true,
@@ -1600,6 +1613,7 @@ mod tests {
         .is_ok());
         // rank 0 is still rejected on the (default) adapter path.
         assert!(validate_request(&base_request(
+            &tmp,
             one_item(),
             TrainingConfig {
                 rank: 0,
@@ -1609,6 +1623,7 @@ mod tests {
         .is_err());
         // The shared guards still bite in full mode.
         assert!(validate_request(&base_request(
+            &tmp,
             vec![],
             TrainingConfig {
                 full_finetune: true,
@@ -1617,6 +1632,7 @@ mod tests {
         ))
         .is_err());
         assert!(validate_request(&base_request(
+            &tmp,
             one_item(),
             TrainingConfig {
                 full_finetune: true,
@@ -1626,6 +1642,7 @@ mod tests {
         ))
         .is_err());
         assert!(validate_request(&base_request(
+            &tmp,
             one_item(),
             TrainingConfig {
                 full_finetune: true,
@@ -1638,11 +1655,13 @@ mod tests {
 
     #[test]
     fn full_finetune_rejects_unported_gradient_checkpointing_but_lora_is_unaffected() {
+        let tmp = tempfile::tempdir().unwrap();
         // sc-14989 is not ported. On the FULL path this flag is the advertised mitigation for the
         // exact memory wall the path hits, and an MLX overcommit is an uncatchable SIGKILL — so
         // silently ignoring it would hand the caller a hard process kill instead of the help they
         // asked for. Reject it with a message that names the story and the levers that DO work.
         let err = validate_request(&base_request(
+            &tmp,
             one_item(),
             TrainingConfig {
                 full_finetune: true,
@@ -1665,6 +1684,7 @@ mod tests {
         // (sc-14055), and the SceneWorks Mage target sets it by default, so erroring would break the
         // shipped adapter path.
         assert!(validate_request(&base_request(
+            &tmp,
             one_item(),
             TrainingConfig {
                 gradient_checkpointing: true,
@@ -1675,6 +1695,7 @@ mod tests {
 
         // A full fine-tune WITHOUT the flag is fine.
         assert!(validate_request(&base_request(
+            &tmp,
             one_item(),
             TrainingConfig {
                 full_finetune: true,
@@ -1807,8 +1828,8 @@ mod tests {
             return;
         };
         let root = PathBuf::from(&root);
-        let tmp = std::env::temp_dir().join(format!("mage_full_e2e_{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let tmp = tmp_guard.path().to_path_buf();
 
         // A tiny dataset: two solid-colour swatches (a real, low-entropy in-distribution target).
         let mut items = Vec::new();
@@ -1914,7 +1935,5 @@ mod tests {
             max_abs > 0.0 && max_abs.is_finite(),
             "a full fine-tune must move the DiT: reloaded velocity == base (max_abs {max_abs})"
         );
-
-        std::fs::remove_dir_all(&tmp).ok();
     }
 }

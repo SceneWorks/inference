@@ -771,11 +771,8 @@ mod tests {
         );
     }
 
-    fn packed_q4_spec() -> (LoadSpec, PathBuf) {
-        let root = std::env::temp_dir().join(format!(
-            "candle-z-image-sc-16600-admission-{}",
-            std::process::id()
-        ));
+    fn packed_q4_spec(tmp: &tempfile::TempDir) -> (LoadSpec, PathBuf) {
+        let root = tmp.path().join("candle-z-image-sc-16600-admission");
         std::fs::create_dir_all(root.join("transformer")).unwrap();
         std::fs::write(
             root.join("transformer/config.json"),
@@ -805,7 +802,8 @@ mod tests {
 
     #[test]
     fn loaded_and_registered_admission_seams_cover_the_complete_context_gate() {
-        let (spec, root) = packed_q4_spec();
+        let tmp = tempfile::tempdir().unwrap();
+        let (spec, root) = packed_q4_spec(&tmp);
 
         for (label, generator) in [
             ("loaded turbo hook", load(&spec).unwrap()),

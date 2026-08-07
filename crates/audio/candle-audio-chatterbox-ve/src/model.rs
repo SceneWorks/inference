@@ -221,7 +221,8 @@ mod tests {
 
     #[test]
     fn load_rejects_unsupported_spec_shapes() {
-        let dir = std::env::temp_dir();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         // A snapshot dir is rejected (single-file provider).
         assert!(load(&LoadSpec::new(WeightsSource::Dir(dir.clone()))).is_err());
         // Quantization is rejected, typed Unsupported.
@@ -232,8 +233,9 @@ mod tests {
 
     #[test]
     fn embed_rejects_a_too_short_clip() {
+        let tmp = tempfile::tempdir().unwrap();
         let e = load(&LoadSpec::new(WeightsSource::File(
-            std::env::temp_dir().join("ve.safetensors"),
+            tmp.path().join("ve.safetensors"),
         )))
         .unwrap();
         let clip = AudioTrack {
@@ -248,8 +250,9 @@ mod tests {
 
     #[test]
     fn embed_rejects_short_stereo_by_frame_count_before_weight_io() {
+        let tmp = tempfile::tempdir().unwrap();
         let e = load(&LoadSpec::new(WeightsSource::File(
-            std::env::temp_dir().join("missing-ve.safetensors"),
+            tmp.path().join("missing-ve.safetensors"),
         )))
         .unwrap();
         let clip = AudioTrack {

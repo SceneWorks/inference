@@ -31,6 +31,10 @@ metal = ["candle-gen/metal", "candle-transformers/metal", "candle-gen-pid/metal"
 cuda = ["candle-gen/cuda", "candle-transformers/cuda", "candle-gen-pid/cuda"]
 
 [dev-dependencies]
+# RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on
+# `Drop` — including out of a panicking test, which is the only path the old
+# `env::temp_dir().join(..)` + trailing `remove_dir_all` shape ever leaked on.
+tempfile = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["png"] }
 # Shared test-support helpers (`candle_gen::testkit` — PPM IO / env-path / mean-abs-diff) for the
 # `#[ignore]`d img2img real-weight validation (sc-11786). Cargo unifies this with the `[dependencies]`

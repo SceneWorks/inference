@@ -3,8 +3,8 @@ mod atomic_cache;
 
 #[test]
 fn staging_is_process_scoped_and_publish_keeps_the_shared_name_stable() {
-    let root =
-        std::env::temp_dir().join(format!("mlx_gen_atomic_cache_test_{}", std::process::id()));
+    let root_tmp = tempfile::tempdir().unwrap();
+    let root = root_tmp.path().to_path_buf();
     let final_path = root.join("shared-cache");
     let staging = atomic_cache::prepare_staging(&final_path).expect("prepare staging");
 
@@ -27,13 +27,12 @@ fn staging_is_process_scoped_and_publish_keeps_the_shared_name_stable() {
         b"complete cache"
     );
     assert!(!staging.exists(), "rename must consume the staging path");
-
-    std::fs::remove_dir_all(root).expect("clean test cache");
 }
 
 #[test]
 fn staging_preserves_a_file_extension_required_by_the_writer() {
-    let final_path = std::env::temp_dir().join("shared-cache.safetensors");
+    let final_path_tmp = tempfile::tempdir().unwrap();
+    let final_path = final_path_tmp.path().join("shared-cache.safetensors");
 
     assert_eq!(
         atomic_cache::staging_path(&final_path).file_name().unwrap(),
@@ -43,10 +42,8 @@ fn staging_preserves_a_file_extension_required_by_the_writer() {
 
 #[test]
 fn losing_directory_publisher_reuses_the_complete_winner() {
-    let root = std::env::temp_dir().join(format!(
-        "mlx_gen_atomic_cache_race_test_{}",
-        std::process::id()
-    ));
+    let root_tmp = tempfile::tempdir().unwrap();
+    let root = root_tmp.path().to_path_buf();
     let final_path = root.join("shared-cache");
     let staging = atomic_cache::prepare_staging(&final_path).expect("prepare staging");
     std::fs::create_dir_all(&final_path).expect("create winning cache");
@@ -61,16 +58,12 @@ fn losing_directory_publisher_reuses_the_complete_winner() {
         b"winner"
     );
     assert!(!staging.exists(), "losing staging tree must be removed");
-
-    std::fs::remove_dir_all(root).expect("clean race cache");
 }
 
 #[test]
 fn symlink_is_not_visible_until_publish() {
-    let root = std::env::temp_dir().join(format!(
-        "mlx_gen_atomic_cache_symlink_test_{}",
-        std::process::id()
-    ));
+    let root_tmp = tempfile::tempdir().unwrap();
+    let root = root_tmp.path().to_path_buf();
     let source = root.join("source");
     let final_path = root.join("shared-link");
     std::fs::create_dir_all(&source).expect("create symlink source");
@@ -82,6 +75,4 @@ fn symlink_is_not_visible_until_publish() {
         source
     );
     assert!(!atomic_cache::staging_path(&final_path).exists());
-
-    std::fs::remove_dir_all(root).expect("clean symlink cache");
 }

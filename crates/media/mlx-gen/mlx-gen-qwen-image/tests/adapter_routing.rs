@@ -14,9 +14,8 @@ use mlx_gen_qwen_image::apply_qwen_adapters;
 use mlx_gen_qwen_image::transformer::{FeedForward, QwenJointAttention, QwenTransformerBlock};
 use mlx_rs::Array;
 
-fn tmp(name: &str) -> PathBuf {
-    let dir =
-        std::env::temp_dir().join(format!("mlx_gen_qwen_routing_test_{}", std::process::id()));
+fn scratch_file(tmp: &tempfile::TempDir, name: &str) -> PathBuf {
+    let dir = tmp.path().join("mlx_gen_qwen_routing_test");
     std::fs::create_dir_all(&dir).unwrap();
     dir.join(name)
 }
@@ -46,7 +45,7 @@ fn push_linear<'a>(
     tensors.push((Box::leak(format!("{prefix}.bias").into_boxed_str()), bias));
 }
 
-fn tiny_block() -> QwenTransformerBlock {
+fn tiny_block(tmp: &tempfile::TempDir) -> QwenTransformerBlock {
     let w8 = Array::from_slice(&vec![0.1f32; 64], &[8, 8]);
     let b8 = Array::from_slice(&[0.0f32; 8], &[8]);
     let n4 = Array::from_slice(&[1.0f32; 4], &[4]);
@@ -55,7 +54,7 @@ fn tiny_block() -> QwenTransformerBlock {
     let w16x8 = Array::from_slice(&vec![0.1f32; 16 * 8], &[16, 8]);
     let b16 = Array::from_slice(&[0.0f32; 16], &[16]);
     let w8x16 = Array::from_slice(&vec![0.1f32; 8 * 16], &[8, 16]);
-    let path = tmp("block_mod.safetensors");
+    let path = scratch_file(tmp, "block_mod.safetensors");
     let mut t: Vec<(&str, &Array)> = Vec::new();
 
     push_linear(&mut t, "img_mod_linear".to_string(), &w48x8, &b48);
@@ -91,11 +90,12 @@ fn tiny_block() -> QwenTransformerBlock {
 
 #[test]
 fn attention_routes_diffusers_names() {
+    let tmp = tempfile::tempdir().unwrap();
     // inner = num_heads*head_dim = 2*4 = 8; all 8 projections [8,8]+bias[8], norms [4].
     let w8 = Array::from_slice(&vec![0.1f32; 64], &[8, 8]);
     let b8 = Array::from_slice(&[0.0f32; 8], &[8]);
     let n4 = Array::from_slice(&[1.0f32; 4], &[4]);
-    let path = tmp("attn.safetensors");
+    let path = scratch_file(&tmp, "attn.safetensors");
     let mut t: Vec<(&str, &Array)> = Vec::new();
     for p in [
         "to_q",
@@ -144,12 +144,13 @@ fn attention_routes_diffusers_names() {
 
 #[test]
 fn feed_forward_routes_net_indices() {
+    let tmp = tempfile::tempdir().unwrap();
     // mlp_in [16,8], mlp_out [8,16] + biases.
     let win = Array::from_slice(&vec![0.1f32; 128], &[16, 8]);
     let bin = Array::from_slice(&[0.0f32; 16], &[16]);
     let wout = Array::from_slice(&vec![0.1f32; 128], &[8, 16]);
     let bout = Array::from_slice(&[0.0f32; 8], &[8]);
-    let path = tmp("ff.safetensors");
+    let path = scratch_file(&tmp, "ff.safetensors");
     write(
         &path,
         vec![
@@ -173,8 +174,9 @@ fn feed_forward_routes_net_indices() {
 
 #[test]
 fn block_routes_diffusers_modulation_linears() {
+    let tmp = tempfile::tempdir().unwrap();
     // Minimal block: inner = num_heads*head_dim = 2*4 = 8. The modulation Linear is [6*8,8].
-    let mut block = tiny_block();
+    let mut block = tiny_block(&tmp);
 
     assert!(install_adapter(&mut block, "img_mod.1", dummy()).is_ok());
     assert!(install_adapter(&mut block, "txt_mod.1", dummy()).is_ok());
@@ -184,11 +186,12 @@ fn block_routes_diffusers_modulation_linears() {
 
 #[test]
 fn strict_loader_applies_peft_modulation_loras() {
-    let mut block = tiny_block();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut block = tiny_block(&tmp);
     let r = 2i32;
     let down = Array::from_slice(&vec![0.01f32; (r * 8) as usize], &[r, 8]);
     let up = Array::from_slice(&vec![0.01f32; (48 * r) as usize], &[48, r]);
-    let path = tmp("mod_lora.safetensors");
+    let path = scratch_file(&tmp, "mod_lora.safetensors");
     write(
         &path,
         vec![

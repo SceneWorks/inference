@@ -93,9 +93,8 @@ fn ti2v_5b_convert_matches_golden() {
     assert!(golden.is_dir(), "golden dir missing: {}", golden.display());
     assert!(ckpt.is_dir(), "checkpoint dir missing: {}", ckpt.display());
 
-    let out =
-        std::env::temp_dir().join(format!("mlx_gen_wan_5b_parity_out_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&out);
+    let out_tmp = tempfile::tempdir().unwrap();
+    let out = out_tmp.path().to_path_buf();
     eprintln!("converting {} → {}", ckpt.display(), out.display());
 
     convert_ti2v_5b(&ckpt, &out).unwrap();

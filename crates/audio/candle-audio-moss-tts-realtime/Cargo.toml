@@ -26,6 +26,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+# RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on
+# `Drop` — including out of a panicking test, which is the only path the old
+# `env::temp_dir().join(..)` + trailing `remove_dir_all` shape ever leaked on.
+tempfile = { workspace = true }
 # The backend-neutral audio-generator conformance suite (streaming reassembly law, seed
 # determinism) the real-weight test runs against the loaded provider.
 sceneworks-gen-core-testkit = { workspace = true }

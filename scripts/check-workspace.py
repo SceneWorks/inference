@@ -1344,6 +1344,170 @@ def check_snapshot_path_derivation(root: Path) -> None:
         )
 
 
+# --- test-fixture temp roots (sc-17704 / sc-17755 / sc-17768 / sc-17791) -------------------------
+TEMP_DIR_READ = re.compile(r"env::temp_dir\(\)")
+TEMPFILE_GUARD = re.compile(r"tempfile::|TempDir")
+# The one legitimate `env::temp_dir()` in a test: a *deliberately persistent* artifact the author
+# wants to open afterwards (a rendered WAV, a preview PNG, a converted snapshot). Deleting it would
+# defeat the point of writing it. Two ways that shape appears, and the lint has to see both:
+#
+#   * the function reads the override itself — `env::var("X_WAV_OUT")…`; or
+#   * the `$TMPDIR` path is the *fallback arm* of a lookup that happens elsewhere, which is how the
+#     `preview_real_weights.rs` suites are written:
+#         `env_path("SDXL_PREVIEW_ARTIFACT_DIR").unwrap_or_else(|| env::temp_dir().join(…))`
+#     A repo-local reader (`env_path`) hides the `env::var` from a function-scoped regex, so match
+#     the fallback position instead. It is a reliable signal on its own: the defect shape is a
+#     `let dir = env::temp_dir().join(…)` statement, never an `unwrap_or_else` arm.
+ENV_OVERRIDE_READ = re.compile(r"env::var(?:_os)?\(")
+FALLBACK_CALL = re.compile(r"\.(?:unwrap_or_else|unwrap_or|ok_or_else)\s*\($")
+
+
+def _inside_a_fallback_arm(text: str, index: int) -> bool:
+    """Is ``index`` lexically inside a ``.unwrap_or_else( … )`` argument?
+
+    Positional, not function-wide: an unrelated ``unwrap_or_else`` earlier in the same function
+    must not launder an ordinary ``let dir = env::temp_dir().join(..)`` fixture root, which is what
+    a function-scoped search did.
+    """
+    depth = 0
+    cursor = index
+    while cursor > 0:
+        cursor -= 1
+        char = text[cursor]
+        if char in ")]}":
+            depth += 1
+        elif char in "([{":
+            if depth == 0:
+                return bool(FALLBACK_CALL.search(text[:cursor + 1]))
+            depth -= 1
+    return False
+# Cargo's own test targets: every function in them is test code.
+TEST_TARGET_DIRS = frozenset({"tests", "benches", "examples"})
+
+
+def _inline_cfg_test_spans(text: str) -> list[tuple[int, int]]:
+    """Byte ranges of `#[cfg(test)] mod .. { .. }` blocks (not `#[cfg(test)] mod name;`)."""
+    spans: list[tuple[int, int]] = []
+    for match in re.finditer(r"#\[cfg\(test\)\]", text):
+        tail = text[match.end() :]
+        if re.match(r"\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\s*;", tail):
+            continue  # a whole-file test module; `_test_only_files` claims it instead
+        opening = text.find("{", match.end())
+        if opening < 0 or ";" in text[match.end() : opening]:
+            continue
+        spans.append((match.start(), _match_brace(text, opening) + 1))
+    return spans
+
+
+def _test_only_files(root: Path) -> set[Path]:
+    """Files pulled in by a `#[cfg(test)] mod name;` declaration — test code end to end."""
+    files: set[Path] = set()
+    for path in root.rglob("*.rs"):
+        if not IGNORED_TREE_PARTS.isdisjoint(path.relative_to(root).parts):
+            continue
+        text = path.read_text(encoding="utf-8")
+        for match in re.finditer(
+            r"#\[cfg\(test\)\]\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;", text
+        ):
+            name = match.group(1)
+            for candidate in (
+                path.with_name(f"{name}.rs"),
+                path.parent / name / "mod.rs",
+                path.parent / path.stem / f"{name}.rs",
+            ):
+                if candidate.exists():
+                    files.add(candidate)
+    return files
+
+
+def check_test_temp_dir_guards(root: Path) -> None:
+    """Fail when test code builds a fixture path from ``env::temp_dir()`` instead of a guard.
+
+    The defect this closes is narrow and was measured, not assumed. A helper that writes
+    ``env::temp_dir().join(format!("{prefix}-{pid}"))`` and cleans up with a trailing
+    ``remove_dir_all`` looks tidy on a green run — every cleanup fires — and leaks on exactly two
+    paths:
+
+    1. **The panic path.** A failing test never reaches its trailing cleanup. Measured on `mlx-llm`
+       for sc-17768: eleven panicking probes left ten trees behind before the fix and none after.
+    2. **Same-PID collisions.** Two `#[test]`s in one binary get the *same* ``{prefix}{pid}`` path,
+       so one test's cleanup deletes a fixture another is still reading. Observed in
+       `mlx-llm/tests/contract_roundtrip.rs`.
+
+    A `tempfile` guard fixes both at once: it removes the tree while unwinding, and its suffix comes
+    from OS randomness rather than a PID the OS will hand out again.
+
+    Deliberately scoped to **test code** — `#[cfg(test)]` blocks, `#[cfg(test)] mod name;` files, and
+    cargo's `tests/` `benches/` `examples/` targets. Production code that materializes into `$TMPDIR`
+    (`mlx-gen-seedvr2`'s bundled negative embedding, `candle-gen`'s device-format cache root) is
+    making a deliberate, reviewed choice about a process- or host-lifetime file, which is a different
+    question from a fixture that should not outlive its test.
+
+    **Scope: every unguarded test temp root, whatever its name.** An earlier revision fired only on
+    a *per-run varying* name (``{pid}``, a counter, a clock) on the theory that a stable name is
+    bounded at one entry and therefore usually deliberate. The measurement taken while fixing
+    sc-17791 refutes that, and is the reason this is scoped as it is:
+
+    ==========================  ==============  =====================
+    lane (green run on `main`)  per-run leaked  **stable-name leaked**
+    ==========================  ==============  =====================
+    ``candle-audio*``                        0                   **14**
+    ``candle-gen*`` + contracts             14                   **16**
+    ``mlx-gen*``                            30                        0
+    ==========================  ==============  =====================
+
+    **The entire audio family's leak was stable-named — none of it was deliberate.** A per-run-only
+    lint would not catch a regression of the exact thing that story fixed there. Stable names are
+    also the *worse* of the two for the second hazard: a ``{pid}`` path collides only between tests
+    sharing a process, while a fixed name collides across every concurrent test *and* every
+    concurrent ``cargo test``, which is what deleted a live fixture mid-run in
+    `mlx-llm/tests/contract_roundtrip.rs`.
+
+    Nothing syntactic separates a deliberate artifact from a fixture root someone forgot to clean —
+    only the author knows — so the author has to say. That is what the exemption below is for, and
+    the sixteen genuinely-deliberate sites in the tree now carry it.
+
+    That override is also the exemption: an ``env::var(..)``-then-fall-back reads as "the file is
+    the point", whether the read is in this function or the ``unwrap_or_else`` sits downstream of a
+    helper that does it.
+    """
+    test_only = _test_only_files(root)
+    violations: list[str] = []
+    for path in sorted(root.rglob("*.rs")):
+        relative = path.relative_to(root)
+        if not IGNORED_TREE_PARTS.isdisjoint(relative.parts):
+            continue
+        text = strip_rust_comments(path.read_text(encoding="utf-8"))
+        whole_file_is_test = path in test_only or not TEST_TARGET_DIRS.isdisjoint(relative.parts)
+        spans = [] if whole_file_is_test else _inline_cfg_test_spans(text)
+        lines = text.split("\n")
+        for match in TEMP_DIR_READ.finditer(text):
+            if not whole_file_is_test and not any(
+                start <= match.start() < end for start, end in spans
+            ):
+                continue
+            index = text.count("\n", 0, match.start())
+            _, body = _enclosing_fn(lines, index)
+            enclosing = "\n".join(body)
+            if TEMPFILE_GUARD.search(enclosing) or ENV_OVERRIDE_READ.search(enclosing):
+                continue
+            # ...or the `$TMPDIR` path IS the fallback arm of a lookup made elsewhere.
+            if _inside_a_fallback_arm(text, match.start()):
+                continue
+            violations.append(f"{relative}:{index + 1}: {lines[index].strip()}")
+
+    if violations:
+        joined = "\n  ".join(violations)
+        fail(
+            "test code builds a fixture path from env::temp_dir() with no tempfile guard in the "
+            "enclosing function. That tree survives a panicking test and collides with a sibling "
+            "test at the same PID (sc-17704 / sc-17755 / sc-17768 / sc-17791). Mint it from "
+            "`tempfile::tempdir()` and delete the trailing remove_dir_all — the guard is the "
+            "cleanup. A deliberately persistent artifact keeps its `env::var(..)` override in "
+            "front:\n  " + joined
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -1361,6 +1525,7 @@ def main() -> int:
         check_rust_sources(ROOT)
         check_pid_decode_route_adoption(metadata, ROOT)
         check_snapshot_path_derivation(ROOT)
+        check_test_temp_dir_guards(ROOT)
     except (AssertionError, json.JSONDecodeError) as error:
         print(f"workspace gate: FAIL: {error}", file=sys.stderr)
         return 1
@@ -1369,7 +1534,7 @@ def main() -> int:
         "workspace gate: OK "
         f"({EXPECTED_MEMBER_COUNT} path members, one lockfile, explicit registries, pinned backends, "
         "intentional tokenizer split, no network clients, no HF-cache references, "
-        "no $HOME-derived snapshot paths)"
+        "no $HOME-derived snapshot paths, no unguarded test temp roots)"
     )
     return 0
 

@@ -200,8 +200,8 @@ mod tests {
     /// forcing dense bf16. GPU-free: asserts file selection only (no mmap / weights).
     #[test]
     fn instantid_unet_file_forks_packed_vs_dense() {
-        let tmp =
-            std::env::temp_dir().join(format!("sc10813_instantid_unet_{}", std::process::id()));
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let tmp = tmp_guard.path().to_path_buf();
         let unet_dir = tmp.join("unet");
         std::fs::create_dir_all(&unet_dir).unwrap();
 
@@ -238,8 +238,6 @@ mod tests {
             unet_dir.join("diffusion_pytorch_model.fp16.safetensors"),
             "a dense snapshot ⇒ the .fp16 weight file (unchanged pre-sc-10813 behavior)"
         );
-
-        std::fs::remove_dir_all(&tmp).ok();
     }
 
     /// sc-11176 (F-084): the InstantID/edit/IP-Adapter **adapter** loader forks on the packed tier the
@@ -251,8 +249,8 @@ mod tests {
     /// (and the dense arm still does), proving the fork is taken.
     #[test]
     fn instantid_adapter_load_forks_packed_vs_dense() {
-        let tmp =
-            std::env::temp_dir().join(format!("sc11176_instantid_adapter_{}", std::process::id()));
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let tmp = tmp_guard.path().to_path_buf();
         let unet_dir = tmp.join("unet");
         std::fs::create_dir_all(&unet_dir).unwrap();
         let dev = Device::Cpu;
@@ -294,7 +292,5 @@ mod tests {
             err.contains("fp16"),
             "a dense snapshot with no weights ⇒ the missing-.fp16 diagnosis (got: {err})"
         );
-
-        std::fs::remove_dir_all(&tmp).ok();
     }
 }

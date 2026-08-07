@@ -691,9 +691,8 @@ mod tests {
     #[test]
     fn resolve_component_files_prefers_shards_and_drops_fp16() {
         use std::fs::File;
-        let dir = std::env::temp_dir().join(format!("sana_rcf_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         // Mimic the diffusers transformer dir: single bf16 + fp32 shards + an fp16 copy + non-weights.
         for f in [
             "diffusion_pytorch_model.safetensors",
@@ -734,6 +733,5 @@ mod tests {
             chosen[0].file_name().unwrap().to_str().unwrap(),
             "diffusion_pytorch_model.safetensors"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

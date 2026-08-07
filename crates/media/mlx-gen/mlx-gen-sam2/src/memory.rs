@@ -719,10 +719,10 @@ mod tests {
         // `cargo test` invocations on one machine (two worktrees, two agents) share `$TMPDIR`, so a
         // fixed name lets the other run's copy of this same test truncate or delete the file between
         // this save and load — `Weights::from_file` then fails `NotFile`.
-        let path = std::env::temp_dir().join(format!(
-            "mlx_gen_sam2_synth_memory_{}.safetensors",
-            std::process::id()
-        ));
+        let path_tmp = tempfile::tempdir().unwrap();
+        let path = path_tmp
+            .path()
+            .join("mlx_gen_sam2_synth_memory.safetensors");
         let refs: Vec<(&str, &Array)> = t.iter().map(|(k, v)| (k.as_str(), v)).collect();
         Array::save_safetensors(refs, None, &path).unwrap();
         let w = Weights::from_file(&path).unwrap();

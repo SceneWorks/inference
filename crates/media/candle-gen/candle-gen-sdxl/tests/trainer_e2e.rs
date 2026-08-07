@@ -198,7 +198,8 @@ fn assert_reloads(adapter_path: &Path, kind: AdapterKind, n_targets: usize) {
 #[test]
 #[ignore = "needs real SDXL weights + a CUDA GPU; run with --features cuda --release --ignored"]
 fn sdxl_trainer_lora_trains_reloads_and_renders() {
-    let tmp = std::env::temp_dir().join("candle_sdxl_trainer_lora_e2e");
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let out = run(
         &tmp,
         "swatch_lora.safetensors",
@@ -237,7 +238,8 @@ fn sdxl_trainer_lora_trains_reloads_and_renders() {
 #[test]
 #[ignore = "needs real SDXL weights + a CUDA GPU; run with --features cuda --release --ignored"]
 fn sdxl_trainer_lokr_trains_and_reloads() {
-    let tmp = std::env::temp_dir().join("candle_sdxl_trainer_lokr_e2e");
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let out = run(
         &tmp,
         "swatch_lokr.safetensors",
@@ -264,7 +266,8 @@ fn sdxl_trainer_lokr_trains_and_reloads() {
 #[test]
 #[ignore = "needs real SDXL weights + a CUDA GPU; run with --features cuda --release --ignored"]
 fn sdxl_trainer_gradient_checkpointing_converges() {
-    let tmp = std::env::temp_dir().join("candle_sdxl_trainer_gc_e2e");
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let out = run(
         &tmp,
         "swatch_lora_gc.safetensors",
@@ -288,15 +291,17 @@ fn sdxl_trainer_gradient_checkpointing_converges() {
 #[test]
 #[ignore = "needs real SDXL weights + a CUDA GPU; run with --features cuda --release --ignored"]
 fn sdxl_trainer_same_seed_is_reproducible() {
+    let det_a = tempfile::tempdir().unwrap();
+    let det_b = tempfile::tempdir().unwrap();
     let a = run(
-        &std::env::temp_dir().join("candle_sdxl_trainer_det_a"),
+        det_a.path(),
         "det_a.safetensors",
         NetworkType::Lora,
         6,
         false,
     );
     let b = run(
-        &std::env::temp_dir().join("candle_sdxl_trainer_det_b"),
+        det_b.path(),
         "det_b.safetensors",
         NetworkType::Lora,
         6,
@@ -343,7 +348,8 @@ fn sdxl_trainer_emits_preview_samples() {
         eprintln!("skipping: no SDXL snapshot (set SDXL_SNAPSHOT)");
         return;
     }
-    let tmp = std::env::temp_dir().join("candle_sdxl_trainer_samples_e2e");
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let items = make_dataset(&tmp);
     // Link the provider crate's trainer registration into this binary.
     assert_eq!(candle_gen_sdxl::MODEL_ID, "sdxl");

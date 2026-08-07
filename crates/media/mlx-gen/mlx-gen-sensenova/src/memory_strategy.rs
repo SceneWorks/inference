@@ -700,17 +700,17 @@ mod tests {
     use mlx_gen::{LoadShape, LoadSpec, Quant, WeightsSource};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    fn unique_root(label: &str) -> std::path::PathBuf {
+    fn unique_root(tmp: &tempfile::TempDir, label: &str) -> std::path::PathBuf {
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        std::env::temp_dir().join(format!(
+        tmp.path().join(format!(
             "sensenova-{label}-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ))
     }
 
-    fn fixture_spec() -> (std::path::PathBuf, LoadSpec) {
-        let root = unique_root("memory-contract");
+    fn fixture_spec(tmp: &tempfile::TempDir) -> (std::path::PathBuf, LoadSpec) {
+        let root = unique_root(tmp, "memory-contract");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("model.safetensors"), [0_u8; 8]).unwrap();
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
@@ -720,7 +720,8 @@ mod tests {
 
     #[test]
     fn contract_declares_only_the_current_truthful_surface() {
-        let (root, spec) = fixture_spec();
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, spec) = fixture_spec(&tmp);
         let contract = memory_strategy_contract(crate::MODEL_ID, &spec).unwrap();
         assert!(
             contract.conformance_errors().is_empty(),
@@ -809,7 +810,8 @@ mod tests {
 
     #[test]
     fn fast_runtime_lora_route_refuses_streaming_until_premerged() {
-        let (root, spec) = fixture_spec();
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, spec) = fixture_spec(&tmp);
         let contract = memory_strategy_contract(crate::MODEL_ID_FAST, &spec).unwrap();
         assert_eq!(
             contract
@@ -832,7 +834,8 @@ mod tests {
 
     #[test]
     fn sharded_inventory_does_not_advertise_deferred_streaming() {
-        let (root, spec) = fixture_spec();
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, spec) = fixture_spec(&tmp);
         std::fs::write(root.join("model-00001-of-00002.safetensors"), [1_u8; 8]).unwrap();
         let contract = memory_strategy_contract(crate::MODEL_ID, &spec).unwrap();
         assert_eq!(
@@ -848,7 +851,8 @@ mod tests {
 
     #[test]
     fn hidden_safetensors_sidecars_do_not_change_the_single_file_inventory() {
-        let (root, spec) = fixture_spec();
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, spec) = fixture_spec(&tmp);
         std::fs::write(root.join("._model.safetensors"), [1_u8; 8]).unwrap();
         let contract = memory_strategy_contract(crate::MODEL_ID, &spec).unwrap();
         assert_eq!(
@@ -864,7 +868,8 @@ mod tests {
 
     #[test]
     fn expected_digest_basename_with_arbitrary_bytes_does_not_calibrate() {
-        let root = unique_root("calibration-contract");
+        let tmp = tempfile::tempdir().unwrap();
+        let root = unique_root(&tmp, "calibration-contract");
         std::fs::create_dir_all(&root).unwrap();
         let blob = root.join(QUALITY_Q8_ARTIFACT);
         std::fs::write(&blob, [0_u8; 8]).unwrap();
@@ -930,7 +935,8 @@ mod tests {
     /// the existing coverage could not see it. `open_weights` must go through `loader_path`.
     #[test]
     fn hf_cached_blob_symlink_loads_through_the_extension_bearing_entry() {
-        let root = unique_root("hf-blob-symlink");
+        let tmp = tempfile::tempdir().unwrap();
+        let root = unique_root(&tmp, "hf-blob-symlink");
         let (snapshot, entry) = hf_cache_shape(&root, FAST_Q8_ARTIFACT);
 
         let spec = LoadSpec::new(WeightsSource::Dir(snapshot)).with_quant(Quant::Q8);
@@ -968,7 +974,8 @@ mod tests {
     /// check is the only thing standing between a repointed link and a different set of weights.
     #[test]
     fn repointed_snapshot_symlink_is_rejected_before_it_can_be_opened() {
-        let root = unique_root("hf-blob-repoint");
+        let tmp = tempfile::tempdir().unwrap();
+        let root = unique_root(&tmp, "hf-blob-repoint");
         let (snapshot, entry) = hf_cache_shape(&root, FAST_Q8_ARTIFACT);
         let spec = LoadSpec::new(WeightsSource::Dir(snapshot)).with_quant(Quant::Q8);
         let artifact = verified_artifact(&spec).expect("initial pin");
@@ -1000,7 +1007,8 @@ mod tests {
 
     #[test]
     fn pinned_stream_source_fails_closed_after_atomic_replacement() {
-        let root = unique_root("replacement-contract");
+        let tmp = tempfile::tempdir().unwrap();
+        let root = unique_root(&tmp, "replacement-contract");
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("model.safetensors");
         std::fs::write(&path, [0_u8; 8]).unwrap();
@@ -1021,7 +1029,8 @@ mod tests {
 
     #[test]
     fn concurrent_verification_coalesces_one_content_hash() {
-        let root = unique_root("coalesced-hash");
+        let tmp = tempfile::tempdir().unwrap();
+        let root = unique_root(&tmp, "coalesced-hash");
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("model.safetensors");
         std::fs::write(&path, vec![7_u8; 4 * 1024 * 1024]).unwrap();
@@ -1067,7 +1076,8 @@ mod tests {
 
     #[test]
     fn runner_gate_requires_exact_provider_sha_and_calibration() {
-        let (root, spec) = fixture_spec();
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, spec) = fixture_spec(&tmp);
         let mut contract = memory_strategy_contract(crate::MODEL_ID, &spec).unwrap();
         contract.calibration = Some(MemoryCalibrationIdentity::new(
             QUALITY_CALIBRATION_FINGERPRINT,
@@ -1085,7 +1095,8 @@ mod tests {
 
     #[test]
     fn safety_accepts_only_the_two_measured_mode_reference_pairs() {
-        let (root, spec) = fixture_spec();
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, spec) = fixture_spec(&tmp);
         let spec = spec.with_quant(Quant::Q8);
         let mut contract = memory_strategy_contract(crate::MODEL_ID, &spec).unwrap();
         contract.calibration = Some(MemoryCalibrationIdentity::new(

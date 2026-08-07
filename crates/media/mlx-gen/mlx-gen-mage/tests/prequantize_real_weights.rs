@@ -22,6 +22,16 @@ use mlx_gen_mage::{MageComponentDirs, MageFlowPipeline};
 #[allow(dead_code)] // this cache has no symlink components
 mod atomic_cache;
 
+/// Root for this suite's **deliberately persistent** artifacts. `MAGE_PREQUANT_DIR` points them
+/// somewhere durable; the `$TMPDIR` default is intentional and must NOT become a `tempfile`
+/// guard — these outputs outlive the test on purpose (a pre-quantized tree the NEXT run is meant to reuse), so a guard
+/// would delete the very thing the test exists to produce (sc-17791).
+fn prequant_root() -> PathBuf {
+    std::env::var("MAGE_PREQUANT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir())
+}
+
 fn env_dir(key: &str) -> Option<PathBuf> {
     std::env::var(key)
         .ok()
@@ -50,7 +60,7 @@ fn ensure_trees() -> (PathBuf, PathBuf) {
         return (t, c);
     }
     let src = snapshot();
-    let base = std::env::temp_dir().join("mage-prequant-test");
+    let base = prequant_root().join("mage-prequant-test");
     let (tiers, components) = (base.join("variant"), base.join("components"));
     // Both packed tiers, so the tier-mismatch test has a q8 artifact to point at even when the
     // caller did not pre-build a full tree. `bf16` is skipped here: it is a byte-exact copy of the

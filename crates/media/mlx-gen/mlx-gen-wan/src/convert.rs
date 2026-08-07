@@ -1322,8 +1322,8 @@ mod tests {
     /// it is pure file packaging.
     #[test]
     fn assemble_wan_vace_snapshot_links_components() {
-        let tmp = std::env::temp_dir().join(format!("wanvace_assemble_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let tmp = tmp_guard.path().to_path_buf();
         let tf = tmp.join("vace_repo/transformer");
         let base = tmp.join("base_wan");
         let out = tmp.join("wan_vace");
@@ -1375,8 +1375,6 @@ mod tests {
         std::fs::remove_file(base.join("vae.safetensors")).unwrap();
         let err = assemble_wan_vace_snapshot(out.join("again"), &tf, &base, true).unwrap_err();
         assert!(err.to_string().contains("vae.safetensors"), "got: {err}");
-
-        std::fs::remove_dir_all(&tmp).ok();
     }
 
     /// `assemble_wan_vace_fun_snapshot` (sc-6604) lays out a load-ready dual-expert `wan2_2_vace_fun_14b`
@@ -1384,8 +1382,8 @@ mod tests {
     /// idempotent. Pure file packaging, no weights.
     #[test]
     fn assemble_wan_vace_fun_snapshot_links_both_experts() {
-        let tmp = std::env::temp_dir().join(format!("wanvacefun_assemble_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let tmp = tmp_guard.path().to_path_buf();
         let high = tmp.join("vace_fun_repo/transformer");
         let low = tmp.join("vace_fun_repo/transformer_2");
         let base = tmp.join("base_wan");
@@ -1434,7 +1432,5 @@ mod tests {
         let err = assemble_wan_vace_fun_snapshot(out.join("again"), &high, &low, &base, true)
             .unwrap_err();
         assert!(err.to_string().contains("transformer_2"), "got: {err}");
-
-        std::fs::remove_dir_all(&tmp).ok();
     }
 }

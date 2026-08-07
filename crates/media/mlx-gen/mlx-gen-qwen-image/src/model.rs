@@ -817,13 +817,8 @@ mod tests {
 
     #[test]
     fn load_uses_shared_tier_guard_before_weights() {
-        let root = std::env::temp_dir().join(format!(
-            "qwen-shared-tier-{}-{:?}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-        ));
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         std::fs::create_dir_all(root.join("transformer")).unwrap();
         std::fs::write(
             root.join("transformer/config.json"),
@@ -849,7 +844,6 @@ mod tests {
             error.contains("parse") && error.contains("config.json"),
             "{error}"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     // ── F-180 (sc-11126): weight-free, default-run proof that Qwen-Image's dispatch HONORS

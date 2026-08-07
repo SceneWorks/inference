@@ -58,6 +58,7 @@ const COND_B_KEY: &str = "diffusion_model.llm_adapter.blocks.0.self_attn.q_proj.
 #[test]
 #[ignore = "needs the circlestone-labs/Anima + Anima-Official-LoRAs snapshots"]
 fn scale_convention_dit_and_conditioner() {
+    let tmp = tempfile::tempdir().unwrap();
     // ---------------------------------------------------------------------------------------------
     // LEG 1 — DiT + adaLN at scale 1.0 (real turbo LoRA, its 448 DiT `lora_B` are non-zero).
     // Proves the injected forward == base + B·A at scale 1.0 the way we compute B·A (self-consistency);
@@ -133,7 +134,7 @@ fn scale_convention_dit_and_conditioner() {
     // `llm_adapter.*` target. Proves forward == base + B·A at scale 1.0 AND diverges from base + 0.5·B·A.
     // ---------------------------------------------------------------------------------------------
     {
-        let synth = synth_conditioner_lora();
+        let synth = synth_conditioner_lora(&tmp);
         let lw = Weights::from_file(&synth).unwrap();
         // Vacuity guard: the synth B is non-zero, so base + B·A genuinely differs from base and the
         // scale assertion below can actually fail (the turbo conditioner leg could not).
@@ -177,7 +178,7 @@ fn scale_convention_dit_and_conditioner() {
     // base + 0.5·B·A and DIVERGE from base + 1.0·B·A — the non-zero conditioner analogue of LEG 2.
     // ---------------------------------------------------------------------------------------------
     {
-        let synth = synth_conditioner_lora();
+        let synth = synth_conditioner_lora(&tmp);
         let lw = Weights::from_file(&synth).unwrap();
 
         let mut c = load_base();

@@ -23,3 +23,9 @@ zip = { version = "8.6.0", default-features = false }
 # Decode training-dataset images (LoRA/LoKr training, sc-3046). PNG + JPEG cover the SceneWorks
 # dataset formats; the trainer center-crops + hands the Image to the VAE preprocess.
 image = { workspace = true }
+
+[dev-dependencies]
+# RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on
+# `Drop` — including out of a panicking test, which is the only path the old
+# `env::temp_dir().join(..)` + trailing `remove_dir_all` shape ever leaked on.
+tempfile = { workspace = true }

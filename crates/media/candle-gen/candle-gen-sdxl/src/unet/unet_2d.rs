@@ -933,10 +933,8 @@ mod instantid_tests {
                     .unwrap();
             }
         }
-        let file = std::env::temp_dir().join(format!(
-            "sc11679_time_surface_{}.safetensors",
-            std::process::id()
-        ));
+        let file_tmp = tempfile::tempdir().unwrap();
+        let file = file_tmp.path().join("sc11679_time_surface.safetensors");
         save_lora_peft(&set, SDXL_PEFT_PREFIX, &HashMap::new(), &file).unwrap();
 
         let vb2 = VarBuilder::from_varmap(&VarMap::new(), DType::F32, &dev);

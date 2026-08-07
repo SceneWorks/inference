@@ -463,14 +463,13 @@ mod tests {
     /// Serialize a tiny TE weight map to a dense component dir (`Weights::from_dir`-loadable at either
     /// store dtype). Caller removes it.
     fn write_boogu_te_dir(
+        tmp: &tempfile::TempDir,
         map: &std::collections::HashMap<String, Tensor>,
         tag: &str,
     ) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "boogu_te_{tag}_{}_{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
+        let dir = tmp
+            .path()
+            .join(format!("boogu_te_{tag}_{:?}", std::thread::current().id()));
         std::fs::create_dir_all(&dir).unwrap();
         candle_gen::candle_core::safetensors::save(map, dir.join("model.safetensors")).unwrap();
         // A dense component config (no `quantization` block ⇒ `Weights::packed()` is None).
@@ -486,8 +485,9 @@ mod tests {
     /// because the compute never leaves f32.
     #[test]
     fn bf16_store_last_hidden_is_bit_identical_to_f32_store() {
+        let tmp = tempfile::tempdir().unwrap();
         let (map, cfg) = tiny_boogu_te_map();
-        let dir = write_boogu_te_dir(&map, "biteq");
+        let dir = write_boogu_te_dir(&tmp, &map, "biteq");
         let ids = Tensor::from_vec(vec![1u32, 5, 3, 9], (1, 4), &Device::Cpu).unwrap();
 
         let w_f32 = Weights::from_dir(&dir, &Device::Cpu, DType::F32).unwrap();
@@ -531,8 +531,9 @@ mod tests {
     /// bit-identical grounded context.
     #[test]
     fn bf16_store_grounded_is_bit_identical_to_f32_store() {
+        let tmp = tempfile::tempdir().unwrap();
         let (map, cfg) = tiny_boogu_te_map();
-        let dir = write_boogu_te_dir(&map, "grounded");
+        let dir = write_boogu_te_dir(&tmp, &map, "grounded");
         let dev = Device::Cpu;
 
         // 2 text, a 4-token image block (id 0, a 2×2 merged grid → grid [1,4,4]), 1 text.

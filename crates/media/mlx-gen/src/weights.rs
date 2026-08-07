@@ -334,8 +334,8 @@ mod tests {
     fn round_trip_file_with_metadata() {
         // Per-process scratch dir (matching `mlx_gen_appledouble_{pid}` below) — a fixed `$TMPDIR`
         // name races a second concurrent `cargo test`.
-        let dir = std::env::temp_dir().join(format!("mlx_gen_weights_test_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let path = dir.join("w.safetensors");
 
         let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]);
@@ -353,11 +353,8 @@ mod tests {
 
     #[test]
     fn fp8_capable_filter_materializes_only_selected_tensor_names() {
-        let dir = std::env::temp_dir().join(format!(
-            "mlx_gen_weights_filter_test_{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let path = dir.join("components.safetensors");
         let text = Array::from_slice(&[1.0f32], &[1]);
         let transformer = Array::from_slice(&[2.0f32], &[1]);
@@ -375,7 +372,6 @@ mod tests {
             Weights::from_file_with_fp8_filter(&path, |name| name.starts_with("text_encoder"))
                 .unwrap();
         assert_eq!(weights.keys().collect::<Vec<_>>(), ["text_encoder.weight"]);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -422,8 +418,8 @@ mod tests {
     /// `[load_safetensors] Invalid json header length`. The sidecar must be skipped.
     #[test]
     fn from_dir_skips_appledouble_sidecar() {
-        let dir = std::env::temp_dir().join(format!("mlx_gen_appledouble_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
 
         let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]);
         Array::save_safetensors(
@@ -442,16 +438,14 @@ mod tests {
         let w = Weights::from_dir(&dir).expect("sidecar must be skipped, not loaded");
         assert_eq!(w.len(), 1);
         assert!(w.get("blk.weight").is_some());
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A genuinely corrupt *shard* still errors — and the message now names the file, which the bare
     /// mlx-c error (a C++ source location) did not.
     #[test]
     fn from_dir_error_names_the_offending_shard() {
-        let dir = std::env::temp_dir().join(format!("mlx_gen_bad_shard_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         std::fs::write(dir.join("model.safetensors"), [0x00, 0x05, 0x16, 0x07]).unwrap();
 
         let err = match Weights::from_dir(&dir) {
@@ -459,8 +453,6 @@ mod tests {
             Err(e) => e.to_string(),
         };
         assert!(err.contains("model.safetensors"), "unexpected: {err}");
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

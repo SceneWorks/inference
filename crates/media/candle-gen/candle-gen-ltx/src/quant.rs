@@ -330,6 +330,7 @@ mod tests {
     /// affine grid the pack represents (bit-exact repack + dequant-on-forward).
     #[test]
     fn qlinear_packed_detect_on_avdit_key_layout() -> Result<()> {
+        let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (128usize, 256usize);
         let (wq, s, b, grid) = q4_packed(out_dim, in_dim);
@@ -354,8 +355,7 @@ mod tests {
             Tensor::randn(0f32, 1f32, (out_dim,), &dev)?,
         );
 
-        let tmp =
-            std::env::temp_dir().join(format!("sc9417_avdit_{}.safetensors", std::process::id()));
+        let tmp = tmp.path().join("sc9417_avdit.safetensors");
         candle_gen::candle_core::safetensors::save(&map, &tmp)?;
         // SAFETY: freshly written, single-reader for the test.
         let st = unsafe { MmapedSafetensors::new(&tmp)? };
@@ -413,7 +413,6 @@ mod tests {
             .to_scalar::<f32>()?;
         assert_eq!(zero_diff, 0.0, "scale=0 must equal the packed base");
 
-        std::fs::remove_file(&tmp).ok();
         Ok(())
     }
 
@@ -422,6 +421,7 @@ mod tests {
     /// unchanged. Confirms the current single-file LTX checkpoint path is untouched.
     #[test]
     fn qlinear_dense_path_unchanged() -> Result<()> {
+        let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (32usize, 64usize);
         let w = Tensor::randn(0f32, 1f32, (out_dim, in_dim), &dev)?;
@@ -430,8 +430,7 @@ mod tests {
         let mut map: HashMap<String, Tensor> = HashMap::new();
         map.insert("proj.weight".into(), w.clone());
         map.insert("proj.bias".into(), b.clone());
-        let tmp =
-            std::env::temp_dir().join(format!("sc9417_dense_{}.safetensors", std::process::id()));
+        let tmp = tmp.path().join("sc9417_dense.safetensors");
         candle_gen::candle_core::safetensors::save(&map, &tmp)?;
         // SAFETY: freshly written, single-reader.
         let st = unsafe { MmapedSafetensors::new(&tmp)? };
@@ -451,7 +450,6 @@ mod tests {
             "dense arm deviates from the legacy linear read"
         );
 
-        std::fs::remove_file(&tmp).ok();
         Ok(())
     }
 
@@ -479,6 +477,7 @@ mod tests {
     /// the dense arm (no `.scales`) loads the raw `{key}.weight` table unchanged.
     #[test]
     fn qembedding_packed_detect_on_gemma_embed_tokens() -> Result<()> {
+        let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
         let (vocab, hidden) = (64usize, 128usize);
         let (wq, s, b, grid) = q4_packed(vocab, hidden);
@@ -492,8 +491,7 @@ mod tests {
             "dense_embed.weight".into(),
             Tensor::from_vec(grid.clone(), (vocab, hidden), &dev)?,
         );
-        let tmp =
-            std::env::temp_dir().join(format!("sc9417_emb_{}.safetensors", std::process::id()));
+        let tmp = tmp.path().join("sc9417_emb.safetensors");
         candle_gen::candle_core::safetensors::save(&map, &tmp)?;
         // SAFETY: freshly written, single-reader.
         let st = unsafe { MmapedSafetensors::new(&tmp)? };
@@ -515,7 +513,6 @@ mod tests {
             "packed embed table deviates from the affine grid"
         );
 
-        std::fs::remove_file(&tmp).ok();
         Ok(())
     }
 
@@ -524,6 +521,7 @@ mod tests {
     /// guard the story requires so a tier that ever packs a conv doesn't silently load u32-code garbage.
     #[test]
     fn guard_no_scales_errors_on_packed_conv() -> Result<()> {
+        let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
         let (wq, s, b, _grid) = q4_packed(16, 64);
 
@@ -537,8 +535,7 @@ mod tests {
             "conv_out.conv.weight".into(),
             Tensor::randn(0f32, 1f32, (8, 8), &dev)?,
         );
-        let tmp =
-            std::env::temp_dir().join(format!("sc9417_guard_{}.safetensors", std::process::id()));
+        let tmp = tmp.path().join("sc9417_guard.safetensors");
         candle_gen::candle_core::safetensors::save(&map, &tmp)?;
         // SAFETY: freshly written, single-reader.
         let st = unsafe { MmapedSafetensors::new(&tmp)? };
@@ -553,7 +550,6 @@ mod tests {
         let ok = guard_no_scales(&vb, "conv_out.conv", DType::F32)?;
         assert_eq!(ok.dims2()?, (8, 8));
 
-        std::fs::remove_file(&tmp).ok();
         Ok(())
     }
 }

@@ -124,9 +124,8 @@ mod tests {
         }
     }
 
-    fn write_fixture(tag: &str, cfg: &SanaTransformerConfig) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("sana-block-stream-{tag}-{}", std::process::id()));
+    fn write_fixture(tmp: &tempfile::TempDir, tag: &str, cfg: &SanaTransformerConfig) -> PathBuf {
+        let dir = tmp.path().join(format!("sana-block-stream-{tag}"));
         std::fs::create_dir_all(&dir).unwrap();
         let inner = cfg.inner_dim();
         let hidden = (cfg.mlp_ratio * inner as f32) as i32;
@@ -222,8 +221,9 @@ mod tests {
     /// budget is bit-identical rather than merely close.
     #[test]
     fn a_block_forward_threads_the_attention_budget_to_attn2() {
+        let tmp = tempfile::tempdir().unwrap();
         let cfg = cfg(false);
-        let dir = write_fixture("budget", &cfg);
+        let dir = write_fixture(&tmp, "budget", &cfg);
         let stream = SanaBlockStream::new(&dir, cfg.clone());
         let mut view = stream.open().unwrap();
         let block = stream.materialize(&mut view, 0).unwrap();
@@ -277,8 +277,9 @@ mod tests {
     /// Exact draining leaves an un-read key visible, which is what the second half asserts.
     #[test]
     fn block_stream_drains_exactly_what_the_block_read() {
+        let tmp = tempfile::tempdir().unwrap();
         let cfg = cfg(false);
-        let dir = write_fixture("drain", &cfg);
+        let dir = write_fixture(&tmp, "drain", &cfg);
         let stream = SanaBlockStream::new(&dir, cfg.clone());
         let mut view = stream.open().unwrap();
         let before = view.len();
@@ -318,8 +319,9 @@ mod tests {
     /// A fresh view per window is what keeps the bound: re-opening returns the full key set.
     #[test]
     fn each_window_opens_an_independent_view() {
+        let tmp = tempfile::tempdir().unwrap();
         let cfg = cfg(false);
-        let dir = write_fixture("reopen", &cfg);
+        let dir = write_fixture(&tmp, "reopen", &cfg);
         let stream = SanaBlockStream::new(&dir, cfg);
         let mut first = stream.open().unwrap();
         let full = first.len();
@@ -336,9 +338,10 @@ mod tests {
     /// A streamed block is the resident block: same constructor, same tensors, same arithmetic.
     #[test]
     fn a_materialized_block_matches_its_resident_twin() {
+        let tmp = tempfile::tempdir().unwrap();
         for qk_norm in [false, true] {
             let cfg = cfg(qk_norm);
-            let dir = write_fixture(&format!("twin-{qk_norm}"), &cfg);
+            let dir = write_fixture(&tmp, &format!("twin-{qk_norm}"), &cfg);
             let stream = SanaBlockStream::new(&dir, cfg.clone());
             let view = stream.open().unwrap();
             let resident = SanaBlock::load(&view, "transformer_blocks.1", &cfg).unwrap();
@@ -359,8 +362,9 @@ mod tests {
     /// carrying the trunk's own config load-bearing rather than decorative.
     #[test]
     fn a_base_config_stream_over_sprint_weights_is_present_but_wrong() {
+        let tmp = tempfile::tempdir().unwrap();
         let sprint = cfg(true);
-        let dir = write_fixture("present-but-wrong", &sprint);
+        let dir = write_fixture(&tmp, "present-but-wrong", &sprint);
 
         let sprint_stream = SanaBlockStream::new(&dir, sprint.clone());
         let mut view = sprint_stream.open().unwrap();
@@ -380,10 +384,11 @@ mod tests {
     /// A MISSING tensor fails loudly rather than defaulting.
     #[test]
     fn a_missing_tensor_fails_loudly() {
+        let tmp = tempfile::tempdir().unwrap();
         let sprint = cfg(true);
-        let dir = write_fixture("missing", &sprint);
+        let dir = write_fixture(&tmp, "missing", &sprint);
         // A Sprint stream over BASE weights requires `norm_q`/`norm_k`, which a base fixture lacks.
-        let base_dir = write_fixture("missing-base", &cfg(false));
+        let base_dir = write_fixture(&tmp, "missing-base", &cfg(false));
         let stream = SanaBlockStream::new(&base_dir, sprint);
         let mut view = stream.open().unwrap();
         let error = match stream.materialize(&mut view, 0) {
@@ -400,8 +405,9 @@ mod tests {
 
     #[test]
     fn out_of_range_blocks_are_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
         let cfg = cfg(false);
-        let dir = write_fixture("range", &cfg);
+        let dir = write_fixture(&tmp, "range", &cfg);
         let stream = SanaBlockStream::new(&dir, cfg);
         let mut view = stream.open().unwrap();
         let error = match stream.materialize(&mut view, 2) {

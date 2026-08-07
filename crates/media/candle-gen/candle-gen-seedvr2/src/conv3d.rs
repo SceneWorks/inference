@@ -368,10 +368,14 @@ mod tests {
         Ok(())
     }
 
-    /// [`row_chunked_conv2d`] (and the budget-driven split in [`chunked_conv2d_budgeted`]) is
-    /// bit-identical to a single `conv2d`, for stride 1 and 2, padded and unpadded, across a budget
+    /// [`row_chunked_conv2d`] (and the budget-driven split in [`chunked_conv2d_budgeted`]) matches a
+    /// single `conv2d` to `1e-4` max-abs, for stride 1 and 2, padded and unpadded, across a budget
     /// small enough to force multi-row bands (sc-10083: this is the still-image high-res path where
     /// batch splitting can't help and the unbudgeted conv silently corrupted its output).
+    ///
+    /// A tolerance, **not** bit-identity (SC-15943): banding the output rows changes the im2col GEMM's
+    /// `M`, which lets the BLAS pick a different accumulation order. `candle-gen-wan/src/conv3d.rs`
+    /// carries the same correction for the chunker it modelled on this one.
     #[test]
     fn row_chunk_matches_plain_conv2d() -> Result<()> {
         let dev = Device::Cpu;

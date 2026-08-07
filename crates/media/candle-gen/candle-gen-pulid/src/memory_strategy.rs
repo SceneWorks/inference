@@ -244,8 +244,8 @@ mod tests {
         std::fs::write(path, bytes).unwrap();
     }
 
-    fn paths() -> PulidFluxPaths {
-        let root = std::env::temp_dir().join(format!("pulid-memory-{}", std::process::id()));
+    fn paths(tmp: &tempfile::TempDir) -> PulidFluxPaths {
+        let root = tmp.path().join("pulid-memory");
         for component in ["text_encoder", "text_encoder_2", "transformer", "vae"] {
             write_safetensors(&root.join("base").join(component).join("model.safetensors"));
         }
@@ -273,7 +273,8 @@ mod tests {
 
     #[test]
     fn contract_is_full_but_has_a_distinct_identity_and_prices_every_resident_network() {
-        let paths = paths();
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths(&tmp);
         let contract = provider_contract(&paths).unwrap();
         assert!(contract.conformance_errors().is_empty());
         assert_eq!(contract.provider_id, PROVIDER_ID);
@@ -312,7 +313,8 @@ mod tests {
 
     #[test]
     fn exact_identity_route_is_accepted_but_base_overlay_reuse_fails_closed() {
-        let paths = paths();
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths(&tmp);
         let contract = provider_contract(&paths).unwrap();
         let tier = resolved_numeric_tier(&paths).unwrap();
         let mut context = gen_core::standard_memory_behavior_context(
@@ -341,7 +343,8 @@ mod tests {
 
     #[test]
     fn pid_is_rejected_for_every_strategy_including_resident() {
-        let paths = paths();
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths(&tmp);
         let contract = provider_contract(&paths).unwrap();
         let tier = resolved_numeric_tier(&paths).unwrap();
         for strategy in MemoryStrategy::ALL {
@@ -376,7 +379,8 @@ mod tests {
 
     #[test]
     fn batch_must_be_exactly_one_at_admission_and_loaded_context_validation() {
-        let paths = paths();
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths(&tmp);
         let contract = provider_contract(&paths).unwrap();
         let tier = resolved_numeric_tier(&paths).unwrap();
         let mut context = gen_core::standard_memory_behavior_context(
@@ -411,7 +415,8 @@ mod tests {
 
     #[test]
     fn resident_accounting_prices_loaded_f32_tensors_not_serialized_file_bytes() {
-        let root = std::env::temp_dir().join(format!("pulid-memory-dtypes-{}", std::process::id()));
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         for (name, dtype, elements, stored_bytes, expected_resident) in [
             ("bf16.safetensors", "BF16", 3, 6, 12),
             ("f16.safetensors", "F16", 5, 10, 20),
@@ -429,8 +434,8 @@ mod tests {
 
     #[test]
     fn pulid_and_eva_non_float_tensors_fail_closed_instead_of_being_underpriced() {
-        let root =
-            std::env::temp_dir().join(format!("pulid-memory-non-float-{}", std::process::id()));
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         let path = root.join("i64.safetensors");
         write_typed_safetensors(&path, "I64", 3, 24);
 

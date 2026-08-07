@@ -365,9 +365,8 @@ mod tests {
                  $SD35_LARGE_PATH/$SD35_MEDIUM_PATH) — cache the snapshot before running this `--ignored` test",
             );
 
-        let tmp = std::env::temp_dir().join(format!("sc8500_stock_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&tmp);
-        fs::create_dir_all(&tmp).expect("mk tmp");
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let tmp = tmp_guard.path().to_path_buf();
         fs::copy(src.join("vocab.json"), tmp.join("vocab.json")).expect("copy vocab");
         fs::copy(src.join("merges.txt"), tmp.join("merges.txt")).expect("copy merges");
         assert!(
@@ -378,7 +377,5 @@ mod tests {
         let tok = load_clip_tokenizer(&tmp, "CLIP-L (stock-sim)").expect("load via fallback");
         let got = ids(&tok, "a photo of a cat", true);
         assert_eq!(got, vec![49406, 320, 1125, 539, 320, 2368, 49407]);
-
-        let _ = fs::remove_dir_all(&tmp);
     }
 }

@@ -708,8 +708,8 @@ mod tests {
             (4, Quant::Q4, Some(Quant::Q8)),
             (8, Quant::Q8, Some(Quant::Q4)),
         ] {
-            let root = std::env::temp_dir()
-                .join(format!("candle-z-image-tier-{bits}-{}", std::process::id()));
+            let root_tmp = tempfile::tempdir().unwrap();
+            let root = root_tmp.path().to_path_buf();
             std::fs::create_dir_all(root.join("transformer")).unwrap();
             std::fs::write(
                 root.join("transformer/config.json"),
@@ -751,7 +751,6 @@ mod tests {
                     ));
                 }
             }
-            std::fs::remove_dir_all(root).ok();
         }
     }
 
@@ -791,10 +790,8 @@ mod tests {
             }
         ));
 
-        let root = std::env::temp_dir().join(format!(
-            "z-image-sc15815-packed-contract-{}",
-            std::process::id()
-        ));
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         let transformer = root.join("transformer");
         std::fs::create_dir_all(&transformer).unwrap();
         std::fs::write(
@@ -804,7 +801,6 @@ mod tests {
         .unwrap();
         let packed_spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
         let packed = provider_contract(crate::MODEL_ID, &packed_spec).unwrap();
-        std::fs::remove_dir_all(root).unwrap();
         assert!(matches!(
             packed.backend,
             MemoryBackendRealization::CandleCuda {

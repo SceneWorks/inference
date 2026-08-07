@@ -580,7 +580,8 @@ mod tests {
             Tensor::randn(0f32, 1f32, (out_dim, in_dim), &dev).unwrap(),
         );
 
-        let tmp = std::env::temp_dir().join(format!("anima_q4_{}.safetensors", std::process::id()));
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let tmp = tmp_guard.path().join("anima_q4.safetensors");
         candle_gen::candle_core::safetensors::save(&map, &tmp).unwrap();
         // SAFETY: just-written file, nothing else touches it during the test.
         let st = unsafe { MmapedSafetensors::new(&tmp).unwrap() };
@@ -603,6 +604,5 @@ mod tests {
             cos > 0.99999,
             "packed vs affine-grid cosine {cos:.6} (CPU dequant-dense)"
         );
-        let _ = std::fs::remove_file(&tmp);
     }
 }

@@ -216,8 +216,8 @@ mod tests {
 
     #[test]
     fn validate_config_rejects_drift() {
-        let dir = std::env::temp_dir().join("openvoice-cfg-validate");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let good = dir.join("good.json");
         std::fs::write(
             &good,

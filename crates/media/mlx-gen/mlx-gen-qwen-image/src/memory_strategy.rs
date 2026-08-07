@@ -499,7 +499,6 @@ mod tests {
     use mlx_gen::gen_core::{
         MemoryNumericTier, MemorySelection, MemoryStrategyParameters, MemoryStrategySupport,
     };
-    use std::sync::OnceLock;
 
     fn write_snapshot(root: &std::path::Path) {
         for component in ["text_encoder", "transformer", "vae"] {
@@ -509,14 +508,9 @@ mod tests {
         }
     }
 
-    fn spec() -> LoadSpec {
-        static ROOT: OnceLock<std::path::PathBuf> = OnceLock::new();
-        let root = ROOT.get_or_init(|| {
-            let root =
-                std::env::temp_dir().join(format!("qwen-memory-spec-{}", std::process::id()));
-            write_snapshot(&root);
-            root
-        });
+    fn spec(tmp: &tempfile::TempDir) -> LoadSpec {
+        let root = tmp.path().join("qwen-memory-spec");
+        write_snapshot(&root);
         LoadSpec::new(WeightsSource::Dir(root.clone()))
             .with_offload_policy(OffloadPolicy::Sequential)
             .with_load_shape(LoadShape::DeferredMaterialization)
@@ -537,19 +531,19 @@ mod tests {
 
     #[test]
     fn empty_required_component_directory_cannot_be_reported_as_zero() {
-        let root =
-            std::env::temp_dir().join(format!("qwen-empty-component-{}", std::process::id()));
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         write_snapshot(&root);
         std::fs::remove_file(root.join("transformer/model.safetensors")).unwrap();
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
         assert!(memory_strategy_contract("qwen_image", &spec).is_err());
         assert!(weights_free_memory_strategy_contract("qwen_image", &spec).is_ok());
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn sequential_deferred_directory_declares_the_exact_dit_window() {
-        let contract = memory_strategy_contract("qwen_image", &spec()).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let contract = memory_strategy_contract("qwen_image", &spec(&tmp)).unwrap();
         assert!(contract.conformance_errors().is_empty());
         let decode = contract.capability(MemoryStrategy::BoundedDecode).unwrap();
         assert_eq!(decode.support, MemoryStrategySupport::Implemented);
@@ -596,7 +590,8 @@ mod tests {
 
     #[test]
     fn block_stream_load_shape_predicate_is_exact_and_excludes_control() {
-        let eligible = spec();
+        let tmp = tempfile::tempdir().unwrap();
+        let eligible = spec(&tmp);
         assert!(is_streamable_spec(&eligible));
         assert!(should_arm_block_stream(crate::model::MODEL_ID, &eligible));
         assert!(should_arm_block_stream(
@@ -641,7 +636,8 @@ mod tests {
 
     #[test]
     fn control_route_does_not_overstate_its_unbounded_side_branch() {
-        let contract = memory_strategy_contract("qwen_image_control", &spec()).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let contract = memory_strategy_contract("qwen_image_control", &spec(&tmp)).unwrap();
         assert_eq!(
             contract
                 .capability(MemoryStrategy::BoundedDecode)
@@ -665,13 +661,8 @@ mod tests {
 
     #[test]
     fn control_overlay_is_quant_projected_typed_and_excluded_from_base() {
-        let root = std::env::temp_dir().join(format!(
-            "qwen-control-facts-{}-{:?}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-        ));
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         write_snapshot(&root);
         let control = root.join("control.safetensors");
         write_control(&control);
@@ -690,7 +681,6 @@ mod tests {
             MemoryFormulaKind::ComponentPhaseEnvelope { .. }
         ));
         assert!(contract.conformance_errors().is_empty());
-        std::fs::remove_dir_all(root).ok();
     }
 
     fn selection(strategy: MemoryStrategy) -> MemorySelection {
@@ -727,7 +717,8 @@ mod tests {
 
     #[test]
     fn selections_translate_to_the_shared_cumulative_request_contract() {
-        let contract = memory_strategy_contract("qwen_image", &spec()).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let contract = memory_strategy_contract("qwen_image", &spec(&tmp)).unwrap();
         let resident = qwen_generation_memory(&contract, &selection(MemoryStrategy::Resident));
         assert_eq!(resident, None);
 
@@ -773,7 +764,8 @@ mod tests {
 
     #[test]
     fn unpublished_parameters_are_rejected_instead_of_silently_coerced() {
-        let contract = memory_strategy_contract("qwen_image", &spec()).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let contract = memory_strategy_contract("qwen_image", &spec(&tmp)).unwrap();
         let mut decode = selection(MemoryStrategy::BoundedDecode);
         assert!(
             contract.validate_selection(&decode).is_ok(),
@@ -795,8 +787,9 @@ mod tests {
 
     #[test]
     fn eager_and_resident_loads_do_not_advertise_rung_four() {
-        let deferred_contract = memory_strategy_contract("qwen_image", &spec()).unwrap();
-        let mut eager = spec();
+        let tmp = tempfile::tempdir().unwrap();
+        let deferred_contract = memory_strategy_contract("qwen_image", &spec(&tmp)).unwrap();
+        let mut eager = spec(&tmp);
         eager.load_shape = LoadShape::EagerMaterialization;
         let eager_contract = memory_strategy_contract("qwen_image", &eager).unwrap();
         assert_eq!(
@@ -807,7 +800,7 @@ mod tests {
             deferred_contract.calibration.as_ref().unwrap().load_shape,
             eager_contract.calibration.as_ref().unwrap().load_shape
         );
-        let mut resident = spec();
+        let mut resident = spec(&tmp);
         resident.offload_policy = OffloadPolicy::Resident;
         for spec in [eager, resident] {
             let contract = memory_strategy_contract("qwen_image", &spec).unwrap();
@@ -823,8 +816,8 @@ mod tests {
 
     #[test]
     fn dense_load_time_quantization_does_not_advertise_rung_four() {
-        let root =
-            std::env::temp_dir().join(format!("qwen-rung4-quant-contract-{}", std::process::id()));
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         write_snapshot(&root);
         std::fs::write(
             root.join("transformer/config.json"),
@@ -858,19 +851,20 @@ mod tests {
                 .support,
             MemoryStrategySupport::Implemented
         );
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn single_file_source_is_rejected_by_the_family_contract() {
-        let mut file = spec();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut file = spec(&tmp);
         file.weights = WeightsSource::File("/nonexistent/qwen.safetensors".into());
         assert!(memory_strategy_contract("qwen_image", &file).is_err());
     }
 
     #[test]
     fn rung_four_rejects_an_unpublished_window() {
-        let contract = memory_strategy_contract("qwen_image", &spec()).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let contract = memory_strategy_contract("qwen_image", &spec(&tmp)).unwrap();
         let mut selection = selection(MemoryStrategy::BoundedTransformerResidency);
         assert!(
             contract.validate_selection(&selection).is_ok(),
