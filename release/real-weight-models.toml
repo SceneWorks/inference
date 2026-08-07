@@ -72,8 +72,9 @@ environment = ["QWEN_IMAGE_SNAPSHOT"]
 # THIS NAME NO LONGER HAS AN MLX CONSUMER (sc-17284). Until then the 45 mlx-gen-qwen-image
 # real-weight tests read QWEN_IMAGE_SNAPSHOT too — and fed it something this row does not describe.
 # The repo's own provenance receipt records what they were actually given:
-# `tools/adapter_parity_receipt.json` pins QWEN_IMAGE_SNAPSHOT at
-# `models--SceneWorks--qwen-image-mlx/snapshots/8080a417…/bf16`, an MLX re-host at a different
+# `tools/adapter_parity_receipt.json` recorded those runs under QWEN_IMAGE_SNAPSHOT at
+# `models--SceneWorks--qwen-image-mlx/snapshots/8080a417…/bf16` — the sc-17651 re-record now
+# pins that same path under MLX_GEN_QWEN_SNAPSHOT — an MLX re-host at a different
 # revision of a different repository from the `Qwen/Qwen-Image@75e0b4be` pinned here. One name
 # cannot be verified against two pins: `ensure_model_snapshot.py --model qwen-image` checks for
 # revision 75e0b4be and would fail closed on the re-host. So the MLX half was renamed to
@@ -180,30 +181,54 @@ expected_files = [
 # `q4` is not fetched — no test in the wired lane selects it.
 #
 # COVERAGE THIS VARIABLE ACTUALLY BUYS, because one name gates 45 tests and "wired" is per-name.
-# The 45 account for exactly, and the arithmetic is the point — 21 + 19 + 5 = 45:
+# The 45 account for exactly, and the arithmetic is the point — 21 + 23 + 1 = 45:
 #
-# WIRED, 19: 15 in `mlx-qwen-image` on the schedule (control x4, unified sampler x2, sequential
-# residency x4, rung-4 block residency, Lightning render x2, golden-free adapter x2), 3 in
-# `mlx-qwen-image-pid`, 1 in the dispatch-only `mlx-qwen-image-producers`. All measured passing on
-# nax-macos 2026-08-04.
+# WIRED, 23: 19 in `mlx-qwen-image` on the schedule (control x4, unified sampler x2, sequential
+# residency x4, rung-4 block residency, Lightning render x2, golden-free adapter x3, preview fit,
+# compiled-glue A/B x2), 3 in `mlx-qwen-image-pid`, 1 in the dispatch-only
+# `mlx-qwen-image-producers`. All measured passing on nax-macos — 19 of them 2026-08-04, and the
+# four most recently wired 2026-08-06: `lightning_loras_apply_cleanly` (sc-17518), the preview fit
+# (sc-17515), and both `perf.rs` arms (sc-17513).
 #
 # BLOCKED ON THE ORACLE BUNDLE, 21: adapter 6, e2e 7, img2img 6, text_encoder 2 read
 # `tools/golden/`, which is gitignored by design and minted by the frozen `mflux` fork against the
 # ~60 GB torch original — a Mage-shaped operator seed bundle, sc-17503. It is 21 and not "all 9 of
 # adapter_real_weights": three of that file's tests resolve no golden at all.
 #
-# EXCLUDED WITH A MEASUREMENT, 5. A lane that is red every week is ignored within a month
-# (sc-16981), so each of these is recorded here rather than wired red or quietly dropped:
-#   * `perf.rs` x2 — FAIL on real weights, and always have. sc-17284 ran them for the first time
-#     and measured max|D| 1.897e-3 / 1.475e-3 / 9.739e-3 (T2I 256/512/1024 px) and 1.345e-3 (Edit)
-#     against an `assert_eq!(max_diff, 0.0)`. sc-17513 owns the bound. Their silent-skip shape was
-#     removed in the same pass, so they now fail loudly instead of reporting 1 passed.
-#   * `fit_preview_rgb_factors` x1 — FAILS: R^2 = 0.0114 against its own 0.90 floor. sc-17515.
-#   * `lightning_loras_apply_cleanly` x1 — FAILS: asserts 840 per-block modules, and the pinned
-#     lightx2v file carries 12 of 14 per block (no img/txt modulation) so it applies 720 with zero
-#     unmatched. Golden-free, so it joins the wired adapter step the moment sc-17518 settles it.
+# EXCLUDED WITH A MEASUREMENT, 1. A lane that is red every week is ignored within a month
+# (sc-16981), so it is recorded here rather than wired red or quietly dropped:
 #   * `edit_lightning_user_lora_reference_repro` x1 — needs a user LoRA and a reference PPM that
 #     exist in no repository and on no Hub.
+#
+# This block held FIVE entries until 2026-08-06. Four were retired in the same week, and every one
+# had been excluded on a number that turned out to measure the test rather than the code:
+#   * `lightning_loras_apply_cleanly` (sc-17518) asserted `applied == 840` — the HOST map's
+#     60 x 14 target count, never a measured application. Both pinned lightx2v files apply
+#     60 x 12 = 720 with zero unmatched; no published Lightning release has ever trained
+#     `img_mod.1`/`txt_mod.1`. Evidence and the per-class assertion that replaced the raw count are
+#     in the test's doc comment.
+#   * `fit_preview_rgb_factors` (sc-17515) was excluded at R^2 = 0.0114 against its own 0.90 floor.
+#     That was a defect in the test's host readback — `mlx-rs` `as_slice` returns physical storage
+#     for a transpose view, so it regressed latent channel 0 against the red channel. With the
+#     contiguity pass it measures R^2 = 0.9521 (unclamped re-solve, the quantity the floor gates).
+#   * `perf.rs` x2 (sc-17513) asserted the compiled sc-2963 glue was BIT-identical to eager on the
+#     real 60-layer forward — `assert_eq!(max_diff, 0.0)` — which had never held: sc-17284 measured
+#     max|D| 1.897e-3 / 1.475e-3 / 9.739e-3 (T2I 256/512/1024 px) and 1.345e-3 (Edit). sc-17513
+#     swept 18 shapes across both arms (T2I bf16 128..1280 px, Edit q8 256..1024 px) and ran two
+#     controls that settle what the residual IS: truncating the transformer to 1 layer makes
+#     compiled-vs-eager exactly 0.0 on the same real weights against a max|out| of 114.1, so the
+#     zero is not vacuous (0.3 ULP at 2 layers), and perturbing the EAGER forward's own input by
+#     1-4 f32 ULP moves its output by the same 1e-4..2.5e-3 the whole compiled-vs-eager gap does.
+#     So it is this stack's amplification of a sub-ULP rounding difference, not a fusion defect —
+#     which also explains why it is non-monotonic in sequence length (the amplification is). The
+#     gate is now peak-RELATIVE and PER-ARM: 1.0e-2 (T2I) and 2.6e-3 (Edit), each 4x that arm's own
+#     measured conditioning envelope and ~4.5x its worst measured divergence. One shared constant
+#     left the Edit arm 85x loose at the geometry this lane runs, which would not have caught a 20x
+#     regression on it. A genuinely wrong fusion is O(1e-1) and still trips both. The tables and the
+#     derivation are on `perf.rs::COMPILED_GLUE_WHOLE_FWD_REL_TOL_T2I`; the sweep that produced them
+#     is committed as `mlx-gen-qwen-image/examples/qwen_compiled_glue_sweep.rs` (an example, not a
+#     test — it adds nothing to the 45 above).
+# All four are WIRED above. None weakened a gate to get there.
 key = "qwen-image-mlx"
 repository = "SceneWorks/qwen-image-mlx"
 revision = "8080a4171f1c8b7fca6c30491eafbe6ffab754bf"
@@ -244,11 +269,14 @@ expected_files = [
 # to load. `expected_files` names the q8 weights so a partial fetch cannot pass verification.
 #
 # WHAT "WIRED" DOES NOT MEAN HERE. `QWEN_IMAGE_EDIT_SNAPSHOT` also gates 19 tests this lane does not
-# run — `edit_real_weights.rs` (12) and `vision_real_weights.rs` (7) — plus one arm of
-# `perf.rs`. The gate is per-variable, so this row now reads as covered while those 19 still execute
-# nowhere; that is the same hazard recorded against MLX_GEN_FLUX_DEV_SNAPSHOT on `flux-1-dev`, and
-# it is accepted here rather than avoided because the sequential-residency Edit arm genuinely needs
-# this artifact. The 19 are tracked in sc-17519; do not read this row as evidence they run.
+# run — `edit_real_weights.rs` (12) and `vision_real_weights.rs` (7). The gate is per-variable, so
+# this row now reads as covered while those 19 still execute nowhere; that is the same hazard
+# recorded against MLX_GEN_FLUX_DEV_SNAPSHOT on `flux-1-dev`, and it is accepted here rather than
+# avoided because the sequential-residency Edit arm genuinely needs this artifact. The 19 are
+# tracked in sc-17519; do not read this row as evidence they run.
+#
+# The `perf.rs` Edit arm was a 20th until sc-17513 wired it into the compiled-glue A/B step; it is
+# the only test outside `sequential_residency_real_weights` that this row's q8 tier now backs in CI.
 key = "qwen-image-edit-2511-mlx"
 repository = "SceneWorks/qwen-image-edit-2511-mlx"
 revision = "0dfbf3a018bcee42d77de14494c35f97a7531def"
@@ -307,10 +335,23 @@ expected_files = ["pid_flux_2kto4k.safetensors"]
 # The lightx2v 8-step Lightning distillation LoRAs for T2I and Edit-2511. Only the one file each
 # suite loads is fetched (~0.85 GB apiece), not the repos' full variant matrices.
 #
-# These resolve through MLX_GEN_MODELS_ROOT + a HARD-CODED `models--<org>--<repo>/snapshots/<rev>`
-# layout inside the tests, not from their own variable, so the lane derives the path from the models
-# root and the revision below rather than carrying a second repository variable that could drift out
-# of agreement with this pin.
+# Neither carries a repository variable of its own. The LANE derives
+# `$MLX_GEN_MODELS_ROOT/models--<org>--<repo>/snapshots/<rev>` from the revision pinned below,
+# exports it as the environment name in this record via `$GITHUB_ENV`, and verifies THAT dir with
+# `ensure_model_snapshot.py`; the tests read the variable and fail loudly if it points at a file
+# that is not there. Deriving the dir from this pin is what keeps the revision CI verifies and the
+# revision the tests actually load identical; a second repository variable could only drift from it.
+#
+# The T2I file has a THIRD consumer as of sc-17515: `fit_preview_rgb_factors` renders its fit corpus
+# through it, because the committed `preview::RGB_FACTORS` document an "8-step Lightning" fit and
+# `lightning_sigmas` alone is only the schedule half of that. Measured: without the LoRA the re-solve
+# lands 0.26 from the committed factors, with it 0.082.
+#
+# No test hard-codes a revision. With the variable unset (local dev) the three consumers fall back
+# on their own, and not identically: `adapter_real_weights` and `fit_preview_rgb_factors` each scan
+# `snapshots/` and take the sorted-first entry, while `lightning_render_real_weights` takes whatever
+# `read_dir` yields first — so two of the three are at least run-to-run stable, and none of them is
+# this pin.
 key = "qwen-image-lightning"
 repository = "lightx2v/Qwen-Image-Lightning"
 revision = "e74da8d4e71a54b341de86aa9f8d2509165aa513"
@@ -349,6 +390,32 @@ expected_files = [
     "config.json",
     "tokenizer.json",
     "model.safetensors.index.json",
+]
+
+[[models]]
+# sc-17739 — `mlx-gen-lens` shipped in the macOS catalog with NO real-weight coverage of any kind:
+# no testkit dev-dependency, no conformance test, no entry here, no job. sc-17418 recorded that its
+# `check_cfg_off_render` arm covered lens "on the nightly"; it never did, because the suite is a
+# per-crate opt-in and lens had never opted in. This row plus the `mlx-media` wiring is what makes
+# that true.
+#
+# The upstream `microsoft/Lens-Turbo` was DELETED from the Hub by Microsoft; this is SceneWorks's
+# re-assembled diffusers-layout repackage (byte-identical weights, per its model card). Three test
+# resolvers still derived the dead `models--microsoft--Lens-Turbo` path and are repointed in the same
+# change.
+key = "lens-turbo"
+repository = "SceneWorks/Lens-Turbo"
+revision = "33acd265a2fc97a4a2f5d546ef4952b5a960aa56"
+license = "MIT"
+size_class = "very-large"
+profiles = ["media-macos"]
+environment = ["LENS_SNAPSHOT"]
+expected_files = [
+    "model_index.json",
+    "tokenizer/tokenizer.json",
+    "text_encoder/model.safetensors.index.json",
+    "transformer/lens_turbo_bf16.safetensors",
+    "vae/diffusion_pytorch_model.safetensors",
 ]
 
 [[models]]
@@ -1202,3 +1269,93 @@ profiles = ["media-macos"]
 environment = ["KREA_DISTILL_LORA_SNAPSHOT"]
 download_files = ["Lightx2v/lightx2v_T2V_14B_cfg_step_distill_v2_lora_rank64_bf16.safetensors"]
 expected_files = ["Lightx2v/lightx2v_T2V_14B_cfg_step_distill_v2_lora_rank64_bf16.safetensors"]
+
+[[models]]
+# SANA-1.6B 1024px, the SceneWorks MLX re-host (epic 8485, memory ladder SC-15523). The pin exists so
+# the SC-15523 rung-3/rung-4 evidence records can name the exact bytes they were measured over:
+# `verify_model_snapshot.py --inventory-output` turns this entry plus the snapshot on disk into the
+# `model_revision` + `model_inventory_sha256` pair every `MEMORY_EVIDENCE_V1` record carries, and
+# without it those two fields would be operator-typed strings nothing can check.
+#
+# `expected_files` names the q4 turnkey tier, the tier both SANA entries ship and the one the ladder
+# was measured at; bf16/ and q8/ are siblings under the same revision and are inventoried when
+# present, so a later per-tier sweep changes the inventory sha rather than silently reusing this one.
+key = "sana-1600m-mlx"
+repository = "SceneWorks/Sana_1600M_1024px_mlx"
+revision = "ac421696dd6eb0b41f446f4c45a53ccc057d82a1"
+license = "Apache-2.0"
+size_class = "large"
+profiles = ["media-macos"]
+environment = ["SANA_LADDER_1600M"]
+# The image memory-ladder harnesses are operator-run on authoritative Apple hardware, not CI-wired —
+# the same posture as every sibling family on epic 15448 (Chroma's CHROMA_LADDER_*, SDXL's
+# SDXL_LADDER_*, Kolors'), none of which has a real-weights lane either. A rung-4 sweep re-materializes
+# the trunk once per block per step, so a hosted lane would be hours per entry. This entry exists for
+# the evidence binding above; wiring a lane is a separate, family-wide decision (sc-17848).
+unwired_reason = "epic-15448 ladder harnesses are operator-run on authoritative hardware; pinned here only to bind evidence records to exact weights (sc-15523)"
+expected_files = [
+    "q4/transformer/diffusion_pytorch_model.safetensors",
+    "q4/vae/diffusion_pytorch_model.safetensors",
+    "q4/text_encoder/gemma-2-2b-it.safetensors",
+    "q4/text_encoder/tokenizer.json",
+]
+
+[[models]]
+# SANA-Sprint 1.6B 1024px — the CFG-free, continuous-time-consistency-distilled few-step variant
+# (sc-8490). Same Linear-DiT backbone and the same DC-AE, a different checkpoint and a different
+# sampler, which is exactly why it owes its own memory-ladder evidence rather than inheriting the
+# base entry's. It is the SC-15523 representative for the multi-row sweeps: 2 CFG-free steps against
+# base SANA's 40 trunk forwards per image.
+key = "sana-sprint-1600m-mlx"
+repository = "SceneWorks/Sana_Sprint_1.6B_1024px_mlx"
+revision = "0b0d18484cac2fb515e76d25a09a5911ae4ab58e"
+license = "Apache-2.0"
+size_class = "large"
+profiles = ["media-macos"]
+environment = ["SANA_LADDER_SPRINT"]
+unwired_reason = "epic-15448 ladder harnesses are operator-run on authoritative hardware; pinned here only to bind evidence records to exact weights (sc-15523)"
+expected_files = [
+    "q4/transformer/diffusion_pytorch_model.safetensors",
+    "q4/vae/diffusion_pytorch_model.safetensors",
+    "q4/text_encoder/gemma-2-2b-it.safetensors",
+    "q4/text_encoder/tokenizer.json",
+]
+
+[[models]]
+# Bernini — the SceneWorks MLX re-host of ByteDance Bernini (Qwen2.5-VL-7B latent-semantic planner
+# driving a Wan2.2-T2V-A14B dual-expert renderer), memory ladder sc-15528 / sc-16354.
+#
+# The pin exists so this family's `MEMORY_EVIDENCE_V1` records can name the exact bytes they were
+# measured over: `verify_model_snapshot.py --inventory-output` turns this entry plus the snapshot on
+# disk into the `model_revision` + `model_inventory_sha256` pair every record carries. Without it
+# those two fields would be operator-typed strings nothing can check.
+#
+# `expected_files` names the q4 tier — the smallest of the three and the only one that leaves useful
+# headroom for a rung-4 sweep on a 128 GB Mac (q4 is ~35 GiB on disk against ~51 GiB for q8 and
+# ~82 GiB for bf16, and the card measures ~44 GB peak at q4). bf16/ and q8/ are siblings under the
+# same revision and are inventoried when present, so a later per-tier sweep changes the inventory sha
+# rather than silently reusing this one.
+key = "bernini-mlx"
+repository = "SceneWorks/bernini-mlx"
+revision = "533d688f16c8f33dc832890c1e16c11921a2019a"
+license = "Apache-2.0"
+size_class = "large"
+profiles = ["media-macos"]
+environment = ["BERNINI_LADDER_SNAPSHOT"]
+expected_files = [
+  "q4/config.json",
+  "q4/bernini_renderer.json",
+  "q4/high_noise_model.safetensors",
+  "q4/low_noise_model.safetensors",
+  "q4/qwen2_5_vl.safetensors",
+  "q4/t5_encoder.safetensors",
+  "q4/vae.safetensors",
+  "q4/tokenizer.json",
+]
+# NOT wired to a lane, and the reason is specific rather than the family-wide posture. The repository
+# is public and ungated, so it IS provisionable exactly the way `chroma-memory-ladder` provisions
+# Chroma (anonymous `snapshot_download` into `runner.temp`) — what is missing is the harness the lane
+# would invoke: sc-15528 lands the ladder mechanism and its weights-free gates, not
+# `tests/memory_ladder_real_weights.rs`. A lane dispatching a test file that does not exist is worse
+# than no lane, so this stays exempt until the harness lands with it. See the follow-up on sc-15528.
+unwired_reason = "sc-15528 landed the Bernini ladder mechanism; the real-weight harness and its lane are the tracked follow-up, and a lane with no test to run would be vacuously green"

@@ -153,8 +153,8 @@ fn train_to(out_dir: &Path, cfg: TrainingConfig) -> PathBuf {
 #[test]
 #[ignore = "needs real SDXL weights; validates F-125 end-to-end resume"]
 fn sdxl_resume_matches_uninterrupted() {
-    let base = std::env::temp_dir().join(format!("sdxl_resume_e2e_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
+    let base_tmp = tempfile::tempdir().unwrap();
+    let base = base_tmp.path().to_path_buf();
 
     let mk_cfg = |steps: u32, save_every: u32, resume: bool| TrainingConfig {
         rank: 4,
@@ -210,7 +210,8 @@ fn sdxl_resume_matches_uninterrupted() {
 #[test]
 #[ignore = "needs real SDXL weights"]
 fn sdxl_trainer_trains_and_writes_lora_that_reloads() {
-    let tmp = std::env::temp_dir().join(format!("sdxl_trainer_lora_e2e_{}", std::process::id()));
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let (_losses, _steps, adapter_path) = run(&tmp, "swatch_lora.safetensors", NetworkType::Lora);
 
     // The produced adapter carries PEFT keys under the SDXL prefix + reload metadata.
@@ -251,7 +252,8 @@ fn sdxl_trainer_trains_and_writes_lora_that_reloads() {
 #[test]
 #[ignore = "needs real SDXL weights"]
 fn sdxl_trainer_trains_and_writes_lokr_that_reloads() {
-    let tmp = std::env::temp_dir().join(format!("sdxl_trainer_lokr_e2e_{}", std::process::id()));
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let (_losses, _steps, adapter_path) = run(&tmp, "swatch_lokr.safetensors", NetworkType::Lokr);
 
     let w = Weights::from_file(&adapter_path).unwrap();
@@ -288,7 +290,8 @@ fn sdxl_trainer_trains_and_writes_lokr_that_reloads() {
 #[test]
 #[ignore = "needs real SDXL weights"]
 fn sdxl_trainer_gradient_checkpointing_converges() {
-    let tmp = std::env::temp_dir().join(format!("sdxl_trainer_gc_e2e_{}", std::process::id()));
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let (losses, steps, adapter_path) = run_cfg(
         &tmp,
         "swatch_lora_gc.safetensors",
@@ -350,7 +353,8 @@ fn forward_finite(unet: &mlx_gen_sdxl::UNet2DConditionModel) {
 #[test]
 #[ignore = "needs real SDXL weights"]
 fn sdxl_trainer_emits_preview_samples() {
-    let tmp = std::env::temp_dir().join(format!("sdxl_trainer_samples_e2e_{}", std::process::id()));
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let items = make_dataset(&tmp);
     assert_eq!(mlx_gen_sdxl::MODEL_ID, "sdxl");
     let mut trainer = mlx_gen_sdxl::provider_registry()

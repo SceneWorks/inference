@@ -211,19 +211,94 @@ projection of that transcript. A deliberate reference refresh must update the ma
 receipt, and `CHECKSUMS.txt` in the same review as any changed acceptance number; silently
 accepting a new golden is not permitted.
 
-**Known stale binding (sc-17070): the transcript pins the verifier's own bytes.** `source_state()`
-hashes every path in the manifest's `scripts` map, and `verify_adapter_parity_artifacts.py` is one of
-them — so the frozen transcript's `source.files` records the *verifier's* SHA-256 beside the dump
-scripts that actually produced the goldens. Any byte edit to the verifier therefore makes a full
-(non-`--manifest-only`) run report `result transcript source files mismatch`. That is **not** drift in
-the parity evidence: the measurements, artifact hashes, model inventories, and receipt projection are
-all still bound and still check. It cannot be repaired in place — the frozen `files` dict already
-holds the old hash and `source_sha256` digests it — so the entry re-syncs on the next legitimate
-re-record, which is when sc-17070 should also narrow the hashed set to exclude the verifier. Do not
-re-record solely to clear it. As of the 2026-08-02 Windows path-comparison fix (compare the recorded
-reference-host model path as `PurePosixPath` rather than `str(Path(p).expanduser().absolute())`, which
-re-rooted the recorded `/Users/...` path onto the verifying host's drive and made the check
-permanently red off-host), the verifier's entry is stale in exactly this way.
+**What the transcript binds, and what it deliberately does not (sc-17070).** `source_state()` keeps
+two different sets. The **hashed** set — `bound_source_files()` — is the Rust sources plus every
+manifest `scripts` entry *except* `UNBOUND_SOURCE_FILES`, and its SHA-256 map is frozen into the
+transcript's `source.files`/`source_sha256`. The **changed-path allowlist** is that set plus
+`UNBOUND_SOURCE_FILES` plus `EVIDENCE_CHANGE_FILES`. `verify_adapter_parity_artifacts.py` is the sole
+unbound entry: the dump scripts, `_adapter_parity_provenance.py`, and `record_adapter_parity_transcript.py`
+*produced* the goldens and the measurements, so freezing their bytes is meaningful; the verifier only
+checks, so freezing its bytes would mean any edit to it — a pure bugfix included — invalidated the
+proof and demanded a licensed real-weight re-record that buys no extra assurance about the parity
+numbers. It keeps its `scripts` hash pin, which `validate_manifest` still enforces and which *is*
+repairable in place. Both halves are covered by tests that do not mock `source_state`; if the verifier
+is ever renamed, `bound_source_files()` refuses rather than silently rebinding it.
+
+**The source binding is current as of the sc-17651 re-record (2026-08-04).** The frozen
+`source.files` now matches `main` at the re-record, all 11 bound entries, and the two bookkeeping
+entries that used to differ are gone: `verify_adapter_parity_artifacts.py` is no longer in the
+frozen map at all (sc-17070 narrowed `source_state()`'s hashed set before this record, so verifier
+edits no longer re-stale it), and `record_adapter_parity_transcript.py` is re-bound to its current
+bytes. `adapter_parity_receipt.json`'s `proof.source.files` is the committed, path-redacted copy of
+the frozen map, so the comparison needs no gitignored binaries:
+
+```python
+import hashlib, json, pathlib, sys
+sys.path.insert(0, 'crates/media/mlx-gen/tools')
+import record_adapter_parity_transcript as R
+frozen = json.loads(pathlib.Path('crates/media/mlx-gen/tools/adapter_parity_receipt.json').read_text())['proof']['source']['files']
+manifest = json.loads(pathlib.Path('crates/media/mlx-gen/tools/adapter_parity_artifacts.json').read_text())
+for name in R.bound_source_files(manifest):
+    live = hashlib.sha256(pathlib.Path(name).read_bytes()).hexdigest()
+    print(name, 'MATCH' if frozen.get(name) == live else f'DRIFT {frozen.get(name)} -> {live}')
+```
+
+*What the re-record settled (sc-17651).* Between `071b84ff` and the re-record, two bound harnesses
+had moved — `mlx-gen-z-image/tests/adapter_real_weights.rs` and
+`mlx-gen-qwen-image/tests/adapter_real_weights.rs`, the files that emit the `SC15505_RESULT` lines —
+via `11eab9cf` (sc-16057, process-unique temp fixtures) and `716c97d9` (sc-17284, macOS real-weight
+CI lanes). Re-running the full acceptance proof reproduced **every one of the 34 pinned measurement
+fields exactly**, so neither change moved a number. Two things are worth keeping, because reading
+the diffs alone would not have established either:
+
+- sc-16057 touched only `kohya_matches_peft_on_real_tree()`, which emits no `SC15505_RESULT` and is
+  never selected — each recorded run names one test with `--exact`.
+- sc-17284 renamed the Qwen snapshot variable to `MLX_GEN_QWEN_SNAPSHOT` on the measured path and
+  renamed `expected_runs()` in lockstep, so the resolved model directory is unchanged. But
+  `verify_result_transcript` compares `run["env"]` against a freshly built `expected_runs()`, so the
+  *old* transcript's two Qwen rows had become unverifiable (`env mismatch`) independently of any
+  measurement question. A stale binding here is not always just bookkeeping — check whether the
+  recorded run spec still reproduces before assuming the numbers are the only question.
+
+*Reproducing the artifact set.* The **11 generated** artifacts regenerate byte-for-byte on the
+reference host from the commands in each `artifacts.*.source.command`, given the frozen fork at
+`81106c83` and `.venv-0320`; that includes the MLX renders, not just the synthetic adapters. The
+12th, `hyper_flux_lora`, is `source.kind: "huggingface"` — a pinned 1.38 GB ByteDance download with
+no `command`, verified by hash rather than regenerated. If a regenerated golden's SHA-256 does *not*
+match, treat it as a real signal rather than as expected float noise — the one historical exception
+was a defect, not nondeterministic math: `dump_hyper_flux_golden.py` is the only dump here that
+writes via `safetensors.numpy.save_file`, which serializes `__metadata__` out of a Rust `HashMap`
+with per-process iteration order, so its file hash changed every run while all eight tensors stayed
+bit-identical. `_canonicalize_metadata_order()` sorts the metadata after the write — a key
+permutation that preserves the serialized length, re-padded into the original header slot, with the
+write confined to the header bytes so the payload cannot move. That made the artifact reproducible
+and moved its pinned hash, in the sc-17651 review.
+
+Two consequences worth knowing before you touch that script. Its own SHA-256 is embedded in the
+golden it writes (`golden_metadata()` sets `reference_script_sha256`), so **any byte edit to
+`dump_hyper_flux_golden.py` invalidates this artifact's pin and forces a licensed regeneration plus
+a re-record** — it is a bound source file too. That is the same ratchet sc-17070 removed for the
+verifier, and it is why the canonicalization helper lives in this script rather than in
+`_adapter_parity_provenance.py`: that module's hash is embedded in *all five* generated goldens as
+`reference_provenance_sha256`, so hoisting the helper there would invalidate every one of them. Do
+not "simplify" it by moving it. The sibling dumps use `mx.save_safetensors` and were never affected.
+
+Note also what the recorded Hyper-FLUX run does and does not pin. `hyper_flux_scale_zero_is_bit_exact_noop`
+compares `injected_render(None)` against `injected_render(Some(0.0))` — both sides read the same
+golden — so `byte_differences=0` is insensitive to the golden's tensor *values*; the tests that
+would detect a changed Hyper-FLUX golden (they compare against `image_u8`/`final_latents`) are not
+in the recorded run set. What evidences a faithful regeneration here is therefore the artifact's
+unchanged byte count and the ten sibling artifacts reproducing byte-exactly from the same
+fork/venv/models — not that single acceptance number.
+
+One operational note. A full (non-`--manifest-only`) run from an ordinary `main` checkout never
+reaches the source comparison at all: `source_state()` raises `proof worktree contains changes
+outside the bound allowlist` first (944 paths differ from `implementation_base` at the time of
+writing). The comparison is only reachable from a detached checkout at `implementation_base`
+(`39a11d36…`) with the proof's source overlaid — the 11 bound files plus `UNBOUND_SOURCE_FILES` plus
+`EVIDENCE_CHANGE_FILES` — which is the same protocol a re-record runs under. And when it is reached,
+any file-hash drift also moves `source_sha256`, which is compared first — so the failure you
+actually see is `result transcript source source_sha256 mismatch`, not the `files` one.
 
 ## Manifest
 
@@ -565,6 +640,12 @@ generated are listed.
 > ```sh
 > cd tools/golden && shasum -a 256 *.safetensors > CHECKSUMS.txt   # after a full re-dump
 > ```
+>
+> **Only run that after a genuinely full re-dump.** `>` truncates, so on a host holding a subset
+> of the directory it silently *deletes* every row it cannot see. sc-17651 regenerated only the
+> 11 sc-15505 artifacts out of the ~76 rows listed here; re-blessing from the directory would
+> have dropped the other 65, so that review hand-edited the single changed line instead. Editing
+> the affected rows is the correct move whenever you re-dumped less than everything.
 >
 > Until that next full re-dump, the `shasum -c` tripwire silently passes for any family it doesn't
 > list — so the manifest above is the source of truth for *what should exist*. The byte tripwire

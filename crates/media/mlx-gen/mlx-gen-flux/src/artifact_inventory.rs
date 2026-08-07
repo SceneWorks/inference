@@ -808,8 +808,8 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};
 
-    fn unique_root(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
+    fn unique_root(tmp: &tempfile::TempDir, label: &str) -> PathBuf {
+        tmp.path().join(format!(
             "flux-artifact-{label}-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
@@ -830,12 +830,13 @@ mod tests {
 
     #[test]
     fn dense_q4_and_q8_exact_single_file_inventories_are_loadable() {
+        let tmp = tempfile::tempdir().unwrap();
         for (label, quant) in [
             ("dense-inventory", None),
             ("q4-inventory", Some(Quant::Q4)),
             ("q8-inventory", Some(Quant::Q8)),
         ] {
-            let root = unique_root(label);
+            let root = unique_root(&tmp, label);
             write_snapshot(&root, quant);
             let inventory =
                 verified_stream_inventory(crate::FLUX1_DEV_ID, &eligible_spec(&root, quant))
@@ -852,9 +853,10 @@ mod tests {
 
     #[test]
     fn pinned_loader_path_preserves_safetensors_extension_for_extensionless_hf_blob() {
+        let tmp = tempfile::tempdir().unwrap();
         use std::os::unix::fs::symlink;
 
-        let root = unique_root("extensionless-hf-blob");
+        let root = unique_root(&tmp, "extensionless-hf-blob");
         write_snapshot(&root, Some(Quant::Q4));
         let snapshot_path = root.join("transformer/model.safetensors");
         let blob_path = root.join("blobs/0123456789abcdef");
@@ -891,7 +893,8 @@ mod tests {
 
     #[test]
     fn sharded_or_mismatched_component_inventory_is_not_streamable() {
-        let root = unique_root("sharded-inventory");
+        let tmp = tempfile::tempdir().unwrap();
+        let root = unique_root(&tmp, "sharded-inventory");
         write_snapshot(&root, Some(Quant::Q4));
         let spec = eligible_spec(&root, Some(Quant::Q4));
         std::fs::write(
@@ -915,7 +918,8 @@ mod tests {
 
     #[test]
     fn composite_identity_and_pin_change_on_same_size_component_mutation() {
-        let root = unique_root("inventory-mutation");
+        let tmp = tempfile::tempdir().unwrap();
+        let root = unique_root(&tmp, "inventory-mutation");
         write_snapshot(&root, None);
         let spec = eligible_spec(&root, None);
         let first = verified_stream_inventory(crate::FLUX1_SCHNELL_ID, &spec).unwrap();
@@ -941,7 +945,8 @@ mod tests {
 
     #[test]
     fn missing_t5_tokenizer_fails_stream_eligibility() {
-        let root = unique_root("missing-tokenizer");
+        let tmp = tempfile::tempdir().unwrap();
+        let root = unique_root(&tmp, "missing-tokenizer");
         write_snapshot(&root, None);
         let spec = eligible_spec(&root, None);
         std::fs::remove_file(root.join("tokenizer_2/tokenizer.json")).unwrap();
@@ -950,12 +955,13 @@ mod tests {
     }
 
     fn assert_component_content_rejected(
+        tmp: &tempfile::TempDir,
         label: &str,
         quant: Option<Quant>,
         component: &str,
         tensors: &[TestTensor],
     ) {
-        let root = unique_root(label);
+        let root = unique_root(tmp, label);
         write_snapshot(&root, quant);
         write_test_safetensors(&root.join(component).join("model.safetensors"), tensors);
         assert!(
@@ -967,8 +973,9 @@ mod tests {
 
     #[test]
     fn corrupt_empty_and_arbitrary_model_files_fail_in_every_component() {
+        let tmp = tempfile::tempdir().unwrap();
         for component in COMPONENTS {
-            let root = unique_root(&format!("empty-{component}"));
+            let root = unique_root(&tmp, &format!("empty-{component}"));
             write_snapshot(&root, None);
             std::fs::write(root.join(component).join("model.safetensors"), []).unwrap();
             assert!(
@@ -978,7 +985,7 @@ mod tests {
             );
             std::fs::remove_dir_all(&root).ok();
 
-            let root = unique_root(&format!("arbitrary-{component}"));
+            let root = unique_root(&tmp, &format!("arbitrary-{component}"));
             write_snapshot(&root, None);
             std::fs::write(
                 root.join(component).join("model.safetensors"),
@@ -993,12 +1000,14 @@ mod tests {
             std::fs::remove_dir_all(root).ok();
         }
 
-        assert_component_content_rejected("zero-tensor-header", None, "transformer", &[]);
+        assert_component_content_rejected(&tmp, "zero-tensor-header", None, "transformer", &[]);
     }
 
     #[test]
     fn dense_tier_rejects_packed_leaves() {
+        let tmp = tempfile::tempdir().unwrap();
         assert_component_content_rejected(
+            &tmp,
             "dense-with-packed",
             None,
             "transformer",
@@ -1008,7 +1017,9 @@ mod tests {
 
     #[test]
     fn quantized_tier_rejects_missing_triple_for_eligible_dense_weight() {
+        let tmp = tempfile::tempdir().unwrap();
         assert_component_content_rejected(
+            &tmp,
             "quant-with-dense",
             Some(Quant::Q4),
             "text_encoder",
@@ -1022,7 +1033,9 @@ mod tests {
 
     #[test]
     fn q4_marker_rejects_q8_content() {
+        let tmp = tempfile::tempdir().unwrap();
         assert_component_content_rejected(
+            &tmp,
             "q4-marker-q8-content",
             Some(Quant::Q4),
             "transformer",
@@ -1032,14 +1045,17 @@ mod tests {
 
     #[test]
     fn quantized_tier_rejects_partial_and_orphan_triples() {
+        let tmp = tempfile::tempdir().unwrap();
         let full = packed_test_tensors("text_encoder_2", 4);
         assert_component_content_rejected(
+            &tmp,
             "partial-triple",
             Some(Quant::Q4),
             "text_encoder_2",
             &full[..2],
         );
         assert_component_content_rejected(
+            &tmp,
             "orphan-triple",
             Some(Quant::Q4),
             "text_encoder_2",
@@ -1053,9 +1069,11 @@ mod tests {
 
     #[test]
     fn quantized_tier_rejects_wrong_code_dtype_and_packed_shapes() {
+        let tmp = tempfile::tempdir().unwrap();
         let mut wrong_dtype = packed_test_tensors("transformer", 4);
         wrong_dtype[0].dtype = "BF16";
         assert_component_content_rejected(
+            &tmp,
             "wrong-code-dtype",
             Some(Quant::Q4),
             "transformer",
@@ -1065,6 +1083,7 @@ mod tests {
         let mut wrong_rows = packed_test_tensors("transformer", 4);
         wrong_rows[2].shape = vec![3, 1];
         assert_component_content_rejected(
+            &tmp,
             "wrong-packed-shape",
             Some(Quant::Q4),
             "transformer",
@@ -1074,6 +1093,7 @@ mod tests {
         let mut wrong_scale_dtype = packed_test_tensors("transformer", 4);
         wrong_scale_dtype[1].dtype = "U32";
         assert_component_content_rejected(
+            &tmp,
             "wrong-scale-dtype",
             Some(Quant::Q4),
             "transformer",
@@ -1083,7 +1103,8 @@ mod tests {
 
     #[test]
     fn quantized_tier_rejects_non_group_64_marker() {
-        let root = unique_root("wrong-group-size");
+        let tmp = tempfile::tempdir().unwrap();
+        let root = unique_root(&tmp, "wrong-group-size");
         write_snapshot(&root, Some(Quant::Q4));
         std::fs::write(
             root.join("vae/config.json"),
@@ -1100,7 +1121,9 @@ mod tests {
 
     #[test]
     fn vae_rejects_packed_non_attention_target() {
+        let tmp = tempfile::tempdir().unwrap();
         assert_component_content_rejected(
+            &tmp,
             "vae-packed-non-attention",
             Some(Quant::Q4),
             "vae",
@@ -1110,7 +1133,9 @@ mod tests {
 
     #[test]
     fn vae_requires_only_eligible_attention_targets_to_be_packed() {
+        let tmp = tempfile::tempdir().unwrap();
         assert_component_content_rejected(
+            &tmp,
             "vae-missing-attention-triple",
             Some(Quant::Q4),
             "vae",
@@ -1121,7 +1146,7 @@ mod tests {
             }],
         );
 
-        let root = unique_root("vae-target-only-positive");
+        let root = unique_root(&tmp, "vae-target-only-positive");
         write_snapshot(&root, Some(Quant::Q4));
         let mut tensors = packed_test_tensors("vae", 4);
         tensors.push(TestTensor {
@@ -1140,7 +1165,8 @@ mod tests {
 
     #[test]
     fn admitted_snapshot_rejects_new_visible_safetensors_member() {
-        let root = unique_root("post-admission-extra-file");
+        let tmp = tempfile::tempdir().unwrap();
+        let root = unique_root(&tmp, "post-admission-extra-file");
         write_snapshot(&root, None);
         let inventory =
             verified_stream_inventory(crate::FLUX1_DEV_ID, &eligible_spec(&root, None)).unwrap();
@@ -1151,7 +1177,8 @@ mod tests {
 
     #[test]
     fn admitted_snapshot_rejects_config_replacement() {
-        let root = unique_root("post-admission-config-replacement");
+        let tmp = tempfile::tempdir().unwrap();
+        let root = unique_root(&tmp, "post-admission-config-replacement");
         write_snapshot(&root, Some(Quant::Q4));
         let inventory =
             verified_stream_inventory(crate::FLUX1_DEV_ID, &eligible_spec(&root, Some(Quant::Q4)))
@@ -1170,9 +1197,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn admitted_snapshot_rejects_model_symlink_retarget() {
+        let tmp = tempfile::tempdir().unwrap();
         use std::os::unix::fs::symlink;
 
-        let root = unique_root("post-admission-symlink-retarget");
+        let root = unique_root(&tmp, "post-admission-symlink-retarget");
         write_snapshot(&root, None);
         let component = root.join("transformer");
         let objects = root.join("objects");
@@ -1201,9 +1229,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn admitted_snapshot_rejects_parent_snapshot_symlink_retarget() {
+        let tmp = tempfile::tempdir().unwrap();
         use std::os::unix::fs::symlink;
 
-        let base = unique_root("post-admission-parent-symlink-retarget");
+        let base = unique_root(&tmp, "post-admission-parent-symlink-retarget");
         let first = base.join("snapshot-a");
         let second = base.join("snapshot-b");
         write_snapshot(&first, None);
@@ -1220,7 +1249,8 @@ mod tests {
 
     #[test]
     fn structural_gate_rejects_every_overlay_tier_policy_and_shape_mutation() {
-        let root = unique_root("structural-mutations");
+        let tmp = tempfile::tempdir().unwrap();
+        let root = unique_root(&tmp, "structural-mutations");
         write_snapshot(&root, Some(Quant::Q4));
         let base = eligible_spec(&root, Some(Quant::Q4));
         assert!(structurally_streamable(crate::FLUX1_DEV_ID, &base));
@@ -1275,7 +1305,8 @@ mod tests {
 
     #[test]
     fn replacement_between_hash_and_post_stat_is_rejected() {
-        let root = unique_root("hash-replacement");
+        let tmp = tempfile::tempdir().unwrap();
+        let root = unique_root(&tmp, "hash-replacement");
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("model.safetensors");
         std::fs::write(&path, [1_u8; 32]).unwrap();
@@ -1294,7 +1325,8 @@ mod tests {
 
     #[test]
     fn same_path_same_size_content_mutation_gets_a_new_digest() {
-        let root = unique_root("content-mutation");
+        let tmp = tempfile::tempdir().unwrap();
+        let root = unique_root(&tmp, "content-mutation");
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("model.safetensors");
         std::fs::write(&path, [3_u8; 32]).unwrap();
@@ -1308,7 +1340,8 @@ mod tests {
 
     #[test]
     fn concurrent_first_use_hashes_one_file_identity_once() {
-        let root = unique_root("coalesced-hash");
+        let tmp = tempfile::tempdir().unwrap();
+        let root = unique_root(&tmp, "coalesced-hash");
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("model.safetensors");
         std::fs::write(&path, vec![7_u8; 4 * 1024 * 1024]).unwrap();

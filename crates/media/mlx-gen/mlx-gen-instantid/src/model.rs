@@ -588,10 +588,7 @@ impl InstantId {
             // seeded prior, dual conditioning via `denoise_ip_multi_control`.
             let prior = seeded_prior(&self.sampler, req.seed, width, height)?;
             let ancestral = AncestralEuler::new(&self.sampler, req.steps, self.sampler.max_time())?;
-            let d = Denoiser {
-                unet: &self.unet,
-                sampler: &ancestral,
-            };
+            let d = Denoiser::new(&self.unet, &ancestral);
             denoise_ip_multi_control(
                 &d,
                 prior,

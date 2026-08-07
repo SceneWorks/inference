@@ -808,8 +808,8 @@ mod tests {
     /// A weights-free [`LoadSpec`] that stages every required component (placeholder paths — `load`
     /// is lazy and reads no file, so the pipeline is not built here). `weights` is an ignored
     /// placeholder (mmaudio is a pure assembly of the five named components).
-    fn staged_spec() -> LoadSpec {
-        let dir = std::env::temp_dir().join("mmaudio-16k-staged");
+    fn staged_spec(tmp: &tempfile::TempDir) -> LoadSpec {
+        let dir = tmp.path().join("mmaudio-16k-staged");
         LoadSpec::new(WeightsSource::Dir(dir))
             .with_component("clip", WeightsSource::File("/nonexistent/clip.bin".into()))
             .with_component(
@@ -826,6 +826,7 @@ mod tests {
 
     #[test]
     fn load_requires_every_component_and_rejects_unsupported_spec_shapes() {
+        let tmp = tempfile::tempdir().unwrap();
         // Bare spec (no components) → load fails at the first missing component gate.
         let bare = LoadSpec::new(WeightsSource::Dir(std::env::temp_dir()));
         let err = match load(&bare) {
@@ -835,19 +836,20 @@ mod tests {
         assert!(err.to_string().contains("clip"), "got: {err}");
 
         // Every required component staged → load succeeds (lazy; no weight read).
-        assert!(load(&staged_spec()).is_ok());
+        assert!(load(&staged_spec(&tmp)).is_ok());
 
         // Quantization is still rejected as Unsupported even with components staged.
-        let mut spec = staged_spec();
+        let mut spec = staged_spec(&tmp);
         spec.quantize = Some(gen_core::Quant::Q4);
         assert!(matches!(load(&spec), Err(gen_core::Error::Unsupported(_))));
     }
 
     #[test]
     fn pre_tripped_cancel_returns_typed_canceled_before_any_heavy_work() {
+        let tmp = tempfile::tempdir().unwrap();
         // Components point at nonexistent files, but a pre-tripped cancel must return `Canceled`
         // before the lazy pipeline build ever touches them.
-        let g = load(&staged_spec()).unwrap();
+        let g = load(&staged_spec(&tmp)).unwrap();
         let flag = CancelFlag::new();
         flag.cancel();
         let mut req = foley_req(foley_frames(8, 16, 16, 0), 8);
@@ -858,9 +860,10 @@ mod tests {
 
     #[test]
     fn generate_on_missing_component_weights_fails_cleanly() {
+        let tmp = tempfile::tempdir().unwrap();
         // Components staged but their files do not exist → the lazy pipeline build fails with a
         // non-`Canceled` error (not a mid-render surprise).
-        let g = load(&staged_spec()).unwrap();
+        let g = load(&staged_spec(&tmp)).unwrap();
         let req = foley_req(foley_frames(8, 16, 16, 0), 8);
         let err = g.generate(&req, &mut |_| {}).unwrap_err();
         assert!(!matches!(err, gen_core::Error::Canceled));

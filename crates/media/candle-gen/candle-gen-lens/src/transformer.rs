@@ -161,7 +161,9 @@ pub fn gated(x: &Tensor, gate: &Tensor, y: &Tensor) -> Result<Tensor> {
 /// scores tensor would exceed [`candle_gen::ATTN_SCORES_BUDGET`] (the candle CUDA i32-index limit) —
 /// broadcasting the `[B,1,1,Sk]` mask identically onto every chunk. The `softmax_last_dim` closure keeps
 /// the exact fused softmax; each query row's softmax is independent, so the chunked result is
-/// byte-identical to the single pass. This crate does the head-merge transpose/reshape here.
+/// *mathematically* equal to the single pass — not bitwise equal, since narrowing the query axis changes
+/// the GEMM `M` and so may change the f32 accumulation order (SC-15943). This crate does the head-merge
+/// transpose/reshape here.
 fn attention(
     q: &Tensor,
     k: &Tensor,
@@ -1143,15 +1145,14 @@ mod tests {
                 Tensor::randn(0f32, 0.5f32, (inner, rank), &dev).unwrap(),
             );
         }
-        let tmp =
-            std::env::temp_dir().join(format!("sc11105_lens_{}.safetensors", std::process::id()));
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let tmp = tmp_guard.path().join("sc11105_lens.safetensors");
         candle_gen::candle_core::safetensors::save(&map, &tmp).unwrap();
         let report = crate::adapters::install_additive(
             &mut adapted,
             &[AdapterSpec::new(tmp.clone(), 1.0, AdapterKind::Lora)],
         )
         .unwrap();
-        std::fs::remove_file(&tmp).ok();
         assert_eq!(
             report.applied, 2,
             "both to_out.0 + to_add_out residuals installed"

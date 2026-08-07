@@ -294,18 +294,38 @@ fn no_preparer_msg(spec: &PrepareSpec, all: &[&SnapshotPreparerRegistration]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering};
 
-    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    /// A fresh temp directory for a test, removed on `Drop` (sc-17755).
+    ///
+    /// This used to be a hand-rolled `temp_dir().join(format!("core-llm-prepare-{pid}-{tag}-{n}"))`
+    /// with a process-local counter and no cleanup at all — "mirrors the testkit's process-id
+    /// scheme", as the old comment put it — which leaked one directory per call and had piled up
+    /// 252 of them under `%TEMP%` on the CUDA box. The counter is gone with it: `TempDir` draws its
+    /// suffix from an OS-seeded RNG and makes it unique by exclusive create-and-retry, so a
+    /// recycled PID cannot reopen a previous run's directory.
+    ///
+    /// Callers bind the guard and read `.path()`; letting it drop early would delete the fixture
+    /// out from under the test.
+    fn fixture_dir(tag: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("core-llm-prepare-{tag}-"))
+            .tempdir()
+            .expect("fixture temp dir")
+    }
 
-    /// A fresh, unique temp directory for a test (no `tempfile` dep — mirrors the testkit's
-    /// process-id scheme).
-    fn tmp(tag: &str) -> PathBuf {
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir =
-            std::env::temp_dir().join(format!("core-llm-prepare-{}-{tag}-{n}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// Guards the sc-17755 fix, and specifically the property the old `{pid}-{tag}-{n}` scheme
+    /// lacked: two calls with the SAME tag get different directories, so a recycled PID cannot
+    /// reopen a previous run's fixture. Both also leave on `Drop`.
+    #[test]
+    fn fixture_dirs_are_unique_per_call_and_removed_on_drop() {
+        let (a, b) = (fixture_dir("dup"), fixture_dir("dup"));
+        let (pa, pb) = (a.path().to_path_buf(), b.path().to_path_buf());
+        assert_ne!(pa, pb, "same tag must not collide");
+        drop(a);
+        assert!(!pa.exists(), "first fixture survived: {}", pa.display());
+        assert!(pb.exists(), "dropping one guard must not disturb the other");
+        drop(b);
+        assert!(!pb.exists(), "second fixture survived: {}", pb.display());
     }
 
     fn write(path: &Path, bytes: &[u8]) {
@@ -314,7 +334,8 @@ mod tests {
 
     #[test]
     fn detects_gguf_by_magic_regardless_of_extension() {
-        let dir = tmp("magic");
+        let guard = fixture_dir("magic");
+        let dir = guard.path();
         let f = dir.join("model.bin");
         write(&f, b"GGUF\x00\x00\x00\x03rest");
         assert_eq!(detect_format(&f).unwrap(), ModelFormat::Gguf);
@@ -322,7 +343,8 @@ mod tests {
 
     #[test]
     fn detects_gguf_by_extension_when_unreadable_magic() {
-        let dir = tmp("ext");
+        let guard = fixture_dir("ext");
+        let dir = guard.path();
         let f = dir.join("model.gguf");
         write(&f, b"xx"); // too short for magic, but the extension carries it
         assert_eq!(detect_format(&f).unwrap(), ModelFormat::Gguf);
@@ -330,7 +352,8 @@ mod tests {
 
     #[test]
     fn detects_safetensors_file() {
-        let dir = tmp("st-file");
+        let guard = fixture_dir("st-file");
+        let dir = guard.path();
         let f = dir.join("model.safetensors");
         write(&f, b"\x00\x00\x00\x00not-really-but-extension-counts");
         assert_eq!(detect_format(&f).unwrap(), ModelFormat::Safetensors);
@@ -338,23 +361,26 @@ mod tests {
 
     #[test]
     fn detects_hf_snapshot_dir_by_config_json() {
-        let dir = tmp("hf-dir");
+        let guard = fixture_dir("hf-dir");
+        let dir = guard.path();
         write(&dir.join("config.json"), b"{\"model_type\":\"llama\"}");
         write(&dir.join("model.safetensors"), b"\x00");
-        assert_eq!(detect_format(&dir).unwrap(), ModelFormat::Safetensors);
+        assert_eq!(detect_format(dir).unwrap(), ModelFormat::Safetensors);
     }
 
     #[test]
     fn detects_gguf_dir_by_contained_file() {
-        let dir = tmp("gguf-dir");
+        let guard = fixture_dir("gguf-dir");
+        let dir = guard.path();
         write(&dir.join("weights.gguf"), b"GGUF\x00\x00\x00\x03");
-        assert_eq!(detect_format(&dir).unwrap(), ModelFormat::Gguf);
+        assert_eq!(detect_format(dir).unwrap(), ModelFormat::Gguf);
     }
 
     #[test]
     fn empty_dir_is_unsupported() {
-        let dir = tmp("empty");
-        match detect_format(&dir) {
+        let guard = fixture_dir("empty");
+        let dir = guard.path();
+        match detect_format(dir) {
             Err(Error::Unsupported(m)) => assert!(m.contains("no config.json"), "{m}"),
             other => panic!("expected Unsupported, got {other:?}"),
         }
@@ -362,7 +388,9 @@ mod tests {
 
     #[test]
     fn missing_path_is_unsupported() {
-        let p = std::env::temp_dir().join("core-llm-prepare-definitely-not-here-zzz");
+        // An entry inside the guard, never created: the guard's own root exists.
+        let p_tmp = tempfile::tempdir().unwrap();
+        let p = p_tmp.path().join("definitely-not-here-zzz");
         match detect_format(&p) {
             Err(Error::Unsupported(m)) => assert!(m.contains("does not exist"), "{m}"),
             other => panic!("expected Unsupported, got {other:?}"),
@@ -371,7 +399,8 @@ mod tests {
 
     #[test]
     fn stray_file_is_unsupported() {
-        let dir = tmp("stray");
+        let guard = fixture_dir("stray");
+        let dir = guard.path();
         let f = dir.join("notes.txt");
         write(&f, b"hello");
         match detect_format(&f) {

@@ -124,11 +124,8 @@ fn eros_q4_convert_matches_golden() {
         source.display()
     );
 
-    let out = std::env::temp_dir().join(format!(
-        "mlx_gen_ltx_convert_parity_out_{}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&out);
+    let out_tmp = tempfile::tempdir().unwrap();
+    let out = out_tmp.path().to_path_buf();
     eprintln!("converting {} → {}", source.display(), out.display());
 
     // No upscaler dir: validate the six core components + configs (the upsampler components are raw
@@ -169,10 +166,8 @@ fn eros_upscaler_roundtrip_matches_golden() {
     assert!(golden.is_dir(), "golden dir missing: {}", golden.display());
 
     // Stage a fake upscaler dir holding the golden's x2-1.1 component under the source filename.
-    let updir =
-        std::env::temp_dir().join(format!("mlx_gen_ltx_upscaler_src_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&updir);
-    std::fs::create_dir_all(&updir).unwrap();
+    let updir_tmp = tempfile::tempdir().unwrap();
+    let updir = updir_tmp.path().to_path_buf();
     std::fs::copy(
         golden.join("spatial_upscaler_x2_v1_1.safetensors"),
         updir.join("ltx-2.3-spatial-upscaler-x2-1.1.safetensors"),
@@ -181,10 +176,8 @@ fn eros_upscaler_roundtrip_matches_golden() {
 
     // A tiny source file so the converter has a (trivial) transformer to emit; we only check the
     // upscaler components here.
-    let src = std::env::temp_dir().join(format!(
-        "mlx_gen_ltx_tiny_src_{}.safetensors",
-        std::process::id()
-    ));
+    let src_tmp = tempfile::tempdir().unwrap();
+    let src = src_tmp.path().join("mlx_gen_ltx_tiny_src.safetensors");
     let a = mlx_rs::Array::ones::<f32>(&[2, 2]).unwrap();
     mlx_rs::Array::save_safetensors(
         vec![("model.diffusion_model.proj_out.weight", &a)],
@@ -193,8 +186,8 @@ fn eros_upscaler_roundtrip_matches_golden() {
     )
     .unwrap();
 
-    let out = std::env::temp_dir().join(format!("mlx_gen_ltx_upscaler_out_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&out);
+    let out_tmp = tempfile::tempdir().unwrap();
+    let out = out_tmp.path().to_path_buf();
     let opts = LtxConvertOpts {
         include_audio: false,
         quantize: false,
@@ -225,11 +218,8 @@ fn run_base_parity(golden_id: &str, bits: i32) {
     assert!(golden.is_dir(), "golden dir missing: {}", golden.display());
     assert!(source.is_file(), "source missing: {}", source.display());
 
-    let out = std::env::temp_dir().join(format!(
-        "mlx_gen_ltx_{golden_id}_out_{}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&out);
+    let out_tmp = tempfile::tempdir().unwrap();
+    let out = out_tmp.path().to_path_buf();
     eprintln!(
         "converting {} (Q{bits}) → {}",
         source.display(),

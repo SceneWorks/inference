@@ -657,6 +657,7 @@ impl LensGenerator {
                     &req.prompt,
                     negative,
                     DEFAULT_DATE,
+                    guidance,
                     Some(&req.cancel),
                     encoder_window,
                 )
@@ -835,6 +836,7 @@ impl LensGenerator {
                     &req.prompt,
                     negative,
                     DEFAULT_DATE,
+                    guidance,
                     Some(&req.cancel),
                     encoder_window,
                 )
@@ -1301,11 +1303,13 @@ mod tests {
         );
     }
 
-    fn footprint_spec(quantize: Option<mlx_gen::Quant>) -> (std::path::PathBuf, LoadSpec) {
+    fn footprint_spec(
+        tmp: &tempfile::TempDir,
+        quantize: Option<mlx_gen::Quant>,
+    ) -> (std::path::PathBuf, LoadSpec) {
         let tier = if quantize.is_some() { "q8" } else { "dense" };
-        let root = std::env::temp_dir().join(format!(
-            "mlx_gen_lens_sc16014_{}_{}_{}",
-            std::process::id(),
+        let root = tmp.path().join(format!(
+            "mlx_gen_lens_sc16014_{}_{}",
             tier,
             FIXTURE_ID.fetch_add(1, Ordering::Relaxed)
         ));
@@ -1327,7 +1331,8 @@ mod tests {
 
     #[test]
     fn dense_footprint_accounts_for_mxfp4_materialization() {
-        let (root, spec) = footprint_spec(None);
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, spec) = footprint_spec(&tmp, None);
         write_text_encoder_config(
             &root,
             r#"{"dtype":"bfloat16","quantization_config":{"quant_method":"mxfp4"}}"#,
@@ -1342,7 +1347,8 @@ mod tests {
 
     #[test]
     fn bf16_on_disk_footprint_is_not_inflated_as_mxfp4() {
-        let (root, spec) = footprint_spec(None);
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, spec) = footprint_spec(&tmp, None);
         write_text_encoder_config(&root, r#"{"dtype":"bfloat16"}"#);
         assert_eq!(
             component_footprint(&spec).expect("footprint"),
@@ -1358,7 +1364,8 @@ mod tests {
 
     #[test]
     fn unknown_storage_remains_conservative() {
-        let (root, spec) = footprint_spec(None);
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, spec) = footprint_spec(&tmp, None);
         let gib: f64 = 1024.0 * 1024.0 * 1024.0;
         assert_eq!(
             component_footprint(&spec).expect("footprint").text_encoder,
@@ -1370,8 +1377,9 @@ mod tests {
 
     #[test]
     fn quantized_footprint_remains_disk_derived() {
+        let tmp = tempfile::tempdir().unwrap();
         for quant in [mlx_gen::Quant::Q4, mlx_gen::Quant::Q8] {
-            let (root, spec) = footprint_spec(Some(quant));
+            let (root, spec) = footprint_spec(&tmp, Some(quant));
             assert_eq!(
                 component_footprint(&spec).expect("footprint"),
                 mlx_gen::PerComponentBytes {
@@ -1386,7 +1394,8 @@ mod tests {
 
     #[test]
     fn packed_turnkey_without_quant_request_remains_disk_derived() {
-        let (root, spec) = footprint_spec(None);
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, spec) = footprint_spec(&tmp, None);
         std::fs::write(
             root.join("text_encoder").join("config.json"),
             r#"{"quantization":{"bits":8,"group_size":64}}"#,
@@ -1401,7 +1410,8 @@ mod tests {
 
     #[test]
     fn dense_calibration_never_reduces_a_larger_disk_estimate() {
-        let (root, spec) = footprint_spec(None);
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, spec) = footprint_spec(&tmp, None);
         let larger = (30.07_f64 * 1024.0 * 1024.0 * 1024.0).ceil() as u64 + 1;
         std::fs::OpenOptions::new()
             .write(true)
@@ -1666,11 +1676,10 @@ mod tests {
     // only the component `config.json` markers are written.
 
     /// Temp snapshot root with a Q8 marker in each of `components` (others absent = dense).
-    fn tier_fixture(components: &[&str], bits: i32) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "lens-registry-tier-{}-{}-{:?}",
+    fn tier_fixture(tmp: &tempfile::TempDir, components: &[&str], bits: i32) -> std::path::PathBuf {
+        let root = tmp.path().join(format!(
+            "lens-registry-tier-{}-{:?}",
             components.join("-"),
-            std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -1699,7 +1708,8 @@ mod tests {
     /// `quantize_dit` no-op).
     #[test]
     fn heavy_phase_rejects_q4_over_q8_turnkey() {
-        let root = tier_fixture(&["transformer"], 8);
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tier_fixture(&tmp, &["transformer"], 8);
         let spec = q4_spec(&root, mlx_gen::OffloadPolicy::Resident);
         let err = load_heavy_phase(&spec, &root, Dtype::Bfloat16, false, MODEL_ID_BASE)
             .err()
@@ -1717,7 +1727,8 @@ mod tests {
     /// `ExpertBank::Quant` at the on-disk Q8, never consulting the request).
     #[test]
     fn text_phase_rejects_q4_over_q8_turnkey() {
-        let root = tier_fixture(&["text_encoder"], 8);
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tier_fixture(&tmp, &["text_encoder"], 8);
         let spec = q4_spec(&root, mlx_gen::OffloadPolicy::Resident);
         let err = load_text_phase(&spec, &root, Dtype::Bfloat16, MODEL_ID_BASE)
             .err()
@@ -1734,8 +1745,9 @@ mod tests {
     /// with Q4 requested fails with the tier-mismatch error (not a missing-weights error).
     #[test]
     fn both_ids_reject_q4_over_q8_turnkey() {
+        let tmp = tempfile::tempdir().unwrap();
         for id in [MODEL_ID_TURBO, MODEL_ID_BASE] {
-            let root = tier_fixture(&["transformer", "text_encoder"], 8);
+            let root = tier_fixture(&tmp, &["transformer", "text_encoder"], 8);
             let spec = q4_spec(&root, mlx_gen::OffloadPolicy::Resident);
             let err = match crate::provider_registry().unwrap().load(id, &spec) {
                 Ok(_) => panic!("{id}: Q4 over a packed Q8 turnkey must fail to load"),
@@ -1753,7 +1765,8 @@ mod tests {
     /// by the up-front `build_residency` check — at LOAD time, not mid-job.
     #[test]
     fn sequential_fails_fast_on_tier_mismatch() {
-        let root = tier_fixture(&["transformer", "text_encoder"], 8);
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tier_fixture(&tmp, &["transformer", "text_encoder"], 8);
         let err = build_residency(
             &q4_spec(&root, mlx_gen::OffloadPolicy::Sequential),
             MODEL_ID_BASE,
@@ -1769,8 +1782,9 @@ mod tests {
     /// tier). Weight-free via `Sequential`, which runs only the up-front checks.
     #[test]
     fn matching_or_absent_request_passes_the_guard() {
+        let tmp = tempfile::tempdir().unwrap();
         // Q8 over Q8: no tier error (build succeeds — Sequential touches no weights).
-        let root = tier_fixture(&["transformer", "text_encoder"], 8);
+        let root = tier_fixture(&tmp, &["transformer", "text_encoder"], 8);
         let mut spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
             .with_offload_policy(mlx_gen::OffloadPolicy::Sequential);
         spec.quantize = Some(Quant::Q8);

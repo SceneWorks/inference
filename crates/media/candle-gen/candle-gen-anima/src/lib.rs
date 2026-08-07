@@ -489,11 +489,10 @@ mod tests {
 
     /// Write a minimal **dense** DiT split_files layout (one anchor tensor, NO `.scales` codes) so the
     /// quant-guard can header-detect it as dense. Returns the split_files root.
-    fn write_dense_split_files() -> std::path::PathBuf {
+    fn write_dense_split_files(tmp: &tempfile::TempDir) -> std::path::PathBuf {
         use candle_gen::candle_core::{DType, Device, Tensor};
-        let root = std::env::temp_dir().join(format!("anima_quant_guard_{}", std::process::id()));
+        let root = tmp.path().join("anima_quant_guard");
         let dm = root.join("diffusion_models");
-        let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&dm).unwrap();
         let mut m = std::collections::HashMap::new();
         m.insert(
@@ -507,11 +506,10 @@ mod tests {
 
     /// Write a minimal **packed** DiT split_files layout (an anchor tensor WITH a `.scales`/`.biases`
     /// sibling) so the quant-guard header-detects it as packed. Returns the split_files root.
-    fn write_packed_split_files() -> std::path::PathBuf {
+    fn write_packed_split_files(tmp: &tempfile::TempDir) -> std::path::PathBuf {
         use candle_gen::candle_core::{DType, Device, Tensor};
-        let root = std::env::temp_dir().join(format!("anima_packed_guard_{}", std::process::id()));
+        let root = tmp.path().join("anima_packed_guard");
         let dm = root.join("diffusion_models");
-        let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&dm).unwrap();
         let mut m = std::collections::HashMap::new();
         // The anchor `.weight` (u32 codes) + `.scales`/`.biases` — enough for the header-only packed
@@ -535,8 +533,9 @@ mod tests {
 
     #[test]
     fn load_accepts_lora_and_packed_combo_but_rejects_quant_on_dense() {
+        let tmp = tempfile::tempdir().unwrap();
         use candle_gen::gen_core::{AdapterKind, AdapterSpec};
-        let root = write_dense_split_files();
+        let root = write_dense_split_files(&tmp);
         let base = WeightsSource::Dir(root.clone());
         let lora_spec = || {
             vec![AdapterSpec::new(
@@ -583,7 +582,7 @@ mod tests {
 
         // sc-10640: Q4/Q8 + LoRA on a **packed** checkpoint is now ACCEPTED at load (built lazily; the
         // residual install runs at first generate). This is exactly the combo that used to be rejected.
-        let packed_root = write_packed_split_files();
+        let packed_root = write_packed_split_files(&tmp);
         let packed = WeightsSource::Dir(packed_root.clone());
         assert!(
             load_base(

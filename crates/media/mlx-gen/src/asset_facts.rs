@@ -18,6 +18,13 @@ pub enum ResidentProjection {
     GroupQuantized { bits: i32, group_size: usize },
     /// Materialize every element as bf16 (used by Krea's plain-int8 native-file loader).
     Bfloat16,
+    /// Materialize every element as f32, whatever the stored width.
+    ///
+    /// This is the projection for a component whose loader **upcasts unconditionally**, which is
+    /// not a hypothetical: `mlx_gen_sdxl::load_vae` does `cast_all(Float32)` on every load because
+    /// the SDXL VAE is fp16-unstable, and every SDXL-family tier ships the fp16 variant. Priced
+    /// from stored bytes such a component is underpriced by exactly 2x at every tier (sc-15839).
+    Float32,
     /// The loader consumes this source-only tensor without retaining it.
     Omit,
 }
@@ -55,24 +62,37 @@ pub fn projected_safetensors_tensors(
             let resident_bytes = match policy {
                 ResidentProjection::Stored => tensor.data_bytes,
                 ResidentProjection::Omit => 0,
-                ResidentProjection::Bfloat16 => tensor
-                    .shape
-                    .iter()
-                    .try_fold(1_u64, |total, dimension| {
-                        let dimension = u64::try_from(*dimension).map_err(|_| {
+                ResidentProjection::Bfloat16 | ResidentProjection::Float32 => {
+                    let width = if policy == ResidentProjection::Float32 {
+                        4
+                    } else {
+                        2
+                    };
+                    tensor
+                        .shape
+                        .iter()
+                        .try_fold(1_u64, |total, dimension| {
+                            let dimension = u64::try_from(*dimension).map_err(|_| {
+                                Error::Msg(format!(
+                                    "tensor {:?} has an unrepresentable dimension",
+                                    tensor.name
+                                ))
+                            })?;
+                            total.checked_mul(dimension).ok_or_else(|| {
+                                Error::Msg(format!(
+                                    "tensor {:?} element count overflow",
+                                    tensor.name
+                                ))
+                            })
+                        })?
+                        .checked_mul(width)
+                        .ok_or_else(|| {
                             Error::Msg(format!(
-                                "tensor {:?} has an unrepresentable dimension",
-                                tensor.name
+                                "tensor {:?} {}-byte materialization size overflow",
+                                tensor.name, width
                             ))
-                        })?;
-                        total.checked_mul(dimension).ok_or_else(|| {
-                            Error::Msg(format!("tensor {:?} element count overflow", tensor.name))
-                        })
-                    })?
-                    .checked_mul(2)
-                    .ok_or_else(|| {
-                        Error::Msg(format!("tensor {:?} bf16 size overflow", tensor.name))
-                    })?,
+                        })?
+                }
                 ResidentProjection::GroupQuantized { bits, group_size } => {
                     let [out, input] = tensor.shape.as_slice() else {
                         return Ok(ResidentTensorBytes {
@@ -173,13 +193,8 @@ mod tests {
 
     #[test]
     fn projection_is_recursive_checked_and_preserves_existing_packs() {
-        let root = std::env::temp_dir().join(format!(
-            "mlx-asset-facts-{}-{:?}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-        ));
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         let nested = root.join("nested");
         std::fs::create_dir_all(&nested).unwrap();
         write_file(
@@ -236,6 +251,5 @@ mod tests {
         std::fs::create_dir_all(&corrupt_dir).unwrap();
         std::fs::write(corrupt_dir.join("model.safetensors"), b"corrupt").unwrap();
         assert!(projected_safetensors_bytes(&corrupt_dir, |_| ResidentProjection::Stored).is_err());
-        std::fs::remove_dir_all(root).ok();
     }
 }

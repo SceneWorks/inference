@@ -24,6 +24,16 @@ use candle_gen_krea::{fold_diff_patch, merge_adapters, merge_into_weights, Krea2
 const PROMPT: &str =
     "A medium-shot photograph of a red fox sitting in a snowy forest at golden hour.";
 
+/// Root for this suite's **deliberately persistent** artifacts. `KREA_SMOKE_ARTIFACT_DIR` points them
+/// somewhere durable; the `$TMPDIR` default is intentional and must NOT become a `tempfile`
+/// guard — these outputs outlive the test on purpose (rendered PNGs and synthesized adapters you open afterwards), so a guard
+/// would delete the very thing the test exists to produce (sc-17791).
+fn artifact_root() -> PathBuf {
+    std::env::var("KREA_SMOKE_ARTIFACT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir())
+}
+
 fn snapshot() -> Option<PathBuf> {
     std::env::var("KREA_TURBO_DIR").ok().map(PathBuf::from)
 }
@@ -84,7 +94,7 @@ fn longest_flat_row_run(px: &[u8], w: u32, h: u32) -> usize {
 }
 
 fn save(img: &Image, name: &str) {
-    let dir = std::env::temp_dir().join("krea_turbo_smoke");
+    let dir = artifact_root().join("krea_turbo_smoke");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(format!("{name}.png"));
     image::save_buffer(
@@ -340,7 +350,7 @@ fn adapter_merges_every_attention_target() {
     let mut w = Weights::from_dir(&root.join("transformer"), &Device::Cpu, DType::BF16)
         .expect("mmap transformer/");
 
-    let path = std::env::temp_dir().join("krea_synth_lora_merge.safetensors");
+    let path = artifact_root().join("krea_synth_lora_merge.safetensors");
     let n = build_synth_adapter(&path, &cfg, 4, 0.01);
     let report = merge_into_weights(
         &mut w,
@@ -492,7 +502,7 @@ fn turbo_engine_applies_lora_adapter() {
         return;
     };
     let cfg = Krea2Config::from_snapshot(&root).expect("parse transformer config");
-    let path = std::env::temp_dir().join("krea_synth_lora_render.safetensors");
+    let path = artifact_root().join("krea_synth_lora_render.safetensors");
     build_synth_adapter(&path, &cfg, 4, 0.01);
 
     let base = render_with(&root, 1024, 1024, vec![]);

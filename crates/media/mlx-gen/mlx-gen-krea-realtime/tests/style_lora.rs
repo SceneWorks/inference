@@ -256,7 +256,14 @@ fn forward_once(
 /// Write a PEFT LoRA file (`diffusion_model.‹stem›.lora_A/B.weight`) for the given stems, with A
 /// `[rank, in]`, B `[out, rank]`, no `.alpha` (⇒ scale = 1). f32 factors (so the residual math is not
 /// bf16-rounded), deterministic per stem, at a tunable magnitude so the residual is clearly measurable.
-fn write_lora(name: &str, stems: &[(&str, i32, i32)], rank: i32, seed: u64, mag: f32) -> PathBuf {
+fn write_lora(
+    tmp: &tempfile::TempDir,
+    name: &str,
+    stems: &[(&str, i32, i32)],
+    rank: i32,
+    seed: u64,
+    mag: f32,
+) -> PathBuf {
     let mut entries: Vec<(String, Array)> = Vec::new();
     for (i, (stem, out, inp)) in stems.iter().enumerate() {
         let a = det_fill(&[rank, *inp], seed + i as u64 * 7, mag, 0.0, Dtype::Float32);
@@ -270,10 +277,7 @@ fn write_lora(name: &str, stems: &[(&str, i32, i32)], rank: i32, seed: u64, mag:
         entries.push((format!("diffusion_model.{stem}.lora_A.weight"), a));
         entries.push((format!("diffusion_model.{stem}.lora_B.weight"), b));
     }
-    let dir = std::env::temp_dir().join(format!(
-        "mlx_gen_krea_style_lora_test_{}",
-        std::process::id()
-    ));
+    let dir = tmp.path().join("mlx_gen_krea_style_lora_test");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(name);
     let refs: Vec<(&str, &Array)> = entries.iter().map(|(k, v)| (k.as_str(), v)).collect();
@@ -288,7 +292,7 @@ fn spec(path: PathBuf, scale: f32) -> AdapterSpec {
 /// Write a peft **LoKr** file for `blocks.0.self_attn.q` ([64,64] = kron(w1[8,8], w2[8,8])) with
 /// `alpha = rank` in metadata (⇒ lycoris scale 1). Deterministic factors — the LoKr sibling of
 /// [`write_lora`], so `supports_lokr` is honest-by-test (the same shared dense install path scail2 uses).
-fn write_lokr(name: &str, mag: f32) -> PathBuf {
+fn write_lokr(tmp: &tempfile::TempDir, name: &str, mag: f32) -> PathBuf {
     let w1 = det_fill(&[8, 8], 21, mag, 0.0, Dtype::Float32);
     let w2 = det_fill(&[8, 8], 42, mag, 0.0, Dtype::Float32);
     let meta = HashMap::from([
@@ -296,10 +300,7 @@ fn write_lokr(name: &str, mag: f32) -> PathBuf {
         ("alpha".to_string(), "8".to_string()),
         ("rank".to_string(), "8".to_string()),
     ]);
-    let dir = std::env::temp_dir().join(format!(
-        "mlx_gen_krea_style_lora_test_{}",
-        std::process::id()
-    ));
+    let dir = tmp.path().join("mlx_gen_krea_style_lora_test");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(name);
     Array::save_safetensors(
@@ -325,6 +326,7 @@ fn lokr_spec(path: PathBuf, scale: f32) -> AdapterSpec {
 /// would fail one of the two halves.
 #[test]
 fn synthetic_lora_changes_forward_and_scale0_is_noop() {
+    let tmp = tempfile::tempdir().unwrap();
     let cfg = tiny_cfg();
 
     // Baseline (no LoRA).
@@ -343,6 +345,7 @@ fn synthetic_lora_changes_forward_and_scale0_is_noop() {
     );
 
     let lora = write_lora(
+        &tmp,
         "changes_forward.safetensors",
         &[
             ("blocks.0.self_attn.q", 64, 64),
@@ -402,6 +405,7 @@ fn linear_forward(host: &mut CausalKreaTransformer, path: &[&str], x: &Array) ->
 /// A's and B's residuals (both installed over the identical base).
 #[test]
 fn stacked_loras_stack_additively() {
+    let tmp = tempfile::tempdir().unwrap();
     let cfg = tiny_cfg();
     let path = ["blocks", "0", "self_attn", "q"];
     let x = acts(cfg.wan.dim as i32);
@@ -412,6 +416,7 @@ fn stacked_loras_stack_additively() {
     };
 
     let lora_a = write_lora(
+        &tmp,
         "stack_a.safetensors",
         &[("blocks.0.self_attn.q", 64, 64)],
         4,
@@ -419,6 +424,7 @@ fn stacked_loras_stack_additively() {
         0.3,
     );
     let lora_b = write_lora(
+        &tmp,
         "stack_b.safetensors",
         &[("blocks.0.self_attn.q", 64, 64)],
         6,
@@ -470,6 +476,7 @@ fn stacked_loras_stack_additively() {
 /// the `scale = 1` residual.
 #[test]
 fn per_lora_scale_scales_the_residual() {
+    let tmp = tempfile::tempdir().unwrap();
     let cfg = tiny_cfg();
     let path = ["blocks", "0", "ffn", "0"]; // reference FFN naming → normalizes to ffn.fc1
     let x = acts(cfg.wan.dim as i32);
@@ -479,6 +486,7 @@ fn per_lora_scale_scales_the_residual() {
         linear_forward(&mut h, &path, &x)
     };
     let lora = write_lora(
+        &tmp,
         "scale.safetensors",
         &[("blocks.0.ffn.0", 128, 64)],
         4,
@@ -527,6 +535,7 @@ fn per_lora_scale_scales_the_residual() {
 /// `tests/style_lora_real_weights.rs`. Seven here is a statement about the host, not about those files.
 #[test]
 fn globals_install_end_to_end_and_change_the_forward() {
+    let tmp = tempfile::tempdir().unwrap();
     let cfg = tiny_cfg();
     let base = tiny_transformer(&cfg);
     let vel_base = forward_once(&base, &cross_kv(&base, &cfg), &cfg);
@@ -537,6 +546,7 @@ fn globals_install_end_to_end_and_change_the_forward() {
     //   time_embedding_1     [64, 64]                          time_projection  [6·64, 64] = [384, 64]
     //   head.head            [out_dim·∏patch, dim] = [64, 64]
     let lora = write_lora(
+        &tmp,
         "globals_only.safetensors",
         &[
             ("patch_embedding", 64, 64),
@@ -581,10 +591,12 @@ fn globals_install_end_to_end_and_change_the_forward() {
 /// step-distill LoRAs target them with genuine low-rank factors (see `globals_install_end_to_end`).
 #[test]
 fn unsupported_target_is_reported_not_silently_dropped() {
+    let tmp = tempfile::tempdir().unwrap();
     let cfg = tiny_cfg();
 
     // A file mixing a valid target with an I2V-only module this T2V backbone does not have.
     let mixed = write_lora(
+        &tmp,
         "mixed_target.safetensors",
         &[
             ("blocks.0.self_attn.q", 64, 64),
@@ -606,6 +618,7 @@ fn unsupported_target_is_reported_not_silently_dropped() {
     // A block index beyond the model (paired with a valid target so the file matches *something*) is
     // likewise surfaced by name — never silently ignored.
     let oob = write_lora(
+        &tmp,
         "oob_block.safetensors",
         &[
             ("blocks.0.self_attn.q", 64, 64),
@@ -628,6 +641,7 @@ fn unsupported_target_is_reported_not_silently_dropped() {
 /// target (`ffn.fc1`) both via the raw resolver AND end-to-end through the strict installer.
 #[test]
 fn wan_family_ffn_key_normalizes_and_resolves() {
+    let tmp = tempfile::tempdir().unwrap();
     let cfg = tiny_cfg();
     let mut host = tiny_transformer(&cfg);
 
@@ -670,6 +684,7 @@ fn wan_family_ffn_key_normalizes_and_resolves() {
     let x = acts(cfg.wan.dim as i32);
     let out_ref = {
         let lora = write_lora(
+            &tmp,
             "ffn_ref.safetensors",
             &[("blocks.0.ffn.0", 128, 64)],
             4,
@@ -683,6 +698,7 @@ fn wan_family_ffn_key_normalizes_and_resolves() {
     };
     let out_conv = {
         let lora = write_lora(
+            &tmp,
             "ffn_conv.safetensors",
             &[("blocks.0.ffn.fc1", 128, 64)],
             4,
@@ -706,12 +722,13 @@ fn wan_family_ffn_key_normalizes_and_resolves() {
 /// Q4/Q8 LoKr is the separate quant-tier story S19).
 #[test]
 fn lokr_installs_on_dense_and_changes_forward() {
+    let tmp = tempfile::tempdir().unwrap();
     let cfg = tiny_cfg();
 
     let base = tiny_transformer(&cfg);
     let vel_base = forward_once(&base, &cross_kv(&base, &cfg), &cfg);
 
-    let lokr = write_lokr("q_lokr.safetensors", 0.5);
+    let lokr = write_lokr(&tmp, "q_lokr.safetensors", 0.5);
     let mut adapted = tiny_transformer(&cfg);
     let report = apply_adapters_strict(&mut adapted, &[lokr_spec(lokr, 1.0)], MODEL_ID).unwrap();
     assert_eq!(report.applied, 1, "the peft LoKr installs on the dense DiT");
@@ -738,7 +755,11 @@ fn lokr_installs_on_dense_and_changes_forward() {
 /// dropped without a word before sc-15326.
 ///
 /// Returns `(path, expected_fold_count)`.
-fn write_lightx2v_shaped_diff_patch(name: &str, cfg: &KreaRealtimeConfig) -> (PathBuf, usize) {
+fn write_lightx2v_shaped_diff_patch(
+    tmp: &tempfile::TempDir,
+    name: &str,
+    cfg: &KreaRealtimeConfig,
+) -> (PathBuf, usize) {
     let w = &cfg.wan;
     let dim = w.dim as i32;
     let ffn = w.ffn_dim as i32;
@@ -787,10 +808,7 @@ fn write_lightx2v_shaped_diff_patch(name: &str, cfg: &KreaRealtimeConfig) -> (Pa
     }
 
     let expected = entries.len();
-    let dir = std::env::temp_dir().join(format!(
-        "mlx_gen_krea_style_lora_test_{}",
-        std::process::id()
-    ));
+    let dir = tmp.path().join("mlx_gen_krea_style_lora_test");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(name);
     let refs: Vec<(&str, &Array)> = entries.iter().map(|(k, v)| (k.as_str(), v)).collect();
@@ -823,8 +841,10 @@ fn tiny_transformer_q4(cfg: &KreaRealtimeConfig) -> CausalKreaTransformer {
 /// wrote nothing leaves the output bit-identical to baseline).
 #[test]
 fn lightx2v_shaped_diff_patch_applies_identically_on_q4_and_dense() {
+    let tmp = tempfile::tempdir().unwrap();
     let cfg = tiny_cfg();
-    let (dp, expected) = write_lightx2v_shaped_diff_patch("krea_diff_patch.safetensors", &cfg);
+    let (dp, expected) =
+        write_lightx2v_shaped_diff_patch(&tmp, "krea_diff_patch.safetensors", &cfg);
     // 2 blocks × (10 `.diff_b` + 5 `.diff` + 1 `norm3.diff_b`) + 7 global `.diff_b`.
     assert_eq!(expected, 2 * 16 + 7, "fixture shape");
 
@@ -892,11 +912,8 @@ fn norm_only_diff_patch_installs_through_the_norm_param_surface() {
             ));
         }
     }
-    let dir = std::env::temp_dir().join(format!(
-        "mlx_gen_krea_style_lora_test_{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir_tmp = tempfile::tempdir().unwrap();
+    let dir = dir_tmp.path().to_path_buf();
     let path = dir.join("krea_norm_only_diff.safetensors");
     let refs: Vec<(&str, &Array)> = entries.iter().map(|(k, v)| (k.as_str(), v)).collect();
     Array::save_safetensors(refs, None, &path).unwrap();
@@ -923,11 +940,8 @@ fn out_of_surface_diff_patch_key_is_reported_not_dropped() {
     let cfg = tiny_cfg();
     let dim = cfg.wan.dim as i32;
     let d = det_fill(&[dim], 1234, 0.2, 0.0, Dtype::Float32);
-    let dir = std::env::temp_dir().join(format!(
-        "mlx_gen_krea_style_lora_test_{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir_tmp = tempfile::tempdir().unwrap();
+    let dir = dir_tmp.path().to_path_buf();
     let path = dir.join("krea_i2v_norm_diff.safetensors");
     Array::save_safetensors(
         vec![
@@ -956,16 +970,15 @@ fn out_of_surface_diff_patch_key_is_reported_not_dropped() {
 /// payloads, so an empty-fixture fast path cannot make this green.
 #[test]
 fn provider_reports_fully_applied_and_partial_adapters_separately() {
+    let tmp = tempfile::tempdir().unwrap();
     let cfg = tiny_cfg();
     let (lightx2v, expected) =
-        write_lightx2v_shaped_diff_patch("krea_report_lightx2v.safetensors", &cfg);
+        write_lightx2v_shaped_diff_patch(&tmp, "krea_report_lightx2v.safetensors", &cfg);
     let dim = cfg.wan.dim as i32;
     let landed = det_fill(&[dim], 2001, 0.2, 0.0, Dtype::Float32);
     let foreign = det_fill(&[dim], 2002, 0.2, 0.0, Dtype::Float32);
-    let dir = std::env::temp_dir().join(format!(
-        "mlx_gen_krea_style_lora_test_{}",
-        std::process::id()
-    ));
+    let dir_tmp = tempfile::tempdir().unwrap();
+    let dir = dir_tmp.path().to_path_buf();
     let partial = dir.join("krea_report_partial.safetensors");
     Array::save_safetensors(
         vec![
@@ -1005,16 +1018,15 @@ fn provider_reports_fully_applied_and_partial_adapters_separately() {
 /// applies/report files one at a time fails on whichever order reaches the unsupported file.
 #[test]
 fn reported_batch_accepts_supported_plus_wholly_unsupported_in_both_orders() {
+    let tmp = tempfile::tempdir().unwrap();
     let cfg = tiny_cfg();
     let (supported, supported_applied) =
-        write_lightx2v_shaped_diff_patch("krea_report_batch_supported.safetensors", &cfg);
+        write_lightx2v_shaped_diff_patch(&tmp, "krea_report_batch_supported.safetensors", &cfg);
     let dim = cfg.wan.dim as i32;
     let foreign = det_fill(&[dim], 2011, 0.2, 0.0, Dtype::Float32);
-    let unsupported = std::env::temp_dir()
-        .join(format!(
-            "mlx_gen_krea_style_lora_test_{}",
-            std::process::id()
-        ))
+    let unsupported_tmp = tempfile::tempdir().unwrap();
+    let unsupported = unsupported_tmp
+        .path()
         .join("krea_report_batch_unsupported.safetensors");
     Array::save_safetensors(
         vec![(

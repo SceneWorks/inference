@@ -6,9 +6,12 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import textwrap
 import tomllib
 import unittest
+
+import yaml
 from pathlib import Path
 
 
@@ -385,10 +388,11 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
             errors.append(f"{prefix}: unexpected argument after requirement lock")
 
     expected_lock_counts = {
-        # 27 since sc-17284 added the `mlx-qwen-image`, `mlx-qwen-image-pid` and
-        # `mlx-qwen-image-producers` jobs
-        # (24 since sc-17250 added the JoyCaption and MOSS-TTS-Realtime jobs; 22 before).
-        MACOS_HUB_LOCK: 27,
+        # 28 since sc-15520 added the `mlx-chroma-memory-ladder` job
+        # (27 since sc-17284 added the `mlx-qwen-image`, `mlx-qwen-image-pid` and
+        # `mlx-qwen-image-producers` jobs; 24 since sc-17250 added the JoyCaption and
+        # MOSS-TTS-Realtime jobs; 22 before).
+        MACOS_HUB_LOCK: 28,
         WINDOWS_HUB_LOCK: 10,
         WINDOWS_MAGE_LOCK: 1,
         MACOS_MAGE_LOCK: 1,
@@ -554,7 +558,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
     def test_real_weight_python_installs_are_binary_hash_locked(self) -> None:
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
         self.assertEqual(real_weight_pip_policy_errors(workflow), [])
-        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 27)
+        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 28)
         self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 10)
         self.assertEqual(workflow.count(WINDOWS_MAGE_LOCK), 1)
         self.assertNotRegex(
@@ -1343,8 +1347,8 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         head-of-line block); it must carry the seeds WITHOUT WHICH THE TEST CANNOT PASS AT ALL, since
         the verdict rule refuses to rank configs with no between-seed variance estimate; and it must
         surrender its per-cell evidence even when the run fails, because an unresolvable verdict is
-        exactly the outcome whose 21 cells someone needs to read and re-running costs another
-        4.3 hours.
+        exactly the outcome whose measured cells someone needs to read, and re-running costs
+        hours.
         """
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
         start = workflow.index("  mlx-krea-realtime-s18-sweep:")
@@ -1362,19 +1366,266 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         # Over GitHub's 360-minute default, which killed a long macOS lane mid-run in sc-16981.
         self.assertIn("timeout-minutes: 480", job)
         # Rows AND seeds: the run-count assertion below is their product, so the job owns both.
-        self.assertIn('KREA_S18_ROWS: ABCDFEZ', job)
-        self.assertIn('KREA_S18_SEEDS: "7,11,23"', job)
+        # sc-17655 made them dispatch inputs so the sweep can be run in row-sized pieces instead of
+        # one indivisible 4.3 h block, which means the count is DERIVED rather than the literal 21
+        # that only ever held for the full seven-row sweep. Both halves are pinned: the job must read
+        # the inputs, and the inputs must still DEFAULT to the full recorded sweep, or a bare
+        # dispatch would quietly measure something narrower than this lane claims.
+        self.assertIn("KREA_S18_ROWS: ${{ inputs.krea_s18_rows }}", job)
+        self.assertIn("KREA_S18_SEEDS: ${{ inputs.krea_s18_seeds }}", job)
+        # PARSED, not string-matched. Substring assertions over the pre-`jobs:` text were tried and
+        # are false greens twice over: `assertIn("krea_s18_rows:", ...)` matches the key inside a
+        # `#` comment, and `assertIn("default: ABCDFEZ", ...)` is unanchored, so swapping the two
+        # defaults between the rows and seeds inputs still passed. Both were demonstrated.
+        inputs = yaml.safe_load(REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8"))[True][
+            "workflow_dispatch"
+        ]["inputs"]
+        # NOT the full ABCDFEZ. sc-17324 established by measurement that two rows cannot run on
+        # this lane's runner at the pinned 832x480: F (~49 GiB) took nax-macos-2 down twice and
+        # belongs at 640x384, and E (~63-69 GiB) is unmeasurable on this infrastructure at either
+        # bucket. The memory preflight refuses both, so defaulting to all seven would be a default
+        # that always fails. Pinned so the convenience of "just put them back" has to argue with
+        # two crashed runners first.
+        self.assertEqual(inputs["krea_s18_rows"]["default"], "ABCDZ")
+        self.assertNotIn("E", inputs["krea_s18_rows"]["default"])
+        self.assertNotIn("F", inputs["krea_s18_rows"]["default"])
+        self.assertEqual(inputs["krea_s18_seeds"]["default"], "7,11,23")
         # Name-selected, so `--exact` after the `--` plus a run count — the sc-17250 false-green shape.
         self.assertIn("set -o pipefail", job)
         self.assertIn("-- --exact --ignored --nocapture", job)
         self.assertIn('grep -qE "test result: ok\\. 1 passed"', job)
-        self.assertIn('"$cells" -ne 21', job)
+        self.assertIn("expected_cells=$(( n_rows * n_seeds ))", job)
+        self.assertIn('"$cells" -ne "$expected_cells"', job)
+        # A free-text row list is a new way to make the count assertion vacuous: a typo'd letter
+        # selects fewer rows than it counts, and a repeated one counts a row twice. Both are
+        # rejected before the four-hour cargo invocation rather than after it.
+        self.assertIn("=~ ^[ABCDFEZ]+$", job)
+        self.assertIn("repeats a row", job)
+        # Three shell details that were each a live bug in this step, pinned because every one of
+        # them fails SILENTLY — the step still exits non-zero, just with no ::error:: line and no
+        # explanation, four hours in:
+        #   * `|| true` on the seed count. `grep -c` exits 1 when it counts zero, and under
+        #     `bash -e` + `set -o pipefail` that kills the shell at the assignment, making the
+        #     "parsed to no seeds" branch unreachable.
+        #   * `[:blank:]`, not `[:space:]`, in the duplicate-seed check: `[:space:]` deletes the
+        #     newlines separating the seeds, collapsing `7,7` to `77` so the check never fires.
+        #   * field-vs-seed count parity, so a value this shell cannot read the way Rust parses it
+        #     (`+7`, or one wider than u64) fails now rather than as a cell-count mismatch later.
+        # Anchored to the seed-count line: a bare `|| true` also appears on the `cells=` line
+        # below, so the loose form still passed with this one deleted (demonstrated).
+        self.assertIn("[0-9]{1,19}[[:blank:]]*$' || true)\"", job)
+        # Same class, pre-dating sc-17655 and previously unpinned: a sweep that emits ZERO cells
+        # makes this `grep -c` exit 1 too, so without `|| true` the step dies before it can report
+        # "captured 0" — the one diagnosis that matters when nothing was measured.
+        self.assertIn("'^S18CELL' \"$RUNNER_TEMP/s18-sweep.log\" || true)\"", job)
+        self.assertIn("tr -d '[:blank:]'", job)
+        self.assertIn('"$n_seeds" -ne "$n_fields"', job)
+        self.assertIn("parsed to no seeds", job)
+        self.assertIn("repeats a seed", job)
+        # Pieces of a split sweep must be distinguishable: same sha, same inner filename, so without
+        # the rows/seeds in the artifact name the same piece can be re-aggregated twice.
+        #
+        # sc-17807 adds the GEOMETRY for the same reason, and it is not cosmetic: the geometry input
+        # now also carries the KV cache tier (`640x384@q8`), so a bf16 and a q8 dispatch of the same
+        # rows and seeds at the same sha would otherwise produce two artifacts with identical names
+        # and identical inner filenames — two different MODELS, indistinguishable. The re-aggregator
+        # refuses to pool mixed tiers, but only because each cell carries its tier; an artifact you
+        # cannot tell apart is still evidence you cannot safely use.
+        self.assertIn(
+            "name: krea-s18-sweep-${{ github.sha }}-${{ inputs.krea_s18_geometry }}"
+            "-${{ inputs.krea_s18_rows }}-s${{ inputs.krea_s18_seeds }}",
+            job,
+        )
+        # sc-17807 — the KV cache tier rides the geometry input as an optional `@q<bits>` suffix
+        # (the dispatcher is at its input cap). Both the preflight and the run must derive it, or
+        # the guard prices a bf16 sweep while a quantized one runs. The regex is what keeps the two
+        # `##*@q` expansions unambiguous, so pin it alongside them.
+        self.assertIn("^[0-9]+x[0-9]+(@q[0-9]+)?$", job)
+        self.assertEqual(job.count('KREA_S18_KV_BITS="${KREA_S18_GEOMETRY##*@q}"'), 2)
+        # sc-17324: the memory preflight must run, must see the rows actually dispatched, and must
+        # NOT be continue-on-error — refusing a row this host cannot hold is its entire purpose.
+        # It replaces two runner deaths, both row F at 832x480, both of which destroyed every cell
+        # measured up to that point because a dying runner takes the `always()` steps with it.
+        self.assertIn("scripts/ci/s18_memory_preflight.py", job)
+        preflight = job.split("- name: S18 memory preflight", 1)[1].split("- name:", 1)[0]
+        self.assertIn("KREA_S18_ROWS: ${{ inputs.krea_s18_rows }}", preflight)
+        self.assertNotIn("continue-on-error", preflight)
+        # The guard and the run must read the SAME geometry, or the preflight clears one bucket
+        # while the sweep measures another — which is precisely the hole that let an unguarded
+        # row F reach the runner. Both steps take it from the one dispatch input.
+        self.assertIn("KREA_S18_GEOMETRY: ${{ inputs.krea_s18_geometry }}", preflight)
+        sweep = job.split("- name: Run the S18 coherence sweep", 1)[1]
+        self.assertIn("KREA_S18_GEOMETRY: ${{ inputs.krea_s18_geometry }}", sweep)
+        self.assertNotIn('KREA_SMOKE_W: "832"', job)
+        self.assertEqual(inputs["krea_s18_geometry"]["default"], "832x480")
         # The evidence must outlive a failing sweep: teed to a file inside the run step, then
         # extracted and uploaded from steps that run whatever the sweep did.
         self.assertIn('tee "$RUNNER_TEMP/s18-sweep.log"', job)
-        self.assertEqual(job.count("if: always()"), 2)
+        # Three, not two: sc-17355's GPU/memory evidence report is the third `always()` step, and it
+        # is counted here rather than exempted — the point of a count is that a fourth has to be
+        # argued for.
+        self.assertEqual(job.count("if: always()"), 3)
         self.assertIn("actions/upload-artifact@", job)
         self.assertIn("krea-s18-sweep-${{ github.sha }}", job)
+        # The sampler's CSV rides along with the cells: on a 4.3-hour run the summary this job
+        # prints is a fraction of what the trajectory holds, and re-running to get it costs 4.3 hours.
+        self.assertIn("${{ runner.temp }}/gpu-fault-evidence/memory.csv", job)
+
+    def test_krea_lanes_record_gpu_fault_evidence_with_a_predicate_that_parses(self) -> None:
+        """sc-17355: a Metal command-buffer cascade names no cause, so the record must pre-exist.
+
+        Run 30869410054 failed the LoRA gate with `kIOGPUCommandBufferCallbackErrorSubmissionsIgnored`
+        — "ignored for causing prior/excessive GPU errors", i.e. an EARLIER submission faulted and
+        this one was dropped. That earlier fault is the only thing that names a cause, and it is not
+        in the run log. Nor can it be recovered afterwards: the re-dispatch that passed destroyed the
+        machine state that would have explained it. So the collection has to be in place BEFORE the
+        recurrence, on both lanes that drive this crate on `rw-krea`.
+
+        The predicate is pinned because the obvious one is inert. `subsystem == "com.apple.gpu"` —
+        which sc-17355 itself proposed — matches ZERO events on macOS 25.5.0: IOGPU faults carry an
+        empty `subsystem` and are identifiable only by `senderImagePath`. Measured both ways on
+        nax-macos over the same 3-day window: sender-based matching returns real IOGPU faults, the
+        subsystem form returns nothing at all. A capture that silently matches nothing is worse than
+        no capture, because an empty file reads as evidence of absence.
+        """
+        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        bounds = {
+            "  mlx-krea-realtime:": "\n  mlx-krea-realtime-s18-sweep:",
+            "  mlx-krea-realtime-s18-sweep:": "\n  candle-audio-kokoro:",
+        }
+        # The sampler bound is per-caller because the two lanes are not the same length. The sweep
+        # is `timeout-minutes: 480` and really runs ~4.3 h; the 7200s default (the regression lane's
+        # `timeout-minutes: 120`) would stop recording less than halfway through it, silently, in
+        # the half where accumulated pressure is most likely. A shared constant cannot serve both.
+        expected_start = {
+            "  mlx-krea-realtime:": "scripts/ci/gpu_fault_evidence.sh start\n",
+            "  mlx-krea-realtime-s18-sweep:": "scripts/ci/gpu_fault_evidence.sh start 30000\n",
+        }
+        for header, terminator in bounds.items():
+            start = workflow.index(header)
+            job = workflow[start : workflow.index(terminator, start)]
+            with self.subTest(job=header.strip()):
+                self.assertIn(expected_start[header], job)
+                self.assertIn("scripts/ci/gpu_fault_evidence.sh report", job)
+                # SCOPED TO EACH STEP, not counted across the job. A `job.count(...)` of
+                # `continue-on-error: true` is a false green: both evidence steps could lose the
+                # key and the count would still be satisfied by unrelated steps elsewhere in the
+                # job. The properties asserted here are per-step, so the slice must be per-step.
+                for step_name, must_have in (
+                    ("- name: Start GPU fault evidence", ("continue-on-error: true",)),
+                    (
+                        "- name: Report GPU fault evidence",
+                        # The report explains a FAILING run, so it must not be skipped by one.
+                        ("continue-on-error: true", "if: always()"),
+                    ),
+                ):
+                    body = job[job.index(step_name) :]
+                    body = body[: body.index("run:")]
+                    for key in must_have:
+                        self.assertIn(key, body, f"{step_name}: missing {key}")
+
+                # THE RAW RECORD MUST OUTLIVE `$RUNNER_TEMP`, on BOTH lanes. The `report` step
+                # prints a summary — a peak line, a 30-row tail, a histogram — and a diagnosis
+                # needs the 1 Hz CSV and the full event list, which the runner deletes when the
+                # job ends. The regression lane is the one that actually failed (30869410054), so
+                # shipping retention only on the operator-dispatch sweep would have put the record
+                # everywhere except where the fault was seen.
+                self.assertIn("actions/upload-artifact@", job)
+                self.assertIn("gpu-fault-evidence/memory.csv", job)
+                self.assertIn("gpu-fault-evidence/gpu-events.txt", job)
+
+        # ONE TEST PER PROCESS in the LoRA step, and this is a correctness constraint rather than a
+        # style one. sc-17355 made `render()` call `reset_peak_memory()`, which is a process-global
+        # MLX mutation. The step is safe only because `run_one` invokes cargo once per test with
+        # `--exact`; collapsing both names into a single invocation would let libtest's default
+        # thread pool run them concurrently, and each would rebase the other's high-water mid-render
+        # — silently corrupting the per-arm figures this lane now reports.
+        lora_step = workflow[workflow.index("- name: Run Krea Realtime real Wan LoRA gates") :]
+        lora_step = lora_step[: lora_step.index("- name: Report GPU fault evidence")]
+        self.assertIn('"$name" -- --exact --ignored --nocapture', lora_step)
+        self.assertEqual(lora_step.count("run_one real_wan_"), 2)
+
+        script_path = REAL_WEIGHTS_WORKFLOW.parents[2] / "scripts" / "ci" / "gpu_fault_evidence.sh"
+        script = script_path.read_text(encoding="utf-8")
+        # Comments stripped first: the header explains the inert predicate in prose, and that
+        # explanation is precisely why it must not silently reappear in the command itself.
+        code = "\n".join(
+            line for line in script.splitlines() if not line.lstrip().startswith("#")
+        )
+        self.assertNotIn('subsystem == "com.apple.gpu"', code)
+        self.assertIn('senderImagePath CONTAINS "IOGPU"', code)
+        # `log stream` drops messages under load, and load is the only condition of interest: a
+        # local run that ended in a memory kill produced 20+ "Messages dropped during live
+        # streaming" markers and none of the events, while `log show` over the same window
+        # returned them. The reader must stay post-hoc.
+        self.assertIn("/usr/bin/log show", code)
+        self.assertNotIn("log stream", code)
+        # The hypothesis under test is memory pressure, and the kernel names the mechanism outright
+        # (`killing due to "vm-compressor-space-shortage"`). None of those lines contain "IOGPU" or
+        # "command buffer", so a GPU-only predicate throws away the most direct evidence there is.
+        self.assertIn('eventMessage CONTAINS[c] "memorystatus"', code)
+        # `log` records its own argument vector, which contains "IOGPU" — without this exclusion
+        # every run matches itself and reports a spurious hit, which is as useless as reporting none.
+        self.assertIn('processImagePath != "/usr/bin/log"', code)
+        # The sibling `report_runner_disk_headroom.sh` names a lost exec bit as the one failure it
+        # cannot see; git tracks the mode, so pin it here instead of discovering it on a real box.
+        mode = subprocess.run(
+            ["git", "ls-files", "-s", "--", "scripts/ci/gpu_fault_evidence.sh"],
+            capture_output=True,
+            text=True,
+            # `test_script_encoding` requires this explicitly: the locale default decodes these
+            # gates' output as something other than UTF-8 on Windows, where this suite also runs.
+            encoding="utf-8",
+            cwd=script_path.parents[2],
+            check=False,
+        ).stdout.split(" ", 1)[0]
+        self.assertEqual(mode, "100755")
+
+        # THE NAME OF THIS TEST HAS TO BE EARNED. Everything above is substring matching, which
+        # cannot tell a working predicate from a malformed one — and a malformed predicate fails
+        # the same silent way the story's inert one did: `log show` exits non-zero, the script's
+        # `else` branch prints "log show failed", the lane stays green, and the capture records
+        # nothing. So actually run it.
+        #
+        # THE NAME SAYS "parses", NOT "matches", and the difference is the point. This probe catches
+        # a MALFORMED predicate; it cannot catch a well-formed one that matches nothing. Appending
+        # `AND subsystem == "com.apple.iokit.IOGPUFamily"` — i.e. reintroducing exactly the inert
+        # clause sc-17355 proposed — parses fine and would keep this green while collecting zero
+        # events. No assertion here can close that: "matches something" needs an event known to be
+        # in the archive at test time, and nothing is. The guard against inertness is the
+        # `assertNotIn('subsystem == "com.apple.gpu"')` above plus the report's own unclassified
+        # count, not this probe. Naming it `…_that_matches` claimed a check that does not exist.
+        #
+        # HONEST SCOPE, because this is the exact trap the change is about. `scripts/tests` runs on
+        # `ubuntu-latest` in ci.yml and NOWHERE ELSE, so this assertion never executes in CI — it is
+        # a developer-machine gate that fires for anyone running the suite on a Mac, which is where
+        # this script is written and where the lanes it guards run. Do not read a green CI as having
+        # checked the predicate. The runtime backstop is `report` printing "log show failed", which
+        # does run on the lanes.
+        if sys.platform != "darwin":
+            self.skipTest(
+                "`log show` is macOS-only, and this suite runs on ubuntu-latest in CI — the "
+                "predicate parse check fires only on a developer Mac"
+            )
+        predicate = re.search(r"--predicate '(.+?)' \\\n", code, re.DOTALL)
+        self.assertIsNotNone(predicate, "could not extract the predicate from the script")
+        probe = subprocess.run(
+            ["/usr/bin/log", "show", "--last", "1s", "--style", "compact",
+             "--predicate", predicate.group(1)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=False,
+        )
+        # Assert on the PARSE, not on the exit code. `log show` can fail for reasons that say
+        # nothing about the predicate — a sandboxed or restricted host, a busy log archive — and
+        # failing the suite on those would be a flake that teaches people to ignore this test.
+        # A malformed predicate is unambiguous and specific: `log: Bad predicate (...)`.
+        self.assertNotIn(
+            "Bad predicate",
+            probe.stderr,
+            f"the shipped predicate does not parse: {probe.stderr.strip()}",
+        )
 
     def test_krea_e2e_step_pins_its_run_count_and_excludes_the_s18_sweep(self) -> None:
         """sc-17276: the e2e step selects by `--ignored`, which is a blanket.
@@ -1392,23 +1643,73 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("set -o pipefail", step)
         self.assertIn("--skip kv_cache_residency_at_the_production_geometry", step)
         self.assertIn("--skip long_clip_coherence_under_the_bounded_window", step)
+        self.assertIn("--skip s18_verdict_from_accumulated_cells", step)
+        self.assertIn("--skip s18_kv_tier_ab_from_accumulated_cells", step)
         self.assertIn('grep -qE "test result: ok\\. 6 passed"', step)
+
+    def test_krea_kv_residency_step_runs_the_identity_and_retention_gates(self) -> None:
+        """sc-17894: both real-weight acceptance arms must be name-selected and count-pinned."""
+        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        header = workflow.split("jobs:", 1)[0]
+        job_start = workflow.index("  mlx-krea-realtime:")
+        job = workflow[job_start : workflow.index("\n  mlx-krea-realtime-s18-sweep:", job_start)]
+        e2e_start = job.index("      - name: Run Krea Realtime real-weight e2e")
+        e2e = job[
+            e2e_start : job.index("      - name: Run Krea Realtime KV-cache residency", e2e_start)
+        ]
+        start = workflow.index("      - name: Run Krea Realtime KV-cache residency")
+        step = workflow[
+            start : workflow.index("      - name: Run Krea Realtime real Wan LoRA gates", start)
+        ]
+        lora_start = job.index("      - name: Run Krea Realtime real Wan LoRA gates")
+        lora = job[lora_start : job.index("      - name: Report GPU fault evidence", lora_start)]
+
+        self.assertIn("krea-kv-cache", header)
+        self.assertIn("inputs.profile == 'krea-kv-cache'", job.split("steps:", 1)[0])
+        self.assertIn("if: inputs.profile != 'krea-kv-cache'", e2e)
+        self.assertNotIn("if: inputs.profile != 'krea-kv-cache'", step)
+        self.assertIn("if: inputs.profile != 'krea-kv-cache'", lora)
+
+        self.assertIn("set -o pipefail", step)
+        self.assertIn("-- --exact --ignored --nocapture", step)
+        self.assertIn('grep -qE "test result: ok\\. 1 passed"', step)
+        invocations = re.findall(r"^\s+run_one (?:integration|lib) .+$", step, re.MULTILINE)
+        self.assertEqual(
+            invocations,
+            [
+                "          run_one integration kv_cache_residency_at_the_production_geometry",
+                "          run_one lib generate::tests::next_read_eviction_is_bit_identical_to_eager_max_window_retention",
+            ],
+        )
 
     def test_qwen_image_lanes_name_select_every_test_and_pin_its_run_count(self) -> None:
         """sc-17284: the three Qwen-Image jobs must keep the contract they were wired under.
 
-        Each of the 20 selections has to survive all three traps at once. `--exact` AFTER the `--`,
+        Each of the 25 selections has to survive all three traps at once. `--exact` AFTER the `--`,
         because cargo rejects it in its own argument position; a run-count assertion, because with
         `--exact` accepted a renamed test yields `0 passed; N filtered out` and cargo EXITS 0; and a
         NAME, because `--ignored` alone is a blanket that silently conscripts whatever `#[ignore]`
         test lands in the file next -- which is exactly how an 85-minute sweep joined a 20-minute
         regression lane in sc-17276.
 
-        Four tests are deliberately absent and must stay absent while their stories are open:
-        `perf.rs` x2 (sc-17513) and `fit_preview_rgb_factors` (sc-17515) FAIL on real weights, and
-        `lightning_loras_apply_cleanly` (sc-17518) asserts 840 modules against a published LoRA that
-        carries 720. A red weekly lane is ignored within a month, so they are recorded rather than
-        wired.
+        ONE test is deliberately absent and must stay absent, and the excluded tuple below is the
+        list -- `edit_lightning_user_lora_reference_repro`, a bug-repro harness needing a user LoRA
+        and a reference PPM that exist in no repository and on no Hub. A red weekly lane is ignored
+        within a month, so it is recorded with its reason in `release/real-weight-models.toml`
+        rather than wired red or quietly dropped.
+
+        Keep this paragraph in step with both lists. FOUR names left it in the same week, and each
+        had been excluded on a number that measured the test rather than the code:
+        `fit_preview_rgb_factors` (sc-17515), whose R^2 = 0.0114 was its own host readback;
+        `lightning_loras_apply_cleanly` (sc-17518), whose 840 was a host-map target count against
+        pinned lightx2v files that apply 720 with zero unmatched; and `perf.rs` x2 (sc-17513), whose
+        `max|D| == 0.0` had never held on a 60-layer forward -- an 18-shape sweep plus a depth probe
+        and a conditioning control showed the residual to be this stack's amplification of a
+        sub-ULP rounding difference, not a fusion defect, and it now carries a peak-relative bound.
+        All four are selected below. The docstring outliving any of those changes would have made
+        THIS test -- the enforcement point for doc-vs-reality drift about what runs where -- an
+        instance of the defect class it exists to catch.
+
         """
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
         jobs = ("mlx-qwen-image", "mlx-qwen-image-pid", "mlx-qwen-image-producers")
@@ -1447,6 +1748,18 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                 "edit_lightning_render_is_coherent",
                 "routing_map_covers_full_fork_surface",
                 "kohya_matches_peft_on_real_tree",
+                "lightning_loras_apply_cleanly",
+                # sc-17515. Wired out of the exclusion list below: its R^2 = 0.0114 was the test's
+                # own host readback scrambling the samples, not the fit. It also scores the shipping
+                # `preview::RGB_FACTORS` unchanged, so it is a drift gate and belongs on the weekly
+                # schedule rather than in the dispatch-only producers job.
+                "fit_preview_rgb_factors",
+                # sc-17513. The sc-2963 compiled-glue rollout's only real-weight gate, wired out of
+                # the exclusion list once an 18-shape sweep established that its residual is this
+                # stack's amplification floor and replaced the bit-exactness assertion with a
+                # peak-relative bound.
+                "qwen_t2i_per_step_compiled_vs_eager",
+                "qwen_edit_per_step_compiled_vs_eager",
             ],
             "mlx-qwen-image-pid": [
                 "use_pid_without_loaded_pid_errors",
@@ -1457,6 +1770,22 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             ],
             "mlx-qwen-image-producers": ["dump_runb_latents"],
         }
+        # Bind the docstring's count to the list rather than to a maintainer's memory. The prose and
+        # the list drifted apart for exactly as long as the docstring also called
+        # `fit_preview_rgb_factors` excluded while the list above required it (sc-17515 review) --
+        # stale prose in the one test whose subject is doc-vs-reality drift. Either side moving alone
+        # now fails here instead of misinforming the next reader.
+        documented = re.search(
+            r"Each of the (\d+) selections",
+            type(self).test_qwen_image_lanes_name_select_every_test_and_pin_its_run_count.__doc__,
+        )
+        self.assertTrue(documented, "this test's docstring no longer states a selection count")
+        self.assertEqual(
+            sum(len(names) for names in selected.values()),
+            int(documented.group(1)),
+            "this test's docstring names a selection count that no longer matches `selected`",
+        )
+
         for job, names in selected.items():
             body = bodies[job]
             for name in names:
@@ -1502,15 +1831,9 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                 f"{job}: every `--exact` selection needs its own run-count assertion",
             )
 
-        # Absent, and each with an open story. Over CODE only: the steps' comments have to NAME these
-        # tests to say why they are excluded, and prose can never select a test.
-        for name in (
-            "qwen_t2i_per_step_compiled_vs_eager",
-            "qwen_edit_per_step_compiled_vs_eager",
-            "fit_preview_rgb_factors",
-            "lightning_loras_apply_cleanly",
-            "edit_lightning_user_lora_reference_repro",
-        ):
+        # Absent, with an open story. Over CODE only: the steps' comments have to NAME this test to
+        # say why it is excluded, and prose can never select a test.
+        for name in ("edit_lightning_user_lora_reference_repro",):
             for job in jobs:
                 self.assertNotIn(
                     name,
@@ -1539,6 +1862,12 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             ("push", "", True, True),
             ("workflow_dispatch", "", True, True),
             ("push", "", False, False),
+            # A merge group builds a `gh-readonly-queue/main/**` ref in this repository from heads
+            # that already passed the fork guard as PRs, so it is trusted exactly like a push. If
+            # this case ever flips to False the CUDA lane stops gating the merge queue while still
+            # looking green, which is the failure this whole boundary exists to prevent.
+            ("merge_group", "", True, True),
+            ("merge_group", "", False, False),
         )
         for event, head_repository, selected, expected in cases:
             with self.subTest(event=event, head_repository=head_repository, selected=selected):
@@ -1551,6 +1880,57 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                     ),
                     expected,
                 )
+
+    def test_merge_queue_speculative_ref_can_reach_the_workflow(self) -> None:
+        triggers = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))[True]
+        self.assertIn(
+            "merge_group",
+            triggers,
+            "without a merge_group trigger no run is created for the queue's speculative ref, "
+            "so required checks stay pending and every queued PR is evicted on timeout",
+        )
+
+    def test_every_base_sha_resolves_on_a_merge_group_event(self) -> None:
+        # merge_group carries neither `pull_request.base.sha` nor `before`. An empty base is not
+        # uniformly loud: select_lanes.py hard-errors, but check-review-findings.py drops its
+        # append-only comparison and still exits 0. Assert on every BASE_SHA in the file so a new
+        # consumer cannot be added with the two-element chain.
+        assignments = [
+            line.strip()
+            for line in WORKFLOW.read_text(encoding="utf-8").splitlines()
+            if line.strip().startswith("BASE_SHA:")
+        ]
+        self.assertTrue(assignments, "expected at least one BASE_SHA assignment in the workflow")
+        for assignment in assignments:
+            with self.subTest(assignment=assignment):
+                self.assertIn("github.event.merge_group.base_sha", assignment)
+
+    def test_gate_aggregates_every_lane_and_runs_when_they_fail(self) -> None:
+        workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+        jobs = workflow["jobs"]
+        gate = jobs["gate"]
+
+        # `if: always()` is the load-bearing half. The default `success()` would skip the gate
+        # precisely when an upstream lane failed, and a skipped job satisfies a required status
+        # check -- so the gate would report green on exactly the runs it exists to block.
+        self.assertEqual(gate["if"], "always()")
+
+        ungated = sorted(set(jobs) - {"gate"} - set(gate["needs"]))
+        self.assertEqual(
+            ungated,
+            [],
+            f"jobs missing from the CI gate's needs, so nothing enforces them: {ungated}",
+        )
+
+    def test_gate_distinguishes_a_path_skip_from_a_failed_dependency(self) -> None:
+        # Both arrive as "the job did not run", but only one is benign: a lane skipped by its `if:`
+        # is a real path-based no-op, while a lane skipped because `needs: changes` failed means the
+        # verdict is unknown. The gate must accept `skipped` (or docs-only PRs deadlock) and reject
+        # everything else (or a failed `changes` reads green through its skipped dependents).
+        step = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]["gate"]["steps"][0]
+        self.assertIn("success|skipped)", step["run"])
+        self.assertIn("exit 1", step["run"])
+        self.assertIn("join(needs.*.result", step["env"]["RESULTS"])
 
 
 if __name__ == "__main__":

@@ -1202,14 +1202,8 @@ mod registry_tests {
 
     #[test]
     fn split_component_footprint_follows_the_production_loader_paths() {
-        let root = std::env::temp_dir().join(format!(
-            "sc15813_mage_footprint_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path();
         let transformer = root.join("tier/transformer");
         let text = root.join("shared/text_encoder");
         let vae = root.join("shared/vae");
@@ -1237,20 +1231,12 @@ mod registry_tests {
         assert_eq!(edit.asset_facts.conditioning_bytes, 30);
         assert_eq!(generation.asset_facts.base_bytes, 41);
         assert_eq!(edit.asset_facts.base_bytes, 41);
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn staged_edit_keeps_the_route_checkpoint_fingerprint_gate() {
-        let root = std::env::temp_dir().join(format!(
-            "sc15813_mage_edit_verify_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         std::fs::create_dir_all(root.join("transformer")).unwrap();
         let mut invalid_checkpoint = 2u64.to_le_bytes().to_vec();
         invalid_checkpoint.extend_from_slice(b"{}");
@@ -1264,8 +1250,6 @@ mod registry_tests {
         let error = verify_staged_edit_checkpoint(&root, MageEditVariant::Edit, true)
             .expect_err("staged execution must verify the exact edit checkpoint");
         assert!(error.to_string().contains("missing transformer_blocks.0"));
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

@@ -829,7 +829,8 @@ mod tests {
 
     #[test]
     fn load_rejects_unsupported_spec_shapes() {
-        let dir = std::env::temp_dir();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         assert!(load(&LoadSpec::new(WeightsSource::File(
             dir.join("x.safetensors")
         )))
@@ -855,7 +856,8 @@ mod tests {
 
     #[test]
     fn production_path_rejects_short_stereo_by_frame_count_before_weights() {
-        let dir = std::env::temp_dir().join("chatterbox-short-stereo-no-weights");
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let generator = load_generator(&spec_with_stub_components(dir)).unwrap();
         let request = req_with(vec![Conditioning::ReferenceAudio {
             audio: AudioTrack {
@@ -886,7 +888,8 @@ mod tests {
 
     #[test]
     fn load_requires_both_components_fail_fast() {
-        let dir = std::env::temp_dir();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         // Missing BOTH co-requisites → a load-time Msg error naming a missing component + the
         // actionable `with_component` fix (never a mid-render fetch).
         let err = load_err(&LoadSpec::new(WeightsSource::Dir(dir.clone())));
@@ -923,8 +926,8 @@ mod tests {
 
     #[test]
     fn pre_tripped_cancel_returns_typed_canceled_before_any_heavy_work() {
-        let dir = std::env::temp_dir().join("chatterbox-missing-snapshot");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let g = load(&spec_with_stub_components(dir)).unwrap();
         let flag = CancelFlag::new();
         flag.cancel();

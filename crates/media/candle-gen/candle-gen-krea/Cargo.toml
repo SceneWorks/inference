@@ -43,6 +43,10 @@ metal = ["candle-gen/metal", "candle-gen-qwen-image/metal", "candle-gen-boogu/me
 cuda = ["candle-gen/cuda", "candle-gen-qwen-image/cuda", "candle-gen-boogu/cuda", "candle-gen-pid/cuda"]
 
 [dev-dependencies]
+# RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on
+# `Drop` — including out of a panicking test, which is the only path the old
+# `env::temp_dir().join(..)` + trailing `remove_dir_all` shape ever leaked on.
+tempfile = { workspace = true }
 sceneworks-gen-core-testkit = { workspace = true }
 # Encode the e2e real-weight smoke output to PNG for eyeballing (sc-7582); mirrors the other families.
 image = { version = "0.25", default-features = false, features = ["png"] }

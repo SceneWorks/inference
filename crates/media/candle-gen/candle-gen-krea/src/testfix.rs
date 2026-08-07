@@ -225,13 +225,16 @@ fn build_tiny_map(draw: &mut Draw, num_layers: usize) -> (HashMap<String, Tensor
     (t, c)
 }
 
-/// Serialize a built tensor map to a fresh temp `.safetensors` and load it as a [`KreaTrainDit`].
-/// Returns `(dit, temp_path)` — the caller drops the file when done.
-fn serialize_and_load(t: &HashMap<String, Tensor>, c: &Krea2Config) -> (KreaTrainDit, PathBuf) {
+/// Serialize a built tensor map to a `.safetensors` inside `tmp` and load it as a [`KreaTrainDit`].
+/// Returns `(dit, path)`; `tmp` owns the file and removes it on drop.
+fn serialize_and_load(
+    tmp: &tempfile::TempDir,
+    t: &HashMap<String, Tensor>,
+    c: &Krea2Config,
+) -> (KreaTrainDit, PathBuf) {
     static N: AtomicUsize = AtomicUsize::new(0);
-    let path = std::env::temp_dir().join(format!(
-        "krea_tiny_{}_{}.safetensors",
-        std::process::id(),
+    let path = tmp.path().join(format!(
+        "krea_tiny_{}.safetensors",
         N.fetch_add(1, Ordering::Relaxed)
     ));
     candle_gen::candle_core::safetensors::save(t, &path).unwrap();
@@ -241,33 +244,32 @@ fn serialize_and_load(t: &HashMap<String, Tensor>, c: &Krea2Config) -> (KreaTrai
 }
 
 /// Serialize a tiny Krea transformer to a temp `.safetensors` and load it as a [`KreaTrainDit`].
-/// Returns `(dit, cfg, temp_path)` — the caller drops the file when done. Unseeded weights.
-pub(crate) fn tiny_dit() -> (KreaTrainDit, Krea2Config, PathBuf) {
-    tiny_dit_layers(1)
+/// Returns `(dit, cfg, path)`; `tmp` owns the file. Unseeded weights.
+pub(crate) fn tiny_dit(tmp: &tempfile::TempDir) -> (KreaTrainDit, Krea2Config, PathBuf) {
+    tiny_dit_layers(tmp, 1)
 }
 
 /// Serialize a tiny Krea transformer to a temp `.safetensors` and load it as the txt2img inference
-/// [`Krea2Transformer`] (vs [`tiny_dit`]'s trainable [`KreaTrainDit`]). Returns `(dit, cfg, temp_path)`
-/// — the caller drops the file when done. Unseeded weights, **dense F32 tier** so every projection —
+/// [`Krea2Transformer`] (vs [`tiny_dit`]'s trainable [`KreaTrainDit`]). Returns `(dit, cfg)`;
+/// `tmp` owns the serialized file. Unseeded weights, **dense F32 tier** so every projection —
 /// including the front-end globals like `time_mod_proj` — is an adapter-capable `AdaptLinear` (its
 /// `QLinear::as_adapt_mut` returns `Some`), which is what the additive-surface coverage test asserts.
-pub(crate) fn tiny_transformer() -> (Krea2Transformer, Krea2Config, PathBuf) {
+pub(crate) fn tiny_transformer(tmp: &tempfile::TempDir) -> (Krea2Transformer, Krea2Config) {
     static N: AtomicUsize = AtomicUsize::new(0);
     let (t, c) = build_tiny_map(&mut |s| rnd(s), 1);
-    let path = std::env::temp_dir().join(format!(
-        "krea_tiny_xf_{}_{}.safetensors",
-        std::process::id(),
+    let path = tmp.path().join(format!(
+        "krea_tiny_xf_{}.safetensors",
         N.fetch_add(1, Ordering::Relaxed)
     ));
     candle_gen::candle_core::safetensors::save(&t, &path).unwrap();
     let w = Weights::from_file(&path, &Device::Cpu, DType::F32).unwrap();
     let dit = Krea2Transformer::load(&w, &c).unwrap();
-    (dit, c, path)
+    (dit, c)
 }
 
 /// A resident and a **block-streamed** [`Krea2Transformer`] over the SAME serialized weights, at a
-/// configurable trunk depth. Returns `(resident, streamed, cfg, temp_path)` — the caller drops the
-/// file when done.
+/// configurable trunk depth. Returns `(resident, streamed, cfg)`; `tmp` must outlive them, because
+/// `load_block_streamed` reads its blocks from that file lazily.
 ///
 /// One file, two residency policies, is the whole point: it makes "identical to the resident path"
 /// (SC-15792's parity criterion) an assertion about the *schedule* rather than about two weight
@@ -280,15 +282,15 @@ pub(crate) fn tiny_transformer() -> (Krea2Transformer, Krea2Config, PathBuf) {
 /// Windows CUDA compile check. The CUDA-specific claims — peak by window, the pool's driver/reserved
 /// split — are what `rung4_block_window_real_weights.rs` measures, and they cannot be faked here.
 pub(crate) fn tiny_transformer_streamed_pair(
+    tmp: &tempfile::TempDir,
     num_layers: usize,
-) -> (Krea2Transformer, Krea2Transformer, Krea2Config, PathBuf) {
+) -> (Krea2Transformer, Krea2Transformer, Krea2Config) {
     use std::sync::Arc;
 
     static N: AtomicUsize = AtomicUsize::new(0);
     let (t, c) = build_tiny_map(&mut |s| rnd(s), num_layers);
-    let path = std::env::temp_dir().join(format!(
-        "krea_tiny_stream_{}_{}.safetensors",
-        std::process::id(),
+    let path = tmp.path().join(format!(
+        "krea_tiny_stream_{}.safetensors",
         N.fetch_add(1, Ordering::Relaxed)
     ));
     candle_gen::candle_core::safetensors::save(&t, &path).unwrap();
@@ -301,23 +303,29 @@ pub(crate) fn tiny_transformer_streamed_pair(
         let w = Weights::from_file(&path, &Device::Cpu, DType::F32).unwrap();
         Krea2Transformer::load_block_streamed(Arc::new(w), &c).unwrap()
     };
-    (resident, streamed, c, path)
+    (resident, streamed, c)
 }
 
 /// [`tiny_dit`] with a configurable single-stream depth (the control-branch inject-offset tests
 /// need ≥ 2 main blocks). Unseeded weights.
-pub(crate) fn tiny_dit_layers(num_layers: usize) -> (KreaTrainDit, Krea2Config, PathBuf) {
+pub(crate) fn tiny_dit_layers(
+    tmp: &tempfile::TempDir,
+    num_layers: usize,
+) -> (KreaTrainDit, Krea2Config, PathBuf) {
     let (t, c) = build_tiny_map(&mut |s| rnd(s), num_layers);
-    let (dit, path) = serialize_and_load(&t, &c);
+    let (dit, path) = serialize_and_load(tmp, &t, &c);
     (dit, c, path)
 }
 
 /// Deterministic single-layer [`tiny_dit`] whose weights are drawn entirely from `rng` — same seed ⇒
 /// identical base weights every run and platform. The descent-margin tests need a reproducible base
 /// so a marginal loss trajectory can't flip its sign on an unlucky draw (sc-10794).
-pub(crate) fn tiny_dit_seeded(rng: &mut StdRng) -> (KreaTrainDit, Krea2Config, PathBuf) {
+pub(crate) fn tiny_dit_seeded(
+    tmp: &tempfile::TempDir,
+    rng: &mut StdRng,
+) -> (KreaTrainDit, Krea2Config, PathBuf) {
     let (t, c) = build_tiny_map(&mut |s| randn_seeded(rng, 0.0, 0.05, s), 1);
-    let (dit, path) = serialize_and_load(&t, &c);
+    let (dit, path) = serialize_and_load(tmp, &t, &c);
     (dit, c, path)
 }
 

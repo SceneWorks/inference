@@ -1375,16 +1375,8 @@ mod tests {
     #[test]
     fn auto_detected_packed_tier_is_the_generators_loaded_tier() {
         for (bits, expected) in [(4, Quant::Q4), (8, Quant::Q8)] {
-            let nonce = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let root = std::env::temp_dir().join(format!(
-                "sc15833_flux2_auto_tier_{}_{}_{}",
-                bits,
-                std::process::id(),
-                nonce
-            ));
+            let root_tmp = tempfile::tempdir().unwrap();
+            let root = root_tmp.path().to_path_buf();
             let transformer = root.join("transformer");
             std::fs::create_dir_all(&transformer).unwrap();
             std::fs::write(
@@ -1441,7 +1433,6 @@ mod tests {
                     "{label} must admit the auto-detected packed tier"
                 );
             }
-            std::fs::remove_dir_all(root).ok();
         }
     }
 
@@ -1745,7 +1736,8 @@ mod tests {
     /// `Pipeline::load_one_quantizable`'s device choice.
     #[test]
     fn component_is_packed_reads_quantization_block() {
-        let dir = std::env::temp_dir().join(format!("sc9087_pkg_{}", std::process::id()));
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let pipe = Pipeline::load(Flux2Variant::Dev, Some(Quant::Q4), &dir, &Device::Cpu, None);
 
         let packed = dir.join("transformer");
@@ -1782,8 +1774,6 @@ mod tests {
             format!("{err}").contains("config.json"),
             "the error should name the offending file, got: {err}"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The shared quantizable-loader's three device/dtype-selection regimes (the F-024 de-dup home,
@@ -1809,8 +1799,8 @@ mod tests {
             quantized: std::cell::Cell<bool>,
         }
 
-        let dir = std::env::temp_dir().join(format!("sc9004_loader_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         // A one-tensor safetensors shard so `component_vb_on` mmaps successfully for either component.
         let write_shard = |sub: &str, packed: bool| {
             let comp = dir.join(sub);
@@ -1882,8 +1872,6 @@ mod tests {
             p.quantized.get(),
             "packed-tier still runs the (no-op on projections) quantize to carry dense leaves"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// DENSE_TE invariant (epic 8506, sc-11031): klein quantizes ONLY its DiT and keeps the 8B Qwen3 TE
@@ -1891,7 +1879,8 @@ mod tests {
     /// TE with the DiT, so `te_quant` tracks `self.quant`.
     #[test]
     fn te_quant_keeps_klein_text_encoder_dense() {
-        let dir = std::env::temp_dir();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         for q in [None, Some(Quant::Q4), Some(Quant::Q8)] {
             let klein = Pipeline::load(Flux2Variant::Klein9b, q, &dir, &Device::Cpu, None);
             assert_eq!(klein.te_quant(), None, "klein TE stays dense at {q:?}");
@@ -1906,7 +1895,8 @@ mod tests {
     /// unchanged, confirming the delegation is wired without needing real 32B weights.
     #[test]
     fn load_te_and_dit_surfaces_missing_component() {
-        let dir = std::env::temp_dir().join(format!("sc9004_missing_{}", std::process::id()));
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         // No component dirs written → the shared loader must error on the missing text_encoder/.
         let pipe = Pipeline::load(Flux2Variant::Klein9b, None, &dir, &Device::Cpu, None);
         let err = pipe

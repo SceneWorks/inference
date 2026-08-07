@@ -37,3 +37,9 @@ image = { workspace = true }
 # oracle, so `src/latent.rs` implements them directly and pins them against draws captured from the
 # pinned numpy 2.4.3 / torch 2.13.0 environment — result: 0/32768 mismatches against `gs_noise` and
 # `gs_noise_bf16`. The dependency graph is unchanged.
+
+[dev-dependencies]
+# RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on
+# `Drop` — including out of a panicking test, which is the only path the old
+# `env::temp_dir().join(..)` + trailing `remove_dir_all` shape ever leaked on.
+tempfile = { workspace = true }

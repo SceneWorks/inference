@@ -2326,9 +2326,9 @@ mod tests {
         }
     }
 
-    fn tmp(name: &str) -> PathBuf {
+    fn scratch_file(tmp: &tempfile::TempDir, name: &str) -> PathBuf {
         // Per-process scratch dir — a fixed `$TMPDIR` name races a second concurrent `cargo test`.
-        let dir = std::env::temp_dir().join(format!("mlx_gen_loader_test_{}", std::process::id()));
+        let dir = tmp.path().join("mlx_gen_loader_test");
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(name)
     }
@@ -2368,6 +2368,7 @@ mod tests {
 
     #[test]
     fn thirdparty_lokr_resolves_diffusion_model_prefixed_keys() {
+        let tmp = tempfile::tempdir().unwrap();
         // sc-8395: ostris ai-toolkit writes Krea-2 LoKr keys as
         // `diffusion_model.‹native path›.lokr_w*`. Before the prefix strip the dotted
         // fallback handed the host `["diffusion_model", …]`, which matches no arm →
@@ -2379,7 +2380,7 @@ mod tests {
         // Both factors full ⇒ lycoris forces scale 1; w1[2,2] ⊗ w2[2,2] = ΔW[4,4].
         let w1 = Array::from_slice(&[0.5f32, 0.6, 0.7, 0.8], &[2, 2]);
         let w2 = Array::from_slice(&[0.1f32, 0.2, 0.3, 0.4], &[2, 2]);
-        let path = tmp("krea_aitoolkit_lokr.safetensors");
+        let path = scratch_file(&tmp, "krea_aitoolkit_lokr.safetensors");
         Array::save_safetensors(
             vec![
                 ("diffusion_model.blocks.0.attn.wq.lokr_w1", &w1),
@@ -2405,6 +2406,7 @@ mod tests {
 
     #[test]
     fn lora_peft_transposes_and_folds_alpha() {
+        let tmp = tempfile::tempdir().unwrap();
         // base [out=4, in=3]; PEFT lora_A [r=2, in=3], lora_B [out=4, r=2], alpha=4 (rank=2).
         let weight = Array::from_slice(
             &(0..12).map(|i| i as f32 * 0.1).collect::<Vec<_>>(),
@@ -2414,7 +2416,7 @@ mod tests {
         let b_raw = Array::from_slice(&[0.5f32, -0.5, 0.25, 0.75, 0.1, 0.2, -0.3, 0.4], &[4, 2]);
         let alpha = Array::from_slice(&[4.0f32], &[1]);
 
-        let path = tmp("lora.safetensors");
+        let path = scratch_file(&tmp, "lora.safetensors");
         Array::save_safetensors(
             vec![
                 ("lin.lora_A.weight", &a_raw),
@@ -2456,6 +2458,7 @@ mod tests {
 
     #[test]
     fn lora_peft_honors_lora_adapter_metadata_alpha() {
+        let tmp = tempfile::tempdir().unwrap();
         // sc-5513: a diffusers / PEFT `save_lora_adapter` file carries NO per-target `.alpha` tensor —
         // the scaling lives in the `lora_adapter_metadata` header blob. With `lora_alpha = 16`, `r = 8`
         // the PEFT loader must fold `(16/8) = 2.0` (the metadata strength), not the pre-sc-5513
@@ -2474,7 +2477,7 @@ mod tests {
             &[4, 8],
         );
 
-        let path = tmp("lora_adapter_metadata.safetensors");
+        let path = scratch_file(&tmp, "lora_adapter_metadata.safetensors");
         let meta = HashMap::from([(
             "lora_adapter_metadata".to_string(),
             r#"{"lora_alpha": 16, "r": 8}"#.to_string(),
@@ -2620,6 +2623,7 @@ mod tests {
 
     #[test]
     fn lora_bf16_scalar_alpha_reads_without_panic() {
+        let tmp = tempfile::tempdir().unwrap();
         // sc-2657: real kohya/BFL FLUX LoRAs ship `alpha` as a **bf16 scalar of shape []**. The alpha
         // read used `as_slice::<f32>()`, which `unwrap`s a dtype mismatch and would panic on bf16 — a
         // latent bug masked by every prior test synthesizing f32 alpha. The fix casts to f32 first.
@@ -2637,7 +2641,7 @@ mod tests {
             .as_dtype(Dtype::Bfloat16)
             .unwrap();
 
-        let path = tmp("lora_bf16_alpha.safetensors");
+        let path = scratch_file(&tmp, "lora_bf16_alpha.safetensors");
         Array::save_safetensors(
             vec![
                 ("lin.lora_A.weight", &a_raw),
@@ -2691,6 +2695,7 @@ mod tests {
 
     #[test]
     fn lora_peft_folds_bare_alpha_under_a_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
         // Prefixed `lora_A/B` (`transformer.lin.lora_{A,B}.weight`) + a BARE `lin.alpha` — the
         // fork's Qwen convention (bare-only alpha patterns). The bare alpha must NOT be dropped:
         // the residual folds alpha/rank into B exactly as the all-bare case does. (sc-2528 review.)
@@ -2702,7 +2707,7 @@ mod tests {
         let b_raw = Array::from_slice(&[0.5f32, -0.5, 0.25, 0.75, 0.1, 0.2, -0.3, 0.4], &[4, 2]);
         let alpha = Array::from_slice(&[4.0f32], &[1]); // rank=2 -> factor 2
 
-        let path = tmp("lora_prefixed_bare_alpha.safetensors");
+        let path = scratch_file(&tmp, "lora_prefixed_bare_alpha.safetensors");
         Array::save_safetensors(
             vec![
                 ("transformer.lin.lora_A.weight", &a_raw),
@@ -2746,6 +2751,7 @@ mod tests {
 
     #[test]
     fn lora_peft_conflicting_alpha_errors() {
+        let tmp = tempfile::tempdir().unwrap();
         // A prefixed alpha and a bare alpha that disagree for the same path -> hard error, no
         // silent pick.
         let weight = Array::from_slice(
@@ -2754,7 +2760,7 @@ mod tests {
         );
         let a_raw = Array::from_slice(&[0.1f32, 0.2, 0.3, -0.1, -0.2, -0.3], &[2, 3]);
         let b_raw = Array::from_slice(&[0.5f32, -0.5, 0.25, 0.75, 0.1, 0.2, -0.3, 0.4], &[4, 2]);
-        let path = tmp("lora_conflicting_alpha.safetensors");
+        let path = scratch_file(&tmp, "lora_conflicting_alpha.safetensors");
         Array::save_safetensors(
             vec![
                 ("transformer.lin.lora_A.weight", &a_raw),
@@ -2775,13 +2781,14 @@ mod tests {
 
     #[test]
     fn unmatched_paths_are_reported_not_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
         // A LoKr file targeting a path the host doesn't have -> applied 0, path reported.
         let dummy = Array::from_slice(&[1.0f32], &[1, 1]);
         let mut meta = HashMap::new();
         meta.insert("networkType".to_string(), "lokr".to_string());
         meta.insert("alpha".to_string(), "1.0".to_string());
         meta.insert("rank".to_string(), "1".to_string());
-        let path = tmp("lokr_miss.safetensors");
+        let path = scratch_file(&tmp, "lokr_miss.safetensors");
         Array::save_safetensors(
             vec![
                 ("missing.path.lokr_w1", &dummy),
@@ -2888,6 +2895,7 @@ mod tests {
     /// `apply_adapters_strict` dispatch, not just the leaf applier.
     #[test]
     fn bfl_named_lokr_fused_qkv_and_rename_resolve() {
+        let tmp = tempfile::tempdir().unwrap();
         // Fused qkv LoKr: kron(w1[3,1], w2[2,3]) → [6,3].
         let qkv_w1 = Array::from_slice(&[1.0f32, 0.5, -0.25], &[3, 1]);
         let qkv_w2 = Array::from_slice(&[0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6], &[2, 3]);
@@ -2898,7 +2906,7 @@ mod tests {
         meta.insert("networkType".to_string(), "lokr".to_string());
         meta.insert("alpha".to_string(), "1.0".to_string());
         meta.insert("rank".to_string(), "1".to_string());
-        let path = tmp("bfl_lokr_fused.safetensors");
+        let path = scratch_file(&tmp, "bfl_lokr_fused.safetensors");
         Array::save_safetensors(
             vec![
                 (
@@ -2993,6 +3001,7 @@ mod tests {
     /// keys only off the BFL spellings, so non-BFL LyCORIS is untouched by sc-8345.
     #[test]
     fn bare_diffusers_lokr_on_bfl_host_stays_on_plain_path() {
+        let tmp = tempfile::tempdir().unwrap();
         // kron(w1[2,1], w2[1,3]) → [2,3], the shape of the split to_q.
         let w1 = Array::from_slice(&[1.0f32, 0.5], &[2, 1]);
         let w2 = Array::from_slice(&[0.1f32, 0.2, 0.3], &[1, 3]);
@@ -3000,7 +3009,7 @@ mod tests {
         meta.insert("networkType".to_string(), "lokr".to_string());
         meta.insert("alpha".to_string(), "1.0".to_string());
         meta.insert("rank".to_string(), "1".to_string());
-        let path = tmp("bare_lokr_on_bfl_host.safetensors");
+        let path = scratch_file(&tmp, "bare_lokr_on_bfl_host.safetensors");
         Array::save_safetensors(
             vec![
                 ("transformer_blocks.0.attn.to_q.lokr_w1", &w1),
@@ -3026,12 +3035,13 @@ mod tests {
     /// naming routes through the fused→split applier too (sc-8345). Both-full factors ⇒ lycoris scale 1.
     #[test]
     fn bfl_named_thirdparty_lokr_fused_qkv_resolves() {
+        let tmp = tempfile::tempdir().unwrap();
         // kron(w1[3,1], w2[2,3]) → [6,3]; both factors full ⇒ scale 1.0.
         let qkv_w1 = Array::from_slice(&[1.0f32, 0.5, -0.25], &[3, 1]);
         let qkv_w2 = Array::from_slice(&[0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6], &[2, 3]);
         let proj_w1 = Array::from_slice(&[1.0f32, 0.0, 0.0, 1.0], &[2, 2]);
         let proj_w2 = Array::from_slice(&[0.1f32, 0.2, 0.3, 0.4], &[2, 2]);
-        let path = tmp("bfl_tp_lokr_fused.safetensors");
+        let path = scratch_file(&tmp, "bfl_tp_lokr_fused.safetensors");
         // NO `networkType` metadata → is_lokr() false, is_lokr_keys() true (the third-party path).
         Array::save_safetensors(
             vec![
@@ -3096,12 +3106,13 @@ mod tests {
     /// applier (sc-8345); the Hadamard delta is rebuilt at the fused shape, then row-sliced.
     #[test]
     fn bfl_named_loha_fused_qkv_resolves() {
+        let tmp = tempfile::tempdir().unwrap();
         // (w1_a@w1_b) ⊙ (w2_a@w2_b) at [6,3], rank r=1 ⇒ scale 1.0.
         let w1_a = Array::from_slice(&[0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6], &[6, 1]);
         let w1_b = Array::from_slice(&[1.0f32, -1.0, 0.5], &[1, 3]);
         let w2_a = Array::from_slice(&[0.6f32, 0.5, 0.4, 0.3, 0.2, 0.1], &[6, 1]);
         let w2_b = Array::from_slice(&[0.2f32, 0.4, -0.2], &[1, 3]);
-        let path = tmp("bfl_loha_fused.safetensors");
+        let path = scratch_file(&tmp, "bfl_loha_fused.safetensors");
         Array::save_safetensors(
             vec![
                 (
@@ -3165,6 +3176,7 @@ mod tests {
     /// the underlying loaders directly, in order.
     #[test]
     fn apply_specs_stacks_mixed_lora_and_lokr() {
+        let tmp = tempfile::tempdir().unwrap();
         // base [out=4, in=2].
         let base_vals: Vec<f32> = (0..8).map(|i| i as f32 * 0.1).collect();
         let weight = Array::from_slice(&base_vals, &[4, 2]);
@@ -3172,7 +3184,7 @@ mod tests {
         // PEFT LoRA file targeting ["lin"]: lora_A [r=2, in=2], lora_B [out=4, r=2].
         let a_raw = Array::from_slice(&[0.1f32, 0.2, -0.1, -0.2], &[2, 2]);
         let b_raw = Array::from_slice(&[0.5f32, -0.5, 0.25, 0.75, 0.1, 0.2, -0.3, 0.4], &[4, 2]);
-        let lora_path = tmp("specs_lora.safetensors");
+        let lora_path = scratch_file(&tmp, "specs_lora.safetensors");
         Array::save_safetensors(
             vec![("lin.lora_A.weight", &a_raw), ("lin.lora_B.weight", &b_raw)],
             None,
@@ -3187,7 +3199,7 @@ mod tests {
         meta.insert("networkType".to_string(), "lokr".to_string());
         meta.insert("alpha".to_string(), "1.0".to_string());
         meta.insert("rank".to_string(), "1".to_string());
-        let lokr_path = tmp("specs_lokr.safetensors");
+        let lokr_path = scratch_file(&tmp, "specs_lokr.safetensors");
         Array::save_safetensors(
             vec![("lin.lokr_w1", &w1), ("lin.lokr_w2", &w2)],
             Some(&meta),
@@ -3272,12 +3284,13 @@ mod tests {
 
     #[test]
     fn apply_specs_reports_unmatched_paths() {
+        let tmp = tempfile::tempdir().unwrap();
         let dummy = Array::from_slice(&[1.0f32], &[1, 1]);
         let mut meta = HashMap::new();
         meta.insert("networkType".to_string(), "lokr".to_string());
         meta.insert("alpha".to_string(), "1.0".to_string());
         meta.insert("rank".to_string(), "1".to_string());
-        let path = tmp("specs_miss.safetensors");
+        let path = scratch_file(&tmp, "specs_miss.safetensors");
         Array::save_safetensors(
             vec![("nope.here.lokr_w1", &dummy), ("nope.here.lokr_w2", &dummy)],
             Some(&meta),
@@ -3302,10 +3315,11 @@ mod tests {
 
     #[test]
     fn apply_specs_kind_metadata_mismatch_errors() {
+        let tmp = tempfile::tempdir().unwrap();
         let dummy = Array::from_slice(&[1.0f32], &[1, 1]);
         let mut meta = HashMap::new();
         meta.insert("networkType".to_string(), "lokr".to_string());
-        let path = tmp("specs_mismatch.safetensors");
+        let path = scratch_file(&tmp, "specs_mismatch.safetensors");
         Array::save_safetensors(vec![("lin.lokr_w1", &dummy)], Some(&meta), &path).unwrap();
 
         // Declared Lora but the file's metadata says LoKr -> a loud error, not a silent no-op.
@@ -3324,22 +3338,23 @@ mod tests {
 
     #[test]
     fn detect_lora_prefix_variants() {
+        let tmp = tempfile::tempdir().unwrap();
         let a = Array::from_slice(&[0.0f32], &[1, 1]);
-        let bare = tmp("detect_bare.safetensors");
+        let bare = scratch_file(&tmp, "detect_bare.safetensors");
         Array::save_safetensors(vec![("lin.lora_A.weight", &a)], None, &bare).unwrap();
         assert_eq!(
             detect_lora_prefix(&Weights::from_file(&bare).unwrap()),
             None
         );
 
-        let tf = tmp("detect_tf.safetensors");
+        let tf = scratch_file(&tmp, "detect_tf.safetensors");
         Array::save_safetensors(vec![("transformer.lin.lora_A.weight", &a)], None, &tf).unwrap();
         assert_eq!(
             detect_lora_prefix(&Weights::from_file(&tf).unwrap()),
             Some("transformer.")
         );
 
-        let dm = tmp("detect_dm.safetensors");
+        let dm = scratch_file(&tmp, "detect_dm.safetensors");
         Array::save_safetensors(vec![("diffusion_model.lin.lora_A.weight", &a)], None, &dm)
             .unwrap();
         assert_eq!(
@@ -3350,11 +3365,12 @@ mod tests {
 
     #[test]
     fn autoprefix_strips_detected_prefix_and_applies() {
+        let tmp = tempfile::tempdir().unwrap();
         // base [out=2, in=2]; a `transformer.`-prefixed peft LoRA on path ["lin"].
         let weight = Array::from_slice(&[0.1f32, 0.2, 0.3, 0.4], &[2, 2]);
         let a = Array::from_slice(&[0.1f32, 0.2, -0.1, -0.2], &[2, 2]); // [r=2, in=2]
         let b = Array::from_slice(&[0.5f32, -0.5, 0.25, 0.75], &[2, 2]); // [out=2, r=2]
-        let path = tmp("autoprefix_lora.safetensors");
+        let path = scratch_file(&tmp, "autoprefix_lora.safetensors");
         Array::save_safetensors(
             vec![
                 ("transformer.lin.lora_A.weight", &a),
@@ -3383,7 +3399,7 @@ mod tests {
         assert!(report.unmatched_paths.is_empty());
 
         // Strict wrapper: a bare-but-unmatched target errors rather than silently dropping.
-        let miss = tmp("autoprefix_miss.safetensors");
+        let miss = scratch_file(&tmp, "autoprefix_miss.safetensors");
         Array::save_safetensors(
             vec![
                 ("transformer.nope.lora_A.weight", &a),
@@ -3412,6 +3428,7 @@ mod tests {
     /// its `lora_A`/`lora_B` twin — and `apply_adapter_specs_autoprefix` resolves it end-to-end.
     #[test]
     fn diffusers_lora_down_up_equals_peft_ab() {
+        let tmp = tempfile::tempdir().unwrap();
         let weight = Array::from_slice(
             &(0..12).map(|i| i as f32 * 0.1).collect::<Vec<_>>(),
             &[4, 3],
@@ -3421,7 +3438,7 @@ mod tests {
         let alpha = Array::from_slice(&[4.0f32], &[1]);
 
         // down==A, up==B, bare alpha, no namespace prefix — exactly the lightx2v Lightning spelling.
-        let down_path = tmp("diffusers_down_up.safetensors");
+        let down_path = scratch_file(&tmp, "diffusers_down_up.safetensors");
         Array::save_safetensors(
             vec![
                 ("lin.lora_down.weight", &a_raw),
@@ -3449,7 +3466,7 @@ mod tests {
         assert!(report.unmatched_paths.is_empty());
 
         // The `lora_A`/`lora_B` twin must install the identical adapter.
-        let ab_path = tmp("diffusers_ab_twin.safetensors");
+        let ab_path = scratch_file(&tmp, "diffusers_ab_twin.safetensors");
         Array::save_safetensors(
             vec![
                 ("lin.lora_A.weight", &a_raw),
@@ -3509,6 +3526,7 @@ mod tests {
     /// PEFT twin. This is the sc-2618 gate at the core level (no model weights needed).
     #[test]
     fn kohya_equiv_to_peft_bit_exact() {
+        let tmp = tempfile::tempdir().unwrap();
         // out=4/in=3 and out=5/in=3, rank=2; alpha=4 (≠ rank → exercises the alpha/rank fold).
         let a_out = Array::from_slice(&[0.1f32, 0.2, 0.3, -0.1, -0.2, -0.3], &[2, 3]); // [r,in]
         let b_out = Array::from_slice(&[0.5f32, -0.5, 0.25, 0.75, 0.1, 0.2, -0.3, 0.4], &[4, 2]); // [out,r]
@@ -3519,7 +3537,7 @@ mod tests {
         );
         let alpha = Array::from_slice(&[4.0f32], &[1]);
 
-        let kohya_path = tmp("equiv_kohya.safetensors");
+        let kohya_path = scratch_file(&tmp, "equiv_kohya.safetensors");
         Array::save_safetensors(
             vec![
                 ("lora_unet_blocks_0_attn_to_out_0.lora_down.weight", &a_out),
@@ -3534,7 +3552,7 @@ mod tests {
         )
         .unwrap();
 
-        let peft_path = tmp("equiv_peft.safetensors");
+        let peft_path = scratch_file(&tmp, "equiv_peft.safetensors");
         Array::save_safetensors(
             vec![
                 ("transformer.blocks.0.attn.to_out.0.lora_A.weight", &a_out),
@@ -3636,9 +3654,10 @@ mod tests {
     /// surfaced in `unmatched_paths` and fails the strict policy — loud, never silently dropped.
     #[test]
     fn kohya_offsurface_stem_surfaced_and_strict_errors() {
+        let tmp = tempfile::tempdir().unwrap();
         let a = Array::from_slice(&[0.1f32, 0.2, 0.3, -0.1, -0.2, -0.3], &[2, 3]);
         let b = Array::from_slice(&[0.5f32, -0.5, 0.25, 0.75, 0.1, 0.2, -0.3, 0.4], &[4, 2]);
-        let path = tmp("kohya_offsurface.safetensors");
+        let path = scratch_file(&tmp, "kohya_offsurface.safetensors");
         Array::save_safetensors(
             vec![
                 (
@@ -3682,9 +3701,10 @@ mod tests {
     /// detects the format.
     #[test]
     fn kohya_scale_zero_is_bit_exact_noop() {
+        let tmp = tempfile::tempdir().unwrap();
         let a = Array::from_slice(&[0.1f32, 0.2, 0.3, -0.1, -0.2, -0.3], &[2, 3]);
         let b = Array::from_slice(&[0.5f32, -0.5, 0.25, 0.75, 0.1, 0.2, -0.3, 0.4], &[4, 2]);
-        let path = tmp("kohya_scale0.safetensors");
+        let path = scratch_file(&tmp, "kohya_scale0.safetensors");
         Array::save_safetensors(
             vec![
                 ("lora_unet_blocks_0_attn_to_out_0.lora_down.weight", &a),
@@ -3797,6 +3817,7 @@ mod tests {
     /// per-head `[inner, r]`; the down `[r, in]` (rank not ÷3) is shared. No model weights needed.
     #[test]
     fn bfl_fused_qkv_equals_diffusers_split() {
+        let tmp = tempfile::tempdir().unwrap();
         let (inner, inp, r) = (4i32, 3i32, 2i32);
         // Per-head up factors, then the fused up = their dim-0 concat (row-major, so flat concat).
         let bq: Vec<f32> = (0..inner * r)
@@ -3829,7 +3850,7 @@ mod tests {
         let up_key = "lora_unet_double_blocks_0_img_attn_qkv.lora_up.weight";
         let down_key = "lora_unet_double_blocks_0_img_attn_qkv.lora_down.weight";
         let alpha_key = "lora_unet_double_blocks_0_img_attn_qkv.alpha";
-        let bfl_path = tmp("bfl_qkv.safetensors");
+        let bfl_path = scratch_file(&tmp, "bfl_qkv.safetensors");
         Array::save_safetensors(
             vec![(up_key, &b_fused), (down_key, &a), (alpha_key, &alpha)],
             None as Option<&HashMap<String, String>>,
@@ -3858,7 +3879,7 @@ mod tests {
         assert!(rep.unmatched_paths.is_empty());
 
         // Equivalent diffusers split-target file: per-head up, SHARED down, same alpha.
-        let peft_path = tmp("bfl_split_peft.safetensors");
+        let peft_path = scratch_file(&tmp, "bfl_split_peft.safetensors");
         Array::save_safetensors(
             vec![
                 ("transformer.blk.attn.to_q.lora_B.weight", &b_q),
@@ -3899,6 +3920,7 @@ mod tests {
     /// bundled text-encoder key is ignored; and a scale-0 BFL adapter is a bit-exact no-op.
     #[test]
     fn bfl_detection_unmatched_and_scale_zero() {
+        let tmp = tempfile::tempdir().unwrap();
         let up = Array::from_slice(
             &(0..8).map(|i| i as f32 * 0.01).collect::<Vec<_>>(),
             &[4, 2],
@@ -3913,7 +3935,7 @@ mod tests {
             down_slice: None,
         }];
 
-        let path = tmp("bfl_detect.safetensors");
+        let path = scratch_file(&tmp, "bfl_detect.safetensors");
         Array::save_safetensors(
             vec![
                 (
@@ -4131,6 +4153,7 @@ mod tests {
     /// delta at the wrong scale while reporting success.
     #[test]
     fn fixed_prefix_lokr_kind_routes_keys_only_file_to_thirdparty() {
+        let tmp = tempfile::tempdir().unwrap();
         // Keys-only LoKr (no `networkType` stamp): w1 full [2,2], w2 decomposed [2,r=2]·[2,2], and
         // a per-module alpha=1 over rank 2 ⇒ lycoris scale 0.5 — discriminating, because the peft
         // parse drops the `.alpha` tensor and defaults alpha=rank ⇒ scale 1.
@@ -4142,7 +4165,7 @@ mod tests {
         let w2_a = Array::from_slice(&[0.1f32, 0.2, 0.3, 0.4], &[2, 2]);
         let w2_b = Array::from_slice(&[0.4f32, 0.3, 0.2, 0.1], &[2, 2]);
         let alpha = Array::from_slice(&[1.0f32], &[1]);
-        let path = tmp("f012_keysonly_lokr.safetensors");
+        let path = scratch_file(&tmp, "f012_keysonly_lokr.safetensors");
         Array::save_safetensors(
             vec![
                 ("lin.lokr_w1", &w1),
@@ -4204,13 +4227,14 @@ mod tests {
     /// Save a tiny safetensors of `keys` (dummy `[1,1]` tensors — classification reads only
     /// keys/metadata) and load it back as `Weights`.
     fn classify_weights(
+        tmp: &tempfile::TempDir,
         name: &str,
         keys: &[&str],
         meta: Option<&HashMap<String, String>>,
     ) -> Weights {
         let dummy = Array::from_slice(&[1.0f32], &[1, 1]);
         let entries: Vec<(&str, &Array)> = keys.iter().map(|k| (*k, &dummy)).collect();
-        let path = tmp(name);
+        let path = scratch_file(tmp, name);
         Array::save_safetensors(entries, meta, &path).unwrap();
         Weights::from_file(&path).unwrap()
     }
@@ -4221,6 +4245,7 @@ mod tests {
     /// keys; a BFL-named LyCORIS file on a host without a BFL surface stays third-party).
     #[test]
     fn classify_adapter_format_per_format() {
+        let tmp = tempfile::tempdir().unwrap();
         let lokr_meta: HashMap<String, String> = [
             ("networkType".to_string(), "lokr".to_string()),
             ("alpha".to_string(), "1.0".to_string()),
@@ -4241,6 +4266,7 @@ mod tests {
 
         // Third-party LoKr: `lokr_*` keys, no stamp — regardless of the declared kind.
         let w = classify_weights(
+            &tmp,
             "cls_tp_lokr.safetensors",
             &["lin.lokr_w1", "lin.lokr_w2"],
             None,
@@ -4257,6 +4283,7 @@ mod tests {
         // Precedence: a kohya-flattened LoKr also carries `lora_unet_`, but LyCORIS keys win
         // (is_kohya would claim it and apply nothing).
         let w = classify_weights(
+            &tmp,
             "cls_tp_lokr_kohya.safetensors",
             &[
                 "lora_unet_blocks_0_attn_to_q.lokr_w1",
@@ -4271,6 +4298,7 @@ mod tests {
 
         // Third-party LoKr in BFL/ComfyUI fused naming — only on a host with a BFL surface.
         let w = classify_weights(
+            &tmp,
             "cls_tp_lokr_bfl.safetensors",
             &[&format!("{bfl_qkv}.lokr_w1"), &format!("{bfl_qkv}.lokr_w2")],
             None,
@@ -4287,6 +4315,7 @@ mod tests {
 
         // Third-party LoHa (`hada_*` keys) + its BFL twin.
         let w = classify_weights(
+            &tmp,
             "cls_tp_loha.safetensors",
             &[
                 "lin.hada_w1_a",
@@ -4301,6 +4330,7 @@ mod tests {
             AdapterFormat::ThirdpartyLoha
         );
         let w = classify_weights(
+            &tmp,
             "cls_tp_loha_bfl.safetensors",
             &[
                 &format!("{bfl_qkv}.hada_w1_a"),
@@ -4316,6 +4346,7 @@ mod tests {
         // BFL fused→split LoRA — detected before kohya despite sharing no `lora_unet_` here
         // (the `diffusion_model.` spelling), and before the PEFT fallback.
         let w = classify_weights(
+            &tmp,
             "cls_bfl_lora.safetensors",
             &[
                 &format!("{bfl_qkv}.lora_up.weight"),
@@ -4330,6 +4361,7 @@ mod tests {
 
         // kohya-flattened LoRA.
         let w = classify_weights(
+            &tmp,
             "cls_kohya.safetensors",
             &[
                 "lora_unet_blocks_0_attn_to_q.lora_down.weight",
@@ -4344,6 +4376,7 @@ mod tests {
 
         // peft LoKr: the `networkType=lokr` stamp gates the `lokr_*` keys off the third-party path.
         let w = classify_weights(
+            &tmp,
             "cls_peft_lokr.safetensors",
             &["lin.lokr_w1", "lin.lokr_w2"],
             Some(&lokr_meta),
@@ -4355,6 +4388,7 @@ mod tests {
 
         // peft LoKr in BFL/ComfyUI fused naming (sc-8345).
         let w = classify_weights(
+            &tmp,
             "cls_peft_lokr_bfl.safetensors",
             &[&format!("{bfl_qkv}.lokr_w1"), &format!("{bfl_qkv}.lokr_w2")],
             Some(&lokr_meta),
@@ -4366,6 +4400,7 @@ mod tests {
 
         // PEFT/diffusers LoRA — the common fallback.
         let w = classify_weights(
+            &tmp,
             "cls_peft_lora.safetensors",
             &[
                 "transformer.lin.lora_A.weight",
@@ -4380,6 +4415,7 @@ mod tests {
 
         // Declared `Lora` against `networkType=lokr` metadata — the caller error.
         let w = classify_weights(
+            &tmp,
             "cls_mismatch.safetensors",
             &["lin.lokr_w1", "lin.lokr_w2"],
             Some(&lokr_meta),
@@ -4409,7 +4445,7 @@ mod tests {
     /// A peft LoKr over `lin`: `w1 [8,8] ⊗ w2 [8,8] → ΔW [64,64]`, `alpha/rank = 8/4 = 2.0`.
     /// Factor entries are ±powers of two so `kron` and both scale multiplies stay exact in bf16 —
     /// any residual mismatch is then a real disagreement, not float noise.
-    fn pk_lokr_file(name: &str) -> Weights {
+    fn pk_lokr_file(tmp: &tempfile::TempDir, name: &str) -> Weights {
         let w1: Vec<f32> = (0..64)
             .map(|i| if i % 2 == 0 { 0.5 } else { -0.25 })
             .collect();
@@ -4420,7 +4456,7 @@ mod tests {
         meta.insert("networkType".to_string(), "lokr".to_string());
         meta.insert("rank".to_string(), "4".to_string());
         meta.insert("alpha".to_string(), "8.0".to_string());
-        let path = tmp(name);
+        let path = scratch_file(tmp, name);
         Array::save_safetensors(
             vec![
                 ("lin.lokr_w1", &Array::from_slice(&w1, &[8, 8])),
@@ -4465,7 +4501,8 @@ mod tests {
     /// other, so a scale threaded through the wrong path cannot coincidentally pass.
     #[test]
     fn lokr_on_packed_base_installs_structured_and_matches_dense() {
-        let w = pk_lokr_file("sc10578_packed_lokr.safetensors");
+        let tmp = tempfile::tempdir().unwrap();
+        let w = pk_lokr_file(&tmp, "sc10578_packed_lokr.safetensors");
         let x = pk_x();
         let strength = 2.5f32;
         let reference = pk_reference_residual(&w, &x, 2.0 * strength);
@@ -4532,7 +4569,8 @@ mod tests {
     /// exact silent mis-scale that distinction invites — confirm the assertion above would catch it.
     #[test]
     fn structured_lokr_residual_is_sensitive_to_the_strength_factor() {
-        let w = pk_lokr_file("sc10578_packed_lokr_mut.safetensors");
+        let tmp = tempfile::tempdir().unwrap();
+        let w = pk_lokr_file(&tmp, "sc10578_packed_lokr_mut.safetensors");
         let x = pk_x();
         let strength = 2.5f32;
         let reference = pk_reference_residual(&w, &x, 2.0 * strength);
@@ -4573,6 +4611,7 @@ mod tests {
     /// Whether a packed base should refuse a multi-GB delta is sc-10678.
     #[test]
     fn loha_on_packed_base_falls_back_to_materialization() {
+        let tmp = tempfile::tempdir().unwrap();
         let r = 4;
         let a: Vec<f32> = (0..(PK_OUT * r) as usize)
             .map(|i| (i % 5) as f32 * 0.1)
@@ -4584,7 +4623,7 @@ mod tests {
             Array::from_slice(&a, &[PK_OUT, r]),
             Array::from_slice(&b, &[r, PK_IN]),
         );
-        let path = tmp("sc10578_packed_loha.safetensors");
+        let path = scratch_file(&tmp, "sc10578_packed_loha.safetensors");
         Array::save_safetensors(
             vec![
                 ("lin.hada_w1_a", &wa),
@@ -4699,6 +4738,7 @@ mod tests {
     #[test]
     #[ignore = "mutates the process-global MLX memory limit; run alone"]
     fn loha_on_packed_over_budget_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
         let r = 4;
         let a: Vec<f32> = (0..(PK_OUT * r) as usize)
             .map(|i| (i % 5) as f32 * 0.1)
@@ -4710,7 +4750,7 @@ mod tests {
             Array::from_slice(&a, &[PK_OUT, r]),
             Array::from_slice(&b, &[r, PK_IN]),
         );
-        let path = tmp("sc10678_over_budget_loha.safetensors");
+        let path = scratch_file(&tmp, "sc10678_over_budget_loha.safetensors");
         Array::save_safetensors(
             vec![
                 ("lin.hada_w1_a", &wa),
@@ -4756,11 +4796,12 @@ mod tests {
     /// behave IDENTICALLY: sc-10578 introduced no new failure mode for non-deferrable modules.
     #[test]
     fn tucker_lokr_on_packed_base_matches_dense_behavior() {
+        let tmp = tempfile::tempdir().unwrap();
         let t2 = Array::from_slice(&[0.1f32; 2 * 2 * 3 * 3], &[2, 2, 3, 3]);
         let w2a = Array::from_slice(&[0.2f32; 2 * 8], &[2, 8]);
         let w2b = Array::from_slice(&[0.3f32; 2 * 8], &[2, 8]);
         let w1 = Array::from_slice(&[0.4f32; 8 * 8], &[8, 8]);
-        let path = tmp("sc10578_packed_tucker_lokr.safetensors");
+        let path = scratch_file(&tmp, "sc10578_packed_tucker_lokr.safetensors");
         Array::save_safetensors(
             vec![
                 ("lin.lokr_w1", &w1),
@@ -4802,7 +4843,7 @@ mod tests {
     }
 
     /// Write a third-party LoHa file targeting `lin` at `[PK_OUT, PK_IN]` (rank 4).
-    fn write_loha_lin(name: &str) -> Weights {
+    fn write_loha_lin(tmp: &tempfile::TempDir, name: &str) -> Weights {
         let r = 4;
         let a: Vec<f32> = (0..(PK_OUT * r) as usize)
             .map(|i| (i % 5) as f32 * 0.1)
@@ -4814,7 +4855,7 @@ mod tests {
             Array::from_slice(&a, &[PK_OUT, r]),
             Array::from_slice(&b, &[r, PK_IN]),
         );
-        let path = tmp(name);
+        let path = scratch_file(tmp, name);
         Array::save_safetensors(
             vec![
                 ("lin.hada_w1_a", &wa),
@@ -4832,11 +4873,12 @@ mod tests {
     #[test]
     #[ignore = "mutates the process-global MLX memory limit; run alone"]
     fn dense_base_loha_over_budget_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
         // F-011 (sc-11129): a DENSE-base LoHa materializes the same `[out,in]` bf16 delta as a stacked
         // residual, so it must be included in the sc-10678 budget projection — the OOM the packed guard
         // prevents is reachable on the dense tier too. Before the fix a dense group added 0 to the
         // projection and this install went through unchecked.
-        let w = write_loha_lin("f011_dense_over_budget_loha.safetensors");
+        let w = write_loha_lin(&tmp, "f011_dense_over_budget_loha.safetensors");
         let mut dense = OneLinear {
             lin: AdaptableLinear::dense(pk_base_weight(), None),
         };
@@ -4852,9 +4894,10 @@ mod tests {
 
     #[test]
     fn dense_base_loha_within_budget_still_installs() {
+        let tmp = tempfile::tempdir().unwrap();
         // F-011 regression: counting the dense materialization must only refuse GENUINELY over-budget
         // runs — a LoHa that fits still installs on the dense base (the default, unlimited-limit path).
-        let w = write_loha_lin("f011_dense_ok_loha.safetensors");
+        let w = write_loha_lin(&tmp, "f011_dense_ok_loha.safetensors");
         let mut dense = OneLinear {
             lin: AdaptableLinear::dense(pk_base_weight(), None),
         };
@@ -4867,6 +4910,7 @@ mod tests {
 
     #[test]
     fn lycoris_pass2_resolution_miss_is_surfaced_not_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
         // F-012 (sc-11129): if a module resolves in pass 1 but vanishes by pass 2 (a lazy/offloaded
         // host, epic 10834), the plan must be SURFACED in `unmatched_paths`, never silently dropped —
         // honoring `install_lycoris_groups`'s contract. Modeled with a host whose `adaptable_mut`
@@ -4888,7 +4932,7 @@ mod tests {
                 }
             }
         }
-        let w = pk_lokr_file("f012_vanishing_lokr.safetensors");
+        let w = pk_lokr_file(&tmp, "f012_vanishing_lokr.safetensors");
         let mut host = VanishingHost {
             lin: AdaptableLinear::dense(pk_base_weight(), None),
             calls: 0,
@@ -5006,13 +5050,14 @@ mod tests {
 
     #[test]
     fn bfl_lora_conflicting_alpha_errors() {
+        let tmp = tempfile::tempdir().unwrap();
         // F-014 (sc-11129): two `.alpha` spellings mapping to one BFL target must be a hard conflict
         // error (mirroring `apply_lora_peft`), not a nondeterministic HashMap-order last-wins scale.
         let a = Array::from_slice(&[0.1f32, 0.2, 0.3], &[1, 3]);
         let b = Array::from_slice(&[0.4f32, 0.5], &[2, 1]);
         let alpha4 = Array::from_slice(&[4.0f32], &[1]);
         let alpha8 = Array::from_slice(&[8.0f32], &[1]);
-        let path = tmp("f014_bfl_alpha_conflict.safetensors");
+        let path = scratch_file(&tmp, "f014_bfl_alpha_conflict.safetensors");
         Array::save_safetensors(
             vec![
                 ("diffusion_model.m.lora_A.weight", &a),
@@ -5067,15 +5112,17 @@ mod tests {
         }
     }
 
-    fn save_one(name: &str, entries: Vec<(&str, &Array)>) -> PathBuf {
-        let path = tmp(name);
+    fn save_one(tmp: &tempfile::TempDir, name: &str, entries: Vec<(&str, &Array)>) -> PathBuf {
+        let path = scratch_file(tmp, name);
         Array::save_safetensors(entries, None, &path).unwrap();
         path
     }
 
     #[test]
     fn has_diff_patch_keys_detects_diff_and_diff_b() {
+        let tmp = tempfile::tempdir().unwrap();
         let dp = save_one(
+            &tmp,
             "dp_detect.safetensors",
             vec![(
                 "diffusion_model.txtfusion.projector.diff",
@@ -5086,6 +5133,7 @@ mod tests {
 
         // A plain low-rank file carries no `.diff`/`.diff_b` → not a diff-patch file.
         let plain = save_one(
+            &tmp,
             "dp_plain.safetensors",
             vec![
                 (
@@ -5124,9 +5172,11 @@ mod tests {
     /// alias. Untargeted state stays put.
     #[test]
     fn fold_diff_patch_folds_projector_weight_delta() {
+        let tmp = tempfile::tempdir().unwrap();
         let base_w = Array::from_slice(&[1.0f32, 2.0, 3.0], &[1, 3]);
         let delta = Array::from_slice(&[10.0f32, 20.0, 30.0], &[1, 3]);
         let dp = save_one(
+            &tmp,
             "dp_proj.safetensors",
             vec![("diffusion_model.txtfusion.projector.diff", &delta)],
         );
@@ -5153,9 +5203,11 @@ mod tests {
     /// low-rank adapters cannot express. Both fold at `scale`, counted as two.
     #[test]
     fn fold_diff_patch_folds_weight_and_bias_delta() {
+        let tmp = tempfile::tempdir().unwrap();
         let dw = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]);
         let db = Array::from_slice(&[5.0f32, 6.0], &[2]);
         let dp = save_one(
+            &tmp,
             "dp_wb.safetensors",
             vec![
                 ("diffusion_model.txtfusion.projector.diff", &dw),
@@ -5184,9 +5236,11 @@ mod tests {
     /// its coupled `.diff_b` dropped too, never a half-patch — surfaced, never folded; base untouched.
     #[test]
     fn fold_diff_patch_shape_mismatch_skips_whole_module() {
+        let tmp = tempfile::tempdir().unwrap();
         let base_w = Array::from_slice(&[0.0f32; 4], &[2, 2]);
         let base_b = Array::from_slice(&[0.0f32; 2], &[2]);
         let dp = save_one(
+            &tmp,
             "dp_mm.safetensors",
             vec![
                 // [3,3] cannot fold into the [2,2] base; its coupled [2] bias must drop with it.
@@ -5229,8 +5283,10 @@ mod tests {
     /// file resolves to no module at all (folds nothing AND matches no low-rank target).
     #[test]
     fn strict_with_diff_patch_tolerates_diff_only_and_errors_on_all_unmatched() {
+        let tmp = tempfile::tempdir().unwrap();
         // (a) diff-only, targets the projector → folds; applied counts the fold.
         let ok = save_one(
+            &tmp,
             "dp_only.safetensors",
             vec![(
                 "diffusion_model.txtfusion.projector.diff",
@@ -5253,6 +5309,7 @@ mod tests {
 
         // (b) diff-patch stem resolves to no module → folds nothing, no low-rank target → error.
         let bad = save_one(
+            &tmp,
             "dp_bad.safetensors",
             vec![(
                 "diffusion_model.blocks.99.unknown.diff",
@@ -5336,8 +5393,10 @@ mod tests {
     /// values.
     #[test]
     fn diff_patch_bias_delta_folds_identically_on_a_packed_and_a_dense_base() {
+        let tmp = tempfile::tempdir().unwrap();
         let db = Array::from_slice(&(0..64).map(|i| i as f32).collect::<Vec<_>>(), &[64]);
         let dp = save_one(
+            &tmp,
             "dp_tier_bias.safetensors",
             vec![("diffusion_model.blocks.0.self_attn.q.diff_b", &db)],
         );
@@ -5389,9 +5448,11 @@ mod tests {
     /// practice.
     #[test]
     fn diff_patch_weight_delta_on_a_packed_linear_skips_the_whole_module() {
+        let tmp = tempfile::tempdir().unwrap();
         let dw = Array::from_slice(&[0.5f32; 64 * 64], &[64, 64]);
         let db = Array::from_slice(&[7.0f32; 64], &[64]);
         let dp = save_one(
+            &tmp,
             "dp_tier_weight.safetensors",
             vec![
                 ("diffusion_model.blocks.0.self_attn.q.diff", &dw),
@@ -5427,10 +5488,12 @@ mod tests {
     /// any surface width and were dropped without a word before this existed.
     #[test]
     fn diff_patch_norm_deltas_fold_through_the_param_surface() {
+        let tmp = tempfile::tempdir().unwrap();
         let d_nq = Array::from_slice(&[0.5f32; 8], &[8]);
         let d_n3w = Array::from_slice(&[2.0f32; 8], &[8]);
         let d_n3b = Array::from_slice(&[3.0f32; 8], &[8]);
         let dp = save_one(
+            &tmp,
             "dp_norms.safetensors",
             vec![
                 ("diffusion_model.blocks.0.self_attn.norm_q.diff", &d_nq),
@@ -5465,7 +5528,9 @@ mod tests {
     /// neither half is reported unmatched rather than dropped.
     #[test]
     fn diff_patch_norm_shape_mismatch_skips_whole_module_and_unknown_is_unmatched() {
+        let tmp = tempfile::tempdir().unwrap();
         let dp = save_one(
+            &tmp,
             "dp_norm_bad.safetensors",
             vec![
                 // [4] cannot fold into the [8] norm3; its coupled [8] bias must drop with it.
@@ -5516,7 +5581,9 @@ mod tests {
     /// skips the whole module — that split is the point, and the sibling test above pins the other half.
     #[test]
     fn diff_patch_norm_bias_with_no_host_part_does_not_undo_the_weight_fold() {
+        let tmp = tempfile::tempdir().unwrap();
         let dp = save_one(
+            &tmp,
             "dp_norm_qk_bias.safetensors",
             vec![
                 (
@@ -5570,9 +5637,11 @@ mod tests {
     /// skipping the residual outright rather than trusting the multiply.
     #[test]
     fn diff_patch_at_scale_zero_writes_nothing_and_still_clears_the_zero_match_guard() {
+        let tmp = tempfile::tempdir().unwrap();
         let mut nq_delta = [0.5f32; 8];
         nq_delta[3] = f32::INFINITY;
         let dp = save_one(
+            &tmp,
             "dp_scale_zero.safetensors",
             vec![
                 (
@@ -5638,9 +5707,11 @@ mod tests {
     /// line nobody reads. A clean file leaves the list empty.
     #[test]
     fn strict_with_diff_patch_reports_every_unapplied_delta_on_the_report() {
+        let tmp = tempfile::tempdir().unwrap();
         // A file that lands its norm delta but cannot land a packed-Linear weight delta or an
         // out-of-surface stem.
         let mixed = save_one(
+            &tmp,
             "dp_report.safetensors",
             vec![
                 (
@@ -5680,6 +5751,7 @@ mod tests {
         // A file whose every delta lands reports NOTHING unapplied — the list is a real signal, not
         // noise present on every render.
         let clean = save_one(
+            &tmp,
             "dp_report_clean.safetensors",
             vec![(
                 "diffusion_model.blocks.0.norm3.diff",

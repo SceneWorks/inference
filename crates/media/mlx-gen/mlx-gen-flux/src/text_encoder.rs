@@ -314,6 +314,100 @@ pub struct T5TextEncoder {
     shared: TokenEmbedding,
     blocks: Vec<T5Block>,
     final_ln_w: Array,
+    /// Ladder rung 4, `TransformerComponent::TextEncoder` scope (SC-15520). `None` on every ordinary
+    /// load, which keeps the resident path byte-for-byte unchanged.
+    block_stream: Option<T5BlockStream>,
+}
+
+/// T5-XXL's encoder depth. Fixed by the architecture, and the same number
+/// [`T5TextEncoder::from_weights_with_group_size`] loads.
+pub const T5_BLOCKS: usize = 24;
+
+/// A reopenable description of a T5 encoder's 24 blocks, for rung 4's **text-encoder** scope.
+///
+/// ## Why this exists, given that it did not win where it was first measured
+///
+/// Chroma1 (SC-15520) is the first family to reach for this, and the honest record is that the
+/// scope it enables **lost** its own measurement. On Chroma1-Base q4 at 1024², the T5-XXL encoder is
+/// the largest single component by a wide margin (dense bf16, a 10.15 GiB conditioning phase against
+/// a 7.14 GiB packed DiT), which makes a text-encoder window look obviously right — and it is not:
+///
+/// | rung-4 scope | request peak | vs control |
+/// |---|---:|---:|
+/// | control (no window) | 19.2065 GiB | — |
+/// | `TextEncoder` | 19.2065 GiB | **−0.00%** |
+/// | `Dit` | 14.6932 GiB | −23.50% |
+///
+/// (The first two rows previously read 19.2071 GiB, which is `chroma1_hd`'s staged peak rather than
+/// the Base one this table is labelled with. Re-taken on Base: 19.2065 GiB. The percentages and the
+/// `Dit` row are unchanged — sc-15520 review round 2.)
+///
+/// Ladder rung 1 already sheds the encoder before the heavy phase loads, so the request peak *is*
+/// the heavy phase, and bounding a phase that is not the binding one is not a saving. Chroma
+/// therefore publishes `TransformerComponent::Dit` as its default.
+///
+/// It is kept, rather than deleted with its measurement, for two reasons that are about the shape of
+/// the evidence rather than about this number. The scope is genuinely implemented, tested and
+/// output-preserving on a real encoder — which is the expensive part — and which phase binds is a
+/// property of the tier's packing rather than of the architecture: sc-16462 packs Chroma's T5/VAE
+/// auxiliaries, and a family whose decode is bounded (Kolors, SC-15521, whose ChatGLM3-6B encoder
+/// made conditioning peak-bearing) reaches the opposite verdict on the same arithmetic. A future
+/// caller inherits a working mechanism and takes its own measurement; what it must not inherit is
+/// the conclusion.
+#[derive(Clone)]
+pub struct T5BlockStream {
+    /// The reopenable `text_encoder/` component — never the caller's snapshot root.
+    source: mlx_gen::WeightsSource,
+    prefix: String,
+    group_size: i32,
+    n_blocks: usize,
+}
+
+impl T5BlockStream {
+    pub fn new(source: mlx_gen::WeightsSource, prefix: &str, group_size: i32) -> Result<Self> {
+        validate_t5_group_size(group_size)?;
+        Ok(Self {
+            source,
+            prefix: prefix.to_owned(),
+            group_size,
+            n_blocks: T5_BLOCKS,
+        })
+    }
+
+    pub fn n_blocks(&self) -> usize {
+        self.n_blocks
+    }
+
+    /// Open a fresh lazy view of the encoder component. Called once per window.
+    fn open(&self) -> Result<Weights> {
+        match &self.source {
+            mlx_gen::WeightsSource::Dir(dir) => Weights::from_dir(dir),
+            mlx_gen::WeightsSource::File(file) => Weights::from_file(file),
+        }
+    }
+
+    fn materialize(&self, view: &mut Weights, index: usize) -> Result<T5Block> {
+        if index >= self.n_blocks {
+            return Err(Error::Msg(format!(
+                "t5 block stream: block {index} is outside the {}-block encoder",
+                self.n_blocks
+            )));
+        }
+        let prefix = join(&self.prefix, &format!("encoder.block.{index}"));
+        let block = T5Block::from_weights(view, &prefix, self.group_size)?;
+        // The shared drain: `Array` is refcounted and the constructor cloned out of the view, so
+        // draining exactly the accessed keys is what lets the window's drop release them.
+        //
+        // **Not measured on this stream.** The sibling DiT stream in `mlx-gen-chroma` measured its
+        // own two drains INERT on the request peak (removing both left the sweep unchanged), because
+        // a fresh view is opened per window there so the view's references die at the window
+        // boundary regardless. The same structure holds here, so the same inertness is *expected* —
+        // but expected is not measured, and the only rung-4 scope Chroma publishes is `Dit`, so no
+        // run has exercised this path's peak. It is kept as the shared contract's discipline and
+        // deliberately **not** described as load-bearing on a sibling's evidence (SC-15520).
+        view.remove_accessed();
+        Ok(block)
+    }
 }
 
 /// T5's relative-attention-bias table has logical width 64, so group 128 — valid for MLX affine
@@ -344,8 +438,8 @@ impl T5TextEncoder {
     ) -> Result<Self> {
         validate_t5_group_size(group_size)?;
         let p = |suffix: &str| join(prefix, suffix);
-        let mut blocks = Vec::with_capacity(24);
-        for i in 0..24 {
+        let mut blocks = Vec::with_capacity(T5_BLOCKS);
+        for i in 0..T5_BLOCKS {
             blocks.push(T5Block::from_weights(
                 w,
                 &p(&format!("encoder.block.{i}")),
@@ -356,7 +450,40 @@ impl T5TextEncoder {
             shared: TokenEmbedding::from_weights(w, &p("shared"), group_size)?,
             blocks,
             final_ln_w: w.require(&p("encoder.final_layer_norm.weight"))?.clone(),
+            block_stream: None,
         })
+    }
+
+    /// Arm snapshot-backed reconstruction of the 24 encoder blocks (rung 4, text-encoder scope), then
+    /// evict the resident stack. The token embedding and the final layer norm remain resident: they
+    /// are not block weights and run once per prompt.
+    ///
+    /// Must be called **after** any load-time quantization, so a streamed block is rebuilt from the
+    /// same on-disk state the resident block ended in. A dense source the caller intends to
+    /// `quantize` in place is therefore not streamable — the window would re-pack every
+    /// materialization, which is a host-format conversion rather than the device-format transfer the
+    /// contract declares.
+    pub fn with_block_stream(mut self, stream: T5BlockStream) -> Result<Self> {
+        if stream.n_blocks() != self.blocks.len() {
+            return Err(Error::Msg(format!(
+                "t5 block stream: declared {} blocks against a {}-block encoder",
+                stream.n_blocks(),
+                self.blocks.len()
+            )));
+        }
+        self.blocks.clear();
+        self.block_stream = Some(stream);
+        Ok(self)
+    }
+
+    /// `true` once [`Self::with_block_stream`] has armed the encoder.
+    pub fn is_streamable(&self) -> bool {
+        self.block_stream.is_some()
+    }
+
+    /// Resident block count — `0` once a stream is armed.
+    pub fn resident_block_count(&self) -> usize {
+        self.blocks.len()
     }
 
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
@@ -367,6 +494,19 @@ impl T5TextEncoder {
     /// what the offline converter writes at the same `(bits, group_size)`.
     pub fn quantize_with_group_size(&mut self, bits: i32, group_size: i32) -> Result<()> {
         validate_t5_group_size(group_size)?;
+        // Quantizing AFTER the block stream is armed would pack the token embedding and silently
+        // skip all 24 blocks — the stack is empty, so the loop below is a no-op and the streamed
+        // blocks would be rebuilt dense from a snapshot the caller believes it quantized. The
+        // production order (quantize, then arm) is correct; this refuses the inverted one rather
+        // than documenting it (SC-15520).
+        if self.is_streamable() && self.blocks.is_empty() {
+            return Err(Error::Unsupported(
+                "t5: cannot quantize after the encoder block stream is armed — the resident stack \
+                 is evicted, so the block linears would be silently skipped. Quantize first, then \
+                 call with_block_stream"
+                    .to_owned(),
+            ));
+        }
         self.shared.quantize_with_group_size(bits, group_size)?;
         for block in &mut self.blocks {
             block.quantize(bits, group_size)?;
@@ -384,16 +524,92 @@ impl T5TextEncoder {
     /// keys). Chroma (epic 3531) runs T5 with the tokenizer padding mask — unlike FLUX, which runs T5
     /// unmasked. `mask = None` is **byte-identical** to [`forward`](Self::forward).
     pub fn forward_masked(&self, tokens: &Array, mask: Option<&Array>) -> Result<Array> {
-        let mut hidden = self.shared.forward(tokens)?;
-        // The relative-position bias depends only on seq_len and is identical across all blocks (only
-        // block 0 carries the table; every other block clones it), so compute it once here and share
-        // it instead of rebuilding the O(L²) gather inside each of the 24 blocks (F-099).
-        if let Some(block0) = self.blocks.first() {
-            let bias = block0.attn.position_bias(hidden.shape()[1])?;
-            for block in &self.blocks {
-                hidden = block.forward(&hidden, mask, &bias)?;
+        self.forward_masked_windowed(tokens, mask, None, &mlx_gen::CancelFlag::new())
+    }
+
+    /// [`Self::forward_masked`] with an optional rung-4 block window (SC-15520).
+    ///
+    /// `window = None` is byte-for-byte the historical resident path. `Some(size)` requires an armed
+    /// [`T5BlockStream`] and runs the 24 blocks through the shared
+    /// [`mlx_gen::block_residency::run_windowed`] driver, holding `size` blocks materialized at a
+    /// time.
+    pub fn forward_masked_windowed(
+        &self,
+        tokens: &Array,
+        mask: Option<&Array>,
+        window: Option<usize>,
+        cancel: &mlx_gen::CancelFlag,
+    ) -> Result<Array> {
+        let hidden = self.shared.forward(tokens)?;
+        let seq_len = hidden.shape()[1];
+        let hidden = match window {
+            None => {
+                if self.block_stream.is_some() && self.blocks.is_empty() {
+                    return Err(Error::Unsupported(
+                        "t5: a deferred encoder requires an explicit block window".to_owned(),
+                    ));
+                }
+                let mut hidden = hidden;
+                // The relative-position bias depends only on seq_len and is identical across all
+                // blocks (only block 0 carries the table; every other block clones it), so compute it
+                // once here and share it instead of rebuilding the O(L²) gather inside each of the 24
+                // blocks (F-099).
+                if let Some(block0) = self.blocks.first() {
+                    let bias = block0.attn.position_bias(seq_len)?;
+                    for block in &self.blocks {
+                        hidden = block.forward(&hidden, mask, &bias)?;
+                    }
+                }
+                hidden
             }
-        }
+            Some(size) => {
+                let stream = self.block_stream.as_ref().ok_or_else(|| {
+                    Error::Unsupported(
+                        "t5: a bounded encoder window needs a snapshot-backed block stream"
+                            .to_owned(),
+                    )
+                })?;
+                if !self.blocks.is_empty() {
+                    return Err(Error::Msg(
+                        "t5: a windowed encode ran against a stack that still holds resident blocks \
+                         — the bound would not hold"
+                            .to_owned(),
+                    ));
+                }
+                // The position bias lives on block 0 only. Materialize that block alone, force the
+                // bias, and drop it: leaving the bias as a lazy node would keep block 0's weights
+                // referenced for the whole encode and the window would bound nothing.
+                let bias = {
+                    let mut view = stream.open()?;
+                    let block0 = stream.materialize(&mut view, 0)?;
+                    let bias = block0.attn.position_bias(seq_len)?;
+                    mlx_rs::transforms::eval([&bias])?;
+                    drop(block0);
+                    drop(view);
+                    mlx_rs::memory::clear_cache();
+                    bias
+                };
+                let plan = mlx_gen::block_residency::BlockPlan::new(stream.n_blocks(), size)?;
+                mlx_gen::block_residency::run_windowed(
+                    &plan,
+                    cancel,
+                    hidden,
+                    || stream.open(),
+                    |mut hidden, view, range| {
+                        for i in range {
+                            let block = stream.materialize(view, i)?;
+                            hidden = block.forward(&hidden, mask, &bias).map_err(|error| {
+                                Error::Msg(format!("t5 block stream: block {i} forward: {error}"))
+                            })?;
+                        }
+                        Ok(hidden)
+                    },
+                    // LOAD-BEARING: MLX is lazy, so the carried activation still references the
+                    // window's weights until it is forced.
+                    |hidden: &Array| mlx_rs::transforms::eval([hidden]).map_err(Into::into),
+                )?
+            }
+        };
         t5_rms_norm(&hidden, &self.final_ln_w, 1e-6)
     }
 }
@@ -611,6 +827,56 @@ fn relative_position_bucket(relative_position: i32) -> i32 {
 
 #[cfg(test)]
 mod tests {
+
+    /// **`quantize` after the encoder block stream is armed must refuse** (SC-15520, review of
+    /// PR #496).
+    ///
+    /// After arming, `blocks` is empty: the loop in `quantize_with_group_size` iterates nothing, so
+    /// the method would pack the token embedding, return `Ok(())`, and leave all 24 streamed blocks
+    /// to be rebuilt dense from a snapshot the caller believes it quantized.
+    #[test]
+    fn quantizing_after_the_encoder_stream_is_armed_is_refused() {
+        use mlx_gen::WeightsSource;
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
+        let stream =
+            T5BlockStream::new(WeightsSource::Dir(dir.clone()), "", GROUP_SIZE).expect("stream");
+        assert_eq!(stream.n_blocks(), T5_BLOCKS);
+
+        // A hand-built encoder with the right block count and no weights: `with_block_stream` only
+        // checks the declared depth against the resident stack, so this exercises the ordering guard
+        // without a 9 GiB checkpoint.
+        let mut encoder = T5TextEncoder {
+            shared: TokenEmbedding::Dense(Array::from_slice(&[1.0f32], &[1, 1])),
+            blocks: Vec::new(),
+            final_ln_w: Array::from_slice(&[1.0f32], &[1]),
+            block_stream: None,
+        };
+        // Unarmed: the guard does not fire (the discriminating control — without it the assertion
+        // below would pass on a `quantize` that always errored).
+        let unarmed = encoder
+            .quantize_with_group_size(8, GROUP_SIZE)
+            .err()
+            .map(|e| e.to_string());
+        assert!(
+            !unarmed
+                .as_deref()
+                .is_some_and(|e| e.contains("after the encoder block stream is armed")),
+            "an unarmed encoder must not hit the ordering guard, got: {unarmed:?}"
+        );
+
+        encoder.block_stream = Some(stream);
+        assert!(encoder.is_streamable());
+        assert_eq!(encoder.resident_block_count(), 0);
+        let error = match encoder.quantize_with_group_size(8, GROUP_SIZE) {
+            Ok(()) => panic!("quantize after arming packed no blocks and reported success"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("after the encoder block stream is armed"),
+            "the refusal must name the ordering, got: {error}"
+        );
+    }
     use super::*;
 
     #[test]

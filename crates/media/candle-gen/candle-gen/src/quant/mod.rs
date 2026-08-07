@@ -1239,10 +1239,8 @@ mod tests {
             Tensor::from_vec(grid, (vocab, hidden), &dev)?,
         );
 
-        let tmp = std::env::temp_dir().join(format!(
-            "sc9086_emb_dtype_{}.safetensors",
-            std::process::id()
-        ));
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let tmp = tmp_guard.path().join("sc9086_emb_dtype.safetensors");
         candle_core::safetensors::save(&map, &tmp)?;
         // SAFETY: we just wrote this file and nothing else touches it during the test.
         let st = unsafe { MmapedSafetensors::new(&tmp)? };
@@ -1266,7 +1264,6 @@ mod tests {
             "packed embedding forward dtype must match the dense path (dtype parity)"
         );
 
-        std::fs::remove_file(&tmp).ok();
         Ok(())
     }
 
@@ -1513,6 +1510,7 @@ mod tests {
     /// in-memory safetensors so no weights are needed.
     #[test]
     fn lin_and_embedding_packed_detect() -> Result<()> {
+        let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (64, 128);
         let (wq, s, b, _grid) = q4_fixture(out_dim, in_dim);
@@ -1526,8 +1524,7 @@ mod tests {
             Tensor::randn(0f32, 1f32, (out_dim, in_dim), &dev)?,
         );
 
-        let tmp =
-            std::env::temp_dir().join(format!("sc9086_detect_{}.safetensors", std::process::id()));
+        let tmp = tmp.path().join("sc9086_detect.safetensors");
         candle_core::safetensors::save(&map, &tmp)?;
         // SAFETY: we just wrote this file and nothing else touches it during the test.
         let st = unsafe { MmapedSafetensors::new(&tmp)? };
@@ -1541,7 +1538,6 @@ mod tests {
         let emb = embedding(&vb, "proj", out_dim, in_dim)?;
         assert!(emb.is_quantized(), "`.scales` present ⇒ packed embedding");
 
-        std::fs::remove_file(&tmp).ok();
         Ok(())
     }
 

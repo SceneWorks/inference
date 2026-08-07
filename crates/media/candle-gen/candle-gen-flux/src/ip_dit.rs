@@ -59,7 +59,9 @@ fn layer_norm(dim: usize, vb: VarBuilder) -> Result<LayerNorm> {
 /// [`candle_gen::sdpa_budgeted_flat`] (sc-9570) — which chunks once the `[N,Sq,Sk]` scores tensor would
 /// exceed [`candle_gen::ATTN_SCORES_BUDGET`] (the candle CUDA i32-index limit) — then reshapes back.
 /// scale = `1/sqrt(head_dim)`, `softmax_last_dim` closure keeps the exact fused softmax; each query row's
-/// softmax is independent, so the chunked result is byte-identical to the single pass. The FLUX.1 joint
+/// softmax is independent, so the chunked result is *mathematically* equal to the single pass — not
+/// bitwise equal, since narrowing the query axis changes the GEMM `M` and so may change the f32
+/// accumulation order (SC-15943). The FLUX.1 joint
 /// `[txt, img]` sequence at the largest advertised sizes trips the guard; the common sizes stay a single
 /// un-chunked pass. The vendored upstream SDPA is otherwise unchanged.
 pub(crate) fn scaled_dot_product_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {

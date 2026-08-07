@@ -151,23 +151,30 @@ pub const REGISTRATION: core_llm::SnapshotPreparerRegistration =
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_fixture::{
+        assert_fixture_is_a_guarded_entry, assert_fixture_is_self_removing, Fixture,
+    };
     use mlx_rs::Array;
     use serde_json::json;
 
-    fn unique_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "mlx-llm-prepare-{label}-{}-{:?}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// An existing, guarded fixture root for the *source* side (sc-17768). Uniqueness now comes
+    /// from the call — `tempfile` mints a fresh name per invocation — rather than from a PID plus a
+    /// clock stamp, and the tree leaves on `Drop` instead of on the trailing `remove_dir_all` lines,
+    /// which never ran out of a panicking test.
+    fn unique_dir(label: &str) -> Fixture {
+        let fixture = Fixture::new(&format!("mlx-llm-prepare-{label}-"), None);
+        std::fs::create_dir_all(&fixture).unwrap();
+        fixture
     }
 
-    fn write_hf_dir(dir: &Path) {
+    /// A guarded path that does *not* exist yet — for the `out_dir` side, which the preparer either
+    /// creates itself or (on a passthrough) must deliberately leave absent.
+    fn unique_out(label: &str) -> Fixture {
+        Fixture::new(&format!("mlx-llm-prepare-{label}-"), Some("out"))
+    }
+
+    fn write_hf_dir(dir: impl AsRef<Path>) {
+        let dir = dir.as_ref();
         let config = json!({
             "architectures": ["LlamaForCausalLM"],
             "model_type": "llama",
@@ -195,28 +202,23 @@ mod tests {
         let hf = unique_dir("canprep-hf");
         write_hf_dir(&hf);
         assert!(can_prepare(&PrepareSpec::dense(&hf, hf.join("out"))));
-        std::fs::remove_dir_all(&hf).ok();
 
         let empty = unique_dir("canprep-empty");
         assert!(!can_prepare(&PrepareSpec::dense(&empty, empty.join("out"))));
-        std::fs::remove_dir_all(&empty).ok();
     }
 
     #[test]
     fn dense_hf_is_a_no_rewrite_passthrough() {
         let hf = unique_dir("passthrough-src");
         write_hf_dir(&hf);
-        let out = unique_dir("passthrough-out");
-        std::fs::remove_dir_all(&out).ok();
+        let out = unique_out("passthrough-out");
 
         let report = prepare(&PrepareSpec::dense(&hf, &out)).unwrap();
         assert!(report.passthrough, "dense HF must be a passthrough");
-        assert_eq!(report.out_dir, hf, "passthrough returns the source dir");
+        assert_eq!(report.out_dir, *hf, "passthrough returns the source dir");
         assert_eq!(report.quantized, None);
         assert!(report.num_tensors > 0);
         assert!(!out.exists(), "passthrough must not write the out_dir");
-
-        std::fs::remove_dir_all(&hf).ok();
     }
 
     #[test]
@@ -226,14 +228,12 @@ mod tests {
             Err(CoreError::Unsupported(_)) => {}
             other => panic!("expected Unsupported, got {other:?}"),
         }
-        std::fs::remove_dir_all(&empty).ok();
     }
 
     #[test]
     fn quantized_hf_writes_a_loadable_quantized_snapshot() {
         let src = unique_dir("q-src");
-        let out = unique_dir("q-out");
-        std::fs::remove_dir_all(&out).ok();
+        let out = unique_out("q-out");
 
         let (h, v, inter, qd, kvd) = (64i32, 4i32, 128i32, 64i32, 32i32);
         let mut tensors: Vec<(String, Array)> = Vec::new();
@@ -303,7 +303,7 @@ mod tests {
             "a quantization request must write a snapshot"
         );
         assert_eq!(report.quantized, Some(Quantize::Q4));
-        assert_eq!(report.out_dir, out);
+        assert_eq!(report.out_dir, *out);
 
         let cfg = crate::config::ModelConfig::from_dir(&out).unwrap();
         assert_eq!(cfg.quantization, Some(QuantSpec::q4()));
@@ -314,8 +314,13 @@ mod tests {
             model.is_quantized(),
             "quantized snapshot must load as quantized"
         );
+    }
 
-        std::fs::remove_dir_all(&src).ok();
-        std::fs::remove_dir_all(&out).ok();
+    /// Drop-regression for this suite's two fixture helpers: both take their guarded root with
+    /// them. Flip [`Fixture::new`]'s builder to `disable_cleanup(true)` and this goes RED.
+    #[test]
+    fn prepare_fixtures_are_self_removing() {
+        assert_fixture_is_self_removing(unique_dir("guard-src"));
+        assert_fixture_is_a_guarded_entry(unique_out("guard-out"));
     }
 }

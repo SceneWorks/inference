@@ -30,3 +30,7 @@ minijinja = { version = "2", features = ["json", "preserve_order"] }
 minijinja-contrib = { version = "2", features = ["pycompat"] }
 
 # NO tensor dependency and NO gen-ai dependency — this crate must build standalone on any platform.
+
+[dev-dependencies]
+# Self-removing fixture roots for the test suites (sc-17755).
+tempfile = { workspace = true }

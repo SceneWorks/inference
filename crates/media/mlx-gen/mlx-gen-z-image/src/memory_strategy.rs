@@ -904,7 +904,6 @@ mod tests {
         MemoryBudget, MemoryCacheState, MemoryMode, MemoryNumericTier, MemorySelection, Precision,
         Quant, MEMORY_CALIBRATION_ABI,
     };
-    use std::sync::OnceLock;
 
     fn write_minimal_safetensors(path: &std::path::Path) {
         let mut header = br#"{"probe":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#.to_vec();
@@ -926,32 +925,26 @@ mod tests {
     }
 
     /// The load rung 4 is available on: a re-openable snapshot dir with deferred materialization.
-    fn spec() -> LoadSpec {
-        static ROOT: OnceLock<std::path::PathBuf> = OnceLock::new();
-        let root = ROOT.get_or_init(|| {
-            let root =
-                std::env::temp_dir().join(format!("z-image-memory-spec-{}", std::process::id()));
-            write_snapshot(&root);
-            root
-        });
+    fn spec(tmp: &tempfile::TempDir) -> LoadSpec {
+        let root = tmp.path().join("z-image-memory-spec");
+        write_snapshot(&root);
         LoadSpec::new(WeightsSource::Dir(root.clone()))
             .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization)
     }
 
-    fn contract() -> MemoryProviderContract {
-        memory_strategy_contract(crate::model::MODEL_ID, &spec()).unwrap()
+    fn contract(tmp: &tempfile::TempDir) -> MemoryProviderContract {
+        memory_strategy_contract(crate::model::MODEL_ID, &spec(tmp)).unwrap()
     }
 
     #[test]
     fn required_component_directory_cannot_disappear_into_zero_facts() {
-        let root =
-            std::env::temp_dir().join(format!("z-image-missing-component-{}", std::process::id()));
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         write_snapshot(&root);
         std::fs::remove_dir_all(root.join("text_encoder")).unwrap();
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
         assert!(memory_strategy_contract(crate::model::MODEL_ID, &spec).is_err());
         assert!(weights_free_memory_strategy_contract(crate::model::MODEL_ID, &spec).is_ok());
-        std::fs::remove_dir_all(root).ok();
     }
 
     /// A selection carrying exactly the parameters the rungs up to and including `strategy` own —
@@ -1033,13 +1026,13 @@ mod tests {
     }
 
     fn tier_spec(
+        tmp: &tempfile::TempDir,
         tag: &str,
         packed_bits: Option<i32>,
         requested: Option<Quant>,
     ) -> (std::path::PathBuf, LoadSpec) {
-        let root = std::env::temp_dir().join(format!(
-            "z-image-memory-tier-{tag}-{}-{:?}",
-            std::process::id(),
+        let root = tmp.path().join(format!(
+            "z-image-memory-tier-{tag}-{:?}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -1082,11 +1075,12 @@ mod tests {
 
     #[test]
     fn all_four_registrations_bind_prepacked_q4_and_q8_without_an_override() {
+        let tmp = tempfile::tempdir().unwrap();
         for (bits, actual, wrong) in [
             (4, Quant::Q4, Some(Quant::Q8)),
             (8, Quant::Q8, Some(Quant::Q4)),
         ] {
-            let (root, spec) = tier_spec(&format!("packed-{bits}"), Some(bits), None);
+            let (root, spec) = tier_spec(&tmp, &format!("packed-{bits}"), Some(bits), None);
             for registration in memory_registrations() {
                 let contract = (registration.contract)(&spec).unwrap();
                 assert_eq!(
@@ -1123,8 +1117,9 @@ mod tests {
 
     #[test]
     fn all_four_registrations_use_requested_quant_only_for_dense_snapshots() {
+        let tmp = tempfile::tempdir().unwrap();
         for requested in [Quant::Q4, Quant::Q8] {
-            let (root, spec) = tier_spec("dense-requested", None, Some(requested));
+            let (root, spec) = tier_spec(&tmp, "dense-requested", None, Some(requested));
             for registration in memory_registrations() {
                 let contract = (registration.contract)(&spec).unwrap();
                 assert_eq!(
@@ -1146,7 +1141,8 @@ mod tests {
 
     #[test]
     fn packed_request_mismatch_rejects_all_registrations_and_load_entrypoints() {
-        let (root, spec) = tier_spec("packed-mismatch", Some(8), Some(Quant::Q4));
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, spec) = tier_spec(&tmp, "packed-mismatch", Some(8), Some(Quant::Q4));
         for registration in memory_registrations() {
             let contract = (registration.contract)(&spec).unwrap();
             let decision = (registration.safety_check)(
@@ -1198,7 +1194,8 @@ mod tests {
 
     #[test]
     fn contract_is_internally_conformant() {
-        let contract = contract();
+        let tmp = tempfile::tempdir().unwrap();
+        let contract = contract(&tmp);
         assert_eq!(contract.conformance_errors(), Vec::<String>::new());
         gen_core_testkit::check_memory_strategy_contract(&contract).unwrap();
         // SC-15775: the PiD-eligible half of the same conformance obligation, run on the DECLARATION
@@ -1237,17 +1234,8 @@ mod tests {
     #[test]
     fn control_branch_is_a_decomposed_load_bearing_peak_component() {
         use safetensors::{serialize, tensor::TensorView, Dtype};
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "mlx-gen-z-image-sc-16065-{}-{nonce}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         let control = root.join("control.safetensors");
         let stack_weight = vec![0_u8; 2 * 64 * 2];
         let patch_weight = vec![0_u8; 2 * 33 * 2];
@@ -1276,7 +1264,6 @@ mod tests {
             .with_quant(Quant::Q4)
             .with_control(WeightsSource::File(control));
         let contract = memory_strategy_contract(crate::model_control::MODEL_ID, &spec).unwrap();
-        std::fs::remove_dir_all(root).unwrap();
         assert_eq!(crate::control_transformer::CONTROL_LAYERS_PLACES.len(), 15);
 
         // The 2x64 stack Linear is packed to 64 bytes of Q4 codes plus two 2x1 bf16 tables
@@ -1382,11 +1369,12 @@ mod tests {
     /// not be readable as covering this one.
     #[test]
     fn the_fingerprint_retired_the_coupled_staged_window_generation() {
+        let tmp = tempfile::tempdir().unwrap();
         assert_ne!(
             MEMORY_CALIBRATION_FINGERPRINT,
             "z-image-mlx-staged-tiled-decode-bounded-attention-block-window-v2"
         );
-        let contract = contract();
+        let contract = contract(&tmp);
         let mut ctx = context(MemoryStrategy::BoundedAttention);
         ctx.calibration_fingerprint =
             "z-image-mlx-staged-tiled-decode-bounded-attention-block-window-v2".to_owned();
@@ -1398,8 +1386,9 @@ mod tests {
 
     #[test]
     fn eager_and_deferred_evidence_identities_cannot_cross_authorize() {
-        let deferred = contract();
-        let mut eager_spec = spec();
+        let tmp = tempfile::tempdir().unwrap();
+        let deferred = contract(&tmp);
+        let mut eager_spec = spec(&tmp);
         eager_spec.load_shape = mlx_gen::LoadShape::EagerMaterialization;
         let eager = memory_strategy_contract(crate::model::MODEL_ID, &eager_spec).unwrap();
         assert_eq!(
@@ -1437,7 +1426,8 @@ mod tests {
 
     #[test]
     fn every_rung_is_implemented_and_selectable_on_a_snapshot_load() {
-        let contract = contract();
+        let tmp = tempfile::tempdir().unwrap();
+        let contract = contract(&tmp);
         for strategy in MemoryStrategy::ALL {
             assert!(
                 matches!(
@@ -1455,7 +1445,8 @@ mod tests {
     /// either the contract or the scope layer.
     #[test]
     fn bounded_attention_records_exactly_one_chunk_parameter() {
-        let contract = contract();
+        let tmp = tempfile::tempdir().unwrap();
+        let contract = contract(&tmp);
         let capability = contract
             .capability(MemoryStrategy::BoundedAttention)
             .unwrap();
@@ -1481,7 +1472,8 @@ mod tests {
     /// sc-13571 512/64, so nothing about an unparameterized render changed.
     #[test]
     fn bounded_decode_publishes_a_candidate_ladder_with_the_historical_default_in_it() {
-        let contract = contract();
+        let tmp = tempfile::tempdir().unwrap();
+        let contract = contract(&tmp);
         let capability = contract.capability(MemoryStrategy::BoundedDecode).unwrap();
         assert!(
             capability.parameters.decode_tile_edges.len() > 1,
@@ -1545,7 +1537,8 @@ mod tests {
     /// advertising it would let a "rung 4" selection run the resident stack and record a zero saving.
     #[test]
     fn bounded_transformer_residency_publishes_only_bounding_windows() {
-        let contract = contract();
+        let tmp = tempfile::tempdir().unwrap();
+        let contract = contract(&tmp);
         let capability = contract
             .capability(MemoryStrategy::BoundedTransformerResidency)
             .unwrap();
@@ -1578,7 +1571,8 @@ mod tests {
     /// layer rather than at generate time.
     #[test]
     fn rung_four_availability_uses_source_and_load_shape_not_offload_policy() {
-        let mut eager = spec();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut eager = spec(&tmp);
         eager.load_shape = mlx_gen::LoadShape::EagerMaterialization;
         eager.offload_policy = mlx_gen::OffloadPolicy::Resident;
         let contract = memory_strategy_contract(crate::model::MODEL_ID, &eager).unwrap();
@@ -1603,7 +1597,8 @@ mod tests {
             contract.validate_selection(&selection(strategy)).unwrap();
         }
         // Resident+Deferred advertises rung 4: phase release is not the discriminator.
-        let deferred = super::memory_strategy_contract(crate::model::MODEL_ID, &spec()).unwrap();
+        let deferred =
+            super::memory_strategy_contract(crate::model::MODEL_ID, &spec(&tmp)).unwrap();
         assert!(matches!(
             deferred
                 .capability(MemoryStrategy::BoundedTransformerResidency)
@@ -1611,7 +1606,7 @@ mod tests {
             Some(MemoryStrategySupport::Implemented)
         ));
         // Sequential+Eager remains unavailable: staged residency does not imply deferred blocks.
-        let mut staged_eager = spec();
+        let mut staged_eager = spec(&tmp);
         staged_eager.load_shape = mlx_gen::LoadShape::EagerMaterialization;
         staged_eager.offload_policy = mlx_gen::OffloadPolicy::Sequential;
         let staged_eager =
@@ -1654,6 +1649,7 @@ mod tests {
     /// evidence records that it did.
     #[test]
     fn the_rung_four_component_scope_reaches_the_request() {
+        let tmp = tempfile::tempdir().unwrap();
         for component in [
             TransformerComponent::Dit,
             TransformerComponent::TextEncoder,
@@ -1661,7 +1657,7 @@ mod tests {
         ] {
             let mut selection = selection_for(MemoryStrategy::BoundedTransformerResidency, false);
             selection.parameters.transformer_window_component = Some(component);
-            let memory = z_image_generation_memory(&contract(), &selection)
+            let memory = z_image_generation_memory(&contract(&tmp), &selection)
                 .expect("rung 4 maps to a request-scoped control set");
             assert_eq!(
                 memory.transformer_window_component,
@@ -1677,7 +1673,8 @@ mod tests {
             selection.parameters.transformer_window_component,
             Some(TRANSFORMER_WINDOW_COMPONENT)
         );
-        let memory = z_image_generation_memory(&contract(), &selection).expect("rung 4 controls");
+        let memory =
+            z_image_generation_memory(&contract(&tmp), &selection).expect("rung 4 controls");
         assert_eq!(
             memory.transformer_window_component,
             Some(TransformerComponent::Dit),
@@ -1690,7 +1687,7 @@ mod tests {
             MemoryStrategy::BoundedDecode,
             MemoryStrategy::BoundedAttention,
         ] {
-            let memory = z_image_generation_memory(&contract(), &selection_for(lower, false))
+            let memory = z_image_generation_memory(&contract(&tmp), &selection_for(lower, false))
                 .expect("controls");
             assert!(
                 memory.transformer_window_component.is_none(),
@@ -1702,6 +1699,7 @@ mod tests {
 
     #[test]
     fn the_ladder_maps_to_cumulative_request_controls() {
+        let tmp = tempfile::tempdir().unwrap();
         let decode = GenerationMemory {
             tile_vae_decode: true,
             decode_tile_edge: Some(DECODE_TILE_EDGE),
@@ -1709,22 +1707,25 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            z_image_generation_memory(&contract(), &selection(MemoryStrategy::Resident)),
+            z_image_generation_memory(&contract(&tmp), &selection(MemoryStrategy::Resident)),
             None
         );
         assert_eq!(
-            z_image_generation_memory(&contract(), &selection(MemoryStrategy::StagedResidency)),
+            z_image_generation_memory(&contract(&tmp), &selection(MemoryStrategy::StagedResidency)),
             Some(GenerationMemory {
                 stage_residency: true,
                 ..Default::default()
             })
         );
         assert_eq!(
-            z_image_generation_memory(&contract(), &selection(MemoryStrategy::BoundedDecode)),
+            z_image_generation_memory(&contract(&tmp), &selection(MemoryStrategy::BoundedDecode)),
             Some(decode)
         );
         assert_eq!(
-            z_image_generation_memory(&contract(), &selection(MemoryStrategy::BoundedAttention)),
+            z_image_generation_memory(
+                &contract(&tmp),
+                &selection(MemoryStrategy::BoundedAttention)
+            ),
             Some(GenerationMemory {
                 chunk_attention: true,
                 attention_chunk_size: Some(ATTENTION_CHUNK_SIZE),
@@ -1733,7 +1734,7 @@ mod tests {
         );
         assert_eq!(
             z_image_generation_memory(
-                &contract(),
+                &contract(&tmp),
                 &selection(MemoryStrategy::BoundedTransformerResidency)
             ),
             Some(GenerationMemory {
@@ -1758,7 +1759,8 @@ mod tests {
     /// `z_image_generation_memory` to a `match` over the ladder is invisible.
     #[test]
     fn a_rung_the_provider_does_not_implement_is_not_engaged_by_a_deeper_selection() {
-        let mut contract = contract();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut contract = contract(&tmp);
         for capability in &mut contract.strategies {
             if capability.strategy == MemoryStrategy::BoundedDecode {
                 capability.support = MemoryStrategySupport::Missing;
@@ -1795,6 +1797,7 @@ mod tests {
     /// owns it, and a lower rung does not turn a higher one on.
     #[test]
     fn the_request_level_knobs_are_read_by_their_own_seams() {
+        let tmp = tempfile::tempdir().unwrap();
         let plain = GenerationRequest {
             prompt: "a fox".to_owned(),
             width: 1024,
@@ -1813,7 +1816,7 @@ mod tests {
 
         let full = GenerationRequest {
             memory: z_image_generation_memory(
-                &contract(),
+                &contract(&tmp),
                 &selection(MemoryStrategy::BoundedTransformerResidency),
             ),
             ..plain.clone()
@@ -1832,7 +1835,7 @@ mod tests {
         // A published non-default candidate — 640, not one of the measured-and-rejected sub-512 edges.
         sel.parameters.decode_tile_edge = Some(640);
         let tiled = GenerationRequest {
-            memory: z_image_generation_memory(&contract(), &sel),
+            memory: z_image_generation_memory(&contract(&tmp), &sel),
             ..plain.clone()
         };
         assert_eq!(
@@ -1862,10 +1865,11 @@ mod tests {
     /// silent downgrade because a window over an already-materialized trunk would poison evidence.
     #[test]
     fn an_eager_load_refuses_rung_four_instead_of_degrading() {
+        let tmp = tempfile::tempdir().unwrap();
         let req = GenerationRequest {
             prompt: "a fox".to_owned(),
             memory: z_image_generation_memory(
-                &contract(),
+                &contract(&tmp),
                 &selection(MemoryStrategy::BoundedTransformerResidency),
             ),
             ..Default::default()
@@ -1912,7 +1916,7 @@ mod tests {
         ] {
             let req = GenerationRequest {
                 prompt: "a fox".to_owned(),
-                memory: z_image_generation_memory(&contract(), &selection(strategy)),
+                memory: z_image_generation_memory(&contract(&tmp), &selection(strategy)),
                 ..Default::default()
             };
             assert_eq!(
@@ -1928,7 +1932,8 @@ mod tests {
     /// honest on both routes.
     #[test]
     fn the_pid_route_admits_bounded_decode_on_its_own_candidate_domain() {
-        let contract = contract();
+        let tmp = tempfile::tempdir().unwrap();
+        let contract = contract(&tmp);
         let pid_edges = pid_decode_tile_edges();
         assert!(!pid_edges.is_empty());
         assert!(
@@ -1988,7 +1993,8 @@ mod tests {
     /// for, and the catalog entry would be unservable with no local test to say so.
     #[test]
     fn the_edit_surface_z_image_edit_resolves_to_is_admissible() {
-        let contract = contract();
+        let tmp = tempfile::tempdir().unwrap();
+        let contract = contract(&tmp);
         for strategy in MemoryStrategy::ALL {
             let mut ctx = context(strategy);
             ctx.mode = MemoryMode::Edit;
@@ -2016,7 +2022,8 @@ mod tests {
     /// bounded one.
     #[test]
     fn the_scope_rejects_route_drift_the_way_it_rejects_geometry_drift() {
-        let contract = contract();
+        let tmp = tempfile::tempdir().unwrap();
+        let contract = contract(&tmp);
         for admitted_pid in [false, true] {
             let ctx = context_for(MemoryStrategy::BoundedDecode, admitted_pid);
             let mut scope =
@@ -2046,7 +2053,8 @@ mod tests {
 
     #[test]
     fn a_stale_calibration_fingerprint_never_admits_an_optimized_fit() {
-        let contract = contract();
+        let tmp = tempfile::tempdir().unwrap();
+        let contract = contract(&tmp);
         let mut ctx = context(MemoryStrategy::BoundedDecode);
         ctx.calibration_fingerprint = "z-image-mlx-something-older".to_owned();
         match safety_check(&contract, ctx.selection.tier, &ctx) {
@@ -2072,7 +2080,8 @@ mod tests {
 
     #[test]
     fn a_selection_for_a_different_numeric_tier_is_rejected() {
-        let contract = contract();
+        let tmp = tempfile::tempdir().unwrap();
+        let contract = contract(&tmp);
         let mut ctx = context(MemoryStrategy::BoundedDecode);
         let loaded_tier = ctx.selection.tier;
         ctx.selection.tier.quant = Some(Quant::Q8);
@@ -2085,7 +2094,8 @@ mod tests {
 
     #[test]
     fn an_over_budget_prediction_is_rejected_before_any_work() {
-        let contract = contract();
+        let tmp = tempfile::tempdir().unwrap();
+        let contract = contract(&tmp);
         let mut ctx = context(MemoryStrategy::BoundedDecode);
         ctx.predicted_peak_bytes = ctx.budget.effective_bytes() + 1;
         match safety_check(&contract, ctx.selection.tier, &ctx) {
@@ -2104,7 +2114,8 @@ mod tests {
 
     #[test]
     fn the_scope_overwrites_warm_request_state_and_finishes_once() {
-        let contract = contract();
+        let tmp = tempfile::tempdir().unwrap();
+        let contract = contract(&tmp);
         let ctx = context(MemoryStrategy::BoundedDecode);
         let mut scope = begin_request(crate::model::MODEL_ID, &contract, ctx.selection.tier, &ctx)
             .unwrap()
@@ -2168,7 +2179,8 @@ mod tests {
 
     #[test]
     fn the_scope_accepts_only_its_declared_parameters() {
-        let contract = contract();
+        let tmp = tempfile::tempdir().unwrap();
+        let contract = contract(&tmp);
         let ctx = context(MemoryStrategy::BoundedTransformerResidency);
         let mut scope = begin_request(crate::model::MODEL_ID, &contract, ctx.selection.tier, &ctx)
             .unwrap()
@@ -2249,7 +2261,8 @@ mod tests {
 
     #[test]
     fn registered_behavior_enforces_decode_geometry_batch_prefixes_and_terminal_request_state() {
-        let spec = spec().with_quant(Quant::Q4);
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = spec(&tmp).with_quant(Quant::Q4);
         let contract = memory_strategy_contract(crate::model::MODEL_ID, &spec).unwrap();
         let mut ctx = context(MemoryStrategy::BoundedDecode);
         ctx.geometry.batch = 3;
@@ -2300,7 +2313,8 @@ mod tests {
 
     #[test]
     fn a_canceled_or_errored_run_still_releases() {
-        let contract = contract();
+        let tmp = tempfile::tempdir().unwrap();
+        let contract = contract(&tmp);
         for outcome in [
             MemoryRunOutcome::Canceled,
             MemoryRunOutcome::Error {
@@ -2320,13 +2334,14 @@ mod tests {
 
     #[test]
     fn every_registered_variant_declares_the_same_conformant_contract() {
+        let tmp = tempfile::tempdir().unwrap();
         for id in [
             crate::model::MODEL_ID,
             crate::model_base::MODEL_ID,
             crate::model_control::MODEL_ID,
             crate::model_base_control::MODEL_ID,
         ] {
-            let contract = memory_strategy_contract(id, &spec()).unwrap();
+            let contract = memory_strategy_contract(id, &spec(&tmp)).unwrap();
             assert_eq!(contract.provider_id, id);
             assert_eq!(contract.conformance_errors(), Vec::<String>::new(), "{id}");
             gen_core_testkit::check_memory_strategy_contract(&contract).unwrap();
@@ -2335,7 +2350,8 @@ mod tests {
 
     #[test]
     fn declared_parameters_are_the_defaults_and_all_live_in_the_published_ladders() {
-        let contract = contract();
+        let tmp = tempfile::tempdir().unwrap();
+        let contract = contract(&tmp);
         let params = declared_parameters();
         let decode = contract.capability(MemoryStrategy::BoundedDecode).unwrap();
         assert!(decode

@@ -507,11 +507,10 @@ mod tests {
     #[test]
     fn control_checkpoint_resolution() {
         let dev = Device::Cpu;
-        let dir = std::env::temp_dir().join(format!("flux1_ctrl_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         // A nonexistent path errors.
         assert!(control_var_builder(&dir.join("nope.safetensors"), DTYPE, &dev).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     use crate::vae::native::Config as AeCfg;

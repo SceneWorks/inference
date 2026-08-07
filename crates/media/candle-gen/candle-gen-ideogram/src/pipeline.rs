@@ -868,11 +868,8 @@ mod tests {
             );
             candle_gen::candle_core::safetensors::save(&m, te.join("model.safetensors")).unwrap();
         }
-        let base = std::env::temp_dir().join(format!(
-            "ideo_te_store_{}_{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
+        let base_tmp = tempfile::tempdir().unwrap();
+        let base = base_tmp.path().to_path_buf();
 
         let bf = base.join("bf16");
         write_te(&bf, DType::BF16);
@@ -881,8 +878,6 @@ mod tests {
         let f = base.join("f32");
         write_te(&f, DType::F32);
         assert_eq!(te_store_dtype(&f, &Device::Cpu), DType::F32);
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     fn img(w: u32, h: u32, pixels: Vec<u8>) -> Image {

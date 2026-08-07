@@ -31,7 +31,7 @@ const GOLDEN: &str = concat!(
 
 fn snapshot_root() -> std::path::PathBuf {
     let base = std::path::PathBuf::from(std::env::var("MLX_GEN_MODELS_ROOT").expect("set MLX_GEN_MODELS_ROOT to the explicit models root (holds models--*/snapshots); inference never self-fetches or derives a cache location (epic 13657)"))
-        .join("models--microsoft--Lens-Turbo/snapshots");
+        .join("models--SceneWorks--Lens-Turbo/snapshots");
     std::fs::read_dir(&base)
         .unwrap_or_else(|_| panic!("snapshot dir {}", base.display()))
         .filter_map(|e| e.ok())
@@ -111,7 +111,7 @@ fn lens_e2e_matches_reference() {
     let pipe = LensPipeline::load(&snap, Dtype::Bfloat16).expect("load pipeline");
 
     let (features, mask) = pipe
-        .encode_prompt(prompt, negative, date, None)
+        .encode_prompt(prompt, negative, date, guidance, None)
         .expect("encode_prompt");
     let init = g.require("init_latents").unwrap().clone(); // [1, seq, 128] f32
 
@@ -216,7 +216,7 @@ fn lens_curated_samplers_drive_the_real_dit() {
     let seq = (lat_h * lat_w) as i32;
     let (num_steps, guidance) = (4usize, 5.0f32);
     let (features, mask) = pipe
-        .encode_prompt("a red fox in snow", "", "2025-01-01", None)
+        .encode_prompt("a red fox in snow", "", "2025-01-01", guidance, None)
         .expect("encode_prompt");
 
     let run = |sampler: Option<&str>, scheduler: Option<&str>| -> Array {

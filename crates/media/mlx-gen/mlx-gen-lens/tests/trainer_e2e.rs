@@ -128,7 +128,8 @@ fn windowed_means(losses: &[f32]) -> (f32, f32) {
 #[ignore = "needs real microsoft/Lens weights (~20B gpt-oss encoder; loads Q8)"]
 fn lens_trainer_trains_and_writes_lora() {
     let root = snapshot();
-    let tmp = std::env::temp_dir().join(format!("lens_trainer_lora_e2e_{}", std::process::id()));
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let items = make_dataset(&tmp);
 
     assert_eq!(mlx_gen_lens::registry::MODEL_ID_BASE, "lens");
@@ -241,7 +242,8 @@ fn lens_trainer_trains_with_gradient_checkpointing() {
     // `checkpointed_grads_match_dense`), the run must train, converge, and round-trip exactly like the
     // dense LoRA run. This is the integration proof of the `train_impl` plumbing + the produced adapter.
     let root = snapshot();
-    let tmp = std::env::temp_dir().join(format!("lens_trainer_ckpt_e2e_{}", std::process::id()));
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let items = make_dataset(&tmp);
 
     let mut trainer = mlx_gen_lens::provider_registry()
@@ -326,7 +328,8 @@ fn lens_trainer_trains_with_gradient_checkpointing() {
 #[ignore = "needs real microsoft/Lens weights (~20B gpt-oss encoder; loads Q8)"]
 fn lens_trainer_trains_and_reloads_lokr() {
     let root = snapshot();
-    let tmp = std::env::temp_dir().join(format!("lens_trainer_lokr_e2e_{}", std::process::id()));
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let items = make_dataset(&tmp);
     assert_eq!(mlx_gen_lens::registry::MODEL_ID_BASE, "lens");
 
@@ -435,7 +438,8 @@ fn lens_trainer_trains_and_reloads_lokr() {
 #[ignore = "needs real microsoft/Lens weights (~20B gpt-oss encoder; loads Q8)"]
 fn lens_trainer_emits_preview_samples() {
     let root = snapshot();
-    let tmp = std::env::temp_dir().join(format!("lens_trainer_samples_e2e_{}", std::process::id()));
+    let tmp_guard = tempfile::tempdir().unwrap();
+    let tmp = tmp_guard.path().to_path_buf();
     let items = make_dataset(&tmp);
     assert_eq!(mlx_gen_lens::registry::MODEL_ID_BASE, "lens");
     let mut trainer = mlx_gen_lens::provider_registry()

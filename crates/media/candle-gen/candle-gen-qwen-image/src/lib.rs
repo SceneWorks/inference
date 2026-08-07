@@ -1280,8 +1280,8 @@ mod tests {
     /// group size threaded into `QwenTransformer::new_gs` for the packed-detect load (sc-9415).
     #[test]
     fn transformer_group_size_reads_quantization_block() {
-        let tmp = std::env::temp_dir().join(format!("sc9415_gscfg_{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let tmp = tmp_guard.path().to_path_buf();
 
         // The real qwen-image-mlx tier: bits 4, group 64.
         std::fs::write(
@@ -1317,8 +1317,6 @@ mod tests {
             transformer_group_size(&tmp.join("missing")),
             candle_gen::quant::MLX_GROUP_SIZE
         );
-
-        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
@@ -1475,7 +1473,8 @@ mod tests {
         // built `tokenizer/tokenizer.json`. Build that shape and confirm the loader accepts it (no
         // repo-string gate rejects 2512) and that `Pipeline::load` resolves the tokenizer path that
         // `encode` reads.
-        let tmp = std::env::temp_dir().join(format!("qwen2512_snap_{}", std::process::id()));
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let tmp = tmp_guard.path().to_path_buf();
         for sub in ["text_encoder", "transformer", "vae", "tokenizer"] {
             std::fs::create_dir_all(tmp.join(sub)).unwrap();
         }
@@ -1490,7 +1489,5 @@ mod tests {
             pipe.root.join("tokenizer/tokenizer.json").is_file(),
             "loader must resolve the overlaid tokenizer.json under tokenizer/"
         );
-
-        std::fs::remove_dir_all(&tmp).ok();
     }
 }

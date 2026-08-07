@@ -705,13 +705,11 @@ mod tests {
         assert!(!r.cancel.is_cancelled());
     }
 
-    fn zero_cond_t_tmp(name: &str) -> PathBuf {
-        let tmp = std::env::temp_dir().join(format!(
-            "qwen_edit_zct_{name}_{}_{:?}",
-            std::process::id(),
+    fn zero_cond_t_tmp(tmp: &tempfile::TempDir, name: &str) -> PathBuf {
+        let tmp = tmp.path().join(format!(
+            "qwen_edit_zct_{name}_{:?}",
             std::thread::current().id()
         ));
-        let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("transformer")).unwrap();
         tmp
     }
@@ -724,43 +722,44 @@ mod tests {
 
     #[test]
     fn zero_cond_t_defaults_false_when_key_absent() {
+        let tmp = tempfile::tempdir().unwrap();
         // Config present but the key genuinely absent (a valid 2509 config.json) → documented default.
-        let tmp = zero_cond_t_tmp("keyabsent");
+        let tmp = zero_cond_t_tmp(&tmp, "keyabsent");
         std::fs::write(
             tmp.join("transformer/config.json"),
             br#"{"num_layers": 60}"#,
         )
         .unwrap();
         assert!(!read_zero_cond_t(&tmp).unwrap());
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn zero_cond_t_reads_present_value() {
+        let tmp = tempfile::tempdir().unwrap();
         // Edit-2511 config with the key set true → true.
-        let tmp = zero_cond_t_tmp("present");
+        let tmp = zero_cond_t_tmp(&tmp, "present");
         std::fs::write(
             tmp.join("transformer/config.json"),
             br#"{"zero_cond_t": true}"#,
         )
         .unwrap();
         assert!(read_zero_cond_t(&tmp).unwrap());
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn zero_cond_t_errors_on_corrupt_json() {
+        let tmp = tempfile::tempdir().unwrap();
         // A present-but-malformed config (partial download) must error, NOT silently downgrade to 2509.
-        let tmp = zero_cond_t_tmp("corrupt");
+        let tmp = zero_cond_t_tmp(&tmp, "corrupt");
         std::fs::write(tmp.join("transformer/config.json"), b"{ this is not json").unwrap();
         assert!(read_zero_cond_t(&tmp).is_err());
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn zero_cond_t_errors_on_wrong_type() {
+        let tmp = tempfile::tempdir().unwrap();
         // `zero_cond_t` present but the wrong type → error naming the field, not a silent false.
-        let tmp = zero_cond_t_tmp("wrongtype");
+        let tmp = zero_cond_t_tmp(&tmp, "wrongtype");
         std::fs::write(
             tmp.join("transformer/config.json"),
             br#"{"zero_cond_t": "yes"}"#,
@@ -771,14 +770,13 @@ mod tests {
             err.contains("zero_cond_t"),
             "error should name the field: {err}"
         );
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn tokenizer_json_path_prefers_tokenizer_then_processor() {
         // -2511 ships the assembled tokenizer.json only under processor/ (sc-6294).
-        let tmp = std::env::temp_dir().join(format!("qwen_edit_tok_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let tmp = tmp_guard.path().to_path_buf();
         std::fs::create_dir_all(tmp.join("processor")).unwrap();
         std::fs::write(tmp.join("processor/tokenizer.json"), b"{}").unwrap();
         assert!(tokenizer_json_path(&tmp)
@@ -792,8 +790,10 @@ mod tests {
             .unwrap()
             .ends_with("tokenizer/tokenizer.json"));
 
-        // Neither present → a descriptive error rather than a silent panic.
-        let _ = std::fs::remove_dir_all(&tmp);
+        // Neither present → a descriptive error rather than a silent panic. Emptying the
+        // guarded root is the point of this leg, not cleanup.
+        std::fs::remove_dir_all(tmp.join("processor")).unwrap();
+        std::fs::remove_dir_all(tmp.join("tokenizer")).unwrap();
         assert!(tokenizer_json_path(&tmp).is_err());
     }
 

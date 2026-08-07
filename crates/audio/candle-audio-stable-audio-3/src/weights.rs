@@ -836,12 +836,12 @@ mod tests {
     #[test]
     fn zero_element_tensors_load_on_the_target_device() {
         let device = candle_audio::default_device().expect("device");
-        let directory = std::env::temp_dir().join(format!(
-            "sa3-zero-element-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::create_dir_all(&directory).expect("temp dir");
+        // sc-17755: guard the fixture root so it leaves on `Drop`, panic or not.
+        let guard = tempfile::Builder::new()
+            .prefix("sa3-zero-element-")
+            .tempdir()
+            .expect("fixture temp dir");
+        let directory = guard.path();
         let path = directory.join("model.safetensors");
         let empty = Tensor::zeros((1usize, 0usize, 1usize), DType::F32, &Device::Cpu).unwrap();
         let occupied = Tensor::from_vec(vec![1f32, 2.0], (2usize,), &Device::Cpu).unwrap();
@@ -894,6 +894,5 @@ mod tests {
                 "an empty request whose shape does not match the persisted shape must be rejected"
             );
         }
-        let _ = std::fs::remove_dir_all(&directory);
     }
 }

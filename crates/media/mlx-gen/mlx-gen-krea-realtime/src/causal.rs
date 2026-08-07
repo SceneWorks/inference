@@ -37,10 +37,10 @@ use mlx_gen::adapters::{AdaptableHost, AdaptableLinear, DiffPatchPart};
 use mlx_gen::{Error, Result};
 use mlx_gen_wan::patchify::unpatchify;
 use mlx_gen_wan::{normalize_wan_key, WanTransformer};
-use mlx_rs::ops::concatenate_axis;
+use mlx_rs::ops::{concatenate_axis, dequantize, quantize};
 use mlx_rs::{Array, Dtype};
 
-use crate::config::KreaRealtimeConfig;
+use crate::config::{KreaRealtimeConfig, KvCacheQuant};
 
 #[cfg(test)]
 thread_local! {
@@ -55,7 +55,158 @@ fn mask_materialization_count() -> usize {
 }
 
 /// One layer's cached self-attention `(post-RoPE keys, raw values)`, each `[B, n, S, head_dim]`.
+///
+/// This is the **dense** form the attention path produces and consumes. The cache may store it
+/// group-wise-quantized ([`KvCacheQuant`]) and dequantize on read — see [`CausalKvCache`].
 pub type LayerKv = (Array, Array);
+
+/// One group-wise affine-quantized cached tensor: the packed payload plus its per-group scales and
+/// biases (sc-17807).
+///
+/// All three share the cached tensor's **leading** axes `[B, n, S, …]` — packing runs along the last
+/// axis (`head_dim`) — so the cache's token-axis (`axis 2`) `concatenate_axis` / `take_axis` algebra
+/// applies to each part unchanged, and eviction/windowing need no special case.
+#[derive(Clone)]
+struct PackedKv {
+    /// Packed elements, `[B, n, S, head_dim · bits / 32]` (uint32).
+    w: Array,
+    /// Per-group scale, `[B, n, S, head_dim / group_size]`, in the quantized input's dtype.
+    scales: Array,
+    /// Per-group bias, same shape/dtype as [`scales`](Self::scales).
+    biases: Array,
+}
+
+impl PackedKv {
+    /// Pack a dense `[B, n, S, head_dim]` cached tensor at `q`. Errors when `head_dim` is not a
+    /// multiple of the group size — MLX's own requirement, surfaced here with the config knob named
+    /// rather than as an opaque exception inside a chunk forward.
+    fn pack(dense: &Array, q: KvCacheQuant) -> Result<Self> {
+        q.validate()?;
+        let shape = dense.shape();
+        let head_dim = *shape.last().ok_or_else(|| {
+            Error::Msg("krea causal: cannot quantize a zero-dimensional KV tensor".into())
+        })?;
+        if head_dim <= 0 || head_dim % q.group_size != 0 {
+            return Err(Error::Msg(format!(
+                "krea causal: KV head_dim {head_dim} is not a positive multiple of the \
+                 kv_cache_quant group size {} — pick a group size that divides head_dim, or leave \
+                 kv_cache_quant unset for the bf16 cache",
+                q.group_size
+            )));
+        }
+        let (w, scales, biases) = quantize(dense, q.group_size, q.bits)?;
+        Ok(Self { w, scales, biases })
+    }
+
+    /// The dense `[B, n, S, head_dim]` tensor, in the dtype that was packed (bf16 on the AR path).
+    fn unpack(&self, q: KvCacheQuant) -> Result<Array> {
+        Ok(dequantize(
+            &self.w,
+            &self.scales,
+            &self.biases,
+            q.group_size,
+            q.bits,
+        )?)
+    }
+
+    /// Concatenate `other`'s tokens after this one's, on the token axis.
+    fn concat(&self, other: &Self) -> Result<Self> {
+        Ok(Self {
+            w: concatenate_axis(&[&self.w, &other.w], 2)?,
+            scales: concatenate_axis(&[&self.scales, &other.scales], 2)?,
+            biases: concatenate_axis(&[&self.biases, &other.biases], 2)?,
+        })
+    }
+
+    /// Gather the token-axis positions `idx`.
+    fn take(&self, idx: &Array) -> Result<Self> {
+        Ok(Self {
+            w: self.w.take_axis(idx, 2)?,
+            scales: self.scales.take_axis(idx, 2)?,
+            biases: self.biases.take_axis(idx, 2)?,
+        })
+    }
+
+    fn nbytes(&self) -> usize {
+        self.w.nbytes() + self.scales.nbytes() + self.biases.nbytes()
+    }
+}
+
+/// One layer's physically retained K/V, in whichever representation the cache is configured for.
+#[derive(Clone)]
+enum StoredKv {
+    /// The shipped default: post-RoPE keys + raw values as produced by attention (bf16).
+    Dense { k: Array, v: Array },
+    /// Group-wise affine-quantized K and V ([`KreaArConfig::kv_cache_quant`](crate::KreaArConfig::kv_cache_quant)).
+    Packed { k: PackedKv, v: PackedKv },
+}
+
+impl StoredKv {
+    /// Store a chunk's dense `(k, v)`, packing it when the cache is quantized.
+    fn store(kv: LayerKv, quant: Option<KvCacheQuant>) -> Result<Self> {
+        let (k, v) = kv;
+        match quant {
+            None => Ok(Self::Dense { k, v }),
+            Some(q) => Ok(Self::Packed {
+                k: PackedKv::pack(&k, q)?,
+                v: PackedKv::pack(&v, q)?,
+            }),
+        }
+    }
+
+    /// This layer's retained tokens followed by `next`'s, in the same representation.
+    fn concat(&self, next: &Self) -> Result<Self> {
+        match (self, next) {
+            (Self::Dense { k, v }, Self::Dense { k: nk, v: nv }) => Ok(Self::Dense {
+                k: concatenate_axis(&[k, nk], 2)?,
+                v: concatenate_axis(&[v, nv], 2)?,
+            }),
+            (Self::Packed { k, v }, Self::Packed { k: nk, v: nv }) => Ok(Self::Packed {
+                k: k.concat(nk)?,
+                v: v.concat(nv)?,
+            }),
+            _ => Err(Error::Msg(
+                "krea causal: KV cache mixes dense and quantized layer storage".into(),
+            )),
+        }
+    }
+
+    /// Gather the token-axis positions `idx` out of this layer's retained buffer.
+    fn take(&self, idx: &Array) -> Result<Self> {
+        match self {
+            Self::Dense { k, v } => Ok(Self::Dense {
+                k: k.take_axis(idx, 2)?,
+                v: v.take_axis(idx, 2)?,
+            }),
+            Self::Packed { k, v } => Ok(Self::Packed {
+                k: k.take(idx)?,
+                v: v.take(idx)?,
+            }),
+        }
+    }
+
+    /// The dense `(k, v)` the attention path consumes — a handle pair when the cache is dense, a
+    /// per-call `dequantize` when it is packed.
+    fn dense(&self, quant: Option<KvCacheQuant>) -> Result<LayerKv> {
+        match (self, quant) {
+            (Self::Dense { k, v }, _) => Ok((k.clone(), v.clone())),
+            (Self::Packed { k, v }, Some(q)) => Ok((k.unpack(q)?, v.unpack(q)?)),
+            (Self::Packed { .. }, None) => Err(Error::Msg(
+                "krea causal: KV cache holds quantized layers but carries no quantization tier"
+                    .into(),
+            )),
+        }
+    }
+
+    /// Bytes physically retained for this layer — the **stored** representation, so a quantized cache
+    /// reports its packed cost rather than what it would cost dequantized.
+    fn nbytes(&self) -> usize {
+        match self {
+            Self::Dense { k, v } => k.nbytes() + v.nbytes(),
+            Self::Packed { k, v } => k.nbytes() + v.nbytes(),
+        }
+    }
+}
 
 /// End of the frame-block containing global token index `q` (exclusive): `(q / block + 1) * block`.
 /// The widened result represents the final boundary past `i64::MAX` exactly instead of overflowing;
@@ -176,10 +327,10 @@ pub fn block_causal_mask(
 ///     read window is the whole cache. Byte-for-byte the S3/S4 behaviour.
 ///   * **Bounded / streaming** (a finite `local_attn_size`, the Mac memory-feasible path) — physical
 ///     storage is **capped**: only the always-attended sink prefix `[0, sink_tokens)` plus the
-///     most-recent `max_attention_size` tokens are kept; older tail K/V are evicted on
-///     [`append`](Self::append) so a long clip does not grow KV without bound. Mirrors the reference's
-///     rolling KV buffer (`causal_model.py::CausalWanSelfAttention.forward`, the `local_attn_size != -1`
-///     roll at lines 363-385) — pure cache slicing, no VAE. The first-frame VAE re-anchor
+///     exact tokens the next chunk reads are kept; older tail K/V are evicted lazily by
+///     [`window_prev`](Self::window_prev), once that next chunk's actual length is known. Mirrors the
+///     reference's rolling KV buffer (`causal_model.py::CausalWanSelfAttention.forward`, the
+///     `local_attn_size != -1` roll at lines 363-385) — pure cache slicing, no VAE. The first-frame VAE re-anchor
 ///     (`release_server.py::get_clean_context_frames` re-encoding the first output frame) is a
 ///     *separate* mechanism, deferred to S6.
 ///
@@ -188,11 +339,28 @@ pub fn block_causal_mask(
 /// ([`retained_tokens`](Self::retained_tokens)) may be smaller once eviction begins. The **read window**
 /// `k[max(0, end - max_attention_size):end]` (plus the sink prefix) is applied on read by
 /// [`window_prev`](Self::window_prev).
+///
+/// **Per-token cost (sc-17807).** The cache holds *activations*, so the DiT's weight tier does not
+/// shrink it: at the Wan-14B geometry a token of KV is `2 (K and V) × 40 layers × 5120 dim × 2 bytes`
+/// = **800 KiB**. Unlike the ~9 GiB of Q4 weights that term scales with the clip. sc-17894 evicts to
+/// the actual cached history each read: at the shipped 6-frame attention window, the next 3-frame
+/// chunk reads only 3 cached frames, so bf16 retention is **3.57 GiB**, not the old 7.14 GiB. The
+/// wider 15- and 30-frame rows retain 12 and 27 cached frames (14.3 and 32.1 GiB); a global window
+/// over a 45-frame clip still retains all 53.6 GiB. The storage representation is therefore a knob:
+/// [`KreaArConfig::kv_cache_quant`](crate::KreaArConfig::kv_cache_quant) selects group-wise affine
+/// quantization ([`KvCacheQuant`]) and the cache stores packed K/V, **dequantizing the read window
+/// per layer** in [`window_prev`](Self::window_prev). Attention still runs the dense fused SDPA —
+/// consuming a packed cache directly would mean the decomposed quantized-matmul form, whose per-layer
+/// `Sq × Sk` score matrix costs ~37× the dequantized window at AR-video chunk widths (and, for one
+/// layer, as much as the whole cache's Q8 saving) — see [`KvCacheQuant`].
+/// The dequantized window is an anonymous graph intermediate, dropped before the AR loop's per-step
+/// `eval`, so what stays resident across chunks is the packed cache.
+/// [`retained_bytes`](Self::retained_bytes) reports the **stored** cost either way.
 pub struct CausalKvCache {
-    /// Per layer: `Some((k, v))` once populated — the physically retained tokens in global order (the
+    /// Per layer: `Some(stored)` once populated — the physically retained tokens in global order (the
     /// sink prefix `[0, sink_kept)` followed by the rolling tail `[tail_base, stored_tokens)`), each
-    /// `[B, n, retained_tokens, d]` (post-RoPE k, raw v).
-    layers: Vec<Option<LayerKv>>,
+    /// `[B, n, retained_tokens, d]` (post-RoPE k, raw v), dense or packed per [`quant`](Self::quant).
+    layers: Vec<Option<StoredKv>>,
     /// Running global token count committed so far (the reference's `global_end_index`); grows by the
     /// chunk length on every [`append`](Self::append) and never shrinks, even under eviction.
     committed_tokens: usize,
@@ -201,20 +369,92 @@ pub struct CausalKvCache {
     tail_base: usize,
     max_attention_size: usize,
     sink_tokens: usize,
+    /// Storage tier for the retained K/V: `None` = bf16 (the shipped default), `Some(q)` = group-wise
+    /// affine-quantized, dequantized on read (sc-17807).
+    quant: Option<KvCacheQuant>,
+    /// Test-only switch for the real-weight before/after oracle. `false` reproduces the pre-sc-17894
+    /// eager max-window eviction exactly; production builds do not carry this field or branch.
+    #[cfg(test)]
+    evict_to_next_read: bool,
 }
 
 impl CausalKvCache {
     /// An empty cache for `num_layers` transformer blocks with the given read-window geometry (in
-    /// tokens). See [`KreaArConfig::max_attention_size`](crate::KreaArConfig::max_attention_size) /
-    /// [`sink_tokens`](crate::KreaArConfig::sink_tokens).
-    pub fn new(num_layers: usize, max_attention_size: usize, sink_tokens: usize) -> Self {
+    /// tokens) and storage tier. See
+    /// [`KreaArConfig::max_attention_size`](crate::KreaArConfig::max_attention_size) /
+    /// [`sink_tokens`](crate::KreaArConfig::sink_tokens) /
+    /// [`kv_cache_quant`](crate::KreaArConfig::kv_cache_quant).
+    ///
+    /// `quant` is an explicit parameter rather than a defaulted one so a caller cannot silently get
+    /// the bf16 cache while its config asks for a quantized one — the failure mode would be a
+    /// correct-looking run at 1.9× the intended memory.
+    pub fn new(
+        num_layers: usize,
+        max_attention_size: usize,
+        sink_tokens: usize,
+        quant: Option<KvCacheQuant>,
+    ) -> Self {
         Self {
             layers: (0..num_layers).map(|_| None).collect(),
             committed_tokens: 0,
             tail_base: 0,
             max_attention_size,
             sink_tokens,
+            quant,
+            #[cfg(test)]
+            evict_to_next_read: true,
         }
+    }
+
+    /// Reproduce the pre-sc-17894 eager max-window retention for a real-weight bit-identity oracle.
+    #[cfg(test)]
+    pub(crate) fn new_eager_reference(
+        num_layers: usize,
+        max_attention_size: usize,
+        sink_tokens: usize,
+        quant: Option<KvCacheQuant>,
+    ) -> Self {
+        let mut cache = Self::new(num_layers, max_attention_size, sink_tokens, quant);
+        cache.evict_to_next_read = false;
+        cache
+    }
+
+    /// The storage tier this cache retains K/V at — `None` for the shipped bf16 cache.
+    pub fn quant(&self) -> Option<KvCacheQuant> {
+        self.quant
+    }
+
+    /// Bytes **physically retained** right now, summed over every layer, in the representation the
+    /// cache actually stores. A quantized cache reports its packed cost, not what its contents would
+    /// occupy dequantized — which is the whole point of measuring it.
+    pub fn retained_bytes(&self) -> usize {
+        self.layers
+            .iter()
+            .flatten()
+            .map(StoredKv::nbytes)
+            .sum::<usize>()
+    }
+
+    /// Force MLX to materialize the retained buffers **as stored** (packed, when the cache is
+    /// quantized).
+    ///
+    /// MLX is lazy: [`append`](Self::append)'s concat (and eviction's gather) build graph nodes, and
+    /// until something evaluates them the cache occupies no allocator bytes. A residency measurement
+    /// taken without this is a shape calculation. Evaluating [`layer_kv`](Self::layer_kv) instead
+    /// would materialize the *dequantized* copies and leave the packed cache itself unevaluated —
+    /// which is precisely the wrong thing to measure.
+    pub fn eval_retained(&self) -> Result<()> {
+        let mut arrays: Vec<&Array> = Vec::with_capacity(self.layers.len() * 6);
+        for stored in self.layers.iter().flatten() {
+            match stored {
+                StoredKv::Dense { k, v } => arrays.extend([k, v]),
+                StoredKv::Packed { k, v } => {
+                    arrays.extend([&k.w, &k.scales, &k.biases, &v.w, &v.scales, &v.biases]);
+                }
+            }
+        }
+        mlx_rs::transforms::eval(arrays)?;
+        Ok(())
     }
 
     /// Number of tokens (per layer) **committed** so far (the global running end) — grows by the chunk
@@ -247,11 +487,20 @@ impl CausalKvCache {
         self.sink_tokens.min(self.committed_tokens)
     }
 
-    /// The retained `(k, v)` per layer (post-RoPE k, raw v), for verification (S5 recompute /
-    /// bounded-window tests) and the S6 pipeline. `None` before the first append or for an unknown
-    /// layer.
-    pub fn layer_kv(&self, layer: usize) -> Option<&LayerKv> {
-        self.layers.get(layer).and_then(|l| l.as_ref())
+    /// The retained `(k, v)` per layer as **dense** post-RoPE k / raw v, for verification (S5
+    /// recompute / bounded-window tests) and the S6 pipeline. `Ok(None)` before the first append or
+    /// for an unknown layer.
+    ///
+    /// Returns handles to the stored arrays when the cache is dense, and dequantizes when it is
+    /// quantized — so a caller reading it back always sees the values attention sees. Use
+    /// [`retained_bytes`](Self::retained_bytes), not the returned arrays' `nbytes`, to measure
+    /// residency: the dequantized form is *not* what a quantized cache costs.
+    pub fn layer_kv(&self, layer: usize) -> Result<Option<LayerKv>> {
+        self.layers
+            .get(layer)
+            .and_then(|l| l.as_ref())
+            .map(|stored| stored.dense(self.quant))
+            .transpose()
     }
 
     /// The **global token positions** of the read window's cached (prev) keys for a query chunk of
@@ -259,8 +508,9 @@ impl CausalKvCache {
     /// sliding tail `[read_start, stored)`, where
     /// `read_start = max(sink, (stored + s_new) − max_attention_size)` (clamped to `stored`). These are
     /// exactly the prev tokens the new chunk's queries attend, and the caller uses them to build the
-    /// matching mask column positions. Every returned position is physically retained (the eviction
-    /// invariant guarantees `tail_base ≤ read_start`). Empty before the first append.
+    /// matching mask column positions. Empty before the first append. A caller that rereads the same
+    /// committed boundary with a shorter chunk can request history an earlier read already evicted;
+    /// [`window_prev`](Self::window_prev) rejects that sequence before physical indexing.
     fn window_positions(&self, s_new: usize) -> Vec<i64> {
         if self.committed_tokens == 0 {
             return Vec::new();
@@ -295,43 +545,101 @@ impl CausalKvCache {
     /// The windowed cached `(k, v)` per layer for a query chunk of `s_new` new tokens, alongside the
     /// **global token positions** of those keys (for mask construction). Returns `(vec![], vec![])`
     /// before the first append (first chunk has no history). When the window is exactly the whole
-    /// retained buffer (the global / fits case) the stored handles are returned directly (no gather);
-    /// otherwise the physically-indexed window is gathered.
-    pub fn window_prev(&self, s_new: usize) -> Result<(Vec<LayerKv>, Vec<i64>)> {
+    /// retained buffer (the global / fits case) no gather is issued; otherwise the physically-indexed
+    /// window is gathered into the cache itself, evicting every token this read does not need.
+    /// Eviction happens here rather than in [`append`](Self::append), because only the read knows the
+    /// actual `s_new`; a short final chunk reads farther back than a full-sized one.
+    ///
+    /// Returns an error if the same committed boundary was already trimmed for a larger chunk and a
+    /// later reread with a smaller `s_new` would need evicted history. Product denoise steps use one
+    /// fixed chunk shape; rejecting shape expansion keeps the public API fail-closed instead of
+    /// underflowing an index passed to Metal's unchecked `take_axis`.
+    ///
+    /// The returned pairs are always **dense** — a quantized cache gathers packed and dequantizes here
+    /// (sc-17807), so the reused Wan attention keeps its fused SDPA path. Gathering *before*
+    /// dequantizing is what makes it pay: only the window is widened, and only for as long as the
+    /// caller holds it (one chunk forward, dropped before the AR loop's per-step `eval`, so MLX frees
+    /// each layer's copy as that layer's attention completes rather than holding all `num_layers` at
+    /// once).
+    ///
+    /// One asymmetry worth naming: in the **global** regime the read window *is* the whole retained
+    /// buffer, so the dense path returns handles with no copy at all while the quantized path still
+    /// dequantizes. The transient is per layer and bounded by the window, and it is far smaller than
+    /// the packed cache's saving over a global-window clip — but it is not zero, and it is the reason
+    /// the tier's value grows with how much of the cache is *retained* rather than read.
+    pub fn window_prev(&mut self, s_new: usize) -> Result<(Vec<LayerKv>, Vec<i64>)> {
         let positions = self.window_positions(s_new);
-        if positions.is_empty() {
-            return Ok((Vec::new(), Vec::new()));
+        let sink_kept = self.sink_kept();
+        if let Some(requested) = positions
+            .iter()
+            .map(|&g| g as usize)
+            .find(|&g| g >= sink_kept && g < self.tail_base)
+        {
+            return Err(Error::Msg(format!(
+                "krea causal: reread needs evicted token {requested}; retained tail starts at {} \
+                 (committed {}, next chunk {s_new})",
+                self.tail_base, self.committed_tokens
+            )));
         }
         let phys: Vec<i32> = positions
             .iter()
             .map(|&g| self.phys_index(g as usize) as i32)
             .collect();
-        // Reading the entire retained buffer in order ⇒ hand the stored buffers back (no gather).
+        // Reading the entire retained buffer in order means the cache is already the exact window.
         let whole = phys.len() == self.retained_tokens()
             && phys.iter().enumerate().all(|(i, &p)| p as usize == i);
-        let idx = if whole {
-            None
-        } else {
-            Some(Array::from_slice(&phys, &[phys.len() as i32]))
-        };
+        #[cfg(test)]
+        if !self.evict_to_next_read {
+            // The first chunk has no committed history and therefore no populated layer slots. The
+            // eager oracle must match the production fast path below instead of trying to read
+            // `None` from every layer before the first append.
+            if positions.is_empty() && self.committed_tokens == 0 {
+                return Ok((Vec::new(), Vec::new()));
+            }
+            let idx = (!whole).then(|| Array::from_slice(&phys, &[phys.len() as i32]));
+            let mut prev = Vec::with_capacity(self.layers.len());
+            for layer in &self.layers {
+                let stored = layer.as_ref().ok_or_else(|| {
+                    Error::Msg("krea causal: KV cache has tokens but a layer slot is empty".into())
+                })?;
+                prev.push(match &idx {
+                    None => stored.dense(self.quant)?,
+                    Some(ix) => stored.take(ix)?.dense(self.quant)?,
+                });
+            }
+            return Ok((prev, positions));
+        }
+        if !whole {
+            let idx = Array::from_slice(&phys, &[phys.len() as i32]);
+            for slot in self.layers.iter_mut() {
+                if let Some(stored) = slot.as_ref() {
+                    *slot = Some(stored.take(&idx)?);
+                }
+            }
+        }
+        self.tail_base = positions
+            .iter()
+            .map(|&g| g as usize)
+            .find(|&g| g >= sink_kept)
+            .unwrap_or(self.committed_tokens);
+        if positions.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
         let mut prev = Vec::with_capacity(self.layers.len());
         for layer in &self.layers {
-            let (k, v) = layer.as_ref().ok_or_else(|| {
+            let stored = layer.as_ref().ok_or_else(|| {
                 Error::Msg("krea causal: KV cache has tokens but a layer slot is empty".into())
             })?;
-            match &idx {
-                None => prev.push((k.clone(), v.clone())),
-                Some(ix) => prev.push((k.take_axis(ix, 2)?, v.take_axis(ix, 2)?)),
-            }
+            prev.push(stored.dense(self.quant)?);
         }
         Ok((prev, positions))
     }
 
     /// Append this chunk's per-layer post-RoPE `(k, v)` `[B, n, s_new, d]` to the running cache. In the
-    /// global regime this is full retention (the read window is applied on
-    /// [`window_prev`](Self::window_prev)); in the bounded regime the oldest tail tokens beyond
-    /// `sink_tokens + max_attention_size` are **evicted** from physical storage so a long clip stays
-    /// bounded. `new_kv` must carry exactly one `(k, v)` per layer.
+    /// global regime this is full retention. In the bounded regime [`window_prev`](Self::window_prev)
+    /// has already reduced the prior cache to the exact history this chunk read; appending this chunk
+    /// grows that tail until the next read supplies its actual length and trims again. `new_kv` must
+    /// carry exactly one `(k, v)` per layer.
     pub fn append(&mut self, new_kv: Vec<LayerKv>) -> Result<()> {
         if new_kv.len() != self.layers.len() {
             return Err(Error::Msg(format!(
@@ -340,66 +648,56 @@ impl CausalKvCache {
                 new_kv.len()
             )));
         }
-        // Concatenate this chunk's K/V onto the physical tail (each layer identically).
+        // Concatenate this chunk's K/V onto the physical tail (each layer identically). When the cache
+        // is quantized the chunk is packed **here**, at commit — once per chunk, not once per denoise
+        // step, since only the committing forward reaches `append` (sc-17807).
         let mut s_new = 0usize;
-        for (slot, (nk, nv)) in self.layers.iter_mut().zip(new_kv) {
-            s_new = nk.shape()[2] as usize;
+        for (slot, kv) in self.layers.iter_mut().zip(new_kv) {
+            s_new = kv.0.shape()[2] as usize;
+            let incoming = StoredKv::store(kv, self.quant)?;
             *slot = Some(match slot.take() {
-                None => (nk, nv),
-                Some((pk, pv)) => (
-                    concatenate_axis(&[&pk, &nk], 2)?,
-                    concatenate_axis(&[&pv, &nv], 2)?,
-                ),
+                None => incoming,
+                Some(prev) => prev.concat(&incoming)?,
             });
         }
 
-        let tail_base_old = self.tail_base;
-        let committed_before = self.committed_tokens;
+        #[cfg(test)]
+        let (tail_base_old, committed_before) = (self.tail_base, self.committed_tokens);
         self.committed_tokens += s_new;
-
-        // Bounded window: evict the oldest tail tokens beyond the sink prefix + read window. In the
-        // global regime `max_attention_size ≥ committed`, so `tail_base_new` stays at `sink_kept` and
-        // nothing is dropped (identical to full retention).
-        let sink_kept = self.sink_kept();
-        let tail_base_new = sink_kept.max(
-            self.committed_tokens
-                .saturating_sub(self.max_attention_size),
-        );
-        // Only a *real* tail drop (past the sink prefix) needs a re-gather; advancing `tail_base` while
-        // the sink is still filling (tail empty) is a no-op.
-        let drop_start = tail_base_old.max(sink_kept);
-        if tail_base_new > drop_start {
-            // Physical indices to KEEP in the current (**pre-eviction**) buffer. That buffer's layout
-            // is the sink prefix `[0, sink_kept_prev)` followed by the rolling tail
-            // `[tail_base_old, committed)`, where `sink_kept_prev` is the sink length *before* this
-            // append — the physical layout predates any sink growth contributed by this chunk. The
-            // desired keep set is the (possibly grown) sink prefix `[0, sink_kept)` ‖ retained tail
-            // `[tail_base_new, committed)`, but each global position must be mapped through the
-            // pre-eviction sink length: using the post-append `sink_kept` here would overshoot the
-            // tail's true physical start by `sink_kept - sink_kept_prev` whenever the sink is still
-            // filling on the evicting append (e.g. one large first chunk), running the gather past the
-            // axis (`take`/`take_axis` is not bounds-checked on Metal → silent KV corruption). Once the
-            // sink is full `sink_kept_prev == sink_kept`, so this is byte-for-byte the steady state.
-            let sink_kept_prev = self.sink_tokens.min(committed_before);
-            let keep: Vec<i32> = (0..sink_kept)
-                .chain(tail_base_new..self.committed_tokens)
-                .map(|g| {
-                    let p = if g < sink_kept_prev {
-                        g
-                    } else {
-                        sink_kept_prev + (g - tail_base_old)
-                    };
-                    p as i32
-                })
-                .collect();
-            let idx = Array::from_slice(&keep, &[keep.len() as i32]);
-            for slot in self.layers.iter_mut() {
-                if let Some((k, v)) = slot.as_ref() {
-                    *slot = Some((k.take_axis(&idx, 2)?, v.take_axis(&idx, 2)?));
+        #[cfg(test)]
+        if !self.evict_to_next_read {
+            let sink_kept = self.sink_kept();
+            let tail_base_new = sink_kept.max(
+                self.committed_tokens
+                    .saturating_sub(self.max_attention_size),
+            );
+            let drop_start = tail_base_old.max(sink_kept);
+            if tail_base_new > drop_start {
+                let sink_kept_prev = self.sink_tokens.min(committed_before);
+                let keep: Vec<i32> = (0..sink_kept)
+                    .chain(tail_base_new..self.committed_tokens)
+                    .map(|g| {
+                        if g < sink_kept_prev {
+                            g as i32
+                        } else {
+                            (sink_kept_prev + g - tail_base_old) as i32
+                        }
+                    })
+                    .collect();
+                let idx = Array::from_slice(&keep, &[keep.len() as i32]);
+                for slot in self.layers.iter_mut() {
+                    if let Some(stored) = slot.as_ref() {
+                        *slot = Some(stored.take(&idx)?);
+                    }
                 }
             }
+            self.tail_base = tail_base_new;
+            return Ok(());
         }
-        self.tail_base = tail_base_new;
+        // While the sink is still filling, newly appended contiguous tokens become part of it.
+        // Advancing the logical tail start needs no gather: the physical layout remains
+        // `[sink prefix | rolling tail]` in global order.
+        self.tail_base = self.tail_base.max(self.sink_kept());
         Ok(())
     }
 }
@@ -415,6 +713,7 @@ pub struct CausalKreaTransformer {
     block_size: usize,
     max_attention_size: usize,
     sink_tokens: usize,
+    kv_cache_quant: Option<KvCacheQuant>,
     num_layers: usize,
     out_dim: usize,
     patch_size: (usize, usize, usize),
@@ -430,6 +729,7 @@ impl CausalKreaTransformer {
             block_size: cfg.ar.block_size(),
             max_attention_size: cfg.ar.max_attention_size(),
             sink_tokens: cfg.ar.sink_tokens(),
+            kv_cache_quant: cfg.ar.kv_cache_quant,
             num_layers: cfg.wan.num_layers,
             out_dim: cfg.wan.out_dim,
             patch_size: cfg.wan.patch_size,
@@ -447,9 +747,16 @@ impl CausalKreaTransformer {
         self.block_size
     }
 
-    /// A fresh, empty [`CausalKvCache`] sized to this model (layers + read-window geometry).
+    /// A fresh, empty [`CausalKvCache`] sized to this model (layers + read-window geometry) and
+    /// carrying the config's KV storage tier
+    /// ([`KreaArConfig::kv_cache_quant`](crate::KreaArConfig::kv_cache_quant)).
     pub fn new_cache(&self) -> CausalKvCache {
-        CausalKvCache::new(self.num_layers, self.max_attention_size, self.sink_tokens)
+        CausalKvCache::new(
+            self.num_layers,
+            self.max_attention_size,
+            self.sink_tokens,
+            self.kv_cache_quant,
+        )
     }
 
     /// Precompute the per-block text cross-attention K/V once per prompt — the **separate**
@@ -487,19 +794,21 @@ impl CausalKreaTransformer {
     /// Like [`forward_chunk`](Self::forward_chunk) but **does not append** this chunk's self-attention
     /// K/V to `cache` — the read-only denoise forward the S4 few-step loop uses for every denoising
     /// step *except* the last. Every step of one AR chunk attends the **same** committed
-    /// previous-chunk window (the cache is untouched by the intermediate steps), so only the final
-    /// (near-clean) step commits its K/V via [`forward_chunk`](Self::forward_chunk) and the cache grows
-    /// by exactly one chunk per chunk. `current_start_token` must still equal `cache.stored_tokens()`
-    /// (the chunk begins where the committed history ends) and be frame-aligned; it fixes the causal
-    /// RoPE frame offset identically to [`forward_chunk`](Self::forward_chunk). Returns the denoised
-    /// velocity `[out_dim, F_chunk, H, W]` (f32).
+    /// previous-chunk window (its committed history is unchanged by intermediate steps), so only the
+    /// final (near-clean) step commits its K/V via [`forward_chunk`](Self::forward_chunk) and the cache grows
+    /// by exactly one chunk per chunk. A read-only step may still evict history outside this chunk's
+    /// exact read window; that cannot change attention or the committed token count.
+    /// `current_start_token` must still equal `cache.stored_tokens()` (the chunk begins where the
+    /// committed history ends) and be frame-aligned; it fixes the causal RoPE frame offset identically to
+    /// [`forward_chunk`](Self::forward_chunk). Returns the denoised velocity `[out_dim, F_chunk, H, W]`
+    /// (f32).
     pub fn forward_chunk_readonly(
         &self,
         latent_chunk: &Array,
         t: f32,
         cross_kv: &[(Array, Array)],
         current_start_token: usize,
-        cache: &CausalKvCache,
+        cache: &mut CausalKvCache,
     ) -> Result<Array> {
         let (velocity, _new_kv) =
             self.denoise_chunk_inner(latent_chunk, t, cross_kv, current_start_token, cache)?;
@@ -510,8 +819,9 @@ impl CausalKreaTransformer {
     /// the offset RoPE, window the cache, assemble the block-causal mask over `[prev-window ‖ this-chunk]`,
     /// run [`WanTransformer::forward_causal_chunk`], and unpatchify. Returns the denoised velocity
     /// `[out_dim, F_chunk, H, W]` (f32) **and** this chunk's per-layer post-RoPE self-attention `(k, v)`
-    /// for the caller to append or discard — it does **not** mutate `cache`. The two public entries
-    /// differ only in whether they commit `new_kv`: [`forward_chunk`](Self::forward_chunk) appends,
+    /// for the caller to append or discard. It may shrink the physical cache to the exact read window,
+    /// but does not change its committed history. The two public entries differ only in whether they
+    /// commit `new_kv`: [`forward_chunk`](Self::forward_chunk) appends,
     /// [`forward_chunk_readonly`](Self::forward_chunk_readonly) drops it.
     fn denoise_chunk_inner(
         &self,
@@ -519,7 +829,7 @@ impl CausalKreaTransformer {
         t: f32,
         cross_kv: &[(Array, Array)],
         current_start_token: usize,
-        cache: &CausalKvCache,
+        cache: &mut CausalKvCache,
     ) -> Result<(Array, Vec<LayerKv>)> {
         if current_start_token != cache.stored_tokens() {
             return Err(Error::Msg(format!(
@@ -1041,7 +1351,7 @@ mod tests {
     #[test]
     fn window_positions_global_keeps_everything() {
         // Global window (max_attention_size huge, no sink): the prev window is the whole history.
-        let mut cache = CausalKvCache::new(1, 1_000_000, 0);
+        let mut cache = CausalKvCache::new(1, 1_000_000, 0, None);
         cache.committed_tokens = 8; // simulate one 8-token block cached
         let pos = cache.window_positions(8);
         assert_eq!(pos, (0..8).collect::<Vec<i64>>());
@@ -1051,7 +1361,7 @@ mod tests {
     fn window_positions_sliding_and_sink() {
         // stored 16, new 4, window 8, sink 2: current_end=20, read_start=max(2, 20-8)=12,
         // window = sink [0,2) ∪ tail [12,16).
-        let mut cache = CausalKvCache::new(1, 8, 2);
+        let mut cache = CausalKvCache::new(1, 8, 2, None);
         cache.committed_tokens = 16;
         let pos = cache.window_positions(4);
         assert_eq!(pos, vec![0, 1, 12, 13, 14, 15]);
@@ -1068,14 +1378,317 @@ mod tests {
     }
 
     fn retained_key_values(cache: &CausalKvCache) -> Vec<f32> {
-        let (k, _) = cache.layer_kv(0).expect("layer 0 populated");
+        let (k, _) = cache.layer_kv(0).unwrap().expect("layer 0 populated");
         k.as_slice::<f32>().to_vec()
+    }
+
+    // --- sc-17807: the quantized KV cache ------------------------------------------------------
+    //
+    // A quantization group must divide the cached tensor's LAST axis (`head_dim`), so these use a
+    // realistic `d = 64` rather than the `d = 1` the eviction tests above get away with.
+    const QD: i32 = 64;
+
+    /// A `[B=1, n=1, s, QD]` `(k, v)` block whose token `g` carries the row `g + j/QD` for
+    /// `j in 0..QD`. Two properties this buys:
+    ///   * **token identity is recoverable** — the row mean is `g + (QD-1)/(2·QD)`, and adjacent
+    ///     tokens differ by a full 1.0, which is orders of magnitude outside the quantization error
+    ///     below. A gather that returns the wrong token cannot pass a tolerance that a correct one does.
+    ///   * **the quantization is real** — a constant row would quantize with zero scale (exactly), so
+    ///     the intra-row ramp is what makes the round-trip error non-trivial.
+    ///
+    /// `v` is offset so a k/v mix-up is caught too.
+    fn wide_kv_block(positions: &[usize], dtype: Dtype) -> Vec<LayerKv> {
+        let s = positions.len() as i32;
+        let build = |offset: f32| {
+            let data: Vec<f32> = positions
+                .iter()
+                .flat_map(|&g| (0..QD).map(move |j| offset + g as f32 + j as f32 / QD as f32))
+                .collect();
+            Array::from_slice(&data, &[1, 1, s, QD])
+                .as_dtype(dtype)
+                .expect("cast the synthetic KV block")
+        };
+        vec![(build(0.0), build(100.0))]
+    }
+
+    fn row_means(a: &Array) -> Vec<f32> {
+        let flat = a
+            .as_dtype(Dtype::Float32)
+            .expect("read back as f32")
+            .as_slice::<f32>()
+            .to_vec();
+        flat.chunks(QD as usize)
+            .map(|row| row.iter().sum::<f32>() / QD as f32)
+            .collect()
+    }
+
+    /// **The sc-17807 feasibility gate, as arithmetic rather than prose.**
+    ///
+    /// MLX at the pinned revision has no fused quantized SDPA, so "let attention consume the packed
+    /// cache" means the decomposed `quantized_matmul → softmax → quantized_matmul` form — which
+    /// materializes the full `[B, heads, Sq, Sk]` score matrix that the fused kernel never builds. For
+    /// LLM decode that is free (`Sq = 1`); for one Krea AR chunk `Sq` is a whole frame-block.
+    ///
+    /// Two numbers decide it, and both are computed here rather than asserted in prose:
+    ///
+    ///   1. **One layer's** score matrix is of the same order as the Q8 saving on the **whole
+    ///      40-layer cache** — so the route trades a persistent saving for a transient of comparable
+    ///      size, and a `precise` f32 softmax (what mlx-lm uses) doubles the transient.
+    ///   2. Against the route actually taken — gather packed, dequantize the window — the decomposed
+    ///      transient is well over an order of magnitude larger *per layer*. That margin, not (1), is
+    ///      what makes this a settled decision rather than a judgement call.
+    #[test]
+    fn decomposed_quantized_attention_costs_far_more_than_dequantizing_the_window() {
+        // Shipped bounded geometry at 832x480: 1560 tokens/latent frame, 3 frames per AR chunk, a
+        // 6-latent-frame read window, 40 heads, dim 5120.
+        let cfg = KreaRealtimeConfig::krea_realtime_14b();
+        let (tokens_per_frame, frames_per_block, window_frames) = (1560usize, 3, 6);
+        let sq = tokens_per_frame * frames_per_block; // 4,680 query tokens in one chunk
+        let sk = tokens_per_frame * window_frames; // read window ‖ this chunk = 9,360 keys
+        let prev = sk - sq; // 4,680 cached keys this chunk actually reads
+        assert_eq!((sq, sk), (4_680, 9_360));
+
+        // (a) The decomposed form's score matrix, for ONE layer, in bf16 — the optimistic bound.
+        let scores_bytes = cfg.wan.num_heads * sq * sk * 2;
+        // (b) What Q8 saves on the whole cache across all 40 layers.
+        let dense_per_token = cfg.kv_bytes_per_token().unwrap();
+        let mut q8 = cfg.clone();
+        q8.ar.kv_cache_quant = Some(KvCacheQuant::Q8);
+        let saving_bytes = (dense_per_token - q8.kv_bytes_per_token().unwrap()) * sk;
+        // (c) The route taken: one layer's dequantized read window (K and V, bf16).
+        let dequantized_window_bytes = 2 * prev * cfg.wan.dim * 2;
+
+        assert!(
+            scores_bytes * 10 >= saving_bytes * 9,
+            "ONE layer's decomposed-attention score matrix is {scores_bytes} bytes against a \
+             whole-cache Q8 saving of {saving_bytes}. If that ratio ever collapses, consuming the \
+             packed cache directly becomes worth reconsidering — as would a fused quantized SDPA, \
+             which would settle it outright"
+        );
+        assert!(
+            scores_bytes > 30 * dequantized_window_bytes,
+            "per layer, the decomposed route costs {scores_bytes} bytes against \
+             {dequantized_window_bytes} for dequantizing the read window — that margin is why the \
+             cache dequantizes on read instead of attending over packed K/V"
+        );
+    }
+
+    #[test]
+    fn eager_reference_first_chunk_has_no_previous_window() {
+        let mut cache = CausalKvCache::new_eager_reference(2, 4, 0, None);
+        let (previous, positions) = cache.window_prev(2).unwrap();
+        assert!(previous.is_empty());
+        assert!(positions.is_empty());
+        assert!(cache.is_empty());
+    }
+
+    /// MLX emits the quantization `scales`/`biases` in the **input's** dtype. `KvCacheQuant::row_bytes`
+    /// prices a group's overhead at 4 bytes on exactly that basis (bf16 scale + bf16 bias), so if this
+    /// ever changed the published per-token table would silently understate a quantized cache.
+    #[test]
+    fn quantize_emits_scales_and_biases_in_the_input_dtype() {
+        let kv = wide_kv_block(&[0, 1, 2, 3], Dtype::Bfloat16);
+        let packed = PackedKv::pack(&kv[0].0, KvCacheQuant::Q8).unwrap();
+        assert_eq!(packed.scales.dtype(), Dtype::Bfloat16);
+        assert_eq!(packed.biases.dtype(), Dtype::Bfloat16);
+        assert_eq!(packed.w.dtype(), Dtype::Uint32);
+        // Packed payload keeps the leading [B, n, S] axes — which is what makes the cache's
+        // token-axis concat/gather apply to it unchanged — and packs only the last one.
+        assert_eq!(packed.w.shape()[..3], [1, 1, 4]);
+        assert_eq!(packed.scales.shape(), &[1, 1, 4, QD / 64]);
+        // Dequantizing returns the dense shape and dtype attention expects.
+        let back = packed.unpack(KvCacheQuant::Q8).unwrap();
+        assert_eq!(back.shape(), kv[0].0.shape());
+        assert_eq!(back.dtype(), Dtype::Bfloat16);
+    }
+
+    /// A group size that does not divide `head_dim` is a **config** error, and must be reported as one
+    /// (naming the knob) rather than surfacing as an opaque MLX exception from inside a chunk forward.
+    #[test]
+    fn a_group_size_that_does_not_divide_head_dim_is_a_typed_error() {
+        let mut cache = CausalKvCache::new(
+            1,
+            1_000_000,
+            0,
+            Some(KvCacheQuant {
+                bits: 8,
+                group_size: 128,
+            }),
+        );
+        // QD = 64 < 128, so no whole group fits.
+        let err = cache
+            .append(wide_kv_block(&[0, 1], Dtype::Float32))
+            .expect_err("a group size larger than head_dim must be refused");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("head_dim") && msg.contains("kv_cache_quant"),
+            "the error must name the geometry and the knob: {msg}"
+        );
+        // An unsupported width is refused before it reaches MLX at all.
+        let bad = KvCacheQuant {
+            bits: 7,
+            group_size: 64,
+        };
+        assert!(format!("{}", bad.validate().unwrap_err()).contains("affine quantization width"));
+    }
+
+    /// **The cache algebra must commute with packing.** The quantized cache has to evict, window and
+    /// order *exactly* the tokens the dense one does — packing changes the values slightly, never
+    /// which values. Driven through the same eviction-and-roll sequence the dense bounded-window test
+    /// uses, then compared token-for-token.
+    ///
+    /// Discriminating: adjacent tokens differ by 1.0 while the Q8 round trip is bounded at 0.01, so a
+    /// one-token-off gather (the failure mode `take_axis` on packed parts would introduce) fails by
+    /// two orders of magnitude. The dense arm is asserted against the same expectations, so a bug that
+    /// broke *both* representations identically still fails.
+    #[test]
+    fn quantized_cache_evicts_and_windows_exactly_the_dense_tokens() {
+        let window = 4usize;
+        let mut dense = CausalKvCache::new(1, window, 0, None);
+        let mut packed = CausalKvCache::new(1, window, 0, Some(KvCacheQuant::Q8));
+        for start in (0..12).step_by(2) {
+            if start > 0 {
+                dense.window_prev(2).unwrap();
+                packed.window_prev(2).unwrap();
+            }
+            dense
+                .append(wide_kv_block(&[start, start + 1], Dtype::Float32))
+                .unwrap();
+            packed
+                .append(wide_kv_block(&[start, start + 1], Dtype::Float32))
+                .unwrap();
+        }
+        assert_eq!(packed.stored_tokens(), dense.stored_tokens());
+        assert_eq!(packed.retained_tokens(), dense.retained_tokens());
+
+        // The retained buffers hold the same global tokens, in the same order.
+        let (dk, _) = dense.layer_kv(0).unwrap().unwrap();
+        let (pk, pv) = packed.layer_kv(0).unwrap().unwrap();
+        let (dense_rows, packed_rows) = (row_means(&dk), row_means(&pk));
+        assert_eq!(dense_rows.len(), packed_rows.len());
+        // Token `g`'s row mean is `g + 63/128`; the retained window is the last 4 committed tokens.
+        let expected: Vec<f32> = (8..12).map(|g| g as f32 + 63.0 / 128.0).collect();
+        for (i, want) in expected.iter().enumerate() {
+            assert!(
+                (dense_rows[i] - want).abs() < 1e-4,
+                "dense token {i}: {} != {want}",
+                dense_rows[i]
+            );
+            assert!(
+                (packed_rows[i] - want).abs() < 0.01,
+                "quantized token {i}: {} != {want} — an error this large is a wrong token, not \
+                 quantization noise (adjacent tokens differ by 1.0)",
+                packed_rows[i]
+            );
+        }
+        // V is offset by 100 in the fixture, so a k/v swap in the packed path cannot pass.
+        let packed_v_rows = row_means(&pv);
+        assert!((packed_v_rows[0] - (100.0 + expected[0])).abs() < 0.02);
+
+        // ...and the same holds for the READ window, which gathers a strict subset of the retained
+        // buffer (the path that has to index three packed parts consistently).
+        let (dense_prev, dense_pos) = dense.window_prev(2).unwrap();
+        let (packed_prev, packed_pos) = packed.window_prev(2).unwrap();
+        assert_eq!(packed_pos, dense_pos, "the read window must not move");
+        assert_eq!(packed_pos, vec![10, 11]);
+        let dense_window = row_means(&dense_prev[0].0);
+        let packed_window = row_means(&packed_prev[0].0);
+        for (i, (d, p)) in dense_window.iter().zip(&packed_window).enumerate() {
+            assert!(
+                (d - p).abs() < 0.01,
+                "read-window token {i}: dense {d} vs quantized {p}"
+            );
+        }
+    }
+
+    /// The sink prefix is the other retention path (a permanent head plus a rolling tail, gathered
+    /// through a keep-map), and it must survive packing too — this is the same case the
+    /// `bounded_window_retains_sink_prefix` dense test pins.
+    #[test]
+    fn quantized_cache_retains_the_sink_prefix_across_eviction() {
+        let mut cache = CausalKvCache::new(1, 4, 2, Some(KvCacheQuant::Q8));
+        for start in (0..8).step_by(2) {
+            if start > 0 {
+                cache.window_prev(2).unwrap();
+            }
+            cache
+                .append(wide_kv_block(&[start, start + 1], Dtype::Float32))
+                .unwrap();
+        }
+        let (k, _) = cache.layer_kv(0).unwrap().unwrap();
+        let got = row_means(&k);
+        // Sink [0,1] pinned; oldest non-sink tail [2,3] evicted; [4..8) retained.
+        let expected: Vec<f32> = [0usize, 1, 4, 5, 6, 7]
+            .iter()
+            .map(|&g| g as f32 + 63.0 / 128.0)
+            .collect();
+        assert_eq!(got.len(), expected.len());
+        for (i, want) in expected.iter().enumerate() {
+            assert!(
+                (got[i] - want).abs() < 0.01,
+                "retained slot {i}: {} != {want}",
+                got[i]
+            );
+        }
+    }
+
+    /// **The measurement instrument.** `retained_bytes` must report the STORED representation, and it
+    /// must agree with the published per-token table — otherwise the memory claim and the memory
+    /// measurement are two independent stories. Uses bf16 blocks because that is what the AR path
+    /// caches, and what `KvCacheQuant::row_bytes` prices the per-group scale/bias at.
+    #[test]
+    fn retained_bytes_reports_the_packed_cost_and_matches_the_published_row_cost() {
+        let tokens: Vec<usize> = (0..8).collect();
+        let mut dense = CausalKvCache::new(1, 1_000_000, 0, None);
+        let mut packed = CausalKvCache::new(1, 1_000_000, 0, Some(KvCacheQuant::Q8));
+        dense
+            .append(wide_kv_block(&tokens, Dtype::Bfloat16))
+            .unwrap();
+        packed
+            .append(wide_kv_block(&tokens, Dtype::Bfloat16))
+            .unwrap();
+
+        let n = tokens.len();
+        let d = QD as usize;
+        // 2 (K and V) x 1 layer x n tokens x the tier's row cost.
+        assert_eq!(dense.retained_bytes(), 2 * n * d * 2);
+        assert_eq!(
+            packed.retained_bytes(),
+            2 * n * KvCacheQuant::Q8.row_bytes(d).unwrap(),
+            "the measured packed residency must equal the published row cost"
+        );
+        // The whole point: it is materially smaller, and it is NOT the dequantized size.
+        assert!(packed.retained_bytes() < dense.retained_bytes() * 55 / 100);
+        let (k, _) = packed.layer_kv(0).unwrap().unwrap();
+        assert!(
+            k.nbytes() * 2 > packed.retained_bytes(),
+            "reading nbytes off the dequantized handles would report the bf16 size — the accessor \
+             doc says to use retained_bytes for exactly this reason"
+        );
+    }
+
+    /// A quantized cache must be selected by config, and only by config: the shipped preset stays
+    /// dense, so nothing changes for an existing caller.
+    #[test]
+    fn the_shipped_config_builds_a_dense_cache_and_the_knob_builds_a_packed_one() {
+        let base = KreaRealtimeConfig::krea_realtime_14b();
+        assert_eq!(base.ar.kv_cache_quant, None);
+        assert_eq!(
+            CausalKvCache::new(1, 4, 0, base.ar.kv_cache_quant).quant(),
+            None
+        );
+        let mut q8 = base;
+        q8.ar.kv_cache_quant = Some(KvCacheQuant::Q8);
+        assert_eq!(
+            CausalKvCache::new(1, 4, 0, q8.ar.kv_cache_quant).quant(),
+            Some(KvCacheQuant::Q8)
+        );
     }
 
     #[test]
     fn global_regime_retains_everything() {
         // max_attention_size huge ⇒ no eviction ever: retained == committed, buffer is [0, committed).
-        let mut cache = CausalKvCache::new(1, 1_000_000, 0);
+        let mut cache = CausalKvCache::new(1, 1_000_000, 0, None);
         cache.append(kv_block(&[0.0, 1.0, 2.0, 3.0])).unwrap();
         cache.append(kv_block(&[4.0, 5.0, 6.0, 7.0])).unwrap();
         assert_eq!(cache.stored_tokens(), 8);
@@ -1094,27 +1707,31 @@ mod tests {
     }
 
     #[test]
-    fn bounded_window_evicts_oldest_tail_no_sink() {
-        // Window 4 tokens, no sink. Append four 2-token chunks (global 0..8). After each append only the
-        // most-recent ≤ 4 tokens survive physically; committed keeps counting.
-        let mut cache = CausalKvCache::new(1, 4, 0);
+    fn bounded_window_evicts_to_each_actual_read_no_sink() {
+        // Window 4 tokens, no sink. Each 2-token chunk reads only the last 2 cached tokens. The read
+        // trims first; appending the current chunk then grows the rolling tail back to 4.
+        let mut cache = CausalKvCache::new(1, 4, 0, None);
         cache.append(kv_block(&[0.0, 1.0])).unwrap(); // committed 2, retained [0,1]
         assert_eq!(cache.retained_tokens(), 2);
+        cache.window_prev(2).unwrap();
         cache.append(kv_block(&[2.0, 3.0])).unwrap(); // committed 4, retained [0,1,2,3]
         assert_eq!(cache.retained_tokens(), 4);
         assert_eq!(retained_key_values(&cache), vec![0.0, 1.0, 2.0, 3.0]);
-        cache.append(kv_block(&[4.0, 5.0])).unwrap(); // committed 6, evict [0,1] ⇒ retained [2,3,4,5]
+        cache.window_prev(2).unwrap(); // evict [0,1] => retained [2,3]
+        assert_eq!(cache.retained_tokens(), 2);
+        cache.append(kv_block(&[4.0, 5.0])).unwrap(); // committed 6, retained [2,3,4,5]
         assert_eq!(cache.stored_tokens(), 6);
         assert_eq!(
             cache.retained_tokens(),
             4,
-            "storage stays bounded to the window"
+            "the exact read plus the committed chunk fill the window"
         );
         assert_eq!(
             retained_key_values(&cache),
             vec![2.0, 3.0, 4.0, 5.0],
             "the oldest tail tokens are physically evicted"
         );
+        cache.window_prev(2).unwrap(); // evict [2,3] => retained [4,5]
         cache.append(kv_block(&[6.0, 7.0])).unwrap(); // committed 8, retained [4,5,6,7]
         assert_eq!(cache.retained_tokens(), 4);
         assert_eq!(retained_key_values(&cache), vec![4.0, 5.0, 6.0, 7.0]);
@@ -1125,20 +1742,24 @@ mod tests {
         // A clip much longer than the window: the read window for the next chunk is exactly the last
         // `max_attention_size` tokens (global positions), and every one is physically retained (no OOB).
         let window = 4usize;
-        let mut cache = CausalKvCache::new(1, window, 0);
+        let mut cache = CausalKvCache::new(1, window, 0, None);
         for start in (0..12).step_by(2) {
             cache
                 .append(kv_block(&[start as f32, (start + 1) as f32]))
                 .unwrap();
         }
         assert_eq!(cache.stored_tokens(), 12);
-        assert!(cache.retained_tokens() <= window + 2, "bounded storage");
         // Next chunk of s_new = 2: current_end = 14, read_start = max(0, 14 - 4) = 10 ⇒ window [10, 12).
         let (prev, positions) = cache.window_prev(2).unwrap();
         assert_eq!(
             positions,
             vec![10, 11],
-            "reads only the last max_attention_size tokens"
+            "reads only the cached history that fits beside the new chunk"
+        );
+        assert_eq!(
+            cache.retained_tokens(),
+            positions.len(),
+            "storage should evict to the actual next read, not keep one unread chunk"
         );
         // The gathered K carries exactly those global positions' values (retained, correct, no OOB).
         let (k, _) = &prev[0];
@@ -1146,41 +1767,76 @@ mod tests {
     }
 
     #[test]
-    fn bounded_window_retains_sink_prefix() {
-        // sink 2, window 4 (window includes the sink). The first two global tokens [0,1] are always
-        // retained; the tail rolls under them.
-        let mut cache = CausalKvCache::new(1, 4, 2);
-        cache.append(kv_block(&[0.0, 1.0])).unwrap(); // committed 2 (all sink)
-        cache.append(kv_block(&[2.0, 3.0])).unwrap(); // committed 4, retained [0,1,2,3]
-        cache.append(kv_block(&[4.0, 5.0])).unwrap(); // committed 6
-                                                      // sink_kept 2 ([0,1]); tail_base = max(2, 6-4)=2 ⇒ still contiguous, retained [0,1,2,3,4,5]?
-                                                      // committed 6, window 4: tail_base = max(2, 2)=2, retained = 2 + (6-2)=6, no drop yet.
-        assert_eq!(
-            retained_key_values(&cache),
-            vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+    fn a_short_final_chunk_retains_the_farther_back_tokens_it_reads() {
+        // A full next chunk would read [2,4), but the one-token final chunk reads [1,4). Trimming at
+        // the preceding append using its two-token length would silently lose token 1.
+        let mut cache = CausalKvCache::new(1, 4, 0, None);
+        cache.append(kv_block(&[0.0, 1.0])).unwrap();
+        cache.window_prev(2).unwrap();
+        cache.append(kv_block(&[2.0, 3.0])).unwrap();
+
+        let (prev, positions) = cache.window_prev(1).unwrap();
+        assert_eq!(positions, vec![1, 2, 3]);
+        assert_eq!(cache.retained_tokens(), 3);
+        let (k, _) = &prev[0];
+        assert_eq!(k.as_slice::<f32>(), &[1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn a_shorter_reread_cannot_address_history_the_first_read_evicted() {
+        let mut cache = CausalKvCache::new(1, 4, 0, None);
+        cache.append(kv_block(&[0.0, 1.0, 2.0, 3.0])).unwrap();
+        let (_, positions) = cache.window_prev(2).unwrap();
+        assert_eq!(positions, vec![2, 3]);
+        assert_eq!(retained_key_values(&cache), vec![2.0, 3.0]);
+
+        let err = cache
+            .window_prev(1)
+            .expect_err("a shorter reread needs evicted token 1");
+        assert!(
+            matches!(&err, Error::Msg(message) if message.contains("reread needs evicted token 1")),
+            "got: {err:?}"
         );
-        cache.append(kv_block(&[6.0, 7.0])).unwrap(); // committed 8, tail_base = max(2, 8-4)=4 ⇒ drop [2,3]
-        assert_eq!(cache.stored_tokens(), 8);
         assert_eq!(
             retained_key_values(&cache),
-            vec![0.0, 1.0, 4.0, 5.0, 6.0, 7.0],
-            "sink prefix [0,1] retained; oldest non-sink tail [2,3] evicted"
+            vec![2.0, 3.0],
+            "the rejected reread must leave the cache unchanged"
         );
     }
 
     #[test]
-    fn eviction_before_sink_fills_gathers_pre_eviction_layout() {
-        // Discriminating regression (the reviewer's repro): a single chunk that overshoots
-        // `sink_tokens + max_attention_size` *before* the sink prefix has filled. With
-        // `max_attention_size = 2`, `sink_tokens = 4`, ONE 10-token append (global 0..9) fires the
-        // first eviction while `committed_before (0) < sink_tokens (4)`. The pre-eviction buffer is
-        // contiguous (phys == global, `sink_kept_prev = 0`, `tail_base_old = 0`), so the keep map must
-        // gather physical `[0,1,2,3,8,9]` → retained global `[0,1,2,3,8,9]` (sink `[0..4)` ‖ the last
-        // `max_attention_size = 2` tokens `[8,9]`). The old map used the *post-append* sink length and
-        // gathered `[0,1,2,3,12,13]` — out of bounds on a length-10 axis (unchecked `take_axis` on
-        // Metal ⇒ silent KV corruption / crash). This test therefore fails on the buggy map and passes
-        // on the pre-eviction-layout fix.
-        let mut cache = CausalKvCache::new(1, 2, 4);
+    fn bounded_window_retains_sink_prefix() {
+        // sink 2, window 4 (window includes the sink). The first two global tokens [0,1] are always
+        // retained; the tail rolls under them.
+        let mut cache = CausalKvCache::new(1, 4, 2, None);
+        cache.append(kv_block(&[0.0, 1.0])).unwrap(); // committed 2 (all sink)
+        cache.append(kv_block(&[2.0, 3.0])).unwrap(); // committed 4, retained [0,1,2,3]
+        cache.append(kv_block(&[4.0, 5.0])).unwrap(); // committed 6
+        assert_eq!(
+            retained_key_values(&cache),
+            vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+        );
+        cache.append(kv_block(&[6.0, 7.0])).unwrap();
+        assert_eq!(cache.stored_tokens(), 8);
+        let (prev, positions) = cache.window_prev(1).unwrap();
+        assert_eq!(positions, vec![0, 1, 5, 6, 7]);
+        assert_eq!(
+            retained_key_values(&cache),
+            vec![0.0, 1.0, 5.0, 6.0, 7.0],
+            "sink prefix [0,1] plus the short next read's exact tail are retained"
+        );
+        assert_eq!(cache.retained_tokens(), positions.len());
+        let (k, _) = &prev[0];
+        assert_eq!(k.as_slice::<f32>(), &[0.0, 1.0, 5.0, 6.0, 7.0]);
+    }
+
+    #[test]
+    fn read_time_eviction_before_sink_fills_gathers_the_exact_layout() {
+        // A single first append overshoots both the sink and the window. Eviction is deferred until
+        // the next read supplies its actual size, so the gather maps global positions through the
+        // current physical layout rather than guessing during append. `take_axis` is unchecked on
+        // Metal, making the exact values here a corruption regression rather than just bookkeeping.
+        let mut cache = CausalKvCache::new(1, 2, 4, None);
         cache
             .append(kv_block(&[
                 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0,
@@ -1189,25 +1845,19 @@ mod tests {
         assert_eq!(cache.stored_tokens(), 10);
         assert_eq!(
             cache.retained_tokens(),
-            6,
-            "sink (4) + last max_attention_size (2) = 6 physically retained"
+            10,
+            "append does not guess the next length"
         );
-        // The retained global positions are exactly [0,1,2,3,8,9] (values mirror global position),
-        // gathered without OOB — NOT the buggy [0,1,2,3,12,13] map.
-        assert_eq!(
-            retained_key_values(&cache),
-            vec![0.0, 1.0, 2.0, 3.0, 8.0, 9.0],
-            "sink prefix [0..4) retained; window is the last two tokens [8,9]"
-        );
-        // Values (v) mirror keys (k): the same retained source rows, no OOB.
-        let (_, v) = cache.layer_kv(0).expect("layer 0 populated");
-        assert_eq!(v.as_slice::<f32>(), &[0.0, 1.0, 2.0, 3.0, 8.0, 9.0]);
-        // The next chunk's read window is well-formed and gathers retained rows only (no OOB on read).
-        // With this tiny window (max_attention_size = 2), the sliding tail lands at/after `stored`, so
-        // the next chunk attends just the always-on sink prefix [0,1,2,3].
+
+        // With this tiny window the sliding tail lands at `stored`, so the next chunk attends and
+        // retains just the always-on sink prefix [0,1,2,3].
         let (prev, positions) = cache.window_prev(2).unwrap();
         assert_eq!(positions, vec![0, 1, 2, 3]);
+        assert_eq!(cache.retained_tokens(), 4);
+        assert_eq!(retained_key_values(&cache), vec![0.0, 1.0, 2.0, 3.0]);
         let (k, _) = &prev[0];
         assert_eq!(k.as_slice::<f32>(), &[0.0, 1.0, 2.0, 3.0]);
+        let (_, v) = cache.layer_kv(0).unwrap().expect("layer 0 populated");
+        assert_eq!(v.as_slice::<f32>(), &[0.0, 1.0, 2.0, 3.0]);
     }
 }

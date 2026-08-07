@@ -25,7 +25,8 @@ use mlx_gen::{
 
 use mlx_gen_pid::{resolve_pid_decoder_at_sigma, PidEngine};
 use mlx_gen_sdxl::{
-    decode_image, encode_init_latents, load_controlnet, ControlNet, IpImageEncoder, PID_BACKBONE,
+    decode_image_tiled, encode_init_latents, load_controlnet, ControlNet, IpImageEncoder,
+    SdxlBlockWindow, SdxlForwardPlan, PID_BACKBONE,
 };
 
 use crate::ip_adapter::load_kolors_ip_adapter;
@@ -160,6 +161,15 @@ pub struct KolorsGenerator {
     /// Whether an IP-Adapter was requested (`spec.ip_adapter` is a dir). Same rationale as
     /// [`has_control`](Self::has_control).
     has_ip: bool,
+    /// The load-time `OffloadPolicy` verdict, kept as the DEFAULT for a request that names no
+    /// [`GenerationMemory::stage_residency`](mlx_gen::gen_core::GenerationMemory). Rung 1 is
+    /// request-scoped from SC-15521 onward; the policy is no longer the authority.
+    default_stage_residency: bool,
+    /// Whether THIS load can execute ladder rung 4 — see
+    /// [`memory_strategy::streamable`](crate::memory_strategy::streamable).
+    streamable: bool,
+    loaded_spec: LoadSpec,
+    memory_strategy: mlx_gen::gen_core::MemoryProviderContract,
     residency: Residency<KolorsText, KolorsHeavyOwned>,
 }
 
@@ -207,17 +217,37 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
                 .into(),
         ));
     }
-    // F-181: Kolors quantizes the U-Net + ChatGLM3 DENSE at load, so a `Sequential` + `quantize` load
-    // re-quantizes each generate (repeated compute; the dense transient shrinks the memory win).
+    // F-181: a `Sequential` + `quantize` load over a **dense** snapshot re-quantizes each generate
+    // (repeated compute; the dense transient shrinks the memory win).
+    //
+    // SC-15521 narrowed the condition. The advisory used to fire on every staged quantized load,
+    // including the three shipped `SceneWorks/kolors-mlx` tiers whose weights are already packed —
+    // where nothing re-quantizes and the message is simply wrong. Staged residency is the ladder's
+    // rung 1 and therefore now the *normal* path, so an advisory that cried wolf on every default
+    // request would have trained readers to ignore it. These are the same predicates rung 4 gates
+    // on, so the warning and the rung cannot disagree about which loads pack at load time.
+    //
+    // **Both components are checked, not just the U-Net.** `load_leaves_blocks_lazy` inspects
+    // `unet/` alone, and a Sequential load re-runs the ENTIRE staged schedule per generate — encoder
+    // included. On a mixed snapshot (packed `unet/`, dense `text_encoder/`) a U-Net-only gate
+    // suppressed the advisory while the 6B ChatGLM3 tower genuinely re-quantized on every request,
+    // which is by far the larger of the two costs on this family.
     if let Some(q) = spec.quantize {
-        if matches!(spec.offload_policy, OffloadPolicy::Sequential) {
+        let repacks_each_generate = !crate::memory_strategy::load_leaves_blocks_lazy(spec)
+            || !crate::memory_strategy::text_encoder_leaves_blocks_lazy(spec);
+        if matches!(spec.offload_policy, OffloadPolicy::Sequential) && repacks_each_generate {
             mlx_gen::residency::warn_sequential_requantize(MODEL_ID, q.bits());
         }
     }
+    let memory_strategy = crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec)?;
     Ok(Box::new(KolorsGenerator {
         descriptor: descriptor(),
         has_control: spec.control.is_some(),
         has_ip: matches!(&spec.ip_adapter, Some(WeightsSource::Dir(_))),
+        default_stage_residency: crate::memory_strategy::default_stage_residency(spec),
+        streamable: crate::memory_strategy::streamable(spec),
+        loaded_spec: spec.clone(),
+        memory_strategy,
         residency: build_residency(spec)?,
     }))
 }
@@ -255,6 +285,13 @@ pub(crate) fn build_residency(spec: &LoadSpec) -> Result<Residency<KolorsText, K
             // quantizes in `load_heavy_owned`). Deterministic, so byte-identical across residencies.
             if let Some(q) = spec_text.quantize {
                 text.quantize(q.bits())?;
+            }
+            // Ladder rung 4's `TextEncoder` scope (SC-15521) — armed after the quantize, so the
+            // recorded tier is the one the resident blocks carry. Nothing is installed on a
+            // `GlmBlock` at load, so unlike the U-Net there is nothing to capture; see
+            // `crate::block_stream`.
+            if crate::memory_strategy::streamable(&spec_text) {
+                text.arm_block_stream(&root, spec_text.quantize.map(|q| q.bits()))?;
             }
             Ok(text)
         },
@@ -305,6 +342,20 @@ fn load_heavy_owned(
         None => None,
     };
 
+    // Ladder rung 4 (SC-15521) — armed LAST, and that ordering is the whole correctness argument.
+    // Each `Transformer2D`'s stream captures the installed IP-Adapter K/V projections and the
+    // forward-time residual adapters off its FINISHED resident blocks, so the streamed and resident
+    // paths cannot disagree about which state landed where. Arming before the LoRA merge, the
+    // quantize or the IP install would capture an empty state and silently render without the image
+    // prompt (`mlx_gen_sdxl::block_stream` fails loudly on the IP half rather than allowing that).
+    //
+    // `memory_strategy::streamable` is the single authority for whether this load may arm at all: it
+    // refuses an eager load shape, a load-time quantization over a dense snapshot that materializes
+    // the trunk, and an adapter load that merged its delta into weights the snapshot does not carry.
+    if crate::memory_strategy::streamable(spec) {
+        heavy.arm_block_streams(root, spec.quantize.map(|q| q.bits()))?;
+    }
+
     // PiD decoder overlay (epic 7840, sc-7848): load the `sdxl` student + Gemma caption encoder once
     // when the spec carries it AND this generate uses it (Kolors = SDXL VAE latent space).
     let pid = if use_pid {
@@ -324,10 +375,49 @@ fn load_heavy_owned(
     })
 }
 
-mlx_gen::impl_generator!(KolorsGenerator {
-    validate: |s, req| s.validate_impl(req),
-    generate: generate_impl,
-});
+// Written out rather than `mlx_gen::impl_generator!` because Kolors now answers the memory-strategy
+// hooks (SC-15521); the macro covers only `descriptor`/`validate`/`generate`.
+impl Generator for KolorsGenerator {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
+        self.validate_impl(req).map_err(Into::into)
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
+        Some(&self.memory_strategy)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::MemorySafetyDecision {
+        crate::memory_strategy::safety_check(&self.loaded_spec, &self.memory_strategy, context)
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::Result<Option<Box<dyn mlx_gen::gen_core::MemoryRequestScope + '_>>>
+    {
+        crate::memory_strategy::begin_request(
+            self.descriptor.id,
+            &self.loaded_spec,
+            &self.memory_strategy,
+            context,
+        )
+    }
+}
 
 impl KolorsGenerator {
     /// The rich-`Result` body behind [`Generator::validate`]. Kept on the crate's own
@@ -428,7 +518,44 @@ impl KolorsGenerator {
             .unwrap_or(false);
         let use_curated = scheduler_curated || sampler_curated;
 
-        self.residency.run(
+        // ── Ladder request resolution (SC-15521) ────────────────────────────────────────────────
+        // Rung 1 is request-scoped from here on: the load-time `OffloadPolicy` is only the default a
+        // request that names nothing keeps.
+        let stage_residency =
+            crate::memory_strategy::stage_residency(req, self.default_stage_residency);
+        let window = crate::memory_strategy::transformer_window(req)?;
+        let dit_window = window.and_then(|w| w.dit());
+        let text_window = window.and_then(|w| w.text_encoder());
+        // Two fail-closed guards a calibration harness driving `generate` with a hand-built
+        // `GenerationMemory` must still cross — it never went through `safety_check`.
+        if window.is_some() && !self.streamable {
+            return Err(Error::Unsupported(
+                "kolors: bounded transformer residency needs a DeferredMaterialization load over a \
+                 snapshot directory whose U-Net AND ChatGLM3 blocks stay lazy (a pre-quantized tier, or dense with no \
+                 --quantize) and whose adapters (if any) are replayable; this generator cannot \
+                 stream its blocks"
+                    .into(),
+            ));
+        }
+        if window.is_some() && !stage_residency {
+            return Err(Error::Unsupported(
+                "kolors: bounded transformer residency requires staged residency engaged in the \
+                 same request — without the phase release the 6B ChatGLM3 encoder stays resident \
+                 through the denoise and the request peak does not move"
+                    .into(),
+            ));
+        }
+        let decode_tiling = crate::memory_strategy::decode_tiling(req)?;
+        let forward_plan =
+            SdxlForwardPlan::with_attention(crate::memory_strategy::attention_plan(req)?)
+                .with_window(dit_window.map(|size| SdxlBlockWindow {
+                    size,
+                    cancel: &req.cancel,
+                }));
+
+        self.residency.run_request_scoped(
+            stage_residency,
+            false,
             &req.cancel,
             req.use_pid,
             on_progress,
@@ -437,10 +564,20 @@ impl KolorsGenerator {
             // ChatGLM3 encoder before the U-Net/VAE load — bounding peak to `max(ChatGLM3, U-Net+VAE)`.
             // The negative encode is skipped when guidance is off (F-005, sc-9091): the per-mode
             // assemblies build B=1 conditioning for `cfg <= 1.0` and never read the uncond stream.
+            // Ladder rung 4's `TextEncoder` scope (SC-15521) lands HERE, not in the denoise: the
+            // ChatGLM3-6B tower is the largest component in the model, and at the one advertised
+            // cell where the conditioning phase carries the request peak (`bf16` at `min_size`) a
+            // window over these 28 blocks is what moves it. `encode_windowed` is bit-identical to
+            // `encode` — same constructor, same replayed tier — so the negative encode is windowed
+            // too rather than left resident beside a windowed positive.
             |text: &KolorsText| {
-                let pos = text.encode(&req.prompt)?;
+                let encode = |prompt: &str| match text_window {
+                    Some(size) => text.encode_windowed(prompt, size, &req.cancel),
+                    None => text.encode(prompt),
+                };
+                let pos = encode(&req.prompt)?;
                 let neg = if cfg > 1.0 {
-                    Some(text.encode(negative)?)
+                    Some(encode(negative)?)
                 } else {
                     None
                 };
@@ -653,6 +790,7 @@ impl KolorsGenerator {
                             &req.cancel,
                             on_progress,
                             &req.preview,
+                            forward_plan,
                         )?;
                         let latents = match &vp_plan {
                             Some(p) => {
@@ -661,7 +799,13 @@ impl KolorsGenerator {
                             None => latents,
                         };
                         on_progress(Progress::Decoding);
-                        images.push(decode_image(heavy.vae(), &latents, pid_ref)?);
+                        images.push(decode_image_tiled(
+                            heavy.vae(),
+                            &latents,
+                            pid_ref,
+                            decode_tiling.as_ref(),
+                            Some(&req.cancel),
+                        )?);
                         continue;
                     }
 
@@ -694,6 +838,7 @@ impl KolorsGenerator {
                                 &req.cancel,
                                 on_progress,
                                 &req.preview,
+                                forward_plan,
                             )?
                         } else if let Some((image, scale)) = control {
                             heavy.denoise_controlnet_latents_with_preview(
@@ -711,6 +856,7 @@ impl KolorsGenerator {
                                 &req.cancel,
                                 on_progress,
                                 &req.preview,
+                                forward_plan,
                             )?
                         } else if let Some((tokens, scale)) = &ip {
                             heavy.denoise_ip_latents_with_preview(
@@ -727,6 +873,7 @@ impl KolorsGenerator {
                                 &req.cancel,
                                 on_progress,
                                 &req.preview,
+                                forward_plan,
                             )?
                         } else if let Some((_image, strength)) = img2img {
                             let x0 = legacy_img2img_init.as_ref().expect(
@@ -746,6 +893,7 @@ impl KolorsGenerator {
                                 &req.cancel,
                                 on_progress,
                                 &req.preview,
+                                forward_plan,
                             )?
                         } else {
                             heavy.denoise_latents_with_preview(
@@ -760,6 +908,7 @@ impl KolorsGenerator {
                                 &req.cancel,
                                 on_progress,
                                 &req.preview,
+                                forward_plan,
                             )?
                         };
 
@@ -770,7 +919,13 @@ impl KolorsGenerator {
                         None => latents,
                     };
                     on_progress(Progress::Decoding);
-                    images.push(decode_image(heavy.vae(), &latents, pid_ref)?);
+                    images.push(decode_image_tiled(
+                        heavy.vae(),
+                        &latents,
+                        pid_ref,
+                        decode_tiling.as_ref(),
+                        Some(&req.cancel),
+                    )?);
                 }
                 Ok(GenerationOutput::Images(images))
             },
@@ -856,16 +1011,79 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
 
 // The registration constant bridges the crate's rich `Result` into backend-neutral
 // `gen_core::Result`.
+//
+/// Per-component bytes for this snapshot — **the decoder projected to its resident width, not its
+/// stored one** (sc-15839).
+///
+/// `text_encoder/` and `unet/` are priced from stored bytes because that is what they cost resident:
+/// the ChatGLM3 tower and the U-Net load at their snapshot precision (fp16, or already-packed q4/q8
+/// codes, which `PerComponentBytes` sums verbatim).
+///
+/// The VAE is different, and the difference is a factor of two. [`mlx_gen_sdxl::load_vae`] does
+/// `cast_all(Dtype::Float32)` **unconditionally** — the SDXL VAE is fp16-unstable, so it runs f32
+/// even when everything around it is fp16 — while every cached Kolors tier ships only
+/// `vae/diffusion_pytorch_model.fp16.safetensors` (159.56 MiB). A stored-bytes footprint therefore
+/// declared 159.56 MiB for a component that is 319.11 MiB resident, at **all three** tiers, and the
+/// worker sizes budgets off these facts. Projecting through the shared
+/// [`projected_safetensors_bytes`](mlx_gen::asset_facts::projected_safetensors_bytes) primitive —
+/// the same one z-image, krea, qwen-image and mage use — keeps that arithmetic out of this file.
+///
+/// The file is resolved by [`mlx_gen_sdxl::resolve_vae_weight_file`] rather than summed over `vae/`,
+/// so the footprint sizes exactly the file the resident load opens even on a snapshot that happens
+/// to cache both the f32 master and the fp16 variant.
 pub(crate) fn component_footprint(
     spec: &mlx_gen::LoadSpec,
 ) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
-    mlx_gen::PerComponentBytes::from_spec_subdirs(spec, &["text_encoder"], &["unet"], &["vae"])
+    let mut components = mlx_gen::PerComponentBytes::from_spec_subdirs(
+        spec,
+        &["text_encoder"],
+        &["unet"],
+        &["vae"],
+    )?;
+    let WeightsSource::Dir(root) = &spec.weights else {
+        // Unreachable: `from_spec_subdirs` already rejected a single-file checkpoint.
+        return Ok(components);
+    };
+    components.vae = projected_vae_bytes(root)?;
+    Ok(components)
+}
+
+/// The VAE's **resident** bytes: every tensor of the file [`mlx_gen_sdxl::load_vae`] opens,
+/// materialized f32.
+pub(crate) fn projected_vae_bytes(root: &std::path::Path) -> mlx_gen::gen_core::Result<u64> {
+    let file = mlx_gen_sdxl::resolve_vae_weight_file(root)
+        .map_err(|e| mlx_gen::gen_core::Error::Msg(format!("kolors: {e}")))?;
+    mlx_gen::asset_facts::projected_safetensors_bytes(&file, |_| {
+        mlx_gen::asset_facts::ResidentProjection::Float32
+    })
 }
 
 mlx_gen::register_generators! {
     pub(crate) const REGISTRATION = descriptor => load;
     footprint = component_footprint
 }
+
+/// The weights-free memory-strategy registration (SC-15521) — the shared registry conformance
+/// suite's entry point into this provider's declaration.
+pub const MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
+    mlx_gen::gen_core::MemoryRegistration {
+        provider_id: MODEL_ID,
+        contract: |spec| {
+            crate::memory_strategy::weights_free_memory_strategy_contract(MODEL_ID, spec)
+        },
+        safety_check: crate::memory_strategy::safety_check,
+    };
+
+/// The weights-free **behavioral** registration: valid fixtures plus a request scope, so the shared
+/// suite can drive every declared rung's lifecycle without loading a 6 GB tier.
+pub const MEMORY_BEHAVIOR_REGISTRATION: mlx_gen::gen_core::MemoryBehaviorRegistration =
+    mlx_gen::gen_core::MemoryBehaviorRegistration {
+        provider_id: MODEL_ID,
+        valid_fixtures: crate::memory_strategy::registered_valid_fixture,
+        begin_request: |spec, contract, context| {
+            crate::memory_strategy::registered_begin_request(MODEL_ID, spec, contract, context)
+        },
+    };
 
 #[cfg(test)]
 mod tests {

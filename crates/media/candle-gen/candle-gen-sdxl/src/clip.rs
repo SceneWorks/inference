@@ -670,13 +670,11 @@ mod tests {
     }
 
     fn vb_from_map(
+        tmp: &tempfile::TempDir,
         map: HashMap<String, Tensor>,
         tag: &str,
     ) -> (VarBuilder<'static>, std::path::PathBuf) {
-        let tmp = std::env::temp_dir().join(format!(
-            "sc9527_clip_{tag}_{}.safetensors",
-            std::process::id()
-        ));
+        let tmp = tmp.path().join(format!("sc9527_clip_{tag}.safetensors"));
         candle_core::safetensors::save(&map, &tmp).unwrap();
         // SAFETY: we just wrote this file and nothing else touches it during the test.
         let st = unsafe { MmapedSafetensors::new(&tmp).unwrap() };
@@ -691,6 +689,7 @@ mod tests {
     /// (CLIP-L `sdxl()` shape and bigG `sdxl2()` shape at tiny dims).
     #[test]
     fn packed_detect_fires_on_clip_layout() -> Result<()> {
+        let tmp = tempfile::tempdir().unwrap();
         // A CLIP-L-shaped tiny config (QuickGelu, 4 heads, 2 layers) and a bigG-shaped one (Gelu, 8
         // heads, 3 layers) — the two encoders' distinct layer/head/activation layouts. `embed_dim` /
         // `intermediate_size` stay multiples of the group 64 so the synthetic pack tiles cleanly (the
@@ -702,14 +701,14 @@ mod tests {
             ..tiny_cfg()
         };
         for c in [tiny_cfg(), bigg] {
-            let (vb_p, tmp_p) = vb_from_map(build_checkpoint(&c, true), "detect_packed");
+            let (vb_p, tmp_p) = vb_from_map(&tmp, build_checkpoint(&c, true), "detect_packed");
             let packed = ClipTextTransformer::new_gs(vb_p, &c, GS)?;
             assert!(
                 packed.all_projections_packed(),
                 "every CLIP Linear must load packed on a `.scales` checkpoint"
             );
 
-            let (vb_d, tmp_d) = vb_from_map(build_checkpoint(&c, false), "detect_dense");
+            let (vb_d, tmp_d) = vb_from_map(&tmp, build_checkpoint(&c, false), "detect_dense");
             let dense = ClipTextTransformer::new_gs(vb_d, &c, GS)?;
             assert!(
                 !dense.all_projections_packed(),
@@ -728,9 +727,10 @@ mod tests {
     /// dequant-to-dense-matmul). Runs both the last-hidden and the penultimate paths.
     #[test]
     fn packed_vs_dense_encode_parity() -> Result<()> {
+        let tmp = tempfile::tempdir().unwrap();
         let c = tiny_cfg();
-        let (vb_p, tmp_p) = vb_from_map(build_checkpoint(&c, true), "parity_packed");
-        let (vb_d, tmp_d) = vb_from_map(build_checkpoint(&c, false), "parity_dense");
+        let (vb_p, tmp_p) = vb_from_map(&tmp, build_checkpoint(&c, true), "parity_packed");
+        let (vb_d, tmp_d) = vb_from_map(&tmp, build_checkpoint(&c, false), "parity_dense");
         let packed = ClipTextTransformer::new_gs(vb_p, &c, GS)?;
         let dense = ClipTextTransformer::new_gs(vb_d, &c, GS)?;
         assert!(packed.all_projections_packed());
@@ -766,13 +766,14 @@ mod tests {
     /// head packs too (sc-9527 AC: the bigG final text projection packed-detects).
     #[test]
     fn packed_text_projection_matches_dense() -> Result<()> {
+        let tmp = tempfile::tempdir().unwrap();
         let dim = 64usize;
         let mut mp = HashMap::new();
         pack(&mut mp, "text_projection", dim, dim, false);
-        let (vb_p, tmp_p) = vb_from_map(mp, "tp_packed");
+        let (vb_p, tmp_p) = vb_from_map(&tmp, mp, "tp_packed");
         let mut md = HashMap::new();
         dense_lin(&mut md, "text_projection", dim, dim, false);
-        let (vb_d, tmp_d) = vb_from_map(md, "tp_dense");
+        let (vb_d, tmp_d) = vb_from_map(&tmp, md, "tp_dense");
 
         let tp_p = text_projection(&vb_p, dim, GS)?;
         let tp_d = text_projection(&vb_d, dim, GS)?;

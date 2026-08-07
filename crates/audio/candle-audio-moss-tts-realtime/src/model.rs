@@ -1066,7 +1066,8 @@ mod tests {
 
     #[test]
     fn load_rejects_unsupported_spec_shapes() {
-        let dir = std::env::temp_dir();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let spec = LoadSpec::new(WeightsSource::File(dir.join("x.safetensors")));
         assert!(load(&spec).is_err());
         let mut spec = spec_with_codec(dir.clone());
@@ -1079,8 +1080,8 @@ mod tests {
     /// never fetched mid-render (epic 13657). Driven through the real `load` by the shared testkit.
     #[test]
     fn missing_codec_component_fails_at_load() {
-        let dir = std::env::temp_dir().join("moss-tts-rt-load-gate");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let base = spec_with_codec(dir);
         // The fully-provisioned spec loads (the codec is lazy — no directory read yet).
         assert!(
@@ -1093,8 +1094,8 @@ mod tests {
 
     #[test]
     fn pre_tripped_cancel_returns_typed_canceled_before_any_heavy_work() {
-        let dir = std::env::temp_dir().join("moss-tts-rt-missing-snapshot");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let g = load_generator(&spec_with_codec(dir)).unwrap();
         let flag = CancelFlag::new();
         flag.cancel();

@@ -73,8 +73,8 @@ fn mad(a: &[u8], b: &[u8]) -> f32 {
     sum as f32 / a.len() as f32
 }
 
-fn save(img: &Image, name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join("krea_tap_reweight_spike");
+fn save(tmp: &tempfile::TempDir, img: &Image, name: &str) -> PathBuf {
+    let dir = tmp.path().join("krea_tap_reweight_spike");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(format!("{name}.png"));
     image::save_buffer(
@@ -125,6 +125,7 @@ fn sweep() -> Vec<(&'static str, Vec<f32>)> {
 #[test]
 #[ignore = "needs the real Krea 2 Turbo snapshot (set KREA_TURBO_DIR); ~34 GB resident, CUDA"]
 fn tap_reweight_sweep_1024() {
+    let tmp = tempfile::tempdir().unwrap();
     let Some(root) = snapshot() else {
         eprintln!("skipping: set KREA_TURBO_DIR");
         return;
@@ -169,7 +170,7 @@ fn tap_reweight_sweep_1024() {
             Some(b) => mad(b, &img.pixels),
             None => 0.0,
         };
-        let path = save(img, label);
+        let path = save(&tmp, img, label);
         eprintln!(
             "{label:<18} {std:>7.1} {distinct:>8} {adj:>6.1} {mad_v:>7.2} {coh:>7}  [{:.1}s] {}",
             t.elapsed().as_secs_f32(),
@@ -195,6 +196,7 @@ fn tap_reweight_sweep_1024() {
 #[test]
 #[ignore = "needs the real Krea 2 Turbo snapshot (set KREA_TURBO_DIR); ~34 GB resident, CUDA"]
 fn text_style_gain_sweep_1024() {
+    let tmp = tempfile::tempdir().unwrap();
     let Some(root) = snapshot() else {
         eprintln!("skipping: set KREA_TURBO_DIR");
         return;
@@ -240,7 +242,7 @@ fn text_style_gain_sweep_1024() {
             .as_ref()
             .map(|b| mad(b, &img.pixels))
             .unwrap_or(0.0);
-        let path = save(img, label);
+        let path = save(&tmp, img, label);
         eprintln!(
             "{label:<12} {std:>7.1} {distinct:>8} {adj:>6.1} {mad_v:>7.2} {coh:>5}  {}",
             path.display()

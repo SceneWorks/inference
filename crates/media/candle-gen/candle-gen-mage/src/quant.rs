@@ -195,15 +195,8 @@ mod tests {
             tensors.insert(format!("{base}.scales"), scales);
             tensors.insert(format!("{base}.biases"), biases);
         }
-        let dir = std::env::temp_dir().join(format!(
-            "sc16025_mage_packed_dit_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir)?;
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         candle_core::safetensors::save(&tensors, dir.join("model.safetensors"))?;
         std::fs::write(
             dir.join("config.json"),
@@ -222,7 +215,6 @@ mod tests {
             .expect_err("a packed q4 body cannot satisfy a q8 component floor");
         assert!(error.to_string().contains("below the requested 8-bit"));
 
-        std::fs::remove_dir_all(&dir).ok();
         Ok(())
     }
 }

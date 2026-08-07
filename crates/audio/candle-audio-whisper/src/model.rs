@@ -355,7 +355,8 @@ mod tests {
 
     #[test]
     fn validate_rejects_empty_and_overlong_audio() {
-        let t = load(&LoadSpec::new(WeightsSource::Dir(std::env::temp_dir()))).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let t = load(&LoadSpec::new(WeightsSource::Dir(tmp.path().to_path_buf()))).unwrap();
         // Empty audio → rejected.
         assert!(t.validate(&TranscribeRequest::default()).is_err());
         // Over the max duration → rejected.
@@ -374,21 +375,22 @@ mod tests {
 
     #[test]
     fn load_rejects_unsupported_spec_shapes() {
+        let tmp = tempfile::tempdir().unwrap();
         // A single file is not a snapshot dir.
         assert!(load(&LoadSpec::new(WeightsSource::File(
-            std::env::temp_dir().join("model.safetensors")
+            tmp.path().join("model.safetensors")
         )))
         .is_err());
         // Quantization is refused (typed Unsupported).
-        let mut spec = LoadSpec::new(WeightsSource::Dir(std::env::temp_dir()));
+        let mut spec = LoadSpec::new(WeightsSource::Dir(tmp.path().to_path_buf()));
         spec.quantize = Some(gen_core::Quant::Q4);
         assert!(matches!(load(&spec), Err(gen_core::Error::Unsupported(_))));
     }
 
     #[test]
     fn pre_tripped_cancel_returns_typed_canceled_before_any_heavy_work() {
-        let dir = std::env::temp_dir().join("whisper-missing-snapshot");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let t = load(&LoadSpec::new(WeightsSource::Dir(dir))).unwrap();
         let flag = CancelFlag::new();
         flag.cancel();

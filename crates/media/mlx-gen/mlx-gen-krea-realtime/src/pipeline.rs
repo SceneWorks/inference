@@ -487,11 +487,8 @@ mod tests {
         }
     }
 
-    fn actual_tiny_adapter_report() -> AdapterApplyReport {
-        let dir = std::env::temp_dir().join(format!(
-            "mlx_gen_krea_pipeline_report_test_{}",
-            std::process::id()
-        ));
+    fn actual_tiny_adapter_report(tmp: &tempfile::TempDir) -> AdapterApplyReport {
+        let dir = tmp.path().join("mlx_gen_krea_pipeline_report_test");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(format!("actual_report_{}.safetensors", std::process::id()));
         let delta = Array::from_slice(&[0.25f32, -0.5], &[2]);
@@ -561,7 +558,8 @@ mod tests {
     /// `finish_reported_generation` leaves the accessor empty and fails.
     #[test]
     fn every_generation_route_publishes_actual_adapter_application_output() {
-        let actual = actual_tiny_adapter_report();
+        let tmp = tempfile::tempdir().unwrap();
+        let actual = actual_tiny_adapter_report(&tmp);
         let image = Image {
             width: 1,
             height: 1,

@@ -22,6 +22,9 @@ use mlx_llm::{write_hf_snapshot, LlamaProvider};
 
 use mlx_rs::Dtype;
 
+mod common;
+use common::{assert_fixture_is_a_guarded_entry, Fixture};
+
 const PROMPT: &str = "The capital of France is";
 
 fn source_dir() -> Option<String> {
@@ -34,8 +37,13 @@ fn source_dir() -> Option<String> {
     }
 }
 
-fn tmp_out(label: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("mlx-llm-hfsnap-{label}-{}", std::process::id()))
+/// A guarded output path for `write_hf_snapshot` (sc-17768).
+///
+/// Points at an entry *inside* a `TempDir` root because the writer creates the output directory
+/// itself, refuses a non-empty one, and stages next to it; the guard then takes the whole
+/// (multi-GiB, on a real model) snapshot with it on `Drop`, including out of a panicking test.
+fn tmp_out(label: &str) -> Fixture {
+    Fixture::new(&format!("mlx-llm-hfsnap-{label}-"), Some("out"))
 }
 
 fn greedy_request() -> TextLlmRequest {
@@ -115,8 +123,6 @@ fn hf_prepare_dense_q4_q8_loads_and_generates() {
             PROVIDER_ID,
             "{label}: registry routes to mlx provider"
         );
-
-        std::fs::remove_dir_all(&out).ok();
     }
 }
 
@@ -160,6 +166,11 @@ fn hf_dense_passthrough_is_bit_identical() {
         "dense passthrough bit-identical across {} tensors",
         src.len()
     );
+}
 
-    std::fs::remove_dir_all(&out).ok();
+/// Drop-regression for this suite's fixture helper: the guarded root leaves with the value. Flip
+/// [`Fixture::new`]'s builder to `disable_cleanup(true)`, or drop the `Some(..)`, and this goes RED.
+#[test]
+fn snapshot_hf_fixture_is_self_removing() {
+    assert_fixture_is_a_guarded_entry(tmp_out("guard"));
 }

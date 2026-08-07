@@ -33,7 +33,7 @@ fn tiny_arch() -> Sd3Arch {
 
 /// Build an in-memory `Weights` carrying exactly the expected tensor set for `arch`, every tensor
 /// filled with ones at its expected shape.
-fn synthetic_weights(arch: &Sd3Arch) -> Weights {
+fn synthetic_weights(tmp: &tempfile::TempDir, arch: &Sd3Arch) -> Weights {
     let entries: Vec<(String, Array)> = expected_transformer_tensors(arch)
         .into_iter()
         .map(|e| {
@@ -41,10 +41,9 @@ fn synthetic_weights(arch: &Sd3Arch) -> Weights {
             (e.key, Array::ones::<f32>(&dims).unwrap())
         })
         .collect();
-    let path = std::env::temp_dir().join(format!(
-        "mlx_gen_sd3_synthetic_{}_{}.safetensors",
-        entries.len(),
-        std::process::id()
+    let path = tmp.path().join(format!(
+        "mlx_gen_sd3_synthetic_{}.safetensors",
+        entries.len()
     ));
     Array::save_safetensors(
         entries.iter().map(|(k, v)| (k.as_str(), v)),
@@ -142,8 +141,9 @@ fn top_level_shapes_match_arch() {
 
 #[test]
 fn build_target_state_dict_is_identity_over_expected_keys() {
+    let tmp = tempfile::tempdir().unwrap();
     let arch = tiny_arch();
-    let src = synthetic_weights(&arch);
+    let src = synthetic_weights(&tmp, &arch);
     let out = build_target_state_dict(&src, &arch).unwrap();
 
     assert_eq!(out.len(), expected_tensor_count(&arch));
@@ -158,8 +158,9 @@ fn build_target_state_dict_is_identity_over_expected_keys() {
 
 #[test]
 fn build_target_state_dict_drops_non_arch_tensors() {
+    let tmp = tempfile::tempdir().unwrap();
     let arch = tiny_arch();
-    let mut src = synthetic_weights(&arch);
+    let mut src = synthetic_weights(&tmp, &arch);
     // A stray tensor a checkpoint might carry (e.g. an EMA / training artifact) — must not leak.
     src.insert(
         "some.stray.tensor".to_string(),
@@ -182,9 +183,10 @@ fn build_target_state_dict_errors_on_missing_tensor() {
         })
         .collect();
     entries.retain(|(k, _)| k != "proj_out.weight");
-    let path = std::env::temp_dir().join(format!(
-        "mlx_gen_sd3_missing_{}.safetensors",
-        std::process::id()
+    let path_tmp = tempfile::tempdir().unwrap();
+    let path = path_tmp.path().join(format!(
+        "mlx_gen_sd3_synthetic_{}.safetensors",
+        entries.len()
     ));
     Array::save_safetensors(
         entries.iter().map(|(k, v)| (k.as_str(), v)),
@@ -239,11 +241,10 @@ fn validate_arch_reports_missing_extra_and_bad_shape() {
 
 /// Build a `transformer/` dir on disk holding the dense synthetic tensor set for `arch` (sharded as a
 /// single file + a `config.json`), the input the offline pre-quantizer consumes.
-fn write_dense_transformer_dir(arch: &Sd3Arch) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "mlx_gen_sd3_e7_dense_{}_{}",
-        expected_tensor_count(arch),
-        std::process::id()
+fn write_dense_transformer_dir(tmp: &tempfile::TempDir, arch: &Sd3Arch) -> PathBuf {
+    let dir = tmp.path().join(format!(
+        "mlx_gen_sd3_e7_dense_{}",
+        expected_tensor_count(arch)
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let entries: Vec<(String, Array)> = expected_transformer_tensors(arch)
@@ -274,6 +275,7 @@ fn write_dense_transformer_dir(arch: &Sd3Arch) -> PathBuf {
 /// synthetic Large-family arch (no real weights), validating the round trip without Metal/HF.
 #[test]
 fn prequantized_on_disk_round_trips_and_loads_packed() {
+    let tmp = tempfile::tempdir().unwrap();
     use mlx_gen::weights::Weights;
     use mlx_gen_sd3::{quantize_sd3_dir, Sd3Transformer};
 
@@ -295,12 +297,11 @@ fn prequantized_on_disk_round_trips_and_loads_packed() {
         time_proj_dim: 64,
         dual_attention_layers: 0,
     };
-    let src = write_dense_transformer_dir(&arch);
+    let src = write_dense_transformer_dir(&tmp, &arch);
 
     for bits in [8, 4] {
-        let dst =
-            std::env::temp_dir().join(format!("mlx_gen_sd3_e7_q{bits}_{}", std::process::id()));
-        std::fs::remove_dir_all(&dst).ok();
+        let dst_tmp = tempfile::tempdir().unwrap();
+        let dst = dst_tmp.path().to_path_buf();
         quantize_sd3_dir(&arch, &src, &dst, bits, 64).unwrap();
 
         // (a) The packed artifact + manifest exist on disk.
@@ -339,8 +340,6 @@ fn prequantized_on_disk_round_trips_and_loads_packed() {
         // the auto-detect `lin` consumed the triple; a dense loader would error on the u32 codes.)
         let t = Sd3Transformer::from_dir(&dst, &arch).expect("load pre-quantized transformer");
         assert_eq!(t.arch().num_layers, arch.num_layers);
-
-        std::fs::remove_dir_all(&dst).ok();
     }
     std::fs::remove_dir_all(&src).ok();
 }
@@ -354,10 +353,8 @@ fn safetensors_header_reads_shapes_without_body() {
     buf.extend_from_slice(&(header.len() as u64).to_le_bytes());
     buf.extend_from_slice(header);
     buf.extend_from_slice(&[7u8; 24]); // body must not be needed
-    let path = std::env::temp_dir().join(format!(
-        "mlx_gen_sd3_hdr_{}.safetensors",
-        std::process::id()
-    ));
+    let path_tmp = tempfile::tempdir().unwrap();
+    let path = path_tmp.path().join("mlx_gen_sd3_missing.safetensors");
     std::fs::File::create(&path)
         .unwrap()
         .write_all(&buf)

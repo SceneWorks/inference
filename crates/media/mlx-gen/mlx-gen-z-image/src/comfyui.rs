@@ -354,11 +354,8 @@ mod tests {
 
     #[test]
     fn fused_checkpoint_phase_loaders_filter_before_building_arrays() {
-        let dir = std::env::temp_dir().join(format!(
-            "z_image_comfyui_phase_filter_{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         let path = dir.join("combined.safetensors");
         let text = Array::from_slice(&[1.0f32], &[1]);
         let transformer = Array::from_slice(&[2.0f32], &[1]);
@@ -382,6 +379,5 @@ mod tests {
             ["block.weight"]
         );
         assert_eq!(vae_only.keys().collect::<Vec<_>>(), ["decoder.weight"]);
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

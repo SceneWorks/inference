@@ -1240,7 +1240,8 @@ mod tests {
         map.insert("attn.to_out.0.biases".into(), b);
         map.insert("attn.to_q.weight".into(), dense_w);
 
-        let dir = std::env::temp_dir().join(format!("sc9411_detect_{}", std::process::id()));
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         write_component(&dir, map, true);
         let w = Weights::from_dir(&dir, &dev, DType::F32)?;
         assert_eq!(w.packed().map(|c| c.group_size), Some(G as i32));
@@ -1259,7 +1260,6 @@ mod tests {
         let cos = cosine(&packed.forward(&x)?, &grid_lin.forward(&x)?);
         assert!(cos > 0.99999, "group-64 packed vs grid cosine {cos:.6}");
 
-        std::fs::remove_dir_all(&dir).ok();
         Ok(())
     }
 
@@ -1279,14 +1279,8 @@ mod tests {
             ("attn.to_q.scales".to_owned(), scales),
             ("attn.to_q.biases".to_owned(), biases),
         ]);
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "sc16587_krea_read_only_{}_{nonce}",
-            std::process::id()
-        ));
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         let component = root.join("snapshot/transformer");
         let external = root.join("external-cache");
         write_component(&component, map, true);
@@ -1317,7 +1311,6 @@ mod tests {
         assert!(cosine(&packed.forward(&x)?, &dense.forward(&x)?) > 0.99999);
 
         drop(weights);
-        std::fs::remove_dir_all(root).ok();
         Ok(())
     }
 
@@ -1333,13 +1326,13 @@ mod tests {
             "attn.to_q.weight".into(),
             Tensor::randn(0f32, 1f32, (out_dim, in_dim), &dev)?,
         );
-        let dir = std::env::temp_dir().join(format!("sc9411_dense_{}", std::process::id()));
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         write_component(&dir, map, false);
 
         let w = Weights::from_dir(&dir, &dev, DType::F32)?;
         assert!(w.packed().is_none(), "no quantization block ⇒ dense tier");
         assert!(!linear_detect(&w, "attn.to_q", false)?.is_packed());
-        std::fs::remove_dir_all(&dir).ok();
         Ok(())
     }
 
@@ -1355,7 +1348,8 @@ mod tests {
         map.insert("embed_tokens.weight".into(), wq);
         map.insert("embed_tokens.scales".into(), s);
         map.insert("embed_tokens.biases".into(), b);
-        let dir = std::env::temp_dir().join(format!("sc9411_emb_{}", std::process::id()));
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         write_component(&dir, map, true);
 
         let w = Weights::from_dir(&dir, &dev, DType::F32)?;
@@ -1372,7 +1366,6 @@ mod tests {
             .max_all()?
             .to_scalar::<f32>()?;
         assert_eq!(dev_max, 0.0, "packed embedding deviates from the grid");
-        std::fs::remove_dir_all(&dir).ok();
         Ok(())
     }
 
@@ -1391,7 +1384,8 @@ mod tests {
         map.insert("attn.to_q.weight".into(), wq);
         map.insert("attn.to_q.scales".into(), s);
         map.insert("attn.to_q.biases".into(), b);
-        let dir = std::env::temp_dir().join(format!("sc9411_overlay_{}", std::process::id()));
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         write_component(&dir, map, true);
         let mut w = Weights::from_dir(&dir, &dev, DType::F32)?;
 
@@ -1419,7 +1413,6 @@ mod tests {
             dev_max, 0.0,
             "overlay forward must equal the merged dense weight"
         );
-        std::fs::remove_dir_all(&dir).ok();
         Ok(())
     }
 
@@ -1438,7 +1431,8 @@ mod tests {
         map.insert("attn.to_q.weight".into(), wq);
         map.insert("attn.to_q.scales".into(), s);
         map.insert("attn.to_q.biases".into(), b);
-        let dir = std::env::temp_dir().join(format!("sc9411_base_{}", std::process::id()));
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         write_component(&dir, map, true);
         let w = Weights::from_dir(&dir, &dev, DType::F32)?;
         let base = w.get_cpu_merge_base("attn.to_q.weight")?;
@@ -1447,13 +1441,13 @@ mod tests {
             cosine(&base, &grid) > 0.99999,
             "reconstructed base must equal the affine grid"
         );
-        std::fs::remove_dir_all(&dir).ok();
 
         // Dense tier: base is the on-disk weight (identity round-trip).
         let dense_w = Tensor::randn(0f32, 1f32, (out_dim, in_dim), &dev)?;
         let mut dmap: HashMap<String, Tensor> = HashMap::new();
         dmap.insert("attn.to_q.weight".into(), dense_w.clone());
-        let ddir = std::env::temp_dir().join(format!("sc9411_base_dense_{}", std::process::id()));
+        let ddir_tmp = tempfile::tempdir().unwrap();
+        let ddir = ddir_tmp.path().to_path_buf();
         write_component(&ddir, dmap, false);
         let dw = Weights::from_dir(&ddir, &dev, DType::F32)?;
         let dbase = dw.get_cpu_merge_base("attn.to_q.weight")?;
@@ -1462,7 +1456,6 @@ mod tests {
             .max_all()?
             .to_scalar::<f32>()?;
         assert_eq!(dev_max, 0.0, "dense tier base is the on-disk weight");
-        std::fs::remove_dir_all(&ddir).ok();
         Ok(())
     }
 
@@ -1481,8 +1474,8 @@ mod tests {
         map.insert("attn.to_q.weight".into(), wq);
         map.insert("attn.to_q.scales".into(), s);
         map.insert("attn.to_q.biases".into(), b);
-        let dir =
-            std::env::temp_dir().join(format!("sc11727_linear_packed_{}", std::process::id()));
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         write_component(&dir, map, true);
         let w = Weights::from_dir(&dir, &dev, DType::F32)?;
 
@@ -1507,7 +1500,6 @@ mod tests {
             dev_max < 1e-4,
             "packed linear forward must match the dense grid (max dev {dev_max})"
         );
-        std::fs::remove_dir_all(&dir).ok();
         Ok(())
     }
 
@@ -1518,8 +1510,8 @@ mod tests {
     /// of silently swallowing to the dense path.
     #[test]
     fn read_packed_config_absent_vs_corrupt() {
-        let dir = std::env::temp_dir().join(format!("sc9426_krea_cfg_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
 
         // A `quantization` block → packed tier.
         let packed = dir.join("packed");
@@ -1562,8 +1554,6 @@ mod tests {
             format!("{err}").contains("config.json"),
             "the error should name the offending file, got: {err}"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     // ── INT8-ConvRot (sc-9300) ──────────────────────────────────────────────────────────────────
@@ -1694,9 +1684,8 @@ mod tests {
         let (out_dim, in_dim) = (64usize, 128usize);
         let (map, ref_w) = convrot_int8_weight(out_dim, in_dim);
 
-        let path = std::env::temp_dir()
-            .join(format!("sc9601_convrot_{}", std::process::id()))
-            .join("krea2_int8_convrot.safetensors");
+        let path_tmp = tempfile::tempdir().unwrap();
+        let path = path_tmp.path().join("krea2_int8_convrot.safetensors");
         write_single_file(&path, map);
 
         let w = Weights::from_convrot_file(&path, &dev, DType::F32)?;
@@ -1754,9 +1743,8 @@ mod tests {
             "blocks.0.attn.wk.weight".into(),
             Tensor::randn(0f32, 1f32, (32, in_dim), &dev)?,
         );
-        let path = std::env::temp_dir()
-            .join(format!("sc9300_convrot_dense_{}", std::process::id()))
-            .join("m.safetensors");
+        let path_tmp = tempfile::tempdir().unwrap();
+        let path = path_tmp.path().join("m.safetensors");
         write_single_file(&path, map);
         let w = Weights::from_convrot_file(&path, &dev, DType::F32)?;
 
@@ -1785,7 +1773,8 @@ mod tests {
             "transformer_blocks.0.attn.to_q.weight".into(),
             Tensor::randn(0f32, 1f32, (64, 128), &dev)?,
         );
-        let dir = std::env::temp_dir().join(format!("sc9300_plain_{}", std::process::id()));
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         write_component(&dir, map, false);
         let w = Weights::from_dir(&dir, &dev, DType::F32)?;
         assert!(!w.is_convrot());
@@ -1796,7 +1785,6 @@ mod tests {
             !lin.is_convrot_int8() && !lin.is_packed(),
             "plain tier stays dense"
         );
-        std::fs::remove_dir_all(&dir).ok();
         Ok(())
     }
 
@@ -1891,9 +1879,8 @@ mod tests {
     #[test]
     fn plain_int8_native_file_dequants_per_row_without_rotation() -> Result<()> {
         let dev = Device::Cpu;
-        let path = std::env::temp_dir()
-            .join(format!("sc14023_plain_int8_{}", std::process::id()))
-            .join("kreamania_variant4.safetensors");
+        let path_tmp = tempfile::tempdir().unwrap();
+        let path = path_tmp.path().join("kreamania_variant4.safetensors");
         write_plain_int8_native_file(
             &path,
             r#"{"format":"int8_tensorwise","per_row":true}"#,
@@ -1922,9 +1909,8 @@ mod tests {
 
     #[test]
     fn plain_int8_native_file_accepts_scalar_scale_for_single_row() -> Result<()> {
-        let path = std::env::temp_dir()
-            .join(format!("sc14023_plain_int8_scalar_{}", std::process::id()))
-            .join("kreamania_variant4.safetensors");
+        let path_tmp = tempfile::tempdir().unwrap();
+        let path = path_tmp.path().join("kreamania_variant4.safetensors");
         write_plain_int8_native_file_with_shape(
             &path,
             r#"{"format":"int8_tensorwise","per_row":true}"#,
@@ -1952,14 +1938,9 @@ mod tests {
             (r#"{"format":"mxfp4","per_row":true}"#, "int8_tensorwise"),
             (r#"{"format":"int8_tensorwise","per_row":false}"#, "per_row"),
         ];
-        for (index, (descriptor, expected)) in cases.into_iter().enumerate() {
-            let path = std::env::temp_dir()
-                .join(format!(
-                    "sc14023_plain_int8_bad_desc_{}_{}",
-                    std::process::id(),
-                    index
-                ))
-                .join("bad.safetensors");
+        for (descriptor, expected) in cases {
+            let path_tmp = tempfile::tempdir().unwrap();
+            let path = path_tmp.path().join("bad.safetensors");
             write_plain_int8_native_file(&path, descriptor, vec![2], &[0.5, 2.0]);
             let error = match Weights::from_native_file(&path, &Device::Cpu, DType::F32) {
                 Ok(_) => panic!("invalid descriptor must fail"),
@@ -1972,12 +1953,8 @@ mod tests {
 
     #[test]
     fn convrot_constructor_rejects_plain_int8_descriptor() {
-        let path = std::env::temp_dir()
-            .join(format!(
-                "sc14023_plain_int8_wrong_route_{}",
-                std::process::id()
-            ))
-            .join("plain.safetensors");
+        let path_tmp = tempfile::tempdir().unwrap();
+        let path = path_tmp.path().join("plain.safetensors");
         write_plain_int8_native_file(
             &path,
             r#"{"format":"int8_tensorwise","per_row":true}"#,
@@ -1994,14 +1971,9 @@ mod tests {
 
     #[test]
     fn plain_int8_native_file_rejects_non_per_row_scale_shape() {
-        for (index, scale_shape) in [vec![1], vec![]].into_iter().enumerate() {
-            let path = std::env::temp_dir()
-                .join(format!(
-                    "sc14023_plain_int8_bad_scale_{}_{}",
-                    std::process::id(),
-                    index
-                ))
-                .join("bad.safetensors");
+        for scale_shape in [vec![1], vec![]] {
+            let path_tmp = tempfile::tempdir().unwrap();
+            let path = path_tmp.path().join("bad.safetensors");
             write_plain_int8_native_file(
                 &path,
                 r#"{"format":"int8_tensorwise","per_row":true}"#,
@@ -2030,9 +2002,8 @@ mod tests {
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (64usize, 128usize);
         let (map, ref_wq) = dense_native_file(out_dim, in_dim);
-        let path = std::env::temp_dir()
-            .join(format!("sc14022_native_dense_{}", std::process::id()))
-            .join("kreamania_variant5.safetensors");
+        let path_tmp = tempfile::tempdir().unwrap();
+        let path = path_tmp.path().join("kreamania_variant5.safetensors");
         write_single_file(&path, map);
 
         let w = Weights::from_native_file(&path, &dev, DType::F32)?;
@@ -2092,9 +2063,8 @@ mod tests {
 
         // Dense native file (prefixed): native_keys ON, rotation OFF.
         let (dmap, _wq) = dense_native_file(out_dim, in_dim);
-        let dpath = std::env::temp_dir()
-            .join(format!("sc14022_flags_dense_{}", std::process::id()))
-            .join("dense.safetensors");
+        let dpath_tmp = tempfile::tempdir().unwrap();
+        let dpath = dpath_tmp.path().join("dense.safetensors");
         write_single_file(&dpath, dmap);
         let dense = Weights::from_native_file(&dpath, &dev, DType::F32)?;
         assert!(dense.uses_native_keys());
@@ -2102,9 +2072,8 @@ mod tests {
 
         // INT8-ConvRot file (bare native keys): native_keys ON, rotation ON.
         let (cmap, _ref) = convrot_int8_weight(out_dim, in_dim);
-        let cpath = std::env::temp_dir()
-            .join(format!("sc14022_flags_convrot_{}", std::process::id()))
-            .join("convrot.safetensors");
+        let cpath_tmp = tempfile::tempdir().unwrap();
+        let cpath = cpath_tmp.path().join("convrot.safetensors");
         write_single_file(&cpath, cmap);
         let convrot = Weights::from_convrot_file(&cpath, &dev, DType::F32)?;
         assert!(convrot.uses_native_keys());

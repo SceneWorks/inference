@@ -748,16 +748,14 @@ mod tests {
     /// resolve-skip, no backbone I/O.
     #[test]
     fn fast_load_skips_distill_lora_when_premerged_marker_present() {
-        let dir =
-            std::env::temp_dir().join(format!("sc13787_premerged_marker_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create tempdir");
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         // The marker keys off existence only; an empty file is enough. No LoRA file, no component.
         std::fs::write(dir.join(DISTILL_MERGED_MARKER), b"").expect("write marker");
 
         let spec = LoadSpec::new(WeightsSource::Dir(dir.clone()));
         let loaded = load_fast(&spec);
         // Clean up before asserting so a failing assert doesn't leak the tempdir.
-        let _ = std::fs::remove_dir_all(&dir);
         assert!(
             loaded.is_ok(),
             "pre-merged fast tier (marker present, no LoRA) must load, got: {:?}",

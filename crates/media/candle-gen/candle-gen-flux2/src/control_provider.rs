@@ -737,16 +737,8 @@ mod tests {
 
     #[test]
     fn admitted_control_exact_binds_nonempty_overlay() {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "sc15833_flux2_control_{}_{}",
-            std::process::id(),
-            nonce
-        ));
-        std::fs::create_dir_all(&root).unwrap();
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         let overlay = root.join("control.safetensors");
         std::fs::write(&overlay, b"nonempty").unwrap();
         let paths = Flux2ControlPaths {
@@ -775,7 +767,6 @@ mod tests {
         assert!(validate_admitted_paths(&paths, &matching).is_err());
         std::fs::write(&overlay, []).unwrap();
         assert!(validate_admitted_paths(&paths, &matching).is_err());
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

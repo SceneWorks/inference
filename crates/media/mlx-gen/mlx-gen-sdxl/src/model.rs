@@ -32,10 +32,10 @@ use crate::inpaint::{preprocess_mask, InpaintBlend};
 use crate::ip_adapter::IpImageEncoder;
 use crate::loader;
 use crate::pipeline::{
-    decode_image, denoise_cfgpp_with_preview, denoise_curated_with_preview,
-    denoise_inpaint_with_preview, denoise_ip_with_preview, denoise_multi_control_with_preview,
-    denoise_with_preview, encode_conditioning, encode_init_latents, preprocess_control_image,
-    text_time_ids, ControlContext, Denoiser,
+    denoise_cfgpp_with_preview, denoise_curated_with_preview, denoise_inpaint_with_preview,
+    denoise_ip_with_preview, denoise_multi_control_with_preview, denoise_with_preview,
+    encode_conditioning, encode_init_latents, preprocess_control_image, text_time_ids,
+    ControlContext, Denoiser,
 };
 use crate::sampler::{AncestralEuler, EulerSampler};
 use crate::text_encoder::ClipTextEncoder;
@@ -237,6 +237,15 @@ pub struct Sdxl {
     /// [`Residency`] seam owns the eval/drop/clear discipline, the stage-boundary cancel checks, and
     /// the error-safe cache flush once for all providers.
     residency: Residency<(ClipTextEncoder, ClipTextEncoder), SdxlHeavyOwned>,
+    /// The load-time `OffloadPolicy` verdict, kept as the DEFAULT for a request that names no
+    /// [`GenerationMemory::stage_residency`](mlx_gen::gen_core::GenerationMemory). Rung 1 is
+    /// request-scoped from SC-15525 onward; the policy is no longer the authority.
+    default_stage_residency: bool,
+    /// Whether THIS load can execute ladder rung 4 — see
+    /// [`memory_strategy::streamable`](crate::memory_strategy::streamable).
+    streamable: bool,
+    loaded_spec: LoadSpec,
+    memory_strategy: mlx_gen::gen_core::MemoryProviderContract,
 }
 
 /// The heavy render-phase components (everything but the text encoders): the U-Net, its ControlNet
@@ -335,8 +344,13 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         }
     }
     let residency = build_residency(spec)?;
+    let memory_strategy = crate::memory_strategy::memory_strategy_contract(descriptor().id, spec)?;
     Ok(Box::new(Sdxl {
         descriptor: descriptor(),
+        default_stage_residency: crate::memory_strategy::default_stage_residency(spec),
+        streamable: crate::memory_strategy::streamable(spec),
+        loaded_spec: spec.clone(),
+        memory_strategy,
         tokenizer: loader::load_tokenizer(root)?,
         sampler: EulerSampler::new_with_dtype(&cfg, true, DTYPE)?,
         alpha_schedule,
@@ -388,8 +402,16 @@ pub fn load_from_ldm_file(spec: &LoadSpec, tokenizer_root: &Path) -> Result<Box<
     let cfg = DiffusionConfig::sdxl_base();
     let alpha_schedule =
         AlphaSchedule::scaled_linear(cfg.num_train_steps, cfg.beta_start, cfg.beta_end);
+    // A fused LDM/A1111 checkpoint is split in memory, so no component has a re-openable source and
+    // `memory_strategy::streamable` reports `false` for its `WeightsSource::File` — rung 4 is
+    // declared Missing for this load rather than silently executing resident.
+    let memory_strategy = crate::memory_strategy::memory_strategy_contract(descriptor().id, spec)?;
     Ok(Box::new(Sdxl {
         descriptor: descriptor(),
+        default_stage_residency: crate::memory_strategy::default_stage_residency(spec),
+        streamable: false,
+        loaded_spec: spec.clone(),
+        memory_strategy,
         tokenizer: loader::load_tokenizer(tokenizer_root)?,
         sampler: EulerSampler::new_with_dtype(&cfg, true, DTYPE)?,
         alpha_schedule,
@@ -628,6 +650,25 @@ fn load_heavy(spec: &LoadSpec, root: &Path, load_pid: bool) -> Result<SdxlHeavyO
         None
     };
 
+    // Ladder rung 4 (SC-15525, closing SC-16355) — armed LAST, and that ordering is the whole
+    // correctness argument. Each `Transformer2D`'s stream captures the installed IP-Adapter K/V
+    // projections and the forward-time residual adapters off its FINISHED resident blocks, so the
+    // streamed and resident paths cannot disagree about which state landed where. Arming before the
+    // IP install or the adapter merge would capture an empty state and silently render without the
+    // image prompt.
+    //
+    // `memory_strategy::streamable` is the single authority for whether this load may arm at all: it
+    // refuses a fused single file, an eager load shape, a load-time quantization that materializes
+    // the trunk, and an adapter load that merged its delta into weights the snapshot does not carry.
+    if crate::memory_strategy::streamable(spec) {
+        let unet_file =
+            loader::resolve_weight_file(root, "unet", "diffusion_pytorch_model", DTYPE)?;
+        unet.arm_block_streams(
+            &WeightsSource::File(unet_file),
+            spec.quantize.map(|q| q.bits()),
+        );
+    }
+
     Ok(SdxlHeavyOwned {
         unet,
         controls,
@@ -637,10 +678,49 @@ fn load_heavy(spec: &LoadSpec, root: &Path, load_pid: bool) -> Result<SdxlHeavyO
     })
 }
 
-mlx_gen::impl_generator!(Sdxl {
-    validate: |s, req| validate_request(&s.descriptor.capabilities, req),
-    generate: generate_impl,
-});
+// Written out rather than `mlx_gen::impl_generator!` because SDXL now answers the memory-strategy
+// hooks (SC-15525); the macro covers only `descriptor`/`validate`/`generate`.
+impl mlx_gen::gen_core::Generator for Sdxl {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
+        validate_request(&self.descriptor.capabilities, req).map_err(Into::into)
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
+        Some(&self.memory_strategy)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::MemorySafetyDecision {
+        crate::memory_strategy::safety_check(&self.loaded_spec, &self.memory_strategy, context)
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::Result<Option<Box<dyn mlx_gen::gen_core::MemoryRequestScope + '_>>>
+    {
+        crate::memory_strategy::begin_request(
+            self.descriptor.id,
+            &self.loaded_spec,
+            &self.memory_strategy,
+            context,
+        )
+    }
+}
 
 impl Sdxl {
     /// The rich-`Result` body behind [`Generator::generate`]. Kept on the crate's own
@@ -764,7 +844,42 @@ impl Sdxl {
             .tokenizer
             .tokenize_batch(&req.prompt, if cfg_on { Some(negative) } else { None })?;
 
-        self.residency.run(
+        // ── Ladder request resolution (SC-15525) ────────────────────────────────────────────────
+        // Rung 1 is request-scoped from here on: the load-time `OffloadPolicy` is only the default a
+        // request that names nothing keeps.
+        let stage_residency =
+            crate::memory_strategy::stage_residency(req, self.default_stage_residency);
+        let window_size = crate::memory_strategy::transformer_window_size(req)?;
+        // Two fail-closed guards a calibration harness driving `generate` with a hand-built
+        // `GenerationMemory` must still cross — it never went through `safety_check`.
+        if window_size.is_some() && !self.streamable {
+            return Err(Error::Unsupported(
+                "sdxl: bounded transformer residency needs a DeferredMaterialization load over a \
+                 snapshot directory whose U-Net stays lazy and whose adapters (if any) are \
+                 replayable; this generator cannot stream its blocks"
+                    .into(),
+            ));
+        }
+        if window_size.is_some() && !stage_residency {
+            return Err(Error::Unsupported(
+                "sdxl: bounded transformer residency requires staged residency engaged in the same \
+                 request — without the phase release both CLIP towers stay resident through the \
+                 denoise and the request peak does not move"
+                    .into(),
+            ));
+        }
+        let decode_tiling = crate::memory_strategy::decode_tiling(req)?;
+        let forward_plan = crate::plan::SdxlForwardPlan::with_attention(
+            crate::memory_strategy::attention_plan(req)?,
+        )
+        .with_window(window_size.map(|size| crate::plan::SdxlBlockWindow {
+            size,
+            cancel: &req.cancel,
+        }));
+
+        self.residency.run_request_scoped(
+            stage_residency,
+            false,
             &req.cancel,
             req.use_pid,
             on_progress,
@@ -992,6 +1107,7 @@ impl Sdxl {
                         &control_ctxs,
                         ip,
                         None,
+                        forward_plan,
                     )?
                 } else {
                     denoise_curated_with_preview(
@@ -1011,6 +1127,7 @@ impl Sdxl {
                         &control_ctxs,
                         ip,
                         None,
+                        forward_plan,
                     )?
                 };
                 // Curated latents live in RAW VE σ-space (`x0+σ·ε`); an early-stop leaves x_k at σ>0, so
@@ -1021,7 +1138,13 @@ impl Sdxl {
                     None => latents,
                 };
                 on_progress(Progress::Decoding);
-                images.push(decode_image(heavy.vae, &latents, pid_ref)?);
+                images.push(crate::pipeline::decode_image_tiled(
+                    heavy.vae,
+                    &latents,
+                    pid_ref,
+                    decode_tiling.as_ref(),
+                    Some(&req.cancel),
+                )?);
                 continue;
             }
 
@@ -1109,10 +1232,7 @@ impl Sdxl {
                 )
             };
 
-            let d = Denoiser {
-                unet: heavy.unet,
-                sampler: sampler.as_ref(),
-            };
+            let d = Denoiser::with_plan(heavy.unet, sampler.as_ref(), forward_plan);
             let latents = if let Some(tokens) = &ip_tokens {
                 denoise_ip_with_preview(
                     &d,
@@ -1168,7 +1288,13 @@ impl Sdxl {
             };
 
             on_progress(Progress::Decoding);
-            images.push(decode_image(heavy.vae, &latents, pid_ref)?);
+            images.push(crate::pipeline::decode_image_tiled(
+                    heavy.vae,
+                    &latents,
+                    pid_ref,
+                    decode_tiling.as_ref(),
+                    Some(&req.cancel),
+                )?);
         }
                 Ok(GenerationOutput::Images(images))
             },
@@ -1324,6 +1450,28 @@ mlx_gen::register_generators! {
     pub(crate) const REGISTRATION = descriptor => load;
     footprint = component_footprint
 }
+
+/// The weights-free memory-strategy registration (SC-15525) — the shared registry conformance
+/// suite's entry point into this provider's declaration.
+pub const MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
+    mlx_gen::gen_core::MemoryRegistration {
+        provider_id: MODEL_ID,
+        contract: |spec| {
+            crate::memory_strategy::weights_free_memory_strategy_contract(MODEL_ID, spec)
+        },
+        safety_check: crate::memory_strategy::safety_check,
+    };
+
+/// The weights-free **behavioral** registration: valid fixtures plus a request scope, so the shared
+/// suite can drive every declared rung's lifecycle without loading 6.6 GB of weights.
+pub const MEMORY_BEHAVIOR_REGISTRATION: mlx_gen::gen_core::MemoryBehaviorRegistration =
+    mlx_gen::gen_core::MemoryBehaviorRegistration {
+        provider_id: MODEL_ID,
+        valid_fixtures: crate::memory_strategy::registered_valid_fixture,
+        begin_request: |spec, contract, context| {
+            crate::memory_strategy::registered_begin_request(MODEL_ID, spec, contract, context)
+        },
+    };
 
 /// sc-16195 Apple-Silicon warm sweep: q8 and dense both peaked at 14.039 GiB at 1024².
 /// The 14.05 GiB family ceiling is deliberately upward-rounded.

@@ -33,6 +33,8 @@ candle-audio = { path = "../candle-audio", features = ["testkit"] }
 # own `save` cannot emit `__metadata__`, which the native format requires.
 safetensors = { workspace = true }
 sceneworks-gen-core-testkit = { workspace = true }
+# Self-removing fixture roots for the test suites (sc-17755).
+tempfile = { workspace = true }
 
 [features]
 default = []

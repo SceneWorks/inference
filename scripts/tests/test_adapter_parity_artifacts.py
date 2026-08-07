@@ -235,6 +235,130 @@ class AdapterParityArtifactProvenanceTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "outside the bound allowlist"):
                 VERIFY.source_state(manifest, **kwargs)
 
+    def proof_source_repo(self, directory):
+        """A fixture worktree carrying every path `source_state` hashes.
+
+        Mirrors the real layout: the four Rust sources plus one file per
+        manifest script, all committed, so `implementation_base` is HEAD and
+        nothing is changed or untracked until a test edits it.
+        """
+        root = pathlib.Path(directory)
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+        # Keep the committed bytes byte-identical to what is hashed off disk.
+        subprocess.run(["git", "-C", str(root), "config", "core.autocrlf", "false"], check=True)
+        scripts = {
+            name: f"crates/media/mlx-gen/tools/{name}"
+            for name in VERIFY.load_manifest()["scripts"]
+        }
+        for index, relative in enumerate(
+            (*RECORDER.RUST_SOURCE_FILES, *scripts.values())
+        ):
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"ORIGINAL = {index}\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(root), "add", "."], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "-c",
+                "user.name=Codex Test",
+                "-c",
+                "user.email=codex@example.invalid",
+                "commit",
+                "-q",
+                "--no-gpg-sign",
+                "-m",
+                "proof base",
+            ],
+            check=True,
+        )
+        revision = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        ).stdout.strip()
+        manifest = {"implementation_base": revision, "scripts": dict.fromkeys(scripts, "0" * 64)}
+        return root, manifest, scripts
+
+    def test_verifier_bytes_are_not_bound_into_the_proof_source_state(self):
+        verifier = "verify_adapter_parity_artifacts.py"
+        with tempfile.TemporaryDirectory() as directory:
+            root, manifest, scripts = self.proof_source_repo(directory)
+            before = RECORDER.source_state(manifest, root=root)
+            self.assertNotIn(scripts[verifier], before["files"])
+            self.assertIn(scripts["record_adapter_parity_transcript.py"], before["files"])
+            self.assertIn(scripts["dump_qwen_adapter_golden.py"], before["files"])
+            self.assertIn(RECORDER.RUST_SOURCE_FILES[0], before["files"])
+
+            # Editing only the checker must neither move the digest nor trip the
+            # allowlist, even though git now reports it as a changed path.
+            (root / scripts[verifier]).write_text("EDITED = 1\n", encoding="utf-8")
+            after = RECORDER.source_state(manifest, root=root)
+            self.assertEqual(before["files"], after["files"])
+            self.assertEqual(before["source_sha256"], after["source_sha256"])
+            self.assertIn(scripts[verifier], after["changed_paths"])
+
+            # Every producing file stays bound.
+            for producer in (
+                scripts["dump_qwen_adapter_golden.py"],
+                scripts["record_adapter_parity_transcript.py"],
+                scripts["_adapter_parity_provenance.py"],
+                RECORDER.RUST_SOURCE_FILES[0],
+            ):
+                path = root / producer
+                original = path.read_bytes()
+                path.write_text("EDITED = 2\n", encoding="utf-8")
+                moved = RECORDER.source_state(manifest, root=root)
+                self.assertNotEqual(before["files"][producer], moved["files"][producer], producer)
+                self.assertNotEqual(before["source_sha256"], moved["source_sha256"], producer)
+                path.write_bytes(original)
+            self.assertEqual(
+                before["source_sha256"],
+                RECORDER.source_state(manifest, root=root)["source_sha256"],
+            )
+
+    def test_empty_overrides_are_honoured_rather_than_falling_back(self):
+        """`()`/`set()` mean "nothing", not "use the default".
+
+        Splitting the hashed set from the allowlist made both kwargs load-bearing,
+        so a falsy-but-present override must not silently reinstate the manifest
+        set or the permissive default allowlist.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root, manifest, scripts = self.proof_source_repo(directory)
+            empty = RECORDER.source_state(
+                manifest, root=root, source_files=(), permitted_changes=set()
+            )
+            self.assertEqual(empty["files"], {})
+
+            (root / scripts["dump_z_image_golden.py"]).write_text("EDITED = 1\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "outside the bound allowlist"):
+                RECORDER.source_state(
+                    manifest, root=root, source_files=(), permitted_changes=set()
+                )
+
+    def test_unbound_source_files_must_stay_in_the_manifest_script_map(self):
+        manifest = {"implementation_base": "0" * 40, "scripts": {"dump_z_image_golden.py": "0" * 64}}
+        with self.assertRaisesRegex(RuntimeError, "silently rejoin the hashed set"):
+            RECORDER.bound_source_files(manifest)
+
+    def test_tracked_manifest_binds_every_script_but_hashes_only_the_producers(self):
+        manifest = VERIFY.load_manifest()
+        bound = set(RECORDER.bound_source_files(manifest))
+        pinned = {f"crates/media/mlx-gen/tools/{name}" for name in manifest["scripts"]}
+        self.assertEqual(bound, (pinned | set(RECORDER.RUST_SOURCE_FILES)) - RECORDER.UNBOUND_SOURCE_FILES)
+        self.assertEqual(
+            RECORDER.UNBOUND_SOURCE_FILES,
+            {"crates/media/mlx-gen/tools/verify_adapter_parity_artifacts.py"},
+        )
+        # The verifier loses its transcript binding but keeps its in-place
+        # repairable manifest pin, which `validate_manifest` still enforces.
+        self.assertIn("verify_adapter_parity_artifacts.py", manifest["scripts"])
+
     def test_residual_diagnostic_uses_exact_sanitized_runs(self):
         runs = RECORDER.residual_diagnostic_runs(self.valid_manifest())
         self.assertEqual(
@@ -685,6 +809,70 @@ class AdapterParityArtifactProvenanceTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "duplicate result field"):
             VERIFY.parsed_results(duplicate_field)
+
+    def test_hyper_flux_dump_canonicalizes_metadata_order_after_saving(self):
+        """The Hyper-FLUX golden must stay byte-reproducible (sc-17651).
+
+        `safetensors.numpy.save_file` serializes `__metadata__` out of a Rust `HashMap`
+        with per-process iteration order, so without the canonicalization step this dump
+        writes a different file hash on every run while the tensors stay bit-identical —
+        making the manifest's SHA-256 pin for `flux_hyper_golden` unreachable by
+        regeneration. Dropping the call would go unnoticed until someone re-recorded on
+        the licensed host, so guard it over the source text: the module imports torch and
+        diffusers at module scope and cannot be imported here. The sibling dumps write via
+        `mx.save_safetensors` and need no such step.
+        """
+        source = (TOOLS / "dump_hyper_flux_golden.py").read_text(encoding="utf-8")
+        self.assertIn(
+            "def _canonicalize_metadata_order(",
+            source,
+            "dump_hyper_flux_golden.py lost its metadata-order canonicalization helper",
+        )
+        save = source.index("save_file(tensors, OUT, metadata=meta)")
+        self.assertNotEqual(
+            source.find("_canonicalize_metadata_order(OUT)", save),
+            -1,
+            "dump_hyper_flux_golden.py must call _canonicalize_metadata_order(OUT) after "
+            "save_file, or the golden stops being byte-reproducible",
+        )
+
+    def test_hyper_flux_metadata_canonicalization_is_order_invariant(self):
+        """Differing metadata orders must collapse to identical bytes, payload untouched."""
+        source = (TOOLS / "dump_hyper_flux_golden.py").read_text(encoding="utf-8")
+        start = source.index("def _canonicalize_metadata_order(")
+        end = source.index("\n\n\nBASE = ", start)
+        namespace = {"json": json, "struct": struct}
+        exec(source[start:end], namespace)
+        canonicalize = namespace["_canonicalize_metadata_order"]
+
+        payload = bytes(range(256)) * 4
+        produced = []
+        for order in (["b", "a", "c"], ["c", "a", "b"]):
+            header = {
+                "__metadata__": {key: f"value-{key}" for key in order},
+                "t": {
+                    "dtype": "U8",
+                    "shape": [len(payload)],
+                    "data_offsets": [0, len(payload)],
+                },
+            }
+            blob = json.dumps(header, separators=(",", ":")).encode("utf-8")
+            blob += b" " * ((8 - len(blob) % 8) % 8)
+            with tempfile.TemporaryDirectory() as directory:
+                path = pathlib.Path(directory) / "golden.safetensors"
+                path.write_bytes(struct.pack("<Q", len(blob)) + blob + payload)
+                canonicalize(path)
+                produced.append(path.read_bytes())
+
+        self.assertEqual(produced[0], produced[1], "canonicalization is not order-invariant")
+        for blob in produced:
+            length = struct.unpack("<Q", blob[:8])[0]
+            self.assertEqual(blob[8 + length :], payload, "canonicalization moved the payload")
+            self.assertEqual(
+                list(json.loads(blob[8 : 8 + length])["__metadata__"]),
+                ["a", "b", "c"],
+                "metadata was not sorted",
+            )
 
 
 if __name__ == "__main__":

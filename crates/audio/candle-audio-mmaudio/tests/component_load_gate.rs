@@ -9,10 +9,8 @@ use candle_audio_mmaudio::candle_audio::gen_core::{LoadSpec, WeightsSource};
 
 /// A base spec that stages every required component with a placeholder path (never read — the gate
 /// only exercises the load-time validators). `weights` is an ignored placeholder for mmaudio.
-fn staged(required: &[&str]) -> LoadSpec {
-    let mut spec = LoadSpec::new(WeightsSource::Dir(
-        std::env::temp_dir().join("mmaudio-unused-base"),
-    ));
+fn staged(tmp: &tempfile::TempDir, required: &[&str]) -> LoadSpec {
+    let mut spec = LoadSpec::new(WeightsSource::Dir(tmp.path().join("mmaudio-unused-base")));
     for id in required {
         spec = spec.with_component(
             *id,
@@ -24,10 +22,11 @@ fn staged(required: &[&str]) -> LoadSpec {
 
 #[test]
 fn small_16k_gates_missing_and_unknown_components_at_load() {
+    let tmp = tempfile::tempdir().unwrap();
     let required = candle_audio_mmaudio::generator::descriptor().required_components;
     gen_core_testkit::check_component_load_gate(
         candle_audio_mmaudio::generator::load,
-        &staged(required),
+        &staged(&tmp, required),
         required,
     )
     .expect("mmaudio_small_16k gates every required + unknown component at load");
@@ -35,10 +34,11 @@ fn small_16k_gates_missing_and_unknown_components_at_load() {
 
 #[test]
 fn large_44k_gates_missing_and_unknown_components_at_load() {
+    let tmp = tempfile::tempdir().unwrap();
     let required = candle_audio_mmaudio::generator_44k::descriptor().required_components;
     gen_core_testkit::check_component_load_gate(
         candle_audio_mmaudio::generator_44k::load,
-        &staged(required),
+        &staged(&tmp, required),
         required,
     )
     .expect("mmaudio_large_44k gates every required + unknown component at load");

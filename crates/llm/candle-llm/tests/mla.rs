@@ -40,8 +40,14 @@ fn ones(d: usize) -> Tensor {
 /// path: `None` ⇒ a full `q_proj` (DeepSeek-V2-Lite); `Some(r)` ⇒ the low-rank `q_a → norm → q_b`.
 fn load_tiny_deepseek(tag: &str, q_lora_rank: Option<usize>) -> CausalLm {
     let q_head = QK_NOPE + QK_ROPE;
-    let dir = std::env::temp_dir().join(format!("candle-llm-mla-{tag}-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    // sc-17755: a `TempDir` guard rather than a hand-rolled `temp_dir()` join. The snapshot is
+    // read fully into memory by the loader below (`safetensors::load`, not an mmap), so the tree
+    // is safe to remove when this helper returns — and it now does, including out of a panic.
+    let guard = tempfile::Builder::new()
+        .prefix(&format!("candle-llm-mla-{tag}-"))
+        .tempdir()
+        .expect("fixture temp dir");
+    let dir = guard.path();
 
     let q_lora_json = match q_lora_rank {
         Some(r) => r.to_string(),
@@ -150,11 +156,10 @@ fn load_tiny_deepseek(tag: &str, q_lora_rank: Option<usize>) -> CausalLm {
     }
 
     candle_core::safetensors::save(&w, dir.join("model.safetensors")).unwrap();
-    let cfg = ModelConfig::from_dir(&dir).unwrap();
-    let weights = Weights::from_dir(&dir, &Device::Cpu).unwrap();
-    let model = CausalLm::from_weights(&weights, "", cfg).unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
-    model
+    let cfg = ModelConfig::from_dir(dir).unwrap();
+    let weights = Weights::from_dir(dir, &Device::Cpu).unwrap();
+
+    CausalLm::from_weights(&weights, "", cfg).unwrap()
 }
 
 fn assert_finite(logits: &Tensor) {

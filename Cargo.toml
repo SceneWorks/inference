@@ -69,6 +69,11 @@ sha2 = "0.10"
 # Audio validation harness (sc-12854): `getrusage(RUSAGE_SELF)` peak-RSS on macOS/Linux.
 # Already in the resolved graph transitively.
 libc = "0.2"
+# Test-only RAII temp directories (sc-17704). Test helpers that built their own
+# `env::temp_dir().join(format!("...-{pid}-{n}"))` fixture roots leaked one directory per call
+# forever; a `TempDir` guard removes the tree on `Drop`, including out of a panicking test, and
+# draws its uniqueness from OS randomness rather than a recyclable PID.
+tempfile = "3"
 
 # Preserve Candle's dependency optimization for debug/test parity suites.
 [profile.dev.package."*"]

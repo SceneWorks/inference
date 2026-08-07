@@ -39,3 +39,5 @@ memmap2 = "0.9"
 # tokenizers dep needed.)
 # Run the registered LlamaProvider through the backend-neutral contract checks.
 core-llm-testkit = { workspace = true }
+# Self-removing fixture roots for the unit + integration suites (sc-17768).
+tempfile = { workspace = true }

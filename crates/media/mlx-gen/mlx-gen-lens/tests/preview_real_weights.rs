@@ -20,14 +20,24 @@ fn active_preview_emits_native_four_step_strip_without_changing_rgb() {
     let root = snapshot();
     let text = LensText::load(&root, Dtype::Bfloat16, None).unwrap();
     let cancel = CancelFlag::default();
+    // The turbo default: CFG off. The encode gates on this exactly as the render does (sc-17616), so
+    // the conditioning arrives cond-only (`[1, …]`) and the negative is never encoded — at guidance
+    // 1.0 the combine reduces to `cond`, so it could not have reached the output anyway.
+    let guidance = 1.0f32;
     let (encoder_features, encoder_mask) = text
         .encode_prompt(
             "a red fox beside a turquoise alpine lake at golden hour",
             "blurry, low quality",
             DEFAULT_DATE,
+            guidance,
             Some(&cancel),
         )
         .unwrap();
+    assert_eq!(
+        encoder_mask.shape()[0],
+        1,
+        "CFG-off encode must return cond-only conditioning"
+    );
     let mut encoded = encoder_features.iter().collect::<Vec<_>>();
     encoded.push(&encoder_mask);
     mlx_rs::transforms::eval(encoded).unwrap();
@@ -43,7 +53,7 @@ fn active_preview_emits_native_four_step_strip_without_changing_rgb() {
                 16,
                 16,
                 4,
-                1.0,
+                guidance,
                 None,
                 None,
                 1663088,

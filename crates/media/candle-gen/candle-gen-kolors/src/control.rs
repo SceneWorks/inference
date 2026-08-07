@@ -463,14 +463,12 @@ mod tests {
     /// file is used as-is; a missing dir errors loudly.
     #[test]
     fn controlnet_file_resolution() {
-        let dir = std::env::temp_dir().join(format!("candle_kolors_cn_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         assert!(resolve_controlnet_file(&dir).is_err());
         let f = dir.join("diffusion_pytorch_model.safetensors");
         std::fs::write(&f, b"x").unwrap();
         assert_eq!(resolve_controlnet_file(&dir).unwrap(), f);
         assert_eq!(resolve_controlnet_file(&f).unwrap(), f);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

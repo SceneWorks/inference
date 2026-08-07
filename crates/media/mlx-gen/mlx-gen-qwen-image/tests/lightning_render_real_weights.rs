@@ -1,8 +1,10 @@
 //! sc-2909: Qwen-Image Lightning end-to-end render over the integrated public path (real weights).
 //!
 //! The Lightning schedule is bit-exact vs diffusers (`tests/lightning_parity.rs`), the Lightning LoRA
-//! loads cleanly (`adapter_real_weights::lightning_loras_apply_cleanly`, 840/840 modules), and the
-//! transformer + VAE + denoise loop are the SAME pixel-parity components as the production base path
+//! loads cleanly (`adapter_real_weights::lightning_loras_apply_cleanly`, 720 of the host's 840
+//! modules — the 12 per-block classes every published Lightning file trains; sc-17518 corrected a
+//! stale 840 that had never actually run), and the transformer + VAE + denoise loop are the SAME
+//! pixel-parity components as the production base path
 //! (`e2e_real_weights`, 0.000% px>8 vs the fork — itself a diffusers port). What this gate adds is the
 //! **integration** proof: `provider_registry().load("qwen_image", spec.with_adapters([lightning])).generate(req
 //! { sampler: "lightning", steps: 8 })` runs end-to-end and renders a coherent natural image (not

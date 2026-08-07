@@ -1122,8 +1122,8 @@ mod tests {
     fn build_dit_routes_packed_tier_through_additive() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
-        let root = std::env::temp_dir().join(format!("sc10095_5b_{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         write_packed_transformer(&root, &cfg);
 
         // No adapters: the packed tier loads packed, unadapted.
@@ -1182,8 +1182,6 @@ mod tests {
             tiny_pipeline(&root, bogus_specs).build_dit().is_err(),
             "a LoRA matching no packed projection must hard-error (zero-match guard)"
         );
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     // ── sc-12757: dense sequential component offload (TE/VAE off-GPU) — Pillar 1 ──

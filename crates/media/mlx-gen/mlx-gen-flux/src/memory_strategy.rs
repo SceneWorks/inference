@@ -683,7 +683,8 @@ mod tests {
 
     #[test]
     fn production_rung4_needs_verified_exact_inventory_and_unknown_fixture_stays_uncalibrated() {
-        let root = std::env::temp_dir().join(format!("flux-rung4-contract-{}", std::process::id()));
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         write_exact_snapshot(&root, Some(mlx_gen::Quant::Q4));
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
             .with_offload_policy(OffloadPolicy::Sequential)
@@ -723,7 +724,6 @@ mod tests {
         assert!(verified_runner_artifact(crate::FLUX1_DEV_ID, &spec).is_err());
         let resident = spec.clone().with_offload_policy(OffloadPolicy::Resident);
         assert!(verified_runner_artifact(crate::FLUX1_DEV_ID, &resident).is_err());
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -1136,7 +1136,8 @@ mod tests {
 
     #[test]
     fn production_unknown_artifact_has_no_calibration_and_rejects_static_context() {
-        let root = std::env::temp_dir().join(format!("flux-memory-{}", std::process::id()));
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
         for component in ["text_encoder", "text_encoder_2", "transformer", "vae"] {
             std::fs::create_dir_all(root.join(component)).unwrap();
         }
@@ -1153,6 +1154,5 @@ mod tests {
             registered_safety_check(&spec, &runtime, &context),
             MemorySafetyDecision::Reject { .. }
         ));
-        std::fs::remove_dir_all(root).ok();
     }
 }

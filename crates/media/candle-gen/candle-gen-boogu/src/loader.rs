@@ -300,7 +300,8 @@ mod tests {
         map.insert("attn.to_out.0.biases".into(), b);
         map.insert("attn.to_q.weight".into(), dense_w.clone());
 
-        let dir = std::env::temp_dir().join(format!("sc9410_detect_{}", std::process::id()));
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         write_component(&dir, map, true);
         let w = Weights::from_dir(&dir, &dev, DType::F32)?;
         assert_eq!(w.packed().map(|c| c.group_size), Some(G as i32));
@@ -327,7 +328,6 @@ mod tests {
         let cos = dot / (na.sqrt() * nb.sqrt() + 1e-12);
         assert!(cos > 0.99999, "group-32 packed vs grid cosine {cos:.6}");
 
-        std::fs::remove_dir_all(&dir).ok();
         Ok(())
     }
 
@@ -341,7 +341,8 @@ mod tests {
         map.insert("layers.0.q_proj.scales".into(), scales);
         map.insert("layers.0.q_proj.biases".into(), biases);
 
-        let dir = std::env::temp_dir().join(format!("sc16025_mixed_width_{}", std::process::id()));
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         // The component marker remains q4 even though this floor-target projection is q8.
         write_component(&dir, map, true);
         let weights = Weights::from_dir(&dir, &dev, DType::F32)?;
@@ -349,7 +350,6 @@ mod tests {
         let mut projection = linear_detect(&weights, "layers.0.q_proj", false)?;
         projection.quantize_dequant_onto(candle_gen::gen_core::Quant::Q8, &dev)?;
 
-        std::fs::remove_dir_all(&dir).ok();
         Ok(())
     }
 
@@ -376,7 +376,8 @@ mod tests {
             Tensor::randn(0f32, 1f32, (out_dim, in_dim), &dev)?,
         );
 
-        let dir = std::env::temp_dir().join(format!("sc9410_guard_{}", std::process::id()));
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         write_component(&dir, map, true); // packed component config (quantization block present)
         let w = Weights::from_dir(&dir, &dev, DType::F32)?;
         assert!(w.packed().is_some(), "packed component config");
@@ -393,7 +394,6 @@ mod tests {
             "a dense vision weight (no `.scales`) still loads"
         );
 
-        std::fs::remove_dir_all(&dir).ok();
         Ok(())
     }
 
@@ -410,7 +410,8 @@ mod tests {
             "attn.to_q.weight".into(),
             Tensor::randn(0f32, 1f32, (out_dim, in_dim), &dev)?,
         );
-        let dir = std::env::temp_dir().join(format!("sc9410_dense_{}", std::process::id()));
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         write_component(&dir, map, false);
 
         let w = Weights::from_dir(&dir, &dev, DType::F32)?;
@@ -418,7 +419,6 @@ mod tests {
         let lin = linear_detect(&w, "attn.to_q", false)?;
         assert!(!lin.is_packed(), "dense tier ⇒ dense projection");
 
-        std::fs::remove_dir_all(&dir).ok();
         Ok(())
     }
 
@@ -428,8 +428,8 @@ mod tests {
     /// errors loudly naming the file instead of silently swallowing to the dense path.
     #[test]
     fn read_packed_config_absent_vs_corrupt() {
-        let dir = std::env::temp_dir().join(format!("sc9426_boogu_cfg_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
 
         // A `quantization` block → packed tier.
         let packed = dir.join("packed");
@@ -472,8 +472,6 @@ mod tests {
             format!("{err}").contains("config.json"),
             "the error should name the offending file, got: {err}"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The packed-detecting **embedding** loader fires on a group-32 packed `embed_tokens` triple and
@@ -489,7 +487,8 @@ mod tests {
         map.insert("embed_tokens.weight".into(), wq);
         map.insert("embed_tokens.scales".into(), s);
         map.insert("embed_tokens.biases".into(), b);
-        let dir = std::env::temp_dir().join(format!("sc9410_emb_{}", std::process::id()));
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         write_component(&dir, map, true);
 
         let w = Weights::from_dir(&dir, &dev, DType::F32)?;
@@ -509,7 +508,6 @@ mod tests {
             "group-32 packed embedding deviates from the grid"
         );
 
-        std::fs::remove_dir_all(&dir).ok();
         Ok(())
     }
 
@@ -528,7 +526,8 @@ mod tests {
         map.insert("embed_tokens.weight".into(), wq);
         map.insert("embed_tokens.scales".into(), s);
         map.insert("embed_tokens.biases".into(), b);
-        let dir = std::env::temp_dir().join(format!("sc12828_emb_{}", std::process::id()));
+        let dir_tmp = tempfile::tempdir().unwrap();
+        let dir = dir_tmp.path().to_path_buf();
         write_component(&dir, map, true);
 
         // bf16 store — the sc-12828 regime (the projections would ride bf16; the packed embed must not).
@@ -552,7 +551,6 @@ mod tests {
             "f32-dequant packed embed deviates from the grid"
         );
 
-        std::fs::remove_dir_all(&dir).ok();
         Ok(())
     }
 }

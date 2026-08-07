@@ -407,10 +407,26 @@ pub const TURNKEY_ASSET_FILES: &[&str] = &[
 ];
 
 /// Copy `src/config.json` to `dst/config.json` with a `"quantization": {"bits", "group_size"}` block
-/// added (HF/diffusers-compat; the Rust loaders auto-detect packed weights via `{base}.scales` and
-/// ignore this block — it is provenance/informational). A missing source config starts from an empty
-/// object. The written bytes are `serde_json::to_string_pretty` of the merged value, byte-identical
-/// across every provider that packs per-component dirs.
+/// added. A missing source config starts from an empty object. The written bytes are
+/// `serde_json::to_string_pretty` of the merged value, byte-identical across every provider that
+/// packs per-component dirs.
+///
+/// **This block is load-bearing, not provenance.** An earlier version of this doc said the Rust
+/// loaders auto-detect packed weights via `{base}.scales` and "ignore this block" — true of the
+/// *loaders*, false of everything else, and the SC-15525 review traced a real coverage gap back to
+/// believing it. [`packed_quant_bits`] reads this marker and **only** this marker, so a packed
+/// component shipped without it is reported as dense and three separate decisions go the wrong way:
+///
+/// * [`needs_load_time_quant`] answers "yes", which is what the F-144 requested-vs-packed tier guard
+///   consults — so a Q4 request against an unmarked packed-Q8 component passes the guard and is then
+///   served Q8 by a `quantize()` that no-ops on already-packed weights;
+/// * a memory-strategy contract's "does this load leave the transformer lazy" predicate answers "no"
+///   and withholds rung 4. That is exactly why `illustrious_xl_v1`/`illustrious_xl_v2` at q8 publish
+///   no bounded transformer residency — see `mlx_gen_sdxl::memory_strategy::load_leaves_blocks_lazy`;
+/// * anything sizing a fit from the declared tier reads the wrong one.
+///
+/// A packing path that omits this call produces a snapshot that *works* and is *mislabelled*, which
+/// is the hardest kind to notice. Every packing path must write it.
 pub fn write_quantized_config(src: &Path, dst: &Path, bits: i32, group_size: i32) -> Result<()> {
     let src_cfg = src.join("config.json");
     let mut v: serde_json::Value = if src_cfg.exists() {
@@ -482,10 +498,9 @@ pub fn copy_turnkey_assets(src_root: &Path, dst_root: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn marker_fixture(body: Option<&str>) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "mlx-gen-quant-marker-{}-{:?}",
-            std::process::id(),
+    fn marker_fixture(tmp: &tempfile::TempDir, body: Option<&str>) -> std::path::PathBuf {
+        let root = tmp.path().join(format!(
+            "mlx-gen-quant-marker-{:?}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -500,8 +515,9 @@ mod tests {
 
     #[test]
     fn quant_tier_missing_or_unmarked_config_is_dense() {
+        let tmp = tempfile::tempdir().unwrap();
         for body in [None, Some("{}"), Some(r#"{"hidden_size": 64}"#)] {
-            let root = marker_fixture(body);
+            let root = marker_fixture(&tmp, body);
             assert_eq!(packed_quant_bits(&root, "transformer").unwrap(), None);
             assert!(needs_load_time_quant(&root, "transformer", 4, "model").unwrap());
             std::fs::remove_dir_all(root).ok();
@@ -510,7 +526,8 @@ mod tests {
 
     #[test]
     fn quant_tier_match_skips_and_mismatch_names_context() {
-        let root = marker_fixture(Some(r#"{"quantization":{"bits":8,"group_size":64}}"#));
+        let tmp = tempfile::tempdir().unwrap();
+        let root = marker_fixture(&tmp, Some(r#"{"quantization":{"bits":8,"group_size":64}}"#));
         assert!(!needs_load_time_quant(&root, "transformer", 8, "lens_turbo").unwrap());
         let error = needs_load_time_quant(&root, "transformer", 4, "lens_turbo")
             .unwrap_err()
@@ -523,9 +540,10 @@ mod tests {
 
     #[test]
     fn packed_group_size_accepts_only_mlx_affine_geometries() {
+        let tmp = tempfile::tempdir().unwrap();
         for group_size in [32, 64, 128] {
             let body = format!(r#"{{"quantization":{{"bits":8,"group_size":{group_size}}}}}"#);
-            let root = marker_fixture(Some(&body));
+            let root = marker_fixture(&tmp, Some(&body));
             assert_eq!(
                 packed_quant_group_size_at(&root.join("transformer")).unwrap(),
                 Some(group_size)
@@ -538,7 +556,7 @@ mod tests {
             r#"{"quantization":{"bits":8,"group_size":16}}"#,
             r#"{"quantization":{"bits":8,"group_size":2147483648}}"#,
         ] {
-            let root = marker_fixture(Some(marker));
+            let root = marker_fixture(&tmp, Some(marker));
             assert!(
                 packed_quant_group_size_at(&root.join("transformer")).is_err(),
                 "group-size marker must fail: {marker}"
@@ -549,6 +567,7 @@ mod tests {
 
     #[test]
     fn quant_tier_rejects_every_present_but_malformed_marker() {
+        let tmp = tempfile::tempdir().unwrap();
         for body in [
             "{",
             r#"{"quantization":null}"#,
@@ -559,7 +578,7 @@ mod tests {
             r#"{"quantization":{"bits":3}}"#,
             r#"{"quantization":{"bits":2147483648}}"#,
         ] {
-            let root = marker_fixture(Some(body));
+            let root = marker_fixture(&tmp, Some(body));
             assert!(
                 packed_quant_bits(&root, "transformer").is_err(),
                 "marker must fail: {body}"
@@ -570,7 +589,8 @@ mod tests {
 
     #[test]
     fn quant_tier_only_swallows_not_found_and_rejects_unsafe_components() {
-        let root = marker_fixture(None);
+        let tmp = tempfile::tempdir().unwrap();
+        let root = marker_fixture(&tmp, None);
         std::fs::create_dir(root.join("transformer/config.json")).unwrap();
         assert!(packed_quant_bits(&root, "transformer").is_err());
         for component in ["", "../transformer", "/transformer", "transformer/../vae"] {
