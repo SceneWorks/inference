@@ -14,6 +14,12 @@ use candle_gen::testkit::VramProbe;
 use candle_gen_mage::{memory_strategy, REGISTRATION};
 use sha2::{Digest, Sha256};
 
+// The dedicated Windows CUDA runner's desktop/driver baseline is about 1.4 GiB. Keep a finite
+// cleanliness gate (and subtract the sampled baseline from the report), but do not reject the
+// otherwise-idle runner before Mage loads. This matches the 2 GiB ceiling used by other physical
+// GPU probes in this workspace.
+const MAX_IDLE_BASELINE_GB: f64 = 2.0;
+
 fn rung() -> MemoryStrategy {
     match std::env::var("MAGE_MEMORY_RUNG")
         .expect("set MAGE_MEMORY_RUNG to resident, staged, attention, or blocks")
@@ -43,7 +49,7 @@ fn representative_route_exercises_advertised_rung() {
         candle_gen::testkit::reset_cuda_mempool_high_water(0),
         "reset CUDA live-allocation high-water"
     );
-    let mut probe = VramProbe::start_rendered().assert_idle(1.0);
+    let mut probe = VramProbe::start_rendered().assert_idle(MAX_IDLE_BASELINE_GB);
     let load_phase = probe.phase();
     let generator = (REGISTRATION.load)(&spec).expect("registered Mage load");
     probe.end_load(load_phase);
@@ -95,7 +101,7 @@ fn representative_route_exercises_advertised_rung() {
     scope
         .finish(MemoryRunOutcome::Complete)
         .expect("finish memory request");
-    let report = probe.report().assert_trustworthy(1.0);
+    let report = probe.report().assert_trustworthy(MAX_IDLE_BASELINE_GB);
     let live_peak_bytes = candle_gen::testkit::cuda_mempool_used_high_bytes(0)
         .expect("read CUDA live-allocation high-water");
     assert!(live_peak_bytes > 0, "CUDA live peak must be positive");
