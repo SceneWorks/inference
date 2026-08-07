@@ -105,6 +105,31 @@ fn resolve_component_dirs(root: &Path, spec: &LoadSpec) -> gen_core::Result<Mage
     })
 }
 
+/// On-disk footprint of the exact component directories resolved by the production loader.
+///
+/// SceneWorks stages the shared text encoder and VAE through `LoadSpec::components`, outside the
+/// route-local transformer snapshot. Computing from `spec.weights` alone therefore under-counts
+/// split installs. Keep this resolver coupled to [`resolve_component_dirs`] so admission and load
+/// cannot silently disagree about which assets participate in the request.
+pub(crate) fn component_footprint(
+    spec: &LoadSpec,
+) -> gen_core::Result<gen_core::PerComponentBytes> {
+    let root = match &spec.weights {
+        WeightsSource::Dir(root) => root,
+        WeightsSource::File(_) => {
+            return Err(gen_core::Error::Msg(
+                "mage-flow component footprint requires a snapshot directory".to_owned(),
+            ))
+        }
+    };
+    let dirs = resolve_component_dirs(root, spec)?;
+    Ok(gen_core::PerComponentBytes {
+        text_encoder: gen_core::safetensors_path_bytes(dirs.text_encoder),
+        dit: gen_core::safetensors_path_bytes(dirs.transformer),
+        vae: gen_core::safetensors_path_bytes(dirs.vae),
+    })
+}
+
 fn generation_descriptor(
     id: &'static str,
     supports_guidance: bool,
@@ -1173,6 +1198,47 @@ mod registry_tests {
             .unwrap_err()
             .to_string()
             .contains("must be staged as a directory"));
+    }
+
+    #[test]
+    fn split_component_footprint_follows_the_production_loader_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "sc15813_mage_footprint_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let transformer = root.join("tier/transformer");
+        let text = root.join("shared/text_encoder");
+        let vae = root.join("shared/vae");
+        for directory in [&transformer, &text, &vae] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        std::fs::write(transformer.join("model.safetensors"), vec![0u8; 11]).unwrap();
+        std::fs::write(text.join("model.safetensors"), vec![0u8; 13]).unwrap();
+        std::fs::write(vae.join("model.safetensors"), vec![0u8; 17]).unwrap();
+
+        let spec = LoadSpec::new(WeightsSource::Dir(root.join("tier")))
+            .with_component(COMPONENT_TEXT_ENCODER, WeightsSource::Dir(text))
+            .with_component(COMPONENT_VAE, WeightsSource::Dir(vae));
+        assert_eq!(
+            component_footprint(&spec).unwrap(),
+            gen_core::PerComponentBytes {
+                text_encoder: 13,
+                dit: 11,
+                vae: 17,
+            }
+        );
+        let generation = memory_strategy::contract_rl(&spec).unwrap();
+        let edit = memory_strategy::contract_edit(&spec).unwrap();
+        assert_eq!(generation.asset_facts.conditioning_bytes, 13);
+        assert_eq!(edit.asset_facts.conditioning_bytes, 30);
+        assert_eq!(generation.asset_facts.base_bytes, 41);
+        assert_eq!(edit.asset_facts.base_bytes, 41);
+
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
