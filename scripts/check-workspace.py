@@ -1347,13 +1347,6 @@ def check_snapshot_path_derivation(root: Path) -> None:
 # --- test-fixture temp roots (sc-17704 / sc-17755 / sc-17768 / sc-17791) -------------------------
 TEMP_DIR_READ = re.compile(r"env::temp_dir\(\)")
 TEMPFILE_GUARD = re.compile(r"tempfile::|TempDir")
-# What makes a temp root the *defect* rather than a deliberate artifact: a name that varies per
-# run. `{prefix}{pid}` / a counter / a clock reading produces a NEW directory every execution, so
-# the tree grows without bound, and the PID is one the OS will hand out again — which is how two
-# concurrent tests end up sharing a path and deleting each other's fixtures.
-PER_RUN_NAME = re.compile(
-    r"process::id\(\)|\{pid\}|SystemTime::now|Instant::now|fetch_add|line!\(\)|nanos\(\)"
-)
 # The one legitimate `env::temp_dir()` in a test: a *deliberately persistent* artifact the author
 # wants to open afterwards (a rendered WAV, a preview PNG, a converted snapshot). Deleting it would
 # defeat the point of writing it. Two ways that shape appears, and the lint has to see both:
@@ -1450,20 +1443,29 @@ def check_test_temp_dir_guards(root: Path) -> None:
     making a deliberate, reviewed choice about a process- or host-lifetime file, which is a different
     question from a fixture that should not outlive its test.
 
-    **Scope, and the one thing this deliberately does NOT flag.** It fires only on a *per-run
-    varying* name — ``{pid}``, an ``AtomicUsize`` counter, a clock reading. That is the shape the
-    story describes and the one that grows without bound. A *stable* name (``krea_turbo_smoke``,
-    ``mlx_gen_flux2_dev_prequant_q4``) is bounded at one entry, and in this repo it is usually
-    deliberate: a PNG the author eyeballs, or a cross-run pre-quantization cache whose whole
-    purpose is that the next run reuses it. Nothing syntactic separates a stable *artifact* from a
-    stable *fixture root someone forgot to clean* — only the author knows — so flagging stable
-    names would have meant either deleting working artifacts or maintaining an allowlist that rots.
+    **Scope: every unguarded test temp root, whatever its name.** An earlier revision fired only on
+    a *per-run varying* name (``{pid}``, a counter, a clock) on the theory that a stable name is
+    bounded at one entry and therefore usually deliberate. The measurement taken while fixing
+    sc-17791 refutes that, and is the reason this is scoped as it is:
 
-    The residual gap is therefore real and named: a **fixed-name** unguarded fixture root can still
-    be introduced without tripping this. Roughly 100 of those were converted by hand in sc-17791
-    (`whisper-prepare-probe`, `moss-ttsd-cancel`, …); this lint keeps the *unbounded* class from
-    returning, not that one. Closing it needs the author to state intent — the ``env::var(..)``
-    override below is the shape to reach for.
+    ==========================  ==============  =====================
+    lane (green run on `main`)  per-run leaked  **stable-name leaked**
+    ==========================  ==============  =====================
+    ``candle-audio*``                        0                   **14**
+    ``candle-gen*`` + contracts             14                   **16**
+    ``mlx-gen*``                            30                        0
+    ==========================  ==============  =====================
+
+    **The entire audio family's leak was stable-named — none of it was deliberate.** A per-run-only
+    lint would not catch a regression of the exact thing that story fixed there. Stable names are
+    also the *worse* of the two for the second hazard: a ``{pid}`` path collides only between tests
+    sharing a process, while a fixed name collides across every concurrent test *and* every
+    concurrent ``cargo test``, which is what deleted a live fixture mid-run in
+    `mlx-llm/tests/contract_roundtrip.rs`.
+
+    Nothing syntactic separates a deliberate artifact from a fixture root someone forgot to clean —
+    only the author knows — so the author has to say. That is what the exemption below is for, and
+    the sixteen genuinely-deliberate sites in the tree now carry it.
 
     That override is also the exemption: an ``env::var(..)``-then-fall-back reads as "the file is
     the point", whether the read is in this function or the ``unwrap_or_else`` sits downstream of a
@@ -1485,9 +1487,6 @@ def check_test_temp_dir_guards(root: Path) -> None:
             ):
                 continue
             index = text.count("\n", 0, match.start())
-            statement = "\n".join(lines[index : index + 5])
-            if not PER_RUN_NAME.search(statement):
-                continue  # a stable name is bounded at one entry — see the scope note below
             _, body = _enclosing_fn(lines, index)
             enclosing = "\n".join(body)
             if TEMPFILE_GUARD.search(enclosing) or ENV_OVERRIDE_READ.search(enclosing):
