@@ -590,6 +590,12 @@ impl CausalKvCache {
             && phys.iter().enumerate().all(|(i, &p)| p as usize == i);
         #[cfg(test)]
         if !self.evict_to_next_read {
+            // The first chunk has no committed history and therefore no populated layer slots. The
+            // eager oracle must match the production fast path below instead of trying to read
+            // `None` from every layer before the first append.
+            if positions.is_empty() && self.committed_tokens == 0 {
+                return Ok((Vec::new(), Vec::new()));
+            }
             let idx = (!whole).then(|| Array::from_slice(&phys, &[phys.len() as i32]));
             let mut prev = Vec::with_capacity(self.layers.len());
             for layer in &self.layers {
@@ -1465,6 +1471,15 @@ mod tests {
              {dequantized_window_bytes} for dequantizing the read window — that margin is why the \
              cache dequantizes on read instead of attending over packed K/V"
         );
+    }
+
+    #[test]
+    fn eager_reference_first_chunk_has_no_previous_window() {
+        let mut cache = CausalKvCache::new_eager_reference(2, 4, 0, None);
+        let (previous, positions) = cache.window_prev(2).unwrap();
+        assert!(previous.is_empty());
+        assert!(positions.is_empty());
+        assert!(cache.is_empty());
     }
 
     /// MLX emits the quantization `scales`/`biases` in the **input's** dtype. `KvCacheQuant::row_bytes`
