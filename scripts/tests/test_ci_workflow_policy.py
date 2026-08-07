@@ -1659,14 +1659,34 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         catch.
 
         sc-17519 added the 24th, `edit_generate_is_deterministic_rust`, and the arithmetic of what it
-        did NOT add is the point. `QWEN_IMAGE_EDIT_SNAPSHOT` gates 19 further `#[ignore]` tests --
-        `edit_real_weights.rs` x12 and `vision_real_weights.rs` x7 -- which sc-17284 left running
-        nowhere while satisfying the per-VARIABLE manifest gate. All 19 were executed on real weights
-        for the first time on 2026-08-06. ONE resolves no golden and passes (34-44s); the other 18
-        fail at `Weights::from_file` with `SafeTensors(NotFile)` in 0.02s, because `tools/golden/` is
-        gitignored by design and no checkout has the 10 artifacts they read (sc-17909).
+        did NOT add is the point. `edit_real_weights.rs` x12 and `vision_real_weights.rs` x7 -- 19
+        tests -- were left running nowhere by sc-17284 while the per-VARIABLE manifest gate read as
+        satisfied. All 19 were executed on real weights for the first time on 2026-08-06: ONE
+        resolves no golden and passes (34-44s, the selection added below), and the other 18 failed at
+        `Weights::from_file` with `SafeTensors(NotFile)` in 0.02s, because `tools/golden/` is
+        gitignored by design and no checkout had the 10 artifacts they read (sc-17909).
 
-        Those 18 are deliberately NOT in the excluded tuple below, and that is the same call sc-17503's
+        Of those 18, ONE was free to unblock and is no longer among them.
+        `edit_rope_multi_image_matches_fork` reads a golden whose producer imports one symbol from the
+        MIT-licensed fork and touches no snapshot, no HF cache and no torch original, so sc-17519
+        minted it, committed it to `mlx-gen-qwen-image/tests/fixtures/` (78,133 bytes) and DROPPED the
+        test's `#[ignore]`. It runs in the ordinary macOS lane on every PR, needs no weight set, and
+        is therefore not a candidate for selection here at all. 17 still fail on the golden read, and
+        they read 9 artifacts, not 10.
+
+        Note the two different 18s, because conflating them is how this row got its last wrong number:
+        18 is the count that FAILED on the golden read (19 minus the wired determinism test), and 18
+        is also, separately, the count of tests `QWEN_IMAGE_EDIT_SNAPSHOT` gates -- which is 11 + 3
+        from these two files plus 4 elsewhere, and excludes the 5 here that read no environment
+        variable at all. The manifest row derives both.
+
+        Of the 17, only 13 are blocked on the Edit-2511 oracle bundle (sc-17909). The other 4 -- the
+        index/Gate-A gates in `vision_real_weights.rs` -- need no weights on either side, and are
+        blocked solely because `tools/dump_qwen_vision_golden.py` writes its two weight-free halves
+        into the same output file as a third that loads the torch original. That is sc-18085, filed
+        apart so it does not wait on a ~60 GB decision it has no stake in.
+
+        Those 17 are deliberately NOT in the excluded tuple below, and that is the same call sc-17503's
         21 T2I golden-parity tests got: the tuple pins tests that are RUNNABLE and excluded anyway on a
         measured number, so a future reader has to be told why a green lane skips them. A test blocked
         on a missing fixture should be wired the moment the fixture exists, and listing it here would

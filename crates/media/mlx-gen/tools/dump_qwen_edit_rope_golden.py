@@ -7,7 +7,13 @@ the max over both grids). This is the novel core of the Edit transformer path.
 
 Run from the mflux fork venv:
     cd ~/repos/mflux && uv run python /path/to/mlx-gen/tools/dump_qwen_edit_rope_golden.py
-Output (gitignored): tools/golden/qwen_edit_rope_golden.safetensors
+
+Writes `tools/golden/qwen_edit_rope_golden.safetensors`, which is gitignored — but unlike every other
+script here, the artifact this one produces is COMMITTED. sc-17519 promoted it to
+`mlx-gen-qwen-image/tests/fixtures/qwen_edit_rope_golden.safetensors`, which is what
+`edit_rope_multi_image_matches_fork` reads, and why that test is NOT `#[ignore]`d. Nothing above
+needs weights, so a rerun is free; copy the output over the fixture only if the fork's rope math
+changes, and update the provenance block in `tools/golden/README.md` (sha256 + fork pin) when you do.
 """
 
 import os
