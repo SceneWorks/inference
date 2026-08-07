@@ -4531,9 +4531,11 @@ jobs:
         with:
           toolchain: 1.96.0
           components: rustfmt, clippy
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
-        with:
-          python-version: "3.12"
+      - name: Select runner-provisioned Python 3.12
+        shell: cmd
+        run: |
+          py -3.12 --version || exit /b 1
+          for /f "delims=" %%P in ('py -3.12 -c "import os,sys; print(os.path.dirname(sys.executable))"') do echo %%P>>"%GITHUB_PATH%"
       - name: Require and verify the immutable Mage snapshot
         shell: cmd
         run: |
@@ -4541,6 +4543,7 @@ jobs:
             echo Missing repository variable CANDLE_MAGE_SNAPSHOT for the Windows CUDA runner.
             exit /b 1
           )
+          python --version
           python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt || exit /b 1
           set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
           python scripts/release/ensure_model_snapshot.py --model mage-flow --snapshot "%CANDLE_MAGE_SNAPSHOT%" || exit /b 1
