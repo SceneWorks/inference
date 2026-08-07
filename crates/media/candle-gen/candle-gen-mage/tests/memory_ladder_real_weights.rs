@@ -2,7 +2,9 @@
 //!
 //! One invocation exercises one rung in a fresh process so CUDA allocator caching cannot blur the
 //! measured high-water marks. The workflow runs the resident baseline first, then every advertised
-//! optimized rung. All optimized outputs must remain byte-identical to that baseline.
+//! optimized rung. The fixture spans three fixed seeds so a parity verdict is not tuned to one lucky
+//! render; residency-only rungs remain exact, while query-chunked attention reports its measured RGB
+//! drift before applying the provider-owned contract.
 
 #![cfg(feature = "cuda")]
 
@@ -19,6 +21,7 @@ use sha2::{Digest, Sha256};
 // otherwise-idle runner before Mage loads. This matches the 2 GiB ceiling used by other physical
 // GPU probes in this workspace.
 const MAX_IDLE_BASELINE_GB: f64 = 2.0;
+const EVIDENCE_SEEDS: [u64; 3] = [42, 314_159, 271_828];
 
 fn rung() -> MemoryStrategy {
     match std::env::var("MAGE_MEMORY_RUNG")
@@ -101,44 +104,50 @@ fn representative_route_exercises_advertised_rung() {
         MemorySafetyDecision::Accept,
         "shared admission must accept the representative route"
     );
-    let mut scope = generator
-        .begin_memory_strategy_request(&context)
-        .expect("begin memory request")
-        .expect("Mage memory request scope");
-    let mut request = GenerationRequest {
-        prompt: "a calico kitten sitting on a wooden windowsill beside a blue ceramic mug".into(),
-        width: 1024,
-        height: 1024,
-        steps: Some(20),
-        guidance: Some(5.0),
-        seed: Some(42),
-        ..Default::default()
-    };
-    scope
-        .configure_request(&mut request)
-        .expect("configure admitted request");
+    let mut pixels = Vec::with_capacity(EVIDENCE_SEEDS.len() * 1024 * 1024 * 3);
+    for seed in EVIDENCE_SEEDS {
+        let mut scope = generator
+            .begin_memory_strategy_request(&context)
+            .expect("begin memory request")
+            .expect("Mage memory request scope");
+        let mut request = GenerationRequest {
+            prompt: "a calico kitten sitting on a wooden windowsill beside a blue ceramic mug"
+                .into(),
+            width: 1024,
+            height: 1024,
+            steps: Some(20),
+            guidance: Some(5.0),
+            seed: Some(seed),
+            ..Default::default()
+        };
+        scope
+            .configure_request(&mut request)
+            .expect("configure admitted request");
 
-    let generation_phase = probe.phase();
-    let output = generator
-        .generate(&request, &mut |_| {})
-        .expect("Mage memory-rung generation");
-    probe.end_gen(generation_phase);
-    scope
-        .finish(MemoryRunOutcome::Complete)
-        .expect("finish memory request");
+        let generation_phase = probe.phase();
+        let output = generator
+            .generate(&request, &mut |_| {})
+            .expect("Mage memory-rung generation");
+        probe.end_gen(generation_phase);
+        scope
+            .finish(MemoryRunOutcome::Complete)
+            .expect("finish memory request");
+        let image = match output {
+            GenerationOutput::Images(mut images) if images.len() == 1 => images.remove(0),
+            GenerationOutput::Images(images) => panic!("expected one image, got {}", images.len()),
+            _ => panic!("expected image output"),
+        };
+        assert_eq!((image.width, image.height), (1024, 1024));
+        assert_eq!(image.pixels.len(), 1024 * 1024 * 3);
+        pixels.extend_from_slice(&image.pixels);
+    }
     let report = probe.report().assert_trustworthy(MAX_IDLE_BASELINE_GB);
     let live_peak_bytes = candle_gen::testkit::cuda_mempool_used_high_bytes(0)
         .expect("read CUDA live-allocation high-water");
     assert!(live_peak_bytes > 0, "CUDA live peak must be positive");
 
-    let image = match output {
-        GenerationOutput::Images(mut images) if images.len() == 1 => images.remove(0),
-        GenerationOutput::Images(images) => panic!("expected one image, got {}", images.len()),
-        _ => panic!("expected image output"),
-    };
-    assert_eq!((image.width, image.height), (1024, 1024));
-    assert_eq!(image.pixels.len(), 1024 * 1024 * 3);
-    std::fs::write(&out, &image.pixels).expect("write raw RGB output");
+    assert_eq!(pixels.len(), EVIDENCE_SEEDS.len() * 1024 * 1024 * 3);
+    std::fs::write(&out, &pixels).expect("write concatenated raw RGB outputs");
 
     if strategy != MemoryStrategy::Resident {
         let reference_path = std::env::var("MAGE_MEMORY_REFERENCE")
@@ -146,17 +155,17 @@ fn representative_route_exercises_advertised_rung() {
         let reference = std::fs::read(&reference_path)
             .unwrap_or_else(|error| panic!("read MAGE_MEMORY_REFERENCE={reference_path}: {error}"));
         let (changed_fraction, max_abs, mean_abs, rmse, psnr_db) =
-            parity_metrics(&reference, &image.pixels);
+            parity_metrics(&reference, &pixels);
         eprintln!(
             "MAGE_MEMORY_PARITY strategy={strategy:?} changed_fraction={changed_fraction:.12} max_abs={max_abs} mean_abs={mean_abs:.12} rmse={rmse:.12} psnr_db={psnr_db:.12}"
         );
         assert_eq!(
-            image.pixels, reference,
+            pixels, reference,
             "{strategy:?} changed the deterministic resident output"
         );
     }
 
-    let output_sha256 = format!("{:x}", Sha256::digest(&image.pixels));
+    let output_sha256 = format!("{:x}", Sha256::digest(&pixels));
     eprintln!(
         "MAGE_MEMORY_EVIDENCE strategy={strategy:?} composition={:?} peak_bytes={live_peak_bytes} output_sha256={output_sha256} gpu={} {report}",
         contract.engaged_composition(strategy),
