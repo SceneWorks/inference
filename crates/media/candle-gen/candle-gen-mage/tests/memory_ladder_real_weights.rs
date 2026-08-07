@@ -204,7 +204,7 @@ fn representative_route_exercises_advertised_rung() {
             .expect("finish memory request");
         if strategy >= MemoryStrategy::BoundedAttention {
             assert!(
-                candle_gen::attention::chunk_probe::last_chunk_count() > 1,
+                candle_gen::attention::chunk_probe::max_chunk_count() > 1,
                 "{}: bounded attention did not split the score tensor",
                 case.name,
             );
