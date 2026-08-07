@@ -320,6 +320,33 @@ enum MageBlocks {
     },
 }
 
+#[cfg(feature = "testkit")]
+pub mod block_window_probe {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static MATERIALIZED_WINDOWS: AtomicUsize = AtomicUsize::new(0);
+
+    pub fn reset() {
+        MATERIALIZED_WINDOWS.store(0, Ordering::Relaxed);
+    }
+
+    pub fn materialized_windows() -> usize {
+        MATERIALIZED_WINDOWS.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn record() {
+        MATERIALIZED_WINDOWS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(feature = "testkit")]
+fn record_materialized_window() {
+    block_window_probe::record();
+}
+
+#[cfg(not(feature = "testkit"))]
+fn record_materialized_window() {}
+
 struct Mods {
     shift: Tensor,
     scale: Tensor,
@@ -662,6 +689,7 @@ impl MageTransformer {
                     (image, text),
                     || Weights::from_dir(dir, target_device, DType::BF16).map_err(Into::into),
                     |(mut image, mut text), weights, range| {
+                        record_materialized_window();
                         let blocks = range
                             .map(|index| {
                                 Block::load_with_sidecars(

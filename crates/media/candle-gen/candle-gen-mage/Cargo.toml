@@ -7,6 +7,7 @@ license = "Apache-2.0"
 [features]
 default = []
 cuda = ["candle-gen/cuda", "candle-gen-boogu/cuda", "candle-transformers/cuda"]
+testkit = ["candle-gen/testkit"]
 
 [dependencies]
 candle-gen = { path = "../candle-gen" }

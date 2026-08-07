@@ -10,7 +10,8 @@
 
 use candle_gen::gen_core::{
     GenerationOutput, GenerationRequest, LoadShape, LoadSpec, MemoryBehaviorRoute, MemoryMode,
-    MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy, Quant, WeightsSource,
+    MemoryParityContract, MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy, Quant,
+    WeightsSource,
 };
 use candle_gen::testkit::VramProbe;
 use candle_gen_mage::{memory_strategy, REGISTRATION};
@@ -21,7 +22,70 @@ use sha2::{Digest, Sha256};
 // otherwise-idle runner before Mage loads. This matches the 2 GiB ceiling used by other physical
 // GPU probes in this workspace.
 const MAX_IDLE_BASELINE_GB: f64 = 2.0;
-const EVIDENCE_SEEDS: [u64; 3] = [42, 314_159, 271_828];
+
+struct EvidenceCase {
+    cohort: &'static str,
+    name: &'static str,
+    prompt: &'static str,
+    seed: u64,
+}
+
+const EVIDENCE_CASES: [EvidenceCase; 6] = [
+    EvidenceCase {
+        cohort: "calibration",
+        name: "animal-still-life",
+        prompt: "a calico kitten sitting on a wooden windowsill beside a blue ceramic mug",
+        seed: 42,
+    },
+    EvidenceCase {
+        cohort: "calibration",
+        name: "wide-landscape",
+        prompt: "a wide alpine lake at sunrise, snow peaks reflected in still water, documentary photograph",
+        seed: 314_159,
+    },
+    EvidenceCase {
+        cohort: "calibration",
+        name: "graphic-poster",
+        prompt: "a bold geometric travel poster of a red lighthouse, flat colors, crisp screen print texture",
+        seed: 271_828,
+    },
+    EvidenceCase {
+        cohort: "holdout",
+        name: "architectural-interior",
+        prompt: "a sunlit brutalist library interior with long concrete shadows, architectural photography",
+        seed: 1_618_033,
+    },
+    EvidenceCase {
+        cohort: "holdout",
+        name: "macro-nature",
+        prompt: "macro photograph of a dew-covered blue butterfly on a fern, shallow depth of field",
+        seed: 57_721,
+    },
+    EvidenceCase {
+        cohort: "holdout",
+        name: "night-street",
+        prompt: "a rainy city street at night with warm shop lights reflected on pavement, cinematic photograph",
+        seed: 1_414_213,
+    },
+];
+
+// Query-row chunking preserves each row's complete K/V reduction but changes GEMM M, so Candle's
+// shared SDPA contract explicitly promises numerical rather than bit parity. An 8.0 RGB8 RMSE ceiling
+// is an independently chosen >=30 dB PSNR quality floor (8.0 is slightly stricter than the 8.063
+// RMSE equivalent). Every calibration and holdout image must pass separately; no cohort averaging can
+// dilute a bad render. Staged residency and block materialization itself remain exact.
+const ATTENTION_RMSE_MAX: f64 = 8.0;
+
+fn parity_contract(strategy: MemoryStrategy) -> MemoryParityContract {
+    if strategy >= MemoryStrategy::BoundedAttention {
+        MemoryParityContract::Tolerance {
+            metric: "rgb8_rmse_per_image".to_owned(),
+            maximum_error: ATTENTION_RMSE_MAX,
+        }
+    } else {
+        MemoryParityContract::Exact
+    }
+}
 
 fn rung() -> MemoryStrategy {
     match std::env::var("MAGE_MEMORY_RUNG")
@@ -99,31 +163,37 @@ fn representative_route_exercises_advertised_rung() {
         },
     )
     .expect("Mage memory context");
-    assert_eq!(
-        generator.memory_strategy_safety_check(&context),
-        MemorySafetyDecision::Accept,
-        "shared admission must accept the representative route"
-    );
-    let mut pixels = Vec::with_capacity(EVIDENCE_SEEDS.len() * 1024 * 1024 * 3);
-    for seed in EVIDENCE_SEEDS {
+    let mut pixels = Vec::with_capacity(EVIDENCE_CASES.len() * 1024 * 1024 * 3);
+    for case in &EVIDENCE_CASES {
+        assert_eq!(
+            generator.memory_strategy_safety_check(&context),
+            MemorySafetyDecision::Accept,
+            "shared admission must accept calibration case {}",
+            case.name,
+        );
         let mut scope = generator
             .begin_memory_strategy_request(&context)
             .expect("begin memory request")
             .expect("Mage memory request scope");
         let mut request = GenerationRequest {
-            prompt: "a calico kitten sitting on a wooden windowsill beside a blue ceramic mug"
-                .into(),
+            prompt: case.prompt.into(),
             width: 1024,
             height: 1024,
             steps: Some(20),
             guidance: Some(5.0),
-            seed: Some(seed),
+            seed: Some(case.seed),
             ..Default::default()
         };
         scope
             .configure_request(&mut request)
             .expect("configure admitted request");
 
+        if strategy >= MemoryStrategy::BoundedAttention {
+            candle_gen::attention::chunk_probe::reset();
+        }
+        if strategy == MemoryStrategy::BoundedTransformerResidency {
+            candle_gen_mage::transformer::block_window_probe::reset();
+        }
         let generation_phase = probe.phase();
         let output = generator
             .generate(&request, &mut |_| {})
@@ -132,6 +202,21 @@ fn representative_route_exercises_advertised_rung() {
         scope
             .finish(MemoryRunOutcome::Complete)
             .expect("finish memory request");
+        if strategy >= MemoryStrategy::BoundedAttention {
+            assert!(
+                candle_gen::attention::chunk_probe::last_chunk_count() > 1,
+                "{}: bounded attention did not split the score tensor",
+                case.name,
+            );
+        }
+        if strategy == MemoryStrategy::BoundedTransformerResidency {
+            assert!(
+                candle_gen_mage::transformer::block_window_probe::materialized_windows()
+                    >= memory_strategy::TRANSFORMER_BLOCKS as usize,
+                "{}: transformer block windows were not materialized",
+                case.name,
+            );
+        }
         let image = match output {
             GenerationOutput::Images(mut images) if images.len() == 1 => images.remove(0),
             GenerationOutput::Images(images) => panic!("expected one image, got {}", images.len()),
@@ -146,7 +231,8 @@ fn representative_route_exercises_advertised_rung() {
         .expect("read CUDA live-allocation high-water");
     assert!(live_peak_bytes > 0, "CUDA live peak must be positive");
 
-    assert_eq!(pixels.len(), EVIDENCE_SEEDS.len() * 1024 * 1024 * 3);
+    let bytes_per_case = 1024 * 1024 * 3;
+    assert_eq!(pixels.len(), EVIDENCE_CASES.len() * bytes_per_case);
     std::fs::write(&out, &pixels).expect("write concatenated raw RGB outputs");
 
     if strategy != MemoryStrategy::Resident {
@@ -154,15 +240,55 @@ fn representative_route_exercises_advertised_rung() {
             .expect("set MAGE_MEMORY_REFERENCE for optimized rungs");
         let reference = std::fs::read(&reference_path)
             .unwrap_or_else(|error| panic!("read MAGE_MEMORY_REFERENCE={reference_path}: {error}"));
-        let (changed_fraction, max_abs, mean_abs, rmse, psnr_db) =
-            parity_metrics(&reference, &pixels);
-        eprintln!(
-            "MAGE_MEMORY_PARITY strategy={strategy:?} changed_fraction={changed_fraction:.12} max_abs={max_abs} mean_abs={mean_abs:.12} rmse={rmse:.12} psnr_db={psnr_db:.12}"
-        );
-        assert_eq!(
-            pixels, reference,
-            "{strategy:?} changed the deterministic resident output"
-        );
+        assert_eq!(reference.len(), pixels.len(), "resident cohort shape");
+        for (index, case) in EVIDENCE_CASES.iter().enumerate() {
+            let range = index * bytes_per_case..(index + 1) * bytes_per_case;
+            let resident = &reference[range.clone()];
+            let candidate = &pixels[range];
+            let (changed_fraction, max_abs, mean_abs, rmse, psnr_db) =
+                parity_metrics(resident, candidate);
+            eprintln!(
+                "MAGE_MEMORY_PARITY cohort={} case={} seed={} strategy={strategy:?} contract={:?} changed_fraction={changed_fraction:.12} max_abs={max_abs} mean_abs={mean_abs:.12} rmse={rmse:.12} psnr_db={psnr_db:.12}",
+                case.cohort, case.name, case.seed, parity_contract(strategy),
+            );
+            match parity_contract(strategy) {
+                MemoryParityContract::Exact => assert_eq!(
+                    candidate, resident,
+                    "{strategy:?} changed resident output for {}",
+                    case.name,
+                ),
+                MemoryParityContract::Tolerance { maximum_error, .. } => assert!(
+                    rmse <= maximum_error,
+                    "{strategy:?} RGB8 RMSE {rmse:.6} exceeded {maximum_error:.6} for {}",
+                    case.name,
+                ),
+                MemoryParityContract::Golden { .. } => unreachable!("Mage uses no golden contract"),
+            }
+        }
+    }
+
+    if strategy == MemoryStrategy::BoundedTransformerResidency {
+        let attention_path = std::env::var("MAGE_MEMORY_ATTENTION_REFERENCE")
+            .expect("set MAGE_MEMORY_ATTENTION_REFERENCE for block-streaming isolation");
+        let attention = std::fs::read(&attention_path).unwrap_or_else(|error| {
+            panic!("read MAGE_MEMORY_ATTENTION_REFERENCE={attention_path}: {error}")
+        });
+        assert_eq!(attention.len(), pixels.len(), "attention cohort shape");
+        for (index, case) in EVIDENCE_CASES.iter().enumerate() {
+            let range = index * bytes_per_case..(index + 1) * bytes_per_case;
+            let baseline = &attention[range.clone()];
+            let candidate = &pixels[range];
+            let (_, max_abs, mean_abs, rmse, _) = parity_metrics(baseline, candidate);
+            eprintln!(
+                "MAGE_BLOCK_ISOLATION cohort={} case={} seed={} max_abs={max_abs} mean_abs={mean_abs:.12} rmse={rmse:.12}",
+                case.cohort, case.name, case.seed,
+            );
+            assert_eq!(
+                candidate, baseline,
+                "block streaming changed bounded-attention output for {}",
+                case.name,
+            );
+        }
     }
 
     let output_sha256 = format!("{:x}", Sha256::digest(&pixels));
