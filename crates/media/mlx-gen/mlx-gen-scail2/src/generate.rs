@@ -333,10 +333,10 @@ pub fn generate(
         if crate::lora::has_diff_patch_keys(&spec.path)? {
             diff_patch.push(spec);
         }
-        // A file joins the residual pass only if it actually carries low-rank factors. The strict
-        // installer errors when a spec resolves no targets, so handing it a pure-`.diff` file (legal,
-        // just not what this file happens to be) would turn a good adapter into "matched nothing".
-        if crate::lora::has_low_rank_keys(&spec.path)? {
+        // A file joins the residual pass unless the diff-patch fold consumed ALL of it. Tested by
+        // exclusion rather than by listing LoRA suffixes: the installer also handles LoKr/LoHa (the
+        // descriptor advertises `supports_lokr`), and an allow-list would silently drop those.
+        if crate::lora::has_residual_installable_keys(&spec.path)? {
             residual.push(spec.clone());
         }
     }

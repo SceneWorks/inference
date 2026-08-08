@@ -287,12 +287,24 @@ fn diff_patch_merge_report() {
         report.skipped_cross_arch,
         report.skipped_unmatched
     );
-    // 40 blocks × (12 lora projections + 6 norm `.diff`s = 18) = 720, + dim-5120 globals with a weight
-    // delta (text_embedding.0/.2, time_embedding.0/.2, time_projection.1, img_emb.proj.1/.3 = lora;
-    // img_emb.proj.0/.4 = diff; head.head = diff) = 10 → 730.
+    // sc-18198 re-split this by ROLE, so the counts moved: only FULL-RANK `.diff` deltas merge here.
+    //   merged   = 40 blocks × 6 norm `.diff`s (self/cross `norm_q`/`norm_k`, `norm_k_img`, `norm3`)
+    //              = 240, + `img_emb.proj.0` / `img_emb.proj.4` / `head.head` = 3  ->  243
+    //   deferred = 40 blocks × 12 low-rank projections = 480, + 7 low-rank globals
+    //              (`text_embedding.0/.2`, `time_embedding.0/.2`, `time_projection.1`,
+    //              `img_emb.proj.1/.3`)  ->  487
+    // 243 + 487 = 730, the old combined total — the work did not change, only which pass performs it.
     assert_eq!(
-        report.merged_weights, 730,
-        "every compatible weight delta merges"
+        report.merged_weights, 243,
+        "every compatible FULL-RANK weight delta merges (low-rank is deferred now)"
+    );
+    assert_eq!(
+        report.deferred_low_rank, 487,
+        "every low-rank target is handed to the post-quantize residual installer"
+    );
+    assert!(
+        report.blocked_packed_diff.is_empty(),
+        "no full-rank delta lands on a packed weight in a dense snapshot"
     );
     // Every `.diff_b` except patch_embedding's (531 total − 1 skipped with the cross-arch module) = 530.
     assert_eq!(
@@ -311,12 +323,19 @@ fn diff_patch_merge_report() {
 }
 
 /// The same diff-patch file against a **pre-quantized-on-disk** snapshot (`SCAIL2_Q4_SNAPSHOT_DIR`,
-/// e.g. `~/.cache/scail2-mlx-q4`) must error loudly: a dense delta can't fold into packed u32 weights,
-/// so the loader directs the user to the dense bf16 snapshot rather than silently dropping the patch.
-/// Skips when the env var is unset.
+/// e.g. `~/.cache/scail2-mlx-q4`) must now **succeed** (sc-18198). This test previously asserted the
+/// opposite: the loader rejected the whole file whenever the tier was pre-quantized. That gate was
+/// broader than its own justification — the file's full-rank deltas land only on tensors MLX leaves
+/// dense (norms, biases, `head.head`, `img_emb.proj.{0,4}`), and the low-rank factors that DO target
+/// packed projections install as post-quantize residuals. q4 is the default macOS tier, so the old
+/// behavior made the bundled lightning toggle unusable out of the box.
+///
+/// Kept as a real-weight contract rather than deleted: the claim "nothing in this file needs a dense
+/// base" is a statement about the PUBLISHED tier and adapter, which only real headers can settle.
+/// Skips when the env vars are unset.
 #[test]
 #[ignore = "needs the raw lightx2v file + a pre-quantized snapshot; run with --ignored on macOS"]
-fn diff_patch_rejected_on_prequantized() {
+fn diff_patch_applies_on_prequantized() {
     let (Ok(lora), Ok(q4_dir)) = (
         std::env::var("SCAIL2_DIFF_PATCH_LORA"),
         std::env::var("SCAIL2_Q4_SNAPSHOT_DIR"),
@@ -358,13 +377,20 @@ fn diff_patch_rejected_on_prequantized() {
         .unwrap()
         .load(MODEL_ID, &spec)
         .expect("load scail2 provider");
-    let err = gen
-        .generate(&req, &mut |_| {})
-        .expect_err("a diff-patch LoRA on a pre-quantized snapshot must be rejected");
-    let msg = format!("{err}");
+    let out = gen.generate(&req, &mut |_| {}).unwrap_or_else(|err| {
+        panic!(
+            "a diff-patch LoRA must now APPLY on a pre-quantized snapshot (sc-18198), got: {err}"
+        )
+    });
+    let GenerationOutput::Video { frames, .. } = out else {
+        panic!("expected a Video output");
+    };
     assert!(
-        msg.contains("DENSE") || msg.contains("dense"),
-        "expected a dense-snapshot-required error, got: {msg}"
+        !frames.is_empty(),
+        "the lightning LoRA on a q4 tier must produce frames"
     );
-    println!("diff-patch on pre-quantized snapshot correctly rejected: {msg}");
+    println!(
+        "diff-patch applied on the pre-quantized snapshot: {} frame(s)",
+        frames.len()
+    );
 }
