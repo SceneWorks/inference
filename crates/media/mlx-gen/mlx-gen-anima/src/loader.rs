@@ -98,9 +98,9 @@ fn resolve_split_files(source: &WeightsSource) -> Result<PathBuf> {
 /// `split_files/`); this seam reports the real bytes. Shared by anima base/aesthetic/turbo (they differ
 /// only in the DiT filename inside `diffusion_models/`).
 ///
-/// PRE-WIRING: this split is computed correctly, but anima is NOT yet in the worker's
-/// `SEQUENTIAL_CAPABLE_ENGINES` allowlist, so the fit-gate does not consume it until anima is added
-/// there in the fan-out (sc-10840). Until then it is inert (the worker uses its whole-model total).
+/// WIRED (sc-10840): all three anima variants set `supports_sequential_offload: true` in their
+/// descriptor capabilities, and the worker's fit-gate keys on that capability bit (there is no
+/// allowlist) and consumes this split generically through the registered footprint seam.
 pub(crate) fn component_footprint(
     spec: &mlx_gen::LoadSpec,
 ) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {

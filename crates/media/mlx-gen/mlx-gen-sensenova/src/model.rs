@@ -533,7 +533,8 @@ fn image_to_chw01(img: &Image) -> Result<Array> {
 /// (the dual-path `_mot_gen` layout — see [`crate::loader`]), so there is NO separable text encoder to
 /// stage. Report the whole checkpoint as the heavy component (`text_encoder = 0`) — an honest
 /// "`Sequential` residency buys nothing here" (staged peak == resident peak) rather than a fabricated
-/// split. sensenova is not in the worker's sequential-capable allowlist, so this only makes that explicit.
+/// split. sensenova's descriptor sets `supports_sequential_offload: false` — the capability bit the
+/// worker's fit-gate keys on — so the sequential path is never taken; this only makes that explicit.
 pub(crate) fn component_footprint(
     spec: &mlx_gen::LoadSpec,
 ) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
