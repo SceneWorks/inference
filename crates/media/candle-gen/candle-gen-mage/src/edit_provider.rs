@@ -458,21 +458,7 @@ impl MageEdit {
         let latent = target
             .reshape((1, gh, gw, LATENT_CHANNELS))?
             .permute((0, 3, 1, 2))?;
-        let decoded = if memory.is_some_and(|memory| memory.tile_vae_decode) {
-            let memory = memory.expect("guarded above");
-            vae.decode_bounded(
-                &latent,
-                memory
-                    .decode_tile_edge
-                    .unwrap_or(crate::memory_strategy::DECODE_TILE_EDGE),
-                memory
-                    .decode_overlap
-                    .unwrap_or(crate::memory_strategy::DECODE_OVERLAP),
-            )?
-        } else {
-            vae.decode(&latent)?
-        }
-        .to_dtype(DType::F32)?;
+        let decoded = vae.decode(&latent)?.to_dtype(DType::F32)?;
         if cancel.is_cancelled() {
             candle_core::bail!("mage edit canceled");
         }

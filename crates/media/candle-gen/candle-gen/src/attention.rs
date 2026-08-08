@@ -335,15 +335,22 @@ pub mod chunk_probe {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     pub(super) static LAST_CHUNK_COUNT: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static MAX_CHUNK_COUNT: AtomicUsize = AtomicUsize::new(0);
 
     /// Chunks run by the most recent `sdpa_budgeted_*` call (`1` = the un-chunked fast path).
     pub fn last_chunk_count() -> usize {
         LAST_CHUNK_COUNT.load(Ordering::Relaxed)
     }
 
+    /// Largest chunk count observed since the most recent [`reset`].
+    pub fn max_chunk_count() -> usize {
+        MAX_CHUNK_COUNT.load(Ordering::Relaxed)
+    }
+
     /// Reset before a call so a stale value cannot satisfy an assertion.
     pub fn reset() {
         LAST_CHUNK_COUNT.store(0, Ordering::Relaxed);
+        MAX_CHUNK_COUNT.store(0, Ordering::Relaxed);
     }
 }
 
@@ -353,6 +360,7 @@ use chunk_probe::{last_chunk_count, reset as reset_chunk_count};
 #[cfg(any(test, feature = "testkit"))]
 fn record_chunk_count(n: usize) {
     chunk_probe::LAST_CHUNK_COUNT.store(n, std::sync::atomic::Ordering::Relaxed);
+    chunk_probe::MAX_CHUNK_COUNT.fetch_max(n, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[cfg(not(any(test, feature = "testkit")))]
@@ -387,6 +395,11 @@ mod tests {
             "the kernel ran {} chunks, not {expected} — the equivalence around this call would be \
              vacuous",
             last_chunk_count()
+        );
+        assert_eq!(
+            chunk_probe::max_chunk_count(),
+            expected,
+            "the maximum-since-reset probe did not retain the observed chunk count"
         );
     }
 

@@ -106,7 +106,7 @@ on:
         default: all
         # `audio` still runs every audio family. The `audio-*` entries are the per-family split
         # (sc-16981) — dispatch one provider family without taking the Metal runner for the rest.
-        options: [all, llm, llm-joycaption, media, chroma-auxiliary, chroma-memory-ladder, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, krea-realtime, krea-kv-cache, krea-s18-sweep, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base]
+        options: [all, llm, llm-joycaption, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, krea-realtime, krea-kv-cache, krea-s18-sweep, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base]
       sceneworks_revision:
         description: Exact lowercase SceneWorks commit paired with memory-evidence-v1
         type: string
@@ -4566,6 +4566,58 @@ jobs:
           call "%VCVARS%"
           cargo test --locked -p candle-llm --features cuda --test conformance real_model_passes_core_llm_conformance -- --ignored --nocapture || exit /b 1
           cargo test --locked -p candle-llm --features cuda --test conformance qwen3_passes_core_llm_conformance -- --ignored --nocapture || exit /b 1
+
+  # SC-15813 authoritative implementation evidence. This is a deliberately narrow dispatch instead
+  # of another arm of `media`: every rung needs a fresh CUDA process, while the unrelated media
+  # matrix can occupy both real-weight hosts for hours. Catalog calibration remains entry-owned.
+  candle-mage-memory-ladder:
+    name: Candle Mage memory ladder (CUDA)
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'mage-memory-ladder'
+    runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 120
+    env:
+      CANDLE_MAGE_SNAPSHOT: ${{ vars.CANDLE_MAGE_SNAPSHOT }}
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Select Git Bash
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+          components: rustfmt, clippy
+      - name: Require and verify the operator-provisioned immutable Mage snapshot
+        shell: cmd
+        run: |
+          if "%CANDLE_MAGE_SNAPSHOT%"=="" (
+            echo Missing repository variable CANDLE_MAGE_SNAPSHOT for the Windows CUDA runner.
+            exit /b 1
+          )
+          python --version
+          python scripts/release/ensure_model_snapshot.py --model mage-flow --snapshot "%CANDLE_MAGE_SNAPSHOT%" || exit /b 1
+      - name: Exercise every advertised Mage memory rung
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          set "MAGE_MEMORY_REFERENCE=%RUNNER_TEMP%\mage-memory-resident.rgb"
+          set "MAGE_MEMORY_ATTENTION_REFERENCE=%RUNNER_TEMP%\mage-memory-attention.rgb"
+          for %%R in (resident staged attention blocks) do (
+            set "MAGE_MEMORY_RUNG=%%R"
+            set "MAGE_MEMORY_OUT=%RUNNER_TEMP%\mage-memory-%%R.rgb"
+            cargo test --locked --release -p candle-gen-mage --features cuda,testkit --test memory_ladder_real_weights representative_route_exercises_advertised_rung -- --ignored --exact --nocapture || exit /b 1
+          )
+      - name: Upload Mage rung outputs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: mage-memory-ladder-${{ github.sha }}
+          path: ${{ runner.temp }}\mage-memory-*.rgb
+          if-no-files-found: error
 
   candle-media:
     name: Candle media real weights (CUDA)

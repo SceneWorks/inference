@@ -11,27 +11,6 @@ use candle_nn::{Conv2d, Conv2dConfig, Linear};
 
 use crate::config::{LATENT_CHANNELS, NORM_EPS, VAE_DOWNSAMPLE};
 
-fn validate_bounded_decode(latent: &Tensor, tile_edge: u32, overlap: u32) -> Result<()> {
-    if tile_edge != crate::memory_strategy::DECODE_TILE_EDGE
-        || overlap != crate::memory_strategy::DECODE_OVERLAP
-    {
-        candle_core::bail!("mage vae: unsupported bounded decode candidate {tile_edge}/{overlap}");
-    }
-    let (_, _, latent_height, latent_width) = latent.dims4()?;
-    let output_height = latent_height.checked_mul(16).ok_or_else(|| {
-        candle_core::Error::Msg("mage vae: bounded decode height overflow".to_owned())
-    })?;
-    let output_width = latent_width.checked_mul(16).ok_or_else(|| {
-        candle_core::Error::Msg("mage vae: bounded decode width overflow".to_owned())
-    })?;
-    if output_width > tile_edge as usize || output_height > tile_edge as usize {
-        candle_core::bail!(
-            "mage vae: full-edge bounded decode {output_width}x{output_height} exceeds admitted {tile_edge}px edge"
-        );
-    }
-    Ok(())
-}
-
 fn conv(
     w: &Weights,
     prefix: &str,
@@ -629,15 +608,6 @@ impl MageVae {
             .permute((0, 5, 1, 3, 2, 4))?
             .reshape((b, 3, h * 16, w * 16))
     }
-
-    /// Drive the provider's explicit bounded-decode hook. Mage's CoD decoder and DConv tail contain
-    /// full-frame normalization, so the currently verified production domain is deliberately the
-    /// complete 1024px edge. This separates decode residency without pretending a smaller spatial
-    /// tile is parity-safe.
-    pub fn decode_bounded(&self, latent: &Tensor, tile_edge: u32, overlap: u32) -> Result<Tensor> {
-        validate_bounded_decode(latent, tile_edge, overlap)?;
-        self.decode(latent)
-    }
 }
 
 #[cfg(test)]
@@ -656,16 +626,5 @@ mod tests {
         let integer_ramp = ((1f32 / 15.) * std::f32::consts::PI).cos();
         assert!((got[0][1][8] - inclusive).abs() < 1e-6);
         assert!((got[0][1][8] - integer_ramp).abs() > 1e-3);
-    }
-
-    #[test]
-    fn bounded_decode_seam_rejects_latents_larger_than_1024_output() {
-        let latent = Tensor::zeros((1, 128, 65, 64), DType::BF16, &Device::Cpu).unwrap();
-        assert!(validate_bounded_decode(
-            &latent,
-            crate::memory_strategy::DECODE_TILE_EDGE,
-            crate::memory_strategy::DECODE_OVERLAP,
-        )
-        .is_err());
     }
 }

@@ -13,16 +13,11 @@ use candle_gen::gen_core::{
     MemoryParameterRanges, MemoryPhase, MemoryPrerequisiteScope, MemoryProviderContract,
     MemoryRequestScope, MemoryRunContext, MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy,
     MemoryStrategyCapability, MemoryStrategyPrerequisite, MemoryStrategySupport,
-    MemoryWindowMaterialization, PerComponentBytes, Precision, Quant, TransformerComponent,
-    WeightsSource,
+    MemoryWindowMaterialization, Precision, Quant, TransformerComponent, WeightsSource,
 };
 use candle_gen::quant::PackedConfig;
 use std::sync::{Arc, Mutex};
 
-pub const DECODE_TILE_EDGE: u32 = 1024;
-pub const DECODE_TILE_EDGES: &[u32] = &[DECODE_TILE_EDGE];
-pub const DECODE_OVERLAP: u32 = 1;
-pub const DECODE_OVERLAPS: &[u32] = &[DECODE_OVERLAP];
 pub const ATTENTION_CHUNK_SIZE: u32 =
     gen_core::attention_budget::CONSTRAINED_ATTN_SCORES_BUDGET as u32;
 pub const TRANSFORMER_WINDOW_SIZES: &[u32] = &[1];
@@ -48,7 +43,7 @@ fn is_edit(provider_id: &str) -> bool {
 fn fingerprint(provider_id: &str) -> gen_core::Result<String> {
     if PROVIDER_IDS.contains(&provider_id) {
         Ok(format!(
-            "mage-flow-cuda-shared-ladder-provider-abi-v1-{}",
+            "mage-flow-cuda-shared-ladder-provider-abi-v2-{}",
             provider_id.replace('_', "-")
         ))
     } else {
@@ -102,13 +97,7 @@ pub fn provider_contract_for(
 ) -> gen_core::Result<MemoryProviderContract> {
     let calibration_fingerprint = fingerprint(provider_id)?;
     let streamable = streamable(spec) && transformer_has_device_format(spec)?;
-    let components = PerComponentBytes::from_spec_subdirs(
-        spec,
-        &[crate::COMPONENT_TEXT_ENCODER],
-        &["transformer"],
-        &[crate::COMPONENT_VAE],
-    )
-    .unwrap_or_default();
+    let components = crate::component_footprint(spec)?;
     let phases = vec![
         MemoryPhase::Conditioning,
         MemoryPhase::Denoise,
@@ -118,17 +107,21 @@ pub fn provider_contract_for(
         .into_iter()
         .map(|strategy| MemoryStrategyCapability {
             strategy,
-            support: if strategy == MemoryStrategy::BoundedTransformerResidency && !streamable {
-                MemoryStrategySupport::Missing
-            } else {
-                MemoryStrategySupport::Implemented
+            support: match strategy {
+                // Mage's CoD decoder normalizes over the complete latent feature field before its
+                // pixel MLP. Spatial tiles would change that normalization and therefore the image;
+                // a full-edge call is ordinary decode, not a bounded-memory implementation.
+                MemoryStrategy::BoundedDecode => {
+                    MemoryStrategySupport::StructurallyNotApplicable {
+                        reason: "Mage CoD decode contains full-frame normalization and has no parity-safe independent spatial tiles".to_owned(),
+                    }
+                }
+                MemoryStrategy::BoundedTransformerResidency if !streamable => {
+                    MemoryStrategySupport::Missing
+                }
+                _ => MemoryStrategySupport::Implemented,
             },
             parameters: match strategy {
-                MemoryStrategy::BoundedDecode => MemoryParameterRanges {
-                    decode_tile_edges: DECODE_TILE_EDGES.to_vec(),
-                    decode_overlaps: DECODE_OVERLAPS.to_vec(),
-                    ..Default::default()
-                },
                 MemoryStrategy::BoundedAttention => MemoryParameterRanges {
                     attention_chunk_sizes: vec![ATTENTION_CHUNK_SIZE],
                     ..Default::default()
@@ -157,7 +150,6 @@ pub fn provider_contract_for(
         pid_decode_routes: None,
         load_shape: spec.load_shape,
         additional_prerequisites: [
-            MemoryStrategy::BoundedDecode,
             MemoryStrategy::BoundedAttention,
             MemoryStrategy::BoundedTransformerResidency,
         ]
@@ -177,9 +169,7 @@ pub fn provider_contract_for(
         lifecycle: MemoryLifecycleCapabilities {
             phases: phases.clone(),
             synchronized_phase_release: true,
-            // The only production candidate is a full-edge decode. It still drives the explicit
-            // bounded hook and phase lifecycle, but makes no false claim of spatial partitioning.
-            decode_tiling: true,
+            decode_tiling: false,
             attention_chunking: true,
             transformer_window_materialization: streamable,
         },
@@ -190,7 +180,6 @@ pub fn provider_contract_for(
                 MemoryFormulaVariable::PixelCount,
                 MemoryFormulaVariable::BatchCount,
                 MemoryFormulaVariable::ConditioningTokenCount,
-                MemoryFormulaVariable::DecodeTileArea,
                 MemoryFormulaVariable::AttentionChunkSize,
                 MemoryFormulaVariable::TransformerWindowSize,
             ],
@@ -205,7 +194,11 @@ pub fn provider_contract_for(
                 .text_encoder
                 .saturating_add(components.dit)
                 .saturating_add(components.vae),
-            conditioning_bytes: components.text_encoder,
+            conditioning_bytes: if is_edit(provider_id) {
+                components.text_encoder.saturating_add(components.vae)
+            } else {
+                components.text_encoder
+            },
             transformer_bytes: components.dit,
             decoder_bytes: components.vae,
             overlay_bytes: 0,
@@ -293,14 +286,6 @@ pub fn validate_context(
         return Err(gen_core::Error::Unsupported(format!(
             "{}: memory calibration is single-image only",
             contract.provider_id
-        )));
-    }
-    if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode)
-        && (context.geometry.width > DECODE_TILE_EDGE || context.geometry.height > DECODE_TILE_EDGE)
-    {
-        return Err(gen_core::Error::Unsupported(format!(
-            "{}: full-edge bounded decode is valid only through {}px per side",
-            contract.provider_id, DECODE_TILE_EDGE
         )));
     }
     Ok(())
@@ -524,8 +509,6 @@ pub struct MageMemoryScope {
     memory: Option<GenerationMemory>,
     use_pid: bool,
     has_phases: bool,
-    decode_tile_edges: Vec<u32>,
-    decode_overlaps: Vec<u32>,
     attention_chunk_sizes: Vec<u32>,
     transformer_window: Option<u32>,
     admission: Option<AdmissionRegistry>,
@@ -539,9 +522,6 @@ impl MageMemoryScope {
         contract: &MemoryProviderContract,
         context: &MemoryRunContext,
     ) -> Self {
-        let decode = contract
-            .capability(MemoryStrategy::BoundedDecode)
-            .expect("Mage contract publishes bounded decode");
         let attention = contract
             .capability(MemoryStrategy::BoundedAttention)
             .expect("Mage contract publishes bounded attention");
@@ -552,8 +532,6 @@ impl MageMemoryScope {
             memory: contract.generation_memory(&context.selection),
             use_pid: context.use_pid,
             has_phases: context.has_phases,
-            decode_tile_edges: decode.parameters.decode_tile_edges.clone(),
-            decode_overlaps: decode.parameters.decode_overlaps.clone(),
             attention_chunk_sizes: attention.parameters.attention_chunk_sizes.clone(),
             transformer_window: contract
                 .engages(
@@ -645,19 +623,11 @@ impl MemoryRequestScope for MageMemoryScope {
         geometry: MemoryGeometry,
     ) -> gen_core::Result<()> {
         self.active()?;
-        if geometry == self.geometry
-            && geometry.width <= tile_edge
-            && geometry.height <= tile_edge
-            && self.decode_tile_edges.contains(&tile_edge)
-            && self.decode_overlaps.contains(&overlap)
-        {
-            Ok(())
-        } else {
-            Err(gen_core::Error::Unsupported(format!(
-                "{}: decode candidate {tile_edge}/{overlap} or geometry is not admitted",
-                self.provider_id
-            )))
-        }
+        let _ = (tile_edge, overlap, geometry);
+        Err(gen_core::Error::Unsupported(format!(
+            "{}: bounded decode is structurally unavailable for the full-frame CoD decoder",
+            self.provider_id
+        )))
     }
 
     fn configure_attention(&mut self, chunk_size: u32) -> gen_core::Result<()> {
@@ -809,10 +779,15 @@ mod tests {
             gen_core_testkit::check_memory_strategy_contract(&contract).unwrap();
             assert!(fingerprints.insert(contract.calibration.as_ref().unwrap().fingerprint.clone()));
             for strategy in MemoryStrategy::ALL {
-                assert_eq!(
-                    contract.capability(strategy).unwrap().support,
-                    MemoryStrategySupport::Implemented
-                );
+                let support = &contract.capability(strategy).unwrap().support;
+                if strategy == MemoryStrategy::BoundedDecode {
+                    assert!(matches!(
+                        support,
+                        MemoryStrategySupport::StructurallyNotApplicable { .. }
+                    ));
+                } else {
+                    assert_eq!(support, &MemoryStrategySupport::Implemented);
+                }
             }
         }
     }
@@ -822,14 +797,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let contract = contract_rl(&spec(&tmp)).unwrap();
         assert_eq!(TRANSFORMER_BLOCKS, 12);
-        assert_eq!(
-            contract
-                .capability(MemoryStrategy::BoundedDecode)
-                .unwrap()
-                .parameters
-                .decode_tile_edges,
-            DECODE_TILE_EDGES
-        );
+        let decode = contract.capability(MemoryStrategy::BoundedDecode).unwrap();
+        assert!(matches!(
+            decode.support,
+            MemoryStrategySupport::StructurallyNotApplicable { .. }
+        ));
+        assert!(decode.parameters.decode_tile_edges.is_empty());
+        assert!(decode.parameters.decode_overlaps.is_empty());
+        assert!(!contract.lifecycle.decode_tiling);
         assert_eq!(
             contract
                 .capability(MemoryStrategy::BoundedAttention)
@@ -917,26 +892,26 @@ mod tests {
     }
 
     #[test]
-    fn full_edge_decode_rejects_geometry_beyond_1024() {
+    fn later_rungs_do_not_engage_structurally_unavailable_decode() {
         let tmp = tempfile::tempdir().unwrap();
         let contract = contract_rl(&spec(&tmp)).unwrap();
-        let mut context =
-            registered_valid_fixture(&spec(&tmp), &contract, MemoryStrategy::BoundedDecode)
+        assert!(!contract.engages(
+            MemoryStrategy::BoundedAttention,
+            MemoryStrategy::BoundedDecode
+        ));
+        let context =
+            registered_valid_fixture(&spec(&tmp), &contract, MemoryStrategy::BoundedAttention)
                 .unwrap()
                 .remove(0)
                 .context;
-        context.geometry.width = 2048;
-        assert!(validate_context(&contract, &context, Some(Quant::Q4)).is_err());
-
-        context.geometry.width = 1024;
+        assert!(
+            !contract
+                .generation_memory(&context.selection)
+                .unwrap()
+                .tile_vae_decode
+        );
         let mut scope = MageMemoryScope::new(Device::Cpu, &contract, &context);
-        let too_large = MemoryGeometry {
-            width: 2048,
-            ..context.geometry
-        };
-        assert!(scope
-            .configure_decode(DECODE_TILE_EDGE, DECODE_OVERLAP, too_large)
-            .is_err());
+        assert!(scope.configure_decode(1024, 1, context.geometry).is_err());
     }
 
     #[test]
