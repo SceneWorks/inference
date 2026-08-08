@@ -569,11 +569,12 @@ mod tests {
     /// projection for the residual pass, rather than failing the whole file.
     #[test]
     fn packed_projection_defers_low_rank_and_still_folds_dense_targets() {
-        let dp = write_diff_patch("packed.safetensors");
-        let mut w = synthetic_dit();
+        let tmp = tempfile::tempdir().unwrap();
+        let dp = write_diff_patch(&tmp, "packed.safetensors");
+        let mut w = synthetic_dit(&tmp);
         pack_q(&mut w);
         let before = {
-            let mut b = synthetic_dit();
+            let mut b = synthetic_dit(&tmp);
             pack_q(&mut b);
             b
         };
@@ -629,7 +630,8 @@ mod tests {
     /// silently half-applied patch, so it must be a hard error even though other targets applied.
     #[test]
     fn full_rank_diff_on_a_packed_target_is_a_hard_error() {
-        let path = tmp("packed_diff.safetensors");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = scratch_file(&tmp, "packed_diff.safetensors");
         // A `.diff` shaped like the DENSE q weight — on a packed base it cannot be folded.
         let q_diff = f32((0..16 * 8).map(|i| i as f32 * 0.001).collect(), &[16, 8]);
         let norm_diff = f32((0..8).map(|i| i as f32 * 0.01).collect(), &[8]);
@@ -643,7 +645,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut w = synthetic_dit();
+        let mut w = synthetic_dit(&tmp);
         pack_q(&mut w);
         let report = merge_diff_patch_adapters(&mut w, &[&spec(path, 1.0)]).unwrap();
         assert_eq!(
@@ -665,13 +667,14 @@ mod tests {
     /// `supports_lokr` — from the residual pass entirely, with no error. This pins all four shapes.
     #[test]
     fn residual_pass_membership_is_by_exclusion_not_an_allow_list() {
-        let hybrid = write_diff_patch("lowrank_hybrid.safetensors");
+        let tmp = tempfile::tempdir().unwrap();
+        let hybrid = write_diff_patch(&tmp, "lowrank_hybrid.safetensors");
         assert!(has_residual_installable_keys(&hybrid).unwrap());
         assert!(has_diff_patch_keys(&hybrid).unwrap());
 
         // Pure `.diff` (+ a bare `.alpha`, a scalar modifier and never a target on its own): nothing
         // for the strict installer to resolve, so it must stay OUT or it reads as "matched nothing".
-        let pure_diff = tmp("lowrank_pure_diff.safetensors");
+        let pure_diff = scratch_file(&tmp, "lowrank_pure_diff.safetensors");
         let d = f32((0..8).map(|i| i as f32 * 0.01).collect(), &[8]);
         let a = f32(vec![4.0], &[1]);
         Array::save_safetensors(
@@ -690,7 +693,7 @@ mod tests {
         );
 
         // PEFT spelling, not just the diffusers/ComfyUI one.
-        let peft = tmp("lowrank_peft.safetensors");
+        let peft = scratch_file(&tmp, "lowrank_peft.safetensors");
         let down = f32(vec![0.1; 4 * 8], &[4, 8]);
         let up = f32(vec![0.1; 16 * 4], &[16, 4]);
         Array::save_safetensors(
@@ -707,7 +710,7 @@ mod tests {
 
         // LoKr — the regression this test exists for. Its factor names share no suffix with the LoRA
         // spellings, so any allow-list of `lora_*` keys drops it silently.
-        let lokr = tmp("lowrank_lokr.safetensors");
+        let lokr = scratch_file(&tmp, "lowrank_lokr.safetensors");
         let w1 = f32(vec![0.1; 4 * 4], &[4, 4]);
         let w2 = f32(vec![0.1; 4 * 2], &[4, 2]);
         Array::save_safetensors(
