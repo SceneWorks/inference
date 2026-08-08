@@ -257,6 +257,18 @@ fn decode_to_image_with_tiling(
 
 /// Measured production DC-AE tile domain. All edges use one fixed 48-pixel overlap; edges below
 /// 192 reached the same 3294-MiB request floor while degrading output and remain a rejection set.
+///
+/// The overlap is quantized by the 32x DC-AE scale — the shared tiling plan computes
+/// `overlap_px / 32` **latent cells**, so 48 px is ONE blended latent cell and anything below
+/// 32 px is no blend at all. Both ends of that lever are measured (sc-17863, `sana_1600m` q4 at
+/// 1024², tiled vs whole-image decode): dropping the blend (24 px = 0 cells) produces visible
+/// blocky patches and meanD 6.31..6.43 — past the declared 6.0 ceiling — while widening it to
+/// 96 px (3 cells) cuts meanD to 3.04..3.28 at a request peak IDENTICAL to four decimals
+/// (3.2172 GiB; overlap adds tiles, not bigger tiles) but costs +1..4 s of decode wall per
+/// render, which Sprint's 2-step schedule cannot absorb. 48 px is the adjudicated shipping
+/// point: no visible artifact at 1:1, the memory floor intact, and the sweep table at
+/// `DECODE_TILING_MEAN_ABS_U8` (tests/memory_ladder_real_weights.rs) records the measured menu
+/// for any future quality-first move.
 pub const DECODE_TILE_EDGE: i32 = 192;
 pub const DECODE_OVERLAP: i32 = 48;
 
