@@ -696,10 +696,10 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
 /// (`transformer/`), and the VAE (`vae/`), summed from the subdirs [`crate::loader`] loads. Shared by
 /// boogu image/turbo/edit.
 ///
-/// The engine now advertises `supports_sequential_offload` (sc-10840) and this split is the staged
-/// peak the shared `Residency` seam bounds (`max(mllm, DiT+VAE)`). Adding boogu to the worker's
-/// `SEQUENTIAL_CAPABLE_ENGINES` allowlist so the fit-gate consumes this split is the downstream
-/// worker-repo step of the fan-out (this crate reports the bytes; the worker decides to use them).
+/// The engine advertises `supports_sequential_offload` (sc-10840) and this split is the staged
+/// peak the shared `Residency` seam bounds (`max(mllm, DiT+VAE)`). The worker's fit-gate keys on
+/// that descriptor capability bit (there is no allowlist) and consumes this split generically through
+/// the registered footprint seam (this crate reports the bytes; the worker decides how to use them).
 pub(crate) fn component_footprint(
     spec: &mlx_gen::LoadSpec,
 ) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {

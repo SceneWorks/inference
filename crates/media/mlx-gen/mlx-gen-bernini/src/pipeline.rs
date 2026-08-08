@@ -149,12 +149,12 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 /// TE/DiT/VAE render split (they are still in the worker's whole-model total). Shared by `bernini` +
 /// `bernini_renderer`.
 ///
-/// Both ids now advertise `supports_sequential_offload` (sc-10840) — each is structurally always-staged
+/// Both ids advertise `supports_sequential_offload` (sc-10840) — each is structurally always-staged
 /// (the encoders are dropped + `clear_cache()`d before the two co-resident experts load), and this split
-/// is the staged peak the fit-gate should bound (`max(encoders, DiT+VAE)`, dominated by the experts).
-/// Adding bernini to the worker's `SEQUENTIAL_CAPABLE_ENGINES` allowlist so the fit-gate consumes this
-/// split is the downstream worker-repo step of the fan-out (this crate reports the bytes; the worker
-/// decides to use them).
+/// is the staged peak the fit-gate bounds (`max(encoders, DiT+VAE)`, dominated by the experts). The
+/// worker's fit-gate keys on that descriptor capability bit (there is no allowlist) and consumes this
+/// split generically through the registered footprint seam (this crate reports the bytes; the worker
+/// decides how to use them).
 pub(crate) fn component_footprint(
     spec: &mlx_gen::LoadSpec,
 ) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
