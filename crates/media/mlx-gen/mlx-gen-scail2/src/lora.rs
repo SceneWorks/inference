@@ -111,8 +111,7 @@ pub struct DiffPatchReport {
     /// Targets that resolved to no weight in the SCAIL-2 checkpoint (orphan factor / unknown module).
     pub skipped_unmatched: Vec<String>,
     /// Modules whose low-rank factors were deliberately left for the post-quantize residual pass
-    /// rather than folded here (sc-18198). This is every low-rank target, on every tier — see
-    /// [`merge_module`]. Counted so the "matched nothing" guard can tell a file that legitimately
+    /// rather than folded here (sc-18198). This is every low-rank target, on every tier. Counted so the "matched nothing" guard can tell a file that legitimately
     /// carried only low-rank factors from one whose prefixes are misconfigured.
     pub deferred_low_rank: usize,
     /// Modules carrying a full-rank `.diff` whose base weight is PACKED (pre-quantized on disk), so
@@ -132,22 +131,25 @@ pub fn has_diff_patch_keys(path: &Path) -> Result<bool> {
     Ok(found)
 }
 
-/// `true` if `path` carries any low-rank factor (`lora_down`/`lora_up`, or the PEFT `lora_A`/`lora_B`
-/// spelling) — i.e. whether the post-quantize residual installer has anything to do with this file.
+/// `true` if `path` carries anything the post-quantize residual installer could install — i.e. any
+/// tensor NOT consumed by the diff-patch fold above.
 ///
-/// The caller needs this because the residual installer is *strict*: handing it a file whose every key
-/// is a full-rank `.diff` would resolve zero targets and be reported as "matched nothing", turning a
-/// perfectly good pure-diff-patch adapter into a hard error. The lightx2v lightning file happens to
-/// carry both halves, so this only guards the pure-`.diff` shape — but that shape is legal, and
-/// relying on the mixed one would be relying on luck (sc-18198).
-pub fn has_low_rank_keys(path: &Path) -> Result<bool> {
+/// Defined by EXCLUSION on purpose. The caller needs this because the residual installer is *strict*:
+/// handing it a file whose every key is a full-rank `.diff` resolves zero targets and is reported as
+/// "matched nothing", turning a legal pure-diff-patch adapter into a hard error. But enumerating the
+/// installable spellings instead would silently drop every format not on the list — the installer also
+/// handles **LoKr** (`lokr_w1`/`lokr_w2`, full or `_a`/`_b` low-rank, identified by `networkType`
+/// metadata) and **LoHa**, and the SCAIL-2 engine descriptor advertises `supports_lokr`. An
+/// allow-list of LoRA factor suffixes would have quietly excluded those from the residual pass — the
+/// exact silent drop this module refuses to make anywhere else.
+///
+/// `.alpha` is excluded alongside the deltas: it is a scalar scaling modifier, never a target on its
+/// own, so a file of nothing but `.diff` + `.alpha` correctly has nothing left to install.
+pub fn has_residual_installable_keys(path: &Path) -> Result<bool> {
     let w = Weights::from_file(path)?;
-    let found = w.keys().any(|k| {
-        k.ends_with(".lora_down.weight")
-            || k.ends_with(".lora_up.weight")
-            || k.ends_with(".lora_A.weight")
-            || k.ends_with(".lora_B.weight")
-    });
+    let found = w
+        .keys()
+        .any(|k| !k.ends_with(".diff") && !k.ends_with(".diff_b") && !k.ends_with(".alpha"));
     Ok(found)
 }
 
@@ -657,30 +659,37 @@ mod tests {
         );
     }
 
-    /// The residual pass is opt-in per file: a hybrid lightning file joins it (its low-rank half is
-    /// the residual installer's job), a pure-`.diff` file must NOT (the strict installer would resolve
-    /// zero targets and report "matched nothing"), and a plain low-rank file still does.
+    /// The residual pass is opt-in per file, and the predicate is defined by EXCLUSION so it cannot
+    /// silently drop a format it was never told about. A first cut enumerated the LoRA factor
+    /// suffixes and thereby excluded LoKr/LoHa — which the SCAIL-2 descriptor advertises via
+    /// `supports_lokr` — from the residual pass entirely, with no error. This pins all four shapes.
     #[test]
-    fn low_rank_detection_selects_which_files_join_the_residual_pass() {
+    fn residual_pass_membership_is_by_exclusion_not_an_allow_list() {
         let hybrid = write_diff_patch("lowrank_hybrid.safetensors");
-        assert!(has_low_rank_keys(&hybrid).unwrap());
+        assert!(has_residual_installable_keys(&hybrid).unwrap());
         assert!(has_diff_patch_keys(&hybrid).unwrap());
 
+        // Pure `.diff` (+ a bare `.alpha`, a scalar modifier and never a target on its own): nothing
+        // for the strict installer to resolve, so it must stay OUT or it reads as "matched nothing".
         let pure_diff = tmp("lowrank_pure_diff.safetensors");
         let d = f32((0..8).map(|i| i as f32 * 0.01).collect(), &[8]);
+        let a = f32(vec![4.0], &[1]);
         Array::save_safetensors(
-            vec![("diffusion_model.blocks.0.self_attn.norm_q.diff", &d)],
+            vec![
+                ("diffusion_model.blocks.0.self_attn.norm_q.diff", &d),
+                ("diffusion_model.blocks.0.self_attn.norm_q.alpha", &a),
+            ],
             None,
             &pure_diff,
         )
         .unwrap();
         assert!(has_diff_patch_keys(&pure_diff).unwrap());
         assert!(
-            !has_low_rank_keys(&pure_diff).unwrap(),
-            "a pure-.diff file must stay out of the residual pass"
+            !has_residual_installable_keys(&pure_diff).unwrap(),
+            "a pure-.diff file (even with an .alpha) must stay out of the residual pass"
         );
 
-        // PEFT spelling counts too, not just the diffusers/ComfyUI one.
+        // PEFT spelling, not just the diffusers/ComfyUI one.
         let peft = tmp("lowrank_peft.safetensors");
         let down = f32(vec![0.1; 4 * 8], &[4, 8]);
         let up = f32(vec![0.1; 16 * 4], &[16, 4]);
@@ -693,8 +702,28 @@ mod tests {
             &peft,
         )
         .unwrap();
-        assert!(has_low_rank_keys(&peft).unwrap());
+        assert!(has_residual_installable_keys(&peft).unwrap());
         assert!(!has_diff_patch_keys(&peft).unwrap());
+
+        // LoKr — the regression this test exists for. Its factor names share no suffix with the LoRA
+        // spellings, so any allow-list of `lora_*` keys drops it silently.
+        let lokr = tmp("lowrank_lokr.safetensors");
+        let w1 = f32(vec![0.1; 4 * 4], &[4, 4]);
+        let w2 = f32(vec![0.1; 4 * 2], &[4, 2]);
+        Array::save_safetensors(
+            vec![
+                ("diffusion_model.blocks.0.self_attn.q.lokr_w1", &w1),
+                ("diffusion_model.blocks.0.self_attn.q.lokr_w2", &w2),
+            ],
+            None,
+            &lokr,
+        )
+        .unwrap();
+        assert!(
+            has_residual_installable_keys(&lokr).unwrap(),
+            "a LoKr adapter must reach the residual installer (supports_lokr is advertised)"
+        );
+        assert!(!has_diff_patch_keys(&lokr).unwrap());
     }
 
     #[test]
