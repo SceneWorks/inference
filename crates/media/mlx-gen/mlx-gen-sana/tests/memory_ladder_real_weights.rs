@@ -1584,19 +1584,23 @@ fn the_published_decode_tile_domain_is_swept_against_the_whole_image_decode() {
                  {DECODE_TILING_MEAN_ABS_U8} on seed {seed}"
             );
         }
-        // The lever's direction, pinned: a larger tile gives the decoder more context per tile and
-        // must not drift more than the smallest published tile does.
-        let largest = by_edge.first().expect("published domain is non-empty");
-        let smallest = by_edge.last().expect("published domain is non-empty");
-        assert!(
-            largest.1 <= smallest.1,
-            "edge {} (meanD {:.4}) should bound edge {} (meanD {:.4}) from below on seed {seed} — \
-             the drift/peak trade inverted",
-            largest.0,
-            largest.1,
-            smallest.0,
-            smallest.1
-        );
+        // The lever's direction, pinned at every step: `by_edge` descends 512..192, so drift must
+        // be non-decreasing across each adjacent pair — a smaller tile gives the decoder less
+        // context per tile and may not drift LESS than its larger neighbor. The measured gaps
+        // (meanD 2.27 -> 2.85 -> 3.61 -> 4.58 across 512/384/256/192) are an order of magnitude
+        // wider than the observed envelope variance (~1.24%), so this cannot flake on a re-run.
+        for pair in by_edge.windows(2) {
+            let (larger, smaller) = (pair[0], pair[1]);
+            assert!(
+                larger.1 <= smaller.1,
+                "edge {} (meanD {:.4}) should bound edge {} (meanD {:.4}) from below on seed \
+                 {seed} — the drift/peak trade inverted between adjacent published edges",
+                larger.0,
+                larger.1,
+                smaller.0,
+                smaller.1
+            );
+        }
         // Overlap probe at the shipping edge. Published domain is {48}: these rows REFUSE on the
         // production path, and that refusal is the record. Widening the domain for a measurement
         // probe admits them, which is how sc-17863's overlap-vs-edge answer was measured.
@@ -1643,9 +1647,26 @@ fn the_published_decode_tile_domain_is_swept_against_the_whole_image_decode() {
                     );
                 }
                 Ok(other) => panic!("expected images, got {other:?}"),
-                Err(error) => println!(
-                    "[sc-17863 overlap probe seed {seed}] overlap {overlap}: REFUSED ({error})"
-                ),
+                Err(error) => {
+                    // Only the published-domain refusal counts as REFUSED. Any other error (an
+                    // OOM, a snapshot failure) must fail the probe rather than masquerade as the
+                    // domain rejection this row exists to record.
+                    let message = error.to_string();
+                    let refusal = format!(
+                        "decode overlap is {}, got {overlap}",
+                        mlx_gen_sana::pipeline::DECODE_OVERLAP
+                    );
+                    assert!(
+                        message.contains(&refusal),
+                        "overlap probe {overlap} on seed {seed} failed with something other than \
+                         the published-domain refusal (expected \"{refusal}\" in the message): \
+                         {message}"
+                    );
+                    println!(
+                        "[sc-17863 overlap probe seed {seed}] overlap {overlap}: REFUSED \
+                         ({message})"
+                    );
+                }
             }
             drop(model);
             clear_cache();
