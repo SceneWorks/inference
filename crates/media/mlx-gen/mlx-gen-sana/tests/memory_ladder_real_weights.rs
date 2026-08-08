@@ -1293,8 +1293,8 @@ fn evidence(
         // row, and `output_preservation_is_resampled_across_production_latents` re-establishes it
         // across five production latents. `NotRun` is honest only for a harness that captures an
         // output and leaves comparison to a later verifier; here it would understate evidence this
-        // run actually produced. (`mlx-gen-z-image` still hardcodes `NotRun` in the same position —
-        // tracked epic-wide as sc-17861 rather than swept in here.)
+        // run actually produced. (`mlx-gen-z-image` earns its `Passed` the same way since the
+        // sc-17861 sweep: its A/B upgrades `NotRun` records only after asserting byte-identity.)
         parity_result: MemoryParityResult::Passed,
     }
 }

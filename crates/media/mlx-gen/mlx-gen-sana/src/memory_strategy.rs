@@ -1015,6 +1015,10 @@ mod tests {
                 harness_version: "inference-sana-memory-ladder-v1".to_owned(),
                 output_sha256: "e".repeat(64),
                 parity: MemoryParityContract::Exact,
+                // `NotRun` is honest here: this weights-free smoke only proves the record
+                // serializes — it renders nothing, compares nothing, and its line is never emitted
+                // as evidence. The real-weight ladder harness earns `Passed` per row by asserting
+                // each optimized row's sha against its rung-0 row (sc-17861).
                 parity_result: MemoryParityResult::NotRun,
             };
             record.to_json_line().unwrap_or_else(|error| {

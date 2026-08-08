@@ -177,9 +177,63 @@ fn render_measured_id(
         harness_version: "inference-z-image-sequential-v1".to_owned(),
         output_sha256: format!("{:x}", Sha256::digest(&pixels)),
         parity: MemoryParityContract::Exact,
+        // `NotRun` is honest HERE and only here: this single leg renders one output, and by itself
+        // proves nothing about output preservation. The A/B tests upgrade both legs to `Passed`
+        // through [`assert_exact_parity_and_mark_passed`], which establishes byte-identity first so
+        // the verdict is earned by this run (sc-17861). The repeat-job test never emits its records,
+        // so its legs stay `NotRun` — nobody compared them.
         parity_result: MemoryParityResult::NotRun,
     };
     (pixels, peak, record)
+}
+
+/// Establish the `Exact` parity contract both records declare, then — and only then — record the
+/// verdict (sc-17861, following the per-row pattern from `mlx-gen-sana`, sc-15523).
+///
+/// Three checks, each load-bearing:
+/// 1. equal length — the positional byte diff below zips, and `zip` silently truncates to the
+///    shorter side, so a truncated output would otherwise sail through with `diff == 0`;
+/// 2. zero positional byte diff — the headline byte-identity claim, with a readable count;
+/// 3. the two records' own `output_sha256` fields agree — binds the verdict to the exact bytes each
+///    record was built over, so a record constructed from other bytes than the ones compared here
+///    cannot be stamped `Passed`.
+///
+/// Only after all three does either record's `parity_result` become `Passed`; on any failure both
+/// stay `NotRun` and the test dies before printing them.
+fn assert_exact_parity_and_mark_passed(
+    model_id: &str,
+    pixels_resident: &[u8],
+    pixels_sequential: &[u8],
+    resident_record: &mut MemoryEvidenceLogRecord,
+    sequential_record: &mut MemoryEvidenceLogRecord,
+) {
+    assert_eq!(
+        pixels_resident.len(),
+        pixels_sequential.len(),
+        "{model_id}: Sequential residency changed the output LENGTH ({} vs {} bytes) — the byte \
+         diff below would silently truncate to the shorter side",
+        pixels_resident.len(),
+        pixels_sequential.len(),
+    );
+    let diff = pixels_resident
+        .iter()
+        .zip(pixels_sequential)
+        .filter(|(a, b)| a != b)
+        .count();
+    assert_eq!(
+        diff,
+        0,
+        "{model_id}: Sequential residency changed the output: {diff}/{} bytes differ (must be \
+         byte-identical)",
+        pixels_resident.len()
+    );
+    assert_eq!(
+        resident_record.output_sha256, sequential_record.output_sha256,
+        "{model_id}: the records' output_sha256 fields disagree even though the compared buffers \
+         are byte-identical — a record was built over different bytes than the ones compared here",
+    );
+    resident_record.parity_result = MemoryParityResult::Passed;
+    sequential_record.parity_result = MemoryParityResult::Passed;
 }
 
 fn required_revision(name: &str) -> String {
@@ -240,19 +294,17 @@ fn sequential_bounds_peak_and_is_byte_identical() {
         100.0 * (peak_resident.saturating_sub(peak_sequential)) as f64 / peak_resident as f64,
     );
 
-    let diff = pixels_resident
-        .iter()
-        .zip(&pixels_sequential)
-        .filter(|(a, b)| a != b)
-        .count();
-    assert_eq!(
-        diff,
-        0,
-        "Sequential residency changed the output: {diff}/{} bytes differ (must be byte-identical)",
-        pixels_resident.len()
-    );
+    // Persist BEFORE the parity assertion so a failing run leaves both outputs on disk for
+    // diagnosis — a byte-identity failure with no bytes to diff is undebuggable.
     let (resident_path, staged_path) =
         persist_evidence_outputs("z_image_turbo", &pixels_resident, &pixels_sequential);
+    assert_exact_parity_and_mark_passed(
+        "z_image_turbo",
+        &pixels_resident,
+        &pixels_sequential,
+        &mut resident_record,
+        &mut sequential_record,
+    );
     assert!(
         peak_sequential < peak_resident,
         "Sequential peak {:.3} GiB was not below Resident {:.3} GiB — the text-encoder drop did not \
@@ -260,8 +312,6 @@ fn sequential_bounds_peak_and_is_byte_identical() {
         peak_sequential as f64 / GIB,
         peak_resident as f64 / GIB,
     );
-    resident_record.parity_result = MemoryParityResult::Passed;
-    sequential_record.parity_result = MemoryParityResult::Passed;
     println!("{}", resident_record.to_json_line().unwrap());
     println!("{}", sequential_record.to_json_line().unwrap());
     println!(
@@ -269,6 +319,113 @@ fn sequential_bounds_peak_and_is_byte_identical() {
         resident_path.display(),
         staged_path.display()
     );
+}
+
+/// A weights-free record over `pixels` for the parity-helper mutation checks below. Everything the
+/// helper does not read is a placeholder; `output_sha256` is computed from `pixels` exactly the way
+/// [`render_measured_id`] computes it, so the sha-binding check is exercised for real.
+fn placeholder_record(pixels: &[u8]) -> MemoryEvidenceLogRecord {
+    let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from("/nonexistent/z-image")));
+    let calibration = MemoryCalibrationIdentity::new(
+        mlx_gen_z_image::memory_strategy::MEMORY_CALIBRATION_FINGERPRINT,
+        spec.load_shape,
+    );
+    MemoryEvidenceLogRecord {
+        key: MemoryEvidenceKey {
+            resolved_route: "z_image_turbo".to_owned(),
+            backend: MemoryBackend::Mlx,
+            tier: MemoryNumericTier {
+                precision: spec.precision,
+                quant: spec.quantize,
+                component_precision_floors: &[],
+            },
+            load_shape: spec.load_shape,
+            mode: MemoryMode::TextToImage,
+            overlay: None,
+            geometry: MemoryGeometry {
+                width: 2,
+                height: 1,
+                batch: 1,
+                frames: 1,
+                reference_count: 0,
+            },
+            strategy: MemoryStrategy::Resident,
+            engaged_composition: vec![MemoryStrategy::Resident],
+            parameters: MemoryStrategyParameters::default(),
+        },
+        declared_calibration: calibration.clone(),
+        observed_calibration: calibration,
+        predicted_peak_bytes: 1,
+        observed_peak_bytes: 1,
+        inference_revision: "a".repeat(40),
+        sceneworks_revision: "b".repeat(40),
+        model_revision: "c".repeat(40),
+        model_inventory_sha256: "d".repeat(64),
+        harness_version: "inference-z-image-sequential-v1".to_owned(),
+        output_sha256: format!("{:x}", Sha256::digest(pixels)),
+        parity: MemoryParityContract::Exact,
+        parity_result: MemoryParityResult::NotRun,
+    }
+}
+
+/// sc-17861 acceptance: every `Passed` these harnesses print is earned by
+/// [`assert_exact_parity_and_mark_passed`], and the four tests below pin each escape direction —
+/// weights-free, so the seam reddens on every `cargo test`, not only on the ignored real-weight A/B.
+#[test]
+fn parity_helper_marks_passed_only_after_byte_identity() {
+    let pixels = [7u8, 11, 13];
+    let mut resident = placeholder_record(&pixels);
+    let mut sequential = placeholder_record(&pixels);
+    assert_eq!(resident.parity_result, MemoryParityResult::NotRun);
+    assert_exact_parity_and_mark_passed("unit", &pixels, &pixels, &mut resident, &mut sequential);
+    assert_eq!(resident.parity_result, MemoryParityResult::Passed);
+    assert_eq!(sequential.parity_result, MemoryParityResult::Passed);
+}
+
+#[test]
+#[should_panic(expected = "bytes differ")]
+fn parity_helper_reddens_when_an_optimized_byte_changes() {
+    let resident_pixels = [7u8, 11, 13];
+    let mut sequential_pixels = resident_pixels;
+    sequential_pixels[1] ^= 1;
+    let mut resident = placeholder_record(&resident_pixels);
+    let mut sequential = placeholder_record(&sequential_pixels);
+    assert_exact_parity_and_mark_passed(
+        "unit",
+        &resident_pixels,
+        &sequential_pixels,
+        &mut resident,
+        &mut sequential,
+    );
+}
+
+#[test]
+#[should_panic(expected = "changed the output LENGTH")]
+fn parity_helper_reddens_when_the_optimized_output_is_truncated() {
+    // `zip` truncates to the shorter side, so without the explicit length check a truncated output
+    // would pass the positional byte diff with `diff == 0`.
+    let resident_pixels = [7u8, 11, 13];
+    let sequential_pixels = [7u8, 11];
+    let mut resident = placeholder_record(&resident_pixels);
+    let mut sequential = placeholder_record(&sequential_pixels);
+    assert_exact_parity_and_mark_passed(
+        "unit",
+        &resident_pixels,
+        &sequential_pixels,
+        &mut resident,
+        &mut sequential,
+    );
+}
+
+#[test]
+#[should_panic(expected = "output_sha256")]
+fn parity_helper_reddens_when_a_record_was_built_over_other_bytes() {
+    // The compared buffers are identical, but one record's `output_sha256` was computed over
+    // different bytes — `Passed` must not be stampable onto a record the comparison never covered.
+    let pixels = [7u8, 11, 13];
+    let mut resident = placeholder_record(&pixels);
+    let mut sequential = placeholder_record(&[13u8, 11, 7]);
+    assert_exact_parity_and_mark_passed("unit", &pixels, &pixels, &mut resident, &mut sequential);
 }
 
 #[test]
@@ -324,20 +481,17 @@ fn base_z_image_sequential_bounds_peak_and_is_byte_identical() {
         peak_sequential as f64 / GIB,
     );
 
-    let diff = pixels_resident
-        .iter()
-        .zip(&pixels_sequential)
-        .filter(|(a, b)| a != b)
-        .count();
-    assert_eq!(
-        diff,
-        0,
-        "base z_image Sequential residency changed the output: {diff}/{} bytes differ (must be \
-         byte-identical)",
-        pixels_resident.len()
-    );
+    // Persist BEFORE the parity assertion so a failing run leaves both outputs on disk for
+    // diagnosis — a byte-identity failure with no bytes to diff is undebuggable.
     let (resident_path, staged_path) =
         persist_evidence_outputs("z_image", &pixels_resident, &pixels_sequential);
+    assert_exact_parity_and_mark_passed(
+        "z_image",
+        &pixels_resident,
+        &pixels_sequential,
+        &mut resident_record,
+        &mut sequential_record,
+    );
     assert!(
         peak_sequential < peak_resident,
         "base z_image Sequential peak {:.3} GiB was not below Resident {:.3} GiB — the text-encoder \
@@ -345,8 +499,6 @@ fn base_z_image_sequential_bounds_peak_and_is_byte_identical() {
         peak_sequential as f64 / GIB,
         peak_resident as f64 / GIB,
     );
-    resident_record.parity_result = MemoryParityResult::Passed;
-    sequential_record.parity_result = MemoryParityResult::Passed;
     println!("{}", resident_record.to_json_line().unwrap());
     println!("{}", sequential_record.to_json_line().unwrap());
     println!(
