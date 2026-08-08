@@ -10,8 +10,8 @@
 
 use candle_gen::gen_core::{
     GenerationOutput, GenerationRequest, LoadShape, LoadSpec, MemoryBehaviorRoute, MemoryMode,
-    MemoryParityContract, MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy, Quant,
-    WeightsSource,
+    MemoryParityContract, MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy,
+    MemoryStrategySupport, Quant, WeightsSource,
 };
 use candle_gen::testkit::VramProbe;
 use candle_gen_mage::{memory_strategy, REGISTRATION};
@@ -150,6 +150,29 @@ fn representative_route_exercises_advertised_rung() {
         .memory_strategy_contract()
         .expect("Mage CUDA memory contract");
     let tier = memory_strategy::resolved_numeric_tier(&spec).expect("numeric q4 tier");
+    let capability = contract
+        .capability(strategy)
+        .expect("selected Mage memory capability");
+    if matches!(capability.support, MemoryStrategySupport::Missing) {
+        assert_eq!(
+            strategy,
+            MemoryStrategy::BoundedTransformerResidency,
+            "only device-format block streaming may be unavailable for the real snapshot",
+        );
+        assert!(
+            capability.parameters.transformer_window_sizes.is_empty(),
+            "an unavailable block-streaming rung must publish no selectable window",
+        );
+        eprintln!(
+            "MAGE_MEMORY_UNAVAILABLE strategy={strategy:?} support=Missing reason=dense_runtime_quantized_snapshot_has_no_device_format_block_sidecars"
+        );
+        return;
+    }
+    assert_eq!(
+        capability.support,
+        MemoryStrategySupport::Implemented,
+        "the real-weight harness only executes implemented rungs",
+    );
     let context = candle_gen::gen_core::standard_memory_behavior_context(
         contract,
         strategy,
