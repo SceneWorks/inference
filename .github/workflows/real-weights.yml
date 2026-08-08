@@ -1080,8 +1080,10 @@ jobs:
           fi
           # sc-18149: the Sequential route's forced tiled decode (sc-13571) makes Exact parity
           # structurally unsatisfiable for this A/B; the adjudicated contract is the measured
-          # mean-abs drift ceiling the records declare, re-derived by the verifier from the two
-          # bound artifacts rather than trusted from the harness.
+          # mean-abs drift ceiling (+ p99 tail pin) the lane declares here, re-derived by the
+          # verifier from the bound artifacts rather than trusted from the harness. The isolator
+          # artifact (Resident + forced tiled decode) must be byte-identical to the staged output,
+          # which pins residency staging itself to exactness independently of the harness.
           python3.12 scripts/release/verify_residency_ab.py \
             --model z_image_turbo \
             --resident "$MEMORY_EVIDENCE_LOG" \
@@ -1092,8 +1094,10 @@ jobs:
             --expected-model-revision "$MEMORY_MODEL_REVISION" \
             --expected-model-inventory-sha256 "$MEMORY_MODEL_INVENTORY_SHA256" \
             --expected-parity tolerance:mean_abs_u8_subpixel:4.0 \
+            --max-p99-abs-u8 13 \
             --resident-output "$MEMORY_EVIDENCE_OUTPUT_DIR/z_image_turbo-resident.rgb" \
             --sequential-output "$MEMORY_EVIDENCE_OUTPUT_DIR/z_image_turbo-staged.rgb" \
+            --isolator-output "$MEMORY_EVIDENCE_OUTPUT_DIR/z_image_turbo-resident-tiled.rgb" \
             | tee "$MEMORY_EVIDENCE_OUTPUT_DIR/verifier-result.txt"
       - name: Upload evidence log and bound output artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -1106,6 +1110,7 @@ jobs:
             ${{ runner.temp }}/memory-evidence-v1/z-image-turbo-model-inventory.json
             ${{ runner.temp }}/memory-evidence-v1/z_image_turbo-resident.rgb
             ${{ runner.temp }}/memory-evidence-v1/z_image_turbo-staged.rgb
+            ${{ runner.temp }}/memory-evidence-v1/z_image_turbo-resident-tiled.rgb
             ${{ runner.temp }}/memory-evidence-v1/verifier-result.txt
 
   mlx-llm:

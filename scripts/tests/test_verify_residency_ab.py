@@ -117,7 +117,7 @@ class VerifyResidencyAbTests(unittest.TestCase):
                     staged_output,
                     EXACT,
                 ),
-                (24_000 << 20, 15_000 << 20, None),
+                (24_000 << 20, 15_000 << 20, None, None),
             )
 
     def test_rejects_legacy_missing_duplicate_and_malformed_records(self) -> None:
@@ -424,7 +424,7 @@ class VerifyResidencyAbTests(unittest.TestCase):
                     staged_output,
                     TOLERANCE,
                 ),
-                (24_000 << 20, 15_000 << 20, 2.0),
+                (24_000 << 20, 15_000 << 20, 2.0, None),
             )
 
     def test_rejects_tolerance_drift_above_the_declared_ceiling(self) -> None:
@@ -545,6 +545,136 @@ class VerifyResidencyAbTests(unittest.TestCase):
                     resident_output,
                     staged_output,
                     EXACT,
+                )
+
+    def test_accepts_and_binds_the_isolator_artifact(self) -> None:
+        # The isolator leg (Resident + forced tiled decode) must be byte-identical to the staged
+        # output — recomputed HERE from the persisted artifact (sc-18149 review), so residency
+        # exactness is verifier-enforced rather than harness-trusted.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            staged_bytes = bytes([2] * 16)
+            resident, staged, resident_output, staged_output = self.tolerance_pair(
+                root, bytes([0] * 16), staged_bytes
+            )
+            isolator_output = root / "resident-tiled.rgb"
+            isolator_output.write_bytes(staged_bytes)
+            self.assertEqual(
+                verify(
+                    resident,
+                    staged,
+                    512,
+                    "flux1_dev",
+                    FINGERPRINT,
+                    3,
+                    MODEL_REVISION,
+                    MODEL_INVENTORY_SHA256,
+                    resident_output,
+                    staged_output,
+                    TOLERANCE,
+                    isolator_output=isolator_output,
+                ),
+                (24_000 << 20, 15_000 << 20, 2.0, None),
+            )
+
+    def test_rejects_an_isolator_that_differs_from_the_staged_output(self) -> None:
+        # A staged/isolator byte difference means residency staging itself drifted — the decode
+        # tolerance must not absorb it, and the verifier must catch it independently.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            resident, staged, resident_output, staged_output = self.tolerance_pair(
+                root, bytes([0] * 16), bytes([2] * 16)
+            )
+            isolator_output = root / "resident-tiled.rgb"
+            isolator_output.write_bytes(bytes([3] * 16))
+            with self.assertRaisesRegex(
+                RuntimeError, "not byte-identical to the resident\\+tiled isolator"
+            ):
+                verify(
+                    resident,
+                    staged,
+                    512,
+                    "flux1_dev",
+                    FINGERPRINT,
+                    3,
+                    MODEL_REVISION,
+                    MODEL_INVENTORY_SHA256,
+                    resident_output,
+                    staged_output,
+                    TOLERANCE,
+                    isolator_output=isolator_output,
+                )
+
+    def test_rejects_a_missing_isolator_artifact(self) -> None:
+        # A harness that stops persisting the isolator leg must fail the lane, not silently drop
+        # the exactness check.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            resident, staged, resident_output, staged_output = self.tolerance_pair(
+                root, bytes([0] * 16), bytes([2] * 16)
+            )
+            with self.assertRaisesRegex(RuntimeError, "isolator output artifact is missing"):
+                verify(
+                    resident,
+                    staged,
+                    512,
+                    "flux1_dev",
+                    FINGERPRINT,
+                    3,
+                    MODEL_REVISION,
+                    MODEL_INVENTORY_SHA256,
+                    resident_output,
+                    staged_output,
+                    TOLERANCE,
+                    isolator_output=root / "never-written.rgb",
+                )
+
+    def test_accepts_a_p99_within_the_declared_tail_pin(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            resident, staged, resident_output, staged_output = self.tolerance_pair(
+                Path(temporary), bytes([0] * 16), bytes([2] * 16)
+            )
+            self.assertEqual(
+                verify(
+                    resident,
+                    staged,
+                    512,
+                    "flux1_dev",
+                    FINGERPRINT,
+                    3,
+                    MODEL_REVISION,
+                    MODEL_INVENTORY_SHA256,
+                    resident_output,
+                    staged_output,
+                    TOLERANCE,
+                    max_p99_abs_u8=13,
+                ),
+                (24_000 << 20, 15_000 << 20, 2.0, 2),
+            )
+
+    def test_rejects_a_p99_breach_even_when_the_mean_is_within_ceiling(self) -> None:
+        # 11 of 1000 subpixels at 255, the rest identical: mean 2.805 passes the 4.0 ceiling but
+        # more than 1% of subpixels sit at 255, so p99 = 255 — the tail redistribution the pin
+        # exists to catch, recomputed by the verifier from the artifacts.
+        with tempfile.TemporaryDirectory() as temporary:
+            staged_bytes = bytes([255] * 11 + [0] * 989)
+            resident, staged, resident_output, staged_output = self.tolerance_pair(
+                Path(temporary), bytes([0] * 1000), staged_bytes
+            )
+            with self.assertRaisesRegex(RuntimeError, "above the declared tail pin"):
+                verify(
+                    resident,
+                    staged,
+                    512,
+                    "flux1_dev",
+                    FINGERPRINT,
+                    3,
+                    MODEL_REVISION,
+                    MODEL_INVENTORY_SHA256,
+                    resident_output,
+                    staged_output,
+                    TOLERANCE,
+                    max_p99_abs_u8=13,
                 )
 
     def test_rejects_malformed_expected_parity(self) -> None:

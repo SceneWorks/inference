@@ -424,6 +424,31 @@ def _mean_abs_u8_subpixel(resident_bytes: bytes, sequential_bytes: bytes) -> flo
     return total / len(resident_bytes)
 
 
+def _p99_abs_u8_subpixel(resident_bytes: bytes, sequential_bytes: bytes) -> int:
+    """The exact 99th-percentile absolute u8 subpixel delta, from a 256-bin histogram.
+
+    The tail companion to the mean ceiling (sc-18149): a pathological redistribution of the same
+    mean — a few huge deltas hiding under many zeros — moves this quantile while leaving the mean
+    within its ceiling, so the lane pins both from outside the harness.
+    """
+    if len(resident_bytes) != len(sequential_bytes):
+        raise RuntimeError(
+            "resident and staged outputs differ in length; the drift metric is undefined"
+        )
+    if not resident_bytes:
+        raise RuntimeError("outputs are empty; the drift metric is undefined")
+    histogram = [0] * 256
+    for a, b in zip(resident_bytes, sequential_bytes):
+        histogram[abs(a - b)] += 1
+    need = math.ceil(0.99 * len(resident_bytes))
+    seen = 0
+    for delta, count in enumerate(histogram):
+        seen += count
+        if seen >= need:
+            return delta
+    return 255
+
+
 def verify(
     resident_log: Path,
     sequential_log: Path,
@@ -436,7 +461,9 @@ def verify(
     resident_output: Path,
     sequential_output: Path,
     expected_parity: dict[str, Any],
-) -> tuple[int, int, float | None]:
+    isolator_output: Path | None = None,
+    max_p99_abs_u8: int | None = None,
+) -> tuple[int, int, float | None, int | None]:
     if min_reduction_mib < 0:
         raise RuntimeError("minimum reduction MiB must be non-negative")
     if GIT_REVISION.fullmatch(expected_model_revision) is None:
@@ -460,6 +487,23 @@ def verify(
             "record parity contract does not match the parity contract this lane declares: "
             f"expected {expected_parity!r}, found {resident.payload['parity']!r}"
         )
+    if isolator_output is not None:
+        # The isolator leg (sc-18149): a Resident render forced onto the Sequential route's tiled
+        # decode. Byte-identity with the staged output attributes the whole declared drift to the
+        # tiled decode and proves residency staging itself is still numerically exact — checked
+        # HERE, from the persisted artifact, so the exactness claim is enforced by this verifier
+        # rather than trusted from the harness.
+        if not isolator_output.is_file():
+            raise RuntimeError(
+                "isolator output artifact is missing — the harness did not persist the "
+                "resident+tiled isolator leg"
+            )
+        isolator_hash = hashlib.sha256(isolator_output.read_bytes()).hexdigest()
+        if isolator_hash != sequential_hash:
+            raise RuntimeError(
+                "staged output is not byte-identical to the resident+tiled isolator — residency "
+                "staging itself drifted, which the decode-drift tolerance must not absorb"
+            )
     drift: float | None = None
     if expected_parity["kind"] == "exact":
         if resident_hash != sequential_hash:
@@ -472,6 +516,16 @@ def verify(
             raise RuntimeError(
                 f"resident and staged outputs drift {drift:.4f} mean_abs_u8_subpixel, above the "
                 f"declared tolerance {expected_parity['maximum_error']}"
+            )
+    p99: int | None = None
+    if max_p99_abs_u8 is not None:
+        if max_p99_abs_u8 < 0:
+            raise RuntimeError("maximum p99 absolute u8 delta must be non-negative")
+        p99 = _p99_abs_u8_subpixel(resident_bytes, sequential_bytes)
+        if p99 > max_p99_abs_u8:
+            raise RuntimeError(
+                f"resident and staged outputs drift p99 {p99} abs u8, above the declared "
+                f"tail pin {max_p99_abs_u8}"
             )
     if resident.key["resolved_route"] != expected_route:
         raise RuntimeError(
@@ -508,7 +562,7 @@ def verify(
             f"staged residency reduced peak by {reduction} bytes; required at least {minimum_bytes} "
             f"bytes (resident={resident_peak}, staged={sequential_peak})"
         )
-    return resident_peak, sequential_peak, drift
+    return resident_peak, sequential_peak, drift, p99
 
 
 def main() -> int:
@@ -524,8 +578,10 @@ def main() -> int:
     parser.add_argument("--resident-output", required=True, type=Path)
     parser.add_argument("--sequential-output", required=True, type=Path)
     parser.add_argument("--expected-parity", default="exact")
+    parser.add_argument("--isolator-output", type=Path, default=None)
+    parser.add_argument("--max-p99-abs-u8", type=int, default=None)
     args = parser.parse_args()
-    resident, sequential, drift = verify(
+    resident, sequential, drift, p99 = verify(
         args.resident,
         args.sequential,
         args.min_reduction_mib,
@@ -537,12 +593,15 @@ def main() -> int:
         args.resident_output,
         args.sequential_output,
         parse_expected_parity(args.expected_parity),
+        isolator_output=args.isolator_output,
+        max_p99_abs_u8=args.max_p99_abs_u8,
     )
     drift_suffix = "" if drift is None else f" drift_mean_abs_u8={drift:.4f}"
+    p99_suffix = "" if p99 is None else f" p99_abs_u8={p99}"
     print(
         f"MEMORY_EVIDENCE_V1_RESULT model={args.model} verdict=pass "
         f"resident_peak_bytes={resident} staged_peak_bytes={sequential} "
-        f"reduction_bytes={resident - sequential}{drift_suffix}"
+        f"reduction_bytes={resident - sequential}{drift_suffix}{p99_suffix}"
     )
     return 0
 

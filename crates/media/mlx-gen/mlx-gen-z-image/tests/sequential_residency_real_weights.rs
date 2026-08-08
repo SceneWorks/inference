@@ -98,9 +98,12 @@ const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 const DECODE_TILING_MEAN_ABS_U8: f64 = 4.0;
 
 /// The p99 companion to [`DECODE_TILING_MEAN_ABS_U8`]: 99% of subpixel deltas must sit at or below
-/// this value. Measured 7..9 across the three seeds above; declared at 16 (~1.8x headroom over the
-/// worst seed).
-const DECODE_TILING_P99_ABS_U8: u32 = 16;
+/// this value. Derived exactly the way the mean's ceiling is: worst measured seed (9, from the
+/// table above; seed spread 7..9, 1.29x) times the same ~1.43x headroom factor the mean carries
+/// (9 x 1.43 = 12.9, rounded up to the next integer quantile step). The verifier recomputes this
+/// quantile from the two bound artifacts and the lane pins it via `--max-p99-abs-u8`, so the pin
+/// is enforced independently of this harness (sc-18149 review).
+const DECODE_TILING_P99_ABS_U8: u32 = 13;
 
 /// The declared parity contract both A/B evidence records carry (sc-18149): the drift the
 /// Sequential route's forced tiled decode (sc-13571) introduces, bounded on the non-saturating
@@ -492,16 +495,28 @@ fn required_sha256(name: &str) -> String {
     value
 }
 
-fn persist_evidence_outputs(model_id: &str, resident: &[u8], staged: &[u8]) -> (PathBuf, PathBuf) {
+/// Persist the three rendered legs for the strict verifier. The isolator artifact is deliberately
+/// part of the signature: the verifier independently re-checks `sha(staged) == sha(isolator)`
+/// (lane-wired via `--isolator-output`), so the residency-exactness claim is enforced outside this
+/// harness — a harness that stops rendering the isolator leg cannot compile past this call, and a
+/// lane run without the artifact fails the verifier (sc-18149 review).
+fn persist_evidence_outputs(
+    model_id: &str,
+    resident: &[u8],
+    staged: &[u8],
+    resident_tiled: &[u8],
+) -> (PathBuf, PathBuf, PathBuf) {
     let root = std::env::var_os("MEMORY_EVIDENCE_OUTPUT_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join("inference-memory-evidence-v1"));
     std::fs::create_dir_all(&root).expect("create memory evidence output directory");
     let resident_path = root.join(format!("{model_id}-resident.rgb"));
     let staged_path = root.join(format!("{model_id}-staged.rgb"));
+    let isolator_path = root.join(format!("{model_id}-resident-tiled.rgb"));
     std::fs::write(&resident_path, resident).expect("write resident evidence artifact");
     std::fs::write(&staged_path, staged).expect("write staged evidence artifact");
-    (resident_path, staged_path)
+    std::fs::write(&isolator_path, resident_tiled).expect("write isolator evidence artifact");
+    (resident_path, staged_path, isolator_path)
 }
 
 #[test]
@@ -533,8 +548,12 @@ fn sequential_bounds_peak_within_declared_decode_drift() {
 
     // Persist BEFORE the parity assertions so a failing run leaves all outputs on disk for
     // diagnosis — a parity failure with no bytes to diff is undebuggable.
-    let (resident_path, staged_path) =
-        persist_evidence_outputs("z_image_turbo", &pixels_resident, &pixels_sequential);
+    let (resident_path, staged_path, isolator_path) = persist_evidence_outputs(
+        "z_image_turbo",
+        &pixels_resident,
+        &pixels_sequential,
+        &pixels_resident_tiled,
+    );
     dump_ppm(
         "z_image_turbo_resident",
         req.width,
@@ -577,9 +596,10 @@ fn sequential_bounds_peak_within_declared_decode_drift() {
     println!("{}", resident_record.to_json_line().unwrap());
     println!("{}", sequential_record.to_json_line().unwrap());
     println!(
-        "MEMORY_EVIDENCE_ARTIFACTS resident={} staged={}",
+        "MEMORY_EVIDENCE_ARTIFACTS resident={} staged={} isolator={}",
         resident_path.display(),
-        staged_path.display()
+        staged_path.display(),
+        isolator_path.display()
     );
 }
 
@@ -935,8 +955,12 @@ fn base_z_image_sequential_bounds_peak_within_declared_decode_drift() {
 
     // Persist BEFORE the parity assertions so a failing run leaves all outputs on disk for
     // diagnosis — a parity failure with no bytes to diff is undebuggable.
-    let (resident_path, staged_path) =
-        persist_evidence_outputs("z_image", &pixels_resident, &pixels_sequential);
+    let (resident_path, staged_path, isolator_path) = persist_evidence_outputs(
+        "z_image",
+        &pixels_resident,
+        &pixels_sequential,
+        &pixels_resident_tiled,
+    );
     assert_staging_is_exact("z_image", &pixels_sequential, &pixels_resident_tiled);
     assert_decode_drift_within_ceiling_and_mark_passed(
         "z_image",
@@ -955,8 +979,9 @@ fn base_z_image_sequential_bounds_peak_within_declared_decode_drift() {
     println!("{}", resident_record.to_json_line().unwrap());
     println!("{}", sequential_record.to_json_line().unwrap());
     println!(
-        "MEMORY_EVIDENCE_ARTIFACTS resident={} staged={}",
+        "MEMORY_EVIDENCE_ARTIFACTS resident={} staged={} isolator={}",
         resident_path.display(),
-        staged_path.display()
+        staged_path.display(),
+        isolator_path.display()
     );
 }

@@ -1333,10 +1333,18 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("--expected-abi 3", job)
         # sc-18149: the lane pins the adjudicated tolerance contract from outside the harness.
         self.assertIn("--expected-parity tolerance:mean_abs_u8_subpixel:4.0", job)
+        # sc-18149 review: the p99 tail pin and the isolator binding are lane-pinned so the
+        # verifier — not the harness — enforces both, and deleting either seam reddens here.
+        self.assertIn("--max-p99-abs-u8 13", job)
+        self.assertIn(
+            '--isolator-output "$MEMORY_EVIDENCE_OUTPUT_DIR/z_image_turbo-resident-tiled.rgb"',
+            job,
+        )
         self.assertIn("--expected-model-revision", job)
         self.assertIn("--expected-model-inventory-sha256", job)
         self.assertIn("z_image_turbo-resident.rgb", job)
         self.assertIn("z_image_turbo-staged.rgb", job)
+        self.assertIn("z_image_turbo-resident-tiled.rgb", job)
         self.assertIn("actions/upload-artifact@", job)
         self.assertNotIn("if: always()", job)
         self.assertIn("z-image-turbo-model-inventory.json", job)
