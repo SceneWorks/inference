@@ -1196,11 +1196,49 @@ fn parity_contract(strategy: MemoryStrategy) -> MemoryParityContract {
 /// `meanD` is the resolvable one: **3.786..4.580 over the same five latents, a 1.21x spread**. So the
 /// declared contract is on the mean, with headroom above the worst case.
 ///
-/// **This drift is material and it is not this story's rung.** SC-15523 owns rungs 3 and 4; rung 2 is
-/// SC-16783's. It is measured and bounded here because [`parity_contract`] must declare *something*
-/// for it, and a bound nobody measured is exactly the unknown evidence this epic exists to remove.
-/// Whether ~1.7% mean subpixel drift is an acceptable default is a quality decision, filed as
-/// sc-17863.
+/// ## The sc-17863 verdict: ACCEPTED as the shipping Sequential default, and the ceiling stands
+///
+/// Adjudicated with eyes on real renders, not statistics alone
+/// (`the_published_decode_tile_domain_is_swept_against_the_whole_image_decode`, three production
+/// latents, `sana_1600m` q4 at 1024²). At 1:1 the shipping route is visually indistinguishable from
+/// the whole-image decode in every inspected crop — smooth snow across tile boundaries, and
+/// high-frequency fur, where the drift concentrates as perceptually-neutral texture jitter. The
+/// failure mode that IS visible — blocky tonal patches — appears only when the blend is removed
+/// (overlap 24 px = ZERO blended latent cells), and that configuration also **measurably breaches
+/// this ceiling** (meanD 6.31..6.43 > 6.0 on all three latents): the bound fails exactly when the
+/// image visibly degrades, which is what makes it a real contract rather than a number.
+///
+/// The full drift/peak trade, measured (request peak; whole-image decode reads 13.6213 GiB):
+///
+/// | edge @ overlap 48 | peak GiB | vs whole | meanD (3 seeds) | p99D |
+/// |---|---:|---:|---|---:|
+/// | 512 | 5.0250 | −63.11% | 2.271..2.410 | 24..28 |
+/// | 384 | 4.5315 | −66.73% | 2.595..2.857 | 30..32 |
+/// | 256 | 3.3837 | −75.16% | 3.624..3.809 | 33..40 |
+/// | **192 (shipping)** | **3.2172** | **−76.38%** | 3.786..4.580 (5 latents) | 39..45 |
+///
+/// **The OVERLAP, not the edge, is the seam lever** — measured at the shipping edge 192 by widening
+/// the admission domain for the probe (the production path refuses these):
+///
+/// | overlap px (latent cells) | peak GiB | meanD (3 seeds) | p99D |
+/// |---|---:|---|---:|
+/// | 24 (0 — no blend) | 3.2172 | 6.315..6.427 **breaches the ceiling** | 54..60 |
+/// | 48 (1 — shipping) | 3.2172 | 4.322..4.580 | 39..45 |
+/// | 64 (2) | 3.2172 | 3.394..3.632 | 33..38 |
+/// | 96 (3) | 3.2172 | 3.036..3.278 | 30..35 |
+///
+/// Overlap 96 removes the residual (8x-amplified-only) seam grid at a request peak IDENTICAL to
+/// four decimals — tile area sets the decode transient, and overlap adds tiles, not bigger tiles —
+/// but costs +1..4 s of decode wall per 1024² render, which on Sprint's 2-step schedule is a
+/// 20..50% wall regression. Larger edges buy fidelity with the ladder's scarce resource (peak:
+/// edge 512 is +56% over the floor) and still show a faint amplified seam grid. So the default
+/// STAYS at edge 192 / overlap 48: the floor keeps its −76%, the drift has no visible artifact,
+/// and the numbers above are the measured menu for any future quality-first move of the route.
+///
+/// The ceiling therefore stays 6.0: non-saturating metric, 1.31x headroom over the measured worst
+/// published-domain row (4.580), and demonstrated able to fail — by the no-blend breach above and
+/// by mutation (tightening it to 2.0 reddens the sweep on the first published row; see the sc-17863
+/// PR for the run).
 const DECODE_TILING_MEAN_ABS_U8: f64 = 6.0;
 
 #[allow(clippy::too_many_arguments)]
@@ -1399,6 +1437,241 @@ fn the_tiled_decode_drift_is_resampled_across_production_latents() {
         "the shipping tiled-decode route drifted meanD {worst_mean:.4} past its declared ceiling \
          {DECODE_TILING_MEAN_ABS_U8}; the declared parity contract no longer bounds the engine"
     );
+}
+
+/// The `q`-quantile of the absolute uint8 subpixel difference — the tail statistic that, unlike
+/// `maxD`, does NOT saturate on this route (sc-17863). Computed exactly from a 256-bin histogram.
+fn quantile_delta(a: &[u8], b: &[u8], q: f64) -> u32 {
+    assert_eq!(a.len(), b.len(), "pixel buffers differ in length");
+    let mut histogram = [0u64; 256];
+    for (x, y) in a.iter().zip(b) {
+        histogram[x.abs_diff(*y) as usize] += 1;
+    }
+    let need = (q * a.len() as f64).ceil() as u64;
+    let mut seen = 0u64;
+    for (delta, count) in histogram.iter().enumerate() {
+        seen += count;
+        if seen >= need {
+            return delta as u32;
+        }
+    }
+    255
+}
+
+/// The fraction of subpixels whose absolute difference exceeds `threshold`.
+fn fraction_above(a: &[u8], b: &[u8], threshold: u8) -> f64 {
+    let count = a
+        .iter()
+        .zip(b)
+        .filter(|(x, y)| x.abs_diff(**y) > threshold)
+        .count();
+    count as f64 / a.len() as f64
+}
+
+/// Dump one RGB8 buffer as a binary PPM into `SANA_SWEEP_OUT` (no-op when unset) so the sweep's
+/// verdict can be made with eyes on the renders rather than on statistics alone (sc-17863).
+fn dump_ppm(name: &str, edge: u32, pixels: &[u8]) {
+    let Ok(dir) = std::env::var("SANA_SWEEP_OUT") else {
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    std::fs::create_dir_all(&dir).expect("create SANA_SWEEP_OUT");
+    let mut data = format!("P6\n{edge} {edge}\n255\n").into_bytes();
+    data.extend_from_slice(pixels);
+    std::fs::write(dir.join(format!("{name}.ppm")), data).expect("write ppm");
+}
+
+/// The per-subpixel absolute difference, amplified 8x and clamped — the seam-structure image.
+fn amplified_diff(a: &[u8], b: &[u8]) -> Vec<u8> {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (u32::from(x.abs_diff(*y)) * 8).min(255) as u8)
+        .collect()
+}
+
+/// **The tiled-decode drift/peak trade, swept over the PUBLISHED domain (sc-17863).**
+///
+/// SC-16783 shipped edge 192 / overlap 48 as the Sequential default and sc-15523's resample bounded
+/// that one cell. This sweeps every published edge at the fixed 48-pixel overlap against the
+/// whole-image decode, per production latent, so the declared ceiling bounds the DOMAIN rather than
+/// one cell — and so the edge-vs-overlap question is answered by measurement:
+///
+/// * the EDGE is the lever: drift falls monotonically as the tile grows (more decoder context per
+///   tile), while the request peak rises with tile area;
+/// * the OVERLAP is quantized by the 32x DC-AE scale (`overlap_px / 32` latent cells — 48 px is ONE
+///   blended latent cell), so the unpublished probe overlaps below document the refusal of the
+///   out-of-domain values rather than silently measuring an unshippable configuration.
+#[test]
+#[ignore = "needs a real SANA snapshot (see the module docs for the env vars)"]
+fn the_published_decode_tile_domain_is_swept_against_the_whole_image_decode() {
+    const SEEDS: [u64; 3] = [1234, 7, 8_675_309];
+    /// Unpublished overlaps at the shipping edge: 24 px is ZERO blended latent cells (a hard seam),
+    /// 64 and 96 px are two and three. Outside the published `{48}` domain, so the production path
+    /// refuses them — rows print REFUSED unless the domain is deliberately widened for a probe.
+    const PROBE_OVERLAPS: [u32; 3] = [24, 64, 96];
+    let edge = probe_size();
+    let dir = require_tier(REPRESENTATIVE_ENV, DEFAULT_TIER);
+    let steps = steps_for(REPRESENTATIVE_IS_SPRINT);
+    warm_up(REPRESENTATIVE, &dir, REPRESENTATIVE_IS_SPRINT, edge);
+
+    let untiled = GenerationMemory {
+        stage_residency: true,
+        ..Default::default()
+    };
+    let registry = mlx_gen_sana::provider_registry().expect("provider registry");
+    for seed in SEEDS {
+        let mut whole_req = request(REPRESENTATIVE_IS_SPRINT, Some(untiled), edge, steps);
+        whole_req.seed = Some(seed);
+        let whole = measure(
+            REPRESENTATIVE,
+            &dir,
+            DEFAULT_TIER,
+            LoadShape::DeferredMaterialization,
+            &whole_req,
+        );
+        dump_ppm(&format!("seed{seed}_whole"), edge, &whole.pixels);
+        println!(
+            "[sc-17863 sweep seed {seed}] whole-image decode: {:.4} GiB, {:.0} ms/step",
+            whole.peak_gib,
+            ms_per_step(&whole, steps)
+        );
+        let mut by_edge: Vec<(u32, f64)> = Vec::new();
+        for tile_edge in ms::DECODE_TILE_EDGES {
+            let memory = GenerationMemory {
+                tile_vae_decode: true,
+                decode_tile_edge: Some(*tile_edge),
+                decode_overlap: Some(mlx_gen_sana::pipeline::DECODE_OVERLAP as u32),
+                ..Default::default()
+            };
+            let mut req = request(REPRESENTATIVE_IS_SPRINT, Some(memory), edge, steps);
+            req.seed = Some(seed);
+            let row = measure(
+                REPRESENTATIVE,
+                &dir,
+                DEFAULT_TIER,
+                LoadShape::DeferredMaterialization,
+                &req,
+            );
+            let mean = mean_delta(&whole.pixels, &row.pixels);
+            println!(
+                "[sc-17863 sweep seed {seed}] edge {tile_edge:>3} overlap 48: {:.4} GiB \
+                 ({:+.2}% vs whole), maxD {}, meanD {mean:.4}, p99D {}, >8/255 {:.2}%, >32/255 \
+                 {:.2}%, {:.0} ms/step",
+                row.peak_gib,
+                100.0 * (row.peak_gib - whole.peak_gib) / whole.peak_gib,
+                max_delta(&whole.pixels, &row.pixels),
+                quantile_delta(&whole.pixels, &row.pixels, 0.99),
+                100.0 * fraction_above(&whole.pixels, &row.pixels, 8),
+                100.0 * fraction_above(&whole.pixels, &row.pixels, 32),
+                ms_per_step(&row, steps)
+            );
+            dump_ppm(
+                &format!("seed{seed}_edge{tile_edge}_overlap48"),
+                edge,
+                &row.pixels,
+            );
+            dump_ppm(
+                &format!("seed{seed}_edge{tile_edge}_overlap48_diff8x"),
+                edge,
+                &amplified_diff(&whole.pixels, &row.pixels),
+            );
+            by_edge.push((*tile_edge, mean));
+            // The declared tolerance bounds the DOMAIN, not one cell: a caller may select any
+            // published edge, so every published edge must honor the contract's ceiling.
+            assert!(
+                mean <= DECODE_TILING_MEAN_ABS_U8,
+                "published edge {tile_edge} drifted meanD {mean:.4} past the declared ceiling \
+                 {DECODE_TILING_MEAN_ABS_U8} on seed {seed}"
+            );
+        }
+        // The lever's direction, pinned at every step: `by_edge` descends 512..192, so drift must
+        // be non-decreasing across each adjacent pair — a smaller tile gives the decoder less
+        // context per tile and may not drift LESS than its larger neighbor. The measured gaps
+        // (meanD 2.27 -> 2.85 -> 3.61 -> 4.58 across 512/384/256/192) are an order of magnitude
+        // wider than the observed envelope variance (~1.24%), so this cannot flake on a re-run.
+        for pair in by_edge.windows(2) {
+            let (larger, smaller) = (pair[0], pair[1]);
+            assert!(
+                larger.1 <= smaller.1,
+                "edge {} (meanD {:.4}) should bound edge {} (meanD {:.4}) from below on seed \
+                 {seed} — the drift/peak trade inverted between adjacent published edges",
+                larger.0,
+                larger.1,
+                smaller.0,
+                smaller.1
+            );
+        }
+        // Overlap probe at the shipping edge. Published domain is {48}: these rows REFUSE on the
+        // production path, and that refusal is the record. Widening the domain for a measurement
+        // probe admits them, which is how sc-17863's overlap-vs-edge answer was measured.
+        for overlap in PROBE_OVERLAPS {
+            let memory = GenerationMemory {
+                tile_vae_decode: true,
+                decode_tile_edge: Some(mlx_gen_sana::pipeline::DECODE_TILE_EDGE as u32),
+                decode_overlap: Some(overlap),
+                ..Default::default()
+            };
+            let mut req = request(REPRESENTATIVE_IS_SPRINT, Some(memory), edge, steps);
+            req.seed = Some(seed);
+            let model = registry
+                .load(
+                    REPRESENTATIVE,
+                    &spec(&dir, DEFAULT_TIER, LoadShape::DeferredMaterialization),
+                )
+                .expect("load sana");
+            clear_cache();
+            reset_peak_memory();
+            let started = std::time::Instant::now();
+            match model.generate(&req, &mut |_: Progress| {}) {
+                Ok(GenerationOutput::Images(images)) => {
+                    let pixels = &images.first().expect("one image").pixels;
+                    let peak = get_peak_memory() as f64 / GIB;
+                    println!(
+                        "[sc-17863 overlap probe seed {seed}] edge {} overlap {overlap}: \
+                         {peak:.4} GiB, maxD {}, meanD {:.4}, p99D {}, {:.0} ms/step",
+                        mlx_gen_sana::pipeline::DECODE_TILE_EDGE,
+                        max_delta(&whole.pixels, pixels),
+                        mean_delta(&whole.pixels, pixels),
+                        quantile_delta(&whole.pixels, pixels, 0.99),
+                        started.elapsed().as_secs_f64() * 1000.0 / f64::from(steps)
+                    );
+                    dump_ppm(
+                        &format!("seed{seed}_edge192_overlap{overlap}"),
+                        edge,
+                        pixels,
+                    );
+                    dump_ppm(
+                        &format!("seed{seed}_edge192_overlap{overlap}_diff8x"),
+                        edge,
+                        &amplified_diff(&whole.pixels, pixels),
+                    );
+                }
+                Ok(other) => panic!("expected images, got {other:?}"),
+                Err(error) => {
+                    // Only the published-domain refusal counts as REFUSED. Any other error (an
+                    // OOM, a snapshot failure) must fail the probe rather than masquerade as the
+                    // domain rejection this row exists to record.
+                    let message = error.to_string();
+                    let refusal = format!(
+                        "decode overlap is {}, got {overlap}",
+                        mlx_gen_sana::pipeline::DECODE_OVERLAP
+                    );
+                    assert!(
+                        message.contains(&refusal),
+                        "overlap probe {overlap} on seed {seed} failed with something other than \
+                         the published-domain refusal (expected \"{refusal}\" in the message): \
+                         {message}"
+                    );
+                    println!(
+                        "[sc-17863 overlap probe seed {seed}] overlap {overlap}: REFUSED \
+                         ({message})"
+                    );
+                }
+            }
+            drop(model);
+            clear_cache();
+        }
+    }
 }
 
 /// **A quality verdict is not a single image (SC-17743).**
