@@ -308,33 +308,36 @@ pub fn generate(
         job.segment_len,
         job.segment_overlap,
     )?;
-    // Partition the inference LoRAs (before the 31 GB DiT load, so the gate below fails fast):
-    //   * diff-patch ("lightning") files — full-rank `.diff`/`.diff_b` (+ low-rank factors) that the
-    //     residual loader can't consume — are merged *in place* into the dense weights below (sc-5684).
-    //   * pure low-rank files (the Bias-Aware DPO LoRA, …) install as forward-time residuals over the
-    //     (possibly Q4/Q8) base, the way sc-5451 wired them.
+    // Split the inference LoRAs BY ROLE, not by file (sc-18198). A lightx2v "lightning" file is a
+    // hybrid, and its two halves want opposite treatment:
+    //   * full-rank `.diff`/`.diff_b` deltas land on the qk-norms, `norm3`, `head.head`,
+    //     `img_emb.proj.{0,4}` and the Linear biases — none of which the residual host exposes as
+    //     adapter targets, so they are folded into the raw weight map below (sc-5684). Every one of
+    //     those tensors stays DENSE bf16 in the pre-quantized q4/q8 tiers (only the 2-D block
+    //     projections are packed), so the fold is tier-independent.
+    //   * low-rank `lora_down`/`lora_up` factors target exactly the projections that DO get packed.
+    //     Those install as forward-time residuals after the build+quantize, which is the one form
+    //     that works over a packed base — and is already how the Bias-Aware DPO LoRA loads (sc-5451).
+    // So EVERY spec goes to the residual pass, and diff-patch files additionally go to the fold. The
+    // two passes are disjoint by key suffix — the low-rank loader groups only `.lora_A`/`.lora_down`/
+    // `.lora_B`/`.lora_up`/`.alpha` and ignores every other key, so a hybrid file is never applied
+    // twice. This replaces the blanket "needs the DENSE (bf16) snapshot" rejection, which failed the
+    // whole file whenever the tier was pre-quantized even though nothing in it actually requires a
+    // dense base; a full-rank delta that genuinely CANNOT be carried is now refused per-target by
+    // `report_outcome` instead.
     let mut diff_patch: Vec<&AdapterSpec> = Vec::new();
     let mut residual: Vec<AdapterSpec> = Vec::new();
     for spec in adapters {
+        // Propagate a header read failure rather than defaulting to "not a diff-patch": treating an
+        // unreadable adapter as low-rank-only would drop its `.diff` half without a word.
         if crate::lora::has_diff_patch_keys(&spec.path)? {
             diff_patch.push(spec);
-        } else {
-            residual.push(spec.clone());
         }
-    }
-    // The in-place diff-patch merge folds dense deltas into the weights, so it needs the DENSE (bf16)
-    // snapshot — a pre-quantized-on-disk DiT carries packed u32 weights that can't take a dense delta.
-    // Fail loudly rather than silently dropping the lightning patch (sc-5684/sc-5445).
-    if !diff_patch.is_empty() {
-        if let Some(q) = cfg.wan.quantization {
-            return Err(Error::Msg(format!(
-                "scail2: a lightx2v diff-patch lightning LoRA needs the DENSE (bf16) snapshot, but \
-                 this one is pre-quantized on disk (Q{}). Point the loader at the bf16 snapshot — \
-                 load-time Q4/Q8 still applies *after* the merge, and the lightning recipe is a \
-                 speed lever (8 steps, CFG off) on activation-bound 480p memory where pre-packed Q4 \
-                 weights help little (sc-5684/sc-5445).",
-                q.bits
-            )));
+        // A file joins the residual pass only if it actually carries low-rank factors. The strict
+        // installer errors when a spec resolves no targets, so handing it a pure-`.diff` file (legal,
+        // just not what this file happens to be) would turn a good adapter into "matched nothing".
+        if crate::lora::has_low_rank_keys(&spec.path)? {
+            residual.push(spec.clone());
         }
     }
     let (tw, th) = (align(job.width), align(job.height));

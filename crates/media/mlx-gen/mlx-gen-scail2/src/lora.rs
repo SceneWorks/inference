@@ -19,15 +19,26 @@
 //!      The transformer blocks (dim 5120 q/k/v/o/ffn/k_img/v_img), the dim-5120 globals, and the
 //!      `img_emb` stack ARE compatible and DO transfer — only the input patch-embed differs.
 //!
-//! **Mechanism — in-place dense merge (option (a) from the story).** Rather than expose every norm /
-//! bias as a residual adapter target, this merges the deltas directly into the raw [`Weights`] map
-//! *before* the DiT is built and *before* load-time quantization: a `.diff` adds onto `{stem}.weight`,
-//! a `.diff_b` adds onto `{stem}.bias`, and the low-rank factors fold `(alpha/rank)·(up·down)` onto
-//! `{stem}.weight` — all uniformly. This composes with *load-time* Q4/Q8 (merge the dense weights,
-//! then quantize) but **not** a pre-quantized-on-disk snapshot (packed u32 weights can't take a dense
-//! delta) — the caller gates it to the dense bf16 snapshot. The lightning recipe is a *speed* lever
-//! (8 steps, shift 1, CFG off) and 480p memory is activation-bound (the Q4 *weights* help little
-//! there, per sc-5445), so requiring the dense base is the right trade.
+//! **Mechanism — split by ROLE, so the file is tier-independent (sc-18198).** A lightning file's two
+//! halves want opposite treatment, and each half's targets happen to be exactly the ones that suit it:
+//!
+//!   * **Full-rank `.diff`/`.diff_b`** are folded directly into the raw [`Weights`] map here, *before*
+//!     the DiT is built. This is what reaches the norms and biases the residual host does not expose
+//!     as adapter targets. Crucially, every full-rank target — the qk-norms, `norm3`, `head.head`,
+//!     `img_emb.proj.{0,4}`, and every Linear bias — stays **dense bf16 even in the pre-quantized
+//!     q4/q8 tiers**, because MLX packs only the 2-D block projections. So the fold needs no
+//!     dequantization and works identically on every tier.
+//!   * **Low-rank `lora_down`/`lora_up` factors** are NOT folded here at all. They target precisely
+//!     the projections that DO get packed, and they install as forward-time residuals *after* the
+//!     build and quantize — the one form that composes with a packed base, and already how the
+//!     Bias-Aware DPO LoRA loads (sc-5451).
+//!
+//! Nothing in the file ever requires a dense delta to meet a packed weight, so there is no
+//! dequantize/requantize step and no tier gate. This replaced a blanket "needs the DENSE (bf16)
+//! snapshot" rejection that failed the whole file whenever the snapshot was pre-quantized — which made
+//! the bundled `scail2_lightning` toggle unusable on the default (q4) tier. A full-rank delta that
+//! genuinely cannot be carried (a `.diff` on a packed target, with no low-rank factor to stand in) is
+//! now refused per-target by [`report_outcome`] rather than pre-empted for the whole file.
 //!
 //! **Shape-aware skipping is loud, never silent.** A target whose weight-delta shape doesn't match
 //! the SCAIL-2 base (the in_dim-36 `patch_embedding`) is skipped *as a whole module* — its coupled
@@ -39,10 +50,9 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use mlx_gen::array::scalar;
-use mlx_gen::gen_core::weightsmeta::{LoraAdapterMeta, LORA_ADAPTER_METADATA_KEY};
 use mlx_gen::weights::Weights;
 use mlx_gen::{AdapterSpec, Error, Result};
-use mlx_rs::ops::{add, matmul, multiply};
+use mlx_rs::ops::{add, multiply};
 use mlx_rs::{Array, Dtype};
 
 /// LoRA key namespace prefixes stripped (longest-first). The lightx2v files use `diffusion_model.`;
@@ -100,6 +110,16 @@ pub struct DiffPatchReport {
     pub skipped_cross_arch: Vec<String>,
     /// Targets that resolved to no weight in the SCAIL-2 checkpoint (orphan factor / unknown module).
     pub skipped_unmatched: Vec<String>,
+    /// Modules whose low-rank factors were deliberately left for the post-quantize residual pass
+    /// rather than folded here (sc-18198). This is every low-rank target, on every tier — see
+    /// [`merge_module`]. Counted so the "matched nothing" guard can tell a file that legitimately
+    /// carried only low-rank factors from one whose prefixes are misconfigured.
+    pub deferred_low_rank: usize,
+    /// Modules carrying a full-rank `.diff` whose base weight is PACKED (pre-quantized on disk), so
+    /// the dense delta cannot be folded and no low-rank factor exists to carry it. A hard error —
+    /// applying the rest would silently ship a partial patch. Empty for the lightx2v lightning file,
+    /// whose every full-rank target is dense on every tier (sc-18198).
+    pub blocked_packed_diff: Vec<String>,
 }
 
 /// `true` if `path` is a diff-patch ("lightning") LoRA — a file carrying any full-rank `.diff` (weight
@@ -109,6 +129,25 @@ pub fn has_diff_patch_keys(path: &Path) -> Result<bool> {
     let found = w
         .keys()
         .any(|k| k.ends_with(".diff") || k.ends_with(".diff_b"));
+    Ok(found)
+}
+
+/// `true` if `path` carries any low-rank factor (`lora_down`/`lora_up`, or the PEFT `lora_A`/`lora_B`
+/// spelling) — i.e. whether the post-quantize residual installer has anything to do with this file.
+///
+/// The caller needs this because the residual installer is *strict*: handing it a file whose every key
+/// is a full-rank `.diff` would resolve zero targets and be reported as "matched nothing", turning a
+/// perfectly good pure-diff-patch adapter into a hard error. The lightx2v lightning file happens to
+/// carry both halves, so this only guards the pure-`.diff` shape — but that shape is legal, and
+/// relying on the mixed one would be relying on luck (sc-18198).
+pub fn has_low_rank_keys(path: &Path) -> Result<bool> {
+    let w = Weights::from_file(path)?;
+    let found = w.keys().any(|k| {
+        k.ends_with(".lora_down.weight")
+            || k.ends_with(".lora_up.weight")
+            || k.ends_with(".lora_A.weight")
+            || k.ends_with(".lora_B.weight")
+    });
     Ok(found)
 }
 
@@ -130,11 +169,16 @@ fn strip_namespace(key: &str) -> &str {
         .unwrap_or(key)
 }
 
-/// Merge every diff-patch adapter in `specs` into the **dense** SCAIL-2 weight map `w`, in place
-/// (sc-5684). Call this on the freshly-loaded `dit.safetensors` weights *before* [`crate::Scail2Dit`]
-/// is built and *before* any load-time quantization. Multiple files accumulate (each reads the
-/// already-merged weight back from `w`). The caller must have verified `w` is the dense bf16 snapshot
-/// (a pre-quantized-on-disk DiT can't take a dense delta).
+/// Fold every diff-patch adapter's **full-rank** `.diff`/`.diff_b` deltas into the SCAIL-2 weight map
+/// `w`, in place (sc-5684). Call this on the freshly-loaded `dit.safetensors` weights *before*
+/// [`crate::Scail2Dit`] is built and *before* any load-time quantization. Multiple files accumulate
+/// (each reads the already-merged weight back from `w`).
+///
+/// `w` may be a **pre-quantized (q4/q8) tier** as well as the dense bf16 one (sc-18198): a target
+/// whose base is packed is detected by its `{stem}.scales` sibling and left alone, and the low-rank
+/// factors that target those packed projections are deferred to the post-quantize residual installer
+/// by design — this function never folds low-rank factors on any tier. The caller must pass the same
+/// specs to that installer; [`report_outcome`] refuses the one case neither pass can carry.
 pub fn merge_diff_patch_adapters(
     w: &mut Weights,
     specs: &[&AdapterSpec],
@@ -166,12 +210,12 @@ fn merge_one(w: &mut Weights, spec: &AdapterSpec, report: &mut DiffPatchReport) 
             Role::DiffB => parts.diff_b = Some(lw.require(&key)?.clone()),
         }
     }
-    // PEFT/diffusers `save_lora_adapter` scaling lives in the `lora_adapter_metadata` blob (sc-5513);
-    // `None` for a diff-patch file (the lightx2v files carry no blob and no `.alpha` → alpha = rank →
-    // scale 1.0, the canonical lightning composition).
-    let meta = LoraAdapterMeta::from_metadata(lw.metadata(LORA_ADAPTER_METADATA_KEY));
+    // The `lora_adapter_metadata` alpha/rank blob (sc-5513) is deliberately NOT read here any more:
+    // since sc-18198 this fold handles only full-rank `.diff`/`.diff_b`, which are absolute deltas
+    // scaled by `spec.scale` alone — alpha/rank scaling applies to low-rank factors, and those are
+    // now installed by the residual loader, which resolves the blob itself.
     for (stem, parts) in groups {
-        merge_module(w, &stem, &parts, meta.as_ref(), spec.scale, report)?;
+        merge_module(w, &stem, &parts, spec.scale, report)?;
     }
     Ok(())
 }
@@ -184,7 +228,6 @@ fn merge_module(
     w: &mut Weights,
     stem: &str,
     parts: &Parts,
-    meta: Option<&LoraAdapterMeta>,
     strength: f32,
     report: &mut DiffPatchReport,
 ) -> Result<()> {
@@ -193,43 +236,51 @@ fn merge_module(
         report.skipped_unmatched.push(stem.to_string());
         return Ok(());
     };
-    let base_shape = base_w.shape().to_vec();
+    // A pre-quantized-on-disk tier stores each quantized Linear as packed `{stem}.weight` (u32) plus
+    // sibling `{stem}.scales` / `{stem}.biases`. The `.scales` sibling is the reliable marker — the
+    // packed weight's own dtype/shape say nothing a dense check could use. NOTE `{stem}.biases` (the
+    // quantization zero-points) is a DIFFERENT tensor from `{stem}.bias` (the Linear's bias); only
+    // the latter is a `.diff_b` target, and it stays dense on every tier.
+    let packed = w.get(&format!("{stem}.scales")).is_some();
 
-    // --- weight delta (f32): full-rank `.diff` (@ strength) + low-rank `up·down` (@ alpha/rank·strength)
-    let mut wdelta: Option<Array> = None;
-    if let Some(diff) = &parts.diff {
-        if diff.shape() != base_shape.as_slice() {
-            report.skipped_cross_arch.push(stem.to_string());
-            return Ok(()); // cross-arch (e.g. patch_embedding in_dim 36 vs 20) — skip whole module.
-        }
-        wdelta = Some(multiply(&f32a(diff)?, scalar(strength))?);
-    }
+    // --- low-rank factors: NEVER folded here (sc-18198) ---
+    // They install as forward-time residuals AFTER the DiT is built and quantized, which is the one
+    // form that works over a packed base — and is what SCAIL-2 already does for the Bias-Aware DPO
+    // LoRA. Folding them here instead would (a) be impossible on a packed tier and (b) make the
+    // whole file tier-gated for no reason, since the low-rank factors are the ONLY part of a
+    // lightning file that ever targets a quantized Linear. Deferring them uniformly — on dense tiers
+    // too — keeps one code path per tier rather than two divergent ones; on an unquantized base a
+    // residual and a merged delta are the same arithmetic.
     match (&parts.down, &parts.up) {
-        (Some(down), Some(up)) => {
-            // alpha precedence: per-target `.alpha` → blob `alpha_pattern`/`lora_alpha` → factor rank.
-            let (cfg_alpha, cfg_rank) = meta.map_or((None, None), |m| m.effective(stem));
-            let rank = cfg_rank.map(|r| r as f64).unwrap_or(down.shape()[0] as f64);
-            let alpha = parts.alpha.or(cfg_alpha).map(|a| a as f64).unwrap_or(rank);
-            let eff = (alpha / rank * strength as f64) as f32;
-            let delta = matmul(&f32a(up)?, &f32a(down)?)?; // [out, in]
-            if delta.shape() != base_shape.as_slice() {
-                report.skipped_cross_arch.push(stem.to_string());
-                return Ok(());
-            }
-            let delta = multiply(&delta, scalar(eff))?;
-            wdelta = Some(match wdelta {
-                Some(d) => add(&d, &delta)?,
-                None => delta,
-            });
-        }
+        (Some(_), Some(_)) => report.deferred_low_rank += 1,
         (None, None) => {}
         _ => {
-            // An orphan low-rank factor (its partner targeted a non-LoRA key) — surface, don't fold.
+            // An orphan low-rank factor (its partner targeted a non-LoRA key) — surface it here
+            // rather than leaving the residual pass to infer the mismatch.
             report.skipped_unmatched.push(stem.to_string());
             return Ok(());
         }
     }
-    if let Some(d) = wdelta {
+
+    // --- full-rank weight delta (`.diff`, @ strength) ---
+    if let Some(diff) = &parts.diff {
+        if packed {
+            // Nothing can carry this: a dense delta cannot fold into packed u32 weights, and a
+            // full-rank `.diff` has no low-rank factor for the residual pass to install instead.
+            // Applying the rest of the file would ship a silently partial patch, so this is fatal
+            // (raised together for every affected target by `report_outcome`). The lightx2v
+            // lightning file never reaches here: its full-rank targets are the qk-norms, `norm3`,
+            // `head.head`, `img_emb.proj.{0,4}` and every Linear bias, all of which stay dense
+            // BF16 in the q4/q8 tiers — only the 2-D block projections are packed, and those carry
+            // low-rank factors.
+            report.blocked_packed_diff.push(stem.to_string());
+            return Ok(());
+        }
+        if diff.shape() != base_w.shape() {
+            report.skipped_cross_arch.push(stem.to_string());
+            return Ok(()); // cross-arch (e.g. patch_embedding in_dim 36 vs 20) — skip whole module.
+        }
+        let d = multiply(&f32a(diff)?, scalar(strength))?;
         let merged = add(&f32a(&base_w)?, &d)?.as_dtype(base_w.dtype())?;
         w.insert(wkey, merged);
         report.merged_weights += 1;
@@ -276,7 +327,26 @@ pub fn report_outcome(report: &DiffPatchReport, model_id: &str) -> Result<()> {
             report.skipped_unmatched
         );
     }
-    if report.merged_weights + report.merged_biases == 0 {
+    // A full-rank delta on a packed base can be carried by nothing — not the fold (it cannot unpack)
+    // and not the residual pass (there is no low-rank factor for that target). Refusing here is the
+    // difference between a loud failure and a silently half-applied patch, so it is fatal even though
+    // every other target may have applied cleanly (sc-18198).
+    if !report.blocked_packed_diff.is_empty() {
+        return Err(Error::Msg(format!(
+            "{model_id}: {} diff-patch target(s) carry a full-rank `.diff` whose base weight is \
+             pre-quantized on disk, which cannot be applied without dequantizing the tier — and \
+             they carry no low-rank factor to install as a residual instead. Refusing rather than \
+             applying a partial patch. Load the dense `bf16` tier for this adapter, or re-export it \
+             with low-rank factors for these targets: {:?}",
+            report.blocked_packed_diff.len(),
+            report.blocked_packed_diff
+        )));
+    }
+    // `deferred_low_rank` counts targets handed to the post-quantize residual pass. They are real
+    // matches, so a file that is mostly low-rank (or whose full-rank targets were all cross-arch
+    // skips) must not read as "matched nothing" — the residual installer runs its own strict
+    // zero-match guard over exactly those targets.
+    if report.merged_weights + report.merged_biases + report.deferred_low_rank == 0 {
         return Err(Error::Msg(format!(
             "{model_id}: the diff-patch LoRA matched no SCAIL-2 module (every target skipped) — \
              likely a format / prefix mismatch, or the wrong base model"
@@ -413,9 +483,13 @@ mod tests {
         let mut w = synthetic_dit();
         let report = merge_diff_patch_adapters(&mut w, &[&spec(dp.clone(), 1.0)]).unwrap();
 
-        // q.weight (lora) + norm_q.weight (diff) merged; q.bias + norm... only q has diff_b → 1 bias.
-        assert_eq!(report.merged_weights, 2, "q (lora) + norm_q (diff)");
+        // sc-18198: ONLY the full-rank `.diff` folds here. q's low-rank factors are deferred to the
+        // post-quantize residual installer (on every tier, not just packed ones), so `norm_q` is the
+        // single merged weight and q is counted as deferred instead.
+        assert_eq!(report.merged_weights, 1, "norm_q (.diff) only");
         assert_eq!(report.merged_biases, 1, "q.diff_b");
+        assert_eq!(report.deferred_low_rank, 1, "q's low-rank factors deferred");
+        assert!(report.blocked_packed_diff.is_empty());
         // patch_embedding is the lone cross-architecture skip (its .diff is in_dim 6 vs base 4); its
         // .diff_b is dropped with it even though [16] would have matched.
         assert_eq!(
@@ -435,31 +509,29 @@ mod tests {
             );
         }
 
-        // q.weight == base + (up·down) (alpha = rank → scale 1.0), folded in f32.
-        let lw = Weights::from_file(&dp).unwrap();
-        let down = lw
-            .require("diffusion_model.blocks.0.self_attn.q.lora_down.weight")
-            .unwrap();
-        let up = lw
-            .require("diffusion_model.blocks.0.self_attn.q.lora_up.weight")
-            .unwrap();
-        let delta = matmul(f32a(up).unwrap(), f32a(down).unwrap()).unwrap();
-        let q_base = base.require("blocks.0.self_attn.q.weight").unwrap();
-        let want = add(f32a(q_base).unwrap(), &delta)
-            .unwrap()
-            .as_dtype(Dtype::Bfloat16)
-            .unwrap();
+        // q.weight must be left BIT-IDENTICAL: its low-rank factors are the residual installer's job
+        // now. Folding them here as well would double-apply them, since the same spec goes to both
+        // passes (the low-rank loader ignores `.diff`/`.diff_b`, and this fold ignores `lora_*`).
         assert!(
-            all_close(
+            array_eq(
                 w.require("blocks.0.self_attn.q.weight").unwrap(),
-                &want,
-                1e-4,
-                1e-4,
+                base.require("blocks.0.self_attn.q.weight").unwrap(),
                 false
             )
             .unwrap()
             .item::<bool>(),
-            "merged q.weight must equal base + up·down"
+            "q.weight must be untouched — low-rank factors install as post-quantize residuals"
+        );
+        // ...while its `.diff_b` bias delta DID fold (biases stay dense on every tier).
+        assert!(
+            !array_eq(
+                w.require("blocks.0.self_attn.q.bias").unwrap(),
+                base.require("blocks.0.self_attn.q.bias").unwrap(),
+                false
+            )
+            .unwrap()
+            .item::<bool>(),
+            "q.bias must be patched by its .diff_b"
         );
         // norm_q.weight changed (a diff was applied).
         assert!(
@@ -474,6 +546,154 @@ mod tests {
         );
     }
 
+    /// Turn the synthetic DiT's `q` projection into a PRE-QUANTIZED one: packed u32 `weight` plus the
+    /// `scales`/`biases` siblings MLX writes. Mirrors the real q4/q8 tiers, where only the 2-D block
+    /// projections are packed and every norm / Linear `bias` stays dense bf16. NOTE `q.biases`
+    /// (quantization zero-points) is a different tensor from `q.bias` (the Linear bias).
+    fn pack_q(w: &mut Weights) {
+        let packed = Array::from_slice(&[0u32; 16 * 2], &[16, 2]);
+        let scales = f32(vec![0.01; 16 * 2], &[16, 2]);
+        let zeros = f32(vec![0.0; 16 * 2], &[16, 2]);
+        w.insert("blocks.0.self_attn.q.weight".to_string(), packed);
+        w.insert("blocks.0.self_attn.q.scales".to_string(), scales);
+        w.insert("blocks.0.self_attn.q.biases".to_string(), zeros);
+    }
+
+    /// sc-18198 — the case the old blanket gate rejected outright. On a pre-quantized tier the fold
+    /// must still apply everything it can (the dense norms and biases) and leave the packed
+    /// projection for the residual pass, rather than failing the whole file.
+    #[test]
+    fn packed_projection_defers_low_rank_and_still_folds_dense_targets() {
+        let dp = write_diff_patch("packed.safetensors");
+        let mut w = synthetic_dit();
+        pack_q(&mut w);
+        let before = {
+            let mut b = synthetic_dit();
+            pack_q(&mut b);
+            b
+        };
+
+        let report = merge_diff_patch_adapters(&mut w, &[&spec(dp, 1.0)]).unwrap();
+
+        // Nothing is blocked: q carries only low-rank factors, which the residual pass will install
+        // over the packed weight, and its `.diff_b` targets the still-dense `q.bias`.
+        assert!(
+            report.blocked_packed_diff.is_empty(),
+            "no full-rank .diff lands on a packed target in this file: {:?}",
+            report.blocked_packed_diff
+        );
+        assert_eq!(
+            report.deferred_low_rank, 1,
+            "q deferred to the residual pass"
+        );
+        assert_eq!(report.merged_weights, 1, "norm_q .diff still folds");
+        assert_eq!(
+            report.merged_biases, 1,
+            "q.diff_b still folds (bias is dense)"
+        );
+        report_outcome(&report, "scail2").expect("a packed tier must not fail the file");
+
+        // The packed buffer and its quantization siblings are untouched.
+        for k in [
+            "blocks.0.self_attn.q.weight",
+            "blocks.0.self_attn.q.scales",
+            "blocks.0.self_attn.q.biases",
+        ] {
+            assert!(
+                array_eq(w.require(k).unwrap(), before.require(k).unwrap(), false)
+                    .unwrap()
+                    .item::<bool>(),
+                "{k} must be untouched on a packed tier"
+            );
+        }
+        // ...but the dense targets around it were patched.
+        assert!(
+            !array_eq(
+                w.require("blocks.0.self_attn.norm_q.weight").unwrap(),
+                before.require("blocks.0.self_attn.norm_q.weight").unwrap(),
+                false
+            )
+            .unwrap()
+            .item::<bool>(),
+            "norm_q.weight is dense on every tier and must still be patched"
+        );
+    }
+
+    /// The one case that genuinely cannot be carried: a full-rank `.diff` on a packed base, with no
+    /// low-rank factor to install instead. Refusing is the difference between a loud failure and a
+    /// silently half-applied patch, so it must be a hard error even though other targets applied.
+    #[test]
+    fn full_rank_diff_on_a_packed_target_is_a_hard_error() {
+        let path = tmp("packed_diff.safetensors");
+        // A `.diff` shaped like the DENSE q weight — on a packed base it cannot be folded.
+        let q_diff = f32((0..16 * 8).map(|i| i as f32 * 0.001).collect(), &[16, 8]);
+        let norm_diff = f32((0..8).map(|i| i as f32 * 0.01).collect(), &[8]);
+        Array::save_safetensors(
+            vec![
+                ("diffusion_model.blocks.0.self_attn.q.diff", &q_diff),
+                ("diffusion_model.blocks.0.self_attn.norm_q.diff", &norm_diff),
+            ],
+            None,
+            &path,
+        )
+        .unwrap();
+
+        let mut w = synthetic_dit();
+        pack_q(&mut w);
+        let report = merge_diff_patch_adapters(&mut w, &[&spec(path, 1.0)]).unwrap();
+        assert_eq!(
+            report.blocked_packed_diff,
+            vec!["blocks.0.self_attn.q".to_string()]
+        );
+        let err = report_outcome(&report, "scail2")
+            .expect_err("a full-rank .diff on a packed base must not apply silently");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("pre-quantized on disk") && msg.contains("blocks.0.self_attn.q"),
+            "error must name the blocking target: {msg}"
+        );
+    }
+
+    /// The residual pass is opt-in per file: a hybrid lightning file joins it (its low-rank half is
+    /// the residual installer's job), a pure-`.diff` file must NOT (the strict installer would resolve
+    /// zero targets and report "matched nothing"), and a plain low-rank file still does.
+    #[test]
+    fn low_rank_detection_selects_which_files_join_the_residual_pass() {
+        let hybrid = write_diff_patch("lowrank_hybrid.safetensors");
+        assert!(has_low_rank_keys(&hybrid).unwrap());
+        assert!(has_diff_patch_keys(&hybrid).unwrap());
+
+        let pure_diff = tmp("lowrank_pure_diff.safetensors");
+        let d = f32((0..8).map(|i| i as f32 * 0.01).collect(), &[8]);
+        Array::save_safetensors(
+            vec![("diffusion_model.blocks.0.self_attn.norm_q.diff", &d)],
+            None,
+            &pure_diff,
+        )
+        .unwrap();
+        assert!(has_diff_patch_keys(&pure_diff).unwrap());
+        assert!(
+            !has_low_rank_keys(&pure_diff).unwrap(),
+            "a pure-.diff file must stay out of the residual pass"
+        );
+
+        // PEFT spelling counts too, not just the diffusers/ComfyUI one.
+        let peft = tmp("lowrank_peft.safetensors");
+        let down = f32(vec![0.1; 4 * 8], &[4, 8]);
+        let up = f32(vec![0.1; 16 * 4], &[16, 4]);
+        Array::save_safetensors(
+            vec![
+                ("diffusion_model.blocks.0.self_attn.q.lora_A.weight", &down),
+                ("diffusion_model.blocks.0.self_attn.q.lora_B.weight", &up),
+            ],
+            None,
+            &peft,
+        )
+        .unwrap();
+        assert!(has_low_rank_keys(&peft).unwrap());
+        assert!(!has_diff_patch_keys(&peft).unwrap());
+    }
+
     #[test]
     fn scale_zero_is_noop() {
         let dp = write_diff_patch("zero.safetensors");
@@ -481,7 +701,11 @@ mod tests {
         let base = synthetic_dit();
         let report = merge_diff_patch_adapters(&mut w, &[&spec(dp, 0.0)]).unwrap();
         // Still "merged" (folded a zero delta), but every touched weight is bit-identical to the base.
-        assert_eq!(report.merged_weights, 2);
+        // One weight, not two: q's low-rank factors are deferred rather than folded (sc-18198), so
+        // only `norm_q`'s full-rank `.diff` folds here. q.weight is untouched at ANY strength now,
+        // which is why the loop below still holds for it.
+        assert_eq!(report.merged_weights, 1);
+        assert_eq!(report.deferred_low_rank, 1);
         for k in [
             "blocks.0.self_attn.q.weight",
             "blocks.0.self_attn.q.bias",
