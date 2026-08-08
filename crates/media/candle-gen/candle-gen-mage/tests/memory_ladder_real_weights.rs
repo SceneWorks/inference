@@ -190,6 +190,7 @@ fn representative_route_exercises_advertised_rung() {
 
         if strategy >= MemoryStrategy::BoundedAttention {
             candle_gen::attention::chunk_probe::reset();
+            candle_gen_mage::transformer::attention_head_chunk_probe::reset();
         }
         if strategy == MemoryStrategy::BoundedTransformerResidency {
             candle_gen_mage::transformer::block_window_probe::reset();
@@ -204,8 +205,14 @@ fn representative_route_exercises_advertised_rung() {
             .expect("finish memory request");
         if strategy >= MemoryStrategy::BoundedAttention {
             assert!(
-                candle_gen::attention::chunk_probe::max_chunk_count() > 1,
-                "{}: bounded attention did not split the score tensor",
+                candle_gen_mage::transformer::attention_head_chunk_probe::max_chunk_count() > 1,
+                "{}: bounded attention did not split complete heads",
+                case.name,
+            );
+            assert_eq!(
+                candle_gen::attention::chunk_probe::max_chunk_count(),
+                1,
+                "{}: Mage 1024px attention unexpectedly fell back to query-row chunks",
                 case.name,
             );
         }

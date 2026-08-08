@@ -154,6 +154,88 @@ struct JointAttention {
     heads: usize,
 }
 
+#[cfg(any(test, feature = "testkit"))]
+pub mod attention_head_chunk_probe {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static MAX_CHUNK_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    pub fn reset() {
+        MAX_CHUNK_COUNT.store(0, Ordering::Relaxed);
+    }
+
+    pub fn max_chunk_count() -> usize {
+        MAX_CHUNK_COUNT.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn record(count: usize) {
+        MAX_CHUNK_COUNT.fetch_max(count, Ordering::Relaxed);
+    }
+}
+
+#[cfg(any(test, feature = "testkit"))]
+fn record_attention_head_chunk_count(count: usize) {
+    attention_head_chunk_probe::record(count);
+}
+
+#[cfg(not(any(test, feature = "testkit")))]
+fn record_attention_head_chunk_count(_count: usize) {}
+
+/// Bound the score tensor over complete attention heads before falling back to query rows.
+///
+/// Mage repeatedly feeds BF16 attention output back through the diffusion trajectory. Query-row
+/// chunking changes GEMM's `M` dimension and can amplify otherwise-small rounding differences across
+/// steps. Complete heads are independent, and the shared planner can fit three full Mage heads in the
+/// 64 Mi score budget at 1024px. Splitting that axis keeps every query GEMM shape intact while the
+/// shared kernel remains the single-head fallback for shapes where one head itself exceeds budget.
+fn sdpa_planned_by_heads(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+    plan: candle_gen::gen_core::attention_budget::AttentionPlan<'_>,
+) -> candle_gen::Result<Tensor> {
+    let (b, h, sq, _d) = q.dims4()?;
+    let sk = k.dim(2)?;
+    let head_plan = plan
+        .budget
+        .head_chunks(b as u64, h as u64, sq as u64, sk as u64);
+    if !head_plan.chunks_heads() {
+        record_attention_head_chunk_count(1);
+        return candle_gen::sdpa_planned_bhsd(
+            q,
+            k,
+            v,
+            scale,
+            None,
+            candle_nn::ops::softmax_last_dim,
+            plan,
+        );
+    }
+
+    let heads_per_chunk = head_plan.heads_per_chunk() as usize;
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < h {
+        if plan.is_cancelled() {
+            return Err(candle_gen::CandleError::Canceled);
+        }
+        let len = heads_per_chunk.min(h - start);
+        chunks.push(candle_gen::sdpa_planned_bhsd(
+            &q.narrow(1, start, len)?,
+            &k.narrow(1, start, len)?,
+            &v.narrow(1, start, len)?,
+            scale,
+            None,
+            candle_nn::ops::softmax_last_dim,
+            plan,
+        )?);
+        start += len;
+    }
+    record_attention_head_chunk_count(chunks.len());
+    Ok(Tensor::cat(&chunks, 1)?)
+}
+
 impl JointAttention {
     fn load_with_sidecars(
         w: &Weights,
@@ -239,19 +321,11 @@ impl JointAttention {
                 ),
             )
             .with_cancel(cancel);
-            let o = candle_gen::sdpa_planned_bhsd(
-                &q,
-                &k,
-                &v,
-                (HEAD_DIM as f64).powf(-0.5),
-                None,
-                candle_nn::ops::softmax_last_dim,
-                plan,
-            )
-            .map_err(|error| candle_core::Error::Msg(error.to_string()))?
-            .squeeze(0)?
-            .transpose(0, 1)?
-            .reshape((tl + il, self.heads * HEAD_DIM))?;
+            let o = sdpa_planned_by_heads(&q, &k, &v, (HEAD_DIM as f64).powf(-0.5), plan)
+                .map_err(|error| candle_core::Error::Msg(error.to_string()))?
+                .squeeze(0)?
+                .transpose(0, 1)?
+                .reshape((tl + il, self.heads * HEAD_DIM))?;
             text_parts.push(o.narrow(0, 0, tl)?);
             image_parts.push(o.narrow(0, tl, il)?);
         }
@@ -762,6 +836,7 @@ fn place_linear(linear: &mut QLinear, quant: Option<Quant>, device: &Device) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
     use std::collections::HashMap;
 
     #[test]
@@ -781,6 +856,48 @@ mod tests {
     #[test]
     fn quantized_projection_count_tracks_the_full_architecture() {
         assert_eq!(6 + crate::config::DEPTH * 14, 174);
+    }
+
+    #[test]
+    fn bounded_attention_chunks_complete_heads_without_query_fallback() -> Result<()> {
+        let device = Device::Cpu;
+        let q = Tensor::randn(0f32, 1f32, (1, 2, 7, 4), &device)?;
+        candle_gen::attention::chunk_probe::reset();
+        attention_head_chunk_probe::reset();
+        let full = sdpa_planned_by_heads(&q, &q, &q, 0.5, AttentionPlan::UNBOUNDED)
+            .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
+        assert_eq!(attention_head_chunk_probe::max_chunk_count(), 1);
+        assert_eq!(candle_gen::attention::chunk_probe::max_chunk_count(), 1);
+
+        candle_gen::attention::chunk_probe::reset();
+        attention_head_chunk_probe::reset();
+        let bounded = sdpa_planned_by_heads(
+            &q,
+            &q,
+            &q,
+            0.5,
+            AttentionPlan::budgeted(AttentionBudget::from_score_elements(7 * 7, false)),
+        )
+        .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
+        assert_eq!(attention_head_chunk_probe::max_chunk_count(), 2);
+        assert_eq!(candle_gen::attention::chunk_probe::max_chunk_count(), 1);
+        assert_eq!(
+            full.flatten_all()?.to_vec1::<f32>()?,
+            bounded.flatten_all()?.to_vec1::<f32>()?,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_head_chunks_honor_request_cancellation() {
+        let device = Device::Cpu;
+        let q = Tensor::randn(0f32, 1f32, (1, 2, 7, 4), &device).unwrap();
+        let cancel = candle_gen::gen_core::CancelFlag::default();
+        cancel.cancel();
+        let plan = AttentionPlan::budgeted(AttentionBudget::from_score_elements(7 * 7, false))
+            .with_cancel(&cancel);
+        let error = sdpa_planned_by_heads(&q, &q, &q, 0.5, plan).unwrap_err();
+        assert!(matches!(error, candle_gen::CandleError::Canceled));
     }
 
     #[test]
