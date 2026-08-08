@@ -972,8 +972,13 @@ jobs:
     timeout-minutes: 180
     env:
       ZIMAGE_SNAPSHOT: ${{ vars.ZIMAGE_SNAPSHOT }}
-      # Keep this A/B below the VAE tiling threshold so residency is the only mechanism that differs.
-      ZIMAGE_SEQ_SIZE: 512
+      # sc-18149: no ZIMAGE_SEQ_SIZE override. The lane used to pin 512, where the Sequential
+      # route's forced tiled decode degenerates to a single tile and reproduces the whole-image
+      # decode byte-for-byte (measured drift exactly 0) — which kept Exact green at the cell while
+      # the shipping 768²+ configuration drifted uncharacterized. The A/B now runs the test's 768²
+      # default, where tiling actually engages, under the declared drift tolerance; the in-test
+      # isolator leg (Resident + forced tiled decode) still pins residency staging itself to
+      # byte-exactness on every run.
       INFERENCE_REVISION: ${{ github.sha }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -1063,7 +1068,7 @@ jobs:
           set -o pipefail
           cargo test --locked --release -p mlx-gen-z-image \
             --test sequential_residency_real_weights \
-            sequential_bounds_peak_and_is_byte_identical -- --ignored --exact --test-threads=1 --nocapture \
+            sequential_bounds_peak_within_declared_decode_drift -- --ignored --exact --test-threads=1 --nocapture \
             2>&1 | tee "$MEMORY_EVIDENCE_LOG"
           python3.12 scripts/release/verify_model_snapshot.py \
             --model z-image-turbo \
@@ -1073,6 +1078,10 @@ jobs:
             echo "Z-Image snapshot content changed during the evidence run" >&2
             exit 1
           fi
+          # sc-18149: the Sequential route's forced tiled decode (sc-13571) makes Exact parity
+          # structurally unsatisfiable for this A/B; the adjudicated contract is the measured
+          # mean-abs drift ceiling the records declare, re-derived by the verifier from the two
+          # bound artifacts rather than trusted from the harness.
           python3.12 scripts/release/verify_residency_ab.py \
             --model z_image_turbo \
             --resident "$MEMORY_EVIDENCE_LOG" \
@@ -1082,6 +1091,7 @@ jobs:
             --expected-abi 3 \
             --expected-model-revision "$MEMORY_MODEL_REVISION" \
             --expected-model-inventory-sha256 "$MEMORY_MODEL_INVENTORY_SHA256" \
+            --expected-parity tolerance:mean_abs_u8_subpixel:4.0 \
             --resident-output "$MEMORY_EVIDENCE_OUTPUT_DIR/z_image_turbo-resident.rgb" \
             --sequential-output "$MEMORY_EVIDENCE_OUTPUT_DIR/z_image_turbo-staged.rgb" \
             | tee "$MEMORY_EVIDENCE_OUTPUT_DIR/verifier-result.txt"

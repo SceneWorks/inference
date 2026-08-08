@@ -34,6 +34,9 @@ STRATEGY_ORDER = {
     "bounded_transformer_residency": 4,
 }
 LOAD_SHAPES = {"eager_materialization", "deferred_materialization"}
+# Tolerance metrics this verifier can recompute from the two bound output artifacts. A lane may
+# only declare an expected tolerance over one of these (sc-18149).
+SUPPORTED_TOLERANCE_METRICS = {"mean_abs_u8_subpixel"}
 BACKENDS = {"candle", "mlx"}
 PRECISIONS = {"bf16", "fp32"}
 QUANTS = {None, "q4", "q8", "nvfp4"}
@@ -377,6 +380,50 @@ def _invariant_projection(record: EvidenceRecord) -> dict[str, Any]:
     }
 
 
+def parse_expected_parity(value: str) -> dict[str, Any]:
+    """Parse the lane's declared parity expectation.
+
+    ``exact`` (the default) or ``tolerance:<metric>:<maximum_error>`` — the lane pins the exact
+    contract the records must carry, so a harness cannot loosen its own bar by emitting a
+    self-serving contract (sc-18149). Only metrics this verifier can recompute from the two output
+    artifacts are accepted.
+    """
+    if value == "exact":
+        return {"kind": "exact"}
+    parts = value.split(":")
+    if len(parts) == 3 and parts[0] == "tolerance":
+        _, metric, maximum_error_text = parts
+        if metric not in SUPPORTED_TOLERANCE_METRICS:
+            raise RuntimeError(
+                f"expected-parity tolerance metric {metric!r} is not recomputable by this verifier"
+            )
+        try:
+            maximum_error = float(maximum_error_text)
+        except ValueError as error:
+            raise RuntimeError(
+                "expected-parity tolerance maximum_error must be a number"
+            ) from error
+        if not math.isfinite(maximum_error) or maximum_error < 0:
+            raise RuntimeError(
+                "expected-parity tolerance maximum_error must be finite and non-negative"
+            )
+        return {"kind": "tolerance", "metric": metric, "maximum_error": maximum_error}
+    raise RuntimeError(
+        "expected-parity must be 'exact' or 'tolerance:<metric>:<maximum_error>'"
+    )
+
+
+def _mean_abs_u8_subpixel(resident_bytes: bytes, sequential_bytes: bytes) -> float:
+    if len(resident_bytes) != len(sequential_bytes):
+        raise RuntimeError(
+            "resident and staged outputs differ in length; the drift metric is undefined"
+        )
+    if not resident_bytes:
+        raise RuntimeError("outputs are empty; the drift metric is undefined")
+    total = sum(abs(a - b) for a, b in zip(resident_bytes, sequential_bytes))
+    return total / len(resident_bytes)
+
+
 def verify(
     resident_log: Path,
     sequential_log: Path,
@@ -388,7 +435,8 @@ def verify(
     expected_model_inventory_sha256: str,
     resident_output: Path,
     sequential_output: Path,
-) -> tuple[int, int]:
+    expected_parity: dict[str, Any],
+) -> tuple[int, int, float | None]:
     if min_reduction_mib < 0:
         raise RuntimeError("minimum reduction MiB must be non-negative")
     if GIT_REVISION.fullmatch(expected_model_revision) is None:
@@ -399,16 +447,32 @@ def verify(
     sequential = read_record(sequential_log, "staged_residency")
     if _invariant_projection(resident) != _invariant_projection(sequential):
         raise RuntimeError("resident and staged records differ on a non-strategy A/B invariant")
-    resident_hash = hashlib.sha256(resident_output.read_bytes()).hexdigest()
-    sequential_hash = hashlib.sha256(sequential_output.read_bytes()).hexdigest()
+    resident_bytes = resident_output.read_bytes()
+    sequential_bytes = sequential_output.read_bytes()
+    resident_hash = hashlib.sha256(resident_bytes).hexdigest()
+    sequential_hash = hashlib.sha256(sequential_bytes).hexdigest()
     if resident_hash != resident.payload["output_sha256"]:
         raise RuntimeError("resident output SHA-256 does not match its evidence record")
     if sequential_hash != sequential.payload["output_sha256"]:
         raise RuntimeError("staged output SHA-256 does not match its evidence record")
-    if resident_hash != sequential_hash:
-        raise RuntimeError("resident and staged outputs violate exact parity")
-    if resident.payload["parity"] != {"kind": "exact"}:
-        raise RuntimeError("residency A/B requires an exact parity contract")
+    if resident.payload["parity"] != expected_parity:
+        raise RuntimeError(
+            "record parity contract does not match the parity contract this lane declares: "
+            f"expected {expected_parity!r}, found {resident.payload['parity']!r}"
+        )
+    drift: float | None = None
+    if expected_parity["kind"] == "exact":
+        if resident_hash != sequential_hash:
+            raise RuntimeError("resident and staged outputs violate exact parity")
+    else:
+        # Tolerance: recompute the declared metric from the bound artifacts themselves, so the
+        # ceiling is enforced by this verifier rather than trusted from the harness (sc-18149).
+        drift = _mean_abs_u8_subpixel(resident_bytes, sequential_bytes)
+        if drift > expected_parity["maximum_error"]:
+            raise RuntimeError(
+                f"resident and staged outputs drift {drift:.4f} mean_abs_u8_subpixel, above the "
+                f"declared tolerance {expected_parity['maximum_error']}"
+            )
     if resident.key["resolved_route"] != expected_route:
         raise RuntimeError(
             f"expected route {expected_route!r}, found {resident.key['resolved_route']!r}"
@@ -444,7 +508,7 @@ def verify(
             f"staged residency reduced peak by {reduction} bytes; required at least {minimum_bytes} "
             f"bytes (resident={resident_peak}, staged={sequential_peak})"
         )
-    return resident_peak, sequential_peak
+    return resident_peak, sequential_peak, drift
 
 
 def main() -> int:
@@ -459,8 +523,9 @@ def main() -> int:
     parser.add_argument("--expected-model-inventory-sha256", required=True)
     parser.add_argument("--resident-output", required=True, type=Path)
     parser.add_argument("--sequential-output", required=True, type=Path)
+    parser.add_argument("--expected-parity", default="exact")
     args = parser.parse_args()
-    resident, sequential = verify(
+    resident, sequential, drift = verify(
         args.resident,
         args.sequential,
         args.min_reduction_mib,
@@ -471,11 +536,13 @@ def main() -> int:
         args.expected_model_inventory_sha256,
         args.resident_output,
         args.sequential_output,
+        parse_expected_parity(args.expected_parity),
     )
+    drift_suffix = "" if drift is None else f" drift_mean_abs_u8={drift:.4f}"
     print(
         f"MEMORY_EVIDENCE_V1_RESULT model={args.model} verdict=pass "
         f"resident_peak_bytes={resident} staged_peak_bytes={sequential} "
-        f"reduction_bytes={resident - sequential}"
+        f"reduction_bytes={resident - sequential}{drift_suffix}"
     )
     return 0
 

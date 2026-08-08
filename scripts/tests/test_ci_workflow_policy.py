@@ -1286,7 +1286,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             ),
         )
 
-    def test_memory_evidence_v1_lane_is_exact_artifact_bound_and_operator_dispatched(self) -> None:
+    def test_memory_evidence_v1_lane_is_artifact_bound_tolerance_pinned_and_operator_dispatched(self) -> None:
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
         start = workflow.index("  mlx-memory-evidence-v1:")
         end = workflow.index("\n  mlx-llm:", start)
@@ -1300,7 +1300,10 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             job,
         )
         self.assertIn("INFERENCE_REVISION: ${{ github.sha }}", job)
-        self.assertIn("ZIMAGE_SEQ_SIZE: 512", job)
+        # sc-18149: the lane must NOT pin a sub-tiling geometry — 512 degenerates the
+        # Sequential tiled decode to a byte-exact single tile, dodging the drift the declared
+        # tolerance exists to bound.
+        self.assertNotIn("ZIMAGE_SEQ_SIZE:", job)
         self.assertIn('test "$(git rev-parse HEAD)" = "$INFERENCE_REVISION"', job)
         self.assertIn("git diff --quiet", job)
         self.assertIn("git diff --cached --quiet", job)
@@ -1321,13 +1324,15 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("MEMORY_MODEL_INVENTORY_AFTER", job)
         self.assertIn('cmp -s "$MEMORY_MODEL_INVENTORY" "$MEMORY_MODEL_INVENTORY_AFTER"', job)
         self.assertIn("--model z-image-turbo", job)
-        self.assertIn("sequential_bounds_peak_and_is_byte_identical", job)
+        self.assertIn("sequential_bounds_peak_within_declared_decode_drift", job)
         self.assertIn("--ignored --exact --test-threads=1 --nocapture", job)
         self.assertIn("set -o pipefail", job)
         self.assertIn("verify_residency_ab.py", job)
         self.assertIn("--min-reduction-mib 512", job)
         self.assertIn("--expected-fingerprint z-image-mlx-independent-materialization-v3", job)
         self.assertIn("--expected-abi 3", job)
+        # sc-18149: the lane pins the adjudicated tolerance contract from outside the harness.
+        self.assertIn("--expected-parity tolerance:mean_abs_u8_subpixel:4.0", job)
         self.assertIn("--expected-model-revision", job)
         self.assertIn("--expected-model-inventory-sha256", job)
         self.assertIn("z_image_turbo-resident.rgb", job)
