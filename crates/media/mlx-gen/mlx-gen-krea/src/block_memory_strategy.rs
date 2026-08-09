@@ -287,7 +287,26 @@ pub(crate) fn native_memory_strategy_contract(
             base_snapshot_dir.display()
         ))
     })?;
-    let transformer_bytes = projected_safetensors_bytes(dit_file, |tensor| {
+    let transformer_bytes = native_dit_transformer_bytes(provider_id, dit_file)?;
+    contract.asset_facts.transformer_bytes = transformer_bytes;
+    contract.asset_facts.base_bytes = contract
+        .asset_facts
+        .conditioning_bytes
+        .checked_add(transformer_bytes)
+        .and_then(|bytes| bytes.checked_add(contract.asset_facts.decoder_bytes))
+        .ok_or_else(|| CoreError::Msg("krea native resident byte sum overflow".to_owned()))?;
+    Ok(contract)
+}
+
+/// Resident bytes of a community single-file native DiT: I8 projections materialize to bf16, their
+/// scale/descriptor companion tensors are consumed and dropped, everything else is stored as-is.
+/// The SINGLE projection both native contracts read (the t2i one above and the pose-control one in
+/// `crate::memory_strategy`), so the two can never disagree about what a native file costs resident.
+pub(crate) fn native_dit_transformer_bytes(
+    provider_id: &str,
+    dit_file: &std::path::Path,
+) -> CoreResult<u64> {
+    projected_safetensors_bytes(dit_file, |tensor| {
         if tensor.name.ends_with(".weight_scale") || tensor.name.ends_with(".comfy_quant") {
             ResidentProjection::Omit
         } else if tensor.dtype == mlx_gen::gen_core::weightsmeta::Dtype::I8 {
@@ -301,15 +320,7 @@ pub(crate) fn native_memory_strategy_contract(
             "{provider_id}: native DiT asset facts for '{}': {error}",
             dit_file.display()
         ))
-    })?;
-    contract.asset_facts.transformer_bytes = transformer_bytes;
-    contract.asset_facts.base_bytes = contract
-        .asset_facts
-        .conditioning_bytes
-        .checked_add(transformer_bytes)
-        .and_then(|bytes| bytes.checked_add(contract.asset_facts.decoder_bytes))
-        .ok_or_else(|| CoreError::Msg("krea native resident byte sum overflow".to_owned()))?;
-    Ok(contract)
+    })
 }
 
 pub(crate) fn safety_check(

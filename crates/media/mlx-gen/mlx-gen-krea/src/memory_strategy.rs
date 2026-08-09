@@ -181,6 +181,67 @@ fn memory_strategy_contract_with_asset_facts(
     })
 }
 
+/// Exact contract for the community single-file DiT **pose-control** composition (the control twin of
+/// `crate::block_memory_strategy::native_memory_strategy_contract`): the imported DiT is read from
+/// `dit_file` (its native I8 projections are dequantized to bf16 at load, scale/descriptor tensors
+/// consumed and dropped), the text encoder and VAE come from the resident base tier, and the pose
+/// overlay loads dense — the native DiT is dense in memory, and a dense base carries a dense branch
+/// (`crate::memory::control_branch_quant_bits(None)`), so the overlay bytes are its stored bytes.
+/// Same `provider_id` + calibration fingerprint as the snapshot control contract, so promoted
+/// evidence keyed on the `krea_2_turbo_control` identity resolves for this composition through the
+/// same selectors (tier / geometry / load shape) rather than a bespoke imported identity.
+pub(crate) fn native_memory_strategy_contract(
+    provider_id: &str,
+    dit_file: &std::path::Path,
+    base_snapshot_dir: &std::path::Path,
+    control: &std::path::Path,
+) -> CoreResult<MemoryProviderContract> {
+    let stored = |path: &std::path::Path, what: &str| -> CoreResult<u64> {
+        projected_safetensors_bytes(path, |_| ResidentProjection::Stored).map_err(|error| {
+            CoreError::Msg(format!(
+                "{provider_id}: native {what} asset facts for '{}': {error}",
+                path.display()
+            ))
+        })
+    };
+    let conditioning_bytes = stored(&base_snapshot_dir.join("text_encoder"), "base text encoder")?;
+    let decoder_bytes = stored(&base_snapshot_dir.join("vae"), "base VAE")?;
+    let transformer_bytes =
+        crate::block_memory_strategy::native_dit_transformer_bytes(provider_id, dit_file)?;
+    let overlay_bytes = stored(control, "pose control overlay")?;
+    if overlay_bytes == 0 {
+        return Err(CoreError::Msg(format!(
+            "{provider_id}: pose control overlay '{}' contains no tensor bytes",
+            control.display()
+        )));
+    }
+    let resident_components = vec![MemoryResidentComponent {
+        id: "pose_control_branch".to_owned(),
+        kind: MemoryComponentKind::ControlBranch,
+        resident_bytes: overlay_bytes,
+        bounded_by: None,
+    }];
+    let asset_facts = MemoryAssetFacts {
+        base_bytes: conditioning_bytes
+            .saturating_add(transformer_bytes)
+            .saturating_add(decoder_bytes),
+        conditioning_bytes,
+        transformer_bytes,
+        decoder_bytes,
+        overlay_bytes,
+    };
+    // The native composition is Resident-only (the single-file DiT has no snapshot dir to re-load
+    // from), so the default spec below truthfully declares StagedResidency / windowing Missing.
+    let spec = LoadSpec::new(mlx_gen::WeightsSource::Dir(base_snapshot_dir.to_path_buf()));
+    memory_strategy_contract_with_asset_facts(
+        provider_id,
+        &spec,
+        asset_facts,
+        resident_components,
+        false,
+    )
+}
+
 fn streamable_base_transformer(spec: &LoadSpec, provider_id: &str) -> CoreResult<bool> {
     let mlx_gen::WeightsSource::Dir(root) = &spec.weights else {
         return Ok(false);
@@ -443,6 +504,67 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             write_control(&dir.join("model.safetensors"));
         }
+    }
+
+    #[test]
+    fn native_control_contract_keeps_the_builtin_provider_identity_and_components() {
+        // The imported single-file pose-control contract must resolve evidence through the SAME
+        // provider identity as the snapshot lane: same provider_id, same calibration fingerprint,
+        // same resident pose-branch component — never a bespoke "imported" identity that would
+        // orphan promoted evidence. Resident-only: no staged residency, no windowing.
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
+        write_snapshot(&root);
+        let dit = root.join("imported-dit.safetensors");
+        write_control(&dit);
+        let overlay = root.join("control.safetensors");
+        write_control(&overlay);
+
+        let contract =
+            native_memory_strategy_contract("krea_2_turbo_control", &dit, &root, &overlay).unwrap();
+        assert_eq!(contract.provider_id, "krea_2_turbo_control");
+        assert_eq!(
+            contract.calibration.as_ref().unwrap().fingerprint,
+            MEMORY_CALIBRATION_FINGERPRINT
+        );
+        let components = contract.resident_components();
+        assert_eq!(components.len(), 1);
+        assert_eq!(components[0].id, "pose_control_branch");
+        assert_eq!(components[0].kind, MemoryComponentKind::ControlBranch);
+        assert!(components[0].resident_bytes > 0);
+        // The transformer term is the native FILE's projection, not the base tier's transformer dir;
+        // the fixture stores one dense bf16 tensor, so projected == stored bytes.
+        assert_eq!(contract.asset_facts.transformer_bytes, 256);
+        assert_eq!(
+            contract.asset_facts.base_bytes,
+            contract.asset_facts.conditioning_bytes
+                + contract.asset_facts.transformer_bytes
+                + contract.asset_facts.decoder_bytes
+        );
+        assert_eq!(
+            contract
+                .capability(MemoryStrategy::StagedResidency)
+                .unwrap()
+                .support,
+            MemoryStrategySupport::Missing
+        );
+        assert_eq!(
+            contract
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .support,
+            MemoryStrategySupport::Missing
+        );
+        // A missing / zero-byte overlay is refused loudly — the branch is a REQUIRED component.
+        let missing = native_memory_strategy_contract(
+            "krea_2_turbo_control",
+            &dit,
+            &root,
+            &root.join("missing-control.safetensors"),
+        )
+        .expect_err("missing overlay must fail")
+        .to_string();
+        assert!(missing.contains("pose control overlay"), "got: {missing}");
     }
 
     #[test]
