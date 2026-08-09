@@ -895,15 +895,19 @@ mod first_step_repro {
     };
     use std::path::PathBuf;
 
-    /// The Z-Image-Turbo snapshot root from the required `ZIMAGE_SNAPSHOT` env var. sc-13668: there
+    /// The Z-Image-Turbo dense source root (a `SceneWorks/z-image-turbo-mlx` bf16 tier dir — the
+    /// re-host the MLX product path trains from, sc-18213) from the required
+    /// `MLX_GEN_ZIMAGE_SNAPSHOT` env var. sc-13668: there
     /// is no implicit default — the source snapshot path must be passed in explicitly.
     fn snapshot() -> Option<PathBuf> {
-        std::env::var("ZIMAGE_SNAPSHOT").ok().map(PathBuf::from)
+        std::env::var("MLX_GEN_ZIMAGE_SNAPSHOT")
+            .ok()
+            .map(PathBuf::from)
     }
 
     #[test]
     fn source_root_requires_explicit_env_no_default() {
-        let key = "ZIMAGE_SNAPSHOT";
+        let key = "MLX_GEN_ZIMAGE_SNAPSHOT";
         let saved = std::env::var(key).ok();
         std::env::remove_var(key);
         assert!(
@@ -1019,7 +1023,8 @@ mod first_step_repro {
     }
 
     fn build_trainer_and_adapter() -> (ZImageTurboTrainer, TrainAdapter, LoraParams, Array) {
-        let root = snapshot().expect("set ZIMAGE_SNAPSHOT to the Z-Image-Turbo snapshot root");
+        let root =
+            snapshot().expect("set MLX_GEN_ZIMAGE_SNAPSHOT to the Z-Image-Turbo snapshot root");
         let mut trainer = ZImageTurboTrainer {
             descriptor: trainer_descriptor(),
             tokenizer: crate::loader::load_tokenizer(&root).unwrap(),

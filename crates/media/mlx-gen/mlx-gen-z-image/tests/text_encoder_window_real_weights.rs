@@ -10,7 +10,7 @@
 //!    and a mutation check proves the measurement can tell the two apart.
 //!
 //! ```sh
-//! ZIMAGE_SNAPSHOT=<tier dir, e.g. …/q4> \
+//! MLX_GEN_ZIMAGE_SNAPSHOT=<tier dir, e.g. …/q4> \
 //!   cargo test -p mlx-gen-z-image --release --test text_encoder_window_real_weights \
 //!   -- --ignored --nocapture --test-threads=1
 //! ```
@@ -23,7 +23,7 @@ use mlx_gen_z_image::text_encoder::{TextEncoder, ZTextEncoderConfig};
 use mlx_rs::memory::{clear_cache, get_peak_memory, reset_peak_memory};
 use mlx_rs::Array;
 
-use common::snapshot;
+use common::tier_snapshot as snapshot;
 
 const PROMPT: &str = "A photorealistic portrait of an elderly lighthouse keeper on a weathered \
      stone pier at dawn, heavy wool coat soaked with sea spray, low coastal fog behind him";

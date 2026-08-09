@@ -1,10 +1,10 @@
 //! SC-15615 — the real-weight bounded-attention (ladder rung 3) A/B on the MLX Z-Image lane.
 //!
-//! `#[ignore]`d: needs a real Z-Image-Turbo snapshot (`ZIMAGE_SNAPSHOT`, a pre-quantized tier dir for
+//! `#[ignore]`d: needs a real Z-Image-Turbo snapshot (`MLX_GEN_ZIMAGE_SNAPSHOT`, a pre-quantized tier dir for
 //! q4/q8) and an Apple/Metal GPU. Run:
 //!
 //! ```text
-//! ZIMAGE_SNAPSHOT=<path to a Z-Image-Turbo snapshot, or its q4/q8 tier subdirectory> \
+//! MLX_GEN_ZIMAGE_SNAPSHOT=<path to a Z-Image-Turbo snapshot, or its q4/q8 tier subdirectory> \
 //!   cargo test -p mlx-gen-z-image --release --test bounded_attention_real_weights -- --ignored --nocapture
 //! ```
 //!
@@ -50,7 +50,7 @@
 
 mod common;
 
-use common::snapshot;
+use common::tier_snapshot as snapshot;
 use mlx_gen::gen_core::GenerationMemory;
 use mlx_gen::{
     CancelFlag, GenerationOutput, GenerationRequest, Image, LoadSpec, OffloadPolicy, Progress,
