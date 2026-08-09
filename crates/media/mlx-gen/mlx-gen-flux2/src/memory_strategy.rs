@@ -1,9 +1,11 @@
-//! FLUX.2-dev edit's provider-side memory-safety contract.
+//! FLUX.2-dev provider-side memory-safety contracts.
 //!
-//! The provider already bounds long multi-reference sequences internally with `MemoryConfig::LONG_SEQ`.
-//! SceneWorks supplies request geometry, numeric tier, incremental live demand derived from the
-//! evidence-owned absolute peak, and the live unified-memory budget. This module validates the
-//! provider route and tier, then delegates the canonical budget comparison to `gen-core`;
+//! Text-to-image and edit share weights and the resident execution path, but they are distinct
+//! provider registrations with distinct route gates and calibration identities. The edit provider
+//! already bounds long multi-reference sequences internally with `MemoryConfig::LONG_SEQ`.
+//! SceneWorks supplies request geometry, numeric tier, incremental live demand derived from each
+//! route's evidence-owned absolute peak, and the live unified-memory budget. This module validates
+//! the exact provider route and tier, then delegates the canonical budget comparison to `gen-core`;
 //! calibration coefficients never live in a provider.
 
 use mlx_gen::attention::{AttentionBudget, AttentionPlan};
@@ -18,14 +20,18 @@ use mlx_gen::gen_core::{
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::{GenerationRequest, OffloadPolicy, WeightsSource};
 
-use crate::config::{Flux2Variant, FLUX2_DEV_EDIT_ID};
+use crate::config::{Flux2Variant, FLUX2_DEV_EDIT_ID, FLUX2_DEV_ID};
 
 pub const CALIBRATION_FINGERPRINT: &str = "sc-16593-flux2-dev-edit-evidence-v2";
+pub const DEV_T2I_CALIBRATION_FINGERPRINT: &str = "sc-18218-flux2-dev-t2i-resident-evidence-v1";
 
 pub fn contract_for_variant(
     variant: Flux2Variant,
     spec: &LoadSpec,
 ) -> mlx_gen::Result<Option<MemoryProviderContract>> {
+    if variant == Flux2Variant::Dev {
+        return Ok(Some(build_dev_t2i_contract()));
+    }
     if variant == Flux2Variant::DevEdit {
         return Ok(Some(build_contract()));
     }
@@ -62,6 +68,54 @@ fn build_contract() -> MemoryProviderContract {
         }
     }
     contract
+}
+
+fn build_dev_t2i_contract() -> MemoryProviderContract {
+    let mut contract = MemoryProviderContract::compatibility_default(
+        FLUX2_DEV_ID,
+        MemoryBackendRealization::MlxMetal {
+            bounded_wired_residency: false,
+            lazy_or_mmap_materialization: true,
+            explicit_evaluation_and_synchronization: true,
+            cache_eviction: true,
+        },
+    );
+    contract.load_shape = LoadShape::EagerMaterialization;
+    contract.formula = MemoryFormulaKind::Affine {
+        variables: vec![
+            MemoryFormulaVariable::PixelCount,
+            MemoryFormulaVariable::ConditioningTokenCount,
+        ],
+    };
+    contract.calibration = Some(MemoryCalibrationIdentity::new(
+        DEV_T2I_CALIBRATION_FINGERPRINT,
+        LoadShape::EagerMaterialization,
+    ));
+    contract
+}
+
+pub fn dev_t2i_safety_check(
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    expected_tier: MemoryNumericTier,
+) -> MemorySafetyDecision {
+    let route_gate = || {
+        if context.mode != MemoryMode::TextToImage
+            || context.has_reference
+            || context.geometry.reference_count != 0
+        {
+            return Err(CoreError::Unsupported(format!(
+                "{FLUX2_DEV_ID}: memory-safety context must describe reference-free text-to-image"
+            )));
+        }
+        if expected_tier.quant == Some(Quant::Nvfp4) {
+            return Err(CoreError::Unsupported(format!(
+                "{FLUX2_DEV_ID}: NVFP4 is not implemented by the MLX provider"
+            )));
+        }
+        Ok(())
+    };
+    standard_memory_strategy_safety_check(contract, context, Some(expected_tier), Some(&route_gate))
 }
 
 pub fn safety_check(
@@ -137,6 +191,28 @@ pub fn registered_dev_safety_check(
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
     safety_check(
+        contract,
+        context,
+        MemoryNumericTier {
+            precision: spec.precision,
+            quant: spec.quantize,
+            component_precision_floors: &[],
+        },
+    )
+}
+
+pub fn registered_dev_t2i_contract(
+    _spec: &LoadSpec,
+) -> mlx_gen::gen_core::Result<MemoryProviderContract> {
+    Ok(build_dev_t2i_contract())
+}
+
+pub fn registered_dev_t2i_safety_check(
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> MemorySafetyDecision {
+    dev_t2i_safety_check(
         contract,
         context,
         MemoryNumericTier {
@@ -660,6 +736,122 @@ mod tests {
             cache_state: MemoryCacheState::Cold,
             evidence_revision: "worker-owned-exact-evidence".to_owned(),
         }
+    }
+
+    fn dev_t2i_context(total_gb: f64) -> MemoryRunContext {
+        let contract = build_dev_t2i_contract();
+        let calibration = contract.calibration.expect("calibration");
+        let mut context = context(total_gb);
+        context.calibration_abi = calibration.abi;
+        context.calibration_fingerprint = calibration.fingerprint;
+        context.load_shape = calibration.load_shape;
+        context.mode = MemoryMode::TextToImage;
+        context.has_reference = false;
+        context.geometry.reference_count = 0;
+        context.predicted_peak_bytes = context.budget.total_bytes;
+        context
+    }
+
+    #[test]
+    fn dev_t2i_contract_is_distinct_conforming_and_resident_only() {
+        let t2i = build_dev_t2i_contract();
+        let edit = build_contract();
+
+        assert_eq!(t2i.provider_id, FLUX2_DEV_ID);
+        assert_eq!(edit.provider_id, FLUX2_DEV_EDIT_ID);
+        assert_eq!(
+            t2i.calibration.as_ref().unwrap().fingerprint,
+            DEV_T2I_CALIBRATION_FINGERPRINT
+        );
+        assert_ne!(t2i.calibration, edit.calibration);
+        assert!(t2i.conformance_errors().is_empty());
+        assert!(t2i.strategies.iter().all(|capability| {
+            capability.strategy == MemoryStrategy::Resident
+                && capability.support == MemoryStrategySupport::Implemented
+                || capability.strategy != MemoryStrategy::Resident
+                    && capability.support == MemoryStrategySupport::Missing
+        }));
+
+        let mut non_resident = dev_t2i_context(96.0);
+        non_resident.selection.strategy = MemoryStrategy::StagedResidency;
+        let MemorySafetyDecision::Reject { reason } =
+            dev_t2i_safety_check(&t2i, &non_resident, non_resident.selection.tier)
+        else {
+            panic!("a missing non-resident rung must reject");
+        };
+        assert!(
+            reason.contains("cannot execute StagedResidency"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn dev_t2i_route_gate_accepts_only_reference_free_text_to_image() {
+        let contract = build_dev_t2i_contract();
+        let exact = dev_t2i_context(96.0);
+        assert_eq!(
+            dev_t2i_safety_check(&contract, &exact, exact.selection.tier),
+            MemorySafetyDecision::Accept
+        );
+
+        let mut edit_shaped = exact.clone();
+        edit_shaped.mode = MemoryMode::Edit;
+        edit_shaped.has_reference = true;
+        edit_shaped.geometry.reference_count = 2;
+        let MemorySafetyDecision::Reject { reason } =
+            dev_t2i_safety_check(&contract, &edit_shaped, edit_shaped.selection.tier)
+        else {
+            panic!("the edit route must not inherit the T2I contract");
+        };
+        assert!(reason.contains("reference-free text-to-image"), "{reason}");
+
+        let mut referenced_t2i = exact.clone();
+        referenced_t2i.has_reference = true;
+        referenced_t2i.geometry.reference_count = 1;
+        let MemorySafetyDecision::Reject { reason } =
+            dev_t2i_safety_check(&contract, &referenced_t2i, referenced_t2i.selection.tier)
+        else {
+            panic!("a referenced request must not enter the base T2I evidence lane");
+        };
+        assert!(reason.contains("reference-free text-to-image"), "{reason}");
+    }
+
+    #[test]
+    fn dev_t2i_handshake_numeric_tier_and_quantization_fail_closed() {
+        let contract = build_dev_t2i_contract();
+        let exact = dev_t2i_context(96.0);
+
+        let mut stale = exact.clone();
+        stale.calibration_fingerprint = "stale-flux2-dev-t2i".to_owned();
+        let MemorySafetyDecision::Reject { reason } =
+            dev_t2i_safety_check(&contract, &stale, stale.selection.tier)
+        else {
+            panic!("stale T2I evidence must reject");
+        };
+        assert!(
+            reason.contains("calibration handshake mismatch"),
+            "{reason}"
+        );
+
+        let q8 = MemoryNumericTier {
+            precision: Precision::Bf16,
+            quant: Some(Quant::Q8),
+            component_precision_floors: &[],
+        };
+        let MemorySafetyDecision::Reject { reason } = dev_t2i_safety_check(&contract, &exact, q8)
+        else {
+            panic!("the selected tier must match the loaded T2I artifact");
+        };
+        assert!(reason.contains("does not match loaded tier"), "{reason}");
+
+        let mut nvfp4 = exact;
+        nvfp4.selection.tier.quant = Some(Quant::Nvfp4);
+        let MemorySafetyDecision::Reject { reason } =
+            dev_t2i_safety_check(&contract, &nvfp4, nvfp4.selection.tier)
+        else {
+            panic!("the unwired NVFP4 tier must reject");
+        };
+        assert!(reason.contains("NVFP4 is not implemented"), "{reason}");
     }
 
     #[test]
