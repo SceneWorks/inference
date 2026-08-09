@@ -168,6 +168,102 @@ expected_files = [
     "q4/vae/diffusion_pytorch_model.safetensors",
 ]
 
+# sc-18213 (epic 18093) — `SceneWorks/flux2-dev-mlx`, the re-host `mlx-gen-flux2`'s DEV engine
+# actually loads (`MLX_GEN_FLUX2_DEV_SNAPSHOT` points one level in, at a tier dir). NOT the klein
+# entry above: klein is a different model in the same family, and its key matching "flux2" in a
+# grep is exactly how this artifact went unbound. The repo ships three self-contained
+# diffusers-layout tiers; the epic-18093 right-size calibration measures per artifact x tier and
+# each tier is provisioned independently (q8 alone is ~57 GiB), so the binding is keyed per tier —
+# the flux2-klein-9b-mlx-q4 shape — rather than one key whose `expected_files` would demand all
+# ~150 GiB of siblings on disk before any single tier's capture could bind evidence. All three
+# keys share one repository + revision; `verify_model_snapshot.py --inventory-output` still
+# inventories sibling tiers when present, so a multi-tier snapshot changes the inventory sha
+# rather than silently reusing a single-tier one.
+[[models]]
+key = "flux2-dev-mlx-bf16"
+repository = "SceneWorks/flux2-dev-mlx"
+revision = "2868b1461b2b6e6e05d84e52534df3632b4c7d5d"
+license = "FLUX.2-dev Non-Commercial License"
+size_class = "very-large"
+profiles = ["media-macos"]
+environment = ["MLX_GEN_FLUX2_DEV_SNAPSHOT"]
+unwired_reason = "operator-run epic-18093 right-size calibration on authoritative Apple hardware; pinned to bind capture evidence to exact weights (sc-18213), no CI lane dispatches the flux2 dev-tier harnesses"
+download_files = ["bf16/*"]
+expected_files = [
+    "bf16/LICENSE.md",
+    "bf16/model_index.json",
+    "bf16/scheduler/scheduler_config.json",
+    "bf16/text_encoder/config.json",
+    "bf16/text_encoder/generation_config.json",
+    "bf16/text_encoder/model.safetensors.index.json",
+    "bf16/tokenizer/chat_template.jinja",
+    "bf16/tokenizer/preprocessor_config.json",
+    "bf16/tokenizer/processor_config.json",
+    "bf16/tokenizer/special_tokens_map.json",
+    "bf16/tokenizer/tokenizer.json",
+    "bf16/tokenizer/tokenizer_config.json",
+    "bf16/transformer/config.json",
+    "bf16/transformer/diffusion_pytorch_model.safetensors.index.json",
+    "bf16/vae/config.json",
+    "bf16/vae/diffusion_pytorch_model.safetensors",
+]
+
+[[models]]
+key = "flux2-dev-mlx-q8"
+repository = "SceneWorks/flux2-dev-mlx"
+revision = "2868b1461b2b6e6e05d84e52534df3632b4c7d5d"
+license = "FLUX.2-dev Non-Commercial License"
+size_class = "very-large"
+profiles = ["media-macos"]
+environment = ["MLX_GEN_FLUX2_DEV_SNAPSHOT"]
+unwired_reason = "operator-run epic-18093 right-size calibration on authoritative Apple hardware; pinned to bind capture evidence to exact weights (sc-18213), no CI lane dispatches the flux2 dev-tier harnesses"
+download_files = ["q8/*"]
+expected_files = [
+    "q8/LICENSE.md",
+    "q8/model_index.json",
+    "q8/scheduler/scheduler_config.json",
+    "q8/text_encoder/config.json",
+    "q8/text_encoder/model.safetensors",
+    "q8/tokenizer/chat_template.jinja",
+    "q8/tokenizer/preprocessor_config.json",
+    "q8/tokenizer/processor_config.json",
+    "q8/tokenizer/special_tokens_map.json",
+    "q8/tokenizer/tokenizer.json",
+    "q8/tokenizer/tokenizer_config.json",
+    "q8/transformer/config.json",
+    "q8/transformer/diffusion_pytorch_model.safetensors",
+    "q8/vae/config.json",
+    "q8/vae/diffusion_pytorch_model.safetensors",
+]
+
+[[models]]
+key = "flux2-dev-mlx-q4"
+repository = "SceneWorks/flux2-dev-mlx"
+revision = "2868b1461b2b6e6e05d84e52534df3632b4c7d5d"
+license = "FLUX.2-dev Non-Commercial License"
+size_class = "very-large"
+profiles = ["media-macos"]
+environment = ["MLX_GEN_FLUX2_DEV_SNAPSHOT"]
+unwired_reason = "operator-run epic-18093 right-size calibration on authoritative Apple hardware; pinned to bind capture evidence to exact weights (sc-18213), no CI lane dispatches the flux2 dev-tier harnesses"
+download_files = ["q4/*"]
+expected_files = [
+    "q4/LICENSE.md",
+    "q4/model_index.json",
+    "q4/scheduler/scheduler_config.json",
+    "q4/text_encoder/config.json",
+    "q4/text_encoder/model.safetensors",
+    "q4/tokenizer/chat_template.jinja",
+    "q4/tokenizer/preprocessor_config.json",
+    "q4/tokenizer/processor_config.json",
+    "q4/tokenizer/special_tokens_map.json",
+    "q4/tokenizer/tokenizer.json",
+    "q4/tokenizer/tokenizer_config.json",
+    "q4/transformer/config.json",
+    "q4/transformer/diffusion_pytorch_model.safetensors",
+    "q4/vae/config.json",
+    "q4/vae/diffusion_pytorch_model.safetensors",
+]
+
 [[models]]
 # sc-17284 — what `mlx-gen-qwen-image` ACTUALLY loads. The engine never reads `Qwen/Qwen-Image`
 # above: every real-weight test takes a tier directory of this SceneWorks MLX re-host, whose q4/q8
@@ -537,6 +633,89 @@ expected_files = [
     "tokenizer/tokenizer.json",
     "transformer/diffusion_pytorch_model.safetensors.index.json",
     "vae/diffusion_pytorch_model.safetensors",
+]
+
+# sc-18213 (epic 18093) — `SceneWorks/z-image-turbo-mlx`, the pre-quantized MLX re-host of the
+# torch original pinned directly above. The `mlx-gen-z-image` real-weight tests read the SAME
+# `ZIMAGE_SNAPSHOT` name for both artifacts (a tier dir here, the torch snapshot root there) — so
+# these keys declare that name and the wiring gate reads them as wired, but the wiring rides the
+# memory-evidence-v1 lane, which materializes and verifies the `z-image-turbo` TORCH entry, never
+# this re-host. These keys are operator-run epic-18093 right-size calibration bindings
+# (mlx:z_image_turbo is the #2 provider by widened admission surface); an `unwired_reason` cannot
+# record that here because the gate rejects an exemption on a referenced name. Keyed per tier —
+# each tier subdir is a complete diffusers-layout snapshot and each rung of the calibration ladder
+# verifies its own tier without requiring the ~19 GiB-per-tier siblings on disk. All three keys
+# share one repository + revision.
+[[models]]
+key = "z-image-turbo-mlx-bf16"
+repository = "SceneWorks/z-image-turbo-mlx"
+revision = "bb2bc9893b3c49ae96c813350775f791a2e8bc80"
+license = "Apache-2.0"
+size_class = "very-large"
+profiles = ["media-macos"]
+environment = ["ZIMAGE_SNAPSHOT"]
+download_files = ["bf16/*"]
+expected_files = [
+    "bf16/model_index.json",
+    "bf16/scheduler/scheduler_config.json",
+    "bf16/text_encoder/config.json",
+    "bf16/text_encoder/model.safetensors",
+    "bf16/tokenizer/merges.txt",
+    "bf16/tokenizer/tokenizer.json",
+    "bf16/tokenizer/tokenizer_config.json",
+    "bf16/tokenizer/vocab.json",
+    "bf16/transformer/config.json",
+    "bf16/transformer/model.safetensors",
+    "bf16/vae/config.json",
+    "bf16/vae/model.safetensors",
+]
+
+[[models]]
+key = "z-image-turbo-mlx-q8"
+repository = "SceneWorks/z-image-turbo-mlx"
+revision = "bb2bc9893b3c49ae96c813350775f791a2e8bc80"
+license = "Apache-2.0"
+size_class = "very-large"
+profiles = ["media-macos"]
+environment = ["ZIMAGE_SNAPSHOT"]
+download_files = ["q8/*"]
+expected_files = [
+    "q8/model_index.json",
+    "q8/scheduler/scheduler_config.json",
+    "q8/text_encoder/config.json",
+    "q8/text_encoder/model.safetensors",
+    "q8/tokenizer/merges.txt",
+    "q8/tokenizer/tokenizer.json",
+    "q8/tokenizer/tokenizer_config.json",
+    "q8/tokenizer/vocab.json",
+    "q8/transformer/config.json",
+    "q8/transformer/model.safetensors",
+    "q8/vae/config.json",
+    "q8/vae/model.safetensors",
+]
+
+[[models]]
+key = "z-image-turbo-mlx-q4"
+repository = "SceneWorks/z-image-turbo-mlx"
+revision = "bb2bc9893b3c49ae96c813350775f791a2e8bc80"
+license = "Apache-2.0"
+size_class = "very-large"
+profiles = ["media-macos"]
+environment = ["ZIMAGE_SNAPSHOT"]
+download_files = ["q4/*"]
+expected_files = [
+    "q4/model_index.json",
+    "q4/scheduler/scheduler_config.json",
+    "q4/text_encoder/config.json",
+    "q4/text_encoder/model.safetensors",
+    "q4/tokenizer/merges.txt",
+    "q4/tokenizer/tokenizer.json",
+    "q4/tokenizer/tokenizer_config.json",
+    "q4/tokenizer/vocab.json",
+    "q4/transformer/config.json",
+    "q4/transformer/model.safetensors",
+    "q4/vae/config.json",
+    "q4/vae/model.safetensors",
 ]
 
 [[models]]
@@ -1343,6 +1522,87 @@ expected_files = [
     "q4/t5_encoder.safetensors",
     "q4/tokenizer.json",
     "q4/vae.safetensors",
+]
+
+# sc-18213 (epic 18093) — `SceneWorks/krea-2-turbo-mlx`, the Krea 2 Turbo IMAGE re-host
+# `mlx-gen-krea` actually loads (`KREA_TURBO_DIR` points one level in, at a tier dir). NOT related
+# to `krea-realtime-14b-mlx` above beyond the vendor name: that is a Wan-2.1 video model. The repo
+# ships three self-contained diffusers-layout tiers; the epic-18093 right-size calibration measures
+# per artifact x tier and each tier is provisioned independently (bf16 alone is ~33 GiB), so the
+# binding is keyed per tier — the flux2-klein-9b-mlx-q4 shape. All three keys share one
+# repository + revision; sibling tiers present on disk are still inventoried by
+# `verify_model_snapshot.py --inventory-output`, so a multi-tier snapshot changes the inventory
+# sha rather than silently reusing a single-tier one.
+[[models]]
+key = "krea-2-turbo-mlx-bf16"
+repository = "SceneWorks/krea-2-turbo-mlx"
+revision = "d009674080cc1bccf2b629d834c34bf5eccdb723"
+license = "Krea 2 Community License"
+size_class = "very-large"
+profiles = ["media-macos"]
+environment = ["KREA_TURBO_DIR"]
+unwired_reason = "operator-run epic-18093 right-size calibration on authoritative Apple hardware; pinned to bind capture evidence to exact weights (sc-18213), no CI lane dispatches the krea-2-turbo harnesses"
+download_files = ["bf16/*"]
+expected_files = [
+    "bf16/model_index.json",
+    "bf16/scheduler/scheduler_config.json",
+    "bf16/text_encoder/config.json",
+    "bf16/text_encoder/model.safetensors",
+    "bf16/tokenizer/chat_template.jinja",
+    "bf16/tokenizer/tokenizer.json",
+    "bf16/tokenizer/tokenizer_config.json",
+    "bf16/transformer/config.json",
+    "bf16/transformer/diffusion_pytorch_model.safetensors.index.json",
+    "bf16/vae/config.json",
+    "bf16/vae/diffusion_pytorch_model.safetensors",
+]
+
+[[models]]
+key = "krea-2-turbo-mlx-q8"
+repository = "SceneWorks/krea-2-turbo-mlx"
+revision = "d009674080cc1bccf2b629d834c34bf5eccdb723"
+license = "Krea 2 Community License"
+size_class = "very-large"
+profiles = ["media-macos"]
+environment = ["KREA_TURBO_DIR"]
+unwired_reason = "operator-run epic-18093 right-size calibration on authoritative Apple hardware; pinned to bind capture evidence to exact weights (sc-18213), no CI lane dispatches the krea-2-turbo harnesses"
+download_files = ["q8/*"]
+expected_files = [
+    "q8/model_index.json",
+    "q8/scheduler/scheduler_config.json",
+    "q8/text_encoder/config.json",
+    "q8/text_encoder/model.safetensors",
+    "q8/tokenizer/chat_template.jinja",
+    "q8/tokenizer/tokenizer.json",
+    "q8/tokenizer/tokenizer_config.json",
+    "q8/transformer/config.json",
+    "q8/transformer/diffusion_pytorch_model.safetensors",
+    "q8/vae/config.json",
+    "q8/vae/diffusion_pytorch_model.safetensors",
+]
+
+[[models]]
+key = "krea-2-turbo-mlx-q4"
+repository = "SceneWorks/krea-2-turbo-mlx"
+revision = "d009674080cc1bccf2b629d834c34bf5eccdb723"
+license = "Krea 2 Community License"
+size_class = "very-large"
+profiles = ["media-macos"]
+environment = ["KREA_TURBO_DIR"]
+unwired_reason = "operator-run epic-18093 right-size calibration on authoritative Apple hardware; pinned to bind capture evidence to exact weights (sc-18213), no CI lane dispatches the krea-2-turbo harnesses"
+download_files = ["q4/*"]
+expected_files = [
+    "q4/model_index.json",
+    "q4/scheduler/scheduler_config.json",
+    "q4/text_encoder/config.json",
+    "q4/text_encoder/model.safetensors",
+    "q4/tokenizer/chat_template.jinja",
+    "q4/tokenizer/tokenizer.json",
+    "q4/tokenizer/tokenizer_config.json",
+    "q4/transformer/config.json",
+    "q4/transformer/diffusion_pytorch_model.safetensors",
+    "q4/vae/config.json",
+    "q4/vae/diffusion_pytorch_model.safetensors",
 ]
 
 [[models]]
