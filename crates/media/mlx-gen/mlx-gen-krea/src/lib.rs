@@ -75,7 +75,9 @@ pub use model::{
     load_turbo_edit, raw_descriptor, turbo_edit_descriptor, Krea, KREA_2_EDIT_ID, KREA_2_RAW_ID,
     KREA_2_TURBO_EDIT_ID, KREA_2_TURBO_ID, RES_MULTIPLE,
 };
-pub use model_control::{KreaTurboControl, KREA_2_TURBO_CONTROL_ID};
+pub use model_control::{
+    load_control_from_native_dit_file, KreaTurboControl, KREA_2_TURBO_CONTROL_ID,
+};
 pub use multiphase::{
     any_phase_uses_cfg, phase_spec_subset, phase_uses_cfg, resolve_phase_adapters,
     resolve_phase_slices, resolve_phases, total_phase_steps, PhaseSlice, ResolvedPhase,
