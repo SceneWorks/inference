@@ -1051,14 +1051,28 @@ jobs:
           # the five-latent resample that owns the 6.0 ceiling, then the published-domain sweep
           # that bounds every published edge, pins the drift/peak monotonicity, and records the
           # out-of-domain overlap refusals (an admitted probe row asserts the same ceiling).
-          cargo test --locked --release -p mlx-gen-sana \
+          #
+          # Each invocation must prove it ran EXACTLY ONE passing test. A rename, a filter typo,
+          # or a lost `#[ignore]` all produce "0 passed" and exit 0 — a lane that is fully green
+          # while enforcing nothing (the sc-15520 review-round-2 guard the sibling ladder lanes
+          # carry). Per invocation rather than aggregate, so one invocation matching two tests
+          # can never cover for the other matching none.
+          out="$(cargo test --locked --release -p mlx-gen-sana \
             --test memory_ladder_real_weights \
             the_tiled_decode_drift_is_resampled_across_production_latents -- --ignored --exact --test-threads=1 --nocapture \
-            2>&1 | tee "$SANA_DRIFT_LOG"
-          cargo test --locked --release -p mlx-gen-sana \
+            2>&1 | tee "$SANA_DRIFT_LOG" /dev/stderr)"
+          if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
+            echo "::error::the resample test did not run exactly one passing test — a rename or a filter typo would make this step vacuously green" >&2
+            exit 1
+          fi
+          out="$(cargo test --locked --release -p mlx-gen-sana \
             --test memory_ladder_real_weights \
             the_published_decode_tile_domain_is_swept_against_the_whole_image_decode -- --ignored --exact --test-threads=1 --nocapture \
-            2>&1 | tee -a "$SANA_DRIFT_LOG"
+            2>&1 | tee -a "$SANA_DRIFT_LOG" /dev/stderr)"
+          if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
+            echo "::error::the domain sweep did not run exactly one passing test — a rename or a filter typo would make this step vacuously green" >&2
+            exit 1
+          fi
           python3.12 scripts/release/verify_model_snapshot.py \
             --model sana-1600m-mlx \
             --snapshot "$SANA_LADDER_1600M" \

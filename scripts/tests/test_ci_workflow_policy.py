@@ -1400,6 +1400,17 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             "the_published_decode_tile_domain_is_swept_against_the_whole_image_decode", job
         )
         self.assertEqual(job.count("--ignored --exact --test-threads=1 --nocapture"), 2)
+        # Each invocation must PROVE it ran exactly one passing test. `cargo test` exits 0 when
+        # a filter matches nothing, so a Rust-side rename or a lost `#[ignore]` would leave the
+        # YAML names (and every pin above) green while the lane enforces nothing — the sc-15520
+        # review-round-2 guard the sibling ladder lanes carry. Per invocation, not aggregate:
+        # exactly one guard per cargo run, so one invocation matching two tests can never cover
+        # for the other matching none.
+        self.assertEqual(job.count('grep -qE "test result: ok\\. 1 passed"'), 2)
+        self.assertEqual(
+            job.count("cargo test"),
+            job.count('grep -qE "test result: ok\\. 1 passed"'),
+        )
         self.assertIn("set -o pipefail", job)
         # The sc-17863 verdict was made with eyes on the renders; the lane must keep producing
         # them per run rather than leaving that evidence on one dev Mac.
