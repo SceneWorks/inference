@@ -1319,6 +1319,68 @@ mod tests {
         );
     }
 
+    /// **sc-15325 — the LTX temporal candidate grid can no longer starve the decoder.**
+    ///
+    /// `LTX_VAE_TEMPORAL_FR` holds `(48, 16)` and `(24, 8)`, which at the LTX VAE's `temporal_scale`
+    /// of 8 are latent tiles of **6** and **3**. gen-core's `MIN_TEMPORAL_TILE_LATENT_FRAMES` floor
+    /// removes both from the selectable set; this pins that across a budget sweep rather than at one
+    /// point, and pins that the decode stays *feasible* afterwards (the savings move to the spatial
+    /// axis) — removing candidates must not turn a working decode into an over-budget error.
+    ///
+    /// ⚠️ **This is a quality improvement on LTX, not a defect fix.** The z16 VAE collapses at a
+    /// starved temporal tile (24.4/255 vs single-pass, 30.8 % of a worst frame blown to white); LTX was
+    /// measured the same way (`tests/vae_decode_tiling_parity.rs`) and **did not reproduce that** — its
+    /// worst candidate read 1.73/255 with 0.00 % clipping. The floor is applied here because latent
+    /// 3 → 8 buys 6.6× less error for 17 % more decode peak, which is worth having and not worth a
+    /// second policy.
+    ///
+    /// ⚠️ **Scope of that clearing.** The numbers above are a **dated snapshot** (2026-07, one host,
+    /// q8, one source clip); the *asserted* contract is the **ratio**, gated in
+    /// `tests/vae_decode_tiling_parity.rs`. And the clearing is **empirical, at one bucket, with the
+    /// mechanism unexplained**: 640×384 × 89 frames never tiles in production (single-pass peaks
+    /// ~10.7 GiB, so this planner returns `Ok(None)` there and the test forces the config by hand),
+    /// and that test's source amplitudes never approach the clip threshold, so its 0.00 % clipping is
+    /// partly structural. The causal-tiling explanation originally offered does **not** hold —
+    /// `causal_temporal` is also true for Wan z48, and z16 at matched effective context is still 3.7×
+    /// worse than LTX. Do not generalise "LTX was fine" to any other VAE, causal or not.
+    ///
+    /// Red before the fix: at the tighter budgets the selector reached straight for `(24, 8)`.
+    #[test]
+    fn ltx_tiling_never_selects_a_starved_temporal_tile() {
+        use mlx_gen::tiling::{MIN_TEMPORAL_TILE_LATENT_FRAMES, MIN_TEMPORAL_TILE_LATENT_OVERLAP};
+        let scale = VaeTiling::LTX.temporal_scale;
+        for (w, h, f) in [
+            (1280, 704, 121),
+            (1280, 720, 121),
+            (768, 512, 241),
+            (1920, 1088, 121),
+        ] {
+            for safe in [12.0f64, 20.0, 32.0, 48.0, 96.0] {
+                let Ok(Some(cfg)) = plan_ltx_tiling(h, w, f, safe) else {
+                    continue; // infeasible or single-pass — neither can starve a tile.
+                };
+                let Some(t) = cfg.temporal else { continue };
+                let lat = t.tile_frames / scale;
+                assert!(
+                    lat >= MIN_TEMPORAL_TILE_LATENT_FRAMES,
+                    "{w}x{h}x{f} @ {safe} GiB: selected a {lat}-latent-frame LTX temporal tile \
+                     ({} output frames) — sc-15325's receptive-field floor",
+                    t.tile_frames
+                );
+                assert!(
+                    (t.overlap_frames / scale).min(lat - 1) >= MIN_TEMPORAL_TILE_LATENT_OVERLAP,
+                    "{w}x{h}x{f} @ {safe} GiB: latent overlap under the blend floor"
+                );
+            }
+        }
+        // ...and the shipped envelope is still plannable at a small-Mac budget: removing candidates
+        // must not turn a working decode into an over-budget error.
+        for (w, h, f) in [(1280, 704, 121), (768, 512, 241)] {
+            plan_ltx_tiling(h, w, f, 12.0)
+                .unwrap_or_else(|e| panic!("{w}x{h}x{f} became infeasible at 12 GiB: {e}"));
+        }
+    }
+
     #[test]
     fn ltx_tiling_errors_when_unfittable() {
         // 4K × 257 frames under an 8 GiB budget: the output accumulators (+ fixed floor) alone blow it
