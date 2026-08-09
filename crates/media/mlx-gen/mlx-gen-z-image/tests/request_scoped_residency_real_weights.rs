@@ -1,14 +1,14 @@
 //! SC-15806 real-weight proof for one generator serving a mixed warm/staged request sequence.
 //!
 //! ```text
-//! ZIMAGE_SNAPSHOT=<q4 tier dir> ZIMAGE_SIZE=512 ZIMAGE_STEPS=1 \
+//! MLX_GEN_ZIMAGE_SNAPSHOT=<q4 tier dir> ZIMAGE_SIZE=512 ZIMAGE_STEPS=1 \
 //!   cargo test -p mlx-gen-z-image --release --test request_scoped_residency_real_weights \
 //!   -- --ignored --nocapture --test-threads=1
 //! ```
 
 mod common;
 
-use common::snapshot;
+use common::tier_snapshot as snapshot;
 use mlx_gen::gen_core::GenerationMemory;
 use mlx_gen::{
     GenerationOutput, GenerationRequest, Image, LoadPhase, LoadSpec, OffloadPolicy, Progress,

@@ -5,7 +5,7 @@
 //! RGB colour of the decoded 8×8 pixel block represented by one native Z-Image latent position.
 //!
 //! ```sh
-//! ZIMAGE_SNAPSHOT=/path/to/z-image-turbo/bf16 \
+//! MLX_GEN_ZIMAGE_SNAPSHOT=/path/to/z-image-turbo-mlx/bf16 \
 //! ZIMAGE_PREVIEW_ARTIFACT_DIR=/path/to/artifacts \
 //!   cargo test --release -p mlx-gen-z-image --test fit_preview_rgb -- --ignored --nocapture
 //! ```
@@ -66,9 +66,13 @@ const HOLDOUT_CHANNEL_R2_FLOOR: f64 = 0.86;
 const HOLDOUT_OVERALL_R2_FLOOR: f64 = 0.90;
 
 fn snapshot() -> PathBuf {
-    PathBuf::from(std::env::var("ZIMAGE_SNAPSHOT").unwrap_or_else(|_| {
-        panic!("set ZIMAGE_SNAPSHOT to the required real Z-Image-Turbo snapshot")
-    }))
+    PathBuf::from(
+        std::env::var("MLX_GEN_ZIMAGE_SNAPSHOT").unwrap_or_else(|_| {
+            panic!(
+                "set MLX_GEN_ZIMAGE_SNAPSHOT to the required SceneWorks/z-image-turbo-mlx tier dir"
+            )
+        }),
+    )
 }
 
 struct Pair {

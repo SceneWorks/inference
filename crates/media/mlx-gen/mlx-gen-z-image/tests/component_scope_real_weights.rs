@@ -21,7 +21,7 @@
 //! an 8 GB budget; it is now decode-bound at 4.365.
 //!
 //! ```sh
-//! ZIMAGE_SNAPSHOT=<tier dir, e.g. …/bf16> \
+//! MLX_GEN_ZIMAGE_SNAPSHOT=<tier dir, e.g. …/bf16> \
 //!   cargo test -p mlx-gen-z-image --release --test component_scope_real_weights \
 //!   -- --ignored --nocapture --test-threads=1
 //! ```
@@ -34,7 +34,7 @@ use mlx_gen::{
 };
 use mlx_rs::memory::{clear_cache, get_peak_memory, reset_peak_memory};
 
-use common::snapshot;
+use common::tier_snapshot as snapshot;
 
 fn gib(bytes: u64) -> f64 {
     bytes as f64 / (1024.0 * 1024.0 * 1024.0)

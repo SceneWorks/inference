@@ -38,12 +38,12 @@
 //! ## Running
 //!
 //! ```sh
-//! ZIMAGE_SNAPSHOT=<snapshot root, containing bf16/ q4/ q8/> \
+//! MLX_GEN_ZIMAGE_SNAPSHOT=<snapshot root, containing bf16/ q4/ q8/> \
 //!   cargo test -p mlx-gen-z-image --release --test text_encoder_residency_real_weights \
 //!   -- --ignored --nocapture --test-threads=1
 //! ```
 //!
-//! `ZIMAGE_SNAPSHOT` may point either at a multi-tier root (all present tiers are measured) or at a
+//! `MLX_GEN_ZIMAGE_SNAPSHOT` may point either at a multi-tier root (all present tiers are measured) or at a
 //! single tier directory (that one is measured).
 
 mod common;
@@ -54,7 +54,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen_z_image::text_encoder::TextEncoder;
 use mlx_rs::memory::{clear_cache, get_active_memory, get_peak_memory, reset_peak_memory};
 
-use common::snapshot;
+use common::tier_snapshot as snapshot;
 
 fn gib(bytes: u64) -> f64 {
     bytes as f64 / (1024.0 * 1024.0 * 1024.0)

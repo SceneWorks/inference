@@ -183,7 +183,7 @@ expected_files = [
 key = "flux2-dev-mlx-bf16"
 repository = "SceneWorks/flux2-dev-mlx"
 revision = "2868b1461b2b6e6e05d84e52534df3632b4c7d5d"
-license = "FLUX.2-dev Non-Commercial License"
+license = "FLUX Non-Commercial License v2.1"
 size_class = "very-large"
 profiles = ["media-macos"]
 environment = ["MLX_GEN_FLUX2_DEV_SNAPSHOT"]
@@ -212,7 +212,7 @@ expected_files = [
 key = "flux2-dev-mlx-q8"
 repository = "SceneWorks/flux2-dev-mlx"
 revision = "2868b1461b2b6e6e05d84e52534df3632b4c7d5d"
-license = "FLUX.2-dev Non-Commercial License"
+license = "FLUX Non-Commercial License v2.1"
 size_class = "very-large"
 profiles = ["media-macos"]
 environment = ["MLX_GEN_FLUX2_DEV_SNAPSHOT"]
@@ -240,7 +240,7 @@ expected_files = [
 key = "flux2-dev-mlx-q4"
 repository = "SceneWorks/flux2-dev-mlx"
 revision = "2868b1461b2b6e6e05d84e52534df3632b4c7d5d"
-license = "FLUX.2-dev Non-Commercial License"
+license = "FLUX Non-Commercial License v2.1"
 size_class = "very-large"
 profiles = ["media-macos"]
 environment = ["MLX_GEN_FLUX2_DEV_SNAPSHOT"]
@@ -636,16 +636,18 @@ expected_files = [
 ]
 
 # sc-18213 (epic 18093) — `SceneWorks/z-image-turbo-mlx`, the pre-quantized MLX re-host of the
-# torch original pinned directly above. The `mlx-gen-z-image` real-weight tests read the SAME
-# `ZIMAGE_SNAPSHOT` name for both artifacts (a tier dir here, the torch snapshot root there) — so
-# these keys declare that name and the wiring gate reads them as wired, but the wiring rides the
-# memory-evidence-v1 lane, which materializes and verifies the `z-image-turbo` TORCH entry, never
-# this re-host. These keys are operator-run epic-18093 right-size calibration bindings
-# (mlx:z_image_turbo is the #2 provider by widened admission surface); an `unwired_reason` cannot
-# record that here because the gate rejects an exemption on a referenced name. Keyed per tier —
-# each tier subdir is a complete diffusers-layout snapshot and each rung of the calibration ladder
-# verifies its own tier without requiring the ~19 GiB-per-tier siblings on disk. All three keys
-# share one repository + revision.
+# torch original pinned directly above. One env name per verifier pin — the sc-17284 Qwen split:
+# `ZIMAGE_SNAPSHOT` stays the TORCH original's name (the entry above; it is what the wired
+# memory-evidence-v1 and MLX-media lanes export after verifying `--model z-image-turbo`), and the
+# re-host tier-dir consumers in `mlx-gen-z-image` were renamed onto `MLX_GEN_ZIMAGE_SNAPSHOT`
+# (tests/common `tier_snapshot()`, the tier-dir real-weight tests, `fit_preview_rgb`, the
+# `training.rs` first-step harness). `ZIMAGE_TURBO_SNAPSHOT` is `preview_real_weights.rs`'s
+# pre-existing name for the same tier dirs. Neither name is exported by any workflow: these keys
+# are operator-run epic-18093 right-size calibration bindings (mlx:z_image_turbo is the #2
+# provider by widened admission surface), hence the `unwired_reason`. Keyed per tier — each tier
+# subdir is a complete diffusers-layout snapshot and each rung of the calibration ladder verifies
+# its own tier without requiring the ~19 GiB-per-tier siblings on disk. All three keys share one
+# repository + revision.
 [[models]]
 key = "z-image-turbo-mlx-bf16"
 repository = "SceneWorks/z-image-turbo-mlx"
@@ -653,7 +655,8 @@ revision = "bb2bc9893b3c49ae96c813350775f791a2e8bc80"
 license = "Apache-2.0"
 size_class = "very-large"
 profiles = ["media-macos"]
-environment = ["ZIMAGE_SNAPSHOT"]
+environment = ["MLX_GEN_ZIMAGE_SNAPSHOT", "ZIMAGE_TURBO_SNAPSHOT"]
+unwired_reason = "operator-run epic-18093 right-size calibration on authoritative Apple hardware; pinned to bind capture evidence to exact weights (sc-18213), no CI lane dispatches the re-host tier harnesses (the wired z-image lanes verify and feed the z-image-turbo torch original)"
 download_files = ["bf16/*"]
 expected_files = [
     "bf16/model_index.json",
@@ -677,7 +680,8 @@ revision = "bb2bc9893b3c49ae96c813350775f791a2e8bc80"
 license = "Apache-2.0"
 size_class = "very-large"
 profiles = ["media-macos"]
-environment = ["ZIMAGE_SNAPSHOT"]
+environment = ["MLX_GEN_ZIMAGE_SNAPSHOT", "ZIMAGE_TURBO_SNAPSHOT"]
+unwired_reason = "operator-run epic-18093 right-size calibration on authoritative Apple hardware; pinned to bind capture evidence to exact weights (sc-18213), no CI lane dispatches the re-host tier harnesses (the wired z-image lanes verify and feed the z-image-turbo torch original)"
 download_files = ["q8/*"]
 expected_files = [
     "q8/model_index.json",
@@ -701,7 +705,8 @@ revision = "bb2bc9893b3c49ae96c813350775f791a2e8bc80"
 license = "Apache-2.0"
 size_class = "very-large"
 profiles = ["media-macos"]
-environment = ["ZIMAGE_SNAPSHOT"]
+environment = ["MLX_GEN_ZIMAGE_SNAPSHOT", "ZIMAGE_TURBO_SNAPSHOT"]
+unwired_reason = "operator-run epic-18093 right-size calibration on authoritative Apple hardware; pinned to bind capture evidence to exact weights (sc-18213), no CI lane dispatches the re-host tier harnesses (the wired z-image lanes verify and feed the z-image-turbo torch original)"
 download_files = ["q4/*"]
 expected_files = [
     "q4/model_index.json",
@@ -1542,8 +1547,9 @@ size_class = "very-large"
 profiles = ["media-macos"]
 environment = ["KREA_TURBO_DIR"]
 unwired_reason = "operator-run epic-18093 right-size calibration on authoritative Apple hardware; pinned to bind capture evidence to exact weights (sc-18213), no CI lane dispatches the krea-2-turbo harnesses"
-download_files = ["bf16/*"]
+download_files = ["bf16/*", "LICENSE.pdf"]
 expected_files = [
+    "LICENSE.pdf",
     "bf16/model_index.json",
     "bf16/scheduler/scheduler_config.json",
     "bf16/text_encoder/config.json",
@@ -1566,8 +1572,9 @@ size_class = "very-large"
 profiles = ["media-macos"]
 environment = ["KREA_TURBO_DIR"]
 unwired_reason = "operator-run epic-18093 right-size calibration on authoritative Apple hardware; pinned to bind capture evidence to exact weights (sc-18213), no CI lane dispatches the krea-2-turbo harnesses"
-download_files = ["q8/*"]
+download_files = ["q8/*", "LICENSE.pdf"]
 expected_files = [
+    "LICENSE.pdf",
     "q8/model_index.json",
     "q8/scheduler/scheduler_config.json",
     "q8/text_encoder/config.json",
@@ -1590,8 +1597,9 @@ size_class = "very-large"
 profiles = ["media-macos"]
 environment = ["KREA_TURBO_DIR"]
 unwired_reason = "operator-run epic-18093 right-size calibration on authoritative Apple hardware; pinned to bind capture evidence to exact weights (sc-18213), no CI lane dispatches the krea-2-turbo harnesses"
-download_files = ["q4/*"]
+download_files = ["q4/*", "LICENSE.pdf"]
 expected_files = [
+    "LICENSE.pdf",
     "q4/model_index.json",
     "q4/scheduler/scheduler_config.json",
     "q4/text_encoder/config.json",

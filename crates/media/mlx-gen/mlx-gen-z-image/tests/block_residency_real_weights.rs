@@ -1,11 +1,11 @@
 //! SC-15754 / SC-15510 — the real-weight measurements for ladder rungs 4 (bounded transformer
 //! residency) and 2 (the widened decode ladder) on the MLX Z-Image lane.
 //!
-//! `#[ignore]`d: needs a real Z-Image-Turbo snapshot (`ZIMAGE_SNAPSHOT`, a pre-quantized tier dir for
+//! `#[ignore]`d: needs a real Z-Image-Turbo snapshot (`MLX_GEN_ZIMAGE_SNAPSHOT`, a pre-quantized tier dir for
 //! q4/q8) and an Apple/Metal GPU. Run:
 //!
 //! ```text
-//! ZIMAGE_SNAPSHOT=<snapshot or tier dir> \
+//! MLX_GEN_ZIMAGE_SNAPSHOT=<snapshot or tier dir> \
 //!   cargo test -p mlx-gen-z-image --release --test block_residency_real_weights -- --ignored --nocapture
 //! ```
 //!
@@ -24,7 +24,7 @@
 
 mod common;
 
-use common::snapshot;
+use common::tier_snapshot as snapshot;
 use mlx_gen::gen_core::GenerationMemory;
 use mlx_gen::{
     CancelFlag, GenerationOutput, GenerationRequest, Image, LoadSpec, OffloadPolicy, Progress,
