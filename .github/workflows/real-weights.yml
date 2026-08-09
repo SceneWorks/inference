@@ -106,7 +106,7 @@ on:
         default: all
         # `audio` still runs every audio family. The `audio-*` entries are the per-family split
         # (sc-16981) — dispatch one provider family without taking the Metal runner for the rest.
-        options: [all, llm, llm-joycaption, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, krea-realtime, krea-kv-cache, krea-s18-sweep, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base]
+        options: [all, llm, llm-joycaption, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-s18-sweep, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base]
       sceneworks_revision:
         description: Exact lowercase SceneWorks commit paired with memory-evidence-v1
         type: string
@@ -964,6 +964,133 @@ jobs:
         run: >-
           cargo test --locked --release -p mlx-gen-mage
           --test request_memory_scope_real_weights -- --ignored --nocapture
+
+  # sc-18249: the SANA tiled-decode drift ceiling (`DECODE_TILING_MEAN_ABS_U8 = 6.0`) was enforced
+  # only by `#[ignore]` real-weight tests no workflow referenced — the exact sc-17250 shape: a
+  # pinned snapshot holding runner disk while the gates it backs ran nowhere. This lane runs the
+  # two ceiling-bearing tests. Unlike the Z-Image `mlx-memory-evidence-v1` lane below there is NO
+  # out-of-band verifier
+  # (`verify_residency_ab.py` re-derives z-image's drift from bound artifacts; no SANA equivalent
+  # exists): the ceiling is asserted INSIDE the tests, so the job's contract is `set -o pipefail`
+  # plus the test exit code, and the artifacts (full log, model inventory, PPM renders + 8x
+  # amplified diffs from `SANA_SWEEP_OUT`) are the reviewable evidence rather than a verdict file.
+  # Operator-dispatched, not scheduled: base SANA runs its true 20-step CFG schedule (40 trunk
+  # forwards per 1024² render) and the two tests render ~27 images with a fresh model load per
+  # measured row, which is hours on `rw-mage` hardware — the sc-16981 head-of-line shape.
+  mlx-sana-drift-ceiling:
+    name: MLX SANA drift ceiling real weights
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'sana-drift-ceiling'
+    runs-on: [self-hosted, macOS, ARM64, rw-mage]
+    timeout-minutes: 360
+    env:
+      SANA_LADDER_1600M: ${{ vars.SANA_LADDER_1600M }}
+      INFERENCE_REVISION: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      # Repository variables hold ONE value for every runner in a label pool, but the two
+      # macOS boxes do not share a home directory. A `~/`-relative value is resolved here
+      # against the home of whichever runner actually claimed this job; absolute values
+      # pass through untouched, so variables can be flipped one at a time.
+      - name: Resolve runner-local snapshot paths
+        run: >-
+          python3.12 scripts/release/resolve_snapshot_paths.py
+          SANA_LADDER_1600M
+      - name: Verify exact clean inference provenance
+        run: |
+          test "$(git rev-parse HEAD)" = "$INFERENCE_REVISION"
+          git diff --quiet
+          git diff --cached --quiet
+          test -z "$(git status --porcelain --untracked-files=normal)"
+      - name: Toolchain versions
+        run: rustc --version && cargo --version && python3.12 --version
+      # Report-only: what this box had free, and which of these snapshots it already holds,
+      # BEFORE anything transfers. Also names the runner -- `rw-*` labels live in org settings
+      # and are invisible from the runners themselves, so a run log is the only record of
+      # which of the two Macs actually took a lane. Never fails the job; see the script.
+      - name: Report runner disk headroom
+        # The script exits 0 on every path, but the STEP can still fail for reasons it never
+        # sees -- a lost exec bit, a wrong working directory. A step that only produces a
+        # record must not be able to kill a multi-hour real-weight lane.
+        continue-on-error: true
+        run: >-
+          scripts/ci/report_runner_disk_headroom.sh
+          SANA_LADDER_1600M
+      - name: Materialize and verify immutable SANA snapshot
+        env:
+          SANA_MODEL_INVENTORY: ${{ runner.temp }}/sana-drift-ceiling/sana-1600m-mlx-model-inventory.json
+        run: |
+          if [[ -z "$SANA_LADDER_1600M" || "$SANA_LADDER_1600M" != /* ]]; then
+            echo "SANA_LADDER_1600M must be an operator-provided absolute path" >&2
+            exit 1
+          fi
+          python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py \
+            --model sana-1600m-mlx \
+            --snapshot "$SANA_LADDER_1600M"
+          python3.12 scripts/release/verify_model_snapshot.py \
+            --model sana-1600m-mlx \
+            --snapshot "$SANA_LADDER_1600M" \
+            --inventory-output "$SANA_MODEL_INVENTORY"
+      - name: Run the ceiling-bearing drift tests
+        env:
+          SANA_DRIFT_OUTPUT_DIR: ${{ runner.temp }}/sana-drift-ceiling
+          SANA_DRIFT_LOG: ${{ runner.temp }}/sana-drift-ceiling/sana-1600m-drift.log
+          # The sweep dumps every render and its 8x-amplified diff here — the sc-17863 "verdict
+          # with eyes on the renders" evidence, preserved per run instead of living on one dev Mac.
+          SANA_SWEEP_OUT: ${{ runner.temp }}/sana-drift-ceiling/renders
+          SANA_MODEL_INVENTORY: ${{ runner.temp }}/sana-drift-ceiling/sana-1600m-mlx-model-inventory.json
+          SANA_MODEL_INVENTORY_AFTER: ${{ runner.temp }}/sana-drift-ceiling/sana-1600m-mlx-model-inventory-after.json
+        run: |
+          test "$(git rev-parse HEAD)" = "$INFERENCE_REVISION"
+          git diff --quiet
+          git diff --cached --quiet
+          test -z "$(git status --porcelain --untracked-files=normal)"
+          mkdir -p "$SANA_DRIFT_OUTPUT_DIR"
+          set -o pipefail
+          # Two tests, run `--exact` so a rename cannot silently widen or empty the filter:
+          # the five-latent resample that owns the 6.0 ceiling, then the published-domain sweep
+          # that bounds every published edge, pins the drift/peak monotonicity, and records the
+          # out-of-domain overlap refusals (an admitted probe row asserts the same ceiling).
+          #
+          # Each invocation must prove it ran EXACTLY ONE passing test. A rename, a filter typo,
+          # or a lost `#[ignore]` all produce "0 passed" and exit 0 — a lane that is fully green
+          # while enforcing nothing (the sc-15520 review-round-2 guard the sibling ladder lanes
+          # carry). Per invocation rather than aggregate, so one invocation matching two tests
+          # can never cover for the other matching none.
+          out="$(cargo test --locked --release -p mlx-gen-sana \
+            --test memory_ladder_real_weights \
+            the_tiled_decode_drift_is_resampled_across_production_latents -- --ignored --exact --test-threads=1 --nocapture \
+            2>&1 | tee "$SANA_DRIFT_LOG" /dev/stderr)"
+          if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
+            echo "::error::the resample test did not run exactly one passing test — a rename or a filter typo would make this step vacuously green" >&2
+            exit 1
+          fi
+          out="$(cargo test --locked --release -p mlx-gen-sana \
+            --test memory_ladder_real_weights \
+            the_published_decode_tile_domain_is_swept_against_the_whole_image_decode -- --ignored --exact --test-threads=1 --nocapture \
+            2>&1 | tee -a "$SANA_DRIFT_LOG" /dev/stderr)"
+          if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
+            echo "::error::the domain sweep did not run exactly one passing test — a rename or a filter typo would make this step vacuously green" >&2
+            exit 1
+          fi
+          python3.12 scripts/release/verify_model_snapshot.py \
+            --model sana-1600m-mlx \
+            --snapshot "$SANA_LADDER_1600M" \
+            --inventory-output "$SANA_MODEL_INVENTORY_AFTER"
+          if ! cmp -s "$SANA_MODEL_INVENTORY" "$SANA_MODEL_INVENTORY_AFTER"; then
+            echo "SANA snapshot content changed during the drift run" >&2
+            exit 1
+          fi
+      - name: Upload drift log, inventory, and render evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sana-drift-ceiling-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            ${{ runner.temp }}/sana-drift-ceiling/sana-1600m-drift.log
+            ${{ runner.temp }}/sana-drift-ceiling/sana-1600m-mlx-model-inventory.json
+            ${{ runner.temp }}/sana-drift-ceiling/renders
 
   mlx-memory-evidence-v1:
     name: MLX memory evidence V1 real weights

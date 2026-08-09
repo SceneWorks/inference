@@ -1603,7 +1603,9 @@ fn the_published_decode_tile_domain_is_swept_against_the_whole_image_decode() {
         }
         // Overlap probe at the shipping edge. Published domain is {48}: these rows REFUSE on the
         // production path, and that refusal is the record. Widening the domain for a measurement
-        // probe admits them, which is how sc-17863's overlap-vs-edge answer was measured.
+        // probe admits them, which is how sc-17863's overlap-vs-edge answer was measured — and an
+        // admitted row is still bound by the declared ceiling (sc-18249), so a widened domain
+        // cannot quietly ship a configuration the contract does not cover.
         for overlap in PROBE_OVERLAPS {
             let memory = GenerationMemory {
                 tile_vae_decode: true,
@@ -1626,12 +1628,12 @@ fn the_published_decode_tile_domain_is_swept_against_the_whole_image_decode() {
                 Ok(GenerationOutput::Images(images)) => {
                     let pixels = &images.first().expect("one image").pixels;
                     let peak = get_peak_memory() as f64 / GIB;
+                    let mean = mean_delta(&whole.pixels, pixels);
                     println!(
                         "[sc-17863 overlap probe seed {seed}] edge {} overlap {overlap}: \
-                         {peak:.4} GiB, maxD {}, meanD {:.4}, p99D {}, {:.0} ms/step",
+                         {peak:.4} GiB, maxD {}, meanD {mean:.4}, p99D {}, {:.0} ms/step",
                         mlx_gen_sana::pipeline::DECODE_TILE_EDGE,
                         max_delta(&whole.pixels, pixels),
-                        mean_delta(&whole.pixels, pixels),
                         quantile_delta(&whole.pixels, pixels, 0.99),
                         started.elapsed().as_secs_f64() * 1000.0 / f64::from(steps)
                     );
@@ -1644,6 +1646,22 @@ fn the_published_decode_tile_domain_is_swept_against_the_whole_image_decode() {
                         &format!("seed{seed}_edge192_overlap{overlap}_diff8x"),
                         edge,
                         &amplified_diff(&whole.pixels, pixels),
+                    );
+                    // An admitted row is measured AND bound, never exempt (sc-18249). On the
+                    // production path this arm is unreachable — the published domain is {48} and
+                    // the Err arm below asserts that exact refusal — so reaching it at all means
+                    // the domain enforcement was widened or lost. The ceiling then has to hold
+                    // here too, and it binds by construction: overlap 24, the FIRST probe in
+                    // `PROBE_OVERLAPS`, measures meanD 6.315..6.427 on all three seeds (see
+                    // [`DECODE_TILING_MEAN_ABS_U8`]) — above the 6.0 ceiling — so a lost refusal
+                    // panics on the first admitted row rather than printing numbers into a log
+                    // nothing reads. The renders are dumped BEFORE this assertion so a breach
+                    // still leaves its visual evidence behind.
+                    assert!(
+                        mean <= DECODE_TILING_MEAN_ABS_U8,
+                        "admitted overlap probe {overlap} on seed {seed} drifted meanD {mean:.4} \
+                         past the declared ceiling {DECODE_TILING_MEAN_ABS_U8}; an off-domain row \
+                         generated AND breached the contract the domain refusal exists to protect"
                     );
                 }
                 Ok(other) => panic!("expected images, got {other:?}"),

@@ -388,11 +388,12 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
             errors.append(f"{prefix}: unexpected argument after requirement lock")
 
     expected_lock_counts = {
-        # 28 since sc-15520 added the `mlx-chroma-memory-ladder` job
-        # (27 since sc-17284 added the `mlx-qwen-image`, `mlx-qwen-image-pid` and
+        # 29 since sc-18249 added the `mlx-sana-drift-ceiling` job
+        # (28 since sc-15520 added the `mlx-chroma-memory-ladder` job;
+        # 27 since sc-17284 added the `mlx-qwen-image`, `mlx-qwen-image-pid` and
         # `mlx-qwen-image-producers` jobs; 24 since sc-17250 added the JoyCaption and
         # MOSS-TTS-Realtime jobs; 22 before).
-        MACOS_HUB_LOCK: 28,
+        MACOS_HUB_LOCK: 29,
         WINDOWS_HUB_LOCK: 10,
         WINDOWS_MAGE_LOCK: 1,
         MACOS_MAGE_LOCK: 1,
@@ -558,7 +559,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
     def test_real_weight_python_installs_are_binary_hash_locked(self) -> None:
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
         self.assertEqual(real_weight_pip_policy_errors(workflow), [])
-        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 28)
+        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 29)
         self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 10)
         self.assertEqual(workflow.count(WINDOWS_MAGE_LOCK), 1)
         self.assertNotRegex(
@@ -1350,6 +1351,79 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("z-image-turbo-model-inventory.json", job)
         self.assertIn("verifier-result.txt", job)
         self.assertIn("memory-evidence-v1-z-image-${{ github.sha }}", job)
+
+    def test_sana_drift_ceiling_lane_is_operator_dispatched_and_keeps_its_evidence(self) -> None:
+        """sc-18249: the SANA 6.0 drift ceiling must be enforced by a lane a workflow can run.
+
+        The ceiling lived only in `#[ignore]` tests no workflow referenced — the sc-17250 shape
+        (pinned snapshot, gates running nowhere). These pins keep the lane from being silently
+        gutted: the two ceiling-bearing tests must stay named `--exact` (a rename cannot widen or
+        empty the filter), `set -o pipefail` must survive the `tee` (or a red test exits green),
+        the snapshot must be inventory-verified before AND after the run, and the log, inventory
+        and `SANA_SWEEP_OUT` renders must be uploaded unconditionally-on-success (no `if: always()`
+        — a failed run's partial artifacts must not masquerade as evidence). There is deliberately
+        NO `verify_residency_ab.py` pin here: no SANA verifier exists, and the adjudicated contract
+        (sc-17863) is asserted INSIDE the tests, so the exit code is the verdict.
+        """
+        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        start = workflow.index("  mlx-sana-drift-ceiling:")
+        end = workflow.index("\n  mlx-memory-evidence-v1:", start)
+        job = workflow[start:end]
+
+        self.assertIn("sana-drift-ceiling", workflow.split("jobs:", 1)[0])
+        self.assertIn(
+            "if: github.event_name == 'workflow_dispatch' && "
+            "inputs.profile == 'sana-drift-ceiling'",
+            job,
+        )
+        self.assertIn("INFERENCE_REVISION: ${{ github.sha }}", job)
+        self.assertIn("SANA_LADDER_1600M: ${{ vars.SANA_LADDER_1600M }}", job)
+        self.assertIn('test "$(git rev-parse HEAD)" = "$INFERENCE_REVISION"', job)
+        self.assertIn("git diff --quiet", job)
+        self.assertIn("git diff --cached --quiet", job)
+        self.assertGreaterEqual(
+            job.count('test -z "$(git status --porcelain --untracked-files=normal)"'),
+            2,
+        )
+        self.assertIn("resolve_snapshot_paths.py", job)
+        self.assertIn("ensure_model_snapshot.py", job)
+        self.assertIn("--model sana-1600m-mlx", job)
+        self.assertIn("verify_model_snapshot.py", job)
+        self.assertIn("--inventory-output", job)
+        self.assertIn("SANA_MODEL_INVENTORY_AFTER", job)
+        self.assertIn('cmp -s "$SANA_MODEL_INVENTORY" "$SANA_MODEL_INVENTORY_AFTER"', job)
+        # Both ceiling-bearing tests, each `--exact`: the five-latent resample that owns the
+        # 6.0 ceiling, and the published-domain sweep that bounds every published edge and
+        # asserts the same ceiling on any admitted overlap-probe row.
+        self.assertIn("the_tiled_decode_drift_is_resampled_across_production_latents", job)
+        self.assertIn(
+            "the_published_decode_tile_domain_is_swept_against_the_whole_image_decode", job
+        )
+        self.assertEqual(job.count("--ignored --exact --test-threads=1 --nocapture"), 2)
+        # Each invocation must PROVE it ran exactly one passing test. `cargo test` exits 0 when
+        # a filter matches nothing, so a Rust-side rename or a lost `#[ignore]` would leave the
+        # YAML names (and every pin above) green while the lane enforces nothing — the sc-15520
+        # review-round-2 guard the sibling ladder lanes carry. Per invocation, not aggregate:
+        # exactly one guard per cargo run, so one invocation matching two tests can never cover
+        # for the other matching none.
+        self.assertEqual(job.count('grep -qE "test result: ok\\. 1 passed"'), 2)
+        self.assertEqual(
+            job.count("cargo test"),
+            job.count('grep -qE "test result: ok\\. 1 passed"'),
+        )
+        self.assertIn("set -o pipefail", job)
+        # The sc-17863 verdict was made with eyes on the renders; the lane must keep producing
+        # them per run rather than leaving that evidence on one dev Mac.
+        self.assertIn("SANA_SWEEP_OUT:", job)
+        self.assertIn("actions/upload-artifact@", job)
+        self.assertNotIn("if: always()", job)
+        self.assertIn("sana-1600m-drift.log", job)
+        self.assertIn("sana-1600m-mlx-model-inventory.json", job)
+        self.assertIn("/renders", job)
+        self.assertIn("sana-drift-ceiling-${{ github.sha }}", job)
+        # No SANA verifier exists; the day one appears this pin should flip to a positive
+        # requirement rather than being deleted.
+        self.assertNotIn("verify_residency_ab.py", job)
 
     def test_krea_s18_sweep_is_operator_dispatched_and_keeps_its_evidence(self) -> None:
         """sc-17276: the S18 coherence sweep is a measurement lane, not a regression gate.
