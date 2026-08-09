@@ -20,9 +20,9 @@
 //! The NAX 16-bit GEMM + SDPA are correct on the pinned build (sc-2772 fixed the metal compile
 //! target to macOS 26.2, where the `mpp::tensor_ops::matmul2d` matrix-unit kernels are valid — see
 //! [[pmetal-mlx-bf16-matmul-bug]]). An earlier f32-activation version was a workaround for the
-//! then-broken bf16 SDPA; it's obsolete. The pinned build is MLX **0.31.1**; the production reference
-//! is **0.31.2** (which reworked the NAX bf16 kernels), so bf16 parity is exact only up to that
-//! cross-version kernel difference (f32 is bit-exact across the two) until the pin moves to 0.31.2.
+//! then-broken bf16 SDPA; it's obsolete. The pinned build and production parity reference are both
+//! MLX **0.32.0**. Remaining bounded bf16 drift is a matched-version cross-stack kernel-selection
+//! difference, not the former 0.31.1/0.31.2 version gap (sc-12896; see the Wan parity tests).
 
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear, Adapter};
 use mlx_gen::array::scalar;
