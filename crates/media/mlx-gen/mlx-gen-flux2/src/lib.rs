@@ -112,6 +112,7 @@ pub fn register_providers(
         .register_memory_behavior(model::KLEIN_EDIT_MEMORY_BEHAVIOR)
         .register_generator(model::KLEIN_KV_EDIT_REGISTRATION)
         .register_generator(model::DEV_REGISTRATION)
+        .register_memory_strategy(model::DEV_MEMORY_REGISTRATION)
         .register_generator(model::DEV_EDIT_REGISTRATION)
         .register_memory_strategy(model::DEV_EDIT_MEMORY_REGISTRATION)
         .register_generator(model_control::DEV_CONTROL_REGISTRATION)
@@ -172,6 +173,34 @@ mod explicit_registry_tests {
             .expect("FLUX.2-dev edit memory contract");
         assert_eq!(contract.provider_id, super::FLUX2_DEV_EDIT_ID);
         assert!(contract.conformance_errors().is_empty());
+    }
+
+    #[test]
+    fn dev_t2i_exposes_its_own_provider_memory_safety_contract() {
+        let registry = super::provider_registry().unwrap();
+        let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(Default::default()))
+            .with_quant(mlx_gen::Quant::Q4);
+        let t2i = registry
+            .memory_strategy_contract(super::FLUX2_DEV_ID, &spec)
+            .unwrap()
+            .expect("FLUX.2-dev T2I memory contract");
+        let edit = registry
+            .memory_strategy_contract(super::FLUX2_DEV_EDIT_ID, &spec)
+            .unwrap()
+            .expect("FLUX.2-dev edit memory contract");
+
+        assert_eq!(t2i.provider_id, super::FLUX2_DEV_ID);
+        assert_eq!(edit.provider_id, super::FLUX2_DEV_EDIT_ID);
+        assert_ne!(t2i.calibration, edit.calibration);
+        assert!(t2i.conformance_errors().is_empty());
+        assert_eq!(
+            registry
+                .memory_strategy_registrations()
+                .filter(|registration| registration.provider_id == super::FLUX2_DEV_ID)
+                .count(),
+            1,
+            "the T2I provider must have exactly one memory registration"
+        );
     }
 
     #[test]

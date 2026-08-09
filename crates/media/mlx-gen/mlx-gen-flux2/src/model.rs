@@ -381,8 +381,15 @@ impl Flux2 {
             descriptor: variant.descriptor(),
             variant,
             config: variant.config(),
-            memory_strategy: (variant == Flux2Variant::DevEdit)
-                .then(|| crate::memory_strategy::registered_dev_contract(&loaded_spec).unwrap()),
+            memory_strategy: match variant {
+                Flux2Variant::Dev => {
+                    Some(crate::memory_strategy::registered_dev_t2i_contract(&loaded_spec).unwrap())
+                }
+                Flux2Variant::DevEdit => {
+                    Some(crate::memory_strategy::registered_dev_contract(&loaded_spec).unwrap())
+                }
+                _ => None,
+            },
             memory_numeric_tier: None,
             loaded_spec,
             tokenizer: None,
@@ -720,10 +727,28 @@ impl Generator for Flux2 {
                         ),
                     };
                 };
-                if self.variant == Flux2Variant::DevEdit {
-                    crate::memory_strategy::safety_check(contract, context, expected_tier)
-                } else {
-                    crate::memory_strategy::klein_safety_check(&self.loaded_spec, contract, context)
+                match self.variant {
+                    Flux2Variant::Dev => crate::memory_strategy::dev_t2i_safety_check(
+                        contract,
+                        context,
+                        expected_tier,
+                    ),
+                    Flux2Variant::DevEdit => {
+                        crate::memory_strategy::safety_check(contract, context, expected_tier)
+                    }
+                    Flux2Variant::Klein9b | Flux2Variant::Klein9bEdit => {
+                        crate::memory_strategy::klein_safety_check(
+                            &self.loaded_spec,
+                            contract,
+                            context,
+                        )
+                    }
+                    _ => mlx_gen::gen_core::MemorySafetyDecision::Reject {
+                        reason: format!(
+                            "{} has no memory-safety implementation for its registered contract",
+                            self.descriptor.id
+                        ),
+                    },
                 }
             },
         )
@@ -737,7 +762,7 @@ impl Generator for Flux2 {
         let Some(contract) = self.memory_strategy.as_ref() else {
             return Ok(None);
         };
-        if self.variant == Flux2Variant::DevEdit {
+        if matches!(self.variant, Flux2Variant::Dev | Flux2Variant::DevEdit) {
             return Ok(None);
         }
         crate::memory_strategy::begin_klein_request(&self.loaded_spec, contract, context)
@@ -1272,6 +1297,13 @@ pub(crate) const DEV_EDIT_MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistra
         safety_check: crate::memory_strategy::registered_dev_safety_check,
     };
 
+pub(crate) const DEV_MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
+    mlx_gen::gen_core::MemoryRegistration {
+        provider_id: crate::config::FLUX2_DEV_ID,
+        contract: crate::memory_strategy::registered_dev_t2i_contract,
+        safety_check: crate::memory_strategy::registered_dev_t2i_safety_check,
+    };
+
 pub(crate) const KLEIN_MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
     mlx_gen::gen_core::MemoryRegistration {
         provider_id: crate::config::FLUX2_KLEIN_9B_ID,
@@ -1309,8 +1341,12 @@ mod tests {
         DEFAULT_GUIDANCE_DEV, DEFAULT_STEPS_DEV, FLUX2_DEV_EDIT_ID, FLUX2_DEV_ID,
         FLUX2_KLEIN_9B_EDIT_ID, FLUX2_KLEIN_9B_ID,
     };
+    use mlx_gen::gen_core::{
+        MemoryBudget, MemoryCacheState, MemoryGeometry, MemoryMode, MemoryNumericTier,
+        MemoryRunContext, MemorySafetyDecision, MemorySelection, MemoryStrategy,
+    };
     use mlx_gen::media::Image;
-    use mlx_gen::Conditioning;
+    use mlx_gen::{Conditioning, Precision, Quant};
 
     /// L-log-injection: sanitize collapses embedded newlines/control chars (no second prefix line) and
     /// length-caps, so a model-generated rewrite can't break the machine-parsed `ENHANCED_PROMPT:` record.
@@ -1484,6 +1520,122 @@ mod tests {
             ..Default::default()
         };
         model.validate(&req).unwrap();
+    }
+
+    fn dev_memory_context(
+        model: &Flux2,
+        mode: MemoryMode,
+        reference_count: u32,
+    ) -> MemoryRunContext {
+        let contract = model
+            .memory_strategy_contract()
+            .expect("test model memory contract");
+        let calibration = contract.calibration.as_ref().expect("calibration identity");
+        let tier = model.memory_numeric_tier.expect("loaded numeric tier");
+        MemoryRunContext {
+            selection: MemorySelection {
+                strategy: MemoryStrategy::Resident,
+                parameters: Default::default(),
+                tier,
+            },
+            calibration_abi: calibration.abi,
+            calibration_fingerprint: calibration.fingerprint.clone(),
+            load_shape: calibration.load_shape,
+            mode,
+            has_reference: reference_count > 0,
+            use_pid: false,
+            has_phases: false,
+            geometry: MemoryGeometry {
+                width: 768,
+                height: 768,
+                batch: 1,
+                frames: 1,
+                reference_count,
+            },
+            overlay: None,
+            budget: MemoryBudget {
+                total_bytes: 96 * 1024 * 1024 * 1024,
+                committed_bytes: 0,
+                reclaimable_bytes: 0,
+                reserved_headroom_bytes: 0,
+            },
+            predicted_peak_bytes: 80 * 1024 * 1024 * 1024,
+            cache_state: MemoryCacheState::Cold,
+            evidence_revision: "sc-18218-loaded-generator-test".to_owned(),
+        }
+    }
+
+    #[test]
+    fn dev_loaded_generator_uses_the_t2i_contract_not_the_edit_contract() {
+        let tier = MemoryNumericTier {
+            precision: Precision::Bf16,
+            quant: Some(Quant::Q4),
+            component_precision_floors: &[],
+        };
+        let mut t2i = Flux2::new_for_tests(Flux2Variant::Dev);
+        t2i.memory_numeric_tier = Some(tier);
+        assert_eq!(
+            t2i.memory_strategy_contract().unwrap().provider_id,
+            FLUX2_DEV_ID
+        );
+        let t2i_context = dev_memory_context(&t2i, MemoryMode::TextToImage, 0);
+        assert_eq!(
+            t2i.memory_strategy_safety_check(&t2i_context),
+            MemorySafetyDecision::Accept
+        );
+
+        let edit_shaped = dev_memory_context(&t2i, MemoryMode::Edit, 2);
+        let MemorySafetyDecision::Reject { reason } =
+            t2i.memory_strategy_safety_check(&edit_shaped)
+        else {
+            panic!("T2I generator must reject the edit route");
+        };
+        assert!(reason.contains("reference-free text-to-image"), "{reason}");
+
+        let mut edit = Flux2::new_for_tests(Flux2Variant::DevEdit);
+        edit.memory_numeric_tier = Some(tier);
+        assert_eq!(
+            edit.memory_strategy_contract().unwrap().provider_id,
+            FLUX2_DEV_EDIT_ID
+        );
+        let edit_context = dev_memory_context(&edit, MemoryMode::Edit, 2);
+        assert_eq!(
+            edit.memory_strategy_safety_check(&edit_context),
+            MemorySafetyDecision::Accept,
+            "the existing edit route must retain its own safety path"
+        );
+    }
+
+    #[test]
+    fn dev_loaded_generator_rejects_stale_evidence_and_a_wrong_tier() {
+        let q4 = MemoryNumericTier {
+            precision: Precision::Bf16,
+            quant: Some(Quant::Q4),
+            component_precision_floors: &[],
+        };
+        let mut model = Flux2::new_for_tests(Flux2Variant::Dev);
+        model.memory_numeric_tier = Some(q4);
+        let exact = dev_memory_context(&model, MemoryMode::TextToImage, 0);
+
+        let mut stale = exact.clone();
+        stale.calibration_fingerprint = "stale".to_owned();
+        let MemorySafetyDecision::Reject { reason } = model.memory_strategy_safety_check(&stale)
+        else {
+            panic!("loaded T2I generator must reject stale evidence");
+        };
+        assert!(
+            reason.contains("calibration handshake mismatch"),
+            "{reason}"
+        );
+
+        let mut wrong_tier = exact;
+        wrong_tier.selection.tier.quant = Some(Quant::Q8);
+        let MemorySafetyDecision::Reject { reason } =
+            model.memory_strategy_safety_check(&wrong_tier)
+        else {
+            panic!("loaded T2I generator must reject a tier mismatch");
+        };
+        assert!(reason.contains("does not match loaded tier"), "{reason}");
     }
 
     #[test]
