@@ -1393,12 +1393,11 @@ license = "Apache-2.0"
 size_class = "large"
 profiles = ["media-macos"]
 environment = ["SANA_LADDER_1600M"]
-# The image memory-ladder harnesses are operator-run on authoritative Apple hardware, not CI-wired —
-# the same posture as every sibling family on epic 15448 (Chroma's CHROMA_LADDER_*, SDXL's
-# SDXL_LADDER_*, Kolors'), none of which has a real-weights lane either. A rung-4 sweep re-materializes
-# the trunk once per block per step, so a hosted lane would be hours per entry. This entry exists for
-# the evidence binding above; wiring a lane is a separate, family-wide decision (sc-17848).
-unwired_reason = "epic-15448 ladder harnesses are operator-run on authoritative hardware; pinned here only to bind evidence records to exact weights (sc-15523)"
+# Wired since sc-18249: the operator-dispatched `mlx-sana-drift-ceiling` lane in real-weights.yml
+# runs the two tiled-decode drift-ceiling tests in `memory_ladder_real_weights.rs` (mean-abs-u8
+# ceiling 6.0) against this snapshot. The REST of the memory-ladder harness stays operator-run on
+# authoritative Apple hardware — a rung-4 sweep re-materializes the trunk once per block per step,
+# so hosting the whole ladder would be many hours per entry; widening the lane is sc-17848's call.
 expected_files = [
     "q4/transformer/diffusion_pytorch_model.safetensors",
     "q4/vae/diffusion_pytorch_model.safetensors",
