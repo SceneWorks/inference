@@ -86,9 +86,9 @@ pub use latent::{
 pub use license::components::MEDIA_COMPONENT_LICENSES;
 pub use license::families::LICENSE_FAMILIES;
 pub use license::{
-    component_licenses_manifest_json, license_table_conformance_errors, provider_terms,
-    resolve_component, resolve_family, CeilingBoundary, ComponentLicense, LicenseFamily,
-    LicenseTerm, ProviderComponents,
+    component_licenses_manifest_json, decoder_license_conformance_errors,
+    license_table_conformance_errors, provider_terms, resolve_component, resolve_family,
+    CeilingBoundary, ComponentLicense, LicenseFamily, LicenseTerm, ProviderComponents,
 };
 pub use media::{AudioChunk, AudioStem, AudioTrack, Image};
 pub use memory_strategy::{
