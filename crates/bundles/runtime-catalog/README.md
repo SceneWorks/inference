@@ -40,8 +40,11 @@ catalog.snapshot();   // RuntimeCatalogSnapshot   — stable, JSON-serializable,
 ```
 
 `RuntimeCatalogSnapshot` carries the id lists for every provider kind plus the snapshot
-preparer backends, and `to_json()` renders the form consumed by release tooling and
-external smoke projects.
+preparer backends. Its `generator_capabilities` and `audio_generator_capabilities` arrays
+are derived directly from each registered `ModelDescriptor` and include modality,
+conditioning kinds, LoRA/LoKr support, precision tiers, preview support, samplers,
+schedulers, and guidance methods. `to_json()` renders this weights-free form for release
+tooling, backend-parity generation, and external smoke projects.
 
 The crate re-exports `core_llm` and `gen_core` so a bundle (and its consumers) reach the
 contract types through this one path.
