@@ -4785,9 +4785,11 @@ jobs:
         run: |
           if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
           echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.12"
+      - name: Select runner-provisioned Python 3.12
+        shell: cmd
+        run: |
+          py -3.12 --version || exit /b 1
+          for /f "delims=" %%P in ('py -3.12 -c "import os,sys; print(os.path.dirname(sys.executable))"') do echo %%P>>"%GITHUB_PATH%"
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
         with:
           toolchain: 1.96.0
@@ -4796,11 +4798,15 @@ jobs:
         shell: powershell
         run: |
           $log = Join-Path $env:RUNNER_TEMP "scail2-shared-cuda.log"
+          $python = python -c "import platform,sys; print(f'{sys.executable}|{platform.python_version()}')"
+          if ($LASTEXITCODE -ne 0 -or $python -notmatch '\|3\.12\.') {
+            throw "expected runner-provisioned CPython 3.12, got $python"
+          }
           @(
             "inference_head=${{ github.sha }}"
             "repository=$env:SCAIL2_REPOSITORY"
             "revision=$env:SCAIL2_REVISION"
-            "python=$(python --version 2>&1)"
+            "python=$python"
             "provision_status=starting"
           ) | Set-Content -LiteralPath $log -Encoding utf8
       - name: Provision the exact public shared bf16 package

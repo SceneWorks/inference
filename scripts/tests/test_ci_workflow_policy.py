@@ -1374,20 +1374,21 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn('allow_patterns=["bf16/**"]', job)
         self.assertIn("models--SceneWorks--scail2-mlx", job)
         git_bash = job.index("Select Git Bash")
-        setup_python = job.index("actions/setup-python@")
+        select_python = job.index("Select runner-provisioned Python 3.12")
         toolchain = job.index("uses: dtolnay/rust-toolchain@")
         initialize_evidence = job.index("Initialize exact SCAIL CUDA evidence")
         provision = job.index("Provision the exact public shared bf16 package")
         self.assertLess(git_bash, toolchain)
-        self.assertLess(git_bash, setup_python)
-        self.assertLess(setup_python, provision)
+        self.assertLess(git_bash, select_python)
+        self.assertLess(select_python, provision)
         self.assertLess(initialize_evidence, provision)
         self.assertIn(r'C:\Program Files\Git\bin\bash.exe', job)
-        self.assertIn(
-            "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97",
-            job,
-        )
-        self.assertIn('python-version: "3.12"', job)
+        self.assertNotIn("actions/setup-python@", job)
+        self.assertIn("py -3.12 --version || exit /b 1", job)
+        self.assertIn("os.path.dirname(sys.executable)", job)
+        self.assertIn("echo %%P>>\"%GITHUB_PATH%\"", job)
+        self.assertIn("platform.python_version()", job)
+        self.assertIn("$python -notmatch '\\|3\\.12\\.'", job)
         self.assertIn("real-weights-huggingface-hub-windows-x64-py312.txt", job)
         for required in (
             "config.json",
