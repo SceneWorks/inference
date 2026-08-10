@@ -192,10 +192,10 @@ pub fn encode_prompt(
 /// returns its packed final latents; this helper handles the seed sequence, the `Decoding` progress
 /// tick, unpack + decode, and image collection identically for every variant.
 ///
-/// `pid_decoder` is the optional latent→pixel decode seam (sc-7844). The native [`QwenVae`] remains
-/// explicit so the shared memory ladder can select its head-once/tail-tiled path without wrapping or
-/// changing the PiD route. PiD output may be larger than VAE-native, so downstream size is taken
-/// from the decoded tensor, not assumed.
+/// `pid_decoder` is the optional latent→pixel decode seam (sc-7844). The native [`QwenVae`] implements
+/// the same tiled trait entry point, so bounded decode no longer requires a concrete-type escape.
+/// PiD inherits the forwarding default (and keeps its own tile policy). Its output may be larger than
+/// VAE-native, so downstream size is taken from the decoded tensor, not assumed.
 #[allow(clippy::too_many_arguments)] // One explicit, shared decode seam preserves all variant inputs.
 pub fn decode_and_collect<F>(
     vae: &QwenVae,
@@ -213,16 +213,20 @@ pub fn decode_and_collect<F>(
 where
     F: FnMut(u64, &mut dyn FnMut(Progress)) -> Result<Array>,
 {
+    let decoder: &dyn LatentDecoder = pid_decoder.unwrap_or(vae);
+    mlx_gen::ensure_decoder_compatible(
+        Some(&mlx_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE),
+        decoder,
+    )?;
     let mut images = Vec::with_capacity(count as usize);
     for i in 0..count {
         let seed = base_seed.wrapping_add(i as u64);
         let latents = denoise_one(seed, on_progress)?;
         on_progress(Progress::Decoding);
         let unpacked = unpack_latents(&latents, width, height)?;
-        let decoded = match (pid_decoder, tiling) {
-            (Some(pid), _) => pid.decode(&unpacked)?,
-            (None, Some(cfg)) => vae.decode_tiled(&unpacked, cfg, Some(&req.cancel))?,
-            (None, None) => vae.decode(&unpacked)?,
+        let decoded = match tiling {
+            Some(cfg) => decoder.decode_tiled(&unpacked, cfg, Some(&req.cancel))?,
+            None => decoder.decode(&unpacked)?,
         }
         .as_dtype(Dtype::Float32)?;
         // Fire the conformance fault only after the selected decoder (including every native VAE

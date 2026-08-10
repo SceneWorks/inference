@@ -99,6 +99,7 @@ use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::gen_core::tiling::TilingConfig;
 use candle_gen::gen_core::tokenizer::TextTokenizer;
 use candle_gen::gen_core::{
     self, Capabilities, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality,
@@ -463,21 +464,36 @@ impl Pipeline {
             // consume the same normalized `[1,16,H/8,W/8]` latent (QwenVae de-normalizes internally,
             // and PiD is trained on that normalized latent) — a zero-transform seam. PiD returns a
             // larger `[1,3,4H,4W]` tensor; `to_image` reads the size from it.
-            let decoded = match &pid_decoder {
-                Some(pid) => pid.decode(&lat)?,
-                None => vae.decode_with_tile(
-                    &lat,
-                    memory.tile_vae_decode.then(|| {
-                        (
-                            memory
-                                .decode_tile_edge
-                                .unwrap_or(memory_strategy::DECODE_TILE_EDGE),
-                            memory
-                                .decode_overlap
-                                .unwrap_or(memory_strategy::DECODE_OVERLAP),
-                        )
-                    }),
-                )?,
+            let decoder: &dyn LatentDecoder = pid_decoder
+                .as_ref()
+                .map(|decoder| decoder as &dyn LatentDecoder)
+                .unwrap_or(vae);
+            candle_gen::ensure_decoder_compatible(
+                Some(&candle_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE),
+                decoder,
+            )?;
+            let tiling = memory
+                .tile_vae_decode
+                .then(|| {
+                    let edge = memory
+                        .decode_tile_edge
+                        .unwrap_or(memory_strategy::DECODE_TILE_EDGE);
+                    let overlap = memory
+                        .decode_overlap
+                        .unwrap_or(memory_strategy::DECODE_OVERLAP);
+                    Ok::<_, CandleError>(TilingConfig::spatial_only(
+                        edge.try_into().map_err(|_| {
+                            CandleError::Msg(format!("Qwen decode tile edge {edge} exceeds i32"))
+                        })?,
+                        overlap.try_into().map_err(|_| {
+                            CandleError::Msg(format!("Qwen decode overlap {overlap} exceeds i32"))
+                        })?,
+                    ))
+                })
+                .transpose()?;
+            let decoded = match tiling.as_ref() {
+                Some(tiling) => decoder.decode_tiled(&lat, tiling, Some(&req.cancel))?,
+                None => decoder.decode(&lat)?,
             };
             control_common::to_image(&decoded)
         })

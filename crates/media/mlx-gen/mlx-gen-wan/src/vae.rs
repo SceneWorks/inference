@@ -25,10 +25,11 @@ use mlx_gen::gen_core::{QWEN_WAN_Z16_MEAN as VAE_MEAN, QWEN_WAN_Z16_STD as VAE_S
 use mlx_gen::nn::{conv2d, conv3d, silu, upsample_nearest};
 use mlx_gen::tiling::{TilingConfig, VaeTiling};
 use mlx_gen::weights::Weights;
-use mlx_gen::{CancelFlag, Error, Result};
+use mlx_gen::{CancelFlag, Error, LatentDecoder, Result};
 
 use crate::vae_common::{
-    contiguous, last_t_axis, scalar, slice_axis, tile_decode_accumulate, FeatCache,
+    contiguous, last_t_axis, scalar, slice_axis, tile_decode_accumulate, validate_decoder_tiling,
+    FeatCache,
 };
 
 /// Last-`CACHE_T` frames are carried across chunks as causal left-context during encode.
@@ -510,6 +511,105 @@ pub struct WanVae {
     encoder: Option<(CausalConv3d, Encoder3d)>, // (post-encoder conv1, encoder)
     mean: Array,                                // [1, z, 1, 1, 1]
     inv_std: Array,                             // [1, z, 1, 1, 1]
+}
+
+/// Trait adapter for the ordinary Wan z16 video layout. It keeps the VAE's native NCTHW input/output
+/// while publishing the video denoiser's temporal latent identity to generic decode callers.
+pub struct WanVideoDecoder<'a> {
+    vae: &'a WanVae,
+}
+
+impl<'a> WanVideoDecoder<'a> {
+    pub fn new(vae: &'a WanVae) -> Self {
+        Self { vae }
+    }
+}
+
+impl LatentDecoder for WanVideoDecoder<'_> {
+    fn input_latent_space(&self) -> Option<&mlx_gen::gen_core::LatentSpace> {
+        Some(&mlx_gen::gen_core::WAN_Z16_VIDEO_LATENT_SPACE)
+    }
+
+    fn decode(&self, latents: &Array) -> Result<Array> {
+        if latents.shape().len() != 5 {
+            return Err(Error::Msg(format!(
+                "Wan z16 video decoder expects [B,C,T,H,W], got {:?}",
+                latents.shape()
+            )));
+        }
+        self.vae.decode(latents)
+    }
+
+    fn decode_tiled(
+        &self,
+        latents: &Array,
+        tiling: &TilingConfig,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<Array> {
+        if latents.shape().len() != 5 {
+            return Err(Error::Msg(format!(
+                "Wan z16 video decoder expects [B,C,T,H,W], got {:?}",
+                latents.shape()
+            )));
+        }
+        validate_decoder_tiling(tiling, VaeTiling::WAN, latents.shape()[2])?;
+        self.vae.decode_tiled(latents, tiling, cancel)
+    }
+}
+
+/// Single-image z16 adapter used by image pipelines that intentionally substitute the Wan VAE. The
+/// shared z16 normalization is accepted as rank-4 NCHW, lifted to a one-latent-frame Wan decode, and
+/// reduced back to a singleton-frame NCTHW image by selecting the leading output frame. Wan z16 is
+/// non-causal and expands one latent frame to four decoded frames; image lanes consume the first.
+pub struct WanSingleFrameDecoder<'a> {
+    vae: &'a WanVae,
+}
+
+impl<'a> WanSingleFrameDecoder<'a> {
+    pub fn new(vae: &'a WanVae) -> Self {
+        Self { vae }
+    }
+
+    fn input_5d(latents: &Array) -> Result<Array> {
+        let shape = latents.shape();
+        if shape.len() != 4 {
+            return Err(Error::Msg(format!(
+                "Wan z16 single-frame decoder expects [B,C,H,W], got {shape:?}"
+            )));
+        }
+        Ok(latents.reshape(&[shape[0], shape[1], 1, shape[2], shape[3]])?)
+    }
+
+    fn first_frame(decoded: &Array) -> Result<Array> {
+        let shape = decoded.shape();
+        if shape.len() != 5 || shape[2] < 1 {
+            return Err(Error::Msg(format!(
+                "Wan z16 single-frame decoder produced invalid [B,3,T,H,W] output {shape:?}"
+            )));
+        }
+        slice_axis(decoded, 2, 0, 1)
+    }
+}
+
+impl LatentDecoder for WanSingleFrameDecoder<'_> {
+    fn input_latent_space(&self) -> Option<&mlx_gen::gen_core::LatentSpace> {
+        Some(&mlx_gen::gen_core::WAN_Z16_LATENT_SPACE)
+    }
+
+    fn decode(&self, latents: &Array) -> Result<Array> {
+        Self::first_frame(&self.vae.decode(&Self::input_5d(latents)?)?)
+    }
+
+    fn decode_tiled(
+        &self,
+        latents: &Array,
+        tiling: &TilingConfig,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<Array> {
+        let latents = Self::input_5d(latents)?;
+        validate_decoder_tiling(tiling, VaeTiling::WAN, 1)?;
+        Self::first_frame(&self.vae.decode_tiled(&latents, tiling, cancel)?)
+    }
 }
 
 impl WanVae {

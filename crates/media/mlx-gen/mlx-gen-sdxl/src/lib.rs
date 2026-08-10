@@ -76,7 +76,7 @@ pub use tokenizer::{ClipBpeTokenizer, PAD_ID};
 pub use training::family::{train_family, SdxlFamilyHooks, TrainTimestep};
 pub use training::{load_trainer, SdxlTrainer};
 pub use unet::{ControlNet, ControlResiduals, Transformer2D, UNet2DConditionModel};
-pub use vae::Autoencoder;
+pub use vae::{Autoencoder, SdxlLatentDecoder};
 pub use vision_encoder::{ClipVisionEncoder, VisionConfig};
 
 // sc-2963 compiled-glue toggle: when on, the UNet's remaining fusable elementwise glue — the **SiLU**

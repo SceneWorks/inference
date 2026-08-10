@@ -88,7 +88,13 @@ pub(crate) fn decode(
     latents: &Tensor,
 ) -> Result<Image> {
     let img = match pid {
-        Some(pid) => pid.decode(latents)?,
+        Some(pid) => {
+            candle_gen::ensure_decoder_compatible(
+                Some(&candle_gen::gen_core::SDXL_LATENT_SPACE),
+                pid,
+            )?;
+            pid.decode(latents)?
+        }
         None => vae.decode(&(latents / VAE_SCALE)?)?,
     };
     to_image(&img)

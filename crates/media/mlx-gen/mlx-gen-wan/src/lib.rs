@@ -109,6 +109,8 @@ pub use scheduler::{
     compute_sigmas, make_scheduler, FlowDpmpp2m, FlowMatchEuler, FlowUniPC, SolverKind,
     WanScheduler,
 };
+pub use vae::{WanSingleFrameDecoder, WanVideoDecoder};
+pub use vae22::Wan22VideoDecoder;
 
 #[cfg(test)]
 mod conditioning_budget_tests {

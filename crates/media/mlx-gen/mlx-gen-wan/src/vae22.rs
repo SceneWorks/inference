@@ -36,10 +36,11 @@ use mlx_gen::gen_core::{WAN_Z48_MEAN as VAE22_MEAN, WAN_Z48_STD as VAE22_STD};
 use mlx_gen::nn::{conv2d, conv3d, silu, upsample_nearest};
 use mlx_gen::tiling::{TilingConfig, VaeTiling};
 use mlx_gen::weights::Weights;
-use mlx_gen::{CancelFlag, Error, Result};
+use mlx_gen::{CancelFlag, Error, LatentDecoder, Result};
 
 use crate::vae_common::{
-    contiguous, eval, last_t_axis, scalar, slice_axis, tile_decode_accumulate, FeatCache,
+    contiguous, eval, last_t_axis, scalar, slice_axis, tile_decode_accumulate,
+    validate_decoder_tiling, FeatCache,
 };
 
 /// Last-`CACHE_T` frames are carried across chunks as causal left-context during encode.
@@ -853,6 +854,54 @@ pub struct Wan22Vae {
     /// per-tile decoder-activation footprint. The latent denorm and the `RMS_norm` reduction always
     /// run f32; this only governs the conv-heavy body. Decode-only — encode stays whatever loaded.
     compute_dtype: Dtype,
+}
+
+/// Generic decode adapter for the Wan 2.2 z48 video VAE. The underlying implementation is
+/// channels-last; the trait boundary normalizes its decoded output to NCTHW like the other decoders.
+pub struct Wan22VideoDecoder<'a> {
+    vae: &'a Wan22Vae,
+}
+
+impl<'a> Wan22VideoDecoder<'a> {
+    pub fn new(vae: &'a Wan22Vae) -> Self {
+        Self { vae }
+    }
+
+    fn to_ncthw(decoded: &Array) -> Result<Array> {
+        let shape = decoded.shape();
+        if shape.len() != 5 || shape[4] != 3 {
+            return Err(Error::Msg(format!(
+                "Wan z48 decoder produced invalid [B,T,H,W,3] output {shape:?}"
+            )));
+        }
+        Ok(decoded.transpose_axes(&[0, 4, 1, 2, 3])?)
+    }
+}
+
+impl LatentDecoder for Wan22VideoDecoder<'_> {
+    fn input_latent_space(&self) -> Option<&mlx_gen::gen_core::LatentSpace> {
+        Some(&mlx_gen::gen_core::WAN_Z48_LATENT_SPACE)
+    }
+
+    fn decode(&self, latents: &Array) -> Result<Array> {
+        Self::to_ncthw(&self.vae.decode(latents)?)
+    }
+
+    fn decode_tiled(
+        &self,
+        latents: &Array,
+        tiling: &TilingConfig,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<Array> {
+        let shape = latents.shape();
+        if shape.len() != 4 {
+            return Err(Error::Msg(format!(
+                "Wan z48 video decoder expects [C,T,H,W], got {shape:?}"
+            )));
+        }
+        validate_decoder_tiling(tiling, VaeTiling::WAN22, shape[1])?;
+        Self::to_ncthw(&self.vae.decode_tiled(latents, tiling, cancel)?)
+    }
 }
 
 impl Wan22Vae {

@@ -955,25 +955,24 @@ pub(crate) fn denoise_batch(
 }
 
 /// Phase 2 of the staged render (sc-13571): decode each evaluated latent → RGB8 [`Image`]. Uses the
-/// memory-bounded [`Vae::decode_tiled`] when `tiling` is `Some` (small-Mac / large-image), else the
-/// exact single-pass [`Vae::decode`]; a PiD super-res decoder, when present, takes precedence (its own
-/// decode, untiled). `[16,1,H,W] → [1,16,H,W]`; the native VAE + PiD both accept the 4-D latent directly.
+/// memory-bounded [`LatentDecoder::decode_tiled`] when `tiling` is `Some` (small-Mac / large-image),
+/// else the exact single-pass [`LatentDecoder::decode`]. Native VAE and PiD now share this one entry;
+/// PiD inherits the forwarding default and retains its own tiling policy. `[16,1,H,W] → [1,16,H,W]`.
 pub(crate) fn decode_batch(
-    vae: &Vae,
-    pid_decoder: Option<&dyn LatentDecoder>,
+    decoder: &dyn LatentDecoder,
     tiling: Option<&TilingConfig>,
     latents: Vec<Array>,
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Vec<Image>> {
+    mlx_gen::ensure_decoder_compatible(Some(&mlx_gen::gen_core::FLUX1_LATENT_SPACE), decoder)?;
     let mut images = Vec::with_capacity(latents.len());
     for latent in latents {
         on_progress(Progress::Decoding);
         let unpacked = unpack_latents(&latent)?;
-        let decoded = match (pid_decoder, tiling) {
-            (Some(pid), _) => pid.decode(&unpacked)?,
-            (None, Some(cfg)) => vae.decode_tiled(&unpacked, cfg, Some(cancel))?,
-            (None, None) => vae.decode(&unpacked)?,
+        let decoded = match tiling {
+            Some(cfg) => decoder.decode_tiled(&unpacked, cfg, Some(cancel))?,
+            None => decoder.decode(&unpacked)?,
         };
         images.push(decoded_to_image(&decoded.as_dtype(Dtype::Float32)?)?);
     }

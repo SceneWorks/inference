@@ -301,7 +301,7 @@ fn render_one_preview(
     let latents = preview_latents(unet, cond, cfg, lat_h, lat_w, compute_dtype, seed, device)?;
     // The shared decode expects compute-dtype latents (like the inference curated loop); un-scale +
     // `x/2 + 0.5` + clamp + ×255 → RGB8 `Image` lives in `crate::denoise::decode_image`.
-    decode_image(vae, &latents, None)
+    decode_image(vae, &latents, None, None)
 }
 
 /// The curated denoise behind [`render_one_preview`] (sc-11173 / F-083), returning the final
