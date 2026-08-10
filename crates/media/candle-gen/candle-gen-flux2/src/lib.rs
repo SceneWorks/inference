@@ -829,7 +829,13 @@ impl Pipeline {
             let decoded = match pid_decoder {
                 // PiD consumes the packed BN-normalized [1,128,H/16,W/16] latent directly (the same
                 // tensor decode_packed BN-de-normalizes); returns [1,3,4H,4W].
-                Some(pid) => pid.decode(&packed)?,
+                Some(pid) => {
+                    candle_gen::ensure_decoder_layout(
+                        Some(&candle_gen::gen_core::FLUX2_PACKED_LATENT_SPACE),
+                        pid,
+                    )?;
+                    pid.decode(&packed)?
+                }
                 None if req.memory.is_some_and(|memory| memory.tile_vae_decode) => {
                     let memory = req.memory.expect("guarded above");
                     vae.decode_packed_tiled(

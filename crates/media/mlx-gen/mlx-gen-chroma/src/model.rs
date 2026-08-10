@@ -831,12 +831,11 @@ impl Chroma {
         cancel: &CancelFlag,
     ) -> Result<Image> {
         let unpacked = unpack_latents(latents, width, height)?;
-        let decoded = match (decoder, tiling) {
-            // The native VAE, bounded. `decode_tiled` is the shared head-once/tail-tiled decoder
-            // every crate in the FLUX.1 / Z-Image latent space uses.
-            (None, Some(tiling)) => vae.decode_tiled(&unpacked, tiling, Some(cancel))?,
-            (Some(d), _) => d.decode(&unpacked)?,
-            (None, None) => vae.decode(&unpacked)?,
+        let decoder: &dyn LatentDecoder = decoder.unwrap_or(vae);
+        mlx_gen::ensure_decoder_compatible(Some(&mlx_gen::gen_core::FLUX1_LATENT_SPACE), decoder)?;
+        let decoded = match tiling {
+            Some(tiling) => decoder.decode_tiled(&unpacked, tiling, Some(cancel))?,
+            None => decoder.decode(&unpacked)?,
         };
         let decoded = decoded.as_dtype(mlx_rs::Dtype::Float32)?;
         decoded_to_image(&decoded)

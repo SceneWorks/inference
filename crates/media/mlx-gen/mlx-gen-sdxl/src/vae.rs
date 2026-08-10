@@ -12,7 +12,7 @@ use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::array::scalar;
 use mlx_gen::nn::{conv2d, group_norm, silu, upsample_nearest};
 use mlx_gen::weights::Weights;
-use mlx_gen::Result;
+use mlx_gen::{CancelFlag, Error, LatentDecoder, Result};
 
 use crate::config::VaeConfig;
 use crate::unet::ResnetBlock2D;
@@ -386,5 +386,64 @@ impl Autoencoder {
         let idx = Array::from_slice(&(0..half).collect::<Vec<i32>>(), &[half]);
         let mean = moments.take_axis(&idx, 3)?;
         Ok(multiply(&mean, scalar(self.scaling_factor))?)
+    }
+}
+
+/// NCHW adapter for the backend-generic decode seam. The native SDXL VAE is internally NHWC, so the
+/// wrapper performs only the two layout transposes around its established decode methods; the VAE
+/// still owns SDXL's `1 / scaling_factor` de-normalization and all native tile geometry.
+pub struct SdxlLatentDecoder<'a> {
+    vae: &'a Autoencoder,
+}
+
+impl<'a> SdxlLatentDecoder<'a> {
+    pub fn new(vae: &'a Autoencoder) -> Self {
+        Self { vae }
+    }
+
+    fn to_nhwc(latents: &Array) -> Result<Array> {
+        let shape = latents.shape();
+        if shape.len() != 4 || shape[1] != mlx_gen::gen_core::SDXL_LATENT_SPACE.channels as i32 {
+            return Err(Error::Msg(format!(
+                "SDXL decoder expects NCHW [B,4,H,W], got {shape:?}"
+            )));
+        }
+        Ok(latents.transpose_axes(&[0, 2, 3, 1])?)
+    }
+
+    fn to_nchw(decoded: &Array) -> Result<Array> {
+        let shape = decoded.shape();
+        if shape.len() != 4 || shape[3] != 3 {
+            return Err(Error::Msg(format!(
+                "SDXL decoder produced invalid NHWC [B,H,W,3] output {shape:?}"
+            )));
+        }
+        Ok(decoded.transpose_axes(&[0, 3, 1, 2])?)
+    }
+}
+
+impl LatentDecoder for SdxlLatentDecoder<'_> {
+    fn input_latent_space(&self) -> Option<&mlx_gen::gen_core::LatentSpace> {
+        Some(&mlx_gen::gen_core::SDXL_LATENT_SPACE)
+    }
+
+    fn decode(&self, latents: &Array) -> Result<Array> {
+        Self::to_nchw(&self.vae.decode(&Self::to_nhwc(latents)?)?)
+    }
+
+    fn decode_tiled(
+        &self,
+        latents: &Array,
+        tiling: &mlx_gen::tiling::TilingConfig,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<Array> {
+        if cancel.is_some_and(CancelFlag::is_cancelled) {
+            return Err(Error::Canceled);
+        }
+        Self::to_nchw(
+            &self
+                .vae
+                .decode_tiled(&Self::to_nhwc(latents)?, tiling, cancel)?,
+        )
     }
 }

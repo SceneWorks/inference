@@ -885,10 +885,17 @@ impl Flux1 {
             )?;
             on_progress(Progress::Decoding);
             let unpacked = unpack_latents(&final_latents, req.width, req.height)?;
-            let decoded = match (&pid_decoder, &native_tiling) {
-                (Some(pid), _) => pid.decode(&unpacked)?,
-                (None, Some(tiling)) => vae.decode_tiled(&unpacked, tiling, Some(&req.cancel))?,
-                (None, None) => vae.decode(&unpacked)?,
+            let decoder: &dyn LatentDecoder = pid_decoder
+                .as_ref()
+                .map(|d| d as &dyn LatentDecoder)
+                .unwrap_or(vae);
+            mlx_gen::ensure_decoder_compatible(
+                self.descriptor.denoiser_output_latent_space,
+                decoder,
+            )?;
+            let decoded = match &native_tiling {
+                Some(tiling) => decoder.decode_tiled(&unpacked, tiling, Some(&req.cancel))?,
+                None => decoder.decode(&unpacked)?,
             }
             .as_dtype(Dtype::Float32)?;
             // A fault probe must observe the selected lazy decode before returning its synthetic

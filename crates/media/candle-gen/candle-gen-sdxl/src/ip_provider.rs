@@ -354,7 +354,7 @@ impl IpAdapterSdxl {
         // generation opted in (`req.use_pid`) and `with_pid` loaded one (epic 7840, sc-8044).
         let pid_decoder = self.pid_decoder_for(req)?;
         let pid_ref = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
-        decode_image(&self.vae, &latents, pid_ref)
+        decode_image(&self.vae, &latents, pid_ref, Some(&req.cancel))
     }
 
     /// Build the CFG-batched IP tokens from the reference image. **Uncond-first**: under CFG the uncond

@@ -795,7 +795,7 @@ impl KreaHeavy {
                     .to_owned(),
             ));
         }
-        self.decode_latents_native_tiled(&lat, decode_tiling, cancel)
+        self.decode_latents_with_tiling(&lat, None, decode_tiling, cancel)
     }
 
     /// **img2img latent-init Turbo render** (epic 8588 slice A; sc-8589/sc-8590) — the denoise/decode
@@ -1437,35 +1437,28 @@ impl KreaHeavy {
         opts: &TurboOptions,
         cancel: &CancelFlag,
     ) -> Result<Image> {
-        let decoded = match decoder {
-            // PiD binds its request-selected 2048/256 tile plan when the decoder is minted. The
-            // native 512/64 TilingConfig is therefore constructed only for the native Qwen VAE.
-            Some(decoder) => decoder.decode(lat)?,
-            None => match opts.decode_tiling()?.as_ref() {
-                Some(cfg) => self.vae.decode_tiled(lat, cfg, Some(cancel))?,
-                None => self.vae.decode(lat)?,
-            },
-        }
-        .as_dtype(Dtype::Float32)?;
-        decoded_to_image(&decoded)
+        self.decode_latents_with_tiling(lat, decoder, opts.decode_tiling()?.as_ref(), cancel)
     }
 
-    /// Decode a latent through the **native Qwen-VAE**, memory-bounded by tiling when `decode_tiling` is
-    /// `Some` (sc-11747). The control lane never routes a PiD decoder (the pose lane is native-VAE only),
-    /// so this is the control decode seam: `Some(cfg)` runs [`QwenVae::decode_tiled`] (the tiled decode
-    /// selected by the budget gate), `None` the single-pass [`QwenVae::decode`]. Same
-    /// `decoded_to_image` post-step (`clip(x·0.5 + 0.5, 0, 1)`, dropping the singleton temporal axis) as
-    /// [`Self::decode_latents`], so a tiled and an untiled decode yield the same image up to the blend
-    /// tolerance. `cancel` lets the tiled decode abort between tiles.
-    fn decode_latents_native_tiled(
+    /// Decode through the shared trait seam. The native Qwen VAE implements tiled decode; PiD inherits
+    /// the forwarding default and therefore does not accidentally consume native-VAE tile geometry.
+    /// The control lane passes no decoder override and reaches the native implementation through the
+    /// same seam.
+    fn decode_latents_with_tiling(
         &self,
         lat: &Array,
+        decoder: Option<&dyn LatentDecoder>,
         decode_tiling: Option<&TilingConfig>,
         cancel: &CancelFlag,
     ) -> Result<Image> {
+        let decoder: &dyn LatentDecoder = decoder.unwrap_or(&self.vae);
+        mlx_gen::ensure_decoder_compatible(
+            Some(&mlx_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE),
+            decoder,
+        )?;
         let decoded = match decode_tiling {
-            Some(cfg) => self.vae.decode_tiled(lat, cfg, Some(cancel))?,
-            None => self.vae.decode(lat)?,
+            Some(cfg) => decoder.decode_tiled(lat, cfg, Some(cancel))?,
+            None => decoder.decode(lat)?,
         }
         .as_dtype(Dtype::Float32)?;
         decoded_to_image(&decoded)

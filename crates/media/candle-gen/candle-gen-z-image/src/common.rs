@@ -287,7 +287,13 @@ pub(crate) fn decode(
     // the size from the tensor (never `latent*8`).
     let latents = latents.squeeze(LATENT_FRAME_AXIS)?;
     let decoded = match pid {
-        Some(pid) => pid.decode(&latents)?,
+        Some(pid) => {
+            candle_gen::ensure_decoder_compatible(
+                Some(&candle_gen::gen_core::FLUX1_LATENT_SPACE),
+                pid,
+            )?;
+            pid.decode(&latents)?
+        }
         None => vae.decode(&latents)?.to_dtype(DType::F32)?, // (1, 3, H, W) in [-1, 1]
     };
     decoded_to_image(&decoded)
