@@ -335,9 +335,10 @@ class FeatureEpicPolicyTests(unittest.TestCase):
         self.assert_rejected(
             "pull_request",
             event,
-            "GITHUB_SHA must equal pull_request.merge_commit_sha",
+            "exact payload base/head parents",
             use_event_sha=False,
             active_sha="7" * 40,
+            commit_parent_resolver=lambda _commit: ("7" * 40, PR_HEAD_SHA),
         )
         self.assert_rejected(
             "pull_request",
@@ -370,6 +371,16 @@ class FeatureEpicPolicyTests(unittest.TestCase):
             active_sha=PR_MERGE_SHA,
             commit_parent_resolver=lambda _commit: ("7" * 40, PR_HEAD_SHA),
         )
+
+        stale = pull_request_event(STORY, FEATURE)
+        stale["pull_request"]["merge_commit_sha"] = "8" * 40
+        reason = validate(
+            "pull_request",
+            stale,
+            use_event_sha=False,
+            active_sha=PR_MERGE_SHA,
+        )
+        self.assertIn("story", reason)
 
     def test_local_merge_parent_resolver_requires_exactly_two_parents(self) -> None:
         result = SimpleNamespace(returncode=0, stdout=f"{PR_BASE_SHA} {PR_HEAD_SHA}\n", stderr="")
@@ -509,13 +520,13 @@ class FeatureEpicPolicyTests(unittest.TestCase):
             validate("pull_request", event, repository="other/inference")
 
     def test_cli_reports_success_and_annotations_for_policy_errors(self) -> None:
-        valid = pull_request_event("fix/ordinary", "main")
-        invalid = deepcopy(valid)
+        valid = {"repository": {"full_name": REPOSITORY}}
+        invalid = pull_request_event("fix/ordinary", "main")
         invalid["pull_request"]["merge_commit_sha"] = "not-a-commit"
 
-        for payload, expected_code, expected_text in (
-            (valid, 0, "feature epic branch policy:"),
-            (invalid, 1, "::error title=Feature epic branch policy::"),
+        for event_name, payload, expected_code, expected_text in (
+            ("workflow_dispatch", valid, 0, "feature epic branch policy:"),
+            ("pull_request", invalid, 1, "::error title=Feature epic branch policy::"),
         ):
             with self.subTest(expected_code=expected_code):
                 with tempfile.TemporaryDirectory() as temp_dir:
@@ -526,7 +537,7 @@ class FeatureEpicPolicyTests(unittest.TestCase):
                             sys.executable,
                             str(SCRIPT),
                             "--event-name",
-                            "pull_request",
+                            event_name,
                             "--event-path",
                             str(event_path),
                             "--repository",

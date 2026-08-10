@@ -202,12 +202,10 @@ def _active_pull_request_revision(
         raise PolicyError("pull_request.merge_commit_sha is missing")
     merge_commit_sha = pull_request["merge_commit_sha"]
     if merge_commit_sha not in (None, ""):
-        merge_commit_sha = _commit_sha(
+        _commit_sha(
             _string(merge_commit_sha, "pull_request.merge_commit_sha"),
             "pull_request.merge_commit_sha",
         )
-        _active_revision(active_sha, merge_commit_sha, "pull_request.merge_commit_sha")
-        return
 
     if active_sha is None:
         raise PolicyError("GITHUB_SHA is required for this event")
