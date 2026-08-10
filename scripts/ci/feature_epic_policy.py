@@ -5,7 +5,7 @@ Feature work is integrated through a repository-local branch train:
 
 * ``story/sc-<story>-epic-<epic>-<slug>`` -> the unique live
   ``feature/sc-<epic>-<slug>`` with the same canonical slug;
-* ``sync/sc-<epic>-main-<date>`` -> matching feature branch; and
+* ``sync/sc-<epic>-main-<date>[-<sequence>]`` -> matching feature branch; and
 * a feature branch -> ``main``.
 
 Ordinary pull requests remain unaffected.  The explicit epic marker on story
@@ -35,6 +35,7 @@ STORY_RE = re.compile(
 )
 SYNC_RE = re.compile(
     r"sync/sc-(?P<epic>[1-9][0-9]*)-main-(?P<day>[0-9]{4}-[0-9]{2}-[0-9]{2})"
+    r"(?:-(?P<sequence>[1-9][0-9]*))?"
 )
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 EPIC_STORY_PREFIX_RE = re.compile(r"^story/sc-[1-9][0-9]*-epic(?:-|$)")
@@ -129,7 +130,7 @@ def _parse_train_branch(branch: str) -> TrainBranch | None:
         raise PolicyError(
             "malformed feature-epic branch; expected feature/sc-<epic>-<slug>, "
             "story/sc-<story>-epic-<epic>-<slug>, or "
-            f"sync/sc-<epic>-main-<YYYY-MM-DD>: {branch!r}"
+            f"sync/sc-<epic>-main-<YYYY-MM-DD>[-<sequence>]: {branch!r}"
         )
     return None
 

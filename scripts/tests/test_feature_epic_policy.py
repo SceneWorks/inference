@@ -192,6 +192,14 @@ class FeatureEpicPolicyTests(unittest.TestCase):
             "must target its matching feature branch",
         )
 
+        validate(
+            "pull_request",
+            pull_request_event(
+                "sync/sc-18304-main-2026-08-10-2",
+                "feature/sc-18304-pipeline-flexibility-mlx-perf",
+            ),
+        )
+
     def test_sync_date_must_be_a_real_calendar_date(self) -> None:
         self.assert_rejected(
             "pull_request",
