@@ -2034,6 +2034,39 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             with self.subTest(assignment=assignment):
                 self.assertIn("github.event.merge_group.base_sha", assignment)
 
+    def test_feature_epic_policy_runs_in_the_unconditional_gate_path(self) -> None:
+        workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+        changes = workflow["jobs"]["changes"]
+        policy_steps = [
+            step
+            for step in changes["steps"]
+            if step.get("run") == "python3 scripts/ci/feature_epic_policy.py"
+        ]
+        self.assertEqual(
+            len(policy_steps),
+            1,
+            "the feature-epic policy must run exactly once in the always-created changes job",
+        )
+        self.assertNotIn(
+            "if",
+            policy_steps[0],
+            "event or path gating the policy would let an invalid topology omit its verdict",
+        )
+        self.assertNotIn(
+            "if",
+            changes,
+            "the changes job is the always-run trust boundary for feature-epic topology",
+        )
+        self.assertIn(
+            "changes",
+            workflow["jobs"]["gate"]["needs"],
+            "CI gate must fail when the topology policy in changes fails",
+        )
+
+        triggers = workflow[True]
+        self.assertIn("pull_request", triggers)
+        self.assertIn("merge_group", triggers)
+
     def test_gate_aggregates_every_lane_and_runs_when_they_fail(self) -> None:
         workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
         jobs = workflow["jobs"]
