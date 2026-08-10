@@ -202,8 +202,13 @@ pub fn gated(x: &Array, gate: &Array, y: &Array) -> Result<Array> {
         add(x, &multiply(g, y)?)
     };
     if compile_glue() {
+        crate::diagnostics::record_compile(
+            "mlx_gen::nn::gated",
+            crate::diagnostics::CompileDisposition::OneShot,
+        );
         Ok(compile(f, true)((x, gate, y))?)
     } else {
+        crate::diagnostics::record_fallback("mlx_gen::nn::gated", "compiled_glue_disabled");
         Ok(f((x, gate, y))?)
     }
 }
@@ -219,8 +224,13 @@ pub fn rope_rotate(real: &Array, imag: &Array, cos: &Array, sin: &Array) -> Resu
     };
     let args = [real.clone(), imag.clone(), cos.clone(), sin.clone()];
     let mut out = if compile_glue() {
+        crate::diagnostics::record_compile(
+            "mlx_gen::nn::rope_rotate",
+            crate::diagnostics::CompileDisposition::OneShot,
+        );
         compile(f, true)(&args)?
     } else {
+        crate::diagnostics::record_fallback("mlx_gen::nn::rope_rotate", "compiled_glue_disabled");
         f(&args)?
     };
     let out1 = out.pop().unwrap();
@@ -313,8 +323,13 @@ pub fn modulate(
         add(&multiply(n, &add(s, &one)?)?, sh)
     };
     if compile_glue() {
+        crate::diagnostics::record_compile(
+            "mlx_gen::nn::modulate",
+            crate::diagnostics::CompileDisposition::OneShot,
+        );
         Ok(compile(f, true)((norm, scale, shift))?)
     } else {
+        crate::diagnostics::record_fallback("mlx_gen::nn::modulate", "compiled_glue_disabled");
         Ok(f((norm, scale, shift))?)
     }
 }
@@ -384,6 +399,10 @@ pub fn gelu_exact(x: &Array) -> Result<Array> {
         let gate = add(&one, &inner)?; // 1 + erf(x / √2)
         divide(&multiply(x_, &gate)?, &two) // (x · gate) / 2
     };
+    crate::diagnostics::record_compile(
+        "mlx_gen::nn::gelu_exact",
+        crate::diagnostics::CompileDisposition::OneShot,
+    );
     Ok(compile(f, true)(x)?)
 }
 
@@ -397,6 +416,10 @@ pub fn gelu_quick(x: &Array) -> Result<Array> {
         let c = scalar(1.702).as_dtype(x_.dtype())?;
         multiply(x_, &sigmoid(&multiply(x_, &c)?)?) // x · sigmoid(1.702·x)
     };
+    crate::diagnostics::record_compile(
+        "mlx_gen::nn::gelu_quick",
+        crate::diagnostics::CompileDisposition::OneShot,
+    );
     Ok(compile(f, true)(x)?)
 }
 

@@ -51,6 +51,7 @@ pub mod weights;
 // train→kernels, tokenizer→to_arrays, image→decoded_to_image).
 pub mod caption;
 pub mod decoder;
+pub mod diagnostics;
 pub mod image;
 pub mod tokenizer;
 pub mod train;

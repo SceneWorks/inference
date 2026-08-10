@@ -191,8 +191,16 @@ fn modulate(x: &Array, mod_params: &Array) -> Result<(Array, Array)> {
         )
     };
     let out = if compile_glue() {
+        mlx_gen::diagnostics::record_compile(
+            "qwen_image::block::modulate",
+            mlx_gen::diagnostics::CompileDisposition::OneShot,
+        );
         compile(f, true)((x, &scale, &shift))?
     } else {
+        mlx_gen::diagnostics::record_fallback(
+            "qwen_image::block::modulate",
+            "compiled_glue_disabled",
+        );
         f((x, &scale, &shift))?
     };
     Ok((out, gate))
@@ -237,8 +245,13 @@ fn gated(x: &Array, gate: &Array, y: &Array) -> Result<Array> {
         add(x, &multiply(g, y)?)
     };
     if compile_glue() {
+        mlx_gen::diagnostics::record_compile(
+            "qwen_image::block::gated",
+            mlx_gen::diagnostics::CompileDisposition::OneShot,
+        );
         Ok(compile(f, true)((x, gate, y))?)
     } else {
+        mlx_gen::diagnostics::record_fallback("qwen_image::block::gated", "compiled_glue_disabled");
         Ok(f((x, gate, y))?)
     }
 }

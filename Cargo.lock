@@ -3228,7 +3228,12 @@ dependencies = [
  "candle-audio-catalog",
  "mlx-gen-catalog",
  "mlx-llm",
+ "pmetal-mlx-rs",
  "runtime-catalog",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]

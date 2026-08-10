@@ -35,8 +35,13 @@ fn rope_rotate(x_real: &Array, x_imag: &Array, cos: &Array, sin: &Array) -> Resu
     };
     let args = [x_real.clone(), x_imag.clone(), cos.clone(), sin.clone()];
     let mut out = if crate::transformer::compile_glue() {
+        mlx_gen::diagnostics::record_compile(
+            "wan::rope::rope_rotate",
+            mlx_gen::diagnostics::CompileDisposition::OneShot,
+        );
         compile(f, true)(&args)?
     } else {
+        mlx_gen::diagnostics::record_fallback("wan::rope::rope_rotate", "compiled_glue_disabled");
         f(&args)?
     };
     let imag = out.pop().unwrap();

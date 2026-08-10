@@ -9,6 +9,10 @@ pub use runtime_catalog::{
     core_llm, gen_core, memory_strategy, RuntimeCatalog, RuntimeCatalogSnapshot,
 };
 
+/// Stable P6 workload/result schemas and fail-closed validation for the real-weight MLX harness.
+#[cfg(feature = "perf-bench")]
+pub mod perf_bench;
+
 /// The MLX backend crates this platform owns, re-exported from the media catalog
 /// (available under the default `media` feature).
 #[cfg(feature = "media")]

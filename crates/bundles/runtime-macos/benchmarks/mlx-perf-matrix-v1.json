@@ -1,0 +1,180 @@
+{
+  "schemaVersion": "sceneworks.mlx-perf-matrix.v1",
+  "benchmarkId": "sc-18321-cross-family-v1",
+  "warmupRuns": 1,
+  "measuredRuns": 3,
+  "variants": [
+    {
+      "id": "baseline",
+      "toggles": []
+    },
+    {
+      "id": "retained_compilation",
+      "toggles": [
+        "retained_compilation"
+      ]
+    },
+    {
+      "id": "exact_epilogues",
+      "toggles": [
+        "exact_epilogues"
+      ]
+    },
+    {
+      "id": "fused_attention_primitives",
+      "toggles": [
+        "fused_attention_primitives"
+      ]
+    },
+    {
+      "id": "indexed_decode_accumulator",
+      "toggles": [
+        "indexed_decode_accumulator"
+      ]
+    },
+    {
+      "id": "geometry_aware_decode",
+      "toggles": [
+        "geometry_aware_decode"
+      ]
+    },
+    {
+      "id": "all_on",
+      "toggles": [
+        "retained_compilation",
+        "exact_epilogues",
+        "fused_attention_primitives",
+        "indexed_decode_accumulator",
+        "geometry_aware_decode"
+      ]
+    }
+  ],
+  "cases": [
+    {
+      "id": "wan-q4-512x480-f17",
+      "family": "wan_video",
+      "provider": "wan2_2_ti2v_5b",
+      "artifactKey": "wan_q4",
+      "repository": "SceneWorks/wan2.2-ti2v-5b-mlx",
+      "tier": "q4",
+      "width": 512,
+      "height": 480,
+      "frames": 17,
+      "steps": 8,
+      "seed": 1832101,
+      "prompt": "A red fox runs through a snowy pine forest at sunrise, cinematic tracking shot"
+    },
+    {
+      "id": "wan-q4-640x480-f49",
+      "family": "wan_video",
+      "provider": "wan2_2_ti2v_5b",
+      "artifactKey": "wan_q4",
+      "repository": "SceneWorks/wan2.2-ti2v-5b-mlx",
+      "tier": "q4",
+      "width": 640,
+      "height": 480,
+      "frames": 49,
+      "steps": 8,
+      "seed": 1832101,
+      "prompt": "A red fox runs through a snowy pine forest at sunrise, cinematic tracking shot"
+    },
+    {
+      "id": "wan-q4-832x480-f81",
+      "family": "wan_video",
+      "provider": "wan2_2_ti2v_5b",
+      "artifactKey": "wan_q4",
+      "repository": "SceneWorks/wan2.2-ti2v-5b-mlx",
+      "tier": "q4",
+      "width": 832,
+      "height": 480,
+      "frames": 81,
+      "steps": 8,
+      "seed": 1832101,
+      "prompt": "A red fox runs through a snowy pine forest at sunrise, cinematic tracking shot"
+    },
+    {
+      "id": "qwen-q4-512",
+      "family": "image_dit",
+      "provider": "qwen_image",
+      "artifactKey": "qwen_image_q4",
+      "repository": "SceneWorks/qwen-image-mlx",
+      "tier": "q4",
+      "width": 512,
+      "height": 512,
+      "frames": 1,
+      "steps": 8,
+      "seed": 1832102,
+      "prompt": "A glass observatory on a windswept cliff, precise architectural photograph at blue hour"
+    },
+    {
+      "id": "qwen-q4-1024",
+      "family": "image_dit",
+      "provider": "qwen_image",
+      "artifactKey": "qwen_image_q4",
+      "repository": "SceneWorks/qwen-image-mlx",
+      "tier": "q4",
+      "width": 1024,
+      "height": 1024,
+      "frames": 1,
+      "steps": 8,
+      "seed": 1832102,
+      "prompt": "A glass observatory on a windswept cliff, precise architectural photograph at blue hour"
+    },
+    {
+      "id": "qwen-q4-2048",
+      "family": "image_dit",
+      "provider": "qwen_image",
+      "artifactKey": "qwen_image_q4",
+      "repository": "SceneWorks/qwen-image-mlx",
+      "tier": "q4",
+      "width": 2048,
+      "height": 2048,
+      "frames": 1,
+      "steps": 8,
+      "seed": 1832102,
+      "prompt": "A glass observatory on a windswept cliff, precise architectural photograph at blue hour"
+    },
+    {
+      "id": "sdxl-bf16-512",
+      "family": "sdxl_unet",
+      "provider": "sdxl",
+      "artifactKey": "sdxl_bf16",
+      "repository": "SceneWorks/sdxl-base-mlx",
+      "tier": "bf16",
+      "width": 512,
+      "height": 512,
+      "frames": 1,
+      "steps": 8,
+      "seed": 1832103,
+      "prompt": "A ceramic teapot beside folded linen, soft north-window light, editorial still life"
+    },
+    {
+      "id": "sdxl-bf16-1024",
+      "family": "sdxl_unet",
+      "provider": "sdxl",
+      "artifactKey": "sdxl_bf16",
+      "repository": "SceneWorks/sdxl-base-mlx",
+      "tier": "bf16",
+      "width": 1024,
+      "height": 1024,
+      "frames": 1,
+      "steps": 8,
+      "seed": 1832103,
+      "prompt": "A ceramic teapot beside folded linen, soft north-window light, editorial still life"
+    },
+    {
+      "id": "sdxl-bf16-2048",
+      "family": "sdxl_unet",
+      "provider": "sdxl",
+      "artifactKey": "sdxl_bf16",
+      "repository": "SceneWorks/sdxl-base-mlx",
+      "tier": "bf16",
+      "width": 2048,
+      "height": 2048,
+      "frames": 1,
+      "steps": 8,
+      "seed": 1832103,
+      "prompt": "A ceramic teapot beside folded linen, soft north-window light, editorial still life"
+    }
+  ]
+}
