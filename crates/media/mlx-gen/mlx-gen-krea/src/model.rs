@@ -92,6 +92,7 @@ pub const KREA_2_TURBO_EDIT_ID: &str = "krea_2_turbo_edit";
 /// no user negative prompt, no img2img/control conditioning on the Turbo checkpoint.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        denoiser_output_latent_space: Some(&mlx_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
         id: KREA_2_TURBO_ID,

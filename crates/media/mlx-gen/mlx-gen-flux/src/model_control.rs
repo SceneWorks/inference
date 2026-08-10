@@ -65,6 +65,7 @@ const DEFAULT_CONTROL_SCALE: f32 = 0.7;
 /// `resolve_control`, not capability introspection.
 pub fn descriptor_dev_control() -> ModelDescriptor {
     ModelDescriptor {
+        denoiser_output_latent_space: Some(&mlx_gen::gen_core::FLUX1_LATENT_SPACE),
         control_kinds: Some(accepted_control_kinds()),
         required_components: &[],
         id: FLUX1_DEV_CONTROL_ID,

@@ -3746,6 +3746,48 @@ mod preview_advertising {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn every_known_decoder_family_advertises_its_exact_latent_space() {
+        use candle_gen::gen_core::{
+            LatentSpace, FLUX1_LATENT_SPACE, FLUX2_PACKED_LATENT_SPACE, QWEN_KREA_Z16_LATENT_SPACE,
+            SD3_LATENT_SPACE, SDXL_LATENT_SPACE, WAN_Z16_VIDEO_LATENT_SPACE, WAN_Z48_LATENT_SPACE,
+        };
+
+        fn expected(
+            descriptor: &candle_gen::gen_core::ModelDescriptor,
+        ) -> Option<&'static LatentSpace> {
+            match descriptor.family {
+                "qwen-image" | "krea_2" => Some(&QWEN_KREA_Z16_LATENT_SPACE),
+                "wan" if descriptor.id == "wan2_2_ti2v_5b" => Some(&WAN_Z48_LATENT_SPACE),
+                "wan" => Some(&WAN_Z16_VIDEO_LATENT_SPACE),
+                "flux" | "boogu" | "chroma" | "z-image" => Some(&FLUX1_LATENT_SPACE),
+                "stable-diffusion-3" => Some(&SD3_LATENT_SPACE),
+                "sdxl" | "kolors" => Some(&SDXL_LATENT_SPACE),
+                "flux2" | "ideogram" | "lens" => Some(&FLUX2_PACKED_LATENT_SPACE),
+                _ => None,
+            }
+        }
+
+        let registry = super::provider_registry().unwrap();
+        let mut checked = 0;
+        for registration in registry.generators() {
+            let descriptor = (registration.descriptor)();
+            if let Some(expected) = expected(&descriptor) {
+                checked += 1;
+                assert_eq!(
+                    descriptor.denoiser_output_latent_space,
+                    Some(expected),
+                    "{} must advertise the latent space its decoder consumes",
+                    descriptor.id
+                );
+            }
+        }
+        assert!(
+            checked > 20,
+            "known-space guard unexpectedly checked only {checked} routes"
+        );
+    }
+
+    #[test]
     fn every_registered_memory_strategy_rejects_cross_route_decode_geometry() {
         let registry = super::provider_registry().unwrap();
         let spec = candle_gen::gen_core::LoadSpec::new(candle_gen::gen_core::WeightsSource::Dir(

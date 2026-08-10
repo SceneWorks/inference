@@ -21,6 +21,7 @@ use mlx_rs::ops::{
 };
 use mlx_rs::Array;
 
+use mlx_gen::gen_core::{QWEN_WAN_Z16_MEAN as VAE_MEAN, QWEN_WAN_Z16_STD as VAE_STD};
 use mlx_gen::nn::{conv2d, conv3d, silu, upsample_nearest};
 use mlx_gen::tiling::{TilingConfig, VaeTiling};
 use mlx_gen::weights::Weights;
@@ -34,17 +35,6 @@ use crate::vae_common::{
 const CACHE_T: i32 = 2;
 /// Channel-L2 norm floor (reference `mx.clip(..., a_min=1e-12)`).
 const NORM_EPS: f32 = 1e-12;
-
-/// Per-channel latent normalization statistics for z_dim=16 (reference `VAE_MEAN`/`VAE_STD`). These
-/// are architecture constants (not learned), so they are hardcoded here and gated by the fixture.
-const VAE_MEAN: [f32; 16] = [
-    -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508, 0.4134, -0.0715, 0.5517,
-    -0.3632, -0.1922, -0.9497, 0.2503, -0.2921,
-];
-const VAE_STD: [f32; 16] = [
-    2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743, 3.2687, 2.1526, 2.8652, 1.5579,
-    1.6382, 1.1253, 2.8251, 1.9160,
-];
 
 /// Wan2.1 VAE fixed structure (z16, dim_mult [1,2,4,4], 2 res-blocks/stage).
 const DIM_MULT: [i32; 4] = [1, 2, 4, 4];

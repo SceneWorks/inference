@@ -252,6 +252,7 @@ const MAX_STEPS: u32 = 200;
 /// (`req.guidance` overrides the ceiling), no negative prompt / sampler / scheduler / LoRA / quant.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        denoiser_output_latent_space: None,
         control_kinds: None,
         required_components: &[],
         id: MODEL_ID,
