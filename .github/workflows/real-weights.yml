@@ -4795,8 +4795,8 @@ jobs:
             "revision=$env:SCAIL2_REVISION"
             "provision_status=validating_python"
           ) | Set-Content -LiteralPath $log -Encoding utf8
-          where.exe python 2>&1 | Tee-Object -LiteralPath $log -Append
-          python --version 2>&1 | Tee-Object -LiteralPath $log -Append
+          where.exe python 2>&1 | Tee-Object -FilePath $log -Append
+          python --version 2>&1 | Tee-Object -FilePath $log -Append
       - name: Validate runner-provisioned CPython 3.14 x64
         shell: powershell
         run: |
@@ -4851,7 +4851,7 @@ jobs:
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as out:
               out.write(f"SCAIL2_SHARED_BF16_DIR={root}\n")
           print(f"Exact shared package ready: {repo}@{revision}/bf16 -> {root}")
-          '@ | python - 2>&1 | Tee-Object -LiteralPath $log -Append
+          '@ | python - 2>&1 | Tee-Object -FilePath $log -Append
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           "provision_status=complete" | Add-Content -LiteralPath $log -Encoding utf8
       - name: Build the exact CUDA real-weight gate

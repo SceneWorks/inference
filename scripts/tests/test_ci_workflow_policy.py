@@ -1444,7 +1444,11 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("-- --ignored --exact --nocapture", job)
         self.assertIn('"provision_status=validating_python"', job)
         self.assertIn('"provision_status=complete"', job)
-        self.assertIn("Tee-Object -LiteralPath $log -Append", job)
+        # Windows PowerShell 5.1 cannot combine Tee-Object's LiteralPath
+        # parameter set with -Append; the self-hosted CUDA lane must use the
+        # FilePath parameter set for its pre-provision and provision evidence.
+        self.assertEqual(job.count("Tee-Object -FilePath $log -Append"), 4)
+        self.assertNotIn("Tee-Object -LiteralPath $log -Append", job)
         self.assertIn("actions/upload-artifact@", job)
         self.assertIn("scail2-shared-cuda-${{ github.sha }}", job)
 
