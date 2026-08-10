@@ -40,11 +40,42 @@ pub(crate) fn provider_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> gen_core::Result<MemoryProviderContract> {
+    // File and Dir intentionally retain one provider/calibration identity: the executable provider,
+    // phase graph, and output semantics are the same. The promoted matrix has no load-source axis,
+    // however, so only Dir advertises rung 4 until the pinned/re-openable File path has its own real
+    // measurement. A Dir rung-4 cell must never be relabeled as File evidence.
     let streamable = matches!(spec.load_shape, LoadShape::DeferredMaterialization)
         && matches!(spec.weights, gen_core::WeightsSource::Dir(_));
-    let components =
-        PerComponentBytes::from_spec_subdirs(spec, &["text_encoder"], &["transformer"], &["vae"])
-            .unwrap_or_default();
+    let components = match &spec.weights {
+        gen_core::WeightsSource::Dir(_) => PerComponentBytes::from_spec_subdirs(
+            spec,
+            &["text_encoder"],
+            &["transformer"],
+            &["vae"],
+        )
+        .unwrap_or_default(),
+        gen_core::WeightsSource::File(path) => PerComponentBytes {
+            text_encoder: spec
+                .components
+                .get(gen_core::COMFYUI_TEXT_ENCODER_COMPONENT)
+                .map(|source| match source {
+                    gen_core::WeightsSource::Dir(path) | gen_core::WeightsSource::File(path) => {
+                        gen_core::safetensors_path_bytes(path)
+                    }
+                })
+                .unwrap_or(0),
+            dit: gen_core::safetensors_path_bytes(path),
+            vae: spec
+                .components
+                .get(gen_core::COMFYUI_VAE_COMPONENT)
+                .map(|source| match source {
+                    gen_core::WeightsSource::Dir(path) | gen_core::WeightsSource::File(path) => {
+                        gen_core::safetensors_path_bytes(path)
+                    }
+                })
+                .unwrap_or(0),
+        },
+    };
     let phases = vec![
         MemoryPhase::Conditioning,
         MemoryPhase::Denoise,
@@ -295,11 +326,7 @@ pub(crate) fn snapshot_quant_tier(
 ) -> gen_core::Result<Option<Quant>> {
     let root = match &spec.weights {
         WeightsSource::Dir(root) => root,
-        WeightsSource::File(_) => {
-            return Err(gen_core::Error::Msg(format!(
-                "{provider_id}: actual numeric tier requires a snapshot directory"
-            )))
-        }
+        WeightsSource::File(_) => return Ok(None),
     };
     crate::pipeline::packed_config_at(root, "transformer")
         .map_err(gen_core::Error::backend)?

@@ -118,7 +118,7 @@ use candle_gen::gen_core::OffloadPolicy;
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
     GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Progress, Quant,
-    SizeFloor, WeightsSource,
+    SizeFloor, WeightsSource, BASE_SNAPSHOT_COMPONENT,
 };
 
 /// Registry id for the Krea 2 Turbo text-to-image variant. Matches the SceneWorks worker's
@@ -228,6 +228,9 @@ pub struct KreaGenerator {
     /// **job-local** base DiT from `transformer/` regardless of residency mode (the shared resident DiT
     /// is never mutated for per-phase adapter toggling — the concurrency-safety invariant).
     root: PathBuf,
+    /// Imported native DiT source, when `LoadSpec::weights` was a single file. Kept lexical (not
+    /// canonicalized); the provider pins and revalidates it whenever a streamed window is opened.
+    native_dit: Option<PathBuf>,
     /// The LoRA/LoKr adapters this model was loaded with (`LoadSpec::adapters`), retained so the
     /// multi-phase render can install each phase's named subset (by index, bounds-checked against
     /// `adapters.len()`, with an optional per-phase weight) on that phase's job-local DiT. Empty ⇒ a
@@ -535,7 +538,7 @@ impl Generator for KreaGenerator {
         // The Edit variant needs 1..=2 source references (image 1, then image 2). The capability floor
         // above accepts a single `Reference` on Turbo/Raw (img2img latent-init) but rejects a
         // MultiReference there; only `krea_2_edit` advertises both, so resolve + count-check here.
-        if self.descriptor.id == KREA_2_EDIT_ID {
+        if matches!(self.descriptor.id, KREA_2_EDIT_ID | KREA_2_TURBO_EDIT_ID) {
             resolve_edit_references(req)?;
         }
         // Multi-phase denoise (epic 13879, sc-13887): Raw-only, from pure noise, ≥1-step phases. The
@@ -569,7 +572,8 @@ impl Generator for KreaGenerator {
         ensure_multiphase_allowed_for(self.descriptor.id, self.has_diff_patch, req)?;
 
         let raw = self.descriptor.id == KREA_2_RAW_ID;
-        let edit = self.descriptor.id == KREA_2_EDIT_ID;
+        let turbo_edit = self.descriptor.id == KREA_2_TURBO_EDIT_ID;
+        let edit = self.descriptor.id == KREA_2_EDIT_ID || turbo_edit;
         let edit_references: Vec<Image> = if edit {
             resolve_edit_references(req)?.into_iter().cloned().collect()
         } else {
@@ -623,8 +627,9 @@ impl Generator for KreaGenerator {
             // contributes the request-scoped warm-cache transition; this pipeline retains the
             // three-stage execution needed by every cumulative memory rung.
             let images = self.residency.run_exclusive_staged(&req.cancel, || {
-                pipeline::render_three_stage(
+                pipeline::render_three_stage_with_native(
                     &self.root,
+                    self.native_dit.as_deref(),
                     &self.device,
                     &self.adapters,
                     req,
@@ -685,7 +690,7 @@ impl Generator for KreaGenerator {
                         text,
                         req,
                         &edit_references,
-                        false,
+                        turbo_edit,
                         &self.device,
                     )?))
                 }
@@ -767,7 +772,7 @@ impl Generator for KreaGenerator {
                             &edit,
                             req,
                             &edit_references,
-                            false,
+                            turbo_edit,
                             &self.device,
                             on_progress,
                         )
@@ -938,6 +943,17 @@ pub fn edit_descriptor() -> ModelDescriptor {
     d
 }
 
+/// Distilled CFG-free twin of [`edit_descriptor`], routed through the same grounded edit pipeline but
+/// using Turbo's few-step schedule and single conditional forward.
+pub fn turbo_edit_descriptor() -> ModelDescriptor {
+    let mut d = edit_descriptor();
+    d.id = KREA_2_TURBO_EDIT_ID;
+    d.capabilities.supports_negative_prompt = false;
+    d.capabilities.supports_guidance = false;
+    d.capabilities.supports_true_cfg = false;
+    d
+}
+
 /// The img2img reference + strength: the first [`Conditioning::Reference`] in the request, if any. Both
 /// Turbo (`render_img2img`, sc-10134) and Raw (`render_base_img2img`, sc-10226) advertise only `Reference`
 /// (no MultiReference), so at most one is present; `None` ⇒ plain txt2img (CFG-free Turbo / full-CFG Raw).
@@ -1085,14 +1101,14 @@ fn convrot_selector(spec: &LoadSpec, id: &str) -> gen_core::Result<Option<PathBu
 }
 
 fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<dyn Generator>> {
-    let root = match &spec.weights {
-        WeightsSource::Dir(p) => p.clone(),
-        WeightsSource::File(_) => {
-            return Err(gen_core::Error::Msg(format!(
-                "{} expects a snapshot directory (transformer/ text_encoder/ vae/ tokenizer/), not a \
-                 single .safetensors file",
-                descriptor.id
-            )));
+    let (root, native_dit) = match &spec.weights {
+        WeightsSource::Dir(p) => (p.clone(), None),
+        WeightsSource::File(path) => {
+            gen_core::reject_unknown_components(spec, &[BASE_SNAPSHOT_COMPONENT], descriptor.id)?;
+            (
+                gen_core::require_base_snapshot(spec, descriptor.id)?.to_path_buf(),
+                Some(path.clone()),
+            )
         }
     };
     // sc-9300 seam: select the community **INT8-ConvRot** DiT consume path when the spec carries a
@@ -1106,6 +1122,18 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
     // provider in candle-gen AND the worker plus a gen-core pin bump. Only Krea reads this; every other
     // engine ignores `text_encoder` unchanged. `None`/`Dir` here ⇒ the dense/packed snapshot path below.
     let convrot_dit = convrot_selector(spec, descriptor.id)?;
+    if native_dit.is_some() && convrot_dit.is_some() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "candle {}: primary imported DiT and legacy text_encoder ConvRot selector are mutually exclusive",
+            descriptor.id
+        )));
+    }
+    if native_dit.is_some() && spec.quantize.is_some() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "candle {}: an imported DiT carries its numeric format; quantize is unsupported",
+            descriptor.id
+        )));
+    }
     let loaded_quant = actual_quant_tier(spec, descriptor.id)?;
     #[cfg(any(feature = "cuda", test))]
     let memory_contract =
@@ -1139,6 +1167,7 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
     let resident_adapters = spec.adapters.clone();
     let resident_pid = spec.pid.clone();
     let resident_convrot = convrot_dit.clone();
+    let resident_native = native_dit.clone();
     let text_root = root.clone();
     let text_device = device.clone();
     let heavy_root = root.clone();
@@ -1150,20 +1179,30 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
     // `root/transformer` unconditionally — the wrong DiT for a ConvRot request — which is why ConvRot
     // previously bypassed staged residency rather than dropping its 15.6 GB f32 TE.
     let heavy_convrot = convrot_dit.clone();
+    let heavy_native = native_dit.clone();
+    let native_streamable = spec.adapters.is_empty();
     let residency = candle_gen::Residency::request_scoped_with_resident_cancelable(
         move |_| {
-            let components = match resident_convrot.as_ref() {
-                Some(convrot_dit) => pipeline::load_components_convrot(
+            let components = match (resident_native.as_ref(), resident_convrot.as_ref()) {
+                (Some(native_dit), None) => pipeline::load_components_native_registry(
+                    &resident_root,
+                    native_dit,
+                    &resident_device,
+                    &resident_adapters,
+                    resident_pid.as_ref(),
+                )?,
+                (None, Some(convrot_dit)) => pipeline::load_components_convrot(
                     &resident_root,
                     convrot_dit,
                     &resident_device,
                 )?,
-                None => pipeline::load_components(
+                (None, None) => pipeline::load_components(
                     &resident_root,
                     &resident_device,
                     &resident_adapters,
                     resident_pid.as_ref(),
                 )?,
+                (Some(_), Some(_)) => unreachable!("mutually exclusive source forms"),
             };
             Ok((
                 KreaTextPhase::Resident,
@@ -1182,11 +1221,25 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
             )))
         },
         move |use_pid, _, cancel| {
-            let heavy = match heavy_convrot.as_ref() {
+            let heavy = match (heavy_native.as_ref(), heavy_convrot.as_ref()) {
+                (Some(native_dit), None) => {
+                    candle_gen::check_cancel(cancel)?;
+                    let heavy = pipeline::load_residency_heavy_native_registry(
+                        &heavy_root,
+                        native_dit,
+                        &heavy_device,
+                        &heavy_adapters,
+                        heavy_pid.as_ref(),
+                        use_pid,
+                        native_streamable,
+                    )?;
+                    candle_gen::check_cancel(cancel)?;
+                    heavy
+                }
                 // ConvRot: the int8 DiT from the single file + VAE (no adapters/PiD — the lane rejects
                 // both, sc-9300). The TE was already loaded, encoded, and dropped by the text phase, so
                 // this loads into that freed pool — the whole point of going sequential here.
-                Some(convrot_dit) => {
+                (None, Some(convrot_dit)) => {
                     candle_gen::check_cancel(cancel)?;
                     let heavy = pipeline::load_residency_heavy_convrot(
                         &heavy_root,
@@ -1196,7 +1249,7 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
                     candle_gen::check_cancel(cancel)?;
                     heavy
                 }
-                None => pipeline::load_residency_heavy_for_request(
+                (None, None) => pipeline::load_residency_heavy_for_request(
                     &heavy_root,
                     &heavy_device,
                     &heavy_adapters,
@@ -1204,6 +1257,7 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
                     use_pid,
                     cancel,
                 )?,
+                (Some(_), Some(_)) => unreachable!("mutually exclusive source forms"),
             };
             Ok(KreaHeavyPhase::Sequential(Box::new(heavy)))
         },
@@ -1216,6 +1270,7 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
         memory_contract,
         residency,
         root,
+        native_dit,
         // The multi-phase diff-patch guard input (sc-13887): read the adapter file keys at load. The
         // ConvRot path already rejected adapters above, so `spec.adapters` is empty there ⇒ `false`.
         has_diff_patch: crate::adapters::any_diff_patch(&spec.adapters),
@@ -1254,6 +1309,10 @@ pub fn load_edit(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     build(spec, edit_descriptor())
 }
 
+pub fn load_turbo_edit(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    build(spec, turbo_edit_descriptor())
+}
+
 /// Build a Krea 2 generator from a **community single-file DiT checkpoint** (sc-14022, epic 14015 S0b) —
 /// the candle sibling of `mlx-gen-krea::load_from_native_dit_file`, and the candle out-of-registry pattern
 /// z-image's `load_from_comfyui_components` established. `dit_file` is a ComfyUI-exported dense-bf16 or
@@ -1268,48 +1327,21 @@ pub fn load_edit(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 /// `W = codes.i8 * weight_scale` per row. Neither is corrupted by a rotation that was never applied. It is
 /// coverage/bijection + shape validated ([`convert::validate_native_transformer`], fail-closed on any
 /// unmapped/missing/foreign key) before assembly; the TE / VAE / tokenizer load from `base_snapshot_dir`
-/// exactly as [`load`] does. The result is a warm-`Resident` generator that renders through the same
-/// pipeline as a snapshot load. `descriptor` selects the surface — Turbo [`descriptor()`] is the natural
-/// default (variant5 is a distilled-Turbo dense merge).
-///
-/// No load-time adapters (the community merge already baked its LoRAs into the weights). `Sequential`
-/// offload is not threaded — the single-file DiT has no
-/// snapshot dir to re-load from — so the generator is always `Resident`, mirroring the MLX entrypoint.
+/// exactly as [`load`] does. The result renders through the same provider pipeline as a snapshot load.
+/// `descriptor` selects the surface — Turbo [`descriptor()`] is the natural default (variant5 is a
+/// distilled-Turbo dense merge). This compatibility entrypoint supplies no adapters; callers needing
+/// the full registered adapter/PiD/residency surface should build the equivalent File [`LoadSpec`] and
+/// call [`load`].
 pub fn load_from_native_dit_file(
     dit_file: impl AsRef<std::path::Path>,
     base_snapshot_dir: impl AsRef<std::path::Path>,
-    mut descriptor: ModelDescriptor,
+    descriptor: ModelDescriptor,
 ) -> gen_core::Result<Box<dyn Generator>> {
-    let root = base_snapshot_dir.as_ref().to_path_buf();
-    let device = candle_gen::default_device()?;
-    // Architecture config + TE/VAE/tokenizer come from the resident turnkey; only the DiT weights come
-    // from the single file (dense or descriptor-validated plain int8 through the native remap).
-    let components = pipeline::load_components_native(&root, dit_file.as_ref(), &device)?;
-    let residency = candle_gen::Residency::resident(
-        KreaTextPhase::Resident,
-        KreaHeavyPhase::Resident(Box::new(ResidentKrea {
-            components: Arc::new(components),
-            root: root.clone(),
-            device: device.clone(),
-            edit_components: Mutex::new(None),
-            img2img_encoder: Mutex::new(None),
-        })),
+    let spec = LoadSpec::new(WeightsSource::File(dit_file.as_ref().to_path_buf())).with_component(
+        BASE_SNAPSHOT_COMPONENT,
+        WeightsSource::Dir(base_snapshot_dir.as_ref().to_path_buf()),
     );
-    // This source has no phase-local native-DiT reloader. Prevent the selector from choosing a
-    // request-scoped staged strategy that would otherwise fall back to the snapshot's different DiT.
-    descriptor.capabilities.supports_sequential_offload = false;
-    Ok(Box::new(KreaGenerator {
-        descriptor,
-        device,
-        loaded_quant: None,
-        #[cfg(any(feature = "cuda", test))]
-        memory_contract: None,
-        residency,
-        root,
-        // The single-file entrypoint threads no load-time adapters (S0b scope), so no diff-patch guard.
-        adapters: Vec::new(),
-        has_diff_patch: false,
-    }))
+    build(&spec, descriptor)
 }
 
 // Link-time registration: all three variants register here — `krea_2_turbo` (distilled, CFG-free),
@@ -1323,6 +1355,9 @@ candle_gen::register_generators! {
 }
 candle_gen::register_generators! {
     pub(crate) const EDIT_REGISTRATION = edit_descriptor => load_edit
+}
+candle_gen::register_generators! {
+    pub(crate) const TURBO_EDIT_REGISTRATION = turbo_edit_descriptor => load_turbo_edit
 }
 
 /// Krea Turbo's provider-owned half of the shared memory-strategy handshake. The measured phase
@@ -1338,7 +1373,11 @@ fn build_krea_turbo_memory_strategy_contract(spec: &LoadSpec) -> gen_core::Memor
         MemoryWindowMaterialization,
     };
 
-    let streamable = spec.adapters.is_empty();
+    // File and Dir execute through one provider identity, so the already-qualified resident/staged
+    // cells remain applicable. The promoted evidence matrix has no load-source axis, however: its
+    // rung-4 measurements were captured from snapshot directories. Keep File rung 4 Missing until a
+    // real imported-file run is measured rather than silently relabeling Dir evidence.
+    let streamable = spec.adapters.is_empty() && matches!(spec.weights, WeightsSource::Dir(_));
     MemoryProviderContract {
         provider_id: KREA_2_TURBO_ID.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
@@ -1469,11 +1508,7 @@ fn actual_quant_tier(spec: &LoadSpec, id: &str) -> gen_core::Result<Option<Quant
     }
     let root = match &spec.weights {
         WeightsSource::Dir(root) => root,
-        WeightsSource::File(_) => {
-            return Err(gen_core::Error::Msg(format!(
-                "{id}: actual numeric tier requires a snapshot directory"
-            )))
-        }
+        WeightsSource::File(_) => return Ok(None),
     };
     loader::read_packed_config(&root.join("transformer"))
         .map_err(gen_core::Error::backend)?
@@ -1758,7 +1793,8 @@ pub fn register_providers(
     let registry = registry
         .register_generator(TURBO_REGISTRATION)
         .register_generator(RAW_REGISTRATION)
-        .register_generator(EDIT_REGISTRATION);
+        .register_generator(EDIT_REGISTRATION)
+        .register_generator(TURBO_EDIT_REGISTRATION);
     #[cfg(feature = "cuda")]
     let registry = registry
         .register_memory_strategy(TURBO_MEMORY_REGISTRATION)
@@ -1794,7 +1830,12 @@ mod explicit_registry_tests {
 
         assert_eq!(
             explicit_generators,
-            ["krea_2_turbo", "krea_2_raw", "krea_2_edit"]
+            [
+                "krea_2_turbo",
+                "krea_2_raw",
+                "krea_2_edit",
+                "krea_2_turbo_edit"
+            ]
         );
         assert_eq!(explicit_trainers, ["krea_2_raw", "krea_2_control"]);
 
@@ -2308,6 +2349,37 @@ mod tests {
     }
 
     #[test]
+    fn imported_file_does_not_claim_snapshot_rung_four_evidence() {
+        let spec = LoadSpec::new(WeightsSource::File("/imports/krea.safetensors".into()))
+            .with_component(
+                BASE_SNAPSHOT_COMPONENT,
+                WeightsSource::Dir("/snap/krea".into()),
+            );
+        let contract = build_krea_turbo_memory_strategy_contract(&spec);
+        assert!(matches!(
+            contract
+                .capability(gen_core::MemoryStrategy::BoundedTransformerResidency)
+                .expect("rung 4 declared")
+                .support,
+            gen_core::MemoryStrategySupport::Missing
+        ));
+        for rung in [
+            gen_core::MemoryStrategy::Resident,
+            gen_core::MemoryStrategy::StagedResidency,
+            gen_core::MemoryStrategy::BoundedDecode,
+            gen_core::MemoryStrategy::BoundedAttention,
+        ] {
+            assert!(matches!(
+                contract
+                    .capability(rung)
+                    .expect("lower rung declared")
+                    .support,
+                gen_core::MemoryStrategySupport::Implemented
+            ));
+        }
+    }
+
+    #[test]
     fn memory_parameter_domains_reject_orphans_and_unknown_values() {
         let id = KREA_2_TURBO_ID;
         let valid = gen_core::GenerationMemory {
@@ -2599,10 +2671,12 @@ mod tests {
     }
 
     #[test]
-    fn load_raw_rejects_single_file_like_turbo() {
-        // Same snapshot loader as Turbo — a single-file weights source is rejected the same way.
+    fn load_raw_requires_a_base_snapshot_for_single_file() {
         let file = LoadSpec::new(WeightsSource::File("/tmp/x.safetensors".into()));
         assert!(load_raw(&file).is_err());
+        let imported =
+            file.with_component(BASE_SNAPSHOT_COMPONENT, WeightsSource::Dir("/snap".into()));
+        assert!(load_raw(&imported).is_ok());
         // A LoRA `LoadSpec` on the Raw id is accepted + lazy, exactly like Turbo (sc-7836 wiring).
         let dir = LoadSpec::new(WeightsSource::Dir("/snap".into()));
         assert!(load_raw(&dir).is_ok());
@@ -2714,10 +2788,13 @@ mod tests {
     }
 
     #[test]
-    fn load_accepts_lora_rejects_single_file_and_unwired_surfaces() {
+    fn load_accepts_lora_and_complete_single_file_specs() {
         use candle_gen::gen_core::{AdapterKind, AdapterSpec};
         let file = LoadSpec::new(WeightsSource::File("/tmp/q.safetensors".into()));
         assert!(load(&file).is_err());
+        let imported =
+            file.with_component(BASE_SNAPSHOT_COMPONENT, WeightsSource::Dir("/snap".into()));
+        assert!(load(&imported).is_ok());
         // LoRA/LoKr now wired (sc-7836): a LoRA `LoadSpec` is accepted (lazily — the merge happens at
         // first `generate`), so `load` resolves rather than rejecting.
         let lora = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_adapters(vec![
@@ -2848,11 +2925,13 @@ mod tests {
     }
 
     #[test]
-    fn load_edit_rejects_single_file_accepts_dir_and_lora() {
+    fn load_edit_accepts_complete_single_file_dir_and_lora() {
         use candle_gen::gen_core::{AdapterKind, AdapterSpec};
-        // Same snapshot loader as Turbo/Raw — a single-file weights source is rejected.
         let file = LoadSpec::new(WeightsSource::File("/tmp/x.safetensors".into()));
         assert!(load_edit(&file).is_err());
+        let imported =
+            file.with_component(BASE_SNAPSHOT_COMPONENT, WeightsSource::Dir("/snap".into()));
+        assert!(load_edit(&imported).is_ok());
         // A plain snapshot dir loads lazily.
         let dir = LoadSpec::new(WeightsSource::Dir("/snap".into()));
         assert!(load_edit(&dir).is_ok());
@@ -3063,6 +3142,7 @@ mod tests {
                 },
             ),
             root: "/snap".into(),
+            native_dit: None,
             adapters: Vec::new(),
             has_diff_patch: false,
         }
@@ -3246,6 +3326,7 @@ mod tests {
                     },
                 ),
                 root: "/snap".into(),
+                native_dit: None,
                 adapters: Vec::new(),
                 has_diff_patch: false,
             };

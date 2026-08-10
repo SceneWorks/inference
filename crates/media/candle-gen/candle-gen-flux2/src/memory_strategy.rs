@@ -95,6 +95,10 @@ fn path(source: &WeightsSource) -> &std::path::Path {
 }
 
 fn streamable(spec: &LoadSpec) -> bool {
+    // File and Dir intentionally share this provider/calibration identity: their executable phase
+    // graph and output semantics are the same. The evidence matrix has no load-source axis, however,
+    // so a Dir-measured rung-4 cell cannot be claimed for File. Keep imported File rung 4 Missing
+    // until its pinned/re-openable implementation is independently measured.
     matches!(spec.load_shape, LoadShape::DeferredMaterialization)
         && matches!(spec.weights, WeightsSource::Dir(_))
         && spec.adapters.is_empty()
@@ -130,9 +134,23 @@ pub fn provider_contract_for(
 ) -> gen_core::Result<MemoryProviderContract> {
     let profile = profile(provider_id)?;
     let streamable = streamable(spec);
-    let components =
-        PerComponentBytes::from_spec_subdirs(spec, &["text_encoder"], &["transformer"], &["vae"])
-            .unwrap_or_default();
+    let components = match &spec.weights {
+        WeightsSource::Dir(_) => PerComponentBytes::from_spec_subdirs(
+            spec,
+            &["text_encoder"],
+            &["transformer"],
+            &["vae"],
+        )
+        .unwrap_or_default(),
+        WeightsSource::File(dit) => {
+            let base = gen_core::require_base_snapshot(spec, provider_id)?;
+            PerComponentBytes {
+                text_encoder: gen_core::safetensors_path_bytes(base.join("text_encoder")),
+                dit: gen_core::safetensors_path_bytes(dit),
+                vae: gen_core::safetensors_path_bytes(base.join("vae")),
+            }
+        }
+    };
     let resident_components = resident_components(provider_id, spec);
     let overlay_bytes = resident_components
         .iter()
@@ -262,10 +280,11 @@ pub fn contract_for_variant(
 }
 
 fn packed_quant(spec: &LoadSpec) -> gen_core::Result<Option<Quant>> {
+    // Imported ComfyUI File weights carry their own fp8 representation and may request the same
+    // explicit on-the-fly Q4/Q8 fold as the historical shim. They do not have a snapshot transformer
+    // config from which a packed tier could be inferred.
     let WeightsSource::Dir(root) = &spec.weights else {
-        return Err(gen_core::Error::Unsupported(
-            "flux2_dev: numeric tier requires a snapshot directory".to_owned(),
-        ));
+        return Ok(None);
     };
     let config = root.join("transformer/config.json");
     let packed = match std::fs::read_to_string(&config) {

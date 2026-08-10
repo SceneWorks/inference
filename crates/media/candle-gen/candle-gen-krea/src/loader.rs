@@ -48,6 +48,9 @@ use crate::quant::{QEmbedding, QLinear};
 /// and moved to `device` / cast to the requested dtype on read, exactly like the mmap path.
 pub struct Weights {
     st: MmapedSafetensors,
+    /// Present for a single-file source. The mmap keeps reads lazy; this lstat/target fingerprint adds
+    /// the mutation guard required when the same mapping is revisited for successive block windows.
+    pinned_source: Option<candle_gen::gen_core::PinnedWeightsFile>,
     device: Device,
     dtype: DType,
     overlay: HashMap<String, Tensor>,
@@ -173,6 +176,7 @@ impl Weights {
         };
         Ok(Self {
             st,
+            pinned_source: None,
             device: device.clone(),
             dtype,
             overlay: HashMap::new(),
@@ -190,10 +194,13 @@ impl Weights {
     /// packed config), so the packed path is never taken for a single-file fixture. Diffusers-keyed —
     /// for a **native-mmdit-keyed** dense single file use [`from_native_file`](Self::from_native_file).
     pub fn from_file(path: &Path, device: &Device, dtype: DType) -> Result<Self> {
+        let pinned_source = candle_gen::gen_core::PinnedWeightsFile::pin(path)
+            .map_err(|error| Error::Msg(error.to_string()))?;
         // SAFETY: read-only mmap of a weight file; the standard candle loading path.
-        let st = unsafe { MmapedSafetensors::new(path)? };
+        let st = unsafe { MmapedSafetensors::new(pinned_source.loader_path())? };
         Ok(Self {
             st,
+            pinned_source: Some(pinned_source),
             device: device.clone(),
             dtype,
             overlay: HashMap::new(),
@@ -213,12 +220,15 @@ impl Weights {
     /// projections are int8 (per-output-row `.weight_scale`). Dense bf16 tensors (`first`/`last`/`tmlp`
     /// /`tproj`/`txtfusion`/`txtmlp` + norms) load unchanged through the remap.
     pub fn from_convrot_file(path: &Path, device: &Device, dtype: DType) -> Result<Self> {
+        let pinned_source = candle_gen::gen_core::PinnedWeightsFile::pin(path)
+            .map_err(|error| Error::Msg(error.to_string()))?;
         // SAFETY: read-only mmap of a weight file; the standard candle loading path.
-        let st = unsafe { MmapedSafetensors::new(path)? };
+        let st = unsafe { MmapedSafetensors::new(pinned_source.loader_path())? };
         validate_convrot_descriptors(&st)?;
         let native_prefix = detect_native_prefix(&st);
         Ok(Self {
             st,
+            pinned_source: Some(pinned_source),
             device: device.clone(),
             dtype,
             overlay: HashMap::new(),
@@ -247,12 +257,15 @@ impl Weights {
     /// [`from_convrot_file`](Self::from_convrot_file), preventing the old group-size-256 fallback from
     /// silently rotating a plain file.
     pub fn from_native_file(path: &Path, device: &Device, dtype: DType) -> Result<Self> {
+        let pinned_source = candle_gen::gen_core::PinnedWeightsFile::pin(path)
+            .map_err(|error| Error::Msg(error.to_string()))?;
         // SAFETY: read-only mmap of a weight file; the standard candle loading path.
-        let st = unsafe { MmapedSafetensors::new(path)? };
+        let st = unsafe { MmapedSafetensors::new(pinned_source.loader_path())? };
         let native_prefix = detect_native_prefix(&st);
         let plain_int8 = validate_plain_int8_tensorwise(&st)?;
         Ok(Self {
             st,
+            pinned_source: Some(pinned_source),
             device: device.clone(),
             dtype,
             overlay: HashMap::new(),
@@ -281,6 +294,17 @@ impl Weights {
         let _ = cell.set(ctx);
         self.int8 = cell;
         self
+    }
+
+    /// Revalidate a retained single-file source before a new streamed window materializes tensors.
+    /// Directory-backed components have no single entry to pin and therefore no-op here.
+    pub(crate) fn ensure_source_unchanged(&self) -> Result<()> {
+        self.pinned_source
+            .as_ref()
+            .map(candle_gen::gen_core::PinnedWeightsFile::ensure_unchanged)
+            .transpose()
+            .map(|_| ())
+            .map_err(|error| Error::Msg(error.to_string()))
     }
 
     /// The **one** [`Int8Context`] every INT8-ConvRot projection from this weight set shares (sc-12301),

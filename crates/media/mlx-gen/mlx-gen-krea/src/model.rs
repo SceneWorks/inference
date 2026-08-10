@@ -14,7 +14,7 @@ use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, AdapterSpec, Capabilities,
     Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator,
     LatentDecoder, LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, Residency,
-    Result, SizeFloor, WeightsSource,
+    Result, SizeFloor, WeightsSource, BASE_SNAPSHOT_COMPONENT,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 use mlx_gen_qwen_image::pipeline::PID_BACKBONE;
@@ -342,66 +342,46 @@ pub fn load_turbo_edit(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 /// typed error on any adapter target that matches no module, never a silent drop). The t2i/img2img callers
 /// pass `&[]`, whose dense-bf16 native-key load is byte-identical to before this parameter existed.
 ///
-/// Supports dense bf16 and descriptor-validated, non-rotated int8-per-row single files. `Sequential`
-/// offload is not yet threaded (the single-file DiT has no snapshot dir to re-load from) — a follow-on.
+/// Supports dense bf16 and descriptor-validated, non-rotated int8-per-row single files. This legacy
+/// signature is now only a `LoadSpec` construction shim; registry and direct callers share exactly the
+/// same validation, adapter folding, pinned-file streaming, and generator assembly path.
 pub fn load_from_native_dit_file(
     dit_file: impl AsRef<Path>,
     base_snapshot_dir: impl AsRef<Path>,
     adapters: &[AdapterSpec],
     descriptor: ModelDescriptor,
 ) -> Result<Box<dyn Generator>> {
-    Ok(Box::new(build_native_krea(
-        dit_file,
-        base_snapshot_dir,
-        adapters,
-        descriptor,
-    )?))
+    let dit_file = dit_file.as_ref();
+    let base_snapshot_dir = base_snapshot_dir.as_ref();
+    let spec = LoadSpec::new(WeightsSource::File(dit_file.to_path_buf()))
+        .with_component(
+            BASE_SNAPSHOT_COMPONENT,
+            WeightsSource::Dir(base_snapshot_dir.to_path_buf()),
+        )
+        .with_adapters(adapters.to_vec());
+    load_variant(&spec, descriptor)
 }
 
 /// The concrete-[`Krea`] assembly behind [`load_from_native_dit_file`] (which boxes the result). Returning
 /// the concrete type lets the real-weight harness assert the installed `adapters` / `has_diff_patch`
 /// fields — a `Box<dyn Generator>` could not be inspected. See [`load_from_native_dit_file`] for the full
 /// contract; this carries the adapter-fold ordering.
+#[cfg(test)]
 pub(crate) fn build_native_krea(
     dit_file: impl AsRef<Path>,
     base_snapshot_dir: impl AsRef<Path>,
     adapters: &[AdapterSpec],
     descriptor: ModelDescriptor,
 ) -> Result<Krea> {
-    let base = base_snapshot_dir.as_ref();
-    let native_spec = LoadSpec::new(WeightsSource::File(dit_file.as_ref().to_path_buf()))
+    let dit_file = dit_file.as_ref();
+    let base_snapshot_dir = base_snapshot_dir.as_ref();
+    let spec = LoadSpec::new(WeightsSource::File(dit_file.to_path_buf()))
+        .with_component(
+            BASE_SNAPSHOT_COMPONENT,
+            WeightsSource::Dir(base_snapshot_dir.to_path_buf()),
+        )
         .with_adapters(adapters.to_vec());
-    // Architecture config from the resident turnkey (the single file ships no config.json); keep
-    // this as the first native-load stage so adapter-bearing calls prove they entered the same
-    // loader as adapter-free calls before any exact asset sizing is attempted.
-    let cfg = crate::config::Krea2Config::from_snapshot(base)?;
-    let memory_strategy = crate::block_memory_strategy::native_memory_strategy_contract(
-        descriptor.id,
-        dit_file.as_ref(),
-        base,
-    )?;
-    let dit = crate::loader::load_transformer_from_native_file(dit_file.as_ref(), &cfg)?;
-    let vae = crate::vae::load_vae(base)?;
-    let mut heavy = KreaHeavy::from_parts(dit, vae);
-    // Install any Raw-trained LoRA/LoKr adapters onto the single-file DiT BEFORE residency is finalized,
-    // mirroring the snapshot path's load→apply order (`load_krea_heavy`). The shared seam errors (never
-    // silently drops) on an adapter target that matches no module, so a bad adapter fails the load loudly.
-    // An empty slice leaves the dense-bf16 native load byte-identical to the pre-adapter behavior.
-    if !adapters.is_empty() {
-        heavy.apply_adapters(adapters)?;
-    }
-    let text = KreaText::from_snapshot(base)?;
-    let residency = Residency::resident(text, KreaHeavyOwned { heavy, pid: None });
-    Ok(Krea {
-        descriptor,
-        memory_strategy,
-        precision: native_spec.precision,
-        quant: native_spec.quantize,
-        streamable_transformer: false,
-        residency,
-        adapters: adapters.to_vec(),
-        has_diff_patch: adapters_have_diff_patch(adapters),
-    })
+    build_native_krea_from_spec(&spec, dit_file, descriptor)
 }
 
 /// Shared loader behind [`load`] / [`load_raw`] / [`load_edit`]: build the residency from a snapshot
@@ -411,6 +391,11 @@ pub(crate) fn build_native_krea(
 /// ([`load_krea_text`] / [`load_krea_heavy`]), so the components are byte-identical. `descriptor`
 /// selects the variant (Turbo vs Raw vs edit) the returned [`Krea`] renders.
 fn load_variant(spec: &LoadSpec, descriptor: ModelDescriptor) -> Result<Box<dyn Generator>> {
+    if let WeightsSource::File(dit_file) = &spec.weights {
+        return Ok(Box::new(build_native_krea_from_spec(
+            spec, dit_file, descriptor,
+        )?));
+    }
     let (memory_strategy, load_plan) =
         crate::block_memory_strategy::memory_strategy_contract_with_plan(descriptor.id, spec)?;
     let residency = build_residency(spec, descriptor.id, load_plan)?;
@@ -424,6 +409,90 @@ fn load_variant(spec: &LoadSpec, descriptor: ModelDescriptor) -> Result<Box<dyn 
         adapters: spec.adapters.clone(),
         has_diff_patch: adapters_have_diff_patch(&spec.adapters),
     }))
+}
+
+fn build_native_krea_from_spec(
+    spec: &LoadSpec,
+    dit_file: &Path,
+    descriptor: ModelDescriptor,
+) -> Result<Krea> {
+    mlx_gen::gen_core::reject_unknown_components(spec, &[BASE_SNAPSHOT_COMPONENT], descriptor.id)?;
+    if spec.precision != Precision::Bf16 {
+        return Err(Error::Msg(format!(
+            "{}: only the default dense precision is wired (drop the precision override)",
+            descriptor.id
+        )));
+    }
+    if spec.quantize.is_some() {
+        return Err(Error::Unsupported(format!(
+            "{}: an imported native single-file DiT carries its own numeric format; an additional \
+             LoadSpec::quantize request is not supported",
+            descriptor.id
+        )));
+    }
+    if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
+        return Err(Error::Unsupported(format!(
+            "{}: the base single-file provider does not accept control/IP-adapter overlays",
+            descriptor.id
+        )));
+    }
+    let base = mlx_gen::gen_core::require_base_snapshot(spec, descriptor.id)?;
+    let streamable = matches!(spec.offload_policy, mlx_gen::OffloadPolicy::Sequential)
+        && matches!(spec.load_shape, mlx_gen::LoadShape::DeferredMaterialization)
+        && !adapters_have_diff_patch(&spec.adapters);
+    let memory_strategy = crate::block_memory_strategy::native_memory_strategy_contract_from_spec(
+        descriptor.id,
+        spec,
+        base,
+        streamable,
+    )?;
+    let text_base = base.to_path_buf();
+    let heavy_base = base.to_path_buf();
+    let heavy_dit = dit_file.to_path_buf();
+    let heavy_spec = spec.clone();
+    let residency = Residency::from_policy(
+        spec.offload_policy,
+        move || KreaText::from_snapshot(&text_base),
+        move |load_pid| {
+            load_native_krea_heavy(&heavy_spec, &heavy_base, &heavy_dit, streamable, load_pid)
+        },
+    )?;
+    Ok(Krea {
+        descriptor,
+        memory_strategy,
+        precision: spec.precision,
+        quant: None,
+        streamable_transformer: streamable,
+        residency,
+        adapters: spec.adapters.clone(),
+        has_diff_patch: adapters_have_diff_patch(&spec.adapters),
+    })
+}
+
+fn load_native_krea_heavy(
+    spec: &LoadSpec,
+    base: &Path,
+    dit_file: &Path,
+    streamable: bool,
+    load_pid: bool,
+) -> Result<KreaHeavyOwned> {
+    let cfg = crate::config::Krea2Config::from_snapshot(base)?;
+    let dit =
+        crate::loader::load_transformer_from_native_file_with_stream(dit_file, &cfg, streamable)?;
+    let vae = crate::vae::load_vae(base)?;
+    let mut heavy = KreaHeavy::from_parts(dit, vae);
+    if !spec.adapters.is_empty() {
+        heavy.apply_adapters(&spec.adapters)?;
+    }
+    let pid = if load_pid {
+        spec.pid
+            .as_ref()
+            .map(|pid| PidEngine::from_spec(pid, PID_BACKBONE))
+            .transpose()?
+    } else {
+        None
+    };
+    Ok(KreaHeavyOwned { heavy, pid })
 }
 
 /// Detect whether any load-time adapter is a ComfyUI/lightx2v **diff-patch** (`.diff`/`.diff_b`), read
@@ -515,13 +584,7 @@ fn resolve_root<'a>(spec: &'a LoadSpec, id: &str) -> Result<&'a Path> {
             "{id}: only the default dense precision is wired (drop the precision override)"
         )));
     }
-    match &spec.weights {
-        WeightsSource::Dir(p) => Ok(p),
-        WeightsSource::File(_) => Err(Error::Msg(format!(
-            "{id} expects a snapshot directory (transformer/ text_encoder/ vae/), not a single \
-             .safetensors file"
-        ))),
-    }
+    mlx_gen::gen_core::require_base_snapshot(spec, id).map_err(Into::into)
 }
 
 /// Resolve the load-time quantize for a component (F-076). Returns `Some(bits)` to quantize the dense
@@ -1414,6 +1477,31 @@ mod tests {
     use super::*;
     use mlx_gen::{AdapterKind, AdapterSpec, OffloadPolicy};
 
+    fn write_minimal_safetensors(path: &Path) {
+        let mut header = br#"{"probe":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#.to_vec();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.extend([0_u8; 2]);
+        std::fs::write(path, bytes).expect("write minimal safetensors");
+    }
+
+    fn complete_native_file_spec(tmp: &tempfile::TempDir) -> LoadSpec {
+        let base = tmp.path().join("base");
+        for component in ["text_encoder", "vae"] {
+            let dir = base.join(component);
+            std::fs::create_dir_all(&dir).expect("create base component");
+            write_minimal_safetensors(&dir.join("model.safetensors"));
+        }
+        let dit = tmp.path().join("imported-krea.safetensors");
+        write_minimal_safetensors(&dit);
+        LoadSpec::new(WeightsSource::File(dit))
+            .with_component(BASE_SNAPSHOT_COMPONENT, WeightsSource::Dir(base))
+            .with_offload_policy(mlx_gen::OffloadPolicy::Sequential)
+    }
+
     fn req(w: u32, h: u32) -> GenerationRequest {
         GenerationRequest {
             prompt: "a red apple on a wooden table".into(),
@@ -1643,10 +1731,16 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_single_file() {
+    fn load_accepts_complete_single_file_spec() {
         let file = LoadSpec::new(WeightsSource::File("/tmp/x.safetensors".into()));
         let e = load(&file).err().expect("error").to_string();
-        assert!(e.contains("snapshot directory"), "got: {e}");
+        assert!(e.contains(BASE_SNAPSHOT_COMPONENT), "got: {e}");
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let complete = complete_native_file_spec(&tmp);
+        assert!(
+            load(&complete).is_ok(),
+            "complete File spec is registry-loadable"
+        );
     }
 
     #[test]
@@ -1870,10 +1964,12 @@ mod tests {
                 .any(|r| (r.descriptor)().id == KREA_2_RAW_ID),
             "id {KREA_2_RAW_ID} not registered"
         );
-        // Same snapshot loader as Turbo — a single-file weights source is rejected the same way.
         let file = LoadSpec::new(WeightsSource::File("/tmp/x.safetensors".into()));
         let e = load_raw(&file).err().expect("error").to_string();
-        assert!(e.contains("snapshot directory"), "got: {e}");
+        assert!(e.contains(BASE_SNAPSHOT_COMPONENT), "got: {e}");
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let complete = complete_native_file_spec(&tmp);
+        assert!(load_raw(&complete).is_ok());
     }
 
     // --- Image-edit variant (Kontext-style) — epic 10871 ---
@@ -1943,10 +2039,12 @@ mod tests {
                 .any(|r| (r.descriptor)().id == KREA_2_EDIT_ID),
             "id {KREA_2_EDIT_ID} not registered"
         );
-        // Same snapshot loader as Raw/Turbo — a single-file weights source is rejected the same way.
         let file = LoadSpec::new(WeightsSource::File("/tmp/x.safetensors".into()));
         let e = load_edit(&file).err().expect("error").to_string();
-        assert!(e.contains("snapshot directory"), "got: {e}");
+        assert!(e.contains(BASE_SNAPSHOT_COMPONENT), "got: {e}");
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let complete = complete_native_file_spec(&tmp);
+        assert!(load_edit(&complete).is_ok());
     }
 
     // --- CFG-free Turbo image-edit variant — sc-11640 ---
@@ -2003,10 +2101,12 @@ mod tests {
                 .any(|r| (r.descriptor)().id == KREA_2_TURBO_EDIT_ID),
             "id {KREA_2_TURBO_EDIT_ID} not registered"
         );
-        // Same snapshot loader as the other variants — a single-file weights source is rejected.
         let file = LoadSpec::new(WeightsSource::File("/tmp/x.safetensors".into()));
         let e = load_turbo_edit(&file).err().expect("error").to_string();
-        assert!(e.contains("snapshot directory"), "got: {e}");
+        assert!(e.contains(BASE_SNAPSHOT_COMPONENT), "got: {e}");
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let complete = complete_native_file_spec(&tmp);
+        assert!(load_turbo_edit(&complete).is_ok());
     }
 
     // ── F-180 (sc-11126): weight-free, default-run proof that Krea's dispatch HONORS

@@ -591,7 +591,10 @@ impl Krea2Transformer {
                     // fresh view, and re-`mmap`ing per window would buy a guarantee the type already
                     // gives. See `candle_gen::block_window`'s module docs for why Candle discharges
                     // MLX's freshness obligation structurally instead of by re-opening.
-                    || Ok(std::sync::Arc::clone(weights)),
+                    || {
+                        weights.ensure_source_unchanged()?;
+                        Ok(std::sync::Arc::clone(weights))
+                    },
                     |mut state, view, range| {
                         let blocks = materialize_window(view, cfg, &dit_plan, range)?;
                         for block in &blocks {

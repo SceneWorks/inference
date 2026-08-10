@@ -241,17 +241,38 @@ fn dequant_plain_int8_tensorwise(mut native: Weights) -> Result<Weights> {
 /// dequantized first as `codes.i8 * weight_scale` with no rotation. The remapped set then receives the
 /// same architecture coverage/shape validation and transformer assembly as the published snapshot.
 /// `cfg` comes from the resident base snapshot because the single file has no `config.json`.
+pub(crate) fn normalized_native_weights(dit_file: &Path) -> Result<Weights> {
+    let native = dequant_plain_int8_tensorwise(Weights::from_file(dit_file)?)?;
+    let mut remapped = crate::native_remap::remap_native_dit_to_diffusers(native)?;
+    crate::native_remap::normalize_modulation_tables(&mut remapped)?;
+    Ok(remapped)
+}
+
 pub fn load_transformer_from_native_file(
     dit_file: impl AsRef<Path>,
     cfg: &Krea2Config,
 ) -> Result<Krea2Transformer> {
-    let native = dequant_plain_int8_tensorwise(Weights::from_file(dit_file.as_ref())?)?;
-    let mut remapped = crate::native_remap::remap_native_dit_to_diffusers(native)?;
-    // Reshape any flat per-block modulation table (`[6·hidden]`) to the diffusers 2-D `[6, hidden]` so
-    // the set is shape-identical to a snapshot load and `validate_transformer`'s shape check passes.
-    crate::native_remap::normalize_modulation_tables(&mut remapped)?;
+    load_transformer_from_native_file_with_stream(dit_file, cfg, false)
+}
+
+/// Native-file loader with a retained, lstat-pinned source for bounded block residency.
+pub(crate) fn load_transformer_from_native_file_with_stream(
+    dit_file: impl AsRef<Path>,
+    cfg: &Krea2Config,
+    streamable: bool,
+) -> Result<Krea2Transformer> {
+    // Pin before the validation read and verify immediately after it. A concurrent replacement can
+    // therefore neither smuggle a different file past validation nor become the later window source.
+    let pinned = mlx_gen::PinnedWeightsFile::pin(dit_file.as_ref())?;
+    let remapped = normalized_native_weights(pinned.loader_path())?;
     crate::convert::validate_transformer(&remapped, cfg)?;
-    Krea2Transformer::from_weights(&remapped, cfg)
+    let transformer = Krea2Transformer::from_weights(&remapped, cfg)?;
+    pinned.ensure_unchanged()?;
+    Ok(if streamable {
+        transformer.with_native_block_stream(pinned)
+    } else {
+        transformer
+    })
 }
 
 #[cfg(test)]

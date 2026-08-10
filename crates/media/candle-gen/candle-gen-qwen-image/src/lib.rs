@@ -103,6 +103,7 @@ use candle_gen::gen_core::tokenizer::TextTokenizer;
 use candle_gen::gen_core::{
     self, Capabilities, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality,
     ModelDescriptor, PidWeights, Progress, Quant, SizeFloor, WeightsSource,
+    BASE_SNAPSHOT_COMPONENT, COMFYUI_VAE_COMPONENT,
 };
 use candle_gen::{CandleError, LatentDecoder, Result as CResult};
 use candle_gen_pid::PidEngine;
@@ -177,12 +178,12 @@ struct Pipeline {
     /// transformer is built from this file (prefix-strip + fp8→bf16, see [`comfyui`]) instead of the
     /// snapshot's `transformer/` dir; the text encoder / tokenizer still come from `root`. `None`
     /// on the registry path (dense/packed snapshot transformer).
-    comfyui_dit: Option<PathBuf>,
+    comfyui_dit: Option<gen_core::PinnedWeightsFile>,
     /// An in-place ComfyUI Qwen-Image VAE single-file (epic 10451 Phase 2b, sc-10830, `vae/
     /// qwen_image_vae.safetensors`, native WAN-VAE keys). When set, the VAE is built from this file
     /// (key-remapped, see [`comfyui::remap_vae_wan_to_diffusers`]); when `None` the VAE falls back to
     /// the snapshot's `vae/` dir. Independent of `comfyui_dit` (either can be in place).
-    comfyui_vae: Option<PathBuf>,
+    comfyui_vae: Option<gen_core::PinnedWeightsFile>,
 }
 
 impl Pipeline {
@@ -207,16 +208,19 @@ impl Pipeline {
         device: &Device,
         comfyui_dit: PathBuf,
         comfyui_vae: Option<PathBuf>,
-    ) -> Self {
-        Self {
+        pid_spec: Option<PidWeights>,
+    ) -> gen_core::Result<Self> {
+        Ok(Self {
             te_cfg: TextEncoderConfig::qwen_image(),
             dit_cfg: TransformerConfig::qwen_image(),
             root: root.to_path_buf(),
             device: device.clone(),
-            pid_spec: None,
-            comfyui_dit: Some(comfyui_dit),
-            comfyui_vae,
-        }
+            pid_spec,
+            comfyui_dit: Some(gen_core::PinnedWeightsFile::pin(comfyui_dit)?),
+            comfyui_vae: comfyui_vae
+                .map(gen_core::PinnedWeightsFile::pin)
+                .transpose()?,
+        })
     }
 
     fn component_vb(&self, sub: &str, dtype: DType) -> CResult<VarBuilder<'static>> {
@@ -509,13 +513,17 @@ impl Pipeline {
                             .into(),
                     ));
                 }
-                let dit_map = candle_gen::candle_core::safetensors::load(dit_file, &Device::Cpu)
-                    .map_err(|error| {
-                        CandleError::Msg(format!(
-                            "qwen-image comfyui: load DiT {}: {error}",
-                            dit_file.display()
-                        ))
-                    })?;
+                dit_file.ensure_unchanged()?;
+                let dit_map = candle_gen::candle_core::safetensors::load(
+                    dit_file.loader_path(),
+                    &Device::Cpu,
+                )
+                .map_err(|error| {
+                    CandleError::Msg(format!(
+                        "qwen-image comfyui: load DiT {}: {error}",
+                        dit_file.loader_path().display()
+                    ))
+                })?;
                 let dit_map = comfyui::remap_and_cast_comfyui_dit(dit_map, DIT_DTYPE)?;
                 let dit_vb = VarBuilder::from_tensors(dit_map, DIT_DTYPE, &self.device);
                 Ok(QwenTransformer::new_gs(
@@ -576,13 +584,17 @@ impl Pipeline {
     fn load_vae_seq(&self) -> CResult<QwenVae> {
         match &self.comfyui_vae {
             Some(vae_file) => {
-                let vae_map = candle_gen::candle_core::safetensors::load(vae_file, &Device::Cpu)
-                    .map_err(|error| {
-                        CandleError::Msg(format!(
-                            "qwen-image comfyui: load VAE {}: {error}",
-                            vae_file.display()
-                        ))
-                    })?;
+                vae_file.ensure_unchanged()?;
+                let vae_map = candle_gen::candle_core::safetensors::load(
+                    vae_file.loader_path(),
+                    &Device::Cpu,
+                )
+                .map_err(|error| {
+                    CandleError::Msg(format!(
+                        "qwen-image comfyui: load VAE {}: {error}",
+                        vae_file.loader_path().display()
+                    ))
+                })?;
                 let vae_map = comfyui::remap_vae_wan_to_diffusers(vae_map)?;
                 let vae_vb = VarBuilder::from_tensors(vae_map, ENC_DTYPE, &self.device);
                 Ok(QwenVae::new(vae_vb)?)
@@ -917,16 +929,10 @@ fn generator_from_pipeline(
 /// pointing at a `Qwen/Qwen-Image` diffusers snapshot (`text_encoder/`, `transformer/`, `vae/`,
 /// `tokenizer/`). Adapters / quantization / control overlays are rejected (not wired).
 pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    let root = match &spec.weights {
-        WeightsSource::Dir(p) => p.clone(),
-        WeightsSource::File(_) => {
-            return Err(gen_core::Error::Msg(
-                "qwen_image expects a snapshot directory (text_encoder/ transformer/ vae/ \
-                 tokenizer/), not a single .safetensors file"
-                    .into(),
-            ));
-        }
-    };
+    let root = gen_core::require_base_snapshot(spec, MODEL_ID)?.to_path_buf();
+    if matches!(spec.weights, WeightsSource::Dir(_)) {
+        gen_core::reject_unknown_components(spec, &[], MODEL_ID)?;
+    }
     if !spec.adapters.is_empty() {
         return Err(gen_core::Error::Unsupported(
             "candle qwen_image does not support LoRA/LoKr yet".into(),
@@ -942,9 +948,34 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
             "candle qwen_image does not support control / Edit yet (txt2img only)".into(),
         ));
     }
+    if spec.identity.is_some() || spec.text_encoder.is_some() {
+        return Err(gen_core::Error::Unsupported(
+            "candle qwen_image does not support identity or external text-encoder weights".into(),
+        ));
+    }
     let loaded_quant = memory_strategy::snapshot_quant_tier(spec, MODEL_ID)?;
     let device = candle_gen::default_device()?;
-    let pipe = Pipeline::load(&root, &device, spec.pid.clone());
+    let pipe = match &spec.weights {
+        WeightsSource::Dir(_) => Pipeline::load(&root, &device, spec.pid.clone()),
+        WeightsSource::File(dit) => {
+            gen_core::reject_unknown_components(
+                spec,
+                &[BASE_SNAPSHOT_COMPONENT, COMFYUI_VAE_COMPONENT],
+                MODEL_ID,
+            )?;
+            let vae = match spec.components.get(COMFYUI_VAE_COMPONENT) {
+                Some(WeightsSource::File(path)) => Some(path.clone()),
+                Some(WeightsSource::Dir(path)) => {
+                    return Err(gen_core::Error::Msg(format!(
+                        "{MODEL_ID}: component '{COMFYUI_VAE_COMPONENT}' must be a file, not {}",
+                        path.display()
+                    )))
+                }
+                None => None,
+            };
+            Pipeline::load_comfyui(&root, &device, dit.clone(), vae, spec.pid.clone())?
+        }
+    };
     #[cfg(any(feature = "cuda", test))]
     let memory_strategy = Some(memory_strategy::provider_contract(MODEL_ID, spec)?);
     #[cfg(not(any(feature = "cuda", test)))]
@@ -969,14 +1000,14 @@ pub fn load_from_comfyui_dit(
     snapshot_dir: impl Into<PathBuf>,
     vae_file: Option<PathBuf>,
 ) -> gen_core::Result<Box<dyn Generator>> {
-    let device = candle_gen::default_device()?;
-    let pipe = Pipeline::load_comfyui(
-        &snapshot_dir.into(),
-        &device,
-        transformer_file.into(),
-        vae_file,
+    let mut spec = LoadSpec::new(WeightsSource::File(transformer_file.into())).with_component(
+        BASE_SNAPSHOT_COMPONENT,
+        WeightsSource::Dir(snapshot_dir.into()),
     );
-    generator_from_pipeline(pipe, None, None)
+    if let Some(vae_file) = vae_file {
+        spec = spec.with_component(COMFYUI_VAE_COMPONENT, WeightsSource::File(vae_file));
+    }
+    load(&spec)
 }
 
 candle_gen::register_generators! {
@@ -1130,14 +1161,19 @@ mod tests {
 
     #[test]
     fn staged_comfyui_loaders_preserve_both_selected_single_files() {
-        let dit = PathBuf::from("/selected/qwen-comfyui-dit.safetensors");
-        let vae = PathBuf::from("/selected/qwen-comfyui-vae.safetensors");
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dit = dir.path().join("qwen-comfyui-dit.safetensors");
+        let vae = dir.path().join("qwen-comfyui-vae.safetensors");
+        std::fs::write(&dit, b"not safetensors").expect("write dit fixture");
+        std::fs::write(&vae, b"not safetensors").expect("write vae fixture");
         let pipe = Pipeline::load_comfyui(
             Path::new("/missing-snapshot"),
             &Device::Cpu,
             dit.clone(),
             Some(vae.clone()),
-        );
+            None,
+        )
+        .expect("pin selected files");
         let dit_error = pipe
             .load_transformer_seq()
             .err()
@@ -1441,10 +1477,17 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_single_file_source() {
+    fn single_file_source_requires_the_base_snapshot_component() {
         let spec = LoadSpec::new(WeightsSource::File("/tmp/q.safetensors".into()));
         let err = load(&spec).err().expect("expected an error").to_string();
-        assert!(err.contains("snapshot directory"), "got: {err}");
+        assert!(err.contains(BASE_SNAPSHOT_COMPONENT), "got: {err}");
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dit = dir.path().join("qwen.safetensors");
+        std::fs::write(&dit, b"not safetensors").expect("write pinned fixture");
+        let complete = LoadSpec::new(WeightsSource::File(dit))
+            .with_component(BASE_SNAPSHOT_COMPONENT, WeightsSource::Dir("/snap".into()));
+        assert!(load(&complete).is_ok(), "complete File spec loads lazily");
     }
 
     /// sc-8647: a `Qwen/Qwen-Image-2512` snapshot is a structural drop-in for the original

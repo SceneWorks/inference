@@ -131,6 +131,7 @@ use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, ConditioningKind, GenerationOutput, GenerationRequest,
     Generator, LoadSpec, Modality, ModelDescriptor, PidWeights, Progress, SizeFloor, WeightsSource,
+    BASE_SNAPSHOT_COMPONENT, COMFYUI_TEXT_ENCODER_COMPONENT, COMFYUI_VAE_COMPONENT,
 };
 use candle_transformers::models::z_image::vae::Encoder as VaeEncoder;
 
@@ -315,7 +316,13 @@ impl Generator for ZImageGenerator {
         // heavy components come from the cache.
         let pipe = match &self.comfyui {
             // In-place ComfyUI load (sc-10668): the DiT/VAE remap + verbatim Qwen3 TE.
-            Some(sources) => Pipeline::load_comfyui(sources.clone(), &self.device, self.dtype),
+            Some(sources) => Pipeline::load_comfyui(
+                sources.clone(),
+                &self.device,
+                self.dtype,
+                &self.adapters,
+                self.pid_spec.clone(),
+            ),
             None => Pipeline::load(
                 &self.root,
                 &self.device,
@@ -335,13 +342,6 @@ impl Generator for ZImageGenerator {
                 return Err(gen_core::Error::Unsupported(
                     "z_image_turbo: bounded decode, attention, and transformer residency require \
                      request-scoped staged residency"
-                        .into(),
-                ));
-            }
-            if self.comfyui.is_some() {
-                return Err(gen_core::Error::Unsupported(
-                    "z_image_turbo: sequential residency is unavailable for bespoke ComfyUI \
-                     component loads"
                         .into(),
                 ));
             }
@@ -457,29 +457,69 @@ pub fn descriptor() -> ModelDescriptor {
     }
 }
 
-fn comfyui_descriptor() -> ModelDescriptor {
-    let mut descriptor = descriptor();
-    descriptor.capabilities.supports_sequential_offload = false;
-    descriptor
+fn comfyui_sources_from_spec(
+    spec: &LoadSpec,
+) -> gen_core::Result<Option<std::sync::Arc<comfyui::ComfyuiSources>>> {
+    let WeightsSource::File(primary) = &spec.weights else {
+        return Ok(None);
+    };
+    gen_core::reject_unknown_components(
+        spec,
+        &[
+            BASE_SNAPSHOT_COMPONENT,
+            COMFYUI_TEXT_ENCODER_COMPONENT,
+            COMFYUI_VAE_COMPONENT,
+        ],
+        MODEL_ID,
+    )?;
+    let tokenizer_dir = gen_core::require_base_snapshot(spec, MODEL_ID)?.to_path_buf();
+    let text_encoder = spec.components.get(COMFYUI_TEXT_ENCODER_COMPONENT);
+    let vae = spec.components.get(COMFYUI_VAE_COMPONENT);
+    let sources = match (text_encoder, vae) {
+        (None, None) => comfyui::ComfyuiSources::combined(primary.clone(), tokenizer_dir)?,
+        (Some(WeightsSource::File(text_encoder)), Some(WeightsSource::File(vae))) => {
+            comfyui::ComfyuiSources::separate(
+                primary.clone(),
+                text_encoder.clone(),
+                vae.clone(),
+                tokenizer_dir,
+            )?
+        }
+        (Some(WeightsSource::Dir(path)), _) => {
+            return Err(gen_core::Error::Msg(format!(
+                "{MODEL_ID}: component '{COMFYUI_TEXT_ENCODER_COMPONENT}' must be a file, not {}",
+                path.display()
+            )))
+        }
+        (_, Some(WeightsSource::Dir(path))) => {
+            return Err(gen_core::Error::Msg(format!(
+                "{MODEL_ID}: component '{COMFYUI_VAE_COMPONENT}' must be a file, not {}",
+                path.display()
+            )))
+        }
+        _ => {
+            return Err(gen_core::Error::Msg(format!(
+                "{MODEL_ID}: separate ComfyUI import requires both '{COMFYUI_TEXT_ENCODER_COMPONENT}' and '{COMFYUI_VAE_COMPONENT}', or neither for a combined checkpoint"
+            )))
+        }
+    };
+    Ok(Some(std::sync::Arc::new(sources)))
 }
 
-/// Construct the (lazy) candle Z-Image generator from a [`LoadSpec`]. `spec.weights` must be a
-/// [`WeightsSource::Dir`] pointing at a `Tongyi-MAI/Z-Image-Turbo`-layout snapshot (the diffusers
-/// multi-component tree: `tokenizer/`, `text_encoder/`, `transformer/`, `vae/`). LoRA/LoKr adapters
+/// Construct the (lazy) candle Z-Image generator from a [`LoadSpec`]. A [`WeightsSource::Dir`] points
+/// at a complete `Tongyi-MAI/Z-Image-Turbo` diffusers snapshot. A [`WeightsSource::File`] selects an
+/// imported combined checkpoint, or an imported DiT when the text encoder and VAE files are supplied
+/// as named components; both File shapes require the tokenizer companion under
+/// [`BASE_SNAPSHOT_COMPONENT`]. All shapes use this same registry provider. LoRA/LoKr adapters
 /// are accepted and merged into the DiT at first `generate` (sc-5166); on-the-fly quantization and
 /// control/IP-adapter overlays are still rejected — not wired, so refusing is more honest than
 /// silently dropping them (the worker falls back to Python).
 pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    let root = match &spec.weights {
-        WeightsSource::Dir(p) => p.clone(),
-        WeightsSource::File(_) => {
-            return Err(gen_core::Error::Msg(
-                "z_image_turbo expects a snapshot directory (tokenizer/ text_encoder/ transformer/ \
-                 vae/), not a single .safetensors file"
-                    .into(),
-            ));
-        }
-    };
+    let comfyui = comfyui_sources_from_spec(spec)?;
+    let root = gen_core::require_base_snapshot(spec, MODEL_ID)?.to_path_buf();
+    if matches!(spec.weights, WeightsSource::Dir(_)) {
+        gen_core::reject_unknown_components(spec, &[], MODEL_ID)?;
+    }
     // z-image loads a **pre-quantized MLX-packed tier** (`SceneWorks/z-image-turbo-mlx` q4/q8)
     // transparently when the snapshot dir carries a `quantization` block in its component `config.json`
     // (sc-9408, auto-detected at first `generate`) — no `spec.quantize` needed, the tier is already
@@ -496,6 +536,12 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
         return Err(gen_core::Error::Unsupported(
             "candle z_image_turbo does not support control / IP-adapter overlays yet (txt2img only)"
+                .into(),
+        ));
+    }
+    if spec.identity.is_some() || spec.text_encoder.is_some() {
+        return Err(gen_core::Error::Unsupported(
+            "candle z_image_turbo does not support identity or external text-encoder weights"
                 .into(),
         ));
     }
@@ -519,7 +565,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         // any) so the lazy component build loads the engine once. Unlike quant/control above, it is not
         // rejected — `None` simply keeps the byte-exact native-VAE path.
         pid_spec: spec.pid.clone(),
-        comfyui: None,
+        comfyui,
         memory_strategy,
         components: Mutex::new(None),
         vae_encoder: Mutex::new(None),
@@ -534,38 +580,25 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 /// normalize to bf16 before assembly; unsupported packed integer formats remain
 /// typed load errors.
 ///
-/// Invoked **directly by the SceneWorks worker** (like [`edit`] / [`control`]), not through the
-/// gen-core registry — the registered `z_image_turbo` descriptor still expects a diffusers snapshot
-/// dir, so this stays a bespoke worker entry point rather than a `WeightsSource` variant.
+/// Retained as a compatibility shim: it constructs the registry [`LoadSpec`] and delegates to
+/// [`load`], so there is no second provider lifecycle.
 pub fn load_from_comfyui_components(
     transformer_file: impl Into<PathBuf>,
     text_encoder_file: impl Into<PathBuf>,
     vae_file: impl Into<PathBuf>,
     tokenizer_dir: impl Into<PathBuf>,
 ) -> gen_core::Result<Box<dyn Generator>> {
-    let device = candle_gen::default_device()?;
-    let sources = std::sync::Arc::new(comfyui::ComfyuiSources {
-        weights: comfyui::ComfyuiWeights::Separate {
-            transformer_file: transformer_file.into(),
-            text_encoder_file: text_encoder_file.into(),
-            vae_file: vae_file.into(),
-        },
-        tokenizer_dir: tokenizer_dir.into(),
-    });
-    Ok(Box::new(ZImageGenerator {
-        descriptor: comfyui_descriptor(),
-        root: sources.tokenizer_dir.clone(),
-        device,
-        dtype: DType::BF16,
-        loaded_quant: None,
-        lifecycle: Mutex::new(()),
-        adapters: Vec::new(),
-        pid_spec: None,
-        comfyui: Some(sources),
-        memory_strategy: None,
-        components: Mutex::new(None),
-        vae_encoder: Mutex::new(None),
-    }))
+    let spec = LoadSpec::new(WeightsSource::File(transformer_file.into()))
+        .with_component(
+            BASE_SNAPSHOT_COMPONENT,
+            WeightsSource::Dir(tokenizer_dir.into()),
+        )
+        .with_component(
+            COMFYUI_TEXT_ENCODER_COMPONENT,
+            WeightsSource::File(text_encoder_file.into()),
+        )
+        .with_component(COMFYUI_VAE_COMPONENT, WeightsSource::File(vae_file.into()));
+    load(&spec)
 }
 
 /// Construct a Z-Image generator from one fused community checkpoint containing
@@ -575,25 +608,11 @@ pub fn load_from_comfyui_checkpoint(
     checkpoint_file: impl Into<PathBuf>,
     tokenizer_dir: impl Into<PathBuf>,
 ) -> gen_core::Result<Box<dyn Generator>> {
-    let device = candle_gen::default_device()?;
-    let sources = std::sync::Arc::new(comfyui::ComfyuiSources {
-        weights: comfyui::ComfyuiWeights::Combined(checkpoint_file.into()),
-        tokenizer_dir: tokenizer_dir.into(),
-    });
-    Ok(Box::new(ZImageGenerator {
-        descriptor: comfyui_descriptor(),
-        root: sources.tokenizer_dir.clone(),
-        device,
-        dtype: DType::BF16,
-        loaded_quant: None,
-        lifecycle: Mutex::new(()),
-        adapters: Vec::new(),
-        pid_spec: None,
-        comfyui: Some(sources),
-        memory_strategy: None,
-        components: Mutex::new(None),
-        vae_encoder: Mutex::new(None),
-    }))
+    let spec = LoadSpec::new(WeightsSource::File(checkpoint_file.into())).with_component(
+        BASE_SNAPSHOT_COMPONENT,
+        WeightsSource::Dir(tokenizer_dir.into()),
+    );
+    load(&spec)
 }
 
 // Link-time self-registration into gen-core's model registry. Linking this crate makes
@@ -879,12 +898,10 @@ mod tests {
     }
 
     #[test]
-    fn comfyui_descriptor_does_not_advertise_sequential_offload() {
+    fn imported_sources_share_the_registered_provider_capabilities() {
         assert!(
-            !comfyui_descriptor()
-                .capabilities
-                .supports_sequential_offload,
-            "bespoke ComfyUI loads remain resident-only"
+            descriptor().capabilities.supports_sequential_offload,
+            "File and Dir loads now share the registry provider's staged lifecycle"
         );
     }
 
@@ -1058,10 +1075,19 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_single_file_source() {
+    fn single_file_source_requires_the_base_snapshot_component() {
         let spec = LoadSpec::new(WeightsSource::File("/tmp/z.safetensors".into()));
         let err = load(&spec).err().expect("expected an error").to_string();
-        assert!(err.contains("snapshot directory"), "got: {err}");
+        assert!(err.contains(BASE_SNAPSHOT_COMPONENT), "got: {err}");
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let checkpoint = dir.path().join("z-image.safetensors");
+        std::fs::write(&checkpoint, b"not safetensors").expect("write pinned fixture");
+        let complete = LoadSpec::new(WeightsSource::File(checkpoint)).with_component(
+            BASE_SNAPSHOT_COMPONENT,
+            WeightsSource::Dir("/tokenizer".into()),
+        );
+        assert!(load(&complete).is_ok(), "complete File spec loads lazily");
     }
 
     /// The accel-attn runtime toggle defaults on and round-trips (what the worker/UI drive).

@@ -616,27 +616,48 @@ pub fn load_components_native(
     native_dit: &Path,
     device: &Device,
 ) -> Result<Components> {
+    load_components_native_with(root, native_dit, device, &[], false)
+}
+
+/// Registry-backed native load with the same adapter and block-window surface as a snapshot load.
+pub(crate) fn load_components_native_with(
+    root: &Path,
+    native_dit: &Path,
+    device: &Device,
+    adapters: &[AdapterSpec],
+    stream_blocks: bool,
+) -> Result<Components> {
     let text = load_text(root, device)?;
-    let heavy = load_heavy_native(root, native_dit, device)?;
+    let heavy = load_heavy_native_with(root, native_dit, device, adapters, stream_blocks)?;
     Ok(Components { text, heavy })
+}
+
+pub(crate) fn load_components_native_registry(
+    root: &Path,
+    native_dit: &Path,
+    device: &Device,
+    adapters: &[AdapterSpec],
+    pid_spec: Option<&PidWeights>,
+) -> Result<Components> {
+    let mut components = load_components_native_with(root, native_dit, device, adapters, false)?;
+    components.heavy.pid = pid_spec
+        .map(|spec| PidEngine::from_spec(spec, PID_BACKBONE, device).map(Arc::new))
+        .transpose()?;
+    Ok(components)
 }
 
 /// The heavy half of a native single-file load: the dense or dequantized DiT (from `native_dit`, read
 /// through the native→diffusers remap) + the Qwen-Image VAE (from `root`). No adapters/PiD (the
 /// out-of-registry single-file entrypoint bakes any LoRAs into the merge and does not thread overlays —
 /// mirroring the MLX S0b scope); those stay a follow-on with the worker wiring (S0c).
-pub(crate) fn load_heavy_native(
+pub(crate) fn load_heavy_native_with(
     root: &Path,
     native_dit: &Path,
     device: &Device,
+    adapters: &[AdapterSpec],
+    stream_blocks: bool,
 ) -> Result<KreaHeavy> {
-    let cfg = Krea2Config::from_snapshot(root)?;
-    // `from_native_file`: native_keys ON, ConvRot OFF. Dense stores W directly; plain int8 reconstructs
-    // W = codes * row_scale. Neither stores ConvRot's W·R, so neither may rotate.
-    let dit_w = Weights::from_native_file(native_dit, device, DIT_DTYPE)?;
-    crate::convert::validate_native_transformer(&dit_w, &cfg)?;
-    let dit = Krea2Transformer::load(&dit_w, &cfg)?;
-
+    let dit = load_native_dit(root, native_dit, device, adapters, stream_blocks)?;
     let vae = load_vae(root, device)?;
 
     Ok(KreaHeavy {
@@ -644,6 +665,69 @@ pub(crate) fn load_heavy_native(
         vae: Arc::new(vae),
         pid: None,
     })
+}
+
+fn load_native_dit(
+    root: &Path,
+    native_dit: &Path,
+    device: &Device,
+    adapters: &[AdapterSpec],
+    stream_blocks: bool,
+) -> Result<Krea2Transformer> {
+    let cfg = Krea2Config::from_snapshot(root)?;
+    // `from_native_file`: native_keys ON, ConvRot OFF. Dense stores W directly; plain int8 reconstructs
+    // W = codes * row_scale. Neither stores ConvRot's W·R, so neither may rotate.
+    let mut dit_w = Weights::from_native_file(native_dit, device, DIT_DTYPE)?;
+    crate::convert::validate_native_transformer(&dit_w, &cfg)?;
+    let diff = crate::adapters::fold_diff_patch(&mut dit_w, adapters)?;
+    if stream_blocks && !adapters.is_empty() {
+        return Err(CandleError::Msg(
+            "Krea native block streaming does not support load-time adapters".into(),
+        ));
+    }
+    let mut dit = if stream_blocks {
+        Krea2Transformer::load_block_streamed(Arc::new(dit_w), &cfg)?
+    } else {
+        Krea2Transformer::load(&dit_w, &cfg)?
+    };
+    if !adapters.is_empty() {
+        crate::adapters::install_additive(&mut dit, adapters, diff.merged)?;
+    }
+
+    Ok(dit)
+}
+
+/// Sequential imported-file heavy phase: native DiT + VAE + img2img/edit encoder, loaded only after
+/// the text encoder was released. The transformer stays file-backed and window-materialized when the
+/// source is adapter-free.
+pub(crate) fn load_residency_heavy_native(
+    root: &Path,
+    native_dit: &Path,
+    device: &Device,
+    adapters: &[AdapterSpec],
+    stream_blocks: bool,
+) -> Result<ResidencyHeavy> {
+    Ok(ResidencyHeavy {
+        heavy: load_heavy_native_with(root, native_dit, device, adapters, stream_blocks)?,
+        vae_encoder: load_vae_encoder(root, device)?,
+    })
+}
+
+pub(crate) fn load_residency_heavy_native_registry(
+    root: &Path,
+    native_dit: &Path,
+    device: &Device,
+    adapters: &[AdapterSpec],
+    pid_spec: Option<&PidWeights>,
+    use_pid: bool,
+    stream_blocks: bool,
+) -> Result<ResidencyHeavy> {
+    let mut result =
+        load_residency_heavy_native(root, native_dit, device, adapters, stream_blocks)?;
+    result.heavy.pid = pid_to_load(pid_spec, use_pid)
+        .map(|spec| PidEngine::from_spec(spec, PID_BACKBONE, device).map(Arc::new))
+        .transpose()?;
+    Ok(result)
 }
 
 /// The **sequential** twin of [`load_heavy_convrot`] (sc-12089 / epic 10765 Phase 1c): the int8 DiT +
@@ -720,8 +804,12 @@ pub fn render(
 /// The context and final latents intentionally survive their producing phase; model weights do not.
 /// A device synchronization precedes each model drop so asynchronous CUDA work cannot keep the prior
 /// phase alive while the next allocates. The resident/default path never calls this function.
-pub(crate) fn render_three_stage(
+/// Three-stage renderer for snapshot and imported-file sources. All phases remain identical; only the
+/// DiT opener is selected from the optional registry primary `WeightsSource::File` instead of
+/// `root/transformer`.
+pub(crate) fn render_three_stage_with_native(
     root: &Path,
+    native_dit: Option<&Path>,
     device: &Device,
     adapters: &[AdapterSpec],
     req: &GenerationRequest,
@@ -750,13 +838,27 @@ pub(crate) fn render_three_stage(
         gen_core::MemoryPhase::Denoise,
         on_progress,
     )?;
-    let dit = load_dit_cancelable(
-        root,
-        device,
-        adapters,
-        memory.stream_transformer_blocks,
-        Some(&req.cancel),
-    )?;
+    let dit = match native_dit {
+        Some(native_dit) => {
+            candle_gen::check_cancel(&req.cancel)?;
+            let dit = load_native_dit(
+                root,
+                native_dit,
+                device,
+                adapters,
+                memory.stream_transformer_blocks,
+            )?;
+            candle_gen::check_cancel(&req.cancel)?;
+            dit
+        }
+        None => load_dit_cancelable(
+            root,
+            device,
+            adapters,
+            memory.stream_transformer_blocks,
+            Some(&req.cancel),
+        )?,
+    };
     let steps = req.steps.map(|s| s as usize).unwrap_or(TURBO_STEPS);
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
     let native = turbo_sigmas(steps);

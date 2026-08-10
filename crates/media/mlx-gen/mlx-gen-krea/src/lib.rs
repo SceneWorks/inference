@@ -66,6 +66,9 @@ pub mod training;
 pub mod transformer;
 pub mod vae;
 
+pub use block_stream::{
+    block_stream_diagnostics, reset_block_stream_diagnostics, BlockStreamDiagnostics,
+};
 pub use config::Krea2Config;
 pub use control::Krea2ControlBranch;
 pub use loader::{load_text_encoder, load_transformer, load_transformer_from_native_file};

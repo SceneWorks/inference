@@ -275,27 +275,58 @@ fn memory_strategy_contract_with_components(
 /// Exact contract for the supported community single-file DiT composition. The native I8 format is
 /// dequantized projection-by-projection to bf16, while its scale/descriptor tensors are consumed and
 /// dropped; the text encoder and VAE remain sourced from the resident base snapshot.
+///
+/// Keeping the snapshot and imported forms on the same provider/calibration identity is intentional:
+/// the implementation, phase model, and non-transformer components are the same. The promoted-memory
+/// evidence matrix does not currently have a load-source axis, however. Consequently a published
+/// snapshot (`Dir`) rung-4 cell must not be described as an imported-file measurement merely because
+/// this contract can re-open a pinned `File`; the `File` route needs its own real-path measurement
+/// before release evidence may claim that cell. `streamable` here declares the implemented mechanism,
+/// not evidence that a particular source path was measured.
+pub(crate) fn native_memory_strategy_contract_from_spec(
+    provider_id: &str,
+    spec: &LoadSpec,
+    base_snapshot_dir: &std::path::Path,
+    streamable: bool,
+) -> CoreResult<MemoryProviderContract> {
+    let stored = |path: &std::path::Path, what: &str| -> CoreResult<u64> {
+        projected_safetensors_bytes(path, |_| ResidentProjection::Stored).map_err(|error| {
+            CoreError::Msg(format!(
+                "{provider_id}: native {what} asset facts for '{}': {error}",
+                path.display()
+            ))
+        })
+    };
+    let dit_file = match &spec.weights {
+        WeightsSource::File(path) => path,
+        WeightsSource::Dir(path) => {
+            return Err(CoreError::Msg(format!(
+                "{provider_id}: native memory facts require a single-file DiT, not directory {}",
+                path.display()
+            )))
+        }
+    };
+    let components = mlx_gen::PerComponentBytes {
+        text_encoder: stored(&base_snapshot_dir.join("text_encoder"), "base text encoder")?,
+        dit: native_dit_transformer_bytes(provider_id, dit_file)?,
+        vae: stored(&base_snapshot_dir.join("vae"), "base VAE")?,
+    };
+    memory_strategy_contract_with_components(provider_id, spec, components, streamable)
+}
+
+/// Compatibility shim for the pre-registry native loader. New call sites carry the base snapshot in
+/// `LoadSpec::components` and use [`native_memory_strategy_contract_from_spec`].
+#[cfg(test)]
 pub(crate) fn native_memory_strategy_contract(
     provider_id: &str,
     dit_file: &std::path::Path,
     base_snapshot_dir: &std::path::Path,
 ) -> CoreResult<MemoryProviderContract> {
-    let base_spec = LoadSpec::new(WeightsSource::Dir(base_snapshot_dir.to_path_buf()));
-    let mut contract = memory_strategy_contract(provider_id, &base_spec).map_err(|error| {
-        CoreError::Msg(format!(
-            "{provider_id}: native base snapshot asset facts for '{}': {error}",
-            base_snapshot_dir.display()
-        ))
-    })?;
-    let transformer_bytes = native_dit_transformer_bytes(provider_id, dit_file)?;
-    contract.asset_facts.transformer_bytes = transformer_bytes;
-    contract.asset_facts.base_bytes = contract
-        .asset_facts
-        .conditioning_bytes
-        .checked_add(transformer_bytes)
-        .and_then(|bytes| bytes.checked_add(contract.asset_facts.decoder_bytes))
-        .ok_or_else(|| CoreError::Msg("krea native resident byte sum overflow".to_owned()))?;
-    Ok(contract)
+    let spec = LoadSpec::new(WeightsSource::File(dit_file.to_path_buf())).with_component(
+        mlx_gen::BASE_SNAPSHOT_COMPONENT,
+        WeightsSource::Dir(base_snapshot_dir.to_path_buf()),
+    );
+    native_memory_strategy_contract_from_spec(provider_id, &spec, base_snapshot_dir, false)
 }
 
 /// Resident bytes of a community single-file native DiT: I8 projections materialize to bf16, their
@@ -903,14 +934,20 @@ mod tests {
     }
 
     #[test]
-    fn non_reopenable_or_wrong_loader_shapes_do_not_advertise_rung_four() {
+    fn wrong_loader_shapes_fail_closed_and_registry_file_is_reopenable() {
         let tmp = tempfile::tempdir().unwrap();
         let (root, base) = fixture(&tmp);
         let mut resident = base.clone();
         resident.offload_policy = OffloadPolicy::Resident;
         let mut eager = base.clone();
         eager.load_shape = LoadShape::EagerMaterialization;
-        let file = LoadSpec::new(WeightsSource::File(root.join("single.safetensors")))
+        let native = root.join("single.safetensors");
+        write_native_i8_safetensors(&native);
+        let file = LoadSpec::new(WeightsSource::File(native))
+            .with_component(
+                mlx_gen::BASE_SNAPSHOT_COMPONENT,
+                WeightsSource::Dir(root.clone()),
+            )
             .with_offload_policy(OffloadPolicy::Sequential)
             .with_load_shape(LoadShape::DeferredMaterialization);
         for spec in [resident, eager] {
@@ -923,10 +960,16 @@ mod tests {
                 MemoryStrategySupport::Missing
             );
         }
-        let error = memory_strategy_contract("krea_2_turbo", &file)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("snapshot directory"), "{error}");
+        let file_contract =
+            native_memory_strategy_contract_from_spec("krea_2_turbo", &file, &root, true).unwrap();
+        assert_eq!(
+            file_contract
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .support,
+            MemoryStrategySupport::Implemented,
+            "the registry File source is lstat-pinned and reopened for each transformer window"
+        );
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -959,7 +1002,7 @@ mod tests {
             assert_eq!(
                 contract.capability(strategy).unwrap().support,
                 MemoryStrategySupport::Missing,
-                "the single-file ConvRot composition has no reopenable per-phase/per-block source"
+                "the compatibility helper intentionally models the historical eager load; registry File specs carry the reopenable lifecycle"
             );
         }
         assert!(contract.conformance_errors().is_empty());

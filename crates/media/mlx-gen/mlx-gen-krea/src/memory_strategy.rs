@@ -44,6 +44,16 @@ pub fn memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> CoreResult<MemoryProviderContract> {
+    if matches!(spec.weights, mlx_gen::WeightsSource::File(_)) {
+        let base = mlx_gen::require_base_snapshot(spec, provider_id)?;
+        let streamable = matches!(spec.offload_policy, mlx_gen::OffloadPolicy::Sequential)
+            && matches!(
+                spec.load_shape,
+                mlx_gen::gen_core::LoadShape::DeferredMaterialization
+            )
+            && !crate::model::adapters_have_diff_patch(&spec.adapters);
+        return native_memory_strategy_contract_from_spec(provider_id, spec, base, streamable);
+    }
     let (asset_facts, resident_components) = asset_facts(spec, provider_id)?;
     memory_strategy_contract_with_asset_facts(
         provider_id,
@@ -187,15 +197,29 @@ fn memory_strategy_contract_with_asset_facts(
 /// consumed and dropped), the text encoder and VAE come from the resident base tier, and the pose
 /// overlay loads dense — the native DiT is dense in memory, and a dense base carries a dense branch
 /// (`crate::memory::control_branch_quant_bits(None)`), so the overlay bytes are its stored bytes.
-/// Same `provider_id` + calibration fingerprint as the snapshot control contract, so promoted
-/// evidence keyed on the `krea_2_turbo_control` identity resolves for this composition through the
-/// same selectors (tier / geometry / load shape) rather than a bespoke imported identity.
-pub(crate) fn native_memory_strategy_contract(
+/// Same `provider_id` + calibration fingerprint as the snapshot control contract: implementation and
+/// provider evidence stay on one identity. The evidence matrix has no load-source axis, though, so a
+/// `Dir`-measured rung-4 cell must not be reported as a `File` measurement until this re-openable path
+/// is measured directly. `streamable` declares the mechanism and is not itself measurement evidence.
+pub(crate) fn native_memory_strategy_contract_from_spec(
     provider_id: &str,
-    dit_file: &std::path::Path,
+    spec: &LoadSpec,
     base_snapshot_dir: &std::path::Path,
-    control: &std::path::Path,
+    streamable: bool,
 ) -> CoreResult<MemoryProviderContract> {
+    let dit_file = match &spec.weights {
+        mlx_gen::WeightsSource::File(path) => path,
+        mlx_gen::WeightsSource::Dir(path) => {
+            return Err(CoreError::Msg(format!(
+                "{provider_id}: native pose-control facts require a single-file DiT, not {}",
+                path.display()
+            )))
+        }
+    };
+    let control = mlx_gen::require_control(spec, provider_id, "Krea 2 pose control overlay")?;
+    let control_path = match control {
+        mlx_gen::WeightsSource::Dir(path) | mlx_gen::WeightsSource::File(path) => path,
+    };
     let stored = |path: &std::path::Path, what: &str| -> CoreResult<u64> {
         projected_safetensors_bytes(path, |_| ResidentProjection::Stored).map_err(|error| {
             CoreError::Msg(format!(
@@ -208,11 +232,11 @@ pub(crate) fn native_memory_strategy_contract(
     let decoder_bytes = stored(&base_snapshot_dir.join("vae"), "base VAE")?;
     let transformer_bytes =
         crate::block_memory_strategy::native_dit_transformer_bytes(provider_id, dit_file)?;
-    let overlay_bytes = stored(control, "pose control overlay")?;
+    let overlay_bytes = stored(control_path, "pose control overlay")?;
     if overlay_bytes == 0 {
         return Err(CoreError::Msg(format!(
             "{provider_id}: pose control overlay '{}' contains no tensor bytes",
-            control.display()
+            control_path.display()
         )));
     }
     let resident_components = vec![MemoryResidentComponent {
@@ -230,16 +254,30 @@ pub(crate) fn native_memory_strategy_contract(
         decoder_bytes,
         overlay_bytes,
     };
-    // The native composition is Resident-only (the single-file DiT has no snapshot dir to re-load
-    // from), so the default spec below truthfully declares StagedResidency / windowing Missing.
-    let spec = LoadSpec::new(mlx_gen::WeightsSource::Dir(base_snapshot_dir.to_path_buf()));
     memory_strategy_contract_with_asset_facts(
         provider_id,
-        &spec,
+        spec,
         asset_facts,
         resident_components,
-        false,
+        streamable,
     )
+}
+
+/// Compatibility shim for the former bespoke imported-control entrypoint.
+#[cfg(test)]
+pub(crate) fn native_memory_strategy_contract(
+    provider_id: &str,
+    dit_file: &std::path::Path,
+    base_snapshot_dir: &std::path::Path,
+    control: &std::path::Path,
+) -> CoreResult<MemoryProviderContract> {
+    let spec = LoadSpec::new(mlx_gen::WeightsSource::File(dit_file.to_path_buf()))
+        .with_component(
+            mlx_gen::BASE_SNAPSHOT_COMPONENT,
+            mlx_gen::WeightsSource::Dir(base_snapshot_dir.to_path_buf()),
+        )
+        .with_control(mlx_gen::WeightsSource::File(control.to_path_buf()));
+    native_memory_strategy_contract_from_spec(provider_id, &spec, base_snapshot_dir, false)
 }
 
 fn streamable_base_transformer(spec: &LoadSpec, provider_id: &str) -> CoreResult<bool> {
@@ -565,6 +603,34 @@ mod tests {
         .expect_err("missing overlay must fail")
         .to_string();
         assert!(missing.contains("pose control overlay"), "got: {missing}");
+    }
+
+    #[test]
+    fn registry_file_control_contract_uses_file_bytes_and_exposes_the_reopenable_mechanism() {
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
+        write_snapshot(&root);
+        let dit = root.join("imported-dit.safetensors");
+        write_control(&dit);
+        let overlay = root.join("control.safetensors");
+        write_control(&overlay);
+        let spec = LoadSpec::new(WeightsSource::File(dit))
+            .with_component(mlx_gen::BASE_SNAPSHOT_COMPONENT, WeightsSource::Dir(root))
+            .with_control(WeightsSource::File(overlay))
+            .with_offload_policy(mlx_gen::OffloadPolicy::Sequential)
+            .with_load_shape(mlx_gen::gen_core::LoadShape::DeferredMaterialization);
+
+        let contract = memory_strategy_contract("krea_2_turbo_control", &spec).unwrap();
+        assert_eq!(contract.provider_id, "krea_2_turbo_control");
+        assert_eq!(contract.asset_facts.transformer_bytes, 256);
+        assert_eq!(
+            contract
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .support,
+            MemoryStrategySupport::Implemented,
+            "the pinned File implementation is executable; promoted Dir evidence remains a separate caller-side claim"
+        );
     }
 
     #[test]

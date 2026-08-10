@@ -447,13 +447,15 @@ impl Pipeline {
         sources: std::sync::Arc<crate::comfyui::ComfyuiSources>,
         device: &Device,
         dtype: DType,
+        adapters: &[AdapterSpec],
+        pid_spec: Option<PidWeights>,
     ) -> Self {
         Self {
             root: sources.tokenizer_dir.clone(),
             device: device.clone(),
             dtype,
-            adapters: Vec::new(),
-            pid_spec: None,
+            adapters: adapters.to_vec(),
+            pid_spec,
             comfyui: Some(sources),
         }
     }
@@ -461,13 +463,17 @@ impl Pipeline {
     /// Load only the tokenizer + Qwen3 text encoder. This is the first sequential-residency phase and
     /// is also reused by the resident aggregate loader so both policies build identical components.
     pub(crate) fn load_text_phase(&self) -> Result<TextPhase> {
-        if self.comfyui.is_some() {
-            return Err(CandleError::Msg(
-                "z-image sequential residency is unavailable for bespoke ComfyUI component loads"
-                    .into(),
-            ));
-        }
-        let text_encoder = if self.component_is_packed("text_encoder")? {
+        let text_encoder = if let Some(sources) = &self.comfyui {
+            let map = crate::comfyui::normalize_fp8_map(
+                sources.text_encoder_map()?,
+                self.dtype,
+                "z-image text encoder",
+            )?;
+            TextEnc::Dense(Box::new(ZImageTextEncoder::new(
+                &TextEncoderConfig::z_image(),
+                VarBuilder::from_tensors(map, self.dtype, &self.device),
+            )?))
+        } else if self.component_is_packed("text_encoder")? {
             let vb = self.component_vb("text_encoder")?;
             TextEnc::Packed(Box::new(PackedTe::new(&TextEncoderConfig::z_image(), vb)?))
         } else {
@@ -505,14 +511,32 @@ impl Pipeline {
         stream_transformer_blocks: bool,
         cancel: &CancelFlag,
     ) -> Result<DiT> {
-        if self.comfyui.is_some() {
-            return Err(CandleError::Msg(
-                "z-image sequential residency is unavailable for bespoke ComfyUI component loads"
-                    .into(),
-            ));
-        }
         let mut dit_cfg = DitConfig::z_image_turbo();
         dit_cfg.set_use_accelerated_attn(use_accelerated_attn);
+        if let Some(sources) = &self.comfyui {
+            if stream_transformer_blocks {
+                return Err(CandleError::Msg(
+                    "z-image imported File transformer streaming has no promoted File-source rung-4 measurement; the evidence matrix has no load-source axis"
+                        .into(),
+                ));
+            }
+            candle_gen::check_cancel(cancel)?;
+            let map = crate::comfyui::normalize_fp8_map(
+                sources.transformer_map()?,
+                self.dtype,
+                "z-image transformer",
+            )?;
+            let map = crate::comfyui::remap_dit_comfyui_to_diffusers(map)?;
+            let mut dit = PackedDit::new(
+                &dit_cfg,
+                VarBuilder::from_tensors(map, self.dtype, &self.device),
+            )?;
+            if !self.adapters.is_empty() {
+                crate::adapters::install_additive(&mut dit, &self.adapters)?;
+            }
+            candle_gen::check_cancel(cancel)?;
+            return Ok(DiT::Packed(Box::new(dit)));
+        }
         let packed = self.component_packed_config("transformer")?;
         let (vb, sidecars) = if stream_transformer_blocks {
             if let Some(packed) = packed {
@@ -559,11 +583,14 @@ impl Pipeline {
     /// Load only the native AutoencoderKL decoder. Packed tiers dequantize their tiny mid-block
     /// attention projections exactly as the historical resident aggregate did.
     pub(crate) fn load_vae(&self) -> Result<AutoEncoderKL> {
-        if self.comfyui.is_some() {
-            return Err(CandleError::Msg(
-                "z-image sequential residency is unavailable for bespoke ComfyUI component loads"
-                    .into(),
-            ));
+        if let Some(sources) = &self.comfyui {
+            let map =
+                crate::comfyui::normalize_fp8_map(sources.vae_map()?, self.dtype, "z-image VAE")?;
+            let map = crate::comfyui::remap_vae_ldm_to_diffusers(map)?;
+            return Ok(AutoEncoderKL::new(
+                &VaeConfig::z_image(),
+                VarBuilder::from_tensors(map, self.dtype, &self.device),
+            )?);
         }
         if self.component_is_packed("vae")? {
             Ok(AutoEncoderKL::new(
@@ -584,10 +611,14 @@ impl Pipeline {
     /// decode preserves the model's global statistics while bounding CUDA residency to the final
     /// latent transfer; this is slower, but it is the quality-preserving constrained path.
     pub(crate) fn load_vae_cpu(&self) -> Result<AutoEncoderKL> {
-        if self.comfyui.is_some() {
-            return Err(CandleError::Msg(
-                "z-image bounded decode is unavailable for bespoke ComfyUI component loads".into(),
-            ));
+        if let Some(sources) = &self.comfyui {
+            let map =
+                crate::comfyui::normalize_fp8_map(sources.vae_map()?, DType::F32, "z-image VAE")?;
+            let map = crate::comfyui::remap_vae_ldm_to_diffusers(map)?;
+            return Ok(AutoEncoderKL::new(
+                &VaeConfig::z_image(),
+                VarBuilder::from_tensors(map, DType::F32, &Device::Cpu),
+            )?);
         }
         let device = Device::Cpu;
         let vb = if self.component_is_packed("vae")? {
@@ -721,82 +752,21 @@ impl Pipeline {
         sources: &crate::comfyui::ComfyuiSources,
         use_accelerated_attn: bool,
     ) -> Result<Components> {
-        use candle_gen::candle_core::safetensors;
-
-        let mut combined = match &sources.weights {
-            crate::comfyui::ComfyuiWeights::Separate {
-                transformer_file: _,
-                text_encoder_file: _,
-                vae_file: _,
-            } => None,
-            crate::comfyui::ComfyuiWeights::Combined(file) => Some(
-                crate::comfyui::split_combined_checkpoint(safetensors::load(file, &Device::Cpu)?)?,
-            ),
-        };
-
-        // DiT: ComfyUI-native keys → diffusers/candle keys (fused-qkv split + renames), then build.
-        let dit_map = match (&sources.weights, combined.as_mut()) {
-            (
-                crate::comfyui::ComfyuiWeights::Separate {
-                    transformer_file, ..
-                },
-                None,
-            ) => safetensors::load(transformer_file, &Device::Cpu)?,
-            (crate::comfyui::ComfyuiWeights::Combined(_), Some(maps)) => {
-                std::mem::take(&mut maps.transformer)
-            }
-            _ => unreachable!("ComfyUI source variant and combined maps stay aligned"),
-        };
-        let dit_map =
-            crate::comfyui::normalize_fp8_map(dit_map, self.dtype, "z-image transformer")?;
-        let dit_map = crate::comfyui::remap_dit_comfyui_to_diffusers(dit_map)?;
-        let mut dit_cfg = DitConfig::z_image_turbo();
-        dit_cfg.set_use_accelerated_attn(use_accelerated_attn);
-        let dit_vb = VarBuilder::from_tensors(dit_map, self.dtype, &self.device);
-        let transformer = DiT::Dense(Box::new(ZImageTransformer2DModel::new(&dit_cfg, dit_vb)?));
-
-        // Text encoder: standard HF Qwen3 — loaded verbatim and normalized to the compute dtype.
-        let te_map = match (&sources.weights, combined.as_mut()) {
-            (
-                crate::comfyui::ComfyuiWeights::Separate {
-                    text_encoder_file, ..
-                },
-                None,
-            ) => safetensors::load(text_encoder_file, &Device::Cpu)?,
-            (crate::comfyui::ComfyuiWeights::Combined(_), Some(maps)) => {
-                std::mem::take(&mut maps.text_encoder)
-            }
-            _ => unreachable!("ComfyUI source variant and combined maps stay aligned"),
-        };
-        let te_map = crate::comfyui::normalize_fp8_map(te_map, self.dtype, "z-image text encoder")?;
-        let te_vb = VarBuilder::from_tensors(te_map, self.dtype, &self.device);
-        let text_encoder = TextEnc::Dense(Box::new(ZImageTextEncoder::new(
-            &TextEncoderConfig::z_image(),
-            te_vb,
-        )?));
-
-        // VAE: BFL/ldm keys → diffusers keys (incl. the up-block reversal + 1×1-conv→Linear squeeze).
-        let vae_map = match (&sources.weights, combined.as_mut()) {
-            (crate::comfyui::ComfyuiWeights::Separate { vae_file, .. }, None) => {
-                safetensors::load(vae_file, &Device::Cpu)?
-            }
-            (crate::comfyui::ComfyuiWeights::Combined(_), Some(maps)) => {
-                std::mem::take(&mut maps.vae)
-            }
-            _ => unreachable!("ComfyUI source variant and combined maps stay aligned"),
-        };
-        let vae_map = crate::comfyui::normalize_fp8_map(vae_map, self.dtype, "z-image VAE")?;
-        let vae_map = crate::comfyui::remap_vae_ldm_to_diffusers(vae_map)?;
-        let vae_vb = VarBuilder::from_tensors(vae_map, self.dtype, &self.device);
-        let vae = AutoEncoderKL::new(&VaeConfig::z_image(), vae_vb)?;
-
-        let tokenizer = common::build_tokenizer(&self.root, "z-image comfyui")?;
+        sources.ensure_unchanged()?;
+        let text = self.load_text_phase()?;
+        let transformer = self.load_transformer(use_accelerated_attn, false)?;
+        let vae = self.load_vae()?;
+        let pid = self
+            .pid_spec
+            .as_ref()
+            .map(|spec| PidEngine::from_spec(spec, PID_BACKBONE, &self.device).map(Arc::new))
+            .transpose()?;
         Ok(Components {
-            text_encoder: Arc::new(text_encoder),
+            text_encoder: Arc::new(text.text_encoder),
             transformer: Arc::new(transformer),
             vae: Arc::new(vae),
-            tokenizer: Arc::new(tokenizer),
-            pid: None,
+            tokenizer: Arc::new(text.tokenizer),
+            pid,
         })
     }
 
@@ -909,7 +879,12 @@ impl Pipeline {
     /// distribution **mean** deterministically. Only built on the first img2img request (cached by the
     /// generator), so the txt2img / Turbo path never pays for it.
     pub(crate) fn load_vae_encoder(&self) -> Result<VaeEncoder> {
-        let vb = if self.component_is_packed("vae")? {
+        let vb = if let Some(sources) = &self.comfyui {
+            let map =
+                crate::comfyui::normalize_fp8_map(sources.vae_map()?, ENC_DTYPE, "z-image VAE")?;
+            let map = crate::comfyui::remap_vae_ldm_to_diffusers(map)?;
+            VarBuilder::from_tensors(map, ENC_DTYPE, &self.device)
+        } else if self.component_is_packed("vae")? {
             self.vae_vb_dequantized(ENC_DTYPE)?
         } else {
             let files = self.component_files("vae")?;

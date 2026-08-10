@@ -32,6 +32,9 @@ pub const CALIBRATION_FINGERPRINT: &str =
     "qwen-image-cuda-staged-tiled-decode-bounded-attention-device-format-blocks-v1";
 
 fn streamable(spec: &LoadSpec) -> bool {
+    // File and Dir share the provider identity, but the evidence matrix has no source axis. Keep the
+    // imported path's rung 4 Missing until its pinned/re-openable implementation is measured directly;
+    // a snapshot measurement must not be claimed for a File source.
     matches!(spec.load_shape, LoadShape::DeferredMaterialization)
         && matches!(spec.weights, WeightsSource::Dir(_))
         && spec.adapters.is_empty()
@@ -43,9 +46,32 @@ pub(crate) fn provider_contract(
     spec: &LoadSpec,
 ) -> gen_core::Result<MemoryProviderContract> {
     let streamable = streamable(spec);
-    let components =
-        PerComponentBytes::from_spec_subdirs(spec, &["text_encoder"], &["transformer"], &["vae"])
-            .unwrap_or_default();
+    let components = match &spec.weights {
+        WeightsSource::Dir(_) => PerComponentBytes::from_spec_subdirs(
+            spec,
+            &["text_encoder"],
+            &["transformer"],
+            &["vae"],
+        )
+        .unwrap_or_default(),
+        WeightsSource::File(path) => {
+            let base = gen_core::require_base_snapshot(spec, provider_id)?;
+            let vae = spec
+                .components
+                .get(gen_core::COMFYUI_VAE_COMPONENT)
+                .map(|source| match source {
+                    WeightsSource::Dir(path) | WeightsSource::File(path) => {
+                        gen_core::safetensors_path_bytes(path)
+                    }
+                })
+                .unwrap_or_else(|| gen_core::safetensors_path_bytes(base.join("vae")));
+            PerComponentBytes {
+                text_encoder: gen_core::safetensors_path_bytes(base.join("text_encoder")),
+                dit: gen_core::safetensors_path_bytes(path),
+                vae,
+            }
+        }
+    };
     let phases = vec![
         MemoryPhase::Conditioning,
         MemoryPhase::Denoise,
@@ -157,11 +183,7 @@ pub(crate) fn snapshot_quant_tier(
 ) -> gen_core::Result<Option<Quant>> {
     let root = match &spec.weights {
         WeightsSource::Dir(root) => root,
-        WeightsSource::File(_) => {
-            return Err(gen_core::Error::Msg(format!(
-                "{provider_id}: actual numeric tier requires a snapshot directory"
-            )))
-        }
+        WeightsSource::File(_) => return Ok(None),
     };
     let config = root.join("transformer/config.json");
     let packed = std::fs::read_to_string(&config)

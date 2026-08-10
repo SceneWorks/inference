@@ -74,7 +74,8 @@ use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use candle_gen::gen_core::{
     self, Capabilities, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality,
-    ModelDescriptor, PidWeights, Progress, Quant, SizeFloor, WeightsSource,
+    ModelDescriptor, PidWeights, PinnedWeightsFile, Progress, Quant, SizeFloor, WeightsSource,
+    BASE_SNAPSHOT_COMPONENT,
 };
 use candle_gen::{CandleError, LatentDecoder, Result as CResult};
 use candle_gen_pid::{PidDecoder, PidEngine};
@@ -154,7 +155,7 @@ pub(crate) struct Pipeline {
     /// see [`convert::build_comfyui_dit_map`]) instead of the snapshot's `transformer/` dir; the text
     /// encoder / VAE / tokenizer still come from the resident snapshot `root`. `None` on every other
     /// path (registry txt2img, edit, control).
-    pub(crate) comfyui_dit: Option<PathBuf>,
+    pub(crate) comfyui_dit: Option<PinnedWeightsFile>,
 }
 
 impl Pipeline {
@@ -188,18 +189,22 @@ impl Pipeline {
         quant: Option<Quant>,
         root: &Path,
         device: &Device,
-        comfyui_dit: PathBuf,
-    ) -> Self {
-        Self {
+        comfyui_dit: impl AsRef<Path>,
+        pid_spec: Option<PidWeights>,
+    ) -> CResult<Self> {
+        let comfyui_dit = PinnedWeightsFile::pin(comfyui_dit).map_err(|error| {
+            CandleError::Msg(format!("flux2 comfyui: pin transformer source: {error}"))
+        })?;
+        Ok(Self {
             variant: Flux2Variant::Dev,
             cfg: Flux2Variant::Dev.config(),
             root: root.to_path_buf(),
             device: device.clone(),
             dtype: DType::F32,
             quant,
-            pid_spec: None,
+            pid_spec,
             comfyui_dit: Some(comfyui_dit),
-        }
+        })
     }
 
     /// mmap a VarBuilder over every `.safetensors` in the snapshot subdir `sub`, on `self.device`.
@@ -486,12 +491,18 @@ impl Pipeline {
     /// - **quant** (the 32B dev path): stage the dense f32 DiT in CPU RAM, then fold each projection onto
     ///   the GPU (`quantize`); the dense f32 32B never lands on the GPU (it would not fit).
     /// - **no quant** (small fixtures only): build dense on-device.
-    fn load_comfyui_dit(&self, dit_file: &Path) -> CResult<Flux2Transformer> {
+    fn load_comfyui_dit(&self, dit_file: &PinnedWeightsFile) -> CResult<Flux2Transformer> {
+        dit_file.ensure_unchanged().map_err(|error| {
+            CandleError::Msg(format!(
+                "flux2 comfyui: transformer source changed: {error}"
+            ))
+        })?;
+        let dit_path = dit_file.loader_path();
         // SAFETY: read-only mmap of a weight file; the standard candle loading path.
         let mmap =
-            unsafe { candle_gen::candle_core::safetensors::MmapedSafetensors::new(dit_file) }
+            unsafe { candle_gen::candle_core::safetensors::MmapedSafetensors::new(dit_path) }
                 .map_err(|e| {
-                    CandleError::Msg(format!("flux2 comfyui: mmap {}: {e}", dit_file.display()))
+                    CandleError::Msg(format!("flux2 comfyui: mmap {}: {e}", dit_path.display()))
                 })?;
         let map = convert::build_comfyui_dit_map(&mmap, self.dtype)?;
         match self.quant {
@@ -1139,11 +1150,13 @@ fn generator_from_pipeline(
     })
 }
 
-/// Construct a lazy candle FLUX.2 generator for `variant`. `spec.weights` must be a
-/// [`WeightsSource::Dir`] pointing at a diffusers snapshot (`text_encoder/`, `transformer/`, `vae/`,
-/// `tokenizer/`) — klein at `black-forest-labs/FLUX.2-klein-9B`, dev at `black-forest-labs/FLUX.2-dev`
-/// (whose `text_encoder/` is the Mistral3 checkpoint). Adapters / control overlays are rejected (not
-/// wired). `spec.quantize` (Q4/Q8) is honored by BOTH variants — each component staged dense in CPU RAM
+/// Construct a lazy candle FLUX.2 generator for `variant`. A [`WeightsSource::Dir`] points at the
+/// complete diffusers snapshot (`text_encoder/`, `transformer/`, `vae/`, `tokenizer/`). `flux2_dev`
+/// additionally accepts an imported ComfyUI DiT as [`WeightsSource::File`] when the companion snapshot
+/// is supplied under [`BASE_SNAPSHOT_COMPONENT`]. The same registry provider, cache identity, fit gate,
+/// PiD plumbing, and memory contract are used for both sources; `flux2_klein_9b` remains directory-only
+/// because its imported format is not implemented. Adapters / control overlays are rejected (not wired).
+/// `spec.quantize` (Q4/Q8) is honored by BOTH variants — each component staged dense in CPU RAM
 /// then folded onto the GPU: **dev** quantizes the 32B DiT + the ~24B Mistral TE (neither fits dense);
 /// **klein** (sc-11031) quantizes ONLY the 9B DiT and keeps its 8B Qwen3 TE dense bf16 (epic 8506
 /// DENSE_TE, `Pipeline::te_quant`). Without quant both load fully dense (klein's bf16 tier; dev is
@@ -1157,23 +1170,28 @@ fn load_variant_concrete(
     spec: &LoadSpec,
 ) -> gen_core::Result<Flux2Generator> {
     let id = variant.id();
-    let root = match &spec.weights {
-        WeightsSource::Dir(p) => p.clone(),
-        WeightsSource::File(_) => {
-            return Err(gen_core::Error::Msg(format!(
-                "{id} expects a snapshot directory (text_encoder/ transformer/ vae/ tokenizer/), \
-                 not a single .safetensors file"
-            )));
+    let root = gen_core::require_base_snapshot(spec, id)?.to_path_buf();
+    if matches!(spec.weights, WeightsSource::File(_)) && !variant.is_dev() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{id} does not support imported single-file weights; only flux2_dev does"
+        )));
+    }
+    match &spec.weights {
+        WeightsSource::Dir(_) => {
+            gen_core::reject_unknown_components(spec, &[], id)?;
         }
-    };
+        WeightsSource::File(_) => {
+            gen_core::reject_unknown_components(spec, &[BASE_SNAPSHOT_COMPONENT], id)?;
+        }
+    }
     if !spec.adapters.is_empty() {
         return Err(gen_core::Error::Unsupported(format!(
             "candle {id} does not support LoRA/LoKr yet"
         )));
     }
-    if spec.identity.is_some() || spec.text_encoder.is_some() || !spec.components.is_empty() {
+    if spec.identity.is_some() || spec.text_encoder.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
-            "candle {id} does not support identity, external text-encoder, or named-component weights"
+            "candle {id} does not support identity or external text-encoder weights"
         )));
     }
     // Both variants honor Q4/Q8 on-the-fly (CPU-stage dense → quantize-onto-GPU): dev folds the 32B DiT
@@ -1186,7 +1204,12 @@ fn load_variant_concrete(
         )));
     }
     let device = candle_gen::default_device()?;
-    let pipe = Pipeline::load(variant, quant, &root, &device, spec.pid.clone());
+    let pipe = match &spec.weights {
+        WeightsSource::Dir(_) => Pipeline::load(variant, quant, &root, &device, spec.pid.clone()),
+        WeightsSource::File(dit) => {
+            Pipeline::load_comfyui(quant, &root, &device, dit, spec.pid.clone())?
+        }
+    };
     generator_from_pipeline(pipe, Some(spec))
 }
 
@@ -1198,16 +1221,21 @@ fn load_variant_concrete(
 /// FLUX.2-dev diffusers snapshot supplying the Mistral text encoder, VAE, and tokenizer (none of which
 /// are in the single DiT file). `quant` (Q4/Q8) folds the dequanted DiT + the Mistral TE onto the GPU —
 /// the 32B dev does not fit dense — matching the resident dev path; `None` is fixture-only. txt2img
-/// only; no adapters / control / edit / PiD.
+/// only; no adapters / control / edit. PiD, when requested in the registry `LoadSpec`, follows the
+/// same provider lifecycle as the directory-backed path.
 pub fn load_from_comfyui_dit(
     transformer_file: impl Into<PathBuf>,
     snapshot_dir: impl Into<PathBuf>,
     quant: Option<Quant>,
 ) -> gen_core::Result<Box<dyn Generator>> {
-    let device = candle_gen::default_device()?;
-    let root = snapshot_dir.into();
-    let pipe = Pipeline::load_comfyui(quant, &root, &device, transformer_file.into());
-    Ok(Box::new(generator_from_pipeline(pipe, None)?))
+    let mut spec = LoadSpec::new(WeightsSource::File(transformer_file.into())).with_component(
+        BASE_SNAPSHOT_COMPONENT,
+        WeightsSource::Dir(snapshot_dir.into()),
+    );
+    if let Some(quant) = quant {
+        spec = spec.with_quant(quant);
+    }
+    load_dev(&spec)
 }
 
 /// Registry load hook for `flux2_klein_9b`.
@@ -1916,12 +1944,11 @@ mod tests {
     /// plumbing on CPU with no weights (the render itself is GPU-validated separately).
     #[test]
     fn load_from_comfyui_dit_builds_lazy_dev_generator() {
-        let g = load_from_comfyui_dit(
-            "/tree/diffusion_models/flux2_dev_fp8mixed.safetensors",
-            "/snap/flux2-dev",
-            Some(Quant::Q8),
-        )
-        .expect("comfyui dev generator builds lazily");
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dit = dir.path().join("flux2_dev_fp8mixed.safetensors");
+        std::fs::write(&dit, b"not safetensors").expect("write pinned fixture");
+        let g = load_from_comfyui_dit(&dit, "/snap/flux2-dev", Some(Quant::Q8))
+            .expect("comfyui dev generator builds lazily");
         assert_eq!(g.descriptor().id, FLUX2_DEV_ID);
         assert_eq!(g.descriptor().family, "flux2");
         assert_eq!(g.descriptor().backend, "candle");
@@ -1930,13 +1957,17 @@ mod tests {
 
     #[test]
     fn staged_comfyui_dit_loader_preserves_the_selected_single_file() {
-        let selected = PathBuf::from("/selected/flux2-comfyui.safetensors");
+        let dir = tempfile::tempdir().expect("temp dir");
+        let selected = dir.path().join("flux2-comfyui.safetensors");
+        std::fs::write(&selected, b"not safetensors").expect("write pinned fixture");
         let pipe = Pipeline::load_comfyui(
             None,
             Path::new("/missing-snapshot"),
             &Device::Cpu,
             selected.clone(),
-        );
+            None,
+        )
+        .expect("pin selected file");
         let error = pipe
             .load_dit_seq()
             .err()
@@ -1949,13 +1980,13 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_single_file_source() {
+    fn klein_rejects_single_file_source() {
         let spec = LoadSpec::new(WeightsSource::File("/tmp/flux2.safetensors".into()));
         let err = load_klein(&spec)
             .err()
             .expect("expected an error")
             .to_string();
-        assert!(err.contains("snapshot directory"), "got: {err}");
+        assert!(err.contains(BASE_SNAPSHOT_COMPONENT), "got: {err}");
     }
 
     /// Image construction is lazy and the legacy load policy no longer selects lifecycle behavior.

@@ -29,7 +29,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use candle_gen::candle_core::{DType, Tensor};
+use candle_gen::candle_core::{safetensors, DType, Device, Tensor};
 use candle_gen::{CandleError, Result};
 
 /// The four external inputs for an in-place ComfyUI Z-Image load (sc-10668): the
@@ -46,6 +46,84 @@ pub(crate) struct ComfyuiSources {
     pub weights: ComfyuiWeights,
     /// Directory containing `tokenizer/tokenizer.json` (our shipped Z-Image snapshot).
     pub tokenizer_dir: PathBuf,
+    pins: Vec<candle_gen::gen_core::PinnedWeightsFile>,
+}
+
+impl ComfyuiSources {
+    pub(crate) fn separate(
+        transformer_file: PathBuf,
+        text_encoder_file: PathBuf,
+        vae_file: PathBuf,
+        tokenizer_dir: PathBuf,
+    ) -> candle_gen::gen_core::Result<Self> {
+        let pins = [&transformer_file, &text_encoder_file, &vae_file]
+            .into_iter()
+            .map(candle_gen::gen_core::PinnedWeightsFile::pin)
+            .collect::<candle_gen::gen_core::Result<Vec<_>>>()?;
+        Ok(Self {
+            weights: ComfyuiWeights::Separate {
+                transformer_file,
+                text_encoder_file,
+                vae_file,
+            },
+            tokenizer_dir,
+            pins,
+        })
+    }
+
+    pub(crate) fn combined(
+        checkpoint_file: PathBuf,
+        tokenizer_dir: PathBuf,
+    ) -> candle_gen::gen_core::Result<Self> {
+        let pin = candle_gen::gen_core::PinnedWeightsFile::pin(&checkpoint_file)?;
+        Ok(Self {
+            weights: ComfyuiWeights::Combined(checkpoint_file),
+            tokenizer_dir,
+            pins: vec![pin],
+        })
+    }
+
+    pub(crate) fn ensure_unchanged(&self) -> Result<()> {
+        self.pins
+            .iter()
+            .try_for_each(|pin| pin.ensure_unchanged().map_err(Into::into))
+    }
+
+    pub(crate) fn transformer_map(&self) -> Result<HashMap<String, Tensor>> {
+        self.ensure_unchanged()?;
+        match &self.weights {
+            ComfyuiWeights::Separate {
+                transformer_file, ..
+            } => Ok(safetensors::load(transformer_file, &Device::Cpu)?),
+            ComfyuiWeights::Combined(file) => {
+                Ok(split_combined_checkpoint(safetensors::load(file, &Device::Cpu)?)?.transformer)
+            }
+        }
+    }
+
+    pub(crate) fn text_encoder_map(&self) -> Result<HashMap<String, Tensor>> {
+        self.ensure_unchanged()?;
+        match &self.weights {
+            ComfyuiWeights::Separate {
+                text_encoder_file, ..
+            } => Ok(safetensors::load(text_encoder_file, &Device::Cpu)?),
+            ComfyuiWeights::Combined(file) => {
+                Ok(split_combined_checkpoint(safetensors::load(file, &Device::Cpu)?)?.text_encoder)
+            }
+        }
+    }
+
+    pub(crate) fn vae_map(&self) -> Result<HashMap<String, Tensor>> {
+        self.ensure_unchanged()?;
+        match &self.weights {
+            ComfyuiWeights::Separate { vae_file, .. } => {
+                Ok(safetensors::load(vae_file, &Device::Cpu)?)
+            }
+            ComfyuiWeights::Combined(file) => {
+                Ok(split_combined_checkpoint(safetensors::load(file, &Device::Cpu)?)?.vae)
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -79,20 +157,32 @@ pub(crate) fn split_combined_checkpoint(src: HashMap<String, Tensor>) -> Result<
             .strip_prefix("model.diffusion_model.")
             .or_else(|| key.strip_prefix("transformer."))
         {
-            Some((rest, &mut transformer))
+            Some(("transformer", rest, &mut transformer))
         } else if let Some(rest) = key
             .strip_prefix("conditioner.embedders.0.transformer.")
             .or_else(|| key.strip_prefix("text_encoders.qwen3_4b.transformer."))
             .or_else(|| key.strip_prefix("text_encoder."))
         {
-            Some((rest, &mut text_encoder))
+            Some(("text encoder", rest, &mut text_encoder))
         } else {
             key.strip_prefix("first_stage_model.")
                 .or_else(|| key.strip_prefix("vae."))
-                .map(|rest| (rest, &mut vae))
+                .map(|rest| ("VAE", rest, &mut vae))
         };
-        if let Some((key, map)) = target {
-            map.insert(key.to_owned(), tensor);
+        let Some((component, mapped, map)) = target else {
+            return Err(CandleError::Msg(format!(
+                "z-image combined checkpoint tensor {key:?} has no component mapping"
+            )));
+        };
+        if mapped.is_empty() {
+            return Err(CandleError::Msg(format!(
+                "z-image combined checkpoint tensor {key:?} maps to an empty {component} key"
+            )));
+        }
+        if map.insert(mapped.to_owned(), tensor).is_some() {
+            return Err(CandleError::Msg(format!(
+                "z-image combined checkpoint tensor {key:?} collides at {component} key {mapped:?}"
+            )));
         }
     }
     for (name, map) in [
@@ -533,6 +623,26 @@ mod tests {
         assert!(maps.transformer.contains_key("layers.0.weight"));
         assert!(maps.text_encoder.contains_key("model.embed_tokens.weight"));
         assert!(maps.vae.contains_key("decoder.conv_in.weight"));
+    }
+
+    #[test]
+    fn combined_checkpoint_rejects_unmapped_and_colliding_keys() {
+        let mut unmapped = HashMap::new();
+        unmapped.insert("foreign.tensor".into(), w(&[1]));
+        let error = match split_combined_checkpoint(unmapped) {
+            Ok(_) => panic!("foreign keys must fail closed"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("no component mapping"), "got: {error}");
+
+        let mut colliding = HashMap::new();
+        colliding.insert("model.diffusion_model.layers.0.weight".into(), w(&[1]));
+        colliding.insert("transformer.layers.0.weight".into(), w(&[1]));
+        let error = match split_combined_checkpoint(colliding) {
+            Ok(_) => panic!("two aliases may not map onto one tensor"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("collides"), "got: {error}");
     }
 
     #[test]
