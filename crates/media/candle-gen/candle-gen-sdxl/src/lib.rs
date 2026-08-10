@@ -489,6 +489,7 @@ pub fn descriptor() -> ModelDescriptor {
             // route, plus the name-driven edit / IP-Adapter providers. `crate::preview` reuses the
             // epic-16624 four-channel fit; the trainer's sample render stays deliberately dark.
             supports_preview: true,
+            supports_prompt_enhancement: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,

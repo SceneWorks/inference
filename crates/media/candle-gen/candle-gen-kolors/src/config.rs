@@ -102,6 +102,7 @@ pub fn descriptor() -> ModelDescriptor {
             // name-driven pose-control and IP-Adapter providers. Kolors adds no fit of its own; it
             // projects through `candle_gen_sdxl::preview` (one byte-identical VAE file).
             supports_preview: true,
+            supports_prompt_enhancement: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,

@@ -114,6 +114,7 @@ pub fn descriptor() -> ModelDescriptor {
             // onto Turbo/Edit below. The small PiD overlay + tokenizer stay resident on the generator.
             supports_sequential_offload: true,
             supports_preview: false,
+            supports_prompt_enhancement: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,

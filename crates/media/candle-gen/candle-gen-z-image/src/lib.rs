@@ -441,6 +441,7 @@ pub fn descriptor() -> ModelDescriptor {
             // the name-driven control + edit providers' bespoke Euler loops emit directly. The
             // projection reuses the epic-16624 Z-Image 16-channel fit — see [`crate::preview`].
             supports_preview: true,
+            supports_prompt_enhancement: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
