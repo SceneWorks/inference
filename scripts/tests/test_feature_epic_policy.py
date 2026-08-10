@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 from scripts.ci.feature_epic_policy import (
     PolicyError,
+    resolve_local_merge_parents,
     resolve_remote_feature_branch,
     validate_event,
 )
@@ -92,6 +93,7 @@ def validate(
     active_sha: str | None = None,
     use_event_sha: bool = True,
     feature_resolver=canonical_feature,
+    commit_parent_resolver=lambda _commit: (PR_BASE_SHA, PR_HEAD_SHA),
 ) -> str:
     if use_event_sha:
         active_sha = active_sha_for(event_name, payload)
@@ -101,6 +103,7 @@ def validate(
         repository=repository,
         active_sha=active_sha,
         feature_resolver=feature_resolver,
+        commit_parent_resolver=commit_parent_resolver,
     )
 
 
@@ -343,6 +346,44 @@ class FeatureEpicPolicyTests(unittest.TestCase):
             use_event_sha=False,
             active_sha="not-a-commit",
         )
+
+    def test_pull_request_binds_unavailable_payload_merge_sha_to_local_parents(self) -> None:
+        for unavailable in (None, ""):
+            with self.subTest(unavailable=unavailable):
+                event = pull_request_event(STORY, FEATURE)
+                event["pull_request"]["merge_commit_sha"] = unavailable
+                reason = validate(
+                    "pull_request",
+                    event,
+                    use_event_sha=False,
+                    active_sha=PR_MERGE_SHA,
+                )
+                self.assertIn("story", reason)
+
+        event = pull_request_event(STORY, FEATURE)
+        event["pull_request"]["merge_commit_sha"] = None
+        self.assert_rejected(
+            "pull_request",
+            event,
+            "exact payload base/head parents",
+            use_event_sha=False,
+            active_sha=PR_MERGE_SHA,
+            commit_parent_resolver=lambda _commit: ("7" * 40, PR_HEAD_SHA),
+        )
+
+    def test_local_merge_parent_resolver_requires_exactly_two_parents(self) -> None:
+        result = SimpleNamespace(returncode=0, stdout=f"{PR_BASE_SHA} {PR_HEAD_SHA}\n", stderr="")
+        self.assertEqual(
+            resolve_local_merge_parents(PR_MERGE_SHA, runner=lambda *args, **kwargs: result),
+            (PR_BASE_SHA, PR_HEAD_SHA),
+        )
+
+        one_parent = SimpleNamespace(returncode=0, stdout=f"{PR_HEAD_SHA}\n", stderr="")
+        with self.assertRaisesRegex(PolicyError, "two-parent test merge"):
+            resolve_local_merge_parents(
+                PR_MERGE_SHA,
+                runner=lambda *args, **kwargs: one_parent,
+            )
 
     def test_merge_group_accepts_main_and_feature_queue_refs(self) -> None:
         for base in ("main", "feature/sc-18304-pipeline-flexibility-mlx-perf"):

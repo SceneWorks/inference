@@ -43,6 +43,7 @@ EPIC_STORY_PREFIX_RE = re.compile(r"^story/sc-[1-9][0-9]*-epic(?:-|$)")
 PROTECTED_PREFIXES = ("feature/", "sync/")
 PULL_REQUEST_ACTIONS = frozenset({"opened", "reopened", "synchronize"})
 FeatureBranchResolver = Callable[[int], str]
+CommitParentResolver = Callable[[str], tuple[str, str]]
 
 
 class PolicyError(ValueError):
@@ -153,6 +154,77 @@ def _active_revision(active_sha: str | None, expected_sha: str, field: str) -> N
         )
 
 
+def resolve_local_merge_parents(
+    commit: str,
+    *,
+    runner: Callable[..., Any] = subprocess.run,
+) -> tuple[str, str]:
+    """Resolve the exact two parents of a checked-out GitHub test-merge commit."""
+
+    commit = _commit_sha(commit, "merge commit")
+    command = ["git", "show", "-s", "--format=%P", commit]
+    try:
+        result = runner(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise PolicyError(
+            f"could not inspect checked-out merge commit {commit}: {error}"
+        ) from error
+    if result.returncode != 0:
+        detail = (result.stderr or "git show failed").strip()
+        raise PolicyError(f"could not inspect checked-out merge commit {commit}: {detail}")
+
+    parents = (result.stdout or "").strip().split()
+    if len(parents) != 2:
+        raise PolicyError(
+            f"checked-out pull-request revision {commit} must be a two-parent test merge"
+        )
+    return (
+        _commit_sha(parents[0], "checked-out merge base parent"),
+        _commit_sha(parents[1], "checked-out merge head parent"),
+    )
+
+
+def _active_pull_request_revision(
+    pull_request: Mapping[str, Any],
+    active_sha: str | None,
+    base_sha: str,
+    head_sha: str,
+    commit_parent_resolver: CommitParentResolver | None,
+) -> None:
+    if "merge_commit_sha" not in pull_request:
+        raise PolicyError("pull_request.merge_commit_sha is missing")
+    merge_commit_sha = pull_request["merge_commit_sha"]
+    if merge_commit_sha not in (None, ""):
+        merge_commit_sha = _commit_sha(
+            _string(merge_commit_sha, "pull_request.merge_commit_sha"),
+            "pull_request.merge_commit_sha",
+        )
+        _active_revision(active_sha, merge_commit_sha, "pull_request.merge_commit_sha")
+        return
+
+    if active_sha is None:
+        raise PolicyError("GITHUB_SHA is required for this event")
+    active_sha = _commit_sha(active_sha, "GITHUB_SHA")
+    if commit_parent_resolver is None:
+        raise PolicyError(
+            "pull_request.merge_commit_sha is unavailable and no checked-out parent resolver "
+            "was provided"
+        )
+    parents = commit_parent_resolver(active_sha)
+    if parents != (base_sha, head_sha):
+        raise PolicyError(
+            "checked-out pull-request test merge must have the exact payload base/head parents; "
+            f"expected {(base_sha, head_sha)!r}, found {parents!r}"
+        )
+
+
 def _canonical_feature_branch(
     epic: int,
     resolver: FeatureBranchResolver | None,
@@ -239,6 +311,7 @@ def _validate_pull_request(
     repository: str,
     active_sha: str | None,
     feature_resolver: FeatureBranchResolver | None,
+    commit_parent_resolver: CommitParentResolver | None,
 ) -> str:
     action = _nested_string(payload, "action")
     if action not in PULL_REQUEST_ACTIONS:
@@ -252,13 +325,15 @@ def _validate_pull_request(
     base = _nested_mapping(pull_request, "base")
     head_ref = _nested_string(head, "ref")
     base_ref = _nested_string(base, "ref")
-    _commit_sha(_nested_string(head, "sha"), "pull_request.head.sha")
-    _commit_sha(_nested_string(base, "sha"), "pull_request.base.sha")
-    merge_commit_sha = _commit_sha(
-        _nested_string(pull_request, "merge_commit_sha"),
-        "pull_request.merge_commit_sha",
+    head_sha = _commit_sha(_nested_string(head, "sha"), "pull_request.head.sha")
+    base_sha = _commit_sha(_nested_string(base, "sha"), "pull_request.base.sha")
+    _active_pull_request_revision(
+        pull_request,
+        active_sha,
+        base_sha,
+        head_sha,
+        commit_parent_resolver,
     )
-    _active_revision(active_sha, merge_commit_sha, "pull_request.merge_commit_sha")
 
     head_train = _parse_train_branch(head_ref)
     base_train = _parse_train_branch(base_ref)
@@ -398,6 +473,7 @@ def validate_event(
     repository: str | None = None,
     active_sha: str | None = None,
     feature_resolver: FeatureBranchResolver | None = None,
+    commit_parent_resolver: CommitParentResolver | None = None,
 ) -> str:
     """Validate a GitHub event and return a human-readable acceptance reason."""
 
@@ -407,7 +483,11 @@ def validate_event(
 
     if event_name == "pull_request":
         return _validate_pull_request(
-            payload, resolved_repository, active_sha, feature_resolver
+            payload,
+            resolved_repository,
+            active_sha,
+            feature_resolver,
+            commit_parent_resolver,
         )
     if event_name == "merge_group":
         return _validate_merge_group(payload, active_sha, feature_resolver)
@@ -459,6 +539,7 @@ def main(argv: list[str] | None = None) -> int:
             repository=args.repository,
             active_sha=args.active_sha,
             feature_resolver=resolve_remote_feature_branch,
+            commit_parent_resolver=resolve_local_merge_parents,
         )
     except (OSError, json.JSONDecodeError, PolicyError) as error:
         print(f"::error title=Feature epic branch policy::{error}")
