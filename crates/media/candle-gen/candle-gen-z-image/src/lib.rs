@@ -397,6 +397,7 @@ impl Generator for ZImageGenerator {
 /// `mlx-gen-z-image`: `backend = "candle"` and `mac_only = false`.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        denoiser_output_latent_space: Some(&candle_gen::gen_core::FLUX1_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
         id: MODEL_ID,

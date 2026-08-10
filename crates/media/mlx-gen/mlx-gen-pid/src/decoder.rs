@@ -7,6 +7,7 @@
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::decoder::LatentDecoder;
+use mlx_gen::gen_core::LatentSpace;
 use mlx_gen::{CancelFlag, Error, Result};
 
 use crate::lq::PidNet;
@@ -24,6 +25,9 @@ pub struct PidDecoder {
     scale: i32,
     /// VAE spatial compression (latent grid → pixel grid; 8 for the catalog VAEs).
     vae_compression: i32,
+    /// Typed input contract. Direct test construction starts unknown; production engines bind the
+    /// registry-derived space through [`Self::with_input_latent_space`].
+    input_latent_space: Option<LatentSpace>,
     /// Per-decode RNG seed for the sampler's noise + per-step ε.
     seed: u64,
     /// Cooperative cancellation for the ~100 s 4-step decode (F-006). Bound at decoder-mint time
@@ -55,6 +59,7 @@ impl PidDecoder {
             sigma,
             scale,
             vae_compression,
+            input_latent_space: None,
             seed,
             cancel: None,
             tile: None,
@@ -66,6 +71,11 @@ impl PidDecoder {
     /// struct-API callers (e.g. InstantID) can opt in with their request's flag.
     pub fn with_cancel(mut self, cancel: CancelFlag) -> Self {
         self.cancel = Some(cancel);
+        self
+    }
+
+    pub fn with_input_latent_space(mut self, latent_space: LatentSpace) -> Self {
+        self.input_latent_space = Some(latent_space);
         self
     }
 
@@ -180,6 +190,10 @@ impl PidDecoder {
 }
 
 impl LatentDecoder for PidDecoder {
+    fn input_latent_space(&self) -> Option<&LatentSpace> {
+        self.input_latent_space.as_ref()
+    }
+
     /// `latents`: the normalized VAE latent `[B, C, zH, zW]`. Returns super-resolved pixels
     /// `[B, 3, zH·vae_compression·scale, zW·vae_compression·scale]` in `[-1, 1]`.
     fn decode(&self, latents: &Array) -> Result<Array> {

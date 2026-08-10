@@ -346,6 +346,7 @@ impl Generator for FluxGenerator {
 /// `"candle"` and `mac_only` is `false` (the two backend-correct deviations from `mlx-gen-flux`).
 fn descriptor_for(variant: Variant) -> ModelDescriptor {
     ModelDescriptor {
+        denoiser_output_latent_space: Some(&candle_gen::gen_core::FLUX1_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
         id: variant.model_id(),

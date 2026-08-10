@@ -1545,6 +1545,10 @@ pub enum Modality {
 /// constructible without loading weights (registry introspection).
 #[derive(Clone, Debug)]
 pub struct ModelDescriptor {
+    /// The exact latent tensor emitted by the denoiser at its decoder boundary. `None` means the
+    /// provider has not advertised enough information; consumers must treat it as incompatible with
+    /// every decoder rather than infer compatibility from family names or channel counts.
+    pub denoiser_output_latent_space: Option<&'static crate::latent::LatentSpace>,
     pub id: &'static str,
     pub family: &'static str,
     /// `"mlx"` | `"candle"` — the tensor backend whose provider crate registered this engine.

@@ -54,6 +54,7 @@ pub const MODEL_ID: &str = "qwen_image_edit";
 /// VAE-encoded and folded into the transformer's dual-latent sequence (sc-2529).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        denoiser_output_latent_space: Some(&mlx_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
         id: MODEL_ID,

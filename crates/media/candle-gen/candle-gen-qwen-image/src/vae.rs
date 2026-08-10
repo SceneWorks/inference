@@ -14,17 +14,10 @@
 use candle_gen::candle_core::{DType, Error as CandleError, IndexOp, Result, Tensor};
 use candle_gen::candle_nn::{Conv2d, Conv2dConfig, Module, VarBuilder};
 use candle_gen::gen_core::tiling::{TilingConfig, VaeTiling};
+use candle_gen::gen_core::{QWEN_WAN_Z16_MEAN as LATENTS_MEAN, QWEN_WAN_Z16_STD as LATENTS_STD};
+use candle_gen::LatentDecoder;
 
 const NORM_EPS: f64 = 1e-12;
-
-const LATENTS_MEAN: [f32; 16] = [
-    -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508, 0.4134, -0.0715, 0.5517,
-    -0.3632, -0.1922, -0.9497, 0.2503, -0.2921,
-];
-const LATENTS_STD: [f32; 16] = [
-    2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743, 3.2687, 2.1526, 2.8652, 1.5579,
-    1.6382, 1.1253, 2.8251, 1.916,
-];
 
 /// Load a `CausalConv3d` (`[O,I,kD,kH,kW]`) as a candle `Conv2d`, keeping only the last depth tap.
 fn causal_conv2d(
@@ -437,6 +430,16 @@ impl QwenVae {
             weights.ok_or_else(|| CandleError::Msg("vae tail tiling produced no tiles".into()))?;
         // Floor the divisor to avoid a divide-by-zero at any coverage gap (the plan guarantees > 0).
         output.broadcast_div(&weights.clamp(1e-8f32, f32::MAX)?)
+    }
+}
+
+impl LatentDecoder for QwenVae {
+    fn input_latent_space(&self) -> Option<&candle_gen::gen_core::LatentSpace> {
+        Some(&candle_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE)
+    }
+
+    fn decode(&self, latents: &Tensor) -> candle_gen::Result<Tensor> {
+        Ok(QwenVae::decode(self, latents)?)
     }
 }
 

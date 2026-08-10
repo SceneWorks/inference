@@ -838,6 +838,7 @@ fn resolve_steps(requested: Option<u32>) -> usize {
 /// prompt; no conditioning (img2img/Edit deferred), no LoRA/quant, no Lightning sampler.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        denoiser_output_latent_space: Some(&candle_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
         id: MODEL_ID,

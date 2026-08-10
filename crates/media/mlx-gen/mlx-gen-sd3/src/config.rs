@@ -205,6 +205,7 @@ impl Sd3Variant {
 
     pub fn descriptor(self) -> ModelDescriptor {
         ModelDescriptor {
+            denoiser_output_latent_space: Some(&mlx_gen::gen_core::SD3_LATENT_SPACE),
             control_kinds: None,
             required_components: &[],
             id: self.id(),

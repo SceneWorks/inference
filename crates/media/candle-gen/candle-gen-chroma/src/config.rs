@@ -84,6 +84,7 @@ impl ChromaVariant {
     /// job until candle wires them), so they are not advertised and are rejected at load.
     pub fn descriptor(self) -> ModelDescriptor {
         ModelDescriptor {
+            denoiser_output_latent_space: Some(&candle_gen::gen_core::FLUX1_LATENT_SPACE),
             control_kinds: None,
             required_components: &[],
             id: self.id(),

@@ -113,6 +113,7 @@ pub fn descriptor_fast() -> ModelDescriptor {
 /// `mac_only = false`.
 fn descriptor_for(id: &'static str) -> ModelDescriptor {
     ModelDescriptor {
+        denoiser_output_latent_space: None,
         control_kinds: None,
         required_components: &[],
         id,

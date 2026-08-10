@@ -166,6 +166,49 @@ mod tests {
     ];
 
     #[test]
+    fn every_known_decoder_family_advertises_its_exact_latent_space() {
+        use mlx_gen::gen_core::{
+            LatentSpace, FLUX1_LATENT_SPACE, FLUX2_PACKED_LATENT_SPACE, QWEN_KREA_Z16_LATENT_SPACE,
+            SD3_LATENT_SPACE, SDXL_LATENT_SPACE, WAN_Z16_VIDEO_LATENT_SPACE, WAN_Z48_LATENT_SPACE,
+        };
+
+        fn expected(
+            descriptor: &mlx_gen::gen_core::ModelDescriptor,
+        ) -> Option<&'static LatentSpace> {
+            match descriptor.family {
+                "qwen-image" | "krea_2" => Some(&QWEN_KREA_Z16_LATENT_SPACE),
+                "krea_realtime" => Some(&WAN_Z16_VIDEO_LATENT_SPACE),
+                "wan" if descriptor.id == "wan2_2_ti2v_5b" => Some(&WAN_Z48_LATENT_SPACE),
+                "wan" => Some(&WAN_Z16_VIDEO_LATENT_SPACE),
+                "flux" | "boogu" | "chroma" | "z-image" | "pulid" => Some(&FLUX1_LATENT_SPACE),
+                "sd3" => Some(&SD3_LATENT_SPACE),
+                "sdxl" | "kolors" => Some(&SDXL_LATENT_SPACE),
+                "flux2" | "ideogram" | "lens" => Some(&FLUX2_PACKED_LATENT_SPACE),
+                _ => None,
+            }
+        }
+
+        let registry = super::provider_registry().unwrap();
+        let mut checked = 0;
+        for registration in registry.generators() {
+            let descriptor = (registration.descriptor)();
+            if let Some(expected) = expected(&descriptor) {
+                checked += 1;
+                assert_eq!(
+                    descriptor.denoiser_output_latent_space,
+                    Some(expected),
+                    "{} must advertise the latent space its decoder consumes",
+                    descriptor.id
+                );
+            }
+        }
+        assert!(
+            checked > 30,
+            "known-space guard unexpectedly checked only {checked} routes"
+        );
+    }
+
+    #[test]
     fn preview_capability_matches_every_wired_shipped_route_bidirectionally() {
         let registry = super::provider_registry().unwrap();
         let descriptors: Vec<_> = registry

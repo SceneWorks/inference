@@ -964,6 +964,65 @@ pub fn model_descriptor_errors(d: &ModelDescriptor) -> Vec<String> {
              is not in `conditioning` — path-A requests would be rejected by the allowlist"
         ));
     }
+    if let Some(space) = d.denoiser_output_latent_space {
+        if space.channels == 0 {
+            errs.push(format!("{ctx}: latent-space channel count is 0"));
+        }
+        if space.spatial_compression.height == 0 || space.spatial_compression.width == 0 {
+            errs.push(format!(
+                "{ctx}: latent-space spatial compression is {}x{} — both factors must be non-zero",
+                space.spatial_compression.height, space.spatial_compression.width
+            ));
+        }
+        if let crate::latent::LatentPatchLayout::Packed {
+            patch_height,
+            patch_width,
+        } = space.patch_layout
+        {
+            if patch_height == 0 || patch_width == 0 {
+                errs.push(format!(
+                    "{ctx}: packed latent patch is {patch_height}x{patch_width} — both factors must be non-zero"
+                ));
+            }
+        }
+        match space.normalization {
+            crate::latent::LatentNormalization::Affine { .. } => {
+                let (scale, shift) = space
+                    .normalization
+                    .affine_values()
+                    .expect("matched affine normalization");
+                if !scale.is_finite() || scale == 0.0 || !shift.is_finite() {
+                    errs.push(format!(
+                        "{ctx}: affine latent normalization has invalid scale={scale:?} shift={shift:?}"
+                    ));
+                }
+            }
+            crate::latent::LatentNormalization::PerChannel(stats) => {
+                if stats.channels != space.channels {
+                    errs.push(format!(
+                        "{ctx}: latent space declares {} channels but normalization {:?} hashes {}",
+                        space.channels, stats.identity, stats.channels
+                    ));
+                }
+                if stats.identity.is_empty()
+                    || stats.identity.chars().any(char::is_whitespace)
+                    || stats.content_hash == 0
+                {
+                    errs.push(format!(
+                        "{ctx}: per-channel latent normalization must have a non-empty, whitespace-free identity and non-zero content hash"
+                    ));
+                }
+            }
+            crate::latent::LatentNormalization::LearnedPerChannel { identity } => {
+                if identity.is_empty() || identity.chars().any(char::is_whitespace) {
+                    errs.push(format!(
+                        "{ctx}: learned latent normalization identity must be non-empty and whitespace-free"
+                    ));
+                }
+            }
+            crate::latent::LatentNormalization::Identity => {}
+        }
+    }
     // Required components (sc-13658): the weights-free advertisement of the named model components a
     // consumer must provision (see `ModelDescriptor::required_components`). Each declared id must be a
     // non-empty, whitespace-free registry token, and the set must be duplicate-free — a blank or
@@ -1296,6 +1355,7 @@ mod tests {
 
     fn dummy_descriptor() -> ModelDescriptor {
         ModelDescriptor {
+            denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
             id: "dummy_test_model",
@@ -1337,6 +1397,7 @@ mod tests {
 
     fn dummy_delegated_descriptor() -> ModelDescriptor {
         ModelDescriptor {
+            denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
             id: "dummy_delegated_test_model",
@@ -1364,6 +1425,7 @@ mod tests {
     // read as ZERO — so the provider-owned split is what finds it.
     fn dummy_footprint_descriptor() -> ModelDescriptor {
         ModelDescriptor {
+            denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
             id: "dummy_footprint_model",
@@ -1444,6 +1506,7 @@ mod tests {
     // Multi-provider fixtures verify that independently named constants compose into one catalog.
     fn dummy_multi_gen_a_descriptor() -> ModelDescriptor {
         ModelDescriptor {
+            denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
             id: "dummy_multi_gen_a",
@@ -1456,6 +1519,7 @@ mod tests {
 
     fn dummy_multi_gen_b_descriptor() -> ModelDescriptor {
         ModelDescriptor {
+            denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
             id: "dummy_multi_gen_b",
@@ -2732,6 +2796,7 @@ mod tests {
         // A stub audio generator that advertises VoiceEmbedding conditioning.
         let tts = DummyGen {
             desc: ModelDescriptor {
+                denoiser_output_latent_space: None,
                 control_kinds: None,
                 required_components: &[],
                 id: "dummy_tts",
@@ -2863,6 +2928,7 @@ mod tests {
         assert!(model_descriptor_errors(&dummy_descriptor()).is_empty());
 
         let broken = ModelDescriptor {
+            denoiser_output_latent_space: None,
             control_kinds: None,
             // Blank + duplicate required-component ids (sc-13658) — unstageable / ambiguous keys.
             required_components: &["", "voice_embedding", "voice_embedding"],
@@ -2905,6 +2971,7 @@ mod tests {
 
         // All-zero bounds report the Default-0 message (F-084), not the inverted-bounds one.
         let zeroed = ModelDescriptor {
+            denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
             id: "zeroed",
@@ -2925,6 +2992,7 @@ mod tests {
     #[test]
     fn model_descriptor_errors_flags_conversation_history_flag_without_kind() {
         let half_wired = ModelDescriptor {
+            denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
             id: "convo",
@@ -2963,6 +3031,7 @@ mod tests {
     #[test]
     fn audio_descriptor_with_zero_size_bounds_passes_sweep() {
         let audio = ModelDescriptor {
+            denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
             id: "zeroed_audio",
@@ -3009,6 +3078,7 @@ mod tests {
     fn visual_descriptor_with_invalid_size_bounds_still_fails_sweep() {
         // Video, zero bounds → the Default-0 footgun still fires.
         let video_zero = ModelDescriptor {
+            denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
             id: "video_zero",
@@ -3031,6 +3101,7 @@ mod tests {
 
         // Image, inverted bounds → the inverted-bounds message still fires.
         let image_inverted = ModelDescriptor {
+            denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
             id: "image_inverted",
@@ -3053,6 +3124,7 @@ mod tests {
 
         // `Both` (emits image or video) is a visual modality too — zero bounds still fail.
         let both_zero = ModelDescriptor {
+            denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
             id: "both_zero",

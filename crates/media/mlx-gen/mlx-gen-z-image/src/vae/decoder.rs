@@ -310,6 +310,10 @@ impl Vae {
 /// space (`mlx-gen-pid`, sc-7843) implements the same trait, so a generation can swap between them at
 /// the decode call site.
 impl LatentDecoder for Vae {
+    fn input_latent_space(&self) -> Option<&mlx_gen::gen_core::LatentSpace> {
+        Some(&mlx_gen::gen_core::FLUX1_LATENT_SPACE)
+    }
+
     fn decode(&self, latents: &Array) -> Result<Array> {
         Vae::decode(self, latents)
     }

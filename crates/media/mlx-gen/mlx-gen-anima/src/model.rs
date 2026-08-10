@@ -25,6 +25,7 @@ const RES_MAX: u32 = 1536;
 fn descriptor_for(variant: Variant) -> ModelDescriptor {
     let cfg_capable = variant.uses_cfg();
     ModelDescriptor {
+        denoiser_output_latent_space: None,
         control_kinds: None,
         required_components: &[],
         id: variant.id(),

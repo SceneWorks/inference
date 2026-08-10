@@ -42,6 +42,7 @@ pub const MODEL_ID: &str = "scail2_14b";
 /// plain single-scale CFG; packed-token conditioning + per-source RoPE + CLIP image cross-attn).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        denoiser_output_latent_space: None,
         control_kinds: None,
         required_components: &[],
         id: MODEL_ID,
