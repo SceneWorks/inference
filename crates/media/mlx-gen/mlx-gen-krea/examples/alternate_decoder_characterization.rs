@@ -13,27 +13,45 @@
 //! WAN21_VAE_FILE=/path/to/krea-realtime-14b-mlx/q4/vae.safetensors \
 //! cargo run -p mlx-gen-krea --release --example alternate_decoder_characterization
 //! ```
+//!
+//! # Force the production bounded-decode seam
+//!
+//! ```sh
+//! KREA_AB_SIZE=768 KREA_AB_TILED=1 \
+//! cargo run -p mlx-gen-krea --release --example alternate_decoder_characterization
+//! ```
+//!
+//! This selects the Krea memory ladder's real-weight-verified 512 px tile edge and 64 px overlap.
 
 use std::path::{Path, PathBuf};
 
+use mlx_gen::gen_core::GenerationMemory;
 use mlx_gen::{GenerationOutput, GenerationRequest, LoadSpec, Quant, WeightsSource, VAE_COMPONENT};
 use mlx_gen_krea::load;
 
 const PROMPT: &str =
     "A medium-shot photograph of a red fox sitting in a snowy forest at golden hour.";
 const SEED: u64 = 7;
+const TILE_EDGE: u32 = 512;
+const TILE_OVERLAP: u32 = 64;
 
-fn render(spec: &LoadSpec) -> mlx_gen::media::Image {
+fn render(spec: &LoadSpec, size: u32, tiled: bool) -> mlx_gen::media::Image {
     let generator = load(spec).expect("load Krea 2 Turbo");
     let output = generator
         .generate(
             &GenerationRequest {
                 prompt: PROMPT.to_owned(),
-                width: 512,
-                height: 512,
+                width: size,
+                height: size,
                 count: 1,
                 seed: Some(SEED),
                 steps: Some(8),
+                memory: tiled.then_some(GenerationMemory {
+                    tile_vae_decode: true,
+                    decode_tile_edge: Some(TILE_EDGE),
+                    decode_overlap: Some(TILE_OVERLAP),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
             &mut |_| {},
@@ -89,11 +107,31 @@ fn save(image: &mlx_gen::media::Image, name: &str) {
 fn main() {
     let base = PathBuf::from(std::env::var("KREA_TURBO_DIR").expect("set KREA_TURBO_DIR"));
     let donor = PathBuf::from(std::env::var("WAN21_VAE_FILE").expect("set WAN21_VAE_FILE"));
+    let size = std::env::var("KREA_AB_SIZE")
+        .ok()
+        .map(|value| value.parse::<u32>().expect("KREA_AB_SIZE must be a u32"))
+        .unwrap_or(512);
+    let tiled = std::env::var("KREA_AB_TILED").as_deref() == Ok("1");
+    if tiled {
+        assert!(
+            size > TILE_EDGE,
+            "KREA_AB_SIZE={size} must exceed the {TILE_EDGE}px tile edge to force multiple tiles"
+        );
+    }
+    eprintln!(
+        "configuration geometry={size}x{size} tiled={tiled} tile_edge={} overlap={}",
+        tiled.then_some(TILE_EDGE).unwrap_or(0),
+        tiled.then_some(TILE_OVERLAP).unwrap_or(0)
+    );
     let native_spec = LoadSpec::new(WeightsSource::Dir(base)).with_quant(Quant::Q4);
 
-    let native = render(&native_spec);
+    let native = render(&native_spec, size, tiled);
     mlx_rs::memory::clear_cache();
-    let alternate = render(&native_spec.with_component(VAE_COMPONENT, WeightsSource::File(donor)));
+    let alternate = render(
+        &native_spec.with_component(VAE_COMPONENT, WeightsSource::File(donor)),
+        size,
+        tiled,
+    );
 
     assert_eq!(
         (alternate.width, alternate.height),
@@ -142,6 +180,7 @@ fn main() {
         mean_abs_delta > 0.5,
         "alternate decoder delta is negligible"
     );
-    save(&native, "native.png");
-    save(&alternate, "wan21.png");
+    let mode = if tiled { "tiled" } else { "untiled" };
+    save(&native, &format!("native-{mode}-{size}.png"));
+    save(&alternate, &format!("wan21-{mode}-{size}.png"));
 }
