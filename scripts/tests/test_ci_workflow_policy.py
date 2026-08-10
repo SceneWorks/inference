@@ -894,6 +894,9 @@ class CiWorkflowPolicyTests(unittest.TestCase):
 
     def test_mage_media_lane_requires_verified_operator_cpu_oracles(self) -> None:
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        mage_job = workflow[
+            workflow.index("  mlx-media:") : workflow.index("\n  mlx-qwen-image:")
+        ]
         self.assertIn('MAGE_REQUIRE_GOLDENS: "1"', workflow)
         self.assertIn(
             'echo "MAGE_GOLDEN_DIR=$RUNNER_TEMP/mage-flow-oracles" >> "$GITHUB_ENV"',
@@ -912,7 +915,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             "UV_PYTHON_INSTALL_DIR: ${{ runner.temp }}/python-install",
             workflow,
         )
-        self.assertNotIn("uses: actions/setup-python", workflow)
+        self.assertNotIn("uses: actions/setup-python", mage_job)
         self.assertNotIn("3.12.11", workflow)
         self.assertIn("Run Mage-Flow text-encoder parity", workflow)
         self.assertIn("Run Mage-VAE all-geometry parity", workflow)
@@ -1371,9 +1374,21 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn('allow_patterns=["bf16/**"]', job)
         self.assertIn("models--SceneWorks--scail2-mlx", job)
         git_bash = job.index("Select Git Bash")
+        setup_python = job.index("actions/setup-python@")
         toolchain = job.index("uses: dtolnay/rust-toolchain@")
+        initialize_evidence = job.index("Initialize exact SCAIL CUDA evidence")
+        provision = job.index("Provision the exact public shared bf16 package")
         self.assertLess(git_bash, toolchain)
+        self.assertLess(git_bash, setup_python)
+        self.assertLess(setup_python, provision)
+        self.assertLess(initialize_evidence, provision)
         self.assertIn(r'C:\Program Files\Git\bin\bash.exe', job)
+        self.assertIn(
+            "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97",
+            job,
+        )
+        self.assertIn('python-version: "3.12"', job)
+        self.assertIn("real-weights-huggingface-hub-windows-x64-py312.txt", job)
         for required in (
             "config.json",
             "dit.safetensors",
@@ -1390,6 +1405,9 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("Load through the production provider", job)
         self.assertIn("[[SCAIL2_CUDA_VRAM]]", job)
         self.assertIn("-- --ignored --exact --nocapture", job)
+        self.assertIn('"provision_status=starting"', job)
+        self.assertIn('"provision_status=complete"', job)
+        self.assertIn("Tee-Object -LiteralPath $log -Append", job)
         self.assertIn("actions/upload-artifact@", job)
         self.assertIn("scail2-shared-cuda-${{ github.sha }}", job)
 

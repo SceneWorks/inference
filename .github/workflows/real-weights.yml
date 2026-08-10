@@ -4785,13 +4785,28 @@ jobs:
         run: |
           if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
           echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
         with:
           toolchain: 1.96.0
           components: rustfmt, clippy
+      - name: Initialize exact SCAIL CUDA evidence
+        shell: powershell
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP "scail2-shared-cuda.log"
+          @(
+            "inference_head=${{ github.sha }}"
+            "repository=$env:SCAIL2_REPOSITORY"
+            "revision=$env:SCAIL2_REVISION"
+            "python=$(python --version 2>&1)"
+            "provision_status=starting"
+          ) | Set-Content -LiteralPath $log -Encoding utf8
       - name: Provision the exact public shared bf16 package
         shell: powershell
         run: |
+          $log = Join-Path $env:RUNNER_TEMP "scail2-shared-cuda.log"
           python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$env:RUNNER_TEMP\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $env:PYTHONPATH = "$env:RUNNER_TEMP\huggingface-hub"
@@ -4828,8 +4843,9 @@ jobs:
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as out:
               out.write(f"SCAIL2_SHARED_BF16_DIR={root}\n")
           print(f"Exact shared package ready: {repo}@{revision}/bf16 -> {root}")
-          '@ | python -
+          '@ | python - 2>&1 | Tee-Object -LiteralPath $log -Append
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "provision_status=complete" | Add-Content -LiteralPath $log -Encoding utf8
       - name: Build the exact CUDA real-weight gate
         shell: cmd
         run: |
@@ -4845,7 +4861,7 @@ jobs:
           $log = Join-Path $env:RUNNER_TEMP "scail2-shared-cuda.log"
           cargo test --locked --release -p candle-gen-scail2 --features cuda `
             pipeline::tests::shared_bf16_real_weights_cuda_loads_and_renders_with_measured_peak `
-            -- --ignored --exact --nocapture 2>&1 | Tee-Object -FilePath $log
+            -- --ignored --exact --nocapture 2>&1 | Tee-Object -FilePath $log -Append
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (-not (Select-String -LiteralPath $log -SimpleMatch '[[SCAIL2_CUDA_VRAM]]')) {
             throw 'the real-weight test passed without emitting its machine-readable VRAM record'
