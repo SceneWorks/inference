@@ -9,8 +9,10 @@ the production `runtime-macos` catalog with nine fixed, real-weight workloads:
 
 The matrix fixes provider, prompt, seed, exact artifact revision and content inventory, tier,
 geometry, frames, steps, one warmup, and three measured repetitions. Its required-all campaign is
-baseline, each P1/P3/P4/P5/P9 toggle independently, and all five together. Every case/variant runs
-in a fresh child process so process-global MLX allocator state cannot leak between comparison rows.
+baseline, a fixed-tile decode control, each P1/P3/P4/P5/P9 toggle independently, and all five
+together. Every case/variant runs in a fresh child process so process-global MLX allocator state
+cannot leak between comparison rows. P5 uses the same fixed tile geometry as its toggle-free
+control, which isolates accumulator mechanics from the separate P9 admission-policy change.
 
 ## Exact inputs and executable provenance
 
@@ -29,10 +31,15 @@ cargo run --release --locked -p runtime-macos --no-default-features --features p
   --bin mlx-perf-bench -- validate --artifacts /absolute/path/mlx-perf-artifacts.json
 ```
 
-The executable embeds the inference HEAD, dirty state, and pinned mlx-rs revision at build time.
-Every command that can create or accept evidence compares those receipts with the runtime checkout
-and lockfile. Build from a clean committed checkout; changing or committing source requires a fresh
-binary. A runtime-only `git rev-parse` cannot substitute for executable provenance.
+The executable embeds the inference HEAD, dirty state, pinned mlx-rs revision, Cargo profile and
+optimization level, debug-assertion state, target triple, sorted Cargo and target features,
+`RUSTFLAGS`, and full rustc version at build time. Its own SHA-256 is added at runtime. Every command
+that can create or accept evidence compares that complete receipt (including the exact executable
+bytes) with the frozen campaign, runtime checkout, and lockfile. Acceptance requires the documented
+`--release --locked --no-default-features --features perf-bench` build for
+`aarch64-apple-darwin`, with no custom rustflags. Build from a clean committed checkout; changing or
+committing source requires a fresh binary. A runtime-only `git rev-parse` cannot substitute for
+executable provenance.
 
 ## Frozen campaigns and execution
 
@@ -65,10 +72,14 @@ cargo run --release --locked -p runtime-macos --no-default-features --features p
   --output-dir /absolute/path/empty-baseline-directory --variants baseline
 ```
 
-Baseline-only and partial campaigns are diagnostic runs, not acceptance evidence. `summary.json`
-sets `acceptanceComplete` only for the exact required-all selection. Merging this infrastructure
-does not complete sc-18321: the story stays open until P1/P3/P4/P5/P9 are integrated and the full
-nine-case required-all comparison is successfully captured and reviewed.
+Baseline-only, partial, and custom-matrix campaigns are diagnostic runs, not acceptance evidence. A
+canonical required-all campaign is refused unless it uses the documented acceptance build.
+`summary.json` sets `acceptanceComplete` only for the exact committed matrix, exact required-all
+selection, and documented acceptance build. `--matrix` remains useful for diagnosis, but changing
+even a prompt, seed, step count, geometry, artifact, or variant contract cannot produce acceptance
+evidence. Merging this infrastructure does not complete sc-18321: the story stays open until
+P1/P3/P4/P5/P9 are integrated and the full nine-case required-all comparison is successfully
+captured and reviewed.
 
 ## Evidence semantics
 
@@ -78,7 +89,9 @@ The runner does not infer phases from UI progress. It requires exactly ordered b
 post-decode steps; and stage durations whose encode + denoise + decode intervals cover the measured
 request. Denoise throughput uses all configured steps.
 
-Each phase owns a 50 ms background allocator probe with immediate, periodic, and final samples.
+Each phase owns a 10 ms background allocator probe with immediate, periodic, and final samples.
+Validation rejects a phase whose observed inter-sample gap exceeds 30 ms, so the tens-of-
+milliseconds P5 allocation transients cannot be hidden behind the former coarse cadence.
 Every tick reads live active and cache bytes as one pair. JSON preserves:
 
 - MLX's native active-memory high-water mark;
@@ -93,8 +106,15 @@ cache maxima that may not have coexisted. These remain allocator-local host diag
 portable process-footprint or target-device admission estimate.
 
 Every measured output is nonempty, has the exact requested geometry/frame count, and carries a
-SHA-256 over the produced bytes. Digests must be stable across repetitions and exactly equal to the
-case's baseline digest across every selected variant.
+SHA-256 over the produced bytes. Digests must be stable across repetitions. P1/P3/P4 compare exactly
+with baseline; P5 compares exactly with the fixed-tile control; and `all_on` compares exactly with
+P9. P9 itself may differ from baseline only because its quality-admitted tiled policy is permitted
+to change output bytes. P9 and `all_on` must each emit exactly one stable `decode_policy` decision:
+`unchanged` stays byte-identical to baseline, while `geometry_tiled` may drift only when it carries
+the lower-hex SHA-256 identity of the production evidence that admitted tiling. Their decisions and
+evidence identities must match. The harness does not invent a permissive image-distance threshold;
+all outputs still must be byte-stable across repetitions and emit their required applied-toggle
+diagnostics.
 
 Validate an existing result directory without rewriting it:
 

@@ -1070,6 +1070,9 @@ pub(crate) fn transformer_window_size(req: &GenerationRequest) -> mlx_gen::Resul
 /// request that *did* ask would silently render an unbounded decode while the caller believed it had
 /// selected a bounded one, which is the false-green this seam exists to prevent.
 pub(crate) fn decode_tiling(req: &GenerationRequest) -> mlx_gen::Result<Option<TilingConfig>> {
+    if let Some(control) = mlx_gen::diagnostics::benchmark_decode_control() {
+        return Ok(Some(control.tiling_config()));
+    }
     let Some(memory) = req.memory.filter(|memory| memory.tile_vae_decode) else {
         return Ok(None);
     };
@@ -1298,6 +1301,34 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(attention_plan(&GenerationRequest::default()).is_ok());
+    }
+
+    #[test]
+    fn benchmark_fixed_tile_control_is_isolated_from_production_refusal() {
+        let scope = mlx_gen::diagnostics::begin_benchmark_request(
+            "sdxl-fixed-tile",
+            "sdxl_unet",
+            &[],
+            Some(mlx_gen::diagnostics::BenchmarkDecodeControl {
+                spatial_tile_px: 256,
+                spatial_overlap_px: 64,
+                temporal_tile_frames: None,
+                temporal_overlap_frames: None,
+            }),
+            |_| {},
+        )
+        .unwrap();
+        let tiling = decode_tiling(&GenerationRequest::default())
+            .unwrap()
+            .unwrap();
+        let spatial = tiling.spatial.unwrap();
+        assert_eq!((spatial.tile_px, spatial.overlap_px), (256, 64));
+        assert!(tiling.temporal.is_none());
+        scope.finish();
+
+        assert!(decode_tiling(&GenerationRequest::default())
+            .unwrap()
+            .is_none());
     }
 
     /// The rung-4 request-side resolver refuses exactly what admission refuses — the second layer a

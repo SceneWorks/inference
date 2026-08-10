@@ -260,6 +260,9 @@ pub(crate) fn calibration_fault(
 /// edge or overlap, and PiD remains a distinct decoder with its own geometry rather than silently
 /// receiving a Qwen-VAE tile.
 pub(crate) fn decode_tiling(req: &GenerationRequest) -> Option<TilingConfig> {
+    if let Some(control) = mlx_gen::diagnostics::benchmark_decode_control() {
+        return Some(control.tiling_config());
+    }
     req.memory
         .filter(|memory| memory.tile_vae_decode)
         .map(|memory| {
@@ -1084,6 +1087,30 @@ mod tests {
             spatial.overlap_px,
             crate::memory_strategy::DECODE_OVERLAP as i32
         );
+    }
+
+    #[test]
+    fn benchmark_scope_overrides_request_decode_geometry_without_leaking() {
+        let scope = mlx_gen::diagnostics::begin_benchmark_request(
+            "qwen-fixed-tile",
+            "image_dit",
+            &[],
+            Some(mlx_gen::diagnostics::BenchmarkDecodeControl {
+                spatial_tile_px: 256,
+                spatial_overlap_px: 64,
+                temporal_tile_frames: None,
+                temporal_overlap_frames: None,
+            }),
+            |_| {},
+        )
+        .unwrap();
+        let tiling = decode_tiling(&GenerationRequest::default()).unwrap();
+        let spatial = tiling.spatial.unwrap();
+        assert_eq!((spatial.tile_px, spatial.overlap_px), (256, 64));
+        assert!(tiling.temporal.is_none());
+        scope.finish();
+
+        assert!(decode_tiling(&GenerationRequest::default()).is_none());
     }
 
     #[test]

@@ -65,6 +65,18 @@ pub enum ToggleDisposition {
     Unavailable,
 }
 
+/// The P9 geometry-aware policy's semantic decision for one request.
+///
+/// `Unchanged` means P9 deliberately preserved the provider's production/default decoder choice;
+/// it does not imply a physical single-pass decoder because Wan may already auto-tile. A
+/// `GeometryTiled` decision may change output bytes and therefore also carries the immutable
+/// production evidence identity that admitted that policy.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum DecodePolicyDisposition {
+    Unchanged,
+    GeometryTiled,
+}
+
 /// Provider-neutral compute boundaries consumed by the P6 benchmark harness.
 ///
 /// Providers emit these at the exact point where pre-denoise work ends and where denoise hands its
@@ -75,6 +87,36 @@ pub enum ToggleDisposition {
 pub enum BenchmarkPhaseBoundary {
     DenoiseStart,
     DecodeStart,
+}
+
+/// Benchmark-only fixed tile geometry used to compare P5's accumulator mechanics against the old
+/// accumulator without also changing P9's production admission policy. It exists only inside an
+/// active request-local diagnostic scope; ordinary generation can never observe one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BenchmarkDecodeControl {
+    pub spatial_tile_px: i32,
+    pub spatial_overlap_px: i32,
+    pub temporal_tile_frames: Option<i32>,
+    pub temporal_overlap_frames: Option<i32>,
+}
+
+impl BenchmarkDecodeControl {
+    pub fn tiling_config(self) -> crate::tiling::TilingConfig {
+        crate::tiling::TilingConfig {
+            spatial: Some(crate::tiling::SpatialTiling {
+                tile_px: self.spatial_tile_px,
+                overlap_px: self.spatial_overlap_px,
+            }),
+            temporal: self
+                .temporal_tile_frames
+                .map(|tile_frames| crate::tiling::TemporalTiling {
+                    tile_frames,
+                    overlap_frames: self
+                        .temporal_overlap_frames
+                        .expect("validated temporal benchmark control has an overlap"),
+                }),
+        }
+    }
 }
 
 /// One provider-emitted phase boundary measured from the beginning of the diagnostic request.
@@ -107,6 +149,11 @@ pub enum DiagnosticCounter {
         disposition: ToggleDisposition,
         count: u64,
     },
+    DecodePolicy {
+        disposition: DecodePolicyDisposition,
+        production_evidence_sha256: Option<String>,
+        count: u64,
+    },
 }
 
 /// Completed diagnostics for exactly one benchmarked request.
@@ -124,12 +171,14 @@ enum CounterKey {
     Cache(&'static str, CacheDisposition),
     Fallback(&'static str, &'static str),
     Toggle(&'static str, ToggleDisposition),
+    DecodePolicy(DecodePolicyDisposition, Option<String>),
 }
 
 struct Collector {
     request_id: String,
     family: String,
     requested_toggles: BTreeSet<&'static str>,
+    decode_control: Option<BenchmarkDecodeControl>,
     counters: BTreeMap<CounterKey, u64>,
     started: Instant,
     phase_boundaries: Vec<PhaseBoundaryRecord>,
@@ -175,7 +224,7 @@ pub fn begin_request_with_toggles(
     family: impl Into<String>,
     requested_toggles: &[&'static str],
 ) -> Result<DiagnosticScope, ScopeAlreadyActive> {
-    begin_request_with_toggles_and_phase_observer(request_id, family, requested_toggles, None)
+    begin_request_with_toggles_and_phase_observer(request_id, family, requested_toggles, None, None)
 }
 
 /// Begin request diagnostics with a synchronous observer for provider-neutral phase boundaries.
@@ -193,6 +242,26 @@ pub fn begin_request_with_phase_observer(
         request_id,
         family,
         requested_toggles,
+        None,
+        Some(Box::new(phase_observer)),
+    )
+}
+
+/// Begin the complete P6 request scope with an optional fixed-tile control and synchronous phase
+/// observer. This is intentionally distinct from production-facing diagnostic constructors: only
+/// the benchmark harness supplies the control.
+pub fn begin_benchmark_request(
+    request_id: impl Into<String>,
+    family: impl Into<String>,
+    requested_toggles: &[&'static str],
+    decode_control: Option<BenchmarkDecodeControl>,
+    phase_observer: impl FnMut(BenchmarkPhaseBoundary) + 'static,
+) -> Result<DiagnosticScope, ScopeAlreadyActive> {
+    begin_request_with_toggles_and_phase_observer(
+        request_id,
+        family,
+        requested_toggles,
+        decode_control,
         Some(Box::new(phase_observer)),
     )
 }
@@ -201,6 +270,7 @@ fn begin_request_with_toggles_and_phase_observer(
     request_id: impl Into<String>,
     family: impl Into<String>,
     requested_toggles: &[&'static str],
+    decode_control: Option<BenchmarkDecodeControl>,
     phase_observer: Option<Box<dyn FnMut(BenchmarkPhaseBoundary)>>,
 ) -> Result<DiagnosticScope, ScopeAlreadyActive> {
     COLLECTOR.with(|slot| {
@@ -212,6 +282,7 @@ fn begin_request_with_toggles_and_phase_observer(
             request_id: request_id.into(),
             family: family.into(),
             requested_toggles: requested_toggles.iter().copied().collect(),
+            decode_control,
             counters: BTreeMap::new(),
             started: Instant::now(),
             phase_boundaries: Vec::new(),
@@ -228,6 +299,16 @@ pub fn toggle_requested(toggle: &str) -> bool {
         slot.borrow()
             .as_ref()
             .is_some_and(|collector| collector.requested_toggles.contains(toggle))
+    })
+}
+
+/// Fixed tiled-decode control for the active P6 request, or `None` for production/default and P9
+/// policy comparisons. This is request-local and always `None` outside the benchmark scope.
+pub fn benchmark_decode_control() -> Option<BenchmarkDecodeControl> {
+    COLLECTOR.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .and_then(|collector| collector.decode_control)
     })
 }
 
@@ -259,6 +340,21 @@ pub fn record_fallback(site: &'static str, reason: &'static str) {
 /// environment variable or from output timing alone.
 pub fn record_toggle(toggle: &'static str, disposition: ToggleDisposition) {
     increment(CounterKey::Toggle(toggle, disposition));
+}
+
+/// Record P9's request-local policy decision. No-op outside an active diagnostic request.
+///
+/// The benchmark contract rejects `GeometryTiled` without a lower-hex SHA-256 identity and rejects
+/// any evidence identity on `Unchanged`; keeping validation in the versioned P6 schema lets legacy
+/// or malformed serialized evidence fail closed as well.
+pub fn record_decode_policy(
+    disposition: DecodePolicyDisposition,
+    production_evidence_sha256: Option<&str>,
+) {
+    increment(CounterKey::DecodePolicy(
+        disposition,
+        production_evidence_sha256.map(str::to_owned),
+    ));
 }
 
 /// Record and synchronously publish one provider-neutral phase boundary. No-op outside an active
@@ -313,6 +409,13 @@ impl DiagnosticScope {
                         disposition,
                         count,
                     },
+                    CounterKey::DecodePolicy(disposition, production_evidence_sha256) => {
+                        DiagnosticCounter::DecodePolicy {
+                            disposition,
+                            production_evidence_sha256,
+                            count,
+                        }
+                    }
                 })
                 .collect();
             DiagnosticReport {
@@ -398,6 +501,59 @@ mod tests {
         assert!(!toggle_requested("geometry_aware_decode"));
         assert!(scope.finish().counters.is_empty());
         assert!(!toggle_requested("retained_compilation"));
+    }
+
+    #[test]
+    fn fixed_decode_control_is_benchmark_only_and_request_local() {
+        let control = BenchmarkDecodeControl {
+            spatial_tile_px: 256,
+            spatial_overlap_px: 64,
+            temporal_tile_frames: Some(32),
+            temporal_overlap_frames: Some(8),
+        };
+        assert_eq!(benchmark_decode_control(), None);
+
+        let scope = begin_benchmark_request(
+            "fixed-tile",
+            "wan_video",
+            &[INDEXED_DECODE_ACCUMULATOR],
+            Some(control),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(benchmark_decode_control(), Some(control));
+        assert!(toggle_requested(INDEXED_DECODE_ACCUMULATOR));
+        let tiling = benchmark_decode_control().unwrap().tiling_config();
+        let spatial = tiling.spatial.unwrap();
+        let temporal = tiling.temporal.unwrap();
+        assert_eq!((spatial.tile_px, spatial.overlap_px), (256, 64));
+        assert_eq!((temporal.tile_frames, temporal.overlap_frames), (32, 8));
+
+        let report = scope.finish();
+        assert!(report.counters.is_empty());
+        assert_eq!(benchmark_decode_control(), None);
+    }
+
+    #[test]
+    fn p9_policy_receipt_preserves_decision_and_evidence_identity() {
+        let evidence = "a".repeat(64);
+        let scope =
+            begin_request_with_toggles("geometry-policy", "image_dit", &[GEOMETRY_AWARE_DECODE])
+                .unwrap();
+        record_decode_policy(
+            DecodePolicyDisposition::GeometryTiled,
+            Some(evidence.as_str()),
+        );
+        let report = scope.finish();
+
+        assert_eq!(
+            report.counters,
+            [DiagnosticCounter::DecodePolicy {
+                disposition: DecodePolicyDisposition::GeometryTiled,
+                production_evidence_sha256: Some(evidence),
+                count: 1,
+            }]
+        );
     }
 
     #[test]

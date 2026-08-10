@@ -1,42 +1,67 @@
 {
-  "schemaVersion": "sceneworks.mlx-perf-matrix.v2",
+  "schemaVersion": "sceneworks.mlx-perf-matrix.v3",
   "benchmarkId": "sc-18321-cross-family-v1",
   "warmupRuns": 1,
   "measuredRuns": 3,
   "variants": [
     {
       "id": "baseline",
-      "toggles": []
+      "toggles": [],
+      "decodeControl": "default",
+      "controlVariant": "baseline",
+      "outputComparison": "deterministic"
+    },
+    {
+      "id": "tiled_decode_control",
+      "toggles": [],
+      "decodeControl": "fixed_tiled",
+      "controlVariant": "tiled_decode_control",
+      "outputComparison": "deterministic"
     },
     {
       "id": "retained_compilation",
       "toggles": [
         "retained_compilation"
-      ]
+      ],
+      "decodeControl": "default",
+      "controlVariant": "baseline",
+      "outputComparison": "exact_control"
     },
     {
       "id": "exact_epilogues",
       "toggles": [
         "exact_epilogues"
-      ]
+      ],
+      "decodeControl": "default",
+      "controlVariant": "baseline",
+      "outputComparison": "exact_control"
     },
     {
       "id": "fused_attention_primitives",
       "toggles": [
         "fused_attention_primitives"
-      ]
+      ],
+      "decodeControl": "default",
+      "controlVariant": "baseline",
+      "outputComparison": "exact_control"
     },
     {
       "id": "indexed_decode_accumulator",
       "toggles": [
         "indexed_decode_accumulator"
-      ]
+      ],
+      "decodeControl": "fixed_tiled",
+      "controlVariant": "tiled_decode_control",
+      "outputComparison": "exact_control"
     },
     {
       "id": "geometry_aware_decode",
       "toggles": [
         "geometry_aware_decode"
-      ]
+      ],
+      "decodeControl": "default",
+      "controlVariant": "baseline",
+      "outputComparison": "geometry_aware_control"
     },
     {
       "id": "all_on",
@@ -46,7 +71,10 @@
         "fused_attention_primitives",
         "indexed_decode_accumulator",
         "geometry_aware_decode"
-      ]
+      ],
+      "decodeControl": "default",
+      "controlVariant": "geometry_aware_decode",
+      "outputComparison": "exact_control"
     }
   ],
   "artifacts": [
@@ -91,7 +119,13 @@
       "frames": 17,
       "steps": 8,
       "seed": 1832101,
-      "prompt": "A red fox runs through a snowy pine forest at sunrise, cinematic tracking shot"
+      "prompt": "A red fox runs through a snowy pine forest at sunrise, cinematic tracking shot",
+      "tiledDecodeControl": {
+        "spatialTilePx": 256,
+        "spatialOverlapPx": 64,
+        "temporalTileFrames": 32,
+        "temporalOverlapFrames": 8
+      }
     },
     {
       "id": "wan-q4-640x480-f49",
@@ -105,7 +139,13 @@
       "frames": 49,
       "steps": 8,
       "seed": 1832101,
-      "prompt": "A red fox runs through a snowy pine forest at sunrise, cinematic tracking shot"
+      "prompt": "A red fox runs through a snowy pine forest at sunrise, cinematic tracking shot",
+      "tiledDecodeControl": {
+        "spatialTilePx": 256,
+        "spatialOverlapPx": 64,
+        "temporalTileFrames": 32,
+        "temporalOverlapFrames": 8
+      }
     },
     {
       "id": "wan-q4-832x480-f81",
@@ -119,7 +159,13 @@
       "frames": 81,
       "steps": 8,
       "seed": 1832101,
-      "prompt": "A red fox runs through a snowy pine forest at sunrise, cinematic tracking shot"
+      "prompt": "A red fox runs through a snowy pine forest at sunrise, cinematic tracking shot",
+      "tiledDecodeControl": {
+        "spatialTilePx": 256,
+        "spatialOverlapPx": 64,
+        "temporalTileFrames": 32,
+        "temporalOverlapFrames": 8
+      }
     },
     {
       "id": "qwen-q4-512",
@@ -133,7 +179,11 @@
       "frames": 1,
       "steps": 8,
       "seed": 1832102,
-      "prompt": "A glass observatory on a windswept cliff, precise architectural photograph at blue hour"
+      "prompt": "A glass observatory on a windswept cliff, precise architectural photograph at blue hour",
+      "tiledDecodeControl": {
+        "spatialTilePx": 256,
+        "spatialOverlapPx": 64
+      }
     },
     {
       "id": "qwen-q4-1024",
@@ -147,7 +197,11 @@
       "frames": 1,
       "steps": 8,
       "seed": 1832102,
-      "prompt": "A glass observatory on a windswept cliff, precise architectural photograph at blue hour"
+      "prompt": "A glass observatory on a windswept cliff, precise architectural photograph at blue hour",
+      "tiledDecodeControl": {
+        "spatialTilePx": 256,
+        "spatialOverlapPx": 64
+      }
     },
     {
       "id": "qwen-q4-2048",
@@ -161,7 +215,11 @@
       "frames": 1,
       "steps": 8,
       "seed": 1832102,
-      "prompt": "A glass observatory on a windswept cliff, precise architectural photograph at blue hour"
+      "prompt": "A glass observatory on a windswept cliff, precise architectural photograph at blue hour",
+      "tiledDecodeControl": {
+        "spatialTilePx": 256,
+        "spatialOverlapPx": 64
+      }
     },
     {
       "id": "sdxl-bf16-512",
@@ -175,7 +233,11 @@
       "frames": 1,
       "steps": 8,
       "seed": 1832103,
-      "prompt": "A ceramic teapot beside folded linen, soft north-window light, editorial still life"
+      "prompt": "A ceramic teapot beside folded linen, soft north-window light, editorial still life",
+      "tiledDecodeControl": {
+        "spatialTilePx": 256,
+        "spatialOverlapPx": 64
+      }
     },
     {
       "id": "sdxl-bf16-1024",
@@ -189,7 +251,11 @@
       "frames": 1,
       "steps": 8,
       "seed": 1832103,
-      "prompt": "A ceramic teapot beside folded linen, soft north-window light, editorial still life"
+      "prompt": "A ceramic teapot beside folded linen, soft north-window light, editorial still life",
+      "tiledDecodeControl": {
+        "spatialTilePx": 256,
+        "spatialOverlapPx": 64
+      }
     },
     {
       "id": "sdxl-bf16-2048",
@@ -203,7 +269,11 @@
       "frames": 1,
       "steps": 8,
       "seed": 1832103,
-      "prompt": "A ceramic teapot beside folded linen, soft north-window light, editorial still life"
+      "prompt": "A ceramic teapot beside folded linen, soft north-window light, editorial still life",
+      "tiledDecodeControl": {
+        "spatialTilePx": 256,
+        "spatialOverlapPx": 64
+      }
     }
   ]
 }

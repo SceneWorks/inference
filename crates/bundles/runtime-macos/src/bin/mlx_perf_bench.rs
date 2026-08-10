@@ -6,17 +6,17 @@ use runtime_macos::gen_core::{
     GenerationOutput, GenerationRequest, LoadSpec, Progress, Quant, WeightsSource,
 };
 use runtime_macos::media::diagnostics::{
-    self, BenchmarkPhaseBoundary, CacheDisposition, CompileDisposition, DiagnosticCounter,
-    DiagnosticReport, ToggleDisposition,
+    self, BenchmarkDecodeControl, BenchmarkPhaseBoundary, CacheDisposition, CompileDisposition,
+    DecodePolicyDisposition, DiagnosticCounter, DiagnosticReport, ToggleDisposition,
 };
 use runtime_macos::media::memory_probe::{AllocatorProbe, AllocatorProbeReport};
 use runtime_macos::perf_bench::{
     build_summary, inventory_artifact, request_receipt, validate_toggle_diagnostics,
     ArtifactManifest, ArtifactReceipt, BenchmarkFamily, BenchmarkMatrix, BenchmarkSummary,
-    BindingPhase, BuildProvenance, DiagnosticRecord, FrozenCampaign, HostIdentity,
-    MeasurementRecord, MemoryCoverageReceipt, ModelTier, OptimizationToggle, OutputFingerprint,
-    PhaseBoundary, PhaseBoundaryReceipt, PhaseMetrics, PhaseSet, ProgressReceipt,
-    ProviderCapabilityReceipt, RunRecord, StepReceipt, VariantPlan, WorkloadCase,
+    BindingPhase, BuildProvenance, DecodeControlMode, DiagnosticRecord, FrozenCampaign,
+    HostIdentity, MeasurementRecord, MemoryCoverageReceipt, ModelTier, OptimizationToggle,
+    OutputFingerprint, PhaseBoundary, PhaseBoundaryReceipt, PhaseMetrics, PhaseSet,
+    ProgressReceipt, ProviderCapabilityReceipt, RunRecord, StepReceipt, VariantPlan, WorkloadCase,
     MEMORY_SAMPLE_INTERVAL_MICROS, RUN_SCHEMA_VERSION,
 };
 use serde::de::DeserializeOwned;
@@ -25,7 +25,7 @@ use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::rc::Rc;
@@ -190,8 +190,14 @@ fn selected_variants(
         return Err("--variants must be non-empty, unique, and include baseline".to_owned());
     }
     for id in &selected {
-        if matrix.variant(id).is_none() {
-            return Err(format!("unknown variant {id:?}"));
+        let variant = matrix
+            .variant(id)
+            .ok_or_else(|| format!("unknown variant {id:?}"))?;
+        if !unique.contains(variant.control_variant.as_str()) {
+            return Err(format!(
+                "variant {:?} requires control {:?} in --variants",
+                variant.id, variant.control_variant
+            ));
         }
     }
     Ok(selected)
@@ -535,10 +541,11 @@ fn measure_request(
         .iter()
         .map(|toggle| toggle.as_str())
         .collect();
-    let scope = diagnostics::begin_request_with_phase_observer(
+    let scope = diagnostics::begin_benchmark_request(
         request_id,
         case.family.as_str(),
         &requested,
+        benchmark_decode_control(case, variant)?,
         move |boundary| observer.borrow_mut().transition(boundary),
     )
     .map_err(|error| error.to_string())?;
@@ -569,6 +576,31 @@ fn measure_request(
         output,
         diagnostics,
     })
+}
+
+fn benchmark_decode_control(
+    case: &WorkloadCase,
+    variant: &VariantPlan,
+) -> Result<Option<BenchmarkDecodeControl>, String> {
+    if variant.decode_control == DecodeControlMode::Default {
+        return Ok(None);
+    }
+    let control = case.tiled_decode_control;
+    let to_i32 = |value: u32, label: &str| {
+        i32::try_from(value).map_err(|_| format!("{label} exceeds the MLX tiling domain"))
+    };
+    Ok(Some(BenchmarkDecodeControl {
+        spatial_tile_px: to_i32(control.spatial_tile_px, "spatial tile")?,
+        spatial_overlap_px: to_i32(control.spatial_overlap_px, "spatial overlap")?,
+        temporal_tile_frames: control
+            .temporal_tile_frames
+            .map(|value| to_i32(value, "temporal tile"))
+            .transpose()?,
+        temporal_overlap_frames: control
+            .temporal_overlap_frames
+            .map(|value| to_i32(value, "temporal overlap"))
+            .transpose()?,
+    }))
 }
 
 fn validate_report_identity_and_boundaries(
@@ -965,6 +997,7 @@ fn diagnostic_records(report: DiagnosticReport) -> Vec<DiagnosticRecord> {
                 .to_owned(),
                 count,
                 reason: None,
+                production_evidence_sha256: None,
             },
             DiagnosticCounter::Cache {
                 site,
@@ -981,6 +1014,7 @@ fn diagnostic_records(report: DiagnosticReport) -> Vec<DiagnosticRecord> {
                 .to_owned(),
                 count,
                 reason: None,
+                production_evidence_sha256: None,
             },
             DiagnosticCounter::Fallback {
                 site,
@@ -992,6 +1026,7 @@ fn diagnostic_records(report: DiagnosticReport) -> Vec<DiagnosticRecord> {
                 outcome: "fallback".to_owned(),
                 count,
                 reason: Some(reason.to_owned()),
+                production_evidence_sha256: None,
             },
             DiagnosticCounter::Toggle {
                 toggle,
@@ -1008,6 +1043,23 @@ fn diagnostic_records(report: DiagnosticReport) -> Vec<DiagnosticRecord> {
                 .to_owned(),
                 count,
                 reason: None,
+                production_evidence_sha256: None,
+            },
+            DiagnosticCounter::DecodePolicy {
+                disposition,
+                production_evidence_sha256,
+                count,
+            } => DiagnosticRecord {
+                domain: "decode_policy".to_owned(),
+                site: diagnostics::GEOMETRY_AWARE_DECODE.to_owned(),
+                outcome: match disposition {
+                    DecodePolicyDisposition::Unchanged => "unchanged",
+                    DecodePolicyDisposition::GeometryTiled => "geometry_tiled",
+                }
+                .to_owned(),
+                count,
+                reason: None,
+                production_evidence_sha256,
             },
         })
         .collect()
@@ -1124,11 +1176,47 @@ fn build_provenance() -> Result<BuildProvenance, String> {
         "false" => false,
         value => return Err(format!("invalid build-time dirty receipt {value:?}")),
     };
+    let executable =
+        env::current_exe().map_err(|error| format!("resolve current executable: {error}"))?;
     Ok(BuildProvenance {
         source_revision: env!("SCENEWORKS_BENCH_SOURCE_REVISION").to_owned(),
         mlx_revision: env!("SCENEWORKS_BENCH_MLX_REVISION").to_owned(),
         source_dirty,
+        cargo_profile: env!("SCENEWORKS_BENCH_CARGO_PROFILE").to_owned(),
+        opt_level: env!("SCENEWORKS_BENCH_OPT_LEVEL").to_owned(),
+        debug_assertions: cfg!(debug_assertions),
+        target_triple: env!("SCENEWORKS_BENCH_TARGET").to_owned(),
+        cargo_features: split_receipt(env!("SCENEWORKS_BENCH_CARGO_FEATURES"), ','),
+        target_features: split_receipt(env!("SCENEWORKS_BENCH_TARGET_FEATURES"), ','),
+        rustflags: split_receipt(env!("SCENEWORKS_BENCH_RUSTFLAGS"), '\u{241f}'),
+        rustc_version: env!("SCENEWORKS_BENCH_RUSTC_VERSION").to_owned(),
+        executable_sha256: sha256_file(&executable)?,
     })
+}
+
+fn split_receipt(value: &str, separator: char) -> Vec<String> {
+    value
+        .split(separator)
+        .filter(|item| !item.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn sha256_file(path: &Path) -> Result<String, String> {
+    let mut file = fs::File::open(path)
+        .map_err(|error| format!("open executable {}: {error}", path.display()))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("hash executable {}: {error}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 fn verify_executable_provenance(expected: Option<&BuildProvenance>) -> Result<(), String> {
@@ -1296,19 +1384,30 @@ fn write_json_atomic(path: &Path, value: &impl serde::Serialize) -> Result<(), S
 fn print_summary(summary: &BenchmarkSummary) {
     println!("\nStage timing comparison (seconds)");
     println!(
-        "{:<26} {:<24} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}",
-        "case", "variant", "total", "encode", "denoise", "decode", "steps/s", "speedup"
+        "{:<26} {:<24} {:<24} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}",
+        "case",
+        "variant",
+        "control",
+        "total",
+        "encode",
+        "denoise",
+        "decode",
+        "steps/s",
+        "vs ctl",
+        "vs base"
     );
     for row in &summary.rows {
         println!(
-            "{:<26} {:<24} {:>9.3} {:>9.3} {:>9.3} {:>9.3} {:>9.3} {:>8.3}x",
+            "{:<26} {:<24} {:<24} {:>9.3} {:>9.3} {:>9.3} {:>9.3} {:>9.3} {:>8.3}x {:>8.3}x",
             row.case_id,
             row.variant_id,
+            row.control_variant_id,
             row.median_total_seconds,
             row.median_encode_seconds,
             row.median_denoise_seconds,
             row.median_decode_seconds,
             row.median_denoise_steps_per_second,
+            row.speedup_vs_control,
             row.speedup_vs_baseline
         );
     }
@@ -1376,8 +1475,16 @@ mod tests {
     #[test]
     fn full_selection_is_default_and_baseline_is_required() {
         let matrix: BenchmarkMatrix = serde_json::from_str(DEFAULT_MATRIX).unwrap();
-        assert_eq!(selected_variants(&matrix, None).unwrap().len(), 7);
+        assert_eq!(selected_variants(&matrix, None).unwrap().len(), 8);
         assert!(selected_variants(&matrix, Some(&["exact_epilogues".to_owned()])).is_err());
+        assert!(selected_variants(
+            &matrix,
+            Some(&[
+                "baseline".to_owned(),
+                "indexed_decode_accumulator".to_owned()
+            ])
+        )
+        .is_err());
     }
 
     #[test]
@@ -1385,6 +1492,58 @@ mod tests {
         let receipt = build_provenance().unwrap();
         assert_eq!(receipt.source_revision.len(), 40);
         assert_eq!(receipt.mlx_revision.len(), 40);
+        assert!(!receipt.cargo_profile.is_empty());
+        assert!(!receipt.opt_level.is_empty());
+        assert!(!receipt.target_triple.is_empty());
+        assert!(!receipt.rustc_version.is_empty());
+        assert_eq!(receipt.executable_sha256.len(), 64);
+        assert!(receipt
+            .cargo_features
+            .windows(2)
+            .all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn fixed_tiled_control_is_derived_only_for_controlled_variants() {
+        let matrix: BenchmarkMatrix = serde_json::from_str(DEFAULT_MATRIX).unwrap();
+        let case = matrix.case("wan-q4-832x480-f81").unwrap();
+        let baseline = matrix.variant("baseline").unwrap();
+        let control = matrix.variant("tiled_decode_control").unwrap();
+
+        assert_eq!(benchmark_decode_control(case, baseline).unwrap(), None);
+        assert_eq!(
+            benchmark_decode_control(case, control).unwrap(),
+            Some(BenchmarkDecodeControl {
+                spatial_tile_px: 256,
+                spatial_overlap_px: 64,
+                temporal_tile_frames: Some(32),
+                temporal_overlap_frames: Some(8),
+            })
+        );
+    }
+
+    #[test]
+    fn p9_policy_counter_preserves_production_evidence_identity() {
+        let evidence = "a".repeat(64);
+        let records = diagnostic_records(DiagnosticReport {
+            request_id: "p9".to_owned(),
+            family: "image_dit".to_owned(),
+            counters: vec![DiagnosticCounter::DecodePolicy {
+                disposition: DecodePolicyDisposition::GeometryTiled,
+                production_evidence_sha256: Some(evidence.clone()),
+                count: 1,
+            }],
+            phase_boundaries: Vec::new(),
+        });
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].domain, "decode_policy");
+        assert_eq!(records[0].site, diagnostics::GEOMETRY_AWARE_DECODE);
+        assert_eq!(records[0].outcome, "geometry_tiled");
+        assert_eq!(
+            records[0].production_evidence_sha256.as_deref(),
+            Some(evidence.as_str())
+        );
     }
 
     #[test]

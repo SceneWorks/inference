@@ -14,15 +14,19 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-pub const MATRIX_SCHEMA_VERSION: &str = "sceneworks.mlx-perf-matrix.v2";
+pub const MATRIX_SCHEMA_VERSION: &str = "sceneworks.mlx-perf-matrix.v3";
 pub const ARTIFACT_SCHEMA_VERSION: &str = "sceneworks.mlx-perf-artifacts.v2";
-pub const CAMPAIGN_SCHEMA_VERSION: &str = "sceneworks.mlx-perf-campaign.v1";
-pub const RUN_SCHEMA_VERSION: &str = "sceneworks.mlx-perf-run.v2";
-pub const SUMMARY_SCHEMA_VERSION: &str = "sceneworks.mlx-perf-summary.v2";
+pub const CAMPAIGN_SCHEMA_VERSION: &str = "sceneworks.mlx-perf-campaign.v2";
+pub const RUN_SCHEMA_VERSION: &str = "sceneworks.mlx-perf-run.v3";
+pub const SUMMARY_SCHEMA_VERSION: &str = "sceneworks.mlx-perf-summary.v3";
 pub const INVENTORY_ALGORITHM: &str = "sha256-tree-content-v1";
-pub const MEMORY_SAMPLE_INTERVAL_MICROS: u64 = 50_000;
-pub const MEMORY_MAX_GAP_MULTIPLIER: u64 = 8;
+/// P5's decode-allocation transients are measured in tens of milliseconds. Sample substantially
+/// faster than that event and reject a sampler that was descheduled for more than three ticks.
+pub const MEMORY_SAMPLE_INTERVAL_MICROS: u64 = 10_000;
+pub const MEMORY_MAX_GAP_MULTIPLIER: u64 = 3;
 pub const MEMORY_BINDING_RULE: &str = "median_peak_same_sample_active_plus_cache";
+
+const CANONICAL_MATRIX_JSON: &str = include_str!("../benchmarks/mlx-perf-matrix-v1.json");
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -72,6 +76,29 @@ pub enum OptimizationToggle {
     GeometryAwareDecode,
 }
 
+/// Request shape held constant around one optimization comparison.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecodeControlMode {
+    /// Production/default decode selection. P9 may change this policy when its toggle is requested.
+    Default,
+    /// Force the matrix's fixed tile geometry through the benchmark-only request scope.
+    FixedTiled,
+}
+
+/// Correctness relation between a variant and its declared control.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputComparison {
+    /// Repetitions must be stable; no cross-variant byte relation is asserted for this control row.
+    Deterministic,
+    /// Every output byte must equal the declared control variant.
+    ExactControl,
+    /// P9 may differ from its control only when its explicit production-evidence-backed decision
+    /// selected geometry tiling; an unchanged decision remains byte-exact.
+    GeometryAwareControl,
+}
+
 impl OptimizationToggle {
     pub const ALL: [Self; 5] = [
         Self::RetainedCompilation,
@@ -111,6 +138,19 @@ pub enum CampaignMode {
 pub struct VariantPlan {
     pub id: String,
     pub toggles: Vec<OptimizationToggle>,
+    pub decode_control: DecodeControlMode,
+    pub control_variant: String,
+    pub output_comparison: OutputComparison,
+}
+
+/// Fixed tile geometry used only to isolate P5's accumulator mechanics from P9's policy.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TiledDecodeControl {
+    pub spatial_tile_px: u32,
+    pub spatial_overlap_px: u32,
+    pub temporal_tile_frames: Option<u32>,
+    pub temporal_overlap_frames: Option<u32>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -140,6 +180,7 @@ pub struct WorkloadCase {
     pub steps: u32,
     pub seed: u64,
     pub prompt: String,
+    pub tiled_decode_control: TiledDecodeControl,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -217,6 +258,18 @@ pub fn sha256_json(value: &impl Serialize) -> Result<String, ContractError> {
 }
 
 impl BenchmarkMatrix {
+    pub fn canonical() -> Self {
+        serde_json::from_str(CANONICAL_MATRIX_JSON)
+            .expect("the embedded P6 canonical matrix must deserialize")
+    }
+
+    /// Acceptance is tied to the exact committed matrix, not merely to a structurally valid custom
+    /// matrix. Equality binds prompts, models, tiers, artifacts, steps, seeds, geometries, controls,
+    /// and variant semantics.
+    pub fn is_canonical_acceptance_matrix(&self) -> bool {
+        self == &Self::canonical()
+    }
+
     pub fn validate(&self) -> Result<(), ContractError> {
         let mut errors = Vec::new();
         if self.schema_version != MATRIX_SCHEMA_VERSION {
@@ -234,6 +287,7 @@ impl BenchmarkMatrix {
         let mut variant_ids = BTreeSet::new();
         let mut singleton_toggles = BTreeSet::new();
         let mut baseline_count = 0;
+        let mut tiled_control_count = 0;
         let mut all_on_count = 0;
         let all_toggles: BTreeSet<_> = OptimizationToggle::ALL.into_iter().collect();
         for variant in &self.variants {
@@ -249,8 +303,27 @@ impl BenchmarkMatrix {
             }
             if variant.id == "baseline" {
                 baseline_count += 1;
-                if !variant.toggles.is_empty() {
-                    errors.push("baseline must not request any toggle".to_owned());
+                if !variant.toggles.is_empty()
+                    || variant.decode_control != DecodeControlMode::Default
+                    || variant.control_variant != "baseline"
+                    || variant.output_comparison != OutputComparison::Deterministic
+                {
+                    errors.push(
+                        "baseline must be deterministic production/default decode with no toggles"
+                            .to_owned(),
+                    );
+                }
+            } else if variant.id == "tiled_decode_control" {
+                tiled_control_count += 1;
+                if !variant.toggles.is_empty()
+                    || variant.decode_control != DecodeControlMode::FixedTiled
+                    || variant.control_variant != "tiled_decode_control"
+                    || variant.output_comparison != OutputComparison::Deterministic
+                {
+                    errors.push(
+                        "tiled_decode_control must be a deterministic, toggle-free fixed-tile control"
+                            .to_owned(),
+                    );
                 }
             } else if variant.id == "all_on" {
                 all_on_count += 1;
@@ -258,29 +331,94 @@ impl BenchmarkMatrix {
                     errors
                         .push("all_on must contain every benchmark toggle exactly once".to_owned());
                 }
+                if variant.decode_control != DecodeControlMode::Default
+                    || variant.control_variant != "geometry_aware_decode"
+                    || variant.output_comparison != OutputComparison::ExactControl
+                {
+                    errors.push(
+                        "all_on must preserve the geometry-aware control bytes while adding every exact toggle"
+                            .to_owned(),
+                    );
+                }
             } else if variant.toggles.len() == 1 {
-                if !singleton_toggles.insert(variant.toggles[0]) {
+                let toggle = variant.toggles[0];
+                if !singleton_toggles.insert(toggle) {
                     errors.push(format!(
                         "matrix repeats the independent {:?} toggle variant",
-                        variant.toggles[0]
+                        toggle
+                    ));
+                }
+                if variant.id != toggle.as_str() {
+                    errors.push(format!(
+                        "singleton variant {:?} must use its toggle's stable id {:?}",
+                        variant.id,
+                        toggle.as_str()
+                    ));
+                }
+                let expected = match toggle {
+                    OptimizationToggle::IndexedDecodeAccumulator => (
+                        DecodeControlMode::FixedTiled,
+                        "tiled_decode_control",
+                        OutputComparison::ExactControl,
+                    ),
+                    OptimizationToggle::GeometryAwareDecode => (
+                        DecodeControlMode::Default,
+                        "baseline",
+                        OutputComparison::GeometryAwareControl,
+                    ),
+                    OptimizationToggle::RetainedCompilation
+                    | OptimizationToggle::ExactEpilogues
+                    | OptimizationToggle::FusedAttentionPrimitives => (
+                        DecodeControlMode::Default,
+                        "baseline",
+                        OutputComparison::ExactControl,
+                    ),
+                };
+                if (
+                    variant.decode_control,
+                    variant.control_variant.as_str(),
+                    variant.output_comparison,
+                ) != expected
+                {
+                    errors.push(format!(
+                        "variant {:?} has the wrong decode/control/correctness contract",
+                        variant.id
                     ));
                 }
             } else {
                 errors.push(format!(
-                    "variant {:?} must be baseline, one independent toggle, or all_on",
+                    "variant {:?} must be baseline, tiled_decode_control, one independent toggle, or all_on",
                     variant.id
                 ));
             }
         }
-        if self.variants.len() != 7
+        if self.variants.len() != 8
             || baseline_count != 1
+            || tiled_control_count != 1
             || all_on_count != 1
             || singleton_toggles != all_toggles
         {
             errors.push(
-                "matrix must contain baseline, one independent variant per toggle, and all_on"
+                "matrix must contain baseline, tiled_decode_control, one independent variant per toggle, and all_on"
                     .to_owned(),
             );
+        }
+        for variant in &self.variants {
+            let Some(control) = self.variant(&variant.control_variant) else {
+                errors.push(format!(
+                    "variant {:?} references missing control {:?}",
+                    variant.id, variant.control_variant
+                ));
+                continue;
+            };
+            if variant.output_comparison == OutputComparison::ExactControl
+                && variant.decode_control != control.decode_control
+            {
+                errors.push(format!(
+                    "exact variant {:?} must use the same decode control as {:?}",
+                    variant.id, control.id
+                ));
+            }
         }
 
         let mut artifact_keys = BTreeSet::new();
@@ -323,6 +461,29 @@ impl BenchmarkMatrix {
                     case.id
                 ));
             }
+            let tiled = case.tiled_decode_control;
+            if tiled.spatial_tile_px == 0
+                || tiled.spatial_overlap_px == 0
+                || tiled.spatial_overlap_px >= tiled.spatial_tile_px
+                || tiled.spatial_tile_px > i32::MAX as u32
+                || tiled.spatial_overlap_px > i32::MAX as u32
+                || tiled.temporal_tile_frames.is_some() != tiled.temporal_overlap_frames.is_some()
+                || tiled
+                    .temporal_tile_frames
+                    .is_some_and(|tile| tile == 0 || tile > i32::MAX as u32)
+                || tiled.temporal_overlap_frames.is_some_and(|overlap| {
+                    overlap == 0
+                        || overlap > i32::MAX as u32
+                        || tiled
+                            .temporal_tile_frames
+                            .is_some_and(|tile| overlap >= tile)
+                })
+            {
+                errors.push(format!(
+                    "case {:?} has an invalid fixed tiled-decode control",
+                    case.id
+                ));
+            }
             if case.prompt.trim().is_empty()
                 || case.provider.trim().is_empty()
                 || case.artifact_key.trim().is_empty()
@@ -355,6 +516,12 @@ impl BenchmarkMatrix {
                             case.id
                         ));
                     }
+                    if tiled.temporal_tile_frames.is_none() {
+                        errors.push(format!(
+                            "Wan case {:?} requires a temporal fixed-tile control",
+                            case.id
+                        ));
+                    }
                 }
                 BenchmarkFamily::ImageDit => {
                     if !(case.provider.starts_with("qwen_image")
@@ -369,6 +536,12 @@ impl BenchmarkMatrix {
                     if case.width >= 2048 && case.height >= 2048 {
                         decode_bound.insert(case.family);
                     }
+                    if tiled.temporal_tile_frames.is_some() {
+                        errors.push(format!(
+                            "image-DiT case {:?} must not carry temporal tiling",
+                            case.id
+                        ));
+                    }
                 }
                 BenchmarkFamily::SdxlUnet => {
                     if case.provider != "sdxl" || case.frames != 1 {
@@ -379,6 +552,12 @@ impl BenchmarkMatrix {
                     }
                     if case.width >= 2048 && case.height >= 2048 {
                         decode_bound.insert(case.family);
+                    }
+                    if tiled.temporal_tile_frames.is_some() {
+                        errors.push(format!(
+                            "SDXL case {:?} must not carry temporal tiling",
+                            case.id
+                        ));
                     }
                 }
             }
@@ -691,6 +870,57 @@ pub struct BuildProvenance {
     pub source_revision: String,
     pub mlx_revision: String,
     pub source_dirty: bool,
+    pub cargo_profile: String,
+    pub opt_level: String,
+    pub debug_assertions: bool,
+    pub target_triple: String,
+    pub cargo_features: Vec<String>,
+    pub target_features: Vec<String>,
+    pub rustflags: Vec<String>,
+    pub rustc_version: String,
+    pub executable_sha256: String,
+}
+
+impl BuildProvenance {
+    fn validate(&self, errors: &mut Vec<String>) {
+        if !is_lower_hex_revision(&self.source_revision)
+            || !is_lower_hex_revision(&self.mlx_revision)
+            || self.source_dirty
+            || self.cargo_profile.trim().is_empty()
+            || self.opt_level.trim().is_empty()
+            || self.target_triple.trim().is_empty()
+            || self.rustc_version.trim().is_empty()
+            || !is_sha256(&self.executable_sha256)
+            || self
+                .cargo_features
+                .windows(2)
+                .any(|window| window[0] >= window[1])
+            || self
+                .target_features
+                .windows(2)
+                .any(|window| window[0] >= window[1])
+        {
+            errors.push(
+                "campaign requires a clean, exact source/dependency/executable build receipt"
+                    .to_owned(),
+            );
+        }
+    }
+
+    /// The documented acceptance build. Diagnostic campaigns may use other fully recorded builds,
+    /// but a debug/custom-codegen executable must never set `acceptanceComplete`.
+    pub fn is_acceptance_build(&self) -> bool {
+        self.cargo_profile == "release"
+            && self.opt_level == "3"
+            && !self.debug_assertions
+            && self.target_triple == "aarch64-apple-darwin"
+            && self
+                .cargo_features
+                .iter()
+                .map(String::as_str)
+                .eq(["media", "perf-bench"])
+            && self.rustflags.is_empty()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -754,6 +984,17 @@ fn validate_selection(
     for id in selected {
         if matrix.variant(id).is_none() {
             errors.push(format!("selected unknown variant {id:?}"));
+        }
+    }
+    for id in selected {
+        let Some(variant) = matrix.variant(id) else {
+            continue;
+        };
+        if !unique.contains(variant.control_variant.as_str()) {
+            errors.push(format!(
+                "selected variant {:?} requires its control {:?}",
+                variant.id, variant.control_variant
+            ));
         }
     }
     if !errors.is_empty() {
@@ -895,12 +1136,18 @@ impl FrozenCampaign {
         {
             errors.push("campaign selected variants are not in canonical matrix order".to_owned());
         }
-        if self.created_at_unix_millis == 0
-            || !is_lower_hex_revision(&self.build.source_revision)
-            || !is_lower_hex_revision(&self.build.mlx_revision)
-            || self.build.source_dirty
+        if self.created_at_unix_millis == 0 {
+            errors.push("campaign requires a nonzero creation timestamp".to_owned());
+        }
+        self.build.validate(&mut errors);
+        if self.mode == CampaignMode::RequiredAll
+            && self.matrix.is_canonical_acceptance_matrix()
+            && !self.build.is_acceptance_build()
         {
-            errors.push("campaign requires a clean, exact source and mlx build receipt".to_owned());
+            errors.push(
+                "the canonical required-all campaign requires the documented release build"
+                    .to_owned(),
+            );
         }
         if self.host.rustc_version.trim().is_empty()
             || self.host.os_version.trim().is_empty()
@@ -1083,6 +1330,12 @@ impl FrozenCampaign {
             .find(|receipt| receipt.provider == provider)
             .map(|receipt| receipt.available_toggles.as_slice())
     }
+
+    pub fn acceptance_complete(&self) -> bool {
+        self.mode == CampaignMode::RequiredAll
+            && self.matrix.is_canonical_acceptance_matrix()
+            && self.build.is_acceptance_build()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1199,6 +1452,7 @@ pub struct DiagnosticRecord {
     pub outcome: String,
     pub count: u64,
     pub reason: Option<String>,
+    pub production_evidence_sha256: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -1292,6 +1546,94 @@ fn validate_phase(name: &str, phase: &PhaseMetrics, errors: &mut Vec<String>) {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum GeometryDecodeDecision {
+    Unchanged,
+    GeometryTiled,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct GeometryDecodeReceipt {
+    decision: GeometryDecodeDecision,
+    production_evidence_sha256: Option<String>,
+}
+
+fn geometry_decode_receipt(diagnostics: &[DiagnosticRecord]) -> Option<GeometryDecodeReceipt> {
+    let record = diagnostics
+        .iter()
+        .find(|record| record.domain == "decode_policy")?;
+    let decision = match record.outcome.as_str() {
+        "unchanged" => GeometryDecodeDecision::Unchanged,
+        "geometry_tiled" => GeometryDecodeDecision::GeometryTiled,
+        _ => return None,
+    };
+    Some(GeometryDecodeReceipt {
+        decision,
+        production_evidence_sha256: record.production_evidence_sha256.clone(),
+    })
+}
+
+fn validate_geometry_decode_receipt(
+    variant: &VariantPlan,
+    diagnostics: &[DiagnosticRecord],
+    errors: &mut Vec<String>,
+) {
+    let requested = variant
+        .toggles
+        .contains(&OptimizationToggle::GeometryAwareDecode);
+    let records: Vec<_> = diagnostics
+        .iter()
+        .filter(|record| record.domain == "decode_policy")
+        .collect();
+    if !requested {
+        if !records.is_empty() {
+            errors.push(format!(
+                "non-P9 variant {:?} forbids decode_policy receipts",
+                variant.id
+            ));
+        }
+        return;
+    }
+    if records.len() != 1 {
+        errors.push(format!(
+            "P9 variant {:?} requires exactly one decode_policy receipt",
+            variant.id
+        ));
+        return;
+    }
+    let record = records[0];
+    if record.site != OptimizationToggle::GeometryAwareDecode.as_str()
+        || record.count != 1
+        || record.reason.is_some()
+    {
+        errors.push(format!(
+            "P9 variant {:?} has an invalid decode_policy identity/count",
+            variant.id
+        ));
+        return;
+    }
+    match record.outcome.as_str() {
+        "unchanged" if record.production_evidence_sha256.is_none() => {}
+        "geometry_tiled"
+            if record
+                .production_evidence_sha256
+                .as_deref()
+                .is_some_and(is_sha256) => {}
+        "geometry_tiled" => errors.push(format!(
+            "P9 variant {:?} requires a production-evidence SHA-256 for geometry_tiled",
+            variant.id
+        )),
+        "unchanged" => errors.push(format!(
+            "P9 variant {:?} forbids production evidence for unchanged",
+            variant.id
+        )),
+        outcome => errors.push(format!(
+            "P9 variant {:?} has unknown decode_policy outcome {outcome:?}",
+            variant.id
+        )),
+    }
+}
+
 fn validate_toggle_receipts(
     variant: &VariantPlan,
     diagnostics: &[DiagnosticRecord],
@@ -1312,18 +1654,23 @@ fn validate_toggle_receipts(
             diagnostic.site.as_str(),
             diagnostic.outcome.as_str(),
             diagnostic.reason.as_deref(),
+            diagnostic.production_evidence_sha256.as_deref(),
         )) {
             errors
                 .push("diagnostic records must be aggregated into an exact unique set".to_owned());
         }
+        if diagnostic.domain != "decode_policy" && diagnostic.production_evidence_sha256.is_some() {
+            errors.push("only decode_policy may carry a production-evidence SHA-256".to_owned());
+        }
     }
+    validate_geometry_decode_receipt(variant, diagnostics, errors);
     let toggle_records: Vec<_> = diagnostics
         .iter()
         .filter(|diagnostic| diagnostic.domain == "toggle")
         .collect();
     if requested.is_empty() {
         if !toggle_records.is_empty() {
-            errors.push("baseline forbids every toggle terminal receipt".to_owned());
+            errors.push("toggle-free variants forbid every toggle terminal receipt".to_owned());
         }
         return;
     }
@@ -1350,6 +1697,7 @@ fn validate_toggle_receipts(
             || records[0].outcome != "applied"
             || records[0].count == 0
             || records[0].reason.is_some()
+            || records[0].production_evidence_sha256.is_some()
         {
             errors.push(format!(
                 "variant {:?} requires exactly one terminal Applied record and no fallback/unavailable for {toggle}",
@@ -1613,6 +1961,8 @@ pub struct ComparisonRow {
     pub median_denoise_sampled_footprint_peak_bytes: u64,
     pub median_decode_sampled_footprint_peak_bytes: u64,
     pub binding_phase: BindingPhase,
+    pub control_variant_id: String,
+    pub speedup_vs_control: f64,
     pub speedup_vs_baseline: f64,
 }
 
@@ -1630,6 +1980,26 @@ pub struct BenchmarkSummary {
     pub host: HostIdentity,
     pub binding_rule: String,
     pub rows: Vec<ComparisonRow>,
+}
+
+fn stable_geometry_decode_receipt(
+    record: &RunRecord,
+) -> Result<GeometryDecodeReceipt, ContractError> {
+    let receipts: BTreeSet<_> = record
+        .measurements
+        .iter()
+        .filter_map(|measurement| geometry_decode_receipt(&measurement.diagnostics))
+        .collect();
+    if receipts.len() != 1 || record.measurements.is_empty() {
+        return Err(ContractError::new(vec![format!(
+            "case {} variant {} has an unstable or missing decode_policy receipt",
+            record.case_id, record.variant.id
+        )]));
+    }
+    Ok(receipts
+        .into_iter()
+        .next()
+        .expect("one stable decode-policy receipt"))
 }
 
 pub fn build_summary(
@@ -1657,23 +2027,65 @@ pub fn build_summary(
         }
     }
     for case in &campaign.matrix.cases {
-        let Some(baseline) = by_key.get(&(case.id.as_str(), "baseline")) else {
-            continue;
-        };
-        let baseline_digest = &baseline.measurements[0].output.sha256;
-        for variant in &campaign.selected_variants {
-            let Some(record) = by_key.get(&(case.id.as_str(), variant.as_str())) else {
+        for variant_id in &campaign.selected_variants {
+            let Some(plan) = campaign.matrix.variant(variant_id) else {
                 continue;
             };
-            if record
-                .measurements
-                .iter()
-                .any(|measurement| measurement.output.sha256 != *baseline_digest)
-            {
-                errors.push(format!(
-                    "case {} variant {} output digest differs from baseline",
-                    case.id, variant
-                ));
+            let Some(control) = by_key.get(&(case.id.as_str(), plan.control_variant.as_str()))
+            else {
+                continue;
+            };
+            let Some(record) = by_key.get(&(case.id.as_str(), variant_id.as_str())) else {
+                continue;
+            };
+            let control_digest = &control.measurements[0].output.sha256;
+            match plan.output_comparison {
+                OutputComparison::Deterministic => {}
+                OutputComparison::ExactControl => {
+                    if record
+                        .measurements
+                        .iter()
+                        .any(|measurement| measurement.output.sha256 != *control_digest)
+                    {
+                        errors.push(format!(
+                            "case {} variant {} output digest differs from exact control {}",
+                            case.id, variant_id, plan.control_variant
+                        ));
+                    }
+                    if plan
+                        .toggles
+                        .contains(&OptimizationToggle::GeometryAwareDecode)
+                    {
+                        match (
+                            stable_geometry_decode_receipt(record),
+                            stable_geometry_decode_receipt(control),
+                        ) {
+                            (Ok(actual), Ok(expected)) if actual == expected => {}
+                            (Ok(_), Ok(_)) => errors.push(format!(
+                                "case {} variant {} decode_policy differs from control {}",
+                                case.id, variant_id, plan.control_variant
+                            )),
+                            (Err(error), _) | (_, Err(error)) => errors.extend(error.messages),
+                        }
+                    }
+                }
+                OutputComparison::GeometryAwareControl => {
+                    match stable_geometry_decode_receipt(record) {
+                        Ok(receipt)
+                            if receipt.decision == GeometryDecodeDecision::Unchanged
+                                && record.measurements.iter().any(|measurement| {
+                                    measurement.output.sha256 != *control_digest
+                                }) =>
+                        {
+                            errors.push(format!(
+                                "case {} variant {} claimed unchanged decode_policy but differs from control {}",
+                                case.id, variant_id, plan.control_variant
+                            ));
+                        }
+                        Ok(_) => {}
+                        Err(error) => errors.extend(error.messages),
+                    }
+                }
             }
         }
     }
@@ -1693,6 +2105,18 @@ pub fn build_summary(
         );
         for variant_id in &campaign.selected_variants {
             let record = by_key[&(case.id.as_str(), variant_id.as_str())];
+            let plan = campaign
+                .matrix
+                .variant(variant_id)
+                .expect("selected variant belongs to the validated matrix");
+            let control = by_key[&(case.id.as_str(), plan.control_variant.as_str())];
+            let control_total = median_f64(
+                control
+                    .measurements
+                    .iter()
+                    .map(|measurement| measurement.total_seconds)
+                    .collect(),
+            );
             let median_phase_f64 = |pick: fn(&PhaseSet) -> &PhaseMetrics| {
                 median_f64(
                     record
@@ -1790,6 +2214,8 @@ pub fn build_summary(
                 median_denoise_sampled_footprint_peak_bytes: denoise_footprint,
                 median_decode_sampled_footprint_peak_bytes: decode_footprint,
                 binding_phase,
+                control_variant_id: plan.control_variant.clone(),
+                speedup_vs_control: control_total / total,
                 speedup_vs_baseline: baseline_total / total,
             });
         }
@@ -1799,7 +2225,7 @@ pub fn build_summary(
         campaign_id: campaign.campaign_id.clone(),
         benchmark_id: campaign.matrix.benchmark_id.clone(),
         mode: campaign.mode,
-        acceptance_complete: campaign.mode == CampaignMode::RequiredAll,
+        acceptance_complete: campaign.acceptance_complete(),
         matrix_sha256: campaign.matrix_sha256.clone(),
         artifact_set_sha256: campaign.artifact_set_sha256.clone(),
         build: campaign.build.clone(),
@@ -1863,6 +2289,23 @@ mod tests {
         }
     }
 
+    fn fixture_build() -> BuildProvenance {
+        BuildProvenance {
+            source_revision: "a".repeat(40),
+            mlx_revision: "b".repeat(40),
+            source_dirty: false,
+            cargo_profile: "release".to_owned(),
+            opt_level: "3".to_owned(),
+            debug_assertions: false,
+            target_triple: "aarch64-apple-darwin".to_owned(),
+            cargo_features: vec!["media".to_owned(), "perf-bench".to_owned()],
+            target_features: vec!["neon".to_owned()],
+            rustflags: Vec::new(),
+            rustc_version: "rustc test".to_owned(),
+            executable_sha256: "c".repeat(64),
+        }
+    }
+
     fn fixture_campaign() -> (FrozenCampaign, tempfile::TempDir) {
         let mut matrix = committed_matrix();
         let root = tempfile::tempdir().unwrap();
@@ -1913,11 +2356,7 @@ mod tests {
             matrix,
             &manifest,
             selected_variants,
-            BuildProvenance {
-                source_revision: "a".repeat(40),
-                mlx_revision: "b".repeat(40),
-                source_dirty: false,
-            },
+            fixture_build(),
             HostIdentity {
                 rustc_version: "rustc test".to_owned(),
                 os_version: "macOS test".to_owned(),
@@ -1935,7 +2374,7 @@ mod tests {
         let case = campaign.matrix.case(case_id).unwrap();
         let artifact = campaign.artifact(&case.artifact_key).unwrap().clone();
         let variant = campaign.matrix.variant(variant_id).unwrap().clone();
-        let diagnostics: Vec<DiagnosticRecord> = variant
+        let mut diagnostics: Vec<DiagnosticRecord> = variant
             .toggles
             .iter()
             .map(|toggle| DiagnosticRecord {
@@ -1944,8 +2383,22 @@ mod tests {
                 outcome: "applied".to_owned(),
                 count: 7,
                 reason: None,
+                production_evidence_sha256: None,
             })
             .collect();
+        if variant
+            .toggles
+            .contains(&OptimizationToggle::GeometryAwareDecode)
+        {
+            diagnostics.push(DiagnosticRecord {
+                domain: "decode_policy".to_owned(),
+                site: OptimizationToggle::GeometryAwareDecode.as_str().to_owned(),
+                outcome: "unchanged".to_owned(),
+                count: 1,
+                reason: None,
+                production_evidence_sha256: None,
+            });
+        }
         let encode_ns = 1_000_000_000;
         let denoise_ns = 2_000_000_000;
         let decode_ns = 1_000_000_000;
@@ -2024,17 +2477,99 @@ mod tests {
         }
     }
 
+    fn set_geometry_decode_policy(
+        run: &mut RunRecord,
+        outcome: &str,
+        production_evidence_sha256: Option<&str>,
+    ) {
+        for measurement in &mut run.measurements {
+            let receipt = measurement
+                .diagnostics
+                .iter_mut()
+                .find(|record| record.domain == "decode_policy")
+                .expect("P9 fixture has a decode-policy receipt");
+            receipt.outcome = outcome.to_owned();
+            receipt.production_evidence_sha256 = production_evidence_sha256.map(str::to_owned);
+        }
+    }
+
     #[test]
     fn committed_matrix_is_complete_and_content_pinned() {
         let matrix = committed_matrix();
         matrix.validate().unwrap();
         assert_eq!(matrix.cases.len(), 9);
-        assert_eq!(matrix.variants.len(), 7);
+        assert_eq!(matrix.variants.len(), 8);
+        assert!(matrix.is_canonical_acceptance_matrix());
         assert_eq!(matrix.artifacts.len(), 3);
         assert!(matrix
             .artifacts
             .iter()
             .all(|artifact| is_sha256(&artifact.inventory_sha256)));
+    }
+
+    #[test]
+    fn structurally_valid_custom_matrix_is_never_acceptance_canonical() {
+        let mut matrix = committed_matrix();
+        matrix.cases[0].prompt.push_str(" diagnostic override");
+
+        matrix.validate().unwrap();
+        assert!(!matrix.is_canonical_acceptance_matrix());
+    }
+
+    #[test]
+    fn matrix_requires_fixed_tiled_control_for_the_p5_comparison() {
+        let matrix = committed_matrix();
+        assert!(validate_selection(
+            &matrix,
+            &[
+                "baseline".to_owned(),
+                "indexed_decode_accumulator".to_owned(),
+            ]
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("requires its control \"tiled_decode_control\""));
+
+        let mut invalid = matrix;
+        invalid
+            .variants
+            .iter_mut()
+            .find(|variant| variant.id == "indexed_decode_accumulator")
+            .unwrap()
+            .decode_control = DecodeControlMode::Default;
+        assert!(invalid
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("wrong decode/control/correctness contract"));
+    }
+
+    #[test]
+    fn acceptance_build_is_exact_and_fully_receipted() {
+        let build = fixture_build();
+        assert!(build.is_acceptance_build());
+
+        let mutations: [fn(&mut BuildProvenance); 6] = [
+            |build: &mut BuildProvenance| build.cargo_profile = "dev".to_owned(),
+            |build: &mut BuildProvenance| build.opt_level = "2".to_owned(),
+            |build: &mut BuildProvenance| build.debug_assertions = true,
+            |build: &mut BuildProvenance| build.target_triple = "x86_64-apple-darwin".to_owned(),
+            |build: &mut BuildProvenance| build.cargo_features.push("audio".to_owned()),
+            |build: &mut BuildProvenance| build.rustflags.push("-Ctarget-cpu=native".to_owned()),
+        ];
+        for mutate in mutations {
+            let mut changed = build.clone();
+            mutate(&mut changed);
+            assert!(!changed.is_acceptance_build());
+        }
+
+        let mut invalid = build;
+        invalid.executable_sha256 = "not-a-digest".to_owned();
+        let mut errors = Vec::new();
+        invalid.validate(&mut errors);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("exact source/dependency/executable build receipt")));
     }
 
     #[test]
@@ -2210,12 +2745,13 @@ mod tests {
             outcome: "applied".to_owned(),
             count: 1,
             reason: None,
+            production_evidence_sha256: None,
         });
         assert!(baseline
             .validate_against(&campaign)
             .unwrap_err()
             .to_string()
-            .contains("baseline forbids"));
+            .contains("toggle-free variants forbid"));
 
         let mut retained = valid_run(&campaign, "qwen-q4-512", "retained_compilation");
         retained.measurements[0].diagnostics.push(DiagnosticRecord {
@@ -2224,6 +2760,7 @@ mod tests {
             outcome: "fallback".to_owned(),
             count: 1,
             reason: Some("controlled".to_owned()),
+            production_evidence_sha256: None,
         });
         retained.measurements[0].diagnostics.push(DiagnosticRecord {
             domain: "toggle".to_owned(),
@@ -2231,6 +2768,7 @@ mod tests {
             outcome: "applied".to_owned(),
             count: 1,
             reason: None,
+            production_evidence_sha256: None,
         });
         let error = retained
             .validate_against(&campaign)
@@ -2264,10 +2802,16 @@ mod tests {
         phase.coverage.max_gap_micros = 2_000_000;
         let error = run.validate_against(&campaign).unwrap_err().to_string();
         assert!(error.contains("fixed-cadence sampling coverage"));
+
+        let mut run = valid_run(&campaign, "qwen-q4-512", "baseline");
+        run.measurements[0].phases.denoise.coverage.max_gap_micros =
+            (MEMORY_MAX_GAP_MULTIPLIER + 1) * MEMORY_SAMPLE_INTERVAL_MICROS;
+        let error = run.validate_against(&campaign).unwrap_err().to_string();
+        assert!(error.contains("fixed-cadence sampling coverage"));
     }
 
     #[test]
-    fn summary_rejects_cross_variant_digest_changes_and_binds_same_sample_footprint() {
+    fn summary_enforces_declared_controls_and_accepts_evidence_backed_p9_drift() {
         let (campaign, _root) = fixture_campaign();
         let mut records = Vec::new();
         for case in &campaign.matrix.cases {
@@ -2287,7 +2831,7 @@ mod tests {
         assert!(build_summary(&campaign, &records)
             .unwrap_err()
             .to_string()
-            .contains("differs from baseline"));
+            .contains("differs from exact control baseline"));
 
         {
             let changed = records
@@ -2298,13 +2842,136 @@ mod tests {
                 measurement.output.sha256 = "d".repeat(64);
             }
         }
+        for variant_id in ["geometry_aware_decode", "all_on"] {
+            let changed = records
+                .iter_mut()
+                .find(|run| run.case_id == "qwen-q4-512" && run.variant.id == variant_id)
+                .unwrap();
+            set_geometry_decode_policy(changed, "geometry_tiled", Some(&"9".repeat(64)));
+            for measurement in &mut changed.measurements {
+                measurement.output.sha256 = "e".repeat(64);
+            }
+        }
+        for variant_id in ["tiled_decode_control", "indexed_decode_accumulator"] {
+            let changed = records
+                .iter_mut()
+                .find(|run| run.case_id == "qwen-q4-512" && run.variant.id == variant_id)
+                .unwrap();
+            for measurement in &mut changed.measurements {
+                measurement.output.sha256 = "f".repeat(64);
+            }
+        }
         let summary = build_summary(&campaign, &records).unwrap();
         assert_eq!(summary.binding_rule, MEMORY_BINDING_RULE);
-        assert!(summary.acceptance_complete);
+        assert!(!summary.acceptance_complete);
+        assert_eq!(
+            summary
+                .rows
+                .iter()
+                .find(|row| {
+                    row.case_id == "qwen-q4-512" && row.variant_id == "indexed_decode_accumulator"
+                })
+                .unwrap()
+                .control_variant_id,
+            "tiled_decode_control"
+        );
+        assert_eq!(
+            summary
+                .rows
+                .iter()
+                .find(|row| row.case_id == "qwen-q4-512" && row.variant_id == "all_on")
+                .unwrap()
+                .control_variant_id,
+            "geometry_aware_decode"
+        );
         assert!(summary
             .rows
             .iter()
             .all(|row| row.binding_phase == BindingPhase::Decode));
+    }
+
+    #[test]
+    fn summary_rejects_missing_mismatched_and_false_p9_policy_receipts() {
+        let (campaign, _root) = fixture_campaign();
+        let records = || {
+            let mut records = Vec::new();
+            for case in &campaign.matrix.cases {
+                for variant in &campaign.selected_variants {
+                    records.push(valid_run(&campaign, &case.id, variant));
+                }
+            }
+            records
+        };
+
+        let mut missing = records();
+        missing
+            .iter_mut()
+            .find(|run| run.case_id == "qwen-q4-512" && run.variant.id == "geometry_aware_decode")
+            .unwrap()
+            .measurements[0]
+            .diagnostics
+            .retain(|record| record.domain != "decode_policy");
+        assert!(build_summary(&campaign, &missing)
+            .unwrap_err()
+            .to_string()
+            .contains("requires exactly one decode_policy receipt"));
+
+        let mut false_unchanged = records();
+        let p9 = false_unchanged
+            .iter_mut()
+            .find(|run| run.case_id == "qwen-q4-512" && run.variant.id == "geometry_aware_decode")
+            .unwrap();
+        for measurement in &mut p9.measurements {
+            measurement.output.sha256 = "e".repeat(64);
+        }
+        assert!(build_summary(&campaign, &false_unchanged)
+            .unwrap_err()
+            .to_string()
+            .contains("claimed unchanged decode_policy but differs from control baseline"));
+
+        let mut no_evidence = records();
+        let p9 = no_evidence
+            .iter_mut()
+            .find(|run| run.case_id == "qwen-q4-512" && run.variant.id == "geometry_aware_decode")
+            .unwrap();
+        set_geometry_decode_policy(p9, "geometry_tiled", None);
+        assert!(build_summary(&campaign, &no_evidence)
+            .unwrap_err()
+            .to_string()
+            .contains("requires a production-evidence SHA-256"));
+
+        let mut mismatched = records();
+        let p9 = mismatched
+            .iter_mut()
+            .find(|run| run.case_id == "qwen-q4-512" && run.variant.id == "geometry_aware_decode")
+            .unwrap();
+        set_geometry_decode_policy(p9, "geometry_tiled", Some(&"8".repeat(64)));
+        let all_on = mismatched
+            .iter_mut()
+            .find(|run| run.case_id == "qwen-q4-512" && run.variant.id == "all_on")
+            .unwrap();
+        set_geometry_decode_policy(all_on, "geometry_tiled", Some(&"9".repeat(64)));
+        assert!(build_summary(&campaign, &mismatched)
+            .unwrap_err()
+            .to_string()
+            .contains("decode_policy differs from control geometry_aware_decode"));
+
+        let mut unstable = records();
+        let p9 = unstable
+            .iter_mut()
+            .find(|run| run.case_id == "qwen-q4-512" && run.variant.id == "geometry_aware_decode")
+            .unwrap();
+        let receipt = p9.measurements[0]
+            .diagnostics
+            .iter_mut()
+            .find(|record| record.domain == "decode_policy")
+            .unwrap();
+        receipt.outcome = "geometry_tiled".to_owned();
+        receipt.production_evidence_sha256 = Some("7".repeat(64));
+        assert!(build_summary(&campaign, &unstable)
+            .unwrap_err()
+            .to_string()
+            .contains("unstable or missing decode_policy receipt"));
     }
 
     #[test]
@@ -2325,7 +2992,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_v1_run_cannot_deserialize_as_v2() {
+    fn legacy_v1_run_cannot_deserialize_as_current_schema() {
         let value = serde_json::json!({
             "schemaVersion": "sceneworks.mlx-perf-run.v1",
             "benchmarkId": "legacy"
