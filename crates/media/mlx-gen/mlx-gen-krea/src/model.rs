@@ -1768,8 +1768,8 @@ mod tests {
     #[test]
     fn native_load_empty_adapters_preserves_load() {
         // sc-14119: an empty adapter slice keeps the native single-file load behaving as it always has —
-        // it still runs the turnkey config read first (and, with a bogus base dir, fails there), so the
-        // new parameter is inert for the t2i/img2img callers that pass `&[]`.
+        // it still reaches the native base validation (and, with a bogus base dir, fails on the first
+        // required asset), so the new parameter is inert for t2i/img2img callers that pass `&[]`.
         let e = load_from_native_dit_file(
             "/nonexistent-krea/dit.safetensors",
             "/nonexistent-krea",
@@ -1780,16 +1780,16 @@ mod tests {
         .expect("missing base snapshot → err")
         .to_string();
         assert!(
-            e.contains("config.json") || e.contains("read"),
-            "expected the missing-base config-read error, got: {e}"
+            e.contains("native base text encoder asset facts"),
+            "expected the fail-closed missing-base asset error, got: {e}"
         );
     }
 
     #[test]
     fn native_load_accepts_adapters_without_early_rejection() {
         // sc-14119: a non-empty adapter slice is threaded through the native loader (parity with the
-        // snapshot `load` path) and must NOT be rejected at the door. With a bogus base the load still
-        // fails first at the turnkey config read — the adapter fold (`KreaHeavy::apply_adapters`) is
+        // snapshot `load` path) and must NOT be rejected at the door. With a bogus base the load fails
+        // on the first required base asset — the adapter fold (`KreaHeavy::apply_adapters`) is
         // weights-gated and exercised in the #[ignore] real-weight harness below.
         let adapters = vec![AdapterSpec::new(
             std::path::PathBuf::from("/nonexistent-krea/krea2_identity_edit.safetensors"),
@@ -1811,8 +1811,8 @@ mod tests {
             "adapters must be accepted by the native loader, got: {e}"
         );
         assert!(
-            e.contains("config.json") || e.contains("read"),
-            "expected the missing-base config-read error, got: {e}"
+            e.contains("native base text encoder asset facts"),
+            "expected the fail-closed missing-base asset error, got: {e}"
         );
     }
 
@@ -1833,7 +1833,7 @@ mod tests {
         .expect("missing required base components must fail")
         .to_string();
         assert!(
-            e.contains("native base snapshot asset facts"),
+            e.contains("native base text encoder asset facts"),
             "expected the post-config asset-sizing stage, got: {e}"
         );
         assert!(!e.contains("config.json"), "config was valid, got: {e}");
