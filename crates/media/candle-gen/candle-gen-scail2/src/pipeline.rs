@@ -17,7 +17,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use candle_gen::candle_core::{DType, Device, Tensor};
+use candle_gen::candle_core::{safetensors as cst, DType, Device, Tensor};
+use candle_gen::candle_nn::var_builder::Rename;
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
@@ -47,6 +48,65 @@ const DEFAULT_FPS: u32 = 16;
 /// SceneWorks/engine model id (matches `mlx-gen-scail2` so a consumer resolves the same engine across
 /// backends). A still image is `num_frames == 1`.
 pub const MODEL_ID: &str = "scail2_14b";
+
+/// The exact files in one self-contained `SceneWorks/scail2-mlx` tier. The MLX and candle providers
+/// consume these same bytes; q4/q8 remain MLX-only because their DiT is MLX-packed, while the dense
+/// bf16 tier is backend-shared.
+pub const SHARED_TIER_FILES: &[&str] = &[
+    "config.json",
+    "dit.safetensors",
+    "t5_encoder.safetensors",
+    "tokenizer.json",
+    "clip.safetensors",
+    "vae.safetensors",
+];
+
+/// On-disk SCAIL-2 layouts accepted by the candle provider.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SnapshotLayout {
+    /// Flat, self-contained tier from `SceneWorks/scail2-mlx` (the Model Manager package).
+    SharedMlxTier,
+    /// Original candle-only component tree retained for explicit/manual overrides.
+    LegacyComponents,
+}
+
+/// Classify a SCAIL-2 snapshot without loading tensor bytes. Completeness fails closed: a partial
+/// shared tier is not mistaken for the legacy layout, and a legacy tree must contain every component
+/// the provider opens.
+pub fn snapshot_layout(root: &Path) -> gen_core::Result<SnapshotLayout> {
+    if SHARED_TIER_FILES
+        .iter()
+        .all(|file| root.join(file).is_file())
+    {
+        return Ok(SnapshotLayout::SharedMlxTier);
+    }
+    let legacy_dirs = ["transformer", "text_encoder", "vae", "clip"];
+    if legacy_dirs.iter().all(|sub| root.join(sub).is_dir())
+        && root.join("tokenizer/tokenizer.json").is_file()
+    {
+        return Ok(SnapshotLayout::LegacyComponents);
+    }
+    let missing_shared: Vec<&str> = SHARED_TIER_FILES
+        .iter()
+        .copied()
+        .filter(|file| !root.join(file).is_file())
+        .collect();
+    let mut missing_legacy: Vec<String> = legacy_dirs
+        .iter()
+        .filter(|sub| !root.join(sub).is_dir())
+        .map(|sub| format!("{sub}/"))
+        .collect();
+    if !root.join("tokenizer/tokenizer.json").is_file() {
+        missing_legacy.push("tokenizer/tokenizer.json".to_owned());
+    }
+    Err(gen_core::Error::Msg(format!(
+        "scail2: incomplete snapshot at {}: shared SceneWorks/scail2-mlx tier is missing [{}]; \
+         legacy candle layout is missing [{}]",
+        root.display(),
+        missing_shared.join(", "),
+        missing_legacy.join(", ")
+    )))
+}
 
 /// Stable identity + advertised capabilities for SCAIL-2 (Wan2.1-14B I2V end-to-end character
 /// animation: reference image + driving video + color-coded masks → animated/identity-replaced video;
@@ -122,12 +182,62 @@ fn component_vb(root: &Path, device: &Device, sub: &str) -> CResult<VarBuilder<'
     candle_gen::component_vb(root, sub, DType::F32, device, "scail2")
 }
 
+/// Translate the candle/Hugging Face UMT5 key requested by [`Umt5Encoder`] to the normalized key in
+/// the shared MLX tier's `t5_encoder.safetensors`. This is a pure key projection: tensor bytes and
+/// shapes are unchanged.
+fn shared_umt5_key(key: &str) -> String {
+    if key == "shared.weight" {
+        return "token_embedding.weight".to_owned();
+    }
+    if key == "encoder.final_layer_norm.weight" {
+        return "norm.weight".to_owned();
+    }
+    let Some(rest) = key.strip_prefix("encoder.block.") else {
+        return key.to_owned();
+    };
+    let Some((block, leaf)) = rest.split_once('.') else {
+        return key.to_owned();
+    };
+    let mapped = match leaf {
+        "layer.0.layer_norm.weight" => "norm1.weight",
+        "layer.0.SelfAttention.q.weight" => "attn.q.weight",
+        "layer.0.SelfAttention.k.weight" => "attn.k.weight",
+        "layer.0.SelfAttention.v.weight" => "attn.v.weight",
+        "layer.0.SelfAttention.o.weight" => "attn.o.weight",
+        "layer.0.SelfAttention.relative_attention_bias.weight" => "pos_embedding.embedding.weight",
+        "layer.1.layer_norm.weight" => "norm2.weight",
+        "layer.1.DenseReluDense.wi_0.weight" => "ffn.gate_proj.weight",
+        "layer.1.DenseReluDense.wi_1.weight" => "ffn.fc1.weight",
+        "layer.1.DenseReluDense.wo.weight" => "ffn.fc2.weight",
+        _ => return key.to_owned(),
+    };
+    format!("blocks.{block}.{mapped}")
+}
+
+fn shared_umt5_vb(root: &Path, device: &Device) -> CResult<VarBuilder<'static>> {
+    let file = root.join("t5_encoder.safetensors");
+    let inner = candle_gen::mmap_var_builder(std::slice::from_ref(&file), DType::F32, device)?;
+    let renamer: Box<dyn Fn(&str) -> String + Send + Sync> = Box::new(shared_umt5_key);
+    Ok(VarBuilder::from_backend(
+        Box::new(Rename::new(inner, renamer)),
+        DType::F32,
+        device.clone(),
+    ))
+}
+
+fn shared_vae_vb(root: &Path, device: &Device) -> CResult<VarBuilder<'static>> {
+    let map = cst::load(root.join("vae.safetensors"), &Device::Cpu)?;
+    let map = candle_gen::remap_vae_wan_to_diffusers(map)?;
+    Ok(VarBuilder::from_tensors(map, DType::F32, device))
+}
+
 /// The loaded SCAIL-2 model: resolved config + snapshot dir, with the heavy components (DiT / VAE /
 /// UMT5 / CLIP) loaded lazily on first generate and cached.
 pub struct Scail2 {
     descriptor: ModelDescriptor,
     config: Scail2Config,
     root: PathBuf,
+    layout: SnapshotLayout,
     device: Device,
     /// Inference adapters (LoRA / LoKr / LoHa / lightx2v lightning diff-patch) folded into the DiT
     /// before build; empty for the stock path (sc-6838).
@@ -151,10 +261,23 @@ impl Scail2 {
     /// bf16, so `from_tensors` never casts on the GPU.)
     fn transformer_vb(&self) -> CResult<VarBuilder<'static>> {
         if self.adapters.is_empty() {
-            return component_vb(&self.root, &self.device, "transformer");
+            return match self.layout {
+                SnapshotLayout::SharedMlxTier => candle_gen::mmap_var_builder(
+                    &[self.root.join("dit.safetensors")],
+                    DType::F32,
+                    &self.device,
+                ),
+                SnapshotLayout::LegacyComponents => {
+                    component_vb(&self.root, &self.device, "transformer")
+                }
+            };
         }
-        let dir = self.root.join("transformer");
-        let files = candle_gen::sorted_safetensors(&dir, "scail2")?;
+        let files = match self.layout {
+            SnapshotLayout::SharedMlxTier => vec![self.root.join("dit.safetensors")],
+            SnapshotLayout::LegacyComponents => {
+                candle_gen::sorted_safetensors(&self.root.join("transformer"), "scail2")?
+            }
+        };
         let mut tensors: HashMap<String, Tensor> = HashMap::new();
         for f in &files {
             let part = candle_gen::candle_core::safetensors::load(f, &Device::Cpu)?;
@@ -174,20 +297,37 @@ impl Scail2 {
     }
 
     fn load_components(&self) -> CResult<Components> {
-        let te = Umt5Encoder::new(
-            &TextEncoderConfig::umt5_xxl(),
-            component_vb(&self.root, &self.device, "text_encoder")?,
-        )?;
+        let te_vb = match self.layout {
+            SnapshotLayout::SharedMlxTier => shared_umt5_vb(&self.root, &self.device)?,
+            SnapshotLayout::LegacyComponents => {
+                component_vb(&self.root, &self.device, "text_encoder")?
+            }
+        };
+        let te = Umt5Encoder::new(&TextEncoderConfig::umt5_xxl(), te_vb)?;
         let dit = Scail2Dit::new(self.transformer_vb()?, &self.config)?;
-        let vae = WanVae16::new_with_encoder(
-            &Vae16Config::wan21(),
-            component_vb(&self.root, &self.device, "vae")?,
-        )?;
-        let clip = ScailClip::new(
-            component_vb(&self.root, &self.device, "clip")?,
-            &ClipVisionConfig::vit_h_14(),
-        )?;
-        let tok = crate::generate::build_tokenizer(&self.root, &TextEncoderConfig::umt5_xxl())?;
+        let vae_vb = match self.layout {
+            SnapshotLayout::SharedMlxTier => shared_vae_vb(&self.root, &self.device)?,
+            SnapshotLayout::LegacyComponents => component_vb(&self.root, &self.device, "vae")?,
+        };
+        let vae = WanVae16::new_with_encoder(&Vae16Config::wan21(), vae_vb)?;
+        let clip_vb = match self.layout {
+            SnapshotLayout::SharedMlxTier => candle_gen::mmap_var_builder(
+                &[self.root.join("clip.safetensors")],
+                DType::F32,
+                &self.device,
+            )?,
+            SnapshotLayout::LegacyComponents => component_vb(&self.root, &self.device, "clip")?,
+        };
+        let clip = ScailClip::new(clip_vb, &ClipVisionConfig::vit_h_14())?;
+        let tok = match self.layout {
+            SnapshotLayout::SharedMlxTier => crate::generate::build_tokenizer_from_path(
+                self.root.join("tokenizer.json"),
+                &TextEncoderConfig::umt5_xxl(),
+            )?,
+            SnapshotLayout::LegacyComponents => {
+                crate::generate::build_tokenizer(&self.root, &TextEncoderConfig::umt5_xxl())?
+            }
+        };
         Ok(Components {
             te,
             dit,
@@ -202,9 +342,10 @@ impl Scail2 {
     }
 }
 
-/// Construct a candle SCAIL-2 generator. `spec.weights` must be a [`WeightsSource::Dir`] pointing at a
-/// snapshot with `text_encoder/`, `transformer/` (the converted SCAIL2Model DiT), `vae/` (z16 Wan VAE
-/// with encoder), `clip/` (open-CLIP ViT-H/14 visual tower), and `tokenizer/tokenizer.json`. Inference
+/// Construct a candle SCAIL-2 generator. `spec.weights` must be a [`WeightsSource::Dir`] containing
+/// either the flat dense `SceneWorks/scail2-mlx` bf16 tier in [`SHARED_TIER_FILES`] or the legacy
+/// candle component tree (`text_encoder/`, `transformer/`, `vae/`, `clip/`, and
+/// `tokenizer/tokenizer.json`). Inference
 /// adapters (`spec.adapters` — LoRA / LoKr / LoHa / lightx2v lightning diff-patch / Bias-Aware DPO) are
 /// merged into the dense DiT before build (sc-6838); on-the-fly quantization is still rejected.
 pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
@@ -212,8 +353,9 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         WeightsSource::Dir(p) => p.clone(),
         WeightsSource::File(_) => {
             return Err(gen_core::Error::Msg(
-                "scail2: expected a snapshot directory (text_encoder/ transformer/ vae/ clip/ \
-                 tokenizer/), not a single .safetensors file"
+                "scail2: expected a snapshot directory (a shared SceneWorks/scail2-mlx bf16 tier or \
+                 the legacy text_encoder/ transformer/ vae/ clip/ tokenizer/ tree), not a single \
+                 .safetensors file"
                     .into(),
             ));
         }
@@ -229,12 +371,14 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
             root.display()
         )));
     }
+    let layout = snapshot_layout(&root)?;
     let config = Scail2Config::from_model_dir(&root)?;
     let device = candle_gen::default_device()?;
     Ok(Box::new(Scail2 {
         descriptor: descriptor(),
         config,
         root,
+        layout,
         device,
         adapters: spec.adapters.clone(),
         components: Mutex::new(None),
@@ -549,6 +693,87 @@ impl Scail2 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
+    fn touch(path: &Path) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, b"").unwrap();
+    }
+
+    #[test]
+    fn shared_model_manager_tier_is_complete_or_fails_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        for file in SHARED_TIER_FILES {
+            touch(&tmp.path().join(file));
+        }
+        assert_eq!(
+            snapshot_layout(tmp.path()).unwrap(),
+            SnapshotLayout::SharedMlxTier
+        );
+
+        std::fs::remove_file(tmp.path().join("t5_encoder.safetensors")).unwrap();
+        let error = snapshot_layout(tmp.path()).unwrap_err().to_string();
+        assert!(error.contains("t5_encoder.safetensors"), "got: {error}");
+        assert!(error.contains("text_encoder/"), "got: {error}");
+    }
+
+    #[test]
+    fn legacy_component_layout_remains_supported() {
+        let tmp = tempfile::tempdir().unwrap();
+        for sub in ["transformer", "text_encoder", "vae", "clip"] {
+            std::fs::create_dir_all(tmp.path().join(sub)).unwrap();
+        }
+        touch(&tmp.path().join("tokenizer/tokenizer.json"));
+        assert_eq!(
+            snapshot_layout(tmp.path()).unwrap(),
+            SnapshotLayout::LegacyComponents
+        );
+    }
+
+    #[test]
+    fn shared_umt5_projection_covers_every_loaded_tensor_key() {
+        let mut requested = Vec::new();
+        requested.push("shared.weight".to_owned());
+        requested.push("encoder.final_layer_norm.weight".to_owned());
+        let leaves = [
+            "layer.0.layer_norm.weight",
+            "layer.0.SelfAttention.q.weight",
+            "layer.0.SelfAttention.k.weight",
+            "layer.0.SelfAttention.v.weight",
+            "layer.0.SelfAttention.o.weight",
+            "layer.0.SelfAttention.relative_attention_bias.weight",
+            "layer.1.layer_norm.weight",
+            "layer.1.DenseReluDense.wi_0.weight",
+            "layer.1.DenseReluDense.wi_1.weight",
+            "layer.1.DenseReluDense.wo.weight",
+        ];
+        for block in 0..TextEncoderConfig::umt5_xxl().num_layers {
+            requested.extend(
+                leaves
+                    .iter()
+                    .map(|leaf| format!("encoder.block.{block}.{leaf}")),
+            );
+        }
+        assert_eq!(requested.len(), 242, "UMT5-XXL loads exactly 242 tensors");
+        let projected: BTreeSet<String> =
+            requested.iter().map(|key| shared_umt5_key(key)).collect();
+        assert_eq!(
+            projected.len(),
+            requested.len(),
+            "projection must be bijective"
+        );
+        assert!(projected.contains("token_embedding.weight"));
+        assert!(projected.contains("blocks.23.pos_embedding.embedding.weight"));
+        assert!(projected.contains("blocks.23.ffn.fc2.weight"));
+        assert!(projected.contains("norm.weight"));
+        assert_eq!(
+            shared_umt5_key("encoder.block.0.unexpected.weight"),
+            "encoder.block.0.unexpected.weight",
+            "unknown keys stay loud at the underlying missing-tensor gate"
+        );
+    }
 
     #[test]
     fn registers_and_resolves_as_candle_video() {
@@ -815,6 +1040,7 @@ mod tests {
             descriptor: descriptor(),
             config: Scail2Config::default(),
             root: PathBuf::from("/nonexistent-scail2-snapshot"),
+            layout: SnapshotLayout::LegacyComponents,
             device: Device::Cpu,
             adapters: Vec::new(),
             components: Mutex::new(None),

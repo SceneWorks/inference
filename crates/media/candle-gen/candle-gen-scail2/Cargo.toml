@@ -33,3 +33,4 @@ cuda = ["candle-gen/cuda", "candle-gen-wan/cuda"]
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
 sceneworks-gen-core-testkit = { workspace = true }
+tempfile = { workspace = true }

@@ -839,6 +839,7 @@ dependencies = [
  "safetensors 0.7.0",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "tempfile",
  "tokenizers 0.22.2",
 ]
 
