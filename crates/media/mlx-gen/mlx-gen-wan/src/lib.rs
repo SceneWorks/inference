@@ -170,6 +170,17 @@ pub fn validate_selected_single_frame_decoder<'a>(
             descriptor.id
         )));
     }
+    if !descriptor
+        .compatible_decoder_options()
+        .iter()
+        .any(|option| option.id == mlx_gen::gen_core::WAN_2_1_VAE_DECODER_ID)
+    {
+        return Err(mlx_gen::Error::Unsupported(format!(
+            "{}: decoder '{}' is not registered for this provider",
+            descriptor.id,
+            mlx_gen::gen_core::WAN_2_1_VAE_DECODER_ID
+        )));
+    }
     Ok(Some(path.as_path()))
 }
 pub use vae22::Wan22VideoDecoder;
@@ -219,6 +230,24 @@ mod conditioning_budget_tests {
                 .to_string();
         assert!(error.contains("incompatible"), "got: {error}");
         assert!(error.contains(super::MODEL_ID), "got: {error}");
+    }
+
+    #[test]
+    fn alternate_decoder_validation_rejects_same_space_provider_without_registry_eligibility() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/base".into())).with_component(
+            VAE_COMPONENT,
+            WeightsSource::File("/nonexistent/standalone-wan-vae.safetensors".into()),
+        );
+        let mut descriptor = super::model::descriptor();
+        descriptor.id = "same_space_but_unwired";
+        descriptor.denoiser_output_latent_space =
+            Some(&mlx_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE);
+
+        let error = super::validate_selected_single_frame_decoder(&spec, &descriptor)
+            .expect_err("latent compatibility alone must not invent provider eligibility")
+            .to_string();
+        assert!(error.contains("not registered"), "got: {error}");
+        assert!(error.contains("same_space_but_unwired"), "got: {error}");
     }
 
     #[test]
