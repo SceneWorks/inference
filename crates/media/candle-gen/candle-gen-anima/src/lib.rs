@@ -79,7 +79,7 @@ const RES_MAX: u32 = 1536;
 fn descriptor_for(variant: Variant) -> ModelDescriptor {
     let cfg_capable = variant.uses_cfg();
     ModelDescriptor {
-        denoiser_output_latent_space: None,
+        denoiser_output_latent_space: Some(&candle_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
         id: variant.id(),

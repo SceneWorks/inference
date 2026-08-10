@@ -68,7 +68,7 @@ const MAX_STEPS: u32 = 200;
 /// Stable identity + advertised capabilities for SVD-XT (image→video, no audio).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
-        denoiser_output_latent_space: None,
+        denoiser_output_latent_space: Some(&mlx_gen::gen_core::SVD_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
         id: MODEL_ID,

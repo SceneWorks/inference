@@ -88,7 +88,7 @@ pub(crate) const DEFAULT_FPS: u32 = 30;
 /// `spec.quantize` (honouring one only when it matches the tier dir's manifest, [`tier`]).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
-        denoiser_output_latent_space: None,
+        denoiser_output_latent_space: Some(&candle_gen::gen_core::MOCHI_VIDEO_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
         id: MODEL_ID,

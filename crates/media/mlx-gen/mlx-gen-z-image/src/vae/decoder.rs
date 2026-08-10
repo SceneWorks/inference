@@ -302,19 +302,74 @@ impl Vae {
     }
 }
 
-/// The native decoder for the Flux1 / Z-Image latent space (the behavior-preserving default of the PiD
-/// decode seam, sc-7844). This `Vae` is reused verbatim by every crate in that latent space — Z-Image,
-/// FLUX.1, Boogu, Chroma — so this single impl makes all of them PiD-swappable (sc-7846). Delegates to
-/// the inherent [`Vae::decode`], which accepts the 4-D `(B, C, H, W)` normalized latent the engines
-/// hand the seam (it re-adds the singleton frame axis on output). A PiD decoder for this same latent
-/// space (`mlx-gen-pid`, sc-7843) implements the same trait, so a generation can swap between them at
-/// the decode call site.
+/// Resolve the exact latent contract represented by the caller-supplied VAE normalization.
+///
+/// This module is shared by Flux1/Z-Image and SD3.5, which have the same AutoencoderKL structure but
+/// different scale/shift factors. Unknown custom factors remain unadvertised rather than being
+/// mislabeled as either family.
+fn latent_space_for_factors(
+    scaling_factor: f32,
+    shift_factor: f32,
+) -> Option<&'static mlx_gen::gen_core::LatentSpace> {
+    let normalization =
+        mlx_gen::gen_core::LatentNormalization::affine(scaling_factor, shift_factor);
+    if normalization == mlx_gen::gen_core::FLUX1_LATENT_SPACE.normalization {
+        Some(&mlx_gen::gen_core::FLUX1_LATENT_SPACE)
+    } else if normalization == mlx_gen::gen_core::SD3_LATENT_SPACE.normalization {
+        Some(&mlx_gen::gen_core::SD3_LATENT_SPACE)
+    } else {
+        None
+    }
+}
+
+/// The native decoder contract derived from this instance's actual normalization factors. The
+/// Flux1/Z-Image construction remains the behavior-preserving PiD decode seam (sc-7844/sc-7846),
+/// while SD3.5's shared AutoencoderKL correctly advertises SD3 rather than Flux1. Delegates to the
+/// inherent [`Vae::decode`], which accepts the 4-D `(B, C, H, W)` normalized latent the engines hand
+/// the seam and re-adds the singleton frame axis on output.
 impl LatentDecoder for Vae {
     fn input_latent_space(&self) -> Option<&mlx_gen::gen_core::LatentSpace> {
-        Some(&mlx_gen::gen_core::FLUX1_LATENT_SPACE)
+        latent_space_for_factors(self.scaling_factor, self.shift_factor)
     }
 
     fn decode(&self, latents: &Array) -> Result<Array> {
         Vae::decode(self, latents)
+    }
+}
+
+#[cfg(test)]
+mod latent_contract_tests {
+    use super::*;
+
+    #[test]
+    fn shared_vae_reports_the_contract_for_its_actual_factors() {
+        assert_eq!(
+            latent_space_for_factors(Vae::SCALING_FACTOR, Vae::SHIFT_FACTOR),
+            Some(&mlx_gen::gen_core::FLUX1_LATENT_SPACE)
+        );
+
+        let (sd3_scale, sd3_shift) = mlx_gen::gen_core::SD3_LATENT_SPACE
+            .normalization
+            .affine_values()
+            .expect("SD3 uses affine normalization");
+        assert_eq!(
+            latent_space_for_factors(sd3_scale, sd3_shift),
+            Some(&mlx_gen::gen_core::SD3_LATENT_SPACE)
+        );
+        assert!(
+            mlx_gen::gen_core::latent_spaces_compatible(
+                Some(&mlx_gen::gen_core::SD3_LATENT_SPACE),
+                latent_space_for_factors(sd3_scale, sd3_shift),
+            ),
+            "SD3's denoiser output must be accepted by its native shared VAE"
+        );
+        assert!(
+            !mlx_gen::gen_core::latent_spaces_compatible(
+                Some(&mlx_gen::gen_core::FLUX1_LATENT_SPACE),
+                latent_space_for_factors(sd3_scale, sd3_shift),
+            ),
+            "the SD3-normalized VAE must not accept Flux1/Z-Image latents"
+        );
+        assert_eq!(latent_space_for_factors(1.0, 0.0), None);
     }
 }

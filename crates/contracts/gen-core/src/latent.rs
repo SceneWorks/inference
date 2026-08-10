@@ -22,10 +22,14 @@ pub enum LatentPatchLayout {
 /// Temporal pixel-to-latent law.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LatentTemporalLaw {
-    /// Still-image space with no temporal compression contract.
+    /// No temporal compression at the decoder seam (still images or one latent per output frame).
     None,
     /// Causal video law `latent_frames = (pixel_frames - 1) / 4 + 1`.
     Causal4x,
+    /// Causal video law `latent_frames = (pixel_frames - 1) / 6 + 1`.
+    Causal6x,
+    /// Causal video law `latent_frames = (pixel_frames - 1) / 8 + 1`.
+    Causal8x,
 }
 
 /// Stable identity for fixed per-channel normalization vectors.
@@ -177,8 +181,9 @@ pub const fn normalization_vectors_hash(mean: &[f32], std: &[f32]) -> u64 {
     hash
 }
 
-/// Shared Qwen-Image / Krea 2 / Wan-z16 normalization. This is the single numeric definition used
-/// by both tensor backends and every provider that reuses this VAE fit.
+/// Shared Qwen-Image / Krea 2 / Wan-z16 normalization. Qwen-Image adopted the Wan 2.1 VAE
+/// lineage, and Krea 2 reuses that same fit. This is the single numeric definition used by both
+/// tensor backends and every provider that reuses it.
 #[rustfmt::skip]
 pub const QWEN_WAN_Z16_MEAN: [f32; 16] = [
     -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508,
@@ -256,6 +261,86 @@ pub const WAN_Z48_LATENT_SPACE: LatentSpace = LatentSpace {
     patch_layout: LatentPatchLayout::Unpacked,
     temporal_law: LatentTemporalLaw::Causal4x,
     normalization: LatentNormalization::PerChannel(WAN_Z48_NORMALIZATION),
+};
+
+/// SeedVR2's 16-channel causal video VAE. It shares Wan's spatial/temporal geometry but has its own
+/// scalar normalization, so treating it as a Wan latent would be an unsafe false positive.
+pub const SEEDVR2_VIDEO_LATENT_SPACE: LatentSpace = LatentSpace {
+    channels: 16,
+    spatial_compression: SpatialCompression {
+        height: 8,
+        width: 8,
+    },
+    patch_layout: LatentPatchLayout::Unpacked,
+    temporal_law: LatentTemporalLaw::Causal4x,
+    normalization: LatentNormalization::affine(0.9152, 0.0),
+};
+
+/// LTX-2.3's 128-channel causal video space. Its normalization vectors are loaded from the
+/// checkpoint; without their content hash, exact decoder compatibility deliberately fails closed.
+pub const LTX_VIDEO_LATENT_SPACE: LatentSpace = LatentSpace {
+    channels: 128,
+    spatial_compression: SpatialCompression {
+        height: 32,
+        width: 32,
+    },
+    patch_layout: LatentPatchLayout::Unpacked,
+    temporal_law: LatentTemporalLaw::Causal8x,
+    normalization: LatentNormalization::LearnedPerChannel {
+        identity: "ltx-2.3-per-channel-statistics",
+    },
+};
+
+/// Mochi 1's 12-channel causal video space. The per-channel vectors come from `vae/config.json`,
+/// so a static descriptor records the family but cannot claim exact vector compatibility.
+pub const MOCHI_VIDEO_LATENT_SPACE: LatentSpace = LatentSpace {
+    channels: 12,
+    spatial_compression: SpatialCompression {
+        height: 8,
+        width: 8,
+    },
+    patch_layout: LatentPatchLayout::Unpacked,
+    temporal_law: LatentTemporalLaw::Causal6x,
+    normalization: LatentNormalization::LearnedPerChannel {
+        identity: "mochi-1-config-per-channel-statistics",
+    },
+};
+
+/// Mage-Flow's raw 128-channel image latent (no scale, shift, or per-channel fit).
+pub const MAGE_LATENT_SPACE: LatentSpace = LatentSpace {
+    channels: 128,
+    spatial_compression: SpatialCompression {
+        height: 16,
+        width: 16,
+    },
+    patch_layout: LatentPatchLayout::Unpacked,
+    temporal_law: LatentTemporalLaw::None,
+    normalization: LatentNormalization::Identity,
+};
+
+/// SANA's 32-channel DC-AE image latent.
+pub const SANA_LATENT_SPACE: LatentSpace = LatentSpace {
+    channels: 32,
+    spatial_compression: SpatialCompression {
+        height: 32,
+        width: 32,
+    },
+    patch_layout: LatentPatchLayout::Unpacked,
+    temporal_law: LatentTemporalLaw::None,
+    normalization: LatentNormalization::affine(0.41407, 0.0),
+};
+
+/// Stable Video Diffusion's frame-preserving four-channel latent. Its temporal decoder mixes
+/// frames, but it consumes one latent frame per output frame rather than a compressed time grid.
+pub const SVD_LATENT_SPACE: LatentSpace = LatentSpace {
+    channels: 4,
+    spatial_compression: SpatialCompression {
+        height: 8,
+        width: 8,
+    },
+    patch_layout: LatentPatchLayout::Unpacked,
+    temporal_law: LatentTemporalLaw::None,
+    normalization: LatentNormalization::affine(0.18215, 0.0),
 };
 
 pub const FLUX1_LATENT_SPACE: LatentSpace = LatentSpace {
@@ -354,5 +439,29 @@ mod tests {
     #[test]
     fn learned_normalization_without_content_hash_fails_closed() {
         assert!(!FLUX2_PACKED_LATENT_SPACE.is_compatible_with(&FLUX2_PACKED_LATENT_SPACE));
+        assert!(!LTX_VIDEO_LATENT_SPACE.is_compatible_with(&LTX_VIDEO_LATENT_SPACE));
+        assert!(!MOCHI_VIDEO_LATENT_SPACE.is_compatible_with(&MOCHI_VIDEO_LATENT_SPACE));
+    }
+
+    #[test]
+    fn provider_specific_spaces_do_not_collapse_distinct_lineages() {
+        assert_ne!(SEEDVR2_VIDEO_LATENT_SPACE, WAN_Z16_VIDEO_LATENT_SPACE);
+        assert_ne!(SVD_LATENT_SPACE, SDXL_LATENT_SPACE);
+        assert_eq!(
+            MAGE_LATENT_SPACE.normalization,
+            LatentNormalization::Identity
+        );
+        assert_eq!(
+            SANA_LATENT_SPACE.normalization.affine_values(),
+            Some((0.41407, 0.0))
+        );
+        assert_eq!(
+            LTX_VIDEO_LATENT_SPACE.temporal_law,
+            LatentTemporalLaw::Causal8x
+        );
+        assert_eq!(
+            MOCHI_VIDEO_LATENT_SPACE.temporal_law,
+            LatentTemporalLaw::Causal6x
+        );
     }
 }

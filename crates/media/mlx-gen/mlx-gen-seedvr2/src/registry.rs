@@ -47,7 +47,7 @@ fn variant(id: &str) -> (&'static str, DitConfig) {
 
 fn descriptor_for(id: &'static str) -> ModelDescriptor {
     ModelDescriptor {
-        denoiser_output_latent_space: None,
+        denoiser_output_latent_space: Some(&mlx_gen::gen_core::SEEDVR2_VIDEO_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
         id,
