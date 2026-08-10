@@ -164,6 +164,10 @@ impl KreaBlockStream {
             KreaBlockSource::Native(file) => {
                 file.ensure_unchanged().map_err(Error::from)?;
                 let weights = crate::loader::normalized_native_weights(file.loader_path())?;
+                // Close the check/open race as well as the later-window race: replacement while the
+                // file was being parsed must not let bytes different from the pinned source become a
+                // materialized window. The initial native loader uses the same before/after protocol.
+                file.ensure_unchanged().map_err(Error::from)?;
                 NATIVE_WINDOW_REOPENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(weights)
             }
