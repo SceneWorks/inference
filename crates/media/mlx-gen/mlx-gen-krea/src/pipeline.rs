@@ -704,6 +704,7 @@ impl KreaHeavy {
             control_scale,
             None,
             None,
+            None,
             opts,
             cancel,
             &PreviewSink::default(),
@@ -749,6 +750,7 @@ impl KreaHeavy {
         plan: &ControlPlan,
         branch: &Krea2ControlBranch,
         control_scale: f32,
+        decoder: Option<&dyn LatentDecoder>,
         decode_tiling: Option<&TilingConfig>,
         calibration_error_phase: Option<mlx_gen::gen_core::MemoryPhase>,
         opts: &TurboOptions,
@@ -797,7 +799,7 @@ impl KreaHeavy {
                     .to_owned(),
             ));
         }
-        self.decode_latents_with_tiling(&lat, None, decode_tiling, cancel)
+        self.decode_latents_with_tiling(&lat, decoder, decode_tiling, cancel)
     }
 
     /// **img2img latent-init Turbo render** (epic 8588 slice A; sc-8589/sc-8590) — the denoise/decode

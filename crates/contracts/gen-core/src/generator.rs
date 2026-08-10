@@ -1603,6 +1603,25 @@ pub struct ModelDescriptor {
     pub control_kinds: Option<crate::control::AcceptedControlKinds>,
 }
 
+impl ModelDescriptor {
+    /// Alternate decoders this exact provider has wired and whose input space is compatible with its
+    /// advertised denoiser output. Missing/learned normalization evidence therefore fails closed.
+    pub fn compatible_decoder_options(&self) -> Vec<crate::latent::DecoderOption> {
+        crate::latent::DECODER_OPTIONS
+            .iter()
+            .copied()
+            .filter(|option| option.eligible_backends.contains(&self.backend))
+            .filter(|option| option.eligible_provider_ids.contains(&self.id))
+            .filter(|option| {
+                crate::latent::latent_spaces_compatible(
+                    self.denoiser_output_latent_space,
+                    Some(option.input_latent_space),
+                )
+            })
+            .collect()
+    }
+}
+
 /// How a model's advertised size range is enforced.
 ///
 /// The distinction already existed as two entry points —

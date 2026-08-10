@@ -14,10 +14,11 @@ use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, AdapterSpec, Capabilities,
     Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator,
     LatentDecoder, LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, Residency,
-    Result, SizeFloor, WeightsSource, BASE_SNAPSHOT_COMPONENT,
+    Result, SizeFloor, WeightsSource, BASE_SNAPSHOT_COMPONENT, VAE_COMPONENT,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 use mlx_gen_qwen_image::pipeline::PID_BACKBONE;
+use mlx_gen_wan::OwnedWanSingleFrameDecoder;
 
 use mlx_rs::Array;
 use std::path::Path;
@@ -258,6 +259,9 @@ pub(crate) struct KreaHeavyOwned {
     /// reuses the Qwen-Image latent space, so it shares the `qwenimage` PiD student. `req.use_pid`
     /// routes decode through it instead of the VAE. `None` for the plain VAE path.
     pid: Option<PidEngine>,
+    /// Experimental load-time VAE override. This is mutually exclusive with PiD and exists only
+    /// for the explicitly compatible z16 Krea variants advertised by gen-core.
+    alternate_decoder: Option<OwnedWanSingleFrameDecoder>,
 }
 
 /// A borrow of the heavy render-phase components, so the denoise/decode dispatch runs identically
@@ -265,6 +269,7 @@ pub(crate) struct KreaHeavyOwned {
 struct KreaHeavyRef<'a> {
     heavy: &'a KreaHeavy,
     pid: Option<&'a PidEngine>,
+    alternate_decoder: Option<&'a OwnedWanSingleFrameDecoder>,
 }
 
 impl KreaHeavyOwned {
@@ -272,6 +277,7 @@ impl KreaHeavyOwned {
         KreaHeavyRef {
             heavy: &self.heavy,
             pid: self.pid.as_ref(),
+            alternate_decoder: self.alternate_decoder.as_ref(),
         }
     }
 }
@@ -392,6 +398,13 @@ pub(crate) fn build_native_krea(
 /// ([`load_krea_text`] / [`load_krea_heavy`]), so the components are byte-identical. `descriptor`
 /// selects the variant (Turbo vs Raw vs edit) the returned [`Krea`] renders.
 fn load_variant(spec: &LoadSpec, descriptor: ModelDescriptor) -> Result<Box<dyn Generator>> {
+    let allowed_components: &[&str] = if matches!(spec.weights, WeightsSource::File(_)) {
+        &[BASE_SNAPSHOT_COMPONENT, VAE_COMPONENT]
+    } else {
+        &[VAE_COMPONENT]
+    };
+    mlx_gen::gen_core::reject_unknown_components(spec, allowed_components, descriptor.id)?;
+    mlx_gen_wan::validate_selected_single_frame_decoder(spec, &descriptor)?;
     if let WeightsSource::File(dit_file) = &spec.weights {
         return Ok(Box::new(build_native_krea_from_spec(
             spec, dit_file, descriptor,
@@ -417,7 +430,6 @@ fn build_native_krea_from_spec(
     dit_file: &Path,
     descriptor: ModelDescriptor,
 ) -> Result<Krea> {
-    mlx_gen::gen_core::reject_unknown_components(spec, &[BASE_SNAPSHOT_COMPONENT], descriptor.id)?;
     if spec.precision != Precision::Bf16 {
         return Err(Error::Msg(format!(
             "{}: only the default dense precision is wired (drop the precision override)",
@@ -451,11 +463,19 @@ fn build_native_krea_from_spec(
     let heavy_base = base.to_path_buf();
     let heavy_dit = dit_file.to_path_buf();
     let heavy_spec = spec.clone();
+    let heavy_id = descriptor.id;
     let residency = Residency::from_policy(
         spec.offload_policy,
         move || KreaText::from_snapshot(&text_base),
         move |load_pid| {
-            load_native_krea_heavy(&heavy_spec, &heavy_base, &heavy_dit, streamable, load_pid)
+            load_native_krea_heavy(
+                &heavy_spec,
+                &heavy_base,
+                &heavy_dit,
+                streamable,
+                load_pid,
+                heavy_id,
+            )
         },
     )?;
     Ok(Krea {
@@ -476,6 +496,7 @@ fn load_native_krea_heavy(
     dit_file: &Path,
     streamable: bool,
     load_pid: bool,
+    id: &'static str,
 ) -> Result<KreaHeavyOwned> {
     let cfg = crate::config::Krea2Config::from_snapshot(base)?;
     let dit =
@@ -493,7 +514,23 @@ fn load_native_krea_heavy(
     } else {
         None
     };
-    Ok(KreaHeavyOwned { heavy, pid })
+    let alternate_decoder =
+        mlx_gen_wan::load_selected_single_frame_decoder(spec, &descriptor_for_id(id))?;
+    Ok(KreaHeavyOwned {
+        heavy,
+        pid,
+        alternate_decoder,
+    })
+}
+
+fn descriptor_for_id(id: &'static str) -> ModelDescriptor {
+    match id {
+        KREA_2_TURBO_ID => descriptor(),
+        KREA_2_RAW_ID => raw_descriptor(),
+        KREA_2_EDIT_ID => edit_descriptor(),
+        KREA_2_TURBO_EDIT_ID => turbo_edit_descriptor(),
+        _ => unreachable!("Krea loader called with unregistered descriptor id {id}"),
+    }
 }
 
 /// Detect whether any load-time adapter is a ComfyUI/lightx2v **diff-patch** (`.diff`/`.diff_b`), read
@@ -571,6 +608,7 @@ pub(crate) fn build_residency(
                 resolve_root(&spec_heavy, id)?,
                 use_pid,
                 load_plan,
+                id,
             )
         },
     )
@@ -700,6 +738,7 @@ fn load_krea_heavy(
     root: &Path,
     load_pid: bool,
     load_plan: ResolvedLoadPlan,
+    id: &'static str,
 ) -> Result<KreaHeavyOwned> {
     let mut heavy = KreaHeavy::from_snapshot_with_stream(root, load_plan.streamable_transformer)?;
     if !spec.adapters.is_empty() {
@@ -720,7 +759,13 @@ fn load_krea_heavy(
     } else {
         None
     };
-    Ok(KreaHeavyOwned { heavy, pid })
+    let alternate_decoder =
+        mlx_gen_wan::load_selected_single_frame_decoder(spec, &descriptor_for_id(id))?;
+    Ok(KreaHeavyOwned {
+        heavy,
+        pid,
+        alternate_decoder,
+    })
 }
 
 impl Generator for Krea {
@@ -1002,7 +1047,14 @@ impl Krea {
                     self.descriptor.id,
                     capture_sigma,
                 )?;
-                let decoder = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
+                let decoder = pid_decoder
+                    .as_ref()
+                    .map(|decoder| decoder as &dyn LatentDecoder)
+                    .or_else(|| {
+                        heavy
+                            .alternate_decoder
+                            .map(|decoder| decoder as &dyn LatentDecoder)
+                    });
 
                 // Multi-phase render (epic 13879, sc-13884): drive the resolved phases over the ONE
                 // global schedule — per-phase guidance selecting the true-CFG (two-forward) or CFG-off

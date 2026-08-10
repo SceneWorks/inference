@@ -17,6 +17,10 @@ use std::time::SystemTime;
 /// `required_components` set.
 pub const BASE_SNAPSHOT_COMPONENT: &str = "base_snapshot";
 
+/// Optional request-selected decoder weights. A consumer stages this only when it selects an
+/// alternate decoder; an absent entry preserves the provider's native decoder exactly.
+pub const VAE_COMPONENT: &str = "vae";
+
 /// Optional in-place ComfyUI text-encoder file paired with a single-file DiT.
 pub const COMFYUI_TEXT_ENCODER_COMPONENT: &str = "comfyui_text_encoder";
 

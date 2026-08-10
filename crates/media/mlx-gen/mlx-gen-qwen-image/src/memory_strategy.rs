@@ -20,6 +20,19 @@ use mlx_gen::{GenerationRequest, LoadShape, LoadSpec, OffloadPolicy, Precision, 
 
 /// Load shape is a typed evidence-key axis; this content fingerprint remains shape-independent.
 pub const MEMORY_CALIBRATION_FINGERPRINT: &str = "qwen-image-mlx-shared-ladder-2026-08-01-v1";
+/// The Wan terminal decoder has no promoted whole-request measurement. Give the composite its own
+/// identity so native-Qwen evidence cannot be reused; SceneWorks must admit it through the
+/// asset-facts + generic-headroom estimate path, where the estimate safety margin is applied.
+pub const WAN_DECODER_CALIBRATION_FINGERPRINT: &str =
+    "qwen-image-mlx-wan21-decoder-unmeasured-composite-2026-08-10-v1";
+
+fn calibration_fingerprint(spec: &LoadSpec) -> &'static str {
+    if spec.components.contains_key(mlx_gen::VAE_COMPONENT) {
+        WAN_DECODER_CALIBRATION_FINGERPRINT
+    } else {
+        MEMORY_CALIBRATION_FINGERPRINT
+    }
+}
 
 /// Native Qwen-VAE production tile ladder in output pixels, measured against the exact untiled
 /// decode on the real bf16 VAE. SC-15511's same-process Metal A/B found overlap 96 increased the
@@ -142,7 +155,17 @@ pub fn memory_strategy_contract(
     };
     let conditioning_bytes = project(&root.join("text_encoder"), None)?;
     let transformer_bytes = project(&root.join("transformer"), spec.quantize)?;
-    let decoder_bytes = project(&root.join("vae"), None)?;
+    let native_decoder_bytes = project(&root.join("vae"), None)?;
+    // The alternate lane keeps the native VAE loaded (reference/img2img encoding still uses it) and
+    // adds the standalone Wan decoder for the terminal decode. Price the composition, never substitute
+    // donor bytes for the native decoder or borrow the native route's measured peak unchanged.
+    let alternate_decoder_bytes = match spec.components.get(mlx_gen::VAE_COMPONENT) {
+        Some(WeightsSource::Dir(path)) | Some(WeightsSource::File(path)) => {
+            projected_safetensors_bytes(path, |_| ResidentProjection::Stored)?
+        }
+        None => 0,
+    };
+    let decoder_bytes = native_decoder_bytes.saturating_add(alternate_decoder_bytes);
     let overlay_bytes = match &spec.control {
         Some(WeightsSource::Dir(path)) | Some(WeightsSource::File(path)) => {
             projected_safetensors_bytes(path, |_| match spec.quantize {
@@ -227,7 +250,7 @@ fn memory_strategy_contract_with_asset_facts(
         MemoryFormulaKind::PhaseEnvelope { phases, variables }
     };
     contract.calibration = Some(MemoryCalibrationIdentity::new(
-        MEMORY_CALIBRATION_FINGERPRINT,
+        calibration_fingerprint(spec),
         spec.load_shape,
     ));
     contract.asset_facts.base_bytes = conditioning_bytes
@@ -681,6 +704,35 @@ mod tests {
             MemoryFormulaKind::ComponentPhaseEnvelope { .. }
         ));
         assert!(contract.conformance_errors().is_empty());
+    }
+
+    #[test]
+    fn alternate_decoder_is_additive_to_native_decoder_asset_facts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut base_spec = spec(&tmp);
+        let native = memory_strategy_contract("qwen_image", &base_spec).unwrap();
+        let donor = tmp.path().join("wan-vae.safetensors");
+        write_control(&donor);
+        base_spec = base_spec.with_component(mlx_gen::VAE_COMPONENT, WeightsSource::File(donor));
+        let composite = memory_strategy_contract("qwen_image", &base_spec).unwrap();
+        assert_eq!(
+            composite.asset_facts.decoder_bytes,
+            native.asset_facts.decoder_bytes + 256,
+            "reference encoding retains the native VAE while terminal decode adds the donor"
+        );
+        assert_eq!(
+            composite.asset_facts.base_bytes,
+            native.asset_facts.base_bytes + 256
+        );
+        assert_eq!(
+            composite.calibration.as_ref().unwrap().fingerprint,
+            WAN_DECODER_CALIBRATION_FINGERPRINT,
+            "native whole-request measurements must not authorize the composite decoder path"
+        );
+        assert_eq!(
+            native.calibration.as_ref().unwrap().fingerprint,
+            MEMORY_CALIBRATION_FINGERPRINT
+        );
     }
 
     fn selection(strategy: MemoryStrategy) -> MemorySelection {

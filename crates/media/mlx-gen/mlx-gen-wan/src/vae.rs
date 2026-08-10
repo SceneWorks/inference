@@ -25,7 +25,7 @@ use mlx_gen::gen_core::{QWEN_WAN_Z16_MEAN as VAE_MEAN, QWEN_WAN_Z16_STD as VAE_S
 use mlx_gen::nn::{conv2d, conv3d, silu, upsample_nearest};
 use mlx_gen::tiling::{TilingConfig, VaeTiling};
 use mlx_gen::weights::Weights;
-use mlx_gen::{CancelFlag, Error, LatentDecoder, Result};
+use mlx_gen::{CancelFlag, Error, LatentDecoder, PinnedWeightsFile, Result};
 
 use crate::vae_common::{
     contiguous, last_t_axis, scalar, slice_axis, tile_decode_accumulate, validate_decoder_tiling,
@@ -565,6 +565,29 @@ pub struct WanSingleFrameDecoder<'a> {
     vae: &'a WanVae,
 }
 
+/// Owned, mutation-pinned form of [`WanSingleFrameDecoder`] for cross-model decoder substitution.
+///
+/// SceneWorks stages only the standalone `vae.safetensors`; retaining the pin makes replacement of
+/// either a Hugging Face snapshot symlink or its blob a hard error before every decode.
+pub struct OwnedWanSingleFrameDecoder {
+    vae: WanVae,
+    source: PinnedWeightsFile,
+}
+
+impl OwnedWanSingleFrameDecoder {
+    pub fn from_file(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        let source = PinnedWeightsFile::pin(path)?;
+        source.ensure_unchanged()?;
+        let weights = Weights::from_file(source.loader_path())?;
+        let vae = WanVae::from_weights(&weights)?;
+        Ok(Self { vae, source })
+    }
+
+    pub fn source(&self) -> &PinnedWeightsFile {
+        &self.source
+    }
+}
+
 impl<'a> WanSingleFrameDecoder<'a> {
     pub fn new(vae: &'a WanVae) -> Self {
         Self { vae }
@@ -609,6 +632,27 @@ impl LatentDecoder for WanSingleFrameDecoder<'_> {
         let latents = Self::input_5d(latents)?;
         validate_decoder_tiling(tiling, VaeTiling::WAN, 1)?;
         Self::first_frame(&self.vae.decode_tiled(&latents, tiling, cancel)?)
+    }
+}
+
+impl LatentDecoder for OwnedWanSingleFrameDecoder {
+    fn input_latent_space(&self) -> Option<&mlx_gen::gen_core::LatentSpace> {
+        Some(&mlx_gen::gen_core::WAN_Z16_LATENT_SPACE)
+    }
+
+    fn decode(&self, latents: &Array) -> Result<Array> {
+        self.source.ensure_unchanged()?;
+        WanSingleFrameDecoder::new(&self.vae).decode(latents)
+    }
+
+    fn decode_tiled(
+        &self,
+        latents: &Array,
+        tiling: &TilingConfig,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<Array> {
+        self.source.ensure_unchanged()?;
+        WanSingleFrameDecoder::new(&self.vae).decode_tiled(latents, tiling, cancel)
     }
 }
 
