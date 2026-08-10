@@ -17,6 +17,7 @@ from scripts.ci.feature_epic_policy import (
 REPOSITORY = "SceneWorks/inference"
 SCRIPT = Path(__file__).resolve().parents[1] / "ci" / "feature_epic_policy.py"
 FEATURE = "feature/sc-18304-pipeline-flexibility-mlx-perf"
+STORY = "story/sc-18419-epic-18304-pipeline-flexibility-mlx-perf"
 PR_HEAD_SHA = "1" * 40
 PR_BASE_SHA = "2" * 40
 PR_MERGE_SHA = "3" * 40
@@ -118,14 +119,14 @@ class FeatureEpicPolicyTests(unittest.TestCase):
         reason = validate(
             "pull_request",
             pull_request_event(
-                "story/sc-18419-epic-18304-automate-feature-policy",
+                STORY,
                 "feature/sc-18304-pipeline-flexibility-mlx-perf",
             ),
         )
         self.assertIn("matching feature epic sc-18304", reason)
 
     def test_story_cannot_target_main_or_the_wrong_epic(self) -> None:
-        story = "story/sc-18419-epic-18304-automate-feature-policy"
+        story = STORY
         self.assert_rejected(
             "pull_request",
             pull_request_event(story, "main"),
@@ -145,6 +146,16 @@ class FeatureEpicPolicyTests(unittest.TestCase):
                 "feature/sc-18304-pipeline-flexibility-mlx-perf",
             ),
             "accepts only an epic-bearing story",
+        )
+
+    def test_story_slug_must_match_the_live_canonical_feature_slug(self) -> None:
+        self.assert_rejected(
+            "pull_request",
+            pull_request_event(
+                "story/sc-18419-epic-18304-wrong-slug",
+                FEATURE,
+            ),
+            "not the canonical feature slug",
         )
 
     def test_malformed_epic_bearing_story_fails_closed(self) -> None:
@@ -209,9 +220,7 @@ class FeatureEpicPolicyTests(unittest.TestCase):
         duplicate = "feature/sc-18304-duplicate"
         self.assert_rejected(
             "pull_request",
-            pull_request_event(
-                "story/sc-18419-epic-18304-automate-feature-policy", duplicate
-            ),
+            pull_request_event(STORY, duplicate),
             "not the unique live canonical",
         )
         self.assert_rejected(
@@ -228,19 +237,14 @@ class FeatureEpicPolicyTests(unittest.TestCase):
     def test_protected_topology_requires_a_live_resolver(self) -> None:
         self.assert_rejected(
             "pull_request",
-            pull_request_event(
-                "story/sc-18419-epic-18304-automate-feature-policy", FEATURE
-            ),
+            pull_request_event(STORY, FEATURE),
             "live canonical feature-branch resolver is required",
             feature_resolver=None,
         )
 
     def test_protected_train_heads_must_come_from_this_repository(self) -> None:
         for head, base in (
-            (
-                "story/sc-18419-epic-18304-automate-feature-policy",
-                "feature/sc-18304-pipeline-flexibility-mlx-perf",
-            ),
+            (STORY, FEATURE),
             (
                 "sync/sc-18304-main-2026-08-10",
                 "feature/sc-18304-pipeline-flexibility-mlx-perf",
@@ -258,7 +262,7 @@ class FeatureEpicPolicyTests(unittest.TestCase):
         self.assert_rejected(
             "pull_request",
             pull_request_event(
-                "story/sc-18419-epic-18304-automate-feature-policy",
+                STORY,
                 "feature/sc-18304-pipeline-flexibility-mlx-perf",
                 base_repository="other/inference",
             ),
@@ -525,6 +529,11 @@ class FeatureEpicPolicyTests(unittest.TestCase):
             (
                 f"{PR_HEAD_SHA}\trefs/heads/{FEATURE}/nested\n",
                 "invalid feature ref",
+            ),
+            (
+                f"{PR_HEAD_SHA}\trefs/heads/{FEATURE}\n"
+                f"{PR_BASE_SHA}\trefs/heads/{FEATURE}\n",
+                "divergent commits",
             ),
         )
         for stdout, pattern in cases:

@@ -3,8 +3,8 @@
 
 Feature work is integrated through a repository-local branch train:
 
-* ``story/sc-<story>-epic-<epic>-<slug>`` -> matching
-  ``feature/sc-<epic>-<slug>``;
+* ``story/sc-<story>-epic-<epic>-<slug>`` -> the unique live
+  ``feature/sc-<epic>-<slug>`` with the same canonical slug;
 * ``sync/sc-<epic>-main-<date>`` -> matching feature branch; and
 * a feature branch -> ``main``.
 
@@ -52,6 +52,7 @@ class PolicyError(ValueError):
 class TrainBranch:
     kind: str
     epic: int
+    slug: str | None
 
 
 def _mapping(value: Any, field: str) -> Mapping[str, Any]:
@@ -107,11 +108,11 @@ def _event_repository(payload: Mapping[str, Any], expected: str | None) -> str:
 def _parse_train_branch(branch: str) -> TrainBranch | None:
     feature = FEATURE_RE.fullmatch(branch)
     if feature:
-        return TrainBranch("feature", int(feature.group("epic")))
+        return TrainBranch("feature", int(feature.group("epic")), feature.group("slug"))
 
     story = STORY_RE.fullmatch(branch)
     if story:
-        return TrainBranch("story", int(story.group("epic")))
+        return TrainBranch("story", int(story.group("epic")), story.group("slug"))
 
     sync = SYNC_RE.fullmatch(branch)
     if sync:
@@ -119,7 +120,7 @@ def _parse_train_branch(branch: str) -> TrainBranch | None:
             date.fromisoformat(sync.group("day"))
         except ValueError as error:
             raise PolicyError(f"sync branch has an invalid calendar date: {branch!r}") from error
-        return TrainBranch("sync", int(sync.group("epic")))
+        return TrainBranch("sync", int(sync.group("epic")), None)
 
     looks_protected = branch.startswith(PROTECTED_PREFIXES) or bool(
         EPIC_STORY_PREFIX_RE.match(branch)
@@ -198,7 +199,7 @@ def resolve_remote_feature_branch(
             f"could not resolve the canonical feature branch for sc-{epic}: {detail}"
         )
 
-    branches: set[str] = set()
+    branches: dict[str, str] = {}
     for line in result.stdout.splitlines():
         fields = line.split()
         if len(fields) != 2:
@@ -214,7 +215,13 @@ def resolve_remote_feature_branch(
             raise PolicyError(
                 f"git ls-remote returned an invalid feature ref for sc-{epic}: {ref!r}"
             )
-        branches.add(branch)
+        previous = branches.get(branch)
+        if previous is not None and previous != sha:
+            raise PolicyError(
+                f"origin returned divergent commits for canonical candidate {branch!r}: "
+                f"{previous} and {sha}"
+            )
+        branches[branch] = sha
 
     if not branches:
         raise PolicyError(f"no live feature branch exists on origin for epic sc-{epic}")
@@ -297,6 +304,11 @@ def _validate_pull_request(
             raise PolicyError(
                 f"target feature branch {base_ref!r} is not the unique live canonical "
                 f"branch for sc-{head_train.epic}: {canonical!r}"
+            )
+        if head_train.kind == "story" and head_train.slug != base_train.slug:
+            raise PolicyError(
+                f"story branch {head_ref!r} uses slug {head_train.slug!r}, not the "
+                f"canonical feature slug {base_train.slug!r}"
             )
         return f"{head_train.kind} branch targets matching feature epic sc-{head_train.epic}"
 
