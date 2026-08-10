@@ -29,6 +29,9 @@ MACOS_HUB_LOCK = (
 WINDOWS_HUB_LOCK = (
     ".github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt"
 )
+WINDOWS_SCAIL_HUB_LOCK = (
+    ".github/requirements/real-weights-huggingface-hub-windows-x64-py314.txt"
+)
 WINDOWS_MAGE_LOCK = (
     ".github/requirements/real-weights-mage-verify-windows-x64-py312.txt"
 )
@@ -39,6 +42,7 @@ MACOS_INTERPRETER = "python3.12"
 APPROVED_REAL_WEIGHT_LOCKS = {
     MACOS_HUB_LOCK,
     WINDOWS_HUB_LOCK,
+    WINDOWS_SCAIL_HUB_LOCK,
     WINDOWS_MAGE_LOCK,
     MACOS_MAGE_LOCK,
 }
@@ -324,7 +328,14 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
     if not pip_lines:
         return ["real-weight workflow has no pip commands"]
 
-    install_lines: list[tuple[int, str, re.Match[str]]] = []
+    install_lines: list[tuple[int, str, str | None, re.Match[str]]] = []
+    current_job: str | None = None
+    job_at_line: dict[int, str | None] = {}
+    for line_number, line in enumerate(workflow.splitlines(), start=1):
+        job_match = re.fullmatch(r"  ([A-Za-z0-9_-]+):", line)
+        if job_match is not None:
+            current_job = job_match.group(1)
+        job_at_line[line_number] = current_job
     for line_number, command in pip_lines:
         first_pip = pip_token.search(command)
         assert first_pip is not None
@@ -335,10 +346,10 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
                 "single-line install"
             )
             continue
-        install_lines.append((line_number, command, match))
+        install_lines.append((line_number, command, job_at_line[line_number], match))
 
     locks_seen: list[str] = []
-    for line_number, command, install_match in install_lines:
+    for line_number, command, job, install_match in install_lines:
         prefix = f"line {line_number}"
         for required_flag in ("--only-binary=:all:", "--require-hashes"):
             if required_flag not in command:
@@ -363,7 +374,11 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
         elif f"{MACOS_INTERPRETER} -m pip" in command:
             expected_lock = MACOS_HUB_LOCK
         elif "python -m pip" in command:
-            expected_lock = WINDOWS_HUB_LOCK
+            expected_lock = (
+                WINDOWS_SCAIL_HUB_LOCK
+                if job == "candle-scail2-shared"
+                else WINDOWS_HUB_LOCK
+            )
         if expected_lock != lock:
             errors.append(
                 f"{prefix}: install target expects {expected_lock}, got {lock}"
@@ -394,7 +409,8 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
         # `mlx-qwen-image-producers` jobs; 24 since sc-17250 added the JoyCaption and
         # MOSS-TTS-Realtime jobs; 22 before).
         MACOS_HUB_LOCK: 29,
-        WINDOWS_HUB_LOCK: 11,
+        WINDOWS_HUB_LOCK: 10,
+        WINDOWS_SCAIL_HUB_LOCK: 1,
         WINDOWS_MAGE_LOCK: 1,
         MACOS_MAGE_LOCK: 1,
     }
@@ -560,7 +576,8 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
         self.assertEqual(real_weight_pip_policy_errors(workflow), [])
         self.assertEqual(workflow.count(MACOS_HUB_LOCK), 29)
-        self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 11)
+        self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 10)
+        self.assertEqual(workflow.count(WINDOWS_SCAIL_HUB_LOCK), 1)
         self.assertEqual(workflow.count(WINDOWS_MAGE_LOCK), 1)
         self.assertNotRegex(
             workflow,
@@ -699,6 +716,12 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             ),
             HUB_LOCK_PACKAGES | {"colorama"},
         )
+        scail_windows = validate_binary_hashed_lock(
+            (REAL_WEIGHT_REQUIREMENTS / Path(WINDOWS_SCAIL_HUB_LOCK).name).read_text(
+                encoding="utf-8"
+            ),
+            HUB_LOCK_PACKAGES | {"colorama"},
+        )
         mage = validate_binary_hashed_lock(
             (REAL_WEIGHT_REQUIREMENTS / Path(WINDOWS_MAGE_LOCK).name).read_text(
                 encoding="utf-8"
@@ -707,8 +730,17 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         )
         self.assertEqual(macos["huggingface-hub"][0], "1.20.1")
         self.assertEqual(windows["huggingface-hub"][0], "1.20.1")
+        self.assertEqual(scail_windows["huggingface-hub"][0], "1.20.1")
+        self.assertEqual(scail_windows["hf-xet"][0], "1.6.0")
+        self.assertEqual(scail_windows["packaging"][0], "26.3")
         self.assertNotEqual(macos["hf-xet"][1], windows["hf-xet"][1])
         self.assertNotEqual(macos["pyyaml"][1], windows["pyyaml"][1])
+        self.assertNotEqual(windows["pyyaml"][1], scail_windows["pyyaml"][1])
+        scail_lock = (
+            REAL_WEIGHT_REQUIREMENTS / Path(WINDOWS_SCAIL_HUB_LOCK).name
+        ).read_text(encoding="utf-8")
+        self.assertIn("--platform win_amd64 --python-version 3.14", scail_lock)
+        self.assertIn("--implementation cp --abi cp314", scail_lock)
 
     def test_real_weight_lock_policy_discriminates_mutations(self) -> None:
         lock = (REAL_WEIGHT_REQUIREMENTS / Path(MACOS_HUB_LOCK).name).read_text(
@@ -1374,22 +1406,26 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn('allow_patterns=["bf16/**"]', job)
         self.assertIn("models--SceneWorks--scail2-mlx", job)
         git_bash = job.index("Select Git Bash")
-        select_python = job.index("Select runner-provisioned Python 3.12")
+        validate_python = job.index("Validate runner-provisioned CPython 3.14 x64")
         toolchain = job.index("uses: dtolnay/rust-toolchain@")
         initialize_evidence = job.index("Initialize exact SCAIL CUDA evidence")
         provision = job.index("Provision the exact public shared bf16 package")
         self.assertLess(git_bash, toolchain)
-        self.assertLess(git_bash, select_python)
-        self.assertLess(select_python, provision)
+        self.assertLess(git_bash, initialize_evidence)
+        self.assertLess(initialize_evidence, validate_python)
+        self.assertLess(validate_python, toolchain)
+        self.assertLess(validate_python, provision)
         self.assertLess(initialize_evidence, provision)
         self.assertIn(r'C:\Program Files\Git\bin\bash.exe', job)
         self.assertNotIn("actions/setup-python@", job)
-        self.assertIn("py -3.12 --version || exit /b 1", job)
-        self.assertIn("os.path.dirname(sys.executable)", job)
-        self.assertIn("echo %%P>>\"%GITHUB_PATH%\"", job)
+        self.assertNotIn("py -3.12", job)
+        self.assertIn("sys.implementation.name", job)
         self.assertIn("platform.python_version()", job)
-        self.assertIn("$python -notmatch '\\|3\\.12\\.'", job)
-        self.assertIn("real-weights-huggingface-hub-windows-x64-py312.txt", job)
+        self.assertIn("platform.machine()", job)
+        self.assertIn("struct.calcsize('P') * 8", job)
+        self.assertIn("$python -notmatch '\\|cpython\\|3\\.14\\.\\d+\\|AMD64\\|64$'", job)
+        self.assertIn(WINDOWS_SCAIL_HUB_LOCK, job)
+        self.assertNotIn(WINDOWS_HUB_LOCK, job)
         for required in (
             "config.json",
             "dit.safetensors",
@@ -1406,11 +1442,24 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("Load through the production provider", job)
         self.assertIn("[[SCAIL2_CUDA_VRAM]]", job)
         self.assertIn("-- --ignored --exact --nocapture", job)
-        self.assertIn('"provision_status=starting"', job)
+        self.assertIn('"provision_status=validating_python"', job)
         self.assertIn('"provision_status=complete"', job)
         self.assertIn("Tee-Object -LiteralPath $log -Append", job)
         self.assertIn("actions/upload-artifact@", job)
         self.assertIn("scail2-shared-cuda-${{ github.sha }}", job)
+
+        for name, mutated_job in {
+            "py312 lock substitution": job.replace(
+                WINDOWS_SCAIL_HUB_LOCK, WINDOWS_HUB_LOCK, 1
+            ),
+            "shared macOS lock substitution": job.replace(
+                WINDOWS_SCAIL_HUB_LOCK, MACOS_HUB_LOCK, 1
+            ),
+            "unhashed install": job.replace(" --require-hashes", "", 1),
+        }.items():
+            with self.subTest(mutation=name):
+                mutated = workflow[:start] + mutated_job + workflow[end:]
+                self.assertTrue(real_weight_pip_policy_errors(mutated))
 
     def test_sana_drift_ceiling_lane_is_operator_dispatched_and_keeps_its_evidence(self) -> None:
         """sc-18249: the SANA 6.0 drift ceiling must be enforced by a lane a workflow can run.
