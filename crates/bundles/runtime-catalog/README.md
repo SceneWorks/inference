@@ -43,8 +43,10 @@ catalog.snapshot();   // RuntimeCatalogSnapshot   — stable, JSON-serializable,
 preparer backends. Its `generator_capabilities` and `audio_generator_capabilities` arrays
 are derived directly from each registered `ModelDescriptor` and include modality,
 conditioning kinds, LoRA/LoKr support, precision tiers, preview support, samplers,
-schedulers, and guidance methods. `to_json()` renders this weights-free form for release
-tooling, backend-parity generation, and external smoke projects.
+schedulers, and guidance methods. `trainer_capabilities` likewise carries LoRA, LoKr,
+control-branch, and full-fine-tune support directly from every `TrainerDescriptor`.
+`to_json()` renders this weights-free form for release tooling, backend-parity generation,
+and external smoke projects.
 
 The crate re-exports `core_llm` and `gen_core` so a bundle (and its consumers) reach the
 contract types through this one path.

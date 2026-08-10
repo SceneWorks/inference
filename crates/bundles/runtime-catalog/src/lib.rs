@@ -9,7 +9,9 @@ pub use gen_core;
 pub use gen_core::memory_strategy;
 
 use core_llm::{SnapshotPreparerRegistry, TextLlmRegistry};
-use gen_core::{ConditioningKind, Modality, ModelDescriptor, ProviderRegistry, Quant};
+use gen_core::{
+    ConditioningKind, Modality, ModelDescriptor, ProviderRegistry, Quant, TrainerDescriptor,
+};
 
 /// Failure to construct a supported runtime composition.
 #[derive(Debug)]
@@ -238,6 +240,13 @@ impl RuntimeCatalog {
                 .media
                 .trainers()
                 .map(|registration| (registration.descriptor)().id.to_string())
+                .collect(),
+            trainer_capabilities: self
+                .media
+                .trainers()
+                .map(|registration| {
+                    TrainerCapabilitySnapshot::from_descriptor(&(registration.descriptor)())
+                })
                 .collect(),
             captioner_ids: self
                 .media
@@ -659,6 +668,47 @@ fn quant_name(quant: Quant) -> &'static str {
     }
 }
 
+/// The complete weights-free capability surface of one registered trainer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrainerCapabilitySnapshot {
+    pub id: String,
+    pub family: String,
+    pub backend: String,
+    pub modality: String,
+    pub supports_lora: bool,
+    pub supports_lokr: bool,
+    pub supports_control: bool,
+    pub supports_full_finetune: bool,
+}
+
+impl TrainerCapabilitySnapshot {
+    fn from_descriptor(descriptor: &TrainerDescriptor) -> Self {
+        Self {
+            id: descriptor.id.to_string(),
+            family: descriptor.family.to_string(),
+            backend: descriptor.backend.to_string(),
+            modality: modality_name(descriptor.modality).to_string(),
+            supports_lora: descriptor.supports_lora,
+            supports_lokr: descriptor.supports_lokr,
+            supports_control: descriptor.supports_control,
+            supports_full_finetune: descriptor.supports_full_finetune,
+        }
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.id,
+            "family": self.family,
+            "backend": self.backend,
+            "modality": self.modality,
+            "supports_lora": self.supports_lora,
+            "supports_lokr": self.supports_lokr,
+            "supports_control": self.supports_control,
+            "supports_full_finetune": self.supports_full_finetune,
+        })
+    }
+}
+
 /// Stable, machine-readable provider inventory for release and product compatibility checks.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeCatalogSnapshot {
@@ -674,6 +724,8 @@ pub struct RuntimeCatalogSnapshot {
     pub transform_ids: Vec<String>,
     /// Trainer ids — each a `load_trainer` key.
     pub trainer_ids: Vec<String>,
+    /// Trainer descriptor capabilities, in the same stable order as `trainer_ids`.
+    pub trainer_capabilities: Vec<TrainerCapabilitySnapshot>,
     /// Captioner ids — each a `load_captioner` key.
     pub captioner_ids: Vec<String>,
     /// Image-embedder ids — each a `load_image_embedder` key.
@@ -731,6 +783,7 @@ impl RuntimeCatalogSnapshot {
             "generator_capabilities": self.generator_capabilities.iter().map(GeneratorCapabilitySnapshot::to_json).collect::<Vec<_>>(),
             "transform_ids": self.transform_ids,
             "trainer_ids": self.trainer_ids,
+            "trainer_capabilities": self.trainer_capabilities.iter().map(TrainerCapabilitySnapshot::to_json).collect::<Vec<_>>(),
             "captioner_ids": self.captioner_ids,
             "image_embedder_ids": self.image_embedder_ids,
             "text_embedder_ids": self.text_embedder_ids,
@@ -853,6 +906,34 @@ mod tests {
             GeneratorCapabilitySnapshot::from_descriptor(&descriptor).to_json(),
             GeneratorCapabilitySnapshot::from_descriptor(&mutated).to_json(),
             "a descriptor capability mutation must change the machine-readable snapshot"
+        );
+    }
+
+    #[test]
+    fn trainer_capability_snapshot_tracks_every_training_mode() {
+        let descriptor = gen_core::TrainerDescriptor {
+            id: "mage_flow_base",
+            family: "mage_flow",
+            backend: "mlx",
+            modality: gen_core::Modality::Image,
+            supports_lora: true,
+            supports_lokr: false,
+            supports_control: false,
+            supports_full_finetune: true,
+        };
+        let snapshot = TrainerCapabilitySnapshot::from_descriptor(&descriptor);
+        let json = snapshot.to_json();
+        assert_eq!(json["supports_lora"], true);
+        assert_eq!(json["supports_lokr"], false);
+        assert_eq!(json["supports_control"], false);
+        assert_eq!(json["supports_full_finetune"], true);
+
+        let mut mutated = descriptor;
+        mutated.supports_full_finetune = false;
+        assert_ne!(
+            TrainerCapabilitySnapshot::from_descriptor(&descriptor).to_json(),
+            TrainerCapabilitySnapshot::from_descriptor(&mutated).to_json(),
+            "a trainer descriptor mutation must change the machine-readable snapshot"
         );
     }
 
