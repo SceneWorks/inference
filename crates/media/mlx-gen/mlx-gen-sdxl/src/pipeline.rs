@@ -22,7 +22,7 @@ use crate::inpaint::InpaintBlend;
 use crate::sampler::{AncestralEuler, EulerSampler};
 use crate::text_encoder::ClipTextEncoder;
 use crate::unet::{ControlNet, ControlResiduals, UNet2DConditionModel};
-use crate::vae::Autoencoder;
+use crate::vae::{Autoencoder, SdxlLatentDecoder};
 
 /// VAE spatial downscale (latent is image/8 per side).
 pub const SPATIAL_SCALE: u32 = 8;
@@ -1116,14 +1116,18 @@ pub fn decode_image_tiled(
     tiling: Option<&mlx_gen::tiling::TilingConfig>,
     cancel: Option<&CancelFlag>,
 ) -> Result<Image> {
-    let decoded = match (pid, tiling) {
-        (Some(d), _) => d
-            .decode(&latents.transpose_axes(&[0, 3, 1, 2])?)?
-            .transpose_axes(&[0, 2, 3, 1])?,
-        (None, Some(cfg)) => vae.decode_tiled(latents, cfg, cancel)?,
-        (None, None) => vae.decode(latents)?,
+    if cancel.is_some_and(CancelFlag::is_cancelled) {
+        return Err(Error::Canceled);
+    }
+    let native = SdxlLatentDecoder::new(vae);
+    let decoder: &dyn LatentDecoder = pid.unwrap_or(&native);
+    mlx_gen::ensure_decoder_compatible(Some(&mlx_gen::gen_core::SDXL_LATENT_SPACE), decoder)?;
+    let nchw = latents.transpose_axes(&[0, 3, 1, 2])?;
+    let decoded = match tiling {
+        Some(cfg) => decoder.decode_tiled(&nchw, cfg, cancel)?,
+        None => decoder.decode(&nchw)?,
     };
-    decoded_to_image(&decoded)
+    decoded_to_image(&decoded.transpose_axes(&[0, 2, 3, 1])?)
 }
 
 /// Render one preview sample (sc-5637) from the **in-progress training adapter** already installed

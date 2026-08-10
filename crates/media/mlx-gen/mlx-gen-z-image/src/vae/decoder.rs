@@ -335,6 +335,15 @@ impl LatentDecoder for Vae {
     fn decode(&self, latents: &Array) -> Result<Array> {
         Vae::decode(self, latents)
     }
+
+    fn decode_tiled(
+        &self,
+        latents: &Array,
+        tiling: &TilingConfig,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<Array> {
+        Vae::decode_tiled(self, latents, tiling, cancel)
+    }
 }
 
 #[cfg(test)]

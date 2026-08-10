@@ -34,7 +34,7 @@ use candle_gen::gen_core::sampling::DiscreteModelSampling;
 use candle_gen::gen_core::{self, Image, Progress};
 use candle_gen::{CandleError, LatentDecoder, Result};
 
-use crate::pipeline::VAE_SCALE;
+use crate::pipeline::{sdxl_tiling_config, SdxlLatentDecoder};
 use crate::sampler::EulerAncestralSampler;
 use crate::unet::{ControlNet, ControlResiduals, UNet2DConditionModel};
 
@@ -148,12 +148,12 @@ pub fn preprocess_control_image(
 /// post-process), reading the output size from the decoded tensor (never `latent·8`, since PiD emits a
 /// larger `[1, 3, 4H, 4W]`).
 ///
-/// **Latent convention (sc-7848 parity):** the native VAE path un-scales by `VAE_SCALE` (candle
-/// de-scales in the pipeline, not inside `vae.decode`), while the PiD `sdxl` student was trained on the
-/// **0.13025-normalized** latent — the scaled sampler output — so it receives `latents` unchanged.
-/// This mirrors `crate::pipeline::Pipeline::decode` exactly.
+/// **Latent convention (sc-7848 parity):** the seam receives the **0.13025-normalized** sampler
+/// latent. [`SdxlLatentDecoder`] owns the native VAE's `1 / VAE_SCALE` de-normalization, while the
+/// PiD `sdxl` student consumes the normalized latent unchanged. This mirrors
+/// `crate::pipeline::Pipeline::decode` exactly.
 ///
-/// The native VAE decode routes through the shared `crate::pipeline::tiled_vae_decode` (F-061 /
+/// The native VAE decode routes through the shared [`LatentDecoder::decode_tiled`] seam (F-061 /
 /// sc-9045), so every bespoke lane that calls this — the trainer preview, the IP / edit / InstantID
 /// providers — gets the same sc-4987 budgeted VAE tiling the registered
 /// `crate::pipeline::Pipeline::decode` path uses. The tiling only bounds peak VRAM on large latents
@@ -163,14 +163,18 @@ pub fn decode_image(
     vae: &AutoEncoderKL,
     latents: &Tensor,
     pid: Option<&dyn LatentDecoder>,
+    cancel: Option<&CancelFlag>,
 ) -> Result<Image> {
-    let img = match pid {
-        // PiD decodes (and 4× super-resolves) the normalized latent directly — no VAE de-scale.
-        Some(pid) => pid.decode(latents)?,
-        None => {
-            let unscaled = (latents / VAE_SCALE)?;
-            crate::pipeline::tiled_vae_decode(vae, &unscaled)?
-        }
+    let native = SdxlLatentDecoder::new(vae);
+    let decoder: &dyn LatentDecoder = pid.unwrap_or(&native);
+    if cancel.is_some_and(CancelFlag::is_cancelled) {
+        return Err(CandleError::Canceled);
+    }
+    candle_gen::ensure_decoder_compatible(Some(&candle_gen::gen_core::SDXL_LATENT_SPACE), decoder)?;
+    let img = if crate::vae_tiling_enabled() {
+        decoder.decode_tiled(latents, &sdxl_tiling_config(), cancel)?
+    } else {
+        decoder.decode(latents)?
     };
     let img = ((img / 2.)? + 0.5)?.clamp(0f32, 1f32)?;
     let scaled = (img * 255.)?;

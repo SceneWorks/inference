@@ -233,6 +233,15 @@ impl LatentDecoder for QwenVae {
     fn decode(&self, latents: &Array) -> Result<Array> {
         QwenVae::decode(self, latents)
     }
+
+    fn decode_tiled(
+        &self,
+        latents: &Array,
+        tiling: &TilingConfig,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<Array> {
+        QwenVae::decode_tiled(self, latents, tiling, cancel)
+    }
 }
 
 /// Add a singleton temporal axis to a 4-D `(B, C, H, W)` tensor → `(B, C, 1, H, W)`.

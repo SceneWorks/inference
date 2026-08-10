@@ -593,6 +593,10 @@ fn decode(
 
     let decoded = match pid {
         Some(d) => {
+            candle_gen::ensure_decoder_layout(
+                Some(&candle_gen::gen_core::FLUX2_PACKED_LATENT_SPACE),
+                d,
+            )?;
             // Reconstruct the FLUX.2-canonical packed BN-normalized latent the flux2 student trained on:
             // raw NCHW [1,32,H/8,W/8] -> canonical (c,ph,pw) patchify [1,128,H/16,W/16] -> BN-normalize.
             let patched = candle_gen_flux2::vae::patchify(&latent)?; // [1,128,gh,gw] (c,ph,pw)

@@ -95,7 +95,7 @@ pub use control::{
     require_base_dir, require_base_snapshot, require_component_file, require_control,
     AcceptedControlKinds, ControlBranch,
 };
-pub use decoder::LatentDecoder;
+pub use decoder::{ensure_decoder_compatible, ensure_decoder_layout, LatentDecoder};
 pub use error::{Error, Result};
 pub use gen_core::sampling::{
     flow_capture_plan, schedule_sigmas, vp_capture_plan, vp_sigma_from_edm, CapturePlan,
