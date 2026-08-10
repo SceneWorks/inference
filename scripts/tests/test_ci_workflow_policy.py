@@ -394,7 +394,7 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
         # `mlx-qwen-image-producers` jobs; 24 since sc-17250 added the JoyCaption and
         # MOSS-TTS-Realtime jobs; 22 before).
         MACOS_HUB_LOCK: 29,
-        WINDOWS_HUB_LOCK: 10,
+        WINDOWS_HUB_LOCK: 11,
         WINDOWS_MAGE_LOCK: 1,
         MACOS_MAGE_LOCK: 1,
     }
@@ -560,7 +560,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
         self.assertEqual(real_weight_pip_policy_errors(workflow), [])
         self.assertEqual(workflow.count(MACOS_HUB_LOCK), 29)
-        self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 10)
+        self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 11)
         self.assertEqual(workflow.count(WINDOWS_MAGE_LOCK), 1)
         self.assertNotRegex(
             workflow,
@@ -1351,6 +1351,43 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("z-image-turbo-model-inventory.json", job)
         self.assertIn("verifier-result.txt", job)
         self.assertIn("memory-evidence-v1-z-image-${{ github.sha }}", job)
+
+    def test_scail2_shared_cuda_lane_is_exact_revision_provider_exercised_and_measured(self) -> None:
+        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        start = workflow.index("  candle-scail2-shared:")
+        end = workflow.index("\n  candle-media:", start)
+        job = workflow[start:end]
+
+        self.assertIn("scail2", workflow.split("jobs:", 1)[0])
+        self.assertIn(
+            "if: github.event_name == 'workflow_dispatch' && inputs.profile == 'scail2'",
+            job,
+        )
+        self.assertNotIn("github.event_name == 'schedule'", job)
+        self.assertIn('SCAIL2_REPOSITORY: "SceneWorks/scail2-mlx"', job)
+        self.assertIn(
+            'SCAIL2_REVISION: "ce88cfdb1008f395e9c820e525e6db7b6695f7b3"', job
+        )
+        self.assertIn('allow_patterns=["bf16/**"]', job)
+        self.assertIn("models--SceneWorks--scail2-mlx", job)
+        for required in (
+            "config.json",
+            "dit.safetensors",
+            "t5_encoder.safetensors",
+            "tokenizer.json",
+            "clip.safetensors",
+            "vae.safetensors",
+        ):
+            self.assertIn(required, job)
+        self.assertIn(
+            "pipeline::tests::shared_bf16_real_weights_cuda_loads_and_renders_with_measured_peak",
+            job,
+        )
+        self.assertIn("Load through the production provider", job)
+        self.assertIn("[[SCAIL2_CUDA_VRAM]]", job)
+        self.assertIn("-- --ignored --exact --nocapture", job)
+        self.assertIn("actions/upload-artifact@", job)
+        self.assertIn("scail2-shared-cuda-${{ github.sha }}", job)
 
     def test_sana_drift_ceiling_lane_is_operator_dispatched_and_keeps_its_evidence(self) -> None:
         """sc-18249: the SANA 6.0 drift ceiling must be enforced by a lane a workflow can run.

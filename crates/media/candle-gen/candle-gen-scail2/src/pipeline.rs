@@ -17,9 +17,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use candle_gen::candle_core::{safetensors as cst, DType, Device, Tensor};
-use candle_gen::candle_nn::var_builder::Rename;
-use candle_gen::candle_nn::VarBuilder;
+use candle_gen::candle_core::{
+    safetensors as cst, DType, Device, Error as CoreError, Result as CoreResult, Shape, Tensor,
+};
+use candle_gen::candle_nn::var_builder::{Rename, SimpleBackend};
+use candle_gen::candle_nn::{Init, VarBuilder};
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
     GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Progress, Quant,
@@ -30,6 +32,7 @@ use candle_gen_wan::config::{TextEncoderConfig, Vae16Config, MAX_AREA_14B};
 use candle_gen_wan::scheduler::Sampler;
 use candle_gen_wan::text_encoder::Umt5Encoder;
 use candle_gen_wan::vae16::WanVae16;
+use cst::Load;
 
 use crate::clip::{ClipVisionConfig, ScailClip};
 use crate::config::Scail2Config;
@@ -182,6 +185,96 @@ fn component_vb(root: &Path, device: &Device, sub: &str) -> CResult<VarBuilder<'
     candle_gen::component_vb(root, sub, DType::F32, device, "scail2")
 }
 
+/// A safetensors backend that performs precision widening on the CPU before the final device
+/// transfer. Candle's stock mmap backend does these operations in the opposite order
+/// (`load(name, target_device)?.to_dtype(dtype)`), which turns one bf16 SCAIL tensor into a bf16 CUDA
+/// staging allocation followed by its f32 resident allocation. The CUDA caching allocator retains
+/// the freed staging blocks; across the 14B DiT that is roughly 28 GiB of avoidable device pressure.
+///
+/// This backend remains bounded: it maps the checkpoint, materializes one requested tensor on CPU,
+/// casts that tensor on CPU, uploads the final f32 bytes, and drops the host tensor when `get` returns.
+/// It therefore does not need the whole 47.2 GB shared package in host memory at once.
+struct CpuCastMmap {
+    tensors: cst::MmapedSafetensors,
+}
+
+impl CpuCastMmap {
+    fn load_cpu(&self, name: &str, dtype: DType) -> CoreResult<Tensor> {
+        let tensor = self.tensors.load(name, &Device::Cpu)?;
+        let tensor = if tensor.dtype() == dtype {
+            tensor
+        } else {
+            tensor.to_dtype(dtype)?
+        };
+        debug_assert!(tensor.device().is_cpu());
+        Ok(tensor)
+    }
+}
+
+impl SimpleBackend for CpuCastMmap {
+    fn get(
+        &self,
+        shape: Shape,
+        name: &str,
+        _: Init,
+        dtype: DType,
+        device: &Device,
+    ) -> CoreResult<Tensor> {
+        let tensor = self.load_cpu(name, dtype)?;
+        if tensor.shape() != &shape {
+            return Err(CoreError::Msg(format!(
+                "scail2: shape mismatch for {name}: expected {shape:?}, got {:?}",
+                tensor.shape()
+            )));
+        }
+        tensor.to_device(device)
+    }
+
+    fn get_unchecked(&self, name: &str, dtype: DType, device: &Device) -> CoreResult<Tensor> {
+        self.load_cpu(name, dtype)?.to_device(device)
+    }
+
+    fn contains_tensor(&self, name: &str) -> bool {
+        self.tensors.get(name).is_ok()
+    }
+}
+
+/// Build a bounded mmap var-builder whose source tensors are always cast on CPU before upload.
+fn cpu_cast_mmap_var_builder(
+    files: &[PathBuf],
+    dtype: DType,
+    device: &Device,
+) -> CResult<VarBuilder<'static>> {
+    // SAFETY: the same invariant as `candle_gen::mmap_var_builder`: these are process-owned,
+    // read-only model files and are not mutated or truncated while the mapping is live.
+    let tensors = unsafe { cst::MmapedSafetensors::multi(files)? };
+    Ok(VarBuilder::from_backend(
+        Box::new(CpuCastMmap { tensors }),
+        dtype,
+        device.clone(),
+    ))
+}
+
+/// Load a checkpoint to a CPU tensor map and widen every tensor to f32 there. Adapter merging and the
+/// shared VAE key remap require a mutable whole-model map, so they cannot use the bounded backend;
+/// this helper gives them the same no-bf16-on-CUDA invariant as the stock dense path.
+fn cpu_f32_tensor_map(files: &[PathBuf]) -> CResult<HashMap<String, Tensor>> {
+    // SAFETY: the same read-only, process-owned model-file invariant as the builder above.
+    let tensors = unsafe { cst::MmapedSafetensors::multi(files)? };
+    let mut out = HashMap::new();
+    for (name, view) in tensors.tensors() {
+        let tensor = view.load(&Device::Cpu)?;
+        let tensor = if tensor.dtype() == DType::F32 {
+            tensor
+        } else {
+            tensor.to_dtype(DType::F32)?
+        };
+        debug_assert!(tensor.device().is_cpu());
+        out.insert(name, tensor);
+    }
+    Ok(out)
+}
+
 /// Translate the candle/Hugging Face UMT5 key requested by [`Umt5Encoder`] to the normalized key in
 /// the shared MLX tier's `t5_encoder.safetensors`. This is a pure key projection: tensor bytes and
 /// shapes are unchanged.
@@ -216,7 +309,7 @@ fn shared_umt5_key(key: &str) -> String {
 
 fn shared_umt5_vb(root: &Path, device: &Device) -> CResult<VarBuilder<'static>> {
     let file = root.join("t5_encoder.safetensors");
-    let inner = candle_gen::mmap_var_builder(std::slice::from_ref(&file), DType::F32, device)?;
+    let inner = cpu_cast_mmap_var_builder(std::slice::from_ref(&file), DType::F32, device)?;
     let renamer: Box<dyn Fn(&str) -> String + Send + Sync> = Box::new(shared_umt5_key);
     Ok(VarBuilder::from_backend(
         Box::new(Rename::new(inner, renamer)),
@@ -226,7 +319,7 @@ fn shared_umt5_vb(root: &Path, device: &Device) -> CResult<VarBuilder<'static>> 
 }
 
 fn shared_vae_vb(root: &Path, device: &Device) -> CResult<VarBuilder<'static>> {
-    let map = cst::load(root.join("vae.safetensors"), &Device::Cpu)?;
+    let map = cpu_f32_tensor_map(&[root.join("vae.safetensors")])?;
     let map = candle_gen::remap_vae_wan_to_diffusers(map)?;
     Ok(VarBuilder::from_tensors(map, DType::F32, device))
 }
@@ -246,43 +339,30 @@ pub struct Scail2 {
 }
 
 impl Scail2 {
-    /// Build the DiT [`VarBuilder`] over the `transformer/` snapshot. With no adapters this is the
-    /// stock f32 mmap build — **byte-identical** to the pre-sc-6838 path (the empty-adapter regression
-    /// gate). With adapters, the base tensors are loaded to a CPU map, each delta is folded in
+    /// Build the DiT [`VarBuilder`] over the shared flat file or legacy `transformer/` snapshot. The
+    /// stock path streams one tensor at a time through the CPU f32 cast; with adapters, the base
+    /// tensors are loaded to a CPU map and each delta is folded in
     /// ([`crate::adapters::merge_adapters`], f32 math — merge not residual, the chaos-sensitive-sampler
     /// rationale), the **whole map is cast to f32 on the CPU**, then the DiT is built from it.
     ///
     /// The host-side f32 cast is load-bearing for memory: SCAIL-2's DiT is f32, so a bf16 base tensor
-    /// served through `from_tensors(F32, gpu)` would cast bf16→f32 *on the GPU*, and candle's CUDA
+    /// served through Candle's stock mmap backend would upload bf16 and cast bf16→f32 *on the GPU*,
+    /// and candle's CUDA
     /// caching allocator retains the freed bf16 staging blocks — ~28 GiB piled on top of the ~56 GiB
     /// f32 DiT, OOM-ing at the VAE-decode peak even on a 96 GiB card. Casting host-side (host RAM is
-    /// ample, the map is transient) makes `get` a pure f32 host→device move, so the GPU footprint
-    /// matches the stock mmap path exactly. (The Wan-14B merge path doesn't need this — its DiT is
-    /// bf16, so `from_tensors` never casts on the GPU.)
+    /// ample, the map is transient) makes `get` a pure f32 host→device move. The Wan-14B merge path
+    /// doesn't need this because its DiT is bf16, so `from_tensors` never casts on the GPU.
     fn transformer_vb(&self) -> CResult<VarBuilder<'static>> {
-        if self.adapters.is_empty() {
-            return match self.layout {
-                SnapshotLayout::SharedMlxTier => candle_gen::mmap_var_builder(
-                    &[self.root.join("dit.safetensors")],
-                    DType::F32,
-                    &self.device,
-                ),
-                SnapshotLayout::LegacyComponents => {
-                    component_vb(&self.root, &self.device, "transformer")
-                }
-            };
-        }
         let files = match self.layout {
             SnapshotLayout::SharedMlxTier => vec![self.root.join("dit.safetensors")],
             SnapshotLayout::LegacyComponents => {
                 candle_gen::sorted_safetensors(&self.root.join("transformer"), "scail2")?
             }
         };
-        let mut tensors: HashMap<String, Tensor> = HashMap::new();
-        for f in &files {
-            let part = candle_gen::candle_core::safetensors::load(f, &Device::Cpu)?;
-            tensors.extend(part);
+        if self.adapters.is_empty() {
+            return cpu_cast_mmap_var_builder(&files, DType::F32, &self.device);
         }
+        let mut tensors = cpu_f32_tensor_map(&files)?;
         // Discard the merge report — the silent twin (`candle-gen-z-image`'s
         // `transformer_vb_with_adapters`) does the same; a mismatched adapter surface already errors
         // inside `merge_adapters`, so library code stays quiet on stderr (sc-9035 / F-051).
@@ -292,6 +372,7 @@ impl Scail2 {
             if v.dtype() != DType::F32 {
                 *v = v.to_dtype(DType::F32)?;
             }
+            debug_assert!(v.device().is_cpu());
         }
         Ok(VarBuilder::from_tensors(tensors, DType::F32, &self.device))
     }
@@ -311,7 +392,7 @@ impl Scail2 {
         };
         let vae = WanVae16::new_with_encoder(&Vae16Config::wan21(), vae_vb)?;
         let clip_vb = match self.layout {
-            SnapshotLayout::SharedMlxTier => candle_gen::mmap_var_builder(
+            SnapshotLayout::SharedMlxTier => cpu_cast_mmap_var_builder(
                 &[self.root.join("clip.safetensors")],
                 DType::F32,
                 &self.device,
@@ -772,6 +853,262 @@ mod tests {
             shared_umt5_key("encoder.block.0.unexpected.weight"),
             "encoder.block.0.unexpected.weight",
             "unknown keys stay loud at the underlying missing-tensor gate"
+        );
+    }
+
+    fn write_bf16_safetensors(path: &Path) {
+        let cpu = Device::Cpu;
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "weight".to_owned(),
+            Tensor::new(&[[1.0_f32, 2.0], [3.0, 4.0]], &cpu)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap(),
+        );
+        tensors.insert(
+            "bias".to_owned(),
+            Tensor::new(&[5.0_f32, 6.0], &cpu)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap(),
+        );
+        cst::save(&tensors, path).unwrap();
+    }
+
+    #[test]
+    fn shared_dense_loader_casts_on_cpu_and_releases_source_mapping() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source.safetensors");
+        let moved = tmp.path().join("moved.safetensors");
+        write_bf16_safetensors(&source);
+
+        let map = cpu_f32_tensor_map(std::slice::from_ref(&source)).unwrap();
+        assert_eq!(map.len(), 2);
+        for tensor in map.values() {
+            assert_eq!(tensor.dtype(), DType::F32);
+            assert!(tensor.device().is_cpu());
+        }
+        // The returned CPU/F32 map owns its tensors rather than retaining a live file mapping. This
+        // is especially load-bearing on Windows, where an open mmap would make the rename fail.
+        std::fs::rename(&source, &moved).unwrap();
+        assert_eq!(
+            map["weight"]
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+            vec![1.0, 2.0, 3.0, 4.0]
+        );
+    }
+
+    #[test]
+    fn bounded_shared_backend_returns_final_dtype_without_retaining_bf16_tensor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source.safetensors");
+        write_bf16_safetensors(&source);
+
+        // Exercise the backend's pre-upload seam directly: the only tensor it can hand to the
+        // target-device transfer is already CPU/F32.
+        let mapped =
+            unsafe { cst::MmapedSafetensors::multi(std::slice::from_ref(&source)) }.unwrap();
+        let backend = CpuCastMmap { tensors: mapped };
+        let prepared = backend.load_cpu("weight", DType::F32).unwrap();
+        assert_eq!(prepared.dtype(), DType::F32);
+        assert!(prepared.device().is_cpu());
+        assert_eq!(prepared.dims(), &[2, 2]);
+
+        // And exercise the exact VarBuilder path used by dense DiT/T5/CLIP. A mutation back to the
+        // stock mmap backend makes the source-structure gate below fail even though CPU-only CI
+        // cannot observe the intermediate CUDA allocation.
+        let vb = cpu_cast_mmap_var_builder(std::slice::from_ref(&source), DType::F32, &Device::Cpu)
+            .unwrap();
+        let loaded = vb.get((2, 2), "weight").unwrap();
+        assert_eq!(loaded.dtype(), DType::F32);
+        assert!(loaded.device().is_cpu());
+    }
+
+    #[test]
+    fn every_shared_component_avoids_the_stock_device_then_cast_backend() {
+        let source = include_str!("pipeline.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source before tests");
+        let forbidden = [
+            "SnapshotLayout::SharedMlxTier => candle_gen::",
+            "mmap_var_builder",
+        ]
+        .concat();
+        assert!(
+            !source.contains(&forbidden),
+            "a shared component must never upload its stored dtype before widening to f32"
+        );
+        for required in [
+            "let inner = cpu_cast_mmap_var_builder",
+            "return cpu_cast_mmap_var_builder(&files",
+            "SnapshotLayout::SharedMlxTier => cpu_cast_mmap_var_builder",
+            "let map = cpu_f32_tensor_map(&[root.join(\"vae.safetensors\")])",
+        ] {
+            assert!(
+                source.contains(required),
+                "shared dense component lost the CPU-first loader seam: {required}"
+            );
+        }
+        assert!(
+            source.contains("let mut tensors = cpu_f32_tensor_map(&files)?"),
+            "the adapter DiT must begin from the same CPU/F32 invariant as the stock path"
+        );
+    }
+
+    /// Exact shared-package CUDA gate. The official real-weight workflow provisions
+    /// `SceneWorks/scail2-mlx@ce88cfdb.../bf16`, runs this test on an otherwise-idle CUDA device,
+    /// and records both driver-reserved (the admission unit) and concurrent-live pool peaks.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs the exact 47.2 GB shared SCAIL bf16 package and an idle >=96 GB CUDA GPU"]
+    fn shared_bf16_real_weights_cuda_loads_and_renders_with_measured_peak() {
+        const REPOSITORY: &str = "SceneWorks/scail2-mlx";
+        const REVISION: &str = "ce88cfdb1008f395e9c820e525e6db7b6695f7b3";
+        const WIDTH: u32 = 832;
+        const HEIGHT: u32 = 480;
+        const FRAMES: usize = 81;
+        const STEPS: u32 = 1;
+
+        let root = PathBuf::from(
+            std::env::var("SCAIL2_SHARED_BF16_DIR")
+                .expect("set SCAIL2_SHARED_BF16_DIR to the exact Model Manager bf16 tier"),
+        );
+        let canonical = root.canonicalize().expect("canonical shared snapshot path");
+        let normalized = canonical.to_string_lossy().replace('\\', "/");
+        let expected_suffix = format!("models--SceneWorks--scail2-mlx/snapshots/{REVISION}/bf16");
+        assert!(
+            normalized.ends_with(&expected_suffix),
+            "snapshot must be the exact fixed repository/revision/tier, got {normalized}"
+        );
+        assert_eq!(
+            snapshot_layout(&canonical).unwrap(),
+            SnapshotLayout::SharedMlxTier
+        );
+
+        let mut source_dtypes = Vec::new();
+        for file in [
+            "dit.safetensors",
+            "t5_encoder.safetensors",
+            "vae.safetensors",
+            "clip.safetensors",
+        ] {
+            let path = canonical.join(file);
+            let mapped = unsafe { cst::MmapedSafetensors::new(&path) }.unwrap();
+            let mut counts = std::collections::BTreeMap::<String, usize>::new();
+            for (_, view) in mapped.tensors() {
+                *counts.entry(format!("{:?}", view.dtype())).or_default() += 1;
+            }
+            source_dtypes.push(format!("{file}={counts:?}"));
+        }
+        assert!(
+            source_dtypes[0].contains("BF16"),
+            "DiT must exercise widening"
+        );
+        assert!(
+            source_dtypes[1].contains("BF16"),
+            "T5 must exercise widening"
+        );
+        assert!(
+            source_dtypes[2].contains("F32"),
+            "VAE is the shared f32 companion"
+        );
+        assert!(
+            source_dtypes[3].contains("F32"),
+            "CLIP is the shared f32 companion"
+        );
+
+        let pool =
+            candle_gen::cuda_mempool::MemPool::device_default(0).expect("CUDA default memory pool");
+        assert!(pool.reset_high_water(), "reset CUDA pool high-water marks");
+        let mut probe = candle_gen::testkit::VramProbe::start_rendered().assert_idle(1.0);
+
+        let load_phase = probe.phase();
+        let load_started = std::time::Instant::now();
+        // Use the public provider entry point that worker dispatch calls. `load` deliberately keeps
+        // component construction lazy, so its settled residency is near zero; the generate phase
+        // below covers both real component materialization and the smallest valid render.
+        let model = load(&LoadSpec::new(WeightsSource::Dir(canonical)))
+            .expect("production SCAIL provider accepts the shared package");
+        probe.end_load(load_phase);
+        let load_seconds = load_started.elapsed().as_secs_f64();
+
+        let image = |rgb: [u8; 3]| Image {
+            width: WIDTH,
+            height: HEIGHT,
+            pixels: std::iter::repeat_n(rgb, (WIDTH * HEIGHT) as usize)
+                .flatten()
+                .collect(),
+        };
+        let driving_frame = image([96, 128, 160]);
+        let driving_mask = image([0, 0, 255]);
+        let req = GenerationRequest {
+            prompt: "a character follows the driving motion".to_owned(),
+            negative_prompt: Some(String::new()),
+            width: WIDTH,
+            height: HEIGHT,
+            count: 1,
+            steps: Some(STEPS),
+            guidance: Some(5.0),
+            seed: Some(18473),
+            fps: Some(16),
+            video_mode: Some("animation".to_owned()),
+            conditioning: vec![
+                Conditioning::Reference {
+                    image: image([120, 80, 40]),
+                    strength: None,
+                },
+                Conditioning::Mask {
+                    image: image([0, 0, 255]),
+                },
+                Conditioning::ControlClip {
+                    frames: vec![driving_frame; FRAMES],
+                    mask: vec![driving_mask; FRAMES],
+                    masking_strength: 1.0,
+                    start_frame: 0,
+                    mode: Default::default(),
+                },
+            ],
+            ..Default::default()
+        };
+        let render_phase = probe.phase();
+        let render_started = std::time::Instant::now();
+        let output = model
+            .generate(&req, &mut |_| {})
+            .expect("minimal production-provider render");
+        probe.end_gen(render_phase);
+        let render_seconds = render_started.elapsed().as_secs_f64();
+        let GenerationOutput::Video { frames, fps, .. } = output else {
+            panic!("SCAIL must return video");
+        };
+        assert_eq!(frames.len(), FRAMES);
+        assert_eq!(fps, 16);
+        assert!(frames
+            .iter()
+            .any(|frame| frame.pixels.iter().any(|&v| v != 0)));
+
+        let report = probe.report().assert_trustworthy(1.0);
+        let used_high = pool.used_high().expect("USED_MEM_HIGH") as f64 / 1.0e9;
+        let reserved_high = pool.reserved_high().expect("RESERVED_MEM_HIGH") as f64 / 1.0e9;
+        assert!(
+            report.peak_gb > 70.0,
+            "real F32 stack was not observed through the production provider: {report}"
+        );
+        println!(
+            "[[SCAIL2_CUDA_VRAM]] repository={REPOSITORY} revision={REVISION} tier=bf16 width={WIDTH} \
+             height={HEIGHT} frames={FRAMES} steps={STEPS} baselineGb={:.3} loadPeakGb={:.3} \
+             steadyGb={:.3} overallPeakGb={:.3} poolUsedHighGb={used_high:.3} \
+             poolReservedHighGb={reserved_high:.3} loadSeconds={load_seconds:.3} \
+             renderSeconds={render_seconds:.3} sourceDtypes=\"{}\"",
+            report.baseline_gb,
+            report.load_peak_gb,
+            report.steady_gb,
+            report.peak_gb,
+            source_dtypes.join(";"),
         );
     }
 

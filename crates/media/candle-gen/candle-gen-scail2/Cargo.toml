@@ -34,3 +34,5 @@ cuda = ["candle-gen/cuda", "candle-gen-wan/cuda"]
 image = { version = "0.25", default-features = false, features = ["png"] }
 sceneworks-gen-core-testkit = { workspace = true }
 tempfile = { workspace = true }
+# Device-level load/steady/overall peak sampler for the exact shared-package CUDA gate.
+candle-gen = { path = "../candle-gen", features = ["testkit"] }
