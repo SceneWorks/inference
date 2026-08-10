@@ -594,6 +594,12 @@ impl Wan {
                 None => None,
             };
             let total = steps as u32;
+            // Provider-neutral benchmark boundary: model construction, adapter/quant work, and
+            // context embedding above are pre-denoise preparation. Emit only when the solver is
+            // ready to consume its first latent, matching Qwen and SDXL.
+            mlx_gen::diagnostics::record_phase_boundary(
+                mlx_gen::diagnostics::BenchmarkPhaseBoundary::DenoiseStart,
+            );
             // Curated unified solver (epic 7114, sc-7121): the gen-core-only solvers route through the
             // shared `denoise_curated`; the native unipc/euler/dpmpp2m stay on `scheduler.rs` (N1). The
             // image-conditioned TI2V mask-blend (per-token timesteps + a post-step re-blend) has no
@@ -680,6 +686,9 @@ impl Wan {
         }
 
         // --- Stage 3: z48 vae22 decode → RGB8 frames ---
+        mlx_gen::diagnostics::record_phase_boundary(
+            mlx_gen::diagnostics::BenchmarkPhaseBoundary::DecodeStart,
+        );
         on_progress(Progress::Decoding);
         // Causal temporal decode: t_lat → 1 + (t_lat−1)·4 output frames (= gen_frames). The tiling
         // was chosen (and budget-checked) up front by `auto_tiling_budgeted` (sc-4998). sc-5039 casts

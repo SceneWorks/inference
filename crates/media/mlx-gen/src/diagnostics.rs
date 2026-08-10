@@ -17,6 +17,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::time::Instant;
 
 /// P1 retained compiled-operation handles.
 pub const RETAINED_COMPILATION: &str = "retained_compilation";
@@ -64,6 +65,25 @@ pub enum ToggleDisposition {
     Unavailable,
 }
 
+/// Provider-neutral compute boundaries consumed by the P6 benchmark harness.
+///
+/// Providers emit these at the exact point where pre-denoise work ends and where denoise hands its
+/// final latents to the decoder. They are deliberately separate from [`gen_core::Progress`]: the UI
+/// progress contract has historically allowed providers to emit `Step` before or after a solver
+/// evaluation, so it cannot also be a comparable timing boundary.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum BenchmarkPhaseBoundary {
+    DenoiseStart,
+    DecodeStart,
+}
+
+/// One provider-emitted phase boundary measured from the beginning of the diagnostic request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PhaseBoundaryRecord {
+    pub boundary: BenchmarkPhaseBoundary,
+    pub elapsed_nanos: u64,
+}
+
 /// One aggregated diagnostic counter from a request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DiagnosticCounter {
@@ -95,6 +115,7 @@ pub struct DiagnosticReport {
     pub request_id: String,
     pub family: String,
     pub counters: Vec<DiagnosticCounter>,
+    pub phase_boundaries: Vec<PhaseBoundaryRecord>,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -110,6 +131,9 @@ struct Collector {
     family: String,
     requested_toggles: BTreeSet<&'static str>,
     counters: BTreeMap<CounterKey, u64>,
+    started: Instant,
+    phase_boundaries: Vec<PhaseBoundaryRecord>,
+    phase_observer: Option<Box<dyn FnMut(BenchmarkPhaseBoundary)>>,
 }
 
 thread_local! {
@@ -151,6 +175,34 @@ pub fn begin_request_with_toggles(
     family: impl Into<String>,
     requested_toggles: &[&'static str],
 ) -> Result<DiagnosticScope, ScopeAlreadyActive> {
+    begin_request_with_toggles_and_phase_observer(request_id, family, requested_toggles, None)
+}
+
+/// Begin request diagnostics with a synchronous observer for provider-neutral phase boundaries.
+///
+/// The observer runs on the generation thread before the provider proceeds into the next phase.
+/// P6 uses that stop-the-world seam to stop and join the old phase's memory sampler, reset MLX's
+/// native active-memory high-water mark, and start the next sampler without misattributing work.
+pub fn begin_request_with_phase_observer(
+    request_id: impl Into<String>,
+    family: impl Into<String>,
+    requested_toggles: &[&'static str],
+    phase_observer: impl FnMut(BenchmarkPhaseBoundary) + 'static,
+) -> Result<DiagnosticScope, ScopeAlreadyActive> {
+    begin_request_with_toggles_and_phase_observer(
+        request_id,
+        family,
+        requested_toggles,
+        Some(Box::new(phase_observer)),
+    )
+}
+
+fn begin_request_with_toggles_and_phase_observer(
+    request_id: impl Into<String>,
+    family: impl Into<String>,
+    requested_toggles: &[&'static str],
+    phase_observer: Option<Box<dyn FnMut(BenchmarkPhaseBoundary)>>,
+) -> Result<DiagnosticScope, ScopeAlreadyActive> {
     COLLECTOR.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.is_some() {
@@ -161,6 +213,9 @@ pub fn begin_request_with_toggles(
             family: family.into(),
             requested_toggles: requested_toggles.iter().copied().collect(),
             counters: BTreeMap::new(),
+            started: Instant::now(),
+            phase_boundaries: Vec::new(),
+            phase_observer,
         });
         Ok(DiagnosticScope { active: true })
     })
@@ -206,6 +261,25 @@ pub fn record_toggle(toggle: &'static str, disposition: ToggleDisposition) {
     increment(CounterKey::Toggle(toggle, disposition));
 }
 
+/// Record and synchronously publish one provider-neutral phase boundary. No-op outside an active
+/// request, so the production path pays only the request-local diagnostic branch.
+pub fn record_phase_boundary(boundary: BenchmarkPhaseBoundary) {
+    COLLECTOR.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let Some(collector) = slot.as_mut() else {
+            return;
+        };
+        let elapsed_nanos = collector.started.elapsed().as_nanos();
+        collector.phase_boundaries.push(PhaseBoundaryRecord {
+            boundary,
+            elapsed_nanos: u64::try_from(elapsed_nanos).unwrap_or(u64::MAX),
+        });
+        if let Some(observer) = collector.phase_observer.as_mut() {
+            observer(boundary);
+        }
+    });
+}
+
 impl DiagnosticScope {
     /// Finish this request and return its counters in deterministic key order.
     pub fn finish(mut self) -> DiagnosticReport {
@@ -245,6 +319,7 @@ impl DiagnosticScope {
                 request_id: collector.request_id,
                 family: collector.family,
                 counters,
+                phase_boundaries: collector.phase_boundaries,
             }
         })
     }
@@ -323,5 +398,41 @@ mod tests {
         assert!(!toggle_requested("geometry_aware_decode"));
         assert!(scope.finish().counters.is_empty());
         assert!(!toggle_requested("retained_compilation"));
+    }
+
+    #[test]
+    fn phase_boundaries_are_explicit_ordered_and_synchronously_observed() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let observed = Rc::new(RefCell::new(Vec::new()));
+        let observer = Rc::clone(&observed);
+        let scope = begin_request_with_phase_observer("phase", "qwen_image", &[], move |phase| {
+            observer.borrow_mut().push(phase);
+        })
+        .unwrap();
+        record_phase_boundary(BenchmarkPhaseBoundary::DenoiseStart);
+        record_phase_boundary(BenchmarkPhaseBoundary::DecodeStart);
+        let report = scope.finish();
+
+        assert_eq!(
+            *observed.borrow(),
+            [
+                BenchmarkPhaseBoundary::DenoiseStart,
+                BenchmarkPhaseBoundary::DecodeStart,
+            ]
+        );
+        assert_eq!(report.phase_boundaries.len(), 2);
+        assert_eq!(
+            report.phase_boundaries[0].boundary,
+            BenchmarkPhaseBoundary::DenoiseStart
+        );
+        assert_eq!(
+            report.phase_boundaries[1].boundary,
+            BenchmarkPhaseBoundary::DecodeStart
+        );
+        assert!(
+            report.phase_boundaries[0].elapsed_nanos <= report.phase_boundaries[1].elapsed_nanos
+        );
     }
 }

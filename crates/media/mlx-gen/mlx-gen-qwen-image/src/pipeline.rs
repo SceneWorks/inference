@@ -217,6 +217,9 @@ where
     for i in 0..count {
         let seed = base_seed.wrapping_add(i as u64);
         let latents = denoise_one(seed, on_progress)?;
+        mlx_gen::diagnostics::record_phase_boundary(
+            mlx_gen::diagnostics::BenchmarkPhaseBoundary::DecodeStart,
+        );
         on_progress(Progress::Decoding);
         let unpacked = unpack_latents(&latents, width, height)?;
         let decoded = match (pid_decoder, tiling) {

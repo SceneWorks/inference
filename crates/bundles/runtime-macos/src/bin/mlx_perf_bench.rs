@@ -6,25 +6,34 @@ use runtime_macos::gen_core::{
     GenerationOutput, GenerationRequest, LoadSpec, Progress, Quant, WeightsSource,
 };
 use runtime_macos::media::diagnostics::{
-    self, CacheDisposition, CompileDisposition, DiagnosticCounter, DiagnosticReport,
-    ToggleDisposition,
+    self, BenchmarkPhaseBoundary, CacheDisposition, CompileDisposition, DiagnosticCounter,
+    DiagnosticReport, ToggleDisposition,
 };
+use runtime_macos::media::memory_probe::{AllocatorProbe, AllocatorProbeReport};
 use runtime_macos::perf_bench::{
-    build_summary, ArtifactManifest, ArtifactReceipt, BenchmarkFamily, BenchmarkMatrix,
-    BenchmarkSummary, DiagnosticRecord, EnvironmentRecord, MeasurementRecord, ModelTier,
-    OutputFingerprint, PhaseMetrics, PhaseSet, RunRecord, VariantPlan, RUN_SCHEMA_VERSION,
+    build_summary, inventory_artifact, request_receipt, validate_toggle_diagnostics,
+    ArtifactManifest, ArtifactReceipt, BenchmarkFamily, BenchmarkMatrix, BenchmarkSummary,
+    BindingPhase, BuildProvenance, DiagnosticRecord, FrozenCampaign, HostIdentity,
+    MeasurementRecord, MemoryCoverageReceipt, ModelTier, OptimizationToggle, OutputFingerprint,
+    PhaseBoundary, PhaseBoundaryReceipt, PhaseMetrics, PhaseSet, ProgressReceipt,
+    ProviderCapabilityReceipt, RunRecord, StepReceipt, VariantPlan, WorkloadCase,
+    MEMORY_SAMPLE_INTERVAL_MICROS, RUN_SCHEMA_VERSION,
 };
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
+use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::rc::Rc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_MATRIX: &str = include_str!("../../benchmarks/mlx-perf-matrix-v1.json");
+const CAMPAIGN_FILE: &str = "campaign.json";
+const SUMMARY_FILE: &str = "summary.json";
 
 fn main() -> ExitCode {
     match run() {
@@ -39,9 +48,10 @@ fn main() -> ExitCode {
 fn run() -> Result<(), String> {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("validate") => validate_inputs(&args[1..]),
         Some("run") => run_matrix(&args[1..]),
         Some("child") => run_child(&args[1..]),
-        Some("validate") => validate_inputs(&args[1..]),
+        Some("validate-results") => validate_results(&args[1..]),
         _ => Err(usage()),
     }
 }
@@ -49,9 +59,10 @@ fn run() -> Result<(), String> {
 fn usage() -> String {
     "usage:\n  mlx-perf-bench validate [--matrix PATH] --artifacts PATH\n  \
      mlx-perf-bench run [--matrix PATH] --artifacts PATH --output-dir PATH \
-     [--variants baseline,id,...]\n\nThe output directory must be absolute, outside the \
-     checkout, and empty. `run` defaults to the full baseline + independent toggles + all-on \
-     matrix; use `--variants baseline` only for a pre-optimization baseline campaign."
+     [--variants baseline,id,...]\n  \
+     mlx-perf-bench validate-results --results-dir PATH\n\nThe output directory must be \
+     absolute, outside the checkout, and empty. `run` defaults to the required-all matrix. \
+     `--variants baseline` creates a runnable baseline campaign but never acceptance evidence."
         .to_owned()
 }
 
@@ -60,7 +71,9 @@ struct Options {
     matrix: Option<PathBuf>,
     artifacts: Option<PathBuf>,
     output_dir: Option<PathBuf>,
+    results_dir: Option<PathBuf>,
     variants: Option<Vec<String>>,
+    campaign: Option<PathBuf>,
     case_id: Option<String>,
     variant_id: Option<String>,
     output_file: Option<PathBuf>,
@@ -80,6 +93,11 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
             "--matrix" => options.matrix = Some(PathBuf::from(value)),
             "--artifacts" => options.artifacts = Some(PathBuf::from(value)),
             "--output-dir" => options.output_dir = Some(PathBuf::from(value)),
+            "--results-dir" => options.results_dir = Some(PathBuf::from(value)),
+            "--campaign" => options.campaign = Some(PathBuf::from(value)),
+            "--case" => options.case_id = Some(value.clone()),
+            "--variant" => options.variant_id = Some(value.clone()),
+            "--output-file" => options.output_file = Some(PathBuf::from(value)),
             "--variants" => {
                 options.variants = Some(
                     value
@@ -88,11 +106,8 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
                         .filter(|value| !value.is_empty())
                         .map(str::to_owned)
                         .collect(),
-                )
+                );
             }
-            "--case" => options.case_id = Some(value.clone()),
-            "--variant" => options.variant_id = Some(value.clone()),
-            "--output-file" => options.output_file = Some(PathBuf::from(value)),
             _ => return Err(format!("unknown option {flag:?}\n{}", usage())),
         }
     }
@@ -133,55 +148,27 @@ fn load_inputs(options: &Options) -> Result<(BenchmarkMatrix, ArtifactManifest),
 
 fn validate_inputs(args: &[String]) -> Result<(), String> {
     let options = parse_options(args)?;
-    let (matrix, artifacts) = load_inputs(&options)?;
+    verify_executable_provenance(None)?;
+    let (matrix, manifest) = load_inputs(&options)?;
+    let capabilities = provider_capability_receipts(&matrix)?;
+    let campaign = FrozenCampaign::freeze(
+        matrix,
+        &manifest,
+        vec!["baseline".to_owned()],
+        build_provenance()?,
+        host_identity()?,
+        capabilities,
+        unix_millis()?,
+    )
+    .map_err(|error| format!("invalid frozen inputs: {error}"))?;
     println!(
-        "validated {}: {} cases, {} variants, {} artifacts",
-        matrix.benchmark_id,
-        matrix.cases.len(),
-        matrix.variants.len(),
-        artifacts.artifacts.len()
+        "validated {}: {} cases, {} exact artifacts; campaign {}",
+        campaign.matrix.benchmark_id,
+        campaign.matrix.cases.len(),
+        campaign.artifacts.len(),
+        campaign.campaign_id
     );
     Ok(())
-}
-
-fn repository_root() -> Result<PathBuf, String> {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(3)
-        .ok_or_else(|| "cannot resolve repository root from CARGO_MANIFEST_DIR".to_owned())?
-        .canonicalize()
-        .map_err(|error| format!("canonicalize repository root: {error}"))
-}
-
-fn prepare_output_dir(path: &Path, require_empty: bool) -> Result<PathBuf, String> {
-    if !path.is_absolute() {
-        return Err(format!("output path must be absolute: {}", path.display()));
-    }
-    fs::create_dir_all(path)
-        .map_err(|error| format!("create output directory {}: {error}", path.display()))?;
-    let canonical = path
-        .canonicalize()
-        .map_err(|error| format!("canonicalize output directory {}: {error}", path.display()))?;
-    let root = repository_root()?;
-    if canonical.starts_with(&root) {
-        return Err(format!(
-            "results must be outside the repository ({} is under {})",
-            canonical.display(),
-            root.display()
-        ));
-    }
-    if require_empty
-        && fs::read_dir(&canonical)
-            .map_err(|error| format!("read output directory {}: {error}", canonical.display()))?
-            .next()
-            .is_some()
-    {
-        return Err(format!(
-            "output directory must be empty to prevent mixed campaigns: {}",
-            canonical.display()
-        ));
-    }
-    Ok(canonical)
 }
 
 fn selected_variants(
@@ -199,11 +186,8 @@ fn selected_variants(
         <[String]>::to_vec,
     );
     let unique: BTreeSet<_> = selected.iter().map(String::as_str).collect();
-    if selected.is_empty() || unique.len() != selected.len() {
-        return Err("--variants must name a non-empty unique list".to_owned());
-    }
-    if !unique.contains("baseline") {
-        return Err("--variants must include baseline".to_owned());
+    if selected.is_empty() || unique.len() != selected.len() || !unique.contains("baseline") {
+        return Err("--variants must be non-empty, unique, and include baseline".to_owned());
     }
     for id in &selected {
         if matrix.variant(id).is_none() {
@@ -215,96 +199,177 @@ fn selected_variants(
 
 fn run_matrix(args: &[String]) -> Result<(), String> {
     let options = parse_options(args)?;
-    let (matrix, _artifacts) = load_inputs(&options)?;
-    let output_dir = prepare_output_dir(
+    verify_executable_provenance(None)?;
+    let (matrix, manifest) = load_inputs(&options)?;
+    let selected = selected_variants(&matrix, options.variants.as_deref())?;
+    let output_dir = prepare_new_output_dir(
         options
             .output_dir
             .as_deref()
             .ok_or_else(|| "--output-dir is required".to_owned())?,
-        true,
     )?;
-    let selected = selected_variants(&matrix, options.variants.as_deref())?;
-    ensure_clean_checkout()?;
+    let capabilities = provider_capability_receipts(&matrix)?;
+    let campaign = FrozenCampaign::freeze(
+        matrix,
+        &manifest,
+        selected,
+        build_provenance()?,
+        host_identity()?,
+        capabilities,
+        unix_millis()?,
+    )
+    .map_err(|error| format!("refuse unavailable or unfrozen campaign: {error}"))?;
+    let campaign_file = output_dir.join(CAMPAIGN_FILE);
+    write_json_atomic(&campaign_file, &campaign)?;
+
     let executable =
         env::current_exe().map_err(|error| format!("resolve current binary: {error}"))?;
-    let artifacts = options
-        .artifacts
-        .as_deref()
-        .expect("load_inputs required --artifacts")
-        .canonicalize()
-        .map_err(|error| format!("canonicalize artifact manifest: {error}"))?;
-
-    for case in &matrix.cases {
-        for variant in &matrix.variants {
-            if !selected.iter().any(|id| id == &variant.id) {
-                continue;
-            }
-            let output_file = output_dir.join(format!("{}__{}.json", case.id, variant.id));
-            let mut command = Command::new(&executable);
-            command
+    for case in &campaign.matrix.cases {
+        for variant_id in &campaign.selected_variants {
+            let output_file = output_dir.join(run_file_name(&case.id, variant_id));
+            println!("run {} / {}", case.id, variant_id);
+            let status = Command::new(&executable)
                 .arg("child")
-                .arg("--artifacts")
-                .arg(&artifacts)
+                .arg("--campaign")
+                .arg(&campaign_file)
                 .arg("--case")
                 .arg(&case.id)
                 .arg("--variant")
-                .arg(&variant.id)
+                .arg(variant_id)
                 .arg("--output-file")
                 .arg(&output_file)
                 .stdin(Stdio::null())
                 .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit());
-            if let Some(matrix_path) = options.matrix.as_deref() {
-                command.arg("--matrix").arg(matrix_path);
-            }
-            println!("run {} / {}", case.id, variant.id);
-            let status = command
+                .stderr(Stdio::inherit())
                 .status()
                 .map_err(|error| format!("start child benchmark: {error}"))?;
             if !status.success() {
                 return Err(format!(
                     "child failed for {} / {}; no summary was published",
-                    case.id, variant.id
+                    case.id, variant_id
                 ));
             }
         }
     }
 
-    let mut records = Vec::new();
-    for case in &matrix.cases {
-        for variant in &selected {
-            records.push(load_json(
-                &output_dir.join(format!("{}__{}.json", case.id, variant)),
-                "run record",
-            )?);
-        }
-    }
-    let summary = build_summary(&matrix, &records, &selected)
+    let records = load_campaign_records(&output_dir, &campaign, false)?;
+    let summary = build_summary(&campaign, &records)
         .map_err(|error| format!("refuse incomplete comparison set: {error}"))?;
-    write_json_atomic(&output_dir.join("summary.json"), &summary)?;
+    write_json_atomic(&output_dir.join(SUMMARY_FILE), &summary)?;
     print_summary(&summary);
     Ok(())
 }
 
+fn validate_results(args: &[String]) -> Result<(), String> {
+    let options = parse_options(args)?;
+    let results_dir = existing_results_dir(
+        options
+            .results_dir
+            .as_deref()
+            .ok_or_else(|| "--results-dir is required".to_owned())?,
+    )?;
+    let campaign_path = results_dir.join(CAMPAIGN_FILE);
+    if !campaign_path.is_file() {
+        return Err(format!(
+            "legacy/unbound results: missing {} in {}",
+            CAMPAIGN_FILE,
+            results_dir.display()
+        ));
+    }
+    let campaign: FrozenCampaign = load_json(&campaign_path, "frozen campaign")?;
+    campaign
+        .validate()
+        .map_err(|error| format!("invalid frozen campaign: {error}"))?;
+    verify_executable_provenance(Some(&campaign.build))?;
+    let records = load_campaign_records(&results_dir, &campaign, true)?;
+    let summary = build_summary(&campaign, &records)
+        .map_err(|error| format!("invalid comparison set: {error}"))?;
+    let stored_summary = results_dir.join(SUMMARY_FILE);
+    if stored_summary.is_file() {
+        let stored: BenchmarkSummary = load_json(&stored_summary, "stored summary")?;
+        if stored != summary {
+            return Err("stored summary does not match the validated campaign records".to_owned());
+        }
+    }
+    print_summary(&summary);
+    Ok(())
+}
+
+fn load_campaign_records(
+    output_dir: &Path,
+    campaign: &FrozenCampaign,
+    allow_summary: bool,
+) -> Result<Vec<RunRecord>, String> {
+    let mut expected = BTreeSet::from([CAMPAIGN_FILE.to_owned()]);
+    if allow_summary {
+        expected.insert(SUMMARY_FILE.to_owned());
+    }
+    for case in &campaign.matrix.cases {
+        for variant in &campaign.selected_variants {
+            expected.insert(run_file_name(&case.id, variant));
+        }
+    }
+    for entry in fs::read_dir(output_dir)
+        .map_err(|error| format!("read results directory {}: {error}", output_dir.display()))?
+    {
+        let entry = entry.map_err(|error| format!("read results entry: {error}"))?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| "results contain a non-UTF-8 entry".to_owned())?;
+        if !expected.contains(&name) {
+            return Err(format!(
+                "results contain an unexpected mixed/stale entry {name:?}"
+            ));
+        }
+    }
+    let mut records = Vec::new();
+    for case in &campaign.matrix.cases {
+        for variant in &campaign.selected_variants {
+            records.push(load_json(
+                &output_dir.join(run_file_name(&case.id, variant)),
+                "run record",
+            )?);
+        }
+    }
+    Ok(records)
+}
+
 fn run_child(args: &[String]) -> Result<(), String> {
     let options = parse_options(args)?;
-    let (matrix, artifacts) = load_inputs(&options)?;
-    let case = matrix
+    let campaign_path = options
+        .campaign
+        .as_deref()
+        .ok_or_else(|| "child requires --campaign".to_owned())?;
+    let campaign: FrozenCampaign = load_json(campaign_path, "frozen campaign")?;
+    campaign
+        .validate()
+        .map_err(|error| format!("invalid frozen campaign: {error}"))?;
+    verify_executable_provenance(Some(&campaign.build))?;
+    let current_host = host_identity()?;
+    if current_host != campaign.host {
+        return Err("runtime host identity differs from the frozen campaign".to_owned());
+    }
+
+    let case = campaign
+        .matrix
         .case(
             options
                 .case_id
                 .as_deref()
                 .ok_or_else(|| "child requires --case".to_owned())?,
         )
-        .ok_or_else(|| "child case is not in the matrix".to_owned())?;
-    let variant = matrix
+        .ok_or_else(|| "child case is not in the frozen campaign".to_owned())?;
+    let variant = campaign
+        .matrix
         .variant(
             options
                 .variant_id
                 .as_deref()
                 .ok_or_else(|| "child requires --variant".to_owned())?,
         )
-        .ok_or_else(|| "child variant is not in the matrix".to_owned())?;
+        .filter(|variant| campaign.selected_variants.contains(&variant.id))
+        .ok_or_else(|| "child variant is not selected by the frozen campaign".to_owned())?;
     let output_file = options
         .output_file
         .as_deref()
@@ -312,38 +377,53 @@ fn run_child(args: &[String]) -> Result<(), String> {
     let output_dir = output_file
         .parent()
         .ok_or_else(|| "output file must have a parent directory".to_owned())?;
-    let canonical_dir = prepare_output_dir(output_dir, false)?;
-    let file_name = output_file
-        .file_name()
-        .ok_or_else(|| "output file must have a file name".to_owned())?;
-    let output_file = canonical_dir.join(file_name);
+    let output_dir = existing_results_dir(output_dir)?;
+    let campaign_parent = campaign_path
+        .parent()
+        .ok_or_else(|| "campaign file has no parent".to_owned())?
+        .canonicalize()
+        .map_err(|error| format!("canonicalize campaign directory: {error}"))?;
+    if output_dir != campaign_parent
+        || output_file.file_name().and_then(|name| name.to_str())
+            != Some(run_file_name(&case.id, &variant.id).as_str())
+    {
+        return Err("child output must be the exact campaign-owned run filename".to_owned());
+    }
+    let output_file = output_dir.join(run_file_name(&case.id, &variant.id));
     if output_file.exists() {
         return Err(format!("refuse to overwrite {}", output_file.display()));
     }
-    ensure_clean_checkout()?;
 
-    let artifact = artifacts
+    let artifact = campaign
         .artifact(&case.artifact_key)
-        .expect("validated artifact manifest covers every case");
-    let artifact_path = artifact
-        .path
-        .canonicalize()
-        .map_err(|error| format!("canonicalize artifact {}: {error}", artifact.path.display()))?;
-    let environment = environment_record()?;
-    let started_at_unix_millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| format!("system clock predates Unix epoch: {error}"))?
-        .as_millis();
+        .expect("validated campaign covers every case artifact");
+    verify_artifact_content(artifact)?;
+    let available_toggles = campaign
+        .capabilities(&case.provider)
+        .ok_or_else(|| "campaign omitted provider capability receipt".to_owned())?;
+    if !variant
+        .toggles
+        .iter()
+        .all(|toggle| available_toggles.contains(toggle))
+    {
+        return Err(format!(
+            "provider {} does not declare every toggle requested by {}",
+            case.provider, variant.id
+        ));
+    }
 
+    let started_at_unix_millis = unix_millis()?;
     clear_cache();
     reset_peak_memory();
     let load_start = Instant::now();
     let catalog =
         runtime_macos::catalog().map_err(|error| format!("build macOS catalog: {error}"))?;
-    let spec = load_spec(case.tier, &artifact_path);
     let generator = catalog
         .media()
-        .load(&case.provider, &spec)
+        .load(
+            &case.provider,
+            &load_spec(case.tier, &artifact.canonical_path),
+        )
         .map_err(|error| format!("load {}: {error}", case.provider))?;
     let load_seconds = load_start.elapsed().as_secs_f64();
     let load_active_peak_bytes = get_peak_memory() as u64;
@@ -352,12 +432,12 @@ fn run_child(args: &[String]) -> Result<(), String> {
         return Err("cold model load did not produce credible timing evidence".to_owned());
     }
 
-    for warmup in 0..matrix.warmup_runs {
+    for warmup in 0..campaign.matrix.warmup_runs {
         let request_id = format!("{}/{}/warmup-{warmup}", case.id, variant.id);
-        let _ = measure_request(&*generator, case, variant, &request_id, warmup, true)?;
+        let _ = measure_request(&*generator, case, variant, &request_id, warmup)?;
     }
     let mut measurements = Vec::new();
-    for repetition in 0..matrix.measured_runs {
+    for repetition in 0..campaign.matrix.measured_runs {
         let request_id = format!("{}/{}/measured-{repetition}", case.id, variant.id);
         measurements.push(measure_request(
             &*generator,
@@ -365,37 +445,51 @@ fn run_child(args: &[String]) -> Result<(), String> {
             variant,
             &request_id,
             repetition,
-            false,
         )?);
     }
 
     let record = RunRecord {
         schema_version: RUN_SCHEMA_VERSION.to_owned(),
-        benchmark_id: matrix.benchmark_id.clone(),
+        campaign_id: campaign.campaign_id.clone(),
+        benchmark_id: campaign.matrix.benchmark_id.clone(),
         case_id: case.id.clone(),
         family: case.family,
         provider: case.provider.clone(),
-        artifact: ArtifactReceipt {
-            key: artifact.key.clone(),
-            repository: artifact.repository.clone(),
-            resolved_revision: artifact.resolved_revision.clone(),
-            tier: case.tier,
-            canonical_path: artifact_path,
-        },
+        artifact: artifact.clone(),
         variant: variant.clone(),
-        environment,
+        request: request_receipt(&campaign, case, artifact).map_err(|error| error.to_string())?,
+        build: campaign.build.clone(),
+        host: campaign.host.clone(),
+        available_toggles: available_toggles.to_vec(),
         started_at_unix_millis,
         load_seconds,
         load_active_peak_bytes,
         load_cache_bytes_after_load,
-        warmup_runs_completed: matrix.warmup_runs,
+        warmup_runs_completed: campaign.matrix.warmup_runs,
         measurements,
     };
     record
-        .validate_against(&matrix)
+        .validate_against(&campaign)
         .map_err(|error| format!("refuse false-green run record: {error}"))?;
     write_json_atomic(&output_file, &record)?;
     println!("wrote {}", output_file.display());
+    Ok(())
+}
+
+fn verify_artifact_content(artifact: &ArtifactReceipt) -> Result<(), String> {
+    if !artifact.canonical_path.is_dir() {
+        return Err(format!(
+            "frozen artifact path is unavailable: {}",
+            artifact.canonical_path.display()
+        ));
+    }
+    let actual = inventory_artifact(&artifact.canonical_path).map_err(|error| error.to_string())?;
+    if actual != artifact.inventory {
+        return Err(format!(
+            "artifact {} changed after the campaign was frozen",
+            artifact.key
+        ));
+    }
     Ok(())
 }
 
@@ -408,7 +502,7 @@ fn load_spec(tier: ModelTier, path: &Path) -> LoadSpec {
     }
 }
 
-fn generation_request(case: &runtime_macos::perf_bench::WorkloadCase) -> GenerationRequest {
+fn generation_request(case: &WorkloadCase) -> GenerationRequest {
     GenerationRequest {
         prompt: case.prompt.clone(),
         width: case.width,
@@ -423,80 +517,88 @@ fn generation_request(case: &runtime_macos::perf_bench::WorkloadCase) -> Generat
 
 fn measure_request(
     generator: &dyn runtime_macos::gen_core::Generator,
-    case: &runtime_macos::perf_bench::WorkloadCase,
+    case: &WorkloadCase,
     variant: &VariantPlan,
     request_id: &str,
     repetition: u32,
-    warmup: bool,
 ) -> Result<MeasurementRecord, String> {
+    let request = generation_request(case);
+    generator
+        .validate(&request)
+        .map_err(|error| format!("validate {}: {error}", case.id))?;
+    clear_cache();
+
+    let recorder = Rc::new(RefCell::new(PhaseRecorder::new(case.steps)));
+    let observer = Rc::clone(&recorder);
     let requested: Vec<_> = variant
         .toggles
         .iter()
         .map(|toggle| toggle.as_str())
         .collect();
-    let scope =
-        diagnostics::begin_request_with_toggles(request_id, case.family.as_str(), &requested)
-            .map_err(|error| error.to_string())?;
-    let request = generation_request(case);
-    generator
-        .validate(&request)
-        .map_err(|error| format!("validate {}: {error}", case.id))?;
-
-    clear_cache();
-    reset_peak_memory();
-    let start = Instant::now();
-    let mut phases = PhaseRecorder::new(start, case.steps);
+    let scope = diagnostics::begin_request_with_phase_observer(
+        request_id,
+        case.family.as_str(),
+        &requested,
+        move |boundary| observer.borrow_mut().transition(boundary),
+    )
+    .map_err(|error| error.to_string())?;
     let output = generator
-        .generate(&request, &mut |progress| phases.observe(progress))
+        .generate(&request, &mut |progress| {
+            recorder.borrow_mut().observe(progress)
+        })
         .map_err(|error| format!("generate {} / {}: {error}", case.id, variant.id))?;
-    let total_seconds = start.elapsed().as_secs_f64();
-    let phase_set = phases.finish()?;
-    let output = fingerprint_output(case, &output)?;
     let report = scope.finish();
+    let recorder = Rc::try_unwrap(recorder)
+        .map_err(|_| "phase observer remained alive after diagnostics finished".to_owned())?
+        .into_inner();
+    let finished = recorder.finish()?;
+    validate_report_identity_and_boundaries(request_id, case, &report, &finished.phase_boundaries)?;
     let diagnostics = diagnostic_records(report);
-    let steady_steps = phases_step_intervals(case.steps);
-    let denoise_steps_per_second = steady_steps as f64 / phase_set.denoise.seconds;
-    let measurement = MeasurementRecord {
+    validate_toggle_diagnostics(variant, &diagnostics)
+        .map_err(|error| format!("invalid toggle receipts: {error}"))?;
+    let output = fingerprint_output(case, &output)?;
+    let denoise_steps_per_second = case.steps as f64 / finished.phases.denoise.seconds;
+    Ok(MeasurementRecord {
         repetition,
-        total_seconds,
+        total_elapsed_nanos: finished.total_elapsed_nanos,
+        total_seconds: finished.total_elapsed_nanos as f64 / 1e9,
         denoise_steps_per_second,
-        step_events: phases.step_events,
-        saw_decode: phases.saw_decode,
-        phases: phase_set,
+        progress: finished.progress,
+        phase_boundaries: finished.phase_boundaries,
+        phases: finished.phases,
         output,
         diagnostics,
-    };
-    if !warmup {
-        // Validation of applied receipts happens again at the complete-record boundary. Fail here as
-        // well so an unavailable toggle never burns the rest of a multi-hour matrix.
-        require_toggle_receipts(variant, &measurement)?;
-    }
-    Ok(measurement)
+    })
 }
 
-fn phases_step_intervals(steps: u32) -> u32 {
-    // Progress::Step is emitted after each step. The first event is the only current
-    // encode→denoise boundary, so steady denoise throughput spans the remaining intervals.
-    steps.saturating_sub(1).max(1)
-}
-
-fn require_toggle_receipts(
-    variant: &VariantPlan,
-    measurement: &MeasurementRecord,
+fn validate_report_identity_and_boundaries(
+    request_id: &str,
+    case: &WorkloadCase,
+    report: &DiagnosticReport,
+    receipts: &[PhaseBoundaryReceipt],
 ) -> Result<(), String> {
-    for toggle in &variant.toggles {
-        if !measurement.diagnostics.iter().any(|diagnostic| {
-            diagnostic.domain == "toggle"
-                && diagnostic.site == toggle.as_str()
-                && diagnostic.outcome == "applied"
-                && diagnostic.count > 0
-        }) {
-            return Err(format!(
-                "toggle {} was requested but the provider emitted no applied receipt; refusing a \
-                 false comparison (the owning optimization story must wire and acknowledge it)",
-                toggle.as_str()
-            ));
-        }
+    if report.request_id != request_id || report.family != case.family.as_str() {
+        return Err("diagnostic report escaped its request/family scope".to_owned());
+    }
+    let reported: Vec<_> = report
+        .phase_boundaries
+        .iter()
+        .map(|record| match record.boundary {
+            BenchmarkPhaseBoundary::DenoiseStart => PhaseBoundary::DenoiseStart,
+            BenchmarkPhaseBoundary::DecodeStart => PhaseBoundary::DecodeStart,
+        })
+        .collect();
+    let observed: Vec<_> = receipts.iter().map(|receipt| receipt.boundary).collect();
+    if reported != observed
+        || report
+            .phase_boundaries
+            .windows(2)
+            .any(|window| window[0].elapsed_nanos >= window[1].elapsed_nanos)
+    {
+        return Err(
+            "provider diagnostic phase boundaries were missing, duplicated, or reordered"
+                .to_owned(),
+        );
     }
     Ok(())
 }
@@ -508,172 +610,249 @@ enum Phase {
     Decode,
 }
 
-#[derive(Clone, Copy)]
 struct OpenPhase {
     phase: Phase,
     started: Instant,
-    active_peak: u64,
-    cache_peak: u64,
-    cache_at_boundary: u64,
-    samples: u32,
+    probe: AllocatorProbe,
 }
 
 impl OpenPhase {
     fn new(phase: Phase, started: Instant) -> Self {
+        reset_peak_memory();
         Self {
             phase,
             started,
-            active_peak: 0,
-            cache_peak: 0,
-            cache_at_boundary: 0,
-            samples: 0,
+            probe: AllocatorProbe::start(Duration::from_micros(MEMORY_SAMPLE_INTERVAL_MICROS)),
         }
     }
 
-    fn sample(&mut self) {
-        self.active_peak = self.active_peak.max(get_peak_memory() as u64);
-        let cache = get_cache_memory() as u64;
-        self.cache_peak = self.cache_peak.max(cache);
-        self.cache_at_boundary = cache;
-        self.samples += 1;
-    }
-
-    fn finish(mut self, at: Instant) -> PhaseMetrics {
-        self.sample();
-        PhaseMetrics {
-            seconds: at.duration_since(self.started).as_secs_f64(),
-            active_peak_bytes: self.active_peak,
-            cache_peak_bytes: self.cache_peak,
-            cache_bytes_at_boundary: self.cache_at_boundary,
-            samples: self.samples,
-        }
+    fn finish(self, at: Instant) -> PhaseMetrics {
+        let native_active_peak_bytes = get_peak_memory() as u64;
+        let report = self.probe.finish();
+        phase_metrics(
+            at.duration_since(self.started).as_secs_f64(),
+            native_active_peak_bytes,
+            report,
+        )
     }
 }
 
+fn phase_metrics(
+    seconds: f64,
+    native_active_peak_bytes: u64,
+    report: AllocatorProbeReport,
+) -> PhaseMetrics {
+    PhaseMetrics {
+        seconds,
+        native_active_peak_bytes,
+        sampled_active_peak_bytes: report.sampled_active_peak_bytes,
+        sampled_cache_peak_bytes: report.sampled_cache_peak_bytes,
+        sampled_footprint_peak_bytes: report.sampled_footprint_peak_bytes,
+        footprint_peak_active_bytes: report.footprint_peak_active_bytes,
+        footprint_peak_cache_bytes: report.footprint_peak_cache_bytes,
+        boundary_active_bytes: report.boundary_active_bytes,
+        boundary_cache_bytes: report.boundary_cache_bytes,
+        coverage: MemoryCoverageReceipt {
+            interval_micros: report.interval_micros,
+            sample_count: report.sample_count,
+            periodic_sample_count: report.periodic_sample_count,
+            sampling_span_micros: report.sampling_span_micros,
+            max_gap_micros: report.max_gap_micros,
+        },
+    }
+}
+
+struct FinishedPhases {
+    total_elapsed_nanos: u64,
+    progress: ProgressReceipt,
+    phase_boundaries: Vec<PhaseBoundaryReceipt>,
+    phases: PhaseSet,
+}
+
 struct PhaseRecorder {
+    started: Instant,
     current: Option<OpenPhase>,
     encode: Option<PhaseMetrics>,
     denoise: Option<PhaseMetrics>,
     decode: Option<PhaseMetrics>,
     expected_steps: u32,
-    step_events: u32,
-    saw_decode: bool,
+    steps: Vec<StepReceipt>,
+    decoding_elapsed_nanos: Option<u64>,
+    phase_boundaries: Vec<PhaseBoundaryReceipt>,
     error: Option<String>,
 }
 
 impl PhaseRecorder {
-    fn new(started: Instant, expected_steps: u32) -> Self {
+    fn new(expected_steps: u32) -> Self {
+        let started = Instant::now();
         Self {
+            started,
             current: Some(OpenPhase::new(Phase::Encode, started)),
             encode: None,
             denoise: None,
             decode: None,
             expected_steps,
-            step_events: 0,
-            saw_decode: false,
+            steps: Vec::new(),
+            decoding_elapsed_nanos: None,
+            phase_boundaries: Vec::new(),
             error: None,
         }
     }
 
-    fn transition(&mut self, expected: Phase, next: Phase, now: Instant) {
-        let Some(mut current) = self.current.take() else {
-            self.error
-                .get_or_insert_with(|| "phase recorder is closed".to_owned());
+    fn elapsed_nanos(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    fn fail(&mut self, message: impl Into<String>) {
+        if self.error.is_none() {
+            self.error = Some(message.into());
+        }
+    }
+
+    fn transition(&mut self, boundary: BenchmarkPhaseBoundary) {
+        let (expected, next, receipt) = match boundary {
+            BenchmarkPhaseBoundary::DenoiseStart => {
+                (Phase::Encode, Phase::Denoise, PhaseBoundary::DenoiseStart)
+            }
+            BenchmarkPhaseBoundary::DecodeStart => {
+                if self.steps.len() != self.expected_steps as usize {
+                    self.fail(format!(
+                        "DecodeStart arrived after {} Step events, expected {}",
+                        self.steps.len(),
+                        self.expected_steps
+                    ));
+                }
+                (Phase::Denoise, Phase::Decode, PhaseBoundary::DecodeStart)
+            }
+        };
+        let now = Instant::now();
+        let elapsed_nanos =
+            u64::try_from(now.duration_since(self.started).as_nanos()).unwrap_or(u64::MAX);
+        let Some(current) = self.current.take() else {
+            self.fail("phase recorder was already closed");
             return;
         };
         if current.phase != expected {
-            self.error.get_or_insert_with(|| {
-                format!(
-                    "invalid progress phase transition: expected {expected:?}, got {:?}",
-                    current.phase
-                )
-            });
+            let actual = current.phase;
             self.current = Some(current);
+            self.fail(format!(
+                "invalid explicit phase transition: expected {expected:?}, got {actual:?}"
+            ));
             return;
         }
-        current.sample();
         let metrics = current.finish(now);
         match expected {
             Phase::Encode => self.encode = Some(metrics),
             Phase::Denoise => self.denoise = Some(metrics),
             Phase::Decode => self.decode = Some(metrics),
         }
-        reset_peak_memory();
+        self.phase_boundaries.push(PhaseBoundaryReceipt {
+            boundary: receipt,
+            elapsed_nanos,
+        });
         self.current = Some(OpenPhase::new(next, now));
     }
 
     fn observe(&mut self, progress: Progress) {
-        if let Some(current) = self.current.as_mut() {
-            current.sample();
-        }
         match progress {
             Progress::Step { current, total } => {
-                if current == 0 || current > total || total != self.expected_steps {
-                    self.error.get_or_insert_with(|| {
-                        format!(
-                            "invalid Step progress current={current} total={total}; expected total {}",
-                            self.expected_steps
-                        )
-                    });
+                let expected_current = self.steps.len() as u32 + 1;
+                if self.decoding_elapsed_nanos.is_some() {
+                    self.fail("Step progress arrived after Decoding");
                 }
-                self.step_events += 1;
-                if self.step_events == 1 {
-                    self.transition(Phase::Encode, Phase::Denoise, Instant::now());
+                if current != expected_current || total != self.expected_steps {
+                    self.fail(format!(
+                        "invalid Step current={current} total={total}; expected {expected_current}/{}",
+                        self.expected_steps
+                    ));
                 }
+                self.steps.push(StepReceipt {
+                    current,
+                    total,
+                    elapsed_nanos: self.elapsed_nanos(),
+                });
             }
             Progress::Decoding => {
-                if self.saw_decode {
-                    self.error
-                        .get_or_insert_with(|| "duplicate Decoding progress event".to_owned());
-                    return;
+                if self.decoding_elapsed_nanos.is_some() {
+                    self.fail("duplicate Decoding progress event");
+                } else {
+                    if self.steps.len() != self.expected_steps as usize {
+                        self.fail(format!(
+                            "Decoding arrived after {} Step events, expected {}",
+                            self.steps.len(),
+                            self.expected_steps
+                        ));
+                    }
+                    self.decoding_elapsed_nanos = Some(self.elapsed_nanos());
                 }
-                self.saw_decode = true;
-                self.transition(Phase::Denoise, Phase::Decode, Instant::now());
             }
             Progress::Loading(_) => {}
         }
     }
 
-    fn finish(&mut self) -> Result<PhaseSet, String> {
-        if let Some(error) = self.error.take() {
-            return Err(error);
+    fn finish(mut self) -> Result<FinishedPhases, String> {
+        let finished_at = Instant::now();
+        let total_elapsed_nanos =
+            u64::try_from(finished_at.duration_since(self.started).as_nanos()).unwrap_or(u64::MAX);
+        if let Some(current) = self.current.take() {
+            if current.phase != Phase::Decode {
+                self.fail(format!(
+                    "generation completed in {:?}, expected Decode",
+                    current.phase
+                ));
+            } else {
+                self.decode = Some(current.finish(finished_at));
+            }
+        } else {
+            self.fail("phase recorder closed before generation completed");
         }
-        if self.step_events != self.expected_steps {
-            return Err(format!(
-                "observed {} Step events, expected {}; a zero/partial run is not benchmark evidence",
-                self.step_events, self.expected_steps
+        if self.steps.len() != self.expected_steps as usize {
+            self.fail(format!(
+                "observed {} Step events, expected {}",
+                self.steps.len(),
+                self.expected_steps
             ));
         }
-        if !self.saw_decode {
-            return Err("generation emitted no Decoding event".to_owned());
+        if self.phase_boundaries.len() != 2 {
+            self.fail(format!(
+                "observed {} explicit phase boundaries, expected 2",
+                self.phase_boundaries.len()
+            ));
         }
-        let current = self
-            .current
-            .take()
-            .ok_or_else(|| "phase recorder closed before output".to_owned())?;
-        if current.phase != Phase::Decode {
-            return Err("generation completed outside the decode phase".to_owned());
+        let decoding_elapsed_nanos = match self.decoding_elapsed_nanos {
+            Some(value) => value,
+            None => {
+                self.fail("generation emitted no Decoding event");
+                0
+            }
+        };
+        if let Some(error) = self.error {
+            return Err(error);
         }
-        self.decode = Some(current.finish(Instant::now()));
-        Ok(PhaseSet {
-            encode: self
-                .encode
-                .take()
-                .ok_or_else(|| "missing encode phase".to_owned())?,
-            denoise: self
-                .denoise
-                .take()
-                .ok_or_else(|| "missing denoise phase".to_owned())?,
-            decode: self
-                .decode
-                .take()
-                .ok_or_else(|| "missing decode phase".to_owned())?,
+        Ok(FinishedPhases {
+            total_elapsed_nanos,
+            progress: ProgressReceipt {
+                steps: self.steps,
+                decoding_elapsed_nanos,
+            },
+            phase_boundaries: self.phase_boundaries,
+            phases: PhaseSet {
+                encode: self
+                    .encode
+                    .ok_or_else(|| "missing encode phase".to_owned())?,
+                denoise: self
+                    .denoise
+                    .ok_or_else(|| "missing denoise phase".to_owned())?,
+                decode: self
+                    .decode
+                    .ok_or_else(|| "missing decode phase".to_owned())?,
+            },
         })
     }
 }
 
 fn fingerprint_output(
-    case: &runtime_macos::perf_bench::WorkloadCase,
+    case: &WorkloadCase,
     output: &GenerationOutput,
 ) -> Result<OutputFingerprint, String> {
     let mut hash = Sha256::new();
@@ -720,7 +899,7 @@ fn fingerprint_output(
             ("video", frames.len())
         }
         GenerationOutput::Audio(_) => {
-            return Err("image/video P6 matrix unexpectedly produced audio-only output".to_owned())
+            return Err("image/video P6 matrix unexpectedly produced audio-only output".to_owned());
         }
     };
     if payload_bytes == 0 || items == 0 {
@@ -737,7 +916,7 @@ fn fingerprint_output(
 }
 
 fn hash_image(
-    case: &runtime_macos::perf_bench::WorkloadCase,
+    case: &WorkloadCase,
     image: &runtime_macos::gen_core::Image,
     hash: &mut Sha256,
     payload_bytes: &mut u64,
@@ -834,6 +1013,167 @@ fn diagnostic_records(report: DiagnosticReport) -> Vec<DiagnosticRecord> {
         .collect()
 }
 
+fn provider_capability_receipts(
+    matrix: &BenchmarkMatrix,
+) -> Result<Vec<ProviderCapabilityReceipt>, String> {
+    let providers: BTreeSet<_> = matrix
+        .cases
+        .iter()
+        .map(|case| case.provider.as_str())
+        .collect();
+    providers
+        .into_iter()
+        .map(|provider| {
+            let declared =
+                runtime_macos::benchmark_toggle_capabilities(provider).ok_or_else(|| {
+                    format!("provider {provider:?} has no benchmark capability contract")
+                })?;
+            let mut available_toggles: Vec<_> = declared
+                .iter()
+                .map(|name| {
+                    OptimizationToggle::from_name(name).ok_or_else(|| {
+                        format!("provider {provider:?} declares unknown benchmark toggle {name:?}")
+                    })
+                })
+                .collect::<Result<_, _>>()?;
+            available_toggles.sort_unstable();
+            available_toggles.dedup();
+            if available_toggles.len() != declared.len() {
+                return Err(format!("provider {provider:?} repeats a benchmark toggle"));
+            }
+            Ok(ProviderCapabilityReceipt {
+                provider: provider.to_owned(),
+                available_toggles,
+            })
+        })
+        .collect()
+}
+
+fn repository_root() -> Result<PathBuf, String> {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(3)
+        .ok_or_else(|| "cannot resolve repository root from CARGO_MANIFEST_DIR".to_owned())?
+        .canonicalize()
+        .map_err(|error| format!("canonicalize repository root: {error}"))
+}
+
+fn ensure_outside_checkout(path: &Path) -> Result<(), String> {
+    let root = repository_root()?;
+    if path.starts_with(&root) {
+        return Err(format!(
+            "benchmark evidence must be outside the repository ({} is under {})",
+            path.display(),
+            root.display()
+        ));
+    }
+    Ok(())
+}
+
+fn prepare_new_output_dir(path: &Path) -> Result<PathBuf, String> {
+    if !path.is_absolute() {
+        return Err(format!("output path must be absolute: {}", path.display()));
+    }
+    fs::create_dir_all(path)
+        .map_err(|error| format!("create output directory {}: {error}", path.display()))?;
+    let canonical = path
+        .canonicalize()
+        .map_err(|error| format!("canonicalize output directory {}: {error}", path.display()))?;
+    ensure_outside_checkout(&canonical)?;
+    if fs::read_dir(&canonical)
+        .map_err(|error| format!("read output directory {}: {error}", canonical.display()))?
+        .next()
+        .is_some()
+    {
+        return Err(format!(
+            "output directory must be empty to prevent mixed campaigns: {}",
+            canonical.display()
+        ));
+    }
+    Ok(canonical)
+}
+
+fn existing_results_dir(path: &Path) -> Result<PathBuf, String> {
+    if !path.is_absolute() || !path.is_dir() {
+        return Err(format!(
+            "results path must be an existing absolute directory: {}",
+            path.display()
+        ));
+    }
+    let canonical = path
+        .canonicalize()
+        .map_err(|error| format!("canonicalize results directory {}: {error}", path.display()))?;
+    ensure_outside_checkout(&canonical)?;
+    Ok(canonical)
+}
+
+fn run_file_name(case_id: &str, variant_id: &str) -> String {
+    format!("{case_id}__{variant_id}.json")
+}
+
+fn unix_millis() -> Result<u128, String> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .map_err(|error| format!("system clock predates Unix epoch: {error}"))
+}
+
+fn build_provenance() -> Result<BuildProvenance, String> {
+    let source_dirty = match env!("SCENEWORKS_BENCH_SOURCE_DIRTY") {
+        "true" => true,
+        "false" => false,
+        value => return Err(format!("invalid build-time dirty receipt {value:?}")),
+    };
+    Ok(BuildProvenance {
+        source_revision: env!("SCENEWORKS_BENCH_SOURCE_REVISION").to_owned(),
+        mlx_revision: env!("SCENEWORKS_BENCH_MLX_REVISION").to_owned(),
+        source_dirty,
+    })
+}
+
+fn verify_executable_provenance(expected: Option<&BuildProvenance>) -> Result<(), String> {
+    let build = build_provenance()?;
+    if build.source_dirty {
+        return Err(
+            "benchmark executable was built from a dirty checkout; commit and rebuild it"
+                .to_owned(),
+        );
+    }
+    let root = repository_root()?;
+    ensure_clean_checkout(&root)?;
+    let root_text = root
+        .to_str()
+        .ok_or_else(|| "repository root is not UTF-8".to_owned())?;
+    let runtime_source = command_output("git", &["-C", root_text, "rev-parse", "HEAD"])?;
+    let runtime_mlx = mlx_revision(&root.join("Cargo.lock"))?;
+    if runtime_source != build.source_revision || runtime_mlx != build.mlx_revision {
+        return Err(format!(
+            "runtime checkout/lock differs from executable build provenance: build={}/{} runtime={}/{}",
+            build.source_revision, build.mlx_revision, runtime_source, runtime_mlx
+        ));
+    }
+    if expected.is_some_and(|expected| expected != &build) {
+        return Err("executable build provenance differs from the frozen campaign".to_owned());
+    }
+    Ok(())
+}
+
+fn ensure_clean_checkout(root: &Path) -> Result<(), String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["status", "--porcelain", "--untracked-files=all"])
+        .output()
+        .map_err(|error| format!("inspect checkout status: {error}"))?;
+    if !output.status.success() {
+        return Err("git status failed while binding benchmark provenance".to_owned());
+    }
+    if !output.stdout.is_empty() {
+        return Err("benchmark evidence requires a clean inference checkout".to_owned());
+    }
+    Ok(())
+}
+
 fn command_output(program: &str, args: &[&str]) -> Result<String, String> {
     let output = Command::new(program)
         .args(args)
@@ -849,33 +1189,8 @@ fn command_output(program: &str, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
-fn ensure_clean_checkout() -> Result<(), String> {
-    let root = repository_root()?;
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(&root)
-        .args(["status", "--porcelain", "--untracked-files=all"])
-        .output()
-        .map_err(|error| format!("inspect checkout status: {error}"))?;
-    if !status.status.success() {
-        return Err("git status failed while binding benchmark provenance".to_owned());
-    }
-    if !status.stdout.is_empty() {
-        return Err("benchmark evidence requires a clean inference checkout".to_owned());
-    }
-    Ok(())
-}
-
-fn environment_record() -> Result<EnvironmentRecord, String> {
-    let root = repository_root()?;
-    let root_text = root
-        .to_str()
-        .ok_or_else(|| "repository root is not UTF-8".to_owned())?;
-    let inference_revision = command_output("git", &["-C", root_text, "rev-parse", "HEAD"])?;
-    let mlx_revision = mlx_revision(&root.join("Cargo.lock"))?;
-    Ok(EnvironmentRecord {
-        inference_revision,
-        mlx_revision,
+fn host_identity() -> Result<HostIdentity, String> {
+    Ok(HostIdentity {
         rustc_version: command_output("rustc", &["--version", "--verbose"])?.replace('\n', "; "),
         os_version: format!(
             "{} ({})",
@@ -906,30 +1221,13 @@ fn hardware_model() -> Result<String, String> {
             .and_then(serde_json::Value::as_str)
             .filter(|value| !value.trim().is_empty())
     };
-    let machine = field("machine_name").unwrap_or("Mac");
-    let model = field("machine_model").unwrap_or("unknown model");
-    let chip = field("chip_type").unwrap_or("unknown chip");
-    let memory = field("physical_memory").unwrap_or("unknown memory");
-    Ok(format!("{machine} ({model}; {chip}; {memory})"))
-}
-
-fn mlx_revision(lockfile: &Path) -> Result<String, String> {
-    let lock = fs::read_to_string(lockfile)
-        .map_err(|error| format!("read {}: {error}", lockfile.display()))?;
-    let marker = "git+https://github.com/michaeltrefry/mlx-rs?rev=";
-    let source = lock
-        .lines()
-        .find(|line| line.contains(marker))
-        .ok_or_else(|| "Cargo.lock has no pinned pmetal mlx-rs source".to_owned())?;
-    let revision = source
-        .split("?rev=")
-        .nth(1)
-        .and_then(|tail| tail.split('#').next())
-        .ok_or_else(|| "cannot parse mlx-rs revision from Cargo.lock".to_owned())?;
-    if revision.len() != 40 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err("Cargo.lock mlx-rs revision is not a full SHA".to_owned());
-    }
-    Ok(revision.to_ascii_lowercase())
+    Ok(format!(
+        "{} ({}; {}; {})",
+        field("machine_name").unwrap_or("Mac"),
+        field("machine_model").unwrap_or("unknown model"),
+        field("chip_type").unwrap_or("unknown chip"),
+        field("physical_memory").unwrap_or("unknown memory")
+    ))
 }
 
 fn metal_device() -> Result<String, String> {
@@ -952,6 +1250,25 @@ fn metal_device() -> Result<String, String> {
     find(&value)
         .map(str::to_owned)
         .ok_or_else(|| "system_profiler did not report a Metal device".to_owned())
+}
+
+fn mlx_revision(lockfile: &Path) -> Result<String, String> {
+    let lock = fs::read_to_string(lockfile)
+        .map_err(|error| format!("read {}: {error}", lockfile.display()))?;
+    let marker = "git+https://github.com/michaeltrefry/mlx-rs?rev=";
+    let source = lock
+        .lines()
+        .find(|line| line.contains(marker))
+        .ok_or_else(|| "Cargo.lock has no pinned pmetal mlx-rs source".to_owned())?;
+    let revision = source
+        .split("?rev=")
+        .nth(1)
+        .and_then(|tail| tail.split('#').next())
+        .ok_or_else(|| "cannot parse mlx-rs revision from Cargo.lock".to_owned())?;
+    if revision.len() != 40 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("Cargo.lock mlx-rs revision is not a full SHA".to_owned());
+    }
+    Ok(revision.to_ascii_lowercase())
 }
 
 fn write_json_atomic(path: &Path, value: &impl serde::Serialize) -> Result<(), String> {
@@ -977,70 +1294,74 @@ fn write_json_atomic(path: &Path, value: &impl serde::Serialize) -> Result<(), S
 }
 
 fn print_summary(summary: &BenchmarkSummary) {
-    println!("\nTiming comparison");
+    println!("\nStage timing comparison (seconds)");
     println!(
-        "{:<26} {:<12} {:<30} {:>10} {:>10} {:>10}",
-        "case", "tier", "variant", "seconds", "steps/s", "speedup"
+        "{:<26} {:<24} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}",
+        "case", "variant", "total", "encode", "denoise", "decode", "steps/s", "speedup"
     );
     for row in &summary.rows {
         println!(
-            "{:<26} {:<12} {:<30} {:>10.3} {:>10.3} {:>9.3}x",
+            "{:<26} {:<24} {:>9.3} {:>9.3} {:>9.3} {:>9.3} {:>9.3} {:>8.3}x",
             row.case_id,
-            row.tier.as_str(),
             row.variant_id,
             row.median_total_seconds,
+            row.median_encode_seconds,
+            row.median_denoise_seconds,
+            row.median_decode_seconds,
             row.median_denoise_steps_per_second,
             row.speedup_vs_baseline
         );
     }
-    println!("\nPhase peaks (active/cache GiB)");
+    println!("\nPhase allocator peaks (native-active / sampled-cache / paired-footprint GiB)");
     println!(
-        "{:<26} {:<30} {:>15} {:>15} {:>15} {:<8}",
+        "{:<26} {:<24} {:>20} {:>20} {:>20} {:<8}",
         "case", "variant", "encode", "denoise", "decode", "binds"
     );
     const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let triple = |active: u64, cache: u64, footprint: u64| {
+        format!(
+            "{:.2}/{:.2}/{:.2}",
+            active as f64 / GIB,
+            cache as f64 / GIB,
+            footprint as f64 / GIB
+        )
+    };
     for row in &summary.rows {
-        let pair = |active: u64, cache: u64| {
-            format!("{:.2}/{:.2}", active as f64 / GIB, cache as f64 / GIB)
-        };
         println!(
-            "{:<26} {:<30} {:>15} {:>15} {:>15} {:<8?}",
+            "{:<26} {:<24} {:>20} {:>20} {:>20} {:<8}",
             row.case_id,
             row.variant_id,
-            pair(
-                row.median_encode_active_peak_bytes,
-                row.median_encode_cache_peak_bytes
+            triple(
+                row.median_encode_native_active_peak_bytes,
+                row.median_encode_sampled_cache_peak_bytes,
+                row.median_encode_sampled_footprint_peak_bytes
             ),
-            pair(
-                row.median_denoise_active_peak_bytes,
-                row.median_denoise_cache_peak_bytes
+            triple(
+                row.median_denoise_native_active_peak_bytes,
+                row.median_denoise_sampled_cache_peak_bytes,
+                row.median_denoise_sampled_footprint_peak_bytes
             ),
-            pair(
-                row.median_decode_active_peak_bytes,
-                row.median_decode_cache_peak_bytes
+            triple(
+                row.median_decode_native_active_peak_bytes,
+                row.median_decode_sampled_cache_peak_bytes,
+                row.median_decode_sampled_footprint_peak_bytes
             ),
-            row.binding_phase
+            match row.binding_phase {
+                BindingPhase::Encode => "encode",
+                BindingPhase::Denoise => "denoise",
+                BindingPhase::Decode => "decode",
+            }
         );
     }
-    println!("\nJSON summary: schema {}", summary.schema_version);
+    println!(
+        "\nJSON summary: schema {}, campaign {}, acceptance_complete={}",
+        summary.schema_version, summary.campaign_id, summary.acceptance_complete
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn step_intervals_exclude_the_progress_boundary_step() {
-        assert_eq!(phases_step_intervals(8), 7);
-        assert_eq!(phases_step_intervals(1), 1);
-    }
-
-    #[test]
-    fn mlx_revision_is_bound_to_the_workspace_lock() {
-        let revision = mlx_revision(&repository_root().unwrap().join("Cargo.lock")).unwrap();
-        assert_eq!(revision.len(), 40);
-        assert!(revision.bytes().all(|byte| byte.is_ascii_hexdigit()));
-    }
 
     #[test]
     fn default_matrix_parses_and_validates() {
@@ -1050,5 +1371,26 @@ mod tests {
             runtime_macos::perf_bench::MATRIX_SCHEMA_VERSION
         );
         matrix.validate().unwrap();
+    }
+
+    #[test]
+    fn full_selection_is_default_and_baseline_is_required() {
+        let matrix: BenchmarkMatrix = serde_json::from_str(DEFAULT_MATRIX).unwrap();
+        assert_eq!(selected_variants(&matrix, None).unwrap().len(), 7);
+        assert!(selected_variants(&matrix, Some(&["exact_epilogues".to_owned()])).is_err());
+    }
+
+    #[test]
+    fn compile_time_build_receipt_has_exact_revisions() {
+        let receipt = build_provenance().unwrap();
+        assert_eq!(receipt.source_revision.len(), 40);
+        assert_eq!(receipt.mlx_revision.len(), 40);
+    }
+
+    #[test]
+    fn mlx_revision_is_bound_to_the_workspace_lock() {
+        let revision = mlx_revision(&repository_root().unwrap().join("Cargo.lock")).unwrap();
+        assert_eq!(revision.len(), 40);
+        assert!(revision.bytes().all(|byte| byte.is_ascii_hexdigit()));
     }
 }

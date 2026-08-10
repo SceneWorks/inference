@@ -2,6 +2,8 @@
 
 #[cfg(feature = "audio")]
 pub use candle_audio_catalog::audio;
+#[cfg(feature = "perf-bench")]
+pub use mlx_gen_catalog::benchmark_toggle_capabilities;
 #[cfg(feature = "media")]
 pub use mlx_gen_catalog::media;
 pub use mlx_llm as llm;

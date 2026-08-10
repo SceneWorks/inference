@@ -79,6 +79,10 @@ pub use unet::{ControlNet, ControlResiduals, Transformer2D, UNet2DConditionModel
 pub use vae::Autoencoder;
 pub use vision_encoder::{ClipVisionEncoder, VisionConfig};
 
+/// Shared-optimization toggles whose production call sites this provider can actually execute.
+/// Availability never substitutes for the request-local `Applied` receipt required by P6.
+pub const BENCHMARK_TOGGLE_CAPABILITIES: &[&str] = &[];
+
 // sc-2963 compiled-glue toggle: when on, the UNet's remaining fusable elementwise glue — the **SiLU**
 // activations (`x·sigmoid(x)`: ResNet GN→SiLU, the time-embedding MLP, the output head) — runs through
 // `mx.compile`, fusing each into one kernel. The GEGLU/erf-GELU activations are already `mx.compile`'d

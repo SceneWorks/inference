@@ -74,6 +74,10 @@ pub(crate) const MAX_WAN_FRAMES: usize = 1025;
 /// Matching z16/z48 temporal-conditioning budget after 4x causal compression.
 pub(crate) const MAX_WAN_CONDITIONING_LATENTS: usize = 257;
 
+/// Shared-optimization toggles whose production call sites this provider can actually execute.
+/// Availability never substitutes for the request-local `Applied` receipt required by P6.
+pub const BENCHMARK_TOGGLE_CAPABILITIES: &[&str] = &[];
+
 pub(crate) fn combined_conditioning_latents(
     control_frames: usize,
     reference_images: usize,
