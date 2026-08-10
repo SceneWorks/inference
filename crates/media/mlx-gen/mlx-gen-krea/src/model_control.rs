@@ -826,9 +826,10 @@ mod tests {
     }
 
     #[test]
-    fn native_control_load_missing_base_fails_at_config_read() {
-        // The native control entrypoint proves the base tier is present FIRST (arch-config read),
-        // exactly like the t2i native entrypoint — a bogus base fails there, before any tensor I/O.
+    fn native_control_load_missing_base_fails_during_asset_inventory() {
+        // The native control entrypoint proves the base tier is present first, exactly like the t2i
+        // native entrypoint. A bogus base fails during the fail-closed asset inventory before any
+        // tensor materialization.
         let e = load_control_from_native_dit_file(
             "/nonexistent-krea/dit.safetensors",
             "/nonexistent-krea",
@@ -839,8 +840,8 @@ mod tests {
         .expect("missing base snapshot → err")
         .to_string();
         assert!(
-            e.contains("config.json") || e.contains("read"),
-            "expected the missing-base config-read error, got: {e}"
+            e.contains("native base text encoder asset facts"),
+            "expected the missing-base inventory error, got: {e}"
         );
     }
 
