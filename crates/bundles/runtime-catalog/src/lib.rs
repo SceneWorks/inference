@@ -561,6 +561,7 @@ pub struct GeneratorCapabilitySnapshot {
     pub supports_lokr: bool,
     pub supported_quants: Vec<String>,
     pub supports_preview: bool,
+    pub supports_prompt_enhancement: bool,
     pub samplers: Vec<String>,
     pub schedulers: Vec<String>,
     pub supported_guidance_methods: Vec<String>,
@@ -592,6 +593,7 @@ impl GeneratorCapabilitySnapshot {
                 .map(str::to_string)
                 .collect(),
             supports_preview: descriptor.capabilities.supports_preview,
+            supports_prompt_enhancement: descriptor.capabilities.supports_prompt_enhancement,
             samplers: descriptor
                 .capabilities
                 .samplers
@@ -624,6 +626,7 @@ impl GeneratorCapabilitySnapshot {
             "supports_lokr": self.supports_lokr,
             "supported_quants": self.supported_quants,
             "supports_preview": self.supports_preview,
+            "supports_prompt_enhancement": self.supports_prompt_enhancement,
             "samplers": self.samplers,
             "schedulers": self.schedulers,
             "supported_guidance_methods": self.supported_guidance_methods,
@@ -881,6 +884,7 @@ mod tests {
                 supports_lokr: true,
                 supported_quants: &[gen_core::Quant::Q4, gen_core::Quant::Q8],
                 supports_preview: true,
+                supports_prompt_enhancement: true,
                 samplers: vec!["euler"],
                 schedulers: vec!["simple"],
                 supported_guidance_methods: vec!["cfg"],
@@ -899,6 +903,7 @@ mod tests {
         assert_eq!(json["supports_lora"], true);
         assert_eq!(json["supports_lokr"], true);
         assert_eq!(json["supports_preview"], true);
+        assert_eq!(json["supports_prompt_enhancement"], true);
 
         let mut mutated = descriptor.clone();
         mutated.capabilities.supports_preview = false;
@@ -906,6 +911,13 @@ mod tests {
             GeneratorCapabilitySnapshot::from_descriptor(&descriptor).to_json(),
             GeneratorCapabilitySnapshot::from_descriptor(&mutated).to_json(),
             "a descriptor capability mutation must change the machine-readable snapshot"
+        );
+        mutated = descriptor.clone();
+        mutated.capabilities.supports_prompt_enhancement = false;
+        assert_ne!(
+            GeneratorCapabilitySnapshot::from_descriptor(&descriptor).to_json(),
+            GeneratorCapabilitySnapshot::from_descriptor(&mutated).to_json(),
+            "prompt-enhancement support must be anti-restamp protected"
         );
     }
 

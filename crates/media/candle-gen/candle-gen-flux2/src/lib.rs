@@ -1053,6 +1053,10 @@ fn descriptor(variant: Flux2Variant) -> ModelDescriptor {
             // the epic-16624 fit. `candle-gen-catalog`'s `preview_advertising` guard derives this
             // flag from the sources, so it cannot be set ahead of the wiring or left behind it.
             supports_preview: true,
+            // The Candle FLUX.2 provider currently carries `enhance_prompt` through the request but
+            // does not run a caption upsampler; the generated capability snapshot must expose that
+            // semantic difference from MLX.
+            supports_prompt_enhancement: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
@@ -1609,6 +1613,7 @@ mod tests {
         assert!(d.capabilities.conditioning.is_empty());
         assert!(!d.capabilities.supports_lora);
         assert!(!d.capabilities.supports_kv_cache);
+        assert!(!d.capabilities.supports_prompt_enhancement);
         // klein now quantizes its DiT on-the-fly (sc-11031); the Qwen3 TE stays dense (`te_quant`).
         assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
         assert!(!d.capabilities.accepts(ConditioningKind::Reference));
@@ -1633,6 +1638,7 @@ mod tests {
         assert!(!d.capabilities.mac_only);
         assert!(d.capabilities.conditioning.is_empty());
         assert!(d.capabilities.requires_sigma_shift);
+        assert!(!d.capabilities.supports_prompt_enhancement);
         // dev and klein both advertise Q4/Q8 now (CPU-stage → quantize-onto-GPU); klein keeps its Qwen3
         // TE dense (`te_quant`), dev folds the Mistral TE with the DiT (sc-11031).
         assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
