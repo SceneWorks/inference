@@ -452,6 +452,7 @@ mod preview_advertising {
         "krea_2_turbo",
         "krea_2_raw",
         "krea_2_edit",
+        "krea_2_turbo_edit",
         "qwen_image",
         "anima_base",
         "anima_aesthetic",
@@ -3189,11 +3190,12 @@ mod preview_advertising {
             classified.difference(&registered).collect::<Vec<_>>()
         );
 
-        // The shape at sc-16961: 51 registered generators = 29 wired + 19 no-go + 3 deferred. This
-        // story moves the wired count by ZERO — it measures nothing and wires nothing.
+        // The shape after SC-18306 registers the already-wired Krea Turbo edit route:
+        // 52 registered generators = 30 wired + 19 no-go + 3 deferred. No preview fit or emission
+        // behavior changed; the new descriptor reaches Krea's existing edit preview hook.
         assert_eq!(
             (registered.len(), wired.len(), no_go.len(), deferred.len()),
-            (51, 29, 19, 3),
+            (52, 30, 19, 3),
             "moving a route between preview classes is a decision that must be written down here"
         );
     }
@@ -3904,6 +3906,7 @@ mod tests {
                 "krea_2_turbo",
                 "krea_2_raw",
                 "krea_2_edit",
+                "krea_2_turbo_edit",
                 "lens_turbo",
                 "lens",
                 "ltx_2_3_distilled",
@@ -3957,9 +3960,9 @@ mod tests {
 
         // sc-16667: the pinned surface and the model-weight licence mapping move together — this is
         // where a surface change and a mapping change meet. Five of the seven trainer ids are also
-        // generator ids, which is why 51 + 7 + 1 + 2 registrations are 56 distinct ids.
+        // generator ids, which is why 52 + 7 + 1 + 2 registrations are 57 distinct ids.
         //
-        // Registration is never conditioned on the mapping: 47 < 56 because nine ids load nothing
+        // Registration is never conditioned on the mapping: 48 < 57 because nine ids load nothing
         // the shared checkpoint table covers, and they ship exactly as before. That gap is a hole in
         // our metadata for CI to report, and `licenses::tests` pins which nine and why — as
         // `#[cfg(test)]` data, so no gate can read it and suppress them.
@@ -3970,8 +3973,8 @@ mod tests {
             .chain(&image_embedders)
             .chain(&text_embedders)
             .collect();
-        assert_eq!(distinct.len(), 56);
-        assert_eq!(super::provider_components().len(), 47);
+        assert_eq!(distinct.len(), 57);
+        assert_eq!(super::provider_components().len(), 48);
     }
 
     /// The manifest emitter runs on **this** catalog's three slices, and its output is

@@ -139,11 +139,10 @@ pub const KREA_2_RAW_ID: &str = "krea_2_raw";
 /// `krea_2_edit` seam. Matches the worker `payload.model` + manifest `engine_id`.
 pub const KREA_2_EDIT_ID: &str = "krea_2_edit";
 
-/// Surface tag for the **distilled Turbo image-edit** (`krea_2_turbo_edit`, sc-11640). Not a registered
-/// `Generator` id — the CFG-free distilled edit is driven through the worker's bespoke
-/// `generate_candle_krea_edit_stream` lane, which calls [`pipeline::render_edit`] with `distilled = true`
-/// directly. Named here so the shared edit path (PiD decode-seam errors, sc-11197) reports the right
-/// surface for the Turbo edit vs the Raw [`KREA_2_EDIT_ID`].
+/// Registered surface tag for the **distilled Turbo image-edit** (`krea_2_turbo_edit`, sc-11640).
+/// The CFG-free distilled edit shares [`pipeline::render_edit`] with the Raw edit and passes
+/// `distilled = true`, so the route uses Turbo's few-step schedule and reports its own surface in
+/// PiD decode-seam errors (sc-11197).
 pub const KREA_2_TURBO_EDIT_ID: &str = "krea_2_turbo_edit";
 /// Content identity for the CUDA resident/staged and ladder calibration harness.
 pub const RESIDENCY_CALIBRATION_FINGERPRINT: &str = "krea-cuda-residency-ladder-v1";
