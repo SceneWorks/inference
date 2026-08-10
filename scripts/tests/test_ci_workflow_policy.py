@@ -1370,6 +1370,10 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         )
         self.assertIn('allow_patterns=["bf16/**"]', job)
         self.assertIn("models--SceneWorks--scail2-mlx", job)
+        git_bash = job.index("Select Git Bash")
+        toolchain = job.index("uses: dtolnay/rust-toolchain@")
+        self.assertLess(git_bash, toolchain)
+        self.assertIn(r'C:\Program Files\Git\bin\bash.exe', job)
         for required in (
             "config.json",
             "dit.safetensors",
