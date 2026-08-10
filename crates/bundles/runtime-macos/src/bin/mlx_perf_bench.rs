@@ -7,7 +7,8 @@ use runtime_macos::gen_core::{
 };
 use runtime_macos::media::diagnostics::{
     self, BenchmarkDecodeControl, BenchmarkPhaseBoundary, CacheDisposition, CompileDisposition,
-    DecodePolicyDisposition, DiagnosticCounter, DiagnosticReport, ToggleDisposition,
+    DecodePathDisposition, DecodePolicyDisposition, DiagnosticCounter, DiagnosticReport,
+    ToggleDisposition,
 };
 use runtime_macos::media::memory_probe::{AllocatorProbe, AllocatorProbeReport};
 use runtime_macos::perf_bench::{
@@ -997,6 +998,7 @@ fn diagnostic_records(report: DiagnosticReport) -> Vec<DiagnosticRecord> {
                 .to_owned(),
                 count,
                 reason: None,
+                decode_path: None,
                 production_evidence_sha256: None,
             },
             DiagnosticCounter::Cache {
@@ -1014,6 +1016,7 @@ fn diagnostic_records(report: DiagnosticReport) -> Vec<DiagnosticRecord> {
                 .to_owned(),
                 count,
                 reason: None,
+                decode_path: None,
                 production_evidence_sha256: None,
             },
             DiagnosticCounter::Fallback {
@@ -1026,6 +1029,7 @@ fn diagnostic_records(report: DiagnosticReport) -> Vec<DiagnosticRecord> {
                 outcome: "fallback".to_owned(),
                 count,
                 reason: Some(reason.to_owned()),
+                decode_path: None,
                 production_evidence_sha256: None,
             },
             DiagnosticCounter::Toggle {
@@ -1043,10 +1047,12 @@ fn diagnostic_records(report: DiagnosticReport) -> Vec<DiagnosticRecord> {
                 .to_owned(),
                 count,
                 reason: None,
+                decode_path: None,
                 production_evidence_sha256: None,
             },
             DiagnosticCounter::DecodePolicy {
                 disposition,
+                decode_path,
                 production_evidence_sha256,
                 count,
             } => DiagnosticRecord {
@@ -1059,6 +1065,13 @@ fn diagnostic_records(report: DiagnosticReport) -> Vec<DiagnosticRecord> {
                 .to_owned(),
                 count,
                 reason: None,
+                decode_path: Some(
+                    match decode_path {
+                        DecodePathDisposition::Dense => "dense",
+                        DecodePathDisposition::Tiled => "tiled",
+                    }
+                    .to_owned(),
+                ),
                 production_evidence_sha256,
             },
         })
@@ -1530,6 +1543,7 @@ mod tests {
             family: "image_dit".to_owned(),
             counters: vec![DiagnosticCounter::DecodePolicy {
                 disposition: DecodePolicyDisposition::GeometryTiled,
+                decode_path: DecodePathDisposition::Tiled,
                 production_evidence_sha256: Some(evidence.clone()),
                 count: 1,
             }],
@@ -1540,6 +1554,7 @@ mod tests {
         assert_eq!(records[0].domain, "decode_policy");
         assert_eq!(records[0].site, diagnostics::GEOMETRY_AWARE_DECODE);
         assert_eq!(records[0].outcome, "geometry_tiled");
+        assert_eq!(records[0].decode_path.as_deref(), Some("tiled"));
         assert_eq!(
             records[0].production_evidence_sha256.as_deref(),
             Some(evidence.as_str())

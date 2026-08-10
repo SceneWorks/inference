@@ -1452,6 +1452,7 @@ pub struct DiagnosticRecord {
     pub outcome: String,
     pub count: u64,
     pub reason: Option<String>,
+    pub decode_path: Option<String>,
     pub production_evidence_sha256: Option<String>,
 }
 
@@ -1536,9 +1537,15 @@ fn validate_phase(name: &str, phase: &PhaseMetrics, errors: &mut Vec<String>) {
             "measurement {name} phase sampling span does not cover its duration"
         ));
     }
-    if coverage.sampling_span_micros > 4 * MEMORY_SAMPLE_INTERVAL_MICROS
-        && (coverage.periodic_sample_count == 0
-            || coverage.max_gap_micros > MEMORY_MAX_GAP_MULTIPLIER * MEMORY_SAMPLE_INTERVAL_MICROS)
+    let observed_intervals = coverage.sample_count.saturating_sub(1);
+    let minimum_possible_max_gap = if observed_intervals == 0 {
+        u64::MAX
+    } else {
+        coverage.sampling_span_micros.div_ceil(observed_intervals)
+    };
+    if coverage.max_gap_micros > MEMORY_MAX_GAP_MULTIPLIER * MEMORY_SAMPLE_INTERVAL_MICROS
+        || coverage.max_gap_micros > coverage.sampling_span_micros
+        || coverage.max_gap_micros < minimum_possible_max_gap
     {
         errors.push(format!(
             "measurement {name} phase lacks fixed-cadence sampling coverage"
@@ -1552,9 +1559,16 @@ enum GeometryDecodeDecision {
     GeometryTiled,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum PhysicalDecodePath {
+    Dense,
+    Tiled,
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct GeometryDecodeReceipt {
     decision: GeometryDecodeDecision,
+    decode_path: PhysicalDecodePath,
     production_evidence_sha256: Option<String>,
 }
 
@@ -1567,8 +1581,14 @@ fn geometry_decode_receipt(diagnostics: &[DiagnosticRecord]) -> Option<GeometryD
         "geometry_tiled" => GeometryDecodeDecision::GeometryTiled,
         _ => return None,
     };
+    let decode_path = match record.decode_path.as_deref() {
+        Some("dense") => PhysicalDecodePath::Dense,
+        Some("tiled") => PhysicalDecodePath::Tiled,
+        _ => return None,
+    };
     Some(GeometryDecodeReceipt {
         decision,
+        decode_path,
         production_evidence_sha256: record.production_evidence_sha256.clone(),
     })
 }
@@ -1613,18 +1633,21 @@ fn validate_geometry_decode_receipt(
         return;
     }
     match record.outcome.as_str() {
-        "unchanged" if record.production_evidence_sha256.is_none() => {}
+        "unchanged"
+            if matches!(record.decode_path.as_deref(), Some("dense" | "tiled"))
+                && record.production_evidence_sha256.is_none() => {}
         "geometry_tiled"
-            if record
+            if record.decode_path.as_deref() == Some("tiled")
+                && record
                 .production_evidence_sha256
                 .as_deref()
                 .is_some_and(is_sha256) => {}
         "geometry_tiled" => errors.push(format!(
-            "P9 variant {:?} requires a production-evidence SHA-256 for geometry_tiled",
+            "P9 variant {:?} requires physical tiled decode and a production-evidence SHA-256 for geometry_tiled",
             variant.id
         )),
         "unchanged" => errors.push(format!(
-            "P9 variant {:?} forbids production evidence for unchanged",
+            "P9 variant {:?} requires a physical decode path and forbids production evidence for unchanged",
             variant.id
         )),
         outcome => errors.push(format!(
@@ -1639,7 +1662,7 @@ fn validate_toggle_receipts(
     diagnostics: &[DiagnosticRecord],
     errors: &mut Vec<String>,
 ) {
-    let requested: BTreeSet<_> = variant
+    let declared: BTreeSet<_> = variant
         .toggles
         .iter()
         .map(|toggle| toggle.as_str())
@@ -1662,13 +1685,23 @@ fn validate_toggle_receipts(
         if diagnostic.domain != "decode_policy" && diagnostic.production_evidence_sha256.is_some() {
             errors.push("only decode_policy may carry a production-evidence SHA-256".to_owned());
         }
+        if diagnostic.domain != "decode_policy" && diagnostic.decode_path.is_some() {
+            errors.push("only decode_policy may carry a physical decode path".to_owned());
+        }
     }
     validate_geometry_decode_receipt(variant, diagnostics, errors);
+    let all_on_p5_inactive = variant.id == "all_on"
+        && geometry_decode_receipt(diagnostics)
+            .is_some_and(|receipt| receipt.decode_path == PhysicalDecodePath::Dense);
+    let mut expected = declared.clone();
+    if all_on_p5_inactive {
+        expected.remove(OptimizationToggle::IndexedDecodeAccumulator.as_str());
+    }
     let toggle_records: Vec<_> = diagnostics
         .iter()
         .filter(|diagnostic| diagnostic.domain == "toggle")
         .collect();
-    if requested.is_empty() {
+    if declared.is_empty() {
         if !toggle_records.is_empty() {
             errors.push("toggle-free variants forbid every toggle terminal receipt".to_owned());
         }
@@ -1681,14 +1714,24 @@ fn validate_toggle_receipts(
         errors.push("requested variants forbid fallback diagnostics".to_owned());
     }
     for record in &toggle_records {
-        if !requested.contains(record.site.as_str()) {
+        if !declared.contains(record.site.as_str()) {
             errors.push(format!(
                 "variant {:?} emitted an unrequested toggle receipt for {}",
                 variant.id, record.site
             ));
         }
     }
-    for toggle in requested {
+    if all_on_p5_inactive
+        && toggle_records
+            .iter()
+            .any(|record| record.site == OptimizationToggle::IndexedDecodeAccumulator.as_str())
+    {
+        errors.push(
+            "all_on forbids an indexed_decode_accumulator terminal receipt for a physical dense decode path"
+                .to_owned(),
+        );
+    }
+    for toggle in expected {
         let records: Vec<_> = toggle_records
             .iter()
             .filter(|record| record.site == toggle)
@@ -2377,12 +2420,17 @@ mod tests {
         let mut diagnostics: Vec<DiagnosticRecord> = variant
             .toggles
             .iter()
+            .filter(|toggle| {
+                !(variant.id == "all_on"
+                    && **toggle == OptimizationToggle::IndexedDecodeAccumulator)
+            })
             .map(|toggle| DiagnosticRecord {
                 domain: "toggle".to_owned(),
                 site: toggle.as_str().to_owned(),
                 outcome: "applied".to_owned(),
                 count: 7,
                 reason: None,
+                decode_path: None,
                 production_evidence_sha256: None,
             })
             .collect();
@@ -2396,6 +2444,7 @@ mod tests {
                 outcome: "unchanged".to_owned(),
                 count: 1,
                 reason: None,
+                decode_path: Some("dense".to_owned()),
                 production_evidence_sha256: None,
             });
         }
@@ -2480,8 +2529,11 @@ mod tests {
     fn set_geometry_decode_policy(
         run: &mut RunRecord,
         outcome: &str,
+        decode_path: &str,
         production_evidence_sha256: Option<&str>,
     ) {
+        let indexed = OptimizationToggle::IndexedDecodeAccumulator.as_str();
+        let all_on = run.variant.id == "all_on";
         for measurement in &mut run.measurements {
             let receipt = measurement
                 .diagnostics
@@ -2489,7 +2541,29 @@ mod tests {
                 .find(|record| record.domain == "decode_policy")
                 .expect("P9 fixture has a decode-policy receipt");
             receipt.outcome = outcome.to_owned();
+            receipt.decode_path = Some(decode_path.to_owned());
             receipt.production_evidence_sha256 = production_evidence_sha256.map(str::to_owned);
+            if all_on && decode_path == "tiled" {
+                if !measurement
+                    .diagnostics
+                    .iter()
+                    .any(|record| record.domain == "toggle" && record.site == indexed)
+                {
+                    measurement.diagnostics.push(DiagnosticRecord {
+                        domain: "toggle".to_owned(),
+                        site: indexed.to_owned(),
+                        outcome: "applied".to_owned(),
+                        count: 7,
+                        reason: None,
+                        decode_path: None,
+                        production_evidence_sha256: None,
+                    });
+                }
+            } else if all_on {
+                measurement
+                    .diagnostics
+                    .retain(|record| !(record.domain == "toggle" && record.site == indexed));
+            }
         }
     }
 
@@ -2745,6 +2819,7 @@ mod tests {
             outcome: "applied".to_owned(),
             count: 1,
             reason: None,
+            decode_path: None,
             production_evidence_sha256: None,
         });
         assert!(baseline
@@ -2760,6 +2835,7 @@ mod tests {
             outcome: "fallback".to_owned(),
             count: 1,
             reason: Some("controlled".to_owned()),
+            decode_path: None,
             production_evidence_sha256: None,
         });
         retained.measurements[0].diagnostics.push(DiagnosticRecord {
@@ -2768,6 +2844,7 @@ mod tests {
             outcome: "applied".to_owned(),
             count: 1,
             reason: None,
+            decode_path: None,
             production_evidence_sha256: None,
         });
         let error = retained
@@ -2811,6 +2888,91 @@ mod tests {
     }
 
     #[test]
+    fn sampling_gap_gate_applies_to_short_measured_phases() {
+        let mut acceptable = phase(0.025, 100);
+        acceptable.coverage.sample_count = 2;
+        acceptable.coverage.periodic_sample_count = 0;
+        acceptable.coverage.sampling_span_micros = 25_000;
+        acceptable.coverage.max_gap_micros = 25_000;
+        let mut errors = Vec::new();
+        validate_phase("short", &acceptable, &mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
+
+        let mut starved = phase(0.035, 100);
+        starved.coverage.sample_count = 2;
+        starved.coverage.periodic_sample_count = 0;
+        starved.coverage.sampling_span_micros = 35_000;
+        starved.coverage.max_gap_micros = 35_000;
+        let mut errors = Vec::new();
+        validate_phase("short", &starved, &mut errors);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("fixed-cadence sampling coverage")));
+
+        // A serialized receipt cannot conceal that same starvation by claiming a max gap smaller
+        // than the average gap implied by its span and sample count.
+        starved.coverage.max_gap_micros = 1;
+        let mut errors = Vec::new();
+        validate_phase("short", &starved, &mut errors);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("fixed-cadence sampling coverage")));
+    }
+
+    #[test]
+    fn all_on_p5_receipt_tracks_the_actual_physical_decode_path() {
+        let (campaign, _root) = fixture_campaign();
+        let mut unchanged = valid_run(&campaign, "qwen-q4-512", "all_on");
+        unchanged.validate_against(&campaign).unwrap();
+        assert!(!unchanged.measurements.iter().any(|measurement| {
+            measurement.diagnostics.iter().any(|record| {
+                record.domain == "toggle"
+                    && record.site == OptimizationToggle::IndexedDecodeAccumulator.as_str()
+            })
+        }));
+
+        for measurement in &mut unchanged.measurements {
+            measurement.diagnostics.push(DiagnosticRecord {
+                domain: "toggle".to_owned(),
+                site: OptimizationToggle::IndexedDecodeAccumulator
+                    .as_str()
+                    .to_owned(),
+                outcome: "applied".to_owned(),
+                count: 1,
+                reason: None,
+                decode_path: None,
+                production_evidence_sha256: None,
+            });
+        }
+        assert!(unchanged
+            .validate_against(&campaign)
+            .unwrap_err()
+            .to_string()
+            .contains("forbids an indexed_decode_accumulator terminal receipt"));
+
+        let mut tiled = valid_run(&campaign, "qwen-q4-512", "all_on");
+        set_geometry_decode_policy(&mut tiled, "geometry_tiled", "tiled", Some(&"9".repeat(64)));
+        tiled.validate_against(&campaign).unwrap();
+        for measurement in &mut tiled.measurements {
+            measurement.diagnostics.retain(|record| {
+                !(record.domain == "toggle"
+                    && record.site == OptimizationToggle::IndexedDecodeAccumulator.as_str())
+            });
+        }
+        assert!(tiled
+            .validate_against(&campaign)
+            .unwrap_err()
+            .to_string()
+            .contains("requires exactly one terminal Applied record"));
+
+        // Wan may preserve its production policy while that pre-existing policy auto-tiles. The
+        // physical path, not P9's semantic disposition, is therefore authoritative for P5.
+        let mut unchanged_but_tiled = valid_run(&campaign, "wan-q4-512x480-f17", "all_on");
+        set_geometry_decode_policy(&mut unchanged_but_tiled, "unchanged", "tiled", None);
+        unchanged_but_tiled.validate_against(&campaign).unwrap();
+    }
+
+    #[test]
     fn summary_enforces_declared_controls_and_accepts_evidence_backed_p9_drift() {
         let (campaign, _root) = fixture_campaign();
         let mut records = Vec::new();
@@ -2847,7 +3009,7 @@ mod tests {
                 .iter_mut()
                 .find(|run| run.case_id == "qwen-q4-512" && run.variant.id == variant_id)
                 .unwrap();
-            set_geometry_decode_policy(changed, "geometry_tiled", Some(&"9".repeat(64)));
+            set_geometry_decode_policy(changed, "geometry_tiled", "tiled", Some(&"9".repeat(64)));
             for measurement in &mut changed.measurements {
                 measurement.output.sha256 = "e".repeat(64);
             }
@@ -2934,23 +3096,52 @@ mod tests {
             .iter_mut()
             .find(|run| run.case_id == "qwen-q4-512" && run.variant.id == "geometry_aware_decode")
             .unwrap();
-        set_geometry_decode_policy(p9, "geometry_tiled", None);
+        set_geometry_decode_policy(p9, "geometry_tiled", "tiled", None);
         assert!(build_summary(&campaign, &no_evidence)
             .unwrap_err()
             .to_string()
-            .contains("requires a production-evidence SHA-256"));
+            .contains("production-evidence SHA-256 for geometry_tiled"));
+
+        let mut impossible_dense_geometry = records();
+        let p9 = impossible_dense_geometry
+            .iter_mut()
+            .find(|run| run.case_id == "qwen-q4-512" && run.variant.id == "geometry_aware_decode")
+            .unwrap();
+        set_geometry_decode_policy(p9, "geometry_tiled", "dense", Some(&"8".repeat(64)));
+        assert!(build_summary(&campaign, &impossible_dense_geometry)
+            .unwrap_err()
+            .to_string()
+            .contains("requires physical tiled decode"));
+
+        let mut missing_path = records();
+        let p9 = missing_path
+            .iter_mut()
+            .find(|run| run.case_id == "qwen-q4-512" && run.variant.id == "geometry_aware_decode")
+            .unwrap();
+        for measurement in &mut p9.measurements {
+            measurement
+                .diagnostics
+                .iter_mut()
+                .find(|record| record.domain == "decode_policy")
+                .unwrap()
+                .decode_path = None;
+        }
+        assert!(build_summary(&campaign, &missing_path)
+            .unwrap_err()
+            .to_string()
+            .contains("requires a physical decode path"));
 
         let mut mismatched = records();
         let p9 = mismatched
             .iter_mut()
             .find(|run| run.case_id == "qwen-q4-512" && run.variant.id == "geometry_aware_decode")
             .unwrap();
-        set_geometry_decode_policy(p9, "geometry_tiled", Some(&"8".repeat(64)));
+        set_geometry_decode_policy(p9, "geometry_tiled", "tiled", Some(&"8".repeat(64)));
         let all_on = mismatched
             .iter_mut()
             .find(|run| run.case_id == "qwen-q4-512" && run.variant.id == "all_on")
             .unwrap();
-        set_geometry_decode_policy(all_on, "geometry_tiled", Some(&"9".repeat(64)));
+        set_geometry_decode_policy(all_on, "geometry_tiled", "tiled", Some(&"9".repeat(64)));
         assert!(build_summary(&campaign, &mismatched)
             .unwrap_err()
             .to_string()
@@ -2967,6 +3158,7 @@ mod tests {
             .find(|record| record.domain == "decode_policy")
             .unwrap();
         receipt.outcome = "geometry_tiled".to_owned();
+        receipt.decode_path = Some("tiled".to_owned());
         receipt.production_evidence_sha256 = Some("7".repeat(64));
         assert!(build_summary(&campaign, &unstable)
             .unwrap_err()

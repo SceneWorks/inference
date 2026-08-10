@@ -77,6 +77,16 @@ pub enum DecodePolicyDisposition {
     GeometryTiled,
 }
 
+/// Physical decoder path selected for a request carrying a P9 policy receipt.
+///
+/// This is separate from [`DecodePolicyDisposition`]: Wan can truthfully preserve its production
+/// policy (`Unchanged`) while that pre-existing policy auto-tiles the concrete request.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum DecodePathDisposition {
+    Dense,
+    Tiled,
+}
+
 /// Provider-neutral compute boundaries consumed by the P6 benchmark harness.
 ///
 /// Providers emit these at the exact point where pre-denoise work ends and where denoise hands its
@@ -151,6 +161,7 @@ pub enum DiagnosticCounter {
     },
     DecodePolicy {
         disposition: DecodePolicyDisposition,
+        decode_path: DecodePathDisposition,
         production_evidence_sha256: Option<String>,
         count: u64,
     },
@@ -171,7 +182,11 @@ enum CounterKey {
     Cache(&'static str, CacheDisposition),
     Fallback(&'static str, &'static str),
     Toggle(&'static str, ToggleDisposition),
-    DecodePolicy(DecodePolicyDisposition, Option<String>),
+    DecodePolicy(
+        DecodePolicyDisposition,
+        DecodePathDisposition,
+        Option<String>,
+    ),
 }
 
 struct Collector {
@@ -344,15 +359,17 @@ pub fn record_toggle(toggle: &'static str, disposition: ToggleDisposition) {
 
 /// Record P9's request-local policy decision. No-op outside an active diagnostic request.
 ///
-/// The benchmark contract rejects `GeometryTiled` without a lower-hex SHA-256 identity and rejects
-/// any evidence identity on `Unchanged`; keeping validation in the versioned P6 schema lets legacy
-/// or malformed serialized evidence fail closed as well.
+/// The benchmark contract rejects `GeometryTiled` without both a physical tiled path and a
+/// lower-hex SHA-256 identity, and rejects any evidence identity on `Unchanged`; keeping validation
+/// in the versioned P6 schema lets legacy or malformed serialized evidence fail closed as well.
 pub fn record_decode_policy(
     disposition: DecodePolicyDisposition,
+    decode_path: DecodePathDisposition,
     production_evidence_sha256: Option<&str>,
 ) {
     increment(CounterKey::DecodePolicy(
         disposition,
+        decode_path,
         production_evidence_sha256.map(str::to_owned),
     ));
 }
@@ -409,13 +426,16 @@ impl DiagnosticScope {
                         disposition,
                         count,
                     },
-                    CounterKey::DecodePolicy(disposition, production_evidence_sha256) => {
-                        DiagnosticCounter::DecodePolicy {
-                            disposition,
-                            production_evidence_sha256,
-                            count,
-                        }
-                    }
+                    CounterKey::DecodePolicy(
+                        disposition,
+                        decode_path,
+                        production_evidence_sha256,
+                    ) => DiagnosticCounter::DecodePolicy {
+                        disposition,
+                        decode_path,
+                        production_evidence_sha256,
+                        count,
+                    },
                 })
                 .collect();
             DiagnosticReport {
@@ -542,6 +562,7 @@ mod tests {
                 .unwrap();
         record_decode_policy(
             DecodePolicyDisposition::GeometryTiled,
+            DecodePathDisposition::Tiled,
             Some(evidence.as_str()),
         );
         let report = scope.finish();
@@ -550,6 +571,7 @@ mod tests {
             report.counters,
             [DiagnosticCounter::DecodePolicy {
                 disposition: DecodePolicyDisposition::GeometryTiled,
+                decode_path: DecodePathDisposition::Tiled,
                 production_evidence_sha256: Some(evidence),
                 count: 1,
             }]

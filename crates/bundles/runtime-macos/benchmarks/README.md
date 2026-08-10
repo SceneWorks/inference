@@ -61,8 +61,14 @@ wrong-host state.
 The default required-all campaign fails at preflight until every benchmark provider explicitly
 declares every requested capability. Declaration is only availability, never proof that a path ran.
 Every warmup and measured request must independently emit exactly one aggregated terminal
-`ToggleDisposition::Applied` record for each requested toggle, no unrequested terminal record, and
-no fallback or unavailable outcome. Baseline forbids all toggle terminal records.
+`ToggleDisposition::Applied` record for each toggle that can execute under the request's actual
+physical decode path, no unrequested terminal record, and no fallback or unavailable outcome. The
+one conditional is `all_on`: a dense-path P9 receipt forbids P5's terminal receipt because its tiled
+accumulator did not execute, while a tiled-path receipt requires P5 `Applied`. The physical path is
+separate from P9's semantic decision because Wan can preserve its pre-existing production policy
+(`unchanged`) while that policy auto-tiles the request. The dedicated fixed-tile P5 row always
+requires its own `Applied` receipt. Baseline and the fixed-tile control forbid all toggle terminal
+records.
 
 A baseline-only campaign remains available while optimization call sites are being integrated:
 
@@ -111,10 +117,11 @@ with baseline; P5 compares exactly with the fixed-tile control; and `all_on` com
 P9. P9 itself may differ from baseline only because its quality-admitted tiled policy is permitted
 to change output bytes. P9 and `all_on` must each emit exactly one stable `decode_policy` decision:
 `unchanged` stays byte-identical to baseline, while `geometry_tiled` may drift only when it carries
-the lower-hex SHA-256 identity of the production evidence that admitted tiling. Their decisions and
-evidence identities must match. The harness does not invent a permissive image-distance threshold;
-all outputs still must be byte-stable across repetitions and emit their required applied-toggle
-diagnostics.
+the lower-hex SHA-256 identity of the production evidence that admitted tiling. Each receipt also
+records the physical `dense`/`tiled` decoder path; `geometry_tiled` requires `tiled`, while
+`unchanged` may be either. P9 and `all_on` must match on the decision, physical path, and evidence
+identity. The harness does not invent a permissive image-distance threshold; all outputs still must
+be byte-stable across repetitions and emit their required applied-toggle diagnostics.
 
 Validate an existing result directory without rewriting it:
 
