@@ -1,10 +1,21 @@
-//! sc-17140: video-VAE decode parity against the Apache-2.0 reference implementation.
+//! sc-17140: video-VAE decode parity — against the **official diffusers**
+//! `AutoencoderKLMiniMaxH3`, i.e. the converted checkpoint production actually loads.
 //!
-//! Fixture `tests/fixtures/video_vae_decode.safetensors` ← `tools/dump_minimax_h3_video_vae.py`,
-//! which imports the reference bundle shipped INSIDE the MiniMax-H3 snapshot
-//! (`FL2VA/video_vae/{klvae,vae_vit,base_module,attention,func,flash}.py`) and runs its real
-//! `ViT3DDecoder` / `AutoencoderKLLegacy.decode_temporal` at tiny dims. This is a genuine
-//! independent-graph parity check, not a re-derivation from config.
+//! Fixture `tests/fixtures/video_vae_decode.safetensors` ← `tools/dump_minimax_h3_video_vae.py`.
+//!
+//! # Why the reference class changed (sc-18740)
+//!
+//! This fixture was originally dumped from the MiniMax reference modules shipped inside the
+//! snapshot (`FL2VA/video_vae/*.py`) with a **pure rename** onto the published key names. That made
+//! the whole file a false green: the official conversion swaps the two halves of every gated FFN
+//! projection, so the fixture carried the *source* layout under *published* names, the loader read
+//! it the source way, they agreed, and the shipped 36-layer decoder was wrong on real weights by
+//! 0.86-0.99 relative max-abs-diff per block. See [`mlx_gen_minimax_h3::layout`].
+//!
+//! The generator now runs `AutoencoderKLMiniMaxH3` and additionally proves the conversion by
+//! loading the inverse-converted weights back into the reference and asserting both decode
+//! identically. `fixture_provenance_records_the_converted_path` and
+//! `published_ffn_projection_is_value_then_gate` below make a silent revert to the old method fail.
 //!
 //! Tolerance 1e-2 peak-relative, the mlx-gen house value. Everything here is f32 and MLX runs f32
 //! matmul in reduced precision on Metal, so the observed residual is ~1e-3 — a 10x margin, and the
@@ -15,14 +26,15 @@
 
 mod common;
 
-use common::{assert_parity, fixture_config, rel, std_dev, FIXTURE};
+use common::{assert_parity, cosine, fixture_config, l2_norm, rel, std_dev, FIXTURE};
 
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::weights::Weights;
 use mlx_gen_minimax_h3::blocks::TransformerBlock;
 use mlx_gen_minimax_h3::{
-    split_fused_qkv, MiniMaxH3VaeConfig, MiniMaxH3VideoVae, Rope3d, ViT3dDecoder,
+    split_fused_qkv, GatedFfnLayout, MiniMaxH3VaeConfig, MiniMaxH3VideoVae, Rope3d, ViT3dDecoder,
+    PUBLISHED_GATED_FFN_LAYOUT,
 };
 
 const TOL: f32 = 1e-2;
@@ -275,6 +287,168 @@ fn fused_qkv_split_reproduces_the_published_split() {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// sc-18740 — the gated-FFN layout contract
+// ---------------------------------------------------------------------------------------------
+
+/// Swap the two row halves of a `[2·inner, dim]` (or `[2·inner]`) fused gated projection.
+fn swap_halves(t: &Array) -> Array {
+    let rows = t.shape()[0];
+    let parts = t.split_axis(&[rows / 2], 0).unwrap();
+    mlx_rs::ops::concatenate_axis(&[parts[1].clone(), parts[0].clone()], 0).unwrap()
+}
+
+/// **The assertion that kills the false green.** The committed fixture must be in the CONVERTED
+/// (`[value | gate]`) layout, not the source (`[gate | value]`) one.
+///
+/// The fixture carries both forms: `decoder.…ff.net.0.proj.*` as the official
+/// `AutoencoderKLMiniMaxH3` holds it, and `src.decoder.…ff.w1.*` as the MiniMax reference holds it
+/// (verified in the generator by loading the inverse conversion back into the reference and
+/// getting a bit-identical decode). This asserts the published tensor is the source tensor with its
+/// halves *swapped* — and, critically, that it is NOT the source tensor verbatim.
+///
+/// That second half is the whole point. Regenerating this fixture with a pure `"ff.w1" ->
+/// "ff.net.0.proj"` rename — which is exactly how sc-18740 shipped — makes the two forms equal and
+/// fails here, instead of quietly passing every other test in this file.
+#[test]
+fn published_ffn_projection_is_value_then_gate() {
+    let f = fixture();
+    let cfg = fixture_config(3);
+    assert_eq!(
+        PUBLISHED_GATED_FFN_LAYOUT,
+        GatedFfnLayout::ValueFirst,
+        "the crate's layout contract"
+    );
+
+    for block in 0..cfg.num_layers {
+        for suffix in ["weight", "bias"] {
+            let published = f
+                .require(&format!(
+                    "decoder.transformer_blocks.{block}.ff.net.0.proj.{suffix}"
+                ))
+                .unwrap();
+            let source = f
+                .require(&format!(
+                    "src.decoder.transformer_blocks.{block}.ff.w1.{suffix}"
+                ))
+                .unwrap();
+            assert_eq!(
+                published.shape(),
+                source.shape(),
+                "shapes are identical — that is the hazard"
+            );
+
+            assert_eq!(
+                published.as_slice::<f32>(),
+                swap_halves(source).as_slice::<f32>(),
+                "block {block} ff.net.0.proj.{suffix}: the published tensor must be the source \
+                 tensor with its halves SWAPPED"
+            );
+            assert_ne!(
+                published.as_slice::<f32>(),
+                source.as_slice::<f32>(),
+                "block {block} ff.net.0.proj.{suffix} is byte-equal to the pre-conversion \
+                 `ff.w1` — this fixture was dumped through a pure rename with no half-swap, so it \
+                 tests the port against a layout production never loads (sc-18740). Re-run \
+                 tools/dump_minimax_h3_video_vae.py against diffusers `main`."
+            );
+        }
+    }
+}
+
+/// **Mutation gate for the half-swap specifically.** Swapping the halves of every published
+/// `ff.net.0.proj` — i.e. handing the loader the source layout, which is what production was
+/// effectively doing — must break parity.
+///
+/// Gated on the **relative max-abs-diff**, and it prints the L2 norms and the cosine alongside so
+/// the reason the old gates were blind stays visible in the test output rather than only in a
+/// story comment: the norms barely move, and the cosine stays well away from zero because
+/// `silu(a)·b` and `silu(b)·a` share sign structure. A `norm`, `std` or checksum assertion of any
+/// tolerance would pass here.
+#[test]
+fn reading_the_ffn_halves_gate_first_breaks_parity() {
+    let f = fixture();
+    let cfg = fixture_config(3);
+    let latent = f.require("in.temporal7.latent").unwrap();
+    let want = f.require("out.temporal7.video").unwrap();
+
+    let baseline = vae(3).decode(latent).unwrap();
+    let (base_peak, _) = rel(&baseline, want);
+
+    let mut w = model_weights();
+    for block in 0..cfg.num_layers {
+        for suffix in ["weight", "bias"] {
+            let key = format!("decoder.transformer_blocks.{block}.ff.net.0.proj.{suffix}");
+            let swapped = swap_halves(w.require(&key).unwrap());
+            w.insert(&key, swapped);
+        }
+    }
+    let mutated = MiniMaxH3VideoVae::from_weights(&mut w, &cfg, Dtype::Float32)
+        .unwrap()
+        .decode(latent)
+        .unwrap();
+
+    let (peak, mean) = rel(&mutated, &baseline);
+    let cos = cosine(&mutated, &baseline);
+    println!(
+        "FFN half-swap: rel-max-abs={peak:.3e} rel-mean={mean:.3e} cosine={cos:.4} \
+         ||correct||={:.4} ||swapped||={:.4}  (parity residual with the correct layout: {base_peak:.3e})",
+        l2_norm(&baseline),
+        l2_norm(&mutated),
+    );
+
+    assert!(
+        peak > 1e-2,
+        "swapping the gate and value halves moved the decode by only {peak:.3e}; this suite \
+         cannot gate the sc-18740 defect"
+    );
+    // ...and the mutated decode must fail the actual parity gate, not merely differ.
+    let (vs_ref, _) = rel(&mutated, want);
+    assert!(
+        vs_ref > TOL,
+        "the source-layout decode still matches the reference within {TOL:.0e} ({vs_ref:.3e}) — \
+         the fixture is not in the converted layout"
+    );
+}
+
+/// The fixture must record which reference path produced it. A regeneration that reverts to
+/// running the MiniMax reference modules writes different provenance (or none) and fails here.
+#[test]
+fn fixture_provenance_records_the_converted_path() {
+    let f = fixture();
+    let meta = |k: &str| {
+        f.metadata(k)
+            .unwrap_or_else(|| {
+                panic!(
+                    "fixture metadata is missing `{k}`; re-run tools/dump_minimax_h3_video_vae.py \
+                     against diffusers `main` (a fixture with no provenance is one that cannot be \
+                     shown to come from the converted-checkpoint path — sc-18740)"
+                )
+            })
+            .to_string()
+    };
+    assert_eq!(meta("provenance"), "converted-checkpoint");
+    assert_eq!(meta("reference"), "diffusers.AutoencoderKLMiniMaxH3");
+    assert_eq!(meta("gated_ffn_layout"), "value_first");
+    // The generator's own conversion cross-check and half-swap negative control, carried forward
+    // so their results are auditable from the committed artifact.
+    let cross: f32 = meta("conversion_cross_check_rel").parse().unwrap();
+    assert!(
+        cross < 1e-5,
+        "the generator's inverse-conversion cross-check was {cross:.3e}"
+    );
+    let swap: f32 = meta("ffn_half_swap_rel").parse().unwrap();
+    assert!(
+        swap > 1e-2,
+        "the generator measured the half-swap as only {swap:.3e} — it would not be gateable"
+    );
+    println!(
+        "fixture provenance: {} {} (cross-check {cross:.3e}, half-swap {swap:.3e})",
+        meta("reference"),
+        meta("reference_version"),
+    );
+}
+
 /// Every model tensor must be consumed. A silently unmapped tensor is the failure mode this
 /// crate's key mapping most plausibly has, and it would still produce plausible-looking output.
 #[test]
@@ -401,10 +575,13 @@ fn every_weight_is_load_bearing() {
             MUTATION_FLOOR,
         ),
         ("decoder.transformer_blocks.0.scale2", MUTATION_FLOOR),
-        (
-            "decoder.transformer_blocks.1.attn.to_q.weight",
-            MUTATION_FLOOR,
-        ),
+        // The LAST block's query projection is the second genuine outlier, measured at ~8.7e-3 on
+        // the sc-18740 fixture draw (block 0's equivalent is 1.5e-2). That is intrinsic to being
+        // last: a perturbation there passes through one attention mixture and one `scale2`
+        // residual before `proj_out`, where block 0's also propagates through block 1. It still
+        // sits ~9x over the ~1e-3 parity residual this suite measures, and block 0's `to_q` covers
+        // the projection's wiring at the full floor.
+        ("decoder.transformer_blocks.1.attn.to_q.weight", 5e-3),
         ("decoder.transformer_blocks.1.scale1", MUTATION_FLOOR),
         ("decoder.norm_out.weight", MUTATION_FLOOR),
         ("decoder.norm_out.bias", MUTATION_FLOOR),

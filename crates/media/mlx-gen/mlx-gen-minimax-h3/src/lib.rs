@@ -36,7 +36,8 @@
 //! ## Text encoder (sc-17143)
 //!
 //! - [`text_encoder`] runs **Qwen3-VL-32B** and returns the `context` the DiT consumes: the hidden
-//!   state after 50 of its 64 layers, with the chat-template prefix dropped.
+//!   state after 50 of its 64 layers, one row per presentation token. The conditioner applies **no
+//!   chat template** and adds no special tokens, so nothing is sliced off the front (sc-18741).
 //!
 //! Two findings from that slice are load-bearing elsewhere in the epic. First, the checkpoint is
 //! **upstream `Qwen/Qwen3-VL-32B-Instruct`, byte-identical** across all 14 shards — only
@@ -44,6 +45,16 @@
 //! `lm_head` are never executed. Second, `<d>` and six sibling specials are declared *only* in that
 //! one changed file, get their ids assigned positionally at load time, and land on **untrained**
 //! embedding rows.
+//!
+//! ## Read [`layout`] before porting anything else in this family
+//!
+//! MiniMax publishes the checkpoint in the **converted diffusers layout**, and that conversion
+//! applies tensor transforms which are *shape-identical* to their inputs — a swapped gated-FFN
+//! projection and a fused-QKV reorder. No shape check, exhaustive-key-mapping proof or checksum can
+//! see them; only an explicit assertion can. [`layout`] states the contract, backs it with
+//! [`layout::split_gate_value`], and records how sc-18740 shipped a functionally wrong 36-layer
+//! decoder past a fully green parity suite. **The DiT (sc-17144) carries the same FFN swap plus a
+//! grouped-QKV reorder**, and the candle twins (sc-17154 / sc-17155) inherit both.
 //!
 //! Not in this crate yet: either CNN encoder, the DiT (sc-17144) and the pipeline
 //! (sc-17146/17147). Nothing is registered with `mlx-gen-catalog` — there is no generator to ship
@@ -56,6 +67,7 @@ pub mod blocks;
 pub mod chunking;
 pub mod config;
 pub mod decoder;
+pub mod layout;
 pub mod rope;
 pub mod tensor;
 pub mod text_encoder;
@@ -75,11 +87,14 @@ pub use config::{
     LATENTS_STD, LATENT_CHANNELS, TOKEN_DROP, VAE_RATIO, VAE_RATIO_T,
 };
 pub use decoder::ViT3dDecoder;
+pub use layout::{
+    split_gate_value, GatedFfnLayout, AUDIO_VAE_IS_UNCONVERTED, PUBLISHED_GATED_FFN_LAYOUT,
+};
 pub use rope::{create_token_ids, Rope3d, RopeTables};
 pub use text_encoder::{
     encode_grounded, encode_grounded_from_vision, minimax_h3_vision_config, run_vision,
     GroundedVision, MiniMaxH3TeConfig, MiniMaxH3TextEncoder, MiniMaxH3Tokenizer, SpecialTokens,
-    LM_PREFIX, MINIMAX_ADDED_SPECIALS, NUM_HIDDEN_LAYERS, PREFIX_TOKENS, SELECT_HIDDEN,
+    APPLIES_CHAT_TEMPLATE, LM_PREFIX, MINIMAX_ADDED_SPECIALS, NUM_HIDDEN_LAYERS, SELECT_HIDDEN,
     VISION_PREFIX,
 };
 pub use vae::{split_fused_qkv, MiniMaxH3VideoVae};

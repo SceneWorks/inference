@@ -1,5 +1,15 @@
-//! H3 condition tokenization — the chat template plus the seven special tokens MiniMax declares
-//! but never ships in a vocabulary.
+//! H3 condition tokenization — the presentation the DiT is conditioned on, plus the seven special
+//! tokens MiniMax declares but never ships in a vocabulary.
+//!
+//! # There is no chat template (sc-18741)
+//!
+//! The official conditioner builds every presentation as `tokenizer(text,
+//! add_special_tokens=False)` over text it assembles itself, with **no chat template**. See
+//! [`APPLIES_CHAT_TEMPLATE`] for the full contract and for what sc-17143 got wrong and why.
+//!
+//! `text_encoder/chat_template.json` exists in the component only because the text encoder is a
+//! byte-identical copy of `Qwen/Qwen3-VL-32B-Instruct`, where that file drives *chat*. Its presence
+//! is not evidence that MiniMax-H3 conditions through it.
 //!
 //! # `<d>` is declared in exactly one file, and its id is a function of list ORDER
 //!
@@ -59,25 +69,34 @@ pub const MINIMAX_ADDED_SPECIALS: [&str; 7] = [
 /// `added_tokens_decoder` (151668).
 pub const FIRST_ADDED_ID: i32 = 151669;
 
-/// User-turn template prefix rendered by the shipped `chat_template.json` for a bare text prompt.
+/// **The presentation contract: MiniMax-H3 applies no chat template and adds no special tokens.**
 ///
-/// Derived by running `apply_chat_template([{"role": "user", "content": prompt}],
-/// add_generation_prompt=True)` against the shipped template and splitting on the prompt — **not**
-/// asserted from the template string here. `tests/te_parity.rs` pins this against a fixture dumped
-/// from the real `chat_template.json`.
-pub const PREFIX: &str = "<|im_start|>user\n";
-
-/// Generation cue the same render appends after the prompt.
-pub const SUFFIX: &str = "<|im_end|>\n<|im_start|>assistant\n";
-
-/// Leading template tokens dropped from the conditioning. [`PREFIX`] tokenizes to exactly this many
-/// (`[151644, 872, 198]`).
+/// Every presentation the official conditioner builds — `t2va`, `fl2va` and `ref2va` alike — is
+/// `tokenizer(text, add_special_tokens=False)` over text this module assembles itself. There is no
+/// `<|im_start|>user\n` turn, no `<|im_end|>\n<|im_start|>assistant\n` generation cue, and
+/// therefore **no template prefix to slice off the context**.
 ///
-/// H3 ships no conditioner, so there is no published `prompt_template_encode_start_idx` to copy:
-/// this is *derived* from the shipped template. A system turn would lengthen it (14 tokens for a
-/// short system message), which is why [`MiniMaxH3Tokenizer::prefix_len`] exists — callers that
-/// introduce a system prompt must re-derive rather than reuse this constant.
-pub const PREFIX_TOKENS: usize = 3;
+/// This constant exists so the absence is a *pinned* property with a test attached rather than the
+/// silent consequence of some code having been deleted. See
+/// `tests/te_parity.rs::presentation_applies_no_chat_template`, which additionally checks the port
+/// against the exact ids the (wrong) chat-template render would have produced.
+///
+/// # sc-18741
+///
+/// sc-17143 could not check this: it was written before `MiniMaxH3` landed on diffusers `main`
+/// (PR #14355, merged 2026-08-05, in no tagged release), so no reference conditioner existed. It
+/// reasonably *derived* a 3-token prefix by rendering the shipped `chat_template.json` — a file
+/// which is present in the component only because the text encoder is a byte-identical copy of
+/// `Qwen/Qwen3-VL-32B-Instruct`, where it is used for chat, not for conditioning. The port then
+/// rendered `PREFIX + prompt + SUFFIX` and dropped 3 leading tokens. Measured against the real
+/// tokenizer, that slice lands exactly on the `<|im_start|>user\n` boundary for ordinary prompts, so
+/// the damage is **not** lost prompt tokens — it is the 5-token generation cue
+/// `<|im_end|>\n<|im_start|>assistant\n` (`[151645, 198, 151644, 77091, 198]`) that nothing ever
+/// removed. The DiT was conditioned on `prompt + 5 rows of chat-turn control tokens`: 16 rows
+/// instead of 11 for a 9-word prompt. A prompt that *begins* with whitespace loses a real token too,
+/// because the tokenizer merges the template's trailing newline into it. Nothing failed loudly; the
+/// conditioning was simply off-distribution.
+pub const APPLIES_CHAT_TEMPLATE: bool = false;
 
 /// Qwen `<|endoftext|>` — the pad id (unused on the natural-length path).
 const PAD_TOKEN_ID: i32 = 151643;
@@ -207,7 +226,8 @@ impl MiniMaxH3Tokenizer {
         &self.specials
     }
 
-    /// Encode a rendered string to ids (`add_special_tokens=false`, matching the reference path).
+    /// Encode a string to ids with `add_special_tokens=false` — the reference conditioner's one and
+    /// only tokenizer call.
     fn encode(&self, text: &str) -> Result<Vec<i32>> {
         let enc = self
             .inner
@@ -216,48 +236,47 @@ impl MiniMaxH3Tokenizer {
         Ok(enc.get_ids().iter().map(|&id| id as i32).collect())
     }
 
-    /// Render the user-turn template around `prompt`.
-    fn render(prompt: &str) -> String {
-        format!("{PREFIX}{prompt}{SUFFIX}")
-    }
-
-    /// Render the grounded template: one `<|vision_start|><|image_pad|>×n<|vision_end|>` block per
-    /// reference, before the prompt.
+    /// The `ref2va` / `fl2va` visual presentation: a `"<Picture i>: "` label and a vision block per
+    /// reference, then the prompt **verbatim**.
+    ///
+    /// Mirrors `MiniMaxH3FL2VATextEncoderStep` / `MiniMaxH3Ref2VATextEncoderStep`: labels are
+    /// numbered from 1 per modality, and there is no chat template anywhere in it. sc-17148 owns
+    /// the rest of that presentation (keyframe conditioning latents, the per-row modality tags that
+    /// mark vision rows as *video*, and the `<Audio j>` / `<Video k>` limbs); this covers the image
+    /// half the crate already reaches through [`crate::text_encoder::encode_grounded`].
     fn render_with_images(prompt: &str, num_image_tokens: &[usize]) -> String {
-        let mut vision = String::new();
-        for &n in num_image_tokens {
-            vision.push_str(VISION_START);
+        let mut out = String::new();
+        for (i, &n) in num_image_tokens.iter().enumerate() {
+            out.push_str(&format!("<Picture {}>: ", i + 1));
+            out.push_str(VISION_START);
             for _ in 0..n {
-                vision.push_str(IMAGE_PAD);
+                out.push_str(IMAGE_PAD);
             }
-            vision.push_str(VISION_END);
+            out.push_str(VISION_END);
         }
-        format!("{PREFIX}{vision}{prompt}{SUFFIX}")
+        out.push_str(prompt);
+        out
     }
 
-    /// Raw id vector for the templated prompt (parity testing against the reference `input_ids`).
+    /// Raw id vector for a `t2va` prompt: the prompt **verbatim**, no chat template, no special
+    /// tokens — `tokenizer(prompt, add_special_tokens=False)` exactly as the reference conditioner
+    /// spells it. See [`APPLIES_CHAT_TEMPLATE`].
     pub fn ids(&self, prompt: &str) -> Result<Vec<i32>> {
-        self.encode(&Self::render(prompt))
+        self.encode(prompt)
     }
 
-    /// Token count of the bare [`PREFIX`] — should equal [`PREFIX_TOKENS`]. Callers that introduce
-    /// a system turn must use this rather than the constant.
-    pub fn prefix_len(&self) -> Result<usize> {
-        Ok(self.encode(PREFIX)?.len())
-    }
-
-    /// Encode ids for an arbitrary pre-rendered string (used by the template fixtures).
+    /// Encode ids for an arbitrary pre-rendered string (used by the presentation fixtures).
     pub fn encode_raw(&self, text: &str) -> Result<Vec<i32>> {
         self.encode(text)
     }
 
-    /// Encode the templated prompt → `(input_ids, attention_mask)` `[1, L]` int32, mask all-ones
-    /// (no padding on the natural-length path).
+    /// Encode a `t2va` prompt → `(input_ids, attention_mask)` `[1, L]` int32, mask all-ones (no
+    /// padding on the natural-length path).
     pub fn encode_prompt(&self, prompt: &str) -> Result<(Array, Array)> {
         Self::to_arrays(self.ids(prompt)?)
     }
 
-    /// Encode the grounded template → `(input_ids, attention_mask)` `[1, L]` int32.
+    /// Encode the visual presentation → `(input_ids, attention_mask)` `[1, L]` int32.
     /// `num_image_tokens[k]` is reference `k`'s merged vision-token count.
     pub fn encode_with_images(
         &self,
@@ -387,28 +406,54 @@ mod tests {
         assert!(max < super::super::MiniMaxH3TeConfig::qwen3_vl_32b().vocab_size);
     }
 
-    /// The rendered template must be exactly prefix + prompt + suffix, with no stray whitespace.
+    /// **The sc-18741 contract.** No chat template is applied anywhere, so the presentation for a
+    /// bare prompt is the prompt itself — byte for byte, no turn markers, no generation cue.
+    ///
+    /// Written against the literal template strings sc-17143 used, so reintroducing either one
+    /// fails here rather than silently shifting the conditioning.
     #[test]
-    fn render_is_prefix_prompt_suffix() {
+    fn no_chat_template_is_applied() {
+        const { assert!(!APPLIES_CHAT_TEMPLATE) };
+        let presentation = MiniMaxH3Tokenizer::render_with_images("a cat", &[]);
         assert_eq!(
-            MiniMaxH3Tokenizer::render("a cat"),
-            "<|im_start|>user\na cat<|im_end|>\n<|im_start|>assistant\n"
+            presentation, "a cat",
+            "a reference-free presentation is the prompt"
         );
+        for residue in [
+            "<|im_start|>",
+            "<|im_end|>",
+            "<|im_start|>user\n",
+            "<|im_end|>\n<|im_start|>assistant\n",
+        ] {
+            assert!(
+                !presentation.contains(residue),
+                "chat-template residue {residue:?} is back in the presentation (sc-18741)"
+            );
+        }
     }
 
-    /// The grounded render places one vision block per reference, before the prompt, with exactly
-    /// `n` image pads each.
+    /// The visual presentation places a numbered `"<Picture i>: "` label and one vision block per
+    /// reference, then the prompt verbatim — and still no template.
     #[test]
-    fn grounded_render_places_one_vision_block_per_reference() {
+    fn grounded_render_labels_each_reference_and_appends_the_prompt_verbatim() {
         let r = MiniMaxH3Tokenizer::render_with_images("x", &[2, 1]);
         assert_eq!(
             r,
-            "<|im_start|>user\n\
-             <|vision_start|><|image_pad|><|image_pad|><|vision_end|>\
-             <|vision_start|><|image_pad|><|vision_end|>\
-             x<|im_end|>\n<|im_start|>assistant\n"
+            "<Picture 1>: <|vision_start|><|image_pad|><|image_pad|><|vision_end|>\
+             <Picture 2>: <|vision_start|><|image_pad|><|vision_end|>\
+             x"
         );
         assert_eq!(r.matches(IMAGE_PAD).count(), 3);
         assert_eq!(r.matches(VISION_START).count(), 2);
+        // Labels are numbered from 1, per modality — not 0-indexed.
+        assert!(r.starts_with("<Picture 1>: "));
+        assert!(
+            r.ends_with('x'),
+            "the prompt is appended verbatim, with no cue after it"
+        );
+        assert!(
+            !r.contains("<|im_start|>"),
+            "no chat template on the grounded path either"
+        );
     }
 }

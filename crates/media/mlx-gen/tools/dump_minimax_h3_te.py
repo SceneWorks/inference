@@ -1,7 +1,43 @@
-"""MiniMax-H3 text-encoder (Qwen3-VL-32B) context-extraction parity fixture (sc-17143).
+"""MiniMax-H3 text-encoder (Qwen3-VL-32B) context-extraction parity fixture (sc-17143, corrected by
+sc-18741).
 
-Runs the **transformers** ``Qwen3VLTextModel`` — an independent reference graph — at TINY dims and
-dumps the inputs, weights and the select-layer hidden states the Rust/MLX port must reproduce.
+Two halves, from two references, and the fixture records which produced which:
+
+* the **tensor** half runs the **transformers** ``Qwen3VLTextModel`` — an independent reference
+  graph, and exactly the stack the official conditioner reads ``hidden_states[50]`` off — at TINY
+  dims, and dumps the inputs, weights and select-layer hidden states the Rust/MLX port must
+  reproduce;
+* the **presentation** half is taken from the **official diffusers conditioner**
+  (``diffusers.modular_pipelines.minimax_h3.encoders.MiniMaxH3TextEncoderStep``) applied to the real
+  shipped tokenizer.
+
+sc-18741: THERE IS NO TEMPLATE PREFIX TO SLICE
+-----------------------------------------------
+
+The first version of this script rendered the shipped ``chat_template.json``, measured its 3-token
+prefix, and dumped ``hidden_states[SELECT][:, 3:]`` as the golden. The port matched, so parity was
+green — but the official conditioner is one line::
+
+    token_ids = components.tokenizer(prompt, add_special_tokens=False)["input_ids"]
+
+with the block's own description reading "the prompt verbatim, with no chat template and no special
+tokens". So there is no prefix to slice.
+
+Measured against the real tokenizer, the 3-token slice does land exactly on the
+``<|im_start|>user\\n`` boundary for ordinary prompts, so the damage is *not* lost prompt tokens. It
+is the 5-token generation cue ``<|im_end|>\\n<|im_start|>assistant\\n`` that nothing ever removed:
+the DiT was conditioned on ``prompt + 5 rows of chat-turn control tokens`` (16 rows instead of 11 for
+a 9-word prompt). A prompt beginning with whitespace additionally loses a real token, because the
+tokenizer merges the template's trailing newline into it.
+
+``chat_template.json`` is present in ``text_encoder/`` only because the component is a byte-identical
+copy of ``Qwen/Qwen3-VL-32B-Instruct``, where that file drives chat. Its presence was never evidence
+that H3 conditions through it — and sc-17143 could not check, because ``MiniMaxH3`` had not yet
+landed on diffusers ``main`` (PR #14355, merged 2026-08-05, in no tagged release).
+
+The golden is therefore the **untrimmed** select-layer state, and the metadata carries the reference
+presentation ids for a probe prompt **plus** the ids the old chat-template render would have
+produced, so ``tests/te_parity.rs`` can assert the port produces the first and not the second.
 
 Why tiny-but-real: the shipped encoder is 64 layers x 5120 hidden (66.7 GB), far too large to
 commit. Every *structural* knob is preserved though — bias-less GQA with distinct query/kv head
@@ -19,7 +55,7 @@ because a shifted implementation still produces a plausible-looking tensor.
 Random norm weights: Qwen3 RMSNorm initializes to ones, which hides the weight-multiply entirely.
 Every norm is re-randomized and non-degeneracy is asserted before writing.
 
-Run from a torch venv:  ~/Repos/mflux/.venv/bin/python tools/dump_minimax_h3_te.py
+Run from a venv with torch + transformers:  python3 tools/dump_minimax_h3_te.py
 """
 
 from __future__ import annotations
@@ -45,8 +81,11 @@ EPS, THETA = 1e-6, 5_000_000.0
 SELECT = 4
 # Neighbours dumped so the Rust test can prove a one-off in EITHER direction fails.
 NEIGHBOURS = (SELECT - 1, SELECT + 1)
-PREFIX = 3  # `<|im_start|>user\n` — derived from the shipped chat_template.json (see below)
 SEQ = 12
+
+# The probe the presentation facts are derived from. Deliberately >3 tokens and starting with a
+# word the old 3-token prefix slice would have eaten, so the two id vectors differ visibly.
+PROBE_PROMPT = "a red fox leaps over a mossy log at dawn"
 
 MODEL_REPO = "models--MiniMaxAI--MiniMax-H3"
 
@@ -60,46 +99,58 @@ def snapshot_dir() -> str | None:
     return str(snaps[-1]) if snaps else None
 
 
-def template_facts() -> dict:
-    """Derive the chat-template prefix and the special-token ids FROM THE SHIPPED FILES.
+def presentation_facts() -> dict:
+    """Derive the PRESENTATION and the special-token ids from the shipped files + the reference.
 
     This is the half of the fixture that pins configuration no tensor can witness:
 
-    * ``PREFIX``/``PREFIX_TOKENS`` come from rendering the shipped ``chat_template.json``, not from
-      the template string transcribed into Rust;
+    * ``presentation_ids`` is the official conditioner's own call —
+      ``tokenizer(prompt, add_special_tokens=False)`` — against the real shipped tokenizer;
+    * ``templated_ids`` is what sc-17143's chat-template render produced for the same prompt, kept
+      as an explicit NEGATIVE control so the Rust side can assert the port emits the first and never
+      the second. Pinning only the current token count would not catch a template coming back with a
+      compensating slice;
     * the seven MiniMax specials come from ``tokenizer_config.json``'s
       ``additional_special_tokens``, whose ORDER is the id assignment.
     """
     snap = snapshot_dir()
     if snap is None:
         raise SystemExit(
-            "no MiniMax-H3 snapshot in the HF cache; the template/token half of the fixture needs "
-            "tokenizer/ and text_encoder/chat_template.json"
+            "no MiniMax-H3 snapshot in the HF cache; the presentation/token half of the fixture "
+            "needs tokenizer/ and text_encoder/chat_template.json"
         )
     from transformers import AutoTokenizer
 
     tk = AutoTokenizer.from_pretrained(os.path.join(snap, "tokenizer"))
+
+    # THE reference call. `diffusers.modular_pipelines.minimax_h3.encoders.MiniMaxH3TextEncoderStep`
+    # spells it exactly this way, and `MiniMaxH3FL2VATextEncoderStep` /
+    # `MiniMaxH3Ref2VATextEncoderStep` spell it the same way for the prompt half of their
+    # presentations.
+    presentation_ids = tk(PROBE_PROMPT, add_special_tokens=False)["input_ids"]
+
+    # The negative control: sc-17143's rendering, kept so its absence is testable.
     with open(os.path.join(snap, "text_encoder", "chat_template.json")) as f:
         chat_template = json.load(f)["chat_template"]
-
-    probe = "PROMPT"
-    rendered = tk.apply_chat_template(
-        [{"role": "user", "content": probe}],
+    templated = tk.apply_chat_template(
+        [{"role": "user", "content": PROBE_PROMPT}],
         chat_template=chat_template,
         tokenize=False,
         add_generation_prompt=True,
     )
-    prefix_str, suffix_str = rendered.split(probe)
-    prefix_ids = tk(prefix_str, add_special_tokens=False).input_ids
+    templated_ids = tk(templated, add_special_tokens=False).input_ids
+    # ...and what the shipped port actually fed the DiT: that render with 3 leading ids dropped.
+    sc17143_ids = templated_ids[3:]
+    assert presentation_ids != sc17143_ids, "the probe must distinguish the two presentations"
 
     with open(os.path.join(snap, "tokenizer", "tokenizer_config.json")) as f:
         tcfg = json.load(f)
     additional = tcfg["additional_special_tokens"]
 
     return {
-        "prefix_str": prefix_str,
-        "suffix_str": suffix_str,
-        "prefix_ids": prefix_ids,
+        "presentation_ids": presentation_ids,
+        "templated_ids": templated_ids,
+        "sc17143_ids": sc17143_ids,
         "additional_special_tokens": additional,
         "special_ids": {t: tk.convert_tokens_to_ids(t) for t in additional},
         "len_tokenizer": len(tk),
@@ -108,10 +159,7 @@ def template_facts() -> dict:
 
 @torch.no_grad()
 def main():
-    facts = template_facts()
-    assert (
-        len(facts["prefix_ids"]) == PREFIX
-    ), f"shipped template prefix is {len(facts['prefix_ids'])} tokens, fixture assumes {PREFIX}"
+    facts = presentation_facts()
 
     cfg = Qwen3VLTextConfig(
         vocab_size=VOCAB,
@@ -140,12 +188,13 @@ def main():
     assert len(out.hidden_states) == LAYERS + 1, "hidden_states must be depth+1 (index 0 = embeds)"
 
     def ctx(idx: int) -> torch.Tensor:
-        # `.clone()`: the slice is a VIEW of the same storage as the untrimmed state, and
-        # `safetensors` refuses to serialize tensors that share memory.
-        return out.hidden_states[idx][:, PREFIX:].clone()
+        # UNTRIMMED — the reference conditioner returns `hidden_states[layer]` whole
+        # (`encoders.py`: `return outputs.hidden_states[text_encoder_layer]`). sc-18741.
+        return out.hidden_states[idx].clone()
 
     selected = ctx(SELECT)
     lo, hi = (ctx(i) for i in NEIGHBOURS)
+    assert selected.shape[1] == SEQ, "the context keeps one row per presentation token"
 
     # A golden whose neighbours are numerically indistinguishable cannot gate an off-by-one.
     for label, other in (("lo", lo), ("hi", hi)):
@@ -159,8 +208,6 @@ def main():
     tensors["out.context"] = selected
     tensors[f"out.context_at_{NEIGHBOURS[0]}"] = lo
     tensors[f"out.context_at_{NEIGHBOURS[1]}"] = hi
-    # The untrimmed state too, so the prefix-drop itself is separately checkable.
-    tensors["out.hidden_untrimmed"] = out.hidden_states[SELECT].clone()
     tensors = {
         k: (v if v.dtype == torch.int32 else v.to(torch.float32)).contiguous()
         for k, v in tensors.items()
@@ -168,22 +215,35 @@ def main():
 
     from safetensors.torch import save_file
 
+    import transformers
+
     meta = {
+        # Which reference produced which half — the sc-18740/18741 methodology requirement.
+        "provenance": "official-conditioner",
+        "tensor_reference": "transformers.Qwen3VLTextModel",
+        "presentation_reference": "diffusers.MiniMaxH3TextEncoderStep",
+        "reference_version": f"transformers {transformers.__version__}",
         "select_hidden": str(SELECT),
         "num_layers": str(LAYERS),
-        "prefix_tokens": str(PREFIX),
         "neighbours": ",".join(str(n) for n in NEIGHBOURS),
-        "prefix_str": facts["prefix_str"],
-        "suffix_str": facts["suffix_str"],
-        "prefix_ids": ",".join(str(i) for i in facts["prefix_ids"]),
+        # The presentation contract, and the two things it must NOT be.
+        "applies_chat_template": "false",
+        "add_special_tokens": "false",
+        "probe_prompt": PROBE_PROMPT,
+        "presentation_ids": ",".join(str(i) for i in facts["presentation_ids"]),
+        "templated_ids": ",".join(str(i) for i in facts["templated_ids"]),
+        "sc17143_ids": ",".join(str(i) for i in facts["sc17143_ids"]),
         "additional_special_tokens": ",".join(facts["additional_special_tokens"]),
         "special_ids": json.dumps(facts["special_ids"]),
         "len_tokenizer": str(facts["len_tokenizer"]),
+        "story": "sc-17143, corrected by sc-18741",
     }
     path = fixture("mlx-gen-minimax-h3/tests/fixtures/te_context.safetensors")
     save_file(tensors, path, metadata=meta)
     print(f"wrote {path}  ({len(tensors)} tensors, context {tuple(selected.shape)})")
-    print(f"  template prefix {facts['prefix_ids']} from the shipped chat_template.json")
+    print(f"  probe {PROBE_PROMPT!r}")
+    print(f"    reference presentation ({len(facts['presentation_ids'])} ids): {facts['presentation_ids']}")
+    print(f"    sc-17143's templated+sliced ({len(facts['sc17143_ids'])} ids): {facts['sc17143_ids']}")
     print(f"  <d> -> {facts['special_ids']['<d>']}")
 
 
