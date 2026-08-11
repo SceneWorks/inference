@@ -1355,6 +1355,98 @@ pub(crate) fn snapshot_file(root: &Path, sub: &str) -> Result<PathBuf> {
 mod tests {
     use super::*;
 
+    struct SdxlDecodeSpy {
+        output: Tensor,
+    }
+
+    impl LatentDecoder for SdxlDecodeSpy {
+        fn input_latent_space(&self) -> Option<&candle_gen::gen_core::LatentSpace> {
+            Some(&candle_gen::gen_core::SDXL_LATENT_SPACE)
+        }
+
+        fn decode(&self, _latents: &Tensor) -> Result<Tensor> {
+            Ok(self.output.clone())
+        }
+    }
+
+    fn tiny_sdxl_vae(device: &Device) -> AutoEncoderKL {
+        use candle_gen::candle_nn::{VarBuilder, VarMap};
+        use candle_transformers::models::stable_diffusion::vae::AutoEncoderKLConfig;
+
+        let vars = VarMap::new();
+        AutoEncoderKL::new(
+            VarBuilder::from_varmap(&vars, DType::F32, device),
+            4,
+            3,
+            AutoEncoderKLConfig::default(),
+        )
+        .unwrap()
+    }
+
+    fn legacy_sdxl_image(vae: &AutoEncoderKL, latents: &Tensor) -> Image {
+        use candle_gen::candle_core::IndexOp;
+
+        let decoded = vae.decode(&(latents / VAE_SCALE).unwrap()).unwrap();
+        let scaled = (((decoded / 2.0).unwrap() + 0.5).unwrap())
+            .clamp(0f32, 1f32)
+            .unwrap();
+        let scaled = (scaled * 255.0).unwrap();
+        let image = candle_gen::round_rgb8(&scaled)
+            .unwrap()
+            .i(0)
+            .unwrap()
+            .to_device(&Device::Cpu)
+            .unwrap();
+        let (channels, height, width) = image.dims3().unwrap();
+        assert_eq!(channels, 3);
+        Image {
+            width: width as u32,
+            height: height as u32,
+            pixels: image
+                .permute((1, 2, 0))
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<u8>()
+                .unwrap(),
+        }
+    }
+
+    /// SC-18309 N1: a real tiny SDXL AutoEncoderKL proves that moving `1 / VAE_SCALE` into the
+    /// native trait adapter leaves the no-override tensor and engine RGB bytes exact. The PiD arm
+    /// uses a distinct geometry to pin override selection and output-layout handling.
+    #[test]
+    fn decoder_seam_preserves_sdxl_default_and_pid_bytes() {
+        let device = Device::Cpu;
+        let vae = tiny_sdxl_vae(&device);
+        let values = (0..(4 * 3 * 5))
+            .map(|index| index as f32 * 0.01 - 0.3)
+            .collect::<Vec<_>>();
+        let latents = Tensor::from_vec(values, (1, 4, 3, 5), &device).unwrap();
+
+        let legacy_tensor = vae.decode(&(latents.clone() / VAE_SCALE).unwrap()).unwrap();
+        let via_seam = SdxlLatentDecoder::new(&vae).decode(&latents).unwrap();
+        assert_eq!(
+            via_seam.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            legacy_tensor
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+            "normalization ownership must not change one output bit"
+        );
+        let expected = legacy_sdxl_image(&vae, &latents);
+        let got = crate::denoise::decode_image(&vae, &latents, None, None).unwrap();
+        assert_eq!(got, expected);
+
+        let pid = SdxlDecodeSpy {
+            output: Tensor::ones((1, 3, 4, 7), DType::F32, &device).unwrap(),
+        };
+        let got = crate::denoise::decode_image(&vae, &latents, Some(&pid), None).unwrap();
+        assert_eq!((got.width, got.height), (7, 4));
+        assert!(got.pixels.iter().all(|pixel| *pixel == 255));
+    }
+
     /// sc-9416: `detect_packed_unet` returns `Some((file, group_size))` for a snapshot whose
     /// `unet/config.json` carries a `quantization` block AND the packed weight file exists, and `None`
     /// for a dense snapshot (no block) — the packed/dense fork the base txt2img load takes. GPU-free.

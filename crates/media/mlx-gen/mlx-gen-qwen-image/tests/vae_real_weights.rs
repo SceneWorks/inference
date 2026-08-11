@@ -7,6 +7,7 @@
 //!   cargo test -p mlx-gen-qwen-image --release --test vae_real_weights -- --ignored --nocapture
 
 use mlx_gen::weights::Weights;
+use mlx_gen::{CancelFlag, Error, LatentDecoder};
 use mlx_gen_qwen_image::QwenVae;
 use mlx_rs::Array;
 
@@ -47,6 +48,40 @@ fn vae_decode_matches_fork_golden() {
     // bound tolerates the few image-border pixels that diverge in f32 after upsample+conv.
     assert!(mean < 2e-3, "VAE decode mean-rel regressed: {mean:.3e}");
     assert!(peak < 1.5e-2, "VAE decode peak-rel regressed: {peak:.3e}");
+}
+
+/// SC-18309 N1 hardware gate: the native Qwen trait entry is exactly the former direct VAE call.
+/// This is bitwise because both arms execute the same MLX model, not cross-framework tolerance.
+#[test]
+#[ignore = "needs real Qwen-Image VAE weights + local golden"]
+fn native_decode_seam_is_byte_exact_and_precancelled() {
+    let g = Weights::from_file(GOLDEN).unwrap();
+    let vae = QwenVae::from_weights(&g).unwrap();
+    let latent = g.require("dec_in").unwrap();
+    let legacy = QwenVae::decode(&vae, latent).unwrap();
+    let seam = LatentDecoder::decode(&vae, latent).unwrap();
+    assert_eq!(seam.shape(), legacy.shape());
+    assert_eq!(
+        seam.reshape(&[-1]).unwrap().as_slice::<f32>(),
+        legacy.reshape(&[-1]).unwrap().as_slice::<f32>()
+    );
+
+    let malformed = Array::from_slice(&[1.0f32], &[1]);
+    let cancel = CancelFlag::new();
+    cancel.cancel();
+    for cfg in [
+        mlx_gen::tiling::TilingConfig::spatial_only(8, 2),
+        mlx_gen::tiling::TilingConfig::spatial_only(4096, 64),
+    ] {
+        assert!(matches!(
+            QwenVae::decode_tiled(&vae, &malformed, &cfg, Some(&cancel)),
+            Err(Error::Canceled)
+        ));
+        assert!(matches!(
+            LatentDecoder::decode_tiled(&vae, &malformed, &cfg, Some(&cancel)),
+            Err(Error::Canceled)
+        ));
+    }
 }
 
 #[test]

@@ -14,7 +14,8 @@
 //! conv2d-per-temporal-slice decomposition of the same convolution (bounded, like the 2.1 gate).
 
 use mlx_gen::weights::Weights;
-use mlx_gen_wan::Wan22Vae;
+use mlx_gen::{CancelFlag, Error, LatentDecoder};
+use mlx_gen_wan::{Wan22Vae, Wan22VideoDecoder};
 use mlx_rs::Dtype;
 
 fn fixture() -> Weights {
@@ -75,6 +76,60 @@ fn vae22_decode_matches_reference() {
         mean_rel < 1e-3,
         "decode diverged: mean_rel={mean_rel:.3e} max|Δ|={max_abs:.3e}"
     );
+}
+
+/// SC-18309 N1: the z48 adapter must preserve the historical de-normalize/decode exactly and only
+/// relayout the vendored channels-last `[B,T,H,W,3]` result to the generic NCTHW contract.
+#[test]
+fn vae22_video_adapter_is_byte_exact_to_legacy_route() {
+    let w = fixture();
+    let vae = vae(&w);
+    let latent = w.require("dec_in").unwrap();
+    let legacy = vae
+        .decode(latent)
+        .unwrap()
+        .transpose_axes(&[0, 4, 1, 2, 3])
+        .unwrap();
+    let seam = Wan22VideoDecoder::new(&vae).decode(latent).unwrap();
+    assert_eq!(seam.shape(), legacy.shape());
+    assert_eq!(
+        seam.reshape(&[-1]).unwrap().as_slice::<f32>(),
+        legacy.reshape(&[-1]).unwrap().as_slice::<f32>()
+    );
+}
+
+/// Both firing and non-firing tile policies reject a pre-tripped cancel before the adapter validates
+/// rank/temporal geometry and before the VAE transposes, de-normalizes, or decodes.
+#[test]
+fn vae22_tiled_entries_cancel_before_validation_and_decode() {
+    let w = fixture();
+    let vae = vae(&w);
+    let malformed = mlx_rs::Array::from_slice(&[1.0f32], &[1]);
+    let cancel = CancelFlag::new();
+    cancel.cancel();
+    let firing = mlx_gen::tiling::TilingConfig {
+        spatial: Some(mlx_gen::tiling::SpatialTiling {
+            tile_px: 32,
+            overlap_px: 16,
+        }),
+        temporal: Some(mlx_gen::tiling::TemporalTiling {
+            tile_frames: 17,
+            overlap_frames: 5,
+        }),
+    };
+    for cfg in [
+        firing,
+        mlx_gen::tiling::TilingConfig::spatial_only(4096, 64),
+    ] {
+        assert!(matches!(
+            Wan22VideoDecoder::new(&vae).decode_tiled(&malformed, &cfg, Some(&cancel)),
+            Err(Error::Canceled)
+        ));
+        assert!(matches!(
+            vae.decode_tiled(&malformed, &cfg, Some(&cancel)),
+            Err(Error::Canceled)
+        ));
+    }
 }
 
 #[test]

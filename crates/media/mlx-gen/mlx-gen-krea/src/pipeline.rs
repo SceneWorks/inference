@@ -1451,18 +1451,34 @@ impl KreaHeavy {
         decode_tiling: Option<&TilingConfig>,
         cancel: &CancelFlag,
     ) -> Result<Image> {
-        let decoder: &dyn LatentDecoder = decoder.unwrap_or(&self.vae);
-        mlx_gen::ensure_decoder_compatible(
-            Some(&mlx_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE),
-            decoder,
-        )?;
-        let decoded = match decode_tiling {
-            Some(cfg) => decoder.decode_tiled(lat, cfg, Some(cancel))?,
-            None => decoder.decode(lat)?,
-        }
-        .as_dtype(Dtype::Float32)?;
-        decoded_to_image(&decoded)
+        decode_latents_via_seam(&self.vae, decoder, lat, decode_tiling, cancel)
     }
+}
+
+/// Engine-level decode route shared by Krea's resident, sequential, control, img2img, and edit
+/// entry points. Kept independent of `KreaHeavy` so its dispatch and byte-preserving post-process can
+/// be regression-tested without constructing the multi-gigabyte model aggregate.
+fn decode_latents_via_seam(
+    native: &dyn LatentDecoder,
+    decoder: Option<&dyn LatentDecoder>,
+    lat: &Array,
+    decode_tiling: Option<&TilingConfig>,
+    cancel: &CancelFlag,
+) -> Result<Image> {
+    if cancel.is_cancelled() {
+        return Err(Error::Canceled);
+    }
+    let decoder = decoder.unwrap_or(native);
+    mlx_gen::ensure_decoder_compatible(
+        Some(&mlx_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE),
+        decoder,
+    )?;
+    let decoded = match decode_tiling {
+        Some(cfg) => decoder.decode_tiled(lat, cfg, Some(cancel))?,
+        None => decoder.decode(lat)?,
+    }
+    .as_dtype(Dtype::Float32)?;
+    decoded_to_image(&decoded)
 }
 
 /// The assembled Krea 2 Turbo pipeline: the [`KreaText`] encode phase + the [`KreaHeavy`] render phase.
@@ -1903,9 +1919,79 @@ fn init_noise(height: u32, width: u32, seed: u64) -> Result<Array> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::sync::{Arc, Mutex};
 
     use super::*;
+
+    struct DecodeSpy {
+        output: Array,
+        calls: Cell<usize>,
+    }
+
+    impl DecodeSpy {
+        fn new(output: Array) -> Self {
+            Self {
+                output,
+                calls: Cell::new(0),
+            }
+        }
+    }
+
+    impl LatentDecoder for DecodeSpy {
+        fn input_latent_space(&self) -> Option<&mlx_gen::gen_core::LatentSpace> {
+            Some(&mlx_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE)
+        }
+
+        fn decode(&self, _latents: &Array) -> Result<Array> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(self.output.clone())
+        }
+    }
+
+    fn legacy_decode_latents(decoder: &dyn LatentDecoder, latents: &Array) -> Image {
+        let decoded = decoder
+            .decode(latents)
+            .unwrap()
+            .as_dtype(Dtype::Float32)
+            .unwrap();
+        decoded_to_image(&decoded).unwrap()
+    }
+
+    /// SC-18309 N1: compare Krea's exact historical no-override decode expression with the engine
+    /// helper now used by every resident/sequential/base/control/edit route. Distinct channel/frame
+    /// values make the NCTHW singleton drop and RGB interleave observable. The PiD arm proves an
+    /// override still wins and ignores native tile geometry through the trait forwarding default.
+    #[test]
+    fn decode_engine_keeps_native_and_pid_dispatch_byte_exact() {
+        let latents = Array::from_slice(&[0.0f32; 16 * 2 * 3], &[1, 16, 2, 3]);
+        let native_output = Array::from_slice(
+            &[
+                -1.0f32, -0.5, 0.0, 0.5, 1.0, 0.25, 1.0, 0.5, 0.0, -0.5, -1.0, -0.25, -0.75, -0.25,
+                0.25, 0.75, -1.0, 1.0,
+            ],
+            &[1, 3, 1, 2, 3],
+        );
+        let legacy = DecodeSpy::new(native_output.clone());
+        let expected = legacy_decode_latents(&legacy, &latents);
+        let native = DecodeSpy::new(native_output);
+        let cancel = CancelFlag::new();
+        let got = decode_latents_via_seam(&native, None, &latents, None, &cancel).unwrap();
+        assert_eq!(got, expected);
+        assert_eq!(native.calls.get(), 1);
+
+        let native = DecodeSpy::new(Array::zeros::<f32>(&[1, 3, 1, 2, 3]).unwrap());
+        let pid_output = Array::from_slice(&vec![1.0f32; 3 * 4 * 5], &[1, 3, 4, 5]);
+        let legacy_pid = DecodeSpy::new(pid_output.clone());
+        let expected_pid = legacy_decode_latents(&legacy_pid, &latents);
+        let pid = DecodeSpy::new(pid_output);
+        let cfg = TilingConfig::spatial_only(16, 4);
+        let got =
+            decode_latents_via_seam(&native, Some(&pid), &latents, Some(&cfg), &cancel).unwrap();
+        assert_eq!(got, expected_pid);
+        assert_eq!(native.calls.get(), 0);
+        assert_eq!(pid.calls.get(), 1);
+    }
 
     fn zero_velocity(x: &Array, _sigma: f32) -> Result<Array> {
         Ok(Array::zeros::<f32>(x.shape())?)

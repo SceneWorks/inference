@@ -546,6 +546,9 @@ impl LatentDecoder for WanVideoDecoder<'_> {
         tiling: &TilingConfig,
         cancel: Option<&CancelFlag>,
     ) -> Result<Array> {
+        if cancel.is_some_and(CancelFlag::is_cancelled) {
+            return Err(Error::Canceled);
+        }
         if latents.shape().len() != 5 {
             return Err(Error::Msg(format!(
                 "Wan z16 video decoder expects [B,C,T,H,W], got {:?}",
@@ -606,6 +609,9 @@ impl LatentDecoder for WanSingleFrameDecoder<'_> {
         tiling: &TilingConfig,
         cancel: Option<&CancelFlag>,
     ) -> Result<Array> {
+        if cancel.is_some_and(CancelFlag::is_cancelled) {
+            return Err(Error::Canceled);
+        }
         let latents = Self::input_5d(latents)?;
         validate_decoder_tiling(tiling, VaeTiling::WAN, 1)?;
         Self::first_frame(&self.vae.decode_tiled(&latents, tiling, cancel)?)
@@ -664,6 +670,9 @@ impl WanVae {
         cfg: &TilingConfig,
         cancel: Option<&CancelFlag>,
     ) -> Result<Array> {
+        if cancel.is_some_and(CancelFlag::is_cancelled) {
+            return Err(Error::Canceled);
+        }
         let sh = z.shape();
         let (f, h, w) = (sh[2], sh[3], sh[4]);
         if !cfg.needs_tiling(VaeTiling::WAN, f, h, w) {

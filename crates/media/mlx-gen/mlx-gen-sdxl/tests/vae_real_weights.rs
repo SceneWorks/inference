@@ -7,7 +7,8 @@
 mod common;
 
 use mlx_gen::weights::Weights;
-use mlx_gen_sdxl::load_vae;
+use mlx_gen::{CancelFlag, Error, LatentDecoder};
+use mlx_gen_sdxl::{decode_image, decoded_to_image, load_vae, SdxlLatentDecoder};
 use mlx_rs::Array;
 
 const GOLDEN: &str = concat!(
@@ -43,6 +44,49 @@ fn vae_decode_matches_vendored() {
     println!("vae decode {:?}: peak_rel={pr:.3e}", decoded.shape());
     assert!(pr < 5e-3, "VAE decode diverged: peak_rel {pr:.3e}");
     println!("✓ SDXL VAE decode matches the vendored reference (f32)");
+}
+
+/// SC-18309 N1 hardware gate: execute the exact pre-seam native expression and the full engine
+/// no-override route over the same real normalized latent. Equality is bitwise, not tolerance-based:
+/// the seam may only transpose around the native VAE and must not alter normalization or readback.
+#[test]
+#[ignore = "needs the real SDXL snapshot + VAE golden"]
+fn native_decode_seam_is_byte_exact_to_pre_seam_engine() {
+    let g = Weights::from_file(GOLDEN).unwrap();
+    let vae = load_vae(&snapshot()).unwrap();
+    let latents_nhwc = g.require("latents").unwrap();
+
+    let legacy_tensor = vae.decode(latents_nhwc).unwrap();
+    let latents_nchw = latents_nhwc.transpose_axes(&[0, 3, 1, 2]).unwrap();
+    let seam_nchw = SdxlLatentDecoder::new(&vae).decode(&latents_nchw).unwrap();
+    let seam_nhwc = seam_nchw.transpose_axes(&[0, 2, 3, 1]).unwrap();
+    assert_eq!(seam_nhwc.shape(), legacy_tensor.shape());
+    assert_eq!(
+        seam_nhwc.reshape(&[-1]).unwrap().as_slice::<f32>(),
+        legacy_tensor.reshape(&[-1]).unwrap().as_slice::<f32>(),
+        "native seam changed real-VAE output bytes"
+    );
+
+    let legacy_image = decoded_to_image(&legacy_tensor).unwrap();
+    let engine_image = decode_image(&vae, latents_nhwc, None).unwrap();
+    assert_eq!(engine_image, legacy_image, "engine RGB bytes changed");
+
+    let malformed = Array::from_slice(&[1.0f32], &[1]);
+    let cancel = CancelFlag::new();
+    cancel.cancel();
+    for cfg in [
+        mlx_gen::tiling::TilingConfig::spatial_only(8, 2),
+        mlx_gen::tiling::TilingConfig::spatial_only(4096, 64),
+    ] {
+        assert!(matches!(
+            vae.decode_tiled(&malformed, &cfg, Some(&cancel)),
+            Err(Error::Canceled)
+        ));
+        assert!(matches!(
+            SdxlLatentDecoder::new(&vae).decode_tiled(&malformed, &cfg, Some(&cancel)),
+            Err(Error::Canceled)
+        ));
+    }
 }
 
 #[test]
