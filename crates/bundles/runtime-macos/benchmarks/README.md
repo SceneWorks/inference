@@ -63,7 +63,12 @@ seal before any child starts. Children load only from the sealed private path, v
 path identities before loading and immediately before publishing each run record, and bind that
 snapshot equivalence into the record. The parent keeps each snapshot alive across all rows that use
 it, then verifies and removes every snapshot before it can publish `summary.json`. Changed, mixed,
-stale, wrong-build, wrong-host, unsealable, or uncleanable state is refused.
+stale, wrong-build, wrong-host, unsealable, or uncleanable state is refused. Each private tree also
+has a durable harness-owned lease and an inode-bound cleanup receipt published before sealing. At
+the next `run`, the harness leaves live leases untouched and scavenges only unlocked stale trees
+whose ownership and cleanup identities validate; malformed, foreign, symlinked, or multiply-linked
+state is left untouched and fails closed. This recovers trees left by signals, aborts, OOM kills, or
+other parent termination without clearing flags through an unrelated path.
 
 The default required-all campaign fails at preflight until every benchmark provider explicitly
 declares every requested capability. Declaration is only availability, never proof that a path ran.
@@ -138,3 +143,5 @@ cargo run --release --locked -p runtime-macos --no-default-features --features p
 ```
 
 Legacy v1 directories have no frozen campaign and are rejected as unbound evidence.
+Run records without the real stored `summary.json` are also rejected: that file is the parent's
+finalization marker and is published only after every private snapshot was reverified and removed.

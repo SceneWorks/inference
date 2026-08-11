@@ -5,7 +5,7 @@ compile_error!("mlx-perf-bench is supported only on macOS with an MLX Metal devi
 mod pinned_artifact;
 
 use mlx_rs::memory::{clear_cache, get_cache_memory, get_peak_memory, reset_peak_memory};
-use pinned_artifact::{OwnedPinnedArtifact, VerifiedPinnedArtifact};
+use pinned_artifact::{scavenge_stale_snapshots, OwnedPinnedArtifact, VerifiedPinnedArtifact};
 use runtime_macos::gen_core::{
     GenerationOutput, GenerationRequest, LoadSpec, Progress, Quant, WeightsSource,
 };
@@ -212,6 +212,10 @@ fn selected_variants(
 fn run_matrix(args: &[String]) -> Result<(), String> {
     let options = parse_options(args)?;
     verify_executable_provenance(None)?;
+    let recovered = scavenge_stale_snapshots()?;
+    if recovered != 0 {
+        eprintln!("recovered {recovered} stale private artifact snapshot(s)");
+    }
     let (matrix, manifest) = load_inputs(&options)?;
     let selected = selected_variants(&matrix, options.variants.as_deref())?;
     let output_dir = prepare_new_output_dir(
@@ -342,18 +346,35 @@ fn validate_results(args: &[String]) -> Result<(), String> {
         .validate()
         .map_err(|error| format!("invalid frozen campaign: {error}"))?;
     verify_executable_provenance(Some(&campaign.build))?;
+    let stored_summary = require_parent_finalization_marker(&results_dir)?;
     let records = load_campaign_records(&results_dir, &campaign, true)?;
     let summary = build_summary(&campaign, &records)
         .map_err(|error| format!("invalid comparison set: {error}"))?;
-    let stored_summary = results_dir.join(SUMMARY_FILE);
-    if stored_summary.is_file() {
-        let stored: BenchmarkSummary = load_json(&stored_summary, "stored summary")?;
-        if stored != summary {
-            return Err("stored summary does not match the validated campaign records".to_owned());
-        }
+    let stored: BenchmarkSummary = load_json(&stored_summary, "stored summary")?;
+    if stored != summary {
+        return Err("stored summary does not match the validated campaign records".to_owned());
     }
     print_summary(&summary);
     Ok(())
+}
+
+fn require_parent_finalization_marker(results_dir: &Path) -> Result<PathBuf, String> {
+    let path = results_dir.join(SUMMARY_FILE);
+    let metadata = fs::symlink_metadata(&path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            format!(
+                "incomplete/unfinalized results: missing {SUMMARY_FILE}; the parent did not publish proof that snapshot verification and cleanup completed"
+            )
+        } else {
+            format!("inspect parent finalization marker {}: {error}", path.display())
+        }
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "incomplete/unfinalized results: {SUMMARY_FILE} must be a real regular file published by the parent"
+        ));
+    }
+    Ok(path)
 }
 
 fn load_campaign_records(
@@ -1640,6 +1661,26 @@ mod tests {
         let mut snapshots = vec![(artifact.key, snapshot)];
         finish_owned_snapshots(&mut snapshots).unwrap();
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn result_validation_requires_a_real_parent_finalization_marker() {
+        let results = tempfile::tempdir().unwrap();
+        let missing = require_parent_finalization_marker(results.path()).unwrap_err();
+        assert!(
+            missing.contains("incomplete/unfinalized results"),
+            "{missing}"
+        );
+        assert!(
+            missing.contains("snapshot verification and cleanup"),
+            "{missing}"
+        );
+
+        let external = results.path().join("external-summary.json");
+        fs::write(&external, b"{}").unwrap();
+        std::os::unix::fs::symlink(&external, results.path().join(SUMMARY_FILE)).unwrap();
+        let linked = require_parent_finalization_marker(results.path()).unwrap_err();
+        assert!(linked.contains("real regular file"), "{linked}");
     }
 
     #[test]
