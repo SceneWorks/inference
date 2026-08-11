@@ -17,7 +17,8 @@ use std::path::{Path, PathBuf};
 pub const MATRIX_SCHEMA_VERSION: &str = "sceneworks.mlx-perf-matrix.v3";
 pub const ARTIFACT_SCHEMA_VERSION: &str = "sceneworks.mlx-perf-artifacts.v2";
 pub const CAMPAIGN_SCHEMA_VERSION: &str = "sceneworks.mlx-perf-campaign.v2";
-pub const RUN_SCHEMA_VERSION: &str = "sceneworks.mlx-perf-run.v3";
+pub const RUN_SCHEMA_VERSION: &str = "sceneworks.mlx-perf-run.v4";
+pub const ARTIFACT_SNAPSHOT_FORMAT: &str = "sceneworks.private-artifact-snapshot.v1";
 pub const SUMMARY_SCHEMA_VERSION: &str = "sceneworks.mlx-perf-summary.v3";
 pub const INVENTORY_ALGORITHM: &str = "sha256-tree-content-v1";
 /// P5's decode-allocation transients are measured in tens of milliseconds. Sample substantially
@@ -689,6 +690,13 @@ pub struct ArtifactReceipt {
     pub tier: ModelTier,
     pub input_path: PathBuf,
     pub canonical_path: PathBuf,
+    pub inventory: ArtifactInventoryReceipt,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ArtifactSnapshotReceipt {
+    pub format: String,
     pub inventory: ArtifactInventoryReceipt,
 }
 
@@ -1480,6 +1488,7 @@ pub struct RunRecord {
     pub family: BenchmarkFamily,
     pub provider: String,
     pub artifact: ArtifactReceipt,
+    pub artifact_snapshot: ArtifactSnapshotReceipt,
     pub variant: VariantPlan,
     pub request: RequestReceipt,
     pub build: BuildProvenance,
@@ -1801,6 +1810,14 @@ impl RunRecord {
             || self.artifact != *expected_artifact
         {
             errors.push("run family/provider/artifact identity does not match the case".to_owned());
+        }
+        if self.artifact_snapshot.format != ARTIFACT_SNAPSHOT_FORMAT
+            || self.artifact_snapshot.inventory != expected_artifact.inventory
+        {
+            errors.push(
+                "run artifact snapshot receipt does not match the exact frozen artifact content"
+                    .to_owned(),
+            );
         }
         if campaign.matrix.variant(&self.variant.id) != Some(&self.variant)
             || !campaign.selected_variants.contains(&self.variant.id)
@@ -2512,6 +2529,10 @@ mod tests {
             family: case.family,
             provider: case.provider.clone(),
             artifact: artifact.clone(),
+            artifact_snapshot: ArtifactSnapshotReceipt {
+                format: ARTIFACT_SNAPSHOT_FORMAT.to_owned(),
+                inventory: artifact.inventory.clone(),
+            },
             variant,
             request: request_receipt(campaign, case, &artifact).unwrap(),
             build: campaign.build.clone(),
@@ -2764,6 +2785,14 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("identity"));
+
+        let mut wrong_snapshot = valid_run(&campaign, "qwen-q4-512", "baseline");
+        wrong_snapshot.artifact_snapshot.inventory.sha256 = "f".repeat(64);
+        assert!(wrong_snapshot
+            .validate_against(&campaign)
+            .unwrap_err()
+            .to_string()
+            .contains("snapshot receipt"));
     }
 
     #[test]

@@ -51,12 +51,19 @@ cargo run --release --locked -p runtime-macos --no-default-features --features p
   --output-dir /absolute/path/empty-results-directory
 ```
 
-Before starting any child, the parent writes `campaign.json`. It contains canonical copies and
-hashes of the full matrix and artifact manifest, exact artifact inventories, selected variants,
-build and host identities, and provider-owned toggle capability declarations. Its campaign ID binds
-all of that state. Children receive only this frozen envelope plus their case/variant identity; they
-rehash the selected artifact before loading and reject changed, mixed, stale, wrong-build, or
-wrong-host state.
+Before starting any child, the parent creates one private snapshot of each exact artifact and then
+writes `campaign.json`. It contains canonical copies and hashes of the full matrix and artifact
+manifest, exact artifact inventories, selected variants, build and host identities, and
+provider-owned toggle capability declarations. Its campaign ID binds all of that state. Snapshot
+files are cloned copy-on-write from already-open file descriptors when the local filesystem supports
+it, with a safe full-copy fallback from those same descriptors. File symlinks are materialized as
+independent regular files; directory symlinks and special entries are refused. Every completed tree
+must match its frozen inventory, use independent file identities, and accept macOS's user-immutable
+seal before any child starts. Children load only from the sealed private path, verify its content and
+path identities before loading and immediately before publishing each run record, and bind that
+snapshot equivalence into the record. The parent keeps each snapshot alive across all rows that use
+it, then verifies and removes every snapshot before it can publish `summary.json`. Changed, mixed,
+stale, wrong-build, wrong-host, unsealable, or uncleanable state is refused.
 
 The default required-all campaign fails at preflight until every benchmark provider explicitly
 declares every requested capability. Declaration is only availability, never proof that a path ran.

@@ -1,7 +1,11 @@
 #[cfg(not(target_os = "macos"))]
 compile_error!("mlx-perf-bench is supported only on macOS with an MLX Metal device");
 
+#[path = "mlx_perf_bench/pinned_artifact.rs"]
+mod pinned_artifact;
+
 use mlx_rs::memory::{clear_cache, get_cache_memory, get_peak_memory, reset_peak_memory};
+use pinned_artifact::{OwnedPinnedArtifact, VerifiedPinnedArtifact};
 use runtime_macos::gen_core::{
     GenerationOutput, GenerationRequest, LoadSpec, Progress, Quant, WeightsSource,
 };
@@ -12,13 +16,12 @@ use runtime_macos::media::diagnostics::{
 };
 use runtime_macos::media::memory_probe::{AllocatorProbe, AllocatorProbeReport};
 use runtime_macos::perf_bench::{
-    build_summary, inventory_artifact, request_receipt, validate_toggle_diagnostics,
-    ArtifactManifest, ArtifactReceipt, BenchmarkFamily, BenchmarkMatrix, BenchmarkSummary,
-    BindingPhase, BuildProvenance, DecodeControlMode, DiagnosticRecord, FrozenCampaign,
-    HostIdentity, MeasurementRecord, MemoryCoverageReceipt, ModelTier, OptimizationToggle,
-    OutputFingerprint, PhaseBoundary, PhaseBoundaryReceipt, PhaseMetrics, PhaseSet,
-    ProgressReceipt, ProviderCapabilityReceipt, RunRecord, StepReceipt, VariantPlan, WorkloadCase,
-    MEMORY_SAMPLE_INTERVAL_MICROS, RUN_SCHEMA_VERSION,
+    build_summary, request_receipt, validate_toggle_diagnostics, ArtifactManifest, BenchmarkFamily,
+    BenchmarkMatrix, BenchmarkSummary, BindingPhase, BuildProvenance, DecodeControlMode,
+    DiagnosticRecord, FrozenCampaign, HostIdentity, MeasurementRecord, MemoryCoverageReceipt,
+    ModelTier, OptimizationToggle, OutputFingerprint, PhaseBoundary, PhaseBoundaryReceipt,
+    PhaseMetrics, PhaseSet, ProgressReceipt, ProviderCapabilityReceipt, RunRecord, StepReceipt,
+    VariantPlan, WorkloadCase, MEMORY_SAMPLE_INTERVAL_MICROS, RUN_SCHEMA_VERSION,
 };
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
@@ -78,6 +81,7 @@ struct Options {
     case_id: Option<String>,
     variant_id: Option<String>,
     output_file: Option<PathBuf>,
+    artifact_snapshot: Option<PathBuf>,
 }
 
 fn parse_options(args: &[String]) -> Result<Options, String> {
@@ -99,6 +103,7 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
             "--case" => options.case_id = Some(value.clone()),
             "--variant" => options.variant_id = Some(value.clone()),
             "--output-file" => options.output_file = Some(PathBuf::from(value)),
+            "--artifact-snapshot" => options.artifact_snapshot = Some(PathBuf::from(value)),
             "--variants" => {
                 options.variants = Some(
                     value
@@ -226,37 +231,62 @@ fn run_matrix(args: &[String]) -> Result<(), String> {
         unix_millis()?,
     )
     .map_err(|error| format!("refuse unavailable or unfrozen campaign: {error}"))?;
-    let campaign_file = output_dir.join(CAMPAIGN_FILE);
-    write_json_atomic(&campaign_file, &campaign)?;
-
     let executable =
         env::current_exe().map_err(|error| format!("resolve current binary: {error}"))?;
-    for case in &campaign.matrix.cases {
-        for variant_id in &campaign.selected_variants {
-            let output_file = output_dir.join(run_file_name(&case.id, variant_id));
-            println!("run {} / {}", case.id, variant_id);
-            let status = Command::new(&executable)
-                .arg("child")
-                .arg("--campaign")
-                .arg(&campaign_file)
-                .arg("--case")
-                .arg(&case.id)
-                .arg("--variant")
-                .arg(variant_id)
-                .arg("--output-file")
-                .arg(&output_file)
-                .stdin(Stdio::null())
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit())
-                .status()
-                .map_err(|error| format!("start child benchmark: {error}"))?;
-            if !status.success() {
-                return Err(format!(
-                    "child failed for {} / {}; no summary was published",
-                    case.id, variant_id
-                ));
+    let mut snapshots = Vec::new();
+    for artifact in &campaign.artifacts {
+        match OwnedPinnedArtifact::create(artifact) {
+            Ok(snapshot) => snapshots.push((artifact.key.clone(), snapshot)),
+            Err(error) => {
+                let cleanup = finish_owned_snapshots(&mut snapshots);
+                return Err(combine_primary_and_cleanup(error, cleanup));
             }
         }
+    }
+    let campaign_file = output_dir.join(CAMPAIGN_FILE);
+    let execution = (|| {
+        write_json_atomic(&campaign_file, &campaign)?;
+        for case in &campaign.matrix.cases {
+            let snapshot = snapshots
+                .iter()
+                .find(|(key, _)| key == &case.artifact_key)
+                .map(|(_, snapshot)| snapshot)
+                .expect("every validated case has a parent-owned artifact snapshot");
+            for variant_id in &campaign.selected_variants {
+                let output_file = output_dir.join(run_file_name(&case.id, variant_id));
+                println!("run {} / {}", case.id, variant_id);
+                let status = Command::new(&executable)
+                    .arg("child")
+                    .arg("--campaign")
+                    .arg(&campaign_file)
+                    .arg("--case")
+                    .arg(&case.id)
+                    .arg("--variant")
+                    .arg(variant_id)
+                    .arg("--output-file")
+                    .arg(&output_file)
+                    .arg("--artifact-snapshot")
+                    .arg(snapshot.path())
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit())
+                    .status()
+                    .map_err(|error| format!("start child benchmark: {error}"))?;
+                if !status.success() {
+                    return Err(format!(
+                        "child failed for {} / {}; no summary was published",
+                        case.id, variant_id
+                    ));
+                }
+            }
+        }
+        Ok(())
+    })();
+    let cleanup = finish_owned_snapshots(&mut snapshots);
+    match (execution, cleanup) {
+        (Err(error), cleanup) => return Err(combine_primary_and_cleanup(error, cleanup)),
+        (Ok(()), Err(error)) => return Err(error),
+        (Ok(()), Ok(())) => {}
     }
 
     let records = load_campaign_records(&output_dir, &campaign, false)?;
@@ -265,6 +295,30 @@ fn run_matrix(args: &[String]) -> Result<(), String> {
     write_json_atomic(&output_dir.join(SUMMARY_FILE), &summary)?;
     print_summary(&summary);
     Ok(())
+}
+
+fn finish_owned_snapshots(snapshots: &mut [(String, OwnedPinnedArtifact)]) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for (key, snapshot) in snapshots {
+        if let Err(error) = snapshot.verify_integrity() {
+            errors.push(format!("verify private snapshot {key:?}: {error}"));
+        }
+        if let Err(error) = snapshot.cleanup() {
+            errors.push(format!("clean private snapshot {key:?}: {error}"));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+fn combine_primary_and_cleanup(primary: String, cleanup: Result<(), String>) -> String {
+    match cleanup {
+        Ok(()) => primary,
+        Err(cleanup) => format!("{primary}; additionally failed to finalize snapshots: {cleanup}"),
+    }
 }
 
 fn validate_results(args: &[String]) -> Result<(), String> {
@@ -404,7 +458,6 @@ fn run_child(args: &[String]) -> Result<(), String> {
     let artifact = campaign
         .artifact(&case.artifact_key)
         .expect("validated campaign covers every case artifact");
-    verify_artifact_content(artifact)?;
     let available_toggles = campaign
         .capabilities(&case.provider)
         .ok_or_else(|| "campaign omitted provider capability receipt".to_owned())?;
@@ -418,6 +471,11 @@ fn run_child(args: &[String]) -> Result<(), String> {
             case.provider, variant.id
         ));
     }
+    let snapshot_path = options
+        .artifact_snapshot
+        .as_deref()
+        .ok_or_else(|| "child requires --artifact-snapshot".to_owned())?;
+    let pinned_artifact = VerifiedPinnedArtifact::admit(artifact, snapshot_path)?;
 
     let started_at_unix_millis = unix_millis()?;
     clear_cache();
@@ -427,10 +485,7 @@ fn run_child(args: &[String]) -> Result<(), String> {
         runtime_macos::catalog().map_err(|error| format!("build macOS catalog: {error}"))?;
     let generator = catalog
         .media()
-        .load(
-            &case.provider,
-            &load_spec(case.tier, &artifact.canonical_path),
-        )
+        .load(&case.provider, &load_spec(case.tier, &pinned_artifact))
         .map_err(|error| format!("load {}: {error}", case.provider))?;
     let load_seconds = load_start.elapsed().as_secs_f64();
     let load_active_peak_bytes = get_peak_memory() as u64;
@@ -463,6 +518,7 @@ fn run_child(args: &[String]) -> Result<(), String> {
         family: case.family,
         provider: case.provider.clone(),
         artifact: artifact.clone(),
+        artifact_snapshot: pinned_artifact.receipt().clone(),
         variant: variant.clone(),
         request: request_receipt(&campaign, case, artifact).map_err(|error| error.to_string())?,
         build: campaign.build.clone(),
@@ -478,41 +534,24 @@ fn run_child(args: &[String]) -> Result<(), String> {
     record
         .validate_against(&campaign)
         .map_err(|error| format!("refuse false-green run record: {error}"))?;
-    write_artifact_bound_json_atomic(&output_file, artifact, &record)?;
+    drop(generator);
+    write_pinned_json_atomic(&output_file, &pinned_artifact, &record)?;
     println!("wrote {}", output_file.display());
     Ok(())
 }
 
-fn verify_artifact_content(artifact: &ArtifactReceipt) -> Result<(), String> {
-    if !artifact.canonical_path.is_dir() {
-        return Err(format!(
-            "frozen artifact path is unavailable: {}",
-            artifact.canonical_path.display()
-        ));
-    }
-    let actual = inventory_artifact(&artifact.canonical_path).map_err(|error| error.to_string())?;
-    if actual != artifact.inventory {
-        return Err(format!(
-            "artifact {} changed after the campaign was frozen",
-            artifact.key
-        ));
-    }
-    Ok(())
-}
-
-fn write_artifact_bound_json_atomic(
+fn write_pinned_json_atomic(
     path: &Path,
-    artifact: &ArtifactReceipt,
+    artifact: &VerifiedPinnedArtifact,
     value: &impl serde::Serialize,
 ) -> Result<(), String> {
-    // Serialize and sync first, then re-inventory at the last possible point before the atomic
-    // rename makes the record visible. This rejects changes during loading, warmups, measurements,
-    // validation, or record serialization rather than publishing the stale frozen receipt.
-    write_json_atomic_before_publish(path, value, || verify_artifact_content(artifact))
+    // Serialize and sync first, then verify the sealed snapshot's complete content and path
+    // identities at the last possible point before the record becomes visible.
+    write_json_atomic_before_publish(path, value, || artifact.verify_integrity())
 }
 
-fn load_spec(tier: ModelTier, path: &Path) -> LoadSpec {
-    let spec = LoadSpec::new(WeightsSource::Dir(path.to_path_buf()));
+fn load_spec(tier: ModelTier, artifact: &VerifiedPinnedArtifact) -> LoadSpec {
+    let spec = LoadSpec::new(WeightsSource::Dir(artifact.path().to_path_buf()));
     match tier {
         ModelTier::Bf16 => spec,
         ModelTier::Q4 => spec.with_quant(Quant::Q4),
@@ -1503,6 +1542,7 @@ fn print_summary(summary: &BenchmarkSummary) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use runtime_macos::perf_bench::{inventory_artifact, ArtifactReceipt};
 
     #[test]
     fn default_matrix_parses_and_validates() {
@@ -1546,7 +1586,7 @@ mod tests {
     }
 
     #[test]
-    fn artifact_mutation_during_execution_prevents_record_publication() {
+    fn unavailable_pinned_snapshot_prevents_record_publication_and_removes_json_temp() {
         let temp = tempfile::tempdir().unwrap();
         let artifact_path = temp.path().join("artifact");
         fs::create_dir(&artifact_path).unwrap();
@@ -1562,21 +1602,44 @@ mod tests {
             inventory: inventory_artifact(&canonical_path).unwrap(),
             canonical_path,
         };
-
-        // This is the same successful pre-load check the child performs before execution begins.
-        verify_artifact_content(&artifact).unwrap();
-        fs::write(&weights, b"after!").unwrap();
+        let mut owned = OwnedPinnedArtifact::create(&artifact).unwrap();
+        let verified = VerifiedPinnedArtifact::admit(&artifact, owned.path()).unwrap();
+        match load_spec(ModelTier::Q4, &verified).weights {
+            WeightsSource::Dir(path) => assert_eq!(path, verified.path()),
+            WeightsSource::File(_) => panic!("benchmark artifact must load from its pinned tree"),
+        }
+        owned.cleanup().unwrap();
 
         let output = temp.path().join("run.json");
-        let error = write_artifact_bound_json_atomic(
-            &output,
-            &artifact,
-            &serde_json::json!({"stale": "record"}),
-        )
-        .unwrap_err();
-        assert!(error.contains("changed after the campaign was frozen"));
+        let error =
+            write_pinned_json_atomic(&output, &verified, &serde_json::json!({"stale": "record"}))
+                .unwrap_err();
+        assert!(error.contains("sealed snapshot"), "{error}");
         assert!(!output.exists());
         assert!(!temp.path().join(".run.json.tmp").exists());
+    }
+
+    #[test]
+    fn parent_finalization_reverifies_and_removes_shared_snapshot_before_summary() {
+        let temp = tempfile::tempdir().unwrap();
+        let artifact_path = temp.path().join("artifact");
+        fs::create_dir(&artifact_path).unwrap();
+        fs::write(artifact_path.join("weights.bin"), b"weights").unwrap();
+        let canonical_path = artifact_path.canonicalize().unwrap();
+        let artifact = ArtifactReceipt {
+            key: "fixture".to_owned(),
+            repository: "fixture/repository".to_owned(),
+            resolved_revision: "a".repeat(40),
+            tier: ModelTier::Q4,
+            input_path: artifact_path,
+            inventory: inventory_artifact(&canonical_path).unwrap(),
+            canonical_path,
+        };
+        let snapshot = OwnedPinnedArtifact::create(&artifact).unwrap();
+        let root = snapshot.path().parent().unwrap().to_path_buf();
+        let mut snapshots = vec![(artifact.key, snapshot)];
+        finish_owned_snapshots(&mut snapshots).unwrap();
+        assert!(!root.exists());
     }
 
     #[test]

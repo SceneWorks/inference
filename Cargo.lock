@@ -3226,6 +3226,7 @@ name = "runtime-macos"
 version = "0.0.0"
 dependencies = [
  "candle-audio-catalog",
+ "libc",
  "mlx-gen-catalog",
  "mlx-llm",
  "pmetal-mlx-rs",
