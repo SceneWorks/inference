@@ -812,6 +812,7 @@ pub const MEMORY_BEHAVIOR_REGISTRATION: mlx_gen::gen_core::MemoryBehaviorRegistr
 mod tests {
     use super::*;
     use mlx_gen::{Conditioning, ControlKind, Modality, OffloadPolicy, Quant, WeightsSource};
+    use std::path::PathBuf;
 
     fn write_minimal_safetensors(path: &Path) {
         let mut header = br#"{"probe":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#.to_vec();
@@ -822,6 +823,17 @@ mod tests {
         bytes.extend(header);
         bytes.extend([0_u8; 2]);
         std::fs::write(path, bytes).unwrap();
+    }
+
+    fn incomplete_native_control_fixture(tmp: &tempfile::TempDir) -> (PathBuf, PathBuf, PathBuf) {
+        let base = tmp.path().join("incomplete-base");
+        std::fs::create_dir_all(base.join("transformer")).unwrap();
+        std::fs::write(base.join("transformer/config.json"), "{}").unwrap();
+        let dit = tmp.path().join("native-dit.safetensors");
+        let control = tmp.path().join("control.safetensors");
+        write_minimal_safetensors(&dit);
+        write_minimal_safetensors(&control);
+        (dit, base, control)
     }
 
     #[test]
@@ -971,17 +983,14 @@ mod tests {
     #[test]
     fn native_control_load_missing_base_fails_during_asset_inventory() {
         // The native control entrypoint proves the base tier is present first, exactly like the t2i
-        // native entrypoint. A bogus base fails during the fail-closed asset inventory before any
+        // native entrypoint. An incomplete base fails during the fail-closed asset inventory before any
         // tensor materialization.
-        let e = load_control_from_native_dit_file(
-            "/nonexistent-krea/dit.safetensors",
-            "/nonexistent-krea",
-            "/nonexistent-krea/control.safetensors",
-            &[],
-        )
-        .err()
-        .expect("missing base snapshot → err")
-        .to_string();
+        let tmp = tempfile::tempdir().unwrap();
+        let (dit, base, control) = incomplete_native_control_fixture(&tmp);
+        let e = load_control_from_native_dit_file(&dit, &base, &control, &[])
+            .err()
+            .expect("missing base snapshot → err")
+            .to_string();
         assert!(
             e.contains("native base text encoder asset facts"),
             "expected the missing-base inventory error, got: {e}"
@@ -991,51 +1000,47 @@ mod tests {
     #[test]
     fn native_control_load_accepts_adapters_without_early_rejection() {
         // Adapters thread through the native control assembly (parity with the snapshot control
-        // load's `spec.adapters`) and must NOT be rejected at the door — with a bogus base the load
-        // still fails first at the config read, never at an "adapters unsupported" guard.
+        // load's `spec.adapters`) and must NOT be rejected at the door — with an incomplete base the
+        // load still fails first at asset inventory, never at an "adapters unsupported" guard.
+        let tmp = tempfile::tempdir().unwrap();
+        let (dit, base, control) = incomplete_native_control_fixture(&tmp);
+        let adapter = tmp.path().join("style.safetensors");
+        write_minimal_safetensors(&adapter);
         let adapters = vec![mlx_gen::AdapterSpec::new(
-            std::path::PathBuf::from("/nonexistent-krea/style.safetensors"),
+            adapter,
             1.0,
             mlx_gen::AdapterKind::Lora,
         )];
-        let e = load_control_from_native_dit_file(
-            "/nonexistent-krea/dit.safetensors",
-            "/nonexistent-krea",
-            "/nonexistent-krea/control.safetensors",
-            &adapters,
-        )
-        .err()
-        .expect("missing base snapshot → err")
-        .to_string();
+        let e = load_control_from_native_dit_file(&dit, &base, &control, &adapters)
+            .err()
+            .expect("missing base snapshot → err")
+            .to_string();
         assert!(
             !e.to_lowercase().contains("not yet supported")
                 && !e.to_lowercase().contains("not supported"),
             "adapters must be accepted by the native control loader, got: {e}"
         );
+        assert!(
+            e.contains("native base text encoder asset facts"),
+            "expected the missing-base inventory error, got: {e}"
+        );
     }
 
     #[test]
     fn native_control_valid_config_reaches_fail_closed_asset_sizing() {
-        // A parseable arch config advances the load to the memory contract's fail-closed component
-        // sizing, which requires the base text encoder / VAE and the pose overlay to actually hold
-        // tensor bytes — a torn base or missing overlay fails loudly here, before any weight load.
+        // Real pinned DiT/control files plus a parseable arch config remove ambient path and config
+        // ambiguity. The memory contract must fail at component sizing because the intentionally
+        // incomplete base has no text encoder / VAE, before any weight materialization.
         let root_tmp = tempfile::tempdir().unwrap();
-        let root = root_tmp.path().to_path_buf();
-        std::fs::create_dir_all(root.join("transformer")).unwrap();
-        std::fs::write(root.join("transformer/config.json"), "{}").unwrap();
+        let (dit, root, control) = incomplete_native_control_fixture(&root_tmp);
 
-        let e = load_control_from_native_dit_file(
-            root.join("missing-dit.safetensors"),
-            &root,
-            root.join("missing-control.safetensors"),
-            &[],
-        )
-        .err()
-        .expect("missing required components must fail")
-        .to_string();
+        let e = load_control_from_native_dit_file(&dit, &root, &control, &[])
+            .err()
+            .expect("missing required components must fail")
+            .to_string();
         assert!(
-            e.contains("asset facts"),
-            "expected the post-config asset-sizing stage, got: {e}"
+            e.contains("native base text encoder asset facts"),
+            "expected the fail-closed base asset-sizing stage, got: {e}"
         );
         assert!(!e.contains("config.json"), "config was valid, got: {e}");
     }

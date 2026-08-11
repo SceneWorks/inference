@@ -274,12 +274,22 @@ mod explicit_registry_tests {
                     .capability(MemoryStrategy::BoundedTransformerResidency)
                     .unwrap()
                     .support,
-                MemoryStrategySupport::Implemented,
+                MemoryStrategySupport::Missing,
                 "{id}"
             );
-            registry.load(id, &base_spec).unwrap_or_else(|error| {
+            let loaded = registry.load(id, &base_spec).unwrap_or_else(|error| {
                 panic!("{id} File load must agree with its public contracts: {error}")
             });
+            assert_eq!(
+                loaded
+                    .memory_strategy_contract()
+                    .expect("loaded File generator memory contract")
+                    .capability(MemoryStrategy::BoundedTransformerResidency)
+                    .unwrap()
+                    .support,
+                MemoryStrategySupport::Missing,
+                "{id} loaded File generator must keep the unpromoted rung eager"
+            );
         }
 
         let control_spec = base_spec
@@ -293,9 +303,18 @@ mod explicit_registry_tests {
             .expect("control memory contract");
         assert_eq!(contract.provider_id, id);
         assert!(contract.asset_facts.overlay_bytes > 0);
-        registry
+        let loaded = registry
             .load(id, &control_spec)
             .expect("control File load must agree with its public contracts");
+        assert_eq!(
+            loaded
+                .memory_strategy_contract()
+                .expect("loaded control File generator memory contract")
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .support,
+            MemoryStrategySupport::Missing
+        );
     }
 
     #[test]

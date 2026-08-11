@@ -56,11 +56,11 @@ impl ComfyuiSources {
         tokenizer_dir: PathBuf,
     ) -> candle_gen::gen_core::Result<Self> {
         Ok(Self {
-            weights: ComfyuiWeights::Separate {
+            weights: ComfyuiWeights::Separate(Box::new(SeparateComfyuiWeights {
                 transformer_file: candle_gen::gen_core::PinnedWeightsFile::pin(transformer_file)?,
                 text_encoder_file: candle_gen::gen_core::PinnedWeightsFile::pin(text_encoder_file)?,
                 vae_file: candle_gen::gen_core::PinnedWeightsFile::pin(vae_file)?,
-            },
+            })),
             tokenizer_dir,
         })
     }
@@ -79,13 +79,13 @@ impl ComfyuiSources {
 
     pub(crate) fn ensure_unchanged(&self) -> Result<()> {
         match &self.weights {
-            ComfyuiWeights::Separate {
-                transformer_file,
-                text_encoder_file,
-                vae_file,
-            } => [transformer_file, text_encoder_file, vae_file]
-                .into_iter()
-                .try_for_each(|pin| pin.ensure_unchanged().map_err(Into::into)),
+            ComfyuiWeights::Separate(files) => [
+                &files.transformer_file,
+                &files.text_encoder_file,
+                &files.vae_file,
+            ]
+            .into_iter()
+            .try_for_each(|pin| pin.ensure_unchanged().map_err(Into::into)),
             ComfyuiWeights::Combined(file) => file.ensure_unchanged().map_err(Into::into),
         }
     }
@@ -93,9 +93,9 @@ impl ComfyuiSources {
     pub(crate) fn transformer_map(&self) -> Result<HashMap<String, Tensor>> {
         self.ensure_unchanged()?;
         match &self.weights {
-            ComfyuiWeights::Separate {
-                transformer_file, ..
-            } => transformer_file.read_unchanged(|path| Ok(safetensors::load(path, &Device::Cpu)?)),
+            ComfyuiWeights::Separate(files) => files
+                .transformer_file
+                .read_unchanged(|path| Ok(safetensors::load(path, &Device::Cpu)?)),
             ComfyuiWeights::Combined(file) => file.read_unchanged(|path| {
                 Ok(split_combined_checkpoint(safetensors::load(path, &Device::Cpu)?)?.transformer)
             }),
@@ -105,11 +105,9 @@ impl ComfyuiSources {
     pub(crate) fn text_encoder_map(&self) -> Result<HashMap<String, Tensor>> {
         self.ensure_unchanged()?;
         match &self.weights {
-            ComfyuiWeights::Separate {
-                text_encoder_file, ..
-            } => {
-                text_encoder_file.read_unchanged(|path| Ok(safetensors::load(path, &Device::Cpu)?))
-            }
+            ComfyuiWeights::Separate(files) => files
+                .text_encoder_file
+                .read_unchanged(|path| Ok(safetensors::load(path, &Device::Cpu)?)),
             ComfyuiWeights::Combined(file) => file.read_unchanged(|path| {
                 Ok(split_combined_checkpoint(safetensors::load(path, &Device::Cpu)?)?.text_encoder)
             }),
@@ -119,9 +117,9 @@ impl ComfyuiSources {
     pub(crate) fn vae_map(&self) -> Result<HashMap<String, Tensor>> {
         self.ensure_unchanged()?;
         match &self.weights {
-            ComfyuiWeights::Separate { vae_file, .. } => {
-                vae_file.read_unchanged(|path| Ok(safetensors::load(path, &Device::Cpu)?))
-            }
+            ComfyuiWeights::Separate(files) => files
+                .vae_file
+                .read_unchanged(|path| Ok(safetensors::load(path, &Device::Cpu)?)),
             ComfyuiWeights::Combined(file) => file.read_unchanged(|path| {
                 Ok(split_combined_checkpoint(safetensors::load(path, &Device::Cpu)?)?.vae)
             }),
@@ -131,12 +129,15 @@ impl ComfyuiSources {
 
 #[derive(Clone, Debug)]
 pub(crate) enum ComfyuiWeights {
-    Separate {
-        transformer_file: candle_gen::gen_core::PinnedWeightsFile,
-        text_encoder_file: candle_gen::gen_core::PinnedWeightsFile,
-        vae_file: candle_gen::gen_core::PinnedWeightsFile,
-    },
+    Separate(Box<SeparateComfyuiWeights>),
     Combined(candle_gen::gen_core::PinnedWeightsFile),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SeparateComfyuiWeights {
+    transformer_file: candle_gen::gen_core::PinnedWeightsFile,
+    text_encoder_file: candle_gen::gen_core::PinnedWeightsFile,
+    vae_file: candle_gen::gen_core::PinnedWeightsFile,
 }
 
 pub(crate) struct ComponentMaps {

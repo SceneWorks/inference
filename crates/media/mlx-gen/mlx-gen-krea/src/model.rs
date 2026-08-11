@@ -1517,6 +1517,7 @@ mlx_gen::register_generators! {
 mod tests {
     use super::*;
     use mlx_gen::{AdapterKind, AdapterSpec, OffloadPolicy};
+    use std::path::PathBuf;
 
     fn write_minimal_safetensors(path: &Path) {
         let mut header = br#"{"probe":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#.to_vec();
@@ -1541,6 +1542,16 @@ mod tests {
         LoadSpec::new(WeightsSource::File(dit))
             .with_component(BASE_SNAPSHOT_COMPONENT, WeightsSource::Dir(base))
             .with_offload_policy(mlx_gen::OffloadPolicy::Sequential)
+    }
+
+    fn incomplete_native_file_fixture(tmp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+        let base = tmp.path().join("incomplete-base");
+        std::fs::create_dir_all(base.join("transformer")).expect("create transformer config dir");
+        std::fs::write(base.join("transformer/config.json"), "{}")
+            .expect("write parseable transformer config");
+        let dit = tmp.path().join("native-dit.safetensors");
+        write_minimal_safetensors(&dit);
+        (dit, base)
     }
 
     #[test]
@@ -1831,17 +1842,14 @@ mod tests {
     #[test]
     fn native_load_empty_adapters_preserves_load() {
         // sc-14119: an empty adapter slice keeps the native single-file load behaving as it always has —
-        // it still runs the fail-closed base inventory first (and, with a bogus base dir, fails there),
+        // it still runs the fail-closed base inventory first (and, with an incomplete base, fails there),
         // so the new parameter is inert for the t2i/img2img callers that pass `&[]`.
-        let e = load_from_native_dit_file(
-            "/nonexistent-krea/dit.safetensors",
-            "/nonexistent-krea",
-            &[],
-            descriptor(),
-        )
-        .err()
-        .expect("missing base snapshot → err")
-        .to_string();
+        let tmp = tempfile::tempdir().unwrap();
+        let (dit, base) = incomplete_native_file_fixture(&tmp);
+        let e = load_from_native_dit_file(&dit, &base, &[], descriptor())
+            .err()
+            .expect("missing base snapshot → err")
+            .to_string();
         assert!(
             e.contains("native base text encoder asset facts"),
             "expected the missing-base inventory error, got: {e}"
@@ -1851,24 +1859,19 @@ mod tests {
     #[test]
     fn native_load_accepts_adapters_without_early_rejection() {
         // sc-14119: a non-empty adapter slice is threaded through the native loader (parity with the
-        // snapshot `load` path) and must NOT be rejected at the door. With a bogus base the load still
+        // snapshot `load` path) and must NOT be rejected at the door. With an incomplete base the load still
         // fails first at the fail-closed base inventory — the adapter fold
         // (`KreaHeavy::apply_adapters`) is weights-gated and exercised in the #[ignore] real-weight
         // harness below.
-        let adapters = vec![AdapterSpec::new(
-            std::path::PathBuf::from("/nonexistent-krea/krea2_identity_edit.safetensors"),
-            1.0,
-            AdapterKind::Lora,
-        )];
-        let e = load_from_native_dit_file(
-            "/nonexistent-krea/dit.safetensors",
-            "/nonexistent-krea",
-            &adapters,
-            edit_descriptor(),
-        )
-        .err()
-        .expect("missing base snapshot → err")
-        .to_string();
+        let tmp = tempfile::tempdir().unwrap();
+        let (dit, base) = incomplete_native_file_fixture(&tmp);
+        let adapter = tmp.path().join("krea2_identity_edit.safetensors");
+        write_minimal_safetensors(&adapter);
+        let adapters = vec![AdapterSpec::new(adapter, 1.0, AdapterKind::Lora)];
+        let e = load_from_native_dit_file(&dit, &base, &adapters, edit_descriptor())
+            .err()
+            .expect("missing base snapshot → err")
+            .to_string();
         assert!(
             !e.to_lowercase().contains("not yet supported")
                 && !e.to_lowercase().contains("not supported"),
@@ -1883,19 +1886,12 @@ mod tests {
     #[test]
     fn native_load_valid_config_reaches_fail_closed_base_asset_sizing() {
         let root_tmp = tempfile::tempdir().unwrap();
-        let root = root_tmp.path().to_path_buf();
-        std::fs::create_dir_all(root.join("transformer")).unwrap();
-        std::fs::write(root.join("transformer/config.json"), "{}").unwrap();
+        let (dit, root) = incomplete_native_file_fixture(&root_tmp);
 
-        let e = load_from_native_dit_file(
-            root.join("missing-dit.safetensors"),
-            &root,
-            &[],
-            descriptor(),
-        )
-        .err()
-        .expect("missing required base components must fail")
-        .to_string();
+        let e = load_from_native_dit_file(&dit, &root, &[], descriptor())
+            .err()
+            .expect("missing required base components must fail")
+            .to_string();
         assert!(
             e.contains("native base text encoder asset facts"),
             "expected the fail-closed base asset-sizing stage, got: {e}"
