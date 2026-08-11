@@ -15,8 +15,8 @@ use std::path::PathBuf;
 use mlx_gen_kolors::Kolors;
 
 use mlx_gen::{
-    Conditioning, ControlKind, GenerationOutput, GenerationRequest, Image, LoadSpec, Precision,
-    Progress, Quant, WeightsSource,
+    Conditioning, ControlKind, GenerationOutput, GenerationRequest, Image, LoadSpec, Progress,
+    Quant, WeightsSource,
 };
 use mlx_rs::Dtype;
 
@@ -51,21 +51,7 @@ fn ip_snap() -> PathBuf {
 }
 
 fn base_spec() -> LoadSpec {
-    LoadSpec {
-        weights: WeightsSource::Dir(kolors_snap()),
-        quantize: None,
-        precision: Precision::Bf16,
-        control: None,
-        ip_adapter: None,
-        adapters: Vec::new(),
-        extra_controls: Vec::new(),
-        pid: None,
-        identity: None,
-        text_encoder: None,
-        offload_policy: Default::default(),
-        load_shape: Default::default(),
-        components: Default::default(),
-    }
+    LoadSpec::new(WeightsSource::Dir(kolors_snap()))
 }
 
 /// A deterministic 512² test image (the engine never sees a real photo in these gates).

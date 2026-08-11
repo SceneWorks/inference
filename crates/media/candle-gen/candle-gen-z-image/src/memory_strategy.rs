@@ -181,12 +181,20 @@ fn imported_file_components(
         .get(gen_core::COMFYUI_TEXT_ENCODER_COMPONENT);
     let vae = spec.components.get(gen_core::COMFYUI_VAE_COMPONENT);
     match (text_encoder, vae) {
-        (None, None) => combined_file_components(primary),
+        (None, None) => {
+            spec.read_file_unchanged_if_prepared(primary, combined_file_components)
+        }
         (Some(WeightsSource::File(text_encoder)), Some(WeightsSource::File(vae))) => {
             Ok(PerComponentBytes {
-                text_encoder: single_file_tensor_bytes(text_encoder, "text encoder")?,
-                dit: single_file_tensor_bytes(primary, "transformer")?,
-                vae: single_file_tensor_bytes(vae, "VAE")?,
+                text_encoder: spec.read_file_unchanged_if_prepared(text_encoder, |p| {
+                    single_file_tensor_bytes(p, "text encoder")
+                })?,
+                dit: spec.read_file_unchanged_if_prepared(primary, |p| {
+                    single_file_tensor_bytes(p, "transformer")
+                })?,
+                vae: spec.read_file_unchanged_if_prepared(vae, |p| {
+                    single_file_tensor_bytes(p, "VAE")
+                })?,
             })
         }
         (Some(WeightsSource::Dir(path)), _) => Err(gen_core::Error::Msg(format!(
@@ -358,9 +366,11 @@ pub(crate) fn control_contract(
 ) -> gen_core::Result<MemoryProviderContract> {
     let mut contract = provider_contract(provider_id, spec)?;
     let overlay_bytes = match spec.control.as_ref() {
-        Some(gen_core::WeightsSource::Dir(path)) | Some(gen_core::WeightsSource::File(path)) => {
-            gen_core::safetensors_path_bytes(path)
-        }
+        Some(gen_core::WeightsSource::Dir(path)) => gen_core::safetensors_path_bytes(path),
+        Some(gen_core::WeightsSource::File(path)) => spec
+            .read_file_unchanged_if_prepared(path, |p| -> gen_core::Result<u64> {
+                Ok(gen_core::safetensors_path_bytes(p))
+            })?,
         None => 0,
     };
     contract.asset_facts.base_bytes = contract

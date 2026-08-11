@@ -273,13 +273,14 @@ pub fn load_control_from_native_dit_file(
     control: impl AsRef<Path>,
     adapters: &[mlx_gen::AdapterSpec],
 ) -> Result<Box<dyn Generator>> {
-    let spec = LoadSpec::new(WeightsSource::File(dit_file.as_ref().to_path_buf()))
+    let mut spec = LoadSpec::new(WeightsSource::File(dit_file.as_ref().to_path_buf()))
         .with_component(
             BASE_SNAPSHOT_COMPONENT,
             WeightsSource::Dir(base_snapshot_dir.as_ref().to_path_buf()),
         )
         .with_control(WeightsSource::File(control.as_ref().to_path_buf()))
         .with_adapters(adapters.to_vec());
+    spec.prepare_file_sources()?;
     load(&spec)
 }
 
@@ -293,28 +294,31 @@ pub(crate) fn build_native_krea_control(
     control: impl AsRef<Path>,
     adapters: &[mlx_gen::AdapterSpec],
 ) -> Result<KreaTurboControl> {
-    let spec = LoadSpec::new(WeightsSource::File(dit_file.as_ref().to_path_buf()))
+    let mut spec = LoadSpec::new(WeightsSource::File(dit_file.as_ref().to_path_buf()))
         .with_component(
             BASE_SNAPSHOT_COMPONENT,
             WeightsSource::Dir(base_snapshot_dir.as_ref().to_path_buf()),
         )
         .with_control(WeightsSource::File(control.as_ref().to_path_buf()))
         .with_adapters(adapters.to_vec());
+    spec.prepare_file_sources()?;
     build_native_krea_control_from_spec(&spec)
 }
 
 fn build_native_krea_control_from_spec(spec: &LoadSpec) -> Result<KreaTurboControl> {
     validate_control_spec(spec)?;
-    let WeightsSource::File(dit_file) = &spec.weights else {
+    let WeightsSource::File(_) = &spec.weights else {
         return Err(Error::Msg(format!(
             "{KREA_2_TURBO_CONTROL_ID}: imported control assembly requires a single-file DiT"
         )));
     };
-    let native_dit = mlx_gen::PinnedWeightsFile::pin(dit_file)?;
+    let native_dit = spec
+        .weights_file_pin()?
+        .expect("File weights must resolve to a pin");
     let base = require_base_snapshot(spec, KREA_2_TURBO_CONTROL_ID)?.to_path_buf();
     let pinned_control =
         match require_control(spec, KREA_2_TURBO_CONTROL_ID, "Krea 2 pose control overlay")? {
-            WeightsSource::File(path) => Some(mlx_gen::PinnedWeightsFile::pin(path)?),
+            WeightsSource::File(path) => Some(spec.file_pin_for(path)?),
             WeightsSource::Dir(_) => None,
         };
     let mut pinned_spec = spec.clone();
@@ -382,7 +386,9 @@ fn load_native_control_heavy(
     let vae = crate::vae::load_vae(base)?;
     let mut heavy = KreaHeavy::from_parts(dit, vae);
     if !spec.adapters.is_empty() {
-        heavy.apply_adapters(&spec.adapters)?;
+        spec.read_files_unchanged(spec.adapters.iter().map(|adapter| &adapter.path), || {
+            heavy.apply_adapters(&spec.adapters)
+        })?;
     }
     let control = require_control(spec, KREA_2_TURBO_CONTROL_ID, "Krea 2 pose control overlay")?;
     let branch = match pinned_control {
@@ -403,6 +409,7 @@ fn load_native_control_heavy(
 /// allowed (sc-11727) — a pre-packed snapshot or a `spec.quantize` request both pack only the base DiT/TE,
 /// leaving activations bf16 — so there is no quant rejection here.
 pub(crate) fn validate_control_spec(spec: &LoadSpec) -> Result<()> {
+    spec.validate_prepared_file_pins()?;
     if spec.precision != Precision::Bf16 {
         return Err(Error::Msg(format!(
             "{KREA_2_TURBO_CONTROL_ID}: only the default bf16 activation precision is wired (drop the \
@@ -459,7 +466,7 @@ fn build_control_residency(spec: &LoadSpec) -> Result<Residency<KreaText, Contro
 
 fn pin_control_source(spec: &LoadSpec) -> Result<Option<mlx_gen::PinnedWeightsFile>> {
     match require_control(spec, KREA_2_TURBO_CONTROL_ID, "Krea 2 pose control overlay")? {
-        WeightsSource::File(path) => Ok(Some(mlx_gen::PinnedWeightsFile::pin(path)?)),
+        WeightsSource::File(path) => Ok(Some(spec.file_pin_for(path)?)),
         WeightsSource::Dir(_) => Ok(None),
     }
 }
@@ -522,11 +529,13 @@ fn load_control_heavy(
             spec.load_shape,
             mlx_gen::gen_core::LoadShape::DeferredMaterialization
         )
-        && !crate::model::adapters_have_diff_patch(&spec.adapters)
+        && !crate::model::adapters_have_diff_patch_for_spec(spec)?
         && plan.load_time_quant_bits.is_none();
     let mut heavy = KreaHeavy::from_snapshot_with_stream(root, streamable_transformer)?;
     if !spec.adapters.is_empty() {
-        heavy.apply_adapters(&spec.adapters)?;
+        spec.read_files_unchanged(spec.adapters.iter().map(|adapter| &adapter.path), || {
+            heavy.apply_adapters(&spec.adapters)
+        })?;
     }
     if let Some(bits) = crate::model::load_time_quant_bits(spec, root, KREA_2_TURBO_CONTROL_ID)? {
         heavy.quantize(bits)?;
@@ -849,14 +858,22 @@ mod tests {
         let control = tmp.path().join("control.safetensors");
         write_minimal_safetensors(&dit);
         write_minimal_safetensors(&control);
-        let spec = LoadSpec::new(WeightsSource::File(dit.clone()))
+        let mut spec = LoadSpec::new(WeightsSource::File(dit.clone()))
             .with_component(BASE_SNAPSHOT_COMPONENT, WeightsSource::Dir(base))
             .with_control(WeightsSource::File(control.clone()))
             .with_offload_policy(OffloadPolicy::Sequential)
             .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization);
+        spec.prepare_file_sources().unwrap();
+        let prepared_dit = spec.weights_file_pin().unwrap().unwrap();
+        let prepared_control = spec.file_pin_for(&control).unwrap();
         let model = build_native_krea_control_from_spec(&spec).unwrap();
         let dit_pin = model._native_dit.expect("native DiT pin");
         let control_pin = model._native_control.expect("native control pin");
+        assert_eq!(dit_pin, prepared_dit, "DiT must reuse the cache-key token");
+        assert_eq!(
+            control_pin, prepared_control,
+            "control must reuse the cache-key token"
+        );
 
         std::fs::write(&dit, b"replacement dit").unwrap();
         std::fs::write(&control, b"replacement control").unwrap();

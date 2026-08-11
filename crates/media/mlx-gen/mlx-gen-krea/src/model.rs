@@ -249,6 +249,10 @@ pub struct Krea {
     /// phase would silently carry the diff-patch. Multi-phase is therefore rejected loudly on such a
     /// model (low-rank LoRA/LoKr — including the turbo LoRA — toggle cleanly and are unaffected).
     has_diff_patch: bool,
+    /// Caller-prepared identities retained for any adapter files reopened by multi-phase generation.
+    /// Primary/PiD deferred loaders keep their exact tokens too; retaining the complete spec makes
+    /// every later path lookup use the same cache-identity contract.
+    file_pin_spec: LoadSpec,
 }
 
 /// The heavy render-phase components (the single-stream DiT + VAE, via [`KreaHeavy`], plus the optional
@@ -356,12 +360,13 @@ pub fn load_from_native_dit_file(
 ) -> Result<Box<dyn Generator>> {
     let dit_file = dit_file.as_ref();
     let base_snapshot_dir = base_snapshot_dir.as_ref();
-    let spec = LoadSpec::new(WeightsSource::File(dit_file.to_path_buf()))
+    let mut spec = LoadSpec::new(WeightsSource::File(dit_file.to_path_buf()))
         .with_component(
             BASE_SNAPSHOT_COMPONENT,
             WeightsSource::Dir(base_snapshot_dir.to_path_buf()),
         )
         .with_adapters(adapters.to_vec());
+    spec.prepare_file_sources()?;
     load_variant(&spec, descriptor)
 }
 
@@ -378,12 +383,13 @@ pub(crate) fn build_native_krea(
 ) -> Result<Krea> {
     let dit_file = dit_file.as_ref();
     let base_snapshot_dir = base_snapshot_dir.as_ref();
-    let spec = LoadSpec::new(WeightsSource::File(dit_file.to_path_buf()))
+    let mut spec = LoadSpec::new(WeightsSource::File(dit_file.to_path_buf()))
         .with_component(
             BASE_SNAPSHOT_COMPONENT,
             WeightsSource::Dir(base_snapshot_dir.to_path_buf()),
         )
         .with_adapters(adapters.to_vec());
+    spec.prepare_file_sources()?;
     build_native_krea_from_spec(&spec, descriptor)
 }
 
@@ -394,6 +400,7 @@ pub(crate) fn build_native_krea(
 /// ([`load_krea_text`] / [`load_krea_heavy`]), so the components are byte-identical. `descriptor`
 /// selects the variant (Turbo vs Raw vs edit) the returned [`Krea`] renders.
 fn load_variant(spec: &LoadSpec, descriptor: ModelDescriptor) -> Result<Box<dyn Generator>> {
+    spec.validate_prepared_file_pins()?;
     if matches!(spec.weights, WeightsSource::File(_)) {
         return Ok(Box::new(build_native_krea_from_spec(spec, descriptor)?));
     }
@@ -409,7 +416,8 @@ fn load_variant(spec: &LoadSpec, descriptor: ModelDescriptor) -> Result<Box<dyn 
         _native_dit: None,
         residency,
         adapters: spec.adapters.clone(),
-        has_diff_patch: adapters_have_diff_patch(&spec.adapters),
+        has_diff_patch: adapters_have_diff_patch_for_spec(spec)?,
+        file_pin_spec: spec.clone(),
     }))
 }
 
@@ -447,10 +455,12 @@ pub(crate) fn validate_native_krea_spec(spec: &LoadSpec, provider_id: &str) -> R
 fn build_native_krea_from_spec(spec: &LoadSpec, descriptor: ModelDescriptor) -> Result<Krea> {
     validate_native_krea_spec(spec, descriptor.id)?;
     let base = mlx_gen::gen_core::require_base_snapshot(spec, descriptor.id)?;
-    let WeightsSource::File(dit_file) = &spec.weights else {
+    let WeightsSource::File(_) = &spec.weights else {
         unreachable!("native builder is called only for File weights")
     };
-    let native_dit = mlx_gen::PinnedWeightsFile::pin(dit_file)?;
+    let native_dit = spec
+        .weights_file_pin()?
+        .expect("File weights must resolve to a pin");
     let mut pinned_spec = spec.clone();
     pinned_spec.weights = WeightsSource::File(native_dit.loader_path().to_path_buf());
     // The File is physically reopenable, but the public File contract deliberately withholds rung 4
@@ -488,7 +498,8 @@ fn build_native_krea_from_spec(spec: &LoadSpec, descriptor: ModelDescriptor) -> 
         _native_dit: Some(native_dit),
         residency,
         adapters: spec.adapters.clone(),
-        has_diff_patch: adapters_have_diff_patch(&spec.adapters),
+        has_diff_patch: adapters_have_diff_patch_for_spec(spec)?,
+        file_pin_spec: spec.clone(),
     })
 }
 
@@ -513,16 +524,14 @@ fn load_native_krea_heavy(
     let vae = crate::vae::load_vae(base)?;
     let mut heavy = KreaHeavy::from_parts(dit, vae);
     if !spec.adapters.is_empty() {
-        heavy.apply_adapters(&spec.adapters)?;
+        spec.read_files_unchanged(spec.adapters.iter().map(|adapter| &adapter.path), || {
+            heavy.apply_adapters(&spec.adapters)
+        })?;
     }
-    let pid = if load_pid {
-        spec.pid
-            .as_ref()
-            .map(|pid| PidEngine::from_spec(pid, PID_BACKBONE))
-            .transpose()?
-    } else {
-        None
-    };
+    let pid = load_pid
+        .then(|| load_prepared_pid(spec))
+        .transpose()?
+        .flatten();
     Ok(KreaHeavyOwned { heavy, pid })
 }
 
@@ -537,6 +546,31 @@ pub(crate) fn adapters_have_diff_patch(specs: &[AdapterSpec]) -> bool {
             .map(|meta| mlx_gen::adapters::loader::has_diff_patch_key_names(meta.keys()))
             .unwrap_or(false)
     })
+}
+
+/// Prepared-token wrapper for [`adapters_have_diff_patch`]. The header classification influences
+/// multi-phase safety, so it must inspect the same adapter identities the cache key and merge use.
+pub(crate) fn adapters_have_diff_patch_for_spec(spec: &LoadSpec) -> Result<bool> {
+    spec.read_prepared_files_unchanged(|| Ok(adapters_have_diff_patch(&spec.adapters)))
+}
+
+/// Load PiD beneath the same caller-prepared File tokens used for request cache identity.
+///
+/// Today the checkpoint is normally a File and Gemma is normally a Dir, but guarding both declared
+/// sources keeps this correct for any accepted File-shaped compatibility input. The outer pre/post
+/// checks also span the provider's lazy tensor materialization.
+fn load_prepared_pid(spec: &LoadSpec) -> Result<Option<PidEngine>> {
+    let Some(pid) = &spec.pid else {
+        return Ok(None);
+    };
+    let file_paths = [&pid.checkpoint, &pid.gemma]
+        .into_iter()
+        .filter_map(|source| match source {
+            WeightsSource::File(path) => Some(path.as_path()),
+            WeightsSource::Dir(_) => None,
+        });
+    spec.read_files_unchanged(file_paths, || PidEngine::from_spec(pid, PID_BACKBONE))
+        .map(Some)
 }
 
 fn resolve_transformer_window(req: &GenerationRequest, streamable: bool) -> Result<Option<usize>> {
@@ -733,7 +767,9 @@ fn load_krea_heavy(
 ) -> Result<KreaHeavyOwned> {
     let mut heavy = KreaHeavy::from_snapshot_with_stream(root, load_plan.streamable_transformer)?;
     if !spec.adapters.is_empty() {
-        heavy.apply_adapters(&spec.adapters)?;
+        spec.read_files_unchanged(spec.adapters.iter().map(|adapter| &adapter.path), || {
+            heavy.apply_adapters(&spec.adapters)
+        })?;
     }
     if let Some(bits) = load_plan.load_time_quant_bits {
         heavy.quantize(bits)?;
@@ -742,14 +778,10 @@ fn load_krea_heavy(
     // same `qwenimage` student + Gemma-2 caption encoder when `spec.pid` is set AND this generate uses
     // it (`load_pid`, F-177) — Resident passes `true` (loaded once, reused), Sequential passes
     // `req.use_pid` so a non-PiD generate skips the student + its Gemma-2 caption encoder entirely.
-    let pid = if load_pid {
-        spec.pid
-            .as_ref()
-            .map(|p| PidEngine::from_spec(p, PID_BACKBONE))
-            .transpose()?
-    } else {
-        None
-    };
+    let pid = load_pid
+        .then(|| load_prepared_pid(spec))
+        .transpose()?
+        .flatten();
     Ok(KreaHeavyOwned { heavy, pid })
 }
 
@@ -1042,13 +1074,18 @@ impl Krea {
                 // that phase uses CFG, backed by the `encode_guidance` neg-context gate) and reused
                 // across the count loop (one image per seed). Returns before the single-phase dispatch.
                 if let (Some(resolved), Some(full)) = (mp_resolved.as_ref(), mp_sigmas.as_ref()) {
-                    let plans = heavy.heavy.prepare_multiphase(
-                        resolved,
-                        &self.adapters,
-                        &ctx.pos,
-                        ctx.neg.as_ref(),
-                        req.width,
-                        req.height,
+                    let plans = self.file_pin_spec.read_files_unchanged(
+                        self.adapters.iter().map(|adapter| &adapter.path),
+                        || {
+                            heavy.heavy.prepare_multiphase(
+                                resolved,
+                                &self.adapters,
+                                &ctx.pos,
+                                ctx.neg.as_ref(),
+                                req.width,
+                                req.height,
+                            )
+                        },
                     )?;
                     let mut images = Vec::with_capacity(req.count as usize);
                     for n in 0..req.count {
@@ -1563,10 +1600,16 @@ mod tests {
             WeightsSource::File(path) => path.clone(),
             WeightsSource::Dir(_) => unreachable!(),
         };
+        spec.prepare_file_sources().unwrap();
+        let prepared = spec
+            .weights_file_pin()
+            .unwrap()
+            .expect("prepared primary token");
         let model = build_native_krea_from_spec(&spec, descriptor()).unwrap();
         let pin = model
             ._native_dit
             .expect("native generator must retain its pin");
+        assert_eq!(pin, prepared, "provider must retain the cache-key token");
         assert_eq!(pin.loader_path(), std::path::absolute(&native).unwrap());
 
         std::fs::write(&native, b"replacement after construction").unwrap();
@@ -1881,6 +1924,24 @@ mod tests {
             e.contains("native base text encoder asset facts"),
             "expected the missing-base inventory error, got: {e}"
         );
+    }
+
+    #[test]
+    fn prepared_adapter_header_classification_rejects_replacement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let adapter = tmp.path().join("adapter.safetensors");
+        write_minimal_safetensors(&adapter);
+        let mut spec =
+            LoadSpec::new(WeightsSource::Dir(tmp.path().join("base"))).with_adapters(vec![
+                AdapterSpec::new(adapter.clone(), 1.0, AdapterKind::Lora),
+            ]);
+        spec.prepare_file_sources().unwrap();
+
+        std::fs::write(&adapter, b"replacement adapter bytes").unwrap();
+        let error = adapters_have_diff_patch_for_spec(&spec)
+            .expect_err("header classification must consume the prepared adapter token")
+            .to_string();
+        assert!(error.contains("changed after load"), "got: {error}");
     }
 
     #[test]

@@ -1536,21 +1536,7 @@ mod tests {
         // The family catalog resolves both ids. Component access is intentionally request-scoped,
         // so a missing snapshot is not touched until generation begins.
         for id in [MODEL_ID_TURBO, MODEL_ID_BASE] {
-            let spec = LoadSpec {
-                weights: WeightsSource::Dir("/nonexistent/lens".into()),
-                quantize: None,
-                precision: Precision::Bf16,
-                control: None,
-                ip_adapter: None,
-                adapters: Vec::new(),
-                extra_controls: Vec::new(),
-                pid: None,
-                identity: None,
-                text_encoder: None,
-                offload_policy: Default::default(),
-                load_shape: Default::default(),
-                components: Default::default(),
-            };
+            let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/lens".into()));
             let generator = crate::provider_registry()
                 .unwrap()
                 .load(id, &spec)
@@ -1561,27 +1547,11 @@ mod tests {
 
     #[test]
     fn load_rejects_unsupported_overlays_not_quant() {
-        let base = LoadSpec {
-            weights: WeightsSource::Dir("/nonexistent/lens".into()),
-            quantize: None,
-            precision: Precision::Bf16,
-            control: None,
-            ip_adapter: None,
-            adapters: Vec::new(),
-            extra_controls: Vec::new(),
-            pid: None,
-            identity: None,
-            text_encoder: None,
-            offload_policy: Default::default(),
-            load_shape: Default::default(),
-            components: Default::default(),
-        };
+        let base = LoadSpec::new(WeightsSource::Dir("/nonexistent/lens".into()));
         // A ControlNet overlay is rejected (not part of the Lens port) — the message names it, before
         // any weights load.
-        let with_control = LoadSpec {
-            control: Some(WeightsSource::Dir("/nonexistent/cn".into())),
-            ..base.clone()
-        };
+        let mut with_control = base.clone();
+        with_control.control = Some(WeightsSource::Dir("/nonexistent/cn".into()));
         let err = match load_with(&with_control, TURBO_DEFAULTS) {
             Ok(_) => panic!("control must be rejected"),
             Err(e) => e.to_string(),
@@ -1590,10 +1560,8 @@ mod tests {
 
         // Quantize is NOT rejected (sc-3172). Construction remains lazy, so the bogus weights path
         // is deferred until generation just like the unquantized path.
-        let quant = LoadSpec {
-            quantize: Some(Quant::Q8),
-            ..base.clone()
-        };
+        let mut quant = base;
+        quant.quantize = Some(Quant::Q8);
         let generator = load_with(&quant, TURBO_DEFAULTS)
             .unwrap_or_else(|err| panic!("quantize must be accepted (sc-3172); got: {err}"));
         assert_eq!(generator.descriptor().id, MODEL_ID_TURBO);

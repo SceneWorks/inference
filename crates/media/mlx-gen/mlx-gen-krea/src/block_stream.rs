@@ -80,7 +80,7 @@ enum KreaBlockSource {
     /// Native/ComfyUI keys are normalized on every fresh view. The retained source path is the
     /// extension-bearing loader path and is lstat/target pinned; it is never canonicalized to an HF
     /// cache blob.
-    Native(PinnedWeightsFile),
+    Native(Box<PinnedWeightsFile>),
 }
 
 impl KreaBlockStream {
@@ -101,7 +101,7 @@ impl KreaBlockStream {
     pub(crate) fn new_native(source: PinnedWeightsFile, cfg: Krea2Config) -> Self {
         let n_blocks = cfg.num_layers;
         Self {
-            source: KreaBlockSource::Native(source),
+            source: KreaBlockSource::Native(Box::new(source)),
             cfg,
             quant_bits: None,
             adapters: vec![BlockAdapters::default(); n_blocks],
