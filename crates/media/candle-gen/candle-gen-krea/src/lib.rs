@@ -227,9 +227,10 @@ pub struct KreaGenerator {
     /// **job-local** base DiT from `transformer/` regardless of residency mode (the shared resident DiT
     /// is never mutated for per-phase adapter toggling — the concurrency-safety invariant).
     root: PathBuf,
-    /// Imported native DiT source, when `LoadSpec::weights` was a single file. Kept lexical (not
-    /// canonicalized); the provider pins and revalidates it whenever a streamed window is opened.
-    native_dit: Option<PathBuf>,
+    /// Imported native DiT source, when `LoadSpec::weights` was a single file. Pinned once at
+    /// generator construction and retained across resident, sequential, streamed, and multi-phase
+    /// materialization so no later request can silently adopt a replacement at the same path.
+    native_dit: Option<gen_core::PinnedWeightsFile>,
     /// The LoRA/LoKr adapters this model was loaded with (`LoadSpec::adapters`), retained so the
     /// multi-phase render can install each phase's named subset (by index, bounds-checked against
     /// `adapters.len()`, with an optional per-phase weight) on that phase's job-local DiT. Empty ⇒ a
@@ -628,7 +629,7 @@ impl Generator for KreaGenerator {
             let images = self.residency.run_exclusive_staged(&req.cancel, || {
                 pipeline::render_three_stage_with_native(
                     &self.root,
-                    self.native_dit.as_deref(),
+                    self.native_dit.as_ref(),
                     &self.device,
                     &self.adapters,
                     req,
@@ -712,6 +713,7 @@ impl Generator for KreaGenerator {
                     synchronize(pipeline::render_multiphase(
                         heavy.vae(),
                         &self.root,
+                        self.native_dit.as_ref(),
                         &self.device,
                         resolved,
                         &self.adapters,
@@ -733,6 +735,7 @@ impl Generator for KreaGenerator {
                     synchronize(pipeline::render_multiphase(
                         comps.vae(),
                         &self.root,
+                        self.native_dit.as_ref(),
                         &self.device,
                         resolved,
                         &self.adapters,
@@ -1099,17 +1102,30 @@ fn convrot_selector(spec: &LoadSpec, id: &str) -> gen_core::Result<Option<PathBu
     }
 }
 
-fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<dyn Generator>> {
-    let (root, native_dit) = match &spec.weights {
-        WeightsSource::Dir(p) => (p.clone(), None),
+fn resolved_base_and_native(
+    spec: &LoadSpec,
+    id: &str,
+) -> gen_core::Result<(PathBuf, Option<gen_core::PinnedWeightsFile>)> {
+    match &spec.weights {
+        WeightsSource::Dir(path) => Ok((path.clone(), None)),
         WeightsSource::File(path) => {
-            gen_core::reject_unknown_components(spec, &[BASE_SNAPSHOT_COMPONENT], descriptor.id)?;
-            (
-                gen_core::require_base_snapshot(spec, descriptor.id)?.to_path_buf(),
-                Some(path.clone()),
-            )
+            gen_core::reject_unknown_components(spec, &[BASE_SNAPSHOT_COMPONENT], id)?;
+            Ok((
+                gen_core::require_base_snapshot(spec, id)?.to_path_buf(),
+                Some(gen_core::PinnedWeightsFile::pin(path)?),
+            ))
         }
-    };
+    }
+}
+
+fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<dyn Generator>> {
+    let (root, native_dit) = resolved_base_and_native(spec, descriptor.id)?;
+    if native_dit.is_some() && spec.identity.is_some() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "candle {}: imported single-file weights do not accept identity fields",
+            descriptor.id
+        )));
+    }
     // sc-9300 seam: select the community **INT8-ConvRot** DiT consume path when the spec carries a
     // ConvRot DiT single-file checkpoint. It rides the shared, already-optional `LoadSpec::text_encoder`
     // field as a `WeightsSource::File` — the canonical Krea 2 snapshot (`spec.weights`, a `Dir`) still
@@ -1815,6 +1831,51 @@ pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core:
 
 #[cfg(test)]
 mod explicit_registry_tests {
+    fn imported_file_spec() -> (tempfile::TempDir, candle_gen::gen_core::LoadSpec) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dit = tmp.path().join("imported.safetensors");
+        std::fs::write(&dit, b"pinned source fixture").unwrap();
+        let spec =
+            candle_gen::gen_core::LoadSpec::new(candle_gen::gen_core::WeightsSource::File(dit))
+                .with_component(
+                    candle_gen::gen_core::BASE_SNAPSHOT_COMPONENT,
+                    candle_gen::gen_core::WeightsSource::Dir(tmp.path().join("base")),
+                );
+        (tmp, spec)
+    }
+
+    #[test]
+    fn every_registered_file_route_rejects_unrealized_typed_fields() {
+        let registry = super::provider_registry().unwrap();
+        let (tmp, base_spec) = imported_file_spec();
+        for id in [
+            "krea_2_turbo",
+            "krea_2_raw",
+            "krea_2_edit",
+            "krea_2_turbo_edit",
+        ] {
+            let mut identity = base_spec.clone();
+            identity.identity = Some(candle_gen::gen_core::IdentityWeights::default());
+            let error = registry
+                .load(id, &identity)
+                .err()
+                .expect("identity field must be rejected")
+                .to_string();
+            assert!(error.contains("identity"), "{id}: {error}");
+
+            let mut text_encoder = base_spec.clone();
+            text_encoder.text_encoder = Some(candle_gen::gen_core::WeightsSource::File(
+                tmp.path().join("external-te.safetensors"),
+            ));
+            let error = registry
+                .load(id, &text_encoder)
+                .err()
+                .expect("text_encoder field must be rejected")
+                .to_string();
+            assert!(error.contains("mutually exclusive"), "{id}: {error}");
+        }
+    }
+
     #[test]
     fn explicit_catalog_has_stable_surface() {
         let registry = super::provider_registry().unwrap();
@@ -2671,7 +2732,10 @@ mod tests {
 
     #[test]
     fn load_raw_requires_a_base_snapshot_for_single_file() {
-        let file = LoadSpec::new(WeightsSource::File("/tmp/x.safetensors".into()));
+        let tmp = tempfile::tempdir().unwrap();
+        let native = tmp.path().join("raw.safetensors");
+        std::fs::write(&native, b"pinned source fixture").unwrap();
+        let file = LoadSpec::new(WeightsSource::File(native));
         assert!(load_raw(&file).is_err());
         let imported =
             file.with_component(BASE_SNAPSHOT_COMPONENT, WeightsSource::Dir("/snap".into()));
@@ -2789,7 +2853,10 @@ mod tests {
     #[test]
     fn load_accepts_lora_and_complete_single_file_specs() {
         use candle_gen::gen_core::{AdapterKind, AdapterSpec};
-        let file = LoadSpec::new(WeightsSource::File("/tmp/q.safetensors".into()));
+        let tmp = tempfile::tempdir().unwrap();
+        let native = tmp.path().join("turbo.safetensors");
+        std::fs::write(&native, b"pinned source fixture").unwrap();
+        let file = LoadSpec::new(WeightsSource::File(native));
         assert!(load(&file).is_err());
         let imported =
             file.with_component(BASE_SNAPSHOT_COMPONENT, WeightsSource::Dir("/snap".into()));
@@ -2807,6 +2874,31 @@ mod tests {
             load(&quant).is_ok(),
             "Q4/Q8 quant is accepted + lazy (sc-9607)"
         );
+    }
+
+    #[test]
+    fn imported_source_is_pinned_before_resident_or_sequential_materialization() {
+        for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
+            let tmp = tempfile::tempdir().unwrap();
+            let native = tmp.path().join("krea.safetensors");
+            std::fs::write(&native, b"construction-time bytes").unwrap();
+            let spec = LoadSpec::new(WeightsSource::File(native.clone()))
+                .with_component(
+                    BASE_SNAPSHOT_COMPONENT,
+                    WeightsSource::Dir(tmp.path().join("base")),
+                )
+                .with_offload_policy(policy);
+            let (_, pinned) = resolved_base_and_native(&spec, KREA_2_RAW_ID).unwrap();
+            let pinned = pinned.expect("File source must carry a construction-time pin");
+            assert_eq!(pinned.loader_path(), std::path::absolute(&native).unwrap());
+
+            std::fs::write(&native, b"replacement after construction").unwrap();
+            let error = pinned
+                .ensure_unchanged()
+                .expect_err("later materialization must reject the replacement")
+                .to_string();
+            assert!(error.contains("changed after load"), "{policy:?}: {error}");
+        }
     }
 
     // sc-9300: the ConvRot consume path is reachable through the LoadSpec API. The selector routes a
@@ -2926,7 +3018,10 @@ mod tests {
     #[test]
     fn load_edit_accepts_complete_single_file_dir_and_lora() {
         use candle_gen::gen_core::{AdapterKind, AdapterSpec};
-        let file = LoadSpec::new(WeightsSource::File("/tmp/x.safetensors".into()));
+        let tmp = tempfile::tempdir().unwrap();
+        let native = tmp.path().join("edit.safetensors");
+        std::fs::write(&native, b"pinned source fixture").unwrap();
+        let file = LoadSpec::new(WeightsSource::File(native));
         assert!(load_edit(&file).is_err());
         let imported =
             file.with_component(BASE_SNAPSHOT_COMPONENT, WeightsSource::Dir("/snap".into()));

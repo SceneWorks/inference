@@ -45,6 +45,11 @@ pub fn memory_strategy_contract(
     spec: &LoadSpec,
 ) -> CoreResult<MemoryProviderContract> {
     if matches!(spec.weights, mlx_gen::WeightsSource::File(_)) {
+        if spec.identity.is_some() || spec.text_encoder.is_some() {
+            return Err(CoreError::Unsupported(format!(
+                "{provider_id}: imported pose control does not accept identity or external text-encoder fields"
+            )));
+        }
         let base = mlx_gen::require_base_snapshot(spec, provider_id)?;
         let streamable = matches!(spec.offload_policy, mlx_gen::OffloadPolicy::Sequential)
             && matches!(
@@ -808,5 +813,44 @@ mod tests {
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
         assert!(memory_strategy_contract("krea_2_turbo_control", &spec).is_err());
         assert!(weights_free_memory_strategy_contract("krea_2_turbo_control", &spec).is_ok());
+    }
+
+    #[test]
+    fn imported_pose_overlay_inventory_rejects_missing_empty_and_corrupt_files() {
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
+        write_snapshot(&root);
+        let dit = root.join("imported.safetensors");
+        write_control(&dit);
+        let overlay = root.join("control.safetensors");
+        let spec = LoadSpec::new(WeightsSource::File(dit))
+            .with_component(
+                mlx_gen::BASE_SNAPSHOT_COMPONENT,
+                WeightsSource::Dir(root.clone()),
+            )
+            .with_control(WeightsSource::File(overlay.clone()));
+
+        for (case, replacement) in [
+            ("empty", Some(Vec::new())),
+            ("corrupt", Some(b"corrupt".to_vec())),
+            ("missing", None),
+        ] {
+            match replacement {
+                Some(bytes) => std::fs::write(&overlay, bytes).unwrap(),
+                None => {
+                    if overlay.exists() {
+                        std::fs::remove_file(&overlay).unwrap();
+                    }
+                }
+            }
+            let error = memory_strategy_contract("krea_2_turbo_control", &spec)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("pose control") || error.contains("safetensors"),
+                "{case}: {error}"
+            );
+            write_control(&overlay);
+        }
     }
 }

@@ -64,6 +64,9 @@ pub struct KreaTurboControl {
     memory_strategy: gen_core::MemoryProviderContract,
     loaded_precision: Precision,
     loaded_quant: Option<Quant>,
+    /// Constructor-time pins retained for every deferred imported base/control reopen.
+    _native_dit: Option<mlx_gen::PinnedWeightsFile>,
+    _native_control: Option<mlx_gen::PinnedWeightsFile>,
     /// Component-residency strategy (epic 10834 Phase 1, sc-11101; hoisted to the shared seam in
     /// sc-11125), selected from [`LoadSpec::offload_policy`]. `Resident` (default) holds the text phase +
     /// DiT + VAE + branch warm; `Sequential` holds only the per-phase loader closures and re-loads per
@@ -220,6 +223,8 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         )?,
         loaded_precision: spec.precision,
         loaded_quant,
+        _native_dit: None,
+        _native_control: None,
         residency: build_control_residency(spec)?,
     }))
 }
@@ -289,33 +294,62 @@ fn build_native_krea_control_from_spec(spec: &LoadSpec) -> Result<KreaTurboContr
             "{KREA_2_TURBO_CONTROL_ID}: imported control assembly requires a single-file DiT"
         )));
     };
+    let native_dit = mlx_gen::PinnedWeightsFile::pin(dit_file)?;
     let base = require_base_snapshot(spec, KREA_2_TURBO_CONTROL_ID)?.to_path_buf();
+    let pinned_control =
+        match require_control(spec, KREA_2_TURBO_CONTROL_ID, "Krea 2 pose control overlay")? {
+            WeightsSource::File(path) => Some(mlx_gen::PinnedWeightsFile::pin(path)?),
+            WeightsSource::Dir(_) => None,
+        };
+    let mut pinned_spec = spec.clone();
+    pinned_spec.weights = WeightsSource::File(native_dit.loader_path().to_path_buf());
+    if let Some(control) = &pinned_control {
+        pinned_spec.control = Some(WeightsSource::File(control.loader_path().to_path_buf()));
+    }
     let streamable = matches!(spec.offload_policy, mlx_gen::OffloadPolicy::Sequential)
         && matches!(
             spec.load_shape,
             mlx_gen::gen_core::LoadShape::DeferredMaterialization
         )
         && !crate::model::adapters_have_diff_patch(&spec.adapters);
-    let memory_strategy = crate::memory_strategy::native_memory_strategy_contract_from_spec(
-        KREA_2_TURBO_CONTROL_ID,
-        spec,
-        &base,
-        streamable,
-    )?;
+    let build_memory_contract = || {
+        crate::memory_strategy::native_memory_strategy_contract_from_spec(
+            KREA_2_TURBO_CONTROL_ID,
+            &pinned_spec,
+            &base,
+            streamable,
+        )
+        .map_err(Error::from)
+    };
+    let memory_strategy = native_dit.read_unchanged(|_| match &pinned_control {
+        Some(control) => control.read_unchanged(|_| build_memory_contract()),
+        None => build_memory_contract(),
+    })?;
     let text_base = base.clone();
     let heavy_base = base;
     let heavy_spec = spec.clone();
-    let heavy_dit = dit_file.clone();
+    let heavy_dit = native_dit.clone();
+    let heavy_control = pinned_control.clone();
     let residency = Residency::from_policy(
         spec.offload_policy,
         move || KreaText::from_snapshot(&text_base),
-        move |_use_pid| load_native_control_heavy(&heavy_spec, &heavy_base, &heavy_dit, streamable),
+        move |_use_pid| {
+            load_native_control_heavy(
+                &heavy_spec,
+                &heavy_base,
+                &heavy_dit,
+                heavy_control.as_ref(),
+                streamable,
+            )
+        },
     )?;
     Ok(KreaTurboControl {
         descriptor: descriptor(),
         memory_strategy,
         loaded_precision: spec.precision,
         loaded_quant: None,
+        _native_dit: Some(native_dit),
+        _native_control: pinned_control,
         residency,
     })
 }
@@ -323,19 +357,26 @@ fn build_native_krea_control_from_spec(spec: &LoadSpec) -> Result<KreaTurboContr
 fn load_native_control_heavy(
     spec: &LoadSpec,
     base: &Path,
-    dit_file: &Path,
+    dit_file: &mlx_gen::PinnedWeightsFile,
+    pinned_control: Option<&mlx_gen::PinnedWeightsFile>,
     streamable: bool,
 ) -> Result<ControlHeavyOwned> {
     let cfg = Krea2Config::from_snapshot(base)?;
-    let dit =
-        crate::loader::load_transformer_from_native_file_with_stream(dit_file, &cfg, streamable)?;
+    let dit = crate::loader::load_transformer_from_pinned_native_file_with_stream(
+        dit_file, &cfg, streamable,
+    )?;
     let vae = crate::vae::load_vae(base)?;
     let mut heavy = KreaHeavy::from_parts(dit, vae);
     if !spec.adapters.is_empty() {
         heavy.apply_adapters(&spec.adapters)?;
     }
     let control = require_control(spec, KREA_2_TURBO_CONTROL_ID, "Krea 2 pose control overlay")?;
-    let branch = Krea2ControlBranch::from_source(control, &cfg)?;
+    let branch = match pinned_control {
+        Some(pinned) => pinned.read_unchanged(|path| {
+            Krea2ControlBranch::from_source(&WeightsSource::File(path.to_path_buf()), &cfg)
+        })?,
+        None => Krea2ControlBranch::from_source(control, &cfg)?,
+    };
     Ok(ControlHeavyOwned {
         heavy,
         branch,
@@ -369,9 +410,14 @@ fn validate_control_spec(spec: &LoadSpec) -> Result<()> {
                 "{KREA_2_TURBO_CONTROL_ID}: imported DiT carries its numeric format; quantize is unsupported"
             )));
         }
-        if spec.ip_adapter.is_some() || !spec.extra_controls.is_empty() || spec.pid.is_some() {
+        if spec.ip_adapter.is_some()
+            || !spec.extra_controls.is_empty()
+            || spec.pid.is_some()
+            || spec.identity.is_some()
+            || spec.text_encoder.is_some()
+        {
             return Err(Error::Unsupported(format!(
-                "{KREA_2_TURBO_CONTROL_ID}: imported pose control does not accept IP-adapter, extra-control, or PiD overlays"
+                "{KREA_2_TURBO_CONTROL_ID}: imported pose control does not accept IP-adapter, extra-control, PiD, identity, or external text-encoder fields"
             )));
         }
     }
@@ -713,6 +759,50 @@ pub const MEMORY_BEHAVIOR_REGISTRATION: mlx_gen::gen_core::MemoryBehaviorRegistr
 mod tests {
     use super::*;
     use mlx_gen::{Conditioning, ControlKind, Modality, OffloadPolicy, Quant, WeightsSource};
+
+    fn write_minimal_safetensors(path: &Path) {
+        let mut header = br#"{"probe":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#.to_vec();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.extend([0_u8; 2]);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn sequential_native_control_retains_both_constructor_pins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("base");
+        for component in ["text_encoder", "vae"] {
+            let dir = base.join(component);
+            std::fs::create_dir_all(&dir).unwrap();
+            write_minimal_safetensors(&dir.join("model.safetensors"));
+        }
+        let dit = tmp.path().join("dit.safetensors");
+        let control = tmp.path().join("control.safetensors");
+        write_minimal_safetensors(&dit);
+        write_minimal_safetensors(&control);
+        let spec = LoadSpec::new(WeightsSource::File(dit.clone()))
+            .with_component(BASE_SNAPSHOT_COMPONENT, WeightsSource::Dir(base))
+            .with_control(WeightsSource::File(control.clone()))
+            .with_offload_policy(OffloadPolicy::Sequential)
+            .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization);
+        let model = build_native_krea_control_from_spec(&spec).unwrap();
+        let dit_pin = model._native_dit.expect("native DiT pin");
+        let control_pin = model._native_control.expect("native control pin");
+
+        std::fs::write(&dit, b"replacement dit").unwrap();
+        std::fs::write(&control, b"replacement control").unwrap();
+        for (name, pin) in [("DiT", dit_pin), ("control", control_pin)] {
+            let error = pin
+                .ensure_unchanged()
+                .expect_err("later materialization must reject replacement")
+                .to_string();
+            assert!(error.contains("changed after load"), "{name}: {error}");
+        }
+    }
 
     #[test]
     fn decode_tiling_follows_only_the_selected_generation_memory() {

@@ -150,6 +150,29 @@ impl PinnedWeightsFile {
         }
         Ok(())
     }
+
+    /// Run one source read against the retained loader path, validating the pin both immediately
+    /// before the path is opened and immediately after the read completes.
+    ///
+    /// The second check closes the validation-to-open/use race that a lone
+    /// [`ensure_unchanged`](Self::ensure_unchanged) leaves: replacing a selected checkpoint while a
+    /// provider is parsing/remapping it cannot silently produce a generator whose provenance still
+    /// names the earlier file. Callers should keep this same pin for every lazy or sequential reopen.
+    ///
+    /// The post-read check runs even when `read` returns an error. If both the read and the pin fail,
+    /// the mutation error wins because it is the stronger source-identity diagnosis.
+    pub fn read_unchanged<T, E>(
+        &self,
+        read: impl FnOnce(&Path) -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E>
+    where
+        E: From<crate::Error>,
+    {
+        self.ensure_unchanged().map_err(E::from)?;
+        let result = read(&self.loader_path);
+        self.ensure_unchanged().map_err(E::from)?;
+        result
+    }
 }
 
 /// Quantization tier a load may request. [`Q4`](Self::Q4)/[`Q8`](Self::Q8) are the group-wise
@@ -735,7 +758,7 @@ pub enum LoadPhase {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::sync::{Barrier, Mutex};
 
     #[test]
     fn pinned_weights_file_detects_target_mutation() {
@@ -752,6 +775,36 @@ mod tests {
             .ensure_unchanged()
             .expect_err("mutation must invalidate the pin")
             .to_string();
+        assert!(error.contains("changed after load"), "got: {error}");
+    }
+
+    #[test]
+    fn pinned_weights_file_rejects_a_barrier_controlled_mid_read_replacement() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = dir.path().join("model.safetensors");
+        std::fs::write(&file, b"original").expect("write fixture");
+        let pinned = PinnedWeightsFile::pin(&file).expect("pin regular file");
+        let entered_read = Arc::new(Barrier::new(2));
+        let replacement_done = Arc::new(Barrier::new(2));
+
+        let writer_file = file.clone();
+        let writer_entered = Arc::clone(&entered_read);
+        let writer_done = Arc::clone(&replacement_done);
+        let writer = std::thread::spawn(move || {
+            writer_entered.wait();
+            std::fs::write(writer_file, b"replacement bytes").expect("replace during read");
+            writer_done.wait();
+        });
+
+        let error = pinned
+            .read_unchanged::<_, crate::Error>(|path| {
+                entered_read.wait();
+                replacement_done.wait();
+                std::fs::read(path).map_err(Into::into)
+            })
+            .expect_err("a replacement between the two checks must fail")
+            .to_string();
+        writer.join().expect("writer thread");
         assert!(error.contains("changed after load"), "got: {error}");
     }
 

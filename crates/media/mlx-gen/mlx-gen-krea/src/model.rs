@@ -222,6 +222,9 @@ pub struct Krea {
     precision: Precision,
     quant: Option<Quant>,
     streamable_transformer: bool,
+    /// The constructor-time pin for an imported File route. Sequential/lazy loader closures retain a
+    /// clone of this same identity; keeping it on the generator makes that lifetime explicit.
+    _native_dit: Option<mlx_gen::PinnedWeightsFile>,
     /// Component-residency strategy (epic 10834 Phase 1, sc-11101; hoisted to the shared seam in
     /// sc-11125), selected from [`LoadSpec::offload_policy`]. `Resident` (default) holds the Qwen3-VL-4B
     /// text phase + DiT + VAE warm for the whole job and across jobs; `Sequential` holds only the
@@ -381,7 +384,7 @@ pub(crate) fn build_native_krea(
             WeightsSource::Dir(base_snapshot_dir.to_path_buf()),
         )
         .with_adapters(adapters.to_vec());
-    build_native_krea_from_spec(&spec, dit_file, descriptor)
+    build_native_krea_from_spec(&spec, descriptor)
 }
 
 /// Shared loader behind [`load`] / [`load_raw`] / [`load_edit`]: build the residency from a snapshot
@@ -391,10 +394,8 @@ pub(crate) fn build_native_krea(
 /// ([`load_krea_text`] / [`load_krea_heavy`]), so the components are byte-identical. `descriptor`
 /// selects the variant (Turbo vs Raw vs edit) the returned [`Krea`] renders.
 fn load_variant(spec: &LoadSpec, descriptor: ModelDescriptor) -> Result<Box<dyn Generator>> {
-    if let WeightsSource::File(dit_file) = &spec.weights {
-        return Ok(Box::new(build_native_krea_from_spec(
-            spec, dit_file, descriptor,
-        )?));
+    if matches!(spec.weights, WeightsSource::File(_)) {
+        return Ok(Box::new(build_native_krea_from_spec(spec, descriptor)?));
     }
     let (memory_strategy, load_plan) =
         crate::block_memory_strategy::memory_strategy_contract_with_plan(descriptor.id, spec)?;
@@ -405,17 +406,14 @@ fn load_variant(spec: &LoadSpec, descriptor: ModelDescriptor) -> Result<Box<dyn 
         precision: spec.precision,
         quant: load_plan.effective_quant,
         streamable_transformer: load_plan.streamable_transformer,
+        _native_dit: None,
         residency,
         adapters: spec.adapters.clone(),
         has_diff_patch: adapters_have_diff_patch(&spec.adapters),
     }))
 }
 
-fn build_native_krea_from_spec(
-    spec: &LoadSpec,
-    dit_file: &Path,
-    descriptor: ModelDescriptor,
-) -> Result<Krea> {
+fn build_native_krea_from_spec(spec: &LoadSpec, descriptor: ModelDescriptor) -> Result<Krea> {
     mlx_gen::gen_core::reject_unknown_components(spec, &[BASE_SNAPSHOT_COMPONENT], descriptor.id)?;
     if spec.precision != Precision::Bf16 {
         return Err(Error::Msg(format!(
@@ -436,19 +434,34 @@ fn build_native_krea_from_spec(
             descriptor.id
         )));
     }
+    if spec.identity.is_some() || spec.text_encoder.is_some() {
+        return Err(Error::Unsupported(format!(
+            "{}: imported single-file weights do not accept identity or external text-encoder fields",
+            descriptor.id
+        )));
+    }
     let base = mlx_gen::gen_core::require_base_snapshot(spec, descriptor.id)?;
+    let WeightsSource::File(dit_file) = &spec.weights else {
+        unreachable!("native builder is called only for File weights")
+    };
+    let native_dit = mlx_gen::PinnedWeightsFile::pin(dit_file)?;
+    let mut pinned_spec = spec.clone();
+    pinned_spec.weights = WeightsSource::File(native_dit.loader_path().to_path_buf());
     let streamable = matches!(spec.offload_policy, mlx_gen::OffloadPolicy::Sequential)
         && matches!(spec.load_shape, mlx_gen::LoadShape::DeferredMaterialization)
         && !adapters_have_diff_patch(&spec.adapters);
-    let memory_strategy = crate::block_memory_strategy::native_memory_strategy_contract_from_spec(
-        descriptor.id,
-        spec,
-        base,
-        streamable,
-    )?;
+    let memory_strategy = native_dit.read_unchanged(|_| {
+        crate::block_memory_strategy::native_memory_strategy_contract_from_spec(
+            descriptor.id,
+            &pinned_spec,
+            base,
+            streamable,
+        )
+        .map_err(Error::from)
+    })?;
     let text_base = base.to_path_buf();
     let heavy_base = base.to_path_buf();
-    let heavy_dit = dit_file.to_path_buf();
+    let heavy_dit = native_dit.clone();
     let heavy_spec = spec.clone();
     let residency = Residency::from_policy(
         spec.offload_policy,
@@ -463,6 +476,7 @@ fn build_native_krea_from_spec(
         precision: spec.precision,
         quant: None,
         streamable_transformer: streamable,
+        _native_dit: Some(native_dit),
         residency,
         adapters: spec.adapters.clone(),
         has_diff_patch: adapters_have_diff_patch(&spec.adapters),
@@ -472,13 +486,14 @@ fn build_native_krea_from_spec(
 fn load_native_krea_heavy(
     spec: &LoadSpec,
     base: &Path,
-    dit_file: &Path,
+    dit_file: &mlx_gen::PinnedWeightsFile,
     streamable: bool,
     load_pid: bool,
 ) -> Result<KreaHeavyOwned> {
     let cfg = crate::config::Krea2Config::from_snapshot(base)?;
-    let dit =
-        crate::loader::load_transformer_from_native_file_with_stream(dit_file, &cfg, streamable)?;
+    let dit = crate::loader::load_transformer_from_pinned_native_file_with_stream(
+        dit_file, &cfg, streamable,
+    )?;
     let vae = crate::vae::load_vae(base)?;
     let mut heavy = KreaHeavy::from_parts(dit, vae);
     if !spec.adapters.is_empty() {
@@ -1404,12 +1419,22 @@ fn edit_references(req: &GenerationRequest) -> Result<Vec<&Image>> {
 pub(crate) fn component_footprint(
     spec: &mlx_gen::LoadSpec,
 ) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
-    mlx_gen::PerComponentBytes::from_spec_subdirs(
-        spec,
-        &["text_encoder"],
-        &["transformer"],
-        &["vae"],
-    )
+    match &spec.weights {
+        WeightsSource::Dir(_) => mlx_gen::PerComponentBytes::from_spec_subdirs(
+            spec,
+            &["text_encoder"],
+            &["transformer"],
+            &["vae"],
+        ),
+        WeightsSource::File(dit) => {
+            let base = mlx_gen::require_base_snapshot(spec, "krea_2 imported provider")?;
+            Ok(mlx_gen::PerComponentBytes {
+                text_encoder: mlx_gen::safetensors_path_bytes(base.join("text_encoder")),
+                dit: mlx_gen::safetensors_path_bytes(dit),
+                vae: mlx_gen::safetensors_path_bytes(base.join("vae")),
+            })
+        }
+    }
 }
 
 mlx_gen::register_generators! {
@@ -1500,6 +1525,29 @@ mod tests {
         LoadSpec::new(WeightsSource::File(dit))
             .with_component(BASE_SNAPSHOT_COMPONENT, WeightsSource::Dir(base))
             .with_offload_policy(mlx_gen::OffloadPolicy::Sequential)
+    }
+
+    #[test]
+    fn sequential_native_generator_retains_the_constructor_pin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut spec = complete_native_file_spec(&tmp);
+        spec.load_shape = mlx_gen::LoadShape::DeferredMaterialization;
+        let native = match &spec.weights {
+            WeightsSource::File(path) => path.clone(),
+            WeightsSource::Dir(_) => unreachable!(),
+        };
+        let model = build_native_krea_from_spec(&spec, descriptor()).unwrap();
+        let pin = model
+            ._native_dit
+            .expect("native generator must retain its pin");
+        assert_eq!(pin.loader_path(), std::path::absolute(&native).unwrap());
+
+        std::fs::write(&native, b"replacement after construction").unwrap();
+        let error = pin
+            .ensure_unchanged()
+            .expect_err("sequential reopen must reject a replacement")
+            .to_string();
+        assert!(error.contains("changed after load"), "{error}");
     }
 
     fn req(w: u32, h: u32) -> GenerationRequest {

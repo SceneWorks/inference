@@ -1082,7 +1082,25 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("temp dir");
         let checkpoint = dir.path().join("z-image.safetensors");
-        std::fs::write(&checkpoint, b"not safetensors").expect("write pinned fixture");
+        let mut header = serde_json::to_vec(&serde_json::json!({
+            "model.diffusion_model.block.weight": {
+                "dtype": "U8", "shape": [1], "data_offsets": [0, 1]
+            },
+            "text_encoder.layer.weight": {
+                "dtype": "U8", "shape": [1], "data_offsets": [1, 2]
+            },
+            "first_stage_model.decoder.weight": {
+                "dtype": "U8", "shape": [1], "data_offsets": [2, 3]
+            }
+        }))
+        .expect("serialize safetensors header");
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut fixture = (header.len() as u64).to_le_bytes().to_vec();
+        fixture.extend(header);
+        fixture.extend([0_u8; 3]);
+        std::fs::write(&checkpoint, fixture).expect("write pinned fixture");
         let complete = LoadSpec::new(WeightsSource::File(checkpoint)).with_component(
             BASE_SNAPSHOT_COMPONENT,
             WeightsSource::Dir("/tokenizer".into()),

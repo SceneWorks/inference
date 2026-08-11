@@ -513,24 +513,22 @@ impl Pipeline {
                             .into(),
                     ));
                 }
-                dit_file.ensure_unchanged()?;
-                let dit_map = candle_gen::candle_core::safetensors::load(
-                    dit_file.loader_path(),
-                    &Device::Cpu,
-                )
-                .map_err(|error| {
-                    CandleError::Msg(format!(
-                        "qwen-image comfyui: load DiT {}: {error}",
-                        dit_file.loader_path().display()
-                    ))
-                })?;
-                let dit_map = comfyui::remap_and_cast_comfyui_dit(dit_map, DIT_DTYPE)?;
-                let dit_vb = VarBuilder::from_tensors(dit_map, DIT_DTYPE, &self.device);
-                Ok(QwenTransformer::new_gs(
-                    &self.dit_cfg,
-                    dit_vb,
-                    candle_gen::quant::MLX_GROUP_SIZE,
-                )?)
+                dit_file.read_unchanged(|path| {
+                    let dit_map = candle_gen::candle_core::safetensors::load(path, &Device::Cpu)
+                        .map_err(|error| {
+                            CandleError::Msg(format!(
+                                "qwen-image comfyui: load DiT {}: {error}",
+                                path.display()
+                            ))
+                        })?;
+                    let dit_map = comfyui::remap_and_cast_comfyui_dit(dit_map, DIT_DTYPE)?;
+                    let dit_vb = VarBuilder::from_tensors(dit_map, DIT_DTYPE, &self.device);
+                    Ok(QwenTransformer::new_gs(
+                        &self.dit_cfg,
+                        dit_vb,
+                        candle_gen::quant::MLX_GROUP_SIZE,
+                    )?)
+                })
             }
             None => {
                 let dit_dir = self.root.join("transformer");
@@ -583,22 +581,18 @@ impl Pipeline {
     /// co-resident with the DiT through decode (splitting them further buys ~nothing).
     fn load_vae_seq(&self) -> CResult<QwenVae> {
         match &self.comfyui_vae {
-            Some(vae_file) => {
-                vae_file.ensure_unchanged()?;
-                let vae_map = candle_gen::candle_core::safetensors::load(
-                    vae_file.loader_path(),
-                    &Device::Cpu,
-                )
-                .map_err(|error| {
-                    CandleError::Msg(format!(
-                        "qwen-image comfyui: load VAE {}: {error}",
-                        vae_file.loader_path().display()
-                    ))
-                })?;
+            Some(vae_file) => vae_file.read_unchanged(|path| {
+                let vae_map = candle_gen::candle_core::safetensors::load(path, &Device::Cpu)
+                    .map_err(|error| {
+                        CandleError::Msg(format!(
+                            "qwen-image comfyui: load VAE {}: {error}",
+                            path.display()
+                        ))
+                    })?;
                 let vae_map = comfyui::remap_vae_wan_to_diffusers(vae_map)?;
                 let vae_vb = VarBuilder::from_tensors(vae_map, ENC_DTYPE, &self.device);
                 Ok(QwenVae::new(vae_vb)?)
-            }
+            }),
             None => Ok(QwenVae::new(self.component_vb("vae", ENC_DTYPE)?)?),
         }
     }

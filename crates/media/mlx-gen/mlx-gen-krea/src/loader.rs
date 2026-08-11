@@ -261,17 +261,27 @@ pub(crate) fn load_transformer_from_native_file_with_stream(
     cfg: &Krea2Config,
     streamable: bool,
 ) -> Result<Krea2Transformer> {
-    // Pin before the validation read and verify immediately after it. A concurrent replacement can
-    // therefore neither smuggle a different file past validation nor become the later window source.
     let pinned = mlx_gen::PinnedWeightsFile::pin(dit_file.as_ref())?;
-    let remapped = normalized_native_weights(pinned.loader_path())?;
-    crate::convert::validate_transformer(&remapped, cfg)?;
-    let transformer = Krea2Transformer::from_weights(&remapped, cfg)?;
-    pinned.ensure_unchanged()?;
-    Ok(if streamable {
-        transformer.with_native_block_stream(pinned)
-    } else {
-        transformer
+    load_transformer_from_pinned_native_file_with_stream(&pinned, cfg, streamable)
+}
+
+/// Native-file loader over a caller-owned pin. Lazy/sequential generators create this pin once and
+/// reuse it for every materialization, so a path replacement can never become the new base between
+/// requests. Validation, model assembly, and the optional block stream are all tied to that pin.
+pub(crate) fn load_transformer_from_pinned_native_file_with_stream(
+    pinned: &mlx_gen::PinnedWeightsFile,
+    cfg: &Krea2Config,
+    streamable: bool,
+) -> Result<Krea2Transformer> {
+    pinned.read_unchanged(|path| {
+        let remapped = normalized_native_weights(path)?;
+        crate::convert::validate_transformer(&remapped, cfg)?;
+        let transformer = Krea2Transformer::from_weights(&remapped, cfg)?;
+        Ok(if streamable {
+            transformer.with_native_block_stream(pinned.clone())
+        } else {
+            transformer
+        })
     })
 }
 

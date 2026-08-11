@@ -133,6 +133,11 @@ pub fn provider_contract_for(
     spec: &LoadSpec,
 ) -> gen_core::Result<MemoryProviderContract> {
     let profile = profile(provider_id)?;
+    if provider_id == FLUX2_KLEIN_9B_ID && matches!(spec.weights, WeightsSource::File(_)) {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{provider_id} does not support imported single-file weights; only flux2_dev does"
+        )));
+    }
     let streamable = streamable(spec);
     let components = match &spec.weights {
         WeightsSource::Dir(_) => PerComponentBytes::from_spec_subdirs(
@@ -951,6 +956,22 @@ mod tests {
             LoadSpec::new(WeightsSource::Dir(PathBuf::from("/flux2-dev"))).with_quant(Quant::Q4);
         spec.load_shape = LoadShape::DeferredMaterialization;
         spec
+    }
+
+    #[test]
+    fn klein_load_and_memory_contract_reject_the_same_file_source() {
+        let spec = LoadSpec::new(WeightsSource::File("/tmp/klein.safetensors".into()))
+            .with_component(
+                gen_core::BASE_SNAPSHOT_COMPONENT,
+                WeightsSource::Dir("/tmp/klein-base".into()),
+            );
+        let load_error = crate::load_klein(&spec)
+            .err()
+            .expect("Klein loader must reject File")
+            .to_string();
+        let contract_error = klein_provider_contract(&spec).unwrap_err().to_string();
+        assert_eq!(contract_error, load_error);
+        assert!(contract_error.contains("only flux2_dev"));
     }
 
     fn capability(

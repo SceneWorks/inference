@@ -492,31 +492,28 @@ impl Pipeline {
     ///   the GPU (`quantize`); the dense f32 32B never lands on the GPU (it would not fit).
     /// - **no quant** (small fixtures only): build dense on-device.
     fn load_comfyui_dit(&self, dit_file: &PinnedWeightsFile) -> CResult<Flux2Transformer> {
-        dit_file.ensure_unchanged().map_err(|error| {
-            CandleError::Msg(format!(
-                "flux2 comfyui: transformer source changed: {error}"
-            ))
-        })?;
-        let dit_path = dit_file.loader_path();
-        // SAFETY: read-only mmap of a weight file; the standard candle loading path.
-        let mmap =
-            unsafe { candle_gen::candle_core::safetensors::MmapedSafetensors::new(dit_path) }
-                .map_err(|e| {
+        dit_file.read_unchanged(|dit_path| {
+            // SAFETY: read-only mmap of the pinned weight file; every tensor is remapped/materialized
+            // before the post-read fingerprint check runs.
+            let mmap =
+                unsafe { candle_gen::candle_core::safetensors::MmapedSafetensors::new(dit_path) }
+                    .map_err(|e| {
                     CandleError::Msg(format!("flux2 comfyui: mmap {}: {e}", dit_path.display()))
                 })?;
-        let map = convert::build_comfyui_dit_map(&mmap, self.dtype)?;
-        match self.quant {
-            Some(q) => {
-                let vb = VarBuilder::from_tensors(map, self.dtype, &Device::Cpu);
-                let mut dit = Flux2Transformer::new(&self.cfg, vb)?;
-                dit.quantize(q, &self.device)?;
-                Ok(dit)
+            let map = convert::build_comfyui_dit_map(&mmap, self.dtype)?;
+            match self.quant {
+                Some(q) => {
+                    let vb = VarBuilder::from_tensors(map, self.dtype, &Device::Cpu);
+                    let mut dit = Flux2Transformer::new(&self.cfg, vb)?;
+                    dit.quantize(q, &self.device)?;
+                    Ok(dit)
+                }
+                None => {
+                    let vb = VarBuilder::from_tensors(map, self.dtype, &self.device);
+                    Ok(Flux2Transformer::new(&self.cfg, vb)?)
+                }
             }
-            None => {
-                let vb = VarBuilder::from_tensors(map, self.dtype, &self.device);
-                Ok(Flux2Transformer::new(&self.cfg, vb)?)
-            }
-        }
+        })
     }
 
     fn load_components(&self) -> CResult<Components> {

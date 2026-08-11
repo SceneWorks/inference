@@ -259,13 +259,27 @@ impl Weights {
     pub fn from_native_file(path: &Path, device: &Device, dtype: DType) -> Result<Self> {
         let pinned_source = candle_gen::gen_core::PinnedWeightsFile::pin(path)
             .map_err(|error| Error::Msg(error.to_string()))?;
+        Self::from_pinned_native_file(&pinned_source, device, dtype)
+    }
+
+    /// Open a native Krea file through a caller-owned pin. Registry-backed lazy/sequential loads keep
+    /// this exact pin from generator construction through every later materialization instead of
+    /// re-pinning whatever happens to occupy the path at request time.
+    pub(crate) fn from_pinned_native_file(
+        pinned_source: &candle_gen::gen_core::PinnedWeightsFile,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Self> {
+        pinned_source
+            .ensure_unchanged()
+            .map_err(|error| Error::Msg(error.to_string()))?;
         // SAFETY: read-only mmap of a weight file; the standard candle loading path.
         let st = unsafe { MmapedSafetensors::new(pinned_source.loader_path())? };
         let native_prefix = detect_native_prefix(&st);
         let plain_int8 = validate_plain_int8_tensorwise(&st)?;
-        Ok(Self {
+        let result = Self {
             st,
-            pinned_source: Some(pinned_source),
+            pinned_source: Some(pinned_source.clone()),
             device: device.clone(),
             dtype,
             overlay: HashMap::new(),
@@ -276,7 +290,11 @@ impl Weights {
             convrot: false,
             plain_int8,
             int8: OnceLock::new(),
-        })
+        };
+        pinned_source
+            .ensure_unchanged()
+            .map_err(|error| Error::Msg(error.to_string()))?;
+        Ok(result)
     }
 
     /// Install a pre-built [`Int8Context`] as this weight set's shared handle (sc-12301).

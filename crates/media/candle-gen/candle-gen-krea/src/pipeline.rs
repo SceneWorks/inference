@@ -616,13 +616,14 @@ pub fn load_components_native(
     native_dit: &Path,
     device: &Device,
 ) -> Result<Components> {
-    load_components_native_with(root, native_dit, device, &[], false)
+    let pinned = gen_core::PinnedWeightsFile::pin(native_dit)?;
+    load_components_native_with(root, &pinned, device, &[], false)
 }
 
 /// Registry-backed native load with the same adapter and block-window surface as a snapshot load.
 pub(crate) fn load_components_native_with(
     root: &Path,
-    native_dit: &Path,
+    native_dit: &gen_core::PinnedWeightsFile,
     device: &Device,
     adapters: &[AdapterSpec],
     stream_blocks: bool,
@@ -634,7 +635,7 @@ pub(crate) fn load_components_native_with(
 
 pub(crate) fn load_components_native_registry(
     root: &Path,
-    native_dit: &Path,
+    native_dit: &gen_core::PinnedWeightsFile,
     device: &Device,
     adapters: &[AdapterSpec],
     pid_spec: Option<&PidWeights>,
@@ -652,7 +653,7 @@ pub(crate) fn load_components_native_registry(
 /// mirroring the MLX S0b scope); those stay a follow-on with the worker wiring (S0c).
 pub(crate) fn load_heavy_native_with(
     root: &Path,
-    native_dit: &Path,
+    native_dit: &gen_core::PinnedWeightsFile,
     device: &Device,
     adapters: &[AdapterSpec],
     stream_blocks: bool,
@@ -669,32 +670,34 @@ pub(crate) fn load_heavy_native_with(
 
 fn load_native_dit(
     root: &Path,
-    native_dit: &Path,
+    native_dit: &gen_core::PinnedWeightsFile,
     device: &Device,
     adapters: &[AdapterSpec],
     stream_blocks: bool,
 ) -> Result<Krea2Transformer> {
-    let cfg = Krea2Config::from_snapshot(root)?;
-    // `from_native_file`: native_keys ON, ConvRot OFF. Dense stores W directly; plain int8 reconstructs
-    // W = codes * row_scale. Neither stores ConvRot's W·R, so neither may rotate.
-    let mut dit_w = Weights::from_native_file(native_dit, device, DIT_DTYPE)?;
-    crate::convert::validate_native_transformer(&dit_w, &cfg)?;
-    let diff = crate::adapters::fold_diff_patch(&mut dit_w, adapters)?;
-    if stream_blocks && !adapters.is_empty() {
-        return Err(CandleError::Msg(
-            "Krea native block streaming does not support load-time adapters".into(),
-        ));
-    }
-    let mut dit = if stream_blocks {
-        Krea2Transformer::load_block_streamed(Arc::new(dit_w), &cfg)?
-    } else {
-        Krea2Transformer::load(&dit_w, &cfg)?
-    };
-    if !adapters.is_empty() {
-        crate::adapters::install_additive(&mut dit, adapters, diff.merged)?;
-    }
+    native_dit.read_unchanged(|_| {
+        let cfg = Krea2Config::from_snapshot(root)?;
+        // Native keys ON, ConvRot OFF. Dense stores W directly; plain int8 reconstructs
+        // W = codes * row_scale. Neither stores ConvRot's W·R, so neither may rotate.
+        let mut dit_w = Weights::from_pinned_native_file(native_dit, device, DIT_DTYPE)?;
+        crate::convert::validate_native_transformer(&dit_w, &cfg)?;
+        let diff = crate::adapters::fold_diff_patch(&mut dit_w, adapters)?;
+        if stream_blocks && !adapters.is_empty() {
+            return Err(CandleError::Msg(
+                "Krea native block streaming does not support load-time adapters".into(),
+            ));
+        }
+        let mut dit = if stream_blocks {
+            Krea2Transformer::load_block_streamed(Arc::new(dit_w), &cfg)?
+        } else {
+            Krea2Transformer::load(&dit_w, &cfg)?
+        };
+        if !adapters.is_empty() {
+            crate::adapters::install_additive(&mut dit, adapters, diff.merged)?;
+        }
 
-    Ok(dit)
+        Ok(dit)
+    })
 }
 
 /// Sequential imported-file heavy phase: native DiT + VAE + img2img/edit encoder, loaded only after
@@ -702,7 +705,7 @@ fn load_native_dit(
 /// source is adapter-free.
 pub(crate) fn load_residency_heavy_native(
     root: &Path,
-    native_dit: &Path,
+    native_dit: &gen_core::PinnedWeightsFile,
     device: &Device,
     adapters: &[AdapterSpec],
     stream_blocks: bool,
@@ -715,7 +718,7 @@ pub(crate) fn load_residency_heavy_native(
 
 pub(crate) fn load_residency_heavy_native_registry(
     root: &Path,
-    native_dit: &Path,
+    native_dit: &gen_core::PinnedWeightsFile,
     device: &Device,
     adapters: &[AdapterSpec],
     pid_spec: Option<&PidWeights>,
@@ -809,7 +812,7 @@ pub fn render(
 /// `root/transformer`.
 pub(crate) fn render_three_stage_with_native(
     root: &Path,
-    native_dit: Option<&Path>,
+    native_dit: Option<&gen_core::PinnedWeightsFile>,
     device: &Device,
     adapters: &[AdapterSpec],
     req: &GenerationRequest,
@@ -1429,19 +1432,56 @@ pub(crate) fn encode_multiphase_contexts(
     Ok((context, neg))
 }
 
-/// Load a **bare, re-adaptable** job-local Krea DiT from the snapshot's `transformer/` — no load-time
-/// adapters, no diff-patch fold, no PiD (the DiT part of [`load_heavy`] only). This is the job-local base
-/// the multi-phase driver re-adapts between phases ([`Krea2Transformer::clear_adapters`] +
+#[derive(Debug, Eq, PartialEq)]
+enum MultiphaseDitSource {
+    SnapshotDir(PathBuf),
+    NativeFile(gen_core::PinnedWeightsFile),
+}
+
+fn multiphase_dit_source(
+    root: &Path,
+    native_dit: Option<&gen_core::PinnedWeightsFile>,
+) -> MultiphaseDitSource {
+    match native_dit {
+        Some(source) => MultiphaseDitSource::NativeFile(source.clone()),
+        None => MultiphaseDitSource::SnapshotDir(root.join("transformer")),
+    }
+}
+
+fn load_dit_base_with<T>(
+    root: &Path,
+    native_dit: Option<&gen_core::PinnedWeightsFile>,
+    load_snapshot: impl FnOnce(&Path) -> Result<T>,
+    load_native: impl FnOnce(&gen_core::PinnedWeightsFile) -> Result<T>,
+) -> Result<T> {
+    match multiphase_dit_source(root, native_dit) {
+        MultiphaseDitSource::SnapshotDir(transformer) => load_snapshot(&transformer),
+        MultiphaseDitSource::NativeFile(source) => load_native(&source),
+    }
+}
+
+/// Load a **bare, re-adaptable** job-local Krea DiT from the same physical source as the registered
+/// provider — either the snapshot's `transformer/` directory or its imported native single-file DiT.
+/// No load-time adapters, diff-patch fold, or PiD state is carried in. This is the job-local base the
+/// multi-phase driver re-adapts between phases ([`Krea2Transformer::clear_adapters`] +
 /// [`crate::adapters::install_additive`] of the phase subset). It is owned by the render call and never
-/// the shared resident, so re-adapting it between phases can never race a concurrent generate — the
-/// concurrency-safety invariant. (Because candle's `Krea2Transformer` is not a cheap `Clone` like MLX's,
-/// this is ONE extra transient DiT per multi-phase job rather than a per-phase refcounted clone; see the
-/// PR notes / follow-up for the base-sharing-clone optimization.)
-fn load_dit_base(root: &Path, device: &Device) -> Result<Krea2Transformer> {
-    let cfg = Krea2Config::from_snapshot(root)?;
-    let dit_w = Weights::from_dir(&root.join("transformer"), device, DIT_DTYPE)?;
-    crate::convert::validate_transformer(&dit_w, &cfg)?;
-    Ok(Krea2Transformer::load(&dit_w, &cfg)?)
+/// the shared resident, so re-adapting it between phases can never race a concurrent generate.
+fn load_dit_base(
+    root: &Path,
+    native_dit: Option<&gen_core::PinnedWeightsFile>,
+    device: &Device,
+) -> Result<Krea2Transformer> {
+    load_dit_base_with(
+        root,
+        native_dit,
+        |transformer| {
+            let cfg = Krea2Config::from_snapshot(root)?;
+            let dit_w = Weights::from_dir(&transformer, device, DIT_DTYPE)?;
+            crate::convert::validate_transformer(&dit_w, &cfg)?;
+            Ok(Krea2Transformer::load(&dit_w, &cfg)?)
+        },
+        |source| load_native_dit(root, source, device, &[], false),
+    )
 }
 
 /// **Multi-phase Raw render** (epic 13879, sc-13887) — drive the resolved per-phase plan over ONE global
@@ -1452,7 +1492,8 @@ fn load_dit_base(root: &Path, device: &Device) -> Result<Krea2Transformer> {
 /// ACTIVE ADAPTERS and GUIDANCE change per phase.
 ///
 /// **Per-phase adapter toggling, concurrency-safe.** A single **job-local** base DiT ([`load_dit_base`])
-/// is re-adapted in place between phases: [`Krea2Transformer::clear_adapters`] drops the prior phase's
+/// from the provider's exact snapshot/imported source is re-adapted in place between phases:
+/// [`Krea2Transformer::clear_adapters`] drops the prior phase's
 /// forward-time residuals, then [`crate::adapters::install_additive`] pushes the current phase's subset
 /// (empty ⇒ bare base). The shared resident DiT is NEVER touched, so this races no concurrent generate —
 /// the candle realization of MLX's per-phase-clone intent (candle's DiT is not a cheap `Clone`, so it
@@ -1469,6 +1510,7 @@ fn load_dit_base(root: &Path, device: &Device) -> Result<Krea2Transformer> {
 pub(crate) fn render_multiphase(
     vae: &QwenVae,
     root: &Path,
+    native_dit: Option<&gen_core::PinnedWeightsFile>,
     device: &Device,
     resolved: &[crate::multiphase::ResolvedPhase],
     all_specs: &[AdapterSpec],
@@ -1486,7 +1528,7 @@ pub(crate) fn render_multiphase(
     // The job-local base DiT the phases re-adapt (never the shared resident) — built ONCE per request and
     // reused across the seed loop. Pre-resolve each phase's adapter spec subset (host-cheap; the adapter
     // files are read at install time inside the loop).
-    let mut dit = load_dit_base(root, device)?;
+    let mut dit = load_dit_base(root, native_dit, device)?;
     let phase_specs: Vec<Vec<AdapterSpec>> = resolved
         .iter()
         .map(|p| crate::multiphase::phase_spec_subset(p, all_specs))
@@ -2213,6 +2255,45 @@ pub(crate) fn to_image(decoded: &Tensor) -> Result<Image> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resident_and_sequential_multiphase_take_the_real_imported_loader_arm() {
+        use std::cell::Cell;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Path::new("/models/krea");
+        let imported = tmp.path().join("fine-tune.safetensors");
+        std::fs::write(&imported, b"source identity fixture").unwrap();
+        let pinned = gen_core::PinnedWeightsFile::pin(&imported).unwrap();
+        assert_eq!(
+            multiphase_dit_source(root, None),
+            MultiphaseDitSource::SnapshotDir(root.join("transformer"))
+        );
+        for residency in ["Resident", "Sequential"] {
+            let snapshot_arm = Cell::new(false);
+            let native_arm = Cell::new(false);
+            let selected = load_dit_base_with(
+                root,
+                Some(&pinned),
+                |_| {
+                    snapshot_arm.set(true);
+                    Ok(PathBuf::new())
+                },
+                |source| {
+                    native_arm.set(true);
+                    Ok(source.loader_path().to_path_buf())
+                },
+            )
+            .unwrap();
+            assert!(!snapshot_arm.get(), "{residency} used the snapshot DiT arm");
+            assert!(native_arm.get(), "{residency} did not use the imported arm");
+            assert_eq!(
+                selected,
+                std::path::absolute(&imported).unwrap(),
+                "{residency}"
+            );
+        }
+    }
 
     #[test]
     fn calibration_faults_are_request_local_and_default_path_is_inert() {

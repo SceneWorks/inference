@@ -101,6 +101,18 @@ pub fn memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> CoreResult<MemoryProviderContract> {
+    if matches!(spec.weights, WeightsSource::File(_)) {
+        if spec.identity.is_some() || spec.text_encoder.is_some() {
+            return Err(CoreError::Unsupported(format!(
+                "{provider_id}: imported single-file weights do not accept identity or external text-encoder fields"
+            )));
+        }
+        let base = mlx_gen::require_base_snapshot(spec, provider_id)?;
+        let streamable = matches!(spec.offload_policy, OffloadPolicy::Sequential)
+            && matches!(spec.load_shape, LoadShape::DeferredMaterialization)
+            && !crate::model::adapters_have_diff_patch(&spec.adapters);
+        return native_memory_strategy_contract_from_spec(provider_id, spec, base, streamable);
+    }
     Ok(memory_strategy_contract_with_plan(provider_id, spec)?.0)
 }
 
@@ -836,6 +848,41 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(corrupt.contains("native DiT asset facts"), "{corrupt}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn imported_base_component_inventory_rejects_missing_empty_and_corrupt_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, _) = fixture(&tmp);
+        let native = root.join("native.safetensors");
+        write_native_i8_safetensors(&native);
+        let spec = LoadSpec::new(WeightsSource::File(native)).with_component(
+            mlx_gen::BASE_SNAPSHOT_COMPONENT,
+            WeightsSource::Dir(root.clone()),
+        );
+
+        for component in ["text_encoder", "vae"] {
+            let file = root.join(component).join("model.safetensors");
+            for (case, replacement) in [
+                ("empty", Some(Vec::new())),
+                ("corrupt", Some(b"corrupt".to_vec())),
+                ("missing", None),
+            ] {
+                match replacement {
+                    Some(bytes) => std::fs::write(&file, bytes).unwrap(),
+                    None => std::fs::remove_file(&file).unwrap(),
+                }
+                let error = memory_strategy_contract("krea_2_turbo", &spec)
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    error.contains(component) || error.contains("safetensors"),
+                    "{component}/{case}: {error}"
+                );
+                write_minimal_safetensors(&file);
+            }
+        }
         std::fs::remove_dir_all(root).ok();
     }
 
