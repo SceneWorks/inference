@@ -63,8 +63,16 @@ fn modulate(m: &Array, e_scale: &Array, e_shift: &Array) -> Result<Array> {
         add(&multiply(m, &add(s, scalar(1.0))?)?, sh)
     };
     if compile_glue() {
+        mlx_gen::diagnostics::record_compile(
+            "wan::transformer::modulate",
+            mlx_gen::diagnostics::CompileDisposition::OneShot,
+        );
         Ok(compile(f, true)((m, e_scale, e_shift))?)
     } else {
+        mlx_gen::diagnostics::record_fallback(
+            "wan::transformer::modulate",
+            "compiled_glue_disabled",
+        );
         Ok(f((m, e_scale, e_shift))?)
     }
 }
@@ -75,8 +83,13 @@ fn gated(x: &Array, y: &Array, gate: &Array) -> Result<Array> {
         add(x, &multiply(y, g)?)
     };
     if compile_glue() {
+        mlx_gen::diagnostics::record_compile(
+            "wan::transformer::gated",
+            mlx_gen::diagnostics::CompileDisposition::OneShot,
+        );
         Ok(compile(f, true)((x, y, gate))?)
     } else {
+        mlx_gen::diagnostics::record_fallback("wan::transformer::gated", "compiled_glue_disabled");
         Ok(f((x, y, gate))?)
     }
 }
@@ -86,6 +99,10 @@ fn gated(x: &Array, y: &Array, gate: &Array) -> Result<Array> {
 /// per-step glue cost — ~600 MB bf16 tensor × 40 layers, sc-2957). Off ⇒ defers to core `gelu_tanh`.
 fn gelu_ffn(x: &Array) -> Result<Array> {
     if !compile_glue() {
+        mlx_gen::diagnostics::record_fallback(
+            "wan::transformer::gelu_ffn",
+            "compiled_glue_disabled",
+        );
         return gelu_tanh(x);
     }
     let f = |x_: &Array| -> std::result::Result<Array, Exception> {
@@ -97,6 +114,10 @@ fn gelu_ffn(x: &Array) -> Result<Array> {
         let gate = add(&tanh(&inner)?, &s(1.0)?)?;
         multiply(&multiply(x_, &s(0.5)?)?, &gate)
     };
+    mlx_gen::diagnostics::record_compile(
+        "wan::transformer::gelu_ffn",
+        mlx_gen::diagnostics::CompileDisposition::OneShot,
+    );
     Ok(compile(f, true)(x)?)
 }
 

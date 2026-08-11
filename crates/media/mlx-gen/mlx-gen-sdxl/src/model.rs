@@ -1038,6 +1038,9 @@ impl Sdxl {
         )?;
         let pid_ref = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
 
+        mlx_gen::diagnostics::record_phase_boundary(
+            mlx_gen::diagnostics::BenchmarkPhaseBoundary::DenoiseStart,
+        );
         let mut images = Vec::with_capacity(req.count as usize);
         for i in 0..req.count {
             // One image per iteration (the vendored `_run_one`, n_images=1), each with its own seed.
@@ -1138,6 +1141,9 @@ impl Sdxl {
                     Some(p) => multiply(&latents, scalar(p.rescale))?,
                     None => latents,
                 };
+                mlx_gen::diagnostics::record_phase_boundary(
+                    mlx_gen::diagnostics::BenchmarkPhaseBoundary::DecodeStart,
+                );
                 on_progress(Progress::Decoding);
                 images.push(crate::pipeline::decode_image_tiled(
                     heavy.vae,
@@ -1288,6 +1294,9 @@ impl Sdxl {
                 )?
             };
 
+            mlx_gen::diagnostics::record_phase_boundary(
+                mlx_gen::diagnostics::BenchmarkPhaseBoundary::DecodeStart,
+            );
             on_progress(Progress::Decoding);
             images.push(crate::pipeline::decode_image_tiled(
                     heavy.vae,

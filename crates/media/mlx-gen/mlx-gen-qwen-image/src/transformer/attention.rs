@@ -223,8 +223,16 @@ fn rope_rotate(xr: &Array, xi: &Array, cos: &Array, sin: &Array) -> Result<(Arra
     };
     let args = [xr.clone(), xi.clone(), cos.clone(), sin.clone()];
     let mut out = if compile_glue() {
+        mlx_gen::diagnostics::record_compile(
+            "qwen_image::attention::rope_rotate",
+            mlx_gen::diagnostics::CompileDisposition::OneShot,
+        );
         compile(f, true)(&args)?
     } else {
+        mlx_gen::diagnostics::record_fallback(
+            "qwen_image::attention::rope_rotate",
+            "compiled_glue_disabled",
+        );
         f(&args)?
     };
     let out_i = out.pop().unwrap();

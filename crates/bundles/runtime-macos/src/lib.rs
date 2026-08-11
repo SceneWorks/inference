@@ -2,12 +2,18 @@
 
 #[cfg(feature = "audio")]
 pub use candle_audio_catalog::audio;
+#[cfg(feature = "perf-bench")]
+pub use mlx_gen_catalog::benchmark_toggle_capabilities;
 #[cfg(feature = "media")]
 pub use mlx_gen_catalog::media;
 pub use mlx_llm as llm;
 pub use runtime_catalog::{
     core_llm, gen_core, memory_strategy, RuntimeCatalog, RuntimeCatalogSnapshot,
 };
+
+/// Stable P6 workload/result schemas and fail-closed validation for the real-weight MLX harness.
+#[cfg(feature = "perf-bench")]
+pub mod perf_bench;
 
 /// The MLX backend crates this platform owns, re-exported from the media catalog
 /// (available under the default `media` feature).

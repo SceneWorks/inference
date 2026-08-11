@@ -67,6 +67,10 @@ impl FeedForward {
 /// `gelu_tanh`, so the eager path is byte-for-byte the previous behaviour.
 fn gelu_ffn(x: &Array) -> Result<Array> {
     if !compile_glue() {
+        mlx_gen::diagnostics::record_fallback(
+            "qwen_image::feed_forward::gelu_ffn",
+            "compiled_glue_disabled",
+        );
         return gelu_tanh(x);
     }
     let f = |x_: &Array| -> std::result::Result<Array, Exception> {
@@ -78,6 +82,10 @@ fn gelu_ffn(x: &Array) -> Result<Array> {
         let gate = add(&tanh(&inner)?, &s(1.0)?)?;
         multiply(&multiply(x_, &s(0.5)?)?, &gate)
     };
+    mlx_gen::diagnostics::record_compile(
+        "qwen_image::feed_forward::gelu_ffn",
+        mlx_gen::diagnostics::CompileDisposition::OneShot,
+    );
     Ok(compile(f, true)(x)?)
 }
 

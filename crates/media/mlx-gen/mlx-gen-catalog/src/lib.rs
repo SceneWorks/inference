@@ -65,6 +65,20 @@ pub const BESPOKE_UTILITY_CRATES: &[&str] = &["depth", "face", "instantid", "pid
 /// crates must enter this list until their normal `Generator` load/generate path works.
 pub const PENDING_REGISTRATION_CRATES: &[&str] = &[];
 
+/// Explicit shared-optimization capability surface for P6's three benchmark providers.
+///
+/// Provider crates own these declarations and add a toggle only after concrete production call
+/// sites exist. The benchmark independently requires a request-local `Applied` receipt, so this
+/// availability preflight cannot fabricate execution.
+pub fn benchmark_toggle_capabilities(provider_id: &str) -> Option<&'static [&'static str]> {
+    match provider_id {
+        mlx_gen_wan::MODEL_ID => Some(mlx_gen_wan::BENCHMARK_TOGGLE_CAPABILITIES),
+        mlx_gen_qwen_image::MODEL_ID => Some(mlx_gen_qwen_image::BENCHMARK_TOGGLE_CAPABILITIES),
+        "sdxl" => Some(mlx_gen_sdxl::BENCHMARK_TOGGLE_CAPABILITIES),
+        _ => None,
+    }
+}
+
 /// Add every provider shipped by the MLX media platform to an explicit registry builder.
 pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistryBuilder {
     let registry = mlx_gen_anima::register_providers(registry);
@@ -124,6 +138,28 @@ pub fn provider_registry() -> mlx_gen::gen_core::Result<ProviderRegistry> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn benchmark_capabilities_are_explicit_for_every_p6_provider() {
+        use std::collections::BTreeSet;
+
+        let known: BTreeSet<_> = super::media::diagnostics::BENCHMARK_TOGGLES
+            .iter()
+            .copied()
+            .collect();
+        for provider in [mlx_gen_wan::MODEL_ID, mlx_gen_qwen_image::MODEL_ID, "sdxl"] {
+            let declared = super::benchmark_toggle_capabilities(provider).unwrap_or_else(|| {
+                panic!("{provider} must own an explicit P6 capability contract")
+            });
+            let unique: BTreeSet<_> = declared.iter().copied().collect();
+            assert_eq!(unique.len(), declared.len(), "{provider} repeats a toggle");
+            assert!(
+                unique.is_subset(&known),
+                "{provider} declares an unknown P6 toggle"
+            );
+        }
+        assert!(super::benchmark_toggle_capabilities("not-a-provider").is_none());
+    }
+
     const PREVIEW_PROVIDER_IDS: [&str; 38] = [
         "anima_base",
         "anima_aesthetic",

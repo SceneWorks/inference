@@ -79,6 +79,10 @@ pub use unet::{ControlNet, ControlResiduals, Transformer2D, UNet2DConditionModel
 pub use vae::Autoencoder;
 pub use vision_encoder::{ClipVisionEncoder, VisionConfig};
 
+/// Shared-optimization toggles whose production call sites this provider can actually execute.
+/// Availability never substitutes for the request-local `Applied` receipt required by P6.
+pub const BENCHMARK_TOGGLE_CAPABILITIES: &[&str] = &[];
+
 // sc-2963 compiled-glue toggle: when on, the UNet's remaining fusable elementwise glue — the **SiLU**
 // activations (`x·sigmoid(x)`: ResNet GN→SiLU, the time-embedding MLP, the output head) — runs through
 // `mx.compile`, fusing each into one kernel. The GEGLU/erf-GELU activations are already `mx.compile`'d
@@ -161,11 +165,16 @@ mod explicit_registry_tests {
 pub(crate) fn silu_glue(x: &mlx_rs::Array) -> mlx_gen::Result<mlx_rs::Array> {
     use mlx_rs::ops::{multiply, sigmoid};
     if !compile_glue() {
+        mlx_gen::diagnostics::record_fallback("sdxl::silu_glue", "compiled_glue_disabled");
         return mlx_gen::nn::silu(x);
     }
     let f = |x_: &mlx_rs::Array| -> std::result::Result<mlx_rs::Array, mlx_rs::error::Exception> {
         multiply(x_, &sigmoid(x_)?)
     };
+    mlx_gen::diagnostics::record_compile(
+        "sdxl::silu_glue",
+        mlx_gen::diagnostics::CompileDisposition::OneShot,
+    );
     Ok(mlx_rs::transforms::compile::compile(f, true)(x)?)
 }
 

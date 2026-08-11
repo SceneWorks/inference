@@ -67,6 +67,17 @@ const WAN_NATIVE_SAMPLERS: [&str; 3] = ["uni_pc", "euler", "dpmpp_2m"];
 /// manifest surfaces only the curated names.
 const WAN_LEGACY_SAMPLERS: [&str; 2] = ["unipc", "dpmpp2m"];
 
+fn dense_decode_tiling(
+    height: i32,
+    width: i32,
+    out_frames: i32,
+) -> Result<Option<mlx_gen::TilingConfig>> {
+    match mlx_gen::diagnostics::benchmark_decode_control() {
+        Some(control) => Ok(Some(control.tiling_config())),
+        None => auto_tiling_budgeted(height, width, out_frames, true),
+    }
+}
+
 /// Wan's full per-generation sampler menu: native solvers (curated vocabulary) + the curated gen-core
 /// fold-ins + the legacy aliases.
 fn wan_samplers() -> Vec<&'static str> {
@@ -475,8 +486,7 @@ impl Wan {
         // catchably *before* the heavy denoise rather than OOM-ing in the post-loop decode stage.
         // sc-5039 — the decode runs **bf16** (visually lossless, cosine 0.999954 real-weight; lower
         // peak ⇒ the budget fits bigger tiles), so the plan uses the bf16 cost coefficient.
-        let decode_tiling =
-            auto_tiling_budgeted(height as i32, width as i32, gen_frames as i32, true)?;
+        let decode_tiling = dense_decode_tiling(height as i32, width as i32, gen_frames as i32)?;
 
         // --- Stage 1: UMT5 text encode (loaded → used → freed) ---
         let (context, context_null) = encode_text_staged_for_tier(
@@ -595,6 +605,12 @@ impl Wan {
                 None => None,
             };
             let total = steps as u32;
+            // Provider-neutral benchmark boundary: model construction, adapter/quant work, and
+            // context embedding above are pre-denoise preparation. Emit only when the solver is
+            // ready to consume its first latent, matching Qwen and SDXL.
+            mlx_gen::diagnostics::record_phase_boundary(
+                mlx_gen::diagnostics::BenchmarkPhaseBoundary::DenoiseStart,
+            );
             // Curated unified solver (epic 7114, sc-7121): the gen-core-only solvers route through the
             // shared `denoise_curated`; the native unipc/euler/dpmpp2m stay on `scheduler.rs` (N1). The
             // image-conditioned TI2V mask-blend (per-token timesteps + a post-step re-blend) has no
@@ -681,6 +697,9 @@ impl Wan {
         }
 
         // --- Stage 3: z48 vae22 decode → RGB8 frames ---
+        mlx_gen::diagnostics::record_phase_boundary(
+            mlx_gen::diagnostics::BenchmarkPhaseBoundary::DecodeStart,
+        );
         on_progress(Progress::Decoding);
         // Causal temporal decode: t_lat → 1 + (t_lat−1)·4 output frames (= gen_frames). The tiling
         // was chosen (and budget-checked) up front by `auto_tiling_budgeted` (sc-4998). sc-5039 casts
@@ -1804,6 +1823,30 @@ mod tests {
         let five_b = WanModelConfig::wan22_ti2v_5b();
         assert_eq!(resolve_capped_dims(&req(720, 720), &five_b), (704, 704));
         assert_eq!(resolve_capped_dims(&req(512, 512), &five_b), (512, 512));
+    }
+
+    #[test]
+    fn benchmark_scope_forces_dense_wan_spatial_and_temporal_tiles() {
+        let scope = mlx_gen::diagnostics::begin_benchmark_request(
+            "wan-fixed-tile",
+            "wan_video",
+            &[],
+            Some(mlx_gen::diagnostics::BenchmarkDecodeControl {
+                spatial_tile_px: 256,
+                spatial_overlap_px: 64,
+                temporal_tile_frames: Some(32),
+                temporal_overlap_frames: Some(8),
+            }),
+            |_| {},
+        )
+        .unwrap();
+        let tiling = dense_decode_tiling(480, 832, 81).unwrap().unwrap();
+        let spatial = tiling.spatial.unwrap();
+        let temporal = tiling.temporal.unwrap();
+        assert_eq!((spatial.tile_px, spatial.overlap_px), (256, 64));
+        assert_eq!((temporal.tile_frames, temporal.overlap_frames), (32, 8));
+        scope.finish();
+        assert_eq!(mlx_gen::diagnostics::benchmark_decode_control(), None);
     }
 
     #[test]

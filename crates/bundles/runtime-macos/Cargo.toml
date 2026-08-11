@@ -17,6 +17,12 @@ candle-audio-catalog = { workspace = true, optional = true }
 # inside candle-audio-catalog's composed registration (sc-12836) — the catalog owns the
 # candle-llm delegation, so this bundle no longer names candle-llm directly.
 mlx-llm = { workspace = true }
+libc = { workspace = true, optional = true }
+mlx-rs = { workspace = true, optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
 
 [features]
 default = ["media", "audio"]
@@ -37,3 +43,22 @@ audio = ["dep:candle-audio-catalog"]
 # bundle exposes it; runtime-cuda already forwards the audio catalog's cuda feature and runtime-cpu
 # has no GPU lane.
 audio-metal = ["audio", "candle-audio-catalog/metal"]
+# Local, real-weight P6 benchmark runner. Its schema, validation, Metal allocator, and output-digest
+# dependencies are all opt-in with the runner.
+perf-bench = [
+  "media",
+  "dep:libc",
+  "dep:mlx-rs",
+  "dep:serde",
+  "dep:serde_json",
+  "dep:sha2",
+  "dep:tempfile",
+]
+
+[[bin]]
+name = "mlx-perf-bench"
+path = "src/bin/mlx_perf_bench.rs"
+required-features = ["perf-bench"]
+
+[dev-dependencies]
+tempfile = { workspace = true }

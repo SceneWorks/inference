@@ -465,6 +465,9 @@ impl QwenImage {
                     capture_sigma,
                 )?;
                 let denoise_sigmas = &params.sigmas[..keep];
+                mlx_gen::diagnostics::record_phase_boundary(
+                    mlx_gen::diagnostics::BenchmarkPhaseBoundary::DenoiseStart,
+                );
                 let images = decode_and_collect(
                     heavy.vae,
                     pid_decoder
