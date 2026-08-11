@@ -596,6 +596,17 @@ impl Generator for KreaGenerator {
             // request-scoped component transition. This preserves the cancellation contract for
             // every descriptor, including variants that do not support the selected memory rung.
             candle_gen::check_cancel(&req.cancel)?;
+            if self.native_dit.is_some()
+                && (memory.stream_transformer_blocks
+                    || memory.transformer_window_size.is_some()
+                    || memory.transformer_window_component.is_some())
+            {
+                return Err(gen_core::Error::Unsupported(format!(
+                    "{}: imported File weights are reopenable but transformer residency is not \
+                     authorized without File-specific promoted evidence",
+                    self.descriptor.id
+                )));
+            }
             if self.descriptor.id != KREA_2_TURBO_ID
                 || !self.descriptor.capabilities.supports_sequential_offload
                 || reference.is_some()
@@ -1118,12 +1129,22 @@ fn resolved_base_and_native(
     }
 }
 
-fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<dyn Generator>> {
-    let (root, native_dit) = resolved_base_and_native(spec, descriptor.id)?;
+type ValidatedKreaLoad = (
+    PathBuf,
+    Option<gen_core::PinnedWeightsFile>,
+    Option<PathBuf>,
+    Option<Quant>,
+);
+
+/// Static/load-source validation shared by generator construction and the registered memory
+/// contract. Keeping this as the one File-spec gate prevents a contract from accepting a composition
+/// the production loader later rejects (or advertising facts for fields the loader silently ignores).
+fn validate_load_spec(spec: &LoadSpec, id: &str) -> gen_core::Result<ValidatedKreaLoad> {
+    let (root, native_dit) = resolved_base_and_native(spec, id)?;
     if native_dit.is_some() && spec.identity.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
             "candle {}: imported single-file weights do not accept identity fields",
-            descriptor.id
+            id
         )));
     }
     // sc-9300 seam: select the community **INT8-ConvRot** DiT consume path when the spec carries a
@@ -1136,23 +1157,20 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
     // `WeightsSource` enum with a ConvRot variant — which would force a new match arm across every
     // provider in candle-gen AND the worker plus a gen-core pin bump. Only Krea reads this; every other
     // engine ignores `text_encoder` unchanged. `None`/`Dir` here ⇒ the dense/packed snapshot path below.
-    let convrot_dit = convrot_selector(spec, descriptor.id)?;
+    let convrot_dit = convrot_selector(spec, id)?;
     if native_dit.is_some() && convrot_dit.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
             "candle {}: primary imported DiT and legacy text_encoder ConvRot selector are mutually exclusive",
-            descriptor.id
+            id
         )));
     }
     if native_dit.is_some() && spec.quantize.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
             "candle {}: an imported DiT carries its numeric format; quantize is unsupported",
-            descriptor.id
+            id
         )));
     }
-    let loaded_quant = actual_quant_tier(spec, descriptor.id)?;
-    #[cfg(any(feature = "cuda", test))]
-    let memory_contract =
-        (descriptor.id == KREA_2_TURBO_ID).then(|| build_krea_turbo_memory_strategy_contract(spec));
+    let loaded_quant = actual_quant_tier(spec, id)?;
     // LoRA/LoKr adapters are accepted and merged into the DiT at first `generate` (sc-7836); the merge
     // (`adapters::merge_into_weights`) is lazy, so a nonexistent adapter path still loads here.
     //
@@ -1163,7 +1181,7 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
             "candle {} does not support ControlNet / IP-Adapter overlays",
-            descriptor.id
+            id
         )));
     }
     // The ConvRot consume path (sc-9300) is DiT-only and does not thread LoRA/LoKr or PiD overlays — the
@@ -1173,9 +1191,20 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
         return Err(gen_core::Error::Unsupported(format!(
             "candle {}: the INT8-ConvRot DiT path does not support LoRA/LoKr adapters or a PiD decoder \
              overlay",
-            descriptor.id
+            id
         )));
     }
+    Ok((root, native_dit, convrot_dit, loaded_quant))
+}
+
+fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<dyn Generator>> {
+    let (root, native_dit, convrot_dit, loaded_quant) = validate_load_spec(spec, descriptor.id)?;
+    #[cfg(any(feature = "cuda", test))]
+    let memory_contract = if descriptor.id == KREA_2_TURBO_ID {
+        Some(validated_krea_turbo_memory_strategy_contract(spec)?)
+    } else {
+        None
+    };
     let device = candle_gen::default_device()?;
     let resident_root = root.clone();
     let resident_device = device.clone();
@@ -1195,7 +1224,12 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
     // previously bypassed staged residency rather than dropping its 15.6 GB f32 TE.
     let heavy_convrot = convrot_dit.clone();
     let heavy_native = native_dit.clone();
-    let native_streamable = spec.adapters.is_empty();
+    // Imported File providers do not publish rung-4 authorization: the available calibration
+    // evidence covers the canonical snapshot-directory load shape only. Keep the registered
+    // request path eager even when the file is physically reopenable. The lower-level native
+    // loader retains its explicit `stream_blocks` seam for smoke coverage and for a future File
+    // calibration/promotion without silently executing a strategy the public contract marks Missing.
+    let native_streamable = false;
     let residency = candle_gen::Residency::request_scoped_with_resident_cancelable(
         move |_| {
             let components = match (resident_native.as_ref(), resident_convrot.as_ref()) {
@@ -1499,11 +1533,19 @@ fn build_krea_turbo_memory_strategy_contract(spec: &LoadSpec) -> gen_core::Memor
     }
 }
 
+#[cfg(any(feature = "cuda", test))]
+fn validated_krea_turbo_memory_strategy_contract(
+    spec: &LoadSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    validate_load_spec(spec, KREA_2_TURBO_ID)?;
+    Ok(build_krea_turbo_memory_strategy_contract(spec))
+}
+
 #[cfg(feature = "cuda")]
 fn registered_krea_turbo_memory_strategy_contract(
     spec: &LoadSpec,
 ) -> gen_core::Result<gen_core::MemoryProviderContract> {
-    Ok(build_krea_turbo_memory_strategy_contract(spec))
+    validated_krea_turbo_memory_strategy_contract(spec)
 }
 
 #[cfg(test)]
@@ -2436,6 +2478,74 @@ mod tests {
                     .support,
                 gen_core::MemoryStrategySupport::Implemented
             ));
+        }
+    }
+
+    #[test]
+    fn imported_file_contract_matches_the_loader_for_every_typed_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        let native = tmp.path().join("krea.safetensors");
+        std::fs::write(&native, b"pinned File validation fixture").unwrap();
+        let valid = LoadSpec::new(WeightsSource::File(native)).with_component(
+            BASE_SNAPSHOT_COMPONENT,
+            WeightsSource::Dir(tmp.path().join("base")),
+        );
+
+        let mut precision = valid.clone();
+        precision.precision = gen_core::Precision::Fp32;
+        let mut control = valid.clone();
+        control.control = Some(WeightsSource::File(tmp.path().join("control.safetensors")));
+        let mut extra_control = valid.clone();
+        extra_control.extra_controls.push(WeightsSource::File(
+            tmp.path().join("extra-control.safetensors"),
+        ));
+        let mut ip_adapter = valid.clone();
+        ip_adapter.ip_adapter = Some(WeightsSource::Dir(tmp.path().join("ip-adapter")));
+        let mut identity = valid.clone();
+        identity.identity = Some(gen_core::IdentityWeights::default());
+        let mut text_encoder = valid.clone();
+        text_encoder.text_encoder =
+            Some(WeightsSource::File(tmp.path().join("convrot.safetensors")));
+        let mut unknown_component = valid.clone();
+        unknown_component.components.insert(
+            "unknown".into(),
+            WeightsSource::File(tmp.path().join("unknown.safetensors")),
+        );
+        let mut missing_base = valid.clone();
+        missing_base.components.clear();
+        let accepted_adapter = valid.clone().with_adapters(vec![AdapterSpec::new(
+            tmp.path().join("adapter.safetensors"),
+            1.0,
+            gen_core::AdapterKind::Lora,
+        )]);
+        let accepted_pid = valid.clone().with_pid(
+            WeightsSource::File(tmp.path().join("pid.safetensors")),
+            WeightsSource::Dir(tmp.path().join("gemma")),
+        );
+        let accepted_deferred = valid
+            .clone()
+            .with_offload_policy(gen_core::OffloadPolicy::Sequential)
+            .with_load_shape(gen_core::LoadShape::DeferredMaterialization);
+
+        for (case, spec, expected) in [
+            ("valid", valid.clone(), true),
+            ("adapter", accepted_adapter, true),
+            ("pid", accepted_pid, true),
+            ("precision", precision, true),
+            ("deferred", accepted_deferred, true),
+            ("quantize", valid.clone().with_quant(Quant::Q4), false),
+            ("control", control, false),
+            ("extra_control", extra_control, false),
+            ("ip_adapter", ip_adapter, false),
+            ("identity", identity, false),
+            ("text_encoder", text_encoder, false),
+            ("unknown_component", unknown_component, false),
+            ("missing_base", missing_base, false),
+        ] {
+            let loader = validate_load_spec(&spec, KREA_2_TURBO_ID).is_ok();
+            let contract = validated_krea_turbo_memory_strategy_contract(&spec).is_ok();
+            assert_eq!(loader, expected, "loader validation for {case}");
+            assert_eq!(contract, loader, "contract/loader parity for {case}");
         }
     }
 

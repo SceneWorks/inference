@@ -108,6 +108,138 @@ fn streamable(spec: &LoadSpec) -> bool {
         && spec.identity.is_none()
 }
 
+fn ggml_projection_bytes(
+    tensor: &gen_core::weightsmeta::SafetensorsTensorHeader,
+    quant: Quant,
+    component: &str,
+) -> gen_core::Result<u64> {
+    let [out, input] = tensor.shape.as_slice() else {
+        return tensor.materialized_bytes(4);
+    };
+    if !input.is_multiple_of(32) {
+        return Err(gen_core::Error::Unsupported(format!(
+            "FLUX.2 {component} projection {:?} has input width {input}, which cannot be folded to {quant:?}",
+            tensor.name
+        )));
+    }
+    let elements = u64::try_from(*out)
+        .ok()
+        .and_then(|out| {
+            u64::try_from(*input)
+                .ok()
+                .and_then(|input| out.checked_mul(input))
+        })
+        .ok_or_else(|| {
+            gen_core::Error::Msg(format!(
+                "FLUX.2 {component} projection {:?} element count overflow",
+                tensor.name
+            ))
+        })?;
+    let bytes_per_block = match quant {
+        // Candle's load-time fold uses native GGML Q4_0/Q8_0: 32 values plus one f16 scale.
+        Quant::Q4 => 18_u64,
+        Quant::Q8 => 34_u64,
+        Quant::Nvfp4 => {
+            return Err(gen_core::Error::Unsupported(
+                "FLUX.2 File imports do not support NVFP4 folding".into(),
+            ))
+        }
+    };
+    (elements / 32).checked_mul(bytes_per_block).ok_or_else(|| {
+        gen_core::Error::Msg(format!(
+            "FLUX.2 {component} projection {:?} packed byte size overflow",
+            tensor.name
+        ))
+    })
+}
+
+fn f32_or_packed_component_bytes(
+    path: &std::path::Path,
+    quant: Option<Quant>,
+    component: &str,
+    keep_embedding_dense: bool,
+    inline_fp8_scales: bool,
+) -> gen_core::Result<u64> {
+    use gen_core::weightsmeta::Dtype;
+    use std::collections::HashMap;
+
+    let tensors = gen_core::weightsmeta::safetensors_path_tensor_headers(path)?;
+    if tensors.is_empty() {
+        return Err(gen_core::Error::Msg(format!(
+            "FLUX.2 {component} '{}' contains no tensors",
+            path.display()
+        )));
+    }
+    let by_name: HashMap<&str, &gen_core::weightsmeta::SafetensorsTensorHeader> = tensors
+        .iter()
+        .map(|tensor| (tensor.name.as_str(), tensor))
+        .collect();
+    tensors.iter().try_fold(0_u64, |total, tensor| {
+        let source_only =
+            tensor.name.ends_with(".weight_scale") || tensor.name.ends_with(".input_scale");
+        if source_only {
+            return Ok(total);
+        }
+
+        if inline_fp8_scales && tensor.dtype == Dtype::F8_E4M3 {
+            let Some(base) = tensor.name.strip_suffix(".weight") else {
+                return Err(gen_core::Error::Unsupported(format!(
+                    "FLUX.2 {component} fp8 tensor {:?} is not a projection weight",
+                    tensor.name
+                )));
+            };
+            let scale_name = format!("{base}.weight_scale");
+            let scale = by_name.get(scale_name.as_str()).ok_or_else(|| {
+                gen_core::Error::Unsupported(format!(
+                    "FLUX.2 {component} fp8 weight {:?} is missing {scale_name:?}",
+                    tensor.name
+                ))
+            })?;
+            if scale.element_count()? == 0 {
+                return Err(gen_core::Error::Unsupported(format!(
+                    "FLUX.2 {component} scale {scale_name:?} is empty"
+                )));
+            }
+        }
+
+        let loaded = match tensor.dtype {
+            // Both the imported map (`build_comfyui_dit_map`) and snapshot VarBuilders request the
+            // pipeline's F32 dtype. Accepted integer tensors are therefore cast to F32 too; a rank-2
+            // projection then takes the same GGML fold as a floating source when Q4/Q8 is selected.
+            Dtype::U8
+            | Dtype::U16
+            | Dtype::U32
+            | Dtype::I16
+            | Dtype::I32
+            | Dtype::I64
+            | Dtype::F8_E4M3
+            | Dtype::F16
+            | Dtype::BF16
+            | Dtype::F32
+            | Dtype::F64 => {
+                if let Some(quant) = quant.filter(|_| {
+                    tensor.name.ends_with(".weight")
+                        && tensor.shape.len() == 2
+                        && !(keep_embedding_dense && tensor.name.ends_with("embed_tokens.weight"))
+                }) {
+                    ggml_projection_bytes(tensor, quant, component)?
+                } else {
+                    tensor.materialized_bytes(4)?
+                }
+            }
+            dtype => {
+                return Err(gen_core::Error::Unsupported(format!(
+                    "FLUX.2 {component} tensor {:?} uses unsupported Candle dtype {dtype:?}",
+                    tensor.name
+                )))
+            }
+        };
+        total.checked_add(loaded).ok_or_else(|| {
+            gen_core::Error::Msg(format!("FLUX.2 {component} resident byte sum overflow"))
+        })
+    })
+}
+
 fn resident_components(provider_id: &str, spec: &LoadSpec) -> Vec<MemoryResidentComponent> {
     let mut out = Vec::new();
     if provider_id == FLUX2_DEV_ID {
@@ -128,7 +260,7 @@ fn resident_components(provider_id: &str, spec: &LoadSpec) -> Vec<MemoryResident
     out
 }
 
-pub fn provider_contract_for(
+pub(crate) fn composed_provider_contract_for(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> gen_core::Result<MemoryProviderContract> {
@@ -149,10 +281,23 @@ pub fn provider_contract_for(
         .unwrap_or_default(),
         WeightsSource::File(dit) => {
             let base = gen_core::require_base_snapshot(spec, provider_id)?;
+            let quant = resolved_quant(spec)?;
             PerComponentBytes {
-                text_encoder: gen_core::safetensors_path_bytes(base.join("text_encoder")),
-                dit: gen_core::safetensors_path_bytes(dit),
-                vae: gen_core::safetensors_path_bytes(base.join("vae")),
+                text_encoder: f32_or_packed_component_bytes(
+                    &base.join("text_encoder"),
+                    quant,
+                    "base text encoder",
+                    true,
+                    false,
+                )?,
+                dit: f32_or_packed_component_bytes(dit, quant, "imported DiT", false, true)?,
+                vae: f32_or_packed_component_bytes(
+                    &base.join("vae"),
+                    None,
+                    "base VAE",
+                    false,
+                    false,
+                )?,
             }
         }
     };
@@ -267,6 +412,23 @@ pub fn provider_contract_for(
         },
         runtime: gen_core::MemoryRuntimeSemantics::default(),
     })
+}
+
+pub fn provider_contract_for(
+    provider_id: &str,
+    spec: &LoadSpec,
+) -> gen_core::Result<MemoryProviderContract> {
+    let variant = match provider_id {
+        FLUX2_DEV_ID => Flux2Variant::Dev,
+        FLUX2_KLEIN_9B_ID => Flux2Variant::Klein9b,
+        _ => {
+            return Err(gen_core::Error::Unsupported(format!(
+                "unknown FLUX.2 memory provider {provider_id}"
+            )))
+        }
+    };
+    crate::validate_load_spec(variant, spec)?;
+    composed_provider_contract_for(provider_id, spec)
 }
 
 pub fn provider_contract(spec: &LoadSpec) -> gen_core::Result<MemoryProviderContract> {
@@ -958,6 +1120,147 @@ mod tests {
         spec
     }
 
+    fn write_typed_safetensors(path: &std::path::Path, tensors: &[(&str, &str, &[usize], usize)]) {
+        let mut offset = 0_usize;
+        let mut header = serde_json::Map::new();
+        for (name, dtype, shape, bytes) in tensors {
+            header.insert(
+                (*name).to_owned(),
+                serde_json::json!({
+                    "dtype": dtype,
+                    "shape": shape,
+                    "data_offsets": [offset, offset + bytes],
+                }),
+            );
+            offset += bytes;
+        }
+        let mut header = serde_json::to_vec(&header).unwrap();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.resize(bytes.len() + offset, 0);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn file_spec(tmp: &tempfile::TempDir, quant: Option<Quant>) -> LoadSpec {
+        let root = tmp.path().join("base");
+        for component in ["text_encoder", "vae"] {
+            std::fs::create_dir_all(root.join(component)).unwrap();
+        }
+        write_typed_safetensors(
+            &root.join("text_encoder/model.safetensors"),
+            &[
+                (
+                    "model.layers.0.self_attn.q_proj.weight",
+                    "F16",
+                    &[2, 32],
+                    128,
+                ),
+                ("model.layers.0.self_attn.k_proj.weight", "U8", &[2, 32], 64),
+                ("model.embed_tokens.weight", "F16", &[2, 32], 128),
+            ],
+        );
+        write_typed_safetensors(
+            &root.join("vae/model.safetensors"),
+            &[
+                ("decoder.weight", "BF16", &[4], 8),
+                ("decoder.bias", "U8", &[4], 4),
+            ],
+        );
+        let dit = tmp.path().join("dit.safetensors");
+        write_typed_safetensors(
+            &dit,
+            &[
+                ("double_blocks.0.img_mlp.0.weight", "F8_E4M3", &[2, 32], 64),
+                ("double_blocks.0.img_mlp.0.weight_scale", "F32", &[], 4),
+                ("double_blocks.0.img_mlp.0.input_scale", "F32", &[], 4),
+                ("double_blocks.0.img_mlp.2.weight", "U8", &[2, 32], 64),
+                ("double_blocks.0.img_mlp.0.bias", "F16", &[2], 4),
+            ],
+        );
+        let mut spec = LoadSpec::new(WeightsSource::File(dit))
+            .with_component(gen_core::BASE_SNAPSHOT_COMPONENT, WeightsSource::Dir(root));
+        spec.quantize = quant;
+        spec
+    }
+
+    #[test]
+    fn imported_file_asset_facts_follow_fp8_dequant_and_ggml_packing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dense = provider_contract(&file_spec(&tmp, None)).unwrap();
+        assert_eq!(dense.asset_facts.conditioning_bytes, 768);
+        assert_eq!(dense.asset_facts.transformer_bytes, 520);
+        assert_eq!(dense.asset_facts.decoder_bytes, 32);
+
+        let packed = provider_contract(&file_spec(&tmp, Some(Quant::Q4))).unwrap();
+        assert_eq!(packed.asset_facts.conditioning_bytes, 36 + 36 + 256);
+        assert_eq!(packed.asset_facts.transformer_bytes, 36 + 36 + 8);
+        assert_eq!(packed.asset_facts.decoder_bytes, 32);
+        assert_eq!(packed.asset_facts.base_bytes, 440);
+    }
+
+    #[test]
+    fn imported_file_contract_and_loader_share_the_full_typed_field_matrix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let valid = file_spec(&tmp, Some(Quant::Q4));
+        let mut cases = vec![("valid", valid.clone())];
+        cases.push(("dense-is-accepted", file_spec(&tmp, None)));
+
+        let mut precision = valid.clone();
+        precision.precision = Precision::Fp32;
+        cases.push(("precision-is-accepted", precision));
+        let mut pid = valid.clone();
+        pid.pid = Some(gen_core::PidWeights {
+            checkpoint: WeightsSource::File(tmp.path().join("pid.safetensors")),
+            gemma: WeightsSource::Dir(tmp.path().join("gemma")),
+        });
+        cases.push(("pid-is-accepted", pid));
+
+        let mut adapter = valid.clone();
+        adapter.adapters.push(gen_core::AdapterSpec::new(
+            tmp.path().join("adapter.safetensors"),
+            1.0,
+            gen_core::AdapterKind::Lora,
+        ));
+        cases.push(("adapter", adapter));
+        let mut nvfp4 = valid.clone();
+        nvfp4.quantize = Some(Quant::Nvfp4);
+        cases.push(("nvfp4", nvfp4));
+        let mut control = valid.clone();
+        control.control = Some(WeightsSource::File(tmp.path().join("control.safetensors")));
+        cases.push(("control", control));
+        let mut extra = valid.clone();
+        extra
+            .extra_controls
+            .push(WeightsSource::File(tmp.path().join("extra.safetensors")));
+        cases.push(("extra-control", extra));
+        let mut ip = valid.clone();
+        ip.ip_adapter = Some(WeightsSource::File(tmp.path().join("ip.safetensors")));
+        cases.push(("ip-adapter", ip));
+        let mut identity = valid.clone();
+        identity.identity = Some(gen_core::IdentityWeights::default());
+        cases.push(("identity", identity));
+        let mut external_te = valid.clone();
+        external_te.text_encoder = Some(WeightsSource::Dir(tmp.path().join("external-te")));
+        cases.push(("external-text-encoder", external_te));
+        let mut unknown = valid.clone();
+        unknown.components.insert(
+            "unknown".into(),
+            WeightsSource::File(tmp.path().join("unknown.safetensors")),
+        );
+        cases.push(("unknown-component", unknown));
+
+        for (name, spec) in cases {
+            assert_eq!(
+                crate::validate_load_spec(Flux2Variant::Dev, &spec).is_ok(),
+                provider_contract(&spec).is_ok(),
+                "File loader/contract validation drift for {name}"
+            );
+        }
+    }
+
     #[test]
     fn klein_load_and_memory_contract_reject_the_same_file_source() {
         let spec = LoadSpec::new(WeightsSource::File("/tmp/klein.safetensors".into()))
@@ -1117,7 +1420,7 @@ mod tests {
     fn klein_contract_never_inherits_dev_control_residency_identity() {
         let mut spec = spec();
         spec.control = Some(WeightsSource::File("control.safetensors".into()));
-        let contract = klein_provider_contract(&spec).unwrap();
+        let contract = composed_provider_contract_for(FLUX2_KLEIN_9B_ID, &spec).unwrap();
         let MemoryFormulaKind::ComponentPhaseEnvelope {
             resident_components,
             ..

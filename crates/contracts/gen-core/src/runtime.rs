@@ -758,6 +758,7 @@ pub enum LoadPhase {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
     use std::sync::{Barrier, Mutex};
 
     #[test]
@@ -782,25 +783,46 @@ mod tests {
     fn pinned_weights_file_rejects_a_barrier_controlled_mid_read_replacement() {
         let dir = tempfile::tempdir().expect("temp dir");
         let file = dir.path().join("model.safetensors");
-        std::fs::write(&file, b"original").expect("write fixture");
+        let original = vec![0x5a; 128 * 1024];
+        std::fs::write(&file, &original).expect("write fixture");
         let pinned = PinnedWeightsFile::pin(&file).expect("pin regular file");
-        let entered_read = Arc::new(Barrier::new(2));
+        let consumed_first_chunk = Arc::new(Barrier::new(2));
         let replacement_done = Arc::new(Barrier::new(2));
 
         let writer_file = file.clone();
-        let writer_entered = Arc::clone(&entered_read);
+        let writer_entered = Arc::clone(&consumed_first_chunk);
         let writer_done = Arc::clone(&replacement_done);
         let writer = std::thread::spawn(move || {
             writer_entered.wait();
-            std::fs::write(writer_file, b"replacement bytes").expect("replace during read");
+            let replacement = writer_file.with_extension("replacement");
+            std::fs::write(&replacement, vec![0xa5; 128 * 1024])
+                .expect("write replacement beside source");
+            #[cfg(unix)]
+            std::fs::rename(replacement, writer_file).expect("atomically replace during read");
+            #[cfg(not(unix))]
+            {
+                let bytes = std::fs::read(replacement).expect("read replacement fixture");
+                std::fs::write(writer_file, bytes).expect("overwrite source during read");
+            }
             writer_done.wait();
         });
 
         let error = pinned
             .read_unchanged::<_, crate::Error>(|path| {
-                entered_read.wait();
+                // Open and consume part of the original payload before allowing replacement. The
+                // remainder is then read from the already-open original inode, proving the post-read
+                // check—not a pre-open race—is what rejects the mixed-provenance operation.
+                let mut source = std::fs::File::open(path)?;
+                let mut bytes = vec![0; 4096];
+                source.read_exact(&mut bytes)?;
+                assert!(bytes.iter().all(|byte| *byte == 0x5a));
+                consumed_first_chunk.wait();
                 replacement_done.wait();
-                std::fs::read(path).map_err(Into::into)
+                source.read_to_end(&mut bytes)?;
+                assert_eq!(bytes.len(), original.len());
+                #[cfg(unix)]
+                assert!(bytes.iter().all(|byte| *byte == 0x5a));
+                Ok(bytes)
             })
             .expect_err("a replacement between the two checks must fail")
             .to_string();

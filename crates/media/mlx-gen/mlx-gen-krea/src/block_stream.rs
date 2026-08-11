@@ -162,7 +162,7 @@ impl KreaBlockStream {
             KreaBlockSource::Diffusers(WeightsSource::Dir(dir)) => Weights::from_dir(dir),
             KreaBlockSource::Diffusers(WeightsSource::File(file)) => Weights::from_file(file),
             KreaBlockSource::Native(file) => file.read_unchanged(|path| {
-                let weights = crate::loader::normalized_native_weights(path)?;
+                let weights = crate::loader::normalized_native_weights_lazy(path)?;
                 NATIVE_WINDOW_REOPENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(weights)
             }),
@@ -194,6 +194,18 @@ impl KreaBlockStream {
             BLOCK_MATERIALIZATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(block);
         }
+        if let KreaBlockSource::Native(file) = &self.source {
+            return file.read_unchanged(|_| self.materialize_from_view(view, index, true));
+        }
+        self.materialize_from_view(view, index, false)
+    }
+
+    fn materialize_from_view(
+        &self,
+        view: &mut Weights,
+        index: usize,
+        source_guarded: bool,
+    ) -> Result<SingleStreamBlock> {
         let cfg = &self.cfg;
         let mut block = SingleStreamBlock::from_weights(
             view,
@@ -204,6 +216,12 @@ impl KreaBlockStream {
             cfg.hidden_size as i32,
             cfg.norm_eps,
         )?;
+        if source_guarded {
+            // Evaluate only this block's exact read set before the native pin's post-check. Evaluating
+            // the whole normalized map would make File reopening physically correct but memory-bound
+            // in name only; the accessed subset preserves the real windowed implementation.
+            view.materialize_accessed()?;
+        }
         // `Array` handles are refcounted. Removing the exact read set prevents the view from retaining
         // a second handle after the materialized window is dropped.
         view.remove_accessed();

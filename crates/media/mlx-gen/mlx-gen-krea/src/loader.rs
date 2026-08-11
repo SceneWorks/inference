@@ -242,9 +242,63 @@ fn dequant_plain_int8_tensorwise(mut native: Weights) -> Result<Weights> {
 /// same architecture coverage/shape validation and transformer assembly as the published snapshot.
 /// `cfg` comes from the resident base snapshot because the single file has no `config.json`.
 pub(crate) fn normalized_native_weights(dit_file: &Path) -> Result<Weights> {
+    normalized_native_weights_with_materializer(dit_file, |weights| {
+        #[cfg(test)]
+        run_native_materialize_test_hook(NativeMaterializeTestStage::Before, weights)?;
+        weights.materialize()?;
+        #[cfg(test)]
+        run_native_materialize_test_hook(NativeMaterializeTestStage::After, weights)?;
+        Ok(())
+    })
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeMaterializeTestStage {
+    Before,
+    After,
+}
+
+#[cfg(test)]
+type NativeMaterializeTestHook = Box<dyn FnMut(NativeMaterializeTestStage, &Weights) -> Result<()>>;
+
+#[cfg(test)]
+thread_local! {
+    /// Deterministic barrier inside the real eager native-file entrypoint. Production builds contain
+    /// no hook; the ignored Metal regression uses it to replace the selected path between the first
+    /// evaluated provider array and the production `Weights::materialize` completion boundary.
+    static NATIVE_MATERIALIZE_TEST_HOOK: std::cell::RefCell<Option<NativeMaterializeTestHook>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn run_native_materialize_test_hook(
+    stage: NativeMaterializeTestStage,
+    weights: &Weights,
+) -> Result<()> {
+    NATIVE_MATERIALIZE_TEST_HOOK.with(|slot| match slot.borrow_mut().as_mut() {
+        Some(hook) => hook(stage, weights),
+        None => Ok(()),
+    })
+}
+
+/// Normalize the native namespace without evaluating the complete checkpoint. The bounded block
+/// loader consumes only its accessed window under a separate pin guard; eagerly evaluating here
+/// would retain the full DiT and invalidate that implementation's residency bound.
+pub(crate) fn normalized_native_weights_lazy(dit_file: &Path) -> Result<Weights> {
+    normalized_native_weights_with_materializer(dit_file, |_| Ok(()))
+}
+
+fn normalized_native_weights_with_materializer(
+    dit_file: &Path,
+    materialize: impl FnOnce(&Weights) -> Result<()>,
+) -> Result<Weights> {
     let native = dequant_plain_int8_tensorwise(Weights::from_file(dit_file)?)?;
     let mut remapped = crate::native_remap::remap_native_dit_to_diffusers(native)?;
     crate::native_remap::normalize_modulation_tables(&mut remapped)?;
+    // `Weights::from_file` and every MLX cast/remap above are lazy. Force the final normalized map
+    // while the caller's `PinnedWeightsFile::read_unchanged` guard still spans this function.
+    materialize(&remapped)?;
     Ok(remapped)
 }
 
@@ -289,6 +343,8 @@ pub(crate) fn load_transformer_from_pinned_native_file_with_stream(
 mod tests {
     use super::*;
     use mlx_rs::Array;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Barrier};
 
     fn plain_int8_weights(descriptor: &str, scale: Array) -> Weights {
         plain_int8_weights_with_shape(descriptor, &[1_i8, -2, 3, -4, 5, -6], &[2, 3], scale)
@@ -311,6 +367,98 @@ mod tests {
             Array::from_slice(descriptor.as_bytes(), &[descriptor.len() as i32]),
         );
         weights
+    }
+
+    /// MLX keeps safetensors arrays and the remap/cast graph lazy. This regression places a real
+    /// atomic path replacement between two provider-array evaluations and proves the Krea native
+    /// normalization does not return to `PinnedWeightsFile` for its post-check until the final map is
+    /// materialized. Non-macOS runners still compile the test, but cannot execute MLX's Metal runtime.
+    #[test]
+    #[ignore = "requires an accessible Apple Metal device; run explicitly on a physical macOS GPU host"]
+    fn native_file_pin_postchecks_after_final_mlx_evaluation() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let source = dir.path().join("krea-native.safetensors");
+        let replacement = dir.path().join("krea-native.replacement.safetensors");
+        let elements = 64 * 1024;
+
+        let original_weight = Array::from_slice(&vec![0.25_f32; elements], &[elements as i32]);
+        let original_bias = Array::from_slice(&vec![0.75_f32; elements], &[elements as i32]);
+        Array::save_safetensors(
+            vec![
+                ("model.diffusion_model.first.weight", &original_weight),
+                ("model.diffusion_model.first.bias", &original_bias),
+            ],
+            None,
+            &source,
+        )
+        .expect("write original native checkpoint");
+        let replacement_weight = Array::from_slice(&vec![-0.25_f32; elements], &[elements as i32]);
+        let replacement_bias = Array::from_slice(&vec![-0.75_f32; elements], &[elements as i32]);
+        Array::save_safetensors(
+            vec![
+                ("model.diffusion_model.first.weight", &replacement_weight),
+                ("model.diffusion_model.first.bias", &replacement_bias),
+            ],
+            None,
+            &replacement,
+        )
+        .expect("write replacement native checkpoint");
+
+        let first_evaluated = Arc::new(Barrier::new(2));
+        let replacement_done = Arc::new(Barrier::new(2));
+        let final_evaluated = Arc::new(AtomicBool::new(false));
+
+        let writer_source = source.clone();
+        let writer_replacement = replacement.clone();
+        let writer_first = Arc::clone(&first_evaluated);
+        let writer_done = Arc::clone(&replacement_done);
+        let writer = std::thread::spawn(move || {
+            writer_first.wait();
+            std::fs::rename(writer_replacement, writer_source)
+                .expect("atomically replace native checkpoint during lazy evaluation");
+            writer_done.wait();
+        });
+
+        let evaluated = Arc::clone(&final_evaluated);
+        NATIVE_MATERIALIZE_TEST_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |stage, weights| {
+                match stage {
+                    NativeMaterializeTestStage::Before => {
+                        let first = weights.require("img_in.weight")?;
+                        first.eval()?;
+                        assert!(first.as_slice::<f32>().iter().all(|value| *value == 0.25));
+                        first_evaluated.wait();
+                        replacement_done.wait();
+                    }
+                    NativeMaterializeTestStage::After => {
+                        assert_eq!(
+                            weights.require("img_in.bias")?.as_slice::<f32>().len(),
+                            elements
+                        );
+                        evaluated.store(true, Ordering::SeqCst);
+                    }
+                }
+                Ok(())
+            }));
+        });
+        // Call the public production loader, not the guard or normalizer primitive. Validation/model
+        // assembly may fail for this intentionally small checkpoint, but the enclosing pin's mutation
+        // post-check must run first and win as the stronger provenance diagnosis.
+        let result = load_transformer_from_native_file(&source, &Krea2Config::turbo());
+        NATIVE_MATERIALIZE_TEST_HOOK.with(|slot| *slot.borrow_mut() = None);
+        let error = match result {
+            Ok(_) => {
+                panic!("replacement during MLX evaluation must invalidate the native file pin")
+            }
+            Err(error) => error.to_string(),
+        };
+        writer.join().expect("replacement writer");
+
+        assert!(
+            final_evaluated.load(Ordering::SeqCst),
+            "the final MLX array map must be evaluated before the post-check rejects the mutation"
+        );
+        assert!(error.contains("changed after load"), "unexpected: {error}");
     }
 
     #[test]

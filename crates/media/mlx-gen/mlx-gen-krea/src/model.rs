@@ -413,33 +413,39 @@ fn load_variant(spec: &LoadSpec, descriptor: ModelDescriptor) -> Result<Box<dyn 
     }))
 }
 
-fn build_native_krea_from_spec(spec: &LoadSpec, descriptor: ModelDescriptor) -> Result<Krea> {
-    mlx_gen::gen_core::reject_unknown_components(spec, &[BASE_SNAPSHOT_COMPONENT], descriptor.id)?;
+pub(crate) fn validate_native_krea_spec(spec: &LoadSpec, provider_id: &str) -> Result<()> {
+    mlx_gen::gen_core::reject_unknown_components(spec, &[BASE_SNAPSHOT_COMPONENT], provider_id)?;
     if spec.precision != Precision::Bf16 {
         return Err(Error::Msg(format!(
             "{}: only the default dense precision is wired (drop the precision override)",
-            descriptor.id
+            provider_id
         )));
     }
     if spec.quantize.is_some() {
         return Err(Error::Unsupported(format!(
             "{}: an imported native single-file DiT carries its own numeric format; an additional \
              LoadSpec::quantize request is not supported",
-            descriptor.id
+            provider_id
         )));
     }
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
         return Err(Error::Unsupported(format!(
             "{}: the base single-file provider does not accept control/IP-adapter overlays",
-            descriptor.id
+            provider_id
         )));
     }
     if spec.identity.is_some() || spec.text_encoder.is_some() {
         return Err(Error::Unsupported(format!(
             "{}: imported single-file weights do not accept identity or external text-encoder fields",
-            descriptor.id
+            provider_id
         )));
     }
+    let _ = mlx_gen::gen_core::require_base_snapshot(spec, provider_id)?;
+    Ok(())
+}
+
+fn build_native_krea_from_spec(spec: &LoadSpec, descriptor: ModelDescriptor) -> Result<Krea> {
+    validate_native_krea_spec(spec, descriptor.id)?;
     let base = mlx_gen::gen_core::require_base_snapshot(spec, descriptor.id)?;
     let WeightsSource::File(dit_file) = &spec.weights else {
         unreachable!("native builder is called only for File weights")
@@ -447,15 +453,16 @@ fn build_native_krea_from_spec(spec: &LoadSpec, descriptor: ModelDescriptor) -> 
     let native_dit = mlx_gen::PinnedWeightsFile::pin(dit_file)?;
     let mut pinned_spec = spec.clone();
     pinned_spec.weights = WeightsSource::File(native_dit.loader_path().to_path_buf());
-    let streamable = matches!(spec.offload_policy, mlx_gen::OffloadPolicy::Sequential)
-        && matches!(spec.load_shape, mlx_gen::LoadShape::DeferredMaterialization)
-        && !adapters_have_diff_patch(&spec.adapters);
+    // The File is physically reopenable, but the public File contract deliberately withholds rung 4
+    // until that load shape has independent evidence. Keep even a stage-only sequential request eager;
+    // the lower-level pinned stream loader remains available for smoke coverage and future promotion.
+    let reopenable = native_file_streamable(spec);
     let memory_strategy = native_dit.read_unchanged(|_| {
         crate::block_memory_strategy::native_memory_strategy_contract_from_spec(
             descriptor.id,
             &pinned_spec,
             base,
-            streamable,
+            false,
         )
         .map_err(Error::from)
     })?;
@@ -467,7 +474,7 @@ fn build_native_krea_from_spec(spec: &LoadSpec, descriptor: ModelDescriptor) -> 
         spec.offload_policy,
         move || KreaText::from_snapshot(&text_base),
         move |load_pid| {
-            load_native_krea_heavy(&heavy_spec, &heavy_base, &heavy_dit, streamable, load_pid)
+            load_native_krea_heavy(&heavy_spec, &heavy_base, &heavy_dit, reopenable, load_pid)
         },
     )?;
     Ok(Krea {
@@ -475,12 +482,21 @@ fn build_native_krea_from_spec(spec: &LoadSpec, descriptor: ModelDescriptor) -> 
         memory_strategy,
         precision: spec.precision,
         quant: None,
-        streamable_transformer: streamable,
+        // The File loader remains physically reopenable, but only Dir-backed rung-4 cells have
+        // promoted evidence. A hand-built request must therefore not bypass the public contract.
+        streamable_transformer: false,
         _native_dit: Some(native_dit),
         residency,
         adapters: spec.adapters.clone(),
         has_diff_patch: adapters_have_diff_patch(&spec.adapters),
     })
+}
+
+/// Whether a registered primary-File provider may execute bounded transformer residency. The loader
+/// is physically reopenable, but the evidence matrix has no promoted File cell yet, so this remains
+/// false independently of a request's sequential/deferred shape.
+pub(crate) fn native_file_streamable(_spec: &LoadSpec) -> bool {
+    false
 }
 
 fn load_native_krea_heavy(

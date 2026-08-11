@@ -54,6 +54,25 @@ use crate::vae::{load_vae, load_vae_encoder, QwenVaeEncoder};
 /// runs **f32** (decode-precision-sensitive).
 const DIT_DTYPE: DType = DType::BF16;
 
+#[cfg(test)]
+type NativeDitLoadTestHook = Box<dyn FnMut(&Weights, &Device) -> Result<()>>;
+
+#[cfg(test)]
+thread_local! {
+    /// Deterministic barrier injected into the real native-file entrypoint after one provider tensor
+    /// has been consumed. Tests replace the selected path here; production builds contain no hook.
+    static NATIVE_DIT_LOAD_TEST_HOOK: std::cell::RefCell<Option<NativeDitLoadTestHook>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn run_native_dit_load_test_hook(weights: &Weights, device: &Device) -> Result<()> {
+    NATIVE_DIT_LOAD_TEST_HOOK.with(|slot| match slot.borrow_mut().as_mut() {
+        Some(hook) => hook(weights, device),
+        None => Ok(()),
+    })
+}
+
 /// Query-score budget used by the constrained-card rung. This matches the already GPU-validated Krea
 /// ControlNet chunk size: 128 Mi score elements (~512 MiB at f32) instead of the shared multi-GiB
 /// default. Chunking is only over independent query rows, so it does not alter the key/value domain.
@@ -675,11 +694,24 @@ fn load_native_dit(
     adapters: &[AdapterSpec],
     stream_blocks: bool,
 ) -> Result<Krea2Transformer> {
+    load_native_dit_at_dtype(root, native_dit, device, adapters, stream_blocks, DIT_DTYPE)
+}
+
+fn load_native_dit_at_dtype(
+    root: &Path,
+    native_dit: &gen_core::PinnedWeightsFile,
+    device: &Device,
+    adapters: &[AdapterSpec],
+    stream_blocks: bool,
+    dit_dtype: DType,
+) -> Result<Krea2Transformer> {
     native_dit.read_unchanged(|_| {
         let cfg = Krea2Config::from_snapshot(root)?;
         // Native keys ON, ConvRot OFF. Dense stores W directly; plain int8 reconstructs
         // W = codes * row_scale. Neither stores ConvRot's W·R, so neither may rotate.
-        let mut dit_w = Weights::from_pinned_native_file(native_dit, device, DIT_DTYPE)?;
+        let mut dit_w = Weights::from_pinned_native_file(native_dit, device, dit_dtype)?;
+        #[cfg(test)]
+        run_native_dit_load_test_hook(&dit_w, device)?;
         crate::convert::validate_native_transformer(&dit_w, &cfg)?;
         let diff = crate::adapters::fold_diff_patch(&mut dit_w, adapters)?;
         if stream_blocks && !adapters.is_empty() {
@@ -695,6 +727,12 @@ fn load_native_dit(
         if !adapters.is_empty() {
             crate::adapters::install_additive(&mut dit, adapters, diff.merged)?;
         }
+
+        // Both paths materialize mmap-backed payloads here: eager loads the complete DiT, while the
+        // streamed form eagerly loads its front/head tensors before deferring only transformer
+        // blocks. Finish those host-to-device reads before `read_unchanged` performs its post-check.
+        // Individual streamed block windows use the same guarded synchronization when opened.
+        device.synchronize()?;
 
         Ok(dit)
     })
@@ -1466,22 +1504,147 @@ fn load_dit_base_with<T>(
 /// multi-phase driver re-adapts between phases ([`Krea2Transformer::clear_adapters`] +
 /// [`crate::adapters::install_additive`] of the phase subset). It is owned by the render call and never
 /// the shared resident, so re-adapting it between phases can never race a concurrent generate.
+#[cfg(test)]
 fn load_dit_base(
     root: &Path,
     native_dit: Option<&gen_core::PinnedWeightsFile>,
     device: &Device,
+) -> Result<Krea2Transformer> {
+    load_dit_base_at_dtype(root, native_dit, device, DIT_DTYPE)
+}
+
+fn load_dit_base_at_dtype(
+    root: &Path,
+    native_dit: Option<&gen_core::PinnedWeightsFile>,
+    device: &Device,
+    dit_dtype: DType,
 ) -> Result<Krea2Transformer> {
     load_dit_base_with(
         root,
         native_dit,
         |transformer| {
             let cfg = Krea2Config::from_snapshot(root)?;
-            let dit_w = Weights::from_dir(&transformer, device, DIT_DTYPE)?;
+            let dit_w = Weights::from_dir(transformer, device, dit_dtype)?;
             crate::convert::validate_transformer(&dit_w, &cfg)?;
             Ok(Krea2Transformer::load(&dit_w, &cfg)?)
         },
-        |source| load_native_dit(root, source, device, &[], false),
+        |source| load_native_dit_at_dtype(root, source, device, &[], false, dit_dtype),
     )
+}
+
+/// Make one resolved multi-phase adapter subset authoritative on the job-local DiT. This is the
+/// production phase-boundary operation: prior residuals are released before the selected subset is
+/// materialized from its real adapter files. Keeping it as one operation lets regression coverage
+/// exercise the exact state transition used by [`render_multiphase`] without constructing the VAE.
+fn materialize_multiphase_adapter_set(
+    dit: &mut Krea2Transformer,
+    specs: &[AdapterSpec],
+) -> Result<crate::adapters::AdditiveReport> {
+    dit.clear_adapters()?;
+    if specs.is_empty() {
+        return Ok(crate::adapters::AdditiveReport::default());
+    }
+    crate::adapters::install_additive(dit, specs, 0)
+}
+
+type MultiphaseAdapterStateObserver<'a> = dyn FnMut(Option<usize>, &[AdapterSpec], &crate::adapters::AdditiveReport, &mut Krea2Transformer)
+    + 'a;
+
+/// The production multi-phase render driver. The public provider wrapper supplies the production DiT
+/// dtype and VAE decoder; the test-only call supplies F32 and an identity decoder because Candle CPU
+/// cannot execute BF16 matmul. Loading, native-file pinning, noise initialization, global schedule,
+/// phase transitions, sampler forwards, progress, and final adapter release are otherwise identical.
+#[allow(clippy::too_many_arguments)]
+fn render_multiphase_driver<T>(
+    root: &Path,
+    native_dit: Option<&gen_core::PinnedWeightsFile>,
+    device: &Device,
+    resolved: &[crate::multiphase::ResolvedPhase],
+    all_specs: &[AdapterSpec],
+    context: &Tensor,
+    neg_context: Option<&Tensor>,
+    req: &GenerationRequest,
+    on_progress: &mut dyn FnMut(Progress),
+    dit_dtype: DType,
+    on_adapter_state: &mut MultiphaseAdapterStateObserver<'_>,
+    decode: &mut dyn FnMut(&Tensor) -> Result<T>,
+) -> Result<Vec<T>> {
+    // ONE global Raw schedule for the TOTAL step budget (sum of the phases' steps) — the crux that keeps
+    // the sigma trajectory continuous across boundaries (no per-phase recompute / reset).
+    let total = resolved.last().map(|p| p.slice.end).unwrap_or(0);
+    let sigmas = base_schedule(total, req.width, req.height, req.scheduler.as_deref());
+    let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+
+    // The job-local base DiT the phases re-adapt (never the shared resident) — built ONCE per request and
+    // reused across the seed loop. Pre-resolve each phase's adapter spec subset (host-cheap; the adapter
+    // files are read at install time inside the loop).
+    let mut dit = load_dit_base_at_dtype(root, native_dit, device, dit_dtype)?;
+    let phase_specs: Vec<Vec<AdapterSpec>> = resolved
+        .iter()
+        .map(|p| crate::multiphase::phase_spec_subset(p, all_specs))
+        .collect();
+
+    let outputs = candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+        // Phase 0 starts from the initial noise at sigmas[0]; each subsequent phase resumes from the prior
+        // phase's output latent at the SHARED boundary sigma.
+        let mut latent = init_noise(req.height, req.width, seed, device)?;
+        // ONE preview counter over the GLOBAL schedule, per image: each phase drives the sampler over a
+        // contiguous slice, so per-call numbering would restart every phase at frame 1. Built inside the
+        // seed loop because a counter is per trajectory — reusing it would starve image 2 of frames.
+        let preview_counter = crate::preview::multiphase_counter(&sigmas);
+        let preview = crate::preview::multiphase_hook(&req.preview, &preview_counter, &sigmas);
+        for (phase_index, (phase, specs)) in resolved.iter().zip(&phase_specs).enumerate() {
+            // Re-adapt the job-local DiT to THIS phase's adapter set: clear the prior phase's residuals,
+            // then install the current subset (empty ⇒ bare base). Authoritative regardless of what the
+            // prior phase installed.
+            let report = materialize_multiphase_adapter_set(&mut dit, specs)?;
+            on_adapter_state(Some(phase_index), specs, &report, &mut dit);
+            let end = phase.slice.end.min(sigmas.len().saturating_sub(1));
+            let start = phase.slice.start.min(end);
+            let sub = &sigmas[start..=end];
+            let guidance = phase.guidance;
+            latent = candle_gen::run_flow_sampler(
+                req.sampler.as_deref(),
+                TimestepConvention::Sigma,
+                sub,
+                latent,
+                seed,
+                &req.cancel,
+                on_progress,
+                Some(&preview),
+                |x, timestep| -> Result<Tensor> {
+                    let t = Tensor::from_vec(vec![timestep], (1,), device)?;
+                    let cond = dit.forward(x, &t, context)?;
+                    // Per-phase CFG: two forwards combined by the reference `krea_cfg_combine` when
+                    // guidance > 0; else the bare conditional velocity (single forward).
+                    let v = if guidance > 0.0 {
+                        let nc = neg_context.ok_or_else(|| {
+                            CandleError::Msg(
+                                "krea_2 multi-phase: a CFG phase (guidance > 0) requires the \
+                                 unconditional context, but none was encoded"
+                                    .into(),
+                            )
+                        })?;
+                        let uncond = dit.forward(x, &t, nc)?;
+                        krea_cfg_combine(&cond, &uncond, guidance)?
+                    } else {
+                        cond
+                    };
+                    Ok(v.to_dtype(DType::F32)?)
+                },
+            )?;
+        }
+        on_progress(Progress::Decoding);
+        decode(&latent)
+    })?;
+
+    // Release the final phase's residual tensors before returning rather than relying on the
+    // job-local DiT's destructor. This makes the lifetime boundary explicit and keeps repeated
+    // requests from retaining the last adapter subset until an outer owner happens to drop.
+    dit.clear_adapters()?;
+    let released = crate::adapters::AdditiveReport::default();
+    on_adapter_state(None, &[], &released, &mut dit);
+    Ok(outputs)
 }
 
 /// **Multi-phase Raw render** (epic 13879, sc-13887) — drive the resolved per-phase plan over ONE global
@@ -1519,77 +1682,26 @@ pub(crate) fn render_multiphase(
     req: &GenerationRequest,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Vec<Image>> {
-    // ONE global Raw schedule for the TOTAL step budget (sum of the phases' steps) — the crux that keeps
-    // the sigma trajectory continuous across boundaries (no per-phase recompute / reset).
-    let total = resolved.last().map(|p| p.slice.end).unwrap_or(0);
-    let sigmas = base_schedule(total, req.width, req.height, req.scheduler.as_deref());
-    let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
-
-    // The job-local base DiT the phases re-adapt (never the shared resident) — built ONCE per request and
-    // reused across the seed loop. Pre-resolve each phase's adapter spec subset (host-cheap; the adapter
-    // files are read at install time inside the loop).
-    let mut dit = load_dit_base(root, native_dit, device)?;
-    let phase_specs: Vec<Vec<AdapterSpec>> = resolved
-        .iter()
-        .map(|p| crate::multiphase::phase_spec_subset(p, all_specs))
-        .collect();
-
-    candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
-        // Phase 0 starts from the initial noise at sigmas[0]; each subsequent phase resumes from the prior
-        // phase's output latent at the SHARED boundary sigma.
-        let mut latent = init_noise(req.height, req.width, seed, device)?;
-        // ONE preview counter over the GLOBAL schedule, per image: each phase drives the sampler over a
-        // contiguous slice, so per-call numbering would restart every phase at frame 1. Built inside the
-        // seed loop because a counter is per trajectory — reusing it would starve image 2 of frames.
-        let preview_counter = crate::preview::multiphase_counter(&sigmas);
-        let preview = crate::preview::multiphase_hook(&req.preview, &preview_counter, &sigmas);
-        for (phase, specs) in resolved.iter().zip(&phase_specs) {
-            // Re-adapt the job-local DiT to THIS phase's adapter set: clear the prior phase's residuals,
-            // then install the current subset (empty ⇒ bare base). Authoritative regardless of what the
-            // prior phase installed.
-            dit.clear_adapters()?;
-            if !specs.is_empty() {
-                crate::adapters::install_additive(&mut dit, specs, 0)?;
-            }
-            let end = phase.slice.end.min(sigmas.len().saturating_sub(1));
-            let start = phase.slice.start.min(end);
-            let sub = &sigmas[start..=end];
-            let guidance = phase.guidance;
-            latent = candle_gen::run_flow_sampler(
-                req.sampler.as_deref(),
-                TimestepConvention::Sigma,
-                sub,
-                latent,
-                seed,
-                &req.cancel,
-                on_progress,
-                Some(&preview),
-                |x, timestep| -> Result<Tensor> {
-                    let t = Tensor::from_vec(vec![timestep], (1,), device)?;
-                    let cond = dit.forward(x, &t, context)?;
-                    // Per-phase CFG: two forwards combined by the reference `krea_cfg_combine` when
-                    // guidance > 0; else the bare conditional velocity (single forward).
-                    let v = if guidance > 0.0 {
-                        let nc = neg_context.ok_or_else(|| {
-                            CandleError::Msg(
-                                "krea_2 multi-phase: a CFG phase (guidance > 0) requires the \
-                                 unconditional context, but none was encoded"
-                                    .into(),
-                            )
-                        })?;
-                        let uncond = dit.forward(x, &t, nc)?;
-                        krea_cfg_combine(&cond, &uncond, guidance)?
-                    } else {
-                        cond
-                    };
-                    Ok(v.to_dtype(DType::F32)?)
-                },
-            )?;
-        }
-        on_progress(Progress::Decoding);
-        let decoded = vae.decode(&latent)?.to_dtype(DType::F32)?;
+    let mut on_adapter_state =
+        |_, _: &[AdapterSpec], _: &crate::adapters::AdditiveReport, _: &mut Krea2Transformer| {};
+    let mut decode = |latent: &Tensor| {
+        let decoded = vae.decode(latent)?.to_dtype(DType::F32)?;
         to_image(&decoded)
-    })
+    };
+    render_multiphase_driver(
+        root,
+        native_dit,
+        device,
+        resolved,
+        all_specs,
+        context,
+        neg_context,
+        req,
+        on_progress,
+        DIT_DTYPE,
+        &mut on_adapter_state,
+        &mut decode,
+    )
 }
 
 /// Render the **Raw img2img** (reference-guided latent-init under full classifier-free guidance) path
@@ -2257,41 +2369,319 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resident_and_sequential_multiphase_take_the_real_imported_loader_arm() {
-        use std::cell::Cell;
+    fn native_file_entrypoint_postchecks_after_provider_payload_consumption() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Barrier};
 
         let tmp = tempfile::tempdir().unwrap();
-        let root = Path::new("/models/krea");
-        let imported = tmp.path().join("fine-tune.safetensors");
-        std::fs::write(&imported, b"source identity fixture").unwrap();
-        let pinned = gen_core::PinnedWeightsFile::pin(&imported).unwrap();
-        assert_eq!(
-            multiphase_dit_source(root, None),
-            MultiphaseDitSource::SnapshotDir(root.join("transformer"))
-        );
-        for residency in ["Resident", "Sequential"] {
-            let snapshot_arm = Cell::new(false);
-            let native_arm = Cell::new(false);
-            let selected = load_dit_base_with(
-                root,
-                Some(&pinned),
-                |_| {
-                    snapshot_arm.set(true);
-                    Ok(PathBuf::new())
-                },
-                |source| {
-                    native_arm.set(true);
-                    Ok(source.loader_path().to_path_buf())
-                },
+        let (root, source, _) = crate::testfix::tiny_native_transformer_fixture(&tmp);
+        let replacement = tmp.path().join("tiny-native.replacement.safetensors");
+        std::fs::copy(&source, &replacement).unwrap();
+        let pinned = gen_core::PinnedWeightsFile::pin(&source).unwrap();
+
+        let first_consumed = Arc::new(Barrier::new(2));
+        let replacement_done = Arc::new(Barrier::new(2));
+        let payload_consumed = Arc::new(AtomicBool::new(false));
+        let writer_first = Arc::clone(&first_consumed);
+        let writer_done = Arc::clone(&replacement_done);
+        let writer_source = source.clone();
+        let writer = std::thread::spawn(move || {
+            writer_first.wait();
+            #[cfg(unix)]
+            std::fs::rename(replacement, writer_source).unwrap();
+            #[cfg(not(unix))]
+            {
+                let bytes = std::fs::read(replacement).unwrap();
+                std::fs::write(writer_source, bytes).unwrap();
+            }
+            writer_done.wait();
+        });
+
+        let hook_first = Arc::clone(&first_consumed);
+        let hook_done = Arc::clone(&replacement_done);
+        let hook_consumed = Arc::clone(&payload_consumed);
+        NATIVE_DIT_LOAD_TEST_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |weights, device| {
+                let first = weights
+                    .get("img_in.weight")?
+                    .to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                assert!(!first.is_empty());
+                device.synchronize()?;
+                hook_consumed.store(true, Ordering::SeqCst);
+                hook_first.wait();
+                hook_done.wait();
+                Ok(())
+            }));
+        });
+
+        let result = load_native_dit_at_dtype(&root, &pinned, &Device::Cpu, &[], false, DType::F32);
+        NATIVE_DIT_LOAD_TEST_HOOK.with(|slot| *slot.borrow_mut() = None);
+        writer.join().unwrap();
+
+        assert!(payload_consumed.load(Ordering::SeqCst));
+        let error = result
+            .err()
+            .expect("mid-load replacement must invalidate the production native-file entrypoint")
+            .to_string();
+        assert!(error.contains("changed after load"), "unexpected: {error}");
+    }
+
+    #[test]
+    fn request_scoped_residencies_keep_multiphase_on_the_pinned_native_loader() {
+        use candle_gen::gen_core::{AdapterKind, GenerationPhase, PhaseAdapter};
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+
+        struct DropWitness {
+            event: &'static str,
+            log: Arc<Mutex<Vec<&'static str>>>,
+        }
+        impl Drop for DropWitness {
+            fn drop(&mut self) {
+                self.log.lock().unwrap().push(self.event);
+            }
+        }
+        struct ResidentHeavy {
+            // Keep an actually loaded provider DiT under the residency owner, exactly as the real
+            // heavy bundle does. The job-local render DiT below is deliberately a second load.
+            _dit: Krea2Transformer,
+            _release: DropWitness,
+        }
+
+        fn write_lora(
+            tmp: &tempfile::TempDir,
+            file: &str,
+            target: &str,
+            out_dim: usize,
+            sign: f32,
+        ) -> PathBuf {
+            let path = tmp.path().join(file);
+            let down = Tensor::from_vec(vec![0.05f32; 32], (1, 32), &Device::Cpu).unwrap();
+            let up = Tensor::from_vec(vec![sign * 0.05f32; out_dim], (out_dim, 1), &Device::Cpu)
+                .unwrap();
+            candle_gen::candle_core::safetensors::save(
+                &HashMap::from([
+                    (format!("{target}.lora_A.weight"), down),
+                    (format!("{target}.lora_B.weight"), up),
+                ]),
+                &path,
             )
             .unwrap();
-            assert!(!snapshot_arm.get(), "{residency} used the snapshot DiT arm");
-            assert!(native_arm.get(), "{residency} did not use the imported arm");
-            assert_eq!(
-                selected,
-                std::path::absolute(&imported).unwrap(),
-                "{residency}"
+            path
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, imported, cfg) = crate::testfix::tiny_native_transformer_fixture(&tmp);
+        let pinned = gen_core::PinnedWeightsFile::pin(&imported).unwrap();
+        assert_eq!(
+            multiphase_dit_source(&root, Some(&pinned)),
+            MultiphaseDitSource::NativeFile(pinned.clone())
+        );
+        assert!(
+            !root.join("transformer/model.safetensors").exists(),
+            "fixture must make snapshot fallback impossible"
+        );
+
+        let adapter_a = AdapterSpec::new(
+            write_lora(
+                &tmp,
+                "phase-a.safetensors",
+                "transformer_blocks.0.attn.to_q",
+                cfg.q_dim(),
+                1.0,
+            ),
+            1.0,
+            AdapterKind::Lora,
+        );
+        let adapter_b = AdapterSpec::new(
+            write_lora(
+                &tmp,
+                "phase-b.safetensors",
+                "transformer_blocks.0.attn.to_k",
+                cfg.kv_dim(),
+                -1.0,
+            ),
+            1.0,
+            AdapterKind::Lora,
+        );
+        let all_specs = vec![adapter_a.clone(), adapter_b.clone()];
+        let resolved = crate::multiphase::resolve_phases(
+            &[
+                GenerationPhase {
+                    steps: 1,
+                    guidance: Some(0.0),
+                    adapters: vec![PhaseAdapter {
+                        adapter: 0,
+                        weight: None,
+                    }],
+                },
+                GenerationPhase {
+                    steps: 1,
+                    guidance: Some(0.0),
+                    adapters: vec![PhaseAdapter {
+                        adapter: 1,
+                        weight: Some(0.75),
+                    }],
+                },
+            ],
+            0.0,
+            all_specs.len(),
+            "krea_2_raw",
+        )
+        .unwrap();
+
+        // Exercise both request-scoped production residency arms. Each owns a real native-loaded
+        // resident DiT, while the render closure invokes the exact production multi-phase driver:
+        // native pin, generated noise, global schedule, phase adapter transitions, sampler forwards,
+        // decoder boundary, and explicit final adapter release. Only BF16 and VAE decode are swapped
+        // for CPU-executable F32 and an identity decoder.
+        for stage_residency in [false, true] {
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let text_log = Arc::clone(&log);
+            let heavy_log = Arc::clone(&log);
+            let heavy_root = root.clone();
+            let heavy_pin = pinned.clone();
+            let residency = candle_gen::Residency::<DropWitness, ResidentHeavy>::request_scoped(
+                move |_| {
+                    text_log.lock().unwrap().push("load-text");
+                    Ok(DropWitness {
+                        event: "drop-text",
+                        log: Arc::clone(&text_log),
+                    })
+                },
+                move |_, _| {
+                    heavy_log.lock().unwrap().push("load-heavy");
+                    Ok(ResidentHeavy {
+                        _dit: load_dit_base(&heavy_root, Some(&heavy_pin), &Device::Cpu)?,
+                        _release: DropWitness {
+                            event: "drop-heavy",
+                            log: Arc::clone(&heavy_log),
+                        },
+                    })
+                },
             );
+
+            residency
+                .run_request_scoped(
+                    stage_residency,
+                    false,
+                    &gen_core::CancelFlag::new(),
+                    false,
+                    &mut |_| {},
+                    |_| {
+                        log.lock().unwrap().push("encode");
+                        Ok(())
+                    },
+                    |_| {
+                        log.lock().unwrap().push("materialize-encoding");
+                        Ok(())
+                    },
+                    |_, _, _| {
+                        log.lock().unwrap().push("render");
+                        // CPU Candle cannot execute BF16 matmul. Keep the resident-side load above on
+                        // the exact production BF16 entry point, then run the production driver at F32.
+                        let (_, context, _) = crate::testfix::tiny_batch(&cfg);
+                        let context = context.unsqueeze(0)?;
+                        let request = GenerationRequest {
+                            width: 32,
+                            height: 32,
+                            count: 1,
+                            seed: Some(0x5eed),
+                            ..Default::default()
+                        };
+                        let adapter_log = Arc::clone(&log);
+                        let mut on_adapter_state =
+                            |phase: Option<usize>,
+                             specs: &[AdapterSpec],
+                             report: &crate::adapters::AdditiveReport,
+                             dit: &mut Krea2Transformer| {
+                                match phase {
+                                    Some(0) => {
+                                        assert_eq!(specs.len(), 1);
+                                        assert_eq!(specs[0].path, all_specs[0].path);
+                                        assert_eq!(report.applied, 1);
+                                        assert!(dit.adapted_projection_count().unwrap() > 0);
+                                        adapter_log.lock().unwrap().push("materialize-phase-a");
+                                    }
+                                    Some(1) => {
+                                        assert_eq!(specs.len(), 1);
+                                        assert_eq!(specs[0].path, all_specs[1].path);
+                                        assert_eq!(specs[0].scale, 0.75);
+                                        assert_eq!(report.applied, 1);
+                                        assert!(dit.adapted_projection_count().unwrap() > 0);
+                                        adapter_log.lock().unwrap().push("materialize-phase-b");
+                                    }
+                                    None => {
+                                        assert!(specs.is_empty());
+                                        assert_eq!(report.applied, 0);
+                                        assert_eq!(dit.adapted_projection_count().unwrap(), 0);
+                                        adapter_log.lock().unwrap().push("release-phase-adapters");
+                                    }
+                                    Some(index) => panic!("unexpected phase {index}"),
+                                }
+                            };
+                        let mut decode = |latent: &Tensor| -> Result<Tensor> {
+                            assert_eq!(latent.dims(), &[1, LATENT_CHANNELS, 4, 4]);
+                            Ok(latent.clone())
+                        };
+                        let images = render_multiphase_driver(
+                            &root,
+                            Some(&pinned),
+                            &Device::Cpu,
+                            &resolved,
+                            &all_specs,
+                            &context,
+                            None,
+                            &request,
+                            &mut |_| {},
+                            DType::F32,
+                            &mut on_adapter_state,
+                            &mut decode,
+                        )?;
+                        assert_eq!(images.len(), 1);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+
+            let before_owner_drop = log.lock().unwrap().clone();
+            let phase_a = before_owner_drop
+                .iter()
+                .position(|event| *event == "materialize-phase-a")
+                .unwrap();
+            let phase_b = before_owner_drop
+                .iter()
+                .position(|event| *event == "materialize-phase-b")
+                .unwrap();
+            let released = before_owner_drop
+                .iter()
+                .position(|event| *event == "release-phase-adapters")
+                .unwrap();
+            assert!(phase_a < phase_b && phase_b < released);
+            if stage_residency {
+                let text_drop = before_owner_drop
+                    .iter()
+                    .position(|event| *event == "drop-text")
+                    .unwrap();
+                let heavy_load = before_owner_drop
+                    .iter()
+                    .position(|event| *event == "load-heavy")
+                    .unwrap();
+                let heavy_drop = before_owner_drop
+                    .iter()
+                    .position(|event| *event == "drop-heavy")
+                    .unwrap();
+                assert!(text_drop < heavy_load && released < heavy_drop);
+            } else {
+                assert!(!before_owner_drop.contains(&"drop-text"));
+                assert!(!before_owner_drop.contains(&"drop-heavy"));
+            }
+            drop(residency);
+            let after_owner_drop = log.lock().unwrap();
+            assert!(after_owner_drop.contains(&"drop-text"));
+            assert!(after_owner_drop.contains(&"drop-heavy"));
         }
     }
 

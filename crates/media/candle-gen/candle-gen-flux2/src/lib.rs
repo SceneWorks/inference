@@ -134,6 +134,28 @@ enum HeavyPhase {
 
 type Flux2Residency = candle_gen::Residency<TextPhase, HeavyPhase>;
 
+#[cfg(test)]
+type ComfyuiDitLoadTestHook =
+    Box<dyn FnMut(&candle_gen::candle_core::safetensors::MmapedSafetensors) -> CResult<()>>;
+
+#[cfg(test)]
+thread_local! {
+    /// Deterministic barrier inside the real FLUX.2 ComfyUI loader after one mmap-backed provider
+    /// tensor is consumed and before conversion/model assembly returns to the pin post-check.
+    static COMFYUI_DIT_LOAD_TEST_HOOK: std::cell::RefCell<Option<ComfyuiDitLoadTestHook>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn run_comfyui_dit_load_test_hook(
+    source: &candle_gen::candle_core::safetensors::MmapedSafetensors,
+) -> CResult<()> {
+    COMFYUI_DIT_LOAD_TEST_HOOK.with(|slot| match slot.borrow_mut().as_mut() {
+        Some(hook) => hook(source),
+        None => Ok(()),
+    })
+}
+
 /// A txt2img pipeline handle: snapshot root + device + the f32 compute dtype. `pub(crate)` so the
 /// edit provider ([`edit_provider`]) reuses the snapshot mmap + prompt-encode scaffolding.
 #[derive(Clone)]
@@ -500,17 +522,22 @@ impl Pipeline {
                     .map_err(|e| {
                     CandleError::Msg(format!("flux2 comfyui: mmap {}: {e}", dit_path.display()))
                 })?;
+            #[cfg(test)]
+            run_comfyui_dit_load_test_hook(&mmap)?;
             let map = convert::build_comfyui_dit_map(&mmap, self.dtype)?;
             match self.quant {
                 Some(q) => {
                     let vb = VarBuilder::from_tensors(map, self.dtype, &Device::Cpu);
                     let mut dit = Flux2Transformer::new(&self.cfg, vb)?;
                     dit.quantize(q, &self.device)?;
+                    self.device.synchronize()?;
                     Ok(dit)
                 }
                 None => {
                     let vb = VarBuilder::from_tensors(map, self.dtype, &self.device);
-                    Ok(Flux2Transformer::new(&self.cfg, vb)?)
+                    let dit = Flux2Transformer::new(&self.cfg, vb)?;
+                    self.device.synchronize()?;
+                    Ok(dit)
                 }
             }
         })
@@ -1162,12 +1189,12 @@ fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> gen_core::Result<Box<
     Ok(Box::new(load_variant_concrete(variant, spec)?))
 }
 
-fn load_variant_concrete(
+pub(crate) fn validate_load_spec(
     variant: Flux2Variant,
     spec: &LoadSpec,
-) -> gen_core::Result<Flux2Generator> {
+) -> gen_core::Result<Option<Quant>> {
     let id = variant.id();
-    let root = gen_core::require_base_snapshot(spec, id)?.to_path_buf();
+    let _ = gen_core::require_base_snapshot(spec, id)?;
     if matches!(spec.weights, WeightsSource::File(_)) && !variant.is_dev() {
         return Err(gen_core::Error::Unsupported(format!(
             "{id} does not support imported single-file weights; only flux2_dev does"
@@ -1195,11 +1222,26 @@ fn load_variant_concrete(
     // + the ~24B Mistral TE (neither fits the GPU dense), klein (sc-11031) folds ONLY the 9B DiT and
     // keeps the 8B Qwen3 TE DENSE bf16 in every tier (epic 8506 DENSE_TE — see `Pipeline::te_quant`).
     let quant = memory_strategy::resolved_quant(spec)?;
+    if quant == Some(Quant::Nvfp4) {
+        return Err(gen_core::Error::Unsupported(format!(
+            "candle {id} does not support NVFP4 load-time folding"
+        )));
+    }
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
             "candle {id} does not support control / IP-adapter / edit yet (txt2img only)"
         )));
     }
+    Ok(quant)
+}
+
+fn load_variant_concrete(
+    variant: Flux2Variant,
+    spec: &LoadSpec,
+) -> gen_core::Result<Flux2Generator> {
+    let id = variant.id();
+    let quant = validate_load_spec(variant, spec)?;
+    let root = gen_core::require_base_snapshot(spec, id)?.to_path_buf();
     let device = candle_gen::default_device()?;
     let pipe = match &spec.weights {
         WeightsSource::Dir(_) => Pipeline::load(variant, quant, &root, &device, spec.pid.clone()),
@@ -1323,6 +1365,75 @@ mod tests {
     use super::*;
     use crate::config::{FLUX2_DEV_ID, FLUX2_KLEIN_9B_ID};
     use candle_gen::gen_core::ConditioningKind;
+
+    #[test]
+    fn comfyui_dit_entrypoint_postchecks_after_provider_payload_consumption() {
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("flux2-comfyui.safetensors");
+        let replacement = tmp.path().join("flux2-comfyui.replacement.safetensors");
+        for (path, value) in [(&source, 0.25_f32), (&replacement, -0.25_f32)] {
+            candle_gen::candle_core::safetensors::save(
+                &HashMap::from([(
+                    "fixture.weight".to_owned(),
+                    Tensor::from_vec(vec![value; 64], (8, 8), &Device::Cpu).unwrap(),
+                )]),
+                path,
+            )
+            .unwrap();
+        }
+        let pipeline =
+            Pipeline::load_comfyui(None, tmp.path(), &Device::Cpu, &source, None).unwrap();
+
+        let payload_consumed = Arc::new(AtomicBool::new(false));
+        let first_consumed = Arc::new(Barrier::new(2));
+        let replacement_done = Arc::new(Barrier::new(2));
+        let writer_first = Arc::clone(&first_consumed);
+        let writer_done = Arc::clone(&replacement_done);
+        let writer_source = source.clone();
+        let writer = std::thread::spawn(move || {
+            writer_first.wait();
+            #[cfg(unix)]
+            std::fs::rename(replacement, writer_source).unwrap();
+            #[cfg(not(unix))]
+            {
+                let bytes = std::fs::read(replacement).unwrap();
+                std::fs::write(writer_source, bytes).unwrap();
+            }
+            writer_done.wait();
+        });
+
+        let hook_consumed = Arc::clone(&payload_consumed);
+        let hook_first = Arc::clone(&first_consumed);
+        let hook_done = Arc::clone(&replacement_done);
+        COMFYUI_DIT_LOAD_TEST_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |source| {
+                let first = source
+                    .load("fixture.weight", &Device::Cpu)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                assert!(first.iter().all(|value| *value == 0.25));
+                hook_consumed.store(true, Ordering::SeqCst);
+                hook_first.wait();
+                hook_done.wait();
+                Ok(())
+            }));
+        });
+
+        let result = pipeline.load_dit_seq();
+        COMFYUI_DIT_LOAD_TEST_HOOK.with(|slot| *slot.borrow_mut() = None);
+        writer.join().unwrap();
+
+        assert!(payload_consumed.load(Ordering::SeqCst));
+        let error = result
+            .err()
+            .expect("mid-load replacement must invalidate the production FLUX.2 File entrypoint")
+            .to_string();
+        assert!(error.contains("changed after load"), "unexpected: {error}");
+    }
 
     #[test]
     fn bespoke_request_finalizes_success_cancellation_and_error() {
@@ -1936,15 +2047,38 @@ mod tests {
     }
 
     /// The in-place ComfyUI DiT entry point (epic 10451 Phase 2e, sc-10680) builds a lazy dev generator
-    /// without touching weights: it stamps the dev descriptor + carries the DiT file, and the resident
-    /// snapshot dir is the root supplying the TE/VAE/tokenizer. Loading is lazy, so this asserts the
-    /// plumbing on CPU with no weights (the render itself is GPU-validated separately).
+    /// without materializing weights: it stamps the dev descriptor + carries the DiT file, and the
+    /// resident snapshot dir is the root supplying the TE/VAE/tokenizer. Construction reads the small
+    /// safetensors headers for exact memory facts, but tensor payloads remain lazy (the render itself is
+    /// GPU-validated separately).
     #[test]
     fn load_from_comfyui_dit_builds_lazy_dev_generator() {
+        use candle_gen::candle_core::safetensors;
+        use std::collections::HashMap;
+
         let dir = tempfile::tempdir().expect("temp dir");
+        let snapshot = dir.path().join("snapshot");
+        for component in ["text_encoder", "vae"] {
+            std::fs::create_dir_all(snapshot.join(component)).unwrap();
+            safetensors::save(
+                &HashMap::from([(
+                    "fixture.weight".to_string(),
+                    Tensor::zeros((2, 32), DType::F32, &Device::Cpu).unwrap(),
+                )]),
+                snapshot.join(component).join("model.safetensors"),
+            )
+            .unwrap();
+        }
         let dit = dir.path().join("flux2_dev_fp8mixed.safetensors");
-        std::fs::write(&dit, b"not safetensors").expect("write pinned fixture");
-        let g = load_from_comfyui_dit(&dit, "/snap/flux2-dev", Some(Quant::Q8))
+        safetensors::save(
+            &HashMap::from([(
+                "double_blocks.0.img_mlp.0.weight".to_string(),
+                Tensor::zeros((2, 32), DType::F32, &Device::Cpu).unwrap(),
+            )]),
+            &dit,
+        )
+        .unwrap();
+        let g = load_from_comfyui_dit(&dit, &snapshot, Some(Quant::Q8))
             .expect("comfyui dev generator builds lazily");
         assert_eq!(g.descriptor().id, FLUX2_DEV_ID);
         assert_eq!(g.descriptor().family, "flux2");

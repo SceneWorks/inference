@@ -514,9 +514,9 @@ fn comfyui_sources_from_spec(
 /// are accepted and merged into the DiT at first `generate` (sc-5166); on-the-fly quantization and
 /// control/IP-adapter overlays are still rejected — not wired, so refusing is more honest than
 /// silently dropping them (the worker falls back to Python).
-pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    let comfyui = comfyui_sources_from_spec(spec)?;
-    let root = gen_core::require_base_snapshot(spec, MODEL_ID)?.to_path_buf();
+pub(crate) fn validate_load_spec(spec: &LoadSpec) -> gen_core::Result<()> {
+    let _ = comfyui_sources_from_spec(spec)?;
+    let _ = gen_core::require_base_snapshot(spec, MODEL_ID)?;
     if matches!(spec.weights, WeightsSource::Dir(_)) {
         gen_core::reject_unknown_components(spec, &[], MODEL_ID)?;
     }
@@ -545,6 +545,14 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
                 .into(),
         ));
     }
+    let _ = memory_strategy::snapshot_quant_tier(spec, MODEL_ID)?;
+    Ok(())
+}
+
+pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    validate_load_spec(spec)?;
+    let comfyui = comfyui_sources_from_spec(spec)?;
+    let root = gen_core::require_base_snapshot(spec, MODEL_ID)?.to_path_buf();
     let loaded_quant = memory_strategy::snapshot_quant_tier(spec, MODEL_ID)?;
     // Z-Image is a bf16 model; load at bf16 regardless of the CPU-default dtype. The device is the
     // backend selected at compile time (CUDA on Windows, Metal/CPU on Mac).

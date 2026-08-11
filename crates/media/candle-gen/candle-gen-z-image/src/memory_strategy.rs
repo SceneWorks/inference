@@ -36,11 +36,57 @@ pub(crate) const CONTROL_CALIBRATION_FINGERPRINT: &str =
     "z-image-cuda-base-control-host-decode-streamed-device-format-blocks-v2";
 
 #[cfg(any(feature = "cuda", test))]
+fn imported_tensor_bytes(
+    tensor: &gen_core::weightsmeta::SafetensorsTensorHeader,
+    loaded_name: &str,
+    component: &str,
+) -> gen_core::Result<u64> {
+    use gen_core::weightsmeta::Dtype;
+
+    // `candle_core::safetensors::load` first materializes every source tensor. U16 is promoted to
+    // Candle's U32 storage; the remaining accepted integer widths stay native. Every float then
+    // passes through `normalize_fp8_map(..., BF16)`, including dense f32/f64 and plain/scaled fp8.
+    let loaded = match tensor.dtype {
+        Dtype::U8 | Dtype::U32 | Dtype::I16 | Dtype::I32 | Dtype::I64 => tensor.data_bytes,
+        Dtype::U16 => tensor.materialized_bytes(4)?,
+        Dtype::F8_E4M3 | Dtype::F16 | Dtype::BF16 | Dtype::F32 | Dtype::F64 => {
+            tensor.materialized_bytes(2)?
+        }
+        dtype => {
+            return Err(gen_core::Error::Unsupported(format!(
+                "z-image imported {component} tensor {:?} uses unsupported Candle dtype {dtype:?}",
+                tensor.name
+            )))
+        }
+    };
+    // Test the key *after* any combined-checkpoint component prefix is stripped. That is the key
+    // `normalize_fp8_map` sees, so a combined `model.diffusion_model.scaled_fp8` marker is omitted
+    // exactly like a standalone transformer's unprefixed `scaled_fp8` marker.
+    if loaded_name == "scaled_fp8"
+        || loaded_name.ends_with(".scale_weight")
+        || loaded_name.ends_with(".weight_scale")
+        || loaded_name.ends_with(".scale_input")
+        || loaded_name.ends_with(".input_scale")
+    {
+        Ok(0)
+    } else {
+        Ok(loaded)
+    }
+}
+
+#[cfg(any(feature = "cuda", test))]
 fn single_file_tensor_bytes(path: &std::path::Path, component: &str) -> gen_core::Result<u64> {
     let bytes = gen_core::weightsmeta::safetensors_path_tensor_headers(path)?
-        .into_iter()
-        .map(|tensor| tensor.data_bytes)
-        .sum::<u64>();
+        .iter()
+        .try_fold(0_u64, |total, tensor| {
+            total
+                .checked_add(imported_tensor_bytes(tensor, &tensor.name, component)?)
+                .ok_or_else(|| {
+                    gen_core::Error::Msg(format!(
+                        "z-image imported {component} resident byte sum overflow"
+                    ))
+                })
+        })?;
     if bytes == 0 {
         return Err(gen_core::Error::Msg(format!(
             "z-image imported {component} '{}' contains no tensor bytes",
@@ -82,15 +128,29 @@ fn combined_file_components(path: &std::path::Path) -> gen_core::Result<PerCompo
                 tensor.name
             )));
         }
+        let resident_bytes = imported_tensor_bytes(&tensor, mapped, component_name)?;
         match component {
             crate::comfyui::CombinedComponent::Transformer => {
-                components.dit = components.dit.saturating_add(tensor.data_bytes)
+                components.dit = components.dit.checked_add(resident_bytes).ok_or_else(|| {
+                    gen_core::Error::Msg(
+                        "z-image combined transformer resident byte sum overflow".into(),
+                    )
+                })?
             }
             crate::comfyui::CombinedComponent::TextEncoder => {
-                components.text_encoder = components.text_encoder.saturating_add(tensor.data_bytes)
+                components.text_encoder = components
+                    .text_encoder
+                    .checked_add(resident_bytes)
+                    .ok_or_else(|| {
+                        gen_core::Error::Msg(
+                            "z-image combined text-encoder resident byte sum overflow".into(),
+                        )
+                    })?
             }
             crate::comfyui::CombinedComponent::Vae => {
-                components.vae = components.vae.saturating_add(tensor.data_bytes)
+                components.vae = components.vae.checked_add(resident_bytes).ok_or_else(|| {
+                    gen_core::Error::Msg("z-image combined VAE resident byte sum overflow".into())
+                })?
             }
         }
     }
@@ -160,6 +220,9 @@ pub(crate) fn provider_contract(
              not a single .safetensors file"
                 .into(),
         ));
+    }
+    if provider_id == crate::MODEL_ID {
+        crate::validate_load_spec(spec)?;
     }
     // File and Dir intentionally retain one provider/calibration identity: the executable provider,
     // phase graph, and output semantics are the same. The promoted matrix has no load-source axis,
@@ -547,6 +610,138 @@ mod tests {
         std::fs::write(path, file).unwrap();
     }
 
+    fn write_typed_safetensors(path: &std::path::Path, tensors: &[(&str, &str, &[usize], usize)]) {
+        let mut offset = 0_usize;
+        let mut header = serde_json::Map::new();
+        for (name, dtype, shape, bytes) in tensors {
+            header.insert(
+                (*name).to_owned(),
+                serde_json::json!({
+                    "dtype": dtype,
+                    "shape": shape,
+                    "data_offsets": [offset, offset + bytes],
+                }),
+            );
+            offset += bytes;
+        }
+        let mut header = serde_json::to_vec(&header).unwrap();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut file = (header.len() as u64).to_le_bytes().to_vec();
+        file.extend(header);
+        file.resize(file.len() + offset, 0);
+        std::fs::write(path, file).unwrap();
+    }
+
+    fn separate_file_spec(tmp: &tempfile::TempDir) -> LoadSpec {
+        let base = tmp.path().join("base");
+        std::fs::create_dir_all(&base).unwrap();
+        let dit = tmp.path().join("dit.safetensors");
+        let text = tmp.path().join("text.safetensors");
+        let vae = tmp.path().join("vae.safetensors");
+        write_safetensors(&dit, &[("block.weight", 32)]);
+        write_safetensors(&text, &[("layer.weight", 16)]);
+        write_safetensors(&vae, &[("decoder.weight", 8)]);
+        LoadSpec::new(WeightsSource::File(dit))
+            .with_component(gen_core::BASE_SNAPSHOT_COMPONENT, WeightsSource::Dir(base))
+            .with_component(
+                gen_core::COMFYUI_TEXT_ENCODER_COMPONENT,
+                WeightsSource::File(text),
+            )
+            .with_component(gen_core::COMFYUI_VAE_COMPONENT, WeightsSource::File(vae))
+    }
+
+    #[test]
+    fn file_asset_facts_follow_bf16_materialization_and_omit_fp8_companions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("base");
+        std::fs::create_dir_all(&base).unwrap();
+        let dit = tmp.path().join("dit.safetensors");
+        let text = tmp.path().join("text.safetensors");
+        let vae = tmp.path().join("vae.safetensors");
+        write_typed_safetensors(
+            &dit,
+            &[
+                ("block.weight", "F8_E4M3", &[2, 4], 8),
+                ("block.weight_scale", "F32", &[], 4),
+                ("dense.weight", "F32", &[3], 12),
+            ],
+        );
+        write_typed_safetensors(&text, &[("layer.weight", "F32", &[3], 12)]);
+        write_typed_safetensors(&vae, &[("decoder.weight", "BF16", &[4], 8)]);
+        let spec = LoadSpec::new(WeightsSource::File(dit))
+            .with_component(gen_core::BASE_SNAPSHOT_COMPONENT, WeightsSource::Dir(base))
+            .with_component(
+                gen_core::COMFYUI_TEXT_ENCODER_COMPONENT,
+                WeightsSource::File(text),
+            )
+            .with_component(gen_core::COMFYUI_VAE_COMPONENT, WeightsSource::File(vae));
+        let contract = provider_contract(crate::MODEL_ID, &spec).unwrap();
+        assert_eq!(contract.asset_facts.transformer_bytes, 16 + 6);
+        assert_eq!(contract.asset_facts.conditioning_bytes, 6);
+        assert_eq!(contract.asset_facts.decoder_bytes, 8);
+        assert_eq!(contract.asset_facts.base_bytes, 36);
+    }
+
+    #[test]
+    fn file_contract_and_loader_share_the_full_typed_field_matrix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let valid = separate_file_spec(&tmp);
+        let mut cases = vec![("valid", valid.clone())];
+
+        let mut precision = valid.clone();
+        precision.precision = Precision::Fp32;
+        cases.push(("precision-is-accepted", precision));
+        let mut adapter = valid.clone();
+        adapter.adapters.push(gen_core::AdapterSpec::new(
+            tmp.path().join("adapter.safetensors"),
+            1.0,
+            gen_core::AdapterKind::Lora,
+        ));
+        cases.push(("adapter-is-accepted", adapter));
+
+        let mut quant = valid.clone();
+        quant.quantize = Some(Quant::Q4);
+        cases.push(("quant", quant));
+        let mut control = valid.clone();
+        control.control = Some(WeightsSource::File(tmp.path().join("control.safetensors")));
+        cases.push(("control", control));
+        let mut extra = valid.clone();
+        extra
+            .extra_controls
+            .push(WeightsSource::File(tmp.path().join("extra.safetensors")));
+        cases.push(("extra-control", extra));
+        let mut ip = valid.clone();
+        ip.ip_adapter = Some(WeightsSource::File(tmp.path().join("ip.safetensors")));
+        cases.push(("ip-adapter", ip));
+        let mut identity = valid.clone();
+        identity.identity = Some(gen_core::IdentityWeights::default());
+        cases.push(("identity", identity));
+        let mut external_te = valid.clone();
+        external_te.text_encoder = Some(WeightsSource::Dir(tmp.path().join("external-te")));
+        cases.push(("external-text-encoder", external_te));
+        let mut unknown = valid.clone();
+        unknown.components.insert(
+            "unknown".into(),
+            WeightsSource::File(tmp.path().join("unknown.safetensors")),
+        );
+        cases.push(("unknown-component", unknown));
+        let mut half_separate = valid.clone();
+        half_separate
+            .components
+            .remove(gen_core::COMFYUI_VAE_COMPONENT);
+        cases.push(("half-separate", half_separate));
+
+        for (name, spec) in cases {
+            assert_eq!(
+                crate::validate_load_spec(&spec).is_ok(),
+                provider_contract(crate::MODEL_ID, &spec).is_ok(),
+                "File loader/contract validation drift for {name}"
+            );
+        }
+    }
+
     #[test]
     fn combined_and_separate_imports_publish_the_same_exact_phase_inventory() {
         let tmp = tempfile::tempdir().unwrap();
@@ -557,6 +752,9 @@ mod tests {
             &combined,
             &[
                 ("model.diffusion_model.block.weight", 11),
+                // The combined loader strips the component prefix, then `normalize_fp8_map`
+                // discards this exact marker. Asset facts must not count its source payload.
+                ("model.diffusion_model.scaled_fp8", 13),
                 ("conditioner.embedders.0.transformer.layer.weight", 7),
                 ("first_stage_model.decoder.weight", 5),
             ],

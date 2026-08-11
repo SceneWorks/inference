@@ -214,18 +214,34 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     if matches!(spec.weights, WeightsSource::File(_)) {
         return Ok(Box::new(build_native_krea_control_from_spec(spec)?));
     }
-    let loaded_quant = crate::model::effective_base_quant_tier(spec, KREA_2_TURBO_CONTROL_ID)?;
+    // A Dir-backed base may still select a single-file pose overlay. Pin that overlay once at
+    // construction and retain the pin across every sequential reopen, exactly like the imported-DiT
+    // path below. The cloned spec points at the pin's canonical loader path.
+    let pinned_control = pin_control_source(spec)?;
+    let mut pinned_spec = spec.clone();
+    if let Some(control) = &pinned_control {
+        pinned_spec.control = Some(WeightsSource::File(control.loader_path().to_path_buf()));
+    }
+    let loaded_quant =
+        crate::model::effective_base_quant_tier(&pinned_spec, KREA_2_TURBO_CONTROL_ID)?;
+    let memory_strategy = match &pinned_control {
+        Some(control) => control.read_unchanged(|_| {
+            crate::memory_strategy::memory_strategy_contract(KREA_2_TURBO_CONTROL_ID, &pinned_spec)
+                .map_err(Error::from)
+        })?,
+        None => {
+            crate::memory_strategy::memory_strategy_contract(KREA_2_TURBO_CONTROL_ID, &pinned_spec)?
+        }
+    };
+    let residency = build_control_residency_with_pin(&pinned_spec, pinned_control.clone())?;
     Ok(Box::new(KreaTurboControl {
         descriptor: descriptor(),
-        memory_strategy: crate::memory_strategy::memory_strategy_contract(
-            KREA_2_TURBO_CONTROL_ID,
-            spec,
-        )?,
+        memory_strategy,
         loaded_precision: spec.precision,
         loaded_quant,
         _native_dit: None,
-        _native_control: None,
-        residency: build_control_residency(spec)?,
+        _native_control: pinned_control,
+        residency,
     }))
 }
 
@@ -306,18 +322,16 @@ fn build_native_krea_control_from_spec(spec: &LoadSpec) -> Result<KreaTurboContr
     if let Some(control) = &pinned_control {
         pinned_spec.control = Some(WeightsSource::File(control.loader_path().to_path_buf()));
     }
-    let streamable = matches!(spec.offload_policy, mlx_gen::OffloadPolicy::Sequential)
-        && matches!(
-            spec.load_shape,
-            mlx_gen::gen_core::LoadShape::DeferredMaterialization
-        )
-        && !crate::model::adapters_have_diff_patch(&spec.adapters);
+    // File-backed base/control assembly is reopenable but not rung-4-authorized: the promoted
+    // calibration cells are Dir-only. A sequential File request therefore stages components while
+    // keeping its DiT eager until File evidence is promoted.
+    let reopenable = crate::model::native_file_streamable(spec);
     let build_memory_contract = || {
         crate::memory_strategy::native_memory_strategy_contract_from_spec(
             KREA_2_TURBO_CONTROL_ID,
             &pinned_spec,
             &base,
-            streamable,
+            false,
         )
         .map_err(Error::from)
     };
@@ -339,7 +353,7 @@ fn build_native_krea_control_from_spec(spec: &LoadSpec) -> Result<KreaTurboContr
                 &heavy_base,
                 &heavy_dit,
                 heavy_control.as_ref(),
-                streamable,
+                reopenable,
             )
         },
     )?;
@@ -372,9 +386,7 @@ fn load_native_control_heavy(
     }
     let control = require_control(spec, KREA_2_TURBO_CONTROL_ID, "Krea 2 pose control overlay")?;
     let branch = match pinned_control {
-        Some(pinned) => pinned.read_unchanged(|path| {
-            Krea2ControlBranch::from_source(&WeightsSource::File(path.to_path_buf()), &cfg)
-        })?,
+        Some(pinned) => Krea2ControlBranch::from_pinned_file(pinned, &cfg)?,
         None => Krea2ControlBranch::from_source(control, &cfg)?,
     };
     Ok(ControlHeavyOwned {
@@ -390,7 +402,7 @@ fn load_native_control_heavy(
 /// residencies): bf16 activation precision, a base snapshot dir, and the required pose overlay. Quant is
 /// allowed (sc-11727) — a pre-packed snapshot or a `spec.quantize` request both pack only the base DiT/TE,
 /// leaving activations bf16 — so there is no quant rejection here.
-fn validate_control_spec(spec: &LoadSpec) -> Result<()> {
+pub(crate) fn validate_control_spec(spec: &LoadSpec) -> Result<()> {
     if spec.precision != Precision::Bf16 {
         return Err(Error::Msg(format!(
             "{KREA_2_TURBO_CONTROL_ID}: only the default bf16 activation precision is wired (drop the \
@@ -435,12 +447,33 @@ fn validate_control_spec(spec: &LoadSpec) -> Result<()> {
 /// deferral is weight-free-testable: under
 /// `Sequential` this touches no component weights, so a dispatch that mapped `Sequential → Resident`
 /// (ignoring `offload_policy`) would eager-load here and fail the "Sequential defers" unit test.
+#[cfg(test)]
 fn build_control_residency(spec: &LoadSpec) -> Result<Residency<KreaText, ControlHeavyOwned>> {
+    let pinned_control = pin_control_source(spec)?;
+    let mut pinned_spec = spec.clone();
+    if let Some(control) = &pinned_control {
+        pinned_spec.control = Some(WeightsSource::File(control.loader_path().to_path_buf()));
+    }
+    build_control_residency_with_pin(&pinned_spec, pinned_control)
+}
+
+fn pin_control_source(spec: &LoadSpec) -> Result<Option<mlx_gen::PinnedWeightsFile>> {
+    match require_control(spec, KREA_2_TURBO_CONTROL_ID, "Krea 2 pose control overlay")? {
+        WeightsSource::File(path) => Ok(Some(mlx_gen::PinnedWeightsFile::pin(path)?)),
+        WeightsSource::Dir(_) => Ok(None),
+    }
+}
+
+fn build_control_residency_with_pin(
+    spec: &LoadSpec,
+    pinned_control: Option<mlx_gen::PinnedWeightsFile>,
+) -> Result<Residency<KreaText, ControlHeavyOwned>> {
     // Up-front fail-fast for both policies (precision + base dir + control present), so a direct call
     // (e.g. the F-180 unit test) rejects an invalid spec exactly as `load` does.
     validate_control_spec(spec)?;
     let spec_text = spec.clone();
     let spec_heavy = spec.clone();
+    let heavy_control = pinned_control;
     Residency::from_policy(
         spec.offload_policy,
         move || {
@@ -451,7 +484,7 @@ fn build_control_residency(spec: &LoadSpec) -> Result<Residency<KreaText, Contro
         },
         move |_use_pid| {
             let root = require_base_snapshot(&spec_heavy, KREA_2_TURBO_CONTROL_ID)?;
-            load_control_heavy(&spec_heavy, root)
+            load_control_heavy(&spec_heavy, root, heavy_control.as_ref())
         },
     )
 }
@@ -478,7 +511,11 @@ fn build_control_residency(spec: &LoadSpec) -> Result<Residency<KreaText, Contro
 /// once claimed: 8.4 exceeds the whole branch, so it was never a weight-side quantity; the key is
 /// retracted and sc-16013 owns the re-measure.) `control_scale == 0` stays bit-exact to the base at any
 /// tier.
-fn load_control_heavy(spec: &LoadSpec, root: &Path) -> Result<ControlHeavyOwned> {
+fn load_control_heavy(
+    spec: &LoadSpec,
+    root: &Path,
+    pinned_control: Option<&mlx_gen::PinnedWeightsFile>,
+) -> Result<ControlHeavyOwned> {
     let plan = crate::model::resolve_load_plan(spec, root, KREA_2_TURBO_CONTROL_ID)?;
     let streamable_transformer = matches!(spec.offload_policy, mlx_gen::OffloadPolicy::Sequential)
         && matches!(
@@ -496,7 +533,10 @@ fn load_control_heavy(spec: &LoadSpec, root: &Path) -> Result<ControlHeavyOwned>
     }
     let control = require_control(spec, KREA_2_TURBO_CONTROL_ID, "Krea 2 pose control overlay")?;
     let cfg = Krea2Config::from_snapshot(root)?;
-    let mut branch = Krea2ControlBranch::from_source(control, &cfg)?;
+    let mut branch = match pinned_control {
+        Some(pinned) => Krea2ControlBranch::from_pinned_file(pinned, &cfg)?,
+        None => Krea2ControlBranch::from_source(control, &cfg)?,
+    };
     // sc-15799 — tier integrity. The pose overlay always loads bf16 (it ships no `.scales`); pack it to
     // the tier the base tier implies, whether the base was packed at load or arrived pre-packed. No
     // device-budget reading: the branch's tier is a consequence of the user's tier choice, not a rung.
@@ -563,6 +603,19 @@ impl KreaTurboControl {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
+
+        if self._native_dit.is_some()
+            && req.memory.is_some_and(|memory| {
+                memory.stream_transformer_blocks
+                    || memory.transformer_window_size.is_some()
+                    || memory.transformer_window_component.is_some()
+            })
+        {
+            return Err(Error::Unsupported(format!(
+                "{KREA_2_TURBO_CONTROL_ID}: imported File weights are reopenable but transformer \
+                 residency is not authorized without File-specific promoted evidence"
+            )));
+        }
 
         let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
         let base_seed = req.seed.unwrap_or_else(default_seed);
@@ -1111,8 +1164,8 @@ mod tests {
         LoadSpec::new(WeightsSource::Dir(
             "/nonexistent/krea-control-residency-test-snapshot".into(),
         ))
-        .with_control(WeightsSource::File(
-            "/nonexistent/krea-control-residency-test-overlay.safetensors".into(),
+        .with_control(WeightsSource::Dir(
+            "/nonexistent/krea-control-residency-test-overlay".into(),
         ))
         .with_offload_policy(policy)
     }

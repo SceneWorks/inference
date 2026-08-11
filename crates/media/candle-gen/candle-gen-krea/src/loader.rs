@@ -325,6 +325,22 @@ impl Weights {
             .map_err(|error| Error::Msg(error.to_string()))
     }
 
+    /// Run one actual tensor-consumption/materialization operation under the retained File pin.
+    /// Directory sources have no single entry to pin and execute the operation directly.
+    pub(crate) fn read_source_unchanged<T>(&self, read: impl FnOnce() -> Result<T>) -> Result<T> {
+        let Some(pin) = self.pinned_source.as_ref() else {
+            return read();
+        };
+        pin.ensure_unchanged()
+            .map_err(|error| Error::Msg(error.to_string()))?;
+        let result = read();
+        // Mutation identity is the stronger diagnosis, so retain `read_unchanged` semantics and let
+        // the post-consumption pin failure win even if materialization also failed.
+        pin.ensure_unchanged()
+            .map_err(|error| Error::Msg(error.to_string()))?;
+        result
+    }
+
     /// The **one** [`Int8Context`] every INT8-ConvRot projection from this weight set shares (sc-12301),
     /// built on first use if [`with_int8_context`](Self::with_int8_context) did not seed it.
     ///
@@ -1202,6 +1218,8 @@ mod tests {
     use candle_gen::candle_core::safetensors;
     use candle_gen::candle_nn::Module;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Barrier};
 
     /// The Krea MLX tier's group size (64) — the one carried from `config.json`.
     const G: usize = 64;
@@ -1249,6 +1267,105 @@ mod tests {
             serde_json::json!({ "hidden_size": 6144 })
         };
         std::fs::write(dir.join("config.json"), cfg.to_string()).unwrap();
+    }
+
+    /// Replace `target` while a provider has the original file mapped. Unix can exercise the exact
+    /// production failure mode with an atomic rename: the open mmap keeps consuming the original
+    /// inode while the selected path names a new one. Other platforms overwrite an identically shaped
+    /// safetensors payload so the test remains compilable/runnable without relying on Unix rename
+    /// semantics; the retained fingerprint still has to reject that mutation.
+    fn replace_mapped_fixture(replacement: &Path, target: &Path) {
+        #[cfg(unix)]
+        std::fs::rename(replacement, target).expect("atomically replace mapped source");
+        #[cfg(not(unix))]
+        {
+            let bytes = std::fs::read(replacement).expect("read replacement fixture");
+            std::fs::write(target, bytes).expect("overwrite mapped source");
+        }
+    }
+
+    /// The Krea File loader's guard must end only after Candle has copied the last requested tensor
+    /// out of the retained mmap (and synchronized any asynchronous device transfer). A pre-only check
+    /// would let this barrier-controlled replacement return a mixed-provenance materialization.
+    #[test]
+    fn file_pin_postchecks_after_actual_krea_tensor_materialization() -> Result<()> {
+        let dev = Device::Cpu;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let source = dir.path().join("krea.safetensors");
+        let replacement = dir.path().join("krea.replacement.safetensors");
+        let elements = 64 * 1024;
+
+        safetensors::save(
+            &HashMap::from([
+                (
+                    "phase.first".to_owned(),
+                    Tensor::from_vec(vec![0.25_f32; elements], elements, &dev)?,
+                ),
+                (
+                    "phase.last".to_owned(),
+                    Tensor::from_vec(vec![0.75_f32; elements], elements, &dev)?,
+                ),
+            ]),
+            &source,
+        )?;
+        safetensors::save(
+            &HashMap::from([
+                (
+                    "phase.first".to_owned(),
+                    Tensor::from_vec(vec![-0.25_f32; elements], elements, &dev)?,
+                ),
+                (
+                    "phase.last".to_owned(),
+                    Tensor::from_vec(vec![-0.75_f32; elements], elements, &dev)?,
+                ),
+            ]),
+            &replacement,
+        )?;
+
+        let weights = Weights::from_file(&source, &dev, DType::F32)?;
+        let first_consumed = Arc::new(Barrier::new(2));
+        let replacement_done = Arc::new(Barrier::new(2));
+        let last_consumed = Arc::new(AtomicBool::new(false));
+
+        let writer_source = source.clone();
+        let writer_replacement = replacement.clone();
+        let writer_first = Arc::clone(&first_consumed);
+        let writer_done = Arc::clone(&replacement_done);
+        let writer = std::thread::spawn(move || {
+            writer_first.wait();
+            replace_mapped_fixture(&writer_replacement, &writer_source);
+            writer_done.wait();
+        });
+
+        let consumed = Arc::clone(&last_consumed);
+        let error = match weights.read_source_unchanged(|| {
+            let first = weights.get("phase.first")?.to_vec1::<f32>()?;
+            assert!(first.iter().all(|value| *value == 0.25));
+            first_consumed.wait();
+            replacement_done.wait();
+
+            // This is an actual Krea provider `Weights::get`, not a raw File read. Converting the
+            // tensor to a Vec forces CPU payload consumption; synchronize is the same final boundary
+            // the CUDA loader uses before allowing the pin's post-check to run.
+            let last = weights.get("phase.last")?.to_vec1::<f32>()?;
+            assert_eq!(last.len(), elements);
+            dev.synchronize()?;
+            consumed.store(true, Ordering::SeqCst);
+            Ok(())
+        }) {
+            Ok(()) => {
+                panic!("replacement during materialization must invalidate the Krea file pin")
+            }
+            Err(error) => error.to_string(),
+        };
+        writer.join().expect("replacement writer");
+
+        assert!(
+            last_consumed.load(Ordering::SeqCst),
+            "the provider must consume the final tensor before the post-check rejects the mutation"
+        );
+        assert!(error.contains("changed after load"), "unexpected: {error}");
+        Ok(())
     }
 
     fn cosine(a: &Tensor, b: &Tensor) -> f64 {
