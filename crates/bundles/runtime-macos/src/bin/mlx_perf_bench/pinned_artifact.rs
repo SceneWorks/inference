@@ -1493,7 +1493,7 @@ fn cleanup_directory<F>(
     binding: &CleanupBinding<'_>,
     relative: &Path,
     current: &BTreeMap<PathBuf, CleanupNodeIdentity>,
-    preserve_root_receipt: bool,
+    preserve_root_authority: bool,
     hook: &mut F,
 ) -> Result<(), String>
 where
@@ -1512,7 +1512,7 @@ where
     binding.validate_chain()?;
 
     let mut expected_names = expected_child_names(current, relative);
-    if preserve_root_receipt && relative.as_os_str().is_empty() {
+    if preserve_root_authority && relative.as_os_str().is_empty() {
         expected_names.push(OsString::from(CLEANUP_RECEIPT_FILE));
         expected_names.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
     }
@@ -1561,7 +1561,7 @@ where
             &child_binding,
             &child.relative,
             current,
-            preserve_root_receipt,
+            preserve_root_authority,
             hook,
         )?;
     }
@@ -1610,6 +1610,16 @@ where
         hook(&child.relative, CleanupMutation::UnsealMode)?;
         file_binding.validate_chain()?;
         set_open_file_mode(&child.file, 0o600, &child.relative)?;
+        if preserve_root_authority
+            && relative.as_os_str().is_empty()
+            && child.relative == Path::new(OWNER_MARKER_FILE)
+        {
+            // The external sidecar binds this marker, and receipt-present recovery still uses it
+            // to authenticate the root. Keep the now-unsealed marker until the cleanup receipt is
+            // durably retired. A restart in the following state can then authenticate the marker
+            // through the sidecar and finish the ordinary receipt-free cleanup path.
+            continue;
+        }
         hook(&child.relative, CleanupMutation::RemoveEntry)?;
         file_binding.validate_chain()?;
         unlink_entry_at(directory, &child.name, child.initial)?;
@@ -1659,8 +1669,13 @@ where
     }
 
     let remaining = directory_entry_names(directory)?;
-    let wanted = if preserve_root_receipt && relative.as_os_str().is_empty() {
-        vec![OsString::from(CLEANUP_RECEIPT_FILE)]
+    let wanted = if preserve_root_authority && relative.as_os_str().is_empty() {
+        let mut authority = vec![
+            OsString::from(CLEANUP_RECEIPT_FILE),
+            OsString::from(OWNER_MARKER_FILE),
+        ];
+        authority.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+        authority
     } else {
         Vec::new()
     };
@@ -1731,18 +1746,20 @@ where
         unlink_entry_at(&root, receipt_name, receipt_identity)?;
         root_binding.record_child_unlink()?;
         root.sync_all()
-            .map_err(|error| format!("sync emptied snapshot root: {error}"))?;
-    } else {
-        // Receipt-free trees are unfinished construction state, or the terminal empty-root state
-        // after the receipt was durably retired. Root dev+ino from the external lease remains
-        // mandatory, and sealed content is never dynamically authorized for mutation.
-        let current = collect_cleanup_identity_map(&root)?;
-        if current.len() != 1 {
-            validate_snapshot_ownership_fd(&root, lease)?;
-        }
-        verify_unsealed_tree_fd(&root, &current)?;
-        cleanup_directory(&root_binding, root_relative, &current, false, hook)?;
+            .map_err(|error| format!("sync retired snapshot cleanup receipt: {error}"))?;
     }
+    // Receipt-free trees are unfinished construction state, or the terminal cleanup state after
+    // the receipt was durably retired. The receipt-present pass deliberately preserves and
+    // unseals the owner marker, so a crash immediately after receipt retirement still reaches
+    // this authenticated, resumable state instead of becoming permanently quarantined. Root
+    // dev+ino from the external lease remains mandatory, and sealed content is never dynamically
+    // authorized for mutation.
+    let current = collect_cleanup_identity_map(&root)?;
+    if current.len() != 1 {
+        validate_snapshot_ownership_fd(&root, lease)?;
+    }
+    verify_unsealed_tree_fd(&root, &current)?;
+    cleanup_directory(&root_binding, root_relative, &current, false, hook)?;
     if !directory_entry_names(&root)?.is_empty() {
         return Err("private snapshot root is not empty after descriptor cleanup".to_owned());
     }
@@ -3366,6 +3383,56 @@ mod tests {
         assert!(interruption.contains("injected cleanup interruption"));
         assert!(!root.join("artifact/weights.bin").exists());
         assert!(root.join(CLEANUP_RECEIPT_FILE).exists());
+
+        assert_eq!(
+            scavenge_stale_snapshots_in(Some(snapshots.path())).unwrap(),
+            1
+        );
+        assert!(!root.exists());
+        assert_no_owned_snapshots(snapshots.path());
+    }
+
+    #[test]
+    fn cleanup_preserves_owner_marker_until_after_receipt_retirement() {
+        let source = tempfile::tempdir().unwrap();
+        let artifact_path = source.path().join("artifact");
+        fs::create_dir(&artifact_path).unwrap();
+        fs::write(artifact_path.join("weights.bin"), b"weights").unwrap();
+        let artifact = receipt(&artifact_path);
+        let snapshots = tempfile::tempdir().unwrap();
+        let pinned = OwnedPinnedArtifact::create_with_hooks(
+            &artifact,
+            Some(snapshots.path()),
+            ClonePreference::CopyOnly,
+            || Ok(()),
+            |_| Ok(()),
+        )
+        .unwrap();
+        let OwnedPinnedArtifact { owner, .. } = pinned;
+        let (root, lease) = owner.abandon_with_lease_for_test();
+        let namespace = open_directory(snapshots.path()).unwrap();
+        let interruption =
+            remove_owned_snapshot_tree_at(&namespace, &lease, false, &mut |relative, mutation| {
+                if relative == Path::new(OWNER_MARKER_FILE)
+                    && mutation == CleanupMutation::RemoveEntry
+                {
+                    if root.join(CLEANUP_RECEIPT_FILE).exists() {
+                        return Err(
+                            "owner marker removal preceded cleanup receipt retirement".to_owned()
+                        );
+                    }
+                    return Err("injected post-receipt marker interruption".to_owned());
+                }
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(
+            interruption.contains("injected post-receipt marker interruption"),
+            "{interruption}"
+        );
+        assert!(root.is_dir());
+        assert!(!root.join(CLEANUP_RECEIPT_FILE).exists());
+        assert!(root.join(OWNER_MARKER_FILE).is_file());
 
         assert_eq!(
             scavenge_stale_snapshots_in(Some(snapshots.path())).unwrap(),
