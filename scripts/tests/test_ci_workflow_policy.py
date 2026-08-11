@@ -1444,10 +1444,29 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("-- --ignored --exact --nocapture", job)
         self.assertIn('"provision_status=validating_python"', job)
         self.assertIn('"provision_status=complete"', job)
-        # Windows PowerShell 5.1 cannot combine Tee-Object's LiteralPath
-        # parameter set with -Append; the self-hosted CUDA lane must use the
-        # FilePath parameter set for its pre-provision and provision evidence.
-        self.assertEqual(job.count("Tee-Object -FilePath $log -Append"), 4)
+        # Windows PowerShell 5.1 promotes a successful native command's stderr
+        # (including Cargo build warnings) to NativeCommandError under Actions'
+        # stop-on-error wrapper. Keep PowerShell evidence capture on its valid
+        # FilePath parameter set, but run the Cargo profile through the selected
+        # Git Bash with pipefail so warnings are logged and real failures still
+        # propagate through tee.
+        profile_start = job.index(
+            "- name: Load through the production provider, minimally render, and measure the shared package"
+        )
+        profile_end = job.index("- name: Upload exact SCAIL CUDA evidence", profile_start)
+        profile = job[profile_start:profile_end]
+        self.assertIn("shell: bash", profile)
+        self.assertIn("set -o pipefail", profile)
+        self.assertIn(
+            'evidence_log="$(cygpath -u "$RUNNER_TEMP")/scail2-shared-cuda.log"',
+            profile,
+        )
+        self.assertIn('export PATH="$(cygpath -u "$CUDA_PATH")/bin:$PATH"', profile)
+        self.assertIn("cargo test --locked --release", profile)
+        self.assertIn('tee -a "$evidence_log"', profile)
+        self.assertNotIn("shell: powershell", profile)
+        self.assertNotIn("Tee-Object", profile)
+        self.assertEqual(job.count("Tee-Object -FilePath $log -Append"), 3)
         self.assertNotIn("Tee-Object -LiteralPath $log -Append", job)
         self.assertIn("actions/upload-artifact@", job)
         self.assertIn("scail2-shared-cuda-${{ github.sha }}", job)

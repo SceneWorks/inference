@@ -4860,19 +4860,17 @@ jobs:
           call "%VCVARS%"
           cargo test --locked --release --no-run -p candle-gen-scail2 --features cuda || exit /b 1
       - name: Load through the production provider, minimally render, and measure the shared package
-        shell: powershell
+        shell: bash
         run: |
-          cmd /c "call `"$env:VCVARS`" && set" |
-            ForEach-Object {
-              if ($_ -match "^(.*?)=(.*)$") { Set-Item -Force "env:$($matches[1])" $matches[2] }
-            }
-          $log = Join-Path $env:RUNNER_TEMP "scail2-shared-cuda.log"
-          cargo test --locked --release -p candle-gen-scail2 --features cuda `
-            pipeline::tests::shared_bf16_real_weights_cuda_loads_and_renders_with_measured_peak `
-            -- --ignored --exact --nocapture 2>&1 | Tee-Object -FilePath $log -Append
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          if (-not (Select-String -LiteralPath $log -SimpleMatch '[[SCAIL2_CUDA_VRAM]]')) {
-            throw 'the real-weight test passed without emitting its machine-readable VRAM record'
+          set -o pipefail
+          evidence_log="$(cygpath -u "$RUNNER_TEMP")/scail2-shared-cuda.log"
+          export PATH="$(cygpath -u "$CUDA_PATH")/bin:$PATH"
+          cargo test --locked --release -p candle-gen-scail2 --features cuda \
+            pipeline::tests::shared_bf16_real_weights_cuda_loads_and_renders_with_measured_peak \
+            -- --ignored --exact --nocapture 2>&1 | tee -a "$evidence_log"
+          grep -Fq '[[SCAIL2_CUDA_VRAM]]' "$evidence_log" || {
+            echo 'the real-weight test passed without emitting its machine-readable VRAM record' >&2
+            exit 1
           }
       - name: Upload exact SCAIL CUDA evidence
         if: always()
