@@ -30,6 +30,7 @@ use std::collections::BTreeSet;
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
+use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::rc::Rc;
@@ -82,6 +83,7 @@ struct Options {
     variant_id: Option<String>,
     output_file: Option<PathBuf>,
     artifact_snapshot: Option<PathBuf>,
+    artifact_lease_fd: Option<RawFd>,
 }
 
 fn parse_options(args: &[String]) -> Result<Options, String> {
@@ -104,6 +106,11 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
             "--variant" => options.variant_id = Some(value.clone()),
             "--output-file" => options.output_file = Some(PathBuf::from(value)),
             "--artifact-snapshot" => options.artifact_snapshot = Some(PathBuf::from(value)),
+            "--artifact-lease-fd" => {
+                options.artifact_lease_fd = Some(value.parse::<RawFd>().map_err(|error| {
+                    format!("--artifact-lease-fd must be a valid descriptor number: {error}")
+                })?)
+            }
             "--variants" => {
                 options.variants = Some(
                     value
@@ -259,7 +266,8 @@ fn run_matrix(args: &[String]) -> Result<(), String> {
             for variant_id in &campaign.selected_variants {
                 let output_file = output_dir.join(run_file_name(&case.id, variant_id));
                 println!("run {} / {}", case.id, variant_id);
-                let status = Command::new(&executable)
+                let mut child = Command::new(&executable);
+                child
                     .arg("child")
                     .arg("--campaign")
                     .arg(&campaign_file)
@@ -273,7 +281,9 @@ fn run_matrix(args: &[String]) -> Result<(), String> {
                     .arg(snapshot.path())
                     .stdin(Stdio::null())
                     .stdout(Stdio::inherit())
-                    .stderr(Stdio::inherit())
+                    .stderr(Stdio::inherit());
+                snapshot.configure_child_lease(&mut child)?;
+                let status = child
                     .status()
                     .map_err(|error| format!("start child benchmark: {error}"))?;
                 if !status.success() {
@@ -496,7 +506,10 @@ fn run_child(args: &[String]) -> Result<(), String> {
         .artifact_snapshot
         .as_deref()
         .ok_or_else(|| "child requires --artifact-snapshot".to_owned())?;
-    let pinned_artifact = VerifiedPinnedArtifact::admit(artifact, snapshot_path)?;
+    let lease_fd = options
+        .artifact_lease_fd
+        .ok_or_else(|| "child requires --artifact-lease-fd".to_owned())?;
+    let pinned_artifact = VerifiedPinnedArtifact::admit(artifact, snapshot_path, lease_fd)?;
 
     let started_at_unix_millis = unix_millis()?;
     clear_cache();
@@ -1624,7 +1637,8 @@ mod tests {
             canonical_path,
         };
         let mut owned = OwnedPinnedArtifact::create(&artifact).unwrap();
-        let verified = VerifiedPinnedArtifact::admit(&artifact, owned.path()).unwrap();
+        let lease_fd = owned.duplicate_lease_fd().unwrap();
+        let verified = VerifiedPinnedArtifact::admit(&artifact, owned.path(), lease_fd).unwrap();
         match load_spec(ModelTier::Q4, &verified).weights {
             WeightsSource::Dir(path) => assert_eq!(path, verified.path()),
             WeightsSource::File(_) => panic!("benchmark artifact must load from its pinned tree"),

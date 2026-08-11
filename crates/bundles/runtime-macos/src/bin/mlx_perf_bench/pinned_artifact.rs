@@ -4,17 +4,20 @@ use runtime_macos::perf_bench::{
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::{CString, OsStr};
+use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::os::macos::fs::MetadataExt as MacMetadataExt;
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{
     DirBuilderExt, MetadataExt as UnixMetadataExt, OpenOptionsExt, PermissionsExt,
 };
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 // From <sys/clonefile.h>. The source is already an opened regular file; this flag only prevents
 // privileged runs from copying source ownership onto the private destination.
@@ -22,22 +25,30 @@ const CLONE_NOOWNERCOPY: u32 = 1 << 1;
 const SNAPSHOT_NAMESPACE: &str = "sceneworks-mlx-perf-pinned-v1";
 const NAMESPACE_LOCK_FILE: &str = ".namespace.lock";
 const OWNER_SIDECAR_PREFIX: &str = "owner-";
+const OWNER_STAGE_PREFIX: &str = ".owner-stage-";
 const SNAPSHOT_ROOT_PREFIX: &str = "snapshot-";
 const OWNER_MARKER_FILE: &str = ".sceneworks-owner.json";
 const CLEANUP_RECEIPT_FILE: &str = ".sceneworks-cleanup.json";
 const CLEANUP_RECEIPT_TEMP_FILE: &str = ".sceneworks-cleanup.tmp";
-const OWNERSHIP_SCHEMA: &str = "sceneworks.mlx-perf-snapshot-owner.v1";
-const CLEANUP_SCHEMA: &str = "sceneworks.mlx-perf-snapshot-cleanup.v1";
+const OWNERSHIP_SCHEMA: &str = "sceneworks.mlx-perf-snapshot-owner.v2";
+const CLEANUP_SCHEMA: &str = "sceneworks.mlx-perf-snapshot-cleanup.v2";
 const OWNERSHIP_HARNESS: &str = "sceneworks-mlx-perf-bench";
 const MAX_OWNERSHIP_BYTES: u64 = 64 * 1024;
+const MAX_CLEANUP_RECEIPT_BYTES: u64 = 64 * 1024 * 1024;
+const CHILD_LEASE_FD: RawFd = 198;
 
-#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SnapshotLease {
     schema_version: String,
     harness: String,
     token: String,
+    sidecar_name: String,
+    sidecar_device: u64,
+    sidecar_inode: u64,
     root_name: String,
+    root_device: u64,
+    root_inode: u64,
 }
 
 #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -47,6 +58,8 @@ struct SnapshotOwnership {
     harness: String,
     token: String,
     sidecar_name: String,
+    sidecar_device: u64,
+    sidecar_inode: u64,
     root_name: String,
     root_device: u64,
     root_inode: u64,
@@ -58,6 +71,17 @@ struct SnapshotCleanupReceipt {
     schema_version: String,
     node_count: u64,
     identity_sha256: String,
+    nodes: Vec<SnapshotCleanupNode>,
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SnapshotCleanupNode {
+    components_hex: Vec<String>,
+    kind: SnapshotNodeKind,
+    device: u64,
+    inode: u64,
+    links: u64,
 }
 
 enum LockDisposition {
@@ -114,7 +138,8 @@ impl MaterializationCounts {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 enum SnapshotNodeKind {
     Directory,
     File,
@@ -125,6 +150,14 @@ struct SnapshotNodeIdentity {
     kind: SnapshotNodeKind,
     device: u64,
     inode: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CleanupNodeIdentity {
+    kind: SnapshotNodeKind,
+    device: u64,
+    inode: u64,
+    links: u64,
 }
 
 struct SnapshotOwner {
@@ -238,6 +271,260 @@ fn sync_directory(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("sync snapshot directory {}: {error}", path.display()))
 }
 
+fn open_directory(path: &Path) -> Result<File, String> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| format!("open snapshot directory {}: {error}", path.display()))
+}
+
+fn c_name(name: &OsStr) -> Result<CString, String> {
+    CString::new(name.as_bytes()).map_err(|_| "snapshot entry name contains NUL".to_owned())
+}
+
+fn open_entry_at(parent: &File, name: &OsStr, directory: bool) -> Result<File, String> {
+    let name = c_name(name)?;
+    let flags = libc::O_RDONLY
+        | libc::O_NOFOLLOW
+        | libc::O_CLOEXEC
+        | if directory { libc::O_DIRECTORY } else { 0 };
+    // SAFETY: the parent descriptor and NUL-terminated name remain valid for the call. O_NOFOLLOW
+    // prevents the final component from rebinding traversal outside the already-open parent.
+    let descriptor = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+    if descriptor < 0 {
+        Err(format!(
+            "open descriptor-relative snapshot entry {:?}: {}",
+            OsStr::from_bytes(name.as_bytes()),
+            io::Error::last_os_error()
+        ))
+    } else {
+        // SAFETY: openat returned a new owned descriptor.
+        Ok(unsafe { File::from_raw_fd(descriptor) })
+    }
+}
+
+fn duplicate_cloexec(file: &File) -> Result<File, String> {
+    // SAFETY: fcntl duplicates the valid descriptor and returns a new owned descriptor.
+    let descriptor = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+    if descriptor < 0 {
+        Err(format!(
+            "duplicate snapshot directory descriptor: {}",
+            io::Error::last_os_error()
+        ))
+    } else {
+        // SAFETY: fcntl returned a new owned descriptor.
+        Ok(unsafe { File::from_raw_fd(descriptor) })
+    }
+}
+
+fn directory_entry_names(directory: &File) -> Result<Vec<OsString>, String> {
+    struct DirectoryStream(*mut libc::DIR);
+    impl Drop for DirectoryStream {
+        fn drop(&mut self) {
+            // SAFETY: the stream is owned by this guard and closed exactly once.
+            unsafe { libc::closedir(self.0) };
+        }
+    }
+
+    // Opening "." creates an independent open-file description. A plain dup would share the
+    // directory offset, making one traversal silently exhaust later descriptor-relative reads.
+    let independent = open_entry_at(directory, OsStr::new("."), true)?;
+    let descriptor = independent.into_raw_fd();
+    // SAFETY: fdopendir takes ownership of the duplicated directory descriptor.
+    let stream = unsafe { libc::fdopendir(descriptor) };
+    if stream.is_null() {
+        // SAFETY: fdopendir failed and therefore did not take ownership.
+        unsafe { libc::close(descriptor) };
+        return Err(format!(
+            "open snapshot directory stream: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    let stream = DirectoryStream(stream);
+    let mut names = Vec::new();
+    loop {
+        // SAFETY: macOS exposes thread-local errno through __error.
+        unsafe { *libc::__error() = 0 };
+        // SAFETY: the directory stream remains live and exclusively used by this loop.
+        let entry = unsafe { libc::readdir(stream.0) };
+        if entry.is_null() {
+            // SAFETY: read thread-local errno after readdir returned null.
+            let error = unsafe { *libc::__error() };
+            if error != 0 {
+                return Err(format!(
+                    "read snapshot directory stream: {}",
+                    io::Error::from_raw_os_error(error)
+                ));
+            }
+            break;
+        }
+        // SAFETY: d_name is NUL-terminated for a live dirent returned by readdir.
+        let bytes = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if bytes != b"." && bytes != b".." {
+            names.push(OsString::from_vec(bytes.to_vec()));
+        }
+    }
+    names.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    Ok(names)
+}
+
+fn cleanup_identity(metadata: &fs::Metadata) -> Result<CleanupNodeIdentity, String> {
+    let kind = if metadata.is_dir() {
+        SnapshotNodeKind::Directory
+    } else if metadata.is_file() {
+        SnapshotNodeKind::File
+    } else {
+        return Err("snapshot cleanup refuses a non-file, non-directory inode".to_owned());
+    };
+    Ok(CleanupNodeIdentity {
+        kind,
+        device: UnixMetadataExt::dev(metadata),
+        inode: UnixMetadataExt::ino(metadata),
+        links: UnixMetadataExt::nlink(metadata),
+    })
+}
+
+fn validate_cleanup_file(
+    file: &File,
+    expected: CleanupNodeIdentity,
+    label: &str,
+) -> Result<fs::Metadata, String> {
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("stat cleanup inode {label}: {error}"))?;
+    let actual = cleanup_identity(&metadata)?;
+    if actual != expected || UnixMetadataExt::uid(&metadata) != unsafe { libc::geteuid() } {
+        return Err(format!(
+            "snapshot cleanup inode changed before mutation at {label}: expected {expected:?}, actual {actual:?}"
+        ));
+    }
+    if actual.kind == SnapshotNodeKind::File && actual.links != 1 {
+        return Err(format!(
+            "snapshot cleanup refuses multiply-linked file at {label}"
+        ));
+    }
+    Ok(metadata)
+}
+
+fn identity_at_optional(
+    parent: &File,
+    name: &OsStr,
+) -> Result<Option<CleanupNodeIdentity>, String> {
+    let name = c_name(name)?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: parent and name are valid, stat points to writable storage, and AT_SYMLINK_NOFOLLOW
+    // prevents a final-component symlink from redirecting the check.
+    let result = unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result != 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(format!(
+            "stat descriptor-relative snapshot entry {:?}: {}",
+            OsStr::from_bytes(name.as_bytes()),
+            error
+        ));
+    }
+    // SAFETY: fstatat succeeded and initialized stat.
+    let stat = unsafe { stat.assume_init() };
+    let kind = match stat.st_mode & libc::S_IFMT {
+        libc::S_IFDIR => SnapshotNodeKind::Directory,
+        libc::S_IFREG => SnapshotNodeKind::File,
+        _ => return Err("snapshot cleanup refuses a linked or special entry".to_owned()),
+    };
+    Ok(Some(CleanupNodeIdentity {
+        kind,
+        device: stat.st_dev as u64,
+        inode: stat.st_ino,
+        links: stat.st_nlink as u64,
+    }))
+}
+
+fn identity_at(parent: &File, name: &OsStr) -> Result<CleanupNodeIdentity, String> {
+    identity_at_optional(parent, name)?
+        .ok_or_else(|| format!("descriptor-relative snapshot entry {:?} is missing", name))
+}
+
+fn unlink_entry_at(
+    parent: &File,
+    name: &OsStr,
+    expected: CleanupNodeIdentity,
+) -> Result<(), String> {
+    let actual = identity_at(parent, name)?;
+    if actual != expected {
+        return Err(format!(
+            "snapshot entry changed immediately before removal: expected {expected:?}, actual {actual:?}"
+        ));
+    }
+    if actual.kind == SnapshotNodeKind::File && actual.links != 1 {
+        return Err("snapshot cleanup refuses to unlink a multiply-linked file".to_owned());
+    }
+    let name = c_name(name)?;
+    let flags = if expected.kind == SnapshotNodeKind::Directory {
+        libc::AT_REMOVEDIR
+    } else {
+        0
+    };
+    // SAFETY: the descriptor and NUL-terminated relative name are valid for the call.
+    if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), flags) } != 0 {
+        Err(format!(
+            "remove descriptor-relative snapshot entry {:?}: {}",
+            OsStr::from_bytes(name.as_bytes()),
+            io::Error::last_os_error()
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn rename_noreplace_at(directory: &File, from: &OsStr, to: &OsStr) -> Result<(), String> {
+    let from = c_name(from)?;
+    let to = c_name(to)?;
+    // SAFETY: both names are relative to the same owned directory descriptor. RENAME_EXCL makes
+    // publication fail rather than replacing an existing ownership authority.
+    let result = unsafe {
+        libc::renameatx_np(
+            directory.as_raw_fd(),
+            from.as_ptr(),
+            directory.as_raw_fd(),
+            to.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    if result != 0 {
+        Err(format!(
+            "publish snapshot ownership {:?} -> {:?}: {}",
+            OsStr::from_bytes(from.as_bytes()),
+            OsStr::from_bytes(to.as_bytes()),
+            io::Error::last_os_error()
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn create_directory_at(parent: &File, name: &OsStr, mode: u32) -> Result<File, String> {
+    let name_c = c_name(name)?;
+    // SAFETY: the parent descriptor and NUL-terminated relative name are valid for mkdirat.
+    if unsafe { libc::mkdirat(parent.as_raw_fd(), name_c.as_ptr(), mode as libc::mode_t) } != 0 {
+        return Err(format!(
+            "create descriptor-relative snapshot directory {:?}: {}",
+            name,
+            io::Error::last_os_error()
+        ));
+    }
+    open_entry_at(parent, name, true)
+}
+
 fn write_json_to_open_file(file: &mut File, value: &impl Serialize) -> Result<(), String> {
     file.set_len(0)
         .and_then(|()| file.seek(SeekFrom::Start(0)).map(|_| ()))
@@ -249,6 +536,7 @@ fn write_json_to_open_file(file: &mut File, value: &impl Serialize) -> Result<()
         .map_err(|error| format!("persist snapshot ownership: {error}"))
 }
 
+#[cfg(test)]
 fn create_json_file(path: &Path, value: &impl Serialize) -> Result<(), String> {
     let mut file = OpenOptions::new()
         .create_new(true)
@@ -264,12 +552,53 @@ fn create_json_file(path: &Path, value: &impl Serialize) -> Result<(), String> {
         .map_err(|error| format!("persist snapshot ownership {}: {error}", path.display()))
 }
 
+fn create_json_file_at(
+    parent: &File,
+    name: &OsStr,
+    value: &impl Serialize,
+) -> Result<File, String> {
+    let name_c = c_name(name)?;
+    // SAFETY: openat creates a new regular file below the already-open directory without following
+    // a final-component link.
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name_c.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if descriptor < 0 {
+        return Err(format!(
+            "create descriptor-relative ownership file {:?}: {}",
+            name,
+            io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: openat returned a new owned descriptor.
+    let mut file = unsafe { File::from_raw_fd(descriptor) };
+    serde_json::to_writer_pretty(&mut file, value)
+        .map_err(|error| format!("serialize snapshot ownership {:?}: {error}", name))?;
+    file.write_all(b"\n")
+        .and_then(|()| file.sync_all())
+        .map_err(|error| format!("persist snapshot ownership {:?}: {error}", name))?;
+    Ok(file)
+}
+
 fn read_json_from_open_file<T: DeserializeOwned>(
     file: &mut File,
     path: &Path,
 ) -> Result<T, String> {
+    read_json_from_open_file_with_limit(file, path, MAX_OWNERSHIP_BYTES)
+}
+
+fn read_json_from_open_file_with_limit<T: DeserializeOwned>(
+    file: &mut File,
+    path: &Path,
+    maximum_bytes: u64,
+) -> Result<T, String> {
     let metadata = validate_owned_regular_file(file, path)?;
-    if metadata.len() > MAX_OWNERSHIP_BYTES {
+    if metadata.len() > maximum_bytes {
         return Err(format!(
             "snapshot ownership file is unexpectedly large: {}",
             path.display()
@@ -284,13 +613,19 @@ fn read_json_from_open_file<T: DeserializeOwned>(
         .map_err(|error| format!("parse snapshot ownership {}: {error}", path.display()))
 }
 
-fn read_json_nofollow<T: DeserializeOwned>(path: &Path) -> Result<T, String> {
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-        .map_err(|error| format!("open snapshot ownership {}: {error}", path.display()))?;
-    read_json_from_open_file(&mut file, path)
+fn read_json_at<T: DeserializeOwned>(parent: &File, name: &OsStr) -> Result<T, String> {
+    let mut file = open_entry_at(parent, name, false)?;
+    read_json_from_open_file(&mut file, Path::new(name))
+}
+
+fn read_cleanup_receipt_at(
+    parent: &File,
+    name: &OsStr,
+) -> Result<(SnapshotCleanupReceipt, File), String> {
+    let mut file = open_entry_at(parent, name, false)?;
+    let receipt =
+        read_json_from_open_file_with_limit(&mut file, Path::new(name), MAX_CLEANUP_RECEIPT_BYTES)?;
+    Ok((receipt, file))
 }
 
 fn sidecar_token(name: &str) -> Option<&str> {
@@ -298,8 +633,96 @@ fn sidecar_token(name: &str) -> Option<&str> {
     (!token.is_empty() && token.bytes().all(|byte| byte.is_ascii_alphanumeric())).then_some(token)
 }
 
+fn stage_token(name: &str) -> Option<&str> {
+    let token = name.strip_prefix(OWNER_STAGE_PREFIX)?;
+    (!token.is_empty() && token.bytes().all(|byte| byte.is_ascii_alphanumeric())).then_some(token)
+}
+
+fn expected_sidecar_name(token: &str) -> String {
+    format!("{OWNER_SIDECAR_PREFIX}{token}")
+}
+
 fn expected_root_name(token: &str) -> String {
     format!("{SNAPSHOT_ROOT_PREFIX}{token}")
+}
+
+#[cfg(test)]
+fn pause_snapshot_publication_for_test(phase: &str) {
+    const PHASE_ENV: &str = "SCENEWORKS_P6_PUBLICATION_PAUSE_PHASE";
+    const READY_ENV: &str = "SCENEWORKS_P6_PUBLICATION_PAUSE_READY";
+    if std::env::var(PHASE_ENV).as_deref() != Ok(phase) {
+        return;
+    }
+    let ready = std::env::var(READY_ENV).expect("publication pause requires a ready path");
+    fs::write(ready, phase).expect("publication pause must publish readiness");
+    loop {
+        std::thread::park_timeout(std::time::Duration::from_secs(1));
+    }
+}
+
+fn remove_unpublished_root_at(
+    namespace: &File,
+    root_name: &OsStr,
+    expected_root: CleanupNodeIdentity,
+) -> Result<(), String> {
+    let root = open_entry_at(namespace, root_name, true)?;
+    let names = directory_entry_names(&root)?;
+    if names
+        .iter()
+        .any(|name| name.as_os_str() != OsStr::new(OWNER_MARKER_FILE))
+    {
+        return Err("unpublished snapshot root contains unexpected entries".to_owned());
+    }
+    let current_root = cleanup_identity(
+        &root
+            .metadata()
+            .map_err(|error| format!("stat unpublished snapshot root: {error}"))?,
+    )?;
+    if current_root.kind != expected_root.kind
+        || current_root.device != expected_root.device
+        || current_root.inode != expected_root.inode
+    {
+        return Err("unpublished snapshot root identity changed".to_owned());
+    }
+    validate_open_and_entry(
+        &root,
+        namespace,
+        root_name,
+        current_root,
+        Path::new(root_name),
+    )?;
+    if names.len() == 1 {
+        let marker_name = OsStr::new(OWNER_MARKER_FILE);
+        let marker = open_entry_at(&root, marker_name, false)?;
+        let identity = cleanup_identity(
+            &marker
+                .metadata()
+                .map_err(|error| format!("stat unpublished owner marker: {error}"))?,
+        )?;
+        validate_open_and_entry(
+            &marker,
+            &root,
+            marker_name,
+            identity,
+            Path::new(OWNER_MARKER_FILE),
+        )?;
+        unlink_entry_at(&root, marker_name, identity)?;
+    }
+    root.sync_all()
+        .map_err(|error| format!("sync unpublished snapshot root: {error}"))?;
+    let terminal = cleanup_identity(
+        &root
+            .metadata()
+            .map_err(|error| format!("stat emptied unpublished snapshot root: {error}"))?,
+    )?;
+    if terminal.kind != expected_root.kind
+        || terminal.device != expected_root.device
+        || terminal.inode != expected_root.inode
+    {
+        return Err("unpublished snapshot root changed during cleanup".to_owned());
+    }
+    validate_open_and_entry(&root, namespace, root_name, terminal, Path::new(root_name))?;
+    unlink_entry_at(namespace, root_name, terminal)
 }
 
 impl SnapshotOwner {
@@ -311,74 +734,119 @@ impl SnapshotOwner {
             LockDisposition::Busy => unreachable!("blocking namespace lock cannot be busy"),
         }
 
+        let namespace_directory = open_directory(&namespace)?;
         let mut builder = tempfile::Builder::new();
-        builder.prefix(OWNER_SIDECAR_PREFIX);
-        let mut sidecar = builder
+        builder.prefix(OWNER_STAGE_PREFIX);
+        let mut staged_sidecar = builder
             .tempfile_in(&namespace)
-            .map_err(|error| format!("create private snapshot ownership sidecar: {error}"))?;
-        match lock_exclusive(sidecar.as_file(), false)? {
+            .map_err(|error| format!("create staged snapshot ownership sidecar: {error}"))?;
+        match lock_exclusive(staged_sidecar.as_file(), false)? {
             LockDisposition::Acquired => {}
             LockDisposition::Busy => unreachable!("new ownership sidecar cannot be busy"),
         }
-        let sidecar_name = sidecar
+        #[cfg(test)]
+        pause_snapshot_publication_for_test("empty-stage");
+        let staged_name = staged_sidecar
             .path()
             .file_name()
             .and_then(OsStr::to_str)
-            .ok_or_else(|| "snapshot ownership sidecar name is not UTF-8".to_owned())?
+            .ok_or_else(|| "staged snapshot ownership name is not UTF-8".to_owned())?
             .to_owned();
-        let token = sidecar_token(&sidecar_name)
-            .ok_or_else(|| "snapshot ownership sidecar has an unsafe name".to_owned())?
+        let token = stage_token(&staged_name)
+            .ok_or_else(|| "staged snapshot ownership sidecar has an unsafe name".to_owned())?
             .to_owned();
+        let sidecar_name = expected_sidecar_name(&token);
+        let root_name = expected_root_name(&token);
+        let sidecar_metadata =
+            validate_owned_regular_file(staged_sidecar.as_file(), staged_sidecar.path())?;
+        let root_directory =
+            create_directory_at(&namespace_directory, OsStr::new(&root_name), 0o700)?;
+        let root_metadata = root_directory
+            .metadata()
+            .map_err(|error| format!("stat staged snapshot root: {error}"))?;
         let lease = SnapshotLease {
             schema_version: OWNERSHIP_SCHEMA.to_owned(),
             harness: OWNERSHIP_HARNESS.to_owned(),
-            root_name: expected_root_name(&token),
             token,
+            sidecar_name: sidecar_name.clone(),
+            sidecar_device: UnixMetadataExt::dev(&sidecar_metadata),
+            sidecar_inode: UnixMetadataExt::ino(&sidecar_metadata),
+            root_name: root_name.clone(),
+            root_device: UnixMetadataExt::dev(&root_metadata),
+            root_inode: UnixMetadataExt::ino(&root_metadata),
         };
-        write_json_to_open_file(sidecar.as_file_mut(), &lease)?;
-        sync_directory(&namespace)?;
-
-        let root = namespace.join(&lease.root_name);
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&root)
-            .map_err(|error| {
-                format!(
-                    "create private artifact snapshot directory {}: {error}",
-                    root.display()
-                )
-            })?;
-        let root_metadata = fs::symlink_metadata(&root).map_err(|error| {
-            format!("inspect private snapshot root {}: {error}", root.display())
-        })?;
         let ownership = SnapshotOwnership {
             schema_version: OWNERSHIP_SCHEMA.to_owned(),
             harness: OWNERSHIP_HARNESS.to_owned(),
             token: lease.token.clone(),
-            sidecar_name,
+            sidecar_name: sidecar_name.clone(),
+            sidecar_device: lease.sidecar_device,
+            sidecar_inode: lease.sidecar_inode,
             root_name: lease.root_name.clone(),
-            root_device: UnixMetadataExt::dev(&root_metadata),
-            root_inode: UnixMetadataExt::ino(&root_metadata),
+            root_device: lease.root_device,
+            root_inode: lease.root_inode,
         };
-        if let Err(error) = create_json_file(&root.join(OWNER_MARKER_FILE), &ownership)
-            .and_then(|()| sync_directory(&root))
-            .and_then(|()| sync_directory(&namespace))
-        {
-            let cleanup = fs::remove_dir_all(&root).map_err(|cleanup| {
-                format!("remove unpublished snapshot {}: {cleanup}", root.display())
-            });
+        let publication =
+            create_json_file_at(&root_directory, OsStr::new(OWNER_MARKER_FILE), &ownership)
+                .and_then(|_| {
+                    root_directory
+                        .sync_all()
+                        .map_err(|error| format!("sync staged snapshot root: {error}"))
+                })
+                .and_then(|()| write_json_to_open_file(staged_sidecar.as_file_mut(), &lease))
+                .and_then(|()| {
+                    namespace_directory
+                        .sync_all()
+                        .map_err(|error| format!("sync staged snapshot namespace: {error}"))
+                });
+        if let Err(error) = publication {
+            let cleanup = remove_unpublished_root_at(
+                &namespace_directory,
+                OsStr::new(&root_name),
+                cleanup_identity(&root_metadata)?,
+            );
             return Err(combine_snapshot_cleanup(error, cleanup));
         }
-        let (sidecar, sidecar_path) = match sidecar.keep() {
+        #[cfg(test)]
+        pause_snapshot_publication_for_test("complete-stage");
+        let (sidecar, _staged_path) = match staged_sidecar.keep() {
             Ok(kept) => kept,
             Err(error) => {
                 let primary = format!("persist private snapshot ownership sidecar: {error}");
                 return Err(combine_snapshot_cleanup(
                     primary,
-                    remove_owned_snapshot_tree(&root),
+                    remove_unpublished_root_at(
+                        &namespace_directory,
+                        OsStr::new(&root_name),
+                        cleanup_identity(&root_metadata)?,
+                    ),
                 ));
             }
         };
+        if let Err(error) = rename_noreplace_at(
+            &namespace_directory,
+            OsStr::new(&staged_name),
+            OsStr::new(&sidecar_name),
+        )
+        .and_then(|()| {
+            namespace_directory
+                .sync_all()
+                .map_err(|error| format!("sync published snapshot authority: {error}"))
+        }) {
+            let sidecar_cleanup =
+                remove_locked_sidecar_at(&namespace_directory, &sidecar, OsStr::new(&staged_name));
+            let root_cleanup = remove_unpublished_root_at(
+                &namespace_directory,
+                OsStr::new(&root_name),
+                cleanup_identity(&root_metadata)?,
+            );
+            return Err(combine_snapshot_cleanup(
+                combine_snapshot_cleanup(error, sidecar_cleanup),
+                root_cleanup,
+            ));
+        }
+        let root = namespace.join(&root_name);
+        let sidecar_path = namespace.join(&sidecar_name);
         drop(namespace_lock);
         Ok(Self {
             directory: Some(root),
@@ -394,10 +862,65 @@ impl SnapshotOwner {
             .expect("snapshot owner path is unavailable after cleanup")
     }
 
+    fn inherit_child_lease(&self, command: &mut Command) -> Result<(), String> {
+        let source = self
+            .sidecar
+            .as_ref()
+            .ok_or_else(|| "snapshot ownership lease is unavailable after cleanup".to_owned())?
+            .as_raw_fd();
+        // SAFETY: after fork and before exec, the closure invokes only async-signal-safe libc
+        // descriptor operations. dup2 creates a child-only reference to the same locked open-file
+        // description; clearing FD_CLOEXEC makes that reference survive exec.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::dup2(source, CHILD_LEASE_FD) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::fcntl(CHILD_LEASE_FD, libc::F_SETFD, 0) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        Ok(())
+    }
+
+    fn configure_child_lease(&self, command: &mut Command) -> Result<(), String> {
+        self.inherit_child_lease(command)?;
+        command
+            .arg("--artifact-lease-fd")
+            .arg(CHILD_LEASE_FD.to_string());
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn duplicate_lease_fd(&self) -> Result<RawFd, String> {
+        let sidecar = self
+            .sidecar
+            .as_ref()
+            .ok_or_else(|| "snapshot ownership lease is unavailable after cleanup".to_owned())?;
+        Ok(duplicate_cloexec(sidecar)?.into_raw_fd())
+    }
+
     fn prepare_for_sealing(&self) -> Result<(), String> {
-        let receipt = collect_cleanup_receipt(self.path())?;
         let temporary = self.path().join(CLEANUP_RECEIPT_TEMP_FILE);
-        create_json_file(&temporary, &receipt)?;
+        let mut temporary_file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&temporary)
+            .map_err(|error| format!("create snapshot cleanup receipt: {error}"))?;
+        // Collect while the staging inode is linked so the receipt records the directory's exact
+        // post-publication link identity. rename below preserves both that link count and inode.
+        let root = open_directory(self.path())?;
+        let mut identities = collect_cleanup_identity_map(&root)?;
+        identities
+            .remove(Path::new(CLEANUP_RECEIPT_TEMP_FILE))
+            .ok_or_else(|| "cleanup receipt staging inode disappeared".to_owned())?;
+        let receipt = cleanup_receipt_from_identities(&identities)?;
+        write_json_to_open_file(&mut temporary_file, &receipt)?;
         let published = self.path().join(CLEANUP_RECEIPT_FILE);
         if let Err(error) = fs::rename(&temporary, &published)
             .map_err(|error| format!("publish snapshot cleanup receipt: {error}"))
@@ -413,28 +936,30 @@ impl SnapshotOwner {
         let Some(path) = self.directory.as_ref() else {
             return Ok(());
         };
-        match fs::symlink_metadata(path) {
-            Ok(metadata) => {
-                validate_snapshot_ownership(path, &self.lease, &metadata)?;
-                remove_owned_snapshot_tree(path)?;
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(format!(
-                    "inspect private snapshot for removal {}: {error}",
-                    path.display()
-                ));
-            }
+        let namespace = path
+            .parent()
+            .ok_or_else(|| "snapshot root has no namespace".to_owned())?;
+        let namespace_directory = open_directory(namespace)?;
+        if identity_at_optional(&namespace_directory, OsStr::new(&self.lease.root_name))?.is_some()
+        {
+            remove_owned_snapshot_tree_at(
+                &namespace_directory,
+                &self.lease,
+                false,
+                &mut |_, _| Ok(()),
+            )?;
         }
         self.directory.take();
         if let (Some(sidecar), Some(sidecar_path)) =
             (self.sidecar.as_ref(), self.sidecar_path.as_ref())
         {
-            let namespace = sidecar_path
-                .parent()
-                .expect("snapshot ownership sidecar remains in its namespace");
-            remove_locked_sidecar(sidecar, sidecar_path)?;
-            sync_directory(namespace)?;
+            let sidecar_name = sidecar_path
+                .file_name()
+                .ok_or_else(|| "snapshot ownership sidecar has no filename".to_owned())?;
+            remove_locked_sidecar_at(&namespace_directory, sidecar, sidecar_name)?;
+            namespace_directory
+                .sync_all()
+                .map_err(|error| format!("sync removed snapshot authority: {error}"))?;
             self.sidecar.take();
             self.sidecar_path.take();
         }
@@ -457,6 +982,23 @@ impl SnapshotOwner {
         drop(sidecar);
         root
     }
+
+    #[cfg(test)]
+    fn abandon_with_lease_for_test(mut self) -> (PathBuf, SnapshotLease) {
+        let root = self
+            .directory
+            .take()
+            .expect("termination fixture retains its snapshot root");
+        let sidecar = self
+            .sidecar
+            .take()
+            .expect("termination fixture retains its ownership sidecar");
+        self.sidecar_path
+            .take()
+            .expect("termination fixture retains its ownership path");
+        drop(sidecar);
+        (root, self.lease.clone())
+    }
 }
 
 impl Drop for SnapshotOwner {
@@ -465,286 +1007,810 @@ impl Drop for SnapshotOwner {
     }
 }
 
-fn validate_lease(lease: &SnapshotLease, sidecar_name: &str) -> Result<(), String> {
-    let token = sidecar_token(sidecar_name)
-        .ok_or_else(|| format!("unsafe private snapshot ownership name {sidecar_name:?}"))?;
+fn validate_lease(
+    lease: &SnapshotLease,
+    token: &str,
+    sidecar_metadata: &fs::Metadata,
+) -> Result<(), String> {
     if lease.schema_version != OWNERSHIP_SCHEMA
         || lease.harness != OWNERSHIP_HARNESS
         || lease.token != token
+        || lease.sidecar_name != expected_sidecar_name(token)
+        || lease.sidecar_device != UnixMetadataExt::dev(sidecar_metadata)
+        || lease.sidecar_inode != UnixMetadataExt::ino(sidecar_metadata)
         || lease.root_name != expected_root_name(token)
     {
         return Err(format!(
-            "foreign or malformed private snapshot ownership metadata {sidecar_name:?}"
+            "foreign or malformed private snapshot ownership metadata {:?}",
+            lease.sidecar_name
         ));
     }
     Ok(())
 }
 
-fn validate_snapshot_ownership(
-    root: &Path,
-    lease: &SnapshotLease,
-    root_metadata: &fs::Metadata,
-) -> Result<(), String> {
+fn validate_lease_root(lease: &SnapshotLease, root: &File) -> Result<CleanupNodeIdentity, String> {
+    let root_metadata = root
+        .metadata()
+        .map_err(|error| format!("stat owned private snapshot root: {error}"))?;
     if root_metadata.file_type().is_symlink()
         || !root_metadata.is_dir()
-        || UnixMetadataExt::uid(root_metadata) != unsafe { libc::geteuid() }
+        || UnixMetadataExt::uid(&root_metadata) != unsafe { libc::geteuid() }
+        || UnixMetadataExt::dev(&root_metadata) != lease.root_device
+        || UnixMetadataExt::ino(&root_metadata) != lease.root_inode
     {
-        return Err(format!(
-            "owned private snapshot root is no longer a real directory: {}",
-            root.display()
-        ));
+        return Err("owned private snapshot root no longer matches sidecar authority".to_owned());
     }
-    let marker_path = root.join(OWNER_MARKER_FILE);
-    let marker: SnapshotOwnership = read_json_nofollow(&marker_path)?;
-    let sidecar_name = format!("{OWNER_SIDECAR_PREFIX}{}", lease.token);
+    cleanup_identity(&root_metadata)
+}
+
+fn validate_snapshot_ownership_fd(root: &File, lease: &SnapshotLease) -> Result<(), String> {
+    validate_lease_root(lease, root)?;
+    let marker: SnapshotOwnership = read_json_at(root, OsStr::new(OWNER_MARKER_FILE))?;
     if marker.schema_version != OWNERSHIP_SCHEMA
         || marker.harness != OWNERSHIP_HARNESS
         || marker.token != lease.token
-        || marker.sidecar_name != sidecar_name
+        || marker.sidecar_name != lease.sidecar_name
+        || marker.sidecar_device != lease.sidecar_device
+        || marker.sidecar_inode != lease.sidecar_inode
         || marker.root_name != lease.root_name
-        || marker.root_device != UnixMetadataExt::dev(root_metadata)
-        || marker.root_inode != UnixMetadataExt::ino(root_metadata)
+        || marker.root_device != lease.root_device
+        || marker.root_inode != lease.root_inode
     {
-        return Err(format!(
-            "private snapshot ownership marker does not bind the current root: {}",
-            root.display()
-        ));
+        return Err("private snapshot ownership marker does not bind sidecar authority".to_owned());
     }
     Ok(())
 }
 
-fn cleanup_identity_digest(root: &Path) -> Result<(u64, String), String> {
-    fn visit(root: &Path, path: &Path, nodes: &mut u64, digest: &mut Sha256) -> Result<(), String> {
-        let relative = path
-            .strip_prefix(root)
-            .expect("cleanup traversal stays below its root");
-        if relative == Path::new(CLEANUP_RECEIPT_FILE) {
-            return Ok(());
+fn collect_cleanup_identity_map(
+    root: &File,
+) -> Result<BTreeMap<PathBuf, CleanupNodeIdentity>, String> {
+    fn collect(
+        file: &File,
+        relative: &Path,
+        identities: &mut BTreeMap<PathBuf, CleanupNodeIdentity>,
+    ) -> Result<(), String> {
+        let metadata = file
+            .metadata()
+            .map_err(|error| format!("stat descriptor-relative cleanup inode: {error}"))?;
+        if UnixMetadataExt::uid(&metadata) != unsafe { libc::geteuid() } {
+            return Err(format!(
+                "snapshot cleanup refuses an inode owned by another user at {}",
+                relative.display()
+            ));
         }
-        let metadata = fs::symlink_metadata(path)
-            .map_err(|error| format!("inspect cleanup-owned path {}: {error}", path.display()))?;
-        if metadata.file_type().is_symlink()
-            || (!metadata.is_dir() && !metadata.is_file())
-            || UnixMetadataExt::uid(&metadata) != unsafe { libc::geteuid() }
+        let identity = cleanup_identity(&metadata)?;
+        if identity.kind == SnapshotNodeKind::File && identity.links != 1 {
+            return Err(format!(
+                "snapshot cleanup refuses multiply-linked file at {}",
+                relative.display()
+            ));
+        }
+        if identities
+            .insert(relative.to_path_buf(), identity)
+            .is_some()
         {
-            return Err(format!(
-                "cleanup receipt refuses unowned, linked, or special path {}",
-                path.display()
-            ));
+            return Err("snapshot cleanup repeated a relative path".to_owned());
         }
-        if metadata.is_file() && UnixMetadataExt::nlink(&metadata) != 1 {
-            return Err(format!(
-                "cleanup receipt refuses multiply-linked file {}",
-                path.display()
-            ));
-        }
-        *nodes = nodes
-            .checked_add(1)
-            .ok_or_else(|| "snapshot cleanup node count overflowed".to_owned())?;
-        let relative_bytes = relative.as_os_str().as_bytes();
-        digest.update((relative_bytes.len() as u64).to_le_bytes());
-        digest.update(relative_bytes);
-        digest.update([if metadata.is_dir() { b'd' } else { b'f' }]);
-        digest.update(UnixMetadataExt::dev(&metadata).to_le_bytes());
-        digest.update(UnixMetadataExt::ino(&metadata).to_le_bytes());
-        // Darwin directory link counts include ordinary child entries. Publishing the excluded
-        // cleanup receipt therefore changes that count without changing the owned tree. The exact
-        // recursive path/inode digest already binds directory membership; only file link counts
-        // are security-relevant because clearing flags through a hard link could affect an
-        // unrelated path.
-        let link_count = if metadata.is_file() {
-            UnixMetadataExt::nlink(&metadata)
-        } else {
-            0
-        };
-        digest.update(link_count.to_le_bytes());
-        if metadata.is_dir() {
-            for entry in sorted_entries(path)? {
-                visit(root, &entry, nodes, digest)?;
+        if identity.kind == SnapshotNodeKind::Directory {
+            for name in directory_entry_names(file)? {
+                let entry_identity = identity_at(file, &name)?;
+                let child = open_entry_at(
+                    file,
+                    &name,
+                    entry_identity.kind == SnapshotNodeKind::Directory,
+                )?;
+                let opened_identity =
+                    cleanup_identity(&child.metadata().map_err(|error| {
+                        format!("stat opened snapshot entry {:?}: {error}", name)
+                    })?)?;
+                if opened_identity != entry_identity {
+                    return Err(format!(
+                        "snapshot entry changed while collecting cleanup identities: {:?}",
+                        name
+                    ));
+                }
+                collect(&child, &relative.join(&name), identities)?;
             }
         }
         Ok(())
     }
 
-    let mut nodes = 0u64;
-    let mut digest = Sha256::new();
-    visit(root, root, &mut nodes, &mut digest)?;
-    Ok((nodes, format!("{:x}", digest.finalize())))
+    let mut identities = BTreeMap::new();
+    collect(root, Path::new(""), &mut identities)?;
+    Ok(identities)
 }
 
-fn collect_cleanup_receipt(root: &Path) -> Result<SnapshotCleanupReceipt, String> {
-    let (node_count, identity_sha256) = cleanup_identity_digest(root)?;
+fn cleanup_receipt_from_identities(
+    identities: &BTreeMap<PathBuf, CleanupNodeIdentity>,
+) -> Result<SnapshotCleanupReceipt, String> {
+    let mut nodes = Vec::new();
+    for (relative, identity) in identities {
+        if relative == Path::new(CLEANUP_RECEIPT_FILE) {
+            continue;
+        }
+        let mut components_hex = Vec::new();
+        for component in relative.components() {
+            let std::path::Component::Normal(name) = component else {
+                return Err(format!(
+                    "cleanup receipt contains unsafe relative path {}",
+                    relative.display()
+                ));
+            };
+            components_hex.push(hex_bytes(name.as_bytes()));
+        }
+        nodes.push(SnapshotCleanupNode {
+            components_hex,
+            kind: identity.kind,
+            device: identity.device,
+            inode: identity.inode,
+            links: identity.links,
+        });
+    }
+    let node_count = u64::try_from(nodes.len())
+        .map_err(|_| "snapshot cleanup node count overflowed".to_owned())?;
+    let identity_sha256 = cleanup_nodes_digest(&nodes)?;
     Ok(SnapshotCleanupReceipt {
         schema_version: CLEANUP_SCHEMA.to_owned(),
         node_count,
         identity_sha256,
+        nodes,
     })
 }
 
-fn validate_cleanup_receipt(root: &Path) -> Result<(), String> {
-    let receipt_path = root.join(CLEANUP_RECEIPT_FILE);
-    let receipt: SnapshotCleanupReceipt = read_json_nofollow(&receipt_path)?;
-    if receipt.schema_version != CLEANUP_SCHEMA {
-        return Err(format!(
-            "foreign private snapshot cleanup receipt: {}",
-            receipt_path.display()
-        ));
+fn hex_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
     }
-    let actual = collect_cleanup_receipt(root)?;
-    if actual != receipt {
-        return Err(format!(
-            "private snapshot cleanup identities changed; refuse to clear flags: {} (expected {receipt:?}, actual {actual:?})",
-            root.display(),
-        ));
-    }
-    Ok(())
+    encoded
 }
 
-fn verify_unsealed_construction_tree(path: &Path) -> Result<(), String> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
-        format!(
-            "inspect unfinished private snapshot {}: {error}",
-            path.display()
-        )
-    })?;
-    if metadata.file_type().is_symlink()
-        || (!metadata.is_dir() && !metadata.is_file())
-        || UnixMetadataExt::uid(&metadata) != unsafe { libc::geteuid() }
-        || MacMetadataExt::st_flags(&metadata) & libc::UF_IMMUTABLE != 0
+fn decode_hex_name(encoded: &str) -> Result<OsString, String> {
+    if encoded.is_empty() || !encoded.len().is_multiple_of(2) {
+        return Err("cleanup receipt contains an invalid encoded path component".to_owned());
+    }
+    fn nibble(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            _ => None,
+        }
+    }
+    let mut decoded = Vec::with_capacity(encoded.len() / 2);
+    for pair in encoded.as_bytes().chunks_exact(2) {
+        let high = nibble(pair[0])
+            .ok_or_else(|| "cleanup receipt contains non-canonical hex".to_owned())?;
+        let low = nibble(pair[1])
+            .ok_or_else(|| "cleanup receipt contains non-canonical hex".to_owned())?;
+        decoded.push((high << 4) | low);
+    }
+    if decoded == b"." || decoded == b".." || decoded.contains(&0) || decoded.contains(&b'/') {
+        return Err("cleanup receipt contains an unsafe path component".to_owned());
+    }
+    Ok(OsString::from_vec(decoded))
+}
+
+fn cleanup_nodes_digest(nodes: &[SnapshotCleanupNode]) -> Result<String, String> {
+    let mut digest = Sha256::new();
+    for node in nodes {
+        digest.update(
+            u64::try_from(node.components_hex.len())
+                .map_err(|_| "cleanup receipt component count overflowed".to_owned())?
+                .to_le_bytes(),
+        );
+        for component in &node.components_hex {
+            let decoded = decode_hex_name(component)?;
+            let bytes = decoded.as_bytes();
+            digest.update(
+                u64::try_from(bytes.len())
+                    .map_err(|_| "cleanup receipt path component is too large".to_owned())?
+                    .to_le_bytes(),
+            );
+            digest.update(bytes);
+        }
+        digest.update([if node.kind == SnapshotNodeKind::Directory {
+            b'd'
+        } else {
+            b'f'
+        }]);
+        digest.update(node.device.to_le_bytes());
+        digest.update(node.inode.to_le_bytes());
+        digest.update(node.links.to_le_bytes());
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn cleanup_receipt_identity_map(
+    receipt: &SnapshotCleanupReceipt,
+) -> Result<BTreeMap<PathBuf, CleanupNodeIdentity>, String> {
+    if receipt.schema_version != CLEANUP_SCHEMA
+        || receipt.node_count != receipt.nodes.len() as u64
+        || receipt.identity_sha256 != cleanup_nodes_digest(&receipt.nodes)?
     {
-        return Err(format!(
-            "unfinished private snapshot contains an unsafe entry: {}",
-            path.display()
-        ));
+        return Err(
+            "foreign or internally inconsistent private snapshot cleanup receipt".to_owned(),
+        );
     }
-    if metadata.is_file() && UnixMetadataExt::nlink(&metadata) != 1 {
-        return Err(format!(
-            "unfinished private snapshot contains a multiply-linked file: {}",
-            path.display()
-        ));
-    }
-    if metadata.is_dir() {
-        for entry in sorted_entries(path)? {
-            verify_unsealed_construction_tree(&entry)?;
+    let mut identities = BTreeMap::new();
+    let mut previous: Option<PathBuf> = None;
+    for node in &receipt.nodes {
+        let mut relative = PathBuf::new();
+        for component in &node.components_hex {
+            relative.push(decode_hex_name(component)?);
         }
+        if previous.as_ref().is_some_and(|path| path >= &relative)
+            || identities
+                .insert(
+                    relative.clone(),
+                    CleanupNodeIdentity {
+                        kind: node.kind,
+                        device: node.device,
+                        inode: node.inode,
+                        links: node.links,
+                    },
+                )
+                .is_some()
+        {
+            return Err("cleanup receipt paths are duplicated or out of order".to_owned());
+        }
+        previous = Some(relative);
     }
-    Ok(())
+    if !identities
+        .get(Path::new(""))
+        .is_some_and(|identity| identity.kind == SnapshotNodeKind::Directory)
+    {
+        return Err("cleanup receipt omits its root directory".to_owned());
+    }
+    Ok(identities)
 }
 
-fn remove_owned_snapshot_tree(root: &Path) -> Result<(), String> {
-    let receipt_path = root.join(CLEANUP_RECEIPT_FILE);
-    match fs::symlink_metadata(&receipt_path) {
-        Ok(_) => {
-            validate_cleanup_receipt(root)?;
-            unseal_tree(root)?;
-            // Once every owned inode is unsealed, durably remove the sealed-tree receipt before
-            // recursive deletion. If termination interrupts remove_dir_all, the next startup sees
-            // an unsealed construction/removal tree and can safely finish without demanding the
-            // now-partial sealed-tree identity digest.
-            fs::remove_file(&receipt_path).map_err(|error| {
-                format!(
-                    "retire private snapshot cleanup receipt {}: {error}",
-                    receipt_path.display()
-                )
-            })?;
-            sync_directory(root)?;
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            // The receipt is durably published before sealing starts. Its absence proves this is
-            // only an unfinished, unsealed construction tree; do not clear any filesystem flags.
-            verify_unsealed_construction_tree(root)?;
-        }
-        Err(error) => {
+fn expected_directory_links(
+    expected: &BTreeMap<PathBuf, CleanupNodeIdentity>,
+    current: &BTreeMap<PathBuf, CleanupNodeIdentity>,
+    directory: &Path,
+) -> Result<u64, String> {
+    let original = expected
+        .get(directory)
+        .ok_or_else(|| format!("cleanup receipt omitted {}", directory.display()))?
+        .links;
+    let missing_entries = expected
+        .keys()
+        .filter(|path| path.parent() == Some(directory) && !current.contains_key(*path))
+        .count() as u64;
+    original.checked_sub(missing_entries).ok_or_else(|| {
+        format!(
+            "cleanup receipt has impossible directory link accounting at {}",
+            directory.display()
+        )
+    })
+}
+
+fn validate_cleanup_receipt_fd(
+    root: &File,
+    allow_partial: bool,
+) -> Result<
+    (
+        BTreeMap<PathBuf, CleanupNodeIdentity>,
+        File,
+        CleanupNodeIdentity,
+    ),
+    String,
+> {
+    let receipt_name = OsStr::new(CLEANUP_RECEIPT_FILE);
+    let (receipt, receipt_file) = read_cleanup_receipt_at(root, receipt_name)?;
+    let receipt_identity = cleanup_identity(
+        &receipt_file
+            .metadata()
+            .map_err(|error| format!("stat cleanup receipt: {error}"))?,
+    )?;
+    validate_cleanup_file(&receipt_file, receipt_identity, CLEANUP_RECEIPT_FILE)?;
+    let expected = cleanup_receipt_identity_map(&receipt)?;
+    let mut current = collect_cleanup_identity_map(root)?;
+    let collected_receipt = current
+        .remove(Path::new(CLEANUP_RECEIPT_FILE))
+        .ok_or_else(|| "cleanup receipt disappeared during validation".to_owned())?;
+    if collected_receipt != receipt_identity {
+        return Err("cleanup receipt changed during validation".to_owned());
+    }
+    if !allow_partial && current.keys().ne(expected.keys()) {
+        return Err("private snapshot cleanup membership changed before cleanup".to_owned());
+    }
+    for (path, actual) in &current {
+        let wanted = expected.get(path).ok_or_else(|| {
+            format!(
+                "private snapshot contains unexpected entry not authorized by cleanup receipt: {}",
+                path.display()
+            )
+        })?;
+        if actual.kind != wanted.kind
+            || actual.device != wanted.device
+            || actual.inode != wanted.inode
+            || (actual.kind == SnapshotNodeKind::File && actual.links != wanted.links)
+        {
             return Err(format!(
-                "inspect private snapshot cleanup receipt {}: {error}",
-                receipt_path.display()
+                "private snapshot cleanup identity changed at {}: expected {wanted:?}, actual {actual:?}",
+                path.display()
             ));
         }
     }
-    fs::remove_dir_all(root)
-        .map_err(|error| format!("remove private snapshot {}: {error}", root.display()))
+    for (path, actual) in &current {
+        if actual.kind == SnapshotNodeKind::Directory {
+            let wanted_links = expected_directory_links(&expected, &current, path)?;
+            if actual.links != wanted_links {
+                return Err(format!(
+                    "private snapshot directory link identity changed at {}: expected {wanted_links}, actual {}",
+                    path.display(),
+                    actual.links
+                ));
+            }
+        }
+    }
+    Ok((current, receipt_file, receipt_identity))
 }
 
-fn remove_locked_sidecar(file: &File, path: &Path) -> Result<(), String> {
-    let opened = validate_owned_regular_file(file, path)?;
-    let current = fs::symlink_metadata(path)
-        .map_err(|error| format!("inspect snapshot ownership {}: {error}", path.display()))?;
-    if current.file_type().is_symlink()
-        || UnixMetadataExt::dev(&current) != UnixMetadataExt::dev(&opened)
-        || UnixMetadataExt::ino(&current) != UnixMetadataExt::ino(&opened)
-    {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CleanupMutation {
+    UnsealFlags,
+    UnsealMode,
+    RemoveEntry,
+}
+
+fn expected_child_names(
+    identities: &BTreeMap<PathBuf, CleanupNodeIdentity>,
+    parent: &Path,
+) -> Vec<OsString> {
+    let mut names = identities
+        .keys()
+        .filter_map(|relative| {
+            (relative.parent() == Some(parent))
+                .then(|| relative.file_name().map(OsStr::to_os_string))
+                .flatten()
+        })
+        .collect::<Vec<_>>();
+    names.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    names
+}
+
+fn set_open_file_mode(file: &File, mode: u32, label: &Path) -> Result<(), String> {
+    // SAFETY: file is an owned live descriptor and fchmod mutates only that opened inode.
+    if unsafe { libc::fchmod(file.as_raw_fd(), mode as libc::mode_t) } != 0 {
+        Err(format!(
+            "set snapshot mode {mode:o} on {}: {}",
+            label.display(),
+            io::Error::last_os_error()
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn verify_unsealed_tree_fd(
+    root: &File,
+    identities: &BTreeMap<PathBuf, CleanupNodeIdentity>,
+) -> Result<(), String> {
+    for (relative, expected) in identities {
+        let file = open_relative_from_root(root, relative, expected.kind)?;
+        let metadata = validate_cleanup_file(&file, *expected, &relative.display().to_string())?;
+        if MacMetadataExt::st_flags(&metadata) & libc::UF_IMMUTABLE != 0 {
+            return Err(format!(
+                "unfinished private snapshot remains immutable at {}",
+                relative.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn open_relative_from_root(
+    root: &File,
+    relative: &Path,
+    kind: SnapshotNodeKind,
+) -> Result<File, String> {
+    if relative.as_os_str().is_empty() {
+        return duplicate_cloexec(root);
+    }
+    let mut current = duplicate_cloexec(root)?;
+    let components = relative.components().collect::<Vec<_>>();
+    for (index, component) in components.iter().enumerate() {
+        let name = component.as_os_str();
+        let directory = index + 1 != components.len() || kind == SnapshotNodeKind::Directory;
+        current = open_entry_at(&current, name, directory)?;
+    }
+    Ok(current)
+}
+
+struct OpenedCleanupChild {
+    name: OsString,
+    relative: PathBuf,
+    initial: CleanupNodeIdentity,
+    file: File,
+}
+
+struct CleanupBinding<'a> {
+    file: &'a File,
+    parent: &'a File,
+    name: &'a OsStr,
+    relative: &'a Path,
+    identity: CleanupNodeIdentity,
+    links: Cell<u64>,
+    ancestor: Option<&'a CleanupBinding<'a>>,
+}
+
+impl CleanupBinding<'_> {
+    fn expected(&self) -> CleanupNodeIdentity {
+        CleanupNodeIdentity {
+            links: self.links.get(),
+            ..self.identity
+        }
+    }
+
+    fn validate_chain(&self) -> Result<(), String> {
+        if let Some(ancestor) = self.ancestor {
+            ancestor.validate_chain()?;
+        }
+        validate_open_and_entry(
+            self.file,
+            self.parent,
+            self.name,
+            self.expected(),
+            self.relative,
+        )
+    }
+
+    fn record_child_unlink(&self) -> Result<(), String> {
+        let remaining = self.links.get().checked_sub(1).ok_or_else(|| {
+            format!(
+                "snapshot directory link count underflow at {}",
+                self.relative.display()
+            )
+        })?;
+        self.links.set(remaining);
+        self.validate_chain()
+    }
+}
+
+fn validate_open_and_entry(
+    file: &File,
+    parent: &File,
+    name: &OsStr,
+    expected: CleanupNodeIdentity,
+    label: &Path,
+) -> Result<(), String> {
+    validate_cleanup_file(file, expected, &label.display().to_string())?;
+    let linked = identity_at(parent, name)?;
+    if linked != expected {
         return Err(format!(
-            "snapshot ownership path changed while locked: {}",
-            path.display()
+            "snapshot cleanup path rebound at {}: expected {expected:?}, actual {linked:?}",
+            label.display()
         ));
     }
-    fs::remove_file(path).map_err(|error| {
-        format!(
-            "remove stale snapshot ownership {}: {error}",
-            path.display()
-        )
-    })
+    Ok(())
 }
 
-fn recover_stale_sidecar(namespace: &Path, path: &Path) -> Result<bool, String> {
+fn cleanup_directory<F>(
+    binding: &CleanupBinding<'_>,
+    relative: &Path,
+    current: &BTreeMap<PathBuf, CleanupNodeIdentity>,
+    preserve_root_receipt: bool,
+    hook: &mut F,
+) -> Result<(), String>
+where
+    F: FnMut(&Path, CleanupMutation) -> Result<(), String>,
+{
+    let directory = binding.file;
+    let initial = *current
+        .get(relative)
+        .ok_or_else(|| format!("cleanup identity map omitted {}", relative.display()))?;
+    if binding.expected() != initial {
+        return Err(format!(
+            "cleanup binding disagrees with receipt at {}",
+            relative.display()
+        ));
+    }
+    binding.validate_chain()?;
+
+    let mut expected_names = expected_child_names(current, relative);
+    if preserve_root_receipt && relative.as_os_str().is_empty() {
+        expected_names.push(OsString::from(CLEANUP_RECEIPT_FILE));
+        expected_names.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    }
+    let actual_names = directory_entry_names(directory)?;
+    if actual_names != expected_names {
+        return Err(format!(
+            "snapshot directory membership changed before cleanup at {}: expected {expected_names:?}, actual {actual_names:?}",
+            relative.display(),
+        ));
+    }
+
+    let mut children = Vec::new();
+    for name in expected_child_names(current, relative) {
+        let child_relative = relative.join(&name);
+        let child_initial = *current
+            .get(&child_relative)
+            .expect("current cleanup membership has an identity");
+        let child = open_entry_at(
+            directory,
+            &name,
+            child_initial.kind == SnapshotNodeKind::Directory,
+        )?;
+        validate_open_and_entry(&child, directory, &name, child_initial, &child_relative)?;
+        children.push(OpenedCleanupChild {
+            name,
+            relative: child_relative,
+            initial: child_initial,
+            file: child,
+        });
+    }
+
+    for child in children
+        .iter()
+        .filter(|child| child.initial.kind == SnapshotNodeKind::Directory)
+    {
+        let child_binding = CleanupBinding {
+            file: &child.file,
+            parent: directory,
+            name: &child.name,
+            relative: &child.relative,
+            identity: child.initial,
+            links: Cell::new(child.initial.links),
+            ancestor: Some(binding),
+        };
+        cleanup_directory(
+            &child_binding,
+            &child.relative,
+            current,
+            preserve_root_receipt,
+            hook,
+        )?;
+    }
+
+    if directory_entry_names(directory)? != expected_names {
+        return Err(format!(
+            "snapshot directory membership rebound before unsealing at {}",
+            relative.display()
+        ));
+    }
+    hook(relative, CleanupMutation::UnsealFlags)?;
+    if directory_entry_names(directory)? != expected_names {
+        return Err(format!(
+            "snapshot directory membership rebound immediately before flag mutation at {}",
+            relative.display()
+        ));
+    }
+    binding.validate_chain()?;
+    set_open_file_immutable(directory, relative, false)?;
+    hook(relative, CleanupMutation::UnsealMode)?;
+    if directory_entry_names(directory)? != expected_names {
+        return Err(format!(
+            "snapshot directory membership rebound immediately before mode mutation at {}",
+            relative.display()
+        ));
+    }
+    binding.validate_chain()?;
+    set_open_file_mode(directory, 0o700, relative)?;
+
+    for child in children
+        .iter()
+        .filter(|child| child.initial.kind == SnapshotNodeKind::File)
+    {
+        let file_binding = CleanupBinding {
+            file: &child.file,
+            parent: directory,
+            name: &child.name,
+            relative: &child.relative,
+            identity: child.initial,
+            links: Cell::new(child.initial.links),
+            ancestor: Some(binding),
+        };
+        hook(&child.relative, CleanupMutation::UnsealFlags)?;
+        file_binding.validate_chain()?;
+        set_open_file_immutable(&child.file, &child.relative, false)?;
+        hook(&child.relative, CleanupMutation::UnsealMode)?;
+        file_binding.validate_chain()?;
+        set_open_file_mode(&child.file, 0o600, &child.relative)?;
+        hook(&child.relative, CleanupMutation::RemoveEntry)?;
+        file_binding.validate_chain()?;
+        unlink_entry_at(directory, &child.name, child.initial)?;
+        binding.record_child_unlink()?;
+    }
+
+    for child in children
+        .iter()
+        .filter(|child| child.initial.kind == SnapshotNodeKind::Directory)
+    {
+        let direct_entries = current
+            .keys()
+            .filter(|path| path.parent() == Some(child.relative.as_path()))
+            .count() as u64;
+        let terminal = CleanupNodeIdentity {
+            links: child
+                .initial
+                .links
+                .checked_sub(direct_entries)
+                .ok_or_else(|| {
+                    format!(
+                        "cleanup identity has impossible link accounting at {}",
+                        child.relative.display()
+                    )
+                })?,
+            ..child.initial
+        };
+        if !directory_entry_names(&child.file)?.is_empty() {
+            return Err(format!(
+                "snapshot child directory is not empty at {}",
+                child.relative.display()
+            ));
+        }
+        let child_binding = CleanupBinding {
+            file: &child.file,
+            parent: directory,
+            name: &child.name,
+            relative: &child.relative,
+            identity: terminal,
+            links: Cell::new(terminal.links),
+            ancestor: Some(binding),
+        };
+        hook(&child.relative, CleanupMutation::RemoveEntry)?;
+        child_binding.validate_chain()?;
+        unlink_entry_at(directory, &child.name, terminal)?;
+        binding.record_child_unlink()?;
+    }
+
+    let remaining = directory_entry_names(directory)?;
+    let wanted = if preserve_root_receipt && relative.as_os_str().is_empty() {
+        vec![OsString::from(CLEANUP_RECEIPT_FILE)]
+    } else {
+        Vec::new()
+    };
+    if remaining != wanted {
+        return Err(format!(
+            "snapshot directory has unexpected entries after cleanup at {}",
+            relative.display()
+        ));
+    }
+    directory
+        .sync_all()
+        .map_err(|error| format!("sync cleaned snapshot directory: {error}"))
+}
+
+#[cfg(test)]
+fn validate_cleanup_receipt(root: &Path) -> Result<(), String> {
+    let root = open_directory(root)?;
+    validate_cleanup_receipt_fd(&root, false)?;
+    Ok(())
+}
+
+fn remove_owned_snapshot_tree_at<F>(
+    namespace: &File,
+    lease: &SnapshotLease,
+    allow_partial: bool,
+    hook: &mut F,
+) -> Result<(), String>
+where
+    F: FnMut(&Path, CleanupMutation) -> Result<(), String>,
+{
+    let root_name = OsStr::new(&lease.root_name);
+    let root = open_entry_at(namespace, root_name, true)?;
+    let root_authority = validate_lease_root(lease, &root)?;
+    let root_relative = Path::new("");
+    let root_binding = CleanupBinding {
+        file: &root,
+        parent: namespace,
+        name: root_name,
+        relative: Path::new(&lease.root_name),
+        identity: root_authority,
+        links: Cell::new(root_authority.links),
+        ancestor: None,
+    };
+    let receipt_name = OsStr::new(CLEANUP_RECEIPT_FILE);
+    if identity_at_optional(&root, receipt_name)?.is_some() {
+        validate_snapshot_ownership_fd(&root, lease)?;
+        let (current, receipt_file, receipt_identity) =
+            validate_cleanup_receipt_fd(&root, allow_partial)?;
+        cleanup_directory(&root_binding, root_relative, &current, true, hook)?;
+        let receipt_relative = Path::new(CLEANUP_RECEIPT_FILE);
+        let receipt_binding = CleanupBinding {
+            file: &receipt_file,
+            parent: &root,
+            name: receipt_name,
+            relative: receipt_relative,
+            identity: receipt_identity,
+            links: Cell::new(receipt_identity.links),
+            ancestor: Some(&root_binding),
+        };
+        hook(receipt_relative, CleanupMutation::UnsealFlags)?;
+        receipt_binding.validate_chain()?;
+        set_open_file_immutable(&receipt_file, receipt_relative, false)?;
+        hook(receipt_relative, CleanupMutation::UnsealMode)?;
+        receipt_binding.validate_chain()?;
+        set_open_file_mode(&receipt_file, 0o600, receipt_relative)?;
+        hook(receipt_relative, CleanupMutation::RemoveEntry)?;
+        receipt_binding.validate_chain()?;
+        unlink_entry_at(&root, receipt_name, receipt_identity)?;
+        root_binding.record_child_unlink()?;
+        root.sync_all()
+            .map_err(|error| format!("sync emptied snapshot root: {error}"))?;
+    } else {
+        // Receipt-free trees are unfinished construction state, or the terminal empty-root state
+        // after the receipt was durably retired. Root dev+ino from the external lease remains
+        // mandatory, and sealed content is never dynamically authorized for mutation.
+        let current = collect_cleanup_identity_map(&root)?;
+        if current.len() != 1 {
+            validate_snapshot_ownership_fd(&root, lease)?;
+        }
+        verify_unsealed_tree_fd(&root, &current)?;
+        cleanup_directory(&root_binding, root_relative, &current, false, hook)?;
+    }
+    if !directory_entry_names(&root)?.is_empty() {
+        return Err("private snapshot root is not empty after descriptor cleanup".to_owned());
+    }
+    hook(root_relative, CleanupMutation::RemoveEntry)?;
+    root_binding.validate_chain()?;
+    unlink_entry_at(namespace, root_name, root_binding.expected())
+}
+
+fn remove_locked_sidecar_at(namespace: &File, file: &File, name: &OsStr) -> Result<(), String> {
+    let metadata = validate_owned_regular_file(file, Path::new(name))?;
+    let identity = cleanup_identity(&metadata)?;
+    validate_open_and_entry(file, namespace, name, identity, Path::new(name))?;
+    unlink_entry_at(namespace, name, identity)
+}
+
+fn recover_stale_sidecar(
+    namespace: &Path,
+    namespace_directory: &File,
+    path: &Path,
+    staged: bool,
+) -> Result<bool, String> {
     let sidecar_name = path
         .file_name()
         .and_then(OsStr::to_str)
         .ok_or_else(|| "snapshot ownership sidecar name is not UTF-8".to_owned())?;
-    sidecar_token(sidecar_name)
-        .ok_or_else(|| format!("unsafe snapshot ownership sidecar name {sidecar_name:?}"))?;
+    let token = if staged {
+        stage_token(sidecar_name)
+    } else {
+        sidecar_token(sidecar_name)
+    }
+    .ok_or_else(|| format!("unsafe snapshot ownership sidecar name {sidecar_name:?}"))?;
     let mut file = OpenOptions::new()
         .read(true)
         .write(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)
         .map_err(|error| format!("open stale snapshot ownership {}: {error}", path.display()))?;
-    validate_owned_regular_file(&file, path)?;
+    let sidecar_metadata = validate_owned_regular_file(&file, path)?;
     match lock_exclusive(&file, true)? {
         LockDisposition::Busy => return Ok(false),
         LockDisposition::Acquired => {}
     }
-    let lease: SnapshotLease = read_json_from_open_file(&mut file, path)?;
-    validate_lease(&lease, sidecar_name)?;
-    let root = namespace.join(&lease.root_name);
-    match fs::symlink_metadata(&root) {
-        Ok(metadata) => {
-            let receipt_path = root.join(CLEANUP_RECEIPT_FILE);
-            match fs::symlink_metadata(&receipt_path) {
-                Ok(_) => validate_snapshot_ownership(&root, &lease, &metadata)?,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    // The durable cleanup receipt is published only after the root marker is
-                    // complete and immediately before sealing. Without it, even a missing or
-                    // partially written root marker is still an unsealed construction tree.
-                    if metadata.file_type().is_symlink()
-                        || !metadata.is_dir()
-                        || UnixMetadataExt::uid(&metadata) != unsafe { libc::geteuid() }
-                    {
-                        return Err(format!(
-                            "unfinished private snapshot root is unsafe: {}",
-                            root.display()
-                        ));
-                    }
-                }
-                Err(error) => {
-                    return Err(format!(
-                        "inspect private snapshot cleanup receipt {}: {error}",
-                        receipt_path.display()
-                    ));
-                }
+    let lease = match read_json_from_open_file::<SnapshotLease>(&mut file, path) {
+        Ok(lease) => lease,
+        Err(error) if staged => {
+            let root_name = expected_root_name(token);
+            if identity_at_optional(namespace_directory, OsStr::new(&root_name))?.is_some() {
+                return Err(format!(
+                    "{error}; malformed staged authority has a candidate root and was quarantined: {}",
+                    namespace.join(root_name).display()
+                ));
             }
-            remove_owned_snapshot_tree(&root)?;
+            remove_locked_sidecar_at(namespace_directory, &file, OsStr::new(sidecar_name))?;
+            namespace_directory
+                .sync_all()
+                .map_err(|error| format!("sync removed staging authority: {error}"))?;
+            return Ok(true);
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(format!(
-                "inspect stale private snapshot {}: {error}",
-                root.display()
-            ));
-        }
+        Err(error) => return Err(error),
+    };
+    validate_lease(&lease, token, &sidecar_metadata)?;
+    if identity_at_optional(namespace_directory, OsStr::new(&lease.root_name))?.is_some() {
+        remove_owned_snapshot_tree_at(namespace_directory, &lease, true, &mut |_, _| Ok(()))?;
     }
-    remove_locked_sidecar(&file, path)?;
-    sync_directory(namespace)?;
+    remove_locked_sidecar_at(namespace_directory, &file, OsStr::new(sidecar_name))?;
+    namespace_directory
+        .sync_all()
+        .map_err(|error| format!("sync recovered snapshot namespace: {error}"))?;
     Ok(true)
 }
 
@@ -755,6 +1821,7 @@ fn scavenge_stale_snapshots_in(parent: Option<&Path>) -> Result<usize, String> {
         LockDisposition::Acquired => {}
         LockDisposition::Busy => unreachable!("blocking namespace lock cannot be busy"),
     }
+    let namespace_directory = open_directory(&namespace)?;
     let mut recovered = 0usize;
     let mut errors = Vec::new();
     let mut referenced_roots = BTreeSet::new();
@@ -766,9 +1833,15 @@ fn scavenge_stale_snapshots_in(parent: Option<&Path>) -> Result<usize, String> {
             ));
             continue;
         };
-        if let Some(token) = sidecar_token(name) {
+        let token = sidecar_token(name).or_else(|| stage_token(name));
+        if let Some(token) = token {
             referenced_roots.insert(expected_root_name(token));
-            match recover_stale_sidecar(&namespace, &path) {
+            match recover_stale_sidecar(
+                &namespace,
+                &namespace_directory,
+                &path,
+                stage_token(name).is_some(),
+            ) {
                 Ok(true) => recovered += 1,
                 Ok(false) => {}
                 Err(error) => errors.push(error),
@@ -914,6 +1987,20 @@ impl OwnedPinnedArtifact {
         &self.artifact_path
     }
 
+    pub(super) fn configure_child_lease(&self, command: &mut Command) -> Result<(), String> {
+        self.owner.configure_child_lease(command)
+    }
+
+    #[cfg(test)]
+    fn inherit_child_lease_for_test(&self, command: &mut Command) -> Result<(), String> {
+        self.owner.inherit_child_lease(command)
+    }
+
+    #[cfg(test)]
+    pub(super) fn duplicate_lease_fd(&self) -> Result<RawFd, String> {
+        self.owner.duplicate_lease_fd()
+    }
+
     pub(super) fn verify_integrity(&self) -> Result<(), String> {
         verify_sealed_tree(self.owner.path())?;
         let actual_identities = collect_identities(self.owner.path())?;
@@ -945,6 +2032,7 @@ impl OwnedPinnedArtifact {
 
 /// A child-process view of the parent-owned sealed snapshot.
 pub(super) struct VerifiedPinnedArtifact {
+    _lease: File,
     root_path: PathBuf,
     artifact_path: PathBuf,
     identities: BTreeMap<PathBuf, SnapshotNodeIdentity>,
@@ -952,7 +2040,37 @@ pub(super) struct VerifiedPinnedArtifact {
 }
 
 impl VerifiedPinnedArtifact {
-    pub(super) fn admit(artifact: &ArtifactReceipt, path: &Path) -> Result<Self, String> {
+    pub(super) fn admit(
+        artifact: &ArtifactReceipt,
+        path: &Path,
+        lease_fd: RawFd,
+    ) -> Result<Self, String> {
+        if lease_fd < 0 {
+            return Err("child artifact lease descriptor must be non-negative".to_owned());
+        }
+        // SAFETY: F_GETFD only inspects the numeric descriptor and does not take ownership.
+        if unsafe { libc::fcntl(lease_fd, libc::F_GETFD) } < 0 {
+            return Err(format!(
+                "child artifact lease descriptor is not open: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: the child CLI transfers ownership of its explicitly inherited descriptor to the
+        // verified snapshot guard. Callers must pass a live descriptor exactly once.
+        let mut lease_file = unsafe { File::from_raw_fd(lease_fd) };
+        let lease_metadata =
+            validate_owned_regular_file(&lease_file, Path::new("<inherited snapshot lease>"))?;
+        match lock_exclusive(&lease_file, true)? {
+            LockDisposition::Acquired => {}
+            LockDisposition::Busy => {
+                return Err(
+                    "child snapshot lease descriptor is not the inherited locked authority"
+                        .to_owned(),
+                )
+            }
+        }
+        let lease: SnapshotLease =
+            read_json_from_open_file(&mut lease_file, Path::new("<inherited snapshot lease>"))?;
         if !path.is_absolute() {
             return Err("child artifact snapshot path must be absolute".to_owned());
         }
@@ -966,6 +2084,26 @@ impl VerifiedPinnedArtifact {
             .parent()
             .ok_or_else(|| "private artifact snapshot has no parent".to_owned())?
             .to_path_buf();
+        let root_name = root_path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .ok_or_else(|| "private artifact snapshot root name is not UTF-8".to_owned())?;
+        let token = root_name
+            .strip_prefix(SNAPSHOT_ROOT_PREFIX)
+            .filter(|token| {
+                !token.is_empty() && token.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            })
+            .ok_or_else(|| "private artifact snapshot root has an unsafe name".to_owned())?;
+        validate_lease(&lease, token, &lease_metadata)?;
+        if lease.root_name != root_name {
+            return Err("child snapshot path does not match its inherited lease".to_owned());
+        }
+        let namespace_path = root_path
+            .parent()
+            .ok_or_else(|| "private artifact snapshot root has no namespace".to_owned())?;
+        let namespace = open_directory(namespace_path)?;
+        let root = open_entry_at(&namespace, OsStr::new(root_name), true)?;
+        validate_snapshot_ownership_fd(&root, &lease)?;
         verify_sealed_tree(&root_path)?;
         let inventory = inventory_artifact(&artifact_path).map_err(|error| error.to_string())?;
         if inventory != artifact.inventory {
@@ -975,6 +2113,7 @@ impl VerifiedPinnedArtifact {
             ));
         }
         let snapshot = Self {
+            _lease: lease_file,
             identities: collect_identities(&root_path)?,
             root_path,
             artifact_path,
@@ -1362,6 +2501,7 @@ fn seal_tree(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
 fn unseal_tree(path: &Path) -> Result<(), String> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -1497,6 +2637,15 @@ mod tests {
     const TERMINATION_NAMESPACE_ENV: &str = "SCENEWORKS_P6_TERMINATION_NAMESPACE";
     const TERMINATION_ARTIFACT_ENV: &str = "SCENEWORKS_P6_TERMINATION_ARTIFACT";
     const TERMINATION_READY_ENV: &str = "SCENEWORKS_P6_TERMINATION_READY";
+    const PUBLICATION_HELPER_ENV: &str = "SCENEWORKS_P6_PUBLICATION_HELPER";
+    const PUBLICATION_PHASE_ENV: &str = "SCENEWORKS_P6_PUBLICATION_PAUSE_PHASE";
+    const PUBLICATION_READY_ENV: &str = "SCENEWORKS_P6_PUBLICATION_PAUSE_READY";
+    const CHILD_LEASE_PARENT_ENV: &str = "SCENEWORKS_P6_CHILD_LEASE_PARENT";
+    const CHILD_LEASE_CHILD_ENV: &str = "SCENEWORKS_P6_CHILD_LEASE_CHILD";
+    const CHILD_LEASE_NAMESPACE_ENV: &str = "SCENEWORKS_P6_CHILD_LEASE_NAMESPACE";
+    const CHILD_LEASE_ARTIFACT_ENV: &str = "SCENEWORKS_P6_CHILD_LEASE_ARTIFACT";
+    const CHILD_LEASE_SNAPSHOT_ENV: &str = "SCENEWORKS_P6_CHILD_LEASE_SNAPSHOT";
+    const CHILD_LEASE_READY_ENV: &str = "SCENEWORKS_P6_CHILD_LEASE_READY";
 
     fn receipt(path: &Path) -> ArtifactReceipt {
         let canonical_path = path.canonicalize().unwrap();
@@ -1516,7 +2665,9 @@ mod tests {
             .unwrap()
             .map(|entry| entry.unwrap().file_name().into_string().unwrap())
             .filter(|name| {
-                name.starts_with(OWNER_SIDECAR_PREFIX) || name.starts_with(SNAPSHOT_ROOT_PREFIX)
+                name.starts_with(OWNER_SIDECAR_PREFIX)
+                    || name.starts_with(SNAPSHOT_ROOT_PREFIX)
+                    || name.starts_with(OWNER_STAGE_PREFIX)
             })
             .collect::<Vec<_>>();
         assert!(
@@ -1775,6 +2926,204 @@ mod tests {
     }
 
     #[test]
+    fn publication_interruption_helper() {
+        if std::env::var_os(PUBLICATION_HELPER_ENV).is_none() {
+            return;
+        }
+        let namespace = std::env::var(CHILD_LEASE_NAMESPACE_ENV).unwrap();
+        let artifact = std::env::var(CHILD_LEASE_ARTIFACT_ENV).unwrap();
+        let artifact = receipt(Path::new(&artifact));
+        let _pinned = OwnedPinnedArtifact::create_with_hooks(
+            &artifact,
+            Some(Path::new(&namespace)),
+            ClonePreference::CopyOnly,
+            || Ok(()),
+            |_| Ok(()),
+        )
+        .unwrap();
+        panic!("publication helper passed its requested pause point");
+    }
+
+    #[test]
+    fn child_lease_grandchild_helper() {
+        if std::env::var_os(CHILD_LEASE_CHILD_ENV).is_none() {
+            return;
+        }
+        let artifact_path = std::env::var(CHILD_LEASE_ARTIFACT_ENV).unwrap();
+        let snapshot_path = std::env::var(CHILD_LEASE_SNAPSHOT_ENV).unwrap();
+        let ready = std::env::var(CHILD_LEASE_READY_ENV).unwrap();
+        let artifact = receipt(Path::new(&artifact_path));
+        let _verified =
+            VerifiedPinnedArtifact::admit(&artifact, Path::new(&snapshot_path), CHILD_LEASE_FD)
+                .unwrap();
+        fs::write(ready, std::process::id().to_string()).unwrap();
+        loop {
+            thread::park_timeout(Duration::from_secs(1));
+        }
+    }
+
+    #[test]
+    #[allow(clippy::zombie_processes)]
+    fn child_lease_parent_helper() {
+        if std::env::var_os(CHILD_LEASE_PARENT_ENV).is_none() {
+            return;
+        }
+        let namespace = std::env::var(CHILD_LEASE_NAMESPACE_ENV).unwrap();
+        let artifact_path = std::env::var(CHILD_LEASE_ARTIFACT_ENV).unwrap();
+        let ready = PathBuf::from(std::env::var(CHILD_LEASE_READY_ENV).unwrap());
+        let child_ready = ready.with_extension("child");
+        let artifact = receipt(Path::new(&artifact_path));
+        let pinned = OwnedPinnedArtifact::create_with_hooks(
+            &artifact,
+            Some(Path::new(&namespace)),
+            ClonePreference::CopyOnly,
+            || Ok(()),
+            |_| Ok(()),
+        )
+        .unwrap();
+        let test_binary = std::env::current_exe().unwrap();
+        let mut command = Command::new(test_binary);
+        command
+            .arg("--exact")
+            .arg("pinned_artifact::tests::child_lease_grandchild_helper")
+            .arg("--nocapture")
+            .env(CHILD_LEASE_CHILD_ENV, "1")
+            .env(CHILD_LEASE_ARTIFACT_ENV, &artifact_path)
+            .env(CHILD_LEASE_SNAPSHOT_ENV, pinned.path())
+            .env(CHILD_LEASE_READY_ENV, &child_ready)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        pinned.inherit_child_lease_for_test(&mut command).unwrap();
+        let _child = command.spawn().unwrap();
+        for _ in 0..500 {
+            if child_ready.exists() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let child_pid = fs::read_to_string(&child_ready).unwrap();
+        fs::write(
+            &ready,
+            format!("{}\n{}\n", pinned.root_path().display(), child_pid.trim()),
+        )
+        .unwrap();
+        loop {
+            thread::park_timeout(Duration::from_secs(1));
+        }
+    }
+
+    #[test]
+    fn inherited_child_lease_survives_parent_death_and_blocks_scavenging() {
+        let temp = tempfile::tempdir().unwrap();
+        let artifact_path = temp.path().join("artifact");
+        let namespace = temp.path().join("snapshots");
+        let ready = temp.path().join("lease-ready");
+        fs::create_dir(&artifact_path).unwrap();
+        fs::create_dir(&namespace).unwrap();
+        fs::write(artifact_path.join("weights.bin"), b"weights").unwrap();
+        let test_binary = std::env::current_exe().unwrap();
+        let mut parent = Command::new(test_binary)
+            .arg("--exact")
+            .arg("pinned_artifact::tests::child_lease_parent_helper")
+            .arg("--nocapture")
+            .env(CHILD_LEASE_PARENT_ENV, "1")
+            .env(CHILD_LEASE_NAMESPACE_ENV, &namespace)
+            .env(CHILD_LEASE_ARTIFACT_ENV, &artifact_path)
+            .env(CHILD_LEASE_READY_ENV, &ready)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        for _ in 0..500 {
+            if ready.exists() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let state = fs::read_to_string(&ready).expect("lease parent did not become ready");
+        let mut lines = state.lines();
+        let root = PathBuf::from(lines.next().unwrap());
+        let child_pid = lines.next().unwrap().parse::<libc::pid_t>().unwrap();
+        assert_eq!(
+            unsafe { libc::kill(parent.id() as libc::pid_t, libc::SIGKILL) },
+            0
+        );
+        assert!(!parent.wait().unwrap().success());
+        assert_eq!(scavenge_stale_snapshots_in(Some(&namespace)).unwrap(), 0);
+        assert!(root.exists());
+        assert_eq!(unsafe { libc::kill(child_pid, libc::SIGKILL) }, 0);
+        let mut recovered = 0;
+        for _ in 0..500 {
+            recovered = scavenge_stale_snapshots_in(Some(&namespace)).unwrap();
+            if recovered == 1 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(recovered, 1);
+        assert!(!root.exists());
+        assert_no_owned_snapshots(&namespace);
+    }
+
+    #[test]
+    fn staging_authority_interruptions_never_publish_partial_owner_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let artifact_path = temp.path().join("artifact");
+        let namespace = temp.path().join("snapshots");
+        fs::create_dir(&artifact_path).unwrap();
+        fs::create_dir(&namespace).unwrap();
+        fs::write(artifact_path.join("weights.bin"), b"weights").unwrap();
+        let test_binary = std::env::current_exe().unwrap();
+
+        for (phase, signal) in [
+            ("empty-stage", libc::SIGKILL),
+            ("complete-stage", libc::SIGABRT),
+        ] {
+            let ready = temp.path().join(format!("publication-{phase}"));
+            let mut child = Command::new(&test_binary)
+                .arg("--exact")
+                .arg("pinned_artifact::tests::publication_interruption_helper")
+                .arg("--nocapture")
+                .env(PUBLICATION_HELPER_ENV, "1")
+                .env(PUBLICATION_PHASE_ENV, phase)
+                .env(PUBLICATION_READY_ENV, &ready)
+                .env(CHILD_LEASE_NAMESPACE_ENV, &namespace)
+                .env(CHILD_LEASE_ARTIFACT_ENV, &artifact_path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            for _ in 0..500 {
+                if ready.exists() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(ready.exists(), "publication helper did not reach {phase}");
+            let names = fs::read_dir(&namespace)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect::<Vec<_>>();
+            assert!(names
+                .iter()
+                .any(|name| name.starts_with(OWNER_STAGE_PREFIX)));
+            assert!(
+                names
+                    .iter()
+                    .all(|name| !name.starts_with(OWNER_SIDECAR_PREFIX)),
+                "a final owner file became visible before atomic publication: {names:?}"
+            );
+            assert_eq!(unsafe { libc::kill(child.id() as libc::pid_t, signal) }, 0);
+            assert!(!child.wait().unwrap().success());
+            assert_eq!(scavenge_stale_snapshots_in(Some(&namespace)).unwrap(), 1);
+            assert_no_owned_snapshots(&namespace);
+        }
+    }
+
+    #[test]
     fn startup_scavenger_recovers_sigint_sigterm_sigkill_and_abort_trees() {
         let temp = tempfile::tempdir().unwrap();
         let artifact_path = temp.path().join("artifact");
@@ -1838,7 +3187,12 @@ mod tests {
                         schema_version: OWNERSHIP_SCHEMA.to_owned(),
                         harness: "foreign-harness".to_owned(),
                         token: token.to_owned(),
+                        sidecar_name: expected_sidecar_name(token),
+                        sidecar_device: 0,
+                        sidecar_inode: 0,
                         root_name: expected_root_name(token),
+                        root_device: 0,
+                        root_inode: 0,
                     },
                 )
                 .unwrap();
@@ -1851,6 +3205,270 @@ mod tests {
             assert_eq!(fs::read(root.join("sentinel")).unwrap(), b"unrelated");
             assert!(sidecar.exists());
         }
+    }
+
+    #[test]
+    fn receipt_free_recovery_refuses_a_replacement_root_bound_to_the_stale_sidecar() {
+        let source = tempfile::tempdir().unwrap();
+        let artifact_path = source.path().join("artifact");
+        fs::create_dir(&artifact_path).unwrap();
+        fs::write(artifact_path.join("weights.bin"), b"weights").unwrap();
+        let artifact = receipt(&artifact_path);
+        let snapshots = tempfile::tempdir().unwrap();
+        let pinned = OwnedPinnedArtifact::create_with_hooks(
+            &artifact,
+            Some(snapshots.path()),
+            ClonePreference::CopyOnly,
+            || Ok(()),
+            |_| Ok(()),
+        )
+        .unwrap();
+        let OwnedPinnedArtifact { owner, .. } = pinned;
+        let (root, _lease) = owner.abandon_with_lease_for_test();
+        unseal_tree(&root).unwrap();
+        fs::remove_file(root.join(CLEANUP_RECEIPT_FILE)).unwrap();
+        let displaced = snapshots.path().join("displaced-owned-root");
+        fs::rename(&root, &displaced).unwrap();
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("sentinel"), b"replacement").unwrap();
+
+        let error = scavenge_stale_snapshots_in(Some(snapshots.path())).unwrap_err();
+        assert!(
+            error.contains("no longer matches sidecar authority"),
+            "{error}"
+        );
+        assert_eq!(fs::read(root.join("sentinel")).unwrap(), b"replacement");
+
+        fs::remove_dir_all(&root).unwrap();
+        fs::rename(&displaced, &root).unwrap();
+        assert_eq!(
+            scavenge_stale_snapshots_in(Some(snapshots.path())).unwrap(),
+            1
+        );
+        assert_no_owned_snapshots(snapshots.path());
+    }
+
+    #[test]
+    fn child_admission_refuses_missing_and_independent_lease_descriptors() {
+        let source = tempfile::tempdir().unwrap();
+        let artifact_path = source.path().join("artifact");
+        fs::create_dir(&artifact_path).unwrap();
+        fs::write(artifact_path.join("weights.bin"), b"weights").unwrap();
+        let artifact = receipt(&artifact_path);
+        let mut pinned = OwnedPinnedArtifact::create(&artifact).unwrap();
+
+        let missing = VerifiedPinnedArtifact::admit(&artifact, pinned.path(), -1)
+            .err()
+            .expect("missing lease descriptor must be refused");
+        assert!(missing.contains("non-negative"), "{missing}");
+
+        let unrelated_path = source.path().join("unrelated-lease");
+        fs::write(&unrelated_path, b"{}").unwrap();
+        let unrelated = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&unrelated_path)
+            .unwrap();
+        let wrong =
+            VerifiedPinnedArtifact::admit(&artifact, pinned.path(), unrelated.into_raw_fd())
+                .err()
+                .expect("independent lease descriptor must be refused");
+        assert!(wrong.contains("parse snapshot ownership"), "{wrong}");
+        pinned.cleanup().unwrap();
+    }
+
+    #[test]
+    fn cleanup_revalidates_nlink_immediately_before_mode_mutation() {
+        let source = tempfile::tempdir().unwrap();
+        let artifact_path = source.path().join("artifact");
+        fs::create_dir(&artifact_path).unwrap();
+        fs::write(artifact_path.join("weights.bin"), b"weights").unwrap();
+        let artifact = receipt(&artifact_path);
+        let snapshots = tempfile::tempdir().unwrap();
+        let pinned = OwnedPinnedArtifact::create_with_hooks(
+            &artifact,
+            Some(snapshots.path()),
+            ClonePreference::CopyOnly,
+            || Ok(()),
+            |_| Ok(()),
+        )
+        .unwrap();
+        let OwnedPinnedArtifact { owner, .. } = pinned;
+        let (root, lease) = owner.abandon_with_lease_for_test();
+        let namespace = open_directory(snapshots.path()).unwrap();
+        let target = Path::new("artifact/weights.bin");
+        let outside_link = source.path().join("outside-link.bin");
+        let original_mode = fs::metadata(root.join(target))
+            .unwrap()
+            .permissions()
+            .mode();
+        let injected = Cell::new(false);
+        let error =
+            remove_owned_snapshot_tree_at(&namespace, &lease, false, &mut |relative, mutation| {
+                if relative == target
+                    && mutation == CleanupMutation::UnsealMode
+                    && !injected.replace(true)
+                {
+                    fs::hard_link(root.join(target), &outside_link)
+                        .map_err(|error| error.to_string())?;
+                }
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(
+            error.contains("multiply-linked") || error.contains("changed"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::metadata(&outside_link).unwrap().permissions().mode(),
+            original_mode
+        );
+        fs::remove_file(&outside_link).unwrap();
+        assert_eq!(
+            scavenge_stale_snapshots_in(Some(snapshots.path())).unwrap(),
+            1
+        );
+        assert_no_owned_snapshots(snapshots.path());
+    }
+
+    #[test]
+    fn cleanup_manifest_resumes_with_missing_expected_nodes_and_keeps_receipt_until_last() {
+        let source = tempfile::tempdir().unwrap();
+        let artifact_path = source.path().join("artifact");
+        fs::create_dir(&artifact_path).unwrap();
+        fs::write(artifact_path.join("weights.bin"), b"weights").unwrap();
+        let artifact = receipt(&artifact_path);
+        let snapshots = tempfile::tempdir().unwrap();
+        let pinned = OwnedPinnedArtifact::create_with_hooks(
+            &artifact,
+            Some(snapshots.path()),
+            ClonePreference::CopyOnly,
+            || Ok(()),
+            |_| Ok(()),
+        )
+        .unwrap();
+        let OwnedPinnedArtifact { owner, .. } = pinned;
+        let (root, lease) = owner.abandon_with_lease_for_test();
+        let namespace = open_directory(snapshots.path()).unwrap();
+        let removed_file = Cell::new(false);
+        let interruption =
+            remove_owned_snapshot_tree_at(&namespace, &lease, false, &mut |relative, mutation| {
+                if relative == Path::new("artifact/weights.bin")
+                    && mutation == CleanupMutation::RemoveEntry
+                {
+                    removed_file.set(true);
+                } else if removed_file.get() {
+                    return Err("injected cleanup interruption".to_owned());
+                }
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(interruption.contains("injected cleanup interruption"));
+        assert!(!root.join("artifact/weights.bin").exists());
+        assert!(root.join(CLEANUP_RECEIPT_FILE).exists());
+
+        assert_eq!(
+            scavenge_stale_snapshots_in(Some(snapshots.path())).unwrap(),
+            1
+        );
+        assert!(!root.exists());
+        assert_no_owned_snapshots(snapshots.path());
+    }
+
+    #[test]
+    fn cleanup_resumes_after_receipt_retirement_before_root_unlink() {
+        let source = tempfile::tempdir().unwrap();
+        let artifact_path = source.path().join("artifact");
+        fs::create_dir(&artifact_path).unwrap();
+        fs::write(artifact_path.join("weights.bin"), b"weights").unwrap();
+        let artifact = receipt(&artifact_path);
+        let snapshots = tempfile::tempdir().unwrap();
+        let pinned = OwnedPinnedArtifact::create_with_hooks(
+            &artifact,
+            Some(snapshots.path()),
+            ClonePreference::CopyOnly,
+            || Ok(()),
+            |_| Ok(()),
+        )
+        .unwrap();
+        let OwnedPinnedArtifact { owner, .. } = pinned;
+        let (root, lease) = owner.abandon_with_lease_for_test();
+        let namespace = open_directory(snapshots.path()).unwrap();
+        let receipt_retired = Cell::new(false);
+        let interruption =
+            remove_owned_snapshot_tree_at(&namespace, &lease, false, &mut |relative, mutation| {
+                if relative == Path::new(CLEANUP_RECEIPT_FILE)
+                    && mutation == CleanupMutation::RemoveEntry
+                {
+                    receipt_retired.set(true);
+                } else if relative.as_os_str().is_empty()
+                    && mutation == CleanupMutation::RemoveEntry
+                    && receipt_retired.get()
+                {
+                    return Err("injected terminal cleanup interruption".to_owned());
+                }
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(interruption.contains("terminal cleanup interruption"));
+        assert!(root.is_dir());
+        assert!(fs::read_dir(&root).unwrap().next().is_none());
+
+        assert_eq!(
+            scavenge_stale_snapshots_in(Some(snapshots.path())).unwrap(),
+            1
+        );
+        assert!(!root.exists());
+        assert_no_owned_snapshots(snapshots.path());
+    }
+
+    #[test]
+    fn cleanup_refuses_an_intermediate_directory_swap_before_unsealing() {
+        let source = tempfile::tempdir().unwrap();
+        let artifact_path = source.path().join("artifact");
+        fs::create_dir(&artifact_path).unwrap();
+        fs::write(artifact_path.join("weights.bin"), b"weights").unwrap();
+        let artifact = receipt(&artifact_path);
+        let snapshots = tempfile::tempdir().unwrap();
+        let pinned = OwnedPinnedArtifact::create_with_hooks(
+            &artifact,
+            Some(snapshots.path()),
+            ClonePreference::CopyOnly,
+            || Ok(()),
+            |_| Ok(()),
+        )
+        .unwrap();
+        let OwnedPinnedArtifact { owner, .. } = pinned;
+        let (root, lease) = owner.abandon_with_lease_for_test();
+        let namespace = open_directory(snapshots.path()).unwrap();
+        let artifact = root.join("artifact");
+        let displaced = snapshots.path().join("artifact-displaced");
+        let injected = Cell::new(false);
+        let error =
+            remove_owned_snapshot_tree_at(&namespace, &lease, false, &mut |relative, mutation| {
+                if relative == Path::new("artifact/weights.bin")
+                    && mutation == CleanupMutation::UnsealFlags
+                    && !injected.replace(true)
+                {
+                    set_snapshot_protection(&root, 0o700, false)?;
+                    fs::rename(&artifact, &displaced).map_err(|error| error.to_string())?;
+                    fs::create_dir(&artifact).map_err(|error| error.to_string())?;
+                    fs::write(artifact.join("sentinel"), b"replacement")
+                        .map_err(|error| error.to_string())?;
+                }
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.contains("path rebound"), "{error}");
+        assert_eq!(fs::read(artifact.join("sentinel")).unwrap(), b"replacement");
+
+        fs::remove_dir_all(&artifact).unwrap();
+        fs::rename(&displaced, &artifact).unwrap();
+        assert_eq!(
+            scavenge_stale_snapshots_in(Some(snapshots.path())).unwrap(),
+            1
+        );
+        assert_no_owned_snapshots(snapshots.path());
     }
 
     #[test]
@@ -1912,7 +3530,8 @@ mod tests {
         let mut owned = OwnedPinnedArtifact::create(&artifact).unwrap();
 
         fs::write(&weights, b"attack!").unwrap();
-        let child = VerifiedPinnedArtifact::admit(&artifact, owned.path()).unwrap();
+        let lease_fd = owned.duplicate_lease_fd().unwrap();
+        let child = VerifiedPinnedArtifact::admit(&artifact, owned.path(), lease_fd).unwrap();
         assert_eq!(
             fs::read(child.path().join("weights.bin")).unwrap(),
             b"trusted"

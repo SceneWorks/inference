@@ -64,11 +64,16 @@ path identities before loading and immediately before publishing each run record
 snapshot equivalence into the record. The parent keeps each snapshot alive across all rows that use
 it, then verifies and removes every snapshot before it can publish `summary.json`. Changed, mixed,
 stale, wrong-build, wrong-host, unsealable, or uncleanable state is refused. Each private tree also
-has a durable harness-owned lease and an inode-bound cleanup receipt published before sealing. At
-the next `run`, the harness leaves live leases untouched and scavenges only unlocked stale trees
-whose ownership and cleanup identities validate; malformed, foreign, symlinked, or multiply-linked
-state is left untouched and fails closed. This recovers trees left by signals, aborts, OOM kills, or
-other parent termination without clearing flags through an unrelated path.
+has a durable harness-owned lease. Every benchmark child inherits that same locked lease, so parent
+termination cannot make a tree look stale while a child is still loading or publishing a record.
+The lease is fully staged and synced before atomic publication, binds the exact root device and
+inode, and is paired with a full raw-path cleanup identity manifest published before sealing. At the
+next `run`, the harness leaves live leases untouched and scavenges only unlocked stale trees whose
+ownership and cleanup identities validate. Cleanup walks already-open directory descriptors in
+post-order and revalidates device, inode, and link count immediately before each flag, mode, or
+unlink mutation; malformed, foreign, symlinked, multiply-linked, or rebound state is left untouched
+and fails closed. This recovers trees left by signals, aborts, OOM kills, or other parent termination
+without clearing flags through an unrelated path.
 
 The default required-all campaign fails at preflight until every benchmark provider explicitly
 declares every requested capability. Declaration is only availability, never proof that a path ran.
