@@ -89,6 +89,14 @@ const NUM_TRAIN_TIMESTEPS: usize = 1000;
 /// best-effort progress signal, so a long `sample_prompts` list never blows the per-cadence cost up.
 const SAMPLE_PROMPT_CAP: usize = 4;
 
+/// Freeze an inference-only encoder output before retaining it for the training loop. Candle's eager
+/// graph keeps every input, activation, and weight reachable from an output tensor, so caching the
+/// attached value grows VRAM with every dataset item and prevents the encoder drop from reclaiming
+/// memory before the UNet loads (issue #2249).
+fn cache_frozen_encoder_output(tensor: Tensor) -> Tensor {
+    tensor.detach()
+}
+
 /// `"bf16"`/`"bfloat16"` → [`DType::BF16`]; anything else → [`DType::F32`] (the gen-core contract:
 /// unrecognized = f32). The adapter factors / loss / grads stay f32 regardless (master weights).
 fn parse_compute_dtype(s: &str) -> DType {
@@ -651,8 +659,8 @@ impl SdxlTrainer {
                 total,
             });
             let img = load_image_tensor(&item.image_path, edge, device)?;
-            let x0 = vae.encode_mean(&img)?;
-            let cond = clip.encode(&item.caption)?;
+            let x0 = cache_frozen_encoder_output(vae.encode_mean(&img)?);
+            let cond = cache_frozen_encoder_output(clip.encode(&item.caption)?);
             cache.push((x0, cond));
         }
 
@@ -670,7 +678,9 @@ impl SdxlTrainer {
                 let mut prompts = Vec::new();
                 for prompt in cfg.sample_prompts.iter().take(SAMPLE_PROMPT_CAP) {
                     let cond = clip.encode(prompt)?;
-                    conds.push(Tensor::cat(&[uncond.clone(), cond], 0)?.to_dtype(compute_dtype)?);
+                    conds.push(cache_frozen_encoder_output(
+                        Tensor::cat(&[uncond.clone(), cond], 0)?.to_dtype(compute_dtype)?,
+                    ));
                     prompts.push(prompt.clone());
                 }
                 let vae_decoder =
@@ -937,6 +947,24 @@ mod tests {
             .unwrap()
             .to_vec1::<f32>()
             .unwrap()
+    }
+
+    /// Issue #2249: cached VAE/CLIP outputs are constants for the optimizer loop. If their encoder
+    /// graph remains attached, every dataset item retains its full CUDA graph and VRAM grows until
+    /// the next item or the UNet load fails with CUDA_ERROR_OUT_OF_MEMORY.
+    #[test]
+    fn cached_encoder_outputs_are_detached_from_their_graph() {
+        let source =
+            Var::from_tensor(&Tensor::from_vec(vec![1.0f32, 2.0], (1, 2), &Device::Cpu).unwrap())
+                .unwrap();
+        let encoded = (source.as_tensor() * 2.0).unwrap();
+        let cached = cache_frozen_encoder_output(encoded);
+        let grads = cached.sqr().unwrap().sum_all().unwrap().backward().unwrap();
+
+        assert!(
+            grads.get(source.as_tensor()).is_none(),
+            "a cached encoder output must not retain its source computation graph"
+        );
     }
 
     /// The correctness gate for the `gradient_checkpointing` lever: the checkpointed backward
