@@ -1021,7 +1021,10 @@ mod tests {
                 (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
             });
         assert_eq!(
-            vae_header_fnv, 0x48b594705c4d4db6,
+            // Canonical LF is part of the digest input. Do not derive this through a platform text
+            // pipeline: PowerShell's CRLF rendering produces a different value for the same header.
+            vae_header_fnv,
+            0xa7b83f24867477ab,
             "exact SceneWorks/scail2-mlx@ce88 VAE name/dtype/shape header drift"
         );
 
