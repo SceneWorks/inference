@@ -114,6 +114,31 @@ impl LatentNormalization {
     }
 }
 
+/// Structural validity shared by registry diagnostics and the public compatibility seam.
+///
+/// Keep this as one computed result rather than duplicating the rules: decoder-provided latent
+/// descriptors do not necessarily pass through a provider registry before compatibility is checked.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LatentSpaceValidation {
+    pub(crate) zero_channels: bool,
+    pub(crate) zero_spatial_compression: bool,
+    pub(crate) zero_packed_patch: bool,
+    pub(crate) invalid_affine: bool,
+    pub(crate) per_channel_count_mismatch: bool,
+    pub(crate) invalid_per_channel_metadata: bool,
+    pub(crate) invalid_learned_identity: bool,
+}
+
+impl LatentSpaceValidation {
+    pub(crate) fn is_valid(self) -> bool {
+        self == Self::default()
+    }
+}
+
+fn valid_normalization_identity(identity: &str) -> bool {
+    !identity.is_empty() && !identity.chars().any(char::is_whitespace)
+}
+
 /// Complete identity of the tensor at a denoiser-to-decoder boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LatentSpace {
@@ -125,10 +150,56 @@ pub struct LatentSpace {
 }
 
 impl LatentSpace {
+    pub(crate) fn validation(&self) -> LatentSpaceValidation {
+        let mut validation = LatentSpaceValidation {
+            zero_channels: self.channels == 0,
+            zero_spatial_compression: self.spatial_compression.height == 0
+                || self.spatial_compression.width == 0,
+            zero_packed_patch: matches!(
+                self.patch_layout,
+                LatentPatchLayout::Packed {
+                    patch_height: 0,
+                    ..
+                } | LatentPatchLayout::Packed { patch_width: 0, .. }
+            ),
+            ..Default::default()
+        };
+
+        match self.normalization {
+            LatentNormalization::Identity => {}
+            LatentNormalization::Affine { .. } => {
+                let (scale, shift) = self
+                    .normalization
+                    .affine_values()
+                    .expect("matched affine normalization");
+                validation.invalid_affine =
+                    !scale.is_finite() || scale == 0.0 || !shift.is_finite();
+            }
+            LatentNormalization::PerChannel(stats) => {
+                validation.per_channel_count_mismatch = stats.channels != self.channels;
+                validation.invalid_per_channel_metadata =
+                    !valid_normalization_identity(stats.identity) || stats.content_hash == 0;
+            }
+            LatentNormalization::LearnedPerChannel { identity } => {
+                validation.invalid_learned_identity = !valid_normalization_identity(identity);
+            }
+        }
+
+        validation
+    }
+
+    /// Whether every structural and normalization field can identify a real latent space.
+    pub fn is_well_formed(&self) -> bool {
+        self.validation().is_valid()
+    }
+
     /// Exact, fail-closed compatibility. Learned normalization without a content hash remains
-    /// incompatible even when its family identity matches.
+    /// incompatible even when its family identity matches. Malformed descriptors are incompatible
+    /// with every space, including an identical malformed descriptor.
     pub fn is_compatible_with(&self, decoder_input: &Self) -> bool {
-        self.channels == decoder_input.channels
+        self.is_well_formed()
+            && decoder_input.is_well_formed()
+            && self.channels == decoder_input.channels
             && self.spatial_compression == decoder_input.spatial_compression
             && self.patch_layout == decoder_input.patch_layout
             && self.temporal_law == decoder_input.temporal_law
@@ -434,6 +505,75 @@ mod tests {
             Some(&QWEN_KREA_Z16_LATENT_SPACE)
         ));
         assert!(!latent_spaces_compatible(None, None));
+    }
+
+    #[test]
+    fn malformed_descriptors_are_never_compatible_even_with_themselves() {
+        let valid = QWEN_KREA_Z16_LATENT_SPACE;
+        let malformed = [
+            LatentSpace {
+                channels: 0,
+                ..valid
+            },
+            LatentSpace {
+                spatial_compression: SpatialCompression {
+                    height: 0,
+                    width: valid.spatial_compression.width,
+                },
+                ..valid
+            },
+            LatentSpace {
+                patch_layout: LatentPatchLayout::Packed {
+                    patch_height: 0,
+                    patch_width: 2,
+                },
+                ..valid
+            },
+            LatentSpace {
+                normalization: LatentNormalization::affine(0.0, 0.0),
+                ..valid
+            },
+            LatentSpace {
+                normalization: LatentNormalization::affine(f32::NAN, 0.0),
+                ..valid
+            },
+            LatentSpace {
+                normalization: LatentNormalization::affine(1.0, f32::INFINITY),
+                ..valid
+            },
+            LatentSpace {
+                normalization: LatentNormalization::PerChannel(LatentNormalizationStats {
+                    identity: "qwen-wan-z16-v1",
+                    channels: 15,
+                    content_hash: QWEN_WAN_Z16_NORMALIZATION.content_hash,
+                }),
+                ..valid
+            },
+            LatentSpace {
+                normalization: LatentNormalization::PerChannel(LatentNormalizationStats {
+                    identity: "bad identity",
+                    channels: valid.channels,
+                    content_hash: QWEN_WAN_Z16_NORMALIZATION.content_hash,
+                }),
+                ..valid
+            },
+            LatentSpace {
+                normalization: LatentNormalization::PerChannel(LatentNormalizationStats {
+                    identity: "qwen-wan-z16-v1",
+                    channels: valid.channels,
+                    content_hash: 0,
+                }),
+                ..valid
+            },
+        ];
+
+        for invalid in malformed {
+            assert!(!invalid.is_well_formed(), "unexpectedly valid: {invalid:?}");
+            assert!(!invalid.is_compatible_with(&invalid));
+            assert!(!invalid.is_compatible_with(&valid));
+            assert!(!valid.is_compatible_with(&invalid));
+            assert!(!latent_spaces_compatible(Some(&invalid), Some(&invalid)));
+        }
     }
 
     #[test]

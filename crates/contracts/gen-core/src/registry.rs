@@ -965,10 +965,11 @@ pub fn model_descriptor_errors(d: &ModelDescriptor) -> Vec<String> {
         ));
     }
     if let Some(space) = d.denoiser_output_latent_space {
-        if space.channels == 0 {
+        let validation = space.validation();
+        if validation.zero_channels {
             errs.push(format!("{ctx}: latent-space channel count is 0"));
         }
-        if space.spatial_compression.height == 0 || space.spatial_compression.width == 0 {
+        if validation.zero_spatial_compression {
             errs.push(format!(
                 "{ctx}: latent-space spatial compression is {}x{} — both factors must be non-zero",
                 space.spatial_compression.height, space.spatial_compression.width
@@ -979,7 +980,7 @@ pub fn model_descriptor_errors(d: &ModelDescriptor) -> Vec<String> {
             patch_width,
         } = space.patch_layout
         {
-            if patch_height == 0 || patch_width == 0 {
+            if validation.zero_packed_patch {
                 errs.push(format!(
                     "{ctx}: packed latent patch is {patch_height}x{patch_width} — both factors must be non-zero"
                 ));
@@ -991,30 +992,27 @@ pub fn model_descriptor_errors(d: &ModelDescriptor) -> Vec<String> {
                     .normalization
                     .affine_values()
                     .expect("matched affine normalization");
-                if !scale.is_finite() || scale == 0.0 || !shift.is_finite() {
+                if validation.invalid_affine {
                     errs.push(format!(
                         "{ctx}: affine latent normalization has invalid scale={scale:?} shift={shift:?}"
                     ));
                 }
             }
             crate::latent::LatentNormalization::PerChannel(stats) => {
-                if stats.channels != space.channels {
+                if validation.per_channel_count_mismatch {
                     errs.push(format!(
                         "{ctx}: latent space declares {} channels but normalization {:?} hashes {}",
                         space.channels, stats.identity, stats.channels
                     ));
                 }
-                if stats.identity.is_empty()
-                    || stats.identity.chars().any(char::is_whitespace)
-                    || stats.content_hash == 0
-                {
+                if validation.invalid_per_channel_metadata {
                     errs.push(format!(
                         "{ctx}: per-channel latent normalization must have a non-empty, whitespace-free identity and non-zero content hash"
                     ));
                 }
             }
-            crate::latent::LatentNormalization::LearnedPerChannel { identity } => {
-                if identity.is_empty() || identity.chars().any(char::is_whitespace) {
+            crate::latent::LatentNormalization::LearnedPerChannel { .. } => {
+                if validation.invalid_learned_identity {
                     errs.push(format!(
                         "{ctx}: learned latent normalization identity must be non-empty and whitespace-free"
                     ));
