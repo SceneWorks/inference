@@ -415,9 +415,11 @@ jobs:
   # CUDA box (sc-11990). `--tests` is load-bearing here: the break was in a test target, so a bare
   # `cargo build` would still have missed it.
   #
-  # Deliberately `--no-run`: compiling needs nvcc + MSVC but never creates a CUDA context or allocates
-  # VRAM, so this is safe to run on every PR on the shared self-hosted rig without competing for the GPU.
-  # Executing the CUDA tests stays in the manual `windows-cuda` lane below.
+  # The broad package build remains deliberately `--no-run`: compiling needs nvcc + MSVC but never
+  # creates a CUDA context or allocates VRAM, so this is safe to run on every PR on the shared
+  # self-hosted rig without competing for the GPU. One weights-free catalog conformance test executes
+  # below because it needs the CUDA-gated registration graph but never touches a device; executing the
+  # rest of the CUDA tests stays in the manual `windows-cuda` lane.
   windows-cuda-check:
     name: Candle CUDA compile check (Windows)
     needs: changes
@@ -461,6 +463,11 @@ jobs:
         run: |
           call "%VCVARS%"
           cargo test --locked --lib --tests -p candle-llm -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda --no-run
+      - name: Execute weights-free CUDA catalog conformance (no GPU required)
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cargo test --locked -p candle-gen-catalog --features cuda tests::every_registered_memory_strategy_rejects_cross_route_decode_geometry -- --exact
       # The lint twin of the compile check above. The `candle-cpu` lane already Clippies this same
       # package set with --all-targets, but it has no CUDA toolkit and so cannot pass --features cuda:
       # every `#[cfg(feature = "cuda")]` target is invisible to it and reaches main unlinted. That is
