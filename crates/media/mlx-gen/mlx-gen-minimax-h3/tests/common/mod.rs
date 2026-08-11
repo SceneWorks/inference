@@ -41,6 +41,72 @@ pub const TE_FIXTURE: &str = concat!(
     "/tests/fixtures/te_context.safetensors"
 );
 
+/// The committed DiT parity fixture, produced by `tools/dump_minimax_h3_dit.py` running the
+/// **official diffusers** `MiniMaxH3Transformer3DModel` — the converted-checkpoint layout
+/// production loads (sc-18740's Rule 3).
+///
+/// Carries the pre-conversion `src.` tensors alongside the published ones — the raw per-head
+/// interleaved fused QKV, its reordered `[q_all; k_all; v_all]` form, and the gate-first
+/// `mlp.fc1` — each round-tripped through the OFFICIAL conversion functions in the generator, so
+/// `dit_parity.rs` can assert which transform produced the published bytes rather than trusting a
+/// comment. Its `layout.*` tensors are the reference's own `build_packed_sequence` output, which
+/// is what pins the audio-token position convention.
+pub const DIT_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/dit_block.safetensors"
+);
+
+/// The tiny DiT geometry the fixture was dumped at. Mirrors `dump_minimax_h3_dit.py`.
+///
+/// Two structural properties of the shipped model are preserved rather than shrunk away:
+/// `heads · head_dim` (96) stays **wider** than `hidden_size` (64), as 7168 > 5376; and
+/// `2 · 3 · rope_freq_dim` (12) stays **narrower** than `attention_head_dim` (24), as 96 < 128, so
+/// the partial-rotary path is the one under test.
+pub fn dit_fixture_config() -> mlx_gen_minimax_h3::MiniMaxH3DitConfig {
+    mlx_gen_minimax_h3::MiniMaxH3DitConfig {
+        num_attention_heads: 4,
+        attention_head_dim: 24,
+        hidden_size: 64,
+        num_layers: 2,
+        num_refiner_layers: 2,
+        ffn_dim: 32,
+        text_dim: 40,
+        freq_dim: 16,
+        time_embed_hidden_dim: 64,
+        time_embed_dim: 48,
+        rope_freq_dim: 2,
+        ..mlx_gen_minimax_h3::MiniMaxH3DitConfig::default()
+    }
+}
+
+/// The packed layout `dump_minimax_h3_dit.py` built the goldens over.
+pub struct DitLayout {
+    /// Text rows.
+    pub num_text_tokens: i32,
+    /// Audio latents **per channel**.
+    pub num_audio_latents: i32,
+    /// Channels the soundtrack is packed channel-major over.
+    pub audio_channels: i32,
+    /// Target video latent frames.
+    pub num_latent_frames: i32,
+    /// Target latent height.
+    pub latent_height: i32,
+    /// Target latent width.
+    pub latent_width: i32,
+}
+
+/// 5 text rows, 3 audio latents over 2 channels, and 3 latent frames of a 4×6 latent at patch
+/// `[1, 2, 2]` — 29 packed rows. Kept in one place so a fixture regenerated at different dims
+/// fails loudly rather than drifting.
+pub const DIT_LAYOUT: DitLayout = DitLayout {
+    num_text_tokens: 5,
+    num_audio_latents: 3,
+    audio_channels: 2,
+    num_latent_frames: 3,
+    latent_height: 4,
+    latent_width: 6,
+};
+
 /// The tiny text-encoder geometry the fixture was dumped at. Mirrors `dump_minimax_h3_te.py`:
 /// `head_dim` deliberately != `hidden_size / num_heads` (32 vs 16), exactly as the real model has
 /// 128 != 5120/64, and `select_hidden` < `num_layers` so the unused-tail trim is exercised.

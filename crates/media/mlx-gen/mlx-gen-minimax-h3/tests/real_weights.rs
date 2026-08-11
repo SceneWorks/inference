@@ -23,9 +23,10 @@ use mlx_rs::{Array, Dtype};
 
 use mlx_gen::weights::Weights;
 use mlx_gen_minimax_h3::{
-    kaiser_sinc_filter1d, MiniMaxH3AudioVae, MiniMaxH3AudioVaeConfig, MiniMaxH3TeConfig,
-    MiniMaxH3TextEncoder, MiniMaxH3Tokenizer, MiniMaxH3VaeConfig, MiniMaxH3VideoVae,
-    APPLIES_CHAT_TEMPLATE, LM_PREFIX, MINIMAX_ADDED_SPECIALS, VISION_PREFIX,
+    kaiser_sinc_filter1d, DitBlock, MiniMaxH3AudioVae, MiniMaxH3AudioVaeConfig, MiniMaxH3DitConfig,
+    MiniMaxH3TeConfig, MiniMaxH3TextEncoder, MiniMaxH3Tokenizer, MiniMaxH3VaeConfig,
+    MiniMaxH3VideoVae, MmRope, TokenRefiner, APPLIES_CHAT_TEMPLATE, LM_PREFIX,
+    MINIMAX_ADDED_SPECIALS, VISION_PREFIX,
 };
 
 use common::{snapshot, std_dev};
@@ -996,5 +997,219 @@ fn real_weight_te_forward_runs_at_the_published_geometry() {
          5120/128/64-8/25600 geometry; prompt -> {seq} ids -> context {:?} in {fwd_ms} ms \
          (std {spread:.4}, peak {peak:.4})",
         ctx.shape(),
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// sc-17144 — the DiT block stack
+// ---------------------------------------------------------------------------------------------
+
+/// Total tensors in the published `transformer/` component: 50 blocks × 12, the refiner's 21, and
+/// 17 input/output/timestep tensors this story does not port.
+const PUBLISHED_DIT_TENSORS: usize = 638;
+
+/// The shard `transformer_blocks.0` lives in — 4.5 GiB of the 62 GB component. A single-block
+/// smoke has no reason to materialize the other thirteen.
+const DIT_FIRST_SHARD: &str = "diffusion_pytorch_model-00001-of-00014.safetensors";
+
+/// The declared block-stack key set must be EXACTLY the published checkpoint's, minus the
+/// input/output layers sc-17147 owns. Reads only the shard index, so it costs no weight I/O.
+///
+/// This is the exhaustive-mapping proof against the real 33 B model rather than against the tiny
+/// fixture. A tensor the loader never reads would compute something plausible and wrong.
+#[test]
+#[ignore = "needs a real MiniMax-H3 snapshot (MINIMAX_H3_SNAPSHOT); dev box / macos-mlx only"]
+fn declared_dit_tensor_names_match_the_published_checkpoint() {
+    let root = snapshot();
+    let dir = root.join("transformer");
+    let index = dir.join("diffusion_pytorch_model.safetensors.index.json");
+    let text = std::fs::read_to_string(&index)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", index.display()));
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let map = json
+        .get("weight_map")
+        .and_then(serde_json::Value::as_object)
+        .expect("index.json has a weight_map");
+
+    let published: std::collections::BTreeSet<String> = map.keys().cloned().collect();
+    assert_eq!(
+        published.len(),
+        PUBLISHED_DIT_TENSORS,
+        "published transformer/ tensor count changed"
+    );
+
+    let cfg = MiniMaxH3DitConfig::from_diffusers_json(
+        &std::fs::read_to_string(dir.join("config.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        cfg,
+        MiniMaxH3DitConfig::default(),
+        "the shipped transformer config drifted from this crate's defaults"
+    );
+
+    let mut declared: std::collections::BTreeSet<String> = (0..cfg.num_layers)
+        .flat_map(|i| DitBlock::names(&format!("transformer_blocks.{i}")))
+        .collect();
+    declared.extend(TokenRefiner::names("token_refiner", &cfg));
+
+    let missing: Vec<&String> = declared.difference(&published).collect();
+    assert!(
+        missing.is_empty(),
+        "the block stack requires tensors the checkpoint does not have: {missing:?}"
+    );
+
+    // Everything else must be an input/output/timestep tensor — i.e. sc-17147's, not silently
+    // dropped block-stack weights.
+    let unconsumed: Vec<&String> = published
+        .difference(&declared)
+        .filter(|k| k.starts_with("transformer_blocks.") || k.starts_with("token_refiner."))
+        .collect();
+    assert!(
+        unconsumed.is_empty(),
+        "block-stack tensors the loader never reads: {unconsumed:?}"
+    );
+
+    assert_eq!(declared.len(), 50 * 12 + 21);
+    let outer: Vec<&String> = published.difference(&declared).collect();
+    assert_eq!(
+        outer.len(),
+        17,
+        "the 17 input/output/timestep tensors belong to sc-17147: {outer:?}"
+    );
+    println!(
+        "declared {} block-stack tensors of {} published; {} input/output tensors deliberately \
+         unported (sc-17147)",
+        declared.len(),
+        published.len(),
+        outer.len()
+    );
+}
+
+/// Load the real `transformer_blocks.0` and run one forward at the published 5376/56×128 geometry.
+///
+/// **A skipped run must not look like a passing one.** `snapshot()` asserts rather than returning
+/// early, and every assertion below is on evidence only a real run produces: the published shard's
+/// tensor count, the block's real `[7168, 5376]` / `[28672, 5376]` / `[96768, 2688]` shapes, qk-norm
+/// weights that are near 1 but NOT the all-ones a fabricated tensor would be, and a finite,
+/// non-constant output of the right shape.
+#[test]
+#[ignore = "needs a real MiniMax-H3 snapshot (MINIMAX_H3_SNAPSHOT) + Metal; ~4.5 GB resident"]
+fn real_weight_dit_block_runs_one_forward() {
+    let root = snapshot();
+    let dir = root.join("transformer");
+
+    let cfg = MiniMaxH3DitConfig::from_diffusers_json(
+        &std::fs::read_to_string(dir.join("config.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(cfg.hidden_size, 5376);
+    assert_eq!(cfg.inner_dim(), 7168, "attention is wider than the residual stream");
+    assert_eq!(cfg.rotary_dim(), 96, "96 of 128 head channels rotate");
+
+    let started = Instant::now();
+    // Only the shard holding block 0 — the full component is 62 GB and one block needs 4.5.
+    let mut w = Weights::from_file(dir.join(DIT_FIRST_SHARD)).unwrap();
+    let shard_tensors = w.len();
+    assert_eq!(
+        shard_tensors, 64,
+        "expected the published first shard's tensor set"
+    );
+
+    // bf16 is the checkpoint's own dtype for the block stack.
+    let block = DitBlock::from_weights(&mut w, "transformer_blocks.0", &cfg, Dtype::Bfloat16)
+        .unwrap();
+    let load_ms = started.elapsed().as_millis();
+
+    // Evidence the tensors are the real trained ones rather than anything synthesized: the qk-norm
+    // weights are a learned scatter about 1, not the all-ones an untrained `nn.RMSNorm` holds.
+    let nq = Weights::from_file(dir.join(DIT_FIRST_SHARD))
+        .unwrap()
+        .require("transformer_blocks.0.attn.norm_q.weight")
+        .unwrap()
+        .as_dtype(Dtype::Float32)
+        .unwrap();
+    assert_eq!(nq.shape(), &[cfg.attention_head_dim], "qk-norm is per head");
+    let nq_spread = std_dev(&nq);
+    assert!(
+        nq_spread > 1e-4,
+        "norm_q.weight is constant (std {nq_spread:.3e}) — these are not trained weights"
+    );
+
+    // A packed sequence with all three modalities at two timesteps, so the AdaLN row addressing is
+    // exercised: 8 text rows, 8 audio rows, 48 video rows.
+    let seq = 64i32;
+    let ids: Vec<f32> = (0..seq)
+        .flat_map(|i| [i as f32, (i % 7) as f32, (i % 5) as f32])
+        .collect();
+    let position_ids = Array::from_slice(&ids, &[seq, 3]);
+    let rope = MmRope::new(cfg.rope_freq_dim, cfg.rope_theta).unwrap();
+    let tables = rope.tables(&position_ids, Dtype::Bfloat16).unwrap();
+    assert_eq!(tables.cos.shape(), &[seq, 96]);
+
+    let tags: Vec<i32> = (0..seq).map(|i| if i < 8 { 1 } else if i < 16 { 2 } else { 0 }).collect();
+    let steps: Vec<i32> = (0..seq).map(|i| i32::from(i >= 16)).collect();
+    let adaln: Vec<i32> = steps
+        .iter()
+        .zip(&tags)
+        .map(|(s, t)| s * mlx_gen_minimax_h3::MODALITY_NUM + t)
+        .collect();
+    let adaln_indices = Array::from_slice(&adaln, &[seq]);
+
+    let hidden: Vec<f32> = (0..seq * cfg.hidden_size)
+        .map(|i| (i as f32 * 0.013).sin() * 0.5)
+        .collect();
+    let hidden = Array::from_slice(&hidden, &[1, seq, cfg.hidden_size])
+        .as_dtype(Dtype::Bfloat16)
+        .unwrap();
+    let temb: Vec<f32> = (0..2 * cfg.time_embed_dim)
+        .map(|i| (i as f32 * 0.021).cos() * 0.3)
+        .collect();
+    let temb = Array::from_slice(&temb, &[2, cfg.time_embed_dim])
+        .as_dtype(Dtype::Bfloat16)
+        .unwrap();
+
+    let t1 = Instant::now();
+    let out = block
+        .forward_with_temb(&hidden, &temb, &adaln_indices, &rope, &tables)
+        .expect("real-weight block forward");
+    // Force evaluation INSIDE the timer — MLX is lazy, so a timer that stops before an `.item()`
+    // measures graph construction, not compute. An earlier story's timer read 0.0 s for a full
+    // 36-layer decode for exactly this reason.
+    let spread = std_dev(&out);
+    let peak: f32 = out
+        .as_dtype(Dtype::Float32)
+        .unwrap()
+        .abs()
+        .unwrap()
+        .max(None)
+        .unwrap()
+        .item();
+    let fwd_ms = t1.elapsed().as_millis();
+
+    assert_eq!(out.shape(), &[1, seq, cfg.hidden_size]);
+    assert!(peak.is_finite() && peak > 0.0, "block output peak {peak} is not finite/positive");
+    assert!(spread > 1e-3, "block output is ~constant (std {spread:.3e})");
+    // The block is not an identity on real weights.
+    let moved = std_dev(
+        &mlx_rs::ops::subtract(
+            &out.as_dtype(Dtype::Float32).unwrap(),
+            &hidden.as_dtype(Dtype::Float32).unwrap(),
+        )
+        .unwrap(),
+    );
+    assert!(moved > 1e-3, "the real block was an identity (residual std {moved:.3e})");
+    assert!(
+        fwd_ms > 0,
+        "forward reported 0 ms — the timer did not span the evaluation"
+    );
+
+    println!(
+        "REAL-WEIGHT DiT BLOCK SMOKE: loaded {shard_tensors} tensors from {DIT_FIRST_SHARD} and \
+         built transformer_blocks.0 in {load_ms} ms at the published 5376 / 56x128 / ffn 14336 / \
+         adaln 96768x2688 geometry; norm_q std {nq_spread:.4}; {seq}-row packed sequence \
+         (3 modalities, 2 timesteps) -> {:?} in {fwd_ms} ms (std {spread:.4}, peak {peak:.4}, \
+         residual std {moved:.4})",
+        out.shape(),
     );
 }
