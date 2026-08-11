@@ -7,7 +7,7 @@
 //! trait split (which breaks on multi-modal models).
 
 use crate::media::{AudioChunk, AudioTrack, Image};
-use crate::runtime::{CancelFlag, PreviewSink, Progress, Quant};
+use crate::runtime::{CancelFlag, PreviewSink, Progress, PromptEnhancementSink, Quant};
 use crate::voice_embed::VoiceEmbedding;
 use crate::{
     default_memory_strategy_safety_check, Error, MemoryPeakBreakdown, MemoryPhase,
@@ -394,6 +394,9 @@ pub struct GenerationRequest {
     /// Sampling temperature for prompt enhancement (model default when `None`: LTX 0.7, FLUX.2-dev
     /// caption-upsample 0.15 — the reference `caption_upsample_temperature`).
     pub enhance_temperature: Option<f32>,
+    /// Optional consumer sink for the engine-owned effective-prompt fact. Supporting providers emit
+    /// exactly one enhanced/fallback/absent report before encoding their effective prompt.
+    pub prompt_enhancement: PromptEnhancementSink,
 
     // --- Decoder (epic 7840; ignored by models without a PiD backbone) ---
     /// Route this generation's decode through the optional **PiD** super-resolving decoder instead of
@@ -761,6 +764,7 @@ impl Default for GenerationRequest {
             use_uncensored_enhancer: false,
             enhance_max_tokens: None,
             enhance_temperature: None,
+            prompt_enhancement: PromptEnhancementSink::default(),
             use_pid: false,
             pid_capture_sigma: None,
             memory: None,
@@ -925,6 +929,7 @@ impl GenerationRequest {
             enhance_prompt: _,
             use_uncensored_enhancer: _,
             enhance_max_tokens: _,
+            prompt_enhancement: _,
             use_pid: _,
             memory: _,
             cancel: _,
@@ -1903,6 +1908,10 @@ const MAX_STEPS: u32 = 100_000;
 const MAX_FRAMES: u32 = 1_000_000;
 const MAX_FPS: u32 = 100_000;
 const MAX_DURATION_SECS: f32 = 1_000_000.0;
+/// Shared hard ceiling for autoregressive prompt enhancement. Providers may choose a lower cap.
+pub const MAX_ENHANCE_TOKENS: u32 = 2_048;
+/// Shared temperature range for prompt enhancement sampling.
+pub const MAX_ENHANCE_TEMPERATURE: f32 = 2.0;
 
 impl Capabilities {
     /// Whether this model accepts the given conditioning kind.
@@ -2232,6 +2241,40 @@ impl Capabilities {
             return Err(Error::Unsupported(format!(
                 "{id}: true_cfg is not supported"
             )));
+        }
+        if req.enhance_prompt && !self.supports_prompt_enhancement {
+            return Err(Error::Unsupported(format!(
+                "{id}: prompt enhancement is not supported"
+            )));
+        }
+        if let Some(tokens) = req.enhance_max_tokens {
+            if !req.enhance_prompt {
+                return Err(Error::Msg(format!(
+                    "{id}: enhance_max_tokens requires enhance_prompt=true"
+                )));
+            }
+            if tokens == 0 || tokens > MAX_ENHANCE_TOKENS {
+                return Err(Error::Msg(format!(
+                    "{id}: enhance_max_tokens {tokens} outside supported range 1..={MAX_ENHANCE_TOKENS}"
+                )));
+            }
+        }
+        if let Some(temperature) = req.enhance_temperature {
+            if !temperature.is_finite() {
+                return Err(Error::Msg(format!(
+                    "enhance_temperature must be finite (got {temperature})"
+                )));
+            }
+            if !req.enhance_prompt {
+                return Err(Error::Msg(format!(
+                    "{id}: enhance_temperature requires enhance_prompt=true"
+                )));
+            }
+            if !(0.0..=MAX_ENHANCE_TEMPERATURE).contains(&temperature) {
+                return Err(Error::Msg(format!(
+                    "{id}: enhance_temperature {temperature} outside supported range 0..={MAX_ENHANCE_TEMPERATURE}"
+                )));
+            }
         }
         // A non-finite guidance / true_cfg / eta / momentum / strength / control_scale / … would flow
         // into the CFG combine, scheduler shift, or conditioning math and NaN-poison the run (a NaN
@@ -2676,6 +2719,67 @@ mod tests {
 
         assert!(!unsupported.supports_preview);
         assert!(supported_waiting_for_first_frame.supports_preview);
+    }
+
+    #[test]
+    fn prompt_enhancement_is_fail_closed_and_tuning_is_bounded() {
+        let unsupported = caps();
+        let requested = GenerationRequest {
+            enhance_prompt: true,
+            ..base_req()
+        };
+        assert!(matches!(
+            unsupported.validate_request("m", &requested),
+            Err(Error::Unsupported(message)) if message.contains("prompt enhancement")
+        ));
+
+        let supported = Capabilities {
+            supports_prompt_enhancement: true,
+            ..caps()
+        };
+        for request in [
+            GenerationRequest {
+                enhance_max_tokens: Some(32),
+                ..base_req()
+            },
+            GenerationRequest {
+                enhance_temperature: Some(0.15),
+                ..base_req()
+            },
+        ] {
+            assert!(supported
+                .validate_request("m", &request)
+                .unwrap_err()
+                .to_string()
+                .contains("requires enhance_prompt=true"));
+        }
+        for tokens in [0, MAX_ENHANCE_TOKENS + 1] {
+            let request = GenerationRequest {
+                enhance_prompt: true,
+                enhance_max_tokens: Some(tokens),
+                ..base_req()
+            };
+            assert!(supported.validate_request("m", &request).is_err());
+        }
+        for temperature in [-0.1, MAX_ENHANCE_TEMPERATURE + 0.1] {
+            let request = GenerationRequest {
+                enhance_prompt: true,
+                enhance_temperature: Some(temperature),
+                ..base_req()
+            };
+            assert!(supported.validate_request("m", &request).is_err());
+        }
+        assert!(supported
+            .validate_request(
+                "m",
+                &GenerationRequest {
+                    enhance_prompt: true,
+                    enhance_max_tokens: Some(MAX_ENHANCE_TOKENS),
+                    enhance_temperature: Some(MAX_ENHANCE_TEMPERATURE),
+                    ..base_req()
+                }
+            )
+            .is_ok());
     }
 
     fn base_req() -> GenerationRequest {

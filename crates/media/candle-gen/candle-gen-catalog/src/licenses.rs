@@ -185,8 +185,9 @@ pub const PROVIDER_COMPONENTS: &[ProviderComponents] = &[
     },
     // --- flux2 (FLUX.2) ---------------------------------------------------------------------
     // Candle registers two of MLX's six; edit and control are bespoke and unregistered. The
-    // 32-channel VAE ships inside each FLUX.2 snapshot and rides its row; the Qwen3 and Mistral3
-    // towers are pinned holes.
+    // 32-channel VAE ships inside each FLUX.2 snapshot and rides its row. The Qwen3 tower is a
+    // pinned hole; dev's native enhancement route additionally loads the Mistral3 language tower,
+    // Pixtral vision tower, and multimodal projector, all explicitly pinned as unresolved holes.
     ProviderComponents {
         provider_id: "flux2_dev",
         components: &["flux2_dev"],
@@ -625,7 +626,14 @@ mod tests {
             ),
             ("flux1_dev", &["clip_vit_large_patch14"]),
             ("flux1_schnell", &["clip_vit_large_patch14"]),
-            ("flux2_dev", &["flux2_dev_mistral3_tower"]),
+            (
+                "flux2_dev",
+                &[
+                    "flux2_dev_mistral3_tower",
+                    "flux2_dev_pixtral_vision_tower",
+                    "flux2_dev_multimodal_projector",
+                ],
+            ),
             ("flux2_klein_9b", &["flux2_klein_qwen3_text_encoder"]),
             ("ideogram_4", &["ideogram_qwen3_vl_8b"]),
             ("ideogram_4_turbo", &["ideogram_qwen3_vl_8b"]),

@@ -111,7 +111,8 @@ pub use residency::{Residency, ResidencyRuntime, StagedHeavy};
 pub use runtime::{
     AdapterApplyReport, AdapterKind, AdapterSpec, CancelFlag, IdentityWeights, LoadPhase,
     LoadShape, LoadSpec, MoeExpert, OffloadPolicy, PidWeights, Precision, PreviewFrame,
-    PreviewSink, Progress, Quant, WeightsSource,
+    PreviewSink, Progress, PromptEnhancementOutcome, PromptEnhancementReport,
+    PromptEnhancementSink, Quant, WeightsSource,
 };
 pub use text_embed::{TextEmbedder, TextEmbedderDescriptor};
 pub use tier_integrity::{control_branch_tier, is_above_selected_tier};
