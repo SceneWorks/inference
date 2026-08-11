@@ -311,7 +311,7 @@ mod preview_advertising {
     ///
     /// Ideogram is also this table's first genuine `Denoise::Bespoke` **wired** crate: it drives no
     /// shared sampler anywhere, so it becomes visible below through a direct emission call rather than
-    /// through a hooked call site. That is the case `DIRECT_EMISSION_CALLS` was hardened for.
+    /// through a hooked call site. That is the case the direct-emission scanner was hardened for.
     ///
     /// `candle-gen-boogu` is deliberately absent, and its absence is a measurement rather than an
     /// omission: the epic groups it with FLUX.2, but it loads a plain 244-tensor **16-channel**
@@ -1415,8 +1415,8 @@ mod preview_advertising {
     /// `emit_preview_at` are the free functions underneath. Listing only the free functions was the
     /// original hole — a bespoke loop written the canonical way was invisible, which would have hit
     /// SenseNova (sc-16960) and Ideogram (sc-16955), the two crates the constant exists for.
-    const DIRECT_EMISSION_CALLS: &[&str] =
-        &["emit_preview(", "emit_preview_at(", ".emit(", ".emit_step("];
+    const DIRECT_EMISSION_FUNCTION_CALLS: &[&str] = &["emit_preview(", "emit_preview_at("];
+    const DIRECT_EMISSION_METHOD_CALLS: &[(&str, usize)] = &[(".emit(", 4), (".emit_step(", 3)];
 
     /// One shared-sampler call site found in a provider crate's sources.
     struct SamplerSite {
@@ -2250,6 +2250,47 @@ mod preview_advertising {
         sites
     }
 
+    /// Count direct preview emissions without treating every unrelated `.emit(...)` method as a
+    /// preview. Free preview functions have unique names. Method calls must have both the canonical
+    /// preview receiver (`*hook*` / `*preview*`) and the exact `PreviewHook::{emit,emit_step}` arity.
+    /// This remains a lexical source guard, but it is tied to the actual preview call context rather
+    /// than to a generic Rust method name shared by request-local provenance sinks.
+    fn direct_emission_count(file: &str, code: &str) -> usize {
+        let mut count: usize = DIRECT_EMISSION_FUNCTION_CALLS
+            .iter()
+            .map(|call| code.matches(call).count())
+            .sum();
+        for &(call, arity) in DIRECT_EMISSION_METHOD_CALLS {
+            let mut cursor = 0usize;
+            while let Some(offset) = code[cursor..].find(call) {
+                let method_at = cursor + offset;
+                let receiver = method_receiver(&code[..method_at]);
+                let args_start = method_at + call.len();
+                let site = format!("{file}: {receiver}{call}");
+                let args = call_arguments(&site, &code[args_start..]);
+                if (receiver.contains("hook") || receiver.contains("preview"))
+                    && args.len() == arity
+                {
+                    count += 1;
+                }
+                cursor = args_start;
+            }
+        }
+        count
+    }
+
+    /// Last identifier before a method-call dot. The source is already stripped of comments and
+    /// literals; whitespace between receiver and dot is accepted.
+    fn method_receiver(before_dot: &str) -> &str {
+        let trimmed = before_dot.trim_end();
+        let start = trimmed
+            .char_indices()
+            .rev()
+            .find_map(|(index, ch)| (!ch.is_ascii_alphanumeric() && ch != '_').then_some(index + 1))
+            .unwrap_or(0);
+        &trimmed[start..]
+    }
+
     /// Read one provider crate's preview wiring out of its **shipped** module tree.
     ///
     /// Keyed on the directory rather than on a `ProviderCrate`, so the descriptor-less
@@ -2271,10 +2312,7 @@ mod preview_advertising {
         };
         for (relative, code) in &tree.shipped {
             wiring.sites.extend(sampler_sites(relative, code));
-            let count: usize = DIRECT_EMISSION_CALLS
-                .iter()
-                .map(|call| code.matches(call).count())
-                .sum();
+            let count = direct_emission_count(relative, code);
             if count > 0 {
                 wiring.direct.push(DirectEmission {
                     file: relative.clone(),
@@ -2586,7 +2624,7 @@ mod preview_advertising {
                     advertised.is_empty(),
                     "{} advertises supports_preview on {advertised:?} but nothing in its shipped \
                      sources emits: no sampler call site passes a preview hook and no bespoke loop \
-                     calls {DIRECT_EMISSION_CALLS:?}",
+                     calls the direct preview functions/methods",
                     provider.dir
                 );
             }
@@ -2845,6 +2883,18 @@ mod preview_advertising {
              assertion in this module would then be vacuously satisfied by a scanner that read \
              nothing"
         );
+    }
+
+    #[test]
+    fn direct_preview_scan_ignores_prompt_report_emit_but_counts_preview_context() {
+        let code = r#"
+            req.prompt_enhancement.emit(report);
+            hook.emit(&counter, &sigmas, sigma, &latents);
+            preview.emit_step(&counter, step, &state);
+            candle_gen::preview::emit_preview_at(&sink, &counter, step, || frame());
+            audit_hook.emit(one, two, three);
+        "#;
+        assert_eq!(direct_emission_count("synthetic.rs", code), 3);
     }
 
     /// Out-of-line `#[cfg(test)] mod NAME;` files are excluded from the scan.

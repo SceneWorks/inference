@@ -256,12 +256,22 @@ fn run_dev(args: &[String], c: &Common, quant: Option<Quant>) -> Result<()> {
         c.width, c.height, c.steps, c.guidance, c.seed, c.prompt
     );
 
+    let vram_gpu = args.iter().any(|value| value == "--vram-probe").then(|| {
+        arg(args, "--gpu")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0)
+    });
+    let mut probe = vram_gpu.map(candle_gen::testkit::VramProbe::start);
+    let load_phase = probe.as_ref().map(|probe| probe.phase());
     let model = Flux2Edit::load_dev(
         &Flux2EditPaths {
             root: PathBuf::from(&c.snapshot),
         },
         quant,
     )?;
+    if let (Some(probe), Some(phase)) = (probe.as_mut(), load_phase) {
+        probe.end_load(phase);
+    }
     let enhancement_reports = Arc::new(Mutex::new(Vec::<PromptEnhancementReport>::new()));
     let enhancement_recorder = Arc::clone(&enhancement_reports);
     let req = Flux2EditRequest {
@@ -290,8 +300,12 @@ fn run_dev(args: &[String], c: &Common, quant: Option<Quant>) -> Result<()> {
     // 1) Single-reference edit.
     let mut prog = step_progress("edit-dev:1ref");
     let t0 = std::time::Instant::now();
+    let gen_phase = probe.as_ref().map(|probe| probe.phase());
     let single = model.generate(&req, std::slice::from_ref(&reference), &mut prog)?;
     let report = take_enhancement_report(&enhancement_reports, &req.prompt, req.enhance_prompt)?;
+    if let (Some(probe), Some(phase)) = (probe.as_mut(), gen_phase) {
+        probe.end_gen(phase);
+    }
     println!("\n[edit-dev] verified prompt-enhancement report: {report:?}");
     let (m, s) = mean_std(&single);
     println!(
@@ -300,6 +314,14 @@ fn run_dev(args: &[String], c: &Common, quant: Option<Quant>) -> Result<()> {
     );
     save(&single, &c.out)?;
     println!("[edit-dev] wrote {}", c.out.display());
+    if let Some(probe) = &probe {
+        println!(
+            "[vram] flux2_dev_edit {}x{}: {}",
+            c.width,
+            c.height,
+            probe.report()
+        );
+    }
 
     // A focused real-weight caption/Pixtral smoke can stop after the first complete enhanced edit.
     // The default harness still performs multi-reference, ablation, and cancellation coverage.
