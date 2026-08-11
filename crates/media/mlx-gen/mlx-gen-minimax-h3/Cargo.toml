@@ -2,7 +2,7 @@
 name = "mlx-gen-minimax-h3"
 version = "0.0.0"
 edition = "2021"
-description = "MiniMax-H3 (Hailuo 3.0) provider crate for mlx-gen: video VAE decoding (3D-CNN encoder / 36-layer ViT decoder)."
+description = "MiniMax-H3 (Hailuo 3.0) provider crate for mlx-gen: video VAE decoding (3D-CNN encoder / 36-layer ViT decoder) and audio VAE decoding (DAC lineage / BigVGAN, 32 kHz stereo)."
 license = "Apache-2.0"
 repository = "https://github.com/michaeltrefry/mlx-gen"
 keywords = ["mlx", "apple-silicon", "minimax-h3", "video", "inference"]
@@ -13,7 +13,9 @@ mlx-gen = { path = ".." }
 # Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
 mlx-rs = { workspace = true }
 # Parse the diffusers `vae/config.json` (per-channel latents_mean/std, decoder geometry, the
-# clip_length / token_drop temporal-chunk knobs).
+# clip_length / token_drop temporal-chunk knobs) and the audio VAE's `config.json` +
+# `metadata.json`. The audio VAE's third document, `config.yaml`, is four flat `key: integer`
+# pairs; `audio_config` reads it directly rather than taking a YAML dependency for that.
 serde_json = { workspace = true }
 
 [dev-dependencies]
