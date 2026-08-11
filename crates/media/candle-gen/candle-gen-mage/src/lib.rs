@@ -136,6 +136,7 @@ fn generation_descriptor(
     supports_negative_prompt: bool,
 ) -> ModelDescriptor {
     ModelDescriptor {
+        denoiser_output_latent_space: Some(&candle_gen::gen_core::MAGE_LATENT_SPACE),
         control_kinds: None,
         id,
         family: config::FAMILY,
@@ -806,6 +807,7 @@ pub fn load_turbo(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 
 pub fn edit_descriptor(variant: MageEditVariant) -> ModelDescriptor {
     ModelDescriptor {
+        denoiser_output_latent_space: Some(&candle_gen::gen_core::MAGE_LATENT_SPACE),
         control_kinds: None,
         id: variant.id(),
         family: config::FAMILY,

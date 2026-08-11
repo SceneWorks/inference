@@ -70,6 +70,7 @@ impl FluxVariant {
 
     pub fn descriptor(self) -> ModelDescriptor {
         ModelDescriptor {
+            denoiser_output_latent_space: Some(&mlx_gen::gen_core::FLUX1_LATENT_SPACE),
             control_kinds: None,
             required_components: &[],
             id: self.id(),

@@ -104,6 +104,7 @@ pub const LANGUAGES: &[&str] = &["en", "zh"];
 /// a time (the codec decodes a block of frames into a streamed PCM chunk).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        denoiser_output_latent_space: None,
         control_kinds: None,
         required_components: &[CODEC_COMPONENT_ID],
         id: MODEL_ID,

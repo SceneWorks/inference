@@ -1048,6 +1048,7 @@ impl Generator for Flux2Generator {
 /// Both: txt2img only (edit/Reference deferred to epic 6564 story 4), no LoRA, no on-the-fly quant.
 fn descriptor(variant: Flux2Variant) -> ModelDescriptor {
     ModelDescriptor {
+        denoiser_output_latent_space: Some(&candle_gen::gen_core::FLUX2_PACKED_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
         id: variant.id(),

@@ -140,6 +140,7 @@ impl Generator for Ideogram4Generator {
 /// and mask inpaint via a `Mask` (white = repaint) alongside the `Reference`.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        denoiser_output_latent_space: Some(&candle_gen::gen_core::FLUX2_PACKED_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
         id: MODEL_ID,

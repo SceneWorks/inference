@@ -166,6 +166,54 @@ mod tests {
     ];
 
     #[test]
+    fn every_registered_generator_advertises_its_exact_latent_space() {
+        use mlx_gen::gen_core::{
+            LatentSpace, FLUX1_LATENT_SPACE, FLUX2_PACKED_LATENT_SPACE, LTX_VIDEO_LATENT_SPACE,
+            MAGE_LATENT_SPACE, MOCHI_VIDEO_LATENT_SPACE, QWEN_KREA_Z16_LATENT_SPACE,
+            SANA_LATENT_SPACE, SD3_LATENT_SPACE, SDXL_LATENT_SPACE, SEEDVR2_VIDEO_LATENT_SPACE,
+            SVD_LATENT_SPACE, WAN_Z16_VIDEO_LATENT_SPACE, WAN_Z48_LATENT_SPACE,
+        };
+
+        fn expected(
+            descriptor: &mlx_gen::gen_core::ModelDescriptor,
+        ) -> Option<&'static LatentSpace> {
+            match descriptor.family {
+                "anima" | "qwen-image" | "krea_2" => Some(&QWEN_KREA_Z16_LATENT_SPACE),
+                "krea_realtime" => Some(&WAN_Z16_VIDEO_LATENT_SPACE),
+                "wan" if descriptor.id == "wan2_2_ti2v_5b" => Some(&WAN_Z48_LATENT_SPACE),
+                "bernini" | "scail2" | "wan" => Some(&WAN_Z16_VIDEO_LATENT_SPACE),
+                "flux" | "boogu" | "chroma" | "z-image" | "pulid" => Some(&FLUX1_LATENT_SPACE),
+                "sd3" => Some(&SD3_LATENT_SPACE),
+                "sdxl" | "kolors" => Some(&SDXL_LATENT_SPACE),
+                "flux2" | "ideogram" | "lens" => Some(&FLUX2_PACKED_LATENT_SPACE),
+                "ltx" => Some(&LTX_VIDEO_LATENT_SPACE),
+                "mage_flow" => Some(&MAGE_LATENT_SPACE),
+                "mochi" => Some(&MOCHI_VIDEO_LATENT_SPACE),
+                "sana" => Some(&SANA_LATENT_SPACE),
+                "seedvr2" => Some(&SEEDVR2_VIDEO_LATENT_SPACE),
+                "svd" => Some(&SVD_LATENT_SPACE),
+                // SenseNova's flow head emits RGB patches directly; there is no latent decoder seam.
+                "sensenova-u1" => None,
+                family => panic!(
+                    "{} has unclassified latent lineage for registered family {family}",
+                    descriptor.id
+                ),
+            }
+        }
+
+        let registry = super::provider_registry().unwrap();
+        for registration in registry.generators() {
+            let descriptor = (registration.descriptor)();
+            assert_eq!(
+                descriptor.denoiser_output_latent_space,
+                expected(&descriptor),
+                "{} must advertise the latent space its decoder consumes",
+                descriptor.id
+            );
+        }
+    }
+
+    #[test]
     fn preview_capability_matches_every_wired_shipped_route_bidirectionally() {
         let registry = super::provider_registry().unwrap();
         let descriptors: Vec<_> = registry

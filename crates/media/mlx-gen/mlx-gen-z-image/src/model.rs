@@ -65,6 +65,7 @@ pub const PID_BACKBONE: &str = "zimage-turbo";
 /// scheduler port.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        denoiser_output_latent_space: Some(&mlx_gen::gen_core::FLUX1_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
         id: MODEL_ID,

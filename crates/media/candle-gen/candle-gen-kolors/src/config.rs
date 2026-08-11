@@ -47,6 +47,7 @@ pub const SIZE_MULTIPLE: u32 = 8;
 /// `discrete` scheduler alias is retained.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        denoiser_output_latent_space: Some(&candle_gen::gen_core::SDXL_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
         id: MODEL_ID,

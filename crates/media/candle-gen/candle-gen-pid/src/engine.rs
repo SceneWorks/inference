@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::flow_capture_plan;
-use candle_gen::gen_core::{GenerationRequest, PidWeights, WeightsSource};
+use candle_gen::gen_core::{GenerationRequest, LatentSpace, PidWeights, WeightsSource};
 use candle_gen::{CandleError, Result, Weights};
 
 use crate::caption::CaptionEncoder;
@@ -38,6 +38,8 @@ pub struct PidEngine {
     weights: Weights,
     /// Per-latent-space backbone config (`sr4x` topology + the space's LQ latent-channel count).
     cfg: PidConfig,
+    /// Exact latent contract selected by the backbone registry.
+    input_latent_space: LatentSpace,
     /// The released 4-step SDE distill sampler config.
     sampler_cfg: SamplerConfig,
     /// The Gemma-2-2b caption encoder (loaded once; the projection runs per caption).
@@ -86,6 +88,7 @@ impl PidEngine {
         Ok(Self {
             weights,
             cfg,
+            input_latent_space: spec.input_latent_space,
             sampler_cfg: SamplerConfig::distill_4step(),
             caption,
             ckpt_prefix: "",
@@ -131,7 +134,8 @@ impl PidEngine {
             self.cfg.sr_scale,
             self.cfg.latent_spatial_down_factor,
             seed,
-        ))
+        )
+        .with_input_latent_space(self.input_latent_space))
     }
 }
 

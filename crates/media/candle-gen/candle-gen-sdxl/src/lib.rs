@@ -411,6 +411,7 @@ impl Generator for SdxlGenerator {
 /// `mac_only = false`.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        denoiser_output_latent_space: Some(&candle_gen::gen_core::SDXL_LATENT_SPACE),
         control_kinds: None,
         // epic 13657 (sc-13663): SDXL requires three caller-staged components — the two model-agnostic
         // CLIP tokenizers + the fp16-fix VAE — that used to be self-fetched from pinned upstream repos

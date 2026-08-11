@@ -24,6 +24,7 @@ pub mod guidance;
 pub mod image_embed;
 pub mod imageops;
 pub mod json_constraint;
+pub mod latent;
 pub mod license;
 mod macros;
 pub mod media;
@@ -72,6 +73,16 @@ pub use generator::{
 };
 pub use image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
 pub use json_constraint::JsonState;
+pub use latent::{
+    latent_spaces_compatible, normalization_vectors_hash, LatentNormalization,
+    LatentNormalizationStats, LatentPatchLayout, LatentSpace, LatentTemporalLaw,
+    SpatialCompression, FLUX1_LATENT_SPACE, FLUX2_PACKED_LATENT_SPACE, LTX_VIDEO_LATENT_SPACE,
+    MAGE_LATENT_SPACE, MOCHI_VIDEO_LATENT_SPACE, QWEN_KREA_Z16_LATENT_SPACE, QWEN_WAN_Z16_MEAN,
+    QWEN_WAN_Z16_NORMALIZATION, QWEN_WAN_Z16_STD, SANA_LATENT_SPACE, SD3_LATENT_SPACE,
+    SDXL_LATENT_SPACE, SEEDVR2_VIDEO_LATENT_SPACE, SVD_LATENT_SPACE, WAN_Z16_LATENT_SPACE,
+    WAN_Z16_VIDEO_LATENT_SPACE, WAN_Z48_LATENT_SPACE, WAN_Z48_MEAN, WAN_Z48_NORMALIZATION,
+    WAN_Z48_STD,
+};
 pub use license::components::MEDIA_COMPONENT_LICENSES;
 pub use license::families::LICENSE_FAMILIES;
 pub use license::{
