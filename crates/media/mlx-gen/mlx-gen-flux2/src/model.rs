@@ -518,12 +518,14 @@ impl Flux2 {
     ) -> Result<String> {
         if !req.enhance_prompt {
             req.prompt_enhancement
-                .emit(gen_core::PromptEnhancementReport::absent(&req.prompt));
+                .emit(mlx_gen::gen_core::PromptEnhancementReport::absent(
+                    &req.prompt,
+                ));
             return Ok(req.prompt.clone());
         }
         if !self.variant.is_dev() {
             req.prompt_enhancement
-                .emit(gen_core::PromptEnhancementReport::fallback(
+                .emit(mlx_gen::gen_core::PromptEnhancementReport::fallback(
                     &req.prompt,
                     "unsupported_variant",
                 ));
@@ -539,13 +541,16 @@ impl Flux2 {
                 // second prefix line (the returned `p` itself is unchanged) (L-log-injection).
                 eprintln!("ENHANCED_PROMPT:{}", sanitize_log_text(&p));
                 req.prompt_enhancement
-                    .emit(gen_core::PromptEnhancementReport::enhanced(&req.prompt, &p));
+                    .emit(mlx_gen::gen_core::PromptEnhancementReport::enhanced(
+                        &req.prompt,
+                        &p,
+                    ));
                 Ok(p)
             }
             Ok(Err(reason)) => {
                 eprintln!("ENHANCER_FALLBACK:{reason}");
                 req.prompt_enhancement
-                    .emit(gen_core::PromptEnhancementReport::fallback(
+                    .emit(mlx_gen::gen_core::PromptEnhancementReport::fallback(
                         &req.prompt,
                         reason,
                     ));
@@ -558,7 +563,7 @@ impl Flux2 {
                 }
                 eprintln!("ENHANCER_FALLBACK:{}", sanitize_log_text(&e.to_string()));
                 req.prompt_enhancement
-                    .emit(gen_core::PromptEnhancementReport::fallback(
+                    .emit(mlx_gen::gen_core::PromptEnhancementReport::fallback(
                         &req.prompt,
                         "enhancer_error",
                     ));
