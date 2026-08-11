@@ -961,6 +961,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn shared_cuda_profile_reuses_one_stable_idle_policy_and_validates_before_publish() {
+        const SOURCE: &str = include_str!("pipeline.rs");
+        const WORKFLOW: &str = include_str!("../../../../../.github/workflows/real-weights.yml");
+        let profile_start = SOURCE
+            .rfind("\n    fn shared_bf16_real_weights_cuda_loads_and_renders_with_measured_peak()")
+            .expect("exact SCAIL profile declaration");
+        let profile_end = SOURCE[profile_start..]
+            .find("\n    fn registers_and_resolves_as_candle_video()")
+            .map(|offset| profile_start + offset)
+            .expect("profile boundary");
+        let profile = &SOURCE[profile_start..profile_end];
+
+        for required in [
+            "const STABLE_IDLE: candle_gen::testkit::StableIdleConfig =",
+            ".assert_stable_idle(STABLE_IDLE)",
+            ".assert_trustworthy(STABLE_IDLE.max_baseline_gb)",
+        ] {
+            assert!(
+                profile.contains(required),
+                "missing shared idle policy: {required}"
+            );
+        }
+        assert_eq!(
+            profile.matches("STABLE_IDLE").count(),
+            3,
+            "the one stable-idle config must be declared once and consumed by both validations"
+        );
+        assert!(
+            !profile.contains("assert_trustworthy(1.0)"),
+            "the legacy headless ceiling must not override the validated WDDM policy"
+        );
+
+        let raw = profile
+            .find("[[SCAIL2_CUDA_VRAM_RAW]]")
+            .expect("raw diagnostic marker");
+        let validation = profile
+            .find(".assert_trustworthy(STABLE_IDLE.max_baseline_gb)")
+            .expect("post-report validation");
+        let validated = profile
+            .find("[[SCAIL2_CUDA_VRAM]]")
+            .expect("validated publication marker");
+        assert!(raw < validation && validation < validated);
+        assert!(
+            WORKFLOW.contains("grep -Fq '[[SCAIL2_CUDA_VRAM]]'"),
+            "workflow must accept only the final validated marker"
+        );
+        assert!(
+            !WORKFLOW.contains("grep -Fq '[[SCAIL2_CUDA_VRAM_RAW]]'"),
+            "raw diagnostics must never satisfy publication"
+        );
+    }
+
     /// Exact shared-package CUDA gate. The official real-weight workflow provisions
     /// `SceneWorks/scail2-mlx@ce88cfdb.../bf16`, runs this test on an otherwise-idle CUDA device,
     /// and records both driver-reserved (the admission unit) and concurrent-live pool peaks.
@@ -974,6 +1027,8 @@ mod tests {
         const HEIGHT: u32 = 480;
         const FRAMES: usize = 81;
         const STEPS: u32 = 1;
+        const STABLE_IDLE: candle_gen::testkit::StableIdleConfig =
+            candle_gen::testkit::StableIdleConfig::new(2.0, 6, 64, 200);
 
         let root = PathBuf::from(
             std::env::var("SCAIL2_SHARED_BF16_DIR")
@@ -995,7 +1050,7 @@ mod tests {
         // `name<TAB>dtype<TAB>dimxdim...<LF>` stream; this guards all 194 names and source shapes
         // without checking a hand-selected subset. The loader independently validates every tensor
         // class and its post-transpose weight/bias relationship before device construction.
-        let vae_mapped = unsafe { cst::MmapedSafetensors::new(&canonical.join("vae.safetensors")) }
+        let vae_mapped = unsafe { cst::MmapedSafetensors::new(canonical.join("vae.safetensors")) }
             .expect("map exact VAE header");
         let mut vae_specs = vae_mapped
             .tensors()
@@ -1066,8 +1121,8 @@ mod tests {
         // The self-hosted Windows lane's isolated GPU has a stable ~1.6 GB WDDM/UI baseline even
         // when pmon shows no pure compute process. Prove that exact condition instead of either
         // accepting a one-shot busy sample or pretending this runner is a headless <1 GB device.
-        let mut probe = candle_gen::testkit::VramProbe::start_rendered()
-            .assert_stable_idle(candle_gen::testkit::StableIdleConfig::new(2.0, 6, 64, 200));
+        let mut probe =
+            candle_gen::testkit::VramProbe::start_rendered().assert_stable_idle(STABLE_IDLE);
 
         let load_phase = probe.phase();
         let load_started = std::time::Instant::now();
@@ -1133,9 +1188,15 @@ mod tests {
             .iter()
             .any(|frame| frame.pixels.iter().any(|&v| v != 0)));
 
-        let report = probe.report().assert_trustworthy(1.0);
+        let report = probe.report();
         let used_high = pool.used_high().expect("USED_MEM_HIGH") as f64 / 1.0e9;
         let reserved_high = pool.reserved_high().expect("RESERVED_MEM_HIGH") as f64 / 1.0e9;
+        eprintln!(
+            "[[SCAIL2_CUDA_VRAM_RAW]] baselineGb={:.3} loadPeakGb={:.3} steadyGb={:.3} \
+             overallPeakGb={:.3} poolUsedHighGb={used_high:.3} poolReservedHighGb={reserved_high:.3}",
+            report.baseline_gb, report.load_peak_gb, report.steady_gb, report.peak_gb,
+        );
+        let report = report.assert_trustworthy(STABLE_IDLE.max_baseline_gb);
         assert!(
             report.peak_gb > 70.0,
             "real F32 stack was not observed through the production provider: {report}"

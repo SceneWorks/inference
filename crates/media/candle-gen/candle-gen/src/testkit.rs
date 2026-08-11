@@ -698,7 +698,12 @@ mod vram_probe {
             }
 
             let gpu = self.gpu.to_string();
-            let output = Command::new("nvidia-smi")
+            let nvidia_smi = crate::gpu::resolve_nvidia_smi().unwrap_or_else(|| {
+                panic!(
+                    "cannot resolve a trusted nvidia-smi executable for stable-idle process evidence"
+                )
+            });
+            let output = Command::new(nvidia_smi)
                 .args(["pmon", "-i", &gpu, "-c", "1", "-s", "um"])
                 .output()
                 .unwrap_or_else(|error| panic!("cannot run nvidia-smi pmon: {error}"));
