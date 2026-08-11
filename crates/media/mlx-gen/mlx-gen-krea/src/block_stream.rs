@@ -153,7 +153,46 @@ impl KreaBlockStream {
             .collect();
     }
 
+    /// Drop every captured forward-time residual while preserving the immutable reopen source.
+    pub(crate) fn clear_adapters(&mut self) {
+        self.adapters = vec![BlockAdapters::default(); self.n_blocks()];
+    }
+
+    /// Build a temporary full adapter-routing surface without evaluating or retaining the base block
+    /// tensors. Adapter loaders need each block's module paths and base shapes to classify LoRA/LoKr;
+    /// they do not run the base forward. The caller applies adapters, snapshots only their residual
+    /// stacks via [`Self::capture_adapters`], then drops these lazy proxies before generation.
+    pub(crate) fn adapter_proxy_blocks(&self) -> Result<Vec<SingleStreamBlock>> {
+        #[cfg(test)]
+        if let Some(blocks) = &self.test_blocks {
+            let mut blocks = blocks.clone();
+            for (index, block) in blocks.iter_mut().enumerate() {
+                if let Some(adapters) = self.adapters.get(index) {
+                    adapters.install(block)?;
+                }
+            }
+            return Ok(blocks);
+        }
+        let view = self.open_view(false)?;
+        (0..self.n_blocks())
+            .map(|index| {
+                let mut block = self.assemble_block(&view, index)?;
+                if let Some(bits) = self.quant_bits {
+                    block.quantize(bits)?;
+                }
+                if let Some(adapters) = self.adapters.get(index) {
+                    adapters.install(&mut block)?;
+                }
+                Ok(block)
+            })
+            .collect()
+    }
+
     pub(crate) fn open(&self) -> Result<Weights> {
+        self.open_view(true)
+    }
+
+    fn open_view(&self, record_native_window: bool) -> Result<Weights> {
         #[cfg(test)]
         if self.test_blocks.is_some() {
             return Ok(Weights::empty());
@@ -163,7 +202,9 @@ impl KreaBlockStream {
             KreaBlockSource::Diffusers(WeightsSource::File(file)) => Weights::from_file(file),
             KreaBlockSource::Native(file) => file.read_unchanged(|path| {
                 let weights = crate::loader::normalized_native_weights_lazy(path)?;
-                NATIVE_WINDOW_REOPENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if record_native_window {
+                    NATIVE_WINDOW_REOPENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 Ok(weights)
             }),
         }
@@ -182,12 +223,15 @@ impl KreaBlockStream {
         }
         #[cfg(test)]
         if let Some(blocks) = &self.test_blocks {
-            let block = blocks.get(index).cloned().ok_or_else(|| {
+            let mut block = blocks.get(index).cloned().ok_or_else(|| {
                 Error::Msg(format!(
                     "krea test block stream: block {index} is absent from a {}-block fixture",
                     blocks.len()
                 ))
             })?;
+            if let Some(adapters) = self.adapters.get(index) {
+                adapters.install(&mut block)?;
+            }
             if let Some(counter) = &self.test_materializations {
                 counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
@@ -206,16 +250,7 @@ impl KreaBlockStream {
         index: usize,
         source_guarded: bool,
     ) -> Result<SingleStreamBlock> {
-        let cfg = &self.cfg;
-        let mut block = SingleStreamBlock::from_weights(
-            view,
-            &format!("transformer_blocks.{index}"),
-            cfg.num_attention_heads as i32,
-            cfg.num_kv_heads as i32,
-            cfg.attention_head_dim as i32,
-            cfg.hidden_size as i32,
-            cfg.norm_eps,
-        )?;
+        let mut block = self.assemble_block(view, index)?;
         if source_guarded {
             // Evaluate only this block's exact read set before the native pin's post-check. Evaluating
             // the whole normalized map would make File reopening physically correct but memory-bound
@@ -233,6 +268,19 @@ impl KreaBlockStream {
         }
         BLOCK_MATERIALIZATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(block)
+    }
+
+    fn assemble_block(&self, view: &Weights, index: usize) -> Result<SingleStreamBlock> {
+        let cfg = &self.cfg;
+        SingleStreamBlock::from_weights(
+            view,
+            &format!("transformer_blocks.{index}"),
+            cfg.num_attention_heads as i32,
+            cfg.num_kv_heads as i32,
+            cfg.attention_head_dim as i32,
+            cfg.hidden_size as i32,
+            cfg.norm_eps,
+        )
     }
 }
 

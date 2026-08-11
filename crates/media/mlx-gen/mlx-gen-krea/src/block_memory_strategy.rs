@@ -1026,8 +1026,8 @@ mod tests {
         );
         assert!(!registered.lifecycle.transformer_window_materialization);
         assert!(
-            !crate::model::native_file_streamable(&file),
-            "the registered File builder must not execute its lower-level stream seam before evidence promotion"
+            crate::model::native_file_streamable(&file).unwrap(),
+            "explicit Sequential + Deferred execution may use the pinned File stream seam even while automatic authorization stays Missing"
         );
         std::fs::remove_dir_all(root).ok();
     }

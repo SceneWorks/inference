@@ -599,16 +599,12 @@ impl Generator for KreaGenerator {
             // request-scoped component transition. This preserves the cancellation contract for
             // every descriptor, including variants that do not support the selected memory rung.
             candle_gen::check_cancel(&req.cancel)?;
-            if self.native_dit.is_some()
-                && (memory.stream_transformer_blocks
-                    || memory.transformer_window_size.is_some()
-                    || memory.transformer_window_component.is_some())
-            {
-                return Err(gen_core::Error::Unsupported(format!(
-                    "{}: imported File weights are reopenable but transformer residency is not \
-                     authorized without File-specific promoted evidence",
-                    self.descriptor.id
-                )));
+            if self.native_dit.is_some() {
+                validate_native_file_transformer_request(
+                    self.descriptor.id,
+                    &self.file_pin_spec,
+                    *memory,
+                )?;
             }
             if self.descriptor.id != KREA_2_TURBO_ID
                 || !self.descriptor.capabilities.supports_sequential_offload
@@ -1219,6 +1215,68 @@ fn validate_load_spec(spec: &LoadSpec, id: &str) -> gen_core::Result<ValidatedKr
     Ok((root, native_dit, convrot_dit, loaded_quant))
 }
 
+/// Physical eligibility for the registered native-File block loader.
+///
+/// This deliberately does not consult the public memory contract: File rung-4 evidence remains
+/// Missing, while an explicit adapter-free Sequential + Deferred load can still exercise the pinned
+/// native stream path. Candle cannot replay adapters onto streamed blocks, so every adapter form —
+/// including diff-patches — stays excluded.
+fn native_file_streamable(provider_id: &str, spec: &LoadSpec) -> bool {
+    provider_id == KREA_2_TURBO_ID
+        && matches!(spec.weights, WeightsSource::File(_))
+        && matches!(spec.offload_policy, gen_core::OffloadPolicy::Sequential)
+        && matches!(
+            spec.load_shape,
+            gen_core::LoadShape::DeferredMaterialization
+        )
+        && spec.quantize.is_none()
+        && spec.adapters.is_empty()
+}
+
+fn validate_native_file_transformer_request(
+    provider_id: &str,
+    spec: &LoadSpec,
+    memory: gen_core::GenerationMemory,
+) -> gen_core::Result<()> {
+    if !matches!(spec.weights, WeightsSource::File(_)) {
+        return Ok(());
+    }
+    let has_owned_parameter =
+        memory.transformer_window_size.is_some() || memory.transformer_window_component.is_some();
+    if has_owned_parameter && !memory.stream_transformer_blocks {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{provider_id}: transformer_window_size and transformer_window_component require \
+             stream_transformer_blocks=true"
+        )));
+    }
+    if !memory.stream_transformer_blocks {
+        return Ok(());
+    }
+    if !native_file_streamable(provider_id, spec) {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{provider_id}: imported File transformer streaming requires the Turbo text-to-image \
+             route and an adapter-free Sequential + DeferredMaterialization load"
+        )));
+    }
+    let component = memory.transformer_window_component.unwrap_or_default();
+    if component != gen_core::TransformerComponent::Dit {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{provider_id}: imported File transformer streaming owns the DiT component only; \
+             requested {component:?}"
+        )));
+    }
+    let window = memory
+        .transformer_window_size
+        .unwrap_or(SUPPORTED_TRANSFORMER_WINDOWS[0]);
+    if !SUPPORTED_TRANSFORMER_WINDOWS.contains(&window) {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{provider_id}: transformer residency window is fixed at \
+             {SUPPORTED_TRANSFORMER_WINDOWS:?}, got {window}"
+        )));
+    }
+    Ok(())
+}
+
 fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<dyn Generator>> {
     let (root, native_dit, convrot_dit, loaded_quant) = validate_load_spec(spec, descriptor.id)?;
     #[cfg(any(feature = "cuda", test))]
@@ -1248,12 +1306,10 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
     let heavy_convrot = convrot_dit.clone();
     let heavy_native = native_dit.clone();
     let heavy_file_spec = spec.clone();
-    // Imported File providers do not publish rung-4 authorization: the available calibration
-    // evidence covers the canonical snapshot-directory load shape only. Keep the registered
-    // request path eager even when the file is physically reopenable. The lower-level native
-    // loader retains its explicit `stream_blocks` seam for smoke coverage and for a future File
-    // calibration/promotion without silently executing a strategy the public contract marks Missing.
-    let native_streamable = false;
+    // Keep physical execution separate from evidence publication. The File contract below remains
+    // rung-4 Missing, but an explicit eligible load arms the retained native pin for real block
+    // windows rather than silently falling back to an eager DiT.
+    let native_streamable = native_file_streamable(descriptor.id, spec);
     let residency = candle_gen::Residency::request_scoped_with_resident_cancelable(
         move |_| {
             let components = resident_file_spec.read_files_unchanged(
@@ -2514,6 +2570,128 @@ mod tests {
                 gen_core::MemoryStrategySupport::Implemented
             ));
         }
+
+        let eligible = spec
+            .clone()
+            .with_offload_policy(gen_core::OffloadPolicy::Sequential)
+            .with_load_shape(gen_core::LoadShape::DeferredMaterialization);
+        assert!(
+            native_file_streamable(KREA_2_TURBO_ID, &eligible),
+            "the explicit File load shape must arm the physical native block loader"
+        );
+        let explicit_window = gen_core::GenerationMemory {
+            stage_residency: true,
+            stream_transformer_blocks: true,
+            transformer_window_size: Some(SUPPORTED_TRANSFORMER_WINDOWS[0]),
+            transformer_window_component: Some(gen_core::TransformerComponent::Dit),
+            ..Default::default()
+        };
+        validate_native_file_transformer_request(KREA_2_TURBO_ID, &eligible, explicit_window)
+            .expect("an eligible explicit File window must reach the physical renderer");
+        let default_dit_window = gen_core::GenerationMemory {
+            stage_residency: true,
+            stream_transformer_blocks: true,
+            ..Default::default()
+        };
+        validate_native_file_transformer_request(KREA_2_TURBO_ID, &eligible, default_dit_window)
+            .expect("an omitted component/window defaults to the calibrated DiT window");
+        for component in [
+            gen_core::TransformerComponent::TextEncoder,
+            gen_core::TransformerComponent::Both,
+        ] {
+            let wrong_component = gen_core::GenerationMemory {
+                transformer_window_component: Some(component),
+                ..explicit_window
+            };
+            let error = validate_native_file_transformer_request(
+                KREA_2_TURBO_ID,
+                &eligible,
+                wrong_component,
+            )
+            .expect_err("File streaming may not claim a non-DiT component");
+            assert!(error.to_string().contains("DiT component only"), "{error}");
+        }
+        for parameter_only in [
+            gen_core::GenerationMemory {
+                transformer_window_size: Some(SUPPORTED_TRANSFORMER_WINDOWS[0]),
+                ..Default::default()
+            },
+            gen_core::GenerationMemory {
+                transformer_window_component: Some(gen_core::TransformerComponent::Dit),
+                ..Default::default()
+            },
+        ] {
+            let error = validate_native_file_transformer_request(
+                KREA_2_TURBO_ID,
+                &eligible,
+                parameter_only,
+            )
+            .expect_err("transformer parameters without streaming must be rejected");
+            assert!(
+                error.to_string().contains("stream_transformer_blocks=true"),
+                "{error}"
+            );
+        }
+        let invalid_window = gen_core::GenerationMemory {
+            transformer_window_size: Some(SUPPORTED_TRANSFORMER_WINDOWS[0] + 1),
+            ..explicit_window
+        };
+        let error =
+            validate_native_file_transformer_request(KREA_2_TURBO_ID, &eligible, invalid_window)
+                .expect_err("an uncalibrated File window must be rejected");
+        assert!(error.to_string().contains("window is fixed"), "{error}");
+        let eligible_contract = build_krea_turbo_memory_strategy_contract(&eligible);
+        assert!(matches!(
+            eligible_contract
+                .capability(gen_core::MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .support,
+            gen_core::MemoryStrategySupport::Missing
+        ));
+
+        let mut resident = eligible.clone();
+        resident.offload_policy = gen_core::OffloadPolicy::Resident;
+        assert!(!native_file_streamable(KREA_2_TURBO_ID, &resident));
+        assert!(validate_native_file_transformer_request(
+            KREA_2_TURBO_ID,
+            &resident,
+            explicit_window
+        )
+        .is_err());
+
+        let mut eager = eligible.clone();
+        eager.load_shape = gen_core::LoadShape::EagerMaterialization;
+        assert!(!native_file_streamable(KREA_2_TURBO_ID, &eager));
+        assert!(
+            validate_native_file_transformer_request(KREA_2_TURBO_ID, &eager, explicit_window)
+                .is_err()
+        );
+
+        let quantized = eligible.clone().with_quant(Quant::Q4);
+        assert!(!native_file_streamable(KREA_2_TURBO_ID, &quantized));
+        assert!(validate_native_file_transformer_request(
+            KREA_2_TURBO_ID,
+            &quantized,
+            explicit_window
+        )
+        .is_err());
+
+        let adapted = eligible.clone().with_adapters(vec![AdapterSpec::new(
+            "/imports/adapter.safetensors".into(),
+            1.0,
+            gen_core::AdapterKind::Lora,
+        )]);
+        assert!(!native_file_streamable(KREA_2_TURBO_ID, &adapted));
+        assert!(validate_native_file_transformer_request(
+            KREA_2_TURBO_ID,
+            &adapted,
+            explicit_window
+        )
+        .is_err());
+        assert!(
+            !native_file_streamable(KREA_2_RAW_ID, &eligible),
+            "Candle's streamed trunk is only wired through the ordinary Turbo t2i renderer"
+        );
     }
 
     #[test]

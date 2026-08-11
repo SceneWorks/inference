@@ -463,10 +463,11 @@ fn build_native_krea_from_spec(spec: &LoadSpec, descriptor: ModelDescriptor) -> 
         .expect("File weights must resolve to a pin");
     let mut pinned_spec = spec.clone();
     pinned_spec.weights = WeightsSource::File(native_dit.loader_path().to_path_buf());
-    // The File is physically reopenable, but the public File contract deliberately withholds rung 4
-    // until that load shape has independent evidence. Keep even a stage-only sequential request eager;
-    // the lower-level pinned stream loader remains available for smoke coverage and future promotion.
-    let reopenable = native_file_streamable(spec);
+    // Physical execution eligibility is intentionally independent from public evidence. An explicit
+    // Sequential + Deferred File request can use the retained pin to reopen one transformer block at
+    // a time, while the contract below continues to report rung 4 as Missing until File-specific
+    // measurements are promoted.
+    let reopenable = native_file_streamable(spec)?;
     let memory_strategy = native_dit.read_unchanged(|_| {
         crate::block_memory_strategy::native_memory_strategy_contract_from_spec(
             descriptor.id,
@@ -492,9 +493,7 @@ fn build_native_krea_from_spec(spec: &LoadSpec, descriptor: ModelDescriptor) -> 
         memory_strategy,
         precision: spec.precision,
         quant: None,
-        // The File loader remains physically reopenable, but only Dir-backed rung-4 cells have
-        // promoted evidence. A hand-built request must therefore not bypass the public contract.
-        streamable_transformer: false,
+        streamable_transformer: reopenable,
         _native_dit: Some(native_dit),
         residency,
         adapters: spec.adapters.clone(),
@@ -503,11 +502,24 @@ fn build_native_krea_from_spec(spec: &LoadSpec, descriptor: ModelDescriptor) -> 
     })
 }
 
-/// Whether a registered primary-File provider may execute bounded transformer residency. The loader
-/// is physically reopenable, but the evidence matrix has no promoted File cell yet, so this remains
-/// false independently of a request's sequential/deferred shape.
-pub(crate) fn native_file_streamable(_spec: &LoadSpec) -> bool {
-    false
+/// Whether a registered primary-File provider can physically execute bounded transformer residency.
+///
+/// This is an execution predicate, not an evidence claim: File contracts deliberately keep rung 4
+/// `Missing`. Low-rank adapters are replayed by [`crate::block_stream::KreaBlockStream`], while a
+/// dense diff-patch is excluded because it irreversibly mutates the eager base and cannot be rebuilt
+/// from a pristine per-window reopen. Header inspection runs beneath the caller-prepared File tokens.
+pub(crate) fn native_file_streamable(spec: &LoadSpec) -> Result<bool> {
+    if !matches!(spec.weights, WeightsSource::File(_)) {
+        return Ok(false);
+    }
+    Ok(matches!(
+        spec.offload_policy,
+        mlx_gen::gen_core::OffloadPolicy::Sequential
+    ) && matches!(
+        spec.load_shape,
+        mlx_gen::gen_core::LoadShape::DeferredMaterialization
+    ) && spec.quantize.is_none()
+        && !adapters_have_diff_patch_for_spec(spec)?)
 }
 
 fn load_native_krea_heavy(
@@ -573,7 +585,10 @@ fn load_prepared_pid(spec: &LoadSpec) -> Result<Option<PidEngine>> {
         .map(Some)
 }
 
-fn resolve_transformer_window(req: &GenerationRequest, streamable: bool) -> Result<Option<usize>> {
+pub(crate) fn resolve_transformer_window(
+    req: &GenerationRequest,
+    streamable: bool,
+) -> Result<Option<usize>> {
     let Some(memory) = req.memory.filter(|memory| memory.stream_transformer_blocks) else {
         return Ok(None);
     };
@@ -1557,7 +1572,13 @@ mod tests {
     use std::path::PathBuf;
 
     fn write_minimal_safetensors(path: &Path) {
-        let mut header = br#"{"probe":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#.to_vec();
+        write_named_safetensors(path, "probe");
+    }
+
+    fn write_named_safetensors(path: &Path, tensor: &str) {
+        let mut header =
+            format!(r#"{{"{tensor}":{{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}}}"#)
+                .into_bytes();
         while !header.len().is_multiple_of(8) {
             header.push(b' ');
         }
@@ -1606,6 +1627,19 @@ mod tests {
             .unwrap()
             .expect("prepared primary token");
         let model = build_native_krea_from_spec(&spec, descriptor()).unwrap();
+        assert!(
+            model.streamable_transformer,
+            "an explicit Sequential + Deferred File load must arm the physical stream"
+        );
+        assert_eq!(
+            model
+                .memory_strategy
+                .capability(mlx_gen::gen_core::MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .support,
+            mlx_gen::gen_core::MemoryStrategySupport::Missing,
+            "physical File streaming must not inherit the Dir evidence cell"
+        );
         let pin = model
             ._native_dit
             .expect("native generator must retain its pin");
@@ -1618,6 +1652,47 @@ mod tests {
             .expect_err("sequential reopen must reject a replacement")
             .to_string();
         assert!(error.contains("changed after load"), "{error}");
+    }
+
+    #[test]
+    fn native_file_streaming_requires_the_explicit_shape_and_excludes_diff_patches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut eligible = complete_native_file_spec(&tmp);
+        eligible.load_shape = mlx_gen::LoadShape::DeferredMaterialization;
+        assert!(native_file_streamable(&eligible).unwrap());
+
+        let mut resident = eligible.clone();
+        resident.offload_policy = mlx_gen::OffloadPolicy::Resident;
+        assert!(!native_file_streamable(&resident).unwrap());
+        let mut eager = eligible.clone();
+        eager.load_shape = mlx_gen::LoadShape::EagerMaterialization;
+        assert!(!native_file_streamable(&eager).unwrap());
+        assert!(!native_file_streamable(&eligible.clone().with_quant(mlx_gen::Quant::Q4)).unwrap());
+
+        let lora = tmp.path().join("adapter.safetensors");
+        write_named_safetensors(
+            &lora,
+            "transformer.transformer_blocks.0.attn.to_q.lora_down.weight",
+        );
+        let mut residual =
+            eligible
+                .clone()
+                .with_adapters(vec![AdapterSpec::new(lora, 1.0, AdapterKind::Lora)]);
+        residual.prepare_file_sources().unwrap();
+        assert!(
+            native_file_streamable(&residual).unwrap(),
+            "MLX block streams capture and replay forward-time low-rank adapters"
+        );
+
+        let diff = tmp.path().join("diff-patch.safetensors");
+        write_named_safetensors(&diff, "diffusion_model.transformer_blocks.0.attn.to_q.diff");
+        let mut patched =
+            eligible.with_adapters(vec![AdapterSpec::new(diff, 1.0, AdapterKind::Lora)]);
+        patched.prepare_file_sources().unwrap();
+        assert!(
+            !native_file_streamable(&patched).unwrap(),
+            "an irreversible diff-patch cannot be replayed from pristine window reopens"
+        );
     }
 
     fn req(w: u32, h: u32) -> GenerationRequest {

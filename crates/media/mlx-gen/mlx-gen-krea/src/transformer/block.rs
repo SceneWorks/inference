@@ -23,6 +23,16 @@ use super::rope::apply_interleaved_rope;
 use super::{join, repeat_kv};
 use crate::quant::lin;
 
+fn materialize_host_adapters(host: &mut impl AdaptableHost) -> Result<()> {
+    for path in host.adaptable_paths() {
+        let parts: Vec<&str> = path.split('.').collect();
+        if let Some(linear) = host.adaptable_mut(&parts) {
+            linear.materialize_adapters()?;
+        }
+    }
+    Ok(())
+}
+
 /// `1.0 + a`, broadcasting the scalar (the `(1 + scale)` modulation factor).
 fn plus1(a: &Array) -> Result<Array> {
     Ok(add(a, Array::from_f32(1.0))?)
@@ -473,6 +483,10 @@ impl SingleStreamBlock {
         self.attn.cast_weights(dtype)?;
         self.mlp.cast_weights(dtype)
     }
+
+    pub(crate) fn materialize_adapters(&mut self) -> Result<()> {
+        materialize_host_adapters(self)
+    }
 }
 
 /// LoRA target routing for a single-stream block: `attn.{…}` / `ff.{…}` (sc-7577 / sc-7578) — the
@@ -592,6 +606,13 @@ impl TextFusionTransformer {
             b.cast_weights(dtype)?;
         }
         Ok(())
+    }
+
+    pub(crate) fn materialize_adapters(&mut self) -> Result<()> {
+        // `projector` is routable for explicit adapter files but is not enumerated by
+        // `adaptable_paths`; include it explicitly so its payload cannot escape the pin guard.
+        self.projector.materialize_adapters()?;
+        materialize_host_adapters(self)
     }
 }
 
