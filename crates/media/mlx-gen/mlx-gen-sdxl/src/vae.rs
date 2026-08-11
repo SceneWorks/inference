@@ -455,24 +455,55 @@ impl LatentDecoder for SdxlLatentDecoder<'_> {
 mod decoder_seam_tests {
     use super::*;
 
-    /// SC-18309 N1's weight-free layout gate. The engine historically passed NHWC directly to the
-    /// VAE; the generic seam is NCHW. Distinct values in every axis prove both adapter transposes are
-    /// exact inverses and prevent a silent channel/spatial permutation from hiding behind shapes.
+    /// SC-18309 N1's weight-free layout gate. The engine historically passed NHWC latents directly
+    /// to the VAE while the generic seam accepts NCHW; decoded output travels back as RGB NHWC and
+    /// the seam returns RGB NCHW. Distinct values in every axis prove both production transposes
+    /// preserve bytes without weakening the decoded-output RGB shape guard.
     #[test]
-    fn sdxl_seam_layout_roundtrip_is_byte_exact() {
-        let nchw = Array::from_slice(
-            &(0..(2 * 4 * 3 * 5))
-                .map(|value| value as f32)
-                .collect::<Vec<_>>(),
-            &[2, 4, 3, 5],
-        );
+    fn sdxl_seam_layout_transposes_are_byte_exact() {
+        let nchw_values = (0..(2 * 4 * 3 * 5))
+            .map(|value| value as f32)
+            .collect::<Vec<_>>();
+        let nchw = Array::from_slice(&nchw_values, &[2, 4, 3, 5]);
         let nhwc = SdxlLatentDecoder::to_nhwc(&nchw).unwrap();
         assert_eq!(nhwc.shape(), &[2, 3, 5, 4]);
-        let roundtrip = SdxlLatentDecoder::to_nchw(&nhwc).unwrap();
-        assert_eq!(roundtrip.shape(), nchw.shape());
+        let mut expected_nhwc = Vec::with_capacity(nchw_values.len());
+        for batch in 0..2 {
+            for height in 0..3 {
+                for width in 0..5 {
+                    for channel in 0..4 {
+                        expected_nhwc
+                            .push(nchw_values[((batch * 4 + channel) * 3 + height) * 5 + width]);
+                    }
+                }
+            }
+        }
         assert_eq!(
-            roundtrip.reshape(&[-1]).unwrap().as_slice::<f32>(),
-            nchw.reshape(&[-1]).unwrap().as_slice::<f32>()
+            nhwc.reshape(&[-1]).unwrap().as_slice::<f32>(),
+            expected_nhwc
+        );
+
+        let rgb_nhwc_values = (0..(2 * 3 * 5 * 3))
+            .map(|value| value as f32)
+            .collect::<Vec<_>>();
+        let rgb_nhwc = Array::from_slice(&rgb_nhwc_values, &[2, 3, 5, 3]);
+        let rgb_nchw = SdxlLatentDecoder::to_nchw(&rgb_nhwc).unwrap();
+        assert_eq!(rgb_nchw.shape(), &[2, 3, 3, 5]);
+        let mut expected_nchw = Vec::with_capacity(rgb_nhwc_values.len());
+        for batch in 0..2 {
+            for channel in 0..3 {
+                for height in 0..3 {
+                    for width in 0..5 {
+                        expected_nchw.push(
+                            rgb_nhwc_values[((batch * 3 + height) * 5 + width) * 3 + channel],
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            rgb_nchw.reshape(&[-1]).unwrap().as_slice::<f32>(),
+            expected_nchw
         );
     }
 }

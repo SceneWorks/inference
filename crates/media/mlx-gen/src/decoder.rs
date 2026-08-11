@@ -69,7 +69,8 @@ pub fn ensure_decoder_compatible(
 
 /// Require the caller's declared tensor structure to match the selected decoder before routing an
 /// already-normalized latent across the seam. This checks channels, compression, packed layout, and
-/// temporal law; it deliberately does **not** claim normalization compatibility.
+/// temporal law, and rejects either malformed descriptor; it deliberately does **not** claim
+/// normalization compatibility.
 ///
 /// Use [`gen_core::latent_spaces_compatible`] for alternate-decoder selection. That stronger helper
 /// intentionally rejects `LearnedPerChannel` normalization without a content hash, even when the
@@ -86,6 +87,11 @@ pub fn ensure_decoder_layout(
     let input = decoder.input_latent_space().ok_or_else(|| {
         Error::Msg("decoder route rejected: decoder input latent space is undeclared".into())
     })?;
+    if !output.is_well_formed() || !input.is_well_formed() {
+        return Err(Error::Msg(format!(
+            "decoder route rejected: malformed denoiser or decoder latent layout ({output:?} -> {input:?})"
+        )));
+    }
     if output.channels != input.channels
         || output.spatial_compression != input.spatial_compression
         || output.patch_layout != input.patch_layout
@@ -119,6 +125,18 @@ mod tests {
     impl LatentDecoder for PackedDecoder {
         fn input_latent_space(&self) -> Option<&LatentSpace> {
             Some(&gen_core::FLUX2_PACKED_LATENT_SPACE)
+        }
+
+        fn decode(&self, latents: &Array) -> Result<Array> {
+            Ok(latents.clone())
+        }
+    }
+
+    struct DescriptorDecoder(LatentSpace);
+
+    impl LatentDecoder for DescriptorDecoder {
+        fn input_latent_space(&self) -> Option<&LatentSpace> {
+            Some(&self.0)
         }
 
         fn decode(&self, latents: &Array) -> Result<Array> {
@@ -185,5 +203,15 @@ mod tests {
         assert!(
             ensure_decoder_layout(Some(&gen_core::QWEN_KREA_Z16_LATENT_SPACE), &packed).is_err()
         );
+
+        let mut malformed = gen_core::FLUX2_PACKED_LATENT_SPACE;
+        malformed.channels = 0;
+        let malformed_decoder = DescriptorDecoder(malformed);
+        assert!(ensure_decoder_layout(Some(&malformed), &malformed_decoder).is_err());
+        assert!(ensure_decoder_layout(
+            Some(&gen_core::FLUX2_PACKED_LATENT_SPACE),
+            &malformed_decoder,
+        )
+        .is_err());
     }
 }
