@@ -212,8 +212,11 @@ impl Flux2Control {
         validate_admitted_paths(paths, spec)?;
         let loaded_quant = crate::memory_strategy::resolved_quant(spec)
             .map_err(|error| CandleError::Msg(error.to_string()))?;
-        let contract = crate::memory_strategy::provider_contract(spec)
-            .map_err(|error| CandleError::Msg(error.to_string()))?;
+        let contract = crate::memory_strategy::composed_provider_contract_for(
+            crate::config::FLUX2_DEV_ID,
+            spec,
+        )
+        .map_err(|error| CandleError::Msg(error.to_string()))?;
         crate::memory_strategy::validate_context(&contract, context, loaded_quant)
             .map_err(|error| CandleError::Msg(error.to_string()))?;
         if quant.is_some() && quant != loaded_quant {
@@ -684,7 +687,11 @@ mod tests {
             "/control.safetensors",
         )));
         spec.load_shape = candle_gen::gen_core::LoadShape::DeferredMaterialization;
-        let contract = crate::memory_strategy::provider_contract(&spec).unwrap();
+        let contract = crate::memory_strategy::composed_provider_contract_for(
+            crate::config::FLUX2_DEV_ID,
+            &spec,
+        )
+        .unwrap();
         candle_gen::gen_core::standard_memory_behavior_context(
             &contract,
             candle_gen::gen_core::MemoryStrategy::BoundedDecode,

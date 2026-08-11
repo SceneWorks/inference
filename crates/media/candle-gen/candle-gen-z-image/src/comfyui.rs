@@ -46,7 +46,6 @@ pub(crate) struct ComfyuiSources {
     pub weights: ComfyuiWeights,
     /// Directory containing `tokenizer/tokenizer.json` (our shipped Z-Image snapshot).
     pub tokenizer_dir: PathBuf,
-    pins: Vec<candle_gen::gen_core::PinnedWeightsFile>,
 }
 
 impl ComfyuiSources {
@@ -56,18 +55,13 @@ impl ComfyuiSources {
         vae_file: PathBuf,
         tokenizer_dir: PathBuf,
     ) -> candle_gen::gen_core::Result<Self> {
-        let pins = [&transformer_file, &text_encoder_file, &vae_file]
-            .into_iter()
-            .map(candle_gen::gen_core::PinnedWeightsFile::pin)
-            .collect::<candle_gen::gen_core::Result<Vec<_>>>()?;
         Ok(Self {
-            weights: ComfyuiWeights::Separate {
-                transformer_file,
-                text_encoder_file,
-                vae_file,
-            },
+            weights: ComfyuiWeights::Separate(Box::new(SeparateComfyuiWeights {
+                transformer_file: candle_gen::gen_core::PinnedWeightsFile::pin(transformer_file)?,
+                text_encoder_file: candle_gen::gen_core::PinnedWeightsFile::pin(text_encoder_file)?,
+                vae_file: candle_gen::gen_core::PinnedWeightsFile::pin(vae_file)?,
+            })),
             tokenizer_dir,
-            pins,
         })
     }
 
@@ -75,71 +69,110 @@ impl ComfyuiSources {
         checkpoint_file: PathBuf,
         tokenizer_dir: PathBuf,
     ) -> candle_gen::gen_core::Result<Self> {
-        let pin = candle_gen::gen_core::PinnedWeightsFile::pin(&checkpoint_file)?;
         Ok(Self {
-            weights: ComfyuiWeights::Combined(checkpoint_file),
+            weights: ComfyuiWeights::Combined(candle_gen::gen_core::PinnedWeightsFile::pin(
+                checkpoint_file,
+            )?),
             tokenizer_dir,
-            pins: vec![pin],
         })
     }
 
     pub(crate) fn ensure_unchanged(&self) -> Result<()> {
-        self.pins
-            .iter()
-            .try_for_each(|pin| pin.ensure_unchanged().map_err(Into::into))
+        match &self.weights {
+            ComfyuiWeights::Separate(files) => [
+                &files.transformer_file,
+                &files.text_encoder_file,
+                &files.vae_file,
+            ]
+            .into_iter()
+            .try_for_each(|pin| pin.ensure_unchanged().map_err(Into::into)),
+            ComfyuiWeights::Combined(file) => file.ensure_unchanged().map_err(Into::into),
+        }
     }
 
     pub(crate) fn transformer_map(&self) -> Result<HashMap<String, Tensor>> {
         self.ensure_unchanged()?;
         match &self.weights {
-            ComfyuiWeights::Separate {
-                transformer_file, ..
-            } => Ok(safetensors::load(transformer_file, &Device::Cpu)?),
-            ComfyuiWeights::Combined(file) => {
-                Ok(split_combined_checkpoint(safetensors::load(file, &Device::Cpu)?)?.transformer)
-            }
+            ComfyuiWeights::Separate(files) => files
+                .transformer_file
+                .read_unchanged(|path| Ok(safetensors::load(path, &Device::Cpu)?)),
+            ComfyuiWeights::Combined(file) => file.read_unchanged(|path| {
+                Ok(split_combined_checkpoint(safetensors::load(path, &Device::Cpu)?)?.transformer)
+            }),
         }
     }
 
     pub(crate) fn text_encoder_map(&self) -> Result<HashMap<String, Tensor>> {
         self.ensure_unchanged()?;
         match &self.weights {
-            ComfyuiWeights::Separate {
-                text_encoder_file, ..
-            } => Ok(safetensors::load(text_encoder_file, &Device::Cpu)?),
-            ComfyuiWeights::Combined(file) => {
-                Ok(split_combined_checkpoint(safetensors::load(file, &Device::Cpu)?)?.text_encoder)
-            }
+            ComfyuiWeights::Separate(files) => files
+                .text_encoder_file
+                .read_unchanged(|path| Ok(safetensors::load(path, &Device::Cpu)?)),
+            ComfyuiWeights::Combined(file) => file.read_unchanged(|path| {
+                Ok(split_combined_checkpoint(safetensors::load(path, &Device::Cpu)?)?.text_encoder)
+            }),
         }
     }
 
     pub(crate) fn vae_map(&self) -> Result<HashMap<String, Tensor>> {
         self.ensure_unchanged()?;
         match &self.weights {
-            ComfyuiWeights::Separate { vae_file, .. } => {
-                Ok(safetensors::load(vae_file, &Device::Cpu)?)
-            }
-            ComfyuiWeights::Combined(file) => {
-                Ok(split_combined_checkpoint(safetensors::load(file, &Device::Cpu)?)?.vae)
-            }
+            ComfyuiWeights::Separate(files) => files
+                .vae_file
+                .read_unchanged(|path| Ok(safetensors::load(path, &Device::Cpu)?)),
+            ComfyuiWeights::Combined(file) => file.read_unchanged(|path| {
+                Ok(split_combined_checkpoint(safetensors::load(path, &Device::Cpu)?)?.vae)
+            }),
         }
     }
 }
 
 #[derive(Clone, Debug)]
 pub(crate) enum ComfyuiWeights {
-    Separate {
-        transformer_file: PathBuf,
-        text_encoder_file: PathBuf,
-        vae_file: PathBuf,
-    },
-    Combined(PathBuf),
+    Separate(Box<SeparateComfyuiWeights>),
+    Combined(candle_gen::gen_core::PinnedWeightsFile),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SeparateComfyuiWeights {
+    transformer_file: candle_gen::gen_core::PinnedWeightsFile,
+    text_encoder_file: candle_gen::gen_core::PinnedWeightsFile,
+    vae_file: candle_gen::gen_core::PinnedWeightsFile,
 }
 
 pub(crate) struct ComponentMaps {
     pub transformer: HashMap<String, Tensor>,
     pub text_encoder: HashMap<String, Tensor>,
     pub vae: HashMap<String, Tensor>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CombinedComponent {
+    Transformer,
+    TextEncoder,
+    Vae,
+}
+
+/// Classify one fused-checkpoint key through the exact prefix inventory used by the real loader.
+/// Memory phase facts call this same seam, so accounting cannot assign a tensor to a different phase
+/// than [`split_combined_checkpoint`] later loads it into.
+pub(crate) fn combined_component_key(key: &str) -> Option<(CombinedComponent, &str)> {
+    if let Some(rest) = key
+        .strip_prefix("model.diffusion_model.")
+        .or_else(|| key.strip_prefix("transformer."))
+    {
+        Some((CombinedComponent::Transformer, rest))
+    } else if let Some(rest) = key
+        .strip_prefix("conditioner.embedders.0.transformer.")
+        .or_else(|| key.strip_prefix("text_encoders.qwen3_4b.transformer."))
+        .or_else(|| key.strip_prefix("text_encoder."))
+    {
+        Some((CombinedComponent::TextEncoder, rest))
+    } else {
+        key.strip_prefix("first_stage_model.")
+            .or_else(|| key.strip_prefix("vae."))
+            .map(|rest| (CombinedComponent::Vae, rest))
+    }
 }
 
 /// Split a fused community checkpoint into the three Z-Image component maps.
@@ -153,35 +186,24 @@ pub(crate) fn split_combined_checkpoint(src: HashMap<String, Tensor>) -> Result<
     let mut text_encoder = HashMap::new();
     let mut vae = HashMap::new();
     for (key, tensor) in src {
-        let target = if let Some(rest) = key
-            .strip_prefix("model.diffusion_model.")
-            .or_else(|| key.strip_prefix("transformer."))
-        {
-            Some(("transformer", rest, &mut transformer))
-        } else if let Some(rest) = key
-            .strip_prefix("conditioner.embedders.0.transformer.")
-            .or_else(|| key.strip_prefix("text_encoders.qwen3_4b.transformer."))
-            .or_else(|| key.strip_prefix("text_encoder."))
-        {
-            Some(("text encoder", rest, &mut text_encoder))
-        } else {
-            key.strip_prefix("first_stage_model.")
-                .or_else(|| key.strip_prefix("vae."))
-                .map(|rest| ("VAE", rest, &mut vae))
-        };
-        let Some((component, mapped, map)) = target else {
+        let Some((component, mapped)) = combined_component_key(&key) else {
             return Err(CandleError::Msg(format!(
                 "z-image combined checkpoint tensor {key:?} has no component mapping"
             )));
         };
+        let (component_name, map) = match component {
+            CombinedComponent::Transformer => ("transformer", &mut transformer),
+            CombinedComponent::TextEncoder => ("text encoder", &mut text_encoder),
+            CombinedComponent::Vae => ("VAE", &mut vae),
+        };
         if mapped.is_empty() {
             return Err(CandleError::Msg(format!(
-                "z-image combined checkpoint tensor {key:?} maps to an empty {component} key"
+                "z-image combined checkpoint tensor {key:?} maps to an empty {component_name} key"
             )));
         }
         if map.insert(mapped.to_owned(), tensor).is_some() {
             return Err(CandleError::Msg(format!(
-                "z-image combined checkpoint tensor {key:?} collides at {component} key {mapped:?}"
+                "z-image combined checkpoint tensor {key:?} collides at {component_name} key {mapped:?}"
             )));
         }
     }

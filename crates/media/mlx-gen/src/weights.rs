@@ -48,6 +48,28 @@ impl Weights {
         })
     }
 
+    /// Evaluate every retained array before a mutation-sensitive source read is considered complete.
+    ///
+    /// MLX safetensors loads and the remap/cast operations layered on top of them are lazy. A caller
+    /// that only constructs a [`Weights`] value inside `PinnedWeightsFile::read_unchanged` would
+    /// otherwise run the post-read fingerprint check before the file-backed graph had consumed its
+    /// payload. Provider loaders call this after their final normalization so both source arrays and
+    /// derived casts/dequantizations are materialized while the pin guard is still active.
+    pub fn materialize(&self) -> Result<()> {
+        mlx_rs::transforms::eval(self.tensors.values())?;
+        Ok(())
+    }
+
+    /// Evaluate only tensors read through [`Self::get`] / [`Self::require`] since the last drain.
+    /// Block-window loaders use this before [`Self::remove_accessed`] so the source bytes for the
+    /// current window are consumed under its immutable-file guard without evaluating the rest of the
+    /// checkpoint and defeating bounded residency.
+    pub fn materialize_accessed(&self) -> Result<()> {
+        let accessed = self.accessed.borrow();
+        mlx_rs::transforms::eval(accessed.iter().filter_map(|key| self.tensors.get(key)))?;
+        Ok(())
+    }
+
     /// Load a safetensors file while decoding `F8_E4M3` payloads to bf16.
     ///
     /// MLX has no fp8 storage dtype, but does expose byte-accurate E4M3

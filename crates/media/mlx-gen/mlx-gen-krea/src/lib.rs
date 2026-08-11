@@ -226,6 +226,167 @@ mod explicit_registry_tests {
     }
 
     #[test]
+    fn every_registered_file_route_has_load_footprint_and_memory_contract_parity() {
+        use mlx_gen::gen_core::{MemoryStrategy, MemoryStrategySupport};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = super::provider_registry().unwrap();
+        let base = snapshot(&tmp, "registry-file-matrix");
+        let dit = tmp.path().join("imported.safetensors");
+        let control = tmp.path().join("control.safetensors");
+        write_minimal_safetensors(&dit);
+        write_minimal_safetensors(&control);
+        let base_spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::File(dit.clone()))
+            .with_component(
+                mlx_gen::BASE_SNAPSHOT_COMPONENT,
+                mlx_gen::WeightsSource::Dir(base.clone()),
+            )
+            .with_offload_policy(mlx_gen::OffloadPolicy::Sequential)
+            .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization);
+
+        for id in [
+            "krea_2_turbo",
+            "krea_2_raw",
+            "krea_2_edit",
+            "krea_2_turbo_edit",
+        ] {
+            let footprint = registry
+                .footprint(id, &base_spec)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{id} must expose a footprint"));
+            assert_eq!(
+                footprint,
+                mlx_gen::PerComponentBytes {
+                    text_encoder: mlx_gen::safetensors_path_bytes(base.join("text_encoder")),
+                    dit: mlx_gen::safetensors_path_bytes(&dit),
+                    vae: mlx_gen::safetensors_path_bytes(base.join("vae")),
+                },
+                "{id}"
+            );
+            let contract = registry
+                .memory_strategy_contract(id, &base_spec)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{id} must expose a memory contract"));
+            assert_eq!(contract.provider_id, id);
+            assert_eq!(contract.asset_facts.transformer_bytes, 2, "{id}");
+            assert_eq!(
+                contract
+                    .capability(MemoryStrategy::BoundedTransformerResidency)
+                    .unwrap()
+                    .support,
+                MemoryStrategySupport::Missing,
+                "{id}"
+            );
+            let loaded = registry.load(id, &base_spec).unwrap_or_else(|error| {
+                panic!("{id} File load must agree with its public contracts: {error}")
+            });
+            assert_eq!(
+                loaded
+                    .memory_strategy_contract()
+                    .expect("loaded File generator memory contract")
+                    .capability(MemoryStrategy::BoundedTransformerResidency)
+                    .unwrap()
+                    .support,
+                MemoryStrategySupport::Missing,
+                "{id} loaded File generator must keep the unpromoted rung eager"
+            );
+        }
+
+        let control_spec = base_spec
+            .clone()
+            .with_control(mlx_gen::WeightsSource::File(control));
+        let id = "krea_2_turbo_control";
+        assert!(registry.footprint(id, &control_spec).unwrap().is_some());
+        let contract = registry
+            .memory_strategy_contract(id, &control_spec)
+            .unwrap()
+            .expect("control memory contract");
+        assert_eq!(contract.provider_id, id);
+        assert!(contract.asset_facts.overlay_bytes > 0);
+        let loaded = registry
+            .load(id, &control_spec)
+            .expect("control File load must agree with its public contracts");
+        assert_eq!(
+            loaded
+                .memory_strategy_contract()
+                .expect("loaded control File generator memory contract")
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .support,
+            MemoryStrategySupport::Missing
+        );
+    }
+
+    #[test]
+    fn every_registered_file_route_rejects_unrealized_typed_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = super::provider_registry().unwrap();
+        let base = snapshot(&tmp, "registry-file-typed-fields");
+        let dit = tmp.path().join("imported.safetensors");
+        let control = tmp.path().join("control.safetensors");
+        write_minimal_safetensors(&dit);
+        write_minimal_safetensors(&control);
+        let base_spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::File(dit))
+            .with_component(
+                mlx_gen::BASE_SNAPSHOT_COMPONENT,
+                mlx_gen::WeightsSource::Dir(base),
+            )
+            .with_offload_policy(mlx_gen::OffloadPolicy::Sequential);
+
+        for id in [
+            "krea_2_turbo",
+            "krea_2_raw",
+            "krea_2_edit",
+            "krea_2_turbo_edit",
+            "krea_2_turbo_control",
+        ] {
+            let route_spec = if id == "krea_2_turbo_control" {
+                base_spec
+                    .clone()
+                    .with_control(mlx_gen::WeightsSource::File(control.clone()))
+            } else {
+                base_spec.clone()
+            };
+
+            let mut identity = route_spec.clone();
+            identity.identity = Some(mlx_gen::IdentityWeights::default());
+            let error = registry
+                .load(id, &identity)
+                .err()
+                .expect("identity field must be rejected")
+                .to_string();
+            assert!(error.contains("identity"), "{id}: {error}");
+            let contract_error = registry
+                .memory_strategy_contract(id, &identity)
+                .expect_err("identity field must be rejected by the memory contract")
+                .to_string();
+            assert!(
+                contract_error.contains("identity"),
+                "{id}: {contract_error}"
+            );
+
+            let mut text_encoder = route_spec;
+            text_encoder.text_encoder = Some(mlx_gen::WeightsSource::File(
+                tmp.path().join("external-te.safetensors"),
+            ));
+            let error = registry
+                .load(id, &text_encoder)
+                .err()
+                .expect("text_encoder field must be rejected")
+                .to_string();
+            assert!(error.contains("text-encoder"), "{id}: {error}");
+            let contract_error = registry
+                .memory_strategy_contract(id, &text_encoder)
+                .expect_err("text_encoder field must be rejected by the memory contract")
+                .to_string();
+            assert!(
+                contract_error.contains("text-encoder"),
+                "{id}: {contract_error}"
+            );
+        }
+    }
+
+    #[test]
     fn explicit_catalog_has_stable_surface() {
         let tmp = tempfile::tempdir().unwrap();
         let registry = super::provider_registry().unwrap();

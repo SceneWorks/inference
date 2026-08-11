@@ -101,6 +101,14 @@ pub fn memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> CoreResult<MemoryProviderContract> {
+    if matches!(spec.weights, WeightsSource::File(_)) {
+        crate::model::validate_native_krea_spec(spec, provider_id)
+            .map_err(|error| CoreError::Msg(error.to_string()))?;
+        let base = mlx_gen::require_base_snapshot(spec, provider_id)?;
+        // The native loader is retained and smoke-tested as reopenable, but File has no promoted
+        // rung-4 measurement. Keep authorization Missing until source-specific evidence exists.
+        return native_memory_strategy_contract_from_spec(provider_id, spec, base, false);
+    }
     Ok(memory_strategy_contract_with_plan(provider_id, spec)?.0)
 }
 
@@ -281,8 +289,8 @@ fn memory_strategy_contract_with_components(
 /// evidence matrix does not currently have a load-source axis, however. Consequently a published
 /// snapshot (`Dir`) rung-4 cell must not be described as an imported-file measurement merely because
 /// this contract can re-open a pinned `File`; the `File` route needs its own real-path measurement
-/// before release evidence may claim that cell. `streamable` here declares the implemented mechanism,
-/// not evidence that a particular source path was measured.
+/// before release evidence may claim that cell. The lower-level loader may still be reopened for its
+/// story smoke; the public contract must pass `streamable = false` until that evidence exists.
 pub(crate) fn native_memory_strategy_contract_from_spec(
     provider_id: &str,
     spec: &LoadSpec,
@@ -840,6 +848,41 @@ mod tests {
     }
 
     #[test]
+    fn imported_base_component_inventory_rejects_missing_empty_and_corrupt_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, _) = fixture(&tmp);
+        let native = root.join("native.safetensors");
+        write_native_i8_safetensors(&native);
+        let spec = LoadSpec::new(WeightsSource::File(native)).with_component(
+            mlx_gen::BASE_SNAPSHOT_COMPONENT,
+            WeightsSource::Dir(root.clone()),
+        );
+
+        for component in ["text_encoder", "vae"] {
+            let file = root.join(component).join("model.safetensors");
+            for (case, replacement) in [
+                ("empty", Some(Vec::new())),
+                ("corrupt", Some(b"corrupt".to_vec())),
+                ("missing", None),
+            ] {
+                match replacement {
+                    Some(bytes) => std::fs::write(&file, bytes).unwrap(),
+                    None => std::fs::remove_file(&file).unwrap(),
+                }
+                let error = memory_strategy_contract("krea_2_turbo", &spec)
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    error.contains(component) || error.contains("safetensors"),
+                    "{component}/{case}: {error}"
+                );
+                write_minimal_safetensors(&file);
+            }
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn low_rank_overlay_is_admissible_but_dense_diff_patch_is_not() {
         let tmp = tempfile::tempdir().unwrap();
         let (root, mut spec) = fixture(&tmp);
@@ -934,7 +977,7 @@ mod tests {
     }
 
     #[test]
-    fn wrong_loader_shapes_fail_closed_and_registry_file_is_reopenable() {
+    fn file_contract_withholds_rung_four_but_lower_level_loader_remains_reopenable() {
         let tmp = tempfile::tempdir().unwrap();
         let (root, base) = fixture(&tmp);
         let mut resident = base.clone();
@@ -970,7 +1013,89 @@ mod tests {
             MemoryStrategySupport::Implemented,
             "the registry File source is lstat-pinned and reopened for each transformer window"
         );
+        let registered = memory_strategy_contract("krea_2_turbo", &file).unwrap();
+        assert_eq!(
+            registered
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .support,
+            MemoryStrategySupport::Missing,
+            "a reopenable implementation is not authorization without File-specific evidence"
+        );
+        assert!(!registered.lifecycle.transformer_window_materialization);
+        assert!(
+            !crate::model::native_file_streamable(&file),
+            "the registered File builder must not execute its lower-level stream seam before evidence promotion"
+        );
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn imported_file_contract_matches_the_base_loader_for_every_typed_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, _) = fixture(&tmp);
+        let native = root.join("single.safetensors");
+        write_native_i8_safetensors(&native);
+        let valid = LoadSpec::new(WeightsSource::File(native)).with_component(
+            mlx_gen::BASE_SNAPSHOT_COMPONENT,
+            WeightsSource::Dir(root.clone()),
+        );
+
+        let mut precision = valid.clone();
+        precision.precision = Precision::Fp32;
+        let mut control = valid.clone();
+        control.control = Some(WeightsSource::File(root.join("control.safetensors")));
+        let mut extra_control = valid.clone();
+        extra_control
+            .extra_controls
+            .push(WeightsSource::File(root.join("extra-control.safetensors")));
+        let mut ip_adapter = valid.clone();
+        ip_adapter.ip_adapter = Some(WeightsSource::Dir(root.join("ip-adapter")));
+        let mut identity = valid.clone();
+        identity.identity = Some(mlx_gen::gen_core::IdentityWeights::default());
+        let mut text_encoder = valid.clone();
+        text_encoder.text_encoder = Some(WeightsSource::Dir(root.join("external-text")));
+        let mut unknown_component = valid.clone();
+        unknown_component.components.insert(
+            "unknown".into(),
+            WeightsSource::File(root.join("unknown.safetensors")),
+        );
+        let mut missing_base = valid.clone();
+        missing_base.components.clear();
+        let accepted_adapter = valid.clone().with_adapters(vec![AdapterSpec::new(
+            root.join("adapter.safetensors"),
+            1.0,
+            AdapterKind::Lora,
+        )]);
+        let accepted_pid = valid.clone().with_pid(
+            WeightsSource::File(root.join("pid.safetensors")),
+            WeightsSource::Dir(root.join("gemma")),
+        );
+        let accepted_deferred = valid
+            .clone()
+            .with_offload_policy(OffloadPolicy::Sequential)
+            .with_load_shape(LoadShape::DeferredMaterialization);
+
+        for (case, spec, expected) in [
+            ("valid", valid.clone(), true),
+            ("adapter", accepted_adapter, true),
+            ("pid", accepted_pid, true),
+            ("deferred", accepted_deferred, true),
+            ("precision", precision, false),
+            ("quantize", valid.clone().with_quant(Quant::Q4), false),
+            ("control", control, false),
+            ("extra_control", extra_control, false),
+            ("ip_adapter", ip_adapter, false),
+            ("identity", identity, false),
+            ("text_encoder", text_encoder, false),
+            ("unknown_component", unknown_component, false),
+            ("missing_base", missing_base, false),
+        ] {
+            let loader = crate::model::validate_native_krea_spec(&spec, "krea_2_turbo").is_ok();
+            let contract = memory_strategy_contract("krea_2_turbo", &spec).is_ok();
+            assert_eq!(loader, expected, "loader validation for {case}");
+            assert_eq!(contract, loader, "contract/loader parity for {case}");
+        }
     }
 
     #[test]

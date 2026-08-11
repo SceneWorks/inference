@@ -259,13 +259,27 @@ impl Weights {
     pub fn from_native_file(path: &Path, device: &Device, dtype: DType) -> Result<Self> {
         let pinned_source = candle_gen::gen_core::PinnedWeightsFile::pin(path)
             .map_err(|error| Error::Msg(error.to_string()))?;
+        Self::from_pinned_native_file(&pinned_source, device, dtype)
+    }
+
+    /// Open a native Krea file through a caller-owned pin. Registry-backed lazy/sequential loads keep
+    /// this exact pin from generator construction through every later materialization instead of
+    /// re-pinning whatever happens to occupy the path at request time.
+    pub(crate) fn from_pinned_native_file(
+        pinned_source: &candle_gen::gen_core::PinnedWeightsFile,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Self> {
+        pinned_source
+            .ensure_unchanged()
+            .map_err(|error| Error::Msg(error.to_string()))?;
         // SAFETY: read-only mmap of a weight file; the standard candle loading path.
         let st = unsafe { MmapedSafetensors::new(pinned_source.loader_path())? };
         let native_prefix = detect_native_prefix(&st);
         let plain_int8 = validate_plain_int8_tensorwise(&st)?;
-        Ok(Self {
+        let result = Self {
             st,
-            pinned_source: Some(pinned_source),
+            pinned_source: Some(pinned_source.clone()),
             device: device.clone(),
             dtype,
             overlay: HashMap::new(),
@@ -276,7 +290,11 @@ impl Weights {
             convrot: false,
             plain_int8,
             int8: OnceLock::new(),
-        })
+        };
+        pinned_source
+            .ensure_unchanged()
+            .map_err(|error| Error::Msg(error.to_string()))?;
+        Ok(result)
     }
 
     /// Install a pre-built [`Int8Context`] as this weight set's shared handle (sc-12301).
@@ -305,6 +323,22 @@ impl Weights {
             .transpose()
             .map(|_| ())
             .map_err(|error| Error::Msg(error.to_string()))
+    }
+
+    /// Run one actual tensor-consumption/materialization operation under the retained File pin.
+    /// Directory sources have no single entry to pin and execute the operation directly.
+    pub(crate) fn read_source_unchanged<T>(&self, read: impl FnOnce() -> Result<T>) -> Result<T> {
+        let Some(pin) = self.pinned_source.as_ref() else {
+            return read();
+        };
+        pin.ensure_unchanged()
+            .map_err(|error| Error::Msg(error.to_string()))?;
+        let result = read();
+        // Mutation identity is the stronger diagnosis, so retain `read_unchanged` semantics and let
+        // the post-consumption pin failure win even if materialization also failed.
+        pin.ensure_unchanged()
+            .map_err(|error| Error::Msg(error.to_string()))?;
+        result
     }
 
     /// The **one** [`Int8Context`] every INT8-ConvRot projection from this weight set shares (sc-12301),
@@ -1184,6 +1218,8 @@ mod tests {
     use candle_gen::candle_core::safetensors;
     use candle_gen::candle_nn::Module;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Barrier};
 
     /// The Krea MLX tier's group size (64) — the one carried from `config.json`.
     const G: usize = 64;
@@ -1231,6 +1267,105 @@ mod tests {
             serde_json::json!({ "hidden_size": 6144 })
         };
         std::fs::write(dir.join("config.json"), cfg.to_string()).unwrap();
+    }
+
+    /// Replace `target` while a provider has the original file mapped. Unix can exercise the exact
+    /// production failure mode with an atomic rename: the open mmap keeps consuming the original
+    /// inode while the selected path names a new one. Other platforms overwrite an identically shaped
+    /// safetensors payload so the test remains compilable/runnable without relying on Unix rename
+    /// semantics; the retained fingerprint still has to reject that mutation.
+    fn replace_mapped_fixture(replacement: &Path, target: &Path) {
+        #[cfg(unix)]
+        std::fs::rename(replacement, target).expect("atomically replace mapped source");
+        #[cfg(not(unix))]
+        {
+            let bytes = std::fs::read(replacement).expect("read replacement fixture");
+            std::fs::write(target, bytes).expect("overwrite mapped source");
+        }
+    }
+
+    /// The Krea File loader's guard must end only after Candle has copied the last requested tensor
+    /// out of the retained mmap (and synchronized any asynchronous device transfer). A pre-only check
+    /// would let this barrier-controlled replacement return a mixed-provenance materialization.
+    #[test]
+    fn file_pin_postchecks_after_actual_krea_tensor_materialization() -> Result<()> {
+        let dev = Device::Cpu;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let source = dir.path().join("krea.safetensors");
+        let replacement = dir.path().join("krea.replacement.safetensors");
+        let elements = 64 * 1024;
+
+        safetensors::save(
+            &HashMap::from([
+                (
+                    "phase.first".to_owned(),
+                    Tensor::from_vec(vec![0.25_f32; elements], elements, &dev)?,
+                ),
+                (
+                    "phase.last".to_owned(),
+                    Tensor::from_vec(vec![0.75_f32; elements], elements, &dev)?,
+                ),
+            ]),
+            &source,
+        )?;
+        safetensors::save(
+            &HashMap::from([
+                (
+                    "phase.first".to_owned(),
+                    Tensor::from_vec(vec![-0.25_f32; elements], elements, &dev)?,
+                ),
+                (
+                    "phase.last".to_owned(),
+                    Tensor::from_vec(vec![-0.75_f32; elements], elements, &dev)?,
+                ),
+            ]),
+            &replacement,
+        )?;
+
+        let weights = Weights::from_file(&source, &dev, DType::F32)?;
+        let first_consumed = Arc::new(Barrier::new(2));
+        let replacement_done = Arc::new(Barrier::new(2));
+        let last_consumed = Arc::new(AtomicBool::new(false));
+
+        let writer_source = source.clone();
+        let writer_replacement = replacement.clone();
+        let writer_first = Arc::clone(&first_consumed);
+        let writer_done = Arc::clone(&replacement_done);
+        let writer = std::thread::spawn(move || {
+            writer_first.wait();
+            replace_mapped_fixture(&writer_replacement, &writer_source);
+            writer_done.wait();
+        });
+
+        let consumed = Arc::clone(&last_consumed);
+        let error = match weights.read_source_unchanged(|| {
+            let first = weights.get("phase.first")?.to_vec1::<f32>()?;
+            assert!(first.iter().all(|value| *value == 0.25));
+            first_consumed.wait();
+            replacement_done.wait();
+
+            // This is an actual Krea provider `Weights::get`, not a raw File read. Converting the
+            // tensor to a Vec forces CPU payload consumption; synchronize is the same final boundary
+            // the CUDA loader uses before allowing the pin's post-check to run.
+            let last = weights.get("phase.last")?.to_vec1::<f32>()?;
+            assert_eq!(last.len(), elements);
+            dev.synchronize()?;
+            consumed.store(true, Ordering::SeqCst);
+            Ok(())
+        }) {
+            Ok(()) => {
+                panic!("replacement during materialization must invalidate the Krea file pin")
+            }
+            Err(error) => error.to_string(),
+        };
+        writer.join().expect("replacement writer");
+
+        assert!(
+            last_consumed.load(Ordering::SeqCst),
+            "the provider must consume the final tensor before the post-check rejects the mutation"
+        );
+        assert!(error.contains("changed after load"), "unexpected: {error}");
+        Ok(())
     }
 
     fn cosine(a: &Tensor, b: &Tensor) -> f64 {

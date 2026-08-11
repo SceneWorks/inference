@@ -223,6 +223,9 @@ pub struct Krea {
     precision: Precision,
     quant: Option<Quant>,
     streamable_transformer: bool,
+    /// The constructor-time pin for an imported File route. Sequential/lazy loader closures retain a
+    /// clone of this same identity; keeping it on the generator makes that lifetime explicit.
+    _native_dit: Option<mlx_gen::PinnedWeightsFile>,
     /// Component-residency strategy (epic 10834 Phase 1, sc-11101; hoisted to the shared seam in
     /// sc-11125), selected from [`LoadSpec::offload_policy`]. `Resident` (default) holds the Qwen3-VL-4B
     /// text phase + DiT + VAE warm for the whole job and across jobs; `Sequential` holds only the
@@ -382,7 +385,7 @@ pub(crate) fn build_native_krea(
             WeightsSource::Dir(base_snapshot_dir.to_path_buf()),
         )
         .with_adapters(adapters.to_vec());
-    build_native_krea_from_spec(&spec, dit_file, descriptor)
+    build_native_krea_from_spec(&spec, descriptor)
 }
 
 /// Shared loader behind [`load`] / [`load_raw`] / [`load_edit`]: build the residency from a snapshot
@@ -392,10 +395,8 @@ pub(crate) fn build_native_krea(
 /// ([`load_krea_text`] / [`load_krea_heavy`]), so the components are byte-identical. `descriptor`
 /// selects the variant (Turbo vs Raw vs edit) the returned [`Krea`] renders.
 fn load_variant(spec: &LoadSpec, descriptor: ModelDescriptor) -> Result<Box<dyn Generator>> {
-    if let WeightsSource::File(dit_file) = &spec.weights {
-        return Ok(Box::new(build_native_krea_from_spec(
-            spec, dit_file, descriptor,
-        )?));
+    if matches!(spec.weights, WeightsSource::File(_)) {
+        return Ok(Box::new(build_native_krea_from_spec(spec, descriptor)?));
     }
     let (memory_strategy, load_plan) =
         crate::block_memory_strategy::memory_strategy_contract_with_plan(descriptor.id, spec)?;
@@ -406,56 +407,75 @@ fn load_variant(spec: &LoadSpec, descriptor: ModelDescriptor) -> Result<Box<dyn 
         precision: spec.precision,
         quant: load_plan.effective_quant,
         streamable_transformer: load_plan.streamable_transformer,
+        _native_dit: None,
         residency,
         adapters: spec.adapters.clone(),
         has_diff_patch: adapters_have_diff_patch(&spec.adapters),
     }))
 }
 
-fn build_native_krea_from_spec(
-    spec: &LoadSpec,
-    dit_file: &Path,
-    descriptor: ModelDescriptor,
-) -> Result<Krea> {
-    mlx_gen::gen_core::reject_unknown_components(spec, &[BASE_SNAPSHOT_COMPONENT], descriptor.id)?;
+pub(crate) fn validate_native_krea_spec(spec: &LoadSpec, provider_id: &str) -> Result<()> {
+    mlx_gen::gen_core::reject_unknown_components(spec, &[BASE_SNAPSHOT_COMPONENT], provider_id)?;
     if spec.precision != Precision::Bf16 {
         return Err(Error::Msg(format!(
             "{}: only the default dense precision is wired (drop the precision override)",
-            descriptor.id
+            provider_id
         )));
     }
     if spec.quantize.is_some() {
         return Err(Error::Unsupported(format!(
             "{}: an imported native single-file DiT carries its own numeric format; an additional \
              LoadSpec::quantize request is not supported",
-            descriptor.id
+            provider_id
         )));
     }
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
         return Err(Error::Unsupported(format!(
             "{}: the base single-file provider does not accept control/IP-adapter overlays",
-            descriptor.id
+            provider_id
         )));
     }
+    if spec.identity.is_some() || spec.text_encoder.is_some() {
+        return Err(Error::Unsupported(format!(
+            "{}: imported single-file weights do not accept identity or external text-encoder fields",
+            provider_id
+        )));
+    }
+    let _ = mlx_gen::gen_core::require_base_snapshot(spec, provider_id)?;
+    Ok(())
+}
+
+fn build_native_krea_from_spec(spec: &LoadSpec, descriptor: ModelDescriptor) -> Result<Krea> {
+    validate_native_krea_spec(spec, descriptor.id)?;
     let base = mlx_gen::gen_core::require_base_snapshot(spec, descriptor.id)?;
-    let streamable = matches!(spec.offload_policy, mlx_gen::OffloadPolicy::Sequential)
-        && matches!(spec.load_shape, mlx_gen::LoadShape::DeferredMaterialization)
-        && !adapters_have_diff_patch(&spec.adapters);
-    let memory_strategy = crate::block_memory_strategy::native_memory_strategy_contract_from_spec(
-        descriptor.id,
-        spec,
-        base,
-        streamable,
-    )?;
+    let WeightsSource::File(dit_file) = &spec.weights else {
+        unreachable!("native builder is called only for File weights")
+    };
+    let native_dit = mlx_gen::PinnedWeightsFile::pin(dit_file)?;
+    let mut pinned_spec = spec.clone();
+    pinned_spec.weights = WeightsSource::File(native_dit.loader_path().to_path_buf());
+    // The File is physically reopenable, but the public File contract deliberately withholds rung 4
+    // until that load shape has independent evidence. Keep even a stage-only sequential request eager;
+    // the lower-level pinned stream loader remains available for smoke coverage and future promotion.
+    let reopenable = native_file_streamable(spec);
+    let memory_strategy = native_dit.read_unchanged(|_| {
+        crate::block_memory_strategy::native_memory_strategy_contract_from_spec(
+            descriptor.id,
+            &pinned_spec,
+            base,
+            false,
+        )
+        .map_err(Error::from)
+    })?;
     let text_base = base.to_path_buf();
     let heavy_base = base.to_path_buf();
-    let heavy_dit = dit_file.to_path_buf();
+    let heavy_dit = native_dit.clone();
     let heavy_spec = spec.clone();
     let residency = Residency::from_policy(
         spec.offload_policy,
         move || KreaText::from_snapshot(&text_base),
         move |load_pid| {
-            load_native_krea_heavy(&heavy_spec, &heavy_base, &heavy_dit, streamable, load_pid)
+            load_native_krea_heavy(&heavy_spec, &heavy_base, &heavy_dit, reopenable, load_pid)
         },
     )?;
     Ok(Krea {
@@ -463,23 +483,34 @@ fn build_native_krea_from_spec(
         memory_strategy,
         precision: spec.precision,
         quant: None,
-        streamable_transformer: streamable,
+        // The File loader remains physically reopenable, but only Dir-backed rung-4 cells have
+        // promoted evidence. A hand-built request must therefore not bypass the public contract.
+        streamable_transformer: false,
+        _native_dit: Some(native_dit),
         residency,
         adapters: spec.adapters.clone(),
         has_diff_patch: adapters_have_diff_patch(&spec.adapters),
     })
 }
 
+/// Whether a registered primary-File provider may execute bounded transformer residency. The loader
+/// is physically reopenable, but the evidence matrix has no promoted File cell yet, so this remains
+/// false independently of a request's sequential/deferred shape.
+pub(crate) fn native_file_streamable(_spec: &LoadSpec) -> bool {
+    false
+}
+
 fn load_native_krea_heavy(
     spec: &LoadSpec,
     base: &Path,
-    dit_file: &Path,
+    dit_file: &mlx_gen::PinnedWeightsFile,
     streamable: bool,
     load_pid: bool,
 ) -> Result<KreaHeavyOwned> {
     let cfg = crate::config::Krea2Config::from_snapshot(base)?;
-    let dit =
-        crate::loader::load_transformer_from_native_file_with_stream(dit_file, &cfg, streamable)?;
+    let dit = crate::loader::load_transformer_from_pinned_native_file_with_stream(
+        dit_file, &cfg, streamable,
+    )?;
     let vae = crate::vae::load_vae(base)?;
     let mut heavy = KreaHeavy::from_parts(dit, vae);
     if !spec.adapters.is_empty() {
@@ -1405,12 +1436,22 @@ fn edit_references(req: &GenerationRequest) -> Result<Vec<&Image>> {
 pub(crate) fn component_footprint(
     spec: &mlx_gen::LoadSpec,
 ) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
-    mlx_gen::PerComponentBytes::from_spec_subdirs(
-        spec,
-        &["text_encoder"],
-        &["transformer"],
-        &["vae"],
-    )
+    match &spec.weights {
+        WeightsSource::Dir(_) => mlx_gen::PerComponentBytes::from_spec_subdirs(
+            spec,
+            &["text_encoder"],
+            &["transformer"],
+            &["vae"],
+        ),
+        WeightsSource::File(dit) => {
+            let base = mlx_gen::require_base_snapshot(spec, "krea_2 imported provider")?;
+            Ok(mlx_gen::PerComponentBytes {
+                text_encoder: mlx_gen::safetensors_path_bytes(base.join("text_encoder")),
+                dit: mlx_gen::safetensors_path_bytes(dit),
+                vae: mlx_gen::safetensors_path_bytes(base.join("vae")),
+            })
+        }
+    }
 }
 
 mlx_gen::register_generators! {
@@ -1477,6 +1518,7 @@ mlx_gen::register_generators! {
 mod tests {
     use super::*;
     use mlx_gen::{AdapterKind, AdapterSpec, OffloadPolicy};
+    use std::path::PathBuf;
 
     fn write_minimal_safetensors(path: &Path) {
         let mut header = br#"{"probe":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#.to_vec();
@@ -1501,6 +1543,39 @@ mod tests {
         LoadSpec::new(WeightsSource::File(dit))
             .with_component(BASE_SNAPSHOT_COMPONENT, WeightsSource::Dir(base))
             .with_offload_policy(mlx_gen::OffloadPolicy::Sequential)
+    }
+
+    fn incomplete_native_file_fixture(tmp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+        let base = tmp.path().join("incomplete-base");
+        std::fs::create_dir_all(base.join("transformer")).expect("create transformer config dir");
+        std::fs::write(base.join("transformer/config.json"), "{}")
+            .expect("write parseable transformer config");
+        let dit = tmp.path().join("native-dit.safetensors");
+        write_minimal_safetensors(&dit);
+        (dit, base)
+    }
+
+    #[test]
+    fn sequential_native_generator_retains_the_constructor_pin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut spec = complete_native_file_spec(&tmp);
+        spec.load_shape = mlx_gen::LoadShape::DeferredMaterialization;
+        let native = match &spec.weights {
+            WeightsSource::File(path) => path.clone(),
+            WeightsSource::Dir(_) => unreachable!(),
+        };
+        let model = build_native_krea_from_spec(&spec, descriptor()).unwrap();
+        let pin = model
+            ._native_dit
+            .expect("native generator must retain its pin");
+        assert_eq!(pin.loader_path(), std::path::absolute(&native).unwrap());
+
+        std::fs::write(&native, b"replacement after construction").unwrap();
+        let error = pin
+            .ensure_unchanged()
+            .expect_err("sequential reopen must reject a replacement")
+            .to_string();
+        assert!(error.contains("changed after load"), "{error}");
     }
 
     fn req(w: u32, h: u32) -> GenerationRequest {
@@ -1768,17 +1843,14 @@ mod tests {
     #[test]
     fn native_load_empty_adapters_preserves_load() {
         // sc-14119: an empty adapter slice keeps the native single-file load behaving as it always has —
-        // it still runs the fail-closed base inventory first (and, with a bogus base dir, fails there),
+        // it still runs the fail-closed base inventory first (and, with an incomplete base, fails there),
         // so the new parameter is inert for the t2i/img2img callers that pass `&[]`.
-        let e = load_from_native_dit_file(
-            "/nonexistent-krea/dit.safetensors",
-            "/nonexistent-krea",
-            &[],
-            descriptor(),
-        )
-        .err()
-        .expect("missing base snapshot → err")
-        .to_string();
+        let tmp = tempfile::tempdir().unwrap();
+        let (dit, base) = incomplete_native_file_fixture(&tmp);
+        let e = load_from_native_dit_file(&dit, &base, &[], descriptor())
+            .err()
+            .expect("missing base snapshot → err")
+            .to_string();
         assert!(
             e.contains("native base text encoder asset facts"),
             "expected the missing-base inventory error, got: {e}"
@@ -1788,24 +1860,19 @@ mod tests {
     #[test]
     fn native_load_accepts_adapters_without_early_rejection() {
         // sc-14119: a non-empty adapter slice is threaded through the native loader (parity with the
-        // snapshot `load` path) and must NOT be rejected at the door. With a bogus base the load still
+        // snapshot `load` path) and must NOT be rejected at the door. With an incomplete base the load still
         // fails first at the fail-closed base inventory — the adapter fold
         // (`KreaHeavy::apply_adapters`) is weights-gated and exercised in the #[ignore] real-weight
         // harness below.
-        let adapters = vec![AdapterSpec::new(
-            std::path::PathBuf::from("/nonexistent-krea/krea2_identity_edit.safetensors"),
-            1.0,
-            AdapterKind::Lora,
-        )];
-        let e = load_from_native_dit_file(
-            "/nonexistent-krea/dit.safetensors",
-            "/nonexistent-krea",
-            &adapters,
-            edit_descriptor(),
-        )
-        .err()
-        .expect("missing base snapshot → err")
-        .to_string();
+        let tmp = tempfile::tempdir().unwrap();
+        let (dit, base) = incomplete_native_file_fixture(&tmp);
+        let adapter = tmp.path().join("krea2_identity_edit.safetensors");
+        write_minimal_safetensors(&adapter);
+        let adapters = vec![AdapterSpec::new(adapter, 1.0, AdapterKind::Lora)];
+        let e = load_from_native_dit_file(&dit, &base, &adapters, edit_descriptor())
+            .err()
+            .expect("missing base snapshot → err")
+            .to_string();
         assert!(
             !e.to_lowercase().contains("not yet supported")
                 && !e.to_lowercase().contains("not supported"),
@@ -1820,19 +1887,12 @@ mod tests {
     #[test]
     fn native_load_valid_config_reaches_fail_closed_base_asset_sizing() {
         let root_tmp = tempfile::tempdir().unwrap();
-        let root = root_tmp.path().to_path_buf();
-        std::fs::create_dir_all(root.join("transformer")).unwrap();
-        std::fs::write(root.join("transformer/config.json"), "{}").unwrap();
+        let (dit, root) = incomplete_native_file_fixture(&root_tmp);
 
-        let e = load_from_native_dit_file(
-            root.join("missing-dit.safetensors"),
-            &root,
-            &[],
-            descriptor(),
-        )
-        .err()
-        .expect("missing required base components must fail")
-        .to_string();
+        let e = load_from_native_dit_file(&dit, &root, &[], descriptor())
+            .err()
+            .expect("missing required base components must fail")
+            .to_string();
         assert!(
             e.contains("native base text encoder asset facts"),
             "expected the fail-closed base asset-sizing stage, got: {e}"
