@@ -70,7 +70,7 @@ use candle_gen::gen_core::{
 };
 // Shared per-image batch seed (`base + index`) — one home in `candle-gen` (sc-9043 / F-059).
 use candle_gen::{CandleError, LatentDecoder, Result};
-use candle_gen_pid::{PidDecoder, PidEngine};
+use candle_gen_pid::PidEngine;
 
 /// The PiD backbone (latent-space) tag for SDXL (epic 7840 / sc-7853): SDXL's own `sdxl` VP-frame
 /// student (4× SR). Kolors reuses this crate's decode seam via the same `sdxl` tag (shared VAE).
@@ -980,7 +980,14 @@ impl Pipeline {
             };
 
             on_progress(Progress::Decoding);
-            self.decode(vae, pid_decoder.as_ref(), &latents, &req.cancel)
+            self.decode(
+                vae,
+                pid_decoder
+                    .as_ref()
+                    .map(|decoder| decoder as &dyn LatentDecoder),
+                &latents,
+                &req.cancel,
+            )
         })
     }
 
@@ -1142,14 +1149,26 @@ impl Pipeline {
     fn decode(
         &self,
         vae: &AutoEncoderKL,
-        pid: Option<&PidDecoder>,
+        pid: Option<&dyn LatentDecoder>,
         latents: &Tensor,
         cancel: &CancelFlag,
     ) -> Result<Image> {
         let native = SdxlLatentDecoder::new(vae);
-        let decoder: &dyn LatentDecoder = pid
-            .map(|decoder| decoder as &dyn LatentDecoder)
-            .unwrap_or(&native);
+        self.decode_with_tiling_gate(&native, pid, latents, cancel, crate::vae_tiling_enabled())
+    }
+
+    /// Production SDXL decoder dispatch after the process-global tiling gate is sampled. Kept
+    /// separate from [`Self::decode`] so native/PiD selection, tiled-vs-monolithic routing, and the
+    /// final RGB8 postprocess can be exercised together without constructing a real PiD engine.
+    fn decode_with_tiling_gate(
+        &self,
+        native: &dyn LatentDecoder,
+        pid: Option<&dyn LatentDecoder>,
+        latents: &Tensor,
+        cancel: &CancelFlag,
+        tiling_enabled: bool,
+    ) -> Result<Image> {
+        let decoder = pid.unwrap_or(native);
         if cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
@@ -1157,7 +1176,7 @@ impl Pipeline {
             Some(&candle_gen::gen_core::SDXL_LATENT_SPACE),
             decoder,
         )?;
-        let img = if crate::vae_tiling_enabled() {
+        let img = if tiling_enabled {
             decoder.decode_tiled(latents, &sdxl_tiling_config(), Some(cancel))?
         } else {
             decoder.decode(latents)?
@@ -1353,10 +1372,30 @@ pub(crate) fn snapshot_file(root: &Path, sub: &str) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
 
     struct SdxlDecodeSpy {
         output: Tensor,
+        tiled_output: Tensor,
+        decode_calls: Cell<usize>,
+        tiled_calls: Cell<usize>,
+    }
+
+    impl SdxlDecodeSpy {
+        fn new(output: Tensor, tiled_output: Tensor) -> Self {
+            Self {
+                output,
+                tiled_output,
+                decode_calls: Cell::new(0),
+                tiled_calls: Cell::new(0),
+            }
+        }
+
+        fn same(output: Tensor) -> Self {
+            Self::new(output.clone(), output)
+        }
     }
 
     impl LatentDecoder for SdxlDecodeSpy {
@@ -1365,7 +1404,34 @@ mod tests {
         }
 
         fn decode(&self, _latents: &Tensor) -> Result<Tensor> {
+            self.decode_calls.set(self.decode_calls.get() + 1);
             Ok(self.output.clone())
+        }
+
+        fn decode_tiled(
+            &self,
+            _latents: &Tensor,
+            _tiling: &TilingConfig,
+            cancel: Option<&CancelFlag>,
+        ) -> Result<Tensor> {
+            if cancel.is_some_and(CancelFlag::is_cancelled) {
+                return Err(CandleError::Canceled);
+            }
+            self.tiled_calls.set(self.tiled_calls.get() + 1);
+            Ok(self.tiled_output.clone())
+        }
+    }
+
+    fn decode_test_pipeline(device: &Device) -> Pipeline {
+        Pipeline {
+            config: StableDiffusionConfig::sdxl(None, Some(128), Some(128)),
+            root: PathBuf::from("/nonexistent/sdxl-decode-test"),
+            device: device.clone(),
+            dtype: DType::F32,
+            adapters: vec![],
+            pid_spec: None,
+            vae_fix: WeightsSource::File("/nonexistent/vae.safetensors".into()),
+            ldm: None,
         }
     }
 
@@ -1413,8 +1479,9 @@ mod tests {
     }
 
     /// SC-18309 N1: a real tiny SDXL AutoEncoderKL proves that moving `1 / VAE_SCALE` into the
-    /// native trait adapter leaves the no-override tensor and engine RGB bytes exact. The PiD arm
-    /// uses a distinct geometry to pin override selection and output-layout handling.
+    /// native trait adapter leaves the no-override tensor exact, then traverses the registered
+    /// [`Pipeline::decode`] route for byte-exact RGB parity and PiD selection. Explicit gate arms
+    /// exercise the same production helper's monolithic/tiled dispatch and postprocess.
     #[test]
     fn decoder_seam_preserves_sdxl_default_and_pid_bytes() {
         let device = Device::Cpu;
@@ -1436,15 +1503,36 @@ mod tests {
             "normalization ownership must not change one output bit"
         );
         let expected = legacy_sdxl_image(&vae, &latents);
-        let got = crate::denoise::decode_image(&vae, &latents, None, None).unwrap();
+        let pipeline = decode_test_pipeline(&device);
+        let cancel = CancelFlag::default();
+        let got = pipeline.decode(&vae, None, &latents, &cancel).unwrap();
         assert_eq!(got, expected);
 
-        let pid = SdxlDecodeSpy {
-            output: Tensor::ones((1, 3, 4, 7), DType::F32, &device).unwrap(),
-        };
-        let got = crate::denoise::decode_image(&vae, &latents, Some(&pid), None).unwrap();
+        let pid = SdxlDecodeSpy::same(Tensor::ones((1, 3, 4, 7), DType::F32, &device).unwrap());
+        let got = pipeline
+            .decode(&vae, Some(&pid), &latents, &cancel)
+            .unwrap();
         assert_eq!((got.width, got.height), (7, 4));
         assert!(got.pixels.iter().all(|pixel| *pixel == 255));
+        assert_eq!(pid.decode_calls.get() + pid.tiled_calls.get(), 1);
+
+        let native = SdxlDecodeSpy::new(
+            Tensor::full(-1.0f32, (1, 3, 2, 3), &device).unwrap(),
+            Tensor::ones((1, 3, 2, 3), DType::F32, &device).unwrap(),
+        );
+        let monolithic = pipeline
+            .decode_with_tiling_gate(&native, None, &latents, &cancel, false)
+            .unwrap();
+        assert!(monolithic.pixels.iter().all(|pixel| *pixel == 0));
+        assert_eq!(native.decode_calls.get(), 1);
+        assert_eq!(native.tiled_calls.get(), 0);
+
+        let tiled = pipeline
+            .decode_with_tiling_gate(&native, None, &latents, &cancel, true)
+            .unwrap();
+        assert!(tiled.pixels.iter().all(|pixel| *pixel == 255));
+        assert_eq!(native.decode_calls.get(), 1);
+        assert_eq!(native.tiled_calls.get(), 1);
     }
 
     /// sc-9416: `detect_packed_unet` returns `Some((file, group_size))` for a snapshot whose
