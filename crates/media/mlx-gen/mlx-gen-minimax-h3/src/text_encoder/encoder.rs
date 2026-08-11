@@ -1,6 +1,8 @@
 //! The H3 condition-encoder forward: token embedding → causal Qwen3 decoder layers → the hidden
-//! state at [`SELECT_HIDDEN`](super::SELECT_HIDDEN), with the leading chat-template tokens dropped.
-//! That `[B, L - prefix, 5120]` tensor is the `context` the H3 DiT consumes.
+//! state at [`SELECT_HIDDEN`](super::SELECT_HIDDEN). That `[B, L, 5120]` tensor is the `context`
+//! the H3 DiT consumes, **one row per presentation token, none dropped** — the reference applies no
+//! chat template, so there is no prefix to slice (sc-18741; see
+//! [`APPLIES_CHAT_TEMPLATE`](super::tokenizer::APPLIES_CHAT_TEMPLATE)).
 //!
 //! # The off-by-one, stated once
 //!
@@ -32,7 +34,6 @@ pub struct MiniMaxH3TextEncoder {
     rope: TextRope,
     /// 0-indexed decoder layer whose output is the context (`select_hidden - 1`).
     out_layer: usize,
-    prefix_tokens: i32,
     image_token_id: i32,
     mrope_section: [i32; 3],
     head_dim: i32,
@@ -72,7 +73,6 @@ impl MiniMaxH3TextEncoder {
             layers,
             rope: TextRope::new(cfg.head_dim, cfg.rope_theta),
             out_layer,
-            prefix_tokens: cfg.prefix_tokens as i32,
             image_token_id: cfg.image_token_id,
             mrope_section: cfg.mrope_section,
             head_dim: cfg.head_dim,
@@ -96,7 +96,7 @@ impl MiniMaxH3TextEncoder {
     }
 
     /// Text-only (t2va) conditioning. `input_ids` / `attention_mask`: `[b, s]` int32. Returns the
-    /// DiT context `[b, s - prefix_tokens, hidden]`.
+    /// DiT context `[b, s, hidden]` — one row per presentation token.
     ///
     /// Uses plain 1-D RoPE: with no vision tokens Qwen3-VL's interleaved MRoPE sections all index
     /// the same sequential position, so it reduces exactly to standard RoPE.
@@ -110,23 +110,7 @@ impl MiniMaxH3TextEncoder {
         for layer in &self.layers {
             hidden = layer.forward(&hidden, &cos, &sin, &mask)?;
         }
-        self.trim_prefix(hidden)
-    }
-
-    /// Drop the leading template-prefix tokens. Needs strictly more tokens than the prefix; a
-    /// shorter sequence would otherwise build an empty index and hit an opaque `split_axis` panic.
-    fn trim_prefix(&self, hidden: Array) -> Result<Array> {
-        let n = hidden.shape()[1];
-        if n <= self.prefix_tokens {
-            return Err(Error::Msg(format!(
-                "minimax-h3 text encoder: prompt has {n} token(s), must exceed the {} dropped \
-                 template-prefix tokens",
-                self.prefix_tokens
-            )));
-        }
-        // Contiguous split rather than an arange-gather: MLX's `as_slice` ignores strides, so a
-        // gather round-trip is both slower and stride-fragile.
-        Ok(hidden.split_axis(&[self.prefix_tokens], 1)?.swap_remove(1))
+        Ok(hidden)
     }
 
     /// **Vision-grounded** conditioning (the fl2va / Ref2VA image path): run the encoder with each
@@ -137,7 +121,7 @@ impl MiniMaxH3TextEncoder {
     /// tower's merged `image_embeds` `[nⱼ, hidden]`, (b) additively injects each reference's
     /// `deepstack` feature at those positions for the first `deepstack.len()` layers, and (c) uses
     /// interleaved MRoPE — the image block carries its 2-D merged grid position, text stays
-    /// sequential. Returns the same `[b, s - prefix_tokens, hidden]` context. `b = 1`.
+    /// sequential. Returns the same `[b, s, hidden]` context. `b = 1`.
     pub fn forward_with_images(
         &self,
         input_ids: &Array,
@@ -196,7 +180,7 @@ impl MiniMaxH3TextEncoder {
             }
         }
         let _ = self.out_layer; // the loop runs exactly `out_layer + 1` layers by construction
-        self.trim_prefix(hidden)
+        Ok(hidden)
     }
 }
 

@@ -1,9 +1,18 @@
 //! sc-17143 — committed-fixture parity for the MiniMax-H3 Qwen3-VL-32B context extraction against
 //! the **transformers** `Qwen3VLTextModel` forward (an independent graph), at tiny dims.
 //!
-//! Exercises bias-less GQA, per-head q/k RMSNorm, HF half-split RoPE, the causal mask, the
-//! select-layer capture and the template-prefix slice — the `context` the H3 DiT consumes. The
-//! fixture is produced by `tools/dump_minimax_h3_te.py` and committed, so this runs by default.
+//! Exercises bias-less GQA, per-head q/k RMSNorm, HF half-split RoPE, the causal mask and the
+//! select-layer capture — the `context` the H3 DiT consumes. The fixture is produced by
+//! `tools/dump_minimax_h3_te.py` and committed, so this runs by default.
+//!
+//! # sc-18741 — there is no template-prefix slice
+//!
+//! This file used to assert that the port dropped 3 leading rows. The official conditioner
+//! (`diffusers.modular_pipelines.minimax_h3.encoders.MiniMaxH3TextEncoderStep`) applies **no chat
+//! template and no special tokens**, so the context keeps one row per presentation token. The
+//! `presentation_*` tests below pin the *absence* of the template — including against the exact ids
+//! the old render produced — rather than merely pinning a token count, which a reintroduced
+//! template with a compensating slice could still satisfy.
 //!
 //! The suite is built around the fact that **an off-by-one in the layer selection still produces a
 //! plausible tensor**. Equality against `hidden_states[50]` alone cannot catch it, so the fixture
@@ -15,8 +24,8 @@ use common::{assert_parity, rel, std_dev, te_fixture_config, TE_FIXTURE};
 
 use mlx_gen::weights::Weights;
 use mlx_gen_minimax_h3::{
-    MiniMaxH3TeConfig, MiniMaxH3TextEncoder, MINIMAX_ADDED_SPECIALS, NUM_HIDDEN_LAYERS,
-    SELECT_HIDDEN,
+    MiniMaxH3TeConfig, MiniMaxH3TextEncoder, APPLIES_CHAT_TEMPLATE, MINIMAX_ADDED_SPECIALS,
+    NUM_HIDDEN_LAYERS, SELECT_HIDDEN,
 };
 use mlx_rs::Array;
 
@@ -41,8 +50,7 @@ fn run(w: &Weights, cfg: &MiniMaxH3TeConfig) -> Array {
         .expect("forward")
 }
 
-/// The headline parity gate: the port reproduces the reference's select-layer, prefix-trimmed
-/// context.
+/// The headline parity gate: the port reproduces the reference's select-layer context.
 #[test]
 fn context_matches_the_reference() {
     let w = load();
@@ -154,46 +162,44 @@ fn only_the_selected_layers_are_loaded() {
     );
 }
 
-/// The prefix slice drops exactly `prefix_tokens` leading positions off the selected state — the
-/// trim is checked against the reference's UNtrimmed tensor, so the drop count is pinned
-/// independently of the layer selection.
+/// **sc-18741.** The context keeps ONE ROW PER PRESENTATION TOKEN — nothing is sliced off the
+/// front. The reference conditioner returns `outputs.hidden_states[layer]` whole.
+///
+/// Asserted against the reference tensor's own length rather than a constant, so a slice
+/// reintroduced anywhere in the forward shortens the output and fails here.
 #[test]
-fn prefix_trim_drops_exactly_the_template_tokens() {
+fn context_keeps_every_presentation_row() {
     let w = load();
     let cfg = te_fixture_config();
     let got = run(&w, &cfg);
 
-    let untrimmed = w.require("out.hidden_untrimmed").unwrap();
-    let seq = untrimmed.shape()[1];
+    let seq = w.require("in.input_ids").unwrap().shape()[1];
     assert_eq!(
         got.shape()[1],
-        seq - cfg.prefix_tokens as i32,
-        "trimmed length must be seq - prefix_tokens"
+        seq,
+        "the context must have one row per input token; a shorter context means a prefix slice \
+         came back (sc-18741)"
     );
-
-    let tail = untrimmed
-        .split_axis(&[cfg.prefix_tokens as i32], 1)
-        .unwrap()
-        .swap_remove(1);
-    assert_parity(&got, &tail, TOL, "prefix-trimmed tail");
+    assert_eq!(w.require("out.context").unwrap().shape()[1], seq);
 }
 
-/// Dropping the prefix needs strictly more tokens than `prefix_tokens`; a shorter prompt must be a
-/// typed error, not an opaque `split_axis` panic.
+/// A short prompt must work. Under sc-17143's prefix slice, any prompt of 3 tokens or fewer was a
+/// hard error ("must exceed the 3 dropped template-prefix tokens") — a real capability loss that
+/// fell out of a slice the reference never performs. `MiniMax-H3` prompts like `"东京的夜景"`
+/// tokenize to 4 ids, and `"\ttab start"` to 2.
 #[test]
-fn rejects_prompt_shorter_than_the_prefix() {
+fn short_prompts_are_accepted() {
     let w = load();
-    let cfg = te_fixture_config(); // prefix_tokens = 3
+    let cfg = te_fixture_config();
     let te = encoder(&w, &cfg);
 
-    for s in [1i32, 3] {
+    for s in [1i32, 2, 3] {
         let ids = Array::from_slice(&vec![0i32; s as usize], &[1, s]);
         let mask = Array::from_slice(&vec![1i32; s as usize], &[1, s]);
-        let e = te.forward(&ids, &mask).unwrap_err().to_string();
-        assert!(
-            e.contains("template-prefix"),
-            "expected the prefix-drop guard for s={s}, got: {e}"
-        );
+        let out = te
+            .forward(&ids, &mask)
+            .unwrap_or_else(|e| panic!("{s}-token prompt must encode, got: {e}"));
+        assert_eq!(out.shape(), &[1, s, cfg.hidden_size], "{s}-token context");
     }
 }
 
@@ -289,31 +295,103 @@ fn meta(w: &Weights, key: &str) -> String {
         .to_string()
 }
 
-/// The chat-template prefix constant must equal what the SHIPPED `chat_template.json` actually
-/// renders, and must tokenize to exactly `PREFIX_TOKENS` ids.
+/// **The sc-18741 gate: pin the ABSENCE of template application, not just a token count.**
+///
+/// The fixture metadata carries three id vectors for one probe prompt, all produced against the
+/// real shipped tokenizer:
+///
+/// | key | what it is |
+/// |---|---|
+/// | `presentation_ids` | the official conditioner's `tokenizer(prompt, add_special_tokens=False)` |
+/// | `templated_ids` | sc-17143's `chat_template.json` render of the same prompt |
+/// | `sc17143_ids` | that render with its 3-token prefix dropped — what the port actually fed the DiT |
+///
+/// This asserts the presentation is the first and is neither of the others. A test that only
+/// checked "no rows are dropped" would still pass if a template came back together with a
+/// compensating slice; this cannot.
 #[test]
-fn template_prefix_matches_the_shipped_chat_template() {
+fn presentation_applies_no_chat_template() {
     let w = load();
+    // A compile-time assertion: reintroducing the chat template must not even build.
+    const { assert!(!APPLIES_CHAT_TEMPLATE, "the crate's presentation contract") };
+    assert_eq!(meta(&w, "applies_chat_template"), "false");
+    assert_eq!(meta(&w, "add_special_tokens"), "false");
+
+    let ids =
+        |k: &str| -> Vec<i32> { meta(&w, k).split(',').map(|s| s.parse().unwrap()).collect() };
+    let reference = ids("presentation_ids");
+    let templated = ids("templated_ids");
+    let sc17143 = ids("sc17143_ids");
+
+    // The chat-template render opens with `<|im_start|>user\n` = [151644, 872, 198] and closes with
+    // the 5-token generation cue [151645, 198, 151644, 77091, 198]. The reference presentation has
+    // neither.
     assert_eq!(
-        meta(&w, "prefix_str"),
-        mlx_gen_minimax_h3::text_encoder::PREFIX,
-        "the rendered chat-template prefix disagrees with the constant in this crate"
+        &templated[..3],
+        &[151644, 872, 198],
+        "the template's prefix"
     );
     assert_eq!(
-        meta(&w, "suffix_str"),
-        mlx_gen_minimax_h3::text_encoder::SUFFIX,
-        "the rendered generation cue disagrees with the constant in this crate"
+        &templated[templated.len() - 5..],
+        &[151645, 198, 151644, 77091, 198],
+        "the template's generation cue"
+    );
+    assert_ne!(
+        reference, templated,
+        "the presentation is not the template render"
+    );
+    assert_ne!(
+        reference, sc17143,
+        "the presentation is not the template render with 3 ids sliced off — that was the shipped \
+         behaviour and it is what this test exists to keep out (sc-18741)"
     );
 
-    let ids: Vec<i32> = meta(&w, "prefix_ids")
-        .split(',')
-        .map(|s| s.parse().unwrap())
-        .collect();
-    assert_eq!(ids, vec![151644, 872, 198], "<|im_start|>user\\n");
-    assert_eq!(ids.len(), mlx_gen_minimax_h3::PREFIX_TOKENS);
+    // What the port actually shipped: the prompt PLUS the 5-token generation cue. Slicing 3 removed
+    // the prefix but nothing ever removed the suffix.
     assert_eq!(
-        ids.len(),
-        meta(&w, "prefix_tokens").parse::<usize>().unwrap()
+        sc17143.len(),
+        reference.len() + 5,
+        "sc-17143 conditioned on 5 extra generation-cue rows"
+    );
+    assert_eq!(
+        &sc17143[sc17143.len() - 5..],
+        &[151645, 198, 151644, 77091, 198],
+        "and those 5 rows are chat-turn control tokens, not prompt"
+    );
+    // No special token may appear in the reference presentation at all.
+    for id in &reference {
+        assert!(
+            *id < 151643,
+            "reference presentation contains special token {id}; it is plain text only"
+        );
+    }
+    println!(
+        "presentation {:?}: reference {} ids, sc-17143 emitted {} ids",
+        meta(&w, "probe_prompt"),
+        reference.len(),
+        sc17143.len()
+    );
+}
+
+/// The fixture must record which reference produced which half. A regeneration that reverts to
+/// deriving the presentation from `chat_template.json` writes different provenance and fails here.
+#[test]
+fn fixture_provenance_records_the_official_conditioner() {
+    let w = load();
+    assert_eq!(meta(&w, "provenance"), "official-conditioner");
+    assert_eq!(
+        meta(&w, "tensor_reference"),
+        "transformers.Qwen3VLTextModel"
+    );
+    assert_eq!(
+        meta(&w, "presentation_reference"),
+        "diffusers.MiniMaxH3TextEncoderStep"
+    );
+    println!(
+        "te fixture provenance: tensors from {}, presentation from {} ({})",
+        meta(&w, "tensor_reference"),
+        meta(&w, "presentation_reference"),
+        meta(&w, "reference_version"),
     );
 }
 

@@ -8,8 +8,12 @@ use mlx_rs::Array;
 
 use mlx_gen_minimax_h3::{BigVganConfig, MiniMaxH3AudioVaeConfig, MiniMaxH3VaeConfig};
 
-/// The committed parity fixture, produced by `tools/dump_minimax_h3_video_vae.py` running the
-/// Apache-2.0 reference implementation from the MiniMax-H3 snapshot.
+/// The committed video-VAE parity fixture, produced by `tools/dump_minimax_h3_video_vae.py`
+/// running the **official diffusers** `AutoencoderKLMiniMaxH3` — the converted-checkpoint layout
+/// production loads. It carries the pre-conversion `src.` tensors alongside, so
+/// `video_vae_parity.rs` can assert the committed weights really are in the converted layout
+/// (sc-18740: a fixture dumped from the reference modules through a pure rename made the whole
+/// suite a false green).
 pub const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/video_vae_decode.safetensors"
@@ -28,8 +32,10 @@ pub const AUDIO_FIXTURE: &str = concat!(
 ///
 /// Carries the select-layer context AND both neighbouring layers' contexts, so an off-by-one in
 /// either direction is a failure rather than a plausible-looking tensor. Its safetensors metadata
-/// additionally pins the chat-template prefix and the special-token id map, both derived from the
-/// shipped `chat_template.json` / `tokenizer_config.json` rather than transcribed by hand.
+/// additionally pins the **presentation** — the official conditioner's own
+/// `tokenizer(prompt, add_special_tokens=False)` ids for a probe prompt, alongside the ids
+/// sc-17143's chat-template render produced as an explicit negative control — plus the
+/// special-token id map read from the shipped `tokenizer_config.json`.
 pub const TE_FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/te_context.safetensors"
@@ -50,7 +56,6 @@ pub fn te_fixture_config() -> mlx_gen_minimax_h3::MiniMaxH3TeConfig {
         rope_theta: 5_000_000.0,
         vocab_size: 256,
         select_hidden: 4,
-        prefix_tokens: 3,
         ..mlx_gen_minimax_h3::MiniMaxH3TeConfig::qwen3_vl_32b()
     }
 }
@@ -139,6 +144,48 @@ pub fn rel(a: &Array, b: &Array) -> (f32, f32) {
     let max_d: f32 = diff.max(None).unwrap().item();
     let mean_d: f32 = diff.mean(None).unwrap().item();
     (max_d / peak.max(1e-12), mean_d / mean.max(1e-12))
+}
+
+/// Cosine similarity between two tensors, flattened.
+///
+/// Reported alongside [`rel`] wherever a **layout** error is under test rather than a numeric one.
+/// sc-18740's gate/value half-swap leaves the output norm essentially unchanged (89 vs 85 on real
+/// weights) so magnitude, std and checksum assertions are all blind to it — but it also keeps
+/// cosine at 0.73-0.78 rather than ~0, because `silu(a)·b` and `silu(b)·a` share sign structure.
+/// **Neither metric alone is sufficient**: cosine is scale-invariant and the relative max-abs-diff
+/// is the one that actually exposes the swap, so the tests print both and gate on both.
+pub fn cosine(a: &Array, b: &Array) -> f32 {
+    let a = a
+        .as_dtype(mlx_rs::Dtype::Float32)
+        .unwrap()
+        .flatten(None, None)
+        .unwrap();
+    let b = b
+        .as_dtype(mlx_rs::Dtype::Float32)
+        .unwrap()
+        .flatten(None, None)
+        .unwrap();
+    let dot: f32 = mlx_rs::ops::multiply(&a, &b)
+        .unwrap()
+        .sum(None)
+        .unwrap()
+        .item();
+    let na: f32 = a.square().unwrap().sum(None).unwrap().item::<f32>().sqrt();
+    let nb: f32 = b.square().unwrap().sum(None).unwrap().item::<f32>().sqrt();
+    dot / (na * nb).max(1e-12)
+}
+
+/// L2 norm of a tensor — reported (never asserted on) in the half-swap tests, as the direct
+/// demonstration that magnitude cannot see a layout error.
+pub fn l2_norm(x: &Array) -> f32 {
+    x.as_dtype(mlx_rs::Dtype::Float32)
+        .unwrap()
+        .square()
+        .unwrap()
+        .sum(None)
+        .unwrap()
+        .item::<f32>()
+        .sqrt()
 }
 
 /// Assert `got` matches `want` within the parity tolerance, reporting the actual error.

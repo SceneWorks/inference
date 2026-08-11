@@ -50,7 +50,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen_minimax_h3::audio_vae::{AmpBlock1, BigVgan};
 use mlx_gen_minimax_h3::{
     kaiser_sinc_filter1d, LowPassFilter1d, MiniMaxH3AudioVae, MiniMaxH3AudioVaeConfig, SnakeBeta,
-    UpSample1d,
+    UpSample1d, AUDIO_VAE_IS_UNCONVERTED,
 };
 
 /// Whole-decoder parity. Observed residual is 4.4e-3 — see the module docs for where that comes
@@ -828,5 +828,59 @@ fn latent_denormalization_is_applied_per_channel() {
     assert!(
         peak > MUTATION_FLOOR,
         "decode ignored latents_mean/std ({peak:.3e})"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// sc-18740 — the audio VAE's audit result, pinned
+// ---------------------------------------------------------------------------------------------
+
+/// **The audio VAE carries no conversion transform, and has no fused gated projection to mis-read.**
+///
+/// sc-18740 asked for this to be confirmed by evidence rather than assumed. Three independent
+/// checks, all against upstream sources:
+///
+/// 1. `convert_minimax_h3_to_diffusers.py::convert_audio_vae` states "the mapping is an identity:
+///    `AutoencoderKLMiniMaxH3Audio` reproduces the original module tree name for name". It renames
+///    nothing, transforms nothing, and raises `KeyError` on any key the freshly-built model does
+///    not declare — so a silent addition is impossible, not merely unlikely.
+/// 2. `AutoencoderKLMiniMaxH3Audio` contains no `SwiGLU` / `GEGLU` / `FeedForward` / `chunk(2, …)`
+///    construct anywhere. There is no gated projection in the architecture at all.
+/// 3. Of the 1087 published tensors, the 14 with a 2:1 out:in ratio — the shape signature a fused
+///    gate would have — are all rank-3 `ConvTranspose1d` / `Conv1d` kernels
+///    (`decoder.ups.N.0.weight_v` etc.), where the ratio is the stage's channel doubling. A fused
+///    gated projection is rank-2 `[2·inner, dim]`. None exists here.
+///
+/// This test pins the *consequence*: nothing in the audio decode path splits a projection into
+/// halves, so the ordering hazard `crate::layout` describes cannot apply. If a gated block is ever
+/// added, this fails and whoever adds it has to route it through `layout::split_gate_value`.
+#[test]
+fn audio_decode_path_has_no_fused_gated_projection() {
+    const {
+        assert!(
+            AUDIO_VAE_IS_UNCONVERTED,
+            "the audio VAE's conversion is an identity mapping"
+        )
+    };
+
+    let w = Weights::from_file(AUDIO_FIXTURE).unwrap();
+    let cfg = audio_fixture_config();
+    let names = MiniMaxH3AudioVae::tensor_names(&cfg);
+
+    for name in &names {
+        let Some(t) = w.get(name) else { continue };
+        let shape = t.shape();
+        if shape.len() == 2 && shape[0] == 2 * shape[1] {
+            panic!(
+                "{name} is a rank-2 [2*inner, dim] tensor — the fused-gate shape signature. If the \
+                 audio decoder has grown a gated projection it must read its halves through \
+                 mlx_gen_minimax_h3::layout::split_gate_value, not an ad-hoc slice (sc-18740)."
+            );
+        }
+    }
+    println!(
+        "AUDIO VAE AUDIT: {} declared decode tensors, none a rank-2 fused gated projection; the \
+         official conversion carries every audio key over unchanged",
+        names.len()
     );
 }

@@ -1,10 +1,12 @@
 //! MiniMax-H3's **Qwen3-VL-32B** condition encoder (sc-17143) — the `context` the H3 DiT consumes.
 //!
 //! A 64-layer decoder-only LM whose hidden state after **50** layers is handed to the
-//! H3-Omni-Transformer, with the leading chat-template prefix dropped. Structurally this is the same
-//! trick `mlx-gen-krea` already ships for Qwen3-VL-4B (sc-7569), at 32B and with a **single** select
-//! layer instead of a 12-layer stack — so the DiT context is `[B, L - prefix, 5120]`, not the rank-4
-//! stack Krea produces.
+//! H3-Omni-Transformer. Structurally this is the same trick `mlx-gen-krea` already ships for
+//! Qwen3-VL-4B (sc-7569), at 32B and with a **single** select layer instead of a 12-layer stack —
+//! so the DiT context is `[B, L, 5120]`, not the rank-4 stack Krea produces.
+//!
+//! **Unlike Krea, H3 has no template-prefix slice.** Krea's conditioner does render a template and
+//! drop its prefix; H3's does not, and copying that half of the pattern is what sc-18741 corrects.
 //!
 //! # Provenance: the weights are upstream Qwen, unmodified
 //!
@@ -27,8 +29,9 @@
 //!    layers 50-63 are never run. `tests/te_parity.rs`'s
 //!    `layer_selection_is_off_by_one_safe_in_both_directions` pins it against the reference in both
 //!    directions.
-//! 2. **[`PREFIX_TOKENS`] = 3** is derived by rendering the shipped `chat_template.json`, not
-//!    asserted from the template string in this crate.
+//! 2. **[`APPLIES_CHAT_TEMPLATE`] = false** — the conditioner tokenizes the presentation verbatim
+//!    with `add_special_tokens=False`. No config declares that either; it is a property of the
+//!    reference conditioner, and sc-17143 derived the opposite before that reference existed.
 //! 3. **The seven MiniMax special-token ids are assigned by list ORDER at load time** and appear in
 //!    no vocabulary file. See [`tokenizer`].
 
@@ -43,7 +46,7 @@ pub use encoder::MiniMaxH3TextEncoder;
 pub use layer::Qwen3DecoderLayer;
 pub use mlp::Qwen3Mlp;
 pub use tokenizer::{
-    MiniMaxH3Tokenizer, SpecialTokens, MINIMAX_ADDED_SPECIALS, PREFIX, PREFIX_TOKENS, SUFFIX,
+    MiniMaxH3Tokenizer, SpecialTokens, APPLIES_CHAT_TEMPLATE, MINIMAX_ADDED_SPECIALS,
 };
 
 // The HF half-split text RoPE is identical across families and lives in core.
@@ -96,8 +99,7 @@ pub(crate) const SPATIAL_MERGE: i32 = 2;
 
 /// Qwen3-VL-32B text-tower architecture (verified against the published `text_encoder/config.json`
 /// `text_config`: `qwen3_vl_text`, hidden 5120, 64 layers, GQA 64/8, `head_dim` 128, FFN 25600,
-/// eps 1e-6, θ 5e6) plus the H3 conditioning policy (which hidden state to take, how many
-/// template-prefix tokens to drop).
+/// eps 1e-6, θ 5e6) plus the H3 conditioning policy (which hidden state to take).
 #[derive(Debug, Clone, PartialEq)]
 pub struct MiniMaxH3TeConfig {
     /// `text_config.hidden_size` — 5120, and equal to the DiT's `text_dim`, so the context needs no
@@ -124,8 +126,6 @@ pub struct MiniMaxH3TeConfig {
     pub vocab_size: i32,
     /// The HF `output_hidden_states` index handed to the DiT — [`SELECT_HIDDEN`].
     pub select_hidden: usize,
-    /// Leading chat-template tokens dropped from the conditioning — [`PREFIX_TOKENS`].
-    pub prefix_tokens: usize,
     /// `image_token_id` (top-level, not under `text_config`) — 151655.
     pub image_token_id: i32,
     /// `video_token_id` — 151656. Ref2VA's video references occupy `<|video_pad|>` runs.
@@ -168,7 +168,6 @@ impl MiniMaxH3TeConfig {
             rope_theta: 5_000_000.0,
             vocab_size: 151936,
             select_hidden: SELECT_HIDDEN,
-            prefix_tokens: PREFIX_TOKENS,
             image_token_id: 151655,
             video_token_id: 151656,
             vision_start_token_id: 151652,
@@ -195,8 +194,8 @@ impl MiniMaxH3TeConfig {
     }
 
     /// Parse `<root>/text_encoder/config.json`. Missing scalars fall back to
-    /// [`Self::qwen3_vl_32b`]; `select_hidden` and `prefix_tokens` have no config home at all (see
-    /// the module docs) and always come from the constants.
+    /// [`Self::qwen3_vl_32b`]; `select_hidden` has no config home at all (see the module docs) and
+    /// always comes from the constant.
     pub fn from_snapshot(root: impl AsRef<Path>) -> Result<Self> {
         let path = root.as_ref().join("text_encoder").join("config.json");
         let text = std::fs::read_to_string(&path)
@@ -246,7 +245,6 @@ impl MiniMaxH3TeConfig {
             vocab_size: i32_of(tc, "vocab_size", d.vocab_size),
             // No config file declares either of these. See the module docs.
             select_hidden: d.select_hidden,
-            prefix_tokens: d.prefix_tokens,
             image_token_id: i32_of(&v, "image_token_id", d.image_token_id),
             video_token_id: i32_of(&v, "video_token_id", d.video_token_id),
             vision_start_token_id: i32_of(&v, "vision_start_token_id", d.vision_start_token_id),
@@ -343,9 +341,10 @@ pub fn run_vision(vision: &VisionTower, sources: &[&Image]) -> Result<GroundedVi
     })
 }
 
-/// Build the DiT-consumable grounded context `[1, s - prefix_tokens, hidden]` for one prompt,
-/// reusing a pre-computed [`GroundedVision`]: render the chat template with one `<|image_pad|>`
-/// block per reference, then run [`MiniMaxH3TextEncoder::forward_with_images`].
+/// Build the DiT-consumable grounded context `[1, s, hidden]` for one prompt, reusing a
+/// pre-computed [`GroundedVision`]: build the presentation — a `"<Picture i>: "` label and an
+/// `<|image_pad|>` block per reference, then the prompt verbatim — and run
+/// [`MiniMaxH3TextEncoder::forward_with_images`].
 pub fn encode_grounded_from_vision(
     gv: &GroundedVision,
     tok: &MiniMaxH3Tokenizer,

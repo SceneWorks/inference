@@ -30,6 +30,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
 use crate::config::MiniMaxH3VaeConfig;
+use crate::layout::split_gate_value;
 use crate::rope::{Rope3d, RopeTables};
 use crate::tensor::slice_axis;
 
@@ -137,7 +138,14 @@ impl Attention {
     }
 }
 
-/// SwiGLU feed-forward: `w2( silu(gate) · value )` where `w1` emits `[gate | value]`.
+/// SwiGLU feed-forward: `w2( silu(gate) · value )`.
+///
+/// **The published `ff.net.0.proj` emits `[value | gate]`, so the gate is the SECOND half.** The
+/// original MiniMax module stores `[gate | value]`; `convert_minimax_h3_to_diffusers.py` swaps the
+/// two halves on the way into the released checkpoint. The split is delegated to
+/// [`crate::layout::split_gate_value`] so this crate has exactly one place that knows which half is
+/// which — see that module for the full contract and for why nothing structural can catch getting
+/// it wrong (sc-18740).
 #[derive(Debug, Clone)]
 struct FeedForward {
     w1: Linear,
@@ -160,16 +168,8 @@ impl FeedForward {
 
     fn forward(&self, x: &Array) -> Result<Array> {
         let h = self.w1.forward(x)?;
-        let inner = h.shape()[h.shape().len() - 1];
-        if inner % 2 != 0 {
-            return Err(Error::Msg(format!(
-                "minimax-h3 ffn: gated w1 must emit an even width, got {inner}"
-            )));
-        }
         let axis = (h.shape().len() - 1) as i32;
-        // `chunk(2, dim=-1)` -> the GATE is the FIRST half.
-        let gate = slice_axis(&h, axis, 0, inner / 2)?;
-        let value = slice_axis(&h, axis, inner / 2, inner)?;
+        let (gate, value) = split_gate_value(&h, axis)?;
         self.w2.forward(&multiply(&silu(&gate)?, &value)?)
     }
 }

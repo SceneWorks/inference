@@ -24,8 +24,8 @@ use mlx_rs::{Array, Dtype};
 use mlx_gen::weights::Weights;
 use mlx_gen_minimax_h3::{
     kaiser_sinc_filter1d, MiniMaxH3AudioVae, MiniMaxH3AudioVaeConfig, MiniMaxH3TeConfig,
-    MiniMaxH3TextEncoder, MiniMaxH3Tokenizer, MiniMaxH3VaeConfig, MiniMaxH3VideoVae, LM_PREFIX,
-    MINIMAX_ADDED_SPECIALS, PREFIX_TOKENS, VISION_PREFIX,
+    MiniMaxH3TextEncoder, MiniMaxH3Tokenizer, MiniMaxH3VaeConfig, MiniMaxH3VideoVae,
+    APPLIES_CHAT_TEMPLATE, LM_PREFIX, MINIMAX_ADDED_SPECIALS, VISION_PREFIX,
 };
 
 use common::{snapshot, std_dev};
@@ -170,6 +170,113 @@ fn real_weight_decode_produces_a_plausible_video() {
         "REAL-WEIGHT SMOKE: loaded {loaded} tensors ({load_ms} ms to map + build), decoded {:?} \
          in {decode_ms} ms (std {spread:.4}, max |px| {max:.4}, checksum {checksum:.3e})",
         video.shape()
+    );
+}
+
+/// **The gate sc-17140 was missing** (sc-18740): decode the *same latent* the official diffusers
+/// `AutoencoderKLMiniMaxH3` decoded, from the *same published bytes*, and compare numerically.
+///
+/// Why the smoke above cannot do this job: it asserts `std`, `max |px|` and a checksum that were
+/// recorded **from this port**. Those re-derive whatever the port does — the gate/value half-swap
+/// changed every one of them and the test would simply have been written against the new values.
+/// Reproducing an independent implementation's output on real weights is the only assertion that
+/// can catch a layout error, because layout errors are invisible to shape, magnitude and checksum.
+///
+/// Generate the reference with `tools/dump_minimax_h3_video_vae_real.py` (a few hundred KB,
+/// deliberately not committed) and point `MINIMAX_H3_VIDEO_VAE_REFERENCE` at it. Like every test in
+/// this file it **asserts** rather than skipping, so a missing reference cannot read as a pass.
+#[test]
+#[ignore = "needs a real MiniMax-H3 snapshot + a reference decode (MINIMAX_H3_VIDEO_VAE_REFERENCE)"]
+fn real_weight_decode_matches_the_official_diffusers_vae() {
+    let root = snapshot();
+    let reference_path = std::env::var("MINIMAX_H3_VIDEO_VAE_REFERENCE").unwrap_or_default();
+    assert!(
+        !reference_path.is_empty(),
+        "MINIMAX_H3_VIDEO_VAE_REFERENCE must point at the output of \
+         tools/dump_minimax_h3_video_vae_real.py. This test is #[ignore]d and asserts rather than \
+         skips so a missing reference cannot be mistaken for a pass."
+    );
+    let r = Weights::from_file(&reference_path)
+        .unwrap_or_else(|e| panic!("load {reference_path}: {e}"));
+    assert_eq!(
+        r.metadata("reference").unwrap_or_default(),
+        "diffusers.AutoencoderKLMiniMaxH3",
+        "the reference must come from the official converted-checkpoint class"
+    );
+
+    let dir = root.join("vae");
+    let mut w = Weights::from_dir(&dir).unwrap();
+    let cfg = MiniMaxH3VaeConfig::from_diffusers_json(
+        &std::fs::read_to_string(dir.join("config.json")).unwrap(),
+    )
+    .unwrap();
+    // f32 to keep the comparison about layout rather than about bf16 rounding; the decoder is
+    // ~20 GB at f32, which this box carries.
+    let vae = MiniMaxH3VideoVae::from_weights(&mut w, &cfg, Dtype::Float32).unwrap();
+
+    let latent = r.require("in.latent").unwrap();
+    let want = r.require("out.video").unwrap();
+    let got = vae
+        .decode(latent)
+        .unwrap()
+        .as_dtype(Dtype::Float32)
+        .unwrap();
+    assert_eq!(got.shape(), want.shape(), "decoded shape");
+
+    let diff = mlx_rs::ops::subtract(&got, want).unwrap().abs().unwrap();
+    let peak: f32 = want.abs().unwrap().max(None).unwrap().item();
+    let rel_max: f32 = diff.max(None).unwrap().item::<f32>() / peak;
+    let cos = {
+        let dot: f32 = mlx_rs::ops::multiply(&got, want)
+            .unwrap()
+            .sum(None)
+            .unwrap()
+            .item();
+        let a: f32 = got
+            .square()
+            .unwrap()
+            .sum(None)
+            .unwrap()
+            .item::<f32>()
+            .sqrt();
+        let b: f32 = want
+            .square()
+            .unwrap()
+            .sum(None)
+            .unwrap()
+            .item::<f32>()
+            .sqrt();
+        dot / (a * b)
+    };
+    let (n_got, n_want) = (
+        got.square()
+            .unwrap()
+            .sum(None)
+            .unwrap()
+            .item::<f32>()
+            .sqrt(),
+        want.square()
+            .unwrap()
+            .sum(None)
+            .unwrap()
+            .item::<f32>()
+            .sqrt(),
+    );
+    println!(
+        "REAL-WEIGHT PARITY vs {} {}: rel-max-abs={rel_max:.3e} cosine={cos:.6} \
+         ||port||={n_got:.4} ||reference||={n_want:.4}",
+        r.metadata("reference").unwrap_or_default(),
+        r.metadata("reference_version").unwrap_or_default(),
+    );
+
+    // 1e-2 is this crate's house tolerance; MLX's reduced-precision Metal f32 matmul over a
+    // 36-layer / 2048-dim stack is the floor. The sc-18740 half-swap sits at 0.86-0.99 here, i.e.
+    // roughly two orders of magnitude above it.
+    assert!(
+        rel_max < 1e-2,
+        "real-weight decode differs from the official implementation by {rel_max:.3e} \
+         (cosine {cos:.6}). Norms are {n_got:.4} vs {n_want:.4} — note how little those move, \
+         which is why no magnitude or checksum assertion can gate this."
     );
 }
 
@@ -635,24 +742,173 @@ fn real_tokenizer_resolves_the_minimax_special_tokens() {
         "<d> must be a single registered special token, not a BPE split"
     );
 
-    // The template prefix, derived from the shipped chat template, tokenizes to exactly 3 ids.
-    let prefix = tok.prefix_len().expect("tokenize the prefix");
-    assert_eq!(prefix, PREFIX_TOKENS);
+    // **sc-18741, against the REAL tokenizer.** The presentation is the prompt verbatim: the
+    // port's ids must equal `tokenizer(prompt, add_special_tokens=False)` exactly, and must not be
+    // the chat-template render — with or without a compensating 3-token slice.
+    const { assert!(!APPLIES_CHAT_TEMPLATE) };
+    const PROMPT: &str = "a red fox leaps over a mossy log at dawn";
+    const CUE: [i32; 5] = [151645, 198, 151644, 77091, 198];
+
+    let got = tok.ids(PROMPT).expect("presentation ids");
+    assert_eq!(got, tok.encode_raw(PROMPT).unwrap(), "the prompt, verbatim");
+    assert!(
+        got.iter().all(|id| *id < 151643),
+        "the presentation must contain no special tokens at all, got {got:?}"
+    );
+
+    // Reconstruct exactly what sc-17143 fed the DiT and prove the port no longer produces it.
+    let templated = tok
+        .encode_raw(&format!(
+            "<|im_start|>user\n{PROMPT}<|im_end|>\n<|im_start|>assistant\n"
+        ))
+        .unwrap();
+    assert_eq!(&templated[..3], &[151644, 872, 198], "the template prefix");
+    let shipped: Vec<i32> = templated[3..].to_vec();
+    assert_ne!(got, shipped, "the port still emits sc-17143's presentation");
     assert_eq!(
-        tok.encode_raw(mlx_gen_minimax_h3::text_encoder::PREFIX)
-            .unwrap(),
-        vec![151644, 872, 198],
-        "<|im_start|>user\\n"
+        shipped.len(),
+        got.len() + 5,
+        "sc-17143's slice removed the prefix but never the generation cue"
+    );
+    assert_eq!(&shipped[shipped.len() - 5..], &CUE);
+
+    // The head-corruption mode: the 3-token slice lands on the prefix boundary only when the
+    // tokenizer does not merge the template's trailing newline into the prompt. It does merge for
+    // a whitespace-leading prompt, and then a real prompt token is destroyed as well.
+    const WS_PROMPT: &str = "\nleading newline";
+    let ws_ref = tok.ids(WS_PROMPT).unwrap();
+    let ws_shipped: Vec<i32> = tok
+        .encode_raw(&format!(
+            "<|im_start|>user\n{WS_PROMPT}<|im_end|>\n<|im_start|>assistant\n"
+        ))
+        .unwrap()[3..]
+        .to_vec();
+    assert_ne!(
+        &ws_shipped[..ws_ref.len().min(ws_shipped.len())],
+        &ws_ref[..],
+        "expected sc-17143 to also lose a leading token for a whitespace-leading prompt"
     );
 
     println!(
-        "REAL-WEIGHT TOKENIZER SMOKE: <d>={:?} </d>={:?}; template prefix = {prefix} tokens \
-         {:?}; the seven MiniMax specials resolve to 151669-151675 from tokenizer_config.json \
-         alone (they appear in no vocabulary file)",
+        "REAL-WEIGHT TOKENIZER SMOKE: <d>={:?} </d>={:?}; the seven MiniMax specials resolve to \
+         151669-151675 from tokenizer_config.json alone (they appear in no vocabulary file). \
+         Presentation for {PROMPT:?}: {} ids (reference) vs {} ids under sc-17143 — the extra 5 \
+         are the generation cue {CUE:?}. Whitespace-leading prompt {WS_PROMPT:?}: reference \
+         {ws_ref:?} vs sc-17143 {ws_shipped:?}, which also loses a real prompt token.",
         specials.dialogue_open().unwrap(),
         specials.dialogue_close().unwrap(),
-        tok.encode_raw(mlx_gen_minimax_h3::text_encoder::PREFIX)
-            .unwrap(),
+        got.len(),
+        shipped.len(),
+    );
+}
+
+/// **The gate sc-17143 was missing** (sc-18741): run the FULL 50-layer tap on the real 62 GB
+/// `text_encoder/` over the same prompt the official conditioner encoded, and compare numerically.
+///
+/// This is the only assertion that can catch a presentation defect. The committed fixture pins the
+/// tensor math at tiny dims and the tokenizer smoke pins the ids, but neither runs the real stack
+/// end to end, and sc-17143's context was a plausible, finite, non-constant tensor of the wrong
+/// length carrying the wrong rows — every self-generated check it had passed.
+///
+/// Generate the reference with `tools/dump_minimax_h3_te_real.py` (~220 KB, deliberately not
+/// committed) and point `MINIMAX_H3_TE_REFERENCE` at it. **Run this in its own process**: the
+/// conditioner is ~62 GB on the Python side and does not release inside a process on MPS, and this
+/// side holds ~51.5 GB for layers 0-49. Asserts rather than skips, like everything else here.
+#[test]
+#[ignore = "needs a real MiniMax-H3 snapshot + a reference context (MINIMAX_H3_TE_REFERENCE); ~52 GB resident"]
+fn real_weight_te_context_matches_the_official_conditioner() {
+    let root = snapshot();
+    let reference_path = std::env::var("MINIMAX_H3_TE_REFERENCE").unwrap_or_default();
+    assert!(
+        !reference_path.is_empty(),
+        "MINIMAX_H3_TE_REFERENCE must point at the output of tools/dump_minimax_h3_te_real.py. \
+         This test is #[ignore]d and asserts rather than skips so a missing reference cannot be \
+         mistaken for a pass."
+    );
+    let r = Weights::from_file(&reference_path)
+        .unwrap_or_else(|e| panic!("load {reference_path}: {e}"));
+    assert_eq!(
+        r.metadata("reference").unwrap_or_default(),
+        "diffusers.MiniMaxH3TextEncoderStep",
+        "the reference must come from the official conditioner"
+    );
+    assert_eq!(
+        r.metadata("applies_chat_template").unwrap_or_default(),
+        "false"
+    );
+    let prompt = r.metadata("prompt").unwrap_or_default().to_string();
+
+    // The port's own tokenization of that prompt must equal the reference's ids BEFORE any
+    // forward runs — a context that matched numerically but on different ids would be luck.
+    let tok = MiniMaxH3Tokenizer::from_snapshot(&root).expect("tokenizer");
+    let want_ids = r.require("in.input_ids").unwrap();
+    let got_ids = tok.ids(&prompt).expect("presentation ids");
+    assert_eq!(
+        got_ids,
+        want_ids.as_slice::<i32>().to_vec(),
+        "the port's presentation differs from the official conditioner's for {prompt:?}"
+    );
+
+    let dir = root.join("text_encoder");
+    let cfg = MiniMaxH3TeConfig::qwen3_vl_32b();
+    assert_eq!(cfg.select_hidden, 50);
+
+    // Only the shards layers 0-49 need. `Weights::from_dir` would map all 14 (66.7 GB); the tap
+    // reads 51.5 GB of them and shards 12-14 serve only the never-executed tail.
+    let t0 = Instant::now();
+    let mut w = Weights::empty();
+    for i in 1..=12 {
+        let shard = format!("model-{i:05}-of-00014.safetensors");
+        let part =
+            Weights::from_file(dir.join(&shard)).unwrap_or_else(|e| panic!("load {shard}: {e}"));
+        let keys: Vec<String> = part.keys().map(str::to_owned).collect();
+        for k in keys {
+            let t = part.require(&k).unwrap().clone();
+            w.insert(k, t);
+        }
+    }
+    let te = MiniMaxH3TextEncoder::from_weights(&w, LM_PREFIX, &cfg)
+        .expect("build the encoder at the full published depth");
+    assert_eq!(te.num_loaded_layers(), 50, "the full layer-50 tap must run");
+    let load_ms = t0.elapsed().as_millis();
+
+    let (ids, mask) = tok.encode_prompt(&prompt).expect("encode");
+    let seq = ids.shape()[1];
+    let t1 = Instant::now();
+    let got = te
+        .forward(&ids, &mask)
+        .expect("real-weight forward")
+        .as_dtype(Dtype::Float32)
+        .unwrap();
+    let want = r.require("out.context").unwrap();
+
+    assert_eq!(
+        got.shape(),
+        &[1, seq, cfg.hidden_size],
+        "one context row per presentation token"
+    );
+    assert_eq!(got.shape(), want.shape(), "context shape vs the reference");
+
+    let diff = mlx_rs::ops::subtract(&got, want).unwrap().abs().unwrap();
+    let peak: f32 = want.abs().unwrap().max(None).unwrap().item();
+    let rel_max: f32 = diff.max(None).unwrap().item::<f32>() / peak;
+    let fwd_ms = t1.elapsed().as_millis();
+    assert!(fwd_ms > 0, "the timer did not span the evaluation");
+
+    println!(
+        "REAL-WEIGHT TE PARITY vs {} ({}): prompt {prompt:?} -> {seq} ids -> context {:?}; \
+         rel-max-abs={rel_max:.3e} ({load_ms} ms to map 12 shards + build 50 layers, {fwd_ms} ms \
+         to forward)",
+        r.metadata("reference").unwrap_or_default(),
+        r.metadata("reference_version").unwrap_or_default(),
+        got.shape(),
+    );
+
+    // The reference is bf16 (the checkpoint's own dtype) so the floor is bf16 round-off through a
+    // 50-layer stack, not f32 round-off; 5e-2 is the house value for a bf16 real-weight comparison.
+    assert!(
+        rel_max < 5e-2,
+        "real-weight context differs from the official conditioner by {rel_max:.3e}"
     );
 }
 
@@ -710,10 +966,7 @@ fn real_weight_te_forward_runs_at_the_published_geometry() {
         .encode_prompt("a cinematic wide shot of a starship bridge, amber console glow")
         .expect("encode");
     let seq = ids.shape()[1];
-    assert!(
-        seq > cfg.prefix_tokens as i32,
-        "prompt must exceed the prefix"
-    );
+    assert!(seq > 4, "the probe prompt should be several tokens long");
 
     let t1 = Instant::now();
     let ctx = te.forward(&ids, &mask).expect("real-weight forward");
@@ -725,8 +978,8 @@ fn real_weight_te_forward_runs_at_the_published_geometry() {
 
     assert_eq!(
         ctx.shape(),
-        &[1, seq - cfg.prefix_tokens as i32, cfg.hidden_size],
-        "context is [1, seq - prefix, 5120]"
+        &[1, seq, cfg.hidden_size],
+        "context is [1, seq, 5120] — one row per presentation token, none sliced (sc-18741)"
     );
     assert!(
         peak.is_finite() && peak > 0.0,
