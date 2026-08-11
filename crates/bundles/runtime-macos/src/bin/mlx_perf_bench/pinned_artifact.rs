@@ -31,6 +31,7 @@ const OWNER_MARKER_FILE: &str = ".sceneworks-owner.json";
 const CLEANUP_RECEIPT_FILE: &str = ".sceneworks-cleanup.json";
 const CLEANUP_RECEIPT_TEMP_FILE: &str = ".sceneworks-cleanup.tmp";
 const OWNERSHIP_SCHEMA: &str = "sceneworks.mlx-perf-snapshot-owner.v2";
+const OWNERSHIP_STAGE_SCHEMA: &str = "sceneworks.mlx-perf-snapshot-owner-stage.v1";
 const CLEANUP_SCHEMA: &str = "sceneworks.mlx-perf-snapshot-cleanup.v2";
 const OWNERSHIP_HARNESS: &str = "sceneworks-mlx-perf-bench";
 const MAX_OWNERSHIP_BYTES: u64 = 64 * 1024;
@@ -49,6 +50,18 @@ struct SnapshotLease {
     root_name: String,
     root_device: u64,
     root_inode: u64,
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SnapshotStageIntent {
+    schema_version: String,
+    harness: String,
+    token: String,
+    sidecar_name: String,
+    sidecar_device: u64,
+    sidecar_inode: u64,
+    root_name: String,
 }
 
 #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -316,6 +329,24 @@ fn duplicate_cloexec(file: &File) -> Result<File, String> {
         // SAFETY: fcntl returned a new owned descriptor.
         Ok(unsafe { File::from_raw_fd(descriptor) })
     }
+}
+
+fn set_cloexec(file: &File, label: &str) -> Result<(), String> {
+    // SAFETY: F_GETFD and F_SETFD only inspect and update flags on this owned descriptor.
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
+    if flags < 0 {
+        return Err(format!(
+            "read {label} descriptor flags: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(format!(
+            "restore close-on-exec for {label}: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    Ok(())
 }
 
 fn directory_entry_names(directory: &File) -> Result<Vec<OsString>, String> {
@@ -647,10 +678,15 @@ fn expected_root_name(token: &str) -> String {
 }
 
 #[cfg(test)]
-fn pause_snapshot_publication_for_test(phase: &str) {
+fn snapshot_publication_pause_requested_for_test(phase: &str) -> bool {
     const PHASE_ENV: &str = "SCENEWORKS_P6_PUBLICATION_PAUSE_PHASE";
+    std::env::var(PHASE_ENV).as_deref() == Ok(phase)
+}
+
+#[cfg(test)]
+fn pause_snapshot_publication_for_test(phase: &str) {
     const READY_ENV: &str = "SCENEWORKS_P6_PUBLICATION_PAUSE_READY";
-    if std::env::var(PHASE_ENV).as_deref() != Ok(phase) {
+    if !snapshot_publication_pause_requested_for_test(phase) {
         return;
     }
     let ready = std::env::var(READY_ENV).expect("publication pause requires a ready path");
@@ -673,11 +709,15 @@ fn remove_unpublished_root_at(
     {
         return Err("unpublished snapshot root contains unexpected entries".to_owned());
     }
-    let current_root = cleanup_identity(
-        &root
-            .metadata()
-            .map_err(|error| format!("stat unpublished snapshot root: {error}"))?,
-    )?;
+    let current_metadata = root
+        .metadata()
+        .map_err(|error| format!("stat unpublished snapshot root: {error}"))?;
+    let current_root = cleanup_identity(&current_metadata)?;
+    if UnixMetadataExt::uid(&current_metadata) != unsafe { libc::geteuid() }
+        || current_metadata.permissions().mode() & 0o777 != 0o700
+    {
+        return Err("unpublished snapshot root is not an owned private directory".to_owned());
+    }
     if current_root.kind != expected_root.kind
         || current_root.device != expected_root.device
         || current_root.inode != expected_root.inode
@@ -725,6 +765,83 @@ fn remove_unpublished_root_at(
     unlink_entry_at(namespace, root_name, terminal)
 }
 
+fn validate_stage_intent(
+    intent: &SnapshotStageIntent,
+    token: &str,
+    sidecar_metadata: &fs::Metadata,
+) -> Result<(), String> {
+    if intent.schema_version != OWNERSHIP_STAGE_SCHEMA
+        || intent.harness != OWNERSHIP_HARNESS
+        || intent.token != token
+        || intent.sidecar_name != expected_sidecar_name(token)
+        || intent.sidecar_device != UnixMetadataExt::dev(sidecar_metadata)
+        || intent.sidecar_inode != UnixMetadataExt::ino(sidecar_metadata)
+        || intent.root_name != expected_root_name(token)
+    {
+        return Err("foreign or malformed staged snapshot ownership intent".to_owned());
+    }
+    Ok(())
+}
+
+fn unpublished_root_identity_at(
+    namespace: &File,
+    root_name: &OsStr,
+) -> Result<CleanupNodeIdentity, String> {
+    let root = open_entry_at(namespace, root_name, true)?;
+    let metadata = root
+        .metadata()
+        .map_err(|error| format!("stat unpublished snapshot root: {error}"))?;
+    let identity = cleanup_identity(&metadata)?;
+    if identity.kind != SnapshotNodeKind::Directory
+        || UnixMetadataExt::uid(&metadata) != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o777 != 0o700
+    {
+        return Err("unpublished snapshot root is not an owned private directory".to_owned());
+    }
+    validate_open_and_entry(&root, namespace, root_name, identity, Path::new(root_name))?;
+    Ok(identity)
+}
+
+fn validate_unpublished_marker_authority(
+    namespace: &File,
+    root_name: &OsStr,
+    token: &str,
+    sidecar_metadata: &fs::Metadata,
+) -> Result<CleanupNodeIdentity, String> {
+    let root = open_entry_at(namespace, root_name, true)?;
+    let root_metadata = root
+        .metadata()
+        .map_err(|error| format!("stat unpublished snapshot root: {error}"))?;
+    let root_identity = cleanup_identity(&root_metadata)?;
+    if root_identity.kind != SnapshotNodeKind::Directory
+        || UnixMetadataExt::uid(&root_metadata) != unsafe { libc::geteuid() }
+        || root_metadata.permissions().mode() & 0o777 != 0o700
+    {
+        return Err("unpublished snapshot root is not an owned private directory".to_owned());
+    }
+    validate_open_and_entry(
+        &root,
+        namespace,
+        root_name,
+        root_identity,
+        Path::new(root_name),
+    )?;
+    let marker: SnapshotOwnership = read_json_at(&root, OsStr::new(OWNER_MARKER_FILE))?;
+    if marker.schema_version != OWNERSHIP_SCHEMA
+        || marker.harness != OWNERSHIP_HARNESS
+        || marker.token != token
+        || marker.sidecar_name != expected_sidecar_name(token)
+        || marker.sidecar_device != UnixMetadataExt::dev(sidecar_metadata)
+        || marker.sidecar_inode != UnixMetadataExt::ino(sidecar_metadata)
+        || marker.root_name != expected_root_name(token)
+        || marker.root_device != root_identity.device
+        || marker.root_inode != root_identity.inode
+    {
+        return Err("unpublished snapshot marker does not bind staged authority".to_owned());
+    }
+    Ok(root_identity)
+}
+
 impl SnapshotOwner {
     fn new(parent: Option<&Path>) -> Result<Self, String> {
         let namespace = snapshot_namespace(parent)?;
@@ -759,11 +876,28 @@ impl SnapshotOwner {
         let root_name = expected_root_name(&token);
         let sidecar_metadata =
             validate_owned_regular_file(staged_sidecar.as_file(), staged_sidecar.path())?;
+        let stage_intent = SnapshotStageIntent {
+            schema_version: OWNERSHIP_STAGE_SCHEMA.to_owned(),
+            harness: OWNERSHIP_HARNESS.to_owned(),
+            token: token.clone(),
+            sidecar_name: sidecar_name.clone(),
+            sidecar_device: UnixMetadataExt::dev(&sidecar_metadata),
+            sidecar_inode: UnixMetadataExt::ino(&sidecar_metadata),
+            root_name: root_name.clone(),
+        };
+        write_json_to_open_file(staged_sidecar.as_file_mut(), &stage_intent)?;
+        namespace_directory
+            .sync_all()
+            .map_err(|error| format!("sync staged snapshot intent: {error}"))?;
+        #[cfg(test)]
+        pause_snapshot_publication_for_test("intent-stage");
         let root_directory =
             create_directory_at(&namespace_directory, OsStr::new(&root_name), 0o700)?;
         let root_metadata = root_directory
             .metadata()
             .map_err(|error| format!("stat staged snapshot root: {error}"))?;
+        #[cfg(test)]
+        pause_snapshot_publication_for_test("root-stage");
         let lease = SnapshotLease {
             schema_version: OWNERSHIP_SCHEMA.to_owned(),
             harness: OWNERSHIP_HARNESS.to_owned(),
@@ -786,20 +920,39 @@ impl SnapshotOwner {
             root_device: lease.root_device,
             root_inode: lease.root_inode,
         };
-        let publication =
+        let marker_publication =
             create_json_file_at(&root_directory, OsStr::new(OWNER_MARKER_FILE), &ownership)
                 .and_then(|_| {
                     root_directory
                         .sync_all()
                         .map_err(|error| format!("sync staged snapshot root: {error}"))
-                })
-                .and_then(|()| write_json_to_open_file(staged_sidecar.as_file_mut(), &lease))
-                .and_then(|()| {
-                    namespace_directory
-                        .sync_all()
-                        .map_err(|error| format!("sync staged snapshot namespace: {error}"))
                 });
-        if let Err(error) = publication {
+        if let Err(error) = marker_publication {
+            let cleanup = remove_unpublished_root_at(
+                &namespace_directory,
+                OsStr::new(&root_name),
+                cleanup_identity(&root_metadata)?,
+            );
+            return Err(combine_snapshot_cleanup(error, cleanup));
+        }
+        #[cfg(test)]
+        pause_snapshot_publication_for_test("marker-stage");
+        #[cfg(test)]
+        if snapshot_publication_pause_requested_for_test("truncated-lease-stage") {
+            staged_sidecar
+                .as_file_mut()
+                .set_len(0)
+                .and_then(|()| staged_sidecar.as_file().sync_all())
+                .expect("truncate staged lease for crash injection");
+            pause_snapshot_publication_for_test("truncated-lease-stage");
+        }
+        let lease_publication = write_json_to_open_file(staged_sidecar.as_file_mut(), &lease)
+            .and_then(|()| {
+                namespace_directory
+                    .sync_all()
+                    .map_err(|error| format!("sync staged snapshot namespace: {error}"))
+            });
+        if let Err(error) = lease_publication {
             let cleanup = remove_unpublished_root_at(
                 &namespace_directory,
                 OsStr::new(&root_name),
@@ -1804,13 +1957,37 @@ fn recover_stale_sidecar(
     }
     let lease = match read_json_from_open_file::<SnapshotLease>(&mut file, path) {
         Ok(lease) => lease,
-        Err(error) if staged => {
+        Err(lease_error) if staged => {
             let root_name = expected_root_name(token);
             if identity_at_optional(namespace_directory, OsStr::new(&root_name))?.is_some() {
-                return Err(format!(
-                    "{error}; malformed staged authority has a candidate root and was quarantined: {}",
-                    namespace.join(root_name).display()
-                ));
+                let expected_root = match read_json_from_open_file::<SnapshotStageIntent>(
+                    &mut file, path,
+                ) {
+                    Ok(intent) => {
+                        validate_stage_intent(&intent, token, &sidecar_metadata)?;
+                        unpublished_root_identity_at(
+                            namespace_directory,
+                            OsStr::new(&root_name),
+                        )?
+                    }
+                    Err(intent_error) => validate_unpublished_marker_authority(
+                        namespace_directory,
+                        OsStr::new(&root_name),
+                        token,
+                        &sidecar_metadata,
+                    )
+                    .map_err(|marker_error| {
+                        format!(
+                            "{lease_error}; {intent_error}; {marker_error}; malformed staged authority has a candidate root and was quarantined: {}",
+                            namespace.join(&root_name).display()
+                        )
+                    })?,
+                };
+                remove_unpublished_root_at(
+                    namespace_directory,
+                    OsStr::new(&root_name),
+                    expected_root,
+                )?;
             }
             remove_locked_sidecar_at(namespace_directory, &file, OsStr::new(sidecar_name))?;
             namespace_directory
@@ -2075,6 +2252,7 @@ impl VerifiedPinnedArtifact {
         // SAFETY: the child CLI transfers ownership of its explicitly inherited descriptor to the
         // verified snapshot guard. Callers must pass a live descriptor exactly once.
         let mut lease_file = unsafe { File::from_raw_fd(lease_fd) };
+        set_cloexec(&lease_file, "child artifact lease")?;
         let lease_metadata =
             validate_owned_regular_file(&lease_file, Path::new("<inherited snapshot lease>"))?;
         match lock_exclusive(&lease_file, true)? {
@@ -3096,6 +3274,10 @@ mod tests {
 
         for (phase, signal) in [
             ("empty-stage", libc::SIGKILL),
+            ("intent-stage", libc::SIGABRT),
+            ("root-stage", libc::SIGKILL),
+            ("marker-stage", libc::SIGABRT),
+            ("truncated-lease-stage", libc::SIGKILL),
             ("complete-stage", libc::SIGABRT),
         ] {
             let ready = temp.path().join(format!("publication-{phase}"));
@@ -3222,6 +3404,39 @@ mod tests {
             assert_eq!(fs::read(root.join("sentinel")).unwrap(), b"unrelated");
             assert!(sidecar.exists());
         }
+    }
+
+    #[test]
+    fn foreign_staging_intent_with_a_candidate_root_is_never_scavenged() {
+        let namespace = tempfile::tempdir().unwrap();
+        let token = "FOREIGNSTAGE";
+        let sidecar = namespace
+            .path()
+            .join(format!("{OWNER_STAGE_PREFIX}{token}"));
+        let root = namespace.path().join(expected_root_name(token));
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("sentinel"), b"unrelated").unwrap();
+        create_json_file(
+            &sidecar,
+            &SnapshotStageIntent {
+                schema_version: OWNERSHIP_STAGE_SCHEMA.to_owned(),
+                harness: "foreign-harness".to_owned(),
+                token: token.to_owned(),
+                sidecar_name: expected_sidecar_name(token),
+                sidecar_device: 0,
+                sidecar_inode: 0,
+                root_name: expected_root_name(token),
+            },
+        )
+        .unwrap();
+
+        let error = scavenge_stale_snapshots_in(Some(namespace.path())).unwrap_err();
+        assert!(
+            error.contains("foreign or malformed staged snapshot ownership intent"),
+            "{error}"
+        );
+        assert_eq!(fs::read(root.join("sentinel")).unwrap(), b"unrelated");
+        assert!(sidecar.exists());
     }
 
     #[test]
@@ -3599,6 +3814,9 @@ mod tests {
         fs::write(&weights, b"attack!").unwrap();
         let lease_fd = owned.duplicate_lease_fd().unwrap();
         let child = VerifiedPinnedArtifact::admit(&artifact, owned.path(), lease_fd).unwrap();
+        let lease_flags = unsafe { libc::fcntl(child._lease.as_raw_fd(), libc::F_GETFD) };
+        assert!(lease_flags >= 0);
+        assert_ne!(lease_flags & libc::FD_CLOEXEC, 0);
         assert_eq!(
             fs::read(child.path().join("weights.bin")).unwrap(),
             b"trusted"

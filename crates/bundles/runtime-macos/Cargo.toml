@@ -43,8 +43,8 @@ audio = ["dep:candle-audio-catalog"]
 # bundle exposes it; runtime-cuda already forwards the audio catalog's cuda feature and runtime-cpu
 # has no GPU lane.
 audio-metal = ["audio", "candle-audio-catalog/metal"]
-# Local, real-weight P6 benchmark runner. The schema/validation library remains available without
-# this feature; only the Metal allocator and output-digest runner dependencies are opt-in.
+# Local, real-weight P6 benchmark runner. Its schema, validation, Metal allocator, and output-digest
+# dependencies are all opt-in with the runner.
 perf-bench = [
   "media",
   "dep:libc",
