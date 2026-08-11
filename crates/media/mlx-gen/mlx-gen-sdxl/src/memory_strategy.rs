@@ -1209,10 +1209,8 @@ mod tests {
             moe_expert: None,
         };
         let dense = spec(LoadShape::DeferredMaterialization);
-        let with_adapter = LoadSpec {
-            adapters: vec![adapter],
-            ..dense.clone()
-        };
+        let mut with_adapter = dense.clone();
+        with_adapter.adapters = vec![adapter];
         assert!(streamable(&dense), "the adapter-free load streams");
         assert!(
             !streamable(&with_adapter),

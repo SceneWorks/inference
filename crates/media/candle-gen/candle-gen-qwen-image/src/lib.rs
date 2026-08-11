@@ -228,8 +228,8 @@ impl Pipeline {
     fn load_comfyui(
         root: &Path,
         device: &Device,
-        comfyui_dit: PathBuf,
-        comfyui_vae: Option<PathBuf>,
+        comfyui_dit: gen_core::PinnedWeightsFile,
+        comfyui_vae: Option<gen_core::PinnedWeightsFile>,
         pid_spec: Option<PidWeights>,
     ) -> gen_core::Result<Self> {
         Ok(Self {
@@ -238,10 +238,8 @@ impl Pipeline {
             root: root.to_path_buf(),
             device: device.clone(),
             pid_spec,
-            comfyui_dit: Some(gen_core::PinnedWeightsFile::pin(comfyui_dit)?),
-            comfyui_vae: comfyui_vae
-                .map(gen_core::PinnedWeightsFile::pin)
-                .transpose()?,
+            comfyui_dit: Some(comfyui_dit),
+            comfyui_vae,
         })
     }
 
@@ -860,6 +858,7 @@ fn resolve_steps(requested: Option<u32>) -> usize {
 /// prompt; no conditioning (img2img/Edit deferred), no LoRA/quant, no Lightning sampler.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        denoiser_output_latent_space: Some(&candle_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
         id: MODEL_ID,
@@ -911,15 +910,21 @@ fn generator_from_pipeline(
     pipe: Pipeline,
     loaded_quant: Option<Quant>,
     memory_strategy: Option<gen_core::MemoryProviderContract>,
+    file_pin_spec: &LoadSpec,
 ) -> gen_core::Result<Box<dyn Generator>> {
     let resident_pipe = pipe.clone();
+    let resident_file_spec = file_pin_spec.clone();
     let text_pipe = pipe.clone();
     let heavy_pipe = pipe.clone();
+    let heavy_file_spec = file_pin_spec.clone();
     let stream_cancel = Arc::new(Mutex::new(gen_core::CancelFlag::default()));
     let heavy_cancel = stream_cancel.clone();
     let residency = QwenResidency::request_scoped_with_resident(
         move |_| {
-            let comps = resident_pipe.load_components()?;
+            let comps = resident_file_spec
+                .read_files_unchanged(resident_file_spec.file_source_paths(), || {
+                    resident_pipe.load_components()
+                })?;
             Ok((
                 TextPhase::Resident(comps.clone()),
                 HeavyPhase::Resident(comps),
@@ -928,10 +933,15 @@ fn generator_from_pipeline(
         move |_| Ok(TextPhase::Sequential(Box::new(text_pipe.load_te_seq()?))),
         move |use_pid, stream_transformer_blocks| {
             Ok(HeavyPhase::Sequential(Box::new(
-                heavy_pipe.load_heavy_seq_with_memory(
-                    use_pid,
-                    stream_transformer_blocks,
-                    &candle_gen::lock_recover(&heavy_cancel),
+                heavy_file_spec.read_files_unchanged(
+                    heavy_file_spec.file_source_paths(),
+                    || {
+                        heavy_pipe.load_heavy_seq_with_memory(
+                            use_pid,
+                            stream_transformer_blocks,
+                            &candle_gen::lock_recover(&heavy_cancel),
+                        )
+                    },
                 )?,
             )))
         },
@@ -951,6 +961,7 @@ fn generator_from_pipeline(
 /// pointing at a `Qwen/Qwen-Image` diffusers snapshot (`text_encoder/`, `transformer/`, `vae/`,
 /// `tokenizer/`). Adapters / quantization / control overlays are rejected (not wired).
 pub(crate) fn validate_load_spec(spec: &LoadSpec) -> gen_core::Result<()> {
+    spec.validate_prepared_file_pins()?;
     let _ = gen_core::require_base_snapshot(spec, MODEL_ID)?;
     if matches!(spec.weights, WeightsSource::Dir(_)) {
         gen_core::reject_unknown_components(spec, &[], MODEL_ID)?;
@@ -1002,22 +1013,27 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     let device = candle_gen::default_device()?;
     let pipe = match &spec.weights {
         WeightsSource::Dir(_) => Pipeline::load(&root, &device, spec.pid.clone()),
-        WeightsSource::File(dit) => {
+        WeightsSource::File(_) => {
+            let dit = spec
+                .weights_file_pin()?
+                .expect("File weights must resolve to a pin");
             let vae = spec
                 .components
                 .get(COMFYUI_VAE_COMPONENT)
-                .and_then(|source| match source {
-                    WeightsSource::File(path) => Some(path.clone()),
-                    WeightsSource::Dir(_) => None,
-                });
-            Pipeline::load_comfyui(&root, &device, dit.clone(), vae, spec.pid.clone())?
+                .map(|source| match source {
+                    WeightsSource::File(path) => spec.file_pin_for(path).map(Some),
+                    WeightsSource::Dir(_) => Ok(None),
+                })
+                .transpose()?
+                .flatten();
+            Pipeline::load_comfyui(&root, &device, dit, vae, spec.pid.clone())?
         }
     };
     #[cfg(any(feature = "cuda", test))]
     let memory_strategy = Some(memory_strategy::provider_contract(MODEL_ID, spec)?);
     #[cfg(not(any(feature = "cuda", test)))]
     let memory_strategy = None;
-    generator_from_pipeline(pipe, loaded_quant, memory_strategy)
+    generator_from_pipeline(pipe, loaded_quant, memory_strategy, spec)
 }
 
 /// Construct a lazy candle Qwen-Image generator that reads its **DiT** (and optionally its **VAE**) in
@@ -1044,6 +1060,7 @@ pub fn load_from_comfyui_dit(
     if let Some(vae_file) = vae_file {
         spec = spec.with_component(COMFYUI_VAE_COMPONENT, WeightsSource::File(vae_file));
     }
+    spec.prepare_file_sources()?;
     load(&spec)
 }
 
@@ -1156,8 +1173,9 @@ mod tests {
             )
             .unwrap();
         }
+        let source_pin = gen_core::PinnedWeightsFile::pin(&source).unwrap();
         let pipeline =
-            Pipeline::load_comfyui(tmp.path(), &Device::Cpu, source.clone(), None, None).unwrap();
+            Pipeline::load_comfyui(tmp.path(), &Device::Cpu, source_pin, None, None).unwrap();
 
         let payload_consumed = Arc::new(AtomicBool::new(false));
         let first_consumed = Arc::new(Barrier::new(2));
@@ -1275,8 +1293,8 @@ mod tests {
         let pipe = Pipeline::load_comfyui(
             Path::new("/missing-snapshot"),
             &Device::Cpu,
-            dit.clone(),
-            Some(vae.clone()),
+            gen_core::PinnedWeightsFile::pin(&dit).unwrap(),
+            Some(gen_core::PinnedWeightsFile::pin(&vae).unwrap()),
             None,
         )
         .expect("pin selected files");
@@ -1298,6 +1316,28 @@ mod tests {
             vae_error.contains(&vae.display().to_string()),
             "request staging must read the selected ComfyUI VAE, got: {vae_error}"
         );
+    }
+
+    #[test]
+    fn prepared_comfyui_vae_replacement_fails_before_provider_load() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dit = dir.path().join("qwen-dit.safetensors");
+        let vae = dir.path().join("qwen-vae.safetensors");
+        std::fs::write(&dit, b"prepared dit").unwrap();
+        std::fs::write(&vae, b"prepared vae").unwrap();
+        let mut spec = LoadSpec::new(WeightsSource::File(dit))
+            .with_component(
+                BASE_SNAPSHOT_COMPONENT,
+                WeightsSource::Dir(dir.path().join("snapshot")),
+            )
+            .with_component(COMFYUI_VAE_COMPONENT, WeightsSource::File(vae.clone()));
+        spec.prepare_file_sources().unwrap();
+
+        std::fs::write(&vae, b"replacement vae bytes").unwrap();
+        let error = validate_load_spec(&spec)
+            .expect_err("provider must reject a changed prepared VAE")
+            .to_string();
+        assert!(error.contains("changed after load"), "got: {error}");
     }
 
     /// Sequential-residency GPU validation (epic 10765 Phase 1c, sc-10867). ONE probed generation whose

@@ -50,6 +50,7 @@ pub const MODEL_ID: &str = "pulid_flux";
 
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        denoiser_output_latent_space: Some(&mlx_gen::gen_core::FLUX1_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
         id: MODEL_ID,
@@ -603,9 +604,10 @@ mod tests {
         );
 
         // Identity present but each sub-field missing in turn → named error for the missing one.
-        let base = |id: IdentityWeights| LoadSpec {
-            identity: Some(id),
-            ..LoadSpec::new(WeightsSource::Dir("/nonexistent/flux".into()))
+        let base = |id: IdentityWeights| {
+            let mut spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/flux".into()));
+            spec.identity = Some(id);
+            spec
         };
         let file = |p: &str| Some(WeightsSource::File(p.into()));
         let dir = |p: &str| Some(WeightsSource::Dir(p.into()));

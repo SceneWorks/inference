@@ -214,9 +214,6 @@ pub(crate) fn native_memory_strategy_contract_from_spec(
         }
     };
     let control = mlx_gen::require_control(spec, provider_id, "Krea 2 pose control overlay")?;
-    let control_path = match control {
-        mlx_gen::WeightsSource::Dir(path) | mlx_gen::WeightsSource::File(path) => path,
-    };
     let stored = |path: &std::path::Path, what: &str| -> CoreResult<u64> {
         projected_safetensors_bytes(path, |_| ResidentProjection::Stored).map_err(|error| {
             CoreError::Msg(format!(
@@ -227,9 +224,16 @@ pub(crate) fn native_memory_strategy_contract_from_spec(
     };
     let conditioning_bytes = stored(&base_snapshot_dir.join("text_encoder"), "base text encoder")?;
     let decoder_bytes = stored(&base_snapshot_dir.join("vae"), "base VAE")?;
-    let transformer_bytes =
-        crate::block_memory_strategy::native_dit_transformer_bytes(provider_id, dit_file)?;
-    let overlay_bytes = stored(control_path, "pose control overlay")?;
+    let transformer_bytes = spec.read_file_unchanged_if_prepared(dit_file, |p| {
+        crate::block_memory_strategy::native_dit_transformer_bytes(provider_id, p)
+    })?;
+    let (control_path, overlay_bytes) = match control {
+        mlx_gen::WeightsSource::Dir(path) => (path, stored(path, "pose control overlay")?),
+        mlx_gen::WeightsSource::File(path) => (
+            path,
+            spec.read_file_unchanged_if_prepared(path, |p| stored(p, "pose control overlay"))?,
+        ),
+    };
     if overlay_bytes == 0 {
         return Err(CoreError::Msg(format!(
             "{provider_id}: pose control overlay '{}' contains no tensor bytes",
@@ -288,7 +292,7 @@ fn streamable_base_transformer(spec: &LoadSpec, provider_id: &str) -> CoreResult
                 spec.load_shape,
                 mlx_gen::gen_core::LoadShape::DeferredMaterialization
             )
-            && !crate::model::adapters_have_diff_patch(&spec.adapters)
+            && !crate::model::adapters_have_diff_patch_for_spec(spec)?
             && plan.load_time_quant_bits.is_none(),
     )
 }
@@ -323,7 +327,7 @@ fn asset_facts(
     })?;
     let decoder_bytes = project(&root.join("vae"), &|_| false)?;
     let overlay_bytes = match &spec.control {
-        Some(mlx_gen::WeightsSource::Dir(path)) | Some(mlx_gen::WeightsSource::File(path)) => {
+        Some(mlx_gen::WeightsSource::Dir(path)) => {
             let base_bits = crate::model::effective_base_quant_bits(spec, root, provider_id)?;
             let branch_bits = crate::memory::control_branch_quant_bits(base_bits);
             projected_safetensors_bytes(path, |_| match branch_bits {
@@ -332,6 +336,19 @@ fn asset_facts(
                     group_size: crate::quant::GROUP_SIZE as usize,
                 },
                 None => ResidentProjection::Stored,
+            })?
+        }
+        Some(mlx_gen::WeightsSource::File(path)) => {
+            let base_bits = crate::model::effective_base_quant_bits(spec, root, provider_id)?;
+            let branch_bits = crate::memory::control_branch_quant_bits(base_bits);
+            spec.read_file_unchanged_if_prepared(path, |p| {
+                projected_safetensors_bytes(p, |_| match branch_bits {
+                    Some(bits) => ResidentProjection::GroupQuantized {
+                        bits,
+                        group_size: crate::quant::GROUP_SIZE as usize,
+                    },
+                    None => ResidentProjection::Stored,
+                })
             })?
         }
         None => 0,

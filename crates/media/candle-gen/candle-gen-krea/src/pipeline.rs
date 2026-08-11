@@ -1473,7 +1473,7 @@ pub(crate) fn encode_multiphase_contexts(
 #[derive(Debug, Eq, PartialEq)]
 enum MultiphaseDitSource {
     SnapshotDir(PathBuf),
-    NativeFile(gen_core::PinnedWeightsFile),
+    NativeFile(Box<gen_core::PinnedWeightsFile>),
 }
 
 fn multiphase_dit_source(
@@ -1481,7 +1481,7 @@ fn multiphase_dit_source(
     native_dit: Option<&gen_core::PinnedWeightsFile>,
 ) -> MultiphaseDitSource {
     match native_dit {
-        Some(source) => MultiphaseDitSource::NativeFile(source.clone()),
+        Some(source) => MultiphaseDitSource::NativeFile(Box::new(source.clone())),
         None => MultiphaseDitSource::SnapshotDir(root.join("transformer")),
     }
 }
@@ -2477,7 +2477,7 @@ mod tests {
         let pinned = gen_core::PinnedWeightsFile::pin(&imported).unwrap();
         assert_eq!(
             multiphase_dit_source(&root, Some(&pinned)),
-            MultiphaseDitSource::NativeFile(pinned.clone())
+            MultiphaseDitSource::NativeFile(Box::new(pinned.clone()))
         );
         assert!(
             !root.join("transformer/model.safetensors").exists(),

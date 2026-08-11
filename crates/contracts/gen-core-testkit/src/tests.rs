@@ -98,6 +98,7 @@ fn guided_stub_caps() -> Capabilities {
 
 fn guided_stub_desc(id: &'static str) -> ModelDescriptor {
     ModelDescriptor {
+        denoiser_output_latent_space: None,
         capabilities: guided_stub_caps(),
         ..stub_desc(id)
     }
@@ -118,6 +119,7 @@ fn audio_stub_caps() -> Capabilities {
 
 fn stub_desc(id: &'static str) -> ModelDescriptor {
     ModelDescriptor {
+        denoiser_output_latent_space: None,
         control_kinds: None,
         required_components: &[],
         id,
@@ -130,6 +132,7 @@ fn stub_desc(id: &'static str) -> ModelDescriptor {
 
 fn audio_stub_desc(id: &'static str) -> ModelDescriptor {
     ModelDescriptor {
+        denoiser_output_latent_space: None,
         control_kinds: None,
         required_components: &[],
         id,

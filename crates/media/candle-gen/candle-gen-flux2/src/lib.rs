@@ -211,11 +211,13 @@ impl Pipeline {
         quant: Option<Quant>,
         root: &Path,
         device: &Device,
-        comfyui_dit: impl AsRef<Path>,
+        comfyui_dit: PinnedWeightsFile,
         pid_spec: Option<PidWeights>,
     ) -> CResult<Self> {
-        let comfyui_dit = PinnedWeightsFile::pin(comfyui_dit).map_err(|error| {
-            CandleError::Msg(format!("flux2 comfyui: pin transformer source: {error}"))
+        comfyui_dit.ensure_unchanged().map_err(|error| {
+            CandleError::Msg(format!(
+                "flux2 comfyui: validate transformer source: {error}"
+            ))
         })?;
         Ok(Self {
             variant: Flux2Variant::Dev,
@@ -1046,6 +1048,7 @@ impl Generator for Flux2Generator {
 /// Both: txt2img only (edit/Reference deferred to epic 6564 story 4), no LoRA, no on-the-fly quant.
 fn descriptor(variant: Flux2Variant) -> ModelDescriptor {
     ModelDescriptor {
+        denoiser_output_latent_space: Some(&candle_gen::gen_core::FLUX2_PACKED_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
         id: variant.id(),
@@ -1120,35 +1123,55 @@ fn generator_from_pipeline(
 ) -> gen_core::Result<Flux2Generator> {
     let variant = pipe.variant;
     let resident_pipe = pipe.clone();
+    let resident_file_spec = memory_spec.cloned();
     let text_pipe = pipe.clone();
+    let text_file_spec = memory_spec.cloned();
     let heavy_pipe = pipe.clone();
+    let heavy_file_spec = memory_spec.cloned();
     let stream_cancel = Arc::new(std::sync::Mutex::new(gen_core::CancelFlag::default()));
     let heavy_cancel = stream_cancel.clone();
     let bounded_host_decode = Arc::new(std::sync::Mutex::new(false));
     let heavy_bounded_host_decode = bounded_host_decode.clone();
     let residency = Flux2Residency::request_scoped_with_resident(
         move |_| {
-            let comps = resident_pipe.load_components()?;
+            let comps = match &resident_file_spec {
+                Some(spec) => spec.read_files_unchanged(spec.file_source_paths(), || {
+                    resident_pipe.load_components()
+                })?,
+                None => resident_pipe.load_components()?,
+            };
             Ok((
                 TextPhase::Resident(comps.clone()),
                 HeavyPhase::Resident(comps),
             ))
         },
         move |_| {
-            Ok(TextPhase::Sequential(Box::new((
-                text_pipe.load_te_seq()?,
-                text_pipe.build_tokenizer()?,
-            ))))
+            let text = match &text_file_spec {
+                Some(spec) => spec.read_files_unchanged(spec.file_source_paths(), || {
+                    Ok::<_, CandleError>((text_pipe.load_te_seq()?, text_pipe.build_tokenizer()?))
+                })?,
+                None => (text_pipe.load_te_seq()?, text_pipe.build_tokenizer()?),
+            };
+            Ok(TextPhase::Sequential(Box::new(text)))
         },
         move |use_pid, stream_transformer_blocks| {
-            Ok(HeavyPhase::Sequential(Box::new(
-                heavy_pipe.load_heavy_seq_with_memory(
+            let heavy = match &heavy_file_spec {
+                Some(spec) => spec.read_files_unchanged(spec.file_source_paths(), || {
+                    heavy_pipe.load_heavy_seq_with_memory(
+                        use_pid,
+                        stream_transformer_blocks,
+                        *candle_gen::lock_recover(&heavy_bounded_host_decode),
+                        &candle_gen::lock_recover(&heavy_cancel),
+                    )
+                })?,
+                None => heavy_pipe.load_heavy_seq_with_memory(
                     use_pid,
                     stream_transformer_blocks,
                     *candle_gen::lock_recover(&heavy_bounded_host_decode),
                     &candle_gen::lock_recover(&heavy_cancel),
                 )?,
-            )))
+            };
+            Ok(HeavyPhase::Sequential(Box::new(heavy)))
         },
     );
     let loaded_quant = match memory_spec {
@@ -1193,6 +1216,7 @@ pub(crate) fn validate_load_spec(
     variant: Flux2Variant,
     spec: &LoadSpec,
 ) -> gen_core::Result<Option<Quant>> {
+    spec.validate_prepared_file_pins()?;
     let id = variant.id();
     let _ = gen_core::require_base_snapshot(spec, id)?;
     if matches!(spec.weights, WeightsSource::File(_)) && !variant.is_dev() {
@@ -1245,7 +1269,10 @@ fn load_variant_concrete(
     let device = candle_gen::default_device()?;
     let pipe = match &spec.weights {
         WeightsSource::Dir(_) => Pipeline::load(variant, quant, &root, &device, spec.pid.clone()),
-        WeightsSource::File(dit) => {
+        WeightsSource::File(_) => {
+            let dit = spec
+                .weights_file_pin()?
+                .expect("File weights must resolve to a pin");
             Pipeline::load_comfyui(quant, &root, &device, dit, spec.pid.clone())?
         }
     };
@@ -1274,6 +1301,7 @@ pub fn load_from_comfyui_dit(
     if let Some(quant) = quant {
         spec = spec.with_quant(quant);
     }
+    spec.prepare_file_sources()?;
     load_dev(&spec)
 }
 
@@ -1385,8 +1413,9 @@ mod tests {
             )
             .unwrap();
         }
+        let source_pin = PinnedWeightsFile::pin(&source).unwrap();
         let pipeline =
-            Pipeline::load_comfyui(None, tmp.path(), &Device::Cpu, &source, None).unwrap();
+            Pipeline::load_comfyui(None, tmp.path(), &Device::Cpu, source_pin, None).unwrap();
 
         let payload_consumed = Arc::new(AtomicBool::new(false));
         let first_consumed = Arc::new(Barrier::new(2));
@@ -2095,7 +2124,7 @@ mod tests {
             None,
             Path::new("/missing-snapshot"),
             &Device::Cpu,
-            selected.clone(),
+            PinnedWeightsFile::pin(&selected).unwrap(),
             None,
         )
         .expect("pin selected file");
@@ -2108,6 +2137,24 @@ mod tests {
             error.contains(&selected.display().to_string()),
             "request staging must read the selected ComfyUI DiT, got: {error}"
         );
+    }
+
+    #[test]
+    fn prepared_comfyui_dit_replacement_fails_before_provider_load() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dit = dir.path().join("flux2-dit.safetensors");
+        std::fs::write(&dit, b"prepared dit").unwrap();
+        let mut spec = LoadSpec::new(WeightsSource::File(dit.clone())).with_component(
+            BASE_SNAPSHOT_COMPONENT,
+            WeightsSource::Dir(dir.path().join("snapshot")),
+        );
+        spec.prepare_file_sources().unwrap();
+
+        std::fs::write(&dit, b"replacement dit bytes").unwrap();
+        let error = validate_load_spec(Flux2Variant::Dev, &spec)
+            .expect_err("provider must reject a changed prepared DiT")
+            .to_string();
+        assert!(error.contains("changed after load"), "got: {error}");
     }
 
     #[test]

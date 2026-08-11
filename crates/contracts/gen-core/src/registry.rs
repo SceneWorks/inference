@@ -600,7 +600,7 @@ macro_rules! explicit_registry_kind {
                     ))
                 })?;
             self.ensure_quant_supported(id, spec)?;
-            (registration.load)(spec)
+            spec.read_prepared_files_unchanged(|| (registration.load)(spec))
         }
     };
 }
@@ -756,7 +756,9 @@ impl ProviderRegistry {
             .find(|registration| (registration.descriptor)().id == id)
             .ok_or_else(|| Error::Msg(format!("no generator registered for id '{id}'")))?;
         match registration.footprint {
-            Some(footprint) => footprint(spec).map(Some),
+            Some(footprint) => spec
+                .read_prepared_files_unchanged(|| footprint(spec))
+                .map(Some),
             None => Ok(None),
         }
     }
@@ -784,7 +786,7 @@ impl ProviderRegistry {
         else {
             return Ok(None);
         };
-        let contract = (registration.contract)(spec)?;
+        let contract = spec.read_prepared_files_unchanged(|| (registration.contract)(spec))?;
         let errors = contract.conformance_errors();
         if !errors.is_empty() {
             return Err(Error::Msg(format!(
@@ -963,6 +965,63 @@ pub fn model_descriptor_errors(d: &ModelDescriptor) -> Vec<String> {
             "{ctx}: supports_conversation_history is set but ConditioningKind::ConversationHistory \
              is not in `conditioning` — path-A requests would be rejected by the allowlist"
         ));
+    }
+    if let Some(space) = d.denoiser_output_latent_space {
+        let validation = space.validation();
+        if validation.zero_channels {
+            errs.push(format!("{ctx}: latent-space channel count is 0"));
+        }
+        if validation.zero_spatial_compression {
+            errs.push(format!(
+                "{ctx}: latent-space spatial compression is {}x{} — both factors must be non-zero",
+                space.spatial_compression.height, space.spatial_compression.width
+            ));
+        }
+        if let crate::latent::LatentPatchLayout::Packed {
+            patch_height,
+            patch_width,
+        } = space.patch_layout
+        {
+            if validation.zero_packed_patch {
+                errs.push(format!(
+                    "{ctx}: packed latent patch is {patch_height}x{patch_width} — both factors must be non-zero"
+                ));
+            }
+        }
+        match space.normalization {
+            crate::latent::LatentNormalization::Affine { .. } => {
+                let (scale, shift) = space
+                    .normalization
+                    .affine_values()
+                    .expect("matched affine normalization");
+                if validation.invalid_affine {
+                    errs.push(format!(
+                        "{ctx}: affine latent normalization has invalid scale={scale:?} shift={shift:?}"
+                    ));
+                }
+            }
+            crate::latent::LatentNormalization::PerChannel(stats) => {
+                if validation.per_channel_count_mismatch {
+                    errs.push(format!(
+                        "{ctx}: latent space declares {} channels but normalization {:?} hashes {}",
+                        space.channels, stats.identity, stats.channels
+                    ));
+                }
+                if validation.invalid_per_channel_metadata {
+                    errs.push(format!(
+                        "{ctx}: per-channel latent normalization must have a non-empty, whitespace-free identity and non-zero content hash"
+                    ));
+                }
+            }
+            crate::latent::LatentNormalization::LearnedPerChannel { .. } => {
+                if validation.invalid_learned_identity {
+                    errs.push(format!(
+                        "{ctx}: learned latent normalization identity must be non-empty and whitespace-free"
+                    ));
+                }
+            }
+            crate::latent::LatentNormalization::Identity => {}
+        }
     }
     // Required components (sc-13658): the weights-free advertisement of the named model components a
     // consumer must provision (see `ModelDescriptor::required_components`). Each declared id must be a
@@ -1296,6 +1355,7 @@ mod tests {
 
     fn dummy_descriptor() -> ModelDescriptor {
         ModelDescriptor {
+            denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
             id: "dummy_test_model",
@@ -1337,6 +1397,7 @@ mod tests {
 
     fn dummy_delegated_descriptor() -> ModelDescriptor {
         ModelDescriptor {
+            denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
             id: "dummy_delegated_test_model",
@@ -1364,6 +1425,7 @@ mod tests {
     // read as ZERO — so the provider-owned split is what finds it.
     fn dummy_footprint_descriptor() -> ModelDescriptor {
         ModelDescriptor {
+            denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
             id: "dummy_footprint_model",
@@ -1388,6 +1450,64 @@ mod tests {
         const DUMMY_FOOTPRINT_GENERATOR_REGISTRATION =
             dummy_footprint_descriptor => dummy_footprint_load;
         footprint = dummy_footprint
+    }
+
+    #[cfg(unix)]
+    static PREPARED_CALLBACK_REBIND: std::sync::Mutex<Option<(PathBuf, PathBuf, PathBuf)>> =
+        std::sync::Mutex::new(None);
+
+    #[cfg(unix)]
+    fn rebind_prepared_callback_file() -> Result<()> {
+        let (selected, staged_b, staged_a) = PREPARED_CALLBACK_REBIND
+            .lock()
+            .expect("callback rebinding lock")
+            .take()
+            .expect("callback rebinding fixture");
+        std::fs::rename(staged_b, &selected)?;
+        std::fs::rename(staged_a, &selected)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn prepared_callback_descriptor() -> ModelDescriptor {
+        ModelDescriptor {
+            denoiser_output_latent_space: None,
+            control_kinds: None,
+            required_components: &[],
+            id: "prepared_callback_model",
+            family: "test",
+            backend: "mlx",
+            modality: Modality::Image,
+            capabilities: dummy_caps(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn prepared_callback_load(_spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+        rebind_prepared_callback_file()?;
+        Ok(Box::new(DummyGen {
+            desc: prepared_callback_descriptor(),
+        }))
+    }
+
+    #[cfg(unix)]
+    fn prepared_callback_footprint(_spec: &LoadSpec) -> Result<PerComponentBytes> {
+        rebind_prepared_callback_file()?;
+        Ok(PerComponentBytes::default())
+    }
+
+    #[cfg(unix)]
+    fn prepared_callback_memory_contract(_spec: &LoadSpec) -> Result<MemoryProviderContract> {
+        rebind_prepared_callback_file()?;
+        Ok(MemoryProviderContract::compatibility_default(
+            "prepared_callback_model",
+            crate::memory_strategy::MemoryBackendRealization::MlxMetal {
+                bounded_wired_residency: false,
+                lazy_or_mmap_materialization: true,
+                explicit_evaluation_and_synchronization: true,
+                cache_eviction: true,
+            },
+        ))
     }
 
     struct DummyTrainer {
@@ -1444,6 +1564,7 @@ mod tests {
     // Multi-provider fixtures verify that independently named constants compose into one catalog.
     fn dummy_multi_gen_a_descriptor() -> ModelDescriptor {
         ModelDescriptor {
+            denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
             id: "dummy_multi_gen_a",
@@ -1456,6 +1577,7 @@ mod tests {
 
     fn dummy_multi_gen_b_descriptor() -> ModelDescriptor {
         ModelDescriptor {
+            denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
             id: "dummy_multi_gen_b",
@@ -1671,6 +1793,75 @@ mod tests {
             .expect("dummy is registered");
         assert_eq!(g.descriptor().id, "dummy_test_model");
         assert_eq!(g.descriptor().modality, Modality::Image);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepared_file_identity_guards_load_footprint_and_memory_callbacks() {
+        use std::os::unix::fs::symlink;
+
+        fn spec_with_rebinding_callback(tag: &str) -> (tempfile::TempDir, LoadSpec) {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let first = dir.path().join(format!("{tag}-blob-a"));
+            let second = dir.path().join(format!("{tag}-blob-b"));
+            let selected = dir.path().join(format!("{tag}.safetensors"));
+            let staged_b = dir.path().join(format!("{tag}-staged-b.safetensors"));
+            let staged_a = dir.path().join(format!("{tag}-staged-a.safetensors"));
+            std::fs::write(&first, b"same-size-a").expect("write A");
+            std::fs::write(&second, b"same-size-b").expect("write B");
+            symlink(&first, &selected).expect("select A");
+            symlink(&second, &staged_b).expect("stage B link");
+            symlink(&first, &staged_a).expect("stage replacement A link");
+            let mut spec = LoadSpec::new(WeightsSource::File(selected.clone()));
+            spec.prepare_file_sources().expect("prepare A identity");
+            *PREPARED_CALLBACK_REBIND
+                .lock()
+                .expect("callback rebinding lock") = Some((selected, staged_b, staged_a));
+            (dir, spec)
+        }
+
+        let registry = ProviderRegistryBuilder::new()
+            .register_generator(ModelRegistration {
+                descriptor: prepared_callback_descriptor,
+                load: prepared_callback_load,
+                footprint: Some(prepared_callback_footprint),
+            })
+            .register_memory_strategy(MemoryRegistration {
+                provider_id: "prepared_callback_model",
+                contract: prepared_callback_memory_contract,
+                safety_check:
+                    crate::memory_strategy::default_registered_memory_strategy_safety_check,
+            })
+            .build()
+            .expect("callback-boundary registry");
+
+        let (_load_dir, load_spec) = spec_with_rebinding_callback("load");
+        let load_error = registry
+            .load("prepared_callback_model", &load_spec)
+            .err()
+            .expect("load callback A -> B -> recreated A must fail")
+            .to_string();
+        assert!(load_error.contains("entry changed"), "got: {load_error}");
+
+        let (_footprint_dir, footprint_spec) = spec_with_rebinding_callback("footprint");
+        let footprint_error = registry
+            .footprint("prepared_callback_model", &footprint_spec)
+            .expect_err("footprint callback A -> B -> recreated A must fail")
+            .to_string();
+        assert!(
+            footprint_error.contains("entry changed"),
+            "got: {footprint_error}"
+        );
+
+        let (_memory_dir, memory_spec) = spec_with_rebinding_callback("memory");
+        let memory_error = registry
+            .memory_strategy_contract("prepared_callback_model", &memory_spec)
+            .expect_err("memory callback A -> B -> recreated A must fail")
+            .to_string();
+        assert!(
+            memory_error.contains("entry changed"),
+            "got: {memory_error}"
+        );
     }
 
     #[test]
@@ -2732,6 +2923,7 @@ mod tests {
         // A stub audio generator that advertises VoiceEmbedding conditioning.
         let tts = DummyGen {
             desc: ModelDescriptor {
+                denoiser_output_latent_space: None,
                 control_kinds: None,
                 required_components: &[],
                 id: "dummy_tts",
@@ -2863,6 +3055,7 @@ mod tests {
         assert!(model_descriptor_errors(&dummy_descriptor()).is_empty());
 
         let broken = ModelDescriptor {
+            denoiser_output_latent_space: None,
             control_kinds: None,
             // Blank + duplicate required-component ids (sc-13658) — unstageable / ambiguous keys.
             required_components: &["", "voice_embedding", "voice_embedding"],
@@ -2905,6 +3098,7 @@ mod tests {
 
         // All-zero bounds report the Default-0 message (F-084), not the inverted-bounds one.
         let zeroed = ModelDescriptor {
+            denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
             id: "zeroed",
@@ -2925,6 +3119,7 @@ mod tests {
     #[test]
     fn model_descriptor_errors_flags_conversation_history_flag_without_kind() {
         let half_wired = ModelDescriptor {
+            denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
             id: "convo",
@@ -2963,6 +3158,7 @@ mod tests {
     #[test]
     fn audio_descriptor_with_zero_size_bounds_passes_sweep() {
         let audio = ModelDescriptor {
+            denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
             id: "zeroed_audio",
@@ -3009,6 +3205,7 @@ mod tests {
     fn visual_descriptor_with_invalid_size_bounds_still_fails_sweep() {
         // Video, zero bounds → the Default-0 footgun still fires.
         let video_zero = ModelDescriptor {
+            denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
             id: "video_zero",
@@ -3031,6 +3228,7 @@ mod tests {
 
         // Image, inverted bounds → the inverted-bounds message still fires.
         let image_inverted = ModelDescriptor {
+            denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
             id: "image_inverted",
@@ -3053,6 +3251,7 @@ mod tests {
 
         // `Both` (emits image or video) is a visual modality too — zero bounds still fail.
         let both_zero = ModelDescriptor {
+            denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
             id: "both_zero",

@@ -188,6 +188,9 @@ pub struct ZImageGenerator {
     /// LoRA/LoKr adapters merged into the DiT weights at component-load (sc-5166). Fixed for this
     /// generator instance; empty ⇒ the stock unadapted build.
     adapters: Vec<AdapterSpec>,
+    /// Exact caller-prepared identities for every File source used by lazy component/PiD/adapter
+    /// loading. Kept intact so later generate-time reads consume the cache-key tokens.
+    file_pin_spec: LoadSpec,
     /// The `LoadSpec::pid` component captured at load (epic 7840 / sc-7853), threaded into the lazy
     /// component build so the PiD engine loads once alongside the base model. `None` when not opted in.
     pid_spec: Option<PidWeights>,
@@ -332,61 +335,68 @@ impl Generator for ZImageGenerator {
             ),
         };
 
-        if let Some(memory) = req.memory.as_ref().filter(|memory| {
-            memory.stage_residency
-                || memory.tile_vae_decode
-                || memory.chunk_attention
-                || memory.stream_transformer_blocks
-        }) {
-            if !memory.stage_residency {
-                return Err(gen_core::Error::Unsupported(
-                    "z_image_turbo: bounded decode, attention, and transformer residency require \
-                     request-scoped staged residency"
-                        .into(),
-                ));
-            }
-            if req.use_pid {
-                return Err(gen_core::Error::Unsupported(
-                    "z_image_turbo: PiD decode is not supported under sequential residency; use the \
-                     native VAE route or resident policy"
-                        .into(),
-                ));
-            }
-            // A warm request may have populated either cache. Synchronize before releasing those
-            // weights, then let the request-owned three-stage route load/drop each phase in turn.
-            self.device
-                .synchronize()
-                .map_err(candle_gen::CandleError::from)?;
-            drop(candle_gen::lock_recover(&self.components).take());
-            drop(candle_gen::lock_recover(&self.vae_encoder).take());
-            let images = pipe.render_sequential(req, on_progress)?;
-            return Ok(GenerationOutput::Images(images));
-        }
-        let components = self.components(&pipe)?;
+        self.file_pin_spec.read_files_unchanged(
+            self.file_pin_spec.file_source_paths(),
+            || {
+                if let Some(memory) = req.memory.as_ref().filter(|memory| {
+                    memory.stage_residency
+                        || memory.tile_vae_decode
+                        || memory.chunk_attention
+                        || memory.stream_transformer_blocks
+                }) {
+                    if !memory.stage_residency {
+                        return Err(gen_core::Error::Unsupported(
+                            "z_image_turbo: bounded decode, attention, and transformer residency require \
+                             request-scoped staged residency"
+                                .into(),
+                        ));
+                    }
+                    if req.use_pid {
+                        return Err(gen_core::Error::Unsupported(
+                            "z_image_turbo: PiD decode is not supported under sequential residency; use the \
+                             native VAE route or resident policy"
+                                .into(),
+                        ));
+                    }
+                    // A warm request may have populated either cache. Synchronize before releasing those
+                    // weights, then let the request-owned three-stage route load/drop each phase in turn.
+                    self.device
+                        .synchronize()
+                        .map_err(candle_gen::CandleError::from)?;
+                    drop(candle_gen::lock_recover(&self.components).take());
+                    drop(candle_gen::lock_recover(&self.vae_encoder).take());
+                    let images = pipe.render_sequential(req, on_progress)?;
+                    return Ok(GenerationOutput::Images(images));
+                }
+                let components = self.components(&pipe)?;
 
-        // img2img / `Reference` (sc-11783): resolve the single reference + its effective strength, and —
-        // when the strength yields a non-empty structure-preserving denoise (`start_step > 0`) — VAE-encode
-        // it to the clean init latent. `resolve_reference` errors on >1 reference; the capability floor in
-        // `validate` already rejects any non-`Reference` conditioning. Mirrors the base generator + the
-        // shared `render_base` img2img (sc-8646).
-        let reference = pipeline::resolve_reference(req)?;
-        let start_step = match &reference {
-            Some((_, strength)) => pipeline::init_time_step(
-                req.steps.map(|s| s as usize).unwrap_or(DEFAULT_STEPS),
-                *strength,
-            ),
-            None => 0,
-        };
-        let clean = if start_step > 0 {
-            let (image, _) = reference.expect("start_step > 0 implies a reference");
-            let encoder = self.vae_encoder(&pipe)?;
-            Some(pipe.encode_reference(&encoder, image, req.width, req.height)?)
-        } else {
-            None
-        };
+                // img2img / `Reference` (sc-11783): resolve the single reference + its effective
+                // strength, and — when the strength yields a non-empty structure-preserving denoise
+                // (`start_step > 0`) — VAE-encode it to the clean init latent. `resolve_reference`
+                // errors on >1 reference; the capability floor in `validate` already rejects any
+                // non-`Reference` conditioning. Mirrors the base generator + the shared
+                // `render_base` img2img (sc-8646).
+                let reference = pipeline::resolve_reference(req)?;
+                let start_step = match &reference {
+                    Some((_, strength)) => pipeline::init_time_step(
+                        req.steps.map(|s| s as usize).unwrap_or(DEFAULT_STEPS),
+                        *strength,
+                    ),
+                    None => 0,
+                };
+                let clean = if start_step > 0 {
+                    let (image, _) = reference.expect("start_step > 0 implies a reference");
+                    let encoder = self.vae_encoder(&pipe)?;
+                    Some(pipe.encode_reference(&encoder, image, req.width, req.height)?)
+                } else {
+                    None
+                };
 
-        let images = pipe.render(req, &components, clean.as_ref(), start_step, on_progress)?;
-        Ok(GenerationOutput::Images(images))
+                let images =
+                    pipe.render(req, &components, clean.as_ref(), start_step, on_progress)?;
+                Ok(GenerationOutput::Images(images))
+            },
+        )
     }
 }
 
@@ -397,6 +407,7 @@ impl Generator for ZImageGenerator {
 /// `mlx-gen-z-image`: `backend = "candle"` and `mac_only = false`.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        denoiser_output_latent_space: Some(&candle_gen::gen_core::FLUX1_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
         id: MODEL_ID,
@@ -460,7 +471,7 @@ pub fn descriptor() -> ModelDescriptor {
 fn comfyui_sources_from_spec(
     spec: &LoadSpec,
 ) -> gen_core::Result<Option<std::sync::Arc<comfyui::ComfyuiSources>>> {
-    let WeightsSource::File(primary) = &spec.weights else {
+    let WeightsSource::File(_) = &spec.weights else {
         return Ok(None);
     };
     gen_core::reject_unknown_components(
@@ -475,15 +486,10 @@ fn comfyui_sources_from_spec(
     let tokenizer_dir = gen_core::require_base_snapshot(spec, MODEL_ID)?.to_path_buf();
     let text_encoder = spec.components.get(COMFYUI_TEXT_ENCODER_COMPONENT);
     let vae = spec.components.get(COMFYUI_VAE_COMPONENT);
-    let sources = match (text_encoder, vae) {
-        (None, None) => comfyui::ComfyuiSources::combined(primary.clone(), tokenizer_dir)?,
+    let separate = match (text_encoder, vae) {
+        (None, None) => None,
         (Some(WeightsSource::File(text_encoder)), Some(WeightsSource::File(vae))) => {
-            comfyui::ComfyuiSources::separate(
-                primary.clone(),
-                text_encoder.clone(),
-                vae.clone(),
-                tokenizer_dir,
-            )?
+            Some((text_encoder, vae))
         }
         (Some(WeightsSource::Dir(path)), _) => {
             return Err(gen_core::Error::Msg(format!(
@@ -503,6 +509,18 @@ fn comfyui_sources_from_spec(
             )))
         }
     };
+    let primary = spec
+        .weights_file_pin()?
+        .expect("File weights must resolve to a pin");
+    let sources = match separate {
+        None => comfyui::ComfyuiSources::combined(primary, tokenizer_dir)?,
+        Some((text_encoder, vae)) => comfyui::ComfyuiSources::separate(
+            primary,
+            spec.file_pin_for(text_encoder)?,
+            spec.file_pin_for(vae)?,
+            tokenizer_dir,
+        )?,
+    };
     Ok(Some(std::sync::Arc::new(sources)))
 }
 
@@ -515,6 +533,7 @@ fn comfyui_sources_from_spec(
 /// control/IP-adapter overlays are still rejected — not wired, so refusing is more honest than
 /// silently dropping them (the worker falls back to Python).
 pub(crate) fn validate_load_spec(spec: &LoadSpec) -> gen_core::Result<()> {
+    spec.validate_prepared_file_pins()?;
     let _ = comfyui_sources_from_spec(spec)?;
     let _ = gen_core::require_base_snapshot(spec, MODEL_ID)?;
     if matches!(spec.weights, WeightsSource::Dir(_)) {
@@ -569,6 +588,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         loaded_quant,
         lifecycle: Mutex::new(()),
         adapters: spec.adapters.clone(),
+        file_pin_spec: spec.clone(),
         // PiD is an optional aux decoder (epic 7840 / sc-7853): capture the load-spec component (if
         // any) so the lazy component build loads the engine once. Unlike quant/control above, it is not
         // rejected — `None` simply keeps the byte-exact native-VAE path.
@@ -596,7 +616,7 @@ pub fn load_from_comfyui_components(
     vae_file: impl Into<PathBuf>,
     tokenizer_dir: impl Into<PathBuf>,
 ) -> gen_core::Result<Box<dyn Generator>> {
-    let spec = LoadSpec::new(WeightsSource::File(transformer_file.into()))
+    let mut spec = LoadSpec::new(WeightsSource::File(transformer_file.into()))
         .with_component(
             BASE_SNAPSHOT_COMPONENT,
             WeightsSource::Dir(tokenizer_dir.into()),
@@ -606,6 +626,7 @@ pub fn load_from_comfyui_components(
             WeightsSource::File(text_encoder_file.into()),
         )
         .with_component(COMFYUI_VAE_COMPONENT, WeightsSource::File(vae_file.into()));
+    spec.prepare_file_sources()?;
     load(&spec)
 }
 
@@ -616,10 +637,11 @@ pub fn load_from_comfyui_checkpoint(
     checkpoint_file: impl Into<PathBuf>,
     tokenizer_dir: impl Into<PathBuf>,
 ) -> gen_core::Result<Box<dyn Generator>> {
-    let spec = LoadSpec::new(WeightsSource::File(checkpoint_file.into())).with_component(
+    let mut spec = LoadSpec::new(WeightsSource::File(checkpoint_file.into())).with_component(
         BASE_SNAPSHOT_COMPONENT,
         WeightsSource::Dir(tokenizer_dir.into()),
     );
+    spec.prepare_file_sources()?;
     load(&spec)
 }
 
@@ -1114,6 +1136,34 @@ mod tests {
             WeightsSource::Dir("/tokenizer".into()),
         );
         assert!(load(&complete).is_ok(), "complete File spec loads lazily");
+    }
+
+    #[test]
+    fn prepared_comfyui_component_replacement_fails_before_provider_load() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dit = dir.path().join("dit.safetensors");
+        let text = dir.path().join("text.safetensors");
+        let vae = dir.path().join("vae.safetensors");
+        for file in [&dit, &text, &vae] {
+            std::fs::write(file, b"prepared bytes").unwrap();
+        }
+        let mut spec = LoadSpec::new(WeightsSource::File(dit))
+            .with_component(
+                BASE_SNAPSHOT_COMPONENT,
+                WeightsSource::Dir(dir.path().join("tokenizer")),
+            )
+            .with_component(
+                COMFYUI_TEXT_ENCODER_COMPONENT,
+                WeightsSource::File(text.clone()),
+            )
+            .with_component(COMFYUI_VAE_COMPONENT, WeightsSource::File(vae));
+        spec.prepare_file_sources().unwrap();
+
+        std::fs::write(&text, b"replacement text encoder bytes").unwrap();
+        let error = validate_load_spec(&spec)
+            .expect_err("provider must reject a changed prepared component")
+            .to_string();
+        assert!(error.contains("changed after load"), "got: {error}");
     }
 
     /// The accel-attn runtime toggle defaults on and round-trips (what the worker/UI drive).

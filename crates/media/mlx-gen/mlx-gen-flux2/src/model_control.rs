@@ -46,6 +46,7 @@ use crate::{loader, CONTROL_IN_DIM};
 /// init seed). Mac-only, like every FLUX.2 variant.
 pub fn descriptor_dev_control() -> ModelDescriptor {
     ModelDescriptor {
+        denoiser_output_latent_space: Some(&mlx_gen::gen_core::FLUX2_PACKED_LATENT_SPACE),
         // Deliberately input-agnostic, not undeclared: the Fun-Controlnet-Union checkpoint runs
         // pose / canny / depth down one VAE-encoded path with no mode index, so every kind is
         // genuinely accepted. Declaring `Some(Any)` says that; leaving it `None` would say "nobody

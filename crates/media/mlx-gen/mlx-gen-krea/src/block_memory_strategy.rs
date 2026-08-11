@@ -75,7 +75,7 @@ pub(crate) fn is_streamable_spec(provider_id: &str, spec: &LoadSpec) -> CoreResu
     let mut plan = crate::model::resolve_load_plan(spec, root, provider_id)?;
     plan.streamable_transformer = matches!(spec.offload_policy, OffloadPolicy::Sequential)
         && matches!(spec.load_shape, LoadShape::DeferredMaterialization)
-        && !crate::model::adapters_have_diff_patch(&spec.adapters)
+        && !crate::model::adapters_have_diff_patch_for_spec(spec)?
         && plan.load_time_quant_bits.is_none();
     Ok(plan.streamable_transformer)
 }
@@ -92,7 +92,7 @@ fn resolved_load_plan(
     let mut plan = crate::model::resolve_load_plan(spec, root, provider_id)?;
     plan.streamable_transformer = matches!(spec.offload_policy, OffloadPolicy::Sequential)
         && matches!(spec.load_shape, LoadShape::DeferredMaterialization)
-        && !crate::model::adapters_have_diff_patch(&spec.adapters)
+        && !crate::model::adapters_have_diff_patch_for_spec(spec)?
         && plan.load_time_quant_bits.is_none();
     Ok(plan)
 }
@@ -316,7 +316,9 @@ pub(crate) fn native_memory_strategy_contract_from_spec(
     };
     let components = mlx_gen::PerComponentBytes {
         text_encoder: stored(&base_snapshot_dir.join("text_encoder"), "base text encoder")?,
-        dit: native_dit_transformer_bytes(provider_id, dit_file)?,
+        dit: spec.read_file_unchanged_if_prepared(dit_file, |p| {
+            native_dit_transformer_bytes(provider_id, p)
+        })?,
         vae: stored(&base_snapshot_dir.join("vae"), "base VAE")?,
     };
     memory_strategy_contract_with_components(provider_id, spec, components, streamable)
@@ -1024,8 +1026,8 @@ mod tests {
         );
         assert!(!registered.lifecycle.transformer_window_materialization);
         assert!(
-            !crate::model::native_file_streamable(&file),
-            "the registered File builder must not execute its lower-level stream seam before evidence promotion"
+            crate::model::native_file_streamable(&file).unwrap(),
+            "explicit Sequential + Deferred execution may use the pinned File stream seam even while automatic authorization stays Missing"
         );
         std::fs::remove_dir_all(root).ok();
     }

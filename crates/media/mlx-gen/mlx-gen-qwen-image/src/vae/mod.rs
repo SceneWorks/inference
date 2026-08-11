@@ -13,6 +13,7 @@ pub mod blocks;
 use mlx_rs::ops::{add, divide, multiply, split, subtract};
 use mlx_rs::Array;
 
+use mlx_gen::gen_core::{QWEN_WAN_Z16_MEAN as LATENTS_MEAN, QWEN_WAN_Z16_STD as LATENTS_STD};
 use mlx_gen::nn::silu;
 use mlx_gen::tiling::{TilingConfig, VaeTiling};
 use mlx_gen::vae_tiling::tiled_decode;
@@ -20,18 +21,6 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{CancelFlag, LatentDecoder, Result};
 
 use blocks::{rms_norm_channels, CausalConv3d, DownBlock3D, MidBlock3D, UpBlock3D, NORM_EPS};
-
-// fork QwenVAE.LATENTS_{MEAN,STD}, reshaped to (1, 16, 1, 1, 1) for NCTHW broadcast.
-#[rustfmt::skip]
-const LATENTS_MEAN: [f32; 16] = [
-    -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508,
-    0.4134, -0.0715, 0.5517, -0.3632, -0.1922, -0.9497, 0.2503, -0.2921,
-];
-#[rustfmt::skip]
-const LATENTS_STD: [f32; 16] = [
-    2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743,
-    3.2687, 2.1526, 2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.916,
-];
 
 /// Image → 32-ch (sliced to 16) latent. 4 down-stages (3 spatial-downsample), then a mid-block.
 pub struct Encoder3D {
@@ -237,6 +226,10 @@ impl QwenVae {
 /// same latent space (`mlx-gen-pid`, sc-7843/7845) implements the same trait so an engine can swap
 /// between them at the decode call site.
 impl LatentDecoder for QwenVae {
+    fn input_latent_space(&self) -> Option<&mlx_gen::gen_core::LatentSpace> {
+        Some(&mlx_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE)
+    }
+
     fn decode(&self, latents: &Array) -> Result<Array> {
         QwenVae::decode(self, latents)
     }

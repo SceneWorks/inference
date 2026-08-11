@@ -27,6 +27,11 @@ serde_json = { workspace = true }
 # itself tensor-free, so depending on it keeps gen-core's zero-tensor invariant intact.
 core-llm = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+# Stable std does not expose durable Windows file IDs/change time. Prepared File identities use the
+# same handle metadata as candle-gen's sidecar cache so same-size replacement cannot alias a pin.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 # Self-removing fixture roots for the test suites (sc-17755).
 tempfile = { workspace = true }
