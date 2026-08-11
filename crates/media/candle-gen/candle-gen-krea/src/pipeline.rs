@@ -2440,7 +2440,7 @@ mod tests {
         }
         impl Drop for DropWitness {
             fn drop(&mut self) {
-                self.log.lock().unwrap().push(self.event);
+                candle_gen::lock_recover(&self.log).push(self.event);
             }
         }
         struct ResidentHeavy {
@@ -2545,14 +2545,14 @@ mod tests {
             let heavy_pin = pinned.clone();
             let residency = candle_gen::Residency::<DropWitness, ResidentHeavy>::request_scoped(
                 move |_| {
-                    text_log.lock().unwrap().push("load-text");
+                    candle_gen::lock_recover(&text_log).push("load-text");
                     Ok(DropWitness {
                         event: "drop-text",
                         log: Arc::clone(&text_log),
                     })
                 },
                 move |_, _| {
-                    heavy_log.lock().unwrap().push("load-heavy");
+                    candle_gen::lock_recover(&heavy_log).push("load-heavy");
                     Ok(ResidentHeavy {
                         _dit: load_dit_base(&heavy_root, Some(&heavy_pin), &Device::Cpu)?,
                         _release: DropWitness {
@@ -2571,15 +2571,15 @@ mod tests {
                     false,
                     &mut |_| {},
                     |_| {
-                        log.lock().unwrap().push("encode");
+                        candle_gen::lock_recover(&log).push("encode");
                         Ok(())
                     },
                     |_| {
-                        log.lock().unwrap().push("materialize-encoding");
+                        candle_gen::lock_recover(&log).push("materialize-encoding");
                         Ok(())
                     },
                     |_, _, _| {
-                        log.lock().unwrap().push("render");
+                        candle_gen::lock_recover(&log).push("render");
                         // CPU Candle cannot execute BF16 matmul. Keep the resident-side load above on
                         // the exact production BF16 entry point, then run the production driver at F32.
                         let (_, context, _) = crate::testfix::tiny_batch(&cfg);
@@ -2603,7 +2603,8 @@ mod tests {
                                         assert_eq!(specs[0].path, all_specs[0].path);
                                         assert_eq!(report.applied, 1);
                                         assert!(dit.adapted_projection_count().unwrap() > 0);
-                                        adapter_log.lock().unwrap().push("materialize-phase-a");
+                                        candle_gen::lock_recover(&adapter_log)
+                                            .push("materialize-phase-a");
                                     }
                                     Some(1) => {
                                         assert_eq!(specs.len(), 1);
@@ -2611,13 +2612,15 @@ mod tests {
                                         assert_eq!(specs[0].scale, 0.75);
                                         assert_eq!(report.applied, 1);
                                         assert!(dit.adapted_projection_count().unwrap() > 0);
-                                        adapter_log.lock().unwrap().push("materialize-phase-b");
+                                        candle_gen::lock_recover(&adapter_log)
+                                            .push("materialize-phase-b");
                                     }
                                     None => {
                                         assert!(specs.is_empty());
                                         assert_eq!(report.applied, 0);
                                         assert_eq!(dit.adapted_projection_count().unwrap(), 0);
-                                        adapter_log.lock().unwrap().push("release-phase-adapters");
+                                        candle_gen::lock_recover(&adapter_log)
+                                            .push("release-phase-adapters");
                                     }
                                     Some(index) => panic!("unexpected phase {index}"),
                                 }
@@ -2646,7 +2649,7 @@ mod tests {
                 )
                 .unwrap();
 
-            let before_owner_drop = log.lock().unwrap().clone();
+            let before_owner_drop = candle_gen::lock_recover(&log).clone();
             let phase_a = before_owner_drop
                 .iter()
                 .position(|event| *event == "materialize-phase-a")
@@ -2679,7 +2682,7 @@ mod tests {
                 assert!(!before_owner_drop.contains(&"drop-heavy"));
             }
             drop(residency);
-            let after_owner_drop = log.lock().unwrap();
+            let after_owner_drop = candle_gen::lock_recover(&log);
             assert!(after_owner_drop.contains(&"drop-text"));
             assert!(after_owner_drop.contains(&"drop-heavy"));
         }
