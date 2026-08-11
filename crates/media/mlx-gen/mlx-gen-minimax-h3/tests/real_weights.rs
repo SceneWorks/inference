@@ -23,8 +23,9 @@ use mlx_rs::{Array, Dtype};
 
 use mlx_gen::weights::Weights;
 use mlx_gen_minimax_h3::{
-    kaiser_sinc_filter1d, MiniMaxH3AudioVae, MiniMaxH3AudioVaeConfig, MiniMaxH3VaeConfig,
-    MiniMaxH3VideoVae,
+    kaiser_sinc_filter1d, MiniMaxH3AudioVae, MiniMaxH3AudioVaeConfig, MiniMaxH3TeConfig,
+    MiniMaxH3TextEncoder, MiniMaxH3Tokenizer, MiniMaxH3VaeConfig, MiniMaxH3VideoVae, LM_PREFIX,
+    MINIMAX_ADDED_SPECIALS, PREFIX_TOKENS, VISION_PREFIX,
 };
 
 use common::{snapshot, std_dev};
@@ -467,5 +468,280 @@ fn real_weight_audio_decode_produces_a_plausible_stereo_track() {
         left.len() as f32 / track.sample_rate as f32,
         track.sample_rate,
         gap / peak,
+    );
+}
+
+// ── sc-17143: the Qwen3-VL-32B context extraction ────────────────────────────────────────────────
+//
+// The text encoder is 66.7 GB, so these smokes deliberately do NOT hold the whole component
+// resident. They are split by what each can prove for the least memory:
+//
+// * the key-set / trim evidence needs only the shard index (no weight I/O at all);
+// * the `<d>` derivation needs only the two tokenizer files;
+// * the forward smoke loads the first two shards (9.8 GB) and runs a real forward at the REAL
+//   published width — 5120 hidden, head_dim 128, GQA 64/8, FFN 25600 — with a reduced tap. Width,
+//   not depth, is where the block math is exercised; depth is covered exactly by the committed
+//   fixture and by the index test below.
+
+/// Total tensors in the published `text_encoder/` component.
+const PUBLISHED_TE_TENSORS: usize = 1058;
+/// Of those: the text tower, the vision tower, and `lm_head`.
+const TE_LANGUAGE_MODEL_TENSORS: usize = 706;
+const TE_VISION_TENSORS: usize = 351;
+
+/// Per-layer leaf names of one Qwen3 decoder layer, as published.
+const LAYER_LEAVES: [&str; 11] = [
+    "input_layernorm.weight",
+    "post_attention_layernorm.weight",
+    "mlp.down_proj.weight",
+    "mlp.gate_proj.weight",
+    "mlp.up_proj.weight",
+    "self_attn.k_norm.weight",
+    "self_attn.k_proj.weight",
+    "self_attn.o_proj.weight",
+    "self_attn.q_norm.weight",
+    "self_attn.q_proj.weight",
+    "self_attn.v_proj.weight",
+];
+
+fn te_weight_map(root: &std::path::Path) -> serde_json::Map<String, serde_json::Value> {
+    let index = root
+        .join("text_encoder")
+        .join("model.safetensors.index.json");
+    let text = std::fs::read_to_string(&index)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", index.display()));
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    json.get("weight_map")
+        .and_then(serde_json::Value::as_object)
+        .expect("index.json has a weight_map")
+        .clone()
+}
+
+/// Every tensor the layer-50 tap needs must exist in the published checkpoint, and the tensors it
+/// does NOT need must be identifiable as a contiguous trimmable tail.
+///
+/// This is the evidence sc-17139's hosting decision rests on, measured rather than asserted: the
+/// tap reads 551 tensors; decoder layers 50-63 (154 tensors), `lm_head` and the final `norm` are
+/// never read and account for **15.209 GB** of the 66.715 GB component. Reads only the shard index,
+/// so it costs no weight I/O.
+#[test]
+#[ignore = "needs a real MiniMax-H3 snapshot (MINIMAX_H3_SNAPSHOT); dev box / macos-mlx only"]
+fn te_layer_50_tap_is_exhaustive_and_the_tail_is_trimmable() {
+    let root = snapshot();
+    let map = te_weight_map(&root);
+    assert_eq!(
+        map.len(),
+        PUBLISHED_TE_TENSORS,
+        "published text_encoder tensor count changed"
+    );
+
+    let cfg = MiniMaxH3TeConfig::qwen3_vl_32b();
+    assert_eq!(cfg.layers_to_run(), 50);
+    assert_eq!(cfg.num_layers, 64);
+
+    // 1. Everything the tap reads is present.
+    let mut required = vec![format!("{LM_PREFIX}.embed_tokens.weight")];
+    for i in 0..cfg.layers_to_run() {
+        for leaf in LAYER_LEAVES {
+            required.push(format!("{LM_PREFIX}.layers.{i}.{leaf}"));
+        }
+    }
+    assert_eq!(required.len(), 1 + 50 * 11, "551 tensors feed the tap");
+    let missing: Vec<&String> = required.iter().filter(|k| !map.contains_key(*k)).collect();
+    assert!(
+        missing.is_empty(),
+        "missing from the checkpoint: {missing:?}"
+    );
+
+    // 2. The trimmable tail exists, is exactly layers 50..64 + lm_head + norm, and is NOT read.
+    let mut tail: Vec<String> = Vec::new();
+    for i in cfg.layers_to_run()..cfg.num_layers as usize {
+        for leaf in LAYER_LEAVES {
+            let k = format!("{LM_PREFIX}.layers.{i}.{leaf}");
+            assert!(map.contains_key(&k), "{k} should exist in the checkpoint");
+            tail.push(k);
+        }
+    }
+    assert_eq!(tail.len(), 14 * 11, "154 tensors in layers 50-63");
+    assert!(map.contains_key("lm_head.weight"));
+    assert!(map.contains_key(&format!("{LM_PREFIX}.norm.weight")));
+    for k in &tail {
+        assert!(!required.contains(k), "{k} must not be read by the tap");
+    }
+
+    // 3. The tower split, and the vision half that fl2va / Ref2VA need.
+    let lm = map.keys().filter(|k| k.starts_with(LM_PREFIX)).count();
+    let visual = map.keys().filter(|k| k.starts_with(VISION_PREFIX)).count();
+    assert_eq!(lm, TE_LANGUAGE_MODEL_TENSORS);
+    assert_eq!(visual, TE_VISION_TENSORS);
+    assert_eq!(lm + visual + 1, PUBLISHED_TE_TENSORS, "+1 for lm_head");
+
+    // 4. The trim arithmetic, in bytes, against the index's own declared total.
+    let hidden = cfg.hidden_size as u64;
+    let inter = cfg.intermediate_size as u64;
+    let vocab = cfg.vocab_size as u64;
+    let per_layer = 2
+        * (hidden // input_layernorm + post_attention_layernorm
+        + hidden
+        + (cfg.num_heads * cfg.head_dim) as u64 * hidden        // q_proj
+        + 2 * (cfg.num_kv_heads * cfg.head_dim) as u64 * hidden // k_proj + v_proj
+        + hidden * (cfg.num_heads * cfg.head_dim) as u64        // o_proj
+        + 3 * inter * hidden                                    // gate + up + down
+        + 2 * cfg.head_dim as u64); // q_norm + k_norm
+    let trimmable = 14 * per_layer + 2 * vocab * hidden + 2 * hidden; // layers + lm_head + norm
+    let gb = trimmable as f64 / 1e9;
+    assert!(
+        (gb - 15.209).abs() < 0.01,
+        "trimmable tail computed as {gb:.3} GB, expected 15.209 GB"
+    );
+
+    println!(
+        "REAL-WEIGHT TE INDEX SMOKE: {} published tensors ({lm} language_model / {visual} visual / \
+         1 lm_head); the layer-{} tap reads {} of them; layers 50-63 + lm_head + norm = {} tensors \
+         = {gb:.3} GB are never read and can be trimmed on upload",
+        map.len(),
+        cfg.select_hidden,
+        required.len(),
+        tail.len() + 2,
+    );
+}
+
+/// `<d>` resolves to 151669 through the REAL shipped files — the id `transformers` assigns — and a
+/// bare `tokenizer.json` would silently BPE-split it instead.
+///
+/// This is the acceptance item that cannot be checked from the tensor index at all: the token is
+/// declared only in `tokenizer_config.json`, and its id comes from that array's ORDER.
+#[test]
+#[ignore = "needs a real MiniMax-H3 snapshot (MINIMAX_H3_SNAPSHOT); dev box / macos-mlx only"]
+fn real_tokenizer_resolves_the_minimax_special_tokens() {
+    let root = snapshot();
+    let tok = MiniMaxH3Tokenizer::from_snapshot(&root).expect("load the shipped tokenizer");
+
+    let specials = tok.specials();
+    assert_eq!(specials.dialogue_open(), Some(151669), "<d>");
+    assert_eq!(specials.dialogue_close(), Some(151670), "</d>");
+    for (i, name) in MINIMAX_ADDED_SPECIALS.iter().enumerate() {
+        assert_eq!(specials.get(name), Some(151669 + i as i32), "{name}");
+    }
+    // The upstream Qwen specials keep their vocabulary ids.
+    assert_eq!(specials.get("<|im_start|>"), Some(151644));
+    assert_eq!(specials.get("<|image_pad|>"), Some(151655));
+
+    // `<d>` must encode to ONE id, not the `['<d', '>']` split a bare tokenizer.json produces.
+    let ids = tok.encode_raw("<d>").expect("encode <d>");
+    assert_eq!(
+        ids,
+        vec![151669],
+        "<d> must be a single registered special token, not a BPE split"
+    );
+
+    // The template prefix, derived from the shipped chat template, tokenizes to exactly 3 ids.
+    let prefix = tok.prefix_len().expect("tokenize the prefix");
+    assert_eq!(prefix, PREFIX_TOKENS);
+    assert_eq!(
+        tok.encode_raw(mlx_gen_minimax_h3::text_encoder::PREFIX)
+            .unwrap(),
+        vec![151644, 872, 198],
+        "<|im_start|>user\\n"
+    );
+
+    println!(
+        "REAL-WEIGHT TOKENIZER SMOKE: <d>={:?} </d>={:?}; template prefix = {prefix} tokens \
+         {:?}; the seven MiniMax specials resolve to 151669-151675 from tokenizer_config.json \
+         alone (they appear in no vocabulary file)",
+        specials.dialogue_open().unwrap(),
+        specials.dialogue_close().unwrap(),
+        tok.encode_raw(mlx_gen_minimax_h3::text_encoder::PREFIX)
+            .unwrap(),
+    );
+}
+
+/// Load the first two shards (9.8 GB of the 66.7 GB component) and run a REAL forward at the
+/// published width — 5120 hidden, `head_dim` 128, GQA 64 query / 8 kv, FFN 25600 — over a real
+/// tokenized prompt, with a reduced 4-layer tap.
+///
+/// Depth is already pinned exactly by the committed fixture and by the index test above; what only
+/// real weights can prove is that the published key layout, bf16 dtypes and non-square projections
+/// load and execute. The timer spans the `.item()` that forces evaluation — MLX is lazy, and
+/// sc-17140's first attempt reported 0.0 s for a full decode because the timer stopped before
+/// anything had been computed.
+#[test]
+#[ignore = "needs a real MiniMax-H3 snapshot (MINIMAX_H3_SNAPSHOT) + Metal; ~10 GB resident"]
+fn real_weight_te_forward_runs_at_the_published_geometry() {
+    let root = snapshot();
+
+    // Only the shards the reduced tap needs — never the whole 66.7 GB component.
+    let dir = root.join("text_encoder");
+    let t0 = Instant::now();
+    let mut w = Weights::empty();
+    for shard in [
+        "model-00001-of-00014.safetensors",
+        "model-00002-of-00014.safetensors",
+    ] {
+        let part =
+            Weights::from_file(dir.join(shard)).unwrap_or_else(|e| panic!("load {shard}: {e}"));
+        let keys: Vec<String> = part.keys().map(str::to_owned).collect();
+        for k in keys {
+            let t = part.require(&k).unwrap().clone();
+            w.insert(k, t);
+        }
+    }
+    let loaded = w.len();
+    let load_ms = t0.elapsed().as_millis();
+    assert!(
+        loaded > 40,
+        "only {loaded} tensors loaded from the first two shards"
+    );
+
+    // The published geometry, with the tap reduced to what these shards carry.
+    let mut cfg = MiniMaxH3TeConfig::qwen3_vl_32b();
+    cfg.select_hidden = 4;
+    assert_eq!(cfg.hidden_size, 5120);
+    assert_eq!(cfg.head_dim, 128);
+    assert_ne!(cfg.head_dim, cfg.hidden_size / cfg.num_heads);
+
+    let te = MiniMaxH3TextEncoder::from_weights(&w, LM_PREFIX, &cfg)
+        .expect("build the encoder from the published weights");
+    assert_eq!(te.num_loaded_layers(), 4);
+
+    // A real prompt through the real tokenizer.
+    let tok = MiniMaxH3Tokenizer::from_snapshot(&root).expect("tokenizer");
+    let (ids, mask) = tok
+        .encode_prompt("a cinematic wide shot of a starship bridge, amber console glow")
+        .expect("encode");
+    let seq = ids.shape()[1];
+    assert!(
+        seq > cfg.prefix_tokens as i32,
+        "prompt must exceed the prefix"
+    );
+
+    let t1 = Instant::now();
+    let ctx = te.forward(&ids, &mask).expect("real-weight forward");
+    // Force evaluation INSIDE the timer — MLX is lazy, so a timer that stops before an `.item()`
+    // measures graph construction, not compute.
+    let spread = std_dev(&ctx);
+    let peak: f32 = ctx.abs().unwrap().max(None).unwrap().item();
+    let fwd_ms = t1.elapsed().as_millis();
+
+    assert_eq!(
+        ctx.shape(),
+        &[1, seq - cfg.prefix_tokens as i32, cfg.hidden_size],
+        "context is [1, seq - prefix, 5120]"
+    );
+    assert!(
+        peak.is_finite() && peak > 0.0,
+        "context peak {peak} is not finite/positive"
+    );
+    assert!(spread > 1e-3, "context is ~constant (std {spread:.3e})");
+    assert!(
+        fwd_ms > 0,
+        "forward reported 0 ms — the timer did not span the evaluation"
+    );
+
+    println!(
+        "REAL-WEIGHT TE SMOKE: loaded {loaded} tensors in {load_ms} ms; 4 layers at the published \
+         5120/128/64-8/25600 geometry; prompt -> {seq} ids -> context {:?} in {fwd_ms} ms \
+         (std {spread:.4}, peak {peak:.4})",
+        ctx.shape(),
     );
 }

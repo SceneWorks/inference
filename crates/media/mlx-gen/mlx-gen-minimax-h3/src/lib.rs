@@ -33,6 +33,18 @@
 //! weights. Its numerical risk concentrates in 127 anti-aliased activations, so `SnakeBeta` and the
 //! resamplers each carry their own parity fixture rather than only end-to-end coverage.
 //!
+//! ## Text encoder (sc-17143)
+//!
+//! - [`text_encoder`] runs **Qwen3-VL-32B** and returns the `context` the DiT consumes: the hidden
+//!   state after 50 of its 64 layers, with the chat-template prefix dropped.
+//!
+//! Two findings from that slice are load-bearing elsewhere in the epic. First, the checkpoint is
+//! **upstream `Qwen/Qwen3-VL-32B-Instruct`, byte-identical** across all 14 shards — only
+//! `tokenizer_config.json` differs — so the TE need not be rehosted, and decoder layers 50-63 plus
+//! `lm_head` are never executed. Second, `<d>` and six sibling specials are declared *only* in that
+//! one changed file, get their ids assigned positionally at load time, and land on **untrained**
+//! embedding rows.
+//!
 //! Not in this crate yet: either CNN encoder, the DiT (sc-17144) and the pipeline
 //! (sc-17146/17147). Nothing is registered with `mlx-gen-catalog` — there is no generator to ship
 //! until the pipeline lands.
@@ -46,6 +58,7 @@ pub mod config;
 pub mod decoder;
 pub mod rope;
 pub mod tensor;
+pub mod text_encoder;
 pub mod vae;
 
 pub use alias_free::{kaiser_sinc_filter1d, Activation1d, LowPassFilter1d, SnakeBeta, UpSample1d};
@@ -63,6 +76,12 @@ pub use config::{
 };
 pub use decoder::ViT3dDecoder;
 pub use rope::{create_token_ids, Rope3d, RopeTables};
+pub use text_encoder::{
+    encode_grounded, encode_grounded_from_vision, minimax_h3_vision_config, run_vision,
+    GroundedVision, MiniMaxH3TeConfig, MiniMaxH3TextEncoder, MiniMaxH3Tokenizer, SpecialTokens,
+    LM_PREFIX, MINIMAX_ADDED_SPECIALS, NUM_HIDDEN_LAYERS, PREFIX_TOKENS, SELECT_HIDDEN,
+    VISION_PREFIX,
+};
 pub use vae::{split_fused_qkv, MiniMaxH3VideoVae};
 
 /// The published model id this crate targets.
