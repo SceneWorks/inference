@@ -99,6 +99,14 @@ pub(crate) fn source_state(root: &Path) -> (String, bool) {
     (revision, dirty)
 }
 
+fn rerun_if_exists(path: &Path) {
+    match path.try_exists() {
+        Ok(true) => println!("cargo:rerun-if-changed={}", path.display()),
+        Ok(false) => {}
+        Err(error) => panic!("inspect optional Git path {}: {error}", path.display()),
+    }
+}
+
 fn main() {
     if env::var_os("CARGO_FEATURE_PERF_BENCH").is_none() {
         return;
@@ -129,16 +137,14 @@ fn main() {
             root.join(path)
         }
     };
-    println!(
-        "cargo:rerun-if-changed={}",
-        common_dir.join("packed-refs").display()
-    );
+    // `packed-refs` and the current loose ref are alternative storage layouts. Cargo treats a
+    // missing watched path as perpetually dirty, so watch only paths that exist. The existing
+    // `refs` directory covers transitions that create or remove the current loose ref.
+    rerun_if_exists(&common_dir.join("refs"));
+    rerun_if_exists(&common_dir.join("packed-refs"));
     if let Ok(head) = fs::read_to_string(git_dir.join("HEAD")) {
         if let Some(reference) = head.trim().strip_prefix("ref: ") {
-            println!(
-                "cargo:rerun-if-changed={}",
-                common_dir.join(reference).display()
-            );
+            rerun_if_exists(&common_dir.join(reference));
         }
     }
 

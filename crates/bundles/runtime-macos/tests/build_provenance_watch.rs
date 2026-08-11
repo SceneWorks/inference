@@ -4,6 +4,17 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 const MLX_REVISION: &str = "0123456789abcdef0123456789abcdef01234567";
+const BUILD_ARGS: &[&str] = &[
+    "build",
+    "--offline",
+    "--locked",
+    "--no-default-features",
+    "--verbose",
+    "-p",
+    "receipt-fixture",
+    "--features",
+    "perf-bench",
+];
 const CLEAN_SOURCE: &str = r#"const PAYLOAD: &str = "clean";
 
 fn main() {
@@ -25,6 +36,142 @@ fn main() {
     );
 }
 "#;
+
+#[derive(Clone, Copy, Debug)]
+enum RefLayout {
+    LooseOnly,
+    PackedOnly,
+}
+
+struct CargoFixture {
+    _temp: tempfile::TempDir,
+    root: PathBuf,
+    cargo_home: PathBuf,
+    target_dir: PathBuf,
+    source: PathBuf,
+    binary: PathBuf,
+    revision: String,
+    layout: RefLayout,
+}
+
+impl CargoFixture {
+    fn new(layout: RefLayout) -> Self {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repository");
+        let manifest = root.join("crates/bundles/runtime-macos");
+        let cargo_home = temp.path().join("cargo-home");
+        let target_dir = temp.path().join("target");
+        fs::create_dir_all(manifest.join("src")).unwrap();
+        fs::create_dir(&cargo_home).unwrap();
+
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/bundles/runtime-macos\"]\nresolver = \"2\"\n",
+        )
+        .unwrap();
+        fs::write(
+            manifest.join("Cargo.toml"),
+            "[package]\nname = \"receipt-fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\nbuild = \"build.rs\"\n\n[features]\ndefault = []\nperf-bench = []\n",
+        )
+        .unwrap();
+        fs::copy(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("build.rs"),
+            manifest.join("build.rs"),
+        )
+        .unwrap();
+        let source = manifest.join("src/main.rs");
+        fs::write(&source, CLEAN_SOURCE).unwrap();
+
+        cargo(
+            &root,
+            &cargo_home,
+            &target_dir,
+            &["generate-lockfile", "--offline"],
+        );
+        writeln!(
+            OpenOptions::new()
+                .append(true)
+                .open(root.join("Cargo.lock"))
+                .unwrap(),
+            "\n# git+https://github.com/michaeltrefry/mlx-rs?rev={MLX_REVISION}#{MLX_REVISION}"
+        )
+        .unwrap();
+
+        git(&root, &["init", "--quiet"]);
+        git(&root, &["add", "--all"]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=receipt-test",
+                "-c",
+                "user.email=receipt-test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "-m",
+                "fixture",
+            ],
+        );
+
+        let git_dir = root.join(".git");
+        let head = fs::read_to_string(git_dir.join("HEAD")).unwrap();
+        let head_ref = head.trim().strip_prefix("ref: ").unwrap();
+        let loose_ref = git_dir.join(head_ref);
+        match layout {
+            RefLayout::LooseOnly => {
+                assert!(loose_ref.is_file());
+                assert!(!git_dir.join("packed-refs").exists());
+            }
+            RefLayout::PackedOnly => {
+                git(&root, &["pack-refs", "--all", "--prune"]);
+                assert!(git_dir.join("packed-refs").is_file());
+                assert!(!loose_ref.exists());
+            }
+        }
+        assert!(git_dir.join("refs").is_dir());
+        assert!(
+            git(&root, &["status", "--porcelain", "--untracked-files=all"])
+                .stdout
+                .is_empty()
+        );
+
+        let revision = String::from_utf8(git(&root, &["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_owned();
+        let binary = target_dir
+            .join("debug")
+            .join(format!("receipt-fixture{}", std::env::consts::EXE_SUFFIX));
+        Self {
+            _temp: temp,
+            root,
+            cargo_home,
+            target_dir,
+            source,
+            binary,
+            revision,
+            layout,
+        }
+    }
+
+    fn build(&self) -> Output {
+        cargo(&self.root, &self.cargo_home, &self.target_dir, BUILD_ARGS)
+    }
+
+    fn assert_clean_build_stays_fresh(&self) {
+        self.build();
+        let unchanged = self.build();
+        assert!(
+            fixture_was_fresh(&unchanged),
+            "second {:?} build was not Fresh:\n{}",
+            self.layout,
+            String::from_utf8_lossy(&unchanged.stderr)
+        );
+        assert_accepted(&run_artifact(&self.binary), &self.revision, "clean");
+    }
+}
 
 fn run(command: &mut Command, description: &str) -> Output {
     let output = command
@@ -95,124 +242,9 @@ fn assert_refused(output: &Output, revision: &str, payload: &str) {
 }
 
 #[test]
-fn source_only_edit_rebuilds_dirty_receipt_that_stays_refused_after_revert() {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("repository");
-    let manifest = root.join("crates/bundles/runtime-macos");
-    let cargo_home = temp.path().join("cargo-home");
-    let target_dir = temp.path().join("target");
-    fs::create_dir_all(manifest.join("src")).unwrap();
-    fs::create_dir(&cargo_home).unwrap();
-
-    fs::write(
-        root.join("Cargo.toml"),
-        "[workspace]\nmembers = [\"crates/bundles/runtime-macos\"]\nresolver = \"2\"\n",
-    )
-    .unwrap();
-    fs::write(
-        manifest.join("Cargo.toml"),
-        "[package]\nname = \"receipt-fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\nbuild = \"build.rs\"\n\n[features]\ndefault = []\nperf-bench = []\n",
-    )
-    .unwrap();
-    fs::copy(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("build.rs"),
-        manifest.join("build.rs"),
-    )
-    .unwrap();
-    let source = manifest.join("src/main.rs");
-    fs::write(&source, CLEAN_SOURCE).unwrap();
-
-    cargo(
-        &root,
-        &cargo_home,
-        &target_dir,
-        &["generate-lockfile", "--offline"],
-    );
-    writeln!(
-        OpenOptions::new()
-            .append(true)
-            .open(root.join("Cargo.lock"))
-            .unwrap(),
-        "\n# git+https://github.com/michaeltrefry/mlx-rs?rev={MLX_REVISION}#{MLX_REVISION}"
-    )
-    .unwrap();
-
-    git(&root, &["init", "--quiet"]);
-    git(&root, &["add", "--all"]);
-    git(
-        &root,
-        &[
-            "-c",
-            "user.name=receipt-test",
-            "-c",
-            "user.email=receipt-test@example.invalid",
-            "-c",
-            "commit.gpgsign=false",
-            "commit",
-            "--quiet",
-            "-m",
-            "fixture",
-        ],
-    );
-
-    // `build.rs` watches both packed-refs and the loose current-branch ref. Make both exist so a
-    // missing metadata path cannot spuriously rerun the script and conceal a disconnected source
-    // watch in this regression.
-    git(&root, &["pack-refs", "--all", "--prune"]);
-    git(
-        &root,
-        &[
-            "-c",
-            "user.name=receipt-test",
-            "-c",
-            "user.email=receipt-test@example.invalid",
-            "-c",
-            "commit.gpgsign=false",
-            "commit",
-            "--quiet",
-            "--allow-empty",
-            "-m",
-            "loose-head-ref",
-        ],
-    );
-    assert!(root.join(".git/packed-refs").is_file());
-    let head = fs::read_to_string(root.join(".git/HEAD")).unwrap();
-    let head_ref = head.trim().strip_prefix("ref: ").unwrap();
-    assert!(root.join(".git").join(head_ref).is_file());
-    assert!(
-        git(&root, &["status", "--porcelain", "--untracked-files=all"])
-            .stdout
-            .is_empty()
-    );
-
-    let revision = String::from_utf8(git(&root, &["rev-parse", "HEAD"]).stdout)
-        .unwrap()
-        .trim()
-        .to_owned();
-    let build_args = [
-        "build",
-        "--offline",
-        "--locked",
-        "--no-default-features",
-        "--verbose",
-        "-p",
-        "receipt-fixture",
-        "--features",
-        "perf-bench",
-    ];
-    // The second unchanged build must be genuinely Fresh. In particular, build.rs may not rewrite
-    // its own watched Git index while determining the source dirty receipt.
-    cargo(&root, &cargo_home, &target_dir, &build_args);
-    let clean_build = cargo(&root, &cargo_home, &target_dir, &build_args);
-    assert!(
-        fixture_was_fresh(&clean_build),
-        "could not establish a fully fresh Cargo baseline before the source-only edit:\n{}",
-        String::from_utf8_lossy(&clean_build.stderr)
-    );
-    let binary = target_dir
-        .join("debug")
-        .join(format!("receipt-fixture{}", std::env::consts::EXE_SUFFIX));
-    assert_accepted(&run_artifact(&binary), &revision, "clean");
+fn loose_only_git_metadata_stays_fresh_and_source_edit_remains_refused_after_revert() {
+    let fixture = CargoFixture::new(RefLayout::LooseOnly);
+    fixture.assert_clean_build_stays_fresh();
 
     // Do not run Git between this source-only edit and Cargo: refreshing the index would itself
     // touch another watched input and could make a disconnected source-watch loop look correct.
@@ -221,20 +253,26 @@ fn source_only_edit_rebuilds_dirty_receipt_that_stays_refused_after_revert() {
         "const PAYLOAD: &str = \"edited\";",
     );
     assert_ne!(edited_source, CLEAN_SOURCE);
-    fs::write(&source, edited_source).unwrap();
-    cargo(&root, &cargo_home, &target_dir, &build_args);
-    let dirty_artifact = fs::read(&binary).unwrap();
-    assert_refused(&run_artifact(&binary), &revision, "edited");
+    fs::write(&fixture.source, edited_source).unwrap();
+    fixture.build();
+    let dirty_artifact = fs::read(&fixture.binary).unwrap();
+    assert_refused(&run_artifact(&fixture.binary), &fixture.revision, "edited");
 
     // Restore the checkout without asking Cargo to rebuild. The directly executed artifact must
     // retain its dirty build receipt and refuse even though the runtime checkout is now clean.
-    fs::write(&source, CLEAN_SOURCE).unwrap();
-    assert_eq!(fs::read_to_string(&source).unwrap(), CLEAN_SOURCE);
-    assert!(
-        git(&root, &["status", "--porcelain", "--untracked-files=all"])
-            .stdout
-            .is_empty()
-    );
-    assert_eq!(fs::read(&binary).unwrap(), dirty_artifact);
-    assert_refused(&run_artifact(&binary), &revision, "edited");
+    fs::write(&fixture.source, CLEAN_SOURCE).unwrap();
+    assert_eq!(fs::read_to_string(&fixture.source).unwrap(), CLEAN_SOURCE);
+    assert!(git(
+        &fixture.root,
+        &["status", "--porcelain", "--untracked-files=all"]
+    )
+    .stdout
+    .is_empty());
+    assert_eq!(fs::read(&fixture.binary).unwrap(), dirty_artifact);
+    assert_refused(&run_artifact(&fixture.binary), &fixture.revision, "edited");
+}
+
+#[test]
+fn packed_only_current_head_stays_fresh() {
+    CargoFixture::new(RefLayout::PackedOnly).assert_clean_build_stays_fresh();
 }

@@ -478,7 +478,7 @@ fn run_child(args: &[String]) -> Result<(), String> {
     record
         .validate_against(&campaign)
         .map_err(|error| format!("refuse false-green run record: {error}"))?;
-    write_json_atomic(&output_file, &record)?;
+    write_artifact_bound_json_atomic(&output_file, artifact, &record)?;
     println!("wrote {}", output_file.display());
     Ok(())
 }
@@ -498,6 +498,17 @@ fn verify_artifact_content(artifact: &ArtifactReceipt) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn write_artifact_bound_json_atomic(
+    path: &Path,
+    artifact: &ArtifactReceipt,
+    value: &impl serde::Serialize,
+) -> Result<(), String> {
+    // Serialize and sync first, then re-inventory at the last possible point before the atomic
+    // rename makes the record visible. This rejects changes during loading, warmups, measurements,
+    // validation, or record serialization rather than publishing the stale frozen receipt.
+    write_json_atomic_before_publish(path, value, || verify_artifact_content(artifact))
 }
 
 fn load_spec(tier: ModelTier, path: &Path) -> LoadSpec {
@@ -1373,6 +1384,14 @@ fn mlx_revision(lockfile: &Path) -> Result<String, String> {
 }
 
 fn write_json_atomic(path: &Path, value: &impl serde::Serialize) -> Result<(), String> {
+    write_json_atomic_before_publish(path, value, || Ok(()))
+}
+
+fn write_json_atomic_before_publish(
+    path: &Path,
+    value: &impl serde::Serialize,
+    before_publish: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| format!("{} has no parent", path.display()))?;
@@ -1391,6 +1410,16 @@ fn write_json_atomic(path: &Path, value: &impl serde::Serialize) -> Result<(), S
     file.write_all(b"\n")
         .and_then(|()| file.sync_all())
         .map_err(|error| format!("finish {}: {error}", temporary.display()))?;
+    drop(file);
+    if let Err(error) = before_publish() {
+        return match fs::remove_file(&temporary) {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(format!(
+                "{error}; remove unpublished {}: {cleanup}",
+                temporary.display()
+            )),
+        };
+    }
     fs::rename(&temporary, path).map_err(|error| format!("publish {}: {error}", path.display()))
 }
 
@@ -1514,6 +1543,40 @@ mod tests {
             .cargo_features
             .windows(2)
             .all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn artifact_mutation_during_execution_prevents_record_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let artifact_path = temp.path().join("artifact");
+        fs::create_dir(&artifact_path).unwrap();
+        let weights = artifact_path.join("weights.bin");
+        fs::write(&weights, b"before").unwrap();
+        let canonical_path = artifact_path.canonicalize().unwrap();
+        let artifact = ArtifactReceipt {
+            key: "fixture".to_owned(),
+            repository: "fixture/repository".to_owned(),
+            resolved_revision: "a".repeat(40),
+            tier: ModelTier::Q4,
+            input_path: artifact_path,
+            inventory: inventory_artifact(&canonical_path).unwrap(),
+            canonical_path,
+        };
+
+        // This is the same successful pre-load check the child performs before execution begins.
+        verify_artifact_content(&artifact).unwrap();
+        fs::write(&weights, b"after!").unwrap();
+
+        let output = temp.path().join("run.json");
+        let error = write_artifact_bound_json_atomic(
+            &output,
+            &artifact,
+            &serde_json::json!({"stale": "record"}),
+        )
+        .unwrap_err();
+        assert!(error.contains("changed after the campaign was frozen"));
+        assert!(!output.exists());
+        assert!(!temp.path().join(".run.json.tmp").exists());
     }
 
     #[test]
