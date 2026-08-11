@@ -59,6 +59,42 @@ fn mlx_revision(lockfile: &Path) -> String {
     revision.to_ascii_lowercase()
 }
 
+/// Every tracked repository file can affect the benchmark executable through Rust compilation,
+/// feature wiring, generated includes, or workspace dependency resolution. Once a build script emits
+/// any `rerun-if-changed` directive Cargo stops applying its package-wide default, so enumerate the
+/// complete tracked input set explicitly rather than watching only Cargo.lock and Git metadata.
+pub(crate) fn tracked_build_inputs(root: &Path) -> Vec<PathBuf> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "-z", "--cached"])
+        .output()
+        .unwrap_or_else(|error| panic!("start git ls-files: {error}"));
+    assert!(
+        output.status.success(),
+        "git ls-files failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let mut paths = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| {
+            let relative = std::str::from_utf8(path)
+                .expect("tracked repository paths must be UTF-8 for Cargo change tracking");
+            root.join(relative)
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths
+}
+
+pub(crate) fn source_state(root: &Path) -> (String, bool) {
+    let revision = command(root, &["rev-parse", "HEAD"]);
+    let dirty = !command(root, &["status", "--porcelain", "--untracked-files=all"]).is_empty();
+    (revision, dirty)
+}
+
 fn main() {
     if env::var_os("CARGO_FEATURE_PERF_BENCH").is_none() {
         return;
@@ -71,7 +107,9 @@ fn main() {
         .expect("runtime-macos must live under crates/bundles")
         .to_path_buf();
     let lockfile = root.join("Cargo.lock");
-    println!("cargo:rerun-if-changed={}", lockfile.display());
+    for path in tracked_build_inputs(&root) {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
     println!("cargo:rerun-if-env-changed=RUSTFLAGS");
     println!("cargo:rerun-if-env-changed=CARGO_ENCODED_RUSTFLAGS");
 
@@ -100,8 +138,7 @@ fn main() {
         }
     }
 
-    let source_revision = command(&root, &["rev-parse", "HEAD"]);
-    let dirty = !command(&root, &["status", "--porcelain", "--untracked-files=all"]).is_empty();
+    let (source_revision, dirty) = source_state(&root);
     println!("cargo:rustc-env=SCENEWORKS_BENCH_SOURCE_REVISION={source_revision}");
     println!(
         "cargo:rustc-env=SCENEWORKS_BENCH_MLX_REVISION={}",
