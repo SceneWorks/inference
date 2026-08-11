@@ -23,6 +23,38 @@ pub const AUDIO_FIXTURE: &str = concat!(
     "/tests/fixtures/audio_vae_decode.safetensors"
 );
 
+/// The committed text-encoder parity fixture, produced by `tools/dump_minimax_h3_te.py` running
+/// the **transformers** `Qwen3VLTextModel` — an independent reference graph — at tiny dims.
+///
+/// Carries the select-layer context AND both neighbouring layers' contexts, so an off-by-one in
+/// either direction is a failure rather than a plausible-looking tensor. Its safetensors metadata
+/// additionally pins the chat-template prefix and the special-token id map, both derived from the
+/// shipped `chat_template.json` / `tokenizer_config.json` rather than transcribed by hand.
+pub const TE_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/te_context.safetensors"
+);
+
+/// The tiny text-encoder geometry the fixture was dumped at. Mirrors `dump_minimax_h3_te.py`:
+/// `head_dim` deliberately != `hidden_size / num_heads` (32 vs 16), exactly as the real model has
+/// 128 != 5120/64, and `select_hidden` < `num_layers` so the unused-tail trim is exercised.
+pub fn te_fixture_config() -> mlx_gen_minimax_h3::MiniMaxH3TeConfig {
+    mlx_gen_minimax_h3::MiniMaxH3TeConfig {
+        hidden_size: 64,
+        num_layers: 6,
+        num_heads: 4,
+        num_kv_heads: 2,
+        head_dim: 32,
+        intermediate_size: 128,
+        rms_norm_eps: 1e-6,
+        rope_theta: 5_000_000.0,
+        vocab_size: 256,
+        select_hidden: 4,
+        prefix_tokens: 3,
+        ..mlx_gen_minimax_h3::MiniMaxH3TeConfig::qwen3_vl_32b()
+    }
+}
+
 /// The tiny audio geometry the fixture was dumped at.
 ///
 /// Only the *width* is shrunk — `decoder_dim` 1024 → 128 (the smallest that survives all seven
