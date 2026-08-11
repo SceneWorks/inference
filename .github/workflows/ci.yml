@@ -74,6 +74,11 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           fetch-depth: 0
+      # Feature-epic refs form a protected branch train. Keep this in `changes`, which is
+      # unconditional for every CI event and is itself required by the aggregate `CI gate`.
+      # A path-gated lane would let a docs-only topology violation merge without a verdict.
+      - name: Enforce feature-epic pull-request topology
+        run: python3 scripts/ci/feature_epic_policy.py
       # Every BASE_SHA below must name `github.event.merge_group.base_sha`. A merge_group event
       # carries NEITHER `pull_request.base.sha` NOR `before`, and the two consumers fail in
       # opposite directions on an empty base: select_lanes.py hard-errors (visible), while
