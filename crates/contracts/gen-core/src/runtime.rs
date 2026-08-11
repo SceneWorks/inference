@@ -3,9 +3,25 @@
 //! precision knobs, adapter specs, cooperative cancellation, and progress events.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::SystemTime;
+
+/// Conditional [`LoadSpec::components`] id used when [`LoadSpec::weights`] is a single-file DiT.
+///
+/// A provider whose ordinary form is a multi-component snapshot can keep the same provider id and
+/// accept `WeightsSource::File(dit)` by taking the tokenizer/text-encoder/VAE/config companion from
+/// `components[BASE_SNAPSHOT_COMPONENT] = WeightsSource::Dir(snapshot)`. The component is conditional
+/// on the `File` source form, so it is intentionally not listed in a descriptor's unconditional
+/// `required_components` set.
+pub const BASE_SNAPSHOT_COMPONENT: &str = "base_snapshot";
+
+/// Optional in-place ComfyUI text-encoder file paired with a single-file DiT.
+pub const COMFYUI_TEXT_ENCODER_COMPONENT: &str = "comfyui_text_encoder";
+
+/// Optional in-place ComfyUI VAE file paired with a single-file DiT.
+pub const COMFYUI_VAE_COMPONENT: &str = "comfyui_vae";
 
 /// Where a model's weights come from — **always a local, already-provisioned path**. There is
 /// deliberately **no** hub-fetch variant: inference never self-fetches weights and has no knowledge
@@ -20,6 +36,143 @@ pub enum WeightsSource {
     Dir(PathBuf),
     /// A single `.safetensors` file.
     File(PathBuf),
+}
+
+/// Mutation-sensitive identity for one filesystem entry or its resolved file target.
+///
+/// The source entry and target are intentionally separate. Hugging Face snapshots commonly expose
+/// an extension-bearing symlink whose target is an extensionless blob; a streamed loader must keep
+/// opening the source path (format dispatch depends on it) while detecting replacement of either the
+/// link or the blob. `symlink_metadata` supplies the entry half and `metadata` the target half.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct FileStatFingerprint {
+    pub size: u64,
+    pub modified: Option<SystemTime>,
+    pub is_symlink: bool,
+    pub symlink_target: Option<PathBuf>,
+    #[cfg(unix)]
+    pub device: u64,
+    #[cfg(unix)]
+    pub inode: u64,
+    #[cfg(unix)]
+    pub changed_seconds: i64,
+    #[cfg(unix)]
+    pub changed_nanoseconds: i64,
+    #[cfg(not(unix))]
+    pub created: Option<SystemTime>,
+}
+
+fn stat_fingerprint(path: &Path, follow: bool) -> std::io::Result<FileStatFingerprint> {
+    let metadata = if follow {
+        std::fs::metadata(path)?
+    } else {
+        std::fs::symlink_metadata(path)?
+    };
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+    let is_symlink = !follow && metadata.file_type().is_symlink();
+    Ok(FileStatFingerprint {
+        size: metadata.len(),
+        modified: metadata.modified().ok(),
+        is_symlink,
+        symlink_target: is_symlink.then(|| std::fs::read_link(path)).transpose()?,
+        #[cfg(unix)]
+        device: metadata.dev(),
+        #[cfg(unix)]
+        inode: metadata.ino(),
+        #[cfg(unix)]
+        changed_seconds: metadata.ctime(),
+        #[cfg(unix)]
+        changed_nanoseconds: metadata.ctime_nsec(),
+        #[cfg(not(unix))]
+        created: metadata.created().ok(),
+    })
+}
+
+/// A re-openable single-file weights source pinned without canonicalizing its loader path.
+///
+/// The retained path is absolute but otherwise lexical: an extension-bearing snapshot symlink stays
+/// extension-bearing. Every window can call [`ensure_unchanged`](Self::ensure_unchanged) before
+/// re-opening it, which detects mutation/replacement of both the entry (`lstat`) and resolved target.
+/// The paired fingerprints are also suitable for cache/provenance identity without hashing a
+/// multi-gigabyte checkpoint on each request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PinnedWeightsFile {
+    loader_path: PathBuf,
+    entry_fingerprint: FileStatFingerprint,
+    target_fingerprint: FileStatFingerprint,
+}
+
+impl PinnedWeightsFile {
+    pub fn pin(path: impl AsRef<Path>) -> crate::Result<Self> {
+        let loader_path = std::path::absolute(path.as_ref())?;
+        let entry_fingerprint = stat_fingerprint(&loader_path, false)?;
+        let target_fingerprint = stat_fingerprint(&loader_path, true)?;
+        if target_fingerprint.is_symlink || !std::fs::metadata(&loader_path)?.is_file() {
+            return Err(crate::Error::Msg(format!(
+                "weights source is not a regular file: {}",
+                loader_path.display()
+            )));
+        }
+        Ok(Self {
+            loader_path,
+            entry_fingerprint,
+            target_fingerprint,
+        })
+    }
+
+    pub fn loader_path(&self) -> &Path {
+        &self.loader_path
+    }
+
+    pub fn entry_fingerprint(&self) -> &FileStatFingerprint {
+        &self.entry_fingerprint
+    }
+
+    pub fn target_fingerprint(&self) -> &FileStatFingerprint {
+        &self.target_fingerprint
+    }
+
+    pub fn ensure_unchanged(&self) -> crate::Result<()> {
+        let entry = stat_fingerprint(&self.loader_path, false)?;
+        if entry != self.entry_fingerprint {
+            return Err(crate::Error::Unsupported(format!(
+                "pinned weights entry changed after load: {}",
+                self.loader_path.display()
+            )));
+        }
+        let target = stat_fingerprint(&self.loader_path, true)?;
+        if target != self.target_fingerprint {
+            return Err(crate::Error::Unsupported(format!(
+                "pinned weights target changed after load: {}",
+                self.loader_path.display()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Run one source read against the retained loader path, validating the pin both immediately
+    /// before the path is opened and immediately after the read completes.
+    ///
+    /// The second check closes the validation-to-open/use race that a lone
+    /// [`ensure_unchanged`](Self::ensure_unchanged) leaves: replacing a selected checkpoint while a
+    /// provider is parsing/remapping it cannot silently produce a generator whose provenance still
+    /// names the earlier file. Callers should keep this same pin for every lazy or sequential reopen.
+    ///
+    /// The post-read check runs even when `read` returns an error. If both the read and the pin fail,
+    /// the mutation error wins because it is the stronger source-identity diagnosis.
+    pub fn read_unchanged<T, E>(
+        &self,
+        read: impl FnOnce(&Path) -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E>
+    where
+        E: From<crate::Error>,
+    {
+        self.ensure_unchanged().map_err(E::from)?;
+        let result = read(&self.loader_path);
+        self.ensure_unchanged().map_err(E::from)?;
+        result
+    }
 }
 
 /// Quantization tier a load may request. [`Q4`](Self::Q4)/[`Q8`](Self::Q8) are the group-wise
@@ -605,7 +758,107 @@ pub enum LoadPhase {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::io::Read;
+    use std::sync::{Barrier, Mutex};
+
+    #[test]
+    fn pinned_weights_file_detects_target_mutation() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = dir.path().join("model.safetensors");
+        std::fs::write(&file, b"original").expect("write fixture");
+        let pinned = PinnedWeightsFile::pin(&file).expect("pin regular file");
+
+        assert_eq!(pinned.loader_path(), file.as_path());
+        pinned.ensure_unchanged().expect("unchanged file");
+
+        std::fs::write(&file, b"replacement bytes").expect("mutate fixture");
+        let error = pinned
+            .ensure_unchanged()
+            .expect_err("mutation must invalidate the pin")
+            .to_string();
+        assert!(error.contains("changed after load"), "got: {error}");
+    }
+
+    #[test]
+    fn pinned_weights_file_rejects_a_barrier_controlled_mid_read_replacement() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = dir.path().join("model.safetensors");
+        let original = vec![0x5a; 128 * 1024];
+        std::fs::write(&file, &original).expect("write fixture");
+        let pinned = PinnedWeightsFile::pin(&file).expect("pin regular file");
+        let consumed_first_chunk = Arc::new(Barrier::new(2));
+        let replacement_done = Arc::new(Barrier::new(2));
+
+        let writer_file = file.clone();
+        let writer_entered = Arc::clone(&consumed_first_chunk);
+        let writer_done = Arc::clone(&replacement_done);
+        let writer = std::thread::spawn(move || {
+            writer_entered.wait();
+            let replacement = writer_file.with_extension("replacement");
+            std::fs::write(&replacement, vec![0xa5; 128 * 1024])
+                .expect("write replacement beside source");
+            #[cfg(unix)]
+            std::fs::rename(replacement, writer_file).expect("atomically replace during read");
+            #[cfg(not(unix))]
+            {
+                let bytes = std::fs::read(replacement).expect("read replacement fixture");
+                std::fs::write(writer_file, bytes).expect("overwrite source during read");
+            }
+            writer_done.wait();
+        });
+
+        let error = pinned
+            .read_unchanged::<_, crate::Error>(|path| {
+                // Open and consume part of the original payload before allowing replacement. The
+                // remainder is then read from the already-open original inode, proving the post-read
+                // check—not a pre-open race—is what rejects the mixed-provenance operation.
+                let mut source = std::fs::File::open(path)?;
+                let mut bytes = vec![0; 4096];
+                source.read_exact(&mut bytes)?;
+                assert!(bytes.iter().all(|byte| *byte == 0x5a));
+                consumed_first_chunk.wait();
+                replacement_done.wait();
+                source.read_to_end(&mut bytes)?;
+                assert_eq!(bytes.len(), original.len());
+                #[cfg(unix)]
+                assert!(bytes.iter().all(|byte| *byte == 0x5a));
+                Ok(bytes)
+            })
+            .expect_err("a replacement between the two checks must fail")
+            .to_string();
+        writer.join().expect("writer thread");
+        assert!(error.contains("changed after load"), "got: {error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_weights_file_preserves_and_pins_the_symlink_entry() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let first = dir.path().join("content-addressed-blob-a");
+        let second = dir.path().join("content-addressed-blob-b");
+        let link = dir.path().join("selected-model.safetensors");
+        std::fs::write(&first, b"same-size-a").expect("write first target");
+        std::fs::write(&second, b"same-size-b").expect("write second target");
+        symlink(&first, &link).expect("create extension-bearing symlink");
+
+        let pinned = PinnedWeightsFile::pin(&link).expect("pin symlinked file");
+        assert_eq!(
+            pinned.loader_path(),
+            link.as_path(),
+            "the loader path must stay lexical rather than canonicalizing to the blob"
+        );
+        pinned.ensure_unchanged().expect("unchanged symlink");
+
+        std::fs::remove_file(&link).expect("remove old link");
+        symlink(&second, &link).expect("retarget symlink");
+        let error = pinned
+            .ensure_unchanged()
+            .expect_err("retargeting the entry must invalidate the pin")
+            .to_string();
+        assert!(error.contains("entry changed"), "got: {error}");
+    }
 
     fn frame(current: u32, total: u32) -> PreviewFrame {
         PreviewFrame {

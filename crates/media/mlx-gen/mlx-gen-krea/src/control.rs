@@ -85,10 +85,31 @@ impl Krea2ControlBranch {
     /// `Dir` of shards), against the base DiT `cfg` (block dims must match the frozen base).
     pub fn from_source(control: &WeightsSource, cfg: &Krea2Config) -> Result<Self> {
         let w = match control {
-            WeightsSource::File(p) => Weights::from_file(p)?,
+            WeightsSource::File(p) => {
+                let w = Weights::from_file(p)?;
+                // File-backed MLX arrays are lazy. Keep payload evaluation inside the caller's
+                // mutation guard before the branch retains any of these arrays.
+                #[cfg(test)]
+                run_control_materialize_test_hook(ControlMaterializeTestStage::Before, &w)?;
+                w.materialize()?;
+                #[cfg(test)]
+                run_control_materialize_test_hook(ControlMaterializeTestStage::After, &w)?;
+                w
+            }
             WeightsSource::Dir(p) => Weights::from_dir(p)?,
         };
         Self::from_weights(&w, cfg)
+    }
+
+    /// Load a File overlay through a constructor-retained pin. The guard spans MLX's lazy payload
+    /// evaluation and complete branch assembly, and its post-check wins over an assembly error if the
+    /// selected path changes mid-load.
+    pub(crate) fn from_pinned_file(
+        control: &mlx_gen::PinnedWeightsFile,
+        cfg: &Krea2Config,
+    ) -> Result<Self> {
+        control
+            .read_unchanged(|path| Self::from_source(&WeightsSource::File(path.to_path_buf()), cfg))
     }
 
     /// Assemble the branch from an already-loaded overlay. Infers `N` from the `blocks.{i}.*` keys and
@@ -269,6 +290,34 @@ impl Krea2ControlBranch {
     }
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ControlMaterializeTestStage {
+    Before,
+    After,
+}
+
+#[cfg(test)]
+type ControlMaterializeTestHook =
+    Box<dyn FnMut(ControlMaterializeTestStage, &Weights) -> Result<()>>;
+
+#[cfg(test)]
+thread_local! {
+    static CONTROL_MATERIALIZE_TEST_HOOK: std::cell::RefCell<Option<ControlMaterializeTestHook>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn run_control_materialize_test_hook(
+    stage: ControlMaterializeTestStage,
+    weights: &Weights,
+) -> Result<()> {
+    CONTROL_MATERIALIZE_TEST_HOOK.with(|slot| match slot.borrow_mut().as_mut() {
+        Some(hook) => hook(stage, weights),
+        None => Ok(()),
+    })
+}
+
 /// Per-element root-mean-square `sqrt(mean(x²))` as a 0-d scalar array, reduced in f32 (candle upcasts).
 fn rms(t: &Array) -> Result<Array> {
     Ok(sqrt(
@@ -305,6 +354,80 @@ fn read_inject_offset(w: &Weights) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires an accessible Apple Metal device; run explicitly on a physical macOS GPU host"]
+    fn pinned_file_entrypoint_postchecks_after_control_payload_evaluation() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("control.safetensors");
+        let replacement = tmp.path().join("control.replacement.safetensors");
+        let elements = 64 * 1024;
+        for (path, first, last) in [
+            (&source, 0.25_f32, 0.75_f32),
+            (&replacement, -0.25_f32, -0.75_f32),
+        ] {
+            let first = Array::from_slice(&vec![first; elements], &[elements as i32]);
+            let last = Array::from_slice(&vec![last; elements], &[elements as i32]);
+            Array::save_safetensors(
+                vec![("fixture.first", &first), ("fixture.last", &last)],
+                None,
+                path,
+            )
+            .unwrap();
+        }
+        let pinned = mlx_gen::PinnedWeightsFile::pin(&source).unwrap();
+        let first_evaluated = Arc::new(Barrier::new(2));
+        let replacement_done = Arc::new(Barrier::new(2));
+        let final_evaluated = Arc::new(AtomicBool::new(false));
+
+        let writer_first = Arc::clone(&first_evaluated);
+        let writer_done = Arc::clone(&replacement_done);
+        let writer_source = source.clone();
+        let writer = std::thread::spawn(move || {
+            writer_first.wait();
+            std::fs::rename(replacement, writer_source).unwrap();
+            writer_done.wait();
+        });
+
+        let hook_first = Arc::clone(&first_evaluated);
+        let hook_done = Arc::clone(&replacement_done);
+        let hook_final = Arc::clone(&final_evaluated);
+        CONTROL_MATERIALIZE_TEST_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |stage, weights| {
+                match stage {
+                    ControlMaterializeTestStage::Before => {
+                        let first = weights.require("fixture.first")?;
+                        first.eval()?;
+                        assert!(first.as_slice::<f32>().iter().all(|value| *value == 0.25));
+                        hook_first.wait();
+                        hook_done.wait();
+                    }
+                    ControlMaterializeTestStage::After => {
+                        assert_eq!(
+                            weights.require("fixture.last")?.as_slice::<f32>().len(),
+                            elements
+                        );
+                        hook_final.store(true, Ordering::SeqCst);
+                    }
+                }
+                Ok(())
+            }));
+        });
+
+        let result = Krea2ControlBranch::from_pinned_file(&pinned, &Krea2Config::turbo());
+        CONTROL_MATERIALIZE_TEST_HOOK.with(|slot| *slot.borrow_mut() = None);
+        writer.join().unwrap();
+
+        assert!(final_evaluated.load(Ordering::SeqCst));
+        let error = result
+            .err()
+            .expect("mid-load replacement must invalidate the production control File entrypoint")
+            .to_string();
+        assert!(error.contains("changed after load"), "unexpected: {error}");
+    }
 
     #[test]
     fn residual_index_maps_branch_to_offset_block() {

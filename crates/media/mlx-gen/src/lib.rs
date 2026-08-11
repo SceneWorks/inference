@@ -91,7 +91,10 @@ pub use caption::{
     CaptionCapabilities, CaptionFinishReason, CaptionOptions, CaptionOutput, CaptionRequest,
     CaptionSampling, Captioner, CaptionerDescriptor,
 };
-pub use control::{require_base_dir, require_control, AcceptedControlKinds, ControlBranch};
+pub use control::{
+    require_base_dir, require_base_snapshot, require_component_file, require_control,
+    AcceptedControlKinds, ControlBranch,
+};
 pub use decoder::LatentDecoder;
 pub use error::{Error, Result};
 pub use gen_core::sampling::{
@@ -113,8 +116,9 @@ pub use registry::{
 pub use residency::{Residency, StagedHeavy};
 pub use runtime::{
     AdapterApplyReport, AdapterKind, AdapterSpec, CancelFlag, IdentityWeights, LoadPhase,
-    LoadShape, LoadSpec, MoeExpert, OffloadPolicy, PidWeights, Precision, PreviewFrame,
-    PreviewSink, Progress, Quant, WeightsSource,
+    LoadShape, LoadSpec, MoeExpert, OffloadPolicy, PidWeights, PinnedWeightsFile, Precision,
+    PreviewFrame, PreviewSink, Progress, Quant, WeightsSource, BASE_SNAPSHOT_COMPONENT,
+    COMFYUI_TEXT_ENCODER_COMPONENT, COMFYUI_VAE_COMPONENT,
 };
 pub use sampler::{
     curated_sampler_names, curated_scheduler_names, resolve_flow_schedule, resolve_schedule,

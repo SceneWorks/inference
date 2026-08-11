@@ -186,8 +186,33 @@ impl SafetensorsTensorHeader {
     pub fn is_float(&self) -> bool {
         matches!(
             self.dtype,
-            Dtype::F16 | Dtype::BF16 | Dtype::F32 | Dtype::F64
+            Dtype::F8_E4M3 | Dtype::F16 | Dtype::BF16 | Dtype::F32 | Dtype::F64
         )
+    }
+
+    /// Checked element count described by the tensor shape.
+    pub fn element_count(&self) -> Result<u64> {
+        self.shape.iter().try_fold(1_u64, |count, dimension| {
+            let dimension = u64::try_from(*dimension).map_err(|_| {
+                Error::Msg(format!(
+                    "tensor {:?} has an unrepresentable dimension",
+                    self.name
+                ))
+            })?;
+            count
+                .checked_mul(dimension)
+                .ok_or_else(|| Error::Msg(format!("tensor {:?} element count overflow", self.name)))
+        })
+    }
+
+    /// Checked bytes after a loader materializes each logical element at `width` bytes.
+    pub fn materialized_bytes(&self, width: u64) -> Result<u64> {
+        self.element_count()?.checked_mul(width).ok_or_else(|| {
+            Error::Msg(format!(
+                "tensor {:?} {width}-byte materialization size overflow",
+                self.name
+            ))
+        })
     }
 }
 
