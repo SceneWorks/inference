@@ -127,6 +127,32 @@ mod tests {
     }
 
     #[test]
+    fn tiled_default_forwards_exactly_and_cancels_before_decode() {
+        let decoder = ForwardingDecoder;
+        let input = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[1, 4]);
+        let cfg = TilingConfig::spatial_only(512, 64);
+        let got = decoder.decode_tiled(&input, &cfg, None).unwrap();
+        assert_eq!(got.as_slice::<f32>(), input.as_slice::<f32>());
+
+        struct MustNotDecode;
+        impl LatentDecoder for MustNotDecode {
+            fn input_latent_space(&self) -> Option<&LatentSpace> {
+                Some(&gen_core::QWEN_KREA_Z16_LATENT_SPACE)
+            }
+
+            fn decode(&self, _latents: &Array) -> Result<Array> {
+                panic!("pre-tripped cancellation must return before decode")
+            }
+        }
+        let cancel = CancelFlag::new();
+        cancel.cancel();
+        assert!(matches!(
+            MustNotDecode.decode_tiled(&input, &cfg, Some(&cancel)),
+            Err(Error::Canceled)
+        ));
+    }
+
+    #[test]
     fn route_validation_rejects_missing_and_packed_layout_mismatches() {
         let decoder = ForwardingDecoder;
         assert!(ensure_decoder_layout(None, &decoder).is_err());

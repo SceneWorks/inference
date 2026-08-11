@@ -1029,7 +1029,75 @@ pub(crate) fn render_sample(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
+
+    struct DecodeSpy {
+        output: Array,
+        calls: Cell<usize>,
+    }
+
+    impl DecodeSpy {
+        fn new(output: Array) -> Self {
+            Self {
+                output,
+                calls: Cell::new(0),
+            }
+        }
+    }
+
+    impl LatentDecoder for DecodeSpy {
+        fn input_latent_space(&self) -> Option<&mlx_gen::gen_core::LatentSpace> {
+            Some(&mlx_gen::gen_core::FLUX1_LATENT_SPACE)
+        }
+
+        fn decode(&self, _latents: &Array) -> Result<Array> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(self.output.clone())
+        }
+    }
+
+    fn legacy_decode_one(decoder: &dyn LatentDecoder, latent: &Array) -> Image {
+        let unpacked = unpack_latents(latent).unwrap();
+        let decoded = decoder
+            .decode(&unpacked)
+            .unwrap()
+            .as_dtype(Dtype::Float32)
+            .unwrap();
+        decoded_to_image(&decoded).unwrap()
+    }
+
+    /// SC-18309 N1: compare the full Z-Image engine's latent-unpack/decode/RGB route with the exact
+    /// historical no-override expression. The PiD-shaped arm pins override output layout and the
+    /// trait's no-op handling of native tile geometry.
+    #[test]
+    fn decode_batch_keeps_native_and_override_bytes_exact() {
+        let latent = Array::from_slice(&[0.0f32; 16 * 2 * 3], &[16, 1, 2, 3]);
+        let native_output = Array::from_slice(
+            &[
+                -1.0f32, -0.5, 0.0, 0.5, 1.0, 0.25, 1.0, 0.5, 0.0, -0.5, -1.0, -0.25, -0.75, -0.25,
+                0.25, 0.75, -1.0, 1.0,
+            ],
+            &[1, 3, 1, 2, 3],
+        );
+        let legacy = DecodeSpy::new(native_output.clone());
+        let expected = legacy_decode_one(&legacy, &latent);
+        let native = DecodeSpy::new(native_output);
+        let cancel = CancelFlag::new();
+        let got = decode_batch(&native, None, vec![latent.clone()], &cancel, &mut |_| {}).unwrap();
+        assert_eq!(got, vec![expected]);
+        assert_eq!(native.calls.get(), 1);
+
+        let pid_output = Array::from_slice(&vec![1.0f32; 3 * 4 * 5], &[1, 3, 4, 5]);
+        let legacy_pid = DecodeSpy::new(pid_output.clone());
+        let expected_pid = legacy_decode_one(&legacy_pid, &latent);
+        let pid = DecodeSpy::new(pid_output);
+        let tiling = TilingConfig::spatial_only(16, 4);
+        let got = decode_batch(&pid, Some(&tiling), vec![latent], &cancel, &mut |_| {}).unwrap();
+        assert_eq!(got, vec![expected_pid]);
+        assert_eq!(pid.calls.get(), 1);
+    }
 
     #[test]
     fn every_variant_uses_the_canonical_request_rung_preamble() {

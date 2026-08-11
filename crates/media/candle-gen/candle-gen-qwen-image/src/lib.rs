@@ -484,37 +484,15 @@ impl Pipeline {
             // consume the same normalized `[1,16,H/8,W/8]` latent (QwenVae de-normalizes internally,
             // and PiD is trained on that normalized latent) — a zero-transform seam. PiD returns a
             // larger `[1,3,4H,4W]` tensor; `to_image` reads the size from it.
-            let decoder: &dyn LatentDecoder = pid_decoder
-                .as_ref()
-                .map(|decoder| decoder as &dyn LatentDecoder)
-                .unwrap_or(vae);
-            candle_gen::ensure_decoder_compatible(
-                Some(&candle_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE),
-                decoder,
+            let decoded = decode_final_latents(
+                vae,
+                pid_decoder
+                    .as_ref()
+                    .map(|decoder| decoder as &dyn LatentDecoder),
+                &lat,
+                memory,
+                &req.cancel,
             )?;
-            let tiling = memory
-                .tile_vae_decode
-                .then(|| {
-                    let edge = memory
-                        .decode_tile_edge
-                        .unwrap_or(memory_strategy::DECODE_TILE_EDGE);
-                    let overlap = memory
-                        .decode_overlap
-                        .unwrap_or(memory_strategy::DECODE_OVERLAP);
-                    Ok::<_, CandleError>(TilingConfig::spatial_only(
-                        edge.try_into().map_err(|_| {
-                            CandleError::Msg(format!("Qwen decode tile edge {edge} exceeds i32"))
-                        })?,
-                        overlap.try_into().map_err(|_| {
-                            CandleError::Msg(format!("Qwen decode overlap {overlap} exceeds i32"))
-                        })?,
-                    ))
-                })
-                .transpose()?;
-            let decoded = match tiling.as_ref() {
-                Some(tiling) => decoder.decode_tiled(&lat, tiling, Some(&req.cancel))?,
-                None => decoder.decode(&lat)?,
-            };
             control_common::to_image(&decoded)
         })
     }
@@ -692,6 +670,49 @@ impl Pipeline {
             vae: self.load_vae_seq()?,
             pid: self.load_pid(use_pid)?,
         })
+    }
+}
+
+/// Engine-level Qwen decoder route. Keeping selection, native tiling translation, and cancellation
+/// in one callable seam lets the exact default/no-override behavior be tested without constructing
+/// the 20B transformer aggregate.
+fn decode_final_latents(
+    native: &dyn LatentDecoder,
+    decoder: Option<&dyn LatentDecoder>,
+    latents: &Tensor,
+    memory: gen_core::GenerationMemory,
+    cancel: &gen_core::CancelFlag,
+) -> CResult<Tensor> {
+    if cancel.is_cancelled() {
+        return Err(CandleError::Canceled);
+    }
+    let decoder = decoder.unwrap_or(native);
+    candle_gen::ensure_decoder_compatible(
+        Some(&candle_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE),
+        decoder,
+    )?;
+    let tiling = memory
+        .tile_vae_decode
+        .then(|| {
+            let edge = memory
+                .decode_tile_edge
+                .unwrap_or(memory_strategy::DECODE_TILE_EDGE);
+            let overlap = memory
+                .decode_overlap
+                .unwrap_or(memory_strategy::DECODE_OVERLAP);
+            Ok::<_, CandleError>(TilingConfig::spatial_only(
+                edge.try_into().map_err(|_| {
+                    CandleError::Msg(format!("Qwen decode tile edge {edge} exceeds i32"))
+                })?,
+                overlap.try_into().map_err(|_| {
+                    CandleError::Msg(format!("Qwen decode overlap {overlap} exceeds i32"))
+                })?,
+            ))
+        })
+        .transpose()?;
+    match tiling.as_ref() {
+        Some(tiling) => decoder.decode_tiled(latents, tiling, Some(cancel)),
+        None => decoder.decode(latents),
     }
 }
 
@@ -1167,6 +1188,8 @@ mod explicit_registry_tests {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
     use candle_gen::gen_core::ConditioningKind;
 
@@ -1238,6 +1261,83 @@ mod tests {
             .expect("mid-load replacement must invalidate the production Qwen File entrypoint")
             .to_string();
         assert!(error.contains("changed after load"), "unexpected: {error}");
+    }
+
+    struct DecodeSpy {
+        output: Tensor,
+        calls: Cell<usize>,
+    }
+
+    impl DecodeSpy {
+        fn new(output: Tensor) -> Self {
+            Self {
+                output,
+                calls: Cell::new(0),
+            }
+        }
+    }
+
+    impl LatentDecoder for DecodeSpy {
+        fn input_latent_space(&self) -> Option<&gen_core::LatentSpace> {
+            Some(&gen_core::QWEN_KREA_Z16_LATENT_SPACE)
+        }
+
+        fn decode(&self, _latents: &Tensor) -> CResult<Tensor> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(self.output.clone())
+        }
+    }
+
+    fn legacy_decode(decoder: &dyn LatentDecoder, latents: &Tensor) -> Image {
+        control_common::to_image(&decoder.decode(latents).unwrap()).unwrap()
+    }
+
+    /// SC-18309 N1: execute Qwen's real final-latent route and compare it byte-for-byte with the old
+    /// native/PiD match arms. Asymmetric RGB values catch channel-order drift; the override returns a
+    /// different output geometry so dispatch and dynamic-size handling cannot pass accidentally.
+    #[test]
+    fn final_decode_keeps_default_and_override_bytes_exact() {
+        let device = Device::Cpu;
+        let latents = Tensor::zeros((1, 16, 2, 3), DType::F32, &device).unwrap();
+        let native_output = Tensor::from_vec(
+            vec![
+                -1.0f32, -0.5, 0.0, 0.5, 1.0, 0.25, 1.0, 0.5, 0.0, -0.5, -1.0, -0.25, -0.75, -0.25,
+                0.25, 0.75, -1.0, 1.0,
+            ],
+            (1, 3, 2, 3),
+            &device,
+        )
+        .unwrap();
+        let legacy = DecodeSpy::new(native_output.clone());
+        let expected = legacy_decode(&legacy, &latents);
+        let native = DecodeSpy::new(native_output);
+        let cancel = gen_core::CancelFlag::default();
+        let decoded = decode_final_latents(
+            &native,
+            None,
+            &latents,
+            gen_core::GenerationMemory::default(),
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(control_common::to_image(&decoded).unwrap(), expected);
+        assert_eq!(native.calls.get(), 1);
+
+        let native = DecodeSpy::new(Tensor::zeros((1, 3, 2, 3), DType::F32, &device).unwrap());
+        let pid_output = Tensor::ones((1, 3, 4, 5), DType::F32, &device).unwrap();
+        let legacy_pid = DecodeSpy::new(pid_output.clone());
+        let expected_pid = legacy_decode(&legacy_pid, &latents);
+        let pid = DecodeSpy::new(pid_output);
+        let memory = gen_core::GenerationMemory {
+            tile_vae_decode: true,
+            decode_tile_edge: Some(16),
+            decode_overlap: Some(4),
+            ..Default::default()
+        };
+        let decoded = decode_final_latents(&native, Some(&pid), &latents, memory, &cancel).unwrap();
+        assert_eq!(control_common::to_image(&decoded).unwrap(), expected_pid);
+        assert_eq!(native.calls.get(), 0);
+        assert_eq!(pid.calls.get(), 1);
     }
 
     /// F-177 (sc-12089): the PiD student is loaded only when the request will actually decode through it,

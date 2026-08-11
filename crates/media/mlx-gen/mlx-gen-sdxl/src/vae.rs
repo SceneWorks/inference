@@ -345,6 +345,9 @@ impl Autoencoder {
         cfg: &mlx_gen::tiling::TilingConfig,
         cancel: Option<&mlx_gen::CancelFlag>,
     ) -> Result<Array> {
+        if cancel.is_some_and(mlx_gen::CancelFlag::is_cancelled) {
+            return Err(mlx_gen::Error::Canceled);
+        }
         let sh = latents.shape();
         if sh.len() != 4 {
             return Err(mlx_gen::Error::Msg(format!(
@@ -445,5 +448,31 @@ impl LatentDecoder for SdxlLatentDecoder<'_> {
                 .vae
                 .decode_tiled(&Self::to_nhwc(latents)?, tiling, cancel)?,
         )
+    }
+}
+
+#[cfg(test)]
+mod decoder_seam_tests {
+    use super::*;
+
+    /// SC-18309 N1's weight-free layout gate. The engine historically passed NHWC directly to the
+    /// VAE; the generic seam is NCHW. Distinct values in every axis prove both adapter transposes are
+    /// exact inverses and prevent a silent channel/spatial permutation from hiding behind shapes.
+    #[test]
+    fn sdxl_seam_layout_roundtrip_is_byte_exact() {
+        let nchw = Array::from_slice(
+            &(0..(2 * 4 * 3 * 5))
+                .map(|value| value as f32)
+                .collect::<Vec<_>>(),
+            &[2, 4, 3, 5],
+        );
+        let nhwc = SdxlLatentDecoder::to_nhwc(&nchw).unwrap();
+        assert_eq!(nhwc.shape(), &[2, 3, 5, 4]);
+        let roundtrip = SdxlLatentDecoder::to_nchw(&nhwc).unwrap();
+        assert_eq!(roundtrip.shape(), nchw.shape());
+        assert_eq!(
+            roundtrip.reshape(&[-1]).unwrap().as_slice::<f32>(),
+            nchw.reshape(&[-1]).unwrap().as_slice::<f32>()
+        );
     }
 }
