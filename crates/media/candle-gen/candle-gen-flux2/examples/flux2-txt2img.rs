@@ -25,9 +25,11 @@
 //! ```
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use candle_gen::gen_core::{
-    GenerationOutput, GenerationRequest, LoadSpec, Progress, Quant, WeightsSource,
+    GenerationOutput, GenerationRequest, LoadSpec, Progress, PromptEnhancementOutcome,
+    PromptEnhancementReport, PromptEnhancementSink, Quant, WeightsSource,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -51,6 +53,9 @@ fn main() -> Result<()> {
     });
     let steps: Option<u32> = arg(&args, "--steps").and_then(|s| s.parse().ok());
     let guidance: Option<f32> = arg(&args, "--guidance").and_then(|s| s.parse().ok());
+    let enhance_prompt = args.iter().any(|value| value == "--enhance-prompt");
+    let enhance_max_tokens = arg(&args, "--enhance-max-tokens").and_then(|s| s.parse().ok());
+    let enhance_temperature = arg(&args, "--enhance-temperature").and_then(|s| s.parse().ok());
     let seed: u64 = arg(&args, "--seed")
         .and_then(|s| s.parse().ok())
         .unwrap_or(42);
@@ -127,6 +132,8 @@ fn main() -> Result<()> {
         gen.descriptor().backend
     );
 
+    let enhancement_reports = Arc::new(Mutex::new(Vec::<PromptEnhancementReport>::new()));
+    let enhancement_recorder = Arc::clone(&enhancement_reports);
     let req = GenerationRequest {
         prompt,
         width,
@@ -135,6 +142,13 @@ fn main() -> Result<()> {
         seed: Some(seed),
         steps,
         guidance,
+        enhance_prompt,
+        enhance_max_tokens,
+        enhance_temperature,
+        prompt_enhancement: PromptEnhancementSink::new(move |report| {
+            eprintln!("[smoke] prompt-enhancement={report:?}");
+            enhancement_recorder.lock().unwrap().push(report);
+        }),
         ..Default::default()
     };
 
@@ -150,6 +164,37 @@ fn main() -> Result<()> {
     let t0 = std::time::Instant::now();
     let gen_phase = probe.as_ref().map(|p| p.phase());
     let output = gen.generate(&req, &mut on_progress)?;
+    let reports = enhancement_reports.lock().unwrap();
+    if reports.len() != 1 {
+        return Err(format!(
+            "expected exactly one prompt-enhancement report, got {}",
+            reports.len()
+        )
+        .into());
+    }
+    let report = &reports[0];
+    if report.original_prompt != req.prompt {
+        return Err("prompt-enhancement report changed the original prompt".into());
+    }
+    match report.outcome {
+        PromptEnhancementOutcome::Enhanced
+            if report.effective_prompt.trim().is_empty()
+                || report.effective_prompt == report.original_prompt
+                || report.fallback_reason.is_some() =>
+        {
+            return Err("malformed enhanced prompt report".into());
+        }
+        PromptEnhancementOutcome::Fallback
+            if report.effective_prompt != report.original_prompt
+                || report.fallback_reason.as_deref().is_none_or(str::is_empty) =>
+        {
+            return Err("malformed prompt-enhancement fallback report".into());
+        }
+        PromptEnhancementOutcome::Absent if enhance_prompt => {
+            return Err("enhancement was requested but provider reported absent".into());
+        }
+        _ => {}
+    }
     if let (Some(p), Some(ph)) = (probe.as_mut(), gen_phase) {
         p.end_gen(ph);
     }

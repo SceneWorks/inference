@@ -22,11 +22,12 @@
 //! reference on the *same* loaded model. Both check the pre/mid cancel contract.
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::{
-    GenerationOutput, GenerationRequest, Image, LoadSpec, PreviewSink, Progress, Quant,
-    WeightsSource,
+    GenerationOutput, GenerationRequest, Image, LoadSpec, PreviewSink, Progress,
+    PromptEnhancementOutcome, PromptEnhancementReport, PromptEnhancementSink, Quant, WeightsSource,
 };
 use candle_gen_flux2::{Flux2Edit, Flux2EditPaths, Flux2EditRequest};
 
@@ -131,6 +132,45 @@ fn step_progress(tag: &'static str) -> impl FnMut(Progress) {
     }
 }
 
+fn take_enhancement_report(
+    reports: &Arc<Mutex<Vec<PromptEnhancementReport>>>,
+    original: &str,
+    requested: bool,
+) -> Result<PromptEnhancementReport> {
+    let mut reports = reports.lock().map_err(|_| "prompt report lock poisoned")?;
+    if reports.len() != 1 {
+        return Err(format!(
+            "expected exactly one prompt-enhancement report, got {}",
+            reports.len()
+        )
+        .into());
+    }
+    let report = reports.pop().expect("length checked above");
+    if report.original_prompt != original {
+        return Err("prompt-enhancement report changed the original prompt".into());
+    }
+    match report.outcome {
+        PromptEnhancementOutcome::Enhanced
+            if report.effective_prompt.trim().is_empty()
+                || report.effective_prompt == report.original_prompt
+                || report.fallback_reason.is_some() =>
+        {
+            return Err("malformed enhanced prompt report".into());
+        }
+        PromptEnhancementOutcome::Fallback
+            if report.effective_prompt != report.original_prompt
+                || report.fallback_reason.as_deref().is_none_or(str::is_empty) =>
+        {
+            return Err("malformed prompt-enhancement fallback report".into());
+        }
+        PromptEnhancementOutcome::Absent if requested => {
+            return Err("enhancement was requested but provider reported absent".into());
+        }
+        _ => {}
+    }
+    Ok(report)
+}
+
 struct Common {
     snapshot: String,
     prompt: String,
@@ -140,6 +180,9 @@ struct Common {
     width: u32,
     height: u32,
     out: PathBuf,
+    enhance_prompt: bool,
+    enhance_max_tokens: Option<u32>,
+    enhance_temperature: Option<f32>,
 }
 
 fn main() -> Result<()> {
@@ -172,6 +215,9 @@ fn main() -> Result<()> {
         out: arg(&args, "--out")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("flux2_edit.png")),
+        enhance_prompt: args.iter().any(|value| value == "--enhance-prompt"),
+        enhance_max_tokens: arg(&args, "--enhance-max-tokens").and_then(|s| s.parse().ok()),
+        enhance_temperature: arg(&args, "--enhance-temperature").and_then(|s| s.parse().ok()),
     };
 
     if dev_variant {
@@ -210,12 +256,24 @@ fn run_dev(args: &[String], c: &Common, quant: Option<Quant>) -> Result<()> {
         c.width, c.height, c.steps, c.guidance, c.seed, c.prompt
     );
 
+    let vram_gpu = args.iter().any(|value| value == "--vram-probe").then(|| {
+        arg(args, "--gpu")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0)
+    });
+    let mut probe = vram_gpu.map(candle_gen::testkit::VramProbe::start);
+    let load_phase = probe.as_ref().map(|probe| probe.phase());
     let model = Flux2Edit::load_dev(
         &Flux2EditPaths {
             root: PathBuf::from(&c.snapshot),
         },
         quant,
     )?;
+    if let (Some(probe), Some(phase)) = (probe.as_mut(), load_phase) {
+        probe.end_load(phase);
+    }
+    let enhancement_reports = Arc::new(Mutex::new(Vec::<PromptEnhancementReport>::new()));
+    let enhancement_recorder = Arc::clone(&enhancement_reports);
     let req = Flux2EditRequest {
         prompt: c.prompt.clone(),
         negative: String::new(),
@@ -224,6 +282,13 @@ fn run_dev(args: &[String], c: &Common, quant: Option<Quant>) -> Result<()> {
         steps: c.steps as usize,
         guidance: c.guidance,
         seed: c.seed,
+        enhance_prompt: c.enhance_prompt,
+        enhance_max_tokens: c.enhance_max_tokens,
+        enhance_temperature: c.enhance_temperature,
+        prompt_enhancement: PromptEnhancementSink::new(move |report| {
+            eprintln!("[edit-dev] prompt-enhancement={report:?}");
+            enhancement_recorder.lock().unwrap().push(report);
+        }),
         // Native VAE: this example exercises the edit pipeline, not the optional PiD SR (sc-8044).
         use_pid: false,
         // Inert preview sink (epic 16948, sc-16955): this smoke driver wants the finished image, and
@@ -235,7 +300,13 @@ fn run_dev(args: &[String], c: &Common, quant: Option<Quant>) -> Result<()> {
     // 1) Single-reference edit.
     let mut prog = step_progress("edit-dev:1ref");
     let t0 = std::time::Instant::now();
+    let gen_phase = probe.as_ref().map(|probe| probe.phase());
     let single = model.generate(&req, std::slice::from_ref(&reference), &mut prog)?;
+    let report = take_enhancement_report(&enhancement_reports, &req.prompt, req.enhance_prompt)?;
+    if let (Some(probe), Some(phase)) = (probe.as_mut(), gen_phase) {
+        probe.end_gen(phase);
+    }
+    println!("\n[edit-dev] verified prompt-enhancement report: {report:?}");
     let (m, s) = mean_std(&single);
     println!(
         "\n[edit-dev] single-ref done in {:.1}s (mean {m:.1} / std {s:.1})",
@@ -243,11 +314,26 @@ fn run_dev(args: &[String], c: &Common, quant: Option<Quant>) -> Result<()> {
     );
     save(&single, &c.out)?;
     println!("[edit-dev] wrote {}", c.out.display());
+    if let Some(probe) = &probe {
+        println!(
+            "[vram] flux2_dev_edit {}x{}: {}",
+            c.width,
+            c.height,
+            probe.report()
+        );
+    }
+
+    // A focused real-weight caption/Pixtral smoke can stop after the first complete enhanced edit.
+    // The default harness still performs multi-reference, ablation, and cancellation coverage.
+    if args.iter().any(|value| value == "--single-only") {
+        return Ok(());
+    }
 
     // 2) Multi-reference edit ([ref, ref2]) — the multi-ref token concat (grids at t=10, t=20).
     let mut prog = step_progress("edit-dev:2ref");
     let t1 = std::time::Instant::now();
     let multi = model.generate(&req, &[reference.clone(), reference2], &mut prog)?;
+    take_enhancement_report(&enhancement_reports, &req.prompt, req.enhance_prompt)?;
     let (mm, ms) = mean_std(&multi);
     let multi_out = PathBuf::from(format!("{}_multi.png", c.out.display()));
     println!(
@@ -265,6 +351,7 @@ fn run_dev(args: &[String], c: &Common, quant: Option<Quant>) -> Result<()> {
         std::slice::from_ref(&gray_dummy(c.width, c.height)),
         &mut noop,
     )?;
+    take_enhancement_report(&enhancement_reports, &req.prompt, req.enhance_prompt)?;
     save(
         &dummy,
         &PathBuf::from(format!("{}_graydummy.png", c.out.display())),
@@ -337,6 +424,10 @@ fn run_klein(args: &[String], c: &Common) -> Result<()> {
         steps: c.steps as usize,
         guidance: c.guidance,
         seed: c.seed,
+        enhance_prompt: false,
+        enhance_max_tokens: None,
+        enhance_temperature: None,
+        prompt_enhancement: PromptEnhancementSink::default(),
         // Native VAE: this example exercises the edit pipeline, not the optional PiD SR (sc-8044).
         use_pid: false,
         // Inert preview sink (epic 16948, sc-16955): this smoke driver wants the finished image, and
