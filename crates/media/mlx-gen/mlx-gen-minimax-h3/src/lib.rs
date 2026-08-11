@@ -1,8 +1,10 @@
 //! # mlx-gen-minimax-h3
 //!
 //! Native-Rust / MLX inference for **MiniMax-H3 (Hailuo 3.0)** (`MiniMaxAI/MiniMax-H3`,
-//! Apache-2.0) — a joint audio+video generation family. This slice (sc-17140) is the crate
-//! skeleton plus the **video VAE decode** path:
+//! Apache-2.0) — a joint audio+video generation family. This crate currently carries the two
+//! **VAE decode** paths.
+//!
+//! ## Video VAE (sc-17140)
 //!
 //! - [`config`] carries the VAE geometry, the temporal knobs and the per-channel latent
 //!   statistics, reconciling the two published configs (neither is sufficient alone);
@@ -12,15 +14,32 @@
 //! - [`blocks`] and [`decoder`] implement the 36-layer transformer decoder;
 //! - [`vae`] assembles the de-normalize → chunk → decode → cross-fade decode path.
 //!
-//! The VAE is unusual: the encoder is a 3-D causal CNN but the **decoder is a transformer**
+//! The video VAE is unusual: the encoder is a 3-D causal CNN but the **decoder is a transformer**
 //! (36 layers, 2048 dim, ~5.2 B params) that performs all 16× spatial and 4× temporal upsampling
-//! in its output projection. Chunk/overlap/drop bookkeeping — not the blocks — is where this port
+//! in its output projection. Chunk/overlap/drop bookkeeping — not the blocks — is where that port
 //! is most easily wrong, so it is isolated and asserted independently of any tensor math.
 //!
-//! Not in this crate yet: the CNN encoder, the audio VAE (sc-17141), the DiT (sc-17144) and the
-//! pipeline (sc-17146/17147). Nothing is registered with `mlx-gen-catalog` — there is no
-//! generator to ship until the pipeline lands.
+//! ## Audio VAE (sc-17141)
+//!
+//! - [`audio_config`] reconciles the FL2VA source triple (`config.json` + `config.yaml` +
+//!   `metadata.json`) with the diffusers-repackaged root config, and reconstructs the five BigVGAN
+//!   knobs that exist only in the reference's `sample_rate` branch;
+//! - [`alias_free`] implements the Kaiser-sinc resamplers and the `SnakeBeta` periodic activation;
+//! - [`audio_vae`] assembles `dec_in_proj` → BigVGAN → clamp, plus the stereo/interleave path that
+//!   produces a `gen-core` `AudioTrack` at 32 kHz.
+//!
+//! The audio VAE is a **DAC-lineage encoder + BigVGAN decoder** — not an LTX-style audio VAE — and
+//! its decoder is **mono**: stereo is two independent 32-channel latents decoded through the same
+//! weights. Its numerical risk concentrates in 127 anti-aliased activations, so `SnakeBeta` and the
+//! resamplers each carry their own parity fixture rather than only end-to-end coverage.
+//!
+//! Not in this crate yet: either CNN encoder, the DiT (sc-17144) and the pipeline
+//! (sc-17146/17147). Nothing is registered with `mlx-gen-catalog` — there is no generator to ship
+//! until the pipeline lands.
 
+pub mod alias_free;
+pub mod audio_config;
+pub mod audio_vae;
 pub mod blocks;
 pub mod chunking;
 pub mod config;
@@ -29,6 +48,13 @@ pub mod rope;
 pub mod tensor;
 pub mod vae;
 
+pub use alias_free::{kaiser_sinc_filter1d, Activation1d, LowPassFilter1d, SnakeBeta, UpSample1d};
+pub use audio_config::{
+    BigVganConfig, MiniMaxH3AudioVaeConfig, ACTIVATION_KERNEL_SIZE, ACTIVATION_RESAMPLE_RATIO,
+    AUDIO_LATENTS_MEAN, AUDIO_LATENTS_STD, AUDIO_LATENT_CHANNELS, AUDIO_OUTPUT_CHANNELS,
+    AUDIO_SAMPLE_RATE, AUDIO_TOKEN_RATE_HZ,
+};
+pub use audio_vae::MiniMaxH3AudioVae;
 pub use chunking::{ChunkSpan, TemporalGeometry, TemporalPlan};
 pub use config::{
     MiniMaxH3VaeConfig, CLIP_LENGTH, DECODER_HEAD_DIM, DECODER_NUM_HEADS, DECODER_NUM_LAYERS,
@@ -60,5 +86,20 @@ mod tests {
         assert_eq!(LATENT_CHANNELS, 24);
         assert_eq!(LATENTS_MEAN.len(), LATENT_CHANNELS);
         assert_eq!(LATENTS_STD.len(), LATENT_CHANNELS);
+    }
+
+    /// The audio half's published envelope: 32 kHz stereo, 32 latent channels, 40 Hz tokens.
+    #[test]
+    fn audio_surface_is_the_published_envelope() {
+        let cfg = MiniMaxH3AudioVaeConfig::default();
+        assert_eq!(AUDIO_SAMPLE_RATE, 32_000);
+        assert_eq!(AUDIO_OUTPUT_CHANNELS, 2);
+        assert_eq!(AUDIO_LATENT_CHANNELS, 32);
+        assert_eq!(AUDIO_LATENTS_MEAN.len(), AUDIO_LATENT_CHANNELS);
+        assert_eq!(AUDIO_LATENTS_STD.len(), AUDIO_LATENT_CHANNELS);
+        // 40 Hz tokens: a 5-second clip is 200 tokens, and each token is 800 samples.
+        assert_eq!(cfg.hop_length(), 800);
+        assert_eq!(cfg.token_rate_hz() as u32, AUDIO_TOKEN_RATE_HZ);
+        assert_eq!(5 * AUDIO_TOKEN_RATE_HZ, 200);
     }
 }

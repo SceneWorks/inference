@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use mlx_rs::Array;
 
-use mlx_gen_minimax_h3::MiniMaxH3VaeConfig;
+use mlx_gen_minimax_h3::{BigVganConfig, MiniMaxH3AudioVaeConfig, MiniMaxH3VaeConfig};
 
 /// The committed parity fixture, produced by `tools/dump_minimax_h3_video_vae.py` running the
 /// Apache-2.0 reference implementation from the MiniMax-H3 snapshot.
@@ -14,6 +14,51 @@ pub const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/video_vae_decode.safetensors"
 );
+
+/// The committed audio parity fixture, produced by `tools/dump_minimax_h3_audio_vae.py` running
+/// the same snapshot's `FL2VA/audio_vae` bundle (`DacAudioVAE` / `BigVGAN` / `SnakeBeta` /
+/// `kaiser_sinc_filter1d`).
+pub const AUDIO_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/audio_vae_decode.safetensors"
+);
+
+/// The tiny audio geometry the fixture was dumped at.
+///
+/// Only the *width* is shrunk — `decoder_dim` 1024 → 128 (the smallest that survives all seven
+/// halvings) and `latent_dim` 2048 → 64. Everything that drives the arithmetic is the shipped
+/// value: `sample_rate` 32000, which is what selects the production BigVGAN branch, so all seven
+/// upsample stages, the `[3,7,11]` × `[1,3,5]` AMP table, the 800× hop and the 12-tap Kaiser-sinc
+/// filters are the real ones — as are the 32 latent channels and their de-normalization
+/// statistics.
+///
+/// Built by hand rather than through `from_source_files`, because the dump passes `latent_dim`
+/// explicitly instead of letting it derive from `encoder_dim · 2^len(encoder_rates)`; the
+/// derivation itself is covered by the config unit tests and by the real-weight smoke.
+pub fn audio_fixture_config() -> MiniMaxH3AudioVaeConfig {
+    let shipped = MiniMaxH3AudioVaeConfig::default();
+    MiniMaxH3AudioVaeConfig {
+        sample_rate: 32_000,
+        output_channels: 2,
+        latent_channels: 32,
+        encoder_dim: 8,
+        encoder_rates: vec![2, 2],
+        decoder_rates: vec![5, 5, 2, 2, 2, 2, 2],
+        decoder_dim: 128,
+        attn_proj: true,
+        decoder_type: "bigvgan".into(),
+        // The REAL 32-entry de-normalization statistics, not placeholders.
+        latents_mean: shipped.latents_mean.clone(),
+        latents_std: shipped.latents_std.clone(),
+        bigvgan: BigVganConfig::for_sample_rate(32_000, 64, 128).expect("32 kHz is supported"),
+    }
+}
+
+/// NCL `[B, C, T]` → MLX-native NLC `[B, T, C]`. The audio fixture stores the reference's NCL
+/// tensors; the port's public API is NCL too, so this is only for the internal NLC modules.
+pub fn to_nlc(x: &Array) -> Array {
+    x.transpose_axes(&[0, 2, 1]).unwrap()
+}
 
 /// The tiny geometry the fixture was dumped at. Structurally identical to the shipped model —
 /// same partial-rotary ratio, same 24 latent channels, and the **production** temporal knobs
