@@ -1471,6 +1471,7 @@ mod tests {
     #[cfg(unix)]
     fn prepared_callback_descriptor() -> ModelDescriptor {
         ModelDescriptor {
+            denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
             id: "prepared_callback_model",
