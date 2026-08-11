@@ -1025,7 +1025,11 @@ mod tests {
         let pool =
             candle_gen::cuda_mempool::MemPool::device_default(0).expect("CUDA default memory pool");
         assert!(pool.reset_high_water(), "reset CUDA pool high-water marks");
-        let mut probe = candle_gen::testkit::VramProbe::start_rendered().assert_idle(1.0);
+        // The self-hosted Windows lane's isolated GPU has a stable ~1.6 GB WDDM/UI baseline even
+        // when pmon shows no pure compute process. Prove that exact condition instead of either
+        // accepting a one-shot busy sample or pretending this runner is a headless <1 GB device.
+        let mut probe = candle_gen::testkit::VramProbe::start_rendered()
+            .assert_stable_idle(candle_gen::testkit::StableIdleConfig::new(2.0, 6, 64, 200));
 
         let load_phase = probe.phase();
         let load_started = std::time::Instant::now();

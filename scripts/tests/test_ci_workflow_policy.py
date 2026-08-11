@@ -1466,6 +1466,36 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn('tee -a "$evidence_log"', profile)
         self.assertNotIn("shell: powershell", profile)
         self.assertNotIn("Tee-Object", profile)
+
+        def idle_evidence_errors(value: str) -> list[str]:
+            errors = []
+            for required in (
+                'profile_gpu="${CUDA_VISIBLE_DEVICES%%,*}"',
+                'profile_gpu="${profile_gpu:-0}"',
+                '[[CUDA_IDLE_RAW]] profileGpu=$profile_gpu',
+                "--query-gpu=index,name,driver_version,pstate,utilization.gpu,memory.used,memory.total",
+                "for _ in 1 2 3 4 5 6; do",
+                'nvidia-smi pmon -i "$profile_gpu" -c 1 -s um',
+            ):
+                if required not in value:
+                    errors.append(f"missing {required}")
+            if value.count('-i "$profile_gpu"') != 3:
+                errors.append("every raw GPU query must use the rendered physical ordinal")
+            return errors
+
+        self.assertEqual(idle_evidence_errors(profile), [])
+        for mutation, changed in {
+            "missing raw samples": profile.replace("for _ in 1 2 3 4 5 6; do", "for _ in 1; do"),
+            "missing process evidence": profile.replace(
+                'nvidia-smi pmon -i "$profile_gpu" -c 1 -s um', "echo pmon-omitted"
+            ),
+            "wrong process GPU": profile.replace(
+                'nvidia-smi pmon -i "$profile_gpu"', 'nvidia-smi pmon -i "0"'
+            ),
+            "missing evidence marker": profile.replace("[[CUDA_IDLE_RAW]]", "[[CUDA_IDLE_OMITTED]]"),
+        }.items():
+            with self.subTest(idle_evidence_mutation=mutation):
+                self.assertTrue(idle_evidence_errors(changed))
         self.assertEqual(job.count("Tee-Object -FilePath $log -Append"), 3)
         self.assertNotIn("Tee-Object -LiteralPath $log -Append", job)
         self.assertIn("actions/upload-artifact@", job)
