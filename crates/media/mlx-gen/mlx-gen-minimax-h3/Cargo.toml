@@ -1,0 +1,26 @@
+[package]
+name = "mlx-gen-minimax-h3"
+version = "0.0.0"
+edition = "2021"
+description = "MiniMax-H3 (Hailuo 3.0) provider crate for mlx-gen: video VAE decoding (3D-CNN encoder / 36-layer ViT decoder)."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/mlx-gen"
+keywords = ["mlx", "apple-silicon", "minimax-h3", "video", "inference"]
+categories = ["science"]
+
+[dependencies]
+mlx-gen = { path = ".." }
+# Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
+mlx-rs = { workspace = true }
+# Parse the diffusers `vae/config.json` (per-channel latents_mean/std, decoder geometry, the
+# clip_length / token_drop temporal-chunk knobs).
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on
+# `Drop` — including out of a panicking test, which is the only path the old
+# `env::temp_dir().join(..)` + trailing `remove_dir_all` shape ever leaked on.
+tempfile = { workspace = true }
+# The real-weight smoke reads the shard index to prove the loader's key set is exhaustive against
+# the published checkpoint, not just against the committed fixture.
+serde_json = { workspace = true }
