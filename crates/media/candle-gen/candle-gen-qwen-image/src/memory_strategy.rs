@@ -32,20 +32,110 @@ pub const CALIBRATION_FINGERPRINT: &str =
     "qwen-image-cuda-staged-tiled-decode-bounded-attention-device-format-blocks-v1";
 
 fn streamable(spec: &LoadSpec) -> bool {
+    // File and Dir share the provider identity, but the evidence matrix has no source axis. Keep the
+    // imported path's rung 4 Missing until its pinned/re-openable implementation is measured directly;
+    // a snapshot measurement must not be claimed for a File source.
     matches!(spec.load_shape, LoadShape::DeferredMaterialization)
         && matches!(spec.weights, WeightsSource::Dir(_))
         && spec.adapters.is_empty()
         && spec.pid.is_none()
 }
 
+fn cast_component_bytes(
+    path: &std::path::Path,
+    float_width: u64,
+    component: &str,
+    validate_name: impl Fn(&str) -> gen_core::Result<()>,
+) -> gen_core::Result<u64> {
+    use gen_core::weightsmeta::Dtype;
+
+    let tensors = gen_core::weightsmeta::safetensors_path_tensor_headers(path)?;
+    if tensors.is_empty() {
+        return Err(gen_core::Error::Msg(format!(
+            "qwen-image imported {component} '{}' contains no tensors",
+            path.display()
+        )));
+    }
+    tensors.into_iter().try_fold(0_u64, |total, tensor| {
+        validate_name(&tensor.name)?;
+        let resident = match tensor.dtype {
+            Dtype::U8 | Dtype::U32 | Dtype::I16 | Dtype::I32 | Dtype::I64 => tensor.data_bytes,
+            Dtype::U16 => tensor.materialized_bytes(4)?,
+            Dtype::F8_E4M3
+            | Dtype::F16
+            | Dtype::BF16
+            | Dtype::F32
+            | Dtype::F64 => tensor.materialized_bytes(float_width)?,
+            dtype => {
+                return Err(gen_core::Error::Unsupported(format!(
+                    "qwen-image imported {component} tensor {:?} uses unsupported Candle dtype {dtype:?}",
+                    tensor.name
+                )))
+            }
+        };
+        total.checked_add(resident).ok_or_else(|| {
+            gen_core::Error::Msg(format!(
+                "qwen-image imported {component} resident byte sum overflow"
+            ))
+        })
+    })
+}
+
+fn imported_dit_bytes(path: &std::path::Path) -> gen_core::Result<u64> {
+    const PREFIX: &str = "model.diffusion_model.";
+    cast_component_bytes(path, 2, "DiT", |name| {
+        let Some(mapped) = name.strip_prefix(PREFIX) else {
+            return Err(gen_core::Error::Msg(format!(
+                "qwen-image ComfyUI DiT tensor {name:?} is outside the required {PREFIX:?} namespace"
+            )));
+        };
+        if mapped.is_empty() {
+            return Err(gen_core::Error::Msg(
+                "qwen-image ComfyUI DiT tensor maps to an empty key".into(),
+            ));
+        }
+        Ok(())
+    })
+}
+
+fn f32_component_bytes(path: &std::path::Path, component: &str) -> gen_core::Result<u64> {
+    cast_component_bytes(path, 4, component, |_| Ok(()))
+}
+
 pub(crate) fn provider_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> gen_core::Result<MemoryProviderContract> {
+    if provider_id == crate::MODEL_ID {
+        crate::validate_load_spec(spec)?;
+    }
     let streamable = streamable(spec);
-    let components =
-        PerComponentBytes::from_spec_subdirs(spec, &["text_encoder"], &["transformer"], &["vae"])
-            .unwrap_or_default();
+    let components = match &spec.weights {
+        WeightsSource::Dir(_) => PerComponentBytes::from_spec_subdirs(
+            spec,
+            &["text_encoder"],
+            &["transformer"],
+            &["vae"],
+        )
+        .unwrap_or_default(),
+        WeightsSource::File(path) => {
+            let base = gen_core::require_base_snapshot(spec, provider_id)?;
+            let vae = spec
+                .components
+                .get(gen_core::COMFYUI_VAE_COMPONENT)
+                .map(|source| match source {
+                    WeightsSource::Dir(path) | WeightsSource::File(path) => {
+                        f32_component_bytes(path, "VAE")
+                    }
+                })
+                .unwrap_or_else(|| f32_component_bytes(&base.join("vae"), "base VAE"))?;
+            PerComponentBytes {
+                text_encoder: f32_component_bytes(&base.join("text_encoder"), "base text encoder")?,
+                dit: imported_dit_bytes(path)?,
+                vae,
+            }
+        }
+    };
     let phases = vec![
         MemoryPhase::Conditioning,
         MemoryPhase::Denoise,
@@ -157,11 +247,7 @@ pub(crate) fn snapshot_quant_tier(
 ) -> gen_core::Result<Option<Quant>> {
     let root = match &spec.weights {
         WeightsSource::Dir(root) => root,
-        WeightsSource::File(_) => {
-            return Err(gen_core::Error::Msg(format!(
-                "{provider_id}: actual numeric tier requires a snapshot directory"
-            )))
-        }
+        WeightsSource::File(_) => return Ok(None),
     };
     let config = root.join("transformer/config.json");
     let packed = std::fs::read_to_string(&config)
@@ -532,6 +618,134 @@ mod tests {
         bytes.extend(header);
         bytes.extend([0_u8; 256]);
         std::fs::write(path, bytes).unwrap();
+    }
+
+    fn write_typed_safetensors(path: &std::path::Path, tensors: &[(&str, &str, &[usize], usize)]) {
+        let mut offset = 0_usize;
+        let mut header = serde_json::Map::new();
+        for (name, dtype, shape, bytes) in tensors {
+            header.insert(
+                (*name).to_owned(),
+                serde_json::json!({
+                    "dtype": dtype,
+                    "shape": shape,
+                    "data_offsets": [offset, offset + bytes],
+                }),
+            );
+            offset += bytes;
+        }
+        let mut header = serde_json::to_vec(&header).unwrap();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.resize(bytes.len() + offset, 0);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn file_spec(tmp: &tempfile::TempDir) -> LoadSpec {
+        let root = tmp.path().join("base");
+        for component in ["text_encoder", "vae"] {
+            std::fs::create_dir_all(root.join(component)).unwrap();
+        }
+        write_typed_safetensors(
+            &root.join("text_encoder/model.safetensors"),
+            &[("model.layer.weight", "F16", &[2], 4)],
+        );
+        write_typed_safetensors(
+            &root.join("vae/model.safetensors"),
+            &[("decoder.weight", "BF16", &[3], 6)],
+        );
+        let dit = tmp.path().join("dit.safetensors");
+        write_typed_safetensors(
+            &dit,
+            &[("model.diffusion_model.img_in.weight", "F8_E4M3", &[2, 4], 8)],
+        );
+        LoadSpec::new(WeightsSource::File(dit))
+            .with_component(gen_core::BASE_SNAPSHOT_COMPONENT, WeightsSource::Dir(root))
+    }
+
+    #[test]
+    fn imported_file_asset_facts_follow_dit_bf16_and_te_vae_f32_load_dtypes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut spec = file_spec(&tmp);
+        let vae = tmp.path().join("imported-vae.safetensors");
+        write_typed_safetensors(&vae, &[("decoder.weight", "F16", &[5], 10)]);
+        spec.components.insert(
+            gen_core::COMFYUI_VAE_COMPONENT.into(),
+            WeightsSource::File(vae),
+        );
+        let contract = provider_contract("qwen_image", &spec).unwrap();
+        assert_eq!(contract.asset_facts.conditioning_bytes, 2 * 4);
+        assert_eq!(contract.asset_facts.transformer_bytes, 2 * 4 * 2);
+        assert_eq!(contract.asset_facts.decoder_bytes, 5 * 4);
+        assert_eq!(contract.asset_facts.base_bytes, 44);
+    }
+
+    #[test]
+    fn imported_file_contract_and_loader_share_the_full_typed_field_matrix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let valid = file_spec(&tmp);
+        let mut cases = vec![("valid", valid.clone())];
+
+        let mut precision = valid.clone();
+        precision.precision = Precision::Fp32;
+        cases.push(("precision-is-accepted", precision));
+        let mut pid = valid.clone();
+        pid.pid = Some(gen_core::PidWeights {
+            checkpoint: WeightsSource::File(tmp.path().join("pid.safetensors")),
+            gemma: WeightsSource::Dir(tmp.path().join("gemma")),
+        });
+        cases.push(("pid-is-accepted", pid));
+
+        let mut adapter = valid.clone();
+        adapter.adapters.push(gen_core::AdapterSpec::new(
+            tmp.path().join("adapter.safetensors"),
+            1.0,
+            gen_core::AdapterKind::Lora,
+        ));
+        cases.push(("adapter", adapter));
+        let mut quant = valid.clone();
+        quant.quantize = Some(Quant::Q4);
+        cases.push(("quant", quant));
+        let mut control = valid.clone();
+        control.control = Some(WeightsSource::File(tmp.path().join("control.safetensors")));
+        cases.push(("control", control));
+        let mut extra = valid.clone();
+        extra
+            .extra_controls
+            .push(WeightsSource::File(tmp.path().join("extra.safetensors")));
+        cases.push(("extra-control", extra));
+        let mut ip = valid.clone();
+        ip.ip_adapter = Some(WeightsSource::File(tmp.path().join("ip.safetensors")));
+        cases.push(("ip-adapter", ip));
+        let mut identity = valid.clone();
+        identity.identity = Some(gen_core::IdentityWeights::default());
+        cases.push(("identity", identity));
+        let mut external_te = valid.clone();
+        external_te.text_encoder = Some(WeightsSource::Dir(tmp.path().join("external-te")));
+        cases.push(("external-text-encoder", external_te));
+        let mut unknown = valid.clone();
+        unknown.components.insert(
+            "unknown".into(),
+            WeightsSource::File(tmp.path().join("unknown.safetensors")),
+        );
+        cases.push(("unknown-component", unknown));
+        let mut vae_dir = valid.clone();
+        vae_dir.components.insert(
+            gen_core::COMFYUI_VAE_COMPONENT.into(),
+            WeightsSource::Dir(tmp.path().join("vae-dir")),
+        );
+        cases.push(("vae-dir", vae_dir));
+
+        for (name, spec) in cases {
+            assert_eq!(
+                crate::validate_load_spec(&spec).is_ok(),
+                provider_contract("qwen_image", &spec).is_ok(),
+                "File loader/contract validation drift for {name}"
+            );
+        }
     }
 
     fn spec(tmp: &tempfile::TempDir) -> LoadSpec {

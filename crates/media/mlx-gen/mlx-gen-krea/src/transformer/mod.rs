@@ -138,6 +138,17 @@ impl Krea2Transformer {
         self
     }
 
+    /// Arm bounded residency from a native/ComfyUI single-file DiT. The pinned source is reopened
+    /// and native-key-normalized for every block window; the extension-bearing loader path is kept
+    /// verbatim rather than canonicalized to an extensionless cache blob.
+    pub(crate) fn with_native_block_stream(mut self, source: mlx_gen::PinnedWeightsFile) -> Self {
+        self.block_stream = Some(crate::block_stream::KreaBlockStream::new_native(
+            source,
+            self.cfg.clone(),
+        ));
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn with_test_block_stream(
         mut self,

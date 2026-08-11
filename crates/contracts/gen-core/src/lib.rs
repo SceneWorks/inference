@@ -57,8 +57,8 @@ pub use caption::{
     CaptionSampling, Captioner, CaptionerDescriptor,
 };
 pub use control::{
-    reject_unknown_components, require_base_dir, require_component, require_control,
-    AcceptedControlKinds, ControlBranch,
+    reject_unknown_components, require_base_dir, require_base_snapshot, require_component,
+    require_component_file, require_control, AcceptedControlKinds, ControlBranch,
 };
 pub use error::{Error, Result};
 pub use face::{DetectedFace, FaceEmbedder, FaceEmbedderDescriptor};
@@ -109,9 +109,10 @@ pub use registry::{
 };
 pub use residency::{Residency, ResidencyRuntime, StagedHeavy};
 pub use runtime::{
-    AdapterApplyReport, AdapterKind, AdapterSpec, CancelFlag, IdentityWeights, LoadPhase,
-    LoadShape, LoadSpec, MoeExpert, OffloadPolicy, PidWeights, Precision, PreviewFrame,
-    PreviewSink, Progress, Quant, WeightsSource,
+    AdapterApplyReport, AdapterKind, AdapterSpec, CancelFlag, FileStatFingerprint, IdentityWeights,
+    LoadPhase, LoadShape, LoadSpec, MoeExpert, OffloadPolicy, PidWeights, PinnedWeightsFile,
+    Precision, PreviewFrame, PreviewSink, Progress, Quant, WeightsSource, BASE_SNAPSHOT_COMPONENT,
+    COMFYUI_TEXT_ENCODER_COMPONENT, COMFYUI_VAE_COMPONENT,
 };
 pub use text_embed::{TextEmbedder, TextEmbedderDescriptor};
 pub use tier_integrity::{control_branch_tier, is_above_selected_tier};

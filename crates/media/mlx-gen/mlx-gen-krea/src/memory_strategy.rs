@@ -44,6 +44,12 @@ pub fn memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> CoreResult<MemoryProviderContract> {
+    if matches!(spec.weights, mlx_gen::WeightsSource::File(_)) {
+        crate::model_control::validate_control_spec(spec)
+            .map_err(|error| CoreError::Msg(error.to_string()))?;
+        let base = mlx_gen::require_base_snapshot(spec, provider_id)?;
+        return native_memory_strategy_contract_from_spec(provider_id, spec, base, false);
+    }
     let (asset_facts, resident_components) = asset_facts(spec, provider_id)?;
     memory_strategy_contract_with_asset_facts(
         provider_id,
@@ -187,15 +193,30 @@ fn memory_strategy_contract_with_asset_facts(
 /// consumed and dropped), the text encoder and VAE come from the resident base tier, and the pose
 /// overlay loads dense — the native DiT is dense in memory, and a dense base carries a dense branch
 /// (`crate::memory::control_branch_quant_bits(None)`), so the overlay bytes are its stored bytes.
-/// Same `provider_id` + calibration fingerprint as the snapshot control contract, so promoted
-/// evidence keyed on the `krea_2_turbo_control` identity resolves for this composition through the
-/// same selectors (tier / geometry / load shape) rather than a bespoke imported identity.
-pub(crate) fn native_memory_strategy_contract(
+/// Same `provider_id` + calibration fingerprint as the snapshot control contract: implementation and
+/// provider evidence stay on one identity. The evidence matrix has no load-source axis, though, so a
+/// `Dir`-measured rung-4 cell must not be reported as a `File` measurement until this re-openable path
+/// is measured directly. The loader's reopenable mechanism stays available for its source smoke, but
+/// the registry contract must pass `streamable = false` until File evidence is promoted.
+pub(crate) fn native_memory_strategy_contract_from_spec(
     provider_id: &str,
-    dit_file: &std::path::Path,
+    spec: &LoadSpec,
     base_snapshot_dir: &std::path::Path,
-    control: &std::path::Path,
+    streamable: bool,
 ) -> CoreResult<MemoryProviderContract> {
+    let dit_file = match &spec.weights {
+        mlx_gen::WeightsSource::File(path) => path,
+        mlx_gen::WeightsSource::Dir(path) => {
+            return Err(CoreError::Msg(format!(
+                "{provider_id}: native pose-control facts require a single-file DiT, not {}",
+                path.display()
+            )))
+        }
+    };
+    let control = mlx_gen::require_control(spec, provider_id, "Krea 2 pose control overlay")?;
+    let control_path = match control {
+        mlx_gen::WeightsSource::Dir(path) | mlx_gen::WeightsSource::File(path) => path,
+    };
     let stored = |path: &std::path::Path, what: &str| -> CoreResult<u64> {
         projected_safetensors_bytes(path, |_| ResidentProjection::Stored).map_err(|error| {
             CoreError::Msg(format!(
@@ -208,11 +229,11 @@ pub(crate) fn native_memory_strategy_contract(
     let decoder_bytes = stored(&base_snapshot_dir.join("vae"), "base VAE")?;
     let transformer_bytes =
         crate::block_memory_strategy::native_dit_transformer_bytes(provider_id, dit_file)?;
-    let overlay_bytes = stored(control, "pose control overlay")?;
+    let overlay_bytes = stored(control_path, "pose control overlay")?;
     if overlay_bytes == 0 {
         return Err(CoreError::Msg(format!(
             "{provider_id}: pose control overlay '{}' contains no tensor bytes",
-            control.display()
+            control_path.display()
         )));
     }
     let resident_components = vec![MemoryResidentComponent {
@@ -230,16 +251,30 @@ pub(crate) fn native_memory_strategy_contract(
         decoder_bytes,
         overlay_bytes,
     };
-    // The native composition is Resident-only (the single-file DiT has no snapshot dir to re-load
-    // from), so the default spec below truthfully declares StagedResidency / windowing Missing.
-    let spec = LoadSpec::new(mlx_gen::WeightsSource::Dir(base_snapshot_dir.to_path_buf()));
     memory_strategy_contract_with_asset_facts(
         provider_id,
-        &spec,
+        spec,
         asset_facts,
         resident_components,
-        false,
+        streamable,
     )
+}
+
+/// Compatibility shim for the former bespoke imported-control entrypoint.
+#[cfg(test)]
+pub(crate) fn native_memory_strategy_contract(
+    provider_id: &str,
+    dit_file: &std::path::Path,
+    base_snapshot_dir: &std::path::Path,
+    control: &std::path::Path,
+) -> CoreResult<MemoryProviderContract> {
+    let spec = LoadSpec::new(mlx_gen::WeightsSource::File(dit_file.to_path_buf()))
+        .with_component(
+            mlx_gen::BASE_SNAPSHOT_COMPONENT,
+            mlx_gen::WeightsSource::Dir(base_snapshot_dir.to_path_buf()),
+        )
+        .with_control(mlx_gen::WeightsSource::File(control.to_path_buf()));
+    native_memory_strategy_contract_from_spec(provider_id, &spec, base_snapshot_dir, false)
 }
 
 fn streamable_base_transformer(spec: &LoadSpec, provider_id: &str) -> CoreResult<bool> {
@@ -568,6 +603,35 @@ mod tests {
     }
 
     #[test]
+    fn registry_file_control_contract_uses_file_bytes_but_withholds_rung_four() {
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
+        write_snapshot(&root);
+        let dit = root.join("imported-dit.safetensors");
+        write_control(&dit);
+        let overlay = root.join("control.safetensors");
+        write_control(&overlay);
+        let spec = LoadSpec::new(WeightsSource::File(dit))
+            .with_component(mlx_gen::BASE_SNAPSHOT_COMPONENT, WeightsSource::Dir(root))
+            .with_control(WeightsSource::File(overlay))
+            .with_offload_policy(mlx_gen::OffloadPolicy::Sequential)
+            .with_load_shape(mlx_gen::gen_core::LoadShape::DeferredMaterialization);
+
+        let contract = memory_strategy_contract("krea_2_turbo_control", &spec).unwrap();
+        assert_eq!(contract.provider_id, "krea_2_turbo_control");
+        assert_eq!(contract.asset_facts.transformer_bytes, 256);
+        assert_eq!(
+            contract
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .support,
+            MemoryStrategySupport::Missing,
+            "the pinned File mechanism needs source-specific evidence before authorization"
+        );
+        assert!(!contract.lifecycle.transformer_window_materialization);
+    }
+
+    #[test]
     fn staged_residency_and_synchronized_release_require_a_sequential_control_load() {
         let root_tmp = tempfile::tempdir().unwrap();
         let root = root_tmp.path().to_path_buf();
@@ -742,5 +806,115 @@ mod tests {
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
         assert!(memory_strategy_contract("krea_2_turbo_control", &spec).is_err());
         assert!(weights_free_memory_strategy_contract("krea_2_turbo_control", &spec).is_ok());
+    }
+
+    #[test]
+    fn imported_pose_overlay_inventory_rejects_missing_empty_and_corrupt_files() {
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
+        write_snapshot(&root);
+        let dit = root.join("imported.safetensors");
+        write_control(&dit);
+        let overlay = root.join("control.safetensors");
+        let spec = LoadSpec::new(WeightsSource::File(dit))
+            .with_component(
+                mlx_gen::BASE_SNAPSHOT_COMPONENT,
+                WeightsSource::Dir(root.clone()),
+            )
+            .with_control(WeightsSource::File(overlay.clone()));
+
+        for (case, replacement) in [
+            ("empty", Some(Vec::new())),
+            ("corrupt", Some(b"corrupt".to_vec())),
+            ("missing", None),
+        ] {
+            match replacement {
+                Some(bytes) => std::fs::write(&overlay, bytes).unwrap(),
+                None => {
+                    if overlay.exists() {
+                        std::fs::remove_file(&overlay).unwrap();
+                    }
+                }
+            }
+            let error = memory_strategy_contract("krea_2_turbo_control", &spec)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("pose control") || error.contains("safetensors"),
+                "{case}: {error}"
+            );
+            write_control(&overlay);
+        }
+    }
+
+    #[test]
+    fn imported_file_contract_matches_the_control_loader_for_every_typed_field() {
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
+        write_snapshot(&root);
+        let dit = root.join("imported.safetensors");
+        write_control(&dit);
+        let overlay = root.join("control.safetensors");
+        write_control(&overlay);
+        let valid = LoadSpec::new(WeightsSource::File(dit))
+            .with_component(
+                mlx_gen::BASE_SNAPSHOT_COMPONENT,
+                WeightsSource::Dir(root.clone()),
+            )
+            .with_control(WeightsSource::File(overlay));
+
+        let mut precision = valid.clone();
+        precision.precision = Precision::Fp32;
+        let mut extra_control = valid.clone();
+        extra_control
+            .extra_controls
+            .push(WeightsSource::File(root.join("extra-control.safetensors")));
+        let mut ip_adapter = valid.clone();
+        ip_adapter.ip_adapter = Some(WeightsSource::Dir(root.join("ip-adapter")));
+        let mut identity = valid.clone();
+        identity.identity = Some(mlx_gen::gen_core::IdentityWeights::default());
+        let mut text_encoder = valid.clone();
+        text_encoder.text_encoder = Some(WeightsSource::Dir(root.join("external-text")));
+        let mut pid = valid.clone();
+        pid.pid = Some(mlx_gen::gen_core::PidWeights {
+            checkpoint: WeightsSource::File(root.join("pid.safetensors")),
+            gemma: WeightsSource::Dir(root.join("gemma")),
+        });
+        let mut unknown_component = valid.clone();
+        unknown_component.components.insert(
+            "unknown".into(),
+            WeightsSource::File(root.join("unknown.safetensors")),
+        );
+        let mut missing_base = valid.clone();
+        missing_base.components.clear();
+        let accepted_adapter = valid.clone().with_adapters(vec![mlx_gen::AdapterSpec::new(
+            root.join("adapter.safetensors"),
+            1.0,
+            mlx_gen::AdapterKind::Lora,
+        )]);
+        let accepted_deferred = valid
+            .clone()
+            .with_offload_policy(mlx_gen::OffloadPolicy::Sequential)
+            .with_load_shape(mlx_gen::gen_core::LoadShape::DeferredMaterialization);
+
+        for (case, spec, expected) in [
+            ("valid", valid.clone(), true),
+            ("adapter", accepted_adapter, true),
+            ("deferred", accepted_deferred, true),
+            ("precision", precision, false),
+            ("quantize", valid.clone().with_quant(Quant::Q4), false),
+            ("extra_control", extra_control, false),
+            ("ip_adapter", ip_adapter, false),
+            ("pid", pid, false),
+            ("identity", identity, false),
+            ("text_encoder", text_encoder, false),
+            ("unknown_component", unknown_component, false),
+            ("missing_base", missing_base, false),
+        ] {
+            let loader = crate::model_control::validate_control_spec(&spec).is_ok();
+            let contract = memory_strategy_contract("krea_2_turbo_control", &spec).is_ok();
+            assert_eq!(loader, expected, "loader validation for {case}");
+            assert_eq!(contract, loader, "contract/loader parity for {case}");
+        }
     }
 }
