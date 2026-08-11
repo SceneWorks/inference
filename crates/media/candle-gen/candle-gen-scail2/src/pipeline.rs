@@ -320,7 +320,7 @@ fn shared_umt5_vb(root: &Path, device: &Device) -> CResult<VarBuilder<'static>> 
 
 fn shared_vae_vb(root: &Path, device: &Device) -> CResult<VarBuilder<'static>> {
     let map = cpu_f32_tensor_map(&[root.join("vae.safetensors")])?;
-    let map = candle_gen::remap_vae_wan_to_diffusers(map)?;
+    let map = candle_gen::remap_vae_wan_mlx_to_diffusers(map)?;
     Ok(VarBuilder::from_tensors(map, DType::F32, device))
 }
 
@@ -948,6 +948,7 @@ mod tests {
             "return cpu_cast_mmap_var_builder(&files",
             "SnapshotLayout::SharedMlxTier => cpu_cast_mmap_var_builder",
             "let map = cpu_f32_tensor_map(&[root.join(\"vae.safetensors\")])",
+            "remap_vae_wan_mlx_to_diffusers(map)",
         ] {
             assert!(
                 source.contains(required),
@@ -988,6 +989,40 @@ mod tests {
         assert_eq!(
             snapshot_layout(&canonical).unwrap(),
             SnapshotLayout::SharedMlxTier
+        );
+
+        // Bind the runtime proof to the exact complete VAE header. The FNV-1a input is the sorted
+        // `name<TAB>dtype<TAB>dimxdim...<LF>` stream; this guards all 194 names and source shapes
+        // without checking a hand-selected subset. The loader independently validates every tensor
+        // class and its post-transpose weight/bias relationship before device construction.
+        let vae_mapped = unsafe { cst::MmapedSafetensors::new(&canonical.join("vae.safetensors")) }
+            .expect("map exact VAE header");
+        let mut vae_specs = vae_mapped
+            .tensors()
+            .into_iter()
+            .map(|(name, view)| {
+                format!(
+                    "{name}\t{:?}\t{}\n",
+                    view.dtype(),
+                    view.shape()
+                        .iter()
+                        .map(usize::to_string)
+                        .collect::<Vec<_>>()
+                        .join("x")
+                )
+            })
+            .collect::<Vec<_>>();
+        vae_specs.sort_unstable();
+        assert_eq!(vae_specs.len(), 194, "exact SCAIL VAE tensor count");
+        let vae_header_fnv = vae_specs
+            .concat()
+            .bytes()
+            .fold(0xcbf29ce484222325_u64, |hash, byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+            });
+        assert_eq!(
+            vae_header_fnv, 0x48b594705c4d4db6,
+            "exact SceneWorks/scail2-mlx@ce88 VAE name/dtype/shape header drift"
         );
 
         let mut source_dtypes = Vec::new();
