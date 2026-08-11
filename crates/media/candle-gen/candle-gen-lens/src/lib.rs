@@ -1579,6 +1579,7 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             // round exactly onto the fit donor's — so both render lanes hand the shared sampler a
             // `candle_gen_flux2::preview` hook and no fit of its own is introduced.
             supports_preview: true,
+            supports_prompt_enhancement: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,

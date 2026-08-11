@@ -118,6 +118,7 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             // source-verified bidirectional guard in `candle-gen-catalog` (sc-16951), which derives
             // from this crate's shipped sources whether it actually emits.
             supports_preview: true,
+            supports_prompt_enhancement: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,

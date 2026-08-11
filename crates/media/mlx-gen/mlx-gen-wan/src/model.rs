@@ -140,6 +140,7 @@ pub fn descriptor() -> ModelDescriptor {
             // tell "bounds footprint here" from a no-op fallback.
             supports_sequential_offload: true,
             supports_preview: false,
+            supports_prompt_enhancement: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
@@ -759,6 +760,7 @@ pub fn descriptor_t2v_14b() -> ModelDescriptor {
             // the worker's fit-gate can tell "bounds peak here" from a no-op fallback.
             supports_sequential_offload: true,
             supports_preview: false,
+            supports_prompt_enhancement: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
@@ -1708,6 +1710,7 @@ pub fn descriptor_i2v_14b() -> ModelDescriptor {
             // the worker's fit-gate can tell "bounds peak here" from a no-op fallback.
             supports_sequential_offload: true,
             supports_preview: false,
+            supports_prompt_enhancement: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,

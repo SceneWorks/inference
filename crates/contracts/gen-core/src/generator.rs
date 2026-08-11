@@ -1811,6 +1811,14 @@ pub struct Capabilities {
     /// including before the first denoise step). This is advisory discoverability: it does not gate
     /// [`GenerationRequest::preview`] and [`PreviewSink`] itself does not report support.
     pub supports_preview: bool,
+    /// Whether [`GenerationRequest::enhance_prompt`] changes the prompt consumed by this provider.
+    ///
+    /// This is weights-free discoverability for an optional semantic path, not a routing promise:
+    /// consumers must still validate the complete request against the registered provider. `false`
+    /// means the field is ignored or rejected, so a UI must not describe the toggle as effective.
+    /// The flag is deliberately separate from text-LLM registration because prompt enhancement can
+    /// be an internal model component rather than a standalone catalog provider.
+    pub supports_prompt_enhancement: bool,
     /// Whether this model synthesizes audio **incrementally** through
     /// [`Generator::generate_streaming`] (sc-12846) — the opt-in signal for the realtime/streaming
     /// TTS path. `Default` is `false`: a non-streaming generator (every image/video model and the

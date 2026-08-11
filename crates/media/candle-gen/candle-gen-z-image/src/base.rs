@@ -283,6 +283,7 @@ pub fn descriptor() -> ModelDescriptor {
             // CFG blend happens inside the predict closure, so the previewed latent is always the
             // single conditional trajectory. Reuses the epic-16624 Z-Image fit ([`crate::preview`]).
             supports_preview: true,
+            supports_prompt_enhancement: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,

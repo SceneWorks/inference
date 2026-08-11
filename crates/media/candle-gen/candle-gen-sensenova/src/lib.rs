@@ -156,6 +156,7 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             // flow-match denoise loop in `t2i.rs`, which emits directly through
             // `PreviewHook::emit_step`; `preview` owns the fit and the pool to the token grid.
             supports_preview: true,
+            supports_prompt_enhancement: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,

@@ -12,7 +12,7 @@
 //! open-CLIP [`ScailClip`] image encode, the 28-channel [`extract_and_compress_mask_to_latent`] mask
 //! build, and the [`interpolate`]/[`downsample_half`] resizes.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::runtime::CancelFlag;
@@ -286,12 +286,16 @@ fn encode_text(
     Ok(embeds.reshape((l, d))?)
 }
 
-/// Build the SCAIL-2 UMT5 tokenizer from `root/tokenizer/tokenizer.json` **once** (sc-8991 / F-011), so
-/// the generator caches it on its `Components` and reuses it across generate calls rather than
-/// re-parsing per request. Byte-identical [`TokenizerConfig`] to the old per-generate load.
-pub fn build_tokenizer(root: &Path, te_cfg: &TextEncoderConfig) -> CResult<TextTokenizer> {
+/// Build the SCAIL-2 UMT5 tokenizer from an explicit `tokenizer.json` path **once** (sc-8991 /
+/// F-011). The legacy candle snapshot stores it under `tokenizer/tokenizer.json`; the shared
+/// `SceneWorks/scail2-mlx` tier stores the byte-identical tokenizer at the tier root. Keeping this
+/// path-shaped lets both layouts share one parser without copying the file.
+pub fn build_tokenizer_from_path(
+    tokenizer_path: PathBuf,
+    te_cfg: &TextEncoderConfig,
+) -> CResult<TextTokenizer> {
     TextTokenizer::from_file(
-        root.join("tokenizer/tokenizer.json"),
+        tokenizer_path,
         TokenizerConfig {
             max_length: te_cfg.max_length,
             pad_token_id: te_cfg.pad_token_id,
@@ -300,6 +304,11 @@ pub fn build_tokenizer(root: &Path, te_cfg: &TextEncoderConfig) -> CResult<TextT
         },
     )
     .map_err(|e| CandleError::Msg(format!("scail2: load tokenizer: {e}")))
+}
+
+/// Legacy component-directory wrapper retained for caller compatibility.
+pub fn build_tokenizer(root: &Path, te_cfg: &TextEncoderConfig) -> CResult<TextTokenizer> {
+    build_tokenizer_from_path(root.join("tokenizer/tokenizer.json"), te_cfg)
 }
 
 /// Run the full SCAIL-2 generation for `job` against the resident `comps`. `cancel` is polled each

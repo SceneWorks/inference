@@ -176,6 +176,7 @@ pub fn descriptor() -> ModelDescriptor {
             // `candle-gen-catalog`'s guard derives this flag from the sources — including from a
             // bespoke crate's direct emission call — so it cannot run ahead of or behind the wiring.
             supports_preview: true,
+            supports_prompt_enhancement: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,

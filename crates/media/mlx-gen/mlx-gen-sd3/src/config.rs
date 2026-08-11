@@ -256,6 +256,7 @@ impl Sd3Variant {
                 // `max(triple-TE, MMDiT+VAE)`. T5-XXL alone is the biggest TE-drop in the family.
                 supports_sequential_offload: true,
                 supports_preview: true,
+                supports_prompt_enhancement: false,
                 supports_streaming: false,
                 supports_multi_speaker: false,
                 supports_conversation_history: false,

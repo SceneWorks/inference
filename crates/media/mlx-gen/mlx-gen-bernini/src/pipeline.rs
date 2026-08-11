@@ -82,6 +82,7 @@ pub fn descriptor() -> ModelDescriptor {
             // flag is honest discovery parity + memory hygiene, not a behavior change.)
             supports_sequential_offload: true,
             supports_preview: false,
+            supports_prompt_enhancement: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,

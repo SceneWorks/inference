@@ -106,7 +106,7 @@ on:
         default: all
         # `audio` still runs every audio family. The `audio-*` entries are the per-family split
         # (sc-16981) — dispatch one provider family without taking the Metal runner for the rest.
-        options: [all, llm, llm-joycaption, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-s18-sweep, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base]
+        options: [all, llm, llm-joycaption, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-s18-sweep, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base]
       sceneworks_revision:
         description: Exact lowercase SceneWorks commit paired with memory-evidence-v1
         type: string
@@ -4759,6 +4759,143 @@ jobs:
         with:
           name: mage-memory-ladder-${{ github.sha }}
           path: ${{ runner.temp }}\mage-memory-*.rgb
+          if-no-files-found: error
+
+  candle-scail2-shared:
+    name: SCAIL-2 shared bf16 package (CUDA)
+    # This 47.2 GB package is an explicit release/admission calibration, not part of the weekly
+    # `all` sweep. Dispatch `profile=scail2` on the exact inference head being qualified.
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'scail2'
+    runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 240
+    env:
+      SCAIL2_REPOSITORY: "SceneWorks/scail2-mlx"
+      SCAIL2_REVISION: "ce88cfdb1008f395e9c820e525e6db7b6695f7b3"
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+      HF_HUB_DISABLE_IMPLICIT_TOKEN: "1"
+      HF_HUB_DISABLE_PROGRESS_BARS: "1"
+      HF_HUB_DISABLE_TELEMETRY: "1"
+      HF_HUB_VERBOSITY: "error"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Select Git Bash
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - name: Initialize exact SCAIL CUDA evidence
+        shell: powershell
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP "scail2-shared-cuda.log"
+          @(
+            "inference_head=${{ github.sha }}"
+            "repository=$env:SCAIL2_REPOSITORY"
+            "revision=$env:SCAIL2_REVISION"
+            "provision_status=validating_python"
+          ) | Set-Content -LiteralPath $log -Encoding utf8
+          where.exe python 2>&1 | Tee-Object -FilePath $log -Append
+          python --version 2>&1 | Tee-Object -FilePath $log -Append
+      - name: Validate runner-provisioned CPython 3.14 x64
+        shell: powershell
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP "scail2-shared-cuda.log"
+          $python = python -c "import platform,struct,sys; print('|'.join((sys.executable,sys.implementation.name,platform.python_version(),platform.machine(),str(struct.calcsize('P') * 8))))"
+          if ($LASTEXITCODE -ne 0 -or $python -notmatch '\|cpython\|3\.14\.\d+\|AMD64\|64$') {
+            "python_validation=failed value=$python" | Add-Content -LiteralPath $log -Encoding utf8
+            throw "expected runner-provisioned CPython 3.14 x64, got $python"
+          }
+          "python_validation=complete value=$python" | Add-Content -LiteralPath $log -Encoding utf8
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+          components: rustfmt, clippy
+      - name: Provision the exact public shared bf16 package
+        shell: powershell
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP "scail2-shared-cuda.log"
+          python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$env:RUNNER_TEMP\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py314.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:PYTHONPATH = "$env:RUNNER_TEMP\huggingface-hub"
+          @'
+          import os
+          from pathlib import Path
+          from huggingface_hub import snapshot_download
+
+          repo = os.environ["SCAIL2_REPOSITORY"]
+          revision = os.environ["SCAIL2_REVISION"]
+          root = Path(snapshot_download(
+              repo_id=repo,
+              repo_type="model",
+              revision=revision,
+              allow_patterns=["bf16/**"],
+              cache_dir=Path(os.environ["USERPROFILE"]) / ".cache" / "huggingface" / "hub",
+              token=False,
+              max_workers=4,
+          )).resolve() / "bf16"
+          expected = (
+              Path(os.environ["USERPROFILE"]) / ".cache" / "huggingface" / "hub" /
+              "models--SceneWorks--scail2-mlx" / "snapshots" / revision / "bf16"
+          ).resolve()
+          if root != expected:
+              raise SystemExit(f"resolved unexpected SCAIL package path: {root} != {expected}")
+          required = {
+              "config.json", "dit.safetensors", "t5_encoder.safetensors", "tokenizer.json",
+              "clip.safetensors", "vae.safetensors",
+          }
+          actual = {p.name for p in root.iterdir() if p.is_file()}
+          missing = sorted(required - actual)
+          if missing:
+              raise SystemExit(f"exact SCAIL bf16 package is incomplete: {missing}")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as out:
+              out.write(f"SCAIL2_SHARED_BF16_DIR={root}\n")
+          print(f"Exact shared package ready: {repo}@{revision}/bf16 -> {root}")
+          '@ | python - 2>&1 | Tee-Object -FilePath $log -Append
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "provision_status=complete" | Add-Content -LiteralPath $log -Encoding utf8
+      - name: Build the exact CUDA real-weight gate
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cargo test --locked --release --no-run -p candle-gen-scail2 --features cuda || exit /b 1
+      - name: Load through the production provider, minimally render, and measure the shared package
+        shell: bash
+        run: |
+          set -o pipefail
+          evidence_log="$(cygpath -u "$RUNNER_TEMP")/scail2-shared-cuda.log"
+          export PATH="$(cygpath -u "$CUDA_PATH")/bin:$PATH"
+          profile_gpu="${CUDA_VISIBLE_DEVICES%%,*}"
+          profile_gpu="${profile_gpu:-0}"
+          [[ "$profile_gpu" =~ ^[0-9]+$ ]] || {
+            echo "CUDA_VISIBLE_DEVICES must start with a physical GPU ordinal, got ${CUDA_VISIBLE_DEVICES:-<unset>}" >&2
+            exit 1
+          }
+          {
+            echo "[[CUDA_IDLE_RAW]] profileGpu=$profile_gpu visibleDevices=${CUDA_VISIBLE_DEVICES:-<unset>}"
+            nvidia-smi -i "$profile_gpu" \
+              --query-gpu=index,name,driver_version,pstate,utilization.gpu,memory.used,memory.total \
+              --format=csv,noheader
+            for _ in 1 2 3 4 5 6; do
+              nvidia-smi -i "$profile_gpu" --query-gpu=index,memory.used \
+                --format=csv,noheader,nounits
+              sleep 0.2
+            done
+            nvidia-smi pmon -i "$profile_gpu" -c 1 -s um
+          } 2>&1 | tee -a "$evidence_log"
+          cargo test --locked --release -p candle-gen-scail2 --features cuda \
+            pipeline::tests::shared_bf16_real_weights_cuda_loads_and_renders_with_measured_peak \
+            -- --ignored --exact --nocapture 2>&1 | tee -a "$evidence_log"
+          grep -Fq '[[SCAIL2_CUDA_VRAM]]' "$evidence_log" || {
+            echo 'the real-weight test passed without emitting its machine-readable VRAM record' >&2
+            exit 1
+          }
+      - name: Upload exact SCAIL CUDA evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: scail2-shared-cuda-${{ github.sha }}
+          path: ${{ runner.temp }}\scail2-shared-cuda.log
           if-no-files-found: error
 
   candle-media:
