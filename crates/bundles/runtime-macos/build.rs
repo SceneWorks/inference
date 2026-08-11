@@ -3,10 +3,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+fn git(root: &Path) -> Command {
+    let mut command = Command::new("git");
+    // The index is itself a watched input. A status refresh must not rewrite it after Cargo has
+    // fingerprinted the build-script run and thereby make every subsequent build dirty.
+    command.env("GIT_OPTIONAL_LOCKS", "0").arg("-C").arg(root);
+    command
+}
+
 fn command(root: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(root)
+    let output = git(root)
         .args(args)
         .output()
         .unwrap_or_else(|error| panic!("start git {}: {error}", args.join(" ")));
@@ -64,9 +70,7 @@ fn mlx_revision(lockfile: &Path) -> String {
 /// any `rerun-if-changed` directive Cargo stops applying its package-wide default, so enumerate the
 /// complete tracked input set explicitly rather than watching only Cargo.lock and Git metadata.
 pub(crate) fn tracked_build_inputs(root: &Path) -> Vec<PathBuf> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(root)
+    let output = git(root)
         .args(["ls-files", "-z", "--cached"])
         .output()
         .unwrap_or_else(|error| panic!("start git ls-files: {error}"));
