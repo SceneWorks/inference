@@ -105,7 +105,19 @@ pub(crate) fn load_transformer_with_stream(
 /// no `convrot` field, plus an F32 `[out]` or `[out,1]` scale (or scalar when `out == 1`). The consumed
 /// companions are removed so the existing strict native-key remap still sees exactly the dense DiT
 /// surface.
-fn dequant_plain_int8_tensorwise(mut native: Weights) -> Result<Weights> {
+#[cfg(test)]
+fn dequant_plain_int8_tensorwise(native: Weights) -> Result<Weights> {
+    dequant_plain_int8_tensorwise_with_evaluation(native, true)
+}
+
+/// Normalize the native plain-int8 convention, optionally evaluating each reconstructed dense
+/// projection immediately. Eager resident loads evaluate here to release the I8 source graph as each
+/// projection is rebuilt. Deferred block streams must leave the graph lazy: evaluating every block
+/// during each reopen would turn a nominal windowed loader back into full-DiT residency.
+fn dequant_plain_int8_tensorwise_with_evaluation(
+    mut native: Weights,
+    evaluate_dense: bool,
+) -> Result<Weights> {
     let int8_weights: Vec<String> = native
         .keys()
         .filter(|key| {
@@ -219,10 +231,12 @@ fn dequant_plain_int8_tensorwise(mut native: Weights) -> Result<Weights> {
             _ => scale,
         };
         let dense = multiply(&codes, &scale)?.as_dtype(Dtype::Bfloat16)?;
-        // MLX is lazy: materialize projection-by-projection so the dense model does not retain a
-        // graph edge to every removed I8 code/scale buffer (which would keep both the 13.5 GB source
-        // and the BF16 reconstruction alive for the whole load).
-        dense.eval()?;
+        if evaluate_dense {
+            // MLX is lazy: materialize projection-by-projection so the eager dense model does not
+            // retain a graph edge to every removed I8 code/scale buffer (which would keep both the
+            // 13.5 GB source and the BF16 reconstruction alive for the whole resident load).
+            dense.eval()?;
+        }
         native.insert(weight_key, dense);
         native.remove(&descriptor_key);
     }
@@ -286,14 +300,25 @@ fn run_native_materialize_test_hook(
 /// loader consumes only its accessed window under a separate pin guard; eagerly evaluating here
 /// would retain the full DiT and invalidate that implementation's residency bound.
 pub(crate) fn normalized_native_weights_lazy(dit_file: &Path) -> Result<Weights> {
-    normalized_native_weights_with_materializer(dit_file, |_| Ok(()))
+    normalized_native_weights_with_options(dit_file, false, |_| Ok(()))
 }
 
 fn normalized_native_weights_with_materializer(
     dit_file: &Path,
     materialize: impl FnOnce(&Weights) -> Result<()>,
 ) -> Result<Weights> {
-    let native = dequant_plain_int8_tensorwise(Weights::from_file(dit_file)?)?;
+    normalized_native_weights_with_options(dit_file, true, materialize)
+}
+
+fn normalized_native_weights_with_options(
+    dit_file: &Path,
+    evaluate_plain_int8: bool,
+    materialize: impl FnOnce(&Weights) -> Result<()>,
+) -> Result<Weights> {
+    let native = dequant_plain_int8_tensorwise_with_evaluation(
+        Weights::from_file(dit_file)?,
+        evaluate_plain_int8,
+    )?;
     let mut remapped = crate::native_remap::remap_native_dit_to_diffusers(native)?;
     crate::native_remap::normalize_modulation_tables(&mut remapped)?;
     // `Weights::from_file` and every MLX cast/remap above are lazy. Force the final normalized map
@@ -328,14 +353,23 @@ pub(crate) fn load_transformer_from_pinned_native_file_with_stream(
     streamable: bool,
 ) -> Result<Krea2Transformer> {
     pinned.read_unchanged(|path| {
-        let remapped = normalized_native_weights(path)?;
-        crate::convert::validate_transformer(&remapped, cfg)?;
-        let transformer = Krea2Transformer::from_weights(&remapped, cfg)?;
-        Ok(if streamable {
-            transformer.with_native_block_stream(pinned.clone())
+        if streamable {
+            let remapped = normalized_native_weights_lazy(path)?;
+            // Validation reads representative shapes only. Keep that access bookkeeping on a clone
+            // so the pin-bound evaluation below contains exactly the static model tensors retained by
+            // the deferred constructor, not a representative transformer block.
+            crate::convert::validate_transformer(&remapped.clone(), cfg)?;
+            let transformer = Krea2Transformer::from_weights_deferred(&remapped, cfg)?;
+            // The retained static arrays are also lazy file-backed graphs. Consume their exact read
+            // set before the immutable-file post-check; block payloads are consumed later under each
+            // KreaBlockStream reopen's own pin guard.
+            remapped.materialize_accessed()?;
+            Ok(transformer.with_native_block_stream(pinned.clone()))
         } else {
-            transformer
-        })
+            let remapped = normalized_native_weights(path)?;
+            crate::convert::validate_transformer(&remapped, cfg)?;
+            Krea2Transformer::from_weights(&remapped, cfg)
+        }
     })
 }
 
@@ -367,6 +401,39 @@ mod tests {
             Array::from_slice(descriptor.as_bytes(), &[descriptor.len() as i32]),
         );
         weights
+    }
+
+    #[test]
+    fn deferred_native_normalization_skips_the_full_map_materializer() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("deferred-native.safetensors");
+        let mut header = br#"{"model.diffusion_model.first.weight":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]},"model.diffusion_model.first.bias":{"dtype":"BF16","shape":[1],"data_offsets":[2,4]}}"#.to_vec();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut file = Vec::with_capacity(8 + header.len() + 4);
+        file.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        file.extend_from_slice(&header);
+        file.extend_from_slice(&[0, 0, 0, 0]);
+        std::fs::write(&source, file).unwrap();
+
+        let materialized = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&materialized);
+        NATIVE_MATERIALIZE_TEST_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |_, _| {
+                observed.store(true, Ordering::SeqCst);
+                Ok(())
+            }));
+        });
+        let normalized = normalized_native_weights_lazy(&source).unwrap();
+        NATIVE_MATERIALIZE_TEST_HOOK.with(|slot| *slot.borrow_mut() = None);
+
+        assert!(normalized.get("img_in.weight").is_some());
+        assert!(normalized.get("img_in.bias").is_some());
+        assert!(
+            !materialized.load(Ordering::SeqCst),
+            "the deferred File normalizer must never call the eager full-map materialization seam"
+        );
     }
 
     /// MLX keeps safetensors arrays and the remap/cast graph lazy. This regression places a real

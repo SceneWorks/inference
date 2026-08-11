@@ -58,8 +58,79 @@ pub struct FileStatFingerprint {
     pub changed_seconds: i64,
     #[cfg(unix)]
     pub changed_nanoseconds: i64,
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    pub volume_serial_number: u64,
+    #[cfg(windows)]
+    pub file_id: [u8; 16],
+    #[cfg(windows)]
+    pub change_time: i64,
+    #[cfg(not(any(unix, windows)))]
     pub created: Option<SystemTime>,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct WindowsFileStamp {
+    volume_serial_number: u64,
+    file_id: [u8; 16],
+    change_time: i64,
+}
+
+#[cfg(windows)]
+fn windows_path_stamp(path: &Path, follow: bool) -> std::io::Result<WindowsFileStamp> {
+    use std::mem::{size_of, MaybeUninit};
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileBasicInfo, FileIdInfo, GetFileInformationByHandleEx, FILE_BASIC_INFO,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let mut flags = FILE_FLAG_BACKUP_SEMANTICS;
+    if !follow {
+        flags |= FILE_FLAG_OPEN_REPARSE_POINT;
+    }
+    let file = std::fs::OpenOptions::new()
+        .access_mode(0)
+        // Prepared pins validate replacement rather than locking it out.
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(flags)
+        .open(path)?;
+    let handle = file.as_raw_handle();
+    let mut basic = MaybeUninit::<FILE_BASIC_INFO>::uninit();
+    // SAFETY: `file` owns a valid handle and the output buffer has the exact Win32 structure size.
+    let basic_ok = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileBasicInfo,
+            basic.as_mut_ptr().cast(),
+            size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    };
+    if basic_ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut id = MaybeUninit::<FILE_ID_INFO>::uninit();
+    // SAFETY: same valid handle and exact output-buffer contract as above.
+    let id_ok = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileIdInfo,
+            id.as_mut_ptr().cast(),
+            size_of::<FILE_ID_INFO>() as u32,
+        )
+    };
+    if id_ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: both successful calls initialized their complete output structures.
+    let (basic, id) = unsafe { (basic.assume_init(), id.assume_init()) };
+    Ok(WindowsFileStamp {
+        volume_serial_number: id.VolumeSerialNumber,
+        file_id: id.FileId.Identifier,
+        change_time: basic.ChangeTime,
+    })
 }
 
 fn stat_fingerprint(path: &Path, follow: bool) -> std::io::Result<FileStatFingerprint> {
@@ -70,6 +141,8 @@ fn stat_fingerprint(path: &Path, follow: bool) -> std::io::Result<FileStatFinger
     };
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
+    #[cfg(windows)]
+    let windows_stamp = windows_path_stamp(path, follow)?;
     let is_symlink = !follow && metadata.file_type().is_symlink();
     Ok(FileStatFingerprint {
         size: metadata.len(),
@@ -84,28 +157,145 @@ fn stat_fingerprint(path: &Path, follow: bool) -> std::io::Result<FileStatFinger
         changed_seconds: metadata.ctime(),
         #[cfg(unix)]
         changed_nanoseconds: metadata.ctime_nsec(),
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        volume_serial_number: windows_stamp.volume_serial_number,
+        #[cfg(windows)]
+        file_id: windows_stamp.file_id,
+        #[cfg(windows)]
+        change_time: windows_stamp.change_time,
+        #[cfg(not(any(unix, windows)))]
         created: metadata.created().ok(),
     })
+}
+
+/// Replacement-sensitive identity for one lexical parent component.
+///
+/// Unlike [`FileStatFingerprint`], this intentionally omits directory size/timestamps: ordinary
+/// sibling creation must not invalidate a model token. Device + inode detect persistent directory
+/// or symlink replacement on Unix, while the explicit link target detects a persistent retarget.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct PathComponentFingerprint {
+    path: PathBuf,
+    is_symlink: bool,
+    symlink_target: Option<PathBuf>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(windows)]
+    volume_serial_number: u64,
+    #[cfg(windows)]
+    file_id: [u8; 16],
+    #[cfg(not(any(unix, windows)))]
+    created: Option<SystemTime>,
+}
+
+fn path_component_fingerprints(path: &Path) -> std::io::Result<Vec<PathComponentFingerprint>> {
+    let mut parents: Vec<PathBuf> = path
+        .ancestors()
+        .skip(1)
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .collect();
+    parents.reverse();
+    parents
+        .into_iter()
+        .map(|parent| {
+            let metadata = std::fs::symlink_metadata(&parent)?;
+            #[cfg(unix)]
+            use std::os::unix::fs::MetadataExt;
+            #[cfg(windows)]
+            let windows_stamp = windows_path_stamp(&parent, false)?;
+            let is_symlink = metadata.file_type().is_symlink();
+            Ok(PathComponentFingerprint {
+                path: parent.clone(),
+                is_symlink,
+                symlink_target: is_symlink
+                    .then(|| std::fs::read_link(&parent))
+                    .transpose()?,
+                #[cfg(unix)]
+                device: metadata.dev(),
+                #[cfg(unix)]
+                inode: metadata.ino(),
+                #[cfg(windows)]
+                volume_serial_number: windows_stamp.volume_serial_number,
+                #[cfg(windows)]
+                file_id: windows_stamp.file_id,
+                #[cfg(not(any(unix, windows)))]
+                created: metadata.created().ok(),
+            })
+        })
+        .collect()
 }
 
 /// A re-openable single-file weights source pinned without canonicalizing its loader path.
 ///
 /// The retained path is absolute but otherwise lexical: an extension-bearing snapshot symlink stays
 /// extension-bearing. Every window can call [`ensure_unchanged`](Self::ensure_unchanged) before
-/// re-opening it, which detects mutation/replacement of both the entry (`lstat`) and resolved target.
-/// The paired fingerprints are also suitable for cache/provenance identity without hashing a
-/// multi-gigabyte checkpoint on each request.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// re-opening it, which detects persistent or identity-changing mutation/replacement of the lexical
+/// parent chain, entry (`lstat`), resolution, and resolved target. The fingerprints are also suitable
+/// for cache/provenance identity without hashing a multi-gigabyte checkpoint on each request. This
+/// remains a path-token model; see [`read_unchanged`](Self::read_unchanged) for its active-swap bound.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PinnedWeightsFile {
     loader_path: PathBuf,
+    canonical_target_path: PathBuf,
+    path_component_fingerprints: Vec<PathComponentFingerprint>,
     entry_fingerprint: FileStatFingerprint,
     target_fingerprint: FileStatFingerprint,
+}
+
+/// Read-only collection of caller-prepared File identities carried by a [`LoadSpec`].
+///
+/// The private `prepared` bit distinguishes ordinary compatibility mode from an intentionally
+/// prepared spec even when the spec has no File sources. Callers can inspect the map for cache-key
+/// construction, but can only transition or add tokens through [`LoadSpec`] methods; in particular,
+/// there is no mutable-map `clear` that could silently downgrade a prepared spec to compatibility
+/// mode.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PreparedFilePins {
+    prepared: bool,
+    finalized: bool,
+    pins: BTreeMap<PathBuf, PinnedWeightsFile>,
+}
+
+impl PreparedFilePins {
+    /// Whether this spec has explicitly entered prepared mode, including a prepared Dir-only spec.
+    pub fn is_prepared(&self) -> bool {
+        self.prepared
+    }
+
+    /// Whether the caller has installed the complete token set and finalized it for consumption.
+    pub fn is_finalized(&self) -> bool {
+        self.finalized
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pins.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.pins.len()
+    }
+
+    pub fn get(&self, path: &Path) -> Option<&PinnedWeightsFile> {
+        self.pins.get(path)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&PathBuf, &PinnedWeightsFile)> {
+        self.pins.iter()
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &PathBuf> {
+        self.pins.keys()
+    }
 }
 
 impl PinnedWeightsFile {
     pub fn pin(path: impl AsRef<Path>) -> crate::Result<Self> {
         let loader_path = std::path::absolute(path.as_ref())?;
+        let canonical_target_path = std::fs::canonicalize(&loader_path)?;
+        let path_component_fingerprints = path_component_fingerprints(&loader_path)?;
         let entry_fingerprint = stat_fingerprint(&loader_path, false)?;
         let target_fingerprint = stat_fingerprint(&loader_path, true)?;
         if target_fingerprint.is_symlink || !std::fs::metadata(&loader_path)?.is_file() {
@@ -114,15 +304,29 @@ impl PinnedWeightsFile {
                 loader_path.display()
             )));
         }
-        Ok(Self {
+        let pinned = Self {
             loader_path,
+            canonical_target_path,
+            path_component_fingerprints,
             entry_fingerprint,
             target_fingerprint,
-        })
+        };
+        // Prove the entry, parent chain, resolution, and target still agree after the multi-stat
+        // capture. This closes persistent changes during pin construction itself.
+        pinned.ensure_unchanged()?;
+        Ok(pinned)
     }
 
     pub fn loader_path(&self) -> &Path {
         &self.loader_path
+    }
+
+    /// Canonical target resolved by the same pinning operation that captured this token.
+    ///
+    /// A caller can root-confine this path before installing the token on a [`LoadSpec`], avoiding
+    /// a second resolution that could authorize a different filesystem object.
+    pub fn canonical_target_path(&self) -> &Path {
+        &self.canonical_target_path
     }
 
     pub fn entry_fingerprint(&self) -> &FileStatFingerprint {
@@ -134,10 +338,24 @@ impl PinnedWeightsFile {
     }
 
     pub fn ensure_unchanged(&self) -> crate::Result<()> {
+        let path_components = path_component_fingerprints(&self.loader_path)?;
+        if path_components != self.path_component_fingerprints {
+            return Err(crate::Error::Unsupported(format!(
+                "pinned weights path component changed after load: {}",
+                self.loader_path.display()
+            )));
+        }
         let entry = stat_fingerprint(&self.loader_path, false)?;
         if entry != self.entry_fingerprint {
             return Err(crate::Error::Unsupported(format!(
                 "pinned weights entry changed after load: {}",
+                self.loader_path.display()
+            )));
+        }
+        let canonical_target_path = std::fs::canonicalize(&self.loader_path)?;
+        if canonical_target_path != self.canonical_target_path {
+            return Err(crate::Error::Unsupported(format!(
+                "pinned weights resolution changed after load: {}",
                 self.loader_path.display()
             )));
         }
@@ -154,10 +372,11 @@ impl PinnedWeightsFile {
     /// Run one source read against the retained loader path, validating the pin both immediately
     /// before the path is opened and immediately after the read completes.
     ///
-    /// The second check closes the validation-to-open/use race that a lone
-    /// [`ensure_unchanged`](Self::ensure_unchanged) leaves: replacing a selected checkpoint while a
-    /// provider is parsing/remapping it cannot silently produce a generator whose provenance still
-    /// names the earlier file. Callers should keep this same pin for every lazy or sequential reopen.
+    /// The second check detects replacement that remains visible in the lexical entry, parent
+    /// components, resolution, or target identity after the callback. Callers should keep this same
+    /// pin for every lazy or sequential reopen. This is a path-token guard, not an opened-handle
+    /// lease: an active actor that swaps in B and restores the *original* A pathname object wholly
+    /// between the two checks is outside this guarantee.
     ///
     /// The post-read check runs even when `read` returns an error. If both the read and the pin fail,
     /// the mutation error wins because it is the stronger source-identity diagnosis.
@@ -286,6 +505,21 @@ pub enum LoadShape {
 #[derive(Clone, Debug)]
 pub struct LoadSpec {
     pub weights: WeightsSource,
+    /// Caller-prepared identities for every single-file source carried by this spec.
+    ///
+    /// SceneWorks resolves and confines primary weights, controls, adapters, typed auxiliaries, and
+    /// named components before it derives cache identity. Keeping those exact
+    /// [`PinnedWeightsFile`] tokens on the load spec lets the cache key and provider consume one
+    /// identity per lexical path instead of independently re-pinning whatever occupies that path at
+    /// two different times. Keys are absolute but otherwise lexical, so an extension-bearing HF
+    /// snapshot link is never canonicalized to its extensionless blob target.
+    ///
+    /// [`PreparedFilePins`] carries an explicit mode bit: an ordinary caller stays in compatibility
+    /// mode and [`Self::file_pin_for`] pins the requested source on demand, while an intentionally
+    /// prepared spec remains prepared even when it has no File sources. In prepared mode every
+    /// configured File source must have a matching token; a missing or orphaned token fails closed.
+    /// Prefer [`Self::prepare_file_sources`] or [`Self::with_prepared_file_pin`] to enter that mode.
+    prepared_file_pins: PreparedFilePins,
     pub quantize: Option<Quant>,
     pub precision: Precision,
     /// Auxiliary control-branch weights overlaid onto the base model at load time — a ControlNet
@@ -437,6 +671,7 @@ impl LoadSpec {
     pub fn new(weights: WeightsSource) -> Self {
         Self {
             weights,
+            prepared_file_pins: PreparedFilePins::default(),
             quantize: None,
             precision: Precision::Bf16,
             control: None,
@@ -450,6 +685,392 @@ impl LoadSpec {
             load_shape: LoadShape::EagerMaterialization,
             components: BTreeMap::new(),
         }
+    }
+
+    /// Read-only view of the prepared File identities carried by this spec.
+    ///
+    /// The whole field is private so a finalized spec cannot be silently downgraded by replacing
+    /// its collection with [`PreparedFilePins::default`].
+    ///
+    /// ```
+    /// use gen_core::PreparedFilePins;
+    /// assert!(!PreparedFilePins::default().is_prepared());
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use gen_core::{LoadSpec, PreparedFilePins, WeightsSource};
+    /// let mut spec = LoadSpec::new(WeightsSource::Dir("snapshot".into()));
+    /// spec.prepared_file_pins = PreparedFilePins::default();
+    /// ```
+    pub fn prepared_file_pins(&self) -> &PreparedFilePins {
+        &self.prepared_file_pins
+    }
+
+    /// Atomically install an already-pinned, complete File identity set without re-pinning.
+    ///
+    /// The caller can pin each source first, root-confine both its lexical
+    /// [`PinnedWeightsFile::loader_path`] and exact [`PinnedWeightsFile::canonical_target_path`],
+    /// then pass those same tokens here. The candidate set is fully checked before this spec is
+    /// mutated. An empty iterator intentionally finalizes a Dir-only spec.
+    pub fn prepare_with_file_pins(
+        &mut self,
+        prepared: impl IntoIterator<Item = PinnedWeightsFile>,
+    ) -> crate::Result<()> {
+        let mut pins = BTreeMap::new();
+        for pin in prepared {
+            pin.ensure_unchanged()?;
+            let path = pin.loader_path().to_path_buf();
+            if pins.insert(path.clone(), pin).is_some() {
+                return Err(crate::Error::Unsupported(format!(
+                    "duplicate prepared file token for {}",
+                    path.display()
+                )));
+            }
+        }
+        let candidate = PreparedFilePins {
+            prepared: true,
+            finalized: true,
+            pins,
+        };
+        self.validate_prepared_file_pin_set_for(&candidate)?;
+        if self.prepared_file_pins.is_finalized() && self.prepared_file_pins != candidate {
+            return Err(crate::Error::Unsupported(
+                "cannot replace finalized LoadSpec File identity".into(),
+            ));
+        }
+        self.prepared_file_pins = candidate;
+        Ok(())
+    }
+
+    /// Every File path configured anywhere on this load spec, in deterministic field order.
+    ///
+    /// This includes primary weights, typed overlays, adapters, PiD/identity/text-encoder files, and
+    /// named components. Duplicate lexical paths occur once in [`Self::prepared_file_pins`].
+    pub fn file_source_paths(&self) -> Vec<&Path> {
+        fn push_source<'a>(paths: &mut Vec<&'a Path>, source: &'a WeightsSource) {
+            if let WeightsSource::File(path) = source {
+                paths.push(path.as_path());
+            }
+        }
+
+        let mut paths = Vec::new();
+        push_source(&mut paths, &self.weights);
+        if let Some(source) = &self.control {
+            push_source(&mut paths, source);
+        }
+        for source in &self.extra_controls {
+            push_source(&mut paths, source);
+        }
+        if let Some(source) = &self.ip_adapter {
+            push_source(&mut paths, source);
+        }
+        paths.extend(self.adapters.iter().map(|adapter| adapter.path.as_path()));
+        if let Some(pid) = &self.pid {
+            push_source(&mut paths, &pid.checkpoint);
+            push_source(&mut paths, &pid.gemma);
+        }
+        if let Some(identity) = &self.identity {
+            for source in [&identity.encoder, &identity.eva, &identity.face_dir]
+                .into_iter()
+                .flatten()
+            {
+                push_source(&mut paths, source);
+            }
+        }
+        if let Some(source) = &self.text_encoder {
+            push_source(&mut paths, source);
+        }
+        for source in self.components.values() {
+            push_source(&mut paths, source);
+        }
+        paths
+    }
+
+    /// Attach one caller-prepared token to its expected configured File path.
+    pub fn with_prepared_file_pin(
+        mut self,
+        expected_path: impl AsRef<Path>,
+        prepared: PinnedWeightsFile,
+    ) -> crate::Result<Self> {
+        self.set_prepared_file_pin(expected_path, prepared)?;
+        Ok(self)
+    }
+
+    /// Mutable counterpart to [`Self::with_prepared_file_pin`].
+    pub fn set_prepared_file_pin(
+        &mut self,
+        expected_path: impl AsRef<Path>,
+        prepared: PinnedWeightsFile,
+    ) -> crate::Result<()> {
+        let expected = std::path::absolute(expected_path.as_ref())?;
+        let configured = self
+            .file_source_paths()
+            .into_iter()
+            .map(std::path::absolute)
+            .collect::<std::io::Result<Vec<_>>>()?;
+        if !configured.contains(&expected) {
+            return Err(crate::Error::Unsupported(format!(
+                "prepared file token path is not configured on this LoadSpec: {}",
+                expected.display()
+            )));
+        }
+        if prepared.loader_path() != expected {
+            return Err(crate::Error::Unsupported(format!(
+                "prepared file token path mismatch: LoadSpec names {}, token names {}",
+                expected.display(),
+                prepared.loader_path().display()
+            )));
+        }
+        prepared.ensure_unchanged()?;
+        if let Some(existing) = self.prepared_file_pins.get(&expected) {
+            if existing != &prepared {
+                return Err(crate::Error::Unsupported(format!(
+                    "prepared file token was replaced for {}",
+                    expected.display()
+                )));
+            }
+            return Ok(());
+        }
+        if self.prepared_file_pins.finalized {
+            return Err(crate::Error::Unsupported(format!(
+                "cannot add prepared file token after LoadSpec File identity was finalized: {}",
+                expected.display()
+            )));
+        }
+        self.prepared_file_pins.prepared = true;
+        self.prepared_file_pins.pins.insert(expected, prepared);
+        Ok(())
+    }
+
+    /// Pin every configured File source once, retaining any already attached caller token.
+    ///
+    /// Consumers call this after root confinement and before cache-key construction. Repeated calls
+    /// validate existing tokens rather than replacing them.
+    pub fn prepare_file_sources(&mut self) -> crate::Result<()> {
+        if self.prepared_file_pins.is_finalized() {
+            return self.validate_prepared_file_pins();
+        }
+        // Transition before touching the filesystem. A mid-prepare error leaves a sticky, partial
+        // prepared spec that fails closed instead of falling back to on-demand re-pinning.
+        self.prepared_file_pins.prepared = true;
+        let paths: Vec<PathBuf> = self
+            .file_source_paths()
+            .into_iter()
+            .map(Path::to_path_buf)
+            .collect();
+        for path in paths {
+            let absolute = std::path::absolute(&path)?;
+            if let Some(prepared) = self.prepared_file_pins.get(&absolute) {
+                if prepared.loader_path() != absolute {
+                    return Err(crate::Error::Unsupported(format!(
+                        "prepared file token path mismatch: LoadSpec names {}, token names {}",
+                        absolute.display(),
+                        prepared.loader_path().display()
+                    )));
+                }
+                prepared.ensure_unchanged()?;
+            } else {
+                let prepared = PinnedWeightsFile::pin(&path)?;
+                self.set_prepared_file_pin(&path, prepared)?;
+            }
+        }
+        self.finish_file_source_preparation()
+    }
+
+    /// Finalize a complete caller-installed token set without re-pinning any source.
+    ///
+    /// This is the manual counterpart to [`Self::prepare_file_sources`]: a consumer can pin one
+    /// source, validate [`PinnedWeightsFile::canonical_target_path`] against its allowed root, install
+    /// that exact token with [`Self::set_prepared_file_pin`], repeat for every File slot, and call
+    /// this method once. It is also how a caller explicitly prepares a Dir-only spec.
+    pub fn finish_file_source_preparation(&mut self) -> crate::Result<()> {
+        if self.prepared_file_pins.is_finalized() {
+            return self.validate_prepared_file_pins();
+        }
+        self.prepared_file_pins.prepared = true;
+        self.validate_prepared_file_pin_set_for(&self.prepared_file_pins)?;
+        self.prepared_file_pins.finalized = true;
+        Ok(())
+    }
+
+    /// Validate that prepared mode covers exactly the File sources currently configured by the spec.
+    pub fn validate_prepared_file_pins(&self) -> crate::Result<()> {
+        if !self.prepared_file_pins.is_prepared() {
+            return Ok(());
+        }
+        if !self.prepared_file_pins.is_finalized() {
+            return Err(crate::Error::Unsupported(
+                "LoadSpec File identity preparation has not been finalized".into(),
+            ));
+        }
+        self.validate_prepared_file_pin_set_for(&self.prepared_file_pins)
+    }
+
+    fn validate_prepared_file_pin_set_for(&self, prepared: &PreparedFilePins) -> crate::Result<()> {
+        let mut expected: Vec<PathBuf> = self
+            .file_source_paths()
+            .into_iter()
+            .map(std::path::absolute)
+            .collect::<std::io::Result<_>>()?;
+        expected.sort();
+        expected.dedup();
+        let actual: Vec<PathBuf> = prepared.keys().cloned().collect();
+        if expected != actual {
+            return Err(crate::Error::Unsupported(format!(
+                "prepared file-token set does not match LoadSpec File sources: expected {expected:?}, got {actual:?}"
+            )));
+        }
+        for path in expected {
+            let prepared = prepared.get(&path).ok_or_else(|| {
+                crate::Error::Unsupported(format!(
+                    "prepared file-token set is missing configured source {}",
+                    path.display()
+                ))
+            })?;
+            if prepared.loader_path() != path {
+                return Err(crate::Error::Unsupported(format!(
+                    "prepared file token path mismatch: LoadSpec names {}, token names {}",
+                    path.display(),
+                    prepared.loader_path().display()
+                )));
+            }
+            prepared.ensure_unchanged()?;
+        }
+        Ok(())
+    }
+
+    /// Return the exact caller-prepared token for `path`, if this is a prepared spec.
+    ///
+    /// Once the spec enters prepared mode, a missing token for a configured File fails closed. The
+    /// expected path and token loader path are compared as absolute-but-lexical paths on every use.
+    pub fn prepared_file_pin_for(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> crate::Result<Option<&PinnedWeightsFile>> {
+        let expected = std::path::absolute(path.as_ref())?;
+        let configured = self
+            .file_source_paths()
+            .into_iter()
+            .map(std::path::absolute)
+            .collect::<std::io::Result<Vec<_>>>()?;
+        if !configured.contains(&expected) {
+            return Err(crate::Error::Unsupported(format!(
+                "requested file pin is not configured on this LoadSpec: {}",
+                expected.display()
+            )));
+        }
+        if !self.prepared_file_pins.is_prepared() {
+            return Ok(None);
+        }
+        if !self.prepared_file_pins.is_finalized() {
+            return Err(crate::Error::Unsupported(
+                "LoadSpec File identity preparation has not been finalized".into(),
+            ));
+        }
+        let prepared = self.prepared_file_pins.get(&expected).ok_or_else(|| {
+            crate::Error::Unsupported(format!(
+                "prepared file-token set is missing configured source {}",
+                expected.display()
+            ))
+        })?;
+        if prepared.loader_path() != expected {
+            return Err(crate::Error::Unsupported(format!(
+                "prepared file token path mismatch: LoadSpec names {}, token names {}",
+                expected.display(),
+                prepared.loader_path().display()
+            )));
+        }
+        prepared.ensure_unchanged()?;
+        Ok(Some(prepared))
+    }
+
+    /// Resolve the exact file token a provider must retain or guard while it opens `path`.
+    ///
+    /// Prepared mode clones the caller token. An ordinary, unprepared spec pins the current source
+    /// on demand for backward compatibility.
+    pub fn file_pin_for(&self, path: impl AsRef<Path>) -> crate::Result<PinnedWeightsFile> {
+        match self.prepared_file_pin_for(path.as_ref())? {
+            Some(prepared) => Ok(prepared.clone()),
+            None => PinnedWeightsFile::pin(path),
+        }
+    }
+
+    /// Read `path` through its exact prepared token when this spec has been prepared.
+    ///
+    /// Ordinary compatibility-mode specs invoke `read` directly. This preserves providers' legacy
+    /// validation and error ordering while making every prepared caller consume the token installed
+    /// by the resolver instead of re-pinning the current pathname.
+    pub fn read_file_unchanged_if_prepared<T, E>(
+        &self,
+        path: impl AsRef<Path>,
+        read: impl FnOnce(&Path) -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E>
+    where
+        E: From<crate::Error>,
+    {
+        match self.prepared_file_pin_for(path.as_ref()).map_err(E::from)? {
+            Some(prepared) => prepared.read_unchanged(read),
+            None => read(path.as_ref()),
+        }
+    }
+
+    /// Resolve the primary single-file token; directory-backed specs return `Ok(None)`.
+    pub fn weights_file_pin(&self) -> crate::Result<Option<PinnedWeightsFile>> {
+        match &self.weights {
+            WeightsSource::Dir(_) => Ok(None),
+            WeightsSource::File(path) => self.file_pin_for(path).map(Some),
+        }
+    }
+
+    /// Execute a provider read while every listed File source is guarded by this spec's exact pins.
+    ///
+    /// All pins are checked before and after `read`; a post-read mutation error wins over a provider
+    /// error, matching [`PinnedWeightsFile::read_unchanged`]. This lets batch adapter loaders retain
+    /// their all-files ordering and zero-match semantics while consuming the same tokens as cache
+    /// identity.
+    pub fn read_files_unchanged<T, E, P>(
+        &self,
+        paths: impl IntoIterator<Item = P>,
+        read: impl FnOnce() -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E>
+    where
+        P: AsRef<Path>,
+        E: From<crate::Error>,
+    {
+        let pins = paths
+            .into_iter()
+            .map(|path| self.file_pin_for(path).map_err(E::from))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for pin in &pins {
+            pin.ensure_unchanged().map_err(E::from)?;
+        }
+        let result = read();
+        for pin in &pins {
+            pin.ensure_unchanged().map_err(E::from)?;
+        }
+        result
+    }
+
+    /// Execute a registry/provider callback under the complete prepared File identity set.
+    ///
+    /// Ordinary compatibility-mode specs invoke `read` directly, preserving historical callback
+    /// behavior and error ordering without introducing eager filesystem access. Prepared specs must
+    /// cover exactly the current File-slot set, and every token is checked before and after the
+    /// callback so persistent and identity-changing replacement during the callback fails closed.
+    /// As with [`PinnedWeightsFile::read_unchanged`], a fully restored original pathname object is
+    /// outside this path-token guarantee.
+    pub fn read_prepared_files_unchanged<T, E>(
+        &self,
+        read: impl FnOnce() -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E>
+    where
+        E: From<crate::Error>,
+    {
+        if !self.prepared_file_pins.is_prepared() {
+            return read();
+        }
+        self.validate_prepared_file_pins().map_err(E::from)?;
+        self.read_files_unchanged(self.file_source_paths(), read)
     }
 
     /// Builder-style quantization override.
@@ -858,6 +1479,563 @@ mod tests {
             .expect_err("retargeting the entry must invalidate the pin")
             .to_string();
         assert!(error.contains("entry changed"), "got: {error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_weights_file_detects_a_recreated_intermediate_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let first = dir.path().join("snapshot-a");
+        let second = dir.path().join("snapshot-b");
+        std::fs::create_dir(&first).expect("create A snapshot");
+        std::fs::create_dir(&second).expect("create B snapshot");
+        std::fs::write(first.join("model.safetensors"), b"same-size-a").expect("write A");
+        std::fs::write(second.join("model.safetensors"), b"same-size-b").expect("write B");
+        let selected = dir.path().join("selected");
+        let staged_b = dir.path().join("staged-b");
+        let recreated_a = dir.path().join("recreated-a");
+        symlink(&first, &selected).expect("select A directory");
+        symlink(&second, &staged_b).expect("stage B directory link");
+        symlink(&first, &recreated_a).expect("stage recreated A directory link");
+        let lexical_file = selected.join("model.safetensors");
+        let pinned = PinnedWeightsFile::pin(&lexical_file).expect("pin through intermediate link");
+        assert_eq!(
+            pinned.canonical_target_path(),
+            std::fs::canonicalize(first.join("model.safetensors")).unwrap()
+        );
+
+        std::fs::rename(staged_b, &selected).expect("select B directory");
+        std::fs::rename(recreated_a, &selected).expect("select recreated A directory link");
+        assert_eq!(std::fs::read(&lexical_file).unwrap(), b"same-size-a");
+        let error = pinned
+            .ensure_unchanged()
+            .expect_err("recreating an intermediate symlink must change component identity")
+            .to_string();
+        assert!(error.contains("path component changed"), "got: {error}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pinned_weights_file_detects_a_same_size_windows_file_replacement() {
+        use std::os::windows::fs::FileTimesExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let selected = dir.path().join("model.safetensors");
+        let replacement = dir.path().join("replacement.safetensors");
+        std::fs::write(&selected, b"same-size-a").expect("write A");
+        std::fs::write(&replacement, b"same-size-b").expect("write B");
+        let timestamp = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let times = std::fs::FileTimes::new()
+            .set_modified(timestamp)
+            .set_created(timestamp);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&selected)
+            .unwrap()
+            .set_times(times)
+            .expect("set A times");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&replacement)
+            .unwrap()
+            .set_times(times)
+            .expect("set B times");
+        let selected_metadata = std::fs::metadata(&selected).unwrap();
+        let replacement_metadata = std::fs::metadata(&replacement).unwrap();
+        assert_eq!(
+            (
+                selected_metadata.len(),
+                selected_metadata.modified().ok(),
+                selected_metadata.created().ok(),
+            ),
+            (
+                replacement_metadata.len(),
+                replacement_metadata.modified().ok(),
+                replacement_metadata.created().ok(),
+            ),
+            "the legacy size/mtime/created tuple must collide"
+        );
+        let pinned = PinnedWeightsFile::pin(&selected).expect("pin A");
+
+        std::fs::remove_file(&selected).expect("remove A");
+        std::fs::rename(&replacement, &selected).expect("install same-size B");
+        let error = pinned
+            .ensure_unchanged()
+            .expect_err("Windows file ID/change time must reject same-size replacement")
+            .to_string();
+        assert!(
+            error.contains("entry changed") || error.contains("target changed"),
+            "got: {error}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pinned_weights_file_ignores_unrelated_windows_sibling_changes() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let selected = dir.path().join("model.safetensors");
+        let sibling = dir.path().join("unrelated.tmp");
+        std::fs::write(&selected, b"weights").expect("write model");
+        let pinned = PinnedWeightsFile::pin(&selected).expect("pin model");
+
+        std::fs::write(&sibling, b"unrelated").expect("create sibling");
+        std::fs::remove_file(&sibling).expect("remove sibling");
+        pinned
+            .ensure_unchanged()
+            .expect("parent identity must ignore ordinary child-entry timestamp changes");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pinned_weights_file_distinguishes_windows_symlink_entry_and_target() {
+        use std::os::windows::fs::symlink_file;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let first = dir.path().join("blob-a");
+        let second = dir.path().join("blob-b");
+        let selected = dir.path().join("selected.safetensors");
+        std::fs::write(&first, b"same-size-a").expect("write A");
+        std::fs::write(&second, b"same-size-b").expect("write B");
+        if let Err(error) = symlink_file(&first, &selected) {
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                eprintln!(
+                    "skipping Windows symlink identity fixture because this host lacks symlink privilege: {error}"
+                );
+                return;
+            }
+            panic!("create Windows file symlink: {error}");
+        }
+
+        let pinned = PinnedWeightsFile::pin(&selected).expect("pin selected A link");
+        assert_eq!(
+            pinned.loader_path(),
+            std::path::absolute(&selected).unwrap()
+        );
+        assert_eq!(
+            pinned.canonical_target_path(),
+            std::fs::canonicalize(&first).unwrap()
+        );
+        assert_ne!(
+            pinned.entry_fingerprint().file_id,
+            pinned.target_fingerprint().file_id,
+            "OPEN_REPARSE_POINT must fingerprint the link entry, not its target"
+        );
+
+        std::fs::remove_file(&selected).expect("remove A link");
+        symlink_file(&second, &selected).expect("retarget selected link to B");
+        let error = pinned
+            .ensure_unchanged()
+            .expect_err("retargeting the Windows link must invalidate its entry token")
+            .to_string();
+        assert!(
+            error.contains("entry changed") || error.contains("resolution changed"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn load_spec_rejects_a_prepared_token_for_another_lexical_path() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let expected = dir.path().join("expected.safetensors");
+        let other = dir.path().join("other.safetensors");
+        std::fs::write(&expected, b"expected").expect("write expected file");
+        std::fs::write(&other, b"other").expect("write other file");
+
+        let token = PinnedWeightsFile::pin(&other).expect("pin other file");
+        let error = LoadSpec::new(WeightsSource::File(expected.clone()))
+            .with_prepared_file_pin(&expected, token)
+            .expect_err("a token for another file must fail closed")
+            .to_string();
+
+        assert!(error.contains("path mismatch"), "got: {error}");
+    }
+
+    #[test]
+    fn load_spec_reuses_the_exact_prepared_primary_file_token() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = dir.path().join("model.safetensors");
+        std::fs::write(&file, b"weights").expect("write weights");
+        let prepared = PinnedWeightsFile::pin(&file).expect("prepare file");
+        let mut spec = LoadSpec::new(WeightsSource::File(file.clone()))
+            .with_prepared_file_pin(&file, prepared.clone())
+            .expect("attach matching token");
+        spec.finish_file_source_preparation()
+            .expect("finalize matching token set");
+
+        let provider_pin = spec
+            .weights_file_pin()
+            .expect("resolve provider pin")
+            .expect("file pin");
+        assert_eq!(provider_pin, prepared);
+        assert_eq!(provider_pin.loader_path(), file.as_path());
+        assert_eq!(
+            spec.prepared_file_pin_for(&file)
+                .expect("validate prepared token")
+                .expect("prepared token"),
+            &prepared
+        );
+    }
+
+    #[test]
+    fn unprepared_file_callers_still_receive_a_primary_file_pin() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = dir.path().join("model.safetensors");
+        std::fs::write(&file, b"weights").expect("write weights");
+        let spec = LoadSpec::new(WeightsSource::File(file.clone()));
+
+        assert!(spec.prepared_file_pins.is_empty());
+        let provider_pin = spec
+            .weights_file_pin()
+            .expect("pin ordinary file caller")
+            .expect("file pin");
+        assert_eq!(provider_pin.loader_path(), file.as_path());
+    }
+
+    #[test]
+    fn unprepared_callback_guard_preserves_raw_callback_behavior() {
+        let spec = LoadSpec::new(WeightsSource::File(
+            "/a/compatibility/caller/need/not/open/this.safetensors".into(),
+        ));
+
+        let value = spec
+            .read_prepared_files_unchanged(|| Ok::<_, crate::Error>(17))
+            .expect("an unprepared callback must run without eager filesystem access");
+        assert_eq!(value, 17);
+        assert!(!spec.prepared_file_pins.is_prepared());
+    }
+
+    #[test]
+    fn prepared_only_file_guard_preserves_compatibility_and_rejects_a_stale_token() {
+        let missing = PathBuf::from("/a/compatibility/caller/need/not/open/this-file.safetensors");
+        let ordinary = LoadSpec::new(WeightsSource::File(missing.clone()));
+        let value = ordinary
+            .read_file_unchanged_if_prepared(&missing, |path| {
+                assert_eq!(path, missing);
+                Ok::<_, crate::Error>(23)
+            })
+            .expect("an unprepared file read must not eagerly touch the filesystem");
+        assert_eq!(value, 23);
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = dir.path().join("prepared.safetensors");
+        std::fs::write(&file, b"original").expect("write original file");
+        let mut prepared = LoadSpec::new(WeightsSource::File(file.clone()));
+        prepared.prepare_file_sources().expect("prepare file token");
+        std::fs::write(&file, b"replacement-with-another-size").expect("replace prepared file");
+
+        let error = prepared
+            .read_file_unchanged_if_prepared(&file, |_| Ok::<_, crate::Error>(()))
+            .expect_err("a prepared read must validate the caller-installed token")
+            .to_string();
+        assert!(error.contains("changed after load"), "got: {error}");
+    }
+
+    #[test]
+    fn prepared_dir_only_mode_stays_sticky_when_a_file_slot_is_added() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = dir.path().join("late-control.safetensors");
+        std::fs::write(&file, b"control").expect("write control");
+        let mut spec = LoadSpec::new(WeightsSource::Dir(dir.path().join("snapshot")));
+
+        spec.prepare_file_sources().expect("prepare Dir-only spec");
+        assert!(spec.prepared_file_pins.is_prepared());
+        assert!(spec.prepared_file_pins.is_empty());
+
+        spec.control = Some(WeightsSource::File(file.clone()));
+        let error = spec
+            .file_pin_for(&file)
+            .expect_err("a later File slot must not downgrade to compatibility repinning")
+            .to_string();
+        assert!(error.contains("missing configured source"), "got: {error}");
+        assert!(
+            spec.prepare_file_sources().is_err(),
+            "re-preparing a sticky spec must validate rather than fill a newly added slot"
+        );
+        assert!(spec.prepared_file_pins.is_prepared());
+        assert!(spec.prepared_file_pins.is_empty());
+    }
+
+    #[test]
+    fn atomic_prepared_token_install_uses_exact_tokens_and_supports_zero_files() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let primary = dir.path().join("primary.safetensors");
+        let control = dir.path().join("control.safetensors");
+        std::fs::write(&primary, b"primary").expect("write primary");
+        std::fs::write(&control, b"control").expect("write control");
+        let primary_pin = PinnedWeightsFile::pin(&primary).expect("pin primary");
+        let control_pin = PinnedWeightsFile::pin(&control).expect("pin control");
+        let mut spec = LoadSpec::new(WeightsSource::File(primary.clone()))
+            .with_control(WeightsSource::File(control.clone()));
+
+        spec.prepare_with_file_pins([primary_pin.clone(), control_pin.clone()])
+            .expect("atomically install exact set");
+        assert!(spec.prepared_file_pins().is_prepared());
+        assert!(spec.prepared_file_pins().is_finalized());
+        assert_eq!(spec.file_pin_for(&primary).unwrap(), primary_pin);
+        assert_eq!(spec.file_pin_for(&control).unwrap(), control_pin);
+
+        let mut dir_only = LoadSpec::new(WeightsSource::Dir(dir.path().join("snapshot")));
+        dir_only
+            .prepare_with_file_pins(std::iter::empty())
+            .expect("zero-token set explicitly prepares a Dir-only spec");
+        assert!(dir_only.prepared_file_pins().is_prepared());
+        assert!(dir_only.prepared_file_pins().is_finalized());
+        assert!(dir_only.prepared_file_pins().is_empty());
+    }
+
+    #[test]
+    fn prepared_mode_rejects_an_orphan_after_a_file_slot_is_removed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = dir.path().join("primary.safetensors");
+        std::fs::write(&file, b"primary").expect("write primary");
+        let mut spec = LoadSpec::new(WeightsSource::File(file));
+        spec.prepare_file_sources().expect("prepare File spec");
+
+        spec.weights = WeightsSource::Dir(dir.path().join("snapshot"));
+        let error = spec
+            .validate_prepared_file_pins()
+            .expect_err("removing a prepared File slot must leave an invalid orphan")
+            .to_string();
+        assert!(error.contains("does not match"), "got: {error}");
+        assert!(spec.prepared_file_pins.is_prepared());
+        assert_eq!(spec.prepared_file_pins.len(), 1);
+    }
+
+    #[test]
+    fn file_source_paths_covers_the_complete_load_spec_slot_matrix() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = |name: &str| dir.path().join(format!("{name}.safetensors"));
+        let primary = path("primary");
+        let control = path("control");
+        let extra_control_0 = path("extra-control-0");
+        let extra_control_1 = path("extra-control-1");
+        let ip_adapter = path("ip-adapter");
+        let adapter = path("adapter");
+        let pid_checkpoint = path("pid-checkpoint");
+        let pid_gemma = path("pid-gemma");
+        let identity_encoder = path("identity-encoder");
+        let identity_eva = path("identity-eva");
+        let identity_face = path("identity-face");
+        let text_encoder = path("text-encoder");
+        let component_alpha = path("component-alpha");
+        let component_zeta = path("component-zeta");
+        let expected = vec![
+            primary.clone(),
+            control.clone(),
+            extra_control_0.clone(),
+            extra_control_1.clone(),
+            ip_adapter.clone(),
+            adapter.clone(),
+            pid_checkpoint.clone(),
+            pid_gemma.clone(),
+            identity_encoder.clone(),
+            identity_eva.clone(),
+            identity_face.clone(),
+            text_encoder.clone(),
+            component_alpha.clone(),
+            component_zeta.clone(),
+        ];
+        for file in &expected {
+            std::fs::write(file, b"fixture").expect("write slot fixture");
+        }
+
+        let mut spec = LoadSpec::new(WeightsSource::File(primary));
+        spec.control = Some(WeightsSource::File(control));
+        spec.extra_controls = vec![
+            WeightsSource::File(extra_control_0),
+            WeightsSource::File(extra_control_1),
+        ];
+        spec.ip_adapter = Some(WeightsSource::File(ip_adapter));
+        spec.adapters = vec![AdapterSpec::new(adapter, 1.0, AdapterKind::Lora)];
+        spec.pid = Some(PidWeights {
+            checkpoint: WeightsSource::File(pid_checkpoint),
+            gemma: WeightsSource::File(pid_gemma),
+        });
+        spec.identity = Some(IdentityWeights {
+            encoder: Some(WeightsSource::File(identity_encoder)),
+            eva: Some(WeightsSource::File(identity_eva)),
+            face_dir: Some(WeightsSource::File(identity_face)),
+        });
+        spec.text_encoder = Some(WeightsSource::File(text_encoder));
+        // BTreeMap value iteration is key-sorted, independently of insertion order.
+        spec.components
+            .insert("zeta".into(), WeightsSource::File(component_zeta));
+        spec.components
+            .insert("alpha".into(), WeightsSource::File(component_alpha));
+
+        let actual: Vec<PathBuf> = spec
+            .file_source_paths()
+            .into_iter()
+            .map(Path::to_path_buf)
+            .collect();
+        assert_eq!(actual, expected);
+
+        spec.prepare_file_sources()
+            .expect("prepare every File slot");
+        spec.validate_prepared_file_pins()
+            .expect("prepared map exactly covers the slot matrix");
+        assert_eq!(spec.prepared_file_pins.len(), expected.len());
+        for file in expected {
+            let token = spec
+                .file_pin_for(&file)
+                .expect("resolve prepared slot token");
+            assert_eq!(token.loader_path(), file.as_path());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepared_load_spec_rejects_a_to_b_to_recreated_a_rebinding() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let first = dir.path().join("blob-a");
+        let second = dir.path().join("blob-b");
+        let selected = dir.path().join("selected.safetensors");
+        let staged_b = dir.path().join("staged-b.safetensors");
+        let staged_a = dir.path().join("staged-a.safetensors");
+        std::fs::write(&first, b"same-size-a").expect("write A");
+        std::fs::write(&second, b"same-size-b").expect("write B");
+        symlink(&first, &selected).expect("select A");
+        // Create both replacement entries before the race so their inodes are provably distinct
+        // from the original selected entry, even after the final path once again resolves to A.
+        symlink(&second, &staged_b).expect("stage B link");
+        symlink(&first, &staged_a).expect("stage replacement A link");
+
+        let mut spec = LoadSpec::new(WeightsSource::File(selected.clone()));
+        spec.prepare_file_sources().expect("prepare A identity");
+        let key_pin = spec
+            .prepared_file_pin_for(&selected)
+            .expect("validate cache-key token")
+            .expect("prepared token")
+            .clone();
+        let start_mutation = Arc::new(Barrier::new(2));
+        let mutation_done = Arc::new(Barrier::new(2));
+        let writer_start = Arc::clone(&start_mutation);
+        let writer_done = Arc::clone(&mutation_done);
+        let writer_selected = selected.clone();
+        let writer = std::thread::spawn(move || {
+            writer_start.wait();
+            std::fs::rename(staged_b, &writer_selected).expect("rebind selected path to B");
+            std::fs::rename(staged_a, &writer_selected)
+                .expect("replace selected path with a recreated A link");
+            writer_done.wait();
+        });
+
+        start_mutation.wait();
+        mutation_done.wait();
+        writer.join().expect("writer thread");
+        assert_eq!(
+            std::fs::read(&selected).expect("read final selected target"),
+            b"same-size-a",
+            "the lexical path must resolve to A again before the provider consumes the token"
+        );
+        let error = spec
+            .weights_file_pin()
+            .expect_err("the provider must reject the stale cache-key token")
+            .to_string();
+        assert!(error.contains("entry changed"), "got: {error}");
+        assert_eq!(
+            key_pin.loader_path(),
+            selected.as_path(),
+            "cache identity must retain the extension-bearing lexical path"
+        );
+    }
+
+    #[test]
+    fn prepared_mode_rejects_a_missing_token_instead_of_repinning() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let primary = dir.path().join("primary.safetensors");
+        let adapter = dir.path().join("adapter.safetensors");
+        std::fs::write(&primary, b"primary").expect("write primary");
+        std::fs::write(&adapter, b"adapter").expect("write adapter");
+        let mut spec = LoadSpec::new(WeightsSource::File(primary.clone())).with_adapters(vec![
+            AdapterSpec::new(adapter.clone(), 1.0, AdapterKind::Lora),
+        ]);
+        spec.set_prepared_file_pin(
+            &primary,
+            PinnedWeightsFile::pin(&primary).expect("pin primary"),
+        )
+        .expect("attach primary token");
+
+        let error = spec
+            .finish_file_source_preparation()
+            .expect_err("a partial caller-installed set must not finalize")
+            .to_string();
+        assert!(error.contains("does not match"), "got: {error}");
+        let use_error = spec
+            .file_pin_for(&adapter)
+            .expect_err("an unfinished prepared set must not silently re-pin")
+            .to_string();
+        assert!(use_error.contains("not been finalized"), "got: {use_error}");
+        assert!(spec.validate_prepared_file_pins().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepared_adapter_component_and_control_reject_a_to_b_to_recreated_a_rebinding() {
+        use std::os::unix::fs::symlink;
+
+        for role in ["adapter", "component", "control"] {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let first = dir.path().join("blob-a");
+            let second = dir.path().join("blob-b");
+            let selected = dir.path().join(format!("{role}.safetensors"));
+            let staged_b = dir.path().join(format!("{role}-staged-b.safetensors"));
+            let staged_a = dir.path().join(format!("{role}-staged-a.safetensors"));
+            std::fs::write(&first, b"same-size-a").expect("write A");
+            std::fs::write(&second, b"same-size-b").expect("write B");
+            symlink(&first, &selected).expect("select A");
+            symlink(&second, &staged_b).expect("stage B link");
+            symlink(&first, &staged_a).expect("stage replacement A link");
+
+            let mut spec = LoadSpec::new(WeightsSource::Dir(dir.path().join("base")));
+            match role {
+                "adapter" => {
+                    spec.adapters
+                        .push(AdapterSpec::new(selected.clone(), 1.0, AdapterKind::Lora));
+                }
+                "component" => {
+                    spec.components
+                        .insert("vae".into(), WeightsSource::File(selected.clone()));
+                }
+                "control" => spec.control = Some(WeightsSource::File(selected.clone())),
+                _ => unreachable!(),
+            }
+            spec.prepare_file_sources()
+                .expect("prepare composite load identity");
+
+            let start_mutation = Arc::new(Barrier::new(2));
+            let mutation_done = Arc::new(Barrier::new(2));
+            let writer_start = Arc::clone(&start_mutation);
+            let writer_done = Arc::clone(&mutation_done);
+            let writer_selected = selected.clone();
+            let writer = std::thread::spawn(move || {
+                writer_start.wait();
+                std::fs::rename(staged_b, &writer_selected).expect("rebind selected path to B");
+                std::fs::rename(staged_a, &writer_selected)
+                    .expect("replace selected path with a recreated A link");
+                writer_done.wait();
+            });
+
+            start_mutation.wait();
+            mutation_done.wait();
+            writer.join().expect("writer thread");
+            assert_eq!(
+                std::fs::read(&selected).expect("read final selected target"),
+                b"same-size-a"
+            );
+            let error = spec
+                .file_pin_for(&selected)
+                .expect_err("provider must consume the stale prepared token")
+                .to_string();
+            assert!(
+                error.contains("entry changed"),
+                "{role} should fail on the prepared A token, got: {error}"
+            );
+        }
     }
 
     fn frame(current: u32, total: u32) -> PreviewFrame {

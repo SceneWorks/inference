@@ -600,7 +600,7 @@ macro_rules! explicit_registry_kind {
                     ))
                 })?;
             self.ensure_quant_supported(id, spec)?;
-            (registration.load)(spec)
+            spec.read_prepared_files_unchanged(|| (registration.load)(spec))
         }
     };
 }
@@ -756,7 +756,9 @@ impl ProviderRegistry {
             .find(|registration| (registration.descriptor)().id == id)
             .ok_or_else(|| Error::Msg(format!("no generator registered for id '{id}'")))?;
         match registration.footprint {
-            Some(footprint) => footprint(spec).map(Some),
+            Some(footprint) => spec
+                .read_prepared_files_unchanged(|| footprint(spec))
+                .map(Some),
             None => Ok(None),
         }
     }
@@ -784,7 +786,7 @@ impl ProviderRegistry {
         else {
             return Ok(None);
         };
-        let contract = (registration.contract)(spec)?;
+        let contract = spec.read_prepared_files_unchanged(|| (registration.contract)(spec))?;
         let errors = contract.conformance_errors();
         if !errors.is_empty() {
             return Err(Error::Msg(format!(
@@ -1450,6 +1452,63 @@ mod tests {
         footprint = dummy_footprint
     }
 
+    #[cfg(unix)]
+    static PREPARED_CALLBACK_REBIND: std::sync::Mutex<Option<(PathBuf, PathBuf, PathBuf)>> =
+        std::sync::Mutex::new(None);
+
+    #[cfg(unix)]
+    fn rebind_prepared_callback_file() -> Result<()> {
+        let (selected, staged_b, staged_a) = PREPARED_CALLBACK_REBIND
+            .lock()
+            .expect("callback rebinding lock")
+            .take()
+            .expect("callback rebinding fixture");
+        std::fs::rename(staged_b, &selected)?;
+        std::fs::rename(staged_a, &selected)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn prepared_callback_descriptor() -> ModelDescriptor {
+        ModelDescriptor {
+            control_kinds: None,
+            required_components: &[],
+            id: "prepared_callback_model",
+            family: "test",
+            backend: "mlx",
+            modality: Modality::Image,
+            capabilities: dummy_caps(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn prepared_callback_load(_spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+        rebind_prepared_callback_file()?;
+        Ok(Box::new(DummyGen {
+            desc: prepared_callback_descriptor(),
+        }))
+    }
+
+    #[cfg(unix)]
+    fn prepared_callback_footprint(_spec: &LoadSpec) -> Result<PerComponentBytes> {
+        rebind_prepared_callback_file()?;
+        Ok(PerComponentBytes::default())
+    }
+
+    #[cfg(unix)]
+    fn prepared_callback_memory_contract(_spec: &LoadSpec) -> Result<MemoryProviderContract> {
+        rebind_prepared_callback_file()?;
+        Ok(MemoryProviderContract::compatibility_default(
+            "prepared_callback_model",
+            crate::memory_strategy::MemoryBackendRealization::MlxMetal {
+                bounded_wired_residency: false,
+                lazy_or_mmap_materialization: true,
+                explicit_evaluation_and_synchronization: true,
+                cache_eviction: true,
+            },
+        ))
+    }
+
     struct DummyTrainer {
         desc: TrainerDescriptor,
     }
@@ -1733,6 +1792,75 @@ mod tests {
             .expect("dummy is registered");
         assert_eq!(g.descriptor().id, "dummy_test_model");
         assert_eq!(g.descriptor().modality, Modality::Image);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepared_file_identity_guards_load_footprint_and_memory_callbacks() {
+        use std::os::unix::fs::symlink;
+
+        fn spec_with_rebinding_callback(tag: &str) -> (tempfile::TempDir, LoadSpec) {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let first = dir.path().join(format!("{tag}-blob-a"));
+            let second = dir.path().join(format!("{tag}-blob-b"));
+            let selected = dir.path().join(format!("{tag}.safetensors"));
+            let staged_b = dir.path().join(format!("{tag}-staged-b.safetensors"));
+            let staged_a = dir.path().join(format!("{tag}-staged-a.safetensors"));
+            std::fs::write(&first, b"same-size-a").expect("write A");
+            std::fs::write(&second, b"same-size-b").expect("write B");
+            symlink(&first, &selected).expect("select A");
+            symlink(&second, &staged_b).expect("stage B link");
+            symlink(&first, &staged_a).expect("stage replacement A link");
+            let mut spec = LoadSpec::new(WeightsSource::File(selected.clone()));
+            spec.prepare_file_sources().expect("prepare A identity");
+            *PREPARED_CALLBACK_REBIND
+                .lock()
+                .expect("callback rebinding lock") = Some((selected, staged_b, staged_a));
+            (dir, spec)
+        }
+
+        let registry = ProviderRegistryBuilder::new()
+            .register_generator(ModelRegistration {
+                descriptor: prepared_callback_descriptor,
+                load: prepared_callback_load,
+                footprint: Some(prepared_callback_footprint),
+            })
+            .register_memory_strategy(MemoryRegistration {
+                provider_id: "prepared_callback_model",
+                contract: prepared_callback_memory_contract,
+                safety_check:
+                    crate::memory_strategy::default_registered_memory_strategy_safety_check,
+            })
+            .build()
+            .expect("callback-boundary registry");
+
+        let (_load_dir, load_spec) = spec_with_rebinding_callback("load");
+        let load_error = registry
+            .load("prepared_callback_model", &load_spec)
+            .err()
+            .expect("load callback A -> B -> recreated A must fail")
+            .to_string();
+        assert!(load_error.contains("entry changed"), "got: {load_error}");
+
+        let (_footprint_dir, footprint_spec) = spec_with_rebinding_callback("footprint");
+        let footprint_error = registry
+            .footprint("prepared_callback_model", &footprint_spec)
+            .expect_err("footprint callback A -> B -> recreated A must fail")
+            .to_string();
+        assert!(
+            footprint_error.contains("entry changed"),
+            "got: {footprint_error}"
+        );
+
+        let (_memory_dir, memory_spec) = spec_with_rebinding_callback("memory");
+        let memory_error = registry
+            .memory_strategy_contract("prepared_callback_model", &memory_spec)
+            .expect_err("memory callback A -> B -> recreated A must fail")
+            .to_string();
+        assert!(
+            memory_error.contains("entry changed"),
+            "got: {memory_error}"
+        );
     }
 
     #[test]

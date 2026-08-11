@@ -1769,10 +1769,8 @@ mod tests {
             moe_expert: None,
         };
         let dense = spec(LoadShape::DeferredMaterialization);
-        let with_adapter = LoadSpec {
-            adapters: vec![adapter],
-            ..dense.clone()
-        };
+        let mut with_adapter = dense.clone();
+        with_adapter.adapters = vec![adapter];
         assert!(streamable(&dense), "the adapter-free load streams");
         assert!(
             !streamable(&with_adapter),
@@ -1808,10 +1806,8 @@ mod tests {
     /// marker, which is exactly the shape of the upstream `Kwai-Kolors/Kolors-diffusers` snapshot.
     #[test]
     fn a_load_time_quantization_over_a_dense_snapshot_cannot_stream() {
-        let dense_q8 = LoadSpec {
-            quantize: Some(mlx_gen::Quant::Q8),
-            ..spec(LoadShape::DeferredMaterialization)
-        };
+        let mut dense_q8 = spec(LoadShape::DeferredMaterialization);
+        dense_q8.quantize = Some(mlx_gen::Quant::Q8);
         assert!(!load_leaves_blocks_lazy(&dense_q8));
         assert!(!streamable(&dense_q8));
         // The control: the same spec without the quantize request stays lazy.

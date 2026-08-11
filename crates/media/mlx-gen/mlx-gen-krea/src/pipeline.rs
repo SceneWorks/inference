@@ -26,7 +26,6 @@
 use mlx_rs::ops::{add, multiply, subtract};
 use mlx_rs::{random, Array, Dtype};
 
-use mlx_gen::adapters::loader::apply_adapters_strict_with_diff_patch;
 use mlx_gen::array::scalar;
 use mlx_gen::image::{decoded_to_image, validate_multiple_of};
 use mlx_gen::img2img::{add_noise_by_interpolation, init_time_step, preprocess_init_image};
@@ -551,7 +550,8 @@ impl KreaHeavy {
     }
 
     /// Install Raw-trained LoRA/LoKr adapters onto the single-stream DiT (sc-7911). The shared
-    /// [`apply_adapters_strict_with_diff_patch`] seam parses PEFT/diffusers/kohya/LoKr files, folds
+    /// [`mlx_gen::adapters::loader::apply_adapters_strict_with_diff_patch`] parses
+    /// PEFT/diffusers/kohya/LoKr files, folds
     /// alpha/rank, and pushes a residual onto each matched `AdaptableLinear` — erroring (never silently
     /// dropping) on an adapter target that matches no module. The `Krea2Transformer` adapter host routes
     /// the trained `transformer_blocks.{i}.attn.{to_q,to_k,to_v,to_out.0}` paths (+ `text_fusion` +
@@ -564,9 +564,7 @@ impl KreaHeavy {
     /// low-rank residual pass, and dense on every tier (the projector is never quantized), so the fold
     /// survives the subsequent `quantize`.
     pub fn apply_adapters(&mut self, specs: &[AdapterSpec]) -> Result<()> {
-        apply_adapters_strict_with_diff_patch(&mut self.dit, specs, "krea_2")?;
-        self.dit.capture_block_adapters();
-        Ok(())
+        self.dit.apply_adapters_strict(specs, true)
     }
 
     /// A **geometry-only** target latent `[1, 16, H/8, W/8]` of zeros (F-073). The step-invariant
@@ -1099,13 +1097,8 @@ impl KreaHeavy {
         let mut plans = Vec::with_capacity(phases.len());
         for phase in phases {
             // A cheap (refcounted) job-local clone whose adapter stack we own for this job.
-            let mut dit = self.dit.clone();
-            dit.clear_adapters();
             let specs = crate::multiphase::phase_spec_subset(phase, all_specs);
-            if !specs.is_empty() {
-                mlx_gen::adapters::loader::apply_adapters_strict(&mut dit, &specs, "krea_2")?;
-            }
-            dit.capture_block_adapters();
+            let dit = self.dit.clone_for_multiphase(&specs)?;
             // Prep built from THIS phase's clone (an adapter may steer the text-fusion aggregator).
             let prep_pos = dit.prepare(ctx_pos, None, &geom)?;
             let prep_neg = if phase.guidance > 0.0 {

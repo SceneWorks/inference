@@ -1112,21 +1112,7 @@ mod tests {
     #[test]
     fn registered_in_family_catalog() {
         // The family catalog resolves "kolors" and reaches the loader without real weights.
-        let spec = LoadSpec {
-            weights: WeightsSource::Dir("/nonexistent/kolors".into()),
-            quantize: None,
-            precision: mlx_gen::Precision::Bf16,
-            control: None,
-            ip_adapter: None,
-            adapters: Vec::new(),
-            extra_controls: Vec::new(),
-            pid: None,
-            identity: None,
-            text_encoder: None,
-            offload_policy: Default::default(),
-            load_shape: Default::default(),
-            components: Default::default(),
-        };
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/kolors".into()));
         let err = match crate::provider_registry().unwrap().load("kolors", &spec) {
             Ok(_) => panic!("bogus weights dir must fail to load"),
             Err(e) => e.to_string(),

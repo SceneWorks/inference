@@ -1511,10 +1511,8 @@ mod load_trainer_tests {
     /// the split-weight load, so this needs no base snapshot and is deterministic (env-independent).
     #[test]
     fn load_trainer_forwards_text_encoder_override() {
-        let spec = LoadSpec {
-            text_encoder: Some(WeightsSource::Dir("/nonexistent/ltx_gemma".into())),
-            ..LoadSpec::new(WeightsSource::Dir("/nonexistent/ltx_root".into()))
-        };
+        let mut spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/ltx_root".into()));
+        spec.text_encoder = Some(WeightsSource::Dir("/nonexistent/ltx_gemma".into()));
         // `Box<dyn Trainer>` isn't `Debug`, so match rather than `unwrap_err`.
         let err = match load_trainer(&spec) {
             Ok(_) => panic!("expected a LoadSpec::text_encoder override error"),
