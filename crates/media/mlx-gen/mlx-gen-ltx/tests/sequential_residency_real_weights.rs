@@ -120,10 +120,8 @@ fn te_resident_peak(model: &std::path::Path, gemma: &std::path::Path) -> usize {
 
 /// Run the real staged `generate`, returning the video frames + the process peak unified memory.
 fn staged_generate(model: &std::path::Path, gemma: &std::path::Path) -> (Vec<Image>, usize) {
-    let spec = LoadSpec {
-        text_encoder: Some(WeightsSource::Dir(gemma.to_path_buf())),
-        ..LoadSpec::new(WeightsSource::Dir(model.to_path_buf()))
-    };
+    let mut spec = LoadSpec::new(WeightsSource::Dir(model.to_path_buf()));
+    spec.text_encoder = Some(WeightsSource::Dir(gemma.to_path_buf()));
     let m = mlx_gen_ltx::provider_registry()
         .expect("build explicit LTX provider registry")
         .load("ltx_2_3", &spec)

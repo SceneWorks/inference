@@ -67,6 +67,10 @@ pub struct KreaTurboControl {
     /// Constructor-time pins retained for every deferred imported base/control reopen.
     _native_dit: Option<mlx_gen::PinnedWeightsFile>,
     _native_control: Option<mlx_gen::PinnedWeightsFile>,
+    /// Physical block-reopen eligibility for this exact load. Imported File contracts keep rung 4
+    /// Missing until source-specific evidence exists, so this must not be derived from capability
+    /// support; it only permits an explicit, eligible request to use the already-pinned stream seam.
+    streamable_transformer: bool,
     /// Component-residency strategy (epic 10834 Phase 1, sc-11101; hoisted to the shared seam in
     /// sc-11125), selected from [`LoadSpec::offload_policy`]. `Resident` (default) holds the text phase +
     /// DiT + VAE + branch warm; `Sequential` holds only the per-phase loader closures and re-loads per
@@ -175,7 +179,13 @@ impl AdmittedControlGeometry {
         (self.0.width, self.0.height)
     }
 
-    fn turbo_options(self, req: &GenerationRequest, steps: usize, seed: u64) -> TurboOptions {
+    fn turbo_options(
+        self,
+        req: &GenerationRequest,
+        steps: usize,
+        seed: u64,
+        transformer_window_size: Option<usize>,
+    ) -> TurboOptions {
         TurboOptions {
             width: self.0.width,
             height: self.0.height,
@@ -183,10 +193,7 @@ impl AdmittedControlGeometry {
             seed,
             sampler: req.sampler.clone(),
             scheduler: req.scheduler.clone(),
-            transformer_window_size: req
-                .memory
-                .and_then(|memory| memory.transformer_window_size)
-                .map(|window| window as usize),
+            transformer_window_size,
             memory: req.memory.unwrap_or_default(),
         }
     }
@@ -234,6 +241,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         }
     };
     let residency = build_control_residency_with_pin(&pinned_spec, pinned_control.clone())?;
+    let streamable_transformer = memory_strategy.lifecycle.transformer_window_materialization;
     Ok(Box::new(KreaTurboControl {
         descriptor: descriptor(),
         memory_strategy,
@@ -241,6 +249,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         loaded_quant,
         _native_dit: None,
         _native_control: pinned_control,
+        streamable_transformer,
         residency,
     }))
 }
@@ -273,13 +282,14 @@ pub fn load_control_from_native_dit_file(
     control: impl AsRef<Path>,
     adapters: &[mlx_gen::AdapterSpec],
 ) -> Result<Box<dyn Generator>> {
-    let spec = LoadSpec::new(WeightsSource::File(dit_file.as_ref().to_path_buf()))
+    let mut spec = LoadSpec::new(WeightsSource::File(dit_file.as_ref().to_path_buf()))
         .with_component(
             BASE_SNAPSHOT_COMPONENT,
             WeightsSource::Dir(base_snapshot_dir.as_ref().to_path_buf()),
         )
         .with_control(WeightsSource::File(control.as_ref().to_path_buf()))
         .with_adapters(adapters.to_vec());
+    spec.prepare_file_sources()?;
     load(&spec)
 }
 
@@ -293,28 +303,31 @@ pub(crate) fn build_native_krea_control(
     control: impl AsRef<Path>,
     adapters: &[mlx_gen::AdapterSpec],
 ) -> Result<KreaTurboControl> {
-    let spec = LoadSpec::new(WeightsSource::File(dit_file.as_ref().to_path_buf()))
+    let mut spec = LoadSpec::new(WeightsSource::File(dit_file.as_ref().to_path_buf()))
         .with_component(
             BASE_SNAPSHOT_COMPONENT,
             WeightsSource::Dir(base_snapshot_dir.as_ref().to_path_buf()),
         )
         .with_control(WeightsSource::File(control.as_ref().to_path_buf()))
         .with_adapters(adapters.to_vec());
+    spec.prepare_file_sources()?;
     build_native_krea_control_from_spec(&spec)
 }
 
 fn build_native_krea_control_from_spec(spec: &LoadSpec) -> Result<KreaTurboControl> {
     validate_control_spec(spec)?;
-    let WeightsSource::File(dit_file) = &spec.weights else {
+    let WeightsSource::File(_) = &spec.weights else {
         return Err(Error::Msg(format!(
             "{KREA_2_TURBO_CONTROL_ID}: imported control assembly requires a single-file DiT"
         )));
     };
-    let native_dit = mlx_gen::PinnedWeightsFile::pin(dit_file)?;
+    let native_dit = spec
+        .weights_file_pin()?
+        .expect("File weights must resolve to a pin");
     let base = require_base_snapshot(spec, KREA_2_TURBO_CONTROL_ID)?.to_path_buf();
     let pinned_control =
         match require_control(spec, KREA_2_TURBO_CONTROL_ID, "Krea 2 pose control overlay")? {
-            WeightsSource::File(path) => Some(mlx_gen::PinnedWeightsFile::pin(path)?),
+            WeightsSource::File(path) => Some(spec.file_pin_for(path)?),
             WeightsSource::Dir(_) => None,
         };
     let mut pinned_spec = spec.clone();
@@ -322,10 +335,10 @@ fn build_native_krea_control_from_spec(spec: &LoadSpec) -> Result<KreaTurboContr
     if let Some(control) = &pinned_control {
         pinned_spec.control = Some(WeightsSource::File(control.loader_path().to_path_buf()));
     }
-    // File-backed base/control assembly is reopenable but not rung-4-authorized: the promoted
-    // calibration cells are Dir-only. A sequential File request therefore stages components while
-    // keeping its DiT eager until File evidence is promoted.
-    let reopenable = crate::model::native_file_streamable(spec);
+    // Physical File streaming and public authorization are separate. The explicit
+    // Sequential + Deferred path may reopen the retained DiT pin, while the contract below remains
+    // rung-4 Missing until File-specific evidence is promoted.
+    let reopenable = crate::model::native_file_streamable(spec)?;
     let build_memory_contract = || {
         crate::memory_strategy::native_memory_strategy_contract_from_spec(
             KREA_2_TURBO_CONTROL_ID,
@@ -364,6 +377,7 @@ fn build_native_krea_control_from_spec(spec: &LoadSpec) -> Result<KreaTurboContr
         loaded_quant: None,
         _native_dit: Some(native_dit),
         _native_control: pinned_control,
+        streamable_transformer: reopenable,
         residency,
     })
 }
@@ -382,7 +396,9 @@ fn load_native_control_heavy(
     let vae = crate::vae::load_vae(base)?;
     let mut heavy = KreaHeavy::from_parts(dit, vae);
     if !spec.adapters.is_empty() {
-        heavy.apply_adapters(&spec.adapters)?;
+        spec.read_files_unchanged(spec.adapters.iter().map(|adapter| &adapter.path), || {
+            heavy.apply_adapters(&spec.adapters)
+        })?;
     }
     let control = require_control(spec, KREA_2_TURBO_CONTROL_ID, "Krea 2 pose control overlay")?;
     let branch = match pinned_control {
@@ -403,6 +419,7 @@ fn load_native_control_heavy(
 /// allowed (sc-11727) — a pre-packed snapshot or a `spec.quantize` request both pack only the base DiT/TE,
 /// leaving activations bf16 — so there is no quant rejection here.
 pub(crate) fn validate_control_spec(spec: &LoadSpec) -> Result<()> {
+    spec.validate_prepared_file_pins()?;
     if spec.precision != Precision::Bf16 {
         return Err(Error::Msg(format!(
             "{KREA_2_TURBO_CONTROL_ID}: only the default bf16 activation precision is wired (drop the \
@@ -459,7 +476,7 @@ fn build_control_residency(spec: &LoadSpec) -> Result<Residency<KreaText, Contro
 
 fn pin_control_source(spec: &LoadSpec) -> Result<Option<mlx_gen::PinnedWeightsFile>> {
     match require_control(spec, KREA_2_TURBO_CONTROL_ID, "Krea 2 pose control overlay")? {
-        WeightsSource::File(path) => Ok(Some(mlx_gen::PinnedWeightsFile::pin(path)?)),
+        WeightsSource::File(path) => Ok(Some(spec.file_pin_for(path)?)),
         WeightsSource::Dir(_) => Ok(None),
     }
 }
@@ -522,11 +539,13 @@ fn load_control_heavy(
             spec.load_shape,
             mlx_gen::gen_core::LoadShape::DeferredMaterialization
         )
-        && !crate::model::adapters_have_diff_patch(&spec.adapters)
+        && !crate::model::adapters_have_diff_patch_for_spec(spec)?
         && plan.load_time_quant_bits.is_none();
     let mut heavy = KreaHeavy::from_snapshot_with_stream(root, streamable_transformer)?;
     if !spec.adapters.is_empty() {
-        heavy.apply_adapters(&spec.adapters)?;
+        spec.read_files_unchanged(spec.adapters.iter().map(|adapter| &adapter.path), || {
+            heavy.apply_adapters(&spec.adapters)
+        })?;
     }
     if let Some(bits) = crate::model::load_time_quant_bits(spec, root, KREA_2_TURBO_CONTROL_ID)? {
         heavy.quantize(bits)?;
@@ -603,19 +622,8 @@ impl KreaTurboControl {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
-
-        if self._native_dit.is_some()
-            && req.memory.is_some_and(|memory| {
-                memory.stream_transformer_blocks
-                    || memory.transformer_window_size.is_some()
-                    || memory.transformer_window_component.is_some()
-            })
-        {
-            return Err(Error::Unsupported(format!(
-                "{KREA_2_TURBO_CONTROL_ID}: imported File weights are reopenable but transformer \
-                 residency is not authorized without File-specific promoted evidence"
-            )));
-        }
+        let transformer_window_size =
+            crate::model::resolve_transformer_window(req, self.streamable_transformer)?;
 
         let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
         let base_seed = req.seed.unwrap_or_else(default_seed);
@@ -707,6 +715,7 @@ impl KreaTurboControl {
                         req,
                         steps,
                         base_seed.wrapping_add(n as u64),
+                        transformer_window_size,
                     );
                     let img = heavy.heavy.render_control_from(
                         &plan,
@@ -849,14 +858,35 @@ mod tests {
         let control = tmp.path().join("control.safetensors");
         write_minimal_safetensors(&dit);
         write_minimal_safetensors(&control);
-        let spec = LoadSpec::new(WeightsSource::File(dit.clone()))
+        let mut spec = LoadSpec::new(WeightsSource::File(dit.clone()))
             .with_component(BASE_SNAPSHOT_COMPONENT, WeightsSource::Dir(base))
             .with_control(WeightsSource::File(control.clone()))
             .with_offload_policy(OffloadPolicy::Sequential)
             .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization);
+        spec.prepare_file_sources().unwrap();
+        let prepared_dit = spec.weights_file_pin().unwrap().unwrap();
+        let prepared_control = spec.file_pin_for(&control).unwrap();
         let model = build_native_krea_control_from_spec(&spec).unwrap();
+        assert!(
+            model.streamable_transformer,
+            "an explicit Sequential + Deferred control File load must arm the base DiT stream"
+        );
+        assert_eq!(
+            model
+                .memory_strategy
+                .capability(gen_core::MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .support,
+            gen_core::MemoryStrategySupport::Missing,
+            "physical control File streaming must not inherit the Dir evidence cell"
+        );
         let dit_pin = model._native_dit.expect("native DiT pin");
         let control_pin = model._native_control.expect("native control pin");
+        assert_eq!(dit_pin, prepared_dit, "DiT must reuse the cache-key token");
+        assert_eq!(
+            control_pin, prepared_control,
+            "control must reuse the cache-key token"
+        );
 
         std::fs::write(&dit, b"replacement dit").unwrap();
         std::fs::write(&control, b"replacement control").unwrap();
@@ -948,7 +978,7 @@ mod tests {
         // fields after the gate. This mutation makes that distinction observable without weights.
         req.width = 1024;
         req.height = 768;
-        let opts = admitted.turbo_options(&req, 8, 42);
+        let opts = admitted.turbo_options(&req, 8, 42, None);
         assert_eq!((opts.width, opts.height), (640, 384));
         assert_eq!(opts.steps, 8);
         assert_eq!(opts.seed, 42);

@@ -603,9 +603,10 @@ mod tests {
         );
 
         // Identity present but each sub-field missing in turn → named error for the missing one.
-        let base = |id: IdentityWeights| LoadSpec {
-            identity: Some(id),
-            ..LoadSpec::new(WeightsSource::Dir("/nonexistent/flux".into()))
+        let base = |id: IdentityWeights| {
+            let mut spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/flux".into()));
+            spec.identity = Some(id);
+            spec
         };
         let file = |p: &str| Some(WeightsSource::File(p.into()));
         let dir = |p: &str| Some(WeightsSource::Dir(p.into()));

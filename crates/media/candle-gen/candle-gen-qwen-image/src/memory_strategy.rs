@@ -120,18 +120,16 @@ pub(crate) fn provider_contract(
         .unwrap_or_default(),
         WeightsSource::File(path) => {
             let base = gen_core::require_base_snapshot(spec, provider_id)?;
-            let vae = spec
-                .components
-                .get(gen_core::COMFYUI_VAE_COMPONENT)
-                .map(|source| match source {
-                    WeightsSource::Dir(path) | WeightsSource::File(path) => {
-                        f32_component_bytes(path, "VAE")
-                    }
-                })
-                .unwrap_or_else(|| f32_component_bytes(&base.join("vae"), "base VAE"))?;
+            let vae = match spec.components.get(gen_core::COMFYUI_VAE_COMPONENT) {
+                Some(WeightsSource::Dir(path)) => f32_component_bytes(path, "VAE")?,
+                Some(WeightsSource::File(path)) => {
+                    spec.read_file_unchanged_if_prepared(path, |p| f32_component_bytes(p, "VAE"))?
+                }
+                None => f32_component_bytes(&base.join("vae"), "base VAE")?,
+            };
             PerComponentBytes {
                 text_encoder: f32_component_bytes(&base.join("text_encoder"), "base text encoder")?,
-                dit: imported_dit_bytes(path)?,
+                dit: spec.read_file_unchanged_if_prepared(path, imported_dit_bytes)?,
                 vae,
             }
         }

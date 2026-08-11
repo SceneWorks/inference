@@ -88,12 +88,6 @@ fn profile(provider_id: &str) -> gen_core::Result<ProviderProfile> {
     }
 }
 
-fn path(source: &WeightsSource) -> &std::path::Path {
-    match source {
-        WeightsSource::Dir(path) | WeightsSource::File(path) => path,
-    }
-}
-
 fn streamable(spec: &LoadSpec) -> bool {
     // File and Dir intentionally share this provider/calibration identity: their executable phase
     // graph and output semantics are the same. The evidence matrix has no load-source axis, however,
@@ -240,11 +234,21 @@ fn f32_or_packed_component_bytes(
     })
 }
 
-fn resident_components(provider_id: &str, spec: &LoadSpec) -> Vec<MemoryResidentComponent> {
+fn resident_components(
+    provider_id: &str,
+    spec: &LoadSpec,
+) -> gen_core::Result<Vec<MemoryResidentComponent>> {
     let mut out = Vec::new();
     if provider_id == FLUX2_DEV_ID {
         if let Some(control) = spec.control.as_ref() {
-            let resident_bytes = gen_core::weightsmeta::safetensors_path_bytes(path(control));
+            let resident_bytes = match control {
+                WeightsSource::Dir(path) => gen_core::weightsmeta::safetensors_path_bytes(path),
+                WeightsSource::File(path) => {
+                    spec.read_file_unchanged_if_prepared(path, |p| -> gen_core::Result<u64> {
+                        Ok(gen_core::weightsmeta::safetensors_path_bytes(p))
+                    })?
+                }
+            };
             if resident_bytes > 0 {
                 out.push(MemoryResidentComponent {
                     id: "flux2_dev_fun_controlnet_union".to_owned(),
@@ -257,7 +261,7 @@ fn resident_components(provider_id: &str, spec: &LoadSpec) -> Vec<MemoryResident
             }
         }
     }
-    out
+    Ok(out)
 }
 
 pub(crate) fn composed_provider_contract_for(
@@ -290,7 +294,9 @@ pub(crate) fn composed_provider_contract_for(
                     true,
                     false,
                 )?,
-                dit: f32_or_packed_component_bytes(dit, quant, "imported DiT", false, true)?,
+                dit: spec.read_file_unchanged_if_prepared(dit, |p| {
+                    f32_or_packed_component_bytes(p, quant, "imported DiT", false, true)
+                })?,
                 vae: f32_or_packed_component_bytes(
                     &base.join("vae"),
                     None,
@@ -301,7 +307,7 @@ pub(crate) fn composed_provider_contract_for(
             }
         }
     };
-    let resident_components = resident_components(provider_id, spec);
+    let resident_components = resident_components(provider_id, spec)?;
     let overlay_bytes = resident_components
         .iter()
         .map(|component| component.resident_bytes)

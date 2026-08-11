@@ -245,6 +245,9 @@ pub struct KreaGenerator {
     /// Multi-phase is therefore rejected loudly on such a model (low-rank LoRA/LoKr — including the
     /// rank-64 turbo LoRA — toggle cleanly and are unaffected).
     has_diff_patch: bool,
+    /// Prepared File identities retained for lazy/sequential adapter, PiD, component, and imported
+    /// primary reopens. The cache key and every later provider read consume these same tokens.
+    file_pin_spec: LoadSpec,
 }
 
 #[cfg(any(feature = "cuda", test))]
@@ -596,16 +599,12 @@ impl Generator for KreaGenerator {
             // request-scoped component transition. This preserves the cancellation contract for
             // every descriptor, including variants that do not support the selected memory rung.
             candle_gen::check_cancel(&req.cancel)?;
-            if self.native_dit.is_some()
-                && (memory.stream_transformer_blocks
-                    || memory.transformer_window_size.is_some()
-                    || memory.transformer_window_component.is_some())
-            {
-                return Err(gen_core::Error::Unsupported(format!(
-                    "{}: imported File weights are reopenable but transformer residency is not \
-                     authorized without File-specific promoted evidence",
-                    self.descriptor.id
-                )));
+            if self.native_dit.is_some() {
+                validate_native_file_transformer_request(
+                    self.descriptor.id,
+                    &self.file_pin_spec,
+                    *memory,
+                )?;
             }
             if self.descriptor.id != KREA_2_TURBO_ID
                 || !self.descriptor.capabilities.supports_sequential_offload
@@ -638,13 +637,18 @@ impl Generator for KreaGenerator {
             // contributes the request-scoped warm-cache transition; this pipeline retains the
             // three-stage execution needed by every cumulative memory rung.
             let images = self.residency.run_exclusive_staged(&req.cancel, || {
-                pipeline::render_three_stage_with_native(
-                    &self.root,
-                    self.native_dit.as_ref(),
-                    &self.device,
-                    &self.adapters,
-                    req,
-                    on_progress,
+                self.file_pin_spec.read_files_unchanged(
+                    self.file_pin_spec.file_source_paths(),
+                    || {
+                        pipeline::render_three_stage_with_native(
+                            &self.root,
+                            self.native_dit.as_ref(),
+                            &self.device,
+                            &self.adapters,
+                            req,
+                            on_progress,
+                        )
+                    },
                 )
             })?;
             return Ok(GenerationOutput::Images(images));
@@ -721,18 +725,23 @@ impl Generator for KreaGenerator {
                     let resolved = mp_resolved
                         .as_ref()
                         .expect("multi-phase encode implies a resolved plan");
-                    synchronize(pipeline::render_multiphase(
-                        heavy.vae(),
-                        &self.root,
-                        self.native_dit.as_ref(),
-                        &self.device,
-                        resolved,
-                        &self.adapters,
-                        &context,
-                        negative.as_ref(),
-                        req,
-                        on_progress,
-                    ))
+                    self.file_pin_spec.read_files_unchanged(
+                        self.file_pin_spec.file_source_paths(),
+                        || {
+                            synchronize(pipeline::render_multiphase(
+                                heavy.vae(),
+                                &self.root,
+                                self.native_dit.as_ref(),
+                                &self.device,
+                                resolved,
+                                &self.adapters,
+                                &context,
+                                negative.as_ref(),
+                                req,
+                                on_progress,
+                            ))
+                        },
+                    )
                 }
                 (KreaHeavyPhase::Resident(resident), KreaEncoded::Resident)
                     if mp_resolved.is_some() =>
@@ -743,18 +752,23 @@ impl Generator for KreaGenerator {
                     let comps = &resident.components;
                     let (context, negative) =
                         pipeline::encode_multiphase_contexts(comps.text(), req, mp_need_neg)?;
-                    synchronize(pipeline::render_multiphase(
-                        comps.vae(),
-                        &self.root,
-                        self.native_dit.as_ref(),
-                        &self.device,
-                        resolved,
-                        &self.adapters,
-                        &context,
-                        negative.as_ref(),
-                        req,
-                        on_progress,
-                    ))
+                    self.file_pin_spec.read_files_unchanged(
+                        self.file_pin_spec.file_source_paths(),
+                        || {
+                            synchronize(pipeline::render_multiphase(
+                                comps.vae(),
+                                &self.root,
+                                self.native_dit.as_ref(),
+                                &self.device,
+                                resolved,
+                                &self.adapters,
+                                &context,
+                                negative.as_ref(),
+                                req,
+                                on_progress,
+                            ))
+                        },
+                    )
                 }
                 (KreaHeavyPhase::Sequential(heavy), KreaEncoded::Edit(context)) => {
                     synchronize(pipeline::render_edit_residency(
@@ -1119,11 +1133,14 @@ fn resolved_base_and_native(
 ) -> gen_core::Result<(PathBuf, Option<gen_core::PinnedWeightsFile>)> {
     match &spec.weights {
         WeightsSource::Dir(path) => Ok((path.clone(), None)),
-        WeightsSource::File(path) => {
+        WeightsSource::File(_) => {
             gen_core::reject_unknown_components(spec, &[BASE_SNAPSHOT_COMPONENT], id)?;
             Ok((
                 gen_core::require_base_snapshot(spec, id)?.to_path_buf(),
-                Some(gen_core::PinnedWeightsFile::pin(path)?),
+                Some(
+                    spec.weights_file_pin()?
+                        .expect("File weights must resolve to a pin"),
+                ),
             ))
         }
     }
@@ -1140,6 +1157,7 @@ type ValidatedKreaLoad = (
 /// contract. Keeping this as the one File-spec gate prevents a contract from accepting a composition
 /// the production loader later rejects (or advertising facts for fields the loader silently ignores).
 fn validate_load_spec(spec: &LoadSpec, id: &str) -> gen_core::Result<ValidatedKreaLoad> {
+    spec.validate_prepared_file_pins()?;
     let (root, native_dit) = resolved_base_and_native(spec, id)?;
     if native_dit.is_some() && spec.identity.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
@@ -1197,6 +1215,68 @@ fn validate_load_spec(spec: &LoadSpec, id: &str) -> gen_core::Result<ValidatedKr
     Ok((root, native_dit, convrot_dit, loaded_quant))
 }
 
+/// Physical eligibility for the registered native-File block loader.
+///
+/// This deliberately does not consult the public memory contract: File rung-4 evidence remains
+/// Missing, while an explicit adapter-free Sequential + Deferred load can still exercise the pinned
+/// native stream path. Candle cannot replay adapters onto streamed blocks, so every adapter form —
+/// including diff-patches — stays excluded.
+fn native_file_streamable(provider_id: &str, spec: &LoadSpec) -> bool {
+    provider_id == KREA_2_TURBO_ID
+        && matches!(spec.weights, WeightsSource::File(_))
+        && matches!(spec.offload_policy, gen_core::OffloadPolicy::Sequential)
+        && matches!(
+            spec.load_shape,
+            gen_core::LoadShape::DeferredMaterialization
+        )
+        && spec.quantize.is_none()
+        && spec.adapters.is_empty()
+}
+
+fn validate_native_file_transformer_request(
+    provider_id: &str,
+    spec: &LoadSpec,
+    memory: gen_core::GenerationMemory,
+) -> gen_core::Result<()> {
+    if !matches!(spec.weights, WeightsSource::File(_)) {
+        return Ok(());
+    }
+    let has_owned_parameter =
+        memory.transformer_window_size.is_some() || memory.transformer_window_component.is_some();
+    if has_owned_parameter && !memory.stream_transformer_blocks {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{provider_id}: transformer_window_size and transformer_window_component require \
+             stream_transformer_blocks=true"
+        )));
+    }
+    if !memory.stream_transformer_blocks {
+        return Ok(());
+    }
+    if !native_file_streamable(provider_id, spec) {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{provider_id}: imported File transformer streaming requires the Turbo text-to-image \
+             route and an adapter-free Sequential + DeferredMaterialization load"
+        )));
+    }
+    let component = memory.transformer_window_component.unwrap_or_default();
+    if component != gen_core::TransformerComponent::Dit {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{provider_id}: imported File transformer streaming owns the DiT component only; \
+             requested {component:?}"
+        )));
+    }
+    let window = memory
+        .transformer_window_size
+        .unwrap_or(SUPPORTED_TRANSFORMER_WINDOWS[0]);
+    if !SUPPORTED_TRANSFORMER_WINDOWS.contains(&window) {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{provider_id}: transformer residency window is fixed at \
+             {SUPPORTED_TRANSFORMER_WINDOWS:?}, got {window}"
+        )));
+    }
+    Ok(())
+}
+
 fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<dyn Generator>> {
     let (root, native_dit, convrot_dit, loaded_quant) = validate_load_spec(spec, descriptor.id)?;
     #[cfg(any(feature = "cuda", test))]
@@ -1212,6 +1292,7 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
     let resident_pid = spec.pid.clone();
     let resident_convrot = convrot_dit.clone();
     let resident_native = native_dit.clone();
+    let resident_file_spec = spec.clone();
     let text_root = root.clone();
     let text_device = device.clone();
     let heavy_root = root.clone();
@@ -1224,35 +1305,37 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
     // previously bypassed staged residency rather than dropping its 15.6 GB f32 TE.
     let heavy_convrot = convrot_dit.clone();
     let heavy_native = native_dit.clone();
-    // Imported File providers do not publish rung-4 authorization: the available calibration
-    // evidence covers the canonical snapshot-directory load shape only. Keep the registered
-    // request path eager even when the file is physically reopenable. The lower-level native
-    // loader retains its explicit `stream_blocks` seam for smoke coverage and for a future File
-    // calibration/promotion without silently executing a strategy the public contract marks Missing.
-    let native_streamable = false;
+    let heavy_file_spec = spec.clone();
+    // Keep physical execution separate from evidence publication. The File contract below remains
+    // rung-4 Missing, but an explicit eligible load arms the retained native pin for real block
+    // windows rather than silently falling back to an eager DiT.
+    let native_streamable = native_file_streamable(descriptor.id, spec);
     let residency = candle_gen::Residency::request_scoped_with_resident_cancelable(
         move |_| {
-            let components = match (resident_native.as_ref(), resident_convrot.as_ref()) {
-                (Some(native_dit), None) => pipeline::load_components_native_registry(
-                    &resident_root,
-                    native_dit,
-                    &resident_device,
-                    &resident_adapters,
-                    resident_pid.as_ref(),
-                )?,
-                (None, Some(convrot_dit)) => pipeline::load_components_convrot(
-                    &resident_root,
-                    convrot_dit,
-                    &resident_device,
-                )?,
-                (None, None) => pipeline::load_components(
-                    &resident_root,
-                    &resident_device,
-                    &resident_adapters,
-                    resident_pid.as_ref(),
-                )?,
-                (Some(_), Some(_)) => unreachable!("mutually exclusive source forms"),
-            };
+            let components = resident_file_spec.read_files_unchanged(
+                resident_file_spec.file_source_paths(),
+                || match (resident_native.as_ref(), resident_convrot.as_ref()) {
+                    (Some(native_dit), None) => pipeline::load_components_native_registry(
+                        &resident_root,
+                        native_dit,
+                        &resident_device,
+                        &resident_adapters,
+                        resident_pid.as_ref(),
+                    ),
+                    (None, Some(convrot_dit)) => pipeline::load_components_convrot(
+                        &resident_root,
+                        convrot_dit,
+                        &resident_device,
+                    ),
+                    (None, None) => pipeline::load_components(
+                        &resident_root,
+                        &resident_device,
+                        &resident_adapters,
+                        resident_pid.as_ref(),
+                    ),
+                    (Some(_), Some(_)) => unreachable!("mutually exclusive source forms"),
+                },
+            )?;
             Ok((
                 KreaTextPhase::Resident,
                 KreaHeavyPhase::Resident(Box::new(ResidentKrea {
@@ -1270,44 +1353,47 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
             )))
         },
         move |use_pid, _, cancel| {
-            let heavy = match (heavy_native.as_ref(), heavy_convrot.as_ref()) {
-                (Some(native_dit), None) => {
-                    candle_gen::check_cancel(cancel)?;
-                    let heavy = pipeline::load_residency_heavy_native_registry(
+            let heavy = heavy_file_spec.read_files_unchanged(
+                heavy_file_spec.file_source_paths(),
+                || match (heavy_native.as_ref(), heavy_convrot.as_ref()) {
+                    (Some(native_dit), None) => {
+                        candle_gen::check_cancel(cancel)?;
+                        let heavy = pipeline::load_residency_heavy_native_registry(
+                            &heavy_root,
+                            native_dit,
+                            &heavy_device,
+                            &heavy_adapters,
+                            heavy_pid.as_ref(),
+                            use_pid,
+                            native_streamable,
+                        )?;
+                        candle_gen::check_cancel(cancel)?;
+                        Ok(heavy)
+                    }
+                    // ConvRot: the int8 DiT from the single file + VAE (no adapters/PiD — the lane rejects
+                    // both, sc-9300). The TE was already loaded, encoded, and dropped by the text phase, so
+                    // this loads into that freed pool — the whole point of going sequential here.
+                    (None, Some(convrot_dit)) => {
+                        candle_gen::check_cancel(cancel)?;
+                        let heavy = pipeline::load_residency_heavy_convrot(
+                            &heavy_root,
+                            convrot_dit,
+                            &heavy_device,
+                        )?;
+                        candle_gen::check_cancel(cancel)?;
+                        Ok(heavy)
+                    }
+                    (None, None) => pipeline::load_residency_heavy_for_request(
                         &heavy_root,
-                        native_dit,
                         &heavy_device,
                         &heavy_adapters,
                         heavy_pid.as_ref(),
                         use_pid,
-                        native_streamable,
-                    )?;
-                    candle_gen::check_cancel(cancel)?;
-                    heavy
-                }
-                // ConvRot: the int8 DiT from the single file + VAE (no adapters/PiD — the lane rejects
-                // both, sc-9300). The TE was already loaded, encoded, and dropped by the text phase, so
-                // this loads into that freed pool — the whole point of going sequential here.
-                (None, Some(convrot_dit)) => {
-                    candle_gen::check_cancel(cancel)?;
-                    let heavy = pipeline::load_residency_heavy_convrot(
-                        &heavy_root,
-                        convrot_dit,
-                        &heavy_device,
-                    )?;
-                    candle_gen::check_cancel(cancel)?;
-                    heavy
-                }
-                (None, None) => pipeline::load_residency_heavy_for_request(
-                    &heavy_root,
-                    &heavy_device,
-                    &heavy_adapters,
-                    heavy_pid.as_ref(),
-                    use_pid,
-                    cancel,
-                )?,
-                (Some(_), Some(_)) => unreachable!("mutually exclusive source forms"),
-            };
+                        cancel,
+                    ),
+                    (Some(_), Some(_)) => unreachable!("mutually exclusive source forms"),
+                },
+            )?;
             Ok(KreaHeavyPhase::Sequential(Box::new(heavy)))
         },
     );
@@ -1322,8 +1408,11 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
         native_dit,
         // The multi-phase diff-patch guard input (sc-13887): read the adapter file keys at load. The
         // ConvRot path already rejected adapters above, so `spec.adapters` is empty there ⇒ `false`.
-        has_diff_patch: crate::adapters::any_diff_patch(&spec.adapters),
+        has_diff_patch: spec.read_prepared_files_unchanged(|| {
+            Ok::<_, gen_core::Error>(crate::adapters::any_diff_patch(&spec.adapters))
+        })?,
         adapters: spec.adapters.clone(),
+        file_pin_spec: spec.clone(),
     }))
 }
 
@@ -1386,10 +1475,12 @@ pub fn load_from_native_dit_file(
     base_snapshot_dir: impl AsRef<std::path::Path>,
     descriptor: ModelDescriptor,
 ) -> gen_core::Result<Box<dyn Generator>> {
-    let spec = LoadSpec::new(WeightsSource::File(dit_file.as_ref().to_path_buf())).with_component(
-        BASE_SNAPSHOT_COMPONENT,
-        WeightsSource::Dir(base_snapshot_dir.as_ref().to_path_buf()),
-    );
+    let mut spec = LoadSpec::new(WeightsSource::File(dit_file.as_ref().to_path_buf()))
+        .with_component(
+            BASE_SNAPSHOT_COMPONENT,
+            WeightsSource::Dir(base_snapshot_dir.as_ref().to_path_buf()),
+        );
+    spec.prepare_file_sources()?;
     build(&spec, descriptor)
 }
 
@@ -2479,6 +2570,128 @@ mod tests {
                 gen_core::MemoryStrategySupport::Implemented
             ));
         }
+
+        let eligible = spec
+            .clone()
+            .with_offload_policy(gen_core::OffloadPolicy::Sequential)
+            .with_load_shape(gen_core::LoadShape::DeferredMaterialization);
+        assert!(
+            native_file_streamable(KREA_2_TURBO_ID, &eligible),
+            "the explicit File load shape must arm the physical native block loader"
+        );
+        let explicit_window = gen_core::GenerationMemory {
+            stage_residency: true,
+            stream_transformer_blocks: true,
+            transformer_window_size: Some(SUPPORTED_TRANSFORMER_WINDOWS[0]),
+            transformer_window_component: Some(gen_core::TransformerComponent::Dit),
+            ..Default::default()
+        };
+        validate_native_file_transformer_request(KREA_2_TURBO_ID, &eligible, explicit_window)
+            .expect("an eligible explicit File window must reach the physical renderer");
+        let default_dit_window = gen_core::GenerationMemory {
+            stage_residency: true,
+            stream_transformer_blocks: true,
+            ..Default::default()
+        };
+        validate_native_file_transformer_request(KREA_2_TURBO_ID, &eligible, default_dit_window)
+            .expect("an omitted component/window defaults to the calibrated DiT window");
+        for component in [
+            gen_core::TransformerComponent::TextEncoder,
+            gen_core::TransformerComponent::Both,
+        ] {
+            let wrong_component = gen_core::GenerationMemory {
+                transformer_window_component: Some(component),
+                ..explicit_window
+            };
+            let error = validate_native_file_transformer_request(
+                KREA_2_TURBO_ID,
+                &eligible,
+                wrong_component,
+            )
+            .expect_err("File streaming may not claim a non-DiT component");
+            assert!(error.to_string().contains("DiT component only"), "{error}");
+        }
+        for parameter_only in [
+            gen_core::GenerationMemory {
+                transformer_window_size: Some(SUPPORTED_TRANSFORMER_WINDOWS[0]),
+                ..Default::default()
+            },
+            gen_core::GenerationMemory {
+                transformer_window_component: Some(gen_core::TransformerComponent::Dit),
+                ..Default::default()
+            },
+        ] {
+            let error = validate_native_file_transformer_request(
+                KREA_2_TURBO_ID,
+                &eligible,
+                parameter_only,
+            )
+            .expect_err("transformer parameters without streaming must be rejected");
+            assert!(
+                error.to_string().contains("stream_transformer_blocks=true"),
+                "{error}"
+            );
+        }
+        let invalid_window = gen_core::GenerationMemory {
+            transformer_window_size: Some(SUPPORTED_TRANSFORMER_WINDOWS[0] + 1),
+            ..explicit_window
+        };
+        let error =
+            validate_native_file_transformer_request(KREA_2_TURBO_ID, &eligible, invalid_window)
+                .expect_err("an uncalibrated File window must be rejected");
+        assert!(error.to_string().contains("window is fixed"), "{error}");
+        let eligible_contract = build_krea_turbo_memory_strategy_contract(&eligible);
+        assert!(matches!(
+            eligible_contract
+                .capability(gen_core::MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .support,
+            gen_core::MemoryStrategySupport::Missing
+        ));
+
+        let mut resident = eligible.clone();
+        resident.offload_policy = gen_core::OffloadPolicy::Resident;
+        assert!(!native_file_streamable(KREA_2_TURBO_ID, &resident));
+        assert!(validate_native_file_transformer_request(
+            KREA_2_TURBO_ID,
+            &resident,
+            explicit_window
+        )
+        .is_err());
+
+        let mut eager = eligible.clone();
+        eager.load_shape = gen_core::LoadShape::EagerMaterialization;
+        assert!(!native_file_streamable(KREA_2_TURBO_ID, &eager));
+        assert!(
+            validate_native_file_transformer_request(KREA_2_TURBO_ID, &eager, explicit_window)
+                .is_err()
+        );
+
+        let quantized = eligible.clone().with_quant(Quant::Q4);
+        assert!(!native_file_streamable(KREA_2_TURBO_ID, &quantized));
+        assert!(validate_native_file_transformer_request(
+            KREA_2_TURBO_ID,
+            &quantized,
+            explicit_window
+        )
+        .is_err());
+
+        let adapted = eligible.clone().with_adapters(vec![AdapterSpec::new(
+            "/imports/adapter.safetensors".into(),
+            1.0,
+            gen_core::AdapterKind::Lora,
+        )]);
+        assert!(!native_file_streamable(KREA_2_TURBO_ID, &adapted));
+        assert!(validate_native_file_transformer_request(
+            KREA_2_TURBO_ID,
+            &adapted,
+            explicit_window
+        )
+        .is_err());
+        assert!(
+            !native_file_streamable(KREA_2_RAW_ID, &eligible),
+            "Candle's streamed trunk is only wired through the ordinary Turbo t2i renderer"
+        );
     }
 
     #[test]
@@ -2992,14 +3205,17 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let native = tmp.path().join("krea.safetensors");
             std::fs::write(&native, b"construction-time bytes").unwrap();
-            let spec = LoadSpec::new(WeightsSource::File(native.clone()))
+            let mut spec = LoadSpec::new(WeightsSource::File(native.clone()))
                 .with_component(
                     BASE_SNAPSHOT_COMPONENT,
                     WeightsSource::Dir(tmp.path().join("base")),
                 )
                 .with_offload_policy(policy);
+            spec.prepare_file_sources().unwrap();
+            let prepared = spec.weights_file_pin().unwrap().unwrap();
             let (_, pinned) = resolved_base_and_native(&spec, KREA_2_RAW_ID).unwrap();
             let pinned = pinned.expect("File source must carry a construction-time pin");
+            assert_eq!(pinned, prepared, "provider must retain the cache-key token");
             assert_eq!(pinned.loader_path(), std::path::absolute(&native).unwrap());
 
             std::fs::write(&native, b"replacement after construction").unwrap();
@@ -3032,10 +3248,8 @@ mod tests {
             "a File on text_encoder selects the ConvRot DiT consume path"
         );
         // A `Dir` on `text_encoder` is not a valid ConvRot selector (ConvRot is a single file).
-        let bad = LoadSpec {
-            text_encoder: Some(WeightsSource::Dir("/te_dir".into())),
-            ..LoadSpec::new(WeightsSource::Dir("/snap".into()))
-        };
+        let mut bad = LoadSpec::new(WeightsSource::Dir("/snap".into()));
+        bad.text_encoder = Some(WeightsSource::Dir("/te_dir".into()));
         assert!(
             convrot_selector(&bad, KREA_2_TURBO_ID).is_err(),
             "a Dir on text_encoder is a mis-shaped ConvRot selector and errors"
@@ -3349,6 +3563,7 @@ mod tests {
             native_dit: None,
             adapters: Vec::new(),
             has_diff_patch: false,
+            file_pin_spec: LoadSpec::new(WeightsSource::Dir("/snap".into())),
         }
     }
 
@@ -3533,6 +3748,7 @@ mod tests {
                 native_dit: None,
                 adapters: Vec::new(),
                 has_diff_patch: false,
+                file_pin_spec: LoadSpec::new(WeightsSource::Dir("/snap".into())),
             };
             let cancel = gen_core::CancelFlag::new();
             let request = GenerationRequest {

@@ -50,29 +50,27 @@ pub(crate) struct ComfyuiSources {
 
 impl ComfyuiSources {
     pub(crate) fn separate(
-        transformer_file: PathBuf,
-        text_encoder_file: PathBuf,
-        vae_file: PathBuf,
+        transformer_file: candle_gen::gen_core::PinnedWeightsFile,
+        text_encoder_file: candle_gen::gen_core::PinnedWeightsFile,
+        vae_file: candle_gen::gen_core::PinnedWeightsFile,
         tokenizer_dir: PathBuf,
     ) -> candle_gen::gen_core::Result<Self> {
         Ok(Self {
             weights: ComfyuiWeights::Separate(Box::new(SeparateComfyuiWeights {
-                transformer_file: candle_gen::gen_core::PinnedWeightsFile::pin(transformer_file)?,
-                text_encoder_file: candle_gen::gen_core::PinnedWeightsFile::pin(text_encoder_file)?,
-                vae_file: candle_gen::gen_core::PinnedWeightsFile::pin(vae_file)?,
+                transformer_file,
+                text_encoder_file,
+                vae_file,
             })),
             tokenizer_dir,
         })
     }
 
     pub(crate) fn combined(
-        checkpoint_file: PathBuf,
+        checkpoint_file: candle_gen::gen_core::PinnedWeightsFile,
         tokenizer_dir: PathBuf,
     ) -> candle_gen::gen_core::Result<Self> {
         Ok(Self {
-            weights: ComfyuiWeights::Combined(candle_gen::gen_core::PinnedWeightsFile::pin(
-                checkpoint_file,
-            )?),
+            weights: ComfyuiWeights::Combined(Box::new(checkpoint_file)),
             tokenizer_dir,
         })
     }
@@ -130,7 +128,7 @@ impl ComfyuiSources {
 #[derive(Clone, Debug)]
 pub(crate) enum ComfyuiWeights {
     Separate(Box<SeparateComfyuiWeights>),
-    Combined(candle_gen::gen_core::PinnedWeightsFile),
+    Combined(Box<candle_gen::gen_core::PinnedWeightsFile>),
 }
 
 #[derive(Clone, Debug)]

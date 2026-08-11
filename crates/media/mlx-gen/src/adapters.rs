@@ -363,6 +363,23 @@ pub enum Adapter {
 }
 
 impl Adapter {
+    /// Evaluate only this residual's adapter-owned payload arrays.
+    ///
+    /// Safetensors loads and the transpose/reconstruction graph layered over them are lazy. Provider
+    /// loaders call this while the adapter file's immutable token is still guarded, so no LoRA/LoKr
+    /// payload can first touch disk after the pin's post-check. Base Linear weights are intentionally
+    /// absent from this evaluation set.
+    pub fn materialize(&self) -> Result<()> {
+        match self {
+            Adapter::Lora { a, b, .. } => mlx_rs::transforms::eval([a, b])?,
+            Adapter::Lokr { delta, .. } => mlx_rs::transforms::eval([delta])?,
+            Adapter::LokrStructured { factors } => {
+                mlx_rs::transforms::eval([&factors.w1, &factors.w2])?
+            }
+        }
+        Ok(())
+    }
+
     /// One adapter's forward-time contribution `scale · …`, replicating the fork's `LoRALinear`
     /// / `LoKrLinear` `.residual` **byte-for-byte** (sc-2718). No dtype is forced: the earlier f32
     /// upcast (sc-2602/2719) was a workaround for the NAX 16-bit dense GEMM returning garbage on the
@@ -609,6 +626,14 @@ impl AdaptableLinear {
 
     pub fn adapters(&self) -> &[Adapter] {
         &self.adapters
+    }
+
+    /// Evaluate every adapter residual attached to this Linear without touching its base weight.
+    pub fn materialize_adapters(&self) -> Result<()> {
+        for adapter in &self.adapters {
+            adapter.materialize()?;
+        }
+        Ok(())
     }
 
     /// Merge a precomputed `[out, in]` delta into the dense base weight (`W += δ`) — the in-place
@@ -1106,6 +1131,80 @@ pub fn install_adapter(
 mod tests {
     use super::*;
     use mlx_rs::ops::{all_close, array_eq};
+
+    #[derive(Clone, Copy, Debug)]
+    enum ResidualPayloadKind {
+        Lora,
+        MaterializedLokr,
+        StructuredLokr,
+    }
+
+    fn write_lazy_adapter_payload(path: &std::path::Path, value: f32) {
+        let mut header = br#"{"a":{"dtype":"F32","shape":[8,2],"data_offsets":[0,64]},"b":{"dtype":"F32","shape":[2,8],"data_offsets":[64,128]},"delta":{"dtype":"F32","shape":[8,8],"data_offsets":[128,384]},"w1":{"dtype":"F32","shape":[2,2],"data_offsets":[384,400]},"w2":{"dtype":"F32","shape":[4,4],"data_offsets":[400,464]}}"#.to_vec();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut bytes = Vec::with_capacity(8 + header.len() + 464);
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&header);
+        for _ in 0..116 {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn adapter_from_lazy_payload(path: &std::path::Path, kind: ResidualPayloadKind) -> Adapter {
+        let weights = crate::weights::Weights::from_file(path).unwrap();
+        match kind {
+            ResidualPayloadKind::Lora => Adapter::Lora {
+                a: weights.require("a").unwrap().clone(),
+                b: weights.require("b").unwrap().clone(),
+                scale: 1.0,
+            },
+            ResidualPayloadKind::MaterializedLokr => Adapter::Lokr {
+                delta: weights.require("delta").unwrap().clone(),
+                scale: 1.0,
+            },
+            ResidualPayloadKind::StructuredLokr => Adapter::LokrStructured {
+                factors: LokrFactors {
+                    w1: weights.require("w1").unwrap().clone(),
+                    w2: weights.require("w2").unwrap().clone(),
+                    a: 2,
+                    b: 4,
+                    c: 2,
+                    d: 4,
+                    scale: 1.0,
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn adapter_payload_materialization_stays_inside_pin_for_every_residual_form() {
+        for kind in [
+            ResidualPayloadKind::Lora,
+            ResidualPayloadKind::MaterializedLokr,
+            ResidualPayloadKind::StructuredLokr,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let source = dir.path().join("adapter.safetensors");
+            let replacement = dir.path().join("replacement.safetensors");
+            write_lazy_adapter_payload(&source, 0.25);
+            write_lazy_adapter_payload(&replacement, -0.75);
+            let pin = crate::PinnedWeightsFile::pin(&source).unwrap();
+
+            let result: crate::Result<()> = pin.read_unchanged(|path| {
+                let adapter = adapter_from_lazy_payload(path, kind);
+                std::fs::rename(&replacement, &source).unwrap();
+                adapter.materialize()
+            });
+            let error = result.expect_err("A to B replacement must invalidate the adapter pin");
+            assert!(
+                error.to_string().contains("changed after load"),
+                "{kind:?}: unexpected error: {error}"
+            );
+        }
+    }
 
     fn lokr_2x2() -> Array {
         reconstruct_lokr_delta(
