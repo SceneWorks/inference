@@ -74,10 +74,12 @@
 //!
 //! [`crate::dit::qkv`] makes both transforms executable, and
 //! `tests/dit_parity.rs::published_qkv_is_contiguous_thirds_of_the_reordered_fused_projection`
-//! asserts against real reference bytes that **crossing them is shape-identical and wrong** — which
-//! is what turns "we picked a transform" into "we picked the right one". Note the published DiT
-//! ships `to_q`/`to_k`/`to_v` already split (`to_qkv` appears nowhere in its index), so the loader
-//! applies no transform at all; that is precisely why only an explicit assertion can pin it.
+//! asserts that **crossing them is shape-identical and wrong** — which is what turns "we picked a
+//! transform" into "we picked a distinguishable one". Note the published DiT ships
+//! `to_q`/`to_k`/`to_v` already split (`to_qkv` appears nowhere in its index), so the loader applies
+//! no transform at all; that is precisely why only an explicit assertion can pin it. See
+//! [`crate::dit::qkv`]'s "what the tests do and do not establish" for the limits of that evidence —
+//! the pre-conversion tensors are reconstructed, not sourced from an original shard.
 //!
 //! # Rule 3 — a fixture generated from reference modules cannot validate a converted-checkpoint
 //! loader

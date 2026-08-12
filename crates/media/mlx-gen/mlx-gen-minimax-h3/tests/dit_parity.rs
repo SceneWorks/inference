@@ -41,7 +41,7 @@ use mlx_rs::{Array, Dtype};
 
 use mlx_gen::weights::Weights;
 use mlx_gen_minimax_h3::dit::layers::DitAttention;
-use mlx_gen_minimax_h3::dit::positions;
+use mlx_gen_minimax_h3::dit::positions::{self, KeyframeAnchor};
 use mlx_gen_minimax_h3::dit::qkv;
 use mlx_gen_minimax_h3::{
     split_fused_qkv, DitBlock, GatedFfnLayout, MiniMaxH3DitConfig, MmRope, TokenRefiner,
@@ -195,7 +195,7 @@ fn the_packed_position_grid_matches_the_reference() {
         positions::video_position_ids(l.num_text_tokens, l.num_latent_frames, &frame).unwrap(),
     );
 
-    let got = positions::to_array(&rows, Dtype::Float32).unwrap();
+    let got = positions::to_array(&rows).unwrap();
     let want = f.require("layout.position_ids").unwrap();
     assert_eq!(got.shape(), want.shape(), "packed sequence length");
     // Exact, not approximate: these are coordinates, and the reference computes them in f64 and
@@ -297,6 +297,68 @@ fn a_plausible_wrong_audio_convention_is_distinguishable() {
             "audio row {row} landed on an INTERIOR width point; it must be pinned to an extreme"
         );
     }
+}
+
+/// **The `fl2va` keyframe conditioning rows**, against the reference's own `build_packed_sequence`
+/// with `keyframe_anchors = ("first", "last")`.
+///
+/// A keyframe block is one frame's worth of rows at ONE constant time carrying the full spatial
+/// grid — a literal frame pinned to an end of the clip's clock. The `"last"` anchor is the detail
+/// worth pinning: it is the time of the FINAL generated latent frame, which is a sum over the
+/// non-uniform `5/3 × (1,4,4,4,4)` cycle rather than `num_latent_frames × a constant`.
+#[test]
+fn the_keyframe_anchor_rows_match_the_reference() {
+    let f = fixture();
+    let l = &DIT_LAYOUT;
+    let cfg = dit_fixture_config();
+    let [_, patch_h, patch_w] = cfg.patch_size;
+    let (frame, _) =
+        positions::frame_grid(l.latent_height, l.latent_width, patch_h, patch_w).unwrap();
+
+    let mut rows = positions::keyframe_position_ids(
+        KeyframeAnchor::First,
+        l.num_text_tokens,
+        l.num_latent_frames,
+        &frame,
+    )
+    .unwrap();
+    rows.extend(
+        positions::keyframe_position_ids(
+            KeyframeAnchor::Last,
+            l.num_text_tokens,
+            l.num_latent_frames,
+            &frame,
+        )
+        .unwrap(),
+    );
+
+    let want = f.require("layout.keyframe_position_ids").unwrap();
+    let got = positions::to_array(&rows).unwrap();
+    assert_eq!(got.shape(), want.shape(), "two blocks of one frame's rows");
+    let g: Vec<f32> = got.as_slice::<f32>().to_vec();
+    let w: Vec<f32> = want.as_slice::<f32>().to_vec();
+    for (i, (a, b)) in g.iter().zip(&w).enumerate() {
+        assert!(
+            (a - b).abs() < 1e-5,
+            "keyframe row {}, axis {}: got {a}, reference {b}",
+            i / 3,
+            i % 3
+        );
+    }
+
+    // The two anchors must be genuinely different times, and `last` must NOT be a uniform ramp.
+    let per_block = frame.len();
+    let (first_t, last_t) = (w[0], w[per_block * 3]);
+    assert!(last_t > first_t, "the two anchors collapsed to one time");
+    let naive = first_t + (l.num_latent_frames - 1) as f32 * positions::ROPE_FRAME_RESCALE as f32;
+    assert!(
+        (last_t - naive).abs() > 1e-3,
+        "a uniform 5/3 ramp reproduced the `last` anchor ({last_t} vs {naive}); the non-uniform \
+         (1,4,4,4,4) cycle is not reaching it"
+    );
+    println!(
+        "  keyframe anchors: first={first_t:.4} last={last_t:.4} (uniform-ramp guess {naive:.4})"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -619,40 +681,78 @@ fn qk_norm_runs_per_head_before_the_rotary() {
     }
 }
 
-/// `qk_norm_eps` must reach the norm.
+/// **All three epsilons must reach their norms** — `qk_norm_eps`, `norm_eps` and `final_norm_eps`.
 ///
 /// Gated at `eps = 1.0` rather than at a near-miss: with unit-RMS inputs the difference between
-/// 1e-5 and 1e-4 is far under this suite's ~1e-3 reduced-precision floor, so a near-miss test would
-/// be a false green. What is provable is that the field is *wired* — a port that hard-coded any
-/// epsilon fails here.
+/// 1e-5 and 1e-4 is far under this suite's ~4e-3 reduced-precision floor, so a near-miss test would
+/// be a false green. What IS provable is that each field is *wired* — a port that hard-coded any
+/// epsilon, or crossed two of them, fails here.
+///
+/// Crossing them matters even though the shipped config sets all three to 1e-5: they are separate
+/// knobs (`refiner.rs` deliberately reads `final_norm_eps` for `final_norm` and `norm_eps` for the
+/// block norms), so a variant checkpoint that diverged would otherwise run silently wrong.
 #[test]
-fn qk_norm_eps_is_wired_through() {
+fn every_norm_epsilon_is_wired_through() {
     let f = fixture();
     let cfg = dit_fixture_config();
     assert_eq!(cfg.qk_norm_eps, 1e-5, "the published value");
+    assert_eq!(cfg.norm_eps, 1e-5);
+    assert_eq!(cfg.final_norm_eps, 1e-5);
 
     let rope = rope_of(&cfg);
     let tables = rope
         .tables(f.require("layout.position_ids").unwrap(), Dtype::Float32)
         .unwrap();
-    let x = f.require("in.attn.hidden").unwrap();
+    let attn_in = f.require("in.attn.hidden").unwrap();
+    let refiner_in = f.require("in.refiner.hidden").unwrap();
+    let block_in = f.require("in.block.hidden").unwrap();
+    let temb = f.require("in.temb").unwrap();
+    let idx = indices(&f, "layout.adaln_indices");
 
-    let load = |cfg: &MiniMaxH3DitConfig| {
+    // Each epsilon is probed through the module that actually reads it.
+    let attn_out = |c: &MiniMaxH3DitConfig| {
         let mut w = model_weights();
-        DitAttention::from_weights(&mut w, "transformer_blocks.0.attn", cfg, Dtype::Float32)
+        DitAttention::from_weights(&mut w, "transformer_blocks.0.attn", c, Dtype::Float32)
+            .unwrap()
+            .forward(attn_in, Some((&rope, &tables)))
             .unwrap()
     };
-    let baseline = load(&cfg).forward(x, Some((&rope, &tables))).unwrap();
+    let block_out = |c: &MiniMaxH3DitConfig| {
+        let mut w = model_weights();
+        block(&mut w, c, 0)
+            .forward_with_temb(block_in, temb, &idx, &rope, &tables)
+            .unwrap()
+    };
+    let refiner_out = |c: &MiniMaxH3DitConfig| {
+        let mut w = model_weights();
+        TokenRefiner::from_weights(&mut w, "token_refiner", c, Dtype::Float32)
+            .unwrap()
+            .forward(refiner_in)
+            .unwrap()
+    };
 
-    let mut loud = cfg.clone();
-    loud.qk_norm_eps = 1.0;
-    let got = load(&loud).forward(x, Some((&rope, &tables))).unwrap();
-    let (peak, _) = rel(&got, &baseline);
-    println!("  qk_norm_eps 1e-5 -> 1.0: peak rel {peak:.3e}");
-    assert!(
-        peak > MUTATION_FLOOR,
-        "changing qk_norm_eps moved attention by only {peak:.3e}; the config field is inert"
+    /// `(label, how to make the epsilon loud, which module reads it)`.
+    type EpsProbe<'a> = (
+        &'a str,
+        fn(&mut MiniMaxH3DitConfig),
+        &'a dyn Fn(&MiniMaxH3DitConfig) -> Array,
     );
+    let probes: [EpsProbe; 3] = [
+        ("qk_norm_eps", |c| c.qk_norm_eps = 1.0, &attn_out),
+        ("norm_eps", |c| c.norm_eps = 1.0, &block_out),
+        ("final_norm_eps", |c| c.final_norm_eps = 1.0, &refiner_out),
+    ];
+    for (name, mutate, run) in probes {
+        let baseline = run(&cfg);
+        let mut loud = cfg.clone();
+        mutate(&mut loud);
+        let (peak, _) = rel(&run(&loud), &baseline);
+        println!("  {name} 1e-5 -> 1.0: peak rel {peak:.3e}");
+        assert!(
+            peak > MUTATION_FLOOR,
+            "changing {name} moved its module by only {peak:.3e}; the config field is inert"
+        );
+    }
 }
 
 /// A qk-norm sized to the 7168-wide projection instead of to a 128-wide head is the plausible wrong

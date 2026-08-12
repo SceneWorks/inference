@@ -136,25 +136,44 @@ impl MiniMaxH3DitConfig {
                 self.ffn_dim, self.time_embed_dim
             )));
         }
+        // A non-positive or non-finite theta makes every `inv_freq` NaN, and every attention score
+        // with it, which would propagate silently rather than fail.
+        if !self.rope_theta.is_finite() || self.rope_theta <= 0.0 {
+            return Err(Error::Msg(format!(
+                "minimax-h3 dit: rope_theta must be finite and positive, got {}",
+                self.rope_theta
+            )));
+        }
         Ok(())
     }
 
     /// Parse the published `transformer/config.json`.
+    ///
+    /// **Every key is required.** Silently defaulting an absent or wrongly-typed key would let a
+    /// variant checkpoint — a future H3 revision, or `transformer_ref` (sc-17149) — load and run
+    /// against *this* model\'s numbers. Nothing downstream shape-checks `rope_theta`, `freq_dim`,
+    /// `patch_size` or the three epsilons, so a wrong value in any of them is silent.
     pub fn from_diffusers_json(text: &str) -> Result<Self> {
         let v: serde_json::Value = serde_json::from_str(text)
             .map_err(|e| Error::Msg(format!("minimax-h3 dit config: {e}")))?;
-        let d = Self::default();
-        let int = |k: &str, fallback: i32| -> i32 {
+        let missing = |k: &str| {
+            Error::Msg(format!(
+                "minimax-h3 dit config: missing or non-numeric `{k}`"
+            ))
+        };
+        let int = |k: &str| -> Result<i32> {
             v.get(k)
                 .and_then(serde_json::Value::as_i64)
-                .map_or(fallback, |x| x as i32)
+                .map(|x| x as i32)
+                .ok_or_else(|| missing(k))
         };
-        let float = |k: &str, fallback: f32| -> f32 {
+        let float = |k: &str| -> Result<f32> {
             v.get(k)
                 .and_then(serde_json::Value::as_f64)
-                .map_or(fallback, |x| x as f32)
+                .map(|x| x as f32)
+                .ok_or_else(|| missing(k))
         };
-        let patch = v
+        let patch_size = v
             .get("patch_size")
             .and_then(serde_json::Value::as_array)
             .and_then(|a| {
@@ -167,27 +186,29 @@ impl MiniMaxH3DitConfig {
                 }
                 Some(out)
             })
-            .unwrap_or(d.patch_size);
+            .ok_or_else(|| {
+                Error::Msg("minimax-h3 dit config: `patch_size` must be a 3-element array".into())
+            })?;
 
         let cfg = Self {
-            num_attention_heads: int("num_attention_heads", d.num_attention_heads),
-            attention_head_dim: int("attention_head_dim", d.attention_head_dim),
-            hidden_size: int("hidden_size", d.hidden_size),
-            num_layers: int("num_layers", d.num_layers),
-            num_refiner_layers: int("num_refiner_layers", d.num_refiner_layers),
-            ffn_dim: int("ffn_dim", d.ffn_dim),
-            in_channels: int("in_channels", d.in_channels),
-            audio_in_channels: int("audio_in_channels", d.audio_in_channels),
-            patch_size: patch,
-            text_dim: int("text_dim", d.text_dim),
-            freq_dim: int("freq_dim", d.freq_dim),
-            time_embed_hidden_dim: int("time_embed_hidden_dim", d.time_embed_hidden_dim),
-            time_embed_dim: int("time_embed_dim", d.time_embed_dim),
-            rope_freq_dim: int("rope_freq_dim", d.rope_freq_dim),
-            rope_theta: float("rope_theta", d.rope_theta),
-            norm_eps: float("norm_eps", d.norm_eps),
-            qk_norm_eps: float("qk_norm_eps", d.qk_norm_eps),
-            final_norm_eps: float("final_norm_eps", d.final_norm_eps),
+            num_attention_heads: int("num_attention_heads")?,
+            attention_head_dim: int("attention_head_dim")?,
+            hidden_size: int("hidden_size")?,
+            num_layers: int("num_layers")?,
+            num_refiner_layers: int("num_refiner_layers")?,
+            ffn_dim: int("ffn_dim")?,
+            in_channels: int("in_channels")?,
+            audio_in_channels: int("audio_in_channels")?,
+            patch_size,
+            text_dim: int("text_dim")?,
+            freq_dim: int("freq_dim")?,
+            time_embed_hidden_dim: int("time_embed_hidden_dim")?,
+            time_embed_dim: int("time_embed_dim")?,
+            rope_freq_dim: int("rope_freq_dim")?,
+            rope_theta: float("rope_theta")?,
+            norm_eps: float("norm_eps")?,
+            qk_norm_eps: float("qk_norm_eps")?,
+            final_norm_eps: float("final_norm_eps")?,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -232,6 +253,75 @@ mod tests {
             MiniMaxH3DitConfig::from_diffusers_json(text).unwrap(),
             MiniMaxH3DitConfig::default()
         );
+    }
+
+    /// **A missing key is an error, not a silent fall back to this model's numbers.** A variant
+    /// checkpoint that omitted `rope_theta` would otherwise load and run at 10000.0 with nothing
+    /// downstream able to notice.
+    #[test]
+    fn a_missing_or_malformed_key_is_rejected() {
+        assert!(
+            MiniMaxH3DitConfig::from_diffusers_json("{}").is_err(),
+            "an empty config must not resolve to the shipped defaults"
+        );
+
+        let full = r#"{
+            "num_attention_heads": 56, "attention_head_dim": 128, "hidden_size": 5376,
+            "num_layers": 50, "num_refiner_layers": 2, "ffn_dim": 14336,
+            "in_channels": 24, "audio_in_channels": 32, "patch_size": [1, 2, 2],
+            "text_dim": 5120, "freq_dim": 256, "time_embed_hidden_dim": 5376,
+            "time_embed_dim": 2688, "rope_freq_dim": 16, "rope_theta": 10000.0,
+            "norm_eps": 1e-05, "qk_norm_eps": 1e-05, "final_norm_eps": 1e-05
+        }"#;
+        MiniMaxH3DitConfig::from_diffusers_json(full).unwrap();
+
+        // Drop each key in turn; every one must be required.
+        for key in [
+            "num_attention_heads",
+            "attention_head_dim",
+            "hidden_size",
+            "num_layers",
+            "num_refiner_layers",
+            "ffn_dim",
+            "in_channels",
+            "audio_in_channels",
+            "patch_size",
+            "text_dim",
+            "freq_dim",
+            "time_embed_hidden_dim",
+            "time_embed_dim",
+            "rope_freq_dim",
+            "rope_theta",
+            "norm_eps",
+            "qk_norm_eps",
+            "final_norm_eps",
+        ] {
+            let mut v: serde_json::Value = serde_json::from_str(full).unwrap();
+            v.as_object_mut().unwrap().remove(key);
+            assert!(
+                MiniMaxH3DitConfig::from_diffusers_json(&v.to_string()).is_err(),
+                "`{key}` must be required"
+            );
+        }
+
+        // A 2-element patch is malformed, not a reason to assume [1, 2, 2].
+        let mut v: serde_json::Value = serde_json::from_str(full).unwrap();
+        v["patch_size"] = serde_json::json!([2, 2]);
+        assert!(MiniMaxH3DitConfig::from_diffusers_json(&v.to_string()).is_err());
+    }
+
+    /// A non-positive rotary base yields NaN frequencies, which would propagate through every
+    /// attention score instead of failing.
+    #[test]
+    fn rejects_a_non_positive_rope_theta() {
+        for theta in [0.0f32, -1.0, f32::NAN] {
+            let cfg = MiniMaxH3DitConfig {
+                rope_theta: theta,
+                ..MiniMaxH3DitConfig::default()
+            };
+            let e = cfg.validate().unwrap_err().to_string();
+            assert!(e.contains("rope_theta"), "theta {theta}: {e}");
+        }
     }
 
     /// A rotary wider than a head is a geometry the block cannot express, not a silent truncation.

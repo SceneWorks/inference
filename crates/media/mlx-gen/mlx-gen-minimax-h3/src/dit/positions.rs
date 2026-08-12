@@ -17,12 +17,13 @@
 //! (sc-17146) and the pipeline (sc-17147). The grids are here because the rotary cannot be pinned
 //! without them.
 //!
-//! # The three conventions
+//! # The four conventions
 //!
 //! | rows | `t` | `h` | `w` |
 //! |---|---|---|---|
 //! | text | `0 … num_text_tokens-1` | 0 | 0 |
 //! | audio | `num_text_tokens + 0 … num_audio_latents-1`, **tiled per channel** | **0** | `width_grid[0]` for channel 0, `width_grid[-1]` for the rest |
+//! | keyframe condition (`fl2va`) | one constant [`keyframe_anchor_time`] for the whole block | [`frame_grid`] | [`frame_grid`] |
 //! | video | [`temporal_grid`] from `num_text_tokens` | [`frame_grid`] | [`frame_grid`] |
 //!
 //! Two consequences that are easy to miss:
@@ -41,8 +42,13 @@ use mlx_gen::{Error, Result};
 /// `24 fps / 40 audio-latents-per-second`. `_ROPE_FRAME_RESCALE`.
 pub const ROPE_FRAME_RESCALE: f64 = 5.0 / 3.0;
 
-/// Frames each latent frame stands for, cycling. `_ROPE_FRAMES_PER_LATENT` — the first latent
-/// covers 1 frame and every later one covers 4, which is the video VAE's `17n + 5` geometry.
+/// Frames each latent frame stands for. `_ROPE_FRAMES_PER_LATENT`, indexed **cyclically** by the
+/// latent's own index: latents 0, 5, 10, … cover 1 frame and every other latent covers 4.
+///
+/// The cycle is the point — reading this as "the first latent covers 1 and the rest cover 4" gives
+/// a monotone-but-wrong clock that only diverges from latent 5 onwards, which is past every tiny
+/// fixture and inside every real render (17n + 5 frames is 5k + 2 latents, so the shortest legal
+/// render already has 37).
 pub const ROPE_FRAMES_PER_LATENT: [f64; 5] = [1.0, 4.0, 4.0, 4.0, 4.0];
 
 /// The spatial grids are aspect-normalized onto the unit interval and then scaled by this.
@@ -187,6 +193,87 @@ pub fn audio_position_ids(
         .collect())
 }
 
+/// Which end of the generated video a `fl2va` keyframe conditioning block is anchored to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyframeAnchor {
+    /// Anchored at the first latent frame — the block sits at the video clock's origin.
+    First,
+    /// Anchored at the last latent frame.
+    Last,
+}
+
+/// The single rotary time every row of a `fl2va` keyframe conditioning block carries.
+///
+/// A keyframe block occupies one frame's worth of rows, all at **one constant time**, with the full
+/// [`frame_grid`] as its `(h, w)` — it is a literal frame pinned to one end of the clip's clock.
+///
+/// * [`KeyframeAnchor::First`] → `num_text_tokens`, the video clock's origin.
+/// * [`KeyframeAnchor::Last`] → `num_text_tokens + Σ spans - ROPE_FRAME_RESCALE`, which is the
+///   rotary time of the clip's **final video frame** — equivalently
+///   `origin + ROPE_FRAME_RESCALE · (total_frames - 1)`.
+///
+/// That second one is worth stating carefully, because the obvious reading is wrong: it is **not**
+/// the last *latent's* time. [`temporal_grid`] gives each latent the time of its *first* frame, and
+/// every latent after the first spans 4 frames, so the last latent starts 5 rotary units before the
+/// clip ends. At 3 latents from origin 5 the last latent sits at 13.33 while this anchor is 18.33.
+/// They coincide only when `(num_latent_frames - 1) % 5 == 0`, which is exactly the case a small
+/// fixture is most likely to pick. Semantically the anchor is right: an `fl2va` last-frame keyframe
+/// *is* the final frame, not the final latent.
+///
+/// # The summation order is deliberately not replicated
+///
+/// The reference computes the `Last` sum with **numpy's pairwise summation** and notes that the
+/// `ref2va` soundtrack path sums the same series **sequentially**, the two differing in the last
+/// ulp of f64 from 16 latent frames onwards — so it keeps both, one per call site.
+///
+/// This uses a plain sequential sum, because that distinction cannot survive the f64 → f32 narrow
+/// the model performs on entry (`position_ids.to(torch.float32)`). Measured: the two orders differ
+/// by at most 1.1e-11 in f64 and are **bit-identical in f32 for every latent-frame count up to
+/// 400** — far beyond the 102 the longest legal render produces.
+/// `keyframe_anchor_summation_order_is_invisible_after_the_f32_narrow` pins that, so if the claim
+/// ever stops holding this fails rather than drifting.
+pub fn keyframe_anchor_time(
+    anchor: KeyframeAnchor,
+    num_text_tokens: i32,
+    num_latent_frames: i32,
+) -> Result<f64> {
+    if num_latent_frames <= 0 {
+        return Err(Error::Msg(format!(
+            "minimax-h3 dit positions: num_latent_frames must be positive, got {num_latent_frames}"
+        )));
+    }
+    let origin = num_text_tokens as f64;
+    Ok(match anchor {
+        KeyframeAnchor::First => origin,
+        KeyframeAnchor::Last => {
+            let total: f64 = (0..num_latent_frames)
+                .map(|i| {
+                    ROPE_FRAME_RESCALE
+                        * ROPE_FRAMES_PER_LATENT[(i as usize) % ROPE_FRAMES_PER_LATENT.len()]
+                })
+                .sum();
+            origin + total - ROPE_FRAME_RESCALE
+        }
+    })
+}
+
+/// One `fl2va` keyframe conditioning block: the whole [`frame_grid`] at a single
+/// [`keyframe_anchor_time`].
+pub fn keyframe_position_ids(
+    anchor: KeyframeAnchor,
+    num_text_tokens: i32,
+    num_latent_frames: i32,
+    frame_rows: &[[f64; 2]],
+) -> Result<Vec<[f64; 3]>> {
+    if frame_rows.is_empty() {
+        return Err(Error::Msg(
+            "minimax-h3 dit positions: the frame grid is empty".into(),
+        ));
+    }
+    let t = keyframe_anchor_time(anchor, num_text_tokens, num_latent_frames)?;
+    Ok(frame_rows.iter().map(|&[h, w]| [t, h, w]).collect())
+}
+
 /// Target video rows, frame-major: each latent frame contributes the whole [`frame_grid`] at that
 /// frame's [`temporal_grid`] time.
 pub fn video_position_ids(
@@ -211,16 +298,20 @@ pub fn video_position_ids(
 
 /// Stack rows into the `[seq_len, 3]` array [`super::rope::MmRope::tables`] consumes.
 ///
-/// The reference builds the grid in float64 and the model casts to float32 on entry, so the
-/// coordinates are computed in `f64` here and narrowed once, at the boundary.
-pub fn to_array(rows: &[[f64; 3]], dtype: Dtype) -> Result<Array> {
+/// **Always float32**, deliberately, and not caller-selectable. The reference builds the grid in
+/// float64 and narrows exactly once, on entry to the model (`position_ids.to(torch.float32)`);
+/// letting a caller pick bf16 here would quantize the coordinates — the spatial grid spans `[0,32)`
+/// and the temporal one reaches ~170 at 15 s, where bf16's 8-bit significand cannot even represent
+/// adjacent latent frames — and `MmRope::tables` would then silently widen the damaged values back
+/// to f32, leaving no trace.
+pub fn to_array(rows: &[[f64; 3]]) -> Result<Array> {
     if rows.is_empty() {
         return Err(Error::Msg(
             "minimax-h3 dit positions: cannot build an empty position grid".into(),
         ));
     }
     let flat: Vec<f32> = rows.iter().flatten().map(|&v| v as f32).collect();
-    Ok(Array::from_slice(&flat, &[rows.len() as i32, 3]).as_dtype(dtype)?)
+    Ok(Array::from_slice(&flat, &[rows.len() as i32, 3]).as_dtype(Dtype::Float32)?)
 }
 
 #[cfg(test)]
@@ -344,10 +435,115 @@ mod tests {
 
     #[test]
     fn to_array_shapes_and_rejects_empty() {
-        let a = to_array(&[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], Dtype::Float32).unwrap();
+        let a = to_array(&[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]).unwrap();
         assert_eq!(a.shape(), &[2, 3]);
+        assert_eq!(
+            a.dtype(),
+            Dtype::Float32,
+            "the grid is never narrowed below f32"
+        );
         assert_eq!(a.as_slice::<f32>(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        assert!(to_array(&[], Dtype::Float32).is_err());
+        assert!(to_array(&[]).is_err());
+    }
+
+    /// A `fl2va` keyframe block is one frame's rows at ONE constant time, with the full spatial
+    /// grid — not a slice of the video's temporal ramp.
+    #[test]
+    fn a_keyframe_block_is_the_whole_frame_grid_at_one_time() {
+        let (grid, _) = frame_grid(4, 4, 2, 2).unwrap();
+        let rows = keyframe_position_ids(KeyframeAnchor::First, 5, 3, &grid).unwrap();
+        assert_eq!(rows.len(), grid.len(), "one row per patched position");
+        assert!(rows.iter().all(|r| r[0] == rows[0][0]), "one constant time");
+        assert!(
+            (rows[0][0] - 5.0).abs() < 1e-12,
+            "`first` sits at the clock origin"
+        );
+        for (row, cell) in rows.iter().zip(&grid) {
+            assert_eq!([row[1], row[2]], *cell, "the full frame grid, unchanged");
+        }
+
+        // `last` is the final FRAME's time, `origin + 5/3·(total_frames - 1)` — NOT the final
+        // latent's time, which is 5 rotary units earlier whenever the last latent spans 4 frames.
+        let (origin, latents) = (5.0f64, 3);
+        let frames: f64 = (0..latents)
+            .map(|i| ROPE_FRAMES_PER_LATENT[(i as usize) % ROPE_FRAMES_PER_LATENT.len()])
+            .sum();
+        let last = keyframe_anchor_time(KeyframeAnchor::Last, 5, latents).unwrap();
+        assert!(
+            (last - (origin + ROPE_FRAME_RESCALE * (frames - 1.0))).abs() < 1e-12,
+            "`last` must be the final FRAME's rotary time, got {last}"
+        );
+        let times = temporal_grid(latents, origin).unwrap();
+        assert!(
+            (last - times[2]).abs() > 1.0,
+            "`last` must NOT collapse onto the final latent's own time — that is the plausible \
+             misreading, and it agrees only when (num_latent_frames - 1) % 5 == 0"
+        );
+        // ...and the two anchors are different, or the enum would be inert.
+        assert!(last > keyframe_anchor_time(KeyframeAnchor::First, 5, 3).unwrap());
+        assert!(keyframe_position_ids(KeyframeAnchor::Last, 5, 0, &grid).is_err());
+    }
+
+    /// The reference computes the `Last` anchor with numpy's **pairwise** summation and the
+    /// `ref2va` path sums the same series **sequentially**, differing in the last ulp of f64 from
+    /// 16 latent frames on. This port sums sequentially; that is only sound because the
+    /// distinction cannot survive the f64 → f32 narrow the model performs on entry.
+    ///
+    /// Pin it rather than assert it in prose: a pairwise sum is reproduced here and required to be
+    /// **bit-identical in f32** across every latent-frame count a legal render can produce (17n+5
+    /// frames ⇒ 5k+2 latents, so 37 … 102) and well beyond.
+    #[test]
+    fn keyframe_anchor_summation_order_is_invisible_after_the_f32_narrow() {
+        /// numpy's `pairwise_sum` structure: a plain sum up to 8, an 8-accumulator unrolled
+        /// pass up to 128, and a split at `(n/2) & !7` above that.
+        fn pairwise(v: &[f64]) -> f64 {
+            let n = v.len();
+            if n <= 8 {
+                return v.iter().sum();
+            }
+            if n <= 128 {
+                let mut acc = [0.0f64; 8];
+                acc.copy_from_slice(&v[..8]);
+                let mut i = 8;
+                while i + 8 <= n {
+                    for (a, x) in acc.iter_mut().zip(&v[i..i + 8]) {
+                        *a += x;
+                    }
+                    i += 8;
+                }
+                let mut total = ((acc[0] + acc[1]) + (acc[2] + acc[3]))
+                    + ((acc[4] + acc[5]) + (acc[6] + acc[7]));
+                for x in &v[i..] {
+                    total += x;
+                }
+                return total;
+            }
+            // `n > 128` makes `half >= 64`, so both halves are non-empty and the recursion ends.
+            let half = (n / 2) & !7;
+            pairwise(&v[..half]) + pairwise(&v[half..])
+        }
+
+        let mut worst = 0.0f64;
+        for n in 1..=400i32 {
+            let spans: Vec<f64> = (0..n)
+                .map(|i| {
+                    ROPE_FRAME_RESCALE
+                        * ROPE_FRAMES_PER_LATENT[(i as usize) % ROPE_FRAMES_PER_LATENT.len()]
+                })
+                .collect();
+            let sequential: f64 = spans.iter().sum();
+            let paired = pairwise(&spans);
+            worst = worst.max((sequential - paired).abs());
+            assert_eq!(
+                sequential as f32, paired as f32,
+                "at {n} latent frames the two summation orders survive the f32 narrow; this port \
+                 would then have to reproduce numpy's pairwise order per call site"
+            );
+        }
+        assert!(worst < 1e-9, "f64 divergence grew to {worst:.3e}");
+        println!(
+            "  max f64 |pairwise - sequential| over 1..=400 latents: {worst:.3e}; f32 delta 0"
+        );
     }
 
     #[test]

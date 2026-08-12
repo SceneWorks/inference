@@ -139,6 +139,31 @@ fn modulate(x: &Array, scale: &Array, shift: &Array, indices: &Array) -> Result<
     Ok(add(&multiply(x, &add(&one, &scale)?)?, &shift)?)
 }
 
+/// Reject an `adaln_indices` entry that does not address a modulation-table row.
+///
+/// **MLX does not bounds-check a gather** — `mlx-rs`' own indexing docs state that "mlx allows out
+/// of bounds indexing", and the Metal kernel only fixes up *negative* indices — so an index past
+/// the end reads whatever is adjacent in the buffer and the block computes silent garbage. The
+/// reference's `index_select` raises `IndexError` instead
+/// (`transformer_minimax_h3.py::MiniMaxH3TransformerBlock.forward`).
+///
+/// The failure is reachable from ordinary caller arithmetic: `adaln_indices` is
+/// `timestep_indices · MODALITY_NUM + token_tags`, so a single stale timestep index or an
+/// out-of-range modality tag produces it — and sc-17146 is the story that will build those tensors.
+fn check_adaln_indices(indices: &Array, rows: i32) -> Result<()> {
+    let idx = indices.as_dtype(Dtype::Int32)?;
+    let min: i32 = idx.min(None)?.item();
+    let max: i32 = idx.max(None)?.item();
+    if min < 0 || max >= rows {
+        return Err(Error::Msg(format!(
+            "minimax-h3 dit block: adaln_indices range [{min}, {max}] is outside the modulation \
+             table's {rows} rows (num_timesteps · {MODALITY_NUM}); MLX gathers out of bounds \
+             silently rather than failing"
+        )));
+    }
+    Ok(())
+}
+
 /// One block of the 50-layer stack.
 #[derive(Debug, Clone)]
 pub struct DitBlock {
@@ -218,6 +243,7 @@ impl DitBlock {
                 adaln_indices.shape()
             )));
         }
+        check_adaln_indices(adaln_indices, modulation.scale_msa.shape()[0])?;
 
         let normed = modulate(
             &self.norm1.forward(x)?,
@@ -286,6 +312,30 @@ mod tests {
                 .any(|n| n.contains(".ff.") && n.ends_with(".bias")),
             "the feed-forward is bias-free"
         );
+    }
+
+    /// An out-of-range AdaLN index must be an error, not a silent out-of-bounds gather. MLX does
+    /// not bounds-check, so without this the block would compute plausible garbage.
+    #[test]
+    fn an_out_of_range_adaln_index_is_rejected() {
+        // A 6-row table: 2 timesteps × 3 modalities.
+        let ok = Array::from_slice(&[0i32, 5, 2], &[3]);
+        check_adaln_indices(&ok, 6).unwrap();
+
+        for (label, bad) in [
+            ("past the end", Array::from_slice(&[0i32, 6], &[2])),
+            ("negative", Array::from_slice(&[-1i32, 0], &[2])),
+            (
+                "a tag beyond MODALITY_NUM",
+                // timestep 1, tag 3 -> 1·3 + 3 = 6, one past a 2-timestep table.
+                Array::from_slice(&[MODALITY_NUM + 3], &[1]),
+            ),
+        ] {
+            let e = check_adaln_indices(&bad, 6)
+                .expect_err(&format!("{label} must be rejected"))
+                .to_string();
+            assert!(e.contains("outside the modulation table"), "{label}: {e}");
+        }
     }
 
     /// `1 + scale`, not `scale`. An implementation that multiplied by the raw scale would be an

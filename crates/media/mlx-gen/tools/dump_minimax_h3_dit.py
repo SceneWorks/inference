@@ -204,7 +204,27 @@ def packed_layout():
         keyframe_anchors=(),
     )
     assert num_condition_rows == 0 and num_condition_audio_rows == 0
-    return position_ids, token_tags, video_indices, audio_indices, text_indices
+
+    # ...and the `fl2va` variant, purely to capture the two keyframe ANCHOR TIMES. A keyframe block
+    # is one frame's worth of rows at a single constant time; `"last"` is summed with numpy's
+    # pairwise order, which `positions.rs` deliberately does not replicate (the distinction sits
+    # below the f64 -> f32 narrow the model performs on entry, and a Rust test pins that).
+    keyed, _, _, _, _, cond_rows, _ = MiniMaxH3PrepareLayoutStep.build_packed_sequence(
+        text_token_tags=text_token_tags,
+        num_latent_frames=NUM_LATENT_FRAMES,
+        latent_height=LATENT_HEIGHT,
+        latent_width=LATENT_WIDTH,
+        num_audio_latents=NUM_AUDIO_LATENTS,
+        patch_size=PATCH_SIZE,
+        audio_channels=AUDIO_CHANNELS,
+        audio_tag=AUDIO_TAG,
+        video_tag=VIDEO_TAG,
+        keyframe_anchors=("first", "last"),
+    )
+    rows_per_frame = (LATENT_HEIGHT // PATCH_SIZE[1]) * (LATENT_WIDTH // PATCH_SIZE[2])
+    assert cond_rows == 2 * rows_per_frame, cond_rows
+    keyframes = keyed[NUM_TEXT_TOKENS : NUM_TEXT_TOKENS + cond_rows]
+    return position_ids, token_tags, video_indices, audio_indices, text_indices, keyframes
 
 
 def main() -> None:
@@ -220,13 +240,23 @@ def main() -> None:
     out: dict[str, np.ndarray] = {}
 
     # ---- the packed layout, straight from the reference ---------------------------------------
-    position_ids, token_tags, video_indices, audio_indices, text_indices = packed_layout()
+    (
+        position_ids,
+        token_tags,
+        video_indices,
+        audio_indices,
+        text_indices,
+        keyframes,
+    ) = packed_layout()
     seq_len = position_ids.shape[0]
     out["layout.position_ids"] = np32(position_ids)
     out["layout.token_tags"] = token_tags.to(torch.float32).numpy()
     out["layout.video_indices"] = video_indices.to(torch.float32).numpy()
     out["layout.audio_indices"] = audio_indices.to(torch.float32).numpy()
     out["layout.text_indices"] = text_indices.to(torch.float32).numpy()
+    # The `fl2va` keyframe conditioning rows: two blocks (anchored "first" and "last") of one
+    # frame's rows each, every row of a block at the same constant time.
+    out["layout.keyframe_position_ids"] = np32(keyframes)
 
     # ---- MM-RoPE ------------------------------------------------------------------------------
     with torch.no_grad():

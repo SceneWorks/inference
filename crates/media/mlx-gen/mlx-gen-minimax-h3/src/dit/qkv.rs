@@ -4,6 +4,26 @@
 //! `tests/dit_parity.rs` runs both transforms against both source layouts to prove they are
 //! genuinely different partitions rather than two names for one gather.
 //!
+//! # What the tests do and do not establish
+//!
+//! Be precise about this, because overclaiming is how sc-18740 shipped. The fixture's
+//! `src.…qkv_proj.weight` is **derived from the published tensors** by inverting the conversion —
+//! there is no pre-conversion MiniMax shard on disk to compare against, and at tiny dims the
+//! weights are random-init anyway. So the suite establishes two things and not a third:
+//!
+//! * **established** — [`split_thirds`] and [`crate::vae::split_fused_qkv`] are *different
+//!   partitions*, and each reproduces the published split only from its own source layout; the
+//!   cross-applied cases are shape-identical and differ in bytes. That is what makes choosing the
+//!   wrong one a detectable error rather than a coin flip.
+//! * **established** — [`reorder_interleaved`] is the exact inverse of the permute the fixture
+//!   generator applies, and the generator additionally runs the **official**
+//!   `reorder_interleaved_qkv` / `split_fused_qkv` / `convert_transformer_key` forward over it and
+//!   refuses to write the fixture if any disagrees. That check lives in
+//!   `tools/dump_minimax_h3_dit.py` — i.e. it runs at regeneration time, **not** in CI.
+//! * **not established** — that `MiniMaxAI/MiniMax-H3`'s real published bytes were produced by this
+//!   composition. That rests on the upstream conversion script being what it says it is, and no
+//!   test here can independently show it.
+//!
 //! # What the published DiT actually ships
 //!
 //! **Nothing.** `to_qkv` / `qkv_proj` appears nowhere in

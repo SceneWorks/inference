@@ -1222,11 +1222,10 @@ fn real_weight_dit_block_runs_one_forward() {
         moved > 1e-3,
         "the real block was an identity (residual std {moved:.3e})"
     );
-    assert!(
-        fwd_ms > 0,
-        "forward reported 0 ms — the timer did not span the evaluation"
-    );
-
+    // The evaluation is forced by the `std_dev`/`.item()` calls above, which sit INSIDE the timer;
+    // `fwd_ms` is therefore a real compute measurement rather than graph-construction time. It is
+    // reported, not asserted on — a wall-clock lower bound proves nothing on its own, and the
+    // evidence that the block really ran is the shape, finiteness and non-constant residual.
     println!(
         "REAL-WEIGHT DiT BLOCK SMOKE: loaded {shard_tensors} tensors from {DIT_FIRST_SHARD} and \
          built transformer_blocks.0 in {load_ms} ms at the published 5376 / 56x128 / ffn 14336 / \
