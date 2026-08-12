@@ -1,0 +1,380 @@
+#![allow(dead_code)]
+//! Shared helpers. `mod common;` is compiled into every test binary, so only a subset is used by
+//! any one of them.
+
+use std::collections::{BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
+
+use candle_gen::candle_core::{DType, Device, Tensor};
+use candle_gen::Weights;
+
+use candle_gen_minimax_h3::{BigVganConfig, MiniMaxH3AudioVaeConfig, MiniMaxH3VaeConfig};
+
+/// The committed video-VAE parity fixture, produced by the MLX lane's
+/// `tools/dump_minimax_h3_video_vae.py` running the **official diffusers**
+/// `AutoencoderKLMiniMaxH3` — the converted-checkpoint layout production loads. It carries the
+/// pre-conversion `src.` tensors alongside, so `video_vae_parity.rs` can assert the committed
+/// weights really are in the converted layout (sc-18740: a fixture dumped from the reference
+/// modules through a pure rename made the whole MLX suite a false green).
+pub const FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/video_vae_decode.safetensors"
+);
+
+/// The committed audio parity fixture, produced by `tools/dump_minimax_h3_audio_vae.py` running
+/// the same snapshot's `FL2VA/audio_vae` bundle (`DacAudioVAE` / `BigVGAN` / `SnakeBeta` /
+/// `kaiser_sinc_filter1d`).
+pub const AUDIO_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/audio_vae_decode.safetensors"
+);
+
+/// The MLX lane's copy of the same two goldens. `cross_backend.rs` asserts this crate's copies are
+/// **byte-identical** to them: the cross-backend parity argument is that both ports are held to the
+/// same reference tensors, and two fixtures that had silently drifted apart would break that
+/// without breaking either suite on its own.
+pub const MLX_FIXTURE_DIR: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../mlx-gen/mlx-gen-minimax-h3/tests/fixtures"
+);
+
+/// The committed record of the **MLX lane's own decode** of those goldens, written by
+/// `mlx-gen-minimax-h3`'s `tests/cross_backend_record.rs` (an `#[ignore]`d generator that runs on
+/// Metal). `cross_backend.rs` compares this port's tensors against it directly, so the cross-backend
+/// claim is a measurement rather than a triangle bound through the reference.
+pub const MLX_RECORD: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/mlx_cross_backend.safetensors"
+);
+
+// -------------------------------------------------------------------------------------------
+// A hand-rolled safetensors reader
+// -------------------------------------------------------------------------------------------
+
+struct Entry {
+    dtype: String,
+    shape: Vec<usize>,
+    start: usize,
+    end: usize,
+}
+
+/// A committed golden, read by parsing the safetensors container directly.
+///
+/// `candle_core::safetensors` **drops `__metadata__`**, and the video fixture's provenance record
+/// (`provenance`, `reference`, `gated_ffn_layout`, …) is the sc-18740 Rule-3 gate — a fixture that
+/// cannot be shown to come from the converted-checkpoint path is one this suite must refuse. So the
+/// header is parsed here, exactly as `candle-gen-bernini`'s goldens are.
+pub struct Golden {
+    data: Vec<u8>,
+    data_start: usize,
+    entries: HashMap<String, Entry>,
+    meta: HashMap<String, String>,
+}
+
+impl Golden {
+    /// Load a fixture from an absolute path.
+    pub fn load(path: &str) -> Golden {
+        let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+        assert!(bytes.len() > 8, "{path}: truncated safetensors container");
+        let hlen = u64::from_le_bytes(bytes[0..8].try_into().expect("8 bytes")) as usize;
+        let header: serde_json::Value = serde_json::from_slice(&bytes[8..8 + hlen])
+            .unwrap_or_else(|e| panic!("{path}: parse safetensors header: {e}"));
+        let obj = header.as_object().expect("header object");
+
+        let mut entries = HashMap::new();
+        let mut meta = HashMap::new();
+        for (k, v) in obj {
+            if k == "__metadata__" {
+                for (mk, mv) in v.as_object().expect("metadata object") {
+                    meta.insert(mk.clone(), mv.as_str().unwrap_or_default().to_string());
+                }
+                continue;
+            }
+            let dtype = v["dtype"].as_str().expect("dtype").to_string();
+            let shape: Vec<usize> = v["shape"]
+                .as_array()
+                .expect("shape")
+                .iter()
+                .map(|x| x.as_u64().expect("dim") as usize)
+                .collect();
+            let offs = v["data_offsets"].as_array().expect("data_offsets");
+            entries.insert(
+                k.clone(),
+                Entry {
+                    dtype,
+                    shape,
+                    start: offs[0].as_u64().expect("start") as usize,
+                    end: offs[1].as_u64().expect("end") as usize,
+                },
+            );
+        }
+        Golden {
+            data_start: 8 + hlen,
+            data: bytes,
+            entries,
+            meta,
+        }
+    }
+
+    /// Whether the fixture carries `key`.
+    pub fn has(&self, key: &str) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    /// Every tensor key, sorted.
+    pub fn keys(&self) -> BTreeSet<String> {
+        self.entries.keys().cloned().collect()
+    }
+
+    /// A safetensors `__metadata__` entry, or `None`.
+    pub fn meta(&self, key: &str) -> Option<&str> {
+        self.meta.get(key).map(|s| s.as_str())
+    }
+
+    /// Declared shape of `key`.
+    pub fn shape(&self, key: &str) -> Vec<usize> {
+        self.entries
+            .get(key)
+            .unwrap_or_else(|| panic!("missing tensor {key}"))
+            .shape
+            .clone()
+    }
+
+    fn raw(&self, key: &str) -> &[u8] {
+        let e = self
+            .entries
+            .get(key)
+            .unwrap_or_else(|| panic!("missing tensor {key}"));
+        &self.data[self.data_start + e.start..self.data_start + e.end]
+    }
+
+    /// The f32 values of `key`, in logical (row-major) order.
+    pub fn f32(&self, key: &str) -> Vec<f32> {
+        let e = self
+            .entries
+            .get(key)
+            .unwrap_or_else(|| panic!("missing tensor {key}"));
+        assert_eq!(e.dtype, "F32", "{key} is {}, not F32", e.dtype);
+        self.raw(key)
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().expect("4 bytes")))
+            .collect()
+    }
+
+    /// `key` as a CPU f32 tensor.
+    pub fn tensor(&self, key: &str) -> Tensor {
+        Tensor::from_vec(self.f32(key), self.shape(key), &Device::Cpu)
+            .unwrap_or_else(|e| panic!("tensor {key}: {e}"))
+    }
+
+    /// Every tensor whose key does NOT start with one of `drop_prefixes`, as a weight map.
+    ///
+    /// For the video fixture that is exactly the model weights in the published root naming; the
+    /// `src.` / `in.` / `out.` / `const.` namespaces are reference-side extras.
+    pub fn model_map(&self, drop_prefixes: &[&str]) -> HashMap<String, Tensor> {
+        self.entries
+            .keys()
+            .filter(|k| !drop_prefixes.iter().any(|p| k.starts_with(p)))
+            .map(|k| (k.clone(), self.tensor(k)))
+            .collect()
+    }
+
+    /// Every tensor whose key starts with `prefix`, keys unchanged.
+    pub fn prefixed_map(&self, prefix: &str) -> HashMap<String, Tensor> {
+        self.entries
+            .keys()
+            .filter(|k| k.starts_with(prefix))
+            .map(|k| (k.clone(), self.tensor(k)))
+            .collect()
+    }
+}
+
+/// Wrap a weight map as a `candle_gen::Weights`.
+pub fn weights(map: HashMap<String, Tensor>) -> Weights {
+    Weights::from_map(map)
+}
+
+// -------------------------------------------------------------------------------------------
+// Fixture geometry — mirrors the dump scripts
+// -------------------------------------------------------------------------------------------
+
+/// The tiny geometry the video fixture was dumped at. Structurally identical to the shipped model
+/// — same partial-rotary ratio, same 24 latent channels, and the **production** temporal knobs
+/// (`clip_length 17`, `patch_size_t 4`) so the chunk plan is the real one; only the width and depth
+/// are shrunk so the weights are committable.
+pub fn fixture_config(token_drop: i32) -> MiniMaxH3VaeConfig {
+    let shipped = MiniMaxH3VaeConfig::default();
+    MiniMaxH3VaeConfig {
+        latent_channels: 24,
+        out_channels: 3,
+        num_layers: 2,
+        num_heads: 2,
+        head_dim: 16,
+        num_register_tokens: 4,
+        ffn_mult: 4,
+        rope_theta: 100.0,
+        rope_dim_ratio: 0.75,
+        norm_eps: 1e-5,
+        patch_size: 2,
+        patch_size_t: 4,
+        clip_length: 17,
+        token_drop,
+        // The REAL 24-entry de-normalization statistics, not placeholders.
+        latents_mean: shipped.latents_mean.clone(),
+        latents_std: shipped.latents_std.clone(),
+    }
+}
+
+/// The tiny audio geometry the fixture was dumped at.
+///
+/// Only the *width* is shrunk — `decoder_dim` 1024 → 128 (the smallest that survives all seven
+/// halvings) and `latent_dim` 2048 → 64. Everything that drives the arithmetic is the shipped
+/// value: `sample_rate` 32000, which is what selects the production BigVGAN branch, so all seven
+/// upsample stages, the `[3,7,11]` × `[1,3,5]` AMP table, the 800× hop and the 12-tap Kaiser-sinc
+/// filters are the real ones — as are the 32 latent channels and their de-normalization statistics.
+pub fn audio_fixture_config() -> MiniMaxH3AudioVaeConfig {
+    let shipped = MiniMaxH3AudioVaeConfig::default();
+    MiniMaxH3AudioVaeConfig {
+        sample_rate: 32_000,
+        output_channels: 2,
+        latent_channels: 32,
+        encoder_dim: 8,
+        encoder_rates: vec![2, 2],
+        decoder_rates: vec![5, 5, 2, 2, 2, 2, 2],
+        decoder_dim: 128,
+        attn_proj: true,
+        decoder_type: "bigvgan".into(),
+        latents_mean: shipped.latents_mean.clone(),
+        latents_std: shipped.latents_std.clone(),
+        bigvgan: BigVganConfig::for_sample_rate(32_000, 64, 128).expect("32 kHz is supported"),
+    }
+}
+
+// -------------------------------------------------------------------------------------------
+// Metrics
+// -------------------------------------------------------------------------------------------
+
+/// Flatten a tensor to f32 in logical order.
+pub fn flat(t: &Tensor) -> Vec<f32> {
+    t.to_dtype(DType::F32)
+        .expect("f32")
+        .flatten_all()
+        .expect("flatten")
+        .to_vec1::<f32>()
+        .expect("vec")
+}
+
+/// `(max|a-b| / peak|b|, mean|a-b| / mean|b|)` over the full tensors — the peak- and mean-relative
+/// error the parity gates use.
+///
+/// **Gate on the peak-relative form.** Five separate defects in this epic had cosine ≥ 0.98 or an
+/// unchanged norm; the relative max-abs-diff is the metric that actually moves.
+pub fn rel(a: &Tensor, b: &Tensor) -> (f32, f32) {
+    let a = flat(a);
+    let b = flat(b);
+    assert_eq!(a.len(), b.len(), "length mismatch");
+    let peak = b.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-12);
+    let mean = (b.iter().map(|v| v.abs()).sum::<f32>() / b.len() as f32).max(1e-12);
+    let max_d = a
+        .iter()
+        .zip(&b)
+        .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+    let mean_d = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).sum::<f32>() / a.len() as f32;
+    (max_d / peak, mean_d / mean)
+}
+
+/// Cosine similarity between two tensors, flattened.
+///
+/// Reported alongside [`rel`] wherever a **layout** error is under test rather than a numeric one.
+/// sc-18740's gate/value half-swap leaves the output norm essentially unchanged (89 vs 85 on real
+/// weights) so magnitude, std and checksum assertions are all blind to it — but it also keeps
+/// cosine at 0.73-0.78 rather than ~0, because `silu(a)·b` and `silu(b)·a` share sign structure.
+/// **Neither metric alone is sufficient**: cosine is scale-invariant and the relative max-abs-diff
+/// is the one that actually exposes the swap, so the tests print both and gate on the latter.
+pub fn cosine(a: &Tensor, b: &Tensor) -> f32 {
+    let a = flat(a);
+    let b = flat(b);
+    let dot: f32 = a.iter().zip(&b).map(|(x, y)| x * y).sum();
+    let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    dot / (na * nb).max(1e-12)
+}
+
+/// L2 norm — reported (never asserted on) in the half-swap tests, as the direct demonstration that
+/// magnitude cannot see a layout error.
+pub fn l2_norm(x: &Tensor) -> f32 {
+    flat(x).iter().map(|v| v * v).sum::<f32>().sqrt()
+}
+
+/// Standard deviation — a golden whose expected output is ~constant proves nothing.
+pub fn std_dev(x: &Tensor) -> f32 {
+    let v = flat(x);
+    let mean = v.iter().sum::<f32>() / v.len() as f32;
+    (v.iter().map(|a| (a - mean) * (a - mean)).sum::<f32>() / v.len() as f32).sqrt()
+}
+
+/// Assert `got` matches `want` within the parity tolerance, printing the actual error first so a
+/// failing run reports the real numbers rather than only the bound.
+pub fn assert_parity(got: &Tensor, want: &Tensor, tol: f32, what: &str) {
+    assert_eq!(got.dims(), want.dims(), "{what}: shape");
+    let (peak, mean) = rel(got, want);
+    println!("  {what}: peak rel {peak:.3e} (mean {mean:.3e}, tol {tol:.1e})");
+    assert!(
+        peak < tol,
+        "{what}: peak-relative error {peak:.3e} (mean {mean:.3e}) exceeds {tol:.1e}"
+    );
+}
+
+// -------------------------------------------------------------------------------------------
+// Real weights
+// -------------------------------------------------------------------------------------------
+
+/// The MiniMax-H3 snapshot root, from `MINIMAX_H3_SNAPSHOT`.
+///
+/// Deliberately **panics** when unset. These are `#[ignore]`d tests: if this returned `None` and
+/// the test quietly returned, `cargo test -- --ignored` would print `ok` in 0.00s and a reviewer
+/// would read a skipped test as a passing one. Inference never derives a cache location or
+/// self-fetches (epic 13657), so the path must be supplied explicitly.
+pub fn snapshot() -> PathBuf {
+    let raw = std::env::var("MINIMAX_H3_SNAPSHOT").unwrap_or_default();
+    assert!(
+        !raw.is_empty(),
+        "MINIMAX_H3_SNAPSHOT must point at a MiniMaxAI/MiniMax-H3 snapshot root (the dir holding \
+         `vae/`). This test is #[ignore]d and asserts rather than skips so that a missing \
+         snapshot cannot be mistaken for a pass."
+    );
+    let path = PathBuf::from(raw);
+    assert!(
+        path.join("vae").join("config.json").is_file(),
+        "MINIMAX_H3_SNAPSHOT={} has no vae/config.json",
+        path.display()
+    );
+    path
+}
+
+/// Read a file from the snapshot, asserting rather than returning an `Option`.
+pub fn read_snapshot_file(path: &Path) -> String {
+    std::fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()))
+}
+
+/// The keys of a safetensors file, read from its header only (no weight I/O).
+pub fn safetensors_keys(path: &Path) -> BTreeSet<String> {
+    let mut file =
+        std::fs::File::open(path).unwrap_or_else(|e| panic!("opening {}: {e}", path.display()));
+    use std::io::Read;
+    let mut len = [0u8; 8];
+    file.read_exact(&mut len)
+        .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let hlen = u64::from_le_bytes(len) as usize;
+    let mut header = vec![0u8; hlen];
+    file.read_exact(&mut header)
+        .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let json: serde_json::Value = serde_json::from_slice(&header)
+        .unwrap_or_else(|e| panic!("{}: header: {e}", path.display()));
+    json.as_object()
+        .expect("header object")
+        .keys()
+        .filter(|k| *k != "__metadata__")
+        .cloned()
+        .collect()
+}

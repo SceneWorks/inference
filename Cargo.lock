@@ -747,6 +747,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-gen-minimax-h3"
+version = "0.0.0"
+dependencies = [
+ "candle-gen",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "candle-gen-mochi"
 version = "0.0.0"
 dependencies = [
