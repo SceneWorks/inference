@@ -48,6 +48,13 @@
 //! A reference built from frames whose real rate was lost is conditioned on **at the wrong speed,
 //! and nothing raises**. So [`VideoReference`] carries its `fps` and [`AudioReference`] its
 //! `sample_rate` as required data rather than as an optional hint with a plausible default.
+//!
+//! The **request surface must carry the rate too**, or the guarantee stops at this type's boundary.
+//! It does: `gen_core::Conditioning::ReferenceVideo` has its own `fps`, distinct from the
+//! request-level `GenerationRequest::fps` (the *output* rate, which this model pins to 24). An
+//! earlier revision routed references through `Conditioning::VideoClip`, which has no rate — every
+//! reference therefore arrived declaring exactly 24 fps and a 30 fps clip was conditioned on 25%
+//! fast. See `crate::model::request_references` for that decision in full.
 
 use mlx_gen::media::{AudioTrack, Image};
 use mlx_gen::{Error, Result};
@@ -636,6 +643,71 @@ mod tests {
 
     fn img_ref() -> Ref2VaReference {
         Ref2VaReference::Image(image(64, 64))
+    }
+
+    /// A solid-colour frame tagged with `marker`. Solid is the point: the canvas step may stretch
+    /// these, and a stretch of a constant image is that same constant, so the tag survives resizing
+    /// and the test can assert *which* source frames came out rather than only how many.
+    fn tagged(marker: u8) -> Image {
+        Image {
+            width: 64,
+            height: 64,
+            pixels: vec![marker; 64 * 64 * 3],
+        }
+    }
+
+    fn markers(frames: &[Image]) -> Vec<u8> {
+        frames.iter().map(|f| f.pixels[0]).collect()
+    }
+
+    fn normalize_at(fps: f64, frames: &[Image]) -> Vec<Image> {
+        normalize_reference_clip(
+            frames,
+            fps,
+            64, // well above every output length here, so truncation never confounds the resample
+            crate::pipeline::SPATIAL_STRIDE as i32,
+            crate::pipeline::CANVAS_SHORT_EDGE as i32,
+            i64::from(crate::pipeline::CANVAS_MAX_PIXELS),
+            crate::denoise::MINIMAX_H3_FPS,
+        )
+        .expect("a well-formed clip normalizes")
+    }
+
+    /// A reference clip is resampled **from the rate it declares**, and declaring the wrong rate
+    /// silently changes which frames the model sees (sc-17149).
+    ///
+    /// This branch was unreachable until `Conditioning::ReferenceVideo` gave the request surface a
+    /// per-clip rate: the previous carrier had no rate field, so every reference arrived declaring
+    /// exactly 24.0 and took the equality early-return. These are the three cases that now differ.
+    #[test]
+    fn a_clip_is_resampled_from_the_rate_it_declares() {
+        let five: Vec<Image> = [10u8, 20, 30, 40, 50].iter().map(|m| tagged(*m)).collect();
+
+        // 24 fps — the identity case, and the ONLY behaviour the old request surface could produce.
+        assert_eq!(
+            markers(&normalize_at(24.0, &five)),
+            vec![10, 20, 30, 40, 50]
+        );
+
+        // 30 fps — frames are DROPPED (ffmpeg `fps` slotting: 5 · 24/30 keeps 4). The third frame is
+        // the one that goes. Declaring this clip at 24 fps instead would have played it 25% fast
+        // with nothing raised — the exact defect the carrier's `fps` field exists to prevent.
+        assert_eq!(markers(&normalize_at(30.0, &five)), vec![10, 20, 40, 50]);
+
+        // 12 fps — frames are DUPLICATED, each held for two output slots.
+        let three: Vec<Image> = [10u8, 20, 30].iter().map(|m| tagged(*m)).collect();
+        assert_eq!(
+            markers(&normalize_at(12.0, &three)),
+            vec![10, 10, 20, 20, 30, 30]
+        );
+
+        // Nothing is blended: every output frame is one of the inputs, verbatim.
+        for f in normalize_at(30.0, &five) {
+            assert!(
+                f.pixels.iter().all(|p| *p == f.pixels[0]),
+                "a resampled frame must be a held source frame, never an interpolation"
+            );
+        }
     }
 
     fn vid_ref(with_audio: bool) -> Ref2VaReference {

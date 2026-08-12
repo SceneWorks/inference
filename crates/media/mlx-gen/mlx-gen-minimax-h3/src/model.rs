@@ -110,11 +110,15 @@ pub fn descriptor() -> ModelDescriptor {
             // heterogeneous-reference variant and `conditioning` is an **ordered** `Vec`, so the
             // request's own order carries the semantics `ref2va` needs — see
             // [`crate::reference`] on why order is not incidental, and [`request_references`] for
-            // the `VideoClip`-over-`VideoSync` decision.
+            // why the video one is `ReferenceVideo` and not `VideoClip` or `VideoSync`.
+            //
+            // `VideoClip` is deliberately **not** advertised. Nothing here reads it, and leaving it
+            // in the allowlist would let an in-context clip through to a model that has no in-context
+            // clip mechanism; default-deny turns it into the typed `Error::Unsupported` instead.
             conditioning: vec![
                 ConditioningKind::Keyframe,
                 ConditioningKind::Reference,
-                ConditioningKind::VideoClip,
+                ConditioningKind::ReferenceVideo,
                 ConditioningKind::ReferenceAudio,
             ],
             supports_lora: false,
@@ -371,10 +375,11 @@ pub(crate) fn keyframe_images<'a>(
 /// implementation, and what [`keyframe_images`] legitimately does for `fl2va`'s two fixed slots)
 /// would silently rewrite the request.
 ///
-/// # The `VideoClip` decision (sc-17149), and why not the Foley-style whole-clip condition
+/// # The `ReferenceVideo` decision (sc-17149), and the two carriers it replaced
 ///
-/// A `ref2va` video reference maps to [`Conditioning::VideoClip`], **not**
-/// [`Conditioning::VideoSync`]. The story asks for this to be deliberate, so:
+/// A `ref2va` video reference maps to [`Conditioning::ReferenceVideo`] — a carrier added to
+/// gen-core for this task, rather than either of the two video variants that already existed. The
+/// story asks for this to be deliberate, so:
 ///
 /// * **`VideoSync` is the wrong meaning.** Its contract is video→audio Foley — "the whole-clip
 ///   visual condition an audio decoder attends to, to synthesize a synchronized soundtrack for a
@@ -383,32 +388,44 @@ pub(crate) fn keyframe_images<'a>(
 ///   and it conditions a *generated* clip rather than scoring a supplied one. Advertising
 ///   `VideoSync` would also advertise a Foley capability MiniMax-H3 does not have, and the kind is
 ///   what routing reads.
-/// * **`VideoClip` is the right mechanism.** Its contract is "the frames are VAE-encoded and
-///   **appended as extra tokens** (RoPE-offset on the frame axis) with denoise mask `1 − strength`"
-///   — which is precisely what a reference block is: encoded by the video VAE, packed as extra
-///   rows ahead of the generated ones, placed on the shared rotary clock, and never written by the
-///   denoise loop.
+/// * **`VideoClip` is the right *mechanism* but the wrong *vocabulary*.** Its latent handling does
+///   describe a reference block — VAE-encoded, appended as extra rows, never written by the denoise
+///   loop. But its payload is `{frames, frame_idx, strength}`, and a reference can use exactly one
+///   of those three fields:
+///     * `frame_idx` is a **position in the generated timeline**, which is the defining thing a
+///       reference does not have (that is the whole difference from a keyframe);
+///     * `strength` is a `1 − strength` denoise mask, and reference rows are fully pinned at the
+///       checkpoint's own conditioning timestep ([`crate::denoise::KEYFRAME_NOISE_AUG`] for visual
+///       rows, [`crate::denoise::REFERENCE_AUDIO_TIMESTEP`] for audio), never caller-selectable.
 ///
-/// The two fields that do **not** transfer are rejected rather than ignored, because silently
-/// dropping them is how a caller ends up believing it positioned or softened a reference it did
-/// not:
+///   An earlier revision of this function did ride `VideoClip` and rejected both fields unless they
+///   were `0` and `1.0`. That shipped a request vocabulary in which two of three fields were traps,
+///   and it still could not carry the two things a reference actually needs — see below.
 ///
-/// * `frame_idx` must be `0`. A reference has **no position in the generated timeline** — that is
-///   the defining difference from a keyframe. Its rotary placement comes from its ordinal in the
-///   reference list, not from an output frame index.
-/// * `strength` must be `1.0`. Reference rows are fully pinned; their timestep is the checkpoint's
-///   own conditioning policy ([`crate::denoise::KEYFRAME_NOISE_AUG`] for visual rows,
-///   [`crate::denoise::REFERENCE_AUDIO_TIMESTEP`] for audio), not a caller-supplied denoise mask.
+/// # What `VideoClip` could not carry, and why that mattered more than the traps
 ///
-/// # The one capability the request surface cannot express yet
+/// * **The clip's own frame rate.** [`VideoReference::fps`] is required data, not a hint:
+///   MiniMax-H3 resamples every reference onto its own 24 fps by dropping and duplicating whole
+///   frames, so a rate that was lost is a reference conditioned on **at the wrong speed with
+///   nothing to raise about it**. `VideoClip` has no rate, so the old mapping read the
+///   request-level `req.fps` — which [`request_geometry`] independently *rejects* unless it is
+///   exactly [`crate::denoise::MINIMAX_H3_FPS`]. Between them, a reference's rate could only ever
+///   resolve to 24.0: a 30 fps reference clip was silently treated as 24 fps, which is precisely
+///   the failure [`crate::reference`] says the field exists to prevent. `req.fps` is the rate of
+///   the *generated output*; a reference's is the rate of *supplied input media*, and for a
+///   reference — which does not bind the output geometry at all — those are different quantities.
+/// * **The clip's own soundtrack.** [`VideoReference::audio`] is conditioned on as that reference's
+///   own, rotary-aligned with its video rows and sharing their origin. `VideoClip` has no audio
+///   field, so a soundtrack could only arrive as a separate [`Conditioning::ReferenceAudio`] — legal,
+///   but a *standalone* reference with its own rotary slot, which also consumes one of the
+///   [`crate::reference::MAX_AUDIO_REFERENCES`] cap slots a video's own soundtrack does not. A
+///   different request, silently substituted for the one the caller meant.
 ///
-/// A `ref2va` video reference may carry **its own soundtrack**, conditioned on as that reference's
-/// own and rotary-aligned with its video rows ([`VideoReference::audio`]). `Conditioning::VideoClip`
-/// has no audio field, so through this surface a video reference conditions on motion alone and a
-/// soundtrack must arrive as a separate [`Conditioning::ReferenceAudio`] — which is legal but
-/// packs as a *standalone* reference with its own rotary slot rather than sharing its clip's
-/// origin. The engine type supports the aligned form; only the request vocabulary does not. Tracked
-/// on sc-17160 (payload fields) / sc-17159 (reachability).
+/// [`Conditioning::ReferenceVideo`] carries `{frames, fps, audio}` — the engine type's own shape —
+/// so both reach the packer and neither field-trap exists to reject. A standalone
+/// [`Conditioning::ReferenceAudio`] remains available and remains a genuinely different request.
+///
+/// The SceneWorks-side payload and mode-reachability work rides sc-17160 / sc-17159.
 pub(crate) fn request_references(req: &GenerationRequest) -> Result<Option<Ref2VaReferences>> {
     let mut refs: Vec<Ref2VaReference> = Vec::new();
     for c in &req.conditioning {
@@ -421,32 +438,13 @@ pub(crate) fn request_references(req: &GenerationRequest) -> Result<Option<Ref2V
                     audio: audio.clone(),
                 }));
             }
-            Conditioning::VideoClip {
-                frames,
-                frame_idx,
-                strength,
-            } => {
-                if *frame_idx != 0 {
-                    return Err(Error::Msg(format!(
-                        "{MODEL_ID}: a ref2va reference clip has no position in the generated \
-                         timeline, so `frame_idx` must be 0, got {frame_idx}. To pin a literal \
-                         frame of the output, send a keyframe (fl2va) instead."
-                    )));
-                }
-                if (*strength - 1.0).abs() > f32::EPSILON {
-                    return Err(Error::Msg(format!(
-                        "{MODEL_ID}: a ref2va reference clip is fully pinned, so `strength` must \
-                         be 1.0, got {strength}. The conditioning timestep is the checkpoint's own \
-                         policy and is not caller-selectable."
-                    )));
-                }
+            Conditioning::ReferenceVideo { frames, fps, audio } => {
                 refs.push(Ref2VaReference::Video(VideoReference {
                     frames: frames.clone(),
-                    // The rate is the request's own — the same single source of truth
-                    // `Conditioning::VideoSync` documents for its frames, rather than a second
-                    // rate on the variant the two could disagree about.
-                    fps: req.fps.map_or(crate::denoise::MINIMAX_H3_FPS, f64::from),
-                    audio: None,
+                    // The clip's own rate, carried by the variant. Range-checked by
+                    // `Ref2VaReferences::new`, which owns every ref2va rule at the engine boundary.
+                    fps: f64::from(*fps),
+                    audio: audio.clone(),
                 }));
             }
             // Keyframes belong to `fl2va` and are resolved by `keyframe_anchors`; everything else
@@ -1345,22 +1343,26 @@ mod tests {
         }
     }
 
+    fn track() -> mlx_gen::media::AudioTrack {
+        mlx_gen::media::AudioTrack {
+            samples: vec![0.0; 64],
+            sample_rate: 24_000,
+            channels: 1,
+            stems: Vec::new(),
+        }
+    }
+
     fn clip_ref() -> Conditioning {
-        Conditioning::VideoClip {
+        Conditioning::ReferenceVideo {
             frames: vec![image(64, 64)],
-            frame_idx: 0,
-            strength: 1.0,
+            fps: 24.0,
+            audio: None,
         }
     }
 
     fn audio_ref() -> Conditioning {
         Conditioning::ReferenceAudio {
-            audio: mlx_gen::media::AudioTrack {
-                samples: vec![0.0; 64],
-                sample_rate: 24_000,
-                channels: 1,
-                stems: Vec::new(),
-            },
+            audio: track(),
             strength: None,
         }
     }
@@ -1453,34 +1455,93 @@ mod tests {
         validate_request(&caps, &with(vec![clip_ref(); 3])).expect("3 clips is legal");
     }
 
-    /// The two `VideoClip` fields `ref2va` cannot honour are **rejected**, not ignored. Silently
-    /// dropping them is how a caller ends up believing it positioned or softened a reference.
+    /// An in-context clip is **refused**, not silently ignored (sc-17149). This is the arm that
+    /// makes dropping `ConditioningKind::VideoClip` from the descriptor a real gate rather than a
+    /// cosmetic edit: `request_references` no longer reads the variant, so without default-deny a
+    /// `VideoClip` would sail through and render a plausible clip that dropped the caller's
+    /// conditioning entirely.
     #[test]
-    fn a_reference_clip_refuses_a_frame_index_and_a_partial_strength() {
+    fn an_in_context_video_clip_is_refused_as_unsupported() {
         let caps = descriptor().capabilities;
         let e = validate_request(
             &caps,
             &with(vec![Conditioning::VideoClip {
                 frames: vec![image(64, 64)],
                 frame_idx: 7,
-                strength: 1.0,
-            }]),
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(e.contains("`frame_idx` must be 0"), "{e}");
-
-        let e = validate_request(
-            &caps,
-            &with(vec![Conditioning::VideoClip {
-                frames: vec![image(64, 64)],
-                frame_idx: 0,
                 strength: 0.5,
             }]),
         )
-        .unwrap_err()
-        .to_string();
-        assert!(e.contains("`strength` must be 1.0"), "{e}");
+        .unwrap_err();
+        assert!(
+            matches!(e, Error::Unsupported(_)),
+            "an unadvertised kind must be the typed Unsupported, got {e:?}"
+        );
+    }
+
+    /// A reference clip carries **its own frame rate**, and the rate survives the mapping.
+    ///
+    /// This is the hole the old `VideoClip` carrier could not close: it had no rate, so the mapping
+    /// read `req.fps` — which `request_geometry` rejects unless it is exactly 24.0. A 30 fps
+    /// reference was therefore conditioned on as 24 fps with nothing raised. Asserting `30.0`
+    /// *while the request's own fps stays unset* is what pins that the two are separate quantities.
+    #[test]
+    fn a_reference_clip_carries_its_own_frame_rate() {
+        let req = with(vec![Conditioning::ReferenceVideo {
+            frames: vec![image(64, 64)],
+            fps: 30.0,
+            audio: None,
+        }]);
+        assert!(req.fps.is_none(), "the request's own output rate is unset");
+        let refs = request_references(&req).unwrap().unwrap();
+        match &refs.as_slice()[0] {
+            Ref2VaReference::Video(v) => assert!(
+                (v.fps - 30.0).abs() < f64::EPSILON,
+                "the clip's own rate must survive, got {}",
+                v.fps
+            ),
+            other => panic!("expected a video reference, got {other:?}"),
+        }
+        // And it is legal: a reference does not bind the output rate, so a 30 fps reference on a
+        // 24 fps render is a valid request rather than a geometry conflict.
+        validate_request(&descriptor().capabilities, &req).expect("a 30 fps reference is legal");
+    }
+
+    /// A reference clip's **own soundtrack** reaches the engine on the clip, not as a standalone
+    /// audio reference — the distinction the whole carrier exists for.
+    ///
+    /// The two assertions are one claim each and both are needed: the soundtrack is *present* on the
+    /// video reference, and it did *not* also become a reference of its own (which is what sending
+    /// it as a separate `ReferenceAudio` would have done, consuming an audio cap slot and taking its
+    /// own rotary origin instead of sharing the clip's).
+    #[test]
+    fn a_reference_clips_own_soundtrack_rides_the_clip() {
+        let req = with(vec![Conditioning::ReferenceVideo {
+            frames: vec![image(64, 64)],
+            fps: 24.0,
+            audio: Some(track()),
+        }]);
+        let refs = request_references(&req).unwrap().unwrap();
+        assert_eq!(refs.as_slice().len(), 1, "one reference, not two");
+        match &refs.as_slice()[0] {
+            Ref2VaReference::Video(v) => {
+                assert!(v.audio.is_some(), "the soundtrack must ride the clip")
+            }
+            other => panic!("expected a video reference, got {other:?}"),
+        }
+        assert_eq!(
+            refs.audio_count(),
+            0,
+            "a clip's own soundtrack must not consume a standalone audio-reference slot"
+        );
+        validate_request(&descriptor().capabilities, &req)
+            .expect("a lone video reference with its own soundtrack is legal");
+
+        // The same waveform sent as a *standalone* reference is a different request: two
+        // references, and one of them does consume an audio slot.
+        let standalone = with(vec![clip_ref(), audio_ref()]);
+        let refs = request_references(&standalone).unwrap().unwrap();
+        assert_eq!(refs.as_slice().len(), 2);
+        assert_eq!(refs.audio_count(), 1);
     }
 
     /// A request carrying keyframes **and** references is refused at the boundary — the two are
