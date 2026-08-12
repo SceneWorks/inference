@@ -28,7 +28,7 @@ use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::tokenizer::TextTokenizer;
 use candle_gen::gen_core::{
-    AdapterSpec, GenerationMemory, Image, OffloadPolicy, PreviewSink, Progress,
+    AdapterSpec, GenerationMemory, Image, OffloadPolicy, PreviewSink, Progress, WeightsSource,
 };
 use candle_gen::{CandleError, Result};
 
@@ -37,7 +37,9 @@ use crate::image_processor::{ImageInput, QwenImageProcessor};
 use crate::pipeline;
 use crate::transformer::QwenTransformer;
 use crate::vae::{QwenVae, QwenVaeEncoder};
-use crate::vision_language::{load_vision_language_encoder, QwenVisionLanguageEncoder};
+use crate::vision_language::{
+    load_vision_language_encoder_with_text_encoder, QwenVisionLanguageEncoder,
+};
 use crate::vl_tokenizer::{
     condition_resize_dims, encode_reference_latents, preprocess_edit_image, tokenize_edit_text,
 };
@@ -56,6 +58,10 @@ pub struct QwenEditPaths {
     /// The `Qwen/Qwen-Image-Edit` diffusers snapshot dir (`text_encoder/` [LM + vision], `transformer/`,
     /// `vae/`, `tokenizer/`). The validated reference is `-2511`.
     pub root: PathBuf,
+    /// Optional decoder-LM substitution. The provider validates the complete Qwen2.5-VL text
+    /// contract at construction; the image-conditioning `visual.*` tower remains sourced from
+    /// `root/text_encoder` because it is outside the decoder contract.
+    pub text_encoder: Option<WeightsSource>,
     /// LoRA/LoKr adapters folded into the MMDiT at load (sc-6220) — e.g. the Qwen-Image-Edit-2511
     /// Lightning distill, stacked ahead of any user adapters. **Empty** = the production (non-distilled)
     /// edit path: the transformer loads via the mmap fast path, byte-identical to before.
@@ -294,6 +300,7 @@ fn read_zero_cond_t(root: &Path) -> Result<bool> {
 /// source (`merges.txt`/`vocab.json`). The two locations are byte-identical (same SHA256), so prefer
 /// `tokenizer/`, then fall back to `processor/`, so a whole-repo -2511 download loads without a
 /// hand-staged tokenizer.json.
+#[cfg(test)]
 fn tokenizer_json_path(root: &Path) -> Result<PathBuf> {
     for rel in ["tokenizer/tokenizer.json", "processor/tokenizer.json"] {
         let p = root.join(rel);
@@ -330,6 +337,18 @@ struct EditHeavy {
     vae: QwenVae,
 }
 
+fn resolve_edit_text_encoder_source(
+    root: &Path,
+    selected: Option<&WeightsSource>,
+) -> Result<candle_gen::gen_core::ValidatedEncoderSource> {
+    let selected = selected
+        .cloned()
+        .unwrap_or_else(|| WeightsSource::Dir(root.join("text_encoder")));
+    let selected = crate::ENCODER_CONTRACT.validate_source_against_base(&selected, root)?;
+    selected.load_time_quant_bits(None, "qwen_image_edit")?;
+    Ok(selected)
+}
+
 impl QwenEdit {
     /// Load the cheap tokenizer / processor / `zero_cond_t` and retain request-scoped component
     /// loaders. The first warm request caches all four components; a staged request loads the
@@ -338,21 +357,24 @@ impl QwenEdit {
         let device = candle_gen::default_device()?;
         let root = paths.root.clone();
         let te_cfg = TextEncoderConfig::qwen_image();
+        let text_encoder_source =
+            resolve_edit_text_encoder_source(&root, paths.text_encoder.as_ref())?;
 
         // Shared tokenizer policy (F-134 / sc-11190) with the edit lane's own `-2511` processor-bundle
         // path resolution — one `tokenizer_config()` home keeps edit's caption tokenization identical to
         // the txt2img lane's.
-        let tokenizer = TextTokenizer::from_file(
-            tokenizer_json_path(&root)?,
-            crate::control_common::tokenizer_config(&te_cfg),
-        )
-        .map_err(|e| CandleError::Msg(format!("qwen edit: load tokenizer: {e}")))?;
+        let tokenizer = text_encoder_source.read_tokenizer_unchanged(|path| {
+            TextTokenizer::from_file(path, crate::control_common::tokenizer_config(&te_cfg))
+                .map_err(|e| CandleError::Msg(format!("qwen edit: load tokenizer: {e}")))
+        })?;
 
         let resident_root = root.clone();
         let resident_device = device.clone();
         let resident_adapters = paths.adapters.clone();
+        let resident_text_encoder = text_encoder_source.clone();
         let text_root = root.clone();
         let text_device = device.clone();
+        let request_text_encoder = text_encoder_source;
         let heavy_root = root.clone();
         let heavy_device = device.clone();
         let heavy_adapters = paths.adapters.clone();
@@ -362,7 +384,11 @@ impl QwenEdit {
             move |_| {
                 Ok((
                     EditText {
-                        vl_encoder: load_vision_language_encoder(&resident_root, &resident_device)?,
+                        vl_encoder: load_vision_language_encoder_with_text_encoder(
+                            &resident_root,
+                            &resident_text_encoder,
+                            &resident_device,
+                        )?,
                         vae_encoder: QwenVaeEncoder::new(component_vb(
                             &resident_root,
                             "vae",
@@ -390,7 +416,11 @@ impl QwenEdit {
             },
             move |_| {
                 Ok(EditText {
-                    vl_encoder: load_vision_language_encoder(&text_root, &text_device)?,
+                    vl_encoder: load_vision_language_encoder_with_text_encoder(
+                        &text_root,
+                        &request_text_encoder,
+                        &text_device,
+                    )?,
                     vae_encoder: QwenVaeEncoder::new(component_vb(
                         &text_root,
                         "vae",
@@ -705,6 +735,35 @@ mod tests {
         assert!(!r.cancel.is_cancelled());
     }
 
+    #[test]
+    fn selected_decoder_contract_is_validated_separately_from_the_builtin_vision_tower() {
+        let fixture = tempfile::tempdir().unwrap();
+        gen_core_testkit::write_encoder_contract_tokenizer_fixture(
+            fixture.path(),
+            crate::ENCODER_CONTRACT,
+        )
+        .unwrap();
+        let selected = fixture.path().join("selected-decoder");
+        gen_core_testkit::write_encoder_contract_fixture(&selected, crate::ENCODER_CONTRACT)
+            .unwrap();
+        resolve_edit_text_encoder_source(fixture.path(), Some(&WeightsSource::Dir(selected)))
+            .expect("exact selected decoder contract");
+
+        let wrong = fixture.path().join("wrong-kv-heads");
+        gen_core_testkit::write_encoder_contract_fixture(&wrong, crate::ENCODER_CONTRACT).unwrap();
+        let config_path = wrong.join("config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        config["num_key_value_heads"] =
+            serde_json::json!(crate::ENCODER_CONTRACT.num_key_value_heads + 1);
+        std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let error =
+            resolve_edit_text_encoder_source(fixture.path(), Some(&WeightsSource::Dir(wrong)))
+                .expect_err("wrong GQA shape must reject")
+                .to_string();
+        assert!(error.contains("num_key_value_heads"), "unexpected: {error}");
+    }
+
     fn zero_cond_t_tmp(tmp: &tempfile::TempDir, name: &str) -> PathBuf {
         let tmp = tmp.path().join(format!(
             "qwen_edit_zct_{name}_{:?}",
@@ -869,6 +928,7 @@ mod tests {
         let load_phase = probe.phase();
         let model = QwenEdit::load(&QwenEditPaths {
             root,
+            text_encoder: None,
             adapters,
             offload_policy: OffloadPolicy::Resident,
         })

@@ -45,7 +45,9 @@
 //! (29.2% lower), with max/mean pixel delta zero. Native and PiD decode domains remain disjoint and
 //! are validated against `use_pid` at both admission and request-scope configuration.
 
-use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
+use mlx_gen::asset_facts::{
+    projected_safetensors_bytes, projected_tensor_headers_bytes, ResidentProjection,
+};
 #[cfg(test)]
 use mlx_gen::gen_core::MemoryGeometry;
 use mlx_gen::gen_core::{
@@ -134,11 +136,23 @@ pub(crate) fn memory_strategy_contract_with_plan(
             }
         })
     };
+    let selected_text_encoder = crate::model::ENCODER_CONTRACT.source_for_load(spec, root)?;
+    let selected_text_encoder_bytes =
+        projected_tensor_headers_bytes(&selected_text_encoder.tensor_headers()?, |tensor| {
+            if let Some(quant) = spec
+                .quantize
+                .filter(|_| crate::convert::is_text_encoder_quant_target(&tensor.name))
+            {
+                ResidentProjection::GroupQuantized {
+                    bits: quant.bits(),
+                    group_size: crate::quant::GROUP_SIZE as usize,
+                }
+            } else {
+                ResidentProjection::Stored
+            }
+        })?;
     let components = mlx_gen::PerComponentBytes {
-        text_encoder: project(
-            &root.join("text_encoder"),
-            &crate::convert::is_text_encoder_quant_target,
-        )?,
+        text_encoder: selected_text_encoder_bytes,
         dit: project(&root.join("transformer"), &|name| {
             crate::convert::is_transformer_quant_target(name)
         })?,
@@ -314,8 +328,14 @@ pub(crate) fn native_memory_strategy_contract_from_spec(
             )))
         }
     };
+    let selected_text_encoder =
+        crate::model::ENCODER_CONTRACT.source_for_load(spec, base_snapshot_dir)?;
+    let selected_text_encoder_bytes =
+        selected_text_encoder.read_unchanged(|source| match source {
+            WeightsSource::Dir(path) | WeightsSource::File(path) => stored(path, "text encoder"),
+        })?;
     let components = mlx_gen::PerComponentBytes {
-        text_encoder: stored(&base_snapshot_dir.join("text_encoder"), "base text encoder")?,
+        text_encoder: selected_text_encoder_bytes,
         dit: spec.read_file_unchanged_if_prepared(dit_file, |p| {
             native_dit_transformer_bytes(provider_id, p)
         })?,
@@ -576,6 +596,11 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             write_minimal_safetensors(&dir.join("model.safetensors"));
         }
+        gen_core_testkit::write_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            crate::model::ENCODER_CONTRACT,
+        )
+        .expect("validation-complete text encoder fixture");
         std::fs::write(
             root.join("transformer/config.json"),
             r#"{"quantization":{"bits":4,"group_size":64}}"#,
@@ -878,7 +903,15 @@ mod tests {
                     error.contains(component) || error.contains("safetensors"),
                     "{component}/{case}: {error}"
                 );
-                write_minimal_safetensors(&file);
+                if component == "text_encoder" {
+                    gen_core_testkit::write_encoder_contract_fixture(
+                        &root.join("text_encoder"),
+                        crate::model::ENCODER_CONTRACT,
+                    )
+                    .expect("restore validation-complete text encoder fixture");
+                } else {
+                    write_minimal_safetensors(&file);
+                }
             }
         }
         std::fs::remove_dir_all(root).ok();
@@ -1056,7 +1089,13 @@ mod tests {
         let mut identity = valid.clone();
         identity.identity = Some(mlx_gen::gen_core::IdentityWeights::default());
         let mut text_encoder = valid.clone();
-        text_encoder.text_encoder = Some(WeightsSource::Dir(root.join("external-text")));
+        let external_text_encoder = root.join("external-text");
+        gen_core_testkit::write_encoder_contract_fixture(
+            &external_text_encoder,
+            crate::model::ENCODER_CONTRACT,
+        )
+        .expect("validation-complete selected text encoder fixture");
+        text_encoder.text_encoder = Some(WeightsSource::Dir(external_text_encoder));
         let mut unknown_component = valid.clone();
         unknown_component.components.insert(
             "unknown".into(),
@@ -1089,7 +1128,7 @@ mod tests {
             ("extra_control", extra_control, false),
             ("ip_adapter", ip_adapter, false),
             ("identity", identity, false),
-            ("text_encoder", text_encoder, false),
+            ("text_encoder", text_encoder, true),
             ("unknown_component", unknown_component, false),
             ("missing_base", missing_base, false),
         ] {
@@ -1107,10 +1146,10 @@ mod tests {
         let native = root.join("native.safetensors");
         write_native_i8_safetensors(&native);
         let contract = native_memory_strategy_contract("krea_2_turbo", &native, &root).unwrap();
-        assert_eq!(contract.asset_facts.conditioning_bytes, 2);
+        assert_eq!(contract.asset_facts.conditioning_bytes, 8_045_328_384);
         assert_eq!(contract.asset_facts.decoder_bytes, 2);
         assert_eq!(contract.asset_facts.transformer_bytes, 2 * 64 * 2);
-        assert_eq!(contract.asset_facts.base_bytes, 260);
+        assert_eq!(contract.asset_facts.base_bytes, 8_045_328_642);
         for strategy in [
             MemoryStrategy::Resident,
             MemoryStrategy::BoundedDecode,

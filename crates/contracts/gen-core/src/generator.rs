@@ -1545,6 +1545,9 @@ pub enum Modality {
 /// constructible without loading weights (registry introspection).
 #[derive(Clone, Debug)]
 pub struct ModelDescriptor {
+    /// Exact text-encoder architecture/output contract for safe [`crate::LoadSpec::text_encoder`]
+    /// substitution. `None` means the provider has not advertised a substitutable encoder.
+    pub encoder_contract: Option<crate::EncoderContract>,
     /// The exact latent tensor emitted by the denoiser at its decoder boundary. `None` means the
     /// provider has not advertised enough information; consumers must treat it as incompatible with
     /// every decoder rather than infer compatibility from family names or channel counts.

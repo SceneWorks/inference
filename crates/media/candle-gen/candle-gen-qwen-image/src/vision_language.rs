@@ -15,6 +15,7 @@ use std::path::Path;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::gen_core::{ValidatedEncoderSource, WeightsSource};
 use candle_gen::{CandleError, Result};
 
 use crate::config::TextEncoderConfig;
@@ -123,6 +124,18 @@ fn component_vb(
     candle_gen::component_vb(root, sub, dtype, device, "qwen edit")
 }
 
+fn selected_encoder_vb(
+    source: &WeightsSource,
+    dtype: DType,
+    device: &Device,
+) -> Result<VarBuilder<'static>> {
+    let path = match source {
+        WeightsSource::Dir(path) | WeightsSource::File(path) => path,
+    };
+    let files = candle_gen::resolve_weight_files(path, "qwen edit selected text encoder")?;
+    candle_gen::mmap_var_builder(&files, dtype, device)
+}
+
 /// Load the Qwen-Image-**Edit** vision-language conditioning encoder from a `Qwen/Qwen-Image-Edit`
 /// snapshot: the Qwen2.5-VL LM (`model.*`) + vision transformer (`visual.*`), both living under
 /// `text_encoder/`. The validated reference snapshot is `-2511`.
@@ -130,9 +143,34 @@ pub fn load_vision_language_encoder(
     root: &Path,
     device: &Device,
 ) -> Result<QwenVisionLanguageEncoder> {
-    let te_vb = component_vb(root, "text_encoder", ENC_DTYPE, device)?;
-    let lm = QwenTextEncoder::new(&TextEncoderConfig::qwen_image(), te_vb.clone())?;
-    let visual = VisionTransformer::new(te_vb, &VisionConfig::qwen_image_edit())?;
+    let selected = crate::ENCODER_CONTRACT
+        .validate_source_against_base(
+            &candle_gen::gen_core::WeightsSource::Dir(root.join("text_encoder")),
+            root,
+        )
+        .map_err(CandleError::from)?;
+    load_vision_language_encoder_with_text_encoder(root, &selected, device)
+}
+
+/// Load the Edit conditioning encoder with a provider-validated decoder-LM substitution while the
+/// image-conditioning vision tower stays bound to the built-in snapshot. The selected contract is
+/// deliberately decoder-only; inheriting `visual.*` from an arbitrary alternate would silently
+/// broaden compatibility beyond the registry descriptor.
+pub fn load_vision_language_encoder_with_text_encoder(
+    root: &Path,
+    selected: &ValidatedEncoderSource,
+    device: &Device,
+) -> Result<QwenVisionLanguageEncoder> {
+    let lm = selected.read_unchanged(|source| -> Result<QwenTextEncoder> {
+        Ok(QwenTextEncoder::new(
+            &TextEncoderConfig::qwen_image(),
+            selected_encoder_vb(source, ENC_DTYPE, device)?,
+        )?)
+    })?;
+    let visual = VisionTransformer::new(
+        component_vb(root, "text_encoder", ENC_DTYPE, device)?,
+        &VisionConfig::qwen_image_edit(),
+    )?;
     Ok(QwenVisionLanguageEncoder::new(lm, visual))
 }
 

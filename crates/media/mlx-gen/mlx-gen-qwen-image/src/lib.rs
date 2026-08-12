@@ -34,6 +34,105 @@ pub mod transformer;
 pub mod vae;
 pub mod vl_tokenizer;
 
+pub const TOKENIZER_CONTRACT: mlx_gen::gen_core::EncoderTokenizerContract =
+    mlx_gen::gen_core::EncoderTokenizerContract {
+        family: "qwen2_5_vl",
+        binding: mlx_gen::gen_core::EncoderTokenizerBinding::RetainBase,
+        artifact_candidates: &["tokenizer/tokenizer.json"],
+        required_tokens: &[
+            mlx_gen::gen_core::EncoderRequiredToken {
+                role: "qwen_endoftext",
+                literal: "<|endoftext|>",
+                id: 151_643,
+                config_field: Some("bos_token_id"),
+            },
+            mlx_gen::gen_core::EncoderRequiredToken {
+                role: "qwen_im_start",
+                literal: "<|im_start|>",
+                id: 151_644,
+                config_field: None,
+            },
+            mlx_gen::gen_core::EncoderRequiredToken {
+                role: "qwen_im_end",
+                literal: "<|im_end|>",
+                id: 151_645,
+                config_field: Some("eos_token_id"),
+            },
+            mlx_gen::gen_core::EncoderRequiredToken {
+                role: "qwen_vision_start",
+                literal: "<|vision_start|>",
+                id: 151_652,
+                config_field: Some("vision_start_token_id"),
+            },
+            mlx_gen::gen_core::EncoderRequiredToken {
+                role: "qwen_vision_end",
+                literal: "<|vision_end|>",
+                id: 151_653,
+                config_field: Some("vision_end_token_id"),
+            },
+            mlx_gen::gen_core::EncoderRequiredToken {
+                role: "qwen_image_pad",
+                literal: "<|image_pad|>",
+                id: 151_655,
+                config_field: Some("image_token_id"),
+            },
+        ],
+    };
+pub const PROMPT_EXECUTIONS: &[mlx_gen::gen_core::EncoderPromptExecutionContract] = &[
+    mlx_gen::gen_core::EncoderPromptExecutionContract {
+        purpose: "qwen_image_t2i",
+        template: mlx_gen::gen_core::EncoderPromptTemplate::QwenImage,
+        add_special_tokens: true,
+        length: mlx_gen::gen_core::EncoderPromptLengthPolicy::RightTruncate { max_tokens: 1058 },
+        padding: mlx_gen::gen_core::EncoderPromptPadding::None,
+        prefix_trim: 34,
+    },
+    mlx_gen::gen_core::EncoderPromptExecutionContract {
+        purpose: "qwen_image_edit",
+        template: mlx_gen::gen_core::EncoderPromptTemplate::QwenImageEdit,
+        add_special_tokens: true,
+        length: mlx_gen::gen_core::EncoderPromptLengthPolicy::RightTruncate { max_tokens: 1058 },
+        padding: mlx_gen::gen_core::EncoderPromptPadding::None,
+        prefix_trim: 64,
+    },
+];
+
+pub const ENCODER_CONTRACT: mlx_gen::gen_core::EncoderContract =
+    mlx_gen::gen_core::EncoderContract {
+        architecture: "qwen2_5_vl_text",
+        hidden_size: 3584,
+        intermediate_size: 18_944,
+        num_hidden_layers: 28,
+        num_attention_heads: 28,
+        num_key_value_heads: 4,
+        head_dim: 128,
+        vocab_size: 152_064,
+        output_width: 3584,
+        loaded_hidden_layers: 28,
+        requires_final_norm: true,
+        requires_lm_head: false,
+        hidden_activation: "silu",
+        attention_dropout: mlx_gen::gen_core::EncoderConfigFloat::new(0.0),
+        rms_norm_eps: mlx_gen::gen_core::EncoderConfigFloat::new(1e-6),
+        qk_norm_eps: None,
+        rope_theta: mlx_gen::gen_core::EncoderConfigFloat::new(1_000_000.0),
+        max_position_embeddings: 128_000,
+        attention_bias: None,
+        tie_word_embeddings: Some(false),
+        tokenizer: TOKENIZER_CONTRACT,
+        prompt_executions: PROMPT_EXECUTIONS,
+        bos_token_id: Some(151_643),
+        eos_token_id: Some(151_645),
+        image_token_id: Some(151_655),
+        vision_start_token_id: Some(151_652),
+        vision_end_token_id: Some(151_653),
+        mrope_section: &[16, 24, 24],
+        mrope_interleaved: None,
+        selected_hidden_layers: &[28],
+        packing: None,
+        dense_storage_dtype_probe: None,
+    };
+
 pub use adapters::apply_qwen_adapters;
 pub use control_transformer::{QwenFunControlBranch, QwenFunControlConfig};
 pub use image_processor::{ImageInput, ProcessedImage, QwenImageProcessor};
@@ -137,6 +236,11 @@ mod explicit_registry_tests {
             std::fs::create_dir_all(&dir).unwrap();
             write_minimal_safetensors(&dir.join("model.safetensors"));
         }
+        gen_core_testkit::write_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            super::ENCODER_CONTRACT,
+        )
+        .expect("validation-complete text encoder fixture");
         root
     }
 

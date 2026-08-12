@@ -5,7 +5,9 @@
 //! planner through every one of the 60 joint-attention blocks; rung 4 uses the shared block-window
 //! primitive from SC-16353. The provider contract is the only selector surface.
 
-use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
+use mlx_gen::asset_facts::{
+    projected_safetensors_bytes, projected_tensor_headers_bytes, ResidentProjection,
+};
 #[cfg(test)]
 use mlx_gen::gen_core::GenerationMemory;
 use mlx_gen::gen_core::{
@@ -140,7 +142,11 @@ pub fn memory_strategy_contract(
             None => ResidentProjection::Stored,
         })
     };
-    let conditioning_bytes = project(&root.join("text_encoder"), None)?;
+    let selected_text_encoder = crate::ENCODER_CONTRACT.source_for_load(spec, root)?;
+    let conditioning_bytes =
+        projected_tensor_headers_bytes(&selected_text_encoder.tensor_headers()?, |_| {
+            ResidentProjection::Stored
+        })?;
     let transformer_bytes = project(&root.join("transformer"), spec.quantize)?;
     let decoder_bytes = project(&root.join("vae"), None)?;
     let overlay_bytes = match &spec.control {
@@ -506,6 +512,11 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             write_control(&dir.join("model.safetensors"));
         }
+        gen_core_testkit::write_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            crate::ENCODER_CONTRACT,
+        )
+        .expect("validation-complete text encoder fixture");
     }
 
     fn spec(tmp: &tempfile::TempDir) -> LoadSpec {
@@ -586,6 +597,28 @@ mod tests {
             MemoryStrategy::BoundedTransformerResidency,
             MemoryStrategy::StagedResidency
         ));
+    }
+
+    #[test]
+    fn selected_encoder_pricing_ignores_nested_safetensors_not_loaded_as_shards() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = spec(&tmp);
+        let before = memory_strategy_contract("qwen_image", &spec)
+            .unwrap()
+            .asset_facts
+            .conditioning_bytes;
+        let WeightsSource::Dir(root) = &spec.weights else {
+            unreachable!()
+        };
+        let nested = root.join("text_encoder/archive");
+        std::fs::create_dir_all(&nested).unwrap();
+        write_control(&nested.join("ignored.safetensors"));
+
+        let after = memory_strategy_contract("qwen_image", &spec)
+            .unwrap()
+            .asset_facts
+            .conditioning_bytes;
+        assert_eq!(after, before);
     }
 
     #[test]
@@ -670,10 +703,10 @@ mod tests {
             .with_quant(mlx_gen::Quant::Q4)
             .with_control(WeightsSource::File(control));
         let contract = memory_strategy_contract("qwen_image_control", &spec).unwrap();
-        assert_eq!(contract.asset_facts.conditioning_bytes, 256);
+        assert_eq!(contract.asset_facts.conditioning_bytes, 14_141_904_896);
         assert_eq!(contract.asset_facts.transformer_bytes, 72);
         assert_eq!(contract.asset_facts.decoder_bytes, 256);
-        assert_eq!(contract.asset_facts.base_bytes, 584);
+        assert_eq!(contract.asset_facts.base_bytes, 14_141_905_224);
         assert_eq!(contract.asset_facts.overlay_bytes, 72);
         assert_eq!(contract.auxiliary_resident_bytes(), 72);
         assert!(matches!(

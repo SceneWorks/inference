@@ -63,6 +63,7 @@ pub const PID_BACKBONE: &str = "zimage-turbo";
 /// base is a non-distilled foundation model: real CFG (guidance + negative prompt) is supported.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: Some(crate::ENCODER_CONTRACT),
         denoiser_output_latent_space: Some(&mlx_gen::gen_core::FLUX1_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
@@ -507,12 +508,17 @@ mod tests {
         "z_image expects a snapshot directory (tokenizer/ text_encoder/ transformer/ vae/), \
          not a single .safetensors file";
 
-    fn missing_snapshot_spec(policy: mlx_gen::OffloadPolicy) -> LoadSpec {
+    fn missing_snapshot_spec(policy: mlx_gen::OffloadPolicy) -> (tempfile::TempDir, LoadSpec) {
         use mlx_gen::WeightsSource;
-        LoadSpec::new(WeightsSource::Dir(
+        let encoder = tempfile::tempdir().expect("encoder fixture dir");
+        gen_core_testkit::write_encoder_contract_fixture(encoder.path(), crate::ENCODER_CONTRACT)
+            .expect("valid encoder contract fixture");
+        let spec = LoadSpec::new(WeightsSource::Dir(
             "/nonexistent/z-image-base-residency-test-snapshot".into(),
         ))
-        .with_offload_policy(policy)
+        .with_text_encoder(WeightsSource::Dir(encoder.path().to_path_buf()))
+        .with_offload_policy(policy);
+        (encoder, spec)
     }
 
     #[test]
@@ -521,15 +527,12 @@ mod tests {
             mlx_gen::OffloadPolicy::Resident,
             mlx_gen::OffloadPolicy::Sequential,
         ] {
-            let res = crate::model::build_residency(
-                &missing_snapshot_spec(policy),
-                MODEL_ID,
-                BASE_PRECISION_MSG,
-                BASE_FILE_MSG,
-            )
-            .unwrap_or_else(|error| {
-                panic!("{policy:?} must defer and ignore the missing snapshot: {error}")
-            });
+            let (_encoder, spec) = missing_snapshot_spec(policy);
+            let res =
+                crate::model::build_residency(&spec, MODEL_ID, BASE_PRECISION_MSG, BASE_FILE_MSG)
+                    .unwrap_or_else(|error| {
+                        panic!("{policy:?} must defer and ignore the missing snapshot: {error}")
+                    });
             assert!(
                 res.with_resident_parts(|_, _| ()).unwrap().is_none(),
                 "{policy:?} must begin with no warm request-scoped pair"

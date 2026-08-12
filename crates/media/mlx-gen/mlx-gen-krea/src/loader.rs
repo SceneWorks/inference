@@ -38,9 +38,25 @@ fn prepare_text_weights(mut w: Weights) -> Result<Weights> {
 /// [`load_vision_tower`] only when image-grounded (edit) encoding is needed.
 pub fn load_text_encoder(root: impl AsRef<Path>) -> Result<KreaTextEncoder> {
     let root = root.as_ref();
-    let cfg = KreaTeConfig::from_snapshot(root)?;
-    let w = prepare_text_weights(Weights::from_dir(root.join("text_encoder"))?)?;
-    KreaTextEncoder::from_weights(&w, "language_model", &cfg)
+    let source = crate::model::ENCODER_CONTRACT.source_for_load(
+        &mlx_gen::LoadSpec::new(WeightsSource::Dir(root.to_path_buf())),
+        root,
+    )?;
+    source.read_unchanged(|source| load_text_encoder_from_source(root, source))
+}
+
+pub(crate) fn load_text_encoder_from_source(
+    _model_root: &Path,
+    source: &WeightsSource,
+) -> Result<KreaTextEncoder> {
+    let cfg = KreaTeConfig::qwen3_vl_4b();
+    let w = prepare_text_weights(match source {
+        WeightsSource::Dir(path) => Weights::from_dir(path)?,
+        WeightsSource::File(path) => Weights::from_file(path)?,
+    })?;
+    let encoder = KreaTextEncoder::from_weights(&w, "language_model", &cfg)?;
+    w.materialize_accessed()?;
+    Ok(encoder)
 }
 
 /// Load the Qwen3-VL-4B **vision tower** from the same `text_encoder/` dir (epic 10871 P2.1, sc-10879):
@@ -54,7 +70,16 @@ pub fn load_text_encoder(root: impl AsRef<Path>) -> Result<KreaTextEncoder> {
 /// explicitly because the shared tower must not assume any one crate's constant (sc-15154).
 pub fn load_vision_tower(root: impl AsRef<Path>) -> Result<VisionTower> {
     let root = root.as_ref();
-    let mut w = Weights::from_dir(root.join("text_encoder"))?;
+    let selected = crate::model::ENCODER_CONTRACT
+        .validate_source(&WeightsSource::Dir(root.join("text_encoder")))?;
+    selected.read_unchanged(load_vision_tower_from_source)
+}
+
+pub(crate) fn load_vision_tower_from_source(source: &WeightsSource) -> Result<VisionTower> {
+    let mut w = match source {
+        WeightsSource::Dir(path) => Weights::from_dir(path)?,
+        WeightsSource::File(path) => Weights::from_file(path)?,
+    };
     let keys: Vec<String> = w
         .keys()
         .filter(|k| k.starts_with("visual."))
@@ -64,12 +89,14 @@ pub fn load_vision_tower(root: impl AsRef<Path>) -> Result<VisionTower> {
         let t = w.require(&k)?.as_dtype(mlx_rs::Dtype::Float32)?;
         w.insert(k, t);
     }
-    VisionTower::from_weights(
+    let tower = VisionTower::from_weights(
         &w,
         krea_vision_config(),
         "visual",
         crate::convert::QUANT_GROUP_SIZE,
-    )
+    )?;
+    w.materialize_accessed()?;
+    Ok(tower)
 }
 
 /// Load the single-stream DiT from a snapshot's `transformer/` dir: parse + validate the config, load

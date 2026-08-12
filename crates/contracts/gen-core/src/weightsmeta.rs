@@ -293,6 +293,34 @@ pub fn safetensors_path_tensor_headers(
                         path.display()
                     ))
                 })?;
+                let element_count = info.shape.iter().try_fold(1_u64, |count, dimension| {
+                    let dimension = u64::try_from(*dimension).map_err(|_| {
+                        Error::Msg(format!(
+                            "safetensors tensor {name:?} in {} has an unrepresentable dimension",
+                            path.display()
+                        ))
+                    })?;
+                    count.checked_mul(dimension).ok_or_else(|| {
+                        Error::Msg(format!(
+                            "safetensors tensor {name:?} in {} has a shape product overflow",
+                            path.display()
+                        ))
+                    })
+                })?;
+                let expected_bytes = element_count
+                    .checked_mul(info.dtype.size() as u64)
+                    .ok_or_else(|| {
+                        Error::Msg(format!(
+                            "safetensors tensor {name:?} in {} has a byte-size overflow",
+                            path.display()
+                        ))
+                    })?;
+                if data_bytes != expected_bytes {
+                    return Err(Error::Msg(format!(
+                        "safetensors tensor {name:?} in {} declares {data_bytes} payload bytes but {:?} {:?} requires {expected_bytes}",
+                        path.display(), info.dtype, info.shape
+                    )));
+                }
                 Ok((
                     start,
                     end,
@@ -1164,6 +1192,22 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    #[test]
+    fn header_only_reader_rejects_shape_dtype_payload_mismatch() {
+        let tmp = fixture_dir("gencore_header_shape_bytes_");
+        let path = tmp.path().join("wrong-bytes.safetensors");
+        let header = br#"{"a":{"dtype":"F32","shape":[2],"data_offsets":[0,4]}}"#;
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header);
+        bytes.extend_from_slice(&[0_u8; 4]);
+        std::fs::write(&path, bytes).unwrap();
+
+        let error = safetensors_path_tensor_headers(&path)
+            .expect_err("shape/dtype byte mismatch must fail closed")
+            .to_string();
+        assert!(error.contains("requires 8"), "{error}");
     }
 
     #[test]

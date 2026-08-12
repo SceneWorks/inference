@@ -17,6 +17,7 @@ pub mod audio_transform;
 pub mod block_window;
 pub mod caption;
 pub mod control;
+pub mod encoder_contract;
 pub mod error;
 pub mod face;
 pub mod generator;
@@ -60,6 +61,13 @@ pub use caption::{
 pub use control::{
     reject_unknown_components, require_base_dir, require_base_snapshot, require_component,
     require_component_file, require_control, AcceptedControlKinds, ControlBranch,
+};
+pub use encoder_contract::{
+    read_text_encoder_source_unchanged, text_encoder_packed_quant_bits, text_encoder_source_bytes,
+    EncoderConfigFloat, EncoderContract, EncoderPackingContract, EncoderPromptExecutionContract,
+    EncoderPromptLengthPolicy, EncoderPromptPadding, EncoderPromptTemplate, EncoderRequiredToken,
+    EncoderTokenizerBinding, EncoderTokenizerContract, EncoderTokenizerDisposition,
+    ValidatedEncoderSource, ValidatedTokenizerSource,
 };
 pub use error::{Error, Result};
 pub use face::{DetectedFace, FaceEmbedder, FaceEmbedderDescriptor};
@@ -124,6 +132,7 @@ pub use runtime::{
     LoadPhase, LoadShape, LoadSpec, MoeExpert, OffloadPolicy, PidWeights, PinnedWeightsFile,
     Precision, PreparedFilePins, PreviewFrame, PreviewSink, Progress, Quant, WeightsSource,
     BASE_SNAPSHOT_COMPONENT, COMFYUI_TEXT_ENCODER_COMPONENT, COMFYUI_VAE_COMPONENT,
+    KREA_CONVROT_DIT_COMPONENT,
 };
 pub use text_embed::{TextEmbedder, TextEmbedderDescriptor};
 pub use tier_integrity::{control_branch_tier, is_above_selected_tier};

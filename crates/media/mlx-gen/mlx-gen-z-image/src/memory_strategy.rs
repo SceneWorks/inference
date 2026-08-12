@@ -139,7 +139,8 @@
 //! selection. The scope below is defense in depth: it can reject a selection, never substitute one.
 
 use mlx_gen::asset_facts::{
-    projected_safetensors_bytes, projected_safetensors_tensors, ResidentProjection,
+    projected_safetensors_bytes, projected_safetensors_tensors, projected_tensor_headers_bytes,
+    ResidentProjection,
 };
 use mlx_gen::gen_core::{
     Error as CoreError, LoadSpec, MemoryAssetFacts, MemoryBackendRealization,
@@ -597,7 +598,7 @@ fn asset_facts(
     spec: &LoadSpec,
     streamable: bool,
 ) -> CoreResult<(MemoryAssetFacts, Vec<MemoryResidentComponent>)> {
-    let components = match &spec.weights {
+    let mut components = match &spec.weights {
         WeightsSource::Dir(root) => {
             let project = |path: &std::path::Path| {
                 projected_safetensors_bytes(path, |_| match spec.quantize {
@@ -609,7 +610,7 @@ fn asset_facts(
                 })
             };
             mlx_gen::PerComponentBytes {
-                text_encoder: project(&root.join("text_encoder"))?,
+                text_encoder: 0,
                 dit: project(&root.join("transformer"))?,
                 vae: project(&root.join("vae"))?,
             }
@@ -618,6 +619,17 @@ fn asset_facts(
         // Zero remains the truthful unknown; the independently addressed control is still exact.
         WeightsSource::File(_) => mlx_gen::PerComponentBytes::default(),
     };
+    if let WeightsSource::Dir(root) = &spec.weights {
+        let selected = crate::ENCODER_CONTRACT.source_for_load(spec, root)?;
+        components.text_encoder =
+            projected_tensor_headers_bytes(&selected.tensor_headers()?, |_| match spec.quantize {
+                Some(quant) => ResidentProjection::GroupQuantized {
+                    bits: quant.bits(),
+                    group_size: crate::quant::GROUP_SIZE as usize,
+                },
+                None => ResidentProjection::Stored,
+            })?;
+    }
     let resident_components = match &spec.control {
         Some(source) => control_resident_components(source, spec.quantize, streamable)?,
         None => Vec::new(),

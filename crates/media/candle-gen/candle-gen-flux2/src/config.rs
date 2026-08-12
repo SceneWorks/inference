@@ -14,6 +14,158 @@ pub const FLUX2_DEV_CONTROL_ID: &str = "flux2_dev_control";
 /// candle twin of mlx `flux2_dev_edit`).
 pub const FLUX2_DEV_EDIT_ID: &str = "flux2_dev_edit";
 
+pub const KLEIN_TOKENIZER_CONTRACT: candle_gen::gen_core::EncoderTokenizerContract =
+    candle_gen::gen_core::EncoderTokenizerContract {
+        family: "qwen3",
+        binding: candle_gen::gen_core::EncoderTokenizerBinding::RetainBase,
+        artifact_candidates: &["tokenizer/tokenizer.json"],
+        required_tokens: &[
+            candle_gen::gen_core::EncoderRequiredToken {
+                role: "qwen_endoftext",
+                literal: "<|endoftext|>",
+                id: 151_643,
+                config_field: Some("bos_token_id"),
+            },
+            candle_gen::gen_core::EncoderRequiredToken {
+                role: "qwen_im_start",
+                literal: "<|im_start|>",
+                id: 151_644,
+                config_field: None,
+            },
+            candle_gen::gen_core::EncoderRequiredToken {
+                role: "qwen_im_end",
+                literal: "<|im_end|>",
+                id: 151_645,
+                config_field: Some("eos_token_id"),
+            },
+        ],
+    };
+
+pub const DEV_TOKENIZER_CONTRACT: candle_gen::gen_core::EncoderTokenizerContract =
+    candle_gen::gen_core::EncoderTokenizerContract {
+        family: "mistral3_llama_fast",
+        binding: candle_gen::gen_core::EncoderTokenizerBinding::RetainBase,
+        artifact_candidates: &["tokenizer/tokenizer.json"],
+        required_tokens: &[
+            candle_gen::gen_core::EncoderRequiredToken {
+                role: "mistral_bos",
+                literal: "<s>",
+                id: 1,
+                config_field: None,
+            },
+            candle_gen::gen_core::EncoderRequiredToken {
+                role: "mistral_pad",
+                literal: "<pad>",
+                id: 11,
+                config_field: None,
+            },
+        ],
+    };
+
+pub const KLEIN_PROMPT_EXECUTIONS: &[candle_gen::gen_core::EncoderPromptExecutionContract] =
+    &[candle_gen::gen_core::EncoderPromptExecutionContract {
+        purpose: "flux2_klein_conditioning",
+        template: candle_gen::gen_core::EncoderPromptTemplate::QwenInstructNoThink,
+        add_special_tokens: true,
+        length: candle_gen::gen_core::EncoderPromptLengthPolicy::RightTruncate { max_tokens: 512 },
+        padding: candle_gen::gen_core::EncoderPromptPadding::RightToMax {
+            pad_token_id: 151_643,
+        },
+        prefix_trim: 0,
+    }];
+
+pub const DEV_PROMPT_EXECUTIONS: &[candle_gen::gen_core::EncoderPromptExecutionContract] =
+    &[candle_gen::gen_core::EncoderPromptExecutionContract {
+        purpose: "flux2_dev_conditioning",
+        template: candle_gen::gen_core::EncoderPromptTemplate::Flux2DevMistral,
+        add_special_tokens: true,
+        length: candle_gen::gen_core::EncoderPromptLengthPolicy::RightTruncate { max_tokens: 512 },
+        padding: candle_gen::gen_core::EncoderPromptPadding::RightToMax { pad_token_id: 11 },
+        prefix_trim: 0,
+    }];
+
+pub const KLEIN_ENCODER_CONTRACT: candle_gen::gen_core::EncoderContract =
+    candle_gen::gen_core::EncoderContract {
+        architecture: "qwen3",
+        hidden_size: 4096,
+        intermediate_size: 12_288,
+        num_hidden_layers: 36,
+        num_attention_heads: 32,
+        num_key_value_heads: 8,
+        head_dim: 128,
+        vocab_size: 151_936,
+        output_width: 12_288,
+        loaded_hidden_layers: 27,
+        requires_final_norm: false,
+        requires_lm_head: false,
+        hidden_activation: "silu",
+        attention_dropout: candle_gen::gen_core::EncoderConfigFloat::new(0.0),
+        rms_norm_eps: candle_gen::gen_core::EncoderConfigFloat::new(1e-6),
+        qk_norm_eps: Some(candle_gen::gen_core::EncoderConfigFloat::new(1e-6)),
+        rope_theta: candle_gen::gen_core::EncoderConfigFloat::new(1_000_000.0),
+        max_position_embeddings: 40_960,
+        attention_bias: Some(false),
+        tie_word_embeddings: Some(false),
+        tokenizer: KLEIN_TOKENIZER_CONTRACT,
+        prompt_executions: KLEIN_PROMPT_EXECUTIONS,
+        bos_token_id: Some(151_643),
+        eos_token_id: Some(151_645),
+        image_token_id: None,
+        vision_start_token_id: None,
+        vision_end_token_id: None,
+        mrope_section: &[],
+        mrope_interleaved: None,
+        selected_hidden_layers: &[9, 18, 27],
+        packing: Some(candle_gen::gen_core::EncoderPackingContract {
+            group_size: 64,
+            pack_embedding: true,
+            pack_lm_head: false,
+            supports_file: true,
+        }),
+        dense_storage_dtype_probe: None,
+    };
+
+pub const DEV_ENCODER_CONTRACT: candle_gen::gen_core::EncoderContract =
+    candle_gen::gen_core::EncoderContract {
+        architecture: "mistral",
+        hidden_size: 5120,
+        intermediate_size: 32_768,
+        num_hidden_layers: 40,
+        num_attention_heads: 32,
+        num_key_value_heads: 8,
+        head_dim: 128,
+        vocab_size: 131_072,
+        output_width: 15_360,
+        loaded_hidden_layers: 30,
+        requires_final_norm: false,
+        requires_lm_head: false,
+        hidden_activation: "silu",
+        attention_dropout: candle_gen::gen_core::EncoderConfigFloat::new(0.0),
+        rms_norm_eps: candle_gen::gen_core::EncoderConfigFloat::new(1e-5),
+        qk_norm_eps: None,
+        rope_theta: candle_gen::gen_core::EncoderConfigFloat::new(1_000_000_000.0),
+        max_position_embeddings: 131_072,
+        attention_bias: None,
+        tie_word_embeddings: None,
+        tokenizer: DEV_TOKENIZER_CONTRACT,
+        prompt_executions: DEV_PROMPT_EXECUTIONS,
+        bos_token_id: None,
+        eos_token_id: None,
+        image_token_id: None,
+        vision_start_token_id: None,
+        vision_end_token_id: None,
+        mrope_section: &[],
+        mrope_interleaved: None,
+        selected_hidden_layers: &[10, 20, 30],
+        packing: Some(candle_gen::gen_core::EncoderPackingContract {
+            group_size: 64,
+            pack_embedding: true,
+            pack_lm_head: false,
+            supports_file: true,
+        }),
+        dense_storage_dtype_probe: None,
+    };
+
 pub const DEFAULT_WIDTH: u32 = 1024;
 pub const DEFAULT_HEIGHT: u32 = 1024;
 /// Distilled klein default — the fork generates in 4 steps.
@@ -103,6 +255,14 @@ impl Flux2Variant {
     /// The dev variant (Mistral TE + 48/48 DiT + the embedded-guidance forward).
     pub fn is_dev(self) -> bool {
         matches!(self, Self::Dev)
+    }
+
+    pub fn encoder_contract(self) -> candle_gen::gen_core::EncoderContract {
+        if self.is_dev() {
+            DEV_ENCODER_CONTRACT
+        } else {
+            KLEIN_ENCODER_CONTRACT
+        }
     }
 }
 

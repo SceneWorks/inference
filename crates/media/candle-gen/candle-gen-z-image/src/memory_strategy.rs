@@ -76,21 +76,28 @@ fn imported_tensor_bytes(
 
 #[cfg(any(feature = "cuda", test))]
 fn single_file_tensor_bytes(path: &std::path::Path, component: &str) -> gen_core::Result<u64> {
-    let bytes = gen_core::weightsmeta::safetensors_path_tensor_headers(path)?
-        .iter()
-        .try_fold(0_u64, |total, tensor| {
-            total
-                .checked_add(imported_tensor_bytes(tensor, &tensor.name, component)?)
-                .ok_or_else(|| {
-                    gen_core::Error::Msg(format!(
-                        "z-image imported {component} resident byte sum overflow"
-                    ))
-                })
-        })?;
+    let headers = gen_core::weightsmeta::safetensors_path_tensor_headers(path)?;
+    imported_tensor_headers_bytes(&headers, component, &path.display().to_string())
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn imported_tensor_headers_bytes(
+    headers: &[gen_core::weightsmeta::SafetensorsTensorHeader],
+    component: &str,
+    source: &str,
+) -> gen_core::Result<u64> {
+    let bytes = headers.iter().try_fold(0_u64, |total, tensor| {
+        total
+            .checked_add(imported_tensor_bytes(tensor, &tensor.name, component)?)
+            .ok_or_else(|| {
+                gen_core::Error::Msg(format!(
+                    "z-image imported {component} resident byte sum overflow"
+                ))
+            })
+    })?;
     if bytes == 0 {
         return Err(gen_core::Error::Msg(format!(
-            "z-image imported {component} '{}' contains no tensor bytes",
-            path.display()
+            "z-image imported {component} '{source}' contains no tensor bytes"
         )));
     }
     Ok(bytes)
@@ -176,19 +183,28 @@ fn imported_file_components(
     provider_id: &str,
 ) -> gen_core::Result<PerComponentBytes> {
     let _ = gen_core::require_base_snapshot(spec, provider_id)?;
-    let text_encoder = spec
+    let legacy_text_encoder = spec
         .components
         .get(gen_core::COMFYUI_TEXT_ENCODER_COMPONENT);
+    if spec.text_encoder.is_some() && legacy_text_encoder.is_some() {
+        return Err(gen_core::Error::Msg(format!(
+            "{provider_id}: text encoder was supplied through both LoadSpec::text_encoder and legacy component '{}'",
+            gen_core::COMFYUI_TEXT_ENCODER_COMPONENT
+        )));
+    }
+    let text_encoder = spec.text_encoder.as_ref().or(legacy_text_encoder);
     let vae = spec.components.get(gen_core::COMFYUI_VAE_COMPONENT);
+    let text_encoder_bytes = |source: &WeightsSource| -> gen_core::Result<u64> {
+        let headers = gen_core::encoder_contract::text_encoder_source_tensor_headers(source)?;
+        imported_tensor_headers_bytes(&headers, "text encoder", "direct-shard inventory")
+    };
     match (text_encoder, vae) {
         (None, None) => {
             spec.read_file_unchanged_if_prepared(primary, combined_file_components)
         }
-        (Some(WeightsSource::File(text_encoder)), Some(WeightsSource::File(vae))) => {
+        (Some(text_encoder), Some(WeightsSource::File(vae))) => {
             Ok(PerComponentBytes {
-                text_encoder: spec.read_file_unchanged_if_prepared(text_encoder, |p| {
-                    single_file_tensor_bytes(p, "text encoder")
-                })?,
+                text_encoder: text_encoder_bytes(text_encoder)?,
                 dit: spec.read_file_unchanged_if_prepared(primary, |p| {
                     single_file_tensor_bytes(p, "transformer")
                 })?,
@@ -197,19 +213,19 @@ fn imported_file_components(
                 })?,
             })
         }
-        (Some(WeightsSource::Dir(path)), _) => Err(gen_core::Error::Msg(format!(
-            "{provider_id}: component '{}' must be a file, not {}",
-            gen_core::COMFYUI_TEXT_ENCODER_COMPONENT,
-            path.display()
-        ))),
+        (Some(text_encoder), None) => {
+            let mut components =
+                spec.read_file_unchanged_if_prepared(primary, combined_file_components)?;
+            components.text_encoder = text_encoder_bytes(text_encoder)?;
+            Ok(components)
+        }
         (_, Some(WeightsSource::Dir(path))) => Err(gen_core::Error::Msg(format!(
             "{provider_id}: component '{}' must be a file, not {}",
             gen_core::COMFYUI_VAE_COMPONENT,
             path.display()
         ))),
         _ => Err(gen_core::Error::Msg(format!(
-            "{provider_id}: separate ComfyUI import requires both '{}' and '{}', or neither for a combined checkpoint",
-            gen_core::COMFYUI_TEXT_ENCODER_COMPONENT,
+            "{provider_id}: separate ComfyUI import requires a text encoder and '{}', or neither for a combined checkpoint",
             gen_core::COMFYUI_VAE_COMPONENT
         ))),
     }
@@ -229,23 +245,43 @@ pub(crate) fn provider_contract(
                 .into(),
         ));
     }
-    if provider_id == crate::MODEL_ID {
-        crate::validate_load_spec(spec)?;
-    }
+    // This declaration seam must remain weights-free: catalogs and admission planners enumerate it
+    // before model assets exist locally. The generator's `load` path owns exhaustive encoder
+    // config/header validation; this path prices the exact selected source without reopening that
+    // architecture predicate.
     // File and Dir intentionally retain one provider/calibration identity: the executable provider,
     // phase graph, and output semantics are the same. The promoted matrix has no load-source axis,
     // however, so only Dir advertises rung 4 until the pinned/re-openable File path has its own real
     // measurement. A Dir rung-4 cell must never be relabeled as File evidence.
     let streamable = matches!(spec.load_shape, LoadShape::DeferredMaterialization)
         && matches!(spec.weights, gen_core::WeightsSource::Dir(_));
+    let explicit_text_encoder = spec.text_encoder.as_ref();
+    let legacy_text_encoder = spec
+        .components
+        .get(gen_core::COMFYUI_TEXT_ENCODER_COMPONENT);
+    if explicit_text_encoder.is_some() && legacy_text_encoder.is_some() {
+        return Err(gen_core::Error::Msg(format!(
+            "{provider_id}: text encoder was supplied through both LoadSpec::text_encoder and legacy component '{}'",
+            gen_core::COMFYUI_TEXT_ENCODER_COMPONENT
+        )));
+    }
+    let selected_text_encoder = explicit_text_encoder.or(legacy_text_encoder);
+    let source_bytes =
+        |source: &gen_core::WeightsSource| gen_core::text_encoder_source_bytes(source);
     let components = match &spec.weights {
-        gen_core::WeightsSource::Dir(_) => PerComponentBytes::from_spec_subdirs(
-            spec,
-            &["text_encoder"],
-            &["transformer"],
-            &["vae"],
-        )
-        .unwrap_or_default(),
+        gen_core::WeightsSource::Dir(_) => {
+            let mut components = PerComponentBytes::from_spec_subdirs(
+                spec,
+                &["text_encoder"],
+                &["transformer"],
+                &["vae"],
+            )
+            .unwrap_or_default();
+            if let Some(source) = selected_text_encoder {
+                components.text_encoder = source_bytes(source)?;
+            }
+            components
+        }
         gen_core::WeightsSource::File(path) => imported_file_components(spec, path, provider_id)?,
     };
     let phases = vec![
@@ -652,17 +688,20 @@ mod tests {
     fn separate_file_spec(tmp: &tempfile::TempDir) -> LoadSpec {
         let base = tmp.path().join("base");
         std::fs::create_dir_all(&base).unwrap();
+        gen_core_testkit::write_encoder_contract_tokenizer_fixture(&base, crate::ENCODER_CONTRACT)
+            .unwrap();
         let dit = tmp.path().join("dit.safetensors");
-        let text = tmp.path().join("text.safetensors");
+        let text_root = tmp.path().join("text-encoder");
         let vae = tmp.path().join("vae.safetensors");
         write_safetensors(&dit, &[("block.weight", 32)]);
-        write_safetensors(&text, &[("layer.weight", 16)]);
+        gen_core_testkit::write_encoder_contract_fixture(&text_root, crate::ENCODER_CONTRACT)
+            .expect("validation-complete text encoder fixture");
         write_safetensors(&vae, &[("decoder.weight", 8)]);
         LoadSpec::new(WeightsSource::File(dit))
             .with_component(gen_core::BASE_SNAPSHOT_COMPONENT, WeightsSource::Dir(base))
             .with_component(
                 gen_core::COMFYUI_TEXT_ENCODER_COMPONENT,
-                WeightsSource::File(text),
+                WeightsSource::File(text_root.join("model.safetensors")),
             )
             .with_component(gen_core::COMFYUI_VAE_COMPONENT, WeightsSource::File(vae))
     }
@@ -700,61 +739,91 @@ mod tests {
     }
 
     #[test]
-    fn file_contract_and_loader_share_the_full_typed_field_matrix() {
+    fn file_contract_prices_every_loadable_typed_source_shape() {
         let tmp = tempfile::tempdir().unwrap();
         let valid = separate_file_spec(&tmp);
-        let mut cases = vec![("valid", valid.clone())];
+        let mut accepted = vec![("valid", valid.clone())];
 
         let mut precision = valid.clone();
         precision.precision = Precision::Fp32;
-        cases.push(("precision-is-accepted", precision));
+        accepted.push(("precision-is-accepted", precision));
         let mut adapter = valid.clone();
         adapter.adapters.push(gen_core::AdapterSpec::new(
             tmp.path().join("adapter.safetensors"),
             1.0,
             gen_core::AdapterKind::Lora,
         ));
-        cases.push(("adapter-is-accepted", adapter));
-
-        let mut quant = valid.clone();
-        quant.quantize = Some(Quant::Q4);
-        cases.push(("quant", quant));
-        let mut control = valid.clone();
-        control.control = Some(WeightsSource::File(tmp.path().join("control.safetensors")));
-        cases.push(("control", control));
-        let mut extra = valid.clone();
-        extra
-            .extra_controls
-            .push(WeightsSource::File(tmp.path().join("extra.safetensors")));
-        cases.push(("extra-control", extra));
-        let mut ip = valid.clone();
-        ip.ip_adapter = Some(WeightsSource::File(tmp.path().join("ip.safetensors")));
-        cases.push(("ip-adapter", ip));
-        let mut identity = valid.clone();
-        identity.identity = Some(gen_core::IdentityWeights::default());
-        cases.push(("identity", identity));
+        accepted.push(("adapter-is-accepted", adapter));
         let mut external_te = valid.clone();
-        external_te.text_encoder = Some(WeightsSource::Dir(tmp.path().join("external-te")));
-        cases.push(("external-text-encoder", external_te));
-        let mut unknown = valid.clone();
-        unknown.components.insert(
-            "unknown".into(),
-            WeightsSource::File(tmp.path().join("unknown.safetensors")),
-        );
-        cases.push(("unknown-component", unknown));
-        let mut half_separate = valid.clone();
-        half_separate
+        let external_te_root = tmp.path().join("external-te");
+        gen_core_testkit::write_encoder_contract_fixture(
+            &external_te_root,
+            crate::ENCODER_CONTRACT,
+        )
+        .expect("validation-complete typed text encoder fixture");
+        external_te
             .components
-            .remove(gen_core::COMFYUI_VAE_COMPONENT);
-        cases.push(("half-separate", half_separate));
+            .remove(gen_core::COMFYUI_TEXT_ENCODER_COMPONENT);
+        external_te.text_encoder = Some(WeightsSource::Dir(external_te_root));
+        accepted.push(("external-text-encoder", external_te));
 
-        for (name, spec) in cases {
-            assert_eq!(
-                crate::validate_load_spec(&spec).is_ok(),
-                provider_contract(crate::MODEL_ID, &spec).is_ok(),
-                "File loader/contract validation drift for {name}"
-            );
+        for (name, spec) in accepted {
+            crate::validate_load_spec(&spec)
+                .unwrap_or_else(|error| panic!("load gate rejected {name}: {error}"));
+            provider_contract(crate::MODEL_ID, &spec)
+                .unwrap_or_else(|error| panic!("memory contract rejected {name}: {error}"));
         }
+    }
+
+    #[test]
+    fn imported_directory_encoder_pricing_ignores_nested_safetensors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut spec = separate_file_spec(&tmp);
+        spec.components
+            .remove(gen_core::COMFYUI_TEXT_ENCODER_COMPONENT);
+        let external = tmp.path().join("external-text-encoder");
+        gen_core_testkit::write_encoder_contract_fixture(&external, crate::ENCODER_CONTRACT)
+            .unwrap();
+        spec.text_encoder = Some(WeightsSource::Dir(external.clone()));
+        let baseline = provider_contract(crate::MODEL_ID, &spec)
+            .unwrap()
+            .asset_facts
+            .conditioning_bytes;
+
+        let nested = external.join("archive");
+        std::fs::create_dir_all(&nested).unwrap();
+        write_safetensors(
+            &nested.join("not-a-direct-shard.safetensors"),
+            &[("extra", 4096)],
+        );
+
+        assert_eq!(
+            provider_contract(crate::MODEL_ID, &spec)
+                .unwrap()
+                .asset_facts
+                .conditioning_bytes,
+            baseline
+        );
+    }
+
+    #[test]
+    fn weights_free_contract_discovery_does_not_claim_source_validation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut spec = separate_file_spec(&tmp);
+        spec.components
+            .remove(gen_core::COMFYUI_TEXT_ENCODER_COMPONENT);
+        let incompatible = tmp.path().join("wrong-text-encoder.safetensors");
+        write_safetensors(&incompatible, &[("layer.weight", 16)]);
+        spec.text_encoder = Some(WeightsSource::File(incompatible));
+
+        assert!(
+            provider_contract(crate::MODEL_ID, &spec).is_ok(),
+            "catalog discovery must remain weights-free"
+        );
+        let error = crate::validate_load_spec(&spec)
+            .expect_err("the executable load seam must reject a missing selected encoder")
+            .to_string();
+        assert!(error.contains("text encoder"), "got: {error}");
     }
 
     #[test]

@@ -84,10 +84,10 @@ impl KreaTextEncoder {
         })
     }
 
-    /// Quantize the token table + every decoder-layer projection in place (group-wise affine Q4/Q8).
-    /// `cast_to_bf16=true` for the embedding matches the Qwen3 TE convention; the norms stay dense.
+    /// Quantize only the decoder-layer projections in place (group-wise affine Q4/Q8). The token
+    /// table stays dense, matching this provider's offline converter and `pack_embedding=false`
+    /// encoder contract; norms stay dense as well.
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
-        self.embed_tokens.quantize(bits, true)?;
         for layer in &mut self.layers {
             layer.quantize(bits)?;
         }

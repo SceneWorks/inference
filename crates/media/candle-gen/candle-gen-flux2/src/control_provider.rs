@@ -140,9 +140,39 @@ impl Flux2Control {
             candle_gen::gen_core::WeightsSource::Dir(paths.root.clone()),
         );
         spec.quantize = quant;
-        let loaded_quant = crate::memory_strategy::resolved_quant(&spec)
+        Self::load_with_memory_spec(paths, quant, &spec, memory)
+    }
+
+    /// Load without a request-scoped ladder context while preserving the complete caller-authored
+    /// spec, including the validated text-encoder substitution. Constrained memory still requires
+    /// [`Self::load_with_memory_context`].
+    pub fn load_with_memory_spec(
+        paths: &Flux2ControlPaths,
+        quant: Option<Quant>,
+        spec: &candle_gen::gen_core::LoadSpec,
+        memory: GenerationMemory,
+    ) -> Result<Self> {
+        validate_memory_authority(memory, None, "flux2 control")?;
+        validate_control_load_spec(spec)?;
+        validate_admitted_paths(paths, spec)?;
+        let loaded_quant = crate::memory_strategy::resolved_quant(spec)
             .map_err(|error| CandleError::Msg(error.to_string()))?;
-        Self::load_bound(paths, loaded_quant, memory, None, None)
+        if quant.is_some() && quant != loaded_quant {
+            return Err(CandleError::Msg(format!(
+                "flux2 control: requested {quant:?} but the authored snapshot resolves to {loaded_quant:?}"
+            )));
+        }
+        let text_encoder_source = Flux2Variant::Dev
+            .encoder_contract()
+            .source_for_load(spec, &paths.root)
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
+        text_encoder_source
+            .load_time_quant_bits(
+                loaded_quant.map(Quant::bits),
+                crate::config::FLUX2_DEV_CONTROL_ID,
+            )
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
+        Self::load_bound(paths, loaded_quant, memory, None, None, text_encoder_source)
     }
 
     fn load_bound(
@@ -151,6 +181,7 @@ impl Flux2Control {
         memory: GenerationMemory,
         memory_contract: Option<MemoryProviderContract>,
         admitted_context: Option<MemoryRunContext>,
+        text_encoder_source: candle_gen::gen_core::ValidatedEncoderSource,
     ) -> Result<Self> {
         validate_memory_authority(memory, admitted_context.as_ref(), "flux2 control")?;
         let optimized =
@@ -163,7 +194,14 @@ impl Flux2Control {
         let device = candle_gen::default_device()?;
         // PiD (super-resolving decode) is wired only through the txt2img render path (epic 7840 /
         // sc-7853); the control provider passes `None`.
-        let pipe = Pipeline::load(Flux2Variant::Dev, loaded_quant, &paths.root, &device, None);
+        let pipe = Pipeline::load_with_text_encoder(
+            Flux2Variant::Dev,
+            loaded_quant,
+            &paths.root,
+            text_encoder_source,
+            &device,
+            None,
+        );
 
         // Base DiT + Mistral TE. Packed MLX tier → build directly on the GPU from the packed parts
         // (sc-9087, no ~105 GB dense CPU staging); dense tier → stage dense in CPU RAM and quantize each
@@ -209,6 +247,7 @@ impl Flux2Control {
         spec: &candle_gen::gen_core::LoadSpec,
         context: &candle_gen::gen_core::MemoryRunContext,
     ) -> Result<Self> {
+        validate_control_load_spec(spec)?;
         validate_admitted_paths(paths, spec)?;
         let loaded_quant = crate::memory_strategy::resolved_quant(spec)
             .map_err(|error| CandleError::Msg(error.to_string()))?;
@@ -227,12 +266,23 @@ impl Flux2Control {
         let memory = contract
             .generation_memory(&context.selection)
             .unwrap_or_default();
+        let text_encoder_source = Flux2Variant::Dev
+            .encoder_contract()
+            .source_for_load(spec, &paths.root)
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
+        text_encoder_source
+            .load_time_quant_bits(
+                loaded_quant.map(Quant::bits),
+                crate::config::FLUX2_DEV_CONTROL_ID,
+            )
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
         Self::load_bound(
             paths,
             loaded_quant,
             memory,
             Some(contract),
             Some(context.clone()),
+            text_encoder_source,
         )
     }
 
@@ -580,6 +630,36 @@ fn validate_admitted_paths(
     Ok(())
 }
 
+fn validate_control_load_spec(spec: &candle_gen::gen_core::LoadSpec) -> Result<()> {
+    let mut unsupported = Vec::new();
+    if !spec.adapters.is_empty() {
+        unsupported.push("adapters");
+    }
+    if !spec.extra_controls.is_empty() {
+        unsupported.push("extra_controls");
+    }
+    if spec.ip_adapter.is_some() {
+        unsupported.push("ip_adapter");
+    }
+    if spec.pid.is_some() {
+        unsupported.push("pid");
+    }
+    if spec.identity.is_some() {
+        unsupported.push("identity");
+    }
+    if !spec.components.is_empty() {
+        unsupported.push("components");
+    }
+    if unsupported.is_empty() {
+        Ok(())
+    } else {
+        Err(CandleError::Msg(format!(
+            "flux2 control route does not realize LoadSpec fields: {}",
+            unsupported.join(", ")
+        )))
+    }
+}
+
 fn ensure_ordinary_generate_allowed(
     admitted_context: Option<&MemoryRunContext>,
     label: &str,
@@ -793,6 +873,40 @@ mod tests {
         .err()
         .expect("legacy constrained control load must fail");
         assert!(error.to_string().contains("exact admitted context"));
+    }
+
+    #[test]
+    fn control_spec_loader_consumes_authored_text_encoder_before_device_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("base");
+        let selected = tmp.path().join("selected");
+        let control = tmp.path().join("control.safetensors");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&control, b"nonempty").unwrap();
+        gen_core_testkit::write_encoder_contract_fixture(
+            &selected,
+            Flux2Variant::Dev.encoder_contract(),
+        )
+        .unwrap();
+        let config_path = selected.join("config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        config["hidden_size"] = serde_json::json!(7);
+        std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let paths = Flux2ControlPaths {
+            root: root.clone(),
+            control: control.clone(),
+        };
+        let spec =
+            candle_gen::gen_core::LoadSpec::new(candle_gen::gen_core::WeightsSource::Dir(root))
+                .with_control(candle_gen::gen_core::WeightsSource::File(control))
+                .with_text_encoder(candle_gen::gen_core::WeightsSource::Dir(selected));
+        let error =
+            Flux2Control::load_with_memory_spec(&paths, None, &spec, GenerationMemory::default())
+                .err()
+                .expect("authored wrong-shape encoder must reject before device load")
+                .to_string();
+        assert!(error.contains("field hidden_size"), "{error}");
     }
 
     /// The request defaults match the dev control production knobs (1024², 28 steps, guidance 4.0,

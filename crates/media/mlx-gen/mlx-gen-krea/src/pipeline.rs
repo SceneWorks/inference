@@ -34,16 +34,17 @@ use mlx_gen::runtime::AdapterSpec;
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::{
     resolve_flow_schedule, run_flow_sampler, CancelFlag, Error, LatentDecoder, PreviewSink,
-    Progress, Result, TimestepConvention,
+    Progress, Result, TimestepConvention, WeightsSource,
 };
 
 use std::path::Path;
 
 use std::cell::RefCell;
-use std::path::PathBuf;
 
 use crate::control::Krea2ControlBranch;
-use crate::loader::{load_text_encoder, load_transformer_with_stream, load_vision_tower};
+use crate::loader::{
+    load_text_encoder_from_source, load_transformer_with_stream, load_vision_tower_from_source,
+};
 use crate::multiphase::{PhaseSlice, ResolvedPhase};
 use crate::schedule::{dynamic_mu, krea_sigmas, turbo_sigmas, TURBO_MU};
 use crate::text_encoder::{
@@ -169,9 +170,9 @@ impl TurboOptions {
 pub struct KreaText {
     tok: KreaTokenizer,
     te: KreaTextEncoder,
-    /// Snapshot root, retained so the vision tower can be loaded lazily on the first grounded encode
-    /// (F-072) rather than eagerly for every variant.
-    root: PathBuf,
+    /// The checkpoint-coupled visual tower remains on the builtin multimodal source when the
+    /// language tower is substituted.
+    vision_encoder_source: mlx_gen::gen_core::ValidatedEncoderSource,
     /// Qwen3-VL vision tower for image-grounded (edit) encoding (epic 10871 P2). LAZY (F-072): `None`
     /// until the first `encode_grounded`/`run_vision`, so the Turbo/Raw t2i, img2img, and pose-control
     /// paths — which never ground on an image — pay neither its ~0.6 GB residency nor its load time,
@@ -186,10 +187,24 @@ impl KreaText {
     /// first grounded (edit) encode via [`Self::ensure_vision`].
     pub fn from_snapshot(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
+        let selected = crate::model::ENCODER_CONTRACT.source_for_load(
+            &mlx_gen::LoadSpec::new(WeightsSource::Dir(root.to_path_buf())),
+            root,
+        )?;
+        Self::from_snapshot_with_text_encoder(root, &selected)
+    }
+
+    pub(crate) fn from_snapshot_with_text_encoder(
+        root: &Path,
+        text_encoder_source: &mlx_gen::gen_core::ValidatedEncoderSource,
+    ) -> Result<Self> {
+        let vision_encoder_source = crate::model::ENCODER_CONTRACT
+            .validate_source(&WeightsSource::Dir(root.join("text_encoder")))?;
         Ok(Self {
-            tok: KreaTokenizer::from_snapshot(root)?,
-            te: load_text_encoder(root)?,
-            root: root.to_path_buf(),
+            tok: KreaTokenizer::from_validated_source(text_encoder_source)?,
+            te: text_encoder_source
+                .read_unchanged(|source| load_text_encoder_from_source(root, source))?,
+            vision_encoder_source,
             vision: RefCell::new(None),
         })
     }
@@ -215,7 +230,9 @@ impl KreaText {
     /// never pay for it. Idempotent.
     pub fn ensure_vision(&self) -> Result<()> {
         if self.vision.borrow().is_none() {
-            let tower = load_vision_tower(&self.root)?;
+            let tower = self
+                .vision_encoder_source
+                .read_unchanged(load_vision_tower_from_source)?;
             *self.vision.borrow_mut() = Some(tower);
         }
         Ok(())
@@ -1916,6 +1933,26 @@ mod tests {
 
     fn zero_velocity(x: &Array, _sigma: f32) -> Result<Array> {
         Ok(Array::zeros::<f32>(x.shape())?)
+    }
+
+    #[test]
+    fn public_snapshot_text_phase_rejects_the_wrong_encoder_before_tokenizer_open() {
+        let fixture = tempfile::tempdir().unwrap();
+        gen_core_testkit::write_encoder_contract_fixture(
+            &fixture.path().join("text_encoder"),
+            mlx_gen::gen_core::EncoderContract {
+                hidden_size: crate::model::ENCODER_CONTRACT.hidden_size + 1,
+                ..crate::model::ENCODER_CONTRACT
+            },
+        )
+        .unwrap();
+
+        let error = KreaText::from_snapshot(fixture.path())
+            .err()
+            .expect("an incompatible public snapshot must fail before loading the tokenizer")
+            .to_string();
+        assert!(error.contains("field hidden_size"), "{error}");
+        assert!(!error.contains("tokenizer"), "{error}");
     }
 
     #[test]

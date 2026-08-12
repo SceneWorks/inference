@@ -888,6 +888,11 @@ pub fn model_descriptor_errors(d: &ModelDescriptor) -> Vec<String> {
         &ctx,
         &[("id", d.id), ("family", d.family), ("backend", d.backend)],
     );
+    if let Some(contract) = d.encoder_contract {
+        if let Err(error) = contract.validate_definition() {
+            errs.push(format!("{ctx}: {error}"));
+        }
+    }
     let caps = &d.capabilities;
     if caps.max_count == 0 {
         errs.push(format!(
@@ -1355,6 +1360,7 @@ mod tests {
 
     fn dummy_descriptor() -> ModelDescriptor {
         ModelDescriptor {
+            encoder_contract: None,
             denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
@@ -1397,6 +1403,7 @@ mod tests {
 
     fn dummy_delegated_descriptor() -> ModelDescriptor {
         ModelDescriptor {
+            encoder_contract: None,
             denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
@@ -1425,6 +1432,7 @@ mod tests {
     // read as ZERO — so the provider-owned split is what finds it.
     fn dummy_footprint_descriptor() -> ModelDescriptor {
         ModelDescriptor {
+            encoder_contract: None,
             denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
@@ -1471,6 +1479,7 @@ mod tests {
     #[cfg(unix)]
     fn prepared_callback_descriptor() -> ModelDescriptor {
         ModelDescriptor {
+            encoder_contract: None,
             denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
@@ -1564,6 +1573,7 @@ mod tests {
     // Multi-provider fixtures verify that independently named constants compose into one catalog.
     fn dummy_multi_gen_a_descriptor() -> ModelDescriptor {
         ModelDescriptor {
+            encoder_contract: None,
             denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
@@ -1577,6 +1587,7 @@ mod tests {
 
     fn dummy_multi_gen_b_descriptor() -> ModelDescriptor {
         ModelDescriptor {
+            encoder_contract: None,
             denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
@@ -2923,6 +2934,7 @@ mod tests {
         // A stub audio generator that advertises VoiceEmbedding conditioning.
         let tts = DummyGen {
             desc: ModelDescriptor {
+                encoder_contract: None,
                 denoiser_output_latent_space: None,
                 control_kinds: None,
                 required_components: &[],
@@ -3055,6 +3067,52 @@ mod tests {
         assert!(model_descriptor_errors(&dummy_descriptor()).is_empty());
 
         let broken = ModelDescriptor {
+            encoder_contract: Some(crate::EncoderContract {
+                architecture: "qwen3",
+                hidden_size: 8,
+                intermediate_size: 12,
+                num_hidden_layers: 2,
+                num_attention_heads: 2,
+                num_key_value_heads: 3,
+                head_dim: 4,
+                vocab_size: 16,
+                output_width: 8,
+                loaded_hidden_layers: 2,
+                requires_final_norm: true,
+                requires_lm_head: false,
+                hidden_activation: "silu",
+                attention_dropout: crate::EncoderConfigFloat::new(0.0),
+                rms_norm_eps: crate::EncoderConfigFloat::new(1e-6),
+                qk_norm_eps: Some(crate::EncoderConfigFloat::new(1e-6)),
+                rope_theta: crate::EncoderConfigFloat::new(1_000_000.0),
+                max_position_embeddings: 4_096,
+                attention_bias: Some(false),
+                tie_word_embeddings: Some(true),
+                tokenizer: crate::EncoderTokenizerContract {
+                    family: "test-qwen3",
+                    binding: crate::EncoderTokenizerBinding::RetainBase,
+                    artifact_candidates: &["tokenizer/tokenizer.json"],
+                    required_tokens: &[],
+                },
+                prompt_executions: &[crate::EncoderPromptExecutionContract {
+                    purpose: "test",
+                    template: crate::EncoderPromptTemplate::QwenInstruct,
+                    add_special_tokens: true,
+                    length: crate::EncoderPromptLengthPolicy::RightTruncate { max_tokens: 8 },
+                    padding: crate::EncoderPromptPadding::None,
+                    prefix_trim: 0,
+                }],
+                bos_token_id: None,
+                eos_token_id: None,
+                image_token_id: None,
+                vision_start_token_id: None,
+                vision_end_token_id: None,
+                mrope_section: &[],
+                mrope_interleaved: None,
+                selected_hidden_layers: &[2],
+                packing: None,
+                dense_storage_dtype_probe: None,
+            }),
             denoiser_output_latent_space: None,
             control_kinds: None,
             // Blank + duplicate required-component ids (sc-13658) — unstageable / ambiguous keys.
@@ -3081,6 +3139,7 @@ mod tests {
         let has = |needle: &str| errs.iter().any(|e| e.contains(needle));
         assert!(has("id \"Bad Id\""), "{errs:?}");
         assert!(has("family \"\""), "{errs:?}");
+        assert!(has("invalid text encoder contract"), "{errs:?}");
         assert!(has("max_count is 0"), "{errs:?}");
         assert!(has("min_size 512 > max_size 256"), "{errs:?}");
         assert!(has("explicit-size multiple is 0"), "{errs:?}");
@@ -3098,6 +3157,7 @@ mod tests {
 
         // All-zero bounds report the Default-0 message (F-084), not the inverted-bounds one.
         let zeroed = ModelDescriptor {
+            encoder_contract: None,
             denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
@@ -3119,6 +3179,7 @@ mod tests {
     #[test]
     fn model_descriptor_errors_flags_conversation_history_flag_without_kind() {
         let half_wired = ModelDescriptor {
+            encoder_contract: None,
             denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
@@ -3158,6 +3219,7 @@ mod tests {
     #[test]
     fn audio_descriptor_with_zero_size_bounds_passes_sweep() {
         let audio = ModelDescriptor {
+            encoder_contract: None,
             denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
@@ -3205,6 +3267,7 @@ mod tests {
     fn visual_descriptor_with_invalid_size_bounds_still_fails_sweep() {
         // Video, zero bounds → the Default-0 footgun still fires.
         let video_zero = ModelDescriptor {
+            encoder_contract: None,
             denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
@@ -3228,6 +3291,7 @@ mod tests {
 
         // Image, inverted bounds → the inverted-bounds message still fires.
         let image_inverted = ModelDescriptor {
+            encoder_contract: None,
             denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
@@ -3251,6 +3315,7 @@ mod tests {
 
         // `Both` (emits image or video) is a visual modality too — zero bounds still fail.
         let both_zero = ModelDescriptor {
+            encoder_contract: None,
             denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],

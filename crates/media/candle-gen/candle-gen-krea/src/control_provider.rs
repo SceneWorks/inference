@@ -27,7 +27,9 @@ use std::path::{Path, PathBuf};
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::{AdapterSpec, Image, OffloadPolicy, PreviewSink, Progress, Quant};
+use candle_gen::gen_core::{
+    AdapterSpec, Image, OffloadPolicy, PreviewSink, Progress, Quant, WeightsSource,
+};
 use candle_gen::train::flow_match::component_vb;
 use candle_gen::{CandleError, Result};
 use candle_gen_qwen_image::vae::{QwenVae, QwenVaeEncoder};
@@ -196,14 +198,24 @@ impl Krea2Control {
     /// Retain both phase loaders. The first warm request populates the shared pair; a staged request
     /// loads and releases each phase within `generate`.
     pub fn load(paths: &Krea2ControlPaths) -> Result<Self> {
+        Self::load_with_text_encoder(paths, None)
+    }
+
+    pub fn load_with_text_encoder(
+        paths: &Krea2ControlPaths,
+        text_encoder: Option<WeightsSource>,
+    ) -> Result<Self> {
         if paths.convrot_dit.is_some() && !paths.adapters.is_empty() {
             return Err(CandleError::Msg(
                 "krea control: INT8-ConvRot does not support LoRA/LoKr or diff-patch adapters"
                     .into(),
             ));
         }
-        let device = candle_gen::default_device()?;
         let text_root = paths.root.clone();
+        let source =
+            text_encoder.unwrap_or_else(|| WeightsSource::Dir(text_root.join("text_encoder")));
+        let text_encoder = resolve_control_text_encoder_source(&text_root, &source)?;
+        let device = candle_gen::default_device()?;
         let text_device = device.clone();
         let heavy_root = paths.root.clone();
         let heavy_convrot_dit = paths.convrot_dit.clone();
@@ -213,7 +225,7 @@ impl Krea2Control {
         let heavy_chunk_attention = paths.chunk_attention;
         let heavy_device = device.clone();
         let residency = candle_gen::Residency::request_scoped(
-            move |_| load_control_text(&text_root, &text_device),
+            move |_| load_control_text(&text_root, &text_encoder, &text_device),
             move |_use_pid, _| {
                 load_control_heavy(
                     &heavy_root,
@@ -255,13 +267,39 @@ impl Krea2Control {
 }
 
 /// Load the Qwen3-VL text phase exactly once per resident model or once per sequential generation.
-fn load_control_text(root: &Path, device: &Device) -> Result<Krea2ControlText> {
-    let tokenizer = KreaTokenizer::from_snapshot(root, device)?;
-    let te_cfg = KreaTeConfig::from_snapshot(root)?;
-    let te_w = Weights::from_dir(&root.join("text_encoder"), device, DType::F32)?;
+fn load_control_text(
+    _root: &Path,
+    selected_source: &candle_gen::gen_core::ValidatedEncoderSource,
+    device: &Device,
+) -> Result<Krea2ControlText> {
+    let tokenizer = KreaTokenizer::from_validated_source(selected_source, device)?;
+    let te_cfg = KreaTeConfig::qwen3_vl_4b();
+    let te_w = selected_source.read_unchanged(|source| -> Result<Weights> {
+        Ok(match source {
+            WeightsSource::Dir(path) => Weights::from_dir(path, device, DType::F32)?,
+            WeightsSource::File(path) => Weights::from_file(path, device, DType::F32)?,
+        })
+    })?;
     let te = KreaTextEncoder::load(&te_w, "language_model", &te_cfg, MAX_TEXT_TOKENS)?;
     drop(te_w);
     Ok(Krea2ControlText { tokenizer, te })
+}
+
+fn resolve_control_text_encoder_source(
+    root: &Path,
+    selected_source: &WeightsSource,
+) -> Result<candle_gen::gen_core::ValidatedEncoderSource> {
+    let selected = crate::ENCODER_CONTRACT
+        .validate_source_against_base(selected_source, root)
+        .map_err(CandleError::from)?;
+    let builtin = WeightsSource::Dir(root.join("text_encoder"));
+    let expected_bits = candle_gen::gen_core::text_encoder_packed_quant_bits(&builtin)?;
+    if let Some(bits) = selected.load_time_quant_bits(expected_bits, "krea_2_turbo_control")? {
+        return Err(CandleError::Msg(format!(
+            "krea_2_turbo_control requires a selected text encoder already packed at Q{bits}; this provider does not repack a dense Krea encoder on the fly"
+        )));
+    }
+    Ok(selected)
 }
 
 /// Load the render phase after the text value has dropped on the sequential path.
@@ -463,23 +501,33 @@ fn control_image_to_nchw(
 mod tests {
     use super::*;
 
-    fn missing_paths(offload_policy: OffloadPolicy) -> Krea2ControlPaths {
-        Krea2ControlPaths {
-            root: PathBuf::from("/nonexistent/krea-control-residency-test-snapshot"),
+    fn validation_complete_paths(
+        offload_policy: OffloadPolicy,
+    ) -> (tempfile::TempDir, Krea2ControlPaths) {
+        let fixture = tempfile::tempdir().unwrap();
+        gen_core_testkit::write_encoder_contract_fixture(
+            &fixture.path().join("text_encoder"),
+            crate::ENCODER_CONTRACT,
+        )
+        .unwrap();
+        let paths = Krea2ControlPaths {
+            root: fixture.path().to_path_buf(),
             convrot_dit: None,
             control: PathBuf::from("/nonexistent/krea-control-residency-test-overlay.safetensors"),
             adapters: Vec::new(),
             branch_tier: None,
             chunk_attention: false,
             offload_policy,
-        }
+        };
+        (fixture, paths)
     }
 
     /// Weight-free proof that construction is lazy and the legacy path policy is not an authority.
     #[test]
     fn legacy_policy_does_not_eagerly_load_components() {
-        let model = Krea2Control::load(&missing_paths(OffloadPolicy::Sequential))
-            .expect("construction must not touch the missing snapshot");
+        let (_fixture, paths) = validation_complete_paths(OffloadPolicy::Sequential);
+        let model = Krea2Control::load(&paths)
+            .expect("construction must validate but not materialize the snapshot");
         assert!(model
             .residency
             .with_resident_parts(|_, _| ())
@@ -490,8 +538,9 @@ mod tests {
     /// The resident legacy value is equally lazy; neither load-time value can choose the request route.
     #[test]
     fn resident_legacy_policy_is_also_lazy() {
-        let model = Krea2Control::load(&missing_paths(OffloadPolicy::Resident))
-            .expect("construction must not touch the missing snapshot");
+        let (_fixture, paths) = validation_complete_paths(OffloadPolicy::Resident);
+        let model = Krea2Control::load(&paths)
+            .expect("construction must validate but not materialize the snapshot");
         assert!(model
             .residency
             .with_resident_parts(|_, _| ())
@@ -515,7 +564,7 @@ mod tests {
     /// substitute the standard transformer or render without the requested adapter.
     #[test]
     fn convrot_rejects_adapters_before_loading_weights() {
-        let mut paths = missing_paths(OffloadPolicy::Resident);
+        let (_fixture, mut paths) = validation_complete_paths(OffloadPolicy::Resident);
         paths.convrot_dit = Some(PathBuf::from(
             "/nonexistent/krea2_turbo_int8_convrot.safetensors",
         ));

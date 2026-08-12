@@ -154,14 +154,31 @@ fn f32_or_packed_component_bytes(
     keep_embedding_dense: bool,
     inline_fp8_scales: bool,
 ) -> gen_core::Result<u64> {
+    let tensors = gen_core::weightsmeta::safetensors_path_tensor_headers(path)?;
+    f32_or_packed_tensor_headers(
+        &tensors,
+        quant,
+        component,
+        keep_embedding_dense,
+        inline_fp8_scales,
+        &path.display().to_string(),
+    )
+}
+
+fn f32_or_packed_tensor_headers(
+    tensors: &[gen_core::weightsmeta::SafetensorsTensorHeader],
+    quant: Option<Quant>,
+    component: &str,
+    keep_embedding_dense: bool,
+    inline_fp8_scales: bool,
+    source: &str,
+) -> gen_core::Result<u64> {
     use gen_core::weightsmeta::Dtype;
     use std::collections::HashMap;
 
-    let tensors = gen_core::weightsmeta::safetensors_path_tensor_headers(path)?;
     if tensors.is_empty() {
         return Err(gen_core::Error::Msg(format!(
-            "FLUX.2 {component} '{}' contains no tensors",
-            path.display()
+            "FLUX.2 {component} '{source}' contains no tensors"
         )));
     }
     let by_name: HashMap<&str, &gen_core::weightsmeta::SafetensorsTensorHeader> = tensors
@@ -275,7 +292,7 @@ pub(crate) fn composed_provider_contract_for(
         )));
     }
     let streamable = streamable(spec);
-    let components = match &spec.weights {
+    let mut components = match &spec.weights {
         WeightsSource::Dir(_) => PerComponentBytes::from_spec_subdirs(
             spec,
             &["text_encoder"],
@@ -307,6 +324,24 @@ pub(crate) fn composed_provider_contract_for(
             }
         }
     };
+    // Admission and memory planning remain tokenizer-independent metadata operations. An explicit
+    // text-encoder override still replaces the bundled component's byte projection, but the actual
+    // provider load is the boundary that validates and retains the encoder + tokenizer receipts.
+    if let Some(selected) = spec.text_encoder.as_ref() {
+        let headers = gen_core::encoder_contract::text_encoder_source_tensor_headers(selected)?;
+        let text_encoder_quant = (provider_id == FLUX2_DEV_ID)
+            .then(|| resolved_quant(spec))
+            .transpose()?
+            .flatten();
+        components.text_encoder = f32_or_packed_tensor_headers(
+            &headers,
+            text_encoder_quant,
+            "selected text encoder",
+            true,
+            false,
+            "selected direct-shard inventory",
+        )?;
+    }
     let resident_components = resident_components(provider_id, spec)?;
     let overlay_bytes = resident_components
         .iter()
@@ -1155,19 +1190,11 @@ mod tests {
         for component in ["text_encoder", "vae"] {
             std::fs::create_dir_all(root.join(component)).unwrap();
         }
-        write_typed_safetensors(
-            &root.join("text_encoder/model.safetensors"),
-            &[
-                (
-                    "model.layers.0.self_attn.q_proj.weight",
-                    "F16",
-                    &[2, 32],
-                    128,
-                ),
-                ("model.layers.0.self_attn.k_proj.weight", "U8", &[2, 32], 64),
-                ("model.embed_tokens.weight", "F16", &[2, 32], 128),
-            ],
-        );
+        gen_core_testkit::write_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            crate::config::DEV_ENCODER_CONTRACT,
+        )
+        .unwrap();
         write_typed_safetensors(
             &root.join("vae/model.safetensors"),
             &[
@@ -1195,16 +1222,51 @@ mod tests {
     #[test]
     fn imported_file_asset_facts_follow_fp8_dequant_and_ggml_packing() {
         let tmp = tempfile::tempdir().unwrap();
-        let dense = provider_contract(&file_spec(&tmp, None)).unwrap();
-        assert_eq!(dense.asset_facts.conditioning_bytes, 768);
+        let dense_spec = file_spec(&tmp, None);
+        let dense = provider_contract(&dense_spec).unwrap();
+        let dense_conditioning = crate::config::DEV_ENCODER_CONTRACT
+            .source_for_load(
+                &dense_spec,
+                gen_core::require_base_snapshot(&dense_spec, FLUX2_DEV_ID).unwrap(),
+            )
+            .unwrap();
+        let dense_conditioning = f32_or_packed_tensor_headers(
+            &dense_conditioning.tensor_headers().unwrap(),
+            None,
+            "selected text encoder",
+            true,
+            false,
+            "test inventory",
+        )
+        .unwrap();
+        assert_eq!(dense.asset_facts.conditioning_bytes, dense_conditioning);
         assert_eq!(dense.asset_facts.transformer_bytes, 520);
         assert_eq!(dense.asset_facts.decoder_bytes, 32);
 
-        let packed = provider_contract(&file_spec(&tmp, Some(Quant::Q4))).unwrap();
-        assert_eq!(packed.asset_facts.conditioning_bytes, 36 + 36 + 256);
+        let packed_spec = file_spec(&tmp, Some(Quant::Q4));
+        let packed = provider_contract(&packed_spec).unwrap();
+        let packed_conditioning = crate::config::DEV_ENCODER_CONTRACT
+            .source_for_load(
+                &packed_spec,
+                gen_core::require_base_snapshot(&packed_spec, FLUX2_DEV_ID).unwrap(),
+            )
+            .unwrap();
+        let packed_conditioning = f32_or_packed_tensor_headers(
+            &packed_conditioning.tensor_headers().unwrap(),
+            Some(Quant::Q4),
+            "selected text encoder",
+            true,
+            false,
+            "test inventory",
+        )
+        .unwrap();
+        assert_eq!(packed.asset_facts.conditioning_bytes, packed_conditioning);
         assert_eq!(packed.asset_facts.transformer_bytes, 36 + 36 + 8);
         assert_eq!(packed.asset_facts.decoder_bytes, 32);
-        assert_eq!(packed.asset_facts.base_bytes, 440);
+        assert_eq!(
+            packed.asset_facts.base_bytes,
+            packed_conditioning + packed.asset_facts.transformer_bytes + 32
+        );
     }
 
     #[test]
@@ -1249,7 +1311,14 @@ mod tests {
         identity.identity = Some(gen_core::IdentityWeights::default());
         cases.push(("identity", identity));
         let mut external_te = valid.clone();
-        external_te.text_encoder = Some(WeightsSource::Dir(tmp.path().join("external-te")));
+        let external_te_root = tmp.path().join("external-te");
+        gen_core_testkit::write_encoder_contract_fixture_with_quant(
+            &external_te_root,
+            crate::config::DEV_ENCODER_CONTRACT,
+            Some(4),
+        )
+        .unwrap();
+        external_te.text_encoder = Some(WeightsSource::Dir(external_te_root));
         cases.push(("external-text-encoder", external_te));
         let mut unknown = valid.clone();
         unknown.components.insert(

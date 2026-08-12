@@ -15,6 +15,7 @@
 use std::path::Path;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
+use candle_gen::gen_core::WeightsSource;
 use candle_gen::Result;
 use candle_gen_boogu::loader::Weights as BooguWeights;
 pub use candle_gen_boogu::vision::preprocess::preprocess_image;
@@ -59,7 +60,17 @@ pub fn krea_vision_config() -> VisionConfig {
 /// tower stays dense bf16 (loaded → f32 here), which boogu's `VisionTower::load` guards for.
 pub fn load_vision_tower(root: impl AsRef<Path>, device: &Device) -> Result<VisionTower> {
     let dir = root.as_ref().join("text_encoder");
-    let w = BooguWeights::from_dir(&dir, device, VISION_DTYPE)?;
+    load_vision_tower_from_source(&WeightsSource::Dir(dir), device)
+}
+
+pub fn load_vision_tower_from_source(
+    source: &WeightsSource,
+    device: &Device,
+) -> Result<VisionTower> {
+    let w = match source {
+        WeightsSource::Dir(path) => BooguWeights::from_dir(path, device, VISION_DTYPE)?,
+        WeightsSource::File(path) => BooguWeights::from_file(path, device, VISION_DTYPE)?,
+    };
     Ok(VisionTower::load(&w, krea_vision_config(), "visual")?)
 }
 

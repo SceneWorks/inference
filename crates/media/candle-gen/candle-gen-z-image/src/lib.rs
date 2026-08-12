@@ -126,14 +126,14 @@ pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core:
     register_providers(candle_gen::gen_core::ProviderRegistryBuilder::new()).build()
 }
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, ConditioningKind, GenerationOutput, GenerationRequest,
-    Generator, LoadSpec, Modality, ModelDescriptor, PidWeights, Progress, SizeFloor, WeightsSource,
-    BASE_SNAPSHOT_COMPONENT, COMFYUI_TEXT_ENCODER_COMPONENT, COMFYUI_VAE_COMPONENT,
+    Generator, LoadSpec, Modality, ModelDescriptor, PidWeights, Progress, Quant, SizeFloor,
+    WeightsSource, BASE_SNAPSHOT_COMPONENT, COMFYUI_TEXT_ENCODER_COMPONENT, COMFYUI_VAE_COMPONENT,
 };
 use candle_transformers::models::z_image::vae::Encoder as VaeEncoder;
 
@@ -142,6 +142,92 @@ use pipeline::{Components, Pipeline, DEFAULT_STEPS};
 /// Registry id — matches the SceneWorks worker's `payload.model` (`MODEL_TABLE["z_image_turbo"]`)
 /// and the macOS `mlx-gen-z-image` descriptor.
 pub const MODEL_ID: &str = "z_image_turbo";
+
+pub const TOKENIZER_CONTRACT: gen_core::EncoderTokenizerContract =
+    gen_core::EncoderTokenizerContract {
+        family: "qwen3",
+        binding: gen_core::EncoderTokenizerBinding::RetainBase,
+        artifact_candidates: &["tokenizer/tokenizer.json"],
+        required_tokens: &[
+            gen_core::EncoderRequiredToken {
+                role: "qwen_endoftext",
+                literal: "<|endoftext|>",
+                id: 151_643,
+                config_field: Some("bos_token_id"),
+            },
+            gen_core::EncoderRequiredToken {
+                role: "qwen_im_start",
+                literal: "<|im_start|>",
+                id: 151_644,
+                config_field: None,
+            },
+            gen_core::EncoderRequiredToken {
+                role: "qwen_im_end",
+                literal: "<|im_end|>",
+                id: 151_645,
+                config_field: Some("eos_token_id"),
+            },
+        ],
+    };
+
+pub const PROMPT_EXECUTIONS: &[gen_core::EncoderPromptExecutionContract] = &[
+    gen_core::EncoderPromptExecutionContract {
+        purpose: "z_image_prompt",
+        template: gen_core::EncoderPromptTemplate::QwenInstruct,
+        add_special_tokens: true,
+        length: gen_core::EncoderPromptLengthPolicy::RightTruncate { max_tokens: 512 },
+        padding: gen_core::EncoderPromptPadding::None,
+        prefix_trim: 0,
+    },
+    gen_core::EncoderPromptExecutionContract {
+        purpose: "z_image_empty_negative",
+        template: gen_core::EncoderPromptTemplate::QwenInstruct,
+        add_special_tokens: true,
+        length: gen_core::EncoderPromptLengthPolicy::Unbounded,
+        padding: gen_core::EncoderPromptPadding::None,
+        prefix_trim: 0,
+    },
+];
+
+pub const ENCODER_CONTRACT: gen_core::EncoderContract = gen_core::EncoderContract {
+    architecture: "qwen3",
+    hidden_size: 2560,
+    intermediate_size: 9728,
+    num_hidden_layers: 36,
+    num_attention_heads: 32,
+    num_key_value_heads: 8,
+    head_dim: 128,
+    vocab_size: 151_936,
+    output_width: 2560,
+    loaded_hidden_layers: 36,
+    requires_final_norm: false,
+    requires_lm_head: false,
+    hidden_activation: "silu",
+    attention_dropout: gen_core::EncoderConfigFloat::new(0.0),
+    rms_norm_eps: gen_core::EncoderConfigFloat::new(1e-6),
+    qk_norm_eps: Some(gen_core::EncoderConfigFloat::new(1e-6)),
+    rope_theta: gen_core::EncoderConfigFloat::new(1_000_000.0),
+    max_position_embeddings: 40_960,
+    attention_bias: Some(false),
+    tie_word_embeddings: Some(true),
+    tokenizer: TOKENIZER_CONTRACT,
+    prompt_executions: PROMPT_EXECUTIONS,
+    bos_token_id: Some(151_643),
+    eos_token_id: Some(151_645),
+    image_token_id: None,
+    vision_start_token_id: None,
+    vision_end_token_id: None,
+    mrope_section: &[],
+    mrope_interleaved: None,
+    selected_hidden_layers: &[35],
+    packing: Some(gen_core::EncoderPackingContract {
+        group_size: 64,
+        pack_embedding: true,
+        pack_lm_head: false,
+        supports_file: true,
+    }),
+    dense_storage_dtype_probe: None,
+};
 
 /// Z-Image works in latent space at /8 and the DiT patchifies that at /2, so both image dims must be
 /// multiples of **16** for a clean patchify. Enforced in [`validate`](Generator::validate). Exposed as
@@ -181,6 +267,8 @@ pub fn accel_attn_enabled() -> bool {
 pub struct ZImageGenerator {
     descriptor: ModelDescriptor,
     root: PathBuf,
+    text_encoder_source: Option<gen_core::ValidatedEncoderSource>,
+    tokenizer_source: gen_core::ValidatedTokenizerSource,
     device: Device,
     dtype: DType,
     loaded_quant: Option<gen_core::Quant>,
@@ -321,15 +409,22 @@ impl Generator for ZImageGenerator {
         // heavy components come from the cache.
         let pipe = match &self.comfyui {
             // In-place ComfyUI load (sc-10668): the DiT/VAE remap + verbatim Qwen3 TE.
-            Some(sources) => Pipeline::load_comfyui(
+            Some(sources) => Pipeline::load_comfyui_with_text_encoder(
                 sources.clone(),
+                self.text_encoder_source.clone(),
+                self.tokenizer_source.clone(),
                 &self.device,
                 self.dtype,
                 &self.adapters,
                 self.pid_spec.clone(),
             ),
-            None => Pipeline::load(
+            None => Pipeline::load_with_text_encoder(
                 &self.root,
+                self.text_encoder_source.clone().ok_or_else(|| {
+                    gen_core::Error::Msg(
+                        "z_image_turbo: validated text encoder source is unavailable".into(),
+                    )
+                })?,
                 &self.device,
                 self.dtype,
                 &self.adapters,
@@ -409,6 +504,7 @@ impl Generator for ZImageGenerator {
 /// `mlx-gen-z-image`: `backend = "candle"` and `mac_only = false`.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: Some(ENCODER_CONTRACT),
         denoiser_output_latent_space: Some(&candle_gen::gen_core::FLUX1_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
@@ -473,7 +569,7 @@ pub fn descriptor() -> ModelDescriptor {
 fn comfyui_sources_from_spec(
     spec: &LoadSpec,
 ) -> gen_core::Result<Option<std::sync::Arc<comfyui::ComfyuiSources>>> {
-    let WeightsSource::File(_) = &spec.weights else {
+    let WeightsSource::File(_primary_path) = &spec.weights else {
         return Ok(None);
     };
     gen_core::reject_unknown_components(
@@ -486,19 +582,36 @@ fn comfyui_sources_from_spec(
         MODEL_ID,
     )?;
     let tokenizer_dir = gen_core::require_base_snapshot(spec, MODEL_ID)?.to_path_buf();
-    let text_encoder = spec.components.get(COMFYUI_TEXT_ENCODER_COMPONENT);
+    let legacy_text_encoder = spec.components.get(COMFYUI_TEXT_ENCODER_COMPONENT);
+    if spec.text_encoder.is_some() && legacy_text_encoder.is_some() {
+        return Err(gen_core::Error::Msg(format!(
+            "{MODEL_ID}: text encoder was supplied through both LoadSpec::text_encoder and legacy component '{COMFYUI_TEXT_ENCODER_COMPONENT}'"
+        )));
+    }
+    let text_encoder = spec.text_encoder.as_ref().or(legacy_text_encoder);
     let vae = spec.components.get(COMFYUI_VAE_COMPONENT);
-    let separate = match (text_encoder, vae) {
-        (None, None) => None,
+    let primary = spec
+        .weights_file_pin()?
+        .expect("File weights must resolve to a pin");
+    let sources = match (text_encoder, vae) {
+        (None, None) => comfyui::ComfyuiSources::combined(primary.clone(), tokenizer_dir)?,
         (Some(WeightsSource::File(text_encoder)), Some(WeightsSource::File(vae))) => {
-            Some((text_encoder, vae))
+            comfyui::ComfyuiSources::separate(
+                primary.clone(),
+                Some(spec.file_pin_for(text_encoder)?),
+                spec.file_pin_for(vae)?,
+                tokenizer_dir,
+            )?
         }
-        (Some(WeightsSource::Dir(path)), _) => {
-            return Err(gen_core::Error::Msg(format!(
-                "{MODEL_ID}: component '{COMFYUI_TEXT_ENCODER_COMPONENT}' must be a file, not {}",
-                path.display()
-            )))
+        (Some(WeightsSource::Dir(_)), Some(WeightsSource::File(vae))) => {
+            comfyui::ComfyuiSources::separate(
+                primary.clone(),
+                None,
+                spec.file_pin_for(vae)?,
+                tokenizer_dir,
+            )?
         }
+        (Some(_), None) => comfyui::ComfyuiSources::combined(primary.clone(), tokenizer_dir)?,
         (_, Some(WeightsSource::Dir(path))) => {
             return Err(gen_core::Error::Msg(format!(
                 "{MODEL_ID}: component '{COMFYUI_VAE_COMPONENT}' must be a file, not {}",
@@ -507,23 +620,66 @@ fn comfyui_sources_from_spec(
         }
         _ => {
             return Err(gen_core::Error::Msg(format!(
-                "{MODEL_ID}: separate ComfyUI import requires both '{COMFYUI_TEXT_ENCODER_COMPONENT}' and '{COMFYUI_VAE_COMPONENT}', or neither for a combined checkpoint"
+                "{MODEL_ID}: separate ComfyUI import requires a text encoder and '{COMFYUI_VAE_COMPONENT}', or neither for a combined checkpoint"
             )))
         }
     };
-    let primary = spec
-        .weights_file_pin()?
-        .expect("File weights must resolve to a pin");
-    let sources = match separate {
-        None => comfyui::ComfyuiSources::combined(primary, tokenizer_dir)?,
-        Some((text_encoder, vae)) => comfyui::ComfyuiSources::separate(
-            primary,
-            spec.file_pin_for(text_encoder)?,
-            spec.file_pin_for(vae)?,
-            tokenizer_dir,
-        )?,
-    };
     Ok(Some(std::sync::Arc::new(sources)))
+}
+
+fn text_encoder_source_from_spec(
+    spec: &LoadSpec,
+    root: &Path,
+) -> gen_core::Result<Option<gen_core::ValidatedEncoderSource>> {
+    let legacy = spec.components.get(COMFYUI_TEXT_ENCODER_COMPONENT);
+    if spec.text_encoder.is_some() && legacy.is_some() {
+        return Err(gen_core::Error::Msg(format!(
+            "{MODEL_ID}: text encoder was supplied through both LoadSpec::text_encoder and legacy component '{COMFYUI_TEXT_ENCODER_COMPONENT}'"
+        )));
+    }
+    match spec.text_encoder.as_ref().or(legacy) {
+        Some(source @ WeightsSource::File(_)) if matches!(spec.weights, WeightsSource::File(_)) => {
+            ENCODER_CONTRACT
+                .validate_comfyui_source_against_base(source, root)
+                .map(Some)
+        }
+        Some(source) => ENCODER_CONTRACT
+            .validate_source_against_base(source, root)
+            .map(Some),
+        None if matches!(spec.weights, WeightsSource::Dir(_)) => {
+            ENCODER_CONTRACT.source_for_load(spec, root).map(Some)
+        }
+        None => Ok(None),
+    }
+}
+
+fn tokenizer_source_from_spec(
+    spec: &LoadSpec,
+    root: &Path,
+    text_encoder_source: Option<&gen_core::ValidatedEncoderSource>,
+) -> gen_core::Result<gen_core::ValidatedTokenizerSource> {
+    if let Some(source) = text_encoder_source {
+        return source.tokenizer_source().cloned().ok_or_else(|| {
+            gen_core::Error::Unsupported(
+                "z-image validated text encoder has no retained tokenizer receipt".into(),
+            )
+        });
+    }
+    let WeightsSource::File(primary) = &spec.weights else {
+        return Err(gen_core::Error::Unsupported(
+            "z-image tokenizer receipt is unavailable for a non-file source".into(),
+        ));
+    };
+    ENCODER_CONTRACT.validate_embedded_comfyui_file_against_base(
+        primary,
+        &[
+            "conditioner.embedders.0.transformer.",
+            "text_encoders.qwen3_4b.transformer.",
+            "text_encoders.qwen_3_4b.transformer.",
+            "text_encoder.",
+        ],
+        root,
+    )
 }
 
 /// Construct the (lazy) candle Z-Image generator from a [`LoadSpec`]. A [`WeightsSource::Dir`] points
@@ -560,13 +716,24 @@ pub(crate) fn validate_load_spec(spec: &LoadSpec) -> gen_core::Result<()> {
                 .into(),
         ));
     }
-    if spec.identity.is_some() || spec.text_encoder.is_some() {
+    if spec.identity.is_some() {
         return Err(gen_core::Error::Unsupported(
-            "candle z_image_turbo does not support identity or external text-encoder weights"
-                .into(),
+            "candle z_image_turbo does not support identity weights".into(),
         ));
     }
-    let _ = memory_strategy::snapshot_quant_tier(spec, MODEL_ID)?;
+    let root = gen_core::require_base_snapshot(spec, MODEL_ID)?;
+    let text_encoder_source = text_encoder_source_from_spec(spec, root)?;
+    let _ = tokenizer_source_from_spec(spec, root, text_encoder_source.as_ref())?;
+    let loaded_quant = memory_strategy::snapshot_quant_tier(spec, MODEL_ID)?;
+    if let Some(source) = text_encoder_source.as_ref() {
+        let load_time_quant =
+            source.load_time_quant_bits(loaded_quant.map(Quant::bits), MODEL_ID)?;
+        if let Some(bits) = load_time_quant {
+            return Err(gen_core::Error::Unsupported(format!(
+                "candle {MODEL_ID} requires a selected text encoder already packed at Q{bits}; this provider does not quantize a dense Z-Image encoder on the fly"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -574,6 +741,8 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     validate_load_spec(spec)?;
     let comfyui = comfyui_sources_from_spec(spec)?;
     let root = gen_core::require_base_snapshot(spec, MODEL_ID)?.to_path_buf();
+    let text_encoder_source = text_encoder_source_from_spec(spec, &root)?;
+    let tokenizer_source = tokenizer_source_from_spec(spec, &root, text_encoder_source.as_ref())?;
     let loaded_quant = memory_strategy::snapshot_quant_tier(spec, MODEL_ID)?;
     // Z-Image is a bf16 model; load at bf16 regardless of the CPU-default dtype. The device is the
     // backend selected at compile time (CUDA on Windows, Metal/CPU on Mac).
@@ -585,6 +754,8 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     Ok(Box::new(ZImageGenerator {
         descriptor: descriptor(),
         root,
+        text_encoder_source,
+        tokenizer_source,
         device,
         dtype: DType::BF16,
         loaded_quant,
@@ -623,10 +794,7 @@ pub fn load_from_comfyui_components(
             BASE_SNAPSHOT_COMPONENT,
             WeightsSource::Dir(tokenizer_dir.into()),
         )
-        .with_component(
-            COMFYUI_TEXT_ENCODER_COMPONENT,
-            WeightsSource::File(text_encoder_file.into()),
-        )
+        .with_text_encoder(WeightsSource::File(text_encoder_file.into()))
         .with_component(COMFYUI_VAE_COMPONENT, WeightsSource::File(vae_file.into()));
     spec.prepare_file_sources()?;
     load(&spec)
@@ -760,6 +928,77 @@ mod tests {
         MemoryMode, MemoryNumericTier, MemoryRunContext, MemorySafetyDecision, MemoryStrategy,
         Precision, Quant, WeightsSource,
     };
+    use std::path::Path;
+
+    fn valid_model_root() -> tempfile::TempDir {
+        let root = tempfile::tempdir().expect("model root");
+        gen_core_testkit::write_encoder_contract_fixture(
+            &root.path().join("text_encoder"),
+            ENCODER_CONTRACT,
+        )
+        .expect("valid encoder fixture");
+        root
+    }
+
+    fn prefixed_encoder_fixture(
+        root: &Path,
+        contract: gen_core::EncoderContract,
+        prefix: &str,
+    ) -> PathBuf {
+        use std::io::{Read as _, Write as _};
+
+        let component = root.join("encoder");
+        gen_core_testkit::write_encoder_contract_fixture(&component, contract)
+            .expect("encoder fixture");
+        let mut source = std::fs::File::open(component.join("model.safetensors"))
+            .expect("encoder fixture weights");
+        let mut header_len = [0_u8; 8];
+        source.read_exact(&mut header_len).unwrap();
+        let header_len = u64::from_le_bytes(header_len) as usize;
+        let mut header_bytes = vec![0_u8; header_len];
+        source.read_exact(&mut header_bytes).unwrap();
+        let header: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&header_bytes).unwrap();
+        let mut prefixed = serde_json::Map::new();
+        let mut data_len = 0usize;
+        for (name, value) in header {
+            data_len = data_len.max(
+                value["data_offsets"][1]
+                    .as_u64()
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap(),
+            );
+            prefixed.insert(format!("{prefix}{name}"), value);
+        }
+        prefixed.insert(
+            "model.diffusion_model.block.weight".into(),
+            serde_json::json!({
+                "dtype": "U8", "shape": [1], "data_offsets": [data_len, data_len + 1]
+            }),
+        );
+        data_len += 1;
+        prefixed.insert(
+            "first_stage_model.decoder.weight".into(),
+            serde_json::json!({
+                "dtype": "U8", "shape": [1], "data_offsets": [data_len, data_len + 1]
+            }),
+        );
+        data_len += 1;
+        let mut encoded = serde_json::to_vec(&prefixed).unwrap();
+        while !(8 + encoded.len()).is_multiple_of(8) {
+            encoded.push(b' ');
+        }
+        let path = root.join("combined.safetensors");
+        let mut output = std::fs::File::create(&path).unwrap();
+        output
+            .write_all(&(encoded.len() as u64).to_le_bytes())
+            .unwrap();
+        output.write_all(&encoded).unwrap();
+        output
+            .set_len(8 + encoded.len() as u64 + data_len as u64)
+            .unwrap();
+        path
+    }
 
     #[test]
     fn control_memory_registrations_have_weights_free_behavior_seams() {
@@ -891,6 +1130,12 @@ mod tests {
             r#"{"quantization":{"bits":4,"group_size":64}}"#,
         )
         .unwrap();
+        gen_core_testkit::write_encoder_contract_fixture_with_quant(
+            &root.join("text_encoder"),
+            ENCODER_CONTRACT,
+            Some(4),
+        )
+        .expect("valid packed encoder fixture");
         let mut spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
         spec.load_shape = LoadShape::DeferredMaterialization;
         (spec, root)
@@ -901,7 +1146,8 @@ mod tests {
     /// is tensor-lazy, so a nonexistent weights dir still resolves (the absent tier marker is dense).
     #[test]
     fn z_image_registers_and_resolves_as_candle() {
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let root = valid_model_root();
+        let spec = LoadSpec::new(WeightsSource::Dir(root.path().into()));
         let g = crate::provider_registry()
             .unwrap()
             .load("z_image_turbo", &spec)
@@ -1002,7 +1248,8 @@ mod tests {
     /// served). Uses the lazy generator so no weights are needed.
     #[test]
     fn validate_accepts_txt2img_and_rejects_unsupported() {
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let root = valid_model_root();
+        let spec = LoadSpec::new(WeightsSource::Dir(root.path().into()));
         let g = crate::provider_registry()
             .unwrap()
             .load("z_image_turbo", &spec)
@@ -1102,7 +1349,8 @@ mod tests {
     /// silently serving the resident cache path.
     #[test]
     fn request_staging_is_active_and_honors_pre_cancel_before_load() {
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let root = valid_model_root();
+        let spec = LoadSpec::new(WeightsSource::Dir(root.path().into()));
         let generator = load(&spec).expect("lazy sequential generator");
         let cancel = gen_core::CancelFlag::default();
         cancel.cancel();
@@ -1126,7 +1374,8 @@ mod tests {
     /// through denoise and making the advertised peak false.
     #[test]
     fn request_staging_rejects_pid_explicitly_before_load() {
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let root = valid_model_root();
+        let spec = LoadSpec::new(WeightsSource::Dir(root.path().into()));
         let generator = load(&spec).expect("lazy sequential generator");
         let req = GenerationRequest {
             prompt: "a rusty robot holding a lit candle".into(),
@@ -1148,7 +1397,8 @@ mod tests {
     #[test]
     fn load_rejects_unwired_surfaces() {
         use candle_gen::gen_core::{AdapterKind, AdapterSpec, Quant};
-        let lora = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_adapters(vec![
+        let root = valid_model_root();
+        let lora = LoadSpec::new(WeightsSource::Dir(root.path().into())).with_adapters(vec![
             AdapterSpec::new("/lora.safetensors".into(), 1.0, AdapterKind::Lora),
         ]);
         assert!(load(&lora).is_ok(), "LoRA load is wired + lazy (sc-5166)");
@@ -1174,31 +1424,16 @@ mod tests {
         assert!(err.contains(BASE_SNAPSHOT_COMPONENT), "got: {err}");
 
         let dir = tempfile::tempdir().expect("temp dir");
-        let checkpoint = dir.path().join("z-image.safetensors");
-        let mut header = serde_json::to_vec(&serde_json::json!({
-            "model.diffusion_model.block.weight": {
-                "dtype": "U8", "shape": [1], "data_offsets": [0, 1]
-            },
-            "text_encoder.layer.weight": {
-                "dtype": "U8", "shape": [1], "data_offsets": [1, 2]
-            },
-            "first_stage_model.decoder.weight": {
-                "dtype": "U8", "shape": [1], "data_offsets": [2, 3]
-            }
-        }))
-        .expect("serialize safetensors header");
-        while !header.len().is_multiple_of(8) {
-            header.push(b' ');
-        }
-        let mut fixture = (header.len() as u64).to_le_bytes().to_vec();
-        fixture.extend(header);
-        fixture.extend([0_u8; 3]);
-        std::fs::write(&checkpoint, fixture).expect("write pinned fixture");
+        let checkpoint = prefixed_encoder_fixture(dir.path(), ENCODER_CONTRACT, "text_encoder.");
+        gen_core_testkit::write_encoder_contract_tokenizer_fixture(dir.path(), ENCODER_CONTRACT)
+            .unwrap();
         let complete = LoadSpec::new(WeightsSource::File(checkpoint)).with_component(
             BASE_SNAPSHOT_COMPONENT,
-            WeightsSource::Dir("/tokenizer".into()),
+            WeightsSource::Dir(dir.path().to_path_buf()),
         );
-        assert!(load(&complete).is_ok(), "complete File spec loads lazily");
+        if let Err(error) = load(&complete) {
+            panic!("complete File spec loads lazily: {error}");
+        }
     }
 
     #[test]

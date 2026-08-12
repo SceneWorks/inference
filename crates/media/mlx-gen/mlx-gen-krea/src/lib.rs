@@ -189,6 +189,11 @@ mod explicit_registry_tests {
             std::fs::create_dir_all(&dir).unwrap();
             write_minimal_safetensors(&dir.join("model.safetensors"));
         }
+        gen_core_testkit::write_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            crate::model::ENCODER_CONTRACT,
+        )
+        .expect("validation-complete text encoder fixture");
         root
     }
 
@@ -318,7 +323,7 @@ mod explicit_registry_tests {
     }
 
     #[test]
-    fn every_registered_file_route_rejects_unrealized_typed_fields() {
+    fn every_registered_file_route_rejects_unrealized_fields_and_accepts_selected_encoder() {
         let tmp = tempfile::tempdir().unwrap();
         let registry = super::provider_registry().unwrap();
         let base = snapshot(&tmp, "registry-file-typed-fields");
@@ -326,6 +331,12 @@ mod explicit_registry_tests {
         let control = tmp.path().join("control.safetensors");
         write_minimal_safetensors(&dit);
         write_minimal_safetensors(&control);
+        let external_text_encoder = tmp.path().join("external-text-encoder");
+        gen_core_testkit::write_encoder_contract_fixture(
+            &external_text_encoder,
+            crate::model::ENCODER_CONTRACT,
+        )
+        .expect("validation-complete selected text encoder fixture");
         let base_spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::File(dit))
             .with_component(
                 mlx_gen::BASE_SNAPSHOT_COMPONENT,
@@ -366,22 +377,17 @@ mod explicit_registry_tests {
             );
 
             let mut text_encoder = route_spec;
-            text_encoder.text_encoder = Some(mlx_gen::WeightsSource::File(
-                tmp.path().join("external-te.safetensors"),
-            ));
-            let error = registry
+            text_encoder.text_encoder =
+                Some(mlx_gen::WeightsSource::Dir(external_text_encoder.clone()));
+            registry
                 .load(id, &text_encoder)
-                .err()
-                .expect("text_encoder field must be rejected")
-                .to_string();
-            assert!(error.contains("text-encoder"), "{id}: {error}");
-            let contract_error = registry
-                .memory_strategy_contract(id, &text_encoder)
-                .expect_err("text_encoder field must be rejected by the memory contract")
-                .to_string();
+                .unwrap_or_else(|error| panic!("{id}: selected text encoder rejected: {error}"));
             assert!(
-                contract_error.contains("text-encoder"),
-                "{id}: {contract_error}"
+                registry
+                    .memory_strategy_contract(id, &text_encoder)
+                    .unwrap_or_else(|error| panic!("{id}: selected contract rejected: {error}"))
+                    .is_some(),
+                "{id} must retain its memory contract with a compatible selected encoder"
             );
         }
     }

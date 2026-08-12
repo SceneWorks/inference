@@ -130,6 +130,7 @@ pub const PID_BACKBONE: &str = "sdxl";
 /// [[false-green-gates-mask-descope]]).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
         denoiser_output_latent_space: Some(&mlx_gen::gen_core::SDXL_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],

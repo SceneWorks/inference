@@ -62,27 +62,48 @@ pub const MAX_LENGTH: usize = 512;
 /// Load the Qwen2 tokenizer with FLUX.2's chat template (`enable_thinking=False`) and the fork's
 /// padding policy (`padding="max_length"` → every prompt padded to 512).
 pub fn load_tokenizer(root: &Path) -> Result<TextTokenizer> {
-    let path = root.join("tokenizer/tokenizer.json");
-    TextTokenizer::from_file(
-        path,
-        TokenizerConfig {
-            max_length: MAX_LENGTH,
-            pad_token_id: PAD_TOKEN_ID,
-            chat_template: ChatTemplate::QwenInstructNoThink,
-            pad_to_max_length: true,
-        },
-    )
-    .map_err(Into::into)
+    let source = crate::config::KLEIN_ENCODER_CONTRACT
+        .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)?;
+    load_validated_tokenizer(&source)
+}
+
+pub(crate) fn load_validated_tokenizer(
+    source: &mlx_gen::gen_core::ValidatedEncoderSource,
+) -> Result<TextTokenizer> {
+    source.read_tokenizer_unchanged(|path| {
+        TextTokenizer::from_file(
+            path,
+            TokenizerConfig {
+                max_length: MAX_LENGTH,
+                pad_token_id: PAD_TOKEN_ID,
+                chat_template: ChatTemplate::QwenInstructNoThink,
+                pad_to_max_length: true,
+            },
+        )
+        .map_err(Into::into)
+    })
 }
 
 /// Load the Qwen3 text encoder. The on-disk `model.*` keys map directly onto the encoder tree
 /// under the `"model"` prefix — no remap needed. Manifest-aware: a pre-quantized klein snapshot
 /// (sc-5917 convert) loads packed; a stock dense snapshot loads dense (no `quantization` block).
 pub fn load_text_encoder(root: &Path) -> Result<Qwen3TextEncoder> {
-    let dir = root.join("text_encoder");
-    let quant = read_component_quant(&dir)?;
-    let w = Weights::from_dir(dir)?;
-    Qwen3TextEncoder::from_weights_quant(&w, "model", &Qwen3TextEncoderConfig::klein_9b(), quant)
+    let selected = crate::config::KLEIN_ENCODER_CONTRACT
+        .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)?;
+    selected.read_unchanged(load_text_encoder_from_source)
+}
+
+pub(crate) fn load_text_encoder_from_source(source: &WeightsSource) -> Result<Qwen3TextEncoder> {
+    let quant = read_source_quant(source)?;
+    let w = weights_from_source(source)?;
+    let encoder = Qwen3TextEncoder::from_weights_quant(
+        &w,
+        "model",
+        &Qwen3TextEncoderConfig::klein_9b(),
+        quant,
+    )?;
+    w.materialize_accessed()?;
+    Ok(encoder)
 }
 
 /// `<pad>` token id for the FLUX.2-dev Mistral tokenizer (vs klein's Qwen2 `<|endoftext|>` 151643).
@@ -93,17 +114,26 @@ pub const DEV_PAD_TOKEN_ID: i32 = 11;
 /// the fork's `padding="max_length"` (every prompt padded to 512 with `<pad>`). The `PixtralProcessor`
 /// image path is not part of the T2I tokenization (sc-5918).
 pub fn load_tokenizer_dev(root: &Path) -> Result<TextTokenizer> {
-    let path = root.join("tokenizer/tokenizer.json");
-    TextTokenizer::from_file(
-        path,
-        TokenizerConfig {
-            max_length: MAX_LENGTH,
-            pad_token_id: DEV_PAD_TOKEN_ID,
-            chat_template: ChatTemplate::Flux2DevMistral,
-            pad_to_max_length: true,
-        },
-    )
-    .map_err(Into::into)
+    let source = crate::config::DEV_ENCODER_CONTRACT
+        .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)?;
+    load_validated_tokenizer_dev(&source)
+}
+
+pub(crate) fn load_validated_tokenizer_dev(
+    source: &mlx_gen::gen_core::ValidatedEncoderSource,
+) -> Result<TextTokenizer> {
+    source.read_tokenizer_unchanged(|path| {
+        TextTokenizer::from_file(
+            path,
+            TokenizerConfig {
+                max_length: MAX_LENGTH,
+                pad_token_id: DEV_PAD_TOKEN_ID,
+                chat_template: ChatTemplate::Flux2DevMistral,
+                pad_to_max_length: true,
+            },
+        )
+        .map_err(Into::into)
+    })
 }
 
 /// Load the **FLUX.2-dev Mistral** text encoder (sc-5915). The dev `text_encoder` is a
@@ -111,16 +141,25 @@ pub fn load_tokenizer_dev(root: &Path) -> Result<TextTokenizer> {
 /// live under the `language_model.model.*` prefix (the vision tower + projector are unused here,
 /// sc-5918). Same decoder-LM graph as klein's Qwen3 minus the per-head q/k-norm (`qk_norm: false`).
 pub fn load_text_encoder_dev(root: &Path) -> Result<Qwen3TextEncoder> {
-    let dir = root.join("text_encoder");
-    let quant = read_component_quant(&dir)?;
-    let w = Weights::from_dir(dir)?;
-    load_text_encoder_dev_from(&w, quant)
+    let selected = crate::config::DEV_ENCODER_CONTRACT
+        .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)?;
+    selected.read_unchanged(load_text_encoder_dev_from_source)
+}
+
+pub(crate) fn load_text_encoder_dev_from_source(
+    source: &WeightsSource,
+) -> Result<Qwen3TextEncoder> {
+    let quant = read_source_quant(source)?;
+    let w = weights_from_source(source)?;
+    let encoder = load_text_encoder_dev_from(&w, quant)?;
+    w.materialize_accessed()?;
+    Ok(encoder)
 }
 
 /// [`load_text_encoder_dev`] from an already-parsed `text_encoder/` [`Weights`] (+ its component
 /// quant manifest). Lets the dev edit load parse the ~45 GB shard set ONCE and share it across the
 /// Mistral language tower, the Pixtral vision tower, and the multimodal projector (F-112).
-pub fn load_text_encoder_dev_from(
+pub(crate) fn load_text_encoder_dev_from(
     w: &Weights,
     quant: Option<Flux2Quant>,
 ) -> Result<Qwen3TextEncoder> {
@@ -145,13 +184,68 @@ pub fn load_text_encoder_dev_from(
 pub fn load_dev_text_encoder_group(
     root: &Path,
 ) -> Result<(Qwen3TextEncoder, PixtralVisionTower, Mistral3Projector)> {
-    let dir = root.join("text_encoder");
-    let quant = read_component_quant(&dir)?;
-    let w = Weights::from_dir(dir)?;
+    let selected = crate::config::DEV_ENCODER_CONTRACT
+        .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)?;
+    selected.read_unchanged(load_dev_text_encoder_group_from_source)
+}
+
+/// Load a substitutable Mistral language tower while keeping the checkpoint-coupled Pixtral vision
+/// tower and projector on the builtin source. If both sources are identical the legacy one-parse
+/// path is preserved exactly.
+pub(crate) fn load_dev_text_encoder_group_from_sources(
+    language_source: &WeightsSource,
+    multimodal_source: &WeightsSource,
+) -> Result<(Qwen3TextEncoder, PixtralVisionTower, Mistral3Projector)> {
+    if same_source(language_source, multimodal_source) {
+        return load_dev_text_encoder_group_from_source(language_source);
+    }
+    let language_quant = read_source_quant(language_source)?;
+    let language_weights = weights_from_source(language_source)?;
+    let encoder = load_text_encoder_dev_from(&language_weights, language_quant)?;
+    language_weights.materialize_accessed()?;
+    let multimodal_weights = weights_from_source(multimodal_source)?;
+    let vision_tower = load_vision_tower_dev_from(&multimodal_weights)?;
+    let projector = load_multimodal_projector_dev_from(&multimodal_weights)?;
+    multimodal_weights.materialize_accessed()?;
+    Ok((encoder, vision_tower, projector))
+}
+
+pub(crate) fn load_dev_text_encoder_group_from_source(
+    source: &WeightsSource,
+) -> Result<(Qwen3TextEncoder, PixtralVisionTower, Mistral3Projector)> {
+    let quant = read_source_quant(source)?;
+    let w = weights_from_source(source)?;
     let encoder = load_text_encoder_dev_from(&w, quant)?;
     let vision_tower = load_vision_tower_dev_from(&w)?;
     let projector = load_multimodal_projector_dev_from(&w)?;
+    w.materialize_accessed()?;
     Ok((encoder, vision_tower, projector))
+}
+
+fn same_source(left: &WeightsSource, right: &WeightsSource) -> bool {
+    match (left, right) {
+        (WeightsSource::Dir(left), WeightsSource::Dir(right))
+        | (WeightsSource::File(left), WeightsSource::File(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn read_source_quant(source: &WeightsSource) -> Result<Option<Flux2Quant>> {
+    let config = match source {
+        WeightsSource::Dir(path) => path.join("config.json"),
+        WeightsSource::File(path) => path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("config.json"),
+    };
+    read_component_quant(config.parent().unwrap_or_else(|| Path::new(".")))
+}
+
+fn weights_from_source(source: &WeightsSource) -> Result<Weights> {
+    match source {
+        WeightsSource::Dir(path) => Weights::from_dir(path),
+        WeightsSource::File(path) => Weights::from_file(path),
+    }
 }
 
 /// Load the FLUX.2 VAE. The on-disk diffusers keys (`encoder.*`/`decoder.*`/`quant_conv.*`/
@@ -244,8 +338,14 @@ pub fn load_control_transformer_dev(
 /// (only the MMDiT + Mistral language tower quantize), so it loads dense regardless of the
 /// pre-quantized-snapshot manifest.
 pub fn load_vision_tower_dev(root: &Path) -> Result<PixtralVisionTower> {
-    let w = Weights::from_dir(root.join("text_encoder"))?;
-    load_vision_tower_dev_from(&w)
+    let selected = crate::config::DEV_ENCODER_CONTRACT
+        .validate_source(&WeightsSource::Dir(root.join("text_encoder")))?;
+    selected.read_unchanged(|source| {
+        let w = weights_from_source(source)?;
+        let tower = load_vision_tower_dev_from(&w)?;
+        w.materialize_accessed()?;
+        Ok(tower)
+    })
 }
 
 /// [`load_vision_tower_dev`] from an already-parsed `text_encoder/` [`Weights`] (F-112).
@@ -258,8 +358,14 @@ pub fn load_vision_tower_dev_from(w: &Weights) -> Result<PixtralVisionTower> {
 /// uses the Mistral **text** `rms_norm_eps` (1e-5), per the reference. Full precision, like the
 /// vision tower.
 pub fn load_multimodal_projector_dev(root: &Path) -> Result<Mistral3Projector> {
-    let w = Weights::from_dir(root.join("text_encoder"))?;
-    load_multimodal_projector_dev_from(&w)
+    let selected = crate::config::DEV_ENCODER_CONTRACT
+        .validate_source(&WeightsSource::Dir(root.join("text_encoder")))?;
+    selected.read_unchanged(|source| {
+        let w = weights_from_source(source)?;
+        let projector = load_multimodal_projector_dev_from(&w)?;
+        w.materialize_accessed()?;
+        Ok(projector)
+    })
 }
 
 /// [`load_multimodal_projector_dev`] from an already-parsed `text_encoder/` [`Weights`] (F-112).

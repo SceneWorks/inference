@@ -9,7 +9,9 @@
 //! 9.200 GiB (40.9%) with zero pixel delta. The overlay remains explicitly resident in
 //! `resident_components`; only the base DiT advertises `TransformerComponent::Dit` windowing.
 
-use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
+use mlx_gen::asset_facts::{
+    projected_safetensors_bytes, projected_tensor_headers_bytes, ResidentProjection,
+};
 #[cfg(test)]
 use mlx_gen::gen_core::MemoryGeometry;
 use mlx_gen::gen_core::{
@@ -222,7 +224,12 @@ pub(crate) fn native_memory_strategy_contract_from_spec(
             ))
         })
     };
-    let conditioning_bytes = stored(&base_snapshot_dir.join("text_encoder"), "base text encoder")?;
+    let selected_text_encoder =
+        crate::model::ENCODER_CONTRACT.source_for_load(spec, base_snapshot_dir)?;
+    let conditioning_bytes =
+        projected_tensor_headers_bytes(&selected_text_encoder.tensor_headers()?, |_| {
+            ResidentProjection::Stored
+        })?;
     let decoder_bytes = stored(&base_snapshot_dir.join("vae"), "base VAE")?;
     let transformer_bytes = spec.read_file_unchanged_if_prepared(dit_file, |p| {
         crate::block_memory_strategy::native_dit_transformer_bytes(provider_id, p)
@@ -318,10 +325,21 @@ fn asset_facts(
             }
         })
     };
-    let conditioning_bytes = project(
-        &root.join("text_encoder"),
-        &crate::convert::is_text_encoder_quant_target,
-    )?;
+    let selected_text_encoder = crate::model::ENCODER_CONTRACT.source_for_load(spec, root)?;
+    let conditioning_bytes =
+        projected_tensor_headers_bytes(&selected_text_encoder.tensor_headers()?, |tensor| {
+            if let Some(quant) = spec
+                .quantize
+                .filter(|_| crate::convert::is_text_encoder_quant_target(&tensor.name))
+            {
+                ResidentProjection::GroupQuantized {
+                    bits: quant.bits(),
+                    group_size: crate::quant::GROUP_SIZE as usize,
+                }
+            } else {
+                ResidentProjection::Stored
+            }
+        })?;
     let transformer_bytes = project(&root.join("transformer"), &|name| {
         crate::convert::is_transformer_quant_target(name)
     })?;
@@ -556,6 +574,11 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             write_control(&dir.join("model.safetensors"));
         }
+        gen_core_testkit::write_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            crate::model::ENCODER_CONTRACT,
+        )
+        .expect("validation-complete text encoder fixture");
     }
 
     #[test]
@@ -806,10 +829,10 @@ mod tests {
         let contract = memory_strategy_contract("krea_2_turbo_control", &spec).unwrap();
         // Q8: 128 code bytes + two 2x1 bf16 tables (8 bytes). A uniform Q4 projection would be 72.
         assert_eq!(contract.asset_facts.overlay_bytes, 136);
-        assert_eq!(contract.asset_facts.conditioning_bytes, 256);
+        assert_eq!(contract.asset_facts.conditioning_bytes, 2_822_436_864);
         assert_eq!(contract.asset_facts.transformer_bytes, 256);
         assert_eq!(contract.asset_facts.decoder_bytes, 256);
-        assert_eq!(contract.asset_facts.base_bytes, 768);
+        assert_eq!(contract.asset_facts.base_bytes, 2_822_437_376);
         assert_eq!(contract.auxiliary_resident_bytes(), 136);
         assert!(contract.conformance_errors().is_empty());
     }
@@ -891,7 +914,13 @@ mod tests {
         let mut identity = valid.clone();
         identity.identity = Some(mlx_gen::gen_core::IdentityWeights::default());
         let mut text_encoder = valid.clone();
-        text_encoder.text_encoder = Some(WeightsSource::Dir(root.join("external-text")));
+        let external_text_encoder = root.join("external-text");
+        gen_core_testkit::write_encoder_contract_fixture(
+            &external_text_encoder,
+            crate::model::ENCODER_CONTRACT,
+        )
+        .expect("validation-complete selected text encoder fixture");
+        text_encoder.text_encoder = Some(WeightsSource::Dir(external_text_encoder));
         let mut pid = valid.clone();
         pid.pid = Some(mlx_gen::gen_core::PidWeights {
             checkpoint: WeightsSource::File(root.join("pid.safetensors")),
@@ -924,7 +953,7 @@ mod tests {
             ("ip_adapter", ip_adapter, false),
             ("pid", pid, false),
             ("identity", identity, false),
-            ("text_encoder", text_encoder, false),
+            ("text_encoder", text_encoder, true),
             ("unknown_component", unknown_component, false),
             ("missing_base", missing_base, false),
         ] {

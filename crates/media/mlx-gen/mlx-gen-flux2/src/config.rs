@@ -30,6 +30,189 @@ pub const FLUX2_DEV_EDIT_ID: &str = "flux2_dev_edit";
 /// control checkpoint (`control`); a required `Control` conditioning (pose/union skeleton) drives it.
 pub const FLUX2_DEV_CONTROL_ID: &str = "flux2_dev_control";
 
+pub const KLEIN_TOKENIZER_CONTRACT: mlx_gen::gen_core::EncoderTokenizerContract =
+    mlx_gen::gen_core::EncoderTokenizerContract {
+        family: "qwen3",
+        binding: mlx_gen::gen_core::EncoderTokenizerBinding::RetainBase,
+        artifact_candidates: &["tokenizer/tokenizer.json"],
+        required_tokens: &[
+            mlx_gen::gen_core::EncoderRequiredToken {
+                role: "qwen_endoftext",
+                literal: "<|endoftext|>",
+                id: 151_643,
+                config_field: Some("bos_token_id"),
+            },
+            mlx_gen::gen_core::EncoderRequiredToken {
+                role: "qwen_im_start",
+                literal: "<|im_start|>",
+                id: 151_644,
+                config_field: None,
+            },
+            mlx_gen::gen_core::EncoderRequiredToken {
+                role: "qwen_im_end",
+                literal: "<|im_end|>",
+                id: 151_645,
+                config_field: Some("eos_token_id"),
+            },
+        ],
+    };
+pub const DEV_TOKENIZER_CONTRACT: mlx_gen::gen_core::EncoderTokenizerContract =
+    mlx_gen::gen_core::EncoderTokenizerContract {
+        family: "mistral3_llama_fast",
+        binding: mlx_gen::gen_core::EncoderTokenizerBinding::RetainBase,
+        artifact_candidates: &["tokenizer/tokenizer.json"],
+        required_tokens: &[
+            mlx_gen::gen_core::EncoderRequiredToken {
+                role: "mistral_bos",
+                literal: "<s>",
+                id: 1,
+                config_field: None,
+            },
+            mlx_gen::gen_core::EncoderRequiredToken {
+                role: "mistral_eos",
+                literal: "</s>",
+                id: 2,
+                config_field: None,
+            },
+            mlx_gen::gen_core::EncoderRequiredToken {
+                role: "pixtral_image",
+                literal: "[IMG]",
+                id: 10,
+                config_field: None,
+            },
+            mlx_gen::gen_core::EncoderRequiredToken {
+                role: "mistral_pad",
+                literal: "<pad>",
+                id: 11,
+                config_field: None,
+            },
+            mlx_gen::gen_core::EncoderRequiredToken {
+                role: "pixtral_image_break",
+                literal: "[IMG_BREAK]",
+                id: 12,
+                config_field: None,
+            },
+            mlx_gen::gen_core::EncoderRequiredToken {
+                role: "pixtral_image_end",
+                literal: "[IMG_END]",
+                id: 13,
+                config_field: None,
+            },
+        ],
+    };
+pub const KLEIN_PROMPT_EXECUTIONS: &[mlx_gen::gen_core::EncoderPromptExecutionContract] =
+    &[mlx_gen::gen_core::EncoderPromptExecutionContract {
+        purpose: "flux2_klein_conditioning",
+        template: mlx_gen::gen_core::EncoderPromptTemplate::QwenInstructNoThink,
+        add_special_tokens: true,
+        length: mlx_gen::gen_core::EncoderPromptLengthPolicy::RightTruncate { max_tokens: 512 },
+        padding: mlx_gen::gen_core::EncoderPromptPadding::RightToMax {
+            pad_token_id: 151_643,
+        },
+        prefix_trim: 0,
+    }];
+pub const DEV_PROMPT_EXECUTIONS: &[mlx_gen::gen_core::EncoderPromptExecutionContract] = &[
+    mlx_gen::gen_core::EncoderPromptExecutionContract {
+        purpose: "flux2_dev_conditioning",
+        template: mlx_gen::gen_core::EncoderPromptTemplate::Flux2DevMistral,
+        add_special_tokens: true,
+        length: mlx_gen::gen_core::EncoderPromptLengthPolicy::RightTruncate { max_tokens: 512 },
+        padding: mlx_gen::gen_core::EncoderPromptPadding::RightToMax { pad_token_id: 11 },
+        prefix_trim: 0,
+    },
+    mlx_gen::gen_core::EncoderPromptExecutionContract {
+        purpose: "flux2_dev_caption_upsample",
+        template: mlx_gen::gen_core::EncoderPromptTemplate::Flux2DevCaptionUpsample,
+        add_special_tokens: true,
+        length: mlx_gen::gen_core::EncoderPromptLengthPolicy::Unbounded,
+        padding: mlx_gen::gen_core::EncoderPromptPadding::None,
+        prefix_trim: 0,
+    },
+];
+
+pub const KLEIN_ENCODER_CONTRACT: mlx_gen::gen_core::EncoderContract =
+    mlx_gen::gen_core::EncoderContract {
+        architecture: "qwen3",
+        hidden_size: 4096,
+        intermediate_size: 12_288,
+        num_hidden_layers: 36,
+        num_attention_heads: 32,
+        num_key_value_heads: 8,
+        head_dim: 128,
+        vocab_size: 151_936,
+        output_width: 12_288,
+        loaded_hidden_layers: 36,
+        requires_final_norm: false,
+        requires_lm_head: false,
+        hidden_activation: "silu",
+        attention_dropout: mlx_gen::gen_core::EncoderConfigFloat::new(0.0),
+        rms_norm_eps: mlx_gen::gen_core::EncoderConfigFloat::new(1e-6),
+        qk_norm_eps: Some(mlx_gen::gen_core::EncoderConfigFloat::new(1e-6)),
+        rope_theta: mlx_gen::gen_core::EncoderConfigFloat::new(1_000_000.0),
+        max_position_embeddings: 40_960,
+        attention_bias: Some(false),
+        tie_word_embeddings: Some(false),
+        tokenizer: KLEIN_TOKENIZER_CONTRACT,
+        prompt_executions: KLEIN_PROMPT_EXECUTIONS,
+        bos_token_id: Some(151_643),
+        eos_token_id: Some(151_645),
+        image_token_id: None,
+        vision_start_token_id: None,
+        vision_end_token_id: None,
+        mrope_section: &[],
+        mrope_interleaved: None,
+        selected_hidden_layers: &[9, 18, 27],
+        packing: Some(mlx_gen::gen_core::EncoderPackingContract {
+            group_size: 64,
+            pack_embedding: true,
+            pack_lm_head: false,
+            supports_file: true,
+        }),
+        dense_storage_dtype_probe: None,
+    };
+
+pub const DEV_ENCODER_CONTRACT: mlx_gen::gen_core::EncoderContract =
+    mlx_gen::gen_core::EncoderContract {
+        // The multimodal wrapper is `mistral3`; the substituted language tower is Mistral.
+        architecture: "mistral",
+        hidden_size: 5120,
+        intermediate_size: 32_768,
+        num_hidden_layers: 40,
+        num_attention_heads: 32,
+        num_key_value_heads: 8,
+        head_dim: 128,
+        vocab_size: 131_072,
+        output_width: 15_360,
+        loaded_hidden_layers: 40,
+        requires_final_norm: true,
+        requires_lm_head: true,
+        hidden_activation: "silu",
+        attention_dropout: mlx_gen::gen_core::EncoderConfigFloat::new(0.0),
+        rms_norm_eps: mlx_gen::gen_core::EncoderConfigFloat::new(1e-5),
+        qk_norm_eps: None,
+        rope_theta: mlx_gen::gen_core::EncoderConfigFloat::new(1_000_000_000.0),
+        max_position_embeddings: 131_072,
+        attention_bias: None,
+        tie_word_embeddings: None,
+        tokenizer: DEV_TOKENIZER_CONTRACT,
+        prompt_executions: DEV_PROMPT_EXECUTIONS,
+        bos_token_id: None,
+        eos_token_id: None,
+        image_token_id: None,
+        vision_start_token_id: None,
+        vision_end_token_id: None,
+        mrope_section: &[],
+        mrope_interleaved: None,
+        selected_hidden_layers: &[10, 20, 30],
+        packing: Some(mlx_gen::gen_core::EncoderPackingContract {
+            group_size: 64,
+            pack_embedding: true,
+            pack_lm_head: false,
+            supports_file: true,
+        }),
+        dense_storage_dtype_probe: None,
+    };
+
 pub const DEFAULT_WIDTH: u32 = 1024;
 pub const DEFAULT_HEIGHT: u32 = 1024;
 /// Distilled klein default; the fork generates in 4 steps at guidance 1.0.
@@ -119,6 +302,14 @@ impl Flux2Variant {
         matches!(self, Self::Dev | Self::DevEdit)
     }
 
+    pub fn encoder_contract(self) -> mlx_gen::gen_core::EncoderContract {
+        if self.is_dev() {
+            DEV_ENCODER_CONTRACT
+        } else {
+            KLEIN_ENCODER_CONTRACT
+        }
+    }
+
     /// The 9b-kv variant, which caches reference K/V across denoise steps.
     pub fn is_kv(self) -> bool {
         matches!(self, Self::Klein9bKvEdit)
@@ -174,6 +365,7 @@ impl Flux2Variant {
             vec![ConditioningKind::Reference]
         };
         ModelDescriptor {
+            encoder_contract: Some(self.encoder_contract()),
             denoiser_output_latent_space: Some(&mlx_gen::gen_core::FLUX2_PACKED_LATENT_SPACE),
             control_kinds: None,
             required_components: &[],

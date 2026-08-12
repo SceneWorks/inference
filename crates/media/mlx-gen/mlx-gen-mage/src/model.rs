@@ -430,6 +430,7 @@ const EDIT_IDENTITY_SHA256: &str =
 /// the published configs.
 pub fn descriptor_for(variant: MageVariant) -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
         denoiser_output_latent_space: Some(&mlx_gen::gen_core::MAGE_LATENT_SPACE),
         control_kinds: None,
         // The text encoder (8.875 GB) and VAE (0.345 GB) are BIT-IDENTICAL across all six Mage

@@ -353,13 +353,25 @@ fn build_native_krea_control_from_spec(spec: &LoadSpec) -> Result<KreaTurboContr
         None => build_memory_contract(),
     })?;
     let text_base = base.clone();
+    let text_encoder_source = crate::model::ENCODER_CONTRACT.source_for_load(spec, &base)?;
+    let builtin_text_encoder = WeightsSource::Dir(base.join("text_encoder"));
+    let expected_text_encoder_bits =
+        mlx_gen::gen_core::text_encoder_packed_quant_bits(&builtin_text_encoder)?;
+    let text_encoder_load_time_quant_bits = text_encoder_source
+        .load_time_quant_bits(expected_text_encoder_bits, KREA_2_TURBO_CONTROL_ID)?;
     let heavy_base = base;
     let heavy_spec = spec.clone();
     let heavy_dit = native_dit.clone();
     let heavy_control = pinned_control.clone();
     let residency = Residency::from_policy(
         spec.offload_policy,
-        move || KreaText::from_snapshot(&text_base),
+        move || {
+            crate::model::load_krea_text_resolved(
+                &text_base,
+                &text_encoder_source,
+                text_encoder_load_time_quant_bits,
+            )
+        },
         move |_use_pid| {
             load_native_control_heavy(
                 &heavy_spec,
@@ -443,10 +455,9 @@ pub(crate) fn validate_control_spec(spec: &LoadSpec) -> Result<()> {
             || !spec.extra_controls.is_empty()
             || spec.pid.is_some()
             || spec.identity.is_some()
-            || spec.text_encoder.is_some()
         {
             return Err(Error::Unsupported(format!(
-                "{KREA_2_TURBO_CONTROL_ID}: imported pose control does not accept IP-adapter, extra-control, PiD, identity, or external text-encoder fields"
+                "{KREA_2_TURBO_CONTROL_ID}: imported pose control does not accept IP-adapter, extra-control, PiD, or identity fields"
             )));
         }
     }
@@ -838,6 +849,11 @@ mod tests {
         let base = tmp.path().join("incomplete-base");
         std::fs::create_dir_all(base.join("transformer")).unwrap();
         std::fs::write(base.join("transformer/config.json"), "{}").unwrap();
+        gen_core_testkit::write_encoder_contract_fixture(
+            &base.join("text_encoder"),
+            crate::model::ENCODER_CONTRACT,
+        )
+        .expect("validation-complete text encoder fixture");
         let dit = tmp.path().join("native-dit.safetensors");
         let control = tmp.path().join("control.safetensors");
         write_minimal_safetensors(&dit);
@@ -854,6 +870,11 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             write_minimal_safetensors(&dir.join("model.safetensors"));
         }
+        gen_core_testkit::write_encoder_contract_fixture(
+            &base.join("text_encoder"),
+            crate::model::ENCODER_CONTRACT,
+        )
+        .expect("validation-complete text encoder fixture");
         let dit = tmp.path().join("dit.safetensors");
         let control = tmp.path().join("control.safetensors");
         write_minimal_safetensors(&dit);
@@ -1022,7 +1043,7 @@ mod tests {
             .expect("missing base snapshot → err")
             .to_string();
         assert!(
-            e.contains("native base text encoder asset facts"),
+            e.contains("native base VAE asset facts"),
             "expected the missing-base inventory error, got: {e}"
         );
     }
@@ -1051,7 +1072,7 @@ mod tests {
             "adapters must be accepted by the native control loader, got: {e}"
         );
         assert!(
-            e.contains("native base text encoder asset facts"),
+            e.contains("native base VAE asset facts"),
             "expected the missing-base inventory error, got: {e}"
         );
     }
@@ -1069,7 +1090,7 @@ mod tests {
             .expect("missing required components must fail")
             .to_string();
         assert!(
-            e.contains("native base text encoder asset facts"),
+            e.contains("native base VAE asset facts"),
             "expected the fail-closed base asset-sizing stage, got: {e}"
         );
         assert!(!e.contains("config.json"), "config was valid, got: {e}");

@@ -1539,6 +1539,7 @@ impl Generator for LensGenerator {
 /// the merge).
 fn descriptor_for(id: &'static str) -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
         denoiser_output_latent_space: Some(&candle_gen::gen_core::FLUX2_PACKED_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],

@@ -32,6 +32,111 @@ use crate::pipeline::{
 /// `payload.model` and the manifest `engine_id` (sc-7572).
 pub const KREA_2_TURBO_ID: &str = "krea_2_turbo";
 
+/// Qwen3-VL-4B conditioning architecture shared by every Krea 2 route.
+pub const TOKENIZER_CONTRACT: mlx_gen::gen_core::EncoderTokenizerContract =
+    mlx_gen::gen_core::EncoderTokenizerContract {
+        family: "qwen3_vl",
+        binding: mlx_gen::gen_core::EncoderTokenizerBinding::RetainBase,
+        artifact_candidates: &["tokenizer/tokenizer.json"],
+        required_tokens: &[
+            mlx_gen::gen_core::EncoderRequiredToken {
+                role: "qwen_endoftext",
+                literal: "<|endoftext|>",
+                id: 151_643,
+                config_field: Some("bos_token_id"),
+            },
+            mlx_gen::gen_core::EncoderRequiredToken {
+                role: "qwen_im_start",
+                literal: "<|im_start|>",
+                id: 151_644,
+                config_field: None,
+            },
+            mlx_gen::gen_core::EncoderRequiredToken {
+                role: "qwen_im_end",
+                literal: "<|im_end|>",
+                id: 151_645,
+                config_field: Some("eos_token_id"),
+            },
+            mlx_gen::gen_core::EncoderRequiredToken {
+                role: "qwen_vision_start",
+                literal: "<|vision_start|>",
+                id: 151_652,
+                config_field: Some("vision_start_token_id"),
+            },
+            mlx_gen::gen_core::EncoderRequiredToken {
+                role: "qwen_vision_end",
+                literal: "<|vision_end|>",
+                id: 151_653,
+                config_field: Some("vision_end_token_id"),
+            },
+            mlx_gen::gen_core::EncoderRequiredToken {
+                role: "qwen_image_pad",
+                literal: "<|image_pad|>",
+                id: 151_655,
+                config_field: Some("image_token_id"),
+            },
+        ],
+    };
+pub const PROMPT_EXECUTIONS: &[mlx_gen::gen_core::EncoderPromptExecutionContract] = &[
+    mlx_gen::gen_core::EncoderPromptExecutionContract {
+        purpose: "krea_t2i",
+        template: mlx_gen::gen_core::EncoderPromptTemplate::KreaQwen3Vl,
+        add_special_tokens: false,
+        length: mlx_gen::gen_core::EncoderPromptLengthPolicy::Unbounded,
+        padding: mlx_gen::gen_core::EncoderPromptPadding::None,
+        prefix_trim: 34,
+    },
+    mlx_gen::gen_core::EncoderPromptExecutionContract {
+        purpose: "krea_edit",
+        template: mlx_gen::gen_core::EncoderPromptTemplate::KreaQwen3VlEdit,
+        add_special_tokens: false,
+        length: mlx_gen::gen_core::EncoderPromptLengthPolicy::Unbounded,
+        padding: mlx_gen::gen_core::EncoderPromptPadding::None,
+        prefix_trim: 34,
+    },
+];
+
+pub const ENCODER_CONTRACT: mlx_gen::gen_core::EncoderContract =
+    mlx_gen::gen_core::EncoderContract {
+        architecture: "qwen3_vl_text",
+        hidden_size: 2560,
+        intermediate_size: 9728,
+        num_hidden_layers: 36,
+        num_attention_heads: 32,
+        num_key_value_heads: 8,
+        head_dim: 128,
+        vocab_size: 151_936,
+        output_width: 2560,
+        loaded_hidden_layers: 35,
+        requires_final_norm: false,
+        requires_lm_head: false,
+        hidden_activation: "silu",
+        attention_dropout: mlx_gen::gen_core::EncoderConfigFloat::new(0.0),
+        rms_norm_eps: mlx_gen::gen_core::EncoderConfigFloat::new(1e-6),
+        qk_norm_eps: Some(mlx_gen::gen_core::EncoderConfigFloat::new(1e-6)),
+        rope_theta: mlx_gen::gen_core::EncoderConfigFloat::new(5_000_000.0),
+        max_position_embeddings: 262_144,
+        attention_bias: Some(false),
+        tie_word_embeddings: Some(true),
+        tokenizer: TOKENIZER_CONTRACT,
+        prompt_executions: PROMPT_EXECUTIONS,
+        bos_token_id: Some(151_643),
+        eos_token_id: Some(151_645),
+        image_token_id: Some(151_655),
+        vision_start_token_id: Some(151_652),
+        vision_end_token_id: Some(151_653),
+        mrope_section: &[24, 20, 20],
+        mrope_interleaved: Some(true),
+        selected_hidden_layers: &[2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35],
+        packing: Some(mlx_gen::gen_core::EncoderPackingContract {
+            group_size: 64,
+            pack_embedding: false,
+            pack_lm_head: false,
+            supports_file: true,
+        }),
+        dense_storage_dtype_probe: None,
+    };
+
 /// Max images per request (the image-model standard, shared with the other MLX families).
 const MAX_COUNT: u32 = 8;
 /// Resolution bounds (W/H). Turbo renders up to 2048²; the catalog/worker gate the UI options tighter.
@@ -92,6 +197,7 @@ pub const KREA_2_TURBO_EDIT_ID: &str = "krea_2_turbo_edit";
 /// no user negative prompt, no img2img/control conditioning on the Turbo checkpoint.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: Some(ENCODER_CONTRACT),
         denoiser_output_latent_space: Some(&mlx_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
@@ -443,9 +549,9 @@ pub(crate) fn validate_native_krea_spec(spec: &LoadSpec, provider_id: &str) -> R
             provider_id
         )));
     }
-    if spec.identity.is_some() || spec.text_encoder.is_some() {
+    if spec.identity.is_some() {
         return Err(Error::Unsupported(format!(
-            "{}: imported single-file weights do not accept identity or external text-encoder fields",
+            "{}: imported single-file weights do not accept identity fields",
             provider_id
         )));
     }
@@ -479,12 +585,24 @@ fn build_native_krea_from_spec(spec: &LoadSpec, descriptor: ModelDescriptor) -> 
         .map_err(Error::from)
     })?;
     let text_base = base.to_path_buf();
+    let text_encoder_source = ENCODER_CONTRACT.source_for_load(spec, base)?;
+    let builtin_text_encoder = WeightsSource::Dir(base.join("text_encoder"));
+    let expected_text_encoder_bits =
+        mlx_gen::gen_core::text_encoder_packed_quant_bits(&builtin_text_encoder)?;
+    let text_encoder_load_time_quant_bits =
+        text_encoder_source.load_time_quant_bits(expected_text_encoder_bits, descriptor.id)?;
     let heavy_base = base.to_path_buf();
     let heavy_dit = native_dit.clone();
     let heavy_spec = spec.clone();
     let residency = Residency::from_policy(
         spec.offload_policy,
-        move || KreaText::from_snapshot(&text_base),
+        move || {
+            load_krea_text_resolved(
+                &text_base,
+                &text_encoder_source,
+                text_encoder_load_time_quant_bits,
+            )
+        },
         move |load_pid| {
             load_native_krea_heavy(&heavy_spec, &heavy_base, &heavy_dit, reopenable, load_pid)
         },
@@ -634,15 +752,19 @@ pub(crate) fn build_residency(
     load_plan: ResolvedLoadPlan,
 ) -> Result<Residency<KreaText, KreaHeavyOwned>> {
     // Up-front fail-fast for both policies (precision override + single-file rejection).
-    let _ = resolve_root(spec, id)?;
-    let spec_text = spec.clone();
+    let root = resolve_root(spec, id)?;
+    let text_encoder_source = ENCODER_CONTRACT.source_for_load(spec, root)?;
+    let text_encoder_load_time_quant_bits =
+        text_encoder_source.load_time_quant_bits(load_plan.effective_quant.map(Quant::bits), id)?;
+    let text_root = root.to_path_buf();
     let spec_heavy = spec.clone();
     Residency::from_policy(
         spec.offload_policy,
         move || {
             load_krea_text_resolved(
-                resolve_root(&spec_text, id)?,
-                load_plan.load_time_quant_bits,
+                &text_root,
+                &text_encoder_source,
+                text_encoder_load_time_quant_bits,
             )
         },
         move |use_pid| {
@@ -759,11 +881,17 @@ pub(crate) fn effective_base_quant_tier(spec: &LoadSpec, id: &str) -> Result<Opt
 /// the VAE/vision), so the `Resident` and `Sequential` paths build byte-identical text phases.
 pub(crate) fn load_krea_text(spec: &LoadSpec, root: &Path, id: &str) -> Result<KreaText> {
     let plan = resolve_load_plan(spec, root, id)?;
-    load_krea_text_resolved(root, plan.load_time_quant_bits)
+    let source = ENCODER_CONTRACT.source_for_load(spec, root)?;
+    let bits = source.load_time_quant_bits(plan.effective_quant.map(Quant::bits), id)?;
+    load_krea_text_resolved(root, &source, bits)
 }
 
-fn load_krea_text_resolved(root: &Path, load_time_quant_bits: Option<i32>) -> Result<KreaText> {
-    let mut text = KreaText::from_snapshot(root)?;
+pub(crate) fn load_krea_text_resolved(
+    root: &Path,
+    source: &mlx_gen::gen_core::ValidatedEncoderSource,
+    load_time_quant_bits: Option<i32>,
+) -> Result<KreaText> {
+    let mut text = KreaText::from_snapshot_with_text_encoder(root, source)?;
     if let Some(bits) = load_time_quant_bits {
         text.quantize(bits)?;
     }
@@ -1488,21 +1616,31 @@ fn edit_references(req: &GenerationRequest) -> Result<Vec<&Image>> {
 pub(crate) fn component_footprint(
     spec: &mlx_gen::LoadSpec,
 ) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    let base = mlx_gen::require_base_snapshot(spec, "krea_2 imported provider")?;
+    let selected = ENCODER_CONTRACT.source_for_load(spec, base)?;
+    let text_encoder = selected.read_unchanged(|source| {
+        Ok::<u64, mlx_gen::gen_core::Error>(match source {
+            WeightsSource::Dir(path) | WeightsSource::File(path) => {
+                mlx_gen::safetensors_path_bytes(path)
+            }
+        })
+    })?;
     match &spec.weights {
-        WeightsSource::Dir(_) => mlx_gen::PerComponentBytes::from_spec_subdirs(
-            spec,
-            &["text_encoder"],
-            &["transformer"],
-            &["vae"],
-        ),
-        WeightsSource::File(dit) => {
-            let base = mlx_gen::require_base_snapshot(spec, "krea_2 imported provider")?;
-            Ok(mlx_gen::PerComponentBytes {
-                text_encoder: mlx_gen::safetensors_path_bytes(base.join("text_encoder")),
-                dit: mlx_gen::safetensors_path_bytes(dit),
-                vae: mlx_gen::safetensors_path_bytes(base.join("vae")),
-            })
+        WeightsSource::Dir(_) => {
+            let mut footprint = mlx_gen::PerComponentBytes::from_spec_subdirs(
+                spec,
+                &["text_encoder"],
+                &["transformer"],
+                &["vae"],
+            )?;
+            footprint.text_encoder = text_encoder;
+            Ok(footprint)
         }
+        WeightsSource::File(dit) => Ok(mlx_gen::PerComponentBytes {
+            text_encoder,
+            dit: mlx_gen::safetensors_path_bytes(dit),
+            vae: mlx_gen::safetensors_path_bytes(base.join("vae")),
+        }),
     }
 }
 
@@ -1596,6 +1734,11 @@ mod tests {
             std::fs::create_dir_all(&dir).expect("create base component");
             write_minimal_safetensors(&dir.join("model.safetensors"));
         }
+        gen_core_testkit::write_encoder_contract_fixture(
+            &base.join("text_encoder"),
+            ENCODER_CONTRACT,
+        )
+        .expect("validation-complete text encoder fixture");
         let dit = tmp.path().join("imported-krea.safetensors");
         write_minimal_safetensors(&dit);
         LoadSpec::new(WeightsSource::File(dit))
@@ -1608,6 +1751,11 @@ mod tests {
         std::fs::create_dir_all(base.join("transformer")).expect("create transformer config dir");
         std::fs::write(base.join("transformer/config.json"), "{}")
             .expect("write parseable transformer config");
+        gen_core_testkit::write_encoder_contract_fixture(
+            &base.join("text_encoder"),
+            ENCODER_CONTRACT,
+        )
+        .expect("validation-complete text encoder fixture");
         let dit = tmp.path().join("native-dit.safetensors");
         write_minimal_safetensors(&dit);
         (dit, base)
@@ -1970,7 +2118,7 @@ mod tests {
             .expect("missing base snapshot → err")
             .to_string();
         assert!(
-            e.contains("native base text encoder asset facts"),
+            e.contains("native base VAE asset facts"),
             "expected the missing-base inventory error, got: {e}"
         );
     }
@@ -1997,7 +2145,7 @@ mod tests {
             "adapters must be accepted by the native loader, got: {e}"
         );
         assert!(
-            e.contains("native base text encoder asset facts"),
+            e.contains("native base VAE asset facts"),
             "expected the missing-base inventory error, got: {e}"
         );
     }
@@ -2030,7 +2178,7 @@ mod tests {
             .expect("missing required base components must fail")
             .to_string();
         assert!(
-            e.contains("native base text encoder asset facts"),
+            e.contains("native base VAE asset facts"),
             "expected the fail-closed base asset-sizing stage, got: {e}"
         );
         assert!(!e.contains("config.json"), "config was valid, got: {e}");
@@ -2317,17 +2465,20 @@ mod tests {
     // A dispatch that ignored `offload_policy` and always built `Resident` (the F-172 bug class) would
     // eager-load under a `Sequential` request and turn the first assertion's `Ok` into an `Err` —
     // this test would fail. That is exactly the ignore-`offload_policy` regression the smoke tests miss.
-    fn missing_snapshot_spec(policy: OffloadPolicy) -> LoadSpec {
-        LoadSpec::new(WeightsSource::Dir(
-            "/nonexistent/krea-residency-test-snapshot".into(),
-        ))
-        .with_offload_policy(policy)
+    fn validation_complete_snapshot_spec(root: &Path, policy: OffloadPolicy) -> LoadSpec {
+        gen_core_testkit::write_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            ENCODER_CONTRACT,
+        )
+        .expect("validation-complete text encoder fixture");
+        LoadSpec::new(WeightsSource::Dir(root.to_path_buf())).with_offload_policy(policy)
     }
 
     #[test]
     fn build_residency_sequential_defers_all_component_loads() {
         // Sequential defers every heavy/text load, so a missing snapshot dir is NOT touched here.
-        let spec = missing_snapshot_spec(OffloadPolicy::Sequential);
+        let fixture = tempfile::tempdir().expect("snapshot fixture");
+        let spec = validation_complete_snapshot_spec(fixture.path(), OffloadPolicy::Sequential);
         let plan = resolve_load_plan(
             &spec,
             resolve_root(&spec, KREA_2_TURBO_ID).unwrap(),
@@ -2346,7 +2497,8 @@ mod tests {
     fn build_residency_resident_eager_loads_and_fails_on_missing_snapshot() {
         // Resident eager-loads the text encoder now, so the missing snapshot dir surfaces as an error
         // at construction — the flip side that proves the Sequential test's `Ok` came from deferral.
-        let spec = missing_snapshot_spec(OffloadPolicy::Resident);
+        let fixture = tempfile::tempdir().expect("snapshot fixture");
+        let spec = validation_complete_snapshot_spec(fixture.path(), OffloadPolicy::Resident);
         let plan = resolve_load_plan(
             &spec,
             resolve_root(&spec, KREA_2_TURBO_ID).unwrap(),

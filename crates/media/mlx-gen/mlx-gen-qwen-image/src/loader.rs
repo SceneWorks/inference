@@ -18,7 +18,7 @@ use std::path::Path;
 
 use mlx_gen::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use mlx_gen::weights::Weights;
-use mlx_gen::{Error, Result, WeightsSource};
+use mlx_gen::{Result, WeightsSource};
 use mlx_rs::Array;
 
 use crate::control_transformer::{QwenFunControlBranch, QwenFunControlConfig};
@@ -38,31 +38,41 @@ const MAX_LENGTH: usize = 1058;
 /// `tools/build_qwen_tokenizer.py` once to materialize it (the same fast tokenizer the fork builds
 /// at runtime).
 pub fn load_tokenizer(root: &Path) -> Result<TextTokenizer> {
-    let path = root.join("tokenizer/tokenizer.json");
-    if !path.exists() {
-        return Err(Error::Msg(format!(
-            "missing {}: the Qwen-Image snapshot ships only vocab.json + merges.txt; run \
-             tools/build_qwen_tokenizer.py to materialize the fast tokenizer.json",
-            path.display()
-        )));
-    }
-    TextTokenizer::from_file(
-        path,
-        TokenizerConfig {
-            max_length: MAX_LENGTH,
-            pad_token_id: PAD_TOKEN_ID,
-            chat_template: ChatTemplate::QwenImage,
-            pad_to_max_length: false,
-        },
-    )
-    .map_err(Into::into)
+    let source = crate::ENCODER_CONTRACT
+        .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)?;
+    load_validated_tokenizer(&source)
+}
+
+pub(crate) fn load_validated_tokenizer(
+    source: &mlx_gen::gen_core::ValidatedEncoderSource,
+) -> Result<TextTokenizer> {
+    source.read_tokenizer_unchanged(|path| {
+        TextTokenizer::from_file(
+            path,
+            TokenizerConfig {
+                max_length: MAX_LENGTH,
+                pad_token_id: PAD_TOKEN_ID,
+                chat_template: ChatTemplate::QwenImage,
+                pad_to_max_length: false,
+            },
+        )
+        .map_err(Into::into)
+    })
 }
 
 /// Load the Qwen2.5-VL text encoder (text path). The on-disk `model.*` keys map directly onto the
 /// encoder tree under the `"model"` prefix (validated in slice 2) — no remap needed.
 pub fn load_text_encoder(root: &Path) -> Result<QwenTextEncoder> {
-    let w = Weights::from_dir(root.join("text_encoder"))?;
-    QwenTextEncoder::from_weights(&w, "model", &QwenTextEncoderConfig::qwen_image())
+    let selected = crate::ENCODER_CONTRACT
+        .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)?;
+    selected.read_unchanged(load_text_encoder_from_source)
+}
+
+pub(crate) fn load_text_encoder_from_source(source: &WeightsSource) -> Result<QwenTextEncoder> {
+    let w = weights_from_source(source)?;
+    let encoder = QwenTextEncoder::from_weights(&w, "model", &QwenTextEncoderConfig::qwen_image())?;
+    w.materialize_accessed()?;
+    Ok(encoder)
 }
 
 /// Load the Qwen2.5-VL **vision transformer** (Qwen-Image-Edit) from a snapshot's `text_encoder/`
@@ -70,9 +80,17 @@ pub fn load_text_encoder(root: &Path) -> Result<QwenTextEncoder> {
 /// rules ([`remap_vision_keys`]) then read under the `"visual"` prefix. Edit-only — the T2I snapshot
 /// has no `visual.*` weights.
 pub fn load_vision_encoder(root: &Path) -> Result<VisionTransformer> {
-    let mut w = Weights::from_dir(root.join("text_encoder"))?;
+    let selected = crate::ENCODER_CONTRACT
+        .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)?;
+    selected.read_unchanged(load_vision_encoder_from_source)
+}
+
+pub(crate) fn load_vision_encoder_from_source(source: &WeightsSource) -> Result<VisionTransformer> {
+    let mut w = weights_from_source(source)?;
     remap_vision_keys(&mut w)?;
-    VisionTransformer::from_weights(&w, "visual", &VisionConfig::qwen_image_edit())
+    let encoder = VisionTransformer::from_weights(&w, "visual", &VisionConfig::qwen_image_edit())?;
+    w.materialize_accessed()?;
+    Ok(encoder)
 }
 
 /// Load the Qwen-Image-**Edit** vision-language conditioning encoder: the Qwen2.5-VL LM (`model.*`,
@@ -84,11 +102,64 @@ pub fn load_vision_encoder(root: &Path) -> Result<VisionTransformer> {
 /// `load_text_encoder` + `load_vision_encoder` each ran their own `Weights::from_dir`, reading every
 /// shard twice. `remap_vision_keys` only touches `visual.*`, so it is safe to apply before the LM read.
 pub fn load_vision_language_encoder(root: &Path) -> Result<QwenVisionLanguageEncoder> {
-    let mut w = Weights::from_dir(root.join("text_encoder"))?;
-    remap_vision_keys(&mut w)?;
-    let lm = QwenTextEncoder::from_weights(&w, "model", &QwenTextEncoderConfig::qwen_image())?;
-    let visual = VisionTransformer::from_weights(&w, "visual", &VisionConfig::qwen_image_edit())?;
+    let selected =
+        crate::ENCODER_CONTRACT.validate_source(&WeightsSource::Dir(root.join("text_encoder")))?;
+    selected.read_unchanged(load_vision_language_encoder_from_source)
+}
+
+pub(crate) fn load_vision_language_encoder_from_source(
+    source: &WeightsSource,
+) -> Result<QwenVisionLanguageEncoder> {
+    load_vision_language_encoder_from_sources(source, source)
+}
+
+/// Compose the edit encoder from a selectable language tower and the checkpoint-coupled vision
+/// tower. When both halves share one source, preserve the established one-parse fast path.
+pub(crate) fn load_vision_language_encoder_from_sources(
+    language_source: &WeightsSource,
+    vision_source: &WeightsSource,
+) -> Result<QwenVisionLanguageEncoder> {
+    if same_source(language_source, vision_source) {
+        let mut w = weights_from_source(language_source)?;
+        remap_vision_keys(&mut w)?;
+        let lm = QwenTextEncoder::from_weights(&w, "model", &QwenTextEncoderConfig::qwen_image())?;
+        let visual =
+            VisionTransformer::from_weights(&w, "visual", &VisionConfig::qwen_image_edit())?;
+        w.materialize_accessed()?;
+        return Ok(QwenVisionLanguageEncoder::new(lm, visual));
+    }
+
+    let language_weights = weights_from_source(language_source)?;
+    let lm = QwenTextEncoder::from_weights(
+        &language_weights,
+        "model",
+        &QwenTextEncoderConfig::qwen_image(),
+    )?;
+    language_weights.materialize_accessed()?;
+    let mut vision_weights = weights_from_source(vision_source)?;
+    remap_vision_keys(&mut vision_weights)?;
+    let visual = VisionTransformer::from_weights(
+        &vision_weights,
+        "visual",
+        &VisionConfig::qwen_image_edit(),
+    )?;
+    vision_weights.materialize_accessed()?;
     Ok(QwenVisionLanguageEncoder::new(lm, visual))
+}
+
+fn same_source(left: &WeightsSource, right: &WeightsSource) -> bool {
+    match (left, right) {
+        (WeightsSource::Dir(left), WeightsSource::Dir(right))
+        | (WeightsSource::File(left), WeightsSource::File(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn weights_from_source(source: &WeightsSource) -> Result<Weights> {
+    match source {
+        WeightsSource::Dir(path) => Weights::from_dir(path),
+        WeightsSource::File(path) => Weights::from_file(path),
+    }
 }
 
 /// The fork's vision weight transforms (`qwen_weight_mapping.py`), applied in place: transpose the

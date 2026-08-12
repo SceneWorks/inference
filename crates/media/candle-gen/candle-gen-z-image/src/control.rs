@@ -44,7 +44,9 @@ use candle_gen::candle_nn::{self as nn, Linear, Module, VarBuilder};
 use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::{GenerationMemory, Image, LoadPhase, PidWeights, PreviewSink, Progress};
+use candle_gen::gen_core::{
+    GenerationMemory, Image, LoadPhase, PidWeights, PreviewSink, Progress, WeightsSource,
+};
 use candle_gen::{CandleError, Result};
 use candle_gen_pid::{PidDecoder, PidEngine};
 use candle_transformers::models::z_image::preprocess::prepare_inputs;
@@ -140,6 +142,10 @@ pub struct ZImageControlPaths {
     /// The base snapshot dir (`tokenizer/`, `text_encoder/`, `transformer/`, `vae/`) — a
     /// `Tongyi-MAI/Z-Image-Turbo` (Turbo mode) or `Tongyi-MAI/Z-Image` (base mode) tree.
     pub snapshot: PathBuf,
+    /// Explicit text-encoder substitution selected for this route. `None` preserves the bundled
+    /// `<snapshot>/text_encoder` source byte-for-byte. Any override is exhaustively validated and
+    /// pinned before either resident or staged component loading begins.
+    pub text_encoder: Option<WeightsSource>,
     /// The Fun-Controlnet-Union checkpoint — a single `.safetensors` file or a dir containing it
     /// (`Z-Image-Turbo-Fun-Controlnet-Union-2.1` for Turbo, `Z-Image-Fun-Controlnet-Union-2.1` for base).
     pub control: PathBuf,
@@ -581,9 +587,7 @@ impl ZImageControl {
     /// runs f32.
     pub fn load(paths: &ZImageControlPaths) -> Result<Self> {
         let device = candle_gen::default_device()?;
-        let root = paths.snapshot.clone();
-
-        let pipeline = Pipeline::load(&root, &device, DTYPE, &[], None);
+        let pipeline = control_pipeline(paths, &device)?;
         let text = pipeline.load_text_phase()?;
         let dit_cfg = DitConfig::z_image_turbo();
         let base =
@@ -626,7 +630,7 @@ impl ZImageControl {
             return Self::load(paths);
         }
         let device = candle_gen::default_device()?;
-        let pipeline = Pipeline::load(&paths.snapshot, &device, DTYPE, &[], None);
+        let pipeline = control_pipeline(paths, &device)?;
         let control_file = resolve_control_file(&paths.control)?;
         let vae_cfg = VaeConfig::z_image();
         Ok(Self {
@@ -1322,6 +1326,22 @@ impl ZImageControl {
     }
 }
 
+fn control_pipeline(paths: &ZImageControlPaths, device: &Device) -> Result<Pipeline> {
+    let builtin = WeightsSource::Dir(paths.snapshot.join("text_encoder"));
+    let source = paths.text_encoder.as_ref().unwrap_or(&builtin);
+    let validated = crate::ENCODER_CONTRACT
+        .validate_source_against_base(source, &paths.snapshot)
+        .map_err(|error| CandleError::Msg(error.to_string()))?;
+    Ok(Pipeline::load_with_text_encoder(
+        &paths.snapshot,
+        validated,
+        device,
+        DTYPE,
+        &[],
+        None,
+    ))
+}
+
 /// Deterministic overlay-file resolution (sc-8680): pick the intended Fun-Controlnet-**Union** weight
 /// **file** from a dir-or-file path, and NOT a Tile / `-lite` sibling.
 ///
@@ -1404,6 +1424,13 @@ fn control_file_score(path: &Path) -> i32 {
 mod tests {
     use super::*;
 
+    fn valid_encoder() -> tempfile::TempDir {
+        let encoder = tempfile::tempdir().unwrap();
+        gen_core_testkit::write_encoder_contract_fixture(encoder.path(), crate::ENCODER_CONTRACT)
+            .unwrap();
+        encoder
+    }
+
     #[test]
     fn request_defaults() {
         let r = ZImageControlRequest::default();
@@ -1416,6 +1443,52 @@ mod tests {
         assert!(r.guidance.is_none());
         assert!(r.negative_prompt.is_none());
         assert!(!r.cancel.is_cancelled());
+    }
+
+    #[test]
+    fn control_pipeline_honors_and_pins_the_selected_encoder() {
+        let snapshot = tempfile::tempdir().unwrap();
+        gen_core_testkit::write_encoder_contract_tokenizer_fixture(
+            snapshot.path(),
+            crate::ENCODER_CONTRACT,
+        )
+        .unwrap();
+        let encoder = valid_encoder();
+        let paths = ZImageControlPaths {
+            snapshot: snapshot.path().to_path_buf(),
+            text_encoder: Some(WeightsSource::Dir(encoder.path().to_path_buf())),
+            control: snapshot.path().join("control.safetensors"),
+            base: false,
+        };
+        let pipeline = control_pipeline(&paths, &Device::Cpu).expect("valid override");
+        std::fs::write(encoder.path().join("config.json"), b"{}").unwrap();
+        let error = match pipeline.load_text_phase() {
+            Ok(_) => panic!("changed selected encoder must fail before tensor load"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("changed after load"), "{error}");
+    }
+
+    #[test]
+    fn control_pipeline_rejects_wrong_encoder_geometry_before_control_load() {
+        let snapshot = tempfile::tempdir().unwrap();
+        let encoder = valid_encoder();
+        let config_path = encoder.path().join("config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        config["hidden_size"] = serde_json::json!(crate::ENCODER_CONTRACT.hidden_size - 1);
+        std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let paths = ZImageControlPaths {
+            snapshot: snapshot.path().to_path_buf(),
+            text_encoder: Some(WeightsSource::Dir(encoder.path().to_path_buf())),
+            control: snapshot.path().join("control.safetensors"),
+            base: false,
+        };
+        let error = control_pipeline(&paths, &Device::Cpu)
+            .err()
+            .expect("wrong encoder must reject before control overlay loading")
+            .to_string();
+        assert!(error.contains("field hidden_size"), "{error}");
     }
 
     /// Base-mode constants (sc-8680) mirror the base txt2img pipeline + the mlx base control provider

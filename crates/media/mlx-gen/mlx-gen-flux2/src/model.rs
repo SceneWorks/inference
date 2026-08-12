@@ -177,10 +177,11 @@ fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> Result<Box<dyn Genera
         }
     }
     // The dev checkpoint has a different tokenizer (Mistral3, not Qwen3) than klein.
+    let text_encoder_source = variant.encoder_contract().source_for_load(spec, root)?;
     let tokenizer = if variant.is_dev() {
-        loader::load_tokenizer_dev(root)?
+        loader::load_validated_tokenizer_dev(&text_encoder_source)?
     } else {
-        loader::load_tokenizer(root)?
+        loader::load_validated_tokenizer(&text_encoder_source)?
     };
     let memory_numeric_tier = mlx_gen::gen_core::MemoryNumericTier {
         precision: spec.precision,
@@ -195,7 +196,7 @@ fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> Result<Box<dyn Genera
         memory_numeric_tier: Some(memory_numeric_tier),
         loaded_spec: spec.clone(),
         tokenizer: Some(tokenizer),
-        residency: build_residency(variant, spec)?,
+        residency: build_residency_with_source(variant, spec, text_encoder_source)?,
     }))
 }
 
@@ -252,21 +253,30 @@ pub(crate) struct Flux2HeavyOwned {
 /// Q4/Q8 quantizes the **text encoder** here (the transformer + VAE quant lives in [`load_flux2_heavy`]);
 /// the vision tower + projector stay full precision, matching the pre-seam `load` (sc-2604). Factored so
 /// the `Resident` and `Sequential` paths build byte-identical encoders.
-fn load_flux2_text(variant: Flux2Variant, spec: &LoadSpec) -> Result<Flux2TextOwned> {
-    let root = resolve_root(variant, spec)?;
-    let (mut text_encoder, vision_tower, projector) = if variant.is_dev() {
-        let (encoder, vision_tower, projector) = loader::load_dev_text_encoder_group(root)?;
-        (encoder, Some(vision_tower), Some(projector))
-    } else {
-        (loader::load_text_encoder(root)?, None, None)
-    };
-    if let Some(q) = spec.quantize {
-        text_encoder.quantize(q.bits())?;
-    }
-    Ok(Flux2TextOwned {
-        text_encoder,
-        vision_tower,
-        projector,
+fn load_flux2_text(
+    variant: Flux2Variant,
+    text_encoder_source: &mlx_gen::gen_core::ValidatedEncoderSource,
+    multimodal_encoder_source: &mlx_gen::gen_core::ValidatedEncoderSource,
+    text_encoder_load_time_quant_bits: Option<i32>,
+) -> Result<Flux2TextOwned> {
+    text_encoder_source.read_unchanged(|source| {
+        let (mut text_encoder, vision_tower, projector) = if variant.is_dev() {
+            let (encoder, vision_tower, projector) =
+                multimodal_encoder_source.read_unchanged(|multimodal| {
+                    loader::load_dev_text_encoder_group_from_sources(source, multimodal)
+                })?;
+            (encoder, Some(vision_tower), Some(projector))
+        } else {
+            (loader::load_text_encoder_from_source(source)?, None, None)
+        };
+        if let Some(bits) = text_encoder_load_time_quant_bits {
+            text_encoder.quantize(bits)?;
+        }
+        Ok(Flux2TextOwned {
+            text_encoder,
+            vision_tower,
+            projector,
+        })
     })
 }
 
@@ -338,17 +348,71 @@ fn load_flux2_heavy(
 /// overlay loaded once, reused); `Sequential` captures the two per-phase loaders and loads nothing now,
 /// deferring each to [`Residency::run`]. Both use the same [`load_flux2_text`] / [`load_flux2_heavy`],
 /// so the `Resident` composition is byte-identical to the pre-seam one.
+#[cfg(test)]
 fn build_residency(
     variant: Flux2Variant,
     spec: &LoadSpec,
 ) -> Result<Residency<Flux2TextOwned, Flux2HeavyOwned>> {
-    let spec_text = spec.clone();
+    let root = resolve_root(variant, spec)?;
+    let text_encoder_source = variant.encoder_contract().source_for_load(spec, root)?;
+    build_residency_with_source(variant, spec, text_encoder_source)
+}
+
+fn build_residency_with_source(
+    variant: Flux2Variant,
+    spec: &LoadSpec,
+    text_encoder_source: mlx_gen::gen_core::ValidatedEncoderSource,
+) -> Result<Residency<Flux2TextOwned, Flux2HeavyOwned>> {
+    let root = resolve_root(variant, spec)?;
+    // Klein artifacts intentionally keep Qwen3 dense in every Q4/Q8 tier. Dev applies the
+    // effective transformer tier to its language tower, including an already-packed snapshot.
+    let effective_quant_bits = variant
+        .is_dev()
+        .then(|| effective_base_quant(variant, spec, root))
+        .transpose()?
+        .flatten()
+        .map(mlx_gen::gen_core::Quant::bits);
+    let text_encoder_load_time_quant_bits =
+        text_encoder_source.load_time_quant_bits(effective_quant_bits, variant.id())?;
+    let multimodal_encoder_source = if variant.is_dev() {
+        variant
+            .encoder_contract()
+            .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)?
+    } else {
+        text_encoder_source.clone()
+    };
     let spec_heavy = spec.clone();
     Residency::from_policy(
         spec.offload_policy,
-        move || load_flux2_text(variant, &spec_text),
+        move || {
+            load_flux2_text(
+                variant,
+                &text_encoder_source,
+                &multimodal_encoder_source,
+                text_encoder_load_time_quant_bits,
+            )
+        },
         move |use_pid| load_flux2_heavy(variant, &spec_heavy, use_pid),
     )
+}
+
+pub(crate) fn effective_base_quant(
+    variant: Flux2Variant,
+    spec: &LoadSpec,
+    root: &Path,
+) -> Result<Option<mlx_gen::gen_core::Quant>> {
+    if let Some(requested) = spec.quantize {
+        mlx_gen::quant::needs_load_time_quant(root, "transformer", requested.bits(), variant.id())?;
+    }
+    match mlx_gen::quant::packed_quant_bits(root, "transformer")? {
+        Some(4) => Ok(Some(mlx_gen::gen_core::Quant::Q4)),
+        Some(8) => Ok(Some(mlx_gen::gen_core::Quant::Q8)),
+        Some(bits) => Err(Error::Unsupported(format!(
+            "{}: transformer declares unsupported packed quantization width {bits}",
+            variant.id()
+        ))),
+        None => Ok(spec.quantize),
+    }
 }
 
 /// The FLUX.2 generator (klein + dev, ±edit/kv-edit).
@@ -1260,12 +1324,16 @@ pub(crate) fn validate_request(
 pub(crate) fn component_footprint(
     spec: &mlx_gen::LoadSpec,
 ) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
-    mlx_gen::PerComponentBytes::from_spec_subdirs(
+    let mut footprint = mlx_gen::PerComponentBytes::from_spec_subdirs(
         spec,
         &["text_encoder"],
         &["transformer"],
         &["vae"],
-    )
+    )?;
+    if let Some(source) = spec.text_encoder.as_ref() {
+        footprint.text_encoder = mlx_gen::gen_core::text_encoder_source_bytes(source)?;
+    }
+    Ok(footprint)
 }
 
 mlx_gen::register_generators! {
@@ -2016,23 +2084,35 @@ mod tests {
     }
 
     // ── sc-10840: weight-free, default-run proof that FLUX.2's dispatch HONORS `offload_policy`.
-    // `build_residency` at a non-existent snapshot *directory* (so the up-front precision/single-file
-    // guard passes): `Sequential` defers (captures both loaders, no weights → `is_sequential`);
-    // `Resident` eager-loads the text encoder from the missing dir → `Err`. Runs for a klein (Qwen3)
+    // `build_residency` at a validation-complete sparse snapshot: `Sequential` admits the encoder
+    // contract but defers payload materialization (`is_sequential`); `Resident` eager-loads the sparse
+    // test payload and fails. Runs for a klein (Qwen3)
     // and a dev (Mistral-3 group) variant, so both text-loader arms are exercised. The real-weight A/B
     // is deferred (weights not on disk).
-    fn missing_snapshot_spec(policy: OffloadPolicy) -> LoadSpec {
-        LoadSpec::new(WeightsSource::Dir(
-            "/nonexistent/flux2-residency-test-snapshot".into(),
-        ))
-        .with_offload_policy(policy)
+    fn validation_complete_snapshot_spec(
+        root: &Path,
+        variant: Flux2Variant,
+        policy: OffloadPolicy,
+    ) -> LoadSpec {
+        gen_core_testkit::write_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            variant.encoder_contract(),
+        )
+        .unwrap();
+        LoadSpec::new(WeightsSource::Dir(root.to_path_buf())).with_offload_policy(policy)
     }
 
     #[test]
     fn build_residency_sequential_defers_all_component_loads() {
         for variant in [Flux2Variant::Klein9b, Flux2Variant::Dev] {
-            let res = build_residency(variant, &missing_snapshot_spec(OffloadPolicy::Sequential))
-                .expect("Sequential must defer loads and not touch the (missing) snapshot dir");
+            let fixture = tempfile::tempdir().unwrap();
+            let spec = validation_complete_snapshot_spec(
+                fixture.path(),
+                variant,
+                OffloadPolicy::Sequential,
+            );
+            let res = build_residency(variant, &spec)
+                .expect("Sequential must validate the encoder and defer payload loads");
             assert!(
                 res.is_sequential(),
                 "{}: Sequential policy must build a Sequential (deferred) residency",
@@ -2044,9 +2124,12 @@ mod tests {
     #[test]
     fn build_residency_resident_eager_loads_and_fails_on_missing_snapshot() {
         for variant in [Flux2Variant::Klein9b, Flux2Variant::Dev] {
-            let err = build_residency(variant, &missing_snapshot_spec(OffloadPolicy::Resident))
+            let fixture = tempfile::tempdir().unwrap();
+            let spec =
+                validation_complete_snapshot_spec(fixture.path(), variant, OffloadPolicy::Resident);
+            let err = build_residency(variant, &spec)
                 .err()
-                .expect("Resident must eager-load and fail on a missing snapshot dir");
+                .expect("Resident must eager-load and fail on the sparse validation fixture");
             let msg = err.to_string();
             assert!(
                 !msg.contains("single .safetensors file") && !msg.contains("precision override"),

@@ -521,6 +521,7 @@ fn task_to_vit_mode(task: &str) -> Option<VitMode> {
 /// Stable identity + advertised capabilities for the full Bernini pipeline.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
         denoiser_output_latent_space: Some(&mlx_gen::gen_core::WAN_Z16_VIDEO_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],

@@ -29,7 +29,7 @@ use mlx_gen::{
 use mlx_rs::transforms::eval;
 use mlx_rs::Array;
 
-use crate::config::{Flux2Config, FLUX2_DEV_CONTROL_ID};
+use crate::config::{Flux2Config, Flux2Variant, FLUX2_DEV_CONTROL_ID};
 use crate::model::{crop_to_even, match_latent_spatial_size, validate_request, Flux2TextOwned};
 use crate::pipeline::{
     add_noise_by_interpolation, create_noise, fun_control_context_from_latents, init_time_step,
@@ -46,6 +46,7 @@ use crate::{loader, CONTROL_IN_DIM};
 /// init seed). Mac-only, like every FLUX.2 variant.
 pub fn descriptor_dev_control() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: Some(crate::config::DEV_ENCODER_CONTRACT),
         denoiser_output_latent_space: Some(&mlx_gen::gen_core::FLUX2_PACKED_LATENT_SPACE),
         // Deliberately input-agnostic, not undeclared: the Fun-Controlnet-Union checkpoint runs
         // pose / canny / depth down one VAE-encoded path with no mode index, so every kind is
@@ -161,11 +162,13 @@ pub fn load_dev_control(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
             mlx_gen::residency::warn_sequential_requantize(FLUX2_DEV_CONTROL_ID, q.bits());
         }
     }
+    let text_encoder_source = crate::config::DEV_ENCODER_CONTRACT.source_for_load(spec, root)?;
+    let tokenizer = loader::load_validated_tokenizer_dev(&text_encoder_source)?;
     Ok(Box::new(Flux2DevControl {
         descriptor: descriptor_dev_control(),
         config: Flux2Config::dev(),
-        tokenizer: Some(loader::load_tokenizer_dev(root)?),
-        residency: build_control_residency(spec)?,
+        tokenizer: Some(tokenizer),
+        residency: build_control_residency_with_source(spec, text_encoder_source)?,
     }))
 }
 
@@ -174,14 +177,36 @@ pub fn load_dev_control(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 /// loads nothing now. The text phase is the dev Mistral-3 encoder only (no caption upsample — the
 /// control variant has no vision tower), reusing the shared [`Flux2TextOwned`]; the heavy loader builds
 /// the control transformer (base + control branch) + VAE.
+#[cfg(test)]
 fn build_control_residency(
     spec: &LoadSpec,
 ) -> Result<Residency<Flux2TextOwned, Flux2ControlHeavyOwned>> {
-    let spec_text = spec.clone();
+    let root = require_base_dir(
+        spec,
+        FLUX2_DEV_CONTROL_ID,
+        "a FLUX.2-dev snapshot directory",
+    )?;
+    let text_encoder_source = crate::config::DEV_ENCODER_CONTRACT.source_for_load(spec, root)?;
+    build_control_residency_with_source(spec, text_encoder_source)
+}
+
+fn build_control_residency_with_source(
+    spec: &LoadSpec,
+    text_encoder_source: gen_core::ValidatedEncoderSource,
+) -> Result<Residency<Flux2TextOwned, Flux2ControlHeavyOwned>> {
+    let root = require_base_dir(
+        spec,
+        FLUX2_DEV_CONTROL_ID,
+        "a FLUX.2-dev snapshot directory",
+    )?;
+    let effective_quant_bits =
+        crate::model::effective_base_quant(Flux2Variant::Dev, spec, root)?.map(Quant::bits);
+    let text_encoder_load_time_quant_bits =
+        text_encoder_source.load_time_quant_bits(effective_quant_bits, FLUX2_DEV_CONTROL_ID)?;
     let spec_heavy = spec.clone();
     Residency::from_policy(
         spec.offload_policy,
-        move || load_control_text(&spec_text),
+        move || load_control_text(&text_encoder_source, text_encoder_load_time_quant_bits),
         // The control variant has no PiD overlay, so the heavy loader ignores `use_pid`.
         move |_use_pid| load_control_heavy(&spec_heavy),
     )
@@ -190,20 +215,20 @@ fn build_control_residency(
 /// Load the dev Mistral-3 text encoder (+ optional Q4/Q8) — the phase-A component dropped first under
 /// `Sequential`. No vision tower / projector (the control variant does not caption-upsample), so it
 /// wraps the encoder in a text-only [`Flux2TextOwned`].
-fn load_control_text(spec: &LoadSpec) -> Result<Flux2TextOwned> {
-    let root = require_base_dir(
-        spec,
-        FLUX2_DEV_CONTROL_ID,
-        "a FLUX.2-dev snapshot directory",
-    )?;
-    let mut text_encoder = loader::load_text_encoder_dev(root)?;
-    if let Some(q) = spec.quantize {
-        text_encoder.quantize(q.bits())?;
-    }
-    Ok(Flux2TextOwned {
-        text_encoder,
-        vision_tower: None,
-        projector: None,
+fn load_control_text(
+    text_encoder_source: &gen_core::ValidatedEncoderSource,
+    text_encoder_load_time_quant_bits: Option<i32>,
+) -> Result<Flux2TextOwned> {
+    text_encoder_source.read_unchanged(|source| {
+        let mut text_encoder = loader::load_text_encoder_dev_from_source(source)?;
+        if let Some(bits) = text_encoder_load_time_quant_bits {
+            text_encoder.quantize(bits)?;
+        }
+        Ok(Flux2TextOwned {
+            text_encoder,
+            vision_tower: None,
+            projector: None,
+        })
     })
 }
 
@@ -567,23 +592,31 @@ mod tests {
     }
 
     // ── sc-10840: weight-free, default-run proof that the FLUX.2 control dispatch HONORS
-    // `offload_policy`. `build_control_residency` at a non-existent snapshot dir + a control checkpoint:
-    // `Sequential` defers (captures both loaders → `is_sequential`); `Resident` eager-loads the Mistral-3
-    // encoder from the missing dir → `Err`. The real-weight A/B is deferred (weights not on disk).
-    fn missing_snapshot_spec(policy: OffloadPolicy) -> LoadSpec {
-        LoadSpec::new(WeightsSource::Dir(
-            "/nonexistent/flux2-control-residency-test-snapshot".into(),
-        ))
-        .with_control(WeightsSource::File(
-            "/nonexistent/control.safetensors".into(),
-        ))
-        .with_offload_policy(policy)
+    // `offload_policy`. `build_control_residency` uses a validation-complete sparse encoder plus a
+    // missing control checkpoint: `Sequential` admits the encoder and defers payload loads;
+    // `Resident` eagerly materializes and fails. The real-weight A/B remains hosted.
+    fn validation_complete_snapshot_spec(
+        root: &std::path::Path,
+        policy: OffloadPolicy,
+    ) -> LoadSpec {
+        gen_core_testkit::write_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            crate::config::DEV_ENCODER_CONTRACT,
+        )
+        .unwrap();
+        LoadSpec::new(WeightsSource::Dir(root.to_path_buf()))
+            .with_control(WeightsSource::File(
+                "/nonexistent/control.safetensors".into(),
+            ))
+            .with_offload_policy(policy)
     }
 
     #[test]
     fn build_residency_sequential_defers_all_component_loads() {
-        let res = build_control_residency(&missing_snapshot_spec(OffloadPolicy::Sequential))
-            .expect("Sequential must defer loads and not touch the (missing) snapshot dir");
+        let fixture = tempfile::tempdir().unwrap();
+        let spec = validation_complete_snapshot_spec(fixture.path(), OffloadPolicy::Sequential);
+        let res = build_control_residency(&spec)
+            .expect("Sequential must validate the encoder and defer payload loads");
         assert!(
             res.is_sequential(),
             "Sequential policy must build a Sequential (deferred) residency"
@@ -592,7 +625,9 @@ mod tests {
 
     #[test]
     fn build_residency_resident_eager_loads_and_fails_on_missing_snapshot() {
-        let err = build_control_residency(&missing_snapshot_spec(OffloadPolicy::Resident))
+        let fixture = tempfile::tempdir().unwrap();
+        let spec = validation_complete_snapshot_spec(fixture.path(), OffloadPolicy::Resident);
+        let err = build_control_residency(&spec)
             .err()
             .expect("Resident must eager-load and fail on a missing snapshot dir");
         assert!(

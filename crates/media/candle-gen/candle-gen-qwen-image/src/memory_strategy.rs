@@ -47,16 +47,24 @@ fn cast_component_bytes(
     component: &str,
     validate_name: impl Fn(&str) -> gen_core::Result<()>,
 ) -> gen_core::Result<u64> {
+    let tensors = gen_core::weightsmeta::safetensors_path_tensor_headers(path)?;
+    cast_tensor_headers_bytes(&tensors, float_width, component, validate_name)
+}
+
+fn cast_tensor_headers_bytes(
+    tensors: &[gen_core::weightsmeta::SafetensorsTensorHeader],
+    float_width: u64,
+    component: &str,
+    validate_name: impl Fn(&str) -> gen_core::Result<()>,
+) -> gen_core::Result<u64> {
     use gen_core::weightsmeta::Dtype;
 
-    let tensors = gen_core::weightsmeta::safetensors_path_tensor_headers(path)?;
     if tensors.is_empty() {
         return Err(gen_core::Error::Msg(format!(
-            "qwen-image imported {component} '{}' contains no tensors",
-            path.display()
+            "qwen-image imported {component} contains no tensors"
         )));
     }
-    tensors.into_iter().try_fold(0_u64, |total, tensor| {
+    tensors.iter().try_fold(0_u64, |total, tensor| {
         validate_name(&tensor.name)?;
         let resident = match tensor.dtype {
             Dtype::U8 | Dtype::U32 | Dtype::I16 | Dtype::I32 | Dtype::I64 => tensor.data_bytes,
@@ -102,6 +110,12 @@ fn f32_component_bytes(path: &std::path::Path, component: &str) -> gen_core::Res
     cast_component_bytes(path, 4, component, |_| Ok(()))
 }
 
+fn selected_text_encoder_bytes(spec: &LoadSpec, base: &std::path::Path) -> gen_core::Result<u64> {
+    let selected = crate::ENCODER_CONTRACT.source_for_load(spec, base)?;
+    let tensors = selected.tensor_headers()?;
+    cast_tensor_headers_bytes(&tensors, 4, "selected text encoder", |_| Ok(()))
+}
+
 pub(crate) fn provider_contract(
     provider_id: &str,
     spec: &LoadSpec,
@@ -110,16 +124,20 @@ pub(crate) fn provider_contract(
         crate::validate_load_spec(spec)?;
     }
     let streamable = streamable(spec);
+    let base = gen_core::require_base_snapshot(spec, provider_id)?;
     let components = match &spec.weights {
-        WeightsSource::Dir(_) => PerComponentBytes::from_spec_subdirs(
-            spec,
-            &["text_encoder"],
-            &["transformer"],
-            &["vae"],
-        )
-        .unwrap_or_default(),
+        WeightsSource::Dir(_) => {
+            let mut components = PerComponentBytes::from_spec_subdirs(
+                spec,
+                &["text_encoder"],
+                &["transformer"],
+                &["vae"],
+            )
+            .unwrap_or_default();
+            components.text_encoder = selected_text_encoder_bytes(spec, base)?;
+            components
+        }
         WeightsSource::File(path) => {
-            let base = gen_core::require_base_snapshot(spec, provider_id)?;
             let vae = match spec.components.get(gen_core::COMFYUI_VAE_COMPONENT) {
                 Some(WeightsSource::Dir(path)) => f32_component_bytes(path, "VAE")?,
                 Some(WeightsSource::File(path)) => {
@@ -128,7 +146,7 @@ pub(crate) fn provider_contract(
                 None => f32_component_bytes(&base.join("vae"), "base VAE")?,
             };
             PerComponentBytes {
-                text_encoder: f32_component_bytes(&base.join("text_encoder"), "base text encoder")?,
+                text_encoder: selected_text_encoder_bytes(spec, base)?,
                 dit: spec.read_file_unchanged_if_prepared(path, imported_dit_bytes)?,
                 vae,
             }
@@ -644,13 +662,12 @@ mod tests {
 
     fn file_spec(tmp: &tempfile::TempDir) -> LoadSpec {
         let root = tmp.path().join("base");
-        for component in ["text_encoder", "vae"] {
-            std::fs::create_dir_all(root.join(component)).unwrap();
-        }
-        write_typed_safetensors(
-            &root.join("text_encoder/model.safetensors"),
-            &[("model.layer.weight", "F16", &[2], 4)],
-        );
+        gen_core_testkit::write_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            crate::ENCODER_CONTRACT,
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("vae")).unwrap();
         write_typed_safetensors(
             &root.join("vae/model.safetensors"),
             &[("decoder.weight", "BF16", &[3], 6)],
@@ -675,10 +692,28 @@ mod tests {
             WeightsSource::File(vae),
         );
         let contract = provider_contract("qwen_image", &spec).unwrap();
-        assert_eq!(contract.asset_facts.conditioning_bytes, 2 * 4);
+        let encoder = crate::ENCODER_CONTRACT;
+        let attention = encoder.num_attention_heads * encoder.head_dim;
+        let kv = encoder.num_key_value_heads * encoder.head_dim;
+        let per_layer = attention * encoder.hidden_size
+            + 2 * kv * encoder.hidden_size
+            + encoder.hidden_size * attention
+            + 2 * encoder.intermediate_size * encoder.hidden_size
+            + encoder.hidden_size * encoder.intermediate_size
+            + 2 * encoder.hidden_size
+            + attention
+            + 2 * kv;
+        let conditioning_elements = encoder.vocab_size * encoder.hidden_size
+            + encoder.num_hidden_layers * per_layer
+            + encoder.hidden_size;
+        let conditioning_bytes = (conditioning_elements as u64) * 4;
+        assert_eq!(contract.asset_facts.conditioning_bytes, conditioning_bytes);
         assert_eq!(contract.asset_facts.transformer_bytes, 2 * 4 * 2);
         assert_eq!(contract.asset_facts.decoder_bytes, 5 * 4);
-        assert_eq!(contract.asset_facts.base_bytes, 44);
+        assert_eq!(
+            contract.asset_facts.base_bytes,
+            conditioning_bytes + 2 * 4 * 2 + 5 * 4
+        );
     }
 
     #[test]
@@ -722,7 +757,13 @@ mod tests {
         identity.identity = Some(gen_core::IdentityWeights::default());
         cases.push(("identity", identity));
         let mut external_te = valid.clone();
-        external_te.text_encoder = Some(WeightsSource::Dir(tmp.path().join("external-te")));
+        let external_te_root = tmp.path().join("external-te");
+        gen_core_testkit::write_encoder_contract_fixture(
+            &external_te_root,
+            crate::ENCODER_CONTRACT,
+        )
+        .unwrap();
+        external_te.text_encoder = Some(WeightsSource::Dir(external_te_root));
         cases.push(("external-text-encoder", external_te));
         let mut unknown = valid.clone();
         unknown.components.insert(
@@ -748,7 +789,12 @@ mod tests {
 
     fn spec(tmp: &tempfile::TempDir) -> LoadSpec {
         let root = tmp.path().join("qwen-candle-memory-spec");
-        for component in ["text_encoder", "transformer", "vae"] {
+        gen_core_testkit::write_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            crate::ENCODER_CONTRACT,
+        )
+        .unwrap();
+        for component in ["transformer", "vae"] {
             let dir = root.join(component);
             std::fs::create_dir_all(&dir).unwrap();
             write_control(&dir.join("model.safetensors"));
@@ -756,6 +802,20 @@ mod tests {
         LoadSpec::new(WeightsSource::Dir(root.clone()))
             .with_offload_policy(gen_core::OffloadPolicy::Sequential)
             .with_load_shape(LoadShape::DeferredMaterialization)
+    }
+
+    #[test]
+    fn selected_encoder_pricing_ignores_nested_safetensors_that_the_loader_does_not_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = spec(&tmp);
+        let root = gen_core::require_base_snapshot(&spec, "qwen_image").unwrap();
+        let baseline = selected_text_encoder_bytes(&spec, root).unwrap();
+
+        let nested = root.join("text_encoder/nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        write_control(&nested.join("not-a-direct-shard.safetensors"));
+
+        assert_eq!(selected_text_encoder_bytes(&spec, root).unwrap(), baseline);
     }
 
     fn selection(strategy: MemoryStrategy) -> MemorySelection {
@@ -833,6 +893,11 @@ mod tests {
         std::fs::write(
             transformer.join("config.json"),
             br#"{"quantization":{"group_size":64,"bits":4}}"#,
+        )
+        .unwrap();
+        gen_core_testkit::write_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            crate::ENCODER_CONTRACT,
         )
         .unwrap();
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));

@@ -51,6 +51,7 @@ fn real_weight_edit() {
     let t0 = std::time::Instant::now();
     let model = QwenEdit::load(&QwenEditPaths {
         root: env_path("QWEN_EDIT_BASE"),
+        text_encoder: None,
         adapters: vec![],
         offload_policy: OffloadPolicy::Resident,
     })
@@ -177,6 +178,7 @@ fn high_res_edit_avoids_i32_overflow() {
     let reference = read_ppm(&env_path("QWEN_EDIT_REF"));
     let model = QwenEdit::load(&QwenEditPaths {
         root: env_path("QWEN_EDIT_BASE"),
+        text_encoder: None,
         adapters: vec![],
         offload_policy: OffloadPolicy::Resident,
     })
@@ -235,6 +237,7 @@ fn lightning_edit_4steps() {
     let t0 = std::time::Instant::now();
     let model = QwenEdit::load(&QwenEditPaths {
         root: env_path("QWEN_EDIT_BASE"),
+        text_encoder: None,
         adapters: vec![AdapterSpec::new(lora, 1.0, AdapterKind::Lora)],
         offload_policy: OffloadPolicy::Resident,
     })

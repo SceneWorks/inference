@@ -50,6 +50,7 @@ pub const MODEL_ID: &str = "z_image_control";
 /// `Reference` (an optional img2img init — the fork's `generate_image` accepts both).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: Some(crate::ENCODER_CONTRACT),
         denoiser_output_latent_space: Some(&mlx_gen::gen_core::FLUX1_LATENT_SPACE),
         control_kinds: Some(accepted_kinds()),
         required_components: &[],
@@ -506,27 +507,29 @@ mod tests {
     // A `Sequential → Resident` regression (the exact F-172 bug this seam fixed) would eager-load under
     // the Sequential request and fail the first assertion. The real-weight A/B in
     // `tests/sequential_residency_real_weights.rs` is `#[ignore]`d; this runs by default.
-    fn missing_control_spec(policy: OffloadPolicy) -> LoadSpec {
-        LoadSpec::new(WeightsSource::Dir(
+    fn missing_control_spec(policy: OffloadPolicy) -> (tempfile::TempDir, LoadSpec) {
+        let encoder = tempfile::tempdir().expect("encoder fixture dir");
+        gen_core_testkit::write_encoder_contract_fixture(encoder.path(), crate::ENCODER_CONTRACT)
+            .expect("valid encoder contract fixture");
+        let spec = LoadSpec::new(WeightsSource::Dir(
             "/nonexistent/z-image-base-control-residency-test-base".into(),
         ))
+        .with_text_encoder(WeightsSource::Dir(encoder.path().to_path_buf()))
         .with_control(WeightsSource::File(
             "/nonexistent/z-image-base-control-residency-test-overlay.safetensors".into(),
         ))
-        .with_offload_policy(policy)
+        .with_offload_policy(policy);
+        (encoder, spec)
     }
 
     #[test]
     fn build_control_residency_defers_for_both_legacy_offload_values() {
         for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
-            let res = crate::model_control::build_control_residency(
-                &missing_control_spec(policy),
-                MODEL_ID,
-                PRECISION_MSG,
-            )
-            .unwrap_or_else(|error| {
-                panic!("{policy:?} must defer and ignore the missing snapshot: {error}")
-            });
+            let (_encoder, spec) = missing_control_spec(policy);
+            let res = crate::model_control::build_control_residency(&spec, MODEL_ID, PRECISION_MSG)
+                .unwrap_or_else(|error| {
+                    panic!("{policy:?} must defer and ignore the missing snapshot: {error}")
+                });
             assert!(
                 res.with_resident_parts(|_, _| ()).unwrap().is_none(),
                 "{policy:?} must begin with no warm request-scoped pair"

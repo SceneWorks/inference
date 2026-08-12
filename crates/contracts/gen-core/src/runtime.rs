@@ -23,6 +23,14 @@ pub const COMFYUI_TEXT_ENCODER_COMPONENT: &str = "comfyui_text_encoder";
 /// Optional in-place ComfyUI VAE file paired with a single-file DiT.
 pub const COMFYUI_VAE_COMPONENT: &str = "comfyui_vae";
 
+/// Candle Krea's optional community INT8-ConvRot DiT checkpoint.
+///
+/// This is a DiT replacement, not a text encoder. Older Krea loads overloaded
+/// [`LoadSpec::text_encoder`] with this file; keeping it in the named component map preserves the
+/// provider-specific optionality while leaving the typed text-encoder slot available for its declared
+/// purpose.
+pub const KREA_CONVROT_DIT_COMPONENT: &str = "krea_convrot_dit";
+
 /// Where a model's weights come from — **always a local, already-provisioned path**. There is
 /// deliberately **no** hub-fetch variant: inference never self-fetches weights and has no knowledge
 /// of any download cache (epic 13657). A consumer resolves and stages every path — the base
@@ -1076,6 +1084,12 @@ impl LoadSpec {
     /// Builder-style quantization override.
     pub fn with_quant(mut self, quant: Quant) -> Self {
         self.quantize = Some(quant);
+        self
+    }
+
+    /// Builder-style external text-encoder substitution.
+    pub fn with_text_encoder(mut self, text_encoder: WeightsSource) -> Self {
+        self.text_encoder = Some(text_encoder);
         self
     }
 

@@ -58,7 +58,7 @@ use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
 use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::{
     self, AdapterSpec, CancelFlag, Conditioning, GenerationRequest, Image, LoadPhase, PidWeights,
-    Progress,
+    Progress, WeightsSource,
 };
 // Shared per-image batch seed (`base + index`) — one home in `candle-gen` (sc-9043 / F-059).
 use candle_gen::{CandleError, Result};
@@ -289,12 +289,36 @@ pub(crate) fn base_scheduler_config() -> SchedulerConfig {
     }
 }
 
+#[derive(Clone)]
+enum TextEncoderSource {
+    #[cfg(test)]
+    Trusted(WeightsSource),
+    Validated(Box<gen_core::ValidatedEncoderSource>),
+}
+
+impl TextEncoderSource {
+    fn read_unchanged<T>(&self, read: impl FnOnce(&WeightsSource) -> Result<T>) -> Result<T> {
+        match self {
+            #[cfg(test)]
+            Self::Trusted(source) => read(source),
+            Self::Validated(source) => source
+                .read_unchanged(read)
+                .map_err(|error| CandleError::Msg(error.to_string())),
+        }
+    }
+}
+
 /// A txt2img pipeline handle: the snapshot `root` + the compute device/dtype (bf16) + any LoRA/LoKr
 /// adapters to merge into the DiT at component-load time (sc-5166). Loading the heavy components is
 /// done by [`load_components`](Self::load_components) and owned/cached by the generator, mirroring
 /// the SDXL provider's lazy split.
 pub(crate) struct Pipeline {
     root: PathBuf,
+    /// Contract-validated external or snapshot encoder component. `None` is reserved for a fused
+    /// ComfyUI checkpoint whose encoder tensors are split from the primary file in memory.
+    text_encoder_source: Option<TextEncoderSource>,
+    /// Exact base tokenizer identity retained across lazy/request-time component construction.
+    tokenizer_source: Option<gen_core::ValidatedTokenizerSource>,
     device: Device,
     dtype: DType,
     /// Adapters merged into the DiT weights at load. Empty ⇒ the stock mmap build (zero regression).
@@ -421,6 +445,7 @@ impl Pipeline {
     /// Build the (light) pipeline handle for the Z-Image snapshot `root` at the given device/dtype,
     /// with `adapters` to merge into the DiT. Does **no** weight I/O — components load lazily via
     /// [`load_components`](Self::load_components).
+    #[cfg(test)]
     pub(crate) fn load(
         root: &Path,
         device: &Device,
@@ -430,6 +455,31 @@ impl Pipeline {
     ) -> Self {
         Self {
             root: root.to_path_buf(),
+            text_encoder_source: Some(TextEncoderSource::Trusted(WeightsSource::Dir(
+                root.join("text_encoder"),
+            ))),
+            tokenizer_source: None,
+            device: device.clone(),
+            dtype,
+            adapters: adapters.to_vec(),
+            pid_spec,
+            comfyui: None,
+        }
+    }
+
+    pub(crate) fn load_with_text_encoder(
+        root: &Path,
+        text_encoder_source: gen_core::ValidatedEncoderSource,
+        device: &Device,
+        dtype: DType,
+        adapters: &[AdapterSpec],
+        pid_spec: Option<PidWeights>,
+    ) -> Self {
+        let tokenizer_source = text_encoder_source.tokenizer_source().cloned();
+        Self {
+            root: root.to_path_buf(),
+            text_encoder_source: Some(TextEncoderSource::Validated(Box::new(text_encoder_source))),
+            tokenizer_source,
             device: device.clone(),
             dtype,
             adapters: adapters.to_vec(),
@@ -443,8 +493,10 @@ impl Pipeline {
     /// loads verbatim, all at first [`load_components`](Self::load_components). `root` is set to the
     /// sources' `tokenizer_dir` so [`common::build_tokenizer`] finds `tokenizer/tokenizer.json`. Does no
     /// weight I/O here. Dense-only (no packed tier / adapters / PiD).
-    pub(crate) fn load_comfyui(
+    pub(crate) fn load_comfyui_with_text_encoder(
         sources: std::sync::Arc<crate::comfyui::ComfyuiSources>,
+        text_encoder_source: Option<gen_core::ValidatedEncoderSource>,
+        tokenizer_source: gen_core::ValidatedTokenizerSource,
         device: &Device,
         dtype: DType,
         adapters: &[AdapterSpec],
@@ -452,6 +504,9 @@ impl Pipeline {
     ) -> Self {
         Self {
             root: sources.tokenizer_dir.clone(),
+            text_encoder_source: text_encoder_source
+                .map(|source| TextEncoderSource::Validated(Box::new(source))),
+            tokenizer_source: Some(tokenizer_source),
             device: device.clone(),
             dtype,
             adapters: adapters.to_vec(),
@@ -463,27 +518,15 @@ impl Pipeline {
     /// Load only the tokenizer + Qwen3 text encoder. This is the first sequential-residency phase and
     /// is also reused by the resident aggregate loader so both policies build identical components.
     pub(crate) fn load_text_phase(&self) -> Result<TextPhase> {
-        let text_encoder = if let Some(sources) = &self.comfyui {
-            let map = crate::comfyui::normalize_fp8_map(
-                sources.text_encoder_map()?,
-                self.dtype,
-                "z-image text encoder",
-            )?;
-            TextEnc::Dense(Box::new(ZImageTextEncoder::new(
-                &TextEncoderConfig::z_image(),
-                VarBuilder::from_tensors(map, self.dtype, &self.device),
-            )?))
-        } else if self.component_is_packed("text_encoder")? {
-            let vb = self.component_vb("text_encoder")?;
-            TextEnc::Packed(Box::new(PackedTe::new(&TextEncoderConfig::z_image(), vb)?))
-        } else {
-            let vb = self.component_vb("text_encoder")?;
-            TextEnc::Dense(Box::new(ZImageTextEncoder::new(
-                &TextEncoderConfig::z_image(),
-                vb,
-            )?))
-        };
-        let tokenizer = common::build_tokenizer(&self.root, "z-image")?;
+        let tokenizer_source = self.tokenizer_source.as_ref().ok_or_else(|| {
+            CandleError::Msg(
+                "z-image tokenizer parsing requires a retained validation receipt".into(),
+            )
+        })?;
+        let tokenizer = common::build_tokenizer(tokenizer_source, "z-image")?;
+        // Tokenizer identity is part of the selected encoder contract. Parse it before opening any
+        // tensor payload so a post-validation tokenizer replacement fails at the cheap receipt gate.
+        let text_encoder = self.load_text_encoder_component()?;
         Ok(TextPhase {
             text_encoder,
             tokenizer,
@@ -674,16 +717,7 @@ impl Pipeline {
         // forces a full dense build.
         let packed = self.component_is_packed("transformer")?;
 
-        let text_encoder = if self.component_is_packed("text_encoder")? {
-            let vb = self.component_vb("text_encoder")?;
-            TextEnc::Packed(Box::new(PackedTe::new(&TextEncoderConfig::z_image(), vb)?))
-        } else {
-            let vb = self.component_vb("text_encoder")?;
-            TextEnc::Dense(Box::new(ZImageTextEncoder::new(
-                &TextEncoderConfig::z_image(),
-                vb,
-            )?))
-        };
+        let text_encoder = self.load_text_encoder_component()?;
 
         let mut dit_cfg = DitConfig::z_image_turbo();
         dit_cfg.set_use_accelerated_attn(use_accelerated_attn);
@@ -721,7 +755,12 @@ impl Pipeline {
             AutoEncoderKL::new(&VaeConfig::z_image(), self.component_vb("vae")?)?
         };
 
-        let tokenizer = common::build_tokenizer(&self.root, "z-image")?;
+        let tokenizer_source = self.tokenizer_source.as_ref().ok_or_else(|| {
+            CandleError::Msg(
+                "z-image tokenizer parsing requires a retained validation receipt".into(),
+            )
+        })?;
+        let tokenizer = common::build_tokenizer(tokenizer_source, "z-image")?;
         // Load the optional PiD super-resolving decoder once (epic 7840 / sc-7853) when the caller
         // opted in via `LoadSpec::pid`; Z-Image aliases the FLUX.1 latent space (`zimage-turbo` → the
         // shared `flux` student).
@@ -768,6 +807,87 @@ impl Pipeline {
             tokenizer: Arc::new(text.tokenizer),
             pid,
         })
+    }
+
+    fn load_text_encoder_component(&self) -> Result<TextEnc> {
+        let Some(source) = self.text_encoder_source.as_ref() else {
+            let sources = self.comfyui.as_ref().ok_or_else(|| {
+                CandleError::Msg("z-image text encoder source is unavailable".into())
+            })?;
+            let map = crate::comfyui::normalize_fp8_map(
+                sources.text_encoder_map()?,
+                self.dtype,
+                "z-image text encoder",
+            )?;
+            return Ok(TextEnc::Dense(Box::new(ZImageTextEncoder::new(
+                &TextEncoderConfig::z_image(),
+                VarBuilder::from_tensors(map, self.dtype, &self.device),
+            )?)));
+        };
+
+        source.read_unchanged(|source| self.load_text_encoder_from_source(source))
+    }
+
+    fn load_text_encoder_from_source(&self, source: &WeightsSource) -> Result<TextEnc> {
+        if self.text_encoder_is_packed(source)? {
+            return Ok(TextEnc::Packed(Box::new(PackedTe::new(
+                &TextEncoderConfig::z_image(),
+                self.text_encoder_vb(source, false)?,
+            )?)));
+        }
+        Ok(TextEnc::Dense(Box::new(ZImageTextEncoder::new(
+            &TextEncoderConfig::z_image(),
+            self.text_encoder_vb(source, true)?,
+        )?)))
+    }
+
+    fn text_encoder_is_packed(&self, source: &WeightsSource) -> Result<bool> {
+        let config = match source {
+            WeightsSource::Dir(path) => path.join("config.json"),
+            WeightsSource::File(path) => path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("config.json"),
+        };
+        let text = match std::fs::read_to_string(&config) {
+            Ok(text) => text,
+            Err(ref error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(CandleError::Msg(format!(
+                    "z-image: read {}: {error}",
+                    config.display()
+                )))
+            }
+        };
+        let value: serde_json::Value = serde_json::from_str(&text).map_err(|error| {
+            CandleError::Msg(format!(
+                "z-image: parse {} (corrupt encoder?): {error}",
+                config.display()
+            ))
+        })?;
+        Ok(candle_gen::quant::PackedConfig::from_config(&value).is_some())
+    }
+
+    fn text_encoder_vb(
+        &self,
+        source: &WeightsSource,
+        normalize_dense_file: bool,
+    ) -> Result<VarBuilder<'static>> {
+        match source {
+            WeightsSource::Dir(path) => {
+                let files = candle_gen::sorted_safetensors(path, "z-image text encoder")?;
+                candle_gen::mmap_var_builder(&files, self.dtype, &self.device)
+            }
+            WeightsSource::File(path) if normalize_dense_file => {
+                let map = candle_gen::candle_core::safetensors::load(path, &Device::Cpu)?;
+                let map =
+                    crate::comfyui::normalize_fp8_map(map, self.dtype, "z-image text encoder")?;
+                Ok(VarBuilder::from_tensors(map, self.dtype, &self.device))
+            }
+            WeightsSource::File(path) => {
+                candle_gen::mmap_var_builder(std::slice::from_ref(path), self.dtype, &self.device)
+            }
+        }
     }
 
     /// Whether the snapshot component `sub/` is a **pre-quantized MLX-packed tier** — its `config.json`
@@ -1654,6 +1774,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn deferred_text_phase_rejects_tokenizer_replacement_before_encoder_open() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        gen_core_testkit::write_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            crate::ENCODER_CONTRACT,
+        )
+        .unwrap();
+        let spec = gen_core::LoadSpec::new(WeightsSource::Dir(root.to_path_buf()));
+        let source = crate::ENCODER_CONTRACT
+            .source_for_load(&spec, root)
+            .unwrap();
+        let pipeline =
+            Pipeline::load_with_text_encoder(root, source, &Device::Cpu, DType::F32, &[], None);
+        let tokenizer = root.join("tokenizer/tokenizer.json");
+        let replacement = root.join("tokenizer/replacement.json");
+        std::fs::copy(&tokenizer, &replacement).unwrap();
+        std::fs::rename(replacement, tokenizer).unwrap();
+
+        let error = pipeline
+            .load_text_phase()
+            .err()
+            .expect("request-time parse must reject the replaced tokenizer")
+            .to_string();
+        assert!(error.contains("pinned weights"), "{error}");
+    }
+
+    #[test]
     fn bounded_host_transfer_uses_spatial_rows_and_reassembles_exactly() {
         let values = (0..256).map(|value| value as f32).collect::<Vec<_>>();
         let latents = Tensor::from_vec(values.clone(), (1, 1, 1, 128, 2), &Device::Cpu).unwrap();
@@ -2033,7 +2181,7 @@ mod tests {
         let root = std::path::Path::new(&snap);
         // The shared tokenizer (`common::build_tokenizer`) with the shared config — the same seam the
         // three entry points now use (sc-9002).
-        let tok = common::build_tokenizer(root, "z-image").expect("load tokenizer.json");
+        let tok = common::build_tokenizer_from_base(root, "z-image").expect("load tokenizer.json");
 
         // The trap: an empty prompt short-circuits to (1, 0) BEFORE the chat template is applied.
         assert!(
@@ -2058,7 +2206,7 @@ mod tests {
 
         // sc-8991 / F-011: the cached tokenizer must yield the SAME ids as a fresh `from_file` load —
         // caching removes the re-parse, never changes tokenization. Cover a real prompt + empty uncond.
-        let fresh = common::build_tokenizer(root, "z-image").expect("fresh tokenizer");
+        let fresh = common::build_tokenizer_from_base(root, "z-image").expect("fresh tokenizer");
         assert_eq!(
             common::uncond_ids(&tok, "", "z-image").unwrap(),
             common::uncond_ids(&fresh, "", "z-image").unwrap(),
