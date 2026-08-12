@@ -100,7 +100,7 @@ fn registered_reference_img2img_uses_the_vae_init_and_strength_tail() {
         .expect("load Kolors");
     let reference = structured_reference(SIZE);
     let base = GenerationRequest {
-        prompt: "replace the flat landscape with a large red fox made of stained glass, while \
+        prompt: "transform the flat landscape into intricate stained-glass artwork while \
                  preserving the rolling green hills and golden sun"
             .into(),
         negative_prompt: Some("blurry, flat, watermark, text".into()),
