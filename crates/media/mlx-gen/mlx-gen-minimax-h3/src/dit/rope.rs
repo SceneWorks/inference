@@ -105,7 +105,9 @@ impl MmRope {
 
         // freqs[s, axis, i] = pos[s, axis] · inv_freq[i]
         let inv = Array::from_slice(&self.inv_freq, &[1, 1, f]);
-        let pos = position_ids.as_dtype(Dtype::Float32)?.reshape(&[seq, 3, 1])?;
+        let pos = position_ids
+            .as_dtype(Dtype::Float32)?
+            .reshape(&[seq, 3, 1])?;
         // `unbind(1)` then `cat(t, h, w)` is exactly a `[seq, 3·F]` row-major flatten of axis 1,
         // because the axes are already stored in `(t, h, w)` order.
         let freqs = multiply(&pos, &inv)?.reshape(&[seq, 3 * f])?;
@@ -143,8 +145,14 @@ impl MmRope {
         }
 
         // `[seq, rotary]` -> `[1, seq, 1, rotary]`, broadcasting over batch and heads.
-        let cos_t = tables.cos.as_dtype(x.dtype())?.reshape(&[1, seq, 1, rotary])?;
-        let sin_t = tables.sin.as_dtype(x.dtype())?.reshape(&[1, seq, 1, rotary])?;
+        let cos_t = tables
+            .cos
+            .as_dtype(x.dtype())?
+            .reshape(&[1, seq, 1, rotary])?;
+        let sin_t = tables
+            .sin
+            .as_dtype(x.dtype())?
+            .reshape(&[1, seq, 1, rotary])?;
 
         let head = slice_axis(x, 3, 0, rotary)?;
         let half = rotary / 2;
@@ -187,7 +195,10 @@ mod tests {
         let c: Vec<f32> = t.cos.as_slice::<f32>().to_vec();
         assert!((c[0] - 1.0f32.cos()).abs() < 1e-6, "inv_freq[0] must be 1");
         let last = 10_000f32.powf(-15.0 / 16.0);
-        assert!((c[15] - last.cos()).abs() < 1e-6, "inv_freq[15] = theta^(-15/16)");
+        assert!(
+            (c[15] - last.cos()).abs() < 1e-6,
+            "inv_freq[15] = theta^(-15/16)"
+        );
     }
 
     /// **The axis split.** Channels `[0,F)` are `t`, `[F,2F)` are `h`, `[2F,3F)` are `w`, and
@@ -198,10 +209,7 @@ mod tests {
         let f = 4;
         let rope = MmRope::new(f, 100.0).unwrap();
         // Three rows, each with a single non-zero axis: t=1, h=1, w=1.
-        let ids = Array::from_slice(
-            &[1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
-            &[3, 3],
-        );
+        let ids = Array::from_slice(&[1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], &[3, 3]);
         let tables = rope.tables(&ids, Dtype::Float32).unwrap();
         assert_eq!(tables.cos.shape(), &[3, 6 * f]);
         let sin_v: Vec<f32> = tables.sin.as_slice::<f32>().to_vec();
@@ -287,7 +295,10 @@ mod tests {
         let out = rope.apply(&x, &tables).unwrap();
         let a: f32 = x.square().unwrap().sum(None).unwrap().item();
         let b: f32 = out.square().unwrap().sum(None).unwrap().item();
-        assert!((a - b).abs() / a < 1e-4, "rotary must preserve norm: {a} vs {b}");
+        assert!(
+            (a - b).abs() / a < 1e-4,
+            "rotary must preserve norm: {a} vs {b}"
+        );
     }
 
     /// A tables/sequence length mismatch is an error, not a broadcast that silently reuses row 0.

@@ -125,8 +125,14 @@ mod tests {
         let [q, k, v] = split_thirds(&reordered, heads, head_dim).unwrap();
         // q_all is every head's `j = 0` rows, in head order.
         assert_eq!(q.as_slice::<f32>(), &[0.0, 1.0, 100.0, 101.0, 200.0, 201.0]);
-        assert_eq!(k.as_slice::<f32>(), &[10.0, 11.0, 110.0, 111.0, 210.0, 211.0]);
-        assert_eq!(v.as_slice::<f32>(), &[20.0, 21.0, 120.0, 121.0, 220.0, 221.0]);
+        assert_eq!(
+            k.as_slice::<f32>(),
+            &[10.0, 11.0, 110.0, 111.0, 210.0, 211.0]
+        );
+        assert_eq!(
+            v.as_slice::<f32>(),
+            &[20.0, 21.0, 120.0, 121.0, 220.0, 221.0]
+        );
     }
 
     /// **The reason this module exists.** The composed pipeline agrees with the video VAE's
@@ -154,8 +160,16 @@ mod tests {
         let wrong_thirds = split_thirds(&raw, heads, head_dim).unwrap();
         let wrong_gather = split_interleaved(&reordered, heads, head_dim).unwrap();
         for i in 0..3 {
-            assert_eq!(wrong_thirds[i].shape(), via_thirds[i].shape(), "shape-identical");
-            assert_eq!(wrong_gather[i].shape(), via_thirds[i].shape(), "shape-identical");
+            assert_eq!(
+                wrong_thirds[i].shape(),
+                via_thirds[i].shape(),
+                "shape-identical"
+            );
+            assert_eq!(
+                wrong_gather[i].shape(),
+                via_thirds[i].shape(),
+                "shape-identical"
+            );
             assert_ne!(
                 wrong_thirds[i].as_slice::<f32>(),
                 via_thirds[i].as_slice::<f32>(),

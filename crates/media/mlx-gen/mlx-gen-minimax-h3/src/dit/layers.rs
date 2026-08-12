@@ -32,7 +32,7 @@ impl LinearNoBias {
     }
 
     pub fn forward(&self, x: &Array) -> Result<Array> {
-        Ok(mlx_rs::ops::matmul(x, &self.weight.t())?)
+        Ok(mlx_rs::ops::matmul(x, self.weight.t())?)
     }
 
     pub fn names(prefix: &str) -> [String; 1] {
@@ -88,8 +88,12 @@ impl DitAttention {
             }
             Ok(())
         };
-        let norm_q = w.require(&format!("{prefix}.norm_q.weight"))?.as_dtype(dtype)?;
-        let norm_k = w.require(&format!("{prefix}.norm_k.weight"))?.as_dtype(dtype)?;
+        let norm_q = w
+            .require(&format!("{prefix}.norm_q.weight"))?
+            .as_dtype(dtype)?;
+        let norm_k = w
+            .require(&format!("{prefix}.norm_k.weight"))?
+            .as_dtype(dtype)?;
         // A qk-norm sized to the projection rather than to a head is the plausible wrong shape,
         // and it broadcasts silently against `[B, S, H, D]` only when it is `[D]`.
         expect(&norm_q, &[cfg.attention_head_dim], "norm_q")?;
@@ -119,11 +123,7 @@ impl DitAttention {
     }
 
     /// `rope` is `None` for the token refiner, which runs **without** any positional embedding.
-    pub fn forward(
-        &self,
-        x: &Array,
-        rope: Option<(&MmRope, &MmRopeTables)>,
-    ) -> Result<Array> {
+    pub fn forward(&self, x: &Array, rope: Option<(&MmRope, &MmRopeTables)>) -> Result<Array> {
         let s = x.shape();
         if s.len() != 3 {
             return Err(Error::Msg(format!(
@@ -156,7 +156,9 @@ impl DitAttention {
         let scale = 1.0 / (d as f32).sqrt();
         let out = scaled_dot_product_attention(&qh, &kh, &vh, scale, None, None)?;
 
-        let out = out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, seq, h * d])?;
+        let out = out
+            .transpose_axes(&[0, 2, 1, 3])?
+            .reshape(&[b, seq, h * d])?;
         self.to_out.forward(&out)
     }
 }
@@ -204,12 +206,7 @@ pub struct RmsNorm {
 }
 
 impl RmsNorm {
-    pub fn from_weights(
-        w: &mut Weights,
-        prefix: &str,
-        eps: f32,
-        dtype: Dtype,
-    ) -> Result<Self> {
+    pub fn from_weights(w: &mut Weights, prefix: &str, eps: f32, dtype: Dtype) -> Result<Self> {
         Ok(Self {
             weight: w.require(&format!("{prefix}.weight"))?.as_dtype(dtype)?,
             eps,

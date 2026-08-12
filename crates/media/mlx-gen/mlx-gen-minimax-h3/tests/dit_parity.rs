@@ -50,9 +50,14 @@ use mlx_gen_minimax_h3::{
 
 const TOL: f32 = 1e-2;
 
-/// Mutation checks must clear the numeric noise floor by a wide margin, or "the output moved" is
-/// just reduced-precision jitter. The measured parity residual here is ~1e-3, so 1e-2 is 10×
-/// above it. Every probe prints its measured value.
+/// Mutation checks must clear the numeric noise floor, or "the output moved" is just
+/// reduced-precision jitter.
+///
+/// The measured residuals are rope 1e-7, adaln 8e-4, refiner 2e-3, attention 3e-3, full block
+/// 4e-3, so this sits ~2.4× over the deepest one — a narrower margin than the usual 10×, which is
+/// why `parity_residuals_bound_the_mutation_floor` re-measures the whole ladder on every run and
+/// fails if it ever closes. The mutations themselves all land at ≥1e-1, i.e. ≥24× the residual,
+/// and every probe prints its measured value.
 const MUTATION_FLOOR: f32 = 1e-2;
 
 fn fixture() -> Weights {
@@ -79,7 +84,13 @@ fn indices(f: &Weights, key: &str) -> Array {
 }
 
 fn block(w: &mut Weights, cfg: &MiniMaxH3DitConfig, index: i32) -> DitBlock {
-    DitBlock::from_weights(w, &format!("transformer_blocks.{index}"), cfg, Dtype::Float32).unwrap()
+    DitBlock::from_weights(
+        w,
+        &format!("transformer_blocks.{index}"),
+        cfg,
+        Dtype::Float32,
+    )
+    .unwrap()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -101,8 +112,18 @@ fn mm_rope_tables_match_the_reference() {
     let tables = rope
         .tables(f.require("layout.position_ids").unwrap(), Dtype::Float32)
         .unwrap();
-    assert_parity(&tables.cos, f.require("out.rope_cos").unwrap(), TOL, "rope cos");
-    assert_parity(&tables.sin, f.require("out.rope_sin").unwrap(), TOL, "rope sin");
+    assert_parity(
+        &tables.cos,
+        f.require("out.rope_cos").unwrap(),
+        TOL,
+        "rope cos",
+    );
+    assert_parity(
+        &tables.sin,
+        f.require("out.rope_sin").unwrap(),
+        TOL,
+        "rope sin",
+    );
 }
 
 /// **The `(t, h, w)` axis split, against reference bytes.** Rebuilding the tables from a grid whose
@@ -170,7 +191,9 @@ fn the_packed_position_grid_matches_the_reference() {
         )
         .unwrap(),
     );
-    rows.extend(positions::video_position_ids(l.num_text_tokens, l.num_latent_frames, &frame).unwrap());
+    rows.extend(
+        positions::video_position_ids(l.num_text_tokens, l.num_latent_frames, &frame).unwrap(),
+    );
 
     let got = positions::to_array(&rows, Dtype::Float32).unwrap();
     let want = f.require("layout.position_ids").unwrap();
@@ -207,7 +230,9 @@ fn the_packed_position_grid_matches_the_reference() {
     println!(
         "  audio rows: t={:?} w-extremes=({:.4}, {:.4}); interior width points {:?} are unused by \
          audio",
-        (0..audio_rows).map(|r| w[audio_start + r * 3]).collect::<Vec<_>>(),
+        (0..audio_rows)
+            .map(|r| w[audio_start + r * 3])
+            .collect::<Vec<_>>(),
         width[0],
         width.last().unwrap(),
         &width[1..width.len() - 1],
@@ -226,9 +251,13 @@ fn a_plausible_wrong_audio_convention_is_distinguishable() {
     let (_, width) =
         positions::frame_grid(l.latent_height, l.latent_width, patch_h, patch_w).unwrap();
 
-    let correct =
-        positions::audio_position_ids(l.num_text_tokens, l.num_audio_latents, l.audio_channels, &width)
-            .unwrap();
+    let correct = positions::audio_position_ids(
+        l.num_text_tokens,
+        l.num_audio_latents,
+        l.audio_channels,
+        &width,
+    )
+    .unwrap();
 
     // (a) w = 0 everywhere.
     let zeroed: Vec<[f64; 3]> = correct.iter().map(|r| [r[0], r[1], 0.0]).collect();
@@ -238,10 +267,17 @@ fn a_plausible_wrong_audio_convention_is_distinguishable() {
     let latent_major: Vec<[f64; 3]> = (0..correct.len())
         .map(|i| {
             let latent = i / l.audio_channels as usize;
-            [l.num_text_tokens as f64 + latent as f64, correct[i][1], correct[i][2]]
+            [
+                l.num_text_tokens as f64 + latent as f64,
+                correct[i][1],
+                correct[i][2],
+            ]
         })
         .collect();
-    assert_ne!(latent_major, correct, "audio rows are channel-major, not latent-major");
+    assert_ne!(
+        latent_major, correct,
+        "audio rows are channel-major, not latent-major"
+    );
 
     // (c) both interior and extreme width points — i.e. reusing the video grid.
     assert!(
@@ -250,7 +286,11 @@ fn a_plausible_wrong_audio_convention_is_distinguishable() {
     );
     let interior = width[1] as f32;
     let audio_start = (l.num_text_tokens * 3) as usize;
-    let ids: Vec<f32> = f.require("layout.position_ids").unwrap().as_slice::<f32>().to_vec();
+    let ids: Vec<f32> = f
+        .require("layout.position_ids")
+        .unwrap()
+        .as_slice::<f32>()
+        .to_vec();
     for row in 0..(l.num_audio_latents * l.audio_channels) as usize {
         assert!(
             (ids[audio_start + row * 3 + 2] - interior).abs() > 1e-5,
@@ -322,7 +362,12 @@ fn transformer_block_matches_the_reference() {
             &tables,
         )
         .unwrap();
-    assert_parity(&got, f.require("out.block.hidden").unwrap(), TOL, "dit block");
+    assert_parity(
+        &got,
+        f.require("out.block.hidden").unwrap(),
+        TOL,
+        "dit block",
+    );
 }
 
 /// Bare attention, so a qk-norm or rotary error localizes instead of only appearing folded into
@@ -344,10 +389,20 @@ fn attention_matches_the_reference_with_and_without_the_rotary() {
     let x = f.require("in.attn.hidden").unwrap();
 
     let with_rope = attn.forward(x, Some((&rope, &tables))).unwrap();
-    assert_parity(&with_rope, f.require("out.attn.hidden").unwrap(), TOL, "attn + rope");
+    assert_parity(
+        &with_rope,
+        f.require("out.attn.hidden").unwrap(),
+        TOL,
+        "attn + rope",
+    );
 
     let without = attn.forward(x, None).unwrap();
-    assert_parity(&without, f.require("out.attn.norope").unwrap(), TOL, "attn, no rope");
+    assert_parity(
+        &without,
+        f.require("out.attn.norope").unwrap(),
+        TOL,
+        "attn, no rope",
+    );
 
     // ...and the two must genuinely differ, or "the refiner applies no rotary" would be untestable.
     let (peak, _) = rel(&with_rope, &without);
@@ -369,9 +424,13 @@ fn token_refiner_matches_the_reference() {
     let cfg = dit_fixture_config();
 
     let mut w = model_weights();
-    let first =
-        TokenRefinerBlock::from_weights(&mut w, "token_refiner.refiner_blocks.0", &cfg, Dtype::Float32)
-            .unwrap();
+    let first = TokenRefinerBlock::from_weights(
+        &mut w,
+        "token_refiner.refiner_blocks.0",
+        &cfg,
+        Dtype::Float32,
+    )
+    .unwrap();
     let x = f.require("in.refiner.hidden").unwrap();
     assert_parity(
         &first.forward(x).unwrap(),
@@ -381,17 +440,26 @@ fn token_refiner_matches_the_reference() {
     );
 
     let mut w = model_weights();
-    let refiner = TokenRefiner::from_weights(&mut w, "token_refiner", &cfg, Dtype::Float32).unwrap();
+    let refiner =
+        TokenRefiner::from_weights(&mut w, "token_refiner", &cfg, Dtype::Float32).unwrap();
     assert_eq!(refiner.num_layers(), 2, "the refiner has two blocks");
     let got = refiner.forward(x).unwrap();
-    assert_parity(&got, f.require("out.refiner.hidden").unwrap(), TOL, "token refiner");
+    assert_parity(
+        &got,
+        f.require("out.refiner.hidden").unwrap(),
+        TOL,
+        "token refiner",
+    );
 
     // Not a stub: the stack must move its input, and the second block must contribute on top of
     // the first.
     let (vs_input, _) = rel(&got, x);
     let (vs_block0, _) = rel(&got, f.require("out.refiner.block0").unwrap());
     println!("  refiner vs input: {vs_input:.3e}; full stack vs block 0 only: {vs_block0:.3e}");
-    assert!(vs_input > MUTATION_FLOOR, "the refiner is an identity ({vs_input:.3e})");
+    assert!(
+        vs_input > MUTATION_FLOOR,
+        "the refiner is an identity ({vs_input:.3e})"
+    );
     assert!(
         vs_block0 > MUTATION_FLOOR,
         "block 1 and final_norm contribute nothing ({vs_block0:.3e}); a 1-layer refiner would pass"
@@ -466,10 +534,15 @@ fn qk_norm_runs_per_head_before_the_rotary() {
 
     // The port hits the golden.
     let (base, _) = rel(&attn.forward(x, Some((&rope, &tables))).unwrap(), want);
-    assert!(base < TOL, "baseline attention must match first ({base:.3e})");
+    assert!(
+        base < TOL,
+        "baseline attention must match first ({base:.3e})"
+    );
 
     // The norm weight must be non-constant, or neither of the variants below can discriminate.
-    let nq = f.require("transformer_blocks.0.attn.norm_q.weight").unwrap();
+    let nq = f
+        .require("transformer_blocks.0.attn.norm_q.weight")
+        .unwrap();
     assert_eq!(nq.shape(), &[cfg.attention_head_dim], "qk-norm is per HEAD");
     assert!(
         std_dev(nq) > 1e-2,
@@ -484,18 +557,24 @@ fn qk_norm_runs_per_head_before_the_rotary() {
         let t = f
             .require(&format!("transformer_blocks.0.attn.{name}.weight"))
             .unwrap();
-        mlx_rs::ops::matmul(x, &t.t()).unwrap().reshape(&shape).unwrap()
+        mlx_rs::ops::matmul(x, t.t())
+            .unwrap()
+            .reshape(&shape)
+            .unwrap()
     };
-    let norm = |t: &Array, weight: &Array| mlx_rs::fast::rms_norm(t, weight, cfg.qk_norm_eps).unwrap();
-    let nk = f.require("transformer_blocks.0.attn.norm_k.weight").unwrap();
+    let norm =
+        |t: &Array, weight: &Array| mlx_rs::fast::rms_norm(t, weight, cfg.qk_norm_eps).unwrap();
+    let nk = f
+        .require("transformer_blocks.0.attn.norm_k.weight")
+        .unwrap();
     let (q, k, v) = (proj("to_q"), proj("to_k"), proj("to_v"));
 
     let finish = |q: Array, k: Array| -> Array {
         let t = |a: &Array| a.transpose_axes(&[0, 2, 1, 3]).unwrap();
         let out = mlx_rs::fast::scaled_dot_product_attention(
-            &t(&q),
-            &t(&k),
-            &t(&v),
+            t(&q),
+            t(&k),
+            t(&v),
             1.0 / (cfg.attention_head_dim as f32).sqrt(),
             None,
             None,
@@ -509,7 +588,7 @@ fn qk_norm_runs_per_head_before_the_rotary() {
         let wo = f
             .require("transformer_blocks.0.attn.to_out.0.weight")
             .unwrap();
-        mlx_rs::ops::matmul(&flat, &wo.t()).unwrap()
+        mlx_rs::ops::matmul(&flat, wo.t()).unwrap()
     };
 
     let rope_first = finish(
@@ -521,7 +600,10 @@ fn qk_norm_runs_per_head_before_the_rotary() {
         rope.apply(&k, &tables).unwrap(),
     );
 
-    for (label, variant) in [("rope-then-norm", &rope_first), ("no qk-norm at all", &no_norm)] {
+    for (label, variant) in [
+        ("rope-then-norm", &rope_first),
+        ("no qk-norm at all", &no_norm),
+    ] {
         let (peak, _) = rel(variant, want);
         let cos = cosine(variant, want);
         println!(
@@ -557,7 +639,8 @@ fn qk_norm_eps_is_wired_through() {
 
     let load = |cfg: &MiniMaxH3DitConfig| {
         let mut w = model_weights();
-        DitAttention::from_weights(&mut w, "transformer_blocks.0.attn", cfg, Dtype::Float32).unwrap()
+        DitAttention::from_weights(&mut w, "transformer_blocks.0.attn", cfg, Dtype::Float32)
+            .unwrap()
     };
     let baseline = load(&cfg).forward(x, Some((&rope, &tables))).unwrap();
 
@@ -620,12 +703,13 @@ fn published_ffn_projection_is_value_then_gate() {
     let mut prefixes: Vec<String> = (0..cfg.num_layers)
         .map(|i| format!("transformer_blocks.{i}"))
         .collect();
-    prefixes.extend(
-        (0..cfg.num_refiner_layers).map(|i| format!("token_refiner.refiner_blocks.{i}")),
-    );
+    prefixes
+        .extend((0..cfg.num_refiner_layers).map(|i| format!("token_refiner.refiner_blocks.{i}")));
 
     for prefix in prefixes {
-        let published = f.require(&format!("{prefix}.ff.net.0.proj.weight")).unwrap();
+        let published = f
+            .require(&format!("{prefix}.ff.net.0.proj.weight"))
+            .unwrap();
         let source = f.require(&format!("src.{prefix}.mlp.fc1.weight")).unwrap();
         assert_eq!(
             published.shape(),
@@ -725,18 +809,23 @@ fn published_qkv_is_contiguous_thirds_of_the_reordered_fused_projection() {
     let mut prefixes: Vec<String> = (0..cfg.num_layers)
         .map(|i| format!("transformer_blocks.{i}"))
         .collect();
-    prefixes.extend(
-        (0..cfg.num_refiner_layers).map(|i| format!("token_refiner.refiner_blocks.{i}")),
-    );
+    prefixes
+        .extend((0..cfg.num_refiner_layers).map(|i| format!("token_refiner.refiner_blocks.{i}")));
 
     for prefix in prefixes {
-        let raw = f.require(&format!("src.{prefix}.attn.qkv_proj.weight")).unwrap();
+        let raw = f
+            .require(&format!("src.{prefix}.attn.qkv_proj.weight"))
+            .unwrap();
         let reordered = f
             .require(&format!("src.{prefix}.attn.qkv_proj.reordered"))
             .unwrap();
         let published: Vec<Array> = ["to_q", "to_k", "to_v"]
             .iter()
-            .map(|n| f.require(&format!("{prefix}.attn.{n}.weight")).unwrap().clone())
+            .map(|n| {
+                f.require(&format!("{prefix}.attn.{n}.weight"))
+                    .unwrap()
+                    .clone()
+            })
             .collect();
 
         // The reorder itself.
@@ -800,10 +889,11 @@ fn the_wrong_qkv_transform_breaks_parity() {
     let want = f.require("out.attn.hidden").unwrap();
 
     let mut w = model_weights();
-    let baseline = DitAttention::from_weights(&mut w, "transformer_blocks.0.attn", &cfg, Dtype::Float32)
-        .unwrap()
-        .forward(x, Some((&rope, &tables)))
-        .unwrap();
+    let baseline =
+        DitAttention::from_weights(&mut w, "transformer_blocks.0.attn", &cfg, Dtype::Float32)
+            .unwrap()
+            .forward(x, Some((&rope, &tables)))
+            .unwrap();
     let (base, _) = rel(&baseline, want);
     assert!(base < TOL, "baseline must match first ({base:.3e})");
 
@@ -820,10 +910,11 @@ fn the_wrong_qkv_transform_breaks_parity() {
             part.clone(),
         );
     }
-    let mutated = DitAttention::from_weights(&mut w, "transformer_blocks.0.attn", &cfg, Dtype::Float32)
-        .unwrap()
-        .forward(x, Some((&rope, &tables)))
-        .unwrap();
+    let mutated =
+        DitAttention::from_weights(&mut w, "transformer_blocks.0.attn", &cfg, Dtype::Float32)
+            .unwrap()
+            .forward(x, Some((&rope, &tables)))
+            .unwrap();
     let (peak, _) = rel(&mutated, &baseline);
     let cos = cosine(&mutated, &baseline);
     println!("  wrong qkv transform: peak rel {peak:.3e} cosine {cos:.4}");
@@ -855,9 +946,17 @@ fn the_modality_term_of_the_adaln_index_is_load_bearing() {
     let b = block(&mut w, &cfg, 0);
 
     // The fixture's tags must actually vary, or nothing below discriminates.
-    let tags: Vec<f32> = f.require("layout.token_tags").unwrap().as_slice::<f32>().to_vec();
+    let tags: Vec<f32> = f
+        .require("layout.token_tags")
+        .unwrap()
+        .as_slice::<f32>()
+        .to_vec();
     let distinct: std::collections::BTreeSet<i32> = tags.iter().map(|&t| t as i32).collect();
-    assert_eq!(distinct.len(), 3, "the golden must carry all three modalities");
+    assert_eq!(
+        distinct.len(),
+        3,
+        "the golden must carry all three modalities"
+    );
     let steps: Vec<f32> = f
         .require("layout.timestep_indices")
         .unwrap()
@@ -870,7 +969,8 @@ fn the_modality_term_of_the_adaln_index_is_load_bearing() {
 
     let correct = indices(&f, "layout.adaln_indices");
     let (base, _) = rel(
-        &b.forward_with_temb(x, temb, &correct, &rope, &tables).unwrap(),
+        &b.forward_with_temb(x, temb, &correct, &rope, &tables)
+            .unwrap(),
         want,
     );
     assert!(base < TOL, "baseline must match first ({base:.3e})");
@@ -911,7 +1011,7 @@ fn the_adaln_table_is_reshaped_before_it_is_chunked() {
     let bias = f
         .require("transformer_blocks.0.adaln_proj.linear.bias")
         .unwrap();
-    let activated = mlx_rs::ops::multiply(temb, &mlx_rs::ops::sigmoid(temb).unwrap()).unwrap();
+    let activated = mlx_rs::ops::multiply(temb, mlx_rs::ops::sigmoid(temb).unwrap()).unwrap();
     let projected = mlx_gen::nn::linear(&activated, weight, bias).unwrap();
     let steps = temb.shape()[0];
     assert_eq!(projected.shape(), &[steps, cfg.adaln_out_features()]);
@@ -1007,11 +1107,16 @@ fn parity_residuals_bound_the_mutation_floor() {
     let mut w = model_weights();
     let b = block(&mut w, &cfg, 0);
     let mut w = model_weights();
-    let refiner = TokenRefiner::from_weights(&mut w, "token_refiner", &cfg, Dtype::Float32).unwrap();
+    let refiner =
+        TokenRefiner::from_weights(&mut w, "token_refiner", &cfg, Dtype::Float32).unwrap();
 
     let attn_in = f.require("in.attn.hidden").unwrap();
     let stages: [(&str, Array, &Array); 5] = [
-        ("rope cos", tables.cos.clone(), f.require("out.rope_cos").unwrap()),
+        (
+            "rope cos",
+            tables.cos.clone(),
+            f.require("out.rope_cos").unwrap(),
+        ),
         (
             "attention",
             attn.forward(attn_in, Some((&rope, &tables))).unwrap(),
@@ -1024,7 +1129,9 @@ fn parity_residuals_bound_the_mutation_floor() {
         ),
         (
             "token refiner",
-            refiner.forward(f.require("in.refiner.hidden").unwrap()).unwrap(),
+            refiner
+                .forward(f.require("in.refiner.hidden").unwrap())
+                .unwrap(),
             f.require("out.refiner.hidden").unwrap(),
         ),
         (
@@ -1114,15 +1221,28 @@ fn fixture_is_not_degenerate() {
     }
     // The gates specifically must not be zero, or the residual branches are inert.
     for key in ["out.modulation.gate_msa", "out.modulation.gate_mlp"] {
-        let max: f32 = f.require(key).unwrap().abs().unwrap().max(None).unwrap().item();
-        assert!(max > 1e-3, "{key} is ~zero ({max:.3e}); the block would be an identity");
+        let max: f32 = f
+            .require(key)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item();
+        assert!(
+            max > 1e-3,
+            "{key} is ~zero ({max:.3e}); the block would be an identity"
+        );
     }
     // The block must actually move its input.
     let (peak, _) = rel(
         f.require("out.block.hidden").unwrap(),
         f.require("in.block.hidden").unwrap(),
     );
-    assert!(peak > MUTATION_FLOOR, "the golden block is an identity ({peak:.3e})");
+    assert!(
+        peak > MUTATION_FLOOR,
+        "the golden block is an identity ({peak:.3e})"
+    );
 }
 
 /// The declared tensor names must be exactly the fixture's block + refiner tensor set, and every

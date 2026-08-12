@@ -47,8 +47,9 @@
 //! upstream reverts the swap, the published tensors change while every shape stays identical and
 //! every loader keeps loading cleanly. A port must therefore *assert* which layout it expects
 //! against real bytes, not rely on the layout being obvious. `tests/video_vae_parity.rs`'s
-//! `published_ffn_projection_is_value_then_gate` is that assertion for the video VAE; the DiT needs
-//! its own.
+//! `published_ffn_projection_is_value_then_gate` is that assertion for the video VAE, and
+//! `tests/dit_parity.rs` carries the DiT's own (sc-17144) — over the 50-layer stack **and** the
+//! token refiner, both of which the conversion swaps.
 //!
 //! # Rule 2 — fused QKV: two different transforms that must not be confused
 //!
@@ -70,6 +71,13 @@
 //! a fixture dumped from the reference's `state_dict()` needs contiguous thirds, whereas a fixture
 //! dumped from the raw shards needs the interleaved gather. Getting the wrong one produces a
 //! plausible model that is wrong on real weights — the sc-18740 failure mode again.
+//!
+//! [`crate::dit::qkv`] makes both transforms executable, and
+//! `tests/dit_parity.rs::published_qkv_is_contiguous_thirds_of_the_reordered_fused_projection`
+//! asserts against real reference bytes that **crossing them is shape-identical and wrong** — which
+//! is what turns "we picked a transform" into "we picked the right one". Note the published DiT
+//! ships `to_q`/`to_k`/`to_v` already split (`to_qkv` appears nowhere in its index), so the loader
+//! applies no transform at all; that is precisely why only an explicit assertion can pin it.
 //!
 //! # Rule 3 — a fixture generated from reference modules cannot validate a converted-checkpoint
 //! loader

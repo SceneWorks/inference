@@ -1104,7 +1104,11 @@ fn real_weight_dit_block_runs_one_forward() {
     )
     .unwrap();
     assert_eq!(cfg.hidden_size, 5376);
-    assert_eq!(cfg.inner_dim(), 7168, "attention is wider than the residual stream");
+    assert_eq!(
+        cfg.inner_dim(),
+        7168,
+        "attention is wider than the residual stream"
+    );
     assert_eq!(cfg.rotary_dim(), 96, "96 of 128 head channels rotate");
 
     let started = Instant::now();
@@ -1117,8 +1121,8 @@ fn real_weight_dit_block_runs_one_forward() {
     );
 
     // bf16 is the checkpoint's own dtype for the block stack.
-    let block = DitBlock::from_weights(&mut w, "transformer_blocks.0", &cfg, Dtype::Bfloat16)
-        .unwrap();
+    let block =
+        DitBlock::from_weights(&mut w, "transformer_blocks.0", &cfg, Dtype::Bfloat16).unwrap();
     let load_ms = started.elapsed().as_millis();
 
     // Evidence the tensors are the real trained ones rather than anything synthesized: the qk-norm
@@ -1147,7 +1151,17 @@ fn real_weight_dit_block_runs_one_forward() {
     let tables = rope.tables(&position_ids, Dtype::Bfloat16).unwrap();
     assert_eq!(tables.cos.shape(), &[seq, 96]);
 
-    let tags: Vec<i32> = (0..seq).map(|i| if i < 8 { 1 } else if i < 16 { 2 } else { 0 }).collect();
+    let tags: Vec<i32> = (0..seq)
+        .map(|i| {
+            if i < 8 {
+                1
+            } else if i < 16 {
+                2
+            } else {
+                0
+            }
+        })
+        .collect();
     let steps: Vec<i32> = (0..seq).map(|i| i32::from(i >= 16)).collect();
     let adaln: Vec<i32> = steps
         .iter()
@@ -1188,17 +1202,26 @@ fn real_weight_dit_block_runs_one_forward() {
     let fwd_ms = t1.elapsed().as_millis();
 
     assert_eq!(out.shape(), &[1, seq, cfg.hidden_size]);
-    assert!(peak.is_finite() && peak > 0.0, "block output peak {peak} is not finite/positive");
-    assert!(spread > 1e-3, "block output is ~constant (std {spread:.3e})");
+    assert!(
+        peak.is_finite() && peak > 0.0,
+        "block output peak {peak} is not finite/positive"
+    );
+    assert!(
+        spread > 1e-3,
+        "block output is ~constant (std {spread:.3e})"
+    );
     // The block is not an identity on real weights.
     let moved = std_dev(
         &mlx_rs::ops::subtract(
-            &out.as_dtype(Dtype::Float32).unwrap(),
-            &hidden.as_dtype(Dtype::Float32).unwrap(),
+            out.as_dtype(Dtype::Float32).unwrap(),
+            hidden.as_dtype(Dtype::Float32).unwrap(),
         )
         .unwrap(),
     );
-    assert!(moved > 1e-3, "the real block was an identity (residual std {moved:.3e})");
+    assert!(
+        moved > 1e-3,
+        "the real block was an identity (residual std {moved:.3e})"
+    );
     assert!(
         fwd_ms > 0,
         "forward reported 0 ms — the timer did not span the evaluation"

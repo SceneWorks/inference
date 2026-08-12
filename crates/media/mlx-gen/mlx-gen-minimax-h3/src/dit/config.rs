@@ -145,10 +145,14 @@ impl MiniMaxH3DitConfig {
             .map_err(|e| Error::Msg(format!("minimax-h3 dit config: {e}")))?;
         let d = Self::default();
         let int = |k: &str, fallback: i32| -> i32 {
-            v.get(k).and_then(serde_json::Value::as_i64).map_or(fallback, |x| x as i32)
+            v.get(k)
+                .and_then(serde_json::Value::as_i64)
+                .map_or(fallback, |x| x as i32)
         };
         let float = |k: &str, fallback: f32| -> f32 {
-            v.get(k).and_then(serde_json::Value::as_f64).map_or(fallback, |x| x as f32)
+            v.get(k)
+                .and_then(serde_json::Value::as_f64)
+                .map_or(fallback, |x| x as f32)
         };
         let patch = v
             .get("patch_size")
@@ -202,7 +206,10 @@ mod tests {
         let cfg = MiniMaxH3DitConfig::default();
         assert_eq!(cfg.inner_dim(), 7168);
         assert!(cfg.inner_dim() > cfg.hidden_size);
-        assert_ne!(cfg.hidden_size / cfg.num_attention_heads, cfg.attention_head_dim);
+        assert_ne!(
+            cfg.hidden_size / cfg.num_attention_heads,
+            cfg.attention_head_dim
+        );
         assert_eq!(cfg.rotary_dim(), 96);
         assert!(cfg.rotary_dim() < cfg.attention_head_dim);
         assert_eq!(cfg.adaln_out_features(), 96_768);
@@ -230,8 +237,10 @@ mod tests {
     /// A rotary wider than a head is a geometry the block cannot express, not a silent truncation.
     #[test]
     fn rejects_a_rotary_wider_than_a_head() {
-        let mut cfg = MiniMaxH3DitConfig::default();
-        cfg.rope_freq_dim = 32;
+        let cfg = MiniMaxH3DitConfig {
+            rope_freq_dim: 32,
+            ..MiniMaxH3DitConfig::default()
+        };
         assert_eq!(cfg.rotary_dim(), 192);
         let e = cfg.validate().unwrap_err().to_string();
         assert!(e.contains("exceeds head dim"), "unexpected error: {e}");

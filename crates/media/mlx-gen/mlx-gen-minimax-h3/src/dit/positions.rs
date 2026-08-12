@@ -68,7 +68,7 @@ pub fn spatial_axis_grid(dim: i32, patch: i32, sqrt_area: f64) -> Result<Vec<f64
              {patch}"
         )));
     }
-    if !(sqrt_area > 0.0) {
+    if !sqrt_area.is_finite() || sqrt_area <= 0.0 {
         return Err(Error::Msg(format!(
             "minimax-h3 dit positions: sqrt_area must be positive, got {sqrt_area}"
         )));
@@ -117,7 +117,8 @@ pub fn temporal_grid(num_latent_frames: i32, origin: f64) -> Result<Vec<f64>> {
     let mut acc = origin;
     for index in 0..num_latent_frames {
         out.push(acc);
-        acc += ROPE_FRAME_RESCALE * ROPE_FRAMES_PER_LATENT[(index as usize) % ROPE_FRAMES_PER_LATENT.len()];
+        acc += ROPE_FRAME_RESCALE
+            * ROPE_FRAMES_PER_LATENT[(index as usize) % ROPE_FRAMES_PER_LATENT.len()];
     }
     Ok(out)
 }
@@ -291,7 +292,10 @@ mod tests {
         assert_eq!(times, vec![7.0, 8.0, 9.0, 7.0, 8.0, 9.0]);
 
         // h: audio has none.
-        assert!(rows.iter().all(|r| r[1] == 0.0), "audio rows carry no height");
+        assert!(
+            rows.iter().all(|r| r[1] == 0.0),
+            "audio rows carry no height"
+        );
 
         // w: channel 0 at the left extreme, channel 1 at the right — NOT the interior points.
         let widths: Vec<f64> = rows.iter().map(|r| r[2]).collect();

@@ -179,7 +179,9 @@ impl DitBlock {
         v.extend(RmsNorm::names(&format!("{prefix}.norm2")));
         v.extend(DitAttention::names(&format!("{prefix}.attn")));
         v.extend(DitFeedForward::names(&format!("{prefix}.ff")));
-        v.extend(AdaLnProjection::names(&format!("{prefix}.adaln_proj.linear")));
+        v.extend(AdaLnProjection::names(&format!(
+            "{prefix}.adaln_proj.linear"
+        )));
         v
     }
 
@@ -273,11 +275,15 @@ mod tests {
             assert!(names.contains(&expect.to_string()), "missing {expect}");
         }
         assert!(
-            !names.iter().any(|n| n.starts_with("transformer_blocks.0.attn.to_q.bias")),
+            !names
+                .iter()
+                .any(|n| n.starts_with("transformer_blocks.0.attn.to_q.bias")),
             "the attention projections are bias-free"
         );
         assert!(
-            !names.iter().any(|n| n.contains(".ff.") && n.ends_with(".bias")),
+            !names
+                .iter()
+                .any(|n| n.contains(".ff.") && n.ends_with(".bias")),
             "the feed-forward is bias-free"
         );
     }

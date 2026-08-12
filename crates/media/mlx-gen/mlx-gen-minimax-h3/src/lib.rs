@@ -68,9 +68,10 @@
 //! decoder past a fully green parity suite. **The DiT (sc-17144) carries the same FFN swap plus a
 //! grouped-QKV reorder**, and the candle twins (sc-17154 / sc-17155) inherit both.
 //!
-//! Not in this crate yet: either CNN encoder, the DiT (sc-17144) and the pipeline
-//! (sc-17146/17147). Nothing is registered with `mlx-gen-catalog` — there is no generator to ship
-//! until the pipeline lands.
+//! Not in this crate yet: either CNN encoder, the DiT's AdaLN precompute/evict (sc-17145), the
+//! joint denoise loop and packed-sequence assembly (sc-17146), the pipeline and the DiT's
+//! input/output projections (sc-17147), and Ref2VA's `transformer_ref` (sc-17149). Nothing is
+//! registered with `mlx-gen-catalog` — there is no generator to ship until the pipeline lands.
 
 pub mod alias_free;
 pub mod audio_config;
