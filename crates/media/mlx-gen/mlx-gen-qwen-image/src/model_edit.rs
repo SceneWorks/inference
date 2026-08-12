@@ -223,6 +223,8 @@ fn build_residency_with_source(
     let root = resolve_root(spec)?;
     let vision_encoder_source = crate::ENCODER_CONTRACT
         .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)?;
+    vision_encoder_source
+        .validate_vision(&crate::VISION_ENCODER_CONTRACT, &crate::ENCODER_CONTRACT)?;
     let spec_heavy = spec.clone();
     Residency::from_policy(
         spec.offload_policy,
@@ -804,9 +806,10 @@ mod tests {
     // request and fail the first assertion. The A/B real-weight test is `#[ignore]`d; this runs by
     // default.
     fn validation_complete_snapshot_spec(root: &Path, policy: OffloadPolicy) -> LoadSpec {
-        gen_core_testkit::write_encoder_contract_fixture(
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
             &root.join("text_encoder"),
             crate::ENCODER_CONTRACT,
+            crate::VISION_ENCODER_CONTRACT,
         )
         .expect("validation-complete text encoder fixture");
         LoadSpec::new(WeightsSource::Dir(root.to_path_buf())).with_offload_policy(policy)

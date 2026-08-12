@@ -114,16 +114,6 @@ pub fn image_gather_index(
     out
 }
 
-/// mmap a [`VarBuilder`] over every `.safetensors` in `root/sub` at `dtype`.
-fn component_vb(
-    root: &Path,
-    sub: &str,
-    dtype: DType,
-    device: &Device,
-) -> Result<VarBuilder<'static>> {
-    candle_gen::component_vb(root, sub, dtype, device, "qwen edit")
-}
-
 fn selected_encoder_vb(
     source: &WeightsSource,
     dtype: DType,
@@ -161,16 +151,27 @@ pub fn load_vision_language_encoder_with_text_encoder(
     selected: &ValidatedEncoderSource,
     device: &Device,
 ) -> Result<QwenVisionLanguageEncoder> {
+    let vision = crate::ENCODER_CONTRACT
+        .validate_source_against_base(
+            &candle_gen::gen_core::WeightsSource::Dir(root.join("text_encoder")),
+            root,
+        )
+        .map_err(CandleError::from)?;
+    vision
+        .validate_vision(&crate::VISION_ENCODER_CONTRACT, &crate::ENCODER_CONTRACT)
+        .map_err(CandleError::from)?;
     let lm = selected.read_unchanged(|source| -> Result<QwenTextEncoder> {
         Ok(QwenTextEncoder::new(
             &TextEncoderConfig::qwen_image(),
             selected_encoder_vb(source, ENC_DTYPE, device)?,
         )?)
     })?;
-    let visual = VisionTransformer::new(
-        component_vb(root, "text_encoder", ENC_DTYPE, device)?,
-        &VisionConfig::qwen_image_edit(),
-    )?;
+    let visual = vision.read_unchanged(|source| -> Result<VisionTransformer> {
+        VisionTransformer::new(
+            selected_encoder_vb(source, ENC_DTYPE, device)?,
+            &VisionConfig::qwen_image_edit(),
+        )
+    })?;
     Ok(QwenVisionLanguageEncoder::new(lm, visual))
 }
 

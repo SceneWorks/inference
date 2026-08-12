@@ -82,6 +82,7 @@ pub(crate) fn load_text_encoder_from_source(source: &WeightsSource) -> Result<Qw
 pub fn load_vision_encoder(root: &Path) -> Result<VisionTransformer> {
     let selected = crate::ENCODER_CONTRACT
         .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)?;
+    selected.validate_vision(&crate::VISION_ENCODER_CONTRACT, &crate::ENCODER_CONTRACT)?;
     selected.read_unchanged(load_vision_encoder_from_source)
 }
 
@@ -104,6 +105,7 @@ pub(crate) fn load_vision_encoder_from_source(source: &WeightsSource) -> Result<
 pub fn load_vision_language_encoder(root: &Path) -> Result<QwenVisionLanguageEncoder> {
     let selected =
         crate::ENCODER_CONTRACT.validate_source(&WeightsSource::Dir(root.join("text_encoder")))?;
+    selected.validate_vision(&crate::VISION_ENCODER_CONTRACT, &crate::ENCODER_CONTRACT)?;
     selected.read_unchanged(load_vision_language_encoder_from_source)
 }
 
@@ -383,6 +385,22 @@ fn transform_vae_tensor(src_key: &str, t: &Array) -> Result<Array> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qwen_edit_vision_contract_rejects_missing_visual_headers() {
+        let fixture = tempfile::tempdir().unwrap();
+        let component = fixture.path().join("text_encoder");
+        gen_core_testkit::write_encoder_contract_fixture(&component, crate::ENCODER_CONTRACT)
+            .unwrap();
+        let selected = crate::ENCODER_CONTRACT
+            .validate_source(&WeightsSource::Dir(component))
+            .unwrap();
+        let error = selected
+            .validate_vision(&crate::VISION_ENCODER_CONTRACT, &crate::ENCODER_CONTRACT)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("vision_config"), "{error}");
+    }
 
     /// F-120: exercise the PRODUCTION `remap_transformer_keys` over an in-memory `Weights` fixture
     /// (not a duplicated copy of the rename table), so a regression in the real table fails CI. One

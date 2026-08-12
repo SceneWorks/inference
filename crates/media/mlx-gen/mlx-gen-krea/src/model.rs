@@ -137,6 +137,25 @@ pub const ENCODER_CONTRACT: mlx_gen::gen_core::EncoderContract =
         dense_storage_dtype_probe: None,
     };
 
+pub const VISION_ENCODER_CONTRACT: mlx_gen::gen_core::VisionEncoderContract =
+    mlx_gen::gen_core::VisionEncoderContract {
+        architecture: mlx_gen::gen_core::VisionEncoderArchitecture::Qwen3Vl,
+        hidden_size: 1024,
+        intermediate_size: 4096,
+        num_hidden_layers: 24,
+        num_attention_heads: 16,
+        output_width: 2560,
+        hidden_activation: "gelu_pytorch_tanh",
+        patch_size: 16,
+        temporal_patch_size: 2,
+        spatial_merge_size: 2,
+        in_channels: 3,
+        num_position_embeddings: Some(2304),
+        deepstack_visual_indexes: &[5, 11, 17],
+        window_size: None,
+        full_attention_block_indexes: &[],
+    };
+
 /// Max images per request (the image-model standard, shared with the other MLX families).
 const MAX_COUNT: u32 = 8;
 /// Resolution bounds (W/H). Turbo renders up to 2048²; the catalog/worker gate the UI options tighter.

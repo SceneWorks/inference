@@ -226,10 +226,11 @@ pub(crate) fn native_memory_strategy_contract_from_spec(
     };
     let selected_text_encoder =
         crate::model::ENCODER_CONTRACT.source_for_load(spec, base_snapshot_dir)?;
-    let conditioning_bytes =
-        projected_tensor_headers_bytes(&selected_text_encoder.tensor_headers()?, |_| {
-            ResidentProjection::Stored
-        })?;
+    let conditioning_bytes = projected_tensor_headers_bytes(
+        &selected_text_encoder
+            .materialized_language_tensor_headers(&crate::model::ENCODER_CONTRACT)?,
+        |_| ResidentProjection::Stored,
+    )?;
     let decoder_bytes = stored(&base_snapshot_dir.join("vae"), "base VAE")?;
     let transformer_bytes = spec.read_file_unchanged_if_prepared(dit_file, |p| {
         crate::block_memory_strategy::native_dit_transformer_bytes(provider_id, p)
@@ -326,8 +327,10 @@ fn asset_facts(
         })
     };
     let selected_text_encoder = crate::model::ENCODER_CONTRACT.source_for_load(spec, root)?;
-    let conditioning_bytes =
-        projected_tensor_headers_bytes(&selected_text_encoder.tensor_headers()?, |tensor| {
+    let conditioning_bytes = projected_tensor_headers_bytes(
+        &selected_text_encoder
+            .materialized_language_tensor_headers(&crate::model::ENCODER_CONTRACT)?,
+        |tensor| {
             if let Some(quant) = spec
                 .quantize
                 .filter(|_| crate::convert::is_text_encoder_quant_target(&tensor.name))
@@ -339,7 +342,8 @@ fn asset_facts(
             } else {
                 ResidentProjection::Stored
             }
-        })?;
+        },
+    )?;
     let transformer_bytes = project(&root.join("transformer"), &|name| {
         crate::convert::is_transformer_quant_target(name)
     })?;

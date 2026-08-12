@@ -72,6 +72,10 @@ pub fn load_vision_tower(root: impl AsRef<Path>) -> Result<VisionTower> {
     let root = root.as_ref();
     let selected = crate::model::ENCODER_CONTRACT
         .validate_source(&WeightsSource::Dir(root.join("text_encoder")))?;
+    selected.validate_vision(
+        &crate::model::VISION_ENCODER_CONTRACT,
+        &crate::model::ENCODER_CONTRACT,
+    )?;
     selected.read_unchanged(load_vision_tower_from_source)
 }
 

@@ -59,11 +59,17 @@ pub fn krea_vision_config() -> VisionConfig {
 /// over that dir at f32 with prefix `"visual"`. On a packed Krea tier the LM is packed but the vision
 /// tower stays dense bf16 (loaded → f32 here), which boogu's `VisionTower::load` guards for.
 pub fn load_vision_tower(root: impl AsRef<Path>, device: &Device) -> Result<VisionTower> {
-    let dir = root.as_ref().join("text_encoder");
-    load_vision_tower_from_source(&WeightsSource::Dir(dir), device)
+    let root = root.as_ref();
+    let selected = crate::ENCODER_CONTRACT
+        .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)
+        .map_err(candle_gen::CandleError::from)?;
+    selected
+        .validate_vision(&crate::VISION_ENCODER_CONTRACT, &crate::ENCODER_CONTRACT)
+        .map_err(candle_gen::CandleError::from)?;
+    selected.read_unchanged(|source| load_vision_tower_from_source(source, device))
 }
 
-pub fn load_vision_tower_from_source(
+pub(crate) fn load_vision_tower_from_source(
     source: &WeightsSource,
     device: &Device,
 ) -> Result<VisionTower> {

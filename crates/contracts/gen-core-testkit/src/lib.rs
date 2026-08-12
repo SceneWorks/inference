@@ -89,7 +89,7 @@ pub use voice_embedder::{
 
 use gen_core::{
     Capabilities, Conditioning, EncoderContract, Error, GenerationOutput, GenerationRequest,
-    Generator, Image, Modality, Progress,
+    Generator, Image, Modality, Progress, VisionEncoderContract,
 };
 
 /// Write a sparse, validation-complete text-encoder fixture for provider load-gate tests.
@@ -102,6 +102,97 @@ pub fn write_encoder_contract_fixture(
     contract: EncoderContract,
 ) -> std::io::Result<()> {
     write_encoder_contract_fixture_with_quant(root, contract, None)
+}
+
+/// Extend the sparse language fixture with the exact `vision_config` and `visual.*` tensor surface.
+/// This is for edit/load-gate tests only; production loaders must not materialize the sparse file.
+pub fn write_multimodal_encoder_contract_fixture(
+    root: &std::path::Path,
+    language: EncoderContract,
+    vision: VisionEncoderContract,
+) -> std::io::Result<()> {
+    use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+
+    write_encoder_contract_fixture(root, language)?;
+    vision
+        .validate_definition(&language)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+
+    let config_path = root.join("config.json");
+    let mut config: serde_json::Value = serde_json::from_slice(&std::fs::read(&config_path)?)?;
+    let model_type = match vision.architecture {
+        gen_core::VisionEncoderArchitecture::Qwen3Vl => "qwen3_vl",
+        gen_core::VisionEncoderArchitecture::Qwen2_5Vl => "qwen2_5_vl",
+    };
+    let mut vision_config = serde_json::json!({
+        "model_type": model_type,
+        "hidden_act": vision.hidden_activation,
+        "hidden_size": vision.hidden_size,
+        "intermediate_size": vision.intermediate_size,
+        "depth": vision.num_hidden_layers,
+        "num_heads": vision.num_attention_heads,
+        "out_hidden_size": vision.output_width,
+        "patch_size": vision.patch_size,
+        "temporal_patch_size": vision.temporal_patch_size,
+        "spatial_merge_size": vision.spatial_merge_size,
+        "in_channels": vision.in_channels,
+    });
+    if let Some(value) = vision.num_position_embeddings {
+        vision_config["num_position_embeddings"] = serde_json::json!(value);
+    }
+    if !vision.deepstack_visual_indexes.is_empty() {
+        vision_config["deepstack_visual_indexes"] =
+            serde_json::json!(vision.deepstack_visual_indexes);
+    }
+    if let Some(value) = vision.window_size {
+        vision_config["window_size"] = serde_json::json!(value);
+    }
+    if !vision.full_attention_block_indexes.is_empty() {
+        vision_config["fullatt_block_indexes"] =
+            serde_json::json!(vision.full_attention_block_indexes);
+    }
+    config["vision_config"] = vision_config;
+    std::fs::write(&config_path, serde_json::to_vec(&config)?)?;
+
+    let weights_path = root.join("model.safetensors");
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&weights_path)?;
+    let mut len = [0_u8; 8];
+    file.read_exact(&mut len)?;
+    let old_header_len = u64::from_le_bytes(len) as usize;
+    let mut encoded = vec![0_u8; old_header_len];
+    file.read_exact(&mut encoded)?;
+    let mut header: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&encoded)?;
+    let mut offset = header
+        .values()
+        .filter_map(|entry| entry.get("data_offsets")?.as_array()?.get(1)?.as_u64())
+        .max()
+        .unwrap_or(0);
+    for (name, shape) in vision
+        .expected_headers()
+        .map_err(|error| std::io::Error::other(error.to_string()))?
+    {
+        let bytes = shape.iter().try_fold(2_u64, |total, &dimension| {
+            total.checked_mul(dimension as u64)
+        });
+        let bytes = bytes.ok_or_else(|| std::io::Error::other("vision fixture size overflow"))?;
+        let end = offset
+            .checked_add(bytes)
+            .ok_or_else(|| std::io::Error::other("vision fixture offset overflow"))?;
+        header.insert(
+            name,
+            serde_json::json!({"dtype": "F16", "shape": shape, "data_offsets": [offset, end]}),
+        );
+        offset = end;
+    }
+    let encoded = serde_json::to_vec(&header)?;
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(&(encoded.len() as u64).to_le_bytes())?;
+    file.write_all(&encoded)?;
+    file.set_len(8 + encoded.len() as u64 + offset)?;
+    Ok(())
 }
 
 pub fn write_encoder_contract_fixture_with_quant(

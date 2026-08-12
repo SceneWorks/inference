@@ -137,8 +137,21 @@ pub(crate) fn memory_strategy_contract_with_plan(
         })
     };
     let selected_text_encoder = crate::model::ENCODER_CONTRACT.source_for_load(spec, root)?;
+    let mut conditioning_headers = selected_text_encoder
+        .materialized_language_tensor_headers(&crate::model::ENCODER_CONTRACT)?;
+    if matches!(
+        provider_id,
+        crate::model::KREA_2_EDIT_ID | crate::model::KREA_2_TURBO_EDIT_ID
+    ) {
+        let vision = crate::model::ENCODER_CONTRACT
+            .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)?;
+        conditioning_headers.extend(vision.materialized_vision_tensor_headers(
+            &crate::model::VISION_ENCODER_CONTRACT,
+            &crate::model::ENCODER_CONTRACT,
+        )?);
+    }
     let selected_text_encoder_bytes =
-        projected_tensor_headers_bytes(&selected_text_encoder.tensor_headers()?, |tensor| {
+        projected_tensor_headers_bytes(&conditioning_headers, |tensor| {
             if let Some(quant) = spec
                 .quantize
                 .filter(|_| crate::convert::is_text_encoder_quant_target(&tensor.name))
@@ -330,10 +343,11 @@ pub(crate) fn native_memory_strategy_contract_from_spec(
     };
     let selected_text_encoder =
         crate::model::ENCODER_CONTRACT.source_for_load(spec, base_snapshot_dir)?;
-    let selected_text_encoder_bytes =
-        selected_text_encoder.read_unchanged(|source| match source {
-            WeightsSource::Dir(path) | WeightsSource::File(path) => stored(path, "text encoder"),
-        })?;
+    let selected_text_encoder_bytes = projected_tensor_headers_bytes(
+        &selected_text_encoder
+            .materialized_language_tensor_headers(&crate::model::ENCODER_CONTRACT)?,
+        |_| ResidentProjection::Stored,
+    )?;
     let components = mlx_gen::PerComponentBytes {
         text_encoder: selected_text_encoder_bytes,
         dit: spec.read_file_unchanged_if_prepared(dit_file, |p| {
@@ -596,9 +610,10 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             write_minimal_safetensors(&dir.join("model.safetensors"));
         }
-        gen_core_testkit::write_encoder_contract_fixture(
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
             &root.join("text_encoder"),
             crate::model::ENCODER_CONTRACT,
+            crate::model::VISION_ENCODER_CONTRACT,
         )
         .expect("validation-complete text encoder fixture");
         std::fs::write(
@@ -1146,10 +1161,10 @@ mod tests {
         let native = root.join("native.safetensors");
         write_native_i8_safetensors(&native);
         let contract = native_memory_strategy_contract("krea_2_turbo", &native, &root).unwrap();
-        assert_eq!(contract.asset_facts.conditioning_bytes, 8_045_328_384);
+        assert_eq!(contract.asset_facts.conditioning_bytes, 7_843_069_440);
         assert_eq!(contract.asset_facts.decoder_bytes, 2);
         assert_eq!(contract.asset_facts.transformer_bytes, 2 * 64 * 2);
-        assert_eq!(contract.asset_facts.base_bytes, 8_045_328_642);
+        assert_eq!(contract.asset_facts.base_bytes, 7_843_069_698);
         for strategy in [
             MemoryStrategy::Resident,
             MemoryStrategy::BoundedDecode,
@@ -1173,5 +1188,32 @@ mod tests {
         }
         assert!(contract.conformance_errors().is_empty());
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn edit_prices_the_materialized_vision_surface_while_t2i_excludes_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, spec) = fixture(&tmp);
+        let (t2i, _) = memory_strategy_contract_with_plan(crate::model::KREA_2_TURBO_ID, &spec)
+            .expect("t2i contract");
+        let (edit, _) = memory_strategy_contract_with_plan(crate::model::KREA_2_EDIT_ID, &spec)
+            .expect("edit contract");
+        let vision = crate::model::ENCODER_CONTRACT
+            .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), &root)
+            .unwrap();
+        let vision_bytes = projected_tensor_headers_bytes(
+            &vision
+                .materialized_vision_tensor_headers(
+                    &crate::model::VISION_ENCODER_CONTRACT,
+                    &crate::model::ENCODER_CONTRACT,
+                )
+                .unwrap(),
+            |_| ResidentProjection::Stored,
+        )
+        .unwrap();
+        assert_eq!(
+            edit.asset_facts.conditioning_bytes - t2i.asset_facts.conditioning_bytes,
+            vision_bytes
+        );
     }
 }

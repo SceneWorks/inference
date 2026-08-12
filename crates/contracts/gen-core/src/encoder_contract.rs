@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use crate::weightsmeta::Dtype;
 use crate::{
     safetensors_path_tensor_headers, Error, PinnedWeightsFile, Result, SafetensorsTensorHeader,
-    WeightsSource,
+    VisionEncoderContract, WeightsSource,
 };
 
 /// The architecture and output shape a generator requires from its text encoder.
@@ -296,6 +296,102 @@ impl ValidatedEncoderSource {
         let headers = self.pinned.headers()?;
         self.pinned.ensure_unchanged()?;
         Ok(headers)
+    }
+
+    /// Validate the vision half against the same pinned config and shard inventory already accepted
+    /// for the language half. The returned receipt remains this source; callers must still use
+    /// [`Self::read_unchanged`] for materialization.
+    pub fn validate_vision(
+        &self,
+        vision: &VisionEncoderContract,
+        language: &EncoderContract,
+    ) -> Result<()> {
+        self.ensure_unchanged()?;
+        let config_pin = self.pinned.config_pin.as_ref().ok_or_else(|| {
+            Error::Unsupported(format!(
+                "multimodal vision encoder requires authoritative config.json for {}",
+                source_path(&self.weights).display()
+            ))
+        })?;
+        let config: Value = config_pin.read_unchanged(|path| {
+            let bytes = std::fs::read(path).map_err(|error| {
+                Error::Msg(format!(
+                    "vision encoder contract: read {}: {error}",
+                    path.display()
+                ))
+            })?;
+            serde_json::from_slice(&bytes).map_err(|error| {
+                Error::Msg(format!(
+                    "vision encoder contract: parse {}: {error}",
+                    path.display()
+                ))
+            })
+        })?;
+        vision.validate_config(&config, config_pin.loader_path(), language)?;
+        let headers = self.pinned.headers()?;
+        vision.validate_tensor_headers(&headers, source_path(&self.weights))?;
+        self.ensure_unchanged()
+    }
+
+    /// Exact language tensor surface consumed by this contract, excluding unused authored layers
+    /// and unrelated `visual.*` tensors that share the same multimodal checkpoint.
+    pub fn materialized_language_tensor_headers(
+        &self,
+        contract: &EncoderContract,
+    ) -> Result<Vec<SafetensorsTensorHeader>> {
+        self.ensure_unchanged()?;
+        let headers = self.pinned.headers()?;
+        let prefix = contract.expected_header_prefix()?;
+        let lm_head = contract
+            .requires_lm_head
+            .then(|| contract.expected_lm_head_prefix())
+            .transpose()?
+            .map(|prefix| format!("{prefix}.lm_head."));
+        let layer_prefix = format!("{prefix}.layers.");
+        let selected = headers
+            .into_iter()
+            .filter(|header| {
+                if header.name == format!("{prefix}.embed_tokens.weight")
+                    || header.name == format!("{prefix}.norm.weight")
+                        && contract.requires_final_norm
+                    || lm_head
+                        .as_ref()
+                        .is_some_and(|head| header.name.starts_with(head))
+                {
+                    return true;
+                }
+                header
+                    .name
+                    .strip_prefix(&layer_prefix)
+                    .and_then(|tail| tail.split('.').next())
+                    .and_then(|layer| layer.parse::<usize>().ok())
+                    .is_some_and(|layer| layer < contract.loaded_hidden_layers)
+            })
+            .collect();
+        self.ensure_unchanged()?;
+        Ok(selected)
+    }
+
+    /// Exact vision tensor surface consumed by a previously validated multimodal source.
+    pub fn materialized_vision_tensor_headers(
+        &self,
+        vision: &VisionEncoderContract,
+        language: &EncoderContract,
+    ) -> Result<Vec<SafetensorsTensorHeader>> {
+        self.validate_vision(vision, language)?;
+        let expected = vision
+            .expected_headers()?
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<BTreeSet<_>>();
+        let selected = self
+            .pinned
+            .headers()?
+            .into_iter()
+            .filter(|header| expected.contains(&header.name))
+            .collect();
+        self.ensure_unchanged()?;
+        Ok(selected)
     }
 
     /// Execute one backend load against the exact config and direct-shard set that passed contract

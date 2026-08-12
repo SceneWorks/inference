@@ -167,6 +167,25 @@ pub const ENCODER_CONTRACT: gen_core::EncoderContract = gen_core::EncoderContrac
     dense_storage_dtype_probe: None,
 };
 
+pub const VISION_ENCODER_CONTRACT: gen_core::VisionEncoderContract =
+    gen_core::VisionEncoderContract {
+        architecture: gen_core::VisionEncoderArchitecture::Qwen2_5Vl,
+        hidden_size: 1280,
+        intermediate_size: 3420,
+        num_hidden_layers: 32,
+        num_attention_heads: 16,
+        output_width: 3584,
+        hidden_activation: "silu",
+        patch_size: 14,
+        temporal_patch_size: 2,
+        spatial_merge_size: 2,
+        in_channels: 3,
+        num_position_embeddings: None,
+        deepstack_visual_indexes: &[],
+        window_size: Some(112),
+        full_attention_block_indexes: &[7, 15, 23, 31],
+    };
+
 pub use control_fun::{
     QwenFunControl, QwenFunControlPaths, QwenFunControlRequest, CONTROL_IN_DIM, CONTROL_LAYERS,
     DEFAULT_CONTROL_SCALE,

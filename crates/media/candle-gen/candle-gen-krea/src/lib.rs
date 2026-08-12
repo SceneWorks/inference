@@ -230,6 +230,25 @@ pub const ENCODER_CONTRACT: gen_core::EncoderContract = gen_core::EncoderContrac
     dense_storage_dtype_probe: Some("language_model.layers.0.input_layernorm.weight"),
 };
 
+pub const VISION_ENCODER_CONTRACT: gen_core::VisionEncoderContract =
+    gen_core::VisionEncoderContract {
+        architecture: gen_core::VisionEncoderArchitecture::Qwen3Vl,
+        hidden_size: 1024,
+        intermediate_size: 4096,
+        num_hidden_layers: 24,
+        num_attention_heads: 16,
+        output_width: 2560,
+        hidden_activation: "gelu_pytorch_tanh",
+        patch_size: 16,
+        temporal_patch_size: 2,
+        spatial_merge_size: 2,
+        in_channels: 3,
+        num_position_embeddings: Some(2304),
+        deepstack_visual_indexes: &[5, 11, 17],
+        window_size: None,
+        full_attention_block_indexes: &[],
+    };
+
 /// Registry id for the undistilled **Raw** full-CFG text-to-image variant (sc-9994 / epic 9992). The
 /// SAME string as the Krea LoRA *trainer* base (`crate::training::KREA_2_RAW_ID`) — Path 1 makes one id
 /// both the training base and a first-class generator; the trainer + generator live in separate
@@ -2236,9 +2255,10 @@ mod tests {
     use std::path::Path;
 
     fn write_valid_text_encoder(root: &Path) {
-        gen_core_testkit::write_encoder_contract_fixture(
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
             &root.join("text_encoder"),
             ENCODER_CONTRACT,
+            VISION_ENCODER_CONTRACT,
         )
         .unwrap();
     }

@@ -513,15 +513,16 @@ fn load_text_cancelable(
     if let Some(cancel) = cancel {
         candle_gen::check_cancel(cancel)?;
     }
+    let vision_encoder_source = crate::ENCODER_CONTRACT
+        .validate_source(&gen_core::WeightsSource::Dir(root.join("text_encoder")))?;
+    vision_encoder_source
+        .validate_vision(&crate::VISION_ENCODER_CONTRACT, &crate::ENCODER_CONTRACT)?;
     let tok = crate::tokenizer::KreaTokenizer::from_validated_source(source, device)?;
 
     let te_cfg = KreaTeConfig::qwen3_vl_4b();
     let te_w =
         source.read_unchanged(|weights| load_te_weights_cancelable(weights, device, cancel))?;
     let te = KreaTextEncoder::load(&te_w, "language_model", &te_cfg, MAX_TEXT_TOKENS)?;
-    let vision_encoder_source = crate::ENCODER_CONTRACT
-        .validate_source(&gen_core::WeightsSource::Dir(root.join("text_encoder")))?;
-
     Ok(KreaText {
         tok,
         te,

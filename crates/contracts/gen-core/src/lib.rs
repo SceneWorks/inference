@@ -42,6 +42,7 @@ pub mod tokenizer;
 pub mod train;
 pub mod transcribe;
 pub mod transform;
+pub mod vision_encoder_contract;
 pub mod voice_embed;
 pub mod weightsmeta;
 
@@ -137,6 +138,7 @@ pub use runtime::{
 pub use text_embed::{TextEmbedder, TextEmbedderDescriptor};
 pub use tier_integrity::{control_branch_tier, is_above_selected_tier};
 pub use tiling::{TilingConfig, VaeTiling};
+pub use vision_encoder_contract::{VisionEncoderArchitecture, VisionEncoderContract};
 pub use voice_embed::{VoiceEmbedder, VoiceEmbedderDescriptor, VoiceEmbedding};
 pub use weightsmeta::{
     safetensors_dir_bytes, safetensors_path_bytes, safetensors_path_tensor_headers,

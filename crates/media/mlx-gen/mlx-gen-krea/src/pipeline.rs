@@ -200,6 +200,10 @@ impl KreaText {
     ) -> Result<Self> {
         let vision_encoder_source = crate::model::ENCODER_CONTRACT
             .validate_source(&WeightsSource::Dir(root.join("text_encoder")))?;
+        vision_encoder_source.validate_vision(
+            &crate::model::VISION_ENCODER_CONTRACT,
+            &crate::model::ENCODER_CONTRACT,
+        )?;
         Ok(Self {
             tok: KreaTokenizer::from_validated_source(text_encoder_source)?,
             te: text_encoder_source
@@ -1953,6 +1957,71 @@ mod tests {
             .to_string();
         assert!(error.contains("field hidden_size"), "{error}");
         assert!(!error.contains("tokenizer"), "{error}");
+    }
+
+    #[test]
+    fn edit_vision_contract_rejects_missing_and_wrong_visual_surface_at_admission() {
+        let mut headers = crate::model::VISION_ENCODER_CONTRACT
+            .expected_headers()
+            .unwrap()
+            .into_iter()
+            .map(|(name, shape)| mlx_gen::gen_core::SafetensorsTensorHeader {
+                data_bytes: shape.iter().product::<usize>() as u64 * 2,
+                name,
+                dtype: mlx_gen::gen_core::weightsmeta::Dtype::F16,
+                shape,
+            })
+            .collect::<Vec<_>>();
+        headers.remove(0);
+        let error = crate::model::VISION_ENCODER_CONTRACT
+            .validate_tensor_headers(&headers, std::path::Path::new("missing-visual"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("visual.patch_embed.proj.weight"), "{error}");
+
+        let missing = tempfile::tempdir().unwrap();
+        gen_core_testkit::write_encoder_contract_fixture(
+            &missing.path().join("text_encoder"),
+            crate::model::ENCODER_CONTRACT,
+        )
+        .unwrap();
+        let source = crate::model::ENCODER_CONTRACT
+            .validate_source(&WeightsSource::Dir(missing.path().join("text_encoder")))
+            .unwrap();
+        let error = source
+            .validate_vision(
+                &crate::model::VISION_ENCODER_CONTRACT,
+                &crate::model::ENCODER_CONTRACT,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("vision_config"), "{error}");
+
+        let wrong = tempfile::tempdir().unwrap();
+        let component = wrong.path().join("text_encoder");
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
+            &component,
+            crate::model::ENCODER_CONTRACT,
+            crate::model::VISION_ENCODER_CONTRACT,
+        )
+        .unwrap();
+        let config_path = component.join("config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        config["vision_config"]["out_hidden_size"] =
+            serde_json::json!(crate::model::ENCODER_CONTRACT.hidden_size + 1);
+        std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let source = crate::model::ENCODER_CONTRACT
+            .validate_source(&WeightsSource::Dir(component))
+            .unwrap();
+        let error = source
+            .validate_vision(
+                &crate::model::VISION_ENCODER_CONTRACT,
+                &crate::model::ENCODER_CONTRACT,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("out_hidden_size"), "{error}");
     }
 
     #[test]
