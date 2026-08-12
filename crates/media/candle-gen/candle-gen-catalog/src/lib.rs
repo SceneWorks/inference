@@ -1184,9 +1184,9 @@ mod preview_advertising {
             register: candle_gen_sensenova::register_providers,
             denoise: Denoise::Bespoke,
             // Two direct emissions live in `t2i.rs`: the registered T2I loop and the registered
-            // reference/MultiReference it2i loop. Both ids reach both routes through
-            // `T2iModel::generate`; neither drives a shared sampler, which is what
-            // `Denoise::Bespoke` above declares. `preview.rs` gets no row: it carries only the
+            // reference/MultiReference it2i loop. Both ids reach those routes through
+            // `T2iModel::{generate, it2i_generate}`; neither drives a shared sampler, which is
+            // what `Denoise::Bespoke` above declares. `preview.rs` gets no row: it carries only the
             // measured three-channel pixel-space fit and the pool to the token grid, so it neither
             // drives a sampler nor emits. The understanding/VQA interleave entry point reuses the
             // same it2i loop rather than adding a third emission site.
