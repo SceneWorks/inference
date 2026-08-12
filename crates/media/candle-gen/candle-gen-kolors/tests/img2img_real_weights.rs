@@ -88,8 +88,8 @@ fn save(image: &Image, name: &str) {
 #[ignore = "needs KOLORS_IMG2IMG_SNAPSHOT + CUDA; run explicitly with --features cuda --ignored"]
 fn registered_reference_img2img_uses_the_vae_init_and_strength_tail() {
     const SIZE: u32 = 512;
-    const STEPS: u32 = 6;
-    const STRENGTH: f32 = 0.5;
+    const STEPS: u32 = 10;
+    const STRENGTH: f32 = 0.8;
 
     let generator = candle_gen_kolors::provider_registry()
         .expect("Kolors registry")
@@ -100,7 +100,9 @@ fn registered_reference_img2img_uses_the_vae_init_and_strength_tail() {
         .expect("load Kolors");
     let reference = structured_reference(SIZE);
     let base = GenerationRequest {
-        prompt: "a stained-glass fox on rolling green hills beneath a golden sun".into(),
+        prompt: "replace the flat landscape with a large red fox made of stained glass, while \
+                 preserving the rolling green hills and golden sun"
+            .into(),
         negative_prompt: Some("blurry, flat, watermark, text".into()),
         width: SIZE,
         height: SIZE,
@@ -138,12 +140,20 @@ fn registered_reference_img2img_uses_the_vae_init_and_strength_tail() {
         "strength-selected schedule tail"
     );
     let spread = standard_deviation(&img2img.pixels);
-    let delta = mean_abs_delta(&text_only.pixels, &img2img.pixels);
-    eprintln!("Kolors img2img: std={spread:.2}, mean |Δ vs T2I|={delta:.2}");
+    let t2i_delta = mean_abs_delta(&text_only.pixels, &img2img.pixels);
+    let reference_delta = mean_abs_delta(&reference.pixels, &img2img.pixels);
+    eprintln!(
+        "Kolors img2img: std={spread:.2}, mean |Δ vs T2I|={t2i_delta:.2}, \
+         mean |Δ vs reference|={reference_delta:.2}"
+    );
     assert!(spread > 8.0, "conditioned output is near-flat: {spread:.2}");
     assert!(
-        delta > 1.0,
-        "conditioned output is indistinguishable from the unconditioned route: {delta:.3}"
+        t2i_delta > 1.0,
+        "conditioned output is indistinguishable from the unconditioned route: {t2i_delta:.3}"
+    );
+    assert!(
+        reference_delta > 5.0,
+        "conditioned output did not materially edit the source image: {reference_delta:.3}"
     );
 
     save(&reference, "kolors_reference.png");
