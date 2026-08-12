@@ -1,5 +1,5 @@
-//! sc-17154: **cross-backend agreement with the MLX lane**, and an honest statement of the floor
-//! that comparison sits on.
+//! sc-17154 / sc-17155: **cross-backend agreement with the MLX lane**, and an honest statement of
+//! the floor that comparison sits on.
 //!
 //! # How the two backends are compared at all
 //!
@@ -9,31 +9,48 @@
 //! `.safetensors`, and cross-backend agreement is inferred as the sum of two independent residuals.
 //!
 //! This file does that *and* one thing stronger. `fixtures_are_byte_identical_to_the_mlx_lanes`
-//! pins the shared-golden half. Then `mlx-gen-minimax-h3/tests/cross_backend_record.rs` — an
-//! `#[ignore]`d generator run on Metal — records the MLX lane's **own decode** of those goldens
-//! into `tests/fixtures/mlx_cross_backend.safetensors`, and the tests below compare this port's
-//! tensors against MLX's directly. So the headline number is measured, not bounded.
+//! pins the shared-golden half over all four goldens. Then
+//! `mlx-gen-minimax-h3/tests/cross_backend_record.rs` — an `#[ignore]`d generator run on Metal —
+//! records the MLX lane's **own** decode/forward/denoise of those goldens into
+//! `tests/fixtures/mlx_cross_backend.safetensors`, and the tests below compare this port's tensors
+//! against MLX's directly. So the headline number is measured, not bounded.
+//!
+//! Coverage is the two VAEs (sc-17154) plus the DiT, the MM-RoPE tables, the token refiner, the
+//! whole-model velocity and the joint denoise loop (sc-17155) — 20 recorded tensors.
 //!
 //! # The tolerance, the floor, and what the floor is made of
 //!
 //! [`CROSS_TOL`] is `2e-2` peak-relative. That is not a statement about how close the two ports
 //! are — they are far closer — it is the bound the **noisier** of the two lanes can support.
 //!
-//! `the_cross_backend_floor_is_the_mlx_lanes_own_reduced_precision` measures both halves from
-//! committed data rather than quoting them:
+//! Both floor tests measure their halves from committed data rather than quoting them. Measured:
 //!
-//! * **candle vs the reference** is 2.1e-7 … 3.3e-6 (see `video_vae_parity.rs` /
-//!   `audio_vae_parity.rs`): f32 on the CPU, essentially round-off.
-//! * **MLX vs the reference** is ~1e-3 for the video decode and 2.7e-3 … 4.4e-3 for the audio one.
-//!   MLX evaluates f32 matmul in **reduced precision on Metal**, and the sibling MiniMax-H3 DiT
-//!   suite measured the same effect at ~4.2e-3.
+//! | stage | candle vs reference | MLX vs reference | candle vs MLX |
+//! |---|---|---|---|
+//! | video VAE (`ViT3DDecoder`) | 2.6e-7 | 1.05e-3 | 1.05e-3 |
+//! | DiT block | **1.2e-6** | **4.21e-3** | 4.23e-3 |
+//! | whole-model velocity | — | — | **6.03e-3** (the worst) |
+//! | joint denoise loop | — | — | **0.0 — bit-identical** |
 //!
-//! The floor is therefore **entirely MLX's**, and it is ~1e-3 … 4e-3. `CROSS_TOL` sits about 5×
-//! above it.
+//! Two things follow, and both matter:
+//!
+//! * **The floor is entirely MLX's.** candle is f32 on the CPU and floors at round-off; MLX
+//!   evaluates f32 matmul in **reduced precision on Metal**. At the DiT block the gap is ~3500×.
+//!   `CROSS_TOL` clears the worst measured residual (6.03e-3) by ~3.3×.
+//! * **The denoise loop agrees bitwise**, because it is scalar arithmetic over the reference's own
+//!   recorded velocities with no matmul in it — so that comparison is a genuine equality of the
+//!   scheduler and the row bookkeeping, not an agreement within a tolerance.
+//!
+//! This is also why the DiT's own parity suite gates at `1e-4` rather than inheriting the MLX
+//! lane's `1e-2`: a bound set from *this* lane's measured floor can see defect classes the
+//! cross-backend comparison structurally cannot.
 //!
 //! # What this comparison CANNOT detect — read before citing it as coverage
 //!
-//! Any divergence smaller than ~4e-3 relative is **invisible** to this gate. Concretely:
+//! Any divergence smaller than ~6e-3 relative is **invisible** to this gate — three orders above
+//! this lane's own 1.2e-6 parity residual, a gap
+//! `the_dit_cross_backend_floor_is_also_the_mlx_lanes` asserts on so the caveat cannot rot.
+//! Concretely:
 //!
 //! * an RMSNorm epsilon applied outside the square root instead of inside — measured at **5.9e-6**
 //!   through the whole video decoder in `video_vae_parity.rs`, roughly **three orders below** this
@@ -51,15 +68,16 @@
 //! exact, and it must not be cited as the latter.**
 //!
 //! What it *does* catch is exactly the class this epic has been bitten by five times: a layout or
-//! structural divergence. The sc-18740 gated-FFN half-swap moves the decode by 1.3e-1 here — two
-//! orders clear of the floor — while leaving cosine at 0.997 and the L2 norm unchanged to three
-//! digits.
+//! structural divergence. The sc-18740 gated-FFN half-swap moves the video decode by 1.3e-1 here —
+//! two orders clear of the floor — while leaving cosine at 0.997 and the L2 norm unchanged to three
+//! digits; in the **DiT**, which inherits the same swap, it moves the block by 8.8e-1 at cosine
+//! 0.708 with the norm changing only 79.5 → 91.7.
 
 mod common;
 
 use common::{
-    audio_fixture_config, cosine, fixture_config, l2_norm, rel, weights, Golden, AUDIO_FIXTURE,
-    FIXTURE, MLX_FIXTURE_DIR, MLX_RECORD,
+    audio_fixture_config, cosine, dit_fixture_config, fixture_config, l2_norm, rel, weights,
+    Golden, AUDIO_FIXTURE, DENOISE_FIXTURE, DIT_FIXTURE, FIXTURE, MLX_FIXTURE_DIR, MLX_RECORD,
 };
 
 use candle_gen::candle_core::{DType, Device, Tensor};
@@ -113,7 +131,12 @@ fn record() -> Golden {
 /// one reference. This is the drift guard.
 #[test]
 fn fixtures_are_byte_identical_to_the_mlx_lanes() {
-    for name in ["video_vae_decode", "audio_vae_decode"] {
+    for name in [
+        "video_vae_decode",
+        "audio_vae_decode",
+        "dit_block",
+        "av_denoise",
+    ] {
         let here = std::fs::read(format!(
             "{}/tests/fixtures/{name}.safetensors",
             env!("CARGO_MANIFEST_DIR")
@@ -153,6 +176,8 @@ fn mlx_record_is_bound_to_these_fixtures() {
     for (key, path) in [
         ("video_fixture_fnv1a64", FIXTURE),
         ("audio_fixture_fnv1a64", AUDIO_FIXTURE),
+        ("dit_fixture_fnv1a64", DIT_FIXTURE),
+        ("denoise_fixture_fnv1a64", DENOISE_FIXTURE),
     ] {
         let recorded = r
             .meta(key)
@@ -487,5 +512,340 @@ fn a_gated_ffn_half_swap_is_loud_against_the_mlx_record() {
         peak > CROSS_TOL * 5.0,
         "the half-swap moved the decode by only {peak:.3e}; this cross-backend gate would not \
          catch the sc-18740 defect and should not be cited as covering it"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The DiT, the AdaLN cache and the joint denoise (sc-17155)
+// ---------------------------------------------------------------------------------------------
+
+/// Every DiT-side tensor the MLX lane recorded, reproduced here and compared directly.
+///
+/// This is the cross-backend half of sc-17155's first and fourth acceptance criteria: block-level
+/// and MM-RoPE parity fixtures matching the mlx lane's, and cross-backend agreement within the
+/// documented tolerance.
+///
+/// The rope tables are the interesting entry. The two lanes build them by **deliberately different
+/// routes** — MLX multiplies `[seq, 3, 1]` positions by a `[1, 1, F]` `inv_freq` on device at f32,
+/// this lane accumulates the angles on the host in f64 and materializes once — so agreement there is
+/// evidence about the *convention* (the `t,h,w` split, the absent 2π, the partial rotary), which is
+/// exactly what a shared-implementation comparison could not give.
+#[test]
+fn dit_agrees_with_the_mlx_lane() {
+    use candle_gen_minimax_h3::dit::layers::DitAttention;
+    use candle_gen_minimax_h3::dit::model::{BlockModulation, PackedForward};
+    use candle_gen_minimax_h3::{DitBlock, MiniMaxH3Dit, MmRope, TokenRefiner};
+
+    let f = Golden::load(DIT_FIXTURE);
+    let r = record();
+    let cfg = dit_fixture_config();
+    let device = Device::Cpu;
+    let map = f.model_map(&["src.", "in.", "out.", "layout."]);
+    let w = weights(map);
+
+    let mut checked = 0usize;
+    let mut worst = 0.0f32;
+    let report = |name: &str, got: &Tensor, checked: &mut usize, worst: &mut f32| {
+        let want = r.tensor(name);
+        assert_eq!(got.dims(), want.dims(), "{name}: shape");
+        let (peak, mean) = rel(got, &want);
+        println!(
+            "  {name}: candle-vs-mlx peak rel {peak:.3e} (mean {mean:.3e}, cosine {:.7})",
+            cosine(got, &want)
+        );
+        assert!(
+            peak < CROSS_TOL,
+            "{name}: the two backends disagree by {peak:.3e}, over the {CROSS_TOL:.0e} bound"
+        );
+        *checked += 1;
+        *worst = worst.max(peak);
+    };
+
+    let rope = MmRope::new(cfg.rope_freq_dim, cfg.rope_theta).expect("rope");
+    let tables = rope
+        .tables(&f.tensor("layout.position_ids"), DType::F32)
+        .expect("tables");
+    report("dit.rope_cos", &tables.cos, &mut checked, &mut worst);
+    report("dit.rope_sin", &tables.sin, &mut checked, &mut worst);
+
+    let temb = f.tensor("in.temb");
+    let adaln = f.indices("layout.adaln_indices");
+
+    let attn = DitAttention::from_weights(&w, "transformer_blocks.0.attn", &cfg, DType::F32)
+        .expect("attention");
+    report(
+        "dit.attn.hidden",
+        &attn
+            .forward(&f.tensor("in.attn.hidden"), Some((&rope, &tables)))
+            .expect("attn forward"),
+        &mut checked,
+        &mut worst,
+    );
+
+    let block =
+        DitBlock::from_weights(&w, "transformer_blocks.0", &cfg, DType::F32).expect("block");
+    report(
+        "dit.block.hidden",
+        &block
+            .forward_with_temb(&f.tensor("in.block.hidden"), &temb, &adaln, &rope, &tables)
+            .expect("block forward"),
+        &mut checked,
+        &mut worst,
+    );
+
+    let refiner =
+        TokenRefiner::from_weights(&w, "token_refiner", &cfg, DType::F32).expect("refiner");
+    report(
+        "dit.refiner.hidden",
+        &refiner
+            .forward(&f.tensor("in.refiner.hidden"))
+            .expect("refiner forward"),
+        &mut checked,
+        &mut worst,
+    );
+
+    let dit = MiniMaxH3Dit::from_weights(&w, &cfg, &device, DType::F32).expect("the whole DiT");
+    let text_rows = dit
+        .embed_context(&f.tensor("in.refiner.context"))
+        .expect("context");
+    report("dit.refined_context", &text_rows, &mut checked, &mut worst);
+
+    let norm_out = dit
+        .projections()
+        .norm_out
+        .modulation(&temb)
+        .expect("norm_out modulation");
+    let timestep_indices = f.indices("layout.timestep_indices");
+    let video_rows = f.tensor("in.model.video_rows");
+    let audio_rows = f.tensor("in.model.audio_rows");
+    let text_indices = f.u32_vec("layout.text_indices");
+    let video_indices = f.u32_vec("layout.video_indices");
+    let audio_indices = f.u32_vec("layout.audio_indices");
+    let packed = PackedForward {
+        video_rows: &video_rows,
+        audio_rows: &audio_rows,
+        text_rows: &text_rows,
+        adaln_indices: &adaln,
+        timestep_indices: &timestep_indices,
+        tables: &tables,
+        text_indices: &text_indices,
+        video_indices: &video_indices,
+        audio_indices: &audio_indices,
+    };
+    let (video, audio) = dit
+        .forward_packed(&packed, BlockModulation::Temb(&temb), &norm_out)
+        .expect("whole-model forward");
+    report("dit.model.video_velocity", &video, &mut checked, &mut worst);
+    report("dit.model.audio_velocity", &audio, &mut checked, &mut worst);
+
+    assert_eq!(checked, 8, "every recorded DiT tensor must be compared");
+    println!("DIT cross-backend worst peak-relative: {worst:.3e} (bound {CROSS_TOL:.0e})");
+}
+
+/// The **joint denoise loop's** output, both modalities, against the MLX lane's own run of the same
+/// schedule over the same recorded velocities.
+///
+/// This is sc-17155's third acceptance criterion held across backends: both modalities emitted,
+/// time-aligned, with one forward per step. Because both lanes replay the reference's velocity table
+/// rather than running a model, the comparison isolates the scheduler arithmetic and the row
+/// bookkeeping — the two sigma shifts, the reversed velocity sign, the two-source σ, and the
+/// conditioning rows the loop must not touch.
+#[test]
+fn joint_denoise_agrees_with_the_mlx_lane() {
+    use candle_gen::gen_core::CancelFlag;
+    use candle_gen_minimax_h3::denoise::{
+        adaln_schedule, denoise_av, JointGeometry, JointSchedule, JointStep, JointVelocity,
+        PackedLayout, TEXT_TAG,
+    };
+    use candle_gen_minimax_h3::dit::positions::KeyframeAnchor;
+
+    let f = Golden::load(DENOISE_FIXTURE);
+    let r = record();
+    let device = Device::Cpu;
+
+    struct Replay {
+        video: Vec<Tensor>,
+        audio: Vec<Tensor>,
+    }
+    impl JointVelocity for Replay {
+        fn forward(&mut self, step: &JointStep<'_>) -> candle_gen::Result<(Tensor, Tensor)> {
+            Ok((
+                self.video[step.index].clone(),
+                self.audio[step.index].clone(),
+            ))
+        }
+    }
+
+    let layout = PackedLayout::build(
+        JointGeometry::new(124, 4, 6).expect("geometry"),
+        [1, 2, 2],
+        &[TEXT_TAG; 5],
+        2,
+        &[KeyframeAnchor::First, KeyframeAnchor::Last],
+        &device,
+    )
+    .expect("layout");
+    let joint = JointSchedule::new(3).expect("schedule");
+    let adaln = adaln_schedule(&joint).expect("adaln schedule");
+    let mut model = Replay {
+        video: (0..2)
+            .map(|i| f.batched(&format!("in.video_velocity.{i}")))
+            .collect(),
+        audio: (0..2)
+            .map(|i| f.batched(&format!("in.audio_velocity.{i}")))
+            .collect(),
+    };
+    let (video, audio) = denoise_av(
+        &mut model,
+        &layout,
+        &joint,
+        &adaln,
+        &f.batched("in.video_latents"),
+        &f.batched("in.audio_latents"),
+        &device,
+        &CancelFlag::default(),
+        &mut |_| {},
+    )
+    .expect("denoise");
+
+    let mut worst = 0.0f32;
+    for (name, got) in [
+        ("denoise.video_latents", &video),
+        ("denoise.audio_latents", &audio),
+    ] {
+        let want = r.tensor(name);
+        assert_eq!(got.dims(), want.dims(), "{name}: shape");
+        let (peak, mean) = rel(got, &want);
+        println!(
+            "  {name}: candle-vs-mlx peak rel {peak:.3e} (mean {mean:.3e}, cosine {:.7})",
+            cosine(got, &want)
+        );
+        assert!(
+            peak < CROSS_TOL,
+            "{name}: the two backends disagree by {peak:.3e}, over the {CROSS_TOL:.0e} bound"
+        );
+        worst = worst.max(peak);
+    }
+    println!("DENOISE cross-backend worst peak-relative: {worst:.3e} (bound {CROSS_TOL:.0e})");
+}
+
+/// **The DiT half of the floor, measured — and it is a different number from the VAE half.**
+///
+/// `the_cross_backend_floor_is_the_mlx_lanes_own_reduced_precision` measures the video VAE's. The
+/// DiT is a deeper stack of wider matmuls, so its MLX-side residual is its own quantity and is
+/// measured here rather than assumed to be the same.
+///
+/// Both halves of the comparison are computed from committed data: the reference golden and the MLX
+/// record are both in the repo, so this measures MLX-vs-reference and candle-vs-reference directly
+/// and reports which of the two sets the bound.
+#[test]
+fn the_dit_cross_backend_floor_is_also_the_mlx_lanes() {
+    use candle_gen_minimax_h3::{DitBlock, MmRope};
+
+    let f = Golden::load(DIT_FIXTURE);
+    let r = record();
+    let cfg = dit_fixture_config();
+    let w = weights(f.model_map(&["src.", "in.", "out.", "layout."]));
+
+    let rope = MmRope::new(cfg.rope_freq_dim, cfg.rope_theta).expect("rope");
+    let tables = rope
+        .tables(&f.tensor("layout.position_ids"), DType::F32)
+        .expect("tables");
+    let block =
+        DitBlock::from_weights(&w, "transformer_blocks.0", &cfg, DType::F32).expect("block");
+    let candle = block
+        .forward_with_temb(
+            &f.tensor("in.block.hidden"),
+            &f.tensor("in.temb"),
+            &f.indices("layout.adaln_indices"),
+            &rope,
+            &tables,
+        )
+        .expect("block forward");
+
+    let reference = f.tensor("out.block.hidden");
+    let mlx = r.tensor("dit.block.hidden");
+    let (mlx_vs_ref, _) = rel(&mlx, &reference);
+    let (candle_vs_ref, _) = rel(&candle, &reference);
+    let (candle_vs_mlx, _) = rel(&candle, &mlx);
+    println!(
+        "FLOOR (DiT block): mlx-vs-reference {mlx_vs_ref:.3e}, candle-vs-reference \
+         {candle_vs_ref:.3e}, candle-vs-mlx {candle_vs_mlx:.3e}; bound {CROSS_TOL:.0e}"
+    );
+
+    assert!(
+        mlx_vs_ref > candle_vs_ref * 10.0,
+        "the MLX lane's DiT residual ({mlx_vs_ref:.3e}) is no longer an order above candle's \
+         ({candle_vs_ref:.3e}); this file attributes the whole cross-backend floor to Metal's \
+         reduced-precision matmul and would need re-stating"
+    );
+    assert!(
+        CROSS_TOL > mlx_vs_ref * 2.0,
+        "the cross-backend bound {CROSS_TOL:.0e} does not clear the measured DiT floor \
+         {mlx_vs_ref:.3e} with margin"
+    );
+    assert!(
+        candle_vs_mlx < CROSS_TOL,
+        "candle and mlx disagree by {candle_vs_mlx:.3e}"
+    );
+
+    // **What this cannot see, in the DiT's own units.** `dit_parity.rs` measures this lane against
+    // the reference at ~1.2e-6; the cross-backend floor here is three orders looser, so every
+    // defect class between those two numbers is invisible to THIS test and caught only by the
+    // committed-fixture suite. Stated as an assertion so the claim cannot rot.
+    assert!(
+        candle_vs_ref * 100.0 < mlx_vs_ref,
+        "the two-order gap between this lane's own parity residual and the cross-backend floor has \
+         closed; the 'cross-backend agreement is not numerical exactness' caveat must be re-stated"
+    );
+}
+
+/// The other direction: a **layout** error is loud across backends too, which is what makes the
+/// DiT cross-backend gate worth having.
+///
+/// The sc-18740 gated-FFN half-swap — which the DiT inherits — diverges from the MLX record by two
+/// orders more than the floor, while leaving cosine well away from 0 and the L2 norm the same to
+/// within a few percent.
+#[test]
+fn a_dit_gated_ffn_half_swap_is_loud_against_the_mlx_record() {
+    use candle_gen_minimax_h3::{swap_gated_halves, DitBlock, MmRope};
+
+    let f = Golden::load(DIT_FIXTURE);
+    let r = record();
+    let cfg = dit_fixture_config();
+    let want = r.tensor("dit.block.hidden");
+
+    let rope = MmRope::new(cfg.rope_freq_dim, cfg.rope_theta).expect("rope");
+    let tables = rope
+        .tables(&f.tensor("layout.position_ids"), DType::F32)
+        .expect("tables");
+
+    let mut map = f.model_map(&["src.", "in.", "out.", "layout."]);
+    let key = "transformer_blocks.0.ff.net.0.proj.weight";
+    let swapped = swap_gated_halves(&map[key]).expect("swap");
+    map.insert(key.into(), swapped);
+    let mutated = DitBlock::from_weights(&weights(map), "transformer_blocks.0", &cfg, DType::F32)
+        .expect("block")
+        .forward_with_temb(
+            &f.tensor("in.block.hidden"),
+            &f.tensor("in.temb"),
+            &f.indices("layout.adaln_indices"),
+            &rope,
+            &tables,
+        )
+        .expect("block forward");
+
+    let (peak, mean) = rel(&mutated, &want);
+    println!(
+        "sc-18740 half-swap vs the MLX DiT record: peak rel {peak:.3e} (mean {mean:.3e}), cosine \
+         {:.6}, ||mlx||={:.4} ||swapped||={:.4}; bound {CROSS_TOL:.0e}",
+        cosine(&mutated, &want),
+        l2_norm(&want),
+        l2_norm(&mutated),
+    );
+    assert!(
+        peak > CROSS_TOL * 5.0,
+        "the half-swap moved the block by only {peak:.3e}; this cross-backend gate would not catch \
+         the sc-18740 defect in the DiT and should not be cited as covering it"
     );
 }

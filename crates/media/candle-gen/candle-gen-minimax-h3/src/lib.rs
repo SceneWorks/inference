@@ -62,12 +62,28 @@
 //! reduced-precision `conv_transpose1d`; here it is a choice, made so the cross-backend residual is
 //! attributable to matmul precision rather than to two different resampling algorithms.
 //!
+//! ## The DiT, the AdaLN evict and the joint denoise (sc-17155)
+//!
+//! - [`dit`] is the 50-block stack: [`dit::config`] the published geometry, [`dit::rope`] the
+//!   3-axis **MM-RoPE**, [`dit::positions`] the per-modality coordinate conventions (audio's is the
+//!   highest-risk detail in the port), [`dit::layers`] / [`dit::block`] / [`dit::refiner`] the
+//!   modules, [`dit::heads`] the 17 mixed-precision input/output tensors, and [`dit::model`] the
+//!   whole `MiniMaxH3Transformer3DModel`;
+//! - [`dit::adaln`] is the **precompute-and-evict** lever — 26_020_915_200 B of `adaln_proj`
+//!   released before denoise — and it is the module whose answer differs most from the MLX lane's,
+//!   because candle is eager and its CUDA pool releases on *synchronize* rather than on a cache
+//!   drain;
+//! - [`denoise`] is the joint loop: [`denoise::geometry`] the AV time alignment,
+//!   [`denoise::schedule`] the two sigma shifts and the reversed velocity sign,
+//!   [`denoise::packing`] the packed sequence, and the loop itself, which runs **one** forward per
+//!   step because the checkpoint is guidance-distilled.
+//!
 //! ## Not in this crate
 //!
-//! Either CNN encoder, the Qwen3-VL-32B text encoder, the 50-layer DiT with its AdaLN
-//! precompute/evict and MM-RoPE (sc-17155), the pipeline and measured `vramGbByTier` (sc-17156),
-//! and Ref2VA (sc-17157). Nothing is registered with `candle-gen-catalog` — there is no generator
-//! to ship until the pipeline lands, which is exactly the state of the MLX sibling.
+//! The 3-D causal CNN video encoder (ported on the MLX side by sc-17148; the candle twin is a
+//! tracked follow-up), the Qwen3-VL-32B text encoder, the pipeline and measured `vramGbByTier`
+//! (sc-17156), and Ref2VA (sc-17157). Nothing is registered with `candle-gen-catalog` — there is no
+//! generator to ship until the pipeline lands, which is exactly the state of the MLX sibling.
 
 pub mod alias_free;
 pub mod audio_config;
@@ -76,6 +92,8 @@ pub mod blocks;
 pub mod chunking;
 pub mod config;
 pub mod decoder;
+pub mod denoise;
+pub mod dit;
 pub mod layout;
 pub mod nn;
 pub mod rope;
@@ -97,6 +115,16 @@ pub use config::{
     LATENTS_STD, LATENT_CHANNELS, TOKEN_DROP, VAE_RATIO, VAE_RATIO_T,
 };
 pub use decoder::ViT3dDecoder;
+pub use denoise::{
+    adaln_schedule, denoise_av, DenoiseModality, JointGeometry, JointSchedule, JointStep,
+    JointVelocity, PackedLayout, RowClass, SigmaSchedule, AUDIO_SIGMA_SHIFT, LEGAL_FRAME_COUNTS,
+    NUM_ROW_CLASSES, VIDEO_SIGMA_SHIFT,
+};
+pub use dit::{
+    release_device_memory, AdaLnCache, AdaLnResidency, DitBlock, JointDit, KeyframeAnchor,
+    MiniMaxH3Dit, MiniMaxH3DitConfig, MmRope, TimestepSchedule, TokenRefiner, MODALITY_NUM,
+    PUBLISHED_DIT_TENSORS,
+};
 pub use layout::{
     split_gate_value, swap_gated_halves, GatedFfnLayout, AUDIO_VAE_IS_UNCONVERTED,
     PUBLISHED_GATED_FFN_LAYOUT,

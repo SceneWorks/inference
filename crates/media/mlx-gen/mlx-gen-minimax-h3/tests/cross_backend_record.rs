@@ -30,14 +30,58 @@ mod common;
 
 use std::collections::HashMap;
 
-use common::{audio_fixture_config, fixture_config, to_nlc, AUDIO_FIXTURE, FIXTURE};
+use common::{
+    audio_fixture_config, dit_fixture_config, fixture_config, to_nlc, AUDIO_FIXTURE, DIT_FIXTURE,
+    FIXTURE,
+};
 
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::weights::Weights;
+use mlx_gen::{CancelFlag, Result};
 use mlx_gen_minimax_h3::audio_vae::{AmpBlock1, BigVgan};
 use mlx_gen_minimax_h3::blocks::TransformerBlock;
-use mlx_gen_minimax_h3::{MiniMaxH3AudioVae, MiniMaxH3VideoVae, Rope3d, SnakeBeta, ViT3dDecoder};
+use mlx_gen_minimax_h3::denoise::{
+    adaln_schedule, denoise_av, JointGeometry, JointSchedule, JointStep, JointVelocity,
+    PackedLayout, TEXT_TAG,
+};
+use mlx_gen_minimax_h3::dit::layers::DitAttention;
+use mlx_gen_minimax_h3::dit::model::{BlockModulation, PackedForward};
+use mlx_gen_minimax_h3::dit::positions::KeyframeAnchor;
+use mlx_gen_minimax_h3::{
+    DitBlock, MiniMaxH3AudioVae, MiniMaxH3Dit, MiniMaxH3VideoVae, MmRope, Rope3d, SnakeBeta,
+    TokenRefiner, ViT3dDecoder,
+};
+
+/// The committed joint-denoise fixture (sc-17146), whose loop output the candle lane is held
+/// against (sc-17155).
+const DENOISE_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/av_denoise.safetensors"
+);
+
+/// Replays the denoise fixture's per-step velocities, so the recorded loop output is a property of
+/// the scheduler and the row bookkeeping rather than of a model.
+struct Replay {
+    video: Vec<Array>,
+    audio: Vec<Array>,
+}
+
+impl JointVelocity for Replay {
+    fn forward(&mut self, step: &JointStep<'_>) -> Result<(Array, Array)> {
+        Ok((
+            self.video[step.index].clone(),
+            self.audio[step.index].clone(),
+        ))
+    }
+}
+
+/// `[rows, F]` fixture tensor → the `[1, rows, F]` the loop takes.
+fn batched(f: &Weights, key: &str) -> Array {
+    let t = f.require(key).unwrap();
+    let s = t.shape();
+    t.reshape(&[1, s[0], s[1]]).unwrap()
+}
 
 /// FNV-1a over a file's bytes — a dependency-free binding between this record and the exact fixture
 /// bytes it was produced from.
@@ -177,6 +221,150 @@ fn record_mlx_decode_for_the_candle_cross_backend_gate() {
         avae.decode_stereo(&avae.denormalize(z).unwrap()).unwrap(),
     ));
 
+    // ---- DiT + joint denoise (sc-17155) -------------------------------------------------------
+    // The candle lane implements the DiT, the AdaLN precompute/evict and the joint loop, and is
+    // held against THIS lane's numbers rather than only against the shared reference. Everything
+    // below runs at the committed fixtures' tiny geometry.
+    let df = Weights::from_file(DIT_FIXTURE).unwrap();
+    let dcfg = dit_fixture_config();
+    let dit_weights = || {
+        let mut w = Weights::from_file(DIT_FIXTURE).unwrap();
+        for prefix in ["src.", "in.", "out.", "layout."] {
+            w.remove_prefix(prefix);
+        }
+        w
+    };
+    let position_ids = df.require("layout.position_ids").unwrap();
+    let rope = MmRope::new(dcfg.rope_freq_dim, dcfg.rope_theta).unwrap();
+    let tables = rope.tables(position_ids, Dtype::Float32).unwrap();
+    record.push(("dit.rope_cos".into(), tables.cos.clone()));
+    record.push(("dit.rope_sin".into(), tables.sin.clone()));
+
+    let adaln_idx = df
+        .require("layout.adaln_indices")
+        .unwrap()
+        .as_dtype(Dtype::Int32)
+        .unwrap();
+    let temb = df.require("in.temb").unwrap().clone();
+
+    let mut w = dit_weights();
+    let attn =
+        DitAttention::from_weights(&mut w, "transformer_blocks.0.attn", &dcfg, Dtype::Float32)
+            .unwrap();
+    record.push((
+        "dit.attn.hidden".into(),
+        attn.forward(
+            df.require("in.attn.hidden").unwrap(),
+            Some((&rope, &tables)),
+        )
+        .unwrap(),
+    ));
+
+    let mut w = dit_weights();
+    let block =
+        DitBlock::from_weights(&mut w, "transformer_blocks.0", &dcfg, Dtype::Float32).unwrap();
+    record.push((
+        "dit.block.hidden".into(),
+        block
+            .forward_with_temb(
+                df.require("in.block.hidden").unwrap(),
+                &temb,
+                &adaln_idx,
+                &rope,
+                &tables,
+            )
+            .unwrap(),
+    ));
+
+    let mut w = dit_weights();
+    let refiner =
+        TokenRefiner::from_weights(&mut w, "token_refiner", &dcfg, Dtype::Float32).unwrap();
+    record.push((
+        "dit.refiner.hidden".into(),
+        refiner
+            .forward(df.require("in.refiner.hidden").unwrap())
+            .unwrap(),
+    ));
+
+    // The whole model — the gate that covers the 17 projections and their composition.
+    let mut w = dit_weights();
+    let dit = MiniMaxH3Dit::from_weights(&mut w, &dcfg, Dtype::Float32).unwrap();
+    let text_rows = dit
+        .embed_context(df.require("in.refiner.context").unwrap())
+        .unwrap();
+    record.push(("dit.refined_context".into(), text_rows.clone()));
+    let norm_out = dit.projections().norm_out.modulation(&temb).unwrap();
+    let idx = |k: &str| -> Vec<i32> {
+        df.require(k)
+            .unwrap()
+            .as_dtype(Dtype::Int32)
+            .unwrap()
+            .as_slice::<i32>()
+            .to_vec()
+    };
+    let (text_indices, video_indices, audio_indices) = (
+        idx("layout.text_indices"),
+        idx("layout.video_indices"),
+        idx("layout.audio_indices"),
+    );
+    let timestep_indices = df
+        .require("layout.timestep_indices")
+        .unwrap()
+        .as_dtype(Dtype::Int32)
+        .unwrap();
+    let video_rows = df.require("in.model.video_rows").unwrap().clone();
+    let audio_rows = df.require("in.model.audio_rows").unwrap().clone();
+    let packed = PackedForward {
+        video_rows: &video_rows,
+        audio_rows: &audio_rows,
+        text_rows: &text_rows,
+        adaln_indices: &adaln_idx,
+        timestep_indices: &timestep_indices,
+        tables: &tables,
+        text_indices: &text_indices,
+        video_indices: &video_indices,
+        audio_indices: &audio_indices,
+    };
+    let (video_velocity, audio_velocity) = dit
+        .forward_packed(&packed, BlockModulation::Temb(&temb), &norm_out)
+        .unwrap();
+    record.push(("dit.model.video_velocity".into(), video_velocity));
+    record.push(("dit.model.audio_velocity".into(), audio_velocity));
+
+    // The joint denoise loop, replayed over the reference's own velocities.
+    let nf = Weights::from_file(DENOISE_FIXTURE).unwrap();
+    let layout = PackedLayout::build(
+        JointGeometry::new(124, 4, 6).unwrap(),
+        [1, 2, 2],
+        &[TEXT_TAG; 5],
+        2,
+        &[KeyframeAnchor::First, KeyframeAnchor::Last],
+    )
+    .unwrap();
+    let joint = JointSchedule::new(3).unwrap();
+    let adaln = adaln_schedule(&joint).unwrap();
+    let mut model = Replay {
+        video: (0..2)
+            .map(|i| batched(&nf, &format!("in.video_velocity.{i}")))
+            .collect(),
+        audio: (0..2)
+            .map(|i| batched(&nf, &format!("in.audio_velocity.{i}")))
+            .collect(),
+    };
+    let (dv, da) = denoise_av(
+        &mut model,
+        &layout,
+        &joint,
+        &adaln,
+        &batched(&nf, "in.video_latents"),
+        &batched(&nf, "in.audio_latents"),
+        &CancelFlag::default(),
+        &mut |_| {},
+    )
+    .unwrap();
+    record.push(("denoise.video_latents".into(), dv));
+    record.push(("denoise.audio_latents".into(), da));
+
     // ---- write ------------------------------------------------------------------------------
     for (name, array) in &record {
         assert!(
@@ -190,9 +378,11 @@ fn record_mlx_decode_for_the_candle_cross_backend_gate() {
     let mut metadata: HashMap<String, String> = HashMap::new();
     metadata.insert("backend".into(), "mlx".into());
     metadata.insert("dtype".into(), "float32".into());
-    metadata.insert("story".into(), "sc-17154".into());
+    metadata.insert("story".into(), "sc-17154, sc-17155".into());
     metadata.insert("video_fixture_fnv1a64".into(), digest(FIXTURE));
     metadata.insert("audio_fixture_fnv1a64".into(), digest(AUDIO_FIXTURE));
+    metadata.insert("dit_fixture_fnv1a64".into(), digest(DIT_FIXTURE));
+    metadata.insert("denoise_fixture_fnv1a64".into(), digest(DENOISE_FIXTURE));
 
     Array::save_safetensors(
         record.iter().map(|(k, v)| (k.as_str(), v)),
