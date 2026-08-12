@@ -1,19 +1,17 @@
 name: CI
 
 on:
-  # No `branches: [main]` here, deliberately. Ruleset 20481541 makes main reachable only through
-  # the merge queue, which runs this whole workflow against the speculative merge commit — the
-  # exact commit that then lands. A post-merge run would recompile a verdict that already exists,
-  # at ~15-30 min per merge across ~24 merges/day, which is the largest single CI saving available
-  # here. Tags keep their trigger: release lanes are driven by `refs/tags/runtime-*` and never pass
-  # through the queue.
-  #
-  # Known and accepted gap: with `max_entries_to_merge: 5` a batch is verified at its tip, so the
-  # intermediate merge commits inside a batch are not independently compiled. `grouping_strategy:
-  # ALLGREEN` keeps a batch from landing on a red member, but a `git bisect` across main can still
-  # land on an untested intermediate. Restore `branches: [main]` if that ever costs more than the
-  # duplicate runs did.
+  # `branches: [main]` is load-bearing. The merge queue was removed from ruleset 20481541 on
+  # 2026-08-11, so no event tests the commit that actually lands: a merge commit is a new SHA
+  # that no `pull_request` run ever saw. The ruleset still requires the `CI gate` context on
+  # main, which leaves this post-merge run as the only thing that can produce it — without it
+  # main carries zero check-runs and the required context is unproducible (sc-18825). This was
+  # dropped in e1032710 when the queue was introduced; the queue outlived it by six days. Tags
+  # keep their own trigger: release lanes are driven by `refs/tags/runtime-*`. The now-dead
+  # `merge_group:` trigger below is retained deliberately so re-enabling a queue stays a
+  # ruleset-only change.
   push:
+    branches: [main]
     tags: ["runtime-*"]
   pull_request:
   # A merge queue tests a speculative merge on a `gh-readonly-queue/main/**` ref. Without this
@@ -38,12 +36,12 @@ permissions:
 # compiling its cfg, and a killed run misattributes the break to the next commit and makes
 # bisect over main useless.
 #
-# Keying on github.sha rather than relying on cancel-in-progress alone is what fixed it, and
-# the reason survives the trigger's removal: GitHub allows at most ONE pending run per
-# concurrency group and evicts it when a newer run queues, so a shared group drops the middle
-# entry of a 3+ burst even with cancel-in-progress off. Per-SHA groups cannot evict each other;
-# runs serialize on the runner instead. Tag builds likewise never cancel (tags are immutable —
-# see CONTRIBUTING). Do NOT collapse this back to `group: ...${{ github.ref }}`.
+# Keying on github.sha rather than relying on cancel-in-progress alone is what fixed it, and it
+# is what makes the restored main trigger safe (sc-18825): GitHub allows at most ONE pending
+# run per concurrency group and evicts it when a newer run queues, so a shared group drops the
+# middle entry of a 3+ burst even with cancel-in-progress off. Per-SHA groups cannot evict
+# each other; runs serialize on the runner instead. Tag builds likewise never cancel (tags are
+# immutable — see CONTRIBUTING). Do NOT collapse this back to `group: ...${{ github.ref }}`.
 #
 # merge_group deliberately lands in the github.sha branch too. Each speculative merge is a
 # distinct commit, so per-SHA groups let concurrently-built queue entries run side by side
