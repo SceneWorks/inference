@@ -144,9 +144,13 @@ fn selection(
             MemoryNumericTier {
                 precision: Precision::Bf16,
                 quant: tier(),
-                component_precision_floors: (mlx_gen_mage::model::REGISTRATION.descriptor)()
-                    .capabilities
-                    .component_precision_floors,
+                component_precision_floors: if tier() == Some(Quant::Q4) {
+                    (mlx_gen_mage::model::REGISTRATION.descriptor)()
+                        .capabilities
+                        .component_precision_floors
+                } else {
+                    &[]
+                },
             },
             false,
         )

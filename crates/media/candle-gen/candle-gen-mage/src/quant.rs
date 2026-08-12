@@ -28,6 +28,19 @@ pub const COMPONENT_PRECISION_FLOORS: &[ComponentPrecisionFloor] = &[
     },
 ];
 
+/// Return only the provider precision floors active for `selected`.
+///
+/// The complete table remains descriptor-visible. Its two entries apply only to Q4, so Q8 and
+/// dense BF16 receipts must be empty rather than falsely claiming Q4-to-Q8 promotions.
+pub(crate) const fn active_component_precision_floors(
+    selected: Option<Quant>,
+) -> &'static [ComponentPrecisionFloor] {
+    match selected {
+        Some(Quant::Q4) => COMPONENT_PRECISION_FLOORS,
+        _ => &[],
+    }
+}
+
 pub(crate) fn component_quant(component: PrecisionFloorComponent, selected: Quant) -> Quant {
     effective_component_quant(COMPONENT_PRECISION_FLOORS, component, selected)
 }
@@ -145,6 +158,12 @@ mod tests {
         ] {
             assert_eq!(component_quant(component, Quant::Q8), Quant::Q8);
         }
+        assert_eq!(
+            active_component_precision_floors(Some(Quant::Q4)),
+            COMPONENT_PRECISION_FLOORS
+        );
+        assert!(active_component_precision_floors(Some(Quant::Q8)).is_empty());
+        assert!(active_component_precision_floors(None).is_empty());
     }
 
     #[test]
