@@ -1,0 +1,30 @@
+[package]
+name = "candle-gen-minimax-h3"
+version = "0.0.0"
+edition = "2021"
+description = "MiniMax-H3 (Hailuo 3.0) joint audio+video provider crate for candle-gen — the Windows/CUDA sibling of mlx-gen-minimax-h3. Currently the two VAE decode paths."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/candle-gen"
+keywords = ["candle", "cuda", "video", "minimax", "inference"]
+categories = ["science"]
+
+[dependencies]
+candle-gen = { path = "../candle-gen" }
+# MiniMax-H3 has NO candle-transformers reference: the 36-layer transformer video-VAE decoder, its
+# 3-D partial rotary, the DAC-lineage BigVGAN audio decoder and the Kaiser-sinc alias-free
+# resamplers are all written here on candle-core/candle-nn.
+# Parses `vae/config.json` and the audio VAE's `config.json` + `config.yaml` + `metadata.json`
+# source triple (the three documents the Apache-2.0 reference's `from_pretrained` reads).
+serde_json = { workspace = true }
+
+[features]
+default = []
+metal = ["candle-gen/metal"]
+cuda = ["candle-gen/cuda"]
+
+[dev-dependencies]
+# RAII fixture roots for the real-weight helpers (sc-17791). A `TempDir` guard removes the tree on
+# `Drop` — including out of a panicking test.
+tempfile = { workspace = true }
+# Shared test-support helpers (`candle_gen::testkit`).
+candle-gen = { path = "../candle-gen", features = ["testkit"] }

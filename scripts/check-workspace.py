@@ -13,7 +13,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_MEMBER_COUNT = 94
+EXPECTED_MEMBER_COUNT = 95
 INTERNAL_PACKAGES = {
     "candle-audio",
     "candle-audio-catalog",
