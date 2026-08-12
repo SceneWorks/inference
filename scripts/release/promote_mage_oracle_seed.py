@@ -534,14 +534,11 @@ def _validate_receipt(value: Any) -> dict[str, Any]:
     return {**value, "targets": ready["targets"]}
 
 
-def verify_receipt_pair(receipt_dir_path: Path, revision: str) -> None:
+def verify_receipt(receipt_dir_path: Path, revision: str) -> None:
     if re.fullmatch(r"[0-9a-f]{40}", revision) is None:
         raise PromotionError(f"receipt verification revision is not exact 40-hex: {revision}")
     receipt_dir = _require_root(receipt_dir_path, "Mage seed promotion receipt directory")
-    expected_names = {
-        "mage-seed-promotion-primary.json",
-        "mage-seed-promotion-secondary.json",
-    }
+    expected_names = {"mage-seed-promotion-single.json"}
     names = {entry.name for entry in receipt_dir.iterdir()}
     if names != expected_names:
         raise PromotionError(
@@ -549,41 +546,23 @@ def verify_receipt_pair(receipt_dir_path: Path, revision: str) -> None:
             f"missing={sorted(expected_names - names)}, extra={sorted(names - expected_names)}"
         )
 
-    receipts: dict[str, dict[str, Any]] = {}
-    certifying_runners: set[str] = set()
-    for slot in ("primary", "secondary"):
-        receipt = _validate_receipt(
-            _load_json(
-                receipt_dir / f"mage-seed-promotion-{slot}.json",
-                f"Mage seed promotion {slot} receipt",
-            )
+    receipt = _validate_receipt(
+        _load_json(
+            receipt_dir / "mage-seed-promotion-single.json",
+            "Mage seed promotion receipt",
         )
-        certifier = (
-            receipt["recoveredBy"]
-            if receipt["status"] == "recovered"
-            else {
-                "runnerName": receipt["runnerName"],
-                "slot": receipt["slot"],
-                "revision": receipt["revision"],
-            }
-        )
-        if certifier["slot"] != slot or certifier["revision"] != revision:
-            raise PromotionError(
-                f"Mage seed promotion {slot} receipt does not certify this exact run"
-            )
-        certifying_runners.add(certifier["runnerName"])
-        receipts[slot] = receipt
-    if len(certifying_runners) != 2:
-        raise PromotionError("Mage seed promotion receipts must come from two distinct runners")
-
-    primary = receipts["primary"]
-    secondary = receipts["secondary"]
-    if (
-        primary["unchangedDigest"] != secondary["unchangedDigest"]
-        or [record["new"] for record in primary["targets"]]
-        != [record["new"] for record in secondary["targets"]]
-    ):
-        raise PromotionError("Mage seed promotion receipts certify different oracle populations")
+    )
+    certifier = (
+        receipt["recoveredBy"]
+        if receipt["status"] == "recovered"
+        else {
+            "runnerName": receipt["runnerName"],
+            "slot": receipt["slot"],
+            "revision": receipt["revision"],
+        }
+    )
+    if certifier["slot"] != "single" or certifier["revision"] != revision:
+        raise PromotionError("Mage seed promotion receipt does not certify this exact run")
 
 
 def _verified_receipt_destination(
@@ -797,8 +776,8 @@ def main() -> int:
                 )
             if args.revision is None:
                 raise PromotionError("verify-receipts requires an exact revision")
-            verify_receipt_pair(args.verify_receipts, args.revision)
-            print("verified exact Mage seed promotion receipts from two distinct runners")
+            verify_receipt(args.verify_receipts, args.revision)
+            print("verified exact Mage seed promotion receipt from the active runner")
             return 0
         if args.recover_only:
             if any(

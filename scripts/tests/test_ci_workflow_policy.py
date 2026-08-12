@@ -936,13 +936,11 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             workflow[workflow.index("migrate_mage_edit_variant_manifest:") :],
         )
         self.assertIn(
-            "Converge and durably certify the exact Mage manifest pair on both rw-mage seeds",
+            "Converge and durably certify the exact Mage manifest pair on the active rw-mage seed",
             workflow,
         )
         self.assertIn(
-            "mage_seed_slot: ${{ fromJSON(github.event_name == 'workflow_dispatch' "
-            "&& inputs.profile == 'media' && inputs.migrate_mage_edit_variant_manifest "
-            "&& '[\"primary\",\"secondary\"]' || '[\"single\"]') }}",
+            "mage_seed_slot: [single]",
             workflow,
         )
         recovery_index = workflow.index(
@@ -1111,9 +1109,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         )
         cache_save = workflow[cache_save_index:edit_upload_index]
         self.assertIn("inputs.migrate_mage_edit_variant_manifest != true", cache_save)
-        self.assertGreaterEqual(
-            workflow.count("if: matrix.mage_seed_slot != 'secondary'"), 2
-        )
+        self.assertNotIn("matrix.mage_seed_slot != 'secondary'", workflow)
         promotion_gate_index = workflow.index("\n  mage-seed-promotion-gate:")
         qwen_index = workflow.index("\n  # sc-17284", promotion_gate_index)
         promotion_gate = workflow[promotion_gate_index:qwen_index]
@@ -1123,6 +1119,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("merge-multiple: true", promotion_gate)
         self.assertIn("--verify-receipts", promotion_gate)
         self.assertIn("--revision \"$GITHUB_SHA\"", promotion_gate)
+        self.assertIn("Require the exact-run Mage seed certification", promotion_gate)
         candle_media_index = workflow.index("\n  candle-media:")
         self.assertIn(
             "needs: [mlx-media, mage-seed-promotion-gate]",

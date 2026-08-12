@@ -8,8 +8,8 @@ name: Real-weight validation
 # keep moving, and it should not cost a workflow PR each time.
 #
 #   LABEL       WEIGHT SET                                          ON DISK   HOST
-#   rw-mage     Mage-Flow x4 + Z-Image + the Mage oracle bundle      ~96 GiB   BOTH boxes
-#   rw-mage     Qwen-Image + Qwen-Image-Edit + Fun-Controlnet-Union  ~170 GiB  BOTH boxes
+#   rw-mage     Mage-Flow x4 + Z-Image + the Mage oracle bundle      ~96 GiB   nax-macos-2
+#   rw-mage     Qwen-Image + Qwen-Image-Edit + Fun-Controlnet-Union  ~170 GiB  nax-macos-2
 #               MLX re-hosts, both PiD students, Gemma-2-2B,
 #               FLUX.1-dev, two lightx2v Lightning LoRAs  (sc-17284)
 #   rw-sa3      Stable Audio 3 / SAME                                ~0        nax-macos
@@ -28,14 +28,12 @@ name: Real-weight validation
 # ~3 GiB overstatement from being derived as 34 + 11 rather than measured. If you edit a row,
 # measure it — and say which unit, because 42 GiB and 45 GB are the same number of bytes.
 #
-# `rw-mage` IS NOT PINNED — it is registered on BOTH boxes. This block used to claim it was "pinned
-# to `nax-macos` by the one asset here that cannot self-heal: the ~461 MB frozen-Torch oracle bundle
-# behind `MAGE_ORACLE_SEED_DIR`". A label is not a pin, and this one is on both: observed 2026-08-05
-# (sc-17284) when `mlx-qwen-image-producers` ran on `nax-macos-2` with
-# `labels=self-hosted,macOS,ARM64,rw-mage`, which a runner cannot accept unless it carries every
-# requested label.
+# `rw-mage` is currently registered only on `nax-macos-2`, verified from the live org runner
+# inventory on 2026-08-11. It had previously been registered on both boxes, so do not infer the
+# current pool from historical job placement. The label remains the placement mechanism; moving it
+# is an operator action and does not require a workflow edit.
 #
-# What IS true about the bundle is the invariant that replaces the pin. `MAGE_ORACLE_SEED_DIR` is
+# The invariant that makes such a move safe is the oracle bundle. `MAGE_ORACLE_SEED_DIR` is
 # `~/Library/Application Support/SceneWorks/oracles/sc-14052-mage-flow` — a `~/`-relative value
 # resolved per-runner by `resolve_snapshot_paths.py`, so it is ONE setting naming a DIFFERENT
 # directory on each box. It exists on no Hub and this workflow deliberately refuses to regenerate it
@@ -43,12 +41,10 @@ name: Real-weight validation
 # provisioned by hand, and adding the label to a box without it is what actually breaks `mlx-media`
 # — not moving the label around.**
 #
-# Both boxes have the bundle, confirmed 2026-08-05. `nax-macos` was checked from a shell on the box:
-# 461 MB, all 18 required files present as regular non-symlink files, which is exactly what `Require
-# operator-provisioned Mage oracle seed` demands. `nax-macos-2` was confirmed by direct operator
-# inspection, which is the strongest check available — no job or script in this repo can read that
-# box's filesystem. That step remains the enforcement: it fails closed with a named error on a cache
-# miss, so a box that quietly loses its copy surfaces as a red `mlx-media`, never a wrong oracle.
+# Both boxes had the bundle when checked on 2026-08-05, but that historical fact is not a current
+# label or filesystem guarantee. `Require operator-provisioned Mage oracle seed` remains the live
+# enforcement: it fails closed with a named error on a cache miss, so a box that quietly loses its
+# copy surfaces as a red `mlx-media`, never a wrong oracle.
 
 # `rw-sa3` stores nothing between runs (it materializes into `RUNNER_TEMP`), so it is the free
 # rebalancing knob: move it to shift ~83 min of wall clock without moving a single stored byte.
@@ -113,7 +109,7 @@ on:
         required: false
         default: ""
       migrate_mage_edit_variant_manifest:
-        description: Converge and durably certify the exact Mage manifest pair on both rw-mage seeds after full validation (media only)
+        description: Converge and durably certify the exact Mage manifest pair on the active rw-mage seed after full validation (media only)
         type: boolean
         required: false
         default: false
@@ -1390,12 +1386,11 @@ jobs:
     timeout-minutes: 120
     strategy:
       fail-fast: false
-      # The one-shot durable migration must touch the runner-local seed on BOTH boxes carrying
-      # rw-mage. Two simultaneous jobs occupy both single-job runners. If one box is unavailable
-      # and both legs run serially on the same seed, the second leg rejects the now-zero-diff
-      # migration, so a green matrix cannot silently certify only one persistent seed.
+      # The label is the live placement source of truth. Certification must mutate and re-verify
+      # the seed on the one runner that actually claims the rw-mage job; inactive historical hosts
+      # are not part of this run's evidence.
       matrix:
-        mage_seed_slot: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.profile == 'media' && inputs.migrate_mage_edit_variant_manifest && '["primary","secondary"]' || '["single"]') }}
+        mage_seed_slot: [single]
     env:
       ZIMAGE_SNAPSHOT: ${{ vars.ZIMAGE_SNAPSHOT }}
       MAGE_SNAPSHOT: ${{ vars.MAGE_SNAPSHOT }}
@@ -1808,7 +1803,6 @@ jobs:
           path: ${{ runner.temp }}/mage-flow-oracles
           key: ${{ steps.mage-oracle-key.outputs.key }}
       - name: Upload verified Mage edit oracle
-        if: matrix.mage_seed_slot != 'secondary'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: mage-flow-edit-oracle-${{ github.sha }}
@@ -1820,7 +1814,6 @@ jobs:
             ${{ runner.temp }}/mage-flow-oracles/mage_edit_variants_manifest.json
           if-no-files-found: error
       - name: Upload Candle Mage acceptance oracles
-        if: matrix.mage_seed_slot != 'secondary'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: mage-flow-candle-oracles-${{ github.sha }}
@@ -1852,14 +1845,14 @@ jobs:
           fi
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         if: github.event_name == 'workflow_dispatch' && inputs.profile == 'media' && inputs.migrate_mage_edit_variant_manifest
-      - name: Download both persistent Mage seed receipts
+      - name: Download the persistent Mage seed receipt
         if: github.event_name == 'workflow_dispatch' && inputs.profile == 'media' && inputs.migrate_mage_edit_variant_manifest
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: mage-seed-promotion-*-${{ github.sha }}
           path: ${{ runner.temp }}/mage-seed-promotion-receipts
           merge-multiple: true
-      - name: Require two distinct exact-run Mage seed certifications
+      - name: Require the exact-run Mage seed certification
         if: github.event_name == 'workflow_dispatch' && inputs.profile == 'media' && inputs.migrate_mage_edit_variant_manifest
         run: >-
           python3.12 scripts/release/promote_mage_oracle_seed.py
@@ -2425,11 +2418,10 @@ jobs:
     #   nax-macos    1618 s of test time / 32m32s job   (run 30959809619)
     #   nax-macos-2   370 s of test time /  6m43s job   (run 31050459516)
     # Same test, same tier, same resident weights — a 4.4x spread that is HOST variance, not cold
-    # cache. `rw-mage` is carried by both boxes, so this job's wall clock depends on which one takes
-    # it and on what else that machine is doing (nax-macos also runs dev work outside Actions). Size
-    # the cap against the SLOW host: 60 leaves 1.8x headroom over 32m32s, the thinnest of the three
-    # jobs. If any of them ever brushes its cap, raise this one first — it is a producer, so the
-    # cost of a generous cap here is low.
+    # cache. `rw-mage` currently selects only nax-macos-2, but labels are movable and the slow-host
+    # observation remains the conservative sizing datum. Size the cap against that host: 60 leaves
+    # 1.8x headroom over 32m32s, the thinnest of the three jobs. If any of them ever brushes its cap,
+    # raise this one first — it is a producer, so the cost of a generous cap here is low.
     timeout-minutes: 60
     env:
       QWEN_IMAGE_MLX_SNAPSHOT: ${{ vars.QWEN_IMAGE_MLX_SNAPSHOT }}

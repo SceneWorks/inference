@@ -55,7 +55,7 @@ class PromoteMageOracleSeedTests(unittest.TestCase):
             self.seed,
             self.old_hashes(),
             runner_name="nax-macos-test",
-            slot="primary",
+            slot="single",
             revision="a" * 40,
             receipt_path=self.receipt,
             allow_already_current=allow_already_current,
@@ -72,7 +72,7 @@ class PromoteMageOracleSeedTests(unittest.TestCase):
             self.assertEqual((self.seed / name).read_bytes(), (self.source / name).read_bytes())
         self.assertEqual(receipt, json.loads(self.receipt.read_text(encoding="utf-8")))
         self.assertEqual(receipt["runnerName"], "nax-macos-test")
-        self.assertEqual(receipt["slot"], "primary")
+        self.assertEqual(receipt["slot"], "single")
         self.assertEqual(receipt["revision"], "a" * 40)
         self.assertEqual(receipt["unchangedFileCount"], 16)
         self.assertEqual([record["name"] for record in receipt["targets"]], list(self.module.TARGETS))
@@ -109,7 +109,7 @@ class PromoteMageOracleSeedTests(unittest.TestCase):
             self.seed,
             imported_legacy_hashes,
             runner_name="nax-macos-test",
-            slot="primary",
+            slot="single",
             revision="a" * 40,
             receipt_path=self.receipt,
             allow_already_current=True,
@@ -329,55 +329,41 @@ class PromoteMageOracleSeedTests(unittest.TestCase):
         for name in self.module.TARGETS:
             self.assertEqual((self.seed / name).read_bytes(), (self.source / name).read_bytes())
 
-    def test_receipt_pair_requires_two_distinct_exact_run_certifiers(self) -> None:
+    def test_receipt_verifier_requires_one_exact_run_certifier(self) -> None:
         receipt_dir = self.root / "receipts"
         receipt_dir.mkdir()
-        primary = self.promote()
+        receipt = self.promote()
         shutil.copy2(
             self.receipt,
-            receipt_dir / "mage-seed-promotion-primary.json",
+            receipt_dir / "mage-seed-promotion-single.json",
         )
+        self.module.verify_receipt(receipt_dir, "a" * 40)
 
-        secondary = json.loads(json.dumps(primary))
-        secondary["runnerName"] = "nax-macos-other"
-        secondary["slot"] = "secondary"
-        (receipt_dir / "mage-seed-promotion-secondary.json").write_text(
-            json.dumps(secondary), encoding="utf-8"
+        receipt["slot"] = "primary"
+        (receipt_dir / "mage-seed-promotion-single.json").write_text(
+            json.dumps(receipt), encoding="utf-8"
         )
-        self.module.verify_receipt_pair(receipt_dir, "a" * 40)
+        with self.assertRaisesRegex(self.module.PromotionError, "exact run"):
+            self.module.verify_receipt(receipt_dir, "a" * 40)
 
-        secondary["runnerName"] = primary["runnerName"]
-        (receipt_dir / "mage-seed-promotion-secondary.json").write_text(
-            json.dumps(secondary), encoding="utf-8"
-        )
-        with self.assertRaisesRegex(self.module.PromotionError, "two distinct runners"):
-            self.module.verify_receipt_pair(receipt_dir, "a" * 40)
-
-    def test_receipt_pair_accepts_recovery_identity_and_rejects_population_drift(self) -> None:
+    def test_receipt_verifier_accepts_recovery_identity_and_rejects_inventory_drift(self) -> None:
         receipt_dir = self.root / "receipts"
         receipt_dir.mkdir()
-        primary = self.promote()
-        (receipt_dir / "mage-seed-promotion-primary.json").write_text(
-            json.dumps(primary), encoding="utf-8"
-        )
-        secondary = json.loads(json.dumps(primary))
-        secondary["status"] = "recovered"
-        secondary["recoveredBy"] = {
+        receipt = self.promote()
+        receipt["status"] = "recovered"
+        receipt["recoveredBy"] = {
             "runnerName": "recovery-runner",
-            "slot": "secondary",
+            "slot": "single",
             "revision": "a" * 40,
         }
-        (receipt_dir / "mage-seed-promotion-secondary.json").write_text(
-            json.dumps(secondary), encoding="utf-8"
+        (receipt_dir / "mage-seed-promotion-single.json").write_text(
+            json.dumps(receipt), encoding="utf-8"
         )
-        self.module.verify_receipt_pair(receipt_dir, "a" * 40)
+        self.module.verify_receipt(receipt_dir, "a" * 40)
 
-        secondary["targets"][0]["new"]["sha256"] = "f" * 64
-        (receipt_dir / "mage-seed-promotion-secondary.json").write_text(
-            json.dumps(secondary), encoding="utf-8"
-        )
-        with self.assertRaisesRegex(self.module.PromotionError, "different oracle populations"):
-            self.module.verify_receipt_pair(receipt_dir, "a" * 40)
+        (receipt_dir / "unexpected.json").write_text("{}", encoding="utf-8")
+        with self.assertRaisesRegex(self.module.PromotionError, "inventory is not exact"):
+            self.module.verify_receipt(receipt_dir, "a" * 40)
 
 
 if __name__ == "__main__":
