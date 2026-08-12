@@ -125,16 +125,43 @@ pub fn register_providers(
             inherit_adapters: true,
         });
     #[cfg(feature = "cuda")]
-    let registry = registry
-        .register_memory_strategy(TURBO_MEMORY_REGISTRATION)
+    let registry = register_memory_contract_surfaces(registry)
         .register_memory_behavior(TURBO_MEMORY_BEHAVIOR)
-        .register_memory_strategy(BASE_MEMORY_REGISTRATION)
         .register_memory_behavior(BASE_MEMORY_BEHAVIOR)
-        .register_composed_memory_strategy(TURBO_CONTROL_MEMORY_REGISTRATION)
         .register_memory_behavior(TURBO_CONTROL_MEMORY_BEHAVIOR)
-        .register_composed_memory_strategy(BASE_CONTROL_MEMORY_REGISTRATION)
         .register_memory_behavior(BASE_CONTROL_MEMORY_BEHAVIOR);
     registry.register_trainer(training::REGISTRATION)
+}
+
+/// Register the exhaustive weights-free memory-contract surface on every build platform.
+pub fn register_memory_contract_surfaces(
+    registry: gen_core::ProviderRegistryBuilder,
+) -> gen_core::ProviderRegistryBuilder {
+    registry
+        .register_memory_strategy(TURBO_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            surface_specs: gen_core::candle_memory_contract_surface_specs,
+            provider_id: MODEL_ID,
+            contract: weights_free_turbo_memory_contract,
+        })
+        .register_memory_strategy(BASE_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            surface_specs: gen_core::candle_memory_contract_surface_specs,
+            provider_id: base::MODEL_ID,
+            contract: registered_base_memory_contract,
+        })
+        .register_composed_memory_strategy(TURBO_CONTROL_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            surface_specs: gen_core::candle_memory_contract_surface_specs,
+            provider_id: "z_image_turbo_control",
+            contract: registered_turbo_control_memory_contract,
+        })
+        .register_composed_memory_strategy(BASE_CONTROL_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            surface_specs: gen_core::candle_memory_contract_surface_specs,
+            provider_id: "z_image_control",
+            contract: registered_base_control_memory_contract,
+        })
 }
 
 /// Build the complete explicit Candle Z-Image provider catalog.
@@ -830,35 +857,40 @@ pub fn load_from_comfyui_checkpoint(
 // the explicit family and platform catalogs resolve the candle generator.
 candle_gen::register_generators! { pub(crate) const REGISTRATION = descriptor => load }
 
-#[cfg(any(feature = "cuda", test))]
 fn registered_turbo_memory_contract(
     spec: &LoadSpec,
 ) -> gen_core::Result<gen_core::MemoryProviderContract> {
     memory_strategy::provider_contract(MODEL_ID, spec)
 }
 
-#[cfg(any(feature = "cuda", test))]
 fn registered_base_memory_contract(
     spec: &LoadSpec,
 ) -> gen_core::Result<gen_core::MemoryProviderContract> {
     memory_strategy::provider_contract(base::MODEL_ID, spec)
 }
 
-#[cfg(any(feature = "cuda", test))]
+fn weights_free_turbo_memory_contract(
+    spec: &LoadSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    // Q4/Q8 registry tiers are provisioned packed directories, not on-the-fly quant requests. Use
+    // the weights-free route id to bypass source validation, then restore the registered identity.
+    let mut contract = memory_strategy::provider_contract("z_image_turbo_contract_surface", spec)?;
+    contract.provider_id = MODEL_ID.to_owned();
+    Ok(contract)
+}
+
 fn registered_turbo_control_memory_contract(
     spec: &LoadSpec,
 ) -> gen_core::Result<gen_core::MemoryProviderContract> {
     memory_strategy::control_contract("z_image_turbo_control", spec)
 }
 
-#[cfg(any(feature = "cuda", test))]
 fn registered_base_control_memory_contract(
     spec: &LoadSpec,
 ) -> gen_core::Result<gen_core::MemoryProviderContract> {
     memory_strategy::control_contract("z_image_control", spec)
 }
 
-#[cfg(any(feature = "cuda", test))]
 const TURBO_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
     provider_id: MODEL_ID,
     contract: registered_turbo_memory_contract,
@@ -874,7 +906,6 @@ const TURBO_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
         },
     };
 
-#[cfg(any(feature = "cuda", test))]
 const BASE_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
     provider_id: base::MODEL_ID,
     contract: registered_base_memory_contract,
@@ -890,7 +921,6 @@ const BASE_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
         },
     };
 
-#[cfg(any(feature = "cuda", test))]
 const TURBO_CONTROL_MEMORY_REGISTRATION: gen_core::MemoryRegistration =
     gen_core::MemoryRegistration {
         provider_id: "z_image_turbo_control",
@@ -913,7 +943,6 @@ const TURBO_CONTROL_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
         },
     };
 
-#[cfg(any(feature = "cuda", test))]
 const BASE_CONTROL_MEMORY_REGISTRATION: gen_core::MemoryRegistration =
     gen_core::MemoryRegistration {
         provider_id: "z_image_control",

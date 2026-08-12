@@ -24,6 +24,7 @@ pub fn register_providers(
         .register_generator(pulid_flux::REGISTRATION)
         .register_memory_strategy(pulid_flux::MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
             provider_id: pulid_flux::MODEL_ID,
             contract: memory_strategy::weights_free_contract,
         })

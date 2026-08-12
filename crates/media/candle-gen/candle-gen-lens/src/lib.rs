@@ -926,7 +926,6 @@ impl Defaults {
 const TURBO_DEFAULTS: Defaults = Defaults::from(MODEL_ID_TURBO, TURBO);
 const BASE_DEFAULTS: Defaults = Defaults::from(MODEL_ID_BASE, BASE);
 
-#[cfg(any(feature = "cuda", test))]
 fn build_lens_turbo_memory_strategy_contract(spec: &LoadSpec) -> gen_core::MemoryProviderContract {
     build_lens_memory_strategy_contract_with_eligibility(
         MODEL_ID_TURBO,
@@ -943,7 +942,6 @@ fn build_lens_turbo_memory_strategy_contract_with_eligibility(
     build_lens_memory_strategy_contract_with_eligibility(MODEL_ID_TURBO, spec, streamable)
 }
 
-#[cfg(any(feature = "cuda", test))]
 fn build_lens_memory_strategy_contract(
     provider_id: &'static str,
     spec: &LoadSpec,
@@ -955,7 +953,6 @@ fn build_lens_memory_strategy_contract(
     )
 }
 
-#[cfg(any(feature = "cuda", test))]
 fn build_lens_memory_strategy_contract_with_eligibility(
     provider_id: &'static str,
     spec: &LoadSpec,
@@ -1810,7 +1807,6 @@ fn streams_dit_blocks(spec: &LoadSpec) -> bool {
     streams_text_encoder(spec) && transformer_numeric_tier_matches(spec, expected_bits)
 }
 
-#[cfg(any(feature = "cuda", test))]
 fn memory_calibration(
     spec: &LoadSpec,
     _streamable: bool,
@@ -1899,21 +1895,18 @@ candle_gen::register_generators! {
     pub(crate) const BASE_REGISTRATION = descriptor_base => load_base
 }
 
-#[cfg(feature = "cuda")]
 fn registered_lens_turbo_memory_strategy_contract(
     spec: &LoadSpec,
 ) -> gen_core::Result<gen_core::MemoryProviderContract> {
     Ok(build_lens_turbo_memory_strategy_contract(spec))
 }
 
-#[cfg(feature = "cuda")]
 fn registered_lens_base_memory_strategy_contract(
     spec: &LoadSpec,
 ) -> gen_core::Result<gen_core::MemoryProviderContract> {
     Ok(build_lens_memory_strategy_contract(MODEL_ID_BASE, spec))
 }
 
-#[cfg(any(feature = "cuda", test))]
 fn registered_lens_turbo_memory_strategy_safety_check(
     spec: &LoadSpec,
     contract: &gen_core::MemoryProviderContract,
@@ -2011,13 +2004,11 @@ mod weights_free_behavior_tests {
     }
 }
 
-#[cfg(feature = "cuda")]
 const TURBO_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
     provider_id: MODEL_ID_TURBO,
     contract: registered_lens_turbo_memory_strategy_contract,
     safety_check: registered_lens_turbo_memory_strategy_safety_check,
 };
-#[cfg(feature = "cuda")]
 const BASE_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
     provider_id: MODEL_ID_BASE,
     contract: registered_lens_base_memory_strategy_contract,
@@ -2046,12 +2037,29 @@ pub fn register_providers(
         .register_generator(TURBO_REGISTRATION)
         .register_generator(BASE_REGISTRATION);
     #[cfg(feature = "cuda")]
-    let registry = registry
-        .register_memory_strategy(TURBO_MEMORY_REGISTRATION)
+    let registry = register_memory_contract_surfaces(registry)
         .register_memory_behavior(TURBO_MEMORY_BEHAVIOR)
-        .register_memory_strategy(BASE_MEMORY_REGISTRATION)
         .register_memory_behavior(BASE_MEMORY_BEHAVIOR);
     registry.register_trainer(training::TRAINER_REGISTRATION)
+}
+
+/// Register only weights-free memory-contract surfaces; safe on every build platform.
+pub fn register_memory_contract_surfaces(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_memory_strategy(TURBO_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            surface_specs: gen_core::candle_memory_contract_surface_specs,
+            provider_id: MODEL_ID_TURBO,
+            contract: registered_lens_turbo_memory_strategy_contract,
+        })
+        .register_memory_strategy(BASE_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            surface_specs: gen_core::candle_memory_contract_surface_specs,
+            provider_id: MODEL_ID_BASE,
+            contract: registered_lens_base_memory_strategy_contract,
+        })
 }
 
 /// Build the complete explicit Candle Lens provider catalog.

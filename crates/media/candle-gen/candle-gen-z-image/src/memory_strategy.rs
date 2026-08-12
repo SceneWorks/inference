@@ -9,33 +9,29 @@ use candle_gen::gen_core::{
     self, LoadSpec, MemoryNumericTier, MemoryProviderContract, MemoryRunContext,
     MemorySafetyDecision, MemoryStrategy, Precision, Quant, WeightsSource,
 };
-#[cfg(any(feature = "cuda", test))]
 use candle_gen::gen_core::{
     LoadShape, MemoryAssetFacts, MemoryBackendRealization, MemoryCalibrationIdentity,
     MemoryFormulaKind, MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryParameterRanges,
     MemoryPrerequisiteScope, MemoryStrategyCapability, MemoryStrategyPrerequisite,
     MemoryStrategySupport, MemoryWindowMaterialization, PerComponentBytes,
 };
+use gen_core::MemoryPhase;
+#[cfg(any(feature = "cuda", test))]
+use gen_core::MemoryRequestScope;
 #[cfg(test)]
 use gen_core::{GenerationMemory, GenerationRequest, MemoryGeometry, MemoryRunOutcome};
-#[cfg(any(feature = "cuda", test))]
-use gen_core::{MemoryPhase, MemoryRequestScope};
 
 pub(crate) const DECODE_TILE_EDGE: u32 = 512;
 pub(crate) const DECODE_OVERLAP: u32 = 128;
 pub(crate) const ATTENTION_CHUNK_SIZE: u32 =
     gen_core::attention_budget::CONSTRAINED_ATTN_SCORES_BUDGET as u32;
-#[cfg(any(feature = "cuda", test))]
 pub(crate) const TRANSFORMER_WINDOW_SIZES: &[u32] = &[1, 2, 4, 8, 15, 30];
 pub(crate) const DEFAULT_TRANSFORMER_WINDOW: usize = 1;
-#[cfg(any(feature = "cuda", test))]
 pub(crate) const CALIBRATION_FINGERPRINT: &str =
     "z-image-cuda-staged-tiled-decode-bounded-attention-device-format-blocks-v2";
-#[cfg(any(feature = "cuda", test))]
 pub(crate) const CONTROL_CALIBRATION_FINGERPRINT: &str =
     "z-image-cuda-base-control-host-decode-streamed-device-format-blocks-v2";
 
-#[cfg(any(feature = "cuda", test))]
 fn imported_tensor_bytes(
     tensor: &gen_core::weightsmeta::SafetensorsTensorHeader,
     loaded_name: &str,
@@ -74,7 +70,6 @@ fn imported_tensor_bytes(
     }
 }
 
-#[cfg(any(feature = "cuda", test))]
 fn single_file_tensor_bytes(path: &std::path::Path, component: &str) -> gen_core::Result<u64> {
     let headers = gen_core::weightsmeta::safetensors_path_tensor_headers(path)?;
     imported_tensor_headers_bytes(&headers, component, &path.display().to_string())
@@ -296,7 +291,6 @@ fn combined_file_components(path: &std::path::Path) -> gen_core::Result<PerCompo
     Ok(components)
 }
 
-#[cfg(any(feature = "cuda", test))]
 fn imported_file_components(
     spec: &LoadSpec,
     primary: &std::path::Path,
@@ -354,7 +348,6 @@ fn imported_file_components(
     }
 }
 
-#[cfg(any(feature = "cuda", test))]
 pub(crate) fn provider_contract(
     provider_id: &str,
     spec: &LoadSpec,
@@ -521,7 +514,6 @@ pub(crate) fn provider_contract(
 /// Explicit contract for the bespoke dual-network control routes. The control encoder, text encoder,
 /// denoiser, and decoder are phase-loaded; both the base and control main stacks honor the selected
 /// transformer window.
-#[cfg(any(feature = "cuda", test))]
 pub(crate) fn control_contract(
     provider_id: &str,
     spec: &LoadSpec,
@@ -676,7 +668,6 @@ pub(crate) fn snapshot_quant_tier(
         .transpose()
 }
 
-#[cfg(any(feature = "cuda", test))]
 pub(crate) fn registered_safety_check(
     spec: &LoadSpec,
     contract: &MemoryProviderContract,

@@ -117,8 +117,28 @@ pub fn register_providers(
         .register_generator(registry::TURBO_REGISTRATION)
         .register_generator(registry::BASE_REGISTRATION)
         .register_memory_strategy(registry::TURBO_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+            provider_id: registry::MODEL_ID_TURBO,
+            contract: |spec| {
+                memory_strategy::weights_free_memory_strategy_contract(
+                    registry::MODEL_ID_TURBO,
+                    spec,
+                )
+            },
+        })
         .register_memory_behavior(registry::TURBO_MEMORY_BEHAVIOR)
         .register_memory_strategy(registry::BASE_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+            provider_id: registry::MODEL_ID_BASE,
+            contract: |spec| {
+                memory_strategy::weights_free_memory_strategy_contract(
+                    registry::MODEL_ID_BASE,
+                    spec,
+                )
+            },
+        })
         .register_memory_behavior(registry::BASE_MEMORY_BEHAVIOR)
         .register_trainer(training::TRAINER_REGISTRATION)
 }

@@ -116,6 +116,7 @@ pub fn register_providers(
         .register_generator(model::LARGE_REGISTRATION)
         .register_memory_strategy(model::LARGE_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
             provider_id: MODEL_ID,
             contract: |spec| memory_strategy::weights_free_contract(MODEL_ID, spec),
         })
@@ -123,6 +124,7 @@ pub fn register_providers(
         .register_generator(model::TURBO_REGISTRATION)
         .register_memory_strategy(model::TURBO_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
             provider_id: TURBO_MODEL_ID,
             contract: |spec| memory_strategy::weights_free_contract(TURBO_MODEL_ID, spec),
         })
@@ -130,6 +132,7 @@ pub fn register_providers(
         .register_generator(model::MEDIUM_REGISTRATION)
         .register_memory_strategy(model::MEDIUM_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
             provider_id: MEDIUM_MODEL_ID,
             contract: |spec| memory_strategy::weights_free_contract(MEDIUM_MODEL_ID, spec),
         })

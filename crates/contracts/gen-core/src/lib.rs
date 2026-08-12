@@ -123,12 +123,15 @@ pub use memory_strategy::{
     MEMORY_DECODE_QUALITY_IMPLEMENTATION_FINGERPRINT, MEMORY_EVIDENCE_V1_PREFIX,
 };
 pub use registry::{
-    ActivationMemoryRegistration, AudioEmbedderRegistration, AudioTransformRegistration,
-    CaptionerRegistration, EncoderContractRouteRegistration, ImageEmbedderRegistration,
-    ImportedModelOperation, ImportedModelRegistration, ImportedModelSource,
-    MemoryBehaviorBeginRequest, MemoryBehaviorFixture, MemoryBehaviorRegistration,
-    MemoryContractFixtureRegistration, MemoryRegistration, ModelRegistration, PerComponentBytes,
-    ProviderRegistry, ProviderRegistryBuilder, TextEmbedderRegistration, TrainerRegistration,
+    candle_memory_contract_surface_specs, candle_nvfp4_memory_contract_surface_specs,
+    mlx_memory_contract_surface_specs, ActivationMemoryRegistration, AudioEmbedderRegistration,
+    AudioTransformRegistration, CaptionerRegistration, EncoderContractRouteRegistration,
+    ImageEmbedderRegistration, ImportedModelOperation, ImportedModelRegistration,
+    ImportedModelSource, MemoryBehaviorBeginRequest, MemoryBehaviorFixture,
+    MemoryBehaviorRegistration, MemoryContractFixtureRegistration, MemoryContractSurface,
+    MemoryContractSurfaceSelector, MemoryContractSurfaceSpec, MemoryContractSurfaceTier,
+    MemoryRegistration, ModelRegistration, PerComponentBytes, ProviderRegistry,
+    ProviderRegistryBuilder, TextEmbedderRegistration, TrainerRegistration,
     TranscriberRegistration, TransformRegistration, VoiceEmbedderRegistration,
 };
 pub use residency::{Residency, ResidencyRuntime, StagedHeavy};

@@ -209,6 +209,219 @@ pub struct MemoryRegistration {
 pub struct MemoryContractFixtureRegistration {
     pub provider_id: &'static str,
     pub contract: fn(&LoadSpec) -> Result<MemoryProviderContract>,
+    /// Complete, weights-free registry-load surface for this provider.
+    ///
+    /// A caller-selected `LoadSpec` is not a contract inventory: it can hide a rung whose
+    /// availability changes with numeric tier, residency policy, or materialization shape.  The
+    /// provider therefore owns an explicit finite witness set.  Catalog dumps and conformance walk
+    /// every witness; they never substitute one convenient default spec.
+    pub surface_specs: fn() -> Vec<MemoryContractSurfaceSpec>,
+}
+
+/// Numeric tier named by a weights-free memory-contract surface witness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MemoryContractSurfaceTier {
+    Bf16,
+    Q4,
+    Q8,
+    Nvfp4,
+}
+
+impl MemoryContractSurfaceTier {
+    fn load_spec(self) -> LoadSpec {
+        let spec = LoadSpec::new(crate::WeightsSource::Dir(
+            "/__sceneworks_memory_contract_surface__".into(),
+        ));
+        match self {
+            Self::Bf16 => spec,
+            Self::Q4 => spec.with_quant(crate::Quant::Q4),
+            Self::Q8 => spec.with_quant(crate::Quant::Q8),
+            Self::Nvfp4 => spec.with_quant(crate::Quant::Nvfp4),
+        }
+    }
+}
+
+/// Exact selector axes for one shipped registry-load contract witness.
+///
+/// Registry routes consume provisioned snapshot directories. Single-file imports are a separate,
+/// ad-hoc loader surface and are intentionally not allowed to stand in for the catalog contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemoryContractSurfaceSelector {
+    pub tier: MemoryContractSurfaceTier,
+    pub offload_policy: crate::OffloadPolicy,
+    pub load_shape: crate::LoadShape,
+}
+
+impl MemoryContractSurfaceSelector {
+    fn matches_spec(self, spec: &LoadSpec) -> bool {
+        let tier_matches = match self.tier {
+            MemoryContractSurfaceTier::Bf16 => {
+                spec.quantize.is_none() && spec.precision == crate::Precision::Bf16
+            }
+            MemoryContractSurfaceTier::Q4 => spec.quantize == Some(crate::Quant::Q4),
+            MemoryContractSurfaceTier::Q8 => spec.quantize == Some(crate::Quant::Q8),
+            MemoryContractSurfaceTier::Nvfp4 => spec.quantize == Some(crate::Quant::Nvfp4),
+        };
+        tier_matches
+            && self.offload_policy == spec.offload_policy
+            && self.load_shape == spec.load_shape
+    }
+
+    pub fn id(self) -> &'static str {
+        match (self.tier, self.offload_policy, self.load_shape) {
+            (
+                MemoryContractSurfaceTier::Bf16,
+                crate::OffloadPolicy::Resident,
+                crate::LoadShape::EagerMaterialization,
+            ) => "bf16:resident:eager",
+            (
+                MemoryContractSurfaceTier::Bf16,
+                crate::OffloadPolicy::Resident,
+                crate::LoadShape::DeferredMaterialization,
+            ) => "bf16:resident:deferred",
+            (
+                MemoryContractSurfaceTier::Bf16,
+                crate::OffloadPolicy::Sequential,
+                crate::LoadShape::EagerMaterialization,
+            ) => "bf16:sequential:eager",
+            (
+                MemoryContractSurfaceTier::Bf16,
+                crate::OffloadPolicy::Sequential,
+                crate::LoadShape::DeferredMaterialization,
+            ) => "bf16:sequential:deferred",
+            (
+                MemoryContractSurfaceTier::Q4,
+                crate::OffloadPolicy::Resident,
+                crate::LoadShape::EagerMaterialization,
+            ) => "q4:resident:eager",
+            (
+                MemoryContractSurfaceTier::Q4,
+                crate::OffloadPolicy::Resident,
+                crate::LoadShape::DeferredMaterialization,
+            ) => "q4:resident:deferred",
+            (
+                MemoryContractSurfaceTier::Q4,
+                crate::OffloadPolicy::Sequential,
+                crate::LoadShape::EagerMaterialization,
+            ) => "q4:sequential:eager",
+            (
+                MemoryContractSurfaceTier::Q4,
+                crate::OffloadPolicy::Sequential,
+                crate::LoadShape::DeferredMaterialization,
+            ) => "q4:sequential:deferred",
+            (
+                MemoryContractSurfaceTier::Q8,
+                crate::OffloadPolicy::Resident,
+                crate::LoadShape::EagerMaterialization,
+            ) => "q8:resident:eager",
+            (
+                MemoryContractSurfaceTier::Q8,
+                crate::OffloadPolicy::Resident,
+                crate::LoadShape::DeferredMaterialization,
+            ) => "q8:resident:deferred",
+            (
+                MemoryContractSurfaceTier::Q8,
+                crate::OffloadPolicy::Sequential,
+                crate::LoadShape::EagerMaterialization,
+            ) => "q8:sequential:eager",
+            (
+                MemoryContractSurfaceTier::Q8,
+                crate::OffloadPolicy::Sequential,
+                crate::LoadShape::DeferredMaterialization,
+            ) => "q8:sequential:deferred",
+            (
+                MemoryContractSurfaceTier::Nvfp4,
+                crate::OffloadPolicy::Resident,
+                crate::LoadShape::EagerMaterialization,
+            ) => "nvfp4:resident:eager",
+            (
+                MemoryContractSurfaceTier::Nvfp4,
+                crate::OffloadPolicy::Resident,
+                crate::LoadShape::DeferredMaterialization,
+            ) => "nvfp4:resident:deferred",
+            (
+                MemoryContractSurfaceTier::Nvfp4,
+                crate::OffloadPolicy::Sequential,
+                crate::LoadShape::EagerMaterialization,
+            ) => "nvfp4:sequential:eager",
+            (
+                MemoryContractSurfaceTier::Nvfp4,
+                crate::OffloadPolicy::Sequential,
+                crate::LoadShape::DeferredMaterialization,
+            ) => "nvfp4:sequential:deferred",
+        }
+    }
+}
+
+/// A provider-owned, weights-free input to one contract surface.
+pub struct MemoryContractSurfaceSpec {
+    pub selector: MemoryContractSurfaceSelector,
+    pub spec: LoadSpec,
+}
+
+/// One fully constructed contract surface returned by [`ProviderRegistry::memory_contract_surfaces`].
+pub struct MemoryContractSurface {
+    pub selector: MemoryContractSurfaceSelector,
+    pub spec: LoadSpec,
+    pub contract: MemoryProviderContract,
+    pub composed: bool,
+}
+
+fn registry_memory_contract_surface_specs(
+    tiers: &[MemoryContractSurfaceTier],
+) -> Vec<MemoryContractSurfaceSpec> {
+    let mut surfaces = Vec::with_capacity(tiers.len() * 4);
+    for &tier in tiers {
+        for offload_policy in [
+            crate::OffloadPolicy::Resident,
+            crate::OffloadPolicy::Sequential,
+        ] {
+            for load_shape in [
+                crate::LoadShape::EagerMaterialization,
+                crate::LoadShape::DeferredMaterialization,
+            ] {
+                let selector = MemoryContractSurfaceSelector {
+                    tier,
+                    offload_policy,
+                    load_shape,
+                };
+                let spec = tier
+                    .load_spec()
+                    .with_offload_policy(offload_policy)
+                    .with_load_shape(load_shape);
+                surfaces.push(MemoryContractSurfaceSpec { selector, spec });
+            }
+        }
+    }
+    surfaces
+}
+
+/// Complete numeric/load-policy surface shipped by the MLX registry.
+pub fn mlx_memory_contract_surface_specs() -> Vec<MemoryContractSurfaceSpec> {
+    registry_memory_contract_surface_specs(&[
+        MemoryContractSurfaceTier::Bf16,
+        MemoryContractSurfaceTier::Q4,
+        MemoryContractSurfaceTier::Q8,
+    ])
+}
+
+/// Common numeric/load-policy surface shipped by Candle registry providers.
+pub fn candle_memory_contract_surface_specs() -> Vec<MemoryContractSurfaceSpec> {
+    registry_memory_contract_surface_specs(&[
+        MemoryContractSurfaceTier::Bf16,
+        MemoryContractSurfaceTier::Q4,
+        MemoryContractSurfaceTier::Q8,
+    ])
+}
+
+/// Candle surface for providers that additionally expose the explicit NVFP4 load tier.
+pub fn candle_nvfp4_memory_contract_surface_specs() -> Vec<MemoryContractSurfaceSpec> {
+    registry_memory_contract_surface_specs(&[
+        MemoryContractSurfaceTier::Bf16,
+        MemoryContractSurfaceTier::Q4,
+        MemoryContractSurfaceTier::Q8,
+        MemoryContractSurfaceTier::Nvfp4,
+    ])
 }
 
 /// Provider-owned, weights-free executable fixture for one implemented memory strategy.
@@ -877,6 +1090,77 @@ impl ProviderRegistry {
         &self,
     ) -> impl ExactSizeIterator<Item = &MemoryContractFixtureRegistration> {
         self.memory_contract_fixture.iter()
+    }
+
+    /// Construct every provider-owned registry-load contract witness without opening weights.
+    ///
+    /// Coverage is fail-closed in both directions: each memory registration must have exactly one
+    /// paired fixture (builder validation already rejects duplicate/orphan fixtures), each fixture
+    /// must publish a non-empty unique selector set, and every selector must construct a contract
+    /// for the paired provider id. This is the inventory seam consumed by generated capability
+    /// dumps; it deliberately has no caller-supplied `LoadSpec`.
+    pub fn memory_contract_surfaces(&self) -> Result<Vec<MemoryContractSurface>> {
+        let mut out = Vec::new();
+        for registration in &self.memory_strategy {
+            let fixture = self
+                .memory_contract_fixture
+                .iter()
+                .find(|fixture| fixture.provider_id == registration.provider_id)
+                .ok_or_else(|| {
+                    Error::Msg(format!(
+                        "memory-strategy registration '{}' has no weights-free contract-surface fixture",
+                        registration.provider_id
+                    ))
+                })?;
+            let surface_specs = (fixture.surface_specs)();
+            if surface_specs.is_empty() {
+                return Err(Error::Msg(format!(
+                    "memory-contract fixture '{}' publishes no surface selectors",
+                    registration.provider_id
+                )));
+            }
+            let mut selectors = std::collections::BTreeSet::new();
+            for surface in surface_specs {
+                if !surface.selector.matches_spec(&surface.spec) {
+                    return Err(Error::Msg(format!(
+                        "memory-contract fixture '{}' selector '{}' does not match its LoadSpec",
+                        registration.provider_id,
+                        surface.selector.id()
+                    )));
+                }
+                if !selectors.insert(surface.selector.id()) {
+                    return Err(Error::Msg(format!(
+                        "memory-contract fixture '{}' repeats surface selector '{}'",
+                        registration.provider_id,
+                        surface.selector.id()
+                    )));
+                }
+                let contract = (fixture.contract)(&surface.spec).map_err(|error| {
+                    Error::Msg(format!(
+                        "memory-contract fixture '{}' failed surface '{}': {error}",
+                        registration.provider_id,
+                        surface.selector.id()
+                    ))
+                })?;
+                if contract.provider_id != registration.provider_id {
+                    return Err(Error::Msg(format!(
+                        "memory-contract fixture '{}' surface '{}' returned contract for '{}'",
+                        registration.provider_id,
+                        surface.selector.id(),
+                        contract.provider_id
+                    )));
+                }
+                out.push(MemoryContractSurface {
+                    selector: surface.selector,
+                    spec: surface.spec,
+                    contract,
+                    composed: self
+                        .composed_memory_strategy_ids
+                        .contains(&registration.provider_id),
+                });
+            }
+        }
+        Ok(out)
     }
 
     pub fn memory_behavior_registrations(
@@ -2232,7 +2516,36 @@ mod tests {
         MemoryContractFixtureRegistration {
             provider_id: "dummy_weights_free_route",
             contract: weights_free_fixture_contract,
+            surface_specs: mlx_memory_contract_surface_specs,
         };
+
+    fn empty_surface_specs() -> Vec<MemoryContractSurfaceSpec> {
+        Vec::new()
+    }
+
+    fn duplicate_surface_specs() -> Vec<MemoryContractSurfaceSpec> {
+        let first = mlx_memory_contract_surface_specs().remove(0);
+        let duplicate = mlx_memory_contract_surface_specs().remove(0);
+        vec![first, duplicate]
+    }
+
+    fn mismatched_surface_spec() -> Vec<MemoryContractSurfaceSpec> {
+        let mut surface = mlx_memory_contract_surface_specs().remove(0);
+        surface.selector.tier = MemoryContractSurfaceTier::Q4;
+        vec![surface]
+    }
+
+    fn wrong_provider_fixture_contract(_spec: &LoadSpec) -> Result<MemoryProviderContract> {
+        Ok(MemoryProviderContract::compatibility_default(
+            "wrong_provider",
+            crate::memory_strategy::MemoryBackendRealization::MlxMetal {
+                bounded_wired_residency: false,
+                lazy_or_mmap_materialization: true,
+                explicit_evaluation_and_synchronization: true,
+                cache_eviction: true,
+            },
+        ))
+    }
 
     #[test]
     fn production_registry_resolution_never_uses_the_weights_free_factory() {
@@ -2278,6 +2591,64 @@ mod tests {
         assert!(
             duplicate.contains("duplicate memory-contract fixture provider id"),
             "{duplicate}"
+        );
+    }
+
+    #[test]
+    fn contract_surface_inventory_fails_closed_on_missing_empty_duplicate_and_wrong_provider() {
+        let missing = ProviderRegistryBuilder::new()
+            .register_composed_memory_strategy(DUMMY_WEIGHTS_FREE_MEMORY_REGISTRATION)
+            .build()
+            .unwrap()
+            .memory_contract_surfaces()
+            .err()
+            .expect("a missing fixture must fail")
+            .to_string();
+        assert!(
+            missing.contains("no weights-free contract-surface fixture"),
+            "{missing}"
+        );
+
+        for (surface_specs, expected) in [
+            (
+                empty_surface_specs as fn() -> Vec<MemoryContractSurfaceSpec>,
+                "publishes no surface selectors",
+            ),
+            (duplicate_surface_specs, "repeats surface selector"),
+            (mismatched_surface_spec, "does not match its LoadSpec"),
+        ] {
+            let error = ProviderRegistryBuilder::new()
+                .register_composed_memory_strategy(DUMMY_WEIGHTS_FREE_MEMORY_REGISTRATION)
+                .register_memory_contract_fixture(MemoryContractFixtureRegistration {
+                    provider_id: "dummy_weights_free_route",
+                    contract: weights_free_fixture_contract,
+                    surface_specs,
+                })
+                .build()
+                .unwrap()
+                .memory_contract_surfaces()
+                .err()
+                .expect("an invalid surface inventory must fail")
+                .to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+
+        let wrong_provider = ProviderRegistryBuilder::new()
+            .register_composed_memory_strategy(DUMMY_WEIGHTS_FREE_MEMORY_REGISTRATION)
+            .register_memory_contract_fixture(MemoryContractFixtureRegistration {
+                provider_id: "dummy_weights_free_route",
+                contract: wrong_provider_fixture_contract,
+                surface_specs: mlx_memory_contract_surface_specs,
+            })
+            .build()
+            .unwrap()
+            .memory_contract_surfaces()
+            .err()
+            .expect("a wrong-provider fixture must fail")
+            .to_string();
+        assert!(
+            wrong_provider.contains("returned contract for 'wrong_provider'"),
+            "{wrong_provider}"
         );
     }
 

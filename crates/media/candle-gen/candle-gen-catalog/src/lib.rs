@@ -87,6 +87,28 @@ pub fn provider_registry() -> candle_gen::gen_core::Result<ProviderRegistry> {
     register_providers(ProviderRegistryBuilder::new()).build()
 }
 
+/// Build the complete Candle registry contract surface without loading model weights or requiring
+/// CUDA. On CUDA builds the production catalog already owns these registrations; other platforms
+/// append the same contract-only registrations to the ordinary generator catalog.
+pub fn memory_contract_surface_registry() -> candle_gen::gen_core::Result<ProviderRegistry> {
+    let registry = register_providers(ProviderRegistryBuilder::new());
+    #[cfg(not(feature = "cuda"))]
+    let registry = candle_gen_flux::register_memory_contract_surfaces(registry);
+    #[cfg(not(feature = "cuda"))]
+    let registry = candle_gen_flux2::register_memory_contract_surfaces(registry);
+    #[cfg(not(feature = "cuda"))]
+    let registry = candle_gen_krea::register_memory_contract_surfaces(registry);
+    #[cfg(not(feature = "cuda"))]
+    let registry = candle_gen_lens::register_memory_contract_surfaces(registry);
+    #[cfg(not(feature = "cuda"))]
+    let registry = candle_gen_mage::register_memory_contract_surfaces(registry);
+    #[cfg(not(feature = "cuda"))]
+    let registry = candle_gen_qwen_image::register_memory_contract_surfaces(registry);
+    #[cfg(not(feature = "cuda"))]
+    let registry = candle_gen_z_image::register_memory_contract_surfaces(registry);
+    registry.build()
+}
+
 // -------------------------------------------------------------------------------------------------
 // Model-weight licence surface (sc-16667) — the Candle media half.
 //
@@ -3798,6 +3820,20 @@ mod tests {
     #[test]
     fn every_registered_memory_strategy_rejects_cross_route_decode_geometry() {
         let registry = super::provider_registry().unwrap();
+        let contract_registry = super::memory_contract_surface_registry().unwrap();
+        gen_core_testkit::memory_contract_surface_registry_conformance(&contract_registry);
+        assert_eq!(contract_registry.memory_strategy_registrations().len(), 20);
+        let surfaces = contract_registry.memory_contract_surfaces().unwrap();
+        assert_eq!(surfaces.len(), 18 * 12 + 2 * 16);
+        assert_eq!(
+            surfaces
+                .iter()
+                .filter(|surface| surface.composed)
+                .map(|surface| surface.contract.provider_id.as_str())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            4,
+        );
         let spec = candle_gen::gen_core::LoadSpec::new(candle_gen::gen_core::WeightsSource::Dir(
             "/nonexistent".into(),
         ));

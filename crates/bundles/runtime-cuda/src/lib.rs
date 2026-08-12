@@ -51,6 +51,19 @@ fn media_registry() -> gen_core::Result<gen_core::ProviderRegistry> {
     }
 }
 
+/// Complete weights-free memory-contract surface for capability generation and reconciliation.
+pub fn memory_contract_surface_registry() -> gen_core::Result<gen_core::ProviderRegistry> {
+    #[cfg(feature = "media")]
+    {
+        candle_gen_catalog::memory_contract_surface_registry()
+    }
+
+    #[cfg(not(feature = "media"))]
+    {
+        gen_core::ProviderRegistryBuilder::new().build()
+    }
+}
+
 /// The bundle's explicit audio lane (sc-12835): the complete Candle audio catalog from the audio
 /// composition root, plus the lane's snapshot preparer carried **in the lane** so audio model
 /// snapshots are prepared through the same registry shape on every platform. Since sc-12836 the
