@@ -579,10 +579,18 @@ pub struct OwnedWanSingleFrameDecoder {
 
 impl OwnedWanSingleFrameDecoder {
     pub fn from_file(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        let source = PinnedWeightsFile::pin(path)?;
-        source.ensure_unchanged()?;
-        let weights = Weights::from_file(source.loader_path())?;
-        let vae = WanVae::from_weights(&weights)?;
+        Self::from_pinned(PinnedWeightsFile::pin(path)?)
+    }
+
+    /// Load through the exact token prepared by the caller's [`mlx_gen::LoadSpec`].
+    ///
+    /// The pre/post guard spans safetensors metadata and tensor materialization. Retaining the same
+    /// token then protects every later decode from pathname, symlink-target, or file replacement.
+    pub fn from_pinned(source: PinnedWeightsFile) -> Result<Self> {
+        let vae = source.read_unchanged(|path| {
+            let weights = Weights::from_file(path)?;
+            WanVae::from_weights(&weights)
+        })?;
         Ok(Self { vae, source })
     }
 

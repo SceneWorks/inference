@@ -128,7 +128,8 @@ pub fn load_selected_single_frame_decoder(
     let Some(path) = validate_selected_single_frame_decoder(spec, descriptor)? else {
         return Ok(None);
     };
-    Ok(Some(OwnedWanSingleFrameDecoder::from_file(path)?))
+    let source = spec.file_pin_for(path)?;
+    Ok(Some(OwnedWanSingleFrameDecoder::from_pinned(source)?))
 }
 
 /// Validate an alternate Wan decoder selection without opening its weights.
@@ -292,6 +293,30 @@ mod conditioning_budget_tests {
             error.contains("cannot be combined with PiD"),
             "got: {error}"
         );
+    }
+
+    #[test]
+    fn alternate_decoder_consumes_the_callers_prepared_file_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let donor = tmp.path().join("wan-vae.safetensors");
+        std::fs::write(&donor, b"original").unwrap();
+        let mut descriptor = super::model::descriptor();
+        descriptor.id = "qwen_image";
+        descriptor.denoiser_output_latent_space =
+            Some(&mlx_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE);
+        let mut spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/base".into()))
+            .with_component(VAE_COMPONENT, WeightsSource::File(donor.clone()));
+        spec.prepare_file_sources().unwrap();
+
+        std::fs::write(&donor, b"replacement").unwrap();
+        let path = super::validate_selected_single_frame_decoder(&spec, &descriptor)
+            .unwrap()
+            .unwrap();
+        let error = spec
+            .file_pin_for(path)
+            .expect_err("the prepared donor identity must fail closed after replacement")
+            .to_string();
+        assert!(error.contains("changed after load"), "got: {error}");
     }
 }
 #[doc(hidden)]

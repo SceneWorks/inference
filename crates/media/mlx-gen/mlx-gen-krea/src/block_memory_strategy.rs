@@ -148,9 +148,12 @@ pub(crate) fn memory_strategy_contract_with_plan(
         })
     };
     let alternate_decoder_bytes = match spec.components.get(mlx_gen::VAE_COMPONENT) {
-        Some(WeightsSource::Dir(path)) | Some(WeightsSource::File(path)) => {
+        Some(WeightsSource::Dir(path)) => {
             projected_safetensors_bytes(path, |_| ResidentProjection::Stored)?
         }
+        Some(WeightsSource::File(path)) => spec.read_file_unchanged_if_prepared(path, |p| {
+            projected_safetensors_bytes(p, |_| ResidentProjection::Stored)
+        })?,
         None => 0,
     };
     let components = mlx_gen::PerComponentBytes {
@@ -336,8 +339,9 @@ pub(crate) fn native_memory_strategy_contract_from_spec(
         }
     };
     let alternate_decoder_bytes = match spec.components.get(mlx_gen::VAE_COMPONENT) {
-        Some(WeightsSource::Dir(path)) | Some(WeightsSource::File(path)) => {
-            stored(path, "alternate Wan decoder")?
+        Some(WeightsSource::Dir(path)) => stored(path, "alternate Wan decoder")?,
+        Some(WeightsSource::File(path)) => {
+            spec.read_file_unchanged_if_prepared(path, |p| stored(p, "alternate Wan decoder"))?
         }
         None => 0,
     };

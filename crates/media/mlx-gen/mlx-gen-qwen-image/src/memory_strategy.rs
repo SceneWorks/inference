@@ -160,9 +160,12 @@ pub fn memory_strategy_contract(
     // adds the standalone Wan decoder for the terminal decode. Price the composition, never substitute
     // donor bytes for the native decoder or borrow the native route's measured peak unchanged.
     let alternate_decoder_bytes = match spec.components.get(mlx_gen::VAE_COMPONENT) {
-        Some(WeightsSource::Dir(path)) | Some(WeightsSource::File(path)) => {
+        Some(WeightsSource::Dir(path)) => {
             projected_safetensors_bytes(path, |_| ResidentProjection::Stored)?
         }
+        Some(WeightsSource::File(path)) => spec.read_file_unchanged_if_prepared(path, |p| {
+            projected_safetensors_bytes(p, |_| ResidentProjection::Stored)
+        })?,
         None => 0,
     };
     let decoder_bytes = native_decoder_bytes.saturating_add(alternate_decoder_bytes);

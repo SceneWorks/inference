@@ -237,8 +237,9 @@ pub(crate) fn native_memory_strategy_contract_from_spec(
     };
     let conditioning_bytes = stored(&base_snapshot_dir.join("text_encoder"), "base text encoder")?;
     let alternate_decoder_bytes = match spec.components.get(mlx_gen::VAE_COMPONENT) {
-        Some(mlx_gen::WeightsSource::Dir(path)) | Some(mlx_gen::WeightsSource::File(path)) => {
-            stored(path, "alternate Wan decoder")?
+        Some(mlx_gen::WeightsSource::Dir(path)) => stored(path, "alternate Wan decoder")?,
+        Some(mlx_gen::WeightsSource::File(path)) => {
+            spec.read_file_unchanged_if_prepared(path, |p| stored(p, "alternate Wan decoder"))?
         }
         None => 0,
     };
@@ -346,9 +347,13 @@ fn asset_facts(
         crate::convert::is_transformer_quant_target(name)
     })?;
     let alternate_decoder_bytes = match spec.components.get(mlx_gen::VAE_COMPONENT) {
-        Some(mlx_gen::WeightsSource::Dir(path)) | Some(mlx_gen::WeightsSource::File(path)) => {
+        Some(mlx_gen::WeightsSource::Dir(path)) => {
             projected_safetensors_bytes(path, |_| ResidentProjection::Stored)?
         }
+        Some(mlx_gen::WeightsSource::File(path)) => spec
+            .read_file_unchanged_if_prepared(path, |p| {
+                projected_safetensors_bytes(p, |_| ResidentProjection::Stored)
+            })?,
         None => 0,
     };
     let decoder_bytes =
