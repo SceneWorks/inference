@@ -1535,6 +1535,8 @@ jobs:
             mage_flow_vae_f32_768x1152.safetensors
             mage_flow_dit_golden.safetensors
             mage_flow_e2e_golden.safetensors
+            mage_flow_e2e_golden.png
+            mage_flow_edit_golden.png
             mage_oracles_manifest.json
             mage_edit_oracle_manifest.json
             mage_edit_variants_manifest.json

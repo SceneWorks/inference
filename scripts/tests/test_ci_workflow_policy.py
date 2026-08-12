@@ -930,6 +930,12 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             "MAGE_ORACLE_SEED_DIR: ${{ vars.MAGE_ORACLE_SEED_DIR }}",
             workflow,
         )
+        seed_import = workflow[
+            workflow.index("\n      - name: Require operator-provisioned Mage oracle seed") :
+            workflow.index("\n      - name: Require an uncached operator seed")
+        ]
+        self.assertIn("mage_flow_e2e_golden.png", seed_import)
+        self.assertIn("mage_flow_edit_golden.png", seed_import)
         self.assertIn("migrate_mage_edit_variant_manifest:", workflow)
         self.assertIn(
             "default: false",
