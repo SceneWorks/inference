@@ -1,8 +1,9 @@
 //! sc-18476 real-weight CUDA proof for the registered Kolors source-image img2img path.
 //!
-//! The conditioned render is compared with a text-only render at the same seed. Byte identity would
-//! expose the exact regression this story closes: accepting `Reference` while silently taking the
-//! unconditioned T2I path.
+//! Native leading-Euler and curated-Euler conditioned renders are each compared with a text-only
+//! render at the same seed. Byte identity would expose the exact regression this story closes:
+//! accepting `Reference` while silently taking the unconditioned T2I path. A native-vs-curated
+//! comparison also proves the new curated img2img branch ran rather than aliasing the default lane.
 
 use std::path::PathBuf;
 
@@ -118,7 +119,7 @@ fn registered_reference_img2img_uses_the_vae_init_and_strength_tail() {
             .generate(&base, &mut |_| {})
             .expect("text-only baseline"),
     );
-    let mut conditioned = base;
+    let mut conditioned = base.clone();
     conditioned.conditioning = vec![Conditioning::Reference {
         image: reference.clone(),
         strength: Some(STRENGTH),
@@ -134,17 +135,50 @@ fn registered_reference_img2img_uses_the_vae_init_and_strength_tail() {
             .expect("reference-conditioned render"),
     );
 
+    // Exercise the newly wired curated img2img branch as a distinct real-weight path. `euler` is a
+    // curated solver name (unlike the native `euler_discrete` default), so this request must enter
+    // `CuratedSetup::new_img2img` and denoise the same strength-selected schedule tail.
+    let mut curated_request = base;
+    curated_request.sampler = Some("euler".into());
+    curated_request.conditioning = vec![Conditioning::Reference {
+        image: reference.clone(),
+        strength: Some(STRENGTH),
+    }];
+    let mut curated_steps = 0u32;
+    let curated_img2img = one_image(
+        generator
+            .generate(&curated_request, &mut |progress| {
+                if matches!(progress, Progress::Step { .. }) {
+                    curated_steps += 1;
+                }
+            })
+            .expect("curated reference-conditioned render"),
+    );
+
     let expected_steps = (STEPS as f32 * STRENGTH).floor() as u32;
     assert_eq!(
         denoise_steps, expected_steps,
         "strength-selected schedule tail"
     );
+    assert_eq!(
+        curated_steps, expected_steps,
+        "curated strength-selected schedule tail"
+    );
     let spread = standard_deviation(&img2img.pixels);
     let t2i_delta = mean_abs_delta(&text_only.pixels, &img2img.pixels);
     let reference_delta = mean_abs_delta(&reference.pixels, &img2img.pixels);
+    let curated_spread = standard_deviation(&curated_img2img.pixels);
+    let curated_t2i_delta = mean_abs_delta(&text_only.pixels, &curated_img2img.pixels);
+    let curated_reference_delta = mean_abs_delta(&reference.pixels, &curated_img2img.pixels);
+    let lane_delta = mean_abs_delta(&img2img.pixels, &curated_img2img.pixels);
     eprintln!(
         "Kolors img2img: std={spread:.2}, mean |Δ vs T2I|={t2i_delta:.2}, \
          mean |Δ vs reference|={reference_delta:.2}"
+    );
+    eprintln!(
+        "Kolors curated img2img: std={curated_spread:.2}, mean abs vs T2I=\
+         {curated_t2i_delta:.2}, mean abs vs reference={curated_reference_delta:.2}, \
+         mean abs vs native={lane_delta:.2}"
     );
     assert!(spread > 8.0, "conditioned output is near-flat: {spread:.2}");
     assert!(
@@ -155,8 +189,25 @@ fn registered_reference_img2img_uses_the_vae_init_and_strength_tail() {
         reference_delta > 5.0,
         "conditioned output did not materially edit the source image: {reference_delta:.3}"
     );
+    assert!(
+        curated_spread > 8.0,
+        "curated conditioned output is near-flat: {curated_spread:.2}"
+    );
+    assert!(
+        curated_t2i_delta > 1.0,
+        "curated conditioned output is indistinguishable from T2I: {curated_t2i_delta:.3}"
+    );
+    assert!(
+        curated_reference_delta > 5.0,
+        "curated output did not materially edit the source: {curated_reference_delta:.3}"
+    );
+    assert!(
+        lane_delta > 0.1,
+        "curated and native paths produced indistinguishable outputs: {lane_delta:.3}"
+    );
 
     save(&reference, "kolors_reference.png");
     save(&text_only, "kolors_text_only.png");
     save(&img2img, "kolors_img2img.png");
+    save(&curated_img2img, "kolors_img2img_curated_euler.png");
 }

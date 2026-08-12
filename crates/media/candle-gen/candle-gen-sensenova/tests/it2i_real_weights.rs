@@ -1,7 +1,8 @@
-//! sc-18476 real-weight CUDA proof for the registered SenseNova reference-conditioned path.
+//! sc-18476 real-weight CUDA proof for the registered SenseNova singular- and multi-reference paths.
 //!
-//! The same prompt and seed are rendered with and without a reference. A materially different,
-//! non-flat result proves the registered route consumed the image instead of degrading to T2I.
+//! The same prompt and seed are rendered without a reference, with one reference, and with two
+//! distinct references. Materially different, non-flat results prove each registered request shape
+//! consumed its images instead of degrading to T2I or collapsing the array to its first element.
 
 use std::path::PathBuf;
 
@@ -31,6 +32,29 @@ fn structured_reference(size: u32) -> Image {
                 pixels[offset] = 250;
                 pixels[offset + 1] = 190;
                 pixels[offset + 2] = 30;
+            }
+        }
+    }
+    Image {
+        width: size,
+        height: size,
+        pixels,
+    }
+}
+
+fn secondary_reference(size: u32) -> Image {
+    let mut pixels = vec![0u8; (size * size * 3) as usize];
+    for y in 0..size {
+        for x in 0..size {
+            let offset = ((y * size + x) * 3) as usize;
+            let left = x < size / 2;
+            pixels[offset] = if left { 195 } else { 42 };
+            pixels[offset + 1] = if left { 58 } else { 188 };
+            pixels[offset + 2] = if left { 82 } else { 125 };
+            if x.abs_diff(y) < size / 24 {
+                pixels[offset] = 245;
+                pixels[offset + 1] = 235;
+                pixels[offset + 2] = 48;
             }
         }
     }
@@ -97,6 +121,7 @@ fn registered_reference_it2i_consumes_image_and_true_cfg() {
         )
         .expect("load SenseNova");
     let reference = structured_reference(SIZE);
+    let secondary = secondary_reference(SIZE);
     let base = GenerationRequest {
         prompt: "transform the landscape into stained glass and add a small red fox".into(),
         width: SIZE,
@@ -113,7 +138,7 @@ fn registered_reference_it2i_consumes_image_and_true_cfg() {
             .generate(&base, &mut |_| {})
             .expect("text-only baseline"),
     );
-    let mut conditioned = base;
+    let mut conditioned = base.clone();
     conditioned.true_cfg = Some(1.5);
     conditioned.conditioning = vec![Conditioning::Reference {
         image: reference.clone(),
@@ -130,17 +155,57 @@ fn registered_reference_it2i_consumes_image_and_true_cfg() {
             .expect("reference-conditioned render"),
     );
 
+    // Exercise MultiReference independently of the singular shape. The second, visually disjoint
+    // image makes a collapsed implementation (one that keeps only the first element) detectable.
+    let mut multi_request = base;
+    multi_request.true_cfg = Some(1.5);
+    multi_request.conditioning = vec![Conditioning::MultiReference {
+        images: vec![reference.clone(), secondary.clone()],
+    }];
+    let mut multi_steps = 0u32;
+    let multi_it2i = one_image(
+        generator
+            .generate(&multi_request, &mut |progress| {
+                if matches!(progress, Progress::Step { .. }) {
+                    multi_steps += 1;
+                }
+            })
+            .expect("multi-reference-conditioned render"),
+    );
+
     assert_eq!(denoise_steps, STEPS);
+    assert_eq!(multi_steps, STEPS);
     let spread = standard_deviation(&it2i.pixels);
     let delta = mean_abs_delta(&text_only.pixels, &it2i.pixels);
+    let multi_spread = standard_deviation(&multi_it2i.pixels);
+    let multi_t2i_delta = mean_abs_delta(&text_only.pixels, &multi_it2i.pixels);
+    let multi_vs_single = mean_abs_delta(&it2i.pixels, &multi_it2i.pixels);
     eprintln!("SenseNova it2i: std={spread:.2}, mean |Δ vs T2I|={delta:.2}");
     assert!(spread > 8.0, "conditioned output is near-flat: {spread:.2}");
     assert!(
         delta > 1.0,
         "conditioned output is indistinguishable from the unconditioned route: {delta:.3}"
     );
+    eprintln!(
+        "SenseNova multi-reference it2i: std={multi_spread:.2}, mean abs vs T2I=\
+         {multi_t2i_delta:.2}, mean abs vs singular={multi_vs_single:.2}"
+    );
+    assert!(
+        multi_spread > 8.0,
+        "multi-reference output is near-flat: {multi_spread:.2}"
+    );
+    assert!(
+        multi_t2i_delta > 1.0,
+        "multi-reference output is indistinguishable from T2I: {multi_t2i_delta:.3}"
+    );
+    assert!(
+        multi_vs_single > 0.1,
+        "multi-reference output ignored its additional image: {multi_vs_single:.3}"
+    );
 
     save(&reference, "sensenova_reference.png");
+    save(&secondary, "sensenova_reference_secondary.png");
     save(&text_only, "sensenova_text_only.png");
     save(&it2i, "sensenova_it2i.png");
+    save(&multi_it2i, "sensenova_it2i_multi_reference.png");
 }

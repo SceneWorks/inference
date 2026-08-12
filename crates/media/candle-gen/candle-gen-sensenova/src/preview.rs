@@ -64,8 +64,9 @@
 //!   running state is the image grid alone.
 //! * **The registered it2i path shares this projector.** Its running state has the same pixel-space
 //!   layout as txt2img and forwards the request hook into the shared dual-guidance loop. The direct
-//!   interleave API takes a caller-supplied hook too, so callers without a preview carrier can pass an
-//!   inert one without this crate ever replacing the registered request's sink.
+//!   preview-aware interleave API takes a caller-supplied hook too. Its source-compatible legacy
+//!   wrapper deliberately supplies an inert hook because that older API has no preview carrier; this
+//!   never replaces the registered request's sink.
 //!
 //! A stale or absent fit degrades preview colour only; the denoise path never reads these constants.
 
@@ -259,6 +260,21 @@ pub(crate) fn t2i_hook(sink: &PreviewSink, cell: usize) -> PreviewHook<'_> {
     PreviewHook::new(sink, move |image: &Tensor| {
         project_running_image(image, cell)
     })
+}
+
+/// Run a direct, off-registry operation with an inert SenseNova preview hook.
+///
+/// [`crate::T2iModel::interleave_gen`] predates preview support and must preserve its public source
+/// signature. Keeping the inert sink construction here lets that compatibility wrapper delegate to
+/// [`crate::T2iModel::interleave_gen_with_preview`] without teaching `t2i.rs` how to construct or
+/// replace preview plumbing on the registered request path.
+pub(crate) fn with_inert_t2i_preview<T>(
+    cell: usize,
+    run: impl FnOnce(&PreviewHook<'_>) -> Result<T>,
+) -> Result<T> {
+    let sink = PreviewSink::default();
+    let preview = t2i_hook(&sink, cell);
+    run(&preview)
 }
 
 #[cfg(test)]
@@ -663,6 +679,35 @@ mod tests {
         source.lines().filter(|line| line.trim() == WANT).count()
     }
 
+    #[test]
+    fn legacy_interleave_signature_delegates_to_the_preview_aware_method() {
+        let t2i = shipped_t2i();
+        let legacy_at = t2i.find("    pub fn interleave_gen(").unwrap();
+        let preview_at = t2i.find("    pub fn interleave_gen_with_preview(").unwrap();
+        let wrapper = &t2i[legacy_at..preview_at];
+        let legacy_signature = wrapper
+            .split_once(") -> Result<InterleaveOutput>")
+            .expect("legacy interleave_gen declaration must end at its return type")
+            .0;
+
+        assert!(
+            !legacy_signature.contains("PreviewHook") && !legacy_signature.contains("preview:"),
+            "the legacy interleave_gen signature must remain callable without a preview argument"
+        );
+        assert_eq!(
+            wrapper
+                .matches("crate::preview::with_inert_t2i_preview(")
+                .count(),
+            1,
+            "legacy interleave_gen must build its inert compatibility hook only through preview.rs"
+        );
+        assert_eq!(
+            wrapper.matches("self.interleave_gen_with_preview(").count(),
+            1,
+            "legacy interleave_gen must delegate exactly once to the preview-aware implementation"
+        );
+    }
+
     /// **The whole hook path, guarded.** The registered lane builds its hook over the *request's* sink
     /// and every hop between that sink and the emission carries it as a non-`Option` reference.
     ///
@@ -799,7 +844,7 @@ mod tests {
             "    pub fn it2i_generate(",
             "    fn denoise(",
             "    fn it2i_denoise(",
-            "    pub fn interleave_gen(",
+            "    pub fn interleave_gen_with_preview(",
         ] {
             assert_eq!(
                 preview_parameter(t2i, declaration),

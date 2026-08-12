@@ -1062,6 +1062,40 @@ impl T2iModel {
         max_new_tokens: usize,
         max_images: usize,
         cancel: &CancelFlag,
+    ) -> Result<InterleaveOutput> {
+        crate::preview::with_inert_t2i_preview(self.cell(), |preview| {
+            self.interleave_gen_with_preview(
+                tokenizer,
+                prompt,
+                input_images,
+                width,
+                height,
+                opts,
+                system_message,
+                max_new_tokens,
+                max_images,
+                cancel,
+                preview,
+            )
+        })
+    }
+
+    /// Preview-aware sibling of [`Self::interleave_gen`]. The legacy method preserves the original
+    /// public signature and delegates here with an inert hook; callers with a preview carrier use
+    /// this method to receive frames from the same interleave denoise loop.
+    #[allow(clippy::too_many_arguments)]
+    pub fn interleave_gen_with_preview(
+        &self,
+        tokenizer: &SenseNovaTokenizer,
+        prompt: &str,
+        input_images: &[Tensor],
+        width: usize,
+        height: usize,
+        opts: &T2iOptions,
+        system_message: &str,
+        max_new_tokens: usize,
+        max_images: usize,
+        cancel: &CancelFlag,
         preview: &PreviewHook<'_>,
     ) -> Result<InterleaveOutput> {
         let cell = self.cell();

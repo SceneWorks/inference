@@ -333,6 +333,33 @@ impl Generator for SenseNovaGenerator {
         let id = self.descriptor.id;
         // Capability floor (count/size range, guidance, and Reference/MultiReference only).
         self.descriptor.capabilities.validate_request(id, req)?;
+        // SenseNova consumes every supplied reference at full model-native conditioning. It has no
+        // strength-weighted blend or schedule-tail primitive, so accepting either strength carrier
+        // would silently discard a user control. Validate the per-reference carrier first: when a
+        // caller supplies both forms, the more specific field is the actionable error and the
+        // request-level fallback is considered only when the reference omitted its own value.
+        for conditioning in &req.conditioning {
+            match conditioning {
+                Conditioning::Reference {
+                    strength: Some(_), ..
+                } => {
+                    return Err(gen_core::Error::Unsupported(format!(
+                        "{id}: Conditioning::Reference.strength is unsupported; omit it or set it to null"
+                    )));
+                }
+                Conditioning::MultiReference { images } if images.is_empty() => {
+                    return Err(gen_core::Error::Unsupported(format!(
+                        "{id}: MultiReference conditioning requires at least one image"
+                    )));
+                }
+                _ => {}
+            }
+        }
+        if req.strength.is_some() {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{id}: request-level strength is unsupported; omit it or set it to null"
+            )));
+        }
         if req.true_cfg.is_some() && !has_reference(req) {
             return Err(gen_core::Error::Unsupported(format!(
                 "{id}: true_cfg is image guidance and requires Reference or non-empty \
@@ -757,6 +784,106 @@ mod tests {
                 ..Default::default()
             })
             .is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_empty_multi_reference_without_falling_back_to_t2i() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID, &spec)
+            .unwrap();
+        let empty = GenerationRequest {
+            prompt: "use these references".into(),
+            width: 512,
+            height: 512,
+            // Deliberately no true_cfg: the empty shape must fail on its own instead of passing as
+            // an unconditioned T2I request.
+            conditioning: vec![Conditioning::MultiReference { images: vec![] }],
+            ..Default::default()
+        };
+
+        let err = g
+            .validate(&empty)
+            .expect_err("empty MultiReference must fail");
+        assert!(matches!(err, gen_core::Error::Unsupported(_)));
+        assert_eq!(
+            err.to_string(),
+            "unsupported: sensenova_u1_8b: MultiReference conditioning requires at least one image"
+        );
+    }
+
+    #[test]
+    fn validate_strength_fields_are_fail_closed_and_null_is_accepted() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID, &spec)
+            .unwrap();
+        let reference = Image {
+            width: 1,
+            height: 1,
+            pixels: vec![0, 0, 0],
+        };
+        let null_strengths = GenerationRequest {
+            prompt: "edit this reference".into(),
+            width: 512,
+            height: 512,
+            strength: None,
+            conditioning: vec![Conditioning::Reference {
+                image: reference.clone(),
+                strength: None,
+            }],
+            ..Default::default()
+        };
+        assert!(
+            g.validate(&null_strengths).is_ok(),
+            "absent/null strength carriers preserve the supported reference shape"
+        );
+
+        let request_strength = GenerationRequest {
+            strength: Some(0.6),
+            ..null_strengths.clone()
+        };
+        let err = g
+            .validate(&request_strength)
+            .expect_err("request-level strength must not be discarded");
+        assert!(matches!(err, gen_core::Error::Unsupported(_)));
+        assert_eq!(
+            err.to_string(),
+            "unsupported: sensenova_u1_8b: request-level strength is unsupported; omit it or set it to null"
+        );
+
+        let per_reference_strength = GenerationRequest {
+            conditioning: vec![Conditioning::Reference {
+                image: reference.clone(),
+                strength: Some(0.4),
+            }],
+            ..null_strengths.clone()
+        };
+        let err = g
+            .validate(&per_reference_strength)
+            .expect_err("per-reference strength must not be discarded");
+        assert!(matches!(err, gen_core::Error::Unsupported(_)));
+        assert_eq!(
+            err.to_string(),
+            "unsupported: sensenova_u1_8b: Conditioning::Reference.strength is unsupported; omit it or set it to null"
+        );
+
+        // Per-reference strength is the specific carrier and therefore wins when both are present;
+        // this pins the request-level fallback precedence documented by GenerationRequest.
+        let both = GenerationRequest {
+            strength: Some(0.8),
+            conditioning: vec![Conditioning::Reference {
+                image: reference,
+                strength: Some(0.4),
+            }],
+            ..null_strengths
+        };
+        assert_eq!(
+            g.validate(&both).unwrap_err().to_string(),
+            "unsupported: sensenova_u1_8b: Conditioning::Reference.strength is unsupported; omit it or set it to null"
+        );
     }
 
     #[test]
