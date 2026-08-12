@@ -47,9 +47,10 @@ use std::path::Path;
 
 use mlx_rs::Dtype;
 
+use mlx_gen::gen_core::{LoadSpec, WeightsSource};
 use mlx_gen::weights::Weights;
 use mlx_gen_minimax_h3::dit::model::MiniMaxH3Dit;
-use mlx_gen_minimax_h3::model::{MiniMaxH3Task, BASE_DIT_PARTITION, REFERENCE_DIT_PARTITION};
+use mlx_gen_minimax_h3::model::{load, MiniMaxH3Task, BASE_DIT_PARTITION, REFERENCE_DIT_PARTITION};
 
 /// The tensor that distinguishes the two partitions. float32, `[5376]`, in shard 1 of each.
 const PROBE: &str = "proj_in.bias";
@@ -374,5 +375,94 @@ fn every_dit_load_site_is_driven_by_the_task() {
     assert!(
         src.contains("let task = MiniMaxH3Task::resolve("),
         "the task must be resolved from the request, not assumed per arm"
+    );
+}
+
+/// **`ref2va`'s checkpoint is probed at load, beside the resolved DiT — not under the root.**
+///
+/// The sc-17149 / sc-17150 seam, from the caller's side. `ref2va` is a first-class task of this
+/// engine, so a snapshot that cannot serve it must fail at load naming the path, rather than 20
+/// minutes into a render when the reference arm finally reaches for it.
+///
+/// Costs no weights: `load` probes for `config.json` before it reads a single tensor.
+#[test]
+fn a_snapshot_without_the_reference_partition_is_refused_at_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let dit = root.join(BASE_DIT_PARTITION);
+    std::fs::create_dir_all(&dit).unwrap();
+    std::fs::write(dit.join("config.json"), "{}").unwrap();
+
+    // 1. The base partition is staged, the reference one is not.
+    let spec = LoadSpec::new(WeightsSource::Dir(root.to_path_buf()));
+    let message = match load(&spec) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("a snapshot with no {REFERENCE_DIT_PARTITION} must not load"),
+    };
+    assert!(
+        message.contains(REFERENCE_DIT_PARTITION),
+        "the refusal must name the missing partition: {message}"
+    );
+    assert!(
+        message.contains(&root.join(REFERENCE_DIT_PARTITION).display().to_string()),
+        "the refusal must name the PATH it looked at, so a split install can see where: {message}"
+    );
+
+    // 2. Staging it gets past this probe — so the gate above is a real ordering, not a load that
+    //    always fails. The next refusal is a DIFFERENT, later component.
+    let reference = root.join(REFERENCE_DIT_PARTITION);
+    std::fs::create_dir_all(&reference).unwrap();
+    std::fs::write(reference.join("config.json"), "{}").unwrap();
+    let message = match load(&spec) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("the remaining components are still missing"),
+    };
+    assert!(
+        !message.contains(REFERENCE_DIT_PARTITION),
+        "the reference partition is staged now; the refusal must have moved on: {message}"
+    );
+    assert!(
+        message.contains("vae"),
+        "the next missing component is the video VAE: {message}"
+    );
+}
+
+/// The same probe on a **tiered** install looks beside the staged DiT, not under the snapshot root.
+///
+/// This is the case `root.join(REFERENCE_DIT_PARTITION)` got wrong. The root here holds a complete
+/// pair of partitions and is still refused, because the *staged* tier is what `ref2va` would read
+/// and that tier carries only its base partition.
+#[test]
+fn a_tiered_install_probes_the_reference_partition_inside_the_tier() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("snapshot");
+    let tier = dir.path().join("tiers").join("q4");
+    for base in [&root, &tier] {
+        let dit = base.join(BASE_DIT_PARTITION);
+        std::fs::create_dir_all(&dit).unwrap();
+        std::fs::write(dit.join("config.json"), "{}").unwrap();
+    }
+    // The ROOT has a reference partition. The staged tier does not — and the tier is what counts.
+    let root_reference = root.join(REFERENCE_DIT_PARTITION);
+    std::fs::create_dir_all(&root_reference).unwrap();
+    std::fs::write(root_reference.join("config.json"), "{}").unwrap();
+
+    let mut spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+    spec.components.insert(
+        mlx_gen_minimax_h3::model::DIT_COMPONENT.to_string(),
+        WeightsSource::Dir(tier.join(BASE_DIT_PARTITION)),
+    );
+    let message = match load(&spec) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("the staged tier has no {REFERENCE_DIT_PARTITION}"),
+    };
+    assert!(
+        message.contains(&tier.join(REFERENCE_DIT_PARTITION).display().to_string()),
+        "the probe must look inside the TIER, not under the root: {message}"
+    );
+    assert!(
+        !message.contains(&root_reference.display().to_string()),
+        "the root's reference partition belongs to a different tier and must not satisfy this: \
+         {message}"
     );
 }
