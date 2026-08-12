@@ -37,6 +37,7 @@ pub mod providers {
     pub use mlx_gen_lens as lens;
     pub use mlx_gen_ltx as ltx;
     pub use mlx_gen_mage as mage;
+    pub use mlx_gen_minimax_h3 as minimax_h3;
     pub use mlx_gen_mochi as mochi;
     pub use mlx_gen_pid as pid;
     pub use mlx_gen_pulid as pulid;
@@ -82,6 +83,7 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
     let registry = mlx_gen_lens::register_providers(registry);
     let registry = mlx_gen_ltx::register_providers(registry);
     let registry = mlx_gen_mage::register_providers(registry);
+    let registry = mlx_gen_minimax_h3::register_providers(registry);
     let registry = mlx_gen_mochi::register_providers(registry);
     let registry = mlx_gen_pulid::register_providers(registry);
     let registry = mlx_gen_qwen_image::register_providers(registry);
@@ -420,6 +422,7 @@ mod tests {
                 "mage_flow_edit",
                 "mage_flow_edit_base",
                 "mage_flow_edit_turbo",
+                "minimax_h3",
                 "mochi_1",
                 "pulid_flux",
                 "qwen_image",
@@ -490,8 +493,8 @@ mod tests {
             .chain(&image_embedders)
             .chain(&text_embedders)
             .collect();
-        assert_eq!(distinct.len(), 68);
-        assert_eq!(super::MLX_MEDIA_PROVIDER_COMPONENTS.len(), 59);
+        assert_eq!(distinct.len(), 69);
+        assert_eq!(super::MLX_MEDIA_PROVIDER_COMPONENTS.len(), 60);
     }
 
     /// Mage-Flow's base, turbo, and RL variants are registered on the shipped MLX platform surface

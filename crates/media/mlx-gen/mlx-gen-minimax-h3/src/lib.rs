@@ -1,8 +1,19 @@
 //! # mlx-gen-minimax-h3
 //!
-//! Native-Rust / MLX inference for **MiniMax-H3 (Hailuo 3.0)** (`MiniMaxAI/MiniMax-H3`,
-//! Apache-2.0) — a joint audio+video generation family. This crate currently carries the two
-//! **VAE decode** paths.
+//! Native-Rust / MLX inference for **MiniMax-H3 (Hailuo 3.0)** (`MiniMaxAI/MiniMax-H3`) — a joint
+//! audio+video generation family.
+//!
+//! # The weights are NOT Apache-2.0 (corrected in sc-17147)
+//!
+//! This crate's own code is Apache-2.0; the **model** is not, and the two were conflated here until
+//! the licence was read. `MiniMaxAI/MiniMax-H3` declares `license: other` /
+//! `minimax-h3-community-license-agreement`, and that agreement is **territorially exclusive**: §I.3
+//! and §I.5 define its "Applicable Territory" as worldwide **excluding the European Union, the
+//! United Kingdom, the Republic of Korea and the United States of America**, and §V.4 forbids use
+//! outside it. §IV.1 also imposes a $20 M revenue ceiling. The bundled `text_encoder/` is the one
+//! exception: it is byte-identical upstream Qwen3-VL-32B-Instruct under Apache-2.0, which the
+//! LICENSE itself says. Both halves are rowed in
+//! `gen_core::license::components` — see `MINIMAX_H3_COMMUNITY` for the transcription.
 //!
 //! ## Video VAE (sc-17140)
 //!
@@ -100,12 +111,28 @@
 //! decoder past a fully green parity suite. **The DiT (sc-17144) carries the same FFN swap plus a
 //! grouped-QKV reorder**, and the candle twins (sc-17154 / sc-17155) inherit both.
 //!
-//! Not in this crate yet: either CNN encoder, the pipeline and the DiT's input/output projections
-//! — including the timestep MLP the AdaLN precompute takes as a closure, and the
-//! [`denoise::JointVelocity`] implementation the joint loop calls — (sc-17147), `fl2va`
-//! conditioning (sc-17148), Ref2VA's `transformer_ref` (sc-17149) and sequential residency
-//! (sc-17151). Nothing is registered with `mlx-gen-catalog` — there is no generator to ship until
-//! the pipeline lands.
+//! ## `t2va` first light — the DiT's input/output projections and the pipeline (sc-17147)
+//!
+//! - [`dit::heads`] carries the **17** tensors of `transformer/` that are neither a block nor a
+//!   refiner entry: the two patch projections, `context_embedder`, the timestep MLP, the final
+//!   modulated norm and the two output heads;
+//! - [`dit::model`] assembles the whole `MiniMaxH3Transformer3DModel` and implements
+//!   [`denoise::JointVelocity`] over it;
+//! - [`pipeline`] owns request geometry, latent packing, the cancellable render core and the
+//!   delivered soundtrack's length policy;
+//! - [`model`] is the `gen-core` [`Generator`](mlx_gen::gen_core::Generator), registered with
+//!   `mlx-gen-catalog`.
+//!
+//! Three things that slice owns and nothing else can state. The published checkpoint is **mixed
+//! precision** and the 17 are where it lives — twelve of them ship float32 while the 50-block stack
+//! is bfloat16 — so they load at their published dtype rather than the stack's. `norm_out` is keyed
+//! on the **bare timestep index**, not on the blocks' `timestep · MODALITY_NUM + tag`, and the two
+//! index tensors are derived from one another so they cannot drift. And the delivered soundtrack is
+//! **fitted to the picture** rather than muxed at its own length: see [`pipeline::fit_audio_to_video`]
+//! for the ±8.33 ms the audio-latent rounding produces and why the correction belongs on the audio.
+//!
+//! Not in this crate yet: either CNN encoder, `fl2va` conditioning (sc-17148), Ref2VA's
+//! `transformer_ref` (sc-17149), quantized tiers (sc-17150) and sequential residency (sc-17151).
 
 pub mod alias_free;
 pub mod audio_config;
@@ -117,6 +144,8 @@ pub mod decoder;
 pub mod denoise;
 pub mod dit;
 pub mod layout;
+pub mod model;
+pub mod pipeline;
 pub mod rope;
 pub mod tensor;
 pub mod text_encoder;
@@ -145,12 +174,21 @@ pub use denoise::{
     ROPE_UNITS_PER_SECOND, TEXT_TAG, VIDEO_SIGMA_SHIFT, VIDEO_TAG,
 };
 pub use dit::{
-    AdaLnCache, AdaLnModulation, AdaLnProjection, AdaLnResidency, DitBlock, MiniMaxH3DitConfig,
-    MmRope, MmRopeTables, ScheduleKey, TimestepSchedule, TokenRefiner, TokenRefinerBlock,
-    MODALITY_NUM,
+    AdaLayerNormOut, AdaLnCache, AdaLnModulation, AdaLnProjection, AdaLnResidency, DitBlock,
+    DitProjections, JointDit, LinearBias, MiniMaxH3Dit, MiniMaxH3DitConfig, MmRope, MmRopeTables,
+    NormOutModulation, ScheduleKey, TimestepEmbedder, TimestepSchedule, TokenRefiner,
+    TokenRefinerBlock, MODALITY_NUM, PUBLISHED_DIT_TENSORS,
 };
 pub use layout::{
     split_gate_value, GatedFfnLayout, AUDIO_VAE_IS_UNCONVERTED, PUBLISHED_GATED_FFN_LAYOUT,
+};
+pub use model::{descriptor, load, MODEL_ID as GENERATOR_ID};
+pub use pipeline::{
+    align_frames_for_duration, fit_audio_to_video, frames_to_images, initial_latents,
+    patchify_video_latents, render_latents, resolve_geometry, revert_pixel_normalization,
+    t2va_layout, unpack_audio_rows, unpatchify_video_rows, RenderedLatents, RequestGeometry,
+    CANVAS_MAX_PIXELS, CANVAS_SHORT_EDGE, MAX_DURATION_SECONDS, MIN_DURATION_SECONDS, PATCH_SIZE,
+    PIXEL_MEAN, PIXEL_STD, SMALLEST_LEGAL_FRAMES, SPATIAL_STRIDE,
 };
 pub use rope::{create_token_ids, Rope3d, RopeTables};
 pub use text_encoder::{
@@ -164,19 +202,51 @@ pub use vae::{split_fused_qkv, MiniMaxH3VideoVae};
 /// The published model id this crate targets.
 pub const MODEL_ID: &str = "minimax_h3";
 
-/// Frame/pixel alignment the video decode implies — `VAE_RATIO` spatially.
-pub const SIZE_MULTIPLE: u32 = VAE_RATIO as u32;
+/// Pixel alignment a generated canvas must satisfy — the VAE's `VAE_RATIO` spatial compression
+/// **times the DiT's width patch of 2**, i.e. 32.
+///
+/// Consumers read this for `requiresDimensionsMultipleOf`, so it must be the number the engine
+/// actually enforces, not the looser VAE-only one. A 16-aligned canvas survives the VAE and then has
+/// an odd number of latent columns, which has no patched representation at all
+/// ([`pipeline::SPATIAL_STRIDE`]). Until sc-17147 there was no pipeline to enforce anything and this
+/// advertised 16.
+pub const SIZE_MULTIPLE: u32 = VAE_RATIO as u32 * 2;
+
+/// Add the MLX MiniMax-H3 generator to an explicit media registry builder.
+pub fn register_providers(
+    registry: mlx_gen::gen_core::ProviderRegistryBuilder,
+) -> mlx_gen::gen_core::ProviderRegistryBuilder {
+    registry.register_generator(model::REGISTRATION)
+}
+
+/// Build the complete explicit MLX MiniMax-H3 provider catalog.
+pub fn provider_registry() -> mlx_gen::gen_core::Result<mlx_gen::gen_core::ProviderRegistry> {
+    register_providers(mlx_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+#[cfg(test)]
+mod explicit_registry_tests {
+    /// The explicit catalog surface: one generator, at the published id.
+    #[test]
+    fn explicit_catalog_has_stable_surface() {
+        let registry = super::provider_registry().expect("registry");
+        let ids: Vec<&str> = registry.generators().map(|g| (g.descriptor)().id).collect();
+        assert_eq!(ids, vec![super::MODEL_ID]);
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The crate ships no generator yet, so it is deliberately absent from `mlx-gen-catalog`.
-    /// This pins the compression contract the later pipeline slices will build on.
+    /// The published compression contract, and the stride the generator enforces.
     #[test]
     fn published_surface_is_the_vae_decode_contract() {
         assert_eq!(MODEL_ID, "minimax_h3");
-        assert_eq!(SIZE_MULTIPLE, 16);
+        assert_eq!(
+            SIZE_MULTIPLE, 32,
+            "VAE 16x times the DiT's width patch of 2"
+        );
         assert_eq!(VAE_RATIO, 16);
         assert_eq!(VAE_RATIO_T, 4);
         assert_eq!(LATENT_CHANNELS, 24);
