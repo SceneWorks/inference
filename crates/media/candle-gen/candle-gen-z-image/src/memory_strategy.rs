@@ -537,6 +537,7 @@ pub(crate) fn registered_valid_fixture(
     if !strategy.is_optimized() {
         return Ok(Vec::new());
     }
+    let is_control = contract.provider_id.ends_with("_control");
     let context = gen_core::standard_memory_behavior_context(
         contract,
         strategy,
@@ -546,8 +547,12 @@ pub(crate) fn registered_valid_fixture(
             component_precision_floors: &[],
         },
         gen_core::MemoryBehaviorRoute {
-            mode: gen_core::MemoryMode::TextToImage,
-            reference_count: 0,
+            mode: if is_control {
+                gen_core::MemoryMode::ImageToImage
+            } else {
+                gen_core::MemoryMode::TextToImage
+            },
+            reference_count: u32::from(is_control),
             use_pid: false,
             has_phases: false,
             overlay: None,

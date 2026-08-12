@@ -115,7 +115,9 @@ pub fn register_providers(
         .register_memory_strategy(BASE_MEMORY_REGISTRATION)
         .register_memory_behavior(BASE_MEMORY_BEHAVIOR)
         .register_composed_memory_strategy(TURBO_CONTROL_MEMORY_REGISTRATION)
-        .register_composed_memory_strategy(BASE_CONTROL_MEMORY_REGISTRATION);
+        .register_memory_behavior(TURBO_CONTROL_MEMORY_BEHAVIOR)
+        .register_composed_memory_strategy(BASE_CONTROL_MEMORY_REGISTRATION)
+        .register_memory_behavior(BASE_CONTROL_MEMORY_BEHAVIOR);
     registry.register_trainer(training::REGISTRATION)
 }
 
@@ -718,11 +720,36 @@ const TURBO_CONTROL_MEMORY_REGISTRATION: gen_core::MemoryRegistration =
     };
 
 #[cfg(any(feature = "cuda", test))]
+const TURBO_CONTROL_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: "z_image_turbo_control",
+        valid_fixtures: memory_strategy::registered_valid_fixture,
+        begin_request: |spec, contract, context| {
+            memory_strategy::registered_begin_request(
+                "z_image_turbo_control",
+                spec,
+                contract,
+                context,
+            )
+        },
+    };
+
+#[cfg(any(feature = "cuda", test))]
 const BASE_CONTROL_MEMORY_REGISTRATION: gen_core::MemoryRegistration =
     gen_core::MemoryRegistration {
         provider_id: "z_image_control",
         contract: registered_base_control_memory_contract,
         safety_check: memory_strategy::registered_safety_check,
+    };
+
+#[cfg(any(feature = "cuda", test))]
+const BASE_CONTROL_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: "z_image_control",
+        valid_fixtures: memory_strategy::registered_valid_fixture,
+        begin_request: |spec, contract, context| {
+            memory_strategy::registered_begin_request("z_image_control", spec, contract, context)
+        },
     };
 
 #[cfg(test)]
@@ -733,6 +760,42 @@ mod tests {
         MemoryMode, MemoryNumericTier, MemoryRunContext, MemorySafetyDecision, MemoryStrategy,
         Precision, Quant, WeightsSource,
     };
+
+    #[test]
+    fn control_memory_registrations_have_weights_free_behavior_seams() {
+        let registry = gen_core::ProviderRegistryBuilder::new()
+            .register_composed_memory_strategy(TURBO_CONTROL_MEMORY_REGISTRATION)
+            .register_memory_behavior(TURBO_CONTROL_MEMORY_BEHAVIOR)
+            .register_composed_memory_strategy(BASE_CONTROL_MEMORY_REGISTRATION)
+            .register_memory_behavior(BASE_CONTROL_MEMORY_BEHAVIOR)
+            .build()
+            .unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+
+        gen_core_testkit::memory_strategy_registry_conformance(&registry, &spec);
+
+        for contract in [
+            registered_turbo_control_memory_contract(&spec).unwrap(),
+            registered_base_control_memory_contract(&spec).unwrap(),
+        ] {
+            let fixtures = memory_strategy::registered_valid_fixture(
+                &spec,
+                &contract,
+                MemoryStrategy::StagedResidency,
+            )
+            .unwrap();
+            assert!(!fixtures.is_empty(), "{}", contract.provider_id);
+            for fixture in fixtures {
+                assert_eq!(fixture.context.mode, MemoryMode::ImageToImage);
+                assert_eq!(fixture.context.geometry.reference_count, 1);
+                assert_eq!(fixture.request.conditioning.len(), 1);
+                assert!(matches!(
+                    fixture.request.conditioning.as_slice(),
+                    [Conditioning::Reference { .. }]
+                ));
+            }
+        }
+    }
 
     fn admission_context(
         contract: &gen_core::MemoryProviderContract,

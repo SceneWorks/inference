@@ -346,10 +346,11 @@ mod preview_advertising {
     ///   ones own bespoke Euler loops. The same crate is `Denoise::Shared` and emits directly, which is
     ///   why both counts appear on one file's row below.
     /// * **The `_control` route ids in this crate are memory strategies, not descriptors.**
-    ///   `z_image_turbo_control` / `z_image_control` register a `MemoryRegistration` and nothing else,
-    ///   so they have no id to advertise here — exactly the `candle-gen-flux` control/IP shape, and the
-    ///   reason the two ids above cover nine lanes. `edit.rs`'s img2img provider is the same: a
-    ///   name-driven worker stream carrying a `preview` field on its own request type.
+    ///   `z_image_turbo_control` / `z_image_control` register memory contracts and their weights-free
+    ///   behavior seams, but no generator descriptor, so they have no id to advertise here — exactly
+    ///   the `candle-gen-flux` control/IP shape, and the reason the two ids above cover nine lanes.
+    ///   `edit.rs`'s img2img provider is the same: a name-driven worker stream carrying a `preview`
+    ///   field on its own request type.
     ///
     /// Z-Image also settles a question sc-16955 raised and sc-16956 half-answered. Its VAE is
     /// **byte-identical to FLUX.1-dev's** — the same `f5b59a26…40a3` container, whose `vae/config.json`
