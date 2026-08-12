@@ -1036,10 +1036,10 @@ mod tests {
                 "{declaration} must take its hook by reference"
             );
         }
-        // Both `generate_with` / `generate_with_conditioning` pairs (base and Sprint) plus the two
-        // free denoise functions: six declarations in shipped `pipeline.rs`, line-exact for the same
-        // reason as `model.rs` above.
-        assert_eq!(hook_parameters(pipeline), 6);
+        // Both `generate_with` / `generate_with_conditioning` pairs (base and Sprint), the two
+        // public txt2img denoise wrappers, and their img2img schedule-tail twins: eight declarations
+        // in shipped `pipeline.rs`, line-exact for the same reason as `model.rs` above.
+        assert_eq!(hook_parameters(pipeline), 8);
 
         // The only hooks shipped `pipeline.rs` builds are the two documented INERT ones in the
         // `generate` convenience wrappers. A hook over anything else there would be a second wiring
