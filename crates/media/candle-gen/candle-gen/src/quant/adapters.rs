@@ -258,6 +258,39 @@ fn bfl_candidates(family: &str, path: &str, out_features: usize) -> Vec<LoraCand
     out
 }
 
+/// Wan community adapters commonly use the native model namespace while the Candle host exposes
+/// diffusers names. Dense Wan merges translate source keys before lookup; additive dense/packed
+/// installs instead walk the host, so offer the equivalent native spelling as a candidate.
+fn wan_candidates(family: &str, path: &str) -> Vec<LoraCandidate> {
+    if !family.starts_with("wan") {
+        return Vec::new();
+    }
+    let mut native = path
+        .replace(".attn1.", ".self_attn.")
+        .replace(".attn2.", ".cross_attn.");
+    if let Some(base) = native.strip_suffix(".ffn.net.0.proj") {
+        native = format!("{base}.ffn.0");
+    } else if let Some(base) = native.strip_suffix(".ffn.net.2") {
+        native = format!("{base}.ffn.2");
+    } else {
+        for (diffusers, wan) in [
+            (".to_q", ".q"),
+            (".to_k", ".k"),
+            (".to_v", ".v"),
+            (".to_out.0", ".o"),
+        ] {
+            if let Some(base) = native.strip_suffix(diffusers) {
+                native = format!("{base}{wan}");
+                break;
+            }
+        }
+    }
+    (native != path)
+        .then(|| direct_candidate(native))
+        .into_iter()
+        .collect()
+}
+
 fn strip_prefix(key: &str) -> &str {
     for prefix in wmeta::COMMON_LORA_PREFIXES {
         if let Some(rest) = key.strip_prefix(prefix) {
@@ -353,12 +386,27 @@ fn resolve_lokr(
     source: usize,
     pending: &mut BTreeMap<String, Vec<PendingLokr>>,
     skipped: &mut usize,
-) {
+) -> CResult<()> {
     let (rank, alpha) = wmeta::parse_rank_alpha(
         file.meta.get("rank").map(String::as_str),
         file.meta.get("alpha").map(String::as_str),
     );
+    if !rank.is_finite() || rank <= 0.0 {
+        return Err(CandleError::Msg(format!(
+            "LoKr adapter metadata `rank` must be finite and positive, got {rank}"
+        )));
+    }
+    if !alpha.is_finite() {
+        return Err(CandleError::Msg(format!(
+            "LoKr adapter metadata `alpha` must be finite, got {alpha}"
+        )));
+    }
     let full_scale = alpha as f64 / rank as f64 * scale as f64;
+    if !full_scale.is_finite() {
+        return Err(CandleError::Msg(format!(
+            "LoKr derived scale must be finite, got {full_scale}"
+        )));
+    }
     let mut grouped: BTreeMap<String, BTreeMap<&'static str, Tensor>> = BTreeMap::new();
     for (key, tensor) in &file.tensors {
         match classify_lokr_key(key) {
@@ -383,6 +431,7 @@ fn resolve_lokr(
             source,
         });
     }
+    Ok(())
 }
 
 /// Installs a stack on a model that exposes its adaptable projections using canonical dotted keys.
@@ -399,6 +448,13 @@ pub fn install_dotted_adapters(
     let mut lokrs: BTreeMap<String, Vec<PendingLokr>> = BTreeMap::new();
     let mut report = AdditiveAdapterReport::default();
     for (source, spec) in specs.iter().enumerate() {
+        if !spec.scale.is_finite() {
+            return Err(CandleError::Msg(format!(
+                "{family}: adapter {} scale must be finite, got {}",
+                spec.path.display(),
+                spec.scale
+            )));
+        }
         if let Some(expert) = spec.moe_expert {
             return Err(CandleError::Msg(format!(
                 "{family}: adapter {} targets the {expert:?} MoE expert, but this model has a single denoiser",
@@ -439,7 +495,7 @@ pub fn install_dotted_adapters(
                 source,
                 &mut lokrs,
                 &mut report.skipped_keys,
-            ),
+            )?,
             (AdapterKind::Lora, false) => resolve_lora(
                 &file,
                 spec.scale,
@@ -457,6 +513,7 @@ pub fn install_dotted_adapters(
         let kohya = format!("lora_unet_{}", path.replace('.', "_"));
         let mut candidates = vec![direct_candidate(path), direct_candidate(kohya.clone())];
         candidates.extend(bfl_candidates(family, path, out_features));
+        candidates.extend(wan_candidates(family, path));
         for candidate in candidates {
             let Some(items) = loras.get(&candidate.key) else {
                 continue;
@@ -505,27 +562,66 @@ pub fn install_dotted_adapters(
                 applied_sources.insert(item.source);
             }
         }
-        for key in [path, kohya.as_str()] {
-            let Some(items) = lokrs.get(key) else {
+        let mut lokr_candidates = vec![direct_candidate(path), direct_candidate(kohya.as_str())];
+        lokr_candidates.extend(bfl_candidates(family, path, out_features));
+        lokr_candidates.extend(wan_candidates(family, path));
+        for candidate in lokr_candidates {
+            let Some(items) = lokrs.get(&candidate.key) else {
                 continue;
             };
-            matched.insert(key.to_string());
+            matched.insert(candidate.key.clone());
             for item in items {
-                let Some(factors) = LokrFactors::build(
-                    item.scale,
-                    (out_features, in_features),
-                    item.w1.as_ref(),
-                    item.w1_a.as_ref(),
-                    item.w1_b.as_ref(),
-                    item.w2.as_ref(),
-                    None,
-                    item.w2_a.as_ref(),
-                    item.w2_b.as_ref(),
-                )
-                .map_err(|error| candle_core::Error::Msg(error.to_string()))?
+                let built = match candidate.up_slice {
+                    Some(UpSlice::Chunk { count: _, index }) => LokrFactors::build_sliced(
+                        item.scale,
+                        in_features,
+                        (index * out_features, out_features),
+                        item.w1.as_ref(),
+                        item.w1_a.as_ref(),
+                        item.w1_b.as_ref(),
+                        item.w2.as_ref(),
+                        None,
+                        item.w2_a.as_ref(),
+                        item.w2_b.as_ref(),
+                    ),
+                    Some(UpSlice::Range { start, len }) => {
+                        if len != out_features {
+                            return Err(candle_core::Error::Msg(format!(
+                                "{family}: fused LoKr target `{}` output slice has length {len}, expected host width {out_features}",
+                                candidate.key
+                            )));
+                        }
+                        LokrFactors::build_sliced(
+                            item.scale,
+                            in_features,
+                            (start, len),
+                            item.w1.as_ref(),
+                            item.w1_a.as_ref(),
+                            item.w1_b.as_ref(),
+                            item.w2.as_ref(),
+                            None,
+                            item.w2_a.as_ref(),
+                            item.w2_b.as_ref(),
+                        )
+                    }
+                    None => LokrFactors::build(
+                        item.scale,
+                        (out_features, in_features),
+                        item.w1.as_ref(),
+                        item.w1_a.as_ref(),
+                        item.w1_b.as_ref(),
+                        item.w2.as_ref(),
+                        None,
+                        item.w2_a.as_ref(),
+                        item.w2_b.as_ref(),
+                    ),
+                };
+                let Some(factors) =
+                    built.map_err(|error| candle_core::Error::Msg(error.to_string()))?
                 else {
                     return Err(candle_core::Error::Msg(format!(
-                        "{family}: LoKr target `{path}` has no packed-safe structured form"
+                        "{family}: LoKr target `{}` has no packed-safe structured form",
+                        candidate.key
                     )));
                 };
                 linear.push_lokr_structured(
@@ -577,6 +673,23 @@ mod tests {
             Tensor::ones((out_dim, 1), DType::F32, &device).unwrap(),
         );
         candle_core::safetensors::save(&tensors, path).unwrap();
+    }
+
+    fn write_lokr(path: &std::path::Path, target: &str, w1: Tensor, w2: Tensor, alpha: &str) {
+        let tensors = HashMap::from([
+            (format!("{target}.lokr_w1"), w1),
+            (format!("{target}.lokr_w2"), w2),
+        ]);
+        safetensors::serialize_to_file(
+            tensors.into_iter().collect::<Vec<_>>(),
+            Some(HashMap::from([
+                ("networkType".to_string(), "lokr".to_string()),
+                ("rank".to_string(), "1".to_string()),
+                ("alpha".to_string(), alpha.to_string()),
+            ])),
+            path,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -761,5 +874,90 @@ mod tests {
         .unwrap();
         assert_eq!(report.applied, 3);
         assert!(q.is_adapted() && k.is_adapted() && v.is_adapted());
+    }
+
+    #[test]
+    fn flux1_and_flux2_bfl_fused_qkv_lokr_fan_out_structurally() {
+        let temp = tempfile::tempdir().unwrap();
+        let device = Device::Cpu;
+        let w1 = Tensor::from_vec(vec![1.0f32, 2.0, 3.0], (3, 1), &device).unwrap();
+        let w2 = Tensor::eye(2, DType::F32, &device).unwrap();
+        for (family, target) in [
+            ("flux", "lora_unet_double_blocks_0_img_attn_qkv"),
+            ("flux2", "double_blocks.0.img_attn.qkv"),
+        ] {
+            let adapter = temp
+                .path()
+                .join(format!("{family}-bfl-qkv-lokr.safetensors"));
+            write_lokr(&adapter, target, w1.clone(), w2.clone(), "1");
+            let specs = [AdapterSpec::new(adapter, 1.0, AdapterKind::Lokr)];
+            let make = || {
+                AdaptLinear::from_dense(
+                    Linear::new(Tensor::zeros((2, 2), DType::F32, &device).unwrap(), None),
+                    2,
+                    2,
+                )
+            };
+            let (mut q, mut k, mut v) = (make(), make(), make());
+            let report = install_dotted_adapters(family, &specs, &device, |visitor| {
+                visitor("transformer_blocks.0.attn.to_q", &mut q)?;
+                visitor("transformer_blocks.0.attn.to_k", &mut k)?;
+                visitor("transformer_blocks.0.attn.to_v", &mut v)
+            })
+            .unwrap();
+            assert_eq!(
+                report.applied, 3,
+                "{family} fused LoKr must fan out to q/k/v"
+            );
+            let x = Tensor::ones((1, 2), DType::F32, &device).unwrap();
+            let outputs = [
+                q.forward(&x).unwrap(),
+                k.forward(&x).unwrap(),
+                v.forward(&x).unwrap(),
+            ];
+            for (index, output) in outputs.iter().enumerate() {
+                let values = output.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                let want = (index + 1) as f32;
+                assert!(values.iter().all(|value| (*value - want).abs() < 1e-6));
+            }
+        }
+    }
+
+    #[test]
+    fn lokr_rejects_non_finite_metadata_and_user_scale() {
+        let temp = tempfile::tempdir().unwrap();
+        let device = Device::Cpu;
+        let w1 = Tensor::ones((1, 1), DType::F32, &device).unwrap();
+        let w2 = Tensor::ones((2, 2), DType::F32, &device).unwrap();
+        let bad_meta = temp.path().join("bad-meta.safetensors");
+        write_lokr(&bad_meta, "proj", w1.clone(), w2.clone(), "inf");
+        let make = || {
+            AdaptLinear::from_dense(
+                Linear::new(Tensor::zeros((2, 2), DType::F32, &device).unwrap(), None),
+                2,
+                2,
+            )
+        };
+        let mut linear = make();
+        let error = install_dotted_adapters(
+            "fixture",
+            &[AdapterSpec::new(bad_meta, 1.0, AdapterKind::Lokr)],
+            &device,
+            |visitor| visitor("proj", &mut linear),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("alpha` must be finite"));
+
+        let valid = temp.path().join("valid.safetensors");
+        write_lokr(&valid, "proj", w1, w2, "1");
+        let mut linear = make();
+        let error = install_dotted_adapters(
+            "fixture",
+            &[AdapterSpec::new(valid, f32::INFINITY, AdapterKind::Lokr)],
+            &device,
+            |visitor| visitor("proj", &mut linear),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("scale must be finite"));
     }
 }

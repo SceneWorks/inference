@@ -386,6 +386,14 @@ pub fn merge_adapters(
     let mut report = MergeReport::default();
     for spec in specs {
         let af = read_adapter(&spec.path)?;
+        let has_unstamped_lokr = has_lokr_keys(&af);
+        if spec.kind == AdapterKind::Lokr && !af.declares_lokr() {
+            return Err(CandleError::Msg(format!(
+                "krea: adapter {} declared LoKr but does not declare networkType=lokr",
+                spec.path.display()
+            )));
+        }
+        let before = report.merged;
         match spec.kind {
             AdapterKind::Lokr => merge_lokr_file(map, &af, spec.scale, &table, &mut report)?,
             AdapterKind::Lora => {
@@ -400,12 +408,18 @@ pub fn merge_adapters(
                 // A third-party LyCORIS LoKr (ai-toolkit / lycoris, sc-8776) carries `lokr_*` keys but
                 // NO `networkType` stamp, so `classify_adapter` can't know to set kind=Lokr — sniff the
                 // keys and route to the LoKr merge, mirroring MLX's `is_lokr_keys` autoprefix branch.
-                if has_lokr_keys(&af) {
+                if has_unstamped_lokr {
                     merge_lokr_file(map, &af, spec.scale, &table, &mut report)?;
                 } else {
                     merge_lora_file(map, &af, spec.scale, &table, &mut report)?;
                 }
             }
+        }
+        if report.merged == before {
+            return Err(CandleError::Msg(format!(
+                "krea: selected adapter {} matched no Krea projection",
+                spec.path.display()
+            )));
         }
     }
     if report.merged == 0 {
@@ -537,9 +551,16 @@ pub fn any_diff_patch(specs: &[AdapterSpec]) -> bool {
 /// Returns the [`MergeReport`]; the caller sums its `merged` with [`install_additive`]'s applied count
 /// for the zero-match guard, so a diff-patch-only file does not read as "matched nothing". A no-op
 /// (empty report, no overlay installed) for specs carrying no `.diff`/`.diff_b`.
-pub fn fold_diff_patch(w: &mut Weights, specs: &[AdapterSpec]) -> Result<MergeReport> {
+#[derive(Debug, Default)]
+pub struct DiffPatchReport {
+    pub merged: usize,
+    pub skipped_keys: usize,
+    pub applied_by_spec: Vec<usize>,
+}
+
+pub fn fold_diff_patch(w: &mut Weights, specs: &[AdapterSpec]) -> Result<DiffPatchReport> {
     if specs.is_empty() {
-        return Ok(MergeReport::default());
+        return Ok(DiffPatchReport::default());
     }
     let files: Vec<AdapterFile> = specs
         .iter()
@@ -565,7 +586,10 @@ pub fn fold_diff_patch(w: &mut Weights, specs: &[AdapterSpec]) -> Result<MergeRe
         }
     }
     if map.is_empty() {
-        return Ok(MergeReport::default());
+        return Ok(DiffPatchReport {
+            applied_by_spec: vec![0; specs.len()],
+            ..Default::default()
+        });
     }
 
     // Snapshot the preloaded base identities so only projections a delta actually folded into enter the
@@ -574,12 +598,19 @@ pub fn fold_diff_patch(w: &mut Weights, specs: &[AdapterSpec]) -> Result<MergeRe
     // [`merge_into_weights`] uses.
     let base_ids: HashMap<String, _> = map.iter().map(|(k, t)| (k.clone(), t.id())).collect();
     let mut report = MergeReport::default();
+    let mut applied_by_spec = Vec::with_capacity(specs.len());
     for (spec, af) in specs.iter().zip(&files) {
+        let before = report.merged;
         merge_diff_patch_file(&mut map, af, spec.scale, resolve_diff_stem, &mut report)?;
+        applied_by_spec.push(report.merged - before);
     }
     map.retain(|k, t| base_ids.get(k).is_none_or(|&id| t.id() != id));
     w.set_overlay(map);
-    Ok(report)
+    Ok(DiffPatchReport {
+        merged: report.merged,
+        skipped_keys: report.skipped_keys,
+        applied_by_spec,
+    })
 }
 
 // ---- Forward-time additive (unmerged) install on a PACKED tier (sc-11105) ------------------------
@@ -600,6 +631,7 @@ struct PendingLora {
     a: Tensor,
     b: Tensor,
     scale: f64,
+    source: usize,
 }
 
 /// A LoKr module's raw factors + the FULL `(alpha/rank)·strength` scale, pending the projection's
@@ -613,6 +645,7 @@ struct PendingLokr {
     w2_a: Option<Tensor>,
     w2_b: Option<Tensor>,
     scale: f64,
+    source: usize,
 }
 
 /// A report of a forward-time additive install (sc-11105) — the packed-tier analog of [`MergeReport`].
@@ -632,6 +665,7 @@ pub struct AdditiveReport {
 fn resolve_lora_file(
     af: &AdapterFile,
     scale: f32,
+    source: usize,
     table: &BTreeMap<String, String>,
     pending: &mut BTreeMap<String, Vec<PendingLora>>,
     skipped_keys: &mut usize,
@@ -671,6 +705,7 @@ fn resolve_lora_file(
             a,
             b,
             scale: scale as f64,
+            source,
         });
     }
     Ok(())
@@ -683,6 +718,7 @@ fn resolve_lora_file(
 fn resolve_lokr_file(
     af: &AdapterFile,
     scale: f32,
+    source: usize,
     table: &BTreeMap<String, String>,
     pending: &mut BTreeMap<String, Vec<PendingLokr>>,
     skipped_keys: &mut usize,
@@ -738,6 +774,7 @@ fn resolve_lokr_file(
             w2_a: g.factors.get("lokr_w2_a").cloned(),
             w2_b: g.factors.get("lokr_w2_b").cloned(),
             scale: full,
+            source,
         });
     }
     Ok(())
@@ -816,6 +853,37 @@ pub fn install_additive<D: AdditiveDit + ?Sized>(
     specs: &[AdapterSpec],
     pre_applied: usize,
 ) -> Result<AdditiveReport> {
+    install_additive_inner(dit, specs, pre_applied, None)
+}
+
+/// Production composition entry point: preserves the diff-patch match count for every selected
+/// adapter so a valid bundled/diff adapter cannot hide a later zero-match user adapter.
+pub fn install_additive_with_diff<D: AdditiveDit + ?Sized>(
+    dit: &mut D,
+    specs: &[AdapterSpec],
+    diff_applied_by_spec: &[usize],
+) -> Result<AdditiveReport> {
+    if diff_applied_by_spec.len() != specs.len() {
+        return Err(CandleError::Msg(format!(
+            "krea: diff/additive adapter accounting length mismatch ({} specs, {} reports)",
+            specs.len(),
+            diff_applied_by_spec.len()
+        )));
+    }
+    install_additive_inner(
+        dit,
+        specs,
+        diff_applied_by_spec.iter().sum(),
+        Some(diff_applied_by_spec),
+    )
+}
+
+fn install_additive_inner<D: AdditiveDit + ?Sized>(
+    dit: &mut D,
+    specs: &[AdapterSpec],
+    pre_applied: usize,
+    diff_applied_by_spec: Option<&[usize]>,
+) -> Result<AdditiveReport> {
     let mut report = AdditiveReport::default();
 
     // The kohya `flattened → dotted` table, built from the DiT's own adaptable projection paths (all
@@ -834,22 +902,33 @@ pub fn install_additive<D: AdditiveDit + ?Sized>(
     let mut pending_lora: BTreeMap<String, Vec<PendingLora>> = BTreeMap::new();
     let mut pending_lokr: BTreeMap<String, Vec<PendingLokr>> = BTreeMap::new();
 
-    for spec in specs {
+    for (source, spec) in specs.iter().enumerate() {
         let af = read_adapter(&spec.path)?;
+        let has_unstamped_lokr = has_lokr_keys(&af);
+        match (spec.kind, af.declares_lokr()) {
+            (AdapterKind::Lora, true) => {
+                return Err(CandleError::Msg(format!(
+                    "krea: adapter {} declared LoRA but its metadata says networkType=lokr",
+                    spec.path.display()
+                )))
+            }
+            (AdapterKind::Lokr, false) => {
+                return Err(CandleError::Msg(format!(
+                    "krea: adapter {} declared LoKr but does not declare networkType=lokr",
+                    spec.path.display()
+                )))
+            }
+            _ => {}
+        }
         // Route exactly as `merge_adapters`: an explicit/declared LoKr, or a key-sniffed third-party
         // LyCORIS LoKr (`lokr_*` without a `networkType` stamp), resolves as LoKr; else LoRA. A
         // `Lora`-declared file whose metadata says `networkType=lokr` is a loud mismatch.
-        let is_lokr = spec.kind == AdapterKind::Lokr || af.declares_lokr() || has_lokr_keys(&af);
-        if spec.kind == AdapterKind::Lora && af.declares_lokr() {
-            return Err(CandleError::Msg(format!(
-                "krea: adapter {} declared Lora but its metadata says networkType=lokr",
-                spec.path.display()
-            )));
-        }
+        let is_lokr = spec.kind == AdapterKind::Lokr || has_unstamped_lokr;
         if is_lokr {
             resolve_lokr_file(
                 &af,
                 spec.scale,
+                source,
                 &table,
                 &mut pending_lokr,
                 &mut report.skipped_keys,
@@ -858,6 +937,7 @@ pub fn install_additive<D: AdditiveDit + ?Sized>(
             resolve_lora_file(
                 &af,
                 spec.scale,
+                source,
                 &table,
                 &mut pending_lora,
                 &mut report.skipped_keys,
@@ -872,6 +952,7 @@ pub fn install_additive<D: AdditiveDit + ?Sized>(
     let device = dit.adapter_device();
     let mut matched: HashSet<String> = HashSet::new();
     let mut applied = 0usize;
+    let mut applied_sources = HashSet::new();
     let mut skipped_keys = 0usize;
     dit.visit_additive(&mut |path, proj| {
         let (out_f, in_f) = proj.out_in();
@@ -884,6 +965,7 @@ pub fn install_additive<D: AdditiveDit + ?Sized>(
                 }
                 proj.add_lora(p.a.to_device(&device)?, p.b.to_device(&device)?, p.scale);
                 applied += 1;
+                applied_sources.insert(p.source);
             }
         }
         if let Some(list) = pending_lokr.get(path) {
@@ -903,6 +985,7 @@ pub fn install_additive<D: AdditiveDit + ?Sized>(
                     Some(factors) => {
                         proj.add_lokr(factors.to_device(&device)?);
                         applied += 1;
+                        applied_sources.insert(p.source);
                     }
                     None => {
                         return Err(CandleError::Msg(format!(
@@ -923,6 +1006,18 @@ pub fn install_additive<D: AdditiveDit + ?Sized>(
     for path in pending_lora.keys().chain(pending_lokr.keys()) {
         if !matched.contains(path) {
             report.skipped_targets.push(path.clone());
+        }
+    }
+    for (source, spec) in specs.iter().enumerate() {
+        let diff_applied = diff_applied_by_spec
+            .and_then(|counts| counts.get(source))
+            .copied()
+            .unwrap_or_else(|| usize::from(specs.len() == 1) * pre_applied);
+        if !applied_sources.contains(&source) && diff_applied == 0 {
+            return Err(CandleError::Msg(format!(
+                "krea: selected adapter {} matched neither a diff-patch nor a low-rank projection",
+                spec.path.display()
+            )));
         }
     }
     if !specs.is_empty() && report.applied == 0 && pre_applied == 0 {
@@ -964,6 +1059,41 @@ mod tests {
 
     fn t2(data: &[f32], r: usize, c: usize) -> Tensor {
         Tensor::from_vec(data.to_vec(), (r, c), &Device::Cpu).unwrap()
+    }
+
+    #[test]
+    fn dense_stack_rejects_a_later_zero_match_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let valid = tmp.path().join("valid.safetensors");
+        let missing = tmp.path().join("missing.safetensors");
+        for (file, target) in [
+            (&valid, "transformer_blocks.0.attn.to_q"),
+            (&missing, "transformer_blocks.99.attn.to_q"),
+        ] {
+            save_tensors(
+                &HashMap::from([
+                    (
+                        format!("{target}.lora_A.weight"),
+                        t2(&[1.0, 0.0, 0.0, 0.0], 1, 4),
+                    ),
+                    (
+                        format!("{target}.lora_B.weight"),
+                        t2(&[1.0, 0.0, 0.0, 0.0], 4, 1),
+                    ),
+                ]),
+                file,
+            )
+            .unwrap();
+        }
+        let error = merge_adapters(
+            &mut base_map(),
+            &[
+                AdapterSpec::new(valid, 1.0, AdapterKind::Lora),
+                AdapterSpec::new(missing.clone(), 1.0, AdapterKind::Lora),
+            ],
+        )
+        .expect_err("a valid first file must not hide a later dense zero-match");
+        assert!(error.to_string().contains(&missing.display().to_string()));
     }
 
     fn max_abs(t: &Tensor) -> f32 {
@@ -1855,7 +1985,32 @@ mod tests {
             "a diff-only file with nothing pre-folded must error, never render unadapted"
         );
 
+        let missing = dir.join("missing-user.safetensors");
+        save_tensors(
+            &HashMap::from([
+                (
+                    "no_such_module.lora_A.weight".to_string(),
+                    Tensor::ones((1, 4), DType::F32, &dev).unwrap(),
+                ),
+                (
+                    "no_such_module.lora_B.weight".to_string(),
+                    Tensor::ones((4, 1), DType::F32, &dev).unwrap(),
+                ),
+            ]),
+            &missing,
+        )
+        .unwrap();
+        let stacked = [
+            specs[0].clone(),
+            AdapterSpec::new(missing.clone(), 1.0, AdapterKind::Lora),
+        ];
+        let mut dit = mk();
+        let error = install_additive_with_diff(&mut dit, &stacked, &[1, 0])
+            .expect_err("a valid diff-only first file must not hide a later zero-match user file");
+        assert!(error.to_string().contains(&missing.display().to_string()));
+
         std::fs::remove_file(&adapter_file).ok();
+        std::fs::remove_file(&missing).ok();
     }
 
     /// AC: a scale-0 adapter merge is byte-exact with the base (`δ·0 = 0`), so the overlaid weight
@@ -2094,7 +2249,7 @@ mod tests {
         let table: BTreeMap<String, String> = BTreeMap::new();
         let mut pending: BTreeMap<String, Vec<PendingLora>> = BTreeMap::new();
         let mut skipped = 0usize;
-        resolve_lora_file(&af, scale, &table, &mut pending, &mut skipped).unwrap();
+        resolve_lora_file(&af, scale, 0, &table, &mut pending, &mut skipped).unwrap();
         assert_eq!(skipped, 0);
         let p = &pending[diffusers][0];
         assert_eq!(p.a.dims(), &[in_dim, rank], "a = downᵀ [in, rank]");
@@ -2138,7 +2293,7 @@ mod tests {
         let table: BTreeMap<String, String> = BTreeMap::new();
         let mut pending: BTreeMap<String, Vec<PendingLokr>> = BTreeMap::new();
         let mut skipped = 0usize;
-        resolve_lokr_file(&af, 0.5, &table, &mut pending, &mut skipped).unwrap();
+        resolve_lokr_file(&af, 0.5, 0, &table, &mut pending, &mut skipped).unwrap();
         let p = &pending[path][0];
         // full = (alpha/rank)·scale = (4/2)·0.5 = 1.0.
         let factors = LokrFactors::build(

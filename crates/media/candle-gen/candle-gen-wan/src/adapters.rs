@@ -328,9 +328,9 @@ pub fn merge_adapters(
 // **forward-time residual** on the packed [`QLinear`] instead: `y = base(x) + scale·((x·A)·B)`
 // ([`QLinear::push_lora`](crate::quant::QLinear::push_lora)), the base weight used AS-IS — no dense
 // weight is materialized, so a q4 base keeps its q4 footprint. The candle twin of mlx-gen's
-// `apply_wan_adapters_additive` (sc-10044). **LoKr/LoHa on a packed tier is rejected** (its residual
-// needs the base's dense grid — deferred to sc-10050/10051); on a dense tier those still fold through
-// [`merge_adapters`]. `install_additive` inverts the mlx flow (walk the host once, look each projection
+// `apply_wan_adapters_additive` (sc-10044). Structured LoKr residuals use the shared packed-safe
+// [`AdaptLinear`](candle_gen::quant::AdaptLinear) installer; LoHa remains unsupported because it has
+// no truthful additive representation. `install_additive` inverts the mlx flow (walk the host once, look each projection
 // up in the resolved map) — the same result, but no path→field string routing.
 
 /// Report of an additive-adapter install (sc-10094): how many projections received a residual, plus the
@@ -357,9 +357,8 @@ struct PendingLora {
     source: usize,
 }
 
-/// True when a file carries LoKr/LoHa factors (or is stamped/declared LoKr) — such an adapter cannot
-/// apply additively on a **packed** tier (its residual needs the base's dense grid; deferred to
-/// sc-10050/10051), and on a dense tier it belongs on the [`merge_adapters`] fold path.
+/// True when a file carries LoKr/LoHa factors (or is stamped/declared LoKr). LoKr is routed to the
+/// shared structured residual installer; LoHa fails closed because it has no additive representation.
 fn is_lokr_or_loha(af: &AdapterFile, kind: AdapterKind) -> bool {
     kind == AdapterKind::Lokr
         || af.declares_lokr()
@@ -433,8 +432,8 @@ fn resolve_lora_file(
 /// Install `specs` as forward-time additive residuals on an already-built [`WanTransformer`] (sc-10094)
 /// — the packed-tier path where [`merge_adapters`] can't fold. Shared (`moe_expert == None`) specs apply
 /// to any `expert`; expert-tagged specs apply only to their expert (the A14B MoE routing), shared ones
-/// stacked first. **LoKr/LoHa on a packed tier is a hard, actionable error** (deferred to
-/// sc-10050/10051); on a dense base such an adapter belongs on [`merge_adapters`]. Returns the per-call
+/// stacked first. LoKr applies as a structured residual on both dense and packed bases; LoHa is a
+/// hard, actionable error. Returns the per-call
 /// [`AdditiveReport`] **without** raising the zero-match error — the caller aggregates `applied` across
 /// the two experts and decides (a High-only spec legitimately adapts nothing on the Low expert).
 pub fn install_additive(
@@ -466,18 +465,22 @@ pub fn install_additive(
         let af = read_adapter(&spec.path)?;
         if is_lokr_or_loha(&af, spec.kind) {
             if !has_loha_factors(&af) {
-                lokr_specs.push(spec.clone());
+                // Expert routing has already been consumed by `ordered`. The shared structured
+                // installer intentionally rejects expert tags because its other callers own a
+                // single denoiser.
+                let mut selected = spec.clone();
+                selected.moe_expert = None;
+                lokr_specs.push(selected);
                 continue;
             }
             let why = if packed {
-                "on a quantized (packed q4/q8) Wan tier are not supported yet — use the bf16 tier \
-                 (where they fold into the dense weight), or a plain LoRA (which applies additively \
-                 on any tier); tracked in sc-10050 (LoKr) / sc-10051 (LoHa)"
+                "LoHa on a quantized (packed q4/q8) Wan tier has no truthful additive \
+                 representation — use the bf16 tier, where it folds into the dense weight"
             } else {
-                "reached the additive path on a dense base — fold them via merge_adapters instead"
+                "LoHa reached the additive path on a dense base — fold it via merge_adapters instead"
             };
             return Err(CandleError::Msg(format!(
-                "wan: LoKr/LoHa adapters {why}. Offending file: {}",
+                "wan: {why}. Offending file: {}",
                 spec.path.display()
             )));
         }
@@ -1017,39 +1020,57 @@ mod tests {
         std::fs::remove_file(&lora).ok();
     }
 
-    /// A PEFT-stamped LoKr adapter applies through the packed-safe structured residual path.
+    /// PEFT-stamped native-Wan LoKr applies through the packed-safe structured residual path, with
+    /// shared/high/low expert routing consumed before the single-denoiser installer is entered.
     #[test]
-    fn install_additive_applies_lokr() {
+    fn install_additive_applies_native_lokr_on_packed_shared_and_expert_routes() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
         let base = random_base_map(&cfg, &dev);
-        let mut m: HashMap<String, Tensor> = HashMap::new();
-        m.insert(
-            "blocks.0.attn1.to_q.lokr_w1".into(),
-            Tensor::randn(0f32, 1f32, (cfg.dim, cfg.dim), &dev).unwrap(),
-        );
-        m.insert(
-            "blocks.0.attn1.to_q.lokr_w2".into(),
-            Tensor::from_vec(vec![1.0f32], (1, 1), &dev).unwrap(),
-        );
+        let (packed, packed_count) =
+            crate::candle_tier_build::pack_transformer_component(base, 4).unwrap();
+        assert!(packed_count > 0);
         let path_tmp = tempfile::tempdir().unwrap();
-        let path = path_tmp.path().join("sc10094_lora.safetensors");
-        safetensors::serialize_to_file(
-            m.into_iter().collect::<Vec<_>>(),
-            Some(HashMap::from([
-                ("networkType".to_string(), "lokr".to_string()),
-                ("rank".to_string(), "1".to_string()),
-                ("alpha".to_string(), "1".to_string()),
-            ])),
-            &path,
-        )
-        .unwrap();
-        let specs = vec![AdapterSpec::new(path.clone(), 1.0, AdapterKind::Lokr)];
+        let write = |name: &str| {
+            let path = path_tmp.path().join(format!("{name}.safetensors"));
+            let tensors = HashMap::from([
+                (
+                    // Native Wan spelling; the Candle visitor exposes `attn1.to_q`.
+                    "blocks.0.self_attn.q.lokr_w1".to_string(),
+                    Tensor::randn(0f32, 1f32, (cfg.dim, cfg.dim), &dev).unwrap(),
+                ),
+                (
+                    "blocks.0.self_attn.q.lokr_w2".to_string(),
+                    Tensor::from_vec(vec![1.0f32], (1, 1), &dev).unwrap(),
+                ),
+            ]);
+            safetensors::serialize_to_file(
+                tensors.into_iter().collect::<Vec<_>>(),
+                Some(HashMap::from([
+                    ("networkType".to_string(), "lokr".to_string()),
+                    ("rank".to_string(), "1".to_string()),
+                    ("alpha".to_string(), "1".to_string()),
+                ])),
+                &path,
+            )
+            .unwrap();
+            path
+        };
+        let shared = write("shared");
+        let high = write("high");
+        let low = write("low");
+        let specs = vec![
+            AdapterSpec::new(shared, 1.0, AdapterKind::Lokr),
+            AdapterSpec::new(high, 1.0, AdapterKind::Lokr).with_moe_expert(MoeExpert::High),
+            AdapterSpec::new(low, 1.0, AdapterKind::Lokr).with_moe_expert(MoeExpert::Low),
+        ];
 
-        let mut dit = dit_from_map(&cfg, base, &dev);
-        let report = install_additive(&mut dit, &specs, MoeExpert::High).unwrap();
-        assert_eq!(report.applied, 1);
-        assert!(report.skipped_targets.is_empty());
-        std::fs::remove_file(&path).ok();
+        for expert in [MoeExpert::Low, MoeExpert::High] {
+            let mut dit = dit_from_map(&cfg, packed.clone(), &dev);
+            assert!(dit.is_packed());
+            let report = install_additive(&mut dit, &specs, expert).unwrap();
+            assert_eq!(report.applied, 2, "shared + {expert:?} LoKr must apply");
+            assert!(report.skipped_targets.is_empty());
+        }
     }
 }

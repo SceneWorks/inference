@@ -131,6 +131,37 @@ fn real_weight_ip_adapter() {
     println!("[ip] {:?}", t.elapsed());
     write_ppm(&out_dir.join("flux_ip.ppm"), &out_ip);
 
+    // Optional adapter A/B branch for sc-18477. It reuses the exact seed, request shape, and IP
+    // conditioning; CI only compiles this ignored real-weight path, while an operator can provide the
+    // adapter explicitly for a later acceptance run.
+    if let Some(adapter) = std::env::var_os("IP_FLUX_LORA") {
+        drop(model);
+        let adapted = IpAdapterFlux::load(&IpAdapterFluxPaths {
+            flux_base: env_path("IP_FLUX_BASE"),
+            ip_adapter: env_path("IP_FLUX_ADAPTER"),
+            image_encoder: image_encoder.clone(),
+            adapters: vec![candle_gen::gen_core::AdapterSpec::new(
+                adapter.into(),
+                1.0,
+                candle_gen::gen_core::AdapterKind::Lora,
+            )],
+        })
+        .expect("load adapter-conditioned IpAdapterFlux");
+        let out_adapted = adapted
+            .generate(&base, &reference, &mut noop)
+            .expect("generate (ip + LoRA)");
+        assert_eq!(
+            (out_adapted.width, out_adapted.height),
+            (out_ip.width, out_ip.height)
+        );
+        assert_ne!(
+            out_adapted.pixels, out_ip.pixels,
+            "selected FLUX.1 IP adapter must change output"
+        );
+        write_ppm(&out_dir.join("flux_ip_lora.ppm"), &out_adapted);
+        return;
+    }
+
     // Without IP (scale 0 → forked DiT byte-identical to plain FLUX at the same seed/prompt).
     let plain_req = IpAdapterFluxRequest {
         ip_adapter_scale: 0.0,

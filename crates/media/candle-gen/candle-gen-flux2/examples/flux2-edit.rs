@@ -315,6 +315,35 @@ fn run_dev(args: &[String], c: &Common, quant: Option<Quant>) -> Result<()> {
     );
     save(&single, &c.out)?;
     println!("[edit-dev] wrote {}", c.out.display());
+    if let Some(adapter) = arg(args, "--adapter") {
+        drop(model);
+        let adapted = Flux2Edit::load_dev(
+            &Flux2EditPaths {
+                root: PathBuf::from(&c.snapshot),
+                adapters: vec![candle_gen::gen_core::AdapterSpec::new(
+                    PathBuf::from(adapter),
+                    1.0,
+                    candle_gen::gen_core::AdapterKind::Lora,
+                )],
+            },
+            quant,
+        )?;
+        let mut noop = |_: Progress| {};
+        let with_adapter = adapted.generate(&req, std::slice::from_ref(&reference), &mut noop)?;
+        assert_eq!(
+            (with_adapter.width, with_adapter.height),
+            (single.width, single.height)
+        );
+        assert_ne!(
+            with_adapter.pixels, single.pixels,
+            "selected FLUX.2 edit adapter must change output"
+        );
+        save(
+            &with_adapter,
+            &PathBuf::from(format!("{}_lora.png", c.out.display())),
+        )?;
+        return Ok(());
+    }
     if let Some(probe) = &probe {
         println!(
             "[vram] flux2_dev_edit {}x{}: {}",

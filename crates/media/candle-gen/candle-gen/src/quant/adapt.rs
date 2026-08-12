@@ -187,6 +187,8 @@ pub struct LokrFactors {
     c: usize,
     /// `d` — col count of `w2`.
     d: usize,
+    /// Optional output-row slice for a fused source projection routed onto one split host projection.
+    output_slice: Option<(usize, usize)>,
     /// Pre-bake scale retained solely so a disabled structured LoKr can be skipped before reading
     /// factors. The residual math continues to use the scale already baked into `w2`.
     pub(crate) scale: f64,
@@ -220,6 +222,59 @@ impl LokrFactors {
         w2_a: Option<&Tensor>,
         w2_b: Option<&Tensor>,
     ) -> Result<Option<Self>> {
+        Self::build_inner(
+            scale, base_shape, None, w1, w1_a, w1_b, w2, w2_t2, w2_a, w2_b,
+        )
+    }
+
+    /// Build factors for a fused source projection and retain only `output_slice` in the residual.
+    /// This routes BFL/ComfyUI fused FLUX QKV LoKr onto split q/k/v host projections without ever
+    /// materializing the fused `[out,in]` weight delta.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_sliced(
+        scale: f64,
+        input_features: usize,
+        output_slice: (usize, usize),
+        w1: Option<&Tensor>,
+        w1_a: Option<&Tensor>,
+        w1_b: Option<&Tensor>,
+        w2: Option<&Tensor>,
+        w2_t2: Option<&Tensor>,
+        w2_a: Option<&Tensor>,
+        w2_b: Option<&Tensor>,
+    ) -> Result<Option<Self>> {
+        Self::build_inner(
+            scale,
+            (0, input_features),
+            Some(output_slice),
+            w1,
+            w1_a,
+            w1_b,
+            w2,
+            w2_t2,
+            w2_a,
+            w2_b,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_inner(
+        scale: f64,
+        base_shape: (usize, usize),
+        output_slice: Option<(usize, usize)>,
+        w1: Option<&Tensor>,
+        w1_a: Option<&Tensor>,
+        w1_b: Option<&Tensor>,
+        w2: Option<&Tensor>,
+        w2_t2: Option<&Tensor>,
+        w2_a: Option<&Tensor>,
+        w2_b: Option<&Tensor>,
+    ) -> Result<Option<Self>> {
+        if !scale.is_finite() {
+            return Err(CandleError::Msg(format!(
+                "lokr: derived scale must be finite, got {scale}"
+            )));
+        }
         // A tucker/CP `w2` (a 4-D conv factor, lycoris `lokr_t2`) has no 2-D matrix form — not
         // deferrable via the vec-trick. The peft LoKr format never carries it; guard anyway so a conv
         // LoKr falls back to reject/fold rather than silently mis-applying.
@@ -256,7 +311,15 @@ impl LokrFactors {
         let (out_f, in_f) = base_shape;
         // The base must factor as `out = a·b`, `in = c·d` (a plain 2-D linear); anything else (a conv
         // weight with kernel dims, or a factor/base mismatch) is not this linear vec-trick.
-        if a * b != out_f || c * d != in_f {
+        let fused_out = a * b;
+        let output_matches = match output_slice {
+            Some((start, len)) => out_f == 0 && start + len <= fused_out,
+            None => fused_out == out_f,
+        };
+        if !output_matches || c * d != in_f {
+            return Ok(None);
+        }
+        if output_slice.is_some_and(|(start, len)| start + len > fused_out) {
             return Ok(None);
         }
         // Bake the full scale into `w2` (keeps `w1` a clean copy); hold f32, contiguous for the matmuls.
@@ -269,6 +332,7 @@ impl LokrFactors {
             b,
             c,
             d,
+            output_slice,
             scale,
         }))
     }
@@ -283,6 +347,7 @@ impl LokrFactors {
             b: self.b,
             c: self.c,
             d: self.d,
+            output_slice: self.output_slice,
             scale: self.scale,
         })
     }
@@ -324,7 +389,11 @@ impl LokrFactors {
         // [N, a, b] → [.., out] (out = a·b), restoring the original leading dims (row-major flatten).
         let mut ys = lead.to_vec();
         ys.push(self.a * self.b);
-        y.contiguous()?.reshape(ys)
+        let y = y.contiguous()?.reshape(ys)?;
+        match self.output_slice {
+            Some((start, len)) => y.narrow(y.rank() - 1, start, len),
+            None => Ok(y),
+        }
     }
 }
 

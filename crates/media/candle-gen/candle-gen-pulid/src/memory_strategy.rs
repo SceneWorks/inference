@@ -16,9 +16,14 @@ pub const CALIBRATION_FINGERPRINT: &str =
     "pulid-flux-cuda-identity-stack-staged-decode-attention-block-window-v1";
 
 fn base_spec(paths: &PulidFluxPaths) -> LoadSpec {
-    LoadSpec::new(WeightsSource::Dir(paths.flux_base.clone()))
+    let mut spec = LoadSpec::new(WeightsSource::Dir(paths.flux_base.clone()))
         .with_offload_policy(OffloadPolicy::Sequential)
-        .with_load_shape(LoadShape::DeferredMaterialization)
+        .with_load_shape(LoadShape::DeferredMaterialization);
+    // Adapter facts must participate in FLUX admission. The reference backbone cannot safely use
+    // transformer block streaming with additive adapters, so omitting this stack could admit an
+    // adapted PuLID request to a rung that only fails later during load.
+    spec.adapters = paths.adapters.clone();
+    spec
 }
 
 fn resident_component(
@@ -310,6 +315,37 @@ mod tests {
                 .transformer_window_components,
             vec![TransformerComponent::Dit]
         );
+    }
+
+    #[test]
+    fn adapted_route_disables_transformer_block_streaming_before_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut paths = paths(&tmp);
+        paths.adapters.push(candle_gen::gen_core::AdapterSpec::new(
+            tmp.path().join("identity-style.safetensors"),
+            1.0,
+            candle_gen::gen_core::AdapterKind::Lora,
+        ));
+
+        let spec = base_spec(&paths);
+        assert_eq!(
+            spec.adapters.len(),
+            1,
+            "the composed PuLID route must retain its stack"
+        );
+        assert_eq!(spec.adapters[0].path, paths.adapters[0].path);
+        let contract = provider_contract(&paths).unwrap();
+        assert_eq!(
+            contract
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .support,
+            MemoryStrategySupport::Missing,
+            "adapted FLUX reference backbones require resident transformer blocks"
+        );
+        assert!(contract
+            .capability(MemoryStrategy::StagedResidency)
+            .is_some_and(|capability| capability.support == MemoryStrategySupport::Implemented));
     }
 
     #[test]

@@ -15,8 +15,9 @@
 //! the 20B MMDiT in **bf16** (its native checkpoint dtype) — ~74 GB resident, which fits the 96 GB
 //! Blackwell where an all-f32 load (~113 GB) would not.
 //!
-//! **First-slice surface:** txt2img only. The mlx provider's img2img / Edit / ControlNet / Lightning
-//! / LoRA / quantization surface is **deferred** and rejected. `backend = "candle"`, `mac_only = false`.
+//! **Inference surface:** txt2img, Edit/Lightning, strict control, and ComfyUI DiT sources share the
+//! same LoRA/LoKr-capable MMDiT loader, including packed additive residuals. On-the-fly quantization
+//! and unsupported request overlays still fail closed. `backend = "candle"`, `mac_only = false`.
 
 // Qwen-Image-Edit inference adapter merge (sc-6220, epic 5480): fold a LoRA/LoKr `.safetensors` delta
 // into the dense MMDiT weights at load — the Qwen-Image-Edit-2511-Lightning few-step distill, plus

@@ -285,7 +285,11 @@ fn load_control_heavy(
             let mut dit = KreaTrainDit::load_inference(&dit_w, &cfg)?;
             drop(dit_w);
             if !adapters.is_empty() {
-                crate::adapters::install_additive(&mut dit, adapters, diff.merged)?;
+                crate::adapters::install_additive_with_diff(
+                    &mut dit,
+                    adapters,
+                    &diff.applied_by_spec,
+                )?;
             }
             dit
         }

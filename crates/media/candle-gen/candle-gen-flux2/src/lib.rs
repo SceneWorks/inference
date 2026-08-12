@@ -1348,7 +1348,8 @@ fn load_variant_concrete(
 /// FLUX.2-dev diffusers snapshot supplying the Mistral text encoder, VAE, and tokenizer (none of which
 /// are in the single DiT file). `quant` (Q4/Q8) folds the dequanted DiT + the Mistral TE onto the GPU —
 /// the 32B dev does not fit dense — matching the resident dev path; `None` is fixture-only. txt2img
-/// only; no adapters / control / edit / PiD.
+/// only; user LoRA/LoKr applies to the remapped DiT, while control / edit / PiD use their dedicated
+/// providers rather than this source-specific entry point.
 pub fn load_from_comfyui_dit(
     transformer_file: impl Into<PathBuf>,
     snapshot_dir: impl Into<PathBuf>,

@@ -131,7 +131,10 @@ pub fn load_vendored_unet_with_adapters(
             let mut unet = UNet2DConditionModel::new(vs.clone(), 4, 4, false, sdxl_unet_config())?
                 .with_add_embedding(vs, addition_time_embed_dim, projection_input_dim)?;
             let add = crate::adapters::install_additive(&mut unet, adapters, &table, device)?;
-            crate::adapters::guard_additive_matched(adapters.len(), conv.merged + add.applied)?;
+            crate::adapters::guard_each_adapter_matched(
+                adapters,
+                &[&conv.applied_by_spec, &add.applied_by_spec],
+            )?;
             Ok(unet)
         }
         None => {
@@ -150,7 +153,10 @@ pub fn load_vendored_unet_with_adapters(
                 .with_add_embedding(vs, addition_time_embed_dim, projection_input_dim)?;
             let lin = crate::adapters::install_additive(&mut unet, adapters, &table, device)?;
             let conv = crate::adapters::install_additive_conv(&mut unet, adapters, &table, device)?;
-            crate::adapters::guard_additive_matched(adapters.len(), lin.applied + conv.applied)?;
+            crate::adapters::guard_each_adapter_matched(
+                adapters,
+                &[&lin.applied_by_spec, &conv.applied_by_spec],
+            )?;
             Ok(unet)
         }
     }

@@ -228,8 +228,9 @@ fn build(
             )));
         }
     };
-    // User adapters / ControlNet+IP-Adapter overlays are not wired (the turbo LoRA is bundled in the
-    // snapshot and installed internally). img2img/Remix + mask inpaint edit is NOT a LoadSpec overlay —
+    // User LoRA/LoKr stacks are installed with the bundled TurboTime adapter (turbo) or on both CFG
+    // DiTs (quality). ControlNet+IP-Adapter overlays remain separate unsupported combinations.
+    // img2img/Remix + mask inpaint edit is NOT a LoadSpec overlay —
     // it arrives as per-request `Reference`/`Mask` conditioning (sc-6598), handled in the pipeline, so
     // it is unaffected by these load-time rejects.
     // sc-9607: `spec.quantize` (Q4/Q8) is ACCEPTED and is a no-op. The per-tier turnkey is already
