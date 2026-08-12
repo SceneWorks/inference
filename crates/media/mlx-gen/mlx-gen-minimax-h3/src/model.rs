@@ -854,7 +854,6 @@ impl MiniMaxH3 {
         };
         use crate::dit::positions::ReferenceLatentGeometry;
         use crate::pipeline::{prepend_condition_audio_rows, ref2va_layout};
-        use crate::reference::ReferenceKind;
 
         // --- 0. normalize every reference onto the model's own rates and resolutions ------------
         // References do NOT bind the canvas: the geometry was already resolved (16:9 by default)
@@ -948,11 +947,7 @@ impl MiniMaxH3 {
                     }
                 };
                 geometries.push(ReferenceLatentGeometry {
-                    kind: match r.kind() {
-                        ReferenceKind::Image => ReferenceKind::Image,
-                        ReferenceKind::Video => ReferenceKind::Video,
-                        ReferenceKind::Audio => ReferenceKind::Audio,
-                    },
+                    kind: r.kind(),
                     num_latent_frames: frames,
                     latent_height: height,
                     latent_width: width,
