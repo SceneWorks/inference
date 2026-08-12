@@ -10,6 +10,7 @@ use mlx_rs::fast::{rms_norm, scaled_dot_product_attention};
 use mlx_rs::ops::multiply;
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::nn::silu;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
@@ -19,22 +20,57 @@ use crate::dit::rope::{MmRope, MmRopeTables};
 use crate::layout::split_gate_value;
 
 /// `y = x · Wᵀ` for a stored `[out, in]` weight — an `nn.Linear(..., bias=False)`.
-#[derive(Debug, Clone)]
+///
+/// **Tier-aware** (sc-17150). This is one of exactly two loaders in the crate with a packed path:
+/// it goes through [`crate::quant::lin`], so a `q4` / `q8` tier's packed triple builds a quantized
+/// base directly and a `bf16` tier loads dense, with the same call and no manifest read. Every
+/// attention projection (`to_q`/`to_k`/`to_v`/`to_out.0`) and both feed-forward projections in both
+/// the 50-block stack and the 2-block token refiner are this type — the 312 tensors and
+/// 40_076_574_720 bf16 bytes [`crate::convert`] packs at the tier width.
+#[derive(Clone)]
 pub struct LinearNoBias {
-    weight: Array,
+    inner: AdaptableLinear,
+}
+
+/// Reports the logical shape and whether the base is packed, rather than the opaque u32 code buffer
+/// a derived `Debug` would print on a quantized tier.
+impl std::fmt::Debug for LinearNoBias {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LinearNoBias")
+            .field("shape", &self.inner.base_shape())
+            .field("quantized", &self.inner.is_quantized())
+            .finish()
+    }
 }
 
 impl LinearNoBias {
+    /// `dtype` casts a **dense** weight to the model's compute dtype. It is deliberately not applied
+    /// to a packed base: a packed base's compute dtype is fixed by its scales, and
+    /// [`AdaptableLinear::cast_weights`] no-ops on one for exactly that reason.
     pub fn from_weights(w: &mut Weights, prefix: &str, dtype: Dtype) -> Result<Self> {
-        Ok(Self {
-            weight: w.require(&format!("{prefix}.weight"))?.as_dtype(dtype)?,
-        })
+        let mut inner = crate::quant::lin(w, prefix, false)?;
+        inner.cast_weights(dtype)?;
+        Ok(Self { inner })
     }
 
     pub fn forward(&self, x: &Array) -> Result<Array> {
-        Ok(mlx_rs::ops::matmul(x, self.weight.t())?)
+        self.inner.forward(x)
     }
 
+    /// The logical `[out, in]` shape, recovered from the scales grid on a packed base.
+    pub fn shape(&self) -> Vec<i32> {
+        self.inner.base_shape()
+    }
+
+    /// `true` on a `q4` / `q8` tier.
+    pub fn is_quantized(&self) -> bool {
+        self.inner.is_quantized()
+    }
+
+    /// The **dense** tensor names, which is what the published-checkpoint key proofs are written
+    /// against. A packed tier additionally carries `{prefix}.scales` and `{prefix}.biases`; those are
+    /// discovered by [`crate::quant::lin`] rather than enumerated here, so this stays the bf16
+    /// contract the `PUBLISHED_DIT_TENSORS` audit compares to.
     pub fn names(prefix: &str) -> [String; 1] {
         [format!("{prefix}.weight")]
     }

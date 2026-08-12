@@ -298,8 +298,8 @@ fn two_checkpoints_are_never_co_resident() {
 /// reads the source and pins that there is nowhere else for one to be.
 ///
 /// Source-scanning is a blunt instrument, so it is bounded: it asserts a **count**, not a pattern
-/// match, and it asserts the bare partition literals are gone — the state before this story, where
-/// `"transformer"` was a string at the call site, would fail here.
+/// match, and it asserts the bare partition literals never appear at a call site — the state before
+/// this story, where `"transformer"` was a string in the `load` arguments, would fail here.
 #[test]
 fn every_dit_load_site_is_driven_by_the_task() {
     // **Production code only.** `model.rs`'s own `#[cfg(test)]` module legitimately names both
@@ -318,30 +318,57 @@ fn every_dit_load_site_is_driven_by_the_task() {
     // There are two load sites — the `t2va`/`fl2va` arm and the `ref2va` arm — and they are
     // mutually exclusive branches of `generate`, so at most one runs per render. What matters is
     // that **neither** picks its partition by hand.
-    let total = src.matches("MiniMaxH3Dit::load(").count();
-    let by_task = src
-        .matches("MiniMaxH3Dit::load(&self.root, task.partition(), self.dtype)")
+    //
+    // Both go through `load_dir` rather than `load(root, partition)` since sc-17150 made the DiT a
+    // tiered component: a `q4` install stages it outside the snapshot root entirely, so there is no
+    // `(root, partition)` pair that names it. `task_dit_dir` is the single place the task chooses a
+    // directory, and it is still driven by `MiniMaxH3Task::partition()` — asserted directly below,
+    // because a source scan cannot see that the helper it is counting does the right thing.
+    // Comment lines are excluded throughout: prose legitimately names the load site, and counting
+    // it would make the gate track the docs rather than the code.
+    let code = || {
+        src.lines()
+            .map(str::trim_start)
+            .filter(|l| !l.starts_with("//"))
+    };
+    let total = code().filter(|l| l.contains("MiniMaxH3Dit::load")).count();
+    let by_task = code()
+        .filter(|l| l.contains("MiniMaxH3Dit::load_dir(self.task_dit_dir(task), self.dtype)"))
         .count();
     assert_eq!(
         total,
         by_task,
-        "every DiT load must take MiniMaxH3Task::partition(); {} of {total} site(s) do not",
+        "every DiT load must resolve its directory through task_dit_dir(task); {} of {total} \
+         site(s) do not",
         total - by_task
     );
     assert!(total > 0, "the render path must load a DiT somewhere");
 
-    // The bare partition literals survive only as the two named constants' values. Before this
-    // story `"transformer"` was a string at the call site, which is the state this rules out.
-    assert_eq!(
-        src.matches("\"transformer\"").count(),
-        1,
-        "`transformer` should appear once, as BASE_DIT_PARTITION's value"
+    // ...and that helper is the ONE place a partition is chosen, from the task.
+    assert!(
+        src.contains("match task.partition() {"),
+        "task_dit_dir must switch on MiniMaxH3Task::partition(), not on the task enum directly — \
+         otherwise `partition()` is decorative and the two can drift"
     );
-    assert_eq!(
-        src.matches("\"transformer_ref\"").count(),
-        1,
-        "`transformer_ref` should appear once, as REFERENCE_DIT_PARTITION's value"
-    );
+
+    // The bare partition literals survive only as named constants' values. Before this story
+    // `"transformer"` was a string at the call site, which is the state this rules out. Counting
+    // raw occurrences broke when sc-17150 added `DIT_COMPONENT` (a third, legitimate one), so this
+    // asserts the shape that actually matters: every occurrence is a `const … = "…";` binding, and
+    // none is an argument.
+    for literal in ["\"transformer\"", "\"transformer_ref\""] {
+        let as_const = code()
+            .filter(|l| l.starts_with("pub const") && l.contains(literal))
+            .count();
+        let in_code = code().filter(|l| l.contains(literal)).count();
+        assert_eq!(
+            in_code, as_const,
+            "{literal} appears in {} non-comment line(s) but only {as_const} are `pub const` \
+             bindings; a partition literal at a call site is exactly what this gate rules out",
+            in_code
+        );
+        assert!(as_const > 0, "{literal} must be bound to a named constant");
+    }
 
     // The `ref2va` arm resolves its task from the request rather than assuming it.
     assert!(

@@ -131,8 +131,26 @@
 //! **fitted to the picture** rather than muxed at its own length: see [`pipeline::fit_audio_to_video`]
 //! for the ±8.33 ms the audio-latent rounding produces and why the correction belongs on the audio.
 //!
+//! ## Quantized tiers (sc-17150)
+//!
+//! - [`convert`] packs the DiT offline into the `q4` / `q8` artifacts
+//!   `SceneWorks/minimax-h3-mlx` publishes, **one source shard at a time** — the whole-map shape
+//!   every sibling converter uses would hold ~101 GB at q8 on a host this epic has already
+//!   OOM-killed once;
+//! - [`quant`] is the consume side: packed weights auto-detect on `{base}.scales`, so one loader
+//!   serves every tier with no dense transient.
+//!
+//! Three things this slice owns. **Nothing quantizes at load** — [`model::load`] *reconciles*
+//! `spec.quantize` against the staged tier's `config.json` marker and refuses to pack 66_280_430_080
+//! dense bytes on the way in, so a tier is a hosting decision rather than an install-time peak.
+//! **Only the DiT is tiered**: the text encoder, both VAEs and the tokenizer are dense in every tier
+//! and shared, so a tiered install is the upstream root plus one redirected
+//! [`model::DIT_COMPONENT`]. And the dense-by-policy set is a **correctness** boundary, not a size
+//! trade — [`dit::heads`] reads those tensors with a raw `Weights::require`, which would load u32
+//! codes as floats with no error at all (sc-14980).
+//!
 //! Not in this crate yet: either CNN encoder, `fl2va` conditioning (sc-17148), Ref2VA's
-//! `transformer_ref` (sc-17149), quantized tiers (sc-17150) and sequential residency (sc-17151).
+//! `transformer_ref` (sc-17149) and sequential residency (sc-17151).
 
 pub mod alias_free;
 pub mod audio_config;
@@ -142,6 +160,7 @@ pub mod blocks;
 pub mod chunking;
 pub mod conditioning;
 pub mod config;
+pub mod convert;
 pub mod cost;
 pub mod decoder;
 pub mod denoise;
@@ -150,6 +169,7 @@ pub mod keyframe;
 pub mod layout;
 pub mod model;
 pub mod pipeline;
+pub mod quant;
 pub mod reference;
 pub mod rope;
 pub mod tensor;

@@ -35,7 +35,7 @@ use mlx_rs::Dtype;
 use mlx_gen::gen_core::{
     reject_unknown_components, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
     GenerationRequest, Generator, KeyframeRef, LoadSpec, Modality, ModelDescriptor, Precision,
-    Progress, SizeFloor, WeightsSource,
+    Progress, Quant, SizeFloor, WeightsSource,
 };
 use mlx_gen::weights::Weights;
 use mlx_gen::{default_seed, Error, Result};
@@ -123,7 +123,10 @@ pub fn descriptor() -> ModelDescriptor {
             ],
             supports_lora: false,
             supports_lokr: false,
-            supported_quants: &[],
+            // The tiers exist and load (sc-17150) — packed offline by `crate::convert` and staged
+            // as the [`DIT_COMPONENT`]. `spec.quantize` is reconciled against the staged tier's
+            // marker rather than triggering a load-time quantize; see [`reconcile_tier`].
+            supported_quants: &[Quant::Q4, Quant::Q8],
             component_precision_floors: &[],
             samplers: Vec::new(),
             schedulers: Vec::new(),
@@ -234,7 +237,71 @@ impl MiniMaxH3Task {
 pub struct MiniMaxH3 {
     descriptor: ModelDescriptor,
     root: PathBuf,
+    /// The directory holding the DiT's `config.json` and shards — `root.join("transformer")` in the
+    /// **flat** upstream layout, or the staged [`DIT_COMPONENT`] directory in the **split** layout
+    /// where the tiered DiT comes from `SceneWorks/minimax-h3-mlx/{tier}/transformer` while every
+    /// shared component still comes from the upstream root. See [`resolve_dit_dir`].
+    dit_dir: PathBuf,
     dtype: Dtype,
+}
+
+/// The staged-component id for the **tiered** DiT directory (sc-17150).
+///
+/// Only the DiT is tiered: the text encoder, both VAEs and the tokenizer are dense in every tier and
+/// are shared as a co-requisite, so they always resolve against the upstream root. Redirecting just
+/// this one component is what lets a `q4` install hold one 18.8 GB DiT alongside the shared 66.7 GB
+/// text encoder without a second copy of anything.
+///
+/// Deliberately **not** in [`ModelDescriptor::required_components`]: it is needed only for a
+/// non-`bf16` tier, and a flat upstream snapshot must keep loading with nothing staged. That is the
+/// sensenova `distill_lora` convention — a conditionally-needed component is declared to
+/// [`reject_unknown_components`] per load, not advertised as a universal requirement.
+pub const DIT_COMPONENT: &str = "transformer";
+
+/// Resolve the DiT directory: the staged [`DIT_COMPONENT`] if the caller provided one, else
+/// `root/transformer` (the flat upstream layout).
+fn resolve_dit_dir(root: &Path, spec: &LoadSpec) -> PathBuf {
+    match spec.components.get(DIT_COMPONENT) {
+        Some(WeightsSource::Dir(p)) => p.clone(),
+        // A single file is not a component directory; fall back and let the config probe below
+        // produce the actionable "missing transformer/config.json" error against the root.
+        _ => root.join(DIT_COMPONENT),
+    }
+}
+
+/// Reconcile a caller's `spec.quantize` against the tier actually staged on disk.
+///
+/// **MiniMax-H3 never quantizes at load.** Every tier ships pre-quantized (`crate::convert`), and
+/// the reason is not tidiness: quantizing the DiT at load would materialize its 66_280_430_080
+/// dense bytes *and* the growing packed output at once, which is the install-time peak this model
+/// cannot afford on any Mac it targets. So `spec.quantize` is an **assertion** about which tier was
+/// staged, not an instruction — the mochi / LTX `split_model.json` shape, read here from the
+/// `quantization` marker [`mlx_gen::quant::write_quantized_config`] writes into each tier's
+/// `config.json`.
+///
+/// A disagreement is a hard error rather than a silent downgrade, because an unmarked packed
+/// component and a genuinely dense one are indistinguishable to a loader that guesses.
+fn reconcile_tier(dit_dir: &Path, requested: Option<mlx_gen::gen_core::Quant>) -> Result<()> {
+    let packed = mlx_gen::quant::packed_quant_bits_at(dit_dir)?;
+    match (packed, requested) {
+        (Some(bits), Some(q)) if bits != q.bits() => Err(Error::Msg(format!(
+            "{MODEL_ID}: spec.quantize={q:?} (bits {}) disagrees with the staged tier's \
+             config.json quantization marker (bits {bits}) in {} — the on-disk tier is \
+             authoritative; stage the tier you asked for",
+            q.bits(),
+            dit_dir.display()
+        ))),
+        // Packed and agreed (or asserted nothing): the loader builds it packed from `.scales`.
+        (Some(_), _) => Ok(()),
+        (None, Some(q)) => Err(Error::Unsupported(format!(
+            "{MODEL_ID}: spec.quantize={q:?} but {} carries no quantization marker — MiniMax-H3 \
+             does not quantize at load (the DiT's 66_280_430_080 dense bytes plus the packed \
+             output will not co-reside); stage the pre-quantized tier's `transformer` directory as \
+             the '{DIT_COMPONENT}' component",
+            dit_dir.display()
+        ))),
+        (None, None) => Ok(()),
+    }
 }
 
 /// Reject a request this model cannot serve, before any weight is read.
@@ -495,24 +562,45 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
             )))
         }
     };
-    reject_unknown_components(spec, &[], MODEL_ID)?;
-    if spec.quantize.is_some() {
-        return Err(Error::Unsupported(format!(
-            "{MODEL_ID}: quantized tiers are not wired yet (sc-17150); load the bf16 snapshot"
-        )));
-    }
+    reject_unknown_components(spec, &[DIT_COMPONENT], MODEL_ID)?;
     if !spec.adapters.is_empty() {
         return Err(Error::Unsupported(format!(
             "{MODEL_ID}: adapters are not supported"
         )));
     }
+    // The DiT is the one tiered component, so it is probed at its resolved location rather than
+    // under the root — a split install has no `root/transformer` at all.
+    let dit_dir = resolve_dit_dir(&root, spec);
+    let dit_config = dit_dir.join("config.json");
+    if !dit_config.is_file() {
+        return Err(Error::Msg(format!(
+            "{MODEL_ID}: missing {} — stage the tier's `transformer` directory as the \
+             '{DIT_COMPONENT}' component, or point at a snapshot root that holds `transformer/`",
+            dit_config.display()
+        )));
+    }
+    reconcile_tier(&dit_dir, spec.quantize)?;
+    // `ref2va` is a first-class task of this engine, not an optional extra, so its checkpoint is
+    // probed at load like every other partition. A snapshot missing it fails here, naming the path
+    // — rather than 20 minutes into a render when the reference arm finally reaches for it.
+    //
+    // Probed as `dit_dir`'s SIBLING, not under the root: the reference DiT is tiered exactly like
+    // the base one (`crate::convert` pre-quantizes `transformer/` or `transformer_ref/` alike), so
+    // on a split install it sits at `{tier}/transformer_ref` and there is no `root/transformer_ref`
+    // to find. See [`MiniMaxH3::task_dit_dir`], which resolves the same way at denoise time.
+    let reference_dit = dit_dir.with_file_name(REFERENCE_DIT_PARTITION);
+    let reference_config = reference_dit.join("config.json");
+    if !reference_config.is_file() {
+        return Err(Error::Msg(format!(
+            "{MODEL_ID}: missing {} — `ref2va` reads its own DiT partition, which is tiered \
+             alongside the base one; stage the tier's `{REFERENCE_DIT_PARTITION}` directory next \
+             to its `{BASE_DIT_PARTITION}`, or point at a snapshot root that holds \
+             `{REFERENCE_DIT_PARTITION}/`",
+            reference_config.display()
+        )));
+    }
+    reconcile_tier(&reference_dit, spec.quantize)?;
     for (partition, probe) in [
-        (BASE_DIT_PARTITION, "config.json"),
-        // `ref2va` is a first-class task of this engine, not an optional extra, so its checkpoint
-        // is probed at load like every other partition. A snapshot missing it fails here, naming
-        // the path — rather than 20 minutes into a render when the reference arm finally reaches
-        // for it.
-        (REFERENCE_DIT_PARTITION, "config.json"),
         ("vae", "config.json"),
         ("audio_vae", "config.json"),
         ("text_encoder", "config.json"),
@@ -539,6 +627,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     Ok(Box::new(MiniMaxH3 {
         descriptor: descriptor(),
         root,
+        dit_dir,
         dtype,
     }))
 }
@@ -554,6 +643,28 @@ impl MiniMaxH3 {
     /// The snapshot root this generator reads.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The resolved DiT directory — `root/transformer` on a flat install, or the staged
+    /// [`DIT_COMPONENT`] on a tiered one.
+    pub fn dit_dir(&self) -> &Path {
+        &self.dit_dir
+    }
+
+    /// The DiT directory a given task denoises from.
+    ///
+    /// `ref2va` reads its own [`REFERENCE_DIT_PARTITION`] checkpoint (sc-17149) and every tier
+    /// carries both partitions side by side (sc-17150 — `crate::convert` pre-quantizes
+    /// `transformer/` and `transformer_ref/` identically), so the reference partition is resolved
+    /// as [`Self::dit_dir`]'s **sibling** rather than against the snapshot root. That is the only
+    /// form that works on both layouts: a split install has no `root/transformer_ref` at all, and a
+    /// flat one has `dit_dir == root/transformer`, whose sibling is exactly `root/transformer_ref`.
+    /// `load` probes the same path, so a snapshot missing it fails at load rather than here.
+    fn task_dit_dir(&self, task: MiniMaxH3Task) -> PathBuf {
+        match task.partition() {
+            BASE_DIT_PARTITION => self.dit_dir.clone(),
+            partition => self.dit_dir.with_file_name(partition),
+        }
     }
 
     /// The block stack's precision.
@@ -757,7 +868,7 @@ impl MiniMaxH3 {
         }
 
         // --- 2. denoise ---------------------------------------------------------------------
-        let dit = MiniMaxH3Dit::load(&self.root, task.partition(), self.dtype)?;
+        let dit = MiniMaxH3Dit::load_dir(self.task_dit_dir(task), self.dtype)?;
         let patch = dit.config().patch_size;
         let layout = if anchors.is_empty() {
             t2va_layout(&geometry, context.shape()[1], patch)?
@@ -972,7 +1083,7 @@ impl MiniMaxH3 {
             .transpose()?;
 
         // --- 3. denoise on `transformer_ref` ----------------------------------------------------
-        let dit = MiniMaxH3Dit::load(&self.root, task.partition(), self.dtype)?;
+        let dit = MiniMaxH3Dit::load_dir(self.task_dit_dir(task), self.dtype)?;
         let patch = dit.config().patch_size;
         let layout = ref2va_layout(geometry, &text_tags, &geometries, patch)?;
         let (video_rows, audio_rows) = initial_latents(geometry, patch, seed)?;
@@ -1225,6 +1336,62 @@ mod tests {
             height,
             cancel: CancelFlag::default(),
             ..Default::default()
+        }
+    }
+
+    fn generator_at(dit_dir: &str) -> MiniMaxH3 {
+        MiniMaxH3 {
+            descriptor: descriptor(),
+            root: PathBuf::from("/snap"),
+            dit_dir: PathBuf::from(dit_dir),
+            dtype: Dtype::Bfloat16,
+        }
+    }
+
+    /// `ref2va` reads its partition from **beside the resolved DiT**, not from under the root.
+    ///
+    /// The sc-17149 / sc-17150 seam. Before tiering, `ref2va` loaded `root.join("transformer_ref")`
+    /// and that was right because `dit_dir` was always `root/transformer`. On a tiered install the
+    /// DiT is staged outside the snapshot root entirely — `root/transformer_ref` does not exist, and
+    /// resolving there would either fail at load or, worse, find a stale dense checkpoint next to a
+    /// `q4` base and silently mix tiers across two branches of the same render.
+    #[test]
+    fn the_reference_partition_follows_the_tier_not_the_root() {
+        // Flat upstream layout: the sibling IS the root-relative path, so nothing regresses.
+        let flat = generator_at("/snap/transformer");
+        assert_eq!(
+            flat.task_dit_dir(MiniMaxH3Task::Ref2va),
+            PathBuf::from("/snap/transformer_ref")
+        );
+        assert_eq!(
+            flat.task_dit_dir(MiniMaxH3Task::T2va),
+            PathBuf::from("/snap/transformer")
+        );
+
+        // Tiered/split layout: both partitions come from the SAME tier directory, and neither is
+        // under `/snap`. This is the case `root.join(partition)` got wrong.
+        let tiered = generator_at("/tiers/q4/transformer");
+        assert_eq!(
+            tiered.task_dit_dir(MiniMaxH3Task::Ref2va),
+            PathBuf::from("/tiers/q4/transformer_ref")
+        );
+        assert_eq!(
+            tiered.task_dit_dir(MiniMaxH3Task::T2va),
+            PathBuf::from("/tiers/q4/transformer")
+        );
+        assert_eq!(
+            tiered.task_dit_dir(MiniMaxH3Task::Fl2va),
+            tiered.task_dit_dir(MiniMaxH3Task::T2va),
+            "fl2va shares the base partition"
+        );
+
+        // The two partitions are never the same directory — the whole point of the split.
+        for dir in ["/snap/transformer", "/tiers/q8/transformer"] {
+            let g = generator_at(dir);
+            assert_ne!(
+                g.task_dit_dir(MiniMaxH3Task::Ref2va),
+                g.task_dit_dir(MiniMaxH3Task::T2va)
+            );
         }
     }
 

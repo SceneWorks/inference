@@ -36,12 +36,16 @@
 //! bound rather than a sample of a noisy distribution. Median and max are printed beside it and
 //! their ratio is the contention band; a wide band devalues the row, and the reader can see it.
 //!
-//! # Why the tier axis is bf16-only
+//! # The tier axis (sc-17150)
 //!
-//! Quantized tiers do not exist yet — `model::load` refuses `spec.quantize` outright and says
-//! sc-17150 owns building them. The q4/q8 rows of the story's duration × tier table are therefore
-//! **pending sc-17150**, not measured and not estimated. This harness sweeps the duration axis at
-//! bf16 and takes a `MINIMAX_H3_SWEEP_*` canvas so sc-17150 can re-run it per tier unchanged.
+//! The q4/q8 tiers now exist and load. `model::load` no longer refuses `spec.quantize`: it
+//! **reconciles** it against the staged tier's `config.json` marker, because MiniMax-H3 never
+//! quantizes at load (see `model::reconcile_tier`).
+//!
+//! Every row in *this* harness is still a **bf16** measurement — it takes a snapshot root, not a
+//! tier. The per-tier axis lives in `tests/quant_tiers_real.rs`, which stages each tier's DiT via
+//! `MINIMAX_H3_DIT` and renders the identical geometry at each, so the two harnesses answer
+//! different questions and neither has to guess the other's.
 //!
 //! # The 4 s row does not exist
 //!
@@ -615,27 +619,61 @@ fn the_four_second_row_is_structurally_unrenderable() {
     );
 }
 
-/// **Quantized tiers do not exist**, so the story's q4/q8 rows are pending sc-17150 rather than
-/// unmeasured. Pinned so the sweep's "bf16 only" caveat cannot go stale silently: the day
-/// sc-17150 wires a tier, this fails and the sweep gains its tier axis.
+/// **The tier axis is real** (sc-17150), and this pins the three properties the sweep's
+/// tier-comparability rests on. It replaces the "bf16 only until sc-17150" pin, whose whole job was
+/// to fail on this day.
+///
+/// Costs no weights: every assertion is about the load contract, not about tensors.
 #[test]
-fn the_tier_axis_is_bf16_only_until_sc_17150() {
+fn the_tier_axis_exists_and_never_quantizes_at_load() {
+    // 1. Both packed tiers are advertised, so a caller can ask for one.
+    let quants = mlx_gen_minimax_h3::descriptor()
+        .capabilities
+        .supported_quants;
+    assert!(
+        quants.contains(&mlx_gen::gen_core::Quant::Q4)
+            && quants.contains(&mlx_gen::gen_core::Quant::Q8),
+        "both packed tiers must be advertised, got {quants:?}"
+    );
+
+    // 2. A quantize request against a DENSE (unmarked) DiT is refused rather than served by
+    //    quantizing 66_280_430_080 bytes at load — the install-time peak this model cannot afford.
     let dir = tempfile::tempdir().unwrap();
+    let dit = dir.path().join("transformer");
+    std::fs::create_dir_all(&dit).unwrap();
+    // A dense component: a config with no `quantization` marker.
+    std::fs::write(dit.join("config.json"), "{}").unwrap();
     let mut spec = LoadSpec::new(WeightsSource::Dir(dir.path().to_path_buf()));
     spec.quantize = Some(mlx_gen::gen_core::Quant::Q4);
     let message = match load(&spec) {
         Err(e) => e.to_string(),
-        Ok(_) => panic!("a quantized load must not succeed"),
+        Ok(_) => panic!("a quantized load against a dense DiT must not succeed"),
     };
     assert!(
-        message.contains("sc-17150"),
-        "the quantized-tier refusal must name its owning story: {message}"
+        message.contains("does not quantize at load"),
+        "the refusal must say the model never quantizes at load: {message}"
     );
-    // ...and the descriptor advertises no tier either.
-    assert!(mlx_gen_minimax_h3::descriptor()
-        .capabilities
-        .supported_quants
-        .is_empty());
+    assert!(
+        message.contains(mlx_gen_minimax_h3::model::DIT_COMPONENT),
+        "the refusal must name the component to stage: {message}"
+    );
+
+    // 3. A tier that IS staged but disagrees with the request is a hard error, not a silent
+    //    downgrade — an unmarked packed component and a dense one are indistinguishable to a
+    //    loader that guesses, so the marker is authoritative and disagreement must be loud.
+    std::fs::write(
+        dit.join("config.json"),
+        r#"{"quantization": {"bits": 8, "group_size": 64}}"#,
+    )
+    .unwrap();
+    let message = match load(&spec) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("q4 requested against a staged q8 tier must not succeed"),
+    };
+    assert!(
+        message.contains("disagrees"),
+        "a tier mismatch must be reported as a disagreement: {message}"
+    );
 }
 
 /// **The declared 15 s ceiling has no lattice point**, and this is the arithmetic the sc-17152

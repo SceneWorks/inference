@@ -87,7 +87,17 @@ impl MiniMaxH3Dit {
     /// Load `transformer/` (or `transformer_ref/`) from a snapshot root: its `config.json` and its
     /// shards.
     pub fn load(root: impl AsRef<Path>, partition: &str, dtype: Dtype) -> Result<Self> {
-        let dir = root.as_ref().join(partition);
+        Self::load_dir(root.as_ref().join(partition), dtype)
+    }
+
+    /// Load from an already-resolved component directory.
+    ///
+    /// The seam a **tiered** install needs (sc-17150): a `q4` / `q8` DiT is staged from the
+    /// `SceneWorks/minimax-h3-mlx` mirror and does not sit under the snapshot root at all, so there
+    /// is no `(root, partition)` pair that names it. Packed tensors are detected per-Linear on
+    /// `{base}.scales` ([`crate::quant`]), so this one call loads every tier with no branch.
+    pub fn load_dir(dir: impl AsRef<Path>, dtype: Dtype) -> Result<Self> {
+        let dir = dir.as_ref();
         let config_path = dir.join("config.json");
         let text = std::fs::read_to_string(&config_path).map_err(|e| {
             Error::Msg(format!(
@@ -96,7 +106,7 @@ impl MiniMaxH3Dit {
             ))
         })?;
         let cfg = MiniMaxH3DitConfig::from_diffusers_json(&text)?;
-        let mut w = Weights::from_dir(&dir)?;
+        let mut w = Weights::from_dir(dir)?;
         Self::from_weights(&mut w, &cfg, dtype)
     }
 
