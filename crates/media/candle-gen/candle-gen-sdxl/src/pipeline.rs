@@ -294,11 +294,33 @@ pub(crate) fn sdxl_tiling_config() -> TilingConfig {
 /// around the trait for their native default.
 pub struct SdxlLatentDecoder<'a> {
     vae: &'a AutoEncoderKL,
+    decode_dtype: Option<DType>,
 }
 
 impl<'a> SdxlLatentDecoder<'a> {
     pub fn new(vae: &'a AutoEncoderKL) -> Self {
-        Self { vae }
+        Self {
+            vae,
+            decode_dtype: None,
+        }
+    }
+
+    /// Select the dtype at the VAE boundary. Imported single-file SDXL checkpoints carry their
+    /// original VAE, which is loaded in f32 to avoid the base model's unstable fp16 decode; the
+    /// native snapshot route leaves the sampler latent in its existing compute dtype.
+    pub fn with_decode_dtype(vae: &'a AutoEncoderKL, decode_dtype: DType) -> Self {
+        Self {
+            vae,
+            decode_dtype: Some(decode_dtype),
+        }
+    }
+
+    fn unscale(&self, latents: &Tensor) -> Result<Tensor> {
+        let unscaled = (latents / VAE_SCALE)?;
+        match self.decode_dtype {
+            Some(dtype) => Ok(unscaled.to_dtype(dtype)?),
+            None => Ok(unscaled),
+        }
     }
 }
 
@@ -308,7 +330,7 @@ impl LatentDecoder for SdxlLatentDecoder<'_> {
     }
 
     fn decode(&self, latents: &Tensor) -> Result<Tensor> {
-        Ok(self.vae.decode(&(latents / VAE_SCALE)?)?)
+        Ok(self.vae.decode(&self.unscale(latents)?)?)
     }
 
     fn decode_tiled(
@@ -320,7 +342,7 @@ impl LatentDecoder for SdxlLatentDecoder<'_> {
         if cancel.is_some_and(CancelFlag::is_cancelled) {
             return Err(CandleError::Canceled);
         }
-        let unscaled = (latents / VAE_SCALE)?;
+        let unscaled = self.unscale(latents)?;
         let (_, _, h, w) = unscaled.dims4()?;
         if tiling.needs_tiling(SDXL_VAE_TILING, 1, h as i32, w as i32) {
             return tile_blend_decode(&unscaled, SDXL_VAE_TILING, tiling, cancel, |tile| {
@@ -1205,7 +1227,11 @@ impl Pipeline {
         latents: &Tensor,
         cancel: &CancelFlag,
     ) -> Result<Image> {
-        let native = SdxlLatentDecoder::new(vae);
+        let native = if self.ldm.is_some() {
+            SdxlLatentDecoder::with_decode_dtype(vae, DType::F32)
+        } else {
+            SdxlLatentDecoder::new(vae)
+        };
         self.decode_with_tiling_gate(&native, pid, latents, cancel, crate::vae_tiling_enabled())
     }
 
@@ -1256,17 +1282,6 @@ impl Pipeline {
             pixels,
         })
     }
-    /// Decode the already-unscaled latent to an image tensor `[1, 3, H, W]` via the shared
-    /// [`tiled_vae_decode`] — tiled (sc-4987) when [`crate::vae_tiling_enabled`] is set AND the output
-    /// exceeds the tiling threshold (512²); otherwise the monolithic `AutoEncoderKL::decode`.
-    fn decode_image(&self, vae: &AutoEncoderKL, unscaled: &Tensor) -> Result<Tensor> {
-        let unscaled = if self.ldm.is_some() {
-            unscaled.to_dtype(DType::F32)?
-        } else {
-            unscaled.clone()
-        };
-        tiled_vae_decode(vae, &unscaled)
-    }
 }
 
 fn sdxl_vae_config() -> AutoEncoderKLConfig {
@@ -1278,28 +1293,6 @@ fn sdxl_vae_config() -> AutoEncoderKLConfig {
         use_quant_conv: true,
         use_post_quant_conv: true,
     }
-}
-
-/// Decode an already-unscaled SDXL latent `[1, 4, h, w]` to an image tensor `[1, 3, H, W]`, applying the
-/// sc-4987 budgeted VAE tiling when [`crate::vae_tiling_enabled`] is set AND the output exceeds the
-/// tiling threshold (512²); otherwise the monolithic `AutoEncoderKL::decode`. The non-tiling path is
-/// byte-identical to a bare `vae.decode`, so ≤512² renders and the conformance suite are unaffected.
-///
-/// This is the single decode seam for **every** SDXL lane (F-061 / sc-9045): the registered
-/// [`Pipeline::decode`] and the bespoke [`crate::denoise::decode_image`] (trainer preview, IP / edit
-/// providers) both route through it, so all lanes get the same bounded-peak decode at identical
-/// resolutions instead of the bespoke providers decoding 1024² monolithically.
-pub(crate) fn tiled_vae_decode(vae: &AutoEncoderKL, unscaled: &Tensor) -> Result<Tensor> {
-    if crate::vae_tiling_enabled() {
-        let cfg = sdxl_tiling_config();
-        let (_, _, h, w) = unscaled.dims4()?;
-        if cfg.needs_tiling(SDXL_VAE_TILING, 1, h as i32, w as i32) {
-            return tile_blend_decode(unscaled, SDXL_VAE_TILING, &cfg, None, |tile| {
-                Ok(vae.decode(tile)?)
-            });
-        }
-    }
-    Ok(vae.decode(unscaled)?)
 }
 
 /// Tiled VAE decode with trapezoidal seam blending (sc-4987) — the candle port of mlx-gen's
@@ -1526,8 +1519,9 @@ mod tests {
             dtype: DType::F32,
             adapters: vec![],
             pid_spec: None,
-            vae_fix: WeightsSource::File("/nonexistent/vae.safetensors".into()),
+            vae_fix: Some(WeightsSource::File("/nonexistent/vae.safetensors".into())),
             ldm: None,
+            quant: None,
         }
     }
 
@@ -1572,6 +1566,19 @@ mod tests {
                 .to_vec1::<u8>()
                 .unwrap(),
         }
+    }
+
+    #[test]
+    fn imported_ldm_decoder_casts_at_the_vae_boundary() {
+        let device = Device::Cpu;
+        let vae = tiny_sdxl_vae(&device);
+        let latents = Tensor::zeros((1, 4, 2, 2), DType::F16, &device).unwrap();
+
+        let native = SdxlLatentDecoder::new(&vae);
+        assert_eq!(native.unscale(&latents).unwrap().dtype(), DType::F16);
+
+        let imported = SdxlLatentDecoder::with_decode_dtype(&vae, DType::F32);
+        assert_eq!(imported.unscale(&latents).unwrap().dtype(), DType::F32);
     }
 
     /// SC-18309 N1: a real tiny SDXL AutoEncoderKL proves that moving `1 / VAE_SCALE` into the
