@@ -234,10 +234,11 @@ pub fn resolved_quant(spec: &LoadSpec) -> gen_core::Result<Option<Quant>> {
 }
 
 pub fn resolved_numeric_tier(spec: &LoadSpec) -> gen_core::Result<MemoryNumericTier> {
+    let quant = resolved_quant(spec)?;
     Ok(MemoryNumericTier {
         precision: Precision::Bf16,
-        quant: resolved_quant(spec)?,
-        component_precision_floors: crate::quant::COMPONENT_PRECISION_FLOORS,
+        quant,
+        component_precision_floors: crate::quant::active_component_precision_floors(quant),
     })
 }
 
@@ -267,7 +268,9 @@ pub fn validate_context(
         Some(MemoryNumericTier {
             precision: Precision::Bf16,
             quant: loaded_quant,
-            component_precision_floors: crate::quant::COMPONENT_PRECISION_FLOORS,
+            component_precision_floors: crate::quant::active_component_precision_floors(
+                loaded_quant,
+            ),
         }),
         None,
     ) {
@@ -842,6 +845,45 @@ mod tests {
         assert!(validate_context(&edit, &edit_context, Some(Quant::Q4)).is_ok());
         assert!(validate_context(&t2i, &edit_context, Some(Quant::Q4)).is_err());
         assert!(validate_context(&edit, &t2i_context, Some(Quant::Q4)).is_err());
+    }
+
+    #[test]
+    fn registered_receipts_bind_only_floors_active_for_the_loaded_tier() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base_spec = spec(&tmp);
+        for quant in [None, Some(Quant::Q8), Some(Quant::Q4)] {
+            let mut selected_spec = base_spec.clone();
+            selected_spec.quantize = quant;
+            let contract = contract_rl(&selected_spec).unwrap();
+            let tier = resolved_numeric_tier(&selected_spec).unwrap();
+            assert_eq!(
+                tier.component_precision_floors,
+                crate::quant::active_component_precision_floors(quant),
+                "resolved receipt must be tier-exact for {quant:?}"
+            );
+            let context = registered_valid_fixture(
+                &selected_spec,
+                &contract,
+                MemoryStrategy::StagedResidency,
+            )
+            .unwrap()
+            .remove(0)
+            .context;
+            assert!(validate_context(&contract, &context, quant).is_ok());
+
+            if quant != Some(Quant::Q4) {
+                let mut over_bound = context;
+                over_bound.selection.tier.component_precision_floors =
+                    crate::quant::COMPONENT_PRECISION_FLOORS;
+                let error = validate_context(&contract, &over_bound, quant).unwrap_err();
+                assert!(error.to_string().contains("does not match loaded tier"));
+            } else {
+                let mut under_bound = context;
+                under_bound.selection.tier.component_precision_floors = &[];
+                let error = validate_context(&contract, &under_bound, quant).unwrap_err();
+                assert!(error.to_string().contains("does not match loaded tier"));
+            }
+        }
     }
 
     #[test]

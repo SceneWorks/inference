@@ -903,7 +903,7 @@ fn request_context_error(
             Some(mlx_gen::gen_core::MemoryNumericTier {
                 precision: Precision::Bf16,
                 quant: tier,
-                component_precision_floors: crate::quant::COMPONENT_PRECISION_FLOORS,
+                component_precision_floors: crate::quant::active_component_precision_floors(tier),
             }),
             Some(&route_gate),
         )
@@ -1357,7 +1357,9 @@ fn registered_valid_fixture(
         mlx_gen::gen_core::MemoryNumericTier {
             precision: spec.precision,
             quant: spec.quantize,
-            component_precision_floors: crate::quant::COMPONENT_PRECISION_FLOORS,
+            component_precision_floors: crate::quant::active_component_precision_floors(
+                spec.quantize,
+            ),
         },
         mlx_gen::gen_core::MemoryBehaviorRoute {
             mode: if variant.is_edit() {
@@ -1932,6 +1934,70 @@ mod tests {
         )
         .unwrap()
         .contains("committed bytes"));
+    }
+
+    #[test]
+    fn registered_receipts_bind_only_floors_active_for_the_loaded_tier() {
+        for quant in [None, Some(Quant::Q8), Some(Quant::Q4)] {
+            let mut spec = LoadSpec::new(WeightsSource::Dir("/weights-free-mage".into()));
+            spec.quantize = quant;
+            let contract = weights_free_memory_strategy_contract("mage_flow", &spec).unwrap();
+            let context = registered_valid_fixture(
+                MageVariant::Rl,
+                &spec,
+                &contract,
+                MemoryStrategy::StagedResidency,
+            )
+            .unwrap()
+            .remove(0)
+            .context;
+            assert_eq!(
+                context.selection.tier.component_precision_floors,
+                crate::quant::active_component_precision_floors(quant),
+                "fixture receipt must be tier-exact for {quant:?}"
+            );
+            assert_eq!(
+                memory_strategy_safety_check_for(
+                    "mage_flow",
+                    MageVariant::Rl,
+                    quant,
+                    &contract,
+                    &context,
+                ),
+                MemorySafetyDecision::Accept
+            );
+
+            if quant != Some(Quant::Q4) {
+                let mut over_bound = context.clone();
+                over_bound.selection.tier.component_precision_floors =
+                    crate::quant::COMPONENT_PRECISION_FLOORS;
+                assert!(matches!(
+                    memory_strategy_safety_check_for(
+                        "mage_flow",
+                        MageVariant::Rl,
+                        quant,
+                        &contract,
+                        &over_bound,
+                    ),
+                    MemorySafetyDecision::Reject { reason }
+                        if reason.contains("does not match loaded tier")
+                ));
+            } else {
+                let mut under_bound = context.clone();
+                under_bound.selection.tier.component_precision_floors = &[];
+                assert!(matches!(
+                    memory_strategy_safety_check_for(
+                        "mage_flow",
+                        MageVariant::Rl,
+                        quant,
+                        &contract,
+                        &under_bound,
+                    ),
+                    MemorySafetyDecision::Reject { reason }
+                        if reason.contains("does not match loaded tier")
+                ));
+            }
+        }
     }
 
     #[test]

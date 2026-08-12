@@ -8,8 +8,8 @@ name: Real-weight validation
 # keep moving, and it should not cost a workflow PR each time.
 #
 #   LABEL       WEIGHT SET                                          ON DISK   HOST
-#   rw-mage     Mage-Flow x4 + Z-Image + the Mage oracle bundle      ~96 GiB   BOTH boxes
-#   rw-mage     Qwen-Image + Qwen-Image-Edit + Fun-Controlnet-Union  ~170 GiB  BOTH boxes
+#   rw-mage     Mage-Flow x4 + Z-Image + the Mage oracle bundle      ~96 GiB   nax-macos-2
+#   rw-mage     Qwen-Image + Qwen-Image-Edit + Fun-Controlnet-Union  ~170 GiB  nax-macos-2
 #               MLX re-hosts, both PiD students, Gemma-2-2B,
 #               FLUX.1-dev, two lightx2v Lightning LoRAs  (sc-17284)
 #   rw-sa3      Stable Audio 3 / SAME                                ~0        nax-macos
@@ -28,14 +28,12 @@ name: Real-weight validation
 # ~3 GiB overstatement from being derived as 34 + 11 rather than measured. If you edit a row,
 # measure it — and say which unit, because 42 GiB and 45 GB are the same number of bytes.
 #
-# `rw-mage` IS NOT PINNED — it is registered on BOTH boxes. This block used to claim it was "pinned
-# to `nax-macos` by the one asset here that cannot self-heal: the ~461 MB frozen-Torch oracle bundle
-# behind `MAGE_ORACLE_SEED_DIR`". A label is not a pin, and this one is on both: observed 2026-08-05
-# (sc-17284) when `mlx-qwen-image-producers` ran on `nax-macos-2` with
-# `labels=self-hosted,macOS,ARM64,rw-mage`, which a runner cannot accept unless it carries every
-# requested label.
+# `rw-mage` is currently registered only on `nax-macos-2`, verified from the live org runner
+# inventory on 2026-08-11. It had previously been registered on both boxes, so do not infer the
+# current pool from historical job placement. The label remains the placement mechanism; moving it
+# is an operator action and does not require a workflow edit.
 #
-# What IS true about the bundle is the invariant that replaces the pin. `MAGE_ORACLE_SEED_DIR` is
+# The invariant that makes such a move safe is the oracle bundle. `MAGE_ORACLE_SEED_DIR` is
 # `~/Library/Application Support/SceneWorks/oracles/sc-14052-mage-flow` — a `~/`-relative value
 # resolved per-runner by `resolve_snapshot_paths.py`, so it is ONE setting naming a DIFFERENT
 # directory on each box. It exists on no Hub and this workflow deliberately refuses to regenerate it
@@ -43,12 +41,10 @@ name: Real-weight validation
 # provisioned by hand, and adding the label to a box without it is what actually breaks `mlx-media`
 # — not moving the label around.**
 #
-# Both boxes have the bundle, confirmed 2026-08-05. `nax-macos` was checked from a shell on the box:
-# 461 MB, all 18 required files present as regular non-symlink files, which is exactly what `Require
-# operator-provisioned Mage oracle seed` demands. `nax-macos-2` was confirmed by direct operator
-# inspection, which is the strongest check available — no job or script in this repo can read that
-# box's filesystem. That step remains the enforcement: it fails closed with a named error on a cache
-# miss, so a box that quietly loses its copy surfaces as a red `mlx-media`, never a wrong oracle.
+# Both boxes had the bundle when checked on 2026-08-05, but that historical fact is not a current
+# label or filesystem guarantee. `Require operator-provisioned Mage oracle seed` remains the live
+# enforcement: it fails closed with a named error on a cache miss, so a box that quietly loses its
+# copy surfaces as a red `mlx-media`, never a wrong oracle.
 
 # `rw-sa3` stores nothing between runs (it materializes into `RUNNER_TEMP`), so it is the free
 # rebalancing knob: move it to shift ~83 min of wall clock without moving a single stored byte.
@@ -86,6 +82,15 @@ name: Real-weight validation
 # stage later: they import the tree the pip step installed, so they must be the same interpreter
 # that installed it. scripts/tests/test_ci_workflow_policy.py enforces both halves; a bare
 # `python3` anywhere in a macOS job fails that gate.
+#
+# EVERY WINDOWS PYTHON CONSUMER USES THE EXACT UV-MANAGED 3.12.10 PATH.
+#
+# A 2026-08-12 runner restart changed the registered `py` default to 3.14, then setup-python's
+# attempt to restore 3.12 blocked behind an operator-observed Windows elevation prompt. A prompt can
+# never be satisfied by unattended CI. Each Windows job therefore installs pinned uv, asks it for a
+# managed 3.12.10 with both registry and launcher mutation disabled, and exports the absolute
+# interpreter path. The workflow policy rejects setup-python, bare launchers, version drift, or any
+# Python consumer that runs before that path is resolved.
 
 on:
   schedule:
@@ -113,7 +118,7 @@ on:
         required: false
         default: ""
       migrate_mage_edit_variant_manifest:
-        description: Migrate only the copied Mage edit-variant manifest after strict legacy verification (media only)
+        description: Converge and durably certify the exact Mage manifest pair on the active rw-mage seed after full validation (media only)
         type: boolean
         required: false
         default: false
@@ -959,7 +964,8 @@ jobs:
           python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py \
             --model mage-flow \
-            --snapshot "$MAGE_REQUEST_SCOPE_SNAPSHOT"
+            --snapshot "$MAGE_REQUEST_SCOPE_SNAPSHOT" \
+            --require-materialization-provenance
       - name: Run Mage request-memory lifecycle
         run: >-
           cargo test --locked --release -p mlx-gen-mage
@@ -1383,10 +1389,17 @@ jobs:
           run_one joycaption_provider_streams_caption_through_contract
 
   mlx-media:
-    name: MLX media real weights
+    name: MLX media real weights (${{ matrix.mage_seed_slot }})
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'media'
     runs-on: [self-hosted, macOS, ARM64, rw-mage]
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      # The label is the live placement source of truth. Certification must mutate and re-verify
+      # the seed on the one runner that actually claims the rw-mage job; inactive historical hosts
+      # are not part of this run's evidence.
+      matrix:
+        mage_seed_slot: [single]
     env:
       ZIMAGE_SNAPSHOT: ${{ vars.ZIMAGE_SNAPSHOT }}
       MAGE_SNAPSHOT: ${{ vars.MAGE_SNAPSHOT }}
@@ -1432,6 +1445,23 @@ jobs:
         run: echo "MAGE_GOLDEN_DIR=$RUNNER_TEMP/mage-flow-oracles" >> "$GITHUB_ENV"
       - name: Toolchain versions
         run: rustc --version && cargo --version
+      - name: Recover any interrupted persistent Mage seed promotion
+        id: mage-seed-recovery
+        run: |
+          if [[ -z "$MAGE_ORACLE_SEED_DIR" || "$MAGE_ORACLE_SEED_DIR" != /* ]]; then
+            echo "MAGE_ORACLE_SEED_DIR must resolve to an absolute path before recovery" >&2
+            exit 1
+          fi
+          python3.12 scripts/release/promote_mage_oracle_seed.py \
+            --seed "$MAGE_ORACLE_SEED_DIR" \
+            --recover-only \
+            --runner-name "$RUNNER_NAME" \
+            --slot "${{ matrix.mage_seed_slot }}" \
+            --revision "$GITHUB_SHA" \
+            --receipt "$RUNNER_TEMP/mage-seed-promotion-${{ matrix.mage_seed_slot }}.json"
+          if [[ -f "$RUNNER_TEMP/mage-seed-promotion-${{ matrix.mage_seed_slot }}.json" ]]; then
+            echo "completed=true" >> "$GITHUB_OUTPUT"
+          fi
       # Report-only: what this box had free, and which of these snapshots it already holds,
       # BEFORE anything transfers. Also names the runner -- `rw-*` labels live in org settings
       # and are invisible from the runners themselves, so a run log is the only record of
@@ -1450,10 +1480,10 @@ jobs:
           python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model z-image-turbo --snapshot "$ZIMAGE_SNAPSHOT"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model lens-turbo --snapshot "$LENS_SNAPSHOT"
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model mage-flow --snapshot "$MAGE_SNAPSHOT"
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model mage-flow-edit --snapshot "$MAGE_EDIT_SNAPSHOT"
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model mage-flow-edit-base --snapshot "$MAGE_EDIT_BASE_SNAPSHOT"
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model mage-flow-edit-turbo --snapshot "$MAGE_EDIT_TURBO_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model mage-flow --snapshot "$MAGE_SNAPSHOT" --require-materialization-provenance
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model mage-flow-edit --snapshot "$MAGE_EDIT_SNAPSHOT" --require-materialization-provenance
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model mage-flow-edit-base --snapshot "$MAGE_EDIT_BASE_SNAPSHOT" --require-materialization-provenance
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model mage-flow-edit-turbo --snapshot "$MAGE_EDIT_TURBO_SNAPSHOT" --require-materialization-provenance
       - name: Derive immutable Mage oracle cache key
         id: mage-oracle-key
         run: |
@@ -1472,7 +1502,7 @@ jobs:
             fi
             printf '%s' "$revision"
           }
-          producer="${{ hashFiles('.github/workflows/real-weights.yml', 'crates/media/mlx-gen/_vendor/mage_flow/**', 'crates/media/mlx-gen/_vendor/mage_flow/assets/dog.jpg', 'crates/media/mlx-gen/_vendor/mage_flow/requirements-oracles.txt', 'crates/media/mlx-gen/tools/_paths.py', 'crates/media/mlx-gen/tools/dump_mage_flow_golden.py', 'crates/media/mlx-gen/tools/dump_mage_vae_sizes.py', 'scripts/release/mage_reference_environment.py', 'scripts/release/provision_mage_oracles.py', 'scripts/release/provision_mage_edit_variants.py', 'scripts/release/verify_mage_candle_oracles.py', 'scripts/release/verify_mage_candle_transfer.py') }}"
+          producer="${{ hashFiles('.github/workflows/real-weights.yml', 'crates/media/mlx-gen/_vendor/mage_flow/**', 'crates/media/mlx-gen/_vendor/mage_flow/assets/dog.jpg', 'crates/media/mlx-gen/_vendor/mage_flow/requirements-oracles.txt', 'crates/media/mlx-gen/tools/_paths.py', 'crates/media/mlx-gen/tools/dump_mage_flow_golden.py', 'crates/media/mlx-gen/tools/dump_mage_vae_sizes.py', 'scripts/release/mage_reference_environment.py', 'scripts/release/provision_mage_oracles.py', 'scripts/release/provision_mage_edit_variants.py', 'scripts/release/promote_mage_oracle_seed.py', 'scripts/release/verify_mage_candle_oracles.py', 'scripts/release/verify_mage_candle_transfer.py') }}"
           if [[ ! "$producer" =~ ^[0-9a-f]{64}$ ]]; then
             echo "Oracle producer fingerprint is missing or malformed: $producer" >&2
             exit 1
@@ -1481,6 +1511,9 @@ jobs:
           echo "key=$key" >> "$GITHUB_OUTPUT"
       - name: Restore verified Mage oracle cache
         id: mage-oracle-cache
+        # Certification must inspect the persistent seed on the runner that actually claimed each
+        # matrix leg. A normal exact-head cache would bypass that seed and make retries impossible.
+        if: github.event_name != 'workflow_dispatch' || inputs.profile != 'media' || inputs.migrate_mage_edit_variant_manifest != true
         uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ runner.temp }}/mage-flow-oracles
@@ -1511,6 +1544,8 @@ jobs:
             mage_flow_vae_f32_768x1152.safetensors
             mage_flow_dit_golden.safetensors
             mage_flow_e2e_golden.safetensors
+            mage_flow_e2e_golden.png
+            mage_flow_edit_golden.png
             mage_oracles_manifest.json
             mage_edit_oracle_manifest.json
             mage_edit_variants_manifest.json
@@ -1526,9 +1561,58 @@ jobs:
             fi
             install -m 0644 "$source" "$MAGE_GOLDEN_DIR/$file"
           done
-          echo "imported=true" >> "$GITHUB_OUTPUT"
-      - name: Migrate only the copied Mage edit-variant manifest
+          edit_sha="$(shasum -a 256 "$MAGE_ORACLE_SEED_DIR/mage_edit_variants_manifest.json" | awk '{print $1}')"
+          transfer_sha="$(shasum -a 256 "$MAGE_ORACLE_SEED_DIR/mage_candle_transfer_manifest.json" | awk '{print $1}')"
+          if [[ ! "$edit_sha" =~ ^[0-9a-f]{64}$ || ! "$transfer_sha" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "Could not bind the imported Mage seed manifest hashes" >&2
+            exit 1
+          fi
+          {
+            echo "edit-sha=$edit_sha"
+            echo "transfer-sha=$transfer_sha"
+            echo "imported=true"
+          } >> "$GITHUB_OUTPUT"
+      - name: Require an uncached operator seed for durable Mage certification
         if: github.event_name == 'workflow_dispatch' && inputs.profile == 'media' && inputs.migrate_mage_edit_variant_manifest
+        run: |
+          if [[ "${{ steps.mage-oracle-cache.outputs.cache-hit }}" == "true" || \
+                "${{ steps.mage-oracle-seed.outputs.imported }}" != "true" ]]; then
+            echo "Durable Mage certification requires a cache miss copied from this runner's persistent operator seed" >&2
+            exit 1
+          fi
+      - name: Prepare pinned Mage reference environment
+        run: |
+          if [[ ! -x "$RUNNER_TEMP/mage-reference/bin/python" ]]; then
+            python -m venv "$RUNNER_TEMP/mage-reference"
+            "$RUNNER_TEMP/mage-reference/bin/python" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes -r crates/media/mlx-gen/_vendor/mage_flow/requirements-oracles.txt
+          fi
+      - name: Classify the copied Mage manifest pair
+        id: mage-seed-state
+        if: github.event_name == 'workflow_dispatch' && inputs.profile == 'media' && inputs.migrate_mage_edit_variant_manifest && steps.mage-seed-recovery.outputs.completed != 'true'
+        run: |
+          if "$RUNNER_TEMP/mage-reference/bin/python" \
+              scripts/release/provision_mage_edit_variants.py \
+              --gen "$MAGE_SNAPSHOT" \
+              --edit "$MAGE_EDIT_SNAPSHOT" \
+              --edit-base "$MAGE_EDIT_BASE_SNAPSHOT" \
+              --edit-turbo "$MAGE_EDIT_TURBO_SNAPSHOT" \
+              --output "$MAGE_GOLDEN_DIR" \
+              --verify-only && \
+            "$RUNNER_TEMP/mage-reference/bin/python" \
+              scripts/release/verify_mage_candle_transfer.py \
+              --gen "$MAGE_SNAPSHOT" \
+              --edit "$MAGE_EDIT_SNAPSHOT" \
+              --edit-base "$MAGE_EDIT_BASE_SNAPSHOT" \
+              --edit-turbo "$MAGE_EDIT_TURBO_SNAPSHOT" \
+              --output "$MAGE_GOLDEN_DIR"; then
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          else
+            # The migration command below accepts only the one exact legacy population. Any
+            # unrelated validation failure therefore remains fail-closed rather than being blessed.
+            echo "current=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Migrate only the copied Mage edit-variant manifest
+        if: github.event_name == 'workflow_dispatch' && inputs.profile == 'media' && inputs.migrate_mage_edit_variant_manifest && steps.mage-seed-recovery.outputs.completed != 'true' && steps.mage-seed-state.outputs.current != 'true'
         run: |
           golden_root="$(cd "$MAGE_GOLDEN_DIR" && pwd -P)"
           runner_root="$(cd "$RUNNER_TEMP" && pwd -P)"
@@ -1542,13 +1626,35 @@ jobs:
             echo "Mage manifest migration must never mutate the persistent operator seed" >&2
             exit 1
           fi
-          python3.12 scripts/release/provision_mage_edit_variants.py \
+          "$RUNNER_TEMP/mage-reference/bin/python" scripts/release/provision_mage_edit_variants.py \
             --gen "$MAGE_SNAPSHOT" \
             --edit "$MAGE_EDIT_SNAPSHOT" \
             --edit-base "$MAGE_EDIT_BASE_SNAPSHOT" \
             --edit-turbo "$MAGE_EDIT_TURBO_SNAPSHOT" \
             --output "$MAGE_GOLDEN_DIR" \
             --migrate-reference-environment-manifest-only
+          transfer_manifest="$MAGE_GOLDEN_DIR/mage_candle_transfer_manifest.json"
+          seed_transfer_manifest="$MAGE_ORACLE_SEED_DIR/mage_candle_transfer_manifest.json"
+          if [[ ! -f "$transfer_manifest" || -L "$transfer_manifest" ]]; then
+            echo "Mage transfer manifest migration requires an exclusive temporary copy" >&2
+            exit 1
+          fi
+          if [[ "$transfer_manifest" -ef "$seed_transfer_manifest" ]]; then
+            echo "Mage transfer manifest migration must never mutate the persistent operator seed" >&2
+            exit 1
+          fi
+          transfer_links="$(stat -f '%l' "$transfer_manifest")"
+          if [[ "$transfer_links" != "1" ]]; then
+            echo "Mage transfer manifest migration requires exactly one hard link" >&2
+            exit 1
+          fi
+          "$RUNNER_TEMP/mage-reference/bin/python" scripts/release/verify_mage_candle_transfer.py \
+            --gen "$MAGE_SNAPSHOT" \
+            --edit "$MAGE_EDIT_SNAPSHOT" \
+            --edit-base "$MAGE_EDIT_BASE_SNAPSHOT" \
+            --edit-turbo "$MAGE_EDIT_TURBO_SNAPSHOT" \
+            --output "$MAGE_GOLDEN_DIR" \
+            --migrate-edit-variant-manifest-hash-only
       # sc-14051 Candle acceptance oracle: one frozen-Torch 1024²/20-step reference run emits
       # both the step-zero full-DiT boundary and the final e2e image. It is generated on a
       # different backend/process from the Candle implementation and transferred as an immutable
@@ -1556,10 +1662,6 @@ jobs:
       # operator-generated bundle above instead of running the multi-hour producer in Actions.
       - name: Verify restored or operator-provisioned Mage oracle cache
         run: |
-          if [[ ! -x "$RUNNER_TEMP/mage-reference/bin/python" ]]; then
-            python -m venv "$RUNNER_TEMP/mage-reference"
-            "$RUNNER_TEMP/mage-reference/bin/python" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes -r crates/media/mlx-gen/_vendor/mage_flow/requirements-oracles.txt
-          fi
           "$RUNNER_TEMP/mage-reference/bin/python" \
             scripts/release/provision_mage_oracles.py \
             --snapshot "$MAGE_SNAPSHOT" \
@@ -1593,12 +1695,6 @@ jobs:
             --edit-turbo "$MAGE_EDIT_TURBO_SNAPSHOT" \
             --output "$MAGE_GOLDEN_DIR"
           echo "MAGE_FLOW_TE_GOLDEN=$MAGE_GOLDEN_DIR/mage_flow_te_golden.safetensors" >> "$GITHUB_ENV"
-      - name: Save verified Mage oracle cache
-        if: steps.mage-oracle-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
-        with:
-          path: ${{ runner.temp }}/mage-flow-oracles
-          key: ${{ steps.mage-oracle-key.outputs.key }}
       - name: Run provider conformance
         run: >-
           cargo test --locked -p mlx-gen-z-image --test conformance
@@ -1656,6 +1752,67 @@ jobs:
             cargo test --locked --release -p mlx-gen-mage --test edit_real_weights \
             fixed_instruction_edit_matches_the_torch_reference -- --ignored --nocapture || status=$?
           exit "$status"
+      - name: Atomically promote the verified Mage manifests into this runner's operator seed
+        if: github.event_name == 'workflow_dispatch' && inputs.profile == 'media' && inputs.migrate_mage_edit_variant_manifest && steps.mage-seed-recovery.outputs.completed != 'true'
+        run: |
+          python3.12 scripts/release/promote_mage_oracle_seed.py \
+            --source "$MAGE_GOLDEN_DIR" \
+            --seed "$MAGE_ORACLE_SEED_DIR" \
+            --expected-old-edit-sha "${{ steps.mage-oracle-seed.outputs.edit-sha }}" \
+            --expected-old-transfer-sha "${{ steps.mage-oracle-seed.outputs.transfer-sha }}" \
+            --runner-name "$RUNNER_NAME" \
+            --slot "${{ matrix.mage_seed_slot }}" \
+            --revision "$GITHUB_SHA" \
+            --receipt "$RUNNER_TEMP/mage-seed-promotion-${{ matrix.mage_seed_slot }}.json" \
+            --allow-already-current
+      - name: Verify the promoted persistent Mage oracle seed
+        if: github.event_name == 'workflow_dispatch' && inputs.profile == 'media' && inputs.migrate_mage_edit_variant_manifest
+        run: |
+          "$RUNNER_TEMP/mage-reference/bin/python" \
+            scripts/release/provision_mage_oracles.py \
+            --snapshot "$MAGE_SNAPSHOT" \
+            --edit-snapshot "$MAGE_EDIT_SNAPSHOT" \
+            --output "$MAGE_ORACLE_SEED_DIR" \
+            --verify-only
+          "$RUNNER_TEMP/mage-reference/bin/python" \
+            scripts/release/provision_mage_oracles.py \
+            --snapshot "$MAGE_SNAPSHOT" \
+            --edit-snapshot "$MAGE_EDIT_SNAPSHOT" \
+            --output "$MAGE_ORACLE_SEED_DIR" \
+            --verify-edit-artifact
+          "$RUNNER_TEMP/mage-reference/bin/python" \
+            scripts/release/provision_mage_edit_variants.py \
+            --gen "$MAGE_SNAPSHOT" \
+            --edit "$MAGE_EDIT_SNAPSHOT" \
+            --edit-base "$MAGE_EDIT_BASE_SNAPSHOT" \
+            --edit-turbo "$MAGE_EDIT_TURBO_SNAPSHOT" \
+            --output "$MAGE_ORACLE_SEED_DIR" \
+            --verify-only
+          "$RUNNER_TEMP/mage-reference/bin/python" \
+            scripts/release/verify_mage_candle_oracles.py \
+            --snapshot "$MAGE_SNAPSHOT" \
+            --edit-snapshot "$MAGE_EDIT_SNAPSHOT" \
+            --output "$MAGE_ORACLE_SEED_DIR"
+          "$RUNNER_TEMP/mage-reference/bin/python" \
+            scripts/release/verify_mage_candle_transfer.py \
+            --gen "$MAGE_SNAPSHOT" \
+            --edit "$MAGE_EDIT_SNAPSHOT" \
+            --edit-base "$MAGE_EDIT_BASE_SNAPSHOT" \
+            --edit-turbo "$MAGE_EDIT_TURBO_SNAPSHOT" \
+            --output "$MAGE_ORACLE_SEED_DIR"
+      - name: Upload persistent Mage seed promotion receipt
+        if: github.event_name == 'workflow_dispatch' && inputs.profile == 'media' && inputs.migrate_mage_edit_variant_manifest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: mage-seed-promotion-${{ matrix.mage_seed_slot }}-${{ github.sha }}
+          path: ${{ runner.temp }}/mage-seed-promotion-${{ matrix.mage_seed_slot }}.json
+          if-no-files-found: error
+      - name: Save verified Mage oracle cache
+        if: steps.mage-oracle-cache.outputs.cache-hit != 'true' && inputs.migrate_mage_edit_variant_manifest != true
+        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ runner.temp }}/mage-flow-oracles
+          key: ${{ steps.mage-oracle-key.outputs.key }}
       - name: Upload verified Mage edit oracle
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -1684,6 +1841,34 @@ jobs:
             ${{ runner.temp }}/mage-flow-oracles/mage_candle_oracles_manifest.json
             ${{ runner.temp }}/mage-flow-oracles/mage_candle_transfer_manifest.json
           if-no-files-found: error
+
+  mage-seed-promotion-gate:
+    name: Mage seed promotion receipts
+    if: always() && (github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'media')
+    needs: mlx-media
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require MLX media success
+        run: |
+          if [[ "${{ needs.mlx-media.result }}" != "success" ]]; then
+            echo "MLX media did not complete successfully: ${{ needs.mlx-media.result }}" >&2
+            exit 1
+          fi
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        if: github.event_name == 'workflow_dispatch' && inputs.profile == 'media' && inputs.migrate_mage_edit_variant_manifest
+      - name: Download the persistent Mage seed receipt
+        if: github.event_name == 'workflow_dispatch' && inputs.profile == 'media' && inputs.migrate_mage_edit_variant_manifest
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: mage-seed-promotion-*-${{ github.sha }}
+          path: ${{ runner.temp }}/mage-seed-promotion-receipts
+          merge-multiple: true
+      - name: Require the exact-run Mage seed certification
+        if: github.event_name == 'workflow_dispatch' && inputs.profile == 'media' && inputs.migrate_mage_edit_variant_manifest
+        run: >-
+          python3.12 scripts/release/promote_mage_oracle_seed.py
+          --verify-receipts "$RUNNER_TEMP/mage-seed-promotion-receipts"
+          --revision "$GITHUB_SHA"
 
   # sc-17284 — the FIRST CI lane for the mlx-gen-qwen-image real-weight surface.
   #
@@ -2176,7 +2361,7 @@ jobs:
       - name: Materialize and verify immutable snapshots
         run: |
           python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model flux-1-dev --snapshot "$FLUX_DEV_DIR"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model flux-1-dev --snapshot "$FLUX_DEV_DIR" --require-materialization-provenance
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model qwen-image-mlx --snapshot "$QWEN_IMAGE_MLX_SNAPSHOT"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model pid-qwenimage --snapshot "$PID_QWEN_SNAPSHOT"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model pid-flux --snapshot "$PID_FLUX_SNAPSHOT"
@@ -2244,11 +2429,10 @@ jobs:
     #   nax-macos    1618 s of test time / 32m32s job   (run 30959809619)
     #   nax-macos-2   370 s of test time /  6m43s job   (run 31050459516)
     # Same test, same tier, same resident weights — a 4.4x spread that is HOST variance, not cold
-    # cache. `rw-mage` is carried by both boxes, so this job's wall clock depends on which one takes
-    # it and on what else that machine is doing (nax-macos also runs dev work outside Actions). Size
-    # the cap against the SLOW host: 60 leaves 1.8x headroom over 32m32s, the thinnest of the three
-    # jobs. If any of them ever brushes its cap, raise this one first — it is a producer, so the
-    # cost of a generous cap here is low.
+    # cache. `rw-mage` currently selects only nax-macos-2, but labels are movable and the slow-host
+    # observation remains the conservative sizing datum. Size the cap against that host: 60 leaves
+    # 1.8x headroom over 32m32s, the thinnest of the three jobs. If any of them ever brushes its cap,
+    # raise this one first — it is a producer, so the cost of a generous cap here is low.
     timeout-minutes: 60
     env:
       QWEN_IMAGE_MLX_SNAPSHOT: ${{ vars.QWEN_IMAGE_MLX_SNAPSHOT }}
@@ -3993,9 +4177,23 @@ jobs:
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12
+        shell: cmd
+        run: |
+          uv python install 3.12.10 --managed-python --no-registry --no-bin --no-config || exit /b 1
+          for /f "delims=" %%P in ('uv python find 3.12.10 --managed-python --no-project --no-config') do set "REVIEWED_PYTHON=%%P"
+          if not defined REVIEWED_PYTHON exit /b 1
+          "%REVIEWED_PYTHON%" -c "import sys; assert sys.version_info[:3] == (3, 12, 10), sys.version" || exit /b 1
+          echo REVIEWED_PYTHON=%REVIEWED_PYTHON%>>"%GITHUB_ENV%"
       - name: Configure immutable SAME-L snapshot path
         shell: cmd
-        run: python scripts/release/export_model_snapshot_paths.py --model same-l
+        run: |
+          "%REVIEWED_PYTHON%" scripts/release/export_model_snapshot_paths.py --model same-l
       - name: Select Git Bash
         shell: cmd
         run: |
@@ -4015,9 +4213,9 @@ jobs:
       - name: Materialize and verify immutable SAME-L snapshot
         shell: cmd
         run: |
-          python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt
+          "%REVIEWED_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt || exit /b 1
           set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
-          python scripts/release/ensure_model_snapshot.py --model same-l --snapshot "%SA3_SAME_L_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model same-l --snapshot "%SA3_SAME_L_SNAPSHOT%" || exit /b 1
       - name: Verify SAME-L short and long band boundaries on CUDA
         shell: cmd
         run: |
@@ -4120,9 +4318,23 @@ jobs:
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12
+        shell: cmd
+        run: |
+          uv python install 3.12.10 --managed-python --no-registry --no-bin --no-config || exit /b 1
+          for /f "delims=" %%P in ('uv python find 3.12.10 --managed-python --no-project --no-config') do set "REVIEWED_PYTHON=%%P"
+          if not defined REVIEWED_PYTHON exit /b 1
+          "%REVIEWED_PYTHON%" -c "import sys; assert sys.version_info[:3] == (3, 12, 10), sys.version" || exit /b 1
+          echo REVIEWED_PYTHON=%REVIEWED_PYTHON%>>"%GITHUB_ENV%"
       - name: Configure immutable small-music snapshot path
         shell: cmd
-        run: python scripts/release/export_model_snapshot_paths.py --model stable-audio-3-small-music
+        run: |
+          "%REVIEWED_PYTHON%" scripts/release/export_model_snapshot_paths.py --model stable-audio-3-small-music
       - name: Select Git Bash
         shell: cmd
         run: |
@@ -4142,9 +4354,9 @@ jobs:
       - name: Materialize and verify immutable small-music snapshot
         shell: cmd
         run: |
-          python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt
+          "%REVIEWED_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt || exit /b 1
           set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
-          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music --snapshot "%SA3_SMALL_MUSIC_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music --snapshot "%SA3_SMALL_MUSIC_SNAPSHOT%" || exit /b 1
       - name: Run registered provider conformance and concurrent RNG isolation on CUDA
         shell: cmd
         run: |
@@ -4187,10 +4399,23 @@ jobs:
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12
+        shell: cmd
+        run: |
+          uv python install 3.12.10 --managed-python --no-registry --no-bin --no-config || exit /b 1
+          for /f "delims=" %%P in ('uv python find 3.12.10 --managed-python --no-project --no-config') do set "REVIEWED_PYTHON=%%P"
+          if not defined REVIEWED_PYTHON exit /b 1
+          "%REVIEWED_PYTHON%" -c "import sys; assert sys.version_info[:3] == (3, 12, 10), sys.version" || exit /b 1
+          echo REVIEWED_PYTHON=%REVIEWED_PYTHON%>>"%GITHUB_ENV%"
       - name: Configure immutable small-sfx and small-music snapshot paths
         shell: cmd
         run: |
-          python scripts/release/export_model_snapshot_paths.py --model stable-audio-3-small-sfx --model stable-audio-3-small-music
+          "%REVIEWED_PYTHON%" scripts/release/export_model_snapshot_paths.py --model stable-audio-3-small-sfx --model stable-audio-3-small-music
       - name: Select Git Bash
         shell: cmd
         run: |
@@ -4210,10 +4435,10 @@ jobs:
       - name: Materialize and verify both immutable small snapshots
         shell: cmd
         run: |
-          python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt
+          "%REVIEWED_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt || exit /b 1
           set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
-          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-sfx --snapshot "%SA3_SMALL_SFX_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music --snapshot "%SA3_SMALL_MUSIC_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-sfx --snapshot "%SA3_SMALL_SFX_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music --snapshot "%SA3_SMALL_MUSIC_SNAPSHOT%" || exit /b 1
       - name: Prove music and SFX actually diverge on CUDA
         shell: cmd
         # sc-14546 moved `--test variant_binding` to `sa3-base-identity-cuda`, which provisions all
@@ -4273,10 +4498,23 @@ jobs:
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12
+        shell: cmd
+        run: |
+          uv python install 3.12.10 --managed-python --no-registry --no-bin --no-config || exit /b 1
+          for /f "delims=" %%P in ('uv python find 3.12.10 --managed-python --no-project --no-config') do set "REVIEWED_PYTHON=%%P"
+          if not defined REVIEWED_PYTHON exit /b 1
+          "%REVIEWED_PYTHON%" -c "import sys; assert sys.version_info[:3] == (3, 12, 10), sys.version" || exit /b 1
+          echo REVIEWED_PYTHON=%REVIEWED_PYTHON%>>"%GITHUB_ENV%"
       - name: Configure immutable medium and small snapshot paths
         shell: cmd
         run: |
-          python scripts/release/export_model_snapshot_paths.py --model stable-audio-3-medium --model stable-audio-3-medium-base --model stable-audio-3-small-music --model stable-audio-3-small-sfx --model same-l
+          "%REVIEWED_PYTHON%" scripts/release/export_model_snapshot_paths.py --model stable-audio-3-medium --model stable-audio-3-medium-base --model stable-audio-3-small-music --model stable-audio-3-small-sfx --model same-l
       - name: Select Git Bash
         shell: cmd
         run: |
@@ -4306,13 +4544,13 @@ jobs:
       - name: Materialize and verify the immutable snapshots
         shell: cmd
         run: |
-          python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt
+          "%REVIEWED_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt || exit /b 1
           set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
-          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-medium --snapshot "%SA3_MEDIUM_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-medium-base --snapshot "%SA3_MEDIUM_BASE_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music --snapshot "%SA3_SMALL_MUSIC_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-sfx --snapshot "%SA3_SMALL_SFX_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model same-l --snapshot "%SA3_SAME_L_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model stable-audio-3-medium --snapshot "%SA3_MEDIUM_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model stable-audio-3-medium-base --snapshot "%SA3_MEDIUM_BASE_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music --snapshot "%SA3_SMALL_MUSIC_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-sfx --snapshot "%SA3_SMALL_SFX_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model same-l --snapshot "%SA3_SAME_L_SNAPSHOT%" || exit /b 1
       - name: Run medium conformance on CUDA
         shell: cmd
         # sc-14546 moved `--test variant_binding` to `sa3-base-identity-cuda` (all six snapshots).
@@ -4502,10 +4740,23 @@ jobs:
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12
+        shell: cmd
+        run: |
+          uv python install 3.12.10 --managed-python --no-registry --no-bin --no-config || exit /b 1
+          for /f "delims=" %%P in ('uv python find 3.12.10 --managed-python --no-project --no-config') do set "REVIEWED_PYTHON=%%P"
+          if not defined REVIEWED_PYTHON exit /b 1
+          "%REVIEWED_PYTHON%" -c "import sys; assert sys.version_info[:3] == (3, 12, 10), sys.version" || exit /b 1
+          echo REVIEWED_PYTHON=%REVIEWED_PYTHON%>>"%GITHUB_ENV%"
       - name: Configure all six immutable Stable Audio 3 snapshot paths
         shell: cmd
         run: |
-          python scripts/release/export_model_snapshot_paths.py --model stable-audio-3-small-music --model stable-audio-3-small-sfx --model stable-audio-3-medium --model stable-audio-3-small-music-base --model stable-audio-3-small-sfx-base --model stable-audio-3-medium-base --model same-l
+          "%REVIEWED_PYTHON%" scripts/release/export_model_snapshot_paths.py --model stable-audio-3-small-music --model stable-audio-3-small-sfx --model stable-audio-3-medium --model stable-audio-3-small-music-base --model stable-audio-3-small-sfx-base --model stable-audio-3-medium-base --model same-l
       - name: Select Git Bash
         shell: cmd
         run: |
@@ -4525,17 +4776,17 @@ jobs:
       - name: Materialize and verify all six immutable snapshots
         shell: cmd
         run: |
-          python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt
+          "%REVIEWED_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt || exit /b 1
           set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
           rem The three `-base` entries carry `download_files` allow-lists, so the 6.4 GB of
           rem `svd_bases.pt` training pickles across them are not fetched.
-          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music --snapshot "%SA3_SMALL_MUSIC_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-sfx --snapshot "%SA3_SMALL_SFX_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-medium --snapshot "%SA3_MEDIUM_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music-base --snapshot "%SA3_SMALL_MUSIC_BASE_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-sfx-base --snapshot "%SA3_SMALL_SFX_BASE_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-medium-base --snapshot "%SA3_MEDIUM_BASE_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model same-l --snapshot "%SA3_SAME_L_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music --snapshot "%SA3_SMALL_MUSIC_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-sfx --snapshot "%SA3_SMALL_SFX_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model stable-audio-3-medium --snapshot "%SA3_MEDIUM_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music-base --snapshot "%SA3_SMALL_MUSIC_BASE_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-sfx-base --snapshot "%SA3_SMALL_SFX_BASE_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model stable-audio-3-medium-base --snapshot "%SA3_MEDIUM_BASE_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model same-l --snapshot "%SA3_SAME_L_SNAPSHOT%" || exit /b 1
       - name: Reject every cross-variant weight path and match the frozen-Torch sampler oracles
         shell: cmd
         run: |
@@ -4613,10 +4864,23 @@ jobs:
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12
+        shell: cmd
+        run: |
+          uv python install 3.12.10 --managed-python --no-registry --no-bin --no-config || exit /b 1
+          for /f "delims=" %%P in ('uv python find 3.12.10 --managed-python --no-project --no-config') do set "REVIEWED_PYTHON=%%P"
+          if not defined REVIEWED_PYTHON exit /b 1
+          "%REVIEWED_PYTHON%" -c "import sys; assert sys.version_info[:3] == (3, 12, 10), sys.version" || exit /b 1
+          echo REVIEWED_PYTHON=%REVIEWED_PYTHON%>>"%GITHUB_ENV%"
       - name: Configure both immutable small-base snapshot paths
         shell: cmd
         run: |
-          python scripts/release/export_model_snapshot_paths.py --model stable-audio-3-small-music-base --model stable-audio-3-small-sfx-base
+          "%REVIEWED_PYTHON%" scripts/release/export_model_snapshot_paths.py --model stable-audio-3-small-music-base --model stable-audio-3-small-sfx-base
       - name: Select Git Bash
         shell: cmd
         run: |
@@ -4636,10 +4900,10 @@ jobs:
       - name: Materialize and verify both immutable small-base snapshots
         shell: cmd
         run: |
-          python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt
+          "%REVIEWED_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt || exit /b 1
           set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
-          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music-base --snapshot "%SA3_SMALL_MUSIC_BASE_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-sfx-base --snapshot "%SA3_SMALL_SFX_BASE_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music-base --snapshot "%SA3_SMALL_MUSIC_BASE_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-sfx-base --snapshot "%SA3_SMALL_SFX_BASE_SNAPSHOT%" || exit /b 1
       - name: Run registered base provider conformance and re-calibrate both floors on CUDA
         shell: cmd
         run: |
@@ -4686,6 +4950,19 @@ jobs:
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12
+        shell: cmd
+        run: |
+          uv python install 3.12.10 --managed-python --no-registry --no-bin --no-config || exit /b 1
+          for /f "delims=" %%P in ('uv python find 3.12.10 --managed-python --no-project --no-config') do set "REVIEWED_PYTHON=%%P"
+          if not defined REVIEWED_PYTHON exit /b 1
+          "%REVIEWED_PYTHON%" -c "import sys; assert sys.version_info[:3] == (3, 12, 10), sys.version" || exit /b 1
+          echo REVIEWED_PYTHON=%REVIEWED_PYTHON%>>"%GITHUB_ENV%"
       - name: Select Git Bash
         shell: cmd
         run: |
@@ -4698,10 +4975,10 @@ jobs:
       - name: Materialize and verify immutable snapshots
         shell: cmd
         run: |
-          python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt
+          "%REVIEWED_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt || exit /b 1
           set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
-          python scripts/release/ensure_model_snapshot.py --model smollm2-135m-instruct --snapshot "%CANDLE_LLM_TEST_MODEL%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model qwen3-0.6b --snapshot "%CANDLE_LLM_QWEN3_MODEL%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model smollm2-135m-instruct --snapshot "%CANDLE_LLM_TEST_MODEL%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model qwen3-0.6b --snapshot "%CANDLE_LLM_QWEN3_MODEL%" || exit /b 1
       - name: Run representative conformance
         shell: cmd
         run: |
@@ -4724,6 +5001,19 @@ jobs:
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12
+        shell: cmd
+        run: |
+          uv python install 3.12.10 --managed-python --no-registry --no-bin --no-config || exit /b 1
+          for /f "delims=" %%P in ('uv python find 3.12.10 --managed-python --no-project --no-config') do set "REVIEWED_PYTHON=%%P"
+          if not defined REVIEWED_PYTHON exit /b 1
+          "%REVIEWED_PYTHON%" -c "import sys; assert sys.version_info[:3] == (3, 12, 10), sys.version" || exit /b 1
+          echo REVIEWED_PYTHON=%REVIEWED_PYTHON%>>"%GITHUB_ENV%"
       - name: Select Git Bash
         shell: cmd
         run: |
@@ -4740,8 +5030,8 @@ jobs:
             echo Missing repository variable CANDLE_MAGE_SNAPSHOT for the Windows CUDA runner.
             exit /b 1
           )
-          python --version
-          python scripts/release/ensure_model_snapshot.py --model mage-flow --snapshot "%CANDLE_MAGE_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" --version || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model mage-flow --snapshot "%CANDLE_MAGE_SNAPSHOT%" || exit /b 1
       - name: Exercise every advertised Mage memory rung
         shell: cmd
         run: |
@@ -4766,7 +5056,7 @@ jobs:
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'media'
     runs-on: [self-hosted, windows, cuda, real-weights]
     timeout-minutes: 120
-    needs: mlx-media
+    needs: [mlx-media, mage-seed-promotion-gate]
     env:
       Z_IMAGE_SNAPSHOT: ${{ vars.Z_IMAGE_SNAPSHOT }}
       # This is intentionally distinct from the macOS MAGE_SNAPSHOT path: repository variables
@@ -4787,6 +5077,19 @@ jobs:
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12
+        shell: cmd
+        run: |
+          uv python install 3.12.10 --managed-python --no-registry --no-bin --no-config || exit /b 1
+          for /f "delims=" %%P in ('uv python find 3.12.10 --managed-python --no-project --no-config') do set "REVIEWED_PYTHON=%%P"
+          if not defined REVIEWED_PYTHON exit /b 1
+          "%REVIEWED_PYTHON%" -c "import sys; assert sys.version_info[:3] == (3, 12, 10), sys.version" || exit /b 1
+          echo REVIEWED_PYTHON=%REVIEWED_PYTHON%>>"%GITHUB_ENV%"
       - name: Select Git Bash
         shell: cmd
         run: |
@@ -4796,6 +5099,10 @@ jobs:
         with:
           toolchain: 1.96.0
           components: rustfmt, clippy
+      - name: Require reviewed CPython 3.12
+        shell: cmd
+        run: |
+          "%REVIEWED_PYTHON%" -c "import sys; assert sys.version_info[:2] == (3, 12), sys.version" || exit /b 1
       - name: Download independent Candle Mage acceptance oracles
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -4815,22 +5122,22 @@ jobs:
       - name: Materialize and verify immutable snapshot
         shell: cmd
         run: |
-          python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt
+          "%REVIEWED_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt || exit /b 1
           set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
-          python scripts/release/ensure_model_snapshot.py --model z-image-turbo --snapshot "%Z_IMAGE_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model mage-flow --snapshot "%CANDLE_MAGE_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model mage-flow-edit --snapshot "%CANDLE_MAGE_EDIT_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model mage-flow-edit-base --snapshot "%CANDLE_MAGE_EDIT_BASE_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model mage-flow-edit-turbo --snapshot "%CANDLE_MAGE_EDIT_TURBO_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model z-image-turbo --snapshot "%Z_IMAGE_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model mage-flow --snapshot "%CANDLE_MAGE_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model mage-flow-edit --snapshot "%CANDLE_MAGE_EDIT_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model mage-flow-edit-base --snapshot "%CANDLE_MAGE_EDIT_BASE_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model mage-flow-edit-turbo --snapshot "%CANDLE_MAGE_EDIT_TURBO_SNAPSHOT%" || exit /b 1
       - name: Verify transferred Candle Mage acceptance oracles
         shell: cmd
         run: |
-          python scripts/release/verify_mage_candle_transfer.py --gen "%CANDLE_MAGE_SNAPSHOT%" --edit "%CANDLE_MAGE_EDIT_SNAPSHOT%" --edit-base "%CANDLE_MAGE_EDIT_BASE_SNAPSHOT%" --edit-turbo "%CANDLE_MAGE_EDIT_TURBO_SNAPSHOT%" --output "%MAGE_GOLDEN_DIR%" || exit /b 1
-          python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\mage-oracle-verify" -r .github/requirements/real-weights-mage-verify-windows-x64-py312.txt || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/verify_mage_candle_transfer.py --gen "%CANDLE_MAGE_SNAPSHOT%" --edit "%CANDLE_MAGE_EDIT_SNAPSHOT%" --edit-base "%CANDLE_MAGE_EDIT_BASE_SNAPSHOT%" --edit-turbo "%CANDLE_MAGE_EDIT_TURBO_SNAPSHOT%" --output "%MAGE_GOLDEN_DIR%" || exit /b 1
+          "%REVIEWED_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\mage-oracle-verify" -r .github/requirements/real-weights-mage-verify-windows-x64-py312.txt || exit /b 1
           set "PYTHONPATH=%RUNNER_TEMP%\mage-oracle-verify"
-          python scripts/release/provision_mage_oracles.py --snapshot "%CANDLE_MAGE_SNAPSHOT%" --edit-snapshot "%CANDLE_MAGE_EDIT_SNAPSHOT%" --output "%MAGE_GOLDEN_DIR%" --verify-edit-artifact || exit /b 1
-          python scripts/release/provision_mage_edit_variants.py --gen "%CANDLE_MAGE_SNAPSHOT%" --edit "%CANDLE_MAGE_EDIT_SNAPSHOT%" --edit-base "%CANDLE_MAGE_EDIT_BASE_SNAPSHOT%" --edit-turbo "%CANDLE_MAGE_EDIT_TURBO_SNAPSHOT%" --output "%MAGE_GOLDEN_DIR%" --verify-only || exit /b 1
-          python scripts/release/verify_mage_candle_oracles.py --snapshot "%CANDLE_MAGE_SNAPSHOT%" --edit-snapshot "%CANDLE_MAGE_EDIT_SNAPSHOT%" --output "%MAGE_GOLDEN_DIR%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/provision_mage_oracles.py --snapshot "%CANDLE_MAGE_SNAPSHOT%" --edit-snapshot "%CANDLE_MAGE_EDIT_SNAPSHOT%" --output "%MAGE_GOLDEN_DIR%" --verify-edit-artifact || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/provision_mage_edit_variants.py --gen "%CANDLE_MAGE_SNAPSHOT%" --edit "%CANDLE_MAGE_EDIT_SNAPSHOT%" --edit-base "%CANDLE_MAGE_EDIT_BASE_SNAPSHOT%" --edit-turbo "%CANDLE_MAGE_EDIT_TURBO_SNAPSHOT%" --output "%MAGE_GOLDEN_DIR%" --verify-only || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/verify_mage_candle_oracles.py --snapshot "%CANDLE_MAGE_SNAPSHOT%" --edit-snapshot "%CANDLE_MAGE_EDIT_SNAPSHOT%" --output "%MAGE_GOLDEN_DIR%" || exit /b 1
       - name: Run provider conformance
         shell: cmd
         run: |
@@ -4872,6 +5179,19 @@ jobs:
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12
+        shell: cmd
+        run: |
+          uv python install 3.12.10 --managed-python --no-registry --no-bin --no-config || exit /b 1
+          for /f "delims=" %%P in ('uv python find 3.12.10 --managed-python --no-project --no-config') do set "REVIEWED_PYTHON=%%P"
+          if not defined REVIEWED_PYTHON exit /b 1
+          "%REVIEWED_PYTHON%" -c "import sys; assert sys.version_info[:3] == (3, 12, 10), sys.version" || exit /b 1
+          echo REVIEWED_PYTHON=%REVIEWED_PYTHON%>>"%GITHUB_ENV%"
       - name: Select Git Bash
         shell: cmd
         run: |
@@ -4891,19 +5211,19 @@ jobs:
       - name: Materialize and verify immutable snapshots
         shell: cmd
         run: |
-          python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt
+          "%REVIEWED_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt || exit /b 1
           set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
-          python scripts/release/ensure_model_snapshot.py --model sdxl-base-1.0 --snapshot "%SDXL_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model clip-vit-large-patch14 --snapshot "%SDXL_TOKENIZER_CLIP_L_DIR%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model clip-vit-bigg-14-laion2b --snapshot "%SDXL_TOKENIZER_CLIP_BIGG_DIR%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model sdxl-vae-fp16-fix --snapshot "%SDXL_VAE_FP16_FIX_DIR%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model realvisxl-v5 --snapshot "%REALVISXL_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model ip-adapter-plus-sdxl-vit-h --snapshot "%IP_ADAPTER_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model sdxl-base-1.0 --snapshot "%SDXL_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model clip-vit-large-patch14 --snapshot "%SDXL_TOKENIZER_CLIP_L_DIR%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model clip-vit-bigg-14-laion2b --snapshot "%SDXL_TOKENIZER_CLIP_BIGG_DIR%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model sdxl-vae-fp16-fix --snapshot "%SDXL_VAE_FP16_FIX_DIR%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model realvisxl-v5 --snapshot "%REALVISXL_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model ip-adapter-plus-sdxl-vit-h --snapshot "%IP_ADAPTER_SNAPSHOT%" || exit /b 1
       - name: Stage synthetic source images
         shell: cmd
         run: |
-          python scripts/ci/make_test_image.py "%EDIT_SRC%" 768 768 || exit /b 1
-          python scripts/ci/make_test_image.py "%IP_REF%" 768 768 || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/ci/make_test_image.py "%EDIT_SRC%" 768 768 || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/ci/make_test_image.py "%IP_REF%" 768 768 || exit /b 1
       - name: Run SDXL real-weight renders
         shell: cmd
         run: |
@@ -4957,6 +5277,19 @@ jobs:
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12
+        shell: cmd
+        run: |
+          uv python install 3.12.10 --managed-python --no-registry --no-bin --no-config || exit /b 1
+          for /f "delims=" %%P in ('uv python find 3.12.10 --managed-python --no-project --no-config') do set "REVIEWED_PYTHON=%%P"
+          if not defined REVIEWED_PYTHON exit /b 1
+          "%REVIEWED_PYTHON%" -c "import sys; assert sys.version_info[:3] == (3, 12, 10), sys.version" || exit /b 1
+          echo REVIEWED_PYTHON=%REVIEWED_PYTHON%>>"%GITHUB_ENV%"
       - name: Select Git Bash
         shell: cmd
         run: |
@@ -4974,19 +5307,19 @@ jobs:
       - name: Materialize and verify immutable snapshots
         shell: cmd
         run: |
-          python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt
+          "%REVIEWED_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt || exit /b 1
           set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
           rem hkchengrex/MMAudio is a 54 GB repo (~46 GB of training checkpoints + weight variants the
           rem inference stack never loads); each catalog key carries a `download_files` allow-list so
           rem only the pinned checkpoint is fetched (~8 GB across the six components into one dir).
-          python scripts/release/ensure_model_snapshot.py --model synchformer --snapshot "%MMAUDIO_MMAUDIO_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model mmaudio-small-16k --snapshot "%MMAUDIO_MMAUDIO_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model mmaudio-large-44k-v2 --snapshot "%MMAUDIO_MMAUDIO_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model mmaudio-vae-16k --snapshot "%MMAUDIO_MMAUDIO_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model mmaudio-vae-44k --snapshot "%MMAUDIO_MMAUDIO_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model mmaudio-bigvgan-16k --snapshot "%MMAUDIO_MMAUDIO_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model dfn5b-clip-vit-h14-384 --snapshot "%MMAUDIO_CLIP_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model nvidia-bigvgan-v2-44khz-128band-512x --snapshot "%MMAUDIO_BIGVGAN_V2_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model synchformer --snapshot "%MMAUDIO_MMAUDIO_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model mmaudio-small-16k --snapshot "%MMAUDIO_MMAUDIO_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model mmaudio-large-44k-v2 --snapshot "%MMAUDIO_MMAUDIO_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model mmaudio-vae-16k --snapshot "%MMAUDIO_MMAUDIO_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model mmaudio-vae-44k --snapshot "%MMAUDIO_MMAUDIO_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model mmaudio-bigvgan-16k --snapshot "%MMAUDIO_MMAUDIO_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model dfn5b-clip-vit-h14-384 --snapshot "%MMAUDIO_CLIP_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model nvidia-bigvgan-v2-44khz-128band-512x --snapshot "%MMAUDIO_BIGVGAN_V2_SNAPSHOT%" || exit /b 1
       - name: Run mmaudio real-weight renders
         shell: cmd
         run: |

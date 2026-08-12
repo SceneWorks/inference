@@ -36,6 +36,19 @@ MACOS_MAGE_LOCK = (
     "crates/media/mlx-gen/_vendor/mage_flow/requirements-oracles.txt"
 )
 MACOS_INTERPRETER = "python3.12"
+WINDOWS_SETUP_ACTION = "astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e"
+WINDOWS_UV_VERSION = 'version: "0.12.3"'
+WINDOWS_UV_CACHE = "enable-cache: false"
+WINDOWS_UV_INSTALL = (
+    "uv python install 3.12.10 --managed-python --no-registry --no-bin --no-config "
+    "|| exit /b 1"
+)
+WINDOWS_UV_FIND = (
+    "for /f \"delims=\" %%P in ('uv python find 3.12.10 --managed-python "
+    "--no-project --no-config') do set \"REVIEWED_PYTHON=%%P\""
+)
+WINDOWS_PYTHON_EXPORT = 'echo REVIEWED_PYTHON=%REVIEWED_PYTHON%>>"%GITHUB_ENV%"'
+WINDOWS_INTERPRETER = r'"%REVIEWED_PYTHON%"'
 APPROVED_REAL_WEIGHT_LOCKS = {
     MACOS_HUB_LOCK,
     WINDOWS_HUB_LOCK,
@@ -306,6 +319,132 @@ def real_weight_macos_interpreter_errors(workflow: str) -> list[str]:
     return errors
 
 
+def real_weight_windows_interpreter_errors(workflow: str) -> list[str]:
+    """Pin every Windows real-weight Python command to the reviewed CPython 3.12.
+
+    The Windows wheel locks are platform- and interpreter-specific. A runner restart changed bare
+    ``python`` from 3.12 to 3.14, so pip selected cp314 wheels whose hashes correctly differed from
+    the reviewed cp312 lock. ``setup-python`` then blocked behind an operator-observed elevation
+    prompt, which unattended CI cannot satisfy. Guard the no-registry uv provisioning plus every
+    producer and consumer, not only pip: mixing interpreters around a shared ``PYTHONPATH`` is
+    equally unsafe. ``cmd`` also continues after a failed command, so every hash-locked install must
+    explicitly terminate the step.
+    """
+    errors: list[str] = []
+    interpreter = re.compile(
+        rf"({re.escape(WINDOWS_INTERPRETER)}|"
+        r"(?<![\w./$\"'-])py(?:\s+-\d+(?:\.\d+)?)?(?![\w-])|"
+        r"(?<![\w./$\"'-])python[0-9.]*(?:\.exe)?(?![\w-]))",
+        re.IGNORECASE,
+    )
+    setup_action = re.compile(
+        rf"\s*(?:-\s*)?uses:\s*{re.escape(WINDOWS_SETUP_ACTION)}\s*$"
+    )
+    setup_version = re.compile(rf"\s*{re.escape(WINDOWS_UV_VERSION)}\s*$")
+    setup_cache = re.compile(rf"\s*{re.escape(WINDOWS_UV_CACHE)}\s*$")
+    for job, lines in workflow_job_bodies(workflow).items():
+        runs_on = next((line for line in lines if line.startswith("    runs-on:")), "")
+        if "windows" not in runs_on.lower():
+            continue
+        setup_indices = [
+            index
+            for index, line in enumerate(lines)
+            if setup_action.fullmatch(line.split("#", 1)[0])
+        ]
+        if len(setup_indices) != 1:
+            errors.append(
+                f"{job}: expected exactly one pinned Windows setup-uv action, "
+                f"found {len(setup_indices)}"
+            )
+            setup_index = len(lines)
+        else:
+            setup_index = setup_indices[0]
+            setup_block = lines[setup_index : setup_index + 6]
+            if not any(
+                setup_version.fullmatch(line.split("#", 1)[0]) for line in setup_block
+            ):
+                errors.append(f"{job}: setup-uv must install exact uv 0.12.3")
+            if not any(
+                setup_cache.fullmatch(line.split("#", 1)[0]) for line in setup_block
+            ):
+                errors.append(f"{job}: setup-uv cache must remain disabled")
+        if any(
+            re.search(r"\buses:\s*actions/setup-python@", line.split("#", 1)[0])
+            for line in lines
+        ):
+            errors.append(
+                f"{job}: Windows jobs must not invoke the registry-dependent setup-python"
+            )
+
+        exact_commands = [line.split("#", 1)[0].strip() for line in lines]
+        install_indices = [
+            index for index, command in enumerate(exact_commands) if command == WINDOWS_UV_INSTALL
+        ]
+        find_indices = [
+            index for index, command in enumerate(exact_commands) if command == WINDOWS_UV_FIND
+        ]
+        export_indices = [
+            index
+            for index, command in enumerate(exact_commands)
+            if command == WINDOWS_PYTHON_EXPORT
+        ]
+        if len(install_indices) != 1:
+            errors.append(
+                f"{job}: expected exactly one fail-fast managed CPython 3.12.10 install, "
+                f"found {len(install_indices)}"
+            )
+        if len(find_indices) != 1:
+            errors.append(
+                f"{job}: expected exactly one managed CPython 3.12.10 path resolution, "
+                f"found {len(find_indices)}"
+            )
+        if len(export_indices) != 1:
+            errors.append(
+                f"{job}: expected exactly one reviewed Python path export, "
+                f"found {len(export_indices)}"
+            )
+        install_index = install_indices[0] if len(install_indices) == 1 else len(lines)
+        find_index = find_indices[0] if len(find_indices) == 1 else len(lines)
+        export_index = export_indices[0] if len(export_indices) == 1 else len(lines)
+        if not setup_index < install_index < find_index < export_index:
+            errors.append(
+                f"{job}: setup-uv, managed install, path resolution, and export are out of order"
+            )
+        for index, line in enumerate(lines):
+            command = line.split("#", 1)[0]
+            stripped = command.strip()
+            if stripped in {WINDOWS_UV_INSTALL, WINDOWS_UV_FIND}:
+                continue
+            found_interpreters = list(interpreter.finditer(command))
+            looks_like_python_command = bool(
+                re.search(r"\s-m\s+pip\b|scripts[/\\][^\s]+\.py\b", command, re.IGNORECASE)
+            )
+            if looks_like_python_command and WINDOWS_INTERPRETER not in command:
+                errors.append(
+                    f"{job}: Windows Python command must use {WINDOWS_INTERPRETER}: "
+                    f"{command.strip()!r}"
+                )
+            for found in found_interpreters:
+                name = found.group(1)
+                if name != WINDOWS_INTERPRETER:
+                    errors.append(
+                        f"{job}: Windows steps must name {WINDOWS_INTERPRETER}, found "
+                        f"{name!r} in {command.strip()!r}"
+                    )
+                elif index <= find_index:
+                    errors.append(
+                        f"{job}: Windows Python runs before the reviewed path is resolved: "
+                        f"{command.strip()!r}"
+                    )
+            if re.search(r"\s-m\s+pip\s+install\b", command, re.IGNORECASE) and not re.search(
+                r"\|\|\s+exit /b 1\s*$", command
+            ):
+                errors.append(
+                    f"{job}: Windows pip install must fail the cmd step: {command.strip()!r}"
+                )
+    return errors
+
+
 def real_weight_pip_policy_errors(workflow: str) -> list[str]:
     """Reject pip installs that can escape the reviewed wheel/hash inputs."""
     errors: list[str] = []
@@ -362,7 +501,7 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
             expected_lock = WINDOWS_MAGE_LOCK
         elif f"{MACOS_INTERPRETER} -m pip" in command:
             expected_lock = MACOS_HUB_LOCK
-        elif "python -m pip" in command:
+        elif f"{WINDOWS_INTERPRETER} -m pip" in command:
             expected_lock = WINDOWS_HUB_LOCK
         if expected_lock != lock:
             errors.append(
@@ -583,6 +722,91 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             line for line in workflow.splitlines() if not line.lstrip().startswith("#")
         )
         self.assertNotRegex(code, r"(?<![\w.])python3(?!\.12)(?![\w-])")
+
+    def test_real_weight_windows_steps_name_reviewed_cpython_and_fail_fast(self) -> None:
+        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        self.assertEqual(real_weight_windows_interpreter_errors(workflow), [])
+        windows_python_lines = [
+            line
+            for lines in workflow_job_bodies(workflow).values()
+            if any(
+                candidate.startswith("    runs-on:")
+                and "windows" in candidate.lower()
+                for candidate in lines
+            )
+            for line in lines
+            if WINDOWS_INTERPRETER in line and not line.lstrip().startswith("#")
+        ]
+        self.assertEqual(len(windows_python_lines), 76)
+        self.assertEqual(workflow.count(f"uses: {WINDOWS_SETUP_ACTION}"), 11)
+        self.assertEqual(workflow.count(WINDOWS_UV_VERSION), 11)
+        self.assertEqual(workflow.count(WINDOWS_UV_CACHE), 11)
+        self.assertEqual(workflow.count(WINDOWS_UV_INSTALL), 11)
+        self.assertEqual(workflow.count(WINDOWS_UV_FIND), 11)
+        self.assertEqual(workflow.count(WINDOWS_PYTHON_EXPORT), 11)
+        self.assertIn(
+            f'{WINDOWS_INTERPRETER} -c "import sys; assert sys.version_info[:3] == (3, 12, 10), sys.version"',
+            workflow,
+        )
+        pip_installs = [
+            line.strip()
+            for line in windows_python_lines
+            if f"{WINDOWS_INTERPRETER} -m pip install" in line
+        ]
+        self.assertEqual(len(pip_installs), 11)
+        for install in pip_installs:
+            self.assertRegex(install, r"\|\|\s+exit /b 1$")
+        for replacement in ("python", "py", "py -3.14"):
+            with self.subTest(replacement=replacement):
+                mutated = workflow.replace(WINDOWS_INTERPRETER, replacement, 1)
+                self.assertTrue(real_weight_windows_interpreter_errors(mutated))
+        first_windows_install = pip_installs[0]
+        no_fail_fast = workflow.replace(
+            first_windows_install, first_windows_install.removesuffix(" || exit /b 1"), 1
+        )
+        self.assertTrue(real_weight_windows_interpreter_errors(no_fail_fast))
+        whitespace_install_without_fail_fast = first_windows_install.replace(
+            "pip install", "pip  install", 1
+        ).removesuffix(" || exit /b 1")
+        whitespace_bypass = workflow.replace(
+            first_windows_install, whitespace_install_without_fail_fast, 1
+        )
+        self.assertNotEqual(whitespace_bypass, workflow)
+        self.assertTrue(real_weight_windows_interpreter_errors(whitespace_bypass))
+        missing_setup = workflow.replace(f"uses: {WINDOWS_SETUP_ACTION}", "uses: missing", 1)
+        self.assertTrue(real_weight_windows_interpreter_errors(missing_setup))
+        wrong_version = workflow.replace(WINDOWS_UV_VERSION, 'version: "0.99.0"', 1)
+        self.assertTrue(real_weight_windows_interpreter_errors(wrong_version))
+        provisioning_mutations = {
+            "wrong Python": WINDOWS_UV_INSTALL.replace("3.12.10", "3.14.0"),
+            "registry mutation allowed": WINDOWS_UV_INSTALL.replace(" --no-registry", ""),
+            "launcher mutation allowed": WINDOWS_UV_INSTALL.replace(" --no-bin", ""),
+            "system Python allowed": WINDOWS_UV_FIND.replace(" --managed-python", ""),
+        }
+        for name, replacement in provisioning_mutations.items():
+            with self.subTest(provisioning_mutation=name):
+                mutated = workflow.replace(
+                    WINDOWS_UV_INSTALL
+                    if replacement.startswith("uv python install")
+                    else WINDOWS_UV_FIND,
+                    replacement,
+                    1,
+                )
+                self.assertTrue(real_weight_windows_interpreter_errors(mutated))
+        cache_enabled = workflow.replace(WINDOWS_UV_CACHE, "enable-cache: true", 1)
+        self.assertTrue(real_weight_windows_interpreter_errors(cache_enabled))
+        wrong_setup_comment_decoy = workflow.replace(
+            f"uses: {WINDOWS_SETUP_ACTION}",
+            f"uses: astral-sh/setup-uv@{'0' * 40} # uses: {WINDOWS_SETUP_ACTION}",
+            1,
+        )
+        self.assertTrue(real_weight_windows_interpreter_errors(wrong_setup_comment_decoy))
+        wrong_version_comment_decoy = workflow.replace(
+            WINDOWS_UV_VERSION,
+            f'version: "0.99.0" # {WINDOWS_UV_VERSION}',
+            1,
+        )
+        self.assertTrue(real_weight_windows_interpreter_errors(wrong_version_comment_decoy))
 
     def test_real_weight_macos_interpreter_policy_discriminates_mutations(self) -> None:
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
@@ -894,6 +1118,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
 
     def test_mage_media_lane_requires_verified_operator_cpu_oracles(self) -> None:
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        mlx_media = "\n".join(workflow_job_bodies(workflow)["mlx-media"])
         self.assertIn('MAGE_REQUIRE_GOLDENS: "1"', workflow)
         self.assertIn(
             'echo "MAGE_GOLDEN_DIR=$RUNNER_TEMP/mage-flow-oracles" >> "$GITHUB_ENV"',
@@ -912,7 +1137,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             "UV_PYTHON_INSTALL_DIR: ${{ runner.temp }}/python-install",
             workflow,
         )
-        self.assertNotIn("uses: actions/setup-python", workflow)
+        self.assertNotIn("uses: actions/setup-python", mlx_media)
         self.assertNotIn("3.12.11", workflow)
         self.assertIn("Run Mage-Flow text-encoder parity", workflow)
         self.assertIn("Run Mage-VAE all-geometry parity", workflow)
@@ -930,27 +1155,104 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             "MAGE_ORACLE_SEED_DIR: ${{ vars.MAGE_ORACLE_SEED_DIR }}",
             workflow,
         )
+        seed_import = workflow[
+            workflow.index("\n      - name: Require operator-provisioned Mage oracle seed") :
+            workflow.index("\n      - name: Require an uncached operator seed")
+        ]
+        self.assertIn("mage_flow_e2e_golden.png", seed_import)
+        self.assertIn("mage_flow_edit_golden.png", seed_import)
         self.assertIn("migrate_mage_edit_variant_manifest:", workflow)
         self.assertIn(
             "default: false",
             workflow[workflow.index("migrate_mage_edit_variant_manifest:") :],
         )
-        migration = workflow[
-            workflow.index("\n      - name: Migrate only the copied Mage edit-variant manifest") :
-            workflow.index(
-                "\n      - name: Verify restored or operator-provisioned Mage oracle cache"
-            )
-        ]
+        self.assertIn(
+            "Converge and durably certify the exact Mage manifest pair on the active rw-mage seed",
+            workflow,
+        )
+        self.assertIn(
+            "mage_seed_slot: [single]",
+            workflow,
+        )
+        recovery_index = workflow.index(
+            "\n      - name: Recover any interrupted persistent Mage seed promotion"
+        )
+        restore_index = workflow.index("\n      - name: Restore verified Mage oracle cache")
+        seed_index = workflow.index(
+            "\n      - name: Require operator-provisioned Mage oracle seed"
+        )
+        self.assertLess(recovery_index, restore_index)
+        self.assertLess(restore_index, seed_index)
+        restore = workflow[restore_index:seed_index]
+        self.assertIn("id: mage-oracle-cache", restore)
+        self.assertIn("github.event_name != 'workflow_dispatch'", restore)
+        self.assertIn("inputs.profile != 'media'", restore)
+        self.assertIn("inputs.migrate_mage_edit_variant_manifest != true", restore)
+        recovery = workflow[recovery_index:restore_index]
+        self.assertIn("scripts/release/promote_mage_oracle_seed.py", recovery)
+        self.assertIn("--recover-only", recovery)
+        self.assertIn("id: mage-seed-recovery", recovery)
+        self.assertIn('--runner-name "$RUNNER_NAME"', recovery)
+        self.assertIn('--slot "${{ matrix.mage_seed_slot }}"', recovery)
+        self.assertIn('--revision "$GITHUB_SHA"', recovery)
+        self.assertIn('echo "completed=true" >> "$GITHUB_OUTPUT"', recovery)
+        prepare_index = workflow.index("\n      - name: Prepare pinned Mage reference environment")
+        classify_index = workflow.index("\n      - name: Classify the copied Mage manifest pair")
+        migration_index = workflow.index(
+            "\n      - name: Migrate only the copied Mage edit-variant manifest"
+        )
+        verify_index = workflow.index(
+            "\n      - name: Verify restored or operator-provisioned Mage oracle cache"
+        )
+        self.assertLess(prepare_index, classify_index)
+        self.assertLess(classify_index, migration_index)
+        self.assertLess(migration_index, verify_index)
+        preparation = workflow[prepare_index:classify_index]
+        self.assertIn('python -m venv "$RUNNER_TEMP/mage-reference"', preparation)
+        self.assertIn(
+            '"$RUNNER_TEMP/mage-reference/bin/python" -m pip install', preparation
+        )
+        self.assertIn("requirements-oracles.txt", preparation)
+        classification = workflow[classify_index:migration_index]
+        self.assertIn("id: mage-seed-state", classification)
+        self.assertIn("provision_mage_edit_variants.py", classification)
+        self.assertIn("verify_mage_candle_transfer.py", classification)
+        self.assertIn('echo "current=true" >> "$GITHUB_OUTPUT"', classification)
+        self.assertIn('echo "current=false" >> "$GITHUB_OUTPUT"', classification)
+        migration = workflow[migration_index:verify_index]
         self.assertIn("inputs.profile == 'media'", migration)
         self.assertIn("inputs.migrate_mage_edit_variant_manifest", migration)
+        self.assertIn(
+            "steps.mage-seed-recovery.outputs.completed != 'true'", migration
+        )
+        self.assertIn("steps.mage-seed-state.outputs.current != 'true'", migration)
         self.assertIn('golden_root="$(cd "$MAGE_GOLDEN_DIR" && pwd -P)"', migration)
         self.assertIn('runner_root="$(cd "$RUNNER_TEMP" && pwd -P)"', migration)
         self.assertIn('seed_root="$(cd "$MAGE_ORACLE_SEED_DIR" && pwd -P)"', migration)
         self.assertIn('"$golden_root" != "$runner_root/"*', migration)
         self.assertIn('"$golden_root" == "$seed_root"', migration)
         self.assertIn(" -ef ", migration)
+        self.assertIn('"$RUNNER_TEMP/mage-reference/bin/python"', migration)
+        self.assertNotIn("python3.12 scripts/release/provision_mage_edit_variants.py", migration)
         self.assertIn("--migrate-reference-environment-manifest-only", migration)
+        self.assertIn("--migrate-edit-variant-manifest-hash-only", migration)
+        self.assertIn('transfer_links="$(stat -f \'%l\' "$transfer_manifest")"', migration)
+        self.assertIn('"$transfer_links" != "1"', migration)
         self.assertNotIn("dump_mage_flow_golden.py", migration)
+        precondition_index = workflow.index(
+            "\n      - name: Require an uncached operator seed for durable Mage certification"
+        )
+        self.assertLess(seed_index, precondition_index)
+        self.assertLess(precondition_index, migration_index)
+        precondition = workflow[precondition_index:migration_index]
+        self.assertIn("steps.mage-oracle-cache.outputs.cache-hit", precondition)
+        self.assertIn("steps.mage-oracle-seed.outputs.imported", precondition)
+        seed_import = workflow[seed_index:precondition_index]
+        self.assertIn('echo "edit-sha=$edit_sha"', seed_import)
+        self.assertIn(
+            'echo "transfer-sha=$transfer_sha"', seed_import
+        )
+        self.assertIn('} >> "$GITHUB_OUTPUT"', seed_import)
         self.assertIn("refusing to run the multi-hour CPU producer", workflow)
         self.assertNotIn("Regenerate and verify shared CPU Mage oracles", workflow)
         self.assertIn(
@@ -968,6 +1270,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             "scripts/release/mage_reference_environment.py",
             "scripts/release/provision_mage_oracles.py",
             "scripts/release/provision_mage_edit_variants.py",
+            "scripts/release/promote_mage_oracle_seed.py",
             "scripts/release/verify_mage_candle_oracles.py",
             "scripts/release/verify_mage_candle_transfer.py",
         ):
@@ -991,11 +1294,71 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("--verify-edit-artifact", workflow)
         self.assertNotIn("--write-manifest", workflow)
         self.assertIn("mage_candle_oracles_manifest.json", workflow)
-        self.assertGreaterEqual(workflow.count("--edit-snapshot \"$MAGE_EDIT_SNAPSHOT\""), 3)
-        self.assertEqual(workflow.count("--gen \"$MAGE_SNAPSHOT\""), 3)
+        self.assertGreaterEqual(workflow.count("--edit-snapshot \"$MAGE_EDIT_SNAPSHOT\""), 6)
+        self.assertEqual(workflow.count("--gen \"$MAGE_SNAPSHOT\""), 8)
+        provider_index = workflow.index("\n      - name: Run provider conformance")
+        edit_parity_index = workflow.index(
+            "\n      - name: Run Mage-Flow instruction-edit parity"
+        )
+        promote_index = workflow.index(
+            "\n      - name: Atomically promote the verified Mage manifests"
+        )
+        persistent_verify_index = workflow.index(
+            "\n      - name: Verify the promoted persistent Mage oracle seed"
+        )
+        receipt_index = workflow.index(
+            "\n      - name: Upload persistent Mage seed promotion receipt"
+        )
+        cache_save_index = workflow.index("\n      - name: Save verified Mage oracle cache")
+        edit_upload_index = workflow.index("\n      - name: Upload verified Mage edit oracle")
+        self.assertLess(provider_index, edit_parity_index)
+        self.assertLess(edit_parity_index, promote_index)
+        self.assertLess(promote_index, persistent_verify_index)
+        self.assertLess(persistent_verify_index, receipt_index)
+        self.assertLess(receipt_index, cache_save_index)
+        self.assertLess(cache_save_index, edit_upload_index)
+        promotion = workflow[promote_index:persistent_verify_index]
+        self.assertIn(
+            "steps.mage-seed-recovery.outputs.completed != 'true'", promotion
+        )
+        for argument in (
+            "--source \"$MAGE_GOLDEN_DIR\"",
+            "--seed \"$MAGE_ORACLE_SEED_DIR\"",
+            "steps.mage-oracle-seed.outputs.edit-sha",
+            "steps.mage-oracle-seed.outputs.transfer-sha",
+            "--runner-name \"$RUNNER_NAME\"",
+            "--slot \"${{ matrix.mage_seed_slot }}\"",
+            "--revision \"$GITHUB_SHA\"",
+            "--allow-already-current",
+        ):
+            self.assertIn(argument, promotion)
+        persistent_verify = workflow[persistent_verify_index:receipt_index]
+        self.assertEqual(persistent_verify.count('--output "$MAGE_ORACLE_SEED_DIR"'), 5)
+        self.assertIn(
+            "mage-seed-promotion-${{ matrix.mage_seed_slot }}-${{ github.sha }}",
+            workflow[receipt_index:cache_save_index],
+        )
+        cache_save = workflow[cache_save_index:edit_upload_index]
+        self.assertIn("inputs.migrate_mage_edit_variant_manifest != true", cache_save)
+        self.assertNotIn("matrix.mage_seed_slot != 'secondary'", workflow)
+        promotion_gate_index = workflow.index("\n  mage-seed-promotion-gate:")
+        qwen_index = workflow.index("\n  # sc-17284", promotion_gate_index)
+        promotion_gate = workflow[promotion_gate_index:qwen_index]
+        self.assertIn("needs: mlx-media", promotion_gate)
+        self.assertIn("if: always()", promotion_gate)
+        self.assertIn("needs.mlx-media.result", promotion_gate)
+        self.assertIn("merge-multiple: true", promotion_gate)
+        self.assertIn("--verify-receipts", promotion_gate)
+        self.assertIn("--revision \"$GITHUB_SHA\"", promotion_gate)
+        self.assertIn("Require the exact-run Mage seed certification", promotion_gate)
+        candle_media_index = workflow.index("\n  candle-media:")
+        self.assertIn(
+            "needs: [mlx-media, mage-seed-promotion-gate]",
+            workflow[candle_media_index:],
+        )
         self.assertLess(
             workflow.index("Verify restored or operator-provisioned Mage oracle cache"),
-            workflow.index("Save verified Mage oracle cache"),
+            cache_save_index,
         )
         self.assertIn("mage-flow-candle-oracles-${{ github.sha }}", workflow)
         self.assertIn("mage_edit_oracle_manifest.json", workflow)
@@ -1111,6 +1474,144 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         ]
         self.assertGreater(len(requirement_lines), 12)
         self.assertTrue(all(line.endswith(" \\") for line in requirement_lines))
+
+    def test_withdrawn_or_gated_media_models_materialize_from_exact_public_mirrors(self) -> None:
+        models = {
+            model["key"]: model
+            for model in tomllib.loads(MODEL_MANIFEST.read_text(encoding="utf-8"))["models"]
+        }
+        expected = {
+            "flux-1-dev": (
+                "black-forest-labs/FLUX.1-dev",
+                "3de623fc3c33e44ffbe2bad470d0f45bccf2eb21",
+                "SceneWorks/flux1-dev-mlx",
+                "323fd12d79f78ad444e882e8d8e871914584f2b9",
+                "bf16",
+            ),
+            "mage-flow": (
+                "microsoft/Mage-Flow",
+                "faca09c18c1c19458e7fbc3f7bce6f7a7d4d01a9",
+                "SceneWorks/Mage-Flow",
+                "5f6455818d8ca80ce780e9c01b9e0de1d8c5f9db",
+                None,
+            ),
+            "mage-flow-edit": (
+                "microsoft/Mage-Flow-Edit",
+                "b01d524f86498b7dabcc4b3572c6d264d786a16e",
+                "SceneWorks/Mage-Flow-Edit",
+                "dbd4a9c07faca94491ad88ab21225d62e054d9cc",
+                None,
+            ),
+            "mage-flow-edit-base": (
+                "microsoft/Mage-Flow-Edit-Base",
+                "8654a7bc0283ab2946385230b5b2eb944e0b76ea",
+                "SceneWorks/Mage-Flow-Edit-Base",
+                "6c119cdac7ce7cf8c1ab4990d9c8ca18641f2c5d",
+                None,
+            ),
+            "mage-flow-edit-turbo": (
+                "microsoft/Mage-Flow-Edit-Turbo",
+                "14427bd7627d3a25436497a5939e1096f6a0d523",
+                "SceneWorks/Mage-Flow-Edit-Turbo",
+                "75c11a2957aca2c78272984375502105b2b235ab",
+                None,
+            ),
+        }
+        mage_download_files = [
+            "model_index.json",
+            "scheduler/*",
+            "text_encoder/*",
+            "transformer/*",
+            "vae/*",
+        ]
+        mage_materialization_files = [
+            "model_index.json",
+            "scheduler/scheduler_config.json",
+            "text_encoder/.gitattributes",
+            "text_encoder/README.md",
+            "text_encoder/chat_template.json",
+            "text_encoder/config.json",
+            "text_encoder/generation_config.json",
+            "text_encoder/merges.txt",
+            "text_encoder/model-00001-of-00002.safetensors",
+            "text_encoder/model-00002-of-00002.safetensors",
+            "text_encoder/model.safetensors.index.json",
+            "text_encoder/preprocessor_config.json",
+            "text_encoder/tokenizer.json",
+            "text_encoder/tokenizer_config.json",
+            "text_encoder/video_preprocessor_config.json",
+            "text_encoder/vocab.json",
+            "transformer/config.json",
+            "transformer/diffusion_pytorch_model.safetensors",
+            "vae/config.json",
+            "vae/diffusion_pytorch_model.safetensors",
+        ]
+        flux_materialization_files = [
+            "LICENSE.md",
+            "model_index.json",
+            "scheduler/scheduler_config.json",
+            "text_encoder/config.json",
+            "text_encoder/model.safetensors",
+            "text_encoder_2/config.json",
+            "text_encoder_2/model-00001-of-00002.safetensors",
+            "text_encoder_2/model-00002-of-00002.safetensors",
+            "text_encoder_2/model.safetensors.index.json",
+            "tokenizer/merges.txt",
+            "tokenizer/special_tokens_map.json",
+            "tokenizer/tokenizer_config.json",
+            "tokenizer/vocab.json",
+            "tokenizer_2/special_tokens_map.json",
+            "tokenizer_2/spiece.model",
+            "tokenizer_2/tokenizer.json",
+            "tokenizer_2/tokenizer_config.json",
+            "transformer/config.json",
+            "transformer/diffusion_pytorch_model-00001-of-00003.safetensors",
+            "transformer/diffusion_pytorch_model-00002-of-00003.safetensors",
+            "transformer/diffusion_pytorch_model-00003-of-00003.safetensors",
+            "transformer/diffusion_pytorch_model.safetensors.index.json",
+            "vae/config.json",
+            "vae/diffusion_pytorch_model.safetensors",
+        ]
+        for key, (
+            canonical_repo,
+            canonical_rev,
+            mirror_repo,
+            mirror_rev,
+            prefix,
+        ) in expected.items():
+            with self.subTest(key=key):
+                model = models[key]
+                self.assertEqual(model["repository"], canonical_repo)
+                self.assertEqual(model["revision"], canonical_rev)
+                self.assertEqual(model["materialization_repository"], mirror_repo)
+                self.assertEqual(model["materialization_revision"], mirror_rev)
+                self.assertEqual(model.get("materialization_path_prefix"), prefix)
+                self.assertNotIn("materialization_requires_auth", model)
+                if key.startswith("mage-flow"):
+                    self.assertEqual(model["download_files"], mage_download_files)
+                    self.assertEqual(
+                        model["materialization_expected_files"], mage_materialization_files
+                    )
+                    self.assertFalse(
+                        any(
+                            pattern.startswith(("bf16/", "q4/", "q8/"))
+                            for pattern in model["download_files"]
+                        )
+                    )
+                else:
+                    self.assertEqual(
+                        model["materialization_expected_files"], flux_materialization_files
+                    )
+
+        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        self.assertEqual(workflow.count("--require-materialization-provenance"), 6)
+        mac_start = workflow.index("  mlx-request-memory-scope:")
+        windows_start = workflow.index("  candle-mage-memory-ladder:")
+        self.assertEqual(
+            workflow[mac_start:windows_start].count("--require-materialization-provenance"),
+            6,
+        )
+        self.assertNotIn("--require-materialization-provenance", workflow[windows_start:])
 
     def test_residency_ab_is_operator_run_without_ci_model_dependencies(self) -> None:
         """The CUDA residency A/B stays operator-run — gated directly, not by variable name.
