@@ -6,6 +6,7 @@
 //! - [Paper](https://arxiv.org/abs/1512.03385)
 //!
 use super::conv::{conv2d, Conv2d};
+use super::DenseGroupNorm;
 use candle_core::{Result, Tensor, D};
 use candle_gen::train::lora::{lora_linear_detect, LoraLinear};
 use candle_nn as nn;
@@ -47,9 +48,9 @@ impl Default for ResnetBlock2DConfig {
 
 #[derive(Debug)]
 pub struct ResnetBlock2D {
-    norm1: nn::GroupNorm,
+    norm1: DenseGroupNorm,
     conv1: Conv2d,
-    norm2: nn::GroupNorm,
+    norm2: DenseGroupNorm,
     conv2: Conv2d,
     // sc-9416: the `time_emb_proj` Linear packed-detects (the MLX SDXL tiers pack
     // `resnets.*.time_emb_proj`); the surrounding convs/norms stay dense. Dense checkpoints have no
@@ -88,10 +89,10 @@ impl ResnetBlock2D {
             dilation: 1,
             cudnn_fwd_algo: None,
         };
-        let norm1 = nn::group_norm(config.groups, in_channels, config.eps, vs.pp("norm1"))?;
+        let norm1 = DenseGroupNorm::new(config.groups, in_channels, config.eps, vs.pp("norm1"))?;
         let conv1 = conv2d(in_channels, out_channels, 3, conv_cfg, vs.pp("conv1"))?;
         let groups_out = config.groups_out.unwrap_or(config.groups);
-        let norm2 = nn::group_norm(groups_out, out_channels, config.eps, vs.pp("norm2"))?;
+        let norm2 = DenseGroupNorm::new(groups_out, out_channels, config.eps, vs.pp("norm2"))?;
         let conv2 = conv2d(out_channels, out_channels, 3, conv_cfg, vs.pp("conv2"))?;
         let use_in_shortcut = config
             .use_in_shortcut
@@ -170,6 +171,11 @@ impl ResnetBlock2D {
             f(time_emb_proj)?;
         }
         Ok(())
+    }
+
+    pub(crate) fn move_norms_to(&mut self, device: &candle_core::Device) -> Result<()> {
+        self.norm1.to_device(device)?;
+        self.norm2.to_device(device)
     }
 
     /// Visit this resnet's convolutions (`conv1`, `conv2`, and the optional `conv_shortcut`) so a

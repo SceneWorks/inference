@@ -27,6 +27,69 @@ mod unet_2d;
 mod unet_2d_blocks;
 mod vae_encode;
 
+use candle_core::{Device, Result, Tensor};
+use candle_nn::{self as nn, Module};
+
+/// GroupNorm wrapper that retains its affine tensors so a CPU-staged imported UNet can migrate only
+/// the dense-kept leaves after its Linears have been folded directly onto the compute device.
+#[derive(Clone, Debug)]
+struct DenseGroupNorm {
+    inner: nn::GroupNorm,
+    weight: Tensor,
+    bias: Tensor,
+    num_channels: usize,
+    num_groups: usize,
+    eps: f64,
+}
+
+impl DenseGroupNorm {
+    fn new(num_groups: usize, num_channels: usize, eps: f64, vb: nn::VarBuilder) -> Result<Self> {
+        let weight = vb.get_with_hints(num_channels, "weight", nn::Init::Const(1.0))?;
+        let bias = vb.get_with_hints(num_channels, "bias", nn::Init::Const(0.0))?;
+        let inner =
+            nn::GroupNorm::new(weight.clone(), bias.clone(), num_channels, num_groups, eps)?;
+        Ok(Self {
+            inner,
+            weight,
+            bias,
+            num_channels,
+            num_groups,
+            eps,
+        })
+    }
+
+    fn to_device(&mut self, device: &Device) -> Result<()> {
+        self.weight = self.weight.to_device(device)?;
+        self.bias = self.bias.to_device(device)?;
+        self.inner = nn::GroupNorm::new(
+            self.weight.clone(),
+            self.bias.clone(),
+            self.num_channels,
+            self.num_groups,
+            self.eps,
+        )?;
+        Ok(())
+    }
+}
+
+impl Module for DenseGroupNorm {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        self.inner.forward(xs)
+    }
+}
+
+fn layer_norm_to_device(norm: &mut nn::LayerNorm, device: &Device) -> Result<()> {
+    let weight = norm.weight().to_device(device)?;
+    let bias = norm.bias().map(|bias| bias.to_device(device)).transpose()?;
+    *norm = match (norm.remove_mean(), bias) {
+        (true, Some(bias)) => nn::LayerNorm::new(weight, bias, norm.eps()),
+        (true, None) => nn::LayerNorm::new_no_bias(weight, norm.eps()),
+        (false, None) => nn::LayerNorm::rms_norm(weight, norm.eps()),
+        (false, Some(_)) => unreachable!("RMSNorm cannot carry a bias"),
+    };
+    Ok(())
+}
+
 pub use controlnet::{ControlNet, ControlNetConfig, ControlResiduals};
 // The canonical SDXL UNet sub-config, shared by the InstantID UNet loader (sc-5491) and the Kolors
 // IP-Adapter provider (sc-5488), which loads the SDXL-family Kolors UNet into this vendored stack.

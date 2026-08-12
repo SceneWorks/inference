@@ -268,6 +268,15 @@ pub struct SdxlGenerator {
     /// behind an `Arc` (model-agnostic); `lock_recover` mirrors the components-cache poison recovery.
     tokenizers: Mutex<Option<Arc<pipeline::SdxlTokenizers>>>,
     ldm: Option<Arc<ldm::LdmComponents>>,
+    /// Exact source token retained for the lifetime of an imported fused checkpoint. The checkpoint
+    /// is split eagerly, but retaining the token keeps deferred component/adaptor materialization
+    /// tied to the same caller-prepared identity.
+    _ldm_source_pin: Option<gen_core::PinnedWeightsFile>,
+    /// Complete prepared-file set, reused when the lazy UNet/VAE + adapter component cache fills.
+    file_pin_spec: LoadSpec,
+    /// Real load-time affine fold for an imported fused checkpoint. Snapshot directories select
+    /// their packed tier on disk and leave this unset.
+    quant: Option<Quant>,
 }
 
 impl SdxlGenerator {
@@ -290,7 +299,9 @@ impl SdxlGenerator {
                 return Ok(comps.clone());
             }
         }
-        let comps = pipe.load_components(flash)?;
+        let comps = self
+            .file_pin_spec
+            .read_prepared_files_unchanged(|| pipe.load_components(flash))?;
         *guard = Some((flash, comps.clone()));
         Ok(comps)
     }
@@ -300,11 +311,13 @@ impl SdxlGenerator {
     /// them once here removes the tens-of-ms `tokenizer.json` re-parse the per-encode load did. The
     /// shared [`candle_gen::cached`] read-through recovers a poisoned lock internally (the F-031 idiom).
     fn tokenizers(&self) -> gen_core::Result<Arc<pipeline::SdxlTokenizers>> {
-        candle_gen::cached(&self.tokenizers, || {
-            Ok(Arc::new(pipeline::SdxlTokenizers::load(
-                &self.component_paths.tokenizer_clip_l,
-                &self.component_paths.tokenizer_clip_bigg,
-            )?))
+        self.file_pin_spec.read_prepared_files_unchanged(|| {
+            candle_gen::cached(&self.tokenizers, || {
+                Ok(Arc::new(pipeline::SdxlTokenizers::load(
+                    &self.component_paths.tokenizer_clip_l,
+                    &self.component_paths.tokenizer_clip_bigg,
+                )?))
+            })
         })
     }
 }
@@ -380,6 +393,7 @@ impl Generator for SdxlGenerator {
             self.pid_spec.clone(),
             self.component_paths.vae_fp16_fix.clone(),
             self.ldm.clone(),
+            self.quant,
         )?;
         // Encode text FIRST (loads + frees CLIP) so the cold-call ordering — CLIP gone before the
         // UNet/VAE are resident — is preserved (sc-4987); only then acquire the cached UNet/VAE
@@ -516,17 +530,31 @@ pub fn descriptor() -> ModelDescriptor {
 /// PEFT/kohya LoKr are supported; an adapter that matches no UNet target errors at that first
 /// `generate` rather than rendering an unadapted image silently.
 pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    spec.validate_prepared_file_pins()?;
     // Validate the model-agnostic staged components before opening a potentially multi-gigabyte
     // fused checkpoint.
     let component_paths = SdxlComponents::from_spec(spec, MODEL_ID)?;
-    let (root, ldm) = match &spec.weights {
-        WeightsSource::Dir(p) => (p.clone(), None),
-        WeightsSource::File(file) => (
-            file.parent()
-                .unwrap_or_else(|| Path::new("."))
-                .to_path_buf(),
-            Some(Arc::new(ldm::split_ldm_checkpoint(file)?)),
-        ),
+    if matches!(spec.weights, WeightsSource::File(_)) && matches!(spec.quantize, Some(Quant::Nvfp4))
+    {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{MODEL_ID}: imported fused checkpoints support Q4/Q8 affine tiers, not NVFP4"
+        )));
+    }
+    let (root, ldm, ldm_source_pin) = match &spec.weights {
+        WeightsSource::Dir(p) => (p.clone(), None, None),
+        WeightsSource::File(file) => {
+            let pin = spec
+                .weights_file_pin()?
+                .expect("File weights must resolve to a pin");
+            let components = pin.read_unchanged(ldm::split_ldm_checkpoint)?;
+            (
+                file.parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .to_path_buf(),
+                Some(Arc::new(components)),
+                Some(pin),
+            )
+        }
     };
     // epic 13657 (sc-13663) load gate: resolve + validate the three passed-in components
     // (`tokenizer_clip_l` / `tokenizer_clip_bigg` / `vae_fp16_fix`) before any work — a missing one is
@@ -548,7 +576,10 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         pid_spec: spec.pid.clone(),
         components: Mutex::new(None),
         tokenizers: Mutex::new(None),
+        quant: ldm.as_ref().and(spec.quantize),
         ldm,
+        _ldm_source_pin: ldm_source_pin,
+        file_pin_spec: spec.clone(),
     }))
 }
 
@@ -564,6 +595,14 @@ pub fn register_providers(
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(REGISTRATION)
+        .register_imported_model(gen_core::ImportedModelRegistration {
+            family: "sdxl",
+            source: gen_core::ImportedModelSource::FusedCheckpoint,
+            operation: gen_core::ImportedModelOperation::Generate,
+            provider_id: MODEL_ID,
+            required_components: Some(pipeline::LDM_REQUIRED_COMPONENTS),
+            inherit_adapters: true,
+        })
         .register_trainer(training::TRAINER_REGISTRATION)
 }
 
@@ -574,6 +613,8 @@ pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core:
 
 #[cfg(test)]
 mod explicit_registry_tests {
+    use super::{gen_core, pipeline};
+
     #[test]
     fn explicit_catalog_has_stable_surface() {
         let registry = super::provider_registry().unwrap();
@@ -588,6 +629,17 @@ mod explicit_registry_tests {
 
         assert_eq!(explicit_generators, ["sdxl"]);
         assert_eq!(explicit_trainers, ["sdxl"]);
+        let imported = registry
+            .imported_model_descriptor(
+                "sdxl",
+                gen_core::ImportedModelSource::FusedCheckpoint,
+                gen_core::ImportedModelOperation::Generate,
+            )
+            .expect("fused SDXL route");
+        assert_eq!(
+            imported.required_components,
+            pipeline::LDM_REQUIRED_COMPONENTS
+        );
     }
 }
 

@@ -65,7 +65,8 @@ use candle_gen::gen_core::sampling::{
 };
 use candle_gen::gen_core::tiling::{TilingConfig, VaeTiling};
 use candle_gen::gen_core::{
-    self, AdapterSpec, GenerationRequest, Image, LoadSpec, PidWeights, Progress, WeightsSource,
+    self, AdapterSpec, GenerationRequest, Image, LoadSpec, PidWeights, Progress, Quant,
+    WeightsSource,
 };
 // Shared per-image batch seed (`base + index`) — one home in `candle-gen` (sc-9043 / F-059).
 use candle_gen::{CandleError, LatentDecoder, Result};
@@ -77,7 +78,7 @@ use candle_gen_pid::{PidDecoder, PidEngine};
 /// the SDXL VAE, so there is no InstantID-specific PiD checkpoint.
 pub const PID_BACKBONE: &str = "sdxl";
 use candle_transformers::models::stable_diffusion::unet_2d::UNet2DConditionModel;
-use candle_transformers::models::stable_diffusion::vae::AutoEncoderKL;
+use candle_transformers::models::stable_diffusion::vae::{AutoEncoderKL, AutoEncoderKLConfig};
 use candle_transformers::models::stable_diffusion::{self, StableDiffusionConfig};
 
 // The vendored, packed-detecting SDXL UNet (sc-5165 / sc-9416): its Linear surface routes through the
@@ -187,6 +188,10 @@ pub(crate) const REQUIRED_COMPONENTS: &[&str] = &[
     COMPONENT_TOKENIZER_CLIP_BIGG,
     COMPONENT_VAE_FP16_FIX,
 ];
+/// A fused LDM checkpoint carries its own VAE, so only the two model-agnostic tokenizer assets must
+/// be staged. The ordinary snapshot route continues to require the fp16-fix VAE above.
+pub(crate) const LDM_REQUIRED_COMPONENTS: &[&str] =
+    &[COMPONENT_TOKENIZER_CLIP_L, COMPONENT_TOKENIZER_CLIP_BIGG];
 
 /// The caller-staged sources for the three SDXL components, resolved + validated once at load and
 /// threaded to every consumption site (the txt2img tokenizers/VAE, and — for the LoadSpec-driven
@@ -197,7 +202,7 @@ pub(crate) const REQUIRED_COMPONENTS: &[&str] = &[
 pub(crate) struct SdxlComponents {
     pub(crate) tokenizer_clip_l: WeightsSource,
     pub(crate) tokenizer_clip_bigg: WeightsSource,
-    pub(crate) vae_fp16_fix: WeightsSource,
+    pub(crate) vae_fp16_fix: Option<WeightsSource>,
 }
 
 impl SdxlComponents {
@@ -224,9 +229,19 @@ impl SdxlComponents {
             "CLIP-bigG tokenizer",
         )?
         .clone();
-        let vae_fp16_fix =
-            gen_core::require_component(spec, COMPONENT_VAE_FP16_FIX, model_id, "fp16-fix VAE")?
-                .clone();
+        let vae_fp16_fix = if matches!(spec.weights, WeightsSource::File(_)) {
+            spec.components.get(COMPONENT_VAE_FP16_FIX).cloned()
+        } else {
+            Some(
+                gen_core::require_component(
+                    spec,
+                    COMPONENT_VAE_FP16_FIX,
+                    model_id,
+                    "fp16-fix VAE",
+                )?
+                .clone(),
+            )
+        };
         Ok(Self {
             tokenizer_clip_l,
             tokenizer_clip_bigg,
@@ -371,8 +386,9 @@ pub(crate) struct Pipeline {
     pid_spec: Option<PidWeights>,
     /// The caller-staged `vae_fp16_fix` component (epic 13657, sc-13663) — the fp16-stable VAE weight
     /// source, resolved in [`load_components`](Self::load_components) in place of the deleted render-path self-fetch.
-    vae_fix: WeightsSource,
+    vae_fix: Option<WeightsSource>,
     ldm: Option<Arc<crate::ldm::LdmComponents>>,
+    quant: Option<Quant>,
 }
 
 /// The seed- and prompt-independent heavy components (UNet + f16 VAE), `Arc`-shared so they can be
@@ -468,8 +484,9 @@ impl Pipeline {
         height: u32,
         adapters: &[AdapterSpec],
         pid_spec: Option<PidWeights>,
-        vae_fix: WeightsSource,
+        vae_fix: Option<WeightsSource>,
         ldm: Option<Arc<crate::ldm::LdmComponents>>,
+        quant: Option<Quant>,
     ) -> Result<Self> {
         // The config's only request-dependent fields are the latent dims; the component configs
         // (clip/clip2/unet/autoencoder) are fixed for SDXL.
@@ -483,6 +500,7 @@ impl Pipeline {
             pid_spec,
             vae_fix,
             ldm,
+            quant,
         })
     }
 
@@ -550,12 +568,28 @@ impl Pipeline {
             Clip::BigG => &components.clip_bigg,
         });
         let text_model: CandleModule = if let Some(map) = ldm_map {
-            let vb = VarBuilder::from_tensors(map.clone(), self.dtype, &self.device);
-            CandleModule::Vendored(crate::clip::ClipTextTransformer::new_gs(
-                vb,
-                &which.vendored_config(),
-                candle_gen::quant::MLX_GROUP_SIZE,
-            )?)
+            let tower = if let Some(quant) = self.quant {
+                // Stage the dense fused CLIP map in system RAM, then fold each projection directly
+                // onto the compute device. Building the tower on the accelerator first would require
+                // the dense tier to fit before Q4/Q8 could make it smaller.
+                let cpu = Device::Cpu;
+                let vb = VarBuilder::from_tensors(map.clone(), self.dtype, &cpu);
+                let mut tower = crate::clip::ClipTextTransformer::new_gs(
+                    vb,
+                    &which.vendored_config(),
+                    candle_gen::quant::MLX_GROUP_SIZE,
+                )?;
+                tower.quantize_onto(quant, &self.device)?;
+                tower
+            } else {
+                let vb = VarBuilder::from_tensors(map.clone(), self.dtype, &self.device);
+                crate::clip::ClipTextTransformer::new_gs(
+                    vb,
+                    &which.vendored_config(),
+                    candle_gen::quant::MLX_GROUP_SIZE,
+                )?
+            };
+            CandleModule::Vendored(tower)
         } else {
             match detect_packed_clip(&self.root, &which)? {
                 Some((packed_file, group_size)) => {
@@ -632,25 +666,34 @@ impl Pipeline {
         let unet = if let Some(ldm) = &self.ldm {
             let mut raw = ldm.unet.clone();
             let table = crate::adapters::build_sdxl_kohya_table(&raw);
-            let vs = VarBuilder::from_tensors(raw.clone(), self.dtype, &self.device);
+            let cpu = Device::Cpu;
+            let build_device = if self.quant.is_some() {
+                &cpu
+            } else {
+                &self.device
+            };
+            let vs = VarBuilder::from_tensors(raw.clone(), self.dtype, build_device);
             let mut vendored = VendoredUNet::new(vs, 4, 4, false, sdxl_unet_config())?;
             if !self.adapters.is_empty() {
                 let linear = crate::adapters::install_additive(
                     &mut vendored,
                     &self.adapters,
                     &table,
-                    &self.device,
+                    build_device,
                 )?;
                 let conv = crate::adapters::install_additive_conv(
                     &mut vendored,
                     &self.adapters,
                     &table,
-                    &self.device,
+                    build_device,
                 )?;
                 crate::adapters::guard_additive_matched(
                     self.adapters.len(),
                     linear.applied + conv.applied,
                 )?;
+            }
+            if let Some(quant) = self.quant {
+                vendored.quantize_onto(quant, &self.device)?;
             }
             raw.clear();
             SdxlUnet::Vendored(Arc::new(vendored))
@@ -702,9 +745,19 @@ impl Pipeline {
                 }
             }
         };
-        let vae =
+        let vae = if let Some(ldm) = &self.ldm {
+            // A generic fused A1111 checkpoint may carry the original SDXL VAE, whose fp16 decode is
+            // numerically unstable. Consume the checkpoint's own VAE truthfully, but keep it at f32;
+            // `decode_image` casts the latent at this boundary.
+            let vs = VarBuilder::from_tensors(ldm.vae.clone(), DType::F32, &self.device);
+            AutoEncoderKL::new(vs, 3, 3, sdxl_vae_config())?
+        } else {
+            let source = self.vae_fix.as_ref().ok_or_else(|| {
+                CandleError::Msg("sdxl: snapshot load is missing the fp16-fix VAE component".into())
+            })?;
             self.config
-                .build_vae(resolve_vae_file(&self.vae_fix), &self.device, self.dtype)?;
+                .build_vae(resolve_vae_file(source), &self.device, self.dtype)?
+        };
         // Load the optional PiD super-resolving decoder once (epic 7840 / sc-7853) when the caller
         // opted in via `LoadSpec::pid`; SDXL's own `sdxl` latent-space student. `None` ⇒ native VAE.
         let pid = match self.pid_spec.as_ref() {
@@ -1133,7 +1186,23 @@ impl Pipeline {
     /// [`tiled_vae_decode`] — tiled (sc-4987) when [`crate::vae_tiling_enabled`] is set AND the output
     /// exceeds the tiling threshold (512²); otherwise the monolithic `AutoEncoderKL::decode`.
     fn decode_image(&self, vae: &AutoEncoderKL, unscaled: &Tensor) -> Result<Tensor> {
-        tiled_vae_decode(vae, unscaled)
+        let unscaled = if self.ldm.is_some() {
+            unscaled.to_dtype(DType::F32)?
+        } else {
+            unscaled.clone()
+        };
+        tiled_vae_decode(vae, &unscaled)
+    }
+}
+
+fn sdxl_vae_config() -> AutoEncoderKLConfig {
+    AutoEncoderKLConfig {
+        block_out_channels: vec![128, 256, 512, 512],
+        layers_per_block: 2,
+        latent_channels: 4,
+        norm_num_groups: 32,
+        use_quant_conv: true,
+        use_post_quant_conv: true,
     }
 }
 
@@ -1354,8 +1423,9 @@ mod tests {
             dtype: DType::F32,
             adapters: vec![],
             pid_spec: None,
-            vae_fix: WeightsSource::File("/nonexistent/vae.safetensors".into()),
+            vae_fix: Some(WeightsSource::File("/nonexistent/vae.safetensors".into())),
             ldm: None,
+            quant: None,
         };
         let got = pipe.detect_packed_unet().unwrap();
         assert!(got.is_some(), "a quantization block ⇒ packed tier");
@@ -1410,8 +1480,9 @@ mod tests {
             dtype: DType::F32,
             adapters: vec![],
             pid_spec: None,
-            vae_fix: WeightsSource::File("/nonexistent/vae.safetensors".into()),
+            vae_fix: Some(WeightsSource::File("/nonexistent/vae.safetensors".into())),
             ldm: None,
+            quant: None,
         };
         assert!(
             pipe.detect_packed_unet().is_err(),
@@ -1514,7 +1585,7 @@ mod tests {
                 WeightsSource::File("/vae.safetensors".into()),
             );
         let comps = SdxlComponents::from_spec(&spec, crate::MODEL_ID).unwrap();
-        assert!(matches!(comps.vae_fp16_fix, WeightsSource::File(_)));
+        assert!(matches!(comps.vae_fp16_fix, Some(WeightsSource::File(_))));
 
         // Missing the VAE component → a load-time Msg naming the id + the builder.
         let mut bad = spec.clone();
@@ -1524,6 +1595,20 @@ mod tests {
             .to_string();
         assert!(err.contains("vae_fp16_fix"), "names the id: {err}");
         assert!(err.contains("with_component"), "names the builder: {err}");
+
+        // A fused checkpoint carries its own VAE. Its structural gate requires only the two
+        // tokenizer assets and does not demand the model-agnostic replacement VAE.
+        let fused = LoadSpec::new(WeightsSource::File("/model.safetensors".into()))
+            .with_component(
+                COMPONENT_TOKENIZER_CLIP_L,
+                WeightsSource::Dir("/clip_l".into()),
+            )
+            .with_component(
+                COMPONENT_TOKENIZER_CLIP_BIGG,
+                WeightsSource::Dir("/clip_bigg".into()),
+            );
+        let fused_components = SdxlComponents::from_spec(&fused, crate::MODEL_ID).unwrap();
+        assert!(fused_components.vae_fp16_fix.is_none());
     }
 
     /// sc-6128: the Lightning policy is diffusers `EulerDiscreteScheduler(timestep_spacing="trailing",
@@ -1731,8 +1816,9 @@ mod tests {
             dtype,
             adapters: vec![],
             pid_spec: None,
-            vae_fix: WeightsSource::File("/nonexistent/vae.safetensors".into()),
+            vae_fix: Some(WeightsSource::File("/nonexistent/vae.safetensors".into())),
             ldm: None,
+            quant: None,
         };
 
         // Two DISTINCT conditioning rows so the selected row is observable in the pixels: `row_a`

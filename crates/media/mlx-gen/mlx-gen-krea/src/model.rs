@@ -430,13 +430,6 @@ pub(crate) fn validate_native_krea_spec(spec: &LoadSpec, provider_id: &str) -> R
             provider_id
         )));
     }
-    if spec.quantize.is_some() {
-        return Err(Error::Unsupported(format!(
-            "{}: an imported native single-file DiT carries its own numeric format; an additional \
-             LoadSpec::quantize request is not supported",
-            provider_id
-        )));
-    }
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
         return Err(Error::Unsupported(format!(
             "{}: the base single-file provider does not accept control/IP-adapter overlays",
@@ -464,6 +457,7 @@ fn build_native_krea_from_spec(spec: &LoadSpec, descriptor: ModelDescriptor) -> 
         .expect("File weights must resolve to a pin");
     let mut pinned_spec = spec.clone();
     pinned_spec.weights = WeightsSource::File(native_dit.loader_path().to_path_buf());
+    let text_load_plan = resolve_load_plan(spec, base, descriptor.id)?;
     // Physical execution eligibility is intentionally independent from public evidence. An explicit
     // Sequential + Deferred File request can use the retained pin to reopen one transformer block at
     // a time, while the contract below continues to report rung 4 as Missing until File-specific
@@ -482,9 +476,10 @@ fn build_native_krea_from_spec(spec: &LoadSpec, descriptor: ModelDescriptor) -> 
     let heavy_base = base.to_path_buf();
     let heavy_dit = native_dit.clone();
     let heavy_spec = spec.clone();
+    let text_quant_bits = text_load_plan.load_time_quant_bits;
     let residency = Residency::from_policy(
         spec.offload_policy,
-        move || KreaText::from_snapshot(&text_base),
+        move || load_krea_text_resolved(&text_base, text_quant_bits),
         move |load_pid| {
             load_native_krea_heavy(&heavy_spec, &heavy_base, &heavy_dit, reopenable, load_pid)
         },
@@ -493,7 +488,7 @@ fn build_native_krea_from_spec(spec: &LoadSpec, descriptor: ModelDescriptor) -> 
         descriptor,
         memory_strategy,
         precision: spec.precision,
-        quant: None,
+        quant: spec.quantize,
         streamable_transformer: reopenable,
         _native_dit: Some(native_dit),
         residency,
@@ -531,12 +526,24 @@ fn load_native_krea_heavy(
     load_pid: bool,
 ) -> Result<KreaHeavyOwned> {
     let cfg = crate::config::Krea2Config::from_snapshot(base)?;
-    let dit = crate::loader::load_transformer_from_pinned_native_file_with_stream(
-        dit_file, &cfg, streamable,
-    )?;
+    let dit = if let Some(quant) = spec.quantize {
+        crate::loader::load_transformer_from_pinned_native_file_bounded(dit_file, &cfg, |dit| {
+            if !spec.adapters.is_empty() {
+                spec.read_files_unchanged(
+                    spec.adapters.iter().map(|adapter| &adapter.path),
+                    || dit.apply_adapters_strict(&spec.adapters, true),
+                )?;
+            }
+            dit.quantize(quant.bits())
+        })?
+    } else {
+        crate::loader::load_transformer_from_pinned_native_file_with_stream(
+            dit_file, &cfg, streamable,
+        )?
+    };
     let vae = crate::vae::load_vae(base)?;
     let mut heavy = KreaHeavy::from_parts(dit, vae);
-    if !spec.adapters.is_empty() {
+    if spec.quantize.is_none() && !spec.adapters.is_empty() {
         spec.read_files_unchanged(spec.adapters.iter().map(|adapter| &adapter.path), || {
             heavy.apply_adapters(&spec.adapters)
         })?;
@@ -698,6 +705,15 @@ pub(crate) fn resolve_load_plan(
         }
         None => None,
     };
+    if matches!(spec.weights, WeightsSource::File(_))
+        && packed_bits.is_some()
+        && requested_bits.is_none()
+    {
+        return Err(Error::Msg(format!(
+            "{id}: imported single-file weights have no quant request, but the companion snapshot is pre-quantized Q{}; request the matching tier or stage a dense companion snapshot",
+            packed_bits.expect("checked Some")
+        )));
+    }
     if let (Some(packed), Some(requested)) = (packed_bits, requested_bits) {
         if packed != requested {
             return Err(Error::Msg(format!(
@@ -762,10 +778,14 @@ pub(crate) fn load_krea_text(spec: &LoadSpec, root: &Path, id: &str) -> Result<K
     load_krea_text_resolved(root, plan.load_time_quant_bits)
 }
 
-fn load_krea_text_resolved(root: &Path, load_time_quant_bits: Option<i32>) -> Result<KreaText> {
+pub(crate) fn load_krea_text_resolved(
+    root: &Path,
+    load_time_quant_bits: Option<i32>,
+) -> Result<KreaText> {
     let mut text = KreaText::from_snapshot(root)?;
     if let Some(bits) = load_time_quant_bits {
         text.quantize(bits)?;
+        text.materialize_weights()?;
     }
     Ok(text)
 }

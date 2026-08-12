@@ -106,6 +106,19 @@ impl TokenEmbedding {
     pub fn is_quantized(&self) -> bool {
         matches!(self, Self::Quantized { .. })
     }
+
+    /// Evaluate the retained embedding representation without evaluating any other model weight.
+    /// Used by bounded load-time quantization walks to keep the dense-to-packed transient local to
+    /// this table.
+    pub fn materialize_weights(&self) -> Result<()> {
+        match self {
+            Self::Dense(weight) => mlx_rs::transforms::eval([weight])?,
+            Self::Quantized {
+                wq, scales, biases, ..
+            } => mlx_rs::transforms::eval([wq, scales, biases])?,
+        }
+        Ok(())
+    }
 }
 
 /// sc-2963 (rollout of the Wan sc-2957 template): the shared compiled-elementwise-*glue* toggle and

@@ -1144,6 +1144,31 @@ impl Krea2Transformer {
         Ok(())
     }
 
+    /// Materialize retained weights projection-by-projection.  When called after `quantize`, each
+    /// projection evaluates its packed representation and releases the dense file-backed graph
+    /// before the next projection, avoiding a full-dense imported-DiT peak.
+    pub(crate) fn materialize_weights(&self) -> Result<()> {
+        for projection in [
+            &self.img_in,
+            &self.time_embed_l1,
+            &self.time_embed_l2,
+            &self.time_mod_proj,
+            &self.txt_in_l1,
+            &self.txt_in_l2,
+            &self.final_linear,
+        ] {
+            projection.materialize_weights()?;
+        }
+        self.txt_in_norm.materialize_weights()?;
+        self.text_fusion.materialize_weights()?;
+        for block in &self.blocks {
+            block.materialize_weights()?;
+        }
+        self.final_norm.materialize_weights()?;
+        mlx_rs::transforms::eval([&self.final_sstable])?;
+        Ok(())
+    }
+
     /// Clear **every** adapter stack on the DiT — the global projections, the single-stream blocks, and
     /// the text-fusion aggregator — back to the bare frozen base (epic 13879, sc-13884). The forward-time
     /// counterpart to a `set_adapters(vec![])` per module, used by the multi-phase driver to reset before

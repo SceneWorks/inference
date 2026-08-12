@@ -422,6 +422,29 @@ pub(crate) fn load_text_for_request(
     load_text_cancelable(root, device, Some(cancel))
 }
 
+pub(crate) fn load_text_quantized_for_request(
+    root: &Path,
+    device: &Device,
+    cancel: &gen_core::CancelFlag,
+    quant: gen_core::Quant,
+) -> Result<KreaText> {
+    candle_gen::check_cancel(cancel)?;
+    let tok = crate::tokenizer::KreaTokenizer::from_snapshot(root, device)?;
+    let te_cfg = KreaTeConfig::from_snapshot(root)?;
+    let cpu = Device::Cpu;
+    let te_w = load_te_weights_cancelable(root, &cpu, Some(cancel))?;
+    let mut te = KreaTextEncoder::load(&te_w, "language_model", &te_cfg, MAX_TEXT_TOKENS)?;
+    te.quantize_onto(quant, device)?;
+    candle_gen::check_cancel(cancel)?;
+    Ok(KreaText {
+        tok,
+        te,
+        root: root.to_path_buf(),
+        device: device.clone(),
+        vision: Mutex::new(None),
+    })
+}
+
 fn check_optional_cancel(cancel: Option<&gen_core::CancelFlag>) -> Result<()> {
     if let Some(cancel) = cancel {
         candle_gen::check_cancel(cancel)?;
@@ -636,7 +659,7 @@ pub fn load_components_native(
     device: &Device,
 ) -> Result<Components> {
     let pinned = gen_core::PinnedWeightsFile::pin(native_dit)?;
-    load_components_native_with(root, &pinned, device, &[], false)
+    load_components_native_with(root, &pinned, device, &[], None, None, false)
 }
 
 /// Registry-backed native load with the same adapter and block-window surface as a snapshot load.
@@ -645,10 +668,25 @@ pub(crate) fn load_components_native_with(
     native_dit: &gen_core::PinnedWeightsFile,
     device: &Device,
     adapters: &[AdapterSpec],
+    native_quant: Option<gen_core::Quant>,
+    text_load_quant: Option<gen_core::Quant>,
     stream_blocks: bool,
 ) -> Result<Components> {
-    let text = load_text(root, device)?;
-    let heavy = load_heavy_native_with(root, native_dit, device, adapters, stream_blocks)?;
+    let text = match text_load_quant {
+        Some(quant) => {
+            let cancel = gen_core::CancelFlag::new();
+            load_text_quantized_for_request(root, device, &cancel, quant)?
+        }
+        None => load_text(root, device)?,
+    };
+    let heavy = load_heavy_native_with(
+        root,
+        native_dit,
+        device,
+        adapters,
+        native_quant,
+        stream_blocks,
+    )?;
     Ok(Components { text, heavy })
 }
 
@@ -657,9 +695,19 @@ pub(crate) fn load_components_native_registry(
     native_dit: &gen_core::PinnedWeightsFile,
     device: &Device,
     adapters: &[AdapterSpec],
+    native_quant: Option<gen_core::Quant>,
+    text_load_quant: Option<gen_core::Quant>,
     pid_spec: Option<&PidWeights>,
 ) -> Result<Components> {
-    let mut components = load_components_native_with(root, native_dit, device, adapters, false)?;
+    let mut components = load_components_native_with(
+        root,
+        native_dit,
+        device,
+        adapters,
+        native_quant,
+        text_load_quant,
+        false,
+    )?;
     components.heavy.pid = pid_spec
         .map(|spec| PidEngine::from_spec(spec, PID_BACKBONE, device).map(Arc::new))
         .transpose()?;
@@ -675,9 +723,10 @@ pub(crate) fn load_heavy_native_with(
     native_dit: &gen_core::PinnedWeightsFile,
     device: &Device,
     adapters: &[AdapterSpec],
+    quant: Option<gen_core::Quant>,
     stream_blocks: bool,
 ) -> Result<KreaHeavy> {
-    let dit = load_native_dit(root, native_dit, device, adapters, stream_blocks)?;
+    let dit = load_native_dit(root, native_dit, device, adapters, quant, stream_blocks)?;
     let vae = load_vae(root, device)?;
 
     Ok(KreaHeavy {
@@ -692,9 +741,18 @@ fn load_native_dit(
     native_dit: &gen_core::PinnedWeightsFile,
     device: &Device,
     adapters: &[AdapterSpec],
+    quant: Option<gen_core::Quant>,
     stream_blocks: bool,
 ) -> Result<Krea2Transformer> {
-    load_native_dit_at_dtype(root, native_dit, device, adapters, stream_blocks, DIT_DTYPE)
+    load_native_dit_at_dtype(
+        root,
+        native_dit,
+        device,
+        adapters,
+        quant,
+        stream_blocks,
+        DIT_DTYPE,
+    )
 }
 
 fn load_native_dit_at_dtype(
@@ -702,6 +760,7 @@ fn load_native_dit_at_dtype(
     native_dit: &gen_core::PinnedWeightsFile,
     device: &Device,
     adapters: &[AdapterSpec],
+    quant: Option<gen_core::Quant>,
     stream_blocks: bool,
     dit_dtype: DType,
 ) -> Result<Krea2Transformer> {
@@ -709,14 +768,19 @@ fn load_native_dit_at_dtype(
         let cfg = Krea2Config::from_snapshot(root)?;
         // Native keys ON, ConvRot OFF. Dense stores W directly; plain int8 reconstructs
         // W = codes * row_scale. Neither stores ConvRot's W·R, so neither may rotate.
-        let mut dit_w = Weights::from_pinned_native_file(native_dit, device, dit_dtype)?;
+        let source_device = if quant.is_some() {
+            &Device::Cpu
+        } else {
+            device
+        };
+        let mut dit_w = Weights::from_pinned_native_file(native_dit, source_device, dit_dtype)?;
         #[cfg(test)]
         run_native_dit_load_test_hook(&dit_w, device)?;
         crate::convert::validate_native_transformer(&dit_w, &cfg)?;
         let diff = crate::adapters::fold_diff_patch(&mut dit_w, adapters)?;
-        if stream_blocks && !adapters.is_empty() {
+        if stream_blocks && (!adapters.is_empty() || quant.is_some()) {
             return Err(CandleError::Msg(
-                "Krea native block streaming does not support load-time adapters".into(),
+                "Krea native block streaming requires an adapter-free, non-quantizing load".into(),
             ));
         }
         let mut dit = if stream_blocks {
@@ -726,6 +790,9 @@ fn load_native_dit_at_dtype(
         };
         if !adapters.is_empty() {
             crate::adapters::install_additive(&mut dit, adapters, diff.merged)?;
+        }
+        if let Some(quant) = quant {
+            dit.quantize_onto(quant, device)?;
         }
 
         // Both paths materialize mmap-backed payloads here: eager loads the complete DiT, while the
@@ -746,10 +813,11 @@ pub(crate) fn load_residency_heavy_native(
     native_dit: &gen_core::PinnedWeightsFile,
     device: &Device,
     adapters: &[AdapterSpec],
+    quant: Option<gen_core::Quant>,
     stream_blocks: bool,
 ) -> Result<ResidencyHeavy> {
     Ok(ResidencyHeavy {
-        heavy: load_heavy_native_with(root, native_dit, device, adapters, stream_blocks)?,
+        heavy: load_heavy_native_with(root, native_dit, device, adapters, quant, stream_blocks)?,
         vae_encoder: load_vae_encoder(root, device)?,
     })
 }
@@ -759,12 +827,13 @@ pub(crate) fn load_residency_heavy_native_registry(
     native_dit: &gen_core::PinnedWeightsFile,
     device: &Device,
     adapters: &[AdapterSpec],
+    quant: Option<gen_core::Quant>,
     pid_spec: Option<&PidWeights>,
     use_pid: bool,
     stream_blocks: bool,
 ) -> Result<ResidencyHeavy> {
     let mut result =
-        load_residency_heavy_native(root, native_dit, device, adapters, stream_blocks)?;
+        load_residency_heavy_native(root, native_dit, device, adapters, quant, stream_blocks)?;
     result.heavy.pid = pid_to_load(pid_spec, use_pid)
         .map(|spec| PidEngine::from_spec(spec, PID_BACKBONE, device).map(Arc::new))
         .transpose()?;
@@ -853,6 +922,8 @@ pub(crate) fn render_three_stage_with_native(
     native_dit: Option<&gen_core::PinnedWeightsFile>,
     device: &Device,
     adapters: &[AdapterSpec],
+    native_quant: Option<gen_core::Quant>,
+    text_load_quant: Option<gen_core::Quant>,
     req: &GenerationRequest,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Vec<Image>> {
@@ -866,7 +937,14 @@ pub(crate) fn render_three_stage_with_native(
         gen_core::MemoryPhase::Conditioning,
         on_progress,
     )?;
-    let text = load_text_cancelable(root, device, Some(&req.cancel))?;
+    let text = if native_dit.is_some() {
+        match text_load_quant {
+            Some(quant) => load_text_quantized_for_request(root, device, &req.cancel, quant)?,
+            None => load_text_cancelable(root, device, Some(&req.cancel))?,
+        }
+    } else {
+        load_text_cancelable(root, device, Some(&req.cancel))?
+    };
     let context = encode_prompt_context(&text, req)?;
     device.synchronize()?;
     drop(text);
@@ -887,6 +965,7 @@ pub(crate) fn render_three_stage_with_native(
                 native_dit,
                 device,
                 adapters,
+                native_quant,
                 memory.stream_transformer_blocks,
             )?;
             candle_gen::check_cancel(&req.cancel)?;
@@ -1509,14 +1588,16 @@ fn load_dit_base(
     root: &Path,
     native_dit: Option<&gen_core::PinnedWeightsFile>,
     device: &Device,
+    quant: Option<gen_core::Quant>,
 ) -> Result<Krea2Transformer> {
-    load_dit_base_at_dtype(root, native_dit, device, DIT_DTYPE)
+    load_dit_base_at_dtype(root, native_dit, device, quant, DIT_DTYPE)
 }
 
 fn load_dit_base_at_dtype(
     root: &Path,
     native_dit: Option<&gen_core::PinnedWeightsFile>,
     device: &Device,
+    quant: Option<gen_core::Quant>,
     dit_dtype: DType,
 ) -> Result<Krea2Transformer> {
     load_dit_base_with(
@@ -1528,7 +1609,7 @@ fn load_dit_base_at_dtype(
             crate::convert::validate_transformer(&dit_w, &cfg)?;
             Ok(Krea2Transformer::load(&dit_w, &cfg)?)
         },
-        |source| load_native_dit_at_dtype(root, source, device, &[], false, dit_dtype),
+        |source| load_native_dit_at_dtype(root, source, device, &[], quant, false, dit_dtype),
     )
 }
 
@@ -1558,6 +1639,7 @@ type MultiphaseAdapterStateObserver<'a> = dyn FnMut(Option<usize>, &[AdapterSpec
 fn render_multiphase_driver<T>(
     root: &Path,
     native_dit: Option<&gen_core::PinnedWeightsFile>,
+    quant: Option<gen_core::Quant>,
     device: &Device,
     resolved: &[crate::multiphase::ResolvedPhase],
     all_specs: &[AdapterSpec],
@@ -1578,7 +1660,7 @@ fn render_multiphase_driver<T>(
     // The job-local base DiT the phases re-adapt (never the shared resident) — built ONCE per request and
     // reused across the seed loop. Pre-resolve each phase's adapter spec subset (host-cheap; the adapter
     // files are read at install time inside the loop).
-    let mut dit = load_dit_base_at_dtype(root, native_dit, device, dit_dtype)?;
+    let mut dit = load_dit_base_at_dtype(root, native_dit, device, quant, dit_dtype)?;
     let phase_specs: Vec<Vec<AdapterSpec>> = resolved
         .iter()
         .map(|p| crate::multiphase::phase_spec_subset(p, all_specs))
@@ -1674,6 +1756,7 @@ pub(crate) fn render_multiphase(
     vae: &QwenVae,
     root: &Path,
     native_dit: Option<&gen_core::PinnedWeightsFile>,
+    quant: Option<gen_core::Quant>,
     device: &Device,
     resolved: &[crate::multiphase::ResolvedPhase],
     all_specs: &[AdapterSpec],
@@ -1691,6 +1774,7 @@ pub(crate) fn render_multiphase(
     render_multiphase_driver(
         root,
         native_dit,
+        quant,
         device,
         resolved,
         all_specs,
@@ -2416,7 +2500,8 @@ mod tests {
             }));
         });
 
-        let result = load_native_dit_at_dtype(&root, &pinned, &Device::Cpu, &[], false, DType::F32);
+        let result =
+            load_native_dit_at_dtype(&root, &pinned, &Device::Cpu, &[], None, false, DType::F32);
         NATIVE_DIT_LOAD_TEST_HOOK.with(|slot| *slot.borrow_mut() = None);
         writer.join().unwrap();
 
@@ -2554,7 +2639,7 @@ mod tests {
                 move |_, _| {
                     candle_gen::lock_recover(&heavy_log).push("load-heavy");
                     Ok(ResidentHeavy {
-                        _dit: load_dit_base(&heavy_root, Some(&heavy_pin), &Device::Cpu)?,
+                        _dit: load_dit_base(&heavy_root, Some(&heavy_pin), &Device::Cpu, None)?,
                         _release: DropWitness {
                             event: "drop-heavy",
                             log: Arc::clone(&heavy_log),
@@ -2632,6 +2717,7 @@ mod tests {
                         let images = render_multiphase_driver(
                             &root,
                             Some(&pinned),
+                            None,
                             &Device::Cpu,
                             &resolved,
                             &all_specs,

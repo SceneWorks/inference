@@ -325,6 +325,7 @@ fn build_native_krea_control_from_spec(spec: &LoadSpec) -> Result<KreaTurboContr
         .weights_file_pin()?
         .expect("File weights must resolve to a pin");
     let base = require_base_snapshot(spec, KREA_2_TURBO_CONTROL_ID)?.to_path_buf();
+    let text_load_plan = crate::model::resolve_load_plan(spec, &base, KREA_2_TURBO_CONTROL_ID)?;
     let pinned_control =
         match require_control(spec, KREA_2_TURBO_CONTROL_ID, "Krea 2 pose control overlay")? {
             WeightsSource::File(path) => Some(spec.file_pin_for(path)?),
@@ -357,9 +358,10 @@ fn build_native_krea_control_from_spec(spec: &LoadSpec) -> Result<KreaTurboContr
     let heavy_spec = spec.clone();
     let heavy_dit = native_dit.clone();
     let heavy_control = pinned_control.clone();
+    let text_quant_bits = text_load_plan.load_time_quant_bits;
     let residency = Residency::from_policy(
         spec.offload_policy,
-        move || KreaText::from_snapshot(&text_base),
+        move || crate::model::load_krea_text_resolved(&text_base, text_quant_bits),
         move |_use_pid| {
             load_native_control_heavy(
                 &heavy_spec,
@@ -374,7 +376,7 @@ fn build_native_krea_control_from_spec(spec: &LoadSpec) -> Result<KreaTurboContr
         descriptor: descriptor(),
         memory_strategy,
         loaded_precision: spec.precision,
-        loaded_quant: None,
+        loaded_quant: spec.quantize,
         _native_dit: Some(native_dit),
         _native_control: pinned_control,
         streamable_transformer: reopenable,
@@ -390,26 +392,44 @@ fn load_native_control_heavy(
     streamable: bool,
 ) -> Result<ControlHeavyOwned> {
     let cfg = Krea2Config::from_snapshot(base)?;
-    let dit = crate::loader::load_transformer_from_pinned_native_file_with_stream(
-        dit_file, &cfg, streamable,
-    )?;
+    let dit = if let Some(quant) = spec.quantize {
+        crate::loader::load_transformer_from_pinned_native_file_bounded(dit_file, &cfg, |dit| {
+            if !spec.adapters.is_empty() {
+                spec.read_files_unchanged(
+                    spec.adapters.iter().map(|adapter| &adapter.path),
+                    || dit.apply_adapters_strict(&spec.adapters, true),
+                )?;
+            }
+            dit.quantize(quant.bits())
+        })?
+    } else {
+        crate::loader::load_transformer_from_pinned_native_file_with_stream(
+            dit_file, &cfg, streamable,
+        )?
+    };
     let vae = crate::vae::load_vae(base)?;
     let mut heavy = KreaHeavy::from_parts(dit, vae);
-    if !spec.adapters.is_empty() {
+    if spec.quantize.is_none() && !spec.adapters.is_empty() {
         spec.read_files_unchanged(spec.adapters.iter().map(|adapter| &adapter.path), || {
             heavy.apply_adapters(&spec.adapters)
         })?;
     }
+    let base_bits = spec.quantize.map(Quant::bits);
+    let branch_bits = crate::memory::control_branch_quant_bits(base_bits);
     let control = require_control(spec, KREA_2_TURBO_CONTROL_ID, "Krea 2 pose control overlay")?;
-    let branch = match pinned_control {
-        Some(pinned) => Krea2ControlBranch::from_pinned_file(pinned, &cfg)?,
-        None => Krea2ControlBranch::from_source(control, &cfg)?,
+    let branch = match (pinned_control, branch_bits) {
+        (Some(pinned), Some(bits)) => {
+            Krea2ControlBranch::from_pinned_file_bounded(pinned, &cfg, bits)?
+        }
+        (Some(pinned), None) => Krea2ControlBranch::from_pinned_file(pinned, &cfg)?,
+        (None, Some(bits)) => Krea2ControlBranch::from_source_bounded(control, &cfg, bits)?,
+        (None, None) => Krea2ControlBranch::from_source(control, &cfg)?,
     };
     Ok(ControlHeavyOwned {
         heavy,
         branch,
-        base_tier: None,
-        branch_tier: None,
+        base_tier: tier_from_bits(base_bits),
+        branch_tier: tier_from_bits(branch_bits),
         cfg,
     })
 }
@@ -434,11 +454,6 @@ pub(crate) fn validate_control_spec(spec: &LoadSpec) -> Result<()> {
     let _ = require_base_snapshot(spec, KREA_2_TURBO_CONTROL_ID)?;
     let _ = require_control(spec, KREA_2_TURBO_CONTROL_ID, "Krea 2 pose control overlay")?;
     if matches!(spec.weights, WeightsSource::File(_)) {
-        if spec.quantize.is_some() {
-            return Err(Error::Unsupported(format!(
-                "{KREA_2_TURBO_CONTROL_ID}: imported DiT carries its numeric format; quantize is unsupported"
-            )));
-        }
         if spec.ip_adapter.is_some()
             || !spec.extra_controls.is_empty()
             || spec.pid.is_some()
@@ -552,19 +567,20 @@ fn load_control_heavy(
     }
     let control = require_control(spec, KREA_2_TURBO_CONTROL_ID, "Krea 2 pose control overlay")?;
     let cfg = Krea2Config::from_snapshot(root)?;
-    let mut branch = match pinned_control {
-        Some(pinned) => Krea2ControlBranch::from_pinned_file(pinned, &cfg)?,
-        None => Krea2ControlBranch::from_source(control, &cfg)?,
-    };
     // sc-15799 — tier integrity. The pose overlay always loads bf16 (it ships no `.scales`); pack it to
     // the tier the base tier implies, whether the base was packed at load or arrived pre-packed. No
     // device-budget reading: the branch's tier is a consequence of the user's tier choice, not a rung.
     let base_bits = crate::model::effective_base_quant_bits(spec, root, KREA_2_TURBO_CONTROL_ID)?;
     let base_tier = tier_from_bits(base_bits);
     let branch_bits = crate::memory::control_branch_quant_bits(base_bits);
-    if let Some(bits) = branch_bits {
-        branch.quantize(bits)?;
-    }
+    let branch = match (pinned_control, branch_bits) {
+        (Some(pinned), Some(bits)) => {
+            Krea2ControlBranch::from_pinned_file_bounded(pinned, &cfg, bits)?
+        }
+        (Some(pinned), None) => Krea2ControlBranch::from_pinned_file(pinned, &cfg)?,
+        (None, Some(bits)) => Krea2ControlBranch::from_source_bounded(control, &cfg, bits)?,
+        (None, None) => Krea2ControlBranch::from_source(control, &cfg)?,
+    };
     let branch_tier = tier_from_bits(branch_bits);
     Ok(ControlHeavyOwned {
         heavy,

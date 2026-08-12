@@ -112,7 +112,8 @@ pub use memory_strategy::{
 };
 pub use registry::{
     ActivationMemoryRegistration, AudioEmbedderRegistration, AudioTransformRegistration,
-    CaptionerRegistration, ImageEmbedderRegistration, MemoryBehaviorBeginRequest,
+    CaptionerRegistration, ImageEmbedderRegistration, ImportedModelOperation,
+    ImportedModelRegistration, ImportedModelSource, MemoryBehaviorBeginRequest,
     MemoryBehaviorFixture, MemoryBehaviorRegistration, MemoryContractFixtureRegistration,
     MemoryRegistration, ModelRegistration, PerComponentBytes, ProviderRegistry,
     ProviderRegistryBuilder, TextEmbedderRegistration, TrainerRegistration,

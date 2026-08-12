@@ -8,7 +8,7 @@
 //! pristine (unmutated) mmap, which epic-10765 offload/eviction can drop-and-restore cheaply (a folded
 //! weight is not disk-re-derivable → pinned). With no residual installed the forward is byte-identical
 //! to before, so the plain / dense-fold paths are unchanged.
-use candle_core::{Result, Tensor};
+use candle_core::{Device, Result, Tensor};
 use candle_nn::{Conv2dConfig, Module};
 
 /// A forward-time additive conv-LoRA residual (sc-11682): `scale · conv(conv(x, down, base_cfg), up,
@@ -60,6 +60,23 @@ impl Conv2d {
     /// mutated). Multiple pushes stack.
     pub fn push_additive_conv(&mut self, down: Tensor, up: Tensor, scale: f64) {
         self.residuals.push(ConvResidual { down, up, scale });
+    }
+
+    /// Move a CPU-staged dense convolution and its small additive adapter factors onto the compute
+    /// device without changing its stride/padding configuration.
+    pub(crate) fn to_device(&mut self, device: &Device) -> Result<()> {
+        let weight = self.inner.weight().to_device(device)?;
+        let bias = self
+            .inner
+            .bias()
+            .map(|bias| bias.to_device(device))
+            .transpose()?;
+        self.inner = candle_nn::Conv2d::new(weight, bias, self.cfg);
+        for residual in &mut self.residuals {
+            residual.down = residual.down.to_device(device)?;
+            residual.up = residual.up.to_device(device)?;
+        }
+        Ok(())
     }
 }
 

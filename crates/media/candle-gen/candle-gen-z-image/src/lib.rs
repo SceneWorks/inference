@@ -107,7 +107,15 @@ pub fn register_providers(
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
     let registry = registry
         .register_generator(REGISTRATION)
-        .register_generator(base::REGISTRATION);
+        .register_generator(base::REGISTRATION)
+        .register_imported_model(gen_core::ImportedModelRegistration {
+            family: "z-image",
+            source: gen_core::ImportedModelSource::ComfyUiTree,
+            operation: gen_core::ImportedModelOperation::Generate,
+            provider_id: MODEL_ID,
+            required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
+            inherit_adapters: true,
+        });
     #[cfg(feature = "cuda")]
     let registry = registry
         .register_memory_strategy(TURBO_MEMORY_REGISTRATION)

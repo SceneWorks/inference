@@ -201,6 +201,10 @@ impl KreaText {
         self.te.quantize(bits)
     }
 
+    pub(crate) fn materialize_weights(&self) -> Result<()> {
+        self.te.materialize_weights()
+    }
+
     /// Encode a plain text prompt → the DiT text context `[1, n_tok, 12, 2560]` (the 12 selected
     /// Qwen3-VL hidden layers, stacked + prefix-dropped). Used by the Turbo/Raw/control/img2img paths.
     /// Deterministic (no RNG), so encoding once and reusing across a `count` loop is byte-identical to a
