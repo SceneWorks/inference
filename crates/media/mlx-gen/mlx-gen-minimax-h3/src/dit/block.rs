@@ -24,13 +24,17 @@
 //! the wrong contents; [`AdaLnProjection::forward`] does the reshape first, and
 //! `tests/dit_parity.rs` mutates it to prove the difference is observable.
 //!
-//! # What this story does and does not own
+//! # Precompute and evict (sc-17145)
 //!
 //! The projection lives here because the reference block owns it and one-block parity cannot be
-//! shown without it. **Precomputing the modulation across a step schedule and evicting the ~13 B of
-//! `adaln_proj` weights before the denoise loop is sc-17145**, which is why [`AdaLnModulation`] is
-//! a standalone value produced by [`DitBlock::modulation`] rather than an internal of
-//! [`DitBlock::forward`]: caching it needs no change here.
+//! shown without it. [`AdaLnModulation`] is a standalone value produced by
+//! [`DitBlock::modulation`] rather than an internal of [`DitBlock::forward`] precisely so that
+//! [`crate::dit::adaln`] can build one per block for a whole schedule and then take the projection
+//! away with [`DitBlock::evict_adaln`] — ~13 B of the 33 B, **26.02 GB at bf16**.
+//!
+//! After eviction a block is a **body-only** block: [`DitBlock::forward`] still runs unchanged (it
+//! consumes a modulation table and never touches the projection), while [`DitBlock::modulation`]
+//! and [`DitBlock::forward_with_temb`] become typed errors rather than panics or silent zeros.
 
 use mlx_rs::ops::{add, multiply};
 use mlx_rs::{Array, Dtype};
@@ -64,6 +68,24 @@ pub struct AdaLnModulation {
     pub gate_mlp: Array,
 }
 
+impl AdaLnModulation {
+    /// The six tables in the reference's chunk order, for bulk evaluation and byte accounting.
+    ///
+    /// [`crate::dit::adaln::AdaLnCache`] evaluates through this before releasing the projection —
+    /// see that module's "lazy-eval trap".
+    pub fn tables(&self) -> impl Iterator<Item = &Array> {
+        [
+            &self.shift_msa,
+            &self.scale_msa,
+            &self.gate_msa,
+            &self.shift_mlp,
+            &self.scale_mlp,
+            &self.gate_mlp,
+        ]
+        .into_iter()
+    }
+}
+
 /// `adaln_proj`: `time_embed_dim → 6 · MODALITY_NUM · hidden_size`.
 #[derive(Debug, Clone)]
 pub struct AdaLnProjection {
@@ -73,6 +95,29 @@ pub struct AdaLnProjection {
 }
 
 impl AdaLnProjection {
+    /// The width of the timestep embedding this projection consumes — `time_embed_dim`, 2688
+    /// shipped.
+    ///
+    /// Read from the loaded tensor rather than from a config, so that
+    /// [`crate::dit::adaln::AdaLnCache`] validates a caller-supplied `temb` against the weights it
+    /// will actually be multiplied by.
+    pub fn time_embed_dim(&self) -> i32 {
+        self.weight.shape()[1]
+    }
+
+    /// Columns emitted per timestep — `6 · MODALITY_NUM · hidden_size`, 96768 shipped.
+    pub fn out_features(&self) -> i32 {
+        self.weight.shape()[0]
+    }
+
+    /// Device bytes this projection holds: weight + bias at their loaded dtype.
+    ///
+    /// The arithmetic the eviction lever is sized on — 50 × (96768·2688 + 96768) × 2 B =
+    /// **26_020_915_200 B (26.02 GB)** at bf16.
+    pub fn nbytes(&self) -> usize {
+        self.weight.nbytes() + self.bias.nbytes()
+    }
+
     fn from_weights(
         w: &mut Weights,
         prefix: &str,
@@ -171,8 +216,10 @@ pub struct DitBlock {
     attn: DitAttention,
     norm2: RmsNorm,
     ff: DitFeedForward,
-    /// `pub` so sc-17145 can precompute the modulation and then drop the block's copy.
-    pub adaln_proj: AdaLnProjection,
+    /// `None` once [`Self::evict_adaln`] has taken it. An `Option` rather than a `pub` field so
+    /// that the post-eviction state is a **typed** one: every path that needs the projection
+    /// reports its absence instead of reading a stale or fabricated table.
+    adaln_proj: Option<AdaLnProjection>,
 }
 
 impl DitBlock {
@@ -189,13 +236,38 @@ impl DitBlock {
             attn: DitAttention::from_weights(w, &format!("{prefix}.attn"), cfg, dtype)?,
             norm2: RmsNorm::from_weights(w, &format!("{prefix}.norm2"), cfg.norm_eps, dtype)?,
             ff: DitFeedForward::from_weights(w, &format!("{prefix}.ff"), dtype)?,
-            adaln_proj: AdaLnProjection::from_weights(
+            adaln_proj: Some(AdaLnProjection::from_weights(
                 w,
                 &format!("{prefix}.adaln_proj.linear"),
                 cfg,
                 dtype,
-            )?,
+            )?),
         })
+    }
+
+    /// This block's AdaLN projection, or `None` once it has been evicted.
+    pub fn adaln_proj(&self) -> Option<&AdaLnProjection> {
+        self.adaln_proj.as_ref()
+    }
+
+    /// Whether this block still holds its AdaLN projection.
+    pub fn holds_adaln(&self) -> bool {
+        self.adaln_proj.is_some()
+    }
+
+    /// Take the AdaLN projection out of the block, **returning** it so the caller controls the drop
+    /// point.
+    ///
+    /// Returning rather than dropping in place is deliberate. Dropping a Rust handle is not by
+    /// itself a device-memory release: MLX arrays are reference-counted behind a lazy graph, so the
+    /// buffer survives for as long as *anything* still references it — including an un-evaluated
+    /// modulation table computed from it. [`crate::dit::adaln::AdaLnCache::precompute_and_evict`]
+    /// is the path that gets the ordering right (force evaluation → take → drop → drain the
+    /// allocator cache); this method on its own only breaks the block's reference.
+    ///
+    /// Idempotent: a second call returns `None`.
+    pub fn evict_adaln(&mut self) -> Option<AdaLnProjection> {
+        self.adaln_proj.take()
     }
 
     /// Every tensor name a block consumes — 12 in the published checkpoint.
@@ -212,10 +284,25 @@ impl DitBlock {
 
     /// Project the timestep embedding into this block's modulation tables.
     ///
-    /// Separated from [`Self::forward`] so sc-17145 can build these once per schedule, hold them,
-    /// and release `adaln_proj` — the single biggest memory lever in the port (~13 B of the 33 B).
+    /// Separated from [`Self::forward`] so [`crate::dit::adaln`] can build these once per schedule,
+    /// hold them, and release `adaln_proj` — the single biggest memory lever in the port (~13 B of
+    /// the 33 B).
+    ///
+    /// Errors once the projection has been evicted. That is the point: a denoise loop that reaches
+    /// for the projection after the eviction has a mis-wired residency plan, and must say so rather
+    /// than silently fall back.
     pub fn modulation(&self, temb: &Array) -> Result<AdaLnModulation> {
-        self.adaln_proj.forward(temb)
+        self.adaln_proj
+            .as_ref()
+            .ok_or_else(|| {
+                Error::Msg(
+                    "minimax-h3 dit block: adaln_proj has been evicted; use the precomputed \
+                     `AdaLnCache` modulation for this layer, or load with \
+                     `AdaLnResidency::Resident` if the schedule cannot be enumerated up front"
+                        .into(),
+                )
+            })?
+            .forward(temb)
     }
 
     /// `x + gate_msa·attn(mod(norm1(x)))`, then `x + gate_mlp·ff(mod(norm2(x)))`.
