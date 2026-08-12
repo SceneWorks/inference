@@ -771,6 +771,11 @@ mod tests {
             "krea_realtime_video",
             "wan2_1_t2v_14b_diffusers",
             "wan2_1_vace_1_3b_diffusers",
+            // MiniMax-H3 is MLX-only today: sc-17147 registers `minimax_h3` on that backend and
+            // the Candle twins (sc-17154 video VAE / sc-17155 audio VAE) are unported, so neither
+            // the model's own row nor the Qwen3-VL-32B encoder it bundles is reached here.
+            "minimax_h3",
+            "qwen3_vl_32b_instruct",
             // The bespoke Candle PuLID path and the overlay crates (sc-16668), which register
             // no provider id on this backend. Candle has no `sam2` crate at all, so both SAM 2.1
             // rows are unreached here as well.

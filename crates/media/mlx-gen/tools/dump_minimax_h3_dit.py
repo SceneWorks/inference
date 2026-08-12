@@ -316,6 +316,69 @@ def main() -> None:
         out["out.refiner.block0"] = np32(model.token_refiner.refiner_blocks[0](embedded))
         out["out.refiner.hidden"] = np32(model.token_refiner(embedded))
 
+    # ---- the WHOLE model: the 17 input/output projections, composed (sc-17147) -------------------
+    # Every draw below is appended AFTER the existing ones so the goldens above stay bit-identical
+    # on a regeneration. This is the gate for the tensors sc-17144 deliberately left unported:
+    # `proj_in`, `audio_proj_in`, `time_embedder`, `norm_out` and the two output heads. A whole-model
+    # golden catches what none of them can be caught by alone — `norm_out`'s shift/scale half order
+    # and its bare-timestep row addressing are both shape-identical mistakes.
+    num_video_rows = video_indices.numel()
+    num_audio_rows = audio_indices.numel()
+    video_rows = 0.5 * torch.randn(1, num_video_rows, IN_CHANNELS * 1 * 2 * 2, generator=generator)
+    audio_rows = 0.5 * torch.randn(1, num_audio_rows, AUDIO_IN_CHANNELS, generator=generator)
+    out["in.model.video_rows"] = np32(video_rows)
+    out["in.model.audio_rows"] = np32(audio_rows)
+
+    with torch.no_grad():
+        video_velocity, audio_velocity = model(
+            hidden_states=video_rows,
+            audio_hidden_states=audio_rows,
+            encoder_hidden_states=text_context,
+            timestep=timestep,
+            timestep_indices=timestep_indices,
+            token_tags=token_tags,
+            position_ids=position_ids.to(torch.float32),
+            video_indices=video_indices,
+            audio_indices=audio_indices,
+            text_indices=text_indices,
+            return_dict=False,
+        )
+    assert video_velocity.shape == video_rows.shape, video_velocity.shape
+    assert audio_velocity.shape == audio_rows.shape, audio_velocity.shape
+    out["out.model.video_velocity"] = np32(video_velocity)
+    out["out.model.audio_velocity"] = np32(audio_velocity)
+
+    # A measured negative control for `norm_out`'s half order, so the Rust suite can assert the
+    # mutation is gateable rather than assuming it. `shift, scale = linear(...).chunk(2, -1)`;
+    # swapping the two halves of the projection is shape-identical.
+    with torch.no_grad():
+        swapped_state = model.state_dict()
+        for key in ("norm_out.linear.weight", "norm_out.linear.bias"):
+            a, b = swapped_state[key].chunk(2, dim=0)
+            swapped_state[key] = torch.cat([b, a], dim=0).contiguous()
+        norm_mutant = build_model()
+        norm_mutant.load_state_dict(swapped_state)
+        norm_mutant.eval()
+        mutant_video, _ = norm_mutant(
+            hidden_states=video_rows,
+            audio_hidden_states=audio_rows,
+            encoder_hidden_states=text_context,
+            timestep=timestep,
+            timestep_indices=timestep_indices,
+            token_tags=token_tags,
+            position_ids=position_ids.to(torch.float32),
+            video_indices=video_indices,
+            audio_indices=audio_indices,
+            text_indices=text_indices,
+            return_dict=False,
+        )
+    norm_out_swap_rel = float(
+        (mutant_video - video_velocity).abs().max() / video_velocity.abs().max().clamp_min(1e-12)
+    )
+    assert norm_out_swap_rel > 1e-2, (
+        f"the norm_out shift/scale swap moves the output by only {norm_out_swap_rel:.3e}"
+    )
+
     # ---- weights, in the published (converted) naming ------------------------------------------
     state = model.state_dict()
     for key, tensor in state.items():
@@ -407,6 +470,7 @@ def main() -> None:
             print(f"  {key}: {list(out[key].shape)}")
     print(f"  seq_len={seq_len} (text {NUM_TEXT_TOKENS}, audio {NUM_AUDIO_LATENTS * AUDIO_CHANNELS})")
     print(f"  ffn half-swap negative control: {swap_rel:.6e}")
+    print(f"  norm_out shift/scale swap negative control: {norm_out_swap_rel:.6e}")
 
     meta = {
         "provenance": "converted-checkpoint",
@@ -415,7 +479,8 @@ def main() -> None:
         "gated_ffn_layout": "value_first",
         "qkv_transform": "contiguous_thirds_of_reordered",
         "ffn_half_swap_rel": f"{swap_rel:.6e}",
-        "story": "sc-17144",
+        "story": "sc-17144, sc-17147",
+        "norm_out_swap_rel": f"{norm_out_swap_rel:.6e}",
     }
 
     path = fixture("mlx-gen-minimax-h3/tests/fixtures/dit_block.safetensors")

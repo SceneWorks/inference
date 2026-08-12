@@ -2222,6 +2222,7 @@ dependencies = [
  "mlx-gen-lens",
  "mlx-gen-ltx",
  "mlx-gen-mage",
+ "mlx-gen-minimax-h3",
  "mlx-gen-mochi",
  "mlx-gen-pid",
  "mlx-gen-pulid",
