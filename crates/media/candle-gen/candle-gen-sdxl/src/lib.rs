@@ -43,7 +43,7 @@
 mod pipeline;
 // The PiD backbone (latent-space) tag (epic 7840 / sc-8373), re-exported so `candle-gen-instantid`
 // loads the same `sdxl` student through its own `with_pid` (it composes the SDXL VAE).
-pub use pipeline::PID_BACKBONE;
+pub use pipeline::{SdxlLatentDecoder, PID_BACKBONE};
 
 // The vendored, packed-detecting SDXL CLIP text-encoder tower (sc-9527, sc-9089j follow-up to the
 // sc-9416 UNet packed-load): its Linear surface (attn q/k/v/out_proj, MLP fc1/fc2, bigG

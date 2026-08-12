@@ -822,7 +822,7 @@ impl Chroma {
     /// `decoder` override wins — so the super-resolving student never inherits native VAE tile
     /// geometry, whose domains are disjoint by construction.
     fn decode_with_vae(
-        vae: &Vae,
+        vae: &dyn LatentDecoder,
         latents: &Array,
         width: u32,
         height: u32,
@@ -831,12 +831,11 @@ impl Chroma {
         cancel: &CancelFlag,
     ) -> Result<Image> {
         let unpacked = unpack_latents(latents, width, height)?;
-        let decoded = match (decoder, tiling) {
-            // The native VAE, bounded. `decode_tiled` is the shared head-once/tail-tiled decoder
-            // every crate in the FLUX.1 / Z-Image latent space uses.
-            (None, Some(tiling)) => vae.decode_tiled(&unpacked, tiling, Some(cancel))?,
-            (Some(d), _) => d.decode(&unpacked)?,
-            (None, None) => vae.decode(&unpacked)?,
+        let decoder: &dyn LatentDecoder = decoder.unwrap_or(vae);
+        mlx_gen::ensure_decoder_compatible(Some(&mlx_gen::gen_core::FLUX1_LATENT_SPACE), decoder)?;
+        let decoded = match tiling {
+            Some(tiling) => decoder.decode_tiled(&unpacked, tiling, Some(cancel))?,
+            None => decoder.decode(&unpacked)?,
         };
         let decoded = decoded.as_dtype(mlx_rs::Dtype::Float32)?;
         decoded_to_image(&decoded)
@@ -1220,6 +1219,112 @@ mlx_gen::register_generators! {
 mod tests {
     use super::*;
     use mlx_gen::gen_core;
+    use std::cell::Cell;
+
+    struct DecodeSpy {
+        output: Array,
+        calls: Cell<usize>,
+    }
+
+    impl DecodeSpy {
+        fn new(output: Array) -> Self {
+            Self {
+                output,
+                calls: Cell::new(0),
+            }
+        }
+    }
+
+    impl LatentDecoder for DecodeSpy {
+        fn input_latent_space(&self) -> Option<&mlx_gen::gen_core::LatentSpace> {
+            Some(&mlx_gen::gen_core::FLUX1_LATENT_SPACE)
+        }
+
+        fn decode(&self, _latents: &Array) -> Result<Array> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(self.output.clone())
+        }
+    }
+
+    fn decode_fixture() -> (Array, Array) {
+        let native_latent = Array::from_slice(
+            &(0..(16 * 4 * 6)).map(|i| i as f32).collect::<Vec<_>>(),
+            &[1, 16, 4, 6],
+        );
+        let packed = mlx_gen_flux::pack_latents(&native_latent, 48, 32).unwrap();
+        let decoded = Array::from_slice(
+            &[
+                -1.0f32, -0.5, 0.0, 0.5, 1.0, 0.25, // R
+                1.0, 0.5, 0.0, -0.5, -1.0, -0.25, // G
+                -0.75, -0.25, 0.25, 0.75, -1.0, 1.0, // B
+            ],
+            &[1, 3, 1, 2, 3],
+        );
+        (packed, decoded)
+    }
+
+    fn legacy_decode_one(decoder: &dyn LatentDecoder, packed: &Array) -> Image {
+        let unpacked = unpack_latents(packed, 48, 32).unwrap();
+        let decoded = decoder
+            .decode(&unpacked)
+            .unwrap()
+            .as_dtype(mlx_rs::Dtype::Float32)
+            .unwrap();
+        decoded_to_image(&decoded).unwrap()
+    }
+
+    /// SC-18309 N1: compare Chroma's packed-latent decode route against the exact pre-seam
+    /// expression, including unpacking, f32 conversion, singleton-frame removal, NCHW-to-RGB
+    /// layout, and denormalization. The remaining arms cover the production-only native tiled plan
+    /// and the mutually exclusive PiD override, including its dynamic output geometry.
+    #[test]
+    fn decode_engine_keeps_native_and_pid_dispatch_byte_exact() {
+        let (packed, native_output) = decode_fixture();
+        let legacy_native = DecodeSpy::new(native_output.clone());
+        let expected = legacy_decode_one(&legacy_native, &packed);
+        let native = DecodeSpy::new(native_output);
+        let cancel = CancelFlag::new();
+        let got = Chroma::decode_with_vae(&native, &packed, 48, 32, None, None, &cancel).unwrap();
+        assert_eq!(got, expected);
+        assert_eq!(native.calls.get(), 1);
+
+        let tiling = mlx_gen::TilingConfig::spatial_only(16, 4);
+        let tiled_output = Array::from_slice(
+            &[
+                -1.0f32, -0.5, 0.0, 0.5, 1.0, 0.25, 1.0, 0.5, 0.0, -0.5, -1.0, -0.25, -0.75, -0.25,
+                0.25, 0.75, -1.0, 1.0,
+            ],
+            &[1, 3, 1, 2, 3],
+        );
+        let legacy_tiled = DecodeSpy::new(tiled_output.clone());
+        let legacy_tiled_decoded = legacy_tiled
+            .decode_tiled(
+                &unpack_latents(&packed, 48, 32).unwrap(),
+                &tiling,
+                Some(&cancel),
+            )
+            .unwrap()
+            .as_dtype(mlx_rs::Dtype::Float32)
+            .unwrap();
+        let expected_tiled = decoded_to_image(&legacy_tiled_decoded).unwrap();
+        let native_tiled = DecodeSpy::new(tiled_output);
+        let got =
+            Chroma::decode_with_vae(&native_tiled, &packed, 48, 32, None, Some(&tiling), &cancel)
+                .unwrap();
+        assert_eq!(got, expected_tiled);
+        assert_eq!(native_tiled.calls.get(), 1);
+
+        let native = DecodeSpy::new(Array::zeros::<f32>(&[1, 3, 1, 2, 3]).unwrap());
+        let pid_output = Array::from_slice(&vec![1.0f32; 3 * 4 * 5], &[1, 3, 4, 5]);
+        let legacy_pid = DecodeSpy::new(pid_output.clone());
+        let expected_pid = legacy_decode_one(&legacy_pid, &packed);
+        let pid = DecodeSpy::new(pid_output);
+        let got =
+            Chroma::decode_with_vae(&native, &packed, 48, 32, Some(&pid), None, &cancel).unwrap();
+        assert_eq!(got, expected_pid);
+        assert_eq!(native.calls.get(), 0);
+        assert_eq!(pid.calls.get(), 1);
+    }
 
     /// A Chroma with no loadable components — enough to exercise the request-boundary paths
     /// (`validate`, pre-run cancellation) that run before any tensor is touched. The residency is

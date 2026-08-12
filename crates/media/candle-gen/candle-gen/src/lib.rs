@@ -94,7 +94,7 @@ pub mod grounding;
 // final `vae.decode(latent)` through so a per-generation `req.use_pid` toggle can swap in NVIDIA PiD
 // (`candle-gen-pid`) without N bespoke per-engine ports. The candle twin of `mlx_gen::decoder`.
 pub mod decoder;
-pub use decoder::LatentDecoder;
+pub use decoder::{ensure_decoder_compatible, ensure_decoder_layout, LatentDecoder};
 
 // Shared VRAM-budget probe (sc-9014 / F-030): the trusted-path `nvidia-smi` resolver the video-VAE
 // decode tilers (seedvr2/wan/ltx) route through, instead of each spawning a bare

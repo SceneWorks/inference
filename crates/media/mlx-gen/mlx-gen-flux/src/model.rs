@@ -885,12 +885,14 @@ impl Flux1 {
             )?;
             on_progress(Progress::Decoding);
             let unpacked = unpack_latents(&final_latents, req.width, req.height)?;
-            let decoded = match (&pid_decoder, &native_tiling) {
-                (Some(pid), _) => pid.decode(&unpacked)?,
-                (None, Some(tiling)) => vae.decode_tiled(&unpacked, tiling, Some(&req.cancel))?,
-                (None, None) => vae.decode(&unpacked)?,
-            }
-            .as_dtype(Dtype::Float32)?;
+            let decoded = decode_latents_via_seam(
+                vae,
+                pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder),
+                self.descriptor.denoiser_output_latent_space,
+                &unpacked,
+                native_tiling.as_ref(),
+                &req.cancel,
+            )?;
             // A fault probe must observe the selected lazy decode before returning its synthetic
             // error. Normal untiled requests retain their historical materialization path.
             if req.memory.is_some_and(|memory| {
@@ -908,6 +910,26 @@ impl Flux1 {
         }
         Ok(GenerationOutput::Images(images))
     }
+}
+
+/// Decode the final unpacked FLUX latent through the native VAE or a request-selected PiD
+/// override. Kept as one production helper so the default/no-override byte contract can be tested
+/// without constructing the transformer and text encoders.
+fn decode_latents_via_seam(
+    native: &dyn LatentDecoder,
+    decoder_override: Option<&dyn LatentDecoder>,
+    expected_latent_space: Option<&gen_core::LatentSpace>,
+    latents: &Array,
+    native_tiling: Option<&mlx_gen::TilingConfig>,
+    cancel: &mlx_gen::CancelFlag,
+) -> Result<Array> {
+    let decoder = decoder_override.unwrap_or(native);
+    mlx_gen::ensure_decoder_compatible(expected_latent_space, decoder)?;
+    let decoded = match native_tiling {
+        Some(tiling) => decoder.decode_tiled(latents, tiling, Some(cancel))?,
+        None => decoder.decode(latents)?,
+    };
+    Ok(decoded.as_dtype(Dtype::Float32)?)
 }
 
 /// Few-step profile defaults `(steps, guidance)` applied when the request omits them (sc-2908). The
@@ -1102,6 +1124,121 @@ mlx_gen::register_generators! {
 mod tests {
     use super::*;
     use crate::config::{FLUX1_DEV_ID, FLUX1_SCHNELL_ID};
+    use std::cell::Cell;
+
+    struct DecodeSpy {
+        output: Array,
+        calls: Cell<usize>,
+    }
+
+    impl DecodeSpy {
+        fn new(output: Array) -> Self {
+            Self {
+                output,
+                calls: Cell::new(0),
+            }
+        }
+    }
+
+    impl LatentDecoder for DecodeSpy {
+        fn input_latent_space(&self) -> Option<&gen_core::LatentSpace> {
+            Some(&gen_core::FLUX1_LATENT_SPACE)
+        }
+
+        fn decode(&self, _latents: &Array) -> Result<Array> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(self.output.clone())
+        }
+    }
+
+    fn legacy_decode_one(decoder: &dyn LatentDecoder, latents: &Array) -> Image {
+        let decoded = decoder
+            .decode(latents)
+            .unwrap()
+            .as_dtype(Dtype::Float32)
+            .unwrap();
+        decoded_to_image(&decoded).unwrap()
+    }
+
+    /// SC-18309 N1: compare the helper used by the FLUX generation loop against the exact
+    /// pre-seam decode expression. The asymmetric NCTHW fixture makes dtype conversion,
+    /// singleton-frame removal, NCHW-to-RGB layout, denormalization, and output bytes observable.
+    /// The override arm proves a PiD decoder retains precedence and its dynamic output geometry.
+    #[test]
+    fn decode_engine_keeps_native_and_pid_dispatch_byte_exact() {
+        let latents = Array::from_slice(&[0.0f32; 16 * 4 * 6], &[1, 16, 4, 6]);
+        let native_output = Array::from_slice(
+            &[
+                -1.0f32, -0.5, 0.0, 0.5, 1.0, 0.25, // R
+                1.0, 0.5, 0.0, -0.5, -1.0, -0.25, // G
+                -0.75, -0.25, 0.25, 0.75, -1.0, 1.0, // B
+            ],
+            &[1, 3, 1, 2, 3],
+        );
+        let legacy_native = DecodeSpy::new(native_output.clone());
+        let expected = legacy_decode_one(&legacy_native, &latents);
+        let native = DecodeSpy::new(native_output);
+        let cancel = mlx_gen::CancelFlag::new();
+        let decoded = decode_latents_via_seam(
+            &native,
+            None,
+            Some(&gen_core::FLUX1_LATENT_SPACE),
+            &latents,
+            None,
+            &cancel,
+        )
+        .unwrap();
+        let got = decoded_to_image(&decoded).unwrap();
+        assert_eq!(got, expected);
+        assert_eq!(native.calls.get(), 1);
+
+        let tiled_output = Array::from_slice(
+            &[
+                -1.0f32, -0.5, 0.0, 0.5, 1.0, 0.25, 1.0, 0.5, 0.0, -0.5, -1.0, -0.25, -0.75, -0.25,
+                0.25, 0.75, -1.0, 1.0,
+            ],
+            &[1, 3, 1, 2, 3],
+        );
+        let tiling = mlx_gen::TilingConfig::spatial_only(16, 4);
+        let legacy_tiled = DecodeSpy::new(tiled_output.clone());
+        let legacy_tiled_decoded = legacy_tiled
+            .decode_tiled(&latents, &tiling, Some(&cancel))
+            .unwrap()
+            .as_dtype(Dtype::Float32)
+            .unwrap();
+        let expected_tiled = decoded_to_image(&legacy_tiled_decoded).unwrap();
+        let native_tiled = DecodeSpy::new(tiled_output);
+        let decoded = decode_latents_via_seam(
+            &native_tiled,
+            None,
+            Some(&gen_core::FLUX1_LATENT_SPACE),
+            &latents,
+            Some(&tiling),
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(decoded_to_image(&decoded).unwrap(), expected_tiled);
+        assert_eq!(native_tiled.calls.get(), 1);
+
+        let native = DecodeSpy::new(Array::zeros::<f32>(&[1, 3, 1, 2, 3]).unwrap());
+        let pid_output = Array::from_slice(&vec![1.0f32; 3 * 4 * 5], &[1, 3, 4, 5]);
+        let legacy_pid = DecodeSpy::new(pid_output.clone());
+        let expected_pid = legacy_decode_one(&legacy_pid, &latents);
+        let pid = DecodeSpy::new(pid_output);
+        let decoded = decode_latents_via_seam(
+            &native,
+            Some(&pid),
+            Some(&gen_core::FLUX1_LATENT_SPACE),
+            &latents,
+            None,
+            &cancel,
+        )
+        .unwrap();
+        let got = decoded_to_image(&decoded).unwrap();
+        assert_eq!(got, expected_pid);
+        assert_eq!(native.calls.get(), 0);
+        assert_eq!(pid.calls.get(), 1);
+    }
 
     #[test]
     fn validates_base_txt2img_request() {

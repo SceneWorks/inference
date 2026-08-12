@@ -695,6 +695,10 @@ impl Pipeline {
             // then BN-de-normalizes; here PiD gets that grid before de-normalization. Returns `[1,3,4H,4W]`.
             let decoded = match &pid_decoder {
                 Some(pid) => {
+                    candle_gen::ensure_decoder_layout(
+                        Some(&candle_gen::gen_core::FLUX2_PACKED_LATENT_SPACE),
+                        pid,
+                    )?;
                     let (b, _seq, c) = latents.dims3()?;
                     let packed = latents
                         .reshape((b, latent_h, latent_w, c))?
@@ -788,6 +792,10 @@ impl Pipeline {
             on_progress(Progress::Decoding);
             let decoded = match &pid_decoder {
                 Some(pid) => {
+                    candle_gen::ensure_decoder_layout(
+                        Some(&candle_gen::gen_core::FLUX2_PACKED_LATENT_SPACE),
+                        pid,
+                    )?;
                     let (b, _seq, c) = latents.dims3()?;
                     let packed = latents
                         .reshape((b, latent_h, latent_w, c))?

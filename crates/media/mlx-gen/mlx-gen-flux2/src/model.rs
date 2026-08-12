@@ -1210,7 +1210,13 @@ impl Flux2 {
                         // PiD: `packed` (NHWC [1,h,w,128]) is already the BN-normalized packed latent the
                         // student trained on — the exact tensor `decode_packed_latents` BN-de-normalizes
                         // (sc-7847). Hand it over as NCHW [1,128,h,w]; the student returns [1,3,4H,4W].
-                        Some(d) => d.decode(&packed.transpose_axes(&[0, 3, 1, 2])?)?,
+                        Some(d) => {
+                            mlx_gen::ensure_decoder_layout(
+                                self.descriptor.denoiser_output_latent_space,
+                                d,
+                            )?;
+                            d.decode(&packed.transpose_axes(&[0, 3, 1, 2])?)?
+                        }
                         // Native VAE: BN-de-normalize + 2×2-unpatchify + decode → NHWC [1,H,W,3] → NCHW.
                         None => match (!self.variant.is_dev())
                             .then(|| crate::memory_strategy::decode_tiling(req))

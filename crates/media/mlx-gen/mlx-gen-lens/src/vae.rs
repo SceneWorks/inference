@@ -55,9 +55,11 @@ pub fn decode_with_tiling(
         // PiD takes NCHW [B,128,h,w] and returns NCHW [B,3,4H,4W]; transpose back to NHWC so the
         // result matches the native `decode_packed_latents` layout (Lens's `decoded_to_image` is
         // NHWC, unlike `mlx_gen::image::decoded_to_image`).
-        Some(d) => Ok(d
-            .decode(&packed.transpose_axes(&[0, 3, 1, 2])?)?
-            .transpose_axes(&[0, 2, 3, 1])?), // NCHW [B,3,4H,4W] → NHWC [B,4H,4W,3]
+        Some(d) => {
+            mlx_gen::ensure_decoder_layout(Some(&mlx_gen::gen_core::FLUX2_PACKED_LATENT_SPACE), d)?;
+            Ok(d.decode(&packed.transpose_axes(&[0, 3, 1, 2])?)?
+                .transpose_axes(&[0, 2, 3, 1])?) // NCHW [B,3,4H,4W] → NHWC [B,4H,4W,3]
+        }
         None => match tiling {
             Some(cfg) => vae.decode_packed_latents_tiled(&packed, cfg, cancel),
             None => vae.decode_packed_latents(&packed), // NHWC [B,H,W,3]

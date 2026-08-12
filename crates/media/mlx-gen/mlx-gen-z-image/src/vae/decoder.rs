@@ -270,6 +270,9 @@ impl Vae {
         cfg: &TilingConfig,
         cancel: Option<&CancelFlag>,
     ) -> Result<Array> {
+        if cancel.is_some_and(CancelFlag::is_cancelled) {
+            return Err(Error::Canceled);
+        }
         let sh = latents.shape();
         let (h, w) = if sh.len() == 5 {
             (sh[3], sh[4])
@@ -334,6 +337,18 @@ impl LatentDecoder for Vae {
 
     fn decode(&self, latents: &Array) -> Result<Array> {
         Vae::decode(self, latents)
+    }
+
+    fn decode_tiled(
+        &self,
+        latents: &Array,
+        tiling: &TilingConfig,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<Array> {
+        if cancel.is_some_and(CancelFlag::is_cancelled) {
+            return Err(Error::Canceled);
+        }
+        Vae::decode_tiled(self, latents, tiling, cancel)
     }
 }
 
