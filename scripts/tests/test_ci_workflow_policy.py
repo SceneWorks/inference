@@ -36,7 +36,9 @@ MACOS_MAGE_LOCK = (
     "crates/media/mlx-gen/_vendor/mage_flow/requirements-oracles.txt"
 )
 MACOS_INTERPRETER = "python3.12"
-WINDOWS_INTERPRETER = "py -3.12"
+WINDOWS_SETUP_ACTION = "actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1"
+WINDOWS_PYTHON_VERSION = 'python-version: "3.12.10"'
+WINDOWS_INTERPRETER = r'"%pythonLocation%\python.exe"'
 APPROVED_REAL_WEIGHT_LOCKS = {
     MACOS_HUB_LOCK,
     WINDOWS_HUB_LOCK,
@@ -318,23 +320,63 @@ def real_weight_windows_interpreter_errors(workflow: str) -> list[str]:
     """
     errors: list[str] = []
     interpreter = re.compile(
-        r"(?<![\w./$\"'-])"
-        r"(py(?:\s+-\d+(?:\.\d+)?)?|python[0-9.]*)"
-        r"(?![\w-])",
+        rf"({re.escape(WINDOWS_INTERPRETER)}|"
+        r"(?<![\w./$\"'-])py(?:\s+-\d+(?:\.\d+)?)?(?![\w-])|"
+        r"(?<![\w./$\"'-])python[0-9.]*(?:\.exe)?(?![\w-]))",
         re.IGNORECASE,
+    )
+    setup_action = re.compile(
+        rf"\s*(?:-\s*)?uses:\s*{re.escape(WINDOWS_SETUP_ACTION)}\s*$"
+    )
+    setup_version = re.compile(
+        rf"\s*{re.escape(WINDOWS_PYTHON_VERSION)}\s*$"
     )
     for job, lines in workflow_job_bodies(workflow).items():
         runs_on = next((line for line in lines if line.startswith("    runs-on:")), "")
         if "windows" not in runs_on.lower():
             continue
-        for line in lines:
+        setup_indices = [
+            index
+            for index, line in enumerate(lines)
+            if setup_action.fullmatch(line.split("#", 1)[0])
+        ]
+        if len(setup_indices) != 1:
+            errors.append(
+                f"{job}: expected exactly one pinned Windows setup-python action, "
+                f"found {len(setup_indices)}"
+            )
+            setup_index = len(lines)
+        else:
+            setup_index = setup_indices[0]
+            setup_block = lines[setup_index : setup_index + 5]
+            if not any(
+                setup_version.fullmatch(line.split("#", 1)[0]) for line in setup_block
+            ):
+                errors.append(
+                    f"{job}: setup-python must install exact CPython 3.12.10"
+                )
+        for index, line in enumerate(lines):
             command = line.split("#", 1)[0]
-            for found in interpreter.finditer(command):
+            found_interpreters = list(interpreter.finditer(command))
+            looks_like_python_command = bool(
+                re.search(r"\s-m\s+pip\b|scripts[/\\][^\s]+\.py\b", command, re.IGNORECASE)
+            )
+            if looks_like_python_command and WINDOWS_INTERPRETER not in command:
+                errors.append(
+                    f"{job}: Windows Python command must use {WINDOWS_INTERPRETER}: "
+                    f"{command.strip()!r}"
+                )
+            for found in found_interpreters:
                 name = found.group(1)
                 if name != WINDOWS_INTERPRETER:
                     errors.append(
                         f"{job}: Windows steps must name {WINDOWS_INTERPRETER}, found "
                         f"{name!r} in {command.strip()!r}"
+                    )
+                elif index <= setup_index:
+                    errors.append(
+                        f"{job}: Windows Python runs before the pinned setup action: "
+                        f"{command.strip()!r}"
                     )
             if re.search(r"\s-m\s+pip\s+install\b", command, re.IGNORECASE) and not re.search(
                 r"\|\|\s+exit /b 1\s*$", command
@@ -637,7 +679,9 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             for line in lines
             if WINDOWS_INTERPRETER in line and not line.lstrip().startswith("#")
         ]
-        self.assertTrue(windows_python_lines, "Windows policy inspected no Python commands")
+        self.assertEqual(len(windows_python_lines), 65)
+        self.assertEqual(workflow.count(f"uses: {WINDOWS_SETUP_ACTION}"), 11)
+        self.assertEqual(workflow.count(WINDOWS_PYTHON_VERSION), 11)
         self.assertIn(
             f'{WINDOWS_INTERPRETER} -c "import sys; assert sys.version_info[:2] == (3, 12), sys.version"',
             workflow,
@@ -654,9 +698,11 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             with self.subTest(replacement=replacement):
                 mutated = workflow.replace(WINDOWS_INTERPRETER, replacement, 1)
                 self.assertTrue(real_weight_windows_interpreter_errors(mutated))
-        no_fail_fast = workflow.replace(" || exit /b 1", "", 1)
-        self.assertTrue(real_weight_windows_interpreter_errors(no_fail_fast))
         first_windows_install = pip_installs[0]
+        no_fail_fast = workflow.replace(
+            first_windows_install, first_windows_install.removesuffix(" || exit /b 1"), 1
+        )
+        self.assertTrue(real_weight_windows_interpreter_errors(no_fail_fast))
         whitespace_install_without_fail_fast = first_windows_install.replace(
             "pip install", "pip  install", 1
         ).removesuffix(" || exit /b 1")
@@ -665,6 +711,22 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         )
         self.assertNotEqual(whitespace_bypass, workflow)
         self.assertTrue(real_weight_windows_interpreter_errors(whitespace_bypass))
+        missing_setup = workflow.replace(f"uses: {WINDOWS_SETUP_ACTION}", "uses: missing", 1)
+        self.assertTrue(real_weight_windows_interpreter_errors(missing_setup))
+        wrong_version = workflow.replace(WINDOWS_PYTHON_VERSION, 'python-version: "3.14.0"', 1)
+        self.assertTrue(real_weight_windows_interpreter_errors(wrong_version))
+        wrong_setup_comment_decoy = workflow.replace(
+            f"uses: {WINDOWS_SETUP_ACTION}",
+            f"uses: actions/setup-python@{'0' * 40} # uses: {WINDOWS_SETUP_ACTION}",
+            1,
+        )
+        self.assertTrue(real_weight_windows_interpreter_errors(wrong_setup_comment_decoy))
+        wrong_version_comment_decoy = workflow.replace(
+            WINDOWS_PYTHON_VERSION,
+            f'python-version: "3.14.0" # {WINDOWS_PYTHON_VERSION}',
+            1,
+        )
+        self.assertTrue(real_weight_windows_interpreter_errors(wrong_version_comment_decoy))
 
     def test_real_weight_macos_interpreter_policy_discriminates_mutations(self) -> None:
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
@@ -976,6 +1038,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
 
     def test_mage_media_lane_requires_verified_operator_cpu_oracles(self) -> None:
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        mlx_media = "\n".join(workflow_job_bodies(workflow)["mlx-media"])
         self.assertIn('MAGE_REQUIRE_GOLDENS: "1"', workflow)
         self.assertIn(
             'echo "MAGE_GOLDEN_DIR=$RUNNER_TEMP/mage-flow-oracles" >> "$GITHUB_ENV"',
@@ -994,7 +1057,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             "UV_PYTHON_INSTALL_DIR: ${{ runner.temp }}/python-install",
             workflow,
         )
-        self.assertNotIn("uses: actions/setup-python", workflow)
+        self.assertNotIn("uses: actions/setup-python", mlx_media)
         self.assertNotIn("3.12.11", workflow)
         self.assertIn("Run Mage-Flow text-encoder parity", workflow)
         self.assertIn("Run Mage-VAE all-geometry parity", workflow)
