@@ -25,6 +25,11 @@
 //!
 //! # Tolerances — three tiers, matching the decode suite's structure
 //!
+//! `observed` is the dev-Mac figure — the worst of the hosts this runs on. Where a tier's floor is
+//! "MLX's convolution kernel" the observed value is **host-dependent** and lands far lower on a
+//! host whose `conv1d` does not lower to a reduced-precision matmul; the gates are upper bounds and
+//! hold in both regimes.
+//!
 //! | tier | gate | observed | floor |
 //! |---|---|---|---|
 //! | adaptive pool, latent normalization, `std == exp(logs)`, matmul-free conv | 1e-5 | ~1e-7 | f32 round-off |
@@ -35,13 +40,23 @@
 //! | the posterior's `std` | 1e-1 | 4.5e-2 | `exp` amplifying `logs`' absolute error |
 //!
 //! **The convolutional floor is MLX's, and that is measured rather than assumed.** A single
-//! 1 → 24 channel, 7-tap convolution is 8.4e-4 off — far too much for seven f32 multiply-adds —
-//! so `a_matmul_free_convolution_reproduces_the_reference_exactly` recomputes exactly that
-//! convolution from the same fused weights with **no matmul at all** (seven shifted, broadcast
-//! products) and lands inside 1e-5. The weight-norm fusion, the layout transpose, the padding and
-//! the bias are therefore exact, and what `conv1d` adds is the reduced-precision f32 matmul MLX
-//! dispatches to on Metal (`tests/audio_vae_parity.rs` documents the same floor for the decode
-//! half). `the_trunk_residual_is_accumulated_round_off` then walks one conv → one unit → one
+//! 1 → 24 channel, 7-tap convolution comes back 8.4e-4 off on this repo's dev Macs — far too much
+//! for seven f32 multiply-adds — so `a_matmul_free_convolution_reproduces_the_reference_exactly`
+//! recomputes exactly that convolution from the same fused weights with **no matmul at all**
+//! (seven shifted, broadcast products) and lands inside 1e-5, then reads `WnConv1d`'s own taps back
+//! out with a unit impulse and checks that the difference between the two paths is no larger than
+//! that impulse says the host's kernel can explain. The weight-norm fusion, the layout transpose,
+//! the padding and the bias are therefore exact, and what `conv1d` adds is the reduced-precision
+//! f32 matmul MLX dispatches to on Metal (`tests/audio_vae_parity.rs` documents the same floor for
+//! the decode half).
+//!
+//! **How big that kernel share is depends on the host, so no test here asserts a floor for it.**
+//! The hosted macOS CI runner's `conv1d` is exact: both paths return 1.967e-7 and the convolutional
+//! tiers below sit three orders under their gates. The dev Macs' do not. Every gate in this file is
+//! an upper bound, which is true in both regimes; see that test's docs for the assertion this
+//! replaced and why a lower bound was also the wrong direction for catching a regression.
+//!
+//! `the_trunk_residual_is_accumulated_round_off` then walks one conv → one unit → one
 //! block → the whole trunk and shows that floor accumulating monotonically, which a structural
 //! error could not do: a wrong dilation, a wrong `ceil(stride/2)` padding or a mis-ordered Snake
 //! is order-1 wrong at the FIRST stage containing it.
@@ -100,6 +115,13 @@ const UNIT_TOL: f32 = 1e-5;
 /// Mutation probes must clear the whole-encoder gate by 10x, or "the output moved" could be
 /// numerical jitter rather than a wiring difference.
 const MUTATION_FLOOR: f32 = 5e-2;
+/// Slack on the impulse error budget in `a_matmul_free_convolution_reproduces_the_reference_exactly`.
+///
+/// `tap_err · taps · max|x|` is a worst case that assumes every tap errs in the same direction at
+/// the input's peak, so the observed residual sits *under* it: 0.33x on a host whose `conv1d`
+/// lowers to a reduced-precision matmul, ~1.0x on one where it does not and the budget is just the
+/// structural term. 4x covers both regimes and still leaves nothing unexplained through.
+const BUDGET_SLACK: f32 = 4.0;
 
 /// The tiny geometry the fixture was dumped at. Mirrors `dump_minimax_h3_audio_vae_encode.py`.
 ///
@@ -371,10 +393,11 @@ fn the_trunk_residual_is_accumulated_round_off() {
     let x = nlc("in.encode.waveform");
 
     // ONE weight-normed convolution: 1 -> 24 channels, k7, 'same' padding. Seven multiply-adds
-    // per output — and it is already 8e-4 off, which is the whole point: see
+    // per output — and on a dev Mac it is already 8e-4 off, which is the whole point: see
     // `a_matmul_free_convolution_reproduces_the_reference_exactly` for the proof that the
     // weights, the layout transpose, the padding and the bias are all exact and this residual is
-    // MLX's convolution kernel.
+    // MLX's convolution kernel. How much of it there is depends on the host; the gate is an upper
+    // bound, and a host with an exact `conv1d` simply lands three orders under it.
     let mut w = model_weights();
     let conv_in = WnConv1d::from_weights(&mut w, "encoder.block.0", 1, 3, 1, Dtype::Float32)
         .unwrap()
@@ -990,21 +1013,40 @@ fn the_key_bias_is_read_and_is_inert_by_construction() {
     );
 }
 
-/// The single-convolution residual is **MLX's convolution kernel**, not the port's weights.
+/// The single-convolution residual is **MLX's convolution kernel**, not the port's weights — and
+/// that conclusion is reached in a way that holds on any host.
 ///
-/// `encoder.block.0` is a 1 -> 24 channel, 7-tap convolution: seven multiply-adds per output,
-/// which f32 should evaluate to ~1e-7. It comes back 8e-4 off, and this test is what says whose
-/// 8e-4 it is. The same convolution is recomputed here with **no matmul at all** — seven shifted
-/// slices, each broadcast-multiplied by one tap vector and summed — from the same `weight_g` /
-/// `weight_v` / `bias` the loader reads, through the same fusion and the same padding.
+/// `encoder.block.0` is a 1 -> 24 channel, 7-tap convolution: seven multiply-adds per output, which
+/// f32 should evaluate to ~1e-7. On this repo's dev Macs it comes back ~8e-4 off, and this test is
+/// what says whose 8e-4 it is. It makes three measurements and then does the arithmetic:
 ///
-/// That reconstruction lands within [`UNIT_TOL`], which pins four things at once: the weight-norm
-/// fusion (`g · v / ‖v‖`, norm over axes 1..), the `[out, in, k] -> [out, k, in]` layout
-/// transpose, the 'same' padding, and the bias add. Anything wrong in those is a *structural*
-/// error and would be order-1 here, not 1e-7. So the residual `WnConv1d::forward` carries is the
-/// kernel MLX dispatches to — the reduced-precision f32 matmul on Metal that
-/// `tests/audio_vae_parity.rs` documents for the decode half — and the trunk's 7.9e-3 is that
+/// 1. **The reference's semantics, with no matmul at all.** The same convolution recomputed from
+///    the same `weight_g` / `weight_v` / `bias` as seven shifted, broadcast products — landing
+///    within [`UNIT_TOL`], which pins the weight-norm fusion (`g · v / ‖v‖`, norm over axes 1..),
+///    the `[out, in, k] -> [out, k, in]` layout transpose, the 'same' padding and the bias add.
+///    Anything wrong there is a *structural* error and would be order-1, not 1e-7.
+/// 2. **The port's effective kernel, by unit impulse.** A single 1.0 in the input makes every
+///    output exactly one multiply-add, so `WnConv1d`'s own taps read straight back out. They must
+///    match (1)'s fusion within [`CONV_TOL`], and the residual they leave is the kernel's
+///    per-product precision with no accumulation in it.
+/// 3. **The port's convolution over the real input**, against the reference, within [`CONV_TOL`].
+///
+/// Then (3) must fit inside the budget (2) allows plus what (1) costs. It does, so nothing in the
+/// residual is unaccounted for and none of it can be a port defect. The trunk's 7.9e-3 is that same
 /// floor accumulating over ~30 convolutions.
+///
+/// # What this test deliberately does not assert
+///
+/// **How large the kernel's share is, is a property of the host.** An earlier revision asserted
+/// that MLX's `conv1d` must be at least 100x worse than the matmul-free path. That is true where
+/// `conv1d` lowers to the reduced-precision f32 Metal matmul `tests/audio_vae_parity.rs` documents
+/// for the decode half (~8.4e-4 here, ~4000x), and false on the hosted CI runner, where `conv1d`
+/// is exact and both paths return an identical 1.967e-7. The premise was machine-dependent, so the
+/// test failed on half the fleet — and it was the wrong direction for catching regressions anyway:
+/// a broken port makes `conv1d`'s residual *larger*, which satisfies a lower bound more easily.
+/// Every gate here is an upper bound instead, and the budget in (4) degrades gracefully to
+/// `struct_abs` on a host with an exact kernel rather than asserting a floor that host has no
+/// reason to have.
 #[test]
 fn a_matmul_free_convolution_reproduces_the_reference_exactly() {
     let f = fixture();
@@ -1032,6 +1074,13 @@ fn a_matmul_free_convolution_reproduces_the_reference_exactly() {
     let fused = mlx_rs::ops::multiply(g, mlx_rs::ops::divide(v, &norm).unwrap()).unwrap();
     let taps = fused.shape()[2];
     assert_eq!(fused.shape(), &[24, 1, 7]);
+    // A near-constant kernel would make the impulse readout below agree with anything, and a
+    // near-zero one would make every peak-relative gate here divide by noise.
+    assert!(
+        std_dev(&fused) > 1e-2,
+        "the fused kernel is nearly constant ({:.3e}); the comparisons below would be vacuous",
+        std_dev(&fused)
+    );
 
     // Zero-pad 3 either side ('same' for k7), then accumulate seven shifted, broadcast products.
     let s = x.shape().to_vec();
@@ -1052,25 +1101,84 @@ fn a_matmul_free_convolution_reproduces_the_reference_exactly() {
             None => term,
         });
     }
-    let got = mlx_rs::ops::add(acc.unwrap(), f.require("encoder.block.0.bias").unwrap()).unwrap();
+    let bias = f.require("encoder.block.0.bias").unwrap();
+    let got = mlx_rs::ops::add(acc.unwrap(), bias).unwrap();
 
     assert_parity(&got, &want, UNIT_TOL, "matmul-free encoder.block.0");
 
-    // ...and the loader's own convolution agrees with the reference far less well, which is the
-    // measurement this test exists to make.
+    // 2. The PORT's effective kernel, read out by a unit impulse.
+    //
+    // `y[0, t, o] = bias[o] + Σ_k fused[o, k] · imp[t + k - pad]`, and `imp` is 1.0 at `p` and 0
+    // everywhere else, so `y[0, p + pad - k, o] - bias[o]` IS `fused[o, k]` — one multiply-add per
+    // output, no accumulation, no cancellation. That reads the fusion, the `[out, in, k] ->
+    // [out, k, in]` transpose, the padding offset and the bias straight back out of the loaded
+    // module, and the residual it leaves is the kernel's per-product precision with nothing else
+    // mixed into it.
+    let pad = taps / 2;
     let mut w = model_weights();
-    let via_conv = WnConv1d::from_weights(&mut w, "encoder.block.0", 1, 3, 1, Dtype::Float32)
-        .unwrap()
-        .forward(&x)
+    let conv =
+        WnConv1d::from_weights(&mut w, "encoder.block.0", 1, pad, 1, Dtype::Float32).unwrap();
+
+    let span = 2 * taps;
+    let p = span / 2;
+    let mut imp = vec![0.0f32; span as usize];
+    imp[p as usize] = 1.0;
+    let response = conv
+        .forward(&Array::from_slice(&imp, &[1, span, 1]))
         .unwrap();
-    let (kernel_gap, _) = rel(&via_conv, &want);
-    let (exact_gap, _) = rel(&got, &want);
+
+    let (rv, bv, fv) = (values(&response), values(bias), values(&fused));
+    let out = fused.shape()[0] as usize;
+    let k_len = taps as usize;
+    let mut recovered = vec![0.0f32; out * k_len];
+    let mut tap_err = 0.0f32;
+    for o in 0..out {
+        for k in 0..k_len {
+            let t = (p + pad) as usize - k;
+            let v = rv[t * out + o] - bv[o];
+            recovered[o * k_len + k] = v;
+            tap_err = tap_err.max((v - fv[o * k_len + k]).abs());
+        }
+    }
+    let recovered = Array::from_slice(&recovered, &[out as i32, 1, taps]);
+    assert_parity(
+        &recovered,
+        &fused,
+        CONV_TOL,
+        "the port's impulse-recovered kernel",
+    );
+
+    // 3. ...and the port's convolution over the real input still matches the reference.
+    let via_conv = conv.forward(&x).unwrap();
+    assert_parity(&via_conv, &want, CONV_TOL, "WnConv1d encoder.block.0");
+
+    // 4. The accounting: every part of that residual is already paid for.
+    //
+    // Deliberately NOT `kernel_gap > exact_gap * 100`. That held on a host whose `conv1d` lowers to
+    // a reduced-precision matmul and failed on one whose `conv1d` is exact — and it is the wrong
+    // direction for regression detection besides, since breaking the port makes `kernel_gap` LARGER
+    // and a lower bound EASIER to satisfy. The portable claim is an upper bound: the impulse says
+    // this host's kernel misrepresents a single tap by at most `tap_err`, so a `taps`-long
+    // convolution over `x` can stray by at most `tap_err · taps · max|x|`, on top of what the
+    // structure itself costs (`struct_abs`, measured at step 1). Nothing is left over to be a port
+    // defect. On a host with an exact `conv1d` the first term vanishes and the bound collapses to
+    // `struct_abs` — still true, and still the same conclusion.
+    let peak = |a: &Array| -> f32 { a.abs().unwrap().max(None).unwrap().item() };
+    let diff = |a: &Array, b: &Array| peak(&mlx_rs::ops::subtract(a, b).unwrap());
+    let (x_max, obs_abs, struct_abs) = (peak(&x), diff(&via_conv, &want), diff(&got, &want));
+    let budget = tap_err * taps as f32 * x_max + struct_abs;
     println!(
-        "  MLX conv1d vs reference {kernel_gap:.3e}; the SAME arithmetic without a matmul          {exact_gap:.3e}"
+        "  conv1d vs reference {:.3e}; the SAME arithmetic without a matmul {:.3e}",
+        obs_abs / peak(&want),
+        struct_abs / peak(&want)
+    );
+    println!(
+        "  per-tap kernel error {tap_err:.3e} -> budget {budget:.3e} vs observed {obs_abs:.3e} ({:.2}x)",
+        obs_abs / budget.max(f32::MIN_POSITIVE)
     );
     assert!(
-        kernel_gap > exact_gap * 100.0,
-        "the matmul-free reconstruction is no better than MLX's conv1d ({exact_gap:.3e} vs          {kernel_gap:.3e}); the residual is NOT a kernel-precision floor and this test's          conclusion does not hold"
+        obs_abs <= budget * BUDGET_SLACK,
+        "WnConv1d strays {obs_abs:.3e} from the reference, but this host's kernel precision          ({tap_err:.3e} per tap) and the port's own structural residual ({struct_abs:.3e}) only          account for {budget:.3e} — the excess is NOT kernel round-off"
     );
 }
 
