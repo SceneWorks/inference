@@ -110,10 +110,37 @@ fn f32_component_bytes(path: &std::path::Path, component: &str) -> gen_core::Res
     cast_component_bytes(path, 4, component, |_| Ok(()))
 }
 
-fn selected_text_encoder_bytes(spec: &LoadSpec, base: &std::path::Path) -> gen_core::Result<u64> {
+fn selected_language_encoder_bytes(
+    spec: &LoadSpec,
+    base: &std::path::Path,
+) -> gen_core::Result<u64> {
     let selected = crate::ENCODER_CONTRACT.source_for_load(spec, base)?;
-    let tensors = selected.tensor_headers()?;
+    let tensors = selected.materialized_language_tensor_headers(&crate::ENCODER_CONTRACT)?;
     cast_tensor_headers_bytes(&tensors, 4, "selected text encoder", |_| Ok(()))
+}
+
+fn base_vision_encoder_bytes(base: &std::path::Path) -> gen_core::Result<u64> {
+    let source = crate::ENCODER_CONTRACT
+        .validate_source_against_base(&WeightsSource::Dir(base.join("text_encoder")), base)?;
+    let tensors = source.materialized_vision_tensor_headers(
+        &crate::VISION_ENCODER_CONTRACT,
+        &crate::ENCODER_CONTRACT,
+    )?;
+    cast_tensor_headers_bytes(&tensors, 4, "base vision encoder", |_| Ok(()))
+}
+
+fn conditioning_encoder_bytes(
+    provider_id: &str,
+    spec: &LoadSpec,
+    base: &std::path::Path,
+) -> gen_core::Result<u64> {
+    let language = selected_language_encoder_bytes(spec, base)?;
+    if provider_id != "qwen_image_edit" {
+        return Ok(language);
+    }
+    language
+        .checked_add(base_vision_encoder_bytes(base)?)
+        .ok_or_else(|| gen_core::Error::Msg("qwen-image conditioning byte sum overflow".into()))
 }
 
 pub(crate) fn provider_contract(
@@ -134,7 +161,7 @@ pub(crate) fn provider_contract(
                 &["vae"],
             )
             .unwrap_or_default();
-            components.text_encoder = selected_text_encoder_bytes(spec, base)?;
+            components.text_encoder = conditioning_encoder_bytes(provider_id, spec, base)?;
             components
         }
         WeightsSource::File(path) => {
@@ -146,7 +173,7 @@ pub(crate) fn provider_contract(
                 None => f32_component_bytes(&base.join("vae"), "base VAE")?,
             };
             PerComponentBytes {
-                text_encoder: selected_text_encoder_bytes(spec, base)?,
+                text_encoder: conditioning_encoder_bytes(provider_id, spec, base)?,
                 dit: spec.read_file_unchanged_if_prepared(path, imported_dit_bytes)?,
                 vae,
             }
@@ -662,9 +689,10 @@ mod tests {
 
     fn file_spec(tmp: &tempfile::TempDir) -> LoadSpec {
         let root = tmp.path().join("base");
-        gen_core_testkit::write_encoder_contract_fixture(
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
             &root.join("text_encoder"),
             crate::ENCODER_CONTRACT,
+            crate::VISION_ENCODER_CONTRACT,
         )
         .unwrap();
         std::fs::create_dir_all(root.join("vae")).unwrap();
@@ -789,9 +817,10 @@ mod tests {
 
     fn spec(tmp: &tempfile::TempDir) -> LoadSpec {
         let root = tmp.path().join("qwen-candle-memory-spec");
-        gen_core_testkit::write_encoder_contract_fixture(
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
             &root.join("text_encoder"),
             crate::ENCODER_CONTRACT,
+            crate::VISION_ENCODER_CONTRACT,
         )
         .unwrap();
         for component in ["transformer", "vae"] {
@@ -809,13 +838,66 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let spec = spec(&tmp);
         let root = gen_core::require_base_snapshot(&spec, "qwen_image").unwrap();
-        let baseline = selected_text_encoder_bytes(&spec, root).unwrap();
+        let baseline = selected_language_encoder_bytes(&spec, root).unwrap();
 
         let nested = root.join("text_encoder/nested");
         std::fs::create_dir_all(&nested).unwrap();
         write_control(&nested.join("not-a-direct-shard.safetensors"));
 
-        assert_eq!(selected_text_encoder_bytes(&spec, root).unwrap(), baseline);
+        assert_eq!(
+            selected_language_encoder_bytes(&spec, root).unwrap(),
+            baseline
+        );
+    }
+
+    #[test]
+    fn edit_prices_selected_language_plus_base_vision_while_t2i_and_control_exclude_visual() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = spec(&tmp);
+        let root = gen_core::require_base_snapshot(&spec, "qwen_image").unwrap();
+        let language = selected_language_encoder_bytes(&spec, root).unwrap();
+        let vision = base_vision_encoder_bytes(root).unwrap();
+
+        let t2i = provider_contract("qwen_image", &spec).unwrap();
+        let control = provider_contract("qwen_image_2512_fun_control", &spec).unwrap();
+        let edit = provider_contract("qwen_image_edit", &spec).unwrap();
+        assert_eq!(t2i.asset_facts.conditioning_bytes, language);
+        assert_eq!(control.asset_facts.conditioning_bytes, language);
+        assert_eq!(
+            edit.asset_facts.conditioning_bytes,
+            language.checked_add(vision).unwrap()
+        );
+
+        let alternate = tmp.path().join("alternate-language-only");
+        gen_core_testkit::write_encoder_contract_fixture(&alternate, crate::ENCODER_CONTRACT)
+            .unwrap();
+        let mut selected = spec.clone();
+        selected.text_encoder = Some(WeightsSource::Dir(alternate));
+        let selected_language = selected_language_encoder_bytes(&selected, root).unwrap();
+        assert_eq!(
+            provider_contract("qwen_image", &selected)
+                .unwrap()
+                .asset_facts
+                .conditioning_bytes,
+            selected_language,
+            "T2I must not inherit visual.* from the multimodal base"
+        );
+        assert_eq!(
+            provider_contract("qwen_image_2512_fun_control", &selected)
+                .unwrap()
+                .asset_facts
+                .conditioning_bytes,
+            selected_language,
+            "control must not inherit visual.* from the multimodal base"
+        );
+        assert_eq!(
+            provider_contract("qwen_image_edit", &selected)
+                .unwrap()
+                .asset_facts
+                .conditioning_bytes,
+            selected_language.checked_add(vision).unwrap(),
+            "Edit must combine the selected language-only tower with the pinned base vision tower"
+        );
     }
 
     fn selection(strategy: MemoryStrategy) -> MemorySelection {
@@ -895,9 +977,10 @@ mod tests {
             br#"{"quantization":{"group_size":64,"bits":4}}"#,
         )
         .unwrap();
-        gen_core_testkit::write_encoder_contract_fixture(
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
             &root.join("text_encoder"),
             crate::ENCODER_CONTRACT,
+            crate::VISION_ENCODER_CONTRACT,
         )
         .unwrap();
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));

@@ -176,6 +176,8 @@ pub const VISION_ENCODER_CONTRACT: gen_core::VisionEncoderContract =
         num_attention_heads: 16,
         output_width: 3584,
         hidden_activation: "silu",
+        rope_theta: gen_core::EncoderConfigFloat::new(10_000.0),
+        normalization_eps: gen_core::EncoderConfigFloat::new(1e-6),
         patch_size: 14,
         temporal_patch_size: 2,
         spatial_merge_size: 2,

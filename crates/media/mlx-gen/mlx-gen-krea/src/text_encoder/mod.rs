@@ -46,18 +46,28 @@ use mlx_gen_boogu::{vision::preprocess::preprocess_image, VisionConfig, VisionTo
 /// so the parity-critical tower is not duplicated. `out_hidden_size` MUST equal the LM `hidden_size`
 /// (2560) so the merged image embeds splice straight into the token stream.
 pub fn krea_vision_config() -> VisionConfig {
+    let contract = crate::model::VISION_ENCODER_CONTRACT;
     VisionConfig {
-        hidden_size: 1024,
-        num_heads: 16,
-        intermediate_size: 4096,
-        depth: 24,
-        out_hidden_size: 2560,
-        patch_size: 16,
-        temporal_patch_size: 2,
-        spatial_merge_size: 2,
-        in_channels: 3,
-        num_position_embeddings: 2304,
-        deepstack_visual_indexes: vec![5, 11, 17],
+        hidden_size: contract.hidden_size as i32,
+        num_heads: contract.num_attention_heads as i32,
+        intermediate_size: contract.intermediate_size as i32,
+        depth: contract.num_hidden_layers as i32,
+        out_hidden_size: contract.output_width as i32,
+        norm_eps: contract.normalization_eps.get() as f32,
+        rope_theta: contract.rope_theta.get() as f32,
+        patch_size: contract.patch_size as i32,
+        temporal_patch_size: contract.temporal_patch_size as i32,
+        spatial_merge_size: contract.spatial_merge_size as i32,
+        in_channels: contract.in_channels as i32,
+        num_position_embeddings: contract
+            .num_position_embeddings
+            .expect("Qwen3-VL contract requires learned position embeddings")
+            as i32,
+        deepstack_visual_indexes: contract
+            .deepstack_visual_indexes
+            .iter()
+            .map(|&index| index as i32)
+            .collect(),
     }
 }
 
@@ -315,5 +325,16 @@ pub(crate) fn join(prefix: &str, name: &str) -> String {
         name.to_string()
     } else {
         format!("{prefix}.{name}")
+    }
+}
+
+#[cfg(test)]
+mod vision_contract_tests {
+    #[test]
+    fn runtime_vision_config_consumes_the_provider_behavior_contract() {
+        let config = super::krea_vision_config();
+        let contract = crate::model::VISION_ENCODER_CONTRACT;
+        assert_eq!(config.rope_theta, contract.rope_theta.get() as f32);
+        assert_eq!(config.norm_eps, contract.normalization_eps.get() as f32);
     }
 }

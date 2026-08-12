@@ -132,11 +132,17 @@ pub fn write_multimodal_encoder_contract_fixture(
         "depth": vision.num_hidden_layers,
         "num_heads": vision.num_attention_heads,
         "out_hidden_size": vision.output_width,
+        "rope_theta": vision.rope_theta.get(),
         "patch_size": vision.patch_size,
         "temporal_patch_size": vision.temporal_patch_size,
         "spatial_merge_size": vision.spatial_merge_size,
         "in_channels": vision.in_channels,
     });
+    let normalization_field = match vision.architecture {
+        gen_core::VisionEncoderArchitecture::Qwen3Vl => "layer_norm_eps",
+        gen_core::VisionEncoderArchitecture::Qwen2_5Vl => "rms_norm_eps",
+    };
+    vision_config[normalization_field] = serde_json::json!(vision.normalization_eps.get());
     if let Some(value) = vision.num_position_embeddings {
         vision_config["num_position_embeddings"] = serde_json::json!(value);
     }

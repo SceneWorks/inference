@@ -198,12 +198,7 @@ impl KreaText {
         root: &Path,
         text_encoder_source: &mlx_gen::gen_core::ValidatedEncoderSource,
     ) -> Result<Self> {
-        let vision_encoder_source = crate::model::ENCODER_CONTRACT
-            .validate_source(&WeightsSource::Dir(root.join("text_encoder")))?;
-        vision_encoder_source.validate_vision(
-            &crate::model::VISION_ENCODER_CONTRACT,
-            &crate::model::ENCODER_CONTRACT,
-        )?;
+        let vision_encoder_source = resolve_vision_encoder_source(root)?;
         Ok(Self {
             tok: KreaTokenizer::from_validated_source(text_encoder_source)?,
             te: text_encoder_source
@@ -234,9 +229,10 @@ impl KreaText {
     /// never pay for it. Idempotent.
     pub fn ensure_vision(&self) -> Result<()> {
         if self.vision.borrow().is_none() {
-            let tower = self
-                .vision_encoder_source
-                .read_unchanged(load_vision_tower_from_source)?;
+            let tower = read_validated_vision_source(
+                &self.vision_encoder_source,
+                load_vision_tower_from_source,
+            )?;
             *self.vision.borrow_mut() = Some(tower);
         }
         Ok(())
@@ -273,6 +269,24 @@ impl KreaText {
         let gv = self.run_vision(sources)?;
         self.encode_grounded_from_vision(&gv, prompt)
     }
+}
+
+fn resolve_vision_encoder_source(root: &Path) -> Result<mlx_gen::gen_core::ValidatedEncoderSource> {
+    crate::model::ENCODER_CONTRACT
+        .validate_source(&WeightsSource::Dir(root.join("text_encoder")))
+        .map_err(Into::into)
+}
+
+/// Validate the edit-only vision config/header contract immediately before the lazy backend read.
+fn read_validated_vision_source<T>(
+    source: &mlx_gen::gen_core::ValidatedEncoderSource,
+    read: impl FnOnce(&WeightsSource) -> Result<T>,
+) -> Result<T> {
+    source.validate_vision(
+        &crate::model::VISION_ENCODER_CONTRACT,
+        &crate::model::ENCODER_CONTRACT,
+    )?;
+    source.read_unchanged(read)
 }
 
 /// The **heavy render phase** of a Krea 2 pipeline (epic 10834 Phase 1, sc-11101): the single-stream
@@ -1931,9 +1945,37 @@ fn init_noise(height: u32, width: u32, seed: u64) -> Result<Array> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::sync::{Arc, Mutex};
 
     use super::*;
+
+    #[test]
+    fn language_only_snapshot_is_admitted_until_the_edit_only_vision_read() {
+        let fixture = tempfile::tempdir().unwrap();
+        gen_core_testkit::write_encoder_contract_fixture(
+            &fixture.path().join("text_encoder"),
+            crate::model::ENCODER_CONTRACT,
+        )
+        .unwrap();
+
+        let source = resolve_vision_encoder_source(fixture.path())
+            .expect("ordinary text construction must admit a language-valid vision-less snapshot");
+        let opened = Cell::new(false);
+        let error = read_validated_vision_source::<()>(&source, |_| {
+            opened.set(true);
+            Err(mlx_gen::Error::Msg(
+                "vision payload unexpectedly opened".into(),
+            ))
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("vision_config"), "{error}");
+        assert!(
+            !opened.get(),
+            "edit admission must fail before the vision payload loader runs"
+        );
+    }
 
     fn zero_velocity(x: &Array, _sigma: f32) -> Result<Array> {
         Ok(Array::zeros::<f32>(x.shape())?)

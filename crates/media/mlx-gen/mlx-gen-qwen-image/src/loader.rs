@@ -402,6 +402,56 @@ mod tests {
         assert!(error.contains("vision_config"), "{error}");
     }
 
+    #[test]
+    fn qwen2_5_vision_behavior_defaults_are_accepted_but_explicit_conflicts_fail() {
+        let write_fixture = || {
+            let fixture = tempfile::tempdir().unwrap();
+            let component = fixture.path().join("text_encoder");
+            gen_core_testkit::write_multimodal_encoder_contract_fixture(
+                &component,
+                crate::ENCODER_CONTRACT,
+                crate::VISION_ENCODER_CONTRACT,
+            )
+            .unwrap();
+            (fixture, component)
+        };
+
+        let (_fixture, component) = write_fixture();
+        let config_path = component.join("config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        config["vision_config"]
+            .as_object_mut()
+            .unwrap()
+            .remove("rope_theta");
+        config["vision_config"]
+            .as_object_mut()
+            .unwrap()
+            .remove("rms_norm_eps");
+        std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        crate::ENCODER_CONTRACT
+            .validate_source(&WeightsSource::Dir(component))
+            .unwrap()
+            .validate_vision(&crate::VISION_ENCODER_CONTRACT, &crate::ENCODER_CONTRACT)
+            .expect("omission must resolve to the exact Qwen2.5-VL runtime defaults");
+
+        for (field, value) in [("rope_theta", 9_999.0), ("rms_norm_eps", 1e-5)] {
+            let (_fixture, component) = write_fixture();
+            let config_path = component.join("config.json");
+            let mut config: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+            config["vision_config"][field] = serde_json::json!(value);
+            std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+            let error = crate::ENCODER_CONTRACT
+                .validate_source(&WeightsSource::Dir(component))
+                .unwrap()
+                .validate_vision(&crate::VISION_ENCODER_CONTRACT, &crate::ENCODER_CONTRACT)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(field), "{error}");
+        }
+    }
+
     /// F-120: exercise the PRODUCTION `remap_transformer_keys` over an in-memory `Weights` fixture
     /// (not a duplicated copy of the rename table), so a regression in the real table fails CI. One
     /// representative key from each rename family; the aliased name must be present after the remap.

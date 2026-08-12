@@ -155,7 +155,7 @@ pub(crate) struct KreaText {
 impl KreaText {
     fn vision(&self) -> Result<Arc<crate::vision::VisionTower>> {
         candle_gen::cached(&self.vision, || {
-            self.vision_encoder_source.read_unchanged(|source| {
+            read_validated_vision_source(&self.vision_encoder_source, |source| {
                 Ok(Arc::new(crate::vision::load_vision_tower_from_source(
                     source,
                     &self.device,
@@ -233,6 +233,26 @@ fn load_residency_heavy_cancelable(
             load_vae_encoder(root, device)?
         },
     })
+}
+
+fn resolve_vision_encoder_source(
+    root: &Path,
+) -> gen_core::Result<gen_core::ValidatedEncoderSource> {
+    crate::ENCODER_CONTRACT
+        .validate_source(&gen_core::WeightsSource::Dir(root.join("text_encoder")))
+}
+
+/// Admit the exact edit-only vision surface before the backend opens any payload bytes. Keeping this
+/// check beside the lazy read is what lets language-valid T2I/img2img/control snapshots omit
+/// `visual.*` while making the first grounded edit fail closed.
+fn read_validated_vision_source<T>(
+    source: &gen_core::ValidatedEncoderSource,
+    read: impl FnOnce(&gen_core::WeightsSource) -> Result<T>,
+) -> Result<T> {
+    source
+        .validate_vision(&crate::VISION_ENCODER_CONTRACT, &crate::ENCODER_CONTRACT)
+        .map_err(CandleError::from)?;
+    source.read_unchanged(read)
 }
 
 pub(crate) fn encode_residency(
@@ -513,10 +533,7 @@ fn load_text_cancelable(
     if let Some(cancel) = cancel {
         candle_gen::check_cancel(cancel)?;
     }
-    let vision_encoder_source = crate::ENCODER_CONTRACT
-        .validate_source(&gen_core::WeightsSource::Dir(root.join("text_encoder")))?;
-    vision_encoder_source
-        .validate_vision(&crate::VISION_ENCODER_CONTRACT, &crate::ENCODER_CONTRACT)?;
+    let vision_encoder_source = resolve_vision_encoder_source(root)?;
     let tok = crate::tokenizer::KreaTokenizer::from_validated_source(source, device)?;
 
     let te_cfg = KreaTeConfig::qwen3_vl_4b();
@@ -2467,6 +2484,34 @@ pub(crate) fn to_image(decoded: &Tensor) -> Result<Image> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn language_only_snapshot_is_admitted_until_the_edit_only_vision_read() {
+        let fixture = tempfile::tempdir().unwrap();
+        gen_core_testkit::write_encoder_contract_fixture(
+            &fixture.path().join("text_encoder"),
+            crate::ENCODER_CONTRACT,
+        )
+        .unwrap();
+
+        let source = resolve_vision_encoder_source(fixture.path())
+            .expect("ordinary text construction must admit a language-valid vision-less snapshot");
+        let opened = Cell::new(false);
+        let error = read_validated_vision_source::<()>(&source, |_| {
+            opened.set(true);
+            Err(CandleError::Msg(
+                "vision payload unexpectedly opened".into(),
+            ))
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("vision_config"), "{error}");
+        assert!(
+            !opened.get(),
+            "edit admission must fail before the vision payload loader runs"
+        );
+    }
 
     #[test]
     fn selected_text_encoder_admission_is_exact_and_uses_the_builtin_default() {

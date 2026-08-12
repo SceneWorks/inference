@@ -6,7 +6,7 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::weightsmeta::Dtype;
-use crate::{EncoderContract, Error, Result, SafetensorsTensorHeader};
+use crate::{EncoderConfigFloat, EncoderContract, Error, Result, SafetensorsTensorHeader};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VisionEncoderArchitecture {
@@ -24,6 +24,12 @@ pub struct VisionEncoderContract {
     pub num_attention_heads: usize,
     pub output_width: usize,
     pub hidden_activation: &'static str,
+    /// Effective rotary base consumed by the vision runtime. Published Qwen configs commonly omit
+    /// this field, in which case both supported architectures use the Transformers default (10_000).
+    pub rope_theta: EncoderConfigFloat,
+    /// Effective LayerNorm/RMSNorm epsilon consumed by the vision runtime. The serialized field name
+    /// differs by architecture; omission means the architecture default (1e-6).
+    pub normalization_eps: EncoderConfigFloat,
     pub patch_size: usize,
     pub temporal_patch_size: usize,
     pub spatial_merge_size: usize,
@@ -41,6 +47,10 @@ impl VisionEncoderContract {
             || self.num_hidden_layers == 0
             || self.num_attention_heads == 0
             || self.output_width == 0
+            || !self.rope_theta.get().is_finite()
+            || self.rope_theta.get() <= 0.0
+            || !self.normalization_eps.get().is_finite()
+            || self.normalization_eps.get() <= 0.0
             || self.patch_size == 0
             || self.temporal_patch_size == 0
             || self.spatial_merge_size == 0
@@ -102,6 +112,30 @@ impl VisionEncoderContract {
         };
         self.expect_str(&vision, path, "model_type", model_type)?;
         self.expect_str(&vision, path, "hidden_act", self.hidden_activation)?;
+        self.expect_effective_f64(
+            &vision,
+            path,
+            "rope_theta",
+            self.rope_theta.get(),
+            10_000.0,
+            &[
+                &["rope_theta"],
+                &["rope_parameters", "rope_theta"],
+                &["rope_scaling", "rope_theta"],
+            ],
+        )?;
+        let normalization_fields: &[&[&str]] = match self.architecture {
+            VisionEncoderArchitecture::Qwen3Vl => &[&["layer_norm_eps"], &["norm_eps"]],
+            VisionEncoderArchitecture::Qwen2_5Vl => &[&["rms_norm_eps"], &["norm_eps"]],
+        };
+        self.expect_effective_f64(
+            &vision,
+            path,
+            "normalization_eps",
+            self.normalization_eps.get(),
+            1e-6,
+            normalization_fields,
+        )?;
         for (field, expected) in [
             ("hidden_size", self.hidden_size),
             ("intermediate_size", self.intermediate_size),
@@ -357,6 +391,56 @@ impl VisionEncoderContract {
         }
     }
 
+    /// Validate every authored alias, or the architecture default when all aliases are absent/null.
+    /// This is deliberately stricter than picking the first alias: conflicting declarations must not
+    /// validate while a backend silently consumes a different one.
+    fn expect_effective_f64(
+        &self,
+        config: &Value,
+        path: &Path,
+        field: &'static str,
+        expected: f64,
+        default: f64,
+        candidates: &[&[&str]],
+    ) -> Result<()> {
+        let mut found = false;
+        for candidate in candidates {
+            let Some(value) = json_path(config, candidate) else {
+                continue;
+            };
+            if value.is_null() {
+                continue;
+            }
+            let actual = value.as_f64().ok_or_else(|| {
+                self.mismatch(
+                    path,
+                    field,
+                    expected,
+                    format!("{}={value}", candidate.join(".")),
+                )
+            })?;
+            found = true;
+            if actual.to_bits() != expected.to_bits() {
+                return Err(self.mismatch(
+                    path,
+                    field,
+                    expected,
+                    format!("{}={actual}", candidate.join(".")),
+                ));
+            }
+        }
+        if found || default.to_bits() == expected.to_bits() {
+            Ok(())
+        } else {
+            Err(self.mismatch(
+                path,
+                field,
+                expected,
+                format!("architecture default {default}"),
+            ))
+        }
+    }
+
     fn mismatch(
         &self,
         path: &Path,
@@ -369,4 +453,8 @@ impl VisionEncoderContract {
             path.display()
         ))
     }
+}
+
+fn json_path<'a>(root: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    path.iter().try_fold(root, |value, field| value.get(field))
 }
