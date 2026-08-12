@@ -82,6 +82,15 @@ name: Real-weight validation
 # stage later: they import the tree the pip step installed, so they must be the same interpreter
 # that installed it. scripts/tests/test_ci_workflow_policy.py enforces both halves; a bare
 # `python3` anywhere in a macOS job fails that gate.
+#
+# EVERY WINDOWS PYTHON CONSUMER USES THE EXACT UV-MANAGED 3.12.10 PATH.
+#
+# A 2026-08-12 runner restart changed the registered `py` default to 3.14, then setup-python's
+# attempt to restore 3.12 blocked behind an operator-observed Windows elevation prompt. A prompt can
+# never be satisfied by unattended CI. Each Windows job therefore installs pinned uv, asks it for a
+# managed 3.12.10 with both registry and launcher mutation disabled, and exports the absolute
+# interpreter path. The workflow policy rejects setup-python, bare launchers, version drift, or any
+# Python consumer that runs before that path is resolved.
 
 on:
   schedule:
@@ -4168,9 +4177,23 @@ jobs:
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12
+        shell: cmd
+        run: |
+          uv python install 3.12.10 --managed-python --no-registry --no-bin --no-config || exit /b 1
+          for /f "delims=" %%P in ('uv python find 3.12.10 --managed-python --no-project --no-config') do set "REVIEWED_PYTHON=%%P"
+          if not defined REVIEWED_PYTHON exit /b 1
+          "%REVIEWED_PYTHON%" -c "import sys; assert sys.version_info[:3] == (3, 12, 10), sys.version" || exit /b 1
+          echo REVIEWED_PYTHON=%REVIEWED_PYTHON%>>"%GITHUB_ENV%"
       - name: Configure immutable SAME-L snapshot path
         shell: cmd
-        run: python scripts/release/export_model_snapshot_paths.py --model same-l
+        run: |
+          "%REVIEWED_PYTHON%" scripts/release/export_model_snapshot_paths.py --model same-l
       - name: Select Git Bash
         shell: cmd
         run: |
@@ -4190,9 +4213,9 @@ jobs:
       - name: Materialize and verify immutable SAME-L snapshot
         shell: cmd
         run: |
-          python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt
+          "%REVIEWED_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt || exit /b 1
           set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
-          python scripts/release/ensure_model_snapshot.py --model same-l --snapshot "%SA3_SAME_L_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model same-l --snapshot "%SA3_SAME_L_SNAPSHOT%" || exit /b 1
       - name: Verify SAME-L short and long band boundaries on CUDA
         shell: cmd
         run: |
@@ -4295,9 +4318,23 @@ jobs:
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12
+        shell: cmd
+        run: |
+          uv python install 3.12.10 --managed-python --no-registry --no-bin --no-config || exit /b 1
+          for /f "delims=" %%P in ('uv python find 3.12.10 --managed-python --no-project --no-config') do set "REVIEWED_PYTHON=%%P"
+          if not defined REVIEWED_PYTHON exit /b 1
+          "%REVIEWED_PYTHON%" -c "import sys; assert sys.version_info[:3] == (3, 12, 10), sys.version" || exit /b 1
+          echo REVIEWED_PYTHON=%REVIEWED_PYTHON%>>"%GITHUB_ENV%"
       - name: Configure immutable small-music snapshot path
         shell: cmd
-        run: python scripts/release/export_model_snapshot_paths.py --model stable-audio-3-small-music
+        run: |
+          "%REVIEWED_PYTHON%" scripts/release/export_model_snapshot_paths.py --model stable-audio-3-small-music
       - name: Select Git Bash
         shell: cmd
         run: |
@@ -4317,9 +4354,9 @@ jobs:
       - name: Materialize and verify immutable small-music snapshot
         shell: cmd
         run: |
-          python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt
+          "%REVIEWED_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt || exit /b 1
           set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
-          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music --snapshot "%SA3_SMALL_MUSIC_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music --snapshot "%SA3_SMALL_MUSIC_SNAPSHOT%" || exit /b 1
       - name: Run registered provider conformance and concurrent RNG isolation on CUDA
         shell: cmd
         run: |
@@ -4362,10 +4399,23 @@ jobs:
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12
+        shell: cmd
+        run: |
+          uv python install 3.12.10 --managed-python --no-registry --no-bin --no-config || exit /b 1
+          for /f "delims=" %%P in ('uv python find 3.12.10 --managed-python --no-project --no-config') do set "REVIEWED_PYTHON=%%P"
+          if not defined REVIEWED_PYTHON exit /b 1
+          "%REVIEWED_PYTHON%" -c "import sys; assert sys.version_info[:3] == (3, 12, 10), sys.version" || exit /b 1
+          echo REVIEWED_PYTHON=%REVIEWED_PYTHON%>>"%GITHUB_ENV%"
       - name: Configure immutable small-sfx and small-music snapshot paths
         shell: cmd
         run: |
-          python scripts/release/export_model_snapshot_paths.py --model stable-audio-3-small-sfx --model stable-audio-3-small-music
+          "%REVIEWED_PYTHON%" scripts/release/export_model_snapshot_paths.py --model stable-audio-3-small-sfx --model stable-audio-3-small-music
       - name: Select Git Bash
         shell: cmd
         run: |
@@ -4385,10 +4435,10 @@ jobs:
       - name: Materialize and verify both immutable small snapshots
         shell: cmd
         run: |
-          python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt
+          "%REVIEWED_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt || exit /b 1
           set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
-          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-sfx --snapshot "%SA3_SMALL_SFX_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music --snapshot "%SA3_SMALL_MUSIC_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-sfx --snapshot "%SA3_SMALL_SFX_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music --snapshot "%SA3_SMALL_MUSIC_SNAPSHOT%" || exit /b 1
       - name: Prove music and SFX actually diverge on CUDA
         shell: cmd
         # sc-14546 moved `--test variant_binding` to `sa3-base-identity-cuda`, which provisions all
@@ -4448,10 +4498,23 @@ jobs:
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12
+        shell: cmd
+        run: |
+          uv python install 3.12.10 --managed-python --no-registry --no-bin --no-config || exit /b 1
+          for /f "delims=" %%P in ('uv python find 3.12.10 --managed-python --no-project --no-config') do set "REVIEWED_PYTHON=%%P"
+          if not defined REVIEWED_PYTHON exit /b 1
+          "%REVIEWED_PYTHON%" -c "import sys; assert sys.version_info[:3] == (3, 12, 10), sys.version" || exit /b 1
+          echo REVIEWED_PYTHON=%REVIEWED_PYTHON%>>"%GITHUB_ENV%"
       - name: Configure immutable medium and small snapshot paths
         shell: cmd
         run: |
-          python scripts/release/export_model_snapshot_paths.py --model stable-audio-3-medium --model stable-audio-3-medium-base --model stable-audio-3-small-music --model stable-audio-3-small-sfx --model same-l
+          "%REVIEWED_PYTHON%" scripts/release/export_model_snapshot_paths.py --model stable-audio-3-medium --model stable-audio-3-medium-base --model stable-audio-3-small-music --model stable-audio-3-small-sfx --model same-l
       - name: Select Git Bash
         shell: cmd
         run: |
@@ -4481,13 +4544,13 @@ jobs:
       - name: Materialize and verify the immutable snapshots
         shell: cmd
         run: |
-          python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt
+          "%REVIEWED_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt || exit /b 1
           set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
-          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-medium --snapshot "%SA3_MEDIUM_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-medium-base --snapshot "%SA3_MEDIUM_BASE_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music --snapshot "%SA3_SMALL_MUSIC_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-sfx --snapshot "%SA3_SMALL_SFX_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model same-l --snapshot "%SA3_SAME_L_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model stable-audio-3-medium --snapshot "%SA3_MEDIUM_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model stable-audio-3-medium-base --snapshot "%SA3_MEDIUM_BASE_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music --snapshot "%SA3_SMALL_MUSIC_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-sfx --snapshot "%SA3_SMALL_SFX_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model same-l --snapshot "%SA3_SAME_L_SNAPSHOT%" || exit /b 1
       - name: Run medium conformance on CUDA
         shell: cmd
         # sc-14546 moved `--test variant_binding` to `sa3-base-identity-cuda` (all six snapshots).
@@ -4677,10 +4740,23 @@ jobs:
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12
+        shell: cmd
+        run: |
+          uv python install 3.12.10 --managed-python --no-registry --no-bin --no-config || exit /b 1
+          for /f "delims=" %%P in ('uv python find 3.12.10 --managed-python --no-project --no-config') do set "REVIEWED_PYTHON=%%P"
+          if not defined REVIEWED_PYTHON exit /b 1
+          "%REVIEWED_PYTHON%" -c "import sys; assert sys.version_info[:3] == (3, 12, 10), sys.version" || exit /b 1
+          echo REVIEWED_PYTHON=%REVIEWED_PYTHON%>>"%GITHUB_ENV%"
       - name: Configure all six immutable Stable Audio 3 snapshot paths
         shell: cmd
         run: |
-          python scripts/release/export_model_snapshot_paths.py --model stable-audio-3-small-music --model stable-audio-3-small-sfx --model stable-audio-3-medium --model stable-audio-3-small-music-base --model stable-audio-3-small-sfx-base --model stable-audio-3-medium-base --model same-l
+          "%REVIEWED_PYTHON%" scripts/release/export_model_snapshot_paths.py --model stable-audio-3-small-music --model stable-audio-3-small-sfx --model stable-audio-3-medium --model stable-audio-3-small-music-base --model stable-audio-3-small-sfx-base --model stable-audio-3-medium-base --model same-l
       - name: Select Git Bash
         shell: cmd
         run: |
@@ -4700,17 +4776,17 @@ jobs:
       - name: Materialize and verify all six immutable snapshots
         shell: cmd
         run: |
-          python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt
+          "%REVIEWED_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt || exit /b 1
           set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
           rem The three `-base` entries carry `download_files` allow-lists, so the 6.4 GB of
           rem `svd_bases.pt` training pickles across them are not fetched.
-          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music --snapshot "%SA3_SMALL_MUSIC_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-sfx --snapshot "%SA3_SMALL_SFX_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-medium --snapshot "%SA3_MEDIUM_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music-base --snapshot "%SA3_SMALL_MUSIC_BASE_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-sfx-base --snapshot "%SA3_SMALL_SFX_BASE_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-medium-base --snapshot "%SA3_MEDIUM_BASE_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model same-l --snapshot "%SA3_SAME_L_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music --snapshot "%SA3_SMALL_MUSIC_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-sfx --snapshot "%SA3_SMALL_SFX_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model stable-audio-3-medium --snapshot "%SA3_MEDIUM_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music-base --snapshot "%SA3_SMALL_MUSIC_BASE_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-sfx-base --snapshot "%SA3_SMALL_SFX_BASE_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model stable-audio-3-medium-base --snapshot "%SA3_MEDIUM_BASE_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model same-l --snapshot "%SA3_SAME_L_SNAPSHOT%" || exit /b 1
       - name: Reject every cross-variant weight path and match the frozen-Torch sampler oracles
         shell: cmd
         run: |
@@ -4788,10 +4864,23 @@ jobs:
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12
+        shell: cmd
+        run: |
+          uv python install 3.12.10 --managed-python --no-registry --no-bin --no-config || exit /b 1
+          for /f "delims=" %%P in ('uv python find 3.12.10 --managed-python --no-project --no-config') do set "REVIEWED_PYTHON=%%P"
+          if not defined REVIEWED_PYTHON exit /b 1
+          "%REVIEWED_PYTHON%" -c "import sys; assert sys.version_info[:3] == (3, 12, 10), sys.version" || exit /b 1
+          echo REVIEWED_PYTHON=%REVIEWED_PYTHON%>>"%GITHUB_ENV%"
       - name: Configure both immutable small-base snapshot paths
         shell: cmd
         run: |
-          python scripts/release/export_model_snapshot_paths.py --model stable-audio-3-small-music-base --model stable-audio-3-small-sfx-base
+          "%REVIEWED_PYTHON%" scripts/release/export_model_snapshot_paths.py --model stable-audio-3-small-music-base --model stable-audio-3-small-sfx-base
       - name: Select Git Bash
         shell: cmd
         run: |
@@ -4811,10 +4900,10 @@ jobs:
       - name: Materialize and verify both immutable small-base snapshots
         shell: cmd
         run: |
-          python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt
+          "%REVIEWED_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt || exit /b 1
           set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
-          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music-base --snapshot "%SA3_SMALL_MUSIC_BASE_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-sfx-base --snapshot "%SA3_SMALL_SFX_BASE_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-music-base --snapshot "%SA3_SMALL_MUSIC_BASE_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model stable-audio-3-small-sfx-base --snapshot "%SA3_SMALL_SFX_BASE_SNAPSHOT%" || exit /b 1
       - name: Run registered base provider conformance and re-calibrate both floors on CUDA
         shell: cmd
         run: |
@@ -4861,6 +4950,19 @@ jobs:
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12
+        shell: cmd
+        run: |
+          uv python install 3.12.10 --managed-python --no-registry --no-bin --no-config || exit /b 1
+          for /f "delims=" %%P in ('uv python find 3.12.10 --managed-python --no-project --no-config') do set "REVIEWED_PYTHON=%%P"
+          if not defined REVIEWED_PYTHON exit /b 1
+          "%REVIEWED_PYTHON%" -c "import sys; assert sys.version_info[:3] == (3, 12, 10), sys.version" || exit /b 1
+          echo REVIEWED_PYTHON=%REVIEWED_PYTHON%>>"%GITHUB_ENV%"
       - name: Select Git Bash
         shell: cmd
         run: |
@@ -4873,10 +4975,10 @@ jobs:
       - name: Materialize and verify immutable snapshots
         shell: cmd
         run: |
-          python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt
+          "%REVIEWED_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt || exit /b 1
           set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
-          python scripts/release/ensure_model_snapshot.py --model smollm2-135m-instruct --snapshot "%CANDLE_LLM_TEST_MODEL%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model qwen3-0.6b --snapshot "%CANDLE_LLM_QWEN3_MODEL%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model smollm2-135m-instruct --snapshot "%CANDLE_LLM_TEST_MODEL%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model qwen3-0.6b --snapshot "%CANDLE_LLM_QWEN3_MODEL%" || exit /b 1
       - name: Run representative conformance
         shell: cmd
         run: |
@@ -4899,6 +5001,19 @@ jobs:
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12
+        shell: cmd
+        run: |
+          uv python install 3.12.10 --managed-python --no-registry --no-bin --no-config || exit /b 1
+          for /f "delims=" %%P in ('uv python find 3.12.10 --managed-python --no-project --no-config') do set "REVIEWED_PYTHON=%%P"
+          if not defined REVIEWED_PYTHON exit /b 1
+          "%REVIEWED_PYTHON%" -c "import sys; assert sys.version_info[:3] == (3, 12, 10), sys.version" || exit /b 1
+          echo REVIEWED_PYTHON=%REVIEWED_PYTHON%>>"%GITHUB_ENV%"
       - name: Select Git Bash
         shell: cmd
         run: |
@@ -4915,8 +5030,8 @@ jobs:
             echo Missing repository variable CANDLE_MAGE_SNAPSHOT for the Windows CUDA runner.
             exit /b 1
           )
-          python --version
-          python scripts/release/ensure_model_snapshot.py --model mage-flow --snapshot "%CANDLE_MAGE_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" --version || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model mage-flow --snapshot "%CANDLE_MAGE_SNAPSHOT%" || exit /b 1
       - name: Exercise every advertised Mage memory rung
         shell: cmd
         run: |
@@ -4962,6 +5077,19 @@ jobs:
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12
+        shell: cmd
+        run: |
+          uv python install 3.12.10 --managed-python --no-registry --no-bin --no-config || exit /b 1
+          for /f "delims=" %%P in ('uv python find 3.12.10 --managed-python --no-project --no-config') do set "REVIEWED_PYTHON=%%P"
+          if not defined REVIEWED_PYTHON exit /b 1
+          "%REVIEWED_PYTHON%" -c "import sys; assert sys.version_info[:3] == (3, 12, 10), sys.version" || exit /b 1
+          echo REVIEWED_PYTHON=%REVIEWED_PYTHON%>>"%GITHUB_ENV%"
       - name: Select Git Bash
         shell: cmd
         run: |
@@ -4971,6 +5099,10 @@ jobs:
         with:
           toolchain: 1.96.0
           components: rustfmt, clippy
+      - name: Require reviewed CPython 3.12
+        shell: cmd
+        run: |
+          "%REVIEWED_PYTHON%" -c "import sys; assert sys.version_info[:2] == (3, 12), sys.version" || exit /b 1
       - name: Download independent Candle Mage acceptance oracles
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -4990,22 +5122,22 @@ jobs:
       - name: Materialize and verify immutable snapshot
         shell: cmd
         run: |
-          python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt
+          "%REVIEWED_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt || exit /b 1
           set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
-          python scripts/release/ensure_model_snapshot.py --model z-image-turbo --snapshot "%Z_IMAGE_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model mage-flow --snapshot "%CANDLE_MAGE_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model mage-flow-edit --snapshot "%CANDLE_MAGE_EDIT_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model mage-flow-edit-base --snapshot "%CANDLE_MAGE_EDIT_BASE_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model mage-flow-edit-turbo --snapshot "%CANDLE_MAGE_EDIT_TURBO_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model z-image-turbo --snapshot "%Z_IMAGE_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model mage-flow --snapshot "%CANDLE_MAGE_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model mage-flow-edit --snapshot "%CANDLE_MAGE_EDIT_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model mage-flow-edit-base --snapshot "%CANDLE_MAGE_EDIT_BASE_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model mage-flow-edit-turbo --snapshot "%CANDLE_MAGE_EDIT_TURBO_SNAPSHOT%" || exit /b 1
       - name: Verify transferred Candle Mage acceptance oracles
         shell: cmd
         run: |
-          python scripts/release/verify_mage_candle_transfer.py --gen "%CANDLE_MAGE_SNAPSHOT%" --edit "%CANDLE_MAGE_EDIT_SNAPSHOT%" --edit-base "%CANDLE_MAGE_EDIT_BASE_SNAPSHOT%" --edit-turbo "%CANDLE_MAGE_EDIT_TURBO_SNAPSHOT%" --output "%MAGE_GOLDEN_DIR%" || exit /b 1
-          python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\mage-oracle-verify" -r .github/requirements/real-weights-mage-verify-windows-x64-py312.txt || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/verify_mage_candle_transfer.py --gen "%CANDLE_MAGE_SNAPSHOT%" --edit "%CANDLE_MAGE_EDIT_SNAPSHOT%" --edit-base "%CANDLE_MAGE_EDIT_BASE_SNAPSHOT%" --edit-turbo "%CANDLE_MAGE_EDIT_TURBO_SNAPSHOT%" --output "%MAGE_GOLDEN_DIR%" || exit /b 1
+          "%REVIEWED_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\mage-oracle-verify" -r .github/requirements/real-weights-mage-verify-windows-x64-py312.txt || exit /b 1
           set "PYTHONPATH=%RUNNER_TEMP%\mage-oracle-verify"
-          python scripts/release/provision_mage_oracles.py --snapshot "%CANDLE_MAGE_SNAPSHOT%" --edit-snapshot "%CANDLE_MAGE_EDIT_SNAPSHOT%" --output "%MAGE_GOLDEN_DIR%" --verify-edit-artifact || exit /b 1
-          python scripts/release/provision_mage_edit_variants.py --gen "%CANDLE_MAGE_SNAPSHOT%" --edit "%CANDLE_MAGE_EDIT_SNAPSHOT%" --edit-base "%CANDLE_MAGE_EDIT_BASE_SNAPSHOT%" --edit-turbo "%CANDLE_MAGE_EDIT_TURBO_SNAPSHOT%" --output "%MAGE_GOLDEN_DIR%" --verify-only || exit /b 1
-          python scripts/release/verify_mage_candle_oracles.py --snapshot "%CANDLE_MAGE_SNAPSHOT%" --edit-snapshot "%CANDLE_MAGE_EDIT_SNAPSHOT%" --output "%MAGE_GOLDEN_DIR%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/provision_mage_oracles.py --snapshot "%CANDLE_MAGE_SNAPSHOT%" --edit-snapshot "%CANDLE_MAGE_EDIT_SNAPSHOT%" --output "%MAGE_GOLDEN_DIR%" --verify-edit-artifact || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/provision_mage_edit_variants.py --gen "%CANDLE_MAGE_SNAPSHOT%" --edit "%CANDLE_MAGE_EDIT_SNAPSHOT%" --edit-base "%CANDLE_MAGE_EDIT_BASE_SNAPSHOT%" --edit-turbo "%CANDLE_MAGE_EDIT_TURBO_SNAPSHOT%" --output "%MAGE_GOLDEN_DIR%" --verify-only || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/verify_mage_candle_oracles.py --snapshot "%CANDLE_MAGE_SNAPSHOT%" --edit-snapshot "%CANDLE_MAGE_EDIT_SNAPSHOT%" --output "%MAGE_GOLDEN_DIR%" || exit /b 1
       - name: Run provider conformance
         shell: cmd
         run: |
@@ -5047,6 +5179,19 @@ jobs:
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12
+        shell: cmd
+        run: |
+          uv python install 3.12.10 --managed-python --no-registry --no-bin --no-config || exit /b 1
+          for /f "delims=" %%P in ('uv python find 3.12.10 --managed-python --no-project --no-config') do set "REVIEWED_PYTHON=%%P"
+          if not defined REVIEWED_PYTHON exit /b 1
+          "%REVIEWED_PYTHON%" -c "import sys; assert sys.version_info[:3] == (3, 12, 10), sys.version" || exit /b 1
+          echo REVIEWED_PYTHON=%REVIEWED_PYTHON%>>"%GITHUB_ENV%"
       - name: Select Git Bash
         shell: cmd
         run: |
@@ -5066,19 +5211,19 @@ jobs:
       - name: Materialize and verify immutable snapshots
         shell: cmd
         run: |
-          python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt
+          "%REVIEWED_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt || exit /b 1
           set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
-          python scripts/release/ensure_model_snapshot.py --model sdxl-base-1.0 --snapshot "%SDXL_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model clip-vit-large-patch14 --snapshot "%SDXL_TOKENIZER_CLIP_L_DIR%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model clip-vit-bigg-14-laion2b --snapshot "%SDXL_TOKENIZER_CLIP_BIGG_DIR%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model sdxl-vae-fp16-fix --snapshot "%SDXL_VAE_FP16_FIX_DIR%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model realvisxl-v5 --snapshot "%REALVISXL_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model ip-adapter-plus-sdxl-vit-h --snapshot "%IP_ADAPTER_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model sdxl-base-1.0 --snapshot "%SDXL_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model clip-vit-large-patch14 --snapshot "%SDXL_TOKENIZER_CLIP_L_DIR%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model clip-vit-bigg-14-laion2b --snapshot "%SDXL_TOKENIZER_CLIP_BIGG_DIR%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model sdxl-vae-fp16-fix --snapshot "%SDXL_VAE_FP16_FIX_DIR%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model realvisxl-v5 --snapshot "%REALVISXL_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model ip-adapter-plus-sdxl-vit-h --snapshot "%IP_ADAPTER_SNAPSHOT%" || exit /b 1
       - name: Stage synthetic source images
         shell: cmd
         run: |
-          python scripts/ci/make_test_image.py "%EDIT_SRC%" 768 768 || exit /b 1
-          python scripts/ci/make_test_image.py "%IP_REF%" 768 768 || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/ci/make_test_image.py "%EDIT_SRC%" 768 768 || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/ci/make_test_image.py "%IP_REF%" 768 768 || exit /b 1
       - name: Run SDXL real-weight renders
         shell: cmd
         run: |
@@ -5132,6 +5277,19 @@ jobs:
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12
+        shell: cmd
+        run: |
+          uv python install 3.12.10 --managed-python --no-registry --no-bin --no-config || exit /b 1
+          for /f "delims=" %%P in ('uv python find 3.12.10 --managed-python --no-project --no-config') do set "REVIEWED_PYTHON=%%P"
+          if not defined REVIEWED_PYTHON exit /b 1
+          "%REVIEWED_PYTHON%" -c "import sys; assert sys.version_info[:3] == (3, 12, 10), sys.version" || exit /b 1
+          echo REVIEWED_PYTHON=%REVIEWED_PYTHON%>>"%GITHUB_ENV%"
       - name: Select Git Bash
         shell: cmd
         run: |
@@ -5149,19 +5307,19 @@ jobs:
       - name: Materialize and verify immutable snapshots
         shell: cmd
         run: |
-          python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt
+          "%REVIEWED_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt || exit /b 1
           set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
           rem hkchengrex/MMAudio is a 54 GB repo (~46 GB of training checkpoints + weight variants the
           rem inference stack never loads); each catalog key carries a `download_files` allow-list so
           rem only the pinned checkpoint is fetched (~8 GB across the six components into one dir).
-          python scripts/release/ensure_model_snapshot.py --model synchformer --snapshot "%MMAUDIO_MMAUDIO_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model mmaudio-small-16k --snapshot "%MMAUDIO_MMAUDIO_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model mmaudio-large-44k-v2 --snapshot "%MMAUDIO_MMAUDIO_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model mmaudio-vae-16k --snapshot "%MMAUDIO_MMAUDIO_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model mmaudio-vae-44k --snapshot "%MMAUDIO_MMAUDIO_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model mmaudio-bigvgan-16k --snapshot "%MMAUDIO_MMAUDIO_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model dfn5b-clip-vit-h14-384 --snapshot "%MMAUDIO_CLIP_SNAPSHOT%" || exit /b 1
-          python scripts/release/ensure_model_snapshot.py --model nvidia-bigvgan-v2-44khz-128band-512x --snapshot "%MMAUDIO_BIGVGAN_V2_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model synchformer --snapshot "%MMAUDIO_MMAUDIO_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model mmaudio-small-16k --snapshot "%MMAUDIO_MMAUDIO_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model mmaudio-large-44k-v2 --snapshot "%MMAUDIO_MMAUDIO_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model mmaudio-vae-16k --snapshot "%MMAUDIO_MMAUDIO_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model mmaudio-vae-44k --snapshot "%MMAUDIO_MMAUDIO_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model mmaudio-bigvgan-16k --snapshot "%MMAUDIO_MMAUDIO_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model dfn5b-clip-vit-h14-384 --snapshot "%MMAUDIO_CLIP_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model nvidia-bigvgan-v2-44khz-128band-512x --snapshot "%MMAUDIO_BIGVGAN_V2_SNAPSHOT%" || exit /b 1
       - name: Run mmaudio real-weight renders
         shell: cmd
         run: |
