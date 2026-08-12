@@ -93,6 +93,25 @@ fn stats(pixels: &[u8], width: u32) -> (f64, usize, f64) {
     )
 }
 
+fn validate_rgb_output(image: &mlx_gen::media::Image, label: &str, size: u32) {
+    assert_eq!(
+        (image.width, image.height),
+        (size, size),
+        "{label} output geometry did not match the request"
+    );
+    let edge = usize::try_from(size).expect("requested image edge must fit usize");
+    assert!(edge > 0, "requested image edge must be positive");
+    let expected_len = edge
+        .checked_mul(edge)
+        .and_then(|pixels| pixels.checked_mul(3))
+        .expect("requested RGB buffer length overflowed usize");
+    assert_eq!(
+        image.pixels.len(),
+        expected_len,
+        "{label} output was not a complete RGB8 buffer for {size}x{size}"
+    );
+}
+
 fn save(image: &mlx_gen::media::Image, name: &str) {
     let output_dir = std::env::var_os("KREA_AB_OUTPUT_DIR")
         .map(PathBuf::from)
@@ -139,10 +158,8 @@ fn main() {
         tiled,
     );
 
-    assert_eq!(
-        (alternate.width, alternate.height),
-        (native.width, native.height)
-    );
+    validate_rgb_output(&native, "native", size);
+    validate_rgb_output(&alternate, "Wan 2.1", size);
     let native_stats = stats(&native.pixels, native.width);
     let alternate_stats = stats(&alternate.pixels, alternate.width);
     let changed = native

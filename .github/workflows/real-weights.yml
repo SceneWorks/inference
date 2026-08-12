@@ -2730,7 +2730,7 @@ jobs:
       - name: Resolve runner-local model cache
         run: python3.12 scripts/release/resolve_snapshot_paths.py MLX_GEN_MODELS_ROOT
       - name: Toolchain versions
-        run: rustc --version && cargo --version && sw_vers && xcrun metal --version
+        run: rustc --version && cargo --version && sw_vers
       - name: Bind the manifest-pinned q4 Krea tier
         run: |
           python3.12 scripts/release/export_model_snapshot_paths.py \

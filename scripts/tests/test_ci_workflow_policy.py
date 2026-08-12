@@ -2016,6 +2016,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         )
         self.assertIn("actions/upload-artifact@", job)
         self.assertIn("if-no-files-found: error", job)
+        self.assertNotIn("xcrun metal --version", job)
         self.assertNotIn("gpu_fault_evidence.sh", job)
         self.assertNotIn("memory.csv", job)
         self.assertNotIn("--inventory-output", job)
@@ -2043,6 +2044,10 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertNotIn("get_peak_memory", example)
         self.assertNotIn("reset_peak_memory", example)
         self.assertNotIn("std::time::Instant", example)
+        self.assertEqual(example.count("validate_rgb_output("), 3)
+        self.assertIn("usize::try_from(size)", example)
+        self.assertIn(".checked_mul(edge)", example)
+        self.assertIn("pixels.checked_mul(3)", example)
 
     def test_krea_s18_sweep_is_operator_dispatched_and_keeps_its_evidence(self) -> None:
         """sc-17276: the S18 coherence sweep is a measurement lane, not a regression gate.
