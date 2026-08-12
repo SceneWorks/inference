@@ -1528,6 +1528,12 @@ jobs:
             install -m 0644 "$source" "$MAGE_GOLDEN_DIR/$file"
           done
           echo "imported=true" >> "$GITHUB_OUTPUT"
+      - name: Prepare pinned Mage reference environment
+        run: |
+          if [[ ! -x "$RUNNER_TEMP/mage-reference/bin/python" ]]; then
+            python -m venv "$RUNNER_TEMP/mage-reference"
+            "$RUNNER_TEMP/mage-reference/bin/python" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes -r crates/media/mlx-gen/_vendor/mage_flow/requirements-oracles.txt
+          fi
       - name: Migrate only the copied Mage edit-variant manifest
         if: github.event_name == 'workflow_dispatch' && inputs.profile == 'media' && inputs.migrate_mage_edit_variant_manifest
         run: |
@@ -1543,7 +1549,7 @@ jobs:
             echo "Mage manifest migration must never mutate the persistent operator seed" >&2
             exit 1
           fi
-          python3.12 scripts/release/provision_mage_edit_variants.py \
+          "$RUNNER_TEMP/mage-reference/bin/python" scripts/release/provision_mage_edit_variants.py \
             --gen "$MAGE_SNAPSHOT" \
             --edit "$MAGE_EDIT_SNAPSHOT" \
             --edit-base "$MAGE_EDIT_BASE_SNAPSHOT" \
@@ -1557,10 +1563,6 @@ jobs:
       # operator-generated bundle above instead of running the multi-hour producer in Actions.
       - name: Verify restored or operator-provisioned Mage oracle cache
         run: |
-          if [[ ! -x "$RUNNER_TEMP/mage-reference/bin/python" ]]; then
-            python -m venv "$RUNNER_TEMP/mage-reference"
-            "$RUNNER_TEMP/mage-reference/bin/python" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes -r crates/media/mlx-gen/_vendor/mage_flow/requirements-oracles.txt
-          fi
           "$RUNNER_TEMP/mage-reference/bin/python" \
             scripts/release/provision_mage_oracles.py \
             --snapshot "$MAGE_SNAPSHOT" \

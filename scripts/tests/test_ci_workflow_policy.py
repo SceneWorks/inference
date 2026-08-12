@@ -935,12 +935,22 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             "default: false",
             workflow[workflow.index("migrate_mage_edit_variant_manifest:") :],
         )
-        migration = workflow[
-            workflow.index("\n      - name: Migrate only the copied Mage edit-variant manifest") :
-            workflow.index(
-                "\n      - name: Verify restored or operator-provisioned Mage oracle cache"
-            )
-        ]
+        prepare_index = workflow.index("\n      - name: Prepare pinned Mage reference environment")
+        migration_index = workflow.index(
+            "\n      - name: Migrate only the copied Mage edit-variant manifest"
+        )
+        verify_index = workflow.index(
+            "\n      - name: Verify restored or operator-provisioned Mage oracle cache"
+        )
+        self.assertLess(prepare_index, migration_index)
+        self.assertLess(migration_index, verify_index)
+        preparation = workflow[prepare_index:migration_index]
+        self.assertIn('python -m venv "$RUNNER_TEMP/mage-reference"', preparation)
+        self.assertIn(
+            '"$RUNNER_TEMP/mage-reference/bin/python" -m pip install', preparation
+        )
+        self.assertIn("requirements-oracles.txt", preparation)
+        migration = workflow[migration_index:verify_index]
         self.assertIn("inputs.profile == 'media'", migration)
         self.assertIn("inputs.migrate_mage_edit_variant_manifest", migration)
         self.assertIn('golden_root="$(cd "$MAGE_GOLDEN_DIR" && pwd -P)"', migration)
@@ -949,6 +959,8 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn('"$golden_root" != "$runner_root/"*', migration)
         self.assertIn('"$golden_root" == "$seed_root"', migration)
         self.assertIn(" -ef ", migration)
+        self.assertIn('"$RUNNER_TEMP/mage-reference/bin/python"', migration)
+        self.assertNotIn("python3.12 scripts/release/provision_mage_edit_variants.py", migration)
         self.assertIn("--migrate-reference-environment-manifest-only", migration)
         self.assertNotIn("dump_mage_flow_golden.py", migration)
         self.assertIn("refusing to run the multi-hour CPU producer", workflow)
