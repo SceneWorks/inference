@@ -127,20 +127,8 @@ fn vit_decoder_matches_the_reference() {
         .forward(f.require("in.vit.latent").unwrap())
         .unwrap();
     let want = f.require("out.vit.video").unwrap();
-    // 5 latent frames × patch_size_t, a 3×4 latent × patch_size spatially. Derived from the
-    // config rather than restated, so a fixture-geometry change shows up as a parity failure
-    // rather than as a shape literal nobody updated.
-    let cfg = fixture_config(3);
-    assert_eq!(
-        got.shape(),
-        &[
-            1,
-            3,
-            5 * cfg.patch_size_t,
-            3 * cfg.patch_size,
-            4 * cfg.patch_size
-        ]
-    );
+    // 5 latent frames × 4, 3×2 spatial × 2 -> [1, 3, 20, 6, 8].
+    assert_eq!(got.shape(), &[1, 3, 20, 6, 8]);
     assert_parity(&got, want, TOL, "ViT3DDecoder");
 }
 
@@ -170,7 +158,6 @@ fn decode_clip_matches_the_reference() {
 #[test]
 fn temporal_decode_matches_the_reference() {
     let f = fixture();
-    let cfg = fixture_config(3);
     let vae = vae(3);
     for (tokens, frames) in [(5, 17), (7, 22), (9, 30), (12, 39), (17, 56)] {
         let latent = f.require(&format!("in.temporal{tokens}.latent")).unwrap();
@@ -178,7 +165,7 @@ fn temporal_decode_matches_the_reference() {
         let got = vae.decode(latent).unwrap();
         assert_eq!(
             got.shape(),
-            &[1, 3, frames, 3 * cfg.patch_size, 4 * cfg.patch_size],
+            &[1, 3, frames, 6, 8],
             "{tokens} tokens should decode to {frames} frames"
         );
         assert_parity(&got, want, TOL, &format!("decode_temporal({tokens})"));
@@ -190,7 +177,6 @@ fn temporal_decode_matches_the_reference() {
 #[test]
 fn token_drop_zero_two_pass_matches_the_reference() {
     let f = fixture();
-    let cfg = fixture_config(0);
     let vae = vae(0);
     assert_eq!(vae.geometry().token_overlap, 0);
     assert_eq!(vae.geometry().frame_overlap, 0);
@@ -203,10 +189,7 @@ fn token_drop_zero_two_pass_matches_the_reference() {
             .require(&format!("out.drop0_temporal{tokens}.video"))
             .unwrap();
         let got = vae.decode(latent).unwrap();
-        assert_eq!(
-            got.shape(),
-            &[1, 3, frames, 3 * cfg.patch_size, 4 * cfg.patch_size]
-        );
+        assert_eq!(got.shape(), &[1, 3, frames, 6, 8]);
         assert_parity(&got, want, TOL, &format!("drop0 decode_temporal({tokens})"));
     }
 }
@@ -482,12 +465,25 @@ fn weight_mapping_is_exhaustive() {
         "these checkpoint tensors were never read: {leftover:?}"
     );
 
-    // ...and conversely, the declared name list is exactly the fixture's tensor set.
-    let declared: std::collections::BTreeSet<String> =
-        MiniMaxH3VideoVae::tensor_names(&cfg).into_iter().collect();
+    // ...and conversely, the declared name list is exactly the fixture's tensor set — **for the
+    // decode half**. `tensor_names` covers the whole published `vae/` component since sc-17148
+    // added the encoder, but this fixture deliberately carries only the decode half: its bytes are
+    // shared verbatim with `candle-gen-minimax-h3`, whose `cross_backend.rs` digests them, so
+    // adding tensors here would break that crate's gate. `video_vae_encode_parity.rs` holds the
+    // encode half against `video_vae_encode.safetensors`, and `real_weights.rs` asserts the union
+    // is exactly the published 703.
+    let is_encode_half = |k: &str| k.starts_with("encoder.") || k.starts_with("quant_conv.");
+    assert!(
+        !before.iter().any(|k| is_encode_half(k)),
+        "the decode fixture must not carry encode-half tensors"
+    );
+    let declared: std::collections::BTreeSet<String> = MiniMaxH3VideoVae::tensor_names(&cfg)
+        .into_iter()
+        .filter(|k| !is_encode_half(k))
+        .collect();
     assert_eq!(
         declared, before,
-        "declared tensor names differ from the checkpoint's"
+        "declared decode-half tensor names differ from the checkpoint's"
     );
 }
 

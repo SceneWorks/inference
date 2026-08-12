@@ -1,9 +1,11 @@
 //! sc-17148: video-VAE **encode** parity — the 3-D causal CNN half, against the official
 //! diffusers `AutoencoderKLMiniMaxH3`.
 //!
-//! Fixture `tests/fixtures/video_vae_decode.safetensors` ← `tools/dump_minimax_h3_video_vae.py`
-//! (the same file as the decode goldens; one model produces both halves, so splitting the fixture
-//! would let the two drift apart).
+//! Fixture `tests/fixtures/video_vae_encode.safetensors` ←
+//! `tools/dump_minimax_h3_video_vae_encode.py`, which documents at length why the encode half has
+//! its own file rather than sharing the decode goldens': the geometries cannot match (the encoder
+//! must not crop), and the decode fixture's bytes are shared verbatim with
+//! `candle-gen-minimax-h3`, whose cross-backend gate digests them.
 //!
 //! `fl2va` conditions a keyframe through **both** the text encoder's vision tower and this VAE, so
 //! sc-17140's decode-only port is not sufficient for it. The four conventions this file exists to
@@ -26,7 +28,9 @@
 
 mod common;
 
-use common::{assert_parity, fixture_config, rel, std_dev, FIXTURE};
+use common::{
+    assert_parity, encode_fixture_config, encode_fixture_tiles, rel, std_dev, ENCODE_FIXTURE,
+};
 
 use mlx_rs::{Array, Dtype};
 
@@ -42,21 +46,8 @@ const TOL: f32 = 1e-2;
 /// A mutation must move the output by at least this much to count as gated.
 const MUTATION_FLOOR: f32 = 1e-2;
 
-/// The tile geometry the fixture's tiled golden was dumped at — deliberately smaller than the
-/// shipped 256/64 so a committable canvas spans more than one tile. `const.encode_tile` carries
-/// the same two numbers so the fixture and this file cannot drift apart.
-fn fixture_tile_geometry(f: &Weights) -> (i32, i32) {
-    let t = f
-        .require("const.encode_tile")
-        .unwrap()
-        .as_slice::<i32>()
-        .to_vec();
-    assert_eq!(t.len(), 2, "const.encode_tile is [tile_size, min_overlap]");
-    (t[0], t[1])
-}
-
 fn fixture() -> Weights {
-    Weights::from_file(FIXTURE).unwrap()
+    Weights::from_file(ENCODE_FIXTURE).unwrap()
 }
 
 fn model_weights() -> Weights {
@@ -69,7 +60,8 @@ fn model_weights() -> Weights {
 
 fn vae(token_drop: i32) -> MiniMaxH3VideoVae {
     let mut w = model_weights();
-    MiniMaxH3VideoVae::from_weights(&mut w, &fixture_config(token_drop), Dtype::Float32).unwrap()
+    MiniMaxH3VideoVae::from_weights(&mut w, &encode_fixture_config(token_drop), Dtype::Float32)
+        .unwrap()
 }
 
 fn get(f: &Weights, key: &str) -> Array {
@@ -87,7 +79,7 @@ fn get(f: &Weights, key: &str) -> Array {
 #[test]
 fn encoder_stack_matches_the_reference() {
     let f = fixture();
-    let cfg = fixture_config(3);
+    let cfg = encode_fixture_config(3);
     let w = model_weights();
     let enc = VideoEncoder3d::from_weights(&w, "encoder", &cfg, Dtype::Float32).unwrap();
 
@@ -115,7 +107,7 @@ fn encoder_stack_matches_the_reference() {
 #[test]
 fn the_encoder_halves_rather_than_crops() {
     let f = fixture();
-    let cfg = fixture_config(3);
+    let cfg = encode_fixture_config(3);
     let pixels = get(&f, "in.encoder.pixels");
     let want = get(&f, "out.encoder.params");
     let (h, w) = (pixels.shape()[3], pixels.shape()[4]);
@@ -166,7 +158,7 @@ fn encode_clip_matches_the_reference_untiled() {
 fn tiled_encode_matches_the_reference() {
     let f = fixture();
     let v = vae(3);
-    let (tile, overlap) = fixture_tile_geometry(&f);
+    let (tile, overlap) = encode_fixture_tiles(&f);
     let pixels = get(&f, "in.encode_clip.pixels");
     let want = get(&f, "out.encode_clip_tiled.params");
     let untiled = get(&f, "out.encode_clip.params");
@@ -268,7 +260,7 @@ fn chunked_encode_matches_the_reference() {
 /// comparison rather than through the encoder, so it measures the convention itself.
 #[test]
 fn groupnorm_is_frame_isolated() {
-    let cfg = fixture_config(3);
+    let cfg = encode_fixture_config(3);
     let channels = cfg.norm_num_groups;
     let mut w = Weights::empty();
     w.insert(
@@ -348,7 +340,7 @@ fn groupnorm_is_frame_isolated() {
 #[test]
 fn encoder_weights_are_all_load_bearing() {
     let f = fixture();
-    let cfg = fixture_config(3);
+    let cfg = encode_fixture_config(3);
     let pixels = get(&f, "in.encode_clip.pixels");
     let baseline = vae(3).encode_clip_tiled(&pixels, 4096, 64).unwrap();
     assert_parity(
@@ -401,7 +393,7 @@ fn encoder_weights_are_all_load_bearing() {
 fn the_tile_geometry_changes_the_result() {
     let f = fixture();
     let v = vae(3);
-    let (tile, overlap) = fixture_tile_geometry(&f);
+    let (tile, overlap) = encode_fixture_tiles(&f);
     let pixels = get(&f, "in.encode_clip.pixels");
 
     let at_fixture = v.encode_clip_tiled(&pixels, tile, overlap).unwrap();
@@ -503,7 +495,7 @@ fn the_posterior_sample_depends_on_its_noise() {
 fn the_shipped_tile_geometry_is_pinned() {
     assert_eq!(TILE_SAMPLE_MIN_SIZE, 256);
     assert_eq!(TILE_SAMPLE_MIN_OVERLAP, 64);
-    let (tile, overlap) = fixture_tile_geometry(&fixture());
+    let (tile, overlap) = encode_fixture_tiles(&fixture());
     assert!(
         tile < TILE_SAMPLE_MIN_SIZE && overlap < TILE_SAMPLE_MIN_OVERLAP,
         "the fixture tiles at {tile}/{overlap}; it must be SMALLER than the shipped \

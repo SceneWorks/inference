@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use mlx_rs::Array;
 
+use mlx_gen::weights::Weights;
 use mlx_gen_minimax_h3::{BigVganConfig, MiniMaxH3AudioVaeConfig, MiniMaxH3VaeConfig};
 
 /// The committed video-VAE parity fixture, produced by `tools/dump_minimax_h3_video_vae.py`
@@ -17,6 +18,28 @@ use mlx_gen_minimax_h3::{BigVganConfig, MiniMaxH3AudioVaeConfig, MiniMaxH3VaeCon
 pub const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/video_vae_decode.safetensors"
+);
+
+/// The committed video-VAE **encode** fixture (sc-17148), produced by
+/// `tools/dump_minimax_h3_video_vae_encode.py`.
+///
+/// # Why the encode half has its own file
+///
+/// Its geometry cannot be the decode fixture's. The encoder must not **crop**: a level that
+/// strides time without also striding space convolves a 3-wide kernel with no spatial padding and
+/// loses two columns instead of halving, which breaks the tiled encode outright (the stitch
+/// assumes `latent = pixel / ratio`). The original MiniMax module asserts `time_stride in [1, 2]`,
+/// so `patch_size_t` 4 needs TWO time-strided levels — each of which must therefore also be
+/// spatial-strided, making the spatial cumprod 4 rather than [`FIXTURE`]'s 2.
+///
+/// Regenerating [`FIXTURE`] at that geometry was the obvious move and is the wrong one. Its bytes
+/// are **shared verbatim with `candle-gen-minimax-h3`** (sc-17154), whose `cross_backend.rs`
+/// digests them, and re-randomizing it perturbs every decoder weight — which measurably eroded
+/// that crate's `a_gated_ffn_half_swap_is_loud_against_the_mlx_record` mutation gate from ~1.2e-1
+/// to 8.4e-2 against its 1e-1 floor. A second file keeps this slice's change inside this slice.
+pub const ENCODE_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/video_vae_encode.safetensors"
 );
 
 /// The committed audio parity fixture, produced by `tools/dump_minimax_h3_audio_vae.py` running
@@ -180,33 +203,55 @@ pub fn fixture_config(token_drop: i32) -> MiniMaxH3VaeConfig {
         rope_theta: 100.0,
         rope_dim_ratio: 0.75,
         norm_eps: 1e-5,
-        // The spatial cumprod of `spatial_downsample_factors` below. It is 4 rather than the VAE
-        // ratio's shape-minimal 2 because the ORIGINAL MiniMax module asserts `time_stride in
-        // [1, 2]`, so `patch_size_t` 4 needs TWO time-strided levels — and a level that strides
-        // time without also striding space convolves a 3-wide kernel with no spatial padding,
-        // cropping two columns instead of halving. See `tools/dump_minimax_h3_video_vae.py`.
-        patch_size: 4,
+        patch_size: 2,
         patch_size_t: 4,
         clip_length: 17,
         token_drop,
         // The REAL 24-entry de-normalization statistics, not placeholders.
         latents_mean: shipped.latents_mean.clone(),
         latents_std: shipped.latents_std.clone(),
-        // The CNN encoder half (sc-17148), shrunk the same way, and matching
-        // `tools/dump_minimax_h3_video_vae.py`'s `BLOCK_OUT_CHANNELS` / `SPATIAL_DOWN` /
-        // `TIME_DOWN` exactly. The two factor lists' products are the fixture's `patch_size` 2
-        // and `patch_size_t` 4, which `validate_encoder` requires: encode and decode are inverse
-        // geometries at the fixture scale exactly as they are at production scale.
+        // The encoder fields the struct gained in sc-17148. This fixture carries NO `encoder.*`
+        // tensors — it is the decode golden and its bytes are shared with
+        // `candle-gen-minimax-h3` — so these only have to satisfy `validate_encoder`'s
+        // "the cumprods are the patch sizes" rule. `MiniMaxH3VideoVae::from_weights` loads the
+        // encode half only when it is present; see [`ENCODE_FIXTURE`] for the one that has it.
         in_channels: 3,
-        // The width CHANGES at the last level so `conv_shortcut` is actually built and gated;
-        // a uniform-width fixture never constructs one.
-        block_out_channels: vec![32, 32, 32, 64],
+        block_out_channels: vec![32, 32, 32, 32],
         layers_per_block: 1,
-        spatial_downsample_factors: vec![1, 2, 2, 1],
+        spatial_downsample_factors: vec![2, 1, 1, 1],
         temporal_downsample_factors: vec![1, 2, 2, 1],
         norm_num_groups: 32,
         encoder_norm_eps: 1e-6,
     }
+}
+
+/// The geometry [`ENCODE_FIXTURE`] was dumped at, mirroring
+/// `tools/dump_minimax_h3_video_vae_encode.py`.
+///
+/// Differs from [`fixture_config`] in exactly the ways the encode half forces (see
+/// [`ENCODE_FIXTURE`]): every downsampling level is spatial-strided, so nothing crops and the
+/// spatial cumprod — and therefore `patch_size` — is 4. The width also changes at the last level,
+/// so `conv_shortcut` is actually built rather than left unexercised.
+pub fn encode_fixture_config(token_drop: i32) -> MiniMaxH3VaeConfig {
+    MiniMaxH3VaeConfig {
+        patch_size: 4,
+        block_out_channels: vec![32, 32, 32, 64],
+        spatial_downsample_factors: vec![1, 2, 2, 1],
+        temporal_downsample_factors: vec![1, 2, 2, 1],
+        ..fixture_config(token_drop)
+    }
+}
+
+/// The tile geometry [`ENCODE_FIXTURE`]'s tiled golden was dumped at — deliberately smaller than
+/// the shipped 256/64 so a committable canvas spans more than one tile.
+pub fn encode_fixture_tiles(f: &Weights) -> (i32, i32) {
+    let t = f
+        .require("const.encode_tile")
+        .expect("the encode fixture carries const.encode_tile")
+        .as_slice::<i32>()
+        .to_vec();
+    assert_eq!(t.len(), 2, "const.encode_tile is [tile_size, min_overlap]");
+    (t[0], t[1])
 }
 
 /// `(max|a-b| / peak|b|, mean|a-b| / mean|b|)` over the full tensors — the peak- and

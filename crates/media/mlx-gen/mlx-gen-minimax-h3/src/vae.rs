@@ -73,15 +73,23 @@ pub fn split_fused_qkv(fused: &Array, heads: i32, head_dim: i32) -> Result<[Arra
     ])
 }
 
+/// The encode half — `quant_conv` and the CNN encoder, loaded together or not at all.
+#[derive(Debug, Clone)]
+struct EncodeHalf {
+    quant_w: Array,
+    quant_b: Array,
+    encoder: VideoEncoder3d,
+}
+
 /// The video VAE — both halves: the ViT decoder (sc-17140) and the causal-CNN encoder (sc-17148).
 #[derive(Debug, Clone)]
 pub struct MiniMaxH3VideoVae {
     post_quant_w: Array,
     post_quant_b: Array,
     decoder: ViT3dDecoder,
-    quant_w: Array,
-    quant_b: Array,
-    encoder: VideoEncoder3d,
+    /// The encode half, present only when the weight map carried `encoder.*` / `quant_conv.*`.
+    /// See [`MiniMaxH3VideoVae::from_weights`].
+    encode: Option<Box<EncodeHalf>>,
     geometry: TemporalGeometry,
     latents_mean: Array,
     latents_std: Array,
@@ -107,31 +115,40 @@ impl MiniMaxH3VideoVae {
         let post_quant_w = raw.reshape(&[c, c])?;
         let post_quant_b = w.require("post_quant_conv.bias")?.as_dtype(dtype)?;
 
-        // `quant_conv` is the mirror: `nn.Conv3d(2·z, 2·z, 1)` over the POSTERIOR PARAMETERS, so
-        // it is twice as wide as `post_quant_conv` — it maps mean and logvar together.
-        let raw_q = w.require("quant_conv.weight")?.as_dtype(dtype)?;
-        let sq = raw_q.shape();
-        let c2 = 2 * c;
-        if sq != [c2, c2, 1, 1, 1] {
-            return Err(Error::Msg(format!(
-                "minimax-h3 vae: quant_conv.weight is {sq:?}, expected [{c2}, {c2}, 1, 1, 1] — it \
-                 maps the posterior's mean AND logvar, so it is twice the latent width"
-            )));
-        }
-        let quant_w = raw_q.reshape(&[c2, c2])?;
-        let quant_b = w.require("quant_conv.bias")?.as_dtype(dtype)?;
+        // The encode half is loaded **only when the map carries it**. The published `vae/` always
+        // does — [`Self::load`] enforces that — but the committed decode parity fixture does not,
+        // because its bytes are shared verbatim with `candle-gen-minimax-h3` (sc-17154) and adding
+        // tensors to it would break that crate's cross-backend digest. `encode` then reports a
+        // typed error naming the missing half rather than panicking or silently returning noise.
+        let encode = if w.get("encoder.conv_in.weight").is_some() {
+            // `quant_conv` is the mirror of `post_quant_conv`: `nn.Conv3d(2·z, 2·z, 1)` over the
+            // POSTERIOR PARAMETERS, so it is twice as wide — it maps mean and logvar together.
+            let raw_q = w.require("quant_conv.weight")?.as_dtype(dtype)?;
+            let sq = raw_q.shape();
+            let c2 = 2 * c;
+            if sq != [c2, c2, 1, 1, 1] {
+                return Err(Error::Msg(format!(
+                    "minimax-h3 vae: quant_conv.weight is {sq:?}, expected [{c2}, {c2}, 1, 1, 1] \
+                     — it maps the posterior's mean AND logvar, so it is twice the latent width"
+                )));
+            }
+            Some(Box::new(EncodeHalf {
+                quant_w: raw_q.reshape(&[c2, c2])?,
+                quant_b: w.require("quant_conv.bias")?.as_dtype(dtype)?,
+                encoder: VideoEncoder3d::from_weights(w, "encoder", cfg, dtype)?,
+            }))
+        } else {
+            None
+        };
 
         let decoder = ViT3dDecoder::from_weights(w, "decoder", cfg, dtype)?;
-        let encoder = VideoEncoder3d::from_weights(w, "encoder", cfg, dtype)?;
         let geometry = TemporalGeometry::new(cfg)?;
 
         Ok(Self {
             post_quant_w,
             post_quant_b,
             decoder,
-            quant_w,
-            quant_b,
-            encoder,
+            encode,
             geometry,
             latents_mean: Array::from_slice(&cfg.latents_mean, &[1, c, 1, 1, 1]).as_dtype(dtype)?,
             latents_std: Array::from_slice(&cfg.latents_std, &[1, c, 1, 1, 1]).as_dtype(dtype)?,
@@ -167,7 +184,20 @@ impl MiniMaxH3VideoVae {
         })?;
         let cfg = MiniMaxH3VaeConfig::from_diffusers_json(&text)?;
         let mut w = Weights::from_dir(&dir)?;
-        Self::from_weights(&mut w, &cfg, dtype)
+        let vae = Self::from_weights(&mut w, &cfg, dtype)?;
+        // **Production is strict.** `from_weights` tolerates a decode-only weight map because the
+        // committed parity fixture is one; a real `vae/` component always ships all 703 tensors,
+        // so a snapshot missing the encode half is a broken download, not a supported shape. Fail
+        // here rather than at the first `fl2va` request.
+        if !vae.can_encode() {
+            return Err(Error::Msg(format!(
+                "minimax-h3 vae: {} has no `encoder.*` / `quant_conv.*` tensors; the published \
+                 vae/ component carries all 703 and fl2va keyframe conditioning needs the encode \
+                 half",
+                dir.display()
+            )));
+        }
+        Ok(vae)
     }
 
     /// The config in force.
@@ -221,6 +251,7 @@ impl MiniMaxH3VideoVae {
         tile_size: i32,
         min_overlap: i32,
     ) -> Result<Array> {
+        let half = self.encode_half()?;
         let s = pixels.shape();
         if s.len() != 5 {
             return Err(Error::Msg(format!(
@@ -238,7 +269,7 @@ impl MiniMaxH3VideoVae {
             for (j, &x) in cols.starts.iter().enumerate() {
                 let tile = slice_axis(pixels, 3, y, y + rows.lengths[i])?;
                 let tile = slice_axis(&tile, 4, x, x + cols.lengths[j])?;
-                row.push(self.quant_conv(&self.encoder.forward(&tile)?)?);
+                row.push(self.quant_conv(half, &half.encoder.forward(&tile)?)?);
             }
             grid.push(row);
         }
@@ -248,10 +279,26 @@ impl MiniMaxH3VideoVae {
         stitch_tiles(&grid, &latent(&rows.overlaps), &latent(&cols.overlaps))
     }
 
+    /// The encode half, or a typed error naming what is missing.
+    fn encode_half(&self) -> Result<&EncodeHalf> {
+        self.encode.as_deref().ok_or_else(|| {
+            Error::Msg(
+                "minimax-h3 vae: this VAE was built without its encode half (no `encoder.*` / \
+                 `quant_conv.*` in the weight map), so it can decode but not encode"
+                    .into(),
+            )
+        })
+    }
+
+    /// Whether the encode half is loaded.
+    pub fn can_encode(&self) -> bool {
+        self.encode.is_some()
+    }
+
     /// The pointwise `quant_conv` channel map over the posterior parameters.
-    fn quant_conv(&self, x: &Array) -> Result<Array> {
+    fn quant_conv(&self, half: &EncodeHalf, x: &Array) -> Result<Array> {
         let nhwc = x.transpose_axes(&[0, 2, 3, 4, 1])?;
-        let mapped = linear(&nhwc, &self.quant_w, &self.quant_b)?;
+        let mapped = linear(&nhwc, &half.quant_w, &half.quant_b)?;
         Ok(mapped.transpose_axes(&[0, 4, 1, 2, 3])?)
     }
 
@@ -268,6 +315,7 @@ impl MiniMaxH3VideoVae {
     /// Longer inputs are padded up to a multiple of `clip_length` by **repeating the last frame**,
     /// encoded clip by clip, and have `token_drop` trailing latent frames removed.
     pub fn encode(&self, pixels: &Array) -> Result<DiagonalGaussian> {
+        self.encode_half()?;
         let s = pixels.shape();
         if s.len() != 5 {
             return Err(Error::Msg(format!(

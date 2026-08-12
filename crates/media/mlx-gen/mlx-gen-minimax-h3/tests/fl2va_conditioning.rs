@@ -29,7 +29,7 @@
 
 mod common;
 
-use common::{fixture_config, rel, FIXTURE};
+use common::{encode_fixture_config, rel, ENCODE_FIXTURE};
 
 use mlx_rs::{Array, Dtype};
 
@@ -58,11 +58,11 @@ const PATCH: [i32; 3] = [1, 2, 2];
 const KEYFRAME_EDGE: u32 = 24;
 
 fn vae() -> MiniMaxH3VideoVae {
-    let mut w = Weights::from_file(FIXTURE).unwrap();
+    let mut w = Weights::from_file(ENCODE_FIXTURE).unwrap();
     for prefix in ["src.", "in.", "out.", "const."] {
         w.remove_prefix(prefix);
     }
-    MiniMaxH3VideoVae::from_weights(&mut w, &fixture_config(3), Dtype::Float32).unwrap()
+    MiniMaxH3VideoVae::from_weights(&mut w, &encode_fixture_config(3), Dtype::Float32).unwrap()
 }
 
 /// A probe image that **cannot be confused with an unconditioned result**.
@@ -547,7 +547,7 @@ fn keyframes_are_fitted_to_the_canvas_before_encoding() {
     );
     assert_eq!(
         latent.mean().shape()[3],
-        KEYFRAME_EDGE as i32 / fixture_config(3).patch_size
+        KEYFRAME_EDGE as i32 / encode_fixture_config(3).patch_size
     );
 }
 

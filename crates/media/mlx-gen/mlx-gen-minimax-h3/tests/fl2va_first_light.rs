@@ -263,7 +263,10 @@ fn fl2va_renders_all_four_conditioning_shapes() {
     );
 }
 
-fn load_generator(spec: &LoadSpec, root: &std::path::Path) -> Box<dyn mlx_gen::gen_core::Generator> {
+fn load_generator(
+    spec: &LoadSpec,
+    root: &std::path::Path,
+) -> Box<dyn mlx_gen::gen_core::Generator> {
     match mlx_gen_minimax_h3::model::load(spec) {
         Ok(m) => m,
         Err(e) => panic!("load {}: {e}", root.display()),
