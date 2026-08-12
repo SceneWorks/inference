@@ -29,14 +29,17 @@
 //! call and `denoise_sprint`'s SCM call — and there is no hand-written `for`-loop denoise anywhere in
 //! the crate. Two registered descriptors, two user-reachable lanes, one call site each:
 //!
-//! * **`sana_1600m` — txt2img only.** Its `Capabilities::conditioning` is empty and `load` refuses
-//!   quantization, LoRA/LoKr and control / IP-adapter overlays outright, so there is no img2img fork
-//!   and no name-driven provider. The one lane is reachable under the whole curated epic-7114 sampler
-//!   menu, which is why the multi-eval dedup matters here: `heun` and `dpmpp_sde` evaluate twice per
-//!   outer step through that same single call.
-//! * **`sana_sprint_1600m` — txt2img only.** It advertises only the `"default"` sampler / scheduler
-//!   sentinel, because the SCM consistency loop is not a curated [`candle_gen::gen_core::sampling::Solver`]
-//!   at all. `load_sprint` refuses the same overlays.
+//! * **`sana_1600m` — txt2img plus singular-reference img2img.** Its `Reference` conditioning
+//!   VAE-encodes a clean init latent and enters the same flow driver at the strength-derived schedule
+//!   tail, so both request shapes emit through this one preview-hooked call. `load` still refuses
+//!   quantization, LoRA/LoKr, and control / IP-adapter overlays. The route is reachable under the whole
+//!   curated epic-7114 sampler menu, which is why multi-eval dedup matters: `heun` and `dpmpp_sde`
+//!   evaluate twice per outer step through that same call.
+//! * **`sana_sprint_1600m` — txt2img plus singular-reference img2img.** Reference conditioning
+//!   re-noises the DC-AE latent at the strength-derived TrigFlow angle, then runs a suffix of the same
+//!   preview-hooked SCM driver. It advertises only the `"default"` sampler / scheduler sentinel because
+//!   the SCM consistency loop is not a curated [`candle_gen::gen_core::sampling::Solver`] at all;
+//!   `load_sprint` refuses the same overlays.
 //!
 //! The crate ships **no trainer**, so unlike Krea / Lens / SDXL / Z-Image it has no deliberately dark
 //! site: both sampler calls are hooked and `candle-gen-catalog`'s route inventory pins
@@ -1036,10 +1039,10 @@ mod tests {
                 "{declaration} must take its hook by reference"
             );
         }
-        // Both `generate_with` / `generate_with_conditioning` pairs (base and Sprint) plus the two
-        // free denoise functions: six declarations in shipped `pipeline.rs`, line-exact for the same
-        // reason as `model.rs` above.
-        assert_eq!(hook_parameters(pipeline), 6);
+        // Both `generate_with` / `generate_with_conditioning` pairs (base and Sprint), the two
+        // public txt2img denoise wrappers, and their img2img schedule-tail twins: eight declarations
+        // in shipped `pipeline.rs`, line-exact for the same reason as `model.rs` above.
+        assert_eq!(hook_parameters(pipeline), 8);
 
         // The only hooks shipped `pipeline.rs` builds are the two documented INERT ones in the
         // `generate` convenience wrappers. A hook over anything else there would be a second wiring

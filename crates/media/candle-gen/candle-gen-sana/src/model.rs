@@ -13,7 +13,7 @@
 //!
 //! ```text
 //!   transformer/…safetensors   → SanaTransformer   (the Linear-DiT trunk)
-//!   vae/…safetensors           → DcAeDecoder       (DC-AE f32c32 decoder)
+//!   vae/…safetensors           → DcAeEncoder/Decoder (DC-AE f32c32 autoencoder)
 //!   text_encoder/…safetensors  → gemma-2-2b-it     (CHI caption encoder weights)
 //!   tokenizer/tokenizer.json   ↗ gemma tokenizer
 //! ```
@@ -26,17 +26,17 @@
 //! SANA-1.6B is a **true-CFG** flow-match model: default **20 steps / guidance 4.5** (diffusers
 //! `SanaPipeline.__call__`), negative prompt supported, flow-match Euler over a static shift 3.0
 //! schedule routed through the unified epic-7114 sampler. When `guidance <= 1.0` the uncond forward is
-//! skipped (CFG off). No img2img/control conditioning, LoRA, or load-time quantization is wired on the
-//! candle base path — those are rejected rather than silently dropped (the worker routes them to the
-//! Python fallback).
+//! skipped (CFG off). A single reference image drives latent-init img2img with strength-based schedule
+//! truncation; control/IP-adapter overlays, LoRA, and load-time quantization remain unwired and are
+//! rejected rather than silently dropped.
 
 use std::path::PathBuf;
 use std::sync::Mutex;
 
 use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{
-    self, Capabilities, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality,
-    ModelDescriptor, Progress, SizeFloor, WeightsSource,
+    self, Capabilities, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest,
+    Generator, Image, LoadSpec, Modality, ModelDescriptor, Progress, SizeFloor, WeightsSource,
 };
 
 use crate::pipeline::{SanaGenerateRequest, SanaPipeline, SanaSprintPipeline};
@@ -62,7 +62,7 @@ pub const RES_MULTIPLE: u32 = crate::pipeline::SPATIAL_SCALE;
 const MAX_COUNT: u32 = 8;
 
 /// A loaded candle SANA generator. Loading is **lazy** (no file I/O in [`load`]); the heavy components
-/// (gemma-2-2b-it TE + Linear-DiT trunk + DC-AE decoder) are built on the first
+/// (gemma-2-2b-it TE + Linear-DiT trunk + DC-AE encoder/decoder) are built on the first
 /// [`generate`](Generator::generate) call and cached (mirrors the sibling candle providers).
 pub struct SanaGenerator {
     descriptor: ModelDescriptor,
@@ -132,10 +132,12 @@ impl SanaGenerator {
     }
 }
 
-/// SANA-1.6B's identity + capabilities — constructible without loading weights (registry introspection
-/// / capability advertisement). True-CFG text-to-image: negative prompt + guidance scale, flow-match
-/// Euler over the unified curated sampler/scheduler menu (epic 7114). No img2img / control conditioning,
-/// LoRA, or quantization is wired on the candle base path. Backend `"candle"`, `mac_only = false`.
+/// SANA-1.6B's identity + capabilities — constructible without loading weights for registry
+/// introspection and capability advertisement. True-CFG text-to-image and singular-reference img2img:
+/// negative prompt + guidance scale, flow-match Euler over the unified curated sampler/scheduler menu
+/// (epic 7114).
+/// Control/IP-adapter overlays, LoRA, and quantization are not wired on the candle base path. Backend
+/// `"candle"`, `mac_only = false`.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
         control_kinds: None,
@@ -148,8 +150,8 @@ pub fn descriptor() -> ModelDescriptor {
             supports_negative_prompt: true,
             supports_guidance: true,
             supports_true_cfg: true,
-            // Plain txt2img — no img2img/control conditioning on the base SANA checkpoint.
-            conditioning: Vec::new(),
+            // A singular reference is latent-init img2img; control/IP-adapter overlays remain unwired.
+            conditioning: vec![ConditioningKind::Reference],
             supports_lora: false,
             supports_lokr: false,
             // Flow-match Euler over the unified curated sampler/scheduler framework (epic 7114); the
@@ -212,7 +214,7 @@ pub fn sprint_descriptor() -> ModelDescriptor {
             supports_negative_prompt: false,
             supports_guidance: true,
             supports_true_cfg: false,
-            conditioning: Vec::new(),
+            conditioning: vec![ConditioningKind::Reference],
             supports_lora: false,
             supports_lokr: false,
             // The SCM/TrigFlow consistency loop is a dedicated few-step sampler, not a curated
@@ -277,6 +279,28 @@ pub(crate) fn validate_request(
     Ok(())
 }
 
+/// Resolve the single non-edit img2img reference and the common effective strength.
+fn resolve_reference<'a>(
+    req: &'a GenerationRequest,
+    id: &str,
+) -> gen_core::Result<Option<(&'a Image, f32)>> {
+    let mut reference = None;
+    for conditioning in &req.conditioning {
+        if let Conditioning::Reference { image, strength } = conditioning {
+            if reference.is_some() {
+                return Err(gen_core::Error::Msg(format!(
+                    "{id}: multiple reference images are not supported (single img2img init only)"
+                )));
+            }
+            reference = Some((
+                image,
+                crate::pipeline::resolve_strength(*strength, req.strength),
+            ));
+        }
+    }
+    Ok(reference)
+}
+
 /// Construct the (lazy) candle SANA-1.6B generator from a [`LoadSpec`]. `spec.weights` must be a
 /// [`WeightsSource::Dir`] pointing at a `Sana_1600M_1024px_diffusers`-layout snapshot. LoRA/LoKr
 /// adapters, on-the-fly quantization, and control/IP-adapter overlays are rejected (not wired —
@@ -304,7 +328,8 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     }
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
         return Err(gen_core::Error::Unsupported(
-            "candle sana_1600m does not support control / IP-adapter overlays yet (txt2img only)"
+            "candle sana_1600m supports plain txt2img and singular-reference img2img, not control / \
+             IP-adapter overlays"
                 .into(),
         ));
     }
@@ -331,6 +356,10 @@ fn generate_base_images(
     on_progress: &mut dyn FnMut(Progress),
     preview: &candle_gen::preview::PreviewHook<'_>,
 ) -> gen_core::Result<Vec<Image>> {
+    let reference = resolve_reference(req, MODEL_ID)?;
+    let (init_image, strength) = reference
+        .map(|(image, strength)| (Some(image), Some(strength)))
+        .unwrap_or((None, None));
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
     let steps = req.steps.map(|s| s as usize);
     let guidance = req.guidance.unwrap_or(crate::pipeline::DEFAULT_GUIDANCE);
@@ -346,6 +375,8 @@ fn generate_base_images(
                 seed: None,
                 sampler: req.sampler.as_deref(),
                 scheduler: req.scheduler.as_deref(),
+                init_image,
+                strength,
             },
             guidance,
         )
@@ -364,6 +395,8 @@ fn generate_base_images(
                     seed: Some(seed),
                     sampler: req.sampler.as_deref(),
                     scheduler: req.scheduler.as_deref(),
+                    init_image,
+                    strength,
                 },
                 &conditioning,
                 device,
@@ -390,6 +423,9 @@ impl Generator for SanaGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
+        if req.cancel.is_cancelled() {
+            return Err(gen_core::Error::Canceled);
+        }
         let pipeline = self.pipeline()?;
 
         let preview = crate::preview::base_hook(&req.preview);
@@ -471,6 +507,10 @@ fn generate_sprint_images(
     on_progress: &mut dyn FnMut(Progress),
     preview: &candle_gen::preview::PreviewHook<'_>,
 ) -> gen_core::Result<Vec<Image>> {
+    let reference = resolve_reference(req, SPRINT_MODEL_ID)?;
+    let (init_image, strength) = reference
+        .map(|(image, strength)| (Some(image), Some(strength)))
+        .unwrap_or((None, None));
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
     let steps = req.steps.map(|s| s as usize);
     let conditioning = pipeline
@@ -490,6 +530,8 @@ fn generate_sprint_images(
                     seed: Some(seed),
                     sampler: None,
                     scheduler: None,
+                    init_image,
+                    strength,
                 },
                 &conditioning,
                 device,
@@ -528,8 +570,8 @@ pub fn load_sprint(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     }
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
         return Err(gen_core::Error::Unsupported(
-            "candle sana_sprint_1600m does not support control / IP-adapter overlays yet (txt2img \
-             only)"
+            "candle sana_sprint_1600m supports plain txt2img and singular-reference img2img, not \
+             control / IP-adapter overlays"
                 .into(),
         ));
     }
@@ -557,6 +599,9 @@ impl Generator for SanaSprintGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
+        if req.cancel.is_cancelled() {
+            return Err(gen_core::Error::Canceled);
+        }
         let pipeline = self.pipeline()?;
 
         let preview = crate::preview::sprint_hook(&req.preview);
@@ -769,6 +814,49 @@ mod tests {
         }
     }
 
+    fn reference_image() -> Image {
+        Image {
+            width: 32,
+            height: 32,
+            pixels: vec![128; 32 * 32 * 3],
+        }
+    }
+
+    #[test]
+    fn img2img_strength_precedence_default_zero_and_multiple_rejection() {
+        let effective = |reference, request| {
+            let mut r = req(256, 256);
+            r.strength = request;
+            r.conditioning = vec![Conditioning::Reference {
+                image: reference_image(),
+                strength: reference,
+            }];
+            resolve_reference(&r, MODEL_ID).unwrap().unwrap().1
+        };
+        assert_eq!(effective(Some(0.7), Some(0.3)), 0.7);
+        assert_eq!(effective(None, Some(0.3)), 0.3);
+        assert_eq!(
+            effective(None, None),
+            crate::pipeline::DEFAULT_IMG2IMG_STRENGTH
+        );
+        assert_eq!(effective(Some(0.0), Some(0.3)), 0.0);
+
+        let mut r = req(256, 256);
+        r.conditioning = vec![
+            Conditioning::Reference {
+                image: reference_image(),
+                strength: None,
+            },
+            Conditioning::Reference {
+                image: reference_image(),
+                strength: None,
+            },
+        ];
+        assert!(resolve_reference(&r, SPRINT_MODEL_ID).is_err());
+        assert!(validate_request(&descriptor(), &r).is_ok());
+        assert!(validate_request(&sprint_descriptor(), &r).is_ok());
+    }
+
     /// The seam under test: this provider's explicit family registry resolves our Candle generator.
     /// `load` is lazy, so a nonexistent weights dir still resolves (no file I/O until `generate`).
     #[test]
@@ -790,7 +878,10 @@ mod tests {
         assert!(d.capabilities.supports_true_cfg);
         assert!(d.capabilities.supports_guidance);
         assert!(d.capabilities.supports_negative_prompt);
-        assert!(d.capabilities.conditioning.is_empty());
+        assert_eq!(
+            d.capabilities.conditioning,
+            vec![ConditioningKind::Reference]
+        );
         assert!(d.capabilities.supported_quants.is_empty());
         assert!(!d.capabilities.mac_only, "candle is Windows/CUDA, not Mac");
         assert_eq!(d.capabilities.samplers, candle_gen::curated_sampler_names());
@@ -861,6 +952,17 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn canceled_requests_fail_before_lazy_weight_loading_for_both_variants() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let request = req(256, 256);
+        request.cancel.cancel();
+        for generator in [load(&spec).unwrap(), load_sprint(&spec).unwrap()] {
+            let error = generator.generate(&request, &mut |_| {}).unwrap_err();
+            assert!(matches!(error, gen_core::Error::Canceled));
+        }
+    }
+
     // =============================================================================================
     // SANA-Sprint (sc-11781) — the CFG-free SCM/TrigFlow few-step adapter.
     // =============================================================================================
@@ -895,7 +997,10 @@ mod tests {
             "guidance stays an honored embedded knob"
         );
         assert!(d.capabilities.supported_guidance_methods.is_empty());
-        assert!(d.capabilities.conditioning.is_empty());
+        assert_eq!(
+            d.capabilities.conditioning,
+            vec![ConditioningKind::Reference]
+        );
         assert_eq!(d.capabilities.samplers, vec!["default"]);
         assert_eq!(d.capabilities.schedulers, vec!["default"]);
         assert!(!d.capabilities.mac_only, "candle is Windows/CUDA");
