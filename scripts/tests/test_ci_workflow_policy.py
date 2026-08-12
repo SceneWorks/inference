@@ -36,9 +36,19 @@ MACOS_MAGE_LOCK = (
     "crates/media/mlx-gen/_vendor/mage_flow/requirements-oracles.txt"
 )
 MACOS_INTERPRETER = "python3.12"
-WINDOWS_SETUP_ACTION = "actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1"
-WINDOWS_PYTHON_VERSION = 'python-version: "3.12.10"'
-WINDOWS_INTERPRETER = r'"%pythonLocation%\python.exe"'
+WINDOWS_SETUP_ACTION = "astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e"
+WINDOWS_UV_VERSION = 'version: "0.12.3"'
+WINDOWS_UV_CACHE = "enable-cache: false"
+WINDOWS_UV_INSTALL = (
+    "uv python install 3.12.10 --managed-python --no-registry --no-bin --no-config "
+    "|| exit /b 1"
+)
+WINDOWS_UV_FIND = (
+    "for /f \"delims=\" %%P in ('uv python find 3.12.10 --managed-python "
+    "--no-project --no-config') do set \"REVIEWED_PYTHON=%%P\""
+)
+WINDOWS_PYTHON_EXPORT = 'echo REVIEWED_PYTHON=%REVIEWED_PYTHON%>>"%GITHUB_ENV%"'
+WINDOWS_INTERPRETER = r'"%REVIEWED_PYTHON%"'
 APPROVED_REAL_WEIGHT_LOCKS = {
     MACOS_HUB_LOCK,
     WINDOWS_HUB_LOCK,
@@ -314,9 +324,11 @@ def real_weight_windows_interpreter_errors(workflow: str) -> list[str]:
 
     The Windows wheel locks are platform- and interpreter-specific. A runner restart changed bare
     ``python`` from 3.12 to 3.14, so pip selected cp314 wheels whose hashes correctly differed from
-    the reviewed cp312 lock. Guard every producer and consumer, not only pip: mixing interpreters
-    around a shared ``PYTHONPATH`` is equally unsafe. ``cmd`` also continues after a failed command,
-    so every hash-locked install must explicitly terminate the step.
+    the reviewed cp312 lock. ``setup-python`` then blocked behind an operator-observed elevation
+    prompt, which unattended CI cannot satisfy. Guard the no-registry uv provisioning plus every
+    producer and consumer, not only pip: mixing interpreters around a shared ``PYTHONPATH`` is
+    equally unsafe. ``cmd`` also continues after a failed command, so every hash-locked install must
+    explicitly terminate the step.
     """
     errors: list[str] = []
     interpreter = re.compile(
@@ -328,9 +340,8 @@ def real_weight_windows_interpreter_errors(workflow: str) -> list[str]:
     setup_action = re.compile(
         rf"\s*(?:-\s*)?uses:\s*{re.escape(WINDOWS_SETUP_ACTION)}\s*$"
     )
-    setup_version = re.compile(
-        rf"\s*{re.escape(WINDOWS_PYTHON_VERSION)}\s*$"
-    )
+    setup_version = re.compile(rf"\s*{re.escape(WINDOWS_UV_VERSION)}\s*$")
+    setup_cache = re.compile(rf"\s*{re.escape(WINDOWS_UV_CACHE)}\s*$")
     for job, lines in workflow_job_bodies(workflow).items():
         runs_on = next((line for line in lines if line.startswith("    runs-on:")), "")
         if "windows" not in runs_on.lower():
@@ -342,21 +353,68 @@ def real_weight_windows_interpreter_errors(workflow: str) -> list[str]:
         ]
         if len(setup_indices) != 1:
             errors.append(
-                f"{job}: expected exactly one pinned Windows setup-python action, "
+                f"{job}: expected exactly one pinned Windows setup-uv action, "
                 f"found {len(setup_indices)}"
             )
             setup_index = len(lines)
         else:
             setup_index = setup_indices[0]
-            setup_block = lines[setup_index : setup_index + 5]
+            setup_block = lines[setup_index : setup_index + 6]
             if not any(
                 setup_version.fullmatch(line.split("#", 1)[0]) for line in setup_block
             ):
-                errors.append(
-                    f"{job}: setup-python must install exact CPython 3.12.10"
-                )
+                errors.append(f"{job}: setup-uv must install exact uv 0.12.3")
+            if not any(
+                setup_cache.fullmatch(line.split("#", 1)[0]) for line in setup_block
+            ):
+                errors.append(f"{job}: setup-uv cache must remain disabled")
+        if any(
+            re.search(r"\buses:\s*actions/setup-python@", line.split("#", 1)[0])
+            for line in lines
+        ):
+            errors.append(
+                f"{job}: Windows jobs must not invoke the registry-dependent setup-python"
+            )
+
+        exact_commands = [line.split("#", 1)[0].strip() for line in lines]
+        install_indices = [
+            index for index, command in enumerate(exact_commands) if command == WINDOWS_UV_INSTALL
+        ]
+        find_indices = [
+            index for index, command in enumerate(exact_commands) if command == WINDOWS_UV_FIND
+        ]
+        export_indices = [
+            index
+            for index, command in enumerate(exact_commands)
+            if command == WINDOWS_PYTHON_EXPORT
+        ]
+        if len(install_indices) != 1:
+            errors.append(
+                f"{job}: expected exactly one fail-fast managed CPython 3.12.10 install, "
+                f"found {len(install_indices)}"
+            )
+        if len(find_indices) != 1:
+            errors.append(
+                f"{job}: expected exactly one managed CPython 3.12.10 path resolution, "
+                f"found {len(find_indices)}"
+            )
+        if len(export_indices) != 1:
+            errors.append(
+                f"{job}: expected exactly one reviewed Python path export, "
+                f"found {len(export_indices)}"
+            )
+        install_index = install_indices[0] if len(install_indices) == 1 else len(lines)
+        find_index = find_indices[0] if len(find_indices) == 1 else len(lines)
+        export_index = export_indices[0] if len(export_indices) == 1 else len(lines)
+        if not setup_index < install_index < find_index < export_index:
+            errors.append(
+                f"{job}: setup-uv, managed install, path resolution, and export are out of order"
+            )
         for index, line in enumerate(lines):
             command = line.split("#", 1)[0]
+            stripped = command.strip()
+            if stripped in {WINDOWS_UV_INSTALL, WINDOWS_UV_FIND}:
+                continue
             found_interpreters = list(interpreter.finditer(command))
             looks_like_python_command = bool(
                 re.search(r"\s-m\s+pip\b|scripts[/\\][^\s]+\.py\b", command, re.IGNORECASE)
@@ -373,9 +431,9 @@ def real_weight_windows_interpreter_errors(workflow: str) -> list[str]:
                         f"{job}: Windows steps must name {WINDOWS_INTERPRETER}, found "
                         f"{name!r} in {command.strip()!r}"
                     )
-                elif index <= setup_index:
+                elif index <= find_index:
                     errors.append(
-                        f"{job}: Windows Python runs before the pinned setup action: "
+                        f"{job}: Windows Python runs before the reviewed path is resolved: "
                         f"{command.strip()!r}"
                     )
             if re.search(r"\s-m\s+pip\s+install\b", command, re.IGNORECASE) and not re.search(
@@ -679,11 +737,15 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             for line in lines
             if WINDOWS_INTERPRETER in line and not line.lstrip().startswith("#")
         ]
-        self.assertEqual(len(windows_python_lines), 65)
+        self.assertEqual(len(windows_python_lines), 76)
         self.assertEqual(workflow.count(f"uses: {WINDOWS_SETUP_ACTION}"), 11)
-        self.assertEqual(workflow.count(WINDOWS_PYTHON_VERSION), 11)
+        self.assertEqual(workflow.count(WINDOWS_UV_VERSION), 11)
+        self.assertEqual(workflow.count(WINDOWS_UV_CACHE), 11)
+        self.assertEqual(workflow.count(WINDOWS_UV_INSTALL), 11)
+        self.assertEqual(workflow.count(WINDOWS_UV_FIND), 11)
+        self.assertEqual(workflow.count(WINDOWS_PYTHON_EXPORT), 11)
         self.assertIn(
-            f'{WINDOWS_INTERPRETER} -c "import sys; assert sys.version_info[:2] == (3, 12), sys.version"',
+            f'{WINDOWS_INTERPRETER} -c "import sys; assert sys.version_info[:3] == (3, 12, 10), sys.version"',
             workflow,
         )
         pip_installs = [
@@ -713,17 +775,35 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertTrue(real_weight_windows_interpreter_errors(whitespace_bypass))
         missing_setup = workflow.replace(f"uses: {WINDOWS_SETUP_ACTION}", "uses: missing", 1)
         self.assertTrue(real_weight_windows_interpreter_errors(missing_setup))
-        wrong_version = workflow.replace(WINDOWS_PYTHON_VERSION, 'python-version: "3.14.0"', 1)
+        wrong_version = workflow.replace(WINDOWS_UV_VERSION, 'version: "0.99.0"', 1)
         self.assertTrue(real_weight_windows_interpreter_errors(wrong_version))
+        provisioning_mutations = {
+            "wrong Python": WINDOWS_UV_INSTALL.replace("3.12.10", "3.14.0"),
+            "registry mutation allowed": WINDOWS_UV_INSTALL.replace(" --no-registry", ""),
+            "launcher mutation allowed": WINDOWS_UV_INSTALL.replace(" --no-bin", ""),
+            "system Python allowed": WINDOWS_UV_FIND.replace(" --managed-python", ""),
+        }
+        for name, replacement in provisioning_mutations.items():
+            with self.subTest(provisioning_mutation=name):
+                mutated = workflow.replace(
+                    WINDOWS_UV_INSTALL
+                    if replacement.startswith("uv python install")
+                    else WINDOWS_UV_FIND,
+                    replacement,
+                    1,
+                )
+                self.assertTrue(real_weight_windows_interpreter_errors(mutated))
+        cache_enabled = workflow.replace(WINDOWS_UV_CACHE, "enable-cache: true", 1)
+        self.assertTrue(real_weight_windows_interpreter_errors(cache_enabled))
         wrong_setup_comment_decoy = workflow.replace(
             f"uses: {WINDOWS_SETUP_ACTION}",
-            f"uses: actions/setup-python@{'0' * 40} # uses: {WINDOWS_SETUP_ACTION}",
+            f"uses: astral-sh/setup-uv@{'0' * 40} # uses: {WINDOWS_SETUP_ACTION}",
             1,
         )
         self.assertTrue(real_weight_windows_interpreter_errors(wrong_setup_comment_decoy))
         wrong_version_comment_decoy = workflow.replace(
-            WINDOWS_PYTHON_VERSION,
-            f'python-version: "3.14.0" # {WINDOWS_PYTHON_VERSION}',
+            WINDOWS_UV_VERSION,
+            f'version: "0.99.0" # {WINDOWS_UV_VERSION}',
             1,
         )
         self.assertTrue(real_weight_windows_interpreter_errors(wrong_version_comment_decoy))
