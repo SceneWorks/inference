@@ -145,8 +145,8 @@ fn main() {
     }
     eprintln!(
         "configuration geometry={size}x{size} tiled={tiled} tile_edge={} overlap={}",
-        tiled.then_some(TILE_EDGE).unwrap_or(0),
-        tiled.then_some(TILE_OVERLAP).unwrap_or(0)
+        if tiled { TILE_EDGE } else { 0 },
+        if tiled { TILE_OVERLAP } else { 0 }
     );
     let native_spec = LoadSpec::new(WeightsSource::Dir(base)).with_quant(Quant::Q4);
 
