@@ -962,6 +962,9 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn('"$RUNNER_TEMP/mage-reference/bin/python"', migration)
         self.assertNotIn("python3.12 scripts/release/provision_mage_edit_variants.py", migration)
         self.assertIn("--migrate-reference-environment-manifest-only", migration)
+        self.assertIn("--migrate-edit-variant-manifest-hash-only", migration)
+        self.assertIn('transfer_links="$(stat -f \'%l\' "$transfer_manifest")"', migration)
+        self.assertIn('"$transfer_links" != "1"', migration)
         self.assertNotIn("dump_mage_flow_golden.py", migration)
         self.assertIn("refusing to run the multi-hour CPU producer", workflow)
         self.assertNotIn("Regenerate and verify shared CPU Mage oracles", workflow)
@@ -1004,7 +1007,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertNotIn("--write-manifest", workflow)
         self.assertIn("mage_candle_oracles_manifest.json", workflow)
         self.assertGreaterEqual(workflow.count("--edit-snapshot \"$MAGE_EDIT_SNAPSHOT\""), 3)
-        self.assertEqual(workflow.count("--gen \"$MAGE_SNAPSHOT\""), 3)
+        self.assertEqual(workflow.count("--gen \"$MAGE_SNAPSHOT\""), 4)
         self.assertLess(
             workflow.index("Verify restored or operator-provisioned Mage oracle cache"),
             workflow.index("Save verified Mage oracle cache"),

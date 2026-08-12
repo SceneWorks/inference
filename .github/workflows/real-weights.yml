@@ -113,7 +113,7 @@ on:
         required: false
         default: ""
       migrate_mage_edit_variant_manifest:
-        description: Migrate only the copied Mage edit-variant manifest after strict legacy verification (media only)
+        description: Migrate the copied Mage edit-variant manifest and dependent transfer hash after strict legacy verification (media only)
         type: boolean
         required: false
         default: false
@@ -1556,6 +1556,28 @@ jobs:
             --edit-turbo "$MAGE_EDIT_TURBO_SNAPSHOT" \
             --output "$MAGE_GOLDEN_DIR" \
             --migrate-reference-environment-manifest-only
+          transfer_manifest="$MAGE_GOLDEN_DIR/mage_candle_transfer_manifest.json"
+          seed_transfer_manifest="$MAGE_ORACLE_SEED_DIR/mage_candle_transfer_manifest.json"
+          if [[ ! -f "$transfer_manifest" || -L "$transfer_manifest" ]]; then
+            echo "Mage transfer manifest migration requires an exclusive temporary copy" >&2
+            exit 1
+          fi
+          if [[ "$transfer_manifest" -ef "$seed_transfer_manifest" ]]; then
+            echo "Mage transfer manifest migration must never mutate the persistent operator seed" >&2
+            exit 1
+          fi
+          transfer_links="$(stat -f '%l' "$transfer_manifest")"
+          if [[ "$transfer_links" != "1" ]]; then
+            echo "Mage transfer manifest migration requires exactly one hard link" >&2
+            exit 1
+          fi
+          "$RUNNER_TEMP/mage-reference/bin/python" scripts/release/verify_mage_candle_transfer.py \
+            --gen "$MAGE_SNAPSHOT" \
+            --edit "$MAGE_EDIT_SNAPSHOT" \
+            --edit-base "$MAGE_EDIT_BASE_SNAPSHOT" \
+            --edit-turbo "$MAGE_EDIT_TURBO_SNAPSHOT" \
+            --output "$MAGE_GOLDEN_DIR" \
+            --migrate-edit-variant-manifest-hash-only
       # sc-14051 Candle acceptance oracle: one frozen-Torch 1024²/20-step reference run emits
       # both the step-zero full-DiT boundary and the final e2e image. It is generated on a
       # different backend/process from the Candle implementation and transferred as an immutable
