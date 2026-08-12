@@ -17,6 +17,18 @@ from pathlib import Path
 
 WORKFLOW = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml"
 REAL_WEIGHTS_WORKFLOW = WORKFLOW.with_name("real-weights.yml")
+KREA_ALTERNATE_DECODER_SMOKE = (
+    WORKFLOW.parents[2] / "scripts" / "ci" / "run_krea_alternate_decoder_smoke.sh"
+)
+KREA_ALTERNATE_DECODER_EXAMPLE = (
+    WORKFLOW.parents[2]
+    / "crates"
+    / "media"
+    / "mlx-gen"
+    / "mlx-gen-krea"
+    / "examples"
+    / "alternate_decoder_characterization.rs"
+)
 MODEL_MANIFEST = WORKFLOW.parents[2] / "release" / "real-weight-models.toml"
 # An `unwired_reason` has to carry an actual explanation. "n/a" or "todo" would silence the gate
 # while recording nothing, which is precisely the failure this exists to prevent -- a deliberate
@@ -1024,8 +1036,10 @@ class CiWorkflowPolicyTests(unittest.TestCase):
     def test_sa3_snapshot_paths_are_manifest_derived(self) -> None:
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
         self.assertNotRegex(workflow, r"SA3_[A-Z0-9_]+[^\n]*[0-9a-f]{40}")
-        # Thirteen SA3/SAME exporters plus SC-18309's one exact SDXL-VAE projection.
-        self.assertEqual(workflow.count("export_model_snapshot_paths.py"), 14)
+        # Thirteen SA3/SAME exporters, SC-18309's exact SDXL-VAE projection, and SC-18315's
+        # q4 Krea correctness projection.
+        self.assertEqual(workflow.count("export_model_snapshot_paths.py"), 15)
+        self.assertEqual(workflow.count("--model krea-2-turbo-mlx-q4"), 1)
         self.assertEqual(workflow.count("--model sdxl-base-mlx-vae-bf16"), 2)
         expected_models = {
             "same-l-metal": ("same-l",),
@@ -1974,6 +1988,61 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         # No SANA verifier exists; the day one appears this pin should flip to a positive
         # requirement rather than being deleted.
         self.assertNotIn("verify_residency_ab.py", job)
+
+    def test_krea_alternate_decoder_smoke_is_explicit_and_correctness_only(self) -> None:
+        """SC-18315 keeps its model smoke distinct from memory/calibration capture."""
+        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        jobs = workflow_job_bodies(workflow)
+        job = "\n".join(jobs["mlx-krea-alternate-decoder"])
+        job_header = job.split("steps:", 1)[0]
+        inputs = yaml.safe_load(workflow)[True]["workflow_dispatch"]["inputs"]
+        choices = inputs["profile"]["options"]
+
+        self.assertEqual(choices.count("krea-alternate-decoder"), 1)
+        self.assertIn(
+            "if: github.event_name == 'workflow_dispatch' && "
+            "inputs.profile == 'krea-alternate-decoder'",
+            job,
+        )
+        self.assertNotIn("github.event_name == 'schedule'", job_header)
+        self.assertNotIn("inputs.profile == 'all'", job_header)
+        self.assertIn(
+            "runs-on: [self-hosted, macOS, ARM64, nax, real-weights]", job
+        )
+        self.assertIn("scripts/ci/run_krea_alternate_decoder_smoke.sh", job)
+        self.assertLess(
+            job.index("--model krea-2-turbo-mlx-q4"),
+            job.index("scripts/ci/run_krea_alternate_decoder_smoke.sh"),
+        )
+        self.assertIn("actions/upload-artifact@", job)
+        self.assertIn("if-no-files-found: error", job)
+        self.assertNotIn("gpu_fault_evidence.sh", job)
+        self.assertNotIn("memory.csv", job)
+        self.assertNotIn("--inventory-output", job)
+
+        script = KREA_ALTERNATE_DECODER_SMOKE.read_text(encoding="utf-8")
+        self.assertTrue(os.access(KREA_ALTERNATE_DECODER_SMOKE, os.X_OK))
+        self.assertIn("d009674080cc1bccf2b629d834c34bf5eccdb723", script)
+        self.assertIn("e68e9a3d98187fdf6936838ffcf6df5aa48d6626", script)
+        self.assertIn(
+            "42159a8b571dbeb3ea40327b88a6161a5342c0511202af7c031360629757163d",
+            script,
+        )
+        self.assertIn("run_characterization 512 0", script)
+        self.assertIn("run_characterization 768 1", script)
+        self.assertEqual(script.count(".png\n"), 4)
+        self.assertIn("sha256.txt", script)
+        self.assertIn("provenance.txt", script)
+        self.assertNotIn("get_peak_memory", script)
+        self.assertNotIn("reset_peak_memory", script)
+        self.assertNotIn("gpu_fault_evidence", script)
+        self.assertIn('!= "$RUNNER_TEMP"/*', script)
+
+        example = KREA_ALTERNATE_DECODER_EXAMPLE.read_text(encoding="utf-8")
+        self.assertIn("KREA_AB_OUTPUT_DIR", example)
+        self.assertNotIn("get_peak_memory", example)
+        self.assertNotIn("reset_peak_memory", example)
+        self.assertNotIn("std::time::Instant", example)
 
     def test_krea_s18_sweep_is_operator_dispatched_and_keeps_its_evidence(self) -> None:
         """sc-17276: the S18 coherence sweep is a measurement lane, not a regression gate.

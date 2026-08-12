@@ -14,6 +14,9 @@
 //! cargo run -p mlx-gen-krea --release --example alternate_decoder_characterization
 //! ```
 //!
+//! Set `KREA_AB_OUTPUT_DIR` to keep the correctness artifacts in a caller-owned directory.
+//! It defaults to `/tmp/krea_alternate_decoder_ab` for local use.
+//!
 //! # Force the production bounded-decode seam
 //!
 //! ```sh
@@ -91,7 +94,10 @@ fn stats(pixels: &[u8], width: u32) -> (f64, usize, f64) {
 }
 
 fn save(image: &mlx_gen::media::Image, name: &str) {
-    let path = Path::new("/tmp/krea_alternate_decoder_ab").join(name);
+    let output_dir = std::env::var_os("KREA_AB_OUTPUT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new("/tmp/krea_alternate_decoder_ab").to_path_buf());
+    let path = output_dir.join(name);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     image::save_buffer(
         &path,

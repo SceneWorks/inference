@@ -1717,9 +1717,10 @@ expected_files = [
 # sc-18213 (epic 18093) — `SceneWorks/krea-2-turbo-mlx`, the Krea 2 Turbo IMAGE re-host
 # `mlx-gen-krea` actually loads (`KREA_TURBO_DIR` points one level in, at a tier dir). NOT related
 # to `krea-realtime-14b-mlx` above beyond the vendor name: that is a Wan-2.1 video model. The repo
-# ships three self-contained diffusers-layout tiers; the epic-18093 right-size calibration measures
-# per artifact x tier and each tier is provisioned independently (bf16 alone is ~33 GiB), so the
-# binding is keyed per tier — the flux2-klein-9b-mlx-q4 shape. All three keys share one
+# ships three self-contained diffusers-layout tiers. The explicit SC-18315 correctness lane uses
+# q4 only; the epic-18093 right-size calibration keeps bf16/q8 operator-only. Each tier is
+# provisioned independently (bf16 alone is ~33 GiB), so the binding is keyed per tier — the
+# flux2-klein-9b-mlx-q4 shape. All three keys share one
 # repository + revision; sibling tiers present on disk are still inventoried by
 # `verify_model_snapshot.py --inventory-output`, so a multi-tier snapshot changes the inventory
 # sha rather than silently reusing a single-tier one.
@@ -1781,7 +1782,6 @@ license = "Krea 2 Community License"
 size_class = "very-large"
 profiles = ["media-macos"]
 environment = ["KREA_TURBO_DIR"]
-unwired_reason = "operator-run epic-18093 right-size calibration on authoritative Apple hardware; pinned to bind capture evidence to exact weights (sc-18213), no CI lane dispatches the krea-2-turbo harnesses"
 download_files = ["q4/*", "LICENSE.pdf"]
 expected_files = [
     "LICENSE.pdf",

@@ -111,7 +111,7 @@ on:
         default: all
         # `audio` still runs every audio family. The `audio-*` entries are the per-family split
         # (sc-16981) — dispatch one provider family without taking the Metal runner for the rest.
-        options: [all, llm, llm-joycaption, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-s18-sweep, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base]
+        options: [all, llm, llm-joycaption, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base]
       sceneworks_revision:
         description: Exact lowercase SceneWorks commit paired with memory-evidence-v1
         type: string
@@ -2709,6 +2709,42 @@ jobs:
           path: |
             ${{ runner.temp }}/gpu-fault-evidence/memory.csv
             ${{ runner.temp }}/gpu-fault-evidence/gpu-events.txt
+
+  # SC-18315 — correctness-only characterization of the experimental Wan z16 terminal decoder for
+  # Krea 2. This is operator-dispatch only: it runs no weekly cadence, does not join `all`, and does
+  # not collect memory, latency, GPU-counter, or calibration evidence. The exact pinned artifacts
+  # are already resident on `nax-macos`; its `real-weights` label excludes the second NAX box, whose
+  # `rw-krea` set is the unrelated Krea Realtime video model and does not include the Krea 2 image
+  # snapshot. The executable itself asserts output coherence and native/Wan distinctness. A 512 px
+  # run covers the normal native-default seam and a 768 px run forces multiple 512/64 decode tiles;
+  # the uploaded images remain available for the acceptance criterion's artifact inspection.
+  mlx-krea-alternate-decoder:
+    name: MLX Krea alternate decoder correctness (operator dispatch)
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'krea-alternate-decoder'
+    runs-on: [self-hosted, macOS, ARM64, nax, real-weights]
+    timeout-minutes: 120
+    env:
+      MLX_GEN_MODELS_ROOT: ${{ vars.MLX_GEN_MODELS_ROOT }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Resolve runner-local model cache
+        run: python3.12 scripts/release/resolve_snapshot_paths.py MLX_GEN_MODELS_ROOT
+      - name: Toolchain versions
+        run: rustc --version && cargo --version && sw_vers && xcrun metal --version
+      - name: Bind the manifest-pinned q4 Krea tier
+        run: |
+          python3.12 scripts/release/export_model_snapshot_paths.py \
+          --model krea-2-turbo-mlx-q4
+      - name: Run fixed-seed native and Wan decoder correctness smoke
+        env:
+          KREA_ALTERNATE_DECODER_OUTPUT_DIR: ${{ runner.temp }}/krea-alternate-decoder
+        run: scripts/ci/run_krea_alternate_decoder_smoke.sh
+      - name: Upload fixed-seed correctness artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: krea-alternate-decoder-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          path: ${{ runner.temp }}/krea-alternate-decoder
 
   # sc-17276 — the sc-15127/sc-15571 S18 coherence sweep, split out of the regression lane above.
   #
