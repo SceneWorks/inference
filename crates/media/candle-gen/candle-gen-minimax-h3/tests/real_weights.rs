@@ -62,6 +62,33 @@ fn shard_keys(dir: &std::path::Path, label: &str) -> BTreeSet<String> {
     keys
 }
 
+/// `name -> dtype` over a component's shard headers, read without any weight I/O.
+///
+/// Used by the DiT checks to turn `crate::dit::heads`' **mixed-precision** claim — twelve of the 17
+/// top-level tensors ship float32 while everything else ships bfloat16 — into a property asserted
+/// against the real checkpoint. That claim is why `LinearBias` loads at the *stored* dtype rather
+/// than taking one as a parameter, and nothing in the all-f32 fixture can check it.
+fn shard_dtypes(dir: &std::path::Path, label: &str) -> std::collections::BTreeMap<String, String> {
+    let files = sorted_safetensors(dir, label).expect("safetensors shards");
+    let mut out = std::collections::BTreeMap::new();
+    for file in &files {
+        let mut f = std::fs::File::open(file).expect("open shard");
+        let mut len = [0u8; 8];
+        std::io::Read::read_exact(&mut f, &mut len).expect("header length");
+        let hlen = u64::from_le_bytes(len) as usize;
+        let mut header = vec![0u8; hlen];
+        std::io::Read::read_exact(&mut f, &mut header).expect("header");
+        let json: serde_json::Value = serde_json::from_slice(&header).expect("header json");
+        for (k, v) in json.as_object().expect("header object") {
+            if k == "__metadata__" {
+                continue;
+            }
+            out.insert(k.clone(), v["dtype"].as_str().expect("dtype").to_string());
+        }
+    }
+    out
+}
+
 // =============================================================================================
 // Video VAE
 // =============================================================================================
@@ -475,4 +502,184 @@ fn stored_kaiser_filters_match_the_derivation_on_real_weights() {
         checked += 1;
     }
     assert_eq!(checked, 4, "every filter must have been read");
+}
+
+// =============================================================================================
+// DiT (sc-17155)
+// =============================================================================================
+
+/// Tensors the published `transformer/` partition carries: `50 · 12 + 21 + 17`.
+const DIT_TENSOR_COUNT: usize = 638;
+
+/// **The DiT's exhaustive-mapping proof against the real checkpoint.** Reads only the safetensors
+/// headers, so it costs no weight I/O and no GPU — the same class as
+/// `declared_tensor_names_match_the_published_checkpoint` above.
+///
+/// This is the one check the committed fixture structurally cannot give. `dit_block.safetensors` is
+/// dumped at **2** layers and 2 refiner layers; the shipped model has **50** and 2. So the fixture
+/// can prove the per-block name pattern and the top-level set, but it cannot prove the stack is
+/// enumerated to the right depth, nor that the published partition holds nothing outside the three
+/// declared groups. A tensor the loader never reads still produces plausible output.
+///
+/// It also re-verifies against real bytes the finding `crate::dit::qkv` documents as a *contract*:
+/// the published checkpoint ships **no** fused QKV, because the conversion already split it. That
+/// claim is what justifies `DitAttention` applying no transform at all, and it is invisible in the
+/// port.
+#[test]
+#[ignore = "needs a real MiniMax-H3 snapshot (MINIMAX_H3_SNAPSHOT); headers only, no weight I/O"]
+fn declared_dit_tensor_names_match_the_published_checkpoint() {
+    use candle_gen_minimax_h3::{MiniMaxH3Dit, MiniMaxH3DitConfig};
+
+    let root = snapshot();
+    let dir = root.join("transformer");
+    let published = shard_keys(&dir, "minimax-h3 transformer");
+    assert_eq!(
+        published.len(),
+        DIT_TENSOR_COUNT,
+        "the published transformer/ partition should carry {DIT_TENSOR_COUNT} tensors"
+    );
+
+    let cfg =
+        MiniMaxH3DitConfig::from_diffusers_json(&read_snapshot_file(&dir.join("config.json")))
+            .expect("parse transformer/config.json");
+    assert_eq!(
+        cfg,
+        MiniMaxH3DitConfig::default(),
+        "the shipped geometry — 50 layers, hidden 5376, 56 heads x 128"
+    );
+
+    let declared: BTreeSet<String> = MiniMaxH3Dit::names(&cfg).into_iter().collect();
+    assert_eq!(
+        declared, published,
+        "the declared DiT key set must be exactly the published one — nothing unread, nothing \
+         invented"
+    );
+
+    // The three groups partition it at the real depth, not the fixture's.
+    let blocks = published
+        .iter()
+        .filter(|k| k.starts_with("transformer_blocks."))
+        .count();
+    let refiner = published
+        .iter()
+        .filter(|k| k.starts_with("token_refiner."))
+        .count();
+    assert_eq!(
+        (blocks, refiner, published.len() - blocks - refiner),
+        (600, 21, 17)
+    );
+
+    // `crate::dit::qkv`'s contract, against the real index: the conversion already split the fused
+    // projection, so nothing named `qkv_proj` / `to_qkv` survives and the port applies no transform.
+    let fused: Vec<&String> = published
+        .iter()
+        .filter(|k| k.contains("qkv_proj") || k.contains("to_qkv"))
+        .collect();
+    assert!(
+        fused.is_empty(),
+        "the published DiT must ship no fused QKV; found {fused:?}"
+    );
+    for i in 0..cfg.num_layers {
+        for part in ["to_q", "to_k", "to_v"] {
+            assert!(published.contains(&format!("transformer_blocks.{i}.attn.{part}.weight")));
+        }
+    }
+
+    // **The mixed-precision claim, against the real bytes.** `crate::dit::heads` says twelve of the
+    // 17 top-level tensors ship float32 and everything else bfloat16, and that is why `LinearBias`
+    // loads at the STORED dtype instead of taking one as a parameter. The all-f32 fixture cannot
+    // check it; a port that cast the timestep MLP to bf16 would round the one tensor every AdaLN
+    // projection in the model reads, biasing all 50 blocks identically at every step.
+    let dtypes = shard_dtypes(&dir, "minimax-h3 transformer");
+    let f32_names: BTreeSet<&String> = dtypes
+        .iter()
+        .filter(|(_, d)| d.as_str() == "F32")
+        .map(|(k, _)| k)
+        .collect();
+    assert_eq!(f32_names.len(), 12, "twelve float32 tensors: {f32_names:?}");
+    for prefix in [
+        "proj_in.",
+        "audio_proj_in.",
+        "time_embedder.",
+        "proj_out.",
+        "audio_proj_out.",
+    ] {
+        assert!(
+            f32_names.iter().any(|k| k.starts_with(prefix)),
+            "{prefix} should be among the float32-kept modules"
+        );
+    }
+    assert!(
+        f32_names
+            .iter()
+            .all(|k| !k.starts_with("transformer_blocks.") && !k.starts_with("token_refiner.")),
+        "the float32 set is entirely top-level; the block stack is bfloat16"
+    );
+    assert_eq!(
+        dtypes.values().filter(|d| d.as_str() == "BF16").count(),
+        DIT_TENSOR_COUNT - 12
+    );
+
+    println!(
+        "dit: {} published tensors = {blocks} block + {refiner} refiner + {} top-level; 0 fused \
+         QKV; all {} declared names consumed; dtypes 12 F32 (top-level only) + {} BF16",
+        published.len(),
+        published.len() - blocks - refiner,
+        declared.len(),
+        DIT_TENSOR_COUNT - 12
+    );
+}
+
+/// The AdaLN eviction's headline number, computed from the **real** shard headers rather than from
+/// the config arithmetic: `50 × (96768·2688 + 96768)` at the published dtype.
+///
+/// Header-only, so it costs no weight I/O. It is what turns 26_020_915_200 B from a number in a doc
+/// comment into a property of the checkpoint on disk — `dit::adaln`'s unit test asserts the
+/// arithmetic, and this asserts the arithmetic describes the real tensors.
+#[test]
+#[ignore = "needs a real MiniMax-H3 snapshot (MINIMAX_H3_SNAPSHOT); headers only, no weight I/O"]
+fn the_adaln_projections_are_the_documented_twenty_six_gigabytes() {
+    use candle_gen_minimax_h3::MiniMaxH3DitConfig;
+
+    let root = snapshot();
+    let dir = root.join("transformer");
+    let cfg =
+        MiniMaxH3DitConfig::from_diffusers_json(&read_snapshot_file(&dir.join("config.json")))
+            .expect("parse transformer/config.json");
+
+    let published = shard_keys(&dir, "minimax-h3 transformer");
+    let adaln: Vec<&String> = published
+        .iter()
+        .filter(|k| k.contains(".adaln_proj.linear."))
+        .collect();
+    assert_eq!(
+        adaln.len(),
+        cfg.num_layers * 2,
+        "one weight + one bias per block"
+    );
+
+    // Parameters, from the published geometry the config above was just asserted to carry.
+    let per_block = cfg.adaln_out_features() * cfg.time_embed_dim + cfg.adaln_out_features();
+    let params = per_block * cfg.num_layers;
+    assert_eq!(per_block, 260_209_152, "per-block AdaLN parameters");
+    assert_eq!(params, 13_010_457_600, "13.01 B over the 50-block stack");
+    // At bf16 — and that dtype is READ from the shard headers rather than assumed, because the
+    // whole 26.02 GB figure is `params × bytes-per-element` and a wrong dtype halves or doubles it.
+    let dtypes = shard_dtypes(&dir, "minimax-h3 transformer");
+    for key in &adaln {
+        assert_eq!(
+            dtypes.get(*key).map(String::as_str),
+            Some("BF16"),
+            "{key} must ship bfloat16 for the 26.02 GB arithmetic to hold"
+        );
+    }
+    assert_eq!(params * 2, 26_020_915_200, "26.02 GB at bf16");
+
+    println!(
+        "adaln: {} tensors over {} blocks, {per_block} params/block, {params} total = {} GB at \
+         bf16 — the eviction's headline number",
+        adaln.len(),
+        cfg.num_layers,
+        (params * 2) as f64 / 1e9
+    );
 }
