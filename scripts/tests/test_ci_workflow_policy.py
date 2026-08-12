@@ -36,6 +36,7 @@ MACOS_MAGE_LOCK = (
     "crates/media/mlx-gen/_vendor/mage_flow/requirements-oracles.txt"
 )
 MACOS_INTERPRETER = "python3.12"
+WINDOWS_INTERPRETER = "py -3.12"
 APPROVED_REAL_WEIGHT_LOCKS = {
     MACOS_HUB_LOCK,
     WINDOWS_HUB_LOCK,
@@ -306,6 +307,44 @@ def real_weight_macos_interpreter_errors(workflow: str) -> list[str]:
     return errors
 
 
+def real_weight_windows_interpreter_errors(workflow: str) -> list[str]:
+    """Pin every Windows real-weight Python command to the reviewed CPython 3.12.
+
+    The Windows wheel locks are platform- and interpreter-specific. A runner restart changed bare
+    ``python`` from 3.12 to 3.14, so pip selected cp314 wheels whose hashes correctly differed from
+    the reviewed cp312 lock. Guard every producer and consumer, not only pip: mixing interpreters
+    around a shared ``PYTHONPATH`` is equally unsafe. ``cmd`` also continues after a failed command,
+    so every hash-locked install must explicitly terminate the step.
+    """
+    errors: list[str] = []
+    interpreter = re.compile(
+        r"(?<![\w./$\"'-])"
+        r"(py(?:\s+-\d+(?:\.\d+)?)?|python[0-9.]*)"
+        r"(?![\w-])",
+        re.IGNORECASE,
+    )
+    for job, lines in workflow_job_bodies(workflow).items():
+        runs_on = next((line for line in lines if line.startswith("    runs-on:")), "")
+        if "windows" not in runs_on.lower():
+            continue
+        for line in lines:
+            command = line.split("#", 1)[0]
+            for found in interpreter.finditer(command):
+                name = found.group(1)
+                if name != WINDOWS_INTERPRETER:
+                    errors.append(
+                        f"{job}: Windows steps must name {WINDOWS_INTERPRETER}, found "
+                        f"{name!r} in {command.strip()!r}"
+                    )
+            if re.search(r"\s-m\s+pip\s+install\b", command, re.IGNORECASE) and not re.search(
+                r"\|\|\s+exit /b 1\s*$", command
+            ):
+                errors.append(
+                    f"{job}: Windows pip install must fail the cmd step: {command.strip()!r}"
+                )
+    return errors
+
+
 def real_weight_pip_policy_errors(workflow: str) -> list[str]:
     """Reject pip installs that can escape the reviewed wheel/hash inputs."""
     errors: list[str] = []
@@ -362,7 +401,7 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
             expected_lock = WINDOWS_MAGE_LOCK
         elif f"{MACOS_INTERPRETER} -m pip" in command:
             expected_lock = MACOS_HUB_LOCK
-        elif "python -m pip" in command:
+        elif f"{WINDOWS_INTERPRETER} -m pip" in command:
             expected_lock = WINDOWS_HUB_LOCK
         if expected_lock != lock:
             errors.append(
@@ -583,6 +622,49 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             line for line in workflow.splitlines() if not line.lstrip().startswith("#")
         )
         self.assertNotRegex(code, r"(?<![\w.])python3(?!\.12)(?![\w-])")
+
+    def test_real_weight_windows_steps_name_reviewed_cpython_and_fail_fast(self) -> None:
+        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        self.assertEqual(real_weight_windows_interpreter_errors(workflow), [])
+        windows_python_lines = [
+            line
+            for lines in workflow_job_bodies(workflow).values()
+            if any(
+                candidate.startswith("    runs-on:")
+                and "windows" in candidate.lower()
+                for candidate in lines
+            )
+            for line in lines
+            if WINDOWS_INTERPRETER in line and not line.lstrip().startswith("#")
+        ]
+        self.assertTrue(windows_python_lines, "Windows policy inspected no Python commands")
+        self.assertIn(
+            f'{WINDOWS_INTERPRETER} -c "import sys; assert sys.version_info[:2] == (3, 12), sys.version"',
+            workflow,
+        )
+        pip_installs = [
+            line.strip()
+            for line in windows_python_lines
+            if f"{WINDOWS_INTERPRETER} -m pip install" in line
+        ]
+        self.assertEqual(len(pip_installs), 11)
+        for install in pip_installs:
+            self.assertRegex(install, r"\|\|\s+exit /b 1$")
+        for replacement in ("python", "py", "py -3.14"):
+            with self.subTest(replacement=replacement):
+                mutated = workflow.replace(WINDOWS_INTERPRETER, replacement, 1)
+                self.assertTrue(real_weight_windows_interpreter_errors(mutated))
+        no_fail_fast = workflow.replace(" || exit /b 1", "", 1)
+        self.assertTrue(real_weight_windows_interpreter_errors(no_fail_fast))
+        first_windows_install = pip_installs[0]
+        whitespace_install_without_fail_fast = first_windows_install.replace(
+            "pip install", "pip  install", 1
+        ).removesuffix(" || exit /b 1")
+        whitespace_bypass = workflow.replace(
+            first_windows_install, whitespace_install_without_fail_fast, 1
+        )
+        self.assertNotEqual(whitespace_bypass, workflow)
+        self.assertTrue(real_weight_windows_interpreter_errors(whitespace_bypass))
 
     def test_real_weight_macos_interpreter_policy_discriminates_mutations(self) -> None:
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
