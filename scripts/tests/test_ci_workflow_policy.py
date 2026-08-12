@@ -935,24 +935,68 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             "default: false",
             workflow[workflow.index("migrate_mage_edit_variant_manifest:") :],
         )
+        self.assertIn(
+            "Converge and durably certify the exact Mage manifest pair on both rw-mage seeds",
+            workflow,
+        )
+        self.assertIn(
+            "mage_seed_slot: ${{ fromJSON(github.event_name == 'workflow_dispatch' "
+            "&& inputs.profile == 'media' && inputs.migrate_mage_edit_variant_manifest "
+            "&& '[\"primary\",\"secondary\"]' || '[\"single\"]') }}",
+            workflow,
+        )
+        recovery_index = workflow.index(
+            "\n      - name: Recover any interrupted persistent Mage seed promotion"
+        )
+        restore_index = workflow.index("\n      - name: Restore verified Mage oracle cache")
+        seed_index = workflow.index(
+            "\n      - name: Require operator-provisioned Mage oracle seed"
+        )
+        self.assertLess(recovery_index, restore_index)
+        self.assertLess(restore_index, seed_index)
+        restore = workflow[restore_index:seed_index]
+        self.assertIn("id: mage-oracle-cache", restore)
+        self.assertIn("github.event_name != 'workflow_dispatch'", restore)
+        self.assertIn("inputs.profile != 'media'", restore)
+        self.assertIn("inputs.migrate_mage_edit_variant_manifest != true", restore)
+        recovery = workflow[recovery_index:restore_index]
+        self.assertIn("scripts/release/promote_mage_oracle_seed.py", recovery)
+        self.assertIn("--recover-only", recovery)
+        self.assertIn("id: mage-seed-recovery", recovery)
+        self.assertIn('--runner-name "$RUNNER_NAME"', recovery)
+        self.assertIn('--slot "${{ matrix.mage_seed_slot }}"', recovery)
+        self.assertIn('--revision "$GITHUB_SHA"', recovery)
+        self.assertIn('echo "completed=true" >> "$GITHUB_OUTPUT"', recovery)
         prepare_index = workflow.index("\n      - name: Prepare pinned Mage reference environment")
+        classify_index = workflow.index("\n      - name: Classify the copied Mage manifest pair")
         migration_index = workflow.index(
             "\n      - name: Migrate only the copied Mage edit-variant manifest"
         )
         verify_index = workflow.index(
             "\n      - name: Verify restored or operator-provisioned Mage oracle cache"
         )
-        self.assertLess(prepare_index, migration_index)
+        self.assertLess(prepare_index, classify_index)
+        self.assertLess(classify_index, migration_index)
         self.assertLess(migration_index, verify_index)
-        preparation = workflow[prepare_index:migration_index]
+        preparation = workflow[prepare_index:classify_index]
         self.assertIn('python -m venv "$RUNNER_TEMP/mage-reference"', preparation)
         self.assertIn(
             '"$RUNNER_TEMP/mage-reference/bin/python" -m pip install', preparation
         )
         self.assertIn("requirements-oracles.txt", preparation)
+        classification = workflow[classify_index:migration_index]
+        self.assertIn("id: mage-seed-state", classification)
+        self.assertIn("provision_mage_edit_variants.py", classification)
+        self.assertIn("verify_mage_candle_transfer.py", classification)
+        self.assertIn('echo "current=true" >> "$GITHUB_OUTPUT"', classification)
+        self.assertIn('echo "current=false" >> "$GITHUB_OUTPUT"', classification)
         migration = workflow[migration_index:verify_index]
         self.assertIn("inputs.profile == 'media'", migration)
         self.assertIn("inputs.migrate_mage_edit_variant_manifest", migration)
+        self.assertIn(
+            "steps.mage-seed-recovery.outputs.completed != 'true'", migration
+        )
+        self.assertIn("steps.mage-seed-state.outputs.current != 'true'", migration)
         self.assertIn('golden_root="$(cd "$MAGE_GOLDEN_DIR" && pwd -P)"', migration)
         self.assertIn('runner_root="$(cd "$RUNNER_TEMP" && pwd -P)"', migration)
         self.assertIn('seed_root="$(cd "$MAGE_ORACLE_SEED_DIR" && pwd -P)"', migration)
@@ -966,6 +1010,20 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn('transfer_links="$(stat -f \'%l\' "$transfer_manifest")"', migration)
         self.assertIn('"$transfer_links" != "1"', migration)
         self.assertNotIn("dump_mage_flow_golden.py", migration)
+        precondition_index = workflow.index(
+            "\n      - name: Require an uncached operator seed for durable Mage certification"
+        )
+        self.assertLess(seed_index, precondition_index)
+        self.assertLess(precondition_index, migration_index)
+        precondition = workflow[precondition_index:migration_index]
+        self.assertIn("steps.mage-oracle-cache.outputs.cache-hit", precondition)
+        self.assertIn("steps.mage-oracle-seed.outputs.imported", precondition)
+        seed_import = workflow[seed_index:precondition_index]
+        self.assertIn('echo "edit-sha=$edit_sha"', seed_import)
+        self.assertIn(
+            'echo "transfer-sha=$transfer_sha"', seed_import
+        )
+        self.assertIn('} >> "$GITHUB_OUTPUT"', seed_import)
         self.assertIn("refusing to run the multi-hour CPU producer", workflow)
         self.assertNotIn("Regenerate and verify shared CPU Mage oracles", workflow)
         self.assertIn(
@@ -983,6 +1041,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             "scripts/release/mage_reference_environment.py",
             "scripts/release/provision_mage_oracles.py",
             "scripts/release/provision_mage_edit_variants.py",
+            "scripts/release/promote_mage_oracle_seed.py",
             "scripts/release/verify_mage_candle_oracles.py",
             "scripts/release/verify_mage_candle_transfer.py",
         ):
@@ -1006,11 +1065,72 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("--verify-edit-artifact", workflow)
         self.assertNotIn("--write-manifest", workflow)
         self.assertIn("mage_candle_oracles_manifest.json", workflow)
-        self.assertGreaterEqual(workflow.count("--edit-snapshot \"$MAGE_EDIT_SNAPSHOT\""), 3)
-        self.assertEqual(workflow.count("--gen \"$MAGE_SNAPSHOT\""), 4)
+        self.assertGreaterEqual(workflow.count("--edit-snapshot \"$MAGE_EDIT_SNAPSHOT\""), 6)
+        self.assertEqual(workflow.count("--gen \"$MAGE_SNAPSHOT\""), 8)
+        provider_index = workflow.index("\n      - name: Run provider conformance")
+        edit_parity_index = workflow.index(
+            "\n      - name: Run Mage-Flow instruction-edit parity"
+        )
+        promote_index = workflow.index(
+            "\n      - name: Atomically promote the verified Mage manifests"
+        )
+        persistent_verify_index = workflow.index(
+            "\n      - name: Verify the promoted persistent Mage oracle seed"
+        )
+        receipt_index = workflow.index(
+            "\n      - name: Upload persistent Mage seed promotion receipt"
+        )
+        cache_save_index = workflow.index("\n      - name: Save verified Mage oracle cache")
+        edit_upload_index = workflow.index("\n      - name: Upload verified Mage edit oracle")
+        self.assertLess(provider_index, edit_parity_index)
+        self.assertLess(edit_parity_index, promote_index)
+        self.assertLess(promote_index, persistent_verify_index)
+        self.assertLess(persistent_verify_index, receipt_index)
+        self.assertLess(receipt_index, cache_save_index)
+        self.assertLess(cache_save_index, edit_upload_index)
+        promotion = workflow[promote_index:persistent_verify_index]
+        self.assertIn(
+            "steps.mage-seed-recovery.outputs.completed != 'true'", promotion
+        )
+        for argument in (
+            "--source \"$MAGE_GOLDEN_DIR\"",
+            "--seed \"$MAGE_ORACLE_SEED_DIR\"",
+            "steps.mage-oracle-seed.outputs.edit-sha",
+            "steps.mage-oracle-seed.outputs.transfer-sha",
+            "--runner-name \"$RUNNER_NAME\"",
+            "--slot \"${{ matrix.mage_seed_slot }}\"",
+            "--revision \"$GITHUB_SHA\"",
+            "--allow-already-current",
+        ):
+            self.assertIn(argument, promotion)
+        persistent_verify = workflow[persistent_verify_index:receipt_index]
+        self.assertEqual(persistent_verify.count('--output "$MAGE_ORACLE_SEED_DIR"'), 5)
+        self.assertIn(
+            "mage-seed-promotion-${{ matrix.mage_seed_slot }}-${{ github.sha }}",
+            workflow[receipt_index:cache_save_index],
+        )
+        cache_save = workflow[cache_save_index:edit_upload_index]
+        self.assertIn("inputs.migrate_mage_edit_variant_manifest != true", cache_save)
+        self.assertGreaterEqual(
+            workflow.count("if: matrix.mage_seed_slot != 'secondary'"), 2
+        )
+        promotion_gate_index = workflow.index("\n  mage-seed-promotion-gate:")
+        qwen_index = workflow.index("\n  # sc-17284", promotion_gate_index)
+        promotion_gate = workflow[promotion_gate_index:qwen_index]
+        self.assertIn("needs: mlx-media", promotion_gate)
+        self.assertIn("if: always()", promotion_gate)
+        self.assertIn("needs.mlx-media.result", promotion_gate)
+        self.assertIn("merge-multiple: true", promotion_gate)
+        self.assertIn("--verify-receipts", promotion_gate)
+        self.assertIn("--revision \"$GITHUB_SHA\"", promotion_gate)
+        candle_media_index = workflow.index("\n  candle-media:")
+        self.assertIn(
+            "needs: [mlx-media, mage-seed-promotion-gate]",
+            workflow[candle_media_index:],
+        )
         self.assertLess(
             workflow.index("Verify restored or operator-provisioned Mage oracle cache"),
-            workflow.index("Save verified Mage oracle cache"),
+            cache_save_index,
         )
         self.assertIn("mage-flow-candle-oracles-${{ github.sha }}", workflow)
         self.assertIn("mage_edit_oracle_manifest.json", workflow)

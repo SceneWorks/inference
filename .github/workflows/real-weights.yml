@@ -113,7 +113,7 @@ on:
         required: false
         default: ""
       migrate_mage_edit_variant_manifest:
-        description: Migrate the copied Mage edit-variant manifest and dependent transfer hash after strict legacy verification (media only)
+        description: Converge and durably certify the exact Mage manifest pair on both rw-mage seeds after full validation (media only)
         type: boolean
         required: false
         default: false
@@ -1384,10 +1384,18 @@ jobs:
           run_one joycaption_provider_streams_caption_through_contract
 
   mlx-media:
-    name: MLX media real weights
+    name: MLX media real weights (${{ matrix.mage_seed_slot }})
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'media'
     runs-on: [self-hosted, macOS, ARM64, rw-mage]
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      # The one-shot durable migration must touch the runner-local seed on BOTH boxes carrying
+      # rw-mage. Two simultaneous jobs occupy both single-job runners. If one box is unavailable
+      # and both legs run serially on the same seed, the second leg rejects the now-zero-diff
+      # migration, so a green matrix cannot silently certify only one persistent seed.
+      matrix:
+        mage_seed_slot: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.profile == 'media' && inputs.migrate_mage_edit_variant_manifest && '["primary","secondary"]' || '["single"]') }}
     env:
       ZIMAGE_SNAPSHOT: ${{ vars.ZIMAGE_SNAPSHOT }}
       MAGE_SNAPSHOT: ${{ vars.MAGE_SNAPSHOT }}
@@ -1433,6 +1441,23 @@ jobs:
         run: echo "MAGE_GOLDEN_DIR=$RUNNER_TEMP/mage-flow-oracles" >> "$GITHUB_ENV"
       - name: Toolchain versions
         run: rustc --version && cargo --version
+      - name: Recover any interrupted persistent Mage seed promotion
+        id: mage-seed-recovery
+        run: |
+          if [[ -z "$MAGE_ORACLE_SEED_DIR" || "$MAGE_ORACLE_SEED_DIR" != /* ]]; then
+            echo "MAGE_ORACLE_SEED_DIR must resolve to an absolute path before recovery" >&2
+            exit 1
+          fi
+          python3.12 scripts/release/promote_mage_oracle_seed.py \
+            --seed "$MAGE_ORACLE_SEED_DIR" \
+            --recover-only \
+            --runner-name "$RUNNER_NAME" \
+            --slot "${{ matrix.mage_seed_slot }}" \
+            --revision "$GITHUB_SHA" \
+            --receipt "$RUNNER_TEMP/mage-seed-promotion-${{ matrix.mage_seed_slot }}.json"
+          if [[ -f "$RUNNER_TEMP/mage-seed-promotion-${{ matrix.mage_seed_slot }}.json" ]]; then
+            echo "completed=true" >> "$GITHUB_OUTPUT"
+          fi
       # Report-only: what this box had free, and which of these snapshots it already holds,
       # BEFORE anything transfers. Also names the runner -- `rw-*` labels live in org settings
       # and are invisible from the runners themselves, so a run log is the only record of
@@ -1473,7 +1498,7 @@ jobs:
             fi
             printf '%s' "$revision"
           }
-          producer="${{ hashFiles('.github/workflows/real-weights.yml', 'crates/media/mlx-gen/_vendor/mage_flow/**', 'crates/media/mlx-gen/_vendor/mage_flow/assets/dog.jpg', 'crates/media/mlx-gen/_vendor/mage_flow/requirements-oracles.txt', 'crates/media/mlx-gen/tools/_paths.py', 'crates/media/mlx-gen/tools/dump_mage_flow_golden.py', 'crates/media/mlx-gen/tools/dump_mage_vae_sizes.py', 'scripts/release/mage_reference_environment.py', 'scripts/release/provision_mage_oracles.py', 'scripts/release/provision_mage_edit_variants.py', 'scripts/release/verify_mage_candle_oracles.py', 'scripts/release/verify_mage_candle_transfer.py') }}"
+          producer="${{ hashFiles('.github/workflows/real-weights.yml', 'crates/media/mlx-gen/_vendor/mage_flow/**', 'crates/media/mlx-gen/_vendor/mage_flow/assets/dog.jpg', 'crates/media/mlx-gen/_vendor/mage_flow/requirements-oracles.txt', 'crates/media/mlx-gen/tools/_paths.py', 'crates/media/mlx-gen/tools/dump_mage_flow_golden.py', 'crates/media/mlx-gen/tools/dump_mage_vae_sizes.py', 'scripts/release/mage_reference_environment.py', 'scripts/release/provision_mage_oracles.py', 'scripts/release/provision_mage_edit_variants.py', 'scripts/release/promote_mage_oracle_seed.py', 'scripts/release/verify_mage_candle_oracles.py', 'scripts/release/verify_mage_candle_transfer.py') }}"
           if [[ ! "$producer" =~ ^[0-9a-f]{64}$ ]]; then
             echo "Oracle producer fingerprint is missing or malformed: $producer" >&2
             exit 1
@@ -1482,6 +1507,9 @@ jobs:
           echo "key=$key" >> "$GITHUB_OUTPUT"
       - name: Restore verified Mage oracle cache
         id: mage-oracle-cache
+        # Certification must inspect the persistent seed on the runner that actually claimed each
+        # matrix leg. A normal exact-head cache would bypass that seed and make retries impossible.
+        if: github.event_name != 'workflow_dispatch' || inputs.profile != 'media' || inputs.migrate_mage_edit_variant_manifest != true
         uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ runner.temp }}/mage-flow-oracles
@@ -1527,15 +1555,58 @@ jobs:
             fi
             install -m 0644 "$source" "$MAGE_GOLDEN_DIR/$file"
           done
-          echo "imported=true" >> "$GITHUB_OUTPUT"
+          edit_sha="$(shasum -a 256 "$MAGE_ORACLE_SEED_DIR/mage_edit_variants_manifest.json" | awk '{print $1}')"
+          transfer_sha="$(shasum -a 256 "$MAGE_ORACLE_SEED_DIR/mage_candle_transfer_manifest.json" | awk '{print $1}')"
+          if [[ ! "$edit_sha" =~ ^[0-9a-f]{64}$ || ! "$transfer_sha" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "Could not bind the imported Mage seed manifest hashes" >&2
+            exit 1
+          fi
+          {
+            echo "edit-sha=$edit_sha"
+            echo "transfer-sha=$transfer_sha"
+            echo "imported=true"
+          } >> "$GITHUB_OUTPUT"
+      - name: Require an uncached operator seed for durable Mage certification
+        if: github.event_name == 'workflow_dispatch' && inputs.profile == 'media' && inputs.migrate_mage_edit_variant_manifest
+        run: |
+          if [[ "${{ steps.mage-oracle-cache.outputs.cache-hit }}" == "true" || \
+                "${{ steps.mage-oracle-seed.outputs.imported }}" != "true" ]]; then
+            echo "Durable Mage certification requires a cache miss copied from this runner's persistent operator seed" >&2
+            exit 1
+          fi
       - name: Prepare pinned Mage reference environment
         run: |
           if [[ ! -x "$RUNNER_TEMP/mage-reference/bin/python" ]]; then
             python -m venv "$RUNNER_TEMP/mage-reference"
             "$RUNNER_TEMP/mage-reference/bin/python" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes -r crates/media/mlx-gen/_vendor/mage_flow/requirements-oracles.txt
           fi
+      - name: Classify the copied Mage manifest pair
+        id: mage-seed-state
+        if: github.event_name == 'workflow_dispatch' && inputs.profile == 'media' && inputs.migrate_mage_edit_variant_manifest && steps.mage-seed-recovery.outputs.completed != 'true'
+        run: |
+          if "$RUNNER_TEMP/mage-reference/bin/python" \
+              scripts/release/provision_mage_edit_variants.py \
+              --gen "$MAGE_SNAPSHOT" \
+              --edit "$MAGE_EDIT_SNAPSHOT" \
+              --edit-base "$MAGE_EDIT_BASE_SNAPSHOT" \
+              --edit-turbo "$MAGE_EDIT_TURBO_SNAPSHOT" \
+              --output "$MAGE_GOLDEN_DIR" \
+              --verify-only && \
+            "$RUNNER_TEMP/mage-reference/bin/python" \
+              scripts/release/verify_mage_candle_transfer.py \
+              --gen "$MAGE_SNAPSHOT" \
+              --edit "$MAGE_EDIT_SNAPSHOT" \
+              --edit-base "$MAGE_EDIT_BASE_SNAPSHOT" \
+              --edit-turbo "$MAGE_EDIT_TURBO_SNAPSHOT" \
+              --output "$MAGE_GOLDEN_DIR"; then
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          else
+            # The migration command below accepts only the one exact legacy population. Any
+            # unrelated validation failure therefore remains fail-closed rather than being blessed.
+            echo "current=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Migrate only the copied Mage edit-variant manifest
-        if: github.event_name == 'workflow_dispatch' && inputs.profile == 'media' && inputs.migrate_mage_edit_variant_manifest
+        if: github.event_name == 'workflow_dispatch' && inputs.profile == 'media' && inputs.migrate_mage_edit_variant_manifest && steps.mage-seed-recovery.outputs.completed != 'true' && steps.mage-seed-state.outputs.current != 'true'
         run: |
           golden_root="$(cd "$MAGE_GOLDEN_DIR" && pwd -P)"
           runner_root="$(cd "$RUNNER_TEMP" && pwd -P)"
@@ -1618,12 +1689,6 @@ jobs:
             --edit-turbo "$MAGE_EDIT_TURBO_SNAPSHOT" \
             --output "$MAGE_GOLDEN_DIR"
           echo "MAGE_FLOW_TE_GOLDEN=$MAGE_GOLDEN_DIR/mage_flow_te_golden.safetensors" >> "$GITHUB_ENV"
-      - name: Save verified Mage oracle cache
-        if: steps.mage-oracle-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
-        with:
-          path: ${{ runner.temp }}/mage-flow-oracles
-          key: ${{ steps.mage-oracle-key.outputs.key }}
       - name: Run provider conformance
         run: >-
           cargo test --locked -p mlx-gen-z-image --test conformance
@@ -1681,7 +1746,69 @@ jobs:
             cargo test --locked --release -p mlx-gen-mage --test edit_real_weights \
             fixed_instruction_edit_matches_the_torch_reference -- --ignored --nocapture || status=$?
           exit "$status"
+      - name: Atomically promote the verified Mage manifests into this runner's operator seed
+        if: github.event_name == 'workflow_dispatch' && inputs.profile == 'media' && inputs.migrate_mage_edit_variant_manifest && steps.mage-seed-recovery.outputs.completed != 'true'
+        run: |
+          python3.12 scripts/release/promote_mage_oracle_seed.py \
+            --source "$MAGE_GOLDEN_DIR" \
+            --seed "$MAGE_ORACLE_SEED_DIR" \
+            --expected-old-edit-sha "${{ steps.mage-oracle-seed.outputs.edit-sha }}" \
+            --expected-old-transfer-sha "${{ steps.mage-oracle-seed.outputs.transfer-sha }}" \
+            --runner-name "$RUNNER_NAME" \
+            --slot "${{ matrix.mage_seed_slot }}" \
+            --revision "$GITHUB_SHA" \
+            --receipt "$RUNNER_TEMP/mage-seed-promotion-${{ matrix.mage_seed_slot }}.json" \
+            --allow-already-current
+      - name: Verify the promoted persistent Mage oracle seed
+        if: github.event_name == 'workflow_dispatch' && inputs.profile == 'media' && inputs.migrate_mage_edit_variant_manifest
+        run: |
+          "$RUNNER_TEMP/mage-reference/bin/python" \
+            scripts/release/provision_mage_oracles.py \
+            --snapshot "$MAGE_SNAPSHOT" \
+            --edit-snapshot "$MAGE_EDIT_SNAPSHOT" \
+            --output "$MAGE_ORACLE_SEED_DIR" \
+            --verify-only
+          "$RUNNER_TEMP/mage-reference/bin/python" \
+            scripts/release/provision_mage_oracles.py \
+            --snapshot "$MAGE_SNAPSHOT" \
+            --edit-snapshot "$MAGE_EDIT_SNAPSHOT" \
+            --output "$MAGE_ORACLE_SEED_DIR" \
+            --verify-edit-artifact
+          "$RUNNER_TEMP/mage-reference/bin/python" \
+            scripts/release/provision_mage_edit_variants.py \
+            --gen "$MAGE_SNAPSHOT" \
+            --edit "$MAGE_EDIT_SNAPSHOT" \
+            --edit-base "$MAGE_EDIT_BASE_SNAPSHOT" \
+            --edit-turbo "$MAGE_EDIT_TURBO_SNAPSHOT" \
+            --output "$MAGE_ORACLE_SEED_DIR" \
+            --verify-only
+          "$RUNNER_TEMP/mage-reference/bin/python" \
+            scripts/release/verify_mage_candle_oracles.py \
+            --snapshot "$MAGE_SNAPSHOT" \
+            --edit-snapshot "$MAGE_EDIT_SNAPSHOT" \
+            --output "$MAGE_ORACLE_SEED_DIR"
+          "$RUNNER_TEMP/mage-reference/bin/python" \
+            scripts/release/verify_mage_candle_transfer.py \
+            --gen "$MAGE_SNAPSHOT" \
+            --edit "$MAGE_EDIT_SNAPSHOT" \
+            --edit-base "$MAGE_EDIT_BASE_SNAPSHOT" \
+            --edit-turbo "$MAGE_EDIT_TURBO_SNAPSHOT" \
+            --output "$MAGE_ORACLE_SEED_DIR"
+      - name: Upload persistent Mage seed promotion receipt
+        if: github.event_name == 'workflow_dispatch' && inputs.profile == 'media' && inputs.migrate_mage_edit_variant_manifest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: mage-seed-promotion-${{ matrix.mage_seed_slot }}-${{ github.sha }}
+          path: ${{ runner.temp }}/mage-seed-promotion-${{ matrix.mage_seed_slot }}.json
+          if-no-files-found: error
+      - name: Save verified Mage oracle cache
+        if: steps.mage-oracle-cache.outputs.cache-hit != 'true' && inputs.migrate_mage_edit_variant_manifest != true
+        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ runner.temp }}/mage-flow-oracles
+          key: ${{ steps.mage-oracle-key.outputs.key }}
       - name: Upload verified Mage edit oracle
+        if: matrix.mage_seed_slot != 'secondary'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: mage-flow-edit-oracle-${{ github.sha }}
@@ -1693,6 +1820,7 @@ jobs:
             ${{ runner.temp }}/mage-flow-oracles/mage_edit_variants_manifest.json
           if-no-files-found: error
       - name: Upload Candle Mage acceptance oracles
+        if: matrix.mage_seed_slot != 'secondary'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: mage-flow-candle-oracles-${{ github.sha }}
@@ -1709,6 +1837,34 @@ jobs:
             ${{ runner.temp }}/mage-flow-oracles/mage_candle_oracles_manifest.json
             ${{ runner.temp }}/mage-flow-oracles/mage_candle_transfer_manifest.json
           if-no-files-found: error
+
+  mage-seed-promotion-gate:
+    name: Mage seed promotion receipts
+    if: always() && (github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'media')
+    needs: mlx-media
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require MLX media success
+        run: |
+          if [[ "${{ needs.mlx-media.result }}" != "success" ]]; then
+            echo "MLX media did not complete successfully: ${{ needs.mlx-media.result }}" >&2
+            exit 1
+          fi
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        if: github.event_name == 'workflow_dispatch' && inputs.profile == 'media' && inputs.migrate_mage_edit_variant_manifest
+      - name: Download both persistent Mage seed receipts
+        if: github.event_name == 'workflow_dispatch' && inputs.profile == 'media' && inputs.migrate_mage_edit_variant_manifest
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: mage-seed-promotion-*-${{ github.sha }}
+          path: ${{ runner.temp }}/mage-seed-promotion-receipts
+          merge-multiple: true
+      - name: Require two distinct exact-run Mage seed certifications
+        if: github.event_name == 'workflow_dispatch' && inputs.profile == 'media' && inputs.migrate_mage_edit_variant_manifest
+        run: >-
+          python3.12 scripts/release/promote_mage_oracle_seed.py
+          --verify-receipts "$RUNNER_TEMP/mage-seed-promotion-receipts"
+          --revision "$GITHUB_SHA"
 
   # sc-17284 — the FIRST CI lane for the mlx-gen-qwen-image real-weight surface.
   #
@@ -4791,7 +4947,7 @@ jobs:
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'media'
     runs-on: [self-hosted, windows, cuda, real-weights]
     timeout-minutes: 120
-    needs: mlx-media
+    needs: [mlx-media, mage-seed-promotion-gate]
     env:
       Z_IMAGE_SNAPSHOT: ${{ vars.Z_IMAGE_SNAPSHOT }}
       # This is intentionally distinct from the macOS MAGE_SNAPSHOT path: repository variables
