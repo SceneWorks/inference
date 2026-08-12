@@ -1907,6 +1907,47 @@ fn registered_lens_base_memory_strategy_contract(
     Ok(build_lens_memory_strategy_contract(MODEL_ID_BASE, spec))
 }
 
+/// Weights-free catalog surface for Lens' declared packed block-streaming shape.
+///
+/// The production callbacks above intentionally inspect the selected snapshot's config and tensor
+/// inventory before advertising rung 4. A catalog fixture has no snapshot, so invoking those
+/// callbacks on its synthetic path makes every Q4/Q8 surface look unsupported. This factory states
+/// only the load contract: packed Q4/Q8 + Sequential + Deferred is the shape that *may* stream once
+/// production has proved the corresponding real tensor inventory. Asset facts remain zero and the
+/// production callback remains the authority for an actual load.
+fn weights_free_lens_memory_strategy_contract(
+    provider_id: &'static str,
+    spec: &LoadSpec,
+) -> gen_core::MemoryProviderContract {
+    let streamable = matches!(spec.quantize, Some(Quant::Q4 | Quant::Q8))
+        && spec.precision == Precision::Bf16
+        && matches!(spec.offload_policy, OffloadPolicy::Sequential)
+        && matches!(
+            spec.load_shape,
+            gen_core::LoadShape::DeferredMaterialization
+        )
+        && is_plain_measured_load(spec);
+    build_lens_memory_strategy_contract_with_eligibility(provider_id, spec, streamable)
+}
+
+fn weights_free_lens_turbo_memory_strategy_contract(
+    spec: &LoadSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    Ok(weights_free_lens_memory_strategy_contract(
+        MODEL_ID_TURBO,
+        spec,
+    ))
+}
+
+fn weights_free_lens_base_memory_strategy_contract(
+    spec: &LoadSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    Ok(weights_free_lens_memory_strategy_contract(
+        MODEL_ID_BASE,
+        spec,
+    ))
+}
+
 fn registered_lens_turbo_memory_strategy_safety_check(
     spec: &LoadSpec,
     contract: &gen_core::MemoryProviderContract,
@@ -1977,6 +2018,14 @@ fn registered_lens_begin_request(
 mod weights_free_behavior_tests {
     use super::*;
 
+    fn rung_four(
+        contract: &gen_core::MemoryProviderContract,
+    ) -> &gen_core::MemoryStrategyCapability {
+        contract
+            .capability(gen_core::MemoryStrategy::BoundedTransformerResidency)
+            .expect("Lens contracts carry the complete ladder")
+    }
+
     #[test]
     fn cpu_scope_executes_the_registered_lens_behavior() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/lens".into()))
@@ -2001,6 +2050,94 @@ mod weights_free_behavior_tests {
             contract.generation_memory(&fixture.context.selection)
         );
         scope.finish(gen_core::MemoryRunOutcome::Complete).unwrap();
+    }
+
+    #[test]
+    fn catalog_surfaces_publish_only_the_contract_eligible_packed_lens_shapes() {
+        let registry = register_memory_contract_surfaces(
+            candle_gen::gen_core::ProviderRegistryBuilder::new()
+                .register_generator(TURBO_REGISTRATION)
+                .register_generator(BASE_REGISTRATION),
+        )
+        .build()
+        .expect("Lens surface registry");
+        let surfaces = registry
+            .memory_contract_surfaces()
+            .expect("weights-free Lens surfaces");
+
+        for provider_id in [MODEL_ID_BASE, MODEL_ID_TURBO] {
+            let provider_surfaces: Vec<_> = surfaces
+                .iter()
+                .filter(|surface| surface.contract.provider_id == provider_id)
+                .collect();
+            assert_eq!(provider_surfaces.len(), 12);
+            for surface in provider_surfaces {
+                let eligible = matches!(
+                    surface.selector.tier,
+                    gen_core::MemoryContractSurfaceTier::Q4
+                        | gen_core::MemoryContractSurfaceTier::Q8
+                ) && surface.selector.offload_policy == OffloadPolicy::Sequential
+                    && surface.selector.load_shape == gen_core::LoadShape::DeferredMaterialization;
+                let rung = rung_four(&surface.contract);
+                assert_eq!(
+                    rung.support,
+                    if eligible {
+                        gen_core::MemoryStrategySupport::Implemented
+                    } else {
+                        gen_core::MemoryStrategySupport::Missing
+                    },
+                    "{}:{} has the wrong weights-free rung-4 declaration",
+                    provider_id,
+                    surface.selector.id()
+                );
+                assert_eq!(
+                    surface
+                        .contract
+                        .lifecycle
+                        .transformer_window_materialization,
+                    eligible,
+                    "{}:{} lifecycle disagrees with rung-4 support",
+                    provider_id,
+                    surface.selector.id()
+                );
+                assert_eq!(
+                    rung.parameters.transformer_window_sizes,
+                    if eligible {
+                        TRANSFORMER_WINDOW_SIZES.to_vec()
+                    } else {
+                        Vec::new()
+                    },
+                    "{}:{} publishes unsupported window content",
+                    provider_id,
+                    surface.selector.id()
+                );
+                assert_eq!(
+                    surface.contract.asset_facts,
+                    gen_core::MemoryAssetFacts::default(),
+                    "weights-free surfaces must not claim real Lens asset bytes"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn production_contract_still_requires_real_packed_lens_content() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/lens".into()))
+            .with_quant(Quant::Q4)
+            .with_offload_policy(OffloadPolicy::Sequential)
+            .with_load_shape(gen_core::LoadShape::DeferredMaterialization);
+        let production = registered_lens_base_memory_strategy_contract(&spec).unwrap();
+        let fixture = weights_free_lens_base_memory_strategy_contract(&spec).unwrap();
+        assert_eq!(
+            rung_four(&production).support,
+            gen_core::MemoryStrategySupport::Missing,
+            "a synthetic path is not evidence of real packed Lens tensors"
+        );
+        assert_eq!(
+            rung_four(&fixture).support,
+            gen_core::MemoryStrategySupport::Implemented,
+            "the fixture records the contract-eligible load shape"
+        );
     }
 }
 
@@ -2052,13 +2189,13 @@ pub fn register_memory_contract_surfaces(
         .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
             surface_specs: gen_core::candle_memory_contract_surface_specs,
             provider_id: MODEL_ID_TURBO,
-            contract: registered_lens_turbo_memory_strategy_contract,
+            contract: weights_free_lens_turbo_memory_strategy_contract,
         })
         .register_memory_strategy(BASE_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
             surface_specs: gen_core::candle_memory_contract_surface_specs,
             provider_id: MODEL_ID_BASE,
-            contract: registered_lens_base_memory_strategy_contract,
+            contract: weights_free_lens_base_memory_strategy_contract,
         })
 }
 
