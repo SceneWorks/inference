@@ -14,9 +14,11 @@
 use mlx_gen::gen_core;
 use mlx_gen::{
     require_base_snapshot, require_control, AcceptedControlKinds, ConditioningKind, ControlBranch,
-    Error, GenerationOutput, GenerationRequest, Generator, LoadSpec, ModelDescriptor, Precision,
-    Progress, Quant, Residency, Result, WeightsSource, BASE_SNAPSHOT_COMPONENT,
+    Error, GenerationOutput, GenerationRequest, Generator, LatentDecoder, LoadSpec,
+    ModelDescriptor, Precision, Progress, Quant, Residency, Result, WeightsSource,
+    BASE_SNAPSHOT_COMPONENT, VAE_COMPONENT,
 };
+use mlx_gen_wan::OwnedWanSingleFrameDecoder;
 
 use mlx_gen::default_seed;
 
@@ -88,6 +90,7 @@ pub struct KreaTurboControl {
 struct ControlHeavyOwned {
     heavy: KreaHeavy,
     branch: Krea2ControlBranch,
+    alternate_decoder: Option<OwnedWanSingleFrameDecoder>,
     /// The effective base-DiT quant tier (`None` = dense bf16). Captured at load so the render-time
     /// geometry safety check can weigh the resident-weight footprint without re-deriving it from the
     /// (post-quant) modules.
@@ -105,6 +108,7 @@ struct ControlHeavyOwned {
 struct ControlHeavyRef<'a> {
     heavy: &'a KreaHeavy,
     branch: &'a Krea2ControlBranch,
+    alternate_decoder: Option<&'a OwnedWanSingleFrameDecoder>,
 }
 
 impl ControlHeavyOwned {
@@ -112,6 +116,7 @@ impl ControlHeavyOwned {
         ControlHeavyRef {
             heavy: &self.heavy,
             branch: &self.branch,
+            alternate_decoder: self.alternate_decoder.as_ref(),
         }
     }
 }
@@ -405,9 +410,11 @@ fn load_native_control_heavy(
         Some(pinned) => Krea2ControlBranch::from_pinned_file(pinned, &cfg)?,
         None => Krea2ControlBranch::from_source(control, &cfg)?,
     };
+    let alternate_decoder = mlx_gen_wan::load_selected_single_frame_decoder(spec, &descriptor())?;
     Ok(ControlHeavyOwned {
         heavy,
         branch,
+        alternate_decoder,
         base_tier: None,
         branch_tier: None,
         cfg,
@@ -428,9 +435,10 @@ pub(crate) fn validate_control_spec(spec: &LoadSpec) -> Result<()> {
     }
     mlx_gen::gen_core::reject_unknown_components(
         spec,
-        &[BASE_SNAPSHOT_COMPONENT],
+        &[BASE_SNAPSHOT_COMPONENT, VAE_COMPONENT],
         KREA_2_TURBO_CONTROL_ID,
     )?;
+    mlx_gen_wan::validate_selected_single_frame_decoder(spec, &descriptor())?;
     let _ = require_base_snapshot(spec, KREA_2_TURBO_CONTROL_ID)?;
     let _ = require_control(spec, KREA_2_TURBO_CONTROL_ID, "Krea 2 pose control overlay")?;
     if matches!(spec.weights, WeightsSource::File(_)) {
@@ -566,9 +574,11 @@ fn load_control_heavy(
         branch.quantize(bits)?;
     }
     let branch_tier = tier_from_bits(branch_bits);
+    let alternate_decoder = mlx_gen_wan::load_selected_single_frame_decoder(spec, &descriptor())?;
     Ok(ControlHeavyOwned {
         heavy,
         branch,
+        alternate_decoder,
         base_tier,
         branch_tier,
         cfg,
@@ -721,6 +731,9 @@ impl KreaTurboControl {
                         &plan,
                         heavy.branch,
                         control_scale,
+                        heavy
+                            .alternate_decoder
+                            .map(|decoder| decoder as &dyn LatentDecoder),
                         decode_tiling.as_ref(),
                         req.memory.and_then(|memory| memory.calibration_error_phase),
                         &opts,

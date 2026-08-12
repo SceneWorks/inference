@@ -23,6 +23,19 @@ use mlx_gen::gen_core::{
 
 pub const MEMORY_CALIBRATION_FINGERPRINT: &str =
     "krea-control-mlx-full-ladder-512-64-attn64m-window1-2026-08-03-v2";
+/// The Wan terminal decoder is an unmeasured composite with the base and control branch. Keep it off
+/// the native calibration identity so admission uses composite asset facts plus conservative
+/// headroom and the estimate margin.
+pub const WAN_DECODER_CALIBRATION_FINGERPRINT: &str =
+    "krea-control-mlx-wan21-decoder-unmeasured-composite-2026-08-10-v1";
+
+fn calibration_fingerprint(spec: &LoadSpec) -> &'static str {
+    if spec.components.contains_key(mlx_gen::VAE_COMPONENT) {
+        WAN_DECODER_CALIBRATION_FINGERPRINT
+    } else {
+        MEMORY_CALIBRATION_FINGERPRINT
+    }
+}
 pub const DECODE_TILE_EDGE: u32 = 512;
 pub const DECODE_OVERLAP: u32 = 64;
 pub const ATTENTION_CHUNK_SIZE: u32 = mlx_gen::attention::CONSTRAINED_ATTN_SCORES_BUDGET as u32;
@@ -179,7 +192,7 @@ fn memory_strategy_contract_with_asset_facts(
             }
         },
         calibration: Some(MemoryCalibrationIdentity::new(
-            MEMORY_CALIBRATION_FINGERPRINT,
+            calibration_fingerprint(spec),
             spec.load_shape,
         )),
         asset_facts,
@@ -223,7 +236,14 @@ pub(crate) fn native_memory_strategy_contract_from_spec(
         })
     };
     let conditioning_bytes = stored(&base_snapshot_dir.join("text_encoder"), "base text encoder")?;
-    let decoder_bytes = stored(&base_snapshot_dir.join("vae"), "base VAE")?;
+    let alternate_decoder_bytes = match spec.components.get(mlx_gen::VAE_COMPONENT) {
+        Some(mlx_gen::WeightsSource::Dir(path)) | Some(mlx_gen::WeightsSource::File(path)) => {
+            stored(path, "alternate Wan decoder")?
+        }
+        None => 0,
+    };
+    let decoder_bytes =
+        stored(&base_snapshot_dir.join("vae"), "base VAE")?.saturating_add(alternate_decoder_bytes);
     let transformer_bytes = spec.read_file_unchanged_if_prepared(dit_file, |p| {
         crate::block_memory_strategy::native_dit_transformer_bytes(provider_id, p)
     })?;
@@ -325,7 +345,14 @@ fn asset_facts(
     let transformer_bytes = project(&root.join("transformer"), &|name| {
         crate::convert::is_transformer_quant_target(name)
     })?;
-    let decoder_bytes = project(&root.join("vae"), &|_| false)?;
+    let alternate_decoder_bytes = match spec.components.get(mlx_gen::VAE_COMPONENT) {
+        Some(mlx_gen::WeightsSource::Dir(path)) | Some(mlx_gen::WeightsSource::File(path)) => {
+            projected_safetensors_bytes(path, |_| ResidentProjection::Stored)?
+        }
+        None => 0,
+    };
+    let decoder_bytes =
+        project(&root.join("vae"), &|_| false)?.saturating_add(alternate_decoder_bytes);
     let overlay_bytes = match &spec.control {
         Some(mlx_gen::WeightsSource::Dir(path)) => {
             let base_bits = crate::model::effective_base_quant_bits(spec, root, provider_id)?;
@@ -617,6 +644,42 @@ mod tests {
         .expect_err("missing overlay must fail")
         .to_string();
         assert!(missing.contains("pose control overlay"), "got: {missing}");
+    }
+
+    #[test]
+    fn alternate_decoder_is_additive_to_pose_control_decoder_facts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("base");
+        write_snapshot(&root);
+        let overlay = tmp.path().join("control.safetensors");
+        write_control(&overlay);
+        let donor = tmp.path().join("wan-vae.safetensors");
+        write_control(&donor);
+        let spec =
+            LoadSpec::new(WeightsSource::Dir(root)).with_control(WeightsSource::File(overlay));
+        let native = memory_strategy_contract("krea_2_turbo_control", &spec).unwrap();
+        let composite = memory_strategy_contract(
+            "krea_2_turbo_control",
+            &spec.with_component(mlx_gen::VAE_COMPONENT, WeightsSource::File(donor)),
+        )
+        .unwrap();
+        assert_eq!(
+            composite.asset_facts.decoder_bytes,
+            native.asset_facts.decoder_bytes + 256
+        );
+        assert_eq!(
+            composite.asset_facts.base_bytes,
+            native.asset_facts.base_bytes + 256
+        );
+        assert_eq!(
+            composite.calibration.as_ref().unwrap().fingerprint,
+            WAN_DECODER_CALIBRATION_FINGERPRINT,
+            "native control measurements must not authorize the composite decoder path"
+        );
+        assert_eq!(
+            native.calibration.as_ref().unwrap().fingerprint,
+            MEMORY_CALIBRATION_FINGERPRINT
+        );
     }
 
     #[test]
