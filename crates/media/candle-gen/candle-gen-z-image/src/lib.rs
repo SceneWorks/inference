@@ -315,7 +315,9 @@ impl Generator for ZImageGenerator {
         // heavy components come from the cache.
         let pipe = match &self.comfyui {
             // In-place ComfyUI load (sc-10668): the DiT/VAE remap + verbatim Qwen3 TE.
-            Some(sources) => Pipeline::load_comfyui(sources.clone(), &self.device, self.dtype),
+            Some(sources) => {
+                Pipeline::load_comfyui(sources.clone(), &self.device, self.dtype, &self.adapters)
+            }
             None => Pipeline::load(
                 &self.root,
                 &self.device,
@@ -531,9 +533,9 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 /// separate ComfyUI component files + the directory holding our shipped `tokenizer/tokenizer.json` (the
 /// one tiny file a ComfyUI tree does not ship). The DiT and VAE are key-remapped in memory at first
 /// `generate` (`comfyui`) and the Qwen3 encoder loads verbatim — read in place, no copy, no
-/// re-download. Dense bf16, plain fp8, and scalar-companion scaled-fp8 files all
-/// normalize to bf16 before assembly; unsupported packed integer formats remain
-/// typed load errors.
+/// re-download. Dense bf16, plain fp8, and scalar-companion scaled-fp8 files all normalize to bf16
+/// before assembly; unsupported packed integer formats remain typed load errors. `adapters` is the
+/// ordered LoRA/LoKr stack applied to the remapped base DiT before generation.
 ///
 /// Invoked **directly by the SceneWorks worker** (like [`edit`] / [`control`]), not through the
 /// gen-core registry — the registered `z_image_turbo` descriptor still expects a diffusers snapshot
@@ -543,6 +545,7 @@ pub fn load_from_comfyui_components(
     text_encoder_file: impl Into<PathBuf>,
     vae_file: impl Into<PathBuf>,
     tokenizer_dir: impl Into<PathBuf>,
+    adapters: Vec<AdapterSpec>,
 ) -> gen_core::Result<Box<dyn Generator>> {
     let device = candle_gen::default_device()?;
     let sources = std::sync::Arc::new(comfyui::ComfyuiSources {
@@ -560,7 +563,7 @@ pub fn load_from_comfyui_components(
         dtype: DType::BF16,
         loaded_quant: None,
         lifecycle: Mutex::new(()),
-        adapters: Vec::new(),
+        adapters,
         pid_spec: None,
         comfyui: Some(sources),
         memory_strategy: None,
@@ -569,12 +572,13 @@ pub fn load_from_comfyui_components(
     }))
 }
 
-/// Construct a Z-Image generator from one fused community checkpoint containing
-/// transformer, Qwen3 text-encoder, and VAE tensors. The tokenizer remains a
-/// model-agnostic JSON asset supplied by `tokenizer_dir`.
+/// Construct a Z-Image generator from one fused community checkpoint containing transformer, Qwen3
+/// text-encoder, and VAE tensors. The tokenizer remains a model-agnostic JSON asset supplied by
+/// `tokenizer_dir`; `adapters` is applied to the remapped base DiT in order.
 pub fn load_from_comfyui_checkpoint(
     checkpoint_file: impl Into<PathBuf>,
     tokenizer_dir: impl Into<PathBuf>,
+    adapters: Vec<AdapterSpec>,
 ) -> gen_core::Result<Box<dyn Generator>> {
     let device = candle_gen::default_device()?;
     let sources = std::sync::Arc::new(comfyui::ComfyuiSources {
@@ -588,7 +592,7 @@ pub fn load_from_comfyui_checkpoint(
         dtype: DType::BF16,
         loaded_quant: None,
         lifecycle: Mutex::new(()),
-        adapters: Vec::new(),
+        adapters,
         pid_spec: None,
         comfyui: Some(sources),
         memory_strategy: None,

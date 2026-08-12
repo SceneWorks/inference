@@ -50,6 +50,7 @@ use crate::{pipeline, to_image, Pipeline, PID_BACKBONE};
 pub struct Flux2EditPaths {
     /// FLUX.2 diffusers snapshot dir (klein or dev).
     pub root: PathBuf,
+    pub adapters: Vec<candle_gen::gen_core::AdapterSpec>,
 }
 
 /// One FLUX.2-klein edit request.
@@ -261,7 +262,14 @@ impl Flux2Edit {
         let device = candle_gen::default_device()?;
         // PiD (super-resolving decode) is wired only through the txt2img render path (epic 7840 /
         // sc-7853); the edit provider passes `None`.
-        let pipe = Pipeline::load(variant, loaded_quant, &paths.root, &device, None);
+        let pipe = Pipeline::load(
+            variant,
+            loaded_quant,
+            &paths.root,
+            &device,
+            None,
+            paths.adapters.clone(),
+        );
         // Packed MLX tier → build directly on the GPU from the packed parts (sc-9087, no ~105 GB dense
         // CPU staging); dense tier → the legacy CPU-stage → quantize-onto-GPU path. Shared TE+DiT loader
         // with txt2img / control (F-024, sc-9004). The VAE *with encoder* (the reference encode) is the
@@ -723,9 +731,6 @@ fn validate_memory_load_spec(
     spec: &candle_gen::gen_core::LoadSpec,
 ) -> Result<()> {
     let mut unsupported = Vec::new();
-    if !spec.adapters.is_empty() {
-        unsupported.push("adapters");
-    }
     if spec.control.is_some() {
         unsupported.push("control");
     }
@@ -987,6 +992,7 @@ mod tests {
     fn admitted_edit_binds_the_runtime_base_path() {
         let paths = Flux2EditPaths {
             root: PathBuf::from("/runtime"),
+            adapters: Vec::new(),
         };
         let matching = candle_gen::gen_core::LoadSpec::new(
             candle_gen::gen_core::WeightsSource::Dir(paths.root.clone()),
@@ -1014,6 +1020,7 @@ mod tests {
             1.0,
             AdapterKind::Lora,
         ));
+        assert!(validate_memory_load_spec(Flux2Variant::Klein9b, &adapters).is_ok());
         let mut control = base();
         control.control = Some(WeightsSource::File(PathBuf::from("control.safetensors")));
         let mut extra_controls = base();
@@ -1039,7 +1046,6 @@ mod tests {
         );
 
         for (field, spec) in [
-            ("adapters", adapters),
             ("control", control),
             ("extra_controls", extra_controls),
             ("ip_adapter", ip_adapter),
@@ -1058,6 +1064,7 @@ mod tests {
     fn legacy_edit_constructor_rejects_constrained_memory_without_context() {
         let paths = Flux2EditPaths {
             root: PathBuf::from("/missing-flux2-dev"),
+            adapters: Vec::new(),
         };
         let error = Flux2Edit::load_dev_with_memory(
             &paths,

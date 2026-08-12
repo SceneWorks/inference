@@ -96,6 +96,28 @@ pub fn load_instantid_unet_with_adapters(
     dtype: DType,
     adapters: &[AdapterSpec],
 ) -> Result<UNet2DConditionModel> {
+    load_vendored_unet_with_adapters(
+        root,
+        device,
+        dtype,
+        adapters,
+        ADDITION_TIME_EMBED_DIM,
+        PROJECTION_INPUT_DIM,
+    )
+}
+
+/// Load the vendored SDXL-family UNet with an arbitrary add-embedding shape and apply the selected
+/// adapter stack. Kolors shares the SDXL UNet body but uses a 5632-wide add embedding, so its plain,
+/// IP-Adapter, and strict-control providers use this seam rather than duplicating the packed/dense
+/// adapter rules (including the zero-match and declared-kind guards).
+pub fn load_vendored_unet_with_adapters(
+    root: &Path,
+    device: &Device,
+    dtype: DType,
+    adapters: &[AdapterSpec],
+    addition_time_embed_dim: usize,
+    projection_input_dim: usize,
+) -> Result<UNet2DConditionModel> {
     match crate::pipeline::detect_packed_unet(root)? {
         Some((packed_file, group_size)) => {
             // The vendored UNet threads only the default MLX group 64 through its blocks; a non-64 tier
@@ -107,7 +129,7 @@ pub fn load_instantid_unet_with_adapters(
             let conv = crate::adapters::fold_conv_adapters(&mut raw, adapters, &table)?;
             let vs = VarBuilder::from_tensors(raw, dtype, device);
             let mut unet = UNet2DConditionModel::new(vs.clone(), 4, 4, false, sdxl_unet_config())?
-                .with_add_embedding(vs, ADDITION_TIME_EMBED_DIM, PROJECTION_INPUT_DIM)?;
+                .with_add_embedding(vs, addition_time_embed_dim, projection_input_dim)?;
             let add = crate::adapters::install_additive(&mut unet, adapters, &table, device)?;
             crate::adapters::guard_additive_matched(adapters.len(), conv.merged + add.applied)?;
             Ok(unet)
@@ -116,11 +138,16 @@ pub fn load_instantid_unet_with_adapters(
             // sc-11682: keep the bf16 base a pristine mmap (evictable — epic 10765) and apply the
             // adapter additively (Linear + conv residuals) instead of folding into a host `from_tensors`
             // map. The `add_embedding` head shares the same mmap VarBuilder.
-            let unet_file = snapshot_file(root, "unet/diffusion_pytorch_model.fp16.safetensors")?;
+            let dense = root.join("unet/diffusion_pytorch_model.safetensors");
+            let unet_file = if dense.is_file() {
+                dense
+            } else {
+                snapshot_file(root, "unet/diffusion_pytorch_model.fp16.safetensors")?
+            };
             let table = crate::adapters::build_sdxl_kohya_table_from_file(&unet_file)?;
             let vs = candle_gen::mmap_var_builder(&[unet_file], dtype, device)?;
             let mut unet = UNet2DConditionModel::new(vs.clone(), 4, 4, false, sdxl_unet_config())?
-                .with_add_embedding(vs, ADDITION_TIME_EMBED_DIM, PROJECTION_INPUT_DIM)?;
+                .with_add_embedding(vs, addition_time_embed_dim, projection_input_dim)?;
             let lin = crate::adapters::install_additive(&mut unet, adapters, &table, device)?;
             let conv = crate::adapters::install_additive_conv(&mut unet, adapters, &table, device)?;
             crate::adapters::guard_additive_matched(adapters.len(), lin.applied + conv.applied)?;

@@ -66,8 +66,8 @@ pub fn descriptor() -> ModelDescriptor {
             conditioning: vec![ConditioningKind::Reference],
             // LoRA/LoKr merge into the SDXL-family UNet at load in the mlx provider (sc-4733), but the
             // candle merge is not wired in this slice — not advertised, rejected at load.
-            supports_lora: false,
-            supports_lokr: false,
+            supports_lora: true,
+            supports_lokr: true,
             // epic 7114 P4 (sc-7124): the native leading EulerDiscrete (`euler_discrete`) stays the
             // byte-exact DEFAULT (N1), but the curated ε/DDPM menu (euler / euler_ancestral / heun /
             // dpmpp_2m / dpmpp_sde / uni_pc / lcm / ddim) is ADDED over `DiscreteModelSampling`, plus the
@@ -186,8 +186,8 @@ mod tests {
             vec![ConditioningKind::Reference]
         );
         // User adapter stacks remain outside this registered base/img2img lane.
-        assert!(!d.capabilities.supports_lora);
-        assert!(!d.capabilities.supports_lokr);
+        assert!(d.capabilities.supports_lora);
+        assert!(d.capabilities.supports_lokr);
         // sc-10819: packed q4/q8 MLX-tier inference is wired end-to-end, so Q4/Q8 are advertised.
         assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
         // sc-7124: the curated ε/DDPM sampler menu + the native `euler_discrete` alias; the curated

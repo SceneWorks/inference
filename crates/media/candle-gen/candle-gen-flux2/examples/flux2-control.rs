@@ -230,6 +230,7 @@ fn main() -> Result<()> {
         &Flux2ControlPaths {
             root: PathBuf::from(&snapshot),
             control: PathBuf::from(&control),
+            adapters: Vec::new(),
         },
         quant,
     )?;

@@ -74,6 +74,7 @@ fn comfyui_zimage_renders_in_place() {
         &text_encoder,
         &vae,
         &tokenizer_dir,
+        Vec::new(),
     )
     .expect("load_from_comfyui_components");
     eprintln!("[comfyui] load handle {:.2}s", load.elapsed().as_secs_f32());

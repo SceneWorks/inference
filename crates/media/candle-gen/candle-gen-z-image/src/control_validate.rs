@@ -75,6 +75,7 @@ fn run_control_validation(
     let paths = ZImageControlPaths {
         snapshot: env_path("ZIMG_CTRL_BASE"),
         control: env_path("ZIMG_CTRL_NET"),
+        adapters: Vec::new(),
         base,
     };
     let skeleton = read_ppm(&env_path("ZIMG_CTRL_POSE"));

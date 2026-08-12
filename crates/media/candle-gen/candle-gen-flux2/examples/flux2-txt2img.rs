@@ -119,7 +119,12 @@ fn main() -> Result<()> {
                 return Err("--comfyui-dit is dev-only (pass --variant dev)".into());
             }
             println!("[smoke] comfyui-dit={}", dit_file.display());
-            candle_gen_flux2::load_from_comfyui_dit(dit_file, PathBuf::from(&snapshot), quant)?
+            candle_gen_flux2::load_from_comfyui_dit(
+                dit_file,
+                PathBuf::from(&snapshot),
+                quant,
+                Vec::new(),
+            )?
         }
         None => candle_gen_flux2::provider_registry()?.load(id, &spec)?,
     };

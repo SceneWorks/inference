@@ -92,6 +92,7 @@ fn real_weight_ip_adapter() {
         flux_base: env_path("IP_FLUX_BASE"),
         ip_adapter: env_path("IP_FLUX_ADAPTER"),
         image_encoder: image_encoder.clone(),
+        adapters: Vec::new(),
     };
     let reference = read_ppm(&env_path("IP_FLUX_REF"));
     println!(

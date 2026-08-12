@@ -154,6 +154,8 @@ fn generation_descriptor(
                 candle_gen::gen_core::Quant::Q8,
             ],
             component_precision_floors: quant::COMPONENT_PRECISION_FLOORS,
+            supports_lora: true,
+            supports_lokr: true,
             ..Default::default()
         },
     }
@@ -183,6 +185,7 @@ pub struct MageGenerator {
     loaded_quant: Option<candle_gen::gen_core::Quant>,
     memory_strategy: Option<gen_core::MemoryProviderContract>,
     memory_admission: memory_strategy::AdmissionRegistry,
+    adapters: Vec<gen_core::AdapterSpec>,
 }
 
 pub struct MageEditGenerator {
@@ -197,15 +200,21 @@ pub struct MageEditGenerator {
     loaded_quant: Option<candle_gen::gen_core::Quant>,
     memory_strategy: Option<gen_core::MemoryProviderContract>,
     memory_admission: memory_strategy::AdmissionRegistry,
+    adapters: Vec<gen_core::AdapterSpec>,
 }
 
 impl MageEditGenerator {
     fn components(&self) -> gen_core::Result<Arc<MageEdit>> {
         candle_gen::cached(&self.components, || {
             verify_edit_checkpoint(&self.root, self.variant)?;
-            MageEdit::load_components(&self.component_dirs, self.quant, &self.device)
-                .map(Arc::new)
-                .map_err(candle_gen::CandleError::from)
+            MageEdit::load_components(
+                &self.component_dirs,
+                self.quant,
+                &self.device,
+                &self.adapters,
+            )
+            .map(Arc::new)
+            .map_err(candle_gen::CandleError::from)
         })
         .map_err(Into::into)
     }
@@ -482,6 +491,7 @@ impl Generator for MageEditGenerator {
                             &device,
                             stream_transformer_blocks,
                             &req.cancel,
+                            &self.adapters,
                         ),
                         &req.cancel,
                     )
@@ -552,9 +562,14 @@ fn resolve_edit_references(
 impl MageGenerator {
     fn components(&self) -> gen_core::Result<Arc<MagePipeline>> {
         candle_gen::cached(&self.components, || {
-            MagePipeline::load_components(&self.component_dirs, self.quant, &self.device)
-                .map(Arc::new)
-                .map_err(candle_gen::CandleError::from)
+            MagePipeline::load_components(
+                &self.component_dirs,
+                self.quant,
+                &self.device,
+                &self.adapters,
+            )
+            .map(Arc::new)
+            .map_err(candle_gen::CandleError::from)
         })
         .map_err(Into::into)
     }
@@ -713,6 +728,7 @@ impl Generator for MageGenerator {
                             &device,
                             stream_transformer_blocks,
                             &req.cancel,
+                            &self.adapters,
                         ),
                         &req.cancel,
                     )
@@ -763,11 +779,7 @@ fn load_generation_variant(
         }
     };
     let component_dirs = resolve_component_dirs(&root, spec)?;
-    if !spec.adapters.is_empty()
-        || spec.control.is_some()
-        || !spec.extra_controls.is_empty()
-        || spec.ip_adapter.is_some()
-    {
+    if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
         return Err(gen_core::Error::Unsupported(
             "mage_flow RL generation does not accept adapters or control overlays".into(),
         ));
@@ -789,6 +801,7 @@ fn load_generation_variant(
         lifecycle: Mutex::new(()),
         loaded_quant: spec.quantize,
         memory_strategy,
+        adapters: spec.adapters.clone(),
     }))
 }
 
@@ -831,6 +844,8 @@ pub fn edit_descriptor(variant: MageEditVariant) -> ModelDescriptor {
                 candle_gen::gen_core::Quant::Q8,
             ],
             component_precision_floors: quant::COMPONENT_PRECISION_FLOORS,
+            supports_lora: true,
+            supports_lokr: true,
             ..Default::default()
         },
     }
@@ -858,11 +873,7 @@ fn load_edit_variant(
             variant.id()
         )));
     }
-    if !spec.adapters.is_empty()
-        || spec.control.is_some()
-        || !spec.extra_controls.is_empty()
-        || spec.ip_adapter.is_some()
-    {
+    if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
             "{} does not accept adapters or control overlays",
             variant.id()
@@ -896,6 +907,7 @@ fn load_edit_variant(
         lifecycle: Mutex::new(()),
         loaded_quant: spec.quantize,
         memory_strategy,
+        adapters: spec.adapters.clone(),
     }))
 }
 

@@ -88,6 +88,7 @@ fn real_weight_ip_adapter() {
     let paths = IpAdapterKolorsPaths {
         kolors_base: env_path("IP_KOLORS_BASE"),
         ip_adapter: ip_adapter.clone(),
+        adapters: Vec::new(),
     };
     let reference = read_ppm(&env_path("IP_KOLORS_REF"));
     println!(

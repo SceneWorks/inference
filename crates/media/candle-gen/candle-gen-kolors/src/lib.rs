@@ -82,6 +82,7 @@ pub struct KolorsGenerator {
     /// The `LoadSpec::pid` component captured at load (epic 7840 / sc-7853), threaded into the lazy
     /// component build so the PiD engine loads once alongside the base model. `None` when not opted in.
     pid_spec: Option<PidWeights>,
+    adapters: Vec<candle_gen::gen_core::AdapterSpec>,
     components: Mutex<Option<Components>>,
 }
 
@@ -153,7 +154,12 @@ impl Generator for KolorsGenerator {
         if req.cancel.is_cancelled() {
             return Err(gen_core::Error::Canceled);
         }
-        let pipe = Pipeline::load(&self.root, &self.device, self.pid_spec.clone());
+        let pipe = Pipeline::load(
+            &self.root,
+            &self.device,
+            self.pid_spec.clone(),
+            self.adapters.clone(),
+        );
         let components = self.components(&pipe)?;
         let images = pipe.render(req, &components, on_progress)?;
         Ok(GenerationOutput::Images(images))
@@ -177,12 +183,6 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
             ));
         }
     };
-    if !spec.adapters.is_empty() {
-        return Err(gen_core::Error::Unsupported(
-            "candle kolors does not support LoRA/LoKr yet — refusing to silently drop the adapters"
-                .into(),
-        ));
-    }
     // Packed q4/q8 MLX tiers are wired end-to-end (sc-10819, epic 9083): the tier is packed-detected
     // from disk (`unet/` & `text_encoder/` `config.json` `quantization` blocks; see
     // `pipeline::load_components`), so the `LoadSpec::quantize` overlay is an advisory no-op on an
@@ -203,6 +203,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         // any) so the lazy component build loads the engine once. Unlike adapters/quant/control above,
         // it is not rejected — `None` simply keeps the byte-exact native-VAE path.
         pid_spec: spec.pid.clone(),
+        adapters: spec.adapters.clone(),
         components: Mutex::new(None),
     }))
 }
@@ -425,14 +426,11 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_unwired_surfaces_and_single_file() {
+    fn load_accepts_adapters_and_rejects_single_file() {
         let lora = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_adapters(vec![
             AdapterSpec::new("/lora.safetensors".into(), 1.0, AdapterKind::Lora),
         ]);
-        assert!(matches!(
-            load(&lora).err().expect("err"),
-            gen_core::Error::Unsupported(_)
-        ));
+        assert!(load(&lora).is_ok());
 
         // sc-10819: a packed q4/q8 tier is auto-detected from disk, so `quantize` is NO LONGER a load
         // reject (contrast the LoRA/control overlays above). Load is lazy (no file I/O), so a quant-only

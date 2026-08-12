@@ -266,6 +266,7 @@ fn run_dev(args: &[String], c: &Common, quant: Option<Quant>) -> Result<()> {
     let model = Flux2Edit::load_dev(
         &Flux2EditPaths {
             root: PathBuf::from(&c.snapshot),
+            adapters: Vec::new(),
         },
         quant,
     )?;
@@ -415,6 +416,7 @@ fn run_klein(args: &[String], c: &Common) -> Result<()> {
 
     let model = Flux2Edit::load(&Flux2EditPaths {
         root: PathBuf::from(&c.snapshot),
+        adapters: Vec::new(),
     })?;
     let req = Flux2EditRequest {
         prompt: c.prompt.clone(),

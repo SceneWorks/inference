@@ -73,6 +73,7 @@ fn real_weight_memory_rung() {
         pulid_weights: env_path("PULID_WEIGHTS"),
         eva_weights: env_path("PULID_EVA"),
         face_dir: env_path("PULID_FACE_DIR"),
+        adapters: Vec::new(),
     };
     let strategy = memory_strategy_from_env();
     let contract = crate::memory_strategy::provider_contract(&paths).unwrap();
@@ -173,6 +174,7 @@ fn real_weight_pulid() {
         pulid_weights: env_path("PULID_WEIGHTS"),
         eva_weights: env_path("PULID_EVA"),
         face_dir: env_path("PULID_FACE_DIR"),
+        adapters: Vec::new(),
     };
 
     eprintln!("loading PulidFlux (FLUX.1-dev + PuLID + EVA-CLIP + face stack) ...");

@@ -268,6 +268,7 @@ mod tests {
             pulid_weights: root.join("pulid.safetensors"),
             eva_weights: root.join("eva.safetensors"),
             face_dir: root.join("face"),
+            adapters: Vec::new(),
         }
     }
 

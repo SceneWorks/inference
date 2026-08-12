@@ -37,6 +37,7 @@ fn real_weight_control() {
     let paths = KolorsControlPaths {
         kolors_base: env_path("KOLORS_CTRL_BASE"),
         controlnet: env_path("KOLORS_CTRL_NET"),
+        adapters: Vec::new(),
     };
     let skeleton = read_ppm(&env_path("KOLORS_CTRL_POSE"));
     println!(

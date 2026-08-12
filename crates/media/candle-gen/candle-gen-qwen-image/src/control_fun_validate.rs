@@ -42,6 +42,7 @@ fn real_weight_fun_control() {
     let paths = QwenFunControlPaths {
         qwen_base: env_path("QWEN_FUN_BASE"),
         controlnet: env_path("QWEN_FUN_NET"),
+        adapters: Vec::new(),
     };
     let hint = read_ppm(&env_path("QWEN_FUN_HINT"));
     println!(

@@ -130,6 +130,7 @@ fn measure_z_image_base_control_tier() {
     let paths = ZImageControlPaths {
         snapshot,
         control,
+        adapters: Vec::new(),
         base: true,
     };
     let model = ZImageControl::load_with_memory(&paths, memory)

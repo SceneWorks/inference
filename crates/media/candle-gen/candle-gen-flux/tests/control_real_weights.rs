@@ -51,6 +51,7 @@ fn real_weight_control() {
     let paths = Flux1ControlPaths {
         flux_base: env_path("FLUX1_CTRL_BASE"),
         control: env_path("FLUX1_CTRL_OVERLAY"),
+        adapters: Vec::new(),
     };
     let control_image = read_ppm(&env_path("FLUX1_CTRL_IMAGE"));
     println!(

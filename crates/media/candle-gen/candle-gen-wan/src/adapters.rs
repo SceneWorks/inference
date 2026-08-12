@@ -31,6 +31,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use candle_gen::candle_core::{DType, Tensor};
 use candle_gen::gen_core::{AdapterKind, AdapterSpec, MoeExpert};
+use candle_gen::quant::adapters::install_dotted_adapters;
 use candle_gen::train::lora::{reconstruct_lokr_delta, reconstruct_lora_delta};
 // The shared adapter-merge skeleton (sc-8998 / F-018): the format-parsing + merge-report primitives
 // this crate previously hand-copied. Only the Wan-specific key→module resolution stays local below.
@@ -287,6 +288,7 @@ pub fn merge_adapters(
     let table = build_kohya_table(map, &[2]);
     let mut report = MergeReport::default();
     for spec in specs {
+        let merged_before = report.merged;
         let af = read_adapter(&spec.path)?;
         match spec.kind {
             AdapterKind::Lokr => merge_lokr_file(map, &af, spec.scale, &table, &mut report)?,
@@ -299,6 +301,12 @@ pub fn merge_adapters(
                 }
                 merge_lora_file(map, &af, spec.scale, &table, &mut report)?;
             }
+        }
+        if report.merged == merged_before {
+            return Err(CandleError::Msg(format!(
+                "wan: adapter {} matched no compatible model projection; every selected adapter must apply",
+                spec.path.display()
+            )));
         }
     }
     if report.merged == 0 {
@@ -346,6 +354,7 @@ struct PendingLora {
     a: Tensor,
     b: Tensor,
     scale: f64,
+    source: usize,
 }
 
 /// True when a file carries LoKr/LoHa factors (or is stamped/declared LoKr) — such an adapter cannot
@@ -362,6 +371,12 @@ fn is_lokr_or_loha(af: &AdapterFile, kind: AdapterKind) -> bool {
         })
 }
 
+fn has_loha_factors(af: &AdapterFile) -> bool {
+    af.tensors
+        .keys()
+        .any(|key| key.contains(".hada_") || key.starts_with("hada_"))
+}
+
 /// Resolve one LoRA file's complete `(down, up[, alpha])` groups into per-path [`PendingLora`]s at
 /// `scale`, mirroring [`merge_lora_file`]'s classification + `alpha/rank` split — but producing the
 /// **unmerged** `a`/`b` factors instead of folding a delta. `table` is the host-derived kohya
@@ -370,6 +385,7 @@ fn is_lokr_or_loha(af: &AdapterFile, kind: AdapterKind) -> bool {
 fn resolve_lora_file(
     af: &AdapterFile,
     scale: f32,
+    source: usize,
     table: &BTreeMap<String, String>,
     pending: &mut BTreeMap<String, Vec<PendingLora>>,
     skipped_keys: &mut usize,
@@ -408,6 +424,7 @@ fn resolve_lora_file(
             a,
             b,
             scale: scale as f64,
+            source,
         });
     }
     Ok(())
@@ -434,16 +451,24 @@ pub fn install_additive(
 
     // Resolve shared specs first, then this expert's — so shared residuals stack before expert ones
     // (mlx pass-1/pass-2 order).
-    let ordered = specs
+    let ordered: Vec<AdapterSpec> = specs
         .iter()
         .filter(|s| s.moe_expert.is_none())
-        .chain(specs.iter().filter(|s| s.moe_expert == Some(expert)));
+        .chain(specs.iter().filter(|s| s.moe_expert == Some(expert)))
+        .cloned()
+        .collect();
 
     let mut pending: BTreeMap<String, Vec<PendingLora>> = BTreeMap::new();
+    let mut lokr_specs = Vec::new();
     let mut report = AdditiveReport::default();
-    for spec in ordered {
+    let mut lora_sources = BTreeMap::new();
+    for (source, spec) in ordered.iter().enumerate() {
         let af = read_adapter(&spec.path)?;
         if is_lokr_or_loha(&af, spec.kind) {
+            if !has_loha_factors(&af) {
+                lokr_specs.push(spec.clone());
+                continue;
+            }
             let why = if packed {
                 "on a quantized (packed q4/q8) Wan tier are not supported yet — use the bf16 tier \
                  (where they fold into the dense weight), or a plain LoRA (which applies additively \
@@ -456,13 +481,25 @@ pub fn install_additive(
                 spec.path.display()
             )));
         }
+        lora_sources.insert(source, spec.path.clone());
         resolve_lora_file(
             &af,
             spec.scale,
+            source,
             &table,
             &mut pending,
             &mut report.skipped_keys,
         )?;
+    }
+
+    if !lokr_specs.is_empty() {
+        let device = dit.device().clone();
+        let lokr = install_dotted_adapters("wan", &lokr_specs, &device, |visitor| {
+            dit.visit_adaptable_mut(visitor)
+        })?;
+        report.applied += lokr.applied;
+        report.skipped_targets.extend(lokr.skipped_targets);
+        report.skipped_keys += lokr.skipped_keys;
     }
 
     // Attach: walk the host once, pushing any resolved residual for each projection's path. A factor
@@ -473,6 +510,7 @@ pub fn install_additive(
     // they are moved onto it once here — else the forward-time residual matmul is a device mismatch.
     let device = dit.device().clone();
     let mut matched: HashSet<String> = HashSet::new();
+    let mut applied_sources = HashSet::new();
     dit.visit_adaptable_mut(&mut |path, lin| {
         if let Some(list) = pending.get(path) {
             matched.insert(path.to_string());
@@ -484,6 +522,7 @@ pub fn install_additive(
                 }
                 lin.push_lora(p.a.to_device(&device)?, p.b.to_device(&device)?, p.scale);
                 report.applied += 1;
+                applied_sources.insert(p.source);
             }
         }
         Ok(())
@@ -493,6 +532,15 @@ pub fn install_additive(
         if !matched.contains(path) {
             report.skipped_targets.push(path.clone());
         }
+    }
+    if let Some((_source, path)) = lora_sources
+        .iter()
+        .find(|(source, _)| !applied_sources.contains(source))
+    {
+        return Err(CandleError::Msg(format!(
+            "wan: adapter {} matched no compatible model projection; every selected adapter must apply",
+            path.display()
+        )));
     }
     Ok(report)
 }
@@ -901,6 +949,48 @@ mod tests {
         std::fs::remove_file(&lora).ok();
     }
 
+    #[test]
+    fn every_stacked_adapter_must_match_for_additive_and_folded_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        let base = random_base_map(&cfg, &dev);
+        let valid = write_lora(
+            &tmp,
+            &["blocks.0.attn1.to_q"],
+            cfg.dim,
+            4,
+            4.0,
+            "valid-stack-member",
+        );
+        let missing = write_lora(
+            &tmp,
+            &["blocks.99.attn1.to_q"],
+            cfg.dim,
+            4,
+            4.0,
+            "missing-stack-member",
+        );
+        let specs = vec![
+            AdapterSpec::new(valid, 1.0, AdapterKind::Lora),
+            AdapterSpec::new(missing.clone(), 1.0, AdapterKind::Lora),
+        ];
+
+        let mut additive = dit_from_map(&cfg, base.clone(), &dev);
+        let additive_error = install_additive(&mut additive, &specs, MoeExpert::High)
+            .expect_err("one valid adapter must not hide a later additive zero-match");
+        assert!(additive_error
+            .to_string()
+            .contains(&missing.display().to_string()));
+
+        let mut folded = base;
+        let fold_error = merge_adapters(&mut folded, &specs)
+            .expect_err("one valid adapter must not hide a later folded zero-match");
+        assert!(fold_error
+            .to_string()
+            .contains(&missing.display().to_string()));
+    }
+
     /// MoE routing: a High-tagged spec adapts nothing when installed for the Low expert, and adapts its
     /// targets when installed for the High expert.
     #[test]
@@ -927,10 +1017,9 @@ mod tests {
         std::fs::remove_file(&lora).ok();
     }
 
-    /// A LoKr adapter is rejected by the additive path with an actionable error (LoKr/LoHa fold on the
-    /// dense path; a packed tier rejects them entirely — sc-10050/10051).
+    /// A PEFT-stamped LoKr adapter applies through the packed-safe structured residual path.
     #[test]
-    fn install_additive_rejects_lokr() {
+    fn install_additive_applies_lokr() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
         let base = random_base_map(&cfg, &dev);
@@ -945,15 +1034,22 @@ mod tests {
         );
         let path_tmp = tempfile::tempdir().unwrap();
         let path = path_tmp.path().join("sc10094_lora.safetensors");
-        cst::save(&m, &path).unwrap();
+        safetensors::serialize_to_file(
+            m.into_iter().collect::<Vec<_>>(),
+            Some(HashMap::from([
+                ("networkType".to_string(), "lokr".to_string()),
+                ("rank".to_string(), "1".to_string()),
+                ("alpha".to_string(), "1".to_string()),
+            ])),
+            &path,
+        )
+        .unwrap();
         let specs = vec![AdapterSpec::new(path.clone(), 1.0, AdapterKind::Lokr)];
 
         let mut dit = dit_from_map(&cfg, base, &dev);
-        let err = install_additive(&mut dit, &specs, MoeExpert::High).unwrap_err();
-        assert!(
-            err.to_string().contains("LoKr/LoHa"),
-            "expected a LoKr/LoHa rejection, got: {err}"
-        );
+        let report = install_additive(&mut dit, &specs, MoeExpert::High).unwrap();
+        assert_eq!(report.applied, 1);
+        assert!(report.skipped_targets.is_empty());
         std::fs::remove_file(&path).ok();
     }
 }

@@ -33,6 +33,7 @@ use gen_core::Quant;
 
 /// The frozen base weight — **dense** (`candle_nn::Linear`) or **MLX-packed** ([`super::QLinear`],
 /// dequant-on-forward). Both compute `x·Wᵀ (+ b)`; neither is ever mutated by an adapter.
+#[derive(Clone)]
 enum Base {
     Dense(Linear),
     Packed(QLinear),
@@ -72,6 +73,7 @@ impl Base {
 /// A forward-time additive residual attached to an [`AdaptLinear`] — it never touches the frozen base
 /// weight, so it is memory-free on a packed q4/q8 tier. Factors are held **f32** (the merge/train
 /// dtype) and cast to the activation dtype per forward (they are tiny, so the cast is cheap).
+#[derive(Clone)]
 enum Adapter {
     /// LoRA residual `scale·((x·a)·b)`: `a` `[in, rank]` (= `downᵀ`), `b` `[rank, out]` (= `upᵀ` with
     /// the `alpha/rank` ratio folded in at resolution). The **deferred two-small-matmul** form — never
@@ -331,6 +333,7 @@ impl LokrFactors {
 /// [`Self::dense_bias`]) or packed-detecting ([`Self::linear_detect`] / [`Self::linear_detect_gs`] /
 /// [`Self::detect`]). `forward` = `base(x)` plus every residual, in push order; with no adapter it is
 /// byte-identical to the bare base.
+#[derive(Clone)]
 pub struct AdaptLinear {
     base: Base,
     /// The projection's logical `(out_features, in_features)` — captured at construction (recoverable
@@ -341,6 +344,17 @@ pub struct AdaptLinear {
     /// Forward-time additive residuals, applied in push order (adapters stack). Empty on the plain /
     /// dense-fold path ⇒ forward is byte-identical to the bare base.
     adapters: Vec<Adapter>,
+}
+
+impl std::fmt::Debug for AdaptLinear {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdaptLinear")
+            .field("packed", &self.is_packed())
+            .field("out_features", &self.out_features)
+            .field("in_features", &self.in_features)
+            .field("adapters", &self.adapters.len())
+            .finish()
+    }
 }
 
 impl AdaptLinear {
@@ -544,6 +558,24 @@ impl AdaptLinear {
         self.base.is_packed()
     }
 
+    pub fn is_quantized(&self) -> bool {
+        self.is_packed()
+    }
+
+    pub fn matmul_strategy(&self) -> Option<super::MatmulStrategy> {
+        match &self.base {
+            Base::Dense(_) => None,
+            Base::Packed(linear) => linear.matmul_strategy(),
+        }
+    }
+
+    pub fn quant_dtype(&self) -> Option<candle_core::quantized::GgmlDType> {
+        match &self.base {
+            Base::Dense(_) => None,
+            Base::Packed(linear) => linear.quant_dtype(),
+        }
+    }
+
     /// The base projection's `(out_features, in_features)` — the shape a resolved LoRA factor / LoKr
     /// delta is checked against, recoverable even from a packed base.
     pub fn base_shape(&self) -> (usize, usize) {
@@ -638,6 +670,20 @@ impl AdaptLinear {
             Base::Dense(l) => {
                 let mut q = QLinear::from_dense(DenseLinear::Linear(l.clone()));
                 q.quantize_dequant_onto(quant, device)?;
+                self.base = Base::Packed(q);
+                Ok(())
+            }
+        }
+    }
+
+    /// Quantize the base projection with [`QLinear::quantize_onto`] while preserving all attached
+    /// forward-time residuals.
+    pub fn quantize_onto(&mut self, quant: Quant, device: &Device) -> candle_core::Result<()> {
+        match &mut self.base {
+            Base::Packed(_) => Ok(()),
+            Base::Dense(l) => {
+                let mut q = QLinear::from_dense(DenseLinear::Linear(l.clone()));
+                q.quantize_onto(quant, device)?;
                 self.base = Base::Packed(q);
                 Ok(())
             }
