@@ -24,13 +24,14 @@
 //! | [`rope`] | MM-RoPE — the `(t, h, w)` axis split and the partial rotary |
 //! | [`positions`] | the per-modality `(t, h, w)` coordinate conventions, **including audio's** |
 //! | [`block`] | `MiniMaxH3TransformerBlock` + its AdaLN projection |
+//! | [`adaln`] | the schedule-keyed modulation precompute and the **26.02 GB evict** (sc-17145) |
 //! | [`refiner`] | the 2-layer text token refiner |
 //! | [`qkv`] | the published fused-QKV transform, as an executable contract |
 //!
-//! Deliberately **not** here, each owned by a later story: AdaLN precompute/evict (sc-17145), the
-//! joint denoise loop and the packed-sequence assembly (sc-17146), the pipeline and the
-//! input/output projections that wrap this stack (sc-17147), Ref2VA's `transformer_ref`
-//! (sc-17149).
+//! Deliberately **not** here, each owned by a later story: the joint denoise loop and the
+//! packed-sequence assembly (sc-17146), the pipeline and the input/output projections that wrap
+//! this stack — including the timestep MLP [`adaln::AdaLnCache::precompute`] takes as a closure —
+//! (sc-17147), and Ref2VA's `transformer_ref` (sc-17149).
 //!
 //! # Read [`crate::layout`] first
 //!
@@ -39,6 +40,7 @@
 //! [`crate::layout::split_gate_value`]) and a fused-QKV reorder whose DiT arm is *not* the video
 //! VAE's — see [`qkv`].
 
+pub mod adaln;
 pub mod block;
 pub mod config;
 pub mod layers;
@@ -47,6 +49,7 @@ pub mod qkv;
 pub mod refiner;
 pub mod rope;
 
+pub use adaln::{AdaLnCache, AdaLnResidency, ScheduleKey, TimestepSchedule};
 pub use block::{AdaLnModulation, AdaLnProjection, DitBlock};
 pub use config::{MiniMaxH3DitConfig, MODALITY_NUM, MODULATION_PARAMS};
 pub use layers::{DitAttention, DitFeedForward, LinearNoBias, RmsNorm};

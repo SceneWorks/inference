@@ -58,6 +58,22 @@
 //! cross-attention anywhere in MiniMax-H3. The attention inner width (7168) is *wider* than the
 //! residual stream (5376), and only 96 of each head's 128 channels rotate.
 //!
+//! ## AdaLN precompute + evict (sc-17145)
+//!
+//! - [`dit::adaln`] projects the **whole schedule's** modulation up front and then releases the
+//!   `adaln_proj` weights — 13.01 B of the DiT's ~33 B, **26.02 GB at bf16**, taking
+//!   denoise-resident from ~62 GB to ~36 GB.
+//!
+//! The AdaLN weights are a function of the timestep embedding only, never of the tokens, which is
+//! what makes this possible. Two details decide whether an implementation is correct or merely
+//! plausible. MiniMax-H3's packed sequence carries **several timesteps at once** — video, audio,
+//! conditioning (0.999) and text (1.0) rows all sit at different `t` inside one forward pass — so
+//! the table is keyed on distinct timesteps across the run, not on steps. And MLX is lazily
+//! evaluated, so a precompute that is not forced still references the weights it was supposed to
+//! free: [`dit::adaln::AdaLnCache::precompute_and_evict`] owns that ordering, and pairs the drop
+//! with an explicit allocator drain because `get_active_memory` alone cannot tell a released buffer
+//! from a cached one.
+//!
 //! ## Read [`layout`] before porting anything else in this family
 //!
 //! MiniMax publishes the checkpoint in the **converted diffusers layout**, and that conversion
@@ -68,10 +84,11 @@
 //! decoder past a fully green parity suite. **The DiT (sc-17144) carries the same FFN swap plus a
 //! grouped-QKV reorder**, and the candle twins (sc-17154 / sc-17155) inherit both.
 //!
-//! Not in this crate yet: either CNN encoder, the DiT's AdaLN precompute/evict (sc-17145), the
-//! joint denoise loop and packed-sequence assembly (sc-17146), the pipeline and the DiT's
-//! input/output projections (sc-17147), and Ref2VA's `transformer_ref` (sc-17149). Nothing is
-//! registered with `mlx-gen-catalog` — there is no generator to ship until the pipeline lands.
+//! Not in this crate yet: either CNN encoder, the joint denoise loop and packed-sequence assembly
+//! (sc-17146), the pipeline and the DiT's input/output projections — including the timestep MLP the
+//! AdaLN precompute takes as a closure — (sc-17147), and Ref2VA's `transformer_ref` (sc-17149).
+//! Nothing is registered with `mlx-gen-catalog` — there is no generator to ship until the pipeline
+//! lands.
 
 pub mod alias_free;
 pub mod audio_config;
@@ -102,8 +119,9 @@ pub use config::{
 };
 pub use decoder::ViT3dDecoder;
 pub use dit::{
-    AdaLnModulation, AdaLnProjection, DitBlock, MiniMaxH3DitConfig, MmRope, MmRopeTables,
-    TokenRefiner, TokenRefinerBlock, MODALITY_NUM,
+    AdaLnCache, AdaLnModulation, AdaLnProjection, AdaLnResidency, DitBlock, MiniMaxH3DitConfig,
+    MmRope, MmRopeTables, ScheduleKey, TimestepSchedule, TokenRefiner, TokenRefinerBlock,
+    MODALITY_NUM,
 };
 pub use layout::{
     split_gate_value, GatedFfnLayout, AUDIO_VAE_IS_UNCONVERTED, PUBLISHED_GATED_FFN_LAYOUT,
