@@ -7,8 +7,14 @@
 //! 2. **chunk** it temporally ([`crate::chunking`]) and decode each chunk;
 //! 3. **cross-fade** the `token_drop`-induced seams and trim the repeat padding.
 //!
-//! Only the decoder is ported (sc-17140). The 3-D causal CNN encoder, the audio VAE (sc-17141),
-//! the DiT (sc-17144) and the pipeline (sc-17146/17147) are separate slices.
+//! `encode` (sc-17148, [`crate::vae_encoder`]) is the mirror image and is needed by `fl2va`: a
+//! keyframe is conditioned through both the text encoder's vision tower **and** this VAE. The two
+//! halves are structurally unrelated — the decoder is a 36-layer ViT, the encoder a causal conv
+//! stack — and only `encode`'s single-frame short circuit is subtle enough to restate here: a
+//! keyframe is one frame, so it skips the 17-frame temporal chunking entirely.
+//!
+//! The audio VAE (sc-17141), the DiT (sc-17144) and the pipeline (sc-17146/17147) are separate
+//! slices.
 
 use std::path::Path;
 
@@ -24,6 +30,10 @@ use crate::chunking::{TemporalGeometry, TemporalPlan};
 use crate::config::MiniMaxH3VaeConfig;
 use crate::decoder::ViT3dDecoder;
 use crate::tensor::slice_axis;
+use crate::vae_encoder::{
+    stitch_tiles, DiagonalGaussian, TilePlan, VideoEncoder3d, TILE_SAMPLE_MIN_OVERLAP,
+    TILE_SAMPLE_MIN_SIZE,
+};
 
 /// Split a fused `to_qkv` tensor into the published checkpoint's `to_q`/`to_k`/`to_v`.
 ///
@@ -63,12 +73,23 @@ pub fn split_fused_qkv(fused: &Array, heads: i32, head_dim: i32) -> Result<[Arra
     ])
 }
 
-/// The video VAE's decode half.
+/// The encode half — `quant_conv` and the CNN encoder, loaded together or not at all.
+#[derive(Debug, Clone)]
+struct EncodeHalf {
+    quant_w: Array,
+    quant_b: Array,
+    encoder: VideoEncoder3d,
+}
+
+/// The video VAE — both halves: the ViT decoder (sc-17140) and the causal-CNN encoder (sc-17148).
 #[derive(Debug, Clone)]
 pub struct MiniMaxH3VideoVae {
     post_quant_w: Array,
     post_quant_b: Array,
     decoder: ViT3dDecoder,
+    /// The encode half, present only when the weight map carried `encoder.*` / `quant_conv.*`.
+    /// See [`MiniMaxH3VideoVae::from_weights`].
+    encode: Option<Box<EncodeHalf>>,
     geometry: TemporalGeometry,
     latents_mean: Array,
     latents_std: Array,
@@ -94,6 +115,32 @@ impl MiniMaxH3VideoVae {
         let post_quant_w = raw.reshape(&[c, c])?;
         let post_quant_b = w.require("post_quant_conv.bias")?.as_dtype(dtype)?;
 
+        // The encode half is loaded **only when the map carries it**. The published `vae/` always
+        // does — [`Self::load`] enforces that — but the committed decode parity fixture does not,
+        // because its bytes are shared verbatim with `candle-gen-minimax-h3` (sc-17154) and adding
+        // tensors to it would break that crate's cross-backend digest. `encode` then reports a
+        // typed error naming the missing half rather than panicking or silently returning noise.
+        let encode = if w.get("encoder.conv_in.weight").is_some() {
+            // `quant_conv` is the mirror of `post_quant_conv`: `nn.Conv3d(2·z, 2·z, 1)` over the
+            // POSTERIOR PARAMETERS, so it is twice as wide — it maps mean and logvar together.
+            let raw_q = w.require("quant_conv.weight")?.as_dtype(dtype)?;
+            let sq = raw_q.shape();
+            let c2 = 2 * c;
+            if sq != [c2, c2, 1, 1, 1] {
+                return Err(Error::Msg(format!(
+                    "minimax-h3 vae: quant_conv.weight is {sq:?}, expected [{c2}, {c2}, 1, 1, 1] \
+                     — it maps the posterior's mean AND logvar, so it is twice the latent width"
+                )));
+            }
+            Some(Box::new(EncodeHalf {
+                quant_w: raw_q.reshape(&[c2, c2])?,
+                quant_b: w.require("quant_conv.bias")?.as_dtype(dtype)?,
+                encoder: VideoEncoder3d::from_weights(w, "encoder", cfg, dtype)?,
+            }))
+        } else {
+            None
+        };
+
         let decoder = ViT3dDecoder::from_weights(w, "decoder", cfg, dtype)?;
         let geometry = TemporalGeometry::new(cfg)?;
 
@@ -101,6 +148,7 @@ impl MiniMaxH3VideoVae {
             post_quant_w,
             post_quant_b,
             decoder,
+            encode,
             geometry,
             latents_mean: Array::from_slice(&cfg.latents_mean, &[1, c, 1, 1, 1]).as_dtype(dtype)?,
             latents_std: Array::from_slice(&cfg.latents_std, &[1, c, 1, 1, 1]).as_dtype(dtype)?,
@@ -109,15 +157,18 @@ impl MiniMaxH3VideoVae {
         })
     }
 
-    /// Every tensor name the decode path consumes — the exhaustive mapping. Any published
-    /// `vae/` tensor outside this set plus the `encoder.*` / `quant_conv.*` encoder half would be
-    /// silently ignored, which is the failure mode this list exists to make testable.
+    /// Every tensor name the VAE consumes — the exhaustive mapping over **both** halves. Any
+    /// published `vae/` tensor outside this set would be silently ignored, which is the failure
+    /// mode this list exists to make testable.
     pub fn tensor_names(cfg: &MiniMaxH3VaeConfig) -> Vec<String> {
         let mut v = vec![
             "post_quant_conv.weight".to_string(),
             "post_quant_conv.bias".to_string(),
+            "quant_conv.weight".to_string(),
+            "quant_conv.bias".to_string(),
         ];
         v.extend(ViT3dDecoder::names("decoder", cfg));
+        v.extend(VideoEncoder3d::names("encoder", cfg));
         v
     }
 
@@ -133,7 +184,20 @@ impl MiniMaxH3VideoVae {
         })?;
         let cfg = MiniMaxH3VaeConfig::from_diffusers_json(&text)?;
         let mut w = Weights::from_dir(&dir)?;
-        Self::from_weights(&mut w, &cfg, dtype)
+        let vae = Self::from_weights(&mut w, &cfg, dtype)?;
+        // **Production is strict.** `from_weights` tolerates a decode-only weight map because the
+        // committed parity fixture is one; a real `vae/` component always ships all 703 tensors,
+        // so a snapshot missing the encode half is a broken download, not a supported shape. Fail
+        // here rather than at the first `fl2va` request.
+        if !vae.can_encode() {
+            return Err(Error::Msg(format!(
+                "minimax-h3 vae: {} has no `encoder.*` / `quant_conv.*` tensors; the published \
+                 vae/ component carries all 703 and fl2va keyframe conditioning needs the encode \
+                 half",
+                dir.display()
+            )));
+        }
+        Ok(vae)
     }
 
     /// The config in force.
@@ -150,6 +214,161 @@ impl MiniMaxH3VideoVae {
     pub fn denormalize(&self, latents: &Array) -> Result<Array> {
         let z = latents.as_dtype(self.dtype)?;
         Ok(add(&multiply(&z, &self.latents_std)?, &self.latents_mean)?)
+    }
+
+    /// Per-channel latent normalization: `(z - latents_mean) / latents_std` — the exact inverse of
+    /// [`Self::denormalize`], and what the reference applies to a freshly-encoded conditioning
+    /// latent.
+    ///
+    /// There is **no `scaling_factor` and no `shift_factor`** on this VAE; normalization is the
+    /// per-channel 24-vector pair and lives in the pipeline rather than the model. A port that
+    /// reaches for the usual scalar `scaling_factor` finds none and is liable to invent one.
+    pub fn normalize(&self, latents: &Array) -> Result<Array> {
+        let z = latents.as_dtype(self.dtype)?;
+        Ok(z.subtract(&self.latents_mean)?.divide(&self.latents_std)?)
+    }
+
+    /// `encoder` then `quant_conv` on ONE temporal clip, **spatially tiled** — the reference's
+    /// `_encode_clip`.
+    ///
+    /// Tiling is on by default in the shipped VAE
+    /// ([`crate::vae_encoder::ENCODER_TILING_IS_ON_BY_DEFAULT`]), so this is the released
+    /// behaviour, not an opt-in memory optimization. At a canvas no larger than one tile the plan
+    /// degenerates to a single span and the result is bit-identical to an untiled encode.
+    pub fn encode_clip(&self, pixels: &Array) -> Result<Array> {
+        self.encode_clip_tiled(pixels, TILE_SAMPLE_MIN_SIZE, TILE_SAMPLE_MIN_OVERLAP)
+    }
+
+    /// [`Self::encode_clip`] at an explicit tile geometry.
+    ///
+    /// Production always uses the shipped 256/64. This exists because a fixture canvas large
+    /// enough to tile at 256 px would not be committable, so the parity fixture shrinks the tile
+    /// geometry to exercise **this same code path** at fixture scale — the alternative being a
+    /// tiling implementation that nothing gates.
+    pub fn encode_clip_tiled(
+        &self,
+        pixels: &Array,
+        tile_size: i32,
+        min_overlap: i32,
+    ) -> Result<Array> {
+        let half = self.encode_half()?;
+        let s = pixels.shape();
+        if s.len() != 5 {
+            return Err(Error::Msg(format!(
+                "minimax-h3 vae encode: expected [B, C, T, H, W], got {s:?}"
+            )));
+        }
+        let (height, width) = (s[3], s[4]);
+        let ratio = self.cfg.patch_size;
+        let rows = TilePlan::split(height, tile_size, min_overlap, ratio)?;
+        let cols = TilePlan::split(width, tile_size, min_overlap, ratio)?;
+
+        let mut grid = Vec::with_capacity(rows.len());
+        for (i, &y) in rows.starts.iter().enumerate() {
+            let mut row = Vec::with_capacity(cols.len());
+            for (j, &x) in cols.starts.iter().enumerate() {
+                let tile = slice_axis(pixels, 3, y, y + rows.lengths[i])?;
+                let tile = slice_axis(&tile, 4, x, x + cols.lengths[j])?;
+                row.push(self.quant_conv(half, &half.encoder.forward(&tile)?)?);
+            }
+            grid.push(row);
+        }
+        // The overlaps blend in LATENT units — the pixel overlaps are exact multiples of the
+        // spatial compression ratio precisely so this division is exact.
+        let latent = |o: &[i32]| o.iter().map(|v| v / ratio).collect::<Vec<i32>>();
+        stitch_tiles(&grid, &latent(&rows.overlaps), &latent(&cols.overlaps))
+    }
+
+    /// The encode half, or a typed error naming what is missing.
+    fn encode_half(&self) -> Result<&EncodeHalf> {
+        self.encode.as_deref().ok_or_else(|| {
+            Error::Msg(
+                "minimax-h3 vae: this VAE was built without its encode half (no `encoder.*` / \
+                 `quant_conv.*` in the weight map), so it can decode but not encode"
+                    .into(),
+            )
+        })
+    }
+
+    /// Whether the encode half is loaded.
+    pub fn can_encode(&self) -> bool {
+        self.encode.is_some()
+    }
+
+    /// The pointwise `quant_conv` channel map over the posterior parameters.
+    fn quant_conv(&self, half: &EncodeHalf, x: &Array) -> Result<Array> {
+        let nhwc = x.transpose_axes(&[0, 2, 3, 4, 1])?;
+        let mapped = linear(&nhwc, &half.quant_w, &half.quant_b)?;
+        Ok(mapped.transpose_axes(&[0, 4, 1, 2, 3])?)
+    }
+
+    /// Encode normalized pixels `[B, 3, T, H, W]` into a posterior — the reference's `encode`.
+    ///
+    /// **A single frame takes a different path.** `T == 1` short-circuits straight to
+    /// [`Self::encode_clip`]: no padding up to `clip_length`, no temporal chunking, no
+    /// `token_drop`, and exactly one latent frame comes out. Padding a keyframe up to 17 frames by
+    /// repetition instead would run the temporal path over 17 copies of the same image and return
+    /// `17 / 4 - 3` latent frames rather than one — a plausible tensor of the wrong shape carrying
+    /// conditioning MiniMax-H3 was never trained on. This is the path `fl2va` takes for every
+    /// keyframe.
+    ///
+    /// Longer inputs are padded up to a multiple of `clip_length` by **repeating the last frame**,
+    /// encoded clip by clip, and have `token_drop` trailing latent frames removed.
+    pub fn encode(&self, pixels: &Array) -> Result<DiagonalGaussian> {
+        self.encode_half()?;
+        let s = pixels.shape();
+        if s.len() != 5 {
+            return Err(Error::Msg(format!(
+                "minimax-h3 vae encode: expected [B, 3, T, H, W], got {s:?}"
+            )));
+        }
+        if s[1] != self.cfg.in_channels {
+            return Err(Error::Msg(format!(
+                "minimax-h3 vae encode: expected {} input channels, got {}",
+                self.cfg.in_channels, s[1]
+            )));
+        }
+        let num_frames = s[2];
+        if num_frames < 1 {
+            return Err(Error::Msg(
+                "minimax-h3 vae encode: need at least one frame".into(),
+            ));
+        }
+        let x = pixels.as_dtype(self.dtype)?;
+        if num_frames == 1 {
+            return DiagonalGaussian::from_parameters(&self.encode_clip(&x)?);
+        }
+
+        let clip = self.cfg.clip_length;
+        let x = if num_frames % clip == 0 {
+            x
+        } else {
+            let pad = (clip - num_frames % clip) % clip;
+            let last = slice_axis(&x, 2, num_frames - 1, num_frames)?;
+            let mut parts = vec![x.clone()];
+            for _ in 0..pad {
+                parts.push(last.clone());
+            }
+            concatenate_axis(&parts, 2)?
+        };
+        let padded = x.shape()[2];
+        let mut moments = Vec::with_capacity((padded / clip) as usize);
+        for i in 0..(padded / clip) {
+            moments.push(self.encode_clip(&slice_axis(&x, 2, i * clip, (i + 1) * clip)?)?);
+        }
+        let mut out = concatenate_axis(&moments, 2)?;
+        if self.cfg.token_drop > 0 {
+            let t = out.shape()[2];
+            if t <= self.cfg.token_drop {
+                return Err(Error::Msg(format!(
+                    "minimax-h3 vae encode: {t} latent frames is not more than the {} dropped at \
+                     the tail",
+                    self.cfg.token_drop
+                )));
+            }
+            out = slice_axis(&out, 2, 0, t - self.cfg.token_drop)?;
+        }
+        DiagonalGaussian::from_parameters(&out)
     }
 
     /// `post_quant_conv` then the ViT decoder — the reference's `decode`, on ONE chunk.
@@ -256,16 +475,60 @@ impl MiniMaxH3VideoVae {
 mod tests {
     use super::*;
 
+    /// **Both halves, exhaustively.** The published `vae/` index has 703 tensors: 116 encoder +
+    /// 2 `quant_conv` + 583 decoder + 2 `post_quant_conv`. sc-17140 claimed only the 585 decode
+    /// tensors; sc-17148 added the encode half, so the mapping is now the whole file and any
+    /// published tensor outside it is a loader gap rather than a documented omission.
     #[test]
-    fn tensor_names_match_the_published_vae_decode_half() {
+    fn tensor_names_match_the_whole_published_vae() {
         let cfg = MiniMaxH3VaeConfig::default();
         let names = MiniMaxH3VideoVae::tensor_names(&cfg);
-        // The published `vae/` index has 703 tensors: 116 encoder + 2 quant_conv (the encode half,
-        // not ported here) + 583 decoder + 2 post_quant_conv.
-        assert_eq!(names.len(), 583 + 2);
-        assert_eq!(703 - 116 - 2, names.len());
+        assert_eq!(names.len(), 703, "the published vae/ index has 703 tensors");
+        assert_eq!(583 + 2 + 116 + 2, names.len());
         let unique: std::collections::BTreeSet<_> = names.iter().collect();
-        assert_eq!(unique.len(), names.len());
+        assert_eq!(unique.len(), names.len(), "no name is claimed twice");
+
+        // The encode half on its own is the 118 the spike counted.
+        let encoder: Vec<&String> = names
+            .iter()
+            .filter(|n| n.starts_with("encoder.") || n.starts_with("quant_conv."))
+            .collect();
+        assert_eq!(encoder.len(), 118);
+        // Levels 4 and 5 have NO downsampler (`temporal · spatial == 1`); emitting names for one
+        // would ask for tensors the checkpoint does not have.
+        assert!(
+            !names
+                .iter()
+                .any(|n| n.contains("down_blocks.4.downsamplers")
+                    || n.contains("down_blocks.5.downsamplers")),
+            "the last two levels carry no downsampler"
+        );
+        for level in 0..4 {
+            assert!(
+                names.iter().any(
+                    |n| n == &format!("encoder.down_blocks.{level}.downsamplers.0.conv.weight")
+                ),
+                "level {level} downsamples and must declare its conv"
+            );
+        }
+        // `conv_shortcut` exists exactly where the width changes: levels 1, 3 and 5.
+        for level in [1, 3, 5] {
+            assert!(
+                names
+                    .iter()
+                    .any(|n| n
+                        == &format!("encoder.down_blocks.{level}.resnets.0.conv_shortcut.weight")),
+                "level {level} changes width and needs a residual projection"
+            );
+        }
+        for level in [0, 2, 4] {
+            assert!(
+                !names
+                    .iter()
+                    .any(|n| n.contains(&format!("down_blocks.{level}.resnets.0.conv_shortcut"))),
+                "level {level} keeps its width and must not declare a shortcut"
+            );
+        }
     }
 
     /// The interleaved split is an exact partition: reassembling `[q|k|v]` per head must give the

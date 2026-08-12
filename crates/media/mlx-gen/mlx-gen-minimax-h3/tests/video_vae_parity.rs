@@ -465,12 +465,25 @@ fn weight_mapping_is_exhaustive() {
         "these checkpoint tensors were never read: {leftover:?}"
     );
 
-    // ...and conversely, the declared name list is exactly the fixture's tensor set.
-    let declared: std::collections::BTreeSet<String> =
-        MiniMaxH3VideoVae::tensor_names(&cfg).into_iter().collect();
+    // ...and conversely, the declared name list is exactly the fixture's tensor set — **for the
+    // decode half**. `tensor_names` covers the whole published `vae/` component since sc-17148
+    // added the encoder, but this fixture deliberately carries only the decode half: its bytes are
+    // shared verbatim with `candle-gen-minimax-h3`, whose `cross_backend.rs` digests them, so
+    // adding tensors here would break that crate's gate. `video_vae_encode_parity.rs` holds the
+    // encode half against `video_vae_encode.safetensors`, and `real_weights.rs` asserts the union
+    // is exactly the published 703.
+    let is_encode_half = |k: &str| k.starts_with("encoder.") || k.starts_with("quant_conv.");
+    assert!(
+        !before.iter().any(|k| is_encode_half(k)),
+        "the decode fixture must not carry encode-half tensors"
+    );
+    let declared: std::collections::BTreeSet<String> = MiniMaxH3VideoVae::tensor_names(&cfg)
+        .into_iter()
+        .filter(|k| !is_encode_half(k))
+        .collect();
     assert_eq!(
         declared, before,
-        "declared tensor names differ from the checkpoint's"
+        "declared decode-half tensor names differ from the checkpoint's"
     );
 }
 

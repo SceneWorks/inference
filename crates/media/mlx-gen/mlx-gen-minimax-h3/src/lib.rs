@@ -139,10 +139,12 @@ pub mod audio_config;
 pub mod audio_vae;
 pub mod blocks;
 pub mod chunking;
+pub mod conditioning;
 pub mod config;
 pub mod decoder;
 pub mod denoise;
 pub mod dit;
+pub mod keyframe;
 pub mod layout;
 pub mod model;
 pub mod pipeline;
@@ -150,6 +152,7 @@ pub mod rope;
 pub mod tensor;
 pub mod text_encoder;
 pub mod vae;
+pub mod vae_encoder;
 
 pub use alias_free::{kaiser_sinc_filter1d, Activation1d, LowPassFilter1d, SnakeBeta, UpSample1d};
 pub use audio_config::{
@@ -159,6 +162,11 @@ pub use audio_config::{
 };
 pub use audio_vae::MiniMaxH3AudioVae;
 pub use chunking::{ChunkSpan, TemporalGeometry, TemporalPlan};
+pub use conditioning::{
+    build_condition_rows, encode_keyframe_condition, fp16_round_trip, keyframe_condition_rows,
+    scale_noise, validate_condition_arity, KeyframeNoise, KEYFRAME_ENCODE_SEED,
+    KEYFRAME_NOISE_AUG_T,
+};
 pub use config::{
     MiniMaxH3VaeConfig, CLIP_LENGTH, DECODER_HEAD_DIM, DECODER_NUM_HEADS, DECODER_NUM_LAYERS,
     DECODER_NUM_REGISTER_TOKENS, DECODER_ROPE_DIM_RATIO, DECODER_ROPE_THETA, LATENTS_MEAN,
@@ -179,6 +187,10 @@ pub use dit::{
     NormOutModulation, ScheduleKey, TimestepEmbedder, TimestepSchedule, TokenRefiner,
     TokenRefinerBlock, MODALITY_NUM, PUBLISHED_DIT_TENSORS,
 };
+pub use keyframe::{
+    anchors_for, fit_keyframe, fit_keyframes, keyframe_to_vae_pixels, resolve_canvas_size,
+    resolve_keyframe_canvas, round_half_to_even, KeyframeFit, MAX_ASPECT_RATIO, MIN_ASPECT_RATIO,
+};
 pub use layout::{
     split_gate_value, GatedFfnLayout, AUDIO_VAE_IS_UNCONVERTED, PUBLISHED_GATED_FFN_LAYOUT,
 };
@@ -198,6 +210,12 @@ pub use text_encoder::{
     VISION_PREFIX,
 };
 pub use vae::{split_fused_qkv, MiniMaxH3VideoVae};
+pub use vae_encoder::{
+    reflect_pad_axis, stitch_tiles, zero_pad_front_time, CausalConv3d, DiagonalGaussian,
+    DownBlock3d, FrameIsolatedGroupNorm, ResnetBlock3d, TilePlan, VideoEncoder3d,
+    ENCODER_TEMPORAL_PADDING, ENCODER_TILING_IS_ON_BY_DEFAULT, LOGVAR_CLAMP,
+    TILE_SAMPLE_MIN_OVERLAP, TILE_SAMPLE_MIN_SIZE,
+};
 
 /// The published model id this crate targets.
 pub const MODEL_ID: &str = "minimax_h3";
