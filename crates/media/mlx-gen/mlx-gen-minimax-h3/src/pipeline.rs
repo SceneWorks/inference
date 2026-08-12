@@ -60,14 +60,56 @@ pub const SPATIAL_STRIDE: u32 = VAE_RATIO as u32 * 2;
 /// Short edge the released checkpoint generates on by default.
 pub const CANVAS_SHORT_EDGE: u32 = 768;
 
-/// Area budget of the released checkpoint's canvas, `768 · 1344`.
+/// Area budget of the released checkpoint's canvas, `768 · 1344` = 1 032 192 px.
+///
+/// **Enforced by [`resolve_geometry`] since sc-17152.** It was declared and unused, and the gap was
+/// not cosmetic: `Capabilities::max_size` bounds each edge at 1344 independently, so `1344 x 1344`
+/// passed every check at 1.75x this budget. Canvas area is the *dominant* term in the packed
+/// sequence — it sets rows per latent frame, and attention is quadratic in the sequence — so an
+/// unbounded area is an unbounded render cost regardless of what the duration bound says.
+/// Together with [`MAX_DURATION_SECONDS`] this closes the envelope: the longest sequence any
+/// accepted request can build is **104 030 rows** ([`crate::cost`]).
 pub const CANVAS_MAX_PIXELS: u32 = 768 * 1344;
 
-/// Shortest clip the released model generates, in seconds.
-pub const MIN_DURATION_SECONDS: f32 = 5.0;
+/// Shortest clip the released model generates, in seconds — **the lattice floor**, 124 frames.
+///
+/// See [`MAX_DURATION_SECONDS`] for why both bounds are derived from
+/// [`crate::denoise::LEGAL_FRAME_COUNTS`] rather than declared.
+pub const MIN_DURATION_SECONDS: f32 =
+    crate::denoise::LEGAL_FRAME_COUNTS[0] as f32 / MINIMAX_H3_FPS as f32;
 
-/// Longest clip the released model generates, in seconds.
-pub const MAX_DURATION_SECONDS: f32 = 15.0;
+/// Longest clip the released model generates, in seconds — **the lattice ceiling**, 345 frames.
+///
+/// # 14.375 s, not the advertised 15.0 (sc-17152)
+///
+/// The reference pipeline's `max_duration` is **15.0 s**, but its `align_num_frames` walks the
+/// `17n + 5` lattice and the largest rung inside that declaration is `LEGAL_FRAME_COUNTS[13] = 345`
+/// = **14.375 s**. The next rung, 362 frames, is 15.083 s and past it. **No lattice point sits in
+/// `[14.375, 15.0]`**, so a caller asking for the documented maximum has nothing exact to land on —
+/// and the floor had the mirror-image gap at 5.0 s against 124 frames' 5.1667 s.
+///
+/// Both bounds are therefore **derived from the lattice** rather than declared alongside it. Three
+/// reasons, in the order they decided it:
+///
+/// 1. **An advertised bound must be reachable.** sc-17147 kept 15.0 and clamped the aligned count to
+///    the ceiling, which delivers 14.375 s of picture for a 15 s request without telling the caller
+///    — the same quiet refit the `frames` path exists to prevent, applied to three quarters of a
+///    second. Refusing 15.0 s is worse than delivering 14.375 s **only if 15.0 s is real**, and it
+///    is not: nothing upstream can produce it either.
+/// 2. **Admitting 362 frames would be an untested extension, not a fix.** The lattice has no upper
+///    term of its own and MM-RoPE is computed rather than tabulated, so 362 is arithmetically fine —
+///    but the reference pipeline never emits it, so no upstream render has ever exercised it. Taking
+///    the envelope *past* what upstream ships, on our own authority, is a larger commitment than
+///    trimming an unreachable 0.625 s.
+/// 3. **Derived bounds cannot drift apart again.** The declaration and the lattice disagreeing is
+///    the defect; making one the source of the other removes the class.
+///
+/// The consequence is that [`align_frames_for_duration`] needs no ceiling clamp: every duration in
+/// range now aligns *upward* onto a real rung, at both ends, which is the single policy sc-17147
+/// asked for.
+pub const MAX_DURATION_SECONDS: f32 = crate::denoise::LEGAL_FRAME_COUNTS
+    [crate::denoise::LEGAL_FRAME_COUNTS.len() - 1] as f32
+    / MINIMAX_H3_FPS as f32;
 
 /// Per-channel mean the video VAE's pixel space is normalized by — ImageNet's.
 pub const PIXEL_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
@@ -128,19 +170,39 @@ pub fn resolve_geometry(width: u32, height: u32, num_frames: i32) -> Result<Requ
             PATCH_SIZE[2]
         )));
     }
+    // The checkpoint's own area budget. Checked as a product because the per-edge cap is not the
+    // same constraint: 1344x1344 is inside `Capabilities::max_size` on both edges and 75 % over the
+    // area the model generates at. See `CANVAS_MAX_PIXELS`.
+    if width.saturating_mul(height) > CANVAS_MAX_PIXELS {
+        return Err(Error::Msg(format!(
+            "minimax_h3: {width}x{height} is {} px, over the released checkpoint's \
+             {CANVAS_MAX_PIXELS} px canvas budget ({CANVAS_SHORT_EDGE} short edge at 16:9). Canvas \
+             area sets the packed sequence length and the attention is quadratic in it",
+            u64::from(width) * u64::from(height)
+        )));
+    }
+    // **The lattice gate runs first, then the range gate.** The two reject disjoint mistakes and the
+    // caller needs to be told which one it made: a count that is not `17n + 5` has no geometry at
+    // any duration, while one that is on the lattice but outside 5.1667-14.375 s is a legal shape
+    // the model was not trained at. Since sc-17152 derived the range FROM the lattice the two
+    // boundaries touch — 123 frames is both off-lattice and (at 5.125 s) below the floor — and
+    // whichever check runs first owns the message.
+    //
+    // `video_latent_num_frames` is the `17n + 5` gate; `JointGeometry::new` below then re-derives
+    // and validates the audio-token count and the shared rotary clock.
+    video_latent_num_frames(num_frames)?;
     let seconds = f64::from(num_frames) / MINIMAX_H3_FPS;
     if seconds < f64::from(MIN_DURATION_SECONDS) - 1e-9
         || seconds > f64::from(MAX_DURATION_SECONDS) + 1e-9
     {
         return Err(Error::Msg(format!(
             "minimax_h3: {num_frames} frames is {seconds:.4} s, outside the model's \
-             {MIN_DURATION_SECONDS}-{MAX_DURATION_SECONDS} s range (124-345 frames at \
-             {MINIMAX_H3_FPS} fps)"
+             {MIN_DURATION_SECONDS}-{MAX_DURATION_SECONDS} s range ({}-{} frames at \
+             {MINIMAX_H3_FPS} fps)",
+            crate::denoise::LEGAL_FRAME_COUNTS[0],
+            crate::denoise::LEGAL_FRAME_COUNTS[crate::denoise::LEGAL_FRAME_COUNTS.len() - 1],
         )));
     }
-    // `video_latent_num_frames` is the 17n+5 gate; `JointGeometry::new` then re-derives and
-    // validates the audio-token count and the shared rotary clock.
-    video_latent_num_frames(num_frames)?;
     let latent_height = i32::try_from(height / VAE_RATIO as u32).map_err(|_| {
         Error::Msg(format!(
             "minimax_h3: height {height} does not fit an i32 latent"
@@ -166,14 +228,15 @@ pub const SMALLEST_LEGAL_FRAMES: i32 = 124;
 
 /// The nearest legal frame count at or above `seconds · 24`, for a caller that opts in to alignment.
 ///
-/// The requested **duration** is range-checked against the model's declared 5–15 s; the aligned
-/// frame count is then clamped to the lattice's own ceiling.
+/// The requested **duration** is range-checked against
+/// [`MIN_DURATION_SECONDS`]–[`MAX_DURATION_SECONDS`], which are the lattice's own two ends, and the
+/// count is then aligned **upward** onto a rung. Because the range is the lattice's, the walk can
+/// never leave it: the largest in-range duration is exactly 345 frames, so no ceiling clamp is
+/// needed and there is no duration in range that silently renders shorter than it asked for
+/// (sc-17152 — see [`MAX_DURATION_SECONDS`] for why 15.0 s is not in range).
 ///
-/// The two bounds are not the same interval, and the difference is worth stating: the lattice's
-/// ceiling is 345 frames = **14.375 s**, so the declared 15 s has no lattice point at or above it —
-/// `align_num_frames(360)` walks to 362, which is 15.083 s and off the top. Erroring there would
-/// refuse a duration the model itself advertises, so the last rung of the lattice is taken instead.
-/// A duration genuinely outside 5–15 s is still an error.
+/// Alignment is upward at both ends, so a caller that asks for 5.1 s gets 124 frames (5.1667 s) and
+/// one that asks for 14.3 s gets 345 (14.375 s) — always at or above the request, never below.
 pub fn align_frames_for_duration(seconds: f32) -> Result<i32> {
     if !seconds.is_finite() {
         return Err(Error::Msg(format!(
@@ -183,15 +246,19 @@ pub fn align_frames_for_duration(seconds: f32) -> Result<i32> {
     if !(MIN_DURATION_SECONDS - 1e-6..=MAX_DURATION_SECONDS + 1e-6).contains(&seconds) {
         return Err(Error::Msg(format!(
             "minimax_h3: duration {seconds} s is outside the model's \
-             {MIN_DURATION_SECONDS}-{MAX_DURATION_SECONDS} s range"
+             {MIN_DURATION_SECONDS}-{MAX_DURATION_SECONDS} s range (the {} legal frame counts \
+             124-345 at {MINIMAX_H3_FPS} fps; the reference pipeline advertises 5-15 s but its own \
+             17n+5 lattice tops out at 14.375 s)",
+            crate::denoise::LEGAL_FRAME_COUNTS.len()
         )));
     }
     let requested = (f64::from(seconds) * MINIMAX_H3_FPS).round() as i32;
     let aligned = align_num_frames(requested.max(1));
-    let ceiling = *crate::denoise::LEGAL_FRAME_COUNTS
-        .last()
-        .expect("the legal frame lattice is non-empty");
-    Ok(aligned.min(ceiling))
+    debug_assert!(
+        crate::denoise::LEGAL_FRAME_COUNTS.contains(&aligned),
+        "an in-range duration must align onto a lattice rung, got {aligned}"
+    );
+    Ok(aligned)
 }
 
 /// Pack `[1, C, T, H, W]` video latents into transformer rows, **frame-major then row-major**.
@@ -674,6 +741,40 @@ mod tests {
         assert!(resolve_geometry(576, 0, 124).is_err());
     }
 
+    /// **The canvas area budget is enforced, not just declared** (sc-17152).
+    ///
+    /// `Capabilities::max_size` caps each edge at 1344 *independently*, so the square 1344×1344 was
+    /// accepted at 1.75× the area the checkpoint generates at — and area is the dominant term in the
+    /// packed sequence length, hence in an attention cost that is quadratic in it.
+    #[test]
+    fn the_canvas_area_budget_is_enforced() {
+        assert_eq!(CANVAS_MAX_PIXELS, 1_032_192);
+        // The declared canvas itself, in both orientations, is exactly at the budget and passes.
+        resolve_geometry(1344, 768, 124).unwrap();
+        resolve_geometry(768, 1344, 124).unwrap();
+
+        // Every edge here is inside `Capabilities::max_size` (1344) and 32-aligned, so nothing else
+        // in the stack refuses them.
+        for (w, h) in [(1344u32, 1344u32), (1344, 1024), (1088, 1088)] {
+            assert!(w <= 1344 && h <= 1344 && w % 32 == 0 && h % 32 == 0);
+            let e = resolve_geometry(w, h, 124).unwrap_err().to_string();
+            assert!(e.contains("canvas budget"), "{w}x{h}: {e}");
+        }
+
+        // The payoff: with the area budget and the lattice ceiling both enforced, the longest packed
+        // sequence any accepted request can build is bounded — 104 030 rows at a 64-token prompt.
+        // Without the area gate, 1344x1344 x 345 frames would build 181 142.
+        let top = resolve_geometry(1344, 768, 345).unwrap();
+        let seq = crate::cost::packed_seq_len(&top.joint, PATCH_SIZE, 64, 0, 2).unwrap();
+        assert_eq!(seq, 104_030);
+        let unbounded = crate::denoise::JointGeometry::new(345, 84, 84).unwrap();
+        assert_eq!(
+            crate::cost::packed_seq_len(&unbounded, PATCH_SIZE, 64, 0, 2).unwrap(),
+            181_142,
+            "the sequence the un-enforced square canvas would have built"
+        );
+    }
+
     /// The smallest legal render is 124 frames / 5.1667 s — the value a gating first-light run uses.
     #[test]
     fn the_smallest_legal_render_is_one_hundred_and_twenty_four_frames() {
@@ -686,20 +787,62 @@ mod tests {
         assert!(resolve_geometry(576, 320, SMALLEST_LEGAL_FRAMES - 17).is_err());
     }
 
-    /// Alignment is opt-in and still bounded by the 5-15 s range.
+    /// **The advertised duration range IS the lattice** (sc-17152), at both ends.
+    ///
+    /// The reference pipeline declares 5–15 s while its own `17n + 5` lattice runs 5.1667–14.375 s,
+    /// so both declared endpoints are unreachable. Deriving the bounds from
+    /// [`LEGAL_FRAME_COUNTS`] makes every in-range duration land on a rung at or above itself, and
+    /// makes both out-of-range endpoints a refusal rather than a silent 0.625 s short delivery.
     #[test]
-    fn alignment_is_opt_in_and_range_checked() {
-        assert_eq!(align_frames_for_duration(5.0).unwrap(), 124);
-        assert_eq!(align_frames_for_duration(5.1667).unwrap(), 124);
-        assert_eq!(align_frames_for_duration(5.3).unwrap(), 141);
-        // The declared 15 s has no lattice point at or above it — 345 frames is 14.375 s and the
-        // next rung is 15.083 s — so the ceiling rung is taken rather than the request refused.
-        assert_eq!(align_frames_for_duration(15.0).unwrap(), 345);
-        assert_eq!(align_frames_for_duration(14.4).unwrap(), 345);
+    fn the_advertised_duration_range_is_the_lattice_at_both_ends() {
+        // Derived, not declared — the two must agree by construction.
+        assert!((f64::from(MIN_DURATION_SECONDS) - 124.0 / 24.0).abs() < 1e-6);
+        assert_eq!(MAX_DURATION_SECONDS, 14.375);
         assert!(
             (f64::from(LEGAL_FRAME_COUNTS[13]) / MINIMAX_H3_FPS - 14.375).abs() < 1e-9,
-            "the lattice ceiling really is short of the declared 15 s"
+            "the lattice ceiling really is short of the reference's declared 15 s"
         );
+
+        // Both declared-but-unreachable endpoints are now refused rather than quietly refit.
+        for (label, seconds) in [
+            ("the reference's declared 5.0 s floor", 5.0f32),
+            ("the reference's declared 15.0 s ceiling", 15.0),
+        ] {
+            let e = align_frames_for_duration(seconds)
+                .expect_err(&format!(
+                    "{label} is not on the lattice and must be refused"
+                ))
+                .to_string();
+            assert!(e.contains("outside the model"), "{label}: {e}");
+        }
+
+        // Every in-range duration aligns UPWARD onto a real rung — never below the request, and
+        // never off the lattice.
+        for (seconds, frames) in [
+            (5.1667f32, 124),
+            (5.3, 141),
+            (8.0, 192),
+            (12.0, 294),
+            (14.3, 345),
+            (14.375, 345),
+        ] {
+            let got = align_frames_for_duration(seconds).unwrap();
+            assert_eq!(got, frames, "{seconds} s");
+            assert!(LEGAL_FRAME_COUNTS.contains(&got));
+            assert!(
+                f64::from(got) / MINIMAX_H3_FPS >= f64::from(seconds) - 1e-4,
+                "{seconds} s aligned DOWN to {got} frames"
+            );
+        }
+        // ...and the aligned count always resolves, i.e. alignment cannot produce a geometry the
+        // gate then rejects.
+        for &frames in &LEGAL_FRAME_COUNTS {
+            let seconds = frames as f32 / MINIMAX_H3_FPS as f32;
+            let aligned = align_frames_for_duration(seconds).unwrap();
+            assert_eq!(aligned, frames);
+            resolve_geometry(576, 320, aligned).unwrap();
+        }
+
         assert!(align_frames_for_duration(0.5).is_err(), "below the floor");
         assert!(align_frames_for_duration(16.0).is_err(), "past the ceiling");
         assert!(align_frames_for_duration(f32::NAN).is_err());
