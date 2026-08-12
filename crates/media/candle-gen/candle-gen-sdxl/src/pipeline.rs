@@ -1294,12 +1294,9 @@ pub(crate) fn tiled_vae_decode(vae: &AutoEncoderKL, unscaled: &Tensor) -> Result
         let cfg = sdxl_tiling_config();
         let (_, _, h, w) = unscaled.dims4()?;
         if cfg.needs_tiling(SDXL_VAE_TILING, 1, h as i32, w as i32) {
-            return tile_blend_decode(
-                unscaled,
-                SDXL_VAE_TILING,
-                &cfg,
-                |tile| Ok(vae.decode(tile)?),
-            );
+            return tile_blend_decode(unscaled, SDXL_VAE_TILING, &cfg, None, |tile| {
+                Ok(vae.decode(tile)?)
+            });
         }
     }
     Ok(vae.decode(unscaled)?)
