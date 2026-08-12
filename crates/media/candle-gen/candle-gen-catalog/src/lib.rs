@@ -1183,19 +1183,17 @@ mod preview_advertising {
             // direct emission call rather than a driver argument.
             register: candle_gen_sensenova::register_providers,
             denoise: Denoise::Bespoke,
-            // sc-16960's inventory: ONE direct emission, in the registered T2I denoise loop that both
-            // ids reach through `T2iModel::generate`. No hooked site anywhere — there is no shared
-            // sampler call in this crate to hook, which is what `Denoise::Bespoke` above declares —
-            // and therefore no dark site either. `preview.rs` gets no row: it carries only the
+            // Two direct emissions live in `t2i.rs`: the registered T2I loop and the registered
+            // reference/MultiReference it2i loop. Both ids reach those routes through
+            // `T2iModel::{generate, it2i_generate}`; neither drives a shared sampler, which is
+            // what `Denoise::Bespoke` above declares. `preview.rs` gets no row: it carries only the
             // measured three-channel pixel-space fit and the pool to the token grid, so it neither
-            // drives a sampler nor emits. The crate's OTHER denoise loop, `it2i_denoise`, is the
-            // off-registry understanding surface (VQA / interleave), is advertised by no descriptor,
-            // and is deliberately unwired — `candle-gen-sensenova/src/preview.rs` pins that it holds
-            // no emission, which is what keeps this count at 1.
+            // drives a sampler nor emits. The understanding/VQA interleave entry point reuses the
+            // same it2i loop rather than adding a third emission site.
             routes: &[FileRoutes {
                 file: "t2i.rs",
                 hooked: 0,
-                direct: 1,
+                direct: 2,
                 dark: &[],
             }],
         },
@@ -3795,6 +3793,8 @@ mod preview_advertising {
 
 #[cfg(test)]
 mod tests {
+    use candle_gen::gen_core::ConditioningKind;
+
     #[test]
     fn every_registered_memory_strategy_rejects_cross_route_decode_geometry() {
         let registry = super::provider_registry().unwrap();
@@ -3837,13 +3837,14 @@ mod tests {
             let capabilities = descriptor(id).capabilities;
             assert!(capabilities.supports_guidance, "{id}");
             assert!(!capabilities.supports_negative_prompt, "{id}");
-            assert!(
-                !capabilities.supports_true_cfg,
-                "{id} has no Candle reference/image-CFG path"
-            );
-            assert!(
-                capabilities.conditioning.is_empty(),
-                "{id} is Candle txt2img only"
+            assert!(capabilities.supports_true_cfg, "{id} image CFG");
+            assert_eq!(
+                capabilities.conditioning,
+                vec![
+                    ConditioningKind::Reference,
+                    ConditioningKind::MultiReference,
+                ],
+                "{id} registered conditioned-image surface"
             );
         }
     }

@@ -113,6 +113,7 @@ pub mod ldm;
 pub mod loaders;
 pub use loaders::{
     load_instantid_unet, load_instantid_unet_with_adapters, load_sdxl_controlnet, load_sdxl_vae,
+    load_sdxl_vae_encoder,
 };
 
 // The SDXL VAE type the loader returns, re-exported so the `candle-gen-instantid` glue can hold one as
@@ -123,7 +124,10 @@ pub use candle_transformers::models::stable_diffusion::vae::AutoEncoderKL;
 // InstantID surface (install_ip_adapter / set_ip_context / forward_instantid via the denoise loop).
 // `sdxl_unet_config` + `UNet2DConditionModelConfig`/`BlockConfig` are re-exported too so the Kolors
 // IP-Adapter provider (sc-5488) can build the same vendored stack from the SDXL-family Kolors UNet.
-pub use unet::{sdxl_unet_config, BlockConfig, UNet2DConditionModel, UNet2DConditionModelConfig};
+pub use unet::{
+    sdxl_unet_config, BlockConfig, UNet2DConditionModel, UNet2DConditionModelConfig,
+    VaeMomentsEncoder,
+};
 
 // SDXL IP-Adapter-Plus reference-image provider (sc-5488, epic 5480) — the [`ip_adapter`] +
 // [`denoise`] stack composed without a face embedder / ControlNet: CLIP ViT-H image tokens → pure-IP
