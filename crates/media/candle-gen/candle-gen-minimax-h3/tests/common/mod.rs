@@ -47,6 +47,78 @@ pub const MLX_RECORD: &str = concat!(
     "/tests/fixtures/mlx_cross_backend.safetensors"
 );
 
+/// The committed **DiT** parity fixture (sc-17155), produced by
+/// `crates/media/mlx-gen/tools/dump_minimax_h3_dit.py` running the official diffusers
+/// `MiniMaxH3Transformer3DModel` — the converted-checkpoint layout production loads.
+///
+/// Carries the pre-conversion `src.` tensors alongside the published ones — the raw per-head
+/// interleaved fused QKV, its reordered `[q_all; k_all; v_all]` form, and the gate-first
+/// `mlp.fc1` — each round-tripped through the OFFICIAL conversion functions in the generator, so
+/// `dit_parity.rs` can assert which transform produced the published bytes rather than trusting a
+/// comment. Its `layout.*` tensors are the reference's own `build_packed_sequence` output, which is
+/// what pins the audio-token position convention.
+///
+/// **Committed byte-identical to the MLX lane's copy**, which `cross_backend.rs` asserts.
+pub const DIT_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/dit_block.safetensors"
+);
+
+/// The committed **joint-denoise** fixture (sc-17155), produced by
+/// `crates/media/mlx-gen/tools/dump_minimax_h3_av_denoise.py` running the official diffusers
+/// `MiniMaxH3Scheduler` — two instances loaded from the *published* `scheduler/` and
+/// `audio_scheduler/` configs, so the 12.0 / 3.0 pair is read from the same bytes production reads
+/// rather than typed twice.
+pub const DENOISE_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/av_denoise.safetensors"
+);
+
+/// The tiny DiT geometry the fixture was dumped at. Mirrors `dump_minimax_h3_dit.py`, and is the
+/// same set of numbers the MLX lane's `dit_fixture_config` uses — the two lanes must agree about
+/// the fixture's shape before either compares a tensor.
+///
+/// Structurally identical to the shipped model where it matters: `rope_freq_dim` 2 still makes the
+/// rotary **partial** (12 of 24 head channels), `inner_dim` (96) is still **wider** than
+/// `hidden_size` (64), and the patch, modality count and modulation-parameter count are the real
+/// ones. Only the widths and depths are shrunk so the weights are committable.
+pub fn dit_fixture_config() -> candle_gen_minimax_h3::MiniMaxH3DitConfig {
+    candle_gen_minimax_h3::MiniMaxH3DitConfig {
+        num_attention_heads: 4,
+        attention_head_dim: 24,
+        hidden_size: 64,
+        num_layers: 2,
+        num_refiner_layers: 2,
+        ffn_dim: 32,
+        text_dim: 40,
+        freq_dim: 16,
+        time_embed_hidden_dim: 64,
+        time_embed_dim: 48,
+        rope_freq_dim: 2,
+        ..candle_gen_minimax_h3::MiniMaxH3DitConfig::default()
+    }
+}
+
+/// The packed-sequence shape the DiT fixture's `layout.*` tensors were built at.
+pub struct DitLayout {
+    pub num_text_tokens: usize,
+    pub num_audio_latents: usize,
+    pub audio_channels: usize,
+    pub num_latent_frames: usize,
+    pub latent_height: usize,
+    pub latent_width: usize,
+}
+
+/// The DiT fixture's layout, mirroring `dump_minimax_h3_dit.py`.
+pub const DIT_LAYOUT: DitLayout = DitLayout {
+    num_text_tokens: 5,
+    num_audio_latents: 3,
+    audio_channels: 2,
+    num_latent_frames: 3,
+    latent_height: 4,
+    latent_width: 6,
+};
+
 // -------------------------------------------------------------------------------------------
 // A hand-rolled safetensors reader
 // -------------------------------------------------------------------------------------------
@@ -165,6 +237,40 @@ impl Golden {
     pub fn tensor(&self, key: &str) -> Tensor {
         Tensor::from_vec(self.f32(key), self.shape(key), &Device::Cpu)
             .unwrap_or_else(|e| panic!("tensor {key}: {e}"))
+    }
+
+    /// `key` as a `[rows, cols]` f32 tensor reshaped to the `[1, rows, cols]` the packed-sequence
+    /// paths take.
+    pub fn batched(&self, key: &str) -> Tensor {
+        let s = self.shape(key);
+        assert_eq!(s.len(), 2, "{key}: expected a [rows, features] tensor");
+        Tensor::from_vec(self.f32(key), (1, s[0], s[1]), &Device::Cpu)
+            .unwrap_or_else(|e| panic!("tensor {key}: {e}"))
+    }
+
+    /// An index tensor the generator stored as float32, as the `u32` candle's `index_select` takes.
+    ///
+    /// The DiT fixture's whole `layout.*` namespace is written as f32 (safetensors from a numpy
+    /// dump), so every index the port consumes has to be narrowed here rather than in the port —
+    /// which is deliberate: the crate's own index tensors are `u32` end to end, and a test that
+    /// silently accepted floats would be exercising a conversion production never performs.
+    pub fn indices(&self, key: &str) -> Tensor {
+        Tensor::from_vec(self.u32_vec(key), (self.shape(key)[0],), &Device::Cpu)
+            .unwrap_or_else(|e| panic!("indices {key}: {e}"))
+    }
+
+    /// The same values as a host slice.
+    pub fn u32_vec(&self, key: &str) -> Vec<u32> {
+        self.f32(key)
+            .into_iter()
+            .map(|v| {
+                assert!(
+                    v >= 0.0 && v.fract() == 0.0,
+                    "{key}: {v} is not a non-negative integer index"
+                );
+                v as u32
+            })
+            .collect()
     }
 
     /// Every tensor whose key does NOT start with one of `drop_prefixes`, as a weight map.
