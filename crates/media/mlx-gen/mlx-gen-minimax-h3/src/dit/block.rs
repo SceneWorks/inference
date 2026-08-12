@@ -39,6 +39,7 @@
 use mlx_rs::ops::{add, multiply};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::nn::silu;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
@@ -87,11 +88,26 @@ impl AdaLnModulation {
 }
 
 /// `adaln_proj`: `time_embed_dim → 6 · MODALITY_NUM · hidden_size`.
-#[derive(Debug, Clone)]
+///
+/// **Tier-aware** (sc-17150). The second of the crate's two packed loaders — see [`crate::quant`]
+/// for why the set is exactly two. At 26_020_915_200 bf16 bytes this is 39.2% of the DiT, so it is
+/// also the single tensor group whose width most moves a tier's hosted size: packing it at the
+/// tier's own width is what makes `q4` 18_779_814_400 B rather than 25_282_624_000 B.
+#[derive(Clone)]
 pub struct AdaLnProjection {
-    weight: Array,
-    bias: Array,
+    linear: AdaptableLinear,
     hidden_size: i32,
+}
+
+/// Logical shape and packed-ness, not the opaque u32 code buffer.
+impl std::fmt::Debug for AdaLnProjection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdaLnProjection")
+            .field("shape", &self.linear.base_shape())
+            .field("quantized", &self.linear.is_quantized())
+            .field("hidden_size", &self.hidden_size)
+            .finish()
+    }
 }
 
 impl AdaLnProjection {
@@ -100,22 +116,31 @@ impl AdaLnProjection {
     ///
     /// Read from the loaded tensor rather than from a config, so that
     /// [`crate::dit::adaln::AdaLnCache`] validates a caller-supplied `temb` against the weights it
-    /// will actually be multiplied by.
+    /// will actually be multiplied by. On a packed tier the logical width is recovered from the
+    /// scales grid (`scales_cols · group_size`), which is exact because every packable DiT width is
+    /// a multiple of [`crate::convert::GROUP_SIZE`].
     pub fn time_embed_dim(&self) -> i32 {
-        self.weight.shape()[1]
+        self.linear.base_shape()[1]
     }
 
     /// Columns emitted per timestep — `6 · MODALITY_NUM · hidden_size`, 96768 shipped.
     pub fn out_features(&self) -> i32 {
-        self.weight.shape()[0]
+        self.linear.base_shape()[0]
     }
 
-    /// Device bytes this projection holds: weight + bias at their loaded dtype.
+    /// Device bytes this projection **actually** holds — the packed triple on a `q4`/`q8` tier, the
+    /// dense weight + bias on `bf16`.
     ///
-    /// The arithmetic the eviction lever is sized on — 50 × (96768·2688 + 96768) × 2 B =
-    /// **26_020_915_200 B (26.02 GB)** at bf16.
+    /// The arithmetic the eviction lever is sized on. At bf16 that is 50 × (96768·2688 + 96768) ×
+    /// 2 B = **26_020_915_200 B (26.02 GB)**; the same 50 projections are ~13.02 GB at q8 and
+    /// ~6.52 GB at q4, so the lever shrinks with the tier rather than staying at its headline value.
     pub fn nbytes(&self) -> usize {
-        self.weight.nbytes() + self.bias.nbytes()
+        crate::quant::nbytes(&self.linear)
+    }
+
+    /// `true` on a `q4` / `q8` tier.
+    pub fn is_quantized(&self) -> bool {
+        self.linear.is_quantized()
     }
 
     fn from_weights(
@@ -124,18 +149,20 @@ impl AdaLnProjection {
         cfg: &MiniMaxH3DitConfig,
         dtype: Dtype,
     ) -> Result<Self> {
-        let weight = w.require(&format!("{prefix}.weight"))?.as_dtype(dtype)?;
-        let bias = w.require(&format!("{prefix}.bias"))?.as_dtype(dtype)?;
-        let want = [cfg.adaln_out_features(), cfg.time_embed_dim];
-        if weight.shape() != want {
+        let mut linear = crate::quant::lin(w, prefix, true)?;
+        // No-op on a packed base, whose compute dtype is fixed by its scales.
+        linear.cast_weights(dtype)?;
+        let want = vec![cfg.adaln_out_features(), cfg.time_embed_dim];
+        // Checked against the LOGICAL shape, so the guard survives the packed tier — a packed
+        // `weight` is `[out, in·bits/32]` u32 and would fail this for a correct artifact.
+        if linear.base_shape() != want {
             return Err(Error::Msg(format!(
                 "minimax-h3 dit {prefix}.weight: expected {want:?}, got {:?}",
-                weight.shape()
+                linear.base_shape()
             )));
         }
         Ok(Self {
-            weight,
-            bias,
+            linear,
             hidden_size: cfg.hidden_size,
         })
     }
@@ -158,8 +185,10 @@ impl AdaLnProjection {
             )));
         }
         let steps = s[0];
-        let activated = silu(temb)?.as_dtype(self.weight.dtype())?;
-        let projected = mlx_gen::nn::linear(&activated, &self.weight, &self.bias)?;
+        // On a packed tier the compute dtype comes from the scales (bf16), not from a dense weight
+        // that no longer exists — see `crate::quant::compute_dtype`.
+        let activated = silu(temb)?.as_dtype(crate::quant::compute_dtype(&self.linear))?;
+        let projected = self.linear.forward(&activated)?;
 
         // `view(-1, 6·hidden)` BEFORE the chunk: modality becomes a row axis, not a column one.
         let rows = steps * MODALITY_NUM;

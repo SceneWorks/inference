@@ -1732,3 +1732,71 @@ expected_files = [
 # `tests/memory_ladder_real_weights.rs`. A lane dispatching a test file that does not exist is worse
 # than no lane, so this stays exempt until the harness lands with it. See the follow-up on sc-15528.
 unwired_reason = "sc-15528 landed the Bernini ladder mechanism; the real-weight harness and its lane are the tracked follow-up, and a lane with no test to run would be vacuously green"
+
+# ── MiniMax-H3 DiT tiers (sc-17150) ─────────────────────────────────────────────────────────────
+# `SceneWorks/minimax-h3-mlx` hosts ONLY the tiered DiT. The text encoder, both VAEs and the
+# tokenizer are dense in every tier and shared as a co-requisite, sourced from upstream
+# `MiniMaxAI/MiniMax-H3` (activity 18712 on sc-17150 — 0 GB rehosted, provenance stays
+# hash-verifiable). So a tier here is two components, `transformer/` and `transformer_ref/`, and
+# nothing else; do not add TE/VAE rows expecting them in this repository.
+#
+# Keyed **per tier**, the `flux2-dev-mlx-*` shape (sc-18213): the three tiers together are 240.7 GB
+# and each is provisioned independently, so one key whose `expected_files` demanded every sibling
+# would put 240.7 GB on disk before any single tier could be verified.
+#
+# Each tier lists only `config.json` + the safetensors index per component — FOUR entries covering
+# 32 files. `verify_model_snapshot.py` parses any `*.index.json` in `expected_files` and checks every
+# shard its `weight_map` references, resolved against the index's own directory. `convert.rs` writes
+# that index per tier for exactly this reason; without it a tier would need fourteen hand-maintained
+# shard names per component and would silently stop covering a re-shard.
+
+[[models]]
+key = "minimax-h3-mlx-bf16"
+repository = "SceneWorks/minimax-h3-mlx"
+revision = "f22bc294f46894584645aec59a513ee411450c96"
+license = "MiniMax H3 Community License Agreement"
+size_class = "very-large"
+profiles = ["media-macos"]
+environment = ["MINIMAX_H3_DIT"]
+unwired_reason = "no CI lane dispatches any MiniMax-H3 harness yet — the family's real-weight tests are all operator-run on this Mac (the ~196 GB upstream snapshot is not on a runner), and sc-17150's per-tier render harness tests/quant_tiers_real.rs is dispatched by hand; wiring a lane is sc-17153's fit-gate work"
+download_files = ["bf16/*"]
+expected_files = [
+  "bf16/transformer/config.json",
+  "bf16/transformer/diffusion_pytorch_model.safetensors.index.json",
+  "bf16/transformer_ref/config.json",
+  "bf16/transformer_ref/diffusion_pytorch_model.safetensors.index.json",
+]
+
+[[models]]
+key = "minimax-h3-mlx-q8"
+repository = "SceneWorks/minimax-h3-mlx"
+revision = "f22bc294f46894584645aec59a513ee411450c96"
+license = "MiniMax H3 Community License Agreement"
+size_class = "very-large"
+profiles = ["media-macos"]
+environment = ["MINIMAX_H3_DIT"]
+unwired_reason = "no CI lane dispatches any MiniMax-H3 harness yet — see minimax-h3-mlx-bf16"
+download_files = ["q8/*"]
+expected_files = [
+  "q8/transformer/config.json",
+  "q8/transformer/diffusion_pytorch_model.safetensors.index.json",
+  "q8/transformer_ref/config.json",
+  "q8/transformer_ref/diffusion_pytorch_model.safetensors.index.json",
+]
+
+[[models]]
+key = "minimax-h3-mlx-q4"
+repository = "SceneWorks/minimax-h3-mlx"
+revision = "f22bc294f46894584645aec59a513ee411450c96"
+license = "MiniMax H3 Community License Agreement"
+size_class = "very-large"
+profiles = ["media-macos"]
+environment = ["MINIMAX_H3_DIT"]
+unwired_reason = "no CI lane dispatches any MiniMax-H3 harness yet — see minimax-h3-mlx-bf16"
+download_files = ["q4/*"]
+expected_files = [
+  "q4/transformer/config.json",
+  "q4/transformer/diffusion_pytorch_model.safetensors.index.json",
+  "q4/transformer_ref/config.json",
+  "q4/transformer_ref/diffusion_pytorch_model.safetensors.index.json",
+]
