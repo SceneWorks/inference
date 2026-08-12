@@ -46,6 +46,18 @@
 //! one changed file, get their ids assigned positionally at load time, and land on **untrained**
 //! embedding rows.
 //!
+//! ## DiT block stack (sc-17144)
+//!
+//! - [`dit`] carries the 50-layer **single-stream** transformer block, its AdaLN modulation, the
+//!   2-layer text token refiner and the 3-axis **MM-RoPE** — including the `(t, h, w)` coordinate
+//!   conventions each modality carries, of which the audio one (no height; pinned to the two
+//!   extremes of the video's width grid; channel-major on the video clock) is the highest-risk
+//!   detail in the port.
+//!
+//! Video, audio and text tokens share **one** stack and one attention document; there is no
+//! cross-attention anywhere in MiniMax-H3. The attention inner width (7168) is *wider* than the
+//! residual stream (5376), and only 96 of each head's 128 channels rotate.
+//!
 //! ## Read [`layout`] before porting anything else in this family
 //!
 //! MiniMax publishes the checkpoint in the **converted diffusers layout**, and that conversion
@@ -56,9 +68,10 @@
 //! decoder past a fully green parity suite. **The DiT (sc-17144) carries the same FFN swap plus a
 //! grouped-QKV reorder**, and the candle twins (sc-17154 / sc-17155) inherit both.
 //!
-//! Not in this crate yet: either CNN encoder, the DiT (sc-17144) and the pipeline
-//! (sc-17146/17147). Nothing is registered with `mlx-gen-catalog` — there is no generator to ship
-//! until the pipeline lands.
+//! Not in this crate yet: either CNN encoder, the DiT's AdaLN precompute/evict (sc-17145), the
+//! joint denoise loop and packed-sequence assembly (sc-17146), the pipeline and the DiT's
+//! input/output projections (sc-17147), and Ref2VA's `transformer_ref` (sc-17149). Nothing is
+//! registered with `mlx-gen-catalog` — there is no generator to ship until the pipeline lands.
 
 pub mod alias_free;
 pub mod audio_config;
@@ -67,6 +80,7 @@ pub mod blocks;
 pub mod chunking;
 pub mod config;
 pub mod decoder;
+pub mod dit;
 pub mod layout;
 pub mod rope;
 pub mod tensor;
@@ -87,6 +101,10 @@ pub use config::{
     LATENTS_STD, LATENT_CHANNELS, TOKEN_DROP, VAE_RATIO, VAE_RATIO_T,
 };
 pub use decoder::ViT3dDecoder;
+pub use dit::{
+    AdaLnModulation, AdaLnProjection, DitBlock, MiniMaxH3DitConfig, MmRope, MmRopeTables,
+    TokenRefiner, TokenRefinerBlock, MODALITY_NUM,
+};
 pub use layout::{
     split_gate_value, GatedFfnLayout, AUDIO_VAE_IS_UNCONVERTED, PUBLISHED_GATED_FFN_LAYOUT,
 };
