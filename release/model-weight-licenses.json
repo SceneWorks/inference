@@ -355,6 +355,49 @@
       ]
     },
     {
+      "id": "minimax-h3-community",
+      "spdx_id": "LicenseRef-MiniMax-H3-Community",
+      "name": "MiniMax H3 Community License Agreement",
+      "text_url": "https://huggingface.co/MiniMaxAI/MiniMax-H3/raw/main/LICENSE",
+      "terms": [
+        {
+          "term": "revenue_ceiling",
+          "amount_usd": 20000000,
+          "boundary": "exclusive"
+        },
+        {
+          "term": "registration_required",
+          "contact": "api@minimax.io"
+        },
+        {
+          "term": "downstream_restrictions",
+          "family": "minimax-h3-community"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "minimax-h3-community"
+        },
+        {
+          "term": "attribution_required"
+        },
+        {
+          "term": "notice_file_required"
+        },
+        {
+          "term": "deployer_obligation",
+          "text": "You may not use, reproduce, modify, distribute, or display the MiniMax H3 Works or any of their Outputs or results outside the Applicable Territory (worldwide EXCLUDING the European Union, the United Kingdom, the Republic of Korea and the United States of America)"
+        },
+        {
+          "term": "deployer_obligation",
+          "text": "you must implement, maintain, test, and periodically review reasonable and proportionate technical and organizational safeguards designed to prevent and mitigate access, uses, and Outputs that violate this Section V or Exhibit A"
+        },
+        {
+          "term": "acceptable_use_policy",
+          "url": null
+        }
+      ]
+    },
+    {
       "id": "mit",
       "spdx_id": "MIT",
       "name": "MIT License",
