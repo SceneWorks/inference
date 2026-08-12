@@ -17,7 +17,7 @@ read the surface programmatically at runtime, call `catalog().snapshot()` (see t
 
 | Kind                | `runtime-macos` (MLX) | `runtime-cuda` / `runtime-cpu` (Candle) |
 | ------------------- | --------------------: | --------------------------------------: |
-| Generators          |                    57 |                                      43 |
+| Generators          |                    58 |                                      43 |
 | Trainers            |                    14 |                                       6 |
 | Transforms          |                     0 |                                       0 |
 | Captioners          |                     1 |                                       1 |
@@ -82,6 +82,7 @@ Grouped by provider family. `✓` = shipped on that platform; `—` = not shippe
 | | `lens` | ✓ | ✓ |
 | **ltx** (video + audio) | `ltx_2_3` | ✓ | — |
 | | `ltx_2_3_distilled` | — | ✓ |
+| **minimax-h3** (video + audio) | `minimax_h3` | ✓ | — |
 | **pulid** (identity, FLUX) | `pulid_flux` | ✓ | — · *(bespoke — see below)* |
 | **qwen-image** (Qwen-Image) | `qwen_image` | ✓ | ✓ |
 | | `qwen_image_control` | ✓ | — |
