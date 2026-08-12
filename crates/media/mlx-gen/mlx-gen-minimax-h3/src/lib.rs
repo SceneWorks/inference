@@ -141,6 +141,7 @@ pub mod blocks;
 pub mod chunking;
 pub mod conditioning;
 pub mod config;
+pub mod cost;
 pub mod decoder;
 pub mod denoise;
 pub mod dit;
@@ -171,6 +172,10 @@ pub use config::{
     MiniMaxH3VaeConfig, CLIP_LENGTH, DECODER_HEAD_DIM, DECODER_NUM_HEADS, DECODER_NUM_LAYERS,
     DECODER_NUM_REGISTER_TOKENS, DECODER_ROPE_DIM_RATIO, DECODER_ROPE_THETA, LATENTS_MEAN,
     LATENTS_STD, LATENT_CHANNELS, TOKEN_DROP, VAE_RATIO, VAE_RATIO_T,
+};
+pub use cost::{
+    largest_writable_frame_count, packed_seq_len, rows_per_latent_frame, writable_duration_seconds,
+    DitSequenceCost, MAX_WRITABLE_ELEMS,
 };
 pub use decoder::ViT3dDecoder;
 pub use denoise::{
