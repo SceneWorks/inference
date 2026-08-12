@@ -127,8 +127,20 @@ fn vit_decoder_matches_the_reference() {
         .forward(f.require("in.vit.latent").unwrap())
         .unwrap();
     let want = f.require("out.vit.video").unwrap();
-    // 5 latent frames × 4, 3×2 spatial × 2 -> [1, 3, 20, 6, 8].
-    assert_eq!(got.shape(), &[1, 3, 20, 6, 8]);
+    // 5 latent frames × patch_size_t, a 3×4 latent × patch_size spatially. Derived from the
+    // config rather than restated, so a fixture-geometry change shows up as a parity failure
+    // rather than as a shape literal nobody updated.
+    let cfg = fixture_config(3);
+    assert_eq!(
+        got.shape(),
+        &[
+            1,
+            3,
+            5 * cfg.patch_size_t,
+            3 * cfg.patch_size,
+            4 * cfg.patch_size
+        ]
+    );
     assert_parity(&got, want, TOL, "ViT3DDecoder");
 }
 
@@ -158,6 +170,7 @@ fn decode_clip_matches_the_reference() {
 #[test]
 fn temporal_decode_matches_the_reference() {
     let f = fixture();
+    let cfg = fixture_config(3);
     let vae = vae(3);
     for (tokens, frames) in [(5, 17), (7, 22), (9, 30), (12, 39), (17, 56)] {
         let latent = f.require(&format!("in.temporal{tokens}.latent")).unwrap();
@@ -165,7 +178,7 @@ fn temporal_decode_matches_the_reference() {
         let got = vae.decode(latent).unwrap();
         assert_eq!(
             got.shape(),
-            &[1, 3, frames, 6, 8],
+            &[1, 3, frames, 3 * cfg.patch_size, 4 * cfg.patch_size],
             "{tokens} tokens should decode to {frames} frames"
         );
         assert_parity(&got, want, TOL, &format!("decode_temporal({tokens})"));
@@ -177,6 +190,7 @@ fn temporal_decode_matches_the_reference() {
 #[test]
 fn token_drop_zero_two_pass_matches_the_reference() {
     let f = fixture();
+    let cfg = fixture_config(0);
     let vae = vae(0);
     assert_eq!(vae.geometry().token_overlap, 0);
     assert_eq!(vae.geometry().frame_overlap, 0);
@@ -189,7 +203,10 @@ fn token_drop_zero_two_pass_matches_the_reference() {
             .require(&format!("out.drop0_temporal{tokens}.video"))
             .unwrap();
         let got = vae.decode(latent).unwrap();
-        assert_eq!(got.shape(), &[1, 3, frames, 6, 8]);
+        assert_eq!(
+            got.shape(),
+            &[1, 3, frames, 3 * cfg.patch_size, 4 * cfg.patch_size]
+        );
         assert_parity(&got, want, TOL, &format!("drop0 decode_temporal({tokens})"));
     }
 }

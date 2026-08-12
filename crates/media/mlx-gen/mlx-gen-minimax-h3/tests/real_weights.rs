@@ -33,11 +33,12 @@ use common::{snapshot, std_dev};
 
 /// Total tensors in the published `vae/` component.
 const PUBLISHED_VAE_TENSORS: usize = 703;
-/// Of those, the encode half this crate does not port: 116 encoder + 2 `quant_conv`.
+/// Of those, the encode half: 116 `encoder.*` + 2 `quant_conv.*`. Unported until sc-17148, which
+/// `fl2va` forced — a keyframe is conditioned through the VAE as well as the vision tower.
 const ENCODE_HALF_TENSORS: usize = 118;
 
-/// The declared decode-path key set must be EXACTLY the published checkpoint's, minus the encode
-/// half. Reads only the shard index, so it costs no weight I/O.
+/// The declared key set must be EXACTLY the published checkpoint's — **both halves**, since
+/// sc-17148. Reads only the shard index, so it costs no weight I/O.
 ///
 /// This is the exhaustive-mapping proof against the real model rather than against the tiny
 /// fixture: a tensor the loader never reads would decode to something plausible but wrong.
@@ -78,22 +79,29 @@ fn declared_tensor_names_match_the_published_checkpoint() {
         "loader requires tensors the checkpoint does not have: {missing:?}"
     );
 
-    let unconsumed: Vec<&String> = published
-        .difference(&declared)
-        .filter(|k| !k.starts_with("encoder.") && !k.starts_with("quant_conv."))
-        .collect();
+    let unconsumed: Vec<&String> = published.difference(&declared).collect();
     assert!(
         unconsumed.is_empty(),
-        "checkpoint tensors outside the encode half that the decode path never reads: \
-         {unconsumed:?}"
+        "published tensors the loader never reads: {unconsumed:?}"
     );
 
-    assert_eq!(declared.len(), PUBLISHED_VAE_TENSORS - ENCODE_HALF_TENSORS);
+    // The mapping is now the WHOLE file, not the decode half with a documented omission.
+    assert_eq!(declared.len(), PUBLISHED_VAE_TENSORS);
+    let encode_half: Vec<&String> = declared
+        .iter()
+        .filter(|k| k.starts_with("encoder.") || k.starts_with("quant_conv."))
+        .collect();
+    assert_eq!(
+        encode_half.len(),
+        ENCODE_HALF_TENSORS,
+        "the encode half must be exactly the 118 keys the published index carries"
+    );
     println!(
-        "declared {} decode tensors; {} published; {} encode-half deliberately unported",
+        "declared {} tensors ({} decode + {} encode); {} published",
         declared.len(),
-        published.len(),
-        ENCODE_HALF_TENSORS
+        declared.len() - ENCODE_HALF_TENSORS,
+        ENCODE_HALF_TENSORS,
+        published.len()
     );
 }
 

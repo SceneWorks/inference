@@ -85,10 +85,33 @@ TOKEN_DROP = 3
 
 # Tiny geometry. The downsample factor cumprods give vae_ratio 2 / vae_ratio_t 4; the latter is the
 # production value, which is what makes the chunk arithmetic identical to the real model.
-CH = 32  # the CNN encoder's group norms are hardcoded to 32 groups
-BLOCK_OUT_CHANNELS = (CH, CH, CH, CH)
+# The encoder geometry is chosen (sc-17148), not inherited. Three constraints:
+#
+#  * `SPATIAL_DOWN` / `TIME_DOWN` must still cumprod to vae_ratio 2 / vae_ratio_t 4, the latter
+#    being the production value that makes the chunk arithmetic identical to the real model.
+#  * EVERY level that carries a downsampler must have `spatial_stride == 2`. A downsampler is
+#    built whenever `temporal · spatial > 1`, and one with `spatial_stride == 1` still convolves a
+#    3-wide kernel with NO spatial padding — so it CROPS two columns instead of halving. The
+#    shipped config never does this (all four of its downsamplers are spatial-2), but the previous
+#    fixture geometry `TIME_DOWN=(1,2,2,1)` did, twice: 24px encoded to 8 latent rather than 12.
+#    That breaks spatial tiling outright, because the stitch assumes latent = pixel / ratio.
+#    Concentrating all the temporal reduction on the one spatial-2 level is the only 4-level
+#    arrangement satisfying both cumprods with no cropping.
+#  * The widths must CHANGE somewhere, or `conv_shortcut` is never built and the residual
+#    projection goes ungated. (16, 16, 32, 32) puts one at level 2.
+#  * Every width must stay a multiple of 32: the ORIGINAL MiniMax module hardcodes
+#    `num_groups=32` in `norm.py::get_group_norm_3d`, so a narrower fixture cannot even
+#    construct the reference the conversion is cross-checked against. It also asserts
+#    `time_stride in [1, 2]`, so the temporal reduction CANNOT be concentrated on one level.
+#
+# Those two together force the arrangement below: vae_ratio_t 4 needs two time-stride-2 levels,
+# and each of them must also be spatial-stride-2, so the spatial cumprod is 4 rather than the
+# previous 2. `fixture_config` in tests/common tracks it.
+CH = 32
+NORM_NUM_GROUPS = CH
+BLOCK_OUT_CHANNELS = (CH, CH, CH, 2 * CH)
 LAYERS_PER_BLOCK = 1
-SPATIAL_DOWN = (2, 1, 1, 1)
+SPATIAL_DOWN = (1, 2, 2, 1)
 TIME_DOWN = (1, 2, 2, 1)
 Z_CHANNELS = 24
 HEADS = 2
@@ -197,7 +220,7 @@ def build_diffusers(token_drop: int):
         layers_per_block=LAYERS_PER_BLOCK,
         spatial_downsample_factors=SPATIAL_DOWN,
         temporal_downsample_factors=TIME_DOWN,
-        norm_num_groups=32,
+        norm_num_groups=NORM_NUM_GROUPS,
         spatial_padding_mode="reflect",
         decoder_num_layers=NUM_LAYERS,
         decoder_num_attention_heads=HEADS,
@@ -217,14 +240,16 @@ def build_diffusers(token_drop: int):
 
 
 def randomize(model, generator):
-    """Re-randomize every decoder parameter.
+    """Re-randomize every decoder AND encoder parameter (sc-17148 added the encode half).
 
     Both implementations initialize `scale1`/`scale2` to zeros, which would collapse each block to
     an identity map and make the golden pass against a port with no attention and no feed-forward.
     """
     with torch.no_grad():
         for name, param in model.named_parameters():
-            if not (name.startswith("decoder.") or name.startswith("post_quant_conv.")):
+            if not name.startswith(
+                ("decoder.", "post_quant_conv.", "encoder.", "quant_conv.")
+            ):
                 continue
             param.copy_(torch.randn(param.shape, generator=generator, dtype=torch.float32) * 0.35)
 
@@ -334,7 +359,7 @@ def main() -> None:
     # The published weights, straight out of the official class — this IS the converted layout.
     diffusers_sd = {k: v.detach().to(torch.float32) for k, v in model.state_dict().items()}
     for key, tensor in diffusers_sd.items():
-        if key.startswith("decoder.") or key.startswith("post_quant_conv."):
+        if key.startswith(("decoder.", "post_quant_conv.", "encoder.", "quant_conv.")):
             out[key] = tensor.numpy().copy()
 
     # ---- CHECK the conversion by running the reference on inverse-converted weights ---------
@@ -431,6 +456,94 @@ def main() -> None:
         out[f"in.temporal{n_tokens}.latent"] = np32(z)
         out[f"out.temporal{n_tokens}.video"] = np32(dec)
 
+    # ---- (e) the CNN ENCODER half (sc-17148) ------------------------------------------------
+    # `fl2va` conditions a keyframe through the VAE as well as the vision tower, so the encode half
+    # needs its own goldens. Four separate paths, because they diverge on the two axes that matter:
+    # tiled vs untiled, and the T == 1 keyframe short circuit vs the chunked video path.
+    #
+    # ENC_TILE / ENC_OVERLAP are DELIBERATELY smaller than the shipped 256/64. A fixture canvas
+    # large enough to tile at production tile size would not be committable, and an inert tiling
+    # golden proves nothing — so the tile geometry is shrunk to exercise the SAME code path at
+    # fixture scale. The Rust side takes the same two numbers as parameters for exactly this.
+    ENC_TILE, ENC_OVERLAP = 16, 4
+    ENC_H = ENC_W = 24
+
+    with torch.no_grad():
+        # (e1) the bare encoder stack, untiled: conv_in -> down_blocks -> norm_out -> conv_out.
+        #      T = 5 > 1 so the frame-isolated GroupNorm and the temporal strides are both live;
+        #      at T = 1 a plain 3-D GroupNorm is indistinguishable from the isolated one.
+        enc_in = torch.randn(1, 3, 5, ENC_H, ENC_W, generator=generator)
+        enc_out = model.encoder(enc_in)
+    out["in.encoder.pixels"] = np32(enc_in)
+    out["out.encoder.params"] = np32(enc_out)
+    assert enc_out.shape[2] > 1, "the encoder golden must keep a temporal axis"
+
+    with torch.no_grad():
+        # (e2) `_encode_clip` UNTILED — encoder then quant_conv.
+        model.disable_tiling()
+        clip_in = torch.randn(1, 3, 5, ENC_H, ENC_W, generator=generator)
+        clip_out = model._encode_clip(clip_in)
+    out["in.encode_clip.pixels"] = np32(clip_in)
+    out["out.encode_clip.params"] = np32(clip_out)
+
+    with torch.no_grad():
+        # (e3) `_encode_clip` TILED, at the shrunk tile geometry.
+        model.enable_tiling(
+            tile_sample_min_height=ENC_TILE,
+            tile_sample_min_width=ENC_TILE,
+            tile_sample_min_overlap_height=ENC_OVERLAP,
+            tile_sample_min_overlap_width=ENC_OVERLAP,
+        )
+        assert model.use_tiling
+        tiled_out = model._encode_clip(clip_in)
+    out["out.encode_clip_tiled.params"] = np32(tiled_out)
+    tile_enc_delta = float((tiled_out - clip_out).abs().max() / clip_out.abs().max())
+    assert tiled_out.shape == clip_out.shape, (
+        f"tiled {list(tiled_out.shape)} != untiled {list(clip_out.shape)}; the encoder is CROPPING "
+        "rather than halving, so the stitch's latent = pixel / ratio assumption does not hold"
+    )
+    # The whole point of the tiled golden: it must DIFFER from the untiled one, or it is not
+    # gating the blend at all. (The decode fixture asserts the opposite — that tiling is inert
+    # there — which is why the two cannot share one probe.)
+    assert tile_enc_delta > 1e-2, (
+        f"tiled and untiled encode agree to {tile_enc_delta:.3e}; this fixture cannot gate the "
+        "tile blend"
+    )
+    y_idx, y_len, y_ovl = model._split_tiles(ENC_H, ENC_TILE, ENC_OVERLAP)
+    assert len(y_idx) > 1, "the tiled encode golden must actually span more than one tile"
+    out["const.encode_tile"] = np.array([ENC_TILE, ENC_OVERLAP], dtype=np.int32)
+    print(
+        f"  encode tiling: {len(y_idx)} tiles starts={y_idx} overlaps={y_ovl}; "
+        f"tiled vs untiled rel {tile_enc_delta:.3e}"
+    )
+
+    with torch.no_grad():
+        # (e4) THE KEYFRAME PATH: a single frame. `_encode` short-circuits on num_frames == 1 —
+        #      no clip padding, no chunking, no token_drop — and returns exactly ONE latent frame.
+        model.disable_tiling()
+        kf_in = torch.randn(1, 3, 1, ENC_H, ENC_W, generator=generator)
+        kf_posterior = model.encode(kf_in, return_dict=False)[0]
+        kf_mean, kf_logvar = torch.chunk(kf_posterior.parameters, 2, dim=1)
+    assert kf_mean.shape[2] == 1, f"a keyframe must encode to ONE latent frame, got {kf_mean.shape}"
+    out["in.encode_single.pixels"] = np32(kf_in)
+    out["out.encode_single.mean"] = np32(kf_mean)
+    out["out.encode_single.std"] = np32(torch.exp(0.5 * kf_logvar.clamp(-30.0, 20.0)))
+
+    with torch.no_grad():
+        # (e5) the CHUNKED video path: 17 frames = exactly one clip, then token_drop trims the
+        #      tail. This is the path the keyframe short circuit deliberately avoids, kept so the
+        #      two are gated against each other rather than only one being exercised.
+        vid_in = torch.randn(1, 3, CLIP_LENGTH, ENC_H, ENC_W, generator=generator)
+        vid_posterior = model.encode(vid_in, return_dict=False)[0]
+        vid_mean = torch.chunk(vid_posterior.parameters, 2, dim=1)[0]
+    out["in.encode_chunked.pixels"] = np32(vid_in)
+    out["out.encode_chunked.mean"] = np32(vid_mean)
+    print(
+        f"  encode: 1 frame -> {list(kf_mean.shape)}; "
+        f"{CLIP_LENGTH} frames -> {list(vid_mean.shape)}"
+    )
+    model.enable_tiling()
+
     # ---- token_drop = 0 (the two-pass alignment path: no overlap, single split) ------------
     model0 = build_diffusers(0)
     model0.disable_tiling()
@@ -471,7 +584,9 @@ def main() -> None:
         "gated_ffn_layout": "value_first",
         "conversion_cross_check_rel": f"{cross:.6e}",
         "ffn_half_swap_rel": f"{swap_rel:.6e}",
-        "story": "sc-17140, corrected by sc-18740",
+        "encode_tile_blend_rel": f"{tile_enc_delta:.6e}",
+        "halves": "decode+encode",
+        "story": "sc-17140, corrected by sc-18740, encode half added by sc-17148",
     }
 
     path = fixture("mlx-gen-minimax-h3/tests/fixtures/video_vae_decode.safetensors")

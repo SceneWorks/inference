@@ -52,6 +52,8 @@ use tokenizers::{AddedToken, Tokenizer};
 
 use mlx_gen::{Error, Result};
 
+use crate::denoise::packing::{TEXT_TAG, VIDEO_TAG};
+
 /// The seven specials MiniMax adds over upstream Qwen, in the exact order they appear in
 /// `tokenizer_config.json`'s `additional_special_tokens`. **Order is the id assignment**, so this
 /// list is not merely a set.
@@ -284,6 +286,81 @@ impl MiniMaxH3Tokenizer {
         num_image_tokens: &[usize],
     ) -> Result<(Array, Array)> {
         Self::to_arrays(self.encode(&Self::render_with_images(prompt, num_image_tokens))?)
+    }
+
+    /// Resolve one special token's id from the loaded vocabulary.
+    ///
+    /// Read rather than hardcoded, for the same reason [`SpecialTokens::derive`] exists:
+    /// `tokenizer_config.json` is the only file MiniMax changed from upstream Qwen3-VL, so an id
+    /// written as a literal here is an id nothing checks.
+    pub fn special_id(&self, token: &str) -> Result<i32> {
+        self.inner
+            .token_to_id(token)
+            .map(|id| id as i32)
+            .ok_or_else(|| {
+                Error::Msg(format!(
+                    "minimax-h3 tokenizer: `{token}` is not in the vocabulary"
+                ))
+            })
+    }
+
+    /// The `fl2va` presentation **with its per-row modality tags** —
+    /// `(input_ids, attention_mask, token_tags)`.
+    ///
+    /// # Why the tags cannot be recovered afterwards
+    ///
+    /// A vision block's rows are tagged **video** ([`VIDEO_TAG`], 0) rather than text, and that is
+    /// what the DiT's AdaLN modulation keys off: a vision row addresses a different block of the
+    /// modulation table from a text row at the same timestep. The `"<Picture i>: "` label wrapped
+    /// around it stays **text**.
+    ///
+    /// Deriving that split from a finished id vector would mean re-locating each block by scanning
+    /// for pad ids, so this builds the presentation the way the reference does — ids and tags in
+    /// lockstep — and `the_tagged_and_untagged_presentations_agree` asserts the ids come out
+    /// identical to [`Self::encode_with_images`]'s single-string path.
+    ///
+    /// `<|image_pad|>` is the pad `fl2va` uses. `<|video_pad|>` belongs to `ref2va` (sc-17149) and
+    /// appears nowhere on this path.
+    pub fn encode_fl2va(
+        &self,
+        prompt: &str,
+        num_image_tokens: &[usize],
+    ) -> Result<(Array, Array, Vec<i32>)> {
+        let (start, pad, end) = (
+            self.special_id(VISION_START)?,
+            self.special_id(IMAGE_PAD)?,
+            self.special_id(VISION_END)?,
+        );
+        let mut ids: Vec<i32> = Vec::new();
+        let mut tags: Vec<i32> = Vec::new();
+        for (i, &n) in num_image_tokens.iter().enumerate() {
+            if n == 0 {
+                return Err(Error::Msg(format!(
+                    "minimax-h3 tokenizer: keyframe {i} contributes no vision tokens"
+                )));
+            }
+            let label = self.encode(&format!("<Picture {}>: ", i + 1))?;
+            tags.extend(std::iter::repeat_n(TEXT_TAG, label.len()));
+            ids.extend(label);
+            // `<|vision_start|>`, every pad, and `<|vision_end|>` are ALL video rows.
+            ids.push(start);
+            ids.extend(std::iter::repeat_n(pad, n));
+            ids.push(end);
+            tags.extend(std::iter::repeat_n(VIDEO_TAG, n + 2));
+        }
+        let prompt_ids = self.encode(prompt)?;
+        tags.extend(std::iter::repeat_n(TEXT_TAG, prompt_ids.len()));
+        ids.extend(prompt_ids);
+
+        if ids.len() != tags.len() {
+            return Err(Error::Msg(format!(
+                "minimax-h3 tokenizer: {} ids against {} tags",
+                ids.len(),
+                tags.len()
+            )));
+        }
+        let (input_ids, mask) = Self::to_arrays(ids)?;
+        Ok((input_ids, mask, tags))
     }
 
     fn to_arrays(ids: Vec<i32>) -> Result<(Array, Array)> {

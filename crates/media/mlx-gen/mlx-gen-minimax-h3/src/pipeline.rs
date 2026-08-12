@@ -548,6 +548,87 @@ pub fn t2va_layout(
     )
 }
 
+/// Build the packed layout for an `fl2va` request — keyframe anchors, and **per-row** text tags.
+///
+/// The two differences from [`t2va_layout`] are not cosmetic:
+///
+/// * `text_token_tags` is supplied per row rather than filled with [`crate::denoise::TEXT_TAG`],
+///   because a keyframe's vision-block rows are tagged **video** and therefore address a different
+///   block of the AdaLN modulation table;
+/// * `anchors` reserves the conditioning rows that lead the video stream, at their own rotary
+///   times and their own row class.
+///
+/// `t2va` is `fl2va` with empty `anchors` **at the layout level only**. It is not the same path at
+/// the block level: the reference selects a different text-encoder step, a different latent prep
+/// and a different core denoise step on the presence of a keyframe, and this crate mirrors that
+/// split rather than pretending one is a special case of the other.
+pub fn fl2va_layout(
+    geometry: &RequestGeometry,
+    text_token_tags: &[i32],
+    anchors: &[crate::dit::positions::KeyframeAnchor],
+    patch: [i32; 3],
+) -> Result<PackedLayout> {
+    if text_token_tags.is_empty() {
+        return Err(Error::Msg(
+            "minimax_h3: the packed sequence needs at least one text row".into(),
+        ));
+    }
+    PackedLayout::build(
+        geometry.joint,
+        patch,
+        text_token_tags,
+        i32::from(AUDIO_OUTPUT_CHANNELS),
+        anchors,
+    )
+}
+
+/// Prepend a request's conditioning rows to its freshly-drawn video rows.
+///
+/// `MiniMaxH3FL2VAPrepareLatentsStep` in one line: the anchors **lead** the video row stream, and
+/// the scheduler then writes only the tail ([`PackedLayout::generated_video_rows`]), which is how
+/// they ride through every step untouched.
+///
+/// Checked against the layout rather than trusted, because a conditioning block of the wrong
+/// height still concatenates cleanly and produces a runnable — and silently misaligned — sequence.
+pub fn prepend_condition_rows(
+    layout: &PackedLayout,
+    condition_rows: Option<&Array>,
+    video_rows: &Array,
+) -> Result<Array> {
+    let expected = layout.num_condition_video_rows();
+    let Some(rows) = condition_rows else {
+        if expected != 0 {
+            return Err(Error::Msg(format!(
+                "minimax_h3: the layout reserves {expected} conditioning rows but none were \
+                 supplied"
+            )));
+        }
+        return Ok(video_rows.clone());
+    };
+    let (rs, vs) = (rows.shape(), video_rows.shape());
+    if rs.len() != 3 || rs[0] != 1 || vs.len() != 3 || vs[0] != 1 {
+        return Err(Error::Msg(format!(
+            "minimax_h3: expected [1, rows, features] blocks, got {rs:?} and {vs:?}"
+        )));
+    }
+    let got = rs[1];
+    if got != expected {
+        return Err(Error::Msg(format!(
+            "minimax_h3: {got} conditioning rows against a layout reserving {expected}"
+        )));
+    }
+    if rs[2] != vs[2] {
+        return Err(Error::Msg(format!(
+            "minimax_h3: conditioning rows are {} wide, video rows {}",
+            rs[2], vs[2]
+        )));
+    }
+    Ok(mlx_rs::ops::concatenate_axis(
+        &[rows.clone(), video_rows.clone()],
+        1,
+    )?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

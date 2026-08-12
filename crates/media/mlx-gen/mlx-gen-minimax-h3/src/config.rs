@@ -47,6 +47,22 @@ pub const DECODER_ROPE_DIM_RATIO: f32 = 0.75;
 /// `eps` for the decoder's RMSNorms and its output LayerNorm (`decoder_norm_eps`).
 pub const DECODER_NORM_EPS: f32 = 1e-5;
 
+/// Encoded pixel channels.
+pub const ENCODER_IN_CHANNELS: i32 = 3;
+/// Channels each encoder down-block emits (`block_out_channels`).
+pub const ENCODER_BLOCK_OUT_CHANNELS: [i32; 6] = [128, 256, 256, 512, 512, 1024];
+/// Residual blocks per encoder down-block (`layers_per_block`).
+pub const ENCODER_LAYERS_PER_BLOCK: usize = 2;
+/// Per-level spatial stride. Their product is [`VAE_RATIO`]; levels 4 and 5 have **no**
+/// downsampler, which is why the product is not `2^len`.
+pub const ENCODER_SPATIAL_DOWNSAMPLE_FACTORS: [i32; 6] = [2, 2, 2, 2, 1, 1];
+/// Per-level temporal stride. Their product is [`VAE_RATIO_T`].
+pub const ENCODER_TEMPORAL_DOWNSAMPLE_FACTORS: [i32; 6] = [1, 2, 2, 1, 1, 1];
+/// Groups in every encoder `GroupNorm`.
+pub const ENCODER_NORM_NUM_GROUPS: i32 = 32;
+/// The encoder's norm epsilon — **1e-6**, not the decoder's 1e-5.
+pub const ENCODER_NORM_EPS: f32 = 1e-6;
+
 /// Per-channel latent de-normalization mean (`latents_mean`, 24 entries).
 pub const LATENTS_MEAN: [f32; LATENT_CHANNELS] = [
     0.858_090_34,
@@ -139,6 +155,28 @@ pub struct MiniMaxH3VaeConfig {
     pub latents_mean: Vec<f32>,
     /// Per-channel de-normalization standard deviation.
     pub latents_std: Vec<f32>,
+
+    // --- the CNN encoder half (sc-17148) -----------------------------------------------------
+    // The decoder is a 36-layer ViT and needs none of these; the encoder is a 3-D causal CNN and
+    // needs all of them. `patch_size` / `patch_size_t` above are the *products* of the two factor
+    // lists, which is all the decoder ever wanted — the per-level lists are kept separately
+    // because the encoder's shape at level `i` depends on the individual factors, not the product.
+    /// Encoded pixel channels — 3.
+    pub in_channels: i32,
+    /// Channels each down-block emits. `len()` is the number of levels.
+    pub block_out_channels: Vec<i32>,
+    /// Residual blocks per down-block.
+    pub layers_per_block: usize,
+    /// Per-level spatial stride. A level with factor 1 has **no** downsampler at all.
+    pub spatial_downsample_factors: Vec<i32>,
+    /// Per-level temporal stride, applied by the same downsampler conv.
+    pub temporal_downsample_factors: Vec<i32>,
+    /// Groups in every encoder `GroupNorm` — 32.
+    pub norm_num_groups: i32,
+    /// The **encoder's** norm epsilon, 1e-6. Distinct from [`Self::norm_eps`], which is the
+    /// decoder's 1e-5; `vae/config.json` ships both (`norm_eps` and `decoder_norm_eps`) and using
+    /// one for the other is a silent numeric change.
+    pub encoder_norm_eps: f32,
 }
 
 impl Default for MiniMaxH3VaeConfig {
@@ -161,6 +199,13 @@ impl Default for MiniMaxH3VaeConfig {
             token_drop: TOKEN_DROP,
             latents_mean: LATENTS_MEAN.to_vec(),
             latents_std: LATENTS_STD.to_vec(),
+            in_channels: ENCODER_IN_CHANNELS,
+            block_out_channels: ENCODER_BLOCK_OUT_CHANNELS.to_vec(),
+            layers_per_block: ENCODER_LAYERS_PER_BLOCK,
+            spatial_downsample_factors: ENCODER_SPATIAL_DOWNSAMPLE_FACTORS.to_vec(),
+            temporal_downsample_factors: ENCODER_TEMPORAL_DOWNSAMPLE_FACTORS.to_vec(),
+            norm_num_groups: ENCODER_NORM_NUM_GROUPS,
+            encoder_norm_eps: ENCODER_NORM_EPS,
         }
     }
 }
@@ -210,20 +255,20 @@ impl MiniMaxH3VaeConfig {
                 })
                 .collect()
         };
-        let prod = |key: &str| -> Result<i32> {
+        let vec_i32 = |key: &str| -> Result<Vec<i32>> {
             let arr = v
                 .get(key)
                 .and_then(serde_json::Value::as_array)
                 .ok_or_else(|| Error::Msg(format!("minimax-h3 vae/config.json: missing {key}")))?;
-            let mut acc: i32 = 1;
-            for e in arr {
-                let f = e.as_i64().ok_or_else(|| {
-                    Error::Msg(format!("minimax-h3 vae/config.json: non-integer in {key}"))
-                })?;
-                acc *= f as i32;
-            }
-            Ok(acc)
+            arr.iter()
+                .map(|e| {
+                    e.as_i64().map(|f| f as i32).ok_or_else(|| {
+                        Error::Msg(format!("minimax-h3 vae/config.json: non-integer in {key}"))
+                    })
+                })
+                .collect()
         };
+        let prod = |key: &str| -> Result<i32> { Ok(vec_i32(key)?.iter().product()) };
 
         let cfg = Self {
             latent_channels: num("latent_channels")? as i32,
@@ -242,6 +287,13 @@ impl MiniMaxH3VaeConfig {
             token_drop: num("token_drop")? as i32,
             latents_mean: vec_f32("latents_mean")?,
             latents_std: vec_f32("latents_std")?,
+            in_channels: num("in_channels")? as i32,
+            block_out_channels: vec_i32("block_out_channels")?,
+            layers_per_block: num("layers_per_block")? as usize,
+            spatial_downsample_factors: vec_i32("spatial_downsample_factors")?,
+            temporal_downsample_factors: vec_i32("temporal_downsample_factors")?,
+            norm_num_groups: num("norm_num_groups")? as i32,
+            encoder_norm_eps: num("norm_eps")? as f32,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -279,6 +331,100 @@ impl MiniMaxH3VaeConfig {
         }
         if self.token_drop < 0 {
             return Err(Error::Msg("minimax-h3 vae: token_drop must be >= 0".into()));
+        }
+        self.validate_encoder()
+    }
+
+    /// Levels in the CNN encoder.
+    pub fn num_encoder_levels(&self) -> usize {
+        self.block_out_channels.len()
+    }
+
+    /// Input channels of encoder level `i` — `block_out_channels[i - 1]`, and
+    /// `block_out_channels[0]` at level 0 (`conv_in` already lifts 3 → 128).
+    pub fn encoder_level_in_channels(&self, level: usize) -> i32 {
+        if level == 0 {
+            self.block_out_channels[0]
+        } else {
+            self.block_out_channels[level - 1]
+        }
+    }
+
+    /// Whether level `i` carries a `downsamplers.0`.
+    ///
+    /// The reference's condition is `temporal_factor · spatial_factor > 1` — **the product**, not
+    /// the spatial factor alone. Levels 4 and 5 of the shipped config are `1 · 1` and have no
+    /// downsampler module at all, so a loader that emits `downsamplers.0.conv.*` names for them
+    /// asks for tensors the checkpoint does not have. A hypothetical temporal-only level
+    /// (`spatial 1`, `temporal 2`) does carry one, which is why the spatial factor alone is the
+    /// wrong predicate.
+    pub fn encoder_level_has_downsampler(&self, level: usize) -> bool {
+        self.temporal_downsample_factors[level] * self.spatial_downsample_factors[level] > 1
+    }
+
+    /// Reject encoder configs the CNN half cannot express.
+    ///
+    /// The two factor lists' products **must** equal [`Self::patch_size`] / [`Self::patch_size_t`],
+    /// which the decoder already depends on: the encoder's compression and the decoder's patch are
+    /// the same two numbers, and a config in which they disagree produces latents the decoder
+    /// silently reshapes into the wrong geometry.
+    pub fn validate_encoder(&self) -> Result<()> {
+        let levels = self.num_encoder_levels();
+        if levels == 0 {
+            return Err(Error::Msg(
+                "minimax-h3 vae: the encoder needs at least one level".into(),
+            ));
+        }
+        if self.spatial_downsample_factors.len() != levels
+            || self.temporal_downsample_factors.len() != levels
+        {
+            return Err(Error::Msg(format!(
+                "minimax-h3 vae: {levels} block_out_channels but {}/{} spatial/temporal \
+                 downsample factors — the three lists are per-level and must agree",
+                self.spatial_downsample_factors.len(),
+                self.temporal_downsample_factors.len()
+            )));
+        }
+        if self.in_channels <= 0 || self.layers_per_block == 0 {
+            return Err(Error::Msg(
+                "minimax-h3 vae: in_channels and layers_per_block must be positive".into(),
+            ));
+        }
+        if let Some(bad) = self
+            .block_out_channels
+            .iter()
+            .find(|&&c| c <= 0 || c % self.norm_num_groups != 0)
+        {
+            return Err(Error::Msg(format!(
+                "minimax-h3 vae: encoder channel width {bad} must be a positive multiple of the \
+                 {} GroupNorm groups",
+                self.norm_num_groups
+            )));
+        }
+        if self
+            .spatial_downsample_factors
+            .iter()
+            .chain(&self.temporal_downsample_factors)
+            .any(|&f| f <= 0)
+        {
+            return Err(Error::Msg(
+                "minimax-h3 vae: downsample factors must be positive".into(),
+            ));
+        }
+        let spatial: i32 = self.spatial_downsample_factors.iter().product();
+        let temporal: i32 = self.temporal_downsample_factors.iter().product();
+        if spatial != self.patch_size || temporal != self.patch_size_t {
+            return Err(Error::Msg(format!(
+                "minimax-h3 vae: the encoder compresses {spatial}x spatially and {temporal}x \
+                 temporally, but the decoder patch is {}x / {}x — encode and decode must be \
+                 inverse geometries",
+                self.patch_size, self.patch_size_t
+            )));
+        }
+        if self.encoder_norm_eps <= 0.0 {
+            return Err(Error::Msg(
+                "minimax-h3 vae: encoder_norm_eps must be positive".into(),
+            ));
         }
         Ok(())
     }
@@ -354,6 +500,8 @@ mod tests {
             "decoder_ffn_mult": 4, "decoder_rope_theta": 100.0,
             "decoder_rope_dim_ratio": 0.75, "decoder_norm_eps": 1e-05,
             "clip_length": 17, "token_drop": 3,
+            "in_channels": 3, "block_out_channels": [128,256,256,512,512,1024],
+            "layers_per_block": 2, "norm_num_groups": 32, "norm_eps": 1e-06,
             "latents_mean": [0.858090341091156,-0.9606591463088989,1.0661640167236328,-0.5090325474739075,-0.2727581858634949,-1.3675414323806763,-0.2553254961967468,-0.26907554268836975,-0.5376840829849243,-0.0464097298681736,0.6657370328903198,0.19690127670764923,-0.5460608005523682,-0.4035342037677765,-0.23683024942874908,0.25928452610969543,-0.30133944749832153,0.211341992020607,-1.1206848621368408,0.3581933379173279,-0.04225143790245056,0.2604829967021942,0.22864092886447906,0.7056031823158264],
             "latents_std": [1.2223774194717407,1.2767263650894165,1.6831774711608887,1.7549455165863037,1.5636216402053833,2.194143533706665,0.9653137922286987,1.0569885969161987,0.841948926448822,0.7729952931404114,1.8955937623977661,0.946841835975647,0.7996809482574463,0.44988900423049927,0.7197399735450745,0.6936293244361877,2.961095094680786,2.7694199085235596,3.0496184825897217,2.1088054180145264,3.276226282119751,3.1627357006073,2.2816812992095947,2.6127843856811523]
         }"#;

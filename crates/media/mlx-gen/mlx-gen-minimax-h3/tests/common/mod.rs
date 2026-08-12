@@ -180,13 +180,32 @@ pub fn fixture_config(token_drop: i32) -> MiniMaxH3VaeConfig {
         rope_theta: 100.0,
         rope_dim_ratio: 0.75,
         norm_eps: 1e-5,
-        patch_size: 2,
+        // The spatial cumprod of `spatial_downsample_factors` below. It is 4 rather than the VAE
+        // ratio's shape-minimal 2 because the ORIGINAL MiniMax module asserts `time_stride in
+        // [1, 2]`, so `patch_size_t` 4 needs TWO time-strided levels — and a level that strides
+        // time without also striding space convolves a 3-wide kernel with no spatial padding,
+        // cropping two columns instead of halving. See `tools/dump_minimax_h3_video_vae.py`.
+        patch_size: 4,
         patch_size_t: 4,
         clip_length: 17,
         token_drop,
         // The REAL 24-entry de-normalization statistics, not placeholders.
         latents_mean: shipped.latents_mean.clone(),
         latents_std: shipped.latents_std.clone(),
+        // The CNN encoder half (sc-17148), shrunk the same way, and matching
+        // `tools/dump_minimax_h3_video_vae.py`'s `BLOCK_OUT_CHANNELS` / `SPATIAL_DOWN` /
+        // `TIME_DOWN` exactly. The two factor lists' products are the fixture's `patch_size` 2
+        // and `patch_size_t` 4, which `validate_encoder` requires: encode and decode are inverse
+        // geometries at the fixture scale exactly as they are at production scale.
+        in_channels: 3,
+        // The width CHANGES at the last level so `conv_shortcut` is actually built and gated;
+        // a uniform-width fixture never constructs one.
+        block_out_channels: vec![32, 32, 32, 64],
+        layers_per_block: 1,
+        spatial_downsample_factors: vec![1, 2, 2, 1],
+        temporal_downsample_factors: vec![1, 2, 2, 1],
+        norm_num_groups: 32,
+        encoder_norm_eps: 1e-6,
     }
 }
 

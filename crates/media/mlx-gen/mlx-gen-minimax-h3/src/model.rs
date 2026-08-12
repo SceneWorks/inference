@@ -33,11 +33,13 @@ use std::path::{Path, PathBuf};
 use mlx_rs::Dtype;
 
 use mlx_gen::gen_core::{
-    reject_unknown_components, Capabilities, GenerationOutput, GenerationRequest, Generator,
-    LoadSpec, Modality, ModelDescriptor, Precision, Progress, SizeFloor, WeightsSource,
+    reject_unknown_components, Capabilities, ConditioningKind, GenerationOutput, GenerationRequest,
+    Generator, KeyframeRef, LoadSpec, Modality, ModelDescriptor, Precision, Progress, SizeFloor,
+    WeightsSource,
 };
 use mlx_gen::weights::Weights;
 use mlx_gen::{default_seed, Error, Result};
+use mlx_gen_boogu::vision::VisionTower;
 
 use crate::audio_config::{MiniMaxH3AudioVaeConfig, AUDIO_OUTPUT_CHANNELS, AUDIO_SAMPLE_RATE};
 use crate::audio_vae::MiniMaxH3AudioVae;
@@ -45,11 +47,13 @@ use crate::denoise::{JointSchedule, MIN_INFERENCE_STEPS};
 use crate::dit::adaln::AdaLnResidency;
 use crate::dit::model::{JointDit, MiniMaxH3Dit};
 use crate::pipeline::{
-    fit_audio_to_video, frames_to_images, initial_latents, render_latents, resolve_geometry,
-    revert_pixel_normalization, t2va_layout, RequestGeometry, MAX_DURATION_SECONDS,
-    MIN_DURATION_SECONDS, SMALLEST_LEGAL_FRAMES, SPATIAL_STRIDE,
+    fit_audio_to_video, fl2va_layout, frames_to_images, initial_latents, prepend_condition_rows,
+    render_latents, resolve_geometry, revert_pixel_normalization, t2va_layout, RequestGeometry,
+    MAX_DURATION_SECONDS, MIN_DURATION_SECONDS, SMALLEST_LEGAL_FRAMES, SPATIAL_STRIDE,
 };
-use crate::text_encoder::{MiniMaxH3TeConfig, MiniMaxH3TextEncoder, MiniMaxH3Tokenizer, LM_PREFIX};
+use crate::text_encoder::{
+    MiniMaxH3TeConfig, MiniMaxH3TextEncoder, MiniMaxH3Tokenizer, LM_PREFIX, VISION_PREFIX,
+};
 use crate::vae::MiniMaxH3VideoVae;
 
 /// The published provider id.
@@ -73,6 +77,14 @@ pub const MAX_STEPS: u32 = 200;
 /// nothing.
 const TE_SHARDS: std::ops::RangeInclusive<u32> = 1..=12;
 
+/// The shard holding the Qwen3-VL **vision tower**. All 351 `model.visual.*` tensors live in
+/// shard 14 and nowhere else, so [`TE_SHARDS`] excludes it for `t2va` and `fl2va` must add it back.
+const VISION_SHARD: u32 = 14;
+
+/// Quantization group size the shared vision tower is built with — the same value every other
+/// consumer of `mlx-gen-boogu`'s tower passes.
+const VISION_GROUP_SIZE: i32 = 64;
+
 /// The identity, modality and capability surface.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
@@ -87,8 +99,14 @@ pub fn descriptor() -> ModelDescriptor {
             supports_negative_prompt: false,
             supports_guidance: false,
             supports_true_cfg: false,
-            // `t2va` only — keyframes are sc-17148 and the omni-reference is sc-17149.
-            conditioning: Vec::new(),
+            // `t2va` and `fl2va` (sc-17148). The omni-reference (`ref2va`, `transformer_ref`) is
+            // sc-17149.
+            //
+            // **One kind covers all three keyframe shapes.** `Keyframe` carries a `frame_idx`, and
+            // first-only / last-only / first+last are one, one and two of them — see
+            // [`keyframe_anchors`] for why last-frame-only is a payload shape rather than a mode
+            // of its own.
+            conditioning: vec![ConditioningKind::Keyframe],
             supports_lora: false,
             supports_lokr: false,
             supported_quants: &[],
@@ -144,6 +162,102 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
     // The geometry gate itself — the same call `generate` makes, so `validate` and the render agree
     // by construction rather than by two copies of the lattice arithmetic.
     request_geometry(req).map(|_| ())
+}
+
+/// Map a request's keyframes onto MiniMax-H3's two anchor slots, in packed order.
+///
+/// # The last-frame-only decision (sc-17148)
+///
+/// The story asks whether last-frame-only should be a **new SceneWorks mode** or an **optional
+/// field on `first_last_frame`**. It is the latter, and this function is where that is expressed:
+/// there is no third mode, only a `Keyframe` payload whose `frame_idx` names which end it anchors.
+///
+/// Three reasons, in order of weight:
+///
+/// 1. **Upstream does not model it as a separate task either.** `MiniMaxH3Blocks._workflow_map`
+///    has one `fl2va` entry with two accepted signatures (`image`, or `last_image`), and
+///    `before_encoder.py` filters a fixed `(("first", image), ("last", last_image))` pair by
+///    presence. All four shapes fall out of one ordered tuple. A third mode would model as
+///    disjoint something the reference models as one mechanism with an optional slot.
+/// 2. **The information is already carried.** `frame_idx` distinguishes the two ends losslessly. A
+///    new mode would add a manifest entry (sc-17158), an allow-list entry and routing across six
+///    surfaces (sc-17159), and a Video Studio affordance (sc-17161) — all to re-encode one bit
+///    that the existing payload already has.
+/// 3. **The genuine difference is a prompting one, not a plumbing one.** Upstream's own
+///    `VIDEO_PROMPT_WRITING_GUIDE` names I2VA / L2VA / FL2VA as distinct tasks because they take
+///    **different prompt preambles**. That is UI copy and preset territory, and it is well served
+///    by a preset over `first_last_frame` rather than by a mode the engine has to branch on.
+///
+/// What follows for the surfaces this story does not own: `first_last_frame` must accept a payload
+/// with **only** the last slot filled. sc-17159 owns making that reachable; the engine accepts it
+/// today.
+///
+/// # The index convention
+///
+/// `frame_idx` 0 is the first frame. The last is `num_frames - 1` **or** `-1`, because a caller
+/// that knows only "the end of the clip" should not have to resolve the frame count first. Any
+/// other index is **rejected**: the model has exactly two anchor slots, and silently snapping a
+/// mid-clip index to the nearest end would condition on something the caller did not ask for.
+pub(crate) fn keyframe_anchors(
+    keyframes: &[KeyframeRef<'_>],
+    num_frames: i32,
+) -> Result<Vec<crate::dit::positions::KeyframeAnchor>> {
+    use crate::dit::positions::KeyframeAnchor;
+    let mut first = None;
+    let mut last = None;
+    for kf in keyframes {
+        let slot = if kf.frame_idx == 0 {
+            &mut first
+        } else if kf.frame_idx == -1 || kf.frame_idx == num_frames - 1 {
+            &mut last
+        } else {
+            return Err(Error::Msg(format!(
+                "{MODEL_ID}: a keyframe must anchor the FIRST frame (index 0) or the LAST (index \
+                 {} or -1); MiniMax-H3 has exactly two anchor slots and no mid-clip conditioning, \
+                 got index {}",
+                num_frames - 1,
+                kf.frame_idx
+            )));
+        };
+        if slot.is_some() {
+            return Err(Error::Msg(format!(
+                "{MODEL_ID}: two keyframes anchor the same end of the clip (index {})",
+                kf.frame_idx
+            )));
+        }
+        *slot = Some(kf.image);
+    }
+    let mut anchors = Vec::with_capacity(2);
+    if first.is_some() {
+        anchors.push(KeyframeAnchor::First);
+    }
+    if last.is_some() {
+        anchors.push(KeyframeAnchor::Last);
+    }
+    Ok(anchors)
+}
+
+/// The request's keyframe images in packed order — first, then last.
+///
+/// Positional with [`keyframe_anchors`]: the caller may supply them in any order, and both
+/// functions sort them into the reference's `(first, last)` order so `anchors[i]` always describes
+/// `images[i]`.
+pub(crate) fn keyframe_images<'a>(
+    keyframes: &[KeyframeRef<'a>],
+    num_frames: i32,
+) -> Result<Vec<&'a mlx_gen::media::Image>> {
+    let mut first = None;
+    let mut last = None;
+    for kf in keyframes {
+        if kf.frame_idx == 0 {
+            first = Some(kf.image);
+        } else if kf.frame_idx == -1 || kf.frame_idx == num_frames - 1 {
+            last = Some(kf.image);
+        }
+    }
+    // Re-run the validation so the two functions cannot disagree about what is legal.
+    keyframe_anchors(keyframes, num_frames)?;
+    Ok(first.into_iter().chain(last).collect())
 }
 
 /// Resolve the request's geometry: the canvas, and the frame count from `frames` (exact) or
@@ -243,22 +357,43 @@ impl MiniMaxH3 {
         self.dtype
     }
 
+    /// Map the text-encoder shards a presentation needs.
+    ///
+    /// `t2va` reads shards 1-12 ([`TE_SHARDS`]). `fl2va` additionally needs **shard 14**, which is
+    /// where all 351 `model.visual.*` tensors live — the vision tower is not spread across the
+    /// component, it sits entirely in the last shard alongside the never-executed decoder tail.
+    /// That is why the `t2va` window could stop at 12 and why a keyframe request cannot.
+    fn map_te_shards(&self, with_vision: bool) -> Result<Weights> {
+        let dir = self.root.join("text_encoder");
+        let mut w = Weights::empty();
+        let shards: Vec<u32> = if with_vision {
+            TE_SHARDS.chain(std::iter::once(VISION_SHARD)).collect()
+        } else {
+            TE_SHARDS.collect()
+        };
+        for i in shards {
+            let shard = format!("model-{i:05}-of-00014.safetensors");
+            let part = Weights::from_file(dir.join(&shard))?;
+            let keys: Vec<String> = part.keys().map(str::to_owned).collect();
+            for k in keys {
+                // Shard 14 also holds layers 50-63 and `lm_head`, which are never executed. Keep
+                // only what the tower needs so the fl2va path does not carry 15 GB for nothing.
+                if with_vision && i == VISION_SHARD && !k.starts_with(VISION_PREFIX) {
+                    continue;
+                }
+                let t = part.require(&k)?.clone();
+                w.insert(k, t);
+            }
+        }
+        Ok(w)
+    }
+
     /// Encode the prompt and immediately release the 66.7 GB text encoder.
     fn encode_prompt(&self, prompt: &str) -> Result<mlx_rs::Array> {
         let tok = MiniMaxH3Tokenizer::from_snapshot(&self.root)?;
         let (ids, mask) = tok.encode_prompt(prompt)?;
 
-        let dir = self.root.join("text_encoder");
-        let mut w = Weights::empty();
-        for i in TE_SHARDS {
-            let shard = format!("model-{i:05}-of-00014.safetensors");
-            let part = Weights::from_file(dir.join(&shard))?;
-            let keys: Vec<String> = part.keys().map(str::to_owned).collect();
-            for k in keys {
-                let t = part.require(&k)?.clone();
-                w.insert(k, t);
-            }
-        }
+        let w = self.map_te_shards(false)?;
         let cfg = MiniMaxH3TeConfig::qwen3_vl_32b();
         let te = MiniMaxH3TextEncoder::from_weights(&w, LM_PREFIX, &cfg)?;
         let context = te.forward(&ids, &mask)?;
@@ -268,6 +403,64 @@ impl MiniMaxH3 {
         mlx_rs::transforms::eval([&context])?;
         release((te, w));
         Ok(context)
+    }
+
+    /// The `fl2va` presentation: run the Qwen3-VL **vision tower** over the keyframes, splice their
+    /// embeddings into the `"<Picture i>: "` + vision-block presentation, and return the context
+    /// together with its **per-row modality tags**.
+    ///
+    /// This is one of the two paths a keyframe takes. The other is the VAE encode in
+    /// [`crate::conditioning`]; the sc-17242 spike established that the reference runs **both**,
+    /// and neither substitutes for the other — the tower supplies semantic context to the prompt
+    /// stream, the VAE supplies the pixel-space anchor the video rows are conditioned on.
+    fn encode_prompt_grounded(
+        &self,
+        prompt: &str,
+        keyframes: &[&mlx_gen::media::Image],
+    ) -> Result<(mlx_rs::Array, Vec<i32>)> {
+        let tok = MiniMaxH3Tokenizer::from_snapshot(&self.root)?;
+        let mut w = self.map_te_shards(true)?;
+
+        let vision = VisionTower::from_weights(
+            &w,
+            crate::text_encoder::minimax_h3_vision_config(),
+            VISION_PREFIX,
+            VISION_GROUP_SIZE,
+        )?;
+        let grounded = crate::text_encoder::run_vision(&vision, keyframes)?;
+        // Force the tower's output BEFORE dropping it, and drop its tensors out of `w` too — the
+        // same discipline `encode_prompt` documents. Under lazy evaluation `grounded` is a graph
+        // node holding every weight it was computed from, so releasing the tower while `w` still
+        // maps `model.visual.*` frees nothing and the splice below would re-materialize it.
+        let mut forced: Vec<&mlx_rs::Array> = grounded.embeds.iter().collect();
+        forced.extend(grounded.deepstack.iter().flatten());
+        mlx_rs::transforms::eval(forced)?;
+        release(vision);
+        w.remove_prefix(VISION_PREFIX);
+
+        let (ids, mask, tags) = tok.encode_fl2va(prompt, &grounded.counts)?;
+        let cfg = MiniMaxH3TeConfig::qwen3_vl_32b();
+        let te = MiniMaxH3TextEncoder::from_weights(&w, LM_PREFIX, &cfg)?;
+        let context = te.forward_with_images(
+            &ids,
+            &mask,
+            &grounded.embeds,
+            &grounded.deepstack,
+            &grounded.grids,
+        )?;
+        mlx_rs::transforms::eval([&context])?;
+        release((te, w, grounded));
+
+        // The tags describe the presentation row for row; a mismatch would mis-tag every row after
+        // the divergence and is silent, because both lengths build a runnable sequence.
+        if context.shape()[1] != tags.len() as i32 {
+            return Err(Error::Msg(format!(
+                "{MODEL_ID}: the grounded context has {} rows but {} modality tags",
+                context.shape()[1],
+                tags.len()
+            )));
+        }
+        Ok((context, tags))
     }
 
     fn generate_impl(
@@ -292,7 +485,60 @@ impl MiniMaxH3 {
         let seed = req.seed.unwrap_or_else(default_seed);
 
         // --- 1. conditioning ----------------------------------------------------------------
-        let context = self.encode_prompt(&req.prompt)?;
+        // `t2va` and `fl2va` diverge here and stay diverged through the latent prep — deliberately,
+        // as the reference does. Zero keyframes is `t2va` at the WEIGHTS level (one `transformer`
+        // partition) and a different block path at every other level.
+        let keyframes = req.keyframes();
+        let anchors = keyframe_anchors(&keyframes, geometry.joint.num_frames)?;
+        // Fitted ONCE, here, and shared by both keyframe paths. The vision tower and the VAE
+        // encode must see the same pixels — resizing separately per path would let a resampling
+        // difference put the two conditioning signals fractionally out of register, which is
+        // exactly the class of divergence nothing downstream can detect.
+        let fitted = if anchors.is_empty() {
+            Vec::new()
+        } else {
+            let images = keyframe_images(&keyframes, geometry.joint.num_frames)?;
+            crate::keyframe::fit_keyframes(&images, geometry.width, geometry.height)?
+        };
+
+        let (context, text_tags) = if anchors.is_empty() {
+            let context = self.encode_prompt(&req.prompt)?;
+            let tags = vec![crate::denoise::TEXT_TAG; context.shape()[1] as usize];
+            (context, tags)
+        } else {
+            let refs: Vec<&mlx_gen::media::Image> = fitted.iter().collect();
+            self.encode_prompt_grounded(&req.prompt, &refs)?
+        };
+        if req.cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+
+        // --- 1b. keyframe conditioning latents (fl2va) ----------------------------------------
+        // The VAE encode, the second of the keyframe's two paths. Done before the DiT is mapped so
+        // the ~10 GB VAE and the ~62 GB DiT are never both resident.
+        let condition_rows = if anchors.is_empty() {
+            None
+        } else {
+            let pixels: Vec<mlx_rs::Array> = fitted
+                .iter()
+                .map(crate::keyframe::keyframe_to_vae_pixels)
+                .collect::<Result<_>>()?;
+            let vae = MiniMaxH3VideoVae::load(&self.root, self.dtype)?;
+            let rows = crate::conditioning::build_condition_rows(
+                &vae,
+                &pixels,
+                &anchors,
+                crate::pipeline::PATCH_SIZE,
+                &crate::conditioning::KeyframeNoise::Seeded,
+            )?;
+            if let Some(r) = &rows {
+                // Force before the VAE is dropped, for the same lazy-evaluation reason the context
+                // is forced above.
+                mlx_rs::transforms::eval([r])?;
+            }
+            release((vae, pixels));
+            rows
+        };
         if req.cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
@@ -300,8 +546,14 @@ impl MiniMaxH3 {
         // --- 2. denoise ---------------------------------------------------------------------
         let dit = MiniMaxH3Dit::load(&self.root, "transformer", self.dtype)?;
         let patch = dit.config().patch_size;
-        let layout = t2va_layout(&geometry, context.shape()[1], patch)?;
+        let layout = if anchors.is_empty() {
+            t2va_layout(&geometry, context.shape()[1], patch)?
+        } else {
+            fl2va_layout(&geometry, &text_tags, &anchors, patch)?
+        };
         let (video_rows, audio_rows) = initial_latents(&geometry, patch, seed)?;
+        // The anchors LEAD the video row stream; the scheduler then writes only the tail.
+        let video_rows = prepend_condition_rows(&layout, condition_rows.as_ref(), &video_rows)?;
         let adaln = crate::denoise::adaln_schedule(&schedule)?;
         // The 26.02 GB lever: project the whole schedule's modulation and release `adaln_proj`.
         // Every timestep this run evaluates at is enumerated in `adaln`, so the eviction is safe.
