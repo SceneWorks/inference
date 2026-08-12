@@ -66,13 +66,29 @@
 //!
 //! The AdaLN weights are a function of the timestep embedding only, never of the tokens, which is
 //! what makes this possible. Two details decide whether an implementation is correct or merely
-//! plausible. MiniMax-H3's packed sequence carries **several timesteps at once** — video, audio,
-//! conditioning (0.999) and text (1.0) rows all sit at different `t` inside one forward pass — so
+//! plausible. MiniMax-H3's packed sequence carries **several timesteps at once** — video (which the
+//! text rows share), audio, `fl2va` conditioning (0.999) and `ref2va` reference audio (1.0) all sit
+//! at different `t` inside one forward pass — so
 //! the table is keyed on distinct timesteps across the run, not on steps. And MLX is lazily
 //! evaluated, so a precompute that is not forced still references the weights it was supposed to
 //! free: [`dit::adaln::AdaLnCache::precompute_and_evict`] owns that ordering, and pairs the drop
 //! with an explicit allocator drain because `get_active_memory` alone cannot tell a released buffer
 //! from a cached one.
+//!
+//! ## Joint audio+video denoise (sc-17146)
+//!
+//! - [`denoise`] runs the **joint dual-modality loop**: one packed sequence, **one** transformer
+//!   pass per step (the checkpoint is guidance-distilled — there is no CFG), video stepped on a
+//!   12.0 sigma shift and audio on 3.0, with the `fl2va` keyframe anchors written past.
+//!
+//! Three things it owns that nothing else can state. [`denoise::geometry`] carries **the AV time
+//! alignment**: both modalities advance one shared MM-RoPE clock at 40 rotary units per second
+//! (`24 fps · 5/3` and `40 latents/s · 1`), so drift can only enter through a mis-derived
+//! latent-frame count — which is checked, not assumed. [`denoise::schedule`] reproduces five ways
+//! `MiniMaxH3Scheduler` departs from stock rectified flow, of which the **reversed velocity sign**
+//! (`x0 = x_t + σ·v`) and the two-source σ in one Euler update are the ones a port copied from any
+//! other in-tree family gets silently wrong. And [`denoise::packing`] owns the row order, the three
+//! index tensors — `video_indices` **skips the audio block** — the tags and the scatter.
 //!
 //! ## Read [`layout`] before porting anything else in this family
 //!
@@ -84,11 +100,12 @@
 //! decoder past a fully green parity suite. **The DiT (sc-17144) carries the same FFN swap plus a
 //! grouped-QKV reorder**, and the candle twins (sc-17154 / sc-17155) inherit both.
 //!
-//! Not in this crate yet: either CNN encoder, the joint denoise loop and packed-sequence assembly
-//! (sc-17146), the pipeline and the DiT's input/output projections — including the timestep MLP the
-//! AdaLN precompute takes as a closure — (sc-17147), and Ref2VA's `transformer_ref` (sc-17149).
-//! Nothing is registered with `mlx-gen-catalog` — there is no generator to ship until the pipeline
-//! lands.
+//! Not in this crate yet: either CNN encoder, the pipeline and the DiT's input/output projections
+//! — including the timestep MLP the AdaLN precompute takes as a closure, and the
+//! [`denoise::JointVelocity`] implementation the joint loop calls — (sc-17147), `fl2va`
+//! conditioning (sc-17148), Ref2VA's `transformer_ref` (sc-17149) and sequential residency
+//! (sc-17151). Nothing is registered with `mlx-gen-catalog` — there is no generator to ship until
+//! the pipeline lands.
 
 pub mod alias_free;
 pub mod audio_config;
@@ -97,6 +114,7 @@ pub mod blocks;
 pub mod chunking;
 pub mod config;
 pub mod decoder;
+pub mod denoise;
 pub mod dit;
 pub mod layout;
 pub mod rope;
@@ -118,6 +136,14 @@ pub use config::{
     LATENTS_STD, LATENT_CHANNELS, TOKEN_DROP, VAE_RATIO, VAE_RATIO_T,
 };
 pub use decoder::ViT3dDecoder;
+pub use denoise::{
+    adaln_schedule, align_num_frames, audio_latent_num_frames, denoise_av, rope_clocks_agree,
+    shift_sigma, video_latent_num_frames, DenoiseModality, JointGeometry, JointSchedule, JointStep,
+    JointVelocity, PackedLayout, RowClass, SigmaSchedule, AUDIO_LATENTS_PER_SECOND,
+    AUDIO_SIGMA_SHIFT, AUDIO_TAG, KEYFRAME_NOISE_AUG, LEGAL_FRAME_COUNTS, MAX_AV_DRIFT_SECONDS,
+    MINIMAX_H3_FPS, MIN_INFERENCE_STEPS, NUM_ROW_CLASSES, REFERENCE_AUDIO_TIMESTEP,
+    ROPE_UNITS_PER_SECOND, TEXT_TAG, VIDEO_SIGMA_SHIFT, VIDEO_TAG,
+};
 pub use dit::{
     AdaLnCache, AdaLnModulation, AdaLnProjection, AdaLnResidency, DitBlock, MiniMaxH3DitConfig,
     MmRope, MmRopeTables, ScheduleKey, TimestepSchedule, TokenRefiner, TokenRefinerBlock,

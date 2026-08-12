@@ -28,10 +28,11 @@
 //! | [`refiner`] | the 2-layer text token refiner |
 //! | [`qkv`] | the published fused-QKV transform, as an executable contract |
 //!
-//! Deliberately **not** here, each owned by a later story: the joint denoise loop and the
-//! packed-sequence assembly (sc-17146), the pipeline and the input/output projections that wrap
-//! this stack — including the timestep MLP [`adaln::AdaLnCache::precompute`] takes as a closure —
-//! (sc-17147), and Ref2VA's `transformer_ref` (sc-17149).
+//! Deliberately **not** here: the joint denoise loop and the packed-sequence assembly, which are
+//! [`crate::denoise`] (sc-17146); and, each owned by a later story, the pipeline and the
+//! input/output projections that wrap this stack — including the timestep MLP
+//! [`adaln::AdaLnCache::precompute`] takes as a closure — (sc-17147), and Ref2VA's
+//! `transformer_ref` (sc-17149).
 //!
 //! # Read [`crate::layout`] first
 //!

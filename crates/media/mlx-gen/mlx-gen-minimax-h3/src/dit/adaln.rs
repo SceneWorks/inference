@@ -26,19 +26,27 @@
 //! # The timestep axis is per ROW, not per step
 //!
 //! MiniMax-H3's packed sequence carries **several different timesteps simultaneously** inside one
-//! forward pass (sc-17242 spike, sc-17146 activity 18717): the video rows at the video schedule's
-//! `t`, the audio rows at the audio schedule's `t` (a different sigma shift — 3.0 against 12.0), the
-//! `fl2va` conditioning rows pinned at `max(video_t, 0.999)`, and the text rows at a clean `1.0`.
+//! forward pass: the video rows at the video schedule's `t`, the audio rows at the audio schedule's
+//! `t` (a different sigma shift — 3.0 against 12.0), the `fl2va` conditioning rows pinned at
+//! `max(video_t, 0.999)`, and the `ref2va` reference-soundtrack rows at a clean `1.0`.
 //! `t = 1 − σ` on a unit scale, with `t = 1` meaning clean — the opposite direction from every
 //! other flow-match family in-tree.
+//!
+//! **The text rows sit at the VIDEO timestep**, not at `1.0`. This module and the sc-17242 spike
+//! comment (sc-17146 activity 18717) both originally recorded them as clean; sc-17146 read
+//! `build_row_timesteps` and found that `row_timesteps` is *filled* with the video timestep and the
+//! text rows are then never reassigned, so they keep it. The `1.0` class is real but belongs to
+//! `ref2va`, which `t2va` and `fl2va` have no rows of. See [`crate::denoise::packing`], whose
+//! `text_rows_carry_the_video_timestep` pins the corrected reading against the reference's own
+//! golden.
 //!
 //! So the cache is **not** "one row per step". It is one modulation row per
 //! `(distinct timestep, modality)` pair over the whole run, and [`TimestepSchedule`] is what turns a
 //! per-step list of distinct timesteps into that global table plus the per-step remap into it.
 //!
 //! Deduplicating across steps is not tidiness — it is roughly a 2× saving on the cache, because the
-//! keyframe (0.999) and text (1.0) rows are the *same* timestep at every step while only the video
-//! and audio ones move. See [`TimestepSchedule::distinct_timesteps`].
+//! keyframe (0.999) and reference-audio (1.0) rows are the *same* timestep at every step while only
+//! the video and audio ones move. See [`TimestepSchedule::distinct_timesteps`].
 //!
 //! # The lazy-eval trap
 //!
@@ -164,9 +172,11 @@ pub enum AdaLnResidency {
 ///
 /// A MiniMax-H3 packed sequence has a small number of *row classes*, each at its own timestep —
 /// exactly what the reference's `build_row_timesteps` describes (`before_denoise.py`): the video
-/// rows at the video schedule's `t`, the audio rows at the audio schedule's `t`, the `fl2va`
-/// conditioning rows at `max(video_t, 0.999)` and the text rows at `1.0`. Every row of the sequence
-/// belongs to one class, and its AdaLN table row is `timestep_index · MODALITY_NUM + token_tag`.
+/// rows **and the text rows** at the video schedule's `t`, the audio rows at the audio schedule's
+/// `t`, the `fl2va` conditioning rows at `max(video_t, 0.999)` and the `ref2va` reference-soundtrack
+/// rows at `1.0`. Every row of the sequence belongs to one class, and its AdaLN table row is
+/// `timestep_index · MODALITY_NUM + token_tag`. [`crate::denoise::packing::RowClass`] is that class
+/// set, in the order this type is built with.
 ///
 /// This type is constructed from **one timestep per row class per step**, in a caller-fixed class
 /// order, and globalizes it: the per-step lists are unioned into one deduplicated table (first
@@ -619,13 +629,16 @@ mod tests {
     use super::*;
     use crate::dit::config::MODULATION_PARAMS;
 
-    /// A joint run's four row classes at each of `evals` model evaluations: video `t`, audio `t`
-    /// (a different sigma shift), the conditioning rows at `max(video_t, 0.999)` and the text rows
-    /// at `1.0`.
+    /// A joint run's four row classes at each of `evals` model evaluations: video `t` (which the
+    /// text rows share), audio `t` (a different sigma shift), the `fl2va` conditioning rows at
+    /// `max(video_t, 0.999)` and the `ref2va` reference-soundtrack rows at `1.0`.
+    ///
+    /// A hand-rolled stand-in for [`crate::denoise::JointSchedule`], kept so this module's tests
+    /// stay independent of the denoise loop.
     ///
     /// `σ` descends from 1 but never reaches 0: `MiniMaxH3Scheduler` includes the terminal zero in
     /// `num_inference_steps` and the loop runs one evaluation fewer, so the model is never
-    /// evaluated at `σ = 0` (sc-17146 activity 18717).
+    /// evaluated at `σ = 0`.
     fn joint_schedule(evals: usize) -> Vec<Vec<f32>> {
         (0..evals)
             .map(|i| {

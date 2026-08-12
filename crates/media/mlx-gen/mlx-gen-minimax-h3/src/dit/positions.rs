@@ -13,8 +13,8 @@
 //!
 //! These are the **coordinate grids**, i.e. the rotary's input contract. Assembling the packed
 //! sequence itself — the row order `[text | keyframe conditions | target audio | target video]`,
-//! the three index tensors, the modality tags and the scatter — belongs to the joint denoise loop
-//! (sc-17146) and the pipeline (sc-17147). The grids are here because the rotary cannot be pinned
+//! the three index tensors, the modality tags and the scatter — is
+//! [`crate::denoise::packing`] (sc-17146). The grids are here because the rotary cannot be pinned
 //! without them.
 //!
 //! # The four conventions
