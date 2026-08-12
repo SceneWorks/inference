@@ -96,6 +96,9 @@ const REF_MIN_PIXELS: i64 = 512 * 512;
 const REF_MAX_PIXELS: i64 = 2048 * 2048;
 /// Cell = patch·merge: every side must be a multiple of this (the patchify grid).
 pub const SIZE_MULTIPLE: u32 = 32;
+/// Tokenizer-level sentinels owned by the internal image-prefix builder. Letting user text inject
+/// one would corrupt the token/grid relationship that the understanding path derives.
+const RESERVED_IMAGE_MARKERS: [&str; 3] = ["<IMG_CONTEXT>", "<img>", "</img>"];
 
 /// The base descriptor (`sensenova_u1_8b`).
 pub fn descriptor() -> ModelDescriptor {
@@ -333,6 +336,14 @@ impl Generator for SenseNovaGenerator {
         let id = self.descriptor.id;
         // Capability floor (count/size range, guidance, and Reference/MultiReference only).
         self.descriptor.capabilities.validate_request(id, req)?;
+        if let Some(marker) = RESERVED_IMAGE_MARKERS
+            .iter()
+            .find(|marker| req.prompt.contains(**marker))
+        {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{id}: prompt contains reserved internal image marker {marker}"
+            )));
+        }
         // SenseNova consumes every supplied reference at full model-native conditioning. It has no
         // strength-weighted blend or schedule-tail primitive, so accepting either strength carrier
         // would silently discard a user control. Validate the per-reference carrier first: when a
@@ -810,6 +821,34 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "unsupported: sensenova_u1_8b: MultiReference conditioning requires at least one image"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_reserved_image_context_marker_as_typed_error() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID, &spec)
+            .unwrap();
+        let request = GenerationRequest {
+            prompt: "preserve the literal <IMG_CONTEXT> label".into(),
+            width: 512,
+            height: 512,
+            conditioning: vec![Conditioning::Reference {
+                image: Image::default(),
+                strength: None,
+            }],
+            ..Default::default()
+        };
+
+        let err = g
+            .validate(&request)
+            .expect_err("reserved tokenizer markers must never reach the position builder");
+        assert!(matches!(err, gen_core::Error::Unsupported(_)));
+        assert_eq!(
+            err.to_string(),
+            "unsupported: sensenova_u1_8b: prompt contains reserved internal image marker <IMG_CONTEXT>"
         );
     }
 

@@ -651,39 +651,70 @@ impl T2iModel {
         &self,
         ids: &[i32],
         grids: &[(usize, usize)],
-    ) -> (Vec<i32>, Vec<i32>, Vec<i32>) {
-        let n = ids.len();
-        let mut t = Vec::with_capacity(n);
-        let mut acc = 0i32;
-        for i in 0..n {
-            let shift = i32::from(i > 0 && ids[i - 1] == self.img_start_id);
-            let not_img = i32::from(ids[i] != self.img_context_id);
-            acc += shift + not_img;
-            t.push(acc - 1);
-        }
-        // Merged-grid (row=y, col=x) coordinates, concatenated across images in order.
-        let merge = self.merge_size;
-        let mut abs = Vec::new();
-        for &(gh, gw) in grids {
-            let (mh, mw) = (gh / merge, gw / merge);
-            for idx in 0..(mh * mw) {
-                abs.push(((idx / mw) as i32, (idx % mw) as i32));
-            }
-        }
-        let mut h = vec![0i32; n];
-        let mut w = vec![0i32; n];
-        let mut k = 0usize;
-        for i in 0..n {
-            if ids[i] == self.img_context_id {
-                let (y, x) = abs[k];
-                h[i] = y;
-                w[i] = x;
-                k += 1;
-            }
-        }
-        (t, h, w)
+    ) -> CResult<(Vec<i32>, Vec<i32>, Vec<i32>)> {
+        thw_indexes(
+            ids,
+            grids,
+            self.img_start_id,
+            self.img_context_id,
+            self.merge_size,
+        )
     }
+}
 
+/// Pure position builder shared by the production it2i prefix path and its token-level regressions.
+/// It fails closed when tokenizer-produced image markers disagree with the supplied vision grids;
+/// user text can otherwise introduce a reserved `<IMG_CONTEXT>` token before vision features exist.
+fn thw_indexes(
+    ids: &[i32],
+    grids: &[(usize, usize)],
+    img_start_id: i32,
+    img_context_id: i32,
+    merge_size: usize,
+) -> CResult<(Vec<i32>, Vec<i32>, Vec<i32>)> {
+    let n = ids.len();
+    let mut t = Vec::with_capacity(n);
+    let mut acc = 0i32;
+    for i in 0..n {
+        let shift = i32::from(i > 0 && ids[i - 1] == img_start_id);
+        let not_img = i32::from(ids[i] != img_context_id);
+        acc += shift + not_img;
+        t.push(acc - 1);
+    }
+    // Merged-grid (row=y, col=x) coordinates, concatenated across images in order.
+    let mut abs = Vec::new();
+    for &(gh, gw) in grids {
+        let (mh, mw) = (gh / merge_size, gw / merge_size);
+        for idx in 0..(mh * mw) {
+            abs.push(((idx / mw) as i32, (idx % mw) as i32));
+        }
+    }
+    let context_count = ids.iter().filter(|&&id| id == img_context_id).count();
+    if context_count != abs.len() {
+        return Err(candle_gen::candle_core::Error::Msg(format!(
+            "sensenova it2i: {context_count} <IMG_CONTEXT> tokens but {} merged-grid positions",
+            abs.len()
+        )));
+    }
+    let mut h = vec![0i32; n];
+    let mut w = vec![0i32; n];
+    let mut k = 0usize;
+    for i in 0..n {
+        if ids[i] == img_context_id {
+            let (y, x) = abs.get(k).copied().ok_or_else(|| {
+                candle_gen::candle_core::Error::Msg(format!(
+                    "sensenova it2i: <IMG_CONTEXT> position {k} has no merged-grid coordinate"
+                ))
+            })?;
+            h[i] = y;
+            w[i] = x;
+            k += 1;
+        }
+    }
+    Ok((t, h, w))
+}
+
+impl T2iModel {
     /// Embed `ids` and splice the understanding vision features into the `<IMG_CONTEXT>` positions
     /// (the reference `_build_it2i_inputs`). Returns the prefix embeds `[1, S, hidden]` and its
     /// `(t, h, w)` rows. Scatter is a one-hot selection matmul (no in-place index assignment).
@@ -696,7 +727,7 @@ impl T2iModel {
     ) -> CResult<(Tensor, Vec<i32>, Vec<i32>, Vec<i32>)> {
         let s = ids.len();
         let mut embeds = self.backbone.embed(ids)?; // [1, S, H]
-        let (t, h, w) = self.get_thw_indexes(ids, grids);
+        let (t, h, w) = self.get_thw_indexes(ids, grids)?;
 
         if let Some(pv) = pixel_values {
             let vit = self.und_vision_features(pv, grids)?; // [n_ctx, H]
@@ -1407,6 +1438,32 @@ mod tests {
 
     fn flat(t: &Tensor) -> Vec<f32> {
         t.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+    }
+
+    #[test]
+    fn thw_indexes_rejects_token_grid_mismatch_without_panicking() {
+        // These are the production tokenizer ids. A literal reserved marker in user text used to
+        // add this context id without a vision grid and index past the empty coordinate vector.
+        let injected = [tokens::IMG_START, tokens::IMG_CONTEXT, tokens::IMG_END];
+        let err = thw_indexes(&injected, &[], tokens::IMG_START, tokens::IMG_CONTEXT, 2)
+            .expect_err("a tokenizer marker without a vision grid must be a typed error");
+        assert_eq!(
+            err.to_string(),
+            "sensenova it2i: 1 <IMG_CONTEXT> tokens but 0 merged-grid positions"
+        );
+
+        let exact = [
+            tokens::IMG_START,
+            tokens::IMG_CONTEXT,
+            tokens::IMG_CONTEXT,
+            tokens::IMG_CONTEXT,
+            tokens::IMG_CONTEXT,
+            tokens::IMG_END,
+        ];
+        let (_, h, w) =
+            thw_indexes(&exact, &[(4, 4)], tokens::IMG_START, tokens::IMG_CONTEXT, 2).unwrap();
+        assert_eq!(h, vec![0, 0, 0, 1, 1, 0]);
+        assert_eq!(w, vec![0, 0, 1, 0, 1, 0]);
     }
 
     #[test]

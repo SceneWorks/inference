@@ -148,6 +148,11 @@ impl Generator for KolorsGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
+        // A pre-canceled request must not trigger the lazy multi-gigabyte component load. Render
+        // has additional checkpoints after request setup, at every image, and before decode.
+        if req.cancel.is_cancelled() {
+            return Err(gen_core::Error::Canceled);
+        }
         let pipe = Pipeline::load(&self.root, &self.device, self.pid_spec.clone());
         let components = self.components(&pipe)?;
         let images = pipe.render(req, &components, on_progress)?;
@@ -346,6 +351,39 @@ mod tests {
                 ..Default::default()
             })
             .is_ok());
+    }
+
+    #[test]
+    fn pre_cancelled_zero_strength_native_and_curated_skip_component_load() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID, &spec)
+            .unwrap();
+
+        for sampler in [None, Some("dpmpp_2m".to_string())] {
+            let request = GenerationRequest {
+                prompt: "edit the reference".into(),
+                width: 512,
+                height: 512,
+                steps: Some(10),
+                sampler,
+                conditioning: vec![Conditioning::Reference {
+                    image: Image {
+                        width: 8,
+                        height: 8,
+                        pixels: vec![127; 8 * 8 * 3],
+                    },
+                    strength: Some(0.0),
+                }],
+                ..Default::default()
+            };
+            request.cancel.cancel();
+            let err = g
+                .generate(&request, &mut |_| {})
+                .expect_err("pre-cancellation must win before the missing snapshot is opened");
+            assert!(matches!(err, gen_core::Error::Canceled));
+        }
     }
 
     /// sc-7124: the curated ε/DDPM menu is advertised, so `validate` accepts a curated sampler +

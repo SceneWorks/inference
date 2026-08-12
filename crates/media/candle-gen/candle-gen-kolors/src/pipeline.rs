@@ -20,7 +20,7 @@
 //! over bf16 weights"); the SDXL VAE is f32-stable so it needs no fp16-fix.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
@@ -197,7 +197,9 @@ pub(crate) struct Components {
     chatglm: Arc<ChatGlmModel>,
     unet: KolorsUnet,
     vae: Arc<AutoEncoderKL>,
-    vae_encoder: Arc<VaeMomentsEncoder>,
+    /// The img2img-only half of the VAE. Ordinary T2I must not pay for or retain a second copy of
+    /// the encoder weights, so the first reference request populates this shared read-through slot.
+    vae_encoder: Arc<Mutex<Option<Arc<VaeMomentsEncoder>>>>,
     /// Optional NVIDIA PiD super-resolving decoder (epic 7840 / sc-7853); None ⇒ native VAE decode.
     pid: Option<Arc<PidEngine>>,
 }
@@ -273,9 +275,12 @@ impl Pipeline {
             )?)),
         };
 
-        let vae_vb = self.f32_vb(&self.root.join("vae"))?;
-        let vae = AutoEncoderKL::new(vae_vb.clone(), 3, 3, sdxl_vae_config())?;
-        let vae_encoder = VaeMomentsEncoder::new(vae_vb, VAE_SCALE)?;
+        let vae = AutoEncoderKL::new(
+            self.f32_vb(&self.root.join("vae"))?,
+            3,
+            3,
+            sdxl_vae_config(),
+        )?;
         // Load the optional PiD super-resolving decoder once (epic 7840 / sc-7853) when the caller
         // opted in via `LoadSpec::pid`; Kolors shares the SDXL VAE latent space (`sdxl` student).
         let pid = match self.pid_spec.as_ref() {
@@ -291,7 +296,7 @@ impl Pipeline {
             chatglm: Arc::new(chatglm),
             unet,
             vae: Arc::new(vae),
-            vae_encoder: Arc::new(vae_encoder),
+            vae_encoder: Arc::new(Mutex::new(None)),
             pid,
         })
     }
@@ -310,6 +315,7 @@ impl Pipeline {
         components: &Components,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<Image>> {
+        ensure_not_cancelled(req)?;
         let steps = req
             .steps
             .map(|s| s as usize)
@@ -368,6 +374,9 @@ impl Pipeline {
         let (lat_h, lat_w) = ((h / 8) as usize, (w / 8) as usize);
         let total = sampler.num_steps() as u32;
         candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+            // A cancellation raised during prompt/reference setup must be observed even when this
+            // image's strength selects an empty denoise schedule.
+            ensure_not_cancelled(req)?;
             let noise = common::initial_noise(&self.device, seed, lat_h, lat_w)?;
 
             let latents = if let Some(name) = curated {
@@ -437,6 +446,9 @@ impl Pipeline {
                 latents
             };
 
+            // Zero-strength img2img executes no denoise iteration on either route, so this explicit
+            // checkpoint is the final guard against decoding a canceled request.
+            ensure_not_cancelled(req)?;
             on_progress(Progress::Decoding);
             common::decode(&components.vae, pid_decoder.as_ref(), &latents)
         })
@@ -558,7 +570,13 @@ impl Pipeline {
             .unsqueeze(0)?
             .contiguous()?
             .to_dtype(DType::F32)?;
-        Ok(components.vae_encoder.encode_mean(&input)?)
+        let vae_encoder = candle_gen::cached(&components.vae_encoder, || {
+            Ok::<_, CandleError>(Arc::new(VaeMomentsEncoder::new(
+                self.f32_vb(&self.root.join("vae"))?,
+                VAE_SCALE,
+            )?))
+        })?;
+        Ok(vae_encoder.encode_mean(&input)?)
     }
 
     /// Encode one prompt → `(context [1, 256, 4096], pooled [1, 4096])` via the ChatGLM3 encoder. Stays
@@ -568,6 +586,18 @@ impl Pipeline {
     fn encode(&self, components: &Components, prompt: &str) -> Result<(Tensor, Tensor)> {
         let tokens = components.tokenizer.encode(prompt)?;
         Ok(components.chatglm.encode_prompt(&tokens)?)
+    }
+}
+
+/// Cancellation gate used before setup, at each count iteration, and immediately before decode.
+/// The latter two are required for img2img strength `0`, whose native and curated schedules contain
+/// no model evaluations and therefore cannot rely on a denoise-loop poll.
+#[inline]
+fn ensure_not_cancelled(req: &GenerationRequest) -> Result<()> {
+    if req.cancel.is_cancelled() {
+        Err(CandleError::Canceled)
+    } else {
+        Ok(())
     }
 }
 
@@ -741,6 +771,83 @@ mod tests {
             ..Default::default()
         };
         assert!(resolve_reference(&multiple).is_err());
+    }
+
+    fn zero_strength_reference(sampler: Option<&str>) -> GenerationRequest {
+        GenerationRequest {
+            prompt: "edit the reference".into(),
+            width: 512,
+            height: 512,
+            steps: Some(10),
+            sampler: sampler.map(str::to_owned),
+            conditioning: vec![Conditioning::Reference {
+                image: Image::default(),
+                strength: Some(0.0),
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn assert_zero_strength_cancellation(request: &GenerationRequest, curated: bool) {
+        let (_, strength) = resolve_reference(request).unwrap().unwrap();
+        assert_eq!(strength, 0.0);
+        let native_schedule =
+            KolorsEulerSampler::img2img(request.steps.unwrap() as usize, strength).unwrap();
+        assert_eq!(native_schedule.num_steps(), 0, "the denoise loop is empty");
+        assert_eq!(
+            curated_route(request.sampler.as_deref(), request.scheduler.as_deref()).is_some(),
+            curated
+        );
+
+        // Production's first checkpoint handles a pre-canceled request.
+        let mut pre_cancelled = request.clone();
+        pre_cancelled.cancel = gen_core::CancelFlag::new();
+        pre_cancelled.cancel.cancel();
+        assert!(matches!(
+            ensure_not_cancelled(&pre_cancelled),
+            Err(CandleError::Canceled)
+        ));
+
+        // Recreate the second case with a fresh active request, then cancel after setup: the
+        // per-image and pre-decode calls use this same gate and must not depend on a denoise
+        // iteration existing.
+        ensure_not_cancelled(request).expect("request begins active");
+        request.cancel.cancel();
+        assert!(matches!(
+            ensure_not_cancelled(request),
+            Err(CandleError::Canceled)
+        ));
+    }
+
+    #[test]
+    fn native_zero_strength_img2img_observes_cancellation_without_a_step() {
+        let request = zero_strength_reference(None);
+        assert_zero_strength_cancellation(&request, false);
+    }
+
+    #[test]
+    fn curated_zero_strength_img2img_observes_cancellation_without_a_step() {
+        let request = zero_strength_reference(Some("dpmpp_2m"));
+        assert_zero_strength_cancellation(&request, true);
+    }
+
+    #[test]
+    fn t2i_component_load_leaves_the_img2img_encoder_cache_empty() {
+        // Lock the production construction boundary: the ordinary component load creates only the
+        // decoder-bearing AutoEncoderKL and an empty shared slot. VaeMomentsEncoder construction is
+        // confined to encode_reference's read-through miss, reached only by reference requests.
+        let source = include_str!("pipeline.rs");
+        let loader_start = source.find("pub(crate) fn load_components").unwrap();
+        let loader_end = source[loader_start..].find("    fn f32_vb").unwrap() + loader_start;
+        let loader = &source[loader_start..loader_end];
+        assert!(loader.contains("vae_encoder: Arc::new(Mutex::new(None))"));
+        assert!(!loader.contains("VaeMomentsEncoder::new"));
+
+        let encode_start = source.find("    fn encode_reference").unwrap();
+        let encode_end = source[encode_start..].find("    fn encode(").unwrap() + encode_start;
+        let encode = &source[encode_start..encode_end];
+        assert!(encode.contains("candle_gen::cached(&components.vae_encoder"));
+        assert!(encode.contains("VaeMomentsEncoder::new"));
     }
 
     /// sc-10819: `detect_packed_unet` returns `Some((file, group))` when `unet/config.json` carries a

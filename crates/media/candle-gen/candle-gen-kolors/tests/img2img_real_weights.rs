@@ -1,9 +1,9 @@
 //! sc-18476 real-weight CUDA proof for the registered Kolors source-image img2img path.
 //!
-//! Native leading-Euler and curated-Euler conditioned renders are each compared with a text-only
-//! render at the same seed. Byte identity would expose the exact regression this story closes:
-//! accepting `Reference` while silently taking the unconditioned T2I path. A native-vs-curated
-//! comparison also proves the new curated img2img branch ran rather than aliasing the default lane.
+//! Native leading-Euler and curated-Euler each render two materially different references at the
+//! same seed, shape, strength, and schedule. Per-lane A/B divergence proves the reference pixels,
+//! rather than only a shorter schedule or request geometry, affect output. Text-only and cross-lane
+//! comparisons retain the broader route and edit checks.
 
 use std::path::PathBuf;
 
@@ -33,6 +33,29 @@ fn structured_reference(size: u32) -> Image {
                 pixels[offset] = 245;
                 pixels[offset + 1] = 185;
                 pixels[offset + 2] = 35;
+            }
+        }
+    }
+    Image {
+        width: size,
+        height: size,
+        pixels,
+    }
+}
+
+fn secondary_reference(size: u32) -> Image {
+    let mut pixels = vec![0u8; (size * size * 3) as usize];
+    for y in 0..size {
+        for x in 0..size {
+            let offset = ((y * size + x) * 3) as usize;
+            let left = x < size / 2;
+            pixels[offset] = if left { 210 } else { 38 };
+            pixels[offset + 1] = if left { 52 } else { 196 };
+            pixels[offset + 2] = if left { 75 } else { 132 };
+            if x.abs_diff(y) < size / 24 {
+                pixels[offset] = 250;
+                pixels[offset + 1] = 238;
+                pixels[offset + 2] = 42;
             }
         }
     }
@@ -100,6 +123,7 @@ fn registered_reference_img2img_uses_the_vae_init_and_strength_tail() {
         )
         .expect("load Kolors");
     let reference = structured_reference(SIZE);
+    let secondary = secondary_reference(SIZE);
     let base = GenerationRequest {
         prompt: "transform the flat landscape into intricate stained-glass artwork while \
                  preserving the rolling green hills and golden sun"
@@ -134,6 +158,21 @@ fn registered_reference_img2img_uses_the_vae_init_and_strength_tail() {
             })
             .expect("reference-conditioned render"),
     );
+    let mut secondary_conditioned = conditioned.clone();
+    secondary_conditioned.conditioning = vec![Conditioning::Reference {
+        image: secondary.clone(),
+        strength: Some(STRENGTH),
+    }];
+    let mut secondary_denoise_steps = 0u32;
+    let secondary_img2img = one_image(
+        generator
+            .generate(&secondary_conditioned, &mut |progress| {
+                if matches!(progress, Progress::Step { .. }) {
+                    secondary_denoise_steps += 1;
+                }
+            })
+            .expect("same-shape secondary-reference native render"),
+    );
 
     // Exercise the newly wired curated img2img branch as a distinct real-weight path. `euler` is a
     // curated solver name (unlike the native `euler_discrete` default), so this request must enter
@@ -154,6 +193,21 @@ fn registered_reference_img2img_uses_the_vae_init_and_strength_tail() {
             })
             .expect("curated reference-conditioned render"),
     );
+    let mut curated_secondary_request = curated_request.clone();
+    curated_secondary_request.conditioning = vec![Conditioning::Reference {
+        image: secondary.clone(),
+        strength: Some(STRENGTH),
+    }];
+    let mut curated_secondary_steps = 0u32;
+    let curated_secondary_img2img = one_image(
+        generator
+            .generate(&curated_secondary_request, &mut |progress| {
+                if matches!(progress, Progress::Step { .. }) {
+                    curated_secondary_steps += 1;
+                }
+            })
+            .expect("same-shape secondary-reference curated render"),
+    );
 
     let expected_steps = (STEPS as f32 * STRENGTH).floor() as u32;
     assert_eq!(
@@ -164,6 +218,14 @@ fn registered_reference_img2img_uses_the_vae_init_and_strength_tail() {
         curated_steps, expected_steps,
         "curated strength-selected schedule tail"
     );
+    assert_eq!(
+        secondary_denoise_steps, expected_steps,
+        "secondary native strength-selected schedule tail"
+    );
+    assert_eq!(
+        curated_secondary_steps, expected_steps,
+        "secondary curated strength-selected schedule tail"
+    );
     let spread = standard_deviation(&img2img.pixels);
     let t2i_delta = mean_abs_delta(&text_only.pixels, &img2img.pixels);
     let reference_delta = mean_abs_delta(&reference.pixels, &img2img.pixels);
@@ -171,6 +233,9 @@ fn registered_reference_img2img_uses_the_vae_init_and_strength_tail() {
     let curated_t2i_delta = mean_abs_delta(&text_only.pixels, &curated_img2img.pixels);
     let curated_reference_delta = mean_abs_delta(&reference.pixels, &curated_img2img.pixels);
     let lane_delta = mean_abs_delta(&img2img.pixels, &curated_img2img.pixels);
+    let native_pixel_delta = mean_abs_delta(&img2img.pixels, &secondary_img2img.pixels);
+    let curated_pixel_delta =
+        mean_abs_delta(&curated_img2img.pixels, &curated_secondary_img2img.pixels);
     eprintln!(
         "Kolors img2img: std={spread:.2}, mean |Δ vs T2I|={t2i_delta:.2}, \
          mean |Δ vs reference|={reference_delta:.2}"
@@ -205,9 +270,25 @@ fn registered_reference_img2img_uses_the_vae_init_and_strength_tail() {
         lane_delta > 0.1,
         "curated and native paths produced indistinguishable outputs: {lane_delta:.3}"
     );
+    assert!(
+        native_pixel_delta > 0.1,
+        "native same-shape renders ignored materially different reference pixels: \
+         {native_pixel_delta:.3}"
+    );
+    assert!(
+        curated_pixel_delta > 0.1,
+        "curated same-shape renders ignored materially different reference pixels: \
+         {curated_pixel_delta:.3}"
+    );
 
     save(&reference, "kolors_reference.png");
+    save(&secondary, "kolors_reference_secondary.png");
     save(&text_only, "kolors_text_only.png");
     save(&img2img, "kolors_img2img.png");
+    save(&secondary_img2img, "kolors_img2img_secondary.png");
     save(&curated_img2img, "kolors_img2img_curated_euler.png");
+    save(
+        &curated_secondary_img2img,
+        "kolors_img2img_curated_euler_secondary.png",
+    );
 }
