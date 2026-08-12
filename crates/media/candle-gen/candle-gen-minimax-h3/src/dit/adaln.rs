@@ -422,6 +422,17 @@ impl TimestepSchedule {
 /// On the CPU device this is a cheap no-op — candle's CPU storage is a plain Rust allocation that
 /// the global allocator reclaims at drop — so the call is unconditional and the eviction path reads
 /// the same on both backends.
+///
+/// # No test in this crate gates this call
+///
+/// Stated here because the alternative is a reader assuming coverage that does not exist. Deleting
+/// this call and running the whole crate with `--no-fail-fast` leaves it **green**: every suite runs
+/// on the CPU device, where `synchronize` is by definition a no-op. The claim above is SC-15791's
+/// measurement, not this crate's.
+///
+/// `tests/adaln_evict_memory.rs`'s `#[cfg(feature = "cuda")]` arm is the only thing that could gate
+/// it, and it needs a GPU to run. Deleting the *drop* that precedes this call, by contrast, is
+/// caught immediately.
 pub fn release_device_memory(device: &Device) -> Result<()> {
     Ok(device.synchronize()?)
 }

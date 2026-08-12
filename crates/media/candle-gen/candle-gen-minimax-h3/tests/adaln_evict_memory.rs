@@ -55,8 +55,20 @@
 //!   0.0 MiB`). What is unverified is that *this* eviction follows that established behaviour, not
 //!   the behaviour itself.
 //! * Nothing here is measured at the real 26.02 GB. The stack is synthetic and AdaLN-heavy at the
-//!   real *ratio*; the 26_020_915_200 B figure is arithmetic over the published shapes, asserted as
-//!   such in `dit::adaln`'s unit tests.
+//!   real *ratio*; the 26_020_915_200 B figure is arithmetic over the published shapes, asserted
+//!   against the published shard headers by `real_weights.rs`'s
+//!   `the_adaln_projections_are_the_documented_twenty_six_gigabytes`.
+//! * **The synchronize is NOT gated by this suite — measured, not assumed.** Deleting
+//!   `release_device_memory(device)?` from `AdaLnCache::precompute_and_evict` and re-running the
+//!   whole crate with `--no-fail-fast` leaves it **green**. That is correct and unavoidable rather
+//!   than an oversight: `Device::synchronize` is a no-op on the CPU device, so on the only device
+//!   this suite runs on the call cannot change anything observable.
+//!
+//!   The consequence must be stated rather than left implied: **the CUDA half of the eviction
+//!   recipe is unguarded here.** "The synchronize is what returns the pages to the driver" rests on
+//!   SC-15791's measurement, not on anything this file proves. Only the CUDA arm below can gate it,
+//!   and only on a box with a GPU. By contrast, deleting the *drop* is killed immediately and by
+//!   exactly one test — `the_evicted_adaln_weights_leave_memory` — so the release itself is gated.
 //!
 //! # A measured candle property this test had to be built around
 //!
