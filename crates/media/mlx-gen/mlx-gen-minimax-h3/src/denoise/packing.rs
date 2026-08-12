@@ -71,8 +71,9 @@ use crate::denoise::geometry::JointGeometry;
 use crate::denoise::schedule::{KEYFRAME_NOISE_AUG, REFERENCE_AUDIO_TIMESTEP};
 use crate::dit::config::MODALITY_NUM;
 use crate::dit::positions::{
-    audio_position_ids, frame_grid, keyframe_position_ids, text_position_ids, to_array,
-    video_position_ids, KeyframeAnchor,
+    audio_position_ids, frame_grid, keyframe_position_ids, reference_block_position_ids,
+    temporal_grid, text_position_ids, to_array, video_position_ids, KeyframeAnchor,
+    ReferenceLatentGeometry,
 };
 
 /// `MINIMAX_H3_VIDEO_TAG`.
@@ -227,6 +228,43 @@ impl PackedLayout {
         let audio_indices: Vec<i32> = (audio_start..video_start).collect();
         let text_indices: Vec<i32> = (0..num_text_tokens).collect();
 
+        Self::assemble(
+            geometry,
+            num_text_tokens,
+            audio_channels,
+            rows_per_frame,
+            num_condition_video_rows,
+            num_condition_audio_rows,
+            seq_len,
+            position_ids,
+            text_token_tags,
+            video_indices,
+            audio_indices,
+            text_indices,
+        )
+    }
+
+    /// The per-row tags, row classes and scatter permutation, shared by both constructors.
+    ///
+    /// Shared **deliberately**: the leading-rows-are-conditioning rule is the one piece of this
+    /// layout that `ref2va` extends rather than replaces, and two copies of it would let the
+    /// `ConditionAudio` class be right on one path and silently absent on the other. `t2va` /
+    /// `fl2va` pass `num_condition_audio_rows = 0` and take the same code.
+    #[allow(clippy::too_many_arguments)]
+    fn assemble(
+        geometry: JointGeometry,
+        num_text_tokens: i32,
+        audio_channels: i32,
+        rows_per_frame: i32,
+        num_condition_video_rows: i32,
+        num_condition_audio_rows: i32,
+        seq_len: i32,
+        position_ids: Array,
+        text_token_tags: &[i32],
+        video_indices: Vec<i32>,
+        audio_indices: Vec<i32>,
+        text_indices: Vec<i32>,
+    ) -> Result<Self> {
         // --- tags and row classes ---------------------------------------------------------------
         let mut tags = vec![0i32; seq_len as usize];
         let mut classes = vec![0i32; seq_len as usize];
@@ -291,6 +329,178 @@ impl PackedLayout {
             text_indices,
             inverse,
         })
+    }
+
+    /// Assemble the layout for a **`ref2va`** request — the reference blocks, then the generated
+    /// rows.
+    ///
+    /// `references` is in **packed order** and its entries are the *encoded* latent geometries, so
+    /// the layout and the conditioning rows are built from one description and cannot disagree.
+    ///
+    /// # How this differs from [`Self::build`], and why it is a second constructor
+    ///
+    /// `t2va` / `fl2va` have a fixed block order — text, keyframe anchors, audio, video — with the
+    /// anchors all at one of two rotary times and no reference audio at all. `ref2va` has none of
+    /// that:
+    ///
+    /// * **The blocks interleave in request order.** An image, a clip and a waveform each occupy a
+    ///   contiguous run whose position depends on every reference before it, so the row ranges
+    ///   cannot be computed from three counts.
+    /// * **Every reference carries its own canvas.** [`Self::rows_per_frame`] is a single number
+    ///   for the generated rows and simply does not describe the references, which are encoded at
+    ///   their own resolutions.
+    /// * **Audio conditioning rows exist**, at [`RowClass::ConditionAudio`] / a clean `1.0` — the
+    ///   class `t2va` and `fl2va` declare but never populate.
+    /// * **A clip's soundtrack is packed before its own video rows**, sharing their rotary origin.
+    ///
+    /// Folding all of that into `build` behind an `Option` would make the common path carry
+    /// `ref2va`'s bookkeeping, and would make the two orders a runtime property rather than a
+    /// choice of constructor.
+    pub fn build_ref2va(
+        geometry: JointGeometry,
+        patch_size: [i32; 3],
+        text_token_tags: &[i32],
+        audio_channels: i32,
+        references: &[ReferenceLatentGeometry],
+    ) -> Result<Self> {
+        geometry.validate()?;
+        let (patch_h, patch_w) = (patch_size[1], patch_size[2]);
+        if patch_h <= 0 || patch_w <= 0 {
+            return Err(Error::Msg(format!(
+                "minimax-h3 packing: patch {patch_size:?} must be positive"
+            )));
+        }
+        if text_token_tags.is_empty() {
+            return Err(Error::Msg(
+                "minimax-h3 packing: the packed sequence always carries at least one text row"
+                    .into(),
+            ));
+        }
+        if let Some(bad) = text_token_tags
+            .iter()
+            .find(|&&t| !(0..MODALITY_NUM).contains(&t))
+        {
+            return Err(Error::Msg(format!(
+                "minimax-h3 packing: text token tag {bad} is outside [0, {MODALITY_NUM})"
+            )));
+        }
+        if audio_channels <= 0 {
+            return Err(Error::Msg(format!(
+                "minimax-h3 packing: audio_channels must be positive, got {audio_channels}"
+            )));
+        }
+        if references.is_empty() {
+            return Err(Error::Msg(
+                "minimax-h3 packing: a ref2va layout needs at least one reference; a text-only \
+                 request is t2va"
+                    .into(),
+            ));
+        }
+
+        let num_text_tokens = text_token_tags.len() as i32;
+        let rows_per_frame = (geometry.latent_height / patch_h) * (geometry.latent_width / patch_w);
+        if rows_per_frame <= 0 {
+            return Err(Error::Msg(format!(
+                "minimax-h3 packing: a {}x{} latent at patch {patch_h}x{patch_w} has no rows",
+                geometry.latent_height, geometry.latent_width
+            )));
+        }
+        let num_target_audio_rows = geometry.num_audio_latents * audio_channels;
+        let num_target_video_rows = geometry.num_latent_frames * rows_per_frame;
+
+        let (_, target_width_grid) = frame_grid(
+            geometry.latent_height,
+            geometry.latent_width,
+            patch_h,
+            patch_w,
+        )?;
+
+        // --- the reference blocks, in packed order ----------------------------------------------
+        let mut rows: Vec<[f64; 3]> = text_position_ids(num_text_tokens)?;
+        let mut video_indices: Vec<i32> = Vec::new();
+        let mut audio_indices: Vec<i32> = Vec::new();
+        let mut cursor = num_text_tokens;
+        // The shared audio/video rotary clock: it starts where the text rows end.
+        let mut rotary_time = f64::from(num_text_tokens);
+
+        for (i, r) in references.iter().enumerate() {
+            let (audio_rows, video_rows, advance) = reference_block_position_ids(
+                r,
+                rotary_time,
+                patch_h,
+                patch_w,
+                audio_channels,
+                &target_width_grid,
+            )
+            .map_err(|e| Error::Msg(format!("{e} (reference {i})")))?;
+            // Audio FIRST — a clip's soundtrack rows are packed immediately before its video rows.
+            for row in audio_rows {
+                audio_indices.push(cursor);
+                rows.push(row);
+                cursor += 1;
+            }
+            for row in video_rows {
+                video_indices.push(cursor);
+                rows.push(row);
+                cursor += 1;
+            }
+            rotary_time += advance;
+        }
+        let num_condition_video_rows = video_indices.len() as i32;
+        let num_condition_audio_rows = audio_indices.len() as i32;
+
+        // --- the generated rows, sharing the origin the references left behind -------------------
+        let audio_start = cursor;
+        let video_start = audio_start + num_target_audio_rows;
+        let seq_len = video_start + num_target_video_rows;
+
+        rows.extend(
+            audio_position_ids(
+                0,
+                geometry.num_audio_latents,
+                audio_channels,
+                &target_width_grid,
+            )?
+            .into_iter()
+            .map(|[t, h, w]| [t + rotary_time, h, w]),
+        );
+        let (target_frame_grid, _) = frame_grid(
+            geometry.latent_height,
+            geometry.latent_width,
+            patch_h,
+            patch_w,
+        )?;
+        for &t in &temporal_grid(geometry.num_latent_frames, rotary_time)? {
+            rows.extend(target_frame_grid.iter().map(|&[h, w]| [t, h, w]));
+        }
+
+        if rows.len() as i32 != seq_len {
+            return Err(Error::Msg(format!(
+                "minimax-h3 packing: assembled {} position rows for a {seq_len}-row ref2va \
+                 sequence",
+                rows.len()
+            )));
+        }
+        let position_ids = to_array(&rows)?;
+
+        audio_indices.extend(audio_start..video_start);
+        video_indices.extend(video_start..seq_len);
+        let text_indices: Vec<i32> = (0..num_text_tokens).collect();
+
+        Self::assemble(
+            geometry,
+            num_text_tokens,
+            audio_channels,
+            rows_per_frame,
+            num_condition_video_rows,
+            num_condition_audio_rows,
+            seq_len,
+            position_ids,
+            text_token_tags,
+            video_indices,
+            audio_indices,
+            text_indices,
+        )
     }
 
     /// Rows in the packed sequence.

@@ -137,6 +137,7 @@
 pub mod alias_free;
 pub mod audio_config;
 pub mod audio_vae;
+pub mod audio_vae_encoder;
 pub mod blocks;
 pub mod chunking;
 pub mod conditioning;
@@ -149,6 +150,7 @@ pub mod keyframe;
 pub mod layout;
 pub mod model;
 pub mod pipeline;
+pub mod reference;
 pub mod rope;
 pub mod tensor;
 pub mod text_encoder;
@@ -162,6 +164,7 @@ pub use audio_config::{
     AUDIO_SAMPLE_RATE, AUDIO_TOKEN_RATE_HZ,
 };
 pub use audio_vae::MiniMaxH3AudioVae;
+pub use audio_vae_encoder::{AudioDiagonalGaussian, MiniMaxH3AudioVaeEncoder};
 pub use chunking::{ChunkSpan, TemporalGeometry, TemporalPlan};
 pub use conditioning::{
     build_condition_rows, encode_keyframe_condition, fp16_round_trip, keyframe_condition_rows,
@@ -206,6 +209,11 @@ pub use pipeline::{
     t2va_layout, unpack_audio_rows, unpatchify_video_rows, RenderedLatents, RequestGeometry,
     CANVAS_MAX_PIXELS, CANVAS_SHORT_EDGE, MAX_DURATION_SECONDS, MIN_DURATION_SECONDS, PATCH_SIZE,
     PIXEL_MEAN, PIXEL_STD, SMALLEST_LEGAL_FRAMES, SPATIAL_STRIDE,
+};
+pub use reference::{
+    AudioReference, Ref2VaReference, Ref2VaReferences, ReferenceCounts, ReferenceKind,
+    ReferencePresentation, VideoReference, MAX_AUDIO_REFERENCES, MAX_IMAGE_REFERENCES,
+    MAX_TOTAL_REFERENCES, MAX_VIDEO_REFERENCES, REFERENCE_IMAGE_SHORT_EDGE,
 };
 pub use rope::{create_token_ids, Rope3d, RopeTables};
 pub use text_encoder::{

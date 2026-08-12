@@ -35,6 +35,9 @@ pub struct MiniMaxH3TextEncoder {
     /// 0-indexed decoder layer whose output is the context (`select_hidden - 1`).
     out_layer: usize,
     image_token_id: i32,
+    /// `<|video_pad|>` — the pad a `ref2va` **video** reference's blocks occupy. `fl2va` never
+    /// emits one, which is why the base grounded path scans for `image_token_id` alone.
+    video_token_id: i32,
     mrope_section: [i32; 3],
     head_dim: i32,
     rope_theta: f32,
@@ -74,6 +77,7 @@ impl MiniMaxH3TextEncoder {
             rope: TextRope::new(cfg.head_dim, cfg.rope_theta),
             out_layer,
             image_token_id: cfg.image_token_id,
+            video_token_id: cfg.video_token_id,
             mrope_section: cfg.mrope_section,
             head_dim: cfg.head_dim,
             rope_theta: cfg.rope_theta,
@@ -130,20 +134,68 @@ impl MiniMaxH3TextEncoder {
         deepstack: &[Vec<Array>],
         grids: &[[i32; 3]],
     ) -> Result<Array> {
+        let pads = [self.image_token_id];
+        self.forward_grounded(
+            input_ids,
+            attention_mask,
+            image_embeds,
+            deepstack,
+            grids,
+            &pads,
+        )
+    }
+
+    /// The **`ref2va`** grounded forward: splice reference features into runs of *both*
+    /// `<|image_pad|>` and `<|video_pad|>`.
+    ///
+    /// `embeds`, `deepstack` and `grids` are in **sequence order** — the order the pad runs appear
+    /// in the presentation, which for `ref2va` is request order across modalities.
+    ///
+    /// # Why sequence order reproduces the reference's per-modality batching
+    ///
+    /// Qwen3-VL batches vision tensors *per modality* and fills the n-th pad run of a modality with
+    /// the n-th entry of that modality's batch. Relative order **within** a modality is preserved by
+    /// request order, so walking runs in sequence order while consuming features in request order
+    /// yields exactly the same assignment — with one cursor instead of two, and therefore no way
+    /// for the two to drift apart on an interleaved request.
+    ///
+    /// A run never spans two *different* pads, so an image block immediately followed by a video
+    /// block stays two runs and two references.
+    pub fn forward_with_references(
+        &self,
+        input_ids: &Array,
+        attention_mask: &Array,
+        embeds: &[Array],
+        deepstack: &[Vec<Array>],
+        grids: &[[i32; 3]],
+    ) -> Result<Array> {
+        let pads = [self.image_token_id, self.video_token_id];
+        self.forward_grounded(input_ids, attention_mask, embeds, deepstack, grids, &pads)
+    }
+
+    fn forward_grounded(
+        &self,
+        input_ids: &Array,
+        attention_mask: &Array,
+        image_embeds: &[Array],
+        deepstack: &[Vec<Array>],
+        grids: &[[i32; 3]],
+        pad_ids: &[i32],
+    ) -> Result<Array> {
         let sh = input_ids.shape();
         let (b, s) = (sh[0], sh[1]);
         let ids_arr = input_ids.as_dtype(Dtype::Int32)?;
         let ids: Vec<i32> = ids_arr.as_slice::<i32>().to_vec();
 
-        let runs = image_token_runs(&ids, self.image_token_id, s);
+        let runs = image_token_runs(&ids, pad_ids, s);
         if runs.is_empty() {
             return Err(Error::Msg(
-                "minimax-h3 te (grounded): prompt has no <|image_pad|> tokens".into(),
+                "minimax-h3 te (grounded): prompt has no vision-pad tokens".into(),
             ));
         }
         if runs.len() != image_embeds.len() || runs.len() != grids.len() {
             return Err(Error::Msg(format!(
-                "minimax-h3 te (grounded): {} <|image_pad|> run(s) but {} embeds / {} grids",
+                "minimax-h3 te (grounded): {} vision-pad run(s) but {} embeds / {} grids",
                 runs.len(),
                 image_embeds.len(),
                 grids.len()
@@ -157,7 +209,7 @@ impl MiniMaxH3TextEncoder {
             hidden = replace_seq(&hidden, &img, start, end)?;
         }
 
-        let (pt, ph, pw) = mrope_positions_multi(&ids, self.image_token_id, grids);
+        let (pt, ph, pw) = mrope_positions_multi(&ids, pad_ids, grids);
         let (cos, sin) = mrope_cos_sin(
             &pt,
             &ph,
@@ -201,13 +253,18 @@ fn replace_seq(x: &Array, repl: &Array, start: i32, end: i32) -> Result<Array> {
 
 /// Contiguous runs of `image_token_id` in `ids` (`[start, end)` per run), in sequence order — one
 /// run per reference (the template separates references with `<|vision_end|><|vision_start|>`).
-fn image_token_runs(ids: &[i32], image_token_id: i32, s: i32) -> Vec<(i32, i32)> {
+fn image_token_runs(ids: &[i32], pad_ids: &[i32], s: i32) -> Vec<(i32, i32)> {
+    let is_pad = |v: i32| pad_ids.contains(&v);
     let mut runs = Vec::new();
     let mut i = 0i32;
     while i < s {
-        if ids[i as usize] == image_token_id {
+        if is_pad(ids[i as usize]) {
             let start = i;
-            while i < s && ids[i as usize] == image_token_id {
+            // A run does not span two DIFFERENT pads: `<|image_pad|>` and `<|video_pad|>` blocks
+            // are separate references even when adjacent, and merging them would splice one
+            // reference's embeds across two.
+            let first = ids[i as usize];
+            while i < s && ids[i as usize] == first {
                 i += 1;
             }
             runs.push((start, i));
@@ -224,7 +281,7 @@ fn image_token_runs(ids: &[i32], image_token_id: i32, s: i32) -> Vec<(i32, i32)>
 /// `cur += max(h, w) / merge`.
 fn mrope_positions_multi(
     ids: &[i32],
-    image_token_id: i32,
+    pad_ids: &[i32],
     grids: &[[i32; 3]],
 ) -> (Vec<i32>, Vec<i32>, Vec<i32>) {
     let (mut pt, mut ph, mut pw) = (Vec::new(), Vec::new(), Vec::new());
@@ -232,7 +289,7 @@ fn mrope_positions_multi(
     let mut img_i = 0usize;
     let mut i = 0usize;
     while i < ids.len() {
-        if ids[i] == image_token_id && img_i < grids.len() {
+        if pad_ids.contains(&ids[i]) && img_i < grids.len() {
             let g = grids[img_i];
             let (llm_h, llm_w) = (g[1] / SPATIAL_MERGE, g[2] / SPATIAL_MERGE);
             let step = g[1].max(g[2]) / SPATIAL_MERGE;
@@ -307,7 +364,7 @@ mod tests {
     /// full MRoPE build too.
     #[test]
     fn mrope_positions_text_only_is_sequential() {
-        let (pt, ph, pw) = mrope_positions_multi(&[10, 11, 12, 13], 151655, &[]);
+        let (pt, ph, pw) = mrope_positions_multi(&[10, 11, 12, 13], &[151655], &[]);
         assert_eq!(pt, vec![0, 1, 2, 3]);
         assert_eq!(pt, ph);
         assert_eq!(pt, pw);
@@ -320,7 +377,7 @@ mod tests {
         let img = 151655;
         // [txt, txt, img×4, txt] with a 4×4 patch grid → merged 2×2 = 4 image tokens.
         let ids = vec![1, 2, img, img, img, img, 3];
-        let (pt, ph, pw) = mrope_positions_multi(&ids, img, &[[1, 4, 4]]);
+        let (pt, ph, pw) = mrope_positions_multi(&ids, &[img], &[[1, 4, 4]]);
         assert_eq!(pt, vec![0, 1, 2, 2, 2, 2, 4]);
         assert_eq!(ph, vec![0, 1, 2, 2, 3, 3, 4]);
         assert_eq!(pw, vec![0, 1, 2, 3, 2, 3, 4]);
@@ -331,7 +388,7 @@ mod tests {
     fn mrope_positions_handles_two_references() {
         let img = 151655;
         let ids = vec![1, img, img, img, img, 2, img, 3];
-        let (pt, _, _) = mrope_positions_multi(&ids, img, &[[1, 4, 4], [1, 2, 2]]);
+        let (pt, _, _) = mrope_positions_multi(&ids, &[img], &[[1, 4, 4], [1, 2, 2]]);
         // txt@0; img0 (2×2 merged, 4 tokens) @cur=1, then cur += 4/2 = 2 → 3; txt@3 → cur 4;
         // img1 (1×1 merged, 1 token) @cur=4, then cur += 2/2 = 1 → 5; txt@5.
         assert_eq!(pt, vec![0, 1, 1, 1, 1, 3, 4, 5]);
@@ -343,10 +400,10 @@ mod tests {
         let img = 151655;
         let ids = vec![1, img, img, 2, img, 3];
         assert_eq!(
-            image_token_runs(&ids, img, ids.len() as i32),
+            image_token_runs(&ids, &[img], ids.len() as i32),
             vec![(1, 3), (4, 5)]
         );
-        assert!(image_token_runs(&[1, 2, 3], img, 3).is_empty());
+        assert!(image_token_runs(&[1, 2, 3], &[img], 3).is_empty());
     }
 
     /// The interleaved assignment must actually route H and W frequencies to different axes. With

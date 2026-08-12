@@ -649,6 +649,152 @@ pub fn fl2va_layout(
     )
 }
 
+/// A reference soundtrack as the audio VAE encoder's input: `[channels, 1, samples]`,
+/// **de-interleaved**.
+///
+/// # The model is mono, and stereo is a BATCH axis
+///
+/// `AudioTrack` carries interleaved PCM (`L R L R …`), and the audio VAE is mono — a stereo
+/// reference is encoded as **two batch items** through the same weights, exactly as
+/// [`crate::audio_vae::MiniMaxH3AudioVae::decode_stereo`] emits them. So this de-interleaves rather
+/// than reshaping: handing the encoder `[1, 1, 2·n]` would encode the two channels as one waveform
+/// at twice the rate, which runs, produces latents of a plausible shape, and is wrong.
+///
+/// The sample **rate** is not resampled here. The reference resamples a soundtrack onto the audio
+/// VAE's own rate before encoding, and a track arriving at another rate is rejected rather than
+/// silently encoded at the wrong speed.
+pub fn audio_track_to_encoder_input(track: &mlx_gen::media::AudioTrack) -> Result<Array> {
+    let channels = i32::from(track.channels);
+    if channels <= 0 {
+        return Err(Error::Msg(
+            "minimax_h3: a reference soundtrack declares zero channels".into(),
+        ));
+    }
+    if track.samples.is_empty() {
+        return Err(Error::Msg(
+            "minimax_h3: a reference soundtrack carries no samples".into(),
+        ));
+    }
+    if !track.samples.len().is_multiple_of(channels as usize) {
+        return Err(Error::Msg(format!(
+            "minimax_h3: a {}-channel soundtrack cannot hold {} interleaved samples",
+            channels,
+            track.samples.len()
+        )));
+    }
+    if track.sample_rate != AUDIO_SAMPLE_RATE {
+        return Err(Error::Msg(format!(
+            "minimax_h3: a reference soundtrack must be resampled onto the audio VAE's \
+             {AUDIO_SAMPLE_RATE} Hz before encoding, got {} Hz",
+            track.sample_rate
+        )));
+    }
+    let per_channel = track.samples.len() / channels as usize;
+    // De-interleave into channel-major order: every sample of channel 0, then channel 1.
+    let mut planar = Vec::with_capacity(track.samples.len());
+    for c in 0..channels as usize {
+        planar.extend(
+            track
+                .samples
+                .iter()
+                .skip(c)
+                .step_by(channels as usize)
+                .copied(),
+        );
+    }
+    Ok(Array::from_slice(
+        &planar,
+        &[channels, 1, per_channel as i32],
+    ))
+}
+
+/// Build the packed layout for a **`ref2va`** request — ordered multi-modal reference blocks.
+///
+/// `references` is in packed order and carries the *encoded* latent geometry of every reference, so
+/// the layout and the conditioning rows are described once. See
+/// [`PackedLayout::build_ref2va`] for why this is a separate constructor rather than an option on
+/// the `fl2va` one, and [`crate::reference`] for why the order is semantic.
+pub fn ref2va_layout(
+    geometry: &RequestGeometry,
+    text_token_tags: &[i32],
+    references: &[crate::dit::positions::ReferenceLatentGeometry],
+    patch: [i32; 3],
+) -> Result<PackedLayout> {
+    if text_token_tags.is_empty() {
+        return Err(Error::Msg(
+            "minimax_h3: the packed sequence needs at least one text row".into(),
+        ));
+    }
+    PackedLayout::build_ref2va(
+        geometry.joint,
+        patch,
+        text_token_tags,
+        i32::from(AUDIO_OUTPUT_CHANNELS),
+        references,
+    )
+}
+
+/// Prepend a `ref2va` request's **reference soundtrack** rows to its freshly-drawn audio rows.
+///
+/// The audio sibling of [`prepend_condition_rows`], and checked against the layout for the same
+/// reason: a soundtrack block of the wrong height concatenates cleanly and produces a runnable,
+/// silently misaligned sequence. `t2va` / `fl2va` reserve zero such rows and pass `None`.
+///
+/// The reference rows ride at a clean [`crate::denoise::REFERENCE_AUDIO_TIMESTEP`] (`1.0`) rather
+/// than the `0.999` visual anchors sit at — the audio conditioning is genuinely clean, and that
+/// difference is a real class in [`crate::denoise::RowClass`], not a rounding of the same idea.
+pub fn prepend_condition_audio_rows(
+    layout: &PackedLayout,
+    condition_rows: Option<&Array>,
+    audio_rows: &Array,
+) -> Result<Array> {
+    prepend_rows(
+        layout.num_condition_audio_rows(),
+        condition_rows,
+        audio_rows,
+        "reference soundtrack",
+    )
+}
+
+/// The shape-and-count contract both prepends share.
+fn prepend_rows(
+    expected: i32,
+    condition_rows: Option<&Array>,
+    generated: &Array,
+    what: &str,
+) -> Result<Array> {
+    let Some(rows) = condition_rows else {
+        if expected != 0 {
+            return Err(Error::Msg(format!(
+                "minimax_h3: the layout reserves {expected} {what} rows but none were supplied"
+            )));
+        }
+        return Ok(generated.clone());
+    };
+    let (rs, vs) = (rows.shape(), generated.shape());
+    if rs.len() != 3 || rs[0] != 1 || vs.len() != 3 || vs[0] != 1 {
+        return Err(Error::Msg(format!(
+            "minimax_h3: expected [1, rows, features] blocks, got {rs:?} and {vs:?}"
+        )));
+    }
+    let got = rs[1];
+    if got != expected {
+        return Err(Error::Msg(format!(
+            "minimax_h3: {got} {what} rows against a layout reserving {expected}"
+        )));
+    }
+    if rs[2] != vs[2] {
+        return Err(Error::Msg(format!(
+            "minimax_h3: {what} rows are {} wide, generated rows {}",
+            rs[2], vs[2]
+        )));
+    }
+    Ok(mlx_rs::ops::concatenate_axis(
+        &[rows.clone(), generated.clone()],
+        1,
+    )?)
+}
+
 /// Prepend a request's conditioning rows to its freshly-drawn video rows.
 ///
 /// `MiniMaxH3FL2VAPrepareLatentsStep` in one line: the anchors **lead** the video row stream, and
@@ -662,38 +808,12 @@ pub fn prepend_condition_rows(
     condition_rows: Option<&Array>,
     video_rows: &Array,
 ) -> Result<Array> {
-    let expected = layout.num_condition_video_rows();
-    let Some(rows) = condition_rows else {
-        if expected != 0 {
-            return Err(Error::Msg(format!(
-                "minimax_h3: the layout reserves {expected} conditioning rows but none were \
-                 supplied"
-            )));
-        }
-        return Ok(video_rows.clone());
-    };
-    let (rs, vs) = (rows.shape(), video_rows.shape());
-    if rs.len() != 3 || rs[0] != 1 || vs.len() != 3 || vs[0] != 1 {
-        return Err(Error::Msg(format!(
-            "minimax_h3: expected [1, rows, features] blocks, got {rs:?} and {vs:?}"
-        )));
-    }
-    let got = rs[1];
-    if got != expected {
-        return Err(Error::Msg(format!(
-            "minimax_h3: {got} conditioning rows against a layout reserving {expected}"
-        )));
-    }
-    if rs[2] != vs[2] {
-        return Err(Error::Msg(format!(
-            "minimax_h3: conditioning rows are {} wide, video rows {}",
-            rs[2], vs[2]
-        )));
-    }
-    Ok(mlx_rs::ops::concatenate_axis(
-        &[rows.clone(), video_rows.clone()],
-        1,
-    )?)
+    prepend_rows(
+        layout.num_condition_video_rows(),
+        condition_rows,
+        video_rows,
+        "conditioning",
+    )
 }
 
 #[cfg(test)]
