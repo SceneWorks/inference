@@ -4,17 +4,17 @@
 //! (Windows/CUDA) sibling of `mlx-gen-sensenova`. It implements the backend-neutral
 //! [`gen_core::Generator`] contract and exposes both variants through its explicit family catalog.
 //!
-//! **txt2img:** SenseNova-U1 is a *unified* multimodal model — a dense dual-path Qwen3 "MoT" backbone
-//! (understanding + generation paths) with a flow-matching image head; there is no separate VAE or
-//! text encoder. This slice wires the **non-think T2I** path the `Generator` contract drives: build
-//! the `neo1_0` query, prefill it on the understanding path, then run the flow-matching denoise loop
-//! on the generation path (`crate::t2i`) and unpatchify to RGB. Deterministic CPU-seeded noise
-//! (sc-3673) makes output launch-portable per seed.
+//! **Image generation:** SenseNova-U1 is a *unified* multimodal model — a dense dual-path Qwen3 "MoT"
+//! backbone (understanding + generation paths) with a flow-matching image head; there is no separate
+//! VAE or text encoder. The registered non-think routes cover T2I plus instruction/reference it2i:
+//! build the `neo1_0` prompt and optional vision prefix, prefill it on the understanding path, then
+//! run the flow-matching denoise loop on the generation path (`crate::t2i`) and unpatchify to RGB.
+//! Deterministic CPU-seeded noise (sc-3673) makes output launch-portable per seed.
 //!
 //! Two registered ids share the loader: **`sensenova_u1_8b`** (50 NFE, CFG 4.0) and
 //! **`sensenova_u1_8b_fast`** (8 NFE, CFG 1.0 — its loader merges the 8-step distill LoRA into the
-//! dense generation path). Both advertise **only** the wired T2I surface through the `Generator`
-//! contract — image-edit / Character Studio (it2i) and user LoRAs are NOT advertised and are rejected
+//! dense generation path). Both advertise T2I plus reference-conditioned instruction edit and
+//! Character Studio through the `Generator` contract. User LoRAs remain unsupported and are rejected
 //! rather than silently dropped. `backend` is `"candle"` and `mac_only` is `false`.
 //!
 //! **Tiers (sc-14249, epic 9083).** The crate consumes the SceneWorks turnkey's `bf16/`, `q8/` and
@@ -54,11 +54,12 @@ mod vision;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use candle_gen::candle_core::{DType, Device};
+use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::{
-    self, reject_unknown_components, Capabilities, GenerationOutput, GenerationRequest, Generator,
-    LoadSpec, Modality, ModelDescriptor, Progress, Quant, SizeFloor, WeightsSource,
+    self, reject_unknown_components, Capabilities, Conditioning, ConditioningKind,
+    GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor,
+    Progress, Quant, SizeFloor, WeightsSource,
 };
 use candle_gen::{CandleError, Result};
 
@@ -91,6 +92,8 @@ const DEFAULT_GUIDANCE_FAST: f32 = 1.0;
 /// `timestep_shift` (`NeoChatConfig::timestep_shift`, `1.0` for the shipped 8B-MoT). See
 /// [`NeoChatConfig::inference_timestep_shift`] for why the config field does *not* feed inference.
 const DEFAULT_TIMESTEP_SHIFT: f32 = 3.0;
+const REF_MIN_PIXELS: i64 = 512 * 512;
+const REF_MAX_PIXELS: i64 = 2048 * 2048;
 /// Cell = patch·merge: every side must be a multiple of this (the patchify grid).
 pub const SIZE_MULTIPLE: u32 = 32;
 
@@ -105,12 +108,10 @@ pub fn descriptor_fast() -> ModelDescriptor {
     descriptor_for(MODEL_ID_FAST)
 }
 
-/// SenseNova-U1's identity + the surface this candle slice wires: classifier-free guidance over the
-/// prompt, **txt2img only**, over the q4/q8/bf16 turnkey tiers (sc-14249). it2i/edit (Reference),
-/// true-CFG image guidance, VQA, interleave and user LoRA are NOT advertised — they stay the Python
-/// fallback's job until candle wires them, so the descriptor never promises a path `generate` can't
-/// serve. Two backend-correct deviations from `mlx-gen-sensenova`: `backend = "candle"` and
-/// `mac_only = false`.
+/// SenseNova-U1's registered Candle surface: classifier-free text guidance plus Reference and
+/// MultiReference it2i with image guidance, over the q4/q8/bf16 turnkey tiers. VQA and interleave are
+/// direct worker APIs because their text-bearing outputs do not fit `GenerationOutput`; user LoRA is
+/// not advertised. Backend-correct deviations from MLX are `backend = "candle"` and `mac_only = false`.
 fn descriptor_for(id: &'static str) -> ModelDescriptor {
     ModelDescriptor {
         control_kinds: None,
@@ -122,9 +123,12 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
         capabilities: Capabilities {
             supports_negative_prompt: false,
             supports_guidance: true,
-            // it2i image-CFG (true_cfg) and reference conditioning are Phase 6 (understanding surface).
-            supports_true_cfg: false,
-            conditioning: vec![],
+            // `guidance` is text CFG; `true_cfg` is the image-guidance scale on it2i.
+            supports_true_cfg: true,
+            conditioning: vec![
+                ConditioningKind::Reference,
+                ConditioningKind::MultiReference,
+            ],
             supports_lora: false,
             supports_lokr: false,
             // Bespoke-by-architecture (epic 7114 P4, sc-7123 — mirrors the mlx-gen SenseNova won't-do):
@@ -251,6 +255,7 @@ impl SenseNovaGenerator {
         };
         T2iOptions {
             cfg_scale: req.guidance.unwrap_or(def_guidance),
+            img_cfg_scale: req.true_cfg.unwrap_or(1.0),
             num_steps: req.steps.unwrap_or(def_steps) as usize,
             // Precedence: explicit request wins; else the checkpoint's own inference shift if it
             // declares one; else the product default (3.0). Reads the parsed config so the field is
@@ -272,6 +277,7 @@ impl SenseNovaGenerator {
         let comps = self.components()?;
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let (w, h) = (req.width as usize, req.height as usize);
+        let references = references(req)?;
 
         // The per-step preview seam (epic 16948, sc-16960): ONE hook, built over the REQUEST's own
         // sink, carrying the token cell of the very model whose denoise loop the frames come from.
@@ -287,16 +293,30 @@ impl SenseNovaGenerator {
                 return Err(CandleError::Canceled);
             }
             let opts = self.options(req, &comps.cfg, seed);
-            let img = comps.model.generate(
-                &comps.tokenizer,
-                &req.prompt,
-                w,
-                h,
-                &opts,
-                &req.cancel,
-                on_progress,
-                &preview,
-            )?;
+            let img = if references.is_empty() {
+                comps.model.generate(
+                    &comps.tokenizer,
+                    &req.prompt,
+                    w,
+                    h,
+                    &opts,
+                    &req.cancel,
+                    on_progress,
+                    &preview,
+                )?
+            } else {
+                comps.model.it2i_generate(
+                    &comps.tokenizer,
+                    &req.prompt,
+                    &references,
+                    w,
+                    h,
+                    &opts,
+                    &req.cancel,
+                    on_progress,
+                    &preview,
+                )?
+            };
             // `?` bridges the candle-side `tensor_to_image` error into `CandleError`.
             Ok(tensor_to_image(&img)?)
         })?;
@@ -311,9 +331,14 @@ impl Generator for SenseNovaGenerator {
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
         let id = self.descriptor.id;
-        // Capability floor (count/size range, guidance; the empty `conditioning` rejects any
-        // conditioning entry).
+        // Capability floor (count/size range, guidance, and Reference/MultiReference only).
         self.descriptor.capabilities.validate_request(id, req)?;
+        if req.true_cfg.is_some() && !has_reference(req) {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{id}: true_cfg is image guidance and requires Reference or non-empty \
+                 MultiReference conditioning"
+            )));
+        }
         if req.prompt.trim().is_empty() {
             return Err(gen_core::Error::Msg(format!(
                 "{id}: prompt must not be empty"
@@ -340,6 +365,72 @@ impl Generator for SenseNovaGenerator {
         self.validate(req)?;
         self.generate_impl(req, on_progress).map_err(Into::into)
     }
+}
+
+/// Whether this request actually carries image guidance (an empty multi-reference is absent).
+fn has_reference(req: &GenerationRequest) -> bool {
+    req.conditioning
+        .iter()
+        .any(|conditioning| match conditioning {
+            Conditioning::Reference { .. } => true,
+            Conditioning::MultiReference { images } => !images.is_empty(),
+            _ => false,
+        })
+}
+
+fn references(req: &GenerationRequest) -> Result<Vec<Tensor>> {
+    let mut out = Vec::new();
+    for conditioning in &req.conditioning {
+        match conditioning {
+            Conditioning::Reference { image, .. } => out.push(image_to_chw01(image)?),
+            Conditioning::MultiReference { images } => {
+                for image in images {
+                    out.push(image_to_chw01(image)?);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+/// Decode one RGB8 reference to a smart-resized `[3,H,W]` f32 tensor in `[0,1]`, matching the MLX
+/// SenseNova request boundary and the checkpoint's understanding-vision preprocessing contract.
+fn image_to_chw01(image: &Image) -> Result<Tensor> {
+    let (in_w, in_h) = (image.width as usize, image.height as usize);
+    let expected =
+        gen_core::imageops::checked_image_buffer_len(in_w, in_h, 3).ok_or_else(|| {
+            CandleError::Msg(format!(
+                "sensenova: invalid reference dimensions {}x{}",
+                image.width, image.height
+            ))
+        })?;
+    if image.pixels.len() != expected {
+        return Err(CandleError::Msg(format!(
+            "sensenova: reference pixel buffer {} != {in_w}x{in_h}x3",
+            image.pixels.len()
+        )));
+    }
+    let (out_h, out_w) = smart_resize(
+        image.height as i32,
+        image.width as i32,
+        SIZE_MULTIPLE as i32,
+        REF_MIN_PIXELS,
+        REF_MAX_PIXELS,
+    );
+    let resized = gen_core::imageops::resize_bicubic_u8(
+        &image.pixels,
+        in_h,
+        in_w,
+        out_h as usize,
+        out_w as usize,
+    )?;
+    let data: Vec<f32> = resized.into_iter().map(|pixel| pixel / 255.0).collect();
+    Ok(
+        Tensor::from_vec(data, (out_h as usize, out_w as usize, 3), &Device::Cpu)?
+            .permute((2, 0, 1))?
+            .contiguous()?,
+    )
 }
 
 /// The SenseNova-U1 checkpoint shards under `root` — the flat `*.safetensors`, excluding the optional
@@ -450,7 +541,7 @@ fn load_inner(spec: &LoadSpec, fast: bool) -> gen_core::Result<Box<dyn Generator
     // this crate owning a quantizer. A `bf16/` tier still loads dense at the checkpoint's own dtype.
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
-            "{id}: control / IP-adapter overlays are not supported (txt2img only)"
+            "{id}: registered text/reference generator does not support control / IP-adapter overlays"
         )));
     }
     // Named-component contract (sc-13658/sc-13664): the fast variant reads the `distill_lora`
@@ -549,12 +640,13 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_advertises_only_wired_t2i_surface() {
+    fn descriptor_advertises_t2i_and_it2i_surface() {
         let d = descriptor();
         assert!(d.capabilities.supports_guidance);
-        assert!(!d.capabilities.supports_true_cfg);
+        assert!(d.capabilities.supports_true_cfg);
         assert!(!d.capabilities.mac_only);
-        assert!(d.capabilities.conditioning.is_empty());
+        assert!(d.capabilities.accepts(ConditioningKind::Reference));
+        assert!(d.capabilities.accepts(ConditioningKind::MultiReference));
         assert!(!d.capabilities.supports_lora);
         assert!(!d.capabilities.supports_lokr);
         // sc-14249: the turnkey's pre-quantized q4/q8 tiers load natively (packed-detect per
@@ -578,7 +670,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_accepts_t2i_and_rejects_unsupported() {
+    fn validate_accepts_t2i_and_reference_shapes_and_rejects_invalid_guidance() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
         let g = crate::provider_registry()
             .unwrap()
@@ -593,6 +685,22 @@ mod tests {
             ..Default::default()
         };
         assert!(g.validate(&ok).is_ok());
+        let reference = GenerationRequest {
+            true_cfg: Some(1.5),
+            conditioning: vec![Conditioning::Reference {
+                image: Image::default(),
+                strength: None,
+            }],
+            ..ok.clone()
+        };
+        assert!(g.validate(&reference).is_ok());
+        let multi = GenerationRequest {
+            conditioning: vec![Conditioning::MultiReference {
+                images: vec![Image::default(), Image::default()],
+            }],
+            ..ok.clone()
+        };
+        assert!(g.validate(&multi).is_ok());
 
         for bad in [
             GenerationRequest {
@@ -618,16 +726,6 @@ mod tests {
                 width: 512,
                 height: 512,
                 true_cfg: Some(1.5),
-                ..Default::default()
-            },
-            GenerationRequest {
-                prompt: "x".into(),
-                width: 512,
-                height: 512,
-                conditioning: vec![Conditioning::Reference {
-                    image: Image::default(),
-                    strength: None,
-                }],
                 ..Default::default()
             },
         ] {
@@ -659,6 +757,27 @@ mod tests {
                 ..Default::default()
             })
             .is_ok());
+    }
+
+    #[test]
+    fn reference_preprocess_rejects_malformed_pixels_and_preserves_a_bounded_grid() {
+        assert!(image_to_chw01(&Image::default()).is_err());
+
+        let image = Image {
+            width: 4,
+            height: 2,
+            pixels: vec![127; 4 * 2 * 3],
+        };
+        let tensor = image_to_chw01(&image).unwrap();
+        let (channels, height, width) = tensor.dims3().unwrap();
+        assert_eq!(channels, 3);
+        assert!(height.is_multiple_of(SIZE_MULTIPLE as usize));
+        assert!(width.is_multiple_of(SIZE_MULTIPLE as usize));
+        let area = height * width;
+        assert!(area >= REF_MIN_PIXELS as usize);
+        assert!(area <= REF_MAX_PIXELS as usize);
+        let values = tensor.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!(values.iter().all(|value| (0.0..=1.0).contains(value)));
     }
 
     /// sc-9029 / F-045: `options` must route the timestep shift through the checkpoint config, not a

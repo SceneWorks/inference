@@ -11,7 +11,8 @@
 use std::error::Error;
 
 use candle_gen::candle_core::{Device, Tensor};
-use candle_gen::gen_core::CancelFlag;
+use candle_gen::gen_core::{CancelFlag, PreviewSink};
+use candle_gen::preview::PreviewHook;
 use candle_gen_sensenova::{
     load_understanding, tensor_to_image, Sampler, T2iOptions, INTERLEAVE_SYSTEM_MESSAGE,
 };
@@ -62,6 +63,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         ..Default::default()
     };
     let cancel = CancelFlag::new();
+    let preview_sink = PreviewSink::default();
+    let preview = PreviewHook::new(&preview_sink, |_| unreachable!("inactive preview sink"));
     eprintln!("running interleave …");
     let out = model.interleave_gen(
         &tok,
@@ -74,6 +77,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         512,
         4,
         &cancel,
+        &preview,
     )?;
     eprintln!("interleave text: {:?}", out.text);
     eprintln!("interleave images: {}", out.images.len());

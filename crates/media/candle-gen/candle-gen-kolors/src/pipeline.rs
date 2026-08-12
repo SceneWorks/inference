@@ -1,6 +1,8 @@
-//! The candle Kolors **txt2img** pipeline — ChatGLM3-6B prompt encode → the SDXL-family Kolors UNet
-//! (real CFG over the leading-Euler schedule) → the SDXL VAE, driven through the backend-neutral
-//! [`gen_core::Generator`] contract and parity-matched to the macOS `mlx-gen-kolors` provider.
+//! The candle Kolors **txt2img + source-image img2img** pipeline — ChatGLM3-6B prompt encode → seeded
+//! noise or a VAE-encoded reference with the strength-selected schedule tail → the SDXL-family
+//! Kolors UNet (real CFG over the leading-Euler schedule) → the SDXL VAE, driven through the
+//! backend-neutral [`gen_core::Generator`] contract and parity-matched to the macOS
+//! `mlx-gen-kolors` provider.
 //!
 //! Parity choices (grounded in the mlx `model.rs` + diffusers `KolorsPipeline`):
 //! - **Conditioning**: each prompt is tokenized to the fixed 256-len left-padded form and run through
@@ -22,8 +24,9 @@ use std::sync::Arc;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::gen_core::imageops::resize_lanczos_u8;
 use candle_gen::gen_core::sampling::{AlphaSchedule, Scheduler, Solver};
-use candle_gen::gen_core::{self, GenerationRequest, Image, PidWeights, Progress};
+use candle_gen::gen_core::{self, Conditioning, GenerationRequest, Image, PidWeights, Progress};
 use candle_gen::quant::{PackedConfig, QLinear, MLX_GROUP_SIZE};
 // Shared per-image batch seed (`base + index`) — one home in `candle-gen` (sc-9043 / F-059).
 use candle_gen::{CandleError, Result};
@@ -33,7 +36,7 @@ use candle_gen::{CandleError, Result};
 // `add_embedding` + the external `encoder_hid_proj`) are handled outside the block stack, exactly as the
 // Kolors IP-Adapter provider already does (sc-10819).
 use candle_gen_pid::PidEngine;
-use candle_gen_sdxl::{sdxl_unet_config, UNet2DConditionModel as VendoredUNet};
+use candle_gen_sdxl::{sdxl_unet_config, UNet2DConditionModel as VendoredUNet, VaeMomentsEncoder};
 use candle_transformers::models::stable_diffusion::vae::{AutoEncoderKL, AutoEncoderKLConfig};
 
 use crate::chatglm3::ChatGlmModel;
@@ -194,6 +197,7 @@ pub(crate) struct Components {
     chatglm: Arc<ChatGlmModel>,
     unet: KolorsUnet,
     vae: Arc<AutoEncoderKL>,
+    vae_encoder: Arc<VaeMomentsEncoder>,
     /// Optional NVIDIA PiD super-resolving decoder (epic 7840 / sc-7853); None ⇒ native VAE decode.
     pid: Option<Arc<PidEngine>>,
 }
@@ -269,12 +273,9 @@ impl Pipeline {
             )?)),
         };
 
-        let vae = AutoEncoderKL::new(
-            self.f32_vb(&self.root.join("vae"))?,
-            3,
-            3,
-            sdxl_vae_config(),
-        )?;
+        let vae_vb = self.f32_vb(&self.root.join("vae"))?;
+        let vae = AutoEncoderKL::new(vae_vb.clone(), 3, 3, sdxl_vae_config())?;
+        let vae_encoder = VaeMomentsEncoder::new(vae_vb, VAE_SCALE)?;
         // Load the optional PiD super-resolving decoder once (epic 7840 / sc-7853) when the caller
         // opted in via `LoadSpec::pid`; Kolors shares the SDXL VAE latent space (`sdxl` student).
         let pid = match self.pid_spec.as_ref() {
@@ -290,6 +291,7 @@ impl Pipeline {
             chatglm: Arc::new(chatglm),
             unet,
             vae: Arc::new(vae),
+            vae_encoder: Arc::new(vae_encoder),
             pid,
         })
     }
@@ -317,6 +319,11 @@ impl Pipeline {
         let negative = req.negative_prompt.as_deref().unwrap_or("");
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let (h, w) = (req.height, req.width);
+        let img2img = resolve_reference(req)?;
+        let init_latents = match img2img {
+            Some((image, _)) => Some(self.encode_reference(components, image, w, h)?),
+            None => None,
+        };
 
         // sc-7124 (epic 7114 P4): a curated solver name (≠ the native `euler_discrete` default / None)
         // OR a curated scheduler (sc-8984) routes the unified `Sampler` over `DiscreteModelSampling`
@@ -336,7 +343,12 @@ impl Pipeline {
             crate::MODEL_ID,
         )?;
 
-        let sampler = KolorsEulerSampler::new(steps).map_err(CandleError::Msg)?;
+        let sampler = match img2img {
+            Some((_, strength)) => {
+                KolorsEulerSampler::img2img(steps, strength).map_err(CandleError::Msg)?
+            }
+            None => KolorsEulerSampler::new(steps).map_err(CandleError::Msg)?,
+        };
 
         // Conditioning is seed-independent — encode once. CFG batch is [uncond, cond] (candle's chunk
         // order); without guidance only the positive branch is built. The ChatGLM3 encode stays local
@@ -363,6 +375,8 @@ impl Pipeline {
                     req,
                     name,
                     &noise,
+                    init_latents.as_ref(),
+                    img2img.map_or(1.0, |(_, strength)| strength),
                     components,
                     &encoder_hidden_states,
                     &pooled,
@@ -374,7 +388,10 @@ impl Pipeline {
                     on_progress,
                 )?
             } else {
-                let mut latents = (&noise * sampler.init_noise_sigma() as f64)?;
+                let mut latents = match init_latents.as_ref() {
+                    Some(init) => sampler.add_noise(init, &noise)?,
+                    None => (&noise * sampler.init_noise_sigma() as f64)?,
+                };
                 // Per-step latent preview (epic 16948, sc-16954). A bespoke loop, so it numbers its
                 // own frames on the STEP INDEX -- this lane walks a `KolorsEulerSampler` timestep
                 // table, not a descending sigma array. One eval per step, so nothing repeats for the
@@ -442,7 +459,9 @@ impl Pipeline {
         &self,
         req: &GenerationRequest,
         sampler: &str,
-        init: &Tensor,
+        noise: &Tensor,
+        init_latents: Option<&Tensor>,
+        strength: f32,
         components: &Components,
         encoder_hidden_states: &Tensor,
         pooled: &Tensor,
@@ -455,7 +474,12 @@ impl Pipeline {
     ) -> Result<Tensor> {
         // Shared curated-σ setup (sc-9001): the Kolors DiscreteModelSampling + σ-table + VE-σ prior,
         // identical across the three entry points. `init` is the raw seeded noise (lifted to σ-space).
-        let setup = CuratedSetup::new(req.scheduler.as_deref(), steps, init)?;
+        let setup = match init_latents {
+            Some(init) => {
+                CuratedSetup::new_img2img(req.scheduler.as_deref(), steps, strength, noise, init)?
+            }
+            None => CuratedSetup::new(req.scheduler.as_deref(), steps, noise)?,
+        };
         // Per-step latent preview (epic 16948, sc-16954). The sc-16949 projector hook, so the loop is
         // not restructured and the driver owns frame numbering plus the multi-eval dedup. `ve_hook`
         // because the running latent here is raw k-diffusion VE sigma-space. Built per image: the
@@ -500,6 +524,43 @@ impl Pipeline {
         Ok(out.to_dtype(DType::F32)?)
     }
 
+    /// Deterministically VAE-encode one img2img reference: LANCZOS to the render size, RGB
+    /// `[0,255]` to NCHW `[-1,1]`, then the scaled posterior mean (never a device-RNG sample).
+    fn encode_reference(
+        &self,
+        components: &Components,
+        image: &Image,
+        width: u32,
+        height: u32,
+    ) -> Result<Tensor> {
+        let (in_w, in_h) = (image.width as usize, image.height as usize);
+        let expected =
+            gen_core::imageops::checked_image_buffer_len(in_w, in_h, 3).ok_or_else(|| {
+                CandleError::Msg(format!(
+                    "kolors: invalid reference dimensions {}x{}",
+                    image.width, image.height
+                ))
+            })?;
+        if image.pixels.len() != expected {
+            return Err(CandleError::Msg(format!(
+                "kolors: reference pixel buffer {} != {in_w}x{in_h}x3",
+                image.pixels.len()
+            )));
+        }
+        let (out_w, out_h) = (width as usize, height as usize);
+        let resized = resize_lanczos_u8(&image.pixels, in_h, in_w, out_h, out_w)?;
+        let data: Vec<f32> = resized
+            .into_iter()
+            .map(|pixel| pixel / 127.5 - 1.0)
+            .collect();
+        let input = Tensor::from_vec(data, (out_h, out_w, 3), &self.device)?
+            .permute((2, 0, 1))?
+            .unsqueeze(0)?
+            .contiguous()?
+            .to_dtype(DType::F32)?;
+        Ok(components.vae_encoder.encode_mean(&input)?)
+    }
+
     /// Encode one prompt → `(context [1, 256, 4096], pooled [1, 4096])` via the ChatGLM3 encoder. Stays
     /// local (not in [`crate::common`]) because it threads the cached [`Components`]; the shared
     /// [`common::cfg_batch_context`] takes this as a closure so the CFG-concat convention is the only
@@ -508,6 +569,30 @@ impl Pipeline {
         let tokens = components.tokenizer.encode(prompt)?;
         Ok(components.chatglm.encode_prompt(&tokens)?)
     }
+}
+
+/// Resolve Kolors' one latent-init reference. Per-reference strength wins over the request-level
+/// value, then the diffusers default (0.3); more than one reference is unsupported and fails closed.
+fn resolve_reference(req: &GenerationRequest) -> Result<Option<(&Image, f32)>> {
+    const DEFAULT_IMG2IMG_STRENGTH: f32 = 0.3;
+    let mut reference = None;
+    for conditioning in &req.conditioning {
+        if let Conditioning::Reference { image, strength } = conditioning {
+            if reference.is_some() {
+                return Err(CandleError::Msg(
+                    "kolors: multiple reference images are not supported".into(),
+                ));
+            }
+            reference = Some((
+                image,
+                strength
+                    .or(req.strength)
+                    .unwrap_or(DEFAULT_IMG2IMG_STRENGTH)
+                    .clamp(0.0, 1.0),
+            ));
+        }
+    }
+    Ok(reference)
 }
 
 /// Parse the packed `group_size` out of a component `config.json` (sc-10819): `Some(group_size)` when
@@ -607,6 +692,55 @@ mod tests {
         // Unknown names fall back to the native default (N3 at this layer = stay native).
         assert_eq!(curated_route(Some("not_a_solver"), None), None);
         assert_eq!(curated_route(None, Some("not_a_scheduler")), None);
+    }
+
+    #[test]
+    fn reference_strength_precedence_default_and_bounds_match_mlx() {
+        let request = GenerationRequest {
+            strength: Some(0.7),
+            conditioning: vec![Conditioning::Reference {
+                image: Image::default(),
+                strength: Some(0.4),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(resolve_reference(&request).unwrap().unwrap().1, 0.4);
+
+        let request_level = GenerationRequest {
+            conditioning: vec![Conditioning::Reference {
+                image: Image::default(),
+                strength: None,
+            }],
+            ..request.clone()
+        };
+        assert_eq!(resolve_reference(&request_level).unwrap().unwrap().1, 0.7);
+
+        let defaulted = GenerationRequest {
+            strength: None,
+            ..request_level.clone()
+        };
+        assert_eq!(resolve_reference(&defaulted).unwrap().unwrap().1, 0.3);
+
+        let clamped = GenerationRequest {
+            strength: Some(2.0),
+            ..request_level.clone()
+        };
+        assert_eq!(resolve_reference(&clamped).unwrap().unwrap().1, 1.0);
+
+        let multiple = GenerationRequest {
+            conditioning: vec![
+                Conditioning::Reference {
+                    image: Image::default(),
+                    strength: None,
+                },
+                Conditioning::Reference {
+                    image: Image::default(),
+                    strength: None,
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(resolve_reference(&multiple).is_err());
     }
 
     /// sc-10819: `detect_packed_unet` returns `Some((file, group))` when `unet/config.json` carries a

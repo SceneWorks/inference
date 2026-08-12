@@ -1,6 +1,6 @@
-//! Text-to-image generation — the candle port of `mlx-gen-sensenova`'s `t2i.rs` `t2i_generate` spine,
-//! scoped to the **non-think T2I** path the `Generator` contract drives (it2i / VQA / interleave /
-//! think-mode are the understanding surface → Phase 6).
+//! Image generation — the candle port of `mlx-gen-sensenova`'s T2I and it2i spines. The registered
+//! `Generator` drives non-think text-to-image plus instruction-edit / Character-Studio reference
+//! conditioning; VQA and mixed text/image interleave remain direct concrete-model APIs.
 //!
 //! The flow:
 //! 1. Build the `neo1_0` query ([`build_neo1_query`] + [`SYSTEM_MESSAGE_FOR_GEN`] + the no-think
@@ -386,6 +386,120 @@ impl T2iModel {
             preview,
         )?;
         Ok(image)
+    }
+
+    /// Image-conditioned generation for instruction edit and Character Studio. Source images are
+    /// decoded RGB tensors `[3,H,W]` in `[0,1]`, already smart-resized to the model's 32-pixel grid.
+    /// Text guidance (`cfg_scale`) and image guidance (`img_cfg_scale`) use the same three-cache blend
+    /// as the reference implementation and [`Self::interleave_gen`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn it2i_generate(
+        &self,
+        tokenizer: &SenseNovaTokenizer,
+        prompt: &str,
+        images: &[Tensor],
+        width: usize,
+        height: usize,
+        opts: &T2iOptions,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+        preview: &PreviewHook<'_>,
+    ) -> Result<Tensor> {
+        let cell = self.cell();
+        if !width.is_multiple_of(cell) || !height.is_multiple_of(cell) {
+            return Err(CandleError::Msg(format!(
+                "sensenova it2i: width/height must be multiples of {cell}, got {width}x{height}"
+            )));
+        }
+        if images.is_empty() {
+            return Err(CandleError::Msg(
+                "sensenova it2i requires at least one source image".into(),
+            ));
+        }
+        if opts.think_mode {
+            return Err(CandleError::Msg(
+                "sensenova it2i: think mode is not available through the image Generator route"
+                    .into(),
+            ));
+        }
+
+        let mut pv_parts = Vec::with_capacity(images.len());
+        let mut grids = Vec::with_capacity(images.len());
+        for image in images {
+            let (patches, grid) = self.preprocess_image(image)?;
+            pv_parts.push(patches);
+            grids.push(grid);
+        }
+        let pv_refs: Vec<&Tensor> = pv_parts.iter().collect();
+        let pixel_values = Tensor::cat(&pv_refs, 0)?;
+
+        let marker_count = prompt.matches("<image>").count();
+        let mut question = prompt.to_owned();
+        if images.len() > marker_count {
+            let missing = images.len() - marker_count;
+            let prefix = if marker_count == 0 && images.len() > 1 {
+                (0..images.len())
+                    .map(|index| format!("Image-{}:<image>\n", index + 1))
+                    .collect::<String>()
+            } else {
+                "<image>\n".repeat(missing)
+            };
+            question = format!("{prefix}{question}");
+        }
+
+        let (needs_img, needs_uncond) = it2i_cache_requirements(opts.cfg_scale, opts.img_cfg_scale);
+
+        let cond_query = format!(
+            "{}<think>\n\n</think>\n\n<img>",
+            build_neo1_query(&question, SYSTEM_MESSAGE_FOR_GEN)
+        );
+        let cond_ids = self.build_it2i_query_ids(tokenizer, &cond_query, &grids)?;
+        let (cond_embeds, cond_t, cond_h, cond_w) =
+            self.build_it2i_prefix(&cond_ids, Some(&pixel_values), &grids)?;
+        let (mut cache_cond, _, cond_temporal) =
+            self.prefill_prefix(&cond_embeds, &cond_t, &cond_h, &cond_w)?;
+
+        let mut cache_img = if needs_img {
+            let query = format!(
+                "{}<img>",
+                build_neo1_query(&"<image>".repeat(images.len()), "")
+            );
+            let ids = self.build_it2i_query_ids(tokenizer, &query, &grids)?;
+            let (embeds, t, h, w) = self.build_it2i_prefix(&ids, Some(&pixel_values), &grids)?;
+            let (cache, _, temporal) = self.prefill_prefix(&embeds, &t, &h, &w)?;
+            Some((cache, temporal))
+        } else {
+            None
+        };
+
+        let mut cache_uncond = if needs_uncond {
+            let query = format!("{}<img>", build_neo1_query("", ""));
+            let ids = tokenizer.encode_ids(&query, true)?;
+            let (embeds, t, h, w) = self.build_it2i_prefix(&ids, None, &[])?;
+            let (cache, _, temporal) = self.prefill_prefix(&embeds, &t, &h, &w)?;
+            Some((cache, temporal))
+        } else {
+            None
+        };
+
+        let img_temporal = cache_img.as_ref().map_or(0, |(_, temporal)| *temporal);
+        let uncond_temporal = cache_uncond.as_ref().map_or(0, |(_, temporal)| *temporal);
+        let base_noise = gaussian((1, 3, height, width), opts.seed, &self.device)?;
+        self.it2i_denoise(
+            &mut cache_cond,
+            cond_temporal,
+            cache_img.as_mut().map(|(cache, _)| cache),
+            img_temporal,
+            cache_uncond.as_mut().map(|(cache, _)| cache),
+            uncond_temporal,
+            width,
+            height,
+            &base_noise,
+            opts,
+            cancel,
+            on_progress,
+            preview,
+        )
     }
 
     /// The flow-matching denoise loop. Returns the final model-space image `[1,3,H,W]`.
@@ -825,6 +939,7 @@ impl T2iModel {
         opts: &T2iOptions,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
+        preview: &PreviewHook<'_>,
     ) -> Result<Tensor> {
         let cell = self.cell();
         let token_h = height / cell;
@@ -868,11 +983,13 @@ impl T2iModel {
             Some(c) => Some(self.prepare_gen(token_h, token_w, uncond_t, c.len())?),
             None => None,
         };
+        let preview_counter = PreviewCounter::with_steps(steps);
 
         for i in 0..steps {
             if cancel.is_cancelled() {
                 return Err(CandleError::Canceled);
             }
+            preview.emit_step(&preview_counter, i, &image);
             let t = timesteps[i];
             let t_next = timesteps[i + 1];
             // it2i CFG-interval gate: **exclusive** `(i0, i1)` OR an `i0 == 0` always-on override —
@@ -945,6 +1062,7 @@ impl T2iModel {
         max_new_tokens: usize,
         max_images: usize,
         cancel: &CancelFlag,
+        preview: &PreviewHook<'_>,
     ) -> Result<InterleaveOutput> {
         let cell = self.cell();
         if !width.is_multiple_of(cell) || !height.is_multiple_of(cell) {
@@ -1064,6 +1182,7 @@ impl T2iModel {
                 opts,
                 cancel,
                 &mut sink,
+                preview,
             )?;
 
             // Re-encode the generated image back into the condition + text-uncondition caches.
