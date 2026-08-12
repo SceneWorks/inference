@@ -161,6 +161,13 @@ pub(crate) enum CombinedComponent {
     Vae,
 }
 
+pub(crate) const COMBINED_TEXT_ENCODER_PREFIXES: &[&str] = &[
+    "conditioner.embedders.0.transformer.",
+    "text_encoders.qwen3_4b.transformer.",
+    "text_encoders.qwen_3_4b.transformer.",
+    "text_encoder.",
+];
+
 /// Classify one fused-checkpoint key through the exact prefix inventory used by the real loader.
 /// Memory phase facts call this same seam, so accounting cannot assign a tensor to a different phase
 /// than [`split_combined_checkpoint`] later loads it into.
@@ -170,11 +177,9 @@ pub(crate) fn combined_component_key(key: &str) -> Option<(CombinedComponent, &s
         .or_else(|| key.strip_prefix("transformer."))
     {
         Some((CombinedComponent::Transformer, rest))
-    } else if let Some(rest) = key
-        .strip_prefix("conditioner.embedders.0.transformer.")
-        .or_else(|| key.strip_prefix("text_encoders.qwen3_4b.transformer."))
-        .or_else(|| key.strip_prefix("text_encoders.qwen_3_4b.transformer."))
-        .or_else(|| key.strip_prefix("text_encoder."))
+    } else if let Some(rest) = COMBINED_TEXT_ENCODER_PREFIXES
+        .iter()
+        .find_map(|prefix| key.strip_prefix(prefix))
     {
         Some((CombinedComponent::TextEncoder, rest))
     } else {

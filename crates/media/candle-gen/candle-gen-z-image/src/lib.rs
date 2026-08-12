@@ -672,12 +672,7 @@ fn tokenizer_source_from_spec(
     };
     ENCODER_CONTRACT.validate_embedded_comfyui_file_against_base(
         primary,
-        &[
-            "conditioner.embedders.0.transformer.",
-            "text_encoders.qwen3_4b.transformer.",
-            "text_encoders.qwen_3_4b.transformer.",
-            "text_encoder.",
-        ],
+        comfyui::COMBINED_TEXT_ENCODER_PREFIXES,
         root,
     )
 }

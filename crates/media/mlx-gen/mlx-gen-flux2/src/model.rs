@@ -2226,14 +2226,13 @@ mod tests {
             .unwrap();
     }
 
-    fn append_sparse_f16_tensor(root: &Path, name: &str, shape: &[usize]) {
+    fn append_sparse_f16_tensor_to(path: &Path, name: &str, shape: &[usize]) {
         use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 
-        let path = root.join("text_encoder/model.safetensors");
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(&path)
+            .open(path)
             .unwrap();
         let mut encoded_len = [0_u8; 8];
         file.read_exact(&mut encoded_len).unwrap();
@@ -2269,6 +2268,10 @@ mod tests {
             .unwrap();
         file.write_all(&encoded).unwrap();
         file.set_len(8 + encoded.len() as u64 + end).unwrap();
+    }
+
+    fn append_sparse_f16_tensor(root: &Path, name: &str, shape: &[usize]) {
+        append_sparse_f16_tensor_to(&root.join("text_encoder/model.safetensors"), name, shape);
     }
 
     #[test]
@@ -2459,6 +2462,178 @@ mod tests {
             baseline,
             "a valid but unconsumed tensor sharing a loaded-layer prefix must not affect staged-fit bytes"
         );
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum DevEncoderSelection {
+        DefaultDir,
+        OverrideDir,
+        OverrideFile,
+    }
+
+    fn dev_encoder_spec_with_sidecars(
+        fixture: &Path,
+        bits: i32,
+        selection: DevEncoderSelection,
+        sidecars: &[&str],
+    ) -> LoadSpec {
+        let base = fixture.join("base");
+        let selected = fixture.join("selected");
+        let selected_root = match selection {
+            DevEncoderSelection::DefaultDir => base.join("text_encoder"),
+            DevEncoderSelection::OverrideDir | DevEncoderSelection::OverrideFile => {
+                gen_core_testkit::write_encoder_contract_fixture(
+                    &base.join("text_encoder"),
+                    crate::config::DEV_ENCODER_CONTRACT,
+                )
+                .unwrap();
+                selected.clone()
+            }
+        };
+        gen_core_testkit::write_encoder_contract_fixture_with_quant(
+            &selected_root,
+            crate::config::DEV_ENCODER_CONTRACT,
+            Some(bits),
+        )
+        .unwrap();
+        for sidecar in sidecars {
+            append_sparse_f16_tensor_to(
+                &selected_root.join("model.safetensors"),
+                &format!("language_model.lm_head.{sidecar}"),
+                &[1],
+            );
+        }
+        let mut spec = LoadSpec::new(WeightsSource::Dir(base));
+        spec.text_encoder = match selection {
+            DevEncoderSelection::DefaultDir => None,
+            DevEncoderSelection::OverrideDir => Some(WeightsSource::Dir(selected_root)),
+            DevEncoderSelection::OverrideFile => {
+                Some(WeightsSource::File(selected_root.join("model.safetensors")))
+            }
+        };
+        spec
+    }
+
+    #[test]
+    fn packed_dev_rejects_lm_head_sidecars_on_every_selection_surface() {
+        for bits in [4, 8] {
+            for selection in [
+                DevEncoderSelection::DefaultDir,
+                DevEncoderSelection::OverrideDir,
+                DevEncoderSelection::OverrideFile,
+            ] {
+                for sidecars in [&["scales"][..], &["biases"][..], &["scales", "biases"][..]] {
+                    let fixture = tempfile::tempdir().unwrap();
+                    let spec =
+                        dev_encoder_spec_with_sidecars(fixture.path(), bits, selection, sidecars);
+                    let base = mlx_gen::require_base_snapshot(&spec, FLUX2_DEV_ID).unwrap();
+                    let error = crate::config::DEV_ENCODER_CONTRACT
+                        .source_for_load(&spec, base)
+                        .expect_err("Dev's dense LM head must reject every packed sidecar")
+                        .to_string();
+                    assert!(
+                        error.contains("language_model.lm_head")
+                            && (error.contains("packed_surface")
+                                || error.contains("packed_components")),
+                        "Q{bits} {selection:?} {sidecars:?}: {error}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn packed_dev_materialized_surface_keeps_the_dense_lm_head_only() {
+        for bits in [4, 8] {
+            let fixture = tempfile::tempdir().unwrap();
+            let spec = dev_encoder_spec_with_sidecars(
+                fixture.path(),
+                bits,
+                DevEncoderSelection::OverrideFile,
+                &[],
+            );
+            let base = mlx_gen::require_base_snapshot(&spec, FLUX2_DEV_ID).unwrap();
+            let selected = crate::config::DEV_ENCODER_CONTRACT
+                .source_for_load(&spec, base)
+                .unwrap();
+            let names = selected
+                .materialized_language_tensor_headers(&crate::config::DEV_ENCODER_CONTRACT)
+                .unwrap()
+                .into_iter()
+                .map(|header| header.name)
+                .collect::<std::collections::BTreeSet<_>>();
+            assert!(names.contains("language_model.lm_head.weight"));
+            assert!(!names.contains("language_model.lm_head.scales"));
+            assert!(!names.contains("language_model.lm_head.biases"));
+
+            let mut expected_matrix_bases = std::collections::BTreeSet::from([
+                "language_model.model.embed_tokens".to_owned(),
+                "language_model.lm_head".to_owned(),
+            ]);
+            for layer in 0..crate::config::DEV_ENCODER_CONTRACT.loaded_hidden_layers {
+                for suffix in [
+                    "self_attn.q_proj",
+                    "self_attn.k_proj",
+                    "self_attn.v_proj",
+                    "self_attn.o_proj",
+                    "mlp.gate_proj",
+                    "mlp.up_proj",
+                    "mlp.down_proj",
+                ] {
+                    expected_matrix_bases
+                        .insert(format!("language_model.model.layers.{layer}.{suffix}"));
+                }
+            }
+            let actual_matrix_bases = names
+                .iter()
+                .filter_map(|name| {
+                    name.strip_suffix(".weight")
+                        .or_else(|| name.strip_suffix(".scales"))
+                        .or_else(|| name.strip_suffix(".biases"))
+                })
+                .filter(|base| {
+                    base.ends_with("embed_tokens")
+                        || base.ends_with("lm_head")
+                        || [
+                            "q_proj",
+                            "k_proj",
+                            "v_proj",
+                            "o_proj",
+                            "gate_proj",
+                            "up_proj",
+                            "down_proj",
+                        ]
+                        .iter()
+                        .any(|suffix| base.ends_with(suffix))
+                })
+                .map(str::to_owned)
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(actual_matrix_bases, expected_matrix_bases);
+
+            let runtime = [
+                include_str!("text_encoder/attention.rs"),
+                include_str!("text_encoder/mlp.rs"),
+                include_str!("text_encoder/encoder.rs"),
+                include_str!("text_encoder/mod.rs"),
+            ]
+            .join("\n");
+            for suffix in [
+                "q_proj.weight",
+                "k_proj.weight",
+                "v_proj.weight",
+                "o_proj.weight",
+                "gate_proj.weight",
+                "up_proj.weight",
+                "down_proj.weight",
+                "embed_tokens",
+                "lm_head.weight",
+            ] {
+                assert!(
+                    runtime.contains(suffix),
+                    "contract matrix surface has no matching runtime constructor for {suffix}"
+                );
+            }
+        }
     }
 
     #[test]

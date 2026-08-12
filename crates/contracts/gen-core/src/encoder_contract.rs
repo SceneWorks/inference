@@ -277,8 +277,8 @@ impl ValidatedEncoderSource {
         Ok(bytes)
     }
 
-    /// Retained tokenizer receipt. `None` is limited to metadata-only legacy validation helpers;
-    /// every production source path binds against a base snapshot.
+    /// Retained tokenizer receipt. `None` is limited to metadata-only validation helpers; every
+    /// production source path binds against a base snapshot.
     pub fn tokenizer_source(&self) -> Option<&ValidatedTokenizerSource> {
         self.tokenizer.as_ref()
     }
@@ -726,6 +726,23 @@ pub fn text_encoder_source_tensor_headers(
 }
 
 impl EncoderContract {
+    /// Project a previously contract-validated dense header inventory onto the exact language
+    /// tensor names retained by this encoder's constructors. This is the embedded-checkpoint twin
+    /// of [`ValidatedEncoderSource::materialized_language_tensor_headers`]: fused ComfyUI sources
+    /// retain their own file pin, so they cannot produce a standalone encoder receipt, but memory
+    /// planning still must exclude validated yet unmaterialized tails and unrelated extras.
+    pub fn materialized_dense_language_tensor_headers(
+        &self,
+        validated_headers: &[SafetensorsTensorHeader],
+    ) -> Result<Vec<SafetensorsTensorHeader>> {
+        let expected = self.materialized_language_tensor_names(None)?;
+        Ok(validated_headers
+            .iter()
+            .filter(|header| expected.contains(&header.name))
+            .cloned()
+            .collect())
+    }
+
     /// Validate the provider-authored contract itself before it is advertised or used to inspect a
     /// caller's files. This keeps malformed descriptors from turning later shape arithmetic into a
     /// panic or from advertising an architecture for which no exhaustive header signature exists.
@@ -982,6 +999,35 @@ impl EncoderContract {
         validated.tokenizer = Some(self.bind_tokenizer(base_root, source)?);
         validated.ensure_unchanged()?;
         Ok(validated)
+    }
+
+    /// Resolve and validate the effective text-encoder component for metadata-only planning.
+    /// Unlike [`Self::source_for_load`], this deliberately does not require or retain a tokenizer:
+    /// memory admission prices tensor materialization, while the executable load remains the seam
+    /// that proves tokenizer compatibility. Complete selected snapshots are accepted here so their
+    /// tensor surface can be priced before that later load-time binding.
+    pub fn source_for_planning(
+        &self,
+        spec: &crate::LoadSpec,
+        base_root: &Path,
+    ) -> Result<ValidatedEncoderSource> {
+        let builtin = WeightsSource::Dir(base_root.join("text_encoder"));
+        let source = spec.text_encoder.as_ref().unwrap_or(&builtin);
+        self.validate_source_for_planning(source)
+    }
+
+    /// Validate a provider-selected encoder's behavior and tensor surface for metadata-only
+    /// planning, without claiming that its tokenizer has passed the production load-time binding.
+    pub fn validate_source_for_planning(
+        &self,
+        source: &WeightsSource,
+    ) -> Result<ValidatedEncoderSource> {
+        self.validate_source_with_policy(
+            source,
+            EncoderDtypePolicy::Native,
+            EncoderConfigPolicy::Required,
+            None,
+        )
     }
 
     /// Validate a provider-selected source while binding it to the tokenizer retained from
@@ -1900,16 +1946,21 @@ impl EncoderContract {
     ) -> Result<()> {
         let prefix = self.expected_header_prefix()?;
         self.validate_architecture_signature(headers, path, prefix)?;
-        let lm_head_name = self
+        let lm_head_prefix = self
             .requires_lm_head
             .then(|| self.expected_lm_head_prefix())
             .transpose()?
-            .map(|prefix| format!("{prefix}.lm_head.weight"));
+            .map(|prefix| format!("{prefix}.lm_head."));
+        let lm_head_name = lm_head_prefix
+            .as_ref()
+            .map(|prefix| format!("{prefix}weight"));
         let relevant = headers
             .iter()
             .filter(|header| {
                 header.name.starts_with(&format!("{prefix}."))
-                    || lm_head_name.as_ref() == Some(&header.name)
+                    || lm_head_prefix
+                        .as_ref()
+                        .is_some_and(|prefix| header.name.starts_with(prefix))
             })
             .cloned()
             .collect::<Vec<_>>();

@@ -621,14 +621,16 @@ fn asset_facts(
     };
     if let WeightsSource::Dir(root) = &spec.weights {
         let selected = crate::ENCODER_CONTRACT.source_for_load(spec, root)?;
-        components.text_encoder =
-            projected_tensor_headers_bytes(&selected.tensor_headers()?, |_| match spec.quantize {
+        components.text_encoder = projected_tensor_headers_bytes(
+            &selected.materialized_language_tensor_headers(&crate::ENCODER_CONTRACT)?,
+            |_| match spec.quantize {
                 Some(quant) => ResidentProjection::GroupQuantized {
                     bits: quant.bits(),
                     group_size: crate::quant::GROUP_SIZE as usize,
                 },
                 None => ResidentProjection::Stored,
-            })?;
+            },
+        )?;
     }
     let resident_components = match &spec.control {
         Some(source) => control_resident_components(source, spec.quantize, streamable)?,
@@ -929,11 +931,109 @@ mod tests {
     }
 
     fn write_snapshot(root: &std::path::Path) {
-        for component in ["text_encoder", "transformer", "vae"] {
+        for component in ["transformer", "vae"] {
             let dir = root.join(component);
             std::fs::create_dir_all(&dir).unwrap();
             write_minimal_safetensors(&dir.join("model.safetensors"));
         }
+        gen_core_testkit::write_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            crate::ENCODER_CONTRACT,
+        )
+        .unwrap();
+    }
+
+    fn append_sparse_f16_tensor(path: &std::path::Path, name: &str, shape: &[usize]) {
+        use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let mut encoded_len = [0_u8; 8];
+        file.read_exact(&mut encoded_len).unwrap();
+        let mut encoded = vec![0_u8; u64::from_le_bytes(encoded_len) as usize];
+        file.read_exact(&mut encoded).unwrap();
+        let mut header: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&encoded).unwrap();
+        let start = header
+            .values()
+            .filter_map(|entry| entry["data_offsets"][1].as_u64())
+            .max()
+            .unwrap_or(0);
+        let bytes = shape
+            .iter()
+            .try_fold(2_u64, |total, dimension| {
+                total.checked_mul(*dimension as u64)
+            })
+            .unwrap();
+        let end = start.checked_add(bytes).unwrap();
+        assert!(header
+            .insert(
+                name.to_owned(),
+                serde_json::json!({
+                    "dtype": "F16",
+                    "shape": shape,
+                    "data_offsets": [start, end],
+                }),
+            )
+            .is_none());
+        let encoded = serde_json::to_vec(&header).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(&(encoded.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(&encoded).unwrap();
+        file.set_len(8 + encoded.len() as u64 + end).unwrap();
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum EncoderSelection {
+        Builtin,
+        OverrideDir,
+        OverrideFile,
+        CompleteSnapshot,
+    }
+
+    fn snapshot_spec_with_encoder(
+        tmp: &tempfile::TempDir,
+        quant: Option<Quant>,
+        selection: EncoderSelection,
+    ) -> (std::path::PathBuf, LoadSpec, std::path::PathBuf) {
+        let root = tmp.path().join("snapshot");
+        write_snapshot(&root);
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+        spec.quantize = quant;
+        let selected = match selection {
+            EncoderSelection::Builtin => root.join("text_encoder"),
+            EncoderSelection::OverrideDir | EncoderSelection::OverrideFile => {
+                let selected = tmp.path().join("selected-text-encoder");
+                gen_core_testkit::write_encoder_contract_fixture(
+                    &selected,
+                    crate::ENCODER_CONTRACT,
+                )
+                .unwrap();
+                spec.text_encoder = Some(match selection {
+                    EncoderSelection::OverrideDir => WeightsSource::Dir(selected.clone()),
+                    EncoderSelection::OverrideFile => {
+                        WeightsSource::File(selected.join("model.safetensors"))
+                    }
+                    _ => unreachable!(),
+                });
+                selected
+            }
+            EncoderSelection::CompleteSnapshot => {
+                let selected = tmp.path().join("selected-snapshot");
+                gen_core_testkit::write_encoder_contract_fixture(
+                    &selected.join("text_encoder"),
+                    crate::ENCODER_CONTRACT,
+                )
+                .unwrap();
+                spec.text_encoder = Some(WeightsSource::Dir(selected.clone()));
+                selected.join("text_encoder")
+            }
+        };
+        (root, spec, selected.join("model.safetensors"))
     }
 
     /// The load rung 4 is available on: a re-openable snapshot dir with deferred materialization.
@@ -957,6 +1057,58 @@ mod tests {
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
         assert!(memory_strategy_contract(crate::model::MODEL_ID, &spec).is_err());
         assert!(weights_free_memory_strategy_contract(crate::model::MODEL_ID, &spec).is_ok());
+    }
+
+    #[test]
+    fn conditioning_prices_only_the_materialized_36_layer_language_surface() {
+        for quant in [None, Some(Quant::Q4), Some(Quant::Q8)] {
+            for selection in [
+                EncoderSelection::Builtin,
+                EncoderSelection::OverrideDir,
+                EncoderSelection::OverrideFile,
+                EncoderSelection::CompleteSnapshot,
+            ] {
+                let tmp = tempfile::tempdir().unwrap();
+                let (root, spec, selected_path) =
+                    snapshot_spec_with_encoder(&tmp, quant, selection);
+                let conditioning = || {
+                    memory_strategy_contract(crate::model::MODEL_ID, &spec)
+                        .unwrap()
+                        .asset_facts
+                        .conditioning_bytes
+                };
+                let baseline = conditioning();
+                let selected = crate::ENCODER_CONTRACT
+                    .source_for_load(&spec, &root)
+                    .unwrap();
+                let names = selected
+                    .materialized_language_tensor_headers(&crate::ENCODER_CONTRACT)
+                    .unwrap()
+                    .into_iter()
+                    .map(|header| header.name)
+                    .collect::<std::collections::BTreeSet<_>>();
+                assert!(names.contains("model.layers.35.self_attn.q_proj.weight"));
+                assert!(!names
+                    .iter()
+                    .any(|name| name.starts_with("model.layers.36.")));
+                assert!(!names.contains("model.norm.weight"));
+
+                for (name, shape) in [
+                    (
+                        "model.norm.weight",
+                        vec![crate::ENCODER_CONTRACT.hidden_size],
+                    ),
+                    ("model.unrelated_projection.weight", vec![17]),
+                ] {
+                    append_sparse_f16_tensor(&selected_path, name, &shape);
+                    assert_eq!(
+                        conditioning(),
+                        baseline,
+                        "{quant:?} {selection:?} charged an unmaterialized tensor {name}"
+                    );
+                }
+            }
+        }
     }
 
     /// A selection carrying exactly the parameters the rungs up to and including `strategy` own —
@@ -1283,10 +1435,29 @@ mod tests {
         const STACK_RESIDENT_BYTES: u64 = 72;
         const PERSISTENT_RESIDENT_BYTES: u64 = 136;
         const CONTROL_RESIDENT_BYTES: u64 = STACK_RESIDENT_BYTES + PERSISTENT_RESIDENT_BYTES;
-        assert_eq!(contract.asset_facts.conditioning_bytes, 2);
+        let selected = crate::ENCODER_CONTRACT
+            .source_for_load(&spec, &root)
+            .unwrap();
+        let expected_conditioning_bytes = projected_tensor_headers_bytes(
+            &selected
+                .materialized_language_tensor_headers(&crate::ENCODER_CONTRACT)
+                .unwrap(),
+            |_| ResidentProjection::GroupQuantized {
+                bits: Quant::Q4.bits(),
+                group_size: crate::quant::GROUP_SIZE as usize,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            contract.asset_facts.conditioning_bytes,
+            expected_conditioning_bytes
+        );
         assert_eq!(contract.asset_facts.transformer_bytes, 72);
         assert_eq!(contract.asset_facts.decoder_bytes, 2);
-        assert_eq!(contract.asset_facts.base_bytes, 76);
+        assert_eq!(
+            contract.asset_facts.base_bytes,
+            expected_conditioning_bytes + 74
+        );
         assert_eq!(contract.asset_facts.overlay_bytes, CONTROL_RESIDENT_BYTES);
         let component = contract
             .resident_components()
