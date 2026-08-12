@@ -34,8 +34,8 @@ use mlx_rs::Dtype;
 
 use mlx_gen::gen_core::{
     reject_unknown_components, Capabilities, ConditioningKind, GenerationOutput, GenerationRequest,
-    Generator, KeyframeRef, LoadSpec, Modality, ModelDescriptor, Precision, Progress, SizeFloor,
-    WeightsSource,
+    Generator, KeyframeRef, LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant,
+    SizeFloor, WeightsSource,
 };
 use mlx_gen::weights::Weights;
 use mlx_gen::{default_seed, Error, Result};
@@ -109,7 +109,10 @@ pub fn descriptor() -> ModelDescriptor {
             conditioning: vec![ConditioningKind::Keyframe],
             supports_lora: false,
             supports_lokr: false,
-            supported_quants: &[],
+            // The tiers exist and load (sc-17150) — packed offline by `crate::convert` and staged
+            // as the [`DIT_COMPONENT`]. `spec.quantize` is reconciled against the staged tier's
+            // marker rather than triggering a load-time quantize; see [`reconcile_tier`].
+            supported_quants: &[Quant::Q4, Quant::Q8],
             component_precision_floors: &[],
             samplers: Vec::new(),
             schedulers: Vec::new(),
@@ -143,7 +146,71 @@ pub fn descriptor() -> ModelDescriptor {
 pub struct MiniMaxH3 {
     descriptor: ModelDescriptor,
     root: PathBuf,
+    /// The directory holding the DiT's `config.json` and shards — `root.join("transformer")` in the
+    /// **flat** upstream layout, or the staged [`DIT_COMPONENT`] directory in the **split** layout
+    /// where the tiered DiT comes from `SceneWorks/minimax-h3-mlx/{tier}/transformer` while every
+    /// shared component still comes from the upstream root. See [`resolve_dit_dir`].
+    dit_dir: PathBuf,
     dtype: Dtype,
+}
+
+/// The staged-component id for the **tiered** DiT directory (sc-17150).
+///
+/// Only the DiT is tiered: the text encoder, both VAEs and the tokenizer are dense in every tier and
+/// are shared as a co-requisite, so they always resolve against the upstream root. Redirecting just
+/// this one component is what lets a `q4` install hold one 18.8 GB DiT alongside the shared 66.7 GB
+/// text encoder without a second copy of anything.
+///
+/// Deliberately **not** in [`ModelDescriptor::required_components`]: it is needed only for a
+/// non-`bf16` tier, and a flat upstream snapshot must keep loading with nothing staged. That is the
+/// sensenova `distill_lora` convention — a conditionally-needed component is declared to
+/// [`reject_unknown_components`] per load, not advertised as a universal requirement.
+pub const DIT_COMPONENT: &str = "transformer";
+
+/// Resolve the DiT directory: the staged [`DIT_COMPONENT`] if the caller provided one, else
+/// `root/transformer` (the flat upstream layout).
+fn resolve_dit_dir(root: &Path, spec: &LoadSpec) -> PathBuf {
+    match spec.components.get(DIT_COMPONENT) {
+        Some(WeightsSource::Dir(p)) => p.clone(),
+        // A single file is not a component directory; fall back and let the config probe below
+        // produce the actionable "missing transformer/config.json" error against the root.
+        _ => root.join(DIT_COMPONENT),
+    }
+}
+
+/// Reconcile a caller's `spec.quantize` against the tier actually staged on disk.
+///
+/// **MiniMax-H3 never quantizes at load.** Every tier ships pre-quantized (`crate::convert`), and
+/// the reason is not tidiness: quantizing the DiT at load would materialize its 66_280_430_080
+/// dense bytes *and* the growing packed output at once, which is the install-time peak this model
+/// cannot afford on any Mac it targets. So `spec.quantize` is an **assertion** about which tier was
+/// staged, not an instruction — the mochi / LTX `split_model.json` shape, read here from the
+/// `quantization` marker [`mlx_gen::quant::write_quantized_config`] writes into each tier's
+/// `config.json`.
+///
+/// A disagreement is a hard error rather than a silent downgrade, because an unmarked packed
+/// component and a genuinely dense one are indistinguishable to a loader that guesses.
+fn reconcile_tier(dit_dir: &Path, requested: Option<mlx_gen::gen_core::Quant>) -> Result<()> {
+    let packed = mlx_gen::quant::packed_quant_bits_at(dit_dir)?;
+    match (packed, requested) {
+        (Some(bits), Some(q)) if bits != q.bits() => Err(Error::Msg(format!(
+            "{MODEL_ID}: spec.quantize={q:?} (bits {}) disagrees with the staged tier's \
+             config.json quantization marker (bits {bits}) in {} — the on-disk tier is \
+             authoritative; stage the tier you asked for",
+            q.bits(),
+            dit_dir.display()
+        ))),
+        // Packed and agreed (or asserted nothing): the loader builds it packed from `.scales`.
+        (Some(_), _) => Ok(()),
+        (None, Some(q)) => Err(Error::Unsupported(format!(
+            "{MODEL_ID}: spec.quantize={q:?} but {} carries no quantization marker — MiniMax-H3 \
+             does not quantize at load (the DiT's 66_280_430_080 dense bytes plus the packed \
+             output will not co-reside); stage the pre-quantized tier's `transformer` directory as \
+             the '{DIT_COMPONENT}' component",
+            dit_dir.display()
+        ))),
+        (None, None) => Ok(()),
+    }
 }
 
 /// Reject a request this model cannot serve, before any weight is read.
@@ -296,19 +363,25 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
             )))
         }
     };
-    reject_unknown_components(spec, &[], MODEL_ID)?;
-    if spec.quantize.is_some() {
-        return Err(Error::Unsupported(format!(
-            "{MODEL_ID}: quantized tiers are not wired yet (sc-17150); load the bf16 snapshot"
-        )));
-    }
+    reject_unknown_components(spec, &[DIT_COMPONENT], MODEL_ID)?;
     if !spec.adapters.is_empty() {
         return Err(Error::Unsupported(format!(
             "{MODEL_ID}: adapters are not supported"
         )));
     }
+    // The DiT is the one tiered component, so it is probed at its resolved location rather than
+    // under the root — a split install has no `root/transformer` at all.
+    let dit_dir = resolve_dit_dir(&root, spec);
+    let dit_config = dit_dir.join("config.json");
+    if !dit_config.is_file() {
+        return Err(Error::Msg(format!(
+            "{MODEL_ID}: missing {} — stage the tier's `transformer` directory as the \
+             '{DIT_COMPONENT}' component, or point at a snapshot root that holds `transformer/`",
+            dit_config.display()
+        )));
+    }
+    reconcile_tier(&dit_dir, spec.quantize)?;
     for (partition, probe) in [
-        ("transformer", "config.json"),
         ("vae", "config.json"),
         ("audio_vae", "config.json"),
         ("text_encoder", "config.json"),
@@ -335,6 +408,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     Ok(Box::new(MiniMaxH3 {
         descriptor: descriptor(),
         root,
+        dit_dir,
         dtype,
     }))
 }
@@ -350,6 +424,12 @@ impl MiniMaxH3 {
     /// The snapshot root this generator reads.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The resolved DiT directory — `root/transformer` on a flat install, or the staged
+    /// [`DIT_COMPONENT`] on a tiered one.
+    pub fn dit_dir(&self) -> &Path {
+        &self.dit_dir
     }
 
     /// The block stack's precision.
@@ -544,7 +624,7 @@ impl MiniMaxH3 {
         }
 
         // --- 2. denoise ---------------------------------------------------------------------
-        let dit = MiniMaxH3Dit::load(&self.root, "transformer", self.dtype)?;
+        let dit = MiniMaxH3Dit::load_dir(&self.dit_dir, self.dtype)?;
         let patch = dit.config().patch_size;
         let layout = if anchors.is_empty() {
             t2va_layout(&geometry, context.shape()[1], patch)?
