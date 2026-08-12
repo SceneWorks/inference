@@ -90,7 +90,7 @@ fn rms(samples: &[f32]) -> f64 {
 
 /// **The render.** Prompt in, 124 frames of picture and 5.1667 s of stereo sound out.
 #[test]
-#[ignore = "needs the full MiniMax-H3 snapshot (MINIMAX_H3_SNAPSHOT) + Metal; ~76 GB peak, ~20 min"]
+#[ignore = "needs the full MiniMax-H3 snapshot (MINIMAX_H3_SNAPSHOT) + Metal; measured 52.81 GB peak / 655 s at 576x320 x 124 frames x 50 steps"]
 fn first_light_renders_video_and_audio_at_the_smallest_geometry() {
     let root = snapshot();
     let evaluations = steps();

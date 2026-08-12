@@ -86,7 +86,8 @@ pub const APACHE_2_0: LicenseFamily = LicenseFamily {
 /// The LICENSE's own closing note: *"the encoder of MiniMax H3 uses Qwen3-VL-32B, which is licensed
 /// under Apache 2.0 License"*. sc-17143 established that the shipped `text_encoder/` shards are
 /// byte-identical to `Qwen/Qwen3-VL-32B-Instruct`, so that is a **separate component**
-/// ([`QWEN3_VL_32B_INSTRUCT`]) and not covered by this family.
+/// ([`QWEN3_VL_32B_INSTRUCT`](super::components::QWEN3_VL_32B_INSTRUCT)) and not covered by
+/// this family.
 ///
 /// Text read at <https://huggingface.co/MiniMaxAI/MiniMax-H3/raw/main/LICENSE> on 2026-08-12.
 pub const MINIMAX_H3_COMMUNITY: LicenseFamily = LicenseFamily {

@@ -606,7 +606,8 @@ pub const LTX_2_3: ComponentLicense = ComponentLicense {
 /// **Not Apache-2.0.** The model card declares `license: other` /
 /// `minimax-h3-community-license-agreement`, and that agreement is **territorially exclusive**: its
 /// "Applicable Territory" is worldwide *excluding* the European Union, the United Kingdom, the
-/// Republic of Korea and the United States of America. See [`MINIMAX_H3_COMMUNITY`].
+/// Republic of Korea and the United States of America. See
+/// [`MINIMAX_H3_COMMUNITY`](super::families::MINIMAX_H3_COMMUNITY).
 ///
 /// The `text_encoder/` partition is deliberately **not** covered here: it is a byte-identical copy
 /// of upstream Qwen3-VL-32B-Instruct under Apache-2.0, which the LICENSE itself says
