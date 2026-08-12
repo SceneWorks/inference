@@ -2181,6 +2181,17 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             "so required checks stay pending and every queued PR is evicted on timeout",
         )
 
+    def test_push_on_main_can_produce_the_required_ci_gate_context(self) -> None:
+        triggers = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))[True]
+        self.assertIn(
+            "main",
+            (triggers.get("push") or {}).get("branches") or [],
+            "ruleset 20481541 requires the `CI gate` context on main and the merge queue that used "
+            "to produce it was removed on 2026-08-11, so this post-merge run is the only event that "
+            "can produce it: drop `branches: [main]` and every commit landing on main carries zero "
+            "check-runs while the required context becomes unproducible (sc-18825)",
+        )
+
     def test_every_base_sha_resolves_on_a_merge_group_event(self) -> None:
         # merge_group carries neither `pull_request.base.sha` nor `before`. An empty base is not
         # uniformly loud: select_lanes.py hard-errors, but check-review-findings.py drops its
