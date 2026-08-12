@@ -1112,6 +1112,144 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertGreater(len(requirement_lines), 12)
         self.assertTrue(all(line.endswith(" \\") for line in requirement_lines))
 
+    def test_withdrawn_or_gated_media_models_materialize_from_exact_public_mirrors(self) -> None:
+        models = {
+            model["key"]: model
+            for model in tomllib.loads(MODEL_MANIFEST.read_text(encoding="utf-8"))["models"]
+        }
+        expected = {
+            "flux-1-dev": (
+                "black-forest-labs/FLUX.1-dev",
+                "3de623fc3c33e44ffbe2bad470d0f45bccf2eb21",
+                "SceneWorks/flux1-dev-mlx",
+                "323fd12d79f78ad444e882e8d8e871914584f2b9",
+                "bf16",
+            ),
+            "mage-flow": (
+                "microsoft/Mage-Flow",
+                "faca09c18c1c19458e7fbc3f7bce6f7a7d4d01a9",
+                "SceneWorks/Mage-Flow",
+                "5f6455818d8ca80ce780e9c01b9e0de1d8c5f9db",
+                None,
+            ),
+            "mage-flow-edit": (
+                "microsoft/Mage-Flow-Edit",
+                "b01d524f86498b7dabcc4b3572c6d264d786a16e",
+                "SceneWorks/Mage-Flow-Edit",
+                "dbd4a9c07faca94491ad88ab21225d62e054d9cc",
+                None,
+            ),
+            "mage-flow-edit-base": (
+                "microsoft/Mage-Flow-Edit-Base",
+                "8654a7bc0283ab2946385230b5b2eb944e0b76ea",
+                "SceneWorks/Mage-Flow-Edit-Base",
+                "6c119cdac7ce7cf8c1ab4990d9c8ca18641f2c5d",
+                None,
+            ),
+            "mage-flow-edit-turbo": (
+                "microsoft/Mage-Flow-Edit-Turbo",
+                "14427bd7627d3a25436497a5939e1096f6a0d523",
+                "SceneWorks/Mage-Flow-Edit-Turbo",
+                "75c11a2957aca2c78272984375502105b2b235ab",
+                None,
+            ),
+        }
+        mage_download_files = [
+            "model_index.json",
+            "scheduler/*",
+            "text_encoder/*",
+            "transformer/*",
+            "vae/*",
+        ]
+        mage_materialization_files = [
+            "model_index.json",
+            "scheduler/scheduler_config.json",
+            "text_encoder/.gitattributes",
+            "text_encoder/README.md",
+            "text_encoder/chat_template.json",
+            "text_encoder/config.json",
+            "text_encoder/generation_config.json",
+            "text_encoder/merges.txt",
+            "text_encoder/model-00001-of-00002.safetensors",
+            "text_encoder/model-00002-of-00002.safetensors",
+            "text_encoder/model.safetensors.index.json",
+            "text_encoder/preprocessor_config.json",
+            "text_encoder/tokenizer.json",
+            "text_encoder/tokenizer_config.json",
+            "text_encoder/video_preprocessor_config.json",
+            "text_encoder/vocab.json",
+            "transformer/config.json",
+            "transformer/diffusion_pytorch_model.safetensors",
+            "vae/config.json",
+            "vae/diffusion_pytorch_model.safetensors",
+        ]
+        flux_materialization_files = [
+            "LICENSE.md",
+            "model_index.json",
+            "scheduler/scheduler_config.json",
+            "text_encoder/config.json",
+            "text_encoder/model.safetensors",
+            "text_encoder_2/config.json",
+            "text_encoder_2/model-00001-of-00002.safetensors",
+            "text_encoder_2/model-00002-of-00002.safetensors",
+            "text_encoder_2/model.safetensors.index.json",
+            "tokenizer/merges.txt",
+            "tokenizer/special_tokens_map.json",
+            "tokenizer/tokenizer_config.json",
+            "tokenizer/vocab.json",
+            "tokenizer_2/special_tokens_map.json",
+            "tokenizer_2/spiece.model",
+            "tokenizer_2/tokenizer.json",
+            "tokenizer_2/tokenizer_config.json",
+            "transformer/config.json",
+            "transformer/diffusion_pytorch_model-00001-of-00003.safetensors",
+            "transformer/diffusion_pytorch_model-00002-of-00003.safetensors",
+            "transformer/diffusion_pytorch_model-00003-of-00003.safetensors",
+            "transformer/diffusion_pytorch_model.safetensors.index.json",
+            "vae/config.json",
+            "vae/diffusion_pytorch_model.safetensors",
+        ]
+        for key, (
+            canonical_repo,
+            canonical_rev,
+            mirror_repo,
+            mirror_rev,
+            prefix,
+        ) in expected.items():
+            with self.subTest(key=key):
+                model = models[key]
+                self.assertEqual(model["repository"], canonical_repo)
+                self.assertEqual(model["revision"], canonical_rev)
+                self.assertEqual(model["materialization_repository"], mirror_repo)
+                self.assertEqual(model["materialization_revision"], mirror_rev)
+                self.assertEqual(model.get("materialization_path_prefix"), prefix)
+                self.assertNotIn("materialization_requires_auth", model)
+                if key.startswith("mage-flow"):
+                    self.assertEqual(model["download_files"], mage_download_files)
+                    self.assertEqual(
+                        model["materialization_expected_files"], mage_materialization_files
+                    )
+                    self.assertFalse(
+                        any(
+                            pattern.startswith(("bf16/", "q4/", "q8/"))
+                            for pattern in model["download_files"]
+                        )
+                    )
+                else:
+                    self.assertEqual(
+                        model["materialization_expected_files"], flux_materialization_files
+                    )
+
+        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        self.assertEqual(workflow.count("--require-materialization-provenance"), 6)
+        mac_start = workflow.index("  mlx-request-memory-scope:")
+        windows_start = workflow.index("  candle-mage-memory-ladder:")
+        self.assertEqual(
+            workflow[mac_start:windows_start].count("--require-materialization-provenance"),
+            6,
+        )
+        self.assertNotIn("--require-materialization-provenance", workflow[windows_start:])
+
     def test_residency_ab_is_operator_run_without_ci_model_dependencies(self) -> None:
         """The CUDA residency A/B stays operator-run — gated directly, not by variable name.
 

@@ -959,7 +959,8 @@ jobs:
           python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py \
             --model mage-flow \
-            --snapshot "$MAGE_REQUEST_SCOPE_SNAPSHOT"
+            --snapshot "$MAGE_REQUEST_SCOPE_SNAPSHOT" \
+            --require-materialization-provenance
       - name: Run Mage request-memory lifecycle
         run: >-
           cargo test --locked --release -p mlx-gen-mage
@@ -1450,10 +1451,10 @@ jobs:
           python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model z-image-turbo --snapshot "$ZIMAGE_SNAPSHOT"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model lens-turbo --snapshot "$LENS_SNAPSHOT"
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model mage-flow --snapshot "$MAGE_SNAPSHOT"
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model mage-flow-edit --snapshot "$MAGE_EDIT_SNAPSHOT"
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model mage-flow-edit-base --snapshot "$MAGE_EDIT_BASE_SNAPSHOT"
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model mage-flow-edit-turbo --snapshot "$MAGE_EDIT_TURBO_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model mage-flow --snapshot "$MAGE_SNAPSHOT" --require-materialization-provenance
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model mage-flow-edit --snapshot "$MAGE_EDIT_SNAPSHOT" --require-materialization-provenance
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model mage-flow-edit-base --snapshot "$MAGE_EDIT_BASE_SNAPSHOT" --require-materialization-provenance
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model mage-flow-edit-turbo --snapshot "$MAGE_EDIT_TURBO_SNAPSHOT" --require-materialization-provenance
       - name: Derive immutable Mage oracle cache key
         id: mage-oracle-key
         run: |
@@ -2176,7 +2177,7 @@ jobs:
       - name: Materialize and verify immutable snapshots
         run: |
           python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model flux-1-dev --snapshot "$FLUX_DEV_DIR"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model flux-1-dev --snapshot "$FLUX_DEV_DIR" --require-materialization-provenance
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model qwen-image-mlx --snapshot "$QWEN_IMAGE_MLX_SNAPSHOT"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model pid-qwenimage --snapshot "$PID_QWEN_SNAPSHOT"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model pid-flux --snapshot "$PID_FLUX_SNAPSHOT"
