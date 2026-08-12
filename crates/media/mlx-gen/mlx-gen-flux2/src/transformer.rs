@@ -12,7 +12,7 @@
 use mlx_rs::error::Exception;
 use mlx_rs::fast::{layer_norm, rms_norm};
 use mlx_rs::ops::{add, concatenate_axis, multiply, sigmoid, split};
-use mlx_rs::transforms::compile::compile;
+use mlx_rs::transforms::compile::{compile, compile_retained};
 use mlx_rs::{Array, Dtype};
 use std::f32::consts::LN_10;
 
@@ -43,6 +43,37 @@ const RMS_EPS: f32 = 1e-5;
 // FLUX.2's modulate keeps a strong f32 `1` via `one_matches_scale = false`. SwiGLU stays crate-specific.
 use mlx_gen::nn::compile_glue;
 pub use mlx_gen::nn::{set_compile_glue, CompileGlueGuard};
+
+const SITE_SWIGLU: &str = "flux2::transformer::swiglu";
+
+fn swiglu_impl((a, b): (&Array, &Array)) -> std::result::Result<Array, Exception> {
+    multiply(&multiply(a, &sigmoid(a)?)?, b)
+}
+
+thread_local! {
+    static RETAINED_SWIGLU: std::cell::RefCell<Option<mlx_gen::nn::RetainedBinary>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn retained_swiglu(args: (&Array, &Array)) -> std::result::Result<Array, mlx_rs::error::Exception> {
+    mlx_gen::nn::prepare_retained_compilation_thread();
+    RETAINED_SWIGLU.with(|slot| {
+        slot.borrow_mut()
+            .get_or_insert_with(|| {
+                mlx_gen::nn::RetainedBinary::new(compile_retained(swiglu_impl, true))
+            })
+            .call(SITE_SWIGLU, args)
+    })
+}
+
+/// Exercise this crate's production retained handle once for the release memory audit.
+#[doc(hidden)]
+pub fn exercise_retained_compile_inventory(input: &Array) -> Result<()> {
+    let output = retained_swiglu((input, input))?;
+    output.eval()?;
+    drop(output);
+    Ok(())
+}
 
 fn require_f32_input(x: &Array) -> Result<Array> {
     Ok(x.as_dtype(Dtype::Float32)?)
@@ -124,13 +155,19 @@ fn attention(
 /// `multiply(silu(x1), x2)` — the inline `a·sigmoid(a)` mirrors [`mlx_gen::nn::silu`] op-for-op.
 fn swiglu(x: &Array) -> Result<Array> {
     let p = split(x, 2, -1)?;
-    let f = |(a, b): (&Array, &Array)| -> std::result::Result<Array, Exception> {
-        multiply(&multiply(a, &sigmoid(a)?)?, b) // silu(a)·b
-    };
     if compile_glue() {
-        Ok(compile(f, true)((&p[0], &p[1]))?)
+        if mlx_gen::nn::retained_compilation_requested() {
+            Ok(retained_swiglu((&p[0], &p[1]))?)
+        } else {
+            mlx_gen::diagnostics::record_compile(
+                SITE_SWIGLU,
+                mlx_gen::diagnostics::CompileDisposition::OneShot,
+            );
+            Ok(compile(swiglu_impl, true)((&p[0], &p[1]))?)
+        }
     } else {
-        Ok(f((&p[0], &p[1]))?)
+        mlx_gen::diagnostics::record_fallback(SITE_SWIGLU, "compiled_glue_disabled");
+        Ok(swiglu_impl((&p[0], &p[1]))?)
     }
 }
 
@@ -1619,6 +1656,40 @@ pub type Flux2TransformerConfig = Flux2Config;
 mod tests {
     use super::*;
     use mlx_gen::adapters::{install_adapter, Adapter};
+
+    #[test]
+    fn retained_binary_swiglu_preserves_dtype_and_exact_values() {
+        use mlx_gen::diagnostics::{self, RETAINED_COMPILATION};
+        use mlx_rs::Dtype::{Bfloat16, Float32};
+
+        for dtype in [Float32, Bfloat16] {
+            let x = Array::from_slice(&[1.0f32, -2.0, 0.5, 3.0, -0.25, 2.0, 4.0, -1.0], &[1, 1, 8])
+                .as_dtype(dtype)
+                .unwrap();
+            set_compile_glue(false);
+            let eager = swiglu(&x).unwrap();
+
+            mlx_rs::transforms::compile::clear_cache();
+            RETAINED_SWIGLU.with(|slot| *slot.borrow_mut() = None);
+            let scope = diagnostics::begin_request_with_toggles(
+                format!("flux2-retained-binary-{dtype:?}"),
+                "test",
+                &[RETAINED_COMPILATION],
+            )
+            .unwrap();
+            set_compile_glue(true);
+            let first = swiglu(&x).unwrap();
+            let second = swiglu(&x).unwrap();
+            let _ = scope.finish();
+            set_compile_glue(false);
+
+            assert_eq!(first.dtype(), dtype);
+            assert_eq!(second.dtype(), dtype);
+            assert_eq!(first, eager);
+            assert_eq!(second, eager);
+        }
+        RETAINED_SWIGLU.with(|slot| *slot.borrow_mut() = None);
+    }
 
     #[test]
     fn timestep_embedding_shape_and_flip() {

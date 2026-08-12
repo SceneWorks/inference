@@ -710,7 +710,7 @@ pub fn denoise(
     // sc-2957: run the DiT's fusable elementwise glue (adaLN affine, gated residual, gated-GELU FFN,
     // RoPE rotation) through `mx.compile` — bit-exact (proven `max|Δ|=0` real + tiny, perf.rs /
     // compile_parity.rs) and ~14% faster/step at production geometry. Scoped + restored on drop by the
-    // RAII guard (F-006/F-007) instead of leaking the process-global toggle on.
+    // RAII guard (F-006/F-007) instead of leaking the render thread's setting into later work.
     let _compile_glue = crate::transformer::CompileGlueGuard::enable();
 
     // Precompute the RoPE + cross-K/V caches once (grid + context are constant across steps).
@@ -846,7 +846,7 @@ pub fn denoise_ti2v(
 
     // sc-2957: compile the DiT's fusable elementwise glue (bit-exact, ~14% faster/step). The per-token
     // modulation shapes differ from T2V's, so `mx.compile` simply re-traces them once. Scoped +
-    // restored on drop by the RAII guard (F-006/F-007) instead of leaking the process-global toggle on.
+    // restored on drop by the RAII guard (F-006/F-007) instead of leaking into later work.
     let _compile_glue = crate::transformer::CompileGlueGuard::enable();
 
     // Precompute the RoPE + cross-K/V caches once (grid + context constant across steps), exactly like
@@ -977,7 +977,7 @@ pub fn denoise_moe(
     let timesteps: Vec<f32> = sched.timesteps().to_vec();
 
     // sc-2957: compiled elementwise glue (bit-exact, ~14% faster/step) — see `denoise`. Scoped +
-    // restored on drop by the RAII guard (F-006/F-007) instead of leaking the process-global on.
+    // restored on drop by the RAII guard (F-006/F-007) instead of leaking into later work.
     let _compile_glue = crate::transformer::CompileGlueGuard::enable();
 
     // The grid is shared — the channel-concat `y` doesn't change F/H/W and each expert's contexts are
@@ -1254,9 +1254,11 @@ pub fn frames_to_images(frames_u8: &Array) -> Result<Vec<Image>> {
     // the (transpose-strided) H/W/C axes, which forces a contiguous logical-order copy (`as_slice`
     // returns the physical buffer), and it never forms the full `f·h·w·c` product — `f` stays its own
     // dim and the inner `h·w·c` is a single frame (≤ ~1e8 even at 8K, well within i32). This retires
-    // the F-070 `reshape(-1)` workaround: on MLX 0.32.0 reshape is int64-safe past `i32::MAX`
-    // (verified in `mlx-gen/tests/mlx_write_bound_probe.rs`), so `f·h·w·3 > i32::MAX` (1920×1088@349f
-    // ≈ 2.19e9; 4K@89f) now renders rather than overflowing. Byte-identical to the old reshape below-bound.
+    // the F-070 `reshape(-1)` workaround: on the pinned MLX 0.32.0 fork, a multi-dimensional reshape
+    // whose individual dimensions fit i32 is exact past an `i32::MAX` total (verified in
+    // `mlx-gen/tests/mlx_write_bound_probe.rs`; a single `reshape(-1)` dimension still raises). Thus
+    // `f·h·w·3 > i32::MAX` (1920×1088@349f ≈ 2.19e9; 4K@89f) now renders rather than overflowing.
+    // Byte-identical to the old reshape below-bound.
     let per = (h as i64 * w as i64 * c as i64) as usize;
     let flat = frames_u8.reshape(&[f, h * w * c])?;
     let bytes = flat.as_slice::<u8>();

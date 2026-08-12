@@ -999,7 +999,7 @@ impl Flux2 {
                 // sc-2963 (rollout of sc-2957): run the MMDiT's fusable elementwise glue (adaLN affine,
                 // SwiGLU, gated residual, RoPE rotation) through `mx.compile` — bit-exact (`max|Δ|=0`,
                 // compile_parity.rs) and a per-step win at production geometry. Scoped to this render by
-                // the RAII guard (F-007): the process-global toggle is restored on drop, even on `?`.
+                // the RAII guard (F-007): the render thread's prior setting is restored on drop.
                 let _compile_glue = crate::transformer::CompileGlueGuard::enable();
 
                 // PiD decode overlay (epic 7840, sc-7847) + `from_ldm` early-stop (sc-8048): when

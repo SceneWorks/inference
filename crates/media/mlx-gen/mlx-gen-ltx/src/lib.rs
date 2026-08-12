@@ -100,7 +100,7 @@ pub use vocoder::{Generator as VocoderGenerator, LtxVocoder, VocoderWithBwe};
 // unchanged.
 //
 // The toggle + its RAII [`CompileGlueGuard`] are hoisted into core (F-104); re-export core's so the
-// process-global is shared with the FLUX family rather than each crate hand-rolling its own `AtomicBool`.
+// request/thread-local setting is shared with the FLUX family.
 pub(crate) use mlx_gen::nn::compile_glue;
 pub use mlx_gen::nn::{set_compile_glue, CompileGlueGuard};
 
@@ -159,7 +159,7 @@ mod compile_glue_guard_tests {
         }
         assert!(compile_glue(), "guard restores the prior (on) on drop");
 
-        // Leave the global eager, as the reference-parity gates expect.
+        // Leave this thread eager, as the reference-parity gates expect.
         set_compile_glue(false);
     }
 }
