@@ -13,7 +13,7 @@
 //!
 //! ```text
 //!   transformer/…safetensors   → SanaTransformer   (the Linear-DiT trunk)
-//!   vae/…safetensors           → DcAeDecoder       (DC-AE f32c32 decoder)
+//!   vae/…safetensors           → DcAeEncoder/Decoder (DC-AE f32c32 autoencoder)
 //!   text_encoder/…safetensors  → gemma-2-2b-it     (CHI caption encoder weights)
 //!   tokenizer/tokenizer.json   ↗ gemma tokenizer
 //! ```
@@ -26,9 +26,9 @@
 //! SANA-1.6B is a **true-CFG** flow-match model: default **20 steps / guidance 4.5** (diffusers
 //! `SanaPipeline.__call__`), negative prompt supported, flow-match Euler over a static shift 3.0
 //! schedule routed through the unified epic-7114 sampler. When `guidance <= 1.0` the uncond forward is
-//! skipped (CFG off). No img2img/control conditioning, LoRA, or load-time quantization is wired on the
-//! candle base path — those are rejected rather than silently dropped (the worker routes them to the
-//! Python fallback).
+//! skipped (CFG off). A single reference image drives latent-init img2img with strength-based schedule
+//! truncation; control/IP-adapter overlays, LoRA, and load-time quantization remain unwired and are
+//! rejected rather than silently dropped.
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -62,7 +62,7 @@ pub const RES_MULTIPLE: u32 = crate::pipeline::SPATIAL_SCALE;
 const MAX_COUNT: u32 = 8;
 
 /// A loaded candle SANA generator. Loading is **lazy** (no file I/O in [`load`]); the heavy components
-/// (gemma-2-2b-it TE + Linear-DiT trunk + DC-AE decoder) are built on the first
+/// (gemma-2-2b-it TE + Linear-DiT trunk + DC-AE encoder/decoder) are built on the first
 /// [`generate`](Generator::generate) call and cached (mirrors the sibling candle providers).
 pub struct SanaGenerator {
     descriptor: ModelDescriptor,
@@ -132,10 +132,12 @@ impl SanaGenerator {
     }
 }
 
-/// SANA-1.6B's identity + capabilities — constructible without loading weights (registry introspection
-/// / capability advertisement). True-CFG text-to-image: negative prompt + guidance scale, flow-match
-/// Euler over the unified curated sampler/scheduler menu (epic 7114). No img2img / control conditioning,
-/// LoRA, or quantization is wired on the candle base path. Backend `"candle"`, `mac_only = false`.
+/// SANA-1.6B's identity + capabilities — constructible without loading weights for registry
+/// introspection and capability advertisement. True-CFG text-to-image and singular-reference img2img:
+/// negative prompt + guidance scale, flow-match Euler over the unified curated sampler/scheduler menu
+/// (epic 7114).
+/// Control/IP-adapter overlays, LoRA, and quantization are not wired on the candle base path. Backend
+/// `"candle"`, `mac_only = false`.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
         control_kinds: None,
@@ -148,7 +150,7 @@ pub fn descriptor() -> ModelDescriptor {
             supports_negative_prompt: true,
             supports_guidance: true,
             supports_true_cfg: true,
-            // Plain txt2img — no img2img/control conditioning on the base SANA checkpoint.
+            // A singular reference is latent-init img2img; control/IP-adapter overlays remain unwired.
             conditioning: vec![ConditioningKind::Reference],
             supports_lora: false,
             supports_lokr: false,
@@ -326,7 +328,8 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     }
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
         return Err(gen_core::Error::Unsupported(
-            "candle sana_1600m does not support control / IP-adapter overlays yet (txt2img only)"
+            "candle sana_1600m supports plain txt2img and singular-reference img2img, not control / \
+             IP-adapter overlays"
                 .into(),
         ));
     }
@@ -567,8 +570,8 @@ pub fn load_sprint(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     }
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
         return Err(gen_core::Error::Unsupported(
-            "candle sana_sprint_1600m does not support control / IP-adapter overlays yet (txt2img \
-             only)"
+            "candle sana_sprint_1600m supports plain txt2img and singular-reference img2img, not \
+             control / IP-adapter overlays"
                 .into(),
         ));
     }
