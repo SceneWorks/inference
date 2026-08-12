@@ -151,8 +151,9 @@ fn attention(
 
 /// SwiGLU: split last axis in half, `silu(x1) · x2`. The `split` runs eagerly (a shapeless
 /// `mx.compile` can't infer a split's output shapes); the fusable `silu(x1)·x2` arithmetic is
-/// compiled into one kernel when the sc-2963 glue toggle is on. Bit-exact to the eager
-/// `multiply(silu(x1), x2)` — the inline `a·sigmoid(a)` mirrors [`mlx_gen::nn::silu`] op-for-op.
+/// compiled into one kernel when the sc-2963 glue toggle is on. The inline `a·sigmoid(a)` mirrors
+/// [`mlx_gen::nn::silu`] op-for-op; under MLX 0.32 the compiled path remains exact to eager at bf16
+/// and may differ by 1-2 ULP at f32, within [`mlx_gen::nn::COMPILED_GLUE_F32_ULP_TOL`].
 fn swiglu(x: &Array) -> Result<Array> {
     let p = split(x, 2, -1)?;
     if compile_glue() {
@@ -1658,7 +1659,7 @@ mod tests {
     use mlx_gen::adapters::{install_adapter, Adapter};
 
     #[test]
-    fn retained_binary_swiglu_preserves_dtype_and_exact_values() {
+    fn retained_binary_swiglu_matches_oneshot_and_preserves_numeric_contract() {
         use mlx_gen::diagnostics::{self, RETAINED_COMPILATION};
         use mlx_rs::Dtype::{Bfloat16, Float32};
 
@@ -1668,6 +1669,13 @@ mod tests {
                 .unwrap();
             set_compile_glue(false);
             let eager = swiglu(&x).unwrap();
+            eager.eval().unwrap();
+
+            mlx_rs::transforms::compile::clear_cache();
+            set_compile_glue(true);
+            let oneshot = swiglu(&x).unwrap();
+            oneshot.eval().unwrap();
+            set_compile_glue(false);
 
             mlx_rs::transforms::compile::clear_cache();
             RETAINED_SWIGLU.with(|slot| *slot.borrow_mut() = None);
@@ -1679,14 +1687,37 @@ mod tests {
             .unwrap();
             set_compile_glue(true);
             let first = swiglu(&x).unwrap();
+            first.eval().unwrap();
             let second = swiglu(&x).unwrap();
+            second.eval().unwrap();
             let _ = scope.finish();
             set_compile_glue(false);
 
             assert_eq!(first.dtype(), dtype);
             assert_eq!(second.dtype(), dtype);
-            assert_eq!(first, eager);
-            assert_eq!(second, eager);
+            assert_eq!(
+                first, oneshot,
+                "retained miss must match one-shot {dtype:?}"
+            );
+            assert_eq!(
+                second, oneshot,
+                "retained hit must match one-shot {dtype:?}"
+            );
+
+            // MLX 0.32 fused f32 elementwise glue may round 1-2 ULP differently from eager, while
+            // bf16 remains bit-identical. Retention must not change either established contract.
+            let tol = if dtype == Float32 {
+                mlx_gen::nn::COMPILED_GLUE_F32_ULP_TOL
+            } else {
+                0.0
+            };
+            let rel = mlx_gen::nn::max_rel_diff(&oneshot, &eager);
+            assert!(
+                rel <= tol,
+                "swiglu one-shot vs eager {dtype:?}: rel|Δ|={rel:e} exceeds {tol:e}"
+            );
+            assert_eq!(mlx_gen::nn::max_rel_diff(&first, &eager), rel);
+            assert_eq!(mlx_gen::nn::max_rel_diff(&second, &eager), rel);
         }
         RETAINED_SWIGLU.with(|slot| *slot.borrow_mut() = None);
     }
