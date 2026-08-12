@@ -1024,7 +1024,9 @@ class CiWorkflowPolicyTests(unittest.TestCase):
     def test_sa3_snapshot_paths_are_manifest_derived(self) -> None:
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
         self.assertNotRegex(workflow, r"SA3_[A-Z0-9_]+[^\n]*[0-9a-f]{40}")
-        self.assertEqual(workflow.count("export_model_snapshot_paths.py"), 13)
+        # Thirteen SA3/SAME exporters plus SC-18309's one exact SDXL-VAE projection.
+        self.assertEqual(workflow.count("export_model_snapshot_paths.py"), 14)
+        self.assertEqual(workflow.count("--model sdxl-base-mlx-vae-bf16"), 2)
         expected_models = {
             "same-l-metal": ("same-l",),
             "same-chunked-metal": ("same-s", "same-l"),
@@ -1676,6 +1678,53 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             for path in sorted(WORKFLOW.parent.glob("*.yml"))
         )
         self.assertEqual(manifest_environment_wiring_errors(models, workflows), [])
+
+    def test_native_decode_seam_real_weight_gates_are_exact_and_golden_free(self) -> None:
+        workflow_text = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow = yaml.safe_load(workflow_text)
+        cases = {
+            "mlx-media": (
+                "Prove the SDXL native decode seam on real weights",
+                "mlx-gen-sdxl",
+                "native_decode_seam_is_byte_exact_to_pre_seam_engine",
+                'SDXL_SNAPSHOT="$SDXL_N1_SNAPSHOT/bf16"',
+            ),
+            "mlx-qwen-image": (
+                "Prove the Qwen native decode seam on real weights",
+                "mlx-gen-qwen-image",
+                "native_decode_seam_is_byte_exact_and_precancelled",
+                'MLX_GEN_QWEN_SNAPSHOT="$QWEN_IMAGE_MLX_SNAPSHOT/bf16"',
+            ),
+        }
+        for job, (step_name, package, test_name, snapshot_binding) in cases.items():
+            with self.subTest(job=job):
+                steps = workflow["jobs"][job]["steps"]
+                matching = [step for step in steps if step.get("name") == step_name]
+                self.assertEqual(len(matching), 1)
+                run = matching[0]["run"]
+                self.assertIn("set -o pipefail", run)
+                self.assertIn(snapshot_binding, run)
+                self.assertIn(f"cargo test --locked --release -p {package}", run)
+                self.assertIn(f"--test vae_real_weights", run)
+                self.assertIn(test_name, run)
+                self.assertIn("-- --exact --ignored --nocapture", run)
+                self.assertIn('grep -qE "test result: ok\\. 1 passed"', run)
+                self.assertNotIn("GOLDEN", run)
+
+        models = {
+            model["key"]: model
+            for model in tomllib.loads(MODEL_MANIFEST.read_text(encoding="utf-8"))["models"]
+        }
+        sdxl = models["sdxl-base-mlx-vae-bf16"]
+        self.assertEqual(sdxl["repository"], "SceneWorks/sdxl-base-mlx")
+        self.assertEqual(sdxl["revision"], "36699bb8a6353e61c920e3bf19f0e6f8e4151c55")
+        self.assertEqual(sdxl["environment"], ["SDXL_N1_SNAPSHOT"])
+        expected = [
+            "bf16/vae/config.json",
+            "bf16/vae/diffusion_pytorch_model.fp16.safetensors",
+        ]
+        self.assertEqual(sdxl["download_files"], expected)
+        self.assertEqual(sdxl["expected_files"], expected)
 
     def test_manifest_wiring_policy_discriminates_mutations(self) -> None:
         # The detector has to detect. Each case below is a defect shape that really occurred:

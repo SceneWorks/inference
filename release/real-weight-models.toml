@@ -407,6 +407,26 @@ expected_files = [
 ]
 
 [[models]]
+# SC-18309 N1 needs only the real SDXL VAE to prove that the shared native decode seam is byte-
+# exact to the former direct engine expression. Keep this as an exact two-file projection instead
+# of materializing the 13.5 GB full SDXL matrix on the rw-mage runner.
+key = "sdxl-base-mlx-vae-bf16"
+repository = "SceneWorks/sdxl-base-mlx"
+revision = "36699bb8a6353e61c920e3bf19f0e6f8e4151c55"
+license = "CreativeML Open RAIL++-M"
+size_class = "medium"
+profiles = ["media-macos"]
+environment = ["SDXL_N1_SNAPSHOT"]
+download_files = [
+    "bf16/vae/config.json",
+    "bf16/vae/diffusion_pytorch_model.fp16.safetensors",
+]
+expected_files = [
+    "bf16/vae/config.json",
+    "bf16/vae/diffusion_pytorch_model.fp16.safetensors",
+]
+
+[[models]]
 # The Edit sibling, for the one `sequential_residency_real_weights` arm whose dropped component is
 # the Qwen2.5-VL *vision-language* encoder rather than the text encoder.
 #

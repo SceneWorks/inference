@@ -12,7 +12,7 @@ use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::array::scalar;
 use mlx_gen::nn::{conv2d, group_norm, silu, upsample_nearest};
 use mlx_gen::weights::Weights;
-use mlx_gen::Result;
+use mlx_gen::{CancelFlag, Error, LatentDecoder, Result};
 
 use crate::config::VaeConfig;
 use crate::unet::ResnetBlock2D;
@@ -345,6 +345,9 @@ impl Autoencoder {
         cfg: &mlx_gen::tiling::TilingConfig,
         cancel: Option<&mlx_gen::CancelFlag>,
     ) -> Result<Array> {
+        if cancel.is_some_and(mlx_gen::CancelFlag::is_cancelled) {
+            return Err(mlx_gen::Error::Canceled);
+        }
         let sh = latents.shape();
         if sh.len() != 4 {
             return Err(mlx_gen::Error::Msg(format!(
@@ -386,5 +389,121 @@ impl Autoencoder {
         let idx = Array::from_slice(&(0..half).collect::<Vec<i32>>(), &[half]);
         let mean = moments.take_axis(&idx, 3)?;
         Ok(multiply(&mean, scalar(self.scaling_factor))?)
+    }
+}
+
+/// NCHW adapter for the backend-generic decode seam. The native SDXL VAE is internally NHWC, so the
+/// wrapper performs only the two layout transposes around its established decode methods; the VAE
+/// still owns SDXL's `1 / scaling_factor` de-normalization and all native tile geometry.
+pub struct SdxlLatentDecoder<'a> {
+    vae: &'a Autoencoder,
+}
+
+impl<'a> SdxlLatentDecoder<'a> {
+    pub fn new(vae: &'a Autoencoder) -> Self {
+        Self { vae }
+    }
+
+    fn to_nhwc(latents: &Array) -> Result<Array> {
+        let shape = latents.shape();
+        if shape.len() != 4 || shape[1] != mlx_gen::gen_core::SDXL_LATENT_SPACE.channels as i32 {
+            return Err(Error::Msg(format!(
+                "SDXL decoder expects NCHW [B,4,H,W], got {shape:?}"
+            )));
+        }
+        Ok(latents.transpose_axes(&[0, 2, 3, 1])?)
+    }
+
+    fn to_nchw(decoded: &Array) -> Result<Array> {
+        let shape = decoded.shape();
+        if shape.len() != 4 || shape[3] != 3 {
+            return Err(Error::Msg(format!(
+                "SDXL decoder produced invalid NHWC [B,H,W,3] output {shape:?}"
+            )));
+        }
+        Ok(decoded.transpose_axes(&[0, 3, 1, 2])?)
+    }
+}
+
+impl LatentDecoder for SdxlLatentDecoder<'_> {
+    fn input_latent_space(&self) -> Option<&mlx_gen::gen_core::LatentSpace> {
+        Some(&mlx_gen::gen_core::SDXL_LATENT_SPACE)
+    }
+
+    fn decode(&self, latents: &Array) -> Result<Array> {
+        Self::to_nchw(&self.vae.decode(&Self::to_nhwc(latents)?)?)
+    }
+
+    fn decode_tiled(
+        &self,
+        latents: &Array,
+        tiling: &mlx_gen::tiling::TilingConfig,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<Array> {
+        if cancel.is_some_and(CancelFlag::is_cancelled) {
+            return Err(Error::Canceled);
+        }
+        Self::to_nchw(
+            &self
+                .vae
+                .decode_tiled(&Self::to_nhwc(latents)?, tiling, cancel)?,
+        )
+    }
+}
+
+#[cfg(test)]
+mod decoder_seam_tests {
+    use super::*;
+
+    /// SC-18309 N1's weight-free layout gate. The engine historically passed NHWC latents directly
+    /// to the VAE while the generic seam accepts NCHW; decoded output travels back as RGB NHWC and
+    /// the seam returns RGB NCHW. Distinct values in every axis prove both production transposes
+    /// preserve bytes without weakening the decoded-output RGB shape guard.
+    #[test]
+    fn sdxl_seam_layout_transposes_are_byte_exact() {
+        let nchw_values = (0..(2 * 4 * 3 * 5))
+            .map(|value| value as f32)
+            .collect::<Vec<_>>();
+        let nchw = Array::from_slice(&nchw_values, &[2, 4, 3, 5]);
+        let nhwc = SdxlLatentDecoder::to_nhwc(&nchw).unwrap();
+        assert_eq!(nhwc.shape(), &[2, 3, 5, 4]);
+        let mut expected_nhwc = Vec::with_capacity(nchw_values.len());
+        for batch in 0..2 {
+            for height in 0..3 {
+                for width in 0..5 {
+                    for channel in 0..4 {
+                        expected_nhwc
+                            .push(nchw_values[((batch * 4 + channel) * 3 + height) * 5 + width]);
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            nhwc.reshape(&[-1]).unwrap().as_slice::<f32>(),
+            expected_nhwc
+        );
+
+        let rgb_nhwc_values = (0..(2 * 3 * 5 * 3))
+            .map(|value| value as f32)
+            .collect::<Vec<_>>();
+        let rgb_nhwc = Array::from_slice(&rgb_nhwc_values, &[2, 3, 5, 3]);
+        let rgb_nchw = SdxlLatentDecoder::to_nchw(&rgb_nhwc).unwrap();
+        assert_eq!(rgb_nchw.shape(), &[2, 3, 3, 5]);
+        let mut expected_nchw = Vec::with_capacity(rgb_nhwc_values.len());
+        for batch in 0..2 {
+            for channel in 0..3 {
+                for height in 0..3 {
+                    for width in 0..5 {
+                        expected_nchw.push(
+                            rgb_nhwc_values[((batch * 3 + height) * 5 + width) * 3 + channel],
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            rgb_nchw.reshape(&[-1]).unwrap().as_slice::<f32>(),
+            expected_nchw
+        );
     }
 }

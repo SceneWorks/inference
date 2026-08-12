@@ -4,6 +4,7 @@
 //! SiLU → conv_out). Tol 1e-2 (Metal fp32 convs).
 
 use mlx_gen::weights::Weights;
+use mlx_gen::{CancelFlag, Error, LatentDecoder};
 use mlx_gen_z_image::vae::{Decoder, Vae, VaeDecoderConfig};
 use mlx_rs::ops::{add, all_close, multiply};
 use mlx_rs::Array;
@@ -73,4 +74,47 @@ fn vae_decode_applies_scale_shift_and_frame_axis() {
             .item::<bool>(),
         "Vae::decode scale/shift/frame-axis wrapper is wrong"
     );
+}
+
+/// SC-18309 N1: the real tiny VAE fixture's trait default is bit-for-bit the historical inherent
+/// decode, including scale/shift de-normalization and the singleton output frame. This is an exact
+/// comparison (not the tolerance used for cross-framework parity above).
+#[test]
+fn native_trait_decode_is_byte_exact_to_inherent_decode() {
+    let w = Weights::from_file(FIXTURE).unwrap();
+    let vae = Vae::from_weights(&w, "", &small_cfg()).unwrap();
+    let latent = w.require("in.latent").unwrap();
+
+    let legacy = Vae::decode(&vae, latent).unwrap();
+    let seam = LatentDecoder::decode(&vae, latent).unwrap();
+    assert_eq!(seam.shape(), legacy.shape());
+    assert_eq!(
+        seam.reshape(&[-1]).unwrap().as_slice::<f32>(),
+        legacy.reshape(&[-1]).unwrap().as_slice::<f32>()
+    );
+}
+
+/// A pre-tripped cancel wins before rank validation, tiling selection, de-normalization, or the
+/// monolithic/head path. Both a plan that would tile and one that would fall back must return the
+/// same typed cancellation even for a deliberately malformed latent.
+#[test]
+fn native_tiled_decode_rejects_pre_cancel_before_all_tensor_work() {
+    let w = Weights::from_file(FIXTURE).unwrap();
+    let vae = Vae::from_weights(&w, "", &small_cfg()).unwrap();
+    let malformed = Array::from_slice(&[1.0f32], &[1]);
+    let cancel = CancelFlag::new();
+    cancel.cancel();
+    for cfg in [
+        mlx_gen::tiling::TilingConfig::spatial_only(8, 2),
+        mlx_gen::tiling::TilingConfig::spatial_only(4096, 64),
+    ] {
+        assert!(matches!(
+            LatentDecoder::decode_tiled(&vae, &malformed, &cfg, Some(&cancel)),
+            Err(Error::Canceled)
+        ));
+        assert!(matches!(
+            Vae::decode_tiled(&vae, &malformed, &cfg, Some(&cancel)),
+            Err(Error::Canceled)
+        ));
+    }
 }

@@ -192,13 +192,13 @@ pub fn encode_prompt(
 /// returns its packed final latents; this helper handles the seed sequence, the `Decoding` progress
 /// tick, unpack + decode, and image collection identically for every variant.
 ///
-/// `pid_decoder` is the optional latent→pixel decode seam (sc-7844). The native [`QwenVae`] remains
-/// explicit so the shared memory ladder can select its head-once/tail-tiled path without wrapping or
-/// changing the PiD route. PiD output may be larger than VAE-native, so downstream size is taken
-/// from the decoded tensor, not assumed.
+/// `pid_decoder` is the optional latent→pixel decode seam (sc-7844). The native [`QwenVae`] implements
+/// the same tiled trait entry point, so bounded decode no longer requires a concrete-type escape.
+/// PiD inherits the forwarding default (and keeps its own tile policy). Its output may be larger than
+/// VAE-native, so downstream size is taken from the decoded tensor, not assumed.
 #[allow(clippy::too_many_arguments)] // One explicit, shared decode seam preserves all variant inputs.
 pub fn decode_and_collect<F>(
-    vae: &QwenVae,
+    vae: &dyn LatentDecoder,
     pid_decoder: Option<&dyn LatentDecoder>,
     tiling: Option<&TilingConfig>,
     req: &GenerationRequest,
@@ -213,6 +213,11 @@ pub fn decode_and_collect<F>(
 where
     F: FnMut(u64, &mut dyn FnMut(Progress)) -> Result<Array>,
 {
+    let decoder: &dyn LatentDecoder = pid_decoder.unwrap_or(vae);
+    mlx_gen::ensure_decoder_compatible(
+        Some(&mlx_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE),
+        decoder,
+    )?;
     let mut images = Vec::with_capacity(count as usize);
     for i in 0..count {
         let seed = base_seed.wrapping_add(i as u64);
@@ -222,10 +227,9 @@ where
         );
         on_progress(Progress::Decoding);
         let unpacked = unpack_latents(&latents, width, height)?;
-        let decoded = match (pid_decoder, tiling) {
-            (Some(pid), _) => pid.decode(&unpacked)?,
-            (None, Some(cfg)) => vae.decode_tiled(&unpacked, cfg, Some(&req.cancel))?,
-            (None, None) => vae.decode(&unpacked)?,
+        let decoded = match tiling {
+            Some(cfg) => decoder.decode_tiled(&unpacked, cfg, Some(&req.cancel))?,
+            None => decoder.decode(&unpacked)?,
         }
         .as_dtype(Dtype::Float32)?;
         // Fire the conformance fault only after the selected decoder (including every native VAE
@@ -873,6 +877,123 @@ fn slice_seq(x: &Array, n: i32) -> Result<Array> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    struct DecodeSpy {
+        output: Array,
+        calls: Cell<usize>,
+    }
+
+    impl DecodeSpy {
+        fn new(output: Array) -> Self {
+            Self {
+                output,
+                calls: Cell::new(0),
+            }
+        }
+    }
+
+    impl LatentDecoder for DecodeSpy {
+        fn input_latent_space(&self) -> Option<&mlx_gen::gen_core::LatentSpace> {
+            Some(&mlx_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE)
+        }
+
+        fn decode(&self, _latents: &Array) -> Result<Array> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(self.output.clone())
+        }
+    }
+
+    fn decode_fixture() -> (Array, Array) {
+        let native_latent = Array::from_slice(
+            &(0..(16 * 4 * 6)).map(|i| i as f32).collect::<Vec<_>>(),
+            &[1, 16, 4, 6],
+        );
+        let packed = pack_latents(&native_latent, 48, 32).unwrap();
+        // NCTHW output makes the singleton-frame drop and NCHW→RGB interleave observable.
+        let decoded = Array::from_slice(
+            &[
+                -1.0f32, -0.5, 0.0, 0.5, 1.0, 0.25, // R
+                1.0, 0.5, 0.0, -0.5, -1.0, -0.25, // G
+                -0.75, -0.25, 0.25, 0.75, -1.0, 1.0, // B
+            ],
+            &[1, 3, 1, 2, 3],
+        );
+        (packed, decoded)
+    }
+
+    fn legacy_decode_one(decoder: &dyn LatentDecoder, packed: &Array) -> Image {
+        let unpacked = unpack_latents(packed, 48, 32).unwrap();
+        let decoded = decoder
+            .decode(&unpacked)
+            .unwrap()
+            .as_dtype(Dtype::Float32)
+            .unwrap();
+        decoded_to_image(&decoded).unwrap()
+    }
+
+    /// SC-18309 N1: exercise the real Qwen engine's unpack→decoder→RGB route, comparing the exact
+    /// pre-seam native/no-override expression with `decode_and_collect`. The asymmetric per-channel
+    /// fixture catches a lost singleton frame, NCHW/NHWC swap, dtype/readback change, or accidental
+    /// selection of an override. The second arm pins the historical PiD precedence even when a
+    /// native tiling plan is present (PiD's trait default forwards to its own decode unchanged).
+    #[test]
+    fn decode_engine_keeps_default_and_override_bytes_exact() {
+        let (packed, decoded) = decode_fixture();
+        let legacy_native = DecodeSpy::new(decoded.clone());
+        let expected = legacy_decode_one(&legacy_native, &packed);
+
+        let native = DecodeSpy::new(decoded.clone());
+        let req = GenerationRequest {
+            prompt: "decode parity".into(),
+            width: 48,
+            height: 32,
+            ..Default::default()
+        };
+        let got = decode_and_collect(
+            &native,
+            None,
+            None,
+            &req,
+            "qwen-image-test",
+            1,
+            17,
+            48,
+            32,
+            &mut |_| {},
+            |seed, _| {
+                assert_eq!(seed, 17);
+                Ok(packed.clone())
+            },
+        )
+        .unwrap();
+        assert_eq!(got, vec![expected]);
+        assert_eq!(native.calls.get(), 1, "native default must decode once");
+
+        let native = DecodeSpy::new(Array::zeros::<f32>(&[1, 3, 1, 2, 3]).unwrap());
+        let pid_output = Array::from_slice(&vec![1.0f32; 3 * 4 * 5], &[1, 3, 4, 5]);
+        let legacy_pid = DecodeSpy::new(pid_output.clone());
+        let expected_pid = legacy_decode_one(&legacy_pid, &packed);
+        let pid = DecodeSpy::new(pid_output);
+        let tiling = TilingConfig::spatial_only(16, 4);
+        let got = decode_and_collect(
+            &native,
+            Some(&pid),
+            Some(&tiling),
+            &req,
+            "qwen-image-test",
+            1,
+            17,
+            48,
+            32,
+            &mut |_| {},
+            |_, _| Ok(packed.clone()),
+        )
+        .unwrap();
+        assert_eq!(got, vec![expected_pid]);
+        assert_eq!(native.calls.get(), 0, "PiD override must bypass native VAE");
+        assert_eq!(pid.calls.get(), 1, "PiD override must decode once");
+    }
 
     #[test]
     fn every_variant_uses_the_canonical_preamble_and_conditioning_boundary() {

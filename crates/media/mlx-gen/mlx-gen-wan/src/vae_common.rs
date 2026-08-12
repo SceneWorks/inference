@@ -3,8 +3,11 @@
 //! byte-identical across the two layouts live here; the per-file conv/norm leaves (which carry the
 //! channel axis at different positions) stay with their respective modules.
 
-use mlx_gen::tiling::TilePlan;
-use mlx_gen::{CancelFlag, Result};
+use mlx_gen::tiling::{
+    TilePlan, TilingConfig, VaeTiling, MIN_TEMPORAL_TILE_LATENT_FRAMES,
+    MIN_TEMPORAL_TILE_LATENT_OVERLAP,
+};
+use mlx_gen::{CancelFlag, Error, Result};
 use mlx_rs::Array;
 
 /// A length-1 `f32` array, used as a broadcastable scalar operand in MLX ops.
@@ -76,6 +79,38 @@ pub(crate) fn tile_decode_accumulate(
     decode_tile: impl Fn(&Array) -> Result<Array>,
 ) -> Result<Array> {
     mlx_gen::vae_tiling::tiled_decode(denorm, plan, axes, cancel, decode_tile)
+}
+
+/// Validate a temporal tile policy before it crosses the generic [`mlx_gen::LatentDecoder`] seam.
+/// Production Wan plans already come from `budgeted_plan`, which enforces this floor; the seam is a
+/// new public route and must not let an arbitrary caller re-introduce the short-window temporal
+/// starvation corruption documented by sc-15325. Spatial-only plans and temporal policies that do
+/// not actually tile this latent are unaffected.
+pub(crate) fn validate_decoder_tiling(
+    cfg: &TilingConfig,
+    vae: VaeTiling,
+    latent_frames: i32,
+) -> Result<()> {
+    let Some(temporal) = cfg.temporal else {
+        return Ok(());
+    };
+    let scale = vae.temporal_scale.max(1);
+    let tile_latent = temporal.tile_frames / scale;
+    if latent_frames <= tile_latent {
+        return Ok(());
+    }
+    let overlap_latent = temporal.overlap_frames / scale;
+    if tile_latent < MIN_TEMPORAL_TILE_LATENT_FRAMES {
+        return Err(Error::Msg(format!(
+            "Wan tiled decoder requires at least {MIN_TEMPORAL_TILE_LATENT_FRAMES} latent frames per temporal tile; got {tile_latent}"
+        )));
+    }
+    if overlap_latent < MIN_TEMPORAL_TILE_LATENT_OVERLAP || overlap_latent >= tile_latent {
+        return Err(Error::Msg(format!(
+            "Wan tiled decoder requires temporal overlap in [{MIN_TEMPORAL_TILE_LATENT_OVERLAP}, {tile_latent}) latent frames; got {overlap_latent}"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -170,6 +205,32 @@ mod tests {
         assert!(
             matches!(res, Err(mlx_gen::Error::Canceled)),
             "a pre-tripped cancel must abort the tiled decode with Error::Canceled"
+        );
+    }
+
+    #[test]
+    fn decoder_seam_rejects_temporal_starvation_but_keeps_spatial_only_and_single_pass() {
+        let starved = TilingConfig {
+            spatial: None,
+            temporal: Some(TemporalTiling {
+                tile_frames: 16,
+                overlap_frames: 8,
+            }),
+        };
+        assert!(validate_decoder_tiling(&starved, VaeTiling::WAN, 9).is_err());
+        assert!(validate_decoder_tiling(&starved, VaeTiling::WAN, 4).is_ok());
+
+        let safe = TilingConfig {
+            spatial: None,
+            temporal: Some(TemporalTiling {
+                tile_frames: 32,
+                overlap_frames: 16,
+            }),
+        };
+        assert!(validate_decoder_tiling(&safe, VaeTiling::WAN, 9).is_ok());
+        assert!(
+            validate_decoder_tiling(&TilingConfig::spatial_only(512, 64), VaeTiling::WAN, 257,)
+                .is_ok()
         );
     }
 
