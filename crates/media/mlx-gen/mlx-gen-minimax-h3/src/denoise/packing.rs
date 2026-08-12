@@ -405,6 +405,21 @@ impl PackedLayout {
                 self.seq_len
             )));
         }
+        // Bounds-checked on the host, because **MLX does not bounds-check a gather** — an index
+        // past the end reads whatever is adjacent in the buffer and the caller gets silent
+        // garbage. The same hazard [`crate::dit::adaln::TimestepSchedule::adaln_indices`] guards.
+        if rows.is_empty() {
+            return Err(Error::Msg(
+                "minimax-h3 packing: cannot gather zero rows".into(),
+            ));
+        }
+        if let Some(bad) = rows.iter().find(|&&r| r < 0 || r >= self.seq_len) {
+            return Err(Error::Msg(format!(
+                "minimax-h3 packing: row {bad} is outside [0, {}); MLX gathers out of bounds \
+                 silently rather than failing",
+                self.seq_len
+            )));
+        }
         let idx = Array::from_slice(rows, &[rows.len() as i32]);
         Ok(packed.take_axis(&idx, 1)?)
     }
@@ -586,6 +601,18 @@ mod tests {
             k.gather(&text, k.text_indices()).is_err(),
             "a block that is not the packed sequence is rejected"
         );
+        // MLX gathers out of bounds silently, so the row indices are checked on the host.
+        for bad in [
+            vec![k.seq_len()],
+            vec![-1],
+            vec![0, k.seq_len() + 7],
+            vec![],
+        ] {
+            assert!(
+                k.gather(&packed, &bad).is_err(),
+                "{bad:?} must be rejected rather than reading adjacent memory"
+            );
+        }
     }
 
     /// The four row classes drive a `TimestepSchedule` whose per-row lookups resolve to the right
