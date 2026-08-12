@@ -133,24 +133,16 @@ pub fn load_vision_language_encoder(
     root: &Path,
     device: &Device,
 ) -> Result<QwenVisionLanguageEncoder> {
-    let selected = crate::ENCODER_CONTRACT
-        .validate_source_against_base(
-            &candle_gen::gen_core::WeightsSource::Dir(root.join("text_encoder")),
-            root,
-        )
-        .map_err(CandleError::from)?;
-    load_vision_language_encoder_with_text_encoder(root, &selected, device)
+    let selected = validate_builtin_vision_encoder_source(root)?;
+    load_vision_language_encoder_with_text_encoder(&selected, &selected, device)
 }
 
-/// Load the Edit conditioning encoder with a provider-validated decoder-LM substitution while the
-/// image-conditioning vision tower stays bound to the built-in snapshot. The selected contract is
-/// deliberately decoder-only; inheriting `visual.*` from an arbitrary alternate would silently
-/// broaden compatibility beyond the registry descriptor.
-pub fn load_vision_language_encoder_with_text_encoder(
+/// Admit the built-in Edit vision tower against the exact Qwen language + vision contracts without
+/// opening tensor payloads. The returned pin is retained by request-scoped loaders so deferred
+/// residency cannot move the vision load outside the constructor-time validation boundary.
+pub(crate) fn validate_builtin_vision_encoder_source(
     root: &Path,
-    selected: &ValidatedEncoderSource,
-    device: &Device,
-) -> Result<QwenVisionLanguageEncoder> {
+) -> Result<ValidatedEncoderSource> {
     let vision = crate::ENCODER_CONTRACT
         .validate_source_against_base(
             &candle_gen::gen_core::WeightsSource::Dir(root.join("text_encoder")),
@@ -160,6 +152,19 @@ pub fn load_vision_language_encoder_with_text_encoder(
     vision
         .validate_vision(&crate::VISION_ENCODER_CONTRACT, &crate::ENCODER_CONTRACT)
         .map_err(CandleError::from)?;
+    Ok(vision)
+}
+
+/// Load the Edit conditioning encoder from provider-validated decoder-LM and built-in vision pins.
+/// The selected contract is deliberately decoder-only; inheriting `visual.*` from an arbitrary
+/// alternate would silently broaden compatibility beyond the registry descriptor. This stays
+/// crate-private because [`ValidatedEncoderSource`] receipts are not branded with the contract that
+/// produced them; every caller must enter through a Qwen validation seam first.
+pub(crate) fn load_vision_language_encoder_with_text_encoder(
+    selected: &ValidatedEncoderSource,
+    vision: &ValidatedEncoderSource,
+    device: &Device,
+) -> Result<QwenVisionLanguageEncoder> {
     let lm = selected.read_unchanged(|source| -> Result<QwenTextEncoder> {
         Ok(QwenTextEncoder::new(
             &TextEncoderConfig::qwen_image(),
@@ -178,6 +183,13 @@ pub fn load_vision_language_encoder_with_text_encoder(
 #[cfg(test)]
 mod tests {
     use super::image_gather_index;
+
+    #[test]
+    fn validated_receipt_loader_stays_crate_private() {
+        let source = include_str!("vision_language.rs");
+        assert!(source.contains("\npub(crate) fn load_vision_language_encoder_with_text_encoder("));
+        assert!(!source.contains("\npub fn load_vision_language_encoder_with_text_encoder("));
+    }
 
     #[test]
     fn gather_replaces_image_tokens_in_order() {
