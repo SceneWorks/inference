@@ -1047,7 +1047,8 @@ pub(crate) fn render_three_stage_with_native(
                 memory.decode_tile_edge.unwrap_or(512),
                 memory.decode_overlap.unwrap_or(128),
             ));
-            let decoded = vae.decode_with_tile(latent, tile)?.to_dtype(DType::F32)?;
+            let decoded = decode_via_seam(&vae, None, latent, tile, Some(&req.cancel))?
+                .to_dtype(DType::F32)?;
             to_image(&decoded)
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1264,10 +1265,13 @@ fn render_from_context(
         // PiD (super-resolving) decode when the toggle resolved one; else the native VAE. Both consume
         // the same normalized `[1,16,H/8,W/8]` latent (a zero-transform seam); PiD returns a larger
         // `[1,3,4H,4W]` tensor and `to_image` reads the size from it.
-        let decoded = match &pid_decoder {
-            Some(pid) => pid.decode(&lat)?,
-            None => comps.vae.decode(&lat)?.to_dtype(DType::F32)?,
-        };
+        let decoded = decode_via_seam(
+            comps.vae.as_ref(),
+            pid_decoder.as_ref().map(|pid| pid as &dyn LatentDecoder),
+            &lat,
+            None,
+            Some(&req.cancel),
+        )?;
         to_image(&decoded)
     })
 }
@@ -1386,10 +1390,13 @@ fn render_img2img_from_context(
             )?
         };
         on_progress(Progress::Decoding);
-        let decoded = match &pid_decoder {
-            Some(pid) => pid.decode(&lat)?,
-            None => comps.vae.decode(&lat)?.to_dtype(DType::F32)?,
-        };
+        let decoded = decode_via_seam(
+            comps.vae.as_ref(),
+            pid_decoder.as_ref().map(|pid| pid as &dyn LatentDecoder),
+            &lat,
+            None,
+            Some(&req.cancel),
+        )?;
         to_image(&decoded)
     })
 }
@@ -1512,10 +1519,13 @@ fn render_base_from_contexts(
             },
         )?;
         on_progress(Progress::Decoding);
-        let decoded = match &pid_decoder {
-            Some(pid) => pid.decode(&lat)?,
-            None => comps.vae.decode(&lat)?.to_dtype(DType::F32)?,
-        };
+        let decoded = decode_via_seam(
+            comps.vae.as_ref(),
+            pid_decoder.as_ref().map(|pid| pid as &dyn LatentDecoder),
+            &lat,
+            None,
+            Some(&req.cancel),
+        )?;
         to_image(&decoded)
     })
 }
@@ -1768,7 +1778,7 @@ pub(crate) fn render_multiphase(
     let mut on_adapter_state =
         |_, _: &[AdapterSpec], _: &crate::adapters::AdditiveReport, _: &mut Krea2Transformer| {};
     let mut decode = |latent: &Tensor| {
-        let decoded = vae.decode(latent)?.to_dtype(DType::F32)?;
+        let decoded = decode_via_seam(vae, None, latent, None, Some(&req.cancel))?;
         to_image(&decoded)
     };
     render_multiphase_driver(
@@ -1918,10 +1928,13 @@ fn render_base_img2img_from_contexts(
             )?
         };
         on_progress(Progress::Decoding);
-        let decoded = match &pid_decoder {
-            Some(pid) => pid.decode(&lat)?,
-            None => comps.vae.decode(&lat)?.to_dtype(DType::F32)?,
-        };
+        let decoded = decode_via_seam(
+            comps.vae.as_ref(),
+            pid_decoder.as_ref().map(|pid| pid as &dyn LatentDecoder),
+            &lat,
+            None,
+            Some(&req.cancel),
+        )?;
         to_image(&decoded)
     })
 }
@@ -2154,10 +2167,13 @@ fn render_edit_from_context(
         // PiD (super-resolving) decode when the toggle resolved one; else the native VAE. Both consume
         // the same normalized `[1,16,H/8,W/8]` latent (a zero-transform seam); PiD returns a larger
         // `[1,3,4H,4W]` tensor and `to_image` reads the size from it — matching `render` / `render_base`.
-        let decoded = match &pid_decoder {
-            Some(pid) => pid.decode(&lat)?,
-            None => heavy.vae.decode(&lat)?.to_dtype(DType::F32)?,
-        };
+        let decoded = decode_via_seam(
+            heavy.vae.as_ref(),
+            pid_decoder.as_ref().map(|pid| pid as &dyn LatentDecoder),
+            &lat,
+            None,
+            Some(&req.cancel),
+        )?;
         to_image(&decoded)
     })
 }
@@ -2425,6 +2441,42 @@ fn init_noise(height: u32, width: u32, seed: u64, device: &Device) -> Result<Ten
     )
 }
 
+/// Route both the native Qwen VAE and an optional PiD override through the same decoder seam. A
+/// selected native tile tuple becomes a typed [`gen_core::tiling::TilingConfig`]; decoders with their
+/// own policy inherit the trait's forwarding default and ignore that native geometry. The untiled
+/// default remains the exact historical `decode` call.
+fn decode_via_seam(
+    native: &dyn LatentDecoder,
+    decoder: Option<&dyn LatentDecoder>,
+    latents: &Tensor,
+    tile: Option<(u32, u32)>,
+    cancel: Option<&gen_core::CancelFlag>,
+) -> Result<Tensor> {
+    if cancel.is_some_and(gen_core::CancelFlag::is_cancelled) {
+        return Err(CandleError::Canceled);
+    }
+    let decoder: &dyn LatentDecoder = decoder.unwrap_or(native);
+    candle_gen::ensure_decoder_compatible(
+        Some(&candle_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE),
+        decoder,
+    )?;
+    let decoded = match tile {
+        Some((edge, overlap)) => {
+            let tiling = gen_core::tiling::TilingConfig::spatial_only(
+                edge.try_into().map_err(|_| {
+                    CandleError::Msg(format!("Krea decode tile edge {edge} exceeds i32"))
+                })?,
+                overlap.try_into().map_err(|_| {
+                    CandleError::Msg(format!("Krea decode overlap {overlap} exceeds i32"))
+                })?,
+            );
+            decoder.decode_tiled(latents, &tiling, cancel)?
+        }
+        None => decoder.decode(latents)?,
+    };
+    Ok(decoded.to_dtype(DType::F32)?)
+}
+
 /// Convert a decoded pixel tensor `[1, 3, H, W]` in `[-1, 1]` (f32) → RGB8 [`Image`]. Shared by the
 /// native VAE decode (`QwenVae::decode` applies the per-channel `z·std + mean` de-normalize internally)
 /// and the PiD super-resolving decode (which already emits `[-1, 1]` pixels, possibly at 4× the size).
@@ -2450,7 +2502,75 @@ pub(crate) fn to_image(decoded: &Tensor) -> Result<Image> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
+
+    struct DecodeSpy {
+        output: Tensor,
+        calls: Cell<usize>,
+    }
+
+    impl DecodeSpy {
+        fn new(output: Tensor) -> Self {
+            Self {
+                output,
+                calls: Cell::new(0),
+            }
+        }
+    }
+
+    impl LatentDecoder for DecodeSpy {
+        fn input_latent_space(&self) -> Option<&gen_core::LatentSpace> {
+            Some(&gen_core::QWEN_KREA_Z16_LATENT_SPACE)
+        }
+
+        fn decode(&self, _latents: &Tensor) -> Result<Tensor> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(self.output.clone())
+        }
+    }
+
+    fn legacy_decode_image(decoder: &dyn LatentDecoder, latents: &Tensor) -> Image {
+        let decoded = decoder
+            .decode(latents)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap();
+        to_image(&decoded).unwrap()
+    }
+
+    /// SC-18309 N1: the actual Krea decode helper stays byte-identical to each historical match arm.
+    /// The asymmetric NCHW fixture detects channel/layout changes, while the larger PiD fixture proves
+    /// override precedence and dynamic output sizing survive a caller-selected native tile policy.
+    #[test]
+    fn decode_route_keeps_native_and_pid_bytes_exact() {
+        let device = Device::Cpu;
+        let latents = Tensor::zeros((1, 16, 2, 3), DType::F32, &device).unwrap();
+        let native_values = vec![
+            -1.0f32, -0.5, 0.0, 0.5, 1.0, 0.25, 1.0, 0.5, 0.0, -0.5, -1.0, -0.25, -0.75, -0.25,
+            0.25, 0.75, -1.0, 1.0,
+        ];
+        let native_output = Tensor::from_vec(native_values, (1, 3, 2, 3), &device).unwrap();
+        let legacy = DecodeSpy::new(native_output.clone());
+        let expected = legacy_decode_image(&legacy, &latents);
+        let native = DecodeSpy::new(native_output);
+        let got = decode_via_seam(&native, None, &latents, None, None).unwrap();
+        assert_eq!(to_image(&got).unwrap(), expected);
+        assert_eq!(native.calls.get(), 1);
+
+        let native = DecodeSpy::new(Tensor::zeros((1, 3, 2, 3), DType::F32, &device).unwrap());
+        let pid_output = Tensor::ones((1, 3, 4, 5), DType::F32, &device).unwrap();
+        let legacy_pid = DecodeSpy::new(pid_output.clone());
+        let expected_pid = legacy_decode_image(&legacy_pid, &latents);
+        let pid = DecodeSpy::new(pid_output);
+        let cancel = gen_core::CancelFlag::default();
+        let got =
+            decode_via_seam(&native, Some(&pid), &latents, Some((16, 4)), Some(&cancel)).unwrap();
+        assert_eq!(to_image(&got).unwrap(), expected_pid);
+        assert_eq!(native.calls.get(), 0);
+        assert_eq!(pid.calls.get(), 1);
+    }
 
     #[test]
     fn native_file_entrypoint_postchecks_after_provider_payload_consumption() {

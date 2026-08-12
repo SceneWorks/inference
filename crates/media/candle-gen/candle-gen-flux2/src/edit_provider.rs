@@ -586,10 +586,16 @@ impl Flux2Edit {
         let packed = pipeline::unpack_latents(&latents, req.width, req.height)?;
         // Decode the final latent: native FLUX.2 VAE by default, or the `flux2` PiD student (4× SR) when
         // this generation opted in (`req.use_pid`) and `with_pid` loaded one (sc-8044). Both take the same
-        // unpacked latent and emit `[-1, 1]` pixels (PiD at 4×); `to_image` reads the size from the tensor.
+        // packed-grid latent and emit `[-1, 1]` pixels (PiD at 4×); `to_image` reads the size from the tensor.
         let pid_decoder = self.pid_decoder_for(req)?;
         let decoded = match &pid_decoder {
-            Some(pid) => pid.decode(&packed)?, // [1,3,4H,4W]
+            Some(pid) => {
+                candle_gen::ensure_decoder_layout(
+                    Some(&candle_gen::gen_core::FLUX2_PACKED_LATENT_SPACE),
+                    pid,
+                )?;
+                pid.decode(&packed)? // [1,3,4H,4W]
+            }
             None if self.memory.tile_vae_decode => vae.decode_packed_tiled(
                 &packed,
                 self.memory

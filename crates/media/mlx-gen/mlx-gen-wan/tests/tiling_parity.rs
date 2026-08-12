@@ -17,7 +17,8 @@ use std::path::PathBuf;
 
 use mlx_gen::tiling::{SpatialTiling, TemporalTiling, TilingConfig, VaeTiling};
 use mlx_gen::weights::Weights;
-use mlx_gen_wan::WanVae;
+use mlx_gen::{CancelFlag, Error, LatentDecoder};
+use mlx_gen_wan::{WanSingleFrameDecoder, WanVae, WanVideoDecoder};
 use mlx_rs::random;
 
 /// The dump's tiling config (`dump_s2_tiling_fixtures.py`): spatial 64px/32, temporal 16f/8.
@@ -104,6 +105,126 @@ fn wan_tiled_fallback_is_single_pass() {
         mean_rel < 1e-6,
         "no-tiling fallback must equal single-pass decode"
     );
+}
+
+/// SC-18309 N1: the generic z16 video adapter is an exact identity around the historical VAE
+/// decode, while the image adapter performs only the documented rank lift and leading-frame slice.
+/// The checked-in tiny VAE makes this a real de-normalization/decoder/output-layout regression gate.
+#[test]
+fn wan_z16_adapters_are_byte_exact_to_legacy_routes() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/s2_vae.safetensors"
+    );
+    let w = Weights::from_file(path).unwrap();
+    let vae = WanVae::from_weights(&w).unwrap();
+    let video_latent = w.require("dec_in").unwrap();
+
+    let legacy_video = vae.decode(video_latent).unwrap();
+    let seam_video = WanVideoDecoder::new(&vae).decode(video_latent).unwrap();
+    assert_eq!(seam_video.shape(), legacy_video.shape());
+    assert_eq!(
+        seam_video.reshape(&[-1]).unwrap().as_slice::<f32>(),
+        legacy_video.reshape(&[-1]).unwrap().as_slice::<f32>()
+    );
+
+    let image_latent = video_latent
+        .take_axis(mlx_rs::Array::from_int(0), 2)
+        .unwrap();
+    let lifted = image_latent.expand_dims(2).unwrap();
+    let legacy_image = vae
+        .decode(&lifted)
+        .unwrap()
+        .take_axis(mlx_rs::Array::from_slice(&[0i32], &[1]), 2)
+        .unwrap();
+    let seam_image = WanSingleFrameDecoder::new(&vae)
+        .decode(&image_latent)
+        .unwrap();
+    assert_eq!(seam_image.shape(), legacy_image.shape());
+    assert_eq!(
+        seam_image.reshape(&[-1]).unwrap().as_slice::<f32>(),
+        legacy_image.reshape(&[-1]).unwrap().as_slice::<f32>()
+    );
+}
+
+/// Valid z16 video and still-image latents prove that both an actually-firing plan and an actually
+/// non-firing monolithic fallback observe pre-cancellation before any decode work. The explicit
+/// `needs_tiling` assertions prevent malformed shapes from making the route classification vacuous.
+#[test]
+fn wan_z16_valid_firing_and_fallback_routes_precancel() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/s2_tiling.safetensors"
+    );
+    let w = Weights::from_file(path).unwrap();
+    let vae = WanVae::from_weights(&w).unwrap();
+    let video = w.require("tiled_in").unwrap(); // [1,16,6,12,12]
+    let video_shape = video.shape();
+    let firing = golden_cfg();
+    let fallback = TilingConfig::spatial_only(4096, 64);
+    assert!(firing.needs_tiling(
+        VaeTiling::WAN,
+        video_shape[2],
+        video_shape[3],
+        video_shape[4]
+    ));
+    assert!(!fallback.needs_tiling(
+        VaeTiling::WAN,
+        video_shape[2],
+        video_shape[3],
+        video_shape[4]
+    ));
+
+    let image = video.take_axis(mlx_rs::Array::from_int(0), 2).unwrap(); // [1,16,12,12]
+    let image_shape = image.shape();
+    assert!(firing.needs_tiling(VaeTiling::WAN, 1, image_shape[2], image_shape[3]));
+    assert!(!fallback.needs_tiling(VaeTiling::WAN, 1, image_shape[2], image_shape[3]));
+
+    let cancel = CancelFlag::new();
+    cancel.cancel();
+    for cfg in [firing, fallback] {
+        assert!(matches!(
+            WanVideoDecoder::new(&vae).decode_tiled(video, &cfg, Some(&cancel)),
+            Err(Error::Canceled)
+        ));
+        assert!(matches!(
+            WanSingleFrameDecoder::new(&vae).decode_tiled(&image, &cfg, Some(&cancel)),
+            Err(Error::Canceled)
+        ));
+        assert!(matches!(
+            vae.decode_tiled(video, &cfg, Some(&cancel)),
+            Err(Error::Canceled)
+        ));
+    }
+}
+
+/// Malformed-input dominance is independent of the valid firing/fallback proof above: cancellation
+/// must still win before adapter rank checks or inherent VAE shape inspection.
+#[test]
+fn wan_z16_precancel_wins_before_malformed_input_validation() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/s2_tiling.safetensors"
+    );
+    let w = Weights::from_file(path).unwrap();
+    let vae = WanVae::from_weights(&w).unwrap();
+    let malformed = mlx_rs::Array::from_slice(&[1.0f32], &[1]);
+    let cancel = CancelFlag::new();
+    cancel.cancel();
+    for cfg in [golden_cfg(), TilingConfig::spatial_only(4096, 64)] {
+        assert!(matches!(
+            WanVideoDecoder::new(&vae).decode_tiled(&malformed, &cfg, Some(&cancel)),
+            Err(Error::Canceled)
+        ));
+        assert!(matches!(
+            WanSingleFrameDecoder::new(&vae).decode_tiled(&malformed, &cfg, Some(&cancel)),
+            Err(Error::Canceled)
+        ));
+        assert!(matches!(
+            vae.decode_tiled(&malformed, &cfg, Some(&cancel)),
+            Err(Error::Canceled)
+        ));
+    }
 }
 
 /// Min/max/mean of a slice, plus the count of "flat" frames (per-frame range below `eps` — the

@@ -486,7 +486,6 @@ impl ZImageTurboControl {
                 pipeline::calibration_fault(req, mlx_gen::gen_core::MemoryPhase::Decode, MODEL_ID)?;
                 let images = pipeline::decode_batch(
                     view.vae,
-                    None,
                     tiling.as_ref(),
                     latents,
                     &req.cancel,

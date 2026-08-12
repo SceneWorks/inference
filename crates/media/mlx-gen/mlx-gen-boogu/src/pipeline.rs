@@ -747,6 +747,7 @@ impl BooguHeavy {
     /// when the request set `use_pid` and a PiD overlay was loaded (epic 7840, sc-7846); else native VAE.
     fn decode_latents(&self, lat: &Array, decoder: Option<&dyn LatentDecoder>) -> Result<Image> {
         let decoder: &dyn LatentDecoder = decoder.unwrap_or(&self.vae);
+        mlx_gen::ensure_decoder_compatible(Some(&mlx_gen::gen_core::FLUX1_LATENT_SPACE), decoder)?;
         let decoded = decoder.decode(lat)?.as_dtype(Dtype::Float32)?; // VAE [1,3,1,H,W]; PiD [1,3,4H,4W]
         decoded_to_image(&decoded)
     }

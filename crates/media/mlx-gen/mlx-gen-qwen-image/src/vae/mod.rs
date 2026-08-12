@@ -193,10 +193,8 @@ impl QwenVae {
         cfg: &TilingConfig,
         cancel: Option<&CancelFlag>,
     ) -> Result<Array> {
-        let l = to_5d(latents)?;
-        let sh = l.shape(); // [B, 16, T(=1), H, W]
-        let (f, h, w) = (sh[2], sh[3], sh[4]);
-        if !cfg.needs_tiling(VaeTiling::QWEN_IMAGE, f, h, w) {
+        let (l, f, h, w, needs_tiling) = tiled_decode_preamble(latents, cfg, cancel)?;
+        if !needs_tiling {
             return self.decode(latents);
         }
         // Head (denormalize → post_quant_conv → conv_in → mid-block global attention) runs ONCE on the
@@ -233,6 +231,18 @@ impl LatentDecoder for QwenVae {
     fn decode(&self, latents: &Array) -> Result<Array> {
         QwenVae::decode(self, latents)
     }
+
+    fn decode_tiled(
+        &self,
+        latents: &Array,
+        tiling: &TilingConfig,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<Array> {
+        if cancel.is_some_and(CancelFlag::is_cancelled) {
+            return Err(mlx_gen::Error::Canceled);
+        }
+        QwenVae::decode_tiled(self, latents, tiling, cancel)
+    }
 }
 
 /// Add a singleton temporal axis to a 4-D `(B, C, H, W)` tensor → `(B, C, 1, H, W)`.
@@ -242,5 +252,44 @@ fn to_5d(x: &Array) -> Result<Array> {
         Ok(x.reshape(&[s[0], s[1], 1, s[2], s[3]])?)
     } else {
         Ok(x.clone())
+    }
+}
+
+/// The complete work-free preamble for Qwen's native tiled decode. Cancellation is intentionally
+/// first: a pre-tripped request must not validate/reshape a malformed tensor, choose a plan, enter
+/// the monolithic fallback, or execute the globally-scoped head.
+fn tiled_decode_preamble(
+    latents: &Array,
+    cfg: &TilingConfig,
+    cancel: Option<&CancelFlag>,
+) -> Result<(Array, i32, i32, i32, bool)> {
+    if cancel.is_some_and(CancelFlag::is_cancelled) {
+        return Err(mlx_gen::Error::Canceled);
+    }
+    let latent5 = to_5d(latents)?;
+    let shape = latent5.shape();
+    let (frames, height, width) = (shape[2], shape[3], shape[4]);
+    let needs_tiling = cfg.needs_tiling(VaeTiling::QWEN_IMAGE, frames, height, width);
+    Ok((latent5, frames, height, width, needs_tiling))
+}
+
+#[cfg(test)]
+mod tiled_cancel_tests {
+    use super::*;
+
+    #[test]
+    fn pre_cancel_wins_for_firing_and_non_firing_plans_before_validation() {
+        let malformed = Array::from_slice(&[1.0f32], &[1]);
+        let cancel = CancelFlag::new();
+        cancel.cancel();
+        for cfg in [
+            TilingConfig::spatial_only(8, 2),
+            TilingConfig::spatial_only(4096, 64),
+        ] {
+            assert!(matches!(
+                tiled_decode_preamble(&malformed, &cfg, Some(&cancel)),
+                Err(mlx_gen::Error::Canceled)
+            ));
+        }
     }
 }

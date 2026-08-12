@@ -380,9 +380,12 @@ impl ZImage {
             // ── Phase C (decode): light (VAE) view + latents → images. Tiled under `Sequential`.
             |view, (latents, pid_decoder), on_progress| {
                 pipeline::calibration_fault(req, mlx_gen::gen_core::MemoryPhase::Decode, MODEL_ID)?;
+                let decoder: &dyn LatentDecoder = pid_decoder
+                    .as_ref()
+                    .map(|d| d as &dyn LatentDecoder)
+                    .unwrap_or(view.vae);
                 let images = pipeline::decode_batch(
-                    view.vae,
-                    pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder),
+                    decoder,
                     tiling.as_ref(),
                     latents,
                     &req.cancel,

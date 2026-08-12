@@ -541,7 +541,7 @@ impl InstantId {
         // when this generation opted in (`req.use_pid`) and `with_pid` loaded one (epic 7840, sc-8373).
         let pid_decoder = self.pid_decoder_for(req)?;
         let pid_ref = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
-        decode_image(&self.vae, &latents, pid_ref)
+        decode_image(&self.vae, &latents, pid_ref, Some(&req.cancel))
     }
 
     /// Build the CFG-batched face tokens from a 512-d ArcFace `embedding`. **Uncond-first**: under CFG
@@ -814,7 +814,7 @@ impl InstantId {
         // when this generation opted in (`req.use_pid`) and `with_pid` loaded one (epic 7840, sc-8373).
         let pid_decoder = self.pid_decoder_for(req)?;
         let pid_ref = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
-        decode_image(&self.vae, &latents, pid_ref)
+        decode_image(&self.vae, &latents, pid_ref, Some(&req.cancel))
     }
 
     /// **Face-restoration pass** (sc-3380): ADetailer-style identity recovery at full-body framing.

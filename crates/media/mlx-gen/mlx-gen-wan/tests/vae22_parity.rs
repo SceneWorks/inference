@@ -14,8 +14,9 @@
 //! conv2d-per-temporal-slice decomposition of the same convolution (bounded, like the 2.1 gate).
 
 use mlx_gen::weights::Weights;
-use mlx_gen_wan::Wan22Vae;
-use mlx_rs::Dtype;
+use mlx_gen::{CancelFlag, Error, LatentDecoder};
+use mlx_gen_wan::{Wan22Vae, Wan22VideoDecoder};
+use mlx_rs::{Array, Dtype};
 
 fn fixture() -> Weights {
     let path = concat!(
@@ -75,6 +76,88 @@ fn vae22_decode_matches_reference() {
         mean_rel < 1e-3,
         "decode diverged: mean_rel={mean_rel:.3e} max|Δ|={max_abs:.3e}"
     );
+}
+
+/// SC-18309 N1: the z48 adapter must preserve the historical de-normalize/decode exactly and only
+/// relayout the vendored channels-last `[B,T,H,W,3]` result to the generic NCTHW contract.
+#[test]
+fn vae22_video_adapter_is_byte_exact_to_legacy_route() {
+    let w = fixture();
+    let vae = vae(&w);
+    let latent = w.require("dec_in").unwrap();
+    let legacy = vae
+        .decode(latent)
+        .unwrap()
+        .transpose_axes(&[0, 4, 1, 2, 3])
+        .unwrap();
+    let seam = Wan22VideoDecoder::new(&vae).decode(latent).unwrap();
+    assert_eq!(seam.shape(), legacy.shape());
+    assert_eq!(
+        seam.reshape(&[-1]).unwrap().as_slice::<f32>(),
+        legacy.reshape(&[-1]).unwrap().as_slice::<f32>()
+    );
+}
+
+/// A valid z48 latent and valid spatial policy prove pre-cancellation on both an actually-firing
+/// tiled-head route and an actually non-firing monolithic fallback. The explicit `needs_tiling`
+/// assertions prevent malformed input from making those route labels vacuous.
+#[test]
+fn vae22_valid_firing_and_fallback_routes_precancel() {
+    let w = fixture();
+    let vae = vae(&w);
+    let latent = Array::zeros::<f32>(&[48, 2, 3, 3]).unwrap();
+    let shape = latent.shape();
+    let firing = mlx_gen::tiling::TilingConfig::spatial_only(32, 16);
+    let fallback = mlx_gen::tiling::TilingConfig::spatial_only(4096, 64);
+    assert!(firing.needs_tiling(
+        mlx_gen::tiling::VaeTiling::WAN22,
+        shape[1],
+        shape[2],
+        shape[3]
+    ));
+    assert!(!fallback.needs_tiling(
+        mlx_gen::tiling::VaeTiling::WAN22,
+        shape[1],
+        shape[2],
+        shape[3]
+    ));
+
+    let cancel = CancelFlag::new();
+    cancel.cancel();
+    for cfg in [firing, fallback] {
+        assert!(matches!(
+            Wan22VideoDecoder::new(&vae).decode_tiled(&latent, &cfg, Some(&cancel)),
+            Err(Error::Canceled)
+        ));
+        assert!(matches!(
+            vae.decode_tiled(&latent, &cfg, Some(&cancel)),
+            Err(Error::Canceled)
+        ));
+    }
+}
+
+/// Malformed-input dominance is a separate guarantee from the valid route proof: cancellation must
+/// win before the adapter rank check and before the inherent VAE transposes or inspects geometry.
+#[test]
+fn vae22_precancel_wins_before_malformed_input_validation() {
+    let w = fixture();
+    let vae = vae(&w);
+    let malformed = Array::from_slice(&[1.0f32], &[1]);
+    let cancel = CancelFlag::new();
+    cancel.cancel();
+    for cfg in [
+        mlx_gen::tiling::TilingConfig::spatial_only(32, 16),
+        mlx_gen::tiling::TilingConfig::spatial_only(4096, 64),
+    ] {
+        assert!(matches!(
+            Wan22VideoDecoder::new(&vae).decode_tiled(&malformed, &cfg, Some(&cancel)),
+            Err(Error::Canceled)
+        ));
+        assert!(matches!(
+            vae.decode_tiled(&malformed, &cfg, Some(&cancel)),
+            Err(Error::Canceled)
+        ));
+    }
 }
 
 #[test]

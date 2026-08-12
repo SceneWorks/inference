@@ -304,7 +304,7 @@ impl SdxlEdit {
         // (4× SR) when this generation opted in (`req.use_pid`) and `with_pid` loaded one (sc-8044).
         let pid_decoder = self.pid_decoder_for(req)?;
         let pid_ref = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
-        decode_image(&self.vae, &latents, pid_ref)
+        decode_image(&self.vae, &latents, pid_ref, Some(&req.cancel))
     }
 
     /// VAE-encode `source` (resized to the render size, LANCZOS, normalized to `[-1,1]` NCHW) to the
