@@ -2226,6 +2226,51 @@ mod tests {
             .unwrap();
     }
 
+    fn append_sparse_f16_tensor(root: &Path, name: &str, shape: &[usize]) {
+        use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+
+        let path = root.join("text_encoder/model.safetensors");
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut encoded_len = [0_u8; 8];
+        file.read_exact(&mut encoded_len).unwrap();
+        let mut encoded = vec![0_u8; u64::from_le_bytes(encoded_len) as usize];
+        file.read_exact(&mut encoded).unwrap();
+        let mut header: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&encoded).unwrap();
+        let start = header
+            .values()
+            .filter_map(|entry| entry["data_offsets"][1].as_u64())
+            .max()
+            .unwrap();
+        let bytes = shape
+            .iter()
+            .try_fold(2_u64, |bytes, dimension| {
+                bytes.checked_mul(*dimension as u64)
+            })
+            .unwrap();
+        let end = start.checked_add(bytes).unwrap();
+        assert!(header
+            .insert(
+                name.to_owned(),
+                serde_json::json!({
+                    "dtype": "F16",
+                    "shape": shape,
+                    "data_offsets": [start, end],
+                }),
+            )
+            .is_none());
+        let encoded = serde_json::to_vec(&header).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(&(encoded.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(&encoded).unwrap();
+        file.set_len(8 + encoded.len() as u64 + end).unwrap();
+    }
+
     #[test]
     fn dev_multimodal_contract_fails_closed_for_deferred_routes_and_public_loaders() {
         for variant in [Flux2Variant::Dev, Flux2Variant::DevEdit] {
@@ -2348,6 +2393,72 @@ mod tests {
         )
         .expect("the generic estimated-fallback path remains available");
         assert!(estimated.text_encoder > 0);
+    }
+
+    #[test]
+    fn packed_klein_registry_footprint_includes_embedding_affine_tables() {
+        let fixture = tempfile::tempdir().unwrap();
+        gen_core_testkit::write_encoder_contract_fixture_with_quant(
+            &fixture.path().join("text_encoder"),
+            crate::config::KLEIN_ENCODER_CONTRACT,
+            Some(4),
+        )
+        .unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(fixture.path().to_path_buf()));
+        let selected = crate::config::KLEIN_ENCODER_CONTRACT
+            .source_for_load(&spec, fixture.path())
+            .unwrap();
+        let headers = selected.tensor_headers().unwrap();
+        for suffix in ["weight", "scales", "biases"] {
+            assert!(
+                headers
+                    .iter()
+                    .any(|header| header.name == format!("model.embed_tokens.{suffix}")),
+                "packed fixture must carry the embedding {suffix} payload"
+            );
+        }
+        let expected = headers.iter().map(|header| header.data_bytes).sum::<u64>();
+        let actual = crate::provider_registry()
+            .unwrap()
+            .footprint(crate::config::FLUX2_KLEIN_9B_ID, &spec)
+            .unwrap()
+            .unwrap()
+            .text_encoder;
+        assert_eq!(
+            actual, expected,
+            "the packed language-only fixture is entirely materialized, including embedding scales and biases"
+        );
+    }
+
+    #[test]
+    fn registry_footprint_excludes_unrelated_loaded_layer_namespace_tensors() {
+        let fixture = tempfile::tempdir().unwrap();
+        gen_core_testkit::write_encoder_contract_fixture_with_quant(
+            &fixture.path().join("text_encoder"),
+            crate::config::KLEIN_ENCODER_CONTRACT,
+            Some(4),
+        )
+        .unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(fixture.path().to_path_buf()));
+        let footprint = || {
+            crate::provider_registry()
+                .unwrap()
+                .footprint(crate::config::FLUX2_KLEIN_9B_ID, &spec)
+                .unwrap()
+                .unwrap()
+                .text_encoder
+        };
+        let baseline = footprint();
+        append_sparse_f16_tensor(
+            fixture.path(),
+            "model.layers.0.unused_projection.weight",
+            &[257],
+        );
+        assert_eq!(
+            footprint(),
+            baseline,
+            "a valid but unconsumed tensor sharing a loaded-layer prefix must not affect staged-fit bytes"
+        );
     }
 
     #[test]

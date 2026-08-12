@@ -364,32 +364,20 @@ impl ValidatedEncoderSource {
     ) -> Result<Vec<SafetensorsTensorHeader>> {
         self.ensure_unchanged()?;
         let headers = self.pinned.headers()?;
-        let prefix = contract.expected_header_prefix()?;
-        let lm_head = contract
-            .requires_lm_head
-            .then(|| contract.expected_lm_head_prefix())
-            .transpose()?
-            .map(|prefix| format!("{prefix}.lm_head."));
-        let layer_prefix = format!("{prefix}.layers.");
+        let packing = if self.packed_quant_bits.is_some() {
+            Some(contract.packing.ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "validated packed encoder has no packing contract for architecture {}",
+                    contract.architecture
+                ))
+            })?)
+        } else {
+            None
+        };
+        let expected = contract.materialized_language_tensor_names(packing)?;
         let selected = headers
             .into_iter()
-            .filter(|header| {
-                if header.name == format!("{prefix}.embed_tokens.weight")
-                    || header.name == format!("{prefix}.norm.weight")
-                        && contract.requires_final_norm
-                    || lm_head
-                        .as_ref()
-                        .is_some_and(|head| header.name.starts_with(head))
-                {
-                    return true;
-                }
-                header
-                    .name
-                    .strip_prefix(&layer_prefix)
-                    .and_then(|tail| tail.split('.').next())
-                    .and_then(|layer| layer.parse::<usize>().ok())
-                    .is_some_and(|layer| layer < contract.loaded_hidden_layers)
-            })
+            .filter(|header| expected.contains(&header.name))
             .collect();
         self.ensure_unchanged()?;
         Ok(selected)
@@ -2488,6 +2476,75 @@ impl EncoderContract {
                 "text encoder contract requests an LM head but has no LM-head signature for architecture {architecture}"
             ))),
         }
+    }
+
+    /// Exact tensor names retained by the concrete language constructors for this contract.
+    ///
+    /// Packed matrices are three independent safetensors payloads. Keep the affine tables in the
+    /// selected surface alongside their code tensor, while ignoring arbitrary keys that merely share
+    /// a loaded layer prefix.
+    fn materialized_language_tensor_names(
+        &self,
+        packing: Option<EncoderPackingContract>,
+    ) -> Result<BTreeSet<String>> {
+        fn insert_matrix(names: &mut BTreeSet<String>, base: String, packed: bool) {
+            names.insert(format!("{base}.weight"));
+            if packed {
+                names.insert(format!("{base}.scales"));
+                names.insert(format!("{base}.biases"));
+            }
+        }
+
+        let prefix = self.expected_header_prefix()?;
+        let mut names = BTreeSet::new();
+        insert_matrix(
+            &mut names,
+            format!("{prefix}.embed_tokens"),
+            packing.is_some_and(|packing| packing.pack_embedding),
+        );
+        for layer in 0..self.loaded_hidden_layers {
+            let base = format!("{prefix}.layers.{layer}");
+            for suffix in [
+                "self_attn.q_proj",
+                "self_attn.k_proj",
+                "self_attn.v_proj",
+                "self_attn.o_proj",
+                "mlp.gate_proj",
+                "mlp.up_proj",
+                "mlp.down_proj",
+            ] {
+                insert_matrix(&mut names, format!("{base}.{suffix}"), packing.is_some());
+            }
+            names.extend([
+                format!("{base}.input_layernorm.weight"),
+                format!("{base}.post_attention_layernorm.weight"),
+            ]);
+            match self.architecture {
+                "qwen3" | "qwen3_vl_text" => names.extend([
+                    format!("{base}.self_attn.q_norm.weight"),
+                    format!("{base}.self_attn.k_norm.weight"),
+                ]),
+                "qwen2_5_vl_text" => names.extend([
+                    format!("{base}.self_attn.q_proj.bias"),
+                    format!("{base}.self_attn.k_proj.bias"),
+                    format!("{base}.self_attn.v_proj.bias"),
+                ]),
+                "mistral" => {}
+                _ => unreachable!("expected_header_prefix rejects unsupported architectures"),
+            }
+        }
+        if self.requires_final_norm {
+            names.insert(format!("{prefix}.norm.weight"));
+        }
+        if self.requires_lm_head {
+            let prefix = self.expected_lm_head_prefix()?;
+            insert_matrix(
+                &mut names,
+                format!("{prefix}.lm_head"),
+                packing.is_some_and(|packing| packing.pack_lm_head),
+            );
+        }
+        Ok(names)
     }
 
     fn validate_architecture_signature(
