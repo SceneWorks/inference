@@ -186,6 +186,10 @@ pub fn load_dev_text_encoder_group(
 ) -> Result<(Qwen3TextEncoder, PixtralVisionTower, Mistral3Projector)> {
     let selected = crate::config::DEV_ENCODER_CONTRACT
         .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)?;
+    selected.validate_vision(
+        &crate::config::DEV_VISION_ENCODER_CONTRACT,
+        &crate::config::DEV_ENCODER_CONTRACT,
+    )?;
     selected.read_unchanged(load_dev_text_encoder_group_from_source)
 }
 
@@ -339,7 +343,11 @@ pub fn load_control_transformer_dev(
 /// pre-quantized-snapshot manifest.
 pub fn load_vision_tower_dev(root: &Path) -> Result<PixtralVisionTower> {
     let selected = crate::config::DEV_ENCODER_CONTRACT
-        .validate_source(&WeightsSource::Dir(root.join("text_encoder")))?;
+        .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)?;
+    selected.validate_vision(
+        &crate::config::DEV_VISION_ENCODER_CONTRACT,
+        &crate::config::DEV_ENCODER_CONTRACT,
+    )?;
     selected.read_unchanged(|source| {
         let w = weights_from_source(source)?;
         let tower = load_vision_tower_dev_from(&w)?;
@@ -349,7 +357,7 @@ pub fn load_vision_tower_dev(root: &Path) -> Result<PixtralVisionTower> {
 }
 
 /// [`load_vision_tower_dev`] from an already-parsed `text_encoder/` [`Weights`] (F-112).
-pub fn load_vision_tower_dev_from(w: &Weights) -> Result<PixtralVisionTower> {
+pub(crate) fn load_vision_tower_dev_from(w: &Weights) -> Result<PixtralVisionTower> {
     PixtralVisionTower::from_weights(w, "vision_tower", PixtralVisionConfig::dev())
 }
 
@@ -359,7 +367,11 @@ pub fn load_vision_tower_dev_from(w: &Weights) -> Result<PixtralVisionTower> {
 /// vision tower.
 pub fn load_multimodal_projector_dev(root: &Path) -> Result<Mistral3Projector> {
     let selected = crate::config::DEV_ENCODER_CONTRACT
-        .validate_source(&WeightsSource::Dir(root.join("text_encoder")))?;
+        .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)?;
+    selected.validate_vision(
+        &crate::config::DEV_VISION_ENCODER_CONTRACT,
+        &crate::config::DEV_ENCODER_CONTRACT,
+    )?;
     selected.read_unchanged(|source| {
         let w = weights_from_source(source)?;
         let projector = load_multimodal_projector_dev_from(&w)?;
@@ -369,6 +381,6 @@ pub fn load_multimodal_projector_dev(root: &Path) -> Result<Mistral3Projector> {
 }
 
 /// [`load_multimodal_projector_dev`] from an already-parsed `text_encoder/` [`Weights`] (F-112).
-pub fn load_multimodal_projector_dev_from(w: &Weights) -> Result<Mistral3Projector> {
+pub(crate) fn load_multimodal_projector_dev_from(w: &Weights) -> Result<Mistral3Projector> {
     Mistral3Projector::from_weights(w, "multi_modal_projector", 2, 1e-5)
 }

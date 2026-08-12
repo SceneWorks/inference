@@ -12,6 +12,9 @@ use crate::{EncoderConfigFloat, EncoderContract, Error, Result, SafetensorsTenso
 pub enum VisionEncoderArchitecture {
     Qwen3Vl,
     Qwen2_5Vl,
+    /// FLUX.2-dev's Mistral3 wrapper: a Pixtral tower plus the separately named multimodal
+    /// projector that maps vision features into the Mistral language width.
+    PixtralMistral3,
 }
 
 /// The exact vision half of a multimodal conditioning encoder.
@@ -82,6 +85,12 @@ impl VisionEncoderContract {
                     && self.deepstack_visual_indexes.is_empty()
                     && self.window_size.is_some()
                     && !self.full_attention_block_indexes.is_empty() => {}
+            VisionEncoderArchitecture::PixtralMistral3
+                if self.num_position_embeddings.is_none()
+                    && self.deepstack_visual_indexes.is_empty()
+                    && self.window_size.is_none()
+                    && self.full_attention_block_indexes.is_empty()
+                    && self.temporal_patch_size == 1 => {}
             _ => {
                 return Err(Error::Unsupported(format!(
                     "vision contract fields do not match architecture {:?}",
@@ -99,6 +108,9 @@ impl VisionEncoderContract {
         language: &EncoderContract,
     ) -> Result<()> {
         self.validate_definition(language)?;
+        if self.architecture == VisionEncoderArchitecture::PixtralMistral3 {
+            return self.validate_pixtral_mistral3_config(root, path, language);
+        }
         let vision = root
             .get("vision_config")
             .and_then(Value::as_object)
@@ -109,6 +121,7 @@ impl VisionEncoderContract {
         let model_type = match self.architecture {
             VisionEncoderArchitecture::Qwen3Vl => "qwen3_vl",
             VisionEncoderArchitecture::Qwen2_5Vl => "qwen2_5_vl",
+            VisionEncoderArchitecture::PixtralMistral3 => unreachable!("handled above"),
         };
         self.expect_str(&vision, path, "model_type", model_type)?;
         self.expect_str(&vision, path, "hidden_act", self.hidden_activation)?;
@@ -127,6 +140,7 @@ impl VisionEncoderContract {
         let normalization_fields: &[&[&str]] = match self.architecture {
             VisionEncoderArchitecture::Qwen3Vl => &[&["layer_norm_eps"], &["norm_eps"]],
             VisionEncoderArchitecture::Qwen2_5Vl => &[&["rms_norm_eps"], &["norm_eps"]],
+            VisionEncoderArchitecture::PixtralMistral3 => unreachable!("handled above"),
         };
         self.expect_effective_f64(
             &vision,
@@ -170,15 +184,107 @@ impl VisionEncoderContract {
         Ok(())
     }
 
+    fn validate_pixtral_mistral3_config(
+        &self,
+        root: &Value,
+        path: &Path,
+        language: &EncoderContract,
+    ) -> Result<()> {
+        self.expect_str(root, path, "model_type", "mistral3")?;
+        self.expect_usize(root, path, "image_token_index", 10)?;
+        self.expect_bool(root, path, "multimodal_projector_bias", false)?;
+        self.expect_str(root, path, "projector_hidden_act", "gelu")?;
+        self.expect_usize(root, path, "spatial_merge_size", self.spatial_merge_size)?;
+        self.expect_i64(root, path, "vision_feature_layer", -1)?;
+
+        let vision = root
+            .get("vision_config")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                self.mismatch(path, "vision_config", "object", "missing or non-object")
+            })?;
+        let vision = Value::Object(vision.clone());
+        self.expect_str(&vision, path, "vision_config.model_type", "pixtral")?;
+        self.expect_str(
+            &vision,
+            path,
+            "vision_config.hidden_act",
+            self.hidden_activation,
+        )?;
+        for (field, expected) in [
+            ("hidden_size", self.hidden_size),
+            ("intermediate_size", self.intermediate_size),
+            ("num_hidden_layers", self.num_hidden_layers),
+            ("num_attention_heads", self.num_attention_heads),
+            ("head_dim", self.hidden_size / self.num_attention_heads),
+            ("patch_size", self.patch_size),
+            ("num_channels", self.in_channels),
+        ] {
+            self.expect_usize(
+                &vision,
+                path,
+                match field {
+                    "hidden_size" => "vision_config.hidden_size",
+                    "intermediate_size" => "vision_config.intermediate_size",
+                    "num_hidden_layers" => "vision_config.num_hidden_layers",
+                    "num_attention_heads" => "vision_config.num_attention_heads",
+                    "head_dim" => "vision_config.head_dim",
+                    "patch_size" => "vision_config.patch_size",
+                    "num_channels" => "vision_config.num_channels",
+                    _ => unreachable!(),
+                },
+                expected,
+            )?;
+        }
+        self.expect_f64(&vision, path, "vision_config.attention_dropout", 0.0)?;
+        self.expect_effective_f64(
+            &vision,
+            path,
+            "vision_config.rope_theta",
+            self.rope_theta.get(),
+            10_000.0,
+            &[
+                &["rope_theta"],
+                &["rope_parameters", "rope_theta"],
+                &["rope_scaling", "rope_theta"],
+            ],
+        )?;
+        self.expect_effective_f64(
+            &vision,
+            path,
+            "vision_config.normalization_eps",
+            self.normalization_eps.get(),
+            1e-5,
+            &[&["rms_norm_eps"], &["norm_eps"]],
+        )?;
+        if self.output_width != language.hidden_size {
+            return Err(self.mismatch(
+                path,
+                "multi_modal_projector.output_width",
+                language.hidden_size,
+                self.output_width,
+            ));
+        }
+        Ok(())
+    }
+
     pub fn validate_tensor_headers(
         &self,
         headers: &[SafetensorsTensorHeader],
         path: &Path,
     ) -> Result<()> {
         let expected = self.expected_headers()?;
+        let owns_tensor = |name: &str| match self.architecture {
+            VisionEncoderArchitecture::Qwen3Vl | VisionEncoderArchitecture::Qwen2_5Vl => {
+                name.starts_with("visual.")
+            }
+            VisionEncoderArchitecture::PixtralMistral3 => {
+                name.starts_with("vision_tower.") || name.starts_with("multi_modal_projector.")
+            }
+        };
         let actual = headers
             .iter()
-            .filter(|header| header.name.starts_with("visual."))
+            .filter(|header| owns_tensor(&header.name))
             .map(|header| (header.name.as_str(), header))
             .collect::<BTreeMap<_, _>>();
         for (name, shape) in &expected {
@@ -210,7 +316,7 @@ impl VisionEncoderContract {
         let packed = headers
             .iter()
             .filter(|header| {
-                header.name.starts_with("visual.")
+                owns_tensor(&header.name)
                     && (header.dtype == Dtype::U32
                         || header.name.ends_with(".scales")
                         || header.name.ends_with(".biases"))
@@ -322,6 +428,44 @@ impl VisionEncoderContract {
                     ("visual.merger.mlp.2.bias".into(), vec![self.output_width]),
                 ]);
             }
+            VisionEncoderArchitecture::PixtralMistral3 => {
+                tensors = vec![
+                    (
+                        "vision_tower.patch_conv.weight".into(),
+                        vec![h, self.in_channels, self.patch_size, self.patch_size],
+                    ),
+                    ("vision_tower.ln_pre.weight".into(), vec![h]),
+                ];
+                for layer in 0..self.num_hidden_layers {
+                    let base = format!("vision_tower.transformer.layers.{layer}");
+                    tensors.extend([
+                        (format!("{base}.attention_norm.weight"), vec![h]),
+                        (format!("{base}.ffn_norm.weight"), vec![h]),
+                        (format!("{base}.attention.q_proj.weight"), vec![h, h]),
+                        (format!("{base}.attention.k_proj.weight"), vec![h, h]),
+                        (format!("{base}.attention.v_proj.weight"), vec![h, h]),
+                        (format!("{base}.attention.o_proj.weight"), vec![h, h]),
+                        (format!("{base}.feed_forward.gate_proj.weight"), vec![i, h]),
+                        (format!("{base}.feed_forward.up_proj.weight"), vec![i, h]),
+                        (format!("{base}.feed_forward.down_proj.weight"), vec![h, i]),
+                    ]);
+                }
+                tensors.extend([
+                    ("multi_modal_projector.norm.weight".into(), vec![h]),
+                    (
+                        "multi_modal_projector.patch_merger.merging_layer.weight".into(),
+                        vec![h, merged],
+                    ),
+                    (
+                        "multi_modal_projector.linear_1.weight".into(),
+                        vec![self.output_width, h],
+                    ),
+                    (
+                        "multi_modal_projector.linear_2.weight".into(),
+                        vec![self.output_width, self.output_width],
+                    ),
+                ]);
+            }
         }
         Ok(tensors)
     }
@@ -333,7 +477,8 @@ impl VisionEncoderContract {
         field: &'static str,
         expected: &str,
     ) -> Result<()> {
-        match config.get(field).and_then(Value::as_str) {
+        let key = field.rsplit('.').next().expect("field has a key");
+        match config.get(key).and_then(Value::as_str) {
             Some(actual) if actual == expected => Ok(()),
             Some(actual) => Err(self.mismatch(path, field, expected, actual)),
             None => Err(self.mismatch(path, field, expected, "missing")),
@@ -347,12 +492,58 @@ impl VisionEncoderContract {
         field: &'static str,
         expected: usize,
     ) -> Result<()> {
+        let key = field.rsplit('.').next().expect("field has a key");
         match config
-            .get(field)
+            .get(key)
             .and_then(Value::as_u64)
             .and_then(|v| usize::try_from(v).ok())
         {
             Some(actual) if actual == expected => Ok(()),
+            Some(actual) => Err(self.mismatch(path, field, expected, actual)),
+            None => Err(self.mismatch(path, field, expected, "missing")),
+        }
+    }
+
+    fn expect_i64(
+        &self,
+        config: &Value,
+        path: &Path,
+        field: &'static str,
+        expected: i64,
+    ) -> Result<()> {
+        let key = field.rsplit('.').next().expect("field has a key");
+        match config.get(key).and_then(Value::as_i64) {
+            Some(actual) if actual == expected => Ok(()),
+            Some(actual) => Err(self.mismatch(path, field, expected, actual)),
+            None => Err(self.mismatch(path, field, expected, "missing")),
+        }
+    }
+
+    fn expect_bool(
+        &self,
+        config: &Value,
+        path: &Path,
+        field: &'static str,
+        expected: bool,
+    ) -> Result<()> {
+        let key = field.rsplit('.').next().expect("field has a key");
+        match config.get(key).and_then(Value::as_bool) {
+            Some(actual) if actual == expected => Ok(()),
+            Some(actual) => Err(self.mismatch(path, field, expected, actual)),
+            None => Err(self.mismatch(path, field, expected, "missing")),
+        }
+    }
+
+    fn expect_f64(
+        &self,
+        config: &Value,
+        path: &Path,
+        field: &'static str,
+        expected: f64,
+    ) -> Result<()> {
+        let key = field.rsplit('.').next().expect("field has a key");
+        match config.get(key).and_then(Value::as_f64) {
+            Some(actual) if actual.to_bits() == expected.to_bits() => Ok(()),
             Some(actual) => Err(self.mismatch(path, field, expected, actual)),
             None => Err(self.mismatch(path, field, expected, "missing")),
         }

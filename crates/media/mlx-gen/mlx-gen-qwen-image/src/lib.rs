@@ -117,8 +117,8 @@ pub const ENCODER_CONTRACT: mlx_gen::gen_core::EncoderContract =
         qk_norm_eps: None,
         rope_theta: mlx_gen::gen_core::EncoderConfigFloat::new(1_000_000.0),
         max_position_embeddings: 128_000,
-        attention_bias: None,
-        tie_word_embeddings: Some(false),
+        attention_bias: mlx_gen::gen_core::EncoderConfigBool::Optional(true),
+        tie_word_embeddings: mlx_gen::gen_core::EncoderConfigBool::Required(false),
         tokenizer: TOKENIZER_CONTRACT,
         prompt_executions: PROMPT_EXECUTIONS,
         bos_token_id: Some(151_643),
@@ -239,6 +239,28 @@ pub fn provider_registry() -> mlx_gen::gen_core::Result<mlx_gen::gen_core::Provi
 
 #[cfg(test)]
 mod explicit_registry_tests {
+    #[test]
+    fn qwen_authored_attention_bias_must_match_the_biasful_runtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let encoder = tmp.path().join("encoder");
+        gen_core_testkit::write_encoder_contract_fixture(&encoder, super::ENCODER_CONTRACT)
+            .unwrap();
+        super::ENCODER_CONTRACT
+            .validate_source(&mlx_gen::WeightsSource::Dir(encoder.clone()))
+            .expect("omission must select the biasful runtime behavior");
+        let config_path = encoder.join("config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        config["attention_bias"] = serde_json::json!(false);
+        std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let error = super::ENCODER_CONTRACT
+            .validate_source(&mlx_gen::WeightsSource::Dir(encoder))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("attention_bias"), "{error}");
+        assert!(error.contains("expected true"), "{error}");
+    }
+
     fn write_minimal_safetensors(path: &std::path::Path) {
         let mut header = br#"{"probe":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#.to_vec();
         while !header.len().is_multiple_of(8) {
@@ -257,9 +279,10 @@ mod explicit_registry_tests {
             std::fs::create_dir_all(&dir).unwrap();
             write_minimal_safetensors(&dir.join("model.safetensors"));
         }
-        gen_core_testkit::write_encoder_contract_fixture(
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
             &root.join("text_encoder"),
             super::ENCODER_CONTRACT,
+            super::VISION_ENCODER_CONTRACT,
         )
         .expect("validation-complete text encoder fixture");
         root
@@ -314,5 +337,68 @@ mod explicit_registry_tests {
             );
         }
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn registry_footprints_price_only_route_materialized_conditioning() {
+        use mlx_gen::{LoadSpec, WeightsSource};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = super::provider_registry().unwrap();
+        let root = snapshot(&tmp);
+        let base_spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+        let base = registry
+            .footprint("qwen_image", &base_spec)
+            .unwrap()
+            .unwrap();
+        let control = registry
+            .footprint("qwen_image_control", &base_spec)
+            .unwrap()
+            .unwrap();
+        let edit = registry
+            .footprint("qwen_image_edit", &base_spec)
+            .unwrap()
+            .unwrap();
+        assert_eq!(base.text_encoder, control.text_encoder);
+        assert!(edit.text_encoder > base.text_encoder);
+
+        let language_only = tmp.path().join("alternate-language");
+        gen_core_testkit::write_encoder_contract_fixture(&language_only, super::ENCODER_CONTRACT)
+            .unwrap();
+        let complete = tmp.path().join("alternate-complete");
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
+            &complete.join("text_encoder"),
+            super::ENCODER_CONTRACT,
+            super::VISION_ENCODER_CONTRACT,
+        )
+        .unwrap();
+
+        let language_spec = base_spec
+            .clone()
+            .with_text_encoder(WeightsSource::Dir(language_only));
+        let complete_spec = base_spec
+            .clone()
+            .with_text_encoder(WeightsSource::Dir(complete));
+        for id in ["qwen_image", "qwen_image_control", "qwen_image_edit"] {
+            let language = registry.footprint(id, &language_spec).unwrap().unwrap();
+            let multimodal = registry.footprint(id, &complete_spec).unwrap().unwrap();
+            assert_eq!(
+                language.text_encoder, multimodal.text_encoder,
+                "{id}: ignored alternate visual tensors must not be priced"
+            );
+        }
+        let selected_t2i = registry
+            .footprint("qwen_image", &language_spec)
+            .unwrap()
+            .unwrap();
+        let selected_edit = registry
+            .footprint("qwen_image_edit", &language_spec)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            selected_edit.text_encoder - selected_t2i.text_encoder,
+            edit.text_encoder - base.text_encoder,
+            "edit must always add the exact builtin vision side once"
+        );
     }
 }

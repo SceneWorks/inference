@@ -151,8 +151,8 @@ pub const ENCODER_CONTRACT: gen_core::EncoderContract = gen_core::EncoderContrac
     qk_norm_eps: None,
     rope_theta: gen_core::EncoderConfigFloat::new(1_000_000.0),
     max_position_embeddings: 128_000,
-    attention_bias: None,
-    tie_word_embeddings: Some(false),
+    attention_bias: gen_core::EncoderConfigBool::Optional(true),
+    tie_word_embeddings: gen_core::EncoderConfigBool::Required(false),
     tokenizer: TOKENIZER_CONTRACT,
     prompt_executions: PROMPT_EXECUTIONS,
     bos_token_id: Some(151_643),
@@ -1403,6 +1403,27 @@ mod tests {
     fn valid_directory_spec(root: &Path) -> LoadSpec {
         write_valid_text_encoder(root);
         LoadSpec::new(WeightsSource::Dir(root.to_path_buf()))
+    }
+
+    #[test]
+    fn qwen_authored_attention_bias_must_match_the_biasful_runtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let encoder = tmp.path().join("encoder");
+        gen_core_testkit::write_encoder_contract_fixture(&encoder, ENCODER_CONTRACT).unwrap();
+        ENCODER_CONTRACT
+            .validate_source(&WeightsSource::Dir(encoder.clone()))
+            .expect("omission must select the biasful runtime behavior");
+        let config_path = encoder.join("config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        config["attention_bias"] = serde_json::json!(false);
+        std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let error = ENCODER_CONTRACT
+            .validate_source(&WeightsSource::Dir(encoder))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("attention_bias"), "{error}");
+        assert!(error.contains("expected true"), "{error}");
     }
 
     #[test]

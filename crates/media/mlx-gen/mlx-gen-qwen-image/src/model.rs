@@ -580,7 +580,8 @@ pub(crate) fn validate_request(
 
 // The registration constant bridges the crate's rich `Result` into backend-neutral
 // `gen_core::Result`.
-pub(crate) fn component_footprint(
+pub(crate) fn component_footprint_for(
+    provider_id: &str,
     spec: &mlx_gen::LoadSpec,
 ) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
     let root = match &spec.weights {
@@ -592,12 +593,18 @@ pub(crate) fn component_footprint(
         }
     };
     let selected = crate::ENCODER_CONTRACT.source_for_load(spec, root)?;
-    let text_encoder = selected.read_unchanged(|source| {
-        Ok::<u64, mlx_gen::gen_core::Error>(match source {
-            WeightsSource::Dir(path) | WeightsSource::File(path) => {
-                mlx_gen::safetensors_path_bytes(path)
-            }
-        })
+    let mut conditioning =
+        selected.materialized_language_tensor_headers(&crate::ENCODER_CONTRACT)?;
+    if provider_id == crate::model_edit::MODEL_ID {
+        let builtin = crate::ENCODER_CONTRACT
+            .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)?;
+        conditioning.extend(builtin.materialized_vision_tensor_headers(
+            &crate::VISION_ENCODER_CONTRACT,
+            &crate::ENCODER_CONTRACT,
+        )?);
+    }
+    let text_encoder = mlx_gen::asset_facts::projected_tensor_headers_bytes(&conditioning, |_| {
+        mlx_gen::asset_facts::ResidentProjection::Stored
     })?;
     let mut footprint = mlx_gen::PerComponentBytes::from_spec_subdirs(
         spec,
@@ -607,6 +614,24 @@ pub(crate) fn component_footprint(
     )?;
     footprint.text_encoder = text_encoder;
     Ok(footprint)
+}
+
+pub(crate) fn component_footprint(
+    spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    component_footprint_for(MODEL_ID, spec)
+}
+
+pub(crate) fn edit_component_footprint(
+    spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    component_footprint_for(crate::model_edit::MODEL_ID, spec)
+}
+
+pub(crate) fn control_component_footprint(
+    spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    component_footprint_for(crate::model_control::MODEL_ID, spec)
 }
 
 mlx_gen::register_generators! {

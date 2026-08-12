@@ -557,7 +557,7 @@ impl QwenImageControl {
 // `gen_core::Result`.
 mlx_gen::register_generators! {
     pub(crate) const REGISTRATION = descriptor => load;
-    footprint = crate::model::component_footprint
+    footprint = crate::model::control_component_footprint
 }
 
 pub const MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =

@@ -637,7 +637,7 @@ fn validate_reference_images(req: &GenerationRequest) -> Result<()> {
 // shared `validate_request`, so it is not the plain delegation `impl_generator!` expresses.
 mlx_gen::register_generators! {
     pub(crate) const REGISTRATION = descriptor => load;
-    footprint = crate::model::component_footprint
+    footprint = crate::model::edit_component_footprint
 }
 
 pub const MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =

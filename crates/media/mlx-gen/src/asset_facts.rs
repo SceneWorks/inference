@@ -163,17 +163,16 @@ pub fn projected_safetensors_bytes(
     path: impl AsRef<Path>,
     projection: impl Fn(&SafetensorsTensorHeader) -> ResidentProjection,
 ) -> Result<u64> {
-    projected_safetensors_tensors(path, projection)?.into_iter().try_fold(
-        0_u64,
-        |total, tensor| {
+    projected_safetensors_tensors(path, projection)?
+        .into_iter()
+        .try_fold(0_u64, |total, tensor| {
             total.checked_add(tensor.resident_bytes).ok_or_else(|| {
                 Error::Msg(format!(
                     "resident byte sum overflow at tensor {:?}",
                     tensor.name
                 ))
             })
-        },
-    )
+        })
 }
 
 pub fn projected_tensor_headers_bytes(

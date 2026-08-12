@@ -3086,8 +3086,8 @@ mod tests {
                 qk_norm_eps: Some(crate::EncoderConfigFloat::new(1e-6)),
                 rope_theta: crate::EncoderConfigFloat::new(1_000_000.0),
                 max_position_embeddings: 4_096,
-                attention_bias: Some(false),
-                tie_word_embeddings: Some(true),
+                attention_bias: crate::EncoderConfigBool::Required(false),
+                tie_word_embeddings: crate::EncoderConfigBool::Required(true),
                 tokenizer: crate::EncoderTokenizerContract {
                     family: "test-qwen3",
                     binding: crate::EncoderTokenizerBinding::RetainBase,

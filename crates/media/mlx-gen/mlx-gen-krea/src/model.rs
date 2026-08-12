@@ -116,8 +116,8 @@ pub const ENCODER_CONTRACT: mlx_gen::gen_core::EncoderContract =
         qk_norm_eps: Some(mlx_gen::gen_core::EncoderConfigFloat::new(1e-6)),
         rope_theta: mlx_gen::gen_core::EncoderConfigFloat::new(5_000_000.0),
         max_position_embeddings: 262_144,
-        attention_bias: Some(false),
-        tie_word_embeddings: Some(true),
+        attention_bias: mlx_gen::gen_core::EncoderConfigBool::Required(false),
+        tie_word_embeddings: mlx_gen::gen_core::EncoderConfigBool::Required(true),
         tokenizer: TOKENIZER_CONTRACT,
         prompt_executions: PROMPT_EXECUTIONS,
         bos_token_id: Some(151_643),
@@ -1631,20 +1631,26 @@ fn edit_references(req: &GenerationRequest) -> Result<Vec<&Image>> {
 // `krea_2_edit` (the Raw pipeline routed to the Kontext edit entrypoint; epic 10871), and
 // `krea_2_turbo_edit` (that edit surface on the distilled few-step CFG-free schedule; sc-11640).
 /// Per-component on-disk footprint (sc-10894) for the MLX fit-gate's staged-residency split — the
-/// Qwen3-VL text/vision encoder (`text_encoder/`), the DiT (`transformer/`), and the Qwen-Image VAE
-/// (`vae/`), summed from the exact snapshot subdirs [`crate::loader`] loads. Shared by every krea_2 id
-/// (turbo/raw/edit/turbo_edit + turbo_control); the control checkpoint is folded by the worker.
-pub(crate) fn component_footprint(
+/// Route-exact conditioning plus the DiT (`transformer/`) and Qwen-Image VAE (`vae/`). Every route
+/// materializes the selected Qwen3 language tower; edit/turbo-edit also materialize the checkpoint-
+/// coupled builtin vision side. The control checkpoint itself is folded by the worker.
+pub(crate) fn component_footprint_for(
+    provider_id: &str,
     spec: &mlx_gen::LoadSpec,
 ) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
     let base = mlx_gen::require_base_snapshot(spec, "krea_2 imported provider")?;
     let selected = ENCODER_CONTRACT.source_for_load(spec, base)?;
-    let text_encoder = selected.read_unchanged(|source| {
-        Ok::<u64, mlx_gen::gen_core::Error>(match source {
-            WeightsSource::Dir(path) | WeightsSource::File(path) => {
-                mlx_gen::safetensors_path_bytes(path)
-            }
-        })
+    let mut conditioning = selected.materialized_language_tensor_headers(&ENCODER_CONTRACT)?;
+    if provider_id == KREA_2_EDIT_ID || provider_id == KREA_2_TURBO_EDIT_ID {
+        let builtin = ENCODER_CONTRACT
+            .validate_source_against_base(&WeightsSource::Dir(base.join("text_encoder")), base)?;
+        conditioning.extend(
+            builtin
+                .materialized_vision_tensor_headers(&VISION_ENCODER_CONTRACT, &ENCODER_CONTRACT)?,
+        );
+    }
+    let text_encoder = mlx_gen::asset_facts::projected_tensor_headers_bytes(&conditioning, |_| {
+        mlx_gen::asset_facts::ResidentProjection::Stored
     })?;
     match &spec.weights {
         WeightsSource::Dir(_) => {
@@ -1663,6 +1669,24 @@ pub(crate) fn component_footprint(
             vae: mlx_gen::safetensors_path_bytes(base.join("vae")),
         }),
     }
+}
+
+pub(crate) fn component_footprint(
+    spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    component_footprint_for(KREA_2_TURBO_ID, spec)
+}
+
+pub(crate) fn edit_component_footprint(
+    spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    component_footprint_for(KREA_2_EDIT_ID, spec)
+}
+
+pub(crate) fn control_component_footprint(
+    spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    component_footprint_for(crate::model_control::KREA_2_TURBO_CONTROL_ID, spec)
 }
 
 mlx_gen::register_generators! {
@@ -1718,11 +1742,11 @@ mlx_gen::register_generators! {
 }
 mlx_gen::register_generators! {
     pub(crate) const EDIT_REGISTRATION = edit_descriptor => load_edit;
-    footprint = component_footprint
+    footprint = edit_component_footprint
 }
 mlx_gen::register_generators! {
     pub(crate) const TURBO_EDIT_REGISTRATION = turbo_edit_descriptor => load_turbo_edit;
-    footprint = component_footprint
+    footprint = edit_component_footprint
 }
 
 #[cfg(test)]
@@ -1746,6 +1770,75 @@ mod tests {
         bytes.extend(header);
         bytes.extend([0_u8; 2]);
         std::fs::write(path, bytes).expect("write minimal safetensors");
+    }
+
+    fn footprint_snapshot(tmp: &tempfile::TempDir) -> PathBuf {
+        let root = tmp.path().join("footprint-base");
+        for component in ["transformer", "vae"] {
+            let dir = root.join(component);
+            std::fs::create_dir_all(&dir).unwrap();
+            write_minimal_safetensors(&dir.join("model.safetensors"));
+        }
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            ENCODER_CONTRACT,
+            VISION_ENCODER_CONTRACT,
+        )
+        .unwrap();
+        root
+    }
+
+    #[test]
+    fn registry_footprints_price_language_only_except_edit_builtin_vision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = crate::provider_registry().unwrap();
+        let root = footprint_snapshot(&tmp);
+        let base_spec = LoadSpec::new(WeightsSource::Dir(root));
+        let footprint =
+            |id: &str, spec: &LoadSpec| registry.footprint(id, spec).unwrap().unwrap().text_encoder;
+        let t2i = footprint(KREA_2_TURBO_ID, &base_spec);
+        assert_eq!(footprint(KREA_2_RAW_ID, &base_spec), t2i);
+        assert_eq!(
+            footprint(crate::model_control::KREA_2_TURBO_CONTROL_ID, &base_spec),
+            t2i
+        );
+        let edit = footprint(KREA_2_EDIT_ID, &base_spec);
+        assert_eq!(footprint(KREA_2_TURBO_EDIT_ID, &base_spec), edit);
+        assert!(edit > t2i);
+
+        let language_only = tmp.path().join("alternate-language");
+        gen_core_testkit::write_encoder_contract_fixture(&language_only, ENCODER_CONTRACT).unwrap();
+        let complete = tmp.path().join("alternate-complete");
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
+            &complete.join("text_encoder"),
+            ENCODER_CONTRACT,
+            VISION_ENCODER_CONTRACT,
+        )
+        .unwrap();
+        let language_spec = base_spec
+            .clone()
+            .with_text_encoder(WeightsSource::Dir(language_only));
+        let complete_spec = base_spec
+            .clone()
+            .with_text_encoder(WeightsSource::Dir(complete));
+        for id in [
+            KREA_2_TURBO_ID,
+            KREA_2_RAW_ID,
+            KREA_2_EDIT_ID,
+            KREA_2_TURBO_EDIT_ID,
+            crate::model_control::KREA_2_TURBO_CONTROL_ID,
+        ] {
+            assert_eq!(
+                footprint(id, &language_spec),
+                footprint(id, &complete_spec),
+                "{id}: selected visual tensors are ignored and must not be priced"
+            );
+        }
+        assert_eq!(
+            footprint(KREA_2_EDIT_ID, &language_spec) - footprint(KREA_2_TURBO_ID, &language_spec),
+            edit - t2i,
+            "edit adds the builtin vision side exactly once"
+        );
     }
 
     fn complete_native_file_spec(tmp: &tempfile::TempDir) -> LoadSpec {

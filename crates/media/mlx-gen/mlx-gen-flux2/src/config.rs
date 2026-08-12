@@ -150,8 +150,8 @@ pub const KLEIN_ENCODER_CONTRACT: mlx_gen::gen_core::EncoderContract =
         qk_norm_eps: Some(mlx_gen::gen_core::EncoderConfigFloat::new(1e-6)),
         rope_theta: mlx_gen::gen_core::EncoderConfigFloat::new(1_000_000.0),
         max_position_embeddings: 40_960,
-        attention_bias: Some(false),
-        tie_word_embeddings: Some(false),
+        attention_bias: mlx_gen::gen_core::EncoderConfigBool::Required(false),
+        tie_word_embeddings: mlx_gen::gen_core::EncoderConfigBool::Required(false),
         tokenizer: KLEIN_TOKENIZER_CONTRACT,
         prompt_executions: KLEIN_PROMPT_EXECUTIONS,
         bos_token_id: Some(151_643),
@@ -192,8 +192,8 @@ pub const DEV_ENCODER_CONTRACT: mlx_gen::gen_core::EncoderContract =
         qk_norm_eps: None,
         rope_theta: mlx_gen::gen_core::EncoderConfigFloat::new(1_000_000_000.0),
         max_position_embeddings: 131_072,
-        attention_bias: None,
-        tie_word_embeddings: None,
+        attention_bias: mlx_gen::gen_core::EncoderConfigBool::Optional(false),
+        tie_word_embeddings: mlx_gen::gen_core::EncoderConfigBool::Optional(false),
         tokenizer: DEV_TOKENIZER_CONTRACT,
         prompt_executions: DEV_PROMPT_EXECUTIONS,
         bos_token_id: None,
@@ -211,6 +211,30 @@ pub const DEV_ENCODER_CONTRACT: mlx_gen::gen_core::EncoderContract =
             supports_file: true,
         }),
         dense_storage_dtype_probe: None,
+    };
+
+/// Exact builtin multimodal side consumed by FLUX.2-dev caption upsampling. A selected
+/// `LoadSpec::text_encoder` replaces only the Mistral language tower; Pixtral and this projector
+/// remain checkpoint-coupled to the base snapshot and are admitted independently.
+pub const DEV_VISION_ENCODER_CONTRACT: mlx_gen::gen_core::VisionEncoderContract =
+    mlx_gen::gen_core::VisionEncoderContract {
+        architecture: mlx_gen::gen_core::VisionEncoderArchitecture::PixtralMistral3,
+        hidden_size: 1024,
+        intermediate_size: 4096,
+        num_hidden_layers: 24,
+        num_attention_heads: 16,
+        output_width: 5120,
+        hidden_activation: "silu",
+        rope_theta: mlx_gen::gen_core::EncoderConfigFloat::new(10_000.0),
+        normalization_eps: mlx_gen::gen_core::EncoderConfigFloat::new(1e-5),
+        patch_size: 14,
+        temporal_patch_size: 1,
+        spatial_merge_size: 2,
+        in_channels: 3,
+        num_position_embeddings: None,
+        deepstack_visual_indexes: &[],
+        window_size: None,
+        full_attention_block_indexes: &[],
     };
 
 pub const DEFAULT_WIDTH: u32 = 1024;
@@ -544,6 +568,30 @@ impl Flux2Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dev_authored_behavior_boole_must_match_the_biasless_untied_runtime() {
+        for field in ["attention_bias", "tie_word_embeddings"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let encoder = tmp.path().join("encoder");
+            gen_core_testkit::write_encoder_contract_fixture(&encoder, DEV_ENCODER_CONTRACT)
+                .unwrap();
+            DEV_ENCODER_CONTRACT
+                .validate_source(&mlx_gen::WeightsSource::Dir(encoder.clone()))
+                .expect("omission must select the fixed false runtime behavior");
+            let config_path = encoder.join("config.json");
+            let mut config: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+            config[field] = serde_json::json!(true);
+            std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+            let error = DEV_ENCODER_CONTRACT
+                .validate_source(&mlx_gen::WeightsSource::Dir(encoder))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(field), "{field}: {error}");
+            assert!(error.contains("expected false"), "{field}: {error}");
+        }
+    }
 
     #[test]
     fn klein_9b_dims_match_fork() {

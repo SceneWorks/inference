@@ -55,6 +55,30 @@ impl EncoderConfigFloat {
     }
 }
 
+/// An execution-affecting boolean whose authored config value may be required or optional.
+///
+/// `Optional` does not mean unconstrained: omission selects the provider's fixed runtime behavior,
+/// while any authored root or `text_config` value must still equal that effective value. This is
+/// needed for published Qwen2.5-VL and Mistral3 configs which omit booleans that their concrete
+/// loaders nevertheless implement deterministically.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EncoderConfigBool {
+    Required(bool),
+    Optional(bool),
+}
+
+impl EncoderConfigBool {
+    pub const fn effective(self) -> bool {
+        match self {
+            Self::Required(value) | Self::Optional(value) => value,
+        }
+    }
+
+    pub const fn is_required(self) -> bool {
+        matches!(self, Self::Required(_))
+    }
+}
+
 /// What a text-encoder substitution is allowed to do with tokenization. Every currently supported
 /// alternate is a language-weight replacement: the provider retains the base snapshot's tokenizer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -150,9 +174,8 @@ pub struct EncoderContract {
     pub qk_norm_eps: Option<EncoderConfigFloat>,
     pub rope_theta: EncoderConfigFloat,
     pub max_position_embeddings: usize,
-    /// `None` means the published config omits this field and the tensor signature is authoritative.
-    pub attention_bias: Option<bool>,
-    pub tie_word_embeddings: Option<bool>,
+    pub attention_bias: EncoderConfigBool,
+    pub tie_word_embeddings: EncoderConfigBool,
     /// Exact retained-tokenizer identity and evidence policy.
     pub tokenizer: EncoderTokenizerContract,
     /// Exact prompt execution policies for every route/purpose sharing this encoder contract.
@@ -1654,9 +1677,10 @@ impl EncoderContract {
         text: &Value,
         path: &Path,
         field: &'static str,
-        expected: Option<bool>,
+        contract: EncoderConfigBool,
     ) -> Result<()> {
         let mut first = None;
+        let expected = contract.effective();
         for (location, value) in Self::root_text_aliases(root, text, field) {
             if value.is_null() {
                 continue;
@@ -1664,15 +1688,8 @@ impl EncoderContract {
             let actual = value.as_bool().ok_or_else(|| {
                 self.mismatch(path, field, "boolean", format!("{location}={value}"))
             })?;
-            if let Some(expected) = expected {
-                if actual != expected {
-                    return Err(self.mismatch(
-                        path,
-                        field,
-                        expected,
-                        format!("{location}={actual}"),
-                    ));
-                }
+            if actual != expected {
+                return Err(self.mismatch(path, field, expected, format!("{location}={actual}")));
             }
             if first.is_some_and(|first| first != actual) {
                 return Err(self.mismatch(
@@ -1684,9 +1701,10 @@ impl EncoderContract {
             }
             first = Some(actual);
         }
-        match (expected, first) {
-            (Some(expected), None) => Err(self.mismatch(path, field, expected, "missing")),
-            _ => Ok(()),
+        if first.is_none() && contract.is_required() {
+            Err(self.mismatch(path, field, expected, "missing"))
+        } else {
+            Ok(())
         }
     }
 
@@ -3064,8 +3082,8 @@ mod tests {
         qk_norm_eps: Some(EncoderConfigFloat::new(1e-6)),
         rope_theta: EncoderConfigFloat::new(1_000_000.0),
         max_position_embeddings: 4_096,
-        attention_bias: Some(false),
-        tie_word_embeddings: Some(true),
+        attention_bias: EncoderConfigBool::Required(false),
+        tie_word_embeddings: EncoderConfigBool::Required(true),
         tokenizer: TEST_TOKENIZER,
         prompt_executions: TEST_PROMPTS,
         bos_token_id: None,
@@ -4006,6 +4024,36 @@ mod tests {
     }
 
     #[test]
+    fn optional_behavior_bool_allows_omission_but_rejects_every_authored_conflict() {
+        let temp = tempfile::tempdir().unwrap();
+        write_fixture(temp.path(), 8);
+        let path = temp.path().join("config.json");
+        let mut config: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        config.as_object_mut().unwrap().remove("attention_bias");
+        let contract = EncoderContract {
+            attention_bias: EncoderConfigBool::Optional(false),
+            ..CONTRACT
+        };
+        contract
+            .validate_config(&config, &path)
+            .expect("omission selects the provider's fixed false runtime behavior");
+
+        let mut root_conflict = config.clone();
+        root_conflict["attention_bias"] = json!(true);
+        let mut nested = config.clone();
+        nested["attention_bias"] = json!(true);
+        let nested_conflict = json!({ "text_config": nested });
+        for authored in [root_conflict, nested_conflict] {
+            let error = contract
+                .validate_config(&authored, &path)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("attention_bias"), "{error}");
+            assert!(error.contains("expected false"), "{error}");
+        }
+    }
+
+    #[test]
     fn nested_text_architecture_is_authoritative_over_matching_root_wrapper() {
         let temp = tempfile::tempdir().unwrap();
         write_fixture(temp.path(), 8);
@@ -4157,8 +4205,8 @@ mod tests {
         qk_norm_eps: Some(EncoderConfigFloat::new(1e-6)),
         rope_theta: EncoderConfigFloat::new(1_000_000.0),
         max_position_embeddings: 4_096,
-        attention_bias: Some(false),
-        tie_word_embeddings: Some(true),
+        attention_bias: EncoderConfigBool::Required(false),
+        tie_word_embeddings: EncoderConfigBool::Required(true),
         tokenizer: TEST_TOKENIZER,
         prompt_executions: TEST_PROMPTS,
         bos_token_id: None,

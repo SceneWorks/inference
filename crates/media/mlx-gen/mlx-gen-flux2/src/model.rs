@@ -375,9 +375,14 @@ fn build_residency_with_source(
     let text_encoder_load_time_quant_bits =
         text_encoder_source.load_time_quant_bits(effective_quant_bits, variant.id())?;
     let multimodal_encoder_source = if variant.is_dev() {
-        variant
+        let source = variant
             .encoder_contract()
-            .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)?
+            .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)?;
+        source.validate_vision(
+            &crate::config::DEV_VISION_ENCODER_CONTRACT,
+            &crate::config::DEV_ENCODER_CONTRACT,
+        )?;
+        source
     } else {
         text_encoder_source.clone()
     };
@@ -1326,20 +1331,63 @@ pub(crate) fn validate_request(
 
 // The registration constants bridge the crate's rich `Result` into backend-neutral
 // `gen_core::Result`.
-/// Per-component on-disk footprint for the staged-residency split. Shared by every FLUX.2 id.
-pub(crate) fn component_footprint(
+/// Load-exact conditioning footprint for the staged-residency split. The selected source contributes
+/// only its materialized language tower. Dev and DevEdit additionally retain the builtin Pixtral +
+/// projector surface for caption upsampling; Klein and dev-control do not.
+pub(crate) fn component_footprint_for(
+    variant: Flux2Variant,
+    include_builtin_multimodal: bool,
     spec: &mlx_gen::LoadSpec,
 ) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    let root = match &spec.weights {
+        WeightsSource::Dir(root) => root.as_path(),
+        WeightsSource::File(_) => {
+            return Err(mlx_gen::gen_core::Error::Msg(
+                "FLUX.2 component footprint requires a snapshot directory".into(),
+            ))
+        }
+    };
+    let language_contract = variant.encoder_contract();
+    let selected = language_contract.source_for_load(spec, root)?;
+    let mut conditioning = selected.materialized_language_tensor_headers(&language_contract)?;
+    if include_builtin_multimodal {
+        let builtin = crate::config::DEV_ENCODER_CONTRACT
+            .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)?;
+        conditioning.extend(builtin.materialized_vision_tensor_headers(
+            &crate::config::DEV_VISION_ENCODER_CONTRACT,
+            &crate::config::DEV_ENCODER_CONTRACT,
+        )?);
+    }
+    let conditioning_bytes =
+        mlx_gen::asset_facts::projected_tensor_headers_bytes(&conditioning, |_| {
+            mlx_gen::asset_facts::ResidentProjection::Stored
+        })?;
     let mut footprint = mlx_gen::PerComponentBytes::from_spec_subdirs(
         spec,
         &["text_encoder"],
         &["transformer"],
         &["vae"],
     )?;
-    if let Some(source) = spec.text_encoder.as_ref() {
-        footprint.text_encoder = mlx_gen::gen_core::text_encoder_source_bytes(source)?;
-    }
+    footprint.text_encoder = conditioning_bytes;
     Ok(footprint)
+}
+
+pub(crate) fn component_footprint(
+    spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    component_footprint_for(Flux2Variant::Klein9b, false, spec)
+}
+
+pub(crate) fn dev_component_footprint(
+    spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    component_footprint_for(Flux2Variant::Dev, true, spec)
+}
+
+pub(crate) fn dev_control_component_footprint(
+    spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    component_footprint_for(Flux2Variant::Dev, false, spec)
 }
 
 mlx_gen::register_generators! {
@@ -1357,11 +1405,11 @@ mlx_gen::register_generators! {
 }
 mlx_gen::register_generators! {
     pub(crate) const DEV_REGISTRATION = descriptor_dev => load_dev;
-    footprint = component_footprint
+    footprint = dev_component_footprint
 }
 mlx_gen::register_generators! {
     pub(crate) const DEV_EDIT_REGISTRATION = descriptor_dev_edit => load_dev_edit;
-    footprint = component_footprint
+    footprint = dev_component_footprint
 }
 
 pub(crate) const DEV_EDIT_MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
@@ -2100,31 +2148,206 @@ mod tests {
         variant: Flux2Variant,
         policy: OffloadPolicy,
     ) -> LoadSpec {
-        gen_core_testkit::write_encoder_contract_fixture(
-            &root.join("text_encoder"),
-            variant.encoder_contract(),
-        )
-        .unwrap();
+        if variant.is_dev() {
+            gen_core_testkit::write_multimodal_encoder_contract_fixture(
+                &root.join("text_encoder"),
+                variant.encoder_contract(),
+                crate::config::DEV_VISION_ENCODER_CONTRACT,
+            )
+            .unwrap();
+        } else {
+            gen_core_testkit::write_encoder_contract_fixture(
+                &root.join("text_encoder"),
+                variant.encoder_contract(),
+            )
+            .unwrap();
+        }
         LoadSpec::new(WeightsSource::Dir(root.to_path_buf())).with_offload_policy(policy)
     }
 
     #[test]
     fn build_residency_sequential_defers_all_component_loads() {
         for variant in [Flux2Variant::Klein9b, Flux2Variant::Dev] {
-            let fixture = tempfile::tempdir().unwrap();
-            let spec = validation_complete_snapshot_spec(
-                fixture.path(),
-                variant,
-                OffloadPolicy::Sequential,
-            );
-            let res = build_residency(variant, &spec)
-                .expect("Sequential must validate the encoder and defer payload loads");
+            for shape in [
+                mlx_gen::LoadShape::EagerMaterialization,
+                mlx_gen::LoadShape::DeferredMaterialization,
+            ] {
+                let fixture = tempfile::tempdir().unwrap();
+                let mut spec = validation_complete_snapshot_spec(
+                    fixture.path(),
+                    variant,
+                    OffloadPolicy::Sequential,
+                );
+                spec.load_shape = shape;
+                let res = build_residency(variant, &spec)
+                    .expect("Sequential must admit every consumed encoder surface before deferring payload loads");
+                assert!(
+                    res.is_sequential(),
+                    "{} {shape:?}: Sequential policy must build a deferred residency",
+                    variant.id()
+                );
+            }
+        }
+    }
+
+    fn rewrite_tensor_shape(root: &Path, tensor: &str, first_dimension: usize) {
+        use std::io::Write as _;
+
+        let path = root.join("text_encoder/model.safetensors");
+        let bytes = std::fs::read(&path).unwrap();
+        let header_len = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
+        let mut header: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&bytes[8..8 + header_len]).unwrap();
+        let entry = header.get_mut(tensor).unwrap();
+        let old_first = entry["shape"][0].as_u64().unwrap();
+        let row_elements = entry["shape"].as_array().unwrap()[1..]
+            .iter()
+            .map(|dimension| dimension.as_u64().unwrap())
+            .product::<u64>();
+        let old_end = entry["data_offsets"][1].as_u64().unwrap();
+        let added_bytes = (first_dimension as u64 - old_first) * row_elements * 2;
+        entry["shape"][0] = serde_json::json!(first_dimension);
+        entry["data_offsets"][1] = serde_json::json!(old_end + added_bytes);
+        let payload_len = header
+            .values()
+            .filter_map(|entry| entry["data_offsets"][1].as_u64())
+            .max()
+            .unwrap();
+        let encoded = serde_json::to_vec(&header).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(&(encoded.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(&encoded).unwrap();
+        file.set_len(8 + encoded.len() as u64 + payload_len)
+            .unwrap();
+    }
+
+    #[test]
+    fn dev_multimodal_contract_fails_closed_for_deferred_routes_and_public_loaders() {
+        for variant in [Flux2Variant::Dev, Flux2Variant::DevEdit] {
+            for shape in [
+                mlx_gen::LoadShape::EagerMaterialization,
+                mlx_gen::LoadShape::DeferredMaterialization,
+            ] {
+                let fixture = tempfile::tempdir().unwrap();
+                let mut spec = validation_complete_snapshot_spec(
+                    fixture.path(),
+                    variant,
+                    OffloadPolicy::Sequential,
+                );
+                spec.load_shape = shape;
+                let config_path = fixture.path().join("text_encoder/config.json");
+                let mut config: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+                config["vision_config"]["num_hidden_layers"] = serde_json::json!(23);
+                std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+                let error = build_residency(variant, &spec)
+                    .err()
+                    .expect("deferred construction must still load-admit Pixtral config")
+                    .to_string();
+                assert!(error.contains("vision_config.num_hidden_layers"), "{error}");
+            }
+        }
+
+        let fixture = tempfile::tempdir().unwrap();
+        validation_complete_snapshot_spec(
+            fixture.path(),
+            Flux2Variant::Dev,
+            OffloadPolicy::Sequential,
+        );
+        rewrite_tensor_shape(
+            fixture.path(),
+            "multi_modal_projector.linear_2.weight",
+            5121,
+        );
+        for error in [
+            crate::loader::load_vision_tower_dev(fixture.path())
+                .err()
+                .expect("vision loader must validate the paired projector")
+                .to_string(),
+            crate::loader::load_multimodal_projector_dev(fixture.path())
+                .err()
+                .expect("projector loader must validate its exact header")
+                .to_string(),
+            crate::loader::load_dev_text_encoder_group(fixture.path())
+                .err()
+                .expect("group loader must validate the whole multimodal source")
+                .to_string(),
+        ] {
+            assert!(error.contains("vision_tensor_shape"), "{error}");
             assert!(
-                res.is_sequential(),
-                "{}: Sequential policy must build a Sequential (deferred) residency",
-                variant.id()
+                error.contains("multi_modal_projector.linear_2.weight"),
+                "{error}"
             );
         }
+    }
+
+    #[test]
+    fn dev_registry_footprints_dedup_builtin_multimodal_and_ignore_override_visuals() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = crate::provider_registry().unwrap();
+        let base_spec = validation_complete_snapshot_spec(
+            tmp.path(),
+            Flux2Variant::Dev,
+            OffloadPolicy::Sequential,
+        );
+        let footprint =
+            |id: &str, spec: &LoadSpec| registry.footprint(id, spec).unwrap().unwrap().text_encoder;
+        let dev = footprint(crate::config::FLUX2_DEV_ID, &base_spec);
+        let edit = footprint(crate::config::FLUX2_DEV_EDIT_ID, &base_spec);
+        let control = footprint(crate::config::FLUX2_DEV_CONTROL_ID, &base_spec);
+        assert_eq!(dev, edit);
+        assert!(dev > control, "Dev routes add Pixtral + projector once");
+
+        let language_only = tmp.path().join("alternate-language");
+        gen_core_testkit::write_encoder_contract_fixture(
+            &language_only,
+            crate::config::DEV_ENCODER_CONTRACT,
+        )
+        .unwrap();
+        let complete = tmp.path().join("alternate-complete");
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
+            &complete.join("text_encoder"),
+            crate::config::DEV_ENCODER_CONTRACT,
+            crate::config::DEV_VISION_ENCODER_CONTRACT,
+        )
+        .unwrap();
+        let language_spec = base_spec
+            .clone()
+            .with_text_encoder(WeightsSource::Dir(language_only));
+        let complete_spec = base_spec
+            .clone()
+            .with_text_encoder(WeightsSource::Dir(complete));
+        for id in [
+            crate::config::FLUX2_DEV_ID,
+            crate::config::FLUX2_DEV_EDIT_ID,
+            crate::config::FLUX2_DEV_CONTROL_ID,
+        ] {
+            assert_eq!(
+                footprint(id, &language_spec),
+                footprint(id, &complete_spec),
+                "{id}: alternate visual/projector tensors are not consumed"
+            );
+        }
+        assert_eq!(
+            footprint(crate::config::FLUX2_DEV_ID, &language_spec)
+                - footprint(crate::config::FLUX2_DEV_CONTROL_ID, &language_spec),
+            dev - control,
+            "builtin Pixtral + projector must be counted exactly once"
+        );
+
+        let estimated = mlx_gen::PerComponentBytes::from_spec_subdirs(
+            &base_spec,
+            &["text_encoder"],
+            &["transformer"],
+            &["vae"],
+        )
+        .expect("the generic estimated-fallback path remains available");
+        assert!(estimated.text_encoder > 0);
     }
 
     #[test]

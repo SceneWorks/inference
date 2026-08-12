@@ -2538,7 +2538,6 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
-    use std::cell::Cell;
 
     #[test]
     fn language_only_snapshot_is_admitted_until_the_edit_only_vision_read() {

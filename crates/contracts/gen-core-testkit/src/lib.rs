@@ -120,44 +120,77 @@ pub fn write_multimodal_encoder_contract_fixture(
 
     let config_path = root.join("config.json");
     let mut config: serde_json::Value = serde_json::from_slice(&std::fs::read(&config_path)?)?;
-    let model_type = match vision.architecture {
-        gen_core::VisionEncoderArchitecture::Qwen3Vl => "qwen3_vl",
-        gen_core::VisionEncoderArchitecture::Qwen2_5Vl => "qwen2_5_vl",
-    };
-    let mut vision_config = serde_json::json!({
-        "model_type": model_type,
-        "hidden_act": vision.hidden_activation,
-        "hidden_size": vision.hidden_size,
-        "intermediate_size": vision.intermediate_size,
-        "depth": vision.num_hidden_layers,
-        "num_heads": vision.num_attention_heads,
-        "out_hidden_size": vision.output_width,
-        "rope_theta": vision.rope_theta.get(),
-        "patch_size": vision.patch_size,
-        "temporal_patch_size": vision.temporal_patch_size,
-        "spatial_merge_size": vision.spatial_merge_size,
-        "in_channels": vision.in_channels,
-    });
-    let normalization_field = match vision.architecture {
-        gen_core::VisionEncoderArchitecture::Qwen3Vl => "layer_norm_eps",
-        gen_core::VisionEncoderArchitecture::Qwen2_5Vl => "rms_norm_eps",
-    };
-    vision_config[normalization_field] = serde_json::json!(vision.normalization_eps.get());
-    if let Some(value) = vision.num_position_embeddings {
-        vision_config["num_position_embeddings"] = serde_json::json!(value);
+    match vision.architecture {
+        gen_core::VisionEncoderArchitecture::Qwen3Vl
+        | gen_core::VisionEncoderArchitecture::Qwen2_5Vl => {
+            let model_type = match vision.architecture {
+                gen_core::VisionEncoderArchitecture::Qwen3Vl => "qwen3_vl",
+                gen_core::VisionEncoderArchitecture::Qwen2_5Vl => "qwen2_5_vl",
+                gen_core::VisionEncoderArchitecture::PixtralMistral3 => unreachable!(),
+            };
+            let mut vision_config = serde_json::json!({
+                "model_type": model_type,
+                "hidden_act": vision.hidden_activation,
+                "hidden_size": vision.hidden_size,
+                "intermediate_size": vision.intermediate_size,
+                "depth": vision.num_hidden_layers,
+                "num_heads": vision.num_attention_heads,
+                "out_hidden_size": vision.output_width,
+                "rope_theta": vision.rope_theta.get(),
+                "patch_size": vision.patch_size,
+                "temporal_patch_size": vision.temporal_patch_size,
+                "spatial_merge_size": vision.spatial_merge_size,
+                "in_channels": vision.in_channels,
+            });
+            let normalization_field = match vision.architecture {
+                gen_core::VisionEncoderArchitecture::Qwen3Vl => "layer_norm_eps",
+                gen_core::VisionEncoderArchitecture::Qwen2_5Vl => "rms_norm_eps",
+                gen_core::VisionEncoderArchitecture::PixtralMistral3 => unreachable!(),
+            };
+            vision_config[normalization_field] = serde_json::json!(vision.normalization_eps.get());
+            if let Some(value) = vision.num_position_embeddings {
+                vision_config["num_position_embeddings"] = serde_json::json!(value);
+            }
+            if !vision.deepstack_visual_indexes.is_empty() {
+                vision_config["deepstack_visual_indexes"] =
+                    serde_json::json!(vision.deepstack_visual_indexes);
+            }
+            if let Some(value) = vision.window_size {
+                vision_config["window_size"] = serde_json::json!(value);
+            }
+            if !vision.full_attention_block_indexes.is_empty() {
+                vision_config["fullatt_block_indexes"] =
+                    serde_json::json!(vision.full_attention_block_indexes);
+            }
+            config["vision_config"] = vision_config;
+        }
+        gen_core::VisionEncoderArchitecture::PixtralMistral3 => {
+            let text_config = config;
+            config = serde_json::json!({
+                "architectures": ["Mistral3ForConditionalGeneration"],
+                "image_token_index": 10,
+                "model_type": "mistral3",
+                "multimodal_projector_bias": false,
+                "projector_hidden_act": "gelu",
+                "spatial_merge_size": vision.spatial_merge_size,
+                "text_config": text_config,
+                "vision_config": {
+                    "attention_dropout": 0.0,
+                    "head_dim": vision.hidden_size / vision.num_attention_heads,
+                    "hidden_act": vision.hidden_activation,
+                    "hidden_size": vision.hidden_size,
+                    "intermediate_size": vision.intermediate_size,
+                    "model_type": "pixtral",
+                    "num_attention_heads": vision.num_attention_heads,
+                    "num_channels": vision.in_channels,
+                    "num_hidden_layers": vision.num_hidden_layers,
+                    "patch_size": vision.patch_size,
+                    "rope_theta": vision.rope_theta.get()
+                },
+                "vision_feature_layer": -1
+            });
+        }
     }
-    if !vision.deepstack_visual_indexes.is_empty() {
-        vision_config["deepstack_visual_indexes"] =
-            serde_json::json!(vision.deepstack_visual_indexes);
-    }
-    if let Some(value) = vision.window_size {
-        vision_config["window_size"] = serde_json::json!(value);
-    }
-    if !vision.full_attention_block_indexes.is_empty() {
-        vision_config["fullatt_block_indexes"] =
-            serde_json::json!(vision.full_attention_block_indexes);
-    }
-    config["vision_config"] = vision_config;
     std::fs::write(&config_path, serde_json::to_vec(&config)?)?;
 
     let weights_path = root.join("model.safetensors");
@@ -232,10 +265,10 @@ pub fn write_encoder_contract_fixture_with_quant(
         "rope_theta": contract.rope_theta.get(),
         "max_position_embeddings": contract.max_position_embeddings,
     });
-    if let Some(value) = contract.attention_bias {
+    if let gen_core::EncoderConfigBool::Required(value) = contract.attention_bias {
         config["attention_bias"] = serde_json::json!(value);
     }
-    if let Some(value) = contract.tie_word_embeddings {
+    if let gen_core::EncoderConfigBool::Required(value) = contract.tie_word_embeddings {
         config["tie_word_embeddings"] = serde_json::json!(value);
     }
     for (field, value) in [
