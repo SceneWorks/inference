@@ -7,7 +7,9 @@ on:
   # main, which leaves this post-merge run as the only thing that can produce it — without it
   # main carries zero check-runs and the required context is unproducible (sc-18825). This was
   # dropped in e1032710 when the queue was introduced; the queue outlived it by six days. Tags
-  # keep their own trigger: release lanes are driven by `refs/tags/runtime-*`.
+  # keep their own trigger: release lanes are driven by `refs/tags/runtime-*`. The now-dead
+  # `merge_group:` trigger below is retained deliberately so re-enabling a queue stays a
+  # ruleset-only change.
   push:
     branches: [main]
     tags: ["runtime-*"]
