@@ -1428,6 +1428,10 @@ jobs:
           python3.12 scripts/release/resolve_snapshot_paths.py
           ZIMAGE_SNAPSHOT MAGE_SNAPSHOT MAGE_EDIT_SNAPSHOT MAGE_EDIT_BASE_SNAPSHOT
           MAGE_EDIT_TURBO_SNAPSHOT MAGE_ORACLE_SEED_DIR MLX_GEN_MODELS_ROOT LENS_SNAPSHOT
+      - name: Configure the immutable SDXL N1 VAE snapshot path
+        run: >-
+          python3.12 scripts/release/export_model_snapshot_paths.py
+          --model sdxl-base-mlx-vae-bf16
       # actions/setup-python's Darwin package hard-codes /Users/runner during installation, which is
       # not writable on this self-hosted runner. uv installs the exact interpreter wholly in temp.
       - name: Install pinned reference Python
@@ -1484,6 +1488,15 @@ jobs:
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model mage-flow-edit --snapshot "$MAGE_EDIT_SNAPSHOT" --require-materialization-provenance
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model mage-flow-edit-base --snapshot "$MAGE_EDIT_BASE_SNAPSHOT" --require-materialization-provenance
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model mage-flow-edit-turbo --snapshot "$MAGE_EDIT_TURBO_SNAPSHOT" --require-materialization-provenance
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model sdxl-base-mlx-vae-bf16 --snapshot "$SDXL_N1_SNAPSHOT"
+      - name: Prove the SDXL native decode seam on real weights
+        run: |
+          set -o pipefail
+          out="$(SDXL_SNAPSHOT="$SDXL_N1_SNAPSHOT/bf16" \
+            cargo test --locked --release -p mlx-gen-sdxl --test vae_real_weights \
+            native_decode_seam_is_byte_exact_to_pre_seam_engine \
+            -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+          grep -qE "test result: ok\. 1 passed" <<<"$out"
       - name: Derive immutable Mage oracle cache key
         id: mage-oracle-key
         run: |
@@ -2039,6 +2052,14 @@ jobs:
             echo "$var=$dir" >> "$GITHUB_ENV"
             PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model "$key" --snapshot "$dir"
           done
+      - name: Prove the Qwen native decode seam on real weights
+        run: |
+          set -o pipefail
+          out="$(MLX_GEN_QWEN_SNAPSHOT="$QWEN_IMAGE_MLX_SNAPSHOT/bf16" \
+            cargo test --locked --release -p mlx-gen-qwen-image --test vae_real_weights \
+            native_decode_seam_is_byte_exact_and_precancelled \
+            -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+          grep -qE "test result: ok\. 1 passed" <<<"$out"
       # EVERY step below selects by NAME with `--exact` and asserts the run count. All three halves of
       # that are load-bearing and were verified by direct execution for this story:
       #   1. `--exact` goes AFTER the `--`. It is a libtest flag; cargo rejects it in its own

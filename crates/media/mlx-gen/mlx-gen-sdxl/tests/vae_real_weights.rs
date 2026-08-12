@@ -9,7 +9,7 @@ mod common;
 use mlx_gen::weights::Weights;
 use mlx_gen::{CancelFlag, Error, LatentDecoder};
 use mlx_gen_sdxl::{decode_image, decoded_to_image, load_vae, SdxlLatentDecoder};
-use mlx_rs::Array;
+use mlx_rs::{random, Array};
 
 const GOLDEN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -50,16 +50,18 @@ fn vae_decode_matches_vendored() {
 /// no-override route over the same real normalized latent. Equality is bitwise, not tolerance-based:
 /// the seam may only transpose around the native VAE and must not alter normalization or readback.
 #[test]
-#[ignore = "needs the real SDXL snapshot + VAE golden"]
+#[ignore = "needs the real SDXL VAE snapshot"]
 fn native_decode_seam_is_byte_exact_to_pre_seam_engine() {
-    let g = Weights::from_file(GOLDEN).unwrap();
     let vae = load_vae(&snapshot()).unwrap();
-    let latents_nhwc = g.require("latents").unwrap();
+    let key = random::key(18_309).unwrap();
+    let latents_nhwc = random::normal::<f32>(&[1, 8, 8, 4], None, None, Some(&key)).unwrap();
 
-    let legacy_tensor = vae.decode(latents_nhwc).unwrap();
+    let legacy_tensor = vae.decode(&latents_nhwc).unwrap();
     let latents_nchw = latents_nhwc.transpose_axes(&[0, 3, 1, 2]).unwrap();
     let seam_nchw = SdxlLatentDecoder::new(&vae).decode(&latents_nchw).unwrap();
     let seam_nhwc = seam_nchw.transpose_axes(&[0, 2, 3, 1]).unwrap();
+    legacy_tensor.eval().unwrap();
+    seam_nhwc.eval().unwrap();
     assert_eq!(seam_nhwc.shape(), legacy_tensor.shape());
     assert_eq!(
         seam_nhwc.reshape(&[-1]).unwrap().as_slice::<f32>(),
@@ -68,7 +70,7 @@ fn native_decode_seam_is_byte_exact_to_pre_seam_engine() {
     );
 
     let legacy_image = decoded_to_image(&legacy_tensor).unwrap();
-    let engine_image = decode_image(&vae, latents_nhwc, None).unwrap();
+    let engine_image = decode_image(&vae, &latents_nhwc, None).unwrap();
     assert_eq!(engine_image, legacy_image, "engine RGB bytes changed");
 
     let malformed = Array::from_slice(&[1.0f32], &[1]);
