@@ -1660,7 +1660,9 @@ mod tests {
 
     #[test]
     fn retained_binary_swiglu_matches_oneshot_and_preserves_numeric_contract() {
-        use mlx_gen::diagnostics::{self, RETAINED_COMPILATION};
+        use mlx_gen::diagnostics::{
+            self, CompileDisposition, DiagnosticCounter, ToggleDisposition, RETAINED_COMPILATION,
+        };
         use mlx_rs::Dtype::{Bfloat16, Float32};
 
         for dtype in [Float32, Bfloat16] {
@@ -1672,10 +1674,23 @@ mod tests {
             eager.eval().unwrap();
 
             mlx_rs::transforms::compile::clear_cache();
+            let scope =
+                diagnostics::begin_request(format!("flux2-oneshot-binary-{dtype:?}"), "test")
+                    .unwrap();
             set_compile_glue(true);
             let oneshot = swiglu(&x).unwrap();
             oneshot.eval().unwrap();
+            let oneshot_report = scope.finish();
             set_compile_glue(false);
+            assert_eq!(
+                oneshot_report.counters,
+                vec![DiagnosticCounter::Compile {
+                    site: SITE_SWIGLU,
+                    disposition: CompileDisposition::OneShot,
+                    count: 1,
+                }],
+                "no-toggle request must record only the one-shot compile"
+            );
 
             mlx_rs::transforms::compile::clear_cache();
             RETAINED_SWIGLU.with(|slot| *slot.borrow_mut() = None);
@@ -1690,9 +1705,32 @@ mod tests {
             first.eval().unwrap();
             let second = swiglu(&x).unwrap();
             second.eval().unwrap();
-            let _ = scope.finish();
+            let retained_report = scope.finish();
             set_compile_glue(false);
+            assert_eq!(
+                retained_report.counters,
+                vec![
+                    DiagnosticCounter::Compile {
+                        site: SITE_SWIGLU,
+                        disposition: CompileDisposition::RetainedMiss,
+                        count: 1,
+                    },
+                    DiagnosticCounter::Compile {
+                        site: SITE_SWIGLU,
+                        disposition: CompileDisposition::RetainedHit,
+                        count: 1,
+                    },
+                    DiagnosticCounter::Toggle {
+                        toggle: RETAINED_COMPILATION,
+                        disposition: ToggleDisposition::Applied,
+                        count: 2,
+                    },
+                ],
+                "retained request must prove one miss, one hit, and two applied calls"
+            );
 
+            assert_eq!(eager.dtype(), dtype);
+            assert_eq!(oneshot.dtype(), dtype);
             assert_eq!(first.dtype(), dtype);
             assert_eq!(second.dtype(), dtype);
             assert_eq!(

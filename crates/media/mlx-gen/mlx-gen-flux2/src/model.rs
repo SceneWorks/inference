@@ -997,9 +997,10 @@ impl Flux2 {
                     .unwrap_or(0);
 
                 // sc-2963 (rollout of sc-2957): run the MMDiT's fusable elementwise glue (adaLN affine,
-                // SwiGLU, gated residual, RoPE rotation) through `mx.compile` — bit-exact (`max|Δ|=0`,
-                // compile_parity.rs) and a per-step win at production geometry. Scoped to this render by
-                // the RAII guard (F-007): the render thread's prior setting is restored on drop.
+                // SwiGLU, gated residual, RoPE rotation) through `mx.compile`. Under MLX 0.32 bf16 is
+                // exact to eager and f32 stays within the established ULP contract; compile_parity.rs
+                // gates the composed forward. Scoped to this render by the RAII guard (F-007): the
+                // render thread's prior setting is restored on drop.
                 let _compile_glue = crate::transformer::CompileGlueGuard::enable();
 
                 // PiD decode overlay (epic 7840, sc-7847) + `from_ldm` early-stop (sc-8048): when
