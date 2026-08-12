@@ -185,3 +185,62 @@ In `mlx-gen-minimax-h3` (`src/model.rs`), three cases:
 > directly). The claim made here is that the mapping now carries both fields to that already-gated
 > code, and that is what the tests above pin. **No claim is made that a reference-with-soundtrack
 > render has been executed against real weights.**
+
+## ⚠ The tiering seam: `ref2va`'s partition follows the tier, not the root
+
+Landed when this branch merged sc-17150 (q4/q8/bf16 quant tiers, PR #570). The two stories touch the
+same call sites from opposite directions and the textual merge did **not** surface the whole overlap.
+
+sc-17149 gives the DiT a *per-task* partition: `t2va`/`fl2va` read `transformer/`, `ref2va` reads
+`transformer_ref/`. sc-17150 makes the DiT a *tiered component*: a `q4` install stages it from the
+`SceneWorks/minimax-h3-mlx` mirror, **outside the snapshot root**, so `MiniMaxH3Dit::load(root,
+partition, …)` no longer names it at all and sc-17150 replaced that seam with `load_dir(dit_dir, …)`.
+
+Resolved with `MiniMaxH3::task_dit_dir(task)`, which resolves the reference partition as
+`dit_dir`'s **sibling**:
+
+| layout | `dit_dir` | `ref2va` resolves to |
+|---|---|---|
+| flat upstream | `root/transformer` | `root/transformer_ref` — unchanged from before tiering |
+| tiered / split | `{tier}/transformer` | `{tier}/transformer_ref` — same tier, both partitions |
+
+This is the shape sc-17150 already anticipated rather than a new invention: `crate::convert` and
+`examples/minimax_h3_prequant.rs` both document pre-quantizing "`transformer/` **or**
+`transformer_ref/`", so a tier directory holds the pair side by side. The load-time probe and
+`reconcile_tier` were moved to the reference partition's resolved location for the same reason.
+
+### What the clean merge hid
+
+`generate` has **two** DiT load sites — the `t2va`/`fl2va` arm and the `ref2va` arm — and only the
+first conflicted. The `ref2va` arm merged with no marker while still resolving against `&self.root`.
+On a tiered install that resolves to a path the staged tier does not occupy; worse, on a machine
+that also has a flat snapshot it would find a **dense** `transformer_ref` beside a `q4` base and mix
+tiers across two branches of one render, which nothing downstream checks. Both sites now go through
+`task_dit_dir`.
+
+This is the concrete reason the merge was re-verified rather than trusted: a conflict-free hunk is
+not evidence that the surrounding invariant survived.
+
+### The source gate was restated, not relaxed
+
+`every_dit_load_site_is_driven_by_the_task` counted raw `"transformer"` occurrences in `model.rs` and
+required exactly one (`BASE_DIT_PARTITION`'s value). sc-17150 legitimately added a third —
+`DIT_COMPONENT` — so that count was measuring the wrong thing. It now asserts the property that
+actually matters: every occurrence of either partition literal is a `pub const` binding and none sits
+at a call site, comment lines excluded so the gate tracks code rather than prose. It also newly
+asserts that `task_dit_dir` switches on `MiniMaxH3Task::partition()`, because a source scan that
+counts a helper cannot see whether the helper is correct.
+
+**Mutation-verified**, each guard alone, each reverted byte-identical:
+
+| mutation | result |
+|---|---|
+| `ref2va` load site back to `load(&self.root, task.partition(), …)` | `every_dit_load_site_is_driven_by_the_task` — "1 of 2 site(s) do not" |
+| `task_dit_dir` resolves `self.root.join(partition)` | `the_reference_partition_follows_the_tier_not_the_root` — the tiered case fails |
+| `task_dit_dir` switches on the task enum instead of `partition()` | `every_dit_load_site_is_driven_by_the_task` — the `partition()` assertion fails |
+| a bare `"transformer_ref"` returns to a call site | "appears in 2 non-comment line(s) but only 1 are `pub const` bindings" |
+
+> No real-weight validation: confirming a `q4` `ref2va` render reads `{tier}/transformer_ref` needs a
+> staged tier plus the 66 GB reference checkpoint. `the_reference_partition_follows_the_tier_not_the_root`
+> pins the path arithmetic on both layouts; the real-weight assertion belongs with sc-17150's tier
+> smokes.
