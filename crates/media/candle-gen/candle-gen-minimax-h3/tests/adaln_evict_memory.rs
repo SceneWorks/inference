@@ -579,7 +579,7 @@ fn the_evicted_adaln_weights_leave_memory() {
 ///   only after the synchronize `precompute_and_evict` performs.
 #[cfg(feature = "cuda")]
 #[test]
-#[ignore = "needs a CUDA device; never executed by any lane this story can reach (sc-17155)"]
+#[ignore = "needs a CUDA device: compiled/linted by windows-cuda-check, never executed (sc-17155)"]
 fn the_evicted_adaln_weights_leave_the_cuda_pool() {
     use candle_gen::cuda_mempool::MemPool;
 
