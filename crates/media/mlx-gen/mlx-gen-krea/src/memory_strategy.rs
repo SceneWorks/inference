@@ -222,7 +222,8 @@ pub(crate) fn native_memory_strategy_contract_from_spec(
             ))
         })
     };
-    let text_plan = crate::model::resolve_load_plan(spec, base_snapshot_dir, provider_id)?;
+    let text_plan =
+        crate::model::resolve_load_plan_for_component(spec, base_snapshot_dir, provider_id, false)?;
     let conditioning_bytes =
         projected_safetensors_bytes(&base_snapshot_dir.join("text_encoder"), |tensor| {
             if let Some(bits) = text_plan

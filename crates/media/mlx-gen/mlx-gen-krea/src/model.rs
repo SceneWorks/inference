@@ -457,7 +457,7 @@ fn build_native_krea_from_spec(spec: &LoadSpec, descriptor: ModelDescriptor) -> 
         .expect("File weights must resolve to a pin");
     let mut pinned_spec = spec.clone();
     pinned_spec.weights = WeightsSource::File(native_dit.loader_path().to_path_buf());
-    let text_load_plan = resolve_load_plan(spec, base, descriptor.id)?;
+    let text_load_plan = resolve_load_plan_for_component(spec, base, descriptor.id, false)?;
     // Physical execution eligibility is intentionally independent from public evidence. An explicit
     // Sequential + Deferred File request can use the retained pin to reopen one transformer block at
     // a time, while the contract below continues to report rung 4 as Missing until File-specific
@@ -692,6 +692,24 @@ pub(crate) fn resolve_load_plan(
     root: &Path,
     id: &str,
 ) -> Result<ResolvedLoadPlan> {
+    resolve_load_plan_for_component(
+        spec,
+        root,
+        id,
+        matches!(spec.weights, WeightsSource::File(_)),
+    )
+}
+
+/// Resolve the quantization carried by `root`. For an imported primary File, the base snapshot's
+/// text tower is only a companion component: it may be prepacked even though the File DiT carries
+/// its own numeric format. Callers loading that text-only component set `primary_file_rules=false`;
+/// primary-DiT admission retains the mismatch refusal.
+pub(crate) fn resolve_load_plan_for_component(
+    spec: &LoadSpec,
+    root: &Path,
+    id: &str,
+    primary_file_rules: bool,
+) -> Result<ResolvedLoadPlan> {
     // Parse the marker even without a quantization override. Contract construction, admission, and
     // loading must all reject the same malformed/unreadable packed snapshot instead of letting rung 4
     // advertise a source the generator cannot subsequently load.
@@ -705,10 +723,7 @@ pub(crate) fn resolve_load_plan(
         }
         None => None,
     };
-    if matches!(spec.weights, WeightsSource::File(_))
-        && packed_bits.is_some()
-        && requested_bits.is_none()
-    {
+    if primary_file_rules && packed_bits.is_some() && requested_bits.is_none() {
         return Err(Error::Msg(format!(
             "{id}: imported single-file weights have no quant request, but the companion snapshot is pre-quantized Q{}; request the matching tier or stage a dense companion snapshot",
             packed_bits.expect("checked Some")

@@ -325,7 +325,8 @@ fn build_native_krea_control_from_spec(spec: &LoadSpec) -> Result<KreaTurboContr
         .weights_file_pin()?
         .expect("File weights must resolve to a pin");
     let base = require_base_snapshot(spec, KREA_2_TURBO_CONTROL_ID)?.to_path_buf();
-    let text_load_plan = crate::model::resolve_load_plan(spec, &base, KREA_2_TURBO_CONTROL_ID)?;
+    let text_load_plan =
+        crate::model::resolve_load_plan_for_component(spec, &base, KREA_2_TURBO_CONTROL_ID, false)?;
     let pinned_control =
         match require_control(spec, KREA_2_TURBO_CONTROL_ID, "Krea 2 pose control overlay")? {
             WeightsSource::File(path) => Some(spec.file_pin_for(path)?),
