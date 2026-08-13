@@ -12,7 +12,7 @@ use mlx_rs::error::Exception;
 use mlx_rs::fast::{layer_norm, rms_norm};
 use mlx_rs::nn::gelu;
 use mlx_rs::ops::{add, concatenate_axis, multiply, power, split, tanh};
-use mlx_rs::transforms::compile::compile;
+use mlx_rs::transforms::compile::{compile, compile_retained};
 use mlx_rs::{Array, Dtype};
 use std::cell::Cell;
 
@@ -34,6 +34,43 @@ const RMS_EPS: f32 = 1e-5;
 use mlx_gen::nn::compile_glue;
 pub use mlx_gen::nn::{set_compile_glue, CompileGlueGuard};
 
+const SITE_GELU_FFN: &str = "flux::transformer::gelu_ffn";
+
+fn gelu_ffn_impl(x: &Array) -> std::result::Result<Array, Exception> {
+    let dt = x.dtype();
+    let s = |v: f32| -> std::result::Result<Array, Exception> { scalar(v).as_dtype(dt) };
+    let c = (2.0_f64 / std::f64::consts::PI).sqrt() as f32;
+    let x3 = power(x, Array::from_int(3))?;
+    let inner = multiply(&add(x, &multiply(&x3, &s(0.044_715)?)?)?, &s(c)?)?;
+    let gate = add(&tanh(&inner)?, &s(1.0)?)?;
+    multiply(&multiply(x, &s(0.5)?)?, &gate)
+}
+
+thread_local! {
+    static RETAINED_GELU_FFN: std::cell::RefCell<Option<mlx_gen::nn::RetainedUnary>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn retained_gelu_ffn(x: &Array) -> std::result::Result<Array, Exception> {
+    mlx_gen::nn::prepare_retained_compilation_thread();
+    RETAINED_GELU_FFN.with(|slot| {
+        slot.borrow_mut()
+            .get_or_insert_with(|| {
+                mlx_gen::nn::RetainedUnary::new(compile_retained(gelu_ffn_impl, true))
+            })
+            .call(SITE_GELU_FFN, x)
+    })
+}
+
+/// Exercise this crate's production retained handle once for the release memory audit.
+#[doc(hidden)]
+pub fn exercise_retained_compile_inventory(input: &Array) -> Result<()> {
+    let output = retained_gelu_ffn(input)?;
+    output.eval()?;
+    drop(output);
+    Ok(())
+}
+
 /// adaLN affine `normed·(1+scale)+shift` — FLUX.1 casts the `1` to `scale`'s dtype (bf16-coarse,
 /// sc-2787). Forwards to the shared [`mlx_gen::nn::modulate`].
 fn modulate(normed: &Array, scale: &Array, shift: &Array) -> Result<Array> {
@@ -50,18 +87,18 @@ fn gated(x: &Array, gate: &Array, y: &Array) -> Result<Array> {
 /// MLX fuses its ~8 elementwise ops into one kernel. Off ⇒ defers to the core `gelu_tanh`.
 fn gelu_ffn(x: &Array) -> Result<Array> {
     if !compile_glue() {
+        mlx_gen::diagnostics::record_fallback(SITE_GELU_FFN, "compiled_glue_disabled");
         return gelu_tanh(x);
     }
-    let f = |x_: &Array| -> std::result::Result<Array, Exception> {
-        let dt = x_.dtype();
-        let s = |v: f32| -> std::result::Result<Array, Exception> { scalar(v).as_dtype(dt) };
-        let c = (2.0_f64 / std::f64::consts::PI).sqrt() as f32;
-        let x3 = power(x_, Array::from_int(3))?;
-        let inner = multiply(&add(x_, &multiply(&x3, &s(0.044_715)?)?)?, &s(c)?)?;
-        let gate = add(&tanh(&inner)?, &s(1.0)?)?;
-        multiply(&multiply(x_, &s(0.5)?)?, &gate)
-    };
-    Ok(compile(f, true)(x)?)
+    if mlx_gen::nn::retained_compilation_requested() {
+        Ok(retained_gelu_ffn(x)?)
+    } else {
+        mlx_gen::diagnostics::record_compile(
+            SITE_GELU_FFN,
+            mlx_gen::diagnostics::CompileDisposition::OneShot,
+        );
+        Ok(compile(gelu_ffn_impl, true)(x)?)
+    }
 }
 
 /// The complex RoPE rotation `(real + imag·i)·(cos + sin·i)` → `(out_real, out_imag)`, in f32.

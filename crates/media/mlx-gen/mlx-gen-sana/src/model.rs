@@ -83,6 +83,7 @@ const MAX_COUNT: u32 = 8;
 /// init latent. ControlNet conditioning is a separate, later variant.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
         denoiser_output_latent_space: Some(&mlx_gen::gen_core::SANA_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
@@ -163,6 +164,7 @@ pub fn descriptor() -> ModelDescriptor {
 /// is a dedicated few-step loop, so the curated epic-7114 sampler/scheduler menu is NOT advertised.
 pub fn sprint_descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
         denoiser_output_latent_space: Some(&mlx_gen::gen_core::SANA_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],

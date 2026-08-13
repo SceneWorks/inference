@@ -846,7 +846,7 @@ impl Flux1 {
         // selectable. FLUX feeds the raw schedule sigma as the transformer timestep (Sigma convention).
         // sc-2963: run the MMDiT's fusable elementwise glue (adaLN affine, gated residual, tanh-GELU
         // FFN, RoPE rotation) through `mx.compile` — bit-exact and a per-step win. Scoped to this
-        // render by the RAII guard (F-007): the process-global toggle is restored on drop, even on `?`.
+        // render by the RAII guard (F-007): the render thread's prior setting is restored on drop.
         let _compile_glue = crate::transformer::CompileGlueGuard::enable();
 
         let mut images = Vec::with_capacity(req.count as usize);

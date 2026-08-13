@@ -107,6 +107,7 @@ pub const MODEL_ID: &str = "wan2_2_ti2v_5b";
 /// Stable identity + advertised capabilities for the Wan2.2 TI2V-5B (dense text+image→video).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
         denoiser_output_latent_space: Some(&mlx_gen::gen_core::WAN_Z48_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
@@ -743,6 +744,7 @@ pub const MODEL_ID_T2V_14B: &str = "wan2_2_t2v_14b";
 /// Stable identity + advertised capabilities for the Wan2.2 T2V-A14B (dual-expert MoE text→video).
 pub fn descriptor_t2v_14b() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
         denoiser_output_latent_space: Some(&mlx_gen::gen_core::WAN_Z16_VIDEO_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
@@ -1695,6 +1697,7 @@ fn grid(cfg: &WanModelConfig) -> (u32, u32) {
 /// concat first frame) and the (3.5, 3.5) per-expert guidance.
 pub fn descriptor_i2v_14b() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
         denoiser_output_latent_space: Some(&mlx_gen::gen_core::WAN_Z16_VIDEO_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],

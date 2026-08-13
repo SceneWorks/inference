@@ -123,6 +123,62 @@ pub struct ModelRegistration {
     pub footprint: Option<fn(&LoadSpec) -> Result<PerComponentBytes>>,
 }
 
+/// The validated on-disk shape of a caller-owned model routed through a registered generator.
+///
+/// The shape is explicit because family identity alone cannot prove that a File, fused checkpoint,
+/// component directory, or ComfyUI tree is loadable by the same provider.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ImportedModelSource {
+    TransformerFile,
+    FusedCheckpoint,
+    TransformerDirectory,
+    ComfyUiTree,
+}
+
+/// The request surface selected for an imported source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ImportedModelOperation {
+    Generate,
+    Edit,
+    Pose,
+    MultiPhase,
+}
+
+/// Provider-owned route from one imported source shape and operation to the ordinary generator
+/// registration that actually validates and loads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImportedModelRegistration {
+    pub family: &'static str,
+    pub source: ImportedModelSource,
+    pub operation: ImportedModelOperation,
+    pub provider_id: &'static str,
+    /// Source-shape-specific staged components. When present, this replaces the ordinary
+    /// provider descriptor's component list because an imported loader can consume a different
+    /// artifact shape from the published snapshot loader (for example an SDXL fused checkpoint
+    /// still needs caller-staged tokenizer assets).
+    pub required_components: Option<&'static [&'static str]>,
+    /// Whether this source shape inherits the provider's LoRA/LoKr flags. Set false only for a
+    /// structural loader refusal that is narrower than the ordinary provider (for example a full
+    /// Mage fine-tune whose moved base weights cannot safely take an adapter fitted to the published
+    /// checkpoint).
+    pub inherit_adapters: bool,
+}
+
+/// Provider-owned encoder-contract alias for a real route assembled outside an ordinary
+/// [`ModelRegistration`].
+///
+/// Bespoke edit/control routes often reuse a registered base generator's prompt encoder while
+/// loading the denoiser through a platform-specific path.  The alias keeps that relationship in
+/// the inference composition root: callers resolve the authored route id and never need to know or
+/// hardcode which registered base provider owns its [`crate::EncoderContract`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EncoderContractRouteRegistration {
+    /// The externally routed provider id (for example a composed control route).
+    pub route_id: &'static str,
+    /// The ordinary registered generator whose descriptor is the sole contract oracle.
+    pub provider_id: &'static str,
+}
+
 /// Optional, pre-load memory-strategy contract registration for one provider route id.
 ///
 /// Kept separate from [`ModelRegistration`] so every existing provider remains source-compatible:
@@ -297,6 +353,8 @@ pub struct AudioEmbedderRegistration {
 #[derive(Default)]
 pub struct ProviderRegistryBuilder {
     generators: Vec<ModelRegistration>,
+    imported_models: Vec<ImportedModelRegistration>,
+    encoder_contract_routes: Vec<EncoderContractRouteRegistration>,
     memory_strategy: Vec<MemoryRegistration>,
     memory_contract_fixture: Vec<MemoryContractFixtureRegistration>,
     memory_behavior: Vec<MemoryBehaviorRegistration>,
@@ -330,6 +388,16 @@ impl ProviderRegistryBuilder {
     }
 
     builder_registration_method!(register_generator, generators, ModelRegistration);
+    builder_registration_method!(
+        register_imported_model,
+        imported_models,
+        ImportedModelRegistration
+    );
+    builder_registration_method!(
+        register_encoder_contract_route,
+        encoder_contract_routes,
+        EncoderContractRouteRegistration
+    );
     builder_registration_method!(
         register_activation_memory,
         activation_memory,
@@ -430,6 +498,113 @@ impl ProviderRegistryBuilder {
             }};
         }
         ensure_unique!(generators, "generator");
+        {
+            let mut route_ids = std::collections::BTreeSet::new();
+            for registration in &self.encoder_contract_routes {
+                if !is_registry_ident(registration.route_id) {
+                    return Err(Error::Msg(
+                        "encoder-contract route id must be a non-empty lowercase registry identifier"
+                            .to_owned(),
+                    ));
+                }
+                if !route_ids.insert(registration.route_id) {
+                    return Err(Error::Msg(format!(
+                        "duplicate encoder-contract route id '{}'",
+                        registration.route_id
+                    )));
+                }
+            }
+            for registration in &self.encoder_contract_routes {
+                if self
+                    .generators
+                    .iter()
+                    .any(|generator| (generator.descriptor)().id == registration.route_id)
+                {
+                    return Err(Error::Msg(format!(
+                        "encoder-contract route '{}' shadows a registered generator",
+                        registration.route_id
+                    )));
+                }
+                let Some(descriptor) = self
+                    .generators
+                    .iter()
+                    .map(|generator| (generator.descriptor)())
+                    .find(|descriptor| descriptor.id == registration.provider_id)
+                else {
+                    return Err(Error::Msg(format!(
+                        "encoder-contract route '{}' targets unregistered generator '{}'",
+                        registration.route_id, registration.provider_id
+                    )));
+                };
+                if descriptor.encoder_contract.is_none() {
+                    return Err(Error::Msg(format!(
+                        "encoder-contract route '{}' targets generator '{}' with no encoder contract",
+                        registration.route_id, registration.provider_id
+                    )));
+                }
+            }
+        }
+        {
+            let mut routes = std::collections::BTreeSet::new();
+            for registration in &self.imported_models {
+                if !is_registry_ident(registration.family) {
+                    return Err(Error::Msg(
+                        "imported-model route family must be a non-empty lowercase registry identifier"
+                            .to_owned(),
+                    ));
+                }
+                if let Some(required) = registration.required_components {
+                    if required.is_empty() {
+                        return Err(Error::Msg(format!(
+                            "imported-model route '{}'/{:?}/{:?} declares an empty required-components override; use None instead",
+                            registration.family, registration.source, registration.operation
+                        )));
+                    }
+                    let mut component_ids = std::collections::BTreeSet::new();
+                    for component in required {
+                        if component.is_empty() || component.chars().any(char::is_whitespace) {
+                            return Err(Error::Msg(format!(
+                                "imported-model route '{}'/{:?}/{:?} has an empty or whitespace-padded required component",
+                                registration.family, registration.source, registration.operation
+                            )));
+                        }
+                        if !component_ids.insert(*component) {
+                            return Err(Error::Msg(format!(
+                                "imported-model route '{}'/{:?}/{:?} repeats required component '{}'",
+                                registration.family,
+                                registration.source,
+                                registration.operation,
+                                component
+                            )));
+                        }
+                    }
+                }
+                let key = (
+                    registration.family,
+                    registration.source,
+                    registration.operation,
+                );
+                if !routes.insert(key) {
+                    return Err(Error::Msg(format!(
+                        "duplicate imported-model route for family '{}' ({:?}/{:?})",
+                        registration.family, registration.source, registration.operation
+                    )));
+                }
+                if !self
+                    .generators
+                    .iter()
+                    .any(|generator| (generator.descriptor)().id == registration.provider_id)
+                {
+                    return Err(Error::Msg(format!(
+                        "imported-model route '{}'/{:?}/{:?} targets unregistered generator '{}'",
+                        registration.family,
+                        registration.source,
+                        registration.operation,
+                        registration.provider_id
+                    )));
+                }
+            }
+        }
         {
             let mut ids = std::collections::BTreeSet::new();
             for registration in &self.activation_memory {
@@ -541,6 +716,8 @@ impl ProviderRegistryBuilder {
 
         Ok(ProviderRegistry {
             generators: self.generators.into_boxed_slice(),
+            imported_models: self.imported_models.into_boxed_slice(),
+            encoder_contract_routes: self.encoder_contract_routes.into_boxed_slice(),
             memory_strategy: self.memory_strategy.into_boxed_slice(),
             memory_contract_fixture: self.memory_contract_fixture.into_boxed_slice(),
             memory_behavior: self.memory_behavior.into_boxed_slice(),
@@ -563,6 +740,8 @@ impl ProviderRegistryBuilder {
 /// An immutable, explicit catalog of generative-media providers.
 pub struct ProviderRegistry {
     generators: Box<[ModelRegistration]>,
+    imported_models: Box<[ImportedModelRegistration]>,
+    encoder_contract_routes: Box<[EncoderContractRouteRegistration]>,
     memory_strategy: Box<[MemoryRegistration]>,
     memory_contract_fixture: Box<[MemoryContractFixtureRegistration]>,
     memory_behavior: Box<[MemoryBehaviorRegistration]>,
@@ -606,6 +785,69 @@ macro_rules! explicit_registry_kind {
 }
 
 impl ProviderRegistry {
+    /// Resolve the encoder contract for an ordinary generator or an explicitly registered bespoke
+    /// route. Unknown routes, and ordinary generators that do not support substitution, return
+    /// `None`; aliases are validated at registry construction and cannot target another alias or a
+    /// provider without a contract.
+    pub fn provider_encoder_contract(&self, id: &str) -> Option<crate::EncoderContract> {
+        if let Some(descriptor) = self
+            .generators
+            .iter()
+            .map(|registration| (registration.descriptor)())
+            .find(|descriptor| descriptor.id == id)
+        {
+            return descriptor.encoder_contract;
+        }
+        let provider_id = self
+            .encoder_contract_routes
+            .iter()
+            .find(|registration| registration.route_id == id)?
+            .provider_id;
+        self.generators
+            .iter()
+            .map(|registration| (registration.descriptor)())
+            .find(|descriptor| descriptor.id == provider_id)?
+            .encoder_contract
+    }
+
+    /// Every provider-owned bespoke route participating in encoder-contract lookup.
+    pub fn encoder_contract_routes(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &EncoderContractRouteRegistration> {
+        self.encoder_contract_routes.iter()
+    }
+
+    /// Every provider-owned imported-source route in this explicit platform catalog.
+    pub fn imported_models(&self) -> impl ExactSizeIterator<Item = &ImportedModelRegistration> {
+        self.imported_models.iter()
+    }
+
+    /// Resolve an exact imported source shape and operation to the descriptor of the generator that
+    /// will actually load it. Missing is an explicit unsupported answer.
+    pub fn imported_model_descriptor(
+        &self,
+        family: &str,
+        source: ImportedModelSource,
+        operation: ImportedModelOperation,
+    ) -> Option<ModelDescriptor> {
+        let route = self.imported_models.iter().find(|route| {
+            route.family == family && route.source == source && route.operation == operation
+        })?;
+        let mut descriptor = self
+            .generators
+            .iter()
+            .find(|registration| (registration.descriptor)().id == route.provider_id)
+            .map(|registration| (registration.descriptor)())?;
+        if !route.inherit_adapters {
+            descriptor.capabilities.supports_lora = false;
+            descriptor.capabilities.supports_lokr = false;
+        }
+        if let Some(required_components) = route.required_components {
+            descriptor.required_components = required_components;
+        }
+        Some(descriptor)
+    }
+
     /// Provider-owned warm 1024² activation transient for `id`.
     /// `Ok(None)` is the compatibility-safe unmeasured state, including for a known platform-composed
     /// memory route with no standalone generator registration; genuinely unknown ids remain errors.
@@ -888,6 +1130,11 @@ pub fn model_descriptor_errors(d: &ModelDescriptor) -> Vec<String> {
         &ctx,
         &[("id", d.id), ("family", d.family), ("backend", d.backend)],
     );
+    if let Some(contract) = d.encoder_contract {
+        if let Err(error) = contract.validate_definition() {
+            errs.push(format!("{ctx}: {error}"));
+        }
+    }
     let caps = &d.capabilities;
     if caps.max_count == 0 {
         errs.push(format!(
@@ -1355,6 +1602,7 @@ mod tests {
 
     fn dummy_descriptor() -> ModelDescriptor {
         ModelDescriptor {
+            encoder_contract: None,
             denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
@@ -1397,6 +1645,7 @@ mod tests {
 
     fn dummy_delegated_descriptor() -> ModelDescriptor {
         ModelDescriptor {
+            encoder_contract: None,
             denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
@@ -1425,6 +1674,7 @@ mod tests {
     // read as ZERO — so the provider-owned split is what finds it.
     fn dummy_footprint_descriptor() -> ModelDescriptor {
         ModelDescriptor {
+            encoder_contract: None,
             denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
@@ -1471,6 +1721,7 @@ mod tests {
     #[cfg(unix)]
     fn prepared_callback_descriptor() -> ModelDescriptor {
         ModelDescriptor {
+            encoder_contract: None,
             denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
@@ -1564,6 +1815,7 @@ mod tests {
     // Multi-provider fixtures verify that independently named constants compose into one catalog.
     fn dummy_multi_gen_a_descriptor() -> ModelDescriptor {
         ModelDescriptor {
+            encoder_contract: None,
             denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
@@ -1577,6 +1829,7 @@ mod tests {
 
     fn dummy_multi_gen_b_descriptor() -> ModelDescriptor {
         ModelDescriptor {
+            encoder_contract: None,
             denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
@@ -1887,6 +2140,54 @@ mod tests {
         assert!(registry.trainers().next().is_none());
     }
 
+    #[test]
+    fn encoder_contract_route_registration_fails_closed() {
+        let missing_target = ProviderRegistryBuilder::new()
+            .register_encoder_contract_route(EncoderContractRouteRegistration {
+                route_id: "dummy_route",
+                provider_id: "missing_provider",
+            })
+            .build()
+            .err()
+            .expect("an encoder route cannot target an unregistered provider")
+            .to_string();
+        assert!(missing_target.contains("targets unregistered generator"));
+
+        let target_without_contract = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .register_encoder_contract_route(EncoderContractRouteRegistration {
+                route_id: "dummy_route",
+                provider_id: "dummy_test_model",
+            })
+            .build()
+            .err()
+            .expect("an encoder route cannot target a provider without a contract")
+            .to_string();
+        assert!(target_without_contract.contains("with no encoder contract"));
+
+        let duplicate = ProviderRegistryBuilder::new()
+            .register_encoder_contract_route(EncoderContractRouteRegistration {
+                route_id: "dummy_route",
+                provider_id: "missing_a",
+            })
+            .register_encoder_contract_route(EncoderContractRouteRegistration {
+                route_id: "dummy_route",
+                provider_id: "missing_b",
+            })
+            .build()
+            .err()
+            .expect("duplicate encoder routes must fail before resolution")
+            .to_string();
+        assert!(duplicate.contains("duplicate encoder-contract route id"));
+
+        let ordinary = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .build()
+            .unwrap();
+        assert_eq!(ordinary.provider_encoder_contract("dummy_test_model"), None);
+        assert_eq!(ordinary.provider_encoder_contract("unknown_route"), None);
+    }
+
     fn composed_memory_contract(_spec: &LoadSpec) -> Result<MemoryProviderContract> {
         Ok(MemoryProviderContract::compatibility_default(
             "dummy_composed_route",
@@ -2124,6 +2425,158 @@ mod tests {
             error.to_string(),
             "duplicate generator id 'dummy_test_model' in explicit registry"
         );
+    }
+
+    #[test]
+    fn imported_routes_are_exact_and_project_the_selected_provider() {
+        let registry = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .register_imported_model(ImportedModelRegistration {
+                family: "test",
+                source: ImportedModelSource::TransformerFile,
+                operation: ImportedModelOperation::Generate,
+                provider_id: "dummy_test_model",
+                required_components: Some(&["imported_component"]),
+                inherit_adapters: true,
+            })
+            .build()
+            .expect("exact imported route");
+
+        let selected = registry
+            .imported_model_descriptor(
+                "test",
+                ImportedModelSource::TransformerFile,
+                ImportedModelOperation::Generate,
+            )
+            .expect("registered shape and operation resolve");
+        assert_eq!(selected.id, "dummy_test_model");
+        assert_eq!(selected.required_components, &["imported_component"]);
+        assert!(registry
+            .imported_model_descriptor(
+                "test",
+                ImportedModelSource::FusedCheckpoint,
+                ImportedModelOperation::Generate,
+            )
+            .is_none());
+        assert!(registry
+            .imported_model_descriptor(
+                "test",
+                ImportedModelSource::TransformerFile,
+                ImportedModelOperation::Edit,
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn imported_route_can_withdraw_structurally_invalid_adapter_inheritance() {
+        fn adapter_descriptor() -> ModelDescriptor {
+            let mut descriptor = dummy_descriptor();
+            descriptor.id = "dummy_adapter_model";
+            descriptor.capabilities.supports_lora = true;
+            descriptor.capabilities.supports_lokr = true;
+            descriptor
+        }
+        fn adapter_load(_spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+            Ok(Box::new(DummyGen {
+                desc: adapter_descriptor(),
+            }))
+        }
+
+        let registry = ProviderRegistryBuilder::new()
+            .register_generator(ModelRegistration {
+                descriptor: adapter_descriptor,
+                load: adapter_load,
+                footprint: None,
+            })
+            .register_imported_model(ImportedModelRegistration {
+                family: "test",
+                source: ImportedModelSource::TransformerDirectory,
+                operation: ImportedModelOperation::Generate,
+                provider_id: "dummy_adapter_model",
+                required_components: None,
+                inherit_adapters: false,
+            })
+            .build()
+            .expect("structurally restricted imported route");
+
+        let ordinary = (registry.generators().next().unwrap().descriptor)();
+        assert!(ordinary.capabilities.supports_lora);
+        assert!(ordinary.capabilities.supports_lokr);
+        let imported = registry
+            .imported_model_descriptor(
+                "test",
+                ImportedModelSource::TransformerDirectory,
+                ImportedModelOperation::Generate,
+            )
+            .unwrap();
+        assert!(!imported.capabilities.supports_lora);
+        assert!(!imported.capabilities.supports_lokr);
+    }
+
+    #[test]
+    fn imported_routes_reject_duplicates_and_unknown_targets() {
+        let route = ImportedModelRegistration {
+            family: "test",
+            source: ImportedModelSource::TransformerFile,
+            operation: ImportedModelOperation::Generate,
+            provider_id: "dummy_test_model",
+            required_components: None,
+            inherit_adapters: true,
+        };
+        let duplicate = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .register_imported_model(route)
+            .register_imported_model(route)
+            .build()
+            .err()
+            .expect("duplicate route must fail")
+            .to_string();
+        assert!(
+            duplicate.contains("duplicate imported-model route"),
+            "{duplicate}"
+        );
+
+        let unknown = ProviderRegistryBuilder::new()
+            .register_imported_model(route)
+            .build()
+            .err()
+            .expect("unknown target must fail")
+            .to_string();
+        assert!(
+            unknown.contains("targets unregistered generator"),
+            "{unknown}"
+        );
+    }
+
+    #[test]
+    fn imported_routes_reject_malformed_family_and_component_metadata() {
+        let route = |family, required_components| ImportedModelRegistration {
+            family,
+            source: ImportedModelSource::TransformerFile,
+            operation: ImportedModelOperation::Generate,
+            provider_id: "dummy_test_model",
+            required_components,
+            inherit_adapters: true,
+        };
+        for malformed in [
+            route("", None),
+            route(" test", None),
+            route("Krea", None),
+            route("krea 2", None),
+            route("test", Some(&[])),
+            route("test", Some(&[""])),
+            route("test", Some(&["base snapshot"])),
+            route("test", Some(&["base_snapshot", "base_snapshot"])),
+        ] {
+            assert!(
+                ProviderRegistryBuilder::new()
+                    .register_generator(DUMMY_GENERATOR_REGISTRATION)
+                    .register_imported_model(malformed)
+                    .build()
+                    .is_err(),
+                "malformed imported metadata must fail registry construction"
+            );
+        }
     }
 
     #[test]
@@ -2923,6 +3376,7 @@ mod tests {
         // A stub audio generator that advertises VoiceEmbedding conditioning.
         let tts = DummyGen {
             desc: ModelDescriptor {
+                encoder_contract: None,
                 denoiser_output_latent_space: None,
                 control_kinds: None,
                 required_components: &[],
@@ -3055,6 +3509,52 @@ mod tests {
         assert!(model_descriptor_errors(&dummy_descriptor()).is_empty());
 
         let broken = ModelDescriptor {
+            encoder_contract: Some(crate::EncoderContract {
+                architecture: "qwen3",
+                hidden_size: 8,
+                intermediate_size: 12,
+                num_hidden_layers: 2,
+                num_attention_heads: 2,
+                num_key_value_heads: 3,
+                head_dim: 4,
+                vocab_size: 16,
+                output_width: 8,
+                loaded_hidden_layers: 2,
+                requires_final_norm: true,
+                requires_lm_head: false,
+                hidden_activation: "silu",
+                attention_dropout: crate::EncoderConfigFloat::new(0.0),
+                rms_norm_eps: crate::EncoderConfigFloat::new(1e-6),
+                qk_norm_eps: Some(crate::EncoderConfigFloat::new(1e-6)),
+                rope_theta: crate::EncoderConfigFloat::new(1_000_000.0),
+                max_position_embeddings: 4_096,
+                attention_bias: crate::EncoderConfigBool::Required(false),
+                tie_word_embeddings: crate::EncoderConfigBool::Required(true),
+                tokenizer: crate::EncoderTokenizerContract {
+                    family: "test-qwen3",
+                    binding: crate::EncoderTokenizerBinding::RetainBase,
+                    artifact_candidates: &["tokenizer/tokenizer.json"],
+                    required_tokens: &[],
+                },
+                prompt_executions: &[crate::EncoderPromptExecutionContract {
+                    purpose: "test",
+                    template: crate::EncoderPromptTemplate::QwenInstruct,
+                    add_special_tokens: true,
+                    length: crate::EncoderPromptLengthPolicy::RightTruncate { max_tokens: 8 },
+                    padding: crate::EncoderPromptPadding::None,
+                    prefix_trim: 0,
+                }],
+                bos_token_id: None,
+                eos_token_id: None,
+                image_token_id: None,
+                vision_start_token_id: None,
+                vision_end_token_id: None,
+                mrope_section: &[],
+                mrope_interleaved: None,
+                selected_hidden_layers: &[2],
+                packing: None,
+                dense_storage_dtype_probe: None,
+            }),
             denoiser_output_latent_space: None,
             control_kinds: None,
             // Blank + duplicate required-component ids (sc-13658) — unstageable / ambiguous keys.
@@ -3081,6 +3581,7 @@ mod tests {
         let has = |needle: &str| errs.iter().any(|e| e.contains(needle));
         assert!(has("id \"Bad Id\""), "{errs:?}");
         assert!(has("family \"\""), "{errs:?}");
+        assert!(has("invalid text encoder contract"), "{errs:?}");
         assert!(has("max_count is 0"), "{errs:?}");
         assert!(has("min_size 512 > max_size 256"), "{errs:?}");
         assert!(has("explicit-size multiple is 0"), "{errs:?}");
@@ -3098,6 +3599,7 @@ mod tests {
 
         // All-zero bounds report the Default-0 message (F-084), not the inverted-bounds one.
         let zeroed = ModelDescriptor {
+            encoder_contract: None,
             denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
@@ -3119,6 +3621,7 @@ mod tests {
     #[test]
     fn model_descriptor_errors_flags_conversation_history_flag_without_kind() {
         let half_wired = ModelDescriptor {
+            encoder_contract: None,
             denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
@@ -3158,6 +3661,7 @@ mod tests {
     #[test]
     fn audio_descriptor_with_zero_size_bounds_passes_sweep() {
         let audio = ModelDescriptor {
+            encoder_contract: None,
             denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
@@ -3205,6 +3709,7 @@ mod tests {
     fn visual_descriptor_with_invalid_size_bounds_still_fails_sweep() {
         // Video, zero bounds → the Default-0 footgun still fires.
         let video_zero = ModelDescriptor {
+            encoder_contract: None,
             denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
@@ -3228,6 +3733,7 @@ mod tests {
 
         // Image, inverted bounds → the inverted-bounds message still fires.
         let image_inverted = ModelDescriptor {
+            encoder_contract: None,
             denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
@@ -3251,6 +3757,7 @@ mod tests {
 
         // `Both` (emits image or video) is a visual modality too — zero bounds still fail.
         let both_zero = ModelDescriptor {
+            encoder_contract: None,
             denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],

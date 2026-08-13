@@ -24,6 +24,7 @@ mlx-gen-wan = { path = "../mlx-gen-wan" }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+sceneworks-gen-core-testkit = { workspace = true }
 # RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on
 # `Drop` — including out of a panicking test, which is the only path the old
 # `env::temp_dir().join(..)` + trailing `remove_dir_all` shape ever leaked on.

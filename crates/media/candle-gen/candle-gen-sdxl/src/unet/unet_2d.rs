@@ -12,6 +12,8 @@ use candle_gen::train::lora::{LoraHost, LoraLinear};
 use candle_nn as nn;
 use candle_nn::Module;
 
+use super::DenseGroupNorm;
+
 #[derive(Debug, Clone, Copy)]
 pub struct BlockConfig {
     pub out_channels: usize,
@@ -95,7 +97,7 @@ pub struct UNet2DConditionModel {
     down_blocks: Vec<UNetDownBlock>,
     mid_block: UNetMidBlock2DCrossAttn,
     up_blocks: Vec<UNetUpBlock>,
-    conv_norm_out: nn::GroupNorm,
+    conv_norm_out: DenseGroupNorm,
     conv_out: Conv2d,
     // SDXL `add_embedding` (`get_aug_embed`), loaded only for the InstantID inference path
     // ([`with_add_embedding`](UNet2DConditionModel::with_add_embedding)); the vendored UNet's plain
@@ -108,6 +110,42 @@ pub struct UNet2DConditionModel {
 }
 
 impl UNet2DConditionModel {
+    /// Fold the dense imported UNet's Linear target surface to Q4/Q8 while preserving additive
+    /// LoRA/LoKr residuals. Convolutions, norms, and residual factors remain dense.
+    pub(crate) fn quantize(
+        &mut self,
+        quant: candle_gen::gen_core::Quant,
+    ) -> candle_gen::Result<()> {
+        LoraHost::visit_lora_mut(self, &mut |linear| linear.quantize_base(quant))
+    }
+
+    /// CPU-stage a fused imported UNet, fold every advertised Linear directly onto `device`, then
+    /// migrate only the dense-kept convolution/norm surface. No complete dense UNet is ever built on
+    /// the accelerator before the packed tier exists.
+    pub(crate) fn quantize_onto(
+        &mut self,
+        quant: candle_gen::gen_core::Quant,
+        device: &Device,
+    ) -> candle_gen::Result<()> {
+        LoraHost::visit_lora_mut(self, &mut |linear| linear.quantize_base_onto(quant, device))?;
+        self.visit_conv_lora_mut(&mut |conv| conv.move_to_device(device).map_err(Into::into))?;
+        self.conv_norm_out.move_to_device(device)?;
+        for block in &mut self.down_blocks {
+            match block {
+                UNetDownBlock::Basic(block) => block.move_norms_to(device)?,
+                UNetDownBlock::CrossAttn(block) => block.move_norms_to(device)?,
+            }
+        }
+        self.mid_block.move_norms_to(device)?;
+        for block in &mut self.up_blocks {
+            match block {
+                UNetUpBlock::Basic(block) => block.move_norms_to(device)?,
+                UNetUpBlock::CrossAttn(block) => block.move_norms_to(device)?,
+            }
+        }
+        Ok(())
+    }
+
     pub fn new(
         vs: nn::VarBuilder,
         in_channels: usize,
@@ -267,7 +305,7 @@ impl UNet2DConditionModel {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let conv_norm_out = nn::group_norm(
+        let conv_norm_out = DenseGroupNorm::new(
             config.norm_num_groups,
             b_channels,
             config.norm_eps,

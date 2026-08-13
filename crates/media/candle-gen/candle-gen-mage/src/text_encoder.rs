@@ -91,6 +91,8 @@ impl MageTextEncoder {
                     num_heads: 16,
                     depth: 24,
                     out_hidden_size: 2560,
+                    norm_eps: 1e-6,
+                    rope_theta: 10_000.0,
                     patch_size: 16,
                     temporal_patch_size: 2,
                     spatial_merge_size: 2,

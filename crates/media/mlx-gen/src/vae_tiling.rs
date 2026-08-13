@@ -27,12 +27,13 @@ use mlx_rs::Array;
 /// **sc-12748 — this is now a narrow backstop, not the tiled-decode gate.** sc-12438 added this as an
 /// up-front refusal on MLX 0.31.2, where every way to *produce* an over-bound assembled output was
 /// broken: `pad` corrupted (~1.003× the bound), `conv3d` corrupted, and `from_slice`/`reshape(-1)`
-/// overflowed the flat `i32` size (MLX #3327). On this pin (0.32.0 fork `932beb4e` + the sc-12746
-/// copy-gate patch) all of those are fixed **except** `from_slice`: `mlx-gen/tests/mlx_write_bound_probe.rs`
-/// probe-verifies `pad`/`concat`/`conv3d`/`reshape(-1)`/`as_slice`/elementwise EXACT above `i32::MAX`, so
-/// the tiled `pad`-and-accumulate decode now renders past the bound (the refusal was lifted from
-/// [`tiled_decode`]). The residual is `mlx-rs`'s `Array::from_slice`, which still asserts
-/// `len == shape.product::<i32>()` (a fork-side bug).
+/// overflowed the flat `i32` size (MLX #3327). On this pin (0.32.0 fork `eb76c4ba` + the sc-12746
+/// copy-gate patch), the 2026-08-11 re-probe verifies `pad`/`concat`/`conv3d`/multi-dimensional
+/// reshape/`as_slice`/elementwise EXACT above `i32::MAX`, so the tiled `pad`-and-accumulate decode now
+/// renders past the bound (the refusal was lifted from [`tiled_decode`]). A single `reshape(-1)`
+/// dimension still raises, but `contiguous` deliberately uses the verified multi-dimensional path.
+/// `Array::from_slice` also remains i32-capped: it still asserts `len == shape.product::<i32>()` (a
+/// fork-side bug).
 ///
 /// **sc-12926 — status: retained latent tripwire, NO production caller.** When sc-12748 lifted the
 /// refusal it removed both call sites, so nothing in the decode paths invokes this today (they read
@@ -106,10 +107,12 @@ pub fn tiled_decode(
 
                 // sc-12748: the sc-12438 over-bound REFUSAL is RETIRED here. This assembly builds the
                 // full output only with `pad` (+`add`/`divide`/`maximum`) and reads it back through
-                // `contiguous`'s `reshape` + `as_slice` — and every one of those ops is probe-verified
-                // int64-safe above `i32::MAX` on this pin (`mlx-gen/tests/mlx_write_bound_probe.rs`: pad
-                // & concat EXACT via the sc-12746 copy-gate patch; reshape(-1)/as_slice/elementwise all
-                // correct). So a tiled decode whose *assembled* output crosses the bound now RENDERS
+                // `contiguous`'s multi-dimensional `reshape` + `as_slice` — and every operation in that
+                // path is probe-verified int64-safe above `i32::MAX` on this pin
+                // (`mlx-gen/tests/mlx_write_bound_probe.rs`: pad & concat EXACT via the sc-12746
+                // copy-gate patch; multi-dimensional reshape/as_slice/elementwise all correct; a single
+                // reshape(-1) dimension still raises). So a tiled decode whose *assembled* output now
+                // crosses the bound RENDERS
                 // correctly instead of erroring (validated end-to-end vs a below-bound reference in
                 // `tiled_decode_renders_over_bound_output` and the LTX real-weights render). The one
                 // path still i32-capped is a `from_slice` host→Array materialization, which this loop
@@ -318,7 +321,7 @@ mod tests {
 
     /// sc-12748: a tiled decode whose **assembled output crosses `i32::MAX`** now RENDERS (the sc-12438
     /// refusal is retired) and reads back correctly — the payoff of this slice, on the shared loop. Drives
-    /// the real `pad`-and-accumulate + `contiguous`(`reshape(-1)`)+`as_slice` path with a tiny
+    /// the real `pad`-and-accumulate + `contiguous`(multi-dimensional reshape)+`as_slice` path with a tiny
     /// position-dependent latent placed into an over-bound `out_h·out_w·3 > i32::MAX` output, and checks
     /// the placed voxels (sub-bound offsets) hold the identity-decoded values while the rest is zero.
     /// `#[ignore]`d — it allocates a ~2.19e9-element (8.7 GiB) output accumulator.

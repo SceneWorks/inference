@@ -34,16 +34,17 @@ use mlx_gen::runtime::AdapterSpec;
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::{
     resolve_flow_schedule, run_flow_sampler, CancelFlag, Error, LatentDecoder, PreviewSink,
-    Progress, Result, TimestepConvention,
+    Progress, Result, TimestepConvention, WeightsSource,
 };
 
 use std::path::Path;
 
 use std::cell::RefCell;
-use std::path::PathBuf;
 
 use crate::control::Krea2ControlBranch;
-use crate::loader::{load_text_encoder, load_transformer_with_stream, load_vision_tower};
+use crate::loader::{
+    load_text_encoder_from_source, load_transformer_with_stream, load_vision_tower_from_source,
+};
 use crate::multiphase::{PhaseSlice, ResolvedPhase};
 use crate::schedule::{dynamic_mu, krea_sigmas, turbo_sigmas, TURBO_MU};
 use crate::text_encoder::{
@@ -169,9 +170,9 @@ impl TurboOptions {
 pub struct KreaText {
     tok: KreaTokenizer,
     te: KreaTextEncoder,
-    /// Snapshot root, retained so the vision tower can be loaded lazily on the first grounded encode
-    /// (F-072) rather than eagerly for every variant.
-    root: PathBuf,
+    /// The checkpoint-coupled visual tower remains on the builtin multimodal source when the
+    /// language tower is substituted.
+    vision_encoder_source: mlx_gen::gen_core::ValidatedEncoderSource,
     /// Qwen3-VL vision tower for image-grounded (edit) encoding (epic 10871 P2). LAZY (F-072): `None`
     /// until the first `encode_grounded`/`run_vision`, so the Turbo/Raw t2i, img2img, and pose-control
     /// paths — which never ground on an image — pay neither its ~0.6 GB residency nor its load time,
@@ -186,10 +187,23 @@ impl KreaText {
     /// first grounded (edit) encode via [`Self::ensure_vision`].
     pub fn from_snapshot(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
+        let selected = crate::model::ENCODER_CONTRACT.source_for_load(
+            &mlx_gen::LoadSpec::new(WeightsSource::Dir(root.to_path_buf())),
+            root,
+        )?;
+        Self::from_snapshot_with_text_encoder(root, &selected)
+    }
+
+    pub(crate) fn from_snapshot_with_text_encoder(
+        root: &Path,
+        text_encoder_source: &mlx_gen::gen_core::ValidatedEncoderSource,
+    ) -> Result<Self> {
+        let vision_encoder_source = resolve_vision_encoder_source(root)?;
         Ok(Self {
-            tok: KreaTokenizer::from_snapshot(root)?,
-            te: load_text_encoder(root)?,
-            root: root.to_path_buf(),
+            tok: KreaTokenizer::from_validated_source(text_encoder_source)?,
+            te: text_encoder_source
+                .read_unchanged(|source| load_text_encoder_from_source(root, source))?,
+            vision_encoder_source,
             vision: RefCell::new(None),
         })
     }
@@ -199,6 +213,10 @@ impl KreaText {
     /// quant-target set — the monolithic `KreaPipeline::quantize` did `te` + `dit`, not the VAE/vision).
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
         self.te.quantize(bits)
+    }
+
+    pub(crate) fn materialize_weights(&self) -> Result<()> {
+        self.te.materialize_weights()
     }
 
     /// Encode a plain text prompt → the DiT text context `[1, n_tok, 12, 2560]` (the 12 selected
@@ -215,7 +233,10 @@ impl KreaText {
     /// never pay for it. Idempotent.
     pub fn ensure_vision(&self) -> Result<()> {
         if self.vision.borrow().is_none() {
-            let tower = load_vision_tower(&self.root)?;
+            let tower = read_validated_vision_source(
+                &self.vision_encoder_source,
+                load_vision_tower_from_source,
+            )?;
             *self.vision.borrow_mut() = Some(tower);
         }
         Ok(())
@@ -252,6 +273,24 @@ impl KreaText {
         let gv = self.run_vision(sources)?;
         self.encode_grounded_from_vision(&gv, prompt)
     }
+}
+
+fn resolve_vision_encoder_source(root: &Path) -> Result<mlx_gen::gen_core::ValidatedEncoderSource> {
+    crate::model::ENCODER_CONTRACT
+        .validate_source(&WeightsSource::Dir(root.join("text_encoder")))
+        .map_err(Into::into)
+}
+
+/// Validate the edit-only vision config/header contract immediately before the lazy backend read.
+fn read_validated_vision_source<T>(
+    source: &mlx_gen::gen_core::ValidatedEncoderSource,
+    read: impl FnOnce(&WeightsSource) -> Result<T>,
+) -> Result<T> {
+    source.validate_vision(
+        &crate::model::VISION_ENCODER_CONTRACT,
+        &crate::model::ENCODER_CONTRACT,
+    )?;
+    source.read_unchanged(read)
 }
 
 /// The **heavy render phase** of a Krea 2 pipeline (epic 10834 Phase 1, sc-11101): the single-stream
@@ -1926,6 +1965,33 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn language_only_snapshot_is_admitted_until_the_edit_only_vision_read() {
+        let fixture = tempfile::tempdir().unwrap();
+        gen_core_testkit::write_encoder_contract_fixture(
+            &fixture.path().join("text_encoder"),
+            crate::model::ENCODER_CONTRACT,
+        )
+        .unwrap();
+
+        let source = resolve_vision_encoder_source(fixture.path())
+            .expect("ordinary text construction must admit a language-valid vision-less snapshot");
+        let opened = Cell::new(false);
+        let error = read_validated_vision_source::<()>(&source, |_| {
+            opened.set(true);
+            Err(mlx_gen::Error::Msg(
+                "vision payload unexpectedly opened".into(),
+            ))
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("vision_config"), "{error}");
+        assert!(
+            !opened.get(),
+            "edit admission must fail before the vision payload loader runs"
+        );
+    }
+
     struct DecodeSpy {
         output: Array,
         calls: Cell<usize>,
@@ -1997,6 +2063,91 @@ mod tests {
 
     fn zero_velocity(x: &Array, _sigma: f32) -> Result<Array> {
         Ok(Array::zeros::<f32>(x.shape())?)
+    }
+
+    #[test]
+    fn public_snapshot_text_phase_rejects_the_wrong_encoder_before_tokenizer_open() {
+        let fixture = tempfile::tempdir().unwrap();
+        gen_core_testkit::write_encoder_contract_fixture(
+            &fixture.path().join("text_encoder"),
+            mlx_gen::gen_core::EncoderContract {
+                hidden_size: crate::model::ENCODER_CONTRACT.hidden_size + 1,
+                ..crate::model::ENCODER_CONTRACT
+            },
+        )
+        .unwrap();
+
+        let error = KreaText::from_snapshot(fixture.path())
+            .err()
+            .expect("an incompatible public snapshot must fail before loading the tokenizer")
+            .to_string();
+        assert!(error.contains("field hidden_size"), "{error}");
+        assert!(!error.contains("tokenizer"), "{error}");
+    }
+
+    #[test]
+    fn edit_vision_contract_rejects_missing_and_wrong_visual_surface_at_admission() {
+        let mut headers = crate::model::VISION_ENCODER_CONTRACT
+            .expected_headers()
+            .unwrap()
+            .into_iter()
+            .map(|(name, shape)| mlx_gen::gen_core::SafetensorsTensorHeader {
+                data_bytes: shape.iter().product::<usize>() as u64 * 2,
+                name,
+                dtype: mlx_gen::gen_core::weightsmeta::Dtype::F16,
+                shape,
+            })
+            .collect::<Vec<_>>();
+        headers.remove(0);
+        let error = crate::model::VISION_ENCODER_CONTRACT
+            .validate_tensor_headers(&headers, std::path::Path::new("missing-visual"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("visual.patch_embed.proj.weight"), "{error}");
+
+        let missing = tempfile::tempdir().unwrap();
+        gen_core_testkit::write_encoder_contract_fixture(
+            &missing.path().join("text_encoder"),
+            crate::model::ENCODER_CONTRACT,
+        )
+        .unwrap();
+        let source = crate::model::ENCODER_CONTRACT
+            .validate_source(&WeightsSource::Dir(missing.path().join("text_encoder")))
+            .unwrap();
+        let error = source
+            .validate_vision(
+                &crate::model::VISION_ENCODER_CONTRACT,
+                &crate::model::ENCODER_CONTRACT,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("vision_config"), "{error}");
+
+        let wrong = tempfile::tempdir().unwrap();
+        let component = wrong.path().join("text_encoder");
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
+            &component,
+            crate::model::ENCODER_CONTRACT,
+            crate::model::VISION_ENCODER_CONTRACT,
+        )
+        .unwrap();
+        let config_path = component.join("config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        config["vision_config"]["out_hidden_size"] =
+            serde_json::json!(crate::model::ENCODER_CONTRACT.hidden_size + 1);
+        std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let source = crate::model::ENCODER_CONTRACT
+            .validate_source(&WeightsSource::Dir(component))
+            .unwrap();
+        let error = source
+            .validate_vision(
+                &crate::model::VISION_ENCODER_CONTRACT,
+                &crate::model::ENCODER_CONTRACT,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("out_hidden_size"), "{error}");
     }
 
     #[test]

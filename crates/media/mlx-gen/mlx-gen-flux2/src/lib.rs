@@ -116,6 +116,7 @@ pub fn register_providers(
         .register_generator(model::DEV_EDIT_REGISTRATION)
         .register_memory_strategy(model::DEV_EDIT_MEMORY_REGISTRATION)
         .register_generator(model_control::DEV_CONTROL_REGISTRATION)
+        .register_memory_strategy(model_control::DEV_CONTROL_MEMORY_REGISTRATION)
 }
 
 /// Build the complete explicit MLX FLUX.2 provider catalog.

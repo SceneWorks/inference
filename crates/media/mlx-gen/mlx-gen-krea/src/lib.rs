@@ -161,6 +161,38 @@ pub fn register_providers(
             },
         })
         .register_memory_behavior(model_control::MEMORY_BEHAVIOR_REGISTRATION)
+        .register_imported_model(mlx_gen::gen_core::ImportedModelRegistration {
+            family: "krea_2",
+            source: mlx_gen::gen_core::ImportedModelSource::TransformerFile,
+            operation: mlx_gen::gen_core::ImportedModelOperation::Generate,
+            provider_id: KREA_2_TURBO_ID,
+            required_components: Some(&[mlx_gen::BASE_SNAPSHOT_COMPONENT]),
+            inherit_adapters: true,
+        })
+        .register_imported_model(mlx_gen::gen_core::ImportedModelRegistration {
+            family: "krea_2",
+            source: mlx_gen::gen_core::ImportedModelSource::TransformerFile,
+            operation: mlx_gen::gen_core::ImportedModelOperation::Edit,
+            provider_id: KREA_2_TURBO_EDIT_ID,
+            required_components: Some(&[mlx_gen::BASE_SNAPSHOT_COMPONENT]),
+            inherit_adapters: true,
+        })
+        .register_imported_model(mlx_gen::gen_core::ImportedModelRegistration {
+            family: "krea_2",
+            source: mlx_gen::gen_core::ImportedModelSource::TransformerFile,
+            operation: mlx_gen::gen_core::ImportedModelOperation::Pose,
+            provider_id: KREA_2_TURBO_CONTROL_ID,
+            required_components: Some(&[mlx_gen::BASE_SNAPSHOT_COMPONENT]),
+            inherit_adapters: true,
+        })
+        .register_imported_model(mlx_gen::gen_core::ImportedModelRegistration {
+            family: "krea_2",
+            source: mlx_gen::gen_core::ImportedModelSource::TransformerFile,
+            operation: mlx_gen::gen_core::ImportedModelOperation::MultiPhase,
+            provider_id: KREA_2_RAW_ID,
+            required_components: Some(&[mlx_gen::BASE_SNAPSHOT_COMPONENT]),
+            inherit_adapters: true,
+        })
         .register_trainer(training::TRAINER_REGISTRATION)
 }
 
@@ -189,6 +221,12 @@ mod explicit_registry_tests {
             std::fs::create_dir_all(&dir).unwrap();
             write_minimal_safetensors(&dir.join("model.safetensors"));
         }
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            crate::model::ENCODER_CONTRACT,
+            crate::model::VISION_ENCODER_CONTRACT,
+        )
+        .expect("validation-complete text encoder fixture");
         root
     }
 
@@ -254,13 +292,40 @@ mod explicit_registry_tests {
                 .footprint(id, &base_spec)
                 .unwrap()
                 .unwrap_or_else(|| panic!("{id} must expose a footprint"));
+            let selected = crate::model::ENCODER_CONTRACT
+                .source_for_load(&base_spec, &base)
+                .unwrap();
+            let language = crate::model::selected_language_resident_bytes(
+                &selected,
+                crate::model::native_text_encoder_expected_quant_bits(&base).unwrap(),
+                id,
+            )
+            .unwrap();
+            let vision = if matches!(id, "krea_2_edit" | "krea_2_turbo_edit") {
+                let builtin = crate::model::ENCODER_CONTRACT
+                    .validate_source_against_base(
+                        &mlx_gen::WeightsSource::Dir(base.join("text_encoder")),
+                        &base,
+                    )
+                    .unwrap();
+                let headers = builtin
+                    .materialized_vision_tensor_headers(
+                        &crate::model::VISION_ENCODER_CONTRACT,
+                        &crate::model::ENCODER_CONTRACT,
+                    )
+                    .unwrap();
+                mlx_gen::asset_facts::projected_tensor_headers_bytes(&headers, |_| {
+                    mlx_gen::asset_facts::ResidentProjection::Stored
+                })
+                .unwrap()
+            } else {
+                0
+            };
+            assert_eq!(footprint.text_encoder, language + vision, "{id}");
+            assert_eq!(footprint.dit, mlx_gen::safetensors_path_bytes(&dit), "{id}");
             assert_eq!(
-                footprint,
-                mlx_gen::PerComponentBytes {
-                    text_encoder: mlx_gen::safetensors_path_bytes(base.join("text_encoder")),
-                    dit: mlx_gen::safetensors_path_bytes(&dit),
-                    vae: mlx_gen::safetensors_path_bytes(base.join("vae")),
-                },
+                footprint.vae,
+                mlx_gen::safetensors_path_bytes(base.join("vae")),
                 "{id}"
             );
             let contract = registry
@@ -318,7 +383,7 @@ mod explicit_registry_tests {
     }
 
     #[test]
-    fn every_registered_file_route_rejects_unrealized_typed_fields() {
+    fn every_registered_file_route_rejects_unrealized_fields_and_accepts_selected_encoder() {
         let tmp = tempfile::tempdir().unwrap();
         let registry = super::provider_registry().unwrap();
         let base = snapshot(&tmp, "registry-file-typed-fields");
@@ -326,6 +391,12 @@ mod explicit_registry_tests {
         let control = tmp.path().join("control.safetensors");
         write_minimal_safetensors(&dit);
         write_minimal_safetensors(&control);
+        let external_text_encoder = tmp.path().join("external-text-encoder");
+        gen_core_testkit::write_encoder_contract_fixture(
+            &external_text_encoder,
+            crate::model::ENCODER_CONTRACT,
+        )
+        .expect("validation-complete selected text encoder fixture");
         let base_spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::File(dit))
             .with_component(
                 mlx_gen::BASE_SNAPSHOT_COMPONENT,
@@ -366,22 +437,17 @@ mod explicit_registry_tests {
             );
 
             let mut text_encoder = route_spec;
-            text_encoder.text_encoder = Some(mlx_gen::WeightsSource::File(
-                tmp.path().join("external-te.safetensors"),
-            ));
-            let error = registry
+            text_encoder.text_encoder =
+                Some(mlx_gen::WeightsSource::Dir(external_text_encoder.clone()));
+            registry
                 .load(id, &text_encoder)
-                .err()
-                .expect("text_encoder field must be rejected")
-                .to_string();
-            assert!(error.contains("text-encoder"), "{id}: {error}");
-            let contract_error = registry
-                .memory_strategy_contract(id, &text_encoder)
-                .expect_err("text_encoder field must be rejected by the memory contract")
-                .to_string();
+                .unwrap_or_else(|error| panic!("{id}: selected text encoder rejected: {error}"));
             assert!(
-                contract_error.contains("text-encoder"),
-                "{id}: {contract_error}"
+                registry
+                    .memory_strategy_contract(id, &text_encoder)
+                    .unwrap_or_else(|error| panic!("{id}: selected contract rejected: {error}"))
+                    .is_some(),
+                "{id} must retain its memory contract with a compatible selected encoder"
             );
         }
     }

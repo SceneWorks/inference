@@ -14,11 +14,12 @@
 use mlx_rs::{
     module::Param,
     nn::{Linear, QuantizedLinear},
-    ops::{add, addmm, einsum, kron, matmul, multiply, quantized_matmul},
+    ops::{add, addmm, einsum, kron, matmul, multiply},
     Array, Dtype,
 };
 
 use crate::array::scalar;
+use crate::nn::quantized_matmul_with_bias;
 use crate::Result;
 
 pub mod loader;
@@ -510,19 +511,15 @@ impl LinearBase {
                 // feeding bf16 activations straight in matches the fork's own quantized compute dtype
                 // (bf16 latents → `quantized_matmul` → bf16), so it is strictly *more* faithful, not less.
                 // Weights stay Q4/Q8 throughout. (`q8_smoke.rs` exercises the bf16-activation path.)
-                let mut y = quantized_matmul(
+                quantized_matmul_with_bias(
                     x,
                     &q.inner.weight.value,
                     &q.scales.value,
                     &q.biases.value,
-                    true,
+                    q.inner.bias.value.as_ref(),
                     q.group_size,
                     q.bits,
-                )?;
-                if let Some(b) = q.inner.bias.value.as_ref() {
-                    y = add(&y, b)?;
-                }
-                y
+                )?
             }
         })
     }
@@ -634,6 +631,31 @@ impl AdaptableLinear {
             adapter.materialize()?;
         }
         Ok(())
+    }
+
+    /// Evaluate this linear's retained base and adapter arrays.  Each call is deliberately scoped to
+    /// one projection: load-time quantizers can invoke it while walking a model so MLX never has to
+    /// materialize the complete dense source model before retaining the packed Q4/Q8 result.
+    pub fn materialize_weights(&self) -> Result<()> {
+        match &self.base {
+            LinearBase::Dense(linear) => {
+                mlx_rs::transforms::eval(
+                    std::iter::once(&linear.weight.value).chain(linear.bias.value.iter()),
+                )?;
+            }
+            LinearBase::Quantized(quantized) => {
+                mlx_rs::transforms::eval(
+                    [
+                        &quantized.inner.weight.value,
+                        &quantized.scales.value,
+                        &quantized.biases.value,
+                    ]
+                    .into_iter()
+                    .chain(quantized.inner.bias.value.iter()),
+                )?;
+            }
+        }
+        self.materialize_adapters()
     }
 
     /// Merge a precomputed `[out, in]` delta into the dense base weight (`W += δ`) — the in-place
@@ -1019,6 +1041,12 @@ impl AdaptableConv2d {
     /// The conv weight's dtype — lets a forward stay dtype-following without assuming f32.
     pub fn weight_dtype(&self) -> Dtype {
         self.weight.dtype()
+    }
+
+    /// Evaluate this dense convolution without evaluating neighboring model weights.
+    pub fn materialize_weights(&self) -> Result<()> {
+        mlx_rs::transforms::eval(std::iter::once(&self.weight).chain(self.bias.iter()))?;
+        Ok(())
     }
 }
 

@@ -134,6 +134,61 @@ enum HeavyPhase {
 
 type Flux2Residency = candle_gen::Residency<TextPhase, HeavyPhase>;
 
+#[derive(Clone)]
+enum TextEncoderSource {
+    Trusted(WeightsSource),
+    Validated(Box<gen_core::ValidatedEncoderSource>),
+}
+
+impl TextEncoderSource {
+    fn load_vb(&self, dtype: DType, device: &Device) -> CResult<VarBuilder<'static>> {
+        match self {
+            Self::Trusted(source) => load_text_encoder_source(source, dtype, device),
+            Self::Validated(source) => {
+                source.read_unchanged(|weights| load_text_encoder_source(weights, dtype, device))
+            }
+        }
+    }
+
+    fn read_config_unchanged(&self) -> CResult<(PathBuf, Option<String>)> {
+        let read = |source: &WeightsSource| {
+            let path = match source {
+                WeightsSource::Dir(path) => path.join("config.json"),
+                WeightsSource::File(path) => path
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join("config.json"),
+            };
+            let text = match std::fs::read_to_string(&path) {
+                Ok(text) => Some(text),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => {
+                    return Err(CandleError::Msg(format!(
+                        "flux2: read {}: {error}",
+                        path.display()
+                    )))
+                }
+            };
+            Ok((path, text))
+        };
+        match self {
+            Self::Trusted(source) => read(source),
+            Self::Validated(source) => source.read_unchanged(read),
+        }
+    }
+}
+
+fn load_text_encoder_source(
+    source: &WeightsSource,
+    dtype: DType,
+    device: &Device,
+) -> CResult<VarBuilder<'static>> {
+    let path = match source {
+        WeightsSource::Dir(path) | WeightsSource::File(path) => path,
+    };
+    candle_gen::load_path_mmap(path, dtype, device, "flux2 text encoder")
+}
+
 #[cfg(test)]
 type ComfyuiDitLoadTestHook =
     Box<dyn FnMut(&candle_gen::candle_core::safetensors::MmapedSafetensors) -> CResult<()>>;
@@ -163,6 +218,7 @@ pub(crate) struct Pipeline {
     pub(crate) variant: Flux2Variant,
     pub(crate) cfg: Flux2Config,
     pub(crate) root: PathBuf,
+    text_encoder_source: TextEncoderSource,
     pub(crate) device: Device,
     pub(crate) dtype: DType,
     /// When `Some`, the DiT (and, for dev, the TE) is staged dense in CPU RAM and quantized onto
@@ -181,6 +237,7 @@ pub(crate) struct Pipeline {
 }
 
 impl Pipeline {
+    #[cfg(test)]
     pub(crate) fn load(
         variant: Flux2Variant,
         quant: Option<Quant>,
@@ -192,9 +249,33 @@ impl Pipeline {
             variant,
             cfg: variant.config(),
             root: root.to_path_buf(),
+            text_encoder_source: TextEncoderSource::Trusted(WeightsSource::Dir(
+                root.join("text_encoder"),
+            )),
             device: device.clone(),
             // FLUX.2 runs the reference math in f32 (the TE + the MMDiT). The weights are large but
             // the math is parity-sensitive; a bf16 pass is a follow-up optimization.
+            dtype: DType::F32,
+            quant,
+            pid_spec,
+            comfyui_dit: None,
+        }
+    }
+
+    pub(crate) fn load_with_text_encoder(
+        variant: Flux2Variant,
+        quant: Option<Quant>,
+        root: &Path,
+        text_encoder_source: gen_core::ValidatedEncoderSource,
+        device: &Device,
+        pid_spec: Option<PidWeights>,
+    ) -> Self {
+        Self {
+            variant,
+            cfg: variant.config(),
+            root: root.to_path_buf(),
+            text_encoder_source: TextEncoderSource::Validated(Box::new(text_encoder_source)),
+            device: device.clone(),
             dtype: DType::F32,
             quant,
             pid_spec,
@@ -223,12 +304,28 @@ impl Pipeline {
             variant: Flux2Variant::Dev,
             cfg: Flux2Variant::Dev.config(),
             root: root.to_path_buf(),
+            text_encoder_source: TextEncoderSource::Trusted(WeightsSource::Dir(
+                root.join("text_encoder"),
+            )),
             device: device.clone(),
             dtype: DType::F32,
             quant,
             pid_spec,
             comfyui_dit: Some(comfyui_dit),
         })
+    }
+
+    pub(crate) fn load_comfyui_with_text_encoder(
+        quant: Option<Quant>,
+        root: &Path,
+        text_encoder_source: gen_core::ValidatedEncoderSource,
+        device: &Device,
+        comfyui_dit: PinnedWeightsFile,
+        pid_spec: Option<PidWeights>,
+    ) -> CResult<Self> {
+        let mut pipeline = Self::load_comfyui(quant, root, device, comfyui_dit, pid_spec)?;
+        pipeline.text_encoder_source = TextEncoderSource::Validated(Box::new(text_encoder_source));
+        Ok(pipeline)
     }
 
     /// mmap a VarBuilder over every `.safetensors` in the snapshot subdir `sub`, on `self.device`.
@@ -243,6 +340,9 @@ impl Pipeline {
         sub: &str,
         device: &Device,
     ) -> CResult<VarBuilder<'static>> {
+        if sub == "text_encoder" {
+            return self.text_encoder_source.load_vb(self.dtype, device);
+        }
         candle_gen::component_vb(&self.root, sub, self.dtype, device, "flux2")
     }
 
@@ -259,19 +359,23 @@ impl Pipeline {
     /// path (wrong tier / missing weights, no diagnostic). A well-formed config with no `quantization`
     /// block is simply a dense tier → `Ok(false)`. Mirrors the F-073 fix (sc-9010) in qwen-edit / krea.
     pub(crate) fn component_is_packed(&self, sub: &str) -> CResult<bool> {
-        let path = self.root.join(sub).join("config.json");
-        let text = match std::fs::read_to_string(&path) {
-            Ok(t) => t,
-            // No config.json at all → legitimate dense/fixture snapshot, not packed.
-            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            // Present but unreadable (permissions, partial download) → surface, don't swallow.
-            Err(e) => {
-                return Err(CandleError::Msg(format!(
-                    "flux2: read {}: {e}",
-                    path.display()
-                )))
-            }
+        let (path, text) = if sub == "text_encoder" {
+            self.text_encoder_source.read_config_unchanged()?
+        } else {
+            let path = self.root.join(sub).join("config.json");
+            let text = match std::fs::read_to_string(&path) {
+                Ok(text) => Some(text),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => {
+                    return Err(CandleError::Msg(format!(
+                        "flux2: read {}: {error}",
+                        path.display()
+                    )))
+                }
+            };
+            (path, text)
         };
+        let Some(text) = text else { return Ok(false) };
         // Present but malformed JSON → corrupt snapshot, error rather than fall to dense.
         let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
             CandleError::Msg(format!(
@@ -579,16 +683,25 @@ impl Pipeline {
         } else {
             (QWEN_PAD_TOKEN_ID, ChatTemplate::QwenInstructNoThink)
         };
-        TextTokenizer::from_file(
-            self.root.join("tokenizer/tokenizer.json"),
-            TokenizerConfig {
-                max_length: self.cfg.max_sequence_length,
-                pad_token_id,
-                chat_template,
-                pad_to_max_length: true,
-            },
-        )
-        .map_err(|e| CandleError::Msg(format!("flux2: load tokenizer: {e}")))
+        let config = TokenizerConfig {
+            max_length: self.cfg.max_sequence_length,
+            pad_token_id,
+            chat_template,
+            pad_to_max_length: true,
+        };
+        let parse = |path: &Path| {
+            TextTokenizer::from_file(path, config)
+                .map_err(|e| CandleError::Msg(format!("flux2: load tokenizer: {e}")))
+        };
+        match &self.text_encoder_source {
+            TextEncoderSource::Validated(source) => source.read_tokenizer_unchanged(parse),
+            TextEncoderSource::Trusted(_) => self
+                .variant
+                .encoder_contract()
+                .tokenizer_for_base(&self.root)
+                .map_err(CandleError::from)?
+                .read_unchanged(parse),
+        }
     }
 
     /// Tokenize + encode the prompt to `prompt_embeds` `[1, 512, 3·hidden]` (f32). `tok` is the cached
@@ -1054,6 +1167,7 @@ impl Generator for Flux2Generator {
 /// Both: txt2img only (edit/Reference deferred to epic 6564 story 4), no LoRA, no on-the-fly quant.
 fn descriptor(variant: Flux2Variant) -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: Some(variant.encoder_contract()),
         denoiser_output_latent_space: Some(&candle_gen::gen_core::FLUX2_PACKED_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
@@ -1243,9 +1357,9 @@ pub(crate) fn validate_load_spec(
             "candle {id} does not support LoRA/LoKr yet"
         )));
     }
-    if spec.identity.is_some() || spec.text_encoder.is_some() {
+    if spec.identity.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
-            "candle {id} does not support identity or external text-encoder weights"
+            "candle {id} does not support identity weights"
         )));
     }
     // Both variants honor Q4/Q8 on-the-fly (CPU-stage dense → quantize-onto-GPU): dev folds the 32B DiT
@@ -1272,14 +1386,31 @@ fn load_variant_concrete(
     let id = variant.id();
     let quant = validate_load_spec(variant, spec)?;
     let root = gen_core::require_base_snapshot(spec, id)?.to_path_buf();
+    let text_encoder_source = variant.encoder_contract().source_for_load(spec, &root)?;
+    let expected_text_encoder_bits = variant.is_dev().then_some(quant).flatten().map(Quant::bits);
+    text_encoder_source.load_time_quant_bits(expected_text_encoder_bits, id)?;
     let device = candle_gen::default_device()?;
     let pipe = match &spec.weights {
-        WeightsSource::Dir(_) => Pipeline::load(variant, quant, &root, &device, spec.pid.clone()),
+        WeightsSource::Dir(_) => Pipeline::load_with_text_encoder(
+            variant,
+            quant,
+            &root,
+            text_encoder_source,
+            &device,
+            spec.pid.clone(),
+        ),
         WeightsSource::File(_) => {
             let dit = spec
                 .weights_file_pin()?
                 .expect("File weights must resolve to a pin");
-            Pipeline::load_comfyui(quant, &root, &device, dit, spec.pid.clone())?
+            Pipeline::load_comfyui_with_text_encoder(
+                quant,
+                &root,
+                text_encoder_source,
+                &device,
+                dit,
+                spec.pid.clone(),
+            )?
         }
     };
     generator_from_pipeline(pipe, Some(spec))
@@ -1335,7 +1466,19 @@ pub fn register_providers(
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
     let registry = registry
         .register_generator(KLEIN_REGISTRATION)
-        .register_generator(DEV_REGISTRATION);
+        .register_generator(DEV_REGISTRATION)
+        .register_encoder_contract_route(gen_core::EncoderContractRouteRegistration {
+            route_id: config::FLUX2_DEV_CONTROL_ID,
+            provider_id: config::FLUX2_DEV_ID,
+        })
+        .register_imported_model(gen_core::ImportedModelRegistration {
+            family: "flux2",
+            source: gen_core::ImportedModelSource::ComfyUiTree,
+            operation: gen_core::ImportedModelOperation::Generate,
+            provider_id: config::FLUX2_DEV_ID,
+            required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
+            inherit_adapters: true,
+        });
     #[cfg(feature = "cuda")]
     let registry = registry
         .register_memory_strategy(KLEIN_MEMORY_REGISTRATION)
@@ -1391,6 +1534,18 @@ mod explicit_registry_tests {
             .collect();
 
         assert_eq!(explicit, ["flux2_klein_9b", "flux2_dev"]);
+        assert_eq!(
+            registry.provider_encoder_contract(super::config::FLUX2_DEV_ID),
+            Some(super::config::DEV_ENCODER_CONTRACT)
+        );
+        assert_eq!(
+            registry.provider_encoder_contract(super::config::FLUX2_DEV_CONTROL_ID),
+            Some(super::config::DEV_ENCODER_CONTRACT)
+        );
+        assert_eq!(
+            registry.provider_encoder_contract("flux2_dev_control_typo"),
+            None
+        );
     }
 }
 
@@ -1399,6 +1554,27 @@ mod tests {
     use super::*;
     use crate::config::{FLUX2_DEV_ID, FLUX2_KLEIN_9B_ID};
     use candle_gen::gen_core::ConditioningKind;
+
+    fn write_valid_text_encoder(root: &Path, variant: Flux2Variant, quant: Option<Quant>) {
+        let quant_bits = if variant.is_dev() {
+            quant.map(|quant| quant.bits())
+        } else {
+            None
+        };
+        gen_core_testkit::write_encoder_contract_fixture_with_quant(
+            &root.join("text_encoder"),
+            variant.encoder_contract(),
+            quant_bits,
+        )
+        .unwrap();
+    }
+
+    fn valid_directory_spec(root: &Path, variant: Flux2Variant, quant: Option<Quant>) -> LoadSpec {
+        write_valid_text_encoder(root, variant, quant);
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root.to_path_buf()));
+        spec.quantize = quant;
+        spec
+    }
 
     #[test]
     fn comfyui_dit_entrypoint_postchecks_after_provider_payload_consumption() {
@@ -1546,32 +1722,25 @@ mod tests {
     #[test]
     fn auto_detected_packed_tier_is_the_generators_loaded_tier() {
         for (bits, expected) in [(4, Quant::Q4), (8, Quant::Q8)] {
-            let root_tmp = tempfile::tempdir().unwrap();
-            let root = root_tmp.path().to_path_buf();
-            let transformer = root.join("transformer");
-            std::fs::create_dir_all(&transformer).unwrap();
-            std::fs::write(
-                transformer.join("config.json"),
-                format!(r#"{{"quantization":{{"bits":{bits},"group_size":64}}}}"#),
-            )
-            .unwrap();
-            let mut spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
-            spec.load_shape = gen_core::LoadShape::DeferredMaterialization;
-            assert_eq!(
-                memory_strategy::resolved_quant(&spec).unwrap(),
-                Some(expected)
-            );
-            for (label, generator) in [
-                (
-                    "dev",
-                    load_variant_concrete(Flux2Variant::Dev, &spec).expect("lazy dev generator"),
-                ),
-                (
-                    "klein",
-                    load_variant_concrete(Flux2Variant::Klein9b, &spec)
-                        .expect("lazy Klein generator"),
-                ),
-            ] {
+            for (label, variant) in [("dev", Flux2Variant::Dev), ("klein", Flux2Variant::Klein9b)] {
+                let root_tmp = tempfile::tempdir().unwrap();
+                let root = root_tmp.path().to_path_buf();
+                write_valid_text_encoder(&root, variant, Some(expected));
+                let transformer = root.join("transformer");
+                std::fs::create_dir_all(&transformer).unwrap();
+                std::fs::write(
+                    transformer.join("config.json"),
+                    format!(r#"{{"quantization":{{"bits":{bits},"group_size":64}}}}"#),
+                )
+                .unwrap();
+                let mut spec = LoadSpec::new(WeightsSource::Dir(root));
+                spec.load_shape = gen_core::LoadShape::DeferredMaterialization;
+                assert_eq!(
+                    memory_strategy::resolved_quant(&spec).unwrap(),
+                    Some(expected)
+                );
+                let generator =
+                    load_variant_concrete(variant, &spec).expect("lazy FLUX.2 generator");
                 assert_eq!(
                     generator.pipe.quant,
                     Some(expected),
@@ -1609,8 +1778,8 @@ mod tests {
 
     #[test]
     fn registered_generator_requires_exact_safety_begin_configure_handshake() {
-        let mut spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from("/missing-flux2-dev")))
-            .with_quant(Quant::Q4);
+        let fixture = tempfile::tempdir().unwrap();
+        let mut spec = valid_directory_spec(fixture.path(), Flux2Variant::Dev, Some(Quant::Q4));
         spec.load_shape = gen_core::LoadShape::DeferredMaterialization;
         let generator = load_dev(&spec).expect("lazy dev generator");
         let contract = generator.memory_strategy_contract().unwrap().clone();
@@ -1757,7 +1926,8 @@ mod tests {
 
     #[test]
     fn registers_and_resolves_as_candle() {
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let fixture = tempfile::tempdir().unwrap();
+        let spec = valid_directory_spec(fixture.path(), Flux2Variant::Klein9b, None);
         let g = crate::provider_registry()
             .unwrap()
             .load(FLUX2_KLEIN_9B_ID, &spec)
@@ -1787,7 +1957,8 @@ mod tests {
 
     #[test]
     fn dev_registers_and_advertises_embedded_guidance_surface() {
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let fixture = tempfile::tempdir().unwrap();
+        let spec = valid_directory_spec(fixture.path(), Flux2Variant::Dev, None);
         let g = crate::provider_registry()
             .unwrap()
             .load(FLUX2_DEV_ID, &spec)
@@ -1815,7 +1986,8 @@ mod tests {
 
     #[test]
     fn validate_accepts_txt2img_and_rejects_unsupported() {
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let fixture = tempfile::tempdir().unwrap();
+        let spec = valid_directory_spec(fixture.path(), Flux2Variant::Klein9b, None);
         let g = crate::provider_registry()
             .unwrap()
             .load(FLUX2_KLEIN_9B_ID, &spec)
@@ -1878,13 +2050,11 @@ mod tests {
         ));
         let mut identity = LoadSpec::new(WeightsSource::Dir("/snap".into()));
         identity.identity = Some(IdentityWeights::default());
-        let mut external_text_encoder = LoadSpec::new(WeightsSource::Dir("/snap".into()));
-        external_text_encoder.text_encoder = Some(WeightsSource::Dir("/external-te".into()));
         let named_component = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_component(
             "unwired_component",
             WeightsSource::File("/component.bin".into()),
         );
-        for spec in [&identity, &external_text_encoder, &named_component] {
+        for spec in [&identity, &named_component] {
             assert!(matches!(
                 load_klein(spec).err().expect("unwired field must reject"),
                 gen_core::Error::Unsupported(_)
@@ -1892,13 +2062,30 @@ mod tests {
         }
         // klein (sc-11031) AND dev now accept Q4/Q8 on-the-fly (CPU-stage → quantize-onto-GPU): klein
         // folds only the 9B DiT (Qwen3 TE stays dense bf16, `te_quant`), dev folds the DiT + Mistral TE.
-        // The generator builds lazily, so load succeeds without touching the (nonexistent) weights.
-        let klein_q4 = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q4);
+        // The generator remains payload-lazy, but its selected encoder is admitted eagerly.
+        let klein_fixture = tempfile::tempdir().unwrap();
+        let klein_q4 =
+            valid_directory_spec(klein_fixture.path(), Flux2Variant::Klein9b, Some(Quant::Q4));
         assert!(load_klein(&klein_q4).is_ok());
-        let klein_q8 = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q8);
+        let klein_q8 =
+            valid_directory_spec(klein_fixture.path(), Flux2Variant::Klein9b, Some(Quant::Q8));
         assert!(load_klein(&klein_q8).is_ok());
-        let dev_quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q4);
+        let dev_fixture = tempfile::tempdir().unwrap();
+        let dev_quant =
+            valid_directory_spec(dev_fixture.path(), Flux2Variant::Dev, Some(Quant::Q4));
         assert!(load_dev(&dev_quant).is_ok());
+
+        let selected_fixture = tempfile::tempdir().unwrap();
+        let selected = selected_fixture.path().join("selected");
+        gen_core_testkit::write_encoder_contract_fixture(
+            &selected,
+            Flux2Variant::Klein9b.encoder_contract(),
+        )
+        .unwrap();
+        let mut external =
+            valid_directory_spec(selected_fixture.path(), Flux2Variant::Klein9b, None);
+        external.text_encoder = Some(WeightsSource::Dir(selected));
+        assert!(load_klein(&external).is_ok());
     }
 
     /// The loader's packed/dense routing decision (sc-9087): a component whose `config.json` carries a
@@ -1945,6 +2132,36 @@ mod tests {
             format!("{err}").contains("config.json"),
             "the error should name the offending file, got: {err}"
         );
+    }
+
+    #[test]
+    fn selected_text_encoder_config_read_retains_validation_receipt() {
+        let fixture = tempfile::tempdir().unwrap();
+        let selected_root = fixture.path().join("selected");
+        gen_core_testkit::write_encoder_contract_fixture(
+            &selected_root,
+            Flux2Variant::Klein9b.encoder_contract(),
+        )
+        .unwrap();
+        let selected = Flux2Variant::Klein9b
+            .encoder_contract()
+            .validate_source(&WeightsSource::Dir(selected_root.clone()))
+            .unwrap();
+        let pipe = Pipeline::load_with_text_encoder(
+            Flux2Variant::Klein9b,
+            None,
+            fixture.path(),
+            selected,
+            &Device::Cpu,
+            None,
+        );
+
+        std::fs::write(selected_root.join("config.json"), b"{}\n").unwrap();
+        let error = pipe
+            .component_is_packed("text_encoder")
+            .expect_err("the packed/dense decision must not reopen a changed selected config")
+            .to_string();
+        assert!(error.contains("changed after load"), "{error}");
     }
 
     /// The shared quantizable-loader's three device/dtype-selection regimes (the F-024 de-dup home,
@@ -2093,17 +2310,16 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("temp dir");
         let snapshot = dir.path().join("snapshot");
-        for component in ["text_encoder", "vae"] {
-            std::fs::create_dir_all(snapshot.join(component)).unwrap();
-            safetensors::save(
-                &HashMap::from([(
-                    "fixture.weight".to_string(),
-                    Tensor::zeros((2, 32), DType::F32, &Device::Cpu).unwrap(),
-                )]),
-                snapshot.join(component).join("model.safetensors"),
-            )
-            .unwrap();
-        }
+        write_valid_text_encoder(&snapshot, Flux2Variant::Dev, Some(Quant::Q8));
+        std::fs::create_dir_all(snapshot.join("vae")).unwrap();
+        safetensors::save(
+            &HashMap::from([(
+                "fixture.weight".to_string(),
+                Tensor::zeros((2, 32), DType::F32, &Device::Cpu).unwrap(),
+            )]),
+            snapshot.join("vae").join("model.safetensors"),
+        )
+        .unwrap();
         let dit = dir.path().join("flux2_dev_fp8mixed.safetensors");
         safetensors::save(
             &HashMap::from([(
@@ -2176,12 +2392,15 @@ mod tests {
     /// Image construction is lazy and the legacy load policy no longer selects lifecycle behavior.
     #[test]
     fn load_policy_is_not_a_residency_authority() {
-        let resident = LoadSpec::new(WeightsSource::Dir("/snap".into()));
-        let legacy_staged = LoadSpec::new(WeightsSource::Dir("/snap".into()))
-            .with_offload_policy(gen_core::OffloadPolicy::Sequential);
-        for spec in [&resident, &legacy_staged] {
-            assert!(load_dev(spec).is_ok());
-            assert!(load_klein(spec).is_ok());
+        for variant in [Flux2Variant::Dev, Flux2Variant::Klein9b] {
+            let fixture = tempfile::tempdir().unwrap();
+            let resident = valid_directory_spec(fixture.path(), variant, None);
+            let legacy_staged = resident
+                .clone()
+                .with_offload_policy(gen_core::OffloadPolicy::Sequential);
+            for spec in [&resident, &legacy_staged] {
+                assert!(load_variant_concrete(variant, spec).is_ok());
+            }
         }
     }
 

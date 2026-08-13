@@ -87,6 +87,12 @@ separate from P9's semantic decision because Wan can preserve its pre-existing p
 requires its own `Applied` receipt. Baseline and the fixed-tile control forbid all toggle terminal
 records.
 
+P1 is additionally bound to an exact operation inventory on every matrix case. Before each request,
+the runner clears MLX's compiler cache; every declared provider operation must then emit both a real
+`retained_miss` and a later `retained_hit`. Any missing/extra site, one-shot compile, or fallback
+invalidates that warmup or measurement. A generic Applied toggle receipt cannot stand in for this
+per-operation coverage.
+
 A baseline-only campaign remains available while optimization call sites are being integrated:
 
 ```sh
@@ -147,6 +153,24 @@ cargo run --release --locked -p runtime-macos --no-default-features --features p
   --bin mlx-perf-bench -- validate-results --results-dir /absolute/path/results-directory
 ```
 
-Legacy v1 directories have no frozen campaign and are rejected as unbound evidence.
+Legacy matrix/run/summary schema versions are rejected as unbound evidence.
 Run records without the real stored `summary.json` are also rejected: that file is the parent's
 finalization marker and is published only after every private snapshot was reverified and removed.
+
+Run the retained-handle memory audit from the same clean final-pin release executable used for the
+campaign:
+
+```sh
+cargo run --release --locked -p runtime-macos --no-default-features --features perf-bench \
+  --bin mlx-perf-bench -- retention-memory-audit
+```
+
+The command launches one fresh child process, verifies exact inference/mlx-rs build provenance, and
+executes all 25 retained handles (24 logical sites) twice before releasing every request tensor. A
+single-f32 drain then replaces the completed default Metal command buffer's shallow references to
+the last large input/output, so the final sample measures handle ownership rather than command-buffer
+retirement. Its JSON receipt binds that four-byte drain and contains the child PID, handle/site
+counts, baseline/input/retained active and cache measurements, aggregate retained growth, and the
+exact per-site miss/hit multiset. It fails if any constructor is absent from the inventory, any
+receipt is missing or extra, or aggregate retained active-plus-cache growth reaches one eighth of
+the released request allocation.

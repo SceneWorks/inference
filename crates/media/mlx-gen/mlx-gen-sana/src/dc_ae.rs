@@ -24,12 +24,12 @@
 //!    `repeat_interleave → pixel_shuffle`.
 
 use mlx_rs::ops::{
-    add, broadcast_to, concatenate_axis, conv2d as conv2d_op, divide, matmul, mean_axes, multiply,
-    split_sections, sum_axes,
+    add, broadcast_to, concatenate_axis, divide, matmul, mean_axes, multiply, split_sections,
+    sum_axes,
 };
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::nn::{silu, upsample_nearest};
+use mlx_gen::nn::{conv2d_general, silu, upsample_nearest};
 use mlx_gen::weights::Weights;
 use mlx_gen::{CancelFlag, Error, Result};
 
@@ -129,18 +129,15 @@ impl Conv {
     }
 
     fn forward(&self, x: &Array) -> Result<Array> {
-        let y = conv2d_op(
+        conv2d_general(
             x,
             &self.w,
+            self.b.as_ref(),
             (self.stride, self.stride),
             (self.padding, self.padding),
             (1, 1),
             self.groups,
-        )?;
-        match &self.b {
-            Some(b) => Ok(add(&y, b)?),
-            None => Ok(y),
-        }
+        )
     }
 }
 

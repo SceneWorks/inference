@@ -110,6 +110,19 @@ fn streamable_spec(spec: &LoadSpec) -> CoreResult<bool> {
         return Ok(false);
     };
     let dirs = resolve_component_dirs(root, spec)?;
+    streamable_resolved_components(spec, &dirs)
+}
+
+/// Whether the exact component directories selected by the loader can be reopened for bounded
+/// text/transformer residency.  Keeping this seam directory-based is load-bearing for imported
+/// fine-tunes: their `spec.weights` is already the transformer component directory, whereas the
+/// ordinary snapshot resolver would incorrectly append another `transformer/` child.
+fn streamable_resolved_components(spec: &LoadSpec, dirs: &MageComponentDirs) -> CoreResult<bool> {
+    if spec.load_shape != mlx_gen::LoadShape::DeferredMaterialization
+        || adapters_have_diff_patch(&spec.adapters)
+    {
+        return Ok(false);
+    }
     let bits = spec.quantize.map(Quant::bits);
     Ok(
         crate::pipeline::load_time_quant_bits(&dirs.text_encoder, bits, "mage_flow")?.is_none()
@@ -132,6 +145,16 @@ pub fn memory_strategy_contract_for_spec(
         ));
     };
     let dirs = resolve_component_dirs(root, spec)?;
+    memory_strategy_contract_for_resolved_components(provider_id, spec, &dirs)
+}
+
+/// Build the load-exact contract from the same already-resolved directories the executable loader
+/// consumes.  This avoids reinterpreting an imported TransformerDirectory as a snapshot root.
+fn memory_strategy_contract_for_resolved_components(
+    provider_id: &str,
+    spec: &LoadSpec,
+    dirs: &MageComponentDirs,
+) -> CoreResult<MemoryProviderContract> {
     let project =
         |path: &Path, select: &dyn Fn(&str) -> bool, apply_floor: bool| -> CoreResult<u64> {
             projected_safetensors_bytes(path, |tensor| {
@@ -159,7 +182,7 @@ pub fn memory_strategy_contract_for_spec(
         dit: project(&dirs.transformer, &crate::convert::is_dit_target, true)?,
         vae: project(&dirs.vae, &|_| false, false)?,
     };
-    let streamable = streamable_spec(spec)?;
+    let streamable = streamable_resolved_components(spec, dirs)?;
     Ok(memory_strategy_contract_with_adapters(
         provider_id,
         &spec.adapters,
@@ -430,6 +453,7 @@ const EDIT_IDENTITY_SHA256: &str =
 /// the published configs.
 pub fn descriptor_for(variant: MageVariant) -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
         denoiser_output_latent_space: Some(&mlx_gen::gen_core::MAGE_LATENT_SPACE),
         control_kinds: None,
         // The text encoder (8.875 GB) and VAE (0.345 GB) are BIT-IDENTICAL across all six Mage
@@ -498,6 +522,14 @@ pub fn load(variant: MageVariant, spec: &LoadSpec) -> Result<Box<dyn Generator>>
             ))
         }
     };
+    // A full Base fine-tune is the transformer component directory itself, not a published
+    // diffusers snapshot root. The exact imported-source registry route targets `mage_flow_base`,
+    // so dispatch that structural shape to the fine-tuned loader before published-checkpoint
+    // identity validation. Published snapshots keep both files under `transformer/` and therefore
+    // cannot collide with this gate.
+    if variant == MageVariant::Base && is_finetuned_transformer_dir(root) {
+        return load_finetuned(variant, spec);
+    }
     match variant {
         MageVariant::Base => verify_checkpoint_identity(
             root,
@@ -550,6 +582,20 @@ pub fn load(variant: MageVariant, spec: &LoadSpec) -> Result<Box<dyn Generator>>
     assemble(variant, spec, dirs)
 }
 
+fn is_finetuned_transformer_dir(root: &std::path::Path) -> bool {
+    ["config.json", "diffusion_pytorch_model.safetensors"]
+        .into_iter()
+        .all(|name| {
+            // Rehosted/Hugging Face snapshots commonly expose blob-backed symlink entries. The
+            // worker has already confined the resolved transformer directory; follow each child to
+            // verify the loader-visible object is a regular file instead of rejecting valid cache
+            // layouts solely because their directory entry is a symlink.
+            std::fs::metadata(root.join(name))
+                .map(|metadata| metadata.is_file())
+                .unwrap_or(false)
+        })
+}
+
 /// Construct a Mage-Flow generator from a caller-owned **fine-tuned transformer** (sc-15036,
 /// epic 14034 F6) — the artifact a full base fine-tune (sc-14056) writes.
 ///
@@ -573,9 +619,9 @@ pub fn load(variant: MageVariant, spec: &LoadSpec) -> Result<Box<dyn Generator>>
 ///    sampling regime (steps / CFG / distillation) and the edit-vs-generate input assembly the
 ///    fine-tune inherits.
 ///
-/// Deliberately kept off the registry `load(id, spec)` path (like Krea's
-/// `load_from_native_dit_file`): a fine-tune is a caller-owned artifact at an arbitrary path, not
-/// a published id, so it is reached through this explicit API rather than by resolving an id.
+/// Also reached by the exact `TransformerDirectory` imported-source registration. Ordinary
+/// `mage_flow_base` snapshot loads remain unchanged because their config and weights live under
+/// `transformer/`, while this shape has both files at the supplied root.
 pub fn load_finetuned(variant: MageVariant, spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     if spec.precision != Precision::Bf16 {
         return Err(Error::Unsupported(
@@ -639,6 +685,10 @@ fn assemble(
     spec: &LoadSpec,
     dirs: MageComponentDirs,
 ) -> Result<Box<dyn Generator>> {
+    // Compute the contract from the exact component directories selected above.  In particular, a
+    // fine-tune's transformer is `spec.weights` itself, not `<spec.weights>/transformer`.
+    let memory_strategy_contract =
+        memory_strategy_contract_for_resolved_components(variant.id(), spec, &dirs)?;
     let part = if variant.is_edit() {
         crate::vae::VaePart::Both
     } else {
@@ -671,7 +721,7 @@ fn assemble(
         variant,
         descriptor: descriptor_for(variant),
         tier: spec.quantize,
-        memory_strategy_contract: memory_strategy_contract_for_spec(variant.id(), spec)?,
+        memory_strategy_contract,
         residency,
     }))
 }
@@ -1452,6 +1502,33 @@ mage_memory_registration!(
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn finetuned_shape_accepts_blob_backed_symlink_entries() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let blobs = tmp.path().join("blobs");
+        let transformer = tmp.path().join("transformer");
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::create_dir_all(&transformer).unwrap();
+        std::fs::write(blobs.join("config"), b"{}").unwrap();
+        std::fs::write(blobs.join("weights"), b"safetensors").unwrap();
+        symlink(blobs.join("config"), transformer.join("config.json")).unwrap();
+        symlink(
+            blobs.join("weights"),
+            transformer.join("diffusion_pytorch_model.safetensors"),
+        )
+        .unwrap();
+
+        assert!(is_finetuned_transformer_dir(&transformer));
+        std::fs::remove_file(blobs.join("weights")).unwrap();
+        assert!(
+            !is_finetuned_transformer_dir(&transformer),
+            "a broken blob link must remain fail-closed"
+        );
+    }
+
     fn write_memory_safetensors(path: &Path, entries: &[(&str, &str, &[usize], usize)]) {
         let mut offset = 0usize;
         let mut header = serde_json::Map::new();
@@ -1485,6 +1562,42 @@ mod tests {
                 &[("probe", "BF16", &[1], 2)],
             );
         }
+    }
+
+    #[test]
+    fn finetuned_contract_projects_the_supplied_transformer_directory_itself() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transformer = tmp.path().join("trained-transformer");
+        let text_encoder = tmp.path().join("shared-text-encoder");
+        let vae = tmp.path().join("shared-vae");
+        for dir in [&transformer, &text_encoder, &vae] {
+            std::fs::create_dir_all(dir).unwrap();
+            write_memory_safetensors(
+                &dir.join("diffusion_pytorch_model.safetensors"),
+                &[("probe", "BF16", &[1], 2)],
+            );
+        }
+        std::fs::write(transformer.join("config.json"), "{}").unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(transformer.clone()))
+            .with_component(
+                COMPONENT_TEXT_ENCODER,
+                WeightsSource::Dir(text_encoder.clone()),
+            )
+            .with_component(COMPONENT_VAE, WeightsSource::Dir(vae.clone()));
+        let dirs = MageComponentDirs {
+            transformer: transformer.clone(),
+            text_encoder,
+            vae,
+        };
+
+        let contract =
+            memory_strategy_contract_for_resolved_components("mage_flow_base", &spec, &dirs)
+                .unwrap();
+
+        assert_eq!(contract.asset_facts.transformer_bytes, 2);
+        assert_eq!(contract.asset_facts.conditioning_bytes, 2);
+        assert_eq!(contract.asset_facts.decoder_bytes, 2);
+        assert!(!transformer.join("transformer").exists());
     }
 
     #[test]

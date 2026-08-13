@@ -16,26 +16,66 @@ use std::f64::consts::PI;
 
 use mlx_rs::error::Exception;
 use mlx_rs::ops::{add, concatenate_axis, multiply, split, subtract};
-use mlx_rs::transforms::compile::compile;
+use mlx_rs::transforms::compile::{compile, compile_retained};
 use mlx_rs::Array;
 
 use mlx_gen::{Error, Result};
+
+const SITE_ROPE_ROTATE: &str = "ltx::rope::rope_rotate";
+
+fn rope_rotate_impl(inp: &[Array]) -> std::result::Result<Vec<Array>, Exception> {
+    let (a, b, c, s) = (&inp[0], &inp[1], &inp[2], &inp[3]);
+    let out_first = subtract(&multiply(a, c)?, &multiply(b, s)?)?;
+    let out_second = add(&multiply(b, c)?, &multiply(a, s)?)?;
+    Ok(vec![out_first, out_second])
+}
+
+thread_local! {
+    static RETAINED_ROPE_ROTATE: std::cell::RefCell<Option<mlx_gen::nn::RetainedSlice>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn retained_rope_rotate(args: &[Array]) -> std::result::Result<Vec<Array>, Exception> {
+    mlx_gen::nn::prepare_retained_compilation_thread();
+    RETAINED_ROPE_ROTATE.with(|slot| {
+        slot.borrow_mut()
+            .get_or_insert_with(|| {
+                mlx_gen::nn::RetainedSlice::new(compile_retained(rope_rotate_impl, true))
+            })
+            .call(SITE_ROPE_ROTATE, args)
+    })
+}
+
+/// Exercise this module's production retained handle once for the release memory audit.
+#[doc(hidden)]
+pub fn exercise_retained_compile_inventory(input: &Array) -> Result<()> {
+    let args = [input.clone(), input.clone(), input.clone(), input.clone()];
+    let outputs = retained_rope_rotate(&args)?;
+    for output in &outputs {
+        output.eval()?;
+    }
+    drop(outputs);
+    Ok(())
+}
 
 /// The GPT-NeoX "rotate-halves" rotation `(first·cos − second·sin, second·cos + first·sin)` on the
 /// already-split f32 halves. Fused into one kernel when the sc-2963 glue toggle is on (vs 6 eager ops,
 /// applied to q and k every block — the dominant elementwise RoPE cost at video sequence). Bit-exact.
 fn rope_rotate(first: &Array, second: &Array, cos: &Array, sin: &Array) -> Result<(Array, Array)> {
-    let f = |inp: &[Array]| -> std::result::Result<Vec<Array>, Exception> {
-        let (a, b, c, s) = (&inp[0], &inp[1], &inp[2], &inp[3]);
-        let out_first = subtract(&multiply(a, c)?, &multiply(b, s)?)?;
-        let out_second = add(&multiply(b, c)?, &multiply(a, s)?)?;
-        Ok(vec![out_first, out_second])
-    };
     let args = [first.clone(), second.clone(), cos.clone(), sin.clone()];
     let mut out = if crate::compile_glue() {
-        compile(f, true)(&args)?
+        if mlx_gen::nn::retained_compilation_requested() {
+            retained_rope_rotate(&args)?
+        } else {
+            mlx_gen::diagnostics::record_compile(
+                SITE_ROPE_ROTATE,
+                mlx_gen::diagnostics::CompileDisposition::OneShot,
+            );
+            compile(rope_rotate_impl, true)(&args)?
+        }
     } else {
-        f(&args)?
+        mlx_gen::diagnostics::record_fallback(SITE_ROPE_ROTATE, "compiled_glue_disabled");
+        rope_rotate_impl(&args)?
     };
     let out_second = out.pop().unwrap();
     let out_first = out.pop().unwrap();

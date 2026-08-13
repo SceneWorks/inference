@@ -14,7 +14,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-pub const MATRIX_SCHEMA_VERSION: &str = "sceneworks.mlx-perf-matrix.v3";
+pub const MATRIX_SCHEMA_VERSION: &str = "sceneworks.mlx-perf-matrix.v4";
 pub const ARTIFACT_SCHEMA_VERSION: &str = "sceneworks.mlx-perf-artifacts.v2";
 pub const CAMPAIGN_SCHEMA_VERSION: &str = "sceneworks.mlx-perf-campaign.v2";
 pub const RUN_SCHEMA_VERSION: &str = "sceneworks.mlx-perf-run.v4";
@@ -172,6 +172,11 @@ pub struct WorkloadCase {
     pub id: String,
     pub family: BenchmarkFamily,
     pub provider: String,
+    /// Exact production retained-compile sites that P1 must exercise for this provider.
+    pub expected_p1_compile_operations: Vec<String>,
+    /// Exact production operation identities that P3 must apply at least once for this provider.
+    /// The request may additionally carry truthful per-shape fallback receipts.
+    pub expected_p3_exact_epilogue_operations: Vec<String>,
     pub artifact_key: String,
     pub repository: String,
     pub tier: ModelTier,
@@ -182,6 +187,59 @@ pub struct WorkloadCase {
     pub seed: u64,
     pub prompt: String,
     pub tiled_decode_control: TiledDecodeControl,
+}
+
+const WAN_P1_COMPILE_OPERATIONS: &[&str] = &[
+    "wan::rope::rope_rotate",
+    "wan::transformer::gated",
+    "wan::transformer::gelu_ffn",
+    "wan::transformer::modulate",
+];
+const QWEN_P1_COMPILE_OPERATIONS: &[&str] = &[
+    "qwen_image::attention::rope_rotate",
+    "qwen_image::block::gated",
+    "qwen_image::block::modulate",
+    "qwen_image::feed_forward::gelu_ffn",
+];
+const SDXL_P1_COMPILE_OPERATIONS: &[&str] = &[
+    "mlx_gen::nn::gelu_exact",
+    "mlx_gen::nn::gelu_quick",
+    "sdxl::silu_glue",
+];
+// These inventories cover the full request, not only denoise. Wan's staged UMT5/embed-text path
+// reaches the shared eager tanh-GELU helper, while SDXL's VAE reaches shared eager SiLU even though
+// its UNet SiLU glue is already compiled by P1.
+const WAN_P3_EXACT_EPILOGUE_OPERATIONS: &[&str] = &[
+    "conv2d_bias",
+    "conv3d_bias",
+    "gelu_tanh",
+    "quantized_matmul_bias",
+    "silu",
+];
+const QWEN_P3_EXACT_EPILOGUE_OPERATIONS: &[&str] = &[
+    "conv2d_bias",
+    "conv3d_bias",
+    "quantized_matmul_bias",
+    "silu",
+];
+const SDXL_P3_EXACT_EPILOGUE_OPERATIONS: &[&str] = &["conv2d_bias", "group_norm_affine", "silu"];
+
+fn expected_p1_compile_operations(provider: &str) -> Option<&'static [&'static str]> {
+    match provider {
+        "wan2_2_ti2v_5b" => Some(WAN_P1_COMPILE_OPERATIONS),
+        "qwen_image" => Some(QWEN_P1_COMPILE_OPERATIONS),
+        "sdxl" => Some(SDXL_P1_COMPILE_OPERATIONS),
+        _ => None,
+    }
+}
+
+fn expected_p3_exact_epilogue_operations(provider: &str) -> Option<&'static [&'static str]> {
+    match provider {
+        "wan2_2_ti2v_5b" => Some(WAN_P3_EXACT_EPILOGUE_OPERATIONS),
+        "qwen_image" => Some(QWEN_P3_EXACT_EPILOGUE_OPERATIONS),
+        "sdxl" => Some(SDXL_P3_EXACT_EPILOGUE_OPERATIONS),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -491,6 +549,30 @@ impl BenchmarkMatrix {
                 || case.repository.trim().is_empty()
             {
                 errors.push(format!("case {:?} has an empty identity field", case.id));
+            }
+            let expected_p1 = expected_p1_compile_operations(&case.provider);
+            let declared_p1: Vec<_> = case
+                .expected_p1_compile_operations
+                .iter()
+                .map(String::as_str)
+                .collect();
+            if expected_p1 != Some(declared_p1.as_slice()) {
+                errors.push(format!(
+                    "case {:?} must freeze the exact P1 compile-operation inventory for provider {:?}",
+                    case.id, case.provider
+                ));
+            }
+            let expected_p3 = expected_p3_exact_epilogue_operations(&case.provider);
+            let declared_p3: Vec<_> = case
+                .expected_p3_exact_epilogue_operations
+                .iter()
+                .map(String::as_str)
+                .collect();
+            if expected_p3 != Some(declared_p3.as_slice()) {
+                errors.push(format!(
+                    "case {:?} must freeze the exact P3 epilogue-operation inventory for provider {:?}",
+                    case.id, case.provider
+                ));
             }
             match self.artifact(&case.artifact_key) {
                 Some(artifact)
@@ -1666,7 +1748,77 @@ fn validate_geometry_decode_receipt(
     }
 }
 
+fn validate_exact_epilogue_receipts(
+    case: &WorkloadCase,
+    variant: &VariantPlan,
+    diagnostics: &[DiagnosticRecord],
+    errors: &mut Vec<String>,
+) {
+    let requested = variant
+        .toggles
+        .contains(&OptimizationToggle::ExactEpilogues);
+    let records: Vec<_> = diagnostics
+        .iter()
+        .filter(|record| record.domain == "exact_epilogue")
+        .collect();
+    if !requested {
+        if !records.is_empty() {
+            errors.push(format!(
+                "variant {:?} emitted exact_epilogue receipts without requesting P3",
+                variant.id
+            ));
+        }
+        return;
+    }
+
+    let expected: BTreeSet<_> = case
+        .expected_p3_exact_epilogue_operations
+        .iter()
+        .map(String::as_str)
+        .collect();
+    for record in &records {
+        if !expected.contains(record.site.as_str()) {
+            errors.push(format!(
+                "P3 case {:?} emitted an operation outside its exact inventory: {:?}",
+                case.id, record.site
+            ));
+        }
+        match record.outcome.as_str() {
+            "applied" if record.reason.is_none() => {}
+            "fallback" | "unavailable" if record.reason.is_some() => {}
+            outcome => errors.push(format!(
+                "P3 operation {:?} has an invalid {outcome:?} receipt/reason pairing",
+                record.site
+            )),
+        }
+    }
+
+    let actual_applied: BTreeSet<_> = records
+        .iter()
+        .filter(|record| record.outcome == "applied")
+        .map(|record| record.site.as_str())
+        .collect();
+    if actual_applied != expected {
+        errors.push(format!(
+            "P3 Applied receipts for case {:?} must exactly cover {:?}, got {:?}",
+            case.id, expected, actual_applied
+        ));
+    }
+    for operation in expected {
+        let applied: Vec<_> = records
+            .iter()
+            .filter(|record| record.site == operation && record.outcome == "applied")
+            .collect();
+        if applied.len() != 1 || applied[0].count == 0 || applied[0].reason.is_some() {
+            errors.push(format!(
+                "P3 operation {operation:?} requires one positive Applied receipt without a reason"
+            ));
+        }
+    }
+}
+
 fn validate_toggle_receipts(
+    case: &WorkloadCase,
     variant: &VariantPlan,
     diagnostics: &[DiagnosticRecord],
     errors: &mut Vec<String>,
@@ -1699,6 +1851,7 @@ fn validate_toggle_receipts(
         }
     }
     validate_geometry_decode_receipt(variant, diagnostics, errors);
+    validate_exact_epilogue_receipts(case, variant, diagnostics, errors);
     let all_on_p5_inactive = variant.id == "all_on"
         && geometry_decode_receipt(diagnostics)
             .is_some_and(|receipt| receipt.decode_path == PhysicalDecodePath::Dense);
@@ -1757,6 +1910,61 @@ fn validate_toggle_receipts(
             ));
         }
     }
+
+    if variant
+        .toggles
+        .contains(&OptimizationToggle::RetainedCompilation)
+    {
+        let expected: BTreeSet<_> = case
+            .expected_p1_compile_operations
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let compile_records: Vec<_> = diagnostics
+            .iter()
+            .filter(|record| record.domain == "compile")
+            .collect();
+        let actual: BTreeSet<_> = compile_records
+            .iter()
+            .map(|record| record.site.as_str())
+            .collect();
+        if actual != expected {
+            errors.push(format!(
+                "P1 compile receipts for case {:?} must exactly cover {:?}, got {:?}",
+                case.id, expected, actual
+            ));
+        }
+        if compile_records
+            .iter()
+            .any(|record| record.outcome == "one_shot" || record.reason.is_some())
+        {
+            errors.push(
+                "P1 forbids one-shot/fallback compile receipts when retention is requested"
+                    .to_owned(),
+            );
+        }
+        for site in expected {
+            for outcome in ["retained_miss", "retained_hit"] {
+                let records: Vec<_> = compile_records
+                    .iter()
+                    .filter(|record| record.site == site && record.outcome == outcome)
+                    .collect();
+                if records.len() != 1 || records[0].count == 0 || records[0].reason.is_some() {
+                    errors.push(format!(
+                        "P1 operation {site:?} requires one positive {outcome} receipt in every request"
+                    ));
+                }
+            }
+            if compile_records.iter().any(|record| {
+                record.site == site
+                    && !matches!(record.outcome.as_str(), "retained_miss" | "retained_hit")
+            }) {
+                errors.push(format!(
+                    "P1 operation {site:?} emitted a non-retained compile outcome"
+                ));
+            }
+        }
+    }
 }
 
 /// Validate one request's complete, aggregated diagnostic set against its selected variant.
@@ -1764,11 +1972,12 @@ fn validate_toggle_receipts(
 /// The runner applies this to warmups as well as measured repetitions so an unavailable or
 /// silently-fallback toggle aborts the campaign before it can consume the remaining matrix.
 pub fn validate_toggle_diagnostics(
+    case: &WorkloadCase,
     variant: &VariantPlan,
     diagnostics: &[DiagnosticRecord],
 ) -> Result<(), ContractError> {
     let mut errors = Vec::new();
-    validate_toggle_receipts(variant, diagnostics, &mut errors);
+    validate_toggle_receipts(case, variant, diagnostics, &mut errors);
     if errors.is_empty() {
         Ok(())
     } else {
@@ -1974,7 +2183,7 @@ impl RunRecord {
                 );
             }
             digests.insert(measurement.output.sha256.as_str());
-            validate_toggle_receipts(&self.variant, &measurement.diagnostics, &mut errors);
+            validate_toggle_receipts(case, &self.variant, &measurement.diagnostics, &mut errors);
         }
         if digests.len() > 1 {
             errors.push("measured outputs are not byte-stable for this case/variant".to_owned());
@@ -2430,11 +2639,14 @@ mod tests {
         (campaign, root)
     }
 
-    fn valid_run(campaign: &FrozenCampaign, case_id: &str, variant_id: &str) -> RunRecord {
-        let case = campaign.matrix.case(case_id).unwrap();
-        let artifact = campaign.artifact(&case.artifact_key).unwrap().clone();
-        let variant = campaign.matrix.variant(variant_id).unwrap().clone();
-        let mut diagnostics: Vec<DiagnosticRecord> = variant
+    /// Synthetic diagnostic fixture used only to exercise the frozen P6 contract. It must never
+    /// be serialized as benchmark evidence; real run records are produced only from provider
+    /// diagnostics in `mlx_perf_bench::measure_request`.
+    fn diagnostic_contract_fixture(
+        case: &WorkloadCase,
+        variant: &VariantPlan,
+    ) -> Vec<DiagnosticRecord> {
+        let mut diagnostics: Vec<_> = variant
             .toggles
             .iter()
             .filter(|toggle| {
@@ -2465,6 +2677,48 @@ mod tests {
                 production_evidence_sha256: None,
             });
         }
+        if variant
+            .toggles
+            .contains(&OptimizationToggle::RetainedCompilation)
+        {
+            for site in &case.expected_p1_compile_operations {
+                for (outcome, count) in [("retained_miss", 1), ("retained_hit", 7)] {
+                    diagnostics.push(DiagnosticRecord {
+                        domain: "compile".to_owned(),
+                        site: site.clone(),
+                        outcome: outcome.to_owned(),
+                        count,
+                        reason: None,
+                        decode_path: None,
+                        production_evidence_sha256: None,
+                    });
+                }
+            }
+        }
+        if variant
+            .toggles
+            .contains(&OptimizationToggle::ExactEpilogues)
+        {
+            for operation in &case.expected_p3_exact_epilogue_operations {
+                diagnostics.push(DiagnosticRecord {
+                    domain: "exact_epilogue".to_owned(),
+                    site: operation.clone(),
+                    outcome: "applied".to_owned(),
+                    count: 7,
+                    reason: None,
+                    decode_path: None,
+                    production_evidence_sha256: None,
+                });
+            }
+        }
+        diagnostics
+    }
+
+    fn valid_run(campaign: &FrozenCampaign, case_id: &str, variant_id: &str) -> RunRecord {
+        let case = campaign.matrix.case(case_id).unwrap();
+        let artifact = campaign.artifact(&case.artifact_key).unwrap().clone();
+        let variant = campaign.matrix.variant(variant_id).unwrap().clone();
+        let diagnostics = diagnostic_contract_fixture(case, &variant);
         let encode_ns = 1_000_000_000;
         let denoise_ns = 2_000_000_000;
         let decode_ns = 1_000_000_000;
@@ -2882,6 +3136,85 @@ mod tests {
             .to_string();
         assert!(error.contains("exactly one terminal Applied"));
         assert!(error.contains("unrequested toggle"));
+
+        let mut missing_operation = valid_run(&campaign, "qwen-q4-512", "retained_compilation");
+        missing_operation.measurements[0]
+            .diagnostics
+            .retain(|record| {
+                !(record.domain == "compile"
+                    && record.site == "qwen_image::attention::rope_rotate"
+                    && record.outcome == "retained_hit")
+            });
+        assert!(missing_operation
+            .validate_against(&campaign)
+            .unwrap_err()
+            .to_string()
+            .contains("requires one positive retained_hit"));
+
+        let mut one_shot = valid_run(&campaign, "qwen-q4-512", "retained_compilation");
+        one_shot.measurements[0].diagnostics.push(DiagnosticRecord {
+            domain: "compile".to_owned(),
+            site: "qwen_image::block::gated".to_owned(),
+            outcome: "one_shot".to_owned(),
+            count: 1,
+            reason: None,
+            decode_path: None,
+            production_evidence_sha256: None,
+        });
+        let error = one_shot
+            .validate_against(&campaign)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("forbids one-shot"));
+        assert!(error.contains("non-retained compile outcome"));
+    }
+
+    #[test]
+    fn p3_requires_the_exact_applied_inventory_and_allows_truthful_per_shape_fallback() {
+        let (campaign, _root) = fixture_campaign();
+        let mut with_fallback = valid_run(&campaign, "qwen-q4-512", "exact_epilogues");
+        with_fallback.measurements[0]
+            .diagnostics
+            .push(DiagnosticRecord {
+                domain: "exact_epilogue".to_owned(),
+                site: "conv2d_bias".to_owned(),
+                outcome: "fallback".to_owned(),
+                count: 2,
+                reason: Some("unsupported_dtype_shape_or_dispatch".to_owned()),
+                decode_path: None,
+                production_evidence_sha256: None,
+            });
+        with_fallback.validate_against(&campaign).unwrap();
+
+        let mut incomplete = valid_run(&campaign, "qwen-q4-512", "exact_epilogues");
+        incomplete.measurements[0].diagnostics.retain(|record| {
+            !(record.domain == "exact_epilogue"
+                && record.site == "conv3d_bias"
+                && record.outcome == "applied")
+        });
+        assert!(incomplete
+            .validate_against(&campaign)
+            .unwrap_err()
+            .to_string()
+            .contains("must exactly cover"));
+
+        let mut reasonless = valid_run(&campaign, "qwen-q4-512", "exact_epilogues");
+        reasonless.measurements[0]
+            .diagnostics
+            .push(DiagnosticRecord {
+                domain: "exact_epilogue".to_owned(),
+                site: "conv2d_bias".to_owned(),
+                outcome: "fallback".to_owned(),
+                count: 1,
+                reason: None,
+                decode_path: None,
+                production_evidence_sha256: None,
+            });
+        assert!(reasonless
+            .validate_against(&campaign)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid \"fallback\" receipt/reason pairing"));
     }
 
     #[test]

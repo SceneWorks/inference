@@ -37,6 +37,9 @@ fn real_weight_edit() {
 
     let paths = ZImageEditPaths {
         base: env_path("ZIMG_EDIT_BASE"),
+        text_encoder: std::env::var_os("ZIMG_EDIT_TEXT_ENCODER")
+            .map(std::path::PathBuf::from)
+            .map(candle_gen::gen_core::WeightsSource::Dir),
     };
     let source = read_ppm(&env_path("ZIMG_EDIT_SRC"));
     println!(

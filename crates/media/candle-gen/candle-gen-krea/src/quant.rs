@@ -32,6 +32,7 @@
 use candle_gen::candle_core::quantized::QTensor;
 use candle_gen::candle_core::{DType, Device, Result, Tensor};
 use candle_gen::candle_nn::{Embedding, Linear, Module};
+use candle_gen::gen_core::Quant;
 use candle_gen::quant::{self as shared, AdaptLinear, Int8Context};
 
 /// A Linear projection that is **residual-capable** (dense or MLX-packed base + optional forward-time
@@ -328,6 +329,51 @@ impl QLinear {
         }
     }
 
+    /// Fold a dense residual-capable base to Q4/Q8 while preserving its additive adapter stack.
+    /// Specialized ConvRot/NVFP4/probe projections implement different numeric contracts and reject
+    /// an affine fold instead of silently changing format.
+    pub fn quantize(&mut self, quant: Quant) -> Result<()> {
+        match self {
+            Self::Adapt(linear) => linear.quantize(quant),
+            Self::ConvRotInt8(_) => candle_gen::candle_core::bail!(
+                "Krea INT8-ConvRot projections cannot be re-quantized as {quant:?}"
+            ),
+            Self::Nvfp4(_) => candle_gen::candle_core::bail!(
+                "Krea NVFP4 projections cannot be re-quantized as {quant:?}"
+            ),
+            Self::Probed(_) => candle_gen::candle_core::bail!(
+                "Krea activation-probe projections cannot be quantized"
+            ),
+        }
+    }
+
+    /// CPU-stage fold for imported dense checkpoints: quantized projections land directly on the
+    /// compute device, so the full dense DiT never co-resides there with its Q4/Q8 replacement.
+    pub fn quantize_onto(&mut self, quant: Quant, device: &Device) -> Result<()> {
+        match self {
+            Self::Adapt(linear) => {
+                linear.quantize_dequant_onto(quant, device)?;
+                linear.to_device(device)
+            }
+            Self::ConvRotInt8(_) => candle_gen::candle_core::bail!(
+                "Krea INT8-ConvRot projections cannot be re-quantized as {quant:?}"
+            ),
+            Self::Nvfp4(_) => candle_gen::candle_core::bail!(
+                "Krea NVFP4 projections cannot be re-quantized as {quant:?}"
+            ),
+            Self::Probed(_) => candle_gen::candle_core::bail!(
+                "Krea activation-probe projections cannot be quantized"
+            ),
+        }
+    }
+
+    pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        match self {
+            Self::Adapt(linear) => linear.to_device(device),
+            Self::ConvRotInt8(_) | Self::Nvfp4(_) | Self::Probed(_) => Ok(()),
+        }
+    }
+
     /// The NVFP4 leg, when this projection is served through [`candle_gen::quant::Nvfp4Linear`] — the
     /// accounting seam [`crate::transformer::Krea2Transformer::nvfp4_report`] walks for SC#6/SC#4.
     pub(crate) fn nvfp4(&self) -> Option<&candle_gen::quant::Nvfp4Linear> {
@@ -414,6 +460,16 @@ impl QEmbedding {
             Self::Dense(e) => e.forward(indexes),
             Self::Packed(e) => e.forward(indexes),
         }
+    }
+
+    pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        if let Self::Dense(embedding) = self {
+            *embedding = Embedding::new(
+                embedding.embeddings().to_device(device)?,
+                embedding.hidden_size(),
+            );
+        }
+        Ok(())
     }
 
     #[cfg_attr(not(test), allow(dead_code))]

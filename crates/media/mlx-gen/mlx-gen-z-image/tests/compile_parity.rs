@@ -13,8 +13,8 @@
 //! gate asserts the compiled forward within a tight peak-**relative** ULP tolerance
 //! ([`COMPILED_GLUE_F32_WHOLE_FWD_ULP_TOL`]), not bit-exact; the output **shape** stays asserted
 //! exact. A real fusion/packing regression is O(1e-1), orders of magnitude above the ULP floor, so
-//! it is still caught loudly. (flux2/wan whole-forward compile-parity happen to stay bit-identical
-//! on non-NAX and keep their `== 0.0` gate; only z-image's deeper stack accumulates past 0.)
+//! it is still caught loudly. (Wan whole-forward compile-parity remains bit-identical on non-NAX;
+//! FLUX.2 now gates its f32 whole forward with a bounded-ULP contract rather than `== 0.0`.)
 
 use mlx_gen::weights::Weights;
 use mlx_gen_z_image::{

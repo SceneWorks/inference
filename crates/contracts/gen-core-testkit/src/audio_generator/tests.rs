@@ -81,6 +81,7 @@ fn stub_caps() -> Capabilities {
 
 fn stub_desc(id: &'static str) -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
         denoiser_output_latent_space: None,
         control_kinds: None,
         required_components: &[],

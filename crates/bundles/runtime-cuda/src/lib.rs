@@ -176,6 +176,7 @@ mod tests {
 
         fn dummy_audio_descriptor() -> gen_core::ModelDescriptor {
             gen_core::ModelDescriptor {
+                encoder_contract: None,
                 denoiser_output_latent_space: None,
                 control_kinds: None,
                 required_components: &[],

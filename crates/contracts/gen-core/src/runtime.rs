@@ -2,7 +2,7 @@
 //! [`Transform`](crate::transform::Transform): where weights come from, quantization +
 //! precision knobs, adapter specs, cooperative cancellation, and progress events.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -27,6 +27,14 @@ pub const COMFYUI_TEXT_ENCODER_COMPONENT: &str = "comfyui_text_encoder";
 /// Optional in-place ComfyUI VAE file paired with a single-file DiT.
 pub const COMFYUI_VAE_COMPONENT: &str = "comfyui_vae";
 
+/// Candle Krea's optional community INT8-ConvRot DiT checkpoint.
+///
+/// This is a DiT replacement, not a text encoder. Older Krea loads overloaded
+/// [`LoadSpec::text_encoder`] with this file; keeping it in the named component map preserves the
+/// provider-specific optionality while leaving the typed text-encoder slot available for its declared
+/// purpose.
+pub const KREA_CONVROT_DIT_COMPONENT: &str = "krea_convrot_dit";
+
 /// Where a model's weights come from — **always a local, already-provisioned path**. There is
 /// deliberately **no** hub-fetch variant: inference never self-fetches weights and has no knowledge
 /// of any download cache (epic 13657). A consumer resolves and stages every path — the base
@@ -34,7 +42,7 @@ pub const COMFYUI_VAE_COMPONENT: &str = "comfyui_vae";
 /// entry — before calling `load`, and a missing component is a load-time contract error
 /// ([`crate::control::require_component`]), never a mid-render fetch. (The previously-reserved
 /// sc-2340 hub-fetch direction is permanently rejected.)
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WeightsSource {
     /// A directory of (possibly sharded) `.safetensors`.
     Dir(PathBuf),
@@ -255,7 +263,10 @@ pub struct PinnedWeightsFile {
 /// prepared spec even when the spec has no File sources. Callers can inspect the map for cache-key
 /// construction, but can only transition or add tokens through [`LoadSpec`] methods; in particular,
 /// there is no mutable-map `clear` that could silently downgrade a prepared spec to compatibility
-/// mode.
+/// mode. Besides configured [`WeightsSource::File`] slots, a prepared spec may retain exact files
+/// below a configured [`WeightsSource::Dir`] (for example a transformer directory's config and
+/// weights). Those directory-member tokens participate in cache identity and guard the provider
+/// callback without changing the provider's directory-shaped load contract.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PreparedFilePins {
     prepared: bool,
@@ -524,6 +535,15 @@ pub struct LoadSpec {
     /// configured File source must have a matching token; a missing or orphaned token fails closed.
     /// Prefer [`Self::prepare_file_sources`] or [`Self::with_prepared_file_pin`] to enter that mode.
     prepared_file_pins: PreparedFilePins,
+    /// Additional exact files retained by a validated component receipt. These paths are not
+    /// ordinary provider slots: a single-file encoder's sibling config and a complete snapshot's
+    /// tokenizer are behavior-bearing inputs even though the backend only receives the encoder
+    /// source. Only crate-owned validation APIs may populate this set.
+    prepared_receipt_paths: BTreeSet<PathBuf>,
+    /// Exact selected-encoder source shape and direct-shard inventory paired with
+    /// [`prepared_receipt_paths`](Self::prepared_receipt_paths). Known file tokens reject mutation;
+    /// this receipt additionally rejects directory additions, removals, renames, and type changes.
+    prepared_encoder_receipt: Option<crate::encoder_contract::PreparedEncoderLoadReceipt>,
     pub quantize: Option<Quant>,
     pub precision: Precision,
     /// Auxiliary control-branch weights overlaid onto the base model at load time — a ControlNet
@@ -676,6 +696,8 @@ impl LoadSpec {
         Self {
             weights,
             prepared_file_pins: PreparedFilePins::default(),
+            prepared_receipt_paths: BTreeSet::new(),
+            prepared_encoder_receipt: None,
             quantize: None,
             precision: Precision::Bf16,
             control: None,
@@ -715,7 +737,8 @@ impl LoadSpec {
     /// The caller can pin each source first, root-confine both its lexical
     /// [`PinnedWeightsFile::loader_path`] and exact [`PinnedWeightsFile::canonical_target_path`],
     /// then pass those same tokens here. The candidate set is fully checked before this spec is
-    /// mutated. An empty iterator intentionally finalizes a Dir-only spec.
+    /// mutated. Tokens must name either configured File slots or descendants of configured Dir
+    /// slots. An empty iterator intentionally finalizes a Dir-only spec.
     pub fn prepare_with_file_pins(
         &mut self,
         prepared: impl IntoIterator<Item = PinnedWeightsFile>,
@@ -736,10 +759,66 @@ impl LoadSpec {
             finalized: true,
             pins,
         };
+        if !self.prepared_receipt_paths.is_empty() || self.prepared_encoder_receipt.is_some() {
+            return Err(crate::Error::Unsupported(
+                "validated receipt identity must be installed through its owning contract".into(),
+            ));
+        }
         self.validate_prepared_file_pin_set_for(&candidate)?;
         if self.prepared_file_pins.is_finalized() && self.prepared_file_pins != candidate {
             return Err(crate::Error::Unsupported(
                 "cannot replace finalized LoadSpec File identity".into(),
+            ));
+        }
+        self.prepared_file_pins = candidate;
+        Ok(())
+    }
+
+    /// Install the complete exact-file set retained by a crate-validated component receipt.
+    ///
+    /// Kept crate-private so an external caller cannot bless arbitrary paths as cache/load identity.
+    pub(crate) fn prepare_with_validated_receipt_pins(
+        &mut self,
+        prepared: impl IntoIterator<Item = PinnedWeightsFile>,
+        receipt_paths: impl IntoIterator<Item = PathBuf>,
+        encoder_receipt: crate::encoder_contract::PreparedEncoderLoadReceipt,
+    ) -> crate::Result<()> {
+        let mut pins = BTreeMap::new();
+        for pin in prepared {
+            pin.ensure_unchanged()?;
+            let path = pin.loader_path().to_path_buf();
+            if let Some(existing) = pins.insert(path.clone(), pin) {
+                if existing != pins[&path] {
+                    return Err(crate::Error::Unsupported(format!(
+                        "conflicting prepared file tokens for {}",
+                        path.display()
+                    )));
+                }
+            }
+        }
+        let receipt_paths = receipt_paths.into_iter().collect::<BTreeSet<_>>();
+        let candidate = PreparedFilePins {
+            prepared: true,
+            finalized: true,
+            pins,
+        };
+        let previous_receipt_paths =
+            std::mem::replace(&mut self.prepared_receipt_paths, receipt_paths);
+        let previous_encoder_receipt = self.prepared_encoder_receipt.replace(encoder_receipt);
+        if let Err(error) = self.validate_prepared_file_pin_set_for(&candidate) {
+            self.prepared_receipt_paths = previous_receipt_paths;
+            self.prepared_encoder_receipt = previous_encoder_receipt;
+            return Err(error);
+        }
+        if self.prepared_file_pins.is_finalized()
+            && (self.prepared_file_pins != candidate
+                || self.prepared_receipt_paths != previous_receipt_paths
+                || self.prepared_encoder_receipt != previous_encoder_receipt)
+        {
+            self.prepared_receipt_paths = previous_receipt_paths;
+            self.prepared_encoder_receipt = previous_encoder_receipt;
+            return Err(crate::Error::Unsupported(
+                "cannot replace finalized LoadSpec receipt identity".into(),
             ));
         }
         self.prepared_file_pins = candidate;
@@ -769,6 +848,46 @@ impl LoadSpec {
             push_source(&mut paths, source);
         }
         paths.extend(self.adapters.iter().map(|adapter| adapter.path.as_path()));
+        if let Some(pid) = &self.pid {
+            push_source(&mut paths, &pid.checkpoint);
+            push_source(&mut paths, &pid.gemma);
+        }
+        if let Some(identity) = &self.identity {
+            for source in [&identity.encoder, &identity.eva, &identity.face_dir]
+                .into_iter()
+                .flatten()
+            {
+                push_source(&mut paths, source);
+            }
+        }
+        if let Some(source) = &self.text_encoder {
+            push_source(&mut paths, source);
+        }
+        for source in self.components.values() {
+            push_source(&mut paths, source);
+        }
+        paths
+    }
+
+    /// Every configured directory source, used to validate prepared member-file tokens.
+    pub fn directory_source_paths(&self) -> Vec<&Path> {
+        fn push_source<'a>(paths: &mut Vec<&'a Path>, source: &'a WeightsSource) {
+            if let WeightsSource::Dir(path) = source {
+                paths.push(path.as_path());
+            }
+        }
+
+        let mut paths = Vec::new();
+        push_source(&mut paths, &self.weights);
+        if let Some(source) = &self.control {
+            push_source(&mut paths, source);
+        }
+        for source in &self.extra_controls {
+            push_source(&mut paths, source);
+        }
+        if let Some(source) = &self.ip_adapter {
+            push_source(&mut paths, source);
+        }
         if let Some(pid) = &self.pid {
             push_source(&mut paths, &pid.checkpoint);
             push_source(&mut paths, &pid.gemma);
@@ -911,20 +1030,44 @@ impl LoadSpec {
     }
 
     fn validate_prepared_file_pin_set_for(&self, prepared: &PreparedFilePins) -> crate::Result<()> {
+        if let Some(receipt) = &self.prepared_encoder_receipt {
+            receipt.ensure_unchanged_for(self.text_encoder.as_ref())?;
+        }
         let mut expected: Vec<PathBuf> = self
             .file_source_paths()
             .into_iter()
             .map(std::path::absolute)
             .collect::<std::io::Result<_>>()?;
+        expected.extend(self.prepared_receipt_paths.iter().cloned());
         expected.sort();
         expected.dedup();
+        let configured_directories = self
+            .directory_source_paths()
+            .into_iter()
+            .map(std::path::absolute)
+            .collect::<std::io::Result<Vec<_>>>()?;
         let actual: Vec<PathBuf> = prepared.keys().cloned().collect();
-        if expected != actual {
+        let missing = expected
+            .iter()
+            .filter(|path| !actual.contains(path))
+            .cloned()
+            .collect::<Vec<_>>();
+        let orphaned = actual
+            .iter()
+            .filter(|path| {
+                !expected.contains(path)
+                    && !configured_directories
+                        .iter()
+                        .any(|directory| *path != directory && path.starts_with(directory))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() || !orphaned.is_empty() {
             return Err(crate::Error::Unsupported(format!(
-                "prepared file-token set does not match LoadSpec File sources: expected {expected:?}, got {actual:?}"
+                "prepared file-token set does not match the LoadSpec sources: missing {missing:?}, orphaned {orphaned:?}"
             )));
         }
-        for path in expected {
+        for path in actual {
             let prepared = prepared.get(&path).ok_or_else(|| {
                 crate::Error::Unsupported(format!(
                     "prepared file-token set is missing configured source {}",
@@ -1059,8 +1202,9 @@ impl LoadSpec {
     ///
     /// Ordinary compatibility-mode specs invoke `read` directly, preserving historical callback
     /// behavior and error ordering without introducing eager filesystem access. Prepared specs must
-    /// cover exactly the current File-slot set, and every token is checked before and after the
-    /// callback so persistent and identity-changing replacement during the callback fails closed.
+    /// cover every current File slot, may additionally cover configured directory members, and every
+    /// token is checked before and after the callback so persistent and identity-changing replacement
+    /// during the callback fails closed.
     /// As with [`PinnedWeightsFile::read_unchanged`], a fully restored original pathname object is
     /// outside this path-token guarantee.
     pub fn read_prepared_files_unchanged<T, E>(
@@ -1074,12 +1218,30 @@ impl LoadSpec {
             return read();
         }
         self.validate_prepared_file_pins().map_err(E::from)?;
-        self.read_files_unchanged(self.file_source_paths(), read)
+        let pins = self
+            .prepared_file_pins
+            .iter()
+            .map(|(_, pin)| pin)
+            .collect::<Vec<_>>();
+        for pin in &pins {
+            pin.ensure_unchanged().map_err(E::from)?;
+        }
+        let result = read();
+        for pin in &pins {
+            pin.ensure_unchanged().map_err(E::from)?;
+        }
+        result
     }
 
     /// Builder-style quantization override.
     pub fn with_quant(mut self, quant: Quant) -> Self {
         self.quantize = Some(quant);
+        self
+    }
+
+    /// Builder-style external text-encoder substitution.
+    pub fn with_text_encoder(mut self, text_encoder: WeightsSource) -> Self {
+        self.text_encoder = Some(text_encoder);
         self
     }
 
@@ -1787,6 +1949,38 @@ mod tests {
         assert!(dir_only.prepared_file_pins().is_prepared());
         assert!(dir_only.prepared_file_pins().is_finalized());
         assert!(dir_only.prepared_file_pins().is_empty());
+    }
+
+    #[test]
+    fn prepared_directory_members_are_guarded_and_orphans_fail_closed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let transformer = dir.path().join("transformer");
+        std::fs::create_dir(&transformer).expect("create transformer dir");
+        let config = transformer.join("config.json");
+        let weights = transformer.join("diffusion_pytorch_model.safetensors");
+        std::fs::write(&config, b"{\"kind\":\"mage\"}").expect("write config");
+        std::fs::write(&weights, b"weights-v1").expect("write weights");
+
+        let mut spec = LoadSpec::new(WeightsSource::Dir(transformer));
+        spec.prepare_with_file_pins([
+            PinnedWeightsFile::pin(&config).expect("pin config"),
+            PinnedWeightsFile::pin(&weights).expect("pin weights"),
+        ])
+        .expect("directory members are valid prepared identities");
+        assert_eq!(spec.prepared_file_pins().len(), 2);
+        spec.read_prepared_files_unchanged(|| Ok::<_, crate::Error>(()))
+            .expect("unchanged directory members pass the callback guard");
+
+        std::fs::write(&weights, b"weights-v2").expect("replace weights in place");
+        spec.read_prepared_files_unchanged(|| Ok::<_, crate::Error>(()))
+            .expect_err("a changed directory member must fail before provider reuse");
+
+        let outside = dir.path().join("outside.safetensors");
+        std::fs::write(&outside, b"outside").expect("write outside file");
+        let mut orphaned = LoadSpec::new(WeightsSource::Dir(dir.path().join("other")));
+        orphaned
+            .prepare_with_file_pins([PinnedWeightsFile::pin(outside).expect("pin outside")])
+            .expect_err("a token outside every configured directory must fail closed");
     }
 
     #[test]

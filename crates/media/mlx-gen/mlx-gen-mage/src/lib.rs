@@ -151,6 +151,14 @@ pub fn register_providers(
         .register_generator(model::REGISTRATION)
         .register_activation_memory(ACTIVATION_MEMORY_REGISTRATION)
         .register_generator(model::REGISTRATION_BASE)
+        .register_imported_model(mlx_gen::gen_core::ImportedModelRegistration {
+            family: "mage-flow",
+            source: mlx_gen::gen_core::ImportedModelSource::TransformerDirectory,
+            operation: mlx_gen::gen_core::ImportedModelOperation::Generate,
+            provider_id: "mage_flow_base",
+            required_components: Some(model::REQUIRED_COMPONENTS),
+            inherit_adapters: false,
+        })
         .register_generator(model::REGISTRATION_TURBO)
         .register_generator(model::REGISTRATION_EDIT)
         .register_generator(model::REGISTRATION_EDIT_BASE)
@@ -293,5 +301,38 @@ mod explicit_registry_tests {
                 "{id} does not carry the '{FAMILY}' family prefix"
             );
         }
+    }
+
+    #[test]
+    fn imported_transformer_directory_route_executes_the_finetuned_loader() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("config.json"), b"{}").unwrap();
+        write_minimal_safetensors(&root.path().join("diffusion_pytorch_model.safetensors"));
+        let registry = provider_registry().unwrap();
+        let descriptor = registry
+            .imported_model_descriptor(
+                "mage-flow",
+                mlx_gen::gen_core::ImportedModelSource::TransformerDirectory,
+                mlx_gen::gen_core::ImportedModelOperation::Generate,
+            )
+            .expect("exact Mage fine-tune route");
+        assert_eq!(descriptor.id, "mage_flow_base");
+        assert_eq!(descriptor.required_components, model::REQUIRED_COMPONENTS);
+        assert!(!descriptor.capabilities.supports_lora);
+        assert!(!descriptor.capabilities.supports_lokr);
+
+        let error = registry
+            .load(
+                descriptor.id,
+                &mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(root.path().to_path_buf())),
+            )
+            .err()
+            .expect("unstaged fine-tune must fail at its component gate")
+            .to_string();
+        assert!(
+            error.contains(model::COMPONENT_TEXT_ENCODER),
+            "the selected registry loader must enter the fine-tune component gate, got: {error}"
+        );
+        assert!(!error.contains("checkpoint fingerprint"), "{error}");
     }
 }

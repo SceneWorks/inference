@@ -235,7 +235,6 @@ pub(crate) fn native_memory_strategy_contract_from_spec(
             ))
         })
     };
-    let conditioning_bytes = stored(&base_snapshot_dir.join("text_encoder"), "base text encoder")?;
     let alternate_decoder_bytes = match spec.components.get(mlx_gen::VAE_COMPONENT) {
         Some(mlx_gen::WeightsSource::Dir(path)) => stored(path, "alternate Wan decoder")?,
         Some(mlx_gen::WeightsSource::File(path)) => {
@@ -243,16 +242,47 @@ pub(crate) fn native_memory_strategy_contract_from_spec(
         }
         None => 0,
     };
+    let selected_text_encoder =
+        crate::model::ENCODER_CONTRACT.source_for_load(spec, base_snapshot_dir)?;
+    let expected_language_bits =
+        crate::model::native_text_encoder_expected_quant_bits(base_snapshot_dir)?;
+    let conditioning_bytes = crate::model::selected_language_resident_bytes(
+        &selected_text_encoder,
+        expected_language_bits,
+        provider_id,
+    )?;
     let decoder_bytes =
         stored(&base_snapshot_dir.join("vae"), "base VAE")?.saturating_add(alternate_decoder_bytes);
     let transformer_bytes = spec.read_file_unchanged_if_prepared(dit_file, |p| {
-        crate::block_memory_strategy::native_dit_transformer_bytes(provider_id, p)
+        crate::block_memory_strategy::native_dit_transformer_bytes(provider_id, p, spec.quantize)
     })?;
+    let branch_bits =
+        crate::memory::control_branch_quant_bits(spec.quantize.map(mlx_gen::Quant::bits));
+    let projected_control = |path: &std::path::Path| {
+        projected_safetensors_bytes(path, |tensor| {
+            if let Some(bits) =
+                branch_bits.filter(|_| crate::control::is_control_quant_target(&tensor.name))
+            {
+                ResidentProjection::GroupQuantized {
+                    bits,
+                    group_size: crate::quant::GROUP_SIZE as usize,
+                }
+            } else {
+                ResidentProjection::Stored
+            }
+        })
+        .map_err(|error| {
+            CoreError::Msg(format!(
+                "{provider_id}: native pose control overlay asset facts for '{}': {error}",
+                path.display()
+            ))
+        })
+    };
     let (control_path, overlay_bytes) = match control {
-        mlx_gen::WeightsSource::Dir(path) => (path, stored(path, "pose control overlay")?),
+        mlx_gen::WeightsSource::Dir(path) => (path, projected_control(path)?),
         mlx_gen::WeightsSource::File(path) => (
             path,
-            spec.read_file_unchanged_if_prepared(path, |p| stored(p, "pose control overlay"))?,
+            spec.read_file_unchanged_if_prepared(path, projected_control)?,
         ),
     };
     if overlay_bytes == 0 {
@@ -339,9 +369,12 @@ fn asset_facts(
             }
         })
     };
-    let conditioning_bytes = project(
-        &root.join("text_encoder"),
-        &crate::convert::is_text_encoder_quant_target,
+    let selected_text_encoder = crate::model::ENCODER_CONTRACT.source_for_load(spec, root)?;
+    let expected_language_bits = crate::model::effective_base_quant_bits(spec, root, provider_id)?;
+    let conditioning_bytes = crate::model::selected_language_resident_bytes(
+        &selected_text_encoder,
+        expected_language_bits,
+        provider_id,
     )?;
     let transformer_bytes = project(&root.join("transformer"), &|name| {
         crate::convert::is_transformer_quant_target(name)
@@ -588,6 +621,11 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             write_control(&dir.join("model.safetensors"));
         }
+        gen_core_testkit::write_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            crate::model::ENCODER_CONTRACT,
+        )
+        .expect("validation-complete text encoder fixture");
     }
 
     #[test]
@@ -874,10 +912,12 @@ mod tests {
         let contract = memory_strategy_contract("krea_2_turbo_control", &spec).unwrap();
         // Q8: 128 code bytes + two 2x1 bf16 tables (8 bytes). A uniform Q4 projection would be 72.
         assert_eq!(contract.asset_facts.overlay_bytes, 136);
-        assert_eq!(contract.asset_facts.conditioning_bytes, 256);
+        // The runtime retains exactly 35 language layers (the authored 36th layer is never loaded),
+        // with projection matrices at Q4 and embeddings/norms dense.
+        assert_eq!(contract.asset_facts.conditioning_bytes, 2_765_258_240);
         assert_eq!(contract.asset_facts.transformer_bytes, 256);
         assert_eq!(contract.asset_facts.decoder_bytes, 256);
-        assert_eq!(contract.asset_facts.base_bytes, 768);
+        assert_eq!(contract.asset_facts.base_bytes, 2_765_258_752);
         assert_eq!(contract.auxiliary_resident_bytes(), 136);
         assert!(contract.conformance_errors().is_empty());
     }
@@ -959,7 +999,13 @@ mod tests {
         let mut identity = valid.clone();
         identity.identity = Some(mlx_gen::gen_core::IdentityWeights::default());
         let mut text_encoder = valid.clone();
-        text_encoder.text_encoder = Some(WeightsSource::Dir(root.join("external-text")));
+        let external_text_encoder = root.join("external-text");
+        gen_core_testkit::write_encoder_contract_fixture(
+            &external_text_encoder,
+            crate::model::ENCODER_CONTRACT,
+        )
+        .expect("validation-complete selected text encoder fixture");
+        text_encoder.text_encoder = Some(WeightsSource::Dir(external_text_encoder));
         let mut pid = valid.clone();
         pid.pid = Some(mlx_gen::gen_core::PidWeights {
             checkpoint: WeightsSource::File(root.join("pid.safetensors")),
@@ -987,12 +1033,12 @@ mod tests {
             ("adapter", accepted_adapter, true),
             ("deferred", accepted_deferred, true),
             ("precision", precision, false),
-            ("quantize", valid.clone().with_quant(Quant::Q4), false),
+            ("quantize", valid.clone().with_quant(Quant::Q4), true),
             ("extra_control", extra_control, false),
             ("ip_adapter", ip_adapter, false),
             ("pid", pid, false),
             ("identity", identity, false),
-            ("text_encoder", text_encoder, false),
+            ("text_encoder", text_encoder, true),
             ("unknown_component", unknown_component, false),
             ("missing_base", missing_base, false),
         ] {

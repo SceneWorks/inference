@@ -136,6 +136,93 @@ pub fn ggml_dtype(quant: Quant) -> Result<GgmlDType> {
 /// and SAM3's `2→256`/`4→256`/`258→256` projections full-precision.
 pub const QUANT_BLOCK: usize = 32;
 
+/// Resident GGML bytes produced when Candle repacks one validated MLX affine triple. The source
+/// `{base}.weight/.scales/.biases` tensors are transient host inputs: Q4 lands as `Q4_1` (20 bytes
+/// per 32 values) and Q8 lands as `Q8_0` (34 bytes per 32 values). Memory admission must price this
+/// device-format tensor once, rather than either summing the source sidecars or treating the packed
+/// U32 weight's shortened last dimension as a dense/load-time-quantized matrix.
+pub fn mlx_packed_qtensor_resident_bytes(
+    weight: &gen_core::weightsmeta::SafetensorsTensorHeader,
+    scales: &gen_core::weightsmeta::SafetensorsTensorHeader,
+    biases: &gen_core::weightsmeta::SafetensorsTensorHeader,
+    group_size: usize,
+) -> gen_core::Result<u64> {
+    use gen_core::weightsmeta::Dtype as HeaderDtype;
+
+    let [out, packed_columns] = weight.shape.as_slice() else {
+        return Err(gen_core::Error::Unsupported(format!(
+            "packed weight {:?} must be rank 2, got {:?}",
+            weight.name, weight.shape
+        )));
+    };
+    let [scale_out, scale_columns] = scales.shape.as_slice() else {
+        return Err(gen_core::Error::Unsupported(format!(
+            "packed scales {:?} must be rank 2, got {:?}",
+            scales.name, scales.shape
+        )));
+    };
+    if biases.shape.as_slice() != [*scale_out, *scale_columns]
+        || out != scale_out
+        || weight.dtype != HeaderDtype::U32
+        || group_size == 0
+        || !group_size.is_multiple_of(QUANT_BLOCK)
+    {
+        return Err(gen_core::Error::Unsupported(format!(
+            "packed affine triple {:?}/{:?}/{:?} has incompatible shapes, dtype, or group size {group_size}",
+            weight.name, scales.name, biases.name
+        )));
+    }
+    let input = scale_columns.checked_mul(group_size).ok_or_else(|| {
+        gen_core::Error::Msg(format!("packed input width overflow for {:?}", weight.name))
+    })?;
+    let encoded_bits = packed_columns.checked_mul(32).ok_or_else(|| {
+        gen_core::Error::Msg(format!("packed bit width overflow for {:?}", weight.name))
+    })?;
+    if input == 0 || !encoded_bits.is_multiple_of(input) {
+        return Err(gen_core::Error::Unsupported(format!(
+            "packed affine triple {:?} cannot infer a Q4/Q8 bit width",
+            weight.name
+        )));
+    }
+    let bytes_per_block = match encoded_bits / input {
+        4 => 20_u64,
+        8 => 34_u64,
+        bits => {
+            return Err(gen_core::Error::Unsupported(format!(
+                "packed affine triple {:?} has unsupported Q{bits} width",
+                weight.name
+            )))
+        }
+    };
+    let elements = u64::try_from(*out)
+        .ok()
+        .and_then(|out| {
+            u64::try_from(input)
+                .ok()
+                .and_then(|input| out.checked_mul(input))
+        })
+        .ok_or_else(|| {
+            gen_core::Error::Msg(format!(
+                "packed element count overflow for {:?}",
+                weight.name
+            ))
+        })?;
+    if !elements.is_multiple_of(QUANT_BLOCK as u64) {
+        return Err(gen_core::Error::Unsupported(format!(
+            "packed affine triple {:?} has {elements} elements, not a multiple of {QUANT_BLOCK}",
+            weight.name
+        )));
+    }
+    (elements / QUANT_BLOCK as u64)
+        .checked_mul(bytes_per_block)
+        .ok_or_else(|| {
+            gen_core::Error::Msg(format!(
+                "packed resident byte overflow for {:?}",
+                weight.name
+            ))
+        })
+}
+
 /// A component's `quantization` manifest block — the candle twin of `mlx_gen_flux2::config::Flux2Quant`
 /// (generalized out of the dormant per-crate `Flux2Quant`, sc-9086). An install-time convert job
 /// writes `quantization: { "bits", "group_size" }` into a packed component's `config.json`; its

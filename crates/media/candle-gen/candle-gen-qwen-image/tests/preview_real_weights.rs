@@ -524,6 +524,7 @@ fn edit_preview_frames_evolve_toward_the_final_image() {
 
     let model = QwenEdit::load(&QwenEditPaths {
         root,
+        text_encoder: None,
         adapters: vec![],
         offload_policy: OffloadPolicy::Resident,
     })
@@ -641,6 +642,7 @@ fn control_fun_preview_frames_evolve_toward_the_final_image() {
 
     let model = QwenFunControl::load(&QwenFunControlPaths {
         qwen_base,
+        text_encoder: None,
         controlnet,
     })
     .expect("load QwenFunControl");

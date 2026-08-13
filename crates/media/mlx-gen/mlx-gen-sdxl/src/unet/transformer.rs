@@ -101,6 +101,16 @@ impl AttentionMHA {
         Ok(())
     }
 
+    fn materialize_weights(&self) -> Result<()> {
+        for linear in [&self.q, &self.k, &self.v, &self.out] {
+            linear.materialize_weights()?;
+        }
+        for linear in [&self.to_k_ip, &self.to_v_ip].into_iter().flatten() {
+            linear.materialize_weights()?;
+        }
+        Ok(())
+    }
+
     /// `x`: `[B, L, D]` (queries); `context`: `[B, S, Dctx]` (keys/values; == `x` for self-attn).
     /// Fused `scaled_dot_product_attention` (mathematically the reference's `nn.MultiHeadAttention`;
     /// an explicit softmax matmul was tried and gave no measurable parity gain at large e2e cost).
@@ -271,6 +281,22 @@ impl TransformerBlock {
         self.linear2.quantize(bits, None)?;
         self.linear3.quantize(bits, None)?;
         Ok(())
+    }
+
+    pub(crate) fn materialize_weights(&self) -> Result<()> {
+        mlx_rs::transforms::eval([
+            &self.norm1_w,
+            &self.norm1_b,
+            &self.norm2_w,
+            &self.norm2_b,
+            &self.norm3_w,
+            &self.norm3_b,
+        ])?;
+        self.attn1.materialize_weights()?;
+        self.attn2.materialize_weights()?;
+        self.linear1.materialize_weights()?;
+        self.linear2.materialize_weights()?;
+        self.linear3.materialize_weights()
     }
 
     /// Install this block's IP-Adapter K/V projections into its cross-attention (sc-3059).
@@ -473,6 +499,15 @@ impl Transformer2D {
             b.quantize(bits)?;
         }
         Ok(())
+    }
+
+    pub(crate) fn materialize_weights(&self) -> Result<()> {
+        mlx_rs::transforms::eval([&self.norm_w, &self.norm_b])?;
+        self.proj_in.materialize_weights()?;
+        for block in &self.blocks {
+            block.materialize_weights()?;
+        }
+        self.proj_out.materialize_weights()
     }
 
     /// Toggle SDPA-segment checkpointing across every transformer block (sc-4941).

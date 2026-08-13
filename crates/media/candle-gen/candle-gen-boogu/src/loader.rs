@@ -61,6 +61,19 @@ impl Weights {
         })
     }
 
+    /// Mmap one explicitly selected safetensors file. Its sibling `config.json`, when present,
+    /// carries the same packed-triple metadata as a component directory.
+    pub fn from_file(path: &Path, device: &Device, dtype: DType) -> Result<Self> {
+        // SAFETY: read-only mmap of the caller-validated weight file.
+        let st = unsafe { MmapedSafetensors::multi(&[path.to_path_buf()])? };
+        Ok(Self {
+            st,
+            device: device.clone(),
+            dtype,
+            packed: read_packed_config(path.parent().unwrap_or_else(|| Path::new(".")))?,
+        })
+    }
+
     /// Load `name` at the component dtype.
     pub fn get(&self, name: &str) -> Result<Tensor> {
         self.st.load(name, &self.device)?.to_dtype(self.dtype)
