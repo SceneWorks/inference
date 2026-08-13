@@ -271,9 +271,9 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 /// against the base tier's architecture config), `adapters` (Raw-trained LoRA/LoKr) install onto the
 /// imported DiT before residency is finalized (the branch is never an adapter target), and the pose
 /// branch loads from `control` exactly as the snapshot control load does. Branch tier follows the
-/// base-DiT tier (sc-15799): the native loader dequantizes I8 files to bf16, so the in-memory base is
-/// always DENSE — `control_branch_quant_bits(None)` keeps the branch dense, matching the snapshot
-/// lane's dense-base behavior.
+/// requested load-time base-DiT tier (sc-15799): Q8 keeps a Q8 branch, Q4 uses the declared Q8 branch
+/// floor, and no quantization request keeps both base and branch dense. A native I8 file is first
+/// materialized as bf16, then an explicit supported Q4/Q8 request quantizes the loaded base.
 ///
 /// The memory contract keeps the `krea_2_turbo_control` provider identity and calibration fingerprint
 /// so same-provider evidence resolves through the same selectors; the pinned File source can also
