@@ -14,13 +14,14 @@
 //! exposes); the modulation table stays frozen.
 //!
 //! Since sc-11720, every Linear leaf on the frozen base — the attention `to_gate`, the SwiGLU FFN, and
-//! the pre-main front-end (`img_in`, the timestep MLP, `txt_in.linear_1/2`, `final_layer.linear`) — is
-//! also wrapped so it can host a **forward-time additive USER LoRA** at control-lane inference (the
-//! [`crate::adapters::AdditiveDit`] surface, disjoint from the trainer surface above). These wrappers
-//! carry no trainable factor, so training and `control_scale=0` are byte-identical to a plain `Linear`:
-//! candle's `sorted_nodes` prunes any backward branch that reaches no `Var`, so the front-end is still
-//! never differentiated and train/infer conditioning parity holds at zero cost. `time_mod_proj` stays a
-//! plain `Linear` (out of the adapter surface, matching the txt2img front-end set).
+//! the pre-main front-end (`img_in`, the timestep MLP, `time_mod_proj`, `txt_in.linear_1/2`,
+//! `final_layer.linear`) — is also wrapped so it can host a **forward-time additive USER LoRA** at
+//! control-lane inference (the [`crate::adapters::AdditiveDit`] surface, disjoint from the trainer
+//! surface above). These wrappers carry no trainable factor, so training and `control_scale=0` are
+//! byte-identical to a plain `Linear`: candle's `sorted_nodes` prunes any backward branch that reaches
+//! no `Var`, so the front-end is still never differentiated and train/infer conditioning parity holds
+//! at zero cost. The surface matches the txt2img front end, including the native `tproj.1` target that
+//! normalizes to canonical `time_mod_proj` (sc-18477).
 //!
 //! ## Velocity sign
 //!
@@ -41,7 +42,7 @@
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
 use candle_gen::candle_nn::ops::{sigmoid, softmax};
-use candle_gen::candle_nn::{Linear, Module};
+use candle_gen::candle_nn::Module;
 use candle_gen::train::gradient_checkpoint::Segment;
 use candle_gen::train::lora::{LoraHost, LoraLinear};
 
@@ -436,13 +437,13 @@ pub struct KreaTrainDit {
     device: Device,
     dtype: DType,
     // --- pre-main front-end. Upstream of the control branch (never trained); the Linear leaves are
-    //     `LoraLinear` so a USER LoRA (control-lane inference, sc-11720) can ride additively — identity
-    //     to the plain Linear when unadapted, so training / control_scale=0 stay byte-exact. `time_mod_
-    //     proj` stays plain Linear (out of the adapter surface, matching the txt2img front-end set). ---
+    //     composable so a USER LoRA/LoKr (control-lane inference, sc-11720/sc-18477) can ride
+    //     additively — identity to the plain Linear when unadapted, so training / control_scale=0 stay
+    //     byte-exact. The surface matches txt2img, including canonical `time_mod_proj`. ---
     img_in: ComposableLinear,
     time_embed_l1: ComposableLinear,
     time_embed_l2: ComposableLinear,
-    time_mod_proj: Linear,
+    time_mod_proj: ComposableLinear,
     txt_in_norm: RmsScale,
     txt_in_l1: ComposableLinear,
     txt_in_l2: ComposableLinear,
@@ -501,7 +502,7 @@ impl KreaTrainDit {
             img_in: proj(w, "img_in", true)?,
             time_embed_l1: proj(w, "time_embed.linear_1", true)?,
             time_embed_l2: proj(w, "time_embed.linear_2", true)?,
-            time_mod_proj: linear(w, "time_mod_proj", true)?,
+            time_mod_proj: proj(w, "time_mod_proj", true)?,
             txt_in_norm: RmsScale::load(w, "txt_in.norm.weight", eps)?,
             txt_in_l1: proj(w, "txt_in.linear_1", true)?,
             txt_in_l2: proj(w, "txt_in.linear_2", true)?,
@@ -717,6 +718,7 @@ impl crate::adapters::AdditiveDit for KreaTrainDit {
             ("img_in", &mut self.img_in),
             ("time_embed.linear_1", &mut self.time_embed_l1),
             ("time_embed.linear_2", &mut self.time_embed_l2),
+            ("time_mod_proj", &mut self.time_mod_proj),
             ("txt_in.linear_1", &mut self.txt_in_l1),
             ("txt_in.linear_2", &mut self.txt_in_l2),
             ("final_layer.linear", &mut self.final_linear),
@@ -734,7 +736,8 @@ impl crate::adapters::AdditiveDit for KreaTrainDit {
         "expected bare/PEFT `<path>.lora_A/B.weight` (LoRA) or `<module>.lokr_w1/w2` (LoKr) over the \
          control-base DiT attention (to_q|to_k|to_v|to_gate|to_out.0) + SwiGLU FFN (ff.gate|ff.up|ff.\
          down) across the single-stream transformer_blocks and text_fusion blocks, plus the front-end \
-         (img_in|time_embed.linear_1/2|txt_in.linear_1/2|final_layer.linear) projections; or a ComfyUI/\
+         (img_in|time_embed.linear_1/2|time_mod_proj|txt_in.linear_1/2|final_layer.linear) projections; \
+         or a ComfyUI/\
          lightx2v `<module>.diff`/`.diff_b` diff-patch (full-weight/bias delta, incl. the \
          text_fusion.projector 12→1 collapse). The pose control branch is never adapted; conv-layer / \
          text-encoder adapters are out of surface"
@@ -744,10 +747,84 @@ impl crate::adapters::AdditiveDit for KreaTrainDit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapters::{install_additive, AdditiveDit};
+    use candle_gen::gen_core::{AdapterKind, AdapterSpec};
     use std::cell::Cell;
 
+    /// sc-18477: the strict-control DiT must expose the same canonical adapter surface as the base DiT,
+    /// including native Krea's `tproj.1` target after it normalizes to `time_mod_proj`. This deliberately
+    /// installs one already-supported target alongside `tproj.1`: before the fix, installation returned
+    /// success for `img_in` while silently leaving the modulation residual in `skipped_targets`.
     #[test]
-    fn convrot_control_projection_is_exposed_to_additive_adapter_walk() {
+    fn control_adapter_surface_matches_base_and_installs_native_time_mod_projection() {
+        let dev = Device::Cpu;
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut control, cfg, weights_path) = crate::testfix::tiny_dit(&tmp);
+        let weights = Weights::from_file(&weights_path, &dev, DType::F32).unwrap();
+        let mut base = crate::transformer::Krea2Transformer::load(&weights, &cfg).unwrap();
+
+        let surface = |dit: &mut dyn AdditiveDit| {
+            let mut paths = Vec::new();
+            dit.visit_additive(&mut |path, _| {
+                paths.push(path.to_string());
+                Ok(())
+            })
+            .unwrap();
+            paths.sort();
+            paths
+        };
+        let base_surface = surface(&mut base);
+        let control_surface = surface(&mut control);
+        assert_eq!(
+            control_surface, base_surface,
+            "strict-control and base DiTs must expose identical adapter targets"
+        );
+        assert_eq!(
+            control_surface
+                .iter()
+                .filter(|path| path.as_str() == "time_mod_proj")
+                .count(),
+            1,
+            "canonical time_mod_proj must be visited exactly once"
+        );
+
+        let adapter_path = tmp.path().join("native-time-mod-and-img-in.safetensors");
+        let adapter = std::collections::HashMap::from([
+            (
+                "first.lora_A.weight".to_string(),
+                Tensor::ones((1, cfg.in_channels), DType::F32, &dev).unwrap(),
+            ),
+            (
+                "first.lora_B.weight".to_string(),
+                Tensor::ones((cfg.hidden_size, 1), DType::F32, &dev).unwrap(),
+            ),
+            (
+                "tproj.1.lora_A.weight".to_string(),
+                Tensor::ones((1, cfg.hidden_size), DType::F32, &dev).unwrap(),
+            ),
+            (
+                "tproj.1.lora_B.weight".to_string(),
+                Tensor::ones((cfg.time_mod_dim(), 1), DType::F32, &dev).unwrap(),
+            ),
+        ]);
+        candle_gen::candle_core::safetensors::save(&adapter, &adapter_path).unwrap();
+        let specs = [AdapterSpec::new(adapter_path, 1.0, AdapterKind::Lora)];
+
+        let base_report = install_additive(&mut base, &specs, 0).unwrap();
+        let control_report = install_additive(&mut control, &specs, 0).unwrap();
+        for (lane, report) in [("base", base_report), ("strict-control", control_report)] {
+            assert_eq!(report.applied, 2, "{lane} must install both native targets");
+            assert!(
+                report.skipped_targets.is_empty(),
+                "{lane} silently dropped targets: {:?}",
+                report.skipped_targets
+            );
+            assert_eq!(report.skipped_keys, 0, "{lane} rejected adapter keys");
+        }
+    }
+
+    #[test]
+    fn convrot_time_mod_projection_is_exposed_to_additive_adapter_walk() {
         let dev = Device::Cpu;
         let canonical = Tensor::from_vec(
             vec![
@@ -768,8 +845,8 @@ mod tests {
         let bare = projection.forward(&x).unwrap();
         let mut visited = 0usize;
         projection
-            .visit_additive("transformer_blocks.0.attn.to_q", &mut |path, host| {
-                assert_eq!(path, "transformer_blocks.0.attn.to_q");
+            .visit_additive("time_mod_proj", &mut |path, host| {
+                assert_eq!(path, "time_mod_proj");
                 host.add_lora(
                     Tensor::ones((4, 1), DType::F32, &dev).unwrap(),
                     Tensor::ones((1, 4), DType::F32, &dev).unwrap(),
