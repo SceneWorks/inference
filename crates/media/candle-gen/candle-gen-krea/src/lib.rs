@@ -2101,6 +2101,7 @@ mod tests {
     ) -> gen_core::MemoryRunContext {
         let calibration = contract.calibration.as_ref().unwrap();
         gen_core::MemoryRunContext {
+            optimization_authority: gen_core::MemoryOptimizationAuthority::Calibrated,
             selection: gen_core::MemorySelection {
                 strategy: gen_core::MemoryStrategy::Resident,
                 parameters: Default::default(),

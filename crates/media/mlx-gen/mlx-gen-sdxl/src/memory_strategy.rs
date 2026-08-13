@@ -885,7 +885,7 @@ pub(crate) fn safety_check(
         // mode axis is deliberately permissive — unlike a text-to-image-only family. What is NOT
         // permissive is the geometry: a bounded decode must name a geometry from the route it will
         // actually execute on.
-        if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode)
+        if contract.engages_selection(&context.selection, MemoryStrategy::BoundedDecode)
             && contract
                 .capability(MemoryStrategy::BoundedDecode)
                 .is_none_or(|capability| capability.parameters.decode_geometry_policies.is_empty())
@@ -1044,6 +1044,7 @@ fn begin_with_cleanup(
         widest_transformer_stack(),
         move |_use_pid, edge, overlap| Err(refuse_decode(id, Some(edge), Some(overlap))),
     )?;
+    config.load_shape = context.load_shape;
     mlx_gen::request_scope::authorize_selected_geometry_decode(&mut config, contract, context)?;
     // Rungs 2 and 3 are `Missing`, so neither can be engaged and neither parameter is ever set.
     config.attention_chunk_size = None;

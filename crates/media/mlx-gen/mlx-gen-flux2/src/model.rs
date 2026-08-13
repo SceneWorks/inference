@@ -1540,6 +1540,7 @@ mod tests {
         let calibration = contract.calibration.as_ref().expect("calibration identity");
         let tier = model.memory_numeric_tier.expect("loaded numeric tier");
         MemoryRunContext {
+            optimization_authority: mlx_gen::gen_core::MemoryOptimizationAuthority::Calibrated,
             selection: MemorySelection {
                 strategy: MemoryStrategy::Resident,
                 parameters: Default::default(),

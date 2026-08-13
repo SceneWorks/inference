@@ -101,6 +101,8 @@ fn max_delta(a: &[u8], b: &[u8]) -> u32 {
 fn production_latent_quality_admission() {
     let revision = std::env::var("DECODE_QUALITY_SOURCE_REVISION")
         .expect("DECODE_QUALITY_SOURCE_REVISION must bind the exact snapshot");
+    let repository = std::env::var("QUALITY_REPOSITORY")
+        .expect("QUALITY_REPOSITORY must bind the exact snapshot repository");
     let tier = tier();
     let dir = tier_dir(&tier);
     let steps = env_u32("DECODE_QUALITY_STEPS", DEFAULT_STEPS as u32) as usize;
@@ -170,12 +172,20 @@ fn production_latent_quality_admission() {
                 mlx_gen_sdxl::decode_image_tiled(heavy.vae(), &latent, None, Some(&tiling), None)
                     .expect("tiled decode");
             println!(
-                "DECODE_QUALITY_V1 {}",
+                "DECODE_QUALITY_V2 {}",
                 serde_json::json!({
                     "family": "kolors",
                     "resolvedRoute": "kolors",
                     "backend": "mlx",
                     "tier": tier.as_str(),
+                    "loadShape": "eager_materialization",
+                    "artifact": {
+                        "repository": repository.as_str(),
+                        "revision": revision.as_str(),
+                        "variant": tier.as_str(),
+                        "fingerprint": format!("{repository}@{revision}:{tier}"),
+                    },
+                    "implementationFingerprint": mlx_gen::gen_core::MEMORY_DECODE_QUALITY_IMPLEMENTATION_FINGERPRINT,
                     "mode": "text_to_image",
                     "overlay": null,
                     "geometry": { "width": width, "height": height, "batch": 1, "frames": 1, "referenceCount": 0 },

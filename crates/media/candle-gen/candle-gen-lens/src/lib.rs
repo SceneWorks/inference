@@ -2937,6 +2937,7 @@ mod integration_tests {
             memory_contract: Some(contract),
         };
         let mut context = gen_core::MemoryRunContext {
+            optimization_authority: gen_core::MemoryOptimizationAuthority::Calibrated,
             selection: gen_core::MemorySelection {
                 strategy: gen_core::MemoryStrategy::BoundedTransformerResidency,
                 parameters: gen_core::MemoryStrategyParameters {

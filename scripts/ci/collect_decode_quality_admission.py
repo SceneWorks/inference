@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Seal correctness-only production-latent decode receipts into ABI-1 policy rows.
+"""Seal correctness-only production-latent decode receipts into ABI-2 policy rows.
 
 The collector deliberately accepts an exact semantic allowlist. A receipt containing timing,
 memory, allocator, footprint, or any other field is rejected rather than accidentally promoted into
@@ -10,19 +10,31 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable
 
-
-MARKER = "DECODE_QUALITY_V1 "
-QUALITY_ABI = 1
+MARKER = "DECODE_QUALITY_V2 "
+QUALITY_ABI = 2
+_FINGERPRINT_SCRIPT = Path(__file__).with_name("decode_quality_implementation_fingerprint.py")
+_FINGERPRINT_SPEC = importlib.util.spec_from_file_location(
+    "decode_quality_implementation_fingerprint", _FINGERPRINT_SCRIPT
+)
+if _FINGERPRINT_SPEC is None or _FINGERPRINT_SPEC.loader is None:
+    raise RuntimeError("cannot load decode-quality implementation fingerprint helper")
+_FINGERPRINT_MODULE = importlib.util.module_from_spec(_FINGERPRINT_SPEC)
+_FINGERPRINT_SPEC.loader.exec_module(_FINGERPRINT_MODULE)
+IMPLEMENTATION_FINGERPRINT = _FINGERPRINT_MODULE.embedded()
 REQUIRED_KEYS = {
     "family",
     "resolvedRoute",
     "backend",
     "tier",
+    "loadShape",
+    "artifact",
+    "implementationFingerprint",
     "mode",
     "overlay",
     "geometry",
@@ -43,6 +55,9 @@ COORDINATE_KEYS = (
     "resolvedRoute",
     "backend",
     "tier",
+    "loadShape",
+    "artifact",
+    "implementationFingerprint",
     "mode",
     "overlay",
     "geometry",
@@ -78,6 +93,38 @@ def _validate_receipt(receipt: dict[str, Any]) -> None:
     _require(receipt["backend"] == "mlx", "decode-quality admission currently supports MLX only")
     _require(receipt["tier"] in {"bf16", "q4", "q8", "nvfp4", "fp32"}, "unsupported tier")
     _require(
+        receipt["loadShape"] in {"eager_materialization", "deferred_materialization"},
+        "unsupported loadShape",
+    )
+    artifact = receipt["artifact"]
+    _require(
+        isinstance(artifact, dict)
+        and set(artifact) == {"repository", "revision", "variant", "fingerprint"},
+        "artifact must use the exact ABI-2 identity axes",
+    )
+    for field in ("repository", "variant", "fingerprint"):
+        _require(
+            isinstance(artifact[field], str) and bool(artifact[field].strip()),
+            f"artifact.{field} must be a nonempty string",
+        )
+    _require(
+        isinstance(artifact["revision"], str)
+        and len(artifact["revision"]) == 40
+        and all(character in "0123456789abcdef" for character in artifact["revision"]),
+        "artifact.revision must be an exact lowercase 40-hex revision",
+    )
+    implementation = receipt["implementationFingerprint"]
+    _require(
+        isinstance(implementation, str)
+        and len(implementation) == 64
+        and all(character in "0123456789abcdef" for character in implementation),
+        "implementationFingerprint must be lowercase SHA-256",
+    )
+    _require(
+        implementation == IMPLEMENTATION_FINGERPRINT,
+        "implementationFingerprint must match the collector's running inference source closure",
+    )
+    _require(
         receipt["overlay"] is None
         or (
             isinstance(receipt["overlay"], str)
@@ -91,7 +138,7 @@ def _validate_receipt(receipt: dict[str, Any]) -> None:
     _require(
         isinstance(geometry, dict)
         and set(geometry) == {"width", "height", "batch", "frames", "referenceCount"},
-        "geometry must use the exact ABI-1 axes",
+        "geometry must use the exact ABI-2 axes",
     )
     _require(
         all(type(geometry[key]) is int and geometry[key] > 0 for key in ("width", "height", "batch", "frames")),
@@ -140,7 +187,7 @@ def read_receipts(paths: Iterable[Path]) -> list[dict[str, Any]]:
             _require(isinstance(receipt, dict), f"{path}:{line_number}: receipt must be an object")
             _validate_receipt(receipt)
             receipts.append(receipt)
-    _require(bool(receipts), "no DECODE_QUALITY_V1 receipts found")
+    _require(bool(receipts), "no DECODE_QUALITY_V2 receipts found")
     return receipts
 
 
@@ -178,6 +225,14 @@ def _canonical_policy(policy: dict[str, Any]) -> dict[str, Any]:
         "resolved_route": policy["resolvedRoute"],
         "backend": policy["backend"],
         "tier": _canonical_tier(policy["tier"]),
+        "load_shape": policy["loadShape"],
+        "artifact": {
+            "repository": policy["artifact"]["repository"],
+            "revision": policy["artifact"]["revision"],
+            "variant": policy["artifact"]["variant"],
+            "fingerprint": policy["artifact"]["fingerprint"],
+        },
+        "implementation_fingerprint": policy["implementationFingerprint"],
         "mode": policy["mode"],
         "overlay": policy["overlay"],
         "geometry": {
@@ -263,7 +318,10 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     policies = seal(read_receipts(args.input))
-    args.output.write_text(json.dumps(policies, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    payload = json.dumps(policies, indent=2, ensure_ascii=False) + "\n"
+    temporary = args.output.with_suffix(args.output.suffix + ".tmp")
+    temporary.write_text(payload, encoding="utf-8")
+    temporary.replace(args.output)
     print(f"sealed {len(policies)} decode-quality policy row(s) from correctness-only receipts")
     return 0
 

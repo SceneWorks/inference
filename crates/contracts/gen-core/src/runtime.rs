@@ -8,7 +8,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use crate::memory_strategy::{MemoryBackend, MemoryDecodeGeometryPolicy, MemoryNumericTier};
+use crate::memory_strategy::{
+    MemoryBackend, MemoryDecodeGeometryPolicy, MemoryDecodeQualityRuntimeIdentity,
+    MemoryNumericTier,
+};
 
 /// Conditional [`LoadSpec::components`] id used when [`LoadSpec::weights`] is a single-file DiT.
 ///
@@ -517,6 +520,9 @@ pub struct LoadSpec {
     /// rows only when their route/backend/numeric-tier contract validates them; the semantic records
     /// are independent from model-memory calibration evidence.
     pub decode_geometry_policies: Vec<MemoryDecodeGeometryPolicy>,
+    /// Independently resolved runtime identity for the packaged quality rows. A non-empty table
+    /// without this binding is malformed and fails closed before provider construction.
+    pub decode_quality_runtime_identity: Option<MemoryDecodeQualityRuntimeIdentity>,
     /// Caller-prepared identities for every single-file source carried by this spec.
     ///
     /// SceneWorks resolves and confines primary weights, controls, adapters, typed auxiliaries, and
@@ -685,6 +691,7 @@ impl LoadSpec {
             weights,
             resolved_route: None,
             decode_geometry_policies: Vec::new(),
+            decode_quality_runtime_identity: None,
             prepared_file_pins: PreparedFilePins::default(),
             quantize: None,
             precision: Precision::Bf16,
@@ -716,6 +723,15 @@ impl LoadSpec {
         self
     }
 
+    /// Bind packaged decode-quality rows to the artifact and source closure actually being loaded.
+    pub fn with_decode_quality_runtime_identity(
+        mut self,
+        identity: MemoryDecodeQualityRuntimeIdentity,
+    ) -> Self {
+        self.decode_quality_runtime_identity = Some(identity);
+        self
+    }
+
     /// Return only a route-bound quality table. A shared engine must never infer the catalog route
     /// from its provider id when semantic decode evidence is present.
     pub fn route_bound_decode_geometry_policies(
@@ -724,6 +740,12 @@ impl LoadSpec {
         if self.decode_geometry_policies.is_empty() {
             return Ok(Vec::new());
         }
+        let identity = self.decode_quality_runtime_identity.as_ref().ok_or_else(|| {
+            crate::Error::Unsupported(
+                "decode-quality policies require independently resolved artifact and implementation identity"
+                    .to_owned(),
+            )
+        })?;
         let route = self.resolved_route.as_deref().ok_or_else(|| {
             crate::Error::Unsupported(
                 "decode-quality policies require an exact caller-resolved route".to_owned(),
@@ -756,14 +778,25 @@ impl LoadSpec {
                 )));
             }
         }
+        if let Some(foreign) = self.decode_geometry_policies.iter().find(|policy| {
+            policy.artifact != identity.artifact
+                || policy.implementation_fingerprint != identity.implementation_fingerprint
+        }) {
+            return Err(crate::Error::Unsupported(format!(
+                "decode-quality policy artifact/source identity {:?}/{} cannot authorize loaded identity {:?}/{}",
+                foreign.artifact,
+                foreign.implementation_fingerprint,
+                identity.artifact,
+                identity.implementation_fingerprint,
+            )));
+        }
         Ok(self.decode_geometry_policies.clone())
     }
 
     /// Select the rows applicable to one concrete loaded provider contract. A manifest table may
-    /// contain several shipped numeric tiers for the same catalog route; only the exact loaded tier
-    /// enters the runtime contract. Materialization shape is deliberately not a quality axis: it
-    /// does not change the production latent or VAE decoder route. A different backend is a
-    /// malformed table, not an unrelated row to ignore.
+    /// contain several shipped numeric tiers and load shapes for the same catalog route; only the
+    /// exact loaded tier and shape enter the runtime contract. A different backend is a malformed
+    /// table, not an unrelated row to ignore.
     pub fn decode_geometry_policies_for_loaded_contract(
         &self,
         backend: MemoryBackend,
@@ -778,7 +811,7 @@ impl LoadSpec {
         }
         Ok(policies
             .into_iter()
-            .filter(|policy| policy.tier == tier)
+            .filter(|policy| policy.tier == tier && policy.load_shape == self.load_shape)
             .collect())
     }
 

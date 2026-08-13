@@ -2,10 +2,10 @@
 
 use gen_core::{
     LoadSpec, MemoryBehaviorRegistration, MemoryBudget, MemoryCacheState, MemoryCleanupSemantics,
-    MemoryContractFixtureRegistration, MemoryGeometry, MemoryMode, MemoryNumericTier, MemoryPhase,
-    MemoryProviderContract, MemoryRegistration, MemoryRunContext, MemoryRunOutcome,
-    MemorySafetyDecision, MemorySelection, MemoryStrategy, MemoryStrategyParameters,
-    MemoryStrategySupport, Precision, ProviderRegistry,
+    MemoryContractFixtureRegistration, MemoryGeometry, MemoryMode, MemoryNumericTier,
+    MemoryOptimizationAuthority, MemoryPhase, MemoryProviderContract, MemoryRegistration,
+    MemoryRunContext, MemoryRunOutcome, MemorySafetyDecision, MemorySelection, MemoryStrategy,
+    MemoryStrategyParameters, MemoryStrategySupport, Precision, ProviderRegistry,
 };
 
 /// Check the static declaration and the safety-critical runtime semantics every provider must share.
@@ -507,6 +507,7 @@ fn route_context(
                 component_precision_floors: &[],
             },
         },
+        optimization_authority: MemoryOptimizationAuthority::Calibrated,
         calibration_abi,
         calibration_fingerprint: calibration_fingerprint.to_owned(),
         load_shape,

@@ -722,7 +722,7 @@ jobs:
   # SC-18325: correctness-only production-latent tiled-decode admission. These three profiles are
   # manual dispatch only. They do not invoke a memory ladder, read clocks/allocator/process state,
   # or create calibration/performance data; the collector rejects every field outside the semantic
-  # latent/output SHA + max-RGB allowlist before sealing ABI-1 policy rows.
+  # latent/output SHA + max-RGB allowlist before sealing ABI-2 policy rows.
   mlx-decode-quality-kolors:
     name: Decode quality admission (Kolors)
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'decode-quality-kolors'
@@ -767,6 +767,7 @@ jobs:
           DECODE_QUALITY_SOURCE_REVISION: ${{ env.QUALITY_SOURCE_REVISION }}
         run: |
           set -euo pipefail
+          python3.12 scripts/ci/decode_quality_implementation_fingerprint.py --check
           log="$RUNNER_TEMP/decode-quality-kolors.log"
           out="$(cargo test --locked --release -p mlx-gen-kolors \
             --test decode_quality_admission production_latent_quality_admission \
@@ -866,6 +867,7 @@ jobs:
           DECODE_QUALITY_SOURCE_REVISION: ${{ env.QUALITY_SOURCE_REVISION }}
         run: |
           set -euo pipefail
+          python3.12 scripts/ci/decode_quality_implementation_fingerprint.py --check
           log="$RUNNER_TEMP/decode-quality-$QUALITY_MODEL.log"
           out="$(cargo test --locked --release -p mlx-gen-sdxl \
             --test decode_quality_admission production_latent_quality_admission \
@@ -953,6 +955,7 @@ jobs:
           DECODE_QUALITY_SOURCE_REVISION: ${{ env.QUALITY_SOURCE_REVISION }}
         run: |
           set -euo pipefail
+          python3.12 scripts/ci/decode_quality_implementation_fingerprint.py --check
           log="$RUNNER_TEMP/decode-quality-$QUALITY_MODEL.log"
           out="$(cargo test --locked --release -p mlx-gen-chroma \
             --test decode_quality_admission production_latent_quality_admission \

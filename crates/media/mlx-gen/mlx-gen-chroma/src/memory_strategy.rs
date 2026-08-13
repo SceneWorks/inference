@@ -720,7 +720,7 @@ pub(crate) fn safety_check(
                 contract.provider_id
             )));
         }
-        if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode)
+        if contract.engages_selection(&context.selection, MemoryStrategy::BoundedDecode)
             && contract
                 .capability(MemoryStrategy::BoundedDecode)
                 .is_none_or(|capability| capability.parameters.decode_geometry_policies.is_empty())
@@ -816,6 +816,7 @@ fn begin_request_with_cleanup(
                 .map_err(CoreError::Unsupported)
         },
     )?;
+    config.load_shape = context.load_shape;
     mlx_gen::request_scope::authorize_selected_geometry_decode(&mut config, contract, context)?;
     config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
     config.transformer_window = contract

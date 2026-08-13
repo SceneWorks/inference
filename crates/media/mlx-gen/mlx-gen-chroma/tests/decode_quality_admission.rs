@@ -128,6 +128,8 @@ fn production_latent_quality_admission() {
         .unwrap_or_else(|| variant.default_true_cfg());
     let revision = std::env::var("DECODE_QUALITY_SOURCE_REVISION")
         .expect("DECODE_QUALITY_SOURCE_REVISION must bind the exact snapshot");
+    let repository = std::env::var("QUALITY_REPOSITORY")
+        .expect("QUALITY_REPOSITORY must bind the exact snapshot repository");
     // The correctness accessor deliberately drives the warm-resident production components. It is
     // not available on `Sequential`, whose components exist only inside the request closure.
     let spec = LoadSpec::new(WeightsSource::Dir(dir.clone()));
@@ -169,12 +171,20 @@ fn production_latent_quality_admission() {
                     .expect("tiled image")
                     .pixels;
             println!(
-                "DECODE_QUALITY_V1 {}",
+                "DECODE_QUALITY_V2 {}",
                 serde_json::json!({
                     "family": "chroma",
                     "resolvedRoute": resolved_route,
                     "backend": "mlx",
                     "tier": tier.as_str(),
+                    "loadShape": "eager_materialization",
+                    "artifact": {
+                        "repository": repository.as_str(),
+                        "revision": revision.as_str(),
+                        "variant": tier.as_str(),
+                        "fingerprint": format!("{repository}@{revision}:{tier}"),
+                    },
+                    "implementationFingerprint": mlx_gen::gen_core::MEMORY_DECODE_QUALITY_IMPLEMENTATION_FINGERPRINT,
                     "mode": "text_to_image",
                     "overlay": null,
                     "geometry": { "width": width, "height": height, "batch": 1, "frames": 1, "referenceCount": 0 },

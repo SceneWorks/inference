@@ -744,6 +744,7 @@ mod tests {
         let contract = memory_strategy_contract("krea_2_turbo_control", &spec).unwrap();
         let calibration = contract.calibration.as_ref().unwrap();
         let context_for = |quant| MemoryRunContext {
+            optimization_authority: mlx_gen::gen_core::MemoryOptimizationAuthority::Calibrated,
             selection: MemorySelection {
                 strategy: MemoryStrategy::Resident,
                 parameters: MemoryStrategyParameters::default(),

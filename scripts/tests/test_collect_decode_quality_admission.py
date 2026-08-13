@@ -19,6 +19,14 @@ def receipt(seed: int, error: int) -> dict:
         "resolvedRoute": "realvisxl",
         "backend": "mlx",
         "tier": "q4",
+        "loadShape": "deferred_materialization",
+        "artifact": {
+            "repository": "SceneWorks/realvisxl-mlx",
+            "revision": "a" * 40,
+            "variant": "q4",
+            "fingerprint": f"SceneWorks/realvisxl-mlx@{'a' * 40}:q4",
+        },
+        "implementationFingerprint": collector.IMPLEMENTATION_FINGERPRINT,
         "mode": "text_to_image",
         "overlay": None,
         "geometry": {
@@ -47,7 +55,7 @@ def test_seals_a_multi_seed_coordinate_and_retains_failure_reason(tmp_path: Path
     log.write_text(
         "noise\n"
         + "\n".join(
-            f"test output DECODE_QUALITY_V1 {json.dumps(row)}"
+            f"test output DECODE_QUALITY_V2 {json.dumps(row)}"
             for row in (receipt(7, 47), receipt(99, 52))
         )
         + "\n",
@@ -74,7 +82,7 @@ def test_rejects_nonsemantic_fields_instead_of_absorbing_measurements(tmp_path: 
     row["elapsedMs"] = 12
     log = tmp_path / "quality.log"
     log.write_text(
-        f"DECODE_QUALITY_V1 {json.dumps(row)}\n",
+        f"DECODE_QUALITY_V2 {json.dumps(row)}\n",
         encoding="utf-8",
     )
 
@@ -98,7 +106,68 @@ def test_rejects_malformed_semantic_coordinates(
         row["overlap"] = 128
     row[field] = value
     log = tmp_path / "quality.log"
-    log.write_text(f"DECODE_QUALITY_V1 {json.dumps(row)}\n", encoding="utf-8")
+    log.write_text(f"DECODE_QUALITY_V2 {json.dumps(row)}\n", encoding="utf-8")
 
+    with pytest.raises(ValueError, match=message):
+        collector.read_receipts([log])
+
+
+def test_load_shape_artifact_implementation_and_tile_pair_are_exact_coordinates() -> None:
+    rows = [receipt(7, 1), receipt(99, 2)]
+    variants: list[dict] = []
+    for mutate in (
+        lambda row: row.update(loadShape="eager_materialization"),
+        lambda row: row["artifact"].update(variant="q8"),
+        lambda row: row.update(tileEdge=768, overlap=128),
+    ):
+        pair = [receipt(7, 1), receipt(99, 2)]
+        for row in pair:
+            mutate(row)
+        variants.extend(pair)
+
+    policies = collector.seal([*rows, *variants])
+    assert len(policies) == 4
+    coordinates = {
+        (
+            policy["loadShape"],
+            policy["artifact"]["variant"],
+            policy["implementationFingerprint"],
+            policy["tileEdge"],
+            policy["overlap"],
+        )
+        for policy in policies
+    }
+    assert len(coordinates) == 4
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda row: row.update(loadShape="deferred"), "unsupported loadShape"),
+        (
+            lambda row: row["artifact"].update(revision="A" * 40),
+            "artifact.revision",
+        ),
+        (
+            lambda row: row["artifact"].update(extra="ambient"),
+            "exact ABI-2 identity axes",
+        ),
+        (
+            lambda row: row.update(implementationFingerprint="g" * 64),
+            "implementationFingerprint",
+        ),
+        (
+            lambda row: row.update(implementationFingerprint="f" * 64),
+            "running inference source closure",
+        ),
+    ],
+)
+def test_rejects_malformed_load_and_source_identity(
+    tmp_path: Path, mutate, message: str
+) -> None:
+    row = receipt(7, 1)
+    mutate(row)
+    log = tmp_path / "quality.log"
+    log.write_text(f"DECODE_QUALITY_V2 {json.dumps(row)}\n", encoding="utf-8")
     with pytest.raises(ValueError, match=message):
         collector.read_receipts([log])

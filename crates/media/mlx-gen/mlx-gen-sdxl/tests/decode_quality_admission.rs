@@ -115,6 +115,8 @@ fn production_latent_quality_admission() {
     );
     let revision = std::env::var("DECODE_QUALITY_SOURCE_REVISION")
         .expect("DECODE_QUALITY_SOURCE_REVISION must bind the exact snapshot");
+    let repository = std::env::var("QUALITY_REPOSITORY")
+        .expect("QUALITY_REPOSITORY must bind the exact snapshot repository");
     let tier = tier();
     let steps = env_u32(
         "DECODE_QUALITY_STEPS",
@@ -180,12 +182,20 @@ fn production_latent_quality_admission() {
                 "the capture seam must leave the ordinary dense production output byte-identical"
             );
             println!(
-                "DECODE_QUALITY_V1 {}",
+                "DECODE_QUALITY_V2 {}",
                 serde_json::json!({
                     "family": "sdxl",
                     "resolvedRoute": resolved_route.as_str(),
                     "backend": "mlx",
                     "tier": tier.as_str(),
+                    "loadShape": "deferred_materialization",
+                    "artifact": {
+                        "repository": repository.as_str(),
+                        "revision": revision.as_str(),
+                        "variant": tier.as_str(),
+                        "fingerprint": format!("{repository}@{revision}:{tier}"),
+                    },
+                    "implementationFingerprint": mlx_gen::gen_core::MEMORY_DECODE_QUALITY_IMPLEMENTATION_FINGERPRINT,
                     "mode": "text_to_image",
                     "overlay": null,
                     "geometry": { "width": width, "height": height, "batch": 1, "frames": 1, "referenceCount": 0 },

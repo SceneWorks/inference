@@ -1817,6 +1817,7 @@ mod tests {
             * 1_000_000_000.0)
             .round() as u64;
         let valid = MemoryRunContext {
+            optimization_authority: mlx_gen::gen_core::MemoryOptimizationAuthority::Calibrated,
             selection: MemorySelection {
                 strategy: MemoryStrategy::Resident,
                 parameters: MemoryStrategyParameters::default(),
@@ -2020,6 +2021,7 @@ mod tests {
         };
         let contract = memory_strategy_contract("mage_flow", Some(Quant::Q4));
         let context = MemoryRunContext {
+            optimization_authority: mlx_gen::gen_core::MemoryOptimizationAuthority::Calibrated,
             selection,
             calibration_abi: mlx_gen::gen_core::MEMORY_CALIBRATION_ABI,
             calibration_fingerprint: MEMORY_CALIBRATION_FINGERPRINT.to_owned(),
