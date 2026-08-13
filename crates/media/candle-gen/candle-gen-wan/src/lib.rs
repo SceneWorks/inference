@@ -36,6 +36,7 @@ pub mod dit_train;
 // dequantize per-matmul (ComfyUI-GGUF parity), NEVER pre-dequantized to dense at load. Selected on the
 // 5B by the `CANDLE_GEN_WAN_GGUF` sub-story-1 test seam (manifest/catalog routing is sub-story 2).
 mod gguf;
+pub mod memory_strategy;
 pub mod model_vace;
 pub mod pipeline;
 pub mod quant;
@@ -154,6 +155,28 @@ use scheduler::{flow_shift, FlowScheduler, Sampler};
 use text_encoder::Umt5Encoder;
 use transformer::WanTransformer;
 
+/// The DiT source is resolved exactly once when the generator is loaded. The native-GGUF seam is
+/// process-global today, but generation must never re-read it: doing so could make a generator whose
+/// admission contract was calibrated from the snapshot execute a different weight representation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DitSource {
+    Snapshot,
+    NativeGguf(PathBuf),
+}
+
+impl DitSource {
+    pub(crate) fn from_environment() -> Self {
+        crate::gguf::env_gguf_path().map_or(Self::Snapshot, Self::NativeGguf)
+    }
+
+    fn gguf_path(&self) -> Option<&Path> {
+        match self {
+            Self::Snapshot => None,
+            Self::NativeGguf(path) => Some(path),
+        }
+    }
+}
+
 /// Concrete z48 VAE assigned to the TI2V-5B route.
 pub type Ti2vProviderVae = vae::WanVae;
 
@@ -187,6 +210,7 @@ struct Pipeline {
     vae_cfg: VaeConfig,
     root: PathBuf,
     device: Device,
+    dit_source: DitSource,
     /// LoRA/LoKr adapters to apply to the DiT at load (sc-10095). On a dense tier they FOLD into the
     /// weights ([`adapters::merge_adapters`]); on a packed q4/q8 tier they attach as forward-time
     /// **additive** residuals ([`adapters::install_additive`], sc-10094) — a packed tier has no dense
@@ -195,7 +219,12 @@ struct Pipeline {
 }
 
 impl Pipeline {
-    fn load(root: &Path, device: &Device, adapters: Vec<AdapterSpec>) -> Self {
+    fn load(
+        root: &Path,
+        device: &Device,
+        adapters: Vec<AdapterSpec>,
+        dit_source: DitSource,
+    ) -> Self {
         Self {
             adapters,
             te_cfg: TextEncoderConfig::umt5_xxl(),
@@ -203,6 +232,7 @@ impl Pipeline {
             vae_cfg: VaeConfig::ti2v_5b(),
             root: root.to_path_buf(),
             device: device.clone(),
+            dit_source,
         }
     }
 
@@ -260,12 +290,13 @@ impl Pipeline {
     /// fold into, and LoKr/LoHa on it is rejected there (deferred to sc-10050/10051). The 5B is a single
     /// (non-MoE) DiT, so every adapter is shared (`moe_expert = None`); the `expert` arg is a formality.
     fn build_dit(&self) -> CResult<WanTransformer> {
-        // sub-story-1 test seam (sc-12735): a native-GGUF k-quant DiT path, selected by the
-        // `CANDLE_GEN_WAN_GGUF` env var pointing at a downloaded `QuantStack/Wan2.2-TI2V-5B-GGUF` `.gguf`.
+        // sub-story-1 test seam (sc-12735): a native-GGUF k-quant DiT path, selected once at generator
+        // load from `CANDLE_GEN_WAN_GGUF`. Never re-read the environment here: the captured source is
+        // part of the loaded generator's identity and a GGUF source has no SC-19223 calibration.
         // The DiT is held as resident Q4_K_M `QTensor`s (dequant-on-matmul) — the loader-proof this PR
         // lands. Manifest/catalog/tier routing is sub-story 2; adapter routing on this path is a later
         // sub-story, so a LoRA/LoKr spec on the GGUF seam is rejected loudly rather than silently ignored.
-        if let Some(gguf) = crate::gguf::env_gguf_path() {
+        if let Some(gguf) = self.dit_source.gguf_path() {
             if !self.adapters.is_empty() {
                 return Err(CandleError::Msg(format!(
                     "wan: LoRA/LoKr on the native-GGUF 5B path ({}) is not wired yet — sc-12735 sub-story \
@@ -275,7 +306,7 @@ impl Pipeline {
             }
             // candle_core::Result → CResult (CandleError) via the `?` bridge.
             return Ok(crate::gguf::load_wan_dit_gguf(
-                &gguf,
+                gguf,
                 &self.dit_cfg,
                 &self.device,
                 DIT_DTYPE,
@@ -492,9 +523,12 @@ impl Pipeline {
         // Memory-bounded z48 vae22 decode (sc-7111): the per-frame streaming `decode` already bounds
         // the temporal axis; `decode_budgeted` adds budgeted **spatial** tiling so a single high-res
         // frame can't spike VRAM, and returns a catchable error rather than OOM-ing when over budget.
-        let decoded = comps
-            .vae
-            .decode_budgeted_with_cancel(&latents, &req.cancel)?;
+        let decode_cap = memory_strategy::selected_decode_cap(req)?;
+        let decoded = comps.vae.decode_budgeted_with_cancel_and_tile_cap(
+            &latents,
+            &req.cancel,
+            decode_cap,
+        )?;
         let images = pipeline::frames_to_images(&decoded)?;
         Ok((images, knobs.fps))
     }
@@ -603,7 +637,9 @@ impl Pipeline {
             |vae, st| {
                 (st.on_progress)(Progress::Decoding);
                 let latents = st.latents.as_ref().expect("latents denoised in stage 2");
-                let decoded = vae.decode_budgeted_with_cancel(latents, cancel)?;
+                let decode_cap = memory_strategy::selected_decode_cap(req)?;
+                let decoded =
+                    vae.decode_budgeted_with_cancel_and_tile_cap(latents, cancel, decode_cap)?;
                 let images = pipeline::frames_to_images(&decoded)?;
                 Ok((images, knobs.fps))
             },
@@ -646,8 +682,11 @@ struct SeqState<'a> {
 
 pub struct WanGenerator {
     descriptor: ModelDescriptor,
+    memory_strategy: Option<gen_core::MemoryProviderContract>,
+    memory_tier: Option<gen_core::MemoryNumericTier>,
     root: PathBuf,
     device: Device,
+    dit_source: DitSource,
     /// LoRA/LoKr adapters applied to the DiT at first load (sc-10095) — folded (dense) or additive
     /// (packed q4/q8 tier).
     adapters: Vec<AdapterSpec>,
@@ -658,16 +697,63 @@ pub struct WanGenerator {
     /// keeping the ~11 GB bf16 UMT5 encoder (sc-12778) off-GPU. The resident [`components`](Self::components) cache
     /// stays untouched under `Sequential` — the staged path never populates it.
     offload: OffloadPolicy,
+    /// Serializes complete requests so a staged request can synchronize and release a prior warm
+    /// resident cache without racing another request that holds cloned component `Arc`s.
+    lifecycle: Mutex<()>,
     components: Mutex<Option<Components>>,
 }
 
+fn run_serialized_request<T>(
+    lifecycle: &Mutex<()>,
+    run: impl FnOnce() -> gen_core::Result<T>,
+) -> gen_core::Result<T> {
+    let _lifecycle = candle_gen::lock_recover(lifecycle);
+    run()
+}
+
+fn release_warm_cache_for_staged<T>(
+    cache: &Mutex<Option<T>>,
+    synchronize: impl FnOnce() -> CResult<()>,
+) -> CResult<bool> {
+    let mut cached = candle_gen::lock_recover(cache);
+    if cached.is_none() {
+        return Ok(false);
+    }
+    // A completed resident request may still have queued kernels referencing the cached weights.
+    // Fence first; on a fence failure retain the cache and fail closed rather than releasing live
+    // allocations. The caller's lifecycle lock proves no concurrent request holds another clone.
+    synchronize()?;
+    drop(cached.take());
+    Ok(true)
+}
+
 impl WanGenerator {
+    fn pipeline(&self) -> Pipeline {
+        Pipeline::load(
+            &self.root,
+            &self.device,
+            self.adapters.clone(),
+            self.dit_source.clone(),
+        )
+    }
+
     fn components(&self, pipe: &Pipeline) -> gen_core::Result<Components> {
         // `cached` recovers a poisoned lock (sc-9015) internally; `?` bridges the candle-side
         // `load_components` error into `gen_core::Error`.
         Ok(candle_gen::cached(&self.components, || {
             pipe.load_components()
         })?)
+    }
+
+    fn request_offload(&self, req: &GenerationRequest) -> OffloadPolicy {
+        if req.memory.is_some_and(|memory| memory.stage_residency) {
+            OffloadPolicy::Sequential
+        } else {
+            // An explicit Resident selection is represented by no request memory block. Preserve
+            // the policy with which this generator was loaded instead of silently overriding a
+            // caller-owned Sequential load.
+            self.offload
+        }
     }
 }
 
@@ -726,23 +812,62 @@ impl Generator for WanGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
-        let pipe = Pipeline::load(&self.root, &self.device, self.adapters.clone());
-        // Sequential offload (sc-12757): stage load→use→drop each heavy component so the denoise peak is
-        // the DiT alone — the ~11 GB bf16 UMT5 encoder is off-GPU for the whole denoise and the DiT is
-        // freed before the VAE loads. Resident (default): the cached `Components` bundle, unchanged path.
-        // The staged path never populates the resident cache.
-        let (frames, fps) = match self.offload {
-            OffloadPolicy::Sequential => pipe.render_sequential(req, on_progress)?,
-            OffloadPolicy::Resident => {
-                let components = self.components(&pipe)?;
-                pipe.render(req, &components, on_progress)?
-            }
-        };
-        Ok(GenerationOutput::Video {
-            frames,
-            fps,
-            audio: None,
+        run_serialized_request(&self.lifecycle, || {
+            let pipe = self.pipeline();
+            // Sequential offload (sc-12757): stage load→use→drop each heavy component so the
+            // denoise peak is the DiT alone. A request-selected staged transition must first evict a
+            // cache warmed by an earlier Resident request; otherwise it would load TE/DiT/VAE beside
+            // the still-resident aggregate and invalidate the published phase envelope.
+            let (frames, fps) = match self.request_offload(req) {
+                OffloadPolicy::Sequential => {
+                    release_warm_cache_for_staged(&self.components, || {
+                        Ok(self.device.synchronize()?)
+                    })?;
+                    pipe.render_sequential(req, on_progress)?
+                }
+                OffloadPolicy::Resident => {
+                    let components = self.components(&pipe)?;
+                    pipe.render(req, &components, on_progress)?
+                }
+            };
+            Ok(GenerationOutput::Video {
+                frames,
+                fps,
+                audio: None,
+            })
         })
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        self.memory_strategy.as_ref()
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        let (Some(contract), Some(tier)) = (self.memory_strategy.as_ref(), self.memory_tier) else {
+            return if context.selection.strategy == gen_core::MemoryStrategy::Resident {
+                gen_core::MemorySafetyDecision::Accept
+            } else {
+                gen_core::MemorySafetyDecision::Reject {
+                    reason: format!(
+                        "{MODEL_ID} loaded route has no calibrated memory-strategy contract"
+                    ),
+                }
+            };
+        };
+        memory_strategy::safety_check(contract, tier, context)
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        let (Some(contract), Some(tier)) = (self.memory_strategy.as_ref(), self.memory_tier) else {
+            return Ok(None);
+        };
+        memory_strategy::begin_request(contract, tier, self.device.clone(), context)
     }
 }
 
@@ -831,6 +956,13 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 /// policy, returning the concrete [`WanGenerator`] so the offload-policy wiring is unit-testable without
 /// a `dyn Generator` downcast (sc-12757, mirroring the A14B's `build_generator`).
 fn build_generator(spec: &LoadSpec) -> gen_core::Result<WanGenerator> {
+    build_generator_with_source(spec, DitSource::from_environment())
+}
+
+fn build_generator_with_source(
+    spec: &LoadSpec,
+    dit_source: DitSource,
+) -> gen_core::Result<WanGenerator> {
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),
         WeightsSource::File(_) => {
@@ -850,15 +982,29 @@ fn build_generator(spec: &LoadSpec) -> gen_core::Result<WanGenerator> {
             "candle wan does not support image / VACE conditioning yet (txt2video only)".into(),
         ));
     }
+    #[cfg(any(feature = "cuda", test))]
+    let (memory_strategy, memory_tier) =
+        match memory_strategy::contract_for_loaded(spec, &dit_source)? {
+            Some((contract, tier)) => (Some(contract), Some(tier)),
+            None => (None, None),
+        };
+    // The contract declares CandleCuda realization and must not leak from a CPU/Metal-loaded
+    // generator merely because the provider crate is part of that platform's catalog.
+    #[cfg(not(any(feature = "cuda", test)))]
+    let (memory_strategy, memory_tier) = (None, None);
     let device = candle_gen::default_device()?;
     // Video retains the explicit load-time policy contract (sc-12757).
     let offload = spec.offload_policy;
     Ok(WanGenerator {
         descriptor: descriptor(),
+        memory_strategy,
+        memory_tier,
         root,
         device,
+        dit_source,
         adapters: spec.adapters.clone(),
         offload,
+        lifecycle: Mutex::new(()),
         components: Mutex::new(None),
     })
 }
@@ -871,12 +1017,17 @@ candle_gen::register_generators! {
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    registry
+    let registry = registry
         .register_generator(TI2V_REGISTRATION)
         .register_generator(wan14b::T2V_14B_REGISTRATION)
         .register_generator(wan14b::I2V_14B_REGISTRATION)
-        .register_generator(model_vace::VACE_REGISTRATION)
-        .register_trainer(training::TRAINER_REGISTRATION)
+        .register_generator(model_vace::VACE_REGISTRATION);
+    #[cfg(any(feature = "cuda", test))]
+    let registry = registry
+        .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(memory_strategy::MEMORY_FIXTURE)
+        .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR);
+    registry.register_trainer(training::TRAINER_REGISTRATION)
 }
 
 /// Build the complete explicit Candle Wan provider catalog.
@@ -1241,6 +1392,7 @@ mod tests {
             vae_cfg: VaeConfig::ti2v_5b(),
             root: root.to_path_buf(),
             device: Device::Cpu,
+            dit_source: DitSource::Snapshot,
         }
     }
 
@@ -1339,6 +1491,87 @@ mod tests {
         )
         .unwrap();
         assert_eq!(sequential.offload, OffloadPolicy::Sequential);
+    }
+
+    #[test]
+    fn load_captures_dit_source_and_generation_pipeline_reuses_it() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/snap".into()));
+        let snapshot = build_generator_with_source(&spec, DitSource::Snapshot).unwrap();
+        assert_eq!(snapshot.pipeline().dit_source, DitSource::Snapshot);
+
+        let original = DitSource::NativeGguf("/weights/original.gguf".into());
+        let gguf = build_generator_with_source(&spec, original.clone()).unwrap();
+        assert_eq!(gguf.memory_strategy_contract(), None);
+        assert_eq!(gguf.pipeline().dit_source, original);
+        assert_ne!(
+            gguf.pipeline().dit_source,
+            DitSource::NativeGguf("/weights/environment-drift.gguf".into()),
+            "generation must use the source captured at load, not a later environment value"
+        );
+    }
+
+    #[test]
+    fn warm_resident_cache_is_fenced_then_released_before_staging() {
+        struct DropWitness(std::sync::Arc<Mutex<Vec<&'static str>>>);
+        impl Drop for DropWitness {
+            fn drop(&mut self) {
+                candle_gen::lock_recover(&self.0).push("drop-cache");
+            }
+        }
+
+        let log = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let cache = Mutex::new(Some(DropWitness(log.clone())));
+        assert!(release_warm_cache_for_staged(&cache, || {
+            candle_gen::lock_recover(&log).push("synchronize");
+            Ok(())
+        })
+        .unwrap());
+        assert!(candle_gen::lock_recover(&cache).is_none());
+        assert_eq!(
+            *candle_gen::lock_recover(&log),
+            ["synchronize", "drop-cache"],
+            "queued resident work must be fenced before cached weights are dropped"
+        );
+
+        let retained = Mutex::new(Some(7_u8));
+        assert!(release_warm_cache_for_staged(&retained, || {
+            Err(CandleError::Msg("fence failed".into()))
+        })
+        .is_err());
+        assert_eq!(
+            *candle_gen::lock_recover(&retained),
+            Some(7),
+            "a failed fence must retain the warm cache and fail closed"
+        );
+    }
+
+    #[test]
+    fn request_lifecycle_serializes_resident_to_staged_transitions() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let lifecycle = std::sync::Arc::new(Mutex::new(()));
+        let active = std::sync::Arc::new(AtomicUsize::new(0));
+        let max_active = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut threads = Vec::new();
+        for _ in 0..2 {
+            let lifecycle = lifecycle.clone();
+            let active = active.clone();
+            let max_active = max_active.clone();
+            threads.push(std::thread::spawn(move || {
+                run_serialized_request(&lifecycle, || {
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_active.fetch_max(now, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .unwrap();
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(max_active.load(Ordering::SeqCst), 1);
     }
 
     /// A liveness witness for the sequential-offload residency tests, mirroring the drop-order witnesses

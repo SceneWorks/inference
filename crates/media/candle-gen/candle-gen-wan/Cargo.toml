@@ -20,6 +20,7 @@ rand_distr = { workspace = true }
 # Read a trained adapter `.safetensors`' `__metadata__` (the LoKr `networkType`/`rank`/`alpha`), which
 # candle's own `safetensors::load` drops — the inference-side adapter merge (sc-5167, `adapters`).
 safetensors = "0.7"
+serde_json = { workspace = true }
 
 [features]
 default = []
