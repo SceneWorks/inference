@@ -151,6 +151,11 @@ pub use edit_provider::{
     SdxlEdit, SdxlEditPaths, SdxlEditRequest, DEFAULT_EDIT_STRENGTH, DEFAULT_INPAINT_STRENGTH,
 };
 
+// SDXL-family tile-ControlNet img2img provider for the image-detail utility (sc-18480). Kept as an
+// explicit route instead of widening the generic `sdxl` descriptor to arbitrary ControlNet shapes.
+pub mod detail_provider;
+pub use detail_provider::{SdxlDetail, SdxlDetailPaths, SdxlDetailRequest};
+
 /// SDXL edit (img2img / inpaint / outpaint) real-weight GPU validation (sc-6037) — env-driven,
 /// `#[ignore]`d integration test (the analog of the IP-Adapter Phase-5 harness).
 #[cfg(test)]

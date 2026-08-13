@@ -86,7 +86,8 @@ pub use adapters::{
 };
 pub use config::Krea2Config;
 pub use control_provider::{
-    Krea2Control, Krea2ControlPaths, Krea2ControlRequest, DEFAULT_CONTROL_SCALE,
+    load_control_from_native_dit_file, Krea2Control, Krea2ControlPaths, Krea2ControlRequest,
+    DEFAULT_CONTROL_SCALE,
 };
 // The resident aggregate. It splits internally into `pipeline::KreaText` (tokenizer + Qwen3-VL-4B TE)
 // and `pipeline::KreaHeavy` (DiT + VAE + optional PiD) so the `Sequential` path can drop the first
@@ -1274,19 +1275,22 @@ pub fn load_edit(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 /// pipeline as a snapshot load. `descriptor` selects the surface — Turbo [`descriptor()`] is the natural
 /// default (variant5 is a distilled-Turbo dense merge).
 ///
-/// No load-time adapters (the community merge already baked its LoRAs into the weights). `Sequential`
+/// `adapters` is the caller-selected user stack. Dense and plain-int8 native DiTs use the same
+/// canonical Krea target names as the snapshot route: diff-patches fold before assembly and
+/// LoRA/LoKr residuals install additively, with per-selected-file apply-or-reject. `Sequential`
 /// offload is not threaded — the single-file DiT has no
 /// snapshot dir to re-load from — so the generator is always `Resident`, mirroring the MLX entrypoint.
 pub fn load_from_native_dit_file(
     dit_file: impl AsRef<std::path::Path>,
     base_snapshot_dir: impl AsRef<std::path::Path>,
+    adapters: &[AdapterSpec],
     mut descriptor: ModelDescriptor,
 ) -> gen_core::Result<Box<dyn Generator>> {
     let root = base_snapshot_dir.as_ref().to_path_buf();
     let device = candle_gen::default_device()?;
     // Architecture config + TE/VAE/tokenizer come from the resident turnkey; only the DiT weights come
     // from the single file (dense or descriptor-validated plain int8 through the native remap).
-    let components = pipeline::load_components_native(&root, dit_file.as_ref(), &device)?;
+    let components = pipeline::load_components_native(&root, dit_file.as_ref(), &device, adapters)?;
     let residency = candle_gen::Residency::resident(
         KreaTextPhase::Resident,
         KreaHeavyPhase::Resident(Box::new(ResidentKrea {
@@ -1308,9 +1312,10 @@ pub fn load_from_native_dit_file(
         memory_contract: None,
         residency,
         root,
-        // The single-file entrypoint threads no load-time adapters (S0b scope), so no diff-patch guard.
-        adapters: Vec::new(),
-        has_diff_patch: false,
+        // Retain adapter identity for request-time policy and keep the diff-patch concurrency guard
+        // truthful for imported native DiTs too.
+        adapters: adapters.to_vec(),
+        has_diff_patch: crate::adapters::any_diff_patch(adapters),
     }))
 }
 
