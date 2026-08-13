@@ -233,8 +233,8 @@ pub fn provider_registry() -> mlx_gen::gen_core::Result<mlx_gen::gen_core::Provi
 // (`x+gate·norm(out)`), the complex RoPE rotation, and the control-branch hint injection
 // (`x+hint·scale`) — runs through `mx.compile` so MLX fuses each chain into a single Metal kernel.
 // The toggle + its RAII [`CompileGlueGuard`] are hoisted into core (F-104); re-export core's so the
-// process-global is shared with the FLUX family rather than each crate hand-rolling its own
-// `AtomicBool`. **Bit-exact** to the eager form; **enabled by the production denoise loops** (turbo +
+// request/thread-local setting is shared with the FLUX family. **Bit-exact** to the eager form;
+// **enabled by the production denoise loops** (turbo +
 // control, [`pipeline`]); left **off by default** so the reference-parity gates run eager. The
 // mixed-precision dtype flow (base bf16, f32 `control_context`, sc-2720) is preserved unchanged.
 pub(crate) use mlx_gen::nn::compile_glue;
@@ -244,8 +244,7 @@ pub use mlx_gen::nn::{set_compile_glue, CompileGlueGuard};
 mod compile_glue_guard_tests {
     use super::{compile_glue, set_compile_glue, CompileGlueGuard};
 
-    // Single-threaded test runner (`.cargo/config.toml` RUST_TEST_THREADS=1) makes the
-    // process-global `COMPILE_GLUE` safe to assert on, matching the existing `set_compile_glue`
+    // `COMPILE_GLUE` is isolated to this test's thread, matching the existing `set_compile_glue`
     // A/B tests in feed_forward / control_transformer.
     #[test]
     fn guard_enables_then_restores_prior_value() {
@@ -265,7 +264,7 @@ mod compile_glue_guard_tests {
         }
         assert!(compile_glue(), "guard restores the prior (on) on drop");
 
-        // Leave the global eager, as the reference-parity gates expect.
+        // Leave this thread eager, as the reference-parity gates expect.
         set_compile_glue(false);
     }
 }

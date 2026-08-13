@@ -7,7 +7,10 @@
 //! graduates here only once it is provably model-agnostic; we do not lift a block to a shared
 //! abstraction off a single model.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::{
+    cell::{Cell, RefCell},
+    collections::HashSet,
+};
 
 use mlx_rs::error::Exception;
 use mlx_rs::fast::layer_norm;
@@ -15,7 +18,11 @@ use mlx_rs::ops::{
     add, addmm, broadcast_to, conv2d as conv2d_op, conv3d as conv3d_op, dequantize, divide, erf,
     multiply, pad, power, quantize, sigmoid, subtract, tanh,
 };
-use mlx_rs::transforms::compile::compile;
+use mlx_rs::transforms::compile::{
+    compile, compile_retained, RetainedBinary as MlxRetainedBinary,
+    RetainedSlice as MlxRetainedSlice, RetainedTernary as MlxRetainedTernary,
+    RetainedUnary as MlxRetainedUnary,
+};
 use mlx_rs::{Array, Dtype};
 
 use crate::array::scalar;
@@ -108,44 +115,396 @@ impl TokenEmbedding {
     }
 }
 
-/// sc-2963 (rollout of the Wan sc-2957 template): the shared compiled-elementwise-*glue* toggle and
-/// its fusable helpers, hoisted out of the per-family transformers (F-101) so a fix to the wrapper
-/// lands once instead of N times. When on, each helper runs its chain through `mx.compile` so MLX
-/// fuses it into a single Metal kernel; **bit-exact** to the eager form (each family's
-/// `compile_parity` gate asserts `max|Δ|=0`). Process-global; set before the denoise loop, off by
-/// default so reference-parity gates run eager.
-static COMPILE_GLUE: AtomicBool = AtomicBool::new(false);
+struct RetainedSignatures {
+    cache_generation: u64,
+    values: HashSet<Vec<(Dtype, usize)>>,
+}
+
+impl RetainedSignatures {
+    fn new() -> Self {
+        Self {
+            cache_generation: mlx_rs::transforms::compile::cache_generation(),
+            values: HashSet::new(),
+        }
+    }
+
+    fn disposition(
+        &mut self,
+        signature: Vec<(Dtype, usize)>,
+    ) -> crate::diagnostics::CompileDisposition {
+        let cache_generation = mlx_rs::transforms::compile::cache_generation();
+        if self.cache_generation != cache_generation {
+            self.values.clear();
+            self.cache_generation = cache_generation;
+        }
+        if self.values.insert(signature) {
+            crate::diagnostics::CompileDisposition::RetainedMiss
+        } else {
+            crate::diagnostics::CompileDisposition::RetainedHit
+        }
+    }
+}
+
+fn record_retained(site: &'static str, disposition: crate::diagnostics::CompileDisposition) {
+    crate::diagnostics::record_compile(site, disposition);
+    crate::diagnostics::record_toggle(
+        crate::diagnostics::RETAINED_COMPILATION,
+        crate::diagnostics::ToggleDisposition::Applied,
+    );
+}
+
+/// A retained unary `mx.compile` handle, shape-polymorphic within each dtype/rank signature.
+#[doc(hidden)]
+pub struct RetainedUnary {
+    compiled: Box<dyn MlxRetainedUnary>,
+    signatures: RetainedSignatures,
+}
+
+impl RetainedUnary {
+    #[doc(hidden)]
+    pub fn new(compiled: Box<dyn MlxRetainedUnary>) -> Self {
+        Self {
+            compiled,
+            signatures: RetainedSignatures::new(),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn call(&mut self, site: &'static str, x: &Array) -> std::result::Result<Array, Exception> {
+        let signature = vec![(x.dtype(), x.ndim())];
+        let out = self.compiled.call_mut(x)?;
+        record_retained(site, self.signatures.disposition(signature));
+        Ok(out)
+    }
+}
+
+/// A retained two-input `mx.compile` handle, shape-polymorphic within each dtype/rank signature.
+#[doc(hidden)]
+pub struct RetainedBinary {
+    compiled: Box<dyn MlxRetainedBinary>,
+    signatures: RetainedSignatures,
+}
+
+impl RetainedBinary {
+    #[doc(hidden)]
+    pub fn new(compiled: Box<dyn MlxRetainedBinary>) -> Self {
+        Self {
+            compiled,
+            signatures: RetainedSignatures::new(),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn call(
+        &mut self,
+        site: &'static str,
+        args: (&Array, &Array),
+    ) -> std::result::Result<Array, Exception> {
+        let signature = vec![
+            (args.0.dtype(), args.0.ndim()),
+            (args.1.dtype(), args.1.ndim()),
+        ];
+        let out = self.compiled.call_mut(args)?;
+        record_retained(site, self.signatures.disposition(signature));
+        Ok(out)
+    }
+}
+
+/// A retained three-input `mx.compile` handle, shape-polymorphic within each dtype/rank signature.
+#[doc(hidden)]
+pub struct RetainedTernary {
+    compiled: Box<dyn MlxRetainedTernary>,
+    signatures: RetainedSignatures,
+}
+
+impl RetainedTernary {
+    #[doc(hidden)]
+    pub fn new(compiled: Box<dyn MlxRetainedTernary>) -> Self {
+        Self {
+            compiled,
+            signatures: RetainedSignatures::new(),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn call(
+        &mut self,
+        site: &'static str,
+        args: (&Array, &Array, &Array),
+    ) -> std::result::Result<Array, Exception> {
+        let signature = vec![
+            (args.0.dtype(), args.0.ndim()),
+            (args.1.dtype(), args.1.ndim()),
+            (args.2.dtype(), args.2.ndim()),
+        ];
+        let out = self.compiled.call_mut(args)?;
+        record_retained(site, self.signatures.disposition(signature));
+        Ok(out)
+    }
+}
+
+/// A retained variadic `mx.compile` handle, shape-polymorphic within each dtype/rank signature.
+#[doc(hidden)]
+pub struct RetainedSlice {
+    compiled: Box<dyn MlxRetainedSlice>,
+    signatures: RetainedSignatures,
+}
+
+impl RetainedSlice {
+    #[doc(hidden)]
+    pub fn new(compiled: Box<dyn MlxRetainedSlice>) -> Self {
+        Self {
+            compiled,
+            signatures: RetainedSignatures::new(),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn call(
+        &mut self,
+        site: &'static str,
+        args: &[Array],
+    ) -> std::result::Result<Vec<Array>, Exception> {
+        let signature = args.iter().map(|arg| (arg.dtype(), arg.ndim())).collect();
+        let out = self.compiled.call_mut(args)?;
+        record_retained(site, self.signatures.disposition(signature));
+        Ok(out)
+    }
+}
+
+/// Whether the active diagnostic request selected retained compilation.
+#[doc(hidden)]
+pub fn retained_compilation_requested() -> bool {
+    crate::diagnostics::toggle_requested(crate::diagnostics::RETAINED_COMPILATION)
+}
+
+/// Prime MLX's compiler-cache TLS and its native lifetime token before accessing Rust TLS that owns
+/// retained handles. This makes main-thread and worker-thread teardown ordering safe.
+#[doc(hidden)]
+pub fn prepare_retained_compilation_thread() {
+    mlx_rs::transforms::compile::prepare_retained_compilation_thread();
+}
+
+const TRACE_GATED: usize = 0;
+const TRACE_ROPE_ROTATE: usize = 1;
+const TRACE_MODULATE_MATCHING_ONE: usize = 2;
+const TRACE_MODULATE_F32_ONE: usize = 3;
+const TRACE_GELU_EXACT: usize = 4;
+const TRACE_GELU_QUICK: usize = 5;
+
+const SITE_GATED: &str = "mlx_gen::nn::gated";
+const SITE_ROPE_ROTATE: &str = "mlx_gen::nn::rope_rotate";
+const SITE_MODULATE: &str = "mlx_gen::nn::modulate";
+const SITE_GELU_EXACT: &str = "mlx_gen::nn::gelu_exact";
+const SITE_GELU_QUICK: &str = "mlx_gen::nn::gelu_quick";
+
+#[cfg(test)]
+static COMPILE_TRACE_COUNTS: [std::sync::atomic::AtomicUsize; 6] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 6];
+
+#[inline(always)]
+fn note_compile_trace(index: usize) {
+    #[cfg(test)]
+    COMPILE_TRACE_COUNTS[index].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    #[cfg(not(test))]
+    let _ = index;
+}
+
+fn gated_impl((x, gate, y): (&Array, &Array, &Array)) -> std::result::Result<Array, Exception> {
+    add(x, &multiply(gate, y)?)
+}
+
+fn compiled_gated(args: (&Array, &Array, &Array)) -> std::result::Result<Array, Exception> {
+    note_compile_trace(TRACE_GATED);
+    gated_impl(args)
+}
+
+fn rope_rotate_impl(inp: &[Array]) -> std::result::Result<Vec<Array>, Exception> {
+    let (real, imag, cos, sin) = (&inp[0], &inp[1], &inp[2], &inp[3]);
+    let out_real = subtract(&multiply(real, cos)?, &multiply(imag, sin)?)?;
+    let out_imag = add(&multiply(imag, cos)?, &multiply(real, sin)?)?;
+    Ok(vec![out_real, out_imag])
+}
+
+fn compiled_rope_rotate(inp: &[Array]) -> std::result::Result<Vec<Array>, Exception> {
+    note_compile_trace(TRACE_ROPE_ROTATE);
+    rope_rotate_impl(inp)
+}
+
+fn modulate_matching_one_impl(
+    (norm, scale, shift): (&Array, &Array, &Array),
+) -> std::result::Result<Array, Exception> {
+    let one = scalar(1.0).as_dtype(scale.dtype())?;
+    add(&multiply(norm, &add(scale, &one)?)?, shift)
+}
+
+fn compiled_modulate_matching_one(
+    args: (&Array, &Array, &Array),
+) -> std::result::Result<Array, Exception> {
+    note_compile_trace(TRACE_MODULATE_MATCHING_ONE);
+    modulate_matching_one_impl(args)
+}
+
+fn modulate_f32_one_impl(
+    (norm, scale, shift): (&Array, &Array, &Array),
+) -> std::result::Result<Array, Exception> {
+    add(&multiply(norm, &add(scale, scalar(1.0))?)?, shift)
+}
+
+fn compiled_modulate_f32_one(
+    args: (&Array, &Array, &Array),
+) -> std::result::Result<Array, Exception> {
+    note_compile_trace(TRACE_MODULATE_F32_ONE);
+    modulate_f32_one_impl(args)
+}
+
+fn gelu_exact_impl(x: &Array) -> std::result::Result<Array, Exception> {
+    let dt = x.dtype();
+    let inv_sqrt2 = scalar(std::f64::consts::SQRT_2 as f32).as_dtype(dt)?;
+    let one = scalar(1.0).as_dtype(dt)?;
+    let two = scalar(2.0).as_dtype(dt)?;
+    let inner = erf(&divide(x, &inv_sqrt2)?)?;
+    let gate = add(&one, &inner)?;
+    divide(&multiply(x, &gate)?, &two)
+}
+
+fn compiled_gelu_exact(x: &Array) -> std::result::Result<Array, Exception> {
+    note_compile_trace(TRACE_GELU_EXACT);
+    gelu_exact_impl(x)
+}
+
+fn gelu_quick_impl(x: &Array) -> std::result::Result<Array, Exception> {
+    let c = scalar(1.702).as_dtype(x.dtype())?;
+    multiply(x, &sigmoid(&multiply(x, &c)?)?)
+}
+
+fn compiled_gelu_quick(x: &Array) -> std::result::Result<Array, Exception> {
+    note_compile_trace(TRACE_GELU_QUICK);
+    gelu_quick_impl(x)
+}
+
+/// The six retained `mx.compile` transforms owned by the shared `nn` layer. The graph functions
+/// capture no arrays, so this state retains compiler metadata/kernels but cannot pin request inputs
+/// or outputs.
+struct RetainedCompileGlue {
+    gated: RetainedTernary,
+    rope_rotate: RetainedSlice,
+    modulate_matching_one: RetainedTernary,
+    modulate_f32_one: RetainedTernary,
+    gelu_exact: RetainedUnary,
+    gelu_quick: RetainedUnary,
+}
+
+impl RetainedCompileGlue {
+    fn new() -> Self {
+        Self {
+            gated: RetainedTernary::new(compile_retained(compiled_gated, true)),
+            rope_rotate: RetainedSlice::new(compile_retained(compiled_rope_rotate, true)),
+            // Keep the two dtype policies as distinct graph functions so diagnostics and parity
+            // failures identify the exact literal-`1` policy even though retained handles now own
+            // independent backend identities.
+            modulate_matching_one: RetainedTernary::new(compile_retained(
+                compiled_modulate_matching_one,
+                true,
+            )),
+            modulate_f32_one: RetainedTernary::new(compile_retained(
+                compiled_modulate_f32_one,
+                true,
+            )),
+            gelu_exact: RetainedUnary::new(compile_retained(compiled_gelu_exact, true)),
+            gelu_quick: RetainedUnary::new(compile_retained(compiled_gelu_quick, true)),
+        }
+    }
+}
+
+thread_local! {
+    /// Request/thread-local enablement prevents one concurrent render from changing another's
+    /// numeric path. The production guards wrap synchronous denoise loops, so their request scope
+    /// does not migrate between threads.
+    static COMPILE_GLUE: Cell<bool> = const { Cell::new(false) };
+
+    /// Retained until the owning worker thread exits. This is the narrowest lifecycle available to
+    /// shared leaf helpers without moving model-specific state into core or serializing all renders
+    /// behind one process-global mutex.
+    static RETAINED_COMPILE_GLUE: RefCell<Option<RetainedCompileGlue>> =
+        const { RefCell::new(None) };
+}
+
+fn with_retained_compile_glue<T>(
+    f: impl FnOnce(&mut RetainedCompileGlue) -> std::result::Result<T, Exception>,
+) -> std::result::Result<T, Exception> {
+    prepare_retained_compilation_thread();
+    RETAINED_COMPILE_GLUE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        f(slot.get_or_insert_with(RetainedCompileGlue::new))
+    })
+}
+
+/// Exercise every retained handle owned by the shared `nn` layer once for the release memory audit.
+#[doc(hidden)]
+pub fn exercise_retained_compile_inventory(input: &Array) -> Result<()> {
+    let output = with_retained_compile_glue(|compiled| {
+        compiled.gated.call(SITE_GATED, (input, input, input))
+    })?;
+    output.eval()?;
+    drop(output);
+
+    let args = [input.clone(), input.clone(), input.clone(), input.clone()];
+    let outputs =
+        with_retained_compile_glue(|compiled| compiled.rope_rotate.call(SITE_ROPE_ROTATE, &args))?;
+    mlx_rs::transforms::eval(outputs.iter())?;
+    drop(outputs);
+    drop(args);
+
+    for one_matches_scale in [true, false] {
+        let output = with_retained_compile_glue(|compiled| {
+            let handle = if one_matches_scale {
+                &mut compiled.modulate_matching_one
+            } else {
+                &mut compiled.modulate_f32_one
+            };
+            handle.call(SITE_MODULATE, (input, input, input))
+        })?;
+        output.eval()?;
+        drop(output);
+    }
+
+    let output =
+        with_retained_compile_glue(|compiled| compiled.gelu_exact.call(SITE_GELU_EXACT, input))?;
+    output.eval()?;
+    drop(output);
+
+    let output =
+        with_retained_compile_glue(|compiled| compiled.gelu_quick.call(SITE_GELU_QUICK, input))?;
+    output.eval()?;
+    drop(output);
+    Ok(())
+}
 
 /// Enable/disable the compiled elementwise glue (sc-2963).
 ///
-/// **Process-global scope (F-007):** this flips a single process-wide `AtomicBool` that changes the
-/// numeric path of [`gated`] / [`rope_rotate`] / [`modulate`] for **every** model in the process,
-/// for whoever reads it next. It is correct only under the single-job-per-thread /
-/// `RUST_TEST_THREADS=1` invariant (one render on the shared MLX device at a time); there is no
-/// per-call or per-thread scoping. In production prefer the RAII [`CompileGlueGuard`] over a bare
+/// **Request/thread scope (sc-18316):** this changes the numeric path only for work on the current
+/// thread. The production render loops that use this API are synchronous, so a guard cannot migrate
+/// between worker threads and concurrent renders no longer race through one process-global atomic.
+/// In production prefer the RAII [`CompileGlueGuard`] over a bare
 /// `set_compile_glue(true)`: the guard restores the prior value on drop (even on an early `?`), so the
-/// toggle is scoped to the render instead of leaking on process-wide — the footgun this setter is.
-/// The raw setter is for the `compile_parity` / `perf` A/B gates, which toggle it directly under the
-/// single-thread test runner.
+/// toggle is scoped to the render instead of leaking into later work on the same thread. The raw
+/// setter is for the `compile_parity` / `perf` A/B gates.
 pub fn set_compile_glue(on: bool) {
-    COMPILE_GLUE.store(on, Ordering::Relaxed);
+    COMPILE_GLUE.set(on);
 }
 
 /// Whether the compiled elementwise glue is currently enabled.
 pub fn compile_glue() -> bool {
-    COMPILE_GLUE.load(Ordering::Relaxed)
+    COMPILE_GLUE.get()
 }
 
-/// RAII guard that enables the compiled elementwise glue for its lifetime and **restores the prior
-/// `COMPILE_GLUE` value on drop** — even on an early `?` return. This is the one shared guard the
-/// per-family transformers were each hand-rolling (F-007); bind one at the top of a denoise loop
-/// (`let _g = CompileGlueGuard::enable();`) so the process-global toggle is scoped to the render and
-/// code that runs afterward — notably the reference-parity gates, which must run eager — sees the
-/// prior value rather than the leaked-on state a bare [`set_compile_glue`]`(true)` leaves behind.
-///
-/// Process-wide like the toggle it wraps: it scopes *when* the global is on, not *which thread* sees
-/// it, so it inherits the single-job-per-thread / `RUST_TEST_THREADS=1` invariant documented on
-/// [`set_compile_glue`]. A future concurrent caller would need `SeqCst` + strict per-call scoping.
+/// RAII guard that enables the compiled elementwise glue for its lifetime and **restores the current
+/// thread's prior `COMPILE_GLUE` value on drop** — even on an early `?` return. This is the one shared
+/// guard the per-family transformers were each hand-rolling (F-007); bind one at the top of a denoise
+/// loop (`let _g = CompileGlueGuard::enable();`) so the setting is scoped to that render and code that
+/// runs afterward — notably the reference-parity gates, which must run eager — sees the prior value.
 #[must_use = "dropping the guard restores the prior compile-glue setting; bind it for the render's lifetime"]
 pub struct CompileGlueGuard {
     prev: bool,
@@ -155,14 +514,14 @@ impl CompileGlueGuard {
     /// Turn compiled glue on, remembering the prior value to restore on drop.
     pub fn enable() -> Self {
         Self {
-            prev: COMPILE_GLUE.swap(true, Ordering::Relaxed),
+            prev: COMPILE_GLUE.replace(true),
         }
     }
 }
 
 impl Drop for CompileGlueGuard {
     fn drop(&mut self) {
-        COMPILE_GLUE.store(self.prev, Ordering::Relaxed);
+        COMPILE_GLUE.set(self.prev);
     }
 }
 
@@ -198,40 +557,43 @@ pub fn max_rel_diff(a: &Array, b: &Array) -> f32 {
 /// Gated residual `x + gate·y` (`gate` pre-broadcast). One fused kernel when [`compile_glue`] is on;
 /// bit-identical to the eager `add(x, gate·y)`. Shared by the FLUX.1/FLUX.2 MMDiTs (F-101).
 pub fn gated(x: &Array, gate: &Array, y: &Array) -> Result<Array> {
-    let f = |(x, g, y): (&Array, &Array, &Array)| -> std::result::Result<Array, Exception> {
-        add(x, &multiply(g, y)?)
-    };
     if compile_glue() {
-        crate::diagnostics::record_compile(
-            "mlx_gen::nn::gated",
-            crate::diagnostics::CompileDisposition::OneShot,
-        );
-        Ok(compile(f, true)((x, gate, y))?)
+        if retained_compilation_requested() {
+            Ok(with_retained_compile_glue(|compiled| {
+                compiled.gated.call(SITE_GATED, (x, gate, y))
+            })?)
+        } else {
+            crate::diagnostics::record_compile(
+                SITE_GATED,
+                crate::diagnostics::CompileDisposition::OneShot,
+            );
+            Ok(compile(compiled_gated, true)((x, gate, y))?)
+        }
     } else {
-        crate::diagnostics::record_fallback("mlx_gen::nn::gated", "compiled_glue_disabled");
-        Ok(f((x, gate, y))?)
+        crate::diagnostics::record_fallback(SITE_GATED, "compiled_glue_disabled");
+        Ok(gated_impl((x, gate, y))?)
     }
 }
 
 /// The complex RoPE rotation `(real + imag·i)·(cos + sin·i)` → `(out_real, out_imag)`, in f32. One
 /// fused kernel when [`compile_glue`] is on (vs 6 eager ops). Shared by FLUX.1/FLUX.2 (F-101).
 pub fn rope_rotate(real: &Array, imag: &Array, cos: &Array, sin: &Array) -> Result<(Array, Array)> {
-    let f = |inp: &[Array]| -> std::result::Result<Vec<Array>, Exception> {
-        let (r, i, c, s) = (&inp[0], &inp[1], &inp[2], &inp[3]);
-        let out0 = subtract(&multiply(r, c)?, &multiply(i, s)?)?;
-        let out1 = add(&multiply(i, c)?, &multiply(r, s)?)?;
-        Ok(vec![out0, out1])
-    };
     let args = [real.clone(), imag.clone(), cos.clone(), sin.clone()];
     let mut out = if compile_glue() {
-        crate::diagnostics::record_compile(
-            "mlx_gen::nn::rope_rotate",
-            crate::diagnostics::CompileDisposition::OneShot,
-        );
-        compile(f, true)(&args)?
+        if retained_compilation_requested() {
+            with_retained_compile_glue(|compiled| {
+                compiled.rope_rotate.call(SITE_ROPE_ROTATE, &args)
+            })?
+        } else {
+            crate::diagnostics::record_compile(
+                SITE_ROPE_ROTATE,
+                crate::diagnostics::CompileDisposition::OneShot,
+            );
+            compile(compiled_rope_rotate, true)(&args)?
+        }
     } else {
-        crate::diagnostics::record_fallback("mlx_gen::nn::rope_rotate", "compiled_glue_disabled");
-        f(&args)?
+        crate::diagnostics::record_fallback(SITE_ROPE_ROTATE, "compiled_glue_disabled");
+        rope_rotate_impl(&args)?
     };
     let out1 = out.pop().unwrap();
     let out0 = out.pop().unwrap();
@@ -314,23 +676,43 @@ pub fn modulate(
     shift: &Array,
     one_matches_scale: bool,
 ) -> Result<Array> {
-    let f = move |(n, s, sh): (&Array, &Array, &Array)| -> std::result::Result<Array, Exception> {
-        let one = if one_matches_scale {
-            scalar(1.0).as_dtype(s.dtype())?
-        } else {
-            scalar(1.0)
-        };
-        add(&multiply(n, &add(s, &one)?)?, sh)
-    };
     if compile_glue() {
-        crate::diagnostics::record_compile(
-            "mlx_gen::nn::modulate",
-            crate::diagnostics::CompileDisposition::OneShot,
-        );
-        Ok(compile(f, true)((norm, scale, shift))?)
+        if retained_compilation_requested() {
+            if one_matches_scale {
+                Ok(with_retained_compile_glue(|compiled| {
+                    compiled
+                        .modulate_matching_one
+                        .call(SITE_MODULATE, (norm, scale, shift))
+                })?)
+            } else {
+                Ok(with_retained_compile_glue(|compiled| {
+                    compiled
+                        .modulate_f32_one
+                        .call(SITE_MODULATE, (norm, scale, shift))
+                })?)
+            }
+        } else {
+            crate::diagnostics::record_compile(
+                SITE_MODULATE,
+                crate::diagnostics::CompileDisposition::OneShot,
+            );
+            if one_matches_scale {
+                Ok(compile(compiled_modulate_matching_one, true)((
+                    norm, scale, shift,
+                ))?)
+            } else {
+                Ok(compile(compiled_modulate_f32_one, true)((
+                    norm, scale, shift,
+                ))?)
+            }
+        }
     } else {
-        crate::diagnostics::record_fallback("mlx_gen::nn::modulate", "compiled_glue_disabled");
-        Ok(f((norm, scale, shift))?)
+        crate::diagnostics::record_fallback(SITE_MODULATE, "compiled_glue_disabled");
+        if one_matches_scale {
+            Ok(modulate_matching_one_impl((norm, scale, shift))?)
+        } else {
+            Ok(modulate_f32_one_impl((norm, scale, shift))?)
+        }
     }
 }
 
@@ -390,20 +772,17 @@ pub fn gelu_tanh(x: &Array) -> Result<Array> {
 ///      reproduces the 57.7%-byte-exact / 5.3e-4 gap exactly). Compiling the identical graph here
 ///      reproduces the fused rounding → bit-exact. f32-safe: an f32 input is unchanged either way.
 pub fn gelu_exact(x: &Array) -> Result<Array> {
-    let f = |x_: &Array| {
-        let dt = x_.dtype();
-        let inv_sqrt2 = scalar(std::f64::consts::SQRT_2 as f32).as_dtype(dt)?;
-        let one = scalar(1.0).as_dtype(dt)?;
-        let two = scalar(2.0).as_dtype(dt)?;
-        let inner = erf(&divide(x_, &inv_sqrt2)?)?; // erf(x / √2)
-        let gate = add(&one, &inner)?; // 1 + erf(x / √2)
-        divide(&multiply(x_, &gate)?, &two) // (x · gate) / 2
-    };
-    crate::diagnostics::record_compile(
-        "mlx_gen::nn::gelu_exact",
-        crate::diagnostics::CompileDisposition::OneShot,
-    );
-    Ok(compile(f, true)(x)?)
+    if retained_compilation_requested() {
+        Ok(with_retained_compile_glue(|compiled| {
+            compiled.gelu_exact.call(SITE_GELU_EXACT, x)
+        })?)
+    } else {
+        crate::diagnostics::record_compile(
+            SITE_GELU_EXACT,
+            crate::diagnostics::CompileDisposition::OneShot,
+        );
+        Ok(compile(compiled_gelu_exact, true)(x)?)
+    }
 }
 
 /// Fast-approx GELU ("quick_gelu") — `x · sigmoid(1.702·x)` — **byte-identical to MLX-Python's
@@ -412,15 +791,17 @@ pub fn gelu_exact(x: &Array) -> Result<Array> {
 /// f16 input to f32), and the graph is `mx.compile`'d so the fused fp16 rounding matches the
 /// reference. f32-safe (no-op cast, fusion numerically identical).
 pub fn gelu_quick(x: &Array) -> Result<Array> {
-    let f = |x_: &Array| {
-        let c = scalar(1.702).as_dtype(x_.dtype())?;
-        multiply(x_, &sigmoid(&multiply(x_, &c)?)?) // x · sigmoid(1.702·x)
-    };
-    crate::diagnostics::record_compile(
-        "mlx_gen::nn::gelu_quick",
-        crate::diagnostics::CompileDisposition::OneShot,
-    );
-    Ok(compile(f, true)(x)?)
+    if retained_compilation_requested() {
+        Ok(with_retained_compile_glue(|compiled| {
+            compiled.gelu_quick.call(SITE_GELU_QUICK, x)
+        })?)
+    } else {
+        crate::diagnostics::record_compile(
+            SITE_GELU_QUICK,
+            crate::diagnostics::CompileDisposition::OneShot,
+        );
+        Ok(compile(compiled_gelu_quick, true)(x)?)
+    }
 }
 
 /// 2-D conv over NHWC `x` with an mlx `[out, kH, kW, in]` weight (+ optional bias).
@@ -775,8 +1156,7 @@ mod tests {
     #[test]
     fn compile_glue_guard_scopes_and_restores() {
         // F-007: the shared RAII guard enables compiled glue for its scope and restores the PRIOR
-        // value on drop. The single-thread runner (`RUST_TEST_THREADS=1`) makes the process-global
-        // `COMPILE_GLUE` safe to assert on, matching the A/B test above.
+        // value on drop. The setting is isolated to this test's thread.
         set_compile_glue(false);
         {
             let _g = CompileGlueGuard::enable();
@@ -792,7 +1172,327 @@ mod tests {
         }
         assert!(compile_glue(), "guard restores the prior (on) on drop");
 
-        set_compile_glue(false); // leave the global eager, as the reference-parity gates expect
+        set_compile_glue(false); // leave this thread eager, as the reference-parity gates expect
+    }
+
+    #[test]
+    fn compile_glue_setting_is_thread_local() {
+        use std::sync::{Arc, Barrier};
+
+        let barrier = Arc::new(Barrier::new(2));
+        let enabled_barrier = Arc::clone(&barrier);
+        let enabled = std::thread::spawn(move || {
+            set_compile_glue(true);
+            enabled_barrier.wait();
+            assert!(compile_glue());
+            enabled_barrier.wait();
+            set_compile_glue(false);
+        });
+
+        let eager_barrier = Arc::clone(&barrier);
+        let eager = std::thread::spawn(move || {
+            set_compile_glue(false);
+            eager_barrier.wait();
+            assert!(
+                !compile_glue(),
+                "a concurrent render must not inherit another thread's compiled path"
+            );
+            eager_barrier.wait();
+        });
+
+        enabled.join().unwrap();
+        eager.join().unwrap();
+    }
+
+    #[test]
+    fn retained_compile_glue_is_bit_exact_traces_once_and_reports_hits() {
+        use crate::diagnostics::{
+            self, CompileDisposition, DiagnosticCounter, ToggleDisposition, RETAINED_COMPILATION,
+        };
+        use std::sync::atomic::Ordering;
+
+        RETAINED_COMPILE_GLUE.with(|slot| *slot.borrow_mut() = None);
+        set_compile_glue(true);
+
+        let x = Array::from_slice(&[1.0f32, -2.0, 3.0, 0.5], &[1, 1, 4]);
+        let gate = Array::from_slice(&[0.5f32, 0.25, -0.5, 2.0], &[1, 1, 4]);
+        let y = Array::from_slice(&[2.0f32, 2.0, 2.0, 2.0], &[1, 1, 4]);
+
+        // Capture the exact one-shot outputs first. Reset the trace probes afterward so the
+        // assertions below count only retained-handle traces, not these reference calls.
+        let oneshot_gated = gated(&x, &gate, &y).unwrap();
+        let oneshot_rope = rope_rotate(&x, &gate, &y, &x).unwrap();
+        let oneshot_modulate_matching = modulate(&x, &gate, &y, true).unwrap();
+        let oneshot_modulate_f32 = modulate(&x, &gate, &y, false).unwrap();
+        let oneshot_gelu_exact = gelu_exact(&x).unwrap();
+        let oneshot_gelu_quick = gelu_quick(&x).unwrap();
+        for count in &COMPILE_TRACE_COUNTS {
+            count.store(0, Ordering::Relaxed);
+        }
+
+        let scope = diagnostics::begin_request_with_toggles(
+            "retained-shared-nn",
+            "test",
+            &[RETAINED_COMPILATION],
+        )
+        .unwrap();
+
+        let gated_first = gated(&x, &gate, &y).unwrap();
+        let gated_second = gated(&x, &gate, &y).unwrap();
+        for retained in [&gated_first, &gated_second] {
+            assert!(array_eq(retained, &oneshot_gated, None)
+                .unwrap()
+                .item::<bool>());
+        }
+
+        let (rope_real_first, rope_imag_first) = rope_rotate(&x, &gate, &y, &x).unwrap();
+        let (rope_real_second, rope_imag_second) = rope_rotate(&x, &gate, &y, &x).unwrap();
+        for ((first, second), oneshot) in [
+            (rope_real_first, rope_real_second),
+            (rope_imag_first, rope_imag_second),
+        ]
+        .into_iter()
+        .zip([&oneshot_rope.0, &oneshot_rope.1])
+        {
+            for retained in [&first, &second] {
+                assert!(array_eq(retained, oneshot, None).unwrap().item::<bool>());
+            }
+        }
+
+        for (matches_scale, oneshot) in [
+            (true, &oneshot_modulate_matching),
+            (false, &oneshot_modulate_f32),
+        ] {
+            let first = modulate(&x, &gate, &y, matches_scale).unwrap();
+            let second = modulate(&x, &gate, &y, matches_scale).unwrap();
+            for retained in [&first, &second] {
+                assert!(array_eq(retained, oneshot, None).unwrap().item::<bool>());
+            }
+        }
+
+        for (activation, oneshot) in [
+            (
+                gelu_exact as fn(&Array) -> Result<Array>,
+                &oneshot_gelu_exact,
+            ),
+            (gelu_quick, &oneshot_gelu_quick),
+        ] {
+            let first = activation(&x).unwrap();
+            let second = activation(&x).unwrap();
+            for retained in [&first, &second] {
+                assert!(array_eq(retained, oneshot, None).unwrap().item::<bool>());
+            }
+        }
+
+        let report = scope.finish();
+        let compile_count = |site: &'static str, disposition| {
+            report
+                .counters
+                .iter()
+                .find_map(|counter| match counter {
+                    DiagnosticCounter::Compile {
+                        site: recorded_site,
+                        disposition: recorded_disposition,
+                        count,
+                    } if *recorded_site == site && *recorded_disposition == disposition => {
+                        Some(*count)
+                    }
+                    _ => None,
+                })
+                .unwrap_or(0)
+        };
+        for (site, misses, hits) in [
+            (SITE_GATED, 1, 1),
+            (SITE_ROPE_ROTATE, 1, 1),
+            (SITE_MODULATE, 2, 2),
+            (SITE_GELU_EXACT, 1, 1),
+            (SITE_GELU_QUICK, 1, 1),
+        ] {
+            assert_eq!(
+                compile_count(site, CompileDisposition::RetainedMiss),
+                misses
+            );
+            assert_eq!(compile_count(site, CompileDisposition::RetainedHit), hits);
+        }
+        assert!(report.counters.iter().any(|counter| matches!(
+            counter,
+            DiagnosticCounter::Toggle {
+                toggle: RETAINED_COMPILATION,
+                disposition: ToggleDisposition::Applied,
+                count: 12,
+            }
+        )));
+        assert!(COMPILE_TRACE_COUNTS
+            .iter()
+            .all(|count| count.load(Ordering::Relaxed) == 1));
+
+        // Finishing diagnostics must not drop the retained handle. The same dtype at a new shape is
+        // a shapeless-cache hit in the next request; a genuinely new dtype signature is a miss.
+        let next_scope = diagnostics::begin_request_with_toggles(
+            "retained-shared-nn-next-request",
+            "test",
+            &[RETAINED_COMPILATION],
+        )
+        .unwrap();
+        let shape_x = Array::from_slice(&[1.0f32, 2.0], &[1, 1, 2]);
+        let shape_gate = Array::from_slice(&[0.5f32, 0.25], &[1, 1, 2]);
+        let shape_y = Array::from_slice(&[3.0f32, 4.0], &[1, 1, 2]);
+        gated(&shape_x, &shape_gate, &shape_y)
+            .unwrap()
+            .eval()
+            .unwrap();
+        let half_x = shape_x.as_dtype(Dtype::Float16).unwrap();
+        let half_gate = shape_gate.as_dtype(Dtype::Float16).unwrap();
+        let half_y = shape_y.as_dtype(Dtype::Float16).unwrap();
+        gated(&half_x, &half_gate, &half_y).unwrap().eval().unwrap();
+        let next_report = next_scope.finish();
+        assert!(next_report.counters.iter().any(|counter| matches!(
+            counter,
+            DiagnosticCounter::Compile {
+                site: SITE_GATED,
+                disposition: CompileDisposition::RetainedHit,
+                count: 1,
+            }
+        )));
+        assert!(next_report.counters.iter().any(|counter| matches!(
+            counter,
+            DiagnosticCounter::Compile {
+                site: SITE_GATED,
+                disposition: CompileDisposition::RetainedMiss,
+                count: 1,
+            }
+        )));
+        assert!(next_report.counters.iter().any(|counter| matches!(
+            counter,
+            DiagnosticCounter::Toggle {
+                toggle: RETAINED_COMPILATION,
+                disposition: ToggleDisposition::Applied,
+                count: 2,
+            }
+        )));
+        assert_eq!(
+            COMPILE_TRACE_COUNTS[TRACE_GATED].load(Ordering::Relaxed),
+            2,
+            "only the new dtype signature should retrace"
+        );
+
+        let baseline = diagnostics::begin_request("oneshot-shared-nn", "test").unwrap();
+        gated(&x, &gate, &y).unwrap().eval().unwrap();
+        let baseline = baseline.finish();
+        assert!(baseline.counters.iter().any(|counter| matches!(
+            counter,
+            DiagnosticCounter::Compile {
+                site: SITE_GATED,
+                disposition: CompileDisposition::OneShot,
+                count: 1,
+            }
+        )));
+        assert!(!baseline.counters.iter().any(|counter| matches!(
+            counter,
+            DiagnosticCounter::Toggle {
+                toggle: RETAINED_COMPILATION,
+                disposition: ToggleDisposition::Applied,
+                ..
+            }
+        )));
+
+        // A one-shot compile owns an independent MLX lease. It must neither touch this retained
+        // handle nor make the diagnostic signature inventory claim that the retained graph missed.
+        let after_oneshot = diagnostics::begin_request_with_toggles(
+            "retained-shared-nn-after-oneshot",
+            "test",
+            &[RETAINED_COMPILATION],
+        )
+        .unwrap();
+        gated(&x, &gate, &y).unwrap().eval().unwrap();
+        let after_oneshot = after_oneshot.finish();
+        assert!(after_oneshot.counters.iter().any(|counter| matches!(
+            counter,
+            DiagnosticCounter::Compile {
+                site: SITE_GATED,
+                disposition: CompileDisposition::RetainedHit,
+                count: 1,
+            }
+        )));
+
+        // A real process cache clear is different: the upstream generation advances, so the next
+        // retained call must fail closed as a miss even though the Rust handle remains alive.
+        mlx_rs::transforms::compile::clear_cache();
+        let after_cache_clear = diagnostics::begin_request_with_toggles(
+            "retained-shared-nn-after-cache-clear",
+            "test",
+            &[RETAINED_COMPILATION],
+        )
+        .unwrap();
+        gated(&x, &gate, &y).unwrap().eval().unwrap();
+        let after_cache_clear = after_cache_clear.finish();
+        assert!(after_cache_clear.counters.iter().any(|counter| matches!(
+            counter,
+            DiagnosticCounter::Compile {
+                site: SITE_GATED,
+                disposition: CompileDisposition::RetainedMiss,
+                count: 1,
+            }
+        )));
+
+        set_compile_glue(false);
+        RETAINED_COMPILE_GLUE.with(|slot| *slot.borrow_mut() = None);
+    }
+
+    #[test]
+    #[ignore = "serialized audit of process-global MLX active/cache counters"]
+    fn retained_compile_handles_do_not_pin_request_arrays() {
+        use crate::diagnostics::{self, RETAINED_COMPILATION};
+        use mlx_rs::memory::{clear_cache, get_active_memory, get_cache_memory};
+        use mlx_rs::ops::ones;
+
+        set_compile_glue(false);
+        RETAINED_COMPILE_GLUE.with(|slot| *slot.borrow_mut() = None);
+        clear_cache();
+        let baseline_active = get_active_memory();
+
+        let input = ones::<f32>(&[1024, 1024]).unwrap();
+        input.eval().unwrap();
+        clear_cache();
+        let input_active = get_active_memory();
+        let request_bytes = input.nbytes();
+
+        let scope = diagnostics::begin_request_with_toggles(
+            "retained-memory-audit",
+            "test",
+            &[RETAINED_COMPILATION],
+        )
+        .unwrap();
+        set_compile_glue(true);
+        let output = gelu_quick(&input).unwrap();
+        output.eval().unwrap();
+        let _ = gelu_quick(&input).unwrap();
+        let _ = scope.finish();
+        drop(output);
+        drop(input);
+        clear_cache();
+
+        let retained_active = get_active_memory();
+        let retained_cache = get_cache_memory();
+        assert!(
+            retained_active.saturating_sub(baseline_active) < request_bytes / 8,
+            "a retained graph must not pin a request-sized input/output allocation: baseline={baseline_active}, retained={retained_active}, request={request_bytes}"
+        );
+        assert_eq!(
+            retained_cache, 0,
+            "clear_cache must release allocator cache"
+        );
+
+        RETAINED_COMPILE_GLUE.with(|slot| *slot.borrow_mut() = None);
+        clear_cache();
+        let released_active = get_active_memory();
+        let released_cache = get_cache_memory();
+        assert!(released_active <= retained_active);
+        assert_eq!(released_cache, 0);
+        eprintln!(
+            "[retained-memory] baseline_active={baseline_active} input_active={input_active} retained_active={retained_active} released_active={released_active} retained_cache={retained_cache} released_cache={released_cache} request_bytes={request_bytes}"
+        );
+        set_compile_glue(false);
     }
 
     #[test]

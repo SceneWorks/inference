@@ -2,7 +2,8 @@
 //!
 //! `#[ignore]`d: each allocates multi-GB single-buffer arrays straddling the `i32::MAX`-element
 //! boundary. They exist to establish — on *this* pinned runtime (MLX core 0.32.0 via pmetal-mlx-rs
-//! `932beb4e`) — the exact per-operation behaviour the tiling fix depends on. On this pin the
+//! `eb76c4ba`, re-probed 2026-08-11) — the exact per-operation behaviour the tiling fix depends on.
+//! On this pin the
 //! `pad`/`concat` copy-gate overflow is FIXED (sc-12746, pad-copy-int64.patch): those probes now
 //! assert EXACT writes above 2^31, not merely below. **sc-12748 (slice 6):**
 //! `conv3d_8to128_output_across_i32max` now asserts the FIXED behaviour too — MLX 0.32.0 fixes the
@@ -10,7 +11,8 @@
 //! this pin conv3d is EXACT above 2^31 (measured `first_bad_offset=-1`, 216 positions checked below
 //! and above the bound). The old 0.31.2 *corruption* claim inverted here; the conv-stage write-guard
 //! retirement it justified is done in sc-12748. Every op the tiled/untiled decode touches above the
-//! bound (conv3d, pad, concat, reshape, as_slice, elementwise) is now probe-verified int64-safe.
+//! bound (conv3d, pad, concat, multi-dimensional reshape, as_slice, elementwise) is now
+//! probe-verified int64-safe; a single `reshape(-1)` dimension remains rejected as documented below.
 //! **sc-12926:** `conv3d_128ch_input_across_i32max` closes the read-side gap — a conv whose INPUT
 //! (not just output) crosses 2^31, Mochi's real over-bound geometry (`cin=128` padded full-res).
 //! Run explicitly:
@@ -41,7 +43,7 @@ fn pv(i: i64) -> f32 {
 /// `128×D×480×848` geometry, D=41 below / D=42 above). A pointwise (1×1×1) conv with a permutation
 /// weight makes `out[..,co] = in[..,co%8]`, so every output element is predictable. On MLX 0.31.2 the
 /// per-thread output offset overflowed int32 and this conv corrupted above the bound; MLX 0.32.0's
-/// upstream #3524 promotes that offset to `size_t`, so **on this pin (0.32.0 fork `932beb4e`) the conv
+/// upstream #3524 promotes that offset to `size_t`, so **on this pin (0.32.0 fork `eb76c4ba`) the conv
 /// is EXACT both below AND above the bound** (sc-12748). This probe therefore now asserts the *fixed*
 /// behaviour — the inversion of the 0.31.2 corruption claim — which is what retires the conv-stage
 /// write guard (`writable_frame_cap` / Mochi's decode guard).
@@ -270,7 +272,7 @@ fn pad_story_geometry_128x42x480x848() {
     let ys = y.as_slice::<f32>();
 
     // expected Y[cc,dd,hh,ww] = X[cc,dd,hh,ww] if dd<d else 0. sc-12746: on the copy-gate-fixed pin
-    // (pmetal-mlx-rs 932beb4e, pad-copy-int64.patch) pad must be EXACT above 2^31 too — not merely
+    // (pmetal-mlx-rs eb76c4ba, pad-copy-int64.patch) pad must be EXACT above 2^31 too — not merely
     // below — so this loop now also tracks the above-bound region (first_bad_above / above_checked)
     // and max_abs.
     let mut first_bad = -1i64;

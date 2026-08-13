@@ -623,7 +623,8 @@ impl Chroma {
         let txt_ids_pos = zero_text_ids(pos_embeds.shape()[1] as usize);
         let mask_pos = Self::full_mask(pos_mask, si)?;
 
-        // Scoped compiled-glue enable (F-007): restored on drop instead of leaking the global on.
+        // Scoped compiled-glue enable (F-007): restored on drop instead of leaking on this render
+        // thread.
         let _compile_glue = crate::transformer::CompileGlueGuard::enable();
 
         let rope_pos = tr.build_rope_table(&txt_ids_pos, &img_ids)?;

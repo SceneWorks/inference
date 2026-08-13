@@ -181,7 +181,7 @@ pub use vl_tokenizer::{
 
 /// Shared-optimization toggles whose production call sites this provider can actually execute.
 /// Availability never substitutes for the request-local `Applied` receipt required by P6.
-pub const BENCHMARK_TOGGLE_CAPABILITIES: &[&str] = &[];
+pub const BENCHMARK_TOGGLE_CAPABILITIES: &[&str] = &[mlx_gen::diagnostics::RETAINED_COMPILATION];
 
 /// sc-16195 Apple-Silicon warm sweep: base Qwen-Image q8 peaked at 7.661 GiB at 1024².
 /// Rounded upward to 7.67 GiB and applies across weight tiers because activations stay bf16.
