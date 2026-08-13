@@ -169,6 +169,9 @@ pub fn load_dev_edit(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     // Precision + snapshot-dir guard up front for BOTH policies (fail fast).
     let root = resolve_root(variant, spec)?;
+    // Publish the tier the transformer actually realizes. A packed Dev turnkey selected without a
+    // request is still Q4/Q8; a dense turnkey with a request is folded at load time.
+    let memory_numeric_tier = effective_memory_numeric_tier(variant, spec, root, variant.id())?;
     // F-181: a `Sequential` + `spec.quantize` load over a dense snapshot re-quantizes the whole model
     // on every generate; `Resident` quantizes once. Warn for that combination only.
     if let Some(q) = spec.quantize {
@@ -182,11 +185,6 @@ fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> Result<Box<dyn Genera
         loader::load_validated_tokenizer_dev(&text_encoder_source)?
     } else {
         loader::load_validated_tokenizer(&text_encoder_source)?
-    };
-    let memory_numeric_tier = mlx_gen::gen_core::MemoryNumericTier {
-        precision: spec.precision,
-        quant: spec.quantize,
-        component_precision_floors: &[],
     };
     Ok(Box::new(Flux2 {
         descriptor: variant.descriptor(),
@@ -368,7 +366,7 @@ fn build_residency_with_source(
     // effective transformer tier to its language tower, including an already-packed snapshot.
     let effective_quant_bits = variant
         .is_dev()
-        .then(|| effective_base_quant(variant, spec, root))
+        .then(|| effective_base_quant(spec, root, variant.id()))
         .transpose()?
         .flatten()
         .map(mlx_gen::gen_core::Quant::bits);
@@ -402,22 +400,56 @@ fn build_residency_with_source(
 }
 
 pub(crate) fn effective_base_quant(
-    variant: Flux2Variant,
     spec: &LoadSpec,
     root: &Path,
+    provider_id: &str,
 ) -> Result<Option<mlx_gen::gen_core::Quant>> {
     if let Some(requested) = spec.quantize {
-        mlx_gen::quant::needs_load_time_quant(root, "transformer", requested.bits(), variant.id())?;
+        mlx_gen::quant::needs_load_time_quant(root, "transformer", requested.bits(), provider_id)?;
     }
     match mlx_gen::quant::packed_quant_bits(root, "transformer")? {
         Some(4) => Ok(Some(mlx_gen::gen_core::Quant::Q4)),
         Some(8) => Ok(Some(mlx_gen::gen_core::Quant::Q8)),
         Some(bits) => Err(Error::Unsupported(format!(
-            "{}: transformer declares unsupported packed quantization width {bits}",
-            variant.id()
+            "{provider_id}: transformer declares unsupported packed quantization width {bits}"
         ))),
         None => Ok(spec.quantize),
     }
+}
+
+/// Resolve the exact numeric tier a loaded FLUX.2 generator publishes for memory admission.
+pub(crate) fn effective_memory_numeric_tier(
+    variant: Flux2Variant,
+    spec: &LoadSpec,
+    root: &Path,
+    provider_id: &str,
+) -> Result<mlx_gen::gen_core::MemoryNumericTier> {
+    let quant = if variant.is_dev() {
+        effective_base_quant(spec, root, provider_id)?
+    } else {
+        spec.quantize
+    };
+    Ok(mlx_gen::gen_core::MemoryNumericTier {
+        precision: spec.precision,
+        quant,
+        component_precision_floors: &[],
+    })
+}
+
+/// Registry-side counterpart of [`effective_memory_numeric_tier`] for Dev-family routes.
+pub(crate) fn effective_dev_memory_numeric_tier(
+    spec: &LoadSpec,
+    provider_id: &str,
+) -> Result<mlx_gen::gen_core::MemoryNumericTier> {
+    let root = match &spec.weights {
+        WeightsSource::Dir(root) => root.as_path(),
+        WeightsSource::File(_) => {
+            return Err(Error::Msg(format!(
+                "{provider_id} expects a FLUX.2 snapshot directory, not a single .safetensors file"
+            )))
+        }
+    };
+    effective_memory_numeric_tier(Flux2Variant::Dev, spec, root, provider_id)
 }
 
 /// The FLUX.2 generator (klein + dev, ±edit/kv-edit).
@@ -1355,15 +1387,18 @@ pub(crate) fn component_footprint_for(
     // base selected without `LoadSpec::quantize`. Klein intentionally keeps Qwen dense. Resolve and
     // validate that policy here, at the registry footprint consumed by the estimated fit fallback,
     // so admission cannot underprice a dense alternate or accept a packed mismatch the loader rejects.
-    let language_load_time_quant_bits = if variant.is_dev() {
-        let expected_language_bits =
-            effective_base_quant(variant, spec, root)?.map(mlx_gen::Quant::bits);
-        selected.load_time_quant_bits(expected_language_bits, provider_id)?
+    let expected_language_bits = if variant.is_dev() {
+        effective_base_quant(spec, root, provider_id)?.map(mlx_gen::Quant::bits)
     } else {
         // Klein's published tiers deliberately keep Qwen exactly as stored. Do not inherit the
         // transformer request or reinterpret an existing encoder pack in this Dev-only fallback.
         None
     };
+    // Always run the selected source through the contract's packed-policy gate. Klein's deliberate
+    // `None` rejects packed Dir/File/complete-snapshot encoders instead of admitting a surface the
+    // concrete loader rejects.
+    let language_load_time_quant_bits =
+        selected.load_time_quant_bits(expected_language_bits, provider_id)?;
     let language = selected.materialized_language_tensor_headers(&language_contract)?;
     let language_bytes =
         mlx_gen::asset_facts::projected_tensor_headers_bytes(&language, |tensor| {
@@ -1426,6 +1461,28 @@ pub(crate) fn component_footprint(
     )
 }
 
+pub(crate) fn klein_edit_component_footprint(
+    spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    component_footprint_for(
+        Flux2Variant::Klein9bEdit,
+        crate::config::FLUX2_KLEIN_9B_EDIT_ID,
+        false,
+        spec,
+    )
+}
+
+pub(crate) fn klein_kv_edit_component_footprint(
+    spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    component_footprint_for(
+        Flux2Variant::Klein9bKvEdit,
+        crate::config::FLUX2_KLEIN_9B_KV_EDIT_ID,
+        false,
+        spec,
+    )
+}
+
 pub(crate) fn dev_component_footprint_for(
     provider_id: &str,
     spec: &mlx_gen::LoadSpec,
@@ -1462,12 +1519,12 @@ mlx_gen::register_generators! {
 }
 mlx_gen::register_generators! {
     pub(crate) const KLEIN_EDIT_REGISTRATION = descriptor_klein_9b_edit => load_klein_9b_edit;
-    footprint = component_footprint
+    footprint = klein_edit_component_footprint
 }
 mlx_gen::register_generators! {
     pub(crate) const KLEIN_KV_EDIT_REGISTRATION =
         descriptor_klein_9b_kv_edit => load_klein_9b_kv_edit;
-    footprint = component_footprint
+    footprint = klein_kv_edit_component_footprint
 }
 mlx_gen::register_generators! {
     pub(crate) const DEV_REGISTRATION = descriptor_dev => load_dev;
@@ -1824,6 +1881,199 @@ mod tests {
             panic!("loaded T2I generator must reject a tier mismatch");
         };
         assert!(reason.contains("does not match loaded tier"), "{reason}");
+    }
+
+    fn dev_tier_spec(
+        root: &Path,
+        variant: Flux2Variant,
+        packed_bits: Option<i32>,
+        requested: Option<Quant>,
+    ) -> LoadSpec {
+        let mut spec = validation_complete_snapshot_spec(root, variant, OffloadPolicy::Sequential);
+        std::fs::create_dir_all(root.join("transformer")).unwrap();
+        std::fs::write(
+            root.join("transformer/config.json"),
+            packed_bits.map_or_else(
+                || "{}".to_owned(),
+                |bits| format!(r#"{{"quantization":{{"bits":{bits},"group_size":64}}}}"#),
+            ),
+        )
+        .unwrap();
+        spec.quantize = requested;
+        spec
+    }
+
+    fn public_dev_context(
+        generator: &dyn Generator,
+        mode: MemoryMode,
+        reference_count: u32,
+        tier: MemoryNumericTier,
+    ) -> MemoryRunContext {
+        let contract = generator
+            .memory_strategy_contract()
+            .expect("loaded Dev generator memory contract");
+        let calibration = contract.calibration.as_ref().expect("Dev calibration");
+        MemoryRunContext {
+            selection: MemorySelection {
+                strategy: MemoryStrategy::Resident,
+                parameters: Default::default(),
+                tier,
+            },
+            calibration_abi: calibration.abi,
+            calibration_fingerprint: calibration.fingerprint.clone(),
+            load_shape: calibration.load_shape,
+            mode,
+            has_reference: reference_count > 0,
+            use_pid: false,
+            has_phases: false,
+            geometry: MemoryGeometry {
+                width: 768,
+                height: 768,
+                batch: 1,
+                frames: 1,
+                reference_count,
+            },
+            overlay: None,
+            budget: MemoryBudget {
+                total_bytes: 96 * 1024 * 1024 * 1024,
+                committed_bytes: 0,
+                reclaimable_bytes: 0,
+                reserved_headroom_bytes: 0,
+            },
+            predicted_peak_bytes: 1,
+            cache_state: MemoryCacheState::Cold,
+            evidence_revision: "effective-dev-tier-public-context".to_owned(),
+        }
+    }
+
+    #[test]
+    fn dev_loaded_and_registered_safety_use_the_effective_transformer_tier() {
+        let registry = crate::provider_registry().unwrap();
+        for (quant, bits) in [(Quant::Q4, 4), (Quant::Q8, 8)] {
+            for prepacked in [false, true] {
+                for (variant, provider_id, mode, references) in [
+                    (Flux2Variant::Dev, FLUX2_DEV_ID, MemoryMode::TextToImage, 0),
+                    (
+                        Flux2Variant::DevEdit,
+                        FLUX2_DEV_EDIT_ID,
+                        MemoryMode::Edit,
+                        2,
+                    ),
+                ] {
+                    let fixture = tempfile::tempdir().unwrap();
+                    let spec = dev_tier_spec(
+                        fixture.path(),
+                        variant,
+                        prepacked.then_some(bits),
+                        (!prepacked).then_some(quant),
+                    );
+                    let generator = match variant {
+                        Flux2Variant::Dev => load_dev(&spec),
+                        Flux2Variant::DevEdit => load_dev_edit(&spec),
+                        _ => unreachable!(),
+                    }
+                    .unwrap_or_else(|error| {
+                        panic!("Q{bits} prepacked={prepacked} {provider_id}: {error}")
+                    });
+                    assert_eq!(
+                        generator.memory_strategy_contract().unwrap().provider_id,
+                        provider_id
+                    );
+                    let tier = MemoryNumericTier {
+                        precision: Precision::Bf16,
+                        quant: Some(quant),
+                        component_precision_floors: &[],
+                    };
+                    let context = public_dev_context(generator.as_ref(), mode, references, tier);
+                    assert_eq!(
+                        generator.memory_strategy_safety_check(&context),
+                        MemorySafetyDecision::Accept,
+                        "loaded Q{bits} prepacked={prepacked} {provider_id}"
+                    );
+
+                    let registration = registry
+                        .memory_strategy_registrations()
+                        .find(|registration| registration.provider_id == provider_id)
+                        .unwrap();
+                    let contract = (registration.contract)(&spec).unwrap();
+                    assert_eq!(
+                        (registration.safety_check)(&spec, &contract, &context),
+                        MemorySafetyDecision::Accept,
+                        "registered Q{bits} prepacked={prepacked} {provider_id}"
+                    );
+
+                    let mut wrong_tier = context;
+                    wrong_tier.selection.tier.quant = Some(if quant == Quant::Q4 {
+                        Quant::Q8
+                    } else {
+                        Quant::Q4
+                    });
+                    for decision in [
+                        generator.memory_strategy_safety_check(&wrong_tier),
+                        (registration.safety_check)(&spec, &contract, &wrong_tier),
+                    ] {
+                        let MemorySafetyDecision::Reject { reason } = decision else {
+                            panic!("wrong Q{bits} public tier must reject for {provider_id}")
+                        };
+                        assert!(reason.contains("does not match loaded tier"), "{reason}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dev_load_and_registered_safety_reject_requested_vs_packed_tier_mismatches() {
+        let registry = crate::provider_registry().unwrap();
+        for (stored_bits, requested) in [(4, Quant::Q8), (8, Quant::Q4)] {
+            for (variant, provider_id, mode, references) in [
+                (Flux2Variant::Dev, FLUX2_DEV_ID, MemoryMode::TextToImage, 0),
+                (
+                    Flux2Variant::DevEdit,
+                    FLUX2_DEV_EDIT_ID,
+                    MemoryMode::Edit,
+                    2,
+                ),
+            ] {
+                let fixture = tempfile::tempdir().unwrap();
+                let spec =
+                    dev_tier_spec(fixture.path(), variant, Some(stored_bits), Some(requested));
+                let load_error = match variant {
+                    Flux2Variant::Dev => load_dev(&spec),
+                    Flux2Variant::DevEdit => load_dev_edit(&spec),
+                    _ => unreachable!(),
+                }
+                .err()
+                .expect("packed/requested mismatch must reject load")
+                .to_string();
+                assert!(
+                    load_error.contains(provider_id) && load_error.contains("pre-quantized"),
+                    "{load_error}"
+                );
+
+                let registration = registry
+                    .memory_strategy_registrations()
+                    .find(|registration| registration.provider_id == provider_id)
+                    .unwrap();
+                let contract = (registration.contract)(&spec).unwrap();
+                let requested_tier = MemoryNumericTier {
+                    precision: Precision::Bf16,
+                    quant: Some(requested),
+                    component_precision_floors: &[],
+                };
+                let test = Flux2::new_for_tests(variant);
+                let context = public_dev_context(&test, mode, references, requested_tier);
+                let MemorySafetyDecision::Reject { reason } =
+                    (registration.safety_check)(&spec, &contract, &context)
+                else {
+                    panic!("registered mismatch must reject")
+                };
+                assert!(
+                    reason.contains(provider_id) && reason.contains("pre-quantized"),
+                    "{reason}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2542,6 +2792,87 @@ mod tests {
         spec
     }
 
+    fn klein_footprint_spec(
+        fixture: &Path,
+        selection: DevFootprintSelection,
+        base_quant: Option<i32>,
+        requested_quant: Option<Quant>,
+        selected_quant: Option<i32>,
+    ) -> LoadSpec {
+        let base = fixture.join("base");
+        let builtin_quant = matches!(selection, DevFootprintSelection::Builtin)
+            .then_some(selected_quant)
+            .flatten();
+        gen_core_testkit::write_encoder_contract_fixture_with_quant(
+            &base.join("text_encoder"),
+            crate::config::KLEIN_ENCODER_CONTRACT,
+            builtin_quant,
+        )
+        .unwrap();
+        write_tiny_component(&base.join("transformer"));
+        write_tiny_component(&base.join("vae"));
+        std::fs::write(
+            base.join("transformer/config.json"),
+            base_quant.map_or_else(
+                || "{}".to_owned(),
+                |bits| format!(r#"{{"quantization":{{"bits":{bits},"group_size":64}}}}"#),
+            ),
+        )
+        .unwrap();
+
+        let selected = fixture.join(format!("selected-{selection:?}"));
+        let mut spec = LoadSpec::new(WeightsSource::Dir(base));
+        spec.quantize = requested_quant;
+        spec.text_encoder = match selection {
+            DevFootprintSelection::Builtin => None,
+            DevFootprintSelection::ComponentDir => {
+                gen_core_testkit::write_encoder_contract_fixture_with_quant(
+                    &selected,
+                    crate::config::KLEIN_ENCODER_CONTRACT,
+                    selected_quant,
+                )
+                .unwrap();
+                Some(WeightsSource::Dir(selected))
+            }
+            DevFootprintSelection::ComponentFile => {
+                gen_core_testkit::write_encoder_contract_fixture_with_quant(
+                    &selected,
+                    crate::config::KLEIN_ENCODER_CONTRACT,
+                    selected_quant,
+                )
+                .unwrap();
+                Some(WeightsSource::File(selected.join("model.safetensors")))
+            }
+            DevFootprintSelection::CompleteSnapshot => {
+                gen_core_testkit::write_encoder_contract_fixture_with_quant(
+                    &selected.join("text_encoder"),
+                    crate::config::KLEIN_ENCODER_CONTRACT,
+                    selected_quant,
+                )
+                .unwrap();
+                Some(WeightsSource::Dir(selected))
+            }
+        };
+        spec
+    }
+
+    fn expected_stored_language_bytes(
+        spec: &LoadSpec,
+        contract: mlx_gen::gen_core::EncoderContract,
+        provider_id: &str,
+    ) -> u64 {
+        let root = mlx_gen::require_base_snapshot(spec, provider_id).unwrap();
+        let selected = contract.source_for_load(spec, root).unwrap();
+        selected.load_time_quant_bits(None, provider_id).unwrap();
+        let headers = selected
+            .materialized_language_tensor_headers(&contract)
+            .unwrap();
+        mlx_gen::asset_facts::projected_tensor_headers_bytes(&headers, |_| {
+            mlx_gen::asset_facts::ResidentProjection::Stored
+        })
+        .unwrap()
+    }
+
     fn expected_dev_language_bytes(spec: &LoadSpec, bits: Option<i32>, provider_id: &str) -> u64 {
         let root = mlx_gen::require_base_snapshot(spec, provider_id).unwrap();
         let selected = crate::config::DEV_ENCODER_CONTRACT
@@ -2721,38 +3052,70 @@ mod tests {
     }
 
     #[test]
-    fn packed_klein_registry_footprint_includes_embedding_affine_tables() {
-        let fixture = tempfile::tempdir().unwrap();
-        gen_core_testkit::write_encoder_contract_fixture_with_quant(
-            &fixture.path().join("text_encoder"),
-            crate::config::KLEIN_ENCODER_CONTRACT,
-            Some(4),
-        )
-        .unwrap();
-        let spec = LoadSpec::new(WeightsSource::Dir(fixture.path().to_path_buf()));
-        let selected = crate::config::KLEIN_ENCODER_CONTRACT
-            .source_for_load(&spec, fixture.path())
-            .unwrap();
-        let headers = selected.tensor_headers().unwrap();
-        for suffix in ["weight", "scales", "biases"] {
-            assert!(
-                headers
-                    .iter()
-                    .any(|header| header.name == format!("model.embed_tokens.{suffix}")),
-                "packed fixture must carry the embedding {suffix} payload"
-            );
+    fn klein_registry_footprint_keeps_dense_language_stored_and_rejects_every_packed_selector() {
+        let registry = crate::provider_registry().unwrap();
+        let routes = [
+            FLUX2_KLEIN_9B_ID,
+            FLUX2_KLEIN_9B_EDIT_ID,
+            crate::config::FLUX2_KLEIN_9B_KV_EDIT_ID,
+        ];
+        let selections = [
+            DevFootprintSelection::Builtin,
+            DevFootprintSelection::ComponentDir,
+            DevFootprintSelection::ComponentFile,
+            DevFootprintSelection::CompleteSnapshot,
+        ];
+
+        for base_quant in [None, Some(4), Some(8)] {
+            for requested in [None, Some(Quant::Q4), Some(Quant::Q8)] {
+                for selection in selections {
+                    let dense_tmp = tempfile::tempdir().unwrap();
+                    let dense = klein_footprint_spec(
+                        dense_tmp.path(),
+                        selection,
+                        base_quant,
+                        requested,
+                        None,
+                    );
+                    let expected = expected_stored_language_bytes(
+                        &dense,
+                        crate::config::KLEIN_ENCODER_CONTRACT,
+                        FLUX2_KLEIN_9B_ID,
+                    );
+                    for route in routes {
+                        assert_eq!(
+                            registry
+                                .footprint(route, &dense)
+                                .unwrap()
+                                .unwrap()
+                                .text_encoder,
+                            expected,
+                            "dense {selection:?} base={base_quant:?} request={requested:?} {route}"
+                        );
+                    }
+
+                    for packed_bits in [4, 8] {
+                        let packed_tmp = tempfile::tempdir().unwrap();
+                        let packed = klein_footprint_spec(
+                            packed_tmp.path(),
+                            selection,
+                            base_quant,
+                            requested,
+                            Some(packed_bits),
+                        );
+                        for route in routes {
+                            let error = registry.footprint(route, &packed).unwrap_err().to_string();
+                            assert!(
+                                error.contains(route)
+                                    && error.contains("pre-quantized")
+                                    && error.contains("model policy"),
+                                "packed Q{packed_bits} {selection:?} base={base_quant:?} request={requested:?} {route}: {error}"
+                            );
+                        }
+                    }
+                }
+            }
         }
-        let expected = headers.iter().map(|header| header.data_bytes).sum::<u64>();
-        let actual = crate::provider_registry()
-            .unwrap()
-            .footprint(crate::config::FLUX2_KLEIN_9B_ID, &spec)
-            .unwrap()
-            .unwrap()
-            .text_encoder;
-        assert_eq!(
-            actual, expected,
-            "the packed language-only fixture is entirely materialized, including embedding scales and biases"
-        );
     }
 
     #[test]
@@ -2761,7 +3124,7 @@ mod tests {
         gen_core_testkit::write_encoder_contract_fixture_with_quant(
             &fixture.path().join("text_encoder"),
             crate::config::KLEIN_ENCODER_CONTRACT,
-            Some(4),
+            None,
         )
         .unwrap();
         let spec = LoadSpec::new(WeightsSource::Dir(fixture.path().to_path_buf()));

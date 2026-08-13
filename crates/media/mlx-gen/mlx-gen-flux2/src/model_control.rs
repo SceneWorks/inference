@@ -8,8 +8,11 @@
 //! guidance-distilled — a single forward, no true-CFG). [`load_dev_control`] needs the dev snapshot
 //! (`spec.weights`) **and** the control checkpoint (`spec.control`); the base loads manifest-aware
 //! (a pre-quantized dev snapshot loads packed, sc-5917) and the bf16 control overlay loads dense,
-//! then `spec.quantize` packs the control branch in place (the packed base no-ops). The control
-//! patch embedder stays dense (its 260 in-features is not a multiple of the quant group size).
+//! The selected text encoder follows the base transformer's effective tier, including a packed base
+//! selected without `spec.quantize`. An explicit `spec.quantize` also packs the dense control branch
+//! and VAE in place (the packed base no-ops); without that explicit request those two components stay
+//! dense. The control patch embedder always stays dense (its 260 in-features is not a multiple of the
+//! quant group size).
 //!
 //! Architecture (`videox_fun/models/flux2_transformer2d_control.py`): a VACE ControlNet on the first
 //! 4 of dev's 8 base double blocks. The control context is the VAE-encoded pose/union skeleton
@@ -29,7 +32,7 @@ use mlx_gen::{
 use mlx_rs::transforms::eval;
 use mlx_rs::Array;
 
-use crate::config::{Flux2Config, Flux2Variant, FLUX2_DEV_CONTROL_ID};
+use crate::config::{Flux2Config, FLUX2_DEV_CONTROL_ID};
 use crate::model::{crop_to_even, match_latent_spatial_size, validate_request, Flux2TextOwned};
 use crate::pipeline::{
     add_noise_by_interpolation, create_noise, fun_control_context_from_latents, init_time_step,
@@ -122,6 +125,8 @@ pub(crate) struct Flux2ControlHeavyOwned {
 pub struct Flux2DevControl {
     descriptor: ModelDescriptor,
     config: Flux2Config,
+    memory_strategy: gen_core::MemoryProviderContract,
+    memory_numeric_tier: gen_core::MemoryNumericTier,
     tokenizer: Option<TextTokenizer>,
     residency: Residency<Flux2TextOwned, Flux2ControlHeavyOwned>,
 }
@@ -133,9 +138,10 @@ pub struct Flux2DevControl {
 /// `spec.weights` must be the dev snapshot directory (tokenizer/ text_encoder/ transformer/ vae/);
 /// `spec.control` (required) the Fun-Controlnet-Union checkpoint (a single `.safetensors` `File`, or
 /// a `Dir`). The base loads manifest-aware (pre-quantized dev → packed); the bf16 control overlay
-/// loads dense. `spec.quantize` (Q4/Q8) then quantizes the whole model — a no-op on the already
-/// packed base, packing the dense control branch + the text encoder + VAE (the control patch
-/// embedder stays dense, its in-features is not a multiple of 64).
+/// loads dense. The selected text encoder inherits the effective base transformer tier. An explicit
+/// `spec.quantize` (Q4/Q8) additionally packs the dense control branch + VAE — a no-op on an already
+/// packed base (the control patch embedder stays dense, since its in-features is not a multiple of
+/// 64). A packed base selected without an explicit request leaves the control branch + VAE dense.
 pub fn load_dev_control(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     if spec.precision != Precision::Bf16 {
         return Err(Error::Msg(format!(
@@ -164,9 +170,13 @@ pub fn load_dev_control(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     }
     let text_encoder_source = crate::config::DEV_ENCODER_CONTRACT.source_for_load(spec, root)?;
     let tokenizer = loader::load_validated_tokenizer_dev(&text_encoder_source)?;
+    let memory_numeric_tier =
+        crate::model::effective_dev_memory_numeric_tier(spec, FLUX2_DEV_CONTROL_ID)?;
     Ok(Box::new(Flux2DevControl {
         descriptor: descriptor_dev_control(),
         config: Flux2Config::dev(),
+        memory_strategy: crate::memory_strategy::registered_dev_control_contract(spec)?,
+        memory_numeric_tier,
         tokenizer: Some(tokenizer),
         residency: build_control_residency_with_source(spec, text_encoder_source)?,
     }))
@@ -200,7 +210,7 @@ fn build_control_residency_with_source(
         "a FLUX.2-dev snapshot directory",
     )?;
     let effective_quant_bits =
-        crate::model::effective_base_quant(Flux2Variant::Dev, spec, root)?.map(Quant::bits);
+        crate::model::effective_base_quant(spec, root, FLUX2_DEV_CONTROL_ID)?.map(Quant::bits);
     let text_encoder_load_time_quant_bits =
         text_encoder_source.load_time_quant_bits(effective_quant_bits, FLUX2_DEV_CONTROL_ID)?;
     let spec_heavy = spec.clone();
@@ -537,6 +547,21 @@ impl Generator for Flux2DevControl {
     ) -> gen_core::Result<GenerationOutput> {
         self.generate_impl(req, on_progress).map_err(Into::into)
     }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        Some(&self.memory_strategy)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        crate::memory_strategy::dev_control_safety_check(
+            &self.memory_strategy,
+            context,
+            self.memory_numeric_tier,
+        )
+    }
 }
 
 // The registration constant bridges the crate's rich `Result` into backend-neutral
@@ -548,9 +573,20 @@ mlx_gen::register_generators! {
     footprint = crate::model::dev_control_component_footprint
 }
 
+pub(crate) const DEV_CONTROL_MEMORY_REGISTRATION: gen_core::MemoryRegistration =
+    gen_core::MemoryRegistration {
+        provider_id: FLUX2_DEV_CONTROL_ID,
+        contract: crate::memory_strategy::registered_dev_control_contract,
+        safety_check: crate::memory_strategy::registered_dev_control_safety_check,
+    };
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_gen::gen_core::{
+        MemoryBudget, MemoryCacheState, MemoryGeometry, MemoryMode, MemoryNumericTier,
+        MemoryRunContext, MemorySafetyDecision, MemorySelection, MemoryStrategy,
+    };
     use mlx_gen::WeightsSource;
 
     #[test]
@@ -611,6 +647,62 @@ mod tests {
             .with_offload_policy(policy)
     }
 
+    fn tier_spec(
+        root: &std::path::Path,
+        packed_bits: Option<i32>,
+        requested: Option<Quant>,
+    ) -> LoadSpec {
+        let mut spec = validation_complete_snapshot_spec(root, OffloadPolicy::Sequential);
+        std::fs::create_dir_all(root.join("transformer")).unwrap();
+        std::fs::write(
+            root.join("transformer/config.json"),
+            packed_bits.map_or_else(
+                || "{}".to_owned(),
+                |bits| format!(r#"{{"quantization":{{"bits":{bits},"group_size":64}}}}"#),
+            ),
+        )
+        .unwrap();
+        spec.quantize = requested;
+        spec
+    }
+
+    fn public_control_context(
+        contract: &gen_core::MemoryProviderContract,
+        tier: MemoryNumericTier,
+    ) -> MemoryRunContext {
+        MemoryRunContext {
+            selection: MemorySelection {
+                strategy: MemoryStrategy::Resident,
+                parameters: Default::default(),
+                tier,
+            },
+            calibration_abi: 0,
+            calibration_fingerprint: String::new(),
+            load_shape: contract.load_shape,
+            mode: MemoryMode::TextToImage,
+            has_reference: false,
+            use_pid: false,
+            has_phases: false,
+            geometry: MemoryGeometry {
+                width: 768,
+                height: 768,
+                batch: 1,
+                frames: 1,
+                reference_count: 0,
+            },
+            overlay: Some(crate::memory_strategy::DEV_CONTROL_OVERLAY.to_owned()),
+            budget: MemoryBudget {
+                total_bytes: 96 * 1024 * 1024 * 1024,
+                committed_bytes: 0,
+                reclaimable_bytes: 0,
+                reserved_headroom_bytes: 0,
+            },
+            predicted_peak_bytes: 1,
+            cache_state: MemoryCacheState::Cold,
+            evidence_revision: "flux2-dev-control-estimated-fallback".to_owned(),
+        }
+    }
+
     #[test]
     fn build_residency_sequential_defers_all_component_loads() {
         let fixture = tempfile::tempdir().unwrap();
@@ -634,5 +726,175 @@ mod tests {
             !err.to_string().contains("single .safetensors file"),
             "expected an eager-load failure: {err}"
         );
+    }
+
+    #[test]
+    fn loaded_and_registered_control_contracts_use_the_effective_base_tier() {
+        let registry = crate::provider_registry().unwrap();
+        let registration = registry
+            .memory_strategy_registrations()
+            .find(|registration| registration.provider_id == FLUX2_DEV_CONTROL_ID)
+            .expect("DevControl memory registration");
+        assert_eq!(
+            registry
+                .memory_strategy_registrations()
+                .filter(|registration| registration.provider_id == FLUX2_DEV_CONTROL_ID)
+                .count(),
+            1
+        );
+
+        for (quant, bits) in [(Quant::Q4, 4), (Quant::Q8, 8)] {
+            for prepacked in [false, true] {
+                let fixture = tempfile::tempdir().unwrap();
+                let spec = tier_spec(
+                    fixture.path(),
+                    prepacked.then_some(bits),
+                    (!prepacked).then_some(quant),
+                );
+                let loaded = load_dev_control(&spec)
+                    .unwrap_or_else(|error| panic!("Q{bits} prepacked={prepacked}: {error}"));
+                let contract = loaded
+                    .memory_strategy_contract()
+                    .expect("loaded control contract");
+                assert_eq!(contract.provider_id, FLUX2_DEV_CONTROL_ID);
+                assert_eq!(contract.load_shape, spec.load_shape);
+                assert!(contract.calibration.is_none());
+                assert_eq!(contract.asset_facts, Default::default());
+                assert!(contract.conformance_errors().is_empty());
+                assert!(contract.strategies.iter().all(|capability| {
+                    capability.strategy == MemoryStrategy::Resident
+                        && capability.support == gen_core::MemoryStrategySupport::Implemented
+                        || capability.strategy != MemoryStrategy::Resident
+                            && capability.support == gen_core::MemoryStrategySupport::Missing
+                }));
+                let tier = MemoryNumericTier {
+                    precision: Precision::Bf16,
+                    quant: Some(quant),
+                    component_precision_floors: &[],
+                };
+                let context = public_control_context(contract, tier);
+                assert_eq!(
+                    loaded.memory_strategy_safety_check(&context),
+                    MemorySafetyDecision::Accept,
+                    "loaded Q{bits} prepacked={prepacked}"
+                );
+
+                let registered_contract = (registration.contract)(&spec).unwrap();
+                assert_eq!(registered_contract, *contract);
+                assert_eq!(
+                    (registration.safety_check)(&spec, &registered_contract, &context),
+                    MemorySafetyDecision::Accept,
+                    "registered Q{bits} prepacked={prepacked}"
+                );
+                let mut wrong_tier = context.clone();
+                wrong_tier.selection.tier.quant = Some(if quant == Quant::Q4 {
+                    Quant::Q8
+                } else {
+                    Quant::Q4
+                });
+                for decision in [
+                    loaded.memory_strategy_safety_check(&wrong_tier),
+                    (registration.safety_check)(&spec, &registered_contract, &wrong_tier),
+                ] {
+                    let MemorySafetyDecision::Reject { reason } = decision else {
+                        panic!("wrong Q{bits} control tier must reject")
+                    };
+                    assert!(reason.contains("does not match loaded tier"), "{reason}");
+                }
+                assert!(
+                    registry
+                        .footprint(FLUX2_DEV_CONTROL_ID, &spec)
+                        .unwrap()
+                        .is_some(),
+                    "the resident-only contract must retain its estimated-fallback footprint"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn control_contract_rejects_tier_mismatches_and_non_control_public_contexts() {
+        let registry = crate::provider_registry().unwrap();
+        let registration = registry
+            .memory_strategy_registrations()
+            .find(|registration| registration.provider_id == FLUX2_DEV_CONTROL_ID)
+            .unwrap();
+        for (stored_bits, requested) in [(4, Quant::Q8), (8, Quant::Q4)] {
+            let fixture = tempfile::tempdir().unwrap();
+            let mismatch = tier_spec(fixture.path(), Some(stored_bits), Some(requested));
+            let load_error = load_dev_control(&mismatch)
+                .err()
+                .expect("control load must reject a requested/stored mismatch")
+                .to_string();
+            assert!(
+                load_error.contains(FLUX2_DEV_CONTROL_ID) && load_error.contains("pre-quantized"),
+                "{load_error}"
+            );
+            let contract = (registration.contract)(&mismatch).unwrap();
+            let context = public_control_context(
+                &contract,
+                MemoryNumericTier {
+                    precision: Precision::Bf16,
+                    quant: Some(requested),
+                    component_precision_floors: &[],
+                },
+            );
+            let MemorySafetyDecision::Reject { reason } =
+                (registration.safety_check)(&mismatch, &contract, &context)
+            else {
+                panic!("registered mismatch must reject")
+            };
+            assert!(
+                reason.contains(FLUX2_DEV_CONTROL_ID) && reason.contains("pre-quantized"),
+                "{reason}"
+            );
+        }
+
+        let fixture = tempfile::tempdir().unwrap();
+        let spec = tier_spec(fixture.path(), Some(4), None);
+        let loaded = load_dev_control(&spec).unwrap();
+        let contract = loaded.memory_strategy_contract().unwrap();
+        let tier = MemoryNumericTier {
+            precision: Precision::Bf16,
+            quant: Some(Quant::Q4),
+            component_precision_floors: &[],
+        };
+        let exact = public_control_context(contract, tier);
+        for wrong in [
+            {
+                let mut context = exact.clone();
+                context.overlay = None;
+                context
+            },
+            {
+                let mut context = exact.clone();
+                context.mode = MemoryMode::ImageToImage;
+                context.has_reference = true;
+                context.geometry.reference_count = 1;
+                context
+            },
+            {
+                let mut context = exact.clone();
+                context.use_pid = true;
+                context
+            },
+        ] {
+            let MemorySafetyDecision::Reject { reason } =
+                loaded.memory_strategy_safety_check(&wrong)
+            else {
+                panic!("non-control public context must reject: {wrong:?}")
+            };
+            assert!(reason.contains(FLUX2_DEV_CONTROL_ID), "{reason}");
+        }
+
+        let mut missing_control = spec.clone();
+        missing_control.control = None;
+        let registered_contract = (registration.contract)(&missing_control).unwrap();
+        let MemorySafetyDecision::Reject { reason } =
+            (registration.safety_check)(&missing_control, &registered_contract, &exact)
+        else {
+            panic!("registered control safety must reject a missing control artifact")
+        };
+        assert!(reason.contains("Fun-Controlnet-Union"), "{reason}");
     }
 }
