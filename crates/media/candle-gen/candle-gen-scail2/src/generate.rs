@@ -6,7 +6,7 @@
 //! and VAE-decode each segment back to pixels.
 //!
 //! Reuse map — the heavy components are `candle-gen-wan`'s (SCAIL-2 *is* Wan2.1-14B I2V): the z16
-//! [`WanVae16`] (encode/decode; its decode already streams one latent frame at a time = the
+//! [`ProviderVae`] (encode/decode; its decode already streams one latent frame at a time = the
 //! temporal-tiled decode the high-res fix needs), the [`Umt5Encoder`] text encoder, and the
 //! flow-matching [`FlowScheduler`] (UniPC). SCAIL-2's own pieces are the [`Scail2Dit`] forward, the
 //! open-CLIP [`ScailClip`] image encode, the 28-channel [`extract_and_compress_mask_to_latent`] mask

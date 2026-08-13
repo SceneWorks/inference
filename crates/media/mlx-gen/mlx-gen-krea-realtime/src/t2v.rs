@@ -5,7 +5,7 @@
 //!
 //! Every heavy component is **reused from [`mlx_gen_wan`]** (Krea Realtime is Wan 2.1 T2V 14B
 //! weight-for-weight): the UMT5-XXL text encoder ([`Umt5Encoder`] + [`load_tokenizer`]) and the z16
-//! [`WanVae`] (encode/decode + `decode_to_frames`/`frames_to_images`). The only Krea-specific piece in
+//! [`ProviderVae`] (encode/decode + `decode_to_frames`/`frames_to_images`). The only Krea-specific piece in
 //! the chain is the AR causal denoise ([`crate::generate::generate_latents`] over
 //! [`crate::CausalKreaTransformer`]).
 //!
@@ -289,7 +289,7 @@ pub fn decode_tiling(out_h: usize, out_w: usize, out_frames: i32) -> Result<Opti
 }
 
 /// Decode the AR latent sequence `[z16, T_lat, lat_h, lat_w]` (f32) through the reused z16 Wan
-/// [`WanVae`] → an assembled RGB clip ([`GenerationOutput::Video`]). Single-pass for the batch form; a
+/// [`ProviderVae`] → an assembled RGB clip ([`GenerationOutput::Video`]). Single-pass for the batch form; a
 /// `tiling` config bounds a large decode via gen-core [`mlx_gen::tiling`]. The z16 VAE upsamples `T_lat
 /// → 4·T_lat` temporally and `×8` spatially, so the raw decode is `4·T_lat` frames of `8·lat_h ×
 /// 8·lat_w`.
@@ -488,7 +488,7 @@ pub fn generate_t2v_from_components(
 }
 
 /// VAE-encode a reference **still** → clean i2v context latent `[in_dim, 1, latent_h, latent_w]` (f32)
-/// via the reused z16 Wan VAE [`WanVae::encode`] (`.mode()`, the Gaussian mean — the reference's image
+/// via the reused z16 Wan VAE [`ProviderVae::encode`] (`.mode()`, the Gaussian mean — the reference's image
 /// conditioning path, mirroring `mlx-gen-bernini`'s `vae_encode_image`). The image is cover-fit +
 /// center-cropped to `(width, height)` and normalized to `[-1, 1]` by the reused
 /// [`preprocess_i2v_image`], then encoded and the batch axis dropped. The pixel size `(width, height)`
@@ -507,7 +507,7 @@ fn encode_reference_image(
 }
 
 /// VAE-encode a **source clip** → clean v2v source latent `[in_dim, T_lat, latent_h, latent_w]` (f32)
-/// via the reused z16 Wan VAE [`WanVae::encode_sample`] (`.sample()` — the reference's **video** source
+/// via the reused z16 Wan VAE [`ProviderVae::encode_sample`] (`.sample()` — the reference's **video** source
 /// path, mirroring `mlx-gen-bernini`'s `vae_encode_video`; `eps` is drawn from `key` so the encode is
 /// deterministic given the seed). Each frame is cover-fit + center-cropped to `(width, height)`,
 /// stacked on the temporal axis (`T = 1 + 4·k`), encoded, and the batch axis dropped. `T_lat =

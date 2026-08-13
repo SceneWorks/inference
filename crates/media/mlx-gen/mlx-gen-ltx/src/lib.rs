@@ -44,6 +44,7 @@ pub mod connector;
 pub mod convert;
 pub mod enhance;
 pub mod gemma;
+pub mod memory_strategy;
 pub mod model;
 pub mod pipeline;
 pub mod positions;
@@ -123,6 +124,12 @@ pub fn register_providers(
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(model::REGISTRATION)
+        .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            provider_id: MODEL_ID,
+            contract: memory_strategy::weights_free_memory_strategy_contract,
+        })
+        .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR)
         .register_trainer(training::TRAINER_REGISTRATION)
 }
 
@@ -149,6 +156,71 @@ pub fn conservative_video_decode_memory_profile(
 
 #[cfg(test)]
 mod explicit_registry_tests {
+    use mlx_gen::gen_core::{MemoryStrategy, MemoryStrategySupport, ProviderRegistryBuilder};
+    use mlx_gen::{LoadSpec, WeightsSource};
+
+    fn write_named_safetensors(
+        path: &std::path::Path,
+        tensor_name: &str,
+        dtype: &str,
+        elements: usize,
+        bytes_per_element: usize,
+    ) {
+        let payload_bytes = elements.checked_mul(bytes_per_element).unwrap();
+        let mut tensors = serde_json::Map::new();
+        tensors.insert(
+            tensor_name.to_owned(),
+            serde_json::json!({
+                "dtype": dtype,
+                "shape": [elements],
+                "data_offsets": [0, payload_bytes]
+            }),
+        );
+        let mut header = serde_json::to_vec(&tensors).unwrap();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.resize(bytes.len() + payload_bytes, 0);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn write_safetensors(
+        path: &std::path::Path,
+        dtype: &str,
+        elements: usize,
+        bytes_per_element: usize,
+    ) {
+        write_named_safetensors(path, "weight", dtype, elements, bytes_per_element);
+    }
+
+    fn production_contract_spec(tmp: &tempfile::TempDir) -> LoadSpec {
+        let root = tmp.path().join("q8");
+        let gemma = tmp.path().join("gemma");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&gemma).unwrap();
+        std::fs::write(
+            root.join("split_model.json"),
+            r#"{"quantized":true,"quantization_bits":8,"quantization_group_size":64}"#,
+        )
+        .unwrap();
+        for (name, dtype, elements, bytes_per_element) in [
+            ("connector.safetensors", "F32", 11, 4),
+            ("transformer.safetensors", "F32", 13, 4),
+            ("upsampler.safetensors", "BF16", 17, 2),
+            ("vae_decoder.safetensors", "BF16", 19, 2),
+            ("audio_vae.safetensors", "BF16", 23, 2),
+            ("vocoder.safetensors", "BF16", 29, 2),
+        ] {
+            write_safetensors(&root.join(name), dtype, elements, bytes_per_element);
+        }
+        write_safetensors(&gemma.join("model.safetensors"), "F32", 31, 4);
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root));
+        spec.text_encoder = Some(WeightsSource::Dir(gemma));
+        spec
+    }
+
     #[test]
     fn explicit_catalog_has_stable_surface() {
         let registry = super::provider_registry().unwrap();
@@ -163,6 +235,146 @@ mod explicit_registry_tests {
 
         assert_eq!(explicit_generators, ["ltx_2_3"]);
         assert_eq!(explicit_trainers, ["ltx_2_3"]);
+    }
+
+    #[test]
+    fn registered_contract_is_present_and_removal_changes_resolution_to_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = production_contract_spec(&tmp);
+        let registry = super::provider_registry().unwrap();
+        let contract = registry
+            .memory_strategy_contract(super::MODEL_ID, &spec)
+            .unwrap()
+            .expect("LTX production registry must resolve its memory contract");
+        assert!(matches!(
+            contract
+                .capability(MemoryStrategy::StagedResidency)
+                .unwrap()
+                .support,
+            MemoryStrategySupport::Implemented
+        ));
+        // Gemma + connector are retained as bf16, transformer + upsampler preserve storage, and all
+        // three decode components are unconditionally materialized as f32.
+        assert_eq!(contract.asset_facts.conditioning_bytes, 31 * 2 + 11 * 2);
+        assert_eq!(contract.asset_facts.transformer_bytes, 13 * 4 + 17 * 2);
+        assert_eq!(contract.asset_facts.decoder_bytes, 19 * 4 + 23 * 4 + 29 * 4);
+        assert_eq!(
+            contract.asset_facts.base_bytes,
+            31 * 2 + 11 * 2 + 13 * 4 + 17 * 2 + 19 * 4 + 23 * 4 + 29 * 4
+        );
+        assert_eq!(
+            contract.calibration.as_ref().unwrap().fingerprint,
+            super::memory_strategy::CALIBRATION_FINGERPRINT
+        );
+        assert_eq!(
+            super::memory_strategy::resolved_numeric_tier(&spec)
+                .unwrap()
+                .quant,
+            Some(mlx_gen::Quant::Q8)
+        );
+        assert_eq!(
+            super::memory_strategy::route_overlay(&spec),
+            None,
+            "canonical dense-bf16 Gemma is the base route, not an overlay"
+        );
+        let mut mismatched_tier = spec.clone();
+        mismatched_tier.quantize = Some(mlx_gen::Quant::Q4);
+        assert!(registry
+            .memory_strategy_contract(super::MODEL_ID, &mismatched_tier)
+            .is_err());
+
+        // Negative mutation: the identical executable provider without its memory registration
+        // must resolve `None`. This guards the registry row from becoming decorative fixture-only
+        // metadata, the failure SC-19109 is repairing.
+        let without_contract = ProviderRegistryBuilder::new()
+            .register_generator(super::model::REGISTRATION)
+            .register_trainer(super::training::TRAINER_REGISTRATION)
+            .build()
+            .unwrap();
+        assert!(without_contract
+            .memory_strategy_contract(super::MODEL_ID, &spec)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn quantized_gemma_route_does_not_borrow_the_canonical_bf16_contract() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = production_contract_spec(&tmp);
+        let WeightsSource::Dir(root) = &spec.weights else {
+            panic!("fixture must use a model directory");
+        };
+        let Some(WeightsSource::Dir(gemma)) = spec.text_encoder.as_ref() else {
+            panic!("fixture must use a Gemma directory");
+        };
+        let split = super::config::SplitModel::from_model_dir(root).unwrap();
+        let quant = super::gemma::GemmaQuant { group: 64, bits: 8 };
+
+        assert!(
+            super::memory_strategy::contract_for_loaded(&spec, &split, gemma, Some(quant))
+                .unwrap()
+                .is_none()
+        );
+
+        std::fs::write(
+            gemma.join("config.json"),
+            r#"{"quantization":{"mode":"affine","group_size":64,"bits":8}}"#,
+        )
+        .unwrap();
+        let error = super::provider_registry()
+            .unwrap()
+            .memory_strategy_contract(super::MODEL_ID, &spec)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("requires canonical dense-bf16 Gemma"));
+    }
+
+    #[test]
+    fn dense_delta_adapters_keep_loading_but_do_not_publish_underpriced_contracts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut spec = production_contract_spec(&tmp);
+        let WeightsSource::Dir(root) = &spec.weights else {
+            panic!("fixture must use a model directory");
+        };
+        let Some(WeightsSource::Dir(gemma)) = spec.text_encoder.as_ref() else {
+            panic!("fixture must use a Gemma directory");
+        };
+        let split = super::config::SplitModel::from_model_dir(root).unwrap();
+        let adapter = tmp.path().join("third-party-lokr.safetensors");
+        write_named_safetensors(
+            &adapter,
+            "transformer_blocks.0.attn.to_q.lokr_w1",
+            "BF16",
+            8,
+            2,
+        );
+        spec.adapters.push(mlx_gen::AdapterSpec::new(
+            adapter,
+            1.0,
+            mlx_gen::AdapterKind::Lora,
+        ));
+
+        assert!(
+            super::memory_strategy::contract_for_loaded(&spec, &split, gemma, None)
+                .unwrap()
+                .is_none()
+        );
+        let error = super::provider_registry()
+            .unwrap()
+            .memory_strategy_contract(super::MODEL_ID, &spec)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("LoKr/LoHa routes"));
+    }
+
+    #[test]
+    fn weights_free_registry_behavior_is_executable_for_each_implemented_rung() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent-ltx-fixture".into()))
+            .with_quant(mlx_gen::Quant::Q8);
+        gen_core_testkit::memory_strategy_registry_conformance(
+            &super::provider_registry().unwrap(),
+            &spec,
+        );
     }
 }
 

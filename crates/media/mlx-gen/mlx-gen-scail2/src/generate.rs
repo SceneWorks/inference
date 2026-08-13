@@ -6,7 +6,7 @@
 //! continuity, and VAE-decode each segment back to pixels.
 //!
 //! Reuse map — the heavy components are `mlx-gen-wan`'s (SCAIL-2 *is* Wan2.1-14B I2V): the z16
-//! [`WanVae`] (encode/decode), the [`Umt5Encoder`] text encoder, and the flow-matching
+//! [`ProviderVae`] (encode/decode), the [`Umt5Encoder`] text encoder, and the flow-matching
 //! [`make_scheduler`] (UniPC/DPM++). SCAIL-2's own pieces are the [`Scail2Dit`] forward, the
 //! open-CLIP [`ScailClip`] image encode, the 28-channel [`extract_and_compress_mask_to_latent`] mask
 //! build, and the [`interpolate`]/[`downsample_half`] resizes — all already parity-gated.

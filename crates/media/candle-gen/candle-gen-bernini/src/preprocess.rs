@@ -1,5 +1,5 @@
 //! Source-media preprocessing — decoded conditioning [`Image`]s (the worker owns file I/O) → resized
-//! `[-1,1]` pixel tensors → [`WanVae16::encode`] normalized z16 latents, the `videos`/`images` lists
+//! `[-1,1]` pixel tensors → [`ProviderVae::encode`] normalized z16 latents, the `videos`/`images` lists
 //! [`crate::forward::guided_velocity`] consumes. The candle sibling of `mlx-gen-bernini/src/preprocess.rs`.
 //!
 //! Reuses [`candle_gen_wan::wan14b::preprocess_i2v_image`] (cover-fit resize to the target W×H,
@@ -16,7 +16,7 @@ use candle_gen_wan::wan14b::preprocess_i2v_image;
 use crate::ProviderVae;
 
 /// One conditioning image `[1, 16, 1, H/8, W/8]` (z16, normalized): resize → `[-1,1]` `[1,3,1,H,W]` →
-/// [`WanVae16::encode`]. The batch axis is kept (the candle DiT latents are batch-first).
+/// [`ProviderVae::encode`]. The batch axis is kept (the candle DiT latents are batch-first).
 pub fn encode_image(
     vae: &ProviderVae,
     image: &Image,
@@ -29,7 +29,7 @@ pub fn encode_image(
 }
 
 /// One conditioning video clip `[1, 16, T_lat, H/8, W/8]`: each frame resized to `[1,3,1,H,W]`, stacked
-/// on the temporal axis → `[1,3,T,H,W]` (T must be `1 + 4k`) → [`WanVae16::encode`].
+/// on the temporal axis → `[1,3,T,H,W]` (T must be `1 + 4k`) → [`ProviderVae::encode`].
 pub fn encode_videoclip(
     vae: &ProviderVae,
     frames: &[Image],
