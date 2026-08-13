@@ -20,8 +20,8 @@ use mlx_rs::Array;
 
 use mlx_gen::image::resize_lanczos_u8;
 use mlx_gen::tiling::{
-    budgeted_plan, TemporalOverlapPolicy, TileCandidates, TilingBudgetError, TilingConfig,
-    VaeTiling,
+    budgeted_plan, SpatialTiling, TemporalOverlapPolicy, TileCandidates, TilingBudgetError,
+    TilingConfig, VaeTiling,
 };
 use mlx_gen::{default_seed, CancelFlag, Error, GenerationRequest, Image, Progress, Result};
 
@@ -292,21 +292,48 @@ fn estimated_vae22_decode_peak_gib(
     bf16: bool,
 ) -> f64 {
     const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
-    let tile_coeff = if bf16 {
+    vae22_decode_peak_bytes(out_f, out_h, out_w, tile_f, tile_h, tile_w, bf16)
+        .map_or(f64::INFINITY, |bytes| bytes as f64 / GIB)
+}
+
+/// Candidate spatial tile sizes (output px, multiples of the vae22 ×16 spatial scale, overlap 64).
+pub(crate) const VAE22_SPATIAL_PX: [i32; 8] = [768, 640, 512, 448, 384, 320, 256, 192];
+/// Fixed spatial overlap paired with every selected MLX Wan z48 tile edge.
+pub const VAE22_SELECTED_OVERLAP: u32 = 64;
+/// Candidate temporal tiles `(tile_frames, overlap_frames)` in output frames (matching the preset
+/// overlaps: 24 for the longer tiles, 16/8 for the shorter).
+pub(crate) const VAE22_TEMPORAL_FR: [(i32, i32); 4] = [(96, 24), (64, 24), (48, 16), (32, 8)];
+
+/// Checked byte form of the z48 decode model. Both the live planner and the worker-facing selected
+/// profile call this one function, so admission cannot price a different tile than generation runs.
+fn vae22_decode_peak_bytes(
+    out_f: i64,
+    out_h: i64,
+    out_w: i64,
+    tile_f: i64,
+    tile_h: i64,
+    tile_w: i64,
+    bf16: bool,
+) -> Option<u64> {
+    let to_u64 = |value: i64| u64::try_from(value).ok();
+    let output_voxels = to_u64(out_f)?
+        .checked_mul(to_u64(out_h)?)?
+        .checked_mul(to_u64(out_w)?)?;
+    if output_voxels == 0 {
+        return None;
+    }
+    let tile_voxels = to_u64(tile_f)?
+        .checked_mul(to_u64(tile_h)?)?
+        .checked_mul(to_u64(tile_w)?)?;
+    let tile_coefficient = if bf16 {
         VAE22_TILE_BYTES_PER_OUT_VOXEL_BF16
     } else {
         VAE22_TILE_BYTES_PER_OUT_VOXEL
     };
-    let out_voxels = (out_f * out_h * out_w) as f64;
-    let tile_voxels = (tile_f * tile_h * tile_w) as f64;
-    (VAE22_ACCUM_BYTES_PER_VOXEL as f64 * out_voxels + tile_coeff as f64 * tile_voxels) / GIB
+    VAE22_ACCUM_BYTES_PER_VOXEL
+        .checked_mul(output_voxels)?
+        .checked_add(tile_coefficient.checked_mul(tile_voxels)?)
 }
-
-/// Candidate spatial tile sizes (output px, multiples of the vae22 ×16 spatial scale, overlap 64).
-const VAE22_SPATIAL_PX: [i32; 8] = [768, 640, 512, 448, 384, 320, 256, 192];
-/// Candidate temporal tiles `(tile_frames, overlap_frames)` in output frames (matching the preset
-/// overlaps: 24 for the longer tiles, 16/8 for the shorter).
-const VAE22_TEMPORAL_FR: [(i32, i32); 4] = [(96, 24), (64, 24), (48, 16), (32, 8)];
 
 // --- sc-12737: free-aware VAE-decode budget (contract-aligned with candle sc-12734) --------------
 //
@@ -454,6 +481,114 @@ fn plan_vae22_tiling(
     .map_err(|e| wan_budget_error("z48 vae22", width, height, out_frames, e))
 }
 
+/// Resolve a decode plan for one worker-selected spatial cap. The selected edge is the only spatial
+/// candidate: the planner may shorten the temporal tile to stay within the same live safe budget as
+/// the historical automatic route, but it may neither silently widen nor shrink the admitted edge.
+fn plan_vae22_tiling_for_selected_spatial(
+    height: i32,
+    width: i32,
+    out_frames: i32,
+    tile_edge: i32,
+    overlap: i32,
+    safe_gib: f64,
+) -> Result<TilingConfig> {
+    let spatial = [tile_edge];
+    let candidates = TileCandidates {
+        spatial_px: &spatial,
+        spatial_overlap_px: overlap,
+        temporal: &VAE22_TEMPORAL_FR,
+        temporal_overlap_policy: TemporalOverlapPolicy::Candidate,
+    };
+    let max_spatial = i64::from(height.max(width));
+    let tile_edge_i64 = i64::from(tile_edge);
+    let mut plan = budgeted_plan(
+        Wan22Vae::VAE_TILING,
+        height,
+        width,
+        out_frames,
+        safe_gib,
+        candidates,
+        |of, oh, ow, tf, th, tw| {
+            // `budgeted_plan` adds a full-spatial candidate. Above the admitted cap that candidate
+            // must never bypass the worker selection, even when the host could afford it.
+            if max_spatial > tile_edge_i64 && th == oh && tw == ow {
+                f64::INFINITY
+            } else {
+                estimated_vae22_decode_peak_gib(of, oh, ow, tf, th, tw, true)
+            }
+        },
+    )
+    .map_err(|error| wan_budget_error("z48 vae22", width, height, out_frames, error))?
+    .unwrap_or_default();
+
+    // Keep the selected carrier observable even when the output is smaller than the cap. Decode
+    // clamps it to the output extent, while diagnostics still see the exact admitted parameters.
+    plan.spatial = Some(SpatialTiling {
+        tile_px: tile_edge,
+        overlap_px: overlap,
+    });
+    Ok(plan)
+}
+
+fn selected_vae22_plan_with_budget(
+    width: u32,
+    height: u32,
+    frames: u32,
+    tile_edge: u32,
+    overlap: u32,
+    safe_gib: f64,
+) -> Result<(TilingConfig, mlx_gen::VideoDecodeMemoryProfile)> {
+    let width = i32::try_from(width)
+        .map_err(|_| Error::Msg("wan z48 vae22 decode width exceeds i32".into()))?;
+    let height = i32::try_from(height)
+        .map_err(|_| Error::Msg("wan z48 vae22 decode height exceeds i32".into()))?;
+    let frames = i32::try_from(frames)
+        .map_err(|_| Error::Msg("wan z48 vae22 decode frame count exceeds i32".into()))?;
+    let tile_edge = i32::try_from(tile_edge)
+        .map_err(|_| Error::Msg("wan z48 vae22 decode tile edge exceeds i32".into()))?;
+    let overlap = i32::try_from(overlap)
+        .map_err(|_| Error::Msg("wan z48 vae22 decode overlap exceeds i32".into()))?;
+    if width <= 0 || height <= 0 || frames <= 0 || tile_edge <= overlap || overlap < 0 {
+        return Err(Error::Msg(
+            "wan z48 vae22 decode requires positive geometry and tile_edge > overlap".into(),
+        ));
+    }
+
+    let tiling = plan_vae22_tiling_for_selected_spatial(
+        height, width, frames, tile_edge, overlap, safe_gib,
+    )?;
+    let bytes = video_decode_peak_bytes_for_vae_and_tiling(
+        Wan22Vae::VAE_TILING,
+        width as u32,
+        height as u32,
+        frames as u32,
+        Some(&tiling),
+    )
+    .ok_or_else(|| Error::Msg("wan z48 vae22 decode byte projection overflows u64".into()))?;
+    let profile = mlx_gen::VideoDecodeMemoryProfile::new(bytes, 0)
+        .expect("zero included decoder bytes always form a valid decode profile");
+    Ok((tiling, profile))
+}
+
+/// Resolve the exact provider-owned z48 decode carrier and working-set profile for a selected
+/// bounded-decode edge. Admission and generation share this live-budgeted entry point.
+pub fn selected_vae22_plan(
+    width: u32,
+    height: u32,
+    frames: u32,
+    tile_edge: u32,
+    overlap: u32,
+) -> Result<(TilingConfig, mlx_gen::VideoDecodeMemoryProfile)> {
+    selected_vae22_plan_with_budget(
+        width,
+        height,
+        frames,
+        tile_edge,
+        overlap,
+        wan_vae_safe_budget_gib(),
+    )
+}
+
 /// Map gen-core's neutral [`TilingBudgetError`] to a wan-facing message tagged with the VAE `label`
 /// (e.g. `"z48 vae22"`, `"z16 vae"`). Shared by the per-VAE budgeted-tiling wrappers so the catchable
 /// over-budget wording stays identical across them.
@@ -548,16 +683,9 @@ pub fn video_decode_peak_bytes_for_vae_and_tiling(
     if output_voxels == 0 {
         return None;
     }
-    let (accum_bytes_per_voxel, tile_bytes_per_voxel) = if vae == WanVae::VAE_TILING {
-        (VAE16_ACCUM_BYTES_PER_VOXEL, VAE16_TILE_BYTES_PER_OUT_VOXEL)
-    } else if vae == Wan22Vae::VAE_TILING {
-        (
-            VAE22_ACCUM_BYTES_PER_VOXEL,
-            VAE22_TILE_BYTES_PER_OUT_VOXEL_BF16,
-        )
-    } else {
+    if vae != WanVae::VAE_TILING && vae != Wan22Vae::VAE_TILING {
         return None;
-    };
+    }
 
     let positive_extent = |configured: i32, full: u64| {
         let configured = u64::try_from(configured).ok()?;
@@ -578,13 +706,24 @@ pub fn video_decode_peak_bytes_for_vae_and_tiling(
         .map_or(Some(frames), |temporal| {
             positive_extent(temporal.tile_frames, frames)
         })?;
+    if vae == Wan22Vae::VAE_TILING {
+        return vae22_decode_peak_bytes(
+            i64::try_from(frames).ok()?,
+            i64::try_from(height).ok()?,
+            i64::try_from(width).ok()?,
+            i64::try_from(tile_frames).ok()?,
+            i64::try_from(tile_height).ok()?,
+            i64::try_from(tile_width).ok()?,
+            true,
+        );
+    }
+
     let tile_voxels = tile_width
         .checked_mul(tile_height)?
         .checked_mul(tile_frames)?;
-
-    accum_bytes_per_voxel
+    VAE16_ACCUM_BYTES_PER_VOXEL
         .checked_mul(output_voxels)?
-        .checked_add(tile_bytes_per_voxel.checked_mul(tile_voxels)?)
+        .checked_add(VAE16_TILE_BYTES_PER_OUT_VOXEL.checked_mul(tile_voxels)?)
 }
 
 /// Conservative single-pass Wan VAE decode working-set peak in bytes for a concrete VAE geometry.
@@ -1656,6 +1795,73 @@ mod tests {
                 assert!(tiled <= full, "{vae:?} {tiling:?}: {tiled} > {full}");
             }
         }
+    }
+
+    #[test]
+    fn selected_vae22_plan_preserves_exact_edge_and_observable_spatial_carrier() {
+        let (tiling, profile) =
+            selected_vae22_plan_with_budget(480, 480, 1, 768, 64, 100.0).unwrap();
+        assert_eq!(
+            tiling
+                .spatial
+                .map(|spatial| (spatial.tile_px, spatial.overlap_px)),
+            Some((768, 64)),
+            "the admitted carrier stays observable even below its cap"
+        );
+        assert_eq!(tiling.temporal.map(|tile| tile.tile_frames), None);
+        assert_eq!(profile.resident_decoder_bytes_included(), 0);
+        assert_eq!(
+            profile.working_set_bytes(),
+            video_decode_peak_bytes_for_vae_and_tiling(
+                Wan22Vae::VAE_TILING,
+                480,
+                480,
+                1,
+                Some(&tiling),
+            )
+            .unwrap()
+        );
+
+        let (tiling, _) = selected_vae22_plan_with_budget(1280, 704, 97, 448, 64, 1_000.0).unwrap();
+        assert_eq!(
+            tiling
+                .spatial
+                .map(|spatial| (spatial.tile_px, spatial.overlap_px)),
+            Some((448, 64)),
+            "the full-spatial candidate must not bypass an admitted lower cap"
+        );
+    }
+
+    #[test]
+    fn selected_vae22_plan_uses_real_temporal_candidates_and_refuses_overbudget() {
+        // At this output/edge, 96 frames projects to ~67.5 GiB while 64 projects to ~47.2 GiB.
+        // The injected 60 GiB budget therefore selects the exact measured 64/24 temporal row.
+        let (tiling, profile) =
+            selected_vae22_plan_with_budget(1280, 704, 193, 448, 64, 60.0).unwrap();
+        assert_eq!(
+            tiling
+                .spatial
+                .map(|spatial| (spatial.tile_px, spatial.overlap_px)),
+            Some((448, 64))
+        );
+        assert_eq!(
+            tiling
+                .temporal
+                .map(|temporal| (temporal.tile_frames, temporal.overlap_frames)),
+            Some((64, 24))
+        );
+        let exact = video_decode_peak_bytes_for_vae_and_tiling(
+            Wan22Vae::VAE_TILING,
+            1280,
+            704,
+            193,
+            Some(&tiling),
+        )
+        .unwrap();
+        assert_eq!(profile.working_set_bytes(), exact);
+        assert!(exact as f64 / (1024.0 * 1024.0 * 1024.0) <= 60.0);
+
+        assert!(selected_vae22_plan_with_budget(1280, 704, 193, 448, 64, 6.0).is_err());
     }
     use std::collections::{BTreeMap, BTreeSet};
 
