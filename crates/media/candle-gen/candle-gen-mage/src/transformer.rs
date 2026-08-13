@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use candle_core::{DType, Device, Result, Tensor, D};
+use candle_core::{DType, Device, Result, Tensor, Var, D};
 use candle_gen::gen_core::{PrecisionFloorComponent, Quant};
 use candle_gen::quant::{AdaptLinear as QLinear, PackedWeightSidecars};
 use candle_gen_boogu::loader::Weights;
@@ -613,6 +613,16 @@ impl MageTransformer {
         Self::load_with_quant(dir, cfg, None, device)
     }
 
+    pub(crate) fn load_dtype(
+        dir: &Path,
+        cfg: &crate::config::MageConfig,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Self> {
+        let weights = Weights::from_dir(dir, device, dtype)?;
+        Self::from_resident_weights(&weights, cfg, dtype)
+    }
+
     pub fn load_with_quant(
         dir: &Path,
         cfg: &crate::config::MageConfig,
@@ -631,24 +641,7 @@ impl MageTransformer {
         if quant.is_some() && weights.packed().is_some() {
             weights = Weights::from_dir(dir, device, DType::BF16)?;
         }
-        let mut blocks = Vec::with_capacity(cfg.depth);
-        for i in 0..cfg.depth {
-            blocks.push(Block::load(
-                &weights,
-                &format!("transformer_blocks.{i}"),
-                cfg.num_heads,
-            )?);
-        }
-        let mut transformer = Self {
-            image_in: linear(&weights, "img_in", true)?,
-            text_norm: weights.get("txt_norm.weight")?,
-            text_in: linear(&weights, "txt_in", true)?,
-            timestep: TimestepEmbedder::load(&weights)?,
-            blocks: MageBlocks::Resident(blocks),
-            final_mod: linear(&weights, "norm_out.linear", true)?,
-            output: linear(&weights, "proj_out", true)?,
-            dtype: DType::BF16,
-        };
+        let mut transformer = Self::from_resident_weights(&weights, cfg, DType::BF16)?;
         if quant.is_some() {
             transformer.place(quant, device)?;
             let count = transformer.quantized_linear_count();
@@ -659,6 +652,44 @@ impl MageTransformer {
             }
         }
         Ok(transformer)
+    }
+
+    /// Build the production transformer over a complete owned dense parameter map. Every returned
+    /// variable retains its original checkpoint key and is reachable by the same forward used by
+    /// inference; the full-base trainer optimizes this complete list rather than a curated subset.
+    pub(crate) fn load_trainable(
+        dir: &Path,
+        cfg: &crate::config::MageConfig,
+        device: &Device,
+    ) -> Result<(Self, Vec<(String, Var)>)> {
+        let (weights, named) = Weights::from_trainable_dir(dir, device, DType::F32)?;
+        let transformer = Self::from_resident_weights(&weights, cfg, DType::F32)?;
+        Ok((transformer, named))
+    }
+
+    fn from_resident_weights(
+        weights: &Weights,
+        cfg: &crate::config::MageConfig,
+        dtype: DType,
+    ) -> Result<Self> {
+        let mut blocks = Vec::with_capacity(cfg.depth);
+        for i in 0..cfg.depth {
+            blocks.push(Block::load(
+                weights,
+                &format!("transformer_blocks.{i}"),
+                cfg.num_heads,
+            )?);
+        }
+        Ok(Self {
+            image_in: linear(weights, "img_in", true)?,
+            text_norm: weights.get("txt_norm.weight")?,
+            text_in: linear(weights, "txt_in", true)?,
+            timestep: TimestepEmbedder::load(weights)?,
+            blocks: MageBlocks::Resident(blocks),
+            final_mod: linear(weights, "norm_out.linear", true)?,
+            output: linear(weights, "proj_out", true)?,
+            dtype,
+        })
     }
 
     /// Load the non-block shell once and retain only the host-backed transformer directory for the

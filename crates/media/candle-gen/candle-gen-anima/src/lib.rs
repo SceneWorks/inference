@@ -44,6 +44,7 @@ pub mod preview;
 pub mod rope;
 pub mod text_encoder;
 pub mod tokenizer;
+pub mod training;
 pub mod transformer;
 pub mod vae;
 
@@ -362,6 +363,7 @@ pub fn register_providers(
         .register_generator(BASE_REGISTRATION)
         .register_generator(AESTHETIC_REGISTRATION)
         .register_generator(TURBO_REGISTRATION)
+        .register_trainer(training::TRAINER_REGISTRATION)
 }
 
 /// Build the complete explicit Candle Anima provider catalog.

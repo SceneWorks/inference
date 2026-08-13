@@ -30,7 +30,7 @@ use rand::distr::Uniform;
 use rand::{rngs::StdRng, SeedableRng};
 use rand_distr::Distribution;
 
-use crate::quant::{LokrFactors, QLinear};
+use crate::quant::{AdaptLinear, LokrFactors, QLinear};
 use crate::{CandleError, Result};
 
 /// PEFT gaussian-init standard deviation for the **LoRA** `A` factor (diffusers/PEFT
@@ -527,6 +527,17 @@ pub trait LoraHost {
     fn visit_lora_mut(&mut self, f: &mut dyn FnMut(&mut LoraLinear) -> Result<()>) -> Result<()>;
 }
 
+/// A model whose inference projections already use [`AdaptLinear`]. This parallel host seam lets a
+/// trainer attach live `Var`-backed LoRA/LoKr factors without duplicating the model into a second
+/// `LoraLinear`-only implementation. Paths are supplied by the host because `AdaptLinear` deliberately
+/// carries no model-specific naming.
+pub trait AdaptLoraHost {
+    fn visit_adapt_lora_mut(
+        &mut self,
+        f: &mut dyn FnMut(&str, &mut AdaptLinear) -> Result<()>,
+    ) -> Result<()>;
+}
+
 /// One installed target: its PEFT path plus the trainer-owned factor `Var`s keyed by their save-key
 /// suffix (e.g. `("lora_A.weight", a)` / `("lokr_w1", w1)`). The same `Var`s are flattened into
 /// [`LoraSet::vars`] for the optimizer; here they carry the suffix the checkpoint writer needs.
@@ -841,6 +852,115 @@ pub fn build_lokr_targets(
 /// sampler is chaos-sensitive and the merged forward `(W+ΔW)·x` differs from the residual form
 /// `W·x + ΔW·x` by ~1 ULP, which cascades to a visibly different image (see `candle-gen-sdxl`'s
 /// adapter merge). Holding both forms to the same f32 reconstruction keeps train and infer in lockstep.
+/// Install trainable LoRA factors on an [`AdaptLoraHost`]. The saved factor convention is identical
+/// to [`build_lora_targets`]; only the host projection type differs.
+pub fn build_adapt_lora_targets(
+    host: &mut dyn AdaptLoraHost,
+    target_suffixes: &[String],
+    rank: u32,
+    alpha: f32,
+    seed: u64,
+    device: &Device,
+) -> Result<LoraSet> {
+    if rank == 0 {
+        return Err(CandleError::Msg("lora rank must be >= 1".into()));
+    }
+    let r = rank as usize;
+    let scale = alpha as f64 / r as f64;
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut vars = Vec::new();
+    let mut targets = Vec::new();
+    host.visit_adapt_lora_mut(&mut |path, lin| {
+        if !target_suffixes.is_empty()
+            && !target_suffixes
+                .iter()
+                .any(|suffix| path_matches(path, suffix))
+        {
+            return Ok(());
+        }
+        let (out_f, in_f) = lin.base_shape();
+        let down = gaussian_var(r, in_f, INIT_STD, &mut rng, device)?;
+        let up = zero_var(out_f, r, device)?;
+        lin.push_trainable_lora(down.as_tensor().clone(), up.as_tensor().clone(), scale);
+        vars.push(down.clone());
+        vars.push(up.clone());
+        targets.push(AdapterTarget {
+            path: path.to_string(),
+            factors: vec![("lora_A.weight", down), ("lora_B.weight", up)],
+        });
+        Ok(())
+    })?;
+    if targets.is_empty() {
+        return Err(CandleError::Msg(format!(
+            "no LoRA targets matched suffixes {target_suffixes:?} on the host"
+        )));
+    }
+    Ok(LoraSet {
+        kind: AdapterKind::Lora,
+        rank,
+        alpha,
+        decompose_factor: -1,
+        vars,
+        targets,
+    })
+}
+
+/// Install trainable full-factor LoKr residuals on an [`AdaptLoraHost`]. Keeping `w2` full avoids
+/// caching a stale eager `w2_a·w2_b` product between optimizer steps while preserving the standard
+/// LyCORIS `w1`/`w2` checkpoint format consumed by inference mergers.
+pub fn build_adapt_lokr_targets(
+    host: &mut dyn AdaptLoraHost,
+    target_suffixes: &[String],
+    rank: u32,
+    alpha: f32,
+    decompose_factor: i32,
+    seed: u64,
+    device: &Device,
+) -> Result<LoraSet> {
+    if rank == 0 {
+        return Err(CandleError::Msg("lokr rank must be >= 1".into()));
+    }
+    let scale = alpha as f64 / rank as f64;
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut vars = Vec::new();
+    let mut targets = Vec::new();
+    host.visit_adapt_lora_mut(&mut |path, lin| {
+        if !target_suffixes.is_empty()
+            && !target_suffixes
+                .iter()
+                .any(|suffix| path_matches(path, suffix))
+        {
+            return Ok(());
+        }
+        let (out_f, in_f) = lin.base_shape();
+        let (out_a, out_b) = factorization(out_f, decompose_factor);
+        let (in_a, in_b) = factorization(in_f, decompose_factor);
+        let w1 = zero_var(out_a, in_a, device)?;
+        let w2 = kaiming_uniform_var(out_b, in_b, &mut rng, device)?;
+        lin.push_trainable_lokr(w1.as_tensor().clone(), w2.as_tensor().clone(), scale);
+        vars.push(w1.clone());
+        vars.push(w2.clone());
+        targets.push(AdapterTarget {
+            path: path.to_string(),
+            factors: vec![("lokr_w1", w1), ("lokr_w2", w2)],
+        });
+        Ok(())
+    })?;
+    if targets.is_empty() {
+        return Err(CandleError::Msg(format!(
+            "no LoKr targets matched suffixes {target_suffixes:?} on the host"
+        )));
+    }
+    Ok(LoraSet {
+        kind: AdapterKind::Lokr,
+        rank,
+        alpha,
+        decompose_factor,
+        vars,
+        targets,
+    })
+}
+
 pub fn reconstruct_lora_delta(
     down: &Tensor,
     up: &Tensor,
@@ -1179,12 +1299,105 @@ pub fn save_lokr(set: &LoraSet, extra_meta: &HashMap<String, String>, path: &Pat
 mod tests {
     use super::*;
     use crate::quant::DenseLinear;
+    use crate::train::optim::TrainOptimizer;
     use candle_core::IndexOp;
     use gen_core::Quant;
 
     fn fixed_linear(weight: &[f32], out_f: usize, in_f: usize) -> LoraLinear {
         let w = Tensor::from_vec(weight.to_vec(), (out_f, in_f), &Device::Cpu).unwrap();
         LoraLinear::from_linear(Linear::new(w, None), in_f, out_f, "test.to_q".into())
+    }
+
+    struct OneAdaptHost {
+        lin: AdaptLinear,
+    }
+
+    impl AdaptLoraHost for OneAdaptHost {
+        fn visit_adapt_lora_mut(
+            &mut self,
+            f: &mut dyn FnMut(&str, &mut AdaptLinear) -> Result<()>,
+        ) -> Result<()> {
+            f("block.to_q", &mut self.lin)
+        }
+    }
+
+    /// Standard LoRA initialization has B=0: the first loss must still build a graph to B, then an
+    /// optimizer update to B must make the next loss reach A. This pins the distinction between the
+    /// inference residual fast path and the trainable `AdaptLinear` residual seam.
+    #[test]
+    fn adapt_linear_zero_init_lora_trains_across_optimizer_steps() {
+        let device = Device::Cpu;
+        let base = Linear::new(Tensor::zeros((3, 4), DType::F32, &device).unwrap(), None);
+        let mut host = OneAdaptHost {
+            lin: AdaptLinear::from_dense(base, 4, 3),
+        };
+        let set =
+            build_adapt_lora_targets(&mut host, &["to_q".to_string()], 2, 2.0, 7, &device).unwrap();
+        let x = Tensor::from_vec(
+            vec![1.0f32, -2.0, 0.5, 3.0, -1.0, 0.25, 2.0, 1.5],
+            (2, 4),
+            &device,
+        )
+        .unwrap();
+        let target = Tensor::ones((2, 3), DType::F32, &device).unwrap();
+
+        let loss1 = (host.lin.forward(&x).unwrap() - &target)
+            .unwrap()
+            .sqr()
+            .unwrap()
+            .mean_all()
+            .unwrap();
+        let grads1 = loss1.backward().unwrap();
+        let up_grad = grads1
+            .get(set.vars[1].as_tensor())
+            .expect("zero-initialized B must receive the first-step gradient");
+        assert!(
+            up_grad
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap()
+                > 0.0
+        );
+
+        let mut optimizer =
+            TrainOptimizer::from_config("adam", set.vars.clone(), 0.05, 0.0).unwrap();
+        optimizer.step(&grads1).unwrap();
+        assert!(
+            set.vars[1]
+                .as_tensor()
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap()
+                > 0.0,
+            "the optimizer must move B off zero"
+        );
+
+        let loss2 = (host.lin.forward(&x).unwrap() - target)
+            .unwrap()
+            .sqr()
+            .unwrap()
+            .mean_all()
+            .unwrap();
+        let grads2 = loss2.backward().unwrap();
+        let down_grad = grads2
+            .get(set.vars[0].as_tensor())
+            .expect("A must receive a gradient once B is nonzero");
+        assert!(
+            down_grad
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap()
+                > 0.0
+        );
     }
 
     fn deterministic_lora_weight(out_f: usize, in_f: usize) -> Tensor {

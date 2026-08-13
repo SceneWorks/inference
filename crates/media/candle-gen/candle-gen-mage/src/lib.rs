@@ -13,6 +13,7 @@ pub mod quant;
 pub mod rope;
 pub mod scheduler;
 pub mod text_encoder;
+pub mod training;
 pub mod transformer;
 pub mod vae;
 
@@ -951,7 +952,8 @@ pub fn register_providers(
         .register_generator(TURBO_REGISTRATION)
         .register_generator(EDIT_REGISTRATION)
         .register_generator(EDIT_BASE_REGISTRATION)
-        .register_generator(EDIT_TURBO_REGISTRATION);
+        .register_generator(EDIT_TURBO_REGISTRATION)
+        .register_trainer(training::TRAINER_REGISTRATION);
     #[cfg(feature = "cuda")]
     let registry = registry
         .register_memory_strategy(RL_MEMORY_REGISTRATION)
@@ -1047,6 +1049,11 @@ mod registry_tests {
                 "mage_flow_edit_turbo"
             ]
         );
+        let trainers: Vec<_> = registry
+            .trainers()
+            .map(|registration| (registration.descriptor)().id)
+            .collect();
+        assert_eq!(trainers, [config::BASE_MODEL_ID]);
         let g = registry
             .load(
                 MODEL_ID,

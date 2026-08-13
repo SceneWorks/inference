@@ -1040,6 +1040,8 @@ pub fn register_providers(
         .register_generator(model_vace::VACE_REGISTRATION)
         .register_generator(model_vace_fun::VACE_FUN_REGISTRATION)
         .register_trainer(training::TRAINER_REGISTRATION)
+        .register_trainer(training::I2V_14B_TRAINER_REGISTRATION)
+        .register_trainer(training::TI2V_5B_TRAINER_REGISTRATION)
 }
 
 /// Build the complete explicit Candle Wan provider catalog.
@@ -1071,7 +1073,10 @@ mod explicit_registry_tests {
                 "wan2_2_vace_fun_14b",
             ]
         );
-        assert_eq!(explicit_trainers, ["wan2_2_t2v_14b"]);
+        assert_eq!(
+            explicit_trainers,
+            ["wan2_2_t2v_14b", "wan2_2_i2v_14b", "wan2_2_ti2v_5b",]
+        );
         assert!(
             explicit_generators.iter().all(|id| !id.contains("gguf")),
             "the native GGUF loader is an explicit env-only test seam, not a selectable catalog tier"

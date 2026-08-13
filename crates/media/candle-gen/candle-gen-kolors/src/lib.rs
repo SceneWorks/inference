@@ -31,6 +31,7 @@ mod pipeline;
 pub mod preview;
 mod sampler;
 mod tokenizer;
+mod training;
 mod unet;
 
 // IP-Adapter-Plus reference-image (identity) provider (sc-5488, epic 5480) — CLIP ViT-L/14-336 image
@@ -219,7 +220,9 @@ candle_gen::register_generators! {
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    registry.register_generator(REGISTRATION)
+    registry
+        .register_generator(REGISTRATION)
+        .register_trainer(training::TRAINER_REGISTRATION)
 }
 
 /// Build the complete explicit Candle Kolors provider catalog.
@@ -238,6 +241,11 @@ mod explicit_registry_tests {
             .collect();
 
         assert_eq!(explicit, ["kolors"]);
+        let trainers: Vec<String> = registry
+            .trainers()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+        assert_eq!(trainers, ["kolors"]);
     }
 }
 
