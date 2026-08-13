@@ -33,10 +33,10 @@ use crate::adapters::{
 };
 use crate::config::{WanModelConfig, WanQuant, MIN_SIZE};
 use crate::pipeline::{
-    align_dim, auto_tiling_budgeted, auto_tiling_budgeted_z16, build_i2v_y, build_ti2v_keyframe_z,
-    build_ti2v_mask, build_ti2v_multi_mask, crossing_index, decode_to_frames, decode_to_frames_22,
-    denoise, denoise_curated, denoise_moe, denoise_moe_curated, denoise_moe_curated_swapped,
-    denoise_range, denoise_ti2v, frames_to_images, latent_shape, preflight_denoise_memory_guard,
+    align_dim, auto_tiling_budgeted_z16, build_i2v_y, build_ti2v_keyframe_z, build_ti2v_mask,
+    build_ti2v_multi_mask, crossing_index, decode_to_frames, decode_to_frames_22, denoise,
+    denoise_curated, denoise_moe, denoise_moe_curated, denoise_moe_curated_swapped, denoise_range,
+    denoise_ti2v, frames_to_images, latent_shape, preflight_denoise_memory_guard,
     preprocess_ti2v_image, reject_off_grid, reject_over_area, resolve_sampler_knobs, seq_len,
     staged_expert_swap, ti2v_blend_init, Expert,
 };
@@ -150,7 +150,7 @@ pub fn descriptor() -> ModelDescriptor {
             max_count: 1,
             mac_only: true,
             supported_quants: &[Quant::Q4, Quant::Q8],
-            component_precision_floors: &[],
+            component_precision_floors: crate::memory_strategy::COMPONENT_PRECISION_FLOORS,
             // Cross-attention text K/V is cached across denoise steps.
             supports_kv_cache: true,
             // Wan pins a static `sample_shift` from config (not the empirical per-resolution mu).
@@ -186,7 +186,7 @@ pub fn descriptor() -> ModelDescriptor {
 /// GiB** — well under the epic's <16 GB-with-margin target — so we floor the TE at Q8 even when the DiT
 /// tier is Q4: the user's Q4 *DiT* creative choice is untouched, and the TE stays regression-free (the
 /// extra ~2 GiB a Q4 TE would save is not needed and not worth the drift).
-const TE_QUANT_BITS: i32 = 8;
+pub(crate) const TE_QUANT_BITS: i32 = 8;
 
 /// The effective UMT5 text-encoder quantization for a Wan tier (sc-12831). The DiT is packed on an
 /// MLX-affine tier iff a pre-quantized snapshot manifest is present (`config.quantization`) **or** a
@@ -230,6 +230,10 @@ pub struct Wan {
     /// follow — bounding the unified-memory RSS / wired footprint. No expert swap (single dense DiT).
     /// Captured from [`LoadSpec::offload_policy`] at load.
     offload_policy: OffloadPolicy,
+    /// Load-exact memory contract and numeric tier for the one calibrated plain Resident/Eager
+    /// route. Other supported Wan loads remain available but deliberately publish no contract.
+    memory_strategy: Option<mlx_gen::gen_core::MemoryProviderContract>,
+    memory_tier: Option<mlx_gen::gen_core::MemoryNumericTier>,
 }
 
 impl Wan {
@@ -329,6 +333,10 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         )));
     }
     let quant = resolve_load_time_quant(MODEL_ID, &config, spec.quantize)?;
+    let memory = crate::memory_strategy::contract_for_loaded(spec).map_err(Error::from)?;
+    let (memory_strategy, memory_tier) = memory
+        .map(|(contract, tier)| (Some(contract), Some(tier)))
+        .unwrap_or((None, None));
     Ok(Box::new(Wan {
         descriptor: descriptor(),
         config,
@@ -336,13 +344,64 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         adapters: spec.adapters.clone(),
         quant,
         offload_policy: spec.offload_policy,
+        memory_strategy,
+        memory_tier,
     }))
 }
 
-mlx_gen::impl_generator!(Wan {
-    validate: |s, req| s.validate_impl(req),
-    generate: generate_impl,
-});
+// Hand-written so the load-exact SC-19236 contract is a property of the loaded provider. The
+// descriptor/validation/generation arms are otherwise the same delegation emitted by
+// `impl_generator!` for the other Wan routes.
+impl Generator for Wan {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
+        self.validate_impl(req).map_err(Into::into)
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
+        self.memory_strategy.as_ref()
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::MemorySafetyDecision {
+        let (Some(contract), Some(tier)) = (self.memory_strategy.as_ref(), self.memory_tier) else {
+            return if context.selection.strategy == mlx_gen::gen_core::MemoryStrategy::Resident {
+                mlx_gen::gen_core::MemorySafetyDecision::Accept
+            } else {
+                mlx_gen::gen_core::MemorySafetyDecision::Reject {
+                    reason: format!(
+                        "{MODEL_ID} loaded route has no calibrated memory-strategy contract"
+                    ),
+                }
+            };
+        };
+        crate::memory_strategy::safety_check(contract, tier, context)
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::Result<Option<Box<dyn mlx_gen::gen_core::MemoryRequestScope + '_>>>
+    {
+        let (Some(contract), Some(tier)) = (self.memory_strategy.as_ref(), self.memory_tier) else {
+            return Ok(None);
+        };
+        crate::memory_strategy::begin_request(contract, tier, context)
+    }
+}
 
 impl Wan {
     /// Validate body — kept on the crate's own [`mlx_gen::Error`] so `?` on the capability check
@@ -501,7 +560,12 @@ impl Wan {
         let out_frames = 1 + (lat[1] - 1) * Ti2vProviderVae::VAE_TILING.temporal_scale;
         let out_height = lat[2] * Ti2vProviderVae::VAE_TILING.spatial_scale;
         let out_width = lat[3] * Ti2vProviderVae::VAE_TILING.spatial_scale;
-        let decode_tiling = auto_tiling_budgeted(out_height, out_width, out_frames, true)?;
+        let decode_tiling = crate::memory_strategy::decode_tiling(
+            req,
+            out_width as u32,
+            out_height as u32,
+            out_frames as u32,
+        )?;
 
         // --- Stage 1: UMT5 text encode (loaded → used → freed) ---
         let (context, context_null) = encode_text_staged_for_tier(
@@ -2035,6 +2099,8 @@ mod tests {
             adapters: vec![],
             quant: None,
             offload_policy: OffloadPolicy::Resident,
+            memory_strategy: None,
+            memory_tier: None,
         }
     }
 
@@ -2502,6 +2568,8 @@ mod tests {
             adapters,
             quant: None,
             offload_policy: OffloadPolicy::Resident,
+            memory_strategy: None,
+            memory_tier: None,
         }
     }
 

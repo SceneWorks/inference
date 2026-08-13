@@ -54,6 +54,7 @@ pub mod block_stream;
 pub mod chunk;
 pub mod config;
 pub mod convert;
+pub mod memory_strategy;
 pub mod model;
 pub mod model_vace;
 pub mod patchify;
@@ -182,6 +183,9 @@ pub fn register_providers(
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(model::TI2V_REGISTRATION)
+        .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(memory_strategy::MEMORY_FIXTURE)
+        .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR)
         .register_generator(model::T2V_14B_REGISTRATION)
         .register_generator(model::I2V_14B_REGISTRATION)
         .register_generator(model_vace::VACE_REGISTRATION)
@@ -194,6 +198,38 @@ pub fn register_providers(
 /// Build the complete explicit MLX Wan provider catalog.
 pub fn provider_registry() -> mlx_gen::gen_core::Result<mlx_gen::gen_core::ProviderRegistry> {
     register_providers(mlx_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+/// Resolve the load-exact numeric tier for the one calibrated MLX Wan route. Other Wan generator
+/// ids return `None` explicitly; callers must not infer their tier from `LoadSpec::quantize`.
+pub fn resolved_video_memory_numeric_tier(
+    provider_id: &str,
+    spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<Option<mlx_gen::gen_core::MemoryNumericTier>> {
+    if provider_id != model::MODEL_ID {
+        return Ok(None);
+    }
+    memory_strategy::resolved_numeric_tier(spec).map(Some)
+}
+
+/// Provider-owned profile for the actual selected TI2V-5B z48 decode plan. The returned profile and
+/// generation carrier share the same checked byte formula, temporal selector, and live safe budget.
+pub fn selected_video_decode_memory_profile(
+    provider_id: &str,
+    width: u32,
+    height: u32,
+    frames: u32,
+    tile_edge: u32,
+    overlap: u32,
+) -> mlx_gen::gen_core::Result<Option<mlx_gen::VideoDecodeMemoryProfile>> {
+    memory_strategy::selected_video_decode_memory_profile(
+        provider_id,
+        width,
+        height,
+        frames,
+        tile_edge,
+        overlap,
+    )
 }
 
 /// Resolve the concrete MLX Wan VAE geometry used by a registered generator id.

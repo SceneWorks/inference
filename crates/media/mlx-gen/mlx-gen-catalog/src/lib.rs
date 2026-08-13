@@ -122,6 +122,36 @@ pub fn provider_registry() -> mlx_gen::gen_core::Result<ProviderRegistry> {
         .build()
 }
 
+/// Resolve a provider-owned, load-exact numeric tier for calibrated MLX video admission. Today only
+/// Wan TI2V-5B exposes this surface; every other route returns `None` rather than synthesizing a tier
+/// from the requested quantization field.
+pub fn resolved_video_memory_numeric_tier(
+    provider_id: &str,
+    spec: &media::LoadSpec,
+) -> media::gen_core::Result<Option<media::gen_core::MemoryNumericTier>> {
+    mlx_gen_wan::resolved_video_memory_numeric_tier(provider_id, spec)
+}
+
+/// Resolve the working-set profile for a worker-selected bounded-decode edge using the provider's
+/// real live-budget planner. Unsupported provider ids return `Ok(None)`.
+pub fn selected_video_decode_memory_profile(
+    provider_id: &str,
+    width: u32,
+    height: u32,
+    frames: u32,
+    tile_edge: u32,
+    overlap: u32,
+) -> media::gen_core::Result<Option<media::VideoDecodeMemoryProfile>> {
+    mlx_gen_wan::selected_video_decode_memory_profile(
+        provider_id,
+        width,
+        height,
+        frames,
+        tile_edge,
+        overlap,
+    )
+}
+
 /// Resolve the load-bearing VAE geometry for a modelled MLX video generator.
 ///
 /// Each provider owns its id-to-decoder assignment. SVD is intentionally unmodelled in this slice;
@@ -189,6 +219,28 @@ pub fn conservative_video_decode_memory_profile(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn selected_video_memory_apis_do_not_expand_beyond_wan_ti2v_5b() {
+        let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir("/nonexistent".into()));
+        for provider in [
+            "unknown",
+            mlx_gen_wan::MODEL_ID_T2V_14B,
+            mlx_gen_wan::MODEL_ID_I2V_14B,
+            mlx_gen_wan::MODEL_ID_VACE,
+            mlx_gen_wan::MODEL_ID_VACE_FUN,
+        ] {
+            assert_eq!(
+                super::resolved_video_memory_numeric_tier(provider, &spec).unwrap(),
+                None
+            );
+            assert_eq!(
+                super::selected_video_decode_memory_profile(provider, 480, 480, 1, 448, 64)
+                    .unwrap(),
+                None
+            );
+        }
+    }
+
     #[test]
     fn modelled_video_provider_ids_have_typed_vae_assignments() {
         let registry = super::provider_registry().unwrap();

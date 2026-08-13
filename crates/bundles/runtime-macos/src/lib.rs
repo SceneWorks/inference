@@ -23,6 +23,35 @@ pub fn conservative_video_decode_memory_profile(
     mlx_gen_catalog::conservative_video_decode_memory_profile(provider_id, width, height, frames)
 }
 
+#[cfg(feature = "media")]
+/// Resolve the load-exact provider numeric tier used by calibrated video memory admission.
+pub fn resolved_video_memory_numeric_tier(
+    provider_id: &str,
+    spec: &gen_core::LoadSpec,
+) -> gen_core::Result<Option<gen_core::MemoryNumericTier>> {
+    mlx_gen_catalog::resolved_video_memory_numeric_tier(provider_id, spec)
+}
+
+#[cfg(feature = "media")]
+/// Resolve the provider-owned profile for the exact selected bounded-decode carrier.
+pub fn selected_video_decode_memory_profile(
+    provider_id: &str,
+    width: u32,
+    height: u32,
+    frames: u32,
+    tile_edge: u32,
+    overlap: u32,
+) -> gen_core::Result<Option<VideoDecodeMemoryProfile>> {
+    mlx_gen_catalog::selected_video_decode_memory_profile(
+        provider_id,
+        width,
+        height,
+        frames,
+        tile_edge,
+        overlap,
+    )
+}
+
 /// The MLX backend crates this platform owns, re-exported from the media catalog
 /// (available under the default `media` feature).
 #[cfg(feature = "media")]
@@ -105,6 +134,22 @@ pub fn catalog() -> runtime_catalog::Result<RuntimeCatalog> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "media")]
+    #[test]
+    fn bundle_exposes_narrow_selected_video_memory_apis() {
+        let spec = super::gen_core::LoadSpec::new(super::gen_core::WeightsSource::Dir(
+            "/nonexistent".into(),
+        ));
+        assert_eq!(
+            super::resolved_video_memory_numeric_tier("unknown", &spec).unwrap(),
+            None
+        );
+        assert_eq!(
+            super::selected_video_decode_memory_profile("unknown", 480, 480, 1, 448, 64).unwrap(),
+            None
+        );
+    }
+
     #[cfg(feature = "media")]
     #[test]
     fn bundle_exposes_engine_id_vae_geometry() {
