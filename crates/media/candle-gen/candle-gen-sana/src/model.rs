@@ -170,6 +170,7 @@ pub fn descriptor() -> ModelDescriptor {
             requires_sigma_shift: false,
             // No candle `render_sequential` residency seam wired (sc-11126).
             supports_sequential_offload: false,
+            unconditionally_engages_staged_residency: false,
             // sc-16959: the base flow lane emits per-step latent previews through
             // `crate::preview::base_hook` over the epic-16624 BASE DC-AE fit — not Sprint's.
             supports_preview: true,
@@ -229,6 +230,7 @@ pub fn sprint_descriptor() -> ModelDescriptor {
             supports_kv_cache: false,
             requires_sigma_shift: false,
             supports_sequential_offload: false,
+            unconditionally_engages_staged_residency: false,
             // sc-16959: the SCM lane emits per-step latent previews through
             // `crate::preview::sprint_hook` over the epic-16624 SPRINT fit, with the `1/σ_data`
             // correction the SCM driver's pre-scaled running latent needs.

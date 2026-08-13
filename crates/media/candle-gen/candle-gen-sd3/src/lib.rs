@@ -274,6 +274,7 @@ pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
             // pipeline, so it does not require the loader to pre-shift.
             requires_sigma_shift: false,
             supports_sequential_offload: false,
+            unconditionally_engages_staged_residency: false,
             // sc-16958: every SD3.5 route emits per-step latent previews. All three variants share
             // one `run_flow_sampler` site, so the flag is variant-independent — see [`crate::preview`]
             // for the lane enumeration and the reused epic-16624 16-channel fit.

@@ -144,6 +144,7 @@ pub fn descriptor() -> ModelDescriptor {
             supports_kv_cache: true,
             requires_sigma_shift: false,
             supports_sequential_offload: false,
+            unconditionally_engages_staged_residency: false,
             // Batch whole-clip form in S6; the realtime streaming decode is the streaming epic.
             supports_preview: false,
             supports_streaming: false,

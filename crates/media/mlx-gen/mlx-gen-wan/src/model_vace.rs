@@ -294,6 +294,9 @@ pub fn descriptor_vace() -> ModelDescriptor {
             requires_sigma_shift: false,
             // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
             supports_sequential_offload: false,
+            // The TE, scoped z16 VAE work, and VACE transformer are loaded/used/dropped as phases on
+            // every request even though this provider exposes no selectable Sequential control.
+            unconditionally_engages_staged_residency: true,
             supports_preview: false,
             supports_streaming: false,
             supports_multi_speaker: false,
@@ -1021,6 +1024,24 @@ mod tests {
 
     #[test]
     fn only_dual_expert_vace_advertises_sequential_offload() {
+        assert!(!descriptor_vace().capabilities.supports_sequential_offload);
+        assert!(
+            descriptor_vace_fun()
+                .capabilities
+                .supports_sequential_offload
+        );
+    }
+
+    #[test]
+    fn both_registered_vace_variants_declare_unconditional_phase_staging() {
+        for descriptor in [descriptor_vace(), descriptor_vace_fun()] {
+            assert_eq!(
+                descriptor.capabilities.staged_residency_availability(),
+                mlx_gen::StagedResidencyAvailability::UnconditionallyEngaged,
+                "{} always stages heavyweight phases",
+                descriptor.id
+            );
+        }
         assert!(!descriptor_vace().capabilities.supports_sequential_offload);
         assert!(
             descriptor_vace_fun()

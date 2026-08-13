@@ -1161,6 +1161,7 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             // resident (never both), dropping the pre-decode peak on a 24 GB card. Advertised so the
             // worker's fit-gate can tell "bounds peak here" from a no-op fallback.
             supports_sequential_offload: true,
+            unconditionally_engages_staged_residency: false,
             supports_preview: false,
             supports_streaming: false,
             supports_multi_speaker: false,
@@ -1634,6 +1635,23 @@ mod tests {
             assert!(
                 d.capabilities.supports_sequential_offload,
                 "A14B must advertise sequential offload (sc-12733)"
+            );
+        }
+    }
+
+    #[test]
+    fn descriptors_classify_staging_as_selectable_not_unconditional() {
+        for descriptor in [descriptor_t2v_14b(), descriptor_i2v_14b()] {
+            assert!(
+                !descriptor
+                    .capabilities
+                    .unconditionally_engages_staged_residency
+            );
+            assert_eq!(
+                descriptor.capabilities.staged_residency_availability(),
+                candle_gen::gen_core::StagedResidencyAvailability::Selectable,
+                "{} only stages when the selectable policy is requested",
+                descriptor.id
             );
         }
     }

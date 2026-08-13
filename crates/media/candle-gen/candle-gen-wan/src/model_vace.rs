@@ -426,6 +426,7 @@ pub fn descriptor() -> ModelDescriptor {
             supports_kv_cache: false,
             requires_sigma_shift: false,
             supports_sequential_offload: false,
+            unconditionally_engages_staged_residency: false,
             supports_preview: false,
             supports_streaming: false,
             supports_multi_speaker: false,
@@ -484,6 +485,17 @@ candle_gen::register_generators! {
 mod tests {
     use super::*;
     use candle_gen::gen_core::ReplacementMode;
+
+    #[test]
+    fn descriptor_does_not_claim_staged_residency() {
+        let caps = descriptor().capabilities;
+        assert!(!caps.unconditionally_engages_staged_residency);
+        assert!(!caps.supports_sequential_offload);
+        assert_eq!(
+            caps.staged_residency_availability(),
+            candle_gen::gen_core::StagedResidencyAvailability::Absent
+        );
+    }
 
     fn control_req() -> GenerationRequest {
         let frame = Image {

@@ -139,6 +139,9 @@ pub fn descriptor() -> ModelDescriptor {
             // wired-memory pressure) through denoise + decode. Advertised so the worker's fit-gate can
             // tell "bounds footprint here" from a no-op fallback.
             supports_sequential_offload: true,
+            // TE → DiT → z48 VAE is phase-staged on every request; Sequential additionally flushes
+            // dead allocator cache between those already-staged phases.
+            unconditionally_engages_staged_residency: true,
             supports_preview: false,
             supports_streaming: false,
             supports_multi_speaker: false,
@@ -758,6 +761,9 @@ pub fn descriptor_t2v_14b() -> ModelDescriptor {
             // off-GPU during denoise, dropping the unified-memory peak to ~one expert. Advertised so
             // the worker's fit-gate can tell "bounds peak here" from a no-op fallback.
             supports_sequential_offload: true,
+            // TE/VAE and the active expert are phase-staged even under Resident; Sequential adds the
+            // stronger cache-flush/expert-residency controls described above.
+            unconditionally_engages_staged_residency: true,
             supports_preview: false,
             supports_streaming: false,
             supports_multi_speaker: false,
@@ -1707,6 +1713,9 @@ pub fn descriptor_i2v_14b() -> ModelDescriptor {
             // off-GPU during denoise, dropping the unified-memory peak to ~one expert. Advertised so
             // the worker's fit-gate can tell "bounds peak here" from a no-op fallback.
             supports_sequential_offload: true,
+            // TE/VAE and the active expert are phase-staged even under Resident; Sequential adds the
+            // stronger cache-flush/expert-residency controls described above.
+            unconditionally_engages_staged_residency: true,
             supports_preview: false,
             supports_streaming: false,
             supports_multi_speaker: false,
@@ -1877,6 +1886,20 @@ mod tests {
             "the dense TI2V-5B must advertise sequential offload (sc-12796) — the staged TE/VAE \
              clear_cache flush bounds its unified-memory footprint"
         );
+    }
+
+    #[test]
+    fn all_registered_base_wan_variants_also_declare_unconditional_phase_staging() {
+        for descriptor in [descriptor(), descriptor_t2v_14b(), descriptor_i2v_14b()] {
+            assert_eq!(
+                descriptor.capabilities.staged_residency_availability(),
+                mlx_gen::StagedResidencyAvailability::UnconditionallyEngaged,
+                "{} must distinguish its always-staged physical path from the stronger selectable \
+                 Sequential controls it also supports",
+                descriptor.id
+            );
+            assert!(descriptor.capabilities.supports_sequential_offload);
+        }
     }
 
     /// sc-12736: the sc-4986 pre-flight denoise guard's expert-byte accounting must track the ACTUAL
