@@ -2005,7 +2005,7 @@ mod tests {
             .expect("missing base snapshot → err")
             .to_string();
         assert!(
-            e.contains("native base text encoder asset facts"),
+            e.contains("native base text-encoder asset facts"),
             "expected the missing-base inventory error, got: {e}"
         );
     }
@@ -2032,7 +2032,7 @@ mod tests {
             "adapters must be accepted by the native loader, got: {e}"
         );
         assert!(
-            e.contains("native base text encoder asset facts"),
+            e.contains("native base text-encoder asset facts"),
             "expected the missing-base inventory error, got: {e}"
         );
     }
@@ -2065,7 +2065,7 @@ mod tests {
             .expect("missing required base components must fail")
             .to_string();
         assert!(
-            e.contains("native base text encoder asset facts"),
+            e.contains("native base text-encoder asset facts"),
             "expected the fail-closed base asset-sizing stage, got: {e}"
         );
         assert!(!e.contains("config.json"), "config was valid, got: {e}");
