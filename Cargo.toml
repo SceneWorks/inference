@@ -45,12 +45,12 @@ mlx-gen-catalog = { path = "crates/media/mlx-gen/mlx-gen-catalog" }
 candle-gen-catalog = { path = "crates/media/candle-gen/candle-gen-catalog" }
 candle-audio-catalog = { path = "crates/audio/candle-audio-catalog" }
 
-# MLX fork pinned by commit SHA. rev 0a128aa9 adds P3's exact phase-1 epilogues and complete
-# Metal, CUDA, and no-GPU backend definitions on top of the
+# MLX fork pinned by commit SHA. rev e32ba885 adds P3's exact phase-1 epilogues, complete
+# Metal, CUDA, and no-GPU backend definitions, and fail-closed Metal ABI/index admission on top of the
 # collision-free retained compiler leases and safe TLS teardown while preserving MLX 0.32.0.
 # See mlx-gen/Cargo.toml for lineage.
-mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "0a128aa9af8305e8c14f997fd4c9a8e09c447381" }
-mlx-sys = { package = "pmetal-mlx-sys", git = "https://github.com/michaeltrefry/mlx-rs", rev = "0a128aa9af8305e8c14f997fd4c9a8e09c447381" }
+mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "e32ba885a930561a1138e125293cdd81581cb4b0" }
+mlx-sys = { package = "pmetal-mlx-sys", git = "https://github.com/michaeltrefry/mlx-rs", rev = "e32ba885a930561a1138e125293cdd81581cb4b0" }
 
 # Candle pins are shared by media and LLM providers.
 # Upstream PR #3531 removes O(groups) launches from unit-stride depthwise convs (sc-12111).
