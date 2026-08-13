@@ -14,7 +14,7 @@ use candle_gen::quant::AdaptLinear;
 use candle_gen::train::checkpoint::{checkpoint_filename, file_stem};
 use candle_gen::train::dataset::{bucket_resolution, load_image_tensor};
 use candle_gen::train::flow_match::{
-    self, build_batch, effective_weight_decay, noise_seed, sample_noise, save_adapter,
+    self, effective_weight_decay, noise_seed, sample_noise, save_adapter,
     validate_flow_match_request, velocity_loss,
 };
 use candle_gen::train::lora::{
@@ -197,6 +197,22 @@ fn target_suffixes(req: &TrainingRequest) -> Vec<String> {
     }
 }
 
+/// Build Mage's flow-match input in the requested transformer compute dtype while retaining an f32
+/// velocity target for the shared loss. The VAE cache is BF16 and the seeded prior is F32; aligning
+/// both operands before blending avoids mixed-dtype tensor addition without widening the cache.
+fn build_training_batch(
+    latent: &Tensor,
+    noise: &Tensor,
+    sigma: f64,
+    compute_dtype: DType,
+) -> Result<(Tensor, Tensor)> {
+    let latent_compute = latent.to_dtype(compute_dtype)?;
+    let noise_compute = noise.to_dtype(compute_dtype)?;
+    let x_t = ((latent_compute * (1.0 - sigma))? + (noise_compute * sigma)?)?;
+    let target = (noise.to_dtype(DType::F32)? - latent.to_dtype(DType::F32)?)?;
+    Ok((x_t, target))
+}
+
 struct CachedSample {
     latent: Tensor,
     text: Tensor,
@@ -376,10 +392,10 @@ impl MageTrainer {
                 noise_seed(req.config.seed, step),
                 &self.device,
             )?;
-            let (x_t, target) = build_batch(&sample.latent, &noise, sigma)?;
+            let (x_t, target) = build_training_batch(&sample.latent, &noise, sigma, compute_dtype)?;
             let sigma_tensor = Tensor::new(&[sigma as f32], &self.device)?;
             let prediction = transformer.forward(
-                &x_t.to_dtype(compute_dtype)?,
+                &x_t,
                 &sample.text.to_dtype(compute_dtype)?,
                 &sigma_tensor,
                 &sample.layout,
@@ -583,6 +599,33 @@ mod tests {
             Tensor::new(&[0.5f32], &Device::Cpu).unwrap(),
             PackLayout::generation(vec![ImgShape::latent(1, 1)], vec![1]).unwrap(),
         )
+    }
+
+    #[test]
+    fn bf16_cached_latent_and_f32_noise_build_a_finite_typed_batch() {
+        let latent = Tensor::new(&[[-1.0f32, 0.25, 2.0]], &Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let noise = Tensor::new(&[[0.5f32, -0.75, 1.25]], &Device::Cpu).unwrap();
+        let (x_t, target) = build_training_batch(&latent, &noise, 0.4, DType::BF16).unwrap();
+
+        assert_eq!(x_t.dtype(), DType::BF16);
+        assert_eq!(target.dtype(), DType::F32);
+        for tensor in [&x_t, &target] {
+            assert!(tensor
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .into_iter()
+                .all(f32::is_finite));
+        }
+
+        let target_values = target.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(target_values, vec![1.5, -1.0, -0.75]);
     }
 
     fn full_request() -> TrainingRequest {
