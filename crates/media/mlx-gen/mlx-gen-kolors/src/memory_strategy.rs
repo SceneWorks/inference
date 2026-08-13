@@ -28,7 +28,12 @@
 //! | 2 Bounded decode | **Missing** (measured — [`DECODE_SUPPORT`]) | [`Autoencoder::decode_tiled`](mlx_gen_sdxl::Autoencoder) bounds the request 16.041 → 9.998 GiB (−37.67%) and clears the drift bar at 1024²/1280², but fails it at 1536²/2048² and `decode_tile_edges` has no geometry axis |
 //! | 3 Bounded attention | **Missing** (measured — [`ATTENTION_SUPPORT`]) | [`mlx_gen::attention::sdpa_budgeted_bhsd`] reaches every site, moves the peak **0.00% at BOTH scopes** — the request and the U-Net seam — and is not bit-exact on its query-row axis |
 //! | 4 Bounded transformer residency | Implemented (streamable loads), **two scopes** | [`mlx_gen::block_residency::run_windowed`] over the U-Net's eleven `Transformer2D` sub-stacks (70 blocks) **and** over ChatGLM3-6B's 28 `GlmBlock`s |
-
+//!
+//! The rung-2 row is the route-blind legacy default. A caller may now replace it for one exact
+//! catalog route, tier, mode, overlay and output geometry by packaging a sealed production-latent
+//! quality policy. Coordinates absent from that table remain refused; an empty table preserves the
+//! default and the existing estimated-fit fallback.
+//!
 //!
 //! ## What this family actually buys, measured (q4 unless stated, Apple/Metal, 1024², 4 steps)
 //!
@@ -789,6 +794,16 @@ fn contract_with_asset_facts(
     overlays: Vec<MemoryResidentComponent>,
 ) -> CoreResult<MemoryProviderContract> {
     let streamable = streamable(spec);
+    let decode_policies = spec.decode_geometry_policies_for_loaded_contract(
+        mlx_gen::gen_core::MemoryBackend::Mlx,
+        loaded_tier(spec),
+    )?;
+    let geometry_decode = decode_policies.iter().any(|policy| {
+        matches!(
+            policy.disposition,
+            mlx_gen::gen_core::MemoryDecodeQualityDisposition::Admitted
+        )
+    });
     let mut contract = MemoryProviderContract::compatibility_default(
         provider_id,
         MemoryBackendRealization::MlxMetal {
@@ -819,6 +834,9 @@ fn contract_with_asset_facts(
         // Rung 4 makes transformer weight residency a VARIABLE of the peak rather than a constant
         // folded into `AssetBytes`.
         variables.push(MemoryFormulaVariable::TransformerWindowSize);
+    }
+    if geometry_decode {
+        variables.push(MemoryFormulaVariable::DecodeTileArea);
     }
     let overlay_bytes = overlays.iter().fold(0_u64, |total, component| {
         total.saturating_add(component.resident_bytes)
@@ -859,7 +877,7 @@ fn contract_with_asset_facts(
         // Request-scoped: the same cached generator serves warm → staged → warm without
         // reconstruction, so the hook is available regardless of the load-time `OffloadPolicy`.
         synchronized_phase_release: true,
-        decode_tiling: false,
+        decode_tiling: geometry_decode,
         attention_chunking: false,
         transformer_window_materialization: streamable,
     };
@@ -887,6 +905,7 @@ fn contract_with_asset_facts(
             _ => MemoryParameterRanges::default(),
         };
     }
+    contract.adopt_decode_geometry_policies("kolors", decode_policies)?;
     // No `pid_decode_routes`: that declaration exists to split rung 2's candidate domain between the
     // native VAE and the PiD student, and rung 2 is not selectable on this provider. The student
     // keeps its own internal auto-planning exactly as it did before this story — unchanged
@@ -911,8 +930,9 @@ fn contract_with_asset_facts(
     Ok(contract)
 }
 
-/// Refuse a bounded-decode geometry. Rung 2 is `Missing` on this provider ([`DECODE_SUPPORT`]), so
-/// there is no admitted domain to validate against and every geometry is out of it.
+/// Refuse a bounded-decode geometry under the route-blind default. Rung 2 is `Missing` when no
+/// sealed route/geometry table is packaged ([`DECODE_SUPPORT`]), so every geometry is then out of
+/// domain.
 ///
 /// This is a *rejection* rather than an absence on purpose. The shared `validate_selection` already
 /// refuses a rung the contract declares `Missing`, but a calibration harness that hand-builds a
@@ -970,7 +990,11 @@ pub(crate) fn safety_check(
         // Kolors advertises txt2img, img2img, ControlNet-pose, IP-Adapter and the combined
         // strict-pose tier, so the mode axis is deliberately permissive. What is NOT permissive is
         // the geometry.
-        if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
+        if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode)
+            && contract
+                .capability(MemoryStrategy::BoundedDecode)
+                .is_none_or(|capability| capability.parameters.decode_geometry_policies.is_empty())
+        {
             return Err(refuse_decode(
                 &contract.provider_id,
                 context.selection.parameters.decode_tile_edge,
@@ -1143,6 +1167,7 @@ fn begin_with_cleanup(
         widest_windowable_stack(),
         move |_use_pid, edge, overlap| Err(refuse_decode(id, Some(edge), Some(overlap))),
     )?;
+    mlx_gen::request_scope::authorize_selected_geometry_decode(&mut config, contract, context)?;
     // Rungs 2 and 3 are `Missing`, so neither can be engaged and neither parameter is ever set.
     config.attention_chunk_size = None;
     config.transformer_window = contract
@@ -1213,17 +1238,65 @@ pub(crate) fn transformer_window(
     }))
 }
 
-/// Rung 2: **always a refusal.** Bounded decode is `Missing` on this provider ([`DECODE_SUPPORT`]),
-/// and this is the request-side layer of that.
-///
-/// It returns `Ok(None)` — the exact single-pass decode — when the request did not ask for a bounded
-/// decode, and a typed error when it did. The error direction is what matters: `Ok(None)` for a
-/// request that *did* ask would silently render an unbounded decode while the caller believed it had
-/// selected a bounded one, which is the false-green this seam exists to prevent.
+/// Legacy mechanism guard retained for the weights-free refusal tests.
+#[cfg(test)]
 pub(crate) fn decode_tiling(req: &GenerationRequest) -> mlx_gen::Result<Option<TilingConfig>> {
+    decode_tiling_with_contract(req, None)
+}
+
+/// Resolve the production decoder from the exact loaded contract. Historical loads with no sealed
+/// geometry table still fail closed; a policy adopter must also carry the request-local authority
+/// installed by `begin_request`.
+pub(crate) fn decode_tiling_for_contract(
+    req: &GenerationRequest,
+    contract: &MemoryProviderContract,
+) -> mlx_gen::Result<Option<TilingConfig>> {
+    decode_tiling_with_contract(req, Some(contract))
+}
+
+fn decode_tiling_with_contract(
+    req: &GenerationRequest,
+    contract: Option<&MemoryProviderContract>,
+) -> mlx_gen::Result<Option<TilingConfig>> {
     let Some(memory) = req.memory.filter(|memory| memory.tile_vae_decode) else {
+        mlx_gen::diagnostics::record_geometry_decode_decision(
+            mlx_gen::diagnostics::DecodePolicyDisposition::Unchanged,
+            mlx_gen::diagnostics::DecodePathDisposition::Dense,
+            None,
+        );
         return Ok(None);
     };
+    if contract.is_some_and(|contract| {
+        contract
+            .capability(MemoryStrategy::BoundedDecode)
+            .is_some_and(|capability| !capability.parameters.decode_geometry_policies.is_empty())
+    }) {
+        let edge = memory.decode_tile_edge.ok_or_else(|| {
+            mlx_gen::Error::Unsupported(
+                "kolors: geometry-aware bounded decode requires an exact tile edge".to_owned(),
+            )
+        })?;
+        let overlap = memory.decode_overlap.ok_or_else(|| {
+            mlx_gen::Error::Unsupported(
+                "kolors: geometry-aware bounded decode requires an exact overlap".to_owned(),
+            )
+        })?;
+        let evidence = mlx_gen::request_scope::validate_geometry_decode_authorization(
+            crate::MODEL_ID,
+            req,
+            edge,
+            overlap,
+        )?;
+        mlx_gen::diagnostics::record_geometry_decode_decision(
+            mlx_gen::diagnostics::DecodePolicyDisposition::GeometryTiled,
+            mlx_gen::diagnostics::DecodePathDisposition::Tiled,
+            Some(&evidence),
+        );
+        return Ok(Some(TilingConfig::spatial_only(
+            edge as i32,
+            overlap as i32,
+        )));
+    }
     Err(mlx_gen::Error::Unsupported(
         refuse_decode(
             crate::MODEL_ID,

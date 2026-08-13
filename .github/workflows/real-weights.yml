@@ -111,7 +111,7 @@ on:
         default: all
         # `audio` still runs every audio family. The `audio-*` entries are the per-family split
         # (sc-16981) — dispatch one provider family without taking the Metal runner for the rest.
-        options: [all, llm, llm-joycaption, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-s18-sweep, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base]
+        options: [all, llm, llm-joycaption, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-s18-sweep, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base]
       sceneworks_revision:
         description: Exact lowercase SceneWorks commit paired with memory-evidence-v1
         type: string
@@ -718,6 +718,257 @@ jobs:
           name: chroma-sc16462-artifact-${{ matrix.model }}
           if-no-files-found: error
           path: ${{ runner.temp }}/chroma-sc16462-artifact-${{ matrix.model }}.json
+
+  # SC-18325: correctness-only production-latent tiled-decode admission. These three profiles are
+  # manual dispatch only. They do not invoke a memory ladder, read clocks/allocator/process state,
+  # or create calibration/performance data; the collector rejects every field outside the semantic
+  # latent/output SHA + max-RGB allowlist before sealing ABI-1 policy rows.
+  mlx-decode-quality-kolors:
+    name: Decode quality admission (Kolors)
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'decode-quality-kolors'
+    runs-on: [self-hosted, macOS, ARM64, rw-chroma]
+    timeout-minutes: 720
+    env:
+      QUALITY_REPOSITORY: SceneWorks/kolors-mlx
+      QUALITY_SOURCE_REVISION: aadbd49f53b66a33ef1be09384eac409cbc44061
+      DECODE_QUALITY_TIER: q4
+      DECODE_QUALITY_CANDIDATES: >-
+        768x768:576:48 1024x1024:768:64 1280x720:576:48 720x1280:576:48
+        1280x1280:960:80 1536x1536:1152:96 2048x2048:1536:128
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Toolchain versions
+        run: rustc --version && cargo --version && python3.12 --version
+      - name: Materialize exact Kolors q4 snapshot
+        env:
+          PYTHONPATH: ${{ runner.temp }}/huggingface-hub
+          QUALITY_ROOT: ${{ runner.temp }}/decode-quality-${{ github.run_id }}-${{ github.run_attempt }}-kolors
+        run: |
+          set -euo pipefail
+          python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$PYTHONPATH" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
+          python3.12 - <<'PY'
+          import os
+          from huggingface_hub import snapshot_download
+
+          snapshot_download(
+              repo_id=os.environ["QUALITY_REPOSITORY"],
+              revision=os.environ["QUALITY_SOURCE_REVISION"],
+              allow_patterns=["q4/**"],
+              local_dir=os.environ["QUALITY_ROOT"],
+              token=False,
+          )
+          PY
+          test -d "$QUALITY_ROOT/q4/unet"
+          test -d "$QUALITY_ROOT/q4/text_encoder"
+          test -d "$QUALITY_ROOT/q4/vae"
+          echo "KOLORS_QUALITY_ROOT=$QUALITY_ROOT" >> "$GITHUB_ENV"
+      - name: Run production-latent quality admission
+        env:
+          DECODE_QUALITY_SOURCE_REVISION: ${{ env.QUALITY_SOURCE_REVISION }}
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/decode-quality-kolors.log"
+          out="$(cargo test --locked --release -p mlx-gen-kolors \
+            --test decode_quality_admission production_latent_quality_admission \
+            -- --exact --ignored --test-threads=1 --nocapture 2>&1 | tee "$log" /dev/stderr)"
+          grep -qE "test result: ok\. 1 passed" <<<"$out"
+          python3.12 scripts/ci/collect_decode_quality_admission.py \
+            --input "$log" --output "$RUNNER_TEMP/decode-quality-kolors-policies.json"
+      - name: Upload semantic quality receipts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: decode-quality-kolors
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/decode-quality-kolors.log
+            ${{ runner.temp }}/decode-quality-kolors-policies.json
+
+  mlx-decode-quality-sdxl:
+    name: Decode quality admission (${{ matrix.model }})
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'decode-quality-sdxl'
+    runs-on: [self-hosted, macOS, ARM64, rw-chroma]
+    timeout-minutes: 720
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - model: sdxl
+            repository: SceneWorks/sdxl-base-mlx
+            source_revision: 36699bb8a6353e61c920e3bf19f0e6f8e4151c55
+            steps: 30
+            guidance: 7.0
+          - model: realvisxl
+            repository: SceneWorks/realvisxl-mlx
+            source_revision: e40202d63baef826c7df95a639a811698c1178d2
+            steps: 30
+            guidance: 7.0
+          - model: realvisxl_lightning
+            repository: SceneWorks/realvisxl-lightning-mlx
+            source_revision: c09fd586989bdc3c658d4acd03e8ae81677ade8e
+            steps: 5
+            guidance: 1.0
+            sampler: lightning
+          - model: illustrious_xl_v1
+            repository: SceneWorks/illustrious-xl-v1-mlx
+            source_revision: c5a92a902dd4e6ee99c2a57981ecf66209905dd1
+            steps: 30
+            guidance: 7.0
+          - model: illustrious_xl_v2
+            repository: SceneWorks/illustrious-xl-v2-mlx
+            source_revision: 7c5c8b2bb75a8f38a7365e70bdf84d38d6204473
+            steps: 30
+            guidance: 7.0
+    env:
+      QUALITY_MODEL: ${{ matrix.model }}
+      QUALITY_REPOSITORY: ${{ matrix.repository }}
+      QUALITY_SOURCE_REVISION: ${{ matrix.source_revision }}
+      DECODE_QUALITY_TIER: q4
+      DECODE_QUALITY_STEPS: ${{ matrix.steps }}
+      DECODE_QUALITY_GUIDANCE: ${{ matrix.guidance }}
+      DECODE_QUALITY_SAMPLER: ${{ matrix.sampler }}
+      DECODE_QUALITY_CANDIDATES: >-
+        1024x1024:896:192 1152x896:768:160 896x1152:768:160
+        1216x832:704:160 832x1216:704:160 1344x768:640:128 768x1344:640:128
+        1280x1280:1120:240 1536x1536:1344:288 2048x2048:1792:384
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Toolchain versions
+        run: rustc --version && cargo --version && python3.12 --version
+      - name: Materialize exact SDXL-family q4 snapshot
+        env:
+          PYTHONPATH: ${{ runner.temp }}/huggingface-hub
+          QUALITY_ROOT: ${{ runner.temp }}/decode-quality-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model }}
+        run: |
+          set -euo pipefail
+          python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$PYTHONPATH" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
+          python3.12 - <<'PY'
+          import os
+          from huggingface_hub import snapshot_download
+
+          snapshot_download(
+              repo_id=os.environ["QUALITY_REPOSITORY"],
+              revision=os.environ["QUALITY_SOURCE_REVISION"],
+              allow_patterns=["q4/**"],
+              local_dir=os.environ["QUALITY_ROOT"],
+              token=False,
+          )
+          PY
+          test -d "$QUALITY_ROOT/q4/unet"
+          test -d "$QUALITY_ROOT/q4/text_encoder"
+          test -d "$QUALITY_ROOT/q4/text_encoder_2"
+          test -d "$QUALITY_ROOT/q4/vae"
+          echo "SDXL_QUALITY_ROOT=$QUALITY_ROOT" >> "$GITHUB_ENV"
+      - name: Run production-latent quality admission
+        env:
+          SDXL_QUALITY_ENTRY: ${{ env.QUALITY_MODEL }}
+          DECODE_QUALITY_SOURCE_REVISION: ${{ env.QUALITY_SOURCE_REVISION }}
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/decode-quality-$QUALITY_MODEL.log"
+          out="$(cargo test --locked --release -p mlx-gen-sdxl \
+            --test decode_quality_admission production_latent_quality_admission \
+            -- --exact --ignored --test-threads=1 --nocapture 2>&1 | tee "$log" /dev/stderr)"
+          grep -qE "test result: ok\. 1 passed" <<<"$out"
+          python3.12 scripts/ci/collect_decode_quality_admission.py \
+            --input "$log" --output "$RUNNER_TEMP/decode-quality-$QUALITY_MODEL-policies.json"
+      - name: Upload semantic quality receipts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: decode-quality-${{ matrix.model }}
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/decode-quality-${{ matrix.model }}.log
+            ${{ runner.temp }}/decode-quality-${{ matrix.model }}-policies.json
+
+  mlx-decode-quality-chroma:
+    name: Decode quality admission (${{ matrix.model }})
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'decode-quality-chroma'
+    runs-on: [self-hosted, macOS, ARM64, rw-chroma]
+    timeout-minutes: 720
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - model: chroma1_base
+            repository: SceneWorks/chroma1-base-mlx
+            source_revision: e7330dda29d00ffdeeb719b28e92ee74cff0884c
+            steps: 40
+            guidance: 3.0
+          - model: chroma1_hd
+            repository: SceneWorks/chroma1-hd-mlx
+            source_revision: 9d99afe1ebca67032476756bc70d4a7152bc1bd5
+            steps: 40
+            guidance: 3.0
+          - model: chroma1_flash
+            repository: SceneWorks/chroma1-flash-mlx
+            source_revision: 6a9cb6178709559461506bf247f708d0d1008d00
+            steps: 12
+            guidance: 1.0
+    env:
+      QUALITY_MODEL: ${{ matrix.model }}
+      QUALITY_REPOSITORY: ${{ matrix.repository }}
+      QUALITY_SOURCE_REVISION: ${{ matrix.source_revision }}
+      DECODE_QUALITY_TIER: q4
+      DECODE_QUALITY_STEPS: ${{ matrix.steps }}
+      DECODE_QUALITY_GUIDANCE: ${{ matrix.guidance }}
+      DECODE_QUALITY_CANDIDATES: >-
+        768x768:640:192 1024x1024:832:256 1280x720:576:192 720x1280:576:192
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Toolchain versions
+        if: inputs.chroma_model == 'all' || inputs.chroma_model == matrix.model
+        run: rustc --version && cargo --version && python3.12 --version
+      - name: Materialize exact Chroma q4 snapshot
+        if: inputs.chroma_model == 'all' || inputs.chroma_model == matrix.model
+        env:
+          PYTHONPATH: ${{ runner.temp }}/huggingface-hub
+          QUALITY_ROOT: ${{ runner.temp }}/decode-quality-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model }}
+        run: |
+          set -euo pipefail
+          python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$PYTHONPATH" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
+          python3.12 - <<'PY'
+          import os
+          from huggingface_hub import snapshot_download
+
+          snapshot_download(
+              repo_id=os.environ["QUALITY_REPOSITORY"],
+              revision=os.environ["QUALITY_SOURCE_REVISION"],
+              allow_patterns=["q4/**"],
+              local_dir=os.environ["QUALITY_ROOT"],
+              token=False,
+          )
+          PY
+          test -d "$QUALITY_ROOT/q4/transformer"
+          test -d "$QUALITY_ROOT/q4/text_encoder"
+          test -d "$QUALITY_ROOT/q4/vae"
+          echo "CHROMA_QUALITY_ROOT=$QUALITY_ROOT" >> "$GITHUB_ENV"
+      - name: Run production-latent quality admission
+        if: inputs.chroma_model == 'all' || inputs.chroma_model == matrix.model
+        env:
+          CHROMA_QUALITY_ENTRY: ${{ env.QUALITY_MODEL }}
+          DECODE_QUALITY_SOURCE_REVISION: ${{ env.QUALITY_SOURCE_REVISION }}
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/decode-quality-$QUALITY_MODEL.log"
+          out="$(cargo test --locked --release -p mlx-gen-chroma \
+            --test decode_quality_admission production_latent_quality_admission \
+            -- --exact --ignored --test-threads=1 --nocapture 2>&1 | tee "$log" /dev/stderr)"
+          grep -qE "test result: ok\. 1 passed" <<<"$out"
+          python3.12 scripts/ci/collect_decode_quality_admission.py \
+            --input "$log" --output "$RUNNER_TEMP/decode-quality-$QUALITY_MODEL-policies.json"
+      - name: Upload semantic quality receipts
+        if: always() && (inputs.chroma_model == 'all' || inputs.chroma_model == matrix.model)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: decode-quality-${{ matrix.model }}
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/decode-quality-${{ matrix.model }}.log
+            ${{ runner.temp }}/decode-quality-${{ matrix.model }}-policies.json
 
   # SC-15520: the Chroma1 memory ladder on real weights.
   #

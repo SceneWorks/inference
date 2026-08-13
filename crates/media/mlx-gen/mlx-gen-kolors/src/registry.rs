@@ -546,7 +546,8 @@ impl KolorsGenerator {
                     .into(),
             ));
         }
-        let decode_tiling = crate::memory_strategy::decode_tiling(req)?;
+        let decode_tiling =
+            crate::memory_strategy::decode_tiling_for_contract(req, &self.memory_strategy)?;
         let forward_plan =
             SdxlForwardPlan::with_attention(crate::memory_strategy::attention_plan(req)?)
                 .with_window(dit_window.map(|size| SdxlBlockWindow {

@@ -976,7 +976,11 @@ impl Chroma {
         // rather than a silently different execution than the selector chose.
         let plan = self.rung_plan(req)?;
         let attention = crate::memory_strategy::attention_plan(req);
-        let tiling = crate::memory_strategy::decode_tiling(req, self.descriptor.id)?;
+        let tiling = crate::memory_strategy::decode_tiling_for_contract(
+            req,
+            self.descriptor.id,
+            &self.memory_strategy,
+        )?;
 
         // Staged residency lifecycle (sc-10840): under `Sequential` the seam loads the T5 encoder,
         // encodes pos (+neg), materializes, then DROPS it + `clear_cache()` so it frees before the

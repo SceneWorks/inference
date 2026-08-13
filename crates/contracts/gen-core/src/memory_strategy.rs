@@ -115,6 +115,7 @@ use crate::{
     weightsmeta::safetensors_path_bytes, AdapterSpec, Error, GenerationRequest, LoadShape,
     Precision, Quant, Result,
 };
+use sha2::{Digest, Sha256};
 
 /// Current ABI of the provider/evidence calibration handshake.
 ///
@@ -124,10 +125,18 @@ use crate::{
 /// invalidates its measurements.
 ///
 /// ABI 2 added the typed load-shape axis to calibration identities, run contexts, and evidence
-/// keys. ABI 3 adds the typed reference-count geometry axis. Earlier records are intentionally
-/// stale because reference-sensitive request peaks cannot be keyed by a boolean or an overlay
-/// identity string.
+/// keys. ABI 3 adds the typed reference-count geometry axis. Decode-quality admission is versioned
+/// independently below: adding a semantic policy must not invalidate or imply a refresh of the
+/// model-memory calibration matrix.
 pub const MEMORY_CALIBRATION_ABI: u32 = 3;
+
+/// Current ABI of production-latent tiled-decode quality records.
+///
+/// This identity is deliberately independent from [`MEMORY_CALIBRATION_ABI`]: decode quality is a
+/// semantic admission input, not a memory or performance measurement. Changing its fixture or
+/// verdict shape invalidates quality records without pretending that a model-memory matrix was
+/// captured or refreshed.
+pub const MEMORY_DECODE_QUALITY_ABI: u32 = 1;
 
 /// Prefix for the single-line calibration observation protocol consumed by release tooling.
 ///
@@ -364,6 +373,10 @@ impl TransformerComponent {
 pub struct MemoryParameterRanges {
     pub decode_tile_edges: Vec<u32>,
     pub decode_overlaps: Vec<u32>,
+    /// Exact production-latent quality verdicts for geometry-aware bounded decode. Empty preserves
+    /// the legacy route-blind parameter contract. Once non-empty, absence of an exact admitted row
+    /// is a refusal; a tile edge in the union above is never authority by itself.
+    pub decode_geometry_policies: Vec<MemoryDecodeGeometryPolicy>,
     pub attention_chunk_sizes: Vec<u32>,
     pub transformer_window_sizes: Vec<u32>,
     /// Component scopes the provider actually implements for rung 4 (SC-15794). Empty means the
@@ -893,8 +906,9 @@ impl MemoryProviderContract {
         provider_id: impl Into<String>,
         backend: MemoryBackendRealization,
     ) -> Self {
+        let provider_id = provider_id.into();
         Self {
-            provider_id: provider_id.into(),
+            provider_id,
             backend,
             strategies: MemoryStrategy::ALL
                 .into_iter()
@@ -996,6 +1010,150 @@ impl MemoryProviderContract {
         self.strategies
             .iter()
             .find(|capability| capability.strategy == strategy)
+    }
+
+    /// Replace a withheld provider's route-blind rung-2 declaration with sealed, geometry-aware
+    /// quality policy. An empty input is a no-op so existing defaults and estimated fallback remain
+    /// byte-for-byte compatible until a packaged quality table exists.
+    ///
+    /// Refused rows remain published as fail-closed knowledge. Only admitted rows contribute to the
+    /// selectable edge/overlap union or arm the production decode lifecycle.
+    pub fn adopt_decode_geometry_policies(
+        &mut self,
+        expected_family: &str,
+        policies: Vec<MemoryDecodeGeometryPolicy>,
+    ) -> Result<bool> {
+        if policies.is_empty() {
+            return Ok(false);
+        }
+        if expected_family.trim().is_empty()
+            || policies
+                .iter()
+                .any(|policy| policy.family != expected_family)
+        {
+            return Err(Error::Unsupported(format!(
+                "{}: decode-quality policy does not match expected family {:?}",
+                self.provider_id, expected_family
+            )));
+        }
+        let capability = self
+            .strategies
+            .iter_mut()
+            .find(|capability| capability.strategy == MemoryStrategy::BoundedDecode)
+            .ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "{}: decode-quality policy requires a BoundedDecode capability",
+                    self.provider_id
+                ))
+            })?;
+        let mut edges = policies
+            .iter()
+            .filter(|policy| matches!(policy.disposition, MemoryDecodeQualityDisposition::Admitted))
+            .map(|policy| policy.tile_edge)
+            .collect::<Vec<_>>();
+        let mut overlaps = policies
+            .iter()
+            .filter(|policy| matches!(policy.disposition, MemoryDecodeQualityDisposition::Admitted))
+            .map(|policy| policy.overlap)
+            .collect::<Vec<_>>();
+        edges.sort_unstable();
+        edges.dedup();
+        overlaps.sort_unstable();
+        overlaps.dedup();
+        let admitted = !edges.is_empty();
+        capability.support = if admitted {
+            MemoryStrategySupport::Implemented
+        } else {
+            MemoryStrategySupport::Missing
+        };
+        capability.parameters.decode_tile_edges = edges;
+        capability.parameters.decode_overlaps = overlaps;
+        capability.parameters.decode_geometry_policies = policies;
+        self.lifecycle.decode_tiling = admitted;
+
+        let mut errors = Vec::new();
+        validate_decode_geometry_policies(self, &mut errors);
+        if errors.is_empty() {
+            Ok(admitted)
+        } else {
+            Err(Error::Unsupported(format!(
+                "{}: invalid decode-quality policy: {}",
+                self.provider_id,
+                errors.join("; ")
+            )))
+        }
+    }
+
+    /// Resolve the exact production-latent quality row for bounded decode.
+    ///
+    /// `Ok(None)` means this provider has not adopted geometry-aware quality policy and retains its
+    /// legacy route-blind domain. Once any policy row is declared, every coordinate is closed: an
+    /// admitted row returns `Some`, while a recorded failure, an unmeasured coordinate, or a
+    /// tile/overlap mismatch returns a typed refusal. Callers selecting parameters may pass `None`
+    /// to obtain the row's geometry-dependent pair; provider safety passes the selected pair back
+    /// in so it cannot drift between admission and execution.
+    pub fn decode_geometry_policy(
+        &self,
+        query: MemoryDecodePolicyQuery<'_>,
+        selected_parameters: Option<MemoryStrategyParameters>,
+    ) -> Result<Option<&MemoryDecodeGeometryPolicy>> {
+        let Some(capability) = self.capability(MemoryStrategy::BoundedDecode) else {
+            return Ok(None);
+        };
+        let policies = &capability.parameters.decode_geometry_policies;
+        if policies.is_empty() {
+            return Ok(None);
+        }
+        let Some(policy) = policies
+            .iter()
+            .find(|policy| policy.matches_coordinate(self, query))
+        else {
+            return Err(Error::Unsupported(format!(
+                "{}: bounded decode has no admitted production-latent quality record for \
+                 backend={} tier={:?} mode={} overlay={:?} geometry={}x{}x{} \
+                 frames={} references={} use_pid={}",
+                self.provider_id,
+                self.backend.backend_id(),
+                query.tier,
+                query.mode_key,
+                query.overlay,
+                query.geometry.width,
+                query.geometry.height,
+                query.geometry.batch,
+                query.geometry.frames,
+                query.geometry.reference_count,
+                query.use_pid,
+            )));
+        };
+        if let MemoryDecodeQualityDisposition::Refused { reason } = &policy.disposition {
+            return Err(Error::Unsupported(format!(
+                "{}: bounded decode was refused by production-latent quality admission for \
+                 {}x{}: {reason} (evidence {})",
+                self.provider_id,
+                query.geometry.width,
+                query.geometry.height,
+                policy.production_evidence_sha256,
+            )));
+        }
+        if let Some(parameters) = selected_parameters {
+            if parameters.decode_tile_edge != Some(policy.tile_edge)
+                || parameters.decode_overlap != Some(policy.overlap)
+            {
+                return Err(Error::Unsupported(format!(
+                    "{}: bounded decode parameters edge={:?} overlap={:?} do not match the \
+                     admitted geometry policy edge={} overlap={} for {}x{} (evidence {})",
+                    self.provider_id,
+                    parameters.decode_tile_edge,
+                    parameters.decode_overlap,
+                    policy.tile_edge,
+                    policy.overlap,
+                    query.geometry.width,
+                    query.geometry.height,
+                    policy.production_evidence_sha256,
+                )));
+            }
+        }
+        Ok(Some(policy))
     }
 
     fn support(&self, strategy: MemoryStrategy) -> Option<&MemoryStrategySupport> {
@@ -1269,6 +1427,7 @@ impl MemoryProviderContract {
         if let Some(routes) = &self.pid_decode_routes {
             validate_pid_decode_routes(self, routes, &mut errors);
         }
+        validate_decode_geometry_policies(self, &mut errors);
         if implemented(MemoryStrategy::BoundedAttention) && !self.lifecycle.attention_chunking {
             errors.push("BoundedAttention requires the attention_chunking hook".to_owned());
         }
@@ -1610,6 +1769,238 @@ fn validate_pid_decode_routes(
     }
 }
 
+fn validate_decode_geometry_policies(contract: &MemoryProviderContract, errors: &mut Vec<String>) {
+    let Some(bounded_decode) = contract.capability(MemoryStrategy::BoundedDecode) else {
+        return;
+    };
+    let policies = &bounded_decode.parameters.decode_geometry_policies;
+    if policies.is_empty() {
+        return;
+    }
+
+    let implemented = matches!(bounded_decode.support, MemoryStrategySupport::Implemented);
+    let mut coordinates = std::collections::HashSet::new();
+    let mut admitted_edges = Vec::new();
+    let mut admitted_overlaps = Vec::new();
+    let mut admitted_count = 0usize;
+    let mut family = None;
+    let mut resolved_route = None;
+    for policy in policies {
+        if policy.quality_abi != MEMORY_DECODE_QUALITY_ABI {
+            errors.push(format!(
+                "decode quality ABI {} does not match {}",
+                policy.quality_abi, MEMORY_DECODE_QUALITY_ABI
+            ));
+        }
+        if policy.family.trim().is_empty() {
+            errors.push("decode quality family must be non-empty".to_owned());
+        }
+        if let Some(expected) = family {
+            if policy.family != expected {
+                errors.push(format!(
+                    "one loaded provider contract cannot mix decode quality families {:?} and {:?}",
+                    expected, policy.family
+                ));
+            }
+        } else {
+            family = Some(policy.family.as_str());
+        }
+        if policy.resolved_route.trim().is_empty() {
+            errors.push("decode quality resolved route must be non-empty".to_owned());
+        }
+        if let Some(expected) = resolved_route {
+            if policy.resolved_route != expected {
+                errors.push(format!(
+                    "one loaded provider contract cannot mix decode quality routes {:?} and {:?}",
+                    expected, policy.resolved_route
+                ));
+            }
+        } else {
+            resolved_route = Some(policy.resolved_route.as_str());
+        }
+        if policy.backend != contract.backend.backend_kind() {
+            errors.push(format!(
+                "decode quality backend {:?} does not match provider backend {:?}",
+                policy.backend,
+                contract.backend.backend_kind()
+            ));
+        }
+        if policy.mode.as_key().trim().is_empty() {
+            errors.push("decode quality mode must be non-empty".to_owned());
+        }
+        if policy
+            .overlay
+            .as_deref()
+            .is_some_and(|overlay| overlay.trim().is_empty() || overlay.contains('='))
+        {
+            errors.push("decode quality overlay must be a non-empty identity axis".to_owned());
+        }
+        if policy.geometry.width == 0
+            || policy.geometry.height == 0
+            || policy.geometry.batch == 0
+            || policy.geometry.frames == 0
+        {
+            errors.push("decode quality geometry dimensions must be non-zero".to_owned());
+        }
+        if policy.use_pid && contract.pid_decode_routes.is_none() {
+            errors.push(
+                "decode quality cannot admit a PiD route when the provider declares no PiD decode geometry"
+                    .to_owned(),
+            );
+        }
+        if policy.tile_edge == 0 || policy.overlap == 0 || policy.overlap >= policy.tile_edge {
+            errors.push(format!(
+                "decode quality tile edge {} must exceed non-zero overlap {}",
+                policy.tile_edge, policy.overlap
+            ));
+        }
+        if policy.metric.trim().is_empty() {
+            errors.push("decode quality metric must be non-empty".to_owned());
+        }
+        if !is_lower_hex_sha256(&policy.production_evidence_sha256) {
+            errors.push(
+                "decode production evidence SHA-256 must be 64 lowercase hexadecimal characters"
+                    .to_owned(),
+            );
+        } else if policy.production_evidence_sha256 != policy.computed_evidence_sha256() {
+            errors.push(format!(
+                "decode production evidence SHA-256 does not bind the canonical {}x{} quality record",
+                policy.geometry.width, policy.geometry.height
+            ));
+        }
+        if policy.fixtures.len() < 2 {
+            errors.push(format!(
+                "decode quality coordinate {}x{} requires multiple fixed-seed production latents",
+                policy.geometry.width, policy.geometry.height
+            ));
+        }
+        let mut seeds = std::collections::HashSet::new();
+        for fixture in &policy.fixtures {
+            if !seeds.insert(fixture.seed) {
+                errors.push(format!(
+                    "decode quality coordinate {}x{} contains duplicate seed {}",
+                    policy.geometry.width, policy.geometry.height, fixture.seed
+                ));
+            }
+            if fixture.production_latent_provenance.trim().is_empty() {
+                errors.push(format!(
+                    "decode quality seed {} has no production-latent provenance",
+                    fixture.seed
+                ));
+            }
+            for (label, sha256) in [
+                (
+                    "production latent",
+                    fixture.production_latent_sha256.as_str(),
+                ),
+                ("dense output", fixture.dense_output_sha256.as_str()),
+                ("tiled output", fixture.tiled_output_sha256.as_str()),
+            ] {
+                if !is_lower_hex_sha256(sha256) {
+                    errors.push(format!(
+                        "decode quality seed {} {label} SHA-256 must be 64 lowercase hexadecimal characters",
+                        fixture.seed
+                    ));
+                }
+            }
+        }
+
+        let coordinate = format!(
+            "{}|{}|{}|{:?}|{}|{:?}|{}x{}x{}x{}r{}|pid={}",
+            policy.family,
+            policy.resolved_route,
+            policy.backend.as_key(),
+            policy.tier,
+            policy.mode.as_key(),
+            policy.overlay,
+            policy.geometry.width,
+            policy.geometry.height,
+            policy.geometry.batch,
+            policy.geometry.frames,
+            policy.geometry.reference_count,
+            policy.use_pid,
+        );
+        if !coordinates.insert(coordinate) {
+            errors.push(format!(
+                "duplicate decode quality coordinate for {}x{}",
+                policy.geometry.width, policy.geometry.height
+            ));
+        }
+
+        match &policy.disposition {
+            MemoryDecodeQualityDisposition::Admitted => {
+                admitted_count += 1;
+                admitted_edges.push(policy.tile_edge);
+                admitted_overlaps.push(policy.overlap);
+                if !implemented {
+                    errors.push(
+                        "an admitted decode quality row requires BoundedDecode Implemented"
+                            .to_owned(),
+                    );
+                }
+                if policy
+                    .fixtures
+                    .iter()
+                    .any(|fixture| fixture.observed_error > policy.maximum_error)
+                {
+                    errors.push(format!(
+                        "admitted decode quality coordinate {}x{} exceeds its {} maximum",
+                        policy.geometry.width, policy.geometry.height, policy.maximum_error
+                    ));
+                }
+            }
+            MemoryDecodeQualityDisposition::Refused { reason } => {
+                if reason.trim().is_empty() {
+                    errors.push("refused decode quality row requires a reason".to_owned());
+                }
+                if policy
+                    .fixtures
+                    .iter()
+                    .all(|fixture| fixture.observed_error <= policy.maximum_error)
+                {
+                    errors.push(format!(
+                        "refused decode quality coordinate {}x{} has no failing fixture",
+                        policy.geometry.width, policy.geometry.height
+                    ));
+                }
+            }
+        }
+    }
+
+    if implemented && admitted_count == 0 {
+        errors.push(
+            "geometry-aware BoundedDecode requires at least one admitted quality row".to_owned(),
+        );
+    }
+    admitted_edges.sort_unstable();
+    admitted_edges.dedup();
+    admitted_overlaps.sort_unstable();
+    admitted_overlaps.dedup();
+    let mut declared_edges = bounded_decode.parameters.decode_tile_edges.clone();
+    declared_edges.sort_unstable();
+    declared_edges.dedup();
+    let mut declared_overlaps = bounded_decode.parameters.decode_overlaps.clone();
+    declared_overlaps.sort_unstable();
+    declared_overlaps.dedup();
+    if implemented && admitted_edges != declared_edges {
+        errors.push(format!(
+            "BoundedDecode tile edges {declared_edges:?} must equal admitted geometry-policy union {admitted_edges:?}"
+        ));
+    }
+    if implemented && admitted_overlaps != declared_overlaps {
+        errors.push(format!(
+            "BoundedDecode overlaps {declared_overlaps:?} must equal admitted geometry-policy union {admitted_overlaps:?}"
+        ));
+    }
+}
+
+fn is_lower_hex_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 /// The shared safety pipeline for an adopted provider.
 ///
 /// `loaded_tier` binds a weights-free registration or loaded generator to the numeric tier it
@@ -1671,6 +2062,20 @@ pub fn standard_memory_strategy_safety_check(
     }
     if let Err(error) = contract.validate_selection(&context.selection) {
         return reject(error.to_string());
+    }
+    if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
+        if let Err(error) = contract.decode_geometry_policy(
+            MemoryDecodePolicyQuery {
+                tier: context.selection.tier,
+                mode_key: context.mode.as_key(),
+                overlay: context.overlay.as_deref(),
+                geometry: context.geometry,
+                use_pid: context.use_pid,
+            },
+            Some(context.selection.parameters),
+        ) {
+            return reject(error.to_string());
+        }
     }
     if let Some(route_gate) = route_gate {
         if let Err(error) = route_gate() {
@@ -1749,6 +2154,14 @@ fn validate_owned_parameter_domain(
     capability: &MemoryStrategyCapability,
     errors: &mut Vec<String>,
 ) {
+    if capability.strategy != MemoryStrategy::BoundedDecode
+        && !capability.parameters.decode_geometry_policies.is_empty()
+    {
+        errors.push(format!(
+            "{:?} must not own decode geometry policies",
+            capability.strategy
+        ));
+    }
     if !matches!(capability.support, MemoryStrategySupport::Implemented) {
         return;
     }
@@ -1951,6 +2364,154 @@ pub struct MemoryGeometry {
     /// Number of reference images consumed by this provider forward pass. This is request
     /// geometry, not overlay identity; zero means the request has no reference input.
     pub reference_count: u32,
+}
+
+/// One deterministic production latent used to judge a tiled-decode policy.
+///
+/// `production_latent_provenance` names the immutable model revision, prompt fixture, denoise
+/// schedule, and harness source that reproduce the latent. The enclosing evidence SHA binds the
+/// complete ordered fixture set and its observed errors; this record intentionally carries no peak,
+/// duration, or allocator field.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryDecodeQualityFixture {
+    pub seed: u64,
+    pub production_latent_provenance: String,
+    pub production_latent_sha256: String,
+    pub dense_output_sha256: String,
+    pub tiled_output_sha256: String,
+    pub observed_error: u32,
+}
+
+/// Production-latent quality verdict for one exact decode coordinate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MemoryDecodeQualityDisposition {
+    Admitted,
+    Refused { reason: String },
+}
+
+/// Geometry-aware tiled-decode policy and its immutable production-quality receipt.
+///
+/// Every runtime identity axis that can change the latent or decoder route is explicit. A provider
+/// adopting this table may execute bounded decode only when the loaded contract and request match
+/// one `Admitted` row exactly. Failed rows remain first-class records so a known-bad coordinate is
+/// distinguishable from an unmeasured one; both fail closed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryDecodeGeometryPolicy {
+    pub quality_abi: u32,
+    pub family: String,
+    pub resolved_route: String,
+    pub backend: MemoryBackend,
+    pub tier: MemoryNumericTier,
+    pub mode: MemoryMode,
+    pub overlay: Option<String>,
+    pub geometry: MemoryGeometry,
+    pub use_pid: bool,
+    pub tile_edge: u32,
+    pub overlap: u32,
+    pub metric: String,
+    pub maximum_error: u32,
+    pub fixtures: Vec<MemoryDecodeQualityFixture>,
+    /// SHA-256 of the canonical quality record, excluding this field.
+    pub production_evidence_sha256: String,
+    pub disposition: MemoryDecodeQualityDisposition,
+}
+
+/// Exact request coordinate supplied before a selector chooses tiled-decode parameters.
+#[derive(Clone, Copy, Debug)]
+pub struct MemoryDecodePolicyQuery<'a> {
+    pub tier: MemoryNumericTier,
+    pub mode_key: &'a str,
+    pub overlay: Option<&'a str>,
+    pub geometry: MemoryGeometry,
+    pub use_pid: bool,
+}
+
+impl MemoryDecodeGeometryPolicy {
+    /// SHA-256 of the canonical semantic quality record. No timing, memory, or performance field is
+    /// present in the input by construction.
+    pub fn computed_evidence_sha256(&self) -> String {
+        let component_precision_floors = self
+            .tier
+            .component_precision_floors
+            .iter()
+            .map(|floor| {
+                serde_json::json!({
+                    "component": floor.component.as_str(),
+                    "selected_tier": quant_key(floor.selected_tier),
+                    "resident_tier": quant_key(floor.resident_tier),
+                })
+            })
+            .collect::<Vec<_>>();
+        let fixtures = self
+            .fixtures
+            .iter()
+            .map(|fixture| {
+                serde_json::json!({
+                    "seed": fixture.seed,
+                    "production_latent_provenance": fixture.production_latent_provenance,
+                    "production_latent_sha256": fixture.production_latent_sha256,
+                    "dense_output_sha256": fixture.dense_output_sha256,
+                    "tiled_output_sha256": fixture.tiled_output_sha256,
+                    "observed_error": fixture.observed_error,
+                })
+            })
+            .collect::<Vec<_>>();
+        let disposition = match &self.disposition {
+            MemoryDecodeQualityDisposition::Admitted => {
+                serde_json::json!({ "kind": "admitted" })
+            }
+            MemoryDecodeQualityDisposition::Refused { reason } => {
+                serde_json::json!({ "kind": "refused", "reason": reason })
+            }
+        };
+        let canonical = serde_json::json!({
+            "quality_abi": self.quality_abi,
+            "family": self.family,
+            "resolved_route": self.resolved_route,
+            "backend": self.backend.as_key(),
+            "tier": {
+                "precision": precision_key(self.tier.precision),
+                "quant": self.tier.quant.map(quant_key),
+                "component_precision_floors": component_precision_floors,
+            },
+            "mode": self.mode.as_key(),
+            "overlay": self.overlay,
+            "geometry": {
+                "width": self.geometry.width,
+                "height": self.geometry.height,
+                "batch": self.geometry.batch,
+                "frames": self.geometry.frames,
+                "reference_count": self.geometry.reference_count,
+            },
+            "use_pid": self.use_pid,
+            "tile_edge": self.tile_edge,
+            "overlap": self.overlap,
+            "metric": self.metric,
+            "maximum_error": self.maximum_error,
+            "fixtures": fixtures,
+            "disposition": disposition,
+        });
+        format!("{:x}", Sha256::digest(canonical.to_string().as_bytes()))
+    }
+
+    /// Fill the evidence identity from the canonical quality fields.
+    pub fn seal(mut self) -> Self {
+        self.production_evidence_sha256 = self.computed_evidence_sha256();
+        self
+    }
+
+    fn matches_coordinate(
+        &self,
+        contract: &MemoryProviderContract,
+        query: MemoryDecodePolicyQuery<'_>,
+    ) -> bool {
+        self.backend == contract.backend.backend_kind()
+            && self.tier == query.tier
+            && self.mode.as_key() == query.mode_key
+            && self.overlay.as_deref() == query.overlay
+            && self.geometry == query.geometry
+            && self.use_pid == query.use_pid
+    }
 }
 
 /// Canonical live-budget accounting owned by the caller.
@@ -2803,6 +3364,7 @@ pub struct MemoryRejection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{LoadSpec, WeightsSource};
 
     #[test]
     fn adapter_residency_distinguishes_folded_additive_and_missing_evidence() {
@@ -2942,6 +3504,225 @@ mod tests {
             cache_state: MemoryCacheState::Cold,
             evidence_revision: "test".to_owned(),
         }
+    }
+
+    fn decode_quality_policy(contract: &MemoryProviderContract) -> MemoryDecodeGeometryPolicy {
+        MemoryDecodeGeometryPolicy {
+            quality_abi: MEMORY_DECODE_QUALITY_ABI,
+            family: "test-family".to_owned(),
+            resolved_route: contract.provider_id.clone(),
+            backend: MemoryBackend::Mlx,
+            tier: MemoryNumericTier {
+                precision: Precision::Bf16,
+                quant: Some(Quant::Q4),
+                component_precision_floors: &[],
+            },
+            mode: MemoryMode::TextToImage,
+            overlay: None,
+            geometry: MemoryGeometry {
+                width: 512,
+                height: 512,
+                batch: 1,
+                frames: 1,
+                reference_count: 0,
+            },
+            use_pid: false,
+            tile_edge: 512,
+            overlap: 64,
+            metric: "max_abs_rgb_u8".to_owned(),
+            maximum_error: 48,
+            fixtures: [(7, 'a', 'b', 'c', 31), (99, 'd', 'e', 'f', 42)]
+                .into_iter()
+                .map(
+                    |(seed, latent, dense, tiled, observed_error)| MemoryDecodeQualityFixture {
+                        seed,
+                        production_latent_provenance: format!("test-model@revision seed={seed}"),
+                        production_latent_sha256: latent.to_string().repeat(64),
+                        dense_output_sha256: dense.to_string().repeat(64),
+                        tiled_output_sha256: tiled.to_string().repeat(64),
+                        observed_error,
+                    },
+                )
+                .collect(),
+            production_evidence_sha256: String::new(),
+            disposition: MemoryDecodeQualityDisposition::Admitted,
+        }
+        .seal()
+    }
+
+    #[test]
+    fn geometry_decode_quality_is_exact_fail_closed_and_self_authenticating() {
+        let mut contract = adopted_contract();
+        contract.provider_id = "sdxl".to_owned();
+        let mut policy = decode_quality_policy(&contract);
+        policy.resolved_route = "realvisxl".to_owned();
+        policy = policy.seal();
+        assert_eq!(
+            policy.production_evidence_sha256,
+            "f1c7b0037855fd6ddf7ff7a56b7cced07fe1458fe7d78f33e3a7cf7adbefd8d3",
+            "Rust and the correctness-only collector must share one canonical quality ABI"
+        );
+        assert!(contract
+            .adopt_decode_geometry_policies("test-family", vec![policy.clone()])
+            .unwrap());
+        assert!(contract.lifecycle.decode_tiling);
+        let decode = contract.capability(MemoryStrategy::BoundedDecode).unwrap();
+        assert_eq!(decode.parameters.decode_tile_edges, [512]);
+        assert_eq!(decode.parameters.decode_overlaps, [64]);
+        assert!(
+            contract.conformance_errors().is_empty(),
+            "{:?}",
+            contract.conformance_errors()
+        );
+
+        let query = MemoryDecodePolicyQuery {
+            tier: policy.tier,
+            mode_key: "text_to_image",
+            overlay: None,
+            geometry: policy.geometry,
+            use_pid: false,
+        };
+        let admitted = contract
+            .decode_geometry_policy(query, None)
+            .unwrap()
+            .expect("policy adopter returns the exact row");
+        assert_eq!((admitted.tile_edge, admitted.overlap), (512, 64));
+        assert!(contract
+            .decode_geometry_policy(
+                query,
+                Some(MemoryStrategyParameters {
+                    decode_tile_edge: Some(384),
+                    decode_overlap: Some(64),
+                    ..Default::default()
+                })
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("do not match"));
+
+        let off_grid = MemoryDecodePolicyQuery {
+            geometry: MemoryGeometry {
+                width: 513,
+                ..policy.geometry
+            },
+            ..query
+        };
+        assert!(contract
+            .decode_geometry_policy(off_grid, None)
+            .unwrap_err()
+            .to_string()
+            .contains("no admitted"));
+
+        contract.strategies[MemoryStrategy::BoundedDecode as usize]
+            .parameters
+            .decode_geometry_policies[0]
+            .fixtures[0]
+            .observed_error += 1;
+        assert!(contract
+            .conformance_errors()
+            .iter()
+            .any(|error| error.contains("does not bind the canonical")));
+    }
+
+    #[test]
+    fn load_quality_table_requires_the_exact_resolved_route() {
+        let contract = adopted_contract();
+        let mut policy = decode_quality_policy(&contract);
+        policy.resolved_route = "realvisxl".to_owned();
+        policy = policy.seal();
+
+        let unbound = LoadSpec::new(WeightsSource::Dir("/models/sdxl".into()))
+            .with_decode_geometry_policies(vec![policy.clone()]);
+        assert!(unbound.route_bound_decode_geometry_policies().is_err());
+
+        let sibling = unbound.clone().with_resolved_route("realvisxl_lightning");
+        assert!(sibling.route_bound_decode_geometry_policies().is_err());
+
+        let empty = unbound.clone().with_resolved_route("   ");
+        assert!(empty.route_bound_decode_geometry_policies().is_err());
+
+        let exact = unbound.with_resolved_route("realvisxl");
+        assert_eq!(
+            exact.route_bound_decode_geometry_policies().unwrap(),
+            [policy]
+        );
+    }
+
+    #[test]
+    fn loaded_quality_table_selects_the_exact_tier_across_load_shapes() {
+        let contract = adopted_contract();
+        let mut q4 = decode_quality_policy(&contract);
+        q4.resolved_route = "realvisxl".to_owned();
+        q4 = q4.seal();
+        let mut q8 = q4.clone();
+        q8.tier.quant = Some(Quant::Q8);
+        q8 = q8.seal();
+
+        let spec = LoadSpec::new(WeightsSource::Dir("/models/sdxl".into()))
+            .with_resolved_route("realvisxl")
+            .with_decode_geometry_policies(vec![q4.clone(), q8])
+            .with_quant(Quant::Q4)
+            .with_load_shape(LoadShape::DeferredMaterialization);
+        assert_eq!(
+            spec.decode_geometry_policies_for_loaded_contract(
+                MemoryBackend::Mlx,
+                MemoryNumericTier {
+                    precision: Precision::Bf16,
+                    quant: Some(Quant::Q4),
+                    component_precision_floors: &[],
+                },
+            )
+            .unwrap(),
+            [q4.clone()]
+        );
+        let eager = spec.with_load_shape(LoadShape::EagerMaterialization);
+        assert_eq!(
+            eager
+                .decode_geometry_policies_for_loaded_contract(
+                    MemoryBackend::Mlx,
+                    MemoryNumericTier {
+                        precision: Precision::Bf16,
+                        quant: Some(Quant::Q4),
+                        component_precision_floors: &[],
+                    },
+                )
+                .unwrap(),
+            [q4]
+        );
+    }
+
+    #[test]
+    fn loaded_quality_table_cannot_mix_semantic_families() {
+        let mut contract = adopted_contract();
+        let first = decode_quality_policy(&contract);
+        let mut second = first.clone();
+        second.family = "another-family".to_owned();
+        second.geometry.width = 768;
+        second = second.seal();
+
+        let error = contract
+            .adopt_decode_geometry_policies("test-family", vec![first, second])
+            .unwrap_err();
+        assert!(error.to_string().contains("does not match expected family"));
+    }
+
+    #[test]
+    fn empty_decode_quality_table_preserves_legacy_parameter_fallback() {
+        let contract = adopted_contract();
+        let context = admitted_context(&contract);
+        assert!(contract
+            .decode_geometry_policy(
+                MemoryDecodePolicyQuery {
+                    tier: context.selection.tier,
+                    mode_key: context.mode.as_key(),
+                    overlay: context.overlay.as_deref(),
+                    geometry: context.geometry,
+                    use_pid: context.use_pid,
+                },
+                None,
+            )
+            .unwrap()
+            .is_none());
     }
 
     #[test]
