@@ -2210,6 +2210,7 @@ mod tests {
     #[test]
     fn p3_q4_q8_bias_is_exact_across_standard_and_nax_eligible_dtypes() {
         struct Case {
+            context: String,
             x: Array,
             wq: Array,
             scales: Array,
@@ -2245,6 +2246,7 @@ mod tests {
                     )
                     .unwrap();
                     cases.push(Case {
+                        context: format!("standard {dtype:?} Q{bits} gs{group_size}"),
                         x: x.clone(),
                         wq,
                         scales,
@@ -2287,6 +2289,7 @@ mod tests {
                     )
                     .unwrap();
                     cases.push(Case {
+                        context: format!("odd {dtype:?} Q{bits} gs{group_size}"),
                         x: x.clone(),
                         wq,
                         scales,
@@ -2311,6 +2314,12 @@ mod tests {
         for dtype in [Dtype::Float32, Dtype::Float16, Dtype::Bfloat16] {
             let x_base = batch_x_base.as_dtype(dtype).unwrap();
             let x = broadcast_to(&x_base, &[2, BATCH_M, K]).unwrap();
+            // Materialize the broadcast before classifying it as an admitted batched case. An
+            // unscheduled view has only provisional contiguous flags, so strict admission must
+            // conservatively check both its aggregate M=66 interpretation and its eventual
+            // batched M=33 layout. The aggregate path legitimately selects split-K for gs32 and
+            // would therefore be a truthful fallback rather than evidence for the batched kernel.
+            mlx_rs::transforms::eval([&x]).unwrap();
             let w = batch_w_f32.as_dtype(dtype).unwrap();
             let output_bias = batch_output_bias_f32.as_dtype(dtype).unwrap();
             for bits in [4, 8] {
@@ -2327,6 +2336,7 @@ mod tests {
                     )
                     .unwrap();
                     cases.push(Case {
+                        context: format!("batch {dtype:?} Q{bits} gs{group_size}"),
                         x: x.clone(),
                         wq,
                         scales,
@@ -2363,6 +2373,7 @@ mod tests {
                 )
                 .unwrap();
                 fallback_cases.push(Case {
+                    context: format!("small {dtype:?} Q{bits} gs64"),
                     x: x.clone(),
                     wq,
                     scales,
@@ -2392,7 +2403,7 @@ mod tests {
                 case.bits,
             )
             .unwrap();
-            assert!(array_eq(&exact, &case.eager, false).unwrap().item::<bool>());
+            assert_bit_exact(&exact, &case.eager, &case.context);
         }
         for case in &fallback_cases {
             let fallback = quantized_matmul_with_bias(
