@@ -163,18 +163,21 @@ impl MemoryRequestScope for MlxRequestScopeCore {
             || request.height != self.config.geometry.height
             || request.count == 0
             || request.count > self.config.geometry.batch
+            || request.frames.unwrap_or(1) != self.config.geometry.frames
             || request.image_reference_count() != self.config.geometry.reference_count
         {
             return Err(Error::Unsupported(format!(
-                "{}: request geometry {}x{}x{} references={} does not fit admitted {}x{}x{} references={}",
+                "{}: request geometry {}x{}x{} frames={} references={} does not fit admitted {}x{}x{} frames={} references={}",
                 self.config.provider_id,
                 request.width,
                 request.height,
                 request.count,
+                request.frames.unwrap_or(1),
                 request.image_reference_count(),
                 self.config.geometry.width,
                 self.config.geometry.height,
                 self.config.geometry.batch,
+                self.config.geometry.frames,
                 self.config.geometry.reference_count
             )));
         }
@@ -326,6 +329,32 @@ mod tests {
                 height: 64,
                 count: 1,
                 conditioning,
+                ..Default::default()
+            };
+            assert!(scope.configure_request(&mut mismatch).is_err());
+        }
+    }
+
+    #[test]
+    fn configured_request_must_match_the_admitted_frame_count() {
+        let mut cfg = config(7);
+        cfg.geometry.frames = 97;
+        let mut scope = MlxRequestScopeCore::with_cleanup(cfg, MlxScopeCleanup::None);
+        let mut exact = GenerationRequest {
+            width: 64,
+            height: 64,
+            count: 1,
+            frames: Some(97),
+            ..Default::default()
+        };
+        scope.configure_request(&mut exact).unwrap();
+
+        for frames in [None, Some(1), Some(89), Some(105)] {
+            let mut mismatch = GenerationRequest {
+                width: 64,
+                height: 64,
+                count: 1,
+                frames,
                 ..Default::default()
             };
             assert!(scope.configure_request(&mut mismatch).is_err());
@@ -509,6 +538,11 @@ mod tests {
                 "bernini",
                 include_str!("../mlx-gen-bernini/src/memory_strategy.rs"),
                 "WanModelConfig::wan22_t2v_14b().num_layers",
+            ),
+            (
+                "ltx-video",
+                include_str!("../mlx-gen-ltx/src/memory_strategy.rs"),
+                "LtxConfig::video_only_defaults().num_layers",
             ),
         ] {
             assert!(
