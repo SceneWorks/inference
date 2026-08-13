@@ -1714,6 +1714,20 @@ expected_files = [
     "q4/vae.safetensors",
 ]
 
+[[models]]
+# SC-18315 uses only the stock Wan z16 VAE from Krea Realtime's q8 tier as Krea 2's experimental
+# alternate terminal decoder. Keep this as a standalone exact-file projection: the correctness lane
+# must not materialize the unrelated complete repository or silently widen this donor dependency.
+key = "krea-realtime-14b-mlx-wan-z16-vae-q8"
+repository = "SceneWorks/krea-realtime-14b-mlx"
+revision = "e68e9a3d98187fdf6936838ffcf6df5aa48d6626"
+license = "Apache-2.0"
+size_class = "large"
+profiles = ["media-macos"]
+environment = ["KREA_ALTERNATE_DECODER_WAN_VAE_SNAPSHOT"]
+download_files = ["q8/vae.safetensors"]
+expected_files = ["q8/vae.safetensors"]
+
 # sc-18213 (epic 18093) — `SceneWorks/krea-2-turbo-mlx`, the Krea 2 Turbo IMAGE re-host
 # `mlx-gen-krea` actually loads (`KREA_TURBO_DIR` points one level in, at a tier dir). NOT related
 # to `krea-realtime-14b-mlx` above beyond the vendor name: that is a Wan-2.1 video model. The repo

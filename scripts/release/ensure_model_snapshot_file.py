@@ -72,12 +72,14 @@ def ensure_expected_file(
 
     snapshot = canonical_snapshot_path(cache_root, model)
     # Prove the immutable snapshot identity and every other required payload before repairing the
-    # named leaf. This keeps a broad or corrupt cache from being blessed by a one-file download.
+    # named leaf. A standalone one-file projection may create its absent canonical snapshot; any
+    # projection with other required files remains fail-closed if that snapshot is absent.
     reduced_model = {
         **model,
         "expected_files": [name for name in expected_files if name != relative_file],
     }
-    verify_snapshot(reduced_model, snapshot)
+    if snapshot.is_symlink() or snapshot.exists() or reduced_model["expected_files"]:
+        verify_snapshot(reduced_model, snapshot)
 
     downloaded = Path(
         download(

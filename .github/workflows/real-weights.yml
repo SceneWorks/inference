@@ -12,7 +12,7 @@ name: Real-weight validation
 #   rw-mage     Qwen-Image + Qwen-Image-Edit + Fun-Controlnet-Union  ~170 GiB  nax-macos-2
 #               MLX re-hosts, both PiD students, Gemma-2-2B,
 #               FLUX.1-dev, two lightx2v Lightning LoRAs  (sc-17284)
-#   rw-sa3      Stable Audio 3 / SAME + F3 Krea/Wan decoder inputs   pinned    nax-macos
+#   rw-sa3      Stable Audio 3 / SAME + F3 Krea q4 base cache        pinned    nax-macos
 #   rw-krea     Krea Realtime 14B + Wan style/distill LoRAs          ~20 GiB   nax-macos-2
 #   rw-audio    Kokoro, MOSS SFX/TTSD/TTS-Realtime, ACE-Step, ...    ~42 GiB   nax-macos-2
 #   rw-llm      SmolLM2-135M + Qwen3-0.6B + JoyCaption               ~19 GiB   nax-macos-2
@@ -47,9 +47,10 @@ name: Real-weight validation
 # copy surfaces as a red `mlx-media`, never a wrong oracle.
 
 # `rw-sa3` materializes its SA3/SAME rows into `RUNNER_TEMP`, but SC-18315 also uses that label to
-# select `nax-macos`, where the F3 Krea/Wan decoder inputs are operator-provisioned. Moving the label
-# now requires moving those inputs too. It also needs the runner-local Hugging Face credential for
-# the six gated `stabilityai/*` repos.
+# select `nax-macos`, where the large F3 Krea q4 base is operator-provisioned. The lane materializes
+# the manifest-pinned Krea license and standalone Wan z16 donor itself, then verifies the donor's
+# fixed SHA-256. Moving the label requires moving the q4 base and preserving Hub access. It also
+# needs the runner-local Hugging Face credential for the six gated `stabilityai/*` repos.
 #
 # The sc-17284 Qwen/FLUX set is the largest row here and it transferred almost nothing: all of it
 # but the two ~0.85 GB Lightning LoRAs was already resident. "Already there" is still not "free" —
@@ -2713,9 +2714,10 @@ jobs:
 
   # SC-18315 — correctness-only characterization of the experimental Wan z16 terminal decoder for
   # Krea 2. This is operator-dispatch only: it runs no weekly cadence, does not join `all`, and does
-  # not collect memory, latency, GPU-counter, or calibration evidence. The exact pinned artifacts
-  # are already resident on `nax-macos`; its `rw-sa3` label selects that host. The second NAX box's
-  # `rw-krea` set is the unrelated Krea Realtime video model and does not include the Krea 2 image
+  # not collect memory, latency, GPU-counter, or calibration evidence. The large Krea q4 base is
+  # resident on `nax-macos`; its `rw-sa3` label selects that host, while the lane provisions the
+  # exact manifest-pinned license and standalone Wan z16 donor. The second NAX box's `rw-krea` set
+  # is the unrelated complete Krea Realtime video model and does not include the Krea 2 image
   # snapshot. The executable itself asserts output coherence and native/Wan distinctness. A 512 px
   # run covers the normal native-default seam and a 768 px run forces multiple 512/64 decode tiles;
   # the uploaded images remain available for the acceptance criterion's artifact inspection.
@@ -2738,18 +2740,23 @@ jobs:
       - name: Bind the manifest-pinned q4 Krea tier
         run: |
           python3.12 scripts/release/export_model_snapshot_paths.py \
-          --model krea-2-turbo-mlx-q4
+          --model krea-2-turbo-mlx-q4 \
+          --model krea-realtime-14b-mlx-wan-z16-vae-q8
       - name: Install pinned model materializer
         run: |
           python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
-      - name: Ensure manifest-required Krea license
+      - name: Ensure manifest-required decoder inputs
         env:
           PYTHONPATH: ${{ runner.temp }}/huggingface-hub
-        run: >-
-          python3.12 scripts/release/ensure_model_snapshot_file.py
-          --model krea-2-turbo-mlx-q4
-          --file LICENSE.pdf
-          --cache-root "$MLX_GEN_MODELS_ROOT"
+        run: |
+          python3.12 scripts/release/ensure_model_snapshot_file.py \
+            --model krea-2-turbo-mlx-q4 \
+            --file LICENSE.pdf \
+            --cache-root "$MLX_GEN_MODELS_ROOT"
+          python3.12 scripts/release/ensure_model_snapshot_file.py \
+            --model krea-realtime-14b-mlx-wan-z16-vae-q8 \
+            --file q8/vae.safetensors \
+            --cache-root "$MLX_GEN_MODELS_ROOT"
       - name: Run fixed-seed native and Wan decoder correctness smoke
         env:
           KREA_ALTERNATE_DECODER_OUTPUT_DIR: ${{ runner.temp }}/krea-alternate-decoder

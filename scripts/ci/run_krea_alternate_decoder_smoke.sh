@@ -36,6 +36,13 @@ if [[ "${KREA_TURBO_DIR:?workflow must export the q4 manifest projection}" != */
   echo "KREA_TURBO_DIR was not exported from the pinned q4 manifest row: $KREA_TURBO_DIR" >&2
   exit 1
 fi
+if [[ \
+  "${KREA_ALTERNATE_DECODER_WAN_VAE_SNAPSHOT:?workflow must export the Wan donor manifest projection}" \
+  != */model-snapshots/krea-realtime-14b-mlx-wan-z16-vae-q8/$WAN_REVISION \
+]]; then
+  echo "Wan donor path was not exported from its pinned manifest row: $KREA_ALTERNATE_DECODER_WAN_VAE_SNAPSHOT" >&2
+  exit 1
+fi
 # The manifest exporter binds the selected key/revision to the workflow policy. This smoke consumes
 # the immutable copy already resident in the canonical HF cache rather than materializing a second
 # ~20 GiB q4 tier into RUNNER_TEMP.
@@ -47,6 +54,9 @@ export KREA_TURBO_DIR="$KREA_TIER"
 python3.12 scripts/release/verify_model_snapshot.py \
   --model krea-2-turbo-mlx-q4 \
   --snapshot "$KREA_SNAPSHOT"
+python3.12 scripts/release/verify_model_snapshot.py \
+  --model krea-realtime-14b-mlx-wan-z16-vae-q8 \
+  --snapshot "$WAN_SNAPSHOT"
 if [[ ! -f "$WAN_VAE" ]]; then
   echo "pinned Wan z16 decoder is absent: $WAN_VAE" >&2
   exit 1

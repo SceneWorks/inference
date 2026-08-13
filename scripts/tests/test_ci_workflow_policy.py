@@ -1038,9 +1038,12 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
         self.assertNotRegex(workflow, r"SA3_[A-Z0-9_]+[^\n]*[0-9a-f]{40}")
         # Thirteen SA3/SAME exporters, SC-18309's exact SDXL-VAE projection, and SC-18315's
-        # q4 Krea correctness projection plus its exact required-file materialization.
+        # q4 Krea correctness projection and standalone Wan donor plus exact-file materialization.
         self.assertEqual(workflow.count("export_model_snapshot_paths.py"), 15)
         self.assertEqual(workflow.count("--model krea-2-turbo-mlx-q4"), 2)
+        self.assertEqual(
+            workflow.count("--model krea-realtime-14b-mlx-wan-z16-vae-q8"), 2
+        )
         self.assertEqual(workflow.count("--model sdxl-base-mlx-vae-bf16"), 2)
         expected_models = {
             "same-l-metal": ("same-l",),
@@ -2017,6 +2020,8 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         )
         self.assertIn("scripts/release/ensure_model_snapshot_file.py", job)
         self.assertIn("--file LICENSE.pdf", job)
+        self.assertIn("--model krea-realtime-14b-mlx-wan-z16-vae-q8", job)
+        self.assertIn("--file q8/vae.safetensors", job)
         self.assertLess(
             job.index("scripts/release/ensure_model_snapshot_file.py"),
             job.index("scripts/ci/run_krea_alternate_decoder_smoke.sh"),
@@ -2027,6 +2032,21 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertNotIn("gpu_fault_evidence.sh", job)
         self.assertNotIn("memory.csv", job)
         self.assertNotIn("--inventory-output", job)
+
+        models = {
+            model["key"]: model
+            for model in tomllib.loads(MODEL_MANIFEST.read_text(encoding="utf-8"))["models"]
+        }
+        donor = models["krea-realtime-14b-mlx-wan-z16-vae-q8"]
+        self.assertEqual(donor["repository"], "SceneWorks/krea-realtime-14b-mlx")
+        self.assertEqual(
+            donor["revision"], "e68e9a3d98187fdf6936838ffcf6df5aa48d6626"
+        )
+        self.assertEqual(donor["download_files"], ["q8/vae.safetensors"])
+        self.assertEqual(donor["expected_files"], ["q8/vae.safetensors"])
+        self.assertEqual(
+            donor["environment"], ["KREA_ALTERNATE_DECODER_WAN_VAE_SNAPSHOT"]
+        )
 
         script = KREA_ALTERNATE_DECODER_SMOKE.read_text(encoding="utf-8")
         self.assertTrue(os.access(KREA_ALTERNATE_DECODER_SMOKE, os.X_OK))
