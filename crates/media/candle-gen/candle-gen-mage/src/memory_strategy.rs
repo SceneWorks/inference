@@ -95,9 +95,16 @@ pub fn provider_contract_for(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> gen_core::Result<MemoryProviderContract> {
+    provider_contract_with_components(provider_id, spec, crate::component_footprint(spec)?)
+}
+
+pub(crate) fn provider_contract_with_components(
+    provider_id: &str,
+    spec: &LoadSpec,
+    components: gen_core::PerComponentBytes,
+) -> gen_core::Result<MemoryProviderContract> {
     let calibration_fingerprint = fingerprint(provider_id)?;
     let streamable = streamable(spec) && transformer_has_device_format(spec)?;
-    let components = crate::component_footprint(spec)?;
     let phases = vec![
         MemoryPhase::Conditioning,
         MemoryPhase::Denoise,

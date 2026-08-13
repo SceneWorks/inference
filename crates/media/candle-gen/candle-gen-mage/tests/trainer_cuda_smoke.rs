@@ -59,6 +59,33 @@ fn run(kind: NetworkType, full: bool) {
             &candle_gen::default_device().unwrap(),
         )
         .expect("full output reloads through production Mage loader");
+        let spec = LoadSpec::new(WeightsSource::Dir(output_dir))
+            .with_component(
+                candle_gen_mage::COMPONENT_TEXT_ENCODER,
+                WeightsSource::Dir(snapshot.join("text_encoder")),
+            )
+            .with_component(
+                candle_gen_mage::COMPONENT_VAE,
+                WeightsSource::Dir(snapshot.join("vae")),
+            );
+        let generator = candle_gen_mage::load_finetuned(candle_gen_mage::MageVariant::Base, &spec)
+            .expect("trainer output loads through the public fine-tuned generation seam");
+        let request = GenerationRequest {
+            prompt: "a gold tile".into(),
+            width: 512,
+            height: 512,
+            steps: Some(1),
+            seed: Some(7),
+            ..Default::default()
+        };
+        let GenerationOutput::Images(images) = generator
+            .generate(&request, &mut |_| {})
+            .expect("fine-tuned model renders through the production generator")
+        else {
+            panic!("expected image output")
+        };
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].pixels.len(), 512 * 512 * 3);
     } else {
         let trained_suffix = match kind {
             NetworkType::Lora => ".lora_B.weight",

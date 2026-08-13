@@ -67,6 +67,9 @@ pub struct Krea2ControlPaths {
     /// registered Krea provider's validated ConvRot route. User LoRA/LoKr residuals apply over the
     /// frozen int8 projections before the control branch is composed.
     pub convrot_dit: Option<PathBuf>,
+    /// Optional caller-owned native-mmdit Krea DiT. This is mutually exclusive with
+    /// [`convrot_dit`](Self::convrot_dit) and composes with the same pose branch and adapter stack.
+    pub native_dit: Option<PathBuf>,
     /// The trained control-branch overlay checkpoint (`.safetensors`, e.g. `control_step5000.safetensors`).
     pub control: PathBuf,
     /// User LoRA/LoKr adapters applied **additively** to the frozen base DiT (sc-11720) — a character /
@@ -197,11 +200,17 @@ impl Krea2Control {
     /// Retain both phase loaders. The first warm request populates the shared pair; a staged request
     /// loads and releases each phase within `generate`.
     pub fn load(paths: &Krea2ControlPaths) -> Result<Self> {
+        if paths.convrot_dit.is_some() && paths.native_dit.is_some() {
+            return Err(CandleError::Msg(
+                "krea control: select at most one replacement DiT (ConvRot or native)".into(),
+            ));
+        }
         let device = candle_gen::default_device()?;
         let text_root = paths.root.clone();
         let text_device = device.clone();
         let heavy_root = paths.root.clone();
         let heavy_convrot_dit = paths.convrot_dit.clone();
+        let heavy_native_dit = paths.native_dit.clone();
         let heavy_control = paths.control.clone();
         let heavy_adapters = paths.adapters.clone();
         let heavy_branch_tier = paths.branch_tier;
@@ -213,6 +222,7 @@ impl Krea2Control {
                 load_control_heavy(
                     &heavy_root,
                     heavy_convrot_dit.as_deref(),
+                    heavy_native_dit.as_deref(),
                     &heavy_control,
                     &heavy_adapters,
                     heavy_branch_tier,
@@ -249,6 +259,27 @@ impl Krea2Control {
     }
 }
 
+/// Load strict-pose control around a caller-owned native-mmdit Krea DiT. The imported transformer,
+/// selected adapter stack, and control branch are all retained by one resident provider; every
+/// selected adapter must apply to the imported base or loading the heavy phase fails loudly.
+pub fn load_control_from_native_dit_file(
+    dit_file: impl AsRef<Path>,
+    base_snapshot_dir: impl AsRef<Path>,
+    control: impl AsRef<Path>,
+    adapters: &[AdapterSpec],
+) -> Result<Krea2Control> {
+    Krea2Control::load(&Krea2ControlPaths {
+        root: base_snapshot_dir.as_ref().to_path_buf(),
+        convrot_dit: None,
+        native_dit: Some(dit_file.as_ref().to_path_buf()),
+        control: control.as_ref().to_path_buf(),
+        adapters: adapters.to_vec(),
+        branch_tier: None,
+        chunk_attention: false,
+        offload_policy: OffloadPolicy::Resident,
+    })
+}
+
 /// Load the Qwen3-VL text phase exactly once per resident model or once per sequential generation.
 fn load_control_text(root: &Path, device: &Device) -> Result<Krea2ControlText> {
     let tokenizer = KreaTokenizer::from_snapshot(root, device)?;
@@ -260,9 +291,11 @@ fn load_control_text(root: &Path, device: &Device) -> Result<Krea2ControlText> {
 }
 
 /// Load the render phase after the text value has dropped on the sequential path.
+#[allow(clippy::too_many_arguments)]
 fn load_control_heavy(
     root: &Path,
     convrot_dit: Option<&Path>,
+    native_dit: Option<&Path>,
     control: &Path,
     adapters: &[AdapterSpec],
     branch_tier: Option<Quant>,
@@ -270,7 +303,7 @@ fn load_control_heavy(
     device: &Device,
 ) -> Result<Krea2ControlHeavy> {
     let cfg = Krea2Config::from_snapshot(root)?;
-    let mut dit = match control_dit_source(convrot_dit) {
+    let mut dit = match control_dit_source(convrot_dit, native_dit)? {
         ControlDitSource::Snapshot => {
             let mut dit_w = Weights::from_dir(&root.join("transformer"), device, DType::BF16)?;
             // Diff-patch (`.diff`/`.diff_b`) deltas fold into the dense baseline weights before the DiT
@@ -299,6 +332,20 @@ fn load_control_heavy(
             let mut dit = KreaTrainDit::load_inference(&dit_w, &cfg)?;
             if !adapters.is_empty() {
                 crate::adapters::install_additive(&mut dit, adapters, 0)?;
+            }
+            dit
+        }
+        ControlDitSource::Native(native_dit) => {
+            let mut dit_w = Weights::from_native_file(native_dit, device, DType::BF16)?;
+            crate::convert::validate_native_transformer(&dit_w, &cfg)?;
+            let diff = crate::adapters::fold_diff_patch(&mut dit_w, adapters)?;
+            let mut dit = KreaTrainDit::load_inference(&dit_w, &cfg)?;
+            if !adapters.is_empty() {
+                crate::adapters::install_additive_with_diff(
+                    &mut dit,
+                    adapters,
+                    &diff.applied_by_spec,
+                )?;
             }
             dit
         }
@@ -335,12 +382,20 @@ fn load_control_heavy(
 enum ControlDitSource<'a> {
     Snapshot,
     ConvRot(&'a Path),
+    Native(&'a Path),
 }
 
-fn control_dit_source(convrot_dit: Option<&Path>) -> ControlDitSource<'_> {
-    match convrot_dit {
-        Some(path) => ControlDitSource::ConvRot(path),
-        None => ControlDitSource::Snapshot,
+fn control_dit_source<'a>(
+    convrot_dit: Option<&'a Path>,
+    native_dit: Option<&'a Path>,
+) -> Result<ControlDitSource<'a>> {
+    match (convrot_dit, native_dit) {
+        (Some(_), Some(_)) => Err(CandleError::Msg(
+            "krea control: select at most one replacement DiT (ConvRot or native)".into(),
+        )),
+        (Some(path), None) => Ok(ControlDitSource::ConvRot(path)),
+        (None, Some(path)) => Ok(ControlDitSource::Native(path)),
+        (None, None) => Ok(ControlDitSource::Snapshot),
     }
 }
 
@@ -470,6 +525,7 @@ mod tests {
         Krea2ControlPaths {
             root: PathBuf::from("/nonexistent/krea-control-residency-test-snapshot"),
             convrot_dit: None,
+            native_dit: None,
             control: PathBuf::from("/nonexistent/krea-control-residency-test-overlay.safetensors"),
             adapters: Vec::new(),
             branch_tier: None,
@@ -508,10 +564,41 @@ mod tests {
     fn convrot_identity_selects_the_convrot_dit_loader() {
         let path = Path::new("/models/krea2_turbo_int8_convrot.safetensors");
         assert_eq!(
-            control_dit_source(Some(path)),
+            control_dit_source(Some(path), None).unwrap(),
             ControlDitSource::ConvRot(path)
         );
-        assert_eq!(control_dit_source(None), ControlDitSource::Snapshot);
+        assert_eq!(
+            control_dit_source(None, None).unwrap(),
+            ControlDitSource::Snapshot
+        );
+    }
+
+    #[test]
+    fn native_identity_selects_native_and_conflicts_fail_closed() {
+        let native = Path::new("/models/community-krea.safetensors");
+        let convrot = Path::new("/models/krea-convrot.safetensors");
+        assert_eq!(
+            control_dit_source(None, Some(native)).unwrap(),
+            ControlDitSource::Native(native)
+        );
+        assert!(control_dit_source(Some(convrot), Some(native)).is_err());
+
+        let model = load_control_from_native_dit_file(
+            native,
+            "/nonexistent/krea-base",
+            "/nonexistent/control.safetensors",
+            &[AdapterSpec::new(
+                "/nonexistent/user.safetensors".into(),
+                0.75,
+                candle_gen::gen_core::AdapterKind::Lora,
+            )],
+        )
+        .expect("native control construction stays lazy while retaining its complete route");
+        assert!(model
+            .residency
+            .with_resident_parts(|_, _| ())
+            .unwrap()
+            .is_none());
     }
 
     /// ConvRot + adapters is admitted and retained for the lazy heavy-phase loader.
@@ -670,6 +757,7 @@ mod tests {
         let paths = Krea2ControlPaths {
             root,
             convrot_dit,
+            native_dit: None,
             control,
             adapters: Vec::new(),
             branch_tier,
