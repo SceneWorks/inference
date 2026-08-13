@@ -78,10 +78,10 @@ pub fn descriptor() -> ModelDescriptor {
             // z16 VAE — dropping BOTH encoders (+ `clear_cache()`) before the experts, so peak unified
             // memory is already bounded to the dominant expert phase. The shared per-component footprint
             // reports the two experts as the DiT phase (the peak), so the fit-gate's staged estimate is
-            // sound. `OffloadPolicy` is not consumed — there is no Resident-warm mode to toggle. (This id
-            // is `Modality::Video`; the worker's image fit-gate does not gate on it, so advertising the
-            // flag is honest discovery parity + memory hygiene, not a behavior change.)
-            supports_sequential_offload: true,
+            // sound. `OffloadPolicy` is not consumed — there is no Resident-warm mode to toggle, so this
+            // is unconditional physical staging rather than a selectable offload control.
+            supports_sequential_offload: false,
+            unconditionally_engages_staged_residency: true,
             supports_preview: false,
             supports_streaming: false,
             supports_multi_speaker: false,
@@ -150,10 +150,10 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 /// TE/DiT/VAE render split (they are still in the worker's whole-model total). Shared by `bernini` +
 /// `bernini_renderer`.
 ///
-/// Both ids advertise `supports_sequential_offload` (sc-10840) — each is structurally always-staged
+/// Both ids declare unconditional staged residency — each is structurally always-staged
 /// (the encoders are dropped + `clear_cache()`d before the two co-resident experts load), and this split
 /// is the staged peak the fit-gate bounds (`max(encoders, DiT+VAE)`, dominated by the experts). The
-/// worker's fit-gate keys on that descriptor capability bit (there is no allowlist) and consumes this
+/// worker can consume that physical fact independently of the false selectable-control bit and this
 /// split generically through the registered footprint seam (this crate reports the bytes; the worker
 /// decides how to use them).
 pub(crate) fn component_footprint(
@@ -680,16 +680,18 @@ mod tests {
     use super::*;
     use mlx_rs::ops::multiply;
 
-    /// Component residency (epic 10834, sc-10840): the renderer advertises `supports_sequential_offload`
-    /// because it is structurally always-staged — `generate_impl` drops the UMT5 text encoder and the
+    /// Component residency (epic 10834, sc-10840): the renderer is structurally always-staged —
+    /// `generate_impl` drops the UMT5 text encoder and the
     /// source-VAE encoder (each + `clear_cache()`) before loading the two co-resident MoE experts, so
     /// peak unified memory is already bounded to the dominant expert phase (the footprint's DiT split).
     #[test]
-    fn advertises_sequential_offload() {
-        assert!(
-            descriptor().capabilities.supports_sequential_offload,
-            "bernini_renderer is always-staged (UMT5 + source-VAE dropped before the experts); it must \
-             advertise supports_sequential_offload so the fit-gate consumes the staged footprint"
+    fn declares_unconditional_staged_residency_without_a_selectable_control() {
+        let capabilities = descriptor().capabilities;
+        assert!(!capabilities.supports_sequential_offload);
+        assert!(capabilities.unconditionally_engages_staged_residency);
+        assert_eq!(
+            capabilities.staged_residency_availability(),
+            mlx_gen::StagedResidencyAvailability::UnconditionallyEngaged,
         );
     }
 

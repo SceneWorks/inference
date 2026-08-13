@@ -1735,6 +1735,22 @@ pub struct ActivationMemoryAnchor {
     pub bytes_1024: u64,
 }
 
+/// Static descriptor classification for the provider's staged-residency behavior. This describes
+/// physical execution independent of request-selected memory-strategy evidence.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StagedResidencyAvailability {
+    /// The provider neither stages components unconditionally nor offers the shared selectable
+    /// sequential-residency control.
+    #[default]
+    Absent,
+    /// The provider honors the shared selectable sequential-residency control, but does not perform
+    /// the staged load/use/drop lifecycle on every request by default.
+    Selectable,
+    /// The provider performs a staged component load/use/drop lifecycle on every request, regardless
+    /// of whether it also offers a stronger selectable sequential-residency control.
+    UnconditionallyEngaged,
+}
+
 /// What a model supports — drives `validate()` and consumer UI. `Default` is "supports
 /// nothing"; a model turns on what it offers (`Capabilities { supports_guidance: true,
 /// ..Default::default() }`).
@@ -1884,6 +1900,14 @@ pub struct Capabilities {
     /// max-single-component estimate. `Default` is `false` so an unwired engine does not over-advertise;
     /// a provider that drives the shared [`crate::runtime`] residency seam sets it `true`.
     pub supports_sequential_offload: bool,
+    /// Whether every generation physically stages eligible heavyweight components through a
+    /// load/use/drop lifecycle even when no selectable [`OffloadPolicy::Sequential`](crate::runtime::OffloadPolicy)
+    /// control is requested. This is independent of [`supports_sequential_offload`](Self::supports_sequential_offload):
+    /// MLX Wan, for example, stages phases unconditionally and also exposes a stronger selectable
+    /// Sequential mode that flushes dead allocator cache or narrows expert residency. `Default` is
+    /// `false`; this is static descriptor truth and must not be copied into request evidence
+    /// composition.
+    pub unconditionally_engages_staged_residency: bool,
 }
 
 /// Generous upper sanity caps for the unbounded counter knobs (F-004). Not model limits — each model
@@ -1897,6 +1921,20 @@ const MAX_FPS: u32 = 100_000;
 const MAX_DURATION_SECS: f32 = 1_000_000.0;
 
 impl Capabilities {
+    /// Static descriptor view of staged-residency availability. Unconditional physical staging wins
+    /// the derived classification when both independent bits are true; callers that need to know
+    /// whether the stronger selectable control also exists must inspect
+    /// [`supports_sequential_offload`](Self::supports_sequential_offload) separately.
+    pub const fn staged_residency_availability(&self) -> StagedResidencyAvailability {
+        if self.unconditionally_engages_staged_residency {
+            StagedResidencyAvailability::UnconditionallyEngaged
+        } else if self.supports_sequential_offload {
+            StagedResidencyAvailability::Selectable
+        } else {
+            StagedResidencyAvailability::Absent
+        }
+    }
+
     /// Whether this model accepts the given conditioning kind.
     pub fn accepts(&self, kind: ConditioningKind) -> bool {
         self.conditioning.contains(&kind)
@@ -2459,6 +2497,34 @@ impl Capabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn staged_residency_availability_preserves_the_two_independent_capabilities() {
+        let classify = |unconditional, selectable| {
+            Capabilities {
+                unconditionally_engages_staged_residency: unconditional,
+                supports_sequential_offload: selectable,
+                ..Default::default()
+            }
+            .staged_residency_availability()
+        };
+
+        assert_eq!(classify(false, false), StagedResidencyAvailability::Absent);
+        assert_eq!(
+            classify(false, true),
+            StagedResidencyAvailability::Selectable
+        );
+        assert_eq!(
+            classify(true, false),
+            StagedResidencyAvailability::UnconditionallyEngaged
+        );
+        assert_eq!(
+            classify(true, true),
+            StagedResidencyAvailability::UnconditionallyEngaged,
+            "unconditional physical staging wins the derived tri-state without erasing that the \
+             separate supports_sequential_offload bit is also true"
+        );
+    }
 
     #[test]
     fn default_scope_is_allowed_only_for_resident_only_contracts() {

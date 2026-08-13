@@ -562,10 +562,12 @@ pub fn descriptor() -> ModelDescriptor {
             // dropping BOTH encoders (+ `clear_cache()`) before the experts, so peak unified memory is
             // already bounded to the dominant expert phase. The per-component footprint reports the two
             // experts as the DiT phase (the peak; the planner is a smaller, earlier, dropped phase), so
-            // the fit-gate's staged estimate is sound. `OffloadPolicy` is not consumed — there is no
-            // Resident-warm mode to toggle. The one thing NOT split is the two experts, which the
+            // fit-gate's staged estimate is sound. `OffloadPolicy` is not consumed — there is no
+            // Resident-warm mode to toggle, so this is unconditional physical staging rather than a
+            // selectable offload control. The one thing NOT split is the two experts, which the
             // MoE-by-timestep denoise loop holds co-resident (see the BLOCKERS note in the PR).
-            supports_sequential_offload: true,
+            supports_sequential_offload: false,
+            unconditionally_engages_staged_residency: true,
             supports_preview: false,
             supports_streaming: false,
             supports_multi_speaker: false,
@@ -1159,16 +1161,18 @@ fn seeded_step_noise(
 mod tests {
     use super::*;
 
-    /// Component residency (epic 10834, sc-10840): Bernini advertises `supports_sequential_offload`
-    /// because it is structurally always-staged — `generate_impl` drops the planner and the T5 encoder
+    /// Component residency (epic 10834, sc-10840): Bernini is structurally always-staged —
+    /// `generate_impl` drops the planner and the T5 encoder
     /// (each + `clear_cache()`) before loading the two co-resident MoE experts, so peak unified memory
     /// is already bounded to the dominant expert phase (which the footprint reports as the DiT split).
     #[test]
-    fn advertises_sequential_offload() {
-        assert!(
-            descriptor().capabilities.supports_sequential_offload,
-            "bernini is always-staged (planner + T5 dropped before the experts); it must advertise \
-             supports_sequential_offload so the fit-gate consumes the staged footprint"
+    fn declares_unconditional_staged_residency_without_a_selectable_control() {
+        let capabilities = descriptor().capabilities;
+        assert!(!capabilities.supports_sequential_offload);
+        assert!(capabilities.unconditionally_engages_staged_residency);
+        assert_eq!(
+            capabilities.staged_residency_availability(),
+            mlx_gen::StagedResidencyAvailability::UnconditionallyEngaged,
         );
     }
 

@@ -99,6 +99,7 @@ pub fn descriptor() -> ModelDescriptor {
             supports_kv_cache: false,
             requires_sigma_shift: false,
             supports_sequential_offload: false,
+            unconditionally_engages_staged_residency: false,
             supports_preview: false,
             supports_streaming: false,
             supports_multi_speaker: false,
@@ -480,6 +481,12 @@ mod tests {
     fn descriptor_surface() {
         let d = descriptor();
         assert_eq!(d.id, MODEL_ID);
+        assert!(!d.capabilities.supports_sequential_offload);
+        assert!(!d.capabilities.unconditionally_engages_staged_residency);
+        assert_eq!(
+            d.capabilities.staged_residency_availability(),
+            candle_gen::gen_core::StagedResidencyAvailability::Absent,
+        );
         assert!(d.capabilities.supports_guidance);
         assert!(d.capabilities.supports_negative_prompt);
         assert!(!d.capabilities.supports_true_cfg);

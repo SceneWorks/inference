@@ -580,6 +580,7 @@ pub fn descriptor() -> ModelDescriptor {
             supports_kv_cache: false,
             requires_sigma_shift: false,
             supports_sequential_offload: false,
+            unconditionally_engages_staged_residency: false,
             supports_preview: false,
             supports_streaming: false,
             supports_multi_speaker: false,
@@ -1264,6 +1265,16 @@ mod tests {
         assert_eq!(g.descriptor().backend, "candle");
         assert_eq!(g.descriptor().modality, Modality::Video);
         assert!(!g.descriptor().capabilities.mac_only);
+        assert!(!g.descriptor().capabilities.supports_sequential_offload);
+        assert!(
+            !g.descriptor()
+                .capabilities
+                .unconditionally_engages_staged_residency
+        );
+        assert_eq!(
+            g.descriptor().capabilities.staged_residency_availability(),
+            candle_gen::gen_core::StagedResidencyAvailability::Absent,
+        );
     }
 
     /// sc-11061 layout contract (loader side): the exact on-disk paths [`BerniniPlanner::load`] reads
