@@ -53,6 +53,7 @@ use tokenizers::{AddedToken, Tokenizer};
 use mlx_gen::{Error, Result};
 
 use crate::denoise::packing::{TEXT_TAG, VIDEO_TAG};
+use crate::reference::ReferencePresentation;
 
 /// The seven specials MiniMax adds over upstream Qwen, in the exact order they appear in
 /// `tokenizer_config.json`'s `additional_special_tokens`. **Order is the id assignment**, so this
@@ -106,6 +107,9 @@ const PAD_TOKEN_ID: i32 = 151643;
 const VISION_START: &str = "<|vision_start|>";
 const VISION_END: &str = "<|vision_end|>";
 const IMAGE_PAD: &str = "<|image_pad|>";
+/// The pad `ref2va` **video** references occupy. `fl2va` never emits one — see
+/// [`MiniMaxH3Tokenizer::encode_fl2va`].
+const VIDEO_PAD: &str = "<|video_pad|>";
 
 /// The resolved id for every special token this crate names, derived from the shipped
 /// `tokenizer_config.json` rather than hardcoded.
@@ -351,6 +355,135 @@ impl MiniMaxH3Tokenizer {
         let prompt_ids = self.encode(prompt)?;
         tags.extend(std::iter::repeat_n(TEXT_TAG, prompt_ids.len()));
         ids.extend(prompt_ids);
+
+        if ids.len() != tags.len() {
+            return Err(Error::Msg(format!(
+                "minimax-h3 tokenizer: {} ids against {} tags",
+                ids.len(),
+                tags.len()
+            )));
+        }
+        let (input_ids, mask) = Self::to_arrays(ids)?;
+        Ok((input_ids, mask, tags))
+    }
+
+    /// Render one video reference's per-block timestamp label, `"<0.2 seconds>"`.
+    ///
+    /// The reference spells this `f"<{timestamp:.1f} seconds>"`, and Python's `format` rounds
+    /// **half to even** on the exact binary value — which is why a 2 fps pair's mean renders as
+    /// `"<0.2 seconds>"` rather than `"<0.3 seconds>"`. Rust's `{:.1}` uses the same rule on the
+    /// same value, verified over the half-way cases by
+    /// `the_timestamp_label_rounds_half_to_even_like_python`. Wrapped in a named function so the
+    /// claim has one place to be pinned rather than being an invisible property of a format string.
+    pub fn timestamp_label(seconds: f64) -> String {
+        format!("<{seconds:.1} seconds>")
+    }
+
+    /// The **`ref2va` presentation** with its per-row modality tags —
+    /// `(input_ids, attention_mask, token_tags)`.
+    ///
+    /// The sibling of [`Self::encode_fl2va`], and the differences are all semantic:
+    ///
+    /// * **Three modalities, numbered independently from 1.** `"<Picture i>"`, `"<Audio j>"` and
+    ///   `"<Video k>"` each carry their own counter, so the third image is `<Picture 3>` however
+    ///   many clips preceded it.
+    /// * **A reference that carries sound emits `"<Audio j>: "` BEFORE its visual label**, mirroring
+    ///   the order its rows are packed in. For a standalone audio reference that label is the whole
+    ///   contribution.
+    /// * **A waveform never reaches the conditioner.** An audio reference contributes a text label
+    ///   and *no* vision block — [`ReferencePresentation::Audio`] carries no token count because
+    ///   there is nothing to count.
+    /// * **A video reference emits one timestamped vision block per merged frame pair**, each
+    ///   `"<t seconds>"` label followed by its own `<|video_pad|>` block. `<|video_pad|>` appears
+    ///   only here; `fl2va` uses `<|image_pad|>` and nothing else.
+    ///
+    /// Ids and tags are built in lockstep for the same reason [`Self::encode_fl2va`] does it:
+    /// a vision block's rows are tagged **video** ([`VIDEO_TAG`]) and address a different block of
+    /// the AdaLN modulation table than the text rows around them, and that split cannot be
+    /// recovered from a finished id vector without re-scanning for pad ids.
+    pub fn encode_ref2va(
+        &self,
+        prompt: &str,
+        references: &[ReferencePresentation],
+    ) -> Result<(Array, Array, Vec<i32>)> {
+        let (start, end) = (self.special_id(VISION_START)?, self.special_id(VISION_END)?);
+        let (image_pad, video_pad) = (self.special_id(IMAGE_PAD)?, self.special_id(VIDEO_PAD)?);
+
+        let mut ids: Vec<i32> = Vec::new();
+        let mut tags: Vec<i32> = Vec::new();
+        let (mut n_image, mut n_video, mut n_audio) = (0usize, 0usize, 0usize);
+
+        // `text` and `vision` mirror the reference's two closures exactly, so the tag policy is
+        // stated once per row kind rather than repeated at each of the five emit sites.
+        let emit_text = |ids: &mut Vec<i32>, tags: &mut Vec<i32>, s: &str| -> Result<()> {
+            let t = self.encode(s)?;
+            tags.extend(std::iter::repeat_n(TEXT_TAG, t.len()));
+            ids.extend(t);
+            Ok(())
+        };
+        let emit_vision = |ids: &mut Vec<i32>, tags: &mut Vec<i32>, pad: i32, n: usize| {
+            ids.push(start);
+            ids.extend(std::iter::repeat_n(pad, n));
+            ids.push(end);
+            // `<|vision_start|>`, every pad and `<|vision_end|>` are ALL video rows.
+            tags.extend(std::iter::repeat_n(VIDEO_TAG, n + 2));
+        };
+
+        for (i, r) in references.iter().enumerate() {
+            // The `<Audio j>` label leads for every reference that contributes audio rows —
+            // a standalone audio reference and a video reference carrying its own soundtrack alike.
+            let has_audio = matches!(
+                r,
+                ReferencePresentation::Audio
+                    | ReferencePresentation::Video {
+                        has_audio: true,
+                        ..
+                    }
+            );
+            if has_audio {
+                n_audio += 1;
+                emit_text(&mut ids, &mut tags, &format!("<Audio {n_audio}>: "))?;
+            }
+            match r {
+                ReferencePresentation::Audio => {}
+                ReferencePresentation::Image { num_tokens } => {
+                    if *num_tokens == 0 {
+                        return Err(Error::Msg(format!(
+                            "minimax-h3 tokenizer: reference {i} is an image contributing no \
+                             vision tokens"
+                        )));
+                    }
+                    n_image += 1;
+                    emit_text(&mut ids, &mut tags, &format!("<Picture {n_image}>: "))?;
+                    emit_vision(&mut ids, &mut tags, image_pad, *num_tokens);
+                }
+                ReferencePresentation::Video {
+                    num_tokens,
+                    timestamps,
+                    ..
+                } => {
+                    if *num_tokens == 0 {
+                        return Err(Error::Msg(format!(
+                            "minimax-h3 tokenizer: reference {i} is a clip whose vision blocks \
+                             contribute no tokens"
+                        )));
+                    }
+                    if timestamps.is_empty() {
+                        return Err(Error::Msg(format!(
+                            "minimax-h3 tokenizer: reference {i} is a clip with no vision blocks"
+                        )));
+                    }
+                    n_video += 1;
+                    emit_text(&mut ids, &mut tags, &format!("<Video {n_video}>: "))?;
+                    for &t in timestamps {
+                        emit_text(&mut ids, &mut tags, &Self::timestamp_label(t))?;
+                        emit_vision(&mut ids, &mut tags, video_pad, *num_tokens);
+                    }
+                }
+            }
+        }
+
+        emit_text(&mut ids, &mut tags, prompt)?;
 
         if ids.len() != tags.len() {
             return Err(Error::Msg(format!(

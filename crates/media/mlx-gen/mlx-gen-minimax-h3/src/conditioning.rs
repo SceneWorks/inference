@@ -241,6 +241,104 @@ pub fn build_condition_rows(
     Ok(Some(mlx_rs::ops::concatenate_axis(&rows, 1)?))
 }
 
+/// A `ref2va` reference clip's pixels in the video VAE's space — `[1, 3, F, H, W]`.
+///
+/// The multi-frame sibling of [`crate::keyframe::keyframe_to_vae_pixels`], and it applies the same
+/// `x/255` + ImageNet normalization, because a reference takes the same two preprocessing paths a
+/// keyframe does (the VAE's here, the vision tower's `0.5/0.5` separately).
+///
+/// **Every frame must share one size.** A ragged clip would encode to a latent whose geometry does
+/// not match what the layout reserved, and the mismatch first surfaces as a shape error deep inside
+/// the DiT.
+pub fn reference_clip_to_vae_pixels(frames: &[mlx_gen::media::Image]) -> Result<Array> {
+    let Some(first) = frames.first() else {
+        return Err(Error::Msg(
+            "minimax-h3 conditioning: a reference clip has no frames".into(),
+        ));
+    };
+    let (w, h) = (first.width as i32, first.height as i32);
+    let mut per_frame = Vec::with_capacity(frames.len());
+    for (i, f) in frames.iter().enumerate() {
+        if f.width as i32 != w || f.height as i32 != h {
+            return Err(Error::Msg(format!(
+                "minimax-h3 conditioning: reference clip frame {i} is {}x{}, but frame 0 is {w}x{h} \
+                 — every frame of a clip shares one size",
+                f.width, f.height
+            )));
+        }
+        // `[1, 3, 1, H, W]` each; concatenating on the temporal axis gives `[1, 3, F, H, W]`.
+        per_frame.push(crate::keyframe::keyframe_to_vae_pixels(f)?);
+    }
+    Ok(mlx_rs::ops::concatenate_axis(&per_frame, 2)?)
+}
+
+/// One `ref2va` reference's conditioning latent: encode, sample, fp16, normalize.
+///
+/// The multi-frame sibling of [`encode_keyframe_condition`] and deliberately the *same* arithmetic
+/// — the reference implementation calls one `encode_vae_condition` for a keyframe, a reference image
+/// and a reference clip alike, so this differs from the keyframe entry point only in accepting more
+/// than one frame.
+///
+/// `pixels` is `[1, 3, F, H, W]`. The result is `[1, latent_channels, F', H/16, W/16]` at **this
+/// reference's own resolution** — references are not fitted to the generated canvas.
+pub fn encode_reference_condition(
+    vae: &MiniMaxH3VideoVae,
+    pixels: &Array,
+    noise: &KeyframeNoise,
+    index: usize,
+) -> Result<Array> {
+    let s = pixels.shape();
+    if s.len() != 5 || s[0] != 1 || s[1] != 3 || s[2] < 1 {
+        return Err(Error::Msg(format!(
+            "minimax-h3 conditioning: a reference is [1, 3, F, H, W] with F >= 1, got {s:?}"
+        )));
+    }
+    let posterior: DiagonalGaussian = vae.encode(pixels)?;
+    let (sample_noise, _) = noise.draw(posterior.mean().shape(), index)?;
+    let sampled = posterior.sample_with(&sample_noise)?;
+    vae.normalize(&fp16_round_trip(&sampled)?)
+}
+
+/// Snap a reference clip's frame count **down** to the `17n + 5` lattice the video VAE encodes
+/// without padding.
+///
+/// Down, not up: padding a short reference would condition on frames that do not exist. This only
+/// bites when the reference is shorter than the target, whose own count already has that form.
+/// Returns at least [`crate::denoise::LEGAL_FRAME_COUNTS`]'s lattice base, `5`.
+pub fn snap_reference_frames_down(num_frames: usize) -> usize {
+    // `17n + 5` in the VAE's own terms: `frames_per_chunk = 17`, `latents_per_chunk = 5`.
+    const FRAMES_PER_CHUNK: usize = 17;
+    const LATENTS_PER_CHUNK: usize = 5;
+    let n = num_frames.saturating_sub(LATENTS_PER_CHUNK) / FRAMES_PER_CHUNK;
+    n.max(1) * FRAMES_PER_CHUNK + LATENTS_PER_CHUNK
+}
+
+/// The **clean** reference-soundtrack rows of one encoded soundtrack, reshaped channel-major.
+///
+/// `normalized` is the audio VAE posterior's **mean**, already normalized by the component's
+/// `latents_mean` / `latents_std`, shaped `[channels, num_audio_latents, audio_latent_channels]`.
+/// The result is `[1, channels · num_audio_latents, audio_latent_channels]`.
+///
+/// # Two things here are deliberate and neither is obvious
+///
+/// * **The posterior is never sampled.** A soundtrack takes the distribution's *mode*, unlike a
+///   visual condition which draws a sample at [`KEYFRAME_ENCODE_SEED`]. Sampling it would make a
+///   reference soundtrack vary per call for no reason the model was trained with.
+/// * **The rows ride clean, at `t = 1.0`.** They are *not* noise-augmented to
+///   [`KEYFRAME_NOISE_AUG_T`] the way visual anchors are — that is what
+///   [`crate::denoise::RowClass::ConditionAudio`] exists to express, and applying the visual
+///   augmentation here would be the plausible wrong answer.
+pub fn reference_audio_rows(normalized: &Array) -> Result<Array> {
+    let s = normalized.shape();
+    if s.len() != 3 {
+        return Err(Error::Msg(format!(
+            "minimax-h3 conditioning: reference audio latents are [channels, latents, features], \
+             got {s:?}"
+        )));
+    }
+    Ok(normalized.reshape(&[1, s[0] * s[1], s[2]])?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

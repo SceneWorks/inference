@@ -85,6 +85,22 @@ pub struct LinearBias {
 }
 
 impl LinearBias {
+    /// The loaded weight, at its published dtype.
+    ///
+    /// Read-only, and exposed so a test can assert **which checkpoint** a loaded model carries.
+    /// `transformer/` and `transformer_ref/` are structurally identical — byte-identical configs,
+    /// the same 638 tensor names — so the only thing that separates them is a value, and the only
+    /// honest place to read that value is off the loaded model rather than off a file the loader
+    /// may never have opened. See `tests/ref2va_checkpoint.rs`.
+    pub fn weight(&self) -> &Array {
+        &self.weight
+    }
+
+    /// The loaded bias, at its published dtype. See [`Self::weight`] for why this is readable.
+    pub fn bias(&self) -> &Array {
+        &self.bias
+    }
+
     /// Load `{prefix}.weight` / `{prefix}.bias` **at their published dtype**, checking the shape.
     ///
     /// The dtype is deliberately not a parameter: these tensors are the mixed-precision half of the

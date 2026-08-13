@@ -1023,6 +1023,13 @@ impl GenerationRequest {
                 } if !s.is_finite() => {
                     return Some(("conditioning.reference_audio.strength", *s));
                 }
+                // A reference clip's declared rate (sc-17149). Not a cosmetic label: it is the
+                // divisor of the resample stride that picks which frames the model actually reads,
+                // so a NaN propagates into a frame-index computation rather than into denoise math
+                // — the same class of silent poisoning, one step earlier.
+                Conditioning::ReferenceVideo { fps, .. } if !fps.is_finite() => {
+                    return Some(("conditioning.reference_video.fps", *fps));
+                }
                 // The audio-edit strength and its region bounds all flow into the edit-window /
                 // blend math; a NaN would silently poison the region conversion or the strength
                 // gate (sc-12847).
@@ -1249,6 +1256,10 @@ pub fn default_seed() -> u64 {
 /// [`VideoClip`](Conditioning::VideoClip) / [`ControlClip`](Conditioning::ControlClip) is
 /// **keyframe-append** (append the clip's VAE latents as extra in-context tokens — extend_clip /
 /// video_bridge / replace_person, the IC-LoRA path).
+///
+/// [`Conditioning::ReferenceVideo`] (sc-17149) is a **third** video mechanism and not part of that
+/// pair: both epic-3040 mechanisms place their clip at an index in the generated timeline, and a
+/// reference has no such index at all — it conditions the render without appearing in it.
 #[derive(Clone, Debug)]
 pub enum Conditioning {
     /// img2img / IP-Adapter / identity reference.
@@ -1261,6 +1272,66 @@ pub enum Conditioning {
     ReferenceAudio {
         audio: AudioTrack,
         strength: Option<f32>,
+    },
+    /// A reference **video** clip — the video analogue of [`Conditioning::Reference`] /
+    /// [`Conditioning::ReferenceAudio`], completing the reference triple (sc-17149). A motion and
+    /// camera reference the model conditions on, optionally carrying **its own soundtrack**.
+    ///
+    /// A reference has **no position in the generated timeline** — that is what separates it from
+    /// every other video-frame variant. It is not spliced into the output at an index, it does not
+    /// bind the output geometry, and it is not softened by a caller-supplied denoise mask; it is
+    /// encoded at its own resolution and packed as extra fully-pinned rows the denoise loop never
+    /// writes. Its placement comes from its **ordinal in the request's `conditioning` list**, which
+    /// is why that list is an ordered `Vec` and why reordering references is a different request.
+    ///
+    /// This is a **distinct variant**, deliberately not an overload of the two existing carriers:
+    ///
+    /// - It is **not** [`Conditioning::VideoClip`]. That is the LTX in-context *latent-append* path,
+    ///   whose whole contract is the two fields a reference cannot use: `frame_idx` (a position in
+    ///   the generated timeline) and `strength` (a `1 − strength` denoise mask). A reference has
+    ///   neither, so riding `VideoClip` means shipping a vocabulary in which two of three fields are
+    ///   constants a provider must reject — and it still cannot carry the two things a reference
+    ///   genuinely needs, `fps` and `audio`.
+    /// - It is **not** [`Conditioning::VideoSync`]. That is the Foley condition (sc-13436): frames
+    ///   an audio decoder attends to in order to score a *supplied silent clip*, explicitly "not
+    ///   spliced into a video latent". A reference video *is* VAE-encoded into latent rows and
+    ///   conditions a *generated* clip. Advertising `VideoSync` would advertise a Foley capability,
+    ///   and the kind is what routing reads.
+    ///
+    /// # `fps` is required data, not a hint
+    ///
+    /// A model resamples a reference onto its own frame rate by dropping and duplicating whole
+    /// frames, so a clip whose real rate was lost is conditioned on **at the wrong speed with
+    /// nothing to raise about it**. That is why the rate is a bare `f32` here rather than an
+    /// `Option` with a plausible default.
+    ///
+    /// This does **not** contradict the single-source-of-truth argument [`Conditioning::VideoSync`]
+    /// makes for reading the request-level [`GenerationRequest::fps`]: that field is the rate of the
+    /// *generated output*, whereas this one is the rate of *supplied input media*. For a variant
+    /// whose defining property is that it does not bind the output timeline, the two are genuinely
+    /// different quantities and a model may legally reject an output rate it happily accepts as an
+    /// input rate. Reusing `req.fps` for both would pin every reference to the output rate.
+    ///
+    /// # `audio` is the reference's own soundtrack
+    ///
+    /// `Some(track)` conditions on the clip's own soundtrack, aligned with its video rows and
+    /// sharing their origin on the model's rotary clock. This is **not** the same request as sending
+    /// the same waveform as a separate [`Conditioning::ReferenceAudio`], which is a *standalone*
+    /// reference occupying its own slot — a distinction models with per-modality reference caps also
+    /// count differently. `None` conditions on motion alone.
+    ///
+    /// A model opts in by advertising [`ConditioningKind::ReferenceVideo`] in
+    /// [`Capabilities::conditioning`]; the shared floor rejects the variant on a non-advertising
+    /// model as the typed [`Error::Unsupported`] (F-008), an empty `frames` as [`Error::Msg`], and a
+    /// non-finite `fps` through the same finiteness floor that owns every other conditioning float.
+    /// Per-model rate, resolution and cap bounds are layered by the provider's own `validate`.
+    ReferenceVideo {
+        frames: Vec<Image>,
+        /// **The rate `frames` actually carry** — see the variant docs.
+        fps: f32,
+        /// This clip's own soundtrack, conditioned on as the reference's own rather than as a
+        /// reference of its own. `None` conditions on motion alone.
+        audio: Option<AudioTrack>,
     },
     /// **Prompted source-audio editing** (sc-12847) — the audio analogue of the image lane's masked
     /// edit / inpaint conditioning ([`Conditioning::Mask`] and the region-carrying
@@ -1455,6 +1526,7 @@ impl Conditioning {
         match self {
             Conditioning::Reference { .. } => ConditioningKind::Reference,
             Conditioning::ReferenceAudio { .. } => ConditioningKind::ReferenceAudio,
+            Conditioning::ReferenceVideo { .. } => ConditioningKind::ReferenceVideo,
             Conditioning::AudioEdit { .. } => ConditioningKind::AudioEdit,
             Conditioning::AudioEditRegions { .. } => ConditioningKind::AudioEditRegions,
             Conditioning::VoiceEmbedding { .. } => ConditioningKind::VoiceEmbedding,
@@ -1499,6 +1571,12 @@ pub enum ConditioningKind {
     Reference,
     /// Voice/style reference audio ([`Conditioning::ReferenceAudio`]).
     ReferenceAudio,
+    /// Motion/camera reference video, optionally with its own soundtrack
+    /// ([`Conditioning::ReferenceVideo`], sc-17149). A **distinct** kind from
+    /// [`VideoClip`](Self::VideoClip): a reference has no position in the generated timeline and no
+    /// denoise mask, so the two carry disjoint payloads and default-deny keeps every existing
+    /// in-context-clip provider from being handed a reference it would splice into the output.
+    ReferenceVideo,
     /// Prompted source-audio editing ([`Conditioning::AudioEdit`]).
     AudioEdit,
     /// **Multi-region** prompted source-audio editing ([`Conditioning::AudioEditRegions`],
@@ -2398,6 +2476,30 @@ impl Capabilities {
                     return Err(Error::Msg(format!(
                         "{id}: VideoSync conditioning carries no frames — a video→audio clip must \
                          have at least one frame"
+                    )));
+                }
+            }
+        }
+        // A reference clip (sc-17149) must carry frames, and must carry the rate they were shot at.
+        // The rate is checked for **positivity** here and not only finiteness, unlike every other
+        // conditioning float the floor owns: those feed denoise math where 0.0 is a meaningful
+        // (inert) value, whereas a rate of 0 or below has no reading at all — it makes the resample
+        // stride undefined or negative, and the frames a model would then read are arbitrary rather
+        // than merely unweighted. Per-model rate *bounds* stay with the provider, which knows what
+        // it resamples onto.
+        for c in &req.conditioning {
+            if let Conditioning::ReferenceVideo { frames, fps, .. } = c {
+                if frames.is_empty() {
+                    return Err(Error::Msg(format!(
+                        "{id}: ReferenceVideo conditioning carries no frames — a reference clip \
+                         must have at least one frame"
+                    )));
+                }
+                if !fps.is_finite() || *fps <= 0.0 {
+                    return Err(Error::Msg(format!(
+                        "{id}: ReferenceVideo conditioning declares a frame rate of {fps} — a \
+                         reference clip is resampled from the rate it carries, so the rate must be \
+                         a positive finite number"
                     )));
                 }
             }
@@ -4562,6 +4664,148 @@ mod tests {
             "empty VideoSync frames → Msg, got {err:?}"
         );
         assert!(err.to_string().contains("carries no frames"));
+    }
+
+    // ---- Reference video conditioning (sc-17149) -------------------------------------------
+
+    /// A video model that admits the `ReferenceVideo` kind.
+    fn ref_video_caps() -> Capabilities {
+        Capabilities {
+            conditioning: vec![ConditioningKind::ReferenceVideo],
+            max_count: 1,
+            min_size: 8,
+            max_size: 2048,
+            ..Default::default()
+        }
+    }
+
+    /// A reference-video request. `fps` is on the **variant** (the clip's own rate), and the
+    /// request's own `fps` is deliberately left unset — the two are different quantities.
+    fn ref_video_req(frame_count: usize, fps: f32, audio: Option<AudioTrack>) -> GenerationRequest {
+        GenerationRequest {
+            prompt: "the same subject, new scene".into(),
+            width: 64,
+            height: 64,
+            conditioning: vec![Conditioning::ReferenceVideo {
+                frames: (0..frame_count).map(|_| img(8, 8)).collect(),
+                fps,
+                audio,
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn reference_video_maps_to_its_own_kind() {
+        // Distinct from every other video-frame carrier. If this ever collapsed onto VideoClip, an
+        // in-context-clip provider would start receiving references it would splice into the output.
+        let req = ref_video_req(3, 30.0, None);
+        assert_eq!(req.conditioning[0].kind(), ConditioningKind::ReferenceVideo);
+        // And it is not collected by the epic-3040 in-context accessors: a reference has no position
+        // in the generated timeline, so it is not an extend_clip / keyframe / replace_person input.
+        assert!(req.video_clips().is_empty());
+        assert!(req.control_clip().is_none());
+        assert!(req.keyframes().is_empty());
+    }
+
+    #[test]
+    fn reference_video_accepted_when_advertised() {
+        let c = ref_video_caps();
+        c.validate_request("refvid", &ref_video_req(4, 30.0, None))
+            .expect("an advertised reference clip is legal");
+        // Carrying its own soundtrack changes nothing at the floor — the pairing rules that do
+        // exist are per-model and layered by the provider's own validate.
+        c.validate_request("refvid", &ref_video_req(4, 24.0, Some(track())))
+            .expect("a reference clip with its own soundtrack is legal");
+    }
+
+    #[test]
+    fn reference_video_unsupported_on_a_non_advertising_model() {
+        // F-008: default-deny. A provider that advertises the in-context clip kind but not the
+        // reference kind must still reject a reference — this is the arm that makes the two kinds
+        // worth separating in the first place.
+        let c = Capabilities {
+            conditioning: vec![ConditioningKind::VideoClip],
+            max_count: 1,
+            min_size: 8,
+            max_size: 2048,
+            ..Default::default()
+        };
+        let err = c
+            .validate_request("ltx", &ref_video_req(2, 24.0, None))
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Unsupported(_)),
+            "un-advertised ReferenceVideo → typed Unsupported, got {err:?}"
+        );
+        // The capability verdict outranks a payload-*shape* problem: an empty reference on a model
+        // that does not admit the kind is still `Unsupported`, because the caller's first problem is
+        // that this model cannot do this at all.
+        let err = c
+            .validate_request("ltx", &ref_video_req(0, 24.0, None))
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Unsupported(_)),
+            "capability gap outranks payload shape, got {err:?}"
+        );
+        // The finiteness floor is the one exception, and it is deliberate and pre-existing: it runs
+        // ahead of the conditioning allowlist for *every* float in the request, so a NaN rate is
+        // reported as the non-finite float it is even on a model that would have refused the kind.
+        // Pinned here so a future reordering of the floor is a visible decision rather than a
+        // silent change of which error a caller sees.
+        let err = c
+            .validate_request("ltx", &ref_video_req(2, f32::NAN, None))
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Msg(m) if m.contains("conditioning.reference_video.fps")),
+            "the finiteness floor precedes the allowlist, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn reference_video_empty_frames_is_a_msg_range_error() {
+        let c = ref_video_caps();
+        let err = c
+            .validate_request("refvid", &ref_video_req(0, 24.0, None))
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Msg(_)),
+            "empty ReferenceVideo frames → Msg, got {err:?}"
+        );
+        assert!(err.to_string().contains("carries no frames"));
+    }
+
+    #[test]
+    fn reference_video_rejects_a_rate_that_has_no_reading() {
+        // Zero and negative are refused as well as non-finite, and that is deliberate: a rate is the
+        // divisor of a resample stride, so unlike every other conditioning float 0.0 is not a
+        // meaningful inert value here — it makes the set of frames the model reads arbitrary.
+        let c = ref_video_caps();
+        for bad in [0.0f32, -24.0, f32::NAN, f32::INFINITY] {
+            let err = c
+                .validate_request("refvid", &ref_video_req(2, bad, None))
+                .unwrap_err();
+            assert!(matches!(err, Error::Msg(_)), "fps {bad} → Msg, got {err:?}");
+        }
+        // A legal rate on the same shape passes, so the loop above is not passing because the
+        // request is malformed for some unrelated reason.
+        c.validate_request("refvid", &ref_video_req(2, 30.0, None))
+            .expect("30 fps is a legal rate");
+    }
+
+    #[test]
+    fn reference_video_rate_joins_the_finiteness_floor() {
+        // The floor is a separate mechanism from validate()'s range check above, and it names the
+        // offending field. Both must cover the rate: the floor is what providers reading the
+        // conditioning directly rely on.
+        let (field, value) = ref_video_req(2, f32::NAN, None)
+            .first_nonfinite_float()
+            .expect("NaN fps must be caught");
+        assert_eq!(field, "conditioning.reference_video.fps");
+        assert!(value.is_nan());
+        assert!(ref_video_req(2, 30.0, None)
+            .first_nonfinite_float()
+            .is_none());
     }
 
     /// sc-13884: the default request carries no phases (single-phase, byte-for-byte the pre-13884
