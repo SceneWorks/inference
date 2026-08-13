@@ -36,7 +36,7 @@ use mlx_rs::ops::{
     add, broadcast_to, concatenate_axis, cos, multiply, power, sigmoid, sin, split, tanh,
 };
 use mlx_rs::transforms::checkpoint;
-use mlx_rs::transforms::compile::compile;
+use mlx_rs::transforms::compile::{compile, compile_retained};
 use mlx_rs::{Array, Dtype};
 
 use crate::config::{WanModelConfig, WanQuant};
@@ -52,45 +52,127 @@ use crate::text_encoder::gelu_tanh;
 // so the tiny reference-parity gates run the eager form and `compile_parity.rs` can A/B both.
 //
 // The toggle + its RAII [`CompileGlueGuard`] are hoisted into core (F-104); re-export core's so the
-// process-global is shared with the FLUX family rather than each crate hand-rolling its own `AtomicBool`.
+// request/thread-local setting is shared with the FLUX family.
 pub(crate) use mlx_gen::nn::compile_glue;
 pub use mlx_gen::nn::{set_compile_glue, CompileGlueGuard};
+
+use mlx_gen::nn::{retained_compilation_requested, RetainedTernary, RetainedUnary};
+
+const SITE_MODULATE: &str = "wan::transformer::modulate";
+const SITE_GATED: &str = "wan::transformer::gated";
+const SITE_GELU_FFN: &str = "wan::transformer::gelu_ffn";
+
+fn modulate_impl(
+    (m, scale, shift): (&Array, &Array, &Array),
+) -> std::result::Result<Array, Exception> {
+    add(&multiply(m, &add(scale, scalar(1.0))?)?, shift)
+}
+
+fn gated_impl((x, y, gate): (&Array, &Array, &Array)) -> std::result::Result<Array, Exception> {
+    add(x, &multiply(y, gate)?)
+}
+
+fn gelu_ffn_impl(x: &Array) -> std::result::Result<Array, Exception> {
+    let dt = x.dtype();
+    let s = |v: f32| -> std::result::Result<Array, Exception> { scalar(v).as_dtype(dt) };
+    let c = (2.0_f64 / std::f64::consts::PI).sqrt() as f32;
+    let x3 = power(x, Array::from_int(3))?;
+    let inner = multiply(&add(x, &multiply(&x3, &s(0.044_715)?)?)?, &s(c)?)?;
+    let gate = add(&tanh(&inner)?, &s(1.0)?)?;
+    multiply(&multiply(x, &s(0.5)?)?, &gate)
+}
+
+struct WanRetainedCompileGlue {
+    modulate: RetainedTernary,
+    gated: RetainedTernary,
+    gelu_ffn: RetainedUnary,
+}
+
+impl WanRetainedCompileGlue {
+    fn new() -> Self {
+        Self {
+            modulate: RetainedTernary::new(compile_retained(modulate_impl, true)),
+            gated: RetainedTernary::new(compile_retained(gated_impl, true)),
+            gelu_ffn: RetainedUnary::new(compile_retained(gelu_ffn_impl, true)),
+        }
+    }
+}
+
+thread_local! {
+    static RETAINED_COMPILE_GLUE: std::cell::RefCell<Option<WanRetainedCompileGlue>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn with_retained_compile_glue<T>(
+    f: impl FnOnce(&mut WanRetainedCompileGlue) -> std::result::Result<T, Exception>,
+) -> std::result::Result<T, Exception> {
+    mlx_gen::nn::prepare_retained_compilation_thread();
+    RETAINED_COMPILE_GLUE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        f(slot.get_or_insert_with(WanRetainedCompileGlue::new))
+    })
+}
+
+/// Exercise every retained handle owned by the Wan transformer once for the release memory audit.
+#[doc(hidden)]
+pub fn exercise_retained_compile_inventory(input: &Array) -> Result<()> {
+    let output = with_retained_compile_glue(|compiled| {
+        compiled.modulate.call(SITE_MODULATE, (input, input, input))
+    })?;
+    output.eval()?;
+    drop(output);
+
+    let output = with_retained_compile_glue(|compiled| {
+        compiled.gated.call(SITE_GATED, (input, input, input))
+    })?;
+    output.eval()?;
+    drop(output);
+
+    let output =
+        with_retained_compile_glue(|compiled| compiled.gelu_ffn.call(SITE_GELU_FFN, input))?;
+    output.eval()?;
+    drop(output);
+    Ok(())
+}
 
 /// adaLN affine `m·(1+e_scale)+e_shift` — one fused kernel when compiled, else 2 eager ops. The
 /// `mx.compile` graph is bit-exact to the eager form (proven `max|Δ|=0`, `tests/compile_micro.rs`).
 fn modulate(m: &Array, e_scale: &Array, e_shift: &Array) -> Result<Array> {
-    let f = |(m, s, sh): (&Array, &Array, &Array)| -> std::result::Result<Array, Exception> {
-        add(&multiply(m, &add(s, scalar(1.0))?)?, sh)
-    };
     if compile_glue() {
-        mlx_gen::diagnostics::record_compile(
-            "wan::transformer::modulate",
-            mlx_gen::diagnostics::CompileDisposition::OneShot,
-        );
-        Ok(compile(f, true)((m, e_scale, e_shift))?)
+        if retained_compilation_requested() {
+            Ok(with_retained_compile_glue(|compiled| {
+                compiled.modulate.call(SITE_MODULATE, (m, e_scale, e_shift))
+            })?)
+        } else {
+            mlx_gen::diagnostics::record_compile(
+                SITE_MODULATE,
+                mlx_gen::diagnostics::CompileDisposition::OneShot,
+            );
+            Ok(compile(modulate_impl, true)((m, e_scale, e_shift))?)
+        }
     } else {
-        mlx_gen::diagnostics::record_fallback(
-            "wan::transformer::modulate",
-            "compiled_glue_disabled",
-        );
-        Ok(f((m, e_scale, e_shift))?)
+        mlx_gen::diagnostics::record_fallback(SITE_MODULATE, "compiled_glue_disabled");
+        Ok(modulate_impl((m, e_scale, e_shift))?)
     }
 }
 
 /// Gated residual `x + y·gate` — one fused kernel when compiled.
 fn gated(x: &Array, y: &Array, gate: &Array) -> Result<Array> {
-    let f = |(x, y, g): (&Array, &Array, &Array)| -> std::result::Result<Array, Exception> {
-        add(x, &multiply(y, g)?)
-    };
     if compile_glue() {
-        mlx_gen::diagnostics::record_compile(
-            "wan::transformer::gated",
-            mlx_gen::diagnostics::CompileDisposition::OneShot,
-        );
-        Ok(compile(f, true)((x, y, gate))?)
+        if retained_compilation_requested() {
+            Ok(with_retained_compile_glue(|compiled| {
+                compiled.gated.call(SITE_GATED, (x, y, gate))
+            })?)
+        } else {
+            mlx_gen::diagnostics::record_compile(
+                SITE_GATED,
+                mlx_gen::diagnostics::CompileDisposition::OneShot,
+            );
+            Ok(compile(gated_impl, true)((x, y, gate))?)
+        }
     } else {
-        mlx_gen::diagnostics::record_fallback("wan::transformer::gated", "compiled_glue_disabled");
-        Ok(f((x, y, gate))?)
+        mlx_gen::diagnostics::record_fallback(SITE_GATED, "compiled_glue_disabled");
+        Ok(gated_impl((x, y, gate))?)
     }
 }
 
@@ -99,26 +181,141 @@ fn gated(x: &Array, y: &Array, gate: &Array) -> Result<Array> {
 /// per-step glue cost — ~600 MB bf16 tensor × 40 layers, sc-2957). Off ⇒ defers to core `gelu_tanh`.
 fn gelu_ffn(x: &Array) -> Result<Array> {
     if !compile_glue() {
-        mlx_gen::diagnostics::record_fallback(
-            "wan::transformer::gelu_ffn",
-            "compiled_glue_disabled",
-        );
+        mlx_gen::diagnostics::record_fallback(SITE_GELU_FFN, "compiled_glue_disabled");
         return gelu_tanh(x);
     }
-    let f = |x_: &Array| -> std::result::Result<Array, Exception> {
-        let dt = x_.dtype();
-        let s = |v: f32| -> std::result::Result<Array, Exception> { scalar(v).as_dtype(dt) };
-        let c = (2.0_f64 / std::f64::consts::PI).sqrt() as f32;
-        let x3 = power(x_, Array::from_int(3))?;
-        let inner = multiply(&add(x_, &multiply(&x3, &s(0.044_715)?)?)?, &s(c)?)?;
-        let gate = add(&tanh(&inner)?, &s(1.0)?)?;
-        multiply(&multiply(x_, &s(0.5)?)?, &gate)
+    if retained_compilation_requested() {
+        Ok(with_retained_compile_glue(|compiled| {
+            compiled.gelu_ffn.call(SITE_GELU_FFN, x)
+        })?)
+    } else {
+        mlx_gen::diagnostics::record_compile(
+            SITE_GELU_FFN,
+            mlx_gen::diagnostics::CompileDisposition::OneShot,
+        );
+        Ok(compile(gelu_ffn_impl, true)(x)?)
+    }
+}
+
+#[cfg(test)]
+mod retained_compile_tests {
+    use super::*;
+    use mlx_gen::diagnostics::{
+        self, CompileDisposition, DiagnosticCounter, ToggleDisposition, RETAINED_COMPILATION,
     };
-    mlx_gen::diagnostics::record_compile(
-        "wan::transformer::gelu_ffn",
-        mlx_gen::diagnostics::CompileDisposition::OneShot,
-    );
-    Ok(compile(f, true)(x)?)
+    use mlx_rs::ops::array_eq;
+
+    fn same(lhs: &Array, rhs: &Array) -> bool {
+        array_eq(lhs, rhs, None).unwrap().item::<bool>()
+    }
+
+    #[test]
+    fn retained_transformer_glue_reuses_every_site_across_requests() {
+        RETAINED_COMPILE_GLUE.with(|slot| *slot.borrow_mut() = None);
+        let x = Array::from_slice(&[1.0f32, -2.0, 3.0, 0.5], &[1, 1, 4]);
+        let scale = Array::from_slice(&[0.5f32, 0.25, -0.5, 2.0], &[1, 1, 4]);
+        let shift = Array::from_slice(&[2.0f32, 2.0, 2.0, 2.0], &[1, 1, 4]);
+
+        set_compile_glue(false);
+        let eager_modulate = modulate(&x, &scale, &shift).unwrap();
+        let eager_gated = gated(&x, &shift, &scale).unwrap();
+        let eager_gelu = gelu_ffn(&x).unwrap();
+
+        set_compile_glue(true);
+        let scope = diagnostics::begin_request_with_toggles(
+            "wan-retained-glue",
+            "wan",
+            &[RETAINED_COMPILATION],
+        )
+        .unwrap();
+        for (first, second, eager) in [
+            (
+                modulate(&x, &scale, &shift).unwrap(),
+                modulate(&x, &scale, &shift).unwrap(),
+                &eager_modulate,
+            ),
+            (
+                gated(&x, &shift, &scale).unwrap(),
+                gated(&x, &shift, &scale).unwrap(),
+                &eager_gated,
+            ),
+            (gelu_ffn(&x).unwrap(), gelu_ffn(&x).unwrap(), &eager_gelu),
+        ] {
+            assert!(same(&first, eager));
+            assert!(same(&second, eager));
+        }
+        let report = scope.finish();
+        for site in [SITE_MODULATE, SITE_GATED, SITE_GELU_FFN] {
+            for disposition in [
+                CompileDisposition::RetainedMiss,
+                CompileDisposition::RetainedHit,
+            ] {
+                assert!(report.counters.iter().any(|counter| matches!(
+                    counter,
+                    DiagnosticCounter::Compile {
+                        site: recorded_site,
+                        disposition: recorded_disposition,
+                        count: 1,
+                    } if *recorded_site == site && *recorded_disposition == disposition
+                )));
+            }
+        }
+        assert!(report.counters.iter().any(|counter| matches!(
+            counter,
+            DiagnosticCounter::Toggle {
+                toggle: RETAINED_COMPILATION,
+                disposition: ToggleDisposition::Applied,
+                count: 6,
+            }
+        )));
+
+        let next = diagnostics::begin_request_with_toggles(
+            "wan-retained-glue-next",
+            "wan",
+            &[RETAINED_COMPILATION],
+        )
+        .unwrap();
+        assert!(same(&gated(&x, &shift, &scale).unwrap(), &eager_gated));
+        let next = next.finish();
+        assert!(next.counters.iter().any(|counter| matches!(
+            counter,
+            DiagnosticCounter::Compile {
+                site: SITE_GATED,
+                disposition: CompileDisposition::RetainedHit,
+                count: 1,
+            }
+        )));
+
+        let baseline = diagnostics::begin_request("wan-oneshot-glue", "wan").unwrap();
+        assert!(same(
+            &modulate(&x, &scale, &shift).unwrap(),
+            &eager_modulate
+        ));
+        assert!(same(&gated(&x, &shift, &scale).unwrap(), &eager_gated));
+        assert!(same(&gelu_ffn(&x).unwrap(), &eager_gelu));
+        let baseline = baseline.finish();
+        for site in [SITE_MODULATE, SITE_GATED, SITE_GELU_FFN] {
+            assert!(baseline.counters.iter().any(|counter| matches!(
+                counter,
+                DiagnosticCounter::Compile {
+                    site: recorded_site,
+                    disposition: CompileDisposition::OneShot,
+                    count: 1,
+                } if *recorded_site == site
+            )));
+        }
+        assert!(!baseline.counters.iter().any(|counter| matches!(
+            counter,
+            DiagnosticCounter::Toggle {
+                toggle: RETAINED_COMPILATION,
+                disposition: ToggleDisposition::Applied,
+                ..
+            }
+        )));
+
+        set_compile_glue(false);
+        RETAINED_COMPILE_GLUE.with(|slot| *slot.borrow_mut() = None);
+    }
 }
 
 /// Load a biased `[out, in]` Linear as a core [`AdaptableLinear`] (every Wan DiT `nn.Linear` is

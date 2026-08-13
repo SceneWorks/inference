@@ -20,7 +20,7 @@ use mlx_gen::nn::{gated, gelu_tanh, silu};
 /// Re-exported so the model's denoise loop can enable the shared `mx.compile` fusion of the DiT's
 /// elementwise glue (adaLN modulate + gated residuals), matching FLUX.1/FLUX.2 (F-101/F-102).
 /// [`CompileGlueGuard`] is the RAII form the production denoise binds so the toggle is restored on
-/// drop (F-007) instead of leaking the process-global on.
+/// drop (F-007) instead of leaking the render thread's setting into later work.
 pub use mlx_gen::nn::{set_compile_glue, CompileGlueGuard};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};

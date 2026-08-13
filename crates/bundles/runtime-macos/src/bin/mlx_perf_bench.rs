@@ -5,6 +5,7 @@ compile_error!("mlx-perf-bench is supported only on macOS with an MLX Metal devi
 mod pinned_artifact;
 
 use mlx_rs::memory::{clear_cache, get_cache_memory, get_peak_memory, reset_peak_memory};
+use mlx_rs::transforms::compile::clear_cache as clear_compile_cache;
 use pinned_artifact::{scavenge_stale_snapshots, OwnedPinnedArtifact, VerifiedPinnedArtifact};
 use runtime_macos::gen_core::{
     GenerationOutput, GenerationRequest, LoadSpec, Progress, Quant, WeightsSource,
@@ -23,10 +24,10 @@ use runtime_macos::perf_bench::{
     PhaseMetrics, PhaseSet, ProgressReceipt, ProviderCapabilityReceipt, RunRecord, StepReceipt,
     VariantPlan, WorkloadCase, MEMORY_SAMPLE_INTERVAL_MICROS, RUN_SCHEMA_VERSION,
 };
-use serde::de::DeserializeOwned;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
@@ -39,6 +40,188 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const DEFAULT_MATRIX: &str = include_str!("../../benchmarks/mlx-perf-matrix-v1.json");
 const CAMPAIGN_FILE: &str = "campaign.json";
 const SUMMARY_FILE: &str = "summary.json";
+const RETENTION_MEMORY_AUDIT_SCHEMA_VERSION: &str = "sceneworks.mlx-retention-memory-audit.v2";
+
+/// Every concrete retained `mx.compile` handle in the shipped MLX graph. The shared modulate site
+/// deliberately appears twice because its matching-dtype and strong-f32-literal policies own
+/// separate compiler handles. The audit executes this exact handle multiset twice in one child
+/// process: one miss and one hit per entry.
+const RETAINED_COMPILE_HANDLES: [&str; 25] = [
+    "mlx_gen::nn::gated",
+    "mlx_gen::nn::rope_rotate",
+    "mlx_gen::nn::modulate",
+    "mlx_gen::nn::modulate",
+    "mlx_gen::nn::gelu_exact",
+    "mlx_gen::nn::gelu_quick",
+    "flux::transformer::gelu_ffn",
+    "flux2::transformer::swiglu",
+    "ltx::rope::rope_rotate",
+    "ltx::transformer::modulate",
+    "ltx::transformer::gated",
+    "ltx::transformer::gelu_ffn",
+    "qwen_image::attention::rope_rotate",
+    "qwen_image::block::modulate",
+    "qwen_image::block::gated",
+    "qwen_image::feed_forward::gelu_ffn",
+    "sdxl::silu_glue",
+    "wan::rope::rope_rotate",
+    "wan::transformer::modulate",
+    "wan::transformer::gated",
+    "wan::transformer::gelu_ffn",
+    "z_image::attention::rope_rotate",
+    "z_image::control_transformer::add_hint",
+    "z_image::feed_forward::swiglu",
+    "z_image::transformer_block::gated",
+];
+
+type DiagnosticKey = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+fn expected_retention_diagnostics() -> BTreeMap<DiagnosticKey, u64> {
+    let mut expected = BTreeMap::new();
+    for site in RETAINED_COMPILE_HANDLES {
+        for outcome in ["retained_miss", "retained_hit"] {
+            *expected
+                .entry((
+                    "compile".to_owned(),
+                    site.to_owned(),
+                    outcome.to_owned(),
+                    None,
+                    None,
+                    None,
+                ))
+                .or_default() += 1;
+        }
+    }
+    expected.insert(
+        (
+            "toggle".to_owned(),
+            diagnostics::RETAINED_COMPILATION.to_owned(),
+            "applied".to_owned(),
+            None,
+            None,
+            None,
+        ),
+        (RETAINED_COMPILE_HANDLES.len() * 2) as u64,
+    );
+    expected
+}
+
+fn aggregate_allocator_bytes(active_bytes: u64, cache_bytes: u64) -> u64 {
+    active_bytes.saturating_add(cache_bytes)
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RetentionMemoryAuditReceipt {
+    schema_version: String,
+    build: BuildProvenance,
+    audit_process_id: u32,
+    retained_handle_count: u64,
+    retained_site_count: u64,
+    baseline_active_bytes: u64,
+    baseline_cache_bytes: u64,
+    input_active_bytes: u64,
+    input_cache_bytes: u64,
+    request_bytes: u64,
+    drain_bytes: u64,
+    retained_active_bytes: u64,
+    retained_cache_bytes: u64,
+    retained_aggregate_growth_bytes: u64,
+    diagnostics: Vec<DiagnosticRecord>,
+}
+
+impl RetentionMemoryAuditReceipt {
+    fn validate(
+        &self,
+        expected_build: &BuildProvenance,
+        parent_process_id: u32,
+    ) -> Result<(), String> {
+        if self.schema_version != RETENTION_MEMORY_AUDIT_SCHEMA_VERSION
+            || &self.build != expected_build
+            || self.build.source_dirty
+        {
+            return Err(
+                "retention-memory receipt is not bound to the exact clean source/MLX pin"
+                    .to_owned(),
+            );
+        }
+        if self.audit_process_id == parent_process_id {
+            return Err(
+                "retention-memory audit did not execute in an isolated subprocess".to_owned(),
+            );
+        }
+        let expected_site_count = RETAINED_COMPILE_HANDLES
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .len() as u64;
+        if self.retained_handle_count != RETAINED_COMPILE_HANDLES.len() as u64
+            || self.retained_site_count != expected_site_count
+        {
+            return Err(format!(
+                "retention-memory audit inventory mismatch: handles={} sites={} expected_handles={} expected_sites={}",
+                self.retained_handle_count,
+                self.retained_site_count,
+                RETAINED_COMPILE_HANDLES.len(),
+                expected_site_count
+            ));
+        }
+        let baseline_allocator_bytes =
+            aggregate_allocator_bytes(self.baseline_active_bytes, self.baseline_cache_bytes);
+        let input_allocator_bytes =
+            aggregate_allocator_bytes(self.input_active_bytes, self.input_cache_bytes);
+        let retained_allocator_bytes =
+            aggregate_allocator_bytes(self.retained_active_bytes, self.retained_cache_bytes);
+        let retained_growth = retained_allocator_bytes.saturating_sub(baseline_allocator_bytes);
+        if self.request_bytes == 0
+            || self.drain_bytes != std::mem::size_of::<f32>() as u64
+            || input_allocator_bytes.saturating_sub(baseline_allocator_bytes) < self.request_bytes
+            || retained_growth != self.retained_aggregate_growth_bytes
+            || retained_growth >= self.request_bytes / 8
+        {
+            return Err(format!(
+                "retained handles pin request-sized aggregate allocator memory: baseline_active={} baseline_cache={} input_active={} input_cache={} retained_active={} retained_cache={} retained_growth={} recorded_growth={} request={} drain={}",
+                self.baseline_active_bytes,
+                self.baseline_cache_bytes,
+                self.input_active_bytes,
+                self.input_cache_bytes,
+                self.retained_active_bytes,
+                self.retained_cache_bytes,
+                retained_growth,
+                self.retained_aggregate_growth_bytes,
+                self.request_bytes,
+                self.drain_bytes,
+            ));
+        }
+        let mut actual = BTreeMap::new();
+        for record in &self.diagnostics {
+            let key = (
+                record.domain.clone(),
+                record.site.clone(),
+                record.outcome.clone(),
+                record.reason.clone(),
+                record.decode_path.clone(),
+                record.production_evidence_sha256.clone(),
+            );
+            *actual.entry(key).or_default() += record.count;
+        }
+        let expected = expected_retention_diagnostics();
+        if self.diagnostics.len() != expected.len() || actual != expected {
+            return Err(
+                "retention-memory audit lacks the exact full-inventory miss/hit execution receipt set"
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    }
+}
 
 fn main() -> ExitCode {
     match run() {
@@ -57,6 +240,8 @@ fn run() -> Result<(), String> {
         Some("run") => run_matrix(&args[1..]),
         Some("child") => run_child(&args[1..]),
         Some("validate-results") => validate_results(&args[1..]),
+        Some("retention-memory-audit") => run_retention_memory_audit(),
+        Some("retention-memory-child") => run_retention_memory_child(),
         _ => Err(usage()),
     }
 }
@@ -65,10 +250,156 @@ fn usage() -> String {
     "usage:\n  mlx-perf-bench validate [--matrix PATH] --artifacts PATH\n  \
      mlx-perf-bench run [--matrix PATH] --artifacts PATH --output-dir PATH \
      [--variants baseline,id,...]\n  \
-     mlx-perf-bench validate-results --results-dir PATH\n\nThe output directory must be \
+     mlx-perf-bench validate-results --results-dir PATH\n  \
+     mlx-perf-bench retention-memory-audit\n\nThe output directory must be \
      absolute, outside the checkout, and empty. `run` defaults to the required-all matrix. \
      `--variants baseline` creates a runnable baseline campaign but never acceptance evidence."
         .to_owned()
+}
+
+fn run_retention_memory_audit() -> Result<(), String> {
+    verify_executable_provenance(None)?;
+    let executable =
+        env::current_exe().map_err(|error| format!("resolve current executable: {error}"))?;
+    let output = Command::new(executable)
+        .arg("retention-memory-child")
+        .output()
+        .map_err(|error| format!("start retention-memory subprocess: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "retention-memory subprocess failed as {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let receipt: RetentionMemoryAuditReceipt = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("parse retention-memory subprocess receipt: {error}"))?;
+    receipt.validate(&build_provenance()?, std::process::id())?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&receipt)
+            .map_err(|error| format!("serialize retention-memory receipt: {error}"))?
+    );
+    Ok(())
+}
+
+fn exercise_retained_compile_inventory(input: &mlx_rs::Array) -> Result<(), String> {
+    runtime_macos::media::nn::exercise_retained_compile_inventory(input)
+        .map_err(|error| format!("audit mlx-gen shared retained handles: {error}"))?;
+    runtime_macos::providers::flux::transformer::exercise_retained_compile_inventory(input)
+        .map_err(|error| format!("audit Flux retained handles: {error}"))?;
+    runtime_macos::providers::flux2::transformer::exercise_retained_compile_inventory(input)
+        .map_err(|error| format!("audit Flux2 retained handles: {error}"))?;
+    runtime_macos::providers::ltx::rope::exercise_retained_compile_inventory(input)
+        .map_err(|error| format!("audit LTX RoPE retained handles: {error}"))?;
+    runtime_macos::providers::ltx::transformer::exercise_retained_compile_inventory(input)
+        .map_err(|error| format!("audit LTX transformer retained handles: {error}"))?;
+    runtime_macos::providers::qwen_image::transformer::attention::exercise_retained_compile_inventory(input)
+        .map_err(|error| format!("audit Qwen attention retained handles: {error}"))?;
+    runtime_macos::providers::qwen_image::transformer::block::exercise_retained_compile_inventory(
+        input,
+    )
+    .map_err(|error| format!("audit Qwen block retained handles: {error}"))?;
+    runtime_macos::providers::qwen_image::transformer::feed_forward::exercise_retained_compile_inventory(input)
+        .map_err(|error| format!("audit Qwen FFN retained handles: {error}"))?;
+    runtime_macos::providers::sdxl::exercise_retained_compile_inventory(input)
+        .map_err(|error| format!("audit SDXL retained handles: {error}"))?;
+    runtime_macos::providers::wan::rope::exercise_retained_compile_inventory(input)
+        .map_err(|error| format!("audit Wan RoPE retained handles: {error}"))?;
+    runtime_macos::providers::wan::transformer::exercise_retained_compile_inventory(input)
+        .map_err(|error| format!("audit Wan transformer retained handles: {error}"))?;
+    runtime_macos::providers::z_image::attention::exercise_retained_compile_inventory(input)
+        .map_err(|error| format!("audit Z-Image attention retained handles: {error}"))?;
+    runtime_macos::providers::z_image::control_transformer::exercise_retained_compile_inventory(
+        input,
+    )
+    .map_err(|error| format!("audit Z-Image control retained handles: {error}"))?;
+    runtime_macos::providers::z_image::feed_forward::exercise_retained_compile_inventory(input)
+        .map_err(|error| format!("audit Z-Image FFN retained handles: {error}"))?;
+    runtime_macos::providers::z_image::transformer_block::exercise_retained_compile_inventory(
+        input,
+    )
+    .map_err(|error| format!("audit Z-Image block retained handles: {error}"))?;
+    Ok(())
+}
+
+fn run_retention_memory_child() -> Result<(), String> {
+    verify_executable_provenance(None)?;
+    clear_cache();
+    clear_compile_cache();
+    runtime_macos::media::nn::set_compile_glue(false);
+    let baseline_active_bytes = mlx_rs::memory::get_active_memory() as u64;
+    let baseline_cache_bytes = get_cache_memory() as u64;
+
+    let input = mlx_rs::ops::ones::<f32>(&[1024, 1024]).map_err(|error| error.to_string())?;
+    input.eval().map_err(|error| error.to_string())?;
+    clear_cache();
+    let input_active_bytes = mlx_rs::memory::get_active_memory() as u64;
+    let input_cache_bytes = get_cache_memory() as u64;
+    let request_bytes = input.nbytes() as u64;
+
+    let scope = diagnostics::begin_request_with_toggles(
+        "retained-memory-audit",
+        "mlx-gen",
+        &[diagnostics::RETAINED_COMPILATION],
+    )
+    .map_err(|error| error.to_string())?;
+    let compile_guard = runtime_macos::media::nn::CompileGlueGuard::enable();
+    for _ in 0..2 {
+        exercise_retained_compile_inventory(&input)?;
+    }
+    let diagnostics = diagnostic_records(scope.finish());
+    drop(compile_guard);
+
+    // The audit helpers evaluate and drop every output before returning. This releases the final
+    // request-owned tensor before allocator/cache sampling while the 25 retained compiler handles
+    // remain alive in their thread-local owners.
+    drop(input);
+    // MLX's completed default Metal command buffer keeps shallow references to its most recent
+    // inputs/outputs until the next submission. Replace those request-sized references with one
+    // four-byte operation before sampling; otherwise the audit measures command-buffer retirement,
+    // not what the retained compiler handles own. The receipt binds this drain to exactly one f32.
+    let drain = mlx_rs::ops::ones::<f32>(&[1]).map_err(|error| error.to_string())?;
+    drain.eval().map_err(|error| error.to_string())?;
+    let drain_bytes = drain.nbytes() as u64;
+    drop(drain);
+    clear_cache();
+    let retained_active_bytes = mlx_rs::memory::get_active_memory() as u64;
+    let retained_cache_bytes = get_cache_memory() as u64;
+    let baseline_allocator_bytes =
+        aggregate_allocator_bytes(baseline_active_bytes, baseline_cache_bytes);
+    let retained_aggregate_growth_bytes =
+        aggregate_allocator_bytes(retained_active_bytes, retained_cache_bytes)
+            .saturating_sub(baseline_allocator_bytes);
+    let receipt = RetentionMemoryAuditReceipt {
+        schema_version: RETENTION_MEMORY_AUDIT_SCHEMA_VERSION.to_owned(),
+        build: build_provenance()?,
+        audit_process_id: std::process::id(),
+        retained_handle_count: RETAINED_COMPILE_HANDLES.len() as u64,
+        retained_site_count: RETAINED_COMPILE_HANDLES
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .len() as u64,
+        baseline_active_bytes,
+        baseline_cache_bytes,
+        input_active_bytes,
+        input_cache_bytes,
+        request_bytes,
+        drain_bytes,
+        retained_active_bytes,
+        retained_cache_bytes,
+        retained_aggregate_growth_bytes,
+        diagnostics,
+    };
+    // Validate locally as well; the parent independently checks build identity and subprocess PID.
+    receipt.validate(&receipt.build, u32::MAX)?;
+    print!(
+        "{}",
+        serde_json::to_string(&receipt)
+            .map_err(|error| format!("serialize retention-memory child receipt: {error}"))?
+    );
+    Ok(())
 }
 
 #[derive(Default)]
@@ -513,6 +844,7 @@ fn run_child(args: &[String]) -> Result<(), String> {
 
     let started_at_unix_millis = unix_millis()?;
     clear_cache();
+    clear_compile_cache();
     reset_peak_memory();
     let load_start = Instant::now();
     let catalog =
@@ -618,6 +950,10 @@ fn measure_request(
         .validate(&request)
         .map_err(|error| format!("validate {}: {error}", case.id))?;
     clear_cache();
+    // Each request starts from a cold compiler cache so its receipt must contain a real retained
+    // miss followed by hits for every provider-declared P1 operation. Warmups cannot fabricate the
+    // measured-run coverage by pre-populating process-local retained handles.
+    clear_compile_cache();
 
     let recorder = Rc::new(RefCell::new(PhaseRecorder::new(case.steps)));
     let observer = Rc::clone(&recorder);
@@ -646,7 +982,7 @@ fn measure_request(
     let finished = recorder.finish()?;
     validate_report_identity_and_boundaries(request_id, case, &report, &finished.phase_boundaries)?;
     let diagnostics = diagnostic_records(report);
-    validate_toggle_diagnostics(variant, &diagnostics)
+    validate_toggle_diagnostics(case, variant, &diagnostics)
         .map_err(|error| format!("invalid toggle receipts: {error}"))?;
     let output = fingerprint_output(case, &output)?;
     let denoise_steps_per_second = case.steps as f64 / finished.phases.denoise.seconds;
@@ -1577,6 +1913,214 @@ fn print_summary(summary: &BenchmarkSummary) {
 mod tests {
     use super::*;
     use runtime_macos::perf_bench::{inventory_artifact, ArtifactReceipt};
+
+    fn retention_memory_receipt_fixture() -> (RetentionMemoryAuditReceipt, BuildProvenance) {
+        let build = BuildProvenance {
+            source_revision: "a".repeat(40),
+            mlx_revision: "b".repeat(40),
+            source_dirty: false,
+            cargo_profile: "release".to_owned(),
+            opt_level: "3".to_owned(),
+            debug_assertions: false,
+            target_triple: "aarch64-apple-darwin".to_owned(),
+            cargo_features: vec!["media".to_owned(), "perf-bench".to_owned()],
+            target_features: vec!["neon".to_owned()],
+            rustflags: Vec::new(),
+            rustc_version: "rustc test".to_owned(),
+            executable_sha256: "c".repeat(64),
+        };
+        let diagnostics = expected_retention_diagnostics()
+            .into_iter()
+            .map(
+                |(
+                    (domain, site, outcome, reason, decode_path, production_evidence_sha256),
+                    count,
+                )| {
+                    DiagnosticRecord {
+                        domain,
+                        site,
+                        outcome,
+                        count,
+                        reason,
+                        decode_path,
+                        production_evidence_sha256,
+                    }
+                },
+            )
+            .collect();
+        let receipt = RetentionMemoryAuditReceipt {
+            schema_version: RETENTION_MEMORY_AUDIT_SCHEMA_VERSION.to_owned(),
+            build: build.clone(),
+            audit_process_id: 2,
+            retained_handle_count: RETAINED_COMPILE_HANDLES.len() as u64,
+            retained_site_count: RETAINED_COMPILE_HANDLES
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .len() as u64,
+            baseline_active_bytes: 1024,
+            baseline_cache_bytes: 0,
+            input_active_bytes: 4 * 1024 * 1024 + 1024,
+            input_cache_bytes: 0,
+            request_bytes: 4 * 1024 * 1024,
+            drain_bytes: std::mem::size_of::<f32>() as u64,
+            retained_active_bytes: 1024,
+            retained_cache_bytes: 0,
+            retained_aggregate_growth_bytes: 0,
+            diagnostics,
+        };
+        (receipt, build)
+    }
+
+    #[test]
+    fn retention_memory_receipt_requires_the_exact_full_inventory_evidence_set() {
+        let (receipt, build) = retention_memory_receipt_fixture();
+        receipt.validate(&build, 1).unwrap();
+
+        let (mut extra_site, build) = retention_memory_receipt_fixture();
+        extra_site.diagnostics.push(DiagnosticRecord {
+            domain: "compile".to_owned(),
+            site: "untracked::compile_site".to_owned(),
+            outcome: "retained_miss".to_owned(),
+            count: 1,
+            reason: None,
+            decode_path: None,
+            production_evidence_sha256: None,
+        });
+        assert!(extra_site
+            .validate(&build, 1)
+            .unwrap_err()
+            .contains("exact full-inventory miss/hit"));
+
+        let (mut missing_site, build) = retention_memory_receipt_fixture();
+        missing_site.diagnostics.remove(0);
+        assert!(missing_site
+            .validate(&build, 1)
+            .unwrap_err()
+            .contains("exact full-inventory miss/hit"));
+
+        let (mut wrong_count, build) = retention_memory_receipt_fixture();
+        wrong_count
+            .diagnostics
+            .iter_mut()
+            .find(|record| record.domain == "compile")
+            .unwrap()
+            .count += 1;
+        assert!(wrong_count
+            .validate(&build, 1)
+            .unwrap_err()
+            .contains("exact full-inventory miss/hit"));
+
+        let expected = expected_retention_diagnostics();
+        assert_eq!(RETAINED_COMPILE_HANDLES.len(), 25);
+        assert_eq!(
+            RETAINED_COMPILE_HANDLES
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .len(),
+            24
+        );
+        assert_eq!(expected.len(), 49);
+        assert_eq!(
+            expected
+                .get(&(
+                    "compile".to_owned(),
+                    "mlx_gen::nn::modulate".to_owned(),
+                    "retained_miss".to_owned(),
+                    None,
+                    None,
+                    None,
+                ))
+                .copied(),
+            Some(2)
+        );
+        assert_eq!(
+            expected
+                .get(&(
+                    "toggle".to_owned(),
+                    diagnostics::RETAINED_COMPILATION.to_owned(),
+                    "applied".to_owned(),
+                    None,
+                    None,
+                    None,
+                ))
+                .copied(),
+            Some(50)
+        );
+    }
+
+    #[test]
+    fn retention_memory_receipt_bounds_aggregate_active_and_cache_growth() {
+        let (mut receipt, build) = retention_memory_receipt_fixture();
+        receipt.baseline_cache_bytes = 128;
+        receipt.input_cache_bytes = 128;
+        receipt.retained_active_bytes = receipt.baseline_active_bytes + 128 * 1024;
+        receipt.retained_cache_bytes = receipt.baseline_cache_bytes + 64 * 1024;
+        receipt.retained_aggregate_growth_bytes = 192 * 1024;
+        receipt.validate(&build, 1).unwrap();
+
+        receipt.retained_cache_bytes = receipt.baseline_cache_bytes + receipt.request_bytes / 8;
+        receipt.retained_aggregate_growth_bytes = receipt.request_bytes / 8 + 128 * 1024;
+        assert!(receipt
+            .validate(&build, 1)
+            .unwrap_err()
+            .contains("aggregate allocator memory"));
+
+        let (mut forged_growth, build) = retention_memory_receipt_fixture();
+        forged_growth.retained_active_bytes += 1;
+        assert!(forged_growth
+            .validate(&build, 1)
+            .unwrap_err()
+            .contains("aggregate allocator memory"));
+
+        let (mut oversized_drain, build) = retention_memory_receipt_fixture();
+        oversized_drain.drain_bytes *= 2;
+        assert!(oversized_drain
+            .validate(&build, 1)
+            .unwrap_err()
+            .contains("aggregate allocator memory"));
+    }
+
+    #[test]
+    fn retention_memory_inventory_tracks_every_retained_constructor() {
+        let mlx_root = repository_root().unwrap().join("crates/media/mlx-gen");
+        let mut pending = vec![mlx_root];
+        let mut constructor_count = 0usize;
+        let mut source = String::new();
+        while let Some(path) = pending.pop() {
+            for entry in fs::read_dir(path).unwrap() {
+                let entry = entry.unwrap();
+                let file_type = entry.file_type().unwrap();
+                if file_type.is_dir() {
+                    pending.push(entry.path());
+                } else if entry.path().extension().and_then(|value| value.to_str()) == Some("rs") {
+                    let text = fs::read_to_string(entry.path()).unwrap();
+                    constructor_count += text.matches("compile_retained(").count();
+                    source.push_str(&text);
+                }
+            }
+        }
+        assert_eq!(
+            constructor_count,
+            RETAINED_COMPILE_HANDLES.len(),
+            "every retained constructor must be added to the executable audit inventory"
+        );
+        assert!(
+            !source.contains("invalidate_retained"),
+            "one-shot compile paths must not mutate independent retained-handle bookkeeping"
+        );
+        for site in RETAINED_COMPILE_HANDLES
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+        {
+            assert!(
+                source.contains(&format!("\"{site}\"")),
+                "audit site {site:?} has no production source literal"
+            );
+        }
+    }
 
     #[test]
     fn default_matrix_parses_and_validates() {

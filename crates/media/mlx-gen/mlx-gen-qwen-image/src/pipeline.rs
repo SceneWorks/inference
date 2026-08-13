@@ -549,7 +549,7 @@ pub(crate) fn denoise_with_progress_windowed(
     // sc-2963 (rollout of sc-2957): run the MMDiT's fusable elementwise glue (adaLN affine, gated
     // residual, tanh-GELU FFN, RoPE rotation) through `mx.compile` — bit-exact (`max|Δ|=0`,
     // compile_parity.rs) and a per-step win at production geometry. Scoped + restored on drop by the
-    // RAII guard (F-006) instead of leaking the process-global toggle on.
+    // RAII guard (F-006) instead of leaking the render thread's setting into later work.
     let _compile_glue = crate::transformer::CompileGlueGuard::enable();
     let (lh, lw) = ((height / 16) as usize, (width / 16) as usize);
     let sliced = &sigmas[start_step.min(sigmas.len().saturating_sub(1))..];
@@ -678,7 +678,7 @@ pub(crate) fn denoise_control_with_progress_windowed(
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
     // Compiled elementwise glue (sc-2963), as in `denoise_with_progress`. Scoped + restored on drop
-    // by the RAII guard (F-006) instead of leaking the process-global toggle on.
+    // by the RAII guard (F-006) instead of leaking the render thread's setting into later work.
     let _compile_glue = crate::transformer::CompileGlueGuard::enable();
     let (lh, lw) = ((height / 16) as usize, (width / 16) as usize);
     let block_window = transformer.block_window(window_size, cancel)?;

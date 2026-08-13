@@ -13,7 +13,7 @@ use mlx_rs::{
     fast::{rms_norm, scaled_dot_product_attention},
     ops::{add, multiply, split, stack_axis, subtract},
     transforms::checkpoint,
-    transforms::compile::compile,
+    transforms::compile::{compile, compile_retained},
     Array, Dtype,
 };
 
@@ -21,6 +21,42 @@ use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::attention::{sdpa_budgeted_bhsd, AttentionPlan};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
+
+const SITE_ROPE_ROTATE: &str = "z_image::attention::rope_rotate";
+
+fn rope_rotate_impl(inp: &[Array]) -> std::result::Result<Vec<Array>, Exception> {
+    let (xr, xi, cos, sin) = (&inp[0], &inp[1], &inp[2], &inp[3]);
+    let out_r = subtract(&multiply(xr, cos)?, &multiply(xi, sin)?)?;
+    let out_i = add(&multiply(xr, sin)?, &multiply(xi, cos)?)?;
+    Ok(vec![out_r, out_i])
+}
+
+thread_local! {
+    static RETAINED_ROPE_ROTATE: std::cell::RefCell<Option<mlx_gen::nn::RetainedSlice>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn retained_rope_rotate(args: &[Array]) -> std::result::Result<Vec<Array>, Exception> {
+    mlx_gen::nn::prepare_retained_compilation_thread();
+    RETAINED_ROPE_ROTATE.with(|slot| {
+        slot.borrow_mut()
+            .get_or_insert_with(|| {
+                mlx_gen::nn::RetainedSlice::new(compile_retained(rope_rotate_impl, true))
+            })
+            .call(SITE_ROPE_ROTATE, args)
+    })
+}
+
+/// Exercise this module's production retained handle once for the release memory audit.
+#[doc(hidden)]
+pub fn exercise_retained_compile_inventory(input: &Array) -> Result<()> {
+    let args = [input.clone(), input.clone(), input.clone(), input.clone()];
+    let outputs = retained_rope_rotate(&args)?;
+    mlx_rs::transforms::eval(outputs.iter())?;
+    drop(outputs);
+    drop(args);
+    Ok(())
+}
 
 #[derive(Clone)]
 pub struct ZImageAttention {
@@ -211,17 +247,20 @@ impl ZImageAttention {
 /// when the sc-2963 glue toggle is on (vs 6 eager ops, applied to q and k every block);
 /// dtype-preserving, bit-identical to the eager form.
 fn rope_rotate(xr: &Array, xi: &Array, cos: &Array, sin: &Array) -> Result<(Array, Array)> {
-    let f = |inp: &[Array]| -> std::result::Result<Vec<Array>, Exception> {
-        let (xr, xi, cos, sin) = (&inp[0], &inp[1], &inp[2], &inp[3]);
-        let out_r = subtract(&multiply(xr, cos)?, &multiply(xi, sin)?)?;
-        let out_i = add(&multiply(xr, sin)?, &multiply(xi, cos)?)?;
-        Ok(vec![out_r, out_i])
-    };
     let args = [xr.clone(), xi.clone(), cos.clone(), sin.clone()];
     let out = if crate::compile_glue() {
-        compile(f, true)(&args)?
+        if mlx_gen::nn::retained_compilation_requested() {
+            retained_rope_rotate(&args)?
+        } else {
+            mlx_gen::diagnostics::record_compile(
+                SITE_ROPE_ROTATE,
+                mlx_gen::diagnostics::CompileDisposition::OneShot,
+            );
+            compile(rope_rotate_impl, true)(&args)?
+        }
     } else {
-        f(&args)?
+        mlx_gen::diagnostics::record_fallback(SITE_ROPE_ROTATE, "compiled_glue_disabled");
+        rope_rotate_impl(&args)?
     };
     let [out_r, out_i]: [Array; 2] = out.try_into().map_err(|v: Vec<Array>| {
         Error::Msg(format!(

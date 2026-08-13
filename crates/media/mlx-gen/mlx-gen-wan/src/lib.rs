@@ -76,7 +76,7 @@ pub(crate) const MAX_WAN_CONDITIONING_LATENTS: usize = 257;
 
 /// Shared-optimization toggles whose production call sites this provider can actually execute.
 /// Availability never substitutes for the request-local `Applied` receipt required by P6.
-pub const BENCHMARK_TOGGLE_CAPABILITIES: &[&str] = &[];
+pub const BENCHMARK_TOGGLE_CAPABILITIES: &[&str] = &[mlx_gen::diagnostics::RETAINED_COMPILATION];
 
 pub(crate) fn combined_conditioning_latents(
     control_frames: usize,
