@@ -92,6 +92,11 @@ impl SinusoidalPositionalEncoding {
         }
         Ok(y)
     }
+
+    pub(crate) fn materialize_weights(&self) -> Result<()> {
+        mlx_rs::transforms::eval([&self.sigmas])?;
+        Ok(())
+    }
 }
 
 /// The 2-layer time-embedding MLP (`linear_1 → SiLU → linear_2`). Used both for the timestep
@@ -117,6 +122,11 @@ impl TimestepEmbedding {
         self.linear1.quantize(bits, None)?;
         self.linear2.quantize(bits, None)?;
         Ok(())
+    }
+
+    pub(crate) fn materialize_weights(&self) -> Result<()> {
+        self.linear1.materialize_weights()?;
+        self.linear2.materialize_weights()
     }
 
     /// Cast both MLP Linears to `dtype` (sc-4941 bf16 training). The sinusoidal `sigmas` tables stay

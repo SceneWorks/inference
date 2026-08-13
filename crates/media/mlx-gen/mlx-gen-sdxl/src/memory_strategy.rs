@@ -1216,7 +1216,7 @@ pub fn declared_parameters() -> mlx_gen::gen_core::MemoryStrategyParameters {
 mod tests {
     use super::*;
     use mlx_gen::gen_core::GenerationMemory;
-    use mlx_gen::AdapterSpec;
+    use mlx_gen::{AdapterSpec, Quant};
 
     fn spec(shape: LoadShape) -> LoadSpec {
         LoadSpec::new(WeightsSource::Dir("/nonexistent/sdxl-contract".into()))
@@ -1226,6 +1226,52 @@ mod tests {
 
     fn contract(shape: LoadShape) -> MemoryProviderContract {
         weights_free_memory_strategy_contract(crate::MODEL_ID, &spec(shape)).unwrap()
+    }
+
+    fn write_fused_contract_fixture(path: &std::path::Path) {
+        let entries = [
+            (
+                "model.diffusion_model.time_embed.0.weight",
+                vec![64, 64],
+                64 * 64 * 2,
+            ),
+            (
+                "conditioner.embedders.0.transformer.text_model.encoder.layers.0.self_attn.q_proj.weight",
+                vec![64, 64],
+                64 * 64 * 2,
+            ),
+            (
+                "conditioner.embedders.1.model.transformer.resblocks.0.attn.in_proj_weight",
+                vec![192, 64],
+                192 * 64 * 2,
+            ),
+            (
+                "first_stage_model.decoder.up.1.block.2.nin_shortcut.weight",
+                vec![1, 1, 1, 1],
+                2,
+            ),
+        ];
+        let mut offset = 0usize;
+        let mut header = serde_json::Map::new();
+        for (name, shape, bytes) in entries {
+            header.insert(
+                name.to_owned(),
+                serde_json::json!({
+                    "dtype": "BF16",
+                    "shape": shape,
+                    "data_offsets": [offset, offset + bytes],
+                }),
+            );
+            offset += bytes;
+        }
+        let mut json = serde_json::to_vec(&header).unwrap();
+        while !json.len().is_multiple_of(8) {
+            json.push(b' ');
+        }
+        let mut file = (json.len() as u64).to_le_bytes().to_vec();
+        file.extend(json);
+        file.resize(file.len() + offset, 0);
+        std::fs::write(path, file).unwrap();
     }
 
     #[test]
@@ -1318,6 +1364,22 @@ mod tests {
         let fused = LoadSpec::new(WeightsSource::File("/nonexistent/sdxl.safetensors".into()))
             .with_load_shape(LoadShape::DeferredMaterialization);
         assert!(!streamable(&fused));
+    }
+
+    #[test]
+    fn fused_file_contract_projects_remapped_components_and_selected_quant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("sdxl.safetensors");
+        write_fused_contract_fixture(&file);
+        let spec = LoadSpec::new(WeightsSource::File(file)).with_quant(Quant::Q4);
+
+        let contract = memory_strategy_contract(crate::MODEL_ID, &spec).unwrap();
+
+        assert_eq!(contract.asset_facts.transformer_bytes, 2_304);
+        assert_eq!(contract.asset_facts.conditioning_bytes, 9_216);
+        assert_eq!(contract.asset_facts.decoder_bytes, 4);
+        assert_eq!(contract.asset_facts.base_bytes, 11_524);
+        assert!(contract.conformance_errors().is_empty());
     }
 
     /// **Rungs 2 and 3 are refused on every layer**, and the refusal names why.

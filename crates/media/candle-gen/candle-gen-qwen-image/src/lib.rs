@@ -1109,7 +1109,16 @@ candle_gen::register_generators! {
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    let registry = registry.register_generator(REGISTRATION);
+    let registry = registry
+        .register_generator(REGISTRATION)
+        .register_imported_model(gen_core::ImportedModelRegistration {
+            family: "qwen-image",
+            source: gen_core::ImportedModelSource::ComfyUiTree,
+            operation: gen_core::ImportedModelOperation::Generate,
+            provider_id: MODEL_ID,
+            required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
+            inherit_adapters: true,
+        });
     #[cfg(feature = "cuda")]
     let registry = registry
         .register_memory_strategy(QWEN_IMAGE_MEMORY_REGISTRATION)

@@ -103,6 +103,24 @@ impl UNetBlock2D {
         Ok(())
     }
 
+    pub(crate) fn materialize_weights(&self) -> Result<()> {
+        for resnet in &self.resnets {
+            resnet.materialize_weights()?;
+        }
+        if let Some(attentions) = &self.attentions {
+            for attention in attentions {
+                attention.materialize_weights()?;
+            }
+        }
+        if let Some(downsample) = &self.downsample {
+            downsample.materialize_weights()?;
+        }
+        if let Some(upsample) = &self.upsample {
+            upsample.materialize_weights()?;
+        }
+        Ok(())
+    }
+
     /// Number of skip tensors this block pops on the up path (one per resnet) — the count
     /// `forward_block_checkpointed` (sc-4941) peels off the residual stack to thread into the block's
     /// checkpoint segment as explicit inputs.

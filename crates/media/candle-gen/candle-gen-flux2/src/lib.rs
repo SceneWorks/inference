@@ -1335,7 +1335,15 @@ pub fn register_providers(
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
     let registry = registry
         .register_generator(KLEIN_REGISTRATION)
-        .register_generator(DEV_REGISTRATION);
+        .register_generator(DEV_REGISTRATION)
+        .register_imported_model(gen_core::ImportedModelRegistration {
+            family: "flux2",
+            source: gen_core::ImportedModelSource::ComfyUiTree,
+            operation: gen_core::ImportedModelOperation::Generate,
+            provider_id: config::FLUX2_DEV_ID,
+            required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
+            inherit_adapters: true,
+        });
     #[cfg(feature = "cuda")]
     let registry = registry
         .register_memory_strategy(KLEIN_MEMORY_REGISTRATION)
