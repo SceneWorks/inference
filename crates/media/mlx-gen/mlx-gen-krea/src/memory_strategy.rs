@@ -962,7 +962,7 @@ mod tests {
             ("adapter", accepted_adapter, true),
             ("deferred", accepted_deferred, true),
             ("precision", precision, false),
-            ("quantize", valid.clone().with_quant(Quant::Q4), false),
+            ("quantize", valid.clone().with_quant(Quant::Q4), true),
             ("extra_control", extra_control, false),
             ("ip_adapter", ip_adapter, false),
             ("pid", pid, false),

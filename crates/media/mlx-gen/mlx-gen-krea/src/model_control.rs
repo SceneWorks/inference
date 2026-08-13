@@ -6,10 +6,10 @@
 //!
 //! Identical to [`crate::model::Krea`] (Turbo) except a [`Krea2ControlBranch`] rides the DiT and
 //! `generate` threads a VAE-encoded pose skeleton through it. [`load`] needs the base snapshot
-//! (`spec.weights`, the DENSE `krea/Krea-2-Turbo` diffusers tree — NOT the packed Q4/Q8 turnkey the
-//! plain `krea_2_turbo` gen uses, because the branch is a composable-forward overlay trained on the bf16
-//! base) **and** the control overlay checkpoint (`spec.control`). Pose-only + dense bf16 (no quant, no
-//! negative prompt, no guidance), mirroring the candle `krea_2_turbo_control` engine.
+//! (`spec.weights`, either a dense `krea/Krea-2-Turbo` diffusers tree or a packed Q4/Q8 turnkey) and
+//! the control overlay checkpoint (`spec.control`). Pose-only with bf16 activations (the base weights
+//! may be dense or Q4/Q8; no negative prompt or guidance), mirroring the candle
+//! `krea_2_turbo_control` engine.
 
 use mlx_gen::gen_core;
 use mlx_gen::{
@@ -213,10 +213,12 @@ impl AdmittedControlGeometry {
 /// seam in sc-11126, F-180): `Resident` (default) builds every component now and holds it warm;
 /// `Sequential` keeps only the spec and re-loads per generate in phase order (encode → drop the text
 /// phase → denoise/decode). Both use the same per-phase loaders, so the components are byte-identical.
-/// Validity (base dir, control present, no quant, bf16) is checked up front either way.
+/// Validity (base present, control present, bf16 activations, and only supported Q4/Q8 packing) is
+/// checked up front either way.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     // Fail fast — validate the whole spec up front for BOTH residencies (mirrors the pre-sc-11101 load
-    // order): dense bf16, a base snapshot dir, the required control overlay, and no quant override.
+    // order): bf16 activations, a base snapshot, the required control overlay, and any requested
+    // supported Q4/Q8 weight packing.
     validate_control_spec(spec)?;
     if matches!(spec.weights, WeightsSource::File(_)) {
         return Ok(Box::new(build_native_krea_control_from_spec(spec)?));
@@ -1174,10 +1176,10 @@ mod tests {
     /// `model::native_load_folds_edit_adapter`): the discriminating check the GPU-free tests can't
     /// run (the branch fold needs a real DiT/base/overlay). Set `KREA_NATIVE_DIT` to a ComfyUI
     /// single-file Krea 2 DiT (e.g. a community fine-tune), `KREA_TURBO_DIR` to a resident turnkey
-    /// snapshot tier (dense bf16), and `KREA_CONTROL_OVERLAY` to the converted pose control-branch
-    /// overlay. Asserts the concrete assembly carries the `krea_2_turbo_control` identity with the
-    /// dense-base ⇒ dense-branch tier consequence, so the imported composition is the builtin one
-    /// with only the DiT swapped.
+    /// snapshot tier (this fixture uses dense bf16), and `KREA_CONTROL_OVERLAY` to the converted pose
+    /// control-branch overlay. Asserts the concrete assembly carries the `krea_2_turbo_control`
+    /// identity with the dense-fixture branch tier, so the imported composition is the builtin one
+    /// with only the DiT swapped. The ordinary parity tests separately cover Q4/Q8 admission.
     #[test]
     #[ignore = "needs real weights: set KREA_NATIVE_DIT, KREA_TURBO_DIR, KREA_CONTROL_OVERLAY"]
     fn native_control_load_assembles_branch_on_imported_dit() {
