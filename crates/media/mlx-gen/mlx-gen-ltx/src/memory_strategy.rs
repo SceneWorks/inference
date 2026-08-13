@@ -824,14 +824,17 @@ mod tests {
     #[test]
     fn selected_decode_parameters_reach_the_real_tiling_carrier_and_mutations_fail() {
         let mut request = GenerationRequest {
-            width: 768,
-            height: 512,
-            frames: Some(97),
+            // Keep the carrier assertion below the smallest supported CI host's live MLX budget.
+            // Long-clip temporal-budget behavior is covered by the injected-budget pipeline test;
+            // this test owns only request-memory propagation and domain validation.
+            width: 256,
+            height: 256,
+            frames: Some(25),
             count: 1,
             memory: Some(GenerationMemory {
                 stage_residency: true,
                 tile_vae_decode: true,
-                decode_tile_edge: Some(512),
+                decode_tile_edge: Some(256),
                 decode_overlap: Some(DECODE_OVERLAP),
                 ..Default::default()
             }),
@@ -839,9 +842,9 @@ mod tests {
         };
         let tiling = decode_tiling(&request).unwrap().unwrap();
         let spatial = tiling.spatial.unwrap();
-        assert_eq!((spatial.tile_px, spatial.overlap_px), (512, 64));
+        assert_eq!((spatial.tile_px, spatial.overlap_px), (256, 64));
 
-        request.memory.as_mut().unwrap().decode_tile_edge = Some(511);
+        request.memory.as_mut().unwrap().decode_tile_edge = Some(255);
         assert!(decode_tiling(&request).is_err());
         request.memory.as_mut().unwrap().decode_tile_edge = None;
         assert!(decode_tiling(&request).is_err());
