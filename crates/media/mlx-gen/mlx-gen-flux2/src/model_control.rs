@@ -213,6 +213,18 @@ fn build_control_residency_with_source(
         crate::model::effective_base_quant(spec, root, FLUX2_DEV_CONTROL_ID)?.map(Quant::bits);
     let text_encoder_load_time_quant_bits =
         text_encoder_source.load_time_quant_bits(effective_quant_bits, FLUX2_DEV_CONTROL_ID)?;
+    build_control_residency_from_admitted_source(
+        spec,
+        text_encoder_source,
+        text_encoder_load_time_quant_bits,
+    )
+}
+
+fn build_control_residency_from_admitted_source(
+    spec: &LoadSpec,
+    text_encoder_source: gen_core::ValidatedEncoderSource,
+    text_encoder_load_time_quant_bits: Option<i32>,
+) -> Result<Residency<Flux2TextOwned, Flux2ControlHeavyOwned>> {
     let spec_heavy = spec.clone();
     Residency::from_policy(
         spec.offload_policy,
@@ -630,7 +642,8 @@ mod tests {
     // ── sc-10840: weight-free, default-run proof that the FLUX.2 control dispatch HONORS
     // `offload_policy`. `build_control_residency` uses a validation-complete sparse encoder plus a
     // missing control checkpoint: `Sequential` admits the encoder and defers payload loads;
-    // `Resident` eagerly materializes and fails. The real-weight A/B remains hosted.
+    // `Resident` immediately enters the unchanged payload bracket without materializing the sparse
+    // production-size file. The real-weight A/B remains hosted.
     fn validation_complete_snapshot_spec(
         root: &std::path::Path,
         policy: OffloadPolicy,
@@ -716,15 +729,44 @@ mod tests {
     }
 
     #[test]
-    fn build_residency_resident_eager_loads_and_fails_on_missing_snapshot() {
+    fn build_residency_resident_enters_payload_bracket_after_admission() {
         let fixture = tempfile::tempdir().unwrap();
         let spec = validation_complete_snapshot_spec(fixture.path(), OffloadPolicy::Resident);
-        let err = build_control_residency(&spec)
-            .err()
-            .expect("Resident must eager-load and fail on a missing snapshot dir");
+        let root = require_base_dir(
+            &spec,
+            FLUX2_DEV_CONTROL_ID,
+            "a FLUX.2-dev snapshot directory",
+        )
+        .unwrap();
+        let text_encoder_source = crate::config::DEV_ENCODER_CONTRACT
+            .source_for_load(&spec, root)
+            .unwrap();
+        let effective_quant_bits =
+            crate::model::effective_base_quant(&spec, root, FLUX2_DEV_CONTROL_ID)
+                .unwrap()
+                .map(Quant::bits);
+        let text_encoder_load_time_quant_bits = text_encoder_source
+            .load_time_quant_bits(effective_quant_bits, FLUX2_DEV_CONTROL_ID)
+            .unwrap();
+
+        // Do not materialize the sparse production-shape fixture. A post-admission shard addition
+        // lets the real Resident closure prove eager entry through the unchanged-read bracket.
+        std::fs::write(
+            root.join("text_encoder/added-after-admission.safetensors"),
+            [],
+        )
+        .unwrap();
+        let err = build_control_residency_from_admitted_source(
+            &spec,
+            text_encoder_source,
+            text_encoder_load_time_quant_bits,
+        )
+        .err()
+        .expect("Resident must immediately enter the admitted payload-load bracket");
         assert!(
-            !err.to_string().contains("single .safetensors file"),
-            "expected an eager-load failure: {err}"
+            err.to_string()
+                .contains("shard inventory changed after validation"),
+            "expected eager payload-bracket mutation detection: {err}"
         );
     }
 

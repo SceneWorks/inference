@@ -384,6 +384,22 @@ fn build_residency_with_source(
     } else {
         text_encoder_source.clone()
     };
+    build_residency_from_admitted_sources(
+        variant,
+        spec,
+        text_encoder_source,
+        multimodal_encoder_source,
+        text_encoder_load_time_quant_bits,
+    )
+}
+
+fn build_residency_from_admitted_sources(
+    variant: Flux2Variant,
+    spec: &LoadSpec,
+    text_encoder_source: mlx_gen::gen_core::ValidatedEncoderSource,
+    multimodal_encoder_source: mlx_gen::gen_core::ValidatedEncoderSource,
+    text_encoder_load_time_quant_bits: Option<i32>,
+) -> Result<Residency<Flux2TextOwned, Flux2HeavyOwned>> {
     let spec_heavy = spec.clone();
     Residency::from_policy(
         spec.offload_policy,
@@ -2455,8 +2471,9 @@ mod tests {
 
     // ── sc-10840: weight-free, default-run proof that FLUX.2's dispatch HONORS `offload_policy`.
     // `build_residency` at a validation-complete sparse snapshot: `Sequential` admits the encoder
-    // contract but defers payload materialization (`is_sequential`); `Resident` eager-loads the sparse
-    // test payload and fails. Runs for a klein (Qwen3)
+    // contract but defers payload materialization (`is_sequential`); `Resident` immediately enters
+    // the unchanged payload bracket, proven without materializing the sparse production-size file.
+    // Runs for a klein (Qwen3)
     // and a dev (Mistral-3 group) variant, so both text-loader arms are exercised. The real-weight A/B
     // is deferred (weights not on disk).
     fn validation_complete_snapshot_spec(
@@ -3322,18 +3339,66 @@ mod tests {
     }
 
     #[test]
-    fn build_residency_resident_eager_loads_and_fails_on_missing_snapshot() {
+    fn build_residency_resident_enters_payload_bracket_after_admission() {
         for variant in [Flux2Variant::Klein9b, Flux2Variant::Dev] {
             let fixture = tempfile::tempdir().unwrap();
             let spec =
                 validation_complete_snapshot_spec(fixture.path(), variant, OffloadPolicy::Resident);
-            let err = build_residency(variant, &spec)
-                .err()
-                .expect("Resident must eager-load and fail on the sparse validation fixture");
+            let root = resolve_root(variant, &spec).unwrap();
+            let text_encoder_source = variant
+                .encoder_contract()
+                .source_for_load(&spec, root)
+                .unwrap();
+            let effective_quant_bits = variant
+                .is_dev()
+                .then(|| effective_base_quant(&spec, root, variant.id()))
+                .transpose()
+                .unwrap()
+                .flatten()
+                .map(mlx_gen::gen_core::Quant::bits);
+            let text_encoder_load_time_quant_bits = text_encoder_source
+                .load_time_quant_bits(effective_quant_bits, variant.id())
+                .unwrap();
+            let multimodal_encoder_source = if variant.is_dev() {
+                let source = variant
+                    .encoder_contract()
+                    .validate_source_against_base(
+                        &WeightsSource::Dir(root.join("text_encoder")),
+                        root,
+                    )
+                    .unwrap();
+                source
+                    .validate_vision(
+                        &crate::config::DEV_VISION_ENCODER_CONTRACT,
+                        &crate::config::DEV_ENCODER_CONTRACT,
+                    )
+                    .unwrap();
+                source
+            } else {
+                text_encoder_source.clone()
+            };
+
+            // The contract fixtures are sparse production-shape files and must never be
+            // materialized. Mutate the admitted shard inventory instead: Sequential leaves this
+            // check deferred, while Resident must invoke the real text-loader closure immediately.
+            std::fs::write(
+                root.join("text_encoder/added-after-admission.safetensors"),
+                [],
+            )
+            .unwrap();
+            let err = build_residency_from_admitted_sources(
+                variant,
+                &spec,
+                text_encoder_source,
+                multimodal_encoder_source,
+                text_encoder_load_time_quant_bits,
+            )
+            .err()
+            .expect("Resident must immediately enter the admitted payload-load bracket");
             let msg = err.to_string();
             assert!(
-                !msg.contains("single .safetensors file") && !msg.contains("precision override"),
-                "{}: expected an eager-load failure, not the up-front guard: {msg}",
+                msg.contains("shard inventory changed after validation"),
+                "{}: expected the eager payload bracket to detect the post-admission mutation: {msg}",
                 variant.id()
             );
         }
