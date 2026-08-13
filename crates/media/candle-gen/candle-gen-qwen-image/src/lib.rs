@@ -1310,6 +1310,14 @@ pub fn register_providers(
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
     let registry = registry
         .register_generator(REGISTRATION)
+        .register_encoder_contract_route(gen_core::EncoderContractRouteRegistration {
+            route_id: "qwen_image_edit",
+            provider_id: MODEL_ID,
+        })
+        .register_encoder_contract_route(gen_core::EncoderContractRouteRegistration {
+            route_id: "qwen_image_control",
+            provider_id: MODEL_ID,
+        })
         .register_imported_model(gen_core::ImportedModelRegistration {
             family: "qwen-image",
             source: gen_core::ImportedModelSource::ComfyUiTree,
@@ -1401,6 +1409,17 @@ mod explicit_registry_tests {
             .collect();
 
         assert_eq!(explicit, ["qwen_image"]);
+        for id in ["qwen_image", "qwen_image_edit", "qwen_image_control"] {
+            assert_eq!(
+                registry.provider_encoder_contract(id),
+                Some(super::ENCODER_CONTRACT),
+                "{id} must resolve through the provider-owned contract surface"
+            );
+        }
+        assert_eq!(
+            registry.provider_encoder_contract("qwen_image_unknown"),
+            None
+        );
     }
 }
 

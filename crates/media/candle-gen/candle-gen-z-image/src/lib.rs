@@ -108,6 +108,14 @@ pub fn register_providers(
     let registry = registry
         .register_generator(REGISTRATION)
         .register_generator(base::REGISTRATION)
+        .register_encoder_contract_route(gen_core::EncoderContractRouteRegistration {
+            route_id: "z_image_turbo_control",
+            provider_id: MODEL_ID,
+        })
+        .register_encoder_contract_route(gen_core::EncoderContractRouteRegistration {
+            route_id: "z_image_control",
+            provider_id: base::MODEL_ID,
+        })
         .register_imported_model(gen_core::ImportedModelRegistration {
             family: "z-image",
             source: gen_core::ImportedModelSource::ComfyUiTree,
@@ -1498,5 +1506,21 @@ mod explicit_registry_tests {
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
         assert_eq!(explicit_trainers, ["z_image_turbo"]);
+        for id in [
+            "z_image_turbo",
+            "z_image",
+            "z_image_turbo_control",
+            "z_image_control",
+        ] {
+            assert_eq!(
+                registry.provider_encoder_contract(id),
+                Some(super::ENCODER_CONTRACT),
+                "{id} must resolve through the provider-owned contract surface"
+            );
+        }
+        assert_eq!(
+            registry.provider_encoder_contract("z_image_control_typo"),
+            None
+        );
     }
 }

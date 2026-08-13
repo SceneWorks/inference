@@ -2171,7 +2171,11 @@ pub fn register_providers(
         .register_generator(TURBO_REGISTRATION)
         .register_generator(RAW_REGISTRATION)
         .register_generator(EDIT_REGISTRATION)
-        .register_generator(TURBO_EDIT_REGISTRATION);
+        .register_generator(TURBO_EDIT_REGISTRATION)
+        .register_encoder_contract_route(gen_core::EncoderContractRouteRegistration {
+            route_id: "krea_2_turbo_control",
+            provider_id: KREA_2_TURBO_ID,
+        });
     #[cfg(feature = "cuda")]
     let registry = registry
         .register_memory_strategy(TURBO_MEMORY_REGISTRATION)
@@ -2292,6 +2296,18 @@ mod explicit_registry_tests {
             ]
         );
         assert_eq!(explicit_trainers, ["krea_2_raw", "krea_2_control"]);
+        assert_eq!(
+            registry.provider_encoder_contract(super::KREA_2_TURBO_ID),
+            Some(super::ENCODER_CONTRACT)
+        );
+        assert_eq!(
+            registry.provider_encoder_contract("krea_2_turbo_control"),
+            Some(super::ENCODER_CONTRACT)
+        );
+        assert_eq!(
+            registry.provider_encoder_contract("krea_2_control_typo"),
+            None
+        );
 
         let spec = candle_gen::gen_core::LoadSpec::new(candle_gen::gen_core::WeightsSource::Dir(
             "/nonexistent".into(),

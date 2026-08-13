@@ -164,6 +164,21 @@ pub struct ImportedModelRegistration {
     pub inherit_adapters: bool,
 }
 
+/// Provider-owned encoder-contract alias for a real route assembled outside an ordinary
+/// [`ModelRegistration`].
+///
+/// Bespoke edit/control routes often reuse a registered base generator's prompt encoder while
+/// loading the denoiser through a platform-specific path.  The alias keeps that relationship in
+/// the inference composition root: callers resolve the authored route id and never need to know or
+/// hardcode which registered base provider owns its [`crate::EncoderContract`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EncoderContractRouteRegistration {
+    /// The externally routed provider id (for example a composed control route).
+    pub route_id: &'static str,
+    /// The ordinary registered generator whose descriptor is the sole contract oracle.
+    pub provider_id: &'static str,
+}
+
 /// Optional, pre-load memory-strategy contract registration for one provider route id.
 ///
 /// Kept separate from [`ModelRegistration`] so every existing provider remains source-compatible:
@@ -339,6 +354,7 @@ pub struct AudioEmbedderRegistration {
 pub struct ProviderRegistryBuilder {
     generators: Vec<ModelRegistration>,
     imported_models: Vec<ImportedModelRegistration>,
+    encoder_contract_routes: Vec<EncoderContractRouteRegistration>,
     memory_strategy: Vec<MemoryRegistration>,
     memory_contract_fixture: Vec<MemoryContractFixtureRegistration>,
     memory_behavior: Vec<MemoryBehaviorRegistration>,
@@ -376,6 +392,11 @@ impl ProviderRegistryBuilder {
         register_imported_model,
         imported_models,
         ImportedModelRegistration
+    );
+    builder_registration_method!(
+        register_encoder_contract_route,
+        encoder_contract_routes,
+        EncoderContractRouteRegistration
     );
     builder_registration_method!(
         register_activation_memory,
@@ -477,6 +498,52 @@ impl ProviderRegistryBuilder {
             }};
         }
         ensure_unique!(generators, "generator");
+        {
+            let mut route_ids = std::collections::BTreeSet::new();
+            for registration in &self.encoder_contract_routes {
+                if !is_registry_ident(registration.route_id) {
+                    return Err(Error::Msg(
+                        "encoder-contract route id must be a non-empty lowercase registry identifier"
+                            .to_owned(),
+                    ));
+                }
+                if !route_ids.insert(registration.route_id) {
+                    return Err(Error::Msg(format!(
+                        "duplicate encoder-contract route id '{}'",
+                        registration.route_id
+                    )));
+                }
+            }
+            for registration in &self.encoder_contract_routes {
+                if self
+                    .generators
+                    .iter()
+                    .any(|generator| (generator.descriptor)().id == registration.route_id)
+                {
+                    return Err(Error::Msg(format!(
+                        "encoder-contract route '{}' shadows a registered generator",
+                        registration.route_id
+                    )));
+                }
+                let Some(descriptor) = self
+                    .generators
+                    .iter()
+                    .map(|generator| (generator.descriptor)())
+                    .find(|descriptor| descriptor.id == registration.provider_id)
+                else {
+                    return Err(Error::Msg(format!(
+                        "encoder-contract route '{}' targets unregistered generator '{}'",
+                        registration.route_id, registration.provider_id
+                    )));
+                };
+                if descriptor.encoder_contract.is_none() {
+                    return Err(Error::Msg(format!(
+                        "encoder-contract route '{}' targets generator '{}' with no encoder contract",
+                        registration.route_id, registration.provider_id
+                    )));
+                }
+            }
+        }
         {
             let mut routes = std::collections::BTreeSet::new();
             for registration in &self.imported_models {
@@ -650,6 +717,7 @@ impl ProviderRegistryBuilder {
         Ok(ProviderRegistry {
             generators: self.generators.into_boxed_slice(),
             imported_models: self.imported_models.into_boxed_slice(),
+            encoder_contract_routes: self.encoder_contract_routes.into_boxed_slice(),
             memory_strategy: self.memory_strategy.into_boxed_slice(),
             memory_contract_fixture: self.memory_contract_fixture.into_boxed_slice(),
             memory_behavior: self.memory_behavior.into_boxed_slice(),
@@ -673,6 +741,7 @@ impl ProviderRegistryBuilder {
 pub struct ProviderRegistry {
     generators: Box<[ModelRegistration]>,
     imported_models: Box<[ImportedModelRegistration]>,
+    encoder_contract_routes: Box<[EncoderContractRouteRegistration]>,
     memory_strategy: Box<[MemoryRegistration]>,
     memory_contract_fixture: Box<[MemoryContractFixtureRegistration]>,
     memory_behavior: Box<[MemoryBehaviorRegistration]>,
@@ -716,6 +785,38 @@ macro_rules! explicit_registry_kind {
 }
 
 impl ProviderRegistry {
+    /// Resolve the encoder contract for an ordinary generator or an explicitly registered bespoke
+    /// route. Unknown routes, and ordinary generators that do not support substitution, return
+    /// `None`; aliases are validated at registry construction and cannot target another alias or a
+    /// provider without a contract.
+    pub fn provider_encoder_contract(&self, id: &str) -> Option<crate::EncoderContract> {
+        if let Some(descriptor) = self
+            .generators
+            .iter()
+            .map(|registration| (registration.descriptor)())
+            .find(|descriptor| descriptor.id == id)
+        {
+            return descriptor.encoder_contract;
+        }
+        let provider_id = self
+            .encoder_contract_routes
+            .iter()
+            .find(|registration| registration.route_id == id)?
+            .provider_id;
+        self.generators
+            .iter()
+            .map(|registration| (registration.descriptor)())
+            .find(|descriptor| descriptor.id == provider_id)?
+            .encoder_contract
+    }
+
+    /// Every provider-owned bespoke route participating in encoder-contract lookup.
+    pub fn encoder_contract_routes(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &EncoderContractRouteRegistration> {
+        self.encoder_contract_routes.iter()
+    }
+
     /// Every provider-owned imported-source route in this explicit platform catalog.
     pub fn imported_models(&self) -> impl ExactSizeIterator<Item = &ImportedModelRegistration> {
         self.imported_models.iter()
@@ -2037,6 +2138,54 @@ mod tests {
             "dummy_test_model"
         );
         assert!(registry.trainers().next().is_none());
+    }
+
+    #[test]
+    fn encoder_contract_route_registration_fails_closed() {
+        let missing_target = ProviderRegistryBuilder::new()
+            .register_encoder_contract_route(EncoderContractRouteRegistration {
+                route_id: "dummy_route",
+                provider_id: "missing_provider",
+            })
+            .build()
+            .err()
+            .expect("an encoder route cannot target an unregistered provider")
+            .to_string();
+        assert!(missing_target.contains("targets unregistered generator"));
+
+        let target_without_contract = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .register_encoder_contract_route(EncoderContractRouteRegistration {
+                route_id: "dummy_route",
+                provider_id: "dummy_test_model",
+            })
+            .build()
+            .err()
+            .expect("an encoder route cannot target a provider without a contract")
+            .to_string();
+        assert!(target_without_contract.contains("with no encoder contract"));
+
+        let duplicate = ProviderRegistryBuilder::new()
+            .register_encoder_contract_route(EncoderContractRouteRegistration {
+                route_id: "dummy_route",
+                provider_id: "missing_a",
+            })
+            .register_encoder_contract_route(EncoderContractRouteRegistration {
+                route_id: "dummy_route",
+                provider_id: "missing_b",
+            })
+            .build()
+            .err()
+            .expect("duplicate encoder routes must fail before resolution")
+            .to_string();
+        assert!(duplicate.contains("duplicate encoder-contract route id"));
+
+        let ordinary = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .build()
+            .unwrap();
+        assert_eq!(ordinary.provider_encoder_contract("dummy_test_model"), None);
+        assert_eq!(ordinary.provider_encoder_contract("unknown_route"), None);
     }
 
     fn composed_memory_contract(_spec: &LoadSpec) -> Result<MemoryProviderContract> {

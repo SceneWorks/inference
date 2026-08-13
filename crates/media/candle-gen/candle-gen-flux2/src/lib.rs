@@ -1467,6 +1467,10 @@ pub fn register_providers(
     let registry = registry
         .register_generator(KLEIN_REGISTRATION)
         .register_generator(DEV_REGISTRATION)
+        .register_encoder_contract_route(gen_core::EncoderContractRouteRegistration {
+            route_id: config::FLUX2_DEV_CONTROL_ID,
+            provider_id: config::FLUX2_DEV_ID,
+        })
         .register_imported_model(gen_core::ImportedModelRegistration {
             family: "flux2",
             source: gen_core::ImportedModelSource::ComfyUiTree,
@@ -1530,6 +1534,18 @@ mod explicit_registry_tests {
             .collect();
 
         assert_eq!(explicit, ["flux2_klein_9b", "flux2_dev"]);
+        assert_eq!(
+            registry.provider_encoder_contract(super::config::FLUX2_DEV_ID),
+            Some(super::config::DEV_ENCODER_CONTRACT)
+        );
+        assert_eq!(
+            registry.provider_encoder_contract(super::config::FLUX2_DEV_CONTROL_ID),
+            Some(super::config::DEV_ENCODER_CONTRACT)
+        );
+        assert_eq!(
+            registry.provider_encoder_contract("flux2_dev_control_typo"),
+            None
+        );
     }
 }
 
