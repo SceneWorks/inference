@@ -30,8 +30,7 @@ use std::collections::HashMap;
 use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::fast::{layer_norm, rms_norm as fast_rms_norm, scaled_dot_product_attention};
 use mlx_rs::ops::{
-    add, concatenate_axis, dequantize, divide, matmul, multiply, power, quantized_matmul, sigmoid,
-    subtract, tanh,
+    add, concatenate_axis, dequantize, divide, matmul, multiply, power, sigmoid, subtract, tanh,
 };
 use mlx_rs::transforms::checkpoint;
 use mlx_rs::transforms::compile::{compile, compile_retained};
@@ -39,7 +38,7 @@ use mlx_rs::{Array, Dtype};
 
 use mlx_gen::train::lora::LoraParams;
 
-use mlx_gen::nn::{gelu_tanh, linear};
+use mlx_gen::nn::{gelu_tanh, linear, quantized_matmul_with_bias};
 use mlx_gen::weights::{to_dtype, Weights};
 use mlx_gen::{Error, Result};
 
@@ -311,10 +310,7 @@ impl LinearKind {
                 b,
                 group,
                 bits,
-            } => Ok(add(
-                &quantized_matmul(x, q, scales, biases, true, *group, *bits)?,
-                b,
-            )?),
+            } => quantized_matmul_with_bias(x, q, scales, biases, Some(b), *group, *bits),
         }
     }
 
