@@ -406,7 +406,7 @@ impl QLinear {
     }
 
     /// The inner shared [`AdaptLinear`] used by dense/MLX-packed projections. INT8-ConvRot carries its
-    /// own additive stack through [`Self::as_additive_mut`]; NVFP4/probed validation legs are bench-only.
+    /// own additive stack through `as_additive_mut`; NVFP4/probed validation legs are bench-only.
     pub fn as_adapt_mut(&mut self) -> Option<&mut AdaptLinear> {
         match self {
             Self::Adapt(a) => Some(a),
