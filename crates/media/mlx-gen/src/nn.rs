@@ -1267,6 +1267,7 @@ mod tests {
         report: &diagnostics::DiagnosticReport,
         operation: &'static str,
         disposition: ToggleDisposition,
+        reason: Option<&'static str>,
     ) -> u64 {
         report
             .counters
@@ -1275,14 +1276,58 @@ mod tests {
                 DiagnosticCounter::ExactEpilogue {
                     operation: recorded_operation,
                     disposition: recorded_disposition,
+                    reason: recorded_reason,
                     count,
-                    ..
                 } if *recorded_operation == operation && *recorded_disposition == disposition => {
-                    Some(*count)
+                    (*recorded_reason == reason).then_some(*count)
                 }
                 _ => None,
             })
             .unwrap_or(0)
+    }
+
+    fn assert_bit_exact(actual: &Array, expected: &Array, context: &str) {
+        assert!(
+            array_eq(actual, expected, false).unwrap().item::<bool>(),
+            "P3 output diverged from the composed baseline for {context}"
+        );
+    }
+
+    fn assert_exact_receipt(
+        report: &diagnostics::DiagnosticReport,
+        operation: &'static str,
+        disposition: ToggleDisposition,
+        reason: Option<&'static str>,
+        count: u64,
+    ) {
+        assert_eq!(
+            exact_receipt_count(report, operation, disposition, reason),
+            count,
+            "unexpected {disposition:?} receipt count for {operation} with reason {reason:?}"
+        );
+    }
+
+    fn assert_no_exact_receipts(report: &diagnostics::DiagnosticReport) {
+        assert!(!report.counters.iter().any(|counter| matches!(
+            counter,
+            DiagnosticCounter::ExactEpilogue { .. }
+                | DiagnosticCounter::Toggle {
+                    toggle: EXACT_EPILOGUES,
+                    ..
+                }
+        )));
+    }
+
+    fn assert_exact_toggle(report: &diagnostics::DiagnosticReport, disposition: ToggleDisposition) {
+        assert!(report.counters.contains(&DiagnosticCounter::Toggle {
+            toggle: EXACT_EPILOGUES,
+            disposition,
+            count: 1,
+        }));
+    }
+
+    fn typed_patterned(shape: &[i32], dtype: Dtype, cosine: bool) -> Array {
+        patterned(shape, cosine).as_dtype(dtype).unwrap()
     }
 
     #[test]
@@ -1781,54 +1826,8 @@ mod tests {
     }
 
     #[test]
-    fn p3_exact_activations_are_bit_exact_and_request_scoped() {
-        let x = patterned(&[3, 17, 65], false);
-
-        let baseline = diagnostics::begin_request("p3-default-activation", "test").unwrap();
-        let eager_silu = silu(&x).unwrap();
-        let eager_gelu = gelu_tanh(&x).unwrap();
-        let baseline = baseline.finish();
-        assert!(!baseline.counters.iter().any(|counter| matches!(
-            counter,
-            DiagnosticCounter::ExactEpilogue { .. }
-                | DiagnosticCounter::Toggle {
-                    toggle: EXACT_EPILOGUES,
-                    ..
-                }
-        )));
-
-        let scope = diagnostics::begin_request_with_toggles(
-            "p3-exact-activation",
-            "test",
-            &[EXACT_EPILOGUES],
-        )
-        .unwrap();
-        let exact_silu = silu(&x).unwrap();
-        let exact_gelu = gelu_tanh(&x).unwrap();
-        assert!(array_eq(&exact_silu, &eager_silu, false)
-            .unwrap()
-            .item::<bool>());
-        assert!(array_eq(&exact_gelu, &eager_gelu, false)
-            .unwrap()
-            .item::<bool>());
-        let report = scope.finish();
-
-        assert_eq!(
-            exact_receipt_count(&report, diagnostics::EXACT_SILU, ToggleDisposition::Applied),
-            1
-        );
-        assert_eq!(
-            exact_receipt_count(
-                &report,
-                diagnostics::EXACT_GELU_TANH,
-                ToggleDisposition::Applied,
-            ),
-            1
-        );
-    }
-
-    #[test]
-    fn p3_exact_convolution_and_group_norm_preserve_eager_rounding() {
+    fn p3_default_path_preserves_every_composed_operation_without_receipts() {
+        let activation = patterned(&[3, 17, 65], false);
         let x2 = patterned(&[1, 8, 8, 16], false);
         let w2 = patterned(&[16, 3, 3, 16], true);
         let b2 = patterned(&[16], false);
@@ -1838,59 +1837,337 @@ mod tests {
         let gn_x = patterned(&[2, 3, 5, 32], false);
         let gn_w = patterned(&[32], true);
         let gn_b = patterned(&[32], false);
+        let qmm_x = patterned(&[32, 64], false);
+        let qmm_w = patterned(&[128, 64], true);
+        let qmm_bias = patterned(&[128], false);
+        let (qmm_wq, qmm_scales, qmm_biases) = quantize(&qmm_w, 64, 4).unwrap();
 
-        let eager2 = conv2d_general(&x2, &w2, Some(&b2), (1, 1), (1, 1), (1, 1), 1).unwrap();
-        let eager3 = conv3d(&x3, &w3, Some(&b3), (1, 1, 1), (1, 1, 1)).unwrap();
-        let eager_gn = group_norm(&gn_x, &gn_w, &gn_b, 8, 1e-5).unwrap();
-
-        // Grouped convolution is deliberately outside the native exact dispatcher. Its output and
-        // rounding still match the default path, and it must coexist with an Applied receipt for a
-        // supported shape under the same request.
-        let grouped_w = patterned(&[16, 3, 3, 8], true);
-        let eager_grouped =
-            conv2d_general(&x2, &grouped_w, Some(&b2), (1, 1), (1, 1), (1, 1), 2).unwrap();
-
-        let scope = diagnostics::begin_request_with_toggles(
-            "p3-exact-conv-norm",
-            "test",
-            &[EXACT_EPILOGUES],
+        let expected_silu = silu(&activation).unwrap();
+        let expected_gelu = gelu_tanh(&activation).unwrap();
+        let expected_conv2 =
+            conv2d_general(&x2, &w2, Some(&b2), (1, 1), (1, 1), (1, 1), 1).unwrap();
+        let expected_conv3 = conv3d(&x3, &w3, Some(&b3), (1, 1, 1), (1, 1, 1)).unwrap();
+        let expected_group_norm = group_norm(&gn_x, &gn_w, &gn_b, 8, 1e-5).unwrap();
+        let expected_qmm = quantized_matmul_with_bias(
+            &qmm_x,
+            &qmm_wq,
+            &qmm_scales,
+            &qmm_biases,
+            Some(&qmm_bias),
+            64,
+            4,
         )
         .unwrap();
-        let exact2 = conv2d_general(&x2, &w2, Some(&b2), (1, 1), (1, 1), (1, 1), 1).unwrap();
-        let exact3 = conv3d(&x3, &w3, Some(&b3), (1, 1, 1), (1, 1, 1)).unwrap();
-        let exact_gn = group_norm(&gn_x, &gn_w, &gn_b, 8, 1e-5).unwrap();
-        let fallback_grouped =
-            conv2d_general(&x2, &grouped_w, Some(&b2), (1, 1), (1, 1), (1, 1), 2).unwrap();
 
-        for (exact, eager) in [
-            (&exact2, &eager2),
-            (&exact3, &eager3),
-            (&exact_gn, &eager_gn),
-            (&fallback_grouped, &eager_grouped),
-        ] {
-            assert!(array_eq(exact, eager, false).unwrap().item::<bool>());
-        }
+        let scope = diagnostics::begin_request("p3-default-full-surface", "test").unwrap();
+        let actual_silu = silu(&activation).unwrap();
+        let actual_gelu = gelu_tanh(&activation).unwrap();
+        let actual_conv2 = conv2d_general(&x2, &w2, Some(&b2), (1, 1), (1, 1), (1, 1), 1).unwrap();
+        let actual_conv3 = conv3d(&x3, &w3, Some(&b3), (1, 1, 1), (1, 1, 1)).unwrap();
+        let actual_group_norm = group_norm(&gn_x, &gn_w, &gn_b, 8, 1e-5).unwrap();
+        let actual_qmm = quantized_matmul_with_bias(
+            &qmm_x,
+            &qmm_wq,
+            &qmm_scales,
+            &qmm_biases,
+            Some(&qmm_bias),
+            64,
+            4,
+        )
+        .unwrap();
         let report = scope.finish();
 
-        for operation in [
-            diagnostics::EXACT_CONV2D_BIAS,
-            diagnostics::EXACT_CONV3D_BIAS,
-            diagnostics::EXACT_GROUP_NORM_AFFINE,
+        for (actual, expected, operation) in [
+            (&actual_silu, &expected_silu, diagnostics::EXACT_SILU),
+            (&actual_gelu, &expected_gelu, diagnostics::EXACT_GELU_TANH),
+            (
+                &actual_conv2,
+                &expected_conv2,
+                diagnostics::EXACT_CONV2D_BIAS,
+            ),
+            (
+                &actual_conv3,
+                &expected_conv3,
+                diagnostics::EXACT_CONV3D_BIAS,
+            ),
+            (
+                &actual_group_norm,
+                &expected_group_norm,
+                diagnostics::EXACT_GROUP_NORM_AFFINE,
+            ),
+            (
+                &actual_qmm,
+                &expected_qmm,
+                diagnostics::EXACT_QUANTIZED_MATMUL_BIAS,
+            ),
         ] {
-            assert_eq!(
-                exact_receipt_count(&report, operation, ToggleDisposition::Applied),
+            assert_bit_exact(actual, expected, operation);
+        }
+        assert_no_exact_receipts(&report);
+    }
+
+    #[test]
+    fn p3_exact_activations_cover_all_supported_dtypes_and_layouts() {
+        for dtype in [Dtype::Float32, Dtype::Float16, Dtype::Bfloat16] {
+            let contiguous = typed_patterned(&[3, 17, 65], dtype, false);
+            let noncontiguous = contiguous.transpose_axes(&[1, 0, 2]).unwrap();
+            for (layout, x) in [("contiguous", contiguous), ("noncontiguous", noncontiguous)] {
+                let eager_silu = silu(&x).unwrap();
+                let eager_gelu = gelu_tanh(&x).unwrap();
+                let scope = diagnostics::begin_request_with_toggles(
+                    "p3-exact-activation",
+                    "test",
+                    &[EXACT_EPILOGUES],
+                )
+                .unwrap();
+                let exact_silu = silu(&x).unwrap();
+                let exact_gelu = gelu_tanh(&x).unwrap();
+                let report = scope.finish();
+
+                assert_bit_exact(
+                    &exact_silu,
+                    &eager_silu,
+                    &format!("silu {dtype:?} {layout}"),
+                );
+                assert_bit_exact(
+                    &exact_gelu,
+                    &eager_gelu,
+                    &format!("gelu_tanh {dtype:?} {layout}"),
+                );
+                assert_exact_receipt(
+                    &report,
+                    diagnostics::EXACT_SILU,
+                    ToggleDisposition::Applied,
+                    None,
+                    1,
+                );
+                assert_exact_receipt(
+                    &report,
+                    diagnostics::EXACT_GELU_TANH,
+                    ToggleDisposition::Applied,
+                    None,
+                    1,
+                );
+                assert_exact_toggle(&report, ToggleDisposition::Applied);
+            }
+        }
+    }
+
+    #[test]
+    fn p3_exact_convolution_and_group_norm_cover_supported_dispatches() {
+        for dtype in [Dtype::Float32, Dtype::Float16, Dtype::Bfloat16] {
+            // These four 2-D cases mirror the native selector's regular, odd/batched,
+            // non-contiguous, and direct-general implicit-GEMM classes. On NAX hardware f16/bf16
+            // exercise the matrix-unit kernels while f32 remains on the standard dispatcher.
+            for (input_shape, weight_shape, noncontiguous) in [
+                (&[1, 8, 8, 16][..], &[16, 3, 3, 16][..], false),
+                (&[2, 9, 11, 16][..], &[16, 3, 3, 16][..], false),
+                (&[2, 9, 11, 16][..], &[16, 3, 3, 16][..], true),
+                (&[2, 15, 17, 5][..], &[7, 3, 3, 5][..], false),
+            ] {
+                let mut source_shape = input_shape.to_vec();
+                if noncontiguous {
+                    source_shape.swap(1, 2);
+                }
+                let mut x = typed_patterned(&source_shape, dtype, false);
+                if noncontiguous {
+                    x = x.transpose_axes(&[0, 2, 1, 3]).unwrap();
+                }
+                let w = typed_patterned(weight_shape, dtype, true);
+                let b = typed_patterned(&[weight_shape[0]], dtype, false);
+                let eager = conv2d_general(&x, &w, Some(&b), (1, 1), (1, 1), (1, 1), 1).unwrap();
+                let scope = diagnostics::begin_request_with_toggles(
+                    "p3-exact-conv2d",
+                    "test",
+                    &[EXACT_EPILOGUES],
+                )
+                .unwrap();
+                let exact = conv2d_general(&x, &w, Some(&b), (1, 1), (1, 1), (1, 1), 1).unwrap();
+                let report = scope.finish();
+
+                assert_bit_exact(
+                    &exact,
+                    &eager,
+                    &format!("conv2d {dtype:?} {input_shape:?} noncontiguous={noncontiguous}"),
+                );
+                assert_exact_receipt(
+                    &report,
+                    diagnostics::EXACT_CONV2D_BIAS,
+                    ToggleDisposition::Applied,
+                    None,
+                    1,
+                );
+                assert_exact_toggle(&report, ToggleDisposition::Applied);
+            }
+
+            let x3 = typed_patterned(&[2, 3, 5, 7, 16], dtype, false);
+            let w3 = typed_patterned(&[16, 3, 3, 3, 16], dtype, true);
+            let b3 = typed_patterned(&[16], dtype, false);
+            let eager3 = conv3d(&x3, &w3, Some(&b3), (1, 1, 1), (1, 1, 1)).unwrap();
+            let scope = diagnostics::begin_request_with_toggles(
+                "p3-exact-conv3d",
+                "test",
+                &[EXACT_EPILOGUES],
+            )
+            .unwrap();
+            let exact3 = conv3d(&x3, &w3, Some(&b3), (1, 1, 1), (1, 1, 1)).unwrap();
+            let report = scope.finish();
+            assert_bit_exact(&exact3, &eager3, &format!("conv3d {dtype:?}"));
+            assert_exact_receipt(
+                &report,
+                diagnostics::EXACT_CONV3D_BIAS,
+                ToggleDisposition::Applied,
+                None,
                 1,
-                "missing Applied receipt for {operation}"
+            );
+            assert_exact_toggle(&report, ToggleDisposition::Applied);
+
+            // Small and large normalized axes select the single-row and looped kernels. The final
+            // case proves the same exact output for a non-contiguous input view.
+            let regular = typed_patterned(&[2, 3, 5, 32], dtype, false);
+            let looped = typed_patterned(&[1, 67, 101, 64], dtype, false);
+            let noncontiguous = typed_patterned(&[2, 4, 3, 32], dtype, false)
+                .transpose_axes(&[0, 2, 1, 3])
+                .unwrap();
+            for (layout, x) in [
+                ("single-row", regular),
+                ("looped", looped),
+                ("noncontiguous", noncontiguous),
+            ] {
+                let channels = *x.shape().last().unwrap();
+                let weight = typed_patterned(&[channels], dtype, true);
+                let bias = typed_patterned(&[channels], dtype, false);
+                let eager = group_norm(&x, &weight, &bias, 8, 1e-5).unwrap();
+                let scope = diagnostics::begin_request_with_toggles(
+                    "p3-exact-group-norm",
+                    "test",
+                    &[EXACT_EPILOGUES],
+                )
+                .unwrap();
+                let exact = group_norm(&x, &weight, &bias, 8, 1e-5).unwrap();
+                let report = scope.finish();
+
+                assert_bit_exact(&exact, &eager, &format!("group_norm {dtype:?} {layout}"));
+                assert_exact_receipt(
+                    &report,
+                    diagnostics::EXACT_GROUP_NORM_AFFINE,
+                    ToggleDisposition::Applied,
+                    None,
+                    1,
+                );
+                assert_exact_toggle(&report, ToggleDisposition::Applied);
+            }
+        }
+    }
+
+    #[test]
+    fn p3_unsupported_operations_preserve_composed_outputs_and_reasons() {
+        let activation = patterned(&[3, 17, 65], false)
+            .as_dtype(Dtype::Int32)
+            .unwrap();
+        let conv2_x = patterned(&[1, 8, 8, 16], false);
+        let conv2_w = patterned(&[16, 3, 3, 8], true);
+        let conv2_b = patterned(&[16], false);
+        let conv3_x = patterned(&[1, 4, 4, 4, 5], false);
+        let conv3_w = patterned(&[17, 3, 3, 3, 5], true);
+        let conv3_b = patterned(&[17], false);
+        let gn_x = patterned(&[2, 3, 5, 32], false);
+        let gn_w = patterned(&[32], true).as_dtype(Dtype::Float16).unwrap();
+        let gn_b = patterned(&[32], false);
+        let qmm_x = patterned(&[1, 128], false);
+        let qmm_w = patterned(&[1024, 128], true);
+        let qmm_bias = patterned(&[1024], false);
+        let (qmm_wq, qmm_scales, qmm_biases) = quantize(&qmm_w, 64, 4).unwrap();
+
+        let eager_silu = silu(&activation).unwrap();
+        let eager_gelu = gelu_tanh(&activation).unwrap();
+        let eager_conv2 = conv2d_general(
+            &conv2_x,
+            &conv2_w,
+            Some(&conv2_b),
+            (1, 1),
+            (1, 1),
+            (1, 1),
+            2,
+        )
+        .unwrap();
+        let eager_conv3 = conv3d(&conv3_x, &conv3_w, Some(&conv3_b), (1, 1, 1), (1, 1, 1)).unwrap();
+        let eager_group_norm = group_norm(&gn_x, &gn_w, &gn_b, 8, 1e-5).unwrap();
+        let eager_qmm = quantized_matmul_with_bias(
+            &qmm_x,
+            &qmm_wq,
+            &qmm_scales,
+            &qmm_biases,
+            Some(&qmm_bias),
+            64,
+            4,
+        )
+        .unwrap();
+
+        let scope =
+            diagnostics::begin_request_with_toggles("p3-all-fallback", "test", &[EXACT_EPILOGUES])
+                .unwrap();
+        let fallback_silu = silu(&activation).unwrap();
+        let fallback_gelu = gelu_tanh(&activation).unwrap();
+        let fallback_conv2 = conv2d_general(
+            &conv2_x,
+            &conv2_w,
+            Some(&conv2_b),
+            (1, 1),
+            (1, 1),
+            (1, 1),
+            2,
+        )
+        .unwrap();
+        let fallback_conv3 =
+            conv3d(&conv3_x, &conv3_w, Some(&conv3_b), (1, 1, 1), (1, 1, 1)).unwrap();
+        let fallback_group_norm = group_norm(&gn_x, &gn_w, &gn_b, 8, 1e-5).unwrap();
+        let fallback_qmm = quantized_matmul_with_bias(
+            &qmm_x,
+            &qmm_wq,
+            &qmm_scales,
+            &qmm_biases,
+            Some(&qmm_bias),
+            64,
+            4,
+        )
+        .unwrap();
+        let report = scope.finish();
+
+        for (actual, expected, operation) in [
+            (&fallback_silu, &eager_silu, diagnostics::EXACT_SILU),
+            (&fallback_gelu, &eager_gelu, diagnostics::EXACT_GELU_TANH),
+            (
+                &fallback_conv2,
+                &eager_conv2,
+                diagnostics::EXACT_CONV2D_BIAS,
+            ),
+            (
+                &fallback_conv3,
+                &eager_conv3,
+                diagnostics::EXACT_CONV3D_BIAS,
+            ),
+            (
+                &fallback_group_norm,
+                &eager_group_norm,
+                diagnostics::EXACT_GROUP_NORM_AFFINE,
+            ),
+            (
+                &fallback_qmm,
+                &eager_qmm,
+                diagnostics::EXACT_QUANTIZED_MATMUL_BIAS,
+            ),
+        ] {
+            assert_bit_exact(actual, expected, operation);
+            assert_exact_receipt(
+                &report,
+                operation,
+                ToggleDisposition::Fallback,
+                Some(EXACT_EPILOGUE_FALLBACK_REASON),
+                1,
             );
         }
-        assert_eq!(
-            exact_receipt_count(
-                &report,
-                diagnostics::EXACT_CONV2D_BIAS,
-                ToggleDisposition::Fallback,
-            ),
-            1
-        );
+        assert_exact_toggle(&report, ToggleDisposition::Fallback);
     }
 
     #[test]
@@ -1951,7 +2228,7 @@ mod tests {
         let odd_x_base = patterned(&[2, K, ODD_M], false);
         let odd_w_f32 = patterned(&[ODD_N, K], true);
         let odd_output_bias_f32 = patterned(&[ODD_N], false);
-        for dtype in [Dtype::Float32, Dtype::Bfloat16] {
+        for dtype in [Dtype::Float32, Dtype::Float16, Dtype::Bfloat16] {
             let x = odd_x_base
                 .as_dtype(dtype)
                 .unwrap()
@@ -1960,27 +2237,29 @@ mod tests {
             let w = odd_w_f32.as_dtype(dtype).unwrap();
             let output_bias = odd_output_bias_f32.as_dtype(dtype).unwrap();
             for bits in [4, 8] {
-                let (wq, scales, biases) = quantize(&w, 64, bits).unwrap();
-                let eager = quantized_matmul_with_bias(
-                    &x,
-                    &wq,
-                    &scales,
-                    &biases,
-                    Some(&output_bias),
-                    64,
-                    bits,
-                )
-                .unwrap();
-                cases.push(Case {
-                    x: x.clone(),
-                    wq,
-                    scales,
-                    biases,
-                    output_bias: output_bias.clone(),
-                    group_size: 64,
-                    bits,
-                    eager,
-                });
+                for group_size in [32, 64, 128] {
+                    let (wq, scales, biases) = quantize(&w, group_size, bits).unwrap();
+                    let eager = quantized_matmul_with_bias(
+                        &x,
+                        &wq,
+                        &scales,
+                        &biases,
+                        Some(&output_bias),
+                        group_size,
+                        bits,
+                    )
+                    .unwrap();
+                    cases.push(Case {
+                        x: x.clone(),
+                        wq,
+                        scales,
+                        biases,
+                        output_bias: output_bias.clone(),
+                        group_size,
+                        bits,
+                        eager,
+                    });
+                }
             }
         }
 
@@ -1992,11 +2271,48 @@ mod tests {
         let batch_x_base = patterned(&[1, BATCH_M, K], false);
         let batch_w_f32 = patterned(&[BATCH_N, K], true);
         let batch_output_bias_f32 = patterned(&[BATCH_N], false);
-        for dtype in [Dtype::Float32, Dtype::Bfloat16] {
+        for dtype in [Dtype::Float32, Dtype::Float16, Dtype::Bfloat16] {
             let x_base = batch_x_base.as_dtype(dtype).unwrap();
             let x = broadcast_to(&x_base, &[2, BATCH_M, K]).unwrap();
             let w = batch_w_f32.as_dtype(dtype).unwrap();
             let output_bias = batch_output_bias_f32.as_dtype(dtype).unwrap();
+            for bits in [4, 8] {
+                for group_size in [32, 64, 128] {
+                    let (wq, scales, biases) = quantize(&w, group_size, bits).unwrap();
+                    let eager = quantized_matmul_with_bias(
+                        &x,
+                        &wq,
+                        &scales,
+                        &biases,
+                        Some(&output_bias),
+                        group_size,
+                        bits,
+                    )
+                    .unwrap();
+                    cases.push(Case {
+                        x: x.clone(),
+                        wq,
+                        scales,
+                        biases,
+                        output_bias: output_bias.clone(),
+                        group_size,
+                        bits,
+                        eager,
+                    });
+                }
+            }
+        }
+
+        // Small-M Q4/Q8 shapes select qmv rather than qmm. Cover all supported dtypes so every
+        // standard/NAX-eligible input proves the truthful composed fallback and stable reason.
+        let small_x_f32 = patterned(&[1, K], false);
+        let small_w_f32 = patterned(&[N, K], true);
+        let small_output_bias_f32 = patterned(&[N], false);
+        let mut fallback_cases = Vec::new();
+        for dtype in [Dtype::Float32, Dtype::Float16, Dtype::Bfloat16] {
+            let x = small_x_f32.as_dtype(dtype).unwrap();
+            let w = small_w_f32.as_dtype(dtype).unwrap();
+            let output_bias = small_output_bias_f32.as_dtype(dtype).unwrap();
             for bits in [4, 8] {
                 let (wq, scales, biases) = quantize(&w, 64, bits).unwrap();
                 let eager = quantized_matmul_with_bias(
@@ -2009,7 +2325,7 @@ mod tests {
                     bits,
                 )
                 .unwrap();
-                cases.push(Case {
+                fallback_cases.push(Case {
                     x: x.clone(),
                     wq,
                     scales,
@@ -2021,23 +2337,6 @@ mod tests {
                 });
             }
         }
-
-        // A small-M Q4 shape selects qmv rather than qmm and therefore exercises the truthful
-        // eager fallback for the same operation identity.
-        let small_x = patterned(&[1, K], false);
-        let small_w = patterned(&[N, K], true);
-        let (small_wq, small_scales, small_biases) = quantize(&small_w, 64, 4).unwrap();
-        let small_output_bias = patterned(&[N], false);
-        let small_eager = quantized_matmul_with_bias(
-            &small_x,
-            &small_wq,
-            &small_scales,
-            &small_biases,
-            Some(&small_output_bias),
-            64,
-            4,
-        )
-        .unwrap();
 
         let scope = diagnostics::begin_request_with_toggles(
             "p3-exact-qmm-bias",
@@ -2058,37 +2357,36 @@ mod tests {
             .unwrap();
             assert!(array_eq(&exact, &case.eager, false).unwrap().item::<bool>());
         }
-        let small_fallback = quantized_matmul_with_bias(
-            &small_x,
-            &small_wq,
-            &small_scales,
-            &small_biases,
-            Some(&small_output_bias),
-            64,
-            4,
-        )
-        .unwrap();
-        assert!(array_eq(&small_fallback, &small_eager, false)
-            .unwrap()
-            .item::<bool>());
+        for case in &fallback_cases {
+            let fallback = quantized_matmul_with_bias(
+                &case.x,
+                &case.wq,
+                &case.scales,
+                &case.biases,
+                Some(&case.output_bias),
+                case.group_size,
+                case.bits,
+            )
+            .unwrap();
+            assert_bit_exact(&fallback, &case.eager, "quantized_matmul_bias fallback");
+        }
         let report = scope.finish();
 
-        assert_eq!(
-            exact_receipt_count(
-                &report,
-                diagnostics::EXACT_QUANTIZED_MATMUL_BIAS,
-                ToggleDisposition::Applied,
-            ),
-            cases.len() as u64
+        assert_exact_receipt(
+            &report,
+            diagnostics::EXACT_QUANTIZED_MATMUL_BIAS,
+            ToggleDisposition::Applied,
+            None,
+            cases.len() as u64,
         );
-        assert_eq!(
-            exact_receipt_count(
-                &report,
-                diagnostics::EXACT_QUANTIZED_MATMUL_BIAS,
-                ToggleDisposition::Fallback,
-            ),
-            1
+        assert_exact_receipt(
+            &report,
+            diagnostics::EXACT_QUANTIZED_MATMUL_BIAS,
+            ToggleDisposition::Fallback,
+            Some(EXACT_EPILOGUE_FALLBACK_REASON),
+            fallback_cases.len() as u64,
         );
+        assert_exact_toggle(&report, ToggleDisposition::Applied);
     }
 
     #[test]

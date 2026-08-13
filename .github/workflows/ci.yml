@@ -399,6 +399,14 @@ jobs:
           cache-bin: "false"
       - name: Exercise MLX engine and complete runtime catalog on NAX
         run: cargo test --locked --lib -p mlx-llm -p runtime-macos
+      # SC-18318 acceptance is correctness-only: exercise the focused synthetic
+      # request-scoped exact-epilogue equality/receipt suite on a live Metal
+      # device. The p3_ filter is intentionally narrow and invokes no timing,
+      # memory, profiling, calibration, matrix, or real-weight path.
+      - name: Exercise exact P3 epilogues on NAX
+        env:
+          MLX_ENABLE_TF32: "1"
+        run: cargo test --locked --lib -p mlx-gen p3_ -- --test-threads=1
       - name: Exercise LLM-only runtime catalog on NAX
         run: cargo test --locked --no-default-features --lib -p runtime-macos
 

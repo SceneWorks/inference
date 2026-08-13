@@ -607,7 +607,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_epilogues_preserve_per_operation_fallback_and_derive_terminal_status() {
+    fn p3_exact_epilogues_preserve_per_operation_fallback_and_derive_terminal_status() {
         let scope = begin_request_with_toggles("p3", "qwen_image", &[EXACT_EPILOGUES]).unwrap();
         record_exact_epilogue(EXACT_CONV2D_BIAS, ToggleDisposition::Applied, None);
         record_exact_epilogue(EXACT_CONV2D_BIAS, ToggleDisposition::Applied, None);
@@ -635,10 +635,30 @@ mod tests {
             disposition: ToggleDisposition::Applied,
             count: 1,
         }));
+
+        let scope =
+            begin_request_with_toggles("p3-fallback", "qwen_image", &[EXACT_EPILOGUES]).unwrap();
+        record_exact_epilogue(
+            EXACT_CONV2D_BIAS,
+            ToggleDisposition::Fallback,
+            Some("unsupported_dtype_shape_or_dispatch"),
+        );
+        let report = scope.finish();
+        assert!(report.counters.contains(&DiagnosticCounter::ExactEpilogue {
+            operation: EXACT_CONV2D_BIAS,
+            disposition: ToggleDisposition::Fallback,
+            reason: Some("unsupported_dtype_shape_or_dispatch"),
+            count: 1,
+        }));
+        assert!(report.counters.contains(&DiagnosticCounter::Toggle {
+            toggle: EXACT_EPILOGUES,
+            disposition: ToggleDisposition::Fallback,
+            count: 1,
+        }));
     }
 
     #[test]
-    fn exact_epilogues_without_an_admitted_operation_are_not_reported_applied() {
+    fn p3_exact_epilogues_without_an_admitted_operation_are_not_reported_applied() {
         let scope = begin_request_with_toggles("p3-empty", "wan", &[EXACT_EPILOGUES]).unwrap();
         let report = scope.finish();
         assert_eq!(
