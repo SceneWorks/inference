@@ -4,10 +4,24 @@
 pub use candle_audio_catalog::audio;
 #[cfg(feature = "media")]
 pub use candle_gen_catalog::media;
+#[cfg(feature = "media")]
+pub use candle_gen_catalog::vae_tiling;
 pub use candle_llm as llm;
 pub use runtime_catalog::{
     core_llm, gen_core, memory_strategy, RuntimeCatalog, RuntimeCatalogSnapshot,
+    VideoDecodeMemoryProfile,
 };
+
+#[cfg(feature = "media")]
+/// Resolve a provider-owned conservative VAE decode profile for contract-safe memory composition.
+pub fn conservative_video_decode_memory_profile(
+    provider_id: &str,
+    width: u32,
+    height: u32,
+    frames: u32,
+) -> Option<VideoDecodeMemoryProfile> {
+    candle_gen_catalog::conservative_video_decode_memory_profile(provider_id, width, height, frames)
+}
 
 /// The Candle backend crates this platform owns, re-exported from the media catalog
 /// (available under the default `media` feature).
@@ -91,6 +105,22 @@ pub fn catalog() -> runtime_catalog::Result<RuntimeCatalog> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "media")]
+    #[test]
+    fn bundle_exposes_engine_id_vae_geometry() {
+        let tiling: super::gen_core::tiling::VaeTiling =
+            super::vae_tiling("bernini").expect("modelled video id");
+        assert_eq!(tiling.full_res_channels, 96);
+        assert!(tiling.causal_temporal);
+        assert_eq!(
+            super::conservative_video_decode_memory_profile("bernini", 64, 64, 9).map(|profile| (
+                profile.working_set_bytes(),
+                profile.resident_decoder_bytes_included(),
+            )),
+            Some((265_830_400, 0))
+        );
+    }
+
     #[test]
     fn smoke_catalog_is_explicit_and_machine_readable() {
         let snapshot = super::catalog().unwrap().snapshot();

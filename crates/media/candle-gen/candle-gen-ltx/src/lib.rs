@@ -65,10 +65,26 @@ use config::{
 use text_encoder::LtxTextEncoder;
 use transformer::AvDiT;
 use vae::LtxVideoVae;
+/// Provider-facing LTX geometry, derived from the decoder implementation.
+pub const VAE_TILING: candle_gen::gen_core::tiling::VaeTiling = LtxVideoVae::VAE_TILING;
 use vocoder::LtxVocoder;
 
 const DIT_DTYPE: DType = DType::BF16;
 const VAE_DTYPE: DType = DType::F32;
+
+#[cfg(test)]
+mod vae_tiling_assignment_tests {
+    #[test]
+    fn provider_id_resolves_to_the_concrete_decoder_geometry() {
+        assert_eq!(
+            super::VAE_TILING,
+            candle_gen::gen_core::tiling::VaeTiling::LTX
+        );
+        assert_eq!(super::VAE_TILING, super::LtxVideoVae::VAE_TILING);
+        assert_eq!(super::vae_tiling(super::MODEL_ID), Some(super::VAE_TILING));
+        assert_eq!(super::vae_tiling("ltx_2_3"), None);
+    }
+}
 /// The request width/height multiple `validate` enforces (= `config::SPATIAL_SCALE` = 32): candle's
 /// single-stage `ltx_2_3_distilled` renders on the 32× VAE grid. Exposed as the pinned-engine stride
 /// SceneWorks ties `requiresDimensionsMultipleOf` to (sc-12587); mirrors `wan::config::SIZE_MULTIPLE_14B`.
@@ -724,6 +740,22 @@ pub fn register_providers(
 /// Build the complete explicit Candle LTX provider catalog.
 pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core::ProviderRegistry> {
     register_providers(candle_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+/// Resolve the load-bearing VAE geometry for a Candle LTX generator id.
+pub fn vae_tiling(provider_id: &str) -> Option<candle_gen::gen_core::tiling::VaeTiling> {
+    (provider_id == MODEL_ID).then_some(VAE_TILING)
+}
+
+/// Resolve the provider-owned conservative VAE decode working-set peak for an LTX generator id.
+pub fn conservative_video_decode_memory_profile(
+    provider_id: &str,
+    width: u32,
+    height: u32,
+    frames: u32,
+) -> Option<candle_gen::VideoDecodeMemoryProfile> {
+    vae_tiling(provider_id)?;
+    vae::conservative_video_decode_memory_profile(width, height, frames)
 }
 
 #[cfg(test)]

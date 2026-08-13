@@ -58,7 +58,7 @@ use mlx_gen_wan::config::WanQuant;
 use mlx_gen_wan::model::effective_te_quant;
 use mlx_gen_wan::pipeline::auto_tiling_budgeted_z16_quality_overlap;
 use mlx_gen_wan::{
-    decode_to_frames, frames_to_images, load_tokenizer, preprocess_i2v_image, Umt5Encoder, WanVae,
+    decode_to_frames, frames_to_images, load_tokenizer, preprocess_i2v_image, Umt5Encoder,
 };
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::{random, Array};
@@ -69,14 +69,15 @@ use crate::generate::{generate_i2v_latents, generate_latents, generate_v2v_laten
 use crate::load::{
     load_krea_realtime_transformer_with_quant, probe_packed_quant, resolve_load_time_quant,
 };
+use crate::{ProviderVae, VAE_TILING};
 
 /// z16 Wan VAE temporal compression (a latent frame decodes to `TEMPORAL_STRIDE` output frames).
-const TEMPORAL_STRIDE: usize = 4;
+const TEMPORAL_STRIDE: usize = VAE_TILING.temporal_scale as usize;
 /// Model-local ceiling for the full latent clip allocated by the AR loop. The z16 temporal mapping
 /// means this accepts at most 1,028 source/output frames (`ceil(frames / 4) == 257`).
 pub(crate) const MAX_LATENT_FRAMES: usize = 257;
 /// z16 Wan VAE spatial stride (latent → pixel; 8× per side). Mirrors `WanModelConfig::vae_stride.1/.2`.
-const SPATIAL_STRIDE: usize = 8;
+const SPATIAL_STRIDE: usize = VAE_TILING.spatial_scale as usize;
 
 /// A fully-specified Krea Realtime text-to-video job (the engine-internal form
 /// [`crate::pipeline`] maps a `GenerationRequest` onto). Dimensions are **pixel** dimensions; the
@@ -301,7 +302,7 @@ pub fn decode_tiling(out_h: usize, out_w: usize, out_frames: i32) -> Result<Opti
 /// mirroring the sibling z16 Wan path's `images.drain(0..trim)` (`mlx-gen-wan::model`). `None` (or a
 /// request ≥ the decoded count) returns the full `4·T_lat` decode untrimmed.
 pub fn decode_latents_to_video(
-    vae: &WanVae,
+    vae: &ProviderVae,
     latents: &Array,
     fps: u32,
     out_frames: Option<usize>,
@@ -462,7 +463,7 @@ pub fn decode_latents_to_video(
 pub fn generate_t2v_from_components(
     transformer: &CausalKreaTransformer,
     cfg: &KreaRealtimeConfig,
-    vae: &WanVae,
+    vae: &ProviderVae,
     context: &Array,
     params: &ArGenParams,
     out_frames: Option<usize>,
@@ -492,7 +493,12 @@ pub fn generate_t2v_from_components(
 /// center-cropped to `(width, height)` and normalized to `[-1, 1]` by the reused
 /// [`preprocess_i2v_image`], then encoded and the batch axis dropped. The pixel size `(width, height)`
 /// must be `latent · 8`, so the encoded latent matches the AR latent geometry.
-fn encode_reference_image(vae: &WanVae, image: &Image, width: u32, height: u32) -> Result<Array> {
+fn encode_reference_image(
+    vae: &ProviderVae,
+    image: &Image,
+    width: u32,
+    height: u32,
+) -> Result<Array> {
     let chw = preprocess_i2v_image(image, width, height)?; // [3, H, W] in [-1, 1]
     let video = chw.expand_dims(1)?.expand_dims(0)?; // [1, 3, 1, H, W]
     let z = vae.encode(&video)?; // [1, z, 1, h8, w8]
@@ -507,7 +513,7 @@ fn encode_reference_image(vae: &WanVae, image: &Image, width: u32, height: u32) 
 /// stacked on the temporal axis (`T = 1 + 4·k`), encoded, and the batch axis dropped. `T_lat =
 /// (T − 1)/4 + 1`.
 fn encode_source_clip(
-    vae: &WanVae,
+    vae: &ProviderVae,
     cfg: &KreaRealtimeConfig,
     frames: &[Image],
     width: u32,
@@ -544,7 +550,7 @@ fn encode_source_clip(
 pub fn generate_i2v_from_components(
     transformer: &CausalKreaTransformer,
     cfg: &KreaRealtimeConfig,
-    vae: &WanVae,
+    vae: &ProviderVae,
     context: &Array,
     reference_image: &Image,
     params: &ArGenParams,
@@ -594,7 +600,7 @@ pub fn generate_i2v_from_components(
 pub fn generate_v2v_from_components(
     transformer: &CausalKreaTransformer,
     cfg: &KreaRealtimeConfig,
-    vae: &WanVae,
+    vae: &ProviderVae,
     context: &Array,
     source_frames: &[Image],
     strength: f32,
@@ -896,7 +902,7 @@ fn stage_components(
 ) -> Result<(
     Array,
     CausalKreaTransformer,
-    WanVae,
+    ProviderVae,
     Vec<AdapterApplyReport>,
 )> {
     let te_quant = resolve_te_quant(root, cfg, quant)?;
@@ -905,7 +911,7 @@ fn stage_components(
     on_progress(Progress::Loading(mlx_gen::LoadPhase::Renderer));
     let (transformer, adapter_reports) = load_transformer(root, cfg, adapters, quant)?;
     let w = Weights::from_file(root.join("vae.safetensors"))?;
-    let vae = WanVae::from_weights(&w)?;
+    let vae = ProviderVae::from_weights(&w)?;
     Ok((context, transformer, vae, adapter_reports))
 }
 

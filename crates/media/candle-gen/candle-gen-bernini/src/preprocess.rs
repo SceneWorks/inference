@@ -11,13 +11,14 @@ use candle_gen::candle_core::{Device, Tensor};
 use candle_gen::gen_core::Image;
 use candle_gen::{CandleError, Result as CResult};
 
-use candle_gen_wan::vae16::WanVae16;
 use candle_gen_wan::wan14b::preprocess_i2v_image;
+
+use crate::ProviderVae;
 
 /// One conditioning image `[1, 16, 1, H/8, W/8]` (z16, normalized): resize → `[-1,1]` `[1,3,1,H,W]` →
 /// [`WanVae16::encode`]. The batch axis is kept (the candle DiT latents are batch-first).
 pub fn encode_image(
-    vae: &WanVae16,
+    vae: &ProviderVae,
     image: &Image,
     width: u32,
     height: u32,
@@ -30,7 +31,7 @@ pub fn encode_image(
 /// One conditioning video clip `[1, 16, T_lat, H/8, W/8]`: each frame resized to `[1,3,1,H,W]`, stacked
 /// on the temporal axis → `[1,3,T,H,W]` (T must be `1 + 4k`) → [`WanVae16::encode`].
 pub fn encode_videoclip(
-    vae: &WanVae16,
+    vae: &ProviderVae,
     frames: &[Image],
     width: u32,
     height: u32,

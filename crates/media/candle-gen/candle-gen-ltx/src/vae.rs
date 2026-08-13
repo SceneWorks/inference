@@ -395,6 +395,9 @@ pub struct LtxVideoVae {
 }
 
 impl LtxVideoVae {
+    /// Geometry owned by the concrete decoder and consumed by its planner and tiled driver.
+    pub const VAE_TILING: VaeTiling = VaeTiling::LTX;
+
     /// Build a decoder-only VAE from a VarBuilder rooted at the `vae.` prefix.
     pub fn new(vb: VarBuilder, latent_channels: usize, patch_size: usize) -> Result<Self> {
         Self::build(vb, None, latent_channels, patch_size)
@@ -544,7 +547,7 @@ impl LtxVideoVae {
         // `VaeTiling::LTX` geometry (×32 spatial / ×8 causal temporal) and the single-pass `decode`
         // closure. Unlike wan, `cfg` may carry a temporal tile (ltx `decode` is not per-frame
         // streaming); the shared driver's `plan.t` loop handles both.
-        vae_tiling::decode_tiled(VaeTiling::LTX, "ltx vae", latent, cfg, |tile| {
+        vae_tiling::decode_tiled(Self::VAE_TILING, "ltx vae", latent, cfg, |tile| {
             self.decode(tile)
         })
     }
@@ -557,9 +560,9 @@ impl LtxVideoVae {
     /// analogue of mlx-gen-ltx `decode_to_frames`'s internal budgeting.
     pub fn decode_budgeted(&self, latent: &Tensor) -> Result<Tensor> {
         let (_b, _c, f, h, w) = latent.dims5()?;
-        let out_f = 1 + (f as i32 - 1) * VaeTiling::LTX.temporal_scale; // causal ×8
-        let out_h = h as i32 * VaeTiling::LTX.spatial_scale; // ×32
-        let out_w = w as i32 * VaeTiling::LTX.spatial_scale;
+        let out_f = 1 + (f as i32 - 1) * Self::VAE_TILING.temporal_scale; // causal ×8
+        let out_h = h as i32 * Self::VAE_TILING.spatial_scale; // ×32
+        let out_w = w as i32 * Self::VAE_TILING.spatial_scale;
         match auto_tiling_budgeted_ltx(out_h, out_w, out_f)? {
             Some(cfg) => self.decode_tiled(latent, &cfg),
             None => self.decode(latent),
@@ -603,9 +606,9 @@ const LTX_VAE_DEFAULT_BUDGET_GIB: f64 = 16.0;
 // anchor regression below still proves that the selector does not under-predict any calibrated row.
 // The placeholders (40/300) under-predicted single-pass by ~1.9×; re-run the sweep after a decoder or
 // candle-allocator change. See the `ltx_decode_peak_matches_cuda_anchors` regression test below.
-const LTX_VAE_FIXED_BYTES: f64 = 2.7e9;
-const LTX_VAE_ACCUM_BYTES_PER_VOXEL: f64 = 80.0;
-const LTX_VAE_TILE_BYTES_PER_OUT_VOXEL: f64 = 620.0;
+const LTX_VAE_FIXED_BYTES: u64 = 2_700_000_000;
+const LTX_VAE_ACCUM_BYTES_PER_VOXEL: u64 = 80;
+const LTX_VAE_TILE_BYTES_PER_OUT_VOXEL: u64 = 620;
 
 /// Candidate spatial tile sizes (output px, multiples of the LTX ×32 scale, overlap 64).
 const LTX_VAE_SPATIAL_PX: [i32; 8] = [768, 640, 512, 448, 384, 320, 256, 192];
@@ -625,10 +628,43 @@ fn estimated_ltx_decode_peak_gib(
 ) -> f64 {
     let out_voxels = (out_f * out_h * out_w) as f64;
     let tile_voxels = (tile_f * tile_h * tile_w) as f64;
-    (LTX_VAE_FIXED_BYTES
-        + LTX_VAE_ACCUM_BYTES_PER_VOXEL * out_voxels
-        + LTX_VAE_TILE_BYTES_PER_OUT_VOXEL * tile_voxels)
+    (LTX_VAE_FIXED_BYTES as f64
+        + LTX_VAE_ACCUM_BYTES_PER_VOXEL as f64 * out_voxels
+        + LTX_VAE_TILE_BYTES_PER_OUT_VOXEL as f64 * tile_voxels)
         / GIB_F64
+}
+
+/// Conservative single-pass LTX VAE decode working-set peak in bytes.
+///
+/// This is the exact full-output case of the calibrated cost function used by
+/// [`auto_tiling_budgeted_ltx`]. It includes that model's fixed decoder/base-working-set floor and
+/// decode accumulators/activations, but no DiT or text-encoder composition weights.
+pub fn conservative_video_decode_peak_bytes(width: u32, height: u32, frames: u32) -> Option<u64> {
+    let voxels = u64::from(width)
+        .checked_mul(u64::from(height))?
+        .checked_mul(u64::from(frames))?;
+    if voxels == 0 {
+        return None;
+    }
+    let variable_per_voxel =
+        LTX_VAE_ACCUM_BYTES_PER_VOXEL.checked_add(LTX_VAE_TILE_BYTES_PER_OUT_VOXEL)?;
+    LTX_VAE_FIXED_BYTES.checked_add(variable_per_voxel.checked_mul(voxels)?)
+}
+
+/// Composable form of [`conservative_video_decode_peak_bytes`].
+///
+/// The calibrated fixed term mixes decoder residency with backend/runtime working set, so no
+/// decoder-only portion is source-grounded. It therefore remains entirely in `working_set_bytes`
+/// and `resident_decoder_bytes_included` is conservatively zero.
+pub fn conservative_video_decode_memory_profile(
+    width: u32,
+    height: u32,
+    frames: u32,
+) -> Option<candle_gen::VideoDecodeMemoryProfile> {
+    candle_gen::VideoDecodeMemoryProfile::new(
+        conservative_video_decode_peak_bytes(width, height, frames)?,
+        0,
+    )
 }
 
 /// The safe peak-GiB budget for the LTX decode tiler. Resolved in order: `LTX_VAE_BUDGET_GIB` env
@@ -672,7 +708,7 @@ fn plan_ltx_tiling(
     };
     vae_tiling::plan_tiling(
         "ltx vae decode",
-        VaeTiling::LTX,
+        LtxVideoVae::VAE_TILING,
         height,
         width,
         out_frames,
@@ -685,6 +721,18 @@ fn plan_ltx_tiling(
 #[cfg(test)]
 mod budget_tests {
     use super::*;
+
+    #[test]
+    fn public_decode_peak_is_the_planners_full_output_case() {
+        let profile = conservative_video_decode_memory_profile(64, 64, 9).unwrap();
+        assert_eq!(profile.working_set_bytes(), 2_725_804_800);
+        assert_eq!(profile.resident_decoder_bytes_included(), 0);
+        assert_eq!(conservative_video_decode_peak_bytes(0, 64, 9), None);
+        assert_eq!(
+            conservative_video_decode_peak_bytes(u32::MAX, u32::MAX, u32::MAX),
+            None
+        );
+    }
 
     #[test]
     fn ltx_tiling_single_pass_when_small() {
@@ -742,13 +790,13 @@ mod budget_tests {
             min_temporal_tile_frames, MIN_TEMPORAL_TILE_LATENT_FRAMES,
             MIN_TEMPORAL_TILE_LATENT_OVERLAP,
         };
-        let scale = VaeTiling::LTX.temporal_scale;
+        let scale = LtxVideoVae::VAE_TILING.temporal_scale;
 
         // The grid this crate actually ships, read through the floor: the two starved entries go.
         let kept: Vec<i32> = LTX_VAE_TEMPORAL_FR
             .iter()
             .map(|&(t, _)| t)
-            .filter(|&t| t >= min_temporal_tile_frames(VaeTiling::LTX))
+            .filter(|&t| t >= min_temporal_tile_frames(LtxVideoVae::VAE_TILING))
             .collect();
         assert_eq!(
             kept,

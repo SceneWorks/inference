@@ -26,7 +26,7 @@ use mlx_rs::{Array, Dtype};
 
 use mlx_gen::image::resize_lanczos_u8;
 use mlx_gen::media::AudioTrack;
-use mlx_gen::tiling::{budgeted_plan, TileCandidates, TilingBudgetError, TilingConfig, VaeTiling};
+use mlx_gen::tiling::{budgeted_plan, TileCandidates, TilingBudgetError, TilingConfig};
 use mlx_gen::{AvLatents, CancelFlag, Error, Image, Progress, Result};
 
 use crate::audio_vae::AudioDecoder;
@@ -157,9 +157,9 @@ pub fn renoise(latents: &Array, noise: &Array, noise_scale: f32) -> Result<Array
 pub fn decode_to_frames(vae: &LtxVideoVae, latents: &Array, cancel: &CancelFlag) -> Result<Array> {
     let sh = latents.shape(); // (B, 128, T_lat, H_lat, W_lat)
     let (t_lat, h_lat, w_lat) = (sh[2], sh[3], sh[4]);
-    let out_f = 1 + (t_lat - 1) * TEMPORAL_SCALE as i32;
-    let out_h = h_lat * SPATIAL_SCALE as i32;
-    let out_w = w_lat * SPATIAL_SCALE as i32;
+    let out_f = 1 + (t_lat - 1) * LtxVideoVae::VAE_TILING.temporal_scale;
+    let out_h = h_lat * LtxVideoVae::VAE_TILING.spatial_scale;
+    let out_w = w_lat * LtxVideoVae::VAE_TILING.spatial_scale;
     // F-051: honor a cancel issued after `Progress::Decoding` but before the (single-pass or tiled)
     // decode begins; the tiled path additionally checks per tile.
     if cancel.is_cancelled() {
@@ -216,15 +216,15 @@ pub fn to_uint8_frames(video: &Array) -> Result<Array> {
 /// dominates small/mid decodes — omitting it would force a no-fixed model to over-predict the
 /// max-size decode by ~140 % and tile pathologically. Fit from `vae_decode_sweep.rs` (5 single-pass
 /// points, intercept ~2.5 GB; rounded **up** to 3.3 for headroom — the model must never under-predict).
-const LTX_VAE_FIXED_BYTES: f64 = 3.3e9;
+const LTX_VAE_FIXED_BYTES: u64 = 3_300_000_000;
 /// Per-output-voxel cost of the LTX decode's full-output f32 accumulators (`output` [1,3,F,H,W] +
 /// `weights` [1,1,F,H,W]) — paid by every tiled plan. Isolated from the single-pass slope minus the
 /// 1024²×25 @512-px tiled anchor (~36 B/voxel); rounded **up** to 40.
-const LTX_VAE_ACCUM_BYTES_PER_VOXEL: f64 = 40.0;
+const LTX_VAE_ACCUM_BYTES_PER_VOXEL: u64 = 40;
 /// Per-tile-output-voxel cost of the LTX decoder working set (×32 spatial / ×8 causal-temporal
 /// upsample). Fit from the same anchors at ~287 B/voxel; rounded **up** to 300. (Far lighter per
 /// voxel than the Wan VAEs — the heavy ×32 upsample runs on a tiny latent.)
-const LTX_VAE_TILE_BYTES_PER_OUT_VOXEL: f64 = 300.0;
+const LTX_VAE_TILE_BYTES_PER_OUT_VOXEL: u64 = 300;
 
 /// Candidate spatial tile sizes (output px, multiples of the LTX ×32 spatial scale, overlap 64).
 const LTX_VAE_SPATIAL_PX: [i32; 8] = [768, 640, 512, 448, 384, 320, 256, 192];
@@ -247,10 +247,43 @@ fn estimated_ltx_decode_peak_gib(
     const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
     let out_voxels = (out_f * out_h * out_w) as f64;
     let tile_voxels = (tile_f * tile_h * tile_w) as f64;
-    (LTX_VAE_FIXED_BYTES
-        + LTX_VAE_ACCUM_BYTES_PER_VOXEL * out_voxels
-        + LTX_VAE_TILE_BYTES_PER_OUT_VOXEL * tile_voxels)
+    (LTX_VAE_FIXED_BYTES as f64
+        + LTX_VAE_ACCUM_BYTES_PER_VOXEL as f64 * out_voxels
+        + LTX_VAE_TILE_BYTES_PER_OUT_VOXEL as f64 * tile_voxels)
         / GIB
+}
+
+/// Conservative single-pass LTX VAE decode working-set peak in bytes.
+///
+/// This is the exact full-output case of the calibrated cost function used by
+/// [`auto_tiling_budgeted_ltx`]. It includes that model's fixed decoder/base-working-set floor and
+/// decode accumulators/activations, but no DiT or text-encoder composition weights.
+pub fn conservative_video_decode_peak_bytes(width: u32, height: u32, frames: u32) -> Option<u64> {
+    let voxels = u64::from(width)
+        .checked_mul(u64::from(height))?
+        .checked_mul(u64::from(frames))?;
+    if voxels == 0 {
+        return None;
+    }
+    let variable_per_voxel =
+        LTX_VAE_ACCUM_BYTES_PER_VOXEL.checked_add(LTX_VAE_TILE_BYTES_PER_OUT_VOXEL)?;
+    LTX_VAE_FIXED_BYTES.checked_add(variable_per_voxel.checked_mul(voxels)?)
+}
+
+/// Composable form of [`conservative_video_decode_peak_bytes`].
+///
+/// The calibrated fixed term mixes decoder residency with backend/runtime working set, so no
+/// decoder-only portion is source-grounded. It therefore remains entirely in `working_set_bytes`
+/// and `resident_decoder_bytes_included` is conservatively zero.
+pub fn conservative_video_decode_memory_profile(
+    width: u32,
+    height: u32,
+    frames: u32,
+) -> Option<mlx_gen::VideoDecodeMemoryProfile> {
+    mlx_gen::VideoDecodeMemoryProfile::new(
+        conservative_video_decode_peak_bytes(width, height, frames)?,
+        0,
+    )
 }
 
 /// **Memory-budgeted** tiling for the LTX VAE decode (sc-6894 F-004): routes the shared
@@ -283,7 +316,7 @@ fn plan_ltx_tiling(
         temporal_overlap_policy: mlx_gen::tiling::TemporalOverlapPolicy::HalfTile,
     };
     budgeted_plan(
-        VaeTiling::LTX,
+        LtxVideoVae::VAE_TILING,
         height,
         width,
         out_frames,
@@ -1349,7 +1382,7 @@ mod tests {
     #[test]
     fn ltx_tiling_never_selects_a_starved_temporal_tile() {
         use mlx_gen::tiling::{MIN_TEMPORAL_TILE_LATENT_FRAMES, MIN_TEMPORAL_TILE_LATENT_OVERLAP};
-        let scale = VaeTiling::LTX.temporal_scale;
+        let scale = LtxVideoVae::VAE_TILING.temporal_scale;
         for (w, h, f) in [
             (1280, 704, 121),
             (1280, 720, 121),
@@ -1380,6 +1413,18 @@ mod tests {
             plan_ltx_tiling(h, w, f, 12.0)
                 .unwrap_or_else(|e| panic!("{w}x{h}x{f} became infeasible at 12 GiB: {e}"));
         }
+    }
+
+    #[test]
+    fn public_decode_peak_is_the_planners_full_output_case() {
+        let profile = conservative_video_decode_memory_profile(64, 64, 9).unwrap();
+        assert_eq!(profile.working_set_bytes(), 3_312_533_760);
+        assert_eq!(profile.resident_decoder_bytes_included(), 0);
+        assert_eq!(conservative_video_decode_peak_bytes(0, 64, 9), None);
+        assert_eq!(
+            conservative_video_decode_peak_bytes(u32::MAX, u32::MAX, u32::MAX),
+            None
+        );
     }
 
     #[test]

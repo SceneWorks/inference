@@ -146,6 +146,7 @@ pub use seed::{
 // tile GEOMETRY stays in `gen_core::tiling`; this module owns the candle-side execution of a plan,
 // parameterized by each VAE's cost model + decode closure so the per-VAE numerics are unchanged.
 pub mod vae_tiling;
+pub use gen_core::tiling::VideoDecodeMemoryProfile;
 
 // Shared safetensors key→`Tensor` weight map (sc-9044 / F-060): the non-`VarBuilder` loader (float
 // dtype-coerce, hard duplicate-key policy, prefix-filtered header-only reads) that the SDXL IP-Adapter/
