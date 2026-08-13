@@ -1098,12 +1098,16 @@ Draft had `RegistrationRequired` only; evidence adds `AttributionRequired`.
 
 ## 15. `apple-mlr` — Apple Machine Learning Research Model License Agreement — **NEW**
 
-- **text_url**: `https://huggingface.co/apple/DFN5B-CLIP-ViT-H-14-384/raw/main/LICENSE`
-  (HTTP 200, 5,820 bytes, retrieved 2026-08-02)
+- **text_url**: `https://huggingface.co/apple/DFN5B-CLIP-ViT-H-14-378/raw/main/LICENSE`
+  (HTTP 200, 5,820 bytes, retrieved 2026-08-13; immutable repo revision
+  `01b771ed0d1395ca5ffdd279897d665ebe00dfd2`)
 - **declared upstream**: already recorded in this repo as `LicenseRef-Apple-MLR` /
   "Apple Machine Learning Research Model License Agreement"
-- **In-catalog checkpoints**: `apple/DFN5B-CLIP-ViT-H-14-384`, the CLIP conditioner inside both
-  MMAudio providers — **2 rows already shipping** in `release/model-weight-licenses.json`
+- **In-catalog checkpoints**: canonical `apple/DFN5B-CLIP-ViT-H-14-378`, the CLIP conditioner
+  inside both MMAudio providers — **2 rows already shipping** in
+  `release/model-weight-licenses.json`. MMAudio feeds this 378-native checkpoint at 384×384; its
+  patch-14/stride-14 visual stem yields the same 27×27 grid at both resolutions. The stable internal
+  component key therefore remains `dfn5b_clip_vit_h14_384`.
 - **gated**: `False`
 
 | ✔ | term | verbatim support |
@@ -1218,7 +1222,8 @@ Gating status (`gated` field) and card metadata were read from `https://huggingf
 
 # Retrieval log
 
-Every URL below was fetched on **2026-08-02** with `curl -sSL`. HTTP status recorded as observed.
+Every URL below was fetched on **2026-08-02** with `curl -sSL`, except the corrected canonical
+`apple-mlr` URL, which was re-fetched on **2026-08-13**. HTTP status recorded as observed.
 
 | family | URL | status |
 | --- | --- | --- |
@@ -1247,7 +1252,7 @@ Every URL below was fetched on **2026-08-02** with `curl -sSL`. HTTP status reco
 | nvidia-nsclv1 (declaration) | `https://huggingface.co/nvidia/PiD/raw/main/README.md` | 200 |
 | insightface-research-only | `https://raw.githubusercontent.com/deepinsight/insightface/master/README.md` | 200 |
 | chatglm3-model-license | `https://raw.githubusercontent.com/THUDM/ChatGLM3/main/MODEL_LICENSE` | 200 |
-| apple-mlr | `https://huggingface.co/apple/DFN5B-CLIP-ViT-H-14-384/raw/main/LICENSE` | 200 |
+| apple-mlr | `https://huggingface.co/apple/DFN5B-CLIP-ViT-H-14-378/raw/main/LICENSE` | 200 |
 | llama-3-1-community | `https://raw.githubusercontent.com/meta-llama/llama-models/main/models/llama3_1/LICENSE` | 200 |
 | SANA 1600M (U5) | `https://huggingface.co/Efficient-Large-Model/Sana_1600M_1024px_diffusers/raw/main/LICENSE` | 200 — **Apache-2.0** |
 | SANA 1600M, URL cited in `candle-gen-sana/NOTICE` (U5) | `.../Sana_1600M_1024px_diffusers/raw/main/LICENSE.txt` | **404** |

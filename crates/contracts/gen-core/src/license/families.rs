@@ -659,13 +659,13 @@ pub const CHATGLM3_MODEL_LICENSE: LicenseFamily = LicenseFamily {
 
 /// Apple Machine Learning Research Model License Agreement.
 ///
-/// Text read at <https://huggingface.co/apple/DFN5B-CLIP-ViT-H-14-384/raw/main/LICENSE> on
-/// 2026-08-02.
+/// Text read at <https://huggingface.co/apple/DFN5B-CLIP-ViT-H-14-378/raw/main/LICENSE> on
+/// 2026-08-13.
 pub const APPLE_MLR: LicenseFamily = LicenseFamily {
     id: "apple-mlr",
     spdx_id: "LicenseRef-Apple-MLR",
     name: "Apple Machine Learning Research Model License Agreement",
-    text_url: "https://huggingface.co/apple/DFN5B-CLIP-ViT-H-14-384/raw/main/LICENSE",
+    text_url: "https://huggingface.co/apple/DFN5B-CLIP-ViT-H-14-378/raw/main/LICENSE",
     terms: &[
         // §1 "limited license, to use, copy, modify, distribute, and create Model Derivatives …
         // exclusively for Research Purposes. … \"Research Purposes\" does not include any commercial
