@@ -80,6 +80,31 @@ pub struct Krea2ControlBranch {
     inject_offset: usize,
 }
 
+/// Header-only twin of [`Krea2ControlBranch::quantize`]'s projection walk. Memory contracts use it
+/// to price exactly the branch matrices that are group-packed; norms and modulation stay dense.
+pub(crate) fn is_control_quant_target(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("blocks.") else {
+        return false;
+    };
+    let Some((index, leaf)) = rest.split_once('.') else {
+        return false;
+    };
+    !index.is_empty()
+        && index.chars().all(|ch| ch.is_ascii_digit())
+        && [
+            "attn.to_q.weight",
+            "attn.to_k.weight",
+            "attn.to_v.weight",
+            "attn.to_gate.weight",
+            "attn.to_out.0.weight",
+            "ff.gate.weight",
+            "ff.up.weight",
+            "ff.down.weight",
+            "proj_out.weight",
+        ]
+        .contains(&leaf)
+}
+
 impl Krea2ControlBranch {
     /// Load the branch from a control checkpoint [`WeightsSource`] (a single `.safetensors` `File`, or a
     /// `Dir` of shards), against the base DiT `cfg` (block dims must match the frozen base).
@@ -110,6 +135,43 @@ impl Krea2ControlBranch {
     ) -> Result<Self> {
         control
             .read_unchanged(|path| Self::from_source(&WeightsSource::File(path.to_path_buf()), cfg))
+    }
+
+    /// Build a quantized File overlay under one retained source pin without first evaluating the
+    /// complete dense branch. The temporary source map is dropped after construction; each retained
+    /// projection is then packed and materialized independently, bounding the dense transient.
+    pub(crate) fn from_pinned_file_bounded(
+        control: &mlx_gen::PinnedWeightsFile,
+        cfg: &Krea2Config,
+        bits: i32,
+    ) -> Result<Self> {
+        control.read_unchanged(|path| {
+            let weights = Weights::from_file(path)?;
+            Self::from_weights_bounded(weights, cfg, bits)
+        })
+    }
+
+    /// Build a bounded quantized branch from either an imported file or a directory of shards. MLX
+    /// keeps both source forms lazy; consuming and dropping the temporary map before projection-wise
+    /// evaluation prevents the dense source map from accumulating beside the packed branch.
+    pub(crate) fn from_source_bounded(
+        control: &WeightsSource,
+        cfg: &Krea2Config,
+        bits: i32,
+    ) -> Result<Self> {
+        let weights = match control {
+            WeightsSource::File(path) => Weights::from_file(path)?,
+            WeightsSource::Dir(path) => Weights::from_dir(path)?,
+        };
+        Self::from_weights_bounded(weights, cfg, bits)
+    }
+
+    fn from_weights_bounded(weights: Weights, cfg: &Krea2Config, bits: i32) -> Result<Self> {
+        let mut branch = Self::from_weights(&weights, cfg)?;
+        drop(weights);
+        branch.quantize(bits)?;
+        branch.materialize_weights()?;
+        Ok(branch)
     }
 
     /// Assemble the branch from an already-loaded overlay. Infers `N` from the `blocks.{i}.*` keys and
@@ -178,6 +240,14 @@ impl Krea2ControlBranch {
         for cb in &mut self.blocks {
             cb.block.quantize(bits)?;
             cb.proj_out.quantize(bits, Some(crate::quant::GROUP_SIZE))?;
+        }
+        Ok(())
+    }
+
+    fn materialize_weights(&self) -> Result<()> {
+        for block in &self.blocks {
+            block.block.materialize_weights()?;
+            block.proj_out.materialize_weights()?;
         }
         Ok(())
     }
@@ -564,6 +634,22 @@ mod tests {
             );
             branch.quantize(bits).unwrap(); // idempotent
             assert!(branch.blocks.iter().all(|b| b.proj_out.is_quantized()));
+        }
+    }
+
+    #[test]
+    fn bounded_branch_constructor_packs_and_materializes_the_complete_walk() {
+        for bits in [8, 4] {
+            let (weights, cfg) = tiny_overlay(2);
+            let branch = Krea2ControlBranch::from_weights_bounded(weights, &cfg, bits).unwrap();
+            assert_eq!(branch.num_blocks(), 2);
+            assert!(branch
+                .blocks
+                .iter()
+                .all(|block| block.proj_out.is_quantized()));
+            // A second full walk must be valid after the source map has been consumed and dropped;
+            // every retained leaf is now owned by the branch rather than a loader-local map.
+            branch.materialize_weights().unwrap();
         }
     }
 

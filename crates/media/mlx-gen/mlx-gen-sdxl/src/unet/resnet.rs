@@ -97,6 +97,19 @@ impl ResnetBlock2D {
         Ok(())
     }
 
+    pub(crate) fn materialize_weights(&self) -> Result<()> {
+        mlx_rs::transforms::eval([&self.norm1_w, &self.norm1_b, &self.norm2_w, &self.norm2_b])?;
+        self.conv1.materialize_weights()?;
+        self.conv2.materialize_weights()?;
+        if let Some(projection) = &self.time_emb_proj {
+            projection.materialize_weights()?;
+        }
+        if let Some(shortcut) = &self.shortcut {
+            shortcut.materialize_weights()?;
+        }
+        Ok(())
+    }
+
     /// Cast every dtype-bearing leaf to `dtype` (sc-4941 bf16 training): the GroupNorm weights/biases,
     /// both convs, the time-embedding projection, and the 1×1 shortcut.
     pub fn cast_weights(&mut self, dtype: Dtype) -> Result<()> {

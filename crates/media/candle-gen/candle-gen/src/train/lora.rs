@@ -30,7 +30,7 @@ use rand::distr::Uniform;
 use rand::{rngs::StdRng, SeedableRng};
 use rand_distr::Distribution;
 
-use crate::quant::{LokrFactors, QLinear};
+use crate::quant::{DenseLinear, LokrFactors, QLinear};
 use crate::{CandleError, Result};
 
 /// PEFT gaussian-init standard deviation for the **LoRA** `A` factor (diffusers/PEFT
@@ -256,6 +256,54 @@ impl LoraLinear {
     /// (sc-9416).
     pub fn is_packed(&self) -> bool {
         self.base.is_packed()
+    }
+
+    /// Fold only the frozen dense base to Q4/Q8, preserving trainable and forward-time residuals.
+    /// Already-packed bases are idempotent.
+    pub fn quantize_base(&mut self, quant: crate::gen_core::Quant) -> Result<()> {
+        let LoraBase::Dense(linear) = &self.base else {
+            return Ok(());
+        };
+        let mut packed = QLinear::from_dense(DenseLinear::Linear(linear.clone()));
+        packed.quantize(quant)?;
+        self.base = LoraBase::Packed(packed);
+        Ok(())
+    }
+
+    /// Fold the frozen dense base from a CPU-staged model directly onto `device`, preserving every
+    /// forward-time inference residual on that same device. This is intentionally unavailable while
+    /// a trainable/frozen preview adapter is installed: migrating those `Var`-backed factors would
+    /// break the optimizer's storage-sharing contract.
+    pub fn quantize_base_onto(
+        &mut self,
+        quant: crate::gen_core::Quant,
+        device: &Device,
+    ) -> Result<()> {
+        if self.adapter.is_some() || self.frozen.is_some() {
+            return Err(CandleError::Msg(
+                "cannot migrate a trainable LoRA/LoKr projection during load-time quantization"
+                    .into(),
+            ));
+        }
+        if let LoraBase::Dense(linear) = &self.base {
+            let mut packed = QLinear::from_dense(DenseLinear::Linear(linear.clone()));
+            // SDXL's established quantized forward uses the dequant-dense arm; only the destination
+            // changes here, so CPU staging is numerically identical to `quantize_base`.
+            packed.quantize_dequant_onto(quant, device)?;
+            self.base = LoraBase::Packed(packed);
+        }
+        for residual in &mut self.additive {
+            match residual {
+                AdditiveResidual::Lora { a, b, .. } => {
+                    *a = a.to_device(device)?;
+                    *b = b.to_device(device)?;
+                }
+                AdditiveResidual::LokrStructured { factors } => {
+                    *factors = factors.to_device(device)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The PEFT module path (e.g. `down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q`),

@@ -76,6 +76,11 @@ impl RmsScale {
         let y = rms_norm(&x.as_dtype(Dtype::Float32)?, &self.weight, self.eps)?;
         Ok(y.as_dtype(dt)?)
     }
+
+    pub(super) fn materialize_weights(&self) -> Result<()> {
+        mlx_rs::transforms::eval([&self.weight])?;
+        Ok(())
+    }
 }
 
 // ── Sigmoid-gated GQA attention (reference `Attention`) ─────────────────────────────────────
@@ -231,6 +236,14 @@ impl GatedAttention {
         }
         Ok(())
     }
+
+    fn materialize_weights(&self) -> Result<()> {
+        for projection in [&self.q, &self.k, &self.v, &self.gate, &self.o] {
+            projection.materialize_weights()?;
+        }
+        self.norm_q.materialize_weights()?;
+        self.norm_k.materialize_weights()
+    }
 }
 
 /// LoRA/LoKr target routing for the gated attention (sc-7577 / sc-7578): the diffusers leaf names
@@ -284,6 +297,12 @@ impl SwiGlu {
         self.up.quantize(bits, Some(crate::quant::GROUP_SIZE))?;
         self.down.quantize(bits, Some(crate::quant::GROUP_SIZE))?;
         Ok(())
+    }
+
+    fn materialize_weights(&self) -> Result<()> {
+        self.gate.materialize_weights()?;
+        self.up.materialize_weights()?;
+        self.down.materialize_weights()
     }
 
     /// Cast the projection weights to the training compute `dtype` in place (sc-7577).
@@ -356,6 +375,13 @@ impl TextFusionBlock {
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
         self.attn.quantize(bits)?;
         self.mlp.quantize(bits)
+    }
+
+    fn materialize_weights(&self) -> Result<()> {
+        self.prenorm.materialize_weights()?;
+        self.postnorm.materialize_weights()?;
+        self.attn.materialize_weights()?;
+        self.mlp.materialize_weights()
     }
 
     pub fn set_sdpa_checkpoint(&mut self, on: bool) {
@@ -472,6 +498,14 @@ impl SingleStreamBlock {
         self.mlp.quantize(bits)
     }
 
+    pub(crate) fn materialize_weights(&self) -> Result<()> {
+        mlx_rs::transforms::eval([&self.scale_shift_table])?;
+        self.prenorm.materialize_weights()?;
+        self.postnorm.materialize_weights()?;
+        self.attn.materialize_weights()?;
+        self.mlp.materialize_weights()
+    }
+
     pub fn set_sdpa_checkpoint(&mut self, on: bool) {
         self.attn.set_sdpa_checkpoint(on);
     }
@@ -584,6 +618,17 @@ impl TextFusionTransformer {
         }
         for b in &mut self.refiner {
             b.quantize(bits)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn materialize_weights(&self) -> Result<()> {
+        for block in &self.layerwise {
+            block.materialize_weights()?;
+        }
+        self.projector.materialize_weights()?;
+        for block in &self.refiner {
+            block.materialize_weights()?;
         }
         Ok(())
     }
