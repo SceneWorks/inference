@@ -2007,7 +2007,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertNotIn("github.event_name == 'schedule'", job_header)
         self.assertNotIn("inputs.profile == 'all'", job_header)
         self.assertIn(
-            "runs-on: [self-hosted, macOS, ARM64, nax, real-weights]", job
+            "runs-on: [self-hosted, macOS, ARM64, nax, rw-sa3]", job
         )
         self.assertIn("scripts/ci/run_krea_alternate_decoder_smoke.sh", job)
         self.assertLess(
