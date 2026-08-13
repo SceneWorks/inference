@@ -362,8 +362,8 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             // shared `validate_request` rejects any conditioning and the worker keeps those shapes on
             // the Python path.
             conditioning: vec![],
-            // LoRA/LoKr (mlx supports both) and Q4/Q8 quantization are deferred to a later slice; not
-            // advertised, and rejected at load rather than silently dropped.
+            // LoRA/LoKr apply as residuals over dense or packed FLUX projections. Q4/Q8 tiers remain
+            // prepacked snapshot choices rather than on-the-fly quantization.
             supports_lora: true,
             supports_lokr: true,
             // Unified curated sampler/scheduler menu (epic 7114 P4, sc-7123): the denoise routes

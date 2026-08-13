@@ -64,7 +64,8 @@ pub struct Krea2ControlPaths {
     pub root: PathBuf,
     /// Optional INT8-ConvRot DiT single-file. When present, it replaces `root/transformer` while the
     /// tokenizer, Qwen3-VL text encoder, and Qwen-Image VAE continue to load from `root`, matching the
-    /// registered Krea provider's validated ConvRot route. ConvRot does not support adapters.
+    /// registered Krea provider's validated ConvRot route. User LoRA/LoKr residuals apply over the
+    /// frozen int8 projections before the control branch is composed.
     pub convrot_dit: Option<PathBuf>,
     /// The trained control-branch overlay checkpoint (`.safetensors`, e.g. `control_step5000.safetensors`).
     pub control: PathBuf,
@@ -196,12 +197,6 @@ impl Krea2Control {
     /// Retain both phase loaders. The first warm request populates the shared pair; a staged request
     /// loads and releases each phase within `generate`.
     pub fn load(paths: &Krea2ControlPaths) -> Result<Self> {
-        if paths.convrot_dit.is_some() && !paths.adapters.is_empty() {
-            return Err(CandleError::Msg(
-                "krea control: INT8-ConvRot does not support LoRA/LoKr or diff-patch adapters"
-                    .into(),
-            ));
-        }
         let device = candle_gen::default_device()?;
         let text_root = paths.root.clone();
         let text_device = device.clone();
@@ -301,7 +296,11 @@ fn load_control_heavy(
             let dit_w = Weights::from_convrot_file(convrot_dit, device, DType::BF16)?
                 .with_int8_context(int8);
             crate::convert::validate_transformer(&dit_w, &cfg)?;
-            KreaTrainDit::load_inference(&dit_w, &cfg)?
+            let mut dit = KreaTrainDit::load_inference(&dit_w, &cfg)?;
+            if !adapters.is_empty() {
+                crate::adapters::install_additive(&mut dit, adapters, 0)?;
+            }
+            dit
         }
     };
 
@@ -515,10 +514,9 @@ mod tests {
         assert_eq!(control_dit_source(None), ControlDitSource::Snapshot);
     }
 
-    /// ConvRot + adapters is unsupported and must reject before lazy model construction can silently
-    /// substitute the standard transformer or render without the requested adapter.
+    /// ConvRot + adapters is admitted and retained for the lazy heavy-phase loader.
     #[test]
-    fn convrot_rejects_adapters_before_loading_weights() {
+    fn convrot_retains_adapters_for_lazy_heavy_load() {
         let mut paths = missing_paths(OffloadPolicy::Resident);
         paths.convrot_dit = Some(PathBuf::from(
             "/nonexistent/krea2_turbo_int8_convrot.safetensors",
@@ -528,11 +526,7 @@ mod tests {
             1.0,
             candle_gen::gen_core::AdapterKind::Lora,
         ));
-        let error = Krea2Control::load(&paths)
-            .err()
-            .expect("ConvRot plus an adapter must reject")
-            .to_string();
-        assert!(error.contains("INT8-ConvRot does not support"), "{error}");
+        Krea2Control::load(&paths).expect("ConvRot plus an adapter must remain lazily loadable");
     }
 
     /// The request defaults match the Turbo control production knobs (1024², 8 CFG-free steps,

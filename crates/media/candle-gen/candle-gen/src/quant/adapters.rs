@@ -8,7 +8,7 @@ use candle_core::{DType, Device, Result, Tensor};
 use gen_core::weightsmeta as wmeta;
 use gen_core::{AdapterKind, AdapterSpec};
 
-use crate::train::lora::LoraAdapterMeta;
+use crate::train::lora::{parse_lokr_metadata, LoraAdapterMeta};
 use crate::train::merge::{read_adapter, read_scalar, AdapterFile, LoraTriple, Role};
 use crate::{CandleError, Result as CResult};
 
@@ -387,20 +387,10 @@ fn resolve_lokr(
     pending: &mut BTreeMap<String, Vec<PendingLokr>>,
     skipped: &mut usize,
 ) -> CResult<()> {
-    let (rank, alpha) = wmeta::parse_rank_alpha(
+    let (rank, alpha) = parse_lokr_metadata(
         file.meta.get("rank").map(String::as_str),
         file.meta.get("alpha").map(String::as_str),
-    );
-    if !rank.is_finite() || rank <= 0.0 {
-        return Err(CandleError::Msg(format!(
-            "LoKr adapter metadata `rank` must be finite and positive, got {rank}"
-        )));
-    }
-    if !alpha.is_finite() {
-        return Err(CandleError::Msg(format!(
-            "LoKr adapter metadata `alpha` must be finite, got {alpha}"
-        )));
-    }
+    )?;
     let full_scale = alpha as f64 / rank as f64 * scale as f64;
     if !full_scale.is_finite() {
         return Err(CandleError::Msg(format!(
@@ -946,7 +936,10 @@ mod tests {
             |visitor| visitor("proj", &mut linear),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("alpha` must be finite"));
+        let message = error.to_string();
+        assert!(
+            message.contains("invalid metadata scale") && message.contains("alpha must be finite")
+        );
 
         let valid = temp.path().join("valid.safetensors");
         write_lokr(&valid, "proj", w1, w2, "1");

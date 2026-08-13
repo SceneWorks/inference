@@ -47,7 +47,9 @@ use candle_gen::candle_core::{DType, Tensor};
 use candle_gen::gen_core::weightsmeta as wmeta;
 use candle_gen::gen_core::{AdapterKind, AdapterSpec};
 use candle_gen::quant::LokrFactors;
-use candle_gen::train::lora::{reconstruct_lokr_delta, reconstruct_lora_delta, LoraAdapterMeta};
+use candle_gen::train::lora::{
+    parse_lokr_metadata, reconstruct_lokr_delta, reconstruct_lora_delta, LoraAdapterMeta,
+};
 
 use crate::transformer::QwenTransformer;
 // The shared adapter-merge skeleton (sc-8998 / F-018): the format-parsing + merge-report + third-party
@@ -179,10 +181,10 @@ fn merge_lokr_file(
     scale: f32,
     report: &mut MergeReport,
 ) -> Result<()> {
-    let (rank, alpha) = wmeta::parse_rank_alpha(
+    let (rank, alpha) = parse_lokr_metadata(
         af.meta.get("rank").map(String::as_str),
         af.meta.get("alpha").map(String::as_str),
-    );
+    )?;
 
     let mut grouped: BTreeMap<String, BTreeMap<&'static str, Tensor>> = BTreeMap::new();
     for (key, t) in &af.tensors {
@@ -487,10 +489,10 @@ fn resolve_lokr_file(
     pending: &mut BTreeMap<String, Vec<PendingLokr>>,
     skipped_keys: &mut usize,
 ) -> Result<()> {
-    let (rank, alpha) = wmeta::parse_rank_alpha(
+    let (rank, alpha) = parse_lokr_metadata(
         af.meta.get("rank").map(String::as_str),
         af.meta.get("alpha").map(String::as_str),
-    );
+    )?;
     let full = (alpha as f64 / rank as f64) * scale as f64;
     let mut grouped: BTreeMap<String, BTreeMap<&'static str, Tensor>> = BTreeMap::new();
     for (key, t) in &af.tensors {
@@ -550,7 +552,7 @@ pub fn install_additive(
         // silently mis-scale (the dense tier folds it via `merge_lokr_thirdparty`). The file's own
         // metadata is authoritative — the caller's `spec.kind` is deliberately NOT consulted, so a
         // `kind == Lokr` hint can't let an undeclared file slip past into `resolve_lokr_file` (where
-        // `parse_rank_alpha(None, None)` = `(1, 1)` and per-module `.alpha` tensors are dropped),
+        // default metadata parsing would yield `(1, 1)` and per-module `.alpha` tensors are dropped),
         // matching the dense route's stance (sc-11188 / F-086).
         if is_untagged_lycoris_lokr(&af) {
             return Err(CandleError::Msg(format!(
@@ -1052,6 +1054,53 @@ mod tests {
             .to_scalar::<f32>()
             .unwrap();
         assert!(diff < 1e-2, "merged lokr weight off by {diff}");
+    }
+
+    #[test]
+    fn dense_lokr_propagates_shared_scaling_errors_without_reporting_application() {
+        let path = "transformer_blocks.0.attn.to_q";
+        for (rank, alpha, scale) in [
+            ("0", "1", 1.0),
+            ("1", "inf", 1.0),
+            ("1", "1", f32::INFINITY),
+        ] {
+            let mut map = base_map();
+            let before = map[&format!("{path}.weight")].to_dtype(DType::F32).unwrap();
+            let af = AdapterFile {
+                tensors: HashMap::from([
+                    (format!("{path}.lokr_w1"), t2(&[1.0, 0.0, 0.0, 1.0], 2, 2)),
+                    (format!("{path}.lokr_w2"), t2(&[1.0, 0.0, 0.0, 1.0], 2, 2)),
+                ]),
+                meta: HashMap::from([
+                    ("networkType".to_string(), "lokr".to_string()),
+                    ("rank".to_string(), rank.to_string()),
+                    ("alpha".to_string(), alpha.to_string()),
+                ]),
+            };
+            let mut report = MergeReport::default();
+            let error = merge_lokr_file(&mut map, &af, scale, &mut report)
+                .expect_err("invalid scaling must propagate through the Qwen dense installer");
+            assert!(
+                error.to_string().contains("LoKr"),
+                "error must identify the failing adapter kind: {error}"
+            );
+            assert_eq!(
+                report.merged, 0,
+                "a rejected file must report no application"
+            );
+            assert_eq!(
+                (map[&format!("{path}.weight")].to_dtype(DType::F32).unwrap() - before)
+                    .unwrap()
+                    .abs()
+                    .unwrap()
+                    .max_all()
+                    .unwrap()
+                    .to_scalar::<f32>()
+                    .unwrap(),
+                0.0,
+                "a rejected file must not mutate the base weight"
+            );
+        }
     }
 
     /// An untagged third-party LyCORIS LoKr (no `networkType`) is detected by keys + merged.

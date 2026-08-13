@@ -41,7 +41,8 @@ use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::{AdapterKind, AdapterSpec};
 use candle_gen::quant::{AdaptLinear, LokrFactors};
 use candle_gen::train::lora::{
-    reconstruct_lokr_delta, reconstruct_lora_delta, LoraAdapterMeta, LoraLinear,
+    parse_lokr_metadata, reconstruct_lokr_delta, reconstruct_lora_delta, LoraAdapterMeta,
+    LoraLinear,
 };
 // The shared adapter-merge skeleton (sc-8998 / F-018): the format-parsing + merge-report primitives
 // this crate previously hand-copied. Only the Krea-specific key→module resolution (ai-toolkit native
@@ -298,9 +299,14 @@ fn merge_lokr_file(
     table: &BTreeMap<String, String>,
     report: &mut MergeReport,
 ) -> Result<()> {
-    let file_rank = af.meta.get("rank").and_then(|s| s.parse::<f32>().ok());
-    let file_alpha = af.meta.get("alpha").and_then(|s| s.parse::<f32>().ok());
-    let has_file_meta = file_rank.is_some() || file_alpha.is_some();
+    let file_meta = if af.meta.contains_key("rank") || af.meta.contains_key("alpha") {
+        Some(parse_lokr_metadata(
+            af.meta.get("rank").map(String::as_str),
+            af.meta.get("alpha").map(String::as_str),
+        )?)
+    } else {
+        None
+    };
 
     let mut grouped: BTreeMap<String, LokrGroup> = BTreeMap::new();
     for (key, t) in &af.tensors {
@@ -345,9 +351,8 @@ fn merge_lokr_file(
         }
         let (out_f, in_f) = (w.dims()[0], w.dims()[1]);
         // File-level peft metadata (candle-trainer) applied uniformly; else lycoris per-target.
-        let (alpha, rank) = if has_file_meta {
-            let rank = file_rank.unwrap_or(1.0);
-            (file_alpha.unwrap_or(rank), rank)
+        let (alpha, rank) = if let Some((rank, alpha)) = file_meta {
+            (alpha, rank)
         } else {
             match g.rank() {
                 Some(r) => (g.alpha.unwrap_or(r), r),
@@ -723,9 +728,14 @@ fn resolve_lokr_file(
     pending: &mut BTreeMap<String, Vec<PendingLokr>>,
     skipped_keys: &mut usize,
 ) -> Result<()> {
-    let file_rank = af.meta.get("rank").and_then(|s| s.parse::<f32>().ok());
-    let file_alpha = af.meta.get("alpha").and_then(|s| s.parse::<f32>().ok());
-    let has_file_meta = file_rank.is_some() || file_alpha.is_some();
+    let file_meta = if af.meta.contains_key("rank") || af.meta.contains_key("alpha") {
+        Some(parse_lokr_metadata(
+            af.meta.get("rank").map(String::as_str),
+            af.meta.get("alpha").map(String::as_str),
+        )?)
+    } else {
+        None
+    };
 
     let mut grouped: BTreeMap<String, LokrGroup> = BTreeMap::new();
     for (key, t) in &af.tensors {
@@ -756,9 +766,8 @@ fn resolve_lokr_file(
             *skipped_keys += 1;
             continue;
         }
-        let (alpha, rank) = if has_file_meta {
-            let rank = file_rank.unwrap_or(1.0);
-            (file_alpha.unwrap_or(rank), rank)
+        let (alpha, rank) = if let Some((rank, alpha)) = file_meta {
+            (alpha, rank)
         } else {
             match g.rank() {
                 Some(r) => (g.alpha.unwrap_or(r), r),
@@ -804,6 +813,18 @@ impl AdditiveProj for AdaptLinear {
     }
     fn add_lokr(&mut self, factors: LokrFactors) {
         self.push_lokr_structured(factors);
+    }
+}
+
+impl AdditiveProj for crate::quant::QLinear {
+    fn out_in(&self) -> (usize, usize) {
+        self.additive_shape()
+    }
+    fn add_lora(&mut self, a: Tensor, b: Tensor, scale: f64) {
+        self.push_additive_lora(a, b, scale);
+    }
+    fn add_lokr(&mut self, factors: LokrFactors) {
+        self.push_additive_lokr(factors);
     }
 }
 
@@ -2441,6 +2462,79 @@ mod tests {
         assert!(
             i_diff < 1e-4,
             "AdaptLinear front-end leaf additive != fold ({i_diff})"
+        );
+    }
+
+    /// The production installer must see INT8-ConvRot projections as real adapter hosts, not admit the
+    /// request and later report a zero-match. The quant module separately proves residual arithmetic;
+    /// this test pins file resolution, per-source accounting, and the route-facing host contract.
+    #[test]
+    fn install_additive_applies_selected_lora_to_convrot_host() {
+        use crate::quant::QLinear;
+
+        let dev = Device::Cpu;
+        let (out_dim, in_dim, group) = (4usize, 4usize, 4usize);
+        let canonical = Tensor::from_vec(
+            vec![
+                0.5f32, -0.2, 0.1, 0.7, -0.3, 0.8, -0.4, 0.2, 0.6, 0.1, -0.5, 0.9, -0.7, 0.4, 0.3,
+                -0.1,
+            ],
+            (out_dim, in_dim),
+            &dev,
+        )
+        .unwrap();
+        let rotation = candle_gen::quant::regular_hadamard(group, &dev).unwrap();
+        let rotated = candle_gen::quant::convrot_rotate(&canonical, &rotation).unwrap();
+        let parts = candle_gen::quant::quantize_weight_int8_per_channel(&rotated).unwrap();
+        let host = QLinear::convrot_int8(parts.q, parts.scale, group, None, &dev).unwrap();
+
+        struct ConvRotDit {
+            device: Device,
+            host: QLinear,
+        }
+        impl AdditiveDit for ConvRotDit {
+            fn visit_additive(
+                &mut self,
+                f: &mut dyn FnMut(&str, &mut dyn AdditiveProj) -> Result<()>,
+            ) -> Result<()> {
+                f("transformer_blocks.0.attn.to_q", &mut self.host)
+            }
+            fn adapter_device(&self) -> Device {
+                self.device.clone()
+            }
+            fn adapter_surface_hint(&self) -> &'static str {
+                "convrot mock"
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let adapter = tmp.path().join("convrot_lora.safetensors");
+        save_tensors(
+            &HashMap::from([
+                (
+                    "transformer_blocks.0.attn.to_q.lora_A.weight".to_string(),
+                    Tensor::from_vec(vec![0.4f32, -0.2, 0.7, 0.3], (1, in_dim), &dev).unwrap(),
+                ),
+                (
+                    "transformer_blocks.0.attn.to_q.lora_B.weight".to_string(),
+                    Tensor::from_vec(vec![0.5f32, -0.6, 0.2, 0.9], (out_dim, 1), &dev).unwrap(),
+                ),
+            ]),
+            &adapter,
+        )
+        .unwrap();
+        let mut dit = ConvRotDit { device: dev, host };
+        let report = install_additive(
+            &mut dit,
+            &[AdapterSpec::new(adapter, 0.75, AdapterKind::Lora)],
+            0,
+        )
+        .unwrap();
+        assert_eq!(report.applied, 1);
+        assert!(report.skipped_targets.is_empty());
+        assert!(
+            dit.host.is_convrot_int8(),
+            "adapter must preserve the int8 base"
         );
     }
 }

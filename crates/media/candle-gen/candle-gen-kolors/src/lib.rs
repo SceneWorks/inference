@@ -13,7 +13,8 @@
 //! with **deterministic CPU-seeded noise** (sc-3673) so output is launch-portable per seed.
 //!
 //! The descriptor advertises the wired surface — txt2img, single-reference img2img, and packed
-//! **Q4/Q8** MLX-tier inference (sc-10819, epic 9083) — but NOT user LoRA/LoKr. ControlNet-pose and
+//! **Q4/Q8** MLX-tier inference (sc-10819, epic 9083), plus user LoRA/LoKr on the SDXL-family UNet.
+//! ControlNet-pose and
 //! IP-Adapter remain separately wired bespoke Candle providers and are deliberately rejected by the
 //! registered base/img2img loader rather than silently dropped. `backend` is `"candle"` and
 //! `mac_only` is `false`.

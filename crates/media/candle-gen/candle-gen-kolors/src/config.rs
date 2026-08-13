@@ -12,7 +12,8 @@
 //! The candle deviations from the mlx descriptor are the two backend-correct ones the SDXL / FLUX /
 //! Z-Image / Chroma candle slices already make: `backend = "candle"` and `mac_only = false`. This lane
 //! wires **txt2img + single-reference img2img + packed q4/q8 tiers** (sc-10819, epic 9083 — the
-//! `SceneWorks/kolors-mlx` tier is packed-detected from disk). LoRA/LoKr are not advertised;
+//! `SceneWorks/kolors-mlx` tier is packed-detected from disk). LoRA/LoKr are applied through the
+//! shared SDXL-family UNet adapter loader;
 //! ControlNet-pose and IP-Adapter stay on their existing bespoke Candle providers and are rejected
 //! by this registered generator rather than silently dropped (the false-capability trap).
 
@@ -37,7 +38,7 @@ pub const SIZE_MULTIPLE: u32 = 8;
 
 /// Kolors' identity + the surface this candle lane wires: real classifier-free guidance (negative
 /// prompt + CFG scale), txt2img, single-reference img2img, and packed **Q4/Q8** MLX-tier inference
-/// (sc-10819). User LoRA remains unadvertised; ControlNet-pose and IP-Adapter retain separate Candle
+/// (sc-10819). User LoRA/LoKr applies at load; ControlNet-pose and IP-Adapter retain separate Candle
 /// providers, so this descriptor never promises a path `generate` cannot serve. Two backend-correct
 /// deviations from `mlx-gen-kolors`: `backend = "candle"` and `mac_only = false`.
 ///
@@ -64,8 +65,7 @@ pub fn descriptor() -> ModelDescriptor {
             // The registered generator accepts one Reference as a deterministic latent-init img2img.
             // ControlNet-pose and IP-Adapter remain separate, already-wired bespoke providers.
             conditioning: vec![ConditioningKind::Reference],
-            // LoRA/LoKr merge into the SDXL-family UNet at load in the mlx provider (sc-4733), but the
-            // candle merge is not wired in this slice — not advertised, rejected at load.
+            // LoRA/LoKr merge into the vendored SDXL-family UNet on dense and packed tiers.
             supports_lora: true,
             supports_lokr: true,
             // epic 7114 P4 (sc-7124): the native leading EulerDiscrete (`euler_discrete`) stays the

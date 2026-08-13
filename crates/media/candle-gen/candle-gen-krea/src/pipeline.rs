@@ -558,12 +558,13 @@ pub fn load_components_convrot(
     root: &Path,
     convrot_dit: &Path,
     device: &Device,
+    adapters: &[AdapterSpec],
 ) -> Result<Components> {
     // The floor probe needs a cuBLASLt handle to read the device's compute capability — so it KEEPS it
     // and hands it to the DiT weight set as the trunk's one shared handle (sc-12301 scope 5), instead of
     // building 32 MiB of workspace, reading two integers off it, and dropping it.
     let text = load_text(root, device)?;
-    let heavy = load_heavy_convrot(root, convrot_dit, device)?;
+    let heavy = load_heavy_convrot(root, convrot_dit, device, adapters)?;
     Ok(Components { text, heavy })
 }
 
@@ -578,6 +579,7 @@ pub(crate) fn load_heavy_convrot(
     root: &Path,
     convrot_dit: &Path,
     device: &Device,
+    adapters: &[AdapterSpec],
 ) -> Result<KreaHeavy> {
     // The floor probe needs a cuBLASLt handle to read the device's compute capability — so it KEEPS it
     // and hands it to the DiT weight set as the trunk's one shared handle (sc-12301 scope 5), instead of
@@ -589,7 +591,10 @@ pub(crate) fn load_heavy_convrot(
     // shares this ONE handle rather than building its own (the sc-12301 defect).
     let dit_w = Weights::from_convrot_file(convrot_dit, device, DIT_DTYPE)?.with_int8_context(int8);
     crate::convert::validate_transformer(&dit_w, &cfg)?;
-    let dit = Krea2Transformer::load(&dit_w, &cfg)?;
+    let mut dit = Krea2Transformer::load(&dit_w, &cfg)?;
+    if !adapters.is_empty() {
+        crate::adapters::install_additive(&mut dit, adapters, 0)?;
+    }
 
     let vae = load_vae(root, device)?;
 
@@ -622,9 +627,9 @@ pub fn load_components_native(
 }
 
 /// The heavy half of a native single-file load: the dense or dequantized DiT (from `native_dit`, read
-/// through the native→diffusers remap) + the Qwen-Image VAE (from `root`). No adapters/PiD (the
-/// out-of-registry single-file entrypoint bakes any LoRAs into the merge and does not thread overlays —
-/// mirroring the MLX S0b scope); those stay a follow-on with the worker wiring (S0c).
+/// through the native→diffusers remap) + the Qwen-Image VAE (from `root`). This out-of-registry native
+/// single-file entrypoint does not accept job-local adapters or PiD; the registered dense, packed, and
+/// ConvRot routes apply adapter stacks through their dedicated component loaders.
 pub(crate) fn load_heavy_native(
     root: &Path,
     native_dit: &Path,
@@ -654,9 +659,10 @@ pub(crate) fn load_residency_heavy_convrot(
     root: &Path,
     convrot_dit: &Path,
     device: &Device,
+    adapters: &[AdapterSpec],
 ) -> Result<ResidencyHeavy> {
     Ok(ResidencyHeavy {
-        heavy: load_heavy_convrot(root, convrot_dit, device)?,
+        heavy: load_heavy_convrot(root, convrot_dit, device, adapters)?,
         vae_encoder: load_vae_encoder(root, device)?,
     })
 }
