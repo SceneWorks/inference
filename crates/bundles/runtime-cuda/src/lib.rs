@@ -123,6 +123,17 @@ mod tests {
             )),
             Some((265_830_400, 0))
         );
+
+        let svd = super::vae_tiling("svd_xt").expect("SVD decode geometry");
+        assert_eq!(svd, super::providers::svd::ProviderVae::VAE_TILING);
+        assert_eq!(svd.full_res_channels, 256);
+        assert_eq!(svd.writable_frame_cap(576, 1024), 14);
+        assert_eq!(svd.writable_frame_cap(1024, 576), 14);
+        assert_eq!(
+            super::conservative_video_decode_memory_profile("svd_xt", 1024, 576, 25),
+            None,
+            "the exact tiling geometry must not imply a budget-independent SVD peak profile"
+        );
     }
 
     #[test]

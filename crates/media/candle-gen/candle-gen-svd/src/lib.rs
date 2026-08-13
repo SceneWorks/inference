@@ -51,7 +51,10 @@ use image_encoder::SvdImageEncoder;
 use pipeline::SvdParams;
 use scheduler::EdmSchedule;
 use unet::SvdUnet;
-use vae::SvdVae;
+/// The concrete VAE assigned to the SVD-XT route.
+pub type ProviderVae = vae::SvdVae;
+/// Provider-facing SVD geometry, derived from the decoder implementation.
+pub const VAE_TILING: candle_gen::gen_core::tiling::VaeTiling = ProviderVae::VAE_TILING;
 
 /// OpenCLIP ViT-H image-normalization mean/std (the SVD `feature_extractor`).
 #[allow(clippy::excessive_precision)]
@@ -65,13 +68,13 @@ const CLIP_SIZE: usize = 224;
 #[derive(Clone)]
 struct Components {
     image_encoder: Arc<SvdImageEncoder>,
-    vae: Arc<SvdVae>,
+    vae: Arc<ProviderVae>,
     unet: Arc<SvdUnet>,
 }
 
 struct ConditioningComponents {
     image_encoder: SvdImageEncoder,
-    vae: SvdVae,
+    vae: ProviderVae,
 }
 
 fn load_image_encoder(root: &Path, device: &Device) -> CResult<SvdImageEncoder> {
@@ -82,8 +85,8 @@ fn load_image_encoder(root: &Path, device: &Device) -> CResult<SvdImageEncoder> 
     .map_err(Into::into)
 }
 
-fn load_vae(root: &Path, device: &Device) -> CResult<SvdVae> {
-    SvdVae::new(
+fn load_vae(root: &Path, device: &Device) -> CResult<ProviderVae> {
+    ProviderVae::new(
         &VaeConfig::default(),
         component_vb(root, "vae", "diffusion_pytorch_model", DType::F32, device)?,
     )
@@ -421,7 +424,7 @@ impl SvdGenerator {
     #[allow(clippy::too_many_arguments)]
     fn image_latents(
         &self,
-        vae: &SvdVae,
+        vae: &ProviderVae,
         img: &Image,
         height: u32,
         width: u32,
@@ -787,6 +790,19 @@ pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core:
     register_providers(candle_gen::gen_core::ProviderRegistryBuilder::new()).build()
 }
 
+/// Resolve the load-bearing VAE geometry for the Candle SVD generator id.
+///
+/// The write cap applies to one actual VAE decode pass. With the library default, the 25-frame clip
+/// is one 25-frame decode pass and therefore exceeds the 14-frame cap at both shipped 1024x576 and
+/// 576x1024 geometries. SceneWorks, however, resolves both product lanes to an 8-frame chunk, which
+/// is below this write cap (although the live-memory budget can still require spatial tiling).
+/// Consumers must therefore classify the pass using
+/// `min(request_frames, max(1, decode_chunk_size))`, not the whole clip length. Neither "the
+/// shipped default is always tiled" nor "an SVD clip is always single-pass" is a truthful model.
+pub fn vae_tiling(provider_id: &str) -> Option<candle_gen::gen_core::tiling::VaeTiling> {
+    (provider_id == MODEL_ID).then_some(VAE_TILING)
+}
+
 #[cfg(test)]
 mod explicit_registry_tests {
     #[test]
@@ -797,6 +813,23 @@ mod explicit_registry_tests {
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
         assert_eq!(explicit, ["svd_xt"]);
+    }
+
+    #[test]
+    fn provider_id_resolves_to_the_concrete_decoder_geometry() {
+        assert_eq!(super::VAE_TILING, super::ProviderVae::VAE_TILING);
+        assert_eq!(
+            super::vae_tiling(super::MODEL_ID),
+            Some(super::ProviderVae::VAE_TILING)
+        );
+        assert_eq!(super::vae_tiling("not_svd"), None);
+        for (width, height) in [(1024, 576), (576, 1024)] {
+            assert_eq!(
+                super::VAE_TILING.writable_frame_cap(height, width),
+                14,
+                "{width}x{height}"
+            );
+        }
     }
 }
 
