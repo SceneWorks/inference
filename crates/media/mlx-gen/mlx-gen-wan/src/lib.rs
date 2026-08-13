@@ -127,6 +127,48 @@ pub use training::{load_trainer, WanMoeTrainer};
 pub use transformer::{
     WanTransformer, WAN_BLOCK_NORM_DIFF_PATCH_TARGETS, WAN_GLOBAL_ADAPTABLE_PATHS,
 };
+pub const WAN_Z16_VAE_TILING: mlx_gen::tiling::VaeTiling = model::A14bProviderVae::VAE_TILING;
+pub const WAN_Z48_VAE_TILING: mlx_gen::tiling::VaeTiling = model::Ti2vProviderVae::VAE_TILING;
+
+#[cfg(test)]
+mod vae_tiling_assignment_tests {
+    #[test]
+    fn every_wan_generator_id_resolves_to_its_concrete_decoder() {
+        assert_eq!(super::WAN_Z16_VAE_TILING, mlx_gen::tiling::VaeTiling::WAN);
+        assert_eq!(super::WAN_Z48_VAE_TILING, mlx_gen::tiling::VaeTiling::WAN22);
+        assert_eq!(super::WAN_Z16_VAE_TILING, super::WanVae::VAE_TILING);
+        assert_eq!(super::WAN_Z48_VAE_TILING, super::Wan22Vae::VAE_TILING);
+        assert_eq!(
+            super::model::ti2v_vae_tiling(super::MODEL_ID),
+            Some(super::model::Ti2vProviderVae::VAE_TILING)
+        );
+        for id in [super::MODEL_ID_T2V_14B, super::MODEL_ID_I2V_14B] {
+            assert_eq!(
+                super::model::a14b_vae_tiling(id),
+                Some(super::model::A14bProviderVae::VAE_TILING)
+            );
+        }
+        for id in [super::MODEL_ID_VACE, super::MODEL_ID_VACE_FUN] {
+            assert_eq!(
+                super::model_vace::vae_tiling(id),
+                Some(super::model_vace::ProviderVae::VAE_TILING)
+            );
+        }
+        assert_eq!(
+            super::vae_tiling(super::MODEL_ID),
+            Some(super::WAN_Z48_VAE_TILING)
+        );
+        for id in [
+            super::MODEL_ID_T2V_14B,
+            super::MODEL_ID_I2V_14B,
+            super::MODEL_ID_VACE,
+            super::MODEL_ID_VACE_FUN,
+        ] {
+            assert_eq!(super::vae_tiling(id), Some(super::WAN_Z16_VAE_TILING));
+        }
+        assert_eq!(super::vae_tiling("not_wan"), None);
+    }
+}
 pub use vace::{
     binarize_mask, build_vace_control, denoise_vace_moe, prepare_masks, prepare_video_latents,
     WanVaceTransformer,
@@ -152,6 +194,55 @@ pub fn register_providers(
 /// Build the complete explicit MLX Wan provider catalog.
 pub fn provider_registry() -> mlx_gen::gen_core::Result<mlx_gen::gen_core::ProviderRegistry> {
     register_providers(mlx_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+/// Resolve the concrete MLX Wan VAE geometry used by a registered generator id.
+pub fn vae_tiling(provider_id: &str) -> Option<mlx_gen::tiling::VaeTiling> {
+    model::ti2v_vae_tiling(provider_id)
+        .or_else(|| model::a14b_vae_tiling(provider_id))
+        .or_else(|| model_vace::vae_tiling(provider_id))
+}
+
+/// Build a conservative VAE decode profile for one concrete MLX Wan geometry.
+pub fn conservative_video_decode_memory_profile_for_vae(
+    vae: mlx_gen::tiling::VaeTiling,
+    width: u32,
+    height: u32,
+    frames: u32,
+) -> Option<mlx_gen::VideoDecodeMemoryProfile> {
+    // The MLX z16 decode is non-causal and materializes four output frames per latent frame. A
+    // request need not itself lie on that lattice, so price the full decoded allocation:
+    // `4 * ceil(requested_frames / 4)`. The z48 path is causal and already prices the requested
+    // output count directly.
+    let decoded_frames = if vae == model::A14bProviderVae::VAE_TILING {
+        let temporal_scale = vae.temporal_scale as u32;
+        frames
+            .checked_add(temporal_scale - 1)?
+            .checked_div(temporal_scale)?
+            .checked_mul(temporal_scale)?
+    } else {
+        frames
+    };
+    mlx_gen::VideoDecodeMemoryProfile::new(
+        pipeline::conservative_video_decode_peak_bytes_for_vae(vae, width, height, decoded_frames)?,
+        0,
+    )
+}
+
+/// Resolve the provider-owned conservative VAE decode working-set peak for a Wan generator id.
+/// Non-causal z16 routes price the full four-frame decode allocation enclosing the request.
+pub fn conservative_video_decode_memory_profile(
+    provider_id: &str,
+    width: u32,
+    height: u32,
+    frames: u32,
+) -> Option<mlx_gen::VideoDecodeMemoryProfile> {
+    conservative_video_decode_memory_profile_for_vae(
+        vae_tiling(provider_id)?,
+        width,
+        height,
+        frames,
+    )
 }
 
 #[cfg(test)]
@@ -182,5 +273,22 @@ mod explicit_registry_tests {
             explicit_trainers,
             ["wan2_2_t2v_14b", "wan2_2_i2v_14b", "wan2_2_ti2v_5b",]
         );
+    }
+
+    #[test]
+    fn noncausal_z16_profiles_price_the_full_four_frame_allocation() {
+        let peak = |provider_id, frames| {
+            super::conservative_video_decode_memory_profile(provider_id, 64, 64, frames)
+                .map(|profile| profile.working_set_bytes())
+        };
+        let z16 = super::MODEL_ID_T2V_14B;
+        assert_eq!(peak(z16, 1), Some(107_544_576));
+        assert_eq!(peak(z16, 9), Some(322_633_728));
+        assert_eq!(peak(z16, 81), Some(2_258_436_096));
+        assert_eq!(peak(z16, u32::MAX), None);
+
+        // Causal z48 pricing is unchanged: requested output frames are used directly.
+        assert_eq!(peak(super::MODEL_ID, 1), Some(14_090_240));
+        assert_eq!(peak(super::MODEL_ID, 9), Some(126_812_160));
     }
 }

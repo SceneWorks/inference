@@ -260,8 +260,8 @@ fn estimated_denoise_peak_gib(
 /// largest tile's output volume (≈3800 B/voxel through the decoder's 1024-channel stack). With these
 /// two constants both anchors reproduce within ~10 % on the conservative side (the model
 /// over-estimates slightly — what a guard wants).
-const VAE22_ACCUM_BYTES_PER_VOXEL: f64 = 40.0;
-const VAE22_TILE_BYTES_PER_OUT_VOXEL: f64 = 3800.0;
+const VAE22_ACCUM_BYTES_PER_VOXEL: u64 = 40;
+const VAE22_TILE_BYTES_PER_OUT_VOXEL: u64 = 3_800;
 /// Per-tile coefficient for a **bf16** decode (sc-5039). Measured on the same real-weight rig at two
 /// tiles of the 1024×576×97 video (cosine 0.99995, no NaN both): 768 px / 64-frame → **79.7 GB**
 /// (vs 97.7 GB f32), 640 px / 48-frame → **55.1 GB**. The per-tile term only drops to ~85 % of f32
@@ -270,7 +270,7 @@ const VAE22_TILE_BYTES_PER_OUT_VOXEL: f64 = 3800.0;
 /// (the 640/48 point) so the estimate never under-shoots a real peak — the 3100 first guess let the
 /// selector pick a tile that measured 55.1 GB, just over the 54.4 GB safe line at the 64 GB tier.
 /// The fixed accumulator term is unchanged (the blend buffers are f32 either way).
-const VAE22_TILE_BYTES_PER_OUT_VOXEL_BF16: f64 = 3400.0;
+const VAE22_TILE_BYTES_PER_OUT_VOXEL_BF16: u64 = 3_400;
 
 /// Estimated concurrent GPU peak (GiB) of a z48 `vae22` decode whose **largest tile** spans
 /// `tile_f·tile_h·tile_w` output voxels while assembling a `out_f·out_h·out_w` video. `bf16` selects
@@ -299,7 +299,7 @@ fn estimated_vae22_decode_peak_gib(
     };
     let out_voxels = (out_f * out_h * out_w) as f64;
     let tile_voxels = (tile_f * tile_h * tile_w) as f64;
-    (VAE22_ACCUM_BYTES_PER_VOXEL * out_voxels + tile_coeff * tile_voxels) / GIB
+    (VAE22_ACCUM_BYTES_PER_VOXEL as f64 * out_voxels + tile_coeff as f64 * tile_voxels) / GIB
 }
 
 /// Candidate spatial tile sizes (output px, multiples of the vae22 ×16 spatial scale, overlap 64).
@@ -443,7 +443,7 @@ fn plan_vae22_tiling(
         temporal_overlap_policy: TemporalOverlapPolicy::Candidate,
     };
     budgeted_plan(
-        VaeTiling::WAN22,
+        Wan22Vae::VAE_TILING,
         height,
         width,
         out_frames,
@@ -496,12 +496,12 @@ fn wan_budget_error(
 /// anchors (128 GB M-series, f32): the 768²×16 single-pass peak (56.35 GB) minus the same output tiled
 /// @384 px (14.46 GB) pins this term at ~57 B/voxel; rounded **up** to 64 for headroom (the model must
 /// never under-predict — an under-shoot is an OOM, an over-shoot only tiles slightly more).
-const VAE16_ACCUM_BYTES_PER_VOXEL: f64 = 64.0;
+const VAE16_ACCUM_BYTES_PER_VOXEL: u64 = 64;
 /// Per-tile-output-voxel cost of the z16 decoder working set (conv stack + ×8 spatial / ×4 temporal
 /// upsample). Fit from the same anchors at ~6355 B/voxel (≈1.7× the z48 `vae22`'s 3800 — the bigger
 /// spatial upsample); rounded **up** to 6500. z16 decodes f32 in production, so there is no bf16
 /// coefficient (unlike `vae22`, sc-5039).
-const VAE16_TILE_BYTES_PER_OUT_VOXEL: f64 = 6500.0;
+const VAE16_TILE_BYTES_PER_OUT_VOXEL: u64 = 6_500;
 
 /// Candidate spatial tile sizes (output px, multiples of the z16 ×8 spatial scale, overlap 64).
 const VAE16_SPATIAL_PX: [i32; 8] = [768, 640, 512, 448, 384, 320, 256, 192];
@@ -523,7 +523,83 @@ fn estimated_z16_decode_peak_gib(
     const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
     let out_voxels = (out_f * out_h * out_w) as f64;
     let tile_voxels = (tile_f * tile_h * tile_w) as f64;
-    (VAE16_ACCUM_BYTES_PER_VOXEL * out_voxels + VAE16_TILE_BYTES_PER_OUT_VOXEL * tile_voxels) / GIB
+    (VAE16_ACCUM_BYTES_PER_VOXEL as f64 * out_voxels
+        + VAE16_TILE_BYTES_PER_OUT_VOXEL as f64 * tile_voxels)
+        / GIB
+}
+
+/// Evaluate the calibrated Wan VAE decode cost for one output and optional tiling configuration.
+///
+/// Tile extents are capped at the output on every axis, exactly as the budget planner sizes a
+/// candidate. All coefficients are non-negative, so passing `None` is a conservative upper bound for
+/// every valid tiled configuration. The z48 path uses its shipped bf16 coefficient.
+#[doc(hidden)]
+pub fn video_decode_peak_bytes_for_vae_and_tiling(
+    vae: VaeTiling,
+    width: u32,
+    height: u32,
+    frames: u32,
+    tiling: Option<&TilingConfig>,
+) -> Option<u64> {
+    let width = u64::from(width);
+    let height = u64::from(height);
+    let frames = u64::from(frames);
+    let output_voxels = width.checked_mul(height)?.checked_mul(frames)?;
+    if output_voxels == 0 {
+        return None;
+    }
+    let (accum_bytes_per_voxel, tile_bytes_per_voxel) = if vae == WanVae::VAE_TILING {
+        (VAE16_ACCUM_BYTES_PER_VOXEL, VAE16_TILE_BYTES_PER_OUT_VOXEL)
+    } else if vae == Wan22Vae::VAE_TILING {
+        (
+            VAE22_ACCUM_BYTES_PER_VOXEL,
+            VAE22_TILE_BYTES_PER_OUT_VOXEL_BF16,
+        )
+    } else {
+        return None;
+    };
+
+    let positive_extent = |configured: i32, full: u64| {
+        let configured = u64::try_from(configured).ok()?;
+        (configured > 0).then_some(configured.min(full))
+    };
+    let tile_width = tiling
+        .and_then(|cfg| cfg.spatial)
+        .map_or(Some(width), |spatial| {
+            positive_extent(spatial.tile_px, width)
+        })?;
+    let tile_height = tiling
+        .and_then(|cfg| cfg.spatial)
+        .map_or(Some(height), |spatial| {
+            positive_extent(spatial.tile_px, height)
+        })?;
+    let tile_frames = tiling
+        .and_then(|cfg| cfg.temporal)
+        .map_or(Some(frames), |temporal| {
+            positive_extent(temporal.tile_frames, frames)
+        })?;
+    let tile_voxels = tile_width
+        .checked_mul(tile_height)?
+        .checked_mul(tile_frames)?;
+
+    accum_bytes_per_voxel
+        .checked_mul(output_voxels)?
+        .checked_add(tile_bytes_per_voxel.checked_mul(tile_voxels)?)
+}
+
+/// Conservative single-pass Wan VAE decode working-set peak in bytes for a concrete VAE geometry.
+///
+/// This is the full-output case of the calibrated cost function used by the actual z16/z48 budget
+/// planners. Because [`video_decode_peak_bytes_for_vae_and_tiling`] caps every configured tile at the
+/// output extent and the cost is monotone, this also bounds providers that use a different valid
+/// tiling selector over the same concrete VAE. It excludes DiT/text-encoder weights.
+pub fn conservative_video_decode_peak_bytes_for_vae(
+    vae: VaeTiling,
+    width: u32,
+    height: u32,
+    frames: u32,
+) -> Option<u64> {
+    video_decode_peak_bytes_for_vae_and_tiling(vae, width, height, frames, None)
 }
 
 /// **Memory-budgeted** tiling for the z16 Wan 2.1 VAE decode (sc-6894 F-009): the z16 analogue of
@@ -590,7 +666,7 @@ fn plan_z16_tiling_with_overlap(
         temporal_overlap_policy,
     };
     budgeted_plan(
-        VaeTiling::WAN,
+        WanVae::VAE_TILING,
         height,
         width,
         out_frames,
@@ -1525,6 +1601,62 @@ pub fn ti2v_blend_init(z_img: &Array, mask: &Array, noise: &Array) -> Result<Arr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_decode_peaks_are_the_planners_full_output_cases() {
+        assert_eq!(
+            conservative_video_decode_peak_bytes_for_vae(WanVae::VAE_TILING, 64, 64, 9),
+            Some(241_975_296)
+        );
+        assert_eq!(
+            conservative_video_decode_peak_bytes_for_vae(Wan22Vae::VAE_TILING, 64, 64, 9),
+            Some(126_812_160)
+        );
+        assert_eq!(
+            conservative_video_decode_peak_bytes_for_vae(VaeTiling::QWEN_IMAGE, 64, 64, 9),
+            None
+        );
+        assert_eq!(
+            conservative_video_decode_peak_bytes_for_vae(WanVae::VAE_TILING, 0, 64, 9),
+            None
+        );
+    }
+
+    #[test]
+    fn full_output_peak_bounds_every_valid_tiling_shape() {
+        use mlx_gen::tiling::{SpatialTiling, TemporalTiling};
+
+        let (width, height, frames) = (1280, 720, 121);
+        for vae in [WanVae::VAE_TILING, Wan22Vae::VAE_TILING] {
+            let full =
+                conservative_video_decode_peak_bytes_for_vae(vae, width, height, frames).unwrap();
+            for tiling in [
+                TilingConfig::spatial_only(768, 64),
+                TilingConfig::spatial_only(192, 64),
+                TilingConfig::temporal_only(96, 24),
+                TilingConfig {
+                    spatial: Some(SpatialTiling {
+                        tile_px: 384,
+                        overlap_px: 64,
+                    }),
+                    temporal: Some(TemporalTiling {
+                        tile_frames: 32,
+                        overlap_frames: 8,
+                    }),
+                },
+            ] {
+                let tiled = video_decode_peak_bytes_for_vae_and_tiling(
+                    vae,
+                    width,
+                    height,
+                    frames,
+                    Some(&tiling),
+                )
+                .unwrap();
+                assert!(tiled <= full, "{vae:?} {tiling:?}: {tiled} > {full}");
+            }
+        }
+    }
     use std::collections::{BTreeMap, BTreeSet};
 
     const WAN_OVERLAP_EVIDENCE: [(&str, &str); 4] = [
@@ -1961,9 +2093,9 @@ mod tests {
     fn z16_tiles_past_the_write_bound_on_an_unlimited_budget() {
         let (h, w, f) = (720i32, 1280i32, 81i32);
         assert!(
-            (f as i64) > VaeTiling::WAN.writable_frame_cap(h, w),
+            (f as i64) > WanVae::VAE_TILING.writable_frame_cap(h, w),
             "test precondition: 81 frames at 720p must exceed the z16 write cap ({})",
-            VaeTiling::WAN.writable_frame_cap(h, w)
+            WanVae::VAE_TILING.writable_frame_cap(h, w)
         );
 
         let cfg = plan_z16_tiling(h, w, f, f64::INFINITY)
@@ -1989,7 +2121,7 @@ mod tests {
                 )
             })
             .unwrap_or((h as i64, w as i64));
-        let write = VaeTiling::WAN.full_res_channels as i64 * tf * th * tw;
+        let write = WanVae::VAE_TILING.full_res_channels as i64 * tf * th * tw;
         assert!(
             write <= mlx_gen::tiling::MAX_WRITABLE_ELEMS,
             "the selected z16 tile writes {write} elements, past the bound — plan {cfg:?}"
@@ -2312,8 +2444,8 @@ mod tests {
             assert!(actual_cells.insert(cell.clone()), "duplicate evidence cell");
 
             let vae = match family {
-                "Z16" => VaeTiling::WAN,
-                "Z48" => VaeTiling::WAN22,
+                "Z16" => WanVae::VAE_TILING,
+                "Z48" => Wan22Vae::VAE_TILING,
                 other => panic!("unexpected evidence family {other}"),
             };
             let (width, height) = fields["bucket"]

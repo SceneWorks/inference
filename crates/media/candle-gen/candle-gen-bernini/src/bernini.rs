@@ -46,7 +46,6 @@ use candle_gen::{CandleError, Result as CResult};
 
 use candle_gen_wan::config::{
     TextEncoderConfig, TransformerConfig, DEFAULT_FRAMES_14B, NUM_TRAIN_TIMESTEPS,
-    VAE16_STRIDE_SPATIAL, VAE16_STRIDE_TEMPORAL,
 };
 use candle_gen_wan::pipeline::{create_noise, frames_to_images};
 use candle_gen_wan::rope::assign_source_ids;
@@ -68,6 +67,7 @@ use crate::forward::{
     num_vit_momentum_buffers, vit_one_step, PackedForward, VitGuidanceParams, VitMode, VitStreams,
 };
 use crate::guidance::MomentumBuffer;
+use crate::latent_dims;
 use crate::mar::{mar_schedule, post_process_input_embeds, sample_vit_embed, StreamState, VitCfg};
 use crate::preprocess::{encode_image, encode_videoclip};
 use crate::process::{
@@ -940,9 +940,7 @@ impl Bernini {
         let pe_wotxt_wovit = concat_with_zero_init(&t5_neg, &s_wotxt_wovit, max_seq)?;
 
         // --- Stage 3: load both experts, ViT-conditioned APG denoise ---
-        let t_lat = ((frames as u32 - 1) / VAE16_STRIDE_TEMPORAL + 1) as usize;
-        let h_lat = (height / VAE16_STRIDE_SPATIAL) as usize;
-        let w_lat = (width / VAE16_STRIDE_SPATIAL) as usize;
+        let (t_lat, h_lat, w_lat) = latent_dims(frames as u32, width, height);
         let init_noise = create_noise(seed, Z_DIM, t_lat, h_lat, w_lat, dev)?;
 
         // Source ids (videos first, then images — mirrors the packing order).

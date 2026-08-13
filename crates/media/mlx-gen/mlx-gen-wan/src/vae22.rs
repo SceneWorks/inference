@@ -871,6 +871,9 @@ pub struct Wan22Vae {
 }
 
 impl Wan22Vae {
+    /// Geometry owned by the concrete causal z48 decoder.
+    pub const VAE_TILING: VaeTiling = VaeTiling::WAN22;
+
     /// Build from a weight map (`convert`-sanitized channels-last keys). Structure is fixed by the
     /// vae22 config; channel widths ride on the weights, so the same builder serves production (enc
     /// 160 / dec 256) and the tiny parity fixture. The encoder is loaded only if its weights are
@@ -963,11 +966,11 @@ impl Wan22Vae {
         let z = self.to_channels_last(latent_czthw)?; // [1,T,H,W,z]
         let sh = z.shape();
         let (f, h, w) = (sh[1], sh[2], sh[3]);
-        if !cfg.needs_tiling(VaeTiling::WAN22, f, h, w) {
+        if !cfg.needs_tiling(Self::VAE_TILING, f, h, w) {
             return self.decode_cl(&z);
         }
         let denorm = add(&multiply(&z, &self.std)?, &self.mean)?;
-        let plan = cfg.plan(VaeTiling::WAN22, f, h, w);
+        let plan = cfg.plan(Self::VAE_TILING, f, h, w);
 
         // Channels-last: channel axis last, tiled axes [1, 2, 3]. Per-tile decode adds the 2× spatial
         // unpatchify (vae22 upsamples 16× via decoder×8 + patch×2) before the clamp. The per-tile

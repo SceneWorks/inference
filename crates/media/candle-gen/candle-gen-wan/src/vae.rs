@@ -424,6 +424,9 @@ pub struct WanVae {
 }
 
 impl WanVae {
+    /// Geometry owned by the concrete causal z48 decoder.
+    pub const VAE_TILING: VaeTiling = VaeTiling::WAN22;
+
     pub fn new(cfg: &VaeConfig, vb: VarBuilder) -> Result<Self> {
         let device = vb.device();
         let mean = Tensor::from_vec(LATENTS_MEAN.to_vec(), (1, 48, 1, 1, 1), device)?;
@@ -587,7 +590,7 @@ impl WanVae {
         // `VaeTiling::WAN22` geometry and the per-frame-streaming `decode` closure. With a
         // spatial-only `cfg`, `plan.t` is a single full-extent temporal tile, so the temporal loop
         // runs once and each `decode` call streams the whole clip.
-        vae_tiling::decode_tiled(VaeTiling::WAN22, "wan z48 vae22", z, cfg, |tile| {
+        vae_tiling::decode_tiled(Self::VAE_TILING, "wan z48 vae22", z, cfg, |tile| {
             self.decode_with_cancel(tile, cancel)
         })
     }
@@ -605,9 +608,9 @@ impl WanVae {
 
     pub fn decode_budgeted_with_cancel(&self, z: &Tensor, cancel: &CancelFlag) -> CResult<Tensor> {
         let (_b, _c, f, h, w) = z.dims5()?;
-        let out_f = 1 + (f as i32 - 1) * VaeTiling::WAN22.temporal_scale; // causal ×4
-        let out_h = h as i32 * VaeTiling::WAN22.spatial_scale; // ×16
-        let out_w = w as i32 * VaeTiling::WAN22.spatial_scale;
+        let out_f = 1 + (f as i32 - 1) * Self::VAE_TILING.temporal_scale; // causal ×4
+        let out_h = h as i32 * Self::VAE_TILING.spatial_scale; // ×16
+        let out_w = w as i32 * Self::VAE_TILING.spatial_scale;
         match auto_tiling_budgeted_wan22(out_h, out_w, out_f)? {
             Some(cfg) => self.decode_tiled_with_cancel(z, &cfg, cancel),
             None => self.decode_with_cancel(z, cancel),
@@ -711,8 +714,8 @@ const WAN22_VAE_DEFAULT_BUDGET_GIB: f64 = 16.0;
 // tile that OOMs. (The story's "even the conservative placeholder never OOMs" assumed the seed
 // over-estimated; the CUDA measurement shows it under-estimated by ~4×.) Re-run the sweep after a
 // decoder or candle-allocator change. See the `wan22_decode_peak_matches_cuda_anchors` test below.
-const WAN22_VAE_ACCUM_BYTES_PER_VOXEL: f64 = 160.0;
-const WAN22_VAE_FRAME_BYTES_PER_OUT_PX: f64 = 92_000.0;
+const WAN22_VAE_ACCUM_BYTES_PER_VOXEL: u64 = 160;
+const WAN22_VAE_FRAME_BYTES_PER_OUT_PX: u64 = 92_000;
 
 /// Candidate spatial tile sizes (output px, multiples of the vae22 ×16 scale, overlap 64). Matches the
 /// mlx `VAE22_SPATIAL_PX` grid.
@@ -737,8 +740,24 @@ fn estimated_wan22_decode_peak_gib(
 ) -> f64 {
     let out_voxels = (out_f * out_h * out_w) as f64;
     let frame_px = (tile_h * tile_w) as f64;
-    (WAN22_VAE_ACCUM_BYTES_PER_VOXEL * out_voxels + WAN22_VAE_FRAME_BYTES_PER_OUT_PX * frame_px)
+    (WAN22_VAE_ACCUM_BYTES_PER_VOXEL as f64 * out_voxels
+        + WAN22_VAE_FRAME_BYTES_PER_OUT_PX as f64 * frame_px)
         / GIB_F64
+}
+
+/// Conservative single-pass causal z48 VAE decode working-set peak in bytes.
+///
+/// This is the full-output case of the calibrated streaming cost function consumed by the actual
+/// budget planner. It excludes DiT and text-encoder composition weights.
+pub fn conservative_video_decode_peak_bytes(width: u32, height: u32, frames: u32) -> Option<u64> {
+    let frame_pixels = u64::from(width).checked_mul(u64::from(height))?;
+    let output_voxels = frame_pixels.checked_mul(u64::from(frames))?;
+    if output_voxels == 0 {
+        return None;
+    }
+    WAN22_VAE_ACCUM_BYTES_PER_VOXEL
+        .checked_mul(output_voxels)?
+        .checked_add(WAN22_VAE_FRAME_BYTES_PER_OUT_PX.checked_mul(frame_pixels)?)
 }
 
 /// The safe peak-GiB budget for the z48 vae22 decode tiler — **free-aware** (sc-12734). The decode
@@ -793,7 +812,7 @@ fn plan_wan22_tiling(
     };
     vae_tiling::plan_tiling(
         "wan z48 vae22 decode",
-        VaeTiling::WAN22,
+        WanVae::VAE_TILING,
         height,
         width,
         out_frames,
@@ -806,6 +825,19 @@ fn plan_wan22_tiling(
 #[cfg(test)]
 mod budget_tests {
     use super::*;
+
+    #[test]
+    fn public_decode_peak_is_the_planners_full_output_case() {
+        assert_eq!(
+            conservative_video_decode_peak_bytes(64, 64, 9),
+            Some(382_730_240)
+        );
+        assert_eq!(conservative_video_decode_peak_bytes(64, 0, 9), None);
+        assert_eq!(
+            conservative_video_decode_peak_bytes(u32::MAX, u32::MAX, u32::MAX),
+            None
+        );
+    }
     use std::cell::Cell;
 
     #[test]

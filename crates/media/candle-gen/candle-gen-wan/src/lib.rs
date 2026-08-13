@@ -50,6 +50,70 @@ pub mod vae;
 pub mod vae16;
 pub mod wan14b;
 
+pub const WAN_Z48_VAE_TILING: candle_gen::gen_core::tiling::VaeTiling = Ti2vProviderVae::VAE_TILING;
+pub const WAN_Z16_VAE_TILING: candle_gen::gen_core::tiling::VaeTiling =
+    wan14b::ProviderVae::VAE_TILING;
+
+#[cfg(test)]
+mod vae_tiling_assignment_tests {
+    #[test]
+    fn every_wan_generator_id_resolves_to_its_concrete_decoder() {
+        assert_eq!(
+            super::WAN_Z48_VAE_TILING,
+            candle_gen::gen_core::tiling::VaeTiling::WAN22
+        );
+        assert_eq!(
+            super::WAN_Z16_VAE_TILING,
+            candle_gen::gen_core::tiling::VaeTiling {
+                spatial_scale: 8,
+                temporal_scale: 4,
+                causal_temporal: true,
+                full_res_channels: 96,
+            }
+        );
+
+        assert_eq!(
+            super::WAN_Z48_VAE_TILING,
+            super::Ti2vProviderVae::VAE_TILING
+        );
+        assert_eq!(
+            super::WAN_Z16_VAE_TILING,
+            super::wan14b::ProviderVae::VAE_TILING
+        );
+        assert_eq!(
+            super::ti2v_vae_tiling(super::MODEL_ID),
+            Some(super::Ti2vProviderVae::VAE_TILING)
+        );
+        assert_eq!(super::pipeline::latent_dims(9, 160, 128), (3, 8, 10));
+        for id in [
+            super::config::MODEL_ID_T2V_14B,
+            super::config::MODEL_ID_I2V_14B,
+        ] {
+            assert_eq!(
+                super::wan14b::vae_tiling(id),
+                Some(super::wan14b::ProviderVae::VAE_TILING)
+            );
+        }
+        assert_eq!(super::wan14b::latent_dims(9, 80, 64), (3, 8, 10));
+        assert_eq!(
+            super::model_vace::vae_tiling(super::config::MODEL_ID_VACE),
+            Some(super::model_vace::ProviderVae::VAE_TILING)
+        );
+        assert_eq!(
+            super::vae_tiling(super::MODEL_ID),
+            Some(super::WAN_Z48_VAE_TILING)
+        );
+        for id in [
+            super::config::MODEL_ID_T2V_14B,
+            super::config::MODEL_ID_I2V_14B,
+            super::config::MODEL_ID_VACE,
+        ] {
+            assert_eq!(super::vae_tiling(id), Some(super::WAN_Z16_VAE_TILING));
+        }
+        assert_eq!(super::vae_tiling("not_wan"), None);
+    }
+}
+
 /// Operational Wan video ceiling: `1 + 4 * 256` pixel frames.
 pub(crate) const MAX_WAN_FRAMES: usize = 1025;
 /// Matching temporal-conditioning budget after the z16 VAE's 4x causal compression.
@@ -89,7 +153,14 @@ use rope::WanRope;
 use scheduler::{flow_shift, FlowScheduler, Sampler};
 use text_encoder::Umt5Encoder;
 use transformer::WanTransformer;
-use vae::WanVae;
+
+/// Concrete z48 VAE assigned to the TI2V-5B route.
+pub type Ti2vProviderVae = vae::WanVae;
+
+/// Resolve the TI2V-5B route's load-bearing VAE geometry.
+pub fn ti2v_vae_tiling(provider_id: &str) -> Option<candle_gen::gen_core::tiling::VaeTiling> {
+    (provider_id == MODEL_ID).then_some(Ti2vProviderVae::VAE_TILING)
+}
 
 /// The 5B DiT runs bf16 (native checkpoint dtype); the UMT5 encoder runs bf16 (sc-12778 — halving the
 /// f32 encoder's ~24 GB ENCODE-stage transient to ~12 GB, the 5B sequential <16 GB lever, epic
@@ -104,7 +175,7 @@ const Z_DIM: usize = 48;
 struct Components {
     te: Arc<Umt5Encoder>,
     dit: Arc<WanTransformer>,
-    vae: Arc<WanVae>,
+    vae: Arc<Ti2vProviderVae>,
     /// UMT5 tokenizer, loaded+parsed **once** at component load and reused across every prompt/branch
     /// encode (sc-8991 / F-011) rather than re-parsing `tokenizer.json` per request.
     tok: Arc<candle_gen::gen_core::tokenizer::TextTokenizer>,
@@ -175,8 +246,8 @@ impl Pipeline {
 
     /// Build the z48 vae22 VAE (f32) — the decode-stage component. Shared by the resident and staged
     /// paths so the residency change stays a residency change only (sc-12757).
-    fn load_vae(&self) -> CResult<WanVae> {
-        Ok(WanVae::new(
+    fn load_vae(&self) -> CResult<Ti2vProviderVae> {
+        Ok(Ti2vProviderVae::new(
             &self.vae_cfg,
             self.component_vb("vae", VAE_DTYPE)?,
         )?)
@@ -813,6 +884,47 @@ pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core:
     register_providers(candle_gen::gen_core::ProviderRegistryBuilder::new()).build()
 }
 
+/// Resolve the concrete Candle Wan VAE geometry used by a registered generator id.
+pub fn vae_tiling(provider_id: &str) -> Option<candle_gen::gen_core::tiling::VaeTiling> {
+    ti2v_vae_tiling(provider_id)
+        .or_else(|| wan14b::vae_tiling(provider_id))
+        .or_else(|| model_vace::vae_tiling(provider_id))
+}
+
+/// Conservative single-pass Wan VAE decode working-set peak for a concrete Candle VAE geometry.
+pub fn conservative_video_decode_peak_bytes_for_vae(
+    vae: candle_gen::gen_core::tiling::VaeTiling,
+    width: u32,
+    height: u32,
+    frames: u32,
+) -> Option<u64> {
+    if vae == wan14b::ProviderVae::VAE_TILING {
+        vae16::conservative_video_decode_peak_bytes(width, height, frames)
+    } else if vae == Ti2vProviderVae::VAE_TILING {
+        vae::conservative_video_decode_peak_bytes(width, height, frames)
+    } else {
+        None
+    }
+}
+
+/// Resolve the provider-owned conservative VAE decode working-set peak for a Wan generator id.
+pub fn conservative_video_decode_memory_profile(
+    provider_id: &str,
+    width: u32,
+    height: u32,
+    frames: u32,
+) -> Option<candle_gen::VideoDecodeMemoryProfile> {
+    candle_gen::VideoDecodeMemoryProfile::new(
+        conservative_video_decode_peak_bytes_for_vae(
+            vae_tiling(provider_id)?,
+            width,
+            height,
+            frames,
+        )?,
+        0,
+    )
+}
+
 #[cfg(test)]
 mod explicit_registry_tests {
     #[test]
@@ -837,6 +949,23 @@ mod explicit_registry_tests {
             ]
         );
         assert_eq!(explicit_trainers, ["wan2_2_t2v_14b"]);
+    }
+
+    #[test]
+    fn candle_profiles_price_the_requested_frames_without_mlx_rounding() {
+        let peak = |provider_id, frames| {
+            super::conservative_video_decode_memory_profile(provider_id, 64, 64, frames)
+                .map(|profile| profile.working_set_bytes())
+        };
+        for (frames, expected) in [(1, 262_553_600), (9, 265_830_400), (81, 295_321_600)] {
+            assert_eq!(
+                peak(super::config::MODEL_ID_T2V_14B, frames),
+                Some(expected)
+            );
+        }
+        for (frames, expected) in [(1, 377_487_360), (9, 382_730_240), (81, 429_916_160)] {
+            assert_eq!(peak(super::config::MODEL_ID, frames), Some(expected));
+        }
     }
 }
 

@@ -123,7 +123,7 @@ pub use sampler::{
     FlowMatchSampler, LcmSampler, LightningSampler, MlxAvLatentOps, MlxLatentOps, TcdSampler,
 };
 pub use scheduler::FlowMatchEuler;
-pub use tiling::{TilingConfig, VaeTiling};
+pub use tiling::{TilingConfig, VaeTiling, VideoDecodeMemoryProfile};
 pub use train::{
     LrSchedule, NetworkType, TrainOptimizer, Trainer, TrainerDescriptor, TrainingConfig,
     TrainingItem, TrainingOutput, TrainingProgress, TrainingRequest,

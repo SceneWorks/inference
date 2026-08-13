@@ -48,14 +48,21 @@ use crate::vace::{
     build_vace_control, denoise_vace, denoise_vace_moe, denoise_vace_range, prepare_masks,
     prepare_video_latents, WanVaceTransformer,
 };
-use crate::vae::WanVae;
+
+/// Concrete z16 VAE assigned to both VACE routes.
+pub type ProviderVae = crate::vae::WanVae;
+
+/// Resolve either VACE route's load-bearing VAE geometry.
+pub fn vae_tiling(provider_id: &str) -> Option<mlx_gen::tiling::VaeTiling> {
+    matches!(provider_id, MODEL_ID_VACE | MODEL_ID_VACE_FUN).then_some(ProviderVae::VAE_TILING)
+}
 
 /// Public provider id: `"wan_vace"`.
 pub const MODEL_ID_VACE: &str = "wan_vace";
 
 /// The Wan z16 VAE strides (the VACE checkpoints are Wan2.1-based): temporal 4, spatial 8, patch 2.
-const VAE_T: usize = 4;
-const VAE_S: usize = 8;
+const VAE_T: usize = ProviderVae::VAE_TILING.temporal_scale as usize;
+const VAE_S: usize = ProviderVae::VAE_TILING.spatial_scale as usize;
 
 /// Upper bound on the control-clip frame count (sc-12459 / F-008): `vace_prep` sizes the control
 /// video, mask, control-latent, and init-noise tensors directly from `clip.frames.len()`, so an
@@ -181,7 +188,7 @@ fn vace_prep(
     // --- Stage 2: z16 VAE encode the control + mask → 96-ch control latent ---
     let control = {
         let w = Weights::from_file(root.join("vae.safetensors"))?;
-        let vae = WanVae::from_weights(&w)?;
+        let vae = ProviderVae::from_weights(&w)?;
         let video_latents = prepare_video_latents(&vae, &control_video, Some(&mask), &references)?;
         let mask_latents = prepare_masks(&mask, VAE_T, VAE_S, base.patch_size.1, num_ref)?;
         let c = build_vace_control(&video_latents, &mask_latents)?;
@@ -238,11 +245,20 @@ fn vace_decode_tail(
     on_progress(Progress::Decoding);
     // sc-6894 — the z16 VAE is non-causal in time (out_f = T_lat·VAE_T, ×4), NOT the causal 4·T−3
     // (task 6897); only the tiling heuristic reads out_frames. Budgeted, catchable selector (F-009).
-    let out_frames = latents.shape()[1] * VAE_T as i32;
-    let tiling = auto_tiling_budgeted_z16(prep.height as i32, prep.width as i32, out_frames)?;
+    let latent_shape = latents.shape();
+    let out_frames = latent_shape[1] * ProviderVae::VAE_TILING.temporal_scale;
+    let out_height = latent_shape[2] * ProviderVae::VAE_TILING.spatial_scale;
+    let out_width = latent_shape[3] * ProviderVae::VAE_TILING.spatial_scale;
+    if (out_width, out_height) != (prep.width as i32, prep.height as i32) {
+        return Err(Error::Msg(format!(
+            "wan vace: z16 VAE geometry resolves {out_width}x{out_height}, expected {}x{}",
+            prep.width, prep.height
+        )));
+    }
+    let tiling = auto_tiling_budgeted_z16(out_height, out_width, out_frames)?;
     let frames_u8 = {
         let w = Weights::from_file(root.join("vae.safetensors"))?;
-        let vae = WanVae::from_weights(&w)?;
+        let vae = ProviderVae::from_weights(&w)?;
         decode_to_frames(&vae, &latents, tiling.as_ref(), Some(&req.cancel))?
     };
     let images = frames_to_images(&frames_u8)?;

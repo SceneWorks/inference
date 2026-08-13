@@ -85,10 +85,23 @@ pub use training::{load_trainer, LtxTrainer};
 pub use transformer::{to_denoised, AvDiT, LtxDiT, Precision, VideoBlock};
 pub use upsampler::{upsample_latents, LatentUpsampler};
 pub use vae::LtxVideoVae;
+/// Provider-facing LTX geometry, derived from the decoder implementation.
+pub const VAE_TILING: mlx_gen::tiling::VaeTiling = LtxVideoVae::VAE_TILING;
 // Re-exported as `VocoderGenerator`, not `Generator`: this is the HiFi-GAN vocoder struct, and a
 // bare `Generator` at the crate root would shadow the core `mlx_gen::Generator` *trait* name — an
 // accidental `use mlx_gen_ltx::Generator` would then compile and mean the wrong thing (F-059).
 pub use vocoder::{Generator as VocoderGenerator, LtxVocoder, VocoderWithBwe};
+
+#[cfg(test)]
+mod vae_tiling_assignment_tests {
+    #[test]
+    fn provider_id_resolves_to_the_concrete_decoder_geometry() {
+        assert_eq!(super::VAE_TILING, mlx_gen::tiling::VaeTiling::LTX);
+        assert_eq!(super::VAE_TILING, super::LtxVideoVae::VAE_TILING);
+        assert_eq!(super::vae_tiling(super::MODEL_ID), Some(super::VAE_TILING));
+        assert_eq!(super::vae_tiling("not_ltx"), None);
+    }
+}
 
 // sc-2963 (rollout of the Wan sc-2957 template): when on, the AvDiT's fusable elementwise *glue* —
 // adaLN affine (`x·(1+scale)+shift`), the gated residuals (`x+out·gate`), the **tanh-GELU FFN
@@ -123,6 +136,22 @@ pub fn register_providers(
 /// Build the complete explicit MLX LTX provider catalog.
 pub fn provider_registry() -> mlx_gen::gen_core::Result<mlx_gen::gen_core::ProviderRegistry> {
     register_providers(mlx_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+/// Resolve the load-bearing VAE geometry for an MLX LTX generator id.
+pub fn vae_tiling(provider_id: &str) -> Option<mlx_gen::tiling::VaeTiling> {
+    (provider_id == MODEL_ID).then_some(VAE_TILING)
+}
+
+/// Resolve the provider-owned conservative VAE decode working-set peak for an LTX generator id.
+pub fn conservative_video_decode_memory_profile(
+    provider_id: &str,
+    width: u32,
+    height: u32,
+    frames: u32,
+) -> Option<mlx_gen::VideoDecodeMemoryProfile> {
+    vae_tiling(provider_id)?;
+    pipeline::conservative_video_decode_memory_profile(width, height, frames)
 }
 
 #[cfg(test)]

@@ -2,13 +2,13 @@
 
 use std::path::Path;
 
+use crate::ProviderVae;
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use candle_gen::{CandleError, Result as CResult};
 use candle_gen_wan::config::{TextEncoderConfig, TransformerConfig, Vae16Config};
 use candle_gen_wan::text_encoder::Umt5Encoder;
 use candle_gen_wan::transformer::WanTransformer;
-use candle_gen_wan::vae16::WanVae16;
 
 const COMPONENT_PLAN: [(&str, DType); 4] = [
     ("text_encoder", DType::F32),
@@ -22,7 +22,7 @@ pub(crate) struct RendererComponents {
     pub(crate) te: Umt5Encoder,
     pub(crate) high: WanTransformer,
     pub(crate) low: WanTransformer,
-    pub(crate) vae: WanVae16,
+    pub(crate) vae: ProviderVae,
     pub(crate) tok: TextTokenizer,
 }
 
@@ -37,7 +37,7 @@ impl RendererComponents {
         let dit_cfg = TransformerConfig::t2v_14b();
         let high = WanTransformer::new(&dit_cfg, component(1)?)?;
         let low = WanTransformer::new(&dit_cfg, component(2)?)?;
-        let vae = WanVae16::new_with_encoder(&Vae16Config::wan21(), component(3)?)?;
+        let vae = ProviderVae::new_with_encoder(&Vae16Config::wan21(), component(3)?)?;
         let tok =
             TextTokenizer::from_file(root.join("tokenizer/tokenizer.json"), tokenizer_config())
                 .map_err(|e| CandleError::Msg(tokenizer_error(provider_id, &e.to_string())))?;
