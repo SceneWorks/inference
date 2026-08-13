@@ -64,6 +64,19 @@ pub const DECODE_OVERLAP: u32 = 64;
 pub const ATTENTION_CHUNK_SIZE: u32 = mlx_gen::attention::CONSTRAINED_ATTN_SCORES_BUDGET as u32;
 pub const MEMORY_CALIBRATION_FINGERPRINT: &str =
     "krea-2-mlx-full-ladder-native-pid-attn64m-window1-2026-08-03-v3";
+/// The Wan terminal decoder has not been measured as part of Krea's whole-request ladder. A separate
+/// identity prevents native-decoder evidence from being reused and forces conservative
+/// asset-facts + headroom estimation (including SceneWorks' estimate margin).
+pub const WAN_DECODER_CALIBRATION_FINGERPRINT: &str =
+    "krea-2-mlx-wan21-decoder-unmeasured-composite-2026-08-10-v1";
+
+fn calibration_fingerprint(spec: &LoadSpec) -> &'static str {
+    if spec.components.contains_key(mlx_gen::VAE_COMPONENT) {
+        WAN_DECODER_CALIBRATION_FINGERPRINT
+    } else {
+        MEMORY_CALIBRATION_FINGERPRINT
+    }
+}
 
 fn decode_routes(provider_id: &str) -> CoreResult<mlx_gen_pid::DecodeRoutes> {
     mlx_gen_pid::DecodeRoutes::new_core(provider_id, [DECODE_TILE_EDGE], DECODE_OVERLAP)
@@ -137,6 +150,15 @@ pub(crate) fn memory_strategy_contract_with_plan(
             }
         })
     };
+    let alternate_decoder_bytes = match spec.components.get(mlx_gen::VAE_COMPONENT) {
+        Some(WeightsSource::Dir(path)) => {
+            projected_safetensors_bytes(path, |_| ResidentProjection::Stored)?
+        }
+        Some(WeightsSource::File(path)) => spec.read_file_unchanged_if_prepared(path, |p| {
+            projected_safetensors_bytes(p, |_| ResidentProjection::Stored)
+        })?,
+        None => 0,
+    };
     let selected_text_encoder = crate::model::ENCODER_CONTRACT.source_for_load(spec, root)?;
     let language_bytes = crate::model::selected_language_resident_bytes(
         &selected_text_encoder,
@@ -168,7 +190,9 @@ pub(crate) fn memory_strategy_contract_with_plan(
         dit: project(&root.join("transformer"), &|name| {
             crate::convert::is_transformer_quant_target(name)
         })?,
-        vae: project(&root.join("vae"), &|_| false)?,
+        // The native Qwen VAE remains resident for reference/edit encoding; Wan is an additive
+        // terminal decoder, so the contract prices both rather than reusing native measurements.
+        vae: project(&root.join("vae"), &|_| false)?.saturating_add(alternate_decoder_bytes),
     };
     Ok((
         memory_strategy_contract_with_components(
@@ -229,7 +253,7 @@ fn memory_strategy_contract_with_components(
         ],
     };
     contract.calibration = Some(MemoryCalibrationIdentity::new(
-        MEMORY_CALIBRATION_FINGERPRINT,
+        calibration_fingerprint(spec),
         spec.load_shape,
     ));
     contract.asset_facts.base_bytes = components
@@ -339,6 +363,13 @@ pub(crate) fn native_memory_strategy_contract_from_spec(
             )))
         }
     };
+    let alternate_decoder_bytes = match spec.components.get(mlx_gen::VAE_COMPONENT) {
+        Some(WeightsSource::Dir(path)) => stored(path, "alternate Wan decoder")?,
+        Some(WeightsSource::File(path)) => {
+            spec.read_file_unchanged_if_prepared(path, |p| stored(p, "alternate Wan decoder"))?
+        }
+        None => 0,
+    };
     let selected_text_encoder =
         crate::model::ENCODER_CONTRACT.source_for_load(spec, base_snapshot_dir)?;
     let expected_language_bits =
@@ -374,7 +405,8 @@ pub(crate) fn native_memory_strategy_contract_from_spec(
         dit: spec.read_file_unchanged_if_prepared(dit_file, |p| {
             native_dit_transformer_bytes(provider_id, p, spec.quantize)
         })?,
-        vae: stored(&base_snapshot_dir.join("vae"), "base VAE")?,
+        vae: stored(&base_snapshot_dir.join("vae"), "base VAE")?
+            .saturating_add(alternate_decoder_bytes),
     };
     memory_strategy_contract_with_components(provider_id, spec, components, streamable)
 }
@@ -684,6 +716,38 @@ mod tests {
             eager.calibration.as_ref().unwrap().load_shape
         );
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn alternate_decoder_is_additive_to_native_decoder_asset_facts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_root, spec) = fixture(&tmp);
+        let native = memory_strategy_contract("krea_2_turbo", &spec).unwrap();
+        let donor = tmp.path().join("wan-vae.safetensors");
+        write_minimal_safetensors(&donor);
+        let composite = memory_strategy_contract(
+            "krea_2_turbo",
+            &spec.with_component(mlx_gen::VAE_COMPONENT, WeightsSource::File(donor)),
+        )
+        .unwrap();
+        assert_eq!(
+            composite.asset_facts.decoder_bytes,
+            native.asset_facts.decoder_bytes + 2,
+            "Krea keeps its Qwen VAE for conditioning and adds the Wan terminal decoder"
+        );
+        assert_eq!(
+            composite.asset_facts.base_bytes,
+            native.asset_facts.base_bytes + 2
+        );
+        assert_eq!(
+            composite.calibration.as_ref().unwrap().fingerprint,
+            WAN_DECODER_CALIBRATION_FINGERPRINT,
+            "native whole-request measurements must not authorize the composite decoder path"
+        );
+        assert_eq!(
+            native.calibration.as_ref().unwrap().fingerprint,
+            MEMORY_CALIBRATION_FINGERPRINT
+        );
     }
 
     fn resident_context(

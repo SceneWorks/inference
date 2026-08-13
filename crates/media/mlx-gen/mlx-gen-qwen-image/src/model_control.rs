@@ -30,9 +30,10 @@ use mlx_gen::{
     gen_core, require_base_dir, require_control, AcceptedControlKinds, Capabilities,
     ConditioningKind, ControlBranch, ControlKind, Error, GenerationOutput, GenerationRequest,
     Generator, LatentDecoder, LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision,
-    Progress, Quant, Residency, Result, SizeFloor, WeightsSource,
+    Progress, Quant, Residency, Result, SizeFloor, WeightsSource, VAE_COMPONENT,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
+use mlx_gen_wan::OwnedWanSingleFrameDecoder;
 use std::path::Path;
 
 use crate::control_transformer::QwenFunControlBranch;
@@ -133,6 +134,7 @@ struct QwenControlHeavyOwned {
     vae: QwenVae,
     /// Optional PiD super-resolving decoder (epic 7840, sc-7845); see [`crate::model::QwenImage`].
     pid: Option<PidEngine>,
+    alternate_decoder: Option<OwnedWanSingleFrameDecoder>,
 }
 
 /// A borrow of the heavy render-phase components, so the denoise/decode body runs identically whether
@@ -142,6 +144,7 @@ struct QwenControlHeavy<'a> {
     controlnet: &'a QwenFunControlBranch,
     vae: &'a QwenVae,
     pid: Option<&'a PidEngine>,
+    alternate_decoder: Option<&'a OwnedWanSingleFrameDecoder>,
 }
 
 impl QwenControlHeavyOwned {
@@ -151,6 +154,7 @@ impl QwenControlHeavyOwned {
             controlnet: &self.controlnet,
             vae: &self.vae,
             pid: self.pid.as_ref(),
+            alternate_decoder: self.alternate_decoder.as_ref(),
         }
     }
 }
@@ -170,6 +174,8 @@ impl QwenControlHeavyOwned {
 /// `max(text-encoder, DiT+control+VAE)`. Both use the same per-phase loaders, so the components are
 /// byte-identical.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    mlx_gen::gen_core::reject_unknown_components(spec, &[VAE_COMPONENT], MODEL_ID)?;
+    mlx_gen_wan::validate_selected_single_frame_decoder(spec, &descriptor())?;
     // Resolve the base dir + required control checkpoint up front — fail-fast for BOTH policies — then
     // the always-warm tokenizer, then the shared [`build_residency`] dispatch.
     let (root, _control) = resolve_base_and_control(spec)?;
@@ -325,11 +331,13 @@ fn load_heavy(
         None
     };
     let vae = loader::load_vae(root)?;
+    let alternate_decoder = mlx_gen_wan::load_selected_single_frame_decoder(spec, &descriptor())?;
     Ok(QwenControlHeavyOwned {
         transformer,
         controlnet,
         vae,
         pid,
+        alternate_decoder,
     })
 }
 
@@ -505,11 +513,17 @@ impl QwenImageControl {
                     capture_sigma,
                 )?;
                 let denoise_sigmas = &params.sigmas[..keep];
+                let decoder = pid_decoder
+                    .as_ref()
+                    .map(|decoder| decoder as &dyn LatentDecoder)
+                    .or_else(|| {
+                        heavy
+                            .alternate_decoder
+                            .map(|decoder| decoder as &dyn LatentDecoder)
+                    });
                 let images = decode_and_collect(
                     heavy.vae,
-                    pid_decoder
-                        .as_ref()
-                        .map(|decoder| decoder as &dyn LatentDecoder),
+                    decoder,
                     decode_tiling.as_ref(),
                     req,
                     MODEL_ID,
