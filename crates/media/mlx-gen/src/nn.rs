@@ -1984,6 +1984,44 @@ mod tests {
             }
         }
 
+        // A broadcast leading dimension keeps each matrix's final two dimensions contiguous while
+        // the full view is non-row-contiguous. This must select the batched qmm kernel using M=33,
+        // not collapse the two batches into one M=66 matrix during strict admission.
+        const BATCH_M: i32 = 33;
+        const BATCH_N: i32 = 1001;
+        let batch_x_base = patterned(&[1, BATCH_M, K], false);
+        let batch_w_f32 = patterned(&[BATCH_N, K], true);
+        let batch_output_bias_f32 = patterned(&[BATCH_N], false);
+        for dtype in [Dtype::Float32, Dtype::Bfloat16] {
+            let x_base = batch_x_base.as_dtype(dtype).unwrap();
+            let x = broadcast_to(&x_base, &[2, BATCH_M, K]).unwrap();
+            let w = batch_w_f32.as_dtype(dtype).unwrap();
+            let output_bias = batch_output_bias_f32.as_dtype(dtype).unwrap();
+            for bits in [4, 8] {
+                let (wq, scales, biases) = quantize(&w, 64, bits).unwrap();
+                let eager = quantized_matmul_with_bias(
+                    &x,
+                    &wq,
+                    &scales,
+                    &biases,
+                    Some(&output_bias),
+                    64,
+                    bits,
+                )
+                .unwrap();
+                cases.push(Case {
+                    x: x.clone(),
+                    wq,
+                    scales,
+                    biases,
+                    output_bias: output_bias.clone(),
+                    group_size: 64,
+                    bits,
+                    eager,
+                });
+            }
+        }
+
         // A small-M Q4 shape selects qmv rather than qmm and therefore exercises the truthful
         // eager fallback for the same operation identity.
         let small_x = patterned(&[1, K], false);
