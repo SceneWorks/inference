@@ -58,7 +58,7 @@ impl DenseGroupNorm {
         })
     }
 
-    fn to_device(&mut self, device: &Device) -> Result<()> {
+    fn move_to_device(&mut self, device: &Device) -> Result<()> {
         self.weight = self.weight.to_device(device)?;
         self.bias = self.bias.to_device(device)?;
         self.inner = nn::GroupNorm::new(

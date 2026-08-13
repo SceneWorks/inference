@@ -163,7 +163,10 @@ impl RmsScale {
         rms_scale(x, &self.weight, self.eps)
     }
 
-    pub(crate) fn to_device(&mut self, device: &candle_gen::candle_core::Device) -> Result<()> {
+    pub(crate) fn move_to_device(
+        &mut self,
+        device: &candle_gen::candle_core::Device,
+    ) -> Result<()> {
         self.weight = self.weight.to_device(device)?;
         Ok(())
     }
@@ -350,8 +353,8 @@ impl GatedAttention {
         ] {
             projection.quantize_onto(quant, device)?;
         }
-        self.norm_q.to_device(device)?;
-        self.norm_k.to_device(device)
+        self.norm_q.move_to_device(device)?;
+        self.norm_k.move_to_device(device)
     }
 }
 
@@ -516,8 +519,8 @@ impl TextFusionBlock {
         quant: candle_gen::gen_core::Quant,
         device: &candle_gen::candle_core::Device,
     ) -> Result<()> {
-        self.prenorm.to_device(device)?;
-        self.postnorm.to_device(device)?;
+        self.prenorm.move_to_device(device)?;
+        self.postnorm.move_to_device(device)?;
         self.attn.quantize_onto(quant, device)?;
         self.mlp.quantize_onto(quant, device)
     }
@@ -685,8 +688,8 @@ impl SingleStreamBlock {
         device: &candle_gen::candle_core::Device,
     ) -> Result<()> {
         self.scale_shift_table = self.scale_shift_table.to_device(device)?;
-        self.prenorm.to_device(device)?;
-        self.postnorm.to_device(device)?;
+        self.prenorm.move_to_device(device)?;
+        self.postnorm.move_to_device(device)?;
         self.attn.quantize_onto(quant, device)?;
         self.mlp.quantize_onto(quant, device)
     }

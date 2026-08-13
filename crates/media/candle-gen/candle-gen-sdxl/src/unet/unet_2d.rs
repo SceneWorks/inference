@@ -128,8 +128,8 @@ impl UNet2DConditionModel {
         device: &Device,
     ) -> candle_gen::Result<()> {
         LoraHost::visit_lora_mut(self, &mut |linear| linear.quantize_base_onto(quant, device))?;
-        self.visit_conv_lora_mut(&mut |conv| conv.to_device(device).map_err(Into::into))?;
-        self.conv_norm_out.to_device(device)?;
+        self.visit_conv_lora_mut(&mut |conv| conv.move_to_device(device).map_err(Into::into))?;
+        self.conv_norm_out.move_to_device(device)?;
         for block in &mut self.down_blocks {
             match block {
                 UNetDownBlock::Basic(block) => block.move_norms_to(device)?,

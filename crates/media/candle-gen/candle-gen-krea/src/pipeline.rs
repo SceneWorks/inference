@@ -195,6 +195,18 @@ pub(crate) struct ResidencyHeavy {
     vae_encoder: QwenVaeEncoder,
 }
 
+/// Native-file quantization choices that must remain paired across the staged renderer.
+pub(crate) struct NativeFileQuantization {
+    pub(crate) transformer: Option<gen_core::Quant>,
+    pub(crate) text_encoder: Option<gen_core::Quant>,
+}
+
+/// Request-scoped PiD selection for a sequential heavy-phase load.
+pub(crate) struct PidLoad<'a> {
+    pub(crate) spec: Option<&'a PidWeights>,
+    pub(crate) enabled: bool,
+}
+
 impl ResidencyHeavy {
     /// The Qwen-Image VAE, for the multi-phase decode (epic 13879, sc-13887) — which decodes through the
     /// native VAE only (PiD is rejected on the multi-phase path).
@@ -828,13 +840,12 @@ pub(crate) fn load_residency_heavy_native_registry(
     device: &Device,
     adapters: &[AdapterSpec],
     quant: Option<gen_core::Quant>,
-    pid_spec: Option<&PidWeights>,
-    use_pid: bool,
+    pid: PidLoad<'_>,
     stream_blocks: bool,
 ) -> Result<ResidencyHeavy> {
     let mut result =
         load_residency_heavy_native(root, native_dit, device, adapters, quant, stream_blocks)?;
-    result.heavy.pid = pid_to_load(pid_spec, use_pid)
+    result.heavy.pid = pid_to_load(pid.spec, pid.enabled)
         .map(|spec| PidEngine::from_spec(spec, PID_BACKBONE, device).map(Arc::new))
         .transpose()?;
     Ok(result)
@@ -922,8 +933,7 @@ pub(crate) fn render_three_stage_with_native(
     native_dit: Option<&gen_core::PinnedWeightsFile>,
     device: &Device,
     adapters: &[AdapterSpec],
-    native_quant: Option<gen_core::Quant>,
-    text_load_quant: Option<gen_core::Quant>,
+    quantization: NativeFileQuantization,
     req: &GenerationRequest,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Vec<Image>> {
@@ -938,7 +948,7 @@ pub(crate) fn render_three_stage_with_native(
         on_progress,
     )?;
     let text = if native_dit.is_some() {
-        match text_load_quant {
+        match quantization.text_encoder {
             Some(quant) => load_text_quantized_for_request(root, device, &req.cancel, quant)?,
             None => load_text_cancelable(root, device, Some(&req.cancel))?,
         }
@@ -965,7 +975,7 @@ pub(crate) fn render_three_stage_with_native(
                 native_dit,
                 device,
                 adapters,
-                native_quant,
+                quantization.transformer,
                 memory.stream_transformer_blocks,
             )?;
             candle_gen::check_cancel(&req.cancel)?;

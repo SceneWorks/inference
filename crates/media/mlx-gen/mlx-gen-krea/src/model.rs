@@ -723,10 +723,10 @@ pub(crate) fn resolve_load_plan_for_component(
         }
         None => None,
     };
-    if primary_file_rules && packed_bits.is_some() && requested_bits.is_none() {
+    if let (true, Some(packed), None) = (primary_file_rules, packed_bits, requested_bits) {
         return Err(Error::Msg(format!(
             "{id}: imported single-file weights have no quant request, but the companion snapshot is pre-quantized Q{}; request the matching tier or stage a dense companion snapshot",
-            packed_bits.expect("checked Some")
+            packed
         )));
     }
     if let (Some(packed), Some(requested)) = (packed_bits, requested_bits) {

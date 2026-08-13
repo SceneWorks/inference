@@ -127,7 +127,7 @@ impl ClipTextEmbeddings {
         })
     }
 
-    fn to_device(&mut self, device: &Device) -> Result<()> {
+    fn move_to_device(&mut self, device: &Device) -> Result<()> {
         self.token_embedding = nn::Embedding::new(
             self.token_embedding.embeddings().to_device(device)?,
             self.token_embedding.hidden_size(),
@@ -419,7 +419,7 @@ impl ClipTextTransformer {
         quant: candle_gen::gen_core::Quant,
         device: &Device,
     ) -> Result<()> {
-        self.embeddings.to_device(device)?;
+        self.embeddings.move_to_device(device)?;
         for layer in &mut self.encoder.layers {
             layer.quantize_onto(quant, device)?;
         }

@@ -629,7 +629,7 @@ impl SpatialTransformer {
     }
 
     pub(crate) fn move_norms_to(&mut self, device: &candle_core::Device) -> Result<()> {
-        self.norm.to_device(device)?;
+        self.norm.move_to_device(device)?;
         for block in &mut self.transformer_blocks {
             block.move_norms_to(device)?;
         }

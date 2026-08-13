@@ -475,8 +475,8 @@ impl Krea2Transformer {
         ] {
             projection.to_device(device)?;
         }
-        self.txt_in_norm.to_device(device)?;
-        self.final_norm.to_device(device)?;
+        self.txt_in_norm.move_to_device(device)?;
+        self.final_norm.move_to_device(device)?;
         self.final_sstable = self.final_sstable.to_device(device)?;
         self.device = device.clone();
         Ok(())

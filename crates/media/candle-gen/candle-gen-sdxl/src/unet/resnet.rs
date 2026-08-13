@@ -174,8 +174,8 @@ impl ResnetBlock2D {
     }
 
     pub(crate) fn move_norms_to(&mut self, device: &candle_core::Device) -> Result<()> {
-        self.norm1.to_device(device)?;
-        self.norm2.to_device(device)
+        self.norm1.move_to_device(device)?;
+        self.norm2.move_to_device(device)
     }
 
     /// Visit this resnet's convolutions (`conv1`, `conv2`, and the optional `conv_shortcut`) so a

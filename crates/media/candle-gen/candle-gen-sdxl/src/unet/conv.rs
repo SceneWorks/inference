@@ -64,7 +64,7 @@ impl Conv2d {
 
     /// Move a CPU-staged dense convolution and its small additive adapter factors onto the compute
     /// device without changing its stride/padding configuration.
-    pub(crate) fn to_device(&mut self, device: &Device) -> Result<()> {
+    pub(crate) fn move_to_device(&mut self, device: &Device) -> Result<()> {
         let weight = self.inner.weight().to_device(device)?;
         let bias = self
             .inner

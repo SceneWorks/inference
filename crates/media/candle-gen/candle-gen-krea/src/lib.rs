@@ -649,8 +649,10 @@ impl Generator for KreaGenerator {
                             self.native_dit.as_ref(),
                             &self.device,
                             &self.adapters,
-                            self.loaded_quant,
-                            self.text_load_quant,
+                            pipeline::NativeFileQuantization {
+                                transformer: self.loaded_quant,
+                                text_encoder: self.text_load_quant,
+                            },
                             req,
                             on_progress,
                         )
@@ -1387,8 +1389,10 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
                             &heavy_device,
                             &heavy_adapters,
                             heavy_quant,
-                            heavy_pid.as_ref(),
-                            use_pid,
+                            pipeline::PidLoad {
+                                spec: heavy_pid.as_ref(),
+                                enabled: use_pid,
+                            },
                             native_streamable,
                         )?;
                         candle_gen::check_cancel(cancel)?;
@@ -2277,8 +2281,7 @@ mod tests {
             .with_component(BASE_SNAPSHOT_COMPONENT, WeightsSource::Dir(root))
             .with_quant(Quant::Q8);
         let error = validate_load_spec(&spec, KREA_2_TURBO_ID)
-            .err()
-            .expect("Q8 imported DiT plus Q4 companion must fail")
+            .expect_err("Q8 imported DiT plus Q4 companion must fail")
             .to_string();
         assert!(error.contains("companion snapshot is packed Q4"), "{error}");
     }

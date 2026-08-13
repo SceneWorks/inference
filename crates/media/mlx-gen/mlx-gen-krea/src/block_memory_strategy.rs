@@ -317,7 +317,7 @@ pub(crate) fn native_memory_strategy_contract_from_spec(
     let text_plan =
         crate::model::resolve_load_plan_for_component(spec, base_snapshot_dir, provider_id, false)?;
     let text_encoder =
-        projected_safetensors_bytes(&base_snapshot_dir.join("text_encoder"), |tensor| {
+        projected_safetensors_bytes(base_snapshot_dir.join("text_encoder"), |tensor| {
             if let Some(bits) = text_plan
                 .load_time_quant_bits
                 .filter(|_| crate::convert::is_text_encoder_quant_target(&tensor.name))

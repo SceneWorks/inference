@@ -456,17 +456,16 @@ pub(crate) fn validate_control_spec(spec: &LoadSpec) -> Result<()> {
     )?;
     let _ = require_base_snapshot(spec, KREA_2_TURBO_CONTROL_ID)?;
     let _ = require_control(spec, KREA_2_TURBO_CONTROL_ID, "Krea 2 pose control overlay")?;
-    if matches!(spec.weights, WeightsSource::File(_)) {
-        if spec.ip_adapter.is_some()
+    if matches!(spec.weights, WeightsSource::File(_))
+        && (spec.ip_adapter.is_some()
             || !spec.extra_controls.is_empty()
             || spec.pid.is_some()
             || spec.identity.is_some()
-            || spec.text_encoder.is_some()
-        {
-            return Err(Error::Unsupported(format!(
-                "{KREA_2_TURBO_CONTROL_ID}: imported pose control does not accept IP-adapter, extra-control, PiD, identity, or external text-encoder fields"
-            )));
-        }
+            || spec.text_encoder.is_some())
+    {
+        return Err(Error::Unsupported(format!(
+            "{KREA_2_TURBO_CONTROL_ID}: imported pose control does not accept IP-adapter, extra-control, PiD, identity, or external text-encoder fields"
+        )));
     }
     Ok(())
 }
