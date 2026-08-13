@@ -9,8 +9,8 @@
 //!
 //! The candle deviations from the mlx descriptor are the two backend-correct ones the SDXL / FLUX /
 //! Z-Image candle slices already make: `backend = "candle"` and `mac_only = false`. Like those
-//! slices this v1 wires **txt2img only** — LoRA/LoKr and Q4/Q8 are NOT advertised (and are rejected
-//! at load rather than silently dropped); ControlNet / IP-Adapter are later ports.
+//! slices this v1 wires **txt2img + LoRA/LoKr**, including packed Q4/Q8 base tiers; ControlNet /
+//! IP-Adapter remain separate combinations.
 
 use candle_gen::gen_core::{Capabilities, Modality, ModelDescriptor, SizeFloor};
 
@@ -80,8 +80,7 @@ impl ChromaVariant {
     /// The candle descriptor for this variant — the txt2img surface sc-5484 actually wires. Chroma
     /// uses real classifier-free guidance with a true negative prompt (`supports_true_cfg` +
     /// `supports_negative_prompt`), and NO distilled guidance-scalar embedding
-    /// (`supports_guidance = false`). LoRA/LoKr and quantization are deferred (the Python fallback's
-    /// job until candle wires them), so they are not advertised and are rejected at load.
+    /// (`supports_guidance = false`). LoRA/LoKr apply through the shared dense/packed adapter stack.
     pub fn descriptor(self) -> ModelDescriptor {
         ModelDescriptor {
             control_kinds: None,

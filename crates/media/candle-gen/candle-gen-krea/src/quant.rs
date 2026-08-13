@@ -105,6 +105,46 @@ pub struct ConvRotInt8 {
     /// [`Self::forward`]).
     #[cfg(feature = "cuda")]
     lt: Option<std::sync::Arc<candle_gen::quant::Int8Linear>>,
+    /// User-selected residuals applied over the frozen INT8-ConvRot base. Keeping these separate from
+    /// the base preserves the int8 GEMM/online-rotation path and avoids materializing a dense weight.
+    adapters: Vec<ConvRotAdapter>,
+}
+
+enum ConvRotAdapter {
+    Lora {
+        a: Tensor,
+        b: Tensor,
+        scale: f64,
+    },
+    Lokr {
+        factors: candle_gen::quant::LokrFactors,
+    },
+}
+
+fn apply_adapter_factor(x: &Tensor, w: &Tensor) -> Result<Tensor> {
+    let dims = x.dims();
+    if w.rank() != 2 || dims.len() <= 2 {
+        return x.broadcast_matmul(w);
+    }
+    let (lead, k) = dims.split_at(dims.len() - 1);
+    let m: usize = lead.iter().product();
+    let mut out_dims = lead.to_vec();
+    out_dims.push(w.dim(1)?);
+    x.reshape((m, k[0]))?.matmul(w)?.reshape(out_dims)
+}
+
+impl ConvRotAdapter {
+    fn residual(&self, x: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Lora { a, b, scale } => {
+                let dtype = x.dtype();
+                let a = a.to_dtype(dtype)?;
+                let b = b.to_dtype(dtype)?;
+                apply_adapter_factor(&apply_adapter_factor(x, &a)?, &b)? * *scale
+            }
+            Self::Lokr { factors } => factors.residual(x),
+        }
+    }
 }
 
 impl ConvRotInt8 {
@@ -125,7 +165,7 @@ impl ConvRotInt8 {
         Ok(self.rot.get_or_init(|| r))
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    fn forward_base(&self, x: &Tensor) -> Result<Tensor> {
         // Online ConvRot leg (sc-9601): rotate the activation by the same regular Hadamard folded into
         // the stored weight, so `RHT(x)·RHT(W)ᵀ = x·Wᵀ`. Runs on both the CUDA and CPU paths.
         let r = self.rotation(x)?.clone();
@@ -149,6 +189,18 @@ impl ConvRotInt8 {
             None => None,
         };
         Linear::new(w, bias).forward(&xr.to_dtype(in_dtype)?)
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let mut y = self.forward_base(x)?;
+        for adapter in &self.adapters {
+            if matches!(adapter, ConvRotAdapter::Lora { scale, .. } if *scale == 0.0) {
+                continue;
+            }
+            let residual = adapter.residual(x)?.to_dtype(y.dtype())?;
+            y = (y + residual)?;
+        }
+        Ok(y)
     }
 }
 
@@ -300,6 +352,7 @@ impl QLinear {
             rot: std::sync::OnceLock::new(),
             #[cfg(feature = "cuda")]
             lt,
+            adapters: Vec::new(),
         }))
     }
 
@@ -352,14 +405,63 @@ impl QLinear {
         matches!(self, Self::ConvRotInt8(_))
     }
 
-    /// The inner residual-capable [`AdaptLinear`] (for the additive install to push a forward-time LoRA/
-    /// LoKr residual — sc-11105), or `None` on an int8-ConvRot projection (never adaptable — the ConvRot
-    /// lane rejects adapters) and on the NVFP4 / probed validation legs (sc-12110), which are bench-only
-    /// and never carry an adapter. The `visit_adaptable_mut` walk yields this to the installer.
+    /// The inner shared [`AdaptLinear`] used by dense/MLX-packed projections. INT8-ConvRot carries its
+    /// own additive stack through [`Self::as_additive_mut`]; NVFP4/probed validation legs are bench-only.
     pub fn as_adapt_mut(&mut self) -> Option<&mut AdaptLinear> {
         match self {
             Self::Adapt(a) => Some(a),
             Self::ConvRotInt8(_) | Self::Nvfp4(_) | Self::Probed(_) => None,
+        }
+    }
+
+    /// Whether this projection can host job-local additive LoRA/LoKr residuals. Shipping dense,
+    /// MLX-packed, and INT8-ConvRot projections are supported; bench-only NVFP4/probed projections are
+    /// deliberately outside generator routing.
+    pub(crate) fn as_additive_mut(&mut self) -> Option<&mut Self> {
+        match self {
+            Self::Adapt(_) | Self::ConvRotInt8(_) => Some(self),
+            Self::Nvfp4(_) | Self::Probed(_) => None,
+        }
+    }
+
+    pub(crate) fn additive_shape(&self) -> (usize, usize) {
+        match self {
+            Self::Adapt(a) => a.base_shape(),
+            Self::ConvRotInt8(c) => {
+                let (out, input) = c.w_i8.dims2().expect("validated ConvRot rank-2 weight");
+                (out, input)
+            }
+            Self::Nvfp4(_) | Self::Probed(_) => {
+                unreachable!("bench-only projections are not exposed to adapter installation")
+            }
+        }
+    }
+
+    pub(crate) fn push_additive_lora(&mut self, a: Tensor, b: Tensor, scale: f64) {
+        match self {
+            Self::Adapt(host) => host.push_lora(a, b, scale),
+            Self::ConvRotInt8(host) => host.adapters.push(ConvRotAdapter::Lora { a, b, scale }),
+            Self::Nvfp4(_) | Self::Probed(_) => {
+                unreachable!("bench-only projections are not exposed to adapter installation")
+            }
+        }
+    }
+
+    pub(crate) fn push_additive_lokr(&mut self, factors: candle_gen::quant::LokrFactors) {
+        match self {
+            Self::Adapt(host) => host.push_lokr_structured(factors),
+            Self::ConvRotInt8(host) => host.adapters.push(ConvRotAdapter::Lokr { factors }),
+            Self::Nvfp4(_) | Self::Probed(_) => {
+                unreachable!("bench-only projections are not exposed to adapter installation")
+            }
+        }
+    }
+
+    pub(crate) fn clear_adapters(&mut self) {
+        match self {
+            Self::Adapt(host) => host.clear_adapters(),
+            Self::ConvRotInt8(host) => host.adapters.clear(),
+            Self::Nvfp4(_) | Self::Probed(_) => {}
         }
     }
 }
@@ -563,6 +665,79 @@ mod tests {
             QLinear::convrot_int8(pc.q.clone(), pc.scale.clone(), G + 1, None, &dev).is_err(),
             "non-power-of-four group_size must be a typed error"
         );
+        Ok(())
+    }
+
+    /// User LoRA and structured LoKr remain forward-time residuals over the ConvRot int8 base. The
+    /// base forward is identical in each pair, so subtraction isolates the adapter contribution and
+    /// proves the INT8-ConvRot route does not silently drop either advertised adapter kind.
+    #[test]
+    fn convrot_int8_applies_lora_and_lokr_without_replacing_int8_base() -> Result<()> {
+        let dev = Device::Cpu;
+        let (out_dim, in_dim, group) = (4usize, 4usize, 4usize);
+        let canonical = Tensor::from_vec(
+            vec![
+                0.5, -0.2, 0.1, 0.7, -0.3, 0.8, -0.4, 0.2, 0.6, 0.1, -0.5, 0.9, -0.7, 0.4, 0.3,
+                -0.1,
+            ],
+            (out_dim, in_dim),
+            &dev,
+        )?;
+        let rotation = candle_gen::quant::regular_hadamard(group, &dev)?;
+        let rotated = candle_gen::quant::convrot_rotate(&canonical, &rotation)?;
+        let parts = candle_gen::quant::quantize_weight_int8_per_channel(&rotated)?;
+        let build =
+            || QLinear::convrot_int8(parts.q.clone(), parts.scale.clone(), group, None, &dev);
+        let x = Tensor::from_vec(
+            vec![0.2f32, -0.4, 0.6, 0.8, -0.3, 0.5, 0.7, -0.9],
+            (2, in_dim),
+            &dev,
+        )?;
+
+        let bare = build()?;
+        let mut lora = build()?;
+        let a = Tensor::from_vec(vec![0.4f32, -0.2, 0.7, 0.3], (in_dim, 1), &dev)?;
+        let b = Tensor::from_vec(vec![0.5f32, -0.6, 0.2, 0.9], (1, out_dim), &dev)?;
+        lora.push_additive_lora(a.clone(), b.clone(), 0.75);
+        let lora_actual = (lora.forward(&x)? - bare.forward(&x)?)?;
+        let lora_expected = (x.matmul(&a)?.matmul(&b)? * 0.75)?;
+        let lora_max = (lora_actual - lora_expected)?
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        assert!(
+            lora_max < 1e-5,
+            "ConvRot LoRA residual drifted ({lora_max})"
+        );
+
+        let w1 = Tensor::from_vec(vec![0.8f32, -0.3, 0.2, 0.6], (2, 2), &dev)?;
+        let w2 = Tensor::from_vec(vec![0.4f32, 0.7, -0.5, 0.9], (2, 2), &dev)?;
+        let factors = candle_gen::quant::LokrFactors::build(
+            0.5,
+            (out_dim, in_dim),
+            Some(&w1),
+            None,
+            None,
+            Some(&w2),
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .expect("2x2 kron factors fit a 4x4 projection");
+        let expected = factors.residual(&x)?;
+        let mut lokr = build()?;
+        lokr.push_additive_lokr(factors);
+        let lokr_actual = (lokr.forward(&x)? - bare.forward(&x)?)?;
+        let lokr_max = (lokr_actual - expected)?
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        assert!(
+            lokr_max < 1e-5,
+            "ConvRot LoKr residual drifted ({lokr_max})"
+        );
+        assert!(lora.is_convrot_int8() && lokr.is_convrot_int8());
         Ok(())
     }
 

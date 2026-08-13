@@ -137,8 +137,8 @@ fn lora_proj(w: &Weights, path: &str, bias: bool) -> Result<ComposableLinear> {
 
 /// A projection in the composable control DiT. Dense and MLX-packed bases retain the adapter-capable
 /// [`LoraLinear`] path; an immutable ConvRot checkpoint uses Krea's native [`KreaQLinear`] so its I8
-/// codes, per-row scales, online Hadamard rotation, and shared cuBLASLt context remain intact. ConvRot
-/// is deliberately absent from the adapter visitors because the provider rejects that combination.
+/// codes, per-row scales, online Hadamard rotation, and shared cuBLASLt context remain intact. Both
+/// arms expose the same inference-only additive LoRA/LoKr contract.
 pub(crate) enum ComposableLinear {
     Adapt(LoraLinear),
     ConvRot(KreaQLinear),
@@ -149,6 +149,20 @@ impl ComposableLinear {
         match self {
             Self::Adapt(linear) => Some(linear),
             Self::ConvRot(_) => None,
+        }
+    }
+
+    fn visit_additive(
+        &mut self,
+        path: &str,
+        f: &mut dyn FnMut(&str, &mut dyn crate::adapters::AdditiveProj) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        match self {
+            Self::Adapt(linear) => f(path, linear),
+            Self::ConvRot(linear) => match linear.as_additive_mut() {
+                Some(linear) => f(path, linear),
+                None => Ok(()),
+            },
         }
     }
 
@@ -692,9 +706,7 @@ impl crate::adapters::AdditiveDit for KreaTrainDit {
                 (format!("{p}.attn.to_gate"), &mut blk.attn.gate),
                 (format!("{p}.attn.to_out.0"), &mut blk.attn.o),
             ] {
-                if let Some(proj) = proj.lora_mut() {
-                    f(&path, proj)?;
-                }
+                proj.visit_additive(&path, f)?;
             }
             blk.mlp
                 .visit_adaptable_mut(&format!("{p}.ff"), &mut |path, a| f(path, a))?;
@@ -709,9 +721,7 @@ impl crate::adapters::AdditiveDit for KreaTrainDit {
             ("txt_in.linear_2", &mut self.txt_in_l2),
             ("final_layer.linear", &mut self.final_linear),
         ] {
-            if let Some(proj) = proj.lora_mut() {
-                f(path, proj)?;
-            }
+            proj.visit_additive(path, f)?;
         }
         Ok(())
     }
@@ -735,6 +745,59 @@ impl crate::adapters::AdditiveDit for KreaTrainDit {
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn convrot_control_projection_is_exposed_to_additive_adapter_walk() {
+        let dev = Device::Cpu;
+        let canonical = Tensor::from_vec(
+            vec![
+                0.5f32, -0.2, 0.1, 0.7, -0.3, 0.8, -0.4, 0.2, 0.6, 0.1, -0.5, 0.9, -0.7, 0.4, 0.3,
+                -0.1,
+            ],
+            (4, 4),
+            &dev,
+        )
+        .unwrap();
+        let rotation = candle_gen::quant::regular_hadamard(4, &dev).unwrap();
+        let rotated = candle_gen::quant::convrot_rotate(&canonical, &rotation).unwrap();
+        let parts = candle_gen::quant::quantize_weight_int8_per_channel(&rotated).unwrap();
+        let mut projection = ComposableLinear::ConvRot(
+            KreaQLinear::convrot_int8(parts.q, parts.scale, 4, None, &dev).unwrap(),
+        );
+        let x = Tensor::ones((1, 4), DType::F32, &dev).unwrap();
+        let bare = projection.forward(&x).unwrap();
+        let mut visited = 0usize;
+        projection
+            .visit_additive("transformer_blocks.0.attn.to_q", &mut |path, host| {
+                assert_eq!(path, "transformer_blocks.0.attn.to_q");
+                host.add_lora(
+                    Tensor::ones((4, 1), DType::F32, &dev).unwrap(),
+                    Tensor::ones((1, 4), DType::F32, &dev).unwrap(),
+                    0.5,
+                );
+                visited += 1;
+                Ok(())
+            })
+            .unwrap();
+        let adapted = projection.forward(&x).unwrap();
+        let shift = (adapted - bare)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert_eq!(
+            visited, 1,
+            "strict-control ConvRot host must be visited once"
+        );
+        assert!(shift > 1e-4, "visited ConvRot host must apply its residual");
+        assert!(
+            projection.is_convrot(),
+            "adapter must preserve the int8 base"
+        );
+    }
 
     #[test]
     fn control_rope_cache_builds_once_and_matches_fresh_tables() -> Result<()> {

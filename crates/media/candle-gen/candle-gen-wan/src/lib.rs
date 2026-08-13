@@ -186,23 +186,22 @@ impl Pipeline {
     /// delta into the weights ([`adapters::merge_adapters`], the merge-not-residual fast path, byte
     /// identical to before); a **packed** q4/q8 tier attaches forward-time **additive** residuals on the
     /// packed `QLinear` ([`adapters::install_additive`], sc-10094) — a packed tier has no dense `W` to
-    /// fold into, and LoKr/LoHa on it is rejected there (deferred to sc-10050/10051). The 5B is a single
+    /// fold into; LoRA and structured LoKr remain additive while LoHa fails closed. The 5B is a single
     /// (non-MoE) DiT, so every adapter is shared (`moe_expert = None`); the `expert` arg is a formality.
     fn build_dit(&self) -> CResult<WanTransformer> {
         // sub-story-1 test seam (sc-12735): a native-GGUF k-quant DiT path, selected by the
         // `CANDLE_GEN_WAN_GGUF` env var pointing at a downloaded `QuantStack/Wan2.2-TI2V-5B-GGUF` `.gguf`.
         // The DiT is held as resident Q4_K_M `QTensor`s (dequant-on-matmul) — the loader-proof this PR
-        // lands. Manifest/catalog/tier routing is sub-story 2; adapter routing on this path is a later
-        // sub-story, so a LoRA/LoKr spec on the GGUF seam is rejected loudly rather than silently ignored.
+        // lands. It is deliberately absent from the manifest/catalog (pinned by the explicit registry
+        // test below), so it is not a selectable product tier. Reject an adapter stack on this env-only
+        // seam rather than letting a test override silently change product semantics.
         if let Some(gguf) = crate::gguf::env_gguf_path() {
             if !self.adapters.is_empty() {
                 return Err(CandleError::Msg(format!(
-                    "wan: LoRA/LoKr on the native-GGUF 5B path ({}) is not wired yet — sc-12735 sub-story \
-                     1 is the GGUF loader mechanism; adapter routing on the GGUF tier is a later sub-story",
+                    "wan: the env-only native-GGUF test seam ({}) is not a registered adapter tier",
                     crate::gguf::GGUF_ENV
                 )));
             }
-            // candle_core::Result → CResult (CandleError) via the `?` bridge.
             return Ok(crate::gguf::load_wan_dit_gguf(
                 &gguf,
                 &self.dit_cfg,
@@ -693,7 +692,8 @@ pub fn descriptor() -> ModelDescriptor {
             supports_true_cfg: false,
             conditioning: vec![],
             // LoRA/LoKr apply at load (sc-10095): folded on a dense tier, or as additive residuals on a
-            // packed q4/q8 tier (sc-10094). LoKr/LoHa on a packed tier is rejected at load (sc-10050/10051).
+            // packed q4/q8 tier. Structured LoKr is packed-safe; LoHa fails closed. The env-only native
+            // GGUF loader is not a registered product tier.
             supports_lora: true,
             supports_lokr: true,
             // Native flow samplers (curated `uni_pc` default / `euler`) + the epic 7114 P4 (sc-7124)
@@ -838,6 +838,10 @@ mod explicit_registry_tests {
             ]
         );
         assert_eq!(explicit_trainers, ["wan2_2_t2v_14b"]);
+        assert!(
+            explicit_generators.iter().all(|id| !id.contains("gguf")),
+            "the native GGUF loader is an explicit env-only test seam, not a selectable catalog tier"
+        );
     }
 }
 

@@ -781,7 +781,7 @@ fn load_generation_variant(
     let component_dirs = resolve_component_dirs(&root, spec)?;
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
         return Err(gen_core::Error::Unsupported(
-            "mage_flow RL generation does not accept adapters or control overlays".into(),
+            "mage_flow RL generation does not accept control or IP-Adapter overlays".into(),
         ));
     }
     let device = candle_gen::default_device()?;
@@ -875,7 +875,7 @@ fn load_edit_variant(
     }
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
-            "{} does not accept adapters or control overlays",
+            "{} does not accept control or IP-Adapter overlays",
             variant.id()
         )));
     }

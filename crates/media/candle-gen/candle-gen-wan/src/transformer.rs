@@ -617,7 +617,7 @@ impl WanTransformer {
     }
 
     /// Whether this DiT loaded from a **packed** MLX tier (its projections are quantized) — the additive
-    /// router uses this to reject LoKr/LoHa on a packed base (sc-10094). Probed on `proj_out` (every
+    /// router uses this to select packed-safe additive residuals (sc-10094). Probed on `proj_out` (every
     /// projection in a tier packs together; a dense checkpoint packs none).
     pub fn is_packed(&self) -> bool {
         self.proj_out.is_packed()

@@ -855,12 +855,40 @@ pub fn reconstruct_lora_delta(
     Ok((ba * eff)?)
 }
 
+/// Parse PEFT LoKr `rank`/`alpha` metadata without collapsing a present malformed value to a default.
+/// Missing rank defaults to 1 and missing alpha defaults to rank; present values must match the same
+/// finite, positive-rank contract enforced by [`reconstruct_lokr_delta`].
+pub fn parse_lokr_metadata(rank: Option<&str>, alpha: Option<&str>) -> Result<(f32, f32)> {
+    let parse = |field: &str, raw: &str| {
+        raw.trim().parse::<f32>().map_err(|_| {
+            CandleError::Msg(format!(
+                "LoKr adapter metadata `{field}` = `{raw}` is not a valid number"
+            ))
+        })
+    };
+    let rank = match rank {
+        Some(raw) => parse("rank", raw)?,
+        None => 1.0,
+    };
+    let alpha = match alpha {
+        Some(raw) => parse("alpha", raw)?,
+        None => rank,
+    };
+    if !rank.is_finite() || rank <= 0.0 || !alpha.is_finite() {
+        return Err(CandleError::Msg(format!(
+            "LoKr: invalid metadata scale (rank = {rank}, alpha = {alpha}); rank must be finite and \
+             > 0 and alpha must be finite"
+        )));
+    }
+    Ok((rank, alpha))
+}
+
 /// Reconstruct the LoKr weight delta `ΔW = (alpha/rank)·scale·kron(w1, w2)` reshaped to `base_shape`
 /// (`[out, in]`), as **f32** — the inference-side merge counterpart to [`LoraLinear`]'s LoKr forward,
 /// using the *same* `kron2d` reconstruction. Each Kronecker leg is either a full factor (`w1`/`w2`)
 /// or a low-rank product (`w1_a·w1_b` / `w2_a·w2_b`, e.g. the trainer's zero-init `w2_a`/`w2_b` form).
-/// Errors if a leg is missing. Linear-only: pass 2-D factors (the SDXL trainer adapts Linears; Tucker /
-/// conv reconstruction is not handled here).
+/// Errors if a leg is missing or if metadata/user scaling is invalid. Linear-only: pass 2-D factors
+/// (the SDXL trainer adapts Linears; Tucker / conv reconstruction is not handled here).
 #[allow(clippy::too_many_arguments)]
 pub fn reconstruct_lokr_delta(
     w1: Option<&Tensor>,
@@ -874,6 +902,23 @@ pub fn reconstruct_lokr_delta(
     scale: f32,
     base_shape: (usize, usize),
 ) -> Result<Tensor> {
+    if !scale.is_finite() {
+        return Err(CandleError::Msg(format!(
+            "LoKr: adapter scale must be finite (got {scale})"
+        )));
+    }
+    if !rank.is_finite() || rank <= 0.0 || !alpha.is_finite() {
+        return Err(CandleError::Msg(format!(
+            "LoKr: invalid metadata scale (rank = {rank}, alpha = {alpha}); rank must be finite and \
+             > 0 and alpha must be finite"
+        )));
+    }
+    let eff = (alpha as f64 / rank as f64) * scale as f64;
+    if !eff.is_finite() {
+        return Err(CandleError::Msg(format!(
+            "LoKr: derived (alpha/rank) * adapter scale must be finite (got {eff})"
+        )));
+    }
     let f32d = |t: &Tensor| t.to_dtype(DType::F32);
     let factor1 = match (w1, w1_a, w1_b) {
         (Some(w), _, _) => f32d(w)?,
@@ -895,7 +940,6 @@ pub fn reconstruct_lokr_delta(
     };
     let (out_f, in_f) = base_shape;
     let delta = kron2d(&factor1, &factor2)?.reshape((out_f, in_f))?;
-    let eff = (alpha as f64 / rank as f64) * scale as f64;
     Ok((delta * eff)?)
 }
 
@@ -1892,6 +1936,59 @@ mod tests {
         assert!(
             diff < 1e-5,
             "reconstruct_lokr_delta diverged from forward residual: {diff}"
+        );
+    }
+
+    #[test]
+    fn reconstruct_lokr_delta_rejects_invalid_metadata_and_user_scaling() {
+        let w1 = Tensor::ones((1, 1), DType::F32, &Device::Cpu).unwrap();
+        let w2 = Tensor::eye(2, DType::F32, &Device::Cpu).unwrap();
+        let reconstruct = |alpha, rank, scale| {
+            reconstruct_lokr_delta(
+                Some(&w1),
+                None,
+                None,
+                Some(&w2),
+                None,
+                None,
+                alpha,
+                rank,
+                scale,
+                (2, 2),
+            )
+        };
+
+        for scale in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let error = reconstruct(1.0, 1.0, scale)
+                .expect_err("a non-finite user scale must not produce a dense delta");
+            assert!(error.to_string().contains("adapter scale must be finite"));
+        }
+        for alpha in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let error = reconstruct(alpha, 1.0, 1.0)
+                .expect_err("a non-finite metadata alpha must not produce a dense delta");
+            assert!(error.to_string().contains("invalid metadata scale"));
+        }
+        for rank in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            let error = reconstruct(1.0, rank, 1.0)
+                .expect_err("an invalid metadata rank must not produce a dense delta");
+            assert!(error.to_string().contains("invalid metadata scale"));
+        }
+
+        for (rank, alpha) in [
+            (Some("not-a-number"), None),
+            (Some("0"), None),
+            (Some("-2"), Some("1")),
+            (Some("1"), Some("inf")),
+        ] {
+            assert!(
+                parse_lokr_metadata(rank, alpha).is_err(),
+                "present malformed metadata must fail closed: rank={rank:?} alpha={alpha:?}"
+            );
+        }
+        assert_eq!(parse_lokr_metadata(None, None).unwrap(), (1.0, 1.0));
+        assert_eq!(
+            parse_lokr_metadata(Some("4"), Some("2")).unwrap(),
+            (4.0, 2.0)
         );
     }
 

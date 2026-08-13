@@ -51,7 +51,9 @@ use candle_gen::candle_core::DType;
 use candle_gen::candle_core::Tensor;
 use candle_gen::gen_core::weightsmeta as wmeta;
 use candle_gen::gen_core::{AdapterKind, AdapterSpec};
-use candle_gen::train::lora::{reconstruct_lokr_delta, reconstruct_lora_delta, LoraAdapterMeta};
+use candle_gen::train::lora::{
+    parse_lokr_metadata, reconstruct_lokr_delta, reconstruct_lora_delta, LoraAdapterMeta,
+};
 // The shared adapter-merge skeleton (sc-8998 / F-018): the format-parsing + merge-report + third-party
 // LyCORIS engine + the ComfyUI/lightx2v diff-patch fold this crate previously hand-copied. Only the
 // SCAIL-2-specific key→module resolution (bare/prefixed dotted paths, no kohya table) stays local below.
@@ -176,10 +178,10 @@ fn merge_lokr_file(
     scale: f32,
     report: &mut MergeReport,
 ) -> Result<()> {
-    let (rank, alpha) = wmeta::parse_rank_alpha(
+    let (rank, alpha) = parse_lokr_metadata(
         af.meta.get("rank").map(String::as_str),
         af.meta.get("alpha").map(String::as_str),
-    );
+    )?;
 
     let mut grouped: BTreeMap<String, BTreeMap<&'static str, Tensor>> = BTreeMap::new();
     for (key, t) in &af.tensors {
