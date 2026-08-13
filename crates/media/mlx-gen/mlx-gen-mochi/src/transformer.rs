@@ -29,12 +29,11 @@ use std::path::Path;
 
 use mlx_rs::fast::{layer_norm, scaled_dot_product_attention};
 use mlx_rs::ops::{
-    add, concatenate_axis, log, matmul, maximum, mean_axis, multiply, quantized_matmul, rsqrt,
-    split, sum_axis, tanh,
+    add, concatenate_axis, log, matmul, maximum, mean_axis, multiply, rsqrt, split, sum_axis, tanh,
 };
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::nn::{conv2d, silu, timestep_sincos};
+use mlx_gen::nn::{conv2d, quantized_matmul_with_bias, silu, timestep_sincos};
 use mlx_gen::weights::{join, Weights};
 use mlx_gen::{Error, Result};
 
@@ -261,11 +260,7 @@ impl MochiLinear {
                 compute,
             } => {
                 let x = x.as_dtype(*compute)?;
-                let mut y = quantized_matmul(&x, wq, scales, biases, true, *group, *bits)?;
-                if let Some(b) = b {
-                    y = add(&y, b)?;
-                }
-                Ok(y)
+                quantized_matmul_with_bias(&x, wq, scales, biases, b.as_ref(), *group, *bits)
             }
         }
     }

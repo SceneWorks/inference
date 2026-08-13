@@ -26,7 +26,7 @@ use mlx_rs::ops::{
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::AdaptableLinear;
-use mlx_gen::nn::{conv2d, gelu_exact, linear};
+use mlx_gen::nn::{conv2d, conv2d_general, gelu_exact, linear};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
@@ -723,8 +723,15 @@ fn conv2d_g(
     pad: i32,
     groups: i32,
 ) -> Result<Array> {
-    let y = mlx_rs::ops::conv2d(x, w_ohwi, (stride, stride), (pad, pad), (1, 1), groups)?;
-    Ok(add(&y, b)?)
+    conv2d_general(
+        x,
+        w_ohwi,
+        Some(b),
+        (stride, stride),
+        (pad, pad),
+        (1, 1),
+        groups,
+    )
 }
 
 thread_local! {

@@ -13,10 +13,11 @@ use std::{
 };
 
 use mlx_rs::error::Exception;
-use mlx_rs::fast::layer_norm;
+use mlx_rs::fast::{gelu_tanh_exact, group_norm_affine, layer_norm, silu_exact};
 use mlx_rs::ops::{
-    add, addmm, broadcast_to, conv2d as conv2d_op, conv3d as conv3d_op, dequantize, divide, erf,
-    multiply, pad, power, quantize, sigmoid, subtract, tanh,
+    add, addmm, broadcast_to, conv2d as conv2d_op, conv3d as conv3d_op, conv_general_bias,
+    dequantize, divide, erf, multiply, pad, power, quantize, quantized_matmul,
+    quantized_matmul_bias as quantized_matmul_bias_op, sigmoid, subtract, tanh,
 };
 use mlx_rs::transforms::compile::{
     compile, compile_retained, RetainedBinary as MlxRetainedBinary,
@@ -27,6 +28,28 @@ use mlx_rs::{Array, Dtype};
 
 use crate::array::scalar;
 use crate::{Error, Result};
+
+const EXACT_EPILOGUE_FALLBACK_REASON: &str = "unsupported_dtype_shape_or_dispatch";
+
+fn exact_epilogues_requested() -> bool {
+    crate::diagnostics::toggle_requested(crate::diagnostics::EXACT_EPILOGUES)
+}
+
+fn record_exact_epilogue_applied(operation: &'static str) {
+    crate::diagnostics::record_exact_epilogue(
+        operation,
+        crate::diagnostics::ToggleDisposition::Applied,
+        None,
+    );
+}
+
+fn record_exact_epilogue_fallback(operation: &'static str) {
+    crate::diagnostics::record_exact_epilogue(
+        operation,
+        crate::diagnostics::ToggleDisposition::Fallback,
+        Some(EXACT_EPILOGUE_FALLBACK_REASON),
+    );
+}
 
 /// A token-embedding table (`[vocab, hidden]`), dense or group-quantized (Q4/Q8) — the shared
 /// implementation behind the FLUX.2 and Z-Image text encoders' `embed_tokens` (F-083). `forward` is a
@@ -740,8 +763,62 @@ pub fn linear(x: &Array, w: &Array, b: &Array) -> Result<Array> {
     Ok(addmm(b, x, w.t(), 1.0, 1.0)?)
 }
 
+/// Affine Q4/Q8 matmul over an already-packed `[out, in]` weight, with an optional dense output
+/// bias. With P3 selected, the biased case first attempts the strict exact native epilogue. Any
+/// unsupported dtype, shape, group size, or Metal dispatcher executes the original
+/// `quantized_matmul` then `add` expression and emits a truthful per-operation fallback receipt.
+/// Biasless paths are not a P3 composition and remain a plain quantized matmul.
+#[allow(clippy::too_many_arguments)]
+pub fn quantized_matmul_with_bias(
+    x: &Array,
+    w: &Array,
+    scales: &Array,
+    biases: &Array,
+    output_bias: Option<&Array>,
+    group_size: i32,
+    bits: i32,
+) -> Result<Array> {
+    if let Some(output_bias) = output_bias {
+        if exact_epilogues_requested() {
+            match quantized_matmul_bias_op(
+                x,
+                w,
+                scales,
+                biases,
+                output_bias,
+                true,
+                group_size,
+                bits,
+            ) {
+                Ok(y) => {
+                    record_exact_epilogue_applied(crate::diagnostics::EXACT_QUANTIZED_MATMUL_BIAS);
+                    return Ok(y);
+                }
+                Err(_) => {
+                    record_exact_epilogue_fallback(crate::diagnostics::EXACT_QUANTIZED_MATMUL_BIAS)
+                }
+            }
+        }
+    }
+
+    let y = quantized_matmul(x, w, scales, biases, true, group_size, bits)?;
+    match output_bias {
+        Some(output_bias) => Ok(add(&y, output_bias)?),
+        None => Ok(y),
+    }
+}
+
 /// SiLU / swish activation: `x · sigmoid(x)`.
 pub fn silu(x: &Array) -> Result<Array> {
+    if exact_epilogues_requested() {
+        match silu_exact(x) {
+            Ok(y) => {
+                record_exact_epilogue_applied(crate::diagnostics::EXACT_SILU);
+                return Ok(y);
+            }
+            Err(_) => record_exact_epilogue_fallback(crate::diagnostics::EXACT_SILU),
+        }
+    }
     Ok(multiply(x, &sigmoid(x)?)?)
 }
 
@@ -762,6 +839,15 @@ pub fn silu(x: &Array) -> Result<Array> {
 /// Shared across the family crates' tanh-approx FFNs (Wan today; Qwen/FLUX/FLUX.2/Z-Image as their
 /// forwards move f32→bf16, sc-2718–2721). `x³` via integer-exponent `power`, as MLX does.
 pub fn gelu_tanh(x: &Array) -> Result<Array> {
+    if exact_epilogues_requested() {
+        match gelu_tanh_exact(x) {
+            Ok(y) => {
+                record_exact_epilogue_applied(crate::diagnostics::EXACT_GELU_TANH);
+                return Ok(y);
+            }
+            Err(_) => record_exact_epilogue_fallback(crate::diagnostics::EXACT_GELU_TANH),
+        }
+    }
     let dt = x.dtype();
     let s = |v: f32| -> Result<Array> { Ok(scalar(v).as_dtype(dt)?) };
     let c = (2.0_f64 / std::f64::consts::PI).sqrt() as f32;
@@ -819,11 +905,49 @@ pub fn gelu_quick(x: &Array) -> Result<Array> {
 
 /// 2-D conv over NHWC `x` with an mlx `[out, kH, kW, in]` weight (+ optional bias).
 pub fn conv2d(x: &Array, w: &Array, b: Option<&Array>, stride: i32, padding: i32) -> Result<Array> {
-    let mut y = conv2d_op(x, w, (stride, stride), (padding, padding), (1, 1), 1)?;
+    conv2d_general(x, w, b, (stride, stride), (padding, padding), (1, 1), 1)
+}
+
+/// General 2-D channels-last convolution used by the remaining grouped/dilated call sites. The P3
+/// native operation deliberately rejects grouped, Winograd, and unfold/explicit-GEMM dispatches;
+/// those cases preserve the composed `conv2d` then `add` path and report Fallback.
+#[allow(clippy::too_many_arguments)]
+pub fn conv2d_general(
+    x: &Array,
+    w: &Array,
+    b: Option<&Array>,
+    stride: (i32, i32),
+    padding: (i32, i32),
+    dilation: (i32, i32),
+    groups: i32,
+) -> Result<Array> {
     if let Some(b) = b {
-        y = add(&y, b)?;
+        if exact_epilogues_requested() {
+            match conv_general_bias(
+                x,
+                w,
+                b,
+                &[stride.0, stride.1][..],
+                &[padding.0, padding.1][..],
+                &[dilation.0, dilation.1][..],
+                &[1, 1][..],
+                groups,
+                false,
+            ) {
+                Ok(y) => {
+                    record_exact_epilogue_applied(crate::diagnostics::EXACT_CONV2D_BIAS);
+                    return Ok(y);
+                }
+                Err(_) => record_exact_epilogue_fallback(crate::diagnostics::EXACT_CONV2D_BIAS),
+            }
+        }
     }
-    Ok(y)
+
+    let y = conv2d_op(x, w, stride, padding, dilation, groups)?;
+    match b {
+        Some(b) => Ok(add(&y, b)?),
+        None => Ok(y),
+    }
 }
 
 /// 3-D conv over NDHWC `x` with an mlx `[out, kD, kH, kW, in]` weight (+ optional bias).
@@ -837,11 +961,33 @@ pub fn conv3d(
     stride: (i32, i32, i32),
     padding: (i32, i32, i32),
 ) -> Result<Array> {
-    let mut y = conv3d_op(x, w, stride, padding, (1, 1, 1), 1)?;
     if let Some(b) = b {
-        y = add(&y, b)?;
+        if exact_epilogues_requested() {
+            match conv_general_bias(
+                x,
+                w,
+                b,
+                &[stride.0, stride.1, stride.2][..],
+                &[padding.0, padding.1, padding.2][..],
+                &[1, 1, 1][..],
+                &[1, 1, 1][..],
+                1,
+                false,
+            ) {
+                Ok(y) => {
+                    record_exact_epilogue_applied(crate::diagnostics::EXACT_CONV3D_BIAS);
+                    return Ok(y);
+                }
+                Err(_) => record_exact_epilogue_fallback(crate::diagnostics::EXACT_CONV3D_BIAS),
+            }
+        }
     }
-    Ok(y)
+
+    let y = conv3d_op(x, w, stride, padding, (1, 1, 1), 1)?;
+    match b {
+        Some(b) => Ok(add(&y, b)?),
+        None => Ok(y),
+    }
 }
 
 /// PyTorch-compatible group normalization over NHWC `x` (`weight`/`bias` are per-channel).
@@ -872,6 +1018,16 @@ pub fn group_norm(
         )));
     }
     let group_size = dims / num_groups;
+
+    if exact_epilogues_requested() {
+        match group_norm_affine(x, weight, bias, num_groups, eps) {
+            Ok(y) => {
+                record_exact_epilogue_applied(crate::diagnostics::EXACT_GROUP_NORM_AFFINE);
+                return Ok(y);
+            }
+            Err(_) => record_exact_epilogue_fallback(crate::diagnostics::EXACT_GROUP_NORM_AFFINE),
+        }
+    }
 
     let g = x
         .reshape(&[batch, -1, num_groups, group_size])?
@@ -1088,8 +1244,119 @@ pub fn window_unpartition(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diagnostics::{self, DiagnosticCounter, ToggleDisposition, EXACT_EPILOGUES};
+    use mlx_rs::ops::indexing::{IndexOp, IntoStrideBy};
     use mlx_rs::ops::{abs, array_eq, max, subtract};
     use mlx_rs::Dtype;
+
+    // MLX keeps this source-backed runtime predicate private to its C++ Metal backend. The focused
+    // NAX job links the exact pinned static library, so this test-only declaration calls the same
+    // predicate used by the qmm/conv dispatchers without adding a production API solely for CI.
+    #[cfg(target_os = "macos")]
+    unsafe extern "C" {
+        #[link_name = "_ZN3mlx4core5metal16is_nax_availableEv"]
+        fn mlx_p3_is_nax_available() -> bool;
+    }
+
+    fn patterned(shape: &[i32], cosine: bool) -> Array {
+        let len = shape.iter().map(|dim| *dim as usize).product::<usize>();
+        let values: Vec<f32> = (0..len)
+            .map(|index| {
+                let x = index as f32 * 0.013;
+                if cosine {
+                    x.cos()
+                } else {
+                    x.sin()
+                }
+            })
+            .collect();
+        Array::from_slice(&values, shape)
+    }
+
+    fn exact_receipt_count(
+        report: &diagnostics::DiagnosticReport,
+        operation: &'static str,
+        disposition: ToggleDisposition,
+        reason: Option<&'static str>,
+    ) -> u64 {
+        report
+            .counters
+            .iter()
+            .find_map(|counter| match counter {
+                DiagnosticCounter::ExactEpilogue {
+                    operation: recorded_operation,
+                    disposition: recorded_disposition,
+                    reason: recorded_reason,
+                    count,
+                } if *recorded_operation == operation && *recorded_disposition == disposition => {
+                    (*recorded_reason == reason).then_some(*count)
+                }
+                _ => None,
+            })
+            .unwrap_or(0)
+    }
+
+    fn assert_bit_exact(actual: &Array, expected: &Array, context: &str) {
+        assert!(
+            array_eq(actual, expected, false).unwrap().item::<bool>(),
+            "P3 output diverged from the composed baseline for {context}"
+        );
+    }
+
+    fn assert_exact_receipt(
+        report: &diagnostics::DiagnosticReport,
+        operation: &'static str,
+        disposition: ToggleDisposition,
+        reason: Option<&'static str>,
+        count: u64,
+    ) {
+        assert_eq!(
+            exact_receipt_count(report, operation, disposition, reason),
+            count,
+            "unexpected {disposition:?} receipt count for {operation} with reason {reason:?}"
+        );
+    }
+
+    fn assert_no_exact_receipts(report: &diagnostics::DiagnosticReport) {
+        assert!(!report.counters.iter().any(|counter| matches!(
+            counter,
+            DiagnosticCounter::ExactEpilogue { .. }
+                | DiagnosticCounter::Toggle {
+                    toggle: EXACT_EPILOGUES,
+                    ..
+                }
+        )));
+    }
+
+    fn assert_exact_toggle(report: &diagnostics::DiagnosticReport, disposition: ToggleDisposition) {
+        assert!(report.counters.contains(&DiagnosticCounter::Toggle {
+            toggle: EXACT_EPILOGUES,
+            disposition,
+            count: 1,
+        }));
+    }
+
+    fn typed_patterned(shape: &[i32], dtype: Dtype, cosine: bool) -> Array {
+        patterned(shape, cosine).as_dtype(dtype).unwrap()
+    }
+
+    #[test]
+    fn p3_nax_runtime_is_available_when_required() {
+        if std::env::var_os("SCENEWORKS_REQUIRE_NAX").is_none() {
+            return;
+        }
+
+        #[cfg(target_os = "macos")]
+        // SAFETY: the no-argument C++ function returns a plain bool and is linked from the same
+        // pinned libmlx.a that owns every exact primitive exercised by this test binary.
+        assert!(
+            unsafe { mlx_p3_is_nax_available() },
+            "SCENEWORKS_REQUIRE_NAX requires MLX's actual runtime NAX predicate to pass"
+        );
+
+        #[cfg(not(target_os = "macos"))]
+        panic!("SCENEWORKS_REQUIRE_NAX is only valid on macOS");
+    }
 
     #[test]
     fn text_rope_offset_zero_equals_forward_and_shifts_positions() {
@@ -1584,6 +1851,590 @@ mod tests {
             .unwrap()
             .item::<f32>();
         assert!(d < 5e-2, "bf16 gelu_tanh diverged from f32 truth: {d}");
+    }
+
+    #[test]
+    fn p3_default_path_preserves_every_composed_operation_without_receipts() {
+        let activation = patterned(&[3, 17, 65], false);
+        let x2 = patterned(&[1, 8, 8, 16], false);
+        let w2 = patterned(&[16, 3, 3, 16], true);
+        let b2 = patterned(&[16], false);
+        let x3 = patterned(&[1, 4, 4, 4, 16], false);
+        let w3 = patterned(&[16, 3, 3, 3, 16], true);
+        let b3 = patterned(&[16], false);
+        let gn_x = patterned(&[2, 3, 5, 32], false);
+        let gn_w = patterned(&[32], true);
+        let gn_b = patterned(&[32], false);
+        let qmm_x = patterned(&[32, 64], false);
+        let qmm_w = patterned(&[128, 64], true);
+        let qmm_bias = patterned(&[128], false);
+        let (qmm_wq, qmm_scales, qmm_biases) = quantize(&qmm_w, 64, 4).unwrap();
+
+        let expected_silu = silu(&activation).unwrap();
+        let expected_gelu = gelu_tanh(&activation).unwrap();
+        let expected_conv2 =
+            conv2d_general(&x2, &w2, Some(&b2), (1, 1), (1, 1), (1, 1), 1).unwrap();
+        let expected_conv3 = conv3d(&x3, &w3, Some(&b3), (1, 1, 1), (1, 1, 1)).unwrap();
+        let expected_group_norm = group_norm(&gn_x, &gn_w, &gn_b, 8, 1e-5).unwrap();
+        let expected_qmm = quantized_matmul_with_bias(
+            &qmm_x,
+            &qmm_wq,
+            &qmm_scales,
+            &qmm_biases,
+            Some(&qmm_bias),
+            64,
+            4,
+        )
+        .unwrap();
+
+        let scope = diagnostics::begin_request("p3-default-full-surface", "test").unwrap();
+        let actual_silu = silu(&activation).unwrap();
+        let actual_gelu = gelu_tanh(&activation).unwrap();
+        let actual_conv2 = conv2d_general(&x2, &w2, Some(&b2), (1, 1), (1, 1), (1, 1), 1).unwrap();
+        let actual_conv3 = conv3d(&x3, &w3, Some(&b3), (1, 1, 1), (1, 1, 1)).unwrap();
+        let actual_group_norm = group_norm(&gn_x, &gn_w, &gn_b, 8, 1e-5).unwrap();
+        let actual_qmm = quantized_matmul_with_bias(
+            &qmm_x,
+            &qmm_wq,
+            &qmm_scales,
+            &qmm_biases,
+            Some(&qmm_bias),
+            64,
+            4,
+        )
+        .unwrap();
+        let report = scope.finish();
+
+        for (actual, expected, operation) in [
+            (&actual_silu, &expected_silu, diagnostics::EXACT_SILU),
+            (&actual_gelu, &expected_gelu, diagnostics::EXACT_GELU_TANH),
+            (
+                &actual_conv2,
+                &expected_conv2,
+                diagnostics::EXACT_CONV2D_BIAS,
+            ),
+            (
+                &actual_conv3,
+                &expected_conv3,
+                diagnostics::EXACT_CONV3D_BIAS,
+            ),
+            (
+                &actual_group_norm,
+                &expected_group_norm,
+                diagnostics::EXACT_GROUP_NORM_AFFINE,
+            ),
+            (
+                &actual_qmm,
+                &expected_qmm,
+                diagnostics::EXACT_QUANTIZED_MATMUL_BIAS,
+            ),
+        ] {
+            assert_bit_exact(actual, expected, operation);
+        }
+        assert_no_exact_receipts(&report);
+    }
+
+    #[test]
+    fn p3_exact_activations_cover_all_supported_dtypes_and_layouts() {
+        for dtype in [Dtype::Float32, Dtype::Float16, Dtype::Bfloat16] {
+            let contiguous = typed_patterned(&[3, 17, 65], dtype, false);
+            let noncontiguous = contiguous.transpose_axes(&[1, 0, 2]).unwrap();
+            for (layout, x) in [("contiguous", contiguous), ("noncontiguous", noncontiguous)] {
+                let eager_silu = silu(&x).unwrap();
+                let eager_gelu = gelu_tanh(&x).unwrap();
+                let scope = diagnostics::begin_request_with_toggles(
+                    "p3-exact-activation",
+                    "test",
+                    &[EXACT_EPILOGUES],
+                )
+                .unwrap();
+                let exact_silu = silu(&x).unwrap();
+                let exact_gelu = gelu_tanh(&x).unwrap();
+                let report = scope.finish();
+
+                assert_bit_exact(
+                    &exact_silu,
+                    &eager_silu,
+                    &format!("silu {dtype:?} {layout}"),
+                );
+                assert_bit_exact(
+                    &exact_gelu,
+                    &eager_gelu,
+                    &format!("gelu_tanh {dtype:?} {layout}"),
+                );
+                assert_exact_receipt(
+                    &report,
+                    diagnostics::EXACT_SILU,
+                    ToggleDisposition::Applied,
+                    None,
+                    1,
+                );
+                assert_exact_receipt(
+                    &report,
+                    diagnostics::EXACT_GELU_TANH,
+                    ToggleDisposition::Applied,
+                    None,
+                    1,
+                );
+                assert_exact_toggle(&report, ToggleDisposition::Applied);
+            }
+        }
+    }
+
+    #[test]
+    fn p3_exact_convolution_and_group_norm_cover_supported_dispatches() {
+        for dtype in [Dtype::Float32, Dtype::Float16, Dtype::Bfloat16] {
+            // These four 2-D cases mirror the native selector's regular, odd/batched,
+            // non-contiguous, and direct-general implicit-GEMM classes. On NAX hardware f16/bf16
+            // exercise the matrix-unit kernels while f32 remains on the standard dispatcher.
+            for (input_shape, weight_shape, noncontiguous) in [
+                (&[1, 8, 8, 16][..], &[16, 3, 3, 16][..], false),
+                (&[2, 9, 11, 16][..], &[16, 3, 3, 16][..], false),
+                (&[2, 9, 11, 16][..], &[16, 3, 3, 16][..], true),
+                (&[2, 15, 17, 5][..], &[7, 3, 3, 5][..], false),
+            ] {
+                let mut source_shape = input_shape.to_vec();
+                if noncontiguous {
+                    source_shape.swap(1, 2);
+                }
+                let mut x = typed_patterned(&source_shape, dtype, false);
+                if noncontiguous {
+                    x = x.transpose_axes(&[0, 2, 1, 3]).unwrap();
+                }
+                let w = typed_patterned(weight_shape, dtype, true);
+                let b = typed_patterned(&[weight_shape[0]], dtype, false);
+                let eager = conv2d_general(&x, &w, Some(&b), (1, 1), (1, 1), (1, 1), 1).unwrap();
+                let scope = diagnostics::begin_request_with_toggles(
+                    "p3-exact-conv2d",
+                    "test",
+                    &[EXACT_EPILOGUES],
+                )
+                .unwrap();
+                let exact = conv2d_general(&x, &w, Some(&b), (1, 1), (1, 1), (1, 1), 1).unwrap();
+                let report = scope.finish();
+
+                assert_bit_exact(
+                    &exact,
+                    &eager,
+                    &format!("conv2d {dtype:?} {input_shape:?} noncontiguous={noncontiguous}"),
+                );
+                assert_exact_receipt(
+                    &report,
+                    diagnostics::EXACT_CONV2D_BIAS,
+                    ToggleDisposition::Applied,
+                    None,
+                    1,
+                );
+                assert_exact_toggle(&report, ToggleDisposition::Applied);
+            }
+
+            let x3 = typed_patterned(&[2, 3, 5, 7, 16], dtype, false);
+            let w3 = typed_patterned(&[16, 3, 3, 3, 16], dtype, true);
+            let b3 = typed_patterned(&[16], dtype, false);
+            let eager3 = conv3d(&x3, &w3, Some(&b3), (1, 1, 1), (1, 1, 1)).unwrap();
+            let scope = diagnostics::begin_request_with_toggles(
+                "p3-exact-conv3d",
+                "test",
+                &[EXACT_EPILOGUES],
+            )
+            .unwrap();
+            let exact3 = conv3d(&x3, &w3, Some(&b3), (1, 1, 1), (1, 1, 1)).unwrap();
+            let report = scope.finish();
+            assert_bit_exact(&exact3, &eager3, &format!("conv3d {dtype:?}"));
+            assert_exact_receipt(
+                &report,
+                diagnostics::EXACT_CONV3D_BIAS,
+                ToggleDisposition::Applied,
+                None,
+                1,
+            );
+            assert_exact_toggle(&report, ToggleDisposition::Applied);
+
+            // Small and large normalized axes select the single-row and looped kernels. The final
+            // case proves the same exact output for a non-contiguous input view.
+            let regular = typed_patterned(&[2, 3, 5, 32], dtype, false);
+            let looped = typed_patterned(&[1, 67, 101, 64], dtype, false);
+            let noncontiguous = typed_patterned(&[2, 4, 3, 32], dtype, false)
+                .transpose_axes(&[0, 2, 1, 3])
+                .unwrap();
+            for (layout, x) in [
+                ("single-row", regular),
+                ("looped", looped),
+                ("noncontiguous", noncontiguous),
+            ] {
+                let channels = *x.shape().last().unwrap();
+                let (weight, bias) = if layout == "noncontiguous" {
+                    let weight_source = typed_patterned(&[channels * 2], dtype, true);
+                    let bias_source = typed_patterned(&[channels * 2], dtype, false);
+                    (
+                        weight_source.index((..).stride_by(2)),
+                        bias_source.index((1..).stride_by(2)),
+                    )
+                } else {
+                    (
+                        typed_patterned(&[channels], dtype, true),
+                        typed_patterned(&[channels], dtype, false),
+                    )
+                };
+                let eager = group_norm(&x, &weight, &bias, 8, 1e-5).unwrap();
+                let scope = diagnostics::begin_request_with_toggles(
+                    "p3-exact-group-norm",
+                    "test",
+                    &[EXACT_EPILOGUES],
+                )
+                .unwrap();
+                let exact = group_norm(&x, &weight, &bias, 8, 1e-5).unwrap();
+                let report = scope.finish();
+
+                assert_bit_exact(&exact, &eager, &format!("group_norm {dtype:?} {layout}"));
+                assert_exact_receipt(
+                    &report,
+                    diagnostics::EXACT_GROUP_NORM_AFFINE,
+                    ToggleDisposition::Applied,
+                    None,
+                    1,
+                );
+                assert_exact_toggle(&report, ToggleDisposition::Applied);
+            }
+        }
+    }
+
+    #[test]
+    fn p3_unsupported_operations_preserve_composed_outputs_and_reasons() {
+        let activation = Array::from_slice(&[-2i32, -1, 0, 1, 2], &[5]);
+        let conv2_x = patterned(&[1, 8, 8, 16], false);
+        let conv2_w = patterned(&[16, 3, 3, 8], true);
+        let conv2_b = patterned(&[16], false);
+        let conv3_x = patterned(&[1, 4, 4, 4, 5], false);
+        let conv3_w = patterned(&[17, 3, 3, 3, 5], true);
+        let conv3_b = patterned(&[17], false);
+        let gn_x = patterned(&[2, 3, 5, 32], false);
+        let gn_w = patterned(&[32], true).as_dtype(Dtype::Float16).unwrap();
+        let gn_b = patterned(&[32], false);
+        let qmm_x = patterned(&[1, 128], false);
+        let qmm_w = patterned(&[1024, 128], true);
+        let qmm_bias = patterned(&[1024], false);
+        let (qmm_wq, qmm_scales, qmm_biases) = quantize(&qmm_w, 64, 4).unwrap();
+
+        let eager_silu = silu(&activation).unwrap();
+        let eager_gelu = gelu_tanh(&activation).unwrap();
+        let eager_conv2 = conv2d_general(
+            &conv2_x,
+            &conv2_w,
+            Some(&conv2_b),
+            (1, 1),
+            (1, 1),
+            (1, 1),
+            2,
+        )
+        .unwrap();
+        let eager_conv3 = conv3d(&conv3_x, &conv3_w, Some(&conv3_b), (1, 1, 1), (1, 1, 1)).unwrap();
+        let eager_group_norm = group_norm(&gn_x, &gn_w, &gn_b, 8, 1e-5).unwrap();
+        let eager_qmm = quantized_matmul_with_bias(
+            &qmm_x,
+            &qmm_wq,
+            &qmm_scales,
+            &qmm_biases,
+            Some(&qmm_bias),
+            64,
+            4,
+        )
+        .unwrap();
+
+        let scope =
+            diagnostics::begin_request_with_toggles("p3-all-fallback", "test", &[EXACT_EPILOGUES])
+                .unwrap();
+        let fallback_silu = silu(&activation).unwrap();
+        let fallback_gelu = gelu_tanh(&activation).unwrap();
+        let fallback_conv2 = conv2d_general(
+            &conv2_x,
+            &conv2_w,
+            Some(&conv2_b),
+            (1, 1),
+            (1, 1),
+            (1, 1),
+            2,
+        )
+        .unwrap();
+        let fallback_conv3 =
+            conv3d(&conv3_x, &conv3_w, Some(&conv3_b), (1, 1, 1), (1, 1, 1)).unwrap();
+        let fallback_group_norm = group_norm(&gn_x, &gn_w, &gn_b, 8, 1e-5).unwrap();
+        let fallback_qmm = quantized_matmul_with_bias(
+            &qmm_x,
+            &qmm_wq,
+            &qmm_scales,
+            &qmm_biases,
+            Some(&qmm_bias),
+            64,
+            4,
+        )
+        .unwrap();
+        let report = scope.finish();
+
+        for (actual, expected, operation) in [
+            (&fallback_silu, &eager_silu, diagnostics::EXACT_SILU),
+            (&fallback_gelu, &eager_gelu, diagnostics::EXACT_GELU_TANH),
+            (
+                &fallback_conv2,
+                &eager_conv2,
+                diagnostics::EXACT_CONV2D_BIAS,
+            ),
+            (
+                &fallback_conv3,
+                &eager_conv3,
+                diagnostics::EXACT_CONV3D_BIAS,
+            ),
+            (
+                &fallback_group_norm,
+                &eager_group_norm,
+                diagnostics::EXACT_GROUP_NORM_AFFINE,
+            ),
+            (
+                &fallback_qmm,
+                &eager_qmm,
+                diagnostics::EXACT_QUANTIZED_MATMUL_BIAS,
+            ),
+        ] {
+            assert_bit_exact(actual, expected, operation);
+            assert_exact_receipt(
+                &report,
+                operation,
+                ToggleDisposition::Fallback,
+                Some(EXACT_EPILOGUE_FALLBACK_REASON),
+                1,
+            );
+        }
+        assert_exact_toggle(&report, ToggleDisposition::Fallback);
+    }
+
+    #[test]
+    fn p3_q4_q8_bias_is_exact_across_standard_and_nax_eligible_dtypes() {
+        struct Case {
+            context: String,
+            x: Array,
+            wq: Array,
+            scales: Array,
+            biases: Array,
+            output_bias: Array,
+            group_size: i32,
+            bits: i32,
+            eager: Array,
+        }
+
+        const M: i32 = 512;
+        const N: i32 = 1024;
+        const K: i32 = 128;
+        let x_f32 = patterned(&[M, K], false);
+        let w_f32 = patterned(&[N, K], true);
+        let output_bias_f32 = patterned(&[N], false);
+        let mut cases = Vec::new();
+        for dtype in [Dtype::Float32, Dtype::Float16, Dtype::Bfloat16] {
+            let x = x_f32.as_dtype(dtype).unwrap();
+            let w = w_f32.as_dtype(dtype).unwrap();
+            let output_bias = output_bias_f32.as_dtype(dtype).unwrap();
+            for bits in [4, 8] {
+                for group_size in [32, 64, 128] {
+                    let (wq, scales, biases) = quantize(&w, group_size, bits).unwrap();
+                    let eager = quantized_matmul_with_bias(
+                        &x,
+                        &wq,
+                        &scales,
+                        &biases,
+                        Some(&output_bias),
+                        group_size,
+                        bits,
+                    )
+                    .unwrap();
+                    cases.push(Case {
+                        context: format!("standard {dtype:?} Q{bits} gs{group_size}"),
+                        x: x.clone(),
+                        wq,
+                        scales,
+                        biases,
+                        output_bias: output_bias.clone(),
+                        group_size,
+                        bits,
+                        eager,
+                    });
+                }
+            }
+        }
+
+        // One odd, batched, non-contiguous shape per standard/NAX-eligible dtype and bit width.
+        // The dense bias is one-dimensional and therefore broadcasts across both leading axes.
+        const ODD_M: i32 = 257;
+        const ODD_N: i32 = 1001;
+        let odd_x_base = patterned(&[2, K, ODD_M], false);
+        let odd_w_f32 = patterned(&[ODD_N, K], true);
+        let odd_output_bias_f32 = patterned(&[ODD_N], false);
+        for dtype in [Dtype::Float32, Dtype::Float16, Dtype::Bfloat16] {
+            let x = odd_x_base
+                .as_dtype(dtype)
+                .unwrap()
+                .transpose_axes(&[0, 2, 1])
+                .unwrap();
+            let w = odd_w_f32.as_dtype(dtype).unwrap();
+            let output_bias = odd_output_bias_f32.as_dtype(dtype).unwrap();
+            for bits in [4, 8] {
+                for group_size in [32, 64, 128] {
+                    let (wq, scales, biases) = quantize(&w, group_size, bits).unwrap();
+                    let eager = quantized_matmul_with_bias(
+                        &x,
+                        &wq,
+                        &scales,
+                        &biases,
+                        Some(&output_bias),
+                        group_size,
+                        bits,
+                    )
+                    .unwrap();
+                    cases.push(Case {
+                        context: format!("odd {dtype:?} Q{bits} gs{group_size}"),
+                        x: x.clone(),
+                        wq,
+                        scales,
+                        biases,
+                        output_bias: output_bias.clone(),
+                        group_size,
+                        bits,
+                        eager,
+                    });
+                }
+            }
+        }
+
+        // A broadcast leading dimension keeps each matrix's final two dimensions contiguous while
+        // the full view is non-row-contiguous. This must select the batched qmm kernel using M=33,
+        // not collapse the two batches into one M=66 matrix during strict admission.
+        const BATCH_M: i32 = 33;
+        const BATCH_N: i32 = 1001;
+        let batch_x_base = patterned(&[1, BATCH_M, K], false);
+        let batch_w_f32 = patterned(&[BATCH_N, K], true);
+        let batch_output_bias_f32 = patterned(&[BATCH_N], false);
+        for dtype in [Dtype::Float32, Dtype::Float16, Dtype::Bfloat16] {
+            let x_base = batch_x_base.as_dtype(dtype).unwrap();
+            let x = broadcast_to(&x_base, &[2, BATCH_M, K]).unwrap();
+            // Materialize the broadcast before classifying it as an admitted batched case. An
+            // unscheduled view has only provisional contiguous flags, so strict admission must
+            // conservatively check both its aggregate M=66 interpretation and its eventual
+            // batched M=33 layout. The aggregate path legitimately selects split-K for gs32 and
+            // would therefore be a truthful fallback rather than evidence for the batched kernel.
+            mlx_rs::transforms::eval([&x]).unwrap();
+            let w = batch_w_f32.as_dtype(dtype).unwrap();
+            let output_bias = batch_output_bias_f32.as_dtype(dtype).unwrap();
+            for bits in [4, 8] {
+                for group_size in [32, 64, 128] {
+                    let (wq, scales, biases) = quantize(&w, group_size, bits).unwrap();
+                    let eager = quantized_matmul_with_bias(
+                        &x,
+                        &wq,
+                        &scales,
+                        &biases,
+                        Some(&output_bias),
+                        group_size,
+                        bits,
+                    )
+                    .unwrap();
+                    cases.push(Case {
+                        context: format!("batch {dtype:?} Q{bits} gs{group_size}"),
+                        x: x.clone(),
+                        wq,
+                        scales,
+                        biases,
+                        output_bias: output_bias.clone(),
+                        group_size,
+                        bits,
+                        eager,
+                    });
+                }
+            }
+        }
+
+        // Small-M Q4/Q8 shapes select qmv rather than qmm. Cover all supported dtypes so every
+        // standard/NAX-eligible input proves the truthful composed fallback and stable reason.
+        let small_x_f32 = patterned(&[1, K], false);
+        let small_w_f32 = patterned(&[N, K], true);
+        let small_output_bias_f32 = patterned(&[N], false);
+        let mut fallback_cases = Vec::new();
+        for dtype in [Dtype::Float32, Dtype::Float16, Dtype::Bfloat16] {
+            let x = small_x_f32.as_dtype(dtype).unwrap();
+            let w = small_w_f32.as_dtype(dtype).unwrap();
+            let output_bias = small_output_bias_f32.as_dtype(dtype).unwrap();
+            for bits in [4, 8] {
+                let (wq, scales, biases) = quantize(&w, 64, bits).unwrap();
+                let eager = quantized_matmul_with_bias(
+                    &x,
+                    &wq,
+                    &scales,
+                    &biases,
+                    Some(&output_bias),
+                    64,
+                    bits,
+                )
+                .unwrap();
+                fallback_cases.push(Case {
+                    context: format!("small {dtype:?} Q{bits} gs64"),
+                    x: x.clone(),
+                    wq,
+                    scales,
+                    biases,
+                    output_bias: output_bias.clone(),
+                    group_size: 64,
+                    bits,
+                    eager,
+                });
+            }
+        }
+
+        let scope = diagnostics::begin_request_with_toggles(
+            "p3-exact-qmm-bias",
+            "test",
+            &[EXACT_EPILOGUES],
+        )
+        .unwrap();
+        for case in &cases {
+            let exact = quantized_matmul_with_bias(
+                &case.x,
+                &case.wq,
+                &case.scales,
+                &case.biases,
+                Some(&case.output_bias),
+                case.group_size,
+                case.bits,
+            )
+            .unwrap();
+            assert_bit_exact(&exact, &case.eager, &case.context);
+        }
+        for case in &fallback_cases {
+            let fallback = quantized_matmul_with_bias(
+                &case.x,
+                &case.wq,
+                &case.scales,
+                &case.biases,
+                Some(&case.output_bias),
+                case.group_size,
+                case.bits,
+            )
+            .unwrap();
+            assert_bit_exact(&fallback, &case.eager, "quantized_matmul_bias fallback");
+        }
+        let report = scope.finish();
+
+        assert_exact_receipt(
+            &report,
+            diagnostics::EXACT_QUANTIZED_MATMUL_BIAS,
+            ToggleDisposition::Applied,
+            None,
+            cases.len() as u64,
+        );
+        assert_exact_receipt(
+            &report,
+            diagnostics::EXACT_QUANTIZED_MATMUL_BIAS,
+            ToggleDisposition::Fallback,
+            Some(EXACT_EPILOGUE_FALLBACK_REASON),
+            fallback_cases.len() as u64,
+        );
+        assert_exact_toggle(&report, ToggleDisposition::Applied);
     }
 
     #[test]
