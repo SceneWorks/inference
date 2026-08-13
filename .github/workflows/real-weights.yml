@@ -2739,6 +2739,17 @@ jobs:
         run: |
           python3.12 scripts/release/export_model_snapshot_paths.py \
           --model krea-2-turbo-mlx-q4
+      - name: Install pinned model materializer
+        run: |
+          python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
+      - name: Ensure manifest-required Krea license
+        env:
+          PYTHONPATH: ${{ runner.temp }}/huggingface-hub
+        run: >-
+          python3.12 scripts/release/ensure_model_snapshot_file.py
+          --model krea-2-turbo-mlx-q4
+          --file LICENSE.pdf
+          --cache-root "$MLX_GEN_MODELS_ROOT"
       - name: Run fixed-seed native and Wan decoder correctness smoke
         env:
           KREA_ALTERNATE_DECODER_OUTPUT_DIR: ${{ runner.temp }}/krea-alternate-decoder

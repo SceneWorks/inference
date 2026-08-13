@@ -539,12 +539,13 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
             errors.append(f"{prefix}: unexpected argument after requirement lock")
 
     expected_lock_counts = {
+        # 30 since sc-18315 added pinned Krea license materialization;
         # 29 since sc-18249 added the `mlx-sana-drift-ceiling` job
         # (28 since sc-15520 added the `mlx-chroma-memory-ladder` job;
         # 27 since sc-17284 added the `mlx-qwen-image`, `mlx-qwen-image-pid` and
         # `mlx-qwen-image-producers` jobs; 24 since sc-17250 added the JoyCaption and
         # MOSS-TTS-Realtime jobs; 22 before).
-        MACOS_HUB_LOCK: 29,
+        MACOS_HUB_LOCK: 30,
         WINDOWS_HUB_LOCK: 10,
         WINDOWS_MAGE_LOCK: 1,
         MACOS_MAGE_LOCK: 1,
@@ -710,7 +711,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
     def test_real_weight_python_installs_are_binary_hash_locked(self) -> None:
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
         self.assertEqual(real_weight_pip_policy_errors(workflow), [])
-        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 29)
+        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 30)
         self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 10)
         self.assertEqual(workflow.count(WINDOWS_MAGE_LOCK), 1)
         self.assertNotRegex(
@@ -1037,9 +1038,9 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
         self.assertNotRegex(workflow, r"SA3_[A-Z0-9_]+[^\n]*[0-9a-f]{40}")
         # Thirteen SA3/SAME exporters, SC-18309's exact SDXL-VAE projection, and SC-18315's
-        # q4 Krea correctness projection.
+        # q4 Krea correctness projection plus its exact required-file materialization.
         self.assertEqual(workflow.count("export_model_snapshot_paths.py"), 15)
-        self.assertEqual(workflow.count("--model krea-2-turbo-mlx-q4"), 1)
+        self.assertEqual(workflow.count("--model krea-2-turbo-mlx-q4"), 2)
         self.assertEqual(workflow.count("--model sdxl-base-mlx-vae-bf16"), 2)
         expected_models = {
             "same-l-metal": ("same-l",),
@@ -2012,6 +2013,12 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("scripts/ci/run_krea_alternate_decoder_smoke.sh", job)
         self.assertLess(
             job.index("--model krea-2-turbo-mlx-q4"),
+            job.index("scripts/ci/run_krea_alternate_decoder_smoke.sh"),
+        )
+        self.assertIn("scripts/release/ensure_model_snapshot_file.py", job)
+        self.assertIn("--file LICENSE.pdf", job)
+        self.assertLess(
+            job.index("scripts/release/ensure_model_snapshot_file.py"),
             job.index("scripts/ci/run_krea_alternate_decoder_smoke.sh"),
         )
         self.assertIn("actions/upload-artifact@", job)
