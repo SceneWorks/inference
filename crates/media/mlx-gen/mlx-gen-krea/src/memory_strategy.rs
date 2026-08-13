@@ -9,9 +9,7 @@
 //! 9.200 GiB (40.9%) with zero pixel delta. The overlay remains explicitly resident in
 //! `resident_components`; only the base DiT advertises `TransformerComponent::Dit` windowing.
 
-use mlx_gen::asset_facts::{
-    projected_safetensors_bytes, projected_tensor_headers_bytes, ResidentProjection,
-};
+use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
 #[cfg(test)]
 use mlx_gen::gen_core::MemoryGeometry;
 use mlx_gen::gen_core::{
@@ -226,10 +224,12 @@ pub(crate) fn native_memory_strategy_contract_from_spec(
     };
     let selected_text_encoder =
         crate::model::ENCODER_CONTRACT.source_for_load(spec, base_snapshot_dir)?;
-    let conditioning_bytes = projected_tensor_headers_bytes(
-        &selected_text_encoder
-            .materialized_language_tensor_headers(&crate::model::ENCODER_CONTRACT)?,
-        |_| ResidentProjection::Stored,
+    let expected_language_bits =
+        crate::model::native_text_encoder_expected_quant_bits(base_snapshot_dir)?;
+    let conditioning_bytes = crate::model::selected_language_resident_bytes(
+        &selected_text_encoder,
+        expected_language_bits,
+        provider_id,
     )?;
     let decoder_bytes = stored(&base_snapshot_dir.join("vae"), "base VAE")?;
     let transformer_bytes = spec.read_file_unchanged_if_prepared(dit_file, |p| {
@@ -327,22 +327,11 @@ fn asset_facts(
         })
     };
     let selected_text_encoder = crate::model::ENCODER_CONTRACT.source_for_load(spec, root)?;
-    let conditioning_bytes = projected_tensor_headers_bytes(
-        &selected_text_encoder
-            .materialized_language_tensor_headers(&crate::model::ENCODER_CONTRACT)?,
-        |tensor| {
-            if let Some(quant) = spec
-                .quantize
-                .filter(|_| crate::convert::is_text_encoder_quant_target(&tensor.name))
-            {
-                ResidentProjection::GroupQuantized {
-                    bits: quant.bits(),
-                    group_size: crate::quant::GROUP_SIZE as usize,
-                }
-            } else {
-                ResidentProjection::Stored
-            }
-        },
+    let expected_language_bits = crate::model::effective_base_quant_bits(spec, root, provider_id)?;
+    let conditioning_bytes = crate::model::selected_language_resident_bytes(
+        &selected_text_encoder,
+        expected_language_bits,
+        provider_id,
     )?;
     let transformer_bytes = project(&root.join("transformer"), &|name| {
         crate::convert::is_transformer_quant_target(name)
@@ -833,10 +822,12 @@ mod tests {
         let contract = memory_strategy_contract("krea_2_turbo_control", &spec).unwrap();
         // Q8: 128 code bytes + two 2x1 bf16 tables (8 bytes). A uniform Q4 projection would be 72.
         assert_eq!(contract.asset_facts.overlay_bytes, 136);
-        assert_eq!(contract.asset_facts.conditioning_bytes, 2_822_436_864);
+        // The runtime retains exactly 35 language layers (the authored 36th layer is never loaded),
+        // with projection matrices at Q4 and embeddings/norms dense.
+        assert_eq!(contract.asset_facts.conditioning_bytes, 2_765_258_240);
         assert_eq!(contract.asset_facts.transformer_bytes, 256);
         assert_eq!(contract.asset_facts.decoder_bytes, 256);
-        assert_eq!(contract.asset_facts.base_bytes, 2_822_437_376);
+        assert_eq!(contract.asset_facts.base_bytes, 2_765_258_752);
         assert_eq!(contract.auxiliary_resident_bytes(), 136);
         assert!(contract.conformance_errors().is_empty());
     }

@@ -189,9 +189,10 @@ mod explicit_registry_tests {
             std::fs::create_dir_all(&dir).unwrap();
             write_minimal_safetensors(&dir.join("model.safetensors"));
         }
-        gen_core_testkit::write_encoder_contract_fixture(
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
             &root.join("text_encoder"),
             crate::model::ENCODER_CONTRACT,
+            crate::model::VISION_ENCODER_CONTRACT,
         )
         .expect("validation-complete text encoder fixture");
         root
@@ -259,13 +260,40 @@ mod explicit_registry_tests {
                 .footprint(id, &base_spec)
                 .unwrap()
                 .unwrap_or_else(|| panic!("{id} must expose a footprint"));
+            let selected = crate::model::ENCODER_CONTRACT
+                .source_for_load(&base_spec, &base)
+                .unwrap();
+            let language = crate::model::selected_language_resident_bytes(
+                &selected,
+                crate::model::native_text_encoder_expected_quant_bits(&base).unwrap(),
+                id,
+            )
+            .unwrap();
+            let vision = if matches!(id, "krea_2_edit" | "krea_2_turbo_edit") {
+                let builtin = crate::model::ENCODER_CONTRACT
+                    .validate_source_against_base(
+                        &mlx_gen::WeightsSource::Dir(base.join("text_encoder")),
+                        &base,
+                    )
+                    .unwrap();
+                let headers = builtin
+                    .materialized_vision_tensor_headers(
+                        &crate::model::VISION_ENCODER_CONTRACT,
+                        &crate::model::ENCODER_CONTRACT,
+                    )
+                    .unwrap();
+                mlx_gen::asset_facts::projected_tensor_headers_bytes(&headers, |_| {
+                    mlx_gen::asset_facts::ResidentProjection::Stored
+                })
+                .unwrap()
+            } else {
+                0
+            };
+            assert_eq!(footprint.text_encoder, language + vision, "{id}");
+            assert_eq!(footprint.dit, mlx_gen::safetensors_path_bytes(&dit), "{id}");
             assert_eq!(
-                footprint,
-                mlx_gen::PerComponentBytes {
-                    text_encoder: mlx_gen::safetensors_path_bytes(base.join("text_encoder")),
-                    dit: mlx_gen::safetensors_path_bytes(&dit),
-                    vae: mlx_gen::safetensors_path_bytes(base.join("vae")),
-                },
+                footprint.vae,
+                mlx_gen::safetensors_path_bytes(base.join("vae")),
                 "{id}"
             );
             let contract = registry

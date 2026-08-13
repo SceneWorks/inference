@@ -111,9 +111,21 @@ pub fn write_multimodal_encoder_contract_fixture(
     language: EncoderContract,
     vision: VisionEncoderContract,
 ) -> std::io::Result<()> {
+    write_multimodal_encoder_contract_fixture_with_quant(root, language, vision, None)
+}
+
+/// Packed counterpart to [`write_multimodal_encoder_contract_fixture`]. The language matrices use
+/// the requested Q4/Q8 affine triples while the checkpoint-coupled vision surface remains dense,
+/// matching multimodal providers whose runtime quantizes only the substitutable language tower.
+pub fn write_multimodal_encoder_contract_fixture_with_quant(
+    root: &std::path::Path,
+    language: EncoderContract,
+    vision: VisionEncoderContract,
+    quant_bits: Option<i32>,
+) -> std::io::Result<()> {
     use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 
-    write_encoder_contract_fixture(root, language)?;
+    write_encoder_contract_fixture_with_quant(root, language, quant_bits)?;
     vision
         .validate_definition(&language)
         .map_err(|error| std::io::Error::other(error.to_string()))?;

@@ -354,9 +354,7 @@ fn build_native_krea_control_from_spec(spec: &LoadSpec) -> Result<KreaTurboContr
     })?;
     let text_base = base.clone();
     let text_encoder_source = crate::model::ENCODER_CONTRACT.source_for_load(spec, &base)?;
-    let builtin_text_encoder = WeightsSource::Dir(base.join("text_encoder"));
-    let expected_text_encoder_bits =
-        mlx_gen::gen_core::text_encoder_packed_quant_bits(&builtin_text_encoder)?;
+    let expected_text_encoder_bits = crate::model::native_text_encoder_expected_quant_bits(&base)?;
     let text_encoder_load_time_quant_bits = text_encoder_source
         .load_time_quant_bits(expected_text_encoder_bits, KREA_2_TURBO_CONTROL_ID)?;
     let heavy_base = base;

@@ -607,9 +607,7 @@ fn build_native_krea_from_spec(spec: &LoadSpec, descriptor: ModelDescriptor) -> 
     })?;
     let text_base = base.to_path_buf();
     let text_encoder_source = ENCODER_CONTRACT.source_for_load(spec, base)?;
-    let builtin_text_encoder = WeightsSource::Dir(base.join("text_encoder"));
-    let expected_text_encoder_bits =
-        mlx_gen::gen_core::text_encoder_packed_quant_bits(&builtin_text_encoder)?;
+    let expected_text_encoder_bits = native_text_encoder_expected_quant_bits(base)?;
     let text_encoder_load_time_quant_bits =
         text_encoder_source.load_time_quant_bits(expected_text_encoder_bits, descriptor.id)?;
     let heavy_base = base.to_path_buf();
@@ -894,6 +892,43 @@ pub(crate) fn effective_base_quant_bits(
 pub(crate) fn effective_base_quant_tier(spec: &LoadSpec, id: &str) -> Result<Option<Quant>> {
     let root = resolve_root(spec, id)?;
     Ok(resolve_load_plan(spec, root, id)?.effective_quant)
+}
+
+/// Project the exact language tensors retained from a validated encoder source using the same
+/// effective numeric policy as [`load_krea_text_resolved`]. A dense alternate inherits the base
+/// transformer's Q4/Q8 tier, a matching packed alternate keeps its stored affine triples, and a
+/// packed mismatch fails before memory admission can authorize a load the runtime rejects.
+pub(crate) fn selected_language_resident_bytes(
+    source: &mlx_gen::gen_core::ValidatedEncoderSource,
+    expected_bits: Option<i32>,
+    provider_id: &str,
+) -> mlx_gen::gen_core::Result<u64> {
+    let load_time_quant_bits = source.load_time_quant_bits(expected_bits, provider_id)?;
+    let headers = source.materialized_language_tensor_headers(&ENCODER_CONTRACT)?;
+    mlx_gen::asset_facts::projected_tensor_headers_bytes(&headers, |tensor| {
+        if let Some(bits) = load_time_quant_bits
+            .filter(|_| crate::convert::is_text_encoder_quant_target(&tensor.name))
+        {
+            mlx_gen::asset_facts::ResidentProjection::GroupQuantized {
+                bits,
+                group_size: crate::quant::GROUP_SIZE as usize,
+            }
+        } else {
+            mlx_gen::asset_facts::ResidentProjection::Stored
+        }
+    })
+}
+
+/// The text-encoder policy retained by an imported native-DiT composition. Native Krea files are
+/// materialized dense independently of the borrowed snapshot, while the runtime deliberately keeps
+/// the borrowed snapshot's language tier. Keep that File-specific policy in one seam shared by load
+/// and admission rather than attempting to infer it from the imported DiT's storage descriptor.
+pub(crate) fn native_text_encoder_expected_quant_bits(
+    base_snapshot_dir: &Path,
+) -> mlx_gen::gen_core::Result<Option<i32>> {
+    mlx_gen::gen_core::text_encoder_packed_quant_bits(&WeightsSource::Dir(
+        base_snapshot_dir.join("text_encoder"),
+    ))
 }
 
 /// Load the Krea text phase (tokenizer + Qwen3-VL-4B condition encoder + vision tower) — the component
@@ -1639,18 +1674,38 @@ pub(crate) fn component_footprint_for(
     spec: &mlx_gen::LoadSpec,
 ) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
     let base = mlx_gen::require_base_snapshot(spec, "krea_2 imported provider")?;
+    let expected_language_bits = match &spec.weights {
+        WeightsSource::Dir(root) => resolve_load_plan(spec, root, provider_id)?
+            .effective_quant
+            .map(Quant::bits),
+        WeightsSource::File(_) => {
+            if provider_id == crate::model_control::KREA_2_TURBO_CONTROL_ID {
+                crate::model_control::validate_control_spec(spec)
+                    .map_err(|error| mlx_gen::gen_core::Error::Msg(error.to_string()))?;
+            } else {
+                validate_native_krea_spec(spec, provider_id)
+                    .map_err(|error| mlx_gen::gen_core::Error::Msg(error.to_string()))?;
+            }
+            native_text_encoder_expected_quant_bits(base)?
+        }
+    };
     let selected = ENCODER_CONTRACT.source_for_load(spec, base)?;
-    let mut conditioning = selected.materialized_language_tensor_headers(&ENCODER_CONTRACT)?;
+    let language_bytes =
+        selected_language_resident_bytes(&selected, expected_language_bits, provider_id)?;
+    let mut vision_bytes = 0;
     if provider_id == KREA_2_EDIT_ID || provider_id == KREA_2_TURBO_EDIT_ID {
         let builtin = ENCODER_CONTRACT
             .validate_source_against_base(&WeightsSource::Dir(base.join("text_encoder")), base)?;
-        conditioning.extend(
-            builtin
-                .materialized_vision_tensor_headers(&VISION_ENCODER_CONTRACT, &ENCODER_CONTRACT)?,
-        );
+        let vision = builtin
+            .materialized_vision_tensor_headers(&VISION_ENCODER_CONTRACT, &ENCODER_CONTRACT)?;
+        vision_bytes = mlx_gen::asset_facts::projected_tensor_headers_bytes(&vision, |_| {
+            mlx_gen::asset_facts::ResidentProjection::Stored
+        })?;
     }
-    let text_encoder = mlx_gen::asset_facts::projected_tensor_headers_bytes(&conditioning, |_| {
-        mlx_gen::asset_facts::ResidentProjection::Stored
+    let text_encoder = language_bytes.checked_add(vision_bytes).ok_or_else(|| {
+        mlx_gen::gen_core::Error::Msg(format!(
+            "{provider_id}: selected language plus builtin vision resident byte overflow"
+        ))
     })?;
     match &spec.weights {
         WeightsSource::Dir(_) => {
@@ -1677,10 +1732,22 @@ pub(crate) fn component_footprint(
     component_footprint_for(KREA_2_TURBO_ID, spec)
 }
 
+pub(crate) fn raw_component_footprint(
+    spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    component_footprint_for(KREA_2_RAW_ID, spec)
+}
+
 pub(crate) fn edit_component_footprint(
     spec: &mlx_gen::LoadSpec,
 ) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
     component_footprint_for(KREA_2_EDIT_ID, spec)
+}
+
+pub(crate) fn turbo_edit_component_footprint(
+    spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    component_footprint_for(KREA_2_TURBO_EDIT_ID, spec)
 }
 
 pub(crate) fn control_component_footprint(
@@ -1738,7 +1805,7 @@ memory_registration!(
 );
 mlx_gen::register_generators! {
     pub(crate) const RAW_REGISTRATION = raw_descriptor => load_raw;
-    footprint = component_footprint
+    footprint = raw_component_footprint
 }
 mlx_gen::register_generators! {
     pub(crate) const EDIT_REGISTRATION = edit_descriptor => load_edit;
@@ -1746,7 +1813,7 @@ mlx_gen::register_generators! {
 }
 mlx_gen::register_generators! {
     pub(crate) const TURBO_EDIT_REGISTRATION = turbo_edit_descriptor => load_turbo_edit;
-    footprint = edit_component_footprint
+    footprint = turbo_edit_component_footprint
 }
 
 #[cfg(test)]
@@ -1841,6 +1908,277 @@ mod tests {
         );
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum FootprintEncoderSelection {
+        Builtin,
+        ComponentDir,
+        ComponentFile,
+        CompleteSnapshot,
+    }
+
+    fn selected_footprint_spec(
+        base_spec: &LoadSpec,
+        fixture: &Path,
+        selection: FootprintEncoderSelection,
+        packed_bits: Option<i32>,
+    ) -> LoadSpec {
+        let mut spec = base_spec.clone();
+        let selected = fixture.join(format!("selected-{selection:?}"));
+        spec.text_encoder = match selection {
+            FootprintEncoderSelection::Builtin => None,
+            FootprintEncoderSelection::ComponentDir => {
+                gen_core_testkit::write_encoder_contract_fixture_with_quant(
+                    &selected,
+                    ENCODER_CONTRACT,
+                    packed_bits,
+                )
+                .unwrap();
+                Some(WeightsSource::Dir(selected))
+            }
+            FootprintEncoderSelection::ComponentFile => {
+                gen_core_testkit::write_encoder_contract_fixture_with_quant(
+                    &selected,
+                    ENCODER_CONTRACT,
+                    packed_bits,
+                )
+                .unwrap();
+                Some(WeightsSource::File(selected.join("model.safetensors")))
+            }
+            FootprintEncoderSelection::CompleteSnapshot => {
+                gen_core_testkit::write_encoder_contract_fixture_with_quant(
+                    &selected.join("text_encoder"),
+                    ENCODER_CONTRACT,
+                    packed_bits,
+                )
+                .unwrap();
+                Some(WeightsSource::Dir(selected))
+            }
+        };
+        spec
+    }
+
+    fn expected_language_bytes(spec: &LoadSpec, bits: Option<i32>, provider_id: &str) -> u64 {
+        let base = mlx_gen::require_base_snapshot(spec, provider_id).unwrap();
+        let selected = ENCODER_CONTRACT.source_for_load(spec, base).unwrap();
+        let action = selected.load_time_quant_bits(bits, provider_id).unwrap();
+        let headers = selected
+            .materialized_language_tensor_headers(&ENCODER_CONTRACT)
+            .unwrap();
+        mlx_gen::asset_facts::projected_tensor_headers_bytes(&headers, |tensor| {
+            if let Some(bits) =
+                action.filter(|_| crate::convert::is_text_encoder_quant_target(&tensor.name))
+            {
+                mlx_gen::asset_facts::ResidentProjection::GroupQuantized {
+                    bits,
+                    group_size: crate::quant::GROUP_SIZE as usize,
+                }
+            } else {
+                mlx_gen::asset_facts::ResidentProjection::Stored
+            }
+        })
+        .unwrap()
+    }
+
+    fn expected_builtin_vision_bytes(root: &Path) -> u64 {
+        let builtin = ENCODER_CONTRACT
+            .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)
+            .unwrap();
+        let headers = builtin
+            .materialized_vision_tensor_headers(&VISION_ENCODER_CONTRACT, &ENCODER_CONTRACT)
+            .unwrap();
+        mlx_gen::asset_facts::projected_tensor_headers_bytes(&headers, |_| {
+            mlx_gen::asset_facts::ResidentProjection::Stored
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn all_registered_dir_routes_price_selected_language_at_the_effective_base_tier() {
+        let registry = crate::provider_registry().unwrap();
+        let routes = [
+            KREA_2_TURBO_ID,
+            KREA_2_RAW_ID,
+            KREA_2_EDIT_ID,
+            KREA_2_TURBO_EDIT_ID,
+            crate::model_control::KREA_2_TURBO_CONTROL_ID,
+        ];
+        for (quant, bits) in [(Quant::Q4, 4), (Quant::Q8, 8)] {
+            for requested in [false, true] {
+                for selection in [
+                    FootprintEncoderSelection::Builtin,
+                    FootprintEncoderSelection::ComponentDir,
+                    FootprintEncoderSelection::ComponentFile,
+                    FootprintEncoderSelection::CompleteSnapshot,
+                ] {
+                    let tmp = tempfile::tempdir().unwrap();
+                    let root = footprint_snapshot(&tmp);
+                    std::fs::write(
+                        root.join("transformer/config.json"),
+                        if requested {
+                            "{}".to_owned()
+                        } else {
+                            format!(r#"{{"quantization":{{"bits":{bits},"group_size":64}}}}"#)
+                        },
+                    )
+                    .unwrap();
+                    let control = tmp.path().join("control");
+                    std::fs::create_dir_all(&control).unwrap();
+                    write_minimal_safetensors(&control.join("model.safetensors"));
+                    let mut base_spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+                    if requested {
+                        base_spec.quantize = Some(quant);
+                    }
+                    let spec = selected_footprint_spec(
+                        &base_spec,
+                        &tmp.path().join(format!("{bits}-{requested}")),
+                        selection,
+                        None,
+                    );
+                    let language = expected_language_bytes(&spec, Some(bits), KREA_2_TURBO_ID);
+                    let vision = expected_builtin_vision_bytes(&root);
+
+                    for id in routes {
+                        let route_spec = if id == crate::model_control::KREA_2_TURBO_CONTROL_ID {
+                            spec.clone()
+                                .with_control(WeightsSource::Dir(control.clone()))
+                        } else {
+                            spec.clone()
+                        };
+                        let footprint = registry
+                            .footprint(id, &route_spec)
+                            .unwrap_or_else(|error| {
+                                panic!("Q{bits} requested={requested} {selection:?} {id}: {error}")
+                            })
+                            .expect("registered Krea route exposes a footprint");
+                        let expected_conditioning =
+                            if matches!(id, KREA_2_EDIT_ID | KREA_2_TURBO_EDIT_ID) {
+                                language + vision
+                            } else {
+                                language
+                            };
+                        assert_eq!(
+                            footprint.text_encoder, expected_conditioning,
+                            "Q{bits} requested={requested} {selection:?} {id}"
+                        );
+                        let contract = registry
+                            .memory_strategy_contract(id, &route_spec)
+                            .unwrap_or_else(|error| {
+                                panic!("Q{bits} requested={requested} {selection:?} {id}: {error}")
+                            })
+                            .expect("registered Krea route exposes a memory contract");
+                        assert_eq!(
+                            contract.asset_facts.conditioning_bytes,
+                            expected_conditioning
+                        );
+                        assert!(contract.asset_facts.transformer_bytes > 0);
+                        assert!(contract.asset_facts.transformer_bytes <= footprint.dit);
+                        assert!(contract.asset_facts.decoder_bytes > 0);
+                        assert!(contract.asset_facts.decoder_bytes <= footprint.vae);
+                        assert_eq!(
+                            contract.asset_facts.base_bytes,
+                            contract.asset_facts.conditioning_bytes
+                                + contract.asset_facts.transformer_bytes
+                                + contract.asset_facts.decoder_bytes
+                        );
+                        if id == crate::model_control::KREA_2_TURBO_CONTROL_ID {
+                            assert!(contract.asset_facts.overlay_bytes > 0);
+                        } else {
+                            assert_eq!(contract.asset_facts.overlay_bytes, 0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn all_registered_dir_routes_preserve_matching_packs_and_reject_mismatches() {
+        let registry = crate::provider_registry().unwrap();
+        let routes = [
+            KREA_2_TURBO_ID,
+            KREA_2_RAW_ID,
+            KREA_2_EDIT_ID,
+            KREA_2_TURBO_EDIT_ID,
+            crate::model_control::KREA_2_TURBO_CONTROL_ID,
+        ];
+        for bits in [4, 8] {
+            for selection in [
+                FootprintEncoderSelection::ComponentDir,
+                FootprintEncoderSelection::ComponentFile,
+                FootprintEncoderSelection::CompleteSnapshot,
+            ] {
+                let tmp = tempfile::tempdir().unwrap();
+                let root = footprint_snapshot(&tmp);
+                std::fs::write(
+                    root.join("transformer/config.json"),
+                    format!(r#"{{"quantization":{{"bits":{bits},"group_size":64}}}}"#),
+                )
+                .unwrap();
+                let control = tmp.path().join("control");
+                std::fs::create_dir_all(&control).unwrap();
+                write_minimal_safetensors(&control.join("model.safetensors"));
+                let base_spec = LoadSpec::new(WeightsSource::Dir(root));
+                let matching = selected_footprint_spec(
+                    &base_spec,
+                    &tmp.path().join("matching"),
+                    selection,
+                    Some(bits),
+                );
+                for id in routes {
+                    let route_spec = if id == crate::model_control::KREA_2_TURBO_CONTROL_ID {
+                        matching
+                            .clone()
+                            .with_control(WeightsSource::Dir(control.clone()))
+                    } else {
+                        matching.clone()
+                    };
+                    assert!(
+                        registry.footprint(id, &route_spec).unwrap().is_some(),
+                        "Q{bits} {selection:?} {id}"
+                    );
+                    assert!(registry
+                        .memory_strategy_contract(id, &route_spec)
+                        .unwrap()
+                        .is_some());
+                }
+
+                let mismatching = selected_footprint_spec(
+                    &base_spec,
+                    &tmp.path().join("mismatching"),
+                    selection,
+                    Some(if bits == 4 { 8 } else { 4 }),
+                );
+                for id in routes {
+                    let route_spec = if id == crate::model_control::KREA_2_TURBO_CONTROL_ID {
+                        mismatching
+                            .clone()
+                            .with_control(WeightsSource::Dir(control.clone()))
+                    } else {
+                        mismatching.clone()
+                    };
+                    let footprint_error =
+                        registry.footprint(id, &route_spec).unwrap_err().to_string();
+                    assert!(
+                        footprint_error.contains("pre-quantized")
+                            && footprint_error.contains("model policy"),
+                        "Q{bits} {selection:?} {id}: {footprint_error}"
+                    );
+                    assert!(footprint_error.contains(id), "{id}: {footprint_error}");
+                    let contract_error = registry
+                        .memory_strategy_contract(id, &route_spec)
+                        .unwrap_err()
+                        .to_string();
+                    assert!(
+                        contract_error.contains("pre-quantized")
+                            && contract_error.contains("model policy"),
+                        "Q{bits} {selection:?} {id}: {contract_error}"
+                    );
+                    assert!(contract_error.contains(id), "{id}: {contract_error}");
+                }
+            }
+        }
+    }
+
     fn complete_native_file_spec(tmp: &tempfile::TempDir) -> LoadSpec {
         let base = tmp.path().join("base");
         for component in ["text_encoder", "vae"] {
@@ -1848,9 +2186,10 @@ mod tests {
             std::fs::create_dir_all(&dir).expect("create base component");
             write_minimal_safetensors(&dir.join("model.safetensors"));
         }
-        gen_core_testkit::write_encoder_contract_fixture(
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
             &base.join("text_encoder"),
             ENCODER_CONTRACT,
+            VISION_ENCODER_CONTRACT,
         )
         .expect("validation-complete text encoder fixture");
         let dit = tmp.path().join("imported-krea.safetensors");
@@ -1860,14 +2199,164 @@ mod tests {
             .with_offload_policy(mlx_gen::OffloadPolicy::Sequential)
     }
 
+    #[test]
+    fn native_file_base_and_pose_routes_follow_the_borrowed_encoder_tier() {
+        let registry = crate::provider_registry().unwrap();
+        for bits in [4, 8] {
+            for selection in [
+                FootprintEncoderSelection::ComponentDir,
+                FootprintEncoderSelection::ComponentFile,
+                FootprintEncoderSelection::CompleteSnapshot,
+            ] {
+                let tmp = tempfile::tempdir().unwrap();
+                let base_spec = complete_native_file_spec(&tmp);
+                let base = mlx_gen::require_base_snapshot(&base_spec, KREA_2_TURBO_ID).unwrap();
+                gen_core_testkit::write_multimodal_encoder_contract_fixture_with_quant(
+                    &base.join("text_encoder"),
+                    ENCODER_CONTRACT,
+                    VISION_ENCODER_CONTRACT,
+                    Some(bits),
+                )
+                .unwrap();
+                let control = tmp.path().join("native-pose.safetensors");
+                write_minimal_safetensors(&control);
+                let dense =
+                    selected_footprint_spec(&base_spec, &tmp.path().join("dense"), selection, None);
+                let expected = expected_language_bytes(&dense, Some(bits), KREA_2_TURBO_ID);
+                for id in [
+                    KREA_2_TURBO_ID,
+                    KREA_2_RAW_ID,
+                    KREA_2_EDIT_ID,
+                    KREA_2_TURBO_EDIT_ID,
+                    crate::model_control::KREA_2_TURBO_CONTROL_ID,
+                ] {
+                    let route_spec = if id == crate::model_control::KREA_2_TURBO_CONTROL_ID {
+                        dense
+                            .clone()
+                            .with_control(WeightsSource::File(control.clone()))
+                    } else {
+                        dense.clone()
+                    };
+                    let footprint = registry.footprint(id, &route_spec).unwrap().unwrap();
+                    let expected_conditioning =
+                        if matches!(id, KREA_2_EDIT_ID | KREA_2_TURBO_EDIT_ID) {
+                            expected + expected_builtin_vision_bytes(base)
+                        } else {
+                            expected
+                        };
+                    assert_eq!(
+                        footprint.text_encoder, expected_conditioning,
+                        "Q{bits} {selection:?} {id}"
+                    );
+                    let contract = registry
+                        .memory_strategy_contract(id, &route_spec)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        contract.asset_facts.conditioning_bytes,
+                        expected_conditioning
+                    );
+                    assert!(contract.asset_facts.transformer_bytes > 0);
+                    assert!(contract.asset_facts.decoder_bytes > 0);
+                    assert_eq!(
+                        contract.asset_facts.base_bytes,
+                        contract.asset_facts.conditioning_bytes
+                            + contract.asset_facts.transformer_bytes
+                            + contract.asset_facts.decoder_bytes
+                    );
+                    assert_eq!(
+                        contract.asset_facts.overlay_bytes > 0,
+                        id == crate::model_control::KREA_2_TURBO_CONTROL_ID
+                    );
+                }
+
+                let matching = selected_footprint_spec(
+                    &base_spec,
+                    &tmp.path().join("matching"),
+                    selection,
+                    Some(bits),
+                );
+                for id in [
+                    KREA_2_TURBO_ID,
+                    KREA_2_RAW_ID,
+                    KREA_2_EDIT_ID,
+                    KREA_2_TURBO_EDIT_ID,
+                    crate::model_control::KREA_2_TURBO_CONTROL_ID,
+                ] {
+                    let route_spec = if id == crate::model_control::KREA_2_TURBO_CONTROL_ID {
+                        matching
+                            .clone()
+                            .with_control(WeightsSource::File(control.clone()))
+                    } else {
+                        matching.clone()
+                    };
+                    let expected_conditioning =
+                        if matches!(id, KREA_2_EDIT_ID | KREA_2_TURBO_EDIT_ID) {
+                            expected + expected_builtin_vision_bytes(base)
+                        } else {
+                            expected
+                        };
+                    assert_eq!(
+                        registry
+                            .footprint(id, &route_spec)
+                            .unwrap()
+                            .unwrap()
+                            .text_encoder,
+                        expected_conditioning,
+                        "Q{bits} matching {selection:?} {id}"
+                    );
+                    assert_eq!(
+                        registry
+                            .memory_strategy_contract(id, &route_spec)
+                            .unwrap()
+                            .unwrap()
+                            .asset_facts
+                            .conditioning_bytes,
+                        expected_conditioning
+                    );
+                }
+                let mismatch = selected_footprint_spec(
+                    &base_spec,
+                    &tmp.path().join("mismatch"),
+                    selection,
+                    Some(if bits == 4 { 8 } else { 4 }),
+                );
+                for id in [
+                    KREA_2_TURBO_ID,
+                    KREA_2_RAW_ID,
+                    KREA_2_EDIT_ID,
+                    KREA_2_TURBO_EDIT_ID,
+                    crate::model_control::KREA_2_TURBO_CONTROL_ID,
+                ] {
+                    let route_spec = if id == crate::model_control::KREA_2_TURBO_CONTROL_ID {
+                        mismatch
+                            .clone()
+                            .with_control(WeightsSource::File(control.clone()))
+                    } else {
+                        mismatch.clone()
+                    };
+                    let footprint_error =
+                        registry.footprint(id, &route_spec).unwrap_err().to_string();
+                    assert!(footprint_error.contains(id), "{id}: {footprint_error}");
+                    let contract_error = registry
+                        .memory_strategy_contract(id, &route_spec)
+                        .unwrap_err()
+                        .to_string();
+                    assert!(contract_error.contains(id), "{id}: {contract_error}");
+                }
+            }
+        }
+    }
+
     fn incomplete_native_file_fixture(tmp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
         let base = tmp.path().join("incomplete-base");
         std::fs::create_dir_all(base.join("transformer")).expect("create transformer config dir");
         std::fs::write(base.join("transformer/config.json"), "{}")
             .expect("write parseable transformer config");
-        gen_core_testkit::write_encoder_contract_fixture(
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
             &base.join("text_encoder"),
             ENCODER_CONTRACT,
+            VISION_ENCODER_CONTRACT,
         )
         .expect("validation-complete text encoder fixture");
         let dit = tmp.path().join("native-dit.safetensors");

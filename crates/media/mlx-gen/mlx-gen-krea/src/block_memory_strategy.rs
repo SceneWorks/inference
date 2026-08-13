@@ -118,12 +118,13 @@ pub(crate) fn memory_strategy_contract_with_plan(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> CoreResult<(MemoryProviderContract, crate::model::ResolvedLoadPlan)> {
-    let _ = crate::model::component_footprint(spec)?;
+    let _ = crate::model::component_footprint_for(provider_id, spec)?;
     let WeightsSource::Dir(root) = &spec.weights else {
         return Err(CoreError::Msg(
             "krea memory facts require a snapshot directory".to_owned(),
         ));
     };
+    let plan = resolved_load_plan(provider_id, spec)?;
     let project = |path: &std::path::Path, select: &dyn Fn(&str) -> bool| -> CoreResult<u64> {
         projected_safetensors_bytes(path, |tensor| {
             if let Some(quant) = spec.quantize.filter(|_| select(&tensor.name)) {
@@ -137,32 +138,30 @@ pub(crate) fn memory_strategy_contract_with_plan(
         })
     };
     let selected_text_encoder = crate::model::ENCODER_CONTRACT.source_for_load(spec, root)?;
-    let mut conditioning_headers = selected_text_encoder
-        .materialized_language_tensor_headers(&crate::model::ENCODER_CONTRACT)?;
+    let language_bytes = crate::model::selected_language_resident_bytes(
+        &selected_text_encoder,
+        plan.effective_quant.map(mlx_gen::Quant::bits),
+        provider_id,
+    )?;
+    let mut vision_bytes = 0;
     if matches!(
         provider_id,
         crate::model::KREA_2_EDIT_ID | crate::model::KREA_2_TURBO_EDIT_ID
     ) {
         let vision = crate::model::ENCODER_CONTRACT
             .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)?;
-        conditioning_headers.extend(vision.materialized_vision_tensor_headers(
+        let vision_headers = vision.materialized_vision_tensor_headers(
             &crate::model::VISION_ENCODER_CONTRACT,
             &crate::model::ENCODER_CONTRACT,
-        )?);
+        )?;
+        vision_bytes =
+            projected_tensor_headers_bytes(&vision_headers, |_| ResidentProjection::Stored)?;
     }
     let selected_text_encoder_bytes =
-        projected_tensor_headers_bytes(&conditioning_headers, |tensor| {
-            if let Some(quant) = spec
-                .quantize
-                .filter(|_| crate::convert::is_text_encoder_quant_target(&tensor.name))
-            {
-                ResidentProjection::GroupQuantized {
-                    bits: quant.bits(),
-                    group_size: crate::quant::GROUP_SIZE as usize,
-                }
-            } else {
-                ResidentProjection::Stored
-            }
+        language_bytes.checked_add(vision_bytes).ok_or_else(|| {
+            CoreError::Msg(format!(
+                "{provider_id}: selected language plus builtin vision resident byte overflow"
+            ))
         })?;
     let components = mlx_gen::PerComponentBytes {
         text_encoder: selected_text_encoder_bytes,
@@ -171,7 +170,6 @@ pub(crate) fn memory_strategy_contract_with_plan(
         })?,
         vae: project(&root.join("vae"), &|_| false)?,
     };
-    let plan = resolved_load_plan(provider_id, spec)?;
     Ok((
         memory_strategy_contract_with_components(
             provider_id,
@@ -343,11 +341,34 @@ pub(crate) fn native_memory_strategy_contract_from_spec(
     };
     let selected_text_encoder =
         crate::model::ENCODER_CONTRACT.source_for_load(spec, base_snapshot_dir)?;
-    let selected_text_encoder_bytes = projected_tensor_headers_bytes(
-        &selected_text_encoder
-            .materialized_language_tensor_headers(&crate::model::ENCODER_CONTRACT)?,
-        |_| ResidentProjection::Stored,
+    let expected_language_bits =
+        crate::model::native_text_encoder_expected_quant_bits(base_snapshot_dir)?;
+    let language_bytes = crate::model::selected_language_resident_bytes(
+        &selected_text_encoder,
+        expected_language_bits,
+        provider_id,
     )?;
+    let mut vision_bytes = 0;
+    if matches!(
+        provider_id,
+        crate::model::KREA_2_EDIT_ID | crate::model::KREA_2_TURBO_EDIT_ID
+    ) {
+        let builtin = crate::model::ENCODER_CONTRACT.validate_source_against_base(
+            &WeightsSource::Dir(base_snapshot_dir.join("text_encoder")),
+            base_snapshot_dir,
+        )?;
+        let headers = builtin.materialized_vision_tensor_headers(
+            &crate::model::VISION_ENCODER_CONTRACT,
+            &crate::model::ENCODER_CONTRACT,
+        )?;
+        vision_bytes = projected_tensor_headers_bytes(&headers, |_| ResidentProjection::Stored)?;
+    }
+    let selected_text_encoder_bytes =
+        language_bytes.checked_add(vision_bytes).ok_or_else(|| {
+            CoreError::Msg(format!(
+                "{provider_id}: selected language plus builtin vision resident byte overflow"
+            ))
+        })?;
     let components = mlx_gen::PerComponentBytes {
         text_encoder: selected_text_encoder_bytes,
         dit: spec.read_file_unchanged_if_prepared(dit_file, |p| {
