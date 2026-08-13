@@ -2524,13 +2524,21 @@ mod tests {
     }
 
     fn rewrite_tensor_shape(root: &Path, tensor: &str, first_dimension: usize) {
-        use std::io::Write as _;
+        use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 
         let path = root.join("text_encoder/model.safetensors");
-        let bytes = std::fs::read(&path).unwrap();
-        let header_len = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut encoded_len = [0_u8; 8];
+        file.read_exact(&mut encoded_len).unwrap();
+        let header_len = u64::from_le_bytes(encoded_len) as usize;
+        let mut encoded = vec![0_u8; header_len];
+        file.read_exact(&mut encoded).unwrap();
         let mut header: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_slice(&bytes[8..8 + header_len]).unwrap();
+            serde_json::from_slice(&encoded).unwrap();
         let entry = header.get_mut(tensor).unwrap();
         let old_first = entry["shape"][0].as_u64().unwrap();
         let row_elements = entry["shape"].as_array().unwrap()[1..]
@@ -2547,11 +2555,8 @@ mod tests {
             .max()
             .unwrap();
         let encoded = serde_json::to_vec(&header).unwrap();
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(&path)
-            .unwrap();
+        file.set_len(0).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
         file.write_all(&(encoded.len() as u64).to_le_bytes())
             .unwrap();
         file.write_all(&encoded).unwrap();
