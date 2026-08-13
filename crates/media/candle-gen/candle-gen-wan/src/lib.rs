@@ -681,6 +681,7 @@ impl Generator for WanGenerator {
 /// (sc-10025) — pre-quantized snapshots the packed-detect loaders read directly (no on-the-fly quant).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
         denoiser_output_latent_space: Some(&candle_gen::gen_core::WAN_Z48_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],

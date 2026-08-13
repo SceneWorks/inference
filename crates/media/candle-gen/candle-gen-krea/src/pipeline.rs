@@ -143,7 +143,9 @@ pub(crate) const MAX_EDIT_TOKENS: usize = 8192;
 pub(crate) struct KreaText {
     tok: crate::tokenizer::KreaTokenizer,
     te: KreaTextEncoder,
-    root: PathBuf,
+    /// Grounded edit keeps the checkpoint-coupled visual tower on the bundled multimodal source;
+    /// a language-only replacement never has to duplicate unrelated `visual.*` tensors.
+    vision_encoder_source: gen_core::ValidatedEncoderSource,
     device: Device,
     /// Qwen3-VL vision tower for grounded edit conditioning (sc-12129). Kept lazy so ordinary
     /// txt2img/img2img/control requests neither load nor require the `visual.*` subtree.
@@ -153,10 +155,12 @@ pub(crate) struct KreaText {
 impl KreaText {
     fn vision(&self) -> Result<Arc<crate::vision::VisionTower>> {
         candle_gen::cached(&self.vision, || {
-            Ok(Arc::new(crate::vision::load_vision_tower(
-                &self.root,
-                &self.device,
-            )?))
+            read_validated_vision_source(&self.vision_encoder_source, |source| {
+                Ok(Arc::new(crate::vision::load_vision_tower_from_source(
+                    source,
+                    &self.device,
+                )?))
+            })
         })
     }
 }
@@ -241,6 +245,26 @@ fn load_residency_heavy_cancelable(
             load_vae_encoder(root, device)?
         },
     })
+}
+
+fn resolve_vision_encoder_source(
+    root: &Path,
+) -> gen_core::Result<gen_core::ValidatedEncoderSource> {
+    crate::ENCODER_CONTRACT
+        .validate_source(&gen_core::WeightsSource::Dir(root.join("text_encoder")))
+}
+
+/// Admit the exact edit-only vision surface before the backend opens any payload bytes. Keeping this
+/// check beside the lazy read is what lets language-valid T2I/img2img/control snapshots omit
+/// `visual.*` while making the first grounded edit fail closed.
+fn read_validated_vision_source<T>(
+    source: &gen_core::ValidatedEncoderSource,
+    read: impl FnOnce(&gen_core::WeightsSource) -> Result<T>,
+) -> Result<T> {
+    source
+        .validate_vision(&crate::VISION_ENCODER_CONTRACT, &crate::ENCODER_CONTRACT)
+        .map_err(CandleError::from)?;
+    source.read_unchanged(read)
 }
 
 pub(crate) fn encode_residency(
@@ -360,6 +384,90 @@ pub fn load_components(
     adapters: &[AdapterSpec],
     pid_spec: Option<&PidWeights>,
 ) -> Result<Components> {
+    let selected = resolve_components_text_encoder(root, None)?;
+    load_components_with_encoder(root, &selected, device, adapters, pid_spec)
+}
+
+/// Load the resident Krea components while selecting an explicitly authored Qwen3-VL text encoder.
+///
+/// `None` selects the snapshot's bundled `text_encoder/`, preserving the existing load route.
+/// `Some` accepts either the encoder component itself or a complete snapshot containing it. Both
+/// routes pass the same exact config-and-header [`crate::ENCODER_CONTRACT`] and numeric-tier policy
+/// before any tensor payload is opened; the retained validation receipt is rechecked immediately
+/// before and after the backend enumerates the selected shards.
+pub fn load_components_with_text_encoder(
+    root: &Path,
+    text_encoder: Option<&gen_core::WeightsSource>,
+    device: &Device,
+    adapters: &[AdapterSpec],
+    pid_spec: Option<&PidWeights>,
+) -> Result<Components> {
+    let selected = resolve_components_text_encoder(root, text_encoder)?;
+    load_components_with_encoder(root, &selected, device, adapters, pid_spec)
+}
+
+/// Load the resident Krea components while preserving the caller's complete prepared encoder receipt.
+///
+/// Unlike a detached `text_encoder` path, the prepared [`gen_core::LoadSpec`] also identifies the
+/// selected config, tokenizer, and exact shard inventory. The entire provider load stays inside that
+/// receipt bracket so an admitted source cannot be replaced and freshly revalidated here.
+pub fn load_components_with_spec(
+    root: &Path,
+    spec: &gen_core::LoadSpec,
+    device: &Device,
+) -> Result<Components> {
+    match &spec.weights {
+        gen_core::WeightsSource::Dir(admitted_root) if admitted_root == root => {}
+        gen_core::WeightsSource::Dir(admitted_root) => {
+            return Err(CandleError::Msg(format!(
+                "krea edit: runtime base {} differs from admitted base {}",
+                root.display(),
+                admitted_root.display()
+            )));
+        }
+        gen_core::WeightsSource::File(_) => {
+            return Err(CandleError::Msg(
+                "krea edit: admitted base must be the runtime snapshot directory".to_owned(),
+            ));
+        }
+    }
+    spec.read_prepared_files_unchanged(|| {
+        load_components_with_text_encoder(
+            root,
+            spec.text_encoder.as_ref(),
+            device,
+            &spec.adapters,
+            spec.pid.as_ref(),
+        )
+    })
+}
+
+fn resolve_components_text_encoder(
+    root: &Path,
+    text_encoder: Option<&gen_core::WeightsSource>,
+) -> Result<gen_core::ValidatedEncoderSource> {
+    let builtin = gen_core::WeightsSource::Dir(root.join("text_encoder"));
+    let requested = text_encoder.unwrap_or(&builtin);
+    let selected = crate::ENCODER_CONTRACT
+        .validate_source_against_base(requested, root)
+        .map_err(CandleError::from)?;
+    let expected_bits = gen_core::text_encoder_packed_quant_bits(&builtin)?;
+    if let Some(bits) = selected.load_time_quant_bits(expected_bits, crate::KREA_2_EDIT_ID)? {
+        return Err(CandleError::Msg(format!(
+            "candle {} requires a selected text encoder already packed at Q{bits}; this provider does not repack a dense Krea encoder on the fly",
+            crate::KREA_2_EDIT_ID
+        )));
+    }
+    Ok(selected)
+}
+
+pub(crate) fn load_components_with_encoder(
+    root: &Path,
+    text_encoder_source: &gen_core::ValidatedEncoderSource,
+    device: &Device,
+    adapters: &[AdapterSpec],
+    pid_spec: Option<&PidWeights>,
+) -> Result<Components> {
     // Both phases, in the SAME order the pre-split loader used (tokenizer + TE, then DiT + VAE + PiD),
     // so the resident load is byte-identical — the phase fns below are just the two halves named.
     //
@@ -367,7 +475,7 @@ pub fn load_components(
     // `GenerationRequest` exists, so the PiD overlay must be there for whichever later request asks for
     // it. That is the opposite of the `Sequential` path's calculus (see [`load_heavy`]), where the load
     // is per-generate and the request IS in hand.
-    let text = load_text(root, device)?;
+    let text = load_text_with_source(root, text_encoder_source, device)?;
     let heavy = load_heavy(root, device, adapters, pid_spec, true)?;
     Ok(Components { text, heavy })
 }
@@ -398,18 +506,36 @@ fn pid_to_load(pid_spec: Option<&PidWeights>, use_pid: bool) -> Option<&PidWeigh
 /// encoder upcasts each projection — so both render correctly; only the resident footprint differs).
 #[cfg(test)]
 fn load_te_weights(root: &Path, device: &Device) -> Result<Weights> {
-    load_te_weights_cancelable(root, device, None)
+    load_te_weights_cancelable(
+        &gen_core::WeightsSource::Dir(root.join("text_encoder")),
+        device,
+        None,
+    )
 }
 
 fn load_te_weights_cancelable(
-    root: &Path,
+    source: &gen_core::WeightsSource,
     device: &Device,
     cancel: Option<&gen_core::CancelFlag>,
 ) -> Result<Weights> {
-    let dir = root.join("text_encoder");
     let open = |dtype| match cancel {
-        Some(cancel) => Weights::from_dir_cancelable(&dir, device, dtype, cancel),
-        None => Weights::from_dir(&dir, device, dtype).map_err(candle_gen::CandleError::from),
+        Some(cancel) => match source {
+            gen_core::WeightsSource::Dir(path) => {
+                Weights::from_dir_cancelable(path, device, dtype, cancel)
+            }
+            gen_core::WeightsSource::File(path) => {
+                candle_gen::check_cancel(cancel)?;
+                Weights::from_file(path, device, dtype).map_err(candle_gen::CandleError::from)
+            }
+        },
+        None => match source {
+            gen_core::WeightsSource::Dir(path) => {
+                Weights::from_dir(path, device, dtype).map_err(candle_gen::CandleError::from)
+            }
+            gen_core::WeightsSource::File(path) => {
+                Weights::from_file(path, device, dtype).map_err(candle_gen::CandleError::from)
+            }
+        },
     };
     let w = open(TE_STORE_DTYPE)?;
     if w.get_native("language_model.layers.0.input_layernorm.weight")?
@@ -422,36 +548,44 @@ fn load_te_weights_cancelable(
     }
 }
 
-pub(crate) fn load_text(root: &Path, device: &Device) -> Result<KreaText> {
-    load_text_cancelable(root, device, None)
+pub(crate) fn load_text_with_source(
+    root: &Path,
+    source: &gen_core::ValidatedEncoderSource,
+    device: &Device,
+) -> Result<KreaText> {
+    load_text_cancelable(root, source, device, None)
 }
 
-pub(crate) fn load_text_for_request(
+pub(crate) fn load_text_for_request_with_source(
     root: &Path,
+    source: &gen_core::ValidatedEncoderSource,
     device: &Device,
     cancel: &gen_core::CancelFlag,
 ) -> Result<KreaText> {
-    load_text_cancelable(root, device, Some(cancel))
+    load_text_cancelable(root, source, device, Some(cancel))
 }
 
 pub(crate) fn load_text_quantized_for_request(
     root: &Path,
+    source: &gen_core::ValidatedEncoderSource,
     device: &Device,
     cancel: &gen_core::CancelFlag,
     quant: gen_core::Quant,
 ) -> Result<KreaText> {
     candle_gen::check_cancel(cancel)?;
-    let tok = crate::tokenizer::KreaTokenizer::from_snapshot(root, device)?;
-    let te_cfg = KreaTeConfig::from_snapshot(root)?;
+    let vision_encoder_source = resolve_vision_encoder_source(root)?;
+    let tok = crate::tokenizer::KreaTokenizer::from_validated_source(source, device)?;
+    let te_cfg = KreaTeConfig::qwen3_vl_4b();
     let cpu = Device::Cpu;
-    let te_w = load_te_weights_cancelable(root, &cpu, Some(cancel))?;
+    let te_w =
+        source.read_unchanged(|weights| load_te_weights_cancelable(weights, &cpu, Some(cancel)))?;
     let mut te = KreaTextEncoder::load(&te_w, "language_model", &te_cfg, MAX_TEXT_TOKENS)?;
     te.quantize_onto(quant, device)?;
     candle_gen::check_cancel(cancel)?;
     Ok(KreaText {
         tok,
         te,
-        root: root.to_path_buf(),
+        vision_encoder_source,
         device: device.clone(),
         vision: Mutex::new(None),
     })
@@ -466,22 +600,24 @@ fn check_optional_cancel(cancel: Option<&gen_core::CancelFlag>) -> Result<()> {
 
 fn load_text_cancelable(
     root: &Path,
+    source: &gen_core::ValidatedEncoderSource,
     device: &Device,
     cancel: Option<&gen_core::CancelFlag>,
 ) -> Result<KreaText> {
     if let Some(cancel) = cancel {
         candle_gen::check_cancel(cancel)?;
     }
-    let tok = crate::tokenizer::KreaTokenizer::from_snapshot(root, device)?;
+    let vision_encoder_source = resolve_vision_encoder_source(root)?;
+    let tok = crate::tokenizer::KreaTokenizer::from_validated_source(source, device)?;
 
-    let te_cfg = KreaTeConfig::from_snapshot(root)?;
-    let te_w = load_te_weights_cancelable(root, device, cancel)?;
+    let te_cfg = KreaTeConfig::qwen3_vl_4b();
+    let te_w =
+        source.read_unchanged(|weights| load_te_weights_cancelable(weights, device, cancel))?;
     let te = KreaTextEncoder::load(&te_w, "language_model", &te_cfg, MAX_TEXT_TOKENS)?;
-
     Ok(KreaText {
         tok,
         te,
-        root: root.to_path_buf(),
+        vision_encoder_source,
         device: device.clone(),
         vision: Mutex::new(None),
     })
@@ -613,10 +749,20 @@ pub fn load_components_convrot(
     convrot_dit: &Path,
     device: &Device,
 ) -> Result<Components> {
+    let selected = resolve_components_text_encoder(root, None)?;
+    load_components_convrot_with_encoder(root, &selected, convrot_dit, device)
+}
+
+pub(crate) fn load_components_convrot_with_encoder(
+    root: &Path,
+    text_encoder_source: &gen_core::ValidatedEncoderSource,
+    convrot_dit: &Path,
+    device: &Device,
+) -> Result<Components> {
     // The floor probe needs a cuBLASLt handle to read the device's compute capability — so it KEEPS it
     // and hands it to the DiT weight set as the trunk's one shared handle (sc-12301 scope 5), instead of
     // building 32 MiB of workspace, reading two integers off it, and dropping it.
-    let text = load_text(root, device)?;
+    let text = load_text_with_source(root, text_encoder_source, device)?;
     let heavy = load_heavy_convrot(root, convrot_dit, device)?;
     Ok(Components { text, heavy })
 }
@@ -671,12 +817,14 @@ pub fn load_components_native(
     device: &Device,
 ) -> Result<Components> {
     let pinned = gen_core::PinnedWeightsFile::pin(native_dit)?;
-    load_components_native_with(root, &pinned, device, &[], None, None, false)
+    let selected = resolve_components_text_encoder(root, None)?;
+    load_components_native_with_encoder(root, &selected, &pinned, device, &[], None, None, false)
 }
 
-/// Registry-backed native load with the same adapter and block-window surface as a snapshot load.
-pub(crate) fn load_components_native_with(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn load_components_native_with_encoder(
     root: &Path,
+    text_encoder_source: &gen_core::ValidatedEncoderSource,
     native_dit: &gen_core::PinnedWeightsFile,
     device: &Device,
     adapters: &[AdapterSpec],
@@ -687,9 +835,9 @@ pub(crate) fn load_components_native_with(
     let text = match text_load_quant {
         Some(quant) => {
             let cancel = gen_core::CancelFlag::new();
-            load_text_quantized_for_request(root, device, &cancel, quant)?
+            load_text_quantized_for_request(root, text_encoder_source, device, &cancel, quant)?
         }
-        None => load_text(root, device)?,
+        None => load_text_with_source(root, text_encoder_source, device)?,
     };
     let heavy = load_heavy_native_with(
         root,
@@ -702,8 +850,10 @@ pub(crate) fn load_components_native_with(
     Ok(Components { text, heavy })
 }
 
-pub(crate) fn load_components_native_registry(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn load_components_native_registry_with_encoder(
     root: &Path,
+    text_encoder_source: &gen_core::ValidatedEncoderSource,
     native_dit: &gen_core::PinnedWeightsFile,
     device: &Device,
     adapters: &[AdapterSpec],
@@ -711,8 +861,9 @@ pub(crate) fn load_components_native_registry(
     text_load_quant: Option<gen_core::Quant>,
     pid_spec: Option<&PidWeights>,
 ) -> Result<Components> {
-    let mut components = load_components_native_with(
+    let mut components = load_components_native_with_encoder(
         root,
+        text_encoder_source,
         native_dit,
         device,
         adapters,
@@ -928,8 +1079,10 @@ pub fn render(
 /// Three-stage renderer for snapshot and imported-file sources. All phases remain identical; only the
 /// DiT opener is selected from the optional registry primary `WeightsSource::File` instead of
 /// `root/transformer`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn render_three_stage_with_native(
     root: &Path,
+    text_encoder_source: &gen_core::ValidatedEncoderSource,
     native_dit: Option<&gen_core::PinnedWeightsFile>,
     device: &Device,
     adapters: &[AdapterSpec],
@@ -949,11 +1102,17 @@ pub(crate) fn render_three_stage_with_native(
     )?;
     let text = if native_dit.is_some() {
         match quantization.text_encoder {
-            Some(quant) => load_text_quantized_for_request(root, device, &req.cancel, quant)?,
-            None => load_text_cancelable(root, device, Some(&req.cancel))?,
+            Some(quant) => load_text_quantized_for_request(
+                root,
+                text_encoder_source,
+                device,
+                &req.cancel,
+                quant,
+            )?,
+            None => load_text_cancelable(root, text_encoder_source, device, Some(&req.cancel))?,
         }
     } else {
-        load_text_cancelable(root, device, Some(&req.cancel))?
+        load_text_cancelable(root, text_encoder_source, device, Some(&req.cancel))?
     };
     let context = encode_prompt_context(&text, req)?;
     device.synchronize()?;
@@ -2515,6 +2674,85 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+
+    #[test]
+    fn language_only_snapshot_is_admitted_until_the_edit_only_vision_read() {
+        let fixture = tempfile::tempdir().unwrap();
+        gen_core_testkit::write_encoder_contract_fixture(
+            &fixture.path().join("text_encoder"),
+            crate::ENCODER_CONTRACT,
+        )
+        .unwrap();
+
+        let source = resolve_vision_encoder_source(fixture.path())
+            .expect("ordinary text construction must admit a language-valid vision-less snapshot");
+        let opened = Cell::new(false);
+        let error = read_validated_vision_source::<()>(&source, |_| {
+            opened.set(true);
+            Err(CandleError::Msg(
+                "vision payload unexpectedly opened".into(),
+            ))
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("vision_config"), "{error}");
+        assert!(
+            !opened.get(),
+            "edit admission must fail before the vision payload loader runs"
+        );
+    }
+
+    #[test]
+    fn selected_text_encoder_admission_is_exact_and_uses_the_builtin_default() {
+        let fixture = tempfile::tempdir().unwrap();
+        let builtin = fixture.path().join("text_encoder");
+        gen_core_testkit::write_encoder_contract_fixture(&builtin, crate::ENCODER_CONTRACT)
+            .unwrap();
+
+        let default = resolve_components_text_encoder(fixture.path(), None).unwrap();
+        default
+            .read_unchanged::<(), gen_core::Error>(|source| match source {
+                gen_core::WeightsSource::Dir(path) if path == &builtin => Ok(()),
+                other => Err(gen_core::Error::Msg(format!(
+                    "unexpected builtin encoder source: {other:?}"
+                ))),
+            })
+            .unwrap();
+
+        let compatible = fixture.path().join("compatible-encoder");
+        gen_core_testkit::write_encoder_contract_fixture(&compatible, crate::ENCODER_CONTRACT)
+            .unwrap();
+        let selected = resolve_components_text_encoder(
+            fixture.path(),
+            Some(&gen_core::WeightsSource::Dir(compatible.clone())),
+        )
+        .unwrap();
+        selected
+            .read_unchanged::<(), gen_core::Error>(|source| match source {
+                gen_core::WeightsSource::Dir(path) if path == &compatible => Ok(()),
+                other => Err(gen_core::Error::Msg(format!(
+                    "unexpected selected encoder source: {other:?}"
+                ))),
+            })
+            .unwrap();
+
+        let incompatible = fixture.path().join("incompatible-encoder");
+        gen_core_testkit::write_encoder_contract_fixture(
+            &incompatible,
+            gen_core::EncoderContract {
+                hidden_size: crate::ENCODER_CONTRACT.hidden_size + 1,
+                ..crate::ENCODER_CONTRACT
+            },
+        )
+        .unwrap();
+        let error = resolve_components_text_encoder(
+            fixture.path(),
+            Some(&gen_core::WeightsSource::Dir(incompatible)),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("field hidden_size"), "{error}");
+    }
 
     struct DecodeSpy {
         output: Tensor,

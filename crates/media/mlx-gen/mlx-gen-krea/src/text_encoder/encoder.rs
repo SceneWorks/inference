@@ -84,8 +84,9 @@ impl KreaTextEncoder {
         })
     }
 
-    /// Quantize every decoder-layer projection in place (group-wise affine Q4/Q8). The token table
-    /// stays dense, matching the hosted Krea converter, Candle route, and memory contract.
+    /// Quantize only the decoder-layer projections in place (group-wise affine Q4/Q8). The token
+    /// table stays dense, matching this provider's offline converter and `pack_embedding=false`
+    /// encoder contract; norms stay dense as well.
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
         for layer in &mut self.layers {
             layer.quantize(bits)?;

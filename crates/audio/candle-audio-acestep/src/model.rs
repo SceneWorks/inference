@@ -194,6 +194,7 @@ pub const LANGUAGES: &[&str] = &["en", "zh", "ja", "ko", "fr", "de", "es", "it",
 /// ACE-Step's identity + capabilities — constructible without weights.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
         denoiser_output_latent_space: None,
         control_kinds: None,
         // Cover's ~7.8 GB sft snapshot is an OPTIONAL, on-demand component ([`COVER_COMPONENT_ID`] =

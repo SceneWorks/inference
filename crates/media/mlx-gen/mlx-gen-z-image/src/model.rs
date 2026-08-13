@@ -65,6 +65,7 @@ pub const PID_BACKBONE: &str = "zimage-turbo";
 /// scheduler port.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: Some(crate::ENCODER_CONTRACT),
         denoiser_output_latent_space: Some(&mlx_gen::gen_core::FLUX1_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
@@ -212,45 +213,86 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 #[derive(Clone)]
 enum ComfyUiSource {
     Components {
-        transformer: std::path::PathBuf,
-        text_encoder: std::path::PathBuf,
-        vae: std::path::PathBuf,
+        transformer: Box<gen_core::PinnedWeightsFile>,
+        text_encoder: Box<gen_core::ValidatedEncoderSource>,
+        vae: Box<gen_core::PinnedWeightsFile>,
     },
-    Checkpoint(std::path::PathBuf),
+    Checkpoint {
+        checkpoint: Box<gen_core::PinnedWeightsFile>,
+        tokenizer: Option<Box<gen_core::ValidatedTokenizerSource>>,
+    },
 }
 
 impl ComfyUiSource {
-    fn load_text(&self) -> Result<mlx_gen::weights::Weights> {
+    fn load_tokenizer(&self) -> Result<TextTokenizer> {
         match self {
-            Self::Components { text_encoder, .. } => {
-                mlx_gen::weights::Weights::from_file_with_fp8(text_encoder)
+            Self::Components { text_encoder, .. } => loader::load_validated_tokenizer(text_encoder),
+            Self::Checkpoint { tokenizer, .. } => {
+                loader::load_tokenizer_from_receipt(tokenizer.as_deref().ok_or_else(|| {
+                    Error::Unsupported(
+                        "Z-Image fused checkpoint has no retained tokenizer receipt".into(),
+                    )
+                })?)
             }
-            Self::Checkpoint(path) => crate::comfyui::split_combined_text(path),
         }
+    }
+
+    fn load_text(&self) -> Result<mlx_gen::weights::Weights> {
+        let weights = match self {
+            Self::Components { text_encoder, .. } => text_encoder.read_unchanged(|source| {
+                let WeightsSource::File(path) = source else {
+                    return Err(Error::Unsupported(
+                        "Z-Image ComfyUI text encoder must remain one File source".into(),
+                    ));
+                };
+                let weights = mlx_gen::weights::Weights::from_file_with_fp8(path)?;
+                weights.materialize()?;
+                Ok(weights)
+            }),
+            Self::Checkpoint { checkpoint, .. } => checkpoint.read_unchanged(|path| {
+                let weights = crate::comfyui::split_combined_text(path)?;
+                weights.materialize()?;
+                Ok(weights)
+            }),
+        }?;
+        Ok(weights)
     }
 
     fn load_heavy(&self) -> Result<(mlx_gen::weights::Weights, mlx_gen::weights::Weights)> {
-        match self {
+        let weights = match self {
             Self::Components {
                 transformer, vae, ..
-            } => Ok((
-                mlx_gen::weights::Weights::from_file_with_fp8(transformer)?,
-                mlx_gen::weights::Weights::from_file_with_fp8(vae)?,
-            )),
-            Self::Checkpoint(path) => crate::comfyui::split_combined_heavy(path),
-        }
+            } => {
+                let transformer = transformer.read_unchanged(|path| {
+                    let weights = mlx_gen::weights::Weights::from_file_with_fp8(path)?;
+                    weights.materialize()?;
+                    Ok::<_, Error>(weights)
+                })?;
+                let vae = vae.read_unchanged(|path| {
+                    let weights = mlx_gen::weights::Weights::from_file_with_fp8(path)?;
+                    weights.materialize()?;
+                    Ok::<_, Error>(weights)
+                })?;
+                Ok::<_, Error>((transformer, vae))
+            }
+            Self::Checkpoint { checkpoint, .. } => checkpoint.read_unchanged(|path| {
+                let (transformer, vae) = crate::comfyui::split_combined_heavy(path)?;
+                transformer.materialize()?;
+                vae.materialize()?;
+                Ok((transformer, vae))
+            }),
+        }?;
+        Ok(weights)
     }
 }
 
-fn build_comfyui_generator(
-    source: ComfyUiSource,
-    tokenizer_root: &Path,
-) -> Result<Box<dyn Generator>> {
+fn build_comfyui_generator(source: ComfyUiSource) -> Result<Box<dyn Generator>> {
+    let tokenizer = source.load_tokenizer()?;
     let text_source = source.clone();
     let heavy_source = source;
     Ok(Box::new(ZImageTurbo {
         descriptor: descriptor(),
-        tokenizer: loader::load_tokenizer(tokenizer_root)?,
+        tokenizer,
         // A community single-file / three-file load has no snapshot component tree, so the contract's
         // asset facts are the truthful zero (see `memory_strategy::asset_facts`).
         memory_strategy: crate::memory_strategy::memory_strategy_contract(
@@ -307,14 +349,16 @@ pub fn load_from_comfyui_components(
     vae_file: impl AsRef<Path>,
     tokenizer_root: impl AsRef<Path>,
 ) -> Result<Box<dyn Generator>> {
-    build_comfyui_generator(
-        ComfyUiSource::Components {
-            transformer: transformer_file.as_ref().to_owned(),
-            text_encoder: text_encoder_file.as_ref().to_owned(),
-            vae: vae_file.as_ref().to_owned(),
-        },
+    let text_encoder_file = text_encoder_file.as_ref();
+    let text_encoder = crate::ENCODER_CONTRACT.validate_comfyui_source_against_base(
+        &WeightsSource::File(text_encoder_file.to_owned()),
         tokenizer_root.as_ref(),
-    )
+    )?;
+    build_comfyui_generator(ComfyUiSource::Components {
+        transformer: Box::new(gen_core::PinnedWeightsFile::pin(transformer_file.as_ref())?),
+        text_encoder: Box::new(text_encoder),
+        vae: Box::new(gen_core::PinnedWeightsFile::pin(vae_file.as_ref())?),
+    })
 }
 
 /// Load one fused community Z-Image checkpoint on MLX.
@@ -322,10 +366,22 @@ pub fn load_from_comfyui_checkpoint(
     checkpoint_file: impl AsRef<Path>,
     tokenizer_root: impl AsRef<Path>,
 ) -> Result<Box<dyn Generator>> {
-    build_comfyui_generator(
-        ComfyUiSource::Checkpoint(checkpoint_file.as_ref().to_owned()),
-        tokenizer_root.as_ref(),
-    )
+    let checkpoint = gen_core::PinnedWeightsFile::pin(checkpoint_file.as_ref())?;
+    let tokenizer = checkpoint.read_unchanged(|path| {
+        crate::ENCODER_CONTRACT.validate_embedded_comfyui_file_against_base(
+            path,
+            &[
+                "conditioner.embedders.0.transformer.",
+                "text_encoders.qwen3_4b.transformer.",
+                "text_encoder.",
+            ],
+            tokenizer_root.as_ref(),
+        )
+    })?;
+    build_comfyui_generator(ComfyUiSource::Checkpoint {
+        checkpoint: Box::new(checkpoint),
+        tokenizer: Some(Box::new(tokenizer)),
+    })
 }
 
 /// Build the tokenizer + request-scoped [`Residency`] seam for a non-control Z-Image generator.
@@ -357,8 +413,21 @@ pub(crate) fn load_residency(
     } else {
         None
     };
-    let tokenizer = loader::load_tokenizer(root)?;
-    let mut residency = build_residency(spec, model_id, precision_msg, file_msg)?;
+    let text_encoder_source = crate::ENCODER_CONTRACT.source_for_load(spec, root)?;
+    let effective_quant_bits = crate::memory_strategy::loaded_tier(spec, model_id)?
+        .quant
+        .map(Quant::bits);
+    let text_encoder_quant_bits =
+        text_encoder_source.load_time_quant_bits(effective_quant_bits, model_id)?;
+    let tokenizer = loader::load_validated_tokenizer(&text_encoder_source)?;
+    let mut residency = build_residency_with_source(
+        spec,
+        model_id,
+        precision_msg,
+        file_msg,
+        text_encoder_source,
+        text_encoder_quant_bits,
+    )?;
     if let Some(bits) = requantize_bits {
         let warned = std::sync::atomic::AtomicBool::new(false);
         residency = residency.with_staged_advisory(move || {
@@ -373,18 +442,42 @@ pub(crate) fn load_residency(
 /// Request-scoped residency builder shared by every Z-Image variant. Both loader closures receive the
 /// request's `streamable` component form; phase-level staging is a separate argument to
 /// [`Residency::run_staged_request_scoped`].
+#[cfg(test)]
 pub(crate) fn build_residency(
     spec: &LoadSpec,
     model_id: &'static str,
     precision_msg: &'static str,
     file_msg: &'static str,
 ) -> Result<Residency<TextEncoder, ZImageHeavyOwned>> {
-    let spec_text = spec.clone();
+    let root = resolve_precision_and_root(spec, precision_msg, file_msg)?;
+    let text_encoder_source = crate::ENCODER_CONTRACT.source_for_load(spec, root)?;
+    let effective_quant_bits = crate::memory_strategy::loaded_tier(spec, model_id)?
+        .quant
+        .map(Quant::bits);
+    let text_encoder_quant_bits =
+        text_encoder_source.load_time_quant_bits(effective_quant_bits, model_id)?;
+    build_residency_with_source(
+        spec,
+        model_id,
+        precision_msg,
+        file_msg,
+        text_encoder_source,
+        text_encoder_quant_bits,
+    )
+}
+
+fn build_residency_with_source(
+    spec: &LoadSpec,
+    model_id: &'static str,
+    precision_msg: &'static str,
+    file_msg: &'static str,
+    text_encoder_source: gen_core::ValidatedEncoderSource,
+    text_encoder_quant_bits: Option<i32>,
+) -> Result<Residency<TextEncoder, ZImageHeavyOwned>> {
     let spec_heavy = spec.clone();
     Ok(Residency::request_scoped(
         move |streamable| {
-            let root = resolve_precision_and_root(&spec_text, precision_msg, file_msg)?;
-            load_text_encoder_only(root, spec_text.quantize, streamable)
+            load_text_encoder_only(&text_encoder_source, text_encoder_quant_bits, streamable)
         },
         move |use_pid, streamable| {
             let root = resolve_precision_and_root(&spec_heavy, precision_msg, file_msg)?;
@@ -422,17 +515,17 @@ fn resolve_precision_and_root<'a>(
 /// `streamable` builds the rung-4 text-encoder stream (SC-15794). SC-15998 derives it from the
 /// independent [`mlx_gen::LoadShape::DeferredMaterialization`] request, not from phase-level residency.
 fn load_text_encoder_only(
-    root: &Path,
-    quant: Option<Quant>,
+    source: &gen_core::ValidatedEncoderSource,
+    load_time_quant_bits: Option<i32>,
     streamable: bool,
 ) -> Result<TextEncoder> {
     let mut text_encoder = if streamable {
-        loader::load_text_encoder_streamable(root)?
+        loader::load_validated_text_encoder_streamable(source)?
     } else {
-        loader::load_text_encoder(root)?
+        loader::load_validated_text_encoder(source)?
     };
-    if let Some(q) = quant {
-        text_encoder.quantize(q.bits())?;
+    if let Some(bits) = load_time_quant_bits {
+        text_encoder.quantize(bits)?;
     }
     Ok(text_encoder)
 }
@@ -760,12 +853,30 @@ pub(crate) fn validate_request(
 pub(crate) fn component_footprint(
     spec: &mlx_gen::LoadSpec,
 ) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
-    mlx_gen::PerComponentBytes::from_spec_subdirs(
+    let root = match &spec.weights {
+        WeightsSource::Dir(root) => root.as_path(),
+        WeightsSource::File(_) => {
+            return Err(gen_core::Error::Msg(
+                "z-image component footprint requires a snapshot directory".to_owned(),
+            ))
+        }
+    };
+    let selected = crate::ENCODER_CONTRACT.source_for_load(spec, root)?;
+    let text_encoder = selected.read_unchanged(|source| {
+        Ok::<u64, gen_core::Error>(match source {
+            WeightsSource::Dir(path) | WeightsSource::File(path) => {
+                mlx_gen::safetensors_path_bytes(path)
+            }
+        })
+    })?;
+    let mut footprint = mlx_gen::PerComponentBytes::from_spec_subdirs(
         spec,
         &["text_encoder"],
         &["transformer"],
         &["vae"],
-    )
+    )?;
+    footprint.text_encoder = text_encoder;
+    Ok(footprint)
 }
 
 mlx_gen::register_generators! {
@@ -804,6 +915,54 @@ pub const MEMORY_BEHAVIOR_REGISTRATION: mlx_gen::gen_core::MemoryBehaviorRegistr
 mod tests {
     use super::*;
     use mlx_gen::OffloadPolicy;
+
+    #[test]
+    fn comfyui_checkpoint_rechecks_retained_pin_before_deferred_text_load() {
+        let fixture = tempfile::tempdir().unwrap();
+        let checkpoint = fixture.path().join("combined.safetensors");
+        std::fs::write(&checkpoint, b"initial checkpoint").unwrap();
+        let source = ComfyUiSource::Checkpoint {
+            checkpoint: Box::new(gen_core::PinnedWeightsFile::pin(&checkpoint).unwrap()),
+            tokenizer: None,
+        };
+
+        std::fs::write(&checkpoint, b"replacement checkpoint with different bytes").unwrap();
+        let error = source
+            .load_text()
+            .err()
+            .expect("request-scoped ComfyUI load must retain its original checkpoint pin");
+        let error = error.to_string();
+        assert!(error.contains("changed after load"), "{error}");
+    }
+
+    #[test]
+    fn comfyui_components_recheck_validated_text_source_before_deferred_load() {
+        let fixture = tempfile::tempdir().unwrap();
+        let encoder = fixture.path().join("encoder");
+        gen_core_testkit::write_encoder_contract_fixture(&encoder, crate::ENCODER_CONTRACT)
+            .unwrap();
+        let encoder_file = encoder.join("model.safetensors");
+        let text_encoder = crate::ENCODER_CONTRACT
+            .validate_comfyui_source(&WeightsSource::File(encoder_file.clone()))
+            .unwrap();
+        let transformer = fixture.path().join("transformer.safetensors");
+        let vae = fixture.path().join("vae.safetensors");
+        std::fs::write(&transformer, b"transformer").unwrap();
+        std::fs::write(&vae, b"vae").unwrap();
+        let source = ComfyUiSource::Components {
+            transformer: Box::new(gen_core::PinnedWeightsFile::pin(&transformer).unwrap()),
+            text_encoder: Box::new(text_encoder),
+            vae: Box::new(gen_core::PinnedWeightsFile::pin(&vae).unwrap()),
+        };
+
+        std::fs::write(&encoder_file, b"replacement encoder payload").unwrap();
+        let error = source
+            .load_text()
+            .err()
+            .expect("request-scoped ComfyUI load must retain the validated encoder receipt");
+        let error = error.to_string();
+        assert!(error.contains("changed after load"), "{error}");
+    }
 
     #[test]
     fn descriptor_is_z_image_turbo() {
@@ -997,25 +1156,28 @@ mod tests {
 
     // SC-15806: Z-Image construction is request-scoped. Both legacy load-policy values retain the
     // same loaders and defer component loading; GenerationMemory chooses the lifecycle per request.
-    fn missing_snapshot_spec(policy: OffloadPolicy) -> LoadSpec {
-        LoadSpec::new(WeightsSource::Dir(
-            "/nonexistent/z-image-residency-test-snapshot".into(),
-        ))
-        .with_offload_policy(policy)
+    fn incomplete_snapshot_spec(policy: OffloadPolicy) -> (tempfile::TempDir, LoadSpec) {
+        let snapshot = tempfile::tempdir().expect("snapshot fixture dir");
+        gen_core_testkit::write_encoder_contract_fixture(
+            &snapshot.path().join("text_encoder"),
+            crate::ENCODER_CONTRACT,
+        )
+        .expect("validation-complete encoder and tokenizer fixture");
+        let spec = LoadSpec::new(WeightsSource::Dir(snapshot.path().to_path_buf()))
+            .with_offload_policy(policy);
+        (snapshot, spec)
     }
 
     #[test]
     fn build_residency_defers_for_both_legacy_offload_values() {
         for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
-            let res = build_residency(
-                &missing_snapshot_spec(policy),
-                MODEL_ID,
-                PRECISION_MSG,
-                FILE_MSG,
-            )
-            .unwrap_or_else(|error| {
-                panic!("{policy:?} must defer and ignore the missing snapshot: {error}")
-            });
+            let (snapshot, spec) = incomplete_snapshot_spec(policy);
+            assert!(!snapshot.path().join("transformer").exists());
+            assert!(!snapshot.path().join("vae").exists());
+            let res =
+                build_residency(&spec, MODEL_ID, PRECISION_MSG, FILE_MSG).unwrap_or_else(|error| {
+                    panic!("{policy:?} must defer absent heavy components: {error}")
+                });
             assert!(
                 res.with_resident_parts(|_, _| ()).unwrap().is_none(),
                 "{policy:?} must begin with no warm request-scoped pair"
@@ -1033,6 +1195,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
             let root = loader::packed_snapshot_fixture(&tmp, "model-load", 8);
+            gen_core_testkit::write_encoder_contract_fixture(
+                &root.join("text_encoder"),
+                crate::ENCODER_CONTRACT,
+            )
+            .unwrap();
             let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
                 .with_quant(mlx_gen::Quant::Q4)
                 .with_offload_policy(policy);
@@ -1073,6 +1240,11 @@ mod tests {
         // A Q8 request over a Q8-packed turnkey must get PAST the guard (and fail later on the
         // missing component weights, not on the tier) — the guard rejects mismatches only.
         let root = loader::packed_snapshot_fixture(&tmp, "model-match", 8);
+        gen_core_testkit::write_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            crate::ENCODER_CONTRACT,
+        )
+        .unwrap();
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone())).with_quant(mlx_gen::Quant::Q8);
         let err = load(&spec).err().expect("expected an error").to_string();
         assert!(
@@ -1080,5 +1252,44 @@ mod tests {
             "a matching packed tier must not trip the mismatch guard, got: {err}"
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn selected_encoder_quant_policy_rejects_packed_mismatch_and_accepts_dense_inheritance() {
+        let base = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(base.path().join("transformer")).unwrap();
+        std::fs::write(
+            base.path().join("transformer/config.json"),
+            r#"{"quantization":{"bits":8,"group_size":64}}"#,
+        )
+        .unwrap();
+        gen_core_testkit::write_encoder_contract_tokenizer_fixture(
+            base.path(),
+            crate::ENCODER_CONTRACT,
+        )
+        .unwrap();
+
+        let packed_q4 = tempfile::tempdir().unwrap();
+        gen_core_testkit::write_encoder_contract_fixture_with_quant(
+            packed_q4.path(),
+            crate::ENCODER_CONTRACT,
+            Some(4),
+        )
+        .unwrap();
+        let mismatch = LoadSpec::new(WeightsSource::Dir(base.path().to_path_buf()))
+            .with_text_encoder(WeightsSource::Dir(packed_q4.path().to_path_buf()));
+        let error = build_residency(&mismatch, MODEL_ID, PRECISION_MSG, FILE_MSG)
+            .err()
+            .expect("packed encoder mismatch")
+            .to_string();
+        assert!(error.contains("pre-quantized Q4"), "{error}");
+        assert!(error.contains("model policy is Q8"), "{error}");
+
+        let dense = tempfile::tempdir().unwrap();
+        gen_core_testkit::write_encoder_contract_fixture(dense.path(), crate::ENCODER_CONTRACT)
+            .unwrap();
+        let inherited = LoadSpec::new(WeightsSource::Dir(base.path().to_path_buf()))
+            .with_text_encoder(WeightsSource::Dir(dense.path().to_path_buf()));
+        build_residency(&inherited, MODEL_ID, PRECISION_MSG, FILE_MSG).unwrap();
     }
 }

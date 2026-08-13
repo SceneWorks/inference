@@ -129,6 +129,7 @@ fn measure_z_image_base_control_tier() {
     let load_phase = probe.phase();
     let paths = ZImageControlPaths {
         snapshot,
+        text_encoder: None,
         control,
         base: true,
     };

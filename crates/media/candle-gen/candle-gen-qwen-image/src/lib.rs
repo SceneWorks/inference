@@ -68,6 +68,126 @@ pub mod vision;
 pub mod vision_language;
 pub mod vl_tokenizer;
 
+pub const TOKENIZER_CONTRACT: gen_core::EncoderTokenizerContract =
+    gen_core::EncoderTokenizerContract {
+        family: "qwen2_5_vl",
+        binding: gen_core::EncoderTokenizerBinding::RetainBase,
+        artifact_candidates: &["tokenizer/tokenizer.json", "processor/tokenizer.json"],
+        required_tokens: &[
+            gen_core::EncoderRequiredToken {
+                role: "qwen_endoftext",
+                literal: "<|endoftext|>",
+                id: 151_643,
+                config_field: Some("bos_token_id"),
+            },
+            gen_core::EncoderRequiredToken {
+                role: "qwen_im_start",
+                literal: "<|im_start|>",
+                id: 151_644,
+                config_field: None,
+            },
+            gen_core::EncoderRequiredToken {
+                role: "qwen_im_end",
+                literal: "<|im_end|>",
+                id: 151_645,
+                config_field: Some("eos_token_id"),
+            },
+            gen_core::EncoderRequiredToken {
+                role: "qwen_vision_start",
+                literal: "<|vision_start|>",
+                id: 151_652,
+                config_field: Some("vision_start_token_id"),
+            },
+            gen_core::EncoderRequiredToken {
+                role: "qwen_vision_end",
+                literal: "<|vision_end|>",
+                id: 151_653,
+                config_field: Some("vision_end_token_id"),
+            },
+            gen_core::EncoderRequiredToken {
+                role: "qwen_image_pad",
+                literal: "<|image_pad|>",
+                id: 151_655,
+                config_field: Some("image_token_id"),
+            },
+        ],
+    };
+
+pub const PROMPT_EXECUTIONS: &[gen_core::EncoderPromptExecutionContract] = &[
+    gen_core::EncoderPromptExecutionContract {
+        purpose: "qwen_image_t2i",
+        template: gen_core::EncoderPromptTemplate::QwenImage,
+        add_special_tokens: true,
+        length: gen_core::EncoderPromptLengthPolicy::RightTruncate { max_tokens: 1058 },
+        padding: gen_core::EncoderPromptPadding::None,
+        prefix_trim: 34,
+    },
+    gen_core::EncoderPromptExecutionContract {
+        purpose: "qwen_image_edit",
+        template: gen_core::EncoderPromptTemplate::QwenImageEdit,
+        add_special_tokens: true,
+        length: gen_core::EncoderPromptLengthPolicy::RightTruncate { max_tokens: 1058 },
+        padding: gen_core::EncoderPromptPadding::None,
+        prefix_trim: 64,
+    },
+];
+
+pub const ENCODER_CONTRACT: gen_core::EncoderContract = gen_core::EncoderContract {
+    architecture: "qwen2_5_vl_text",
+    hidden_size: 3584,
+    intermediate_size: 18_944,
+    num_hidden_layers: 28,
+    num_attention_heads: 28,
+    num_key_value_heads: 4,
+    head_dim: 128,
+    vocab_size: 152_064,
+    output_width: 3584,
+    loaded_hidden_layers: 28,
+    requires_final_norm: true,
+    requires_lm_head: false,
+    hidden_activation: "silu",
+    attention_dropout: gen_core::EncoderConfigFloat::new(0.0),
+    rms_norm_eps: gen_core::EncoderConfigFloat::new(1e-6),
+    qk_norm_eps: None,
+    rope_theta: gen_core::EncoderConfigFloat::new(1_000_000.0),
+    max_position_embeddings: 128_000,
+    attention_bias: gen_core::EncoderConfigBool::Optional(true),
+    tie_word_embeddings: gen_core::EncoderConfigBool::Required(false),
+    tokenizer: TOKENIZER_CONTRACT,
+    prompt_executions: PROMPT_EXECUTIONS,
+    bos_token_id: Some(151_643),
+    eos_token_id: Some(151_645),
+    image_token_id: Some(151_655),
+    vision_start_token_id: Some(151_652),
+    vision_end_token_id: Some(151_653),
+    mrope_section: &[16, 24, 24],
+    mrope_interleaved: None,
+    selected_hidden_layers: &[28],
+    packing: None,
+    dense_storage_dtype_probe: None,
+};
+
+pub const VISION_ENCODER_CONTRACT: gen_core::VisionEncoderContract =
+    gen_core::VisionEncoderContract {
+        architecture: gen_core::VisionEncoderArchitecture::Qwen2_5Vl,
+        hidden_size: 1280,
+        intermediate_size: 3420,
+        num_hidden_layers: 32,
+        num_attention_heads: 16,
+        output_width: 3584,
+        hidden_activation: "silu",
+        rope_theta: gen_core::EncoderConfigFloat::new(10_000.0),
+        normalization_eps: gen_core::EncoderConfigFloat::new(1e-6),
+        patch_size: 14,
+        temporal_patch_size: 2,
+        spatial_merge_size: 2,
+        in_channels: 3,
+        num_position_embeddings: None,
+        deepstack_visual_indexes: &[],
+        window_size: Some(112),
+        full_attention_block_indexes: &[7, 15, 23, 31],
+    };
+
 pub use control_fun::{
     QwenFunControl, QwenFunControlPaths, QwenFunControlRequest, CONTROL_IN_DIM, CONTROL_LAYERS,
     DEFAULT_CONTROL_SCALE,
@@ -167,6 +287,42 @@ enum HeavyPhase {
 
 type QwenResidency = candle_gen::Residency<TextPhase, HeavyPhase>;
 
+#[derive(Clone)]
+enum TextEncoderSource {
+    Trusted(WeightsSource),
+    Validated(Box<gen_core::ValidatedEncoderSource>),
+}
+
+impl From<WeightsSource> for TextEncoderSource {
+    fn from(source: WeightsSource) -> Self {
+        Self::Trusted(source)
+    }
+}
+
+impl From<gen_core::ValidatedEncoderSource> for TextEncoderSource {
+    fn from(source: gen_core::ValidatedEncoderSource) -> Self {
+        Self::Validated(Box::new(source))
+    }
+}
+
+impl TextEncoderSource {
+    fn read_unchanged<T>(&self, read: impl FnOnce(&WeightsSource) -> CResult<T>) -> CResult<T> {
+        match self {
+            Self::Trusted(source) => read(source),
+            Self::Validated(source) => source.read_unchanged(read),
+        }
+    }
+
+    fn validated(&self) -> CResult<&gen_core::ValidatedEncoderSource> {
+        match self {
+            Self::Validated(source) => Ok(source),
+            Self::Trusted(_) => Err(CandleError::Msg(
+                "qwen-image tokenizer parsing requires a validated encoder-source receipt".into(),
+            )),
+        }
+    }
+}
+
 #[cfg(test)]
 type ComfyuiDitLoadTestHook =
     Box<dyn FnMut(&std::collections::HashMap<String, Tensor>) -> CResult<()>>;
@@ -194,6 +350,7 @@ struct Pipeline {
     te_cfg: TextEncoderConfig,
     dit_cfg: TransformerConfig,
     root: PathBuf,
+    text_encoder_source: TextEncoderSource,
     device: Device,
     /// The `LoadSpec::pid` component (converted PiD checkpoint + gemma dir), if the caller opted in.
     pid_spec: Option<PidWeights>,
@@ -210,11 +367,17 @@ struct Pipeline {
 }
 
 impl Pipeline {
-    fn load(root: &Path, device: &Device, pid_spec: Option<PidWeights>) -> Self {
+    fn load<S: Into<TextEncoderSource>>(
+        root: &Path,
+        text_encoder_source: S,
+        device: &Device,
+        pid_spec: Option<PidWeights>,
+    ) -> Self {
         Self {
             te_cfg: TextEncoderConfig::qwen_image(),
             dit_cfg: TransformerConfig::qwen_image(),
             root: root.to_path_buf(),
+            text_encoder_source: text_encoder_source.into(),
             device: device.clone(),
             pid_spec,
             comfyui_dit: None,
@@ -226,17 +389,19 @@ impl Pipeline {
     /// sourced from in-place ComfyUI single-files (sc-10670 / sc-10830). `root` is the resident
     /// Qwen-Image diffusers snapshot that supplies the text encoder / tokenizer (and the VAE when
     /// `comfyui_vae` is `None`).
-    fn load_comfyui(
+    fn load_comfyui<S: Into<TextEncoderSource>>(
         root: &Path,
         device: &Device,
         comfyui_dit: gen_core::PinnedWeightsFile,
         comfyui_vae: Option<gen_core::PinnedWeightsFile>,
+        text_encoder_source: S,
         pid_spec: Option<PidWeights>,
     ) -> gen_core::Result<Self> {
         Ok(Self {
             te_cfg: TextEncoderConfig::qwen_image(),
             dit_cfg: TransformerConfig::qwen_image(),
             root: root.to_path_buf(),
+            text_encoder_source: text_encoder_source.into(),
             device: device.clone(),
             pid_spec,
             comfyui_dit: Some(comfyui_dit),
@@ -270,18 +435,33 @@ impl Pipeline {
         candle_gen::sorted_safetensors(&dir, "qwen-image")
     }
 
+    fn load_text_encoder(&self) -> CResult<QwenTextEncoder> {
+        self.text_encoder_source.read_unchanged(|source| {
+            let files = match source {
+                WeightsSource::Dir(path) => candle_gen::sorted_safetensors(path, "qwen-image")?,
+                WeightsSource::File(path) => vec![path.clone()],
+            };
+            let vb = candle_gen::mmap_var_builder(&files, ENC_DTYPE, &self.device)?;
+            Ok(QwenTextEncoder::new(&self.te_cfg, vb)?)
+        })
+    }
+
     fn load_components(&self) -> CResult<Components> {
         // The fused Qwen2.5-VL text encoder (LM + vision tower) ships DENSE bf16 in every tier — the
         // MLX convert job quantizes only the transformer — so the TE loader is unchanged (it guards
         // against an unexpected `.scales`; see `text_encoder`). The DiT packed-detects: read the packed
         // `group_size` from `transformer/config.json` (default 64 when dense/absent, never silent dense
         // — `candle_gen::quant::PackedConfig` resolves a missing group_size to 64).
-        let te = QwenTextEncoder::new(&self.te_cfg, self.component_vb("text_encoder", ENC_DTYPE)?)?;
+        let te = self.load_text_encoder()?;
         // Warm and request-staged loads share these source-aware component loaders so a ComfyUI
         // generator cannot switch back to snapshot weights when a constrained request arrives.
         let transformer = self.load_transformer_seq()?;
         let vae = self.load_vae_seq()?;
-        let tokenizer = control_common::load_tokenizer(&self.root, &self.te_cfg, "qwen-image")?;
+        let tokenizer = control_common::load_tokenizer(
+            self.text_encoder_source.validated()?,
+            &self.te_cfg,
+            "qwen-image",
+        )?;
         // Load the optional PiD super-resolving decoder once (epic 7840 / sc-7853) when the caller
         // opted in via `LoadSpec::pid`; otherwise `None` and the render path uses the native QwenVae.
         // Resident: this set is cached across requests, so the overlay must be loaded for whichever later
@@ -501,8 +681,12 @@ impl Pipeline {
     /// 10765 Phase 1c, sc-10867) — dropped right after the encode so the ~8 GB encoder frees before the
     /// DiT loads. Same loads as [`load_components`](Self::load_components), minus the DiT / VAE / PiD.
     fn load_te_seq(&self) -> CResult<(QwenTextEncoder, TextTokenizer)> {
-        let te = QwenTextEncoder::new(&self.te_cfg, self.component_vb("text_encoder", ENC_DTYPE)?)?;
-        let tokenizer = control_common::load_tokenizer(&self.root, &self.te_cfg, "qwen-image")?;
+        let te = self.load_text_encoder()?;
+        let tokenizer = control_common::load_tokenizer(
+            self.text_encoder_source.validated()?,
+            &self.te_cfg,
+            "qwen-image",
+        )?;
         Ok((te, tokenizer))
     }
 
@@ -895,6 +1079,7 @@ fn resolve_steps(requested: Option<u32>) -> usize {
 /// prompt; no conditioning (img2img/Edit deferred), no LoRA/quant, no Lightning sampler.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: Some(ENCODER_CONTRACT),
         denoiser_output_latent_space: Some(&candle_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
@@ -1018,11 +1203,14 @@ pub(crate) fn validate_load_spec(spec: &LoadSpec) -> gen_core::Result<()> {
             "candle qwen_image does not support control / Edit yet (txt2img only)".into(),
         ));
     }
-    if spec.identity.is_some() || spec.text_encoder.is_some() {
+    if spec.identity.is_some() {
         return Err(gen_core::Error::Unsupported(
-            "candle qwen_image does not support identity or external text-encoder weights".into(),
+            "candle qwen_image does not support identity weights".into(),
         ));
     }
+    let root = gen_core::require_base_snapshot(spec, MODEL_ID)?;
+    let selected = ENCODER_CONTRACT.source_for_load(spec, root)?;
+    selected.load_time_quant_bits(None, MODEL_ID)?;
     let _ = memory_strategy::snapshot_quant_tier(spec, MODEL_ID)?;
     if matches!(spec.weights, WeightsSource::File(_)) {
         gen_core::reject_unknown_components(
@@ -1046,10 +1234,14 @@ pub(crate) fn validate_load_spec(spec: &LoadSpec) -> gen_core::Result<()> {
 pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     validate_load_spec(spec)?;
     let root = gen_core::require_base_snapshot(spec, MODEL_ID)?.to_path_buf();
+    let text_encoder_source = ENCODER_CONTRACT.source_for_load(spec, &root)?;
+    text_encoder_source.load_time_quant_bits(None, MODEL_ID)?;
     let loaded_quant = memory_strategy::snapshot_quant_tier(spec, MODEL_ID)?;
     let device = candle_gen::default_device()?;
     let pipe = match &spec.weights {
-        WeightsSource::Dir(_) => Pipeline::load(&root, &device, spec.pid.clone()),
+        WeightsSource::Dir(_) => {
+            Pipeline::load(&root, text_encoder_source, &device, spec.pid.clone())
+        }
         WeightsSource::File(_) => {
             let dit = spec
                 .weights_file_pin()?
@@ -1063,7 +1255,14 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
                 })
                 .transpose()?
                 .flatten();
-            Pipeline::load_comfyui(&root, &device, dit, vae, spec.pid.clone())?
+            Pipeline::load_comfyui(
+                &root,
+                &device,
+                dit,
+                vae,
+                text_encoder_source,
+                spec.pid.clone(),
+            )?
         }
     };
     #[cfg(any(feature = "cuda", test))]
@@ -1111,6 +1310,14 @@ pub fn register_providers(
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
     let registry = registry
         .register_generator(REGISTRATION)
+        .register_encoder_contract_route(gen_core::EncoderContractRouteRegistration {
+            route_id: "qwen_image_edit",
+            provider_id: MODEL_ID,
+        })
+        .register_encoder_contract_route(gen_core::EncoderContractRouteRegistration {
+            route_id: "qwen_image_control",
+            provider_id: MODEL_ID,
+        })
         .register_imported_model(gen_core::ImportedModelRegistration {
             family: "qwen-image",
             source: gen_core::ImportedModelSource::ComfyUiTree,
@@ -1122,8 +1329,18 @@ pub fn register_providers(
     #[cfg(feature = "cuda")]
     let registry = registry
         .register_memory_strategy(QWEN_IMAGE_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            provider_id: MODEL_ID,
+            contract: |spec| memory_strategy::weights_free_memory_strategy_contract(MODEL_ID, spec),
+        })
         .register_memory_behavior(QWEN_IMAGE_MEMORY_BEHAVIOR)
         .register_composed_memory_strategy(QWEN_EDIT_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            provider_id: "qwen_image_edit",
+            contract: |spec| {
+                memory_strategy::weights_free_memory_strategy_contract("qwen_image_edit", spec)
+            },
+        })
         .register_memory_behavior(QWEN_EDIT_MEMORY_BEHAVIOR);
     registry
 }
@@ -1192,6 +1409,17 @@ mod explicit_registry_tests {
             .collect();
 
         assert_eq!(explicit, ["qwen_image"]);
+        for id in ["qwen_image", "qwen_image_edit", "qwen_image_control"] {
+            assert_eq!(
+                registry.provider_encoder_contract(id),
+                Some(super::ENCODER_CONTRACT),
+                "{id} must resolve through the provider-owned contract surface"
+            );
+        }
+        assert_eq!(
+            registry.provider_encoder_contract("qwen_image_unknown"),
+            None
+        );
     }
 }
 
@@ -1201,6 +1429,40 @@ mod tests {
 
     use super::*;
     use candle_gen::gen_core::ConditioningKind;
+
+    fn write_valid_text_encoder(root: &Path) {
+        gen_core_testkit::write_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            ENCODER_CONTRACT,
+        )
+        .unwrap();
+    }
+
+    fn valid_directory_spec(root: &Path) -> LoadSpec {
+        write_valid_text_encoder(root);
+        LoadSpec::new(WeightsSource::Dir(root.to_path_buf()))
+    }
+
+    #[test]
+    fn qwen_authored_attention_bias_must_match_the_biasful_runtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let encoder = tmp.path().join("encoder");
+        gen_core_testkit::write_encoder_contract_fixture(&encoder, ENCODER_CONTRACT).unwrap();
+        ENCODER_CONTRACT
+            .validate_source(&WeightsSource::Dir(encoder.clone()))
+            .expect("omission must select the biasful runtime behavior");
+        let config_path = encoder.join("config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        config["attention_bias"] = serde_json::json!(false);
+        std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let error = ENCODER_CONTRACT
+            .validate_source(&WeightsSource::Dir(encoder))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("attention_bias"), "{error}");
+        assert!(error.contains("expected true"), "{error}");
+    }
 
     #[test]
     fn comfyui_dit_entrypoint_postchecks_after_provider_payload_consumption() {
@@ -1222,8 +1484,15 @@ mod tests {
             .unwrap();
         }
         let source_pin = gen_core::PinnedWeightsFile::pin(&source).unwrap();
-        let pipeline =
-            Pipeline::load_comfyui(tmp.path(), &Device::Cpu, source_pin, None, None).unwrap();
+        let pipeline = Pipeline::load_comfyui(
+            tmp.path(),
+            &Device::Cpu,
+            source_pin,
+            None,
+            WeightsSource::Dir(tmp.path().join("text_encoder")),
+            None,
+        )
+        .unwrap();
 
         let payload_consumed = Arc::new(AtomicBool::new(false));
         let first_consumed = Arc::new(Barrier::new(2));
@@ -1363,8 +1632,18 @@ mod tests {
             gemma: WeightsSource::Dir("/gemma".into()),
         };
         let root = Path::new("/nonexistent");
-        let with = Pipeline::load(root, &Device::Cpu, Some(spec));
-        let without = Pipeline::load(root, &Device::Cpu, None);
+        let with = Pipeline::load(
+            root,
+            WeightsSource::Dir(root.join("text_encoder")),
+            &Device::Cpu,
+            Some(spec),
+        );
+        let without = Pipeline::load(
+            root,
+            WeightsSource::Dir(root.join("text_encoder")),
+            &Device::Cpu,
+            None,
+        );
 
         // Opted in at load AND wanted by this request → load it.
         assert!(with.pid_to_load(true).is_some());
@@ -1398,7 +1677,8 @@ mod tests {
 
     #[test]
     fn registers_and_resolves_as_candle() {
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let fixture = tempfile::tempdir().unwrap();
+        let spec = valid_directory_spec(fixture.path());
         let g = crate::provider_registry()
             .unwrap()
             .load(MODEL_ID, &spec)
@@ -1420,6 +1700,7 @@ mod tests {
             &Device::Cpu,
             gen_core::PinnedWeightsFile::pin(&dit).unwrap(),
             Some(gen_core::PinnedWeightsFile::pin(&vae).unwrap()),
+            WeightsSource::Dir(Path::new("/missing-snapshot/text_encoder").to_path_buf()),
             None,
         )
         .expect("pin selected files");
@@ -1658,7 +1939,8 @@ mod tests {
 
     #[test]
     fn validate_accepts_txt2img_and_rejects_unsupported() {
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let fixture = tempfile::tempdir().unwrap();
+        let spec = valid_directory_spec(fixture.path());
         let g = crate::provider_registry()
             .unwrap()
             .load(MODEL_ID, &spec)
@@ -1758,17 +2040,16 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("temp dir");
         let snapshot = dir.path().join("snapshot");
-        for component in ["text_encoder", "vae"] {
-            std::fs::create_dir_all(snapshot.join(component)).unwrap();
-            safetensors::save(
-                &HashMap::from([(
-                    "fixture.weight".to_string(),
-                    Tensor::zeros((2,), DType::F32, &Device::Cpu).unwrap(),
-                )]),
-                snapshot.join(component).join("model.safetensors"),
-            )
-            .unwrap();
-        }
+        write_valid_text_encoder(&snapshot);
+        std::fs::create_dir_all(snapshot.join("vae")).unwrap();
+        safetensors::save(
+            &HashMap::from([(
+                "fixture.weight".to_string(),
+                Tensor::zeros((2,), DType::F32, &Device::Cpu).unwrap(),
+            )]),
+            snapshot.join("vae").join("model.safetensors"),
+        )
+        .unwrap();
         let dit = dir.path().join("qwen.safetensors");
         safetensors::save(
             &HashMap::from([(
@@ -1817,13 +2098,19 @@ mod tests {
         for sub in ["text_encoder", "transformer", "vae", "tokenizer"] {
             std::fs::create_dir_all(tmp.join(sub)).unwrap();
         }
-        std::fs::write(tmp.join("tokenizer/tokenizer.json"), b"{}").unwrap();
+        write_valid_text_encoder(&tmp);
+        gen_core_testkit::write_encoder_contract_tokenizer_fixture(&tmp, ENCODER_CONTRACT).unwrap();
 
         let spec = LoadSpec::new(WeightsSource::Dir(tmp.clone()));
         let g = load(&spec).expect("a 2512-shaped snapshot dir must load like the base");
         assert_eq!(g.descriptor().id, MODEL_ID);
 
-        let pipe = Pipeline::load(&tmp, &Device::Cpu, None);
+        let pipe = Pipeline::load(
+            &tmp,
+            WeightsSource::Dir(tmp.join("text_encoder")),
+            &Device::Cpu,
+            None,
+        );
         assert!(
             pipe.root.join("tokenizer/tokenizer.json").is_file(),
             "loader must resolve the overlaid tokenizer.json under tokenizer/"

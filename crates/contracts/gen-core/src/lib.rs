@@ -17,6 +17,7 @@ pub mod audio_transform;
 pub mod block_window;
 pub mod caption;
 pub mod control;
+pub mod encoder_contract;
 pub mod error;
 pub mod face;
 pub mod generator;
@@ -41,6 +42,7 @@ pub mod tokenizer;
 pub mod train;
 pub mod transcribe;
 pub mod transform;
+pub mod vision_encoder_contract;
 pub mod voice_embed;
 pub mod weightsmeta;
 
@@ -60,6 +62,13 @@ pub use caption::{
 pub use control::{
     reject_unknown_components, require_base_dir, require_base_snapshot, require_component,
     require_component_file, require_control, AcceptedControlKinds, ControlBranch,
+};
+pub use encoder_contract::{
+    read_text_encoder_source_unchanged, text_encoder_packed_quant_bits, text_encoder_source_bytes,
+    EncoderConfigBool, EncoderConfigFloat, EncoderContract, EncoderPackingContract,
+    EncoderPromptExecutionContract, EncoderPromptLengthPolicy, EncoderPromptPadding,
+    EncoderPromptTemplate, EncoderRequiredToken, EncoderTokenizerBinding, EncoderTokenizerContract,
+    EncoderTokenizerDisposition, ValidatedEncoderSource, ValidatedTokenizerSource,
 };
 pub use error::{Error, Result};
 pub use face::{DetectedFace, FaceEmbedder, FaceEmbedderDescriptor};
@@ -112,11 +121,11 @@ pub use memory_strategy::{
 };
 pub use registry::{
     ActivationMemoryRegistration, AudioEmbedderRegistration, AudioTransformRegistration,
-    CaptionerRegistration, ImageEmbedderRegistration, ImportedModelOperation,
-    ImportedModelRegistration, ImportedModelSource, MemoryBehaviorBeginRequest,
-    MemoryBehaviorFixture, MemoryBehaviorRegistration, MemoryContractFixtureRegistration,
-    MemoryRegistration, ModelRegistration, PerComponentBytes, ProviderRegistry,
-    ProviderRegistryBuilder, TextEmbedderRegistration, TrainerRegistration,
+    CaptionerRegistration, EncoderContractRouteRegistration, ImageEmbedderRegistration,
+    ImportedModelOperation, ImportedModelRegistration, ImportedModelSource,
+    MemoryBehaviorBeginRequest, MemoryBehaviorFixture, MemoryBehaviorRegistration,
+    MemoryContractFixtureRegistration, MemoryRegistration, ModelRegistration, PerComponentBytes,
+    ProviderRegistry, ProviderRegistryBuilder, TextEmbedderRegistration, TrainerRegistration,
     TranscriberRegistration, TransformRegistration, VoiceEmbedderRegistration,
 };
 pub use residency::{Residency, ResidencyRuntime, StagedHeavy};
@@ -125,10 +134,12 @@ pub use runtime::{
     LoadPhase, LoadShape, LoadSpec, MoeExpert, OffloadPolicy, PidWeights, PinnedWeightsFile,
     Precision, PreparedFilePins, PreviewFrame, PreviewSink, Progress, Quant, WeightsSource,
     BASE_SNAPSHOT_COMPONENT, COMFYUI_TEXT_ENCODER_COMPONENT, COMFYUI_VAE_COMPONENT,
+    KREA_CONVROT_DIT_COMPONENT,
 };
 pub use text_embed::{TextEmbedder, TextEmbedderDescriptor};
 pub use tier_integrity::{control_branch_tier, is_above_selected_tier};
 pub use tiling::{TilingConfig, VaeTiling};
+pub use vision_encoder_contract::{VisionEncoderArchitecture, VisionEncoderContract};
 pub use voice_embed::{VoiceEmbedder, VoiceEmbedderDescriptor, VoiceEmbedding};
 pub use weightsmeta::{
     safetensors_dir_bytes, safetensors_path_bytes, safetensors_path_tensor_headers,

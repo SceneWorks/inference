@@ -28,7 +28,7 @@ use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::tokenizer::TextTokenizer;
 use candle_gen::gen_core::{
-    AdapterSpec, GenerationMemory, Image, OffloadPolicy, PreviewSink, Progress,
+    AdapterSpec, GenerationMemory, Image, OffloadPolicy, PreviewSink, Progress, WeightsSource,
 };
 use candle_gen::{CandleError, Result};
 
@@ -37,7 +37,10 @@ use crate::image_processor::{ImageInput, QwenImageProcessor};
 use crate::pipeline;
 use crate::transformer::QwenTransformer;
 use crate::vae::{QwenVae, QwenVaeEncoder};
-use crate::vision_language::{load_vision_language_encoder, QwenVisionLanguageEncoder};
+use crate::vision_language::{
+    load_vision_language_encoder_with_text_encoder, validate_builtin_vision_encoder_source,
+    QwenVisionLanguageEncoder,
+};
 use crate::vl_tokenizer::{
     condition_resize_dims, encode_reference_latents, preprocess_edit_image, tokenize_edit_text,
 };
@@ -56,6 +59,10 @@ pub struct QwenEditPaths {
     /// The `Qwen/Qwen-Image-Edit` diffusers snapshot dir (`text_encoder/` [LM + vision], `transformer/`,
     /// `vae/`, `tokenizer/`). The validated reference is `-2511`.
     pub root: PathBuf,
+    /// Optional decoder-LM substitution. The provider validates the complete Qwen2.5-VL text
+    /// contract at construction; the image-conditioning `visual.*` tower remains sourced from
+    /// `root/text_encoder` because it is outside the decoder contract.
+    pub text_encoder: Option<WeightsSource>,
     /// LoRA/LoKr adapters folded into the MMDiT at load (sc-6220) — e.g. the Qwen-Image-Edit-2511
     /// Lightning distill, stacked ahead of any user adapters. **Empty** = the production (non-distilled)
     /// edit path: the transformer loads via the mmap fast path, byte-identical to before.
@@ -294,6 +301,7 @@ fn read_zero_cond_t(root: &Path) -> Result<bool> {
 /// source (`merges.txt`/`vocab.json`). The two locations are byte-identical (same SHA256), so prefer
 /// `tokenizer/`, then fall back to `processor/`, so a whole-repo -2511 download loads without a
 /// hand-staged tokenizer.json.
+#[cfg(test)]
 fn tokenizer_json_path(root: &Path) -> Result<PathBuf> {
     for rel in ["tokenizer/tokenizer.json", "processor/tokenizer.json"] {
         let p = root.join(rel);
@@ -318,6 +326,8 @@ pub struct QwenEdit {
     processor: QwenImageProcessor,
     tokenizer: TextTokenizer,
     zero_cond_t: bool,
+    /// Complete caller-prepared identity retained across request-scoped deferred loads.
+    prepared_spec: Option<candle_gen::gen_core::LoadSpec>,
 }
 
 struct EditText {
@@ -330,29 +340,50 @@ struct EditHeavy {
     vae: QwenVae,
 }
 
+fn resolve_edit_text_encoder_source(
+    root: &Path,
+    selected: Option<&WeightsSource>,
+) -> Result<candle_gen::gen_core::ValidatedEncoderSource> {
+    let selected = selected
+        .cloned()
+        .unwrap_or_else(|| WeightsSource::Dir(root.join("text_encoder")));
+    let selected = crate::ENCODER_CONTRACT.validate_source_against_base(&selected, root)?;
+    selected.load_time_quant_bits(None, "qwen_image_edit")?;
+    Ok(selected)
+}
+
 impl QwenEdit {
     /// Load the cheap tokenizer / processor / `zero_cond_t` and retain request-scoped component
     /// loaders. The first warm request caches all four components; a staged request loads the
     /// vision/VAE encoders and render bundle in separate phases.
     pub fn load(paths: &QwenEditPaths) -> Result<Self> {
-        let device = candle_gen::default_device()?;
         let root = paths.root.clone();
         let te_cfg = TextEncoderConfig::qwen_image();
+        let text_encoder_source =
+            resolve_edit_text_encoder_source(&root, paths.text_encoder.as_ref())?;
+        // Qwen Edit always consumes the built-in visual tower, including when request residency is
+        // staged. Admit its exact config + header surface before device creation, tokenizer parsing,
+        // or retention of any deferred payload loader, then carry this pin into both load closures.
+        let vision_encoder_source = validate_builtin_vision_encoder_source(&root)?;
+        let device = candle_gen::default_device()?;
 
         // Shared tokenizer policy (F-134 / sc-11190) with the edit lane's own `-2511` processor-bundle
         // path resolution — one `tokenizer_config()` home keeps edit's caption tokenization identical to
         // the txt2img lane's.
-        let tokenizer = TextTokenizer::from_file(
-            tokenizer_json_path(&root)?,
-            crate::control_common::tokenizer_config(&te_cfg),
-        )
-        .map_err(|e| CandleError::Msg(format!("qwen edit: load tokenizer: {e}")))?;
+        let tokenizer = text_encoder_source.read_tokenizer_unchanged(|path| {
+            TextTokenizer::from_file(path, crate::control_common::tokenizer_config(&te_cfg))
+                .map_err(|e| CandleError::Msg(format!("qwen edit: load tokenizer: {e}")))
+        })?;
 
         let resident_root = root.clone();
         let resident_device = device.clone();
         let resident_adapters = paths.adapters.clone();
+        let resident_text_encoder = text_encoder_source.clone();
+        let resident_vision_encoder = vision_encoder_source.clone();
         let text_root = root.clone();
         let text_device = device.clone();
+        let request_text_encoder = text_encoder_source;
+        let request_vision_encoder = vision_encoder_source;
         let heavy_root = root.clone();
         let heavy_device = device.clone();
         let heavy_adapters = paths.adapters.clone();
@@ -362,7 +393,11 @@ impl QwenEdit {
             move |_| {
                 Ok((
                     EditText {
-                        vl_encoder: load_vision_language_encoder(&resident_root, &resident_device)?,
+                        vl_encoder: load_vision_language_encoder_with_text_encoder(
+                            &resident_text_encoder,
+                            &resident_vision_encoder,
+                            &resident_device,
+                        )?,
                         vae_encoder: QwenVaeEncoder::new(component_vb(
                             &resident_root,
                             "vae",
@@ -390,7 +425,11 @@ impl QwenEdit {
             },
             move |_| {
                 Ok(EditText {
-                    vl_encoder: load_vision_language_encoder(&text_root, &text_device)?,
+                    vl_encoder: load_vision_language_encoder_with_text_encoder(
+                        &request_text_encoder,
+                        &request_vision_encoder,
+                        &text_device,
+                    )?,
                     vae_encoder: QwenVaeEncoder::new(component_vb(
                         &text_root,
                         "vae",
@@ -422,7 +461,40 @@ impl QwenEdit {
             stream_cancel,
             processor: QwenImageProcessor::default(),
             tokenizer,
+            prepared_spec: None,
         })
+    }
+
+    /// Load through the exact prepared decoder-LM receipt retained by the caller.
+    pub fn load_with_spec(
+        paths: &QwenEditPaths,
+        spec: &candle_gen::gen_core::LoadSpec,
+    ) -> Result<Self> {
+        match &spec.weights {
+            WeightsSource::Dir(admitted_root) if admitted_root == &paths.root => {}
+            WeightsSource::Dir(admitted_root) => {
+                return Err(CandleError::Msg(format!(
+                    "qwen edit: runtime base {} differs from admitted base {}",
+                    paths.root.display(),
+                    admitted_root.display()
+                )));
+            }
+            WeightsSource::File(_) => {
+                return Err(CandleError::Msg(
+                    "qwen edit: admitted base must be the runtime snapshot directory".to_owned(),
+                ));
+            }
+        }
+        let mut model = spec.read_prepared_files_unchanged(|| {
+            Self::load(&QwenEditPaths {
+                root: paths.root.clone(),
+                text_encoder: spec.text_encoder.clone(),
+                adapters: spec.adapters.clone(),
+                offload_policy: paths.offload_policy,
+            })
+        })?;
+        model.prepared_spec = Some(spec.clone());
+        Ok(model)
     }
 
     /// VL-encode one prompt against the precomputed `vision` embeds → `[1, S−64, 3584]` at the DiT
@@ -648,39 +720,55 @@ impl QwenEdit {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
         let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
-        *candle_gen::lock_recover(&self.stream_cancel) = req.cancel.clone();
-        let memory = req.memory.unwrap_or_default();
-        let stage_residency = req.stage_residency || memory.stage_residency;
-        if (memory.tile_vae_decode || memory.chunk_attention || memory.stream_transformer_blocks)
-            && !stage_residency
-        {
-            return Err(CandleError::Msg(
-                "qwen edit: bounded decode, attention, and transformer residency require request-scoped staged residency"
-                    .into(),
-            ));
-        }
-        self.residency.run_request_scoped(
-            stage_residency,
-            memory.stream_transformer_blocks,
-            &req.cancel,
-            false,
-            on_progress,
-            |text| self.encode_conditioning(&text.vl_encoder, &text.vae_encoder, req, references),
-            |_| Ok(self.device.synchronize()?),
-            |heavy, (pos, neg, static_latents, cond_grids), on_progress| {
-                let result = self.denoise_and_decode(
-                    &heavy.transformer,
-                    &heavy.vae,
-                    req,
-                    &pos,
-                    neg.as_ref(),
-                    &static_latents,
-                    &cond_grids,
-                    on_progress,
-                );
-                candle_gen::synchronize_result(&self.device, result)
-            },
-        )
+        read_with_prepared_spec(self.prepared_spec.as_ref(), || {
+            *candle_gen::lock_recover(&self.stream_cancel) = req.cancel.clone();
+            let memory = req.memory.unwrap_or_default();
+            let stage_residency = req.stage_residency || memory.stage_residency;
+            if (memory.tile_vae_decode
+                || memory.chunk_attention
+                || memory.stream_transformer_blocks)
+                && !stage_residency
+            {
+                return Err(CandleError::Msg(
+                    "qwen edit: bounded decode, attention, and transformer residency require request-scoped staged residency"
+                        .into(),
+                ));
+            }
+            self.residency.run_request_scoped(
+                stage_residency,
+                memory.stream_transformer_blocks,
+                &req.cancel,
+                false,
+                on_progress,
+                |text| {
+                    self.encode_conditioning(&text.vl_encoder, &text.vae_encoder, req, references)
+                },
+                |_| Ok(self.device.synchronize()?),
+                |heavy, (pos, neg, static_latents, cond_grids), on_progress| {
+                    let result = self.denoise_and_decode(
+                        &heavy.transformer,
+                        &heavy.vae,
+                        req,
+                        &pos,
+                        neg.as_ref(),
+                        &static_latents,
+                        &cond_grids,
+                        on_progress,
+                    );
+                    candle_gen::synchronize_result(&self.device, result)
+                },
+            )
+        })
+    }
+}
+
+fn read_with_prepared_spec<T>(
+    spec: Option<&candle_gen::gen_core::LoadSpec>,
+    read: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    match spec {
+        Some(spec) => spec.read_prepared_files_unchanged(read),
+        None => read(),
     }
 }
 
@@ -697,12 +785,143 @@ fn image_input(im: &Image) -> ImageInput<'_> {
 mod tests {
     use super::*;
 
+    fn edit_paths(root: &Path, offload_policy: OffloadPolicy) -> QwenEditPaths {
+        QwenEditPaths {
+            root: root.to_path_buf(),
+            text_encoder: None,
+            adapters: Vec::new(),
+            offload_policy,
+        }
+    }
+
+    fn edit_load_error(root: &Path, offload_policy: OffloadPolicy) -> String {
+        match QwenEdit::load(&edit_paths(root, offload_policy)) {
+            Ok(_) => panic!("invalid built-in vision source reached deferred residency"),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    fn rename_safetensors_header_key(path: &Path, from: &str, to: &str) {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        assert_eq!(from.len(), to.len());
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let mut encoded_len = [0_u8; 8];
+        file.read_exact(&mut encoded_len).unwrap();
+        let mut header = vec![0_u8; u64::from_le_bytes(encoded_len) as usize];
+        file.read_exact(&mut header).unwrap();
+        let matches = header
+            .windows(from.len())
+            .enumerate()
+            .filter_map(|(offset, bytes)| (bytes == from.as_bytes()).then_some(offset))
+            .collect::<Vec<_>>();
+        assert_eq!(matches.len(), 1, "fixture must contain one {from} header");
+        let start = matches[0];
+        header[start..start + to.len()].copy_from_slice(to.as_bytes());
+        file.seek(SeekFrom::Start(8)).unwrap();
+        file.write_all(&header).unwrap();
+    }
+
     #[test]
     fn request_defaults() {
         let r = QwenEditRequest::default();
         assert_eq!((r.width, r.height), (1024, 1024));
         assert_eq!(r.steps, 30);
         assert!(!r.cancel.is_cancelled());
+    }
+
+    #[test]
+    fn selected_decoder_contract_is_validated_separately_from_the_builtin_vision_tower() {
+        let fixture = tempfile::tempdir().unwrap();
+        gen_core_testkit::write_encoder_contract_tokenizer_fixture(
+            fixture.path(),
+            crate::ENCODER_CONTRACT,
+        )
+        .unwrap();
+        let selected = fixture.path().join("selected-decoder");
+        gen_core_testkit::write_encoder_contract_fixture(&selected, crate::ENCODER_CONTRACT)
+            .unwrap();
+        resolve_edit_text_encoder_source(fixture.path(), Some(&WeightsSource::Dir(selected)))
+            .expect("exact selected decoder contract");
+
+        let wrong = fixture.path().join("wrong-kv-heads");
+        gen_core_testkit::write_encoder_contract_fixture(&wrong, crate::ENCODER_CONTRACT).unwrap();
+        let config_path = wrong.join("config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        config["num_key_value_heads"] =
+            serde_json::json!(crate::ENCODER_CONTRACT.num_key_value_heads + 1);
+        std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let error =
+            resolve_edit_text_encoder_source(fixture.path(), Some(&WeightsSource::Dir(wrong)))
+                .expect_err("wrong GQA shape must reject")
+                .to_string();
+        assert!(error.contains("num_key_value_heads"), "unexpected: {error}");
+    }
+
+    #[test]
+    fn public_load_admits_builtin_vision_before_retaining_deferred_loaders() {
+        let valid = tempfile::tempdir().unwrap();
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
+            &valid.path().join("text_encoder"),
+            crate::ENCODER_CONTRACT,
+            crate::VISION_ENCODER_CONTRACT,
+        )
+        .unwrap();
+        QwenEdit::load(&edit_paths(valid.path(), OffloadPolicy::Sequential))
+            .expect("validation-complete sparse metadata must reach deferred residency");
+
+        let missing = tempfile::tempdir().unwrap();
+        gen_core_testkit::write_encoder_contract_fixture(
+            &missing.path().join("text_encoder"),
+            crate::ENCODER_CONTRACT,
+        )
+        .unwrap();
+
+        let wrong_config = tempfile::tempdir().unwrap();
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
+            &wrong_config.path().join("text_encoder"),
+            crate::ENCODER_CONTRACT,
+            crate::VISION_ENCODER_CONTRACT,
+        )
+        .unwrap();
+        let config_path = wrong_config.path().join("text_encoder/config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        config["vision_config"]["depth"] =
+            serde_json::json!(crate::VISION_ENCODER_CONTRACT.num_hidden_layers + 1);
+        std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+
+        let wrong_header = tempfile::tempdir().unwrap();
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
+            &wrong_header.path().join("text_encoder"),
+            crate::ENCODER_CONTRACT,
+            crate::VISION_ENCODER_CONTRACT,
+        )
+        .unwrap();
+        rename_safetensors_header_key(
+            &wrong_header.path().join("text_encoder/model.safetensors"),
+            "visual.patch_embed.proj.weight",
+            "visual.patch_embed.proj.weighx",
+        );
+
+        for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
+            let error = edit_load_error(missing.path(), policy);
+            assert!(error.contains("vision_config"), "unexpected: {error}");
+
+            let error = edit_load_error(wrong_config.path(), policy);
+            assert!(error.contains("depth"), "unexpected: {error}");
+
+            let error = edit_load_error(wrong_header.path(), policy);
+            assert!(
+                error.contains("visual.patch_embed.proj.weight") && error.contains("missing"),
+                "unexpected: {error}"
+            );
+        }
     }
 
     fn zero_cond_t_tmp(tmp: &tempfile::TempDir, name: &str) -> PathBuf {
@@ -869,6 +1088,7 @@ mod tests {
         let load_phase = probe.phase();
         let model = QwenEdit::load(&QwenEditPaths {
             root,
+            text_encoder: None,
             adapters,
             offload_policy: OffloadPolicy::Resident,
         })

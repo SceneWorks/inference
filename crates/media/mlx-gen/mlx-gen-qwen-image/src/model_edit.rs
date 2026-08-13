@@ -54,6 +54,7 @@ pub const MODEL_ID: &str = "qwen_image_edit";
 /// VAE-encoded and folded into the transformer's dual-latent sequence (sc-2529).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: Some(crate::ENCODER_CONTRACT),
         denoiser_output_latent_space: Some(&mlx_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
@@ -182,12 +183,14 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
             mlx_gen::residency::warn_sequential_requantize(MODEL_ID, q.bits());
         }
     }
-    let tokenizer = loader::load_tokenizer(root)?;
+    let text_encoder_source = crate::ENCODER_CONTRACT.source_for_load(spec, root)?;
+    text_encoder_source.load_time_quant_bits(None, MODEL_ID)?;
+    let tokenizer = loader::load_validated_tokenizer(&text_encoder_source)?;
     Ok(Box::new(QwenImageEdit {
         descriptor: descriptor(),
         tokenizer,
         processor: QwenImageProcessor::default(),
-        residency: build_residency(spec)?,
+        residency: build_residency_with_source(spec, text_encoder_source)?,
         memory_strategy: crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec)?,
         precision: spec.precision,
         quant: spec.quantize,
@@ -203,14 +206,29 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 /// byte-identical to the pre-seam one. The deferral is weight-free-testable: under `Sequential` this
 /// touches no component weights, so a dispatch that ignored `offload_policy` would eager-load and fail
 /// the "Sequential defers" unit test.
+#[cfg(test)]
 fn build_residency(
     spec: &LoadSpec,
 ) -> Result<Residency<QwenVisionLanguageEncoder, QwenEditHeavyOwned>> {
-    let spec_text = spec.clone();
+    let root = resolve_root(spec)?;
+    let text_encoder_source = crate::ENCODER_CONTRACT.source_for_load(spec, root)?;
+    text_encoder_source.load_time_quant_bits(None, MODEL_ID)?;
+    build_residency_with_source(spec, text_encoder_source)
+}
+
+fn build_residency_with_source(
+    spec: &LoadSpec,
+    text_encoder_source: mlx_gen::gen_core::ValidatedEncoderSource,
+) -> Result<Residency<QwenVisionLanguageEncoder, QwenEditHeavyOwned>> {
+    let root = resolve_root(spec)?;
+    let vision_encoder_source = crate::ENCODER_CONTRACT
+        .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)?;
+    vision_encoder_source
+        .validate_vision(&crate::VISION_ENCODER_CONTRACT, &crate::ENCODER_CONTRACT)?;
     let spec_heavy = spec.clone();
     Residency::from_policy(
         spec.offload_policy,
-        move || load_vl_encoder_only(resolve_root(&spec_text)?),
+        move || load_vl_encoder_only(&text_encoder_source, &vision_encoder_source),
         move |use_pid| load_heavy(&spec_heavy, resolve_root(&spec_heavy)?, use_pid),
     )
 }
@@ -239,8 +257,15 @@ fn resolve_root(spec: &LoadSpec) -> Result<&Path> {
 /// from the shared `text_encoder/` shard set (F-080). Never quantized (the fork marks the
 /// `text_encoder` component `skip_quantization=True`), so the `Resident` and `Sequential` paths build
 /// byte-identical encoders.
-fn load_vl_encoder_only(root: &Path) -> Result<QwenVisionLanguageEncoder> {
-    loader::load_vision_language_encoder(root)
+fn load_vl_encoder_only(
+    language_source: &mlx_gen::gen_core::ValidatedEncoderSource,
+    vision_source: &mlx_gen::gen_core::ValidatedEncoderSource,
+) -> Result<QwenVisionLanguageEncoder> {
+    language_source.read_unchanged(|language| {
+        vision_source.read_unchanged(|vision| {
+            loader::load_vision_language_encoder_from_sources(language, vision)
+        })
+    })
 }
 
 /// Load the heavy render-phase components — the edit MMDiT transformer (+ Q4/Q8 + LoRA/LoKr
@@ -612,7 +637,7 @@ fn validate_reference_images(req: &GenerationRequest) -> Result<()> {
 // shared `validate_request`, so it is not the plain delegation `impl_generator!` expresses.
 mlx_gen::register_generators! {
     pub(crate) const REGISTRATION = descriptor => load;
-    footprint = crate::model::component_footprint
+    footprint = crate::model::edit_component_footprint
 }
 
 pub const MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
@@ -780,16 +805,21 @@ mod tests {
     // A dispatch that ignored `offload_policy` (always `Resident`) would eager-load under a `Sequential`
     // request and fail the first assertion. The A/B real-weight test is `#[ignore]`d; this runs by
     // default.
-    fn missing_snapshot_spec(policy: OffloadPolicy) -> LoadSpec {
-        LoadSpec::new(WeightsSource::Dir(
-            "/nonexistent/qwen-image-edit-residency-test-snapshot".into(),
-        ))
-        .with_offload_policy(policy)
+    fn validation_complete_snapshot_spec(root: &Path, policy: OffloadPolicy) -> LoadSpec {
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            crate::ENCODER_CONTRACT,
+            crate::VISION_ENCODER_CONTRACT,
+        )
+        .expect("validation-complete text encoder fixture");
+        LoadSpec::new(WeightsSource::Dir(root.to_path_buf())).with_offload_policy(policy)
     }
 
     #[test]
     fn build_residency_sequential_defers_all_component_loads() {
-        let res = build_residency(&missing_snapshot_spec(OffloadPolicy::Sequential))
+        let fixture = tempfile::tempdir().expect("snapshot fixture");
+        let spec = validation_complete_snapshot_spec(fixture.path(), OffloadPolicy::Sequential);
+        let res = build_residency(&spec)
             .expect("Sequential must defer loads and not touch the (missing) snapshot dir");
         assert!(
             res.is_sequential(),
@@ -799,7 +829,9 @@ mod tests {
 
     #[test]
     fn build_residency_resident_eager_loads_and_fails_on_missing_snapshot() {
-        let err = build_residency(&missing_snapshot_spec(OffloadPolicy::Resident))
+        let fixture = tempfile::tempdir().expect("snapshot fixture");
+        let spec = validation_complete_snapshot_spec(fixture.path(), OffloadPolicy::Resident);
+        let err = build_residency(&spec)
             .err()
             .expect("Resident must eager-load and fail on a missing snapshot dir");
         let msg = err.to_string();

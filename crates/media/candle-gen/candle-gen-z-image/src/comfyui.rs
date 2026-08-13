@@ -51,7 +51,7 @@ pub(crate) struct ComfyuiSources {
 impl ComfyuiSources {
     pub(crate) fn separate(
         transformer_file: candle_gen::gen_core::PinnedWeightsFile,
-        text_encoder_file: candle_gen::gen_core::PinnedWeightsFile,
+        text_encoder_file: Option<candle_gen::gen_core::PinnedWeightsFile>,
         vae_file: candle_gen::gen_core::PinnedWeightsFile,
         tokenizer_dir: PathBuf,
     ) -> candle_gen::gen_core::Result<Self> {
@@ -77,13 +77,16 @@ impl ComfyuiSources {
 
     pub(crate) fn ensure_unchanged(&self) -> Result<()> {
         match &self.weights {
-            ComfyuiWeights::Separate(files) => [
-                &files.transformer_file,
-                &files.text_encoder_file,
-                &files.vae_file,
-            ]
-            .into_iter()
-            .try_for_each(|pin| pin.ensure_unchanged().map_err(Into::into)),
+            ComfyuiWeights::Separate(files) => {
+                files
+                    .transformer_file
+                    .ensure_unchanged()
+                    .map_err(CandleError::from)?;
+                if let Some(text_encoder) = &files.text_encoder_file {
+                    text_encoder.ensure_unchanged().map_err(CandleError::from)?;
+                }
+                files.vae_file.ensure_unchanged().map_err(CandleError::from)
+            }
             ComfyuiWeights::Combined(file) => file.ensure_unchanged().map_err(Into::into),
         }
     }
@@ -105,6 +108,13 @@ impl ComfyuiSources {
         match &self.weights {
             ComfyuiWeights::Separate(files) => files
                 .text_encoder_file
+                .as_ref()
+                .ok_or_else(|| {
+                    CandleError::Msg(
+                        "ComfyUI Z-Image text encoder is supplied by the validated external source"
+                            .into(),
+                    )
+                })?
                 .read_unchanged(|path| Ok(safetensors::load(path, &Device::Cpu)?)),
             ComfyuiWeights::Combined(file) => file.read_unchanged(|path| {
                 Ok(split_combined_checkpoint(safetensors::load(path, &Device::Cpu)?)?.text_encoder)
@@ -134,7 +144,7 @@ pub(crate) enum ComfyuiWeights {
 #[derive(Clone, Debug)]
 pub(crate) struct SeparateComfyuiWeights {
     transformer_file: candle_gen::gen_core::PinnedWeightsFile,
-    text_encoder_file: candle_gen::gen_core::PinnedWeightsFile,
+    text_encoder_file: Option<candle_gen::gen_core::PinnedWeightsFile>,
     vae_file: candle_gen::gen_core::PinnedWeightsFile,
 }
 
@@ -151,6 +161,13 @@ pub(crate) enum CombinedComponent {
     Vae,
 }
 
+pub(crate) const COMBINED_TEXT_ENCODER_PREFIXES: &[&str] = &[
+    "conditioner.embedders.0.transformer.",
+    "text_encoders.qwen3_4b.transformer.",
+    "text_encoders.qwen_3_4b.transformer.",
+    "text_encoder.",
+];
+
 /// Classify one fused-checkpoint key through the exact prefix inventory used by the real loader.
 /// Memory phase facts call this same seam, so accounting cannot assign a tensor to a different phase
 /// than [`split_combined_checkpoint`] later loads it into.
@@ -160,10 +177,9 @@ pub(crate) fn combined_component_key(key: &str) -> Option<(CombinedComponent, &s
         .or_else(|| key.strip_prefix("transformer."))
     {
         Some((CombinedComponent::Transformer, rest))
-    } else if let Some(rest) = key
-        .strip_prefix("conditioner.embedders.0.transformer.")
-        .or_else(|| key.strip_prefix("text_encoders.qwen3_4b.transformer."))
-        .or_else(|| key.strip_prefix("text_encoder."))
+    } else if let Some(rest) = COMBINED_TEXT_ENCODER_PREFIXES
+        .iter()
+        .find_map(|prefix| key.strip_prefix(prefix))
     {
         Some((CombinedComponent::TextEncoder, rest))
     } else {

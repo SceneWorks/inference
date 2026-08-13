@@ -367,6 +367,7 @@ mod tests {
     fn stub(accepted: AcceptedControlKinds) -> Stub {
         Stub {
             descriptor: ModelDescriptor {
+                encoder_contract: None,
                 denoiser_output_latent_space: None,
                 control_kinds: None,
                 required_components: &[],

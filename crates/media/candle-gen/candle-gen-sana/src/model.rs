@@ -138,6 +138,7 @@ impl SanaGenerator {
 /// LoRA, or quantization is wired on the candle base path. Backend `"candle"`, `mac_only = false`.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
         denoiser_output_latent_space: Some(&candle_gen::gen_core::SANA_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
@@ -201,6 +202,7 @@ pub fn descriptor() -> ModelDescriptor {
 /// the `"default"` engine sentinel.
 pub fn sprint_descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
         denoiser_output_latent_space: Some(&candle_gen::gen_core::SANA_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],

@@ -118,12 +118,138 @@ use candle_gen::gen_core::OffloadPolicy;
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
     GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Progress, Quant,
-    SizeFloor, WeightsSource, BASE_SNAPSHOT_COMPONENT,
+    SizeFloor, WeightsSource, BASE_SNAPSHOT_COMPONENT, KREA_CONVROT_DIT_COMPONENT,
 };
 
 /// Registry id for the Krea 2 Turbo text-to-image variant. Matches the SceneWorks worker's
 /// `payload.model` and the manifest `engine_id` (sc-7572).
 pub const KREA_2_TURBO_ID: &str = "krea_2_turbo";
+
+/// Qwen3-VL-4B conditioning architecture shared by every Krea 2 route.
+pub const TOKENIZER_CONTRACT: gen_core::EncoderTokenizerContract =
+    gen_core::EncoderTokenizerContract {
+        family: "qwen3_vl",
+        binding: gen_core::EncoderTokenizerBinding::RetainBase,
+        artifact_candidates: &["tokenizer/tokenizer.json"],
+        required_tokens: &[
+            gen_core::EncoderRequiredToken {
+                role: "qwen_endoftext",
+                literal: "<|endoftext|>",
+                id: 151_643,
+                config_field: Some("bos_token_id"),
+            },
+            gen_core::EncoderRequiredToken {
+                role: "qwen_im_start",
+                literal: "<|im_start|>",
+                id: 151_644,
+                config_field: None,
+            },
+            gen_core::EncoderRequiredToken {
+                role: "qwen_im_end",
+                literal: "<|im_end|>",
+                id: 151_645,
+                config_field: Some("eos_token_id"),
+            },
+            gen_core::EncoderRequiredToken {
+                role: "qwen_vision_start",
+                literal: "<|vision_start|>",
+                id: 151_652,
+                config_field: Some("vision_start_token_id"),
+            },
+            gen_core::EncoderRequiredToken {
+                role: "qwen_vision_end",
+                literal: "<|vision_end|>",
+                id: 151_653,
+                config_field: Some("vision_end_token_id"),
+            },
+            gen_core::EncoderRequiredToken {
+                role: "qwen_image_pad",
+                literal: "<|image_pad|>",
+                id: 151_655,
+                config_field: Some("image_token_id"),
+            },
+        ],
+    };
+
+pub const PROMPT_EXECUTIONS: &[gen_core::EncoderPromptExecutionContract] = &[
+    gen_core::EncoderPromptExecutionContract {
+        purpose: "krea_t2i",
+        template: gen_core::EncoderPromptTemplate::KreaQwen3Vl,
+        add_special_tokens: false,
+        length: gen_core::EncoderPromptLengthPolicy::RejectAbove { max_tokens: 1024 },
+        padding: gen_core::EncoderPromptPadding::None,
+        prefix_trim: 34,
+    },
+    gen_core::EncoderPromptExecutionContract {
+        purpose: "krea_edit",
+        template: gen_core::EncoderPromptTemplate::KreaQwen3VlEdit,
+        add_special_tokens: false,
+        length: gen_core::EncoderPromptLengthPolicy::RejectAbove { max_tokens: 8192 },
+        padding: gen_core::EncoderPromptPadding::None,
+        prefix_trim: 34,
+    },
+];
+
+pub const ENCODER_CONTRACT: gen_core::EncoderContract = gen_core::EncoderContract {
+    architecture: "qwen3_vl_text",
+    hidden_size: 2560,
+    intermediate_size: 9728,
+    num_hidden_layers: 36,
+    num_attention_heads: 32,
+    num_key_value_heads: 8,
+    head_dim: 128,
+    vocab_size: 151_936,
+    output_width: 2560,
+    loaded_hidden_layers: 35,
+    requires_final_norm: false,
+    requires_lm_head: false,
+    hidden_activation: "silu",
+    attention_dropout: gen_core::EncoderConfigFloat::new(0.0),
+    rms_norm_eps: gen_core::EncoderConfigFloat::new(1e-6),
+    qk_norm_eps: Some(gen_core::EncoderConfigFloat::new(1e-6)),
+    rope_theta: gen_core::EncoderConfigFloat::new(5_000_000.0),
+    max_position_embeddings: 262_144,
+    attention_bias: gen_core::EncoderConfigBool::Required(false),
+    tie_word_embeddings: gen_core::EncoderConfigBool::Required(true),
+    tokenizer: TOKENIZER_CONTRACT,
+    prompt_executions: PROMPT_EXECUTIONS,
+    bos_token_id: Some(151_643),
+    eos_token_id: Some(151_645),
+    image_token_id: Some(151_655),
+    vision_start_token_id: Some(151_652),
+    vision_end_token_id: Some(151_653),
+    mrope_section: &[24, 20, 20],
+    mrope_interleaved: Some(true),
+    selected_hidden_layers: &[2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35],
+    packing: Some(gen_core::EncoderPackingContract {
+        group_size: 64,
+        pack_embedding: false,
+        pack_lm_head: false,
+        supports_file: false,
+    }),
+    dense_storage_dtype_probe: Some("language_model.layers.0.input_layernorm.weight"),
+};
+
+pub const VISION_ENCODER_CONTRACT: gen_core::VisionEncoderContract =
+    gen_core::VisionEncoderContract {
+        architecture: gen_core::VisionEncoderArchitecture::Qwen3Vl,
+        hidden_size: 1024,
+        intermediate_size: 4096,
+        num_hidden_layers: 24,
+        num_attention_heads: 16,
+        output_width: 2560,
+        hidden_activation: "gelu_pytorch_tanh",
+        rope_theta: gen_core::EncoderConfigFloat::new(10_000.0),
+        normalization_eps: gen_core::EncoderConfigFloat::new(1e-6),
+        patch_size: 16,
+        temporal_patch_size: 2,
+        spatial_merge_size: 2,
+        in_channels: 3,
+        num_position_embeddings: Some(2304),
+        deepstack_visual_indexes: &[5, 11, 17],
+        window_size: None,
+        full_attention_block_indexes: &[],
+    };
 
 /// Registry id for the undistilled **Raw** full-CFG text-to-image variant (sc-9994 / epic 9992). The
 /// SAME string as the Krea LoRA *trainer* base (`crate::training::KREA_2_RAW_ID`) — Path 1 makes one id
@@ -231,6 +357,8 @@ pub struct KreaGenerator {
     /// **job-local** base DiT from `transformer/` regardless of residency mode (the shared resident DiT
     /// is never mutated for per-phase adapter toggling — the concurrency-safety invariant).
     root: PathBuf,
+    /// Exact text-encoder source validated at construction, retained for request-staged reloads.
+    text_encoder_source: gen_core::ValidatedEncoderSource,
     /// Imported native DiT source, when `LoadSpec::weights` was a single file. Pinned once at
     /// generator construction and retained across resident, sequential, streamed, and multi-phase
     /// materialization so no later request can silently adopt a replacement at the same path.
@@ -646,6 +774,7 @@ impl Generator for KreaGenerator {
                     || {
                         pipeline::render_three_stage_with_native(
                             &self.root,
+                            &self.text_encoder_source,
                             self.native_dit.as_ref(),
                             &self.device,
                             &self.adapters,
@@ -858,6 +987,7 @@ impl Generator for KreaGenerator {
 /// `Conditioning::Reference` — but no control conditioning on the Turbo checkpoint.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: Some(ENCODER_CONTRACT),
         denoiser_output_latent_space: Some(&candle_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
@@ -1122,17 +1252,14 @@ fn ensure_multiphase_allowed_for(
 }
 
 /// sc-9300 ConvRot selection: decode whether a [`LoadSpec`] selects the community INT8-ConvRot DiT
-/// consume path, returning the DiT single-file checkpoint when it does. ConvRot rides the shared,
-/// already-optional [`LoadSpec::text_encoder`] field as a [`WeightsSource::File`]; a [`WeightsSource::Dir`]
-/// there is a mis-shaped spec (ConvRot is a single file) and errors. `None` on `text_encoder` ⇒ the
-/// dense/packed snapshot path. Extracted from [`build`] so the routing decision is unit-testable on CPU
-/// without loading weights.
+/// consume path, returning the DiT single-file checkpoint when it does. ConvRot has its own named
+/// component so [`LoadSpec::text_encoder`] means the text encoder uniformly across every provider.
 fn convrot_selector(spec: &LoadSpec, id: &str) -> gen_core::Result<Option<PathBuf>> {
-    match spec.text_encoder.as_ref() {
+    match spec.components.get(KREA_CONVROT_DIT_COMPONENT) {
         Some(WeightsSource::File(p)) => Ok(Some(p.clone())),
         Some(WeightsSource::Dir(_)) => Err(gen_core::Error::Msg(format!(
-            "candle {id}: LoadSpec::text_encoder selects the INT8-ConvRot DiT and must be a single \
-             .safetensors file (WeightsSource::File), not a directory"
+            "candle {id}: component {KREA_CONVROT_DIT_COMPONENT} must be a single .safetensors file \
+             (WeightsSource::File), not a directory"
         ))),
         None => Ok(None),
     }
@@ -1144,16 +1271,13 @@ fn resolved_base_and_native(
 ) -> gen_core::Result<(PathBuf, Option<gen_core::PinnedWeightsFile>)> {
     match &spec.weights {
         WeightsSource::Dir(path) => Ok((path.clone(), None)),
-        WeightsSource::File(_) => {
-            gen_core::reject_unknown_components(spec, &[BASE_SNAPSHOT_COMPONENT], id)?;
-            Ok((
-                gen_core::require_base_snapshot(spec, id)?.to_path_buf(),
-                Some(
-                    spec.weights_file_pin()?
-                        .expect("File weights must resolve to a pin"),
-                ),
-            ))
-        }
+        WeightsSource::File(_) => Ok((
+            gen_core::require_base_snapshot(spec, id)?.to_path_buf(),
+            Some(
+                spec.weights_file_pin()?
+                    .expect("File weights must resolve to a pin"),
+            ),
+        )),
     }
 }
 
@@ -1162,6 +1286,7 @@ type ValidatedKreaLoad = (
     Option<gen_core::PinnedWeightsFile>,
     Option<PathBuf>,
     Option<Quant>,
+    gen_core::ValidatedEncoderSource,
 );
 
 /// Static/load-source validation shared by generator construction and the registered memory
@@ -1169,6 +1294,11 @@ type ValidatedKreaLoad = (
 /// the production loader later rejects (or advertising facts for fields the loader silently ignores).
 fn validate_load_spec(spec: &LoadSpec, id: &str) -> gen_core::Result<ValidatedKreaLoad> {
     spec.validate_prepared_file_pins()?;
+    gen_core::reject_unknown_components(
+        spec,
+        &[BASE_SNAPSHOT_COMPONENT, KREA_CONVROT_DIT_COMPONENT],
+        id,
+    )?;
     let (root, native_dit) = resolved_base_and_native(spec, id)?;
     if native_dit.is_some() && spec.identity.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
@@ -1177,23 +1307,28 @@ fn validate_load_spec(spec: &LoadSpec, id: &str) -> gen_core::Result<ValidatedKr
         )));
     }
     // sc-9300 seam: select the community **INT8-ConvRot** DiT consume path when the spec carries a
-    // ConvRot DiT single-file checkpoint. It rides the shared, already-optional `LoadSpec::text_encoder`
-    // field as a `WeightsSource::File` — the canonical Krea 2 snapshot (`spec.weights`, a `Dir`) still
+    // ConvRot DiT single-file checkpoint. The canonical Krea 2 snapshot (`spec.weights`, a `Dir`) still
     // supplies the tokenizer / Qwen3-VL TE / Qwen-Image VAE / config + all non-quantized surface, and
     // only the DiT weights are taken from the int8 checkpoint (`pipeline::load_components_convrot`,
-    // which enforces the sm_89 compute-cap floor). This reuses an existing extensibility point (the same
-    // pattern LTX uses to ride an aux path on `text_encoder`) rather than growing the shared
-    // `WeightsSource` enum with a ConvRot variant — which would force a new match arm across every
-    // provider in candle-gen AND the worker plus a gen-core pin bump. Only Krea reads this; every other
-    // engine ignores `text_encoder` unchanged. `None`/`Dir` here ⇒ the dense/packed snapshot path below.
+    // which enforces the sm_89 compute-cap floor). The provider-specific component avoids overloading
+    // the shared encoder seam. `None` here selects the dense/packed snapshot path below.
     let convrot_dit = convrot_selector(spec, id)?;
     if native_dit.is_some() && convrot_dit.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
-            "candle {}: primary imported DiT and legacy text_encoder ConvRot selector are mutually exclusive",
+            "candle {}: primary imported DiT and {KREA_CONVROT_DIT_COMPONENT} are mutually exclusive",
             id
         )));
     }
     let loaded_quant = actual_quant_tier(spec, id)?;
+    let text_encoder_source = ENCODER_CONTRACT.source_for_load(spec, &root)?;
+    let builtin_text_encoder = WeightsSource::Dir(root.join("text_encoder"));
+    let expected_text_encoder_bits =
+        gen_core::text_encoder_packed_quant_bits(&builtin_text_encoder)?;
+    if let Some(bits) = text_encoder_source.load_time_quant_bits(expected_text_encoder_bits, id)? {
+        return Err(gen_core::Error::Unsupported(format!(
+            "candle {id} requires a selected text encoder already packed at Q{bits}; this provider does not repack a dense Krea encoder on the fly"
+        )));
+    }
     // LoRA/LoKr adapters are accepted and merged into the DiT at first `generate` (sc-7836); the merge
     // (`adapters::merge_into_weights`) is lazy, so a nonexistent adapter path still loads here.
     //
@@ -1217,7 +1352,13 @@ fn validate_load_spec(spec: &LoadSpec, id: &str) -> gen_core::Result<ValidatedKr
             id
         )));
     }
-    Ok((root, native_dit, convrot_dit, loaded_quant))
+    Ok((
+        root,
+        native_dit,
+        convrot_dit,
+        loaded_quant,
+        text_encoder_source,
+    ))
 }
 
 /// Physical eligibility for the registered native-File block loader.
@@ -1283,7 +1424,8 @@ fn validate_native_file_transformer_request(
 }
 
 fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<dyn Generator>> {
-    let (root, native_dit, convrot_dit, loaded_quant) = validate_load_spec(spec, descriptor.id)?;
+    let (root, native_dit, convrot_dit, loaded_quant, text_encoder_source) =
+        validate_load_spec(spec, descriptor.id)?;
     #[cfg(any(feature = "cuda", test))]
     let memory_contract = if descriptor.id == KREA_2_TURBO_ID {
         Some(validated_krea_turbo_memory_strategy_contract(spec)?)
@@ -1299,8 +1441,10 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
     let resident_native = native_dit.clone();
     let resident_file_spec = spec.clone();
     let native_quant = native_dit.as_ref().and(spec.quantize);
+    let resident_text_encoder = text_encoder_source.clone();
     let text_root = root.clone();
     let text_device = device.clone();
+    let request_text_encoder = text_encoder_source.clone();
     let heavy_root = root.clone();
     let heavy_device = device.clone();
     let heavy_adapters = spec.adapters.clone();
@@ -1331,27 +1475,34 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
             let components = resident_file_spec.read_files_unchanged(
                 resident_file_spec.file_source_paths(),
                 || match (resident_native.as_ref(), resident_convrot.as_ref()) {
-                    (Some(native_dit), None) => pipeline::load_components_native_registry(
+                    (Some(native_dit), None) => {
+                        pipeline::load_components_native_registry_with_encoder(
+                            &resident_root,
+                            &resident_text_encoder,
+                            native_dit,
+                            &resident_device,
+                            &resident_adapters,
+                            native_quant,
+                            text_quant,
+                            resident_pid.as_ref(),
+                        )
+                    }
+                    (None, Some(convrot_dit)) => pipeline::load_components_convrot_with_encoder(
                         &resident_root,
-                        native_dit,
-                        &resident_device,
-                        &resident_adapters,
-                        native_quant,
-                        text_quant,
-                        resident_pid.as_ref(),
-                    ),
-                    (None, Some(convrot_dit)) => pipeline::load_components_convrot(
-                        &resident_root,
+                        &resident_text_encoder,
                         convrot_dit,
                         &resident_device,
                     ),
-                    (None, None) => pipeline::load_components(
+                    (None, None) => pipeline::load_components_with_encoder(
                         &resident_root,
+                        &resident_text_encoder,
                         &resident_device,
                         &resident_adapters,
                         resident_pid.as_ref(),
                     ),
-                    (Some(_), Some(_)) => unreachable!("mutually exclusive source forms"),
+                    (Some(_), Some(_)) => {
+                        unreachable!("mutually exclusive source forms")
+                    }
                 },
             )?;
             Ok((
@@ -1369,11 +1520,17 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
             let text = match text_quant {
                 Some(quant) => pipeline::load_text_quantized_for_request(
                     &text_root,
+                    &request_text_encoder,
                     &text_device,
                     cancel,
                     quant,
                 )?,
-                None => pipeline::load_text_for_request(&text_root, &text_device, cancel)?,
+                None => pipeline::load_text_for_request_with_source(
+                    &text_root,
+                    &request_text_encoder,
+                    &text_device,
+                    cancel,
+                )?,
             };
             Ok(KreaTextPhase::Sequential(Box::new(text)))
         },
@@ -1434,6 +1591,7 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
         memory_contract,
         residency,
         root,
+        text_encoder_source,
         native_dit,
         // The multi-phase diff-patch guard input (sc-13887): read the adapter file keys at load. The
         // ConvRot path already rejected adapters above, so `spec.adapters` is empty there ⇒ `false`.
@@ -1450,7 +1608,7 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
 ///
 /// **INT8-ConvRot (sc-9300).** To load the community int8-quantized DiT instead of the snapshot's dense
 /// `transformer/`, pass the ConvRot DiT single-file checkpoint as
-/// `spec.text_encoder = Some(WeightsSource::File(convrot_dit.safetensors))` while keeping
+/// `spec.components[KREA_CONVROT_DIT_COMPONENT] = WeightsSource::File(convrot_dit.safetensors)` while keeping
 /// `spec.weights = WeightsSource::Dir(canonical_snapshot)` (which supplies the tokenizer / TE / VAE /
 /// config). The ConvRot path enforces the sm_89 compute-cap floor and does not combine with LoRA/LoKr
 /// or PiD overlays.
@@ -1798,6 +1956,20 @@ mod weights_free_behavior_tests {
     use super::*;
 
     #[test]
+    fn catalog_contract_fixture_is_weights_free_but_production_admission_stays_strict() {
+        let spec = LoadSpec::new(WeightsSource::Dir(
+            "Z:\\nonexistent\\krea-catalog-fixture".into(),
+        ));
+        let contract = build_krea_turbo_memory_strategy_contract(&spec);
+        assert_eq!(contract.provider_id, KREA_2_TURBO_ID);
+        assert_eq!(contract.asset_facts, gen_core::MemoryAssetFacts::default());
+        assert!(
+            validated_krea_turbo_memory_strategy_contract(&spec).is_err(),
+            "production admission must still validate Krea assets"
+        );
+    }
+
+    #[test]
     fn cpu_scope_executes_the_registered_base_and_control_behaviors() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/krea".into()));
         for (contract, strategy) in [
@@ -1999,10 +2171,18 @@ pub fn register_providers(
         .register_generator(TURBO_REGISTRATION)
         .register_generator(RAW_REGISTRATION)
         .register_generator(EDIT_REGISTRATION)
-        .register_generator(TURBO_EDIT_REGISTRATION);
+        .register_generator(TURBO_EDIT_REGISTRATION)
+        .register_encoder_contract_route(gen_core::EncoderContractRouteRegistration {
+            route_id: "krea_2_turbo_control",
+            provider_id: KREA_2_TURBO_ID,
+        });
     #[cfg(feature = "cuda")]
     let registry = registry
         .register_memory_strategy(TURBO_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            provider_id: KREA_2_TURBO_ID,
+            contract: |spec| Ok(build_krea_turbo_memory_strategy_contract(spec)),
+        })
         .register_memory_behavior(TURBO_MEMORY_BEHAVIOR)
         // The direct CUDA control runtime composes the registered Krea base with a native control
         // overlay in SceneWorks; it is a real route, but not a standalone gen-core Generator.
@@ -2049,17 +2229,23 @@ mod explicit_registry_tests {
         let tmp = tempfile::tempdir().unwrap();
         let dit = tmp.path().join("imported.safetensors");
         std::fs::write(&dit, b"pinned source fixture").unwrap();
+        let base = tmp.path().join("base");
+        gen_core_testkit::write_encoder_contract_fixture(
+            &base.join("text_encoder"),
+            super::ENCODER_CONTRACT,
+        )
+        .unwrap();
         let spec =
             candle_gen::gen_core::LoadSpec::new(candle_gen::gen_core::WeightsSource::File(dit))
                 .with_component(
                     candle_gen::gen_core::BASE_SNAPSHOT_COMPONENT,
-                    candle_gen::gen_core::WeightsSource::Dir(tmp.path().join("base")),
+                    candle_gen::gen_core::WeightsSource::Dir(base),
                 );
         (tmp, spec)
     }
 
     #[test]
-    fn every_registered_file_route_rejects_unrealized_typed_fields() {
+    fn every_registered_file_route_rejects_identity_and_accepts_a_valid_selected_encoder() {
         let registry = super::provider_registry().unwrap();
         let (tmp, base_spec) = imported_file_spec();
         for id in [
@@ -2077,16 +2263,14 @@ mod explicit_registry_tests {
                 .to_string();
             assert!(error.contains("identity"), "{id}: {error}");
 
+            let external = tmp.path().join(format!("{id}-external-te"));
+            gen_core_testkit::write_encoder_contract_fixture(&external, super::ENCODER_CONTRACT)
+                .unwrap();
             let mut text_encoder = base_spec.clone();
-            text_encoder.text_encoder = Some(candle_gen::gen_core::WeightsSource::File(
-                tmp.path().join("external-te.safetensors"),
-            ));
-            let error = registry
+            text_encoder.text_encoder = Some(candle_gen::gen_core::WeightsSource::Dir(external));
+            registry
                 .load(id, &text_encoder)
-                .err()
-                .expect("text_encoder field must be rejected")
-                .to_string();
-            assert!(error.contains("mutually exclusive"), "{id}: {error}");
+                .unwrap_or_else(|error| panic!("{id}: valid selected encoder rejected: {error}"));
         }
     }
 
@@ -2112,6 +2296,18 @@ mod explicit_registry_tests {
             ]
         );
         assert_eq!(explicit_trainers, ["krea_2_raw", "krea_2_control"]);
+        assert_eq!(
+            registry.provider_encoder_contract(super::KREA_2_TURBO_ID),
+            Some(super::ENCODER_CONTRACT)
+        );
+        assert_eq!(
+            registry.provider_encoder_contract("krea_2_turbo_control"),
+            Some(super::ENCODER_CONTRACT)
+        );
+        assert_eq!(
+            registry.provider_encoder_contract("krea_2_control_typo"),
+            None
+        );
 
         let spec = candle_gen::gen_core::LoadSpec::new(candle_gen::gen_core::WeightsSource::Dir(
             "/nonexistent".into(),
@@ -2174,6 +2370,31 @@ mod explicit_registry_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    fn write_valid_text_encoder(root: &Path) {
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            ENCODER_CONTRACT,
+            VISION_ENCODER_CONTRACT,
+        )
+        .unwrap();
+    }
+
+    fn valid_directory_spec(root: &Path) -> LoadSpec {
+        write_valid_text_encoder(root);
+        LoadSpec::new(WeightsSource::Dir(root.to_path_buf()))
+    }
+
+    fn valid_imported_spec(root: &Path, name: &str) -> LoadSpec {
+        write_valid_text_encoder(root);
+        let native = root.join(name);
+        std::fs::write(&native, b"pinned source fixture").unwrap();
+        LoadSpec::new(WeightsSource::File(native)).with_component(
+            BASE_SNAPSHOT_COMPONENT,
+            WeightsSource::Dir(root.to_path_buf()),
+        )
+    }
 
     fn resident_memory_context(
         contract: &gen_core::MemoryProviderContract,
@@ -2799,12 +3020,8 @@ mod tests {
     #[test]
     fn imported_file_contract_matches_the_loader_for_every_typed_field() {
         let tmp = tempfile::tempdir().unwrap();
-        let native = tmp.path().join("krea.safetensors");
-        std::fs::write(&native, b"pinned File validation fixture").unwrap();
-        let valid = LoadSpec::new(WeightsSource::File(native)).with_component(
-            BASE_SNAPSHOT_COMPONENT,
-            WeightsSource::Dir(tmp.path().join("base")),
-        );
+        let base = tmp.path().join("base");
+        let valid = valid_imported_spec(&base, "krea.safetensors");
 
         let mut precision = valid.clone();
         precision.precision = gen_core::Precision::Fp32;
@@ -2819,8 +3036,10 @@ mod tests {
         let mut identity = valid.clone();
         identity.identity = Some(gen_core::IdentityWeights::default());
         let mut text_encoder = valid.clone();
-        text_encoder.text_encoder =
-            Some(WeightsSource::File(tmp.path().join("convrot.safetensors")));
+        let external_text_encoder = tmp.path().join("external-text-encoder");
+        gen_core_testkit::write_encoder_contract_fixture(&external_text_encoder, ENCODER_CONTRACT)
+            .unwrap();
+        text_encoder.text_encoder = Some(WeightsSource::Dir(external_text_encoder));
         let mut unknown_component = valid.clone();
         unknown_component.components.insert(
             "unknown".into(),
@@ -2853,7 +3072,7 @@ mod tests {
             ("extra_control", extra_control, false),
             ("ip_adapter", ip_adapter, false),
             ("identity", identity, false),
-            ("text_encoder", text_encoder, false),
+            ("text_encoder", text_encoder, true),
             ("unknown_component", unknown_component, false),
             ("missing_base", missing_base, false),
         ] {
@@ -3053,7 +3272,8 @@ mod tests {
 
     #[test]
     fn registers_krea_2_turbo_as_candle() {
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let fixture = tempfile::tempdir().unwrap();
+        let spec = valid_directory_spec(fixture.path());
         let g = crate::provider_registry()
             .unwrap()
             .load(KREA_2_TURBO_ID, &spec)
@@ -3068,7 +3288,8 @@ mod tests {
 
     #[test]
     fn registers_krea_2_raw_as_candle() {
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let fixture = tempfile::tempdir().unwrap();
+        let spec = valid_directory_spec(fixture.path());
         let g = crate::provider_registry()
             .unwrap()
             .load(KREA_2_RAW_ID, &spec)
@@ -3105,7 +3326,8 @@ mod tests {
     #[test]
     fn raw_validate_accepts_guidance_and_negative_prompt() {
         // The CFG floor that rejects these on Turbo must ACCEPT them on Raw.
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let fixture = tempfile::tempdir().unwrap();
+        let spec = valid_directory_spec(fixture.path());
         let g = crate::provider_registry()
             .unwrap()
             .load(KREA_2_RAW_ID, &spec)
@@ -3127,7 +3349,8 @@ mod tests {
     #[test]
     fn size_multiple_is_the_pinned_stride() {
         assert_eq!(SIZE_MULTIPLE, 16);
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let fixture = tempfile::tempdir().unwrap();
+        let spec = valid_directory_spec(fixture.path());
         let g = crate::provider_registry()
             .unwrap()
             .load(KREA_2_TURBO_ID, &spec)
@@ -3162,11 +3385,14 @@ mod tests {
         std::fs::write(&native, b"pinned source fixture").unwrap();
         let file = LoadSpec::new(WeightsSource::File(native));
         assert!(load_raw(&file).is_err());
-        let imported =
-            file.with_component(BASE_SNAPSHOT_COMPONENT, WeightsSource::Dir("/snap".into()));
+        write_valid_text_encoder(tmp.path());
+        let imported = file.with_component(
+            BASE_SNAPSHOT_COMPONENT,
+            WeightsSource::Dir(tmp.path().to_path_buf()),
+        );
         assert!(load_raw(&imported).is_ok());
         // A LoRA `LoadSpec` on the Raw id is accepted + lazy, exactly like Turbo (sc-7836 wiring).
-        let dir = LoadSpec::new(WeightsSource::Dir("/snap".into()));
+        let dir = valid_directory_spec(tmp.path());
         assert!(load_raw(&dir).is_ok());
     }
 
@@ -3192,7 +3418,8 @@ mod tests {
 
     #[test]
     fn validate_accepts_txt2img_and_rejects_bad() {
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let fixture = tempfile::tempdir().unwrap();
+        let spec = valid_directory_spec(fixture.path());
         let g = crate::provider_registry()
             .unwrap()
             .load(KREA_2_TURBO_ID, &spec)
@@ -3229,7 +3456,8 @@ mod tests {
     /// reach the TE as an effectively-empty sequence.
     #[test]
     fn validate_rejects_whitespace_only_prompt() {
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let fixture = tempfile::tempdir().unwrap();
+        let spec = valid_directory_spec(fixture.path());
         let g = crate::provider_registry()
             .unwrap()
             .load(KREA_2_TURBO_ID, &spec)
@@ -3250,7 +3478,8 @@ mod tests {
 
     #[test]
     fn validate_rejects_guidance_and_negative_prompt() {
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let fixture = tempfile::tempdir().unwrap();
+        let spec = valid_directory_spec(fixture.path());
         let g = crate::provider_registry()
             .unwrap()
             .load(KREA_2_TURBO_ID, &spec)
@@ -3283,18 +3512,23 @@ mod tests {
         std::fs::write(&native, b"pinned source fixture").unwrap();
         let file = LoadSpec::new(WeightsSource::File(native));
         assert!(load(&file).is_err());
-        let imported =
-            file.with_component(BASE_SNAPSHOT_COMPONENT, WeightsSource::Dir("/snap".into()));
+        write_valid_text_encoder(tmp.path());
+        let imported = file.with_component(
+            BASE_SNAPSHOT_COMPONENT,
+            WeightsSource::Dir(tmp.path().to_path_buf()),
+        );
         assert!(load(&imported).is_ok());
         // LoRA/LoKr now wired (sc-7836): a LoRA `LoadSpec` is accepted (lazily — the merge happens at
         // first `generate`), so `load` resolves rather than rejecting.
-        let lora = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_adapters(vec![
-            AdapterSpec::new("/lora.safetensors".into(), 1.0, AdapterKind::Lora),
-        ]);
+        let lora = valid_directory_spec(tmp.path()).with_adapters(vec![AdapterSpec::new(
+            "/lora.safetensors".into(),
+            1.0,
+            AdapterKind::Lora,
+        )]);
         assert!(load(&lora).is_ok(), "LoRA load is wired + lazy (sc-7836)");
         // sc-9607: a Q4/Q8 `spec.quantize` is now ACCEPTED (a no-op on the already-packed tier) — load
         // proceeds past the quant check and constructs lazily, exactly like the LoRA case above.
-        let quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q8);
+        let quant = valid_directory_spec(tmp.path()).with_quant(Quant::Q8);
         assert!(
             load(&quant).is_ok(),
             "Q4/Q8 quant is accepted + lazy (sc-9607)"
@@ -3330,7 +3564,7 @@ mod tests {
     }
 
     // sc-9300: the ConvRot consume path is reachable through the LoadSpec API. The selector routes a
-    // `WeightsSource::File` on `text_encoder` to the INT8-ConvRot DiT (`load_components_convrot`), a
+    // `WeightsSource::File` on the named ConvRot component to the INT8-ConvRot DiT (`load_components_convrot`), a
     // plain `Dir` weights spec to the dense/packed snapshot path (`load_components`), and rejects the
     // mis-shaped / incompatible combinations. These assert the routing decision on CPU (no weights).
     #[test]
@@ -3342,16 +3576,19 @@ mod tests {
             None,
             "a Dir-only spec dispatches to the dense/packed snapshot path"
         );
-        // A ConvRot DiT single-file on `text_encoder` ⇒ the ConvRot path, carrying the DiT checkpoint.
+        // A ConvRot DiT single-file on the named component ⇒ the ConvRot path, carrying the DiT checkpoint.
         let convrot = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_convrot_text_encoder();
         assert_eq!(
             convrot_selector(&convrot, KREA_2_TURBO_ID).unwrap(),
             Some(PathBuf::from("/krea2_int8_convrot.safetensors")),
-            "a File on text_encoder selects the ConvRot DiT consume path"
+            "a File on the named component selects the ConvRot DiT consume path"
         );
-        // A `Dir` on `text_encoder` is not a valid ConvRot selector (ConvRot is a single file).
+        // A `Dir` on the ConvRot component is not valid (ConvRot is a single file).
         let mut bad = LoadSpec::new(WeightsSource::Dir("/snap".into()));
-        bad.text_encoder = Some(WeightsSource::Dir("/te_dir".into()));
+        bad.components.insert(
+            KREA_CONVROT_DIT_COMPONENT.to_owned(),
+            WeightsSource::Dir("/convrot-dir".into()),
+        );
         assert!(
             convrot_selector(&bad, KREA_2_TURBO_ID).is_err(),
             "a Dir on text_encoder is a mis-shaped ConvRot selector and errors"
@@ -3362,13 +3599,14 @@ mod tests {
     fn load_accepts_convrot_and_rejects_convrot_with_overlays() {
         use candle_gen::gen_core::{AdapterKind, AdapterSpec};
         // A ConvRot-selecting spec loads (lazily — the int8 DiT + snapshot load at first `generate`).
-        let convrot = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_convrot_text_encoder();
+        let fixture = tempfile::tempdir().unwrap();
+        let convrot = valid_directory_spec(fixture.path()).with_convrot_text_encoder();
         assert!(
             load(&convrot).is_ok(),
             "a ConvRot LoadSpec is accepted + lazy (sc-9300)"
         );
         // ConvRot does not thread LoRA/LoKr — the int8 checkpoint replaces the dense DiT wholesale.
-        let convrot_lora = LoadSpec::new(WeightsSource::Dir("/snap".into()))
+        let convrot_lora = valid_directory_spec(fixture.path())
             .with_convrot_text_encoder()
             .with_adapters(vec![AdapterSpec::new(
                 "/lora.safetensors".into(),
@@ -3380,7 +3618,7 @@ mod tests {
             "ConvRot + LoRA is rejected (the int8 DiT path is not adapter-wired)"
         );
         // ConvRot does not thread a PiD decoder overlay either.
-        let convrot_pid = LoadSpec::new(WeightsSource::Dir("/snap".into()))
+        let convrot_pid = valid_directory_spec(fixture.path())
             .with_convrot_text_encoder()
             .with_pid(
                 WeightsSource::File("/pid.safetensors".into()),
@@ -3396,7 +3634,8 @@ mod tests {
 
     #[test]
     fn registers_krea_2_edit_as_candle() {
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let fixture = tempfile::tempdir().unwrap();
+        let spec = valid_directory_spec(fixture.path());
         let g = crate::provider_registry()
             .unwrap()
             .load(KREA_2_EDIT_ID, &spec)
@@ -3449,16 +3688,21 @@ mod tests {
         std::fs::write(&native, b"pinned source fixture").unwrap();
         let file = LoadSpec::new(WeightsSource::File(native));
         assert!(load_edit(&file).is_err());
-        let imported =
-            file.with_component(BASE_SNAPSHOT_COMPONENT, WeightsSource::Dir("/snap".into()));
+        write_valid_text_encoder(tmp.path());
+        let imported = file.with_component(
+            BASE_SNAPSHOT_COMPONENT,
+            WeightsSource::Dir(tmp.path().to_path_buf()),
+        );
         assert!(load_edit(&imported).is_ok());
         // A plain snapshot dir loads lazily.
-        let dir = LoadSpec::new(WeightsSource::Dir("/snap".into()));
+        let dir = valid_directory_spec(tmp.path());
         assert!(load_edit(&dir).is_ok());
         // The edit LoRA rides the shared `spec.adapters` merge path (accepted + lazy).
-        let lora = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_adapters(vec![
-            AdapterSpec::new("/edit_lora.safetensors".into(), 1.0, AdapterKind::Lora),
-        ]);
+        let lora = valid_directory_spec(tmp.path()).with_adapters(vec![AdapterSpec::new(
+            "/edit_lora.safetensors".into(),
+            1.0,
+            AdapterKind::Lora,
+        )]);
         assert!(load_edit(&lora).is_ok(), "edit LoRA load is wired + lazy");
     }
 
@@ -3579,7 +3823,8 @@ mod tests {
 
     #[test]
     fn turbo_validate_accepts_reference_rejects_multireference() {
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let fixture = tempfile::tempdir().unwrap();
+        let spec = valid_directory_spec(fixture.path());
         let g = crate::provider_registry()
             .unwrap()
             .load(KREA_2_TURBO_ID, &spec)
@@ -3615,9 +3860,10 @@ mod tests {
     /// decision. This is weight-free because no loader runs until `generate`.
     #[test]
     fn image_load_policy_is_not_a_residency_authority() {
-        let resident = LoadSpec::new(WeightsSource::Dir("/snap".into()));
-        let legacy_staged = LoadSpec::new(WeightsSource::Dir("/snap".into()))
-            .with_offload_policy(OffloadPolicy::Sequential);
+        let fixture = tempfile::tempdir().unwrap();
+        let resident = valid_directory_spec(fixture.path());
+        let legacy_staged =
+            valid_directory_spec(fixture.path()).with_offload_policy(OffloadPolicy::Sequential);
         for spec in [&resident, &legacy_staged] {
             assert!(load(spec).is_ok());
             assert!(load_raw(spec).is_ok());
@@ -3639,6 +3885,18 @@ mod tests {
         assert!(descriptor().capabilities.supports_sequential_offload);
         assert!(raw_descriptor().capabilities.supports_sequential_offload);
         assert!(edit_descriptor().capabilities.supports_sequential_offload);
+    }
+
+    fn unused_validated_text_encoder() -> gen_core::ValidatedEncoderSource {
+        let component = tempfile::tempdir().unwrap();
+        gen_core_testkit::write_encoder_contract_fixture(component.path(), ENCODER_CONTRACT)
+            .unwrap();
+        // These synthetic generators replace every residency loader and therefore never open this
+        // source. Constructing a real validated value keeps the production invariant non-optional;
+        // the dropped fixture also makes any accidental use fail closed.
+        ENCODER_CONTRACT
+            .validate_source(&WeightsSource::Dir(component.path().to_path_buf()))
+            .unwrap()
     }
 
     fn sequential_generator(descriptor: ModelDescriptor) -> KreaGenerator {
@@ -3663,6 +3921,7 @@ mod tests {
                 },
             ),
             root: "/snap".into(),
+            text_encoder_source: unused_validated_text_encoder(),
             native_dit: None,
             adapters: Vec::new(),
             has_diff_patch: false,
@@ -3849,6 +4108,7 @@ mod tests {
                     },
                 ),
                 root: "/snap".into(),
+                text_encoder_source: unused_validated_text_encoder(),
                 native_dit: None,
                 adapters: Vec::new(),
                 has_diff_patch: false,
@@ -4016,8 +4276,8 @@ mod tests {
                 std::env::var("KREA_EDIT_LORA").expect("set KREA_EDIT_LORA for KREA_SEQ_EDIT=1");
             spec = spec.with_adapters(vec![AdapterSpec::new(lora.into(), 1.0, AdapterKind::Lora)]);
         }
-        // sc-12425: `KREA_CONVROT_DIT` measures the community INT8-ConvRot lane by riding the DiT single
-        // file on `text_encoder` (the `convrot_selector` seam). Run resident vs request-staged in two
+        // sc-12425: `KREA_CONVROT_DIT` measures the community INT8-ConvRot lane through its named DiT
+        // component. Run resident vs request-staged in two
         // processes: sequential must drop the 15.6 GB f32 Qwen3-VL TE before the int8 DiT loads, taking
         // the ~42.9 GB resident peak (sc-12381) down toward the DiT phase alone.
         if let Ok(convrot) = std::env::var("KREA_CONVROT_DIT") {
@@ -4025,7 +4285,10 @@ mod tests {
                 !raw && !edit,
                 "KREA_CONVROT_DIT is the Turbo-only community checkpoint; unset KREA_SEQ_RAW/EDIT"
             );
-            spec.text_encoder = Some(WeightsSource::File(convrot.into()));
+            spec = spec.with_component(
+                KREA_CONVROT_DIT_COMPONENT,
+                WeightsSource::File(convrot.into()),
+            );
         }
         let stage_residency =
             std::env::var("KREA_OFFLOAD_MODE").is_ok_and(|mode| mode == "request-staged");
@@ -4380,9 +4643,10 @@ mod tests {
     }
     impl WithConvRot for LoadSpec {
         fn with_convrot_text_encoder(mut self) -> Self {
-            self.text_encoder = Some(WeightsSource::File(
-                "/krea2_int8_convrot.safetensors".into(),
-            ));
+            self.components.insert(
+                KREA_CONVROT_DIT_COMPONENT.to_owned(),
+                WeightsSource::File("/krea2_int8_convrot.safetensors".into()),
+            );
             self
         }
     }
@@ -4422,7 +4686,8 @@ mod tests {
     /// of scope). Exercised through the full generator `validate`, so the whole request-gate chain runs.
     #[test]
     fn multiphase_rejected_on_non_raw_variants() {
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let fixture = tempfile::tempdir().unwrap();
+        let spec = valid_directory_spec(fixture.path());
         let r = phase_req(vec![phase(8, None)]);
         for id in [KREA_2_TURBO_ID, KREA_2_EDIT_ID] {
             // Free-fn gate.
@@ -4540,7 +4805,8 @@ mod tests {
         };
         assert!(validate_phases(KREA_2_RAW_ID, &single).is_ok());
         assert_eq!(single.phases, None);
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let fixture = tempfile::tempdir().unwrap();
+        let spec = valid_directory_spec(fixture.path());
         let g = crate::provider_registry()
             .unwrap()
             .load(KREA_2_RAW_ID, &spec)

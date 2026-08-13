@@ -473,7 +473,7 @@ const TE_LINEAR_SUFFIXES: &[&str] = &[
 /// `true` iff the TE base key names a quantizable language-tower tensor: a [`TE_LINEAR_SUFFIXES`]
 /// projection **or** the `…​.embed_tokens` table, under the `language_model.model.` prefix only.
 /// A *positive* predicate (unlike the DiT's negative one) so the vision tower is left untouched.
-fn is_te_quant_target(base: &str) -> bool {
+pub(crate) fn is_te_quant_target(base: &str) -> bool {
     if !base.contains("language_model.model.") {
         return false;
     }

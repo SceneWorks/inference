@@ -74,6 +74,9 @@ fn run_control_validation(
 
     let paths = ZImageControlPaths {
         snapshot: env_path("ZIMG_CTRL_BASE"),
+        text_encoder: std::env::var_os("ZIMG_CTRL_TEXT_ENCODER")
+            .map(std::path::PathBuf::from)
+            .map(candle_gen::gen_core::WeightsSource::Dir),
         control: env_path("ZIMG_CTRL_NET"),
         base,
     };
