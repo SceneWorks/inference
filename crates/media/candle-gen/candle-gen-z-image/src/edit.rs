@@ -186,6 +186,34 @@ impl ZImageEdit {
         })
     }
 
+    /// Load through the exact prepared text-encoder receipt retained by the caller.
+    pub fn load_with_spec(
+        paths: &ZImageEditPaths,
+        spec: &candle_gen::gen_core::LoadSpec,
+    ) -> Result<Self> {
+        match &spec.weights {
+            WeightsSource::Dir(admitted_root) if admitted_root == &paths.base => {}
+            WeightsSource::Dir(admitted_root) => {
+                return Err(CandleError::Msg(format!(
+                    "z-image edit: runtime base {} differs from admitted base {}",
+                    paths.base.display(),
+                    admitted_root.display()
+                )));
+            }
+            WeightsSource::File(_) => {
+                return Err(CandleError::Msg(
+                    "z-image edit: admitted base must be the runtime snapshot directory".to_owned(),
+                ));
+            }
+        }
+        spec.read_prepared_files_unchanged(|| {
+            Self::load(&ZImageEditPaths {
+                base: paths.base.clone(),
+                text_encoder: spec.text_encoder.clone(),
+            })
+        })
+    }
+
     /// img2img: regenerate `source` toward `req.prompt` at `req.strength`, denoising with the distilled
     /// flow-match Euler schedule (no CFG). VAE-encodes the source once into the clean init latent, blends
     /// it with seeded noise at the start sigma, then runs the reduced `init_time_step..steps` loop.

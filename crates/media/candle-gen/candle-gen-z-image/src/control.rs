@@ -649,6 +649,57 @@ impl ZImageControl {
         })
     }
 
+    /// Load through the exact prepared encoder receipt retained by the caller.
+    pub fn load_with_spec(
+        paths: &ZImageControlPaths,
+        spec: &candle_gen::gen_core::LoadSpec,
+    ) -> Result<Self> {
+        Self::load_with_memory_spec(paths, spec, GenerationMemory::default())
+    }
+
+    /// Memory-aware counterpart to [`Self::load_with_spec`].
+    pub fn load_with_memory_spec(
+        paths: &ZImageControlPaths,
+        spec: &candle_gen::gen_core::LoadSpec,
+        memory: GenerationMemory,
+    ) -> Result<Self> {
+        match &spec.weights {
+            WeightsSource::Dir(admitted_root) if admitted_root == &paths.snapshot => {}
+            WeightsSource::Dir(admitted_root) => {
+                return Err(CandleError::Msg(format!(
+                    "z-image control: runtime base {} differs from admitted base {}",
+                    paths.snapshot.display(),
+                    admitted_root.display()
+                )));
+            }
+            WeightsSource::File(_) => {
+                return Err(CandleError::Msg(
+                    "z-image control: admitted base must be the runtime snapshot directory"
+                        .to_owned(),
+                ));
+            }
+        }
+        spec.read_prepared_files_unchanged(|| {
+            let control = match spec.control.as_ref() {
+                Some(WeightsSource::Dir(path) | WeightsSource::File(path)) => path.clone(),
+                None => {
+                    return Err(CandleError::Msg(
+                        "z-image control: prepared load spec has no control overlay".to_owned(),
+                    ));
+                }
+            };
+            Self::load_with_memory(
+                &ZImageControlPaths {
+                    snapshot: paths.snapshot.clone(),
+                    text_encoder: spec.text_encoder.clone(),
+                    control,
+                    base: paths.base,
+                },
+                memory,
+            )
+        })
+    }
+
     /// Attach the optional PiD super-resolving decoder (epic 7840, sc-8044). Same [`PidWeights`] load-spec
     /// as the registry Z-Image provider; Z-Image's latent space is FLUX.1's, so PiD's `zimage-turbo`
     /// backbone tag (aliasing the `flux` checkpoint) is used. A `use_pid = true` request then decodes

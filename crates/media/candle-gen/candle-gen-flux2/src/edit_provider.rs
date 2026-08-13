@@ -197,6 +197,18 @@ impl Flux2Edit {
         spec: &candle_gen::gen_core::LoadSpec,
         context: &candle_gen::gen_core::MemoryRunContext,
     ) -> Result<Self> {
+        spec.read_prepared_files_unchanged(|| {
+            Self::load_with_memory_context_inner(paths, variant, quant, spec, context)
+        })
+    }
+
+    fn load_with_memory_context_inner(
+        paths: &Flux2EditPaths,
+        variant: Flux2Variant,
+        quant: Option<Quant>,
+        spec: &candle_gen::gen_core::LoadSpec,
+        context: &candle_gen::gen_core::MemoryRunContext,
+    ) -> Result<Self> {
         validate_base_binding(paths, spec)?;
         validate_memory_load_spec(variant, spec)?;
         let loaded_quant = crate::memory_strategy::resolved_quant(spec)
@@ -263,6 +275,18 @@ impl Flux2Edit {
     }
 
     fn load_variant_with_memory_spec(
+        paths: &Flux2EditPaths,
+        variant: Flux2Variant,
+        quant: Option<Quant>,
+        spec: &candle_gen::gen_core::LoadSpec,
+        memory: GenerationMemory,
+    ) -> Result<Self> {
+        spec.read_prepared_files_unchanged(|| {
+            Self::load_variant_with_memory_spec_inner(paths, variant, quant, spec, memory)
+        })
+    }
+
+    fn load_variant_with_memory_spec_inner(
         paths: &Flux2EditPaths,
         variant: Flux2Variant,
         quant: Option<Quant>,

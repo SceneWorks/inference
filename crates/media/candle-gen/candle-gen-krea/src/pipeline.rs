@@ -406,6 +406,42 @@ pub fn load_components_with_text_encoder(
     load_components_with_encoder(root, &selected, device, adapters, pid_spec)
 }
 
+/// Load the resident Krea components while preserving the caller's complete prepared encoder receipt.
+///
+/// Unlike a detached `text_encoder` path, the prepared [`gen_core::LoadSpec`] also identifies the
+/// selected config, tokenizer, and exact shard inventory. The entire provider load stays inside that
+/// receipt bracket so an admitted source cannot be replaced and freshly revalidated here.
+pub fn load_components_with_spec(
+    root: &Path,
+    spec: &gen_core::LoadSpec,
+    device: &Device,
+) -> Result<Components> {
+    match &spec.weights {
+        gen_core::WeightsSource::Dir(admitted_root) if admitted_root == root => {}
+        gen_core::WeightsSource::Dir(admitted_root) => {
+            return Err(CandleError::Msg(format!(
+                "krea edit: runtime base {} differs from admitted base {}",
+                root.display(),
+                admitted_root.display()
+            )));
+        }
+        gen_core::WeightsSource::File(_) => {
+            return Err(CandleError::Msg(
+                "krea edit: admitted base must be the runtime snapshot directory".to_owned(),
+            ));
+        }
+    }
+    spec.read_prepared_files_unchanged(|| {
+        load_components_with_text_encoder(
+            root,
+            spec.text_encoder.as_ref(),
+            device,
+            &spec.adapters,
+            spec.pid.as_ref(),
+        )
+    })
+}
+
 fn resolve_components_text_encoder(
     root: &Path,
     text_encoder: Option<&gen_core::WeightsSource>,

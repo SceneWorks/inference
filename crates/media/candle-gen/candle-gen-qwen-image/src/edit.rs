@@ -462,6 +462,36 @@ impl QwenEdit {
         })
     }
 
+    /// Load through the exact prepared decoder-LM receipt retained by the caller.
+    pub fn load_with_spec(
+        paths: &QwenEditPaths,
+        spec: &candle_gen::gen_core::LoadSpec,
+    ) -> Result<Self> {
+        match &spec.weights {
+            WeightsSource::Dir(admitted_root) if admitted_root == &paths.root => {}
+            WeightsSource::Dir(admitted_root) => {
+                return Err(CandleError::Msg(format!(
+                    "qwen edit: runtime base {} differs from admitted base {}",
+                    paths.root.display(),
+                    admitted_root.display()
+                )));
+            }
+            WeightsSource::File(_) => {
+                return Err(CandleError::Msg(
+                    "qwen edit: admitted base must be the runtime snapshot directory".to_owned(),
+                ));
+            }
+        }
+        spec.read_prepared_files_unchanged(|| {
+            Self::load(&QwenEditPaths {
+                root: paths.root.clone(),
+                text_encoder: spec.text_encoder.clone(),
+                adapters: spec.adapters.clone(),
+                offload_policy: paths.offload_policy,
+            })
+        })
+    }
+
     /// VL-encode one prompt against the precomputed `vision` embeds → `[1, S−64, 3584]` at the DiT
     /// dtype. `n_image_tokens` is the shared `<|image_pad|>` run length (from the image preprocess).
     /// Takes `vl_encoder` by ref so the resident and sequential paths encode identically.

@@ -241,6 +241,40 @@ impl Krea2Control {
         Ok(Self { device, residency })
     }
 
+    /// Load from the exact caller-prepared specification.
+    ///
+    /// The compatibility [`Self::load_with_text_encoder`] entry point validates a selected path at
+    /// provider construction. Request authors that already prepared an encoder contract must retain
+    /// that complete receipt instead: it also pins the selected config, tokenizer, and complete shard
+    /// inventory. Keep the full provider construction inside the prepared-file bracket so a compatible
+    /// replacement between admission and this bespoke load cannot be silently revalidated.
+    pub fn load_with_spec(
+        paths: &Krea2ControlPaths,
+        spec: &candle_gen::gen_core::LoadSpec,
+    ) -> Result<Self> {
+        validate_spec_root(&paths.root, spec, "krea control")?;
+        spec.read_prepared_files_unchanged(|| {
+            let control = required_source_path(spec.control.as_ref(), "krea control overlay")?;
+            let convrot_dit = spec
+                .components
+                .get(candle_gen::gen_core::KREA_CONVROT_DIT_COMPONENT)
+                .map(|source| required_file_path(source, "krea control ConvRot DiT"))
+                .transpose()?;
+            Self::load_with_text_encoder(
+                &Krea2ControlPaths {
+                    root: paths.root.clone(),
+                    convrot_dit,
+                    control,
+                    adapters: spec.adapters.clone(),
+                    branch_tier: paths.branch_tier,
+                    chunk_attention: paths.chunk_attention,
+                    offload_policy: paths.offload_policy,
+                },
+                spec.text_encoder.clone(),
+            )
+        })
+    }
+
     /// Generate one strict-pose-conditioned image from a rendered OpenPose skeleton. The control image
     /// must already match the request dimensions; the worker renders it at those exact dimensions.
     pub fn generate(
@@ -263,6 +297,43 @@ impl Krea2Control {
                 candle_gen::synchronize_result(&self.device, result)
             },
         )
+    }
+}
+
+fn required_source_path(source: Option<&WeightsSource>, label: &str) -> Result<PathBuf> {
+    match source {
+        Some(WeightsSource::Dir(path) | WeightsSource::File(path)) => Ok(path.clone()),
+        None => Err(CandleError::Msg(format!(
+            "{label}: prepared load spec is missing the required source"
+        ))),
+    }
+}
+
+fn required_file_path(source: &WeightsSource, label: &str) -> Result<PathBuf> {
+    match source {
+        WeightsSource::File(path) => Ok(path.clone()),
+        WeightsSource::Dir(path) => Err(CandleError::Msg(format!(
+            "{label}: expected a file source, got directory {}",
+            path.display()
+        ))),
+    }
+}
+
+fn validate_spec_root(
+    runtime_root: &Path,
+    spec: &candle_gen::gen_core::LoadSpec,
+    label: &str,
+) -> Result<()> {
+    match &spec.weights {
+        WeightsSource::Dir(admitted_root) if admitted_root == runtime_root => Ok(()),
+        WeightsSource::Dir(admitted_root) => Err(CandleError::Msg(format!(
+            "{label}: runtime base {} differs from admitted base {}",
+            runtime_root.display(),
+            admitted_root.display()
+        ))),
+        WeightsSource::File(_) => Err(CandleError::Msg(format!(
+            "{label}: admitted base must be the runtime snapshot directory"
+        ))),
     }
 }
 

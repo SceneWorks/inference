@@ -152,6 +152,17 @@ impl Flux2Control {
         spec: &candle_gen::gen_core::LoadSpec,
         memory: GenerationMemory,
     ) -> Result<Self> {
+        spec.read_prepared_files_unchanged(|| {
+            Self::load_with_memory_spec_inner(paths, quant, spec, memory)
+        })
+    }
+
+    fn load_with_memory_spec_inner(
+        paths: &Flux2ControlPaths,
+        quant: Option<Quant>,
+        spec: &candle_gen::gen_core::LoadSpec,
+        memory: GenerationMemory,
+    ) -> Result<Self> {
         validate_memory_authority(memory, None, "flux2 control")?;
         validate_control_load_spec(spec)?;
         validate_admitted_paths(paths, spec)?;
@@ -242,6 +253,17 @@ impl Flux2Control {
     }
 
     pub fn load_with_memory_context(
+        paths: &Flux2ControlPaths,
+        quant: Option<Quant>,
+        spec: &candle_gen::gen_core::LoadSpec,
+        context: &candle_gen::gen_core::MemoryRunContext,
+    ) -> Result<Self> {
+        spec.read_prepared_files_unchanged(|| {
+            Self::load_with_memory_context_inner(paths, quant, spec, context)
+        })
+    }
+
+    fn load_with_memory_context_inner(
         paths: &Flux2ControlPaths,
         quant: Option<Quant>,
         spec: &candle_gen::gen_core::LoadSpec,

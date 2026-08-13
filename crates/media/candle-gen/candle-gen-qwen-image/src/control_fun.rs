@@ -203,6 +203,44 @@ impl QwenFunControl {
         })
     }
 
+    /// Load through the exact prepared text-encoder receipt retained by the caller.
+    pub fn load_with_spec(
+        paths: &QwenFunControlPaths,
+        spec: &candle_gen::gen_core::LoadSpec,
+    ) -> Result<Self> {
+        match &spec.weights {
+            WeightsSource::Dir(admitted_root) if admitted_root == &paths.qwen_base => {}
+            WeightsSource::Dir(admitted_root) => {
+                return Err(CandleError::Msg(format!(
+                    "qwen fun-control: runtime base {} differs from admitted base {}",
+                    paths.qwen_base.display(),
+                    admitted_root.display()
+                )));
+            }
+            WeightsSource::File(_) => {
+                return Err(CandleError::Msg(
+                    "qwen fun-control: admitted base must be the runtime snapshot directory"
+                        .to_owned(),
+                ));
+            }
+        }
+        spec.read_prepared_files_unchanged(|| {
+            let controlnet = match spec.control.as_ref() {
+                Some(WeightsSource::Dir(path) | WeightsSource::File(path)) => path.clone(),
+                None => {
+                    return Err(CandleError::Msg(
+                        "qwen fun-control: prepared load spec has no control overlay".to_owned(),
+                    ));
+                }
+            };
+            Self::load(&QwenFunControlPaths {
+                qwen_base: paths.qwen_base.clone(),
+                text_encoder: spec.text_encoder.clone(),
+                controlnet,
+            })
+        })
+    }
+
     /// Tokenize + encode `prompt` → `prompt_embeds` `[1, seq, 3584]` at the DiT dtype (bf16). Mirrors
     /// the txt2img `Pipeline::encode`.
     fn encode(&self, prompt: &str) -> Result<Tensor> {
@@ -381,6 +419,93 @@ mod tests {
             .expect_err("the Candle Qwen decoder route is dense-only")
             .to_string();
         assert!(error.contains("dense"), "unexpected: {error}");
+    }
+
+    #[test]
+    fn prepared_file_dir_and_snapshot_mutations_fail_before_bespoke_control_load() {
+        for shape in ["file", "dir", "snapshot"] {
+            let fixture = tempfile::tempdir().unwrap();
+            let base = fixture.path().join("base");
+            let selected = fixture.path().join("selected");
+            let control = fixture.path().join("control.safetensors");
+            std::fs::create_dir_all(&base).unwrap();
+            std::fs::write(&control, b"nonempty").unwrap();
+            gen_core_testkit::write_encoder_contract_tokenizer_fixture(
+                &base,
+                crate::ENCODER_CONTRACT,
+            )
+            .unwrap();
+
+            let source = match shape {
+                "file" => {
+                    gen_core_testkit::write_encoder_contract_fixture(
+                        &selected,
+                        crate::ENCODER_CONTRACT,
+                    )
+                    .unwrap();
+                    WeightsSource::File(selected.join("model.safetensors"))
+                }
+                "dir" => {
+                    gen_core_testkit::write_encoder_contract_fixture(
+                        &selected,
+                        crate::ENCODER_CONTRACT,
+                    )
+                    .unwrap();
+                    WeightsSource::Dir(selected.clone())
+                }
+                "snapshot" => {
+                    gen_core_testkit::write_encoder_contract_fixture(
+                        &selected.join("text_encoder"),
+                        crate::ENCODER_CONTRACT,
+                    )
+                    .unwrap();
+                    gen_core_testkit::write_encoder_contract_tokenizer_fixture(
+                        &selected,
+                        crate::ENCODER_CONTRACT,
+                    )
+                    .unwrap();
+                    WeightsSource::Dir(selected.clone())
+                }
+                _ => unreachable!(),
+            };
+            let validated = crate::ENCODER_CONTRACT
+                .validate_source_against_base(&source, &base)
+                .unwrap();
+            let mut spec = candle_gen::gen_core::LoadSpec::new(WeightsSource::Dir(base.clone()))
+                .with_control(WeightsSource::File(control.clone()));
+            validated.prepare_load_spec(&mut spec).unwrap();
+
+            match shape {
+                "file" => std::fs::write(selected.join("config.json"), b"{}").unwrap(),
+                "dir" => {
+                    std::fs::copy(
+                        selected.join("model.safetensors"),
+                        selected.join("added.safetensors"),
+                    )
+                    .unwrap();
+                }
+                "snapshot" => {
+                    std::fs::write(selected.join("tokenizer/tokenizer.json"), b"{}").unwrap();
+                }
+                _ => unreachable!(),
+            }
+
+            let error = QwenFunControl::load_with_spec(
+                &QwenFunControlPaths {
+                    qwen_base: base,
+                    text_encoder: None,
+                    controlnet: control,
+                },
+                &spec,
+            )
+            .err()
+            .expect("a mutated prepared source must fail before provider/device load")
+            .to_string();
+            assert!(
+                error.contains("receipt changed") || error.contains("pinned weights"),
+                "{shape}: {error}"
+            );
+        }
     }
 
     /// sc-11187 / F-085: the control lane's positive prompt is required. An empty or whitespace-only
