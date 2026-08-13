@@ -7,7 +7,7 @@
 use mlx_rs::error::Exception;
 use mlx_rs::fast::rms_norm;
 use mlx_rs::ops::{add, concatenate_axis, multiply, split, split_sections, subtract};
-use mlx_rs::transforms::compile::compile;
+use mlx_rs::transforms::compile::{compile, compile_retained};
 use mlx_rs::Array;
 
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
@@ -18,6 +18,41 @@ use mlx_gen::Result;
 use super::{compile_glue, join, linear_from};
 
 const RMS_EPS: f32 = 1e-6;
+const SITE_ROPE_ROTATE: &str = "qwen_image::attention::rope_rotate";
+
+fn rope_rotate_impl(inp: &[Array]) -> std::result::Result<Vec<Array>, Exception> {
+    let (real, imag, cos, sin) = (&inp[0], &inp[1], &inp[2], &inp[3]);
+    let out_real = subtract(&multiply(real, cos)?, &multiply(imag, sin)?)?;
+    let out_imag = add(&multiply(real, sin)?, &multiply(imag, cos)?)?;
+    Ok(vec![out_real, out_imag])
+}
+
+thread_local! {
+    static RETAINED_ROPE_ROTATE: std::cell::RefCell<Option<mlx_gen::nn::RetainedSlice>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn retained_rope_rotate(args: &[Array]) -> std::result::Result<Vec<Array>, Exception> {
+    mlx_gen::nn::prepare_retained_compilation_thread();
+    RETAINED_ROPE_ROTATE.with(|slot| {
+        slot.borrow_mut()
+            .get_or_insert_with(|| {
+                mlx_gen::nn::RetainedSlice::new(compile_retained(rope_rotate_impl, true))
+            })
+            .call(SITE_ROPE_ROTATE, args)
+    })
+}
+
+/// Exercise this module's production retained handle once for the release memory audit.
+#[doc(hidden)]
+pub fn exercise_retained_compile_inventory(input: &Array) -> Result<()> {
+    let args = [input.clone(), input.clone(), input.clone(), input.clone()];
+    let outputs = retained_rope_rotate(&args)?;
+    mlx_rs::transforms::eval(outputs.iter())?;
+    drop(outputs);
+    drop(args);
+    Ok(())
+}
 
 pub struct QwenJointAttention {
     to_q: AdaptableLinear,
@@ -215,25 +250,20 @@ fn apply_rope_qwen(x: &Array, cos: &Array, sin: &Array) -> Result<Array> {
 /// when the sc-2963 glue toggle is on (vs 6 eager ops, applied to img/txt q and k every block);
 /// dtype-preserving, bit-identical to the eager form.
 fn rope_rotate(xr: &Array, xi: &Array, cos: &Array, sin: &Array) -> Result<(Array, Array)> {
-    let f = |inp: &[Array]| -> std::result::Result<Vec<Array>, Exception> {
-        let (xr, xi, cos, sin) = (&inp[0], &inp[1], &inp[2], &inp[3]);
-        let out_r = subtract(&multiply(xr, cos)?, &multiply(xi, sin)?)?;
-        let out_i = add(&multiply(xr, sin)?, &multiply(xi, cos)?)?;
-        Ok(vec![out_r, out_i])
-    };
     let args = [xr.clone(), xi.clone(), cos.clone(), sin.clone()];
     let mut out = if compile_glue() {
-        mlx_gen::diagnostics::record_compile(
-            "qwen_image::attention::rope_rotate",
-            mlx_gen::diagnostics::CompileDisposition::OneShot,
-        );
-        compile(f, true)(&args)?
+        if mlx_gen::nn::retained_compilation_requested() {
+            retained_rope_rotate(&args)?
+        } else {
+            mlx_gen::diagnostics::record_compile(
+                SITE_ROPE_ROTATE,
+                mlx_gen::diagnostics::CompileDisposition::OneShot,
+            );
+            compile(rope_rotate_impl, true)(&args)?
+        }
     } else {
-        mlx_gen::diagnostics::record_fallback(
-            "qwen_image::attention::rope_rotate",
-            "compiled_glue_disabled",
-        );
-        f(&args)?
+        mlx_gen::diagnostics::record_fallback(SITE_ROPE_ROTATE, "compiled_glue_disabled");
+        rope_rotate_impl(&args)?
     };
     let out_i = out.pop().unwrap();
     let out_r = out.pop().unwrap();
@@ -262,5 +292,72 @@ mod sc2963 {
         set_compile_glue(false);
         assert_eq!(max_abs(&cr, &er), 0.0, "rope_rotate real");
         assert_eq!(max_abs(&ci, &ei), 0.0, "rope_rotate imag");
+    }
+
+    #[test]
+    fn retained_rope_reports_miss_hit_and_applied() {
+        use mlx_gen::diagnostics::{
+            self, CompileDisposition, DiagnosticCounter, ToggleDisposition, RETAINED_COMPILATION,
+        };
+
+        RETAINED_ROPE_ROTATE.with(|slot| *slot.borrow_mut() = None);
+        let xr = rnd(&[1, 4, 1, 8], Float32);
+        let xi = rnd(&[1, 4, 1, 8], Float32);
+        let cos = rnd(&[1, 4, 1, 8], Float32);
+        let sin = rnd(&[1, 4, 1, 8], Float32);
+        set_compile_glue(false);
+        let eager = rope_rotate(&xr, &xi, &cos, &sin).unwrap();
+
+        set_compile_glue(true);
+        let scope = diagnostics::begin_request_with_toggles(
+            "qwen-retained-rope",
+            "qwen_image",
+            &[RETAINED_COMPILATION],
+        )
+        .unwrap();
+        for retained in [
+            rope_rotate(&xr, &xi, &cos, &sin).unwrap(),
+            rope_rotate(&xr, &xi, &cos, &sin).unwrap(),
+        ] {
+            assert_eq!(max_abs(&retained.0, &eager.0), 0.0);
+            assert_eq!(max_abs(&retained.1, &eager.1), 0.0);
+        }
+        let report = scope.finish();
+        for disposition in [
+            CompileDisposition::RetainedMiss,
+            CompileDisposition::RetainedHit,
+        ] {
+            assert!(report.counters.iter().any(|counter| matches!(
+                counter,
+                DiagnosticCounter::Compile {
+                    site: SITE_ROPE_ROTATE,
+                    disposition: recorded,
+                    count: 1,
+                } if *recorded == disposition
+            )));
+        }
+        assert!(report.counters.iter().any(|counter| matches!(
+            counter,
+            DiagnosticCounter::Toggle {
+                toggle: RETAINED_COMPILATION,
+                disposition: ToggleDisposition::Applied,
+                count: 2,
+            }
+        )));
+
+        let baseline = diagnostics::begin_request("qwen-oneshot-rope", "qwen_image").unwrap();
+        let _ = rope_rotate(&xr, &xi, &cos, &sin).unwrap();
+        let baseline = baseline.finish();
+        assert!(baseline.counters.iter().any(|counter| matches!(
+            counter,
+            DiagnosticCounter::Compile {
+                site: SITE_ROPE_ROTATE,
+                disposition: CompileDisposition::OneShot,
+                count: 1,
+            }
+        )));
+
+        set_compile_glue(false);
+        RETAINED_ROPE_ROTATE.with(|slot| *slot.borrow_mut() = None);
     }
 }

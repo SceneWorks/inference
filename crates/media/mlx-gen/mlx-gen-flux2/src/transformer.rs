@@ -12,7 +12,7 @@
 use mlx_rs::error::Exception;
 use mlx_rs::fast::{layer_norm, rms_norm};
 use mlx_rs::ops::{add, concatenate_axis, multiply, sigmoid, split};
-use mlx_rs::transforms::compile::compile;
+use mlx_rs::transforms::compile::{compile, compile_retained};
 use mlx_rs::{Array, Dtype};
 use std::f32::consts::LN_10;
 
@@ -43,6 +43,37 @@ const RMS_EPS: f32 = 1e-5;
 // FLUX.2's modulate keeps a strong f32 `1` via `one_matches_scale = false`. SwiGLU stays crate-specific.
 use mlx_gen::nn::compile_glue;
 pub use mlx_gen::nn::{set_compile_glue, CompileGlueGuard};
+
+const SITE_SWIGLU: &str = "flux2::transformer::swiglu";
+
+fn swiglu_impl((a, b): (&Array, &Array)) -> std::result::Result<Array, Exception> {
+    multiply(&multiply(a, &sigmoid(a)?)?, b)
+}
+
+thread_local! {
+    static RETAINED_SWIGLU: std::cell::RefCell<Option<mlx_gen::nn::RetainedBinary>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn retained_swiglu(args: (&Array, &Array)) -> std::result::Result<Array, mlx_rs::error::Exception> {
+    mlx_gen::nn::prepare_retained_compilation_thread();
+    RETAINED_SWIGLU.with(|slot| {
+        slot.borrow_mut()
+            .get_or_insert_with(|| {
+                mlx_gen::nn::RetainedBinary::new(compile_retained(swiglu_impl, true))
+            })
+            .call(SITE_SWIGLU, args)
+    })
+}
+
+/// Exercise this crate's production retained handle once for the release memory audit.
+#[doc(hidden)]
+pub fn exercise_retained_compile_inventory(input: &Array) -> Result<()> {
+    let output = retained_swiglu((input, input))?;
+    output.eval()?;
+    drop(output);
+    Ok(())
+}
 
 fn require_f32_input(x: &Array) -> Result<Array> {
     Ok(x.as_dtype(Dtype::Float32)?)
@@ -120,17 +151,24 @@ fn attention(
 
 /// SwiGLU: split last axis in half, `silu(x1) · x2`. The `split` runs eagerly (a shapeless
 /// `mx.compile` can't infer a split's output shapes); the fusable `silu(x1)·x2` arithmetic is
-/// compiled into one kernel when the sc-2963 glue toggle is on. Bit-exact to the eager
-/// `multiply(silu(x1), x2)` — the inline `a·sigmoid(a)` mirrors [`mlx_gen::nn::silu`] op-for-op.
+/// compiled into one kernel when the sc-2963 glue toggle is on. The inline `a·sigmoid(a)` mirrors
+/// [`mlx_gen::nn::silu`] op-for-op; under MLX 0.32 the compiled path remains exact to eager at bf16
+/// and may differ by 1-2 ULP at f32, within [`mlx_gen::nn::COMPILED_GLUE_F32_ULP_TOL`].
 fn swiglu(x: &Array) -> Result<Array> {
     let p = split(x, 2, -1)?;
-    let f = |(a, b): (&Array, &Array)| -> std::result::Result<Array, Exception> {
-        multiply(&multiply(a, &sigmoid(a)?)?, b) // silu(a)·b
-    };
     if compile_glue() {
-        Ok(compile(f, true)((&p[0], &p[1]))?)
+        if mlx_gen::nn::retained_compilation_requested() {
+            Ok(retained_swiglu((&p[0], &p[1]))?)
+        } else {
+            mlx_gen::diagnostics::record_compile(
+                SITE_SWIGLU,
+                mlx_gen::diagnostics::CompileDisposition::OneShot,
+            );
+            Ok(compile(swiglu_impl, true)((&p[0], &p[1]))?)
+        }
     } else {
-        Ok(f((&p[0], &p[1]))?)
+        mlx_gen::diagnostics::record_fallback(SITE_SWIGLU, "compiled_glue_disabled");
+        Ok(swiglu_impl((&p[0], &p[1]))?)
     }
 }
 
@@ -1619,6 +1657,108 @@ pub type Flux2TransformerConfig = Flux2Config;
 mod tests {
     use super::*;
     use mlx_gen::adapters::{install_adapter, Adapter};
+
+    #[test]
+    fn retained_binary_swiglu_matches_oneshot_and_preserves_numeric_contract() {
+        use mlx_gen::diagnostics::{
+            self, CompileDisposition, DiagnosticCounter, ToggleDisposition, RETAINED_COMPILATION,
+        };
+        use mlx_rs::Dtype::{Bfloat16, Float32};
+
+        for dtype in [Float32, Bfloat16] {
+            let x = Array::from_slice(&[1.0f32, -2.0, 0.5, 3.0, -0.25, 2.0, 4.0, -1.0], &[1, 1, 8])
+                .as_dtype(dtype)
+                .unwrap();
+            set_compile_glue(false);
+            let eager = swiglu(&x).unwrap();
+            eager.eval().unwrap();
+
+            mlx_rs::transforms::compile::clear_cache();
+            let scope =
+                diagnostics::begin_request(format!("flux2-oneshot-binary-{dtype:?}"), "test")
+                    .unwrap();
+            set_compile_glue(true);
+            let oneshot = swiglu(&x).unwrap();
+            oneshot.eval().unwrap();
+            let oneshot_report = scope.finish();
+            set_compile_glue(false);
+            assert_eq!(
+                oneshot_report.counters,
+                vec![DiagnosticCounter::Compile {
+                    site: SITE_SWIGLU,
+                    disposition: CompileDisposition::OneShot,
+                    count: 1,
+                }],
+                "no-toggle request must record only the one-shot compile"
+            );
+
+            mlx_rs::transforms::compile::clear_cache();
+            RETAINED_SWIGLU.with(|slot| *slot.borrow_mut() = None);
+            let scope = diagnostics::begin_request_with_toggles(
+                format!("flux2-retained-binary-{dtype:?}"),
+                "test",
+                &[RETAINED_COMPILATION],
+            )
+            .unwrap();
+            set_compile_glue(true);
+            let first = swiglu(&x).unwrap();
+            first.eval().unwrap();
+            let second = swiglu(&x).unwrap();
+            second.eval().unwrap();
+            let retained_report = scope.finish();
+            set_compile_glue(false);
+            assert_eq!(
+                retained_report.counters,
+                vec![
+                    DiagnosticCounter::Compile {
+                        site: SITE_SWIGLU,
+                        disposition: CompileDisposition::RetainedMiss,
+                        count: 1,
+                    },
+                    DiagnosticCounter::Compile {
+                        site: SITE_SWIGLU,
+                        disposition: CompileDisposition::RetainedHit,
+                        count: 1,
+                    },
+                    DiagnosticCounter::Toggle {
+                        toggle: RETAINED_COMPILATION,
+                        disposition: ToggleDisposition::Applied,
+                        count: 2,
+                    },
+                ],
+                "retained request must prove one miss, one hit, and two applied calls"
+            );
+
+            assert_eq!(eager.dtype(), dtype);
+            assert_eq!(oneshot.dtype(), dtype);
+            assert_eq!(first.dtype(), dtype);
+            assert_eq!(second.dtype(), dtype);
+            assert_eq!(
+                first, oneshot,
+                "retained miss must match one-shot {dtype:?}"
+            );
+            assert_eq!(
+                second, oneshot,
+                "retained hit must match one-shot {dtype:?}"
+            );
+
+            // MLX 0.32 fused f32 elementwise glue may round 1-2 ULP differently from eager, while
+            // bf16 remains bit-identical. Retention must not change either established contract.
+            let tol = if dtype == Float32 {
+                mlx_gen::nn::COMPILED_GLUE_F32_ULP_TOL
+            } else {
+                0.0
+            };
+            let rel = mlx_gen::nn::max_rel_diff(&oneshot, &eager);
+            assert!(
+                rel <= tol,
+                "swiglu one-shot vs eager {dtype:?}: rel|Δ|={rel:e} exceeds {tol:e}"
+            );
+            assert_eq!(mlx_gen::nn::max_rel_diff(&first, &eager), rel);
+            assert_eq!(mlx_gen::nn::max_rel_diff(&second, &eager), rel);
+        }
+        RETAINED_SWIGLU.with(|slot| *slot.borrow_mut() = None);
+    }
 
     #[test]
     fn timestep_embedding_shape_and_flip() {
