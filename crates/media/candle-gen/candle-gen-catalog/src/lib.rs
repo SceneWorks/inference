@@ -3952,12 +3952,19 @@ mod tests {
         assert_eq!(
             trainers,
             [
+                "anima_base",
+                "kolors",
                 "krea_2_raw",
                 "krea_2_control",
                 "lens",
                 "ltx_2_3",
+                "mage_flow_base",
+                "sd3_5_large",
+                "sd3_5_medium",
                 "sdxl",
                 "wan2_2_t2v_14b",
+                "wan2_2_i2v_14b",
+                "wan2_2_ti2v_5b",
                 "z_image_turbo",
             ]
         );
@@ -3969,8 +3976,8 @@ mod tests {
         assert_eq!(text_embedders, ["clip_vit_l14_text"]);
 
         // sc-16667: the pinned surface and the model-weight licence mapping move together — this is
-        // where a surface change and a mapping change meet. Five of the seven trainer ids are also
-        // generator ids, which is why 52 + 7 + 1 + 2 registrations are 57 distinct ids.
+        // where a surface change and a mapping change meet. Twelve of the fourteen trainer ids are
+        // also generator ids, which is why 52 + 14 + 1 + 2 registrations are 57 distinct ids.
         //
         // Registration is never conditioned on the mapping: 48 < 57 because nine ids load nothing
         // the shared checkpoint table covers, and they ship exactly as before. That gap is a hole in

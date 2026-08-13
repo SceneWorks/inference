@@ -79,6 +79,23 @@ enum Adapter {
     /// the `alpha/rank` ratio folded in at resolution). The **deferred two-small-matmul** form — never
     /// the `[out,in]` product — so it stays memory-free on any quant.
     Lora { a: Tensor, b: Tensor, scale: f64 },
+    /// Training LoRA keeps the canonical `down [rank,in]` / `up [out,rank]` variable leaves and
+    /// transposes them inside every forward. Holding a precomputed transpose here would retain an
+    /// eager graph node from adapter installation rather than make the owning `Var`s leaves of each
+    /// new loss graph, so gradients and subsequent `Var::set` updates would be silently lost.
+    TrainableLora {
+        down: Tensor,
+        up: Tensor,
+        scale: f64,
+    },
+    /// Training LoKr retains live `Var` leaves and reconstructs only its bounded structured factors
+    /// inside the current forward graph. This is the LoKr twin of `TrainableLora`.
+    TrainableLokr {
+        w1: Tensor,
+        w2: Tensor,
+        base_shape: (usize, usize),
+        scale: f64,
+    },
     /// Structured LoKr residual via the Kronecker vec-trick — the FULL `(alpha/rank)·strength` scale is
     /// baked into [`LokrFactors::w2`], so a LoKr applies WITHOUT ever forming the `[out,in]` delta (the
     /// packed-capable path the whole hoist adds over Wan's old dense-only delta).
@@ -123,6 +140,8 @@ impl Adapter {
     fn is_zero(&self) -> bool {
         match self {
             Adapter::Lora { scale, .. } => *scale == 0.0,
+            Adapter::TrainableLora { scale, .. } => *scale == 0.0,
+            Adapter::TrainableLokr { scale, .. } => *scale == 0.0,
             Adapter::LokrStructured { factors } => factors.scale == 0.0,
         }
     }
@@ -135,6 +154,32 @@ impl Adapter {
                 let r = apply_factor(&apply_factor(x, &a.to_dtype(xd)?)?, &b.to_dtype(xd)?)?;
                 r * *scale
             }
+            Adapter::TrainableLora { down, up, scale } => {
+                let xd = x.dtype();
+                let down = down.to_dtype(xd)?;
+                let up = up.to_dtype(xd)?;
+                let r = apply_factor(&apply_factor(x, &down.t()?)?, &up.t()?)?;
+                r * *scale
+            }
+            Adapter::TrainableLokr {
+                w1,
+                w2,
+                base_shape,
+                scale,
+            } => LokrFactors::build(
+                *scale,
+                *base_shape,
+                Some(w1),
+                None,
+                None,
+                Some(w2),
+                None,
+                None,
+                None,
+            )
+            .map_err(|error| candle_core::Error::Msg(error.to_string()))?
+            .ok_or_else(|| candle_core::Error::Msg("trainable LoKr factors lost 2-D shape".into()))?
+            .residual(x),
             // The `scale` is already baked into `factors.w2`, so the vec-trick returns directly.
             Adapter::LokrStructured { factors } => factors.residual(x),
         }
@@ -146,6 +191,14 @@ impl Adapter {
             Adapter::Lora { a, b, .. } => {
                 *a = a.to_device(device)?;
                 *b = b.to_device(device)?;
+            }
+            Adapter::TrainableLora { down, up, .. } => {
+                *down = down.to_device(device)?;
+                *up = up.to_device(device)?;
+            }
+            Adapter::TrainableLokr { w1, w2, .. } => {
+                *w1 = w1.to_device(device)?;
+                *w2 = w2.to_device(device)?;
             }
             // `LokrFactors` fields are same-module-private; move `w1`/`w2` directly (candle_core::Result).
             Adapter::LokrStructured { factors } => {
@@ -682,6 +735,25 @@ impl AdaptLinear {
     /// tier keeps its footprint.
     pub fn push_lora(&mut self, a: Tensor, b: Tensor, scale: f64) {
         self.adapters.push(Adapter::Lora { a, b, scale });
+    }
+
+    /// Attach a trainable LoRA residual whose canonical factors are `Var`-backed. Unlike
+    /// [`Self::push_lora`], this deliberately performs the factor transposes during each forward so
+    /// every loss graph terminates at the live factor leaves and observes optimizer updates.
+    pub fn push_trainable_lora(&mut self, down: Tensor, up: Tensor, scale: f64) {
+        self.adapters
+            .push(Adapter::TrainableLora { down, up, scale });
+    }
+
+    /// Attach live full-factor LoKr leaves for training. The base shape is captured here so the
+    /// bounded Kronecker residual can be rebuilt inside every eager loss graph.
+    pub fn push_trainable_lokr(&mut self, w1: Tensor, w2: Tensor, scale: f64) {
+        self.adapters.push(Adapter::TrainableLokr {
+            w1,
+            w2,
+            base_shape: self.base_shape(),
+            scale,
+        });
     }
 
     /// Attach a forward-time **structured LoKr** residual via the Kronecker vec-trick: the full

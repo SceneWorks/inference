@@ -28,8 +28,8 @@ use crate::vae::{load_vae, QwenVae};
 /// three variants (the exact bug in HuggingFace's own `convert_anima_to_diffusers.py`).
 const PREFIX_ANCHOR: &str = ".x_embedder.proj.1.weight";
 
-const TEXT_ENCODER_FILE: &str = "text_encoders/qwen_3_06b_base.safetensors";
-const VAE_FILE: &str = "vae/qwen_image_vae.safetensors";
+pub(crate) const TEXT_ENCODER_FILE: &str = "text_encoders/qwen_3_06b_base.safetensors";
+pub(crate) const VAE_FILE: &str = "vae/qwen_image_vae.safetensors";
 
 /// The compute dtype for the DiT / conditioner / text encoder: bf16 on the GPU backends (the native
 /// checkpoint dtype), f32 on CPU (bf16 CPU kernels are slow/unsupported, and f32 is the parity lane).
@@ -95,7 +95,7 @@ fn dit_path_is_packed(dit_path: &Path) -> Result<bool> {
 }
 
 /// Resolve the `split_files/` directory holding `diffusion_models/`, `text_encoders/`, `vae/`.
-fn resolve_split_files(source: &WeightsSource) -> Result<PathBuf> {
+pub(crate) fn resolve_split_files(source: &WeightsSource) -> Result<PathBuf> {
     match source {
         WeightsSource::Dir(p) => {
             if p.join("diffusion_models").is_dir() {

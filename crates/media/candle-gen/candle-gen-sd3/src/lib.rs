@@ -34,6 +34,7 @@ pub mod memory;
 pub mod pipeline;
 pub mod preview;
 pub mod quant;
+pub mod training;
 pub mod transformer;
 pub mod vae;
 
@@ -376,6 +377,8 @@ pub fn register_providers(
         .register_generator(LARGE_REGISTRATION)
         .register_generator(TURBO_REGISTRATION)
         .register_generator(MEDIUM_REGISTRATION)
+        .register_trainer(training::LARGE_TRAINER_REGISTRATION)
+        .register_trainer(training::MEDIUM_TRAINER_REGISTRATION)
 }
 
 /// Build the complete explicit Candle SD3 provider catalog.

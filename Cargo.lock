@@ -739,6 +739,7 @@ dependencies = [
  "candle-transformers",
  "image",
  "rand",
+ "safetensors 0.7.0",
  "sceneworks-gen-core",
  "sceneworks-gen-core-testkit",
  "serde_json",
@@ -933,6 +934,7 @@ dependencies = [
  "rand_distr",
  "safetensors 0.7.0",
  "sceneworks-gen-core-testkit",
+ "serde_json",
  "tempfile",
  "tokenizers 0.22.2",
 ]
