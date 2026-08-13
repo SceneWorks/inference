@@ -48,9 +48,9 @@ fi
 # ~20 GiB q4 tier into RUNNER_TEMP.
 export KREA_TURBO_DIR="$KREA_TIER"
 
-# The manifest check binds the complete q4 base to its immutable repository revision and required
-# file set. The donor is intentionally the resident q8 copy: every tier carries the same unquantized
-# VAE, and the digest below binds the exact standalone file used by the production component seam.
+# The manifest checks bind the complete q4 base and the workflow-provisioned standalone q8 donor to
+# their immutable repository revisions and required file sets. Every video tier carries the same
+# unquantized VAE; the digest below additionally binds the exact file used by the component seam.
 python3.12 scripts/release/verify_model_snapshot.py \
   --model krea-2-turbo-mlx-q4 \
   --snapshot "$KREA_SNAPSHOT"
