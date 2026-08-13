@@ -536,6 +536,10 @@ pub struct LoadSpec {
     /// tokenizer are behavior-bearing inputs even though the backend only receives the encoder
     /// source. Only crate-owned validation APIs may populate this set.
     prepared_receipt_paths: BTreeSet<PathBuf>,
+    /// Exact selected-encoder source shape and direct-shard inventory paired with
+    /// [`prepared_receipt_paths`](Self::prepared_receipt_paths). Known file tokens reject mutation;
+    /// this receipt additionally rejects directory additions, removals, renames, and type changes.
+    prepared_encoder_receipt: Option<crate::encoder_contract::PreparedEncoderLoadReceipt>,
     pub quantize: Option<Quant>,
     pub precision: Precision,
     /// Auxiliary control-branch weights overlaid onto the base model at load time — a ControlNet
@@ -689,6 +693,7 @@ impl LoadSpec {
             weights,
             prepared_file_pins: PreparedFilePins::default(),
             prepared_receipt_paths: BTreeSet::new(),
+            prepared_encoder_receipt: None,
             quantize: None,
             precision: Precision::Bf16,
             control: None,
@@ -750,7 +755,7 @@ impl LoadSpec {
             finalized: true,
             pins,
         };
-        if !self.prepared_receipt_paths.is_empty() {
+        if !self.prepared_receipt_paths.is_empty() || self.prepared_encoder_receipt.is_some() {
             return Err(crate::Error::Unsupported(
                 "validated receipt identity must be installed through its owning contract".into(),
             ));
@@ -772,6 +777,7 @@ impl LoadSpec {
         &mut self,
         prepared: impl IntoIterator<Item = PinnedWeightsFile>,
         receipt_paths: impl IntoIterator<Item = PathBuf>,
+        encoder_receipt: crate::encoder_contract::PreparedEncoderLoadReceipt,
     ) -> crate::Result<()> {
         let mut pins = BTreeMap::new();
         for pin in prepared {
@@ -794,15 +800,19 @@ impl LoadSpec {
         };
         let previous_receipt_paths =
             std::mem::replace(&mut self.prepared_receipt_paths, receipt_paths);
+        let previous_encoder_receipt = self.prepared_encoder_receipt.replace(encoder_receipt);
         if let Err(error) = self.validate_prepared_file_pin_set_for(&candidate) {
             self.prepared_receipt_paths = previous_receipt_paths;
+            self.prepared_encoder_receipt = previous_encoder_receipt;
             return Err(error);
         }
         if self.prepared_file_pins.is_finalized()
             && (self.prepared_file_pins != candidate
-                || self.prepared_receipt_paths != previous_receipt_paths)
+                || self.prepared_receipt_paths != previous_receipt_paths
+                || self.prepared_encoder_receipt != previous_encoder_receipt)
         {
             self.prepared_receipt_paths = previous_receipt_paths;
+            self.prepared_encoder_receipt = previous_encoder_receipt;
             return Err(crate::Error::Unsupported(
                 "cannot replace finalized LoadSpec receipt identity".into(),
             ));
@@ -1016,6 +1026,9 @@ impl LoadSpec {
     }
 
     fn validate_prepared_file_pin_set_for(&self, prepared: &PreparedFilePins) -> crate::Result<()> {
+        if let Some(receipt) = &self.prepared_encoder_receipt {
+            receipt.ensure_unchanged_for(self.text_encoder.as_ref())?;
+        }
         let mut expected: Vec<PathBuf> = self
             .file_source_paths()
             .into_iter()

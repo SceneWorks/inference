@@ -216,6 +216,17 @@ pub struct ValidatedEncoderSource {
     tokenizer: Option<ValidatedTokenizerSource>,
 }
 
+/// Exact selected-encoder source shape and direct-shard inventory exported onto a prepared
+/// [`crate::LoadSpec`]. File pins guard every accepted object; this companion receipt preserves the
+/// directory-enumeration invariant so a later shard addition, removal, rename, or type change cannot
+/// enter a provider load without changing the prepared identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PreparedEncoderLoadReceipt {
+    requested_source: WeightsSource,
+    pinned: PinnedEncoderSource,
+    tokenizer: Option<ValidatedTokenizerSource>,
+}
+
 /// How a validated encoder source relates to the provider's retained tokenizer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EncoderTokenizerDisposition {
@@ -228,20 +239,22 @@ pub enum EncoderTokenizerDisposition {
 /// Exact tokenizer artifact(s) pinned by encoder validation. Production parsers consume the base
 /// path only through [`Self::read_unchanged`], so the bytes validated for literal IDs and semantic
 /// identity are the bytes parsed at runtime.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ValidatedTokenizerSource {
     base: PinnedTokenizerArtifact,
+    base_candidates: Vec<PathBuf>,
     selected: Option<PinnedTokenizerArtifact>,
+    selected_candidates: Option<Vec<PathBuf>>,
     disposition: EncoderTokenizerDisposition,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct PinnedTokenizerArtifact {
     pin: PinnedWeightsFile,
     semantic_sha256: [u8; 32],
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct PinnedEncoderSource {
     weights: WeightsSource,
     shard_paths: Vec<PathBuf>,
@@ -325,7 +338,15 @@ impl ValidatedEncoderSource {
             .iter()
             .map(|pin| pin.loader_path().to_path_buf())
             .collect::<Vec<_>>();
-        candidate.prepare_with_validated_receipt_pins(prepared, receipt_paths)?;
+        candidate.prepare_with_validated_receipt_pins(
+            prepared,
+            receipt_paths,
+            PreparedEncoderLoadReceipt {
+                requested_source: self.requested_source.clone(),
+                pinned: self.pinned.clone(),
+                tokenizer: self.tokenizer.clone(),
+            },
+        )?;
         self.ensure_unchanged()?;
         *spec = candidate;
         Ok(())
@@ -530,6 +551,36 @@ impl ValidatedEncoderSource {
     }
 }
 
+impl PreparedEncoderLoadReceipt {
+    pub(crate) fn ensure_unchanged_for(
+        &self,
+        selected_source: Option<&WeightsSource>,
+    ) -> Result<()> {
+        if selected_source != Some(&self.requested_source) {
+            return Err(Error::Unsupported(
+                "prepared text-encoder receipt no longer matches the LoadSpec source".into(),
+            ));
+        }
+        let (resolved, _) = resolve_source(&self.requested_source)?;
+        if resolved != self.pinned.weights {
+            return Err(Error::Unsupported(format!(
+                "prepared text-encoder source shape changed: expected {}, got {}",
+                source_path(&self.pinned.weights).display(),
+                source_path(&resolved).display()
+            )));
+        }
+        self.pinned.ensure_unchanged().map_err(|error| {
+            Error::Unsupported(format!("prepared text-encoder receipt changed: {error}"))
+        })?;
+        if let Some(tokenizer) = &self.tokenizer {
+            tokenizer.ensure_unchanged().map_err(|error| {
+                Error::Unsupported(format!("prepared text-encoder receipt changed: {error}"))
+            })?;
+        }
+        Ok(())
+    }
+}
+
 impl ValidatedTokenizerSource {
     pub fn path(&self) -> &Path {
         self.base.pin.loader_path()
@@ -557,8 +608,22 @@ impl ValidatedTokenizerSource {
     }
 
     fn ensure_unchanged(&self) -> Result<()> {
+        ensure_tokenizer_resolution_unchanged(
+            &self.base_candidates,
+            self.base.pin.loader_path(),
+            "base snapshot",
+        )?;
         self.base.pin.ensure_unchanged()?;
         if let Some(selected) = &self.selected {
+            ensure_tokenizer_resolution_unchanged(
+                self.selected_candidates.as_deref().ok_or_else(|| {
+                    Error::Unsupported(
+                        "selected tokenizer receipt has no candidate inventory".into(),
+                    )
+                })?,
+                selected.pin.loader_path(),
+                "selected complete snapshot",
+            )?;
             selected.pin.ensure_unchanged()?;
         }
         Ok(())
@@ -1035,15 +1100,15 @@ impl EncoderContract {
         match self.tokenizer.binding {
             EncoderTokenizerBinding::RetainBase => {}
         }
-        let base_path = resolve_tokenizer_artifact(
-            base_root,
-            self.tokenizer.artifact_candidates,
-            "base snapshot",
-        )?;
+        let base_candidates =
+            tokenizer_candidate_paths(base_root, self.tokenizer.artifact_candidates)?;
+        let base_path = resolve_tokenizer_artifact(&base_candidates, "base snapshot")?;
         let base = pin_tokenizer_artifact(&base_path, self.tokenizer.required_tokens)?;
         let tokenizer = ValidatedTokenizerSource {
             base,
+            base_candidates,
             selected: None,
+            selected_candidates: None,
             disposition: EncoderTokenizerDisposition::InheritedBase,
         };
         tokenizer.ensure_unchanged()?;
@@ -1057,11 +1122,10 @@ impl EncoderContract {
     ) -> Result<ValidatedTokenizerSource> {
         let mut tokenizer = self.tokenizer_for_base(base_root)?;
         if let Some(selected_root) = selected_complete_snapshot_root(selected_source) {
-            let selected_path = resolve_tokenizer_artifact(
-                selected_root,
-                self.tokenizer.artifact_candidates,
-                "selected complete snapshot",
-            )?;
+            let selected_candidates =
+                tokenizer_candidate_paths(selected_root, self.tokenizer.artifact_candidates)?;
+            let selected_path =
+                resolve_tokenizer_artifact(&selected_candidates, "selected complete snapshot")?;
             let selected = pin_tokenizer_artifact(&selected_path, self.tokenizer.required_tokens)?;
             if selected.semantic_sha256 != tokenizer.base.semantic_sha256 {
                 return Err(Error::Unsupported(format!(
@@ -1074,6 +1138,7 @@ impl EncoderContract {
                 )));
             }
             tokenizer.selected = Some(selected);
+            tokenizer.selected_candidates = Some(selected_candidates);
             tokenizer.disposition = EncoderTokenizerDisposition::MatchedSelectedTokenizer;
         }
         tokenizer.ensure_unchanged()?;
@@ -3067,18 +3132,38 @@ fn selected_complete_snapshot_root(source: &WeightsSource) -> Option<&Path> {
     }
 }
 
-fn resolve_tokenizer_artifact(root: &Path, candidates: &[&str], label: &str) -> Result<PathBuf> {
-    for candidate in candidates {
-        let path = root.join(candidate);
+fn tokenizer_candidate_paths(root: &Path, candidates: &[&str]) -> Result<Vec<PathBuf>> {
+    candidates
+        .iter()
+        .map(|candidate| std::path::absolute(root.join(candidate)).map_err(Error::from))
+        .collect()
+}
+
+fn resolve_tokenizer_artifact(candidates: &[PathBuf], label: &str) -> Result<PathBuf> {
+    for path in candidates {
         if path.is_file() {
-            return Ok(path);
+            return Ok(path.clone());
         }
     }
     Err(Error::Unsupported(format!(
-        "{label} has no retained tokenizer artifact for encoder compatibility: expected one of {:?} under {}",
-        candidates,
-        root.display()
+        "{label} has no retained tokenizer artifact for encoder compatibility: expected one of {candidates:?}"
     )))
+}
+
+fn ensure_tokenizer_resolution_unchanged(
+    candidates: &[PathBuf],
+    expected: &Path,
+    label: &str,
+) -> Result<()> {
+    let current = resolve_tokenizer_artifact(candidates, label)?;
+    if current != expected {
+        return Err(Error::Unsupported(format!(
+            "{label} tokenizer selection changed after validation: expected {}, got {}",
+            expected.display(),
+            current.display()
+        )));
+    }
+    Ok(())
 }
 
 fn pin_tokenizer_artifact(
@@ -3858,6 +3943,217 @@ mod tests {
                 "missing prepared receipt path"
             );
         }
+
+        std::fs::write(
+            selected.join("tokenizer/tokenizer.json"),
+            br#"{"added_tokens":[]}"#,
+        )
+        .unwrap();
+        let opened = std::cell::Cell::new(false);
+        let error = spec
+            .read_prepared_files_unchanged::<(), Error>(|| {
+                opened.set(true);
+                Ok(())
+            })
+            .expect_err("mutated selected tokenizer must fail before provider load")
+            .to_string();
+        assert!(!opened.get());
+        assert!(error.contains("pinned weights"), "{error}");
+    }
+
+    #[test]
+    fn prepared_directory_receipt_rejects_shard_inventory_mutation() {
+        for mutation in ["addition", "removal", "rename", "type"] {
+            let temp = tempfile::tempdir().unwrap();
+            let base = temp.path().join("base");
+            let selected = temp.path().join("selected");
+            std::fs::create_dir_all(&base).unwrap();
+            write_tokenizer_fixture(&base);
+            write_fixture(&selected, 8);
+            let shard = selected.join("model.safetensors");
+            let mut spec = crate::LoadSpec::new(WeightsSource::Dir(base.clone()));
+            let validated = CONTRACT
+                .validate_source_against_base(&WeightsSource::Dir(selected.clone()), &base)
+                .unwrap();
+            validated.prepare_load_spec(&mut spec).unwrap();
+
+            match mutation {
+                "addition" => {
+                    std::fs::copy(&shard, selected.join("added.safetensors")).unwrap();
+                }
+                "removal" => std::fs::remove_file(&shard).unwrap(),
+                "rename" => {
+                    std::fs::rename(&shard, selected.join("renamed.safetensors")).unwrap();
+                }
+                "type" => {
+                    std::fs::remove_file(&shard).unwrap();
+                    std::fs::create_dir(&shard).unwrap();
+                }
+                _ => unreachable!(),
+            }
+
+            let opened = std::cell::Cell::new(false);
+            let error = spec
+                .read_prepared_files_unchanged::<(), Error>(|| {
+                    opened.set(true);
+                    Ok(())
+                })
+                .expect_err("mutated direct-shard inventory must fail before provider load")
+                .to_string();
+            assert!(!opened.get(), "{mutation} reached the provider callback");
+            assert!(
+                error.contains("receipt changed") || error.contains("pinned weights"),
+                "{mutation}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_encoder_receipt_rejects_selected_source_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("base");
+        let selected = temp.path().join("selected");
+        std::fs::create_dir_all(&base).unwrap();
+        write_tokenizer_fixture(&base);
+        write_fixture(&selected, 8);
+        let mut spec = crate::LoadSpec::new(WeightsSource::Dir(base.clone()));
+        let validated = CONTRACT
+            .validate_source_against_base(&WeightsSource::Dir(selected), &base)
+            .unwrap();
+        validated.prepare_load_spec(&mut spec).unwrap();
+
+        spec.text_encoder = Some(WeightsSource::Dir(temp.path().join("replacement")));
+        let error = spec
+            .validate_prepared_file_pins()
+            .expect_err("prepared encoder source replacement must fail closed")
+            .to_string();
+        assert!(error.contains("no longer matches"), "{error}");
+    }
+
+    #[test]
+    fn prepared_file_receipt_rejects_later_config_sidecar() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("base");
+        let selected = temp.path().join("selected");
+        std::fs::create_dir_all(&base).unwrap();
+        write_tokenizer_fixture(&base);
+        write_fixture(&selected, 8);
+        let selected_file = selected.join("model.safetensors");
+        std::fs::remove_file(selected.join("config.json")).unwrap();
+        let mut spec = crate::LoadSpec::new(WeightsSource::Dir(base.clone()));
+        let validated = CONTRACT
+            .validate_comfyui_source_against_base(&WeightsSource::File(selected_file), &base)
+            .unwrap();
+        validated.prepare_load_spec(&mut spec).unwrap();
+
+        std::fs::write(selected.join("config.json"), b"{}").unwrap();
+        let opened = std::cell::Cell::new(false);
+        let error = spec
+            .read_prepared_files_unchanged::<(), Error>(|| {
+                opened.set(true);
+                Ok(())
+            })
+            .expect_err("a newly added behavior sidecar must fail before provider load")
+            .to_string();
+        assert!(!opened.get());
+        assert!(error.contains("receipt changed"), "{error}");
+    }
+
+    #[test]
+    fn prepared_direct_directory_rejects_complete_snapshot_reinterpretation() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("base");
+        let selected = temp.path().join("selected");
+        std::fs::create_dir_all(&base).unwrap();
+        write_tokenizer_fixture(&base);
+        write_fixture(&selected, 8);
+        let mut spec = crate::LoadSpec::new(WeightsSource::Dir(base.clone()));
+        let validated = CONTRACT
+            .validate_source_against_base(&WeightsSource::Dir(selected.clone()), &base)
+            .unwrap();
+        validated.prepare_load_spec(&mut spec).unwrap();
+
+        write_fixture(&selected.join("text_encoder"), 8);
+        let error = spec
+            .validate_prepared_file_pins()
+            .expect_err("a direct component cannot become a complete snapshot after preparation")
+            .to_string();
+        assert!(error.contains("source shape changed"), "{error}");
+    }
+
+    #[test]
+    fn prepared_receipt_rejects_higher_priority_tokenizer_candidate_addition() {
+        const CANDIDATE_TOKENIZER: EncoderTokenizerContract = EncoderTokenizerContract {
+            artifact_candidates: &["tokenizer/tokenizer.json", "processor/tokenizer.json"],
+            ..TEST_TOKENIZER
+        };
+        const CANDIDATE_CONTRACT: EncoderContract = EncoderContract {
+            tokenizer: CANDIDATE_TOKENIZER,
+            ..CONTRACT
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("base");
+        let selected = temp.path().join("selected");
+        write_tokenizer_fixture(&base);
+        std::fs::create_dir_all(base.join("processor")).unwrap();
+        std::fs::rename(
+            base.join("tokenizer/tokenizer.json"),
+            base.join("processor/tokenizer.json"),
+        )
+        .unwrap();
+        write_fixture(&selected, 8);
+        let mut spec = crate::LoadSpec::new(WeightsSource::Dir(base.clone()));
+        let validated = CANDIDATE_CONTRACT
+            .validate_source_against_base(&WeightsSource::Dir(selected), &base)
+            .unwrap();
+        validated.prepare_load_spec(&mut spec).unwrap();
+
+        write_tokenizer_fixture(&base);
+        let error = spec
+            .validate_prepared_file_pins()
+            .expect_err("a new higher-priority tokenizer must not replace the retained artifact")
+            .to_string();
+        assert!(error.contains("tokenizer selection changed"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepared_directory_receipt_rejects_shard_symlink_retarget() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("base");
+        let selected = temp.path().join("selected");
+        std::fs::create_dir_all(&base).unwrap();
+        write_tokenizer_fixture(&base);
+        write_fixture(&selected, 8);
+        let selected_shard = selected.join("model.safetensors");
+        let target_a = temp.path().join("target-a.safetensors");
+        let target_b = temp.path().join("target-b.safetensors");
+        std::fs::rename(&selected_shard, &target_a).unwrap();
+        std::fs::copy(&target_a, &target_b).unwrap();
+        symlink(&target_a, &selected_shard).unwrap();
+        let mut spec = crate::LoadSpec::new(WeightsSource::Dir(base.clone()));
+        let validated = CONTRACT
+            .validate_source_against_base(&WeightsSource::Dir(selected.clone()), &base)
+            .unwrap();
+        validated.prepare_load_spec(&mut spec).unwrap();
+
+        let staged = selected.join("staged.safetensors");
+        symlink(&target_b, &staged).unwrap();
+        std::fs::rename(staged, &selected_shard).unwrap();
+
+        let opened = std::cell::Cell::new(false);
+        let error = spec
+            .read_prepared_files_unchanged::<(), Error>(|| {
+                opened.set(true);
+                Ok(())
+            })
+            .expect_err("retargeted shard symlink must fail before provider load")
+            .to_string();
+        assert!(!opened.get());
+        assert!(error.contains("pinned weights"), "{error}");
     }
 
     #[test]
