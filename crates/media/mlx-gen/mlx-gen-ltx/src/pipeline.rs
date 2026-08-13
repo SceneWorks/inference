@@ -1021,6 +1021,8 @@ pub fn generate_av_latents(
 #[derive(Clone, Copy)]
 pub struct StageClip<'a> {
     pub stage1: &'a Array,
+    /// Output-frame coordinate consumed by the appended-token RoPE path. The legacy field name is
+    /// retained for source compatibility; request latent indices are converted before construction.
     pub frame_idx: i32,
     pub strength: f32,
 }

@@ -1,8 +1,8 @@
-//! Pipeline glue for LTX-2.3 txt2video: latent geometry, deterministic CPU-seeded noise (sc-3673),
-//! latent token flatten/unflatten, and frames → `gen_core::Image`.
+//! Pipeline glue for LTX-2.3 video generation: latent geometry, deterministic CPU-seeded noise,
+//! conditioned/native joint denoise, latent token flatten/unflatten, and frames → `gen_core::Image`.
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor};
-use candle_gen::gen_core::{AudioTrack, Image};
+use candle_gen::gen_core::{AudioTrack, Image, Progress};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 
@@ -11,6 +11,7 @@ use crate::config::{
     AUDIO_LATENT_CHANNELS, AUDIO_MEL_BINS, LATENT_CHANNELS, SPATIAL_SCALE, TEMPORAL_SCALE,
 };
 use crate::vocoder::LtxVocoder;
+use crate::{conditioning, transformer::AvDiT};
 
 /// Latent dims `(t_lat, h_lat, w_lat)` for `frames × height × width`: temporal `(F-1)/8 + 1`, spatial
 /// `/32`.
@@ -86,6 +87,69 @@ pub fn unflatten_audio_latent(tokens: &Tensor, t: usize) -> Result<Tensor> {
         .reshape((b, t, c, f))?
         .permute((0, 2, 1, 3))?
         .contiguous()
+}
+
+/// Native distilled Euler for image/keyframe and IC-LoRA clip conditioning. Unlike the generic
+/// sampler driver, this path preserves LTX's per-token timesteps and post-prediction clean-latent
+/// blend. The audio stream remains uniform-sigma, matching the MLX/reference A/V implementation.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_av_conditioned(
+    dit: &AvDiT,
+    video: &conditioning::VideoTokenState,
+    audio: &Tensor,
+    video_ctx: &Tensor,
+    audio_ctx: &Tensor,
+    audio_frames: usize,
+    audio_grid: &Tensor,
+    sigmas: &[f32],
+    cancel: &candle_gen::gen_core::CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> candle_gen::Result<(conditioning::VideoTokenState, Tensor)> {
+    let mut state = video.clone();
+    let mut alat = audio.clone();
+    let total = sigmas.len().saturating_sub(1).max(1) as u32;
+    for (step, window) in sigmas.windows(2).enumerate() {
+        if cancel.is_cancelled() {
+            return Err(candle_gen::CandleError::Canceled);
+        }
+        let (sigma, sigma_next) = (window[0], window[1]);
+        let aflat = flatten_audio_latent(&alat)?;
+        let timesteps = state.token_timesteps(sigma)?;
+        let (vvel, avel) = dit.forward_conditioned(
+            &state.latent,
+            &aflat,
+            &timesteps,
+            sigma as f64,
+            video_ctx,
+            audio_ctx,
+            &state.positions,
+            audio_grid,
+        )?;
+        let avel = unflatten_audio_latent(&avel.to_dtype(DType::F32)?, audio_frames)?;
+        let vden = conditioning::apply_denoise_mask(
+            &(&state.latent - (&vvel.to_dtype(DType::F32)? * sigma as f64)?)?,
+            &state.clean_latent,
+            &state.denoise_mask,
+        )?;
+        let aden = (&alat - (&avel * sigma as f64)?)?;
+        state.latent = if sigma_next <= 0.0 {
+            vden
+        } else {
+            let step = (((&state.latent - &vden)? * sigma_next as f64)? / sigma as f64)?;
+            (&vden + step)?
+        };
+        alat = if sigma_next <= 0.0 {
+            aden
+        } else {
+            let step = (((&alat - &aden)? * sigma_next as f64)? / sigma as f64)?;
+            (&aden + step)?
+        };
+        on_progress(Progress::Step {
+            current: step as u32 + 1,
+            total,
+        });
+    }
+    Ok((state, alat))
 }
 
 /// Decode audio latents → an interleaved-PCM [`AudioTrack`]: `AudioDecoder` → mel `(1,2,T',64)` →

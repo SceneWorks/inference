@@ -194,6 +194,16 @@ fn pass_strengths(spec: &AdapterSpec, num_passes: usize) -> Result<Vec<f32>> {
             spec.path.display()
         )));
     }
+    if let Some((pass, scale)) = scales
+        .iter()
+        .enumerate()
+        .find(|(_, scale)| !scale.is_finite())
+    {
+        return Err(Error::Msg(format!(
+            "ltx_2_3 adapter {}: effective scale for pass {pass} must be finite (got {scale})",
+            spec.path.display()
+        )));
+    }
     Ok(scales)
 }
 
@@ -203,10 +213,35 @@ fn pass_strengths(spec: &AdapterSpec, num_passes: usize) -> Result<Vec<f32>> {
 /// uses [`pass_strengths`] directly — no fold here.)
 fn pass_scales(spec: &AdapterSpec, alpha: f32, rank: f32, num_passes: usize) -> Result<Vec<f32>> {
     let eff = |strength: f32| ((alpha as f64 / rank as f64) * strength as f64) as f32;
-    Ok(pass_strengths(spec, num_passes)?
+    let scales: Vec<f32> = pass_strengths(spec, num_passes)?
         .into_iter()
         .map(eff)
-        .collect())
+        .collect();
+    if let Some((pass, scale)) = scales
+        .iter()
+        .enumerate()
+        .find(|(_, scale)| !scale.is_finite())
+    {
+        return Err(Error::Msg(format!(
+            "ltx_2_3 adapter {}: effective LoRA scale for pass {pass} must be finite (got {scale})",
+            spec.path.display()
+        )));
+    }
+    Ok(scales)
+}
+
+fn require_spec_applied(
+    spec: &AdapterSpec,
+    applied_before: usize,
+    applied_after: usize,
+) -> Result<()> {
+    if applied_after == applied_before {
+        return Err(Error::Msg(format!(
+            "ltx_2_3 adapter {} matched no target module — every selected adapter must apply",
+            spec.path.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Install one LoRA file's residuals onto `host` at `spec`'s strength, accumulating into `report`.
@@ -332,8 +367,8 @@ fn apply_one_thirdparty<G>(
 /// Install every adapter in `specs` onto the LTX transformer, stacking in order (sc-2687 LoRA /
 /// sc-2393 LoKr). `num_passes` is the distilled pipeline's denoise-pass count (for validating +
 /// expanding `pass_scales`). LoRA (PEFT/kohya) and LoKr (`networkType=lokr`) are dispatched by the
-/// file's metadata / the spec kind. Errors only if a non-empty spec list matched no target module
-/// (a format/prefix misconfiguration); per-key skips are reported, not fatal.
+/// file's metadata / the spec kind. Every selected file must match at least one target module;
+/// a valid earlier file cannot mask a later zero-match file. Per-key skips are reported, not fatal.
 pub fn apply_ltx_adapters(
     host: &mut impl LtxAdaptable,
     specs: &[AdapterSpec],
@@ -341,6 +376,7 @@ pub fn apply_ltx_adapters(
 ) -> Result<LtxLoraReport> {
     let mut report = LtxLoraReport::default();
     for spec in specs {
+        let applied_before = report.applied;
         let w = Weights::from_file(&spec.path)?;
         // The file's metadata is authoritative; the spec kind is an additional hint. A spec that
         // declares Lora but whose file says `networkType=lokr` is a caller error (the LoRA loader
@@ -371,14 +407,7 @@ pub fn apply_ltx_adapters(
         } else {
             apply_one(host, &w, spec, num_passes, &mut report)?;
         }
-    }
-    if !specs.is_empty() && report.applied == 0 {
-        return Err(Error::Msg(format!(
-            "ltx_2_3 adapters: no target modules matched across {} file(s) — check the format \
-             (expected PEFT `lora_A/B` or kohya `lora_down/up`, or LoKr `lokr_w1/w2`, with \
-             `diffusion_model.` / `transformer_blocks.*` naming)",
-            specs.len()
-        )));
+        require_spec_applied(spec, applied_before, report.applied)?;
     }
     Ok(report)
 }
@@ -563,6 +592,32 @@ mod tests {
         // The default (no pass_scales) still yields the single uniform strength.
         let plain = AdapterSpec::new("x.safetensors".into(), 0.5, AdapterKind::Lora);
         assert_eq!(pass_strengths(&plain, 2).unwrap(), vec![0.5]);
+    }
+
+    #[test]
+    fn non_finite_spec_and_pass_scales_are_rejected() {
+        let nan = AdapterSpec::new("nan.safetensors".into(), f32::NAN, AdapterKind::Lora);
+        assert!(pass_strengths(&nan, 2).is_err());
+
+        let mut infinite = AdapterSpec::new("inf.safetensors".into(), 1.0, AdapterKind::Lora);
+        infinite.pass_scales = Some(vec![1.0, f32::INFINITY]);
+        assert!(pass_strengths(&infinite, 2).is_err());
+
+        let overflow = AdapterSpec::new("overflow.safetensors".into(), f32::MAX, AdapterKind::Lora);
+        assert!(pass_scales(&overflow, f32::MAX, 1.0, 2).is_err());
+    }
+
+    #[test]
+    fn valid_adapter_cannot_mask_later_zero_match_spec() {
+        let valid = AdapterSpec::new("valid.safetensors".into(), 1.0, AdapterKind::Lora);
+        let unmatched = AdapterSpec::new("unmatched.safetensors".into(), 1.0, AdapterKind::Lora);
+
+        require_spec_applied(&valid, 0, 1).unwrap();
+        let err = require_spec_applied(&unmatched, 1, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unmatched.safetensors"), "{err}");
+        assert!(err.contains("every selected adapter must apply"), "{err}");
     }
 
     /// sc-3671: the LTX crate reconstructs third-party LoKr/LoHa deltas (via the shared core pub

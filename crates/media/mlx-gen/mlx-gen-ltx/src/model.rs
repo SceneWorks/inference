@@ -900,10 +900,11 @@ impl Ltx {
     }
 
     /// Build the in-context conditioning clips ([`Conditioning::VideoClip`] — extend_clip /
-    /// video_bridge) as owned `(stage1_clip_latent, latent_frame_idx, strength)` tuples, each
+    /// video_bridge) as owned `(stage1_clip_latent, output_frame_offset, strength)` tuples, each
     /// VAE-encoded at **stage-1** (half-res) resolution into `(1, 128, cf, h1, w1)`. `frame_idx` is a
     /// latent frame index with negative-from-end indexing (`-1` = last latent frame), resolved against
-    /// the target latent-frame count `lf`. Video conditioning is stage-1 only (reference
+    /// the target latent-frame count `lf` and converted to the output-frame coordinate required by
+    /// the appended-token RoPE path. Video conditioning is stage-1 only (reference
     /// `ICLoraPipeline`), so no stage-2 encode.
     fn build_clips(&self, req: &GenerationRequest) -> Result<Vec<(Array, i32, f32)>> {
         let lf = Self::latent_dims(req).0 as i32;
@@ -932,7 +933,14 @@ impl Ltx {
             let video = preprocess_conditioning_clip(clip.frames, req.width / 2, req.height / 2)?;
             let latent = self.vae.encode(&video)?;
             latent.eval()?;
-            out.push((latent, idx, clip.strength));
+            out.push((
+                latent,
+                crate::conditioning::latent_frame_to_output_offset(
+                    idx,
+                    crate::positions::TEMPORAL_SCALE,
+                )?,
+                clip.strength,
+            ));
         }
         // replace_person: the masked control clip rides the same keyframe-append path. Build the
         // gray-neutralized control frames host-side (port of the worker's `_apply_replacement_mask`),
@@ -976,7 +984,14 @@ impl Ltx {
             let video = preprocess_conditioning_clip(&masked, req.width / 2, req.height / 2)?;
             let latent = self.vae.encode(&video)?;
             latent.eval()?;
-            out.push((latent, idx, cc.masking_strength));
+            out.push((
+                latent,
+                crate::conditioning::latent_frame_to_output_offset(
+                    idx,
+                    crate::positions::TEMPORAL_SCALE,
+                )?,
+                cc.masking_strength,
+            ));
         }
         Ok(out)
     }
@@ -1088,7 +1103,7 @@ impl Ltx {
 /// shared capability floor ([`Capabilities::validate_request`] — size range, count, unsupported
 /// guidance/negative/true_cfg/sampler/scheduler, only advertised conditioning kinds) plus the LTX
 /// model-specific constraints: non-empty prompt, 64-aligned width/height (stage-1 runs at //2//32),
-/// and `num_frames = 1 + 8·k`.
+/// `num_frames = 1 + 8·k`, and all weight-free conditioning cardinality/shape/index constraints.
 pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> Result<()> {
     if req.prompt.is_empty() {
         return Err(Error::Msg("ltx_2_3: prompt must not be empty".into()));
@@ -1112,6 +1127,40 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
             )));
         }
     }
+    let latent_frames = Ltx::latent_dims(req).0 as i32;
+    let resolve_latent_index = |label: &str, idx: i32| -> Result<()> {
+        let resolved = if idx < 0 { latent_frames + idx } else { idx };
+        if resolved < 0 || resolved >= latent_frames {
+            return Err(Error::Msg(format!(
+                "ltx_2_3: {label} latent frame index {idx} out of bounds for {latent_frames} latent frames"
+            )));
+        }
+        Ok(())
+    };
+
+    // Apply-or-reject at the weight-free boundary. The render path consumes one Reference and one
+    // ControlClip; accepting more here would silently discard later entries after the ~24 GB staged
+    // text phase. Clip emptiness, mask parity, and target-grid bounds are equally request-only facts.
+    let reference_count = req
+        .conditioning
+        .iter()
+        .filter(|c| matches!(c, Conditioning::Reference { .. }))
+        .count();
+    if reference_count > 1 {
+        return Err(Error::Msg(
+            "ltx_2_3: multiple reference images are not supported (single-image I2V only)".into(),
+        ));
+    }
+    let control_clip_count = req
+        .conditioning
+        .iter()
+        .filter(|c| matches!(c, Conditioning::ControlClip { .. }))
+        .count();
+    if control_clip_count > 1 {
+        return Err(Error::Msg(
+            "ltx_2_3: at most one ControlClip can be applied per request".into(),
+        ));
+    }
     // F-054: range-validate every conditioning strength to [0, 1]. `strength > 1` → a negative denoise
     // mask (`1 − strength`) → negative per-token σ timesteps and extrapolating blends (silent garbage,
     // every stage "succeeds"); `< 0` (or NaN — `contains` is false for NaN) is likewise degenerate.
@@ -1134,11 +1183,49 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
             Conditioning::Reference {
                 strength: Some(s), ..
             } => check_strength("reference", *s)?,
-            Conditioning::Keyframe { strength, .. } => check_strength("keyframe", *strength)?,
-            Conditioning::VideoClip { strength, .. } => check_strength("video clip", *strength)?,
+            Conditioning::Keyframe {
+                frame_idx,
+                strength,
+                ..
+            } => {
+                resolve_latent_index("keyframe", *frame_idx)?;
+                check_strength("keyframe", *strength)?;
+            }
+            Conditioning::VideoClip {
+                frames,
+                frame_idx,
+                strength,
+            } => {
+                if frames.is_empty() {
+                    return Err(Error::Msg(
+                        "ltx_2_3: video conditioning clip is empty".into(),
+                    ));
+                }
+                resolve_latent_index("clip", *frame_idx)?;
+                check_strength("video clip", *strength)?;
+            }
             Conditioning::ControlClip {
-                masking_strength, ..
-            } => check_strength("control clip masking", *masking_strength)?,
+                frames,
+                mask,
+                masking_strength,
+                start_frame,
+                ..
+            } => {
+                if frames.is_empty() {
+                    return Err(Error::Msg(
+                        "ltx_2_3: replace_person control clip is empty".into(),
+                    ));
+                }
+                if frames.len() != mask.len() {
+                    return Err(Error::Msg(format!(
+                        "ltx_2_3: replace_person frame count {} != mask count {}",
+                        frames.len(),
+                        mask.len()
+                    )));
+                }
+                resolve_latent_index("replace_person", *start_frame)?;
+                check_strength("control clip masking", *masking_strength)?;
+            }
             _ => {}
         }
     }
@@ -1513,7 +1600,7 @@ mod tests {
             }
         )
         .is_err());
-        // More than one `Reference` is rejected at resolve time (single-image I2V only).
+        // More than one `Reference` is rejected during weight-free preflight (single-image I2V only).
         let two = GenerationRequest {
             conditioning: vec![
                 Conditioning::Reference {
@@ -1521,15 +1608,107 @@ mod tests {
                     strength: None,
                 },
                 Conditioning::Reference {
-                    image: img,
+                    image: img.clone(),
                     strength: None,
                 },
             ],
-            ..base
+            ..base.clone()
         };
-        // resolve_reference needs an `Ltx`; assert the capability check passes but resolve errors is
-        // covered by the integration path — here just confirm the kinds are individually accepted.
-        assert!(validate_request(&caps, &two).is_ok());
+        let err = validate_request(&caps, &two).unwrap_err().to_string();
+        assert!(err.contains("multiple reference images"), "{err}");
+
+        // The render consumes `control_clip()` (the first match), so duplicates must fail rather
+        // than silently discard the second after text encoding.
+        let control = Conditioning::ControlClip {
+            frames: vec![img.clone()],
+            mask: vec![img],
+            masking_strength: 0.8,
+            start_frame: 0,
+            mode: mlx_gen::ReplacementMode::FaceOnly,
+        };
+        let err = validate_request(
+            &caps,
+            &GenerationRequest {
+                conditioning: vec![control.clone(), control],
+                ..base
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("at most one ControlClip"), "{err}");
+    }
+
+    #[test]
+    fn validate_request_rejects_late_conditioning_shape_errors_preflight() {
+        let caps = descriptor().capabilities;
+        let base = GenerationRequest {
+            prompt: "a".into(),
+            width: 512,
+            height: 512,
+            frames: Some(49), // seven latent frames: accepted indices -7..=6.
+            ..Default::default()
+        };
+        let img = Image {
+            width: 4,
+            height: 4,
+            pixels: vec![0u8; 4 * 4 * 3],
+        };
+        let rejects = |conditioning| {
+            validate_request(
+                &caps,
+                &GenerationRequest {
+                    conditioning,
+                    ..base.clone()
+                },
+            )
+            .unwrap_err()
+            .to_string()
+        };
+
+        let err = rejects(vec![Conditioning::Keyframe {
+            image: img.clone(),
+            frame_idx: 7,
+            strength: 1.0,
+        }]);
+        assert!(err.contains("keyframe latent frame index 7"), "{err}");
+
+        let err = rejects(vec![Conditioning::VideoClip {
+            frames: vec![],
+            frame_idx: 0,
+            strength: 1.0,
+        }]);
+        assert!(err.contains("video conditioning clip is empty"), "{err}");
+        let err = rejects(vec![Conditioning::VideoClip {
+            frames: vec![img.clone()],
+            frame_idx: -8,
+            strength: 1.0,
+        }]);
+        assert!(err.contains("clip latent frame index -8"), "{err}");
+
+        let err = rejects(vec![Conditioning::ControlClip {
+            frames: vec![],
+            mask: vec![],
+            masking_strength: 1.0,
+            start_frame: 0,
+            mode: mlx_gen::ReplacementMode::FaceOnly,
+        }]);
+        assert!(err.contains("control clip is empty"), "{err}");
+        let err = rejects(vec![Conditioning::ControlClip {
+            frames: vec![img.clone()],
+            mask: vec![],
+            masking_strength: 1.0,
+            start_frame: 0,
+            mode: mlx_gen::ReplacementMode::FaceOnly,
+        }]);
+        assert!(err.contains("frame count 1 != mask count 0"), "{err}");
+        let err = rejects(vec![Conditioning::ControlClip {
+            frames: vec![img.clone()],
+            mask: vec![img],
+            masking_strength: 1.0,
+            start_frame: 7,
+            mode: mlx_gen::ReplacementMode::FaceOnly,
+        }]);
+        assert!(err.contains("replace_person latent frame index 7"), "{err}");
     }
 
     #[test]

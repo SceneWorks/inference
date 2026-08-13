@@ -7,9 +7,11 @@
 //! ([`text_encoder`]), and the UniPC flow-match scheduler ([`scheduler`]) are all ported here from
 //! the diffusers checkpoint.
 //!
-//! **txt2video (sc-3697):** [`WanGenerator::generate`] runs UMT5-XXL → the 30-layer DiT (3-axis
-//! interleaved RoPE, AdaLN modulation, cross-attention to text, classifier-free guidance, UniPC) →
-//! the temporal VAE decoder, emitting `GenerationOutput::Video`. Registered under `"wan2_2_ti2v_5b"`.
+//! **TI2V-5B:** [`WanGenerator::generate`] runs UMT5-XXL → the 30-layer DiT (3-axis interleaved
+//! RoPE, per-token AdaLN for image-conditioned masks, cross-attention, classifier-free guidance,
+//! UniPC) → the temporal VAE decoder. The z48 VAE encoder supports a first-frame `Reference` and
+//! arbitrary latent-index `Keyframe`s, including first/last-frame generation. Registered under
+//! `"wan2_2_ti2v_5b"`.
 //!
 //! **Dtypes:** the 5B DiT runs **bf16** (its native dtype), norms/modulation upcast to f32; the UMT5
 //! encoder runs **bf16** (sc-12778 — halving the f32 encoder resident + its ~24 GB ENCODE-stage
@@ -17,10 +19,11 @@
 //! casts the context to bf16, so this REMOVES the old f32→bf16 boundary); the VAE runs **f32**.
 //! `backend = "candle"`, `mac_only = false`.
 //!
-//! **First-slice surface:** txt2video only. The mlx provider's image-conditioning (TI2V / I2V),
-//! VACE, LoRA, and quantization surface is **deferred**. The z48 vae22 decode is memory-bounded:
-//! the temporal axis streams per-frame ([`vae::WanVae::decode`]) and a budgeted **spatial** tiler
-//! ([`vae::WanVae::decode_budgeted`], sc-7111) caps a single high-res frame's VRAM spike.
+//! The crate also registers the z16 A14B T2V/I2V pair, single-expert `wan_vace`, and dual-expert
+//! `wan2_2_vace_fun_14b`. VACE-Fun switches its complete high/low VACE experts at 0.875 while
+//! sharing the prepared control latent and preserving expert-aware LoRA/LoKr routing. The z48 vae22
+//! decode is memory-bounded: the temporal axis streams per-frame ([`vae::WanVae::decode`]) and a
+//! budgeted **spatial** tiler ([`vae::WanVae::decode_budgeted`], sc-7111) caps high-resolution VRAM.
 
 pub mod adapters;
 pub mod candle_tier_build;
@@ -37,6 +40,7 @@ pub mod dit_train;
 // 5B by the `CANDLE_GEN_WAN_GGUF` sub-story-1 test seam (manifest/catalog routing is sub-story 2).
 mod gguf;
 pub mod model_vace;
+pub mod model_vace_fun;
 pub mod pipeline;
 pub mod quant;
 pub mod rope;
@@ -74,9 +78,9 @@ use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::runtime::{CancelFlag, LoadPhase};
 use candle_gen::gen_core::tokenizer::TextTokenizer;
 use candle_gen::gen_core::{
-    self, AdapterSpec, Capabilities, GenerationOutput, GenerationRequest, Generator, Image,
-    LoadSpec, Modality, ModelDescriptor, MoeExpert, OffloadPolicy, Progress, Quant, SizeFloor,
-    WeightsSource,
+    self, AdapterSpec, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
+    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, MoeExpert,
+    OffloadPolicy, Progress, Quant, SizeFloor, WeightsSource,
 };
 use candle_gen::{check_cancel, run_three_stage_sequential, CandleError, Result as CResult};
 
@@ -105,9 +109,16 @@ struct Components {
     te: Arc<Umt5Encoder>,
     dit: Arc<WanTransformer>,
     vae: Arc<WanVae>,
+    vae_has_encoder: bool,
     /// UMT5 tokenizer, loaded+parsed **once** at component load and reused across every prompt/branch
     /// encode (sc-8991 / F-011) rather than re-parsing `tokenizer.json` per request.
     tok: Arc<candle_gen::gen_core::tokenizer::TextTokenizer>,
+}
+
+struct Ti2vConditioning {
+    clean: Tensor,
+    mask: Tensor,
+    mask_tokens: Tensor,
 }
 
 struct Pipeline {
@@ -121,6 +132,17 @@ struct Pipeline {
     /// **additive** residuals ([`adapters::install_additive`], sc-10094) — a packed tier has no dense
     /// `W` to fold into.
     adapters: Vec<AdapterSpec>,
+}
+
+fn validate_ti2v_adapter_routing(adapters: &[AdapterSpec]) -> CResult<()> {
+    if let Some(spec) = adapters.iter().find(|spec| spec.moe_expert.is_some()) {
+        return Err(CandleError::Msg(format!(
+            "wan: TI2V-5B has one DiT and accepts only shared adapters; {} is tagged for {:?}",
+            spec.path.display(),
+            spec.moe_expert.unwrap()
+        )));
+    }
+    Ok(())
 }
 
 impl Pipeline {
@@ -147,15 +169,20 @@ impl Pipeline {
         )
     }
 
-    fn load_components(&self) -> CResult<Components> {
+    fn load_components(&self, with_vae_encoder: bool) -> CResult<Components> {
         let te = self.load_te()?;
         let dit = self.build_dit()?;
-        let vae = self.load_vae()?;
+        let vae = if with_vae_encoder {
+            self.load_vae_with_encoder()?
+        } else {
+            self.load_vae()?
+        };
         let tok = text_encode::build_umt5_tokenizer(&self.root, &self.te_cfg, "wan")?;
         Ok(Components {
             te: Arc::new(te),
             dit: Arc::new(dit),
             vae: Arc::new(vae),
+            vae_has_encoder: with_vae_encoder,
             tok: Arc::new(tok),
         })
     }
@@ -182,6 +209,13 @@ impl Pipeline {
         )?)
     }
 
+    fn load_vae_with_encoder(&self) -> CResult<WanVae> {
+        Ok(WanVae::new_with_encoder(
+            &self.vae_cfg,
+            self.component_vb("vae", VAE_DTYPE)?,
+        )?)
+    }
+
     /// Build the TI2V-5B DiT, applying [`Self::adapters`] by tier (sc-10095): a **dense** tier folds the
     /// delta into the weights ([`adapters::merge_adapters`], the merge-not-residual fast path, byte
     /// identical to before); a **packed** q4/q8 tier attaches forward-time **additive** residuals on the
@@ -189,6 +223,7 @@ impl Pipeline {
     /// fold into; LoRA and structured LoKr remain additive while LoHa fails closed. The 5B is a single
     /// (non-MoE) DiT, so every adapter is shared (`moe_expert = None`); the `expert` arg is a formality.
     fn build_dit(&self) -> CResult<WanTransformer> {
+        validate_ti2v_adapter_routing(&self.adapters)?;
         // sub-story-1 test seam (sc-12735): a native-GGUF k-quant DiT path, selected by the
         // `CANDLE_GEN_WAN_GGUF` env var pointing at a downloaded `QuantStack/Wan2.2-TI2V-5B-GGUF` `.gguf`.
         // The DiT is held as resident Q4_K_M `QTensor`s (dequant-on-matmul) — the loader-proof this PR
@@ -296,6 +331,80 @@ impl Pipeline {
         Ok((t_lat, h_lat, w_lat, cos, sin))
     }
 
+    fn prepare_ti2v(
+        &self,
+        req: &GenerationRequest,
+        vae: &WanVae,
+        noise: &Tensor,
+        t_lat: usize,
+        h_lat: usize,
+        w_lat: usize,
+    ) -> CResult<(Tensor, Option<Ti2vConditioning>)> {
+        let reference = req
+            .conditioning
+            .iter()
+            .find_map(|conditioning| match conditioning {
+                Conditioning::Reference { image, strength } => {
+                    Some((image, strength.or(req.strength).unwrap_or(1.0)))
+                }
+                _ => None,
+            });
+        let keyframes = req.keyframes();
+        if reference.is_none() && keyframes.is_empty() {
+            return Ok((noise.clone(), None));
+        }
+        let encode = |image: &Image| -> CResult<Tensor> {
+            let pixels =
+                pipeline::preprocess_ti2v_image(image, req.width, req.height, &self.device)?;
+            Ok(vae.encode(&pixels)?)
+        };
+        let (clean, pins) = if !keyframes.is_empty() {
+            let mut frames = Vec::with_capacity(keyframes.len());
+            let mut pins = Vec::with_capacity(keyframes.len());
+            for keyframe in keyframes {
+                let index = if keyframe.frame_idx < 0 {
+                    t_lat as i32 + keyframe.frame_idx
+                } else {
+                    keyframe.frame_idx
+                };
+                if index < 0 || index as usize >= t_lat {
+                    return Err(CandleError::Msg(format!(
+                        "wan: keyframe latent frame index {} out of bounds for {t_lat} latent frames",
+                        keyframe.frame_idx
+                    )));
+                }
+                let index = index as usize;
+                frames.push((encode(keyframe.image)?, index));
+                pins.push((index, keyframe.strength));
+            }
+            (
+                pipeline::build_ti2v_keyframe_z(&frames, Z_DIM, t_lat, h_lat, w_lat, &self.device)?,
+                pins,
+            )
+        } else {
+            let (image, strength) = reference.expect("image-conditioned");
+            (encode(image)?, vec![(0, strength)])
+        };
+        let (mask, mask_tokens) = pipeline::build_ti2v_mask(
+            &pins,
+            Z_DIM,
+            t_lat,
+            h_lat,
+            w_lat,
+            self.dit_cfg.patch,
+            &self.device,
+        )?;
+        let init = pipeline::ti2v_blend(&clean, &mask, noise)?;
+        Ok((
+            init,
+            Some(Ti2vConditioning {
+                clean,
+                mask,
+                mask_tokens,
+            }),
+        ))
+    }
+
     /// Run the whole denoise from `latents0` to the final latent on the resident (single, dense) DiT,
     /// returning the denoised latent. Extracted verbatim out of the monolithic render so the resident
     /// and sequential paths drive the **identical** per-step math — the epic 7114 P4 curated fold-in
@@ -318,6 +427,7 @@ impl Pipeline {
         cos: &Tensor,
         sin: &Tensor,
         latents0: Tensor,
+        ti2v: Option<&Ti2vConditioning>,
         knobs: &RenderKnobs,
         sampler_name: Option<&str>,
         cancel: &CancelFlag,
@@ -327,6 +437,12 @@ impl Pipeline {
         let shift = knobs.shift;
         const FOLDIN: &[&str] = &["euler_ancestral", "heun", "dpmpp_sde", "ddim"];
         let latents = if let Some(name) = sampler_name.filter(|n| FOLDIN.contains(n)) {
+            if ti2v.is_some() {
+                return Err(CandleError::Msg(
+                    "wan: curated samplers are not supported with TI2V mask blending; use uni_pc/euler"
+                        .into(),
+                ));
+            }
             let native = scheduler::flow_sigmas(steps, shift);
             let n_train = config::NUM_TRAIN_TIMESTEPS as f64;
             candle_gen::run_flow_sampler(
@@ -359,15 +475,28 @@ impl Pipeline {
             for i in 0..steps {
                 check_cancel(cancel)?;
                 let t = sched.timestep(i);
-                let v_pos = dit.forward(&latents, ctx_pos, t, cos, sin)?;
+                let timestep_tokens = ti2v
+                    .map(|conditioning| conditioning.mask_tokens.affine(t, 0.0))
+                    .transpose()?;
+                let predict = |context: &Tensor| -> CResult<Tensor> {
+                    Ok(match &timestep_tokens {
+                        Some(tokens) => dit.forward_tokens(&latents, tokens, context, cos, sin)?,
+                        None => dit.forward(&latents, context, t, cos, sin)?,
+                    })
+                };
+                let v_pos = predict(ctx_pos)?;
                 let v = match ctx_neg {
                     Some(neg) => {
-                        let v_neg = dit.forward(&latents, neg, t, cos, sin)?;
+                        let v_neg = predict(neg)?;
                         pipeline::cfg(&v_pos, &v_neg, guidance)?
                     }
                     None => v_pos,
                 };
                 latents = sched.step(&v, &latents)?;
+                if let Some(conditioning) = ti2v {
+                    latents =
+                        pipeline::ti2v_blend(&conditioning.clean, &conditioning.mask, &latents)?;
+                }
                 on_progress(Progress::Step {
                     current: i as u32 + 1,
                     total,
@@ -399,8 +528,8 @@ impl Pipeline {
         };
 
         let (t_lat, h_lat, w_lat, cos, sin) = self.geometry(req, knobs.frames)?;
-        let latents0 =
-            pipeline::create_noise(knobs.seed, Z_DIM, t_lat, h_lat, w_lat, &self.device)?;
+        let noise = pipeline::create_noise(knobs.seed, Z_DIM, t_lat, h_lat, w_lat, &self.device)?;
+        let (latents0, ti2v) = self.prepare_ti2v(req, &comps.vae, &noise, t_lat, h_lat, w_lat)?;
 
         let latents = self.denoise(
             &comps.dit,
@@ -410,6 +539,7 @@ impl Pipeline {
             &cos,
             &sin,
             latents0,
+            ti2v.as_ref(),
             &knobs,
             req.sampler.as_deref(),
             &req.cancel,
@@ -462,8 +592,18 @@ impl Pipeline {
         // encoder (~11 GB, sc-12778) is dropped right after encoding.
         let tok = text_encode::build_umt5_tokenizer(&self.root, &self.te_cfg, "wan")?;
         let (t_lat, h_lat, w_lat, cos, sin) = self.geometry(req, knobs.frames)?;
-        let latents0 =
-            pipeline::create_noise(knobs.seed, Z_DIM, t_lat, h_lat, w_lat, &self.device)?;
+        let noise = pipeline::create_noise(knobs.seed, Z_DIM, t_lat, h_lat, w_lat, &self.device)?;
+        // TI2V has an extra staged VAE-encode phase before the DiT. The clean/mask tensors survive
+        // that VAE drop; the decode-only VAE is loaded again after denoise.
+        let (latents0, ti2v) = if req.conditioning.is_empty() {
+            (noise, None)
+        } else {
+            let vae = self.load_vae_with_encoder()?;
+            let prepared = self.prepare_ti2v(req, &vae, &noise, t_lat, h_lat, w_lat)?;
+            self.device.synchronize()?;
+            drop(vae);
+            prepared
+        };
 
         // The cross-stage tensors that must survive a component drop: the raw UMT5 context (stage 1 →
         // stage 2) and the denoised latents (seeded here, denoised in stage 2, decoded in stage 3).
@@ -471,6 +611,7 @@ impl Pipeline {
             pos: None,
             neg: None,
             latents: Some(latents0),
+            ti2v,
             on_progress: &mut *on_progress,
         };
 
@@ -514,6 +655,7 @@ impl Pipeline {
                     &cos,
                     &sin,
                     latents0,
+                    st.ti2v.as_ref(),
                     &knobs,
                     req.sampler.as_deref(),
                     cancel,
@@ -569,6 +711,8 @@ struct SeqState<'a> {
     /// Working latents: seeded before staging, denoised in stage 2 (survives the TE drop), decoded in
     /// stage 3 (survives the DiT drop).
     latents: Option<Tensor>,
+    /// Clean latent + masks for TI2V, prepared before the staged TE/DiT/decode sequence.
+    ti2v: Option<Ti2vConditioning>,
     on_progress: &'a mut dyn FnMut(Progress),
 }
 
@@ -590,13 +734,27 @@ pub struct WanGenerator {
 }
 
 impl WanGenerator {
-    fn components(&self, pipe: &Pipeline) -> gen_core::Result<Components> {
-        // `cached` recovers a poisoned lock (sc-9015) internally; `?` bridges the candle-side
-        // `load_components` error into `gen_core::Error`.
-        Ok(candle_gen::cached(&self.components, || {
-            pipe.load_components()
-        })?)
+    #[allow(clippy::unnecessary_map_or)] // `Option::is_none_or` is newer than the repository MSRV.
+    fn components(&self, pipe: &Pipeline, with_vae_encoder: bool) -> gen_core::Result<Components> {
+        let mut slot = candle_gen::lock_recover(&self.components);
+        if slot.as_ref().map_or(true, |components| {
+            components.vae_has_encoder != with_vae_encoder
+        }) {
+            // Do not keep both VAE variants resident while switching request modes.
+            *slot = None;
+            *slot = Some(pipe.load_components(with_vae_encoder)?);
+        }
+        Ok(slot.as_ref().expect("component cache populated").clone())
     }
+}
+
+fn needs_ti2v_encoder(req: &GenerationRequest) -> bool {
+    req.conditioning.iter().any(|conditioning| {
+        matches!(
+            conditioning,
+            Conditioning::Reference { .. } | Conditioning::Keyframe { .. }
+        )
+    })
 }
 
 impl Generator for WanGenerator {
@@ -645,6 +803,80 @@ impl Generator for WanGenerator {
                 )));
             }
         }
+        let reference_count = req
+            .conditioning
+            .iter()
+            .filter(|c| matches!(c, Conditioning::Reference { .. }))
+            .count();
+        let check_strength = |label: &str, strength: f32| -> gen_core::Result<()> {
+            if !strength.is_finite() || !(0.0..=1.0).contains(&strength) {
+                return Err(gen_core::Error::Msg(format!(
+                    "wan: {label} strength must be finite and in [0,1] (got {strength})"
+                )));
+            }
+            Ok(())
+        };
+        if let Some(strength) = req.strength {
+            check_strength("image", strength)?;
+        }
+        for conditioning in &req.conditioning {
+            match conditioning {
+                Conditioning::Reference {
+                    strength: Some(strength),
+                    ..
+                } => check_strength("Reference", *strength)?,
+                Conditioning::Keyframe { strength, .. } => check_strength("Keyframe", *strength)?,
+                _ => {}
+            }
+        }
+        let image_conditioned = reference_count > 0 || !req.keyframes().is_empty();
+        if reference_count > 1 {
+            return Err(gen_core::Error::Msg(
+                "wan: TI2V accepts at most one Reference image".into(),
+            ));
+        }
+        if reference_count > 0 && !req.keyframes().is_empty() {
+            return Err(gen_core::Error::Msg(
+                "wan: Reference and Keyframe conditioning cannot be combined; express the first \
+                 frame as Keyframe frame_idx=0"
+                    .into(),
+            ));
+        }
+        if !req.keyframes().is_empty() {
+            let frames = req.frames.unwrap_or(DEFAULT_FRAMES) as usize;
+            let t_lat = (frames - 1) / config::VAE_STRIDE_TEMPORAL as usize + 1;
+            for keyframe in req.keyframes() {
+                let index = if keyframe.frame_idx < 0 {
+                    t_lat as i32 + keyframe.frame_idx
+                } else {
+                    keyframe.frame_idx
+                };
+                if index < 0 || index as usize >= t_lat {
+                    return Err(gen_core::Error::Msg(format!(
+                        "wan: keyframe latent frame index {} out of bounds for {t_lat} latent frames",
+                        keyframe.frame_idx
+                    )));
+                }
+            }
+        }
+        const CURATED: &[&str] = &["euler_ancestral", "heun", "dpmpp_sde", "ddim"];
+        if image_conditioned
+            && req
+                .sampler
+                .as_deref()
+                .is_some_and(|sampler| CURATED.contains(&sampler))
+        {
+            return Err(gen_core::Error::Msg(
+                "wan: curated samplers are not supported with TI2V mask blending; use uni_pc/euler"
+                    .into(),
+            ));
+        }
+        if image_conditioned && req.trim_first_frames.unwrap_or(0) > 0 {
+            return Err(gen_core::Error::Msg(
+                "wan: trim_first_frames is not supported with Reference/Keyframe conditioning"
+                    .into(),
+            ));
+        }
         Ok(())
     }
 
@@ -662,7 +894,7 @@ impl Generator for WanGenerator {
         let (frames, fps) = match self.offload {
             OffloadPolicy::Sequential => pipe.render_sequential(req, on_progress)?,
             OffloadPolicy::Resident => {
-                let components = self.components(&pipe)?;
+                let components = self.components(&pipe, needs_ti2v_encoder(req))?;
                 pipe.render(req, &components, on_progress)?
             }
         };
@@ -674,8 +906,8 @@ impl Generator for WanGenerator {
     }
 }
 
-/// Wan2.2 TI2V-5B txt2video descriptor — the surface sc-3697 wires: CFG txt2video with a negative
-/// prompt, UniPC / Euler samplers; no conditioning (image / VACE deferred). **LoRA/LoKr** apply at load
+/// Wan2.2 TI2V-5B descriptor: CFG text-to-video plus z48-encoded `Reference` / latent-index
+/// `Keyframe` mask blending, with UniPC / Euler samplers. **LoRA/LoKr** apply at load
 /// (sc-10095: folded on a dense tier, additive on a packed one). Advertises the Q4/Q8 packed tiers
 /// (sc-10025) — pre-quantized snapshots the packed-detect loaders read directly (no on-the-fly quant).
 pub fn descriptor() -> ModelDescriptor {
@@ -690,7 +922,7 @@ pub fn descriptor() -> ModelDescriptor {
             supports_negative_prompt: true,
             supports_guidance: true,
             supports_true_cfg: false,
-            conditioning: vec![],
+            conditioning: vec![ConditioningKind::Reference, ConditioningKind::Keyframe],
             // LoRA/LoKr apply at load (sc-10095): folded on a dense tier, or as additive residuals on a
             // packed q4/q8 tier. Structured LoKr is packed-safe; LoHa fails closed. The env-only native
             // GGUF loader is not a registered product tier.
@@ -777,7 +1009,7 @@ fn build_generator(spec: &LoadSpec) -> gen_core::Result<WanGenerator> {
     // tier loads dense, so `spec.quantize` is a no-op tier-select marker resolved worker-side (ltx sc-9417).
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
         return Err(gen_core::Error::Unsupported(
-            "candle wan does not support image / VACE conditioning yet (txt2video only)".into(),
+            "candle wan does not support ControlNet / VACE / IP-Adapter load overlays".into(),
         ));
     }
     let device = candle_gen::default_device()?;
@@ -806,6 +1038,7 @@ pub fn register_providers(
         .register_generator(wan14b::T2V_14B_REGISTRATION)
         .register_generator(wan14b::I2V_14B_REGISTRATION)
         .register_generator(model_vace::VACE_REGISTRATION)
+        .register_generator(model_vace_fun::VACE_FUN_REGISTRATION)
         .register_trainer(training::TRAINER_REGISTRATION)
 }
 
@@ -835,6 +1068,7 @@ mod explicit_registry_tests {
                 "wan2_2_t2v_14b",
                 "wan2_2_i2v_14b",
                 "wan_vace",
+                "wan2_2_vace_fun_14b",
             ]
         );
         assert_eq!(explicit_trainers, ["wan2_2_t2v_14b"]);
@@ -881,8 +1115,8 @@ mod tests {
         assert!(!d.capabilities.supports_true_cfg);
         assert!(!d.capabilities.requires_sigma_shift);
         assert!(!d.capabilities.mac_only);
-        assert!(d.capabilities.conditioning.is_empty());
-        assert!(!d.capabilities.accepts(ConditioningKind::Reference));
+        assert!(d.capabilities.accepts(ConditioningKind::Reference));
+        assert!(d.capabilities.accepts(ConditioningKind::Keyframe));
         assert!(d.capabilities.samplers.contains(&"uni_pc")); // curated spelling (sc-7296)
         assert!(d.capabilities.samplers.contains(&"unipc")); // legacy alias retained
         assert!(d.capabilities.samplers.contains(&"euler"));
@@ -1036,6 +1270,138 @@ mod tests {
     }
 
     #[test]
+    fn validate_pins_reference_and_first_last_keyframe_contract() {
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(
+                MODEL_ID,
+                &LoadSpec::new(WeightsSource::Dir("/nonexistent".into())),
+            )
+            .unwrap();
+        let image = Image {
+            width: 32,
+            height: 32,
+            pixels: vec![0; 32 * 32 * 3],
+        };
+        let base = GenerationRequest {
+            prompt: "a controlled shot".into(),
+            width: 512,
+            height: 512,
+            frames: Some(17), // five latent frames
+            sampler: Some("uni_pc".into()),
+            ..Default::default()
+        };
+        let reference = Conditioning::Reference {
+            image: image.clone(),
+            strength: Some(0.35),
+        };
+        assert!(g
+            .validate(&GenerationRequest {
+                conditioning: vec![reference.clone()],
+                ..base.clone()
+            })
+            .is_ok());
+        let first_last = vec![
+            Conditioning::Keyframe {
+                image: image.clone(),
+                frame_idx: 0,
+                strength: 1.0,
+            },
+            Conditioning::Keyframe {
+                image: image.clone(),
+                frame_idx: -1,
+                strength: 0.65,
+            },
+        ];
+        assert!(g
+            .validate(&GenerationRequest {
+                conditioning: first_last.clone(),
+                ..base.clone()
+            })
+            .is_ok());
+        assert!(g
+            .validate(&GenerationRequest {
+                conditioning: [vec![reference], first_last].concat(),
+                ..base.clone()
+            })
+            .is_err());
+        assert!(g
+            .validate(&GenerationRequest {
+                conditioning: vec![Conditioning::Keyframe {
+                    image,
+                    frame_idx: 5,
+                    strength: 1.0,
+                }],
+                ..base
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn validate_rejects_non_finite_or_out_of_range_ti2v_strengths() {
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(
+                MODEL_ID,
+                &LoadSpec::new(WeightsSource::Dir("/nonexistent".into())),
+            )
+            .unwrap();
+        let image = Image {
+            width: 32,
+            height: 32,
+            pixels: vec![0; 32 * 32 * 3],
+        };
+        let base = GenerationRequest {
+            prompt: "a controlled shot".into(),
+            width: 512,
+            height: 512,
+            frames: Some(17),
+            sampler: Some("uni_pc".into()),
+            ..Default::default()
+        };
+        for conditioning in [
+            Conditioning::Reference {
+                image: image.clone(),
+                strength: Some(f32::NAN),
+            },
+            Conditioning::Reference {
+                image: image.clone(),
+                strength: Some(1.01),
+            },
+            Conditioning::Keyframe {
+                image,
+                frame_idx: 0,
+                strength: -0.01,
+            },
+        ] {
+            assert!(g
+                .validate(&GenerationRequest {
+                    conditioning: vec![conditioning],
+                    ..base.clone()
+                })
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn vae_encoder_is_requested_only_for_ti2v_conditioning() {
+        let base = GenerationRequest::default();
+        assert!(!needs_ti2v_encoder(&base));
+        let image = Image {
+            width: 1,
+            height: 1,
+            pixels: vec![0; 3],
+        };
+        assert!(needs_ti2v_encoder(&GenerationRequest {
+            conditioning: vec![Conditioning::Reference {
+                image,
+                strength: Some(0.5),
+            }],
+            ..base
+        }));
+    }
+
+    #[test]
     fn load_accepts_lora_and_quant() {
         use candle_gen::gen_core::{AdapterKind, AdapterSpec};
         // LoRA/LoKr is wired (sc-10095) — load is lazy, so attaching adapters resolves OK (the fold /
@@ -1151,7 +1517,7 @@ mod tests {
         let lora_path = root.join("lora.safetensors");
         cst::save(&m, &lora_path).unwrap();
         let specs = vec![candle_gen::gen_core::AdapterSpec::new(
-            lora_path,
+            lora_path.clone(),
             1.0,
             candle_gen::gen_core::AdapterKind::Lora,
         )];
@@ -1160,6 +1526,26 @@ mod tests {
             adapted.is_packed(),
             "the additive LoRA must not un-pack the base"
         );
+
+        // TI2V-5B owns one DiT, so expert routing is meaningless. In particular, a valid shared
+        // adapter must not mask a Low-tagged file that `install_additive(..., High)` would filter.
+        let shared = candle_gen::gen_core::AdapterSpec::new(
+            lora_path.clone(),
+            1.0,
+            candle_gen::gen_core::AdapterKind::Lora,
+        );
+        let low = candle_gen::gen_core::AdapterSpec::new(
+            lora_path,
+            1.0,
+            candle_gen::gen_core::AdapterKind::Lora,
+        )
+        .with_moe_expert(MoeExpert::Low);
+        let err = tiny_pipeline(&root, vec![shared, low])
+            .build_dit()
+            .err()
+            .expect("mixed shared + expert-tagged stack must be rejected")
+            .to_string();
+        assert!(err.contains("accepts only shared adapters"), "{err}");
         // (The numeric forward shift is a CUDA-only check — the DiT runs bf16, and CPU has no bf16
         // matmul; that's the on-device sc-10026 gate. The QLinear-level additive-on-packed forward is
         // covered on CPU in `quant::tests::additive_lora_on_packed_shifts_and_finite`.)

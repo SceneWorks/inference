@@ -890,7 +890,7 @@ struct SwapState<'a> {
 /// emit their [`Progress::Loading`] before the (heavy) load; the use closures receive `&mut St` to
 /// advance the shared scheduler/latents.
 #[allow(clippy::too_many_arguments)]
-fn staged_expert_swap<E, St>(
+pub(crate) fn staged_expert_swap<E, St>(
     k: usize,
     steps: usize,
     state: &mut St,
