@@ -1312,8 +1312,18 @@ pub fn register_providers(
     #[cfg(feature = "cuda")]
     let registry = registry
         .register_memory_strategy(QWEN_IMAGE_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            provider_id: MODEL_ID,
+            contract: |spec| memory_strategy::weights_free_memory_strategy_contract(MODEL_ID, spec),
+        })
         .register_memory_behavior(QWEN_IMAGE_MEMORY_BEHAVIOR)
         .register_composed_memory_strategy(QWEN_EDIT_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            provider_id: "qwen_image_edit",
+            contract: |spec| {
+                memory_strategy::weights_free_memory_strategy_contract("qwen_image_edit", spec)
+            },
+        })
         .register_memory_behavior(QWEN_EDIT_MEMORY_BEHAVIOR);
     registry
 }

@@ -1898,6 +1898,20 @@ mod weights_free_behavior_tests {
     use super::*;
 
     #[test]
+    fn catalog_contract_fixture_is_weights_free_but_production_admission_stays_strict() {
+        let spec = LoadSpec::new(WeightsSource::Dir(
+            "Z:\\nonexistent\\krea-catalog-fixture".into(),
+        ));
+        let contract = build_krea_turbo_memory_strategy_contract(&spec);
+        assert_eq!(contract.provider_id, KREA_2_TURBO_ID);
+        assert_eq!(contract.asset_facts, gen_core::MemoryAssetFacts::default());
+        assert!(
+            validated_krea_turbo_memory_strategy_contract(&spec).is_err(),
+            "production admission must still validate Krea assets"
+        );
+    }
+
+    #[test]
     fn cpu_scope_executes_the_registered_base_and_control_behaviors() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/krea".into()));
         for (contract, strategy) in [
@@ -2103,6 +2117,10 @@ pub fn register_providers(
     #[cfg(feature = "cuda")]
     let registry = registry
         .register_memory_strategy(TURBO_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            provider_id: KREA_2_TURBO_ID,
+            contract: |spec| Ok(build_krea_turbo_memory_strategy_contract(spec)),
+        })
         .register_memory_behavior(TURBO_MEMORY_BEHAVIOR)
         // The direct CUDA control runtime composes the registered Krea base with a native control
         // overlay in SceneWorks; it is a real route, but not a standalone gen-core Generator.

@@ -179,6 +179,37 @@ pub(crate) fn provider_contract(
             }
         }
     };
+    Ok(build_provider_contract(
+        provider_id,
+        spec,
+        streamable,
+        components,
+    ))
+}
+
+/// Build the route-exact contract used by catalog conformance without opening model assets.
+///
+/// Production resolution continues through [`provider_contract`], including exact encoder and
+/// component admission. The explicit fixture preserves the executable route declaration while
+/// intentionally publishing zero asset facts, as required by `MemoryContractFixtureRegistration`.
+pub(crate) fn weights_free_memory_strategy_contract(
+    provider_id: &str,
+    spec: &LoadSpec,
+) -> gen_core::Result<MemoryProviderContract> {
+    Ok(build_provider_contract(
+        provider_id,
+        spec,
+        streamable(spec),
+        PerComponentBytes::default(),
+    ))
+}
+
+fn build_provider_contract(
+    provider_id: &str,
+    spec: &LoadSpec,
+    streamable: bool,
+    components: PerComponentBytes,
+) -> MemoryProviderContract {
     let phases = vec![
         MemoryPhase::Conditioning,
         MemoryPhase::Denoise,
@@ -215,7 +246,7 @@ pub(crate) fn provider_contract(
         })
         .collect();
 
-    Ok(MemoryProviderContract {
+    MemoryProviderContract {
         provider_id: provider_id.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,
@@ -281,7 +312,7 @@ pub(crate) fn provider_contract(
             overlay_bytes: 0,
         },
         runtime: gen_core::MemoryRuntimeSemantics::default(),
-    })
+    }
 }
 
 pub(crate) fn snapshot_quant_tier(
@@ -649,6 +680,23 @@ pub(crate) fn registered_begin_request(
 mod tests {
     use super::*;
     use gen_core::{MemorySelection, MemoryStrategyParameters};
+
+    #[test]
+    fn catalog_contract_fixtures_are_weights_free_but_production_admission_stays_strict() {
+        let spec = LoadSpec::new(WeightsSource::Dir(
+            "Z:\\nonexistent\\qwen-image-catalog-fixture".into(),
+        ));
+        for provider_id in [crate::MODEL_ID, "qwen_image_edit"] {
+            let contract = weights_free_memory_strategy_contract(provider_id, &spec)
+                .expect("catalog fixture must not traverse the synthetic source");
+            assert_eq!(contract.provider_id, provider_id);
+            assert_eq!(contract.asset_facts, MemoryAssetFacts::default());
+            assert!(
+                provider_contract(provider_id, &spec).is_err(),
+                "production admission must still validate {provider_id} assets"
+            );
+        }
+    }
 
     fn write_control(path: &std::path::Path) {
         let mut header =
