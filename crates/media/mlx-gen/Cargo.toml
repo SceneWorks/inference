@@ -36,7 +36,7 @@
 # worked (sc-7889). Reordered load_default_library to try the own-build metallib BEFORE the user cache
 # (cargo install still falls through to the cache). Resolver-only change; no Rust API moved. Guarded
 # by mlx-gen-qwen-image/tests/bf16_matmul_sweep.
-# SHA 5926c297 = P3's exact biased Conv2d/Conv3d, group-aware GroupNorm+affine, packed Q4/Q8
+# SHA 362b5469 = P3's exact biased Conv2d/Conv3d, group-aware GroupNorm+affine, packed Q4/Q8
 # matmul+bias, and eager SiLU/tanh-GELU primitives on top of the retained compiled-callable API plus
 # collision-free compiler leases and safe main/worker TLS teardown (sc-18316). It preserves the
 # fork's MLX core v0.32.0 (verified:
@@ -49,12 +49,12 @@
 # mlx-c stays 0.6.0 with the fft-FFTNorm patch carried forward (0.32.0's fft.h still declares FFTNorm
 # before the stream arg). Parity re-baseline vs 0.31.2 = 1-2 ULP f32 bug-fix drift only (sc-12744/sc-12747);
 # RNG + softmax bit-identical. Guarded by mlx-gen-qwen-image/tests/{bf16_matmul_sweep,sdpa_nax_repro}.
-mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "5926c297746528742508a602ff06eeb0b184d925" }
+mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "362b5469a189d42cf713085a4ef3faae6f032317" }
 # The mlx-sys C-binding layer (pmetal-mlx-sys), same git rev as mlx-rs's path dep so cargo unifies on
 # ONE build (two distinct sources would yield two `mlx_sys` crates → link/symbol drift). Added as a
 # direct core dep so core can query MLX device properties not surfaced through mlx-rs (sc-8135: the
 # Metal per-single-buffer cap `maxBufferLength`, via the `device_info` C API).
-mlx-sys = { package = "pmetal-mlx-sys", git = "https://github.com/michaeltrefry/mlx-rs", rev = "5926c297746528742508a602ff06eeb0b184d925" }
+mlx-sys = { package = "pmetal-mlx-sys", git = "https://github.com/michaeltrefry/mlx-rs", rev = "362b5469a189d42cf713085a4ef3faae6f032317" }
 # Backend-neutral contract layer (epic 3720). Workspace member; mlx-gen re-exports it so the old
 # `mlx_gen::…` paths keep resolving. Family crates depend on it for `gen_core::Result` at the
 # contract boundary.
