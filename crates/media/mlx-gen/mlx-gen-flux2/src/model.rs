@@ -2609,23 +2609,29 @@ mod tests {
 
     #[test]
     fn dev_multimodal_contract_fails_closed_for_deferred_routes_and_public_loaders() {
+        // One sparse fixture represents a logical production-size multimodal checkpoint. Reuse it
+        // across the route/load-shape matrix: recreating the same ~45 GiB logical sparse file for
+        // every case is unnecessary and can trip hosted-runner resource accounting even though no
+        // payload is ever materialized.
+        let fixture = tempfile::tempdir().unwrap();
+        let base_spec = validation_complete_snapshot_spec(
+            fixture.path(),
+            Flux2Variant::Dev,
+            OffloadPolicy::Sequential,
+        );
+        let config_path = fixture.path().join("text_encoder/config.json");
+        let valid_config = std::fs::read(&config_path).unwrap();
+        let mut invalid_config: serde_json::Value = serde_json::from_slice(&valid_config).unwrap();
+        invalid_config["vision_config"]["num_hidden_layers"] = serde_json::json!(23);
+        std::fs::write(&config_path, serde_json::to_vec(&invalid_config).unwrap()).unwrap();
+
         for variant in [Flux2Variant::Dev, Flux2Variant::DevEdit] {
             for shape in [
                 mlx_gen::LoadShape::EagerMaterialization,
                 mlx_gen::LoadShape::DeferredMaterialization,
             ] {
-                let fixture = tempfile::tempdir().unwrap();
-                let mut spec = validation_complete_snapshot_spec(
-                    fixture.path(),
-                    variant,
-                    OffloadPolicy::Sequential,
-                );
+                let mut spec = base_spec.clone();
                 spec.load_shape = shape;
-                let config_path = fixture.path().join("text_encoder/config.json");
-                let mut config: serde_json::Value =
-                    serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
-                config["vision_config"]["num_hidden_layers"] = serde_json::json!(23);
-                std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
                 let error = build_residency(variant, &spec)
                     .err()
                     .expect("deferred construction must still load-admit Pixtral config")
@@ -2634,12 +2640,7 @@ mod tests {
             }
         }
 
-        let fixture = tempfile::tempdir().unwrap();
-        validation_complete_snapshot_spec(
-            fixture.path(),
-            Flux2Variant::Dev,
-            OffloadPolicy::Sequential,
-        );
+        std::fs::write(&config_path, valid_config).unwrap();
         rewrite_tensor_shape(
             fixture.path(),
             "multi_modal_projector.linear_2.weight",
