@@ -1153,6 +1153,7 @@ impl EncoderContract {
         spec: &crate::LoadSpec,
         base_root: &Path,
     ) -> Result<ValidatedEncoderSource> {
+        spec.validate_prepared_file_pins()?;
         let builtin = WeightsSource::Dir(base_root.join("text_encoder"));
         let source = spec.text_encoder.as_ref().unwrap_or(&builtin);
         let mut validated = self.validate_source_with_policy(
@@ -1163,6 +1164,7 @@ impl EncoderContract {
         )?;
         validated.tokenizer = Some(self.bind_tokenizer(base_root, source)?);
         validated.ensure_unchanged()?;
+        spec.validate_prepared_file_pins()?;
         Ok(validated)
     }
 
@@ -4006,6 +4008,30 @@ mod tests {
                 "{mutation}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn source_for_load_rechecks_prepared_directory_inventory() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("base");
+        let selected = temp.path().join("selected");
+        std::fs::create_dir_all(&base).unwrap();
+        write_tokenizer_fixture(&base);
+        write_fixture(&selected, 8);
+        let shard = selected.join("model.safetensors");
+        let mut spec = crate::LoadSpec::new(WeightsSource::Dir(base.clone()));
+        let validated = CONTRACT
+            .validate_source_against_base(&WeightsSource::Dir(selected.clone()), &base)
+            .unwrap();
+        validated.prepare_load_spec(&mut spec).unwrap();
+
+        std::fs::copy(shard, selected.join("added.safetensors")).unwrap();
+
+        let error = CONTRACT
+            .source_for_load(&spec, &base)
+            .expect_err("direct provider validation must retain the prepared shard inventory")
+            .to_string();
+        assert!(error.contains("receipt changed"), "{error}");
     }
 
     #[test]
