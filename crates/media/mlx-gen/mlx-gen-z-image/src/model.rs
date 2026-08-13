@@ -1261,6 +1261,11 @@ mod tests {
             r#"{"quantization":{"bits":8,"group_size":64}}"#,
         )
         .unwrap();
+        gen_core_testkit::write_encoder_contract_tokenizer_fixture(
+            base.path(),
+            crate::ENCODER_CONTRACT,
+        )
+        .unwrap();
 
         let packed_q4 = tempfile::tempdir().unwrap();
         gen_core_testkit::write_encoder_contract_fixture_with_quant(

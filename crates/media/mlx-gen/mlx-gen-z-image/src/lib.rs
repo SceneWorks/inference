@@ -285,11 +285,16 @@ mod explicit_registry_tests {
 
     fn snapshot(tmp: &tempfile::TempDir, tag: &str) -> std::path::PathBuf {
         let root = tmp.path().join(format!("z-image-{tag}"));
-        for component in ["text_encoder", "transformer", "vae"] {
+        for component in ["transformer", "vae"] {
             let dir = root.join(component);
             std::fs::create_dir_all(&dir).unwrap();
             write_minimal_safetensors(&dir.join("model.safetensors"));
         }
+        gen_core_testkit::write_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            super::ENCODER_CONTRACT,
+        )
+        .unwrap();
         root
     }
 
