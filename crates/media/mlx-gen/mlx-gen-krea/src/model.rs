@@ -557,13 +557,6 @@ pub(crate) fn validate_native_krea_spec(spec: &LoadSpec, provider_id: &str) -> R
             provider_id
         )));
     }
-    if spec.quantize.is_some() {
-        return Err(Error::Unsupported(format!(
-            "{}: an imported native single-file DiT carries its own numeric format; an additional \
-             LoadSpec::quantize request is not supported",
-            provider_id
-        )));
-    }
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
         return Err(Error::Unsupported(format!(
             "{}: the base single-file provider does not accept control/IP-adapter overlays",
@@ -630,7 +623,7 @@ fn build_native_krea_from_spec(spec: &LoadSpec, descriptor: ModelDescriptor) -> 
         descriptor,
         memory_strategy,
         precision: spec.precision,
-        quant: None,
+        quant: spec.quantize,
         streamable_transformer: reopenable,
         _native_dit: Some(native_dit),
         residency,
@@ -668,12 +661,24 @@ fn load_native_krea_heavy(
     load_pid: bool,
 ) -> Result<KreaHeavyOwned> {
     let cfg = crate::config::Krea2Config::from_snapshot(base)?;
-    let dit = crate::loader::load_transformer_from_pinned_native_file_with_stream(
-        dit_file, &cfg, streamable,
-    )?;
+    let dit = if let Some(quant) = spec.quantize {
+        crate::loader::load_transformer_from_pinned_native_file_bounded(dit_file, &cfg, |dit| {
+            if !spec.adapters.is_empty() {
+                spec.read_files_unchanged(
+                    spec.adapters.iter().map(|adapter| &adapter.path),
+                    || dit.apply_adapters_strict(&spec.adapters, true),
+                )?;
+            }
+            dit.quantize(quant.bits())
+        })?
+    } else {
+        crate::loader::load_transformer_from_pinned_native_file_with_stream(
+            dit_file, &cfg, streamable,
+        )?
+    };
     let vae = crate::vae::load_vae(base)?;
     let mut heavy = KreaHeavy::from_parts(dit, vae);
-    if !spec.adapters.is_empty() {
+    if spec.quantize.is_none() && !spec.adapters.is_empty() {
         spec.read_files_unchanged(spec.adapters.iter().map(|adapter| &adapter.path), || {
             heavy.apply_adapters(&spec.adapters)
         })?;
@@ -826,6 +831,24 @@ pub(crate) fn resolve_load_plan(
     root: &Path,
     id: &str,
 ) -> Result<ResolvedLoadPlan> {
+    resolve_load_plan_for_component(
+        spec,
+        root,
+        id,
+        matches!(spec.weights, WeightsSource::File(_)),
+    )
+}
+
+/// Resolve the quantization carried by `root`. For an imported primary File, the base snapshot's
+/// text tower is only a companion component: it may be prepacked even though the File DiT carries
+/// its own numeric format. Callers loading that text-only component set `primary_file_rules=false`;
+/// primary-DiT admission retains the mismatch refusal.
+pub(crate) fn resolve_load_plan_for_component(
+    spec: &LoadSpec,
+    root: &Path,
+    id: &str,
+    primary_file_rules: bool,
+) -> Result<ResolvedLoadPlan> {
     // Parse the marker even without a quantization override. Contract construction, admission, and
     // loading must all reject the same malformed/unreadable packed snapshot instead of letting rung 4
     // advertise a source the generator cannot subsequently load.
@@ -839,6 +862,12 @@ pub(crate) fn resolve_load_plan(
         }
         None => None,
     };
+    if let (true, Some(packed), None) = (primary_file_rules, packed_bits, requested_bits) {
+        return Err(Error::Msg(format!(
+            "{id}: imported single-file weights have no quant request, but the companion snapshot is pre-quantized Q{}; request the matching tier or stage a dense companion snapshot",
+            packed
+        )));
+    }
     if let (Some(packed), Some(requested)) = (packed_bits, requested_bits) {
         if packed != requested {
             return Err(Error::Msg(format!(
@@ -950,6 +979,7 @@ pub(crate) fn load_krea_text_resolved(
     let mut text = KreaText::from_snapshot_with_text_encoder(root, source)?;
     if let Some(bits) = load_time_quant_bits {
         text.quantize(bits)?;
+        text.materialize_weights()?;
     }
     Ok(text)
 }

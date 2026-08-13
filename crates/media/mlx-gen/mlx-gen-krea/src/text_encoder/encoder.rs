@@ -94,6 +94,14 @@ impl KreaTextEncoder {
         Ok(())
     }
 
+    pub(crate) fn materialize_weights(&self) -> Result<()> {
+        self.embed_tokens.materialize_weights()?;
+        for layer in &self.layers {
+            layer.materialize_weights()?;
+        }
+        Ok(())
+    }
+
     /// `input_ids` / `attention_mask`: `[b, s]` int32. Returns the stacked conditioning
     /// `[b, s - prefix_tokens, num_select, hidden]` (the DiT's `context`). The final norm is never
     /// applied; only layers up to `max(out_layers)` are run.

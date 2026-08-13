@@ -404,6 +404,30 @@ pub(crate) fn load_transformer_from_pinned_native_file_with_stream(
     })
 }
 
+/// Build, mutate (adapter fold + quantization), and materialize an imported DiT while one immutable
+/// source pin spans the whole operation.  Normalization stays lazy and the final transformer walks
+/// its retained representation projection-by-projection, so Q4/Q8 loading never first evaluates the
+/// complete dense DiT.
+pub(crate) fn load_transformer_from_pinned_native_file_bounded(
+    pinned: &mlx_gen::PinnedWeightsFile,
+    cfg: &Krea2Config,
+    prepare: impl FnOnce(&mut Krea2Transformer) -> Result<()>,
+) -> Result<Krea2Transformer> {
+    pinned.read_unchanged(|path| {
+        let remapped = normalized_native_weights_lazy(path)?;
+        crate::convert::validate_transformer(&remapped.clone(), cfg)?;
+        let mut transformer = Krea2Transformer::from_weights(&remapped, cfg)?;
+        // `from_weights` clones the lazy Array handles it retains. Drop the normalized source map
+        // before the projection walk: otherwise that map keeps an extra reference to every dense
+        // file-backed source array and evaluated inputs can accumulate to the full dense DiT while
+        // the packed transformer is being materialized.
+        drop(remapped);
+        prepare(&mut transformer)?;
+        transformer.materialize_weights()?;
+        Ok(transformer)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -43,6 +43,9 @@ use crate::tokenizer::ClipBpeTokenizer;
 use crate::unet::{ControlNet, UNet2DConditionModel};
 use crate::vae::Autoencoder;
 
+/// Caller-staged tokenizer snapshot used by the registry path for a fused imported checkpoint.
+pub const LDM_TOKENIZER_COMPONENT: &str = "ldm_tokenizer";
+
 /// img2img default strength (the vendored `generate_latents_from_image` default).
 const DEFAULT_STRENGTH: f32 = 0.8;
 /// Masked-inpaint / outpaint default strength — the worker's `SdxlDiffusersAdapter` uses 0.85 for
@@ -321,6 +324,24 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
                 .into(),
         ));
     }
+    if matches!(spec.weights, WeightsSource::File(_)) {
+        mlx_gen::gen_core::reject_unknown_components(spec, &[LDM_TOKENIZER_COMPONENT], MODEL_ID)?;
+        let tokenizer_root = match spec.components.get(LDM_TOKENIZER_COMPONENT) {
+            Some(WeightsSource::Dir(path)) => path,
+            Some(WeightsSource::File(path)) => {
+                return Err(Error::Msg(format!(
+                    "sdxl: imported fused checkpoint component '{LDM_TOKENIZER_COMPONENT}' must be a directory, got {}",
+                    path.display()
+                )))
+            }
+            None => {
+                return Err(Error::Msg(format!(
+                    "sdxl: imported fused checkpoint requires caller-staged '{LDM_TOKENIZER_COMPONENT}' tokenizer assets"
+                )))
+            }
+        };
+        return load_from_ldm_file(spec, tokenizer_root);
+    }
     // Resolve the snapshot dir up front — a fail-fast for BOTH residencies (Sequential defers the
     // heavy component build to each generate, but a single-file source is still wrong, so reject it
     // here rather than at the first generate).
@@ -364,8 +385,11 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 /// Load a fused SDXL LDM/A1111 checkpoint in memory. The fused file supplies both text encoders,
 /// UNet, and VAE; only the model-agnostic tokenizer assets come from `tokenizer_root`.
 pub fn load_from_ldm_file(spec: &LoadSpec, tokenizer_root: &Path) -> Result<Box<dyn Generator>> {
-    let file = match &spec.weights {
-        WeightsSource::File(path) => path,
+    spec.validate_prepared_file_pins()?;
+    let file_pin = match &spec.weights {
+        WeightsSource::File(_) => spec
+            .weights_file_pin()?
+            .expect("File weights must resolve to a pin"),
         WeightsSource::Dir(_) => {
             return Err(Error::Msg(
                 "sdxl LDM loader expects a fused .safetensors file".into(),
@@ -379,24 +403,43 @@ pub fn load_from_ldm_file(spec: &LoadSpec, tokenizer_root: &Path) -> Result<Box<
     }
     let residency = match spec.offload_policy {
         OffloadPolicy::Resident => {
-            let components = crate::ldm::split_ldm_checkpoint(file)?;
-            let text = build_ldm_text(&components, spec.quantize)?;
-            let heavy = build_ldm_heavy(spec, components, true)?;
+            let (text, heavy) = spec.read_prepared_files_unchanged(|| {
+                file_pin.read_unchanged(|file| {
+                    let crate::ldm::LdmComponents {
+                        unet,
+                        clip_l,
+                        clip_bigg,
+                        vae,
+                    } = crate::ldm::split_ldm_checkpoint(file)?;
+                    let text = build_ldm_text(clip_l, clip_bigg, spec.quantize)?;
+                    let heavy = build_ldm_heavy(spec, unet, vae, true)?;
+                    Ok::<_, Error>((text, heavy))
+                })
+            })?;
             Residency::resident(text, heavy)
         }
         OffloadPolicy::Sequential => {
-            let text_file = file.clone();
-            let heavy_file = file.clone();
+            let text_file = file_pin.clone();
+            let heavy_file = file_pin.clone();
             let text_quant = spec.quantize;
             let heavy_spec = spec.clone();
             Residency::sequential(
                 move || {
-                    let components = crate::ldm::split_ldm_checkpoint(&text_file)?;
-                    build_ldm_text(&components, text_quant)
+                    text_file.read_unchanged(|file| {
+                        let crate::ldm::LdmComponents {
+                            clip_l, clip_bigg, ..
+                        } = crate::ldm::split_ldm_checkpoint(file)?;
+                        build_ldm_text(clip_l, clip_bigg, text_quant)
+                    })
                 },
                 move |load_pid| {
-                    let components = crate::ldm::split_ldm_checkpoint(&heavy_file)?;
-                    build_ldm_heavy(&heavy_spec, components, load_pid)
+                    heavy_spec.read_prepared_files_unchanged(|| {
+                        heavy_file.read_unchanged(|file| {
+                            let crate::ldm::LdmComponents { unet, vae, .. } =
+                                crate::ldm::split_ldm_checkpoint(file)?;
+                            build_ldm_heavy(&heavy_spec, unet, vae, load_pid)
+                        })
+                    })
                 },
             )
         }
@@ -407,14 +450,24 @@ pub fn load_from_ldm_file(spec: &LoadSpec, tokenizer_root: &Path) -> Result<Box<
     // A fused LDM/A1111 checkpoint is split in memory, so no component has a re-openable source and
     // `memory_strategy::streamable` reports `false` for its `WeightsSource::File` — rung 4 is
     // declared Missing for this load rather than silently executing resident.
-    let memory_strategy = crate::memory_strategy::memory_strategy_contract(descriptor().id, spec)?;
+    // The public helper retains the same prepared identity guarantee as registry dispatch: contract
+    // projection reopens the fused header and tokenizer loading opens staged files, so complete both
+    // under the retained source + full prepared-file guards before exposing the generator.
+    let (memory_strategy, tokenizer) = spec.read_prepared_files_unchanged(|| {
+        file_pin.read_unchanged(|_| {
+            Ok::<_, Error>((
+                crate::memory_strategy::memory_strategy_contract(descriptor().id, spec)?,
+                loader::load_tokenizer(tokenizer_root)?,
+            ))
+        })
+    })?;
     Ok(Box::new(Sdxl {
         descriptor: descriptor(),
         default_stage_residency: crate::memory_strategy::default_stage_residency(spec),
         streamable: false,
         loaded_spec: spec.clone(),
         memory_strategy,
-        tokenizer: loader::load_tokenizer(tokenizer_root)?,
+        tokenizer,
         sampler: EulerSampler::new_with_dtype(&cfg, true, DTYPE)?,
         alpha_schedule,
         control_count: spec.control.is_some() as usize + spec.extra_controls.len(),
@@ -423,25 +476,36 @@ pub fn load_from_ldm_file(spec: &LoadSpec, tokenizer_root: &Path) -> Result<Box<
 }
 
 fn build_ldm_text(
-    components: &crate::ldm::LdmComponents,
+    clip_l: mlx_gen::weights::Weights,
+    clip_bigg: mlx_gen::weights::Weights,
     quantize: Option<Quant>,
 ) -> Result<(ClipTextEncoder, ClipTextEncoder)> {
-    let mut te1 = loader::load_text_encoder_1_from_weights(components.clip_l.clone(), DTYPE)?;
-    let mut te2 = loader::load_text_encoder_2_from_weights(components.clip_bigg.clone(), DTYPE)?;
+    // Build from lazy fused-file arrays first. The component maps are consumed and dropped by the
+    // loaders, leaving only the encoder-owned handles before quantization/materialization walks one
+    // projection at a time under the caller's immutable-file guard.
+    let mut te1 = loader::load_text_encoder_1_from_weights(clip_l, DTYPE)?;
+    let mut te2 = loader::load_text_encoder_2_from_weights(clip_bigg, DTYPE)?;
     if let Some(quant) = quantize {
         te1.quantize(quant.bits())?;
         te2.quantize(quant.bits())?;
     }
+    te1.materialize_weights()?;
+    te2.materialize_weights()?;
     Ok((te1, te2))
 }
 
 fn build_ldm_heavy(
     spec: &LoadSpec,
-    components: crate::ldm::LdmComponents,
+    unet_weights: mlx_gen::weights::Weights,
+    vae_weights: mlx_gen::weights::Weights,
     load_pid: bool,
 ) -> Result<SdxlHeavyOwned> {
-    let mut unet = loader::load_unet_from_weights(components.unet, DTYPE)?;
-    let vae = loader::load_vae_from_weights(components.vae)?;
+    // The U-Net component map is consumed by the constructor so no second full source map retains
+    // arrays while the packed model is walked below. The VAE intentionally stays dense and is
+    // materialized as its own bounded component under the same immutable-file guard.
+    let mut unet = loader::load_unet_from_weights(unet_weights, DTYPE)?;
+    vae_weights.materialize()?;
+    let vae = loader::load_vae_from_weights(vae_weights)?;
     if !spec.adapters.is_empty() {
         let coverage = if std::env::var_os("SDXL_LORA_VENDORED").is_some() {
             crate::adapters::LoraCoverage::Vendored
@@ -477,6 +541,7 @@ fn build_ldm_heavy(
             control.quantize(bits)?;
         }
     }
+    unet.materialize_weights()?;
     let pid = if load_pid {
         spec.pid
             .as_ref()
@@ -1449,12 +1514,126 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
 pub(crate) fn component_footprint(
     spec: &mlx_gen::LoadSpec,
 ) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
-    mlx_gen::PerComponentBytes::from_spec_subdirs(
-        spec,
-        &["text_encoder", "text_encoder_2"],
-        &["unet"],
-        &["vae"],
-    )
+    match &spec.weights {
+        WeightsSource::Dir(_) => mlx_gen::PerComponentBytes::from_spec_subdirs(
+            spec,
+            &["text_encoder", "text_encoder_2"],
+            &["unet"],
+            &["vae"],
+        ),
+        WeightsSource::File(file) => fused_ldm_component_footprint(file, spec.quantize),
+    }
+}
+
+/// Header-only resident projection for a fused LDM/A1111 checkpoint.  Unlike a snapshot tree, a
+/// fused file must first be classified by the exact shared LDM key remapper.  Text/UNet values are
+/// retained at fp16 (or at the selected affine Q4/Q8 tier); VAE values are retained at f32.  Keys the
+/// executable splitter ignores are omitted here too.
+fn fused_ldm_component_footprint(
+    file: &Path,
+    quantize: Option<Quant>,
+) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    use mlx_gen::gen_core::sdxl_ldm::{remap_sdxl_ldm_key, SdxlComponent, TensorRemap};
+
+    let headers = mlx_gen::gen_core::safetensors_path_tensor_headers(file)?;
+    if headers.is_empty() {
+        return Err(mlx_gen::gen_core::Error::Msg(
+            "sdxl fused checkpoint contains no tensor headers".to_owned(),
+        ));
+    }
+    let mut out = mlx_gen::PerComponentBytes::default();
+    for tensor in headers {
+        let Some(remap) = remap_sdxl_ldm_key(&tensor.name) else {
+            continue;
+        };
+        let (component, targets, source_shape_is_pack_shape) = match remap {
+            TensorRemap::Rename(component, target) => (component, vec![target], true),
+            // Row-wise Q/K/V packing is additive, so packing the fused row stack has the same byte
+            // total as packing the three remapped projections independently.
+            TensorRemap::SplitQkv(component, targets) => {
+                (component, targets.into_iter().collect(), true)
+            }
+            // Transpose/squeeze preserve element count but can change which axis is grouped. Keep
+            // them dense in the estimate rather than risk understating the exact packed footprint.
+            TensorRemap::Transpose(component, target) | TensorRemap::Squeeze(component, target) => {
+                (component, vec![target], false)
+            }
+        };
+        let bytes = match component {
+            SdxlComponent::Vae => tensor.materialized_bytes(4)?,
+            SdxlComponent::Unet | SdxlComponent::ClipL | SdxlComponent::ClipBigG => {
+                let target_is_packable = source_shape_is_pack_shape
+                    && tensor.shape.len() == 2
+                    && targets.iter().all(|target| {
+                        let Some(base) = target.strip_suffix(".weight") else {
+                            return false;
+                        };
+                        component == SdxlComponent::Unet
+                            || (!base.ends_with(".token_embedding")
+                                && !base.ends_with(".position_embedding"))
+                    });
+                match (quantize, target_is_packable) {
+                    (Some(quant), true) => {
+                        let group = crate::quant::GROUP_SIZE as usize;
+                        let [rows, columns] = tensor.shape.as_slice() else {
+                            unreachable!("target_is_packable requires a weight target; shape is checked below")
+                        };
+                        if *columns < group || *columns % group != 0 {
+                            tensor.materialized_bytes(2)?
+                        } else {
+                            let rows = u64::try_from(*rows).map_err(|_| {
+                                mlx_gen::gen_core::Error::Msg(
+                                    "sdxl fused projection row count overflow".to_owned(),
+                                )
+                            })?;
+                            let columns = u64::try_from(*columns).map_err(|_| {
+                                mlx_gen::gen_core::Error::Msg(
+                                    "sdxl fused projection column count overflow".to_owned(),
+                                )
+                            })?;
+                            let codes = rows
+                                .checked_mul(columns)
+                                .and_then(|elements| elements.checked_mul(quant.bits() as u64))
+                                .map(|bits| bits / 8)
+                                .ok_or_else(|| {
+                                    mlx_gen::gen_core::Error::Msg(
+                                        "sdxl fused quantized code size overflow".to_owned(),
+                                    )
+                                })?;
+                            let tables = rows
+                                .checked_mul(columns / group as u64)
+                                .and_then(|entries| entries.checked_mul(4))
+                                .ok_or_else(|| {
+                                    mlx_gen::gen_core::Error::Msg(
+                                        "sdxl fused quantization table size overflow".to_owned(),
+                                    )
+                                })?;
+                            codes.checked_add(tables).ok_or_else(|| {
+                                mlx_gen::gen_core::Error::Msg(
+                                    "sdxl fused quantized resident size overflow".to_owned(),
+                                )
+                            })?
+                        }
+                    }
+                    _ => tensor.materialized_bytes(2)?,
+                }
+            }
+        };
+        let slot = match component {
+            SdxlComponent::ClipL | SdxlComponent::ClipBigG => &mut out.text_encoder,
+            SdxlComponent::Unet => &mut out.dit,
+            SdxlComponent::Vae => &mut out.vae,
+        };
+        *slot = slot.checked_add(bytes).ok_or_else(|| {
+            mlx_gen::gen_core::Error::Msg("sdxl fused component byte sum overflow".to_owned())
+        })?;
+    }
+    if out.text_encoder == 0 || out.dit == 0 || out.vae == 0 {
+        return Err(mlx_gen::gen_core::Error::Msg(
+            "sdxl fused checkpoint is missing a text encoder, UNet, or VAE component".to_owned(),
+        ));
+    }
+    Ok(out)
 }
 
 mlx_gen::register_generators! {
@@ -1789,10 +1968,13 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_single_file_source() {
+    fn ordinary_load_does_not_treat_an_undeclared_file_as_a_snapshot() {
         let spec = LoadSpec::new(WeightsSource::File("/tmp/sdxl.safetensors".into()));
         let err = load(&spec).err().expect("expected an error").to_string();
-        assert!(err.contains("snapshot directory"), "got: {err}");
+        assert!(
+            err.contains("ldm_tokenizer") || err.contains("snapshot directory"),
+            "the file source must fail at an imported-route structural gate, not load as a snapshot: {err}"
+        );
     }
 
     // ── F-180 (sc-11126): weight-free, default-run proof that SDXL's dispatch HONORS `offload_policy`.

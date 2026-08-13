@@ -372,7 +372,7 @@ pub(crate) fn native_memory_strategy_contract_from_spec(
     let components = mlx_gen::PerComponentBytes {
         text_encoder: selected_text_encoder_bytes,
         dit: spec.read_file_unchanged_if_prepared(dit_file, |p| {
-            native_dit_transformer_bytes(provider_id, p)
+            native_dit_transformer_bytes(provider_id, p, spec.quantize)
         })?,
         vae: stored(&base_snapshot_dir.join("vae"), "base VAE")?,
     };
@@ -401,10 +401,19 @@ pub(crate) fn native_memory_strategy_contract(
 pub(crate) fn native_dit_transformer_bytes(
     provider_id: &str,
     dit_file: &std::path::Path,
+    quant: Option<mlx_gen::Quant>,
 ) -> CoreResult<u64> {
     projected_safetensors_bytes(dit_file, |tensor| {
         if tensor.name.ends_with(".weight_scale") || tensor.name.ends_with(".comfy_quant") {
             ResidentProjection::Omit
+        } else if let Some(quant) = quant.filter(|_| {
+            crate::native_remap::native_dit_key_to_diffusers(&tensor.name)
+                .is_some_and(|name| crate::convert::is_transformer_quant_target(&name))
+        }) {
+            ResidentProjection::GroupQuantized {
+                bits: quant.bits(),
+                group_size: crate::quant::GROUP_SIZE as usize,
+            }
         } else if tensor.dtype == mlx_gen::gen_core::weightsmeta::Dtype::I8 {
             ResidentProjection::Bfloat16
         } else {
@@ -1159,7 +1168,7 @@ mod tests {
             ("pid", accepted_pid, true),
             ("deferred", accepted_deferred, true),
             ("precision", precision, false),
-            ("quantize", valid.clone().with_quant(Quant::Q4), false),
+            ("quantize", valid.clone().with_quant(Quant::Q4), true),
             ("control", control, false),
             ("extra_control", extra_control, false),
             ("ip_adapter", ip_adapter, false),

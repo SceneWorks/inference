@@ -259,7 +259,10 @@ pub struct PinnedWeightsFile {
 /// prepared spec even when the spec has no File sources. Callers can inspect the map for cache-key
 /// construction, but can only transition or add tokens through [`LoadSpec`] methods; in particular,
 /// there is no mutable-map `clear` that could silently downgrade a prepared spec to compatibility
-/// mode.
+/// mode. Besides configured [`WeightsSource::File`] slots, a prepared spec may retain exact files
+/// below a configured [`WeightsSource::Dir`] (for example a transformer directory's config and
+/// weights). Those directory-member tokens participate in cache identity and guard the provider
+/// callback without changing the provider's directory-shaped load contract.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PreparedFilePins {
     prepared: bool,
@@ -719,7 +722,8 @@ impl LoadSpec {
     /// The caller can pin each source first, root-confine both its lexical
     /// [`PinnedWeightsFile::loader_path`] and exact [`PinnedWeightsFile::canonical_target_path`],
     /// then pass those same tokens here. The candidate set is fully checked before this spec is
-    /// mutated. An empty iterator intentionally finalizes a Dir-only spec.
+    /// mutated. Tokens must name either configured File slots or descendants of configured Dir
+    /// slots. An empty iterator intentionally finalizes a Dir-only spec.
     pub fn prepare_with_file_pins(
         &mut self,
         prepared: impl IntoIterator<Item = PinnedWeightsFile>,
@@ -773,6 +777,46 @@ impl LoadSpec {
             push_source(&mut paths, source);
         }
         paths.extend(self.adapters.iter().map(|adapter| adapter.path.as_path()));
+        if let Some(pid) = &self.pid {
+            push_source(&mut paths, &pid.checkpoint);
+            push_source(&mut paths, &pid.gemma);
+        }
+        if let Some(identity) = &self.identity {
+            for source in [&identity.encoder, &identity.eva, &identity.face_dir]
+                .into_iter()
+                .flatten()
+            {
+                push_source(&mut paths, source);
+            }
+        }
+        if let Some(source) = &self.text_encoder {
+            push_source(&mut paths, source);
+        }
+        for source in self.components.values() {
+            push_source(&mut paths, source);
+        }
+        paths
+    }
+
+    /// Every configured directory source, used to validate prepared member-file tokens.
+    pub fn directory_source_paths(&self) -> Vec<&Path> {
+        fn push_source<'a>(paths: &mut Vec<&'a Path>, source: &'a WeightsSource) {
+            if let WeightsSource::Dir(path) = source {
+                paths.push(path.as_path());
+            }
+        }
+
+        let mut paths = Vec::new();
+        push_source(&mut paths, &self.weights);
+        if let Some(source) = &self.control {
+            push_source(&mut paths, source);
+        }
+        for source in &self.extra_controls {
+            push_source(&mut paths, source);
+        }
+        if let Some(source) = &self.ip_adapter {
+            push_source(&mut paths, source);
+        }
         if let Some(pid) = &self.pid {
             push_source(&mut paths, &pid.checkpoint);
             push_source(&mut paths, &pid.gemma);
@@ -922,13 +966,33 @@ impl LoadSpec {
             .collect::<std::io::Result<_>>()?;
         expected.sort();
         expected.dedup();
+        let configured_directories = self
+            .directory_source_paths()
+            .into_iter()
+            .map(std::path::absolute)
+            .collect::<std::io::Result<Vec<_>>>()?;
         let actual: Vec<PathBuf> = prepared.keys().cloned().collect();
-        if expected != actual {
+        let missing = expected
+            .iter()
+            .filter(|path| !actual.contains(path))
+            .cloned()
+            .collect::<Vec<_>>();
+        let orphaned = actual
+            .iter()
+            .filter(|path| {
+                !expected.contains(path)
+                    && !configured_directories
+                        .iter()
+                        .any(|directory| *path != directory && path.starts_with(directory))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() || !orphaned.is_empty() {
             return Err(crate::Error::Unsupported(format!(
-                "prepared file-token set does not match LoadSpec File sources: expected {expected:?}, got {actual:?}"
+                "prepared file-token set does not match the LoadSpec sources: missing {missing:?}, orphaned {orphaned:?}"
             )));
         }
-        for path in expected {
+        for path in actual {
             let prepared = prepared.get(&path).ok_or_else(|| {
                 crate::Error::Unsupported(format!(
                     "prepared file-token set is missing configured source {}",
@@ -1063,8 +1127,9 @@ impl LoadSpec {
     ///
     /// Ordinary compatibility-mode specs invoke `read` directly, preserving historical callback
     /// behavior and error ordering without introducing eager filesystem access. Prepared specs must
-    /// cover exactly the current File-slot set, and every token is checked before and after the
-    /// callback so persistent and identity-changing replacement during the callback fails closed.
+    /// cover every current File slot, may additionally cover configured directory members, and every
+    /// token is checked before and after the callback so persistent and identity-changing replacement
+    /// during the callback fails closed.
     /// As with [`PinnedWeightsFile::read_unchanged`], a fully restored original pathname object is
     /// outside this path-token guarantee.
     pub fn read_prepared_files_unchanged<T, E>(
@@ -1078,7 +1143,19 @@ impl LoadSpec {
             return read();
         }
         self.validate_prepared_file_pins().map_err(E::from)?;
-        self.read_files_unchanged(self.file_source_paths(), read)
+        let pins = self
+            .prepared_file_pins
+            .iter()
+            .map(|(_, pin)| pin)
+            .collect::<Vec<_>>();
+        for pin in &pins {
+            pin.ensure_unchanged().map_err(E::from)?;
+        }
+        let result = read();
+        for pin in &pins {
+            pin.ensure_unchanged().map_err(E::from)?;
+        }
+        result
     }
 
     /// Builder-style quantization override.
@@ -1797,6 +1874,38 @@ mod tests {
         assert!(dir_only.prepared_file_pins().is_prepared());
         assert!(dir_only.prepared_file_pins().is_finalized());
         assert!(dir_only.prepared_file_pins().is_empty());
+    }
+
+    #[test]
+    fn prepared_directory_members_are_guarded_and_orphans_fail_closed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let transformer = dir.path().join("transformer");
+        std::fs::create_dir(&transformer).expect("create transformer dir");
+        let config = transformer.join("config.json");
+        let weights = transformer.join("diffusion_pytorch_model.safetensors");
+        std::fs::write(&config, b"{\"kind\":\"mage\"}").expect("write config");
+        std::fs::write(&weights, b"weights-v1").expect("write weights");
+
+        let mut spec = LoadSpec::new(WeightsSource::Dir(transformer));
+        spec.prepare_with_file_pins([
+            PinnedWeightsFile::pin(&config).expect("pin config"),
+            PinnedWeightsFile::pin(&weights).expect("pin weights"),
+        ])
+        .expect("directory members are valid prepared identities");
+        assert_eq!(spec.prepared_file_pins().len(), 2);
+        spec.read_prepared_files_unchanged(|| Ok::<_, crate::Error>(()))
+            .expect("unchanged directory members pass the callback guard");
+
+        std::fs::write(&weights, b"weights-v2").expect("replace weights in place");
+        spec.read_prepared_files_unchanged(|| Ok::<_, crate::Error>(()))
+            .expect_err("a changed directory member must fail before provider reuse");
+
+        let outside = dir.path().join("outside.safetensors");
+        std::fs::write(&outside, b"outside").expect("write outside file");
+        let mut orphaned = LoadSpec::new(WeightsSource::Dir(dir.path().join("other")));
+        orphaned
+            .prepare_with_file_pins([PinnedWeightsFile::pin(outside).expect("pin outside")])
+            .expect_err("a token outside every configured directory must fail closed");
     }
 
     #[test]

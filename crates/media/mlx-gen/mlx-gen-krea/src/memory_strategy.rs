@@ -233,13 +233,35 @@ pub(crate) fn native_memory_strategy_contract_from_spec(
     )?;
     let decoder_bytes = stored(&base_snapshot_dir.join("vae"), "base VAE")?;
     let transformer_bytes = spec.read_file_unchanged_if_prepared(dit_file, |p| {
-        crate::block_memory_strategy::native_dit_transformer_bytes(provider_id, p)
+        crate::block_memory_strategy::native_dit_transformer_bytes(provider_id, p, spec.quantize)
     })?;
+    let branch_bits =
+        crate::memory::control_branch_quant_bits(spec.quantize.map(mlx_gen::Quant::bits));
+    let projected_control = |path: &std::path::Path| {
+        projected_safetensors_bytes(path, |tensor| {
+            if let Some(bits) =
+                branch_bits.filter(|_| crate::control::is_control_quant_target(&tensor.name))
+            {
+                ResidentProjection::GroupQuantized {
+                    bits,
+                    group_size: crate::quant::GROUP_SIZE as usize,
+                }
+            } else {
+                ResidentProjection::Stored
+            }
+        })
+        .map_err(|error| {
+            CoreError::Msg(format!(
+                "{provider_id}: native pose control overlay asset facts for '{}': {error}",
+                path.display()
+            ))
+        })
+    };
     let (control_path, overlay_bytes) = match control {
-        mlx_gen::WeightsSource::Dir(path) => (path, stored(path, "pose control overlay")?),
+        mlx_gen::WeightsSource::Dir(path) => (path, projected_control(path)?),
         mlx_gen::WeightsSource::File(path) => (
             path,
-            spec.read_file_unchanged_if_prepared(path, |p| stored(p, "pose control overlay"))?,
+            spec.read_file_unchanged_if_prepared(path, projected_control)?,
         ),
     };
     if overlay_bytes == 0 {
@@ -943,7 +965,7 @@ mod tests {
             ("adapter", accepted_adapter, true),
             ("deferred", accepted_deferred, true),
             ("precision", precision, false),
-            ("quantize", valid.clone().with_quant(Quant::Q4), false),
+            ("quantize", valid.clone().with_quant(Quant::Q4), true),
             ("extra_control", extra_control, false),
             ("ip_adapter", ip_adapter, false),
             ("pid", pid, false),

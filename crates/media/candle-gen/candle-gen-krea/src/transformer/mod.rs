@@ -448,6 +448,40 @@ impl Krea2Transformer {
         Ok(())
     }
 
+    /// CPU-stage imported checkpoint fold. Quantized trunk projections land directly on `device`;
+    /// dense-kept global leaves and norms migrate afterward, avoiding a full dense-DiT device peak.
+    pub(crate) fn quantize_onto(
+        &mut self,
+        quant: candle_gen::gen_core::Quant,
+        device: &Device,
+    ) -> candle_gen::Result<()> {
+        let TransformerBlocks::Resident(blocks) = &mut self.blocks else {
+            return Err(candle_gen::CandleError::Msg(
+                "Krea streamed blocks cannot be load-time quantized".into(),
+            ));
+        };
+        for block in blocks {
+            block.quantize_onto(quant, device)?;
+        }
+        self.text_fusion.quantize_onto(quant, device)?;
+        for projection in [
+            &mut self.img_in,
+            &mut self.time_embed_l1,
+            &mut self.time_embed_l2,
+            &mut self.time_mod_proj,
+            &mut self.txt_in_l1,
+            &mut self.txt_in_l2,
+            &mut self.final_linear,
+        ] {
+            projection.to_device(device)?;
+        }
+        self.txt_in_norm.move_to_device(device)?;
+        self.final_norm.move_to_device(device)?;
+        self.final_sstable = self.final_sstable.to_device(device)?;
+        self.device = device.clone();
+        Ok(())
+    }
+
     /// Count projections that currently own additive residual tensors. Test-only introspection for
     /// proving the production multi-phase driver releases a live final subset, not merely that it
     /// emits a release callback. This walks the same complete surface as [`Self::clear_adapters`].

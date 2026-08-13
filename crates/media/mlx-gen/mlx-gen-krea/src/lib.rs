@@ -161,6 +161,38 @@ pub fn register_providers(
             },
         })
         .register_memory_behavior(model_control::MEMORY_BEHAVIOR_REGISTRATION)
+        .register_imported_model(mlx_gen::gen_core::ImportedModelRegistration {
+            family: "krea_2",
+            source: mlx_gen::gen_core::ImportedModelSource::TransformerFile,
+            operation: mlx_gen::gen_core::ImportedModelOperation::Generate,
+            provider_id: KREA_2_TURBO_ID,
+            required_components: Some(&[mlx_gen::BASE_SNAPSHOT_COMPONENT]),
+            inherit_adapters: true,
+        })
+        .register_imported_model(mlx_gen::gen_core::ImportedModelRegistration {
+            family: "krea_2",
+            source: mlx_gen::gen_core::ImportedModelSource::TransformerFile,
+            operation: mlx_gen::gen_core::ImportedModelOperation::Edit,
+            provider_id: KREA_2_TURBO_EDIT_ID,
+            required_components: Some(&[mlx_gen::BASE_SNAPSHOT_COMPONENT]),
+            inherit_adapters: true,
+        })
+        .register_imported_model(mlx_gen::gen_core::ImportedModelRegistration {
+            family: "krea_2",
+            source: mlx_gen::gen_core::ImportedModelSource::TransformerFile,
+            operation: mlx_gen::gen_core::ImportedModelOperation::Pose,
+            provider_id: KREA_2_TURBO_CONTROL_ID,
+            required_components: Some(&[mlx_gen::BASE_SNAPSHOT_COMPONENT]),
+            inherit_adapters: true,
+        })
+        .register_imported_model(mlx_gen::gen_core::ImportedModelRegistration {
+            family: "krea_2",
+            source: mlx_gen::gen_core::ImportedModelSource::TransformerFile,
+            operation: mlx_gen::gen_core::ImportedModelOperation::MultiPhase,
+            provider_id: KREA_2_RAW_ID,
+            required_components: Some(&[mlx_gen::BASE_SNAPSHOT_COMPONENT]),
+            inherit_adapters: true,
+        })
         .register_trainer(training::TRAINER_REGISTRATION)
 }
 

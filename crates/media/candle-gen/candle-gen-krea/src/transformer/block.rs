@@ -162,6 +162,14 @@ impl RmsScale {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         rms_scale(x, &self.weight, self.eps)
     }
+
+    pub(crate) fn move_to_device(
+        &mut self,
+        device: &candle_gen::candle_core::Device,
+    ) -> Result<()> {
+        self.weight = self.weight.to_device(device)?;
+        Ok(())
+    }
 }
 
 // ── Sigmoid-gated GQA attention (reference `Attention`) ─────────────────────────────────────
@@ -330,6 +338,24 @@ impl GatedAttention {
         }
         Ok(())
     }
+
+    fn quantize_onto(
+        &mut self,
+        quant: candle_gen::gen_core::Quant,
+        device: &candle_gen::candle_core::Device,
+    ) -> Result<()> {
+        for projection in [
+            &mut self.q,
+            &mut self.k,
+            &mut self.v,
+            &mut self.gate,
+            &mut self.o,
+        ] {
+            projection.quantize_onto(quant, device)?;
+        }
+        self.norm_q.move_to_device(device)?;
+        self.norm_k.move_to_device(device)
+    }
 }
 
 // ── SwiGLU feed-forward (reference `SwiGLU`: `down(silu(gate(x)) * up(x))`) ──────────────────
@@ -389,6 +415,16 @@ impl SwiGlu {
             }
         }
         Ok(())
+    }
+
+    fn quantize_onto(
+        &mut self,
+        quant: candle_gen::gen_core::Quant,
+        device: &candle_gen::candle_core::Device,
+    ) -> Result<()> {
+        self.gate.quantize_onto(quant, device)?;
+        self.up.quantize_onto(quant, device)?;
+        self.down.quantize_onto(quant, device)
     }
 }
 
@@ -476,6 +512,17 @@ impl TextFusionBlock {
         self.attn.visit_adaptable_mut(&join(prefix, "attn"), f)?;
         self.mlp.visit_adaptable_mut(&join(prefix, "ff"), f)?;
         Ok(())
+    }
+
+    fn quantize_onto(
+        &mut self,
+        quant: candle_gen::gen_core::Quant,
+        device: &candle_gen::candle_core::Device,
+    ) -> Result<()> {
+        self.prenorm.move_to_device(device)?;
+        self.postnorm.move_to_device(device)?;
+        self.attn.quantize_onto(quant, device)?;
+        self.mlp.quantize_onto(quant, device)
     }
 }
 
@@ -634,6 +681,18 @@ impl SingleStreamBlock {
         self.mlp.visit_adaptable_mut(&join(prefix, "ff"), f)?;
         Ok(())
     }
+
+    pub(crate) fn quantize_onto(
+        &mut self,
+        quant: candle_gen::gen_core::Quant,
+        device: &candle_gen::candle_core::Device,
+    ) -> Result<()> {
+        self.scale_shift_table = self.scale_shift_table.to_device(device)?;
+        self.prenorm.move_to_device(device)?;
+        self.postnorm.move_to_device(device)?;
+        self.attn.quantize_onto(quant, device)?;
+        self.mlp.quantize_onto(quant, device)
+    }
 }
 
 // ── TextFusionTransformer (reference `TextFusionTransformer`) ────────────────────────────────
@@ -707,6 +766,17 @@ impl TextFusionTransformer {
                 .map(|i| block(i, "refiner_blocks"))
                 .collect::<Result<_>>()?,
         })
+    }
+
+    pub(crate) fn quantize_onto(
+        &mut self,
+        quant: candle_gen::gen_core::Quant,
+        device: &candle_gen::candle_core::Device,
+    ) -> Result<()> {
+        for block in self.layerwise.iter_mut().chain(self.refiner.iter_mut()) {
+            block.quantize_onto(quant, device)?;
+        }
+        self.projector.to_device(device)
     }
 
     /// Every quantizable projection in the text-fusion stack, paired with its dotted key (SC#6/SC#4

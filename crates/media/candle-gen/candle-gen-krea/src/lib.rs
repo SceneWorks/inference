@@ -346,6 +346,10 @@ pub struct KreaGenerator {
     descriptor: ModelDescriptor,
     device: Device,
     loaded_quant: Option<Quant>,
+    /// Load-time folding request for the companion text encoder. This differs from
+    /// `loaded_quant`: an already-packed companion reports the effective tier but must be loaded
+    /// directly on the compute device instead of entering the dense CPU-fold path.
+    text_load_quant: Option<Quant>,
     #[cfg(any(feature = "cuda", test))]
     memory_contract: Option<gen_core::MemoryProviderContract>,
     residency: candle_gen::Residency<KreaTextPhase, KreaHeavyPhase>,
@@ -774,6 +778,10 @@ impl Generator for KreaGenerator {
                             self.native_dit.as_ref(),
                             &self.device,
                             &self.adapters,
+                            pipeline::NativeFileQuantization {
+                                transformer: self.loaded_quant,
+                                text_encoder: self.text_load_quant,
+                            },
                             req,
                             on_progress,
                         )
@@ -861,6 +869,7 @@ impl Generator for KreaGenerator {
                                 heavy.vae(),
                                 &self.root,
                                 self.native_dit.as_ref(),
+                                self.loaded_quant,
                                 &self.device,
                                 resolved,
                                 &self.adapters,
@@ -888,6 +897,7 @@ impl Generator for KreaGenerator {
                                 comps.vae(),
                                 &self.root,
                                 self.native_dit.as_ref(),
+                                self.loaded_quant,
                                 &self.device,
                                 resolved,
                                 &self.adapters,
@@ -1309,12 +1319,6 @@ fn validate_load_spec(spec: &LoadSpec, id: &str) -> gen_core::Result<ValidatedKr
             id
         )));
     }
-    if native_dit.is_some() && spec.quantize.is_some() {
-        return Err(gen_core::Error::Unsupported(format!(
-            "candle {}: an imported DiT carries its numeric format; quantize is unsupported",
-            id
-        )));
-    }
     let loaded_quant = actual_quant_tier(spec, id)?;
     let text_encoder_source = ENCODER_CONTRACT.source_for_load(spec, &root)?;
     let builtin_text_encoder = WeightsSource::Dir(root.join("text_encoder"));
@@ -1436,6 +1440,7 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
     let resident_convrot = convrot_dit.clone();
     let resident_native = native_dit.clone();
     let resident_file_spec = spec.clone();
+    let native_quant = native_dit.as_ref().and(spec.quantize);
     let resident_text_encoder = text_encoder_source.clone();
     let text_root = root.clone();
     let text_device = device.clone();
@@ -1451,6 +1456,16 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
     let heavy_convrot = convrot_dit.clone();
     let heavy_native = native_dit.clone();
     let heavy_file_spec = spec.clone();
+    // A packed companion snapshot must load its text encoder directly on the compute device. The
+    // CPU-stage fold path is only for a dense companion: QLinear's packed `quantize_onto` is
+    // intentionally idempotent and therefore cannot migrate an already-packed CPU base.
+    let text_quant = if native_dit.is_some() && companion_quant_tier(spec, descriptor.id)?.is_none()
+    {
+        spec.quantize
+    } else {
+        None
+    };
+    let heavy_quant = native_quant;
     // Keep physical execution separate from evidence publication. The File contract below remains
     // rung-4 Missing, but an explicit eligible load arms the retained native pin for real block
     // windows rather than silently falling back to an eager DiT.
@@ -1467,6 +1482,8 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
                             native_dit,
                             &resident_device,
                             &resident_adapters,
+                            native_quant,
+                            text_quant,
                             resident_pid.as_ref(),
                         )
                     }
@@ -1500,12 +1517,21 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
             ))
         },
         move |_, cancel| {
-            let text = pipeline::load_text_for_request_with_source(
-                &text_root,
-                &request_text_encoder,
-                &text_device,
-                cancel,
-            )?;
+            let text = match text_quant {
+                Some(quant) => pipeline::load_text_quantized_for_request(
+                    &text_root,
+                    &request_text_encoder,
+                    &text_device,
+                    cancel,
+                    quant,
+                )?,
+                None => pipeline::load_text_for_request_with_source(
+                    &text_root,
+                    &request_text_encoder,
+                    &text_device,
+                    cancel,
+                )?,
+            };
             Ok(KreaTextPhase::Sequential(Box::new(text)))
         },
         move |use_pid, _, cancel| {
@@ -1519,8 +1545,11 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
                             native_dit,
                             &heavy_device,
                             &heavy_adapters,
-                            heavy_pid.as_ref(),
-                            use_pid,
+                            heavy_quant,
+                            pipeline::PidLoad {
+                                spec: heavy_pid.as_ref(),
+                                enabled: use_pid,
+                            },
                             native_streamable,
                         )?;
                         candle_gen::check_cancel(cancel)?;
@@ -1557,6 +1586,7 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
         descriptor,
         device,
         loaded_quant,
+        text_load_quant: text_quant,
         #[cfg(any(feature = "cuda", test))]
         memory_contract,
         residency,
@@ -1807,15 +1837,12 @@ fn krea_turbo_memory_strategy_contract() -> &'static gen_core::MemoryProviderCon
     })
 }
 
-fn actual_quant_tier(spec: &LoadSpec, id: &str) -> gen_core::Result<Option<Quant>> {
-    if convrot_selector(spec, id)?.is_some() {
-        return Ok(Some(Quant::Q8));
-    }
+fn companion_quant_tier(spec: &LoadSpec, id: &str) -> gen_core::Result<Option<Quant>> {
     let root = match &spec.weights {
         WeightsSource::Dir(root) => root,
-        WeightsSource::File(_) => return Ok(None),
+        WeightsSource::File(_) => gen_core::require_base_snapshot(spec, id)?,
     };
-    loader::read_packed_config(&root.join("transformer"))
+    let companion_quant = loader::read_packed_config(&root.join("transformer"))
         .map_err(gen_core::Error::backend)?
         .map(|packed| match packed.bits {
             4 => Ok(Quant::Q4),
@@ -1824,7 +1851,38 @@ fn actual_quant_tier(spec: &LoadSpec, id: &str) -> gen_core::Result<Option<Quant
                 "{id}: transformer declares unsupported packed quantization width {bits}"
             ))),
         })
-        .transpose()
+        .transpose()?;
+    Ok(companion_quant)
+}
+
+fn actual_quant_tier(spec: &LoadSpec, id: &str) -> gen_core::Result<Option<Quant>> {
+    if convrot_selector(spec, id)?.is_some() {
+        return Ok(Some(Quant::Q8));
+    }
+    let companion_quant = companion_quant_tier(spec, id)?;
+    if matches!(spec.weights, WeightsSource::Dir(_)) {
+        return Ok(companion_quant);
+    }
+
+    let requested = match spec.quantize {
+        Some(quant @ (Quant::Q4 | Quant::Q8)) => Some(quant),
+        Some(Quant::Nvfp4) => {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{id}: imported native checkpoints support Q4/Q8 affine tiers, not NVFP4"
+            )))
+        }
+        None => None,
+    };
+    match (companion_quant, requested) {
+        (Some(companion), Some(requested)) if companion == requested => Ok(Some(requested)),
+        (Some(companion), Some(requested)) => Err(gen_core::Error::Unsupported(format!(
+            "{id}: imported native checkpoint requests {requested:?}, but its companion snapshot is packed {companion:?}; stage the matching tier or a dense companion snapshot"
+        ))),
+        (Some(companion), None) => Err(gen_core::Error::Unsupported(format!(
+            "{id}: imported native checkpoint has no quant request, but its companion snapshot is packed {companion:?}; request the matching tier or stage a dense companion snapshot"
+        ))),
+        (None, requested) => Ok(requested),
+    }
 }
 
 #[cfg(any(feature = "cuda", test))]
@@ -2128,6 +2186,30 @@ pub fn register_providers(
     #[cfg(feature = "cuda")]
     let registry = registry.register_memory_behavior(CONTROL_MEMORY_BEHAVIOR);
     registry
+        .register_imported_model(gen_core::ImportedModelRegistration {
+            family: "krea_2",
+            source: gen_core::ImportedModelSource::TransformerFile,
+            operation: gen_core::ImportedModelOperation::Generate,
+            provider_id: KREA_2_TURBO_ID,
+            required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
+            inherit_adapters: true,
+        })
+        .register_imported_model(gen_core::ImportedModelRegistration {
+            family: "krea_2",
+            source: gen_core::ImportedModelSource::TransformerFile,
+            operation: gen_core::ImportedModelOperation::Edit,
+            provider_id: KREA_2_TURBO_EDIT_ID,
+            required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
+            inherit_adapters: true,
+        })
+        .register_imported_model(gen_core::ImportedModelRegistration {
+            family: "krea_2",
+            source: gen_core::ImportedModelSource::TransformerFile,
+            operation: gen_core::ImportedModelOperation::MultiPhase,
+            provider_id: KREA_2_RAW_ID,
+            required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
+            inherit_adapters: true,
+        })
         .register_trainer(training::TRAINER_REGISTRATION)
         .register_trainer(control_trainer::CONTROL_TRAINER_REGISTRATION)
 }
@@ -2386,6 +2468,27 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[test]
+    fn imported_file_refuses_a_mismatched_packed_companion_tier() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("base");
+        std::fs::create_dir_all(root.join("transformer")).unwrap();
+        std::fs::write(
+            root.join("transformer/config.json"),
+            r#"{"quantization":{"bits":4,"group_size":64}}"#,
+        )
+        .unwrap();
+        let primary = tmp.path().join("imported.safetensors");
+        std::fs::write(&primary, b"pinned fixture").unwrap();
+        let spec = LoadSpec::new(WeightsSource::File(primary))
+            .with_component(BASE_SNAPSHOT_COMPONENT, WeightsSource::Dir(root))
+            .with_quant(Quant::Q8);
+        let error = validate_load_spec(&spec, KREA_2_TURBO_ID)
+            .expect_err("Q8 imported DiT plus Q4 companion must fail")
+            .to_string();
+        assert!(error.contains("companion snapshot is packed Q4"), "{error}");
     }
 
     #[test]
@@ -2948,7 +3051,7 @@ mod tests {
             ("pid", accepted_pid, true),
             ("precision", precision, true),
             ("deferred", accepted_deferred, true),
-            ("quantize", valid.clone().with_quant(Quant::Q4), false),
+            ("quantize", valid.clone().with_quant(Quant::Q4), true),
             ("control", control, false),
             ("extra_control", extra_control, false),
             ("ip_adapter", ip_adapter, false),
@@ -3786,6 +3889,7 @@ mod tests {
             descriptor,
             device: candle_gen::default_device().expect("a default device"),
             loaded_quant: None,
+            text_load_quant: None,
             memory_contract: has_memory_contract
                 .then(|| krea_turbo_memory_strategy_contract().clone()),
             residency: candle_gen::Residency::request_scoped(
@@ -3961,6 +4065,7 @@ mod tests {
                 descriptor: descriptor.clone(),
                 device: Device::Cpu,
                 loaded_quant: None,
+                text_load_quant: None,
                 memory_contract: has_memory_contract
                     .then(|| krea_turbo_memory_strategy_contract().clone()),
                 residency: candle_gen::Residency::request_scoped_with_resident_cancelable(

@@ -123,6 +123,47 @@ pub struct ModelRegistration {
     pub footprint: Option<fn(&LoadSpec) -> Result<PerComponentBytes>>,
 }
 
+/// The validated on-disk shape of a caller-owned model routed through a registered generator.
+///
+/// The shape is explicit because family identity alone cannot prove that a File, fused checkpoint,
+/// component directory, or ComfyUI tree is loadable by the same provider.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ImportedModelSource {
+    TransformerFile,
+    FusedCheckpoint,
+    TransformerDirectory,
+    ComfyUiTree,
+}
+
+/// The request surface selected for an imported source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ImportedModelOperation {
+    Generate,
+    Edit,
+    Pose,
+    MultiPhase,
+}
+
+/// Provider-owned route from one imported source shape and operation to the ordinary generator
+/// registration that actually validates and loads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImportedModelRegistration {
+    pub family: &'static str,
+    pub source: ImportedModelSource,
+    pub operation: ImportedModelOperation,
+    pub provider_id: &'static str,
+    /// Source-shape-specific staged components. When present, this replaces the ordinary
+    /// provider descriptor's component list because an imported loader can consume a different
+    /// artifact shape from the published snapshot loader (for example an SDXL fused checkpoint
+    /// still needs caller-staged tokenizer assets).
+    pub required_components: Option<&'static [&'static str]>,
+    /// Whether this source shape inherits the provider's LoRA/LoKr flags. Set false only for a
+    /// structural loader refusal that is narrower than the ordinary provider (for example a full
+    /// Mage fine-tune whose moved base weights cannot safely take an adapter fitted to the published
+    /// checkpoint).
+    pub inherit_adapters: bool,
+}
+
 /// Optional, pre-load memory-strategy contract registration for one provider route id.
 ///
 /// Kept separate from [`ModelRegistration`] so every existing provider remains source-compatible:
@@ -297,6 +338,7 @@ pub struct AudioEmbedderRegistration {
 #[derive(Default)]
 pub struct ProviderRegistryBuilder {
     generators: Vec<ModelRegistration>,
+    imported_models: Vec<ImportedModelRegistration>,
     memory_strategy: Vec<MemoryRegistration>,
     memory_contract_fixture: Vec<MemoryContractFixtureRegistration>,
     memory_behavior: Vec<MemoryBehaviorRegistration>,
@@ -330,6 +372,11 @@ impl ProviderRegistryBuilder {
     }
 
     builder_registration_method!(register_generator, generators, ModelRegistration);
+    builder_registration_method!(
+        register_imported_model,
+        imported_models,
+        ImportedModelRegistration
+    );
     builder_registration_method!(
         register_activation_memory,
         activation_memory,
@@ -430,6 +477,67 @@ impl ProviderRegistryBuilder {
             }};
         }
         ensure_unique!(generators, "generator");
+        {
+            let mut routes = std::collections::BTreeSet::new();
+            for registration in &self.imported_models {
+                if !is_registry_ident(registration.family) {
+                    return Err(Error::Msg(
+                        "imported-model route family must be a non-empty lowercase registry identifier"
+                            .to_owned(),
+                    ));
+                }
+                if let Some(required) = registration.required_components {
+                    if required.is_empty() {
+                        return Err(Error::Msg(format!(
+                            "imported-model route '{}'/{:?}/{:?} declares an empty required-components override; use None instead",
+                            registration.family, registration.source, registration.operation
+                        )));
+                    }
+                    let mut component_ids = std::collections::BTreeSet::new();
+                    for component in required {
+                        if component.is_empty() || component.chars().any(char::is_whitespace) {
+                            return Err(Error::Msg(format!(
+                                "imported-model route '{}'/{:?}/{:?} has an empty or whitespace-padded required component",
+                                registration.family, registration.source, registration.operation
+                            )));
+                        }
+                        if !component_ids.insert(*component) {
+                            return Err(Error::Msg(format!(
+                                "imported-model route '{}'/{:?}/{:?} repeats required component '{}'",
+                                registration.family,
+                                registration.source,
+                                registration.operation,
+                                component
+                            )));
+                        }
+                    }
+                }
+                let key = (
+                    registration.family,
+                    registration.source,
+                    registration.operation,
+                );
+                if !routes.insert(key) {
+                    return Err(Error::Msg(format!(
+                        "duplicate imported-model route for family '{}' ({:?}/{:?})",
+                        registration.family, registration.source, registration.operation
+                    )));
+                }
+                if !self
+                    .generators
+                    .iter()
+                    .any(|generator| (generator.descriptor)().id == registration.provider_id)
+                {
+                    return Err(Error::Msg(format!(
+                        "imported-model route '{}'/{:?}/{:?} targets unregistered generator '{}'",
+                        registration.family,
+                        registration.source,
+                        registration.operation,
+                        registration.provider_id
+                    )));
+                }
+            }
+        }
         {
             let mut ids = std::collections::BTreeSet::new();
             for registration in &self.activation_memory {
@@ -541,6 +649,7 @@ impl ProviderRegistryBuilder {
 
         Ok(ProviderRegistry {
             generators: self.generators.into_boxed_slice(),
+            imported_models: self.imported_models.into_boxed_slice(),
             memory_strategy: self.memory_strategy.into_boxed_slice(),
             memory_contract_fixture: self.memory_contract_fixture.into_boxed_slice(),
             memory_behavior: self.memory_behavior.into_boxed_slice(),
@@ -563,6 +672,7 @@ impl ProviderRegistryBuilder {
 /// An immutable, explicit catalog of generative-media providers.
 pub struct ProviderRegistry {
     generators: Box<[ModelRegistration]>,
+    imported_models: Box<[ImportedModelRegistration]>,
     memory_strategy: Box<[MemoryRegistration]>,
     memory_contract_fixture: Box<[MemoryContractFixtureRegistration]>,
     memory_behavior: Box<[MemoryBehaviorRegistration]>,
@@ -606,6 +716,37 @@ macro_rules! explicit_registry_kind {
 }
 
 impl ProviderRegistry {
+    /// Every provider-owned imported-source route in this explicit platform catalog.
+    pub fn imported_models(&self) -> impl ExactSizeIterator<Item = &ImportedModelRegistration> {
+        self.imported_models.iter()
+    }
+
+    /// Resolve an exact imported source shape and operation to the descriptor of the generator that
+    /// will actually load it. Missing is an explicit unsupported answer.
+    pub fn imported_model_descriptor(
+        &self,
+        family: &str,
+        source: ImportedModelSource,
+        operation: ImportedModelOperation,
+    ) -> Option<ModelDescriptor> {
+        let route = self.imported_models.iter().find(|route| {
+            route.family == family && route.source == source && route.operation == operation
+        })?;
+        let mut descriptor = self
+            .generators
+            .iter()
+            .find(|registration| (registration.descriptor)().id == route.provider_id)
+            .map(|registration| (registration.descriptor)())?;
+        if !route.inherit_adapters {
+            descriptor.capabilities.supports_lora = false;
+            descriptor.capabilities.supports_lokr = false;
+        }
+        if let Some(required_components) = route.required_components {
+            descriptor.required_components = required_components;
+        }
+        Some(descriptor)
+    }
+
     /// Provider-owned warm 1024² activation transient for `id`.
     /// `Ok(None)` is the compatibility-safe unmeasured state, including for a known platform-composed
     /// memory route with no standalone generator registration; genuinely unknown ids remain errors.
@@ -2135,6 +2276,158 @@ mod tests {
             error.to_string(),
             "duplicate generator id 'dummy_test_model' in explicit registry"
         );
+    }
+
+    #[test]
+    fn imported_routes_are_exact_and_project_the_selected_provider() {
+        let registry = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .register_imported_model(ImportedModelRegistration {
+                family: "test",
+                source: ImportedModelSource::TransformerFile,
+                operation: ImportedModelOperation::Generate,
+                provider_id: "dummy_test_model",
+                required_components: Some(&["imported_component"]),
+                inherit_adapters: true,
+            })
+            .build()
+            .expect("exact imported route");
+
+        let selected = registry
+            .imported_model_descriptor(
+                "test",
+                ImportedModelSource::TransformerFile,
+                ImportedModelOperation::Generate,
+            )
+            .expect("registered shape and operation resolve");
+        assert_eq!(selected.id, "dummy_test_model");
+        assert_eq!(selected.required_components, &["imported_component"]);
+        assert!(registry
+            .imported_model_descriptor(
+                "test",
+                ImportedModelSource::FusedCheckpoint,
+                ImportedModelOperation::Generate,
+            )
+            .is_none());
+        assert!(registry
+            .imported_model_descriptor(
+                "test",
+                ImportedModelSource::TransformerFile,
+                ImportedModelOperation::Edit,
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn imported_route_can_withdraw_structurally_invalid_adapter_inheritance() {
+        fn adapter_descriptor() -> ModelDescriptor {
+            let mut descriptor = dummy_descriptor();
+            descriptor.id = "dummy_adapter_model";
+            descriptor.capabilities.supports_lora = true;
+            descriptor.capabilities.supports_lokr = true;
+            descriptor
+        }
+        fn adapter_load(_spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+            Ok(Box::new(DummyGen {
+                desc: adapter_descriptor(),
+            }))
+        }
+
+        let registry = ProviderRegistryBuilder::new()
+            .register_generator(ModelRegistration {
+                descriptor: adapter_descriptor,
+                load: adapter_load,
+                footprint: None,
+            })
+            .register_imported_model(ImportedModelRegistration {
+                family: "test",
+                source: ImportedModelSource::TransformerDirectory,
+                operation: ImportedModelOperation::Generate,
+                provider_id: "dummy_adapter_model",
+                required_components: None,
+                inherit_adapters: false,
+            })
+            .build()
+            .expect("structurally restricted imported route");
+
+        let ordinary = (registry.generators().next().unwrap().descriptor)();
+        assert!(ordinary.capabilities.supports_lora);
+        assert!(ordinary.capabilities.supports_lokr);
+        let imported = registry
+            .imported_model_descriptor(
+                "test",
+                ImportedModelSource::TransformerDirectory,
+                ImportedModelOperation::Generate,
+            )
+            .unwrap();
+        assert!(!imported.capabilities.supports_lora);
+        assert!(!imported.capabilities.supports_lokr);
+    }
+
+    #[test]
+    fn imported_routes_reject_duplicates_and_unknown_targets() {
+        let route = ImportedModelRegistration {
+            family: "test",
+            source: ImportedModelSource::TransformerFile,
+            operation: ImportedModelOperation::Generate,
+            provider_id: "dummy_test_model",
+            required_components: None,
+            inherit_adapters: true,
+        };
+        let duplicate = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .register_imported_model(route)
+            .register_imported_model(route)
+            .build()
+            .err()
+            .expect("duplicate route must fail")
+            .to_string();
+        assert!(
+            duplicate.contains("duplicate imported-model route"),
+            "{duplicate}"
+        );
+
+        let unknown = ProviderRegistryBuilder::new()
+            .register_imported_model(route)
+            .build()
+            .err()
+            .expect("unknown target must fail")
+            .to_string();
+        assert!(
+            unknown.contains("targets unregistered generator"),
+            "{unknown}"
+        );
+    }
+
+    #[test]
+    fn imported_routes_reject_malformed_family_and_component_metadata() {
+        let route = |family, required_components| ImportedModelRegistration {
+            family,
+            source: ImportedModelSource::TransformerFile,
+            operation: ImportedModelOperation::Generate,
+            provider_id: "dummy_test_model",
+            required_components,
+            inherit_adapters: true,
+        };
+        for malformed in [
+            route("", None),
+            route(" test", None),
+            route("Krea", None),
+            route("krea 2", None),
+            route("test", Some(&[])),
+            route("test", Some(&[""])),
+            route("test", Some(&["base snapshot"])),
+            route("test", Some(&["base_snapshot", "base_snapshot"])),
+        ] {
+            assert!(
+                ProviderRegistryBuilder::new()
+                    .register_generator(DUMMY_GENERATOR_REGISTRATION)
+                    .register_imported_model(malformed)
+                    .build()
+                    .is_err(),
+                "malformed imported metadata must fail registry construction"
+            );
+        }
     }
 
     #[test]

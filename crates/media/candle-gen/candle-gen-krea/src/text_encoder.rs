@@ -420,6 +420,41 @@ impl KreaTextEncoder {
         })
     }
 
+    /// Build the dense encoder on CPU, fold every advertised projection directly onto the compute
+    /// device, and migrate only dense-kept leaves. This avoids a full dense-TE CUDA transient.
+    pub(crate) fn quantize_onto(
+        &mut self,
+        quant: candle_gen::gen_core::Quant,
+        device: &Device,
+    ) -> Result<()> {
+        self.embed_tokens.to_device(device)?;
+        for layer in &mut self.layers {
+            for projection in [
+                &mut layer.attn.q_proj,
+                &mut layer.attn.k_proj,
+                &mut layer.attn.v_proj,
+                &mut layer.attn.o_proj,
+                &mut layer.mlp.gate,
+                &mut layer.mlp.up,
+                &mut layer.mlp.down,
+            ] {
+                projection.quantize_onto(quant, device)?;
+            }
+            layer.input_ln = layer.input_ln.to_device(device)?;
+            layer.post_ln = layer.post_ln.to_device(device)?;
+            layer.attn.q_norm = layer.attn.q_norm.to_device(device)?;
+            layer.attn.k_norm = layer.attn.k_norm.to_device(device)?;
+        }
+        self.rotary = Rotary::new(
+            self.head_dim,
+            self.rope_theta,
+            crate::pipeline::MAX_TEXT_TOKENS,
+            device,
+        )?;
+        self.device = device.clone();
+        Ok(())
+    }
+
     /// `input_ids`: `[1, S]` u32. Returns the stacked conditioning `[1, S - prefix_tokens, num_select,
     /// hidden]` (the DiT's `context`), f32. The final norm is never applied; only layers up to
     /// `max(out_layers)` are run. Causal (decoder-only); no padding (the candle tokenizer emits none).

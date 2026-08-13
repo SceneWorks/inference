@@ -634,11 +634,11 @@ impl SdxlTrainer {
         // --- load + cache: VAE latents (.mean × scale) + dual-CLIP conditioning ---
         on_progress(TrainingProgress::LoadingModel);
         let vae = {
-            let vb = candle_gen::mmap_var_builder(
-                &[resolve_vae_file(&self.component_paths.vae_fp16_fix)],
-                DType::F32,
-                device,
-            )?;
+            let vae_source = self.component_paths.vae_fp16_fix.as_ref().ok_or_else(|| {
+                CandleError::Msg("sdxl trainer requires the fp16-fix VAE component".into())
+            })?;
+            let vb =
+                candle_gen::mmap_var_builder(&[resolve_vae_file(vae_source)], DType::F32, device)?;
             VaeMomentsEncoder::new(vb, VAE_SCALE)?
         };
         let clip = DualClip::load(
@@ -683,8 +683,10 @@ impl SdxlTrainer {
                     ));
                     prompts.push(prompt.clone());
                 }
-                let vae_decoder =
-                    load_sdxl_vae(&self.component_paths.vae_fp16_fix, device, compute_dtype)?;
+                let vae_source = self.component_paths.vae_fp16_fix.as_ref().ok_or_else(|| {
+                    CandleError::Msg("sdxl trainer requires the fp16-fix VAE component".into())
+                })?;
+                let vae_decoder = load_sdxl_vae(vae_source, device, compute_dtype)?;
                 Some(SamplePreview {
                     conds,
                     prompts,

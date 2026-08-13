@@ -94,6 +94,21 @@ impl ClipEncoderLayer {
         Ok(())
     }
 
+    fn materialize_weights(&self) -> Result<()> {
+        mlx_rs::transforms::eval([&self.ln1_w, &self.ln1_b, &self.ln2_w, &self.ln2_b])?;
+        for linear in [
+            &self.q,
+            &self.k,
+            &self.v,
+            &self.out,
+            &self.linear1,
+            &self.linear2,
+        ] {
+            linear.materialize_weights()?;
+        }
+        Ok(())
+    }
+
     fn activation(&self, x: &Array) -> Result<Array> {
         match self.act {
             // CLIP-L "quick_gelu" = `x · sigmoid(1.702·x)` — the vendored `mlx.nn.gelu_fast_approx`
@@ -194,6 +209,22 @@ impl ClipTextEncoder {
         }
         if let Some(p) = &mut self.text_projection {
             p.quantize(bits, None)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn materialize_weights(&self) -> Result<()> {
+        mlx_rs::transforms::eval([
+            &self.token_embedding,
+            &self.position_embedding,
+            &self.final_ln_w,
+            &self.final_ln_b,
+        ])?;
+        for layer in &self.layers {
+            layer.materialize_weights()?;
+        }
+        if let Some(projection) = &self.text_projection {
+            projection.materialize_weights()?;
         }
         Ok(())
     }
