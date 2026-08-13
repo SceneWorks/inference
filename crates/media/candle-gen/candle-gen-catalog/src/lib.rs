@@ -517,7 +517,8 @@ mod preview_advertising {
         /// The Wan **z16** space — `candle_gen_wan::vae16::WanVae16`, built from
         /// `Vae16Config::wan21()` (`z_dim: 16`, `base_dim: 96`, non-residual, no spatial patchify).
         /// **Never measured**; closed under the temporal program gate. Only `wan2_2_t2v_14b`,
-        /// `wan2_2_i2v_14b` and `wan_vace` occupy it inside `candle-gen-wan`; Bernini and Scail2
+        /// `wan2_2_i2v_14b`, `wan_vace`, and `wan2_2_vace_fun_14b` occupy it inside
+        /// `candle-gen-wan`; Bernini and Scail2
         /// build the same VAE from that crate, so they ride this row rather than any measured one.
         ///
         /// **Not** the 5B's space — see [`NoGo::WanZ48`]. `vae16.rs`'s own module docs enumerate three
@@ -675,6 +676,7 @@ mod preview_advertising {
         ("wan2_2_t2v_14b", NoGo::WanZ16),
         ("wan2_2_i2v_14b", NoGo::WanZ16),
         ("wan_vace", NoGo::WanZ16),
+        ("wan2_2_vace_fun_14b", NoGo::WanZ16),
         ("ltx_2_3_distilled", NoGo::Ltx),
         ("mochi_1", NoGo::Mochi),
         ("mage_flow", NoGo::Mage),
@@ -3237,11 +3239,11 @@ mod preview_advertising {
             classified.difference(&registered).collect::<Vec<_>>()
         );
 
-        // The shape at sc-16961: 51 registered generators = 29 wired + 19 no-go + 3 deferred. This
-        // story moves the wired count by ZERO — it measures nothing and wires nothing.
+        // VACE-Fun occupies the already-settled Wan z16 no-go space: 52 registered generators =
+        // 29 wired + 20 no-go + 3 deferred.
         assert_eq!(
             (registered.len(), wired.len(), no_go.len(), deferred.len()),
-            (51, 29, 19, 3),
+            (52, 29, 20, 3),
             "moving a route between preview classes is a decision that must be written down here"
         );
     }
@@ -3566,6 +3568,7 @@ mod preview_advertising {
                 "wan2_2_t2v_14b",
                 "wan2_2_i2v_14b",
                 "wan_vace",
+                "wan2_2_vace_fun_14b",
                 "bernini_renderer",
                 "bernini",
                 "scail2_14b",
@@ -3592,6 +3595,11 @@ mod preview_advertising {
             ),
             (
                 "candle-gen-wan/src/model_vace.rs",
+                &["Vae16Config::wan21()", "vae16::WanVae16"][..],
+                &["VaeConfig::ti2v_5b"][..],
+            ),
+            (
+                "candle-gen-wan/src/model_vace_fun.rs",
                 &["Vae16Config::wan21()", "vae16::WanVae16"][..],
                 &["VaeConfig::ti2v_5b"][..],
             ),
@@ -3936,6 +3944,7 @@ mod tests {
                 "wan2_2_t2v_14b",
                 "wan2_2_i2v_14b",
                 "wan_vace",
+                "wan2_2_vace_fun_14b",
                 "z_image_turbo",
                 "z_image",
             ]
@@ -3961,9 +3970,9 @@ mod tests {
 
         // sc-16667: the pinned surface and the model-weight licence mapping move together — this is
         // where a surface change and a mapping change meet. Five of the seven trainer ids are also
-        // generator ids, which is why 51 + 7 + 1 + 2 registrations are 56 distinct ids.
+        // generator ids, which is why 52 + 7 + 1 + 2 registrations are 57 distinct ids.
         //
-        // Registration is never conditioned on the mapping: 47 < 56 because nine ids load nothing
+        // Registration is never conditioned on the mapping: 48 < 57 because nine ids load nothing
         // the shared checkpoint table covers, and they ship exactly as before. That gap is a hole in
         // our metadata for CI to report, and `licenses::tests` pins which nine and why — as
         // `#[cfg(test)]` data, so no gate can read it and suppress them.
@@ -3974,8 +3983,8 @@ mod tests {
             .chain(&image_embedders)
             .chain(&text_embedders)
             .collect();
-        assert_eq!(distinct.len(), 56);
-        assert_eq!(super::provider_components().len(), 47);
+        assert_eq!(distinct.len(), 57);
+        assert_eq!(super::provider_components().len(), 48);
     }
 
     /// The manifest emitter runs on **this** catalog's three slices, and its output is

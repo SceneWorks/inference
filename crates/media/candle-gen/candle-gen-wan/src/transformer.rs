@@ -312,8 +312,21 @@ impl Block {
     ) -> Result<Tensor> {
         let dt = hidden.dtype();
         // mods: scale_shift_table[1,6,dim] + temb6[B,6,dim] → 6 × [B,1,dim] (f32).
-        let mods = self.scale_shift_table.broadcast_add(temb6)?;
-        let m = |i: usize| -> Result<Tensor> { mods.narrow(1, i, 1) };
+        let table = if temb6.rank() == 4 {
+            self.scale_shift_table.unsqueeze(1)?
+        } else {
+            self.scale_shift_table.clone()
+        };
+        let mods = table.broadcast_add(temb6)?;
+        let modulation_axis = if mods.rank() == 4 { 2 } else { 1 };
+        let m = |i: usize| -> Result<Tensor> {
+            let value = mods.narrow(modulation_axis, i, 1)?;
+            if modulation_axis == 2 {
+                value.squeeze(2)
+            } else {
+                Ok(value)
+            }
+        };
         let (shift_msa, scale_msa, gate_msa) = (m(0)?, m(1)?, m(2)?);
         let (c_shift, c_scale, c_gate) = (m(3)?, m(4)?, m(5)?);
 
@@ -377,6 +390,21 @@ pub(crate) fn timestep_sinusoid(t: f64, freq_dim: usize, b: usize, dev: &Device)
     } else {
         Ok(one.broadcast_as((b, freq_dim))?.contiguous()?)
     }
+}
+
+/// Vectorized timestep embedding for TI2V mask blending. `timesteps` is `[B,L]`; the result is
+/// `[B,L,freq_dim]`, so pinned tokens can carry timestep zero independently of generated tokens.
+fn timestep_sinusoid_tokens(timesteps: &Tensor, freq_dim: usize, dev: &Device) -> Result<Tensor> {
+    let half = freq_dim / 2;
+    let freqs = (0..half)
+        .map(|i| (-(10000f64.ln()) * i as f64 / half as f64).exp() as f32)
+        .collect::<Vec<_>>();
+    let freqs = Tensor::from_vec(freqs, (1, 1, half), dev)?;
+    let angles = timesteps
+        .to_dtype(DType::F32)?
+        .unsqueeze(2)?
+        .broadcast_mul(&freqs)?;
+    Tensor::cat(&[&angles.cos()?, &angles.sin()?], 2)
 }
 
 pub struct WanTransformer {
@@ -596,6 +624,58 @@ impl WanTransformer {
             .broadcast_add(&shift)?
             .to_dtype(self.dtype)?;
         self.proj_out.forward(&normed) // [B,L,out_c*patch]
+    }
+
+    /// TI2V mask-blend forward with per-token timesteps `[B,L]`. The scalar T2V entry point above is
+    /// intentionally unchanged; this only generalizes AdaLN/head modulation to the token axis.
+    pub fn forward_tokens(
+        &self,
+        latents: &Tensor,
+        timestep_tokens: &Tensor,
+        context: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+    ) -> Result<Tensor> {
+        let (tokens, grid) = self.patch_embed_tokens(latents)?;
+        let (b, l, _dim) = tokens.dims3()?;
+        let (tb, tl) = timestep_tokens.dims2()?;
+        if (tb, tl) != (b, l) {
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "wan TI2V timestep tokens must be [{b},{l}] (got [{tb},{tl}])"
+            )));
+        }
+        let sinus = timestep_sinusoid_tokens(timestep_tokens, self.cfg.freq_dim, &self.device)?
+            .to_dtype(self.dtype)?;
+        let temb = self
+            .time_l2
+            .forward(&self.time_l1.forward(&sinus)?.silu()?)?; // [B,L,dim]
+        let temb6 = self
+            .time_proj
+            .forward(&temb.silu()?)?
+            .reshape((b, l, 6, self.cfg.dim))?
+            .to_dtype(DType::F32)?;
+
+        let mut hidden = tokens;
+        for block in &self.blocks {
+            hidden = block.forward(&hidden, &temb6, context, cos, sin)?;
+            if self.bounded_offload {
+                self.device.synchronize()?;
+            }
+        }
+
+        let head_mod = self
+            .scale_shift_table
+            .unsqueeze(1)?
+            .broadcast_add(&temb.unsqueeze(2)?.to_dtype(DType::F32)?)?; // [B,L,2,dim]
+        let shift = head_mod.narrow(2, 0, 1)?.squeeze(2)?;
+        let scale = head_mod.narrow(2, 1, 1)?.squeeze(2)?;
+        let hidden = hidden.to_dtype(DType::F32)?;
+        let normed = ln_no_affine(&hidden, self.norm_out_eps)?
+            .broadcast_mul(&(scale + 1.0)?)?
+            .broadcast_add(&shift)?
+            .to_dtype(self.dtype)?;
+        let out = self.proj_out.forward(&normed)?;
+        self.unpatchify_tokens(&out, grid)
     }
 
     /// Unpatchify a per-token velocity `[B, L, out_channels·∏patch]` (with `L = ppf·pph·ppw`) back to a
@@ -848,6 +928,42 @@ mod tests {
             max_abs(&got, &want),
             0.0,
             "seam composition must equal forward"
+        );
+    }
+
+    #[test]
+    fn per_token_timestep_forward_reduces_to_scalar_and_honors_pinned_tokens() {
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        let dit = tiny_dit(&cfg, &dev);
+        let latents = Tensor::randn(0f32, 1f32, (1, 16, 2, 4, 4), &dev).unwrap();
+        let context = Tensor::randn(0f32, 1f32, (1, 3, cfg.dim), &dev).unwrap();
+        let (cos, sin) = WanRope::new(&cfg).cos_sin(2, 2, 2, &dev).unwrap();
+        let timestep = 833.0;
+        let scalar = dit
+            .forward(&latents, &context, timestep, &cos, &sin)
+            .unwrap();
+        let all_equal = Tensor::full(timestep as f32, (1, 8), &dev).unwrap();
+        let tokenized = dit
+            .forward_tokens(&latents, &all_equal, &context, &cos, &sin)
+            .unwrap();
+        assert!(
+            max_abs(&scalar, &tokenized) < 1e-5,
+            "all-equal token timesteps must reduce to the scalar forward"
+        );
+
+        let mixed = Tensor::from_vec(
+            vec![0f32, 0.0, 0.0, 0.0, 833.0, 833.0, 833.0, 833.0],
+            (1, 8),
+            &dev,
+        )
+        .unwrap();
+        let pinned = dit
+            .forward_tokens(&latents, &mixed, &context, &cos, &sin)
+            .unwrap();
+        assert!(
+            max_abs(&tokenized, &pinned) > 1e-5,
+            "zero-timestep pinned tokens must change the modulation path"
         );
     }
 

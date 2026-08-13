@@ -372,8 +372,8 @@ pub const PROVIDER_COMPONENTS: &[ProviderComponents] = &[
         components: &["stable_video_diffusion_img2vid_xt"],
     },
     // --- wan --------------------------------------------------------------------------------
-    // Candle registers four generators and one trainer; `wan2_2_vace_fun_14b` is MLX-only. The
-    // GGUF re-host is a Candle-only provisioning of the 5B DiT and is listed because a run may
+    // Candle registers five generators and one trainer. The GGUF re-host is a Candle-only
+    // provisioning of the 5B DiT and is listed because a run may
     // load it in place of the safetensors tree. `wan_vace` is 14B-only on Candle (no 1.3B preset
     // exists in `candle-gen-wan/src/config.rs`) and its repository ships the transformer alone, so
     // it also rides the stock Wan UMT5 and the z16 VAE `candle-gen-wan/src/vae16.rs` ports from
@@ -389,6 +389,10 @@ pub const PROVIDER_COMPONENTS: &[ProviderComponents] = &[
     ProviderComponents {
         provider_id: "wan2_2_ti2v_5b",
         components: &["wan2_2_ti2v_5b", "wan2_2_ti2v_5b_gguf", "umt5_xxl"],
+    },
+    ProviderComponents {
+        provider_id: "wan2_2_vace_fun_14b",
+        components: &["wan2_2_vace_fun_a14b", "wan2_2_t2v_a14b", "umt5_xxl"],
     },
     ProviderComponents {
         provider_id: "wan_vace",
@@ -522,7 +526,7 @@ mod tests {
     /// failing.
     #[test]
     fn mapping_is_sorted_and_every_key_resolves() {
-        assert_eq!(PROVIDER_COMPONENTS.len(), 47);
+        assert_eq!(PROVIDER_COMPONENTS.len(), 48);
         let ids: Vec<&str> = PROVIDER_COMPONENTS.iter().map(|p| p.provider_id).collect();
         let mut sorted = ids.clone();
         sorted.sort_unstable();
@@ -554,8 +558,8 @@ mod tests {
         let registered = registered_ids();
         assert_eq!(
             registered.len(),
-            56,
-            "56 distinct Candle provider ids: 51 generators + 7 trainers (5 of them also generator \
+            57,
+            "57 distinct Candle provider ids: 52 generators + 7 trainers (5 of them also generator \
              ids) + 1 captioner + 2 embedders"
         );
 
@@ -720,6 +724,7 @@ mod tests {
                 "wan2_2_i2v_14b",
                 "wan2_2_t2v_14b",
                 "wan2_2_ti2v_5b",
+                "wan2_2_vace_fun_14b",
                 "wan_vace",
             ]
         );
@@ -769,7 +774,6 @@ mod tests {
         let pinned_elsewhere: BTreeSet<&str> = BTreeSet::from([
             // MLX-registered generator ids with no Candle sibling.
             "flux2_klein_9b_kv",
-            "wan2_2_vace_fun_a14b",
             "z_image_fun_controlnet_union_2_1",
             "z_image_turbo_fun_controlnet_union_2_1",
             "qwen_image_2512",
