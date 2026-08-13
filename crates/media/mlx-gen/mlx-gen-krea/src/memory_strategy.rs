@@ -144,6 +144,7 @@ fn memory_strategy_contract_with_asset_facts(
                 },
             })
             .collect(),
+        decode_geometry_policy_authoritative: false,
         pid_decode_routes: None,
         load_shape: spec.load_shape,
         additional_prerequisites: streamable_transformer

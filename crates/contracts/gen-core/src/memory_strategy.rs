@@ -148,10 +148,10 @@ pub const MEMORY_DECODE_QUALITY_ABI: u32 = 2;
 /// merge commit have different object ids but the same implementation. The digest changes only
 /// when the quality-relevant source bytes change.
 pub const MEMORY_DECODE_QUALITY_IMPLEMENTATION_FINGERPRINT: &str =
-    "33b282e34dcc1a152060596b183754355dad260653abfe4523c158aac2ee6d3a";
+    "e6a65abb773c5a98e9b5df592d8f8c7be35293b22d5b461a6d24c312c3ae7e0c";
 #[cfg(test)]
 const MEMORY_DECODE_QUALITY_CANONICAL_FIXTURE_SHA256: &str =
-    "1090fb3e036c884d995b1fd7513a373e9e5cb623fab49f3bd8e96709c07c9b78";
+    "e2fbf794309bd55db1231af38a8fd36949c1cd9570f11e416c627e34bb642642";
 
 /// Prefix for the single-line calibration observation protocol consumed by release tooling.
 ///
@@ -888,6 +888,10 @@ pub struct MemoryProviderContract {
     pub provider_id: String,
     pub backend: MemoryBackendRealization,
     pub strategies: Vec<MemoryStrategyCapability>,
+    /// Whether the caller declared semantic decode authority for this loaded route even when no
+    /// row survives the exact tier/load-shape projection. This distinguishes a genuinely legacy
+    /// empty table from a declared-but-inapplicable/refused table, which must remain fail closed.
+    pub decode_geometry_policy_authoritative: bool,
     /// Exact native/PiD route split when this provider supports PiD decode. The ordinary strategy
     /// ranges publish the union; this declaration makes the route distinction visible to weights-free
     /// registry conformance and provider admission checks.
@@ -937,6 +941,7 @@ impl MemoryProviderContract {
                     parameters: MemoryParameterRanges::default(),
                 })
                 .collect(),
+            decode_geometry_policy_authoritative: false,
             pid_decode_routes: None,
             load_shape: LoadShape::EagerMaterialization,
             additional_prerequisites: Vec::new(),
@@ -1041,6 +1046,7 @@ impl MemoryProviderContract {
         if policies.is_empty() {
             return Ok(false);
         }
+        self.decode_geometry_policy_authoritative = true;
         if expected_family.trim().is_empty()
             || policies
                 .iter()
@@ -1135,6 +1141,12 @@ impl MemoryProviderContract {
         };
         let policies = &capability.parameters.decode_geometry_policies;
         if policies.is_empty() {
+            if self.decode_geometry_policy_authoritative {
+                return Err(Error::Unsupported(format!(
+                    "{}: bounded decode has a declared quality scope but no applicable row for the loaded tier/load shape",
+                    self.provider_id
+                )));
+            }
             return Ok(None);
         }
         let request_rows = self.decode_geometry_policies_for_request(query)?;
@@ -1252,9 +1264,12 @@ impl MemoryProviderContract {
         if !engaged || rung != MemoryStrategy::BoundedDecode {
             return engaged;
         }
-        let has_geometry_policy = self
-            .capability(MemoryStrategy::BoundedDecode)
-            .is_some_and(|capability| !capability.parameters.decode_geometry_policies.is_empty());
+        let has_geometry_policy = self.decode_geometry_policy_authoritative
+            || self
+                .capability(MemoryStrategy::BoundedDecode)
+                .is_some_and(|capability| {
+                    !capability.parameters.decode_geometry_policies.is_empty()
+                });
         if !has_geometry_policy || selection.strategy == MemoryStrategy::BoundedDecode {
             return true;
         }
@@ -3631,6 +3646,7 @@ mod tests {
             provider_id: "test-provider".to_owned(),
             backend: mlx_backend(),
             strategies,
+            decode_geometry_policy_authoritative: false,
             pid_decode_routes: None,
             load_shape: LoadShape::DeferredMaterialization,
             additional_prerequisites: Vec::new(),
@@ -4076,6 +4092,10 @@ mod tests {
             [q4.clone()]
         );
         let eager = spec.with_load_shape(LoadShape::EagerMaterialization);
+        assert!(
+            eager.decode_geometry_policy_authoritative,
+            "an exact projection that yields no row must retain the caller-declared semantic scope"
+        );
         assert_eq!(
             eager
                 .decode_geometry_policies_for_loaded_contract(
@@ -4124,6 +4144,41 @@ mod tests {
             )
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn declared_empty_decode_quality_scope_fails_closed_without_blocking_independent_rungs() {
+        let mut contract = adopted_contract();
+        contract.decode_geometry_policy_authoritative = true;
+        let context = admitted_context(&contract);
+        let query = MemoryDecodePolicyQuery {
+            tier: context.selection.tier,
+            load_shape: context.load_shape,
+            mode_key: context.mode.as_key(),
+            overlay: context.overlay.as_deref(),
+            geometry: context.geometry,
+            use_pid: context.use_pid,
+        };
+        let error = contract
+            .decode_geometry_policy(query, None)
+            .expect_err("declared semantic scope cannot fall back to route-blind decode");
+        assert!(error.to_string().contains("declared quality scope"));
+
+        let independent = MemorySelection {
+            strategy: MemoryStrategy::BoundedAttention,
+            parameters: MemoryStrategyParameters {
+                attention_chunk_size: Some(256),
+                ..Default::default()
+            },
+            tier: context.selection.tier,
+        };
+        assert!(!contract.engages_selection(&independent, MemoryStrategy::BoundedDecode));
+        assert!(contract.engages_selection(&independent, MemoryStrategy::BoundedAttention));
+        let memory = contract
+            .generation_memory(&independent)
+            .expect("optimized selection memory controls");
+        assert!(!memory.tile_vae_decode);
+        assert!(memory.chunk_attention);
     }
 
     #[test]

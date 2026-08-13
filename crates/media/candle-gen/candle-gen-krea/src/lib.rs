@@ -1594,6 +1594,7 @@ fn build_krea_turbo_memory_strategy_contract(spec: &LoadSpec) -> gen_core::Memor
                 },
             })
             .collect(),
+        decode_geometry_policy_authoritative: false,
         pid_decode_routes: None,
         load_shape: LoadShape::DeferredMaterialization,
         // Every higher-rung Krea control is executed by `render_three_stage`: the provider reloads

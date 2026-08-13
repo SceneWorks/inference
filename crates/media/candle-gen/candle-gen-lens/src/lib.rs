@@ -1025,6 +1025,7 @@ fn build_lens_memory_strategy_contract_with_eligibility(
             block_materialization: MemoryWindowMaterialization::DeviceFormatTransfer,
         },
         strategies,
+        decode_geometry_policy_authoritative: false,
         pid_decode_routes: None,
         load_shape: spec.load_shape,
         additional_prerequisites: [

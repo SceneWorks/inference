@@ -147,6 +147,7 @@ pub fn provider_contract_for(
             block_materialization: MemoryWindowMaterialization::DeviceFormatTransfer,
         },
         strategies,
+        decode_geometry_policy_authoritative: false,
         pid_decode_routes: None,
         load_shape: spec.load_shape,
         additional_prerequisites: [

@@ -523,6 +523,10 @@ pub struct LoadSpec {
     /// rows only when their route/backend/numeric-tier contract validates them; the semantic records
     /// are independent from model-memory calibration evidence.
     pub decode_geometry_policies: Vec<MemoryDecodeGeometryPolicy>,
+    /// True once a caller declares quality policy for this route, even if exact tier/load-shape
+    /// projection or an independently audited binding leaves zero usable rows. Providers use this
+    /// to distinguish fail-closed semantic scope from a genuinely legacy empty table.
+    pub decode_geometry_policy_authoritative: bool,
     /// Independently resolved runtime identity for the packaged quality rows. A non-empty table
     /// without this binding is malformed and fails closed before provider construction.
     pub decode_quality_runtime_identity: Option<MemoryDecodeQualityRuntimeIdentity>,
@@ -694,6 +698,7 @@ impl LoadSpec {
             weights,
             resolved_route: None,
             decode_geometry_policies: Vec::new(),
+            decode_geometry_policy_authoritative: false,
             decode_quality_runtime_identity: None,
             prepared_file_pins: PreparedFilePins::default(),
             quantize: None,
@@ -722,7 +727,15 @@ impl LoadSpec {
         mut self,
         policies: Vec<MemoryDecodeGeometryPolicy>,
     ) -> Self {
+        self.decode_geometry_policy_authoritative |= !policies.is_empty();
         self.decode_geometry_policies = policies;
+        self
+    }
+
+    /// Preserve a caller-audited semantic scope when its rows were stripped after a typed binding
+    /// refusal. Setting this false never erases authority already established by attached rows.
+    pub fn with_decode_geometry_policy_authority(mut self, authoritative: bool) -> Self {
+        self.decode_geometry_policy_authoritative |= authoritative;
         self
     }
 

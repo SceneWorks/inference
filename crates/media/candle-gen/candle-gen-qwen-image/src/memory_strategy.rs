@@ -179,6 +179,7 @@ pub(crate) fn provider_contract(
             block_materialization: MemoryWindowMaterialization::DeviceFormatTransfer,
         },
         strategies,
+        decode_geometry_policy_authoritative: false,
         // PiD owns a distinct decoder and tile domain. Until it accepts this explicit native-VAE
         // plan, optimized selections are rejected instead of silently applying the wrong geometry.
         pid_decode_routes: None,

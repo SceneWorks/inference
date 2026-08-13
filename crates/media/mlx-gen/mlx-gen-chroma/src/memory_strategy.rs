@@ -581,6 +581,7 @@ fn build_contract(
             _ => MemoryStrategySupport::Missing,
         };
     }
+    contract.decode_geometry_policy_authoritative = spec.decode_geometry_policy_authoritative;
     contract.adopt_decode_geometry_policies("chroma", decode_policies)?;
     if streamable {
         contract.additional_prerequisites.push((

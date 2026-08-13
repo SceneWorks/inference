@@ -905,6 +905,7 @@ fn contract_with_asset_facts(
             _ => MemoryParameterRanges::default(),
         };
     }
+    contract.decode_geometry_policy_authoritative = spec.decode_geometry_policy_authoritative;
     contract.adopt_decode_geometry_policies("kolors", decode_policies)?;
     // No `pid_decode_routes`: that declaration exists to split rung 2's candidate domain between the
     // native VAE and the PiD student, and rung 2 is not selectable on this provider. The student

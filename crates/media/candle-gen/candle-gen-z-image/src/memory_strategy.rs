@@ -295,6 +295,7 @@ pub(crate) fn provider_contract(
             block_materialization: MemoryWindowMaterialization::DeviceFormatTransfer,
         },
         strategies,
+        decode_geometry_policy_authoritative: false,
         // PiD replaces the native VAE with a separately planned decoder. Until that decoder accepts
         // this provider's bounded host-decode route, the request safety gate rejects optimized PiD
         // runs.
