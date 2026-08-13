@@ -1245,8 +1245,18 @@ pub fn window_unpartition(
 mod tests {
     use super::*;
     use crate::diagnostics::{self, DiagnosticCounter, ToggleDisposition, EXACT_EPILOGUES};
+    use mlx_rs::ops::indexing::{IndexOp, IntoStrideBy};
     use mlx_rs::ops::{abs, array_eq, max, subtract};
     use mlx_rs::Dtype;
+
+    // MLX keeps this source-backed runtime predicate private to its C++ Metal backend. The focused
+    // NAX job links the exact pinned static library, so this test-only declaration calls the same
+    // predicate used by the qmm/conv dispatchers without adding a production API solely for CI.
+    #[cfg(target_os = "macos")]
+    unsafe extern "C" {
+        #[link_name = "_ZN3mlx4core5metal16is_nax_availableEv"]
+        fn mlx_p3_is_nax_available() -> bool;
+    }
 
     fn patterned(shape: &[i32], cosine: bool) -> Array {
         let len = shape.iter().map(|dim| *dim as usize).product::<usize>();
@@ -1328,6 +1338,24 @@ mod tests {
 
     fn typed_patterned(shape: &[i32], dtype: Dtype, cosine: bool) -> Array {
         patterned(shape, cosine).as_dtype(dtype).unwrap()
+    }
+
+    #[test]
+    fn p3_nax_runtime_is_available_when_required() {
+        if std::env::var_os("SCENEWORKS_REQUIRE_NAX").is_none() {
+            return;
+        }
+
+        #[cfg(target_os = "macos")]
+        // SAFETY: the no-argument C++ function returns a plain bool and is linked from the same
+        // pinned libmlx.a that owns every exact primitive exercised by this test binary.
+        assert!(
+            unsafe { mlx_p3_is_nax_available() },
+            "SCENEWORKS_REQUIRE_NAX requires MLX's actual runtime NAX predicate to pass"
+        );
+
+        #[cfg(not(target_os = "macos"))]
+        panic!("SCENEWORKS_REQUIRE_NAX is only valid on macOS");
     }
 
     #[test]
@@ -2035,8 +2063,19 @@ mod tests {
                 ("noncontiguous", noncontiguous),
             ] {
                 let channels = *x.shape().last().unwrap();
-                let weight = typed_patterned(&[channels], dtype, true);
-                let bias = typed_patterned(&[channels], dtype, false);
+                let (weight, bias) = if layout == "noncontiguous" {
+                    let weight_source = typed_patterned(&[channels * 2], dtype, true);
+                    let bias_source = typed_patterned(&[channels * 2], dtype, false);
+                    (
+                        weight_source.index((..).stride_by(2)),
+                        bias_source.index((1..).stride_by(2)),
+                    )
+                } else {
+                    (
+                        typed_patterned(&[channels], dtype, true),
+                        typed_patterned(&[channels], dtype, false),
+                    )
+                };
                 let eager = group_norm(&x, &weight, &bias, 8, 1e-5).unwrap();
                 let scope = diagnostics::begin_request_with_toggles(
                     "p3-exact-group-norm",
@@ -2062,9 +2101,7 @@ mod tests {
 
     #[test]
     fn p3_unsupported_operations_preserve_composed_outputs_and_reasons() {
-        let activation = patterned(&[3, 17, 65], false)
-            .as_dtype(Dtype::Int32)
-            .unwrap();
+        let activation = Array::from_slice(&[-2i32, -1, 0, 1, 2], &[5]);
         let conv2_x = patterned(&[1, 8, 8, 16], false);
         let conv2_w = patterned(&[16, 3, 3, 8], true);
         let conv2_b = patterned(&[16], false);

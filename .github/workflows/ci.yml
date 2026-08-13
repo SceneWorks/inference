@@ -406,6 +406,7 @@ jobs:
       - name: Exercise exact P3 epilogues on NAX
         env:
           MLX_ENABLE_TF32: "1"
+          SCENEWORKS_REQUIRE_NAX: "1"
         run: cargo test --locked --lib -p mlx-gen p3_ -- --test-threads=1
       - name: Exercise LLM-only runtime catalog on NAX
         run: cargo test --locked --no-default-features --lib -p runtime-macos
