@@ -96,8 +96,8 @@ impl ChromaVariant {
                 supports_true_cfg: true,
                 // v1 = T2I only. ControlNet / IP-Adapter / img2img are later ports.
                 conditioning: vec![],
-                supports_lora: false,
-                supports_lokr: false,
+                supports_lora: true,
+                supports_lokr: true,
                 // Unified curated sampler/scheduler menu (epic 7114 P4, sc-7123) plus the legacy
                 // aliases (`flow_match` / `linear`), which fall back to euler / the native per-variant
                 // schedule (N3) so a request the worker builds for either backend still validates.
@@ -227,8 +227,8 @@ mod tests {
             assert!(!d.capabilities.supports_guidance);
             assert!(!d.capabilities.mac_only);
             assert!(d.capabilities.conditioning.is_empty());
-            assert!(!d.capabilities.supports_lora);
-            assert!(!d.capabilities.supports_lokr);
+            assert!(d.capabilities.supports_lora);
+            assert!(d.capabilities.supports_lokr);
             assert!(d.capabilities.supported_quants.is_empty());
             assert_eq!(d.capabilities.min_size, 256);
             assert_eq!(d.capabilities.max_size, 2048);

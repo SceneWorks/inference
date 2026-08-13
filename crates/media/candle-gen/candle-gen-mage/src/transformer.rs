@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use candle_core::{DType, Device, Result, Tensor, D};
 use candle_gen::gen_core::{PrecisionFloorComponent, Quant};
-use candle_gen::quant::{PackedWeightSidecars, QLinear};
+use candle_gen::quant::{AdaptLinear as QLinear, PackedWeightSidecars};
 use candle_gen_boogu::loader::Weights;
 
 use crate::config::{HEAD_DIM, NORM_EPS};
@@ -31,9 +31,19 @@ fn streamed_linear(
     } else {
         None
     };
-    Ok(QLinear::from_qtensor_dequant(
+    let base_linear = candle_gen::quant::QLinear::from_qtensor_dequant(
         Arc::new(sidecars.load(base, weights.device())?),
         dense_bias,
+    );
+    let scales = weights.get_f32(&format!("{base}.scales"))?;
+    let (out_dim, groups) = scales.dims2()?;
+    let group_size = weights
+        .packed()
+        .map_or(64, |config| config.group_size as usize);
+    Ok(QLinear::from_packed(
+        base_linear,
+        groups * group_size,
+        out_dim,
     ))
 }
 
@@ -545,6 +555,60 @@ pub struct MageTransformer {
 }
 
 impl MageTransformer {
+    pub fn visit_adaptable_mut(
+        &mut self,
+        visitor: &mut dyn FnMut(&str, &mut candle_gen::quant::AdaptLinear) -> Result<()>,
+    ) -> Result<()> {
+        visitor("img_in", &mut self.image_in)?;
+        visitor("txt_in", &mut self.text_in)?;
+        visitor(
+            "time_text_embed.timestep_embedder.linear_1",
+            &mut self.timestep.l1,
+        )?;
+        visitor(
+            "time_text_embed.timestep_embedder.linear_2",
+            &mut self.timestep.l2,
+        )?;
+        match &mut self.blocks {
+            MageBlocks::Resident(blocks) => {
+                for (index, block) in blocks.iter_mut().enumerate() {
+                    let prefix = format!("transformer_blocks.{index}");
+                    visitor(&format!("{prefix}.img_mod.1"), &mut block.image_mod)?;
+                    visitor(&format!("{prefix}.txt_mod.1"), &mut block.text_mod)?;
+                    for (name, linear) in [
+                        ("to_q", &mut block.attention.to_q),
+                        ("to_k", &mut block.attention.to_k),
+                        ("to_v", &mut block.attention.to_v),
+                        ("to_out.0", &mut block.attention.to_out),
+                        ("add_q_proj", &mut block.attention.add_q),
+                        ("add_k_proj", &mut block.attention.add_k),
+                        ("add_v_proj", &mut block.attention.add_v),
+                        ("to_add_out", &mut block.attention.add_out),
+                    ] {
+                        visitor(&format!("{prefix}.attn.{name}"), linear)?;
+                    }
+                    visitor(
+                        &format!("{prefix}.img_mlp.net.0.proj"),
+                        &mut block.image_ff.proj,
+                    )?;
+                    visitor(&format!("{prefix}.img_mlp.net.2"), &mut block.image_ff.out)?;
+                    visitor(
+                        &format!("{prefix}.txt_mlp.net.0.proj"),
+                        &mut block.text_ff.proj,
+                    )?;
+                    visitor(&format!("{prefix}.txt_mlp.net.2"), &mut block.text_ff.out)?;
+                }
+            }
+            MageBlocks::Streamed { .. } => {
+                candle_core::bail!(
+                    "Mage adapters require resident transformer blocks; disable block streaming"
+                )
+            }
+        }
+        visitor("norm_out.linear", &mut self.final_mod)?;
+        visitor("proj_out", &mut self.output)
+    }
+
     pub fn load(dir: &Path, cfg: &crate::config::MageConfig, device: &Device) -> Result<Self> {
         Self::load_with_quant(dir, cfg, None, device)
     }

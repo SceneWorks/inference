@@ -26,7 +26,9 @@ use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::imageops::resize_lanczos_u8;
 use candle_gen::gen_core::sampling::{AlphaSchedule, Scheduler, Solver};
-use candle_gen::gen_core::{self, Conditioning, GenerationRequest, Image, PidWeights, Progress};
+use candle_gen::gen_core::{
+    self, AdapterSpec, Conditioning, GenerationRequest, Image, PidWeights, Progress,
+};
 use candle_gen::quant::{PackedConfig, QLinear, MLX_GROUP_SIZE};
 // Shared per-image batch seed (`base + index`) — one home in `candle-gen` (sc-9043 / F-059).
 use candle_gen::{CandleError, Result};
@@ -36,7 +38,9 @@ use candle_gen::{CandleError, Result};
 // `add_embedding` + the external `encoder_hid_proj`) are handled outside the block stack, exactly as the
 // Kolors IP-Adapter provider already does (sc-10819).
 use candle_gen_pid::PidEngine;
-use candle_gen_sdxl::{sdxl_unet_config, UNet2DConditionModel as VendoredUNet, VaeMomentsEncoder};
+use candle_gen_sdxl::{
+    load_vendored_unet_with_adapters, UNet2DConditionModel as VendoredUNet, VaeMomentsEncoder,
+};
 use candle_transformers::models::stable_diffusion::vae::{AutoEncoderKL, AutoEncoderKLConfig};
 
 use crate::chatglm3::ChatGlmModel;
@@ -108,6 +112,7 @@ pub(crate) struct Pipeline {
     /// The `LoadSpec::pid` component captured at load (epic 7840 / sc-7853), built into the cached
     /// [`Components`] so the PiD engine loads once alongside the base model. `None` ⇒ native VAE decode.
     pid_spec: Option<PidWeights>,
+    adapters: Vec<AdapterSpec>,
 }
 
 /// Kolors' two UNet deltas vs stock SDXL, both auto-present in the checkpoint: the `add_embedding` MLP
@@ -205,11 +210,17 @@ pub(crate) struct Components {
 }
 
 impl Pipeline {
-    pub(crate) fn load(root: &Path, device: &Device, pid_spec: Option<PidWeights>) -> Self {
+    pub(crate) fn load(
+        root: &Path,
+        device: &Device,
+        pid_spec: Option<PidWeights>,
+        adapters: Vec<AdapterSpec>,
+    ) -> Self {
         Self {
             root: root.to_path_buf(),
             device: device.clone(),
             pid_spec,
+            adapters,
         }
     }
 
@@ -248,12 +259,14 @@ impl Pipeline {
                 // The vendored UNet + the 5632 `add_embedding` (both packed-detecting via the shared
                 // `candle_gen::quant` seam); `sdxl_unet_config` is the canonical 3-block SDXL geometry
                 // Kolors shares. `false` = math attention (the vendored flash path is a stub).
-                let vendored = VendoredUNet::new(vs.clone(), 4, 4, false, sdxl_unet_config())?
-                    .with_add_embedding(
-                        vs.clone(),
-                        ADDITION_TIME_EMBED_DIM,
-                        PROJECTION_INPUT_DIM,
-                    )?;
+                let vendored = load_vendored_unet_with_adapters(
+                    &self.root,
+                    &self.device,
+                    DType::F32,
+                    &self.adapters,
+                    ADDITION_TIME_EMBED_DIM,
+                    PROJECTION_INPUT_DIM,
+                )?;
                 // The Kolors `encoder_hid_proj` is packed inside `unet/` (pack-all), so it must
                 // packed-detect too — a bare `candle_nn::Linear` would read the u32 codes as garbage.
                 let encoder_hid_proj = QLinear::linear_detect_gs(
@@ -269,10 +282,33 @@ impl Pipeline {
                     encoder_hid_proj: Arc::new(encoder_hid_proj),
                 }
             }
-            None => KolorsUnet::Dense(Arc::new(KolorsUNet::new(
+            None if self.adapters.is_empty() => KolorsUnet::Dense(Arc::new(KolorsUNet::new(
                 self.f32_vb(&self.root.join("unet"))?,
                 false,
             )?)),
+            None => {
+                let vs = self.f32_vb(&self.root.join("unet"))?;
+                let vendored = load_vendored_unet_with_adapters(
+                    &self.root,
+                    &self.device,
+                    DType::F32,
+                    &self.adapters,
+                    ADDITION_TIME_EMBED_DIM,
+                    PROJECTION_INPUT_DIM,
+                )?;
+                let encoder_hid_proj = QLinear::linear_detect_gs(
+                    CONTEXT_DIM,
+                    CROSS_ATTENTION_DIM,
+                    &vs,
+                    "encoder_hid_proj",
+                    true,
+                    MLX_GROUP_SIZE,
+                )?;
+                KolorsUnet::Packed {
+                    unet: Arc::new(vendored),
+                    encoder_hid_proj: Arc::new(encoder_hid_proj),
+                }
+            }
         };
 
         let vae = AutoEncoderKL::new(

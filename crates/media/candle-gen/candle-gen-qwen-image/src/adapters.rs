@@ -296,6 +296,26 @@ fn adapter_file_additive_capable(af: &AdapterFile) -> bool {
         && !is_untagged_lycoris_lokr(af)
 }
 
+const QWEN_ADAPTER_TARGETS: &str =
+    "expected diffusers/PEFT `<transformer.|diffusion_model.><path>.\
+    lora_A/B|lora_down/up.weight` (+ optional `.alpha`) over the MMDiT `transformer_blocks.{i}.\
+    {attn.*,img_mlp.*,txt_mlp.*}` modules, `<path>.lokr_w1/w2` with networkType=lokr (LoKr), or \
+    untagged LyCORIS `lokr_*` / `hada_*`";
+
+/// Enforce the request contract per selected file. A valid bundled/earlier adapter must never make a
+/// later zero-match user adapter look applied merely because the aggregate stack changed the model.
+fn guard_adapter_file_matched(spec: &AdapterSpec, index: usize, applied: usize) -> Result<()> {
+    if applied == 0 {
+        return Err(CandleError::Msg(format!(
+            "qwen edit: adapter #{} `{}` matched no target modules; {}",
+            index + 1,
+            spec.path.display(),
+            QWEN_ADAPTER_TARGETS,
+        )));
+    }
+    Ok(())
+}
+
 /// Fold every adapter spec in `specs` into the base MMDiT tensor `map` (CPU, native dtype) at each
 /// spec's `scale` — LoRA and LoKr, merged into the dense weights (`W += δ`). Returns the
 /// [`MergeReport`]; errors if a non-empty spec list matches **no** target (a format / prefix
@@ -308,16 +328,27 @@ pub fn merge_adapters(
         return Ok(MergeReport::default());
     }
     let mut report = MergeReport::default();
-    for spec in specs {
+    for (index, spec) in specs.iter().enumerate() {
         let af = read_adapter(&spec.path)?;
+        let has_thirdparty_lokr = is_untagged_lycoris_lokr(&af);
+        let has_thirdparty_loha = wmeta::keys_contain_loha(af.tensors.keys().map(String::as_str));
+        if spec.kind == AdapterKind::Lokr && !af.declares_lokr() {
+            return Err(CandleError::Msg(format!(
+                "qwen edit: adapter {} declared LoKr but does not declare networkType=lokr",
+                spec.path.display()
+            )));
+        }
+        let before = report.merged;
         // Untagged LyCORIS: `lokr_*` / `hada_*` keys without a `networkType=lokr` stamp, so the
         // caller's declared `kind` can't label them — detect + route by keys before the kind match.
-        if is_untagged_lycoris_lokr(&af) {
+        if has_thirdparty_lokr {
             merge_lokr_thirdparty(map, &af, spec.scale, &mut report)?;
+            guard_adapter_file_matched(spec, index, report.merged - before)?;
             continue;
         }
-        if wmeta::keys_contain_loha(af.tensors.keys().map(String::as_str)) {
+        if has_thirdparty_loha {
             merge_loha_thirdparty(map, &af, spec.scale, &mut report)?;
+            guard_adapter_file_matched(spec, index, report.merged - before)?;
             continue;
         }
         match spec.kind {
@@ -334,6 +365,7 @@ pub fn merge_adapters(
                 merge_lora_file(map, &af, spec.scale, &mut report)?;
             }
         }
+        guard_adapter_file_matched(spec, index, report.merged - before)?;
     }
     if report.merged == 0 {
         return Err(no_target_matched(
@@ -363,6 +395,7 @@ struct PendingLora {
     a: Tensor,
     b: Tensor,
     scale: f64,
+    spec_index: usize,
 }
 
 /// A LoKr module's raw factors + the FULL `(alpha/rank)·strength` scale, pending the projection's
@@ -376,6 +409,7 @@ struct PendingLokr {
     w2_a: Option<Tensor>,
     w2_b: Option<Tensor>,
     scale: f64,
+    spec_index: usize,
 }
 
 /// A report of a forward-time additive install (sc-11091) — the packed-tier analog of [`MergeReport`].
@@ -387,6 +421,8 @@ pub struct AdditiveReport {
     pub skipped_targets: Vec<String>,
     /// Adapter-file keys outside the LoRA/LoKr surface, half-pairs, or shape-mismatched factors.
     pub skipped_keys: usize,
+    /// Applied targets per selected adapter file, preserving request order.
+    applied_by_spec: Vec<usize>,
 }
 
 /// Resolve one LoRA file into per-path [`PendingLora`] (`a = downᵀ`, `b = upᵀ·ratio`). Mirrors
@@ -395,6 +431,7 @@ pub struct AdditiveReport {
 fn resolve_lora_file(
     af: &AdapterFile,
     scale: f32,
+    spec_index: usize,
     pending: &mut BTreeMap<String, Vec<PendingLora>>,
     skipped_keys: &mut usize,
 ) -> Result<()> {
@@ -434,6 +471,7 @@ fn resolve_lora_file(
             a,
             b,
             scale: scale as f64,
+            spec_index,
         });
     }
     Ok(())
@@ -445,6 +483,7 @@ fn resolve_lora_file(
 fn resolve_lokr_file(
     af: &AdapterFile,
     scale: f32,
+    spec_index: usize,
     pending: &mut BTreeMap<String, Vec<PendingLokr>>,
     skipped_keys: &mut usize,
 ) -> Result<()> {
@@ -471,6 +510,7 @@ fn resolve_lokr_file(
             w2_a: f.get("lokr_w2_a").cloned(),
             w2_b: f.get("lokr_w2_b").cloned(),
             scale: full,
+            spec_index,
         });
     }
     Ok(())
@@ -488,9 +528,12 @@ pub fn install_additive(
 ) -> Result<AdditiveReport> {
     let mut pending_lora: BTreeMap<String, Vec<PendingLora>> = BTreeMap::new();
     let mut pending_lokr: BTreeMap<String, Vec<PendingLokr>> = BTreeMap::new();
-    let mut report = AdditiveReport::default();
+    let mut report = AdditiveReport {
+        applied_by_spec: vec![0; specs.len()],
+        ..Default::default()
+    };
 
-    for spec in specs {
+    for (spec_index, spec) in specs.iter().enumerate() {
         let af = read_adapter(&spec.path)?;
         if wmeta::keys_contain_loha(af.tensors.keys().map(String::as_str)) {
             return Err(CandleError::Msg(format!(
@@ -517,10 +560,33 @@ pub fn install_additive(
                 spec.path.display()
             )));
         }
-        if spec.kind == AdapterKind::Lokr || af.declares_lokr() {
-            resolve_lokr_file(&af, spec.scale, &mut pending_lokr, &mut report.skipped_keys)?;
-        } else {
-            resolve_lora_file(&af, spec.scale, &mut pending_lora, &mut report.skipped_keys)?;
+        match (spec.kind, af.declares_lokr()) {
+            (AdapterKind::Lora, true) => {
+                return Err(CandleError::Msg(format!(
+                    "qwen edit: adapter {} was declared LoRA but its metadata says networkType=lokr",
+                    spec.path.display()
+                )));
+            }
+            (AdapterKind::Lokr, false) => {
+                return Err(CandleError::Msg(format!(
+                    "qwen edit: adapter {} was declared LoKr but does not declare networkType=lokr",
+                    spec.path.display()
+                )));
+            }
+            (AdapterKind::Lokr, true) => resolve_lokr_file(
+                &af,
+                spec.scale,
+                spec_index,
+                &mut pending_lokr,
+                &mut report.skipped_keys,
+            )?,
+            (AdapterKind::Lora, false) => resolve_lora_file(
+                &af,
+                spec.scale,
+                spec_index,
+                &mut pending_lora,
+                &mut report.skipped_keys,
+            )?,
         }
     }
 
@@ -543,6 +609,7 @@ pub fn install_additive(
                 }
                 lin.push_lora(p.a.to_device(&device)?, p.b.to_device(&device)?, p.scale);
                 applied += 1;
+                report.applied_by_spec[p.spec_index] += 1;
             }
         }
         if let Some(list) = pending_lokr.get(path) {
@@ -562,6 +629,7 @@ pub fn install_additive(
                     Some(factors) => {
                         lin.push_lokr_structured(factors.to_device(&device)?);
                         applied += 1;
+                        report.applied_by_spec[p.spec_index] += 1;
                     }
                     None => {
                         return Err(CandleError::Msg(format!(
@@ -595,6 +663,9 @@ pub fn install_additive(
             specs.len(),
         ));
     }
+    for (index, spec) in specs.iter().enumerate() {
+        guard_adapter_file_matched(spec, index, report.applied_by_spec[index])?;
+    }
     Ok(report)
 }
 
@@ -622,6 +693,41 @@ mod tests {
 
     fn t2(data: &[f32], r: usize, c: usize) -> Tensor {
         Tensor::from_vec(data.to_vec(), (r, c), &Device::Cpu).unwrap()
+    }
+
+    #[test]
+    fn dense_stack_rejects_a_later_zero_match_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let valid = tmp.path().join("valid.safetensors");
+        let missing = tmp.path().join("missing.safetensors");
+        for (file, target) in [
+            (&valid, "transformer_blocks.0.attn.to_q"),
+            (&missing, "transformer_blocks.99.attn.to_q"),
+        ] {
+            candle_gen::candle_core::safetensors::save(
+                &HashMap::from([
+                    (
+                        format!("{target}.lora_A.weight"),
+                        t2(&[1.0, 0.0, 0.0, 0.0], 1, 4),
+                    ),
+                    (
+                        format!("{target}.lora_B.weight"),
+                        t2(&[1.0, 0.0, 0.0, 0.0], 4, 1),
+                    ),
+                ]),
+                file,
+            )
+            .unwrap();
+        }
+        let error = merge_adapters(
+            &mut base_map(),
+            &[
+                AdapterSpec::new(valid, 1.0, AdapterKind::Lora),
+                AdapterSpec::new(missing.clone(), 1.0, AdapterKind::Lora),
+            ],
+        )
+        .expect_err("a valid first file must not hide a later dense zero-match");
+        assert!(error.to_string().contains(&missing.display().to_string()));
     }
 
     /// **Additive == folded parity at the resolver level (sc-11091).** The unmerged factors
@@ -653,7 +759,7 @@ mod tests {
         };
         let mut pending: BTreeMap<String, Vec<PendingLora>> = BTreeMap::new();
         let mut skipped = 0usize;
-        resolve_lora_file(&af, scale, &mut pending, &mut skipped).unwrap();
+        resolve_lora_file(&af, scale, 0, &mut pending, &mut skipped).unwrap();
         assert_eq!(skipped, 0, "clean LoRA resolves with no skipped keys");
         let p = &pending[path][0];
         assert_eq!(p.a.dims(), &[in_dim, rank], "a = downᵀ [in, rank]");

@@ -70,9 +70,10 @@ fn load_linear(
         .then(|| vb.get(out_dim, &format!("{base}.bias")))
         .transpose()?;
     let qtensor = stream.sidecars.load(&sidecar_base, vb.device())?;
-    Ok(candle_gen::quant::QLinear::from_qtensor_dequant(
-        Arc::new(qtensor),
-        dense_bias,
+    Ok(candle_gen::quant::AdaptLinear::from_packed(
+        candle_gen::quant::QLinear::from_qtensor_dequant(Arc::new(qtensor), dense_bias),
+        in_dim,
+        out_dim,
     ))
 }
 
@@ -319,6 +320,15 @@ impl FeedForward {
         };
         self.lin2.forward(&x)
     }
+
+    fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        visitor: &mut dyn FnMut(&str, &mut candle_gen::quant::AdaptLinear) -> Result<()>,
+    ) -> Result<()> {
+        visitor(&format!("{prefix}.net.0.proj"), &mut self.lin1)?;
+        visitor(&format!("{prefix}.net.2"), &mut self.lin2)
+    }
 }
 
 /// One diffusers FLUX joint (double-stream) block (`transformer_blocks.{i}`).
@@ -429,6 +439,34 @@ impl JointBlock {
             &self.norm2,
         )?;
         Ok((hidden, encoder))
+    }
+
+    fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        visitor: &mut dyn FnMut(&str, &mut candle_gen::quant::AdaptLinear) -> Result<()>,
+    ) -> Result<()> {
+        visitor(&format!("{prefix}.norm1.linear"), &mut self.norm1.linear)?;
+        visitor(
+            &format!("{prefix}.norm1_context.linear"),
+            &mut self.norm1_context.linear,
+        )?;
+        for (name, linear) in [
+            ("to_q", &mut self.attn.to_q),
+            ("to_k", &mut self.attn.to_k),
+            ("to_v", &mut self.attn.to_v),
+            ("to_out.0", &mut self.attn.to_out),
+            ("add_q_proj", &mut self.attn.add_q),
+            ("add_k_proj", &mut self.attn.add_k),
+            ("add_v_proj", &mut self.attn.add_v),
+            ("to_add_out", &mut self.attn.to_add_out),
+        ] {
+            visitor(&format!("{prefix}.attn.{name}"), linear)?;
+        }
+        self.ff
+            .visit_adaptable_mut(&format!("{prefix}.ff"), visitor)?;
+        self.ff_context
+            .visit_adaptable_mut(&format!("{prefix}.ff_context"), visitor)
     }
 }
 
@@ -560,6 +598,19 @@ impl SingleBlock {
         // Residual with the single-block gate.
         Ok(hidden.broadcast_add(&out.broadcast_mul(&gate.unsqueeze(1)?)?)?)
     }
+
+    fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        visitor: &mut dyn FnMut(&str, &mut candle_gen::quant::AdaptLinear) -> Result<()>,
+    ) -> Result<()> {
+        visitor(&format!("{prefix}.norm.linear"), &mut self.norm.linear)?;
+        visitor(&format!("{prefix}.attn.to_q"), &mut self.to_q)?;
+        visitor(&format!("{prefix}.attn.to_k"), &mut self.to_k)?;
+        visitor(&format!("{prefix}.attn.to_v"), &mut self.to_v)?;
+        visitor(&format!("{prefix}.proj_mlp"), &mut self.proj_mlp)?;
+        visitor(&format!("{prefix}.proj_out"), &mut self.proj_out)
+    }
 }
 
 /// `silu → linear_1 → silu → linear_2` MLP (diffusers `TimestepEmbedding` / text projection).
@@ -578,6 +629,15 @@ impl MlpEmbedder {
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         self.lin2.forward(&self.lin1.forward(x)?.silu()?)
+    }
+
+    fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        visitor: &mut dyn FnMut(&str, &mut candle_gen::quant::AdaptLinear) -> Result<()>,
+    ) -> Result<()> {
+        visitor(&format!("{prefix}.linear_1"), &mut self.lin1)?;
+        visitor(&format!("{prefix}.linear_2"), &mut self.lin2)
     }
 }
 
@@ -622,6 +682,20 @@ impl TimeTextEmbed {
         }
         out = (out + self.text.forward(pooled)?)?;
         Ok(out)
+    }
+
+    fn visit_adaptable_mut(
+        &mut self,
+        visitor: &mut dyn FnMut(&str, &mut candle_gen::quant::AdaptLinear) -> Result<()>,
+    ) -> Result<()> {
+        self.timestep
+            .visit_adaptable_mut("time_text_embed.timestep_embedder", visitor)?;
+        self.text
+            .visit_adaptable_mut("time_text_embed.text_embedder", visitor)?;
+        if let Some(guidance) = &mut self.guidance {
+            guidance.visit_adaptable_mut("time_text_embed.guidance_embedder", visitor)?;
+        }
+        Ok(())
     }
 }
 
@@ -705,6 +779,35 @@ impl PackedFluxDit {
             PackedFluxBlocks::Resident { double, .. } => double.len(),
             PackedFluxBlocks::Streamed { num_double, .. } => *num_double,
         }
+    }
+
+    pub fn visit_adaptable_mut(
+        &mut self,
+        visitor: &mut dyn FnMut(&str, &mut candle_gen::quant::AdaptLinear) -> Result<()>,
+    ) -> Result<()> {
+        visitor("x_embedder", &mut self.x_embedder)?;
+        visitor("context_embedder", &mut self.context_embedder)?;
+        self.time_text_embed.visit_adaptable_mut(visitor)?;
+        match &mut self.blocks {
+            PackedFluxBlocks::Resident { double, single } => {
+                for (index, block) in double.iter_mut().enumerate() {
+                    block.visit_adaptable_mut(&format!("transformer_blocks.{index}"), visitor)?;
+                }
+                for (index, block) in single.iter_mut().enumerate() {
+                    block.visit_adaptable_mut(
+                        &format!("single_transformer_blocks.{index}"),
+                        visitor,
+                    )?;
+                }
+            }
+            PackedFluxBlocks::Streamed { .. } => {
+                candle_gen::candle_core::bail!(
+                    "FLUX adapters require resident transformer blocks; disable block streaming"
+                )
+            }
+        }
+        visitor("norm_out.linear", &mut self.output.norm_linear)?;
+        visitor("proj_out", &mut self.output.proj_out)
     }
 
     /// Load the diffusers FLUX DiT from `vb` (rooted at the `transformer/` component). `cfg` is the

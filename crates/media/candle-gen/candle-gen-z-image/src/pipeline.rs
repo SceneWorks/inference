@@ -304,7 +304,8 @@ pub(crate) struct Pipeline {
     pid_spec: Option<PidWeights>,
     /// External ComfyUI component sources (epic 10451 Phase 2, sc-10668). `Some` ⇒ `load_components`
     /// builds the DiT/TE/VAE from the in-place ComfyUI files (DiT + VAE key-remapped in memory)
-    /// instead of a diffusers snapshot dir. Dense-only: no packed tier, no adapters, no PiD.
+    /// instead of a diffusers snapshot dir. Integer-packed sources and PiD are unavailable; adapters
+    /// select the existing adaptable dense DiT.
     comfyui: Option<std::sync::Arc<crate::comfyui::ComfyuiSources>>,
 }
 
@@ -442,20 +443,31 @@ impl Pipeline {
     /// and VAE are key-remapped from the ComfyUI single-file components in memory and the Qwen3 encoder
     /// loads verbatim, all at first [`load_components`](Self::load_components). `root` is set to the
     /// sources' `tokenizer_dir` so [`common::build_tokenizer`] finds `tokenizer/tokenizer.json`. Does no
-    /// weight I/O here. Dense-only (no packed tier / adapters / PiD).
+    /// weight I/O here. Integer-packed sources and PiD remain unavailable; adapters are installed
+    /// additively on the remapped dense DiT.
     pub(crate) fn load_comfyui(
         sources: std::sync::Arc<crate::comfyui::ComfyuiSources>,
         device: &Device,
         dtype: DType,
+        adapters: &[AdapterSpec],
     ) -> Self {
         Self {
             root: sources.tokenizer_dir.clone(),
             device: device.clone(),
             dtype,
-            adapters: Vec::new(),
+            adapters: adapters.to_vec(),
             pid_spec: None,
             comfyui: Some(sources),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn adapter_specs(&self) -> &[AdapterSpec] {
+        &self.adapters
+    }
+
+    fn comfyui_uses_adaptable_dit(&self) -> bool {
+        self.comfyui.is_some() && !self.adapters.is_empty()
     }
 
     /// Load only the tokenizer + Qwen3 text encoder. This is the first sequential-residency phase and
@@ -753,7 +765,18 @@ impl Pipeline {
         let mut dit_cfg = DitConfig::z_image_turbo();
         dit_cfg.set_use_accelerated_attn(use_accelerated_attn);
         let dit_vb = VarBuilder::from_tensors(dit_map, self.dtype, &self.device);
-        let transformer = DiT::Dense(Box::new(ZImageTransformer2DModel::new(&dit_cfg, dit_vb)?));
+        let transformer = if !self.comfyui_uses_adaptable_dit() {
+            // Preserve the historical byte-exact stock path when no adapter was selected.
+            DiT::Dense(Box::new(ZImageTransformer2DModel::new(&dit_cfg, dit_vb)?))
+        } else {
+            // The ComfyUI remap produces the same diffusers key schema as a dense snapshot. Build the
+            // vendored adaptable DiT over that map and install the ordered stack as forward-time
+            // residuals. This is the same dense/packed-safe path used by snapshot loads and rejects a
+            // non-empty stack when no target matches instead of rendering the unadapted base silently.
+            let mut dit = PackedDit::new(&dit_cfg, dit_vb)?;
+            crate::adapters::install_additive(&mut dit, &self.adapters)?;
+            DiT::Packed(Box::new(dit))
+        };
 
         // Text encoder: standard HF Qwen3 — loaded verbatim and normalized to the compute dtype.
         let te_map = match (&sources.weights, combined.as_mut()) {
@@ -1677,6 +1700,85 @@ impl Pipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn comfyui_pipeline_preserves_ordered_adapter_stack_and_selects_adaptable_dit() {
+        use candle_gen::gen_core::AdapterKind;
+
+        let sources = std::sync::Arc::new(crate::comfyui::ComfyuiSources {
+            weights: crate::comfyui::ComfyuiWeights::Separate {
+                transformer_file: PathBuf::from("transformer.safetensors"),
+                text_encoder_file: PathBuf::from("text_encoder.safetensors"),
+                vae_file: PathBuf::from("vae.safetensors"),
+            },
+            tokenizer_dir: PathBuf::from("tokenizer"),
+        });
+        let adapters = vec![
+            AdapterSpec::new(PathBuf::from("first.safetensors"), 0.25, AdapterKind::Lora),
+            AdapterSpec::new(PathBuf::from("second.safetensors"), 0.75, AdapterKind::Lokr),
+        ];
+
+        let pipeline = Pipeline::load_comfyui(sources, &Device::Cpu, DType::F32, &adapters);
+        assert!(pipeline.comfyui_uses_adaptable_dit());
+        assert_eq!(pipeline.adapter_specs().len(), 2);
+        assert_eq!(pipeline.adapter_specs()[0].path, adapters[0].path);
+        assert_eq!(pipeline.adapter_specs()[0].scale, 0.25);
+        assert_eq!(pipeline.adapter_specs()[0].kind, AdapterKind::Lora);
+        assert_eq!(pipeline.adapter_specs()[1].path, adapters[1].path);
+        assert_eq!(pipeline.adapter_specs()[1].scale, 0.75);
+        assert_eq!(pipeline.adapter_specs()[1].kind, AdapterKind::Lokr);
+
+        let stock = Pipeline::load_comfyui(
+            std::sync::Arc::new(crate::comfyui::ComfyuiSources {
+                weights: crate::comfyui::ComfyuiWeights::Combined(PathBuf::from(
+                    "checkpoint.safetensors",
+                )),
+                tokenizer_dir: PathBuf::from("tokenizer"),
+            }),
+            &Device::Cpu,
+            DType::F32,
+            &[],
+        );
+        assert!(
+            !stock.comfyui_uses_adaptable_dit(),
+            "an empty stack must preserve the historical stock dense path"
+        );
+    }
+
+    #[test]
+    fn registered_reference_pipeline_preserves_adapter_stack_for_identity_init() {
+        use candle_gen::gen_core::AdapterKind;
+
+        let adapters = vec![AdapterSpec::new(
+            PathBuf::from("identity-style.safetensors"),
+            0.65,
+            AdapterKind::Lora,
+        )];
+        let pipeline = Pipeline::load(
+            Path::new("snapshot"),
+            &Device::Cpu,
+            DType::F32,
+            &adapters,
+            None,
+        );
+        let request = GenerationRequest {
+            prompt: "same person in a new setting".into(),
+            conditioning: vec![Conditioning::Reference {
+                image: Image::default(),
+                strength: Some(0.7),
+            }],
+            ..Default::default()
+        };
+
+        let (_, strength) = resolve_reference(&request)
+            .expect("registered Reference conditioning must resolve")
+            .expect("identity init carries one reference");
+        assert_eq!(strength, Some(0.7));
+        assert_eq!(pipeline.adapter_specs().len(), 1);
+        assert_eq!(pipeline.adapter_specs()[0].path, adapters[0].path);
+        assert_eq!(pipeline.adapter_specs()[0].scale, 0.65);
+        assert_eq!(pipeline.adapter_specs()[0].kind, AdapterKind::Lora);
+    }
 
     #[test]
     fn bounded_host_transfer_uses_spatial_rows_and_reassembles_exactly() {

@@ -53,6 +53,7 @@ pub struct Flux2ControlPaths {
     pub root: PathBuf,
     /// The Fun-Controlnet-Union control checkpoint (`.safetensors` file or a dir containing it).
     pub control: PathBuf,
+    pub adapters: Vec<candle_gen::gen_core::AdapterSpec>,
 }
 
 /// One FLUX.2-dev strict-pose control request. dev is guidance-distilled — `guidance` is the embedded
@@ -163,7 +164,14 @@ impl Flux2Control {
         let device = candle_gen::default_device()?;
         // PiD (super-resolving decode) is wired only through the txt2img render path (epic 7840 /
         // sc-7853); the control provider passes `None`.
-        let pipe = Pipeline::load(Flux2Variant::Dev, loaded_quant, &paths.root, &device, None);
+        let pipe = Pipeline::load(
+            Flux2Variant::Dev,
+            loaded_quant,
+            &paths.root,
+            &device,
+            None,
+            paths.adapters.clone(),
+        );
 
         // Base DiT + Mistral TE. Packed MLX tier → build directly on the GPU from the packed parts
         // (sc-9087, no ~105 GB dense CPU staging); dense tier → stage dense in CPU RAM and quantize each
@@ -744,6 +752,7 @@ mod tests {
         let paths = Flux2ControlPaths {
             root: root.clone(),
             control: overlay.clone(),
+            adapters: Vec::new(),
         };
         let matching = candle_gen::gen_core::LoadSpec::new(
             candle_gen::gen_core::WeightsSource::Dir(root.clone()),
@@ -774,6 +783,7 @@ mod tests {
         let paths = Flux2ControlPaths {
             root: PathBuf::from("/missing-flux2-dev"),
             control: PathBuf::from("/missing-control.safetensors"),
+            adapters: Vec::new(),
         };
         let error = Flux2Control::load_with_memory(
             &paths,

@@ -259,6 +259,13 @@ pub fn merge_adapters(
     let mut report = MergeReport::default();
     for spec in specs {
         let af = read_adapter(&spec.path)?;
+        if spec.kind == AdapterKind::Lokr && !af.declares_lokr() {
+            return Err(CandleError::Msg(format!(
+                "lens: adapter {} declared LoKr but does not declare networkType=lokr",
+                spec.path.display()
+            )));
+        }
+        let before = report.merged;
         match spec.kind {
             AdapterKind::Lokr => merge_lokr_file(map, &af, spec.scale, &table, &mut report)?,
             AdapterKind::Lora => {
@@ -272,6 +279,12 @@ pub fn merge_adapters(
                 }
                 merge_lora_file(map, &af, spec.scale, &table, &mut report)?;
             }
+        }
+        if report.merged == before {
+            return Err(CandleError::Msg(format!(
+                "lens: selected adapter {} matched no Lens projection",
+                spec.path.display()
+            )));
         }
     }
     if report.merged == 0 {
@@ -436,6 +449,16 @@ pub fn install_additive(
     dit: &mut LensTransformer,
     specs: &[AdapterSpec],
 ) -> Result<AdditiveReport> {
+    if specs.len() > 1 {
+        let mut total = AdditiveReport::default();
+        for spec in specs {
+            let report = install_additive(dit, std::slice::from_ref(spec))?;
+            total.applied += report.applied;
+            total.skipped_targets.extend(report.skipped_targets);
+            total.skipped_keys += report.skipped_keys;
+        }
+        return Ok(total);
+    }
     let mut report = AdditiveReport::default();
 
     // The kohya `flattened → dotted` table, built from the DiT's own projection paths (all Linear,
@@ -456,6 +479,21 @@ pub fn install_additive(
 
     for spec in specs {
         let af = read_adapter(&spec.path)?;
+        match (spec.kind, af.declares_lokr()) {
+            (AdapterKind::Lora, true) => {
+                return Err(CandleError::Msg(format!(
+                    "lens: adapter {} declared LoRA but its metadata says networkType=lokr",
+                    spec.path.display()
+                )))
+            }
+            (AdapterKind::Lokr, false) => {
+                return Err(CandleError::Msg(format!(
+                    "lens: adapter {} declared LoKr but does not declare networkType=lokr",
+                    spec.path.display()
+                )))
+            }
+            _ => {}
+        }
         if wmeta::keys_contain_loha(af.tensors.keys().map(String::as_str)) {
             return Err(CandleError::Msg(format!(
                 "lens: a LoHa adapter cannot apply on a packed (q4/q8) tier — its Hadamard product \
@@ -480,7 +518,7 @@ pub fn install_additive(
                 spec.path.display()
             )));
         }
-        if spec.kind == AdapterKind::Lokr || af.declares_lokr() {
+        if spec.kind == AdapterKind::Lokr {
             resolve_lokr_file(
                 &af,
                 spec.scale,
@@ -602,6 +640,41 @@ mod tests {
 
     fn t2(data: &[f32], r: usize, c: usize) -> Tensor {
         Tensor::from_vec(data.to_vec(), (r, c), &Device::Cpu).unwrap()
+    }
+
+    #[test]
+    fn dense_stack_rejects_a_later_zero_match_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let valid = tmp.path().join("valid.safetensors");
+        let missing = tmp.path().join("missing.safetensors");
+        for (file, target) in [
+            (&valid, "transformer_blocks.0.attn.to_out.0"),
+            (&missing, "transformer_blocks.99.attn.to_out.0"),
+        ] {
+            candle_gen::candle_core::safetensors::save(
+                &HashMap::from([
+                    (
+                        format!("{target}.lora_A.weight"),
+                        t2(&[1.0, 0.0, 0.0, 0.0], 1, 4),
+                    ),
+                    (
+                        format!("{target}.lora_B.weight"),
+                        t2(&[1.0, 0.0, 0.0, 0.0], 4, 1),
+                    ),
+                ]),
+                file,
+            )
+            .unwrap();
+        }
+        let error = merge_adapters(
+            &mut base_map(),
+            &[
+                AdapterSpec::new(valid, 1.0, AdapterKind::Lora),
+                AdapterSpec::new(missing.clone(), 1.0, AdapterKind::Lora),
+            ],
+        )
+        .expect_err("a valid first file must not hide a later dense zero-match");
+        assert!(error.to_string().contains(&missing.display().to_string()));
     }
 
     /// Bare dotted (the trainer's format), prefixed PEFT, and kohya flattened all resolve to the same

@@ -168,7 +168,7 @@ fn load_transformer_tensors(root: &Path) -> Result<HashMap<String, Tensor>> {
 ///
 /// A non-empty `adapters` slice that matches no MMDiT module errors on either route (it never renders an
 /// unadapted image silently).
-fn load_transformer(
+pub(crate) fn load_transformer(
     root: &Path,
     adapters: &[AdapterSpec],
     dtype: DType,

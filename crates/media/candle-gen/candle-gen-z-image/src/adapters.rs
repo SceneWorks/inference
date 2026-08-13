@@ -250,6 +250,13 @@ pub fn merge_adapters(
     let mut report = MergeReport::default();
     for spec in specs {
         let af = read_adapter(&spec.path)?;
+        if spec.kind == AdapterKind::Lokr && !af.declares_lokr() {
+            return Err(CandleError::Msg(format!(
+                "z_image: adapter {} declared LoKr but does not declare networkType=lokr",
+                spec.path.display()
+            )));
+        }
+        let before = report.merged;
         match spec.kind {
             AdapterKind::Lokr => merge_lokr_file(map, &af, spec.scale, &table, &mut report)?,
             AdapterKind::Lora => {
@@ -263,6 +270,12 @@ pub fn merge_adapters(
                 }
                 merge_lora_file(map, &af, spec.scale, &table, &mut report)?;
             }
+        }
+        if report.merged == before {
+            return Err(CandleError::Msg(format!(
+                "z_image: selected adapter {} matched no Z-Image projection",
+                spec.path.display()
+            )));
         }
     }
     if report.merged == 0 {
@@ -296,6 +309,7 @@ struct PendingLora {
     a: Tensor,
     b: Tensor,
     scale: f64,
+    source: usize,
 }
 
 /// A LoKr module's raw factors + the FULL `(alpha/rank)·strength` scale, pending the projection's
@@ -310,6 +324,7 @@ struct PendingLokr {
     w2_a: Option<Tensor>,
     w2_b: Option<Tensor>,
     scale: f64,
+    source: usize,
 }
 
 /// Resolved host-side residuals retained by a block-streamed DiT. Each materialized window receives
@@ -395,6 +410,7 @@ pub struct AdditiveReport {
 fn resolve_lora_file(
     af: &AdapterFile,
     scale: f32,
+    source: usize,
     table: &BTreeMap<String, String>,
     pending: &mut BTreeMap<String, Vec<PendingLora>>,
     skipped_keys: &mut usize,
@@ -435,6 +451,7 @@ fn resolve_lora_file(
             a,
             b,
             scale: scale as f64,
+            source,
         });
     }
     Ok(())
@@ -446,6 +463,7 @@ fn resolve_lora_file(
 fn resolve_lokr_file(
     af: &AdapterFile,
     scale: f32,
+    source: usize,
     table: &BTreeMap<String, String>,
     pending: &mut BTreeMap<String, Vec<PendingLokr>>,
     skipped_keys: &mut usize,
@@ -479,6 +497,7 @@ fn resolve_lokr_file(
             w2_a: f.get("lokr_w2_a").cloned(),
             w2_b: f.get("lokr_w2_b").cloned(),
             scale: full,
+            source,
         });
     }
     Ok(())
@@ -512,8 +531,23 @@ pub fn install_additive(
     let mut pending_lora: BTreeMap<String, Vec<PendingLora>> = BTreeMap::new();
     let mut pending_lokr: BTreeMap<String, Vec<PendingLokr>> = BTreeMap::new();
 
-    for spec in specs {
+    for (source, spec) in specs.iter().enumerate() {
         let af = read_adapter(&spec.path)?;
+        match (spec.kind, af.declares_lokr()) {
+            (AdapterKind::Lora, true) => {
+                return Err(CandleError::Msg(format!(
+                    "z_image: adapter {} declared LoRA but its metadata says networkType=lokr",
+                    spec.path.display()
+                )))
+            }
+            (AdapterKind::Lokr, false) => {
+                return Err(CandleError::Msg(format!(
+                    "z_image: adapter {} declared LoKr but does not declare networkType=lokr",
+                    spec.path.display()
+                )))
+            }
+            _ => {}
+        }
         if wmeta::keys_contain_loha(af.tensors.keys().map(String::as_str)) {
             return Err(CandleError::Msg(format!(
                 "z_image: a LoHa adapter cannot apply on a packed (q4/q8) tier — its Hadamard product \
@@ -538,10 +572,11 @@ pub fn install_additive(
                 spec.path.display()
             )));
         }
-        if spec.kind == AdapterKind::Lokr || af.declares_lokr() {
+        if spec.kind == AdapterKind::Lokr {
             resolve_lokr_file(
                 &af,
                 spec.scale,
+                source,
                 &table,
                 &mut pending_lokr,
                 &mut report.skipped_keys,
@@ -550,6 +585,7 @@ pub fn install_additive(
             resolve_lora_file(
                 &af,
                 spec.scale,
+                source,
                 &table,
                 &mut pending_lora,
                 &mut report.skipped_keys,
@@ -568,6 +604,7 @@ pub fn install_additive(
     };
     let mut matched: HashSet<String> = HashSet::new();
     let mut applied = 0usize;
+    let mut applied_sources = HashSet::new();
     let mut skipped_keys = 0usize;
     dit.visit_adaptable_for_install(&mut |path, lin| {
         let (out_f, in_f) = lin.base_shape();
@@ -580,6 +617,7 @@ pub fn install_additive(
                 }
                 lin.push_lora(p.a.to_device(&device)?, p.b.to_device(&device)?, p.scale);
                 applied += 1;
+                applied_sources.insert(p.source);
             }
         }
         if let Some(list) = plan.pending_lokr.get(path) {
@@ -599,6 +637,7 @@ pub fn install_additive(
                     Some(factors) => {
                         lin.push_lokr_structured(factors.to_device(&device)?);
                         applied += 1;
+                        applied_sources.insert(p.source);
                     }
                     None => {
                         return Err(CandleError::Msg(format!(
@@ -620,6 +659,14 @@ pub fn install_additive(
     for path in plan.pending_lora.keys().chain(plan.pending_lokr.keys()) {
         if !matched.contains(path) {
             report.skipped_targets.push(path.clone());
+        }
+    }
+    for (source, spec) in specs.iter().enumerate() {
+        if !applied_sources.contains(&source) {
+            return Err(CandleError::Msg(format!(
+                "z_image: selected adapter {} matched no Z-Image projection",
+                spec.path.display()
+            )));
         }
     }
     // A non-empty spec set that adapted nothing is a format/prefix misconfiguration — fail loudly rather
@@ -663,6 +710,41 @@ mod tests {
 
     fn t2(data: &[f32], r: usize, c: usize) -> Tensor {
         Tensor::from_vec(data.to_vec(), (r, c), &Device::Cpu).unwrap()
+    }
+
+    #[test]
+    fn dense_stack_rejects_a_later_zero_match_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let valid = tmp.path().join("valid.safetensors");
+        let missing = tmp.path().join("missing.safetensors");
+        for (file, target) in [
+            (&valid, "layers.0.attention.to_q"),
+            (&missing, "layers.99.attention.to_q"),
+        ] {
+            candle_gen::candle_core::safetensors::save(
+                &HashMap::from([
+                    (
+                        format!("{target}.lora_A.weight"),
+                        t2(&[1.0, 0.0, 0.0, 0.0], 1, 4),
+                    ),
+                    (
+                        format!("{target}.lora_B.weight"),
+                        t2(&[1.0, 0.0, 0.0, 0.0], 4, 1),
+                    ),
+                ]),
+                file,
+            )
+            .unwrap();
+        }
+        let error = merge_adapters(
+            &mut base_map(),
+            &[
+                AdapterSpec::new(valid, 1.0, AdapterKind::Lora),
+                AdapterSpec::new(missing.clone(), 1.0, AdapterKind::Lora),
+            ],
+        )
+        .expect_err("a valid first file must not hide a later dense zero-match");
+        assert!(error.to_string().contains(&missing.display().to_string()));
     }
 
     /// Bare dotted (the trainer's format), prefixed PEFT, and kohya flattened all resolve to the same
@@ -994,7 +1076,7 @@ mod tests {
         let table: BTreeMap<String, String> = BTreeMap::new();
         let mut pending: BTreeMap<String, Vec<PendingLora>> = BTreeMap::new();
         let mut skipped = 0usize;
-        resolve_lora_file(&af, scale, &table, &mut pending, &mut skipped).unwrap();
+        resolve_lora_file(&af, scale, 0, &table, &mut pending, &mut skipped).unwrap();
         assert_eq!(skipped, 0, "clean LoRA resolves with no skipped keys");
         let p = &pending[path][0];
         assert_eq!(p.a.dims(), &[in_dim, rank], "a = downᵀ [in, rank]");

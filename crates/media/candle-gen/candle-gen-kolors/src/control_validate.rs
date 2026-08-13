@@ -37,6 +37,7 @@ fn real_weight_control() {
     let paths = KolorsControlPaths {
         kolors_base: env_path("KOLORS_CTRL_BASE"),
         controlnet: env_path("KOLORS_CTRL_NET"),
+        adapters: Vec::new(),
     };
     let skeleton = read_ppm(&env_path("KOLORS_CTRL_POSE"));
     println!(
@@ -76,6 +77,32 @@ fn real_weight_control() {
         .expect("generate (control)");
     println!("[control] {:?}", t.elapsed());
     write_ppm(&out_dir.join("kolors_control.ppm"), &out_ctrl);
+    if let Some(adapter) = std::env::var_os("KOLORS_CTRL_LORA") {
+        drop(model);
+        let adapted = KolorsControl::load(&KolorsControlPaths {
+            kolors_base: env_path("KOLORS_CTRL_BASE"),
+            controlnet: env_path("KOLORS_CTRL_NET"),
+            adapters: vec![candle_gen::gen_core::AdapterSpec::new(
+                adapter.into(),
+                1.0,
+                candle_gen::gen_core::AdapterKind::Lora,
+            )],
+        })
+        .expect("load adapter-conditioned Kolors control");
+        let with_adapter = adapted
+            .generate(&base, &skeleton, &mut noop)
+            .expect("generate (control + LoRA)");
+        assert_eq!(
+            (with_adapter.width, with_adapter.height),
+            (out_ctrl.width, out_ctrl.height)
+        );
+        assert_ne!(
+            with_adapter.pixels, out_ctrl.pixels,
+            "selected Kolors control adapter must change output"
+        );
+        write_ppm(&out_dir.join("kolors_control_lora.ppm"), &with_adapter);
+        return;
+    }
 
     // Without control (scale 0 → ControlNet residuals zeroed → plain Kolors at the same seed/prompt).
     let plain_req = KolorsControlRequest {

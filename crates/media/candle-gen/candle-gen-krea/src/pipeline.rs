@@ -532,7 +532,7 @@ fn load_dit_cancelable(
         Krea2Transformer::load(&dit_w, &cfg)?
     };
     if !adapters.is_empty() {
-        crate::adapters::install_additive(&mut dit, adapters, diff.merged)?;
+        crate::adapters::install_additive_with_diff(&mut dit, adapters, &diff.applied_by_spec)?;
     }
     Ok(dit)
 }

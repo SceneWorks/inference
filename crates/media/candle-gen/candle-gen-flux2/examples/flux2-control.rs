@@ -230,6 +230,7 @@ fn main() -> Result<()> {
         &Flux2ControlPaths {
             root: PathBuf::from(&snapshot),
             control: PathBuf::from(&control),
+            adapters: Vec::new(),
         },
         quant,
     )?;
@@ -265,6 +266,35 @@ fn main() -> Result<()> {
         t0.elapsed().as_secs_f32()
     );
     save(&controlled, &out)?;
+    if let Some(adapter) = arg(&args, "--adapter") {
+        drop(model);
+        let adapted = Flux2Control::load(
+            &Flux2ControlPaths {
+                root: PathBuf::from(&snapshot),
+                control: PathBuf::from(&control),
+                adapters: vec![candle_gen::gen_core::AdapterSpec::new(
+                    PathBuf::from(adapter),
+                    1.0,
+                    candle_gen::gen_core::AdapterKind::Lora,
+                )],
+            },
+            quant,
+        )?;
+        let with_adapter = adapted.generate(&base_req, &pose, &mut on_progress)?;
+        assert_eq!(
+            (with_adapter.width, with_adapter.height),
+            (controlled.width, controlled.height)
+        );
+        assert_ne!(
+            with_adapter.pixels, controlled.pixels,
+            "selected FLUX.2 control adapter must change output"
+        );
+        save(
+            &with_adapter,
+            &PathBuf::from(format!("{}_lora.png", out.display())),
+        )?;
+        return Ok(());
+    }
     let (m, s) = mean_std(&controlled);
     println!(
         "[control] wrote {} (mean {m:.1} / std {s:.1})",

@@ -172,6 +172,7 @@ pub(crate) struct Pipeline {
     /// encoder / VAE / tokenizer still come from the resident snapshot `root`. `None` on every other
     /// path (registry txt2img, edit, control).
     pub(crate) comfyui_dit: Option<PathBuf>,
+    pub(crate) adapters: Vec<gen_core::AdapterSpec>,
 }
 
 impl Pipeline {
@@ -181,6 +182,7 @@ impl Pipeline {
         root: &Path,
         device: &Device,
         pid_spec: Option<PidWeights>,
+        adapters: Vec<gen_core::AdapterSpec>,
     ) -> Self {
         Self {
             variant,
@@ -193,6 +195,7 @@ impl Pipeline {
             quant,
             pid_spec,
             comfyui_dit: None,
+            adapters,
         }
     }
 
@@ -206,6 +209,7 @@ impl Pipeline {
         root: &Path,
         device: &Device,
         comfyui_dit: PathBuf,
+        adapters: Vec<gen_core::AdapterSpec>,
     ) -> Self {
         Self {
             variant: Flux2Variant::Dev,
@@ -216,6 +220,7 @@ impl Pipeline {
             quant,
             pid_spec: None,
             comfyui_dit: Some(comfyui_dit),
+            adapters,
         }
     }
 
@@ -295,10 +300,17 @@ impl Pipeline {
     /// A staging-strategy change (e.g. pre-quantized snapshot consumption) now lives in one place. Use
     /// [`Self::load_quantizable`] directly only if a future caller needs non-default module builders.
     pub(crate) fn load_te_and_dit(&self) -> CResult<(Flux2PromptEncoder, Flux2Transformer)> {
-        self.load_quantizable(
+        let (te, mut dit) = self.load_quantizable(
             |cfg, vb| Ok(Flux2PromptEncoder::new(cfg, vb)?),
             |cfg, vb| Ok(Flux2Transformer::new(cfg, vb)?),
-        )
+        )?;
+        candle_gen::quant::install_dotted_adapters(
+            "flux2",
+            &self.adapters,
+            &self.device,
+            |visitor| dit.visit_adaptable_mut(visitor),
+        )?;
+        Ok((te, dit))
     }
 
     /// Load ONLY the text encoder for the sequential-residency path (epic 10765 Phase 1c, sc-10868) —
@@ -329,7 +341,7 @@ impl Pipeline {
     /// so it reuses the TE's freed allocator pool (capping peak at DiT+VAE, not TE+DiT+VAE). Same per-tier
     /// routing as the paired [`load_te_and_dit`](Self::load_te_and_dit) DiT half.
     pub(crate) fn load_dit_seq(&self) -> CResult<Flux2Transformer> {
-        match &self.comfyui_dit {
+        let mut dit = match &self.comfyui_dit {
             Some(dit_file) => self.load_comfyui_dit(dit_file),
             None => self.load_one_quantizable(
                 "transformer",
@@ -337,7 +349,14 @@ impl Pipeline {
                 |vb| Ok(Flux2Transformer::new(&self.cfg, vb)?),
                 |m, q, d| Ok(m.quantize(q, d)?),
             ),
-        }
+        }?;
+        candle_gen::quant::install_dotted_adapters(
+            "flux2",
+            &self.adapters,
+            &self.device,
+            |visitor| dit.visit_adaptable_mut(visitor),
+        )?;
+        Ok(dit)
     }
 
     /// Which PiD spec [`load_pid`](Self::load_pid) should actually load: the spec the caller opted into
@@ -395,6 +414,12 @@ impl Pipeline {
     ) -> CResult<Flux2Transformer> {
         if !stream_transformer_blocks {
             return self.load_dit_seq();
+        }
+        if !self.adapters.is_empty() {
+            return Err(CandleError::Msg(
+                "FLUX.2 adapters require resident transformer blocks; disable block streaming"
+                    .into(),
+            ));
         }
         if self.comfyui_dit.is_some() {
             return Err(CandleError::Msg(
@@ -1144,8 +1169,8 @@ fn descriptor(variant: Flux2Variant) -> ModelDescriptor {
             supports_true_cfg: false,
             // txt2img only in this slice — the mlx edit/Reference surface is deferred.
             conditioning: vec![],
-            supports_lora: false,
-            supports_lokr: false,
+            supports_lora: true,
+            supports_lokr: true,
             // Curated sampler/scheduler menu (epic 7114 P4, sc-7123). The legacy `flow_match_euler`
             // scheduler alias is retained and falls back to the native schedule via the N3 path.
             samplers: candle_gen::curated_sampler_names(),
@@ -1289,11 +1314,6 @@ fn load_variant_concrete(
             )));
         }
     };
-    if !spec.adapters.is_empty() {
-        return Err(gen_core::Error::Unsupported(format!(
-            "candle {id} does not support LoRA/LoKr yet"
-        )));
-    }
     if spec.identity.is_some() || spec.text_encoder.is_some() || !spec.components.is_empty() {
         return Err(gen_core::Error::Unsupported(format!(
             "candle {id} does not support identity, external text-encoder, or named-component weights"
@@ -1309,7 +1329,14 @@ fn load_variant_concrete(
         )));
     }
     let device = candle_gen::default_device()?;
-    let pipe = Pipeline::load(variant, quant, &root, &device, spec.pid.clone());
+    let pipe = Pipeline::load(
+        variant,
+        quant,
+        &root,
+        &device,
+        spec.pid.clone(),
+        spec.adapters.clone(),
+    );
     generator_from_pipeline(pipe, Some(spec))
 }
 
@@ -1321,15 +1348,17 @@ fn load_variant_concrete(
 /// FLUX.2-dev diffusers snapshot supplying the Mistral text encoder, VAE, and tokenizer (none of which
 /// are in the single DiT file). `quant` (Q4/Q8) folds the dequanted DiT + the Mistral TE onto the GPU —
 /// the 32B dev does not fit dense — matching the resident dev path; `None` is fixture-only. txt2img
-/// only; no adapters / control / edit / PiD.
+/// only; user LoRA/LoKr applies to the remapped DiT, while control / edit / PiD use their dedicated
+/// providers rather than this source-specific entry point.
 pub fn load_from_comfyui_dit(
     transformer_file: impl Into<PathBuf>,
     snapshot_dir: impl Into<PathBuf>,
     quant: Option<Quant>,
+    adapters: Vec<gen_core::AdapterSpec>,
 ) -> gen_core::Result<Box<dyn Generator>> {
     let device = candle_gen::default_device()?;
     let root = snapshot_dir.into();
-    let pipe = Pipeline::load_comfyui(quant, &root, &device, transformer_file.into());
+    let pipe = Pipeline::load_comfyui(quant, &root, &device, transformer_file.into(), adapters);
     Ok(Box::new(generator_from_pipeline(pipe, None)?))
 }
 
@@ -1692,8 +1721,22 @@ mod tests {
             gemma: WeightsSource::Dir("/gemma".into()),
         };
         let root = Path::new("/nonexistent");
-        let with = Pipeline::load(Flux2Variant::Klein9b, None, root, &Device::Cpu, Some(spec));
-        let without = Pipeline::load(Flux2Variant::Klein9b, None, root, &Device::Cpu, None);
+        let with = Pipeline::load(
+            Flux2Variant::Klein9b,
+            None,
+            root,
+            &Device::Cpu,
+            Some(spec),
+            Vec::new(),
+        );
+        let without = Pipeline::load(
+            Flux2Variant::Klein9b,
+            None,
+            root,
+            &Device::Cpu,
+            None,
+            Vec::new(),
+        );
 
         // Opted in at load AND wanted by this request → load it.
         assert!(with.pid_to_load(true).is_some());
@@ -1730,7 +1773,7 @@ mod tests {
         assert!(d.capabilities.requires_sigma_shift);
         assert!(!d.capabilities.mac_only);
         assert!(d.capabilities.conditioning.is_empty());
-        assert!(!d.capabilities.supports_lora);
+        assert!(d.capabilities.supports_lora);
         assert!(!d.capabilities.supports_kv_cache);
         assert!(!d.capabilities.supports_prompt_enhancement);
         // klein now quantizes its DiT on-the-fly (sc-11031); the Qwen3 TE stays dense (`te_quant`).
@@ -1869,10 +1912,7 @@ mod tests {
         let lora = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_adapters(vec![
             AdapterSpec::new("/lora.safetensors".into(), 1.0, AdapterKind::Lora),
         ]);
-        assert!(matches!(
-            load_klein(&lora).err().expect("err"),
-            gen_core::Error::Unsupported(_)
-        ));
+        assert!(load_klein(&lora).is_ok());
         let mut identity = LoadSpec::new(WeightsSource::Dir("/snap".into()));
         identity.identity = Some(IdentityWeights::default());
         let mut external_text_encoder = LoadSpec::new(WeightsSource::Dir("/snap".into()));
@@ -1906,7 +1946,14 @@ mod tests {
     fn component_is_packed_reads_quantization_block() {
         let dir_tmp = tempfile::tempdir().unwrap();
         let dir = dir_tmp.path().to_path_buf();
-        let pipe = Pipeline::load(Flux2Variant::Dev, Some(Quant::Q4), &dir, &Device::Cpu, None);
+        let pipe = Pipeline::load(
+            Flux2Variant::Dev,
+            Some(Quant::Q4),
+            &dir,
+            &Device::Cpu,
+            None,
+            Vec::new(),
+        );
 
         let packed = dir.join("transformer");
         std::fs::create_dir_all(&packed).unwrap();
@@ -2004,7 +2051,14 @@ mod tests {
 
         // no quant → configured device, no staging call.
         write_shard("text_encoder", false);
-        let pipe = Pipeline::load(Flux2Variant::Klein9b, None, &dir, &Device::Cpu, None);
+        let pipe = Pipeline::load(
+            Flux2Variant::Klein9b,
+            None,
+            &dir,
+            &Device::Cpu,
+            None,
+            Vec::new(),
+        );
         let p = pipe
             .load_one_quantizable("text_encoder", None, build, quantize)
             .unwrap();
@@ -2013,7 +2067,14 @@ mod tests {
         assert!(!p.quantized.get(), "no-quant path must not quantize");
 
         // dense tier + quant → the builder sees the CPU (staging), then quantize runs onto the device.
-        let dense = Pipeline::load(Flux2Variant::Dev, Some(Quant::Q4), &dir, &Device::Cpu, None);
+        let dense = Pipeline::load(
+            Flux2Variant::Dev,
+            Some(Quant::Q4),
+            &dir,
+            &Device::Cpu,
+            None,
+            Vec::new(),
+        );
         let p = dense
             .load_one_quantizable("text_encoder", Some(Quant::Q4), build, quantize)
             .unwrap();
@@ -2028,7 +2089,14 @@ mod tests {
 
         // packed tier + quant → the builder sees the configured device directly (no dense staging).
         write_shard("transformer", true);
-        let packed = Pipeline::load(Flux2Variant::Dev, Some(Quant::Q4), &dir, &Device::Cpu, None);
+        let packed = Pipeline::load(
+            Flux2Variant::Dev,
+            Some(Quant::Q4),
+            &dir,
+            &Device::Cpu,
+            None,
+            Vec::new(),
+        );
         let p = packed
             .load_one_quantizable("transformer", Some(Quant::Q4), build, quantize)
             .unwrap();
@@ -2050,9 +2118,16 @@ mod tests {
         let dir_tmp = tempfile::tempdir().unwrap();
         let dir = dir_tmp.path().to_path_buf();
         for q in [None, Some(Quant::Q4), Some(Quant::Q8)] {
-            let klein = Pipeline::load(Flux2Variant::Klein9b, q, &dir, &Device::Cpu, None);
+            let klein = Pipeline::load(
+                Flux2Variant::Klein9b,
+                q,
+                &dir,
+                &Device::Cpu,
+                None,
+                Vec::new(),
+            );
             assert_eq!(klein.te_quant(), None, "klein TE stays dense at {q:?}");
-            let dev = Pipeline::load(Flux2Variant::Dev, q, &dir, &Device::Cpu, None);
+            let dev = Pipeline::load(Flux2Variant::Dev, q, &dir, &Device::Cpu, None, Vec::new());
             assert_eq!(dev.te_quant(), q, "dev folds its TE with the DiT at {q:?}");
         }
     }
@@ -2066,7 +2141,14 @@ mod tests {
         let dir_tmp = tempfile::tempdir().unwrap();
         let dir = dir_tmp.path().to_path_buf();
         // No component dirs written → the shared loader must error on the missing text_encoder/.
-        let pipe = Pipeline::load(Flux2Variant::Klein9b, None, &dir, &Device::Cpu, None);
+        let pipe = Pipeline::load(
+            Flux2Variant::Klein9b,
+            None,
+            &dir,
+            &Device::Cpu,
+            None,
+            Vec::new(),
+        );
         let err = pipe
             .load_te_and_dit()
             .err()
@@ -2088,6 +2170,7 @@ mod tests {
             "/tree/diffusion_models/flux2_dev_fp8mixed.safetensors",
             "/snap/flux2-dev",
             Some(Quant::Q8),
+            Vec::new(),
         )
         .expect("comfyui dev generator builds lazily");
         assert_eq!(g.descriptor().id, FLUX2_DEV_ID);
@@ -2104,6 +2187,7 @@ mod tests {
             Path::new("/missing-snapshot"),
             &Device::Cpu,
             selected.clone(),
+            Vec::new(),
         );
         let error = pipe
             .load_dit_seq()
@@ -2607,9 +2691,15 @@ mod tests {
         );
         let mut probe = candle_gen::testkit::VramProbe::start_rendered();
         let load_phase = probe.phase();
-        let model =
-            Flux2Edit::load_klein_with_memory_context(&Flux2EditPaths { root }, &spec, &context)
-                .expect("load context-bound Klein edit");
+        let model = Flux2Edit::load_klein_with_memory_context(
+            &Flux2EditPaths {
+                root,
+                adapters: Vec::new(),
+            },
+            &spec,
+            &context,
+        )
+        .expect("load context-bound Klein edit");
         probe.end_load(load_phase);
 
         let mut stale = context.clone();

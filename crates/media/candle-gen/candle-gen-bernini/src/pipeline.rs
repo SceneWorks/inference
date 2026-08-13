@@ -82,9 +82,9 @@ pub fn descriptor() -> ModelDescriptor {
                 ConditioningKind::MultiReference,
                 ConditioningKind::VideoClip,
             ],
-            // LoRA/quant-adapter surface is a follow-on; the renderer ships dense bf16 / packed q4/q8.
-            supports_lora: false,
-            supports_lokr: false,
+            // User LoRA/LoKr stacks apply to both dense bf16 and packed q4/q8 renderer tiers.
+            supports_lora: true,
+            supports_lokr: true,
             // Curated `uni_pc` (sc-7296) → Wan's native UniPC; `euler` flow Euler. Legacy `unipc` alias.
             samplers: vec!["uni_pc", "euler", "unipc"],
             schedulers: Vec::new(),
@@ -123,6 +123,7 @@ pub struct BerniniRenderer {
     knobs: BerniniKnobs,
     root: PathBuf,
     device: Device,
+    adapters: Vec<candle_gen::gen_core::AdapterSpec>,
     components: Mutex<Option<Arc<RendererComponents>>>,
 }
 
@@ -133,6 +134,7 @@ impl BerniniRenderer {
                 &self.root,
                 &self.device,
                 MODEL_ID,
+                &self.adapters,
             )?))
         })
     }
@@ -407,6 +409,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         knobs,
         root,
         device,
+        adapters: spec.adapters.clone(),
         components: Mutex::new(None),
     }))
 }

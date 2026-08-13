@@ -113,7 +113,7 @@ pub mod ldm;
 pub mod loaders;
 pub use loaders::{
     load_instantid_unet, load_instantid_unet_with_adapters, load_sdxl_controlnet, load_sdxl_vae,
-    load_sdxl_vae_encoder,
+    load_sdxl_vae_encoder, load_vendored_unet_with_adapters,
 };
 
 // The SDXL VAE type the loader returns, re-exported so the `candle-gen-instantid` glue can hold one as
