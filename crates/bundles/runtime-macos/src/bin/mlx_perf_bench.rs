@@ -1470,6 +1470,25 @@ fn diagnostic_records(report: DiagnosticReport) -> Vec<DiagnosticRecord> {
                 decode_path: None,
                 production_evidence_sha256: None,
             },
+            DiagnosticCounter::ExactEpilogue {
+                operation,
+                disposition,
+                reason,
+                count,
+            } => DiagnosticRecord {
+                domain: "exact_epilogue".to_owned(),
+                site: operation.to_owned(),
+                outcome: match disposition {
+                    ToggleDisposition::Applied => "applied",
+                    ToggleDisposition::Fallback => "fallback",
+                    ToggleDisposition::Unavailable => "unavailable",
+                }
+                .to_owned(),
+                count,
+                reason: reason.map(str::to_owned),
+                decode_path: None,
+                production_evidence_sha256: None,
+            },
             DiagnosticCounter::DecodePolicy {
                 disposition,
                 decode_path,
@@ -2283,6 +2302,30 @@ mod tests {
         assert_eq!(
             records[0].production_evidence_sha256.as_deref(),
             Some(evidence.as_str())
+        );
+    }
+
+    #[test]
+    fn p3_counter_preserves_operation_outcome_and_fallback_reason() {
+        let records = diagnostic_records(DiagnosticReport {
+            request_id: "p3".to_owned(),
+            family: "wan_video".to_owned(),
+            counters: vec![DiagnosticCounter::ExactEpilogue {
+                operation: diagnostics::EXACT_CONV3D_BIAS,
+                disposition: ToggleDisposition::Fallback,
+                reason: Some("unsupported_dtype_shape_or_dispatch"),
+                count: 3,
+            }],
+            phase_boundaries: Vec::new(),
+        });
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].domain, "exact_epilogue");
+        assert_eq!(records[0].site, diagnostics::EXACT_CONV3D_BIAS);
+        assert_eq!(records[0].outcome, "fallback");
+        assert_eq!(
+            records[0].reason.as_deref(),
+            Some("unsupported_dtype_shape_or_dispatch")
         );
     }
 

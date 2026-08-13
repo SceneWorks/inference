@@ -6,8 +6,8 @@
 //! from a requested toggle that silently fell back.  This module provides a narrow, opt-in seam:
 //!
 //! * [`begin_request`] installs a collector for the current synchronous render thread;
-//! * hot-path [`record_compile`], [`record_cache`], [`record_fallback`], and [`record_toggle`]
-//!   calls are no-ops when no collector is active;
+//! * hot-path [`record_compile`], [`record_cache`], [`record_fallback`], [`record_toggle`], and
+//!   [`record_exact_epilogue`] calls are no-ops when no collector is active;
 //! * [`DiagnosticScope::finish`] returns stable, aggregated counters for that one request.
 //!
 //! MLX generation is synchronous and SceneWorks serializes work on the process-default Metal
@@ -23,6 +23,28 @@ use std::time::Instant;
 pub const RETAINED_COMPILATION: &str = "retained_compilation";
 /// P3 exact elementwise/normalization/matmul epilogue fusions.
 pub const EXACT_EPILOGUES: &str = "exact_epilogues";
+/// P3 biased 2-D convolution operation identity.
+pub const EXACT_CONV2D_BIAS: &str = "conv2d_bias";
+/// P3 biased 3-D convolution operation identity.
+pub const EXACT_CONV3D_BIAS: &str = "conv3d_bias";
+/// P3 group-aware GroupNorm plus affine operation identity.
+pub const EXACT_GROUP_NORM_AFFINE: &str = "group_norm_affine";
+/// P3 packed affine Q4/Q8 matmul plus dense bias operation identity.
+pub const EXACT_QUANTIZED_MATMUL_BIAS: &str = "quantized_matmul_bias";
+/// P3 eager-compatible SiLU operation identity.
+pub const EXACT_SILU: &str = "silu";
+/// P3 eager-compatible tanh-GELU operation identity.
+pub const EXACT_GELU_TANH: &str = "gelu_tanh";
+/// Complete phase-1 operation inventory. Provider request inventories are strict subsets of this
+/// list because already-compiled glue and operations absent from a family are not P3 gains.
+pub const EXACT_EPILOGUE_OPERATIONS: [&str; 6] = [
+    EXACT_CONV2D_BIAS,
+    EXACT_CONV3D_BIAS,
+    EXACT_GROUP_NORM_AFFINE,
+    EXACT_QUANTIZED_MATMUL_BIAS,
+    EXACT_SILU,
+    EXACT_GELU_TANH,
+];
 /// P4 fused QK-normalization, RoPE/layout, and projection primitives.
 pub const FUSED_ATTENTION_PRIMITIVES: &str = "fused_attention_primitives";
 /// P5 indexed/scatter tiled-decode accumulation.
@@ -159,6 +181,14 @@ pub enum DiagnosticCounter {
         disposition: ToggleDisposition,
         count: u64,
     },
+    /// One exact P3 operation's concrete request-local path. A request may carry both Applied and
+    /// Fallback records for the same operation when different shapes select different dispatchers.
+    ExactEpilogue {
+        operation: &'static str,
+        disposition: ToggleDisposition,
+        reason: Option<&'static str>,
+        count: u64,
+    },
     DecodePolicy {
         disposition: DecodePolicyDisposition,
         decode_path: DecodePathDisposition,
@@ -182,6 +212,7 @@ enum CounterKey {
     Cache(&'static str, CacheDisposition),
     Fallback(&'static str, &'static str),
     Toggle(&'static str, ToggleDisposition),
+    ExactEpilogue(&'static str, ToggleDisposition, Option<&'static str>),
     DecodePolicy(
         DecodePolicyDisposition,
         DecodePathDisposition,
@@ -357,6 +388,22 @@ pub fn record_toggle(toggle: &'static str, disposition: ToggleDisposition) {
     increment(CounterKey::Toggle(toggle, disposition));
 }
 
+/// Record one P3 operation's concrete selection. Applied records carry no reason; rejected native
+/// paths carry a stable Fallback/Unavailable reason while the caller executes the original composed
+/// expression. The aggregate P3 terminal receipt is derived at [`DiagnosticScope::finish`]: any
+/// admitted operation makes the toggle Applied, while an all-fallback or empty request remains
+/// Fallback/Unavailable. The P6 validator separately requires the exact provider operation inventory,
+/// so one successful helper cannot certify an incomplete request.
+pub fn record_exact_epilogue(
+    operation: &'static str,
+    disposition: ToggleDisposition,
+    reason: Option<&'static str>,
+) {
+    debug_assert!(EXACT_EPILOGUE_OPERATIONS.contains(&operation));
+    debug_assert_eq!(reason.is_none(), disposition == ToggleDisposition::Applied);
+    increment(CounterKey::ExactEpilogue(operation, disposition, reason));
+}
+
 /// Record P9's request-local policy decision. No-op outside an active diagnostic request.
 ///
 /// The benchmark contract rejects `GeometryTiled` without both a physical tiled path and a
@@ -398,10 +445,38 @@ impl DiagnosticScope {
     pub fn finish(mut self) -> DiagnosticReport {
         self.active = false;
         COLLECTOR.with(|slot| {
-            let collector = slot
+            let mut collector = slot
                 .borrow_mut()
                 .take()
                 .expect("an active diagnostic scope owns one collector");
+            if collector.requested_toggles.contains(EXACT_EPILOGUES)
+                && !collector.counters.keys().any(|key| {
+                    matches!(key, CounterKey::Toggle(toggle, _) if *toggle == EXACT_EPILOGUES)
+                })
+            {
+                let has_applied = collector.counters.keys().any(|key| {
+                    matches!(
+                        key,
+                        CounterKey::ExactEpilogue(_, ToggleDisposition::Applied, None)
+                    )
+                });
+                let has_fallback = collector.counters.keys().any(|key| {
+                    matches!(
+                        key,
+                        CounterKey::ExactEpilogue(_, ToggleDisposition::Fallback, Some(_))
+                    )
+                });
+                let disposition = if has_applied {
+                    ToggleDisposition::Applied
+                } else if has_fallback {
+                    ToggleDisposition::Fallback
+                } else {
+                    ToggleDisposition::Unavailable
+                };
+                collector
+                    .counters
+                    .insert(CounterKey::Toggle(EXACT_EPILOGUES, disposition), 1);
+            }
             let counters = collector
                 .counters
                 .into_iter()
@@ -426,6 +501,14 @@ impl DiagnosticScope {
                         disposition,
                         count,
                     },
+                    CounterKey::ExactEpilogue(operation, disposition, reason) => {
+                        DiagnosticCounter::ExactEpilogue {
+                            operation,
+                            disposition,
+                            reason,
+                            count,
+                        }
+                    }
                     CounterKey::DecodePolicy(
                         disposition,
                         decode_path,
@@ -521,6 +604,51 @@ mod tests {
         assert!(!toggle_requested("geometry_aware_decode"));
         assert!(scope.finish().counters.is_empty());
         assert!(!toggle_requested("retained_compilation"));
+    }
+
+    #[test]
+    fn exact_epilogues_preserve_per_operation_fallback_and_derive_terminal_status() {
+        let scope = begin_request_with_toggles("p3", "qwen_image", &[EXACT_EPILOGUES]).unwrap();
+        record_exact_epilogue(EXACT_CONV2D_BIAS, ToggleDisposition::Applied, None);
+        record_exact_epilogue(EXACT_CONV2D_BIAS, ToggleDisposition::Applied, None);
+        record_exact_epilogue(
+            EXACT_CONV2D_BIAS,
+            ToggleDisposition::Fallback,
+            Some("unsupported_dtype_shape_or_dispatch"),
+        );
+        let report = scope.finish();
+
+        assert!(report.counters.contains(&DiagnosticCounter::ExactEpilogue {
+            operation: EXACT_CONV2D_BIAS,
+            disposition: ToggleDisposition::Applied,
+            reason: None,
+            count: 2,
+        }));
+        assert!(report.counters.contains(&DiagnosticCounter::ExactEpilogue {
+            operation: EXACT_CONV2D_BIAS,
+            disposition: ToggleDisposition::Fallback,
+            reason: Some("unsupported_dtype_shape_or_dispatch"),
+            count: 1,
+        }));
+        assert!(report.counters.contains(&DiagnosticCounter::Toggle {
+            toggle: EXACT_EPILOGUES,
+            disposition: ToggleDisposition::Applied,
+            count: 1,
+        }));
+    }
+
+    #[test]
+    fn exact_epilogues_without_an_admitted_operation_are_not_reported_applied() {
+        let scope = begin_request_with_toggles("p3-empty", "wan", &[EXACT_EPILOGUES]).unwrap();
+        let report = scope.finish();
+        assert_eq!(
+            report.counters,
+            [DiagnosticCounter::Toggle {
+                toggle: EXACT_EPILOGUES,
+                disposition: ToggleDisposition::Unavailable,
+                count: 1,
+            }]
+        );
     }
 
     #[test]

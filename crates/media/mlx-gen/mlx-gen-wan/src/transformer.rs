@@ -32,9 +32,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::fast::{layer_norm, rms_norm, scaled_dot_product_attention};
-use mlx_rs::ops::{
-    add, broadcast_to, concatenate_axis, cos, multiply, power, sigmoid, sin, split, tanh,
-};
+use mlx_rs::ops::{add, broadcast_to, concatenate_axis, cos, multiply, power, sin, split, tanh};
 use mlx_rs::transforms::checkpoint;
 use mlx_rs::transforms::compile::{compile, compile_retained};
 use mlx_rs::{Array, Dtype};
@@ -351,7 +349,7 @@ fn load_linear(w: &Weights, prefix: &str, quant: Option<WanQuant>) -> Result<Ada
 
 /// SiLU `x·σ(x)` (the reference `nn.SiLU`), bit-exact and dtype-preserving.
 fn silu(x: &Array) -> Result<Array> {
-    Ok(multiply(x, &sigmoid(x)?)?)
+    mlx_gen::nn::silu(x)
 }
 
 fn f32(x: &Array) -> Result<Array> {

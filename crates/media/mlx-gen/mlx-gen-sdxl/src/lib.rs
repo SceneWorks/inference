@@ -82,7 +82,10 @@ pub use vision_encoder::{ClipVisionEncoder, VisionConfig};
 
 /// Shared-optimization toggles whose production call sites this provider can actually execute.
 /// Availability never substitutes for the request-local `Applied` receipt required by P6.
-pub const BENCHMARK_TOGGLE_CAPABILITIES: &[&str] = &[mlx_gen::diagnostics::RETAINED_COMPILATION];
+pub const BENCHMARK_TOGGLE_CAPABILITIES: &[&str] = &[
+    mlx_gen::diagnostics::RETAINED_COMPILATION,
+    mlx_gen::diagnostics::EXACT_EPILOGUES,
+];
 
 // sc-2963 compiled-glue toggle: when on, the UNet's remaining fusable elementwise glue — the **SiLU**
 // activations (`x·sigmoid(x)`: ResNet GN→SiLU, the time-embedding MLP, the output head) — runs through
