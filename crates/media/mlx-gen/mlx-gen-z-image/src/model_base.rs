@@ -492,18 +492,10 @@ mod tests {
         assert!(err.contains("snapshot directory"), "got: {err}");
     }
 
-    // ── F-180 (sc-11126): weight-free, default-run proof that the Z-Image BASE dispatch HONORS
-    // `offload_policy`. Upgraded from the sc-11124 smoke test (which pointed a *single File* at both
-    // arms, so both merely hit the shared up-front single-file rejection — an always-`Resident` impl
-    // passed it). This drives the shared `build_residency` seam with a non-existent snapshot
-    // *directory* (so the precision/single-file guard passes) and asserts the real discriminator —
-    // deferral:
-    //   * `Sequential` captures the two per-phase loaders, touches NO weights → `Ok` + `is_sequential`.
-    //   * `Resident` eager-loads the text encoder from the missing dir → `Err`.
-    // A dispatch that ignored `offload_policy` (always `Resident` — the exact F-172 base regression this
-    // seam fixed) would eager-load under a `Sequential` request and fail the first assertion. The
-    // real-weight A/B in `tests/sequential_residency_real_weights.rs` is `#[ignore]`d; this runs by
-    // default. Uses the base's own precision/single-file messages so the guard strings match `load`.
+    // SC-15806: weight-free proof that BASE construction is request-scoped for both legacy policy
+    // values. The fixture is complete through encoder/tokenizer admission but deliberately omits the
+    // transformer and VAE, so construction can only succeed by retaining the heavy loader closures.
+    // Uses the base's own precision/single-file messages so the guard strings match `load`.
     const BASE_PRECISION_MSG: &str =
         "z_image: only dense bf16 is wired in the Rust port; the text encoder already runs f32 \
          internally (drop the precision override)";
@@ -511,17 +503,17 @@ mod tests {
         "z_image expects a snapshot directory (tokenizer/ text_encoder/ transformer/ vae/), \
          not a single .safetensors file";
 
-    fn missing_snapshot_spec(policy: mlx_gen::OffloadPolicy) -> (tempfile::TempDir, LoadSpec) {
+    fn incomplete_snapshot_spec(policy: mlx_gen::OffloadPolicy) -> (tempfile::TempDir, LoadSpec) {
         use mlx_gen::WeightsSource;
-        let encoder = tempfile::tempdir().expect("encoder fixture dir");
-        gen_core_testkit::write_encoder_contract_fixture(encoder.path(), crate::ENCODER_CONTRACT)
-            .expect("valid encoder contract fixture");
-        let spec = LoadSpec::new(WeightsSource::Dir(
-            "/nonexistent/z-image-base-residency-test-snapshot".into(),
-        ))
-        .with_text_encoder(WeightsSource::Dir(encoder.path().to_path_buf()))
-        .with_offload_policy(policy);
-        (encoder, spec)
+        let snapshot = tempfile::tempdir().expect("snapshot fixture dir");
+        gen_core_testkit::write_encoder_contract_fixture(
+            &snapshot.path().join("text_encoder"),
+            crate::ENCODER_CONTRACT,
+        )
+        .expect("validation-complete encoder and tokenizer fixture");
+        let spec = LoadSpec::new(WeightsSource::Dir(snapshot.path().to_path_buf()))
+            .with_offload_policy(policy);
+        (snapshot, spec)
     }
 
     #[test]
@@ -530,11 +522,13 @@ mod tests {
             mlx_gen::OffloadPolicy::Resident,
             mlx_gen::OffloadPolicy::Sequential,
         ] {
-            let (_encoder, spec) = missing_snapshot_spec(policy);
+            let (snapshot, spec) = incomplete_snapshot_spec(policy);
+            assert!(!snapshot.path().join("transformer").exists());
+            assert!(!snapshot.path().join("vae").exists());
             let res =
                 crate::model::build_residency(&spec, MODEL_ID, BASE_PRECISION_MSG, BASE_FILE_MSG)
                     .unwrap_or_else(|error| {
-                        panic!("{policy:?} must defer and ignore the missing snapshot: {error}")
+                        panic!("{policy:?} must defer absent heavy components: {error}")
                     });
             assert!(
                 res.with_resident_parts(|_, _| ()).unwrap().is_none(),

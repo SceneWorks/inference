@@ -1156,25 +1156,27 @@ mod tests {
 
     // SC-15806: Z-Image construction is request-scoped. Both legacy load-policy values retain the
     // same loaders and defer component loading; GenerationMemory chooses the lifecycle per request.
-    fn missing_snapshot_spec(policy: OffloadPolicy) -> (tempfile::TempDir, LoadSpec) {
-        let encoder = tempfile::tempdir().expect("encoder fixture dir");
-        gen_core_testkit::write_encoder_contract_fixture(encoder.path(), crate::ENCODER_CONTRACT)
-            .expect("valid encoder contract fixture");
-        let spec = LoadSpec::new(WeightsSource::Dir(
-            "/nonexistent/z-image-residency-test-snapshot".into(),
-        ))
-        .with_text_encoder(WeightsSource::Dir(encoder.path().to_path_buf()))
-        .with_offload_policy(policy);
-        (encoder, spec)
+    fn incomplete_snapshot_spec(policy: OffloadPolicy) -> (tempfile::TempDir, LoadSpec) {
+        let snapshot = tempfile::tempdir().expect("snapshot fixture dir");
+        gen_core_testkit::write_encoder_contract_fixture(
+            &snapshot.path().join("text_encoder"),
+            crate::ENCODER_CONTRACT,
+        )
+        .expect("validation-complete encoder and tokenizer fixture");
+        let spec = LoadSpec::new(WeightsSource::Dir(snapshot.path().to_path_buf()))
+            .with_offload_policy(policy);
+        (snapshot, spec)
     }
 
     #[test]
     fn build_residency_defers_for_both_legacy_offload_values() {
         for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
-            let (_encoder, spec) = missing_snapshot_spec(policy);
+            let (snapshot, spec) = incomplete_snapshot_spec(policy);
+            assert!(!snapshot.path().join("transformer").exists());
+            assert!(!snapshot.path().join("vae").exists());
             let res =
                 build_residency(&spec, MODEL_ID, PRECISION_MSG, FILE_MSG).unwrap_or_else(|error| {
-                    panic!("{policy:?} must defer and ignore the missing snapshot: {error}")
+                    panic!("{policy:?} must defer absent heavy components: {error}")
                 });
             assert!(
                 res.with_resident_parts(|_, _| ()).unwrap().is_none(),

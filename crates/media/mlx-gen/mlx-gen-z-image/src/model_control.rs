@@ -658,19 +658,19 @@ mod tests {
     }
 
     // SC-15806 construction proof: both legacy values retain loaders and touch no component weights.
-    fn missing_control_spec(policy: OffloadPolicy) -> (tempfile::TempDir, LoadSpec) {
-        let encoder = tempfile::tempdir().expect("encoder fixture dir");
-        gen_core_testkit::write_encoder_contract_fixture(encoder.path(), crate::ENCODER_CONTRACT)
-            .expect("valid encoder contract fixture");
-        let spec = LoadSpec::new(WeightsSource::Dir(
-            "/nonexistent/z-image-control-base".into(),
-        ))
-        .with_text_encoder(WeightsSource::Dir(encoder.path().to_path_buf()))
-        .with_control(WeightsSource::File(
-            "/nonexistent/z-image-control-overlay.safetensors".into(),
-        ))
-        .with_offload_policy(policy);
-        (encoder, spec)
+    fn incomplete_control_spec(policy: OffloadPolicy) -> (tempfile::TempDir, LoadSpec) {
+        let snapshot = tempfile::tempdir().expect("snapshot fixture dir");
+        gen_core_testkit::write_encoder_contract_fixture(
+            &snapshot.path().join("text_encoder"),
+            crate::ENCODER_CONTRACT,
+        )
+        .expect("validation-complete encoder and tokenizer fixture");
+        let spec = LoadSpec::new(WeightsSource::Dir(snapshot.path().to_path_buf()))
+            .with_control(WeightsSource::File(
+                snapshot.path().join("control.safetensors"),
+            ))
+            .with_offload_policy(policy);
+        (snapshot, spec)
     }
 
     // ── F-009 (sc-12461): the control lane's tier-mismatch guard must fire on the DEFAULT
@@ -731,10 +731,13 @@ mod tests {
     #[test]
     fn build_control_residency_defers_for_both_legacy_offload_values() {
         for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
-            let (_encoder, spec) = missing_control_spec(policy);
+            let (snapshot, spec) = incomplete_control_spec(policy);
+            assert!(!snapshot.path().join("transformer").exists());
+            assert!(!snapshot.path().join("vae").exists());
+            assert!(!snapshot.path().join("control.safetensors").exists());
             let res =
                 build_control_residency(&spec, MODEL_ID, PRECISION_MSG).unwrap_or_else(|error| {
-                    panic!("{policy:?} must defer and ignore the missing snapshot: {error}")
+                    panic!("{policy:?} must defer absent heavy components: {error}")
                 });
             assert!(
                 res.with_resident_parts(|_, _| ()).unwrap().is_none(),
