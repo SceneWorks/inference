@@ -2,7 +2,7 @@
 //! [`Transform`](crate::transform::Transform): where weights come from, quantization +
 //! precision knobs, adapter specs, cooperative cancellation, and progress events.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -38,7 +38,7 @@ pub const KREA_CONVROT_DIT_COMPONENT: &str = "krea_convrot_dit";
 /// entry — before calling `load`, and a missing component is a load-time contract error
 /// ([`crate::control::require_component`]), never a mid-render fetch. (The previously-reserved
 /// sc-2340 hub-fetch direction is permanently rejected.)
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WeightsSource {
     /// A directory of (possibly sharded) `.safetensors`.
     Dir(PathBuf),
@@ -531,6 +531,11 @@ pub struct LoadSpec {
     /// configured File source must have a matching token; a missing or orphaned token fails closed.
     /// Prefer [`Self::prepare_file_sources`] or [`Self::with_prepared_file_pin`] to enter that mode.
     prepared_file_pins: PreparedFilePins,
+    /// Additional exact files retained by a validated component receipt. These paths are not
+    /// ordinary provider slots: a single-file encoder's sibling config and a complete snapshot's
+    /// tokenizer are behavior-bearing inputs even though the backend only receives the encoder
+    /// source. Only crate-owned validation APIs may populate this set.
+    prepared_receipt_paths: BTreeSet<PathBuf>,
     pub quantize: Option<Quant>,
     pub precision: Precision,
     /// Auxiliary control-branch weights overlaid onto the base model at load time — a ControlNet
@@ -683,6 +688,7 @@ impl LoadSpec {
         Self {
             weights,
             prepared_file_pins: PreparedFilePins::default(),
+            prepared_receipt_paths: BTreeSet::new(),
             quantize: None,
             precision: Precision::Bf16,
             control: None,
@@ -744,10 +750,61 @@ impl LoadSpec {
             finalized: true,
             pins,
         };
+        if !self.prepared_receipt_paths.is_empty() {
+            return Err(crate::Error::Unsupported(
+                "validated receipt identity must be installed through its owning contract".into(),
+            ));
+        }
         self.validate_prepared_file_pin_set_for(&candidate)?;
         if self.prepared_file_pins.is_finalized() && self.prepared_file_pins != candidate {
             return Err(crate::Error::Unsupported(
                 "cannot replace finalized LoadSpec File identity".into(),
+            ));
+        }
+        self.prepared_file_pins = candidate;
+        Ok(())
+    }
+
+    /// Install the complete exact-file set retained by a crate-validated component receipt.
+    ///
+    /// Kept crate-private so an external caller cannot bless arbitrary paths as cache/load identity.
+    pub(crate) fn prepare_with_validated_receipt_pins(
+        &mut self,
+        prepared: impl IntoIterator<Item = PinnedWeightsFile>,
+        receipt_paths: impl IntoIterator<Item = PathBuf>,
+    ) -> crate::Result<()> {
+        let mut pins = BTreeMap::new();
+        for pin in prepared {
+            pin.ensure_unchanged()?;
+            let path = pin.loader_path().to_path_buf();
+            if let Some(existing) = pins.insert(path.clone(), pin) {
+                if existing != pins[&path] {
+                    return Err(crate::Error::Unsupported(format!(
+                        "conflicting prepared file tokens for {}",
+                        path.display()
+                    )));
+                }
+            }
+        }
+        let receipt_paths = receipt_paths.into_iter().collect::<BTreeSet<_>>();
+        let candidate = PreparedFilePins {
+            prepared: true,
+            finalized: true,
+            pins,
+        };
+        let previous_receipt_paths =
+            std::mem::replace(&mut self.prepared_receipt_paths, receipt_paths);
+        if let Err(error) = self.validate_prepared_file_pin_set_for(&candidate) {
+            self.prepared_receipt_paths = previous_receipt_paths;
+            return Err(error);
+        }
+        if self.prepared_file_pins.is_finalized()
+            && (self.prepared_file_pins != candidate
+                || self.prepared_receipt_paths != previous_receipt_paths)
+        {
+            self.prepared_receipt_paths = previous_receipt_paths;
+            return Err(crate::Error::Unsupported(
+                "cannot replace finalized LoadSpec receipt identity".into(),
             ));
         }
         self.prepared_file_pins = candidate;
@@ -964,6 +1021,7 @@ impl LoadSpec {
             .into_iter()
             .map(std::path::absolute)
             .collect::<std::io::Result<_>>()?;
+        expected.extend(self.prepared_receipt_paths.iter().cloned());
         expected.sort();
         expected.dedup();
         let configured_directories = self

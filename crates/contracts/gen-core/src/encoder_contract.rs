@@ -208,6 +208,7 @@ pub struct EncoderContract {
 /// or a complete snapshot containing `text_encoder/`.
 #[derive(Clone, Debug)]
 pub struct ValidatedEncoderSource {
+    requested_source: WeightsSource,
     weights: WeightsSource,
     config_path: Option<PathBuf>,
     packed_quant_bits: Option<i32>,
@@ -250,6 +251,105 @@ struct PinnedEncoderSource {
 }
 
 impl ValidatedEncoderSource {
+    /// Prove that every lexical loader entry and exact canonical target retained by this receipt is
+    /// under one of the caller's pre-authorized model roots.
+    pub fn ensure_confined_to(&self, allowed_roots: &[PathBuf]) -> Result<()> {
+        self.ensure_unchanged()?;
+        let roots = allowed_roots
+            .iter()
+            .map(std::path::absolute)
+            .collect::<std::io::Result<Vec<_>>>()?;
+        if roots.is_empty() {
+            return Err(Error::Unsupported(
+                "validated text encoder has no authorized model roots".into(),
+            ));
+        }
+        for pin in self.receipt_pins()? {
+            for (kind, path) in [
+                ("loader entry", pin.loader_path()),
+                ("canonical target", pin.canonical_target_path()),
+            ] {
+                if !roots.iter().any(|root| path.starts_with(root)) {
+                    return Err(Error::Unsupported(format!(
+                        "validated text encoder {kind} escapes authorized model roots: {}",
+                        path.display()
+                    )));
+                }
+            }
+        }
+        self.ensure_unchanged()
+    }
+
+    /// Attach the exact validated source and its complete shard/config/tokenizer receipt to a load
+    /// spec in one atomic operation.
+    ///
+    /// The requested source shape is preserved: a complete snapshot remains a complete-snapshot
+    /// `Dir`, while validation continues to expose only its resolved `text_encoder/` component to
+    /// providers. Every direct shard plus the behavior config and retained/selected tokenizer files
+    /// enters the prepared identity set used by cache keys and provider load brackets. This is the
+    /// only public receipt-export seam; callers never recreate the contract's shard inventory.
+    pub fn prepare_load_spec(&self, spec: &mut crate::LoadSpec) -> Result<()> {
+        self.ensure_unchanged()?;
+        let mut candidate = spec.clone();
+        if let Some(existing) = candidate.text_encoder.as_ref() {
+            if existing != &self.requested_source {
+                return Err(Error::Unsupported(format!(
+                    "validated text encoder cannot replace an already selected source: existing {}, validated {}",
+                    source_path(existing).display(),
+                    source_path(&self.requested_source).display()
+                )));
+            }
+        } else {
+            candidate.text_encoder = Some(self.requested_source.clone());
+        }
+
+        let receipt_pins = self.receipt_pins()?;
+        let receipt_by_path = receipt_pins
+            .iter()
+            .map(|pin| (pin.loader_path().to_path_buf(), pin))
+            .collect::<BTreeMap<_, _>>();
+        let mut prepared = Vec::new();
+        for path in candidate.file_source_paths() {
+            let absolute = std::path::absolute(path)?;
+            if let Some(pin) = receipt_by_path.get(&absolute) {
+                prepared.push((*pin).clone());
+            } else if let Some(pin) = candidate.prepared_file_pins().get(&absolute) {
+                pin.ensure_unchanged()?;
+                prepared.push(pin.clone());
+            } else {
+                prepared.push(PinnedWeightsFile::pin(path)?);
+            }
+        }
+        prepared.extend(receipt_pins.iter().cloned());
+        let receipt_paths = receipt_pins
+            .iter()
+            .map(|pin| pin.loader_path().to_path_buf())
+            .collect::<Vec<_>>();
+        candidate.prepare_with_validated_receipt_pins(prepared, receipt_paths)?;
+        self.ensure_unchanged()?;
+        *spec = candidate;
+        Ok(())
+    }
+
+    fn receipt_pins(&self) -> Result<Vec<PinnedWeightsFile>> {
+        self.ensure_unchanged()?;
+        let mut pins = self.pinned.shard_pins.clone();
+        pins.extend(self.pinned.config_pin.iter().cloned());
+        if let Some(tokenizer) = &self.tokenizer {
+            pins.push(tokenizer.base.pin.clone());
+            pins.extend(
+                tokenizer
+                    .selected
+                    .iter()
+                    .map(|selected| selected.pin.clone()),
+            );
+        }
+        pins.sort_by(|left, right| left.loader_path().cmp(right.loader_path()));
+        pins.dedup_by(|left, right| left.loader_path() == right.loader_path());
+        self.ensure_unchanged()?;
+        Ok(pins)
+    }
+
     /// Whether an authoritative behavior config accompanied the source. The path itself stays
     /// encapsulated so callers cannot reopen it outside the unchanged-read bracket.
     pub fn has_config(&self) -> bool {
@@ -1181,6 +1281,7 @@ impl EncoderContract {
         self.validate_headers(&headers, source_path(&weights), packed_quant, dtype_policy)?;
         pinned.ensure_unchanged()?;
         Ok(ValidatedEncoderSource {
+            requested_source: source.clone(),
             weights,
             config_path,
             packed_quant_bits: packed_quant.map(|quant| quant.bits as i32),
@@ -3672,6 +3773,91 @@ mod tests {
             runtime_path,
             std::path::absolute(base.join("tokenizer/tokenizer.json")).unwrap()
         );
+    }
+
+    #[test]
+    fn file_selection_prepares_shard_sibling_config_and_base_tokenizer_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("base");
+        let selected = temp.path().join("selected");
+        std::fs::create_dir_all(&base).unwrap();
+        write_tokenizer_fixture(&base);
+        write_fixture(&selected, 8);
+        let selected_file = selected.join("model.safetensors");
+        let mut spec = crate::LoadSpec::new(WeightsSource::Dir(base.clone()));
+        let validated = CONTRACT
+            .validate_source_against_base(&WeightsSource::File(selected_file.clone()), &base)
+            .unwrap();
+
+        validated.prepare_load_spec(&mut spec).unwrap();
+
+        assert_eq!(
+            spec.text_encoder,
+            Some(WeightsSource::File(selected_file.clone()))
+        );
+        let paths = spec
+            .prepared_file_pins()
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        assert!(paths.contains(&std::path::absolute(&selected_file).unwrap()));
+        assert!(paths.contains(&std::path::absolute(selected.join("config.json")).unwrap()));
+        assert!(
+            paths.contains(&std::path::absolute(base.join("tokenizer/tokenizer.json")).unwrap())
+        );
+
+        std::fs::write(selected.join("config.json"), b"{}").unwrap();
+        let opened = std::cell::Cell::new(false);
+        let error = spec
+            .read_prepared_files_unchanged::<(), Error>(|| {
+                opened.set(true);
+                Ok(())
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !opened.get(),
+            "mutated config must fail before provider load"
+        );
+        assert!(error.contains("pinned weights"), "{error}");
+    }
+
+    #[test]
+    fn complete_snapshot_prepares_selected_and_base_tokenizer_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("base");
+        let selected = temp.path().join("selected");
+        std::fs::create_dir_all(&base).unwrap();
+        write_tokenizer_fixture(&base);
+        write_fixture(&selected.join("text_encoder"), 8);
+        write_tokenizer_fixture(&selected);
+        let mut spec = crate::LoadSpec::new(WeightsSource::Dir(base.clone()));
+        let validated = CONTRACT
+            .validate_source_against_base(&WeightsSource::Dir(selected.clone()), &base)
+            .unwrap();
+
+        validated.prepare_load_spec(&mut spec).unwrap();
+
+        assert_eq!(
+            spec.text_encoder,
+            Some(WeightsSource::Dir(selected.clone()))
+        );
+        let paths = spec
+            .prepared_file_pins()
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for path in [
+            selected.join("text_encoder/model.safetensors"),
+            selected.join("text_encoder/config.json"),
+            selected.join("tokenizer/tokenizer.json"),
+            base.join("tokenizer/tokenizer.json"),
+        ] {
+            assert!(
+                paths.contains(&std::path::absolute(path).unwrap()),
+                "missing prepared receipt path"
+            );
+        }
     }
 
     #[test]
