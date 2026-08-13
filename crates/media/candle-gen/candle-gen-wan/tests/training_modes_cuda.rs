@@ -8,6 +8,11 @@ use candle_gen::gen_core::{
 };
 
 fn run(id: &str, env: &str) {
+    // TI2V-5B's descriptor floor is 480 px per side. Use that shared smoke geometry for both
+    // production reloads so the request is valid on the stricter provider, and keep the I2V
+    // reference exactly aligned with it. One frame is the provider's minimum valid 1 mod 4 lattice;
+    // two denoise steps are required here so the dual-expert I2V smoke exercises high and low.
+    const GENERATION_EDGE: u32 = 480;
     let snapshot = PathBuf::from(std::env::var(env).unwrap_or_else(|_| panic!("set {env}")));
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("input.png");
@@ -71,9 +76,9 @@ fn run(id: &str, env: &str) {
     let conditioning = (id == "wan2_2_i2v_14b")
         .then(|| Conditioning::Reference {
             image: Image {
-                width: 256,
-                height: 256,
-                pixels: vec![128; 256 * 256 * 3],
+                width: GENERATION_EDGE,
+                height: GENERATION_EDGE,
+                pixels: vec![128; GENERATION_EDGE as usize * GENERATION_EDGE as usize * 3],
             },
             strength: None,
         })
@@ -81,8 +86,8 @@ fn run(id: &str, env: &str) {
         .collect();
     let request = GenerationRequest {
         prompt: "a violet tile".into(),
-        width: 256,
-        height: 256,
+        width: GENERATION_EDGE,
+        height: GENERATION_EDGE,
         frames: Some(1),
         steps: Some(2),
         seed: Some(7),
