@@ -113,6 +113,7 @@ pub fn descriptor() -> ModelDescriptor {
             // the ~20.6 GB DiT + VAE load, bounding peak unified memory to `max(mllm, DiT+VAE)`. Cloned
             // onto Turbo/Edit below. The small PiD overlay + tokenizer stay resident on the generator.
             supports_sequential_offload: true,
+            unconditionally_engages_staged_residency: false,
             supports_preview: false,
             supports_streaming: false,
             supports_multi_speaker: false,

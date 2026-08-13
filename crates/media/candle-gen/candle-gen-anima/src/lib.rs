@@ -113,6 +113,7 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             supports_kv_cache: false,
             requires_sigma_shift: true,
             supports_sequential_offload: false,
+            unconditionally_engages_staged_residency: false,
             // Per-step latent previews: wired by sc-16953 for all three variants at once — they share
             // one render lane and differ only in the DiT weights file — and advertised behind the
             // source-verified bidirectional guard in `candle-gen-catalog` (sc-16951), which derives

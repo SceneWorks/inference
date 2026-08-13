@@ -854,6 +854,7 @@ pub fn descriptor() -> ModelDescriptor {
             supports_kv_cache: false,
             requires_sigma_shift: true,
             supports_sequential_offload: true,
+            unconditionally_engages_staged_residency: false,
             // Per-step latent previews: wired by sc-16952, advertised behind the source-verified
             // bidirectional guard sc-16951 added to `candle-gen-catalog`.
             supports_preview: true,

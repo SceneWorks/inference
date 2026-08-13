@@ -1097,6 +1097,7 @@ pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
             supports_kv_cache: false,
             requires_sigma_shift: false,
             supports_sequential_offload: false,
+            unconditionally_engages_staged_residency: false,
             supports_preview: false,
             supports_streaming: false,
             supports_multi_speaker: false,

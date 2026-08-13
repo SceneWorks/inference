@@ -277,6 +277,7 @@ pub fn descriptor() -> ModelDescriptor {
             supports_kv_cache: false,
             requires_sigma_shift: false,
             supports_sequential_offload: true,
+            unconditionally_engages_staged_residency: false,
             // Per-step latent previews (epic 16948, sc-16957). Both base render lanes — the resident
             // `render_base` and the staged `render_base_sequential` — hand `run_flow_sampler` a
             // projector hook, as does the base half of the name-driven Fun-ControlNet provider. The

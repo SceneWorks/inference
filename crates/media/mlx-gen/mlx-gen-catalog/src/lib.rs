@@ -154,14 +154,24 @@ pub fn selected_video_decode_memory_profile(
 
 /// Resolve the load-bearing VAE geometry for a modelled MLX video generator.
 ///
-/// Each provider owns its id-to-decoder assignment. SVD is intentionally unmodelled in this slice;
-/// Mochi uses a different decode architecture and is outside the video-memory-ladder scope.
+/// Each provider owns its id-to-decoder assignment. SVD is explicitly unmodelled: its MLX decode
+/// path consumes temporal chunks but no `VaeTiling` or spatial planner, so copying the Candle
+/// decoder's 256-channel geometry here would claim an enforcement seam that does not exist. See
+/// [`vae_tiling_unmodelled_reason`]. Mochi uses a different decode architecture and is outside the
+/// video-memory-ladder scope.
 pub fn vae_tiling(provider_id: &str) -> Option<media::gen_core::tiling::VaeTiling> {
     mlx_gen_ltx::vae_tiling(provider_id)
         .or_else(|| mlx_gen_wan::vae_tiling(provider_id))
         .or_else(|| mlx_gen_bernini::vae_tiling(provider_id))
         .or_else(|| mlx_gen_scail2::vae_tiling(provider_id))
         .or_else(|| mlx_gen_krea_realtime::vae_tiling(provider_id))
+}
+
+/// Resolve a provider-owned reason that a registered MLX video route deliberately exposes no VAE
+/// write-bound authority. `None` means either modelled, outside this surface, or unknown; callers
+/// use [`vae_tiling`] for the actual modelled result.
+pub fn vae_tiling_unmodelled_reason(provider_id: &str) -> Option<&'static str> {
+    mlx_gen_svd::vae_tiling_unmodelled_reason(provider_id)
 }
 
 /// Resolve a provider-owned conservative single-pass VAE decode memory profile.
@@ -319,8 +329,18 @@ mod tests {
             );
         }
         assert_eq!(super::vae_tiling(mlx_gen_svd::MODEL_ID), None);
+        assert_eq!(
+            super::vae_tiling_unmodelled_reason(mlx_gen_svd::MODEL_ID),
+            Some(mlx_gen_svd::VAE_TILING_UNMODELLED_REASON),
+            "SVD's missing MLX geometry must be an explicit provider-owned result"
+        );
         assert_eq!(super::vae_tiling(mlx_gen_mochi::MODEL_ID), None);
+        assert_eq!(
+            super::vae_tiling_unmodelled_reason(mlx_gen_mochi::MODEL_ID),
+            None
+        );
         assert_eq!(super::vae_tiling("not_a_provider"), None);
+        assert_eq!(super::vae_tiling_unmodelled_reason("not_a_provider"), None);
         for provider_id in [
             mlx_gen_svd::MODEL_ID,
             mlx_gen_mochi::MODEL_ID,

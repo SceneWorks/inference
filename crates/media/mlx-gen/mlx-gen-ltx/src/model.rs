@@ -270,6 +270,10 @@ pub fn descriptor() -> ModelDescriptor {
             requires_sigma_shift: false,
             // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
             supports_sequential_offload: false,
+            // sc-18816: every generate builds/evaluates/drops Gemma before materializing the AvDiT,
+            // then drops the AvDiT before VAE/audio decode. This is physical default behavior, not a
+            // selectable Sequential control and not an evidence-composition edge.
+            unconditionally_engages_staged_residency: true,
             supports_preview: false,
             supports_streaming: false,
             supports_multi_speaker: false,
@@ -1405,6 +1409,16 @@ mod tests {
         assert!(
             caps.schedulers.is_empty(),
             "LTX is sampler-only (no scheduler axis — the distilled schedule is baked)"
+        );
+    }
+
+    #[test]
+    fn descriptor_declares_unconditional_staging_without_selectable_sequential_control() {
+        let caps = descriptor().capabilities;
+        assert!(!caps.supports_sequential_offload);
+        assert_eq!(
+            caps.staged_residency_availability(),
+            mlx_gen::StagedResidencyAvailability::UnconditionallyEngaged
         );
     }
 

@@ -5,7 +5,7 @@ pub use candle_audio_catalog::audio;
 #[cfg(feature = "media")]
 pub use mlx_gen_catalog::media;
 #[cfg(feature = "media")]
-pub use mlx_gen_catalog::vae_tiling;
+pub use mlx_gen_catalog::{vae_tiling, vae_tiling_unmodelled_reason};
 pub use mlx_llm as llm;
 pub use runtime_catalog::{
     core_llm, gen_core, memory_strategy, RuntimeCatalog, RuntimeCatalogSnapshot,
@@ -163,6 +163,14 @@ mod tests {
                 profile.resident_decoder_bytes_included(),
             )),
             Some((322_633_728, 0))
+        );
+
+        assert_eq!(super::vae_tiling("svd_xt"), None);
+        assert_eq!(
+            super::vae_tiling_unmodelled_reason("svd_xt"),
+            Some(super::providers::svd::VAE_TILING_UNMODELLED_REASON),
+            "the shipped MLX SVD route must remain explicitly unmodelled until its decoder has a \
+             load-bearing spatial planner"
         );
     }
 

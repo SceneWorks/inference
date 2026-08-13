@@ -2016,7 +2016,7 @@ mod v3_amendment_tests {
         },
         ComponentLicense {
             component: "dfn5b_clip",
-            source_url: "https://example.invalid/DFN5B-CLIP-ViT-H-14-384",
+            source_url: "https://example.invalid/DFN5B-CLIP-ViT-H-14-378",
             gated: false,
             declared: "apple-ascl",
             family: "apple-mlr",

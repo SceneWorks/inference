@@ -925,6 +925,7 @@ pub fn descriptor() -> ModelDescriptor {
             // frees the dense DiT before the VAE loads, bounding the pre-decode peak. Advertised so the
             // worker's fit-gate can tell "bounds peak here" from a no-op fallback.
             supports_sequential_offload: true,
+            unconditionally_engages_staged_residency: false,
             supports_preview: false,
             supports_streaming: false,
             supports_multi_speaker: false,
@@ -1475,6 +1476,17 @@ mod tests {
         assert!(
             descriptor().capabilities.supports_sequential_offload,
             "the TI2V-5B must advertise sequential offload (sc-12757)"
+        );
+    }
+
+    #[test]
+    fn descriptor_classifies_staging_as_selectable_not_unconditional() {
+        let caps = descriptor().capabilities;
+        assert!(!caps.unconditionally_engages_staged_residency);
+        assert!(caps.supports_sequential_offload);
+        assert_eq!(
+            caps.staged_residency_availability(),
+            candle_gen::gen_core::StagedResidencyAvailability::Selectable
         );
     }
 

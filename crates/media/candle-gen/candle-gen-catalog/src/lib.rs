@@ -89,13 +89,14 @@ pub fn provider_registry() -> candle_gen::gen_core::Result<ProviderRegistry> {
 
 /// Resolve the load-bearing VAE geometry for a modelled Candle video generator.
 ///
-/// Each provider owns its id-to-decoder assignment. SVD is intentionally unmodelled in this slice;
-/// Mochi uses a different decode architecture and is outside the video-memory-ladder scope.
+/// Each provider owns its id-to-decoder assignment. Mochi uses a different decode architecture and
+/// is outside the video-memory-ladder scope.
 pub fn vae_tiling(provider_id: &str) -> Option<media::gen_core::tiling::VaeTiling> {
     candle_gen_ltx::vae_tiling(provider_id)
         .or_else(|| candle_gen_wan::vae_tiling(provider_id))
         .or_else(|| candle_gen_bernini::vae_tiling(provider_id))
         .or_else(|| candle_gen_scail2::vae_tiling(provider_id))
+        .or_else(|| candle_gen_svd::vae_tiling(provider_id))
 }
 
 /// Resolve a provider-owned conservative single-pass VAE decode memory profile.
@@ -107,7 +108,11 @@ pub fn vae_tiling(provider_id: &str) -> Option<media::gen_core::tiling::VaeTilin
 /// [`media::VideoDecodeMemoryProfile::checked_composed_peak`] for checked composition and any declared
 /// substitution. With LTX's zero attribution the whole mixed floor is deliberately preserved, even
 /// though that may conservatively overlap a contract decoder charge. Unsupported ids, zero
-/// dimensions, and arithmetic overflow return `None`.
+/// dimensions, and arithmetic overflow return `None`. SVD currently exports its exact tiling
+/// geometry but not a profile here: its actual peak depends on both the request's decode-chunk size
+/// and its live-free-VRAM tile selection. SceneWorks' 8-frame product chunk is below the 14-frame
+/// write cap at both shipped SVD geometries, while the provider library's 25-frame default is over
+/// it; publishing one budget-independent scalar would conflate those regimes.
 pub fn conservative_video_decode_memory_profile(
     provider_id: &str,
     width: u32,
@@ -3765,42 +3770,47 @@ mod tests {
             (
                 candle_gen_ltx::config::MODEL_ID,
                 candle_gen_ltx::VAE_TILING,
-                2_725_804_800,
+                Some(2_725_804_800),
             ),
             (
                 candle_gen_wan::config::MODEL_ID,
                 candle_gen_wan::WAN_Z48_VAE_TILING,
-                382_730_240,
+                Some(382_730_240),
             ),
             (
                 candle_gen_wan::config::MODEL_ID_T2V_14B,
                 candle_gen_wan::WAN_Z16_VAE_TILING,
-                265_830_400,
+                Some(265_830_400),
             ),
             (
                 candle_gen_wan::config::MODEL_ID_I2V_14B,
                 candle_gen_wan::WAN_Z16_VAE_TILING,
-                265_830_400,
+                Some(265_830_400),
             ),
             (
                 candle_gen_wan::config::MODEL_ID_VACE,
                 candle_gen_wan::WAN_Z16_VAE_TILING,
-                265_830_400,
+                Some(265_830_400),
             ),
             (
                 candle_gen_bernini::MODEL_ID,
                 candle_gen_bernini::VAE_TILING,
-                265_830_400,
+                Some(265_830_400),
             ),
             (
                 candle_gen_bernini::bernini::MODEL_ID,
                 candle_gen_bernini::VAE_TILING,
-                265_830_400,
+                Some(265_830_400),
             ),
             (
                 candle_gen_scail2::MODEL_ID,
                 candle_gen_scail2::VAE_TILING,
-                265_830_400,
+                Some(265_830_400),
+            ),
+            (
+                candle_gen_svd::config::MODEL_ID,
+                candle_gen_svd::VAE_TILING,
+                None,
             ),
         ];
 
@@ -3817,12 +3827,11 @@ mod tests {
             assert_eq!(
                 super::conservative_video_decode_memory_profile(provider_id, 64, 64, 9)
                     .map(|profile| profile.working_set_bytes()),
-                Some(peak_bytes),
+                peak_bytes,
                 "{provider_id}"
             );
         }
         assert_eq!(super::vae_tiling("ltx_2_3"), None);
-        assert_eq!(super::vae_tiling(candle_gen_svd::config::MODEL_ID), None);
         assert_eq!(super::vae_tiling(candle_gen_mochi::MODEL_ID), None);
         assert_eq!(super::vae_tiling("wan2_2_vace_fun_14b"), None);
         assert_eq!(super::vae_tiling("krea_realtime_14b"), None);
