@@ -155,6 +155,17 @@ pub fn renoise(latents: &Array, noise: &Array, noise_scale: f32) -> Result<Array
 /// a **catchable** error here instead of SIGKILLing the process inside a single-pass full-video decode.
 /// Small outputs select `None` → the original single-pass `decode` (byte-identical to before).
 pub fn decode_to_frames(vae: &LtxVideoVae, latents: &Array, cancel: &CancelFlag) -> Result<Array> {
+    decode_to_frames_with_tiling(vae, latents, cancel, None)
+}
+
+/// Decode with an explicitly admitted spatial tile when the shared memory ladder selected rung 2.
+/// `None` preserves the historical budget-driven auto selector byte-for-byte.
+pub(crate) fn decode_to_frames_with_tiling(
+    vae: &LtxVideoVae,
+    latents: &Array,
+    cancel: &CancelFlag,
+    selected_tiling: Option<&TilingConfig>,
+) -> Result<Array> {
     let sh = latents.shape(); // (B, 128, T_lat, H_lat, W_lat)
     let (t_lat, h_lat, w_lat) = (sh[2], sh[3], sh[4]);
     let out_f = 1 + (t_lat - 1) * TEMPORAL_SCALE as i32;
@@ -165,7 +176,11 @@ pub fn decode_to_frames(vae: &LtxVideoVae, latents: &Array, cancel: &CancelFlag)
     if cancel.is_cancelled() {
         return Err(Error::Canceled);
     }
-    let decoded = match auto_tiling_budgeted_ltx(out_h, out_w, out_f)? {
+    let selected = match selected_tiling {
+        Some(config) => Some(*config),
+        None => auto_tiling_budgeted_ltx(out_h, out_w, out_f)?,
+    };
+    let decoded = match selected {
         Some(cfg) => vae.decode_tiled(latents, &cfg, cancel)?,
         None => vae.decode(latents)?,
     };
@@ -227,7 +242,7 @@ const LTX_VAE_ACCUM_BYTES_PER_VOXEL: f64 = 40.0;
 const LTX_VAE_TILE_BYTES_PER_OUT_VOXEL: f64 = 300.0;
 
 /// Candidate spatial tile sizes (output px, multiples of the LTX ×32 spatial scale, overlap 64).
-const LTX_VAE_SPATIAL_PX: [i32; 8] = [768, 640, 512, 448, 384, 320, 256, 192];
+pub(crate) const LTX_VAE_SPATIAL_PX: [i32; 8] = [768, 640, 512, 448, 384, 320, 256, 192];
 /// Candidate temporal tiles `(tile_frames, overlap_frames)` in output frames (the causal decoder maps
 /// `tile_frames/8` latent frames per tile).
 const LTX_VAE_TEMPORAL_FR: [(i32, i32); 4] = [(96, 24), (64, 16), (48, 16), (24, 8)];
@@ -265,6 +280,70 @@ pub fn auto_tiling_budgeted_ltx(
     const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
     let budget_gib = get_memory_limit() as f64 / GIB;
     plan_ltx_tiling(height, width, out_frames, budget_gib * 0.85)
+}
+
+/// Budget the exact spatial tile admitted by the shared memory contract while retaining LTX's
+/// shipped temporal candidate search. A spatial-only override is unsafe for long clips: it can erase
+/// the temporal bound selected by [`auto_tiling_budgeted_ltx`]. If the admitted edge cannot fit even
+/// with a production temporal tile, this fails before decode instead of silently choosing a smaller
+/// spatial parameter than the contract selected.
+pub(crate) fn selected_tiling_budgeted_ltx(
+    height: i32,
+    width: i32,
+    out_frames: i32,
+    tile_edge: i32,
+    overlap: i32,
+) -> Result<TilingConfig> {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let safe_gib = get_memory_limit() as f64 / GIB * 0.85;
+    plan_ltx_tiling_for_selected_spatial(height, width, out_frames, safe_gib, tile_edge, overlap)
+}
+
+fn plan_ltx_tiling_for_selected_spatial(
+    height: i32,
+    width: i32,
+    out_frames: i32,
+    safe_gib: f64,
+    tile_edge: i32,
+    overlap: i32,
+) -> Result<TilingConfig> {
+    let spatial = [tile_edge];
+    let candidates = TileCandidates {
+        spatial_px: &spatial,
+        spatial_overlap_px: overlap,
+        temporal: &LTX_VAE_TEMPORAL_FR,
+        temporal_overlap_policy: mlx_gen::tiling::TemporalOverlapPolicy::HalfTile,
+    };
+    let selected_edge = tile_edge as i64;
+    let plan = budgeted_plan(
+        VaeTiling::LTX,
+        height,
+        width,
+        out_frames,
+        safe_gib,
+        candidates,
+        |out_f, out_h, out_w, tile_f, tile_h, tile_w| {
+            // `budgeted_plan` always includes the full spatial extent as a no-spatial-tiling
+            // candidate. Make that candidate unaffordable when it exceeds the admitted edge, while
+            // preserving the zero-tile accumulator probe.
+            if tile_f != 0 && (tile_h > selected_edge || tile_w > selected_edge) {
+                f64::INFINITY
+            } else {
+                estimated_ltx_decode_peak_gib(out_f, out_h, out_w, tile_f, tile_h, tile_w)
+            }
+        },
+    )
+    .map_err(|error| ltx_decode_budget_error(width, height, out_frames, error))?;
+
+    let mut config = plan.unwrap_or_default();
+    // Even when the entire output is no larger than the selected edge, route through `decode_tiled`
+    // as requested. The resulting one-tile spatial plan is equivalent but keeps the selected carrier
+    // observable instead of silently falling back to the ordinary decode.
+    config.spatial = Some(mlx_gen::tiling::SpatialTiling {
+        tile_px: tile_edge,
+        overlap_px: overlap,
+    });
+    Ok(config)
 }
 
 /// Pure LTX tile selector behind [`auto_tiling_budgeted_ltx`] (the `safe_gib` ceiling is injected so it
@@ -1318,6 +1397,22 @@ mod tests {
             peak <= safe,
             "ltx chosen peak {peak:.1} GiB over safe {safe:.1}"
         );
+    }
+
+    #[test]
+    fn selected_spatial_tile_keeps_the_budgeted_temporal_bound_for_long_clips() {
+        let safe = 25.0;
+        let cfg = plan_ltx_tiling_for_selected_spatial(512, 768, 1025, safe, 512, 64)
+            .expect("the admitted spatial edge plus a production temporal tile must fit");
+        let spatial = cfg
+            .spatial
+            .expect("selected spatial edge must remain explicit");
+        assert_eq!((spatial.tile_px, spatial.overlap_px), (512, 64));
+        assert!(
+            cfg.temporal.is_some(),
+            "the long clip must retain a temporal bound: {cfg:?}"
+        );
+        assert!(ltx_chosen_peak(&cfg, 512, 768, 1025) <= safe);
     }
 
     /// **sc-15325 — the LTX temporal candidate grid can no longer starve the decoder.**
