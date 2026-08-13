@@ -46,9 +46,10 @@ name: Real-weight validation
 # enforcement: it fails closed with a named error on a cache miss, so a box that quietly loses its
 # copy surfaces as a red `mlx-media`, never a wrong oracle.
 
-# `rw-sa3` stores nothing between runs (it materializes into `RUNNER_TEMP`), so it is the free
-# rebalancing knob: move it to shift ~83 min of wall clock without moving a single stored byte.
-# It does need the runner-local Hugging Face credential for the six gated `stabilityai/*` repos.
+# `rw-sa3` materializes its SA3/SAME rows into `RUNNER_TEMP`, but SC-18315 also uses that label to
+# select `nax-macos`, where the F3 Krea/Wan decoder inputs are operator-provisioned. Moving the label
+# now requires moving those inputs too. It also needs the runner-local Hugging Face credential for
+# the six gated `stabilityai/*` repos.
 #
 # The sc-17284 Qwen/FLUX set is the largest row here and it transferred almost nothing: all of it
 # but the two ~0.85 GB Lightning LoRAs was already resident. "Already there" is still not "free" —
