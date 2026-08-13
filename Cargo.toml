@@ -49,8 +49,8 @@ candle-audio-catalog = { path = "crates/audio/candle-audio-catalog" }
 # Metal, CUDA, and no-GPU backend definitions, and fail-closed Metal ABI/index/dispatch admission on top of the
 # collision-free retained compiler leases and safe TLS teardown while preserving MLX 0.32.0.
 # See mlx-gen/Cargo.toml for lineage.
-mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "a858aaa138200684fbc928c57cf1cfa6373cd7b6" }
-mlx-sys = { package = "pmetal-mlx-sys", git = "https://github.com/michaeltrefry/mlx-rs", rev = "a858aaa138200684fbc928c57cf1cfa6373cd7b6" }
+mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "7151a9b27921c6198fd8dfb493dee21db4dcdfcc" }
+mlx-sys = { package = "pmetal-mlx-sys", git = "https://github.com/michaeltrefry/mlx-rs", rev = "7151a9b27921c6198fd8dfb493dee21db4dcdfcc" }
 
 # Candle pins are shared by media and LLM providers.
 # Upstream PR #3531 removes O(groups) launches from unit-stride depthwise convs (sc-12111).
