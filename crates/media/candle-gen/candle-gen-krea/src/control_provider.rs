@@ -192,6 +192,8 @@ struct Krea2ControlHeavy {
 pub struct Krea2Control {
     device: Device,
     residency: candle_gen::Residency<Krea2ControlText, Krea2ControlHeavy>,
+    /// Complete caller-prepared identity retained for deferred warm/staged materialization.
+    prepared_spec: Option<candle_gen::gen_core::LoadSpec>,
 }
 
 impl Krea2Control {
@@ -238,7 +240,11 @@ impl Krea2Control {
                 )
             },
         );
-        Ok(Self { device, residency })
+        Ok(Self {
+            device,
+            residency,
+            prepared_spec: None,
+        })
     }
 
     /// Load from the exact caller-prepared specification.
@@ -253,7 +259,7 @@ impl Krea2Control {
         spec: &candle_gen::gen_core::LoadSpec,
     ) -> Result<Self> {
         validate_spec_root(&paths.root, spec, "krea control")?;
-        spec.read_prepared_files_unchanged(|| {
+        let mut model = spec.read_prepared_files_unchanged(|| {
             let control = required_source_path(spec.control.as_ref(), "krea control overlay")?;
             let convrot_dit = spec
                 .components
@@ -272,7 +278,9 @@ impl Krea2Control {
                 },
                 spec.text_encoder.clone(),
             )
-        })
+        })?;
+        model.prepared_spec = Some(spec.clone());
+        Ok(model)
     }
 
     /// Generate one strict-pose-conditioned image from a rendered OpenPose skeleton. The control image
@@ -284,19 +292,32 @@ impl Krea2Control {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
         validate_request(req)?;
-        self.residency.run_request_scoped(
-            req.stage_residency,
-            false,
-            &req.cancel,
-            false,
-            on_progress,
-            |text| text.encode(req),
-            |_| Ok(self.device.synchronize()?),
-            |heavy, context, on_progress| {
-                let result = heavy.render(&self.device, req, control_image, context, on_progress);
-                candle_gen::synchronize_result(&self.device, result)
-            },
-        )
+        read_with_prepared_spec(self.prepared_spec.as_ref(), || {
+            self.residency.run_request_scoped(
+                req.stage_residency,
+                false,
+                &req.cancel,
+                false,
+                on_progress,
+                |text| text.encode(req),
+                |_| Ok(self.device.synchronize()?),
+                |heavy, context, on_progress| {
+                    let result =
+                        heavy.render(&self.device, req, control_image, context, on_progress);
+                    candle_gen::synchronize_result(&self.device, result)
+                },
+            )
+        })
+    }
+}
+
+fn read_with_prepared_spec<T>(
+    spec: Option<&candle_gen::gen_core::LoadSpec>,
+    read: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    match spec {
+        Some(spec) => spec.read_prepared_files_unchanged(read),
+        None => read(),
     }
 }
 
@@ -617,6 +638,57 @@ mod tests {
             .with_resident_parts(|_, _| ())
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn post_construction_control_mutation_fails_before_deferred_materialization() {
+        let (fixture, mut paths) = validation_complete_paths(OffloadPolicy::Resident);
+        let control = fixture.path().join("control.safetensors");
+        std::fs::write(&control, b"before").unwrap();
+        paths.control = control.clone();
+
+        let selected = WeightsSource::Dir(fixture.path().join("text_encoder"));
+        let validated = crate::ENCODER_CONTRACT
+            .validate_source_against_base(&selected, fixture.path())
+            .unwrap();
+        let mut spec =
+            candle_gen::gen_core::LoadSpec::new(WeightsSource::Dir(fixture.path().to_path_buf()))
+                .with_control(WeightsSource::File(control.clone()));
+        validated.prepare_load_spec(&mut spec).unwrap();
+        let model = Krea2Control::load_with_spec(&paths, &spec)
+            .expect("sparse fixture construction must retain deferred loaders");
+
+        std::fs::write(&control, b"after!").unwrap();
+        let request = Krea2ControlRequest {
+            prompt: "a dancer".into(),
+            width: SIZE_MULTIPLE,
+            height: SIZE_MULTIPLE,
+            steps: 1,
+            ..Default::default()
+        };
+        let control_image = Image {
+            width: SIZE_MULTIPLE,
+            height: SIZE_MULTIPLE,
+            pixels: vec![0; (SIZE_MULTIPLE * SIZE_MULTIPLE * 3) as usize],
+        };
+        let progress_called = std::cell::Cell::new(false);
+        let error = model
+            .generate(&request, &control_image, &mut |_| progress_called.set(true))
+            .expect_err("mutated control must fail before the first deferred materializer")
+            .to_string();
+        assert!(
+            error.contains("receipt changed") || error.contains("pinned weights"),
+            "unexpected mutation error: {error}"
+        );
+        assert!(!progress_called.get(), "materialization emitted progress");
+        assert!(
+            model
+                .residency
+                .with_resident_parts(|_, _| ())
+                .unwrap()
+                .is_none(),
+            "the warm deferred loader ran before the retained receipt rejected mutation"
+        );
     }
 
     /// SC-16453: the immutable ConvRot file must survive the provider-path boundary and select the

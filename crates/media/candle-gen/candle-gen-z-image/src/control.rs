@@ -567,6 +567,8 @@ pub struct ZImageControl {
     /// Z-Image's latent space is FLUX.1's; PiD's `zimage-turbo` tag aliases the `flux` checkpoint (same tag
     /// as the base Z-Image provider).
     pid: Option<PidEngine>,
+    /// Complete caller-prepared identity retained through staged request materialization.
+    prepared_spec: Option<candle_gen::gen_core::LoadSpec>,
 }
 
 impl ZImageControl {
@@ -620,6 +622,7 @@ impl ZImageControl {
             vae_shift: vae_cfg.shift_factor,
             vae_scale: vae_cfg.scaling_factor,
             pid: None,
+            prepared_spec: None,
         })
     }
 
@@ -646,6 +649,7 @@ impl ZImageControl {
             vae_shift: vae_cfg.shift_factor,
             vae_scale: vae_cfg.scaling_factor,
             pid: None,
+            prepared_spec: None,
         })
     }
 
@@ -679,7 +683,7 @@ impl ZImageControl {
                 ));
             }
         }
-        spec.read_prepared_files_unchanged(|| {
+        let mut model = spec.read_prepared_files_unchanged(|| {
             let control = match spec.control.as_ref() {
                 Some(WeightsSource::Dir(path) | WeightsSource::File(path)) => path.clone(),
                 None => {
@@ -697,7 +701,9 @@ impl ZImageControl {
                 },
                 memory,
             )
-        })
+        })?;
+        model.prepared_spec = Some(spec.clone());
+        Ok(model)
     }
 
     /// Attach the optional PiD super-resolving decoder (epic 7840, sc-8044). Same [`PidWeights`] load-spec
@@ -708,7 +714,11 @@ impl ZImageControl {
     pub fn with_pid(mut self, pid: &PidWeights) -> Result<Self> {
         // Z-Image reuses the FLUX.1 latent space; `zimage-turbo` aliases the `flux` PiD checkpoint (the
         // base Z-Image provider's `pipeline::PID_BACKBONE`).
-        self.pid = Some(PidEngine::from_spec(pid, "zimage-turbo", &self.device)?);
+        validate_prepared_pid(self.prepared_spec.as_ref(), pid, "z-image control")?;
+        self.pid = Some(read_with_prepared_spec(
+            self.prepared_spec.as_ref(),
+            || PidEngine::from_spec(pid, "zimage-turbo", &self.device),
+        )?);
         Ok(self)
     }
 
@@ -1045,23 +1055,25 @@ impl ZImageControl {
         skeleton: &Image,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
-        if req.cancel.is_cancelled() {
-            return Err(CandleError::Canceled);
-        }
-        if self.transformer.is_none() {
-            if !req.memory.stage_residency {
-                return Err(CandleError::Msg(
-                    "z-image control was phase-loaded but the request did not select staged residency"
-                        .into(),
-                ));
+        read_with_prepared_spec(self.prepared_spec.as_ref(), || {
+            if req.cancel.is_cancelled() {
+                return Err(CandleError::Canceled);
             }
-            return self.generate_staged(req, skeleton, on_progress);
-        }
-        if self.base {
-            self.generate_base(req, skeleton, on_progress)
-        } else {
-            self.generate_turbo(req, skeleton, on_progress)
-        }
+            if self.transformer.is_none() {
+                if !req.memory.stage_residency {
+                    return Err(CandleError::Msg(
+                        "z-image control was phase-loaded but the request did not select staged residency"
+                            .into(),
+                    ));
+                }
+                return self.generate_staged(req, skeleton, on_progress);
+            }
+            if self.base {
+                self.generate_base(req, skeleton, on_progress)
+            } else {
+                self.generate_turbo(req, skeleton, on_progress)
+            }
+        })
     }
 
     /// The original **Turbo** (distilled, no-CFG) control denoise — condition Z-Image-Turbo on the
@@ -1377,6 +1389,37 @@ impl ZImageControl {
     }
 }
 
+fn read_with_prepared_spec<T>(
+    spec: Option<&candle_gen::gen_core::LoadSpec>,
+    read: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    match spec {
+        Some(spec) => spec.read_prepared_files_unchanged(read),
+        None => read(),
+    }
+}
+
+fn validate_prepared_pid(
+    spec: Option<&candle_gen::gen_core::LoadSpec>,
+    requested: &PidWeights,
+    label: &str,
+) -> Result<()> {
+    let Some(spec) = spec else {
+        return Ok(());
+    };
+    let admitted = spec.pid.as_ref().ok_or_else(|| {
+        CandleError::Msg(format!(
+            "{label}: cannot attach PiD outside the prepared load specification"
+        ))
+    })?;
+    if admitted.checkpoint != requested.checkpoint || admitted.gemma != requested.gemma {
+        return Err(CandleError::Msg(format!(
+            "{label}: requested PiD weights differ from the prepared load specification"
+        )));
+    }
+    Ok(())
+}
+
 fn control_pipeline(paths: &ZImageControlPaths, device: &Device) -> Result<Pipeline> {
     let builtin = WeightsSource::Dir(paths.snapshot.join("text_encoder"));
     let source = paths.text_encoder.as_ref().unwrap_or(&builtin);
@@ -1480,6 +1523,83 @@ mod tests {
         gen_core_testkit::write_encoder_contract_fixture(encoder.path(), crate::ENCODER_CONTRACT)
             .unwrap();
         encoder
+    }
+
+    #[test]
+    fn prepared_control_pid_binding_accepts_exact_and_rejects_missing_or_mismatch() {
+        let admitted = PidWeights {
+            checkpoint: WeightsSource::File(PathBuf::from("pid.safetensors")),
+            gemma: WeightsSource::Dir(PathBuf::from("gemma")),
+        };
+        let mut spec =
+            candle_gen::gen_core::LoadSpec::new(WeightsSource::Dir(PathBuf::from("/z-image")));
+        spec.pid = Some(admitted.clone());
+        assert!(validate_prepared_pid(Some(&spec), &admitted, "z-image control").is_ok());
+
+        let mismatched = PidWeights {
+            checkpoint: WeightsSource::File(PathBuf::from("other-pid.safetensors")),
+            gemma: admitted.gemma.clone(),
+        };
+        assert!(validate_prepared_pid(Some(&spec), &mismatched, "z-image control").is_err());
+        let no_pid =
+            candle_gen::gen_core::LoadSpec::new(WeightsSource::Dir(PathBuf::from("/z-image")));
+        assert!(validate_prepared_pid(Some(&no_pid), &admitted, "z-image control").is_err());
+        assert!(validate_prepared_pid(None, &admitted, "z-image control").is_ok());
+    }
+
+    #[test]
+    fn post_construction_pid_mutation_fails_before_pid_materialization() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("base");
+        let control = fixture.path().join("control.safetensors");
+        let pid_checkpoint = fixture.path().join("pid.safetensors");
+        let gemma = fixture.path().join("gemma");
+        gen_core_testkit::write_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            crate::ENCODER_CONTRACT,
+        )
+        .unwrap();
+        std::fs::write(&control, b"control").unwrap();
+        std::fs::write(&pid_checkpoint, b"before").unwrap();
+        std::fs::create_dir_all(&gemma).unwrap();
+
+        let selected = WeightsSource::Dir(root.join("text_encoder"));
+        let validated = crate::ENCODER_CONTRACT
+            .validate_source_against_base(&selected, &root)
+            .unwrap();
+        let admitted_pid = PidWeights {
+            checkpoint: WeightsSource::File(pid_checkpoint.clone()),
+            gemma: WeightsSource::Dir(gemma),
+        };
+        let mut spec = candle_gen::gen_core::LoadSpec::new(WeightsSource::Dir(root.clone()))
+            .with_control(WeightsSource::File(control.clone()));
+        spec.pid = Some(admitted_pid.clone());
+        validated.prepare_load_spec(&mut spec).unwrap();
+        let model = ZImageControl::load_with_memory_spec(
+            &ZImageControlPaths {
+                snapshot: root,
+                text_encoder: None,
+                control,
+                base: false,
+            },
+            &spec,
+            GenerationMemory {
+                stage_residency: true,
+                ..Default::default()
+            },
+        )
+        .expect("staged construction must retain the prepared PiD receipt");
+
+        std::fs::write(&pid_checkpoint, b"after!").unwrap();
+        let error = model
+            .with_pid(&admitted_pid)
+            .err()
+            .expect("mutated PiD must fail before its materializer")
+            .to_string();
+        assert!(
+            error.contains("receipt changed") || error.contains("pinned weights"),
+            "unexpected mutation error: {error}"
+        );
     }
 
     #[test]

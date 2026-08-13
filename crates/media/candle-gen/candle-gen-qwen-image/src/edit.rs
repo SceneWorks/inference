@@ -326,6 +326,8 @@ pub struct QwenEdit {
     processor: QwenImageProcessor,
     tokenizer: TextTokenizer,
     zero_cond_t: bool,
+    /// Complete caller-prepared identity retained across request-scoped deferred loads.
+    prepared_spec: Option<candle_gen::gen_core::LoadSpec>,
 }
 
 struct EditText {
@@ -459,6 +461,7 @@ impl QwenEdit {
             stream_cancel,
             processor: QwenImageProcessor::default(),
             tokenizer,
+            prepared_spec: None,
         })
     }
 
@@ -482,14 +485,16 @@ impl QwenEdit {
                 ));
             }
         }
-        spec.read_prepared_files_unchanged(|| {
+        let mut model = spec.read_prepared_files_unchanged(|| {
             Self::load(&QwenEditPaths {
                 root: paths.root.clone(),
                 text_encoder: spec.text_encoder.clone(),
                 adapters: spec.adapters.clone(),
                 offload_policy: paths.offload_policy,
             })
-        })
+        })?;
+        model.prepared_spec = Some(spec.clone());
+        Ok(model)
     }
 
     /// VL-encode one prompt against the precomputed `vision` embeds → `[1, S−64, 3584]` at the DiT
@@ -715,39 +720,55 @@ impl QwenEdit {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
         let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
-        *candle_gen::lock_recover(&self.stream_cancel) = req.cancel.clone();
-        let memory = req.memory.unwrap_or_default();
-        let stage_residency = req.stage_residency || memory.stage_residency;
-        if (memory.tile_vae_decode || memory.chunk_attention || memory.stream_transformer_blocks)
-            && !stage_residency
-        {
-            return Err(CandleError::Msg(
-                "qwen edit: bounded decode, attention, and transformer residency require request-scoped staged residency"
-                    .into(),
-            ));
-        }
-        self.residency.run_request_scoped(
-            stage_residency,
-            memory.stream_transformer_blocks,
-            &req.cancel,
-            false,
-            on_progress,
-            |text| self.encode_conditioning(&text.vl_encoder, &text.vae_encoder, req, references),
-            |_| Ok(self.device.synchronize()?),
-            |heavy, (pos, neg, static_latents, cond_grids), on_progress| {
-                let result = self.denoise_and_decode(
-                    &heavy.transformer,
-                    &heavy.vae,
-                    req,
-                    &pos,
-                    neg.as_ref(),
-                    &static_latents,
-                    &cond_grids,
-                    on_progress,
-                );
-                candle_gen::synchronize_result(&self.device, result)
-            },
-        )
+        read_with_prepared_spec(self.prepared_spec.as_ref(), || {
+            *candle_gen::lock_recover(&self.stream_cancel) = req.cancel.clone();
+            let memory = req.memory.unwrap_or_default();
+            let stage_residency = req.stage_residency || memory.stage_residency;
+            if (memory.tile_vae_decode
+                || memory.chunk_attention
+                || memory.stream_transformer_blocks)
+                && !stage_residency
+            {
+                return Err(CandleError::Msg(
+                    "qwen edit: bounded decode, attention, and transformer residency require request-scoped staged residency"
+                        .into(),
+                ));
+            }
+            self.residency.run_request_scoped(
+                stage_residency,
+                memory.stream_transformer_blocks,
+                &req.cancel,
+                false,
+                on_progress,
+                |text| {
+                    self.encode_conditioning(&text.vl_encoder, &text.vae_encoder, req, references)
+                },
+                |_| Ok(self.device.synchronize()?),
+                |heavy, (pos, neg, static_latents, cond_grids), on_progress| {
+                    let result = self.denoise_and_decode(
+                        &heavy.transformer,
+                        &heavy.vae,
+                        req,
+                        &pos,
+                        neg.as_ref(),
+                        &static_latents,
+                        &cond_grids,
+                        on_progress,
+                    );
+                    candle_gen::synchronize_result(&self.device, result)
+                },
+            )
+        })
+    }
+}
+
+fn read_with_prepared_spec<T>(
+    spec: Option<&candle_gen::gen_core::LoadSpec>,
+    read: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    match spec {
+        Some(spec) => spec.read_prepared_files_unchanged(read),
+        None => read(),
     }
 }
 

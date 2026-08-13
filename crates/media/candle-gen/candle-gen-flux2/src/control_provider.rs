@@ -120,6 +120,8 @@ pub struct Flux2Control {
     /// FLUX.2 control composes the FLUX.2 VAE, so it loads the SAME `flux2` student ([`PID_BACKBONE`]) as
     /// the registered FLUX.2 provider.
     pid: Option<PidEngine>,
+    /// Complete caller-prepared identity retained across deferred request materialization.
+    prepared_spec: Option<candle_gen::gen_core::LoadSpec>,
 }
 
 impl Flux2Control {
@@ -140,7 +142,7 @@ impl Flux2Control {
             candle_gen::gen_core::WeightsSource::Dir(paths.root.clone()),
         );
         spec.quantize = quant;
-        Self::load_with_memory_spec(paths, quant, &spec, memory)
+        Self::load_with_memory_spec_inner(paths, quant, &spec, memory)
     }
 
     /// Load without a request-scoped ladder context while preserving the complete caller-authored
@@ -152,9 +154,11 @@ impl Flux2Control {
         spec: &candle_gen::gen_core::LoadSpec,
         memory: GenerationMemory,
     ) -> Result<Self> {
-        spec.read_prepared_files_unchanged(|| {
+        let mut model = spec.read_prepared_files_unchanged(|| {
             Self::load_with_memory_spec_inner(paths, quant, spec, memory)
-        })
+        })?;
+        model.prepared_spec = Some(spec.clone());
+        Ok(model)
     }
 
     fn load_with_memory_spec_inner(
@@ -249,6 +253,7 @@ impl Flux2Control {
             admitted_context,
             lifecycle: std::sync::Mutex::new(()),
             pid: None,
+            prepared_spec: None,
         })
     }
 
@@ -258,9 +263,11 @@ impl Flux2Control {
         spec: &candle_gen::gen_core::LoadSpec,
         context: &candle_gen::gen_core::MemoryRunContext,
     ) -> Result<Self> {
-        spec.read_prepared_files_unchanged(|| {
+        let mut model = spec.read_prepared_files_unchanged(|| {
             Self::load_with_memory_context_inner(paths, quant, spec, context)
-        })
+        })?;
+        model.prepared_spec = Some(spec.clone());
+        Ok(model)
     }
 
     fn load_with_memory_context_inner(
@@ -313,7 +320,11 @@ impl Flux2Control {
     /// `PID_BACKBONE` (`flux2`) student. A `use_pid = true` request then decodes through it (4× SR)
     /// instead of the native VAE; without it, `use_pid` errors loudly. Call after [`load`](Self::load).
     pub fn with_pid(mut self, pid: &PidWeights) -> Result<Self> {
-        self.pid = Some(PidEngine::from_spec(pid, PID_BACKBONE, &self.pipe.device)?);
+        validate_prepared_pid(self.prepared_spec.as_ref(), pid, "flux2 control")?;
+        self.pid = Some(read_with_prepared_spec(
+            self.prepared_spec.as_ref(),
+            || PidEngine::from_spec(pid, PID_BACKBONE, &self.pipe.device),
+        )?);
         Ok(self)
     }
 
@@ -349,13 +360,18 @@ impl Flux2Control {
         crate::run_bespoke_request(
             &self.lifecycle,
             || {
-                ensure_ordinary_generate_allowed(self.admitted_context.as_ref(), "flux2 control")?;
-                validate_memory_authority(
-                    self.memory,
-                    self.admitted_context.as_ref(),
-                    "flux2 control",
-                )?;
-                self.generate_inner(req, control_image, on_progress)
+                read_with_prepared_spec(self.prepared_spec.as_ref(), || {
+                    ensure_ordinary_generate_allowed(
+                        self.admitted_context.as_ref(),
+                        "flux2 control",
+                    )?;
+                    validate_memory_authority(
+                        self.memory,
+                        self.admitted_context.as_ref(),
+                        "flux2 control",
+                    )?;
+                    self.generate_inner(req, control_image, on_progress)
+                })
             },
             || self.pipe.device.synchronize(),
         )
@@ -373,21 +389,23 @@ impl Flux2Control {
         crate::run_bespoke_request(
             &self.lifecycle,
             || {
-                let admitted = self.admitted_context.as_ref().ok_or_else(|| {
-                    CandleError::Msg(
-                        "flux2 control: model was not loaded with a memory context".to_owned(),
-                    )
-                })?;
-                let contract = self.memory_contract.as_ref().ok_or_else(|| {
-                    CandleError::Msg(
-                        "flux2 control: admitted model lost its memory contract".to_owned(),
-                    )
-                })?;
-                validate_admitted_context(admitted, context, "flux2 control")?;
-                validate_memory_request(context, req)?;
-                crate::memory_strategy::validate_context(contract, context, self.quant)
-                    .map_err(|error| CandleError::Msg(error.to_string()))?;
-                self.generate_inner(req, control_image, on_progress)
+                read_with_prepared_spec(self.prepared_spec.as_ref(), || {
+                    let admitted = self.admitted_context.as_ref().ok_or_else(|| {
+                        CandleError::Msg(
+                            "flux2 control: model was not loaded with a memory context".to_owned(),
+                        )
+                    })?;
+                    let contract = self.memory_contract.as_ref().ok_or_else(|| {
+                        CandleError::Msg(
+                            "flux2 control: admitted model lost its memory contract".to_owned(),
+                        )
+                    })?;
+                    validate_admitted_context(admitted, context, "flux2 control")?;
+                    validate_memory_request(context, req)?;
+                    crate::memory_strategy::validate_context(contract, context, self.quant)
+                        .map_err(|error| CandleError::Msg(error.to_string()))?;
+                    self.generate_inner(req, control_image, on_progress)
+                })
             },
             || self.pipe.device.synchronize(),
         )
@@ -606,6 +624,37 @@ impl Flux2Control {
     }
 }
 
+fn read_with_prepared_spec<T>(
+    spec: Option<&candle_gen::gen_core::LoadSpec>,
+    read: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    match spec {
+        Some(spec) => spec.read_prepared_files_unchanged(read),
+        None => read(),
+    }
+}
+
+fn validate_prepared_pid(
+    spec: Option<&candle_gen::gen_core::LoadSpec>,
+    requested: &PidWeights,
+    label: &str,
+) -> Result<()> {
+    let Some(spec) = spec else {
+        return Ok(());
+    };
+    let admitted = spec.pid.as_ref().ok_or_else(|| {
+        CandleError::Msg(format!(
+            "{label}: cannot attach PiD outside the prepared load specification"
+        ))
+    })?;
+    if admitted.checkpoint != requested.checkpoint || admitted.gemma != requested.gemma {
+        return Err(CandleError::Msg(format!(
+            "{label}: requested PiD weights differ from the prepared load specification"
+        )));
+    }
+    Ok(())
+}
+
 fn source_path(source: &candle_gen::gen_core::WeightsSource) -> &Path {
     match source {
         candle_gen::gen_core::WeightsSource::Dir(path)
@@ -669,9 +718,8 @@ fn validate_control_load_spec(spec: &candle_gen::gen_core::LoadSpec) -> Result<(
     if spec.ip_adapter.is_some() {
         unsupported.push("ip_adapter");
     }
-    if spec.pid.is_some() {
-        unsupported.push("pid");
-    }
+    // PiD is the one intentional two-step component: the prepared constructor retains this exact
+    // spec, then `with_pid` checks argument equality and loads it under the same receipt.
     if spec.identity.is_some() {
         unsupported.push("identity");
     }
@@ -882,6 +930,31 @@ mod tests {
         assert!(validate_admitted_paths(&paths, &matching).is_err());
         std::fs::write(&overlay, []).unwrap();
         assert!(validate_admitted_paths(&paths, &matching).is_err());
+    }
+
+    #[test]
+    fn control_route_accepts_only_the_exact_prepared_pid_binding() {
+        use candle_gen::gen_core::WeightsSource;
+
+        let admitted = PidWeights {
+            checkpoint: WeightsSource::File(PathBuf::from("pid.safetensors")),
+            gemma: WeightsSource::Dir(PathBuf::from("gemma")),
+        };
+        let mut spec =
+            candle_gen::gen_core::LoadSpec::new(WeightsSource::Dir(PathBuf::from("/flux2-dev")));
+        spec.pid = Some(admitted.clone());
+        assert!(validate_control_load_spec(&spec).is_ok());
+        assert!(validate_prepared_pid(Some(&spec), &admitted, "flux2 control").is_ok());
+
+        let mismatched = PidWeights {
+            checkpoint: WeightsSource::File(PathBuf::from("other-pid.safetensors")),
+            gemma: admitted.gemma.clone(),
+        };
+        assert!(validate_prepared_pid(Some(&spec), &mismatched, "flux2 control").is_err());
+        let no_pid =
+            candle_gen::gen_core::LoadSpec::new(WeightsSource::Dir(PathBuf::from("/flux2-dev")));
+        assert!(validate_prepared_pid(Some(&no_pid), &admitted, "flux2 control").is_err());
+        assert!(validate_prepared_pid(None, &admitted, "flux2 control").is_ok());
     }
 
     #[test]
