@@ -139,8 +139,12 @@ impl RequestGeometry {
     }
 
     /// Samples **per channel** the delivered soundtrack carries — see [`fit_audio_to_video`].
+    ///
+    /// Delegates to [`crate::denoise::delivered_audio_samples`] rather than recomputing the round:
+    /// the policy's target length is a geometry fact both backends have to agree on, and the second
+    /// copy is where they would stop agreeing (sc-19425).
     pub fn delivered_audio_samples(&self) -> usize {
-        (self.duration_seconds() * f64::from(AUDIO_SAMPLE_RATE)).round() as usize
+        crate::denoise::delivered_audio_samples(self.joint.num_frames) as usize
     }
 }
 
@@ -821,7 +825,7 @@ pub fn prepend_condition_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::denoise::LEGAL_FRAME_COUNTS;
+    use crate::denoise::{LEGAL_FRAME_COUNTS, MAX_DELIVERED_AV_RESIDUAL_SECONDS};
 
     /// **The stride is 32, not 16.** A 16-aligned canvas that is an odd number of latent columns has
     /// no patched representation, and the crate's `SIZE_MULTIPLE` advertises the same number.
@@ -1063,10 +1067,13 @@ mod tests {
             if decoded != want {
                 corrected += 1;
             }
-            // The delivered duration matches frames/fps to well inside one 25 ms audio token.
+            // The delivered duration matches frames/fps to under HALF A SAMPLE. Not "inside one
+            // 25 ms token" as this once asserted — a millisecond of slack is 32 samples, and a
+            // `floor`, a `ceil`, or a length taken off the decoder rather than off `num_frames`
+            // would all have passed it (sc-19425).
             let delivered = want as f64 / f64::from(AUDIO_SAMPLE_RATE);
             assert!(
-                (delivered - g.duration_seconds()).abs() < 0.001,
+                (delivered - g.duration_seconds()).abs() <= MAX_DELIVERED_AV_RESIDUAL_SECONDS,
                 "{frames} frames: {delivered} s of sound against {} s of picture",
                 g.duration_seconds()
             );

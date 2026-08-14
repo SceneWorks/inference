@@ -67,9 +67,11 @@ use candle_gen::{CandleError, Result};
 use crate::dit::adaln::TimestepSchedule;
 
 pub use geometry::{
-    align_num_frames, audio_latent_num_frames, rope_clocks_agree, video_latent_num_frames,
-    JointGeometry, AUDIO_LATENTS_PER_SECOND, FRAMES_PER_CHUNK, LATENTS_PER_CHUNK,
-    LEGAL_FRAME_COUNTS, MAX_AV_DRIFT_SECONDS, MINIMAX_H3_FPS, ROPE_UNITS_PER_SECOND,
+    align_num_frames, audio_latent_num_frames, av_grids_align_exactly, decoded_audio_samples,
+    delivered_audio_samples, rope_clocks_agree, video_latent_num_frames, JointGeometry,
+    AUDIO_LATENTS_PER_SECOND, AUDIO_SAMPLES_PER_LATENT, FRAMES_PER_CHUNK, LATENTS_PER_CHUNK,
+    LEGAL_FRAME_COUNTS, MAX_AV_DRIFT_SECONDS, MAX_DELIVERED_AV_RESIDUAL_SECONDS, MINIMAX_H3_FPS,
+    ROPE_UNITS_PER_SECOND,
 };
 pub use packing::{PackedLayout, RowClass, AUDIO_TAG, NUM_ROW_CLASSES, TEXT_TAG, VIDEO_TAG};
 pub use schedule::{
