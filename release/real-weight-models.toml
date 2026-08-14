@@ -1733,6 +1733,84 @@ expected_files = [
 # than no lane, so this stays exempt until the harness lands with it. See the follow-up on sc-15528.
 unwired_reason = "sc-15528 landed the Bernini ladder mechanism; the real-weight harness and its lane are the tracked follow-up, and a lane with no test to run would be vacuously green"
 
+# ── MiniMax-H3 upstream components (sc-18932) ───────────────────────────────────────────────────
+# `MiniMaxAI/MiniMax-H3` is ONE ~196 GB repository holding the DiT (`transformer/` and
+# `transformer_ref/`, 62 GB each), the dense Qwen3-VL-32B text encoder (62 GB), both VAEs, the
+# tokenizer and the FL2VA source bundles. It was absent from this manifest entirely while
+# `MINIMAX_H3_SNAPSHOT` was read by ~30 `#[ignore]`d tests across BOTH backends and referenced by no
+# workflow — so every one of them could only ever be run by hand. That is the gap this row closes.
+#
+# The tests are correct: they ASSERT on the variable instead of returning early, so a missing
+# snapshot fails loudly (exit 101) rather than printing `ok` in 0.00 s. Nothing could supply the
+# variable, which is a different defect from a vacuous green and is why it survived so long.
+#
+# `download_files` is a deliberate 11.640 GB slice of the 196 GB (measured 2026-08-13 with
+# `os.stat` over the snapshot on nax-macos, symlinks dereferenced):
+#
+#   vae/                                       10.416 GB  video VAE: 3 shards + index + config
+#   audio_vae/                                  0.605 GB  the diffusers-repackaged audio VAE
+#   FL2VA/audio_vae/                            0.605 GB  the reference's own `from_pretrained`
+#                                                         inputs — the config.json / config.yaml /
+#                                                         metadata.json triple plus model.safetensors
+#   tokenizer/                                  0.012 GB  tokenizer.json + tokenizer_config.json
+#   text_encoder/model.safetensors.index.json   0.0001 GB the TE SHARD INDEX ONLY, no shards
+#
+# That slice is what makes THIRTEEN previously undrivable selections runnable in CI — nine in
+# `mlx-gen-minimax-h3` (three header/config gates, the TE-index and tokenizer gates, the video,
+# multi-chunk and ~0.6 GB audio decodes, and the diffusers parity gate) and four in
+# `candle-gen-minimax-h3` (the same three header/config gates plus the stored-Kaiser-filter check).
+# All thirteen were executed against these bytes on 2026-08-13 before the lanes were written; see the
+# `mlx-minimax-h3` and `candle-minimax-h3` jobs in `.github/workflows/real-weights.yml`, and
+# `test_minimax_h3_lanes_select_tests_that_exist_and_pin_their_run_count`, which binds each selected
+# name to a still-`#[ignore]`d `fn` so a rename on either side is a red on the next PR.
+#
+# THE TE INDEX IS DELIBERATELY NOT IN `expected_files`. `verify_model_snapshot.py` parses every
+# `*.index.json` it is given and requires each shard the `weight_map` names, so listing it would
+# demand all fourteen TE shards — 62 GB, five times the rest of this row put together. It is fetched
+# and consumed instead: `te_layer_50_tap_is_exhaustive_and_the_tail_is_trimmable` panics on a missing
+# index, so its absence is loud at the test rather than at verification.
+#
+# `MINIMAX_H3_VIDEO_VAE_REFERENCE` is deliberately NOT an `environment` entry here, and the omission
+# is a category judgement rather than an oversight. `environment` names variables that point a test
+# at THIS PINNED SNAPSHOT; that one points at a ~840 KB artifact an operator PRODUCES from the
+# snapshot with `crates/media/mlx-gen/tools/dump_minimax_h3_video_vae_real.py`. Listing it would
+# claim the pin describes bytes no revision can. It lives in the `mlx-minimax-h3` job instead, the
+# way `MAGE_ORACLE_SEED_DIR` lives only in `mlx-media` — recorded here so a census reader finds it.
+#
+# NOT COVERED, and named here rather than left to be rediscovered: the two candle DiT header gates
+# (`declared_dit_tensor_names_match_the_published_checkpoint`,
+# `the_adaln_projections_are_the_documented_twenty_six_gigabytes`) read only headers but need the
+# 62 GB `transformer/` component to exist, and `real_weight_te_context_matches_the_official_conditioner`
+# needs the 62 GB `text_encoder/`. Adding either would multiply this row's disk cost by six. They stay
+# hand-driven on a box that already holds the full snapshot.
+[[models]]
+key = "minimax-h3"
+repository = "MiniMaxAI/MiniMax-H3"
+revision = "939557dc319dd91227e30195a763f272ba7f8765"
+license = "MiniMax H3 Community License Agreement"
+size_class = "very-large"
+profiles = ["media-macos", "media-cuda"]
+environment = ["MINIMAX_H3_SNAPSHOT"]
+download_files = [
+  "vae/*",
+  "audio_vae/*",
+  "FL2VA/audio_vae/*",
+  "tokenizer/*",
+  "text_encoder/model.safetensors.index.json",
+]
+expected_files = [
+  "vae/config.json",
+  "vae/diffusion_pytorch_model.safetensors.index.json",
+  "audio_vae/config.json",
+  "audio_vae/diffusion_pytorch_model.safetensors",
+  "FL2VA/audio_vae/config.json",
+  "FL2VA/audio_vae/config.yaml",
+  "FL2VA/audio_vae/metadata.json",
+  "FL2VA/audio_vae/model.safetensors",
+  "tokenizer/tokenizer.json",
+  "tokenizer/tokenizer_config.json",
+]
+
 # ── MiniMax-H3 DiT tiers (sc-17150) ─────────────────────────────────────────────────────────────
 # `SceneWorks/minimax-h3-mlx` hosts ONLY the tiered DiT. The text encoder, both VAEs and the
 # tokenizer are dense in every tier and shared as a co-requisite, sourced from upstream
@@ -1758,7 +1836,13 @@ license = "MiniMax H3 Community License Agreement"
 size_class = "very-large"
 profiles = ["media-macos"]
 environment = ["MINIMAX_H3_DIT"]
-unwired_reason = "no CI lane dispatches any MiniMax-H3 harness yet — the family's real-weight tests are all operator-run on this Mac (the ~196 GB upstream snapshot is not on a runner), and sc-17150's per-tier render harness tests/quant_tiers_real.rs is dispatched by hand; wiring a lane is sc-17153's fit-gate work"
+# sc-18932 wired the UPSTREAM components (`minimax-h3` above) into `mlx-minimax-h3` /
+# `candle-minimax-h3`, so "no MiniMax-H3 lane exists" is no longer the reason and this text was
+# rewritten rather than left to rot. What is still true is narrower and specific to the TIERS: the
+# only consumer of `MINIMAX_H3_DIT` is sc-17150's per-tier render harness `tests/quant_tiers_real.rs`,
+# each render is hours of Metal (activity 19108: 147.87 s/step at the shipped default canvas) and the
+# three tiers are 240.7 GB on disk, so it is dispatched by hand. Wiring it is sc-17153's fit-gate work.
+unwired_reason = "sc-17150's per-tier render harness tests/quant_tiers_real.rs is the only consumer and is dispatched by hand — hours of Metal per tier against a 240.7 GB three-tier fetch; wiring a lane is sc-17153's fit-gate work (the upstream components ARE wired, see the minimax-h3 row)"
 download_files = ["bf16/*"]
 expected_files = [
   "bf16/transformer/config.json",
@@ -1775,7 +1859,7 @@ license = "MiniMax H3 Community License Agreement"
 size_class = "very-large"
 profiles = ["media-macos"]
 environment = ["MINIMAX_H3_DIT"]
-unwired_reason = "no CI lane dispatches any MiniMax-H3 harness yet — see minimax-h3-mlx-bf16"
+unwired_reason = "MINIMAX_H3_DIT has one hand-dispatched consumer, sc-17150 tests/quant_tiers_real.rs — see minimax-h3-mlx-bf16"
 download_files = ["q8/*"]
 expected_files = [
   "q8/transformer/config.json",
@@ -1792,7 +1876,7 @@ license = "MiniMax H3 Community License Agreement"
 size_class = "very-large"
 profiles = ["media-macos"]
 environment = ["MINIMAX_H3_DIT"]
-unwired_reason = "no CI lane dispatches any MiniMax-H3 harness yet — see minimax-h3-mlx-bf16"
+unwired_reason = "MINIMAX_H3_DIT has one hand-dispatched consumer, sc-17150 tests/quant_tiers_real.rs — see minimax-h3-mlx-bf16"
 download_files = ["q4/*"]
 expected_files = [
   "q4/transformer/config.json",
