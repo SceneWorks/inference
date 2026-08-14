@@ -2038,6 +2038,13 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                     "declared_audio_tensor_names_match_the_published_checkpoint",
                     "published_audio_configs_reproduce_the_declared_geometry",
                     "stored_kaiser_filters_match_the_derivation_on_real_weights",
+                    # Decodes: ~19.4 GB and ~1.2 GB resident at f32, landing on GPU 0 under
+                    # `--features cuda`. Wired by sc-19414 against a MEASURED 97887 MiB card
+                    # rather than against `CUDA_COMPUTE_CAP`, which names an architecture and
+                    # never a capacity.
+                    "real_weight_decode_produces_a_plausible_video",
+                    "real_weight_multi_chunk_decode_blends_the_seam",
+                    "real_weight_audio_decode_produces_a_plausible_stereo_track",
                 ),
             ),
         }

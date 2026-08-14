@@ -1755,14 +1755,23 @@ unwired_reason = "sc-15528 landed the Bernini ladder mechanism; the real-weight 
 #   tokenizer/                                  0.012 GB  tokenizer.json + tokenizer_config.json
 #   text_encoder/model.safetensors.index.json   0.0001 GB the TE SHARD INDEX ONLY, no shards
 #
-# That slice is what makes THIRTEEN previously undrivable selections runnable in CI — nine in
+# That slice is what makes SIXTEEN previously undrivable selections runnable in CI — nine in
 # `mlx-gen-minimax-h3` (three header/config gates, the TE-index and tokenizer gates, the video,
-# multi-chunk and ~0.6 GB audio decodes, and the diffusers parity gate) and four in
-# `candle-gen-minimax-h3` (the same three header/config gates plus the stored-Kaiser-filter check).
-# All thirteen were executed against these bytes on 2026-08-13 before the lanes were written; see the
-# `mlx-minimax-h3` and `candle-minimax-h3` jobs in `.github/workflows/real-weights.yml`, and
+# multi-chunk and ~0.6 GB audio decodes, and the diffusers parity gate) and seven in
+# `candle-gen-minimax-h3` (the same three header/config gates, the stored-Kaiser-filter check, and
+# the video, multi-chunk and audio decodes). See the `mlx-minimax-h3` and `candle-minimax-h3` jobs in
+# `.github/workflows/real-weights.yml`, and
 # `test_minimax_h3_lanes_select_tests_that_exist_and_pin_their_run_count`, which binds each selected
 # name to a still-`#[ignore]`d `fn` so a rename on either side is a red on the next PR.
+#
+# THIRTEEN of the sixteen were executed against these bytes on 2026-08-13, before the lanes were
+# written. The three candle decodes are the exception and the distinction is deliberate: sc-18932
+# left them out because no VRAM figure for the Windows box existed, and sc-19414 wired them from one
+# — `nvidia-smi` in run 31353865709 puts 2x RTX PRO 6000 Blackwell at 97887 MiB (95.6 GiB) each on
+# `MICHAEL-TRX50`, against ~19.4 GB and ~1.2 GB of f32 residency. That is a sizing decision taken on
+# measurement, but it is NOT an observed execution: those three have never run on candle anywhere,
+# and the first run of the `candle-minimax-h3` lane is their first. The arithmetic is recorded in
+# that job's header.
 #
 # THE TE INDEX IS DELIBERATELY NOT IN `expected_files`. `verify_model_snapshot.py` parses every
 # `*.index.json` it is given and requires each shard the `weight_map` names, so listing it would
