@@ -44,10 +44,19 @@
 //!
 //! `ref2va` (sc-17157) — the `transformer_ref` partition, the omni-reference presentation and the
 //! audio VAE encoder — and the turbo LoRA seam (the candle twin of `mlx_gen_minimax_h3::adapters`).
-//! Both are declared unsupported rather than silently ignored: `supports_lora` is `false` and the
-//! three `ref2va` conditioning kinds are absent from [`descriptor`]'s allowlist, so a request
-//! carrying either gets a typed `Unsupported` at the contract boundary instead of a plausible render
-//! that quietly dropped it.
+//! Both are refused rather than silently ignored, but by **two different mechanisms**, and the
+//! distinction matters because only one of them is carried by the descriptor:
+//!
+//! * **`ref2va` is refused by the descriptor.** The three `ref2va` conditioning kinds are absent
+//!   from [`descriptor`]'s `conditioning` allowlist, and `Capabilities::validate_request` — which
+//!   [`MiniMaxH3::generate_impl`] calls on every render — enforces that allowlist, so a reference
+//!   request gets a typed `Unsupported` naming the kind.
+//! * **The turbo LoRA seam and the quant tiers are refused by [`load`].** `supports_lora`,
+//!   `supports_lokr` and `supported_quants` are *declarations that gen-core reads on no path*: no
+//!   validator and no registry code inspects them. They are advertisements to a weights-free
+//!   consumer, not gates. The gates are the explicit `spec.adapters` / `spec.quantize` checks in
+//!   [`load`]; without them a spec carrying either loaded clean and rendered with the caller's knob
+//!   silently discarded. See [`load`] for the full note.
 
 use std::path::{Path, PathBuf};
 
@@ -613,7 +622,41 @@ impl Generator for MiniMaxH3 {
 }
 
 /// Registry entry point.
+///
+/// # The two load-time refusals, and why the descriptor flags cannot stand in for them
+///
+/// [`descriptor`] sets `supports_lora` / `supports_lokr` to `false` and `supported_quants` to `&[]`,
+/// and the module docs above promise a request carrying either "gets a typed `Unsupported` at the
+/// contract boundary instead of a plausible render that quietly dropped it". **Those three fields are
+/// declarations that gen-core reads on no path.** `Capabilities::validate_request` gates the
+/// conditioning allowlist (which is what actually default-denies the `ref2va` kinds) but never looks
+/// at `supports_lora` or `supported_quants`, and `ProviderRegistryBuilder` does not inspect a
+/// `LoadSpec` either — so without the checks below, a spec carrying `adapters` or `quantize` loaded
+/// clean and rendered with the caller's knob silently discarded. That is the precise failure the
+/// docs claimed was impossible.
+///
+/// `reject_unknown_components` does not cover this: it validates `spec.components`, a different field
+/// from `spec.adapters` and `spec.quantize`.
+///
+/// This is the `candle-gen-mochi` idiom — refuse at the registry entry point, which returns
+/// `gen_core::Result` and can therefore carry the contract-load-bearing
+/// [`gen_core::Error::Unsupported`] that `CandleError` has no variant for.
 pub fn load(spec: &LoadSpec) -> candle_gen::gen_core::Result<Box<dyn Generator>> {
+    if !spec.adapters.is_empty() {
+        return Err(candle_gen::gen_core::Error::Unsupported(format!(
+            "{MODEL_ID}: the candle lane does not support LoRA/LoKr adapters — {} staged, and the \
+             turbo seam (the MLX sibling's `adapters`) is not ported here. Refused rather than \
+             rendered without them.",
+            spec.adapters.len()
+        )));
+    }
+    if let Some(q) = spec.quantize {
+        return Err(candle_gen::gen_core::Error::Unsupported(format!(
+            "{MODEL_ID}: spec.quantize={q:?} is not supported on the candle lane — the pre-quantized \
+             tiers are packed offline by the MLX lane's `convert` and this lane has no tier loader, \
+             so a tier request is refused rather than silently rendered dense."
+        )));
+    }
     Ok(Box::new(MiniMaxH3::load(spec)?))
 }
 
@@ -656,6 +699,82 @@ mod tests {
         );
         assert_eq!(OFFLOAD_POLICY, OffloadPolicy::Sequential);
         assert_ne!(model.offload_policy(), spec.offload_policy);
+    }
+
+    /// A staged snapshot root with all four component dirs — enough for `load` to succeed.
+    fn staged_root(tmp: &tempfile::TempDir) -> PathBuf {
+        let root = tmp.path().to_path_buf();
+        for c in REQUIRED_COMPONENT_DIRS {
+            std::fs::create_dir_all(root.join(c)).unwrap();
+        }
+        root
+    }
+
+    /// **A staged LoRA is REFUSED, not dropped.**
+    ///
+    /// `supports_lora: false` is a declaration gen-core reads on no path — neither
+    /// `validate_request` nor the registry builder inspects it — so before this guard a spec
+    /// carrying `adapters` loaded clean and rendered with the adapter silently discarded, which is
+    /// exactly what the module docs promised could not happen.
+    ///
+    /// The control is the point: the SAME root with no adapters must still load, so this proves the
+    /// adapter is what refuses rather than the fixture being broken.
+    #[test]
+    fn a_staged_lora_is_refused_rather_than_silently_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = staged_root(&tmp);
+
+        // Control: without adapters the very same spec loads.
+        load(&LoadSpec::new(WeightsSource::Dir(root.clone())))
+            .expect("the bare spec must load — otherwise the refusal below proves nothing");
+
+        let spec = LoadSpec::new(WeightsSource::Dir(root)).with_adapters(vec![
+            candle_gen::gen_core::AdapterSpec {
+                path: PathBuf::from("/turbo.safetensors"),
+                scale: 1.0,
+                kind: candle_gen::gen_core::AdapterKind::Lora,
+                pass_scales: None,
+                moe_expert: None,
+            },
+        ]);
+        // `Box<dyn Generator>` is not `Debug`, so `expect_err` is unavailable.
+        let err = match load(&spec) {
+            Ok(_) => panic!("a staged LoRA must be refused, not silently dropped"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, candle_gen::gen_core::Error::Unsupported(_)),
+            "must be the contract-load-bearing Unsupported, not an opaque Msg: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("LoRA/LoKr"), "{msg}");
+    }
+
+    /// **A tier request is REFUSED, not silently rendered dense.**
+    ///
+    /// `supported_quants: &[]` is likewise enforced nowhere in gen-core. Mutating this guard away
+    /// makes a `q4` request load the dense bf16 checkpoint and return a render the caller believes
+    /// is quantized.
+    #[test]
+    fn a_quantize_request_is_refused_rather_than_silently_rendered_dense() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = staged_root(&tmp);
+
+        load(&LoadSpec::new(WeightsSource::Dir(root.clone())))
+            .expect("the bare spec must load — otherwise the refusal below proves nothing");
+
+        let spec =
+            LoadSpec::new(WeightsSource::Dir(root)).with_quant(candle_gen::gen_core::Quant::Q4);
+        let err = match load(&spec) {
+            Ok(_) => panic!("a tier request must be refused, not silently rendered dense"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, candle_gen::gen_core::Error::Unsupported(_)),
+            "must be the contract-load-bearing Unsupported, not an opaque Msg: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("no tier loader"), "{msg}");
     }
 
     /// A snapshot missing any one of the four component directories fails at `load`, naming the
