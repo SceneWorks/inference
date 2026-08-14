@@ -32,8 +32,19 @@
 //! and set from *this* lane's own measured floor, exactly as the decode suite's is. That is not a
 //! stricter standard applied to the same hardware — MLX pays for Metal's reduced-precision f32
 //! matmul and measures a ~1e-3 residual, while this lane runs f32 on the CPU and measures
-//! **~1e-7 … 4e-7** across every golden in this file (each test prints its own). Keeping 1e-2 here
-//! would leave a gate five orders above its own noise floor, which is a gate in name only.
+//! **4.8e-7 … 1.5e-6** across the goldens in this file (each test prints its own), so the bound
+//! sits ~7x above the worst of them. Keeping 1e-2 here would leave a gate four orders above its
+//! own noise floor, which is a gate in name only.
+//!
+//! The encode residual is ~5x the decode suite's 2.1e-7 … 3.7e-7 rather than equal to it: this
+//! path is twelve stacked convolutions whose reduction order differs from torch's, where the
+//! decoder is a matmul stack. The bound is set from the number this lane actually measures, not
+//! copied from the sibling suite.
+//!
+//! On the **real** 118-tensor checkpoint the same comparison measures **1.355e-5**
+//! (`real_weights.rs::real_weight_encode_matches_the_official_diffusers_vae`, bound 2e-2) — a
+//! different bound because that comparison spans six levels and 1024-wide channels, not because a
+//! different standard applies.
 //!
 //! **Every assertion is on the peak relative max-abs-diff.** Not norm, not cosine, not a checksum:
 //! sc-18740's gate/value half-swap sat at cosine 0.73-0.78 with output norms 89 → 85, and a
@@ -56,8 +67,8 @@ use candle_gen_minimax_h3::{
     TILE_SAMPLE_MIN_OVERLAP, TILE_SAMPLE_MIN_SIZE,
 };
 
-/// Peak-relative tolerance. See the module docs: set from this lane's measured ~1e-7 … 4e-7 floor,
-/// not inherited from the MLX sibling's 1e-2.
+/// Peak-relative tolerance. See the module docs: set from this lane's measured 4.8e-7 … 1.5e-6
+/// floor, not inherited from the MLX sibling's 1e-2 nor from the decode suite's own residual.
 const TOL: f32 = 1e-5;
 
 /// A mutation must move the encode by at least this much to count as gated. Three orders above
@@ -65,9 +76,10 @@ const TOL: f32 = 1e-5;
 const MUTATION_FLOOR: f32 = 1e-2;
 
 /// The bar for the four tensors a **downstream normalization largely removes** — see
-/// [`ABSORBED_BY_THE_NEXT_NORM`]. Still 10× [`TOL`] and ~100× this lane's measured parity
-/// residual, so the goldens really do gate them; they simply cannot clear [`MUTATION_FLOOR`], and
-/// pretending otherwise would mean either dropping the probe or lowering the bar for all sixteen.
+/// [`ABSORBED_BY_THE_NEXT_NORM`]. Still 10× [`TOL`] and ~70× this lane's measured 1.4e-6 parity
+/// residual, so the goldens really do gate them (they measure 2.2e-4 … 6.7e-3); they simply cannot
+/// clear [`MUTATION_FLOOR`], and pretending otherwise would mean either dropping the probes or
+/// lowering the bar for all sixteen.
 const NORMALIZED_MUTATION_FLOOR: f32 = 1e-4;
 
 /// The tensors whose perturbation the next `GroupNorm` largely cancels, so they are held to
