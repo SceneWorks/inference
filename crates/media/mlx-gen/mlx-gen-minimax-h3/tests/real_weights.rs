@@ -125,7 +125,10 @@ fn real_weight_decode_produces_a_plausible_video() {
         &std::fs::read_to_string(dir.join("config.json")).unwrap(),
     )
     .unwrap();
-    // bf16 is the checkpoint's own dtype; loading f32 would double an already-10 GB decoder.
+    // bf16 is a DOWNCAST here, not the checkpoint's own dtype: `vae/` ships F32 (703 of 703
+    // tensors, 9.70 GiB, measured from the published headers), so this halves it rather than
+    // matching it. f32 would be a no-op cast holding the full 9.70 GiB — which is what the parity
+    // gate below deliberately does — not the doubling this comment used to assert.
     let vae = MiniMaxH3VideoVae::from_weights(&mut w, &cfg, Dtype::Bfloat16).unwrap();
     let load_ms = started.elapsed().as_millis();
 
@@ -220,8 +223,10 @@ fn real_weight_decode_matches_the_official_diffusers_vae() {
         &std::fs::read_to_string(dir.join("config.json")).unwrap(),
     )
     .unwrap();
-    // f32 to keep the comparison about layout rather than about bf16 rounding; the decoder is
-    // ~20 GB at f32, which this box carries.
+    // f32 to keep the comparison about layout rather than about bf16 rounding. That is free, not
+    // costly: `vae/` is already F32 on disk (703 of 703 tensors, 9.70 GiB), so this is a no-op cast
+    // holding ~9.70 GiB — NOT the ~20 GB this comment used to claim, which came from reading the
+    // component as bf16 and doubling it.
     let vae = MiniMaxH3VideoVae::from_weights(&mut w, &cfg, Dtype::Float32).unwrap();
 
     let latent = r.require("in.latent").unwrap();
