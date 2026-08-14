@@ -143,7 +143,10 @@ pub fn descriptor() -> ModelDescriptor {
             // The AR regime is built on a rolling causal KV cache (sc-8436 S3 / sc-8438 S5).
             supports_kv_cache: true,
             requires_sigma_shift: false,
+            // Every route calls `stage_components`: UMT5 is loaded, evaluated, and dropped before
+            // the DiT + VAE phase. There is no request-selectable Resident mode.
             supports_sequential_offload: false,
+            unconditionally_engages_staged_residency: true,
             // Batch whole-clip form in S6; the realtime streaming decode is the streaming epic.
             supports_preview: false,
             supports_prompt_enhancement: false,
@@ -627,6 +630,12 @@ mod tests {
         assert!(c.supports_lora, "S14 wires dense Wan-family style LoRA");
         assert!(c.supports_lokr, "S14 wires the dense LoKr install path too");
         assert!(c.supports_kv_cache, "the AR regime runs a rolling KV cache");
+        assert!(!c.supports_sequential_offload);
+        assert!(c.unconditionally_engages_staged_residency);
+        assert_eq!(
+            c.staged_residency_availability(),
+            mlx_gen::StagedResidencyAvailability::UnconditionallyEngaged,
+        );
         assert!(c.mac_only);
         assert!(!c.supports_streaming, "batch form; streaming is epic 8432");
         // The descriptor passes the weights-free conformance sweep (Video modality admits VideoClip).

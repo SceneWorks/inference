@@ -31,13 +31,13 @@ use candle_gen::{CandleError, Result as CResult};
 use candle_gen_wan::config::{TextEncoderConfig, Vae16Config, MAX_AREA_14B};
 use candle_gen_wan::scheduler::Sampler;
 use candle_gen_wan::text_encoder::Umt5Encoder;
-use candle_gen_wan::vae16::WanVae16;
 use cst::Load;
 
 use crate::clip::{ClipVisionConfig, ScailClip};
 use crate::config::Scail2Config;
 use crate::generate::{align, CharacterRef, Components, Scail2Job, DIM_ALIGN};
 use crate::model::Scail2Dit;
+use crate::ProviderVae;
 
 /// Default driving-segment window + clean-history overlap (upstream `scail.py` defaults).
 const SEGMENT_LEN: usize = 81;
@@ -158,6 +158,7 @@ pub fn descriptor() -> ModelDescriptor {
             supports_kv_cache: false,
             requires_sigma_shift: false,
             supports_sequential_offload: false,
+            unconditionally_engages_staged_residency: false,
             supports_preview: false,
             supports_prompt_enhancement: false,
             supports_streaming: false,
@@ -390,7 +391,7 @@ impl Scail2 {
             SnapshotLayout::SharedMlxTier => shared_vae_vb(&self.root, &self.device)?,
             SnapshotLayout::LegacyComponents => component_vb(&self.root, &self.device, "vae")?,
         };
-        let vae = WanVae16::new_with_encoder(&Vae16Config::wan21(), vae_vb)?;
+        let vae = ProviderVae::new_with_encoder(&Vae16Config::wan21(), vae_vb)?;
         let clip_vb = match self.layout {
             SnapshotLayout::SharedMlxTier => cpu_cast_mmap_var_builder(
                 &[self.root.join("clip.safetensors")],

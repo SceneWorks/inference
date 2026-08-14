@@ -866,6 +866,7 @@ pub fn descriptor() -> ModelDescriptor {
             // actually run resident makes the gate under-predict its real peak — an admitted job that
             // then OOMs. Never flip this on ahead of the wiring.
             supports_sequential_offload: true,
+            unconditionally_engages_staged_residency: false,
             // sc-16951 (epic 16948): sc-16950 wired EVERY shipped Krea render route — the seven
             // `pipeline` sites (Turbo three-stage / t2i / img2img, Raw t2i / multi-phase / img2img,
             // and the shared Turbo+Raw edit) plus the pose-control provider — to hand

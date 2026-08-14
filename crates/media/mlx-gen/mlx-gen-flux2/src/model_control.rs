@@ -87,6 +87,7 @@ pub fn descriptor_dev_control() -> ModelDescriptor {
             // Mistral-3 text encoder drops after the prompt encode, then the control transformer (dev
             // DiT + control branch) + VAE load, bounding peak to `max(TE, DiT+control+VAE)`.
             supports_sequential_offload: true,
+            unconditionally_engages_staged_residency: false,
             supports_preview: true,
             supports_prompt_enhancement: false,
             supports_streaming: false,

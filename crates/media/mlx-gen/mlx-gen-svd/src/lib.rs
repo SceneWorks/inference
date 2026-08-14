@@ -32,6 +32,22 @@ pub use transformer::TransformerSpatioTemporal;
 pub use unet::SvdUnet;
 pub use vae::SvdVae;
 
+/// Why the MLX SVD route has no provider-owned [`mlx_gen::gen_core::tiling::VaeTiling`].
+///
+/// This is an explicit capability result, not a missing catalog row. The MLX decoder only bounds
+/// an invocation by splitting the clip into temporal `decode_chunk_size` windows; unlike the
+/// Candle decoder, [`SvdVae::decode`] neither consumes a `VaeTiling` nor reaches the shared spatial
+/// tiling planner. Publishing the architectural 256-channel intermediate as a write-bound
+/// authority here would therefore advertise a bound that no MLX decode path enforces. Admission
+/// must keep `decode_cap_modelled = false` on this lane until a load-bearing MLX planner exists.
+pub const VAE_TILING_UNMODELLED_REASON: &str =
+    "mlx svd temporally chunks decode calls but has no load-bearing VaeTiling spatial planner";
+
+/// Resolve the explicit unmodelled result for the MLX SVD provider id.
+pub fn vae_tiling_unmodelled_reason(provider_id: &str) -> Option<&'static str> {
+    (provider_id == MODEL_ID).then_some(VAE_TILING_UNMODELLED_REASON)
+}
+
 /// Add the MLX SVD provider to an explicit media registry builder.
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
@@ -54,5 +70,10 @@ mod explicit_registry_tests {
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
         assert_eq!(explicit, ["svd_xt"]);
+        assert_eq!(
+            super::vae_tiling_unmodelled_reason(super::MODEL_ID),
+            Some(super::VAE_TILING_UNMODELLED_REASON)
+        );
+        assert_eq!(super::vae_tiling_unmodelled_reason("not_svd"), None);
     }
 }

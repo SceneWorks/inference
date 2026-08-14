@@ -21,6 +21,10 @@ pub struct CandleRequestScopeConfig {
     pub provider_id: &'static str,
     pub device: Device,
     pub geometry: MemoryGeometry,
+    /// Provider default used when [`GenerationRequest::frames`] is omitted. Image providers retain
+    /// the historical value `1`; video providers set their real default so an omitted request value
+    /// is still bound to the exact admitted frame geometry.
+    pub default_frames: u32,
     pub memory: Option<GenerationMemory>,
     pub use_pid: bool,
     pub attention_chunk_size: Option<u32>,
@@ -49,6 +53,7 @@ impl CandleRequestScopeConfig {
             provider_id,
             device,
             geometry,
+            default_frames: 1,
             memory,
             use_pid,
             attention_chunk_size: None,
@@ -147,18 +152,21 @@ impl MemoryRequestScope for CandleRequestScopeCore {
             || request.height != self.config.geometry.height
             || request.count == 0
             || request.count > self.config.geometry.batch
+            || request.frames.unwrap_or(self.config.default_frames) != self.config.geometry.frames
             || request.image_reference_count() != self.config.geometry.reference_count
         {
             return Err(Error::Unsupported(format!(
-                "{}: request geometry {}x{}x{} references={} does not fit admitted {}x{}x{} references={}",
+                "{}: request geometry {}x{}x{} frames={} references={} does not fit admitted {}x{}x{} frames={} references={}",
                 self.config.provider_id,
                 request.width,
                 request.height,
                 request.count,
+                request.frames.unwrap_or(self.config.default_frames),
                 request.image_reference_count(),
                 self.config.geometry.width,
                 self.config.geometry.height,
                 self.config.geometry.batch,
+                self.config.geometry.frames,
                 self.config.geometry.reference_count
             )));
         }
@@ -311,6 +319,35 @@ mod tests {
                 height: 64,
                 count: 1,
                 conditioning,
+                ..Default::default()
+            };
+            assert!(scope.configure_request(&mut mismatch).is_err());
+        }
+    }
+
+    #[test]
+    fn configured_request_resolves_frames_through_the_provider_default() {
+        let mut cfg = config(7);
+        cfg.geometry.frames = 81;
+        cfg.default_frames = 81;
+        let mut scope = CandleRequestScopeCore::with_cleanup_action(cfg, Box::new(|| Ok(())));
+
+        for frames in [None, Some(81)] {
+            let mut exact = GenerationRequest {
+                width: 64,
+                height: 64,
+                count: 1,
+                frames,
+                ..Default::default()
+            };
+            scope.configure_request(&mut exact).unwrap();
+        }
+        for frames in [Some(1), Some(77), Some(85)] {
+            let mut mismatch = GenerationRequest {
+                width: 64,
+                height: 64,
+                count: 1,
+                frames,
                 ..Default::default()
             };
             assert!(scope.configure_request(&mut mismatch).is_err());

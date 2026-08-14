@@ -1192,6 +1192,7 @@ fn descriptor(variant: Flux2Variant) -> ModelDescriptor {
             // FLUX.2 uses the empirical-mu shifted flow-match schedule.
             requires_sigma_shift: true,
             supports_sequential_offload: true,
+            unconditionally_engages_staged_residency: false,
             // Per-step latent previews (epic 16948, sc-16955): every shipped FLUX.2 lane hands the
             // shared sampler a `crate::preview` hook that projects the raw 32-channel latent through
             // the epic-16624 fit. `candle-gen-catalog`'s `preview_advertising` guard derives this

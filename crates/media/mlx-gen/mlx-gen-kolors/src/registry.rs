@@ -128,6 +128,7 @@ pub fn descriptor() -> ModelDescriptor {
             // DENSE at load, so a `Sequential` + `quantize` load re-quantizes each generate (F-181
             // advisory in `load`).
             supports_sequential_offload: true,
+            unconditionally_engages_staged_residency: false,
             supports_preview: true,
             supports_prompt_enhancement: false,
             supports_streaming: false,

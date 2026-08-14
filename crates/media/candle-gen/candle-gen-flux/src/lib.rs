@@ -383,6 +383,7 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             supports_kv_cache: false,
             requires_sigma_shift: false,
             supports_sequential_offload: true,
+            unconditionally_engages_staged_residency: false,
             // Per-step latent previews (epic 16948, sc-16956): the registered txt2img route hands
             // `crate::preview::hook` to the shared flow driver, projecting the unpacked 16-channel
             // latent through the reused epic-16624 fit. Both variants share one render lane, so both

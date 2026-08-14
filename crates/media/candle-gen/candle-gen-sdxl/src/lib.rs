@@ -493,6 +493,7 @@ pub fn descriptor() -> ModelDescriptor {
             supports_kv_cache: false,
             requires_sigma_shift: false,
             supports_sequential_offload: false,
+            unconditionally_engages_staged_residency: false,
             // Per-step latent previews (epic 16948, sc-16954): every shipped SDXL render lane
             // emits -- the curated driver lane and the bespoke Lightning loop on this registered
             // route, plus the name-driven edit / IP-Adapter providers. `crate::preview` reuses the

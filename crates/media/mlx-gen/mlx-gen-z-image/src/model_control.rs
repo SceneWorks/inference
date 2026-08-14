@@ -76,6 +76,7 @@ pub fn descriptor() -> ModelDescriptor {
             requires_sigma_shift: false,
             // Wired onto the shared `Residency` seam; honors Sequential offload (F-176).
             supports_sequential_offload: true,
+            unconditionally_engages_staged_residency: false,
             supports_preview: true,
             supports_prompt_enhancement: false,
             supports_streaming: false,

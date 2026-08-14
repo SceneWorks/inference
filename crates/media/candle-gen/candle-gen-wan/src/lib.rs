@@ -39,6 +39,7 @@ pub mod dit_train;
 // dequantize per-matmul (ComfyUI-GGUF parity), NEVER pre-dequantized to dense at load. Selected on the
 // 5B by the `CANDLE_GEN_WAN_GGUF` sub-story-1 test seam (manifest/catalog routing is sub-story 2).
 mod gguf;
+pub mod memory_strategy;
 pub mod model_vace;
 pub mod model_vace_fun;
 pub mod pipeline;
@@ -53,6 +54,70 @@ pub mod vace;
 pub mod vae;
 pub mod vae16;
 pub mod wan14b;
+
+pub const WAN_Z48_VAE_TILING: candle_gen::gen_core::tiling::VaeTiling = Ti2vProviderVae::VAE_TILING;
+pub const WAN_Z16_VAE_TILING: candle_gen::gen_core::tiling::VaeTiling =
+    wan14b::ProviderVae::VAE_TILING;
+
+#[cfg(test)]
+mod vae_tiling_assignment_tests {
+    #[test]
+    fn every_wan_generator_id_resolves_to_its_concrete_decoder() {
+        assert_eq!(
+            super::WAN_Z48_VAE_TILING,
+            candle_gen::gen_core::tiling::VaeTiling::WAN22
+        );
+        assert_eq!(
+            super::WAN_Z16_VAE_TILING,
+            candle_gen::gen_core::tiling::VaeTiling {
+                spatial_scale: 8,
+                temporal_scale: 4,
+                causal_temporal: true,
+                full_res_channels: 96,
+            }
+        );
+
+        assert_eq!(
+            super::WAN_Z48_VAE_TILING,
+            super::Ti2vProviderVae::VAE_TILING
+        );
+        assert_eq!(
+            super::WAN_Z16_VAE_TILING,
+            super::wan14b::ProviderVae::VAE_TILING
+        );
+        assert_eq!(
+            super::ti2v_vae_tiling(super::MODEL_ID),
+            Some(super::Ti2vProviderVae::VAE_TILING)
+        );
+        assert_eq!(super::pipeline::latent_dims(9, 160, 128), (3, 8, 10));
+        for id in [
+            super::config::MODEL_ID_T2V_14B,
+            super::config::MODEL_ID_I2V_14B,
+        ] {
+            assert_eq!(
+                super::wan14b::vae_tiling(id),
+                Some(super::wan14b::ProviderVae::VAE_TILING)
+            );
+        }
+        assert_eq!(super::wan14b::latent_dims(9, 80, 64), (3, 8, 10));
+        assert_eq!(
+            super::model_vace::vae_tiling(super::config::MODEL_ID_VACE),
+            Some(super::model_vace::ProviderVae::VAE_TILING)
+        );
+        assert_eq!(
+            super::vae_tiling(super::MODEL_ID),
+            Some(super::WAN_Z48_VAE_TILING)
+        );
+        for id in [
+            super::config::MODEL_ID_T2V_14B,
+            super::config::MODEL_ID_I2V_14B,
+            super::config::MODEL_ID_VACE,
+        ] {
+            assert_eq!(super::vae_tiling(id), Some(super::WAN_Z16_VAE_TILING));
+        }
+        assert_eq!(super::vae_tiling("not_wan"), None);
+    }
+}
 
 /// Operational Wan video ceiling: `1 + 4 * 256` pixel frames.
 pub(crate) const MAX_WAN_FRAMES: usize = 1025;
@@ -93,7 +158,36 @@ use rope::WanRope;
 use scheduler::{flow_shift, FlowScheduler, Sampler};
 use text_encoder::Umt5Encoder;
 use transformer::WanTransformer;
-use vae::WanVae;
+
+/// The DiT source is resolved exactly once when the generator is loaded. The native-GGUF seam is
+/// process-global today, but generation must never re-read it: doing so could make a generator whose
+/// admission contract was calibrated from the snapshot execute a different weight representation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DitSource {
+    Snapshot,
+    NativeGguf(PathBuf),
+}
+
+impl DitSource {
+    pub(crate) fn from_environment() -> Self {
+        crate::gguf::env_gguf_path().map_or(Self::Snapshot, Self::NativeGguf)
+    }
+
+    fn gguf_path(&self) -> Option<&Path> {
+        match self {
+            Self::Snapshot => None,
+            Self::NativeGguf(path) => Some(path),
+        }
+    }
+}
+
+/// Concrete z48 VAE assigned to the TI2V-5B route.
+pub type Ti2vProviderVae = vae::WanVae;
+
+/// Resolve the TI2V-5B route's load-bearing VAE geometry.
+pub fn ti2v_vae_tiling(provider_id: &str) -> Option<candle_gen::gen_core::tiling::VaeTiling> {
+    (provider_id == MODEL_ID).then_some(Ti2vProviderVae::VAE_TILING)
+}
 
 /// The 5B DiT runs bf16 (native checkpoint dtype); the UMT5 encoder runs bf16 (sc-12778 — halving the
 /// f32 encoder's ~24 GB ENCODE-stage transient to ~12 GB, the 5B sequential <16 GB lever, epic
@@ -108,7 +202,7 @@ const Z_DIM: usize = 48;
 struct Components {
     te: Arc<Umt5Encoder>,
     dit: Arc<WanTransformer>,
-    vae: Arc<WanVae>,
+    vae: Arc<Ti2vProviderVae>,
     vae_has_encoder: bool,
     /// UMT5 tokenizer, loaded+parsed **once** at component load and reused across every prompt/branch
     /// encode (sc-8991 / F-011) rather than re-parsing `tokenizer.json` per request.
@@ -127,6 +221,7 @@ struct Pipeline {
     vae_cfg: VaeConfig,
     root: PathBuf,
     device: Device,
+    dit_source: DitSource,
     /// LoRA/LoKr adapters to apply to the DiT at load (sc-10095). On a dense tier they FOLD into the
     /// weights ([`adapters::merge_adapters`]); on a packed q4/q8 tier they attach as forward-time
     /// **additive** residuals ([`adapters::install_additive`], sc-10094) — a packed tier has no dense
@@ -146,7 +241,12 @@ fn validate_ti2v_adapter_routing(adapters: &[AdapterSpec]) -> CResult<()> {
 }
 
 impl Pipeline {
-    fn load(root: &Path, device: &Device, adapters: Vec<AdapterSpec>) -> Self {
+    fn load(
+        root: &Path,
+        device: &Device,
+        adapters: Vec<AdapterSpec>,
+        dit_source: DitSource,
+    ) -> Self {
         Self {
             adapters,
             te_cfg: TextEncoderConfig::umt5_xxl(),
@@ -154,6 +254,7 @@ impl Pipeline {
             vae_cfg: VaeConfig::ti2v_5b(),
             root: root.to_path_buf(),
             device: device.clone(),
+            dit_source,
         }
     }
 
@@ -202,15 +303,15 @@ impl Pipeline {
 
     /// Build the z48 vae22 VAE (f32) — the decode-stage component. Shared by the resident and staged
     /// paths so the residency change stays a residency change only (sc-12757).
-    fn load_vae(&self) -> CResult<WanVae> {
-        Ok(WanVae::new(
+    fn load_vae(&self) -> CResult<Ti2vProviderVae> {
+        Ok(Ti2vProviderVae::new(
             &self.vae_cfg,
             self.component_vb("vae", VAE_DTYPE)?,
         )?)
     }
 
-    fn load_vae_with_encoder(&self) -> CResult<WanVae> {
-        Ok(WanVae::new_with_encoder(
+    fn load_vae_with_encoder(&self) -> CResult<Ti2vProviderVae> {
+        Ok(Ti2vProviderVae::new_with_encoder(
             &self.vae_cfg,
             self.component_vb("vae", VAE_DTYPE)?,
         )?)
@@ -224,13 +325,13 @@ impl Pipeline {
     /// (non-MoE) DiT, so every adapter is shared (`moe_expert = None`); the `expert` arg is a formality.
     fn build_dit(&self) -> CResult<WanTransformer> {
         validate_ti2v_adapter_routing(&self.adapters)?;
-        // sub-story-1 test seam (sc-12735): a native-GGUF k-quant DiT path, selected by the
-        // `CANDLE_GEN_WAN_GGUF` env var pointing at a downloaded `QuantStack/Wan2.2-TI2V-5B-GGUF` `.gguf`.
+        // sub-story-1 test seam (sc-12735): a native-GGUF k-quant DiT path, selected once at generator
+        // load from `CANDLE_GEN_WAN_GGUF`. Never re-read the environment here: the captured source is
+        // part of the loaded generator's identity and a GGUF source has no SC-19223 calibration.
         // The DiT is held as resident Q4_K_M `QTensor`s (dequant-on-matmul) — the loader-proof this PR
-        // lands. It is deliberately absent from the manifest/catalog (pinned by the explicit registry
-        // test below), so it is not a selectable product tier. Reject an adapter stack on this env-only
-        // seam rather than letting a test override silently change product semantics.
-        if let Some(gguf) = crate::gguf::env_gguf_path() {
+        // lands. Manifest/catalog/tier routing is sub-story 2; adapter routing on this path is a later
+        // sub-story, so a LoRA/LoKr spec on the GGUF seam is rejected loudly rather than silently ignored.
+        if let Some(gguf) = self.dit_source.gguf_path() {
             if !self.adapters.is_empty() {
                 return Err(CandleError::Msg(format!(
                     "wan: the env-only native-GGUF test seam ({}) is not a registered adapter tier",
@@ -238,7 +339,7 @@ impl Pipeline {
                 )));
             }
             return Ok(crate::gguf::load_wan_dit_gguf(
-                &gguf,
+                gguf,
                 &self.dit_cfg,
                 &self.device,
                 DIT_DTYPE,
@@ -334,7 +435,7 @@ impl Pipeline {
     fn prepare_ti2v(
         &self,
         req: &GenerationRequest,
-        vae: &WanVae,
+        vae: &Ti2vProviderVae,
         noise: &Tensor,
         t_lat: usize,
         h_lat: usize,
@@ -550,9 +651,12 @@ impl Pipeline {
         // Memory-bounded z48 vae22 decode (sc-7111): the per-frame streaming `decode` already bounds
         // the temporal axis; `decode_budgeted` adds budgeted **spatial** tiling so a single high-res
         // frame can't spike VRAM, and returns a catchable error rather than OOM-ing when over budget.
-        let decoded = comps
-            .vae
-            .decode_budgeted_with_cancel(&latents, &req.cancel)?;
+        let decode_cap = memory_strategy::selected_decode_cap(req)?;
+        let decoded = comps.vae.decode_budgeted_with_cancel_and_tile_cap(
+            &latents,
+            &req.cancel,
+            decode_cap,
+        )?;
         let images = pipeline::frames_to_images(&decoded)?;
         Ok((images, knobs.fps))
     }
@@ -673,7 +777,9 @@ impl Pipeline {
             |vae, st| {
                 (st.on_progress)(Progress::Decoding);
                 let latents = st.latents.as_ref().expect("latents denoised in stage 2");
-                let decoded = vae.decode_budgeted_with_cancel(latents, cancel)?;
+                let decode_cap = memory_strategy::selected_decode_cap(req)?;
+                let decoded =
+                    vae.decode_budgeted_with_cancel_and_tile_cap(latents, cancel, decode_cap)?;
                 let images = pipeline::frames_to_images(&decoded)?;
                 Ok((images, knobs.fps))
             },
@@ -718,8 +824,11 @@ struct SeqState<'a> {
 
 pub struct WanGenerator {
     descriptor: ModelDescriptor,
+    memory_strategy: Option<gen_core::MemoryProviderContract>,
+    memory_tier: Option<gen_core::MemoryNumericTier>,
     root: PathBuf,
     device: Device,
+    dit_source: DitSource,
     /// LoRA/LoKr adapters applied to the DiT at first load (sc-10095) — folded (dense) or additive
     /// (packed q4/q8 tier).
     adapters: Vec<AdapterSpec>,
@@ -730,21 +839,83 @@ pub struct WanGenerator {
     /// keeping the ~11 GB bf16 UMT5 encoder (sc-12778) off-GPU. The resident [`components`](Self::components) cache
     /// stays untouched under `Sequential` — the staged path never populates it.
     offload: OffloadPolicy,
+    /// Serializes complete requests so a staged request can synchronize and release a prior warm
+    /// resident cache without racing another request that holds cloned component `Arc`s.
+    lifecycle: Mutex<()>,
     components: Mutex<Option<Components>>,
 }
 
+fn run_serialized_request<T>(
+    lifecycle: &Mutex<()>,
+    run: impl FnOnce() -> gen_core::Result<T>,
+) -> gen_core::Result<T> {
+    let _lifecycle = candle_gen::lock_recover(lifecycle);
+    run()
+}
+
+fn release_warm_cache_for_staged<T>(
+    cache: &Mutex<Option<T>>,
+    synchronize: impl FnOnce() -> CResult<()>,
+) -> CResult<bool> {
+    let mut cached = candle_gen::lock_recover(cache);
+    if cached.is_none() {
+        return Ok(false);
+    }
+    // A completed resident request may still have queued kernels referencing the cached weights.
+    // Fence first; on a fence failure retain the cache and fail closed rather than releasing live
+    // allocations. The caller's lifecycle lock proves no concurrent request holds another clone.
+    synchronize()?;
+    drop(cached.take());
+    Ok(true)
+}
+
+fn load_or_replace_cached_variant<T: Clone>(
+    cache: &Mutex<Option<T>>,
+    needs_replacement: impl FnOnce(&T) -> bool,
+    synchronize: impl FnOnce() -> CResult<()>,
+    load: impl FnOnce() -> CResult<T>,
+) -> CResult<T> {
+    let mut cached = candle_gen::lock_recover(cache);
+    if cached.as_ref().is_some_and(needs_replacement) {
+        // A completed request may still have queued kernels referencing the old VAE variant. Fence
+        // before releasing it; on failure retain the live cache and fail closed.
+        synchronize()?;
+        drop(cached.take());
+    }
+    if cached.is_none() {
+        *cached = Some(load()?);
+    }
+    Ok(cached.as_ref().expect("component cache populated").clone())
+}
+
 impl WanGenerator {
-    #[allow(clippy::unnecessary_map_or)] // `Option::is_none_or` is newer than the repository MSRV.
+    fn pipeline(&self) -> Pipeline {
+        Pipeline::load(
+            &self.root,
+            &self.device,
+            self.adapters.clone(),
+            self.dit_source.clone(),
+        )
+    }
+
     fn components(&self, pipe: &Pipeline, with_vae_encoder: bool) -> gen_core::Result<Components> {
-        let mut slot = candle_gen::lock_recover(&self.components);
-        if slot.as_ref().map_or(true, |components| {
-            components.vae_has_encoder != with_vae_encoder
-        }) {
-            // Do not keep both VAE variants resident while switching request modes.
-            *slot = None;
-            *slot = Some(pipe.load_components(with_vae_encoder)?);
+        Ok(load_or_replace_cached_variant(
+            &self.components,
+            |components| components.vae_has_encoder != with_vae_encoder,
+            || Ok(self.device.synchronize()?),
+            || pipe.load_components(with_vae_encoder),
+        )?)
+    }
+
+    fn request_offload(&self, req: &GenerationRequest) -> OffloadPolicy {
+        if req.memory.is_some_and(|memory| memory.stage_residency) {
+            OffloadPolicy::Sequential
+        } else {
+            // An explicit Resident selection is represented by no request memory block. Preserve
+            // the policy with which this generator was loaded instead of silently overriding a
+            // caller-owned Sequential load.
+            self.offload
         }
-        Ok(slot.as_ref().expect("component cache populated").clone())
     }
 }
 
@@ -886,23 +1057,62 @@ impl Generator for WanGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
-        let pipe = Pipeline::load(&self.root, &self.device, self.adapters.clone());
-        // Sequential offload (sc-12757): stage load→use→drop each heavy component so the denoise peak is
-        // the DiT alone — the ~11 GB bf16 UMT5 encoder is off-GPU for the whole denoise and the DiT is
-        // freed before the VAE loads. Resident (default): the cached `Components` bundle, unchanged path.
-        // The staged path never populates the resident cache.
-        let (frames, fps) = match self.offload {
-            OffloadPolicy::Sequential => pipe.render_sequential(req, on_progress)?,
-            OffloadPolicy::Resident => {
-                let components = self.components(&pipe, needs_ti2v_encoder(req))?;
-                pipe.render(req, &components, on_progress)?
-            }
-        };
-        Ok(GenerationOutput::Video {
-            frames,
-            fps,
-            audio: None,
+        run_serialized_request(&self.lifecycle, || {
+            let pipe = self.pipeline();
+            // Sequential offload (sc-12757): stage load→use→drop each heavy component so the
+            // denoise peak is the DiT alone. A request-selected staged transition must first evict a
+            // cache warmed by an earlier Resident request; otherwise it would load TE/DiT/VAE beside
+            // the still-resident aggregate and invalidate the published phase envelope.
+            let (frames, fps) = match self.request_offload(req) {
+                OffloadPolicy::Sequential => {
+                    release_warm_cache_for_staged(&self.components, || {
+                        Ok(self.device.synchronize()?)
+                    })?;
+                    pipe.render_sequential(req, on_progress)?
+                }
+                OffloadPolicy::Resident => {
+                    let components = self.components(&pipe, needs_ti2v_encoder(req))?;
+                    pipe.render(req, &components, on_progress)?
+                }
+            };
+            Ok(GenerationOutput::Video {
+                frames,
+                fps,
+                audio: None,
+            })
         })
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        self.memory_strategy.as_ref()
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        let (Some(contract), Some(tier)) = (self.memory_strategy.as_ref(), self.memory_tier) else {
+            return if context.selection.strategy == gen_core::MemoryStrategy::Resident {
+                gen_core::MemorySafetyDecision::Accept
+            } else {
+                gen_core::MemorySafetyDecision::Reject {
+                    reason: format!(
+                        "{MODEL_ID} loaded route has no calibrated memory-strategy contract"
+                    ),
+                }
+            };
+        };
+        memory_strategy::safety_check(contract, tier, context)
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        let (Some(contract), Some(tier)) = (self.memory_strategy.as_ref(), self.memory_tier) else {
+            return Ok(None);
+        };
+        memory_strategy::begin_request(contract, tier, self.device.clone(), context)
     }
 }
 
@@ -961,6 +1171,7 @@ pub fn descriptor() -> ModelDescriptor {
             // frees the dense DiT before the VAE loads, bounding the pre-decode peak. Advertised so the
             // worker's fit-gate can tell "bounds peak here" from a no-op fallback.
             supports_sequential_offload: true,
+            unconditionally_engages_staged_residency: false,
             supports_preview: false,
             supports_prompt_enhancement: false,
             supports_streaming: false,
@@ -993,6 +1204,13 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 /// policy, returning the concrete [`WanGenerator`] so the offload-policy wiring is unit-testable without
 /// a `dyn Generator` downcast (sc-12757, mirroring the A14B's `build_generator`).
 fn build_generator(spec: &LoadSpec) -> gen_core::Result<WanGenerator> {
+    build_generator_with_source(spec, DitSource::from_environment())
+}
+
+fn build_generator_with_source(
+    spec: &LoadSpec,
+    dit_source: DitSource,
+) -> gen_core::Result<WanGenerator> {
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),
         WeightsSource::File(_) => {
@@ -1012,15 +1230,29 @@ fn build_generator(spec: &LoadSpec) -> gen_core::Result<WanGenerator> {
             "candle wan does not support ControlNet / VACE / IP-Adapter load overlays".into(),
         ));
     }
+    #[cfg(any(feature = "cuda", test))]
+    let (memory_strategy, memory_tier) =
+        match memory_strategy::contract_for_loaded(spec, &dit_source)? {
+            Some((contract, tier)) => (Some(contract), Some(tier)),
+            None => (None, None),
+        };
+    // The contract declares CandleCuda realization and must not leak from a CPU/Metal-loaded
+    // generator merely because the provider crate is part of that platform's catalog.
+    #[cfg(not(any(feature = "cuda", test)))]
+    let (memory_strategy, memory_tier) = (None, None);
     let device = candle_gen::default_device()?;
     // Video retains the explicit load-time policy contract (sc-12757).
     let offload = spec.offload_policy;
     Ok(WanGenerator {
         descriptor: descriptor(),
+        memory_strategy,
+        memory_tier,
         root,
         device,
+        dit_source,
         adapters: spec.adapters.clone(),
         offload,
+        lifecycle: Mutex::new(()),
         components: Mutex::new(None),
     })
 }
@@ -1033,12 +1265,18 @@ candle_gen::register_generators! {
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    registry
+    let registry = registry
         .register_generator(TI2V_REGISTRATION)
         .register_generator(wan14b::T2V_14B_REGISTRATION)
         .register_generator(wan14b::I2V_14B_REGISTRATION)
         .register_generator(model_vace::VACE_REGISTRATION)
-        .register_generator(model_vace_fun::VACE_FUN_REGISTRATION)
+        .register_generator(model_vace_fun::VACE_FUN_REGISTRATION);
+    #[cfg(any(feature = "cuda", test))]
+    let registry = registry
+        .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(memory_strategy::MEMORY_FIXTURE)
+        .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR);
+    registry
         .register_trainer(training::TRAINER_REGISTRATION)
         .register_trainer(training::I2V_14B_TRAINER_REGISTRATION)
         .register_trainer(training::TI2V_5B_TRAINER_REGISTRATION)
@@ -1047,6 +1285,48 @@ pub fn register_providers(
 /// Build the complete explicit Candle Wan provider catalog.
 pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core::ProviderRegistry> {
     register_providers(candle_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+/// Resolve the concrete Candle Wan VAE geometry used by a registered generator id.
+pub fn vae_tiling(provider_id: &str) -> Option<candle_gen::gen_core::tiling::VaeTiling> {
+    ti2v_vae_tiling(provider_id)
+        .or_else(|| wan14b::vae_tiling(provider_id))
+        .or_else(|| model_vace::vae_tiling(provider_id))
+        .or_else(|| model_vace_fun::vae_tiling(provider_id))
+}
+
+/// Conservative single-pass Wan VAE decode working-set peak for a concrete Candle VAE geometry.
+pub fn conservative_video_decode_peak_bytes_for_vae(
+    vae: candle_gen::gen_core::tiling::VaeTiling,
+    width: u32,
+    height: u32,
+    frames: u32,
+) -> Option<u64> {
+    if vae == wan14b::ProviderVae::VAE_TILING {
+        vae16::conservative_video_decode_peak_bytes(width, height, frames)
+    } else if vae == Ti2vProviderVae::VAE_TILING {
+        vae::conservative_video_decode_peak_bytes(width, height, frames)
+    } else {
+        None
+    }
+}
+
+/// Resolve the provider-owned conservative VAE decode working-set peak for a Wan generator id.
+pub fn conservative_video_decode_memory_profile(
+    provider_id: &str,
+    width: u32,
+    height: u32,
+    frames: u32,
+) -> Option<candle_gen::VideoDecodeMemoryProfile> {
+    candle_gen::VideoDecodeMemoryProfile::new(
+        conservative_video_decode_peak_bytes_for_vae(
+            vae_tiling(provider_id)?,
+            width,
+            height,
+            frames,
+        )?,
+        0,
+    )
 }
 
 #[cfg(test)]
@@ -1081,6 +1361,23 @@ mod explicit_registry_tests {
             explicit_generators.iter().all(|id| !id.contains("gguf")),
             "the native GGUF loader is an explicit env-only test seam, not a selectable catalog tier"
         );
+    }
+
+    #[test]
+    fn candle_profiles_price_the_requested_frames_without_mlx_rounding() {
+        let peak = |provider_id, frames| {
+            super::conservative_video_decode_memory_profile(provider_id, 64, 64, frames)
+                .map(|profile| profile.working_set_bytes())
+        };
+        for (frames, expected) in [(1, 262_553_600), (9, 265_830_400), (81, 295_321_600)] {
+            assert_eq!(
+                peak(super::config::MODEL_ID_T2V_14B, frames),
+                Some(expected)
+            );
+        }
+        for (frames, expected) in [(1, 377_487_360), (9, 382_730_240), (81, 429_916_160)] {
+            assert_eq!(peak(super::config::MODEL_ID, frames), Some(expected));
+        }
     }
 }
 
@@ -1488,6 +1785,7 @@ mod tests {
             vae_cfg: VaeConfig::ti2v_5b(),
             root: root.to_path_buf(),
             device: Device::Cpu,
+            dit_source: DitSource::Snapshot,
         }
     }
 
@@ -1593,6 +1891,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn descriptor_classifies_staging_as_selectable_not_unconditional() {
+        let caps = descriptor().capabilities;
+        assert!(!caps.unconditionally_engages_staged_residency);
+        assert!(caps.supports_sequential_offload);
+        assert_eq!(
+            caps.staged_residency_availability(),
+            candle_gen::gen_core::StagedResidencyAvailability::Selectable
+        );
+    }
+
     /// The load path copies the residency policy from `LoadSpec::offload_policy`: the default spec stays `Resident` (cached-components, unchanged
     /// path), an explicit `Sequential` spec flips the generator onto the staged `render_sequential`.
     #[test]
@@ -1606,6 +1915,146 @@ mod tests {
         )
         .unwrap();
         assert_eq!(sequential.offload, OffloadPolicy::Sequential);
+    }
+
+    #[test]
+    fn load_captures_dit_source_and_generation_pipeline_reuses_it() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/snap".into()));
+        let snapshot = build_generator_with_source(&spec, DitSource::Snapshot).unwrap();
+        assert_eq!(snapshot.pipeline().dit_source, DitSource::Snapshot);
+
+        let original = DitSource::NativeGguf("/weights/original.gguf".into());
+        let gguf = build_generator_with_source(&spec, original.clone()).unwrap();
+        assert_eq!(gguf.memory_strategy_contract(), None);
+        assert_eq!(gguf.pipeline().dit_source, original);
+        assert_ne!(
+            gguf.pipeline().dit_source,
+            DitSource::NativeGguf("/weights/environment-drift.gguf".into()),
+            "generation must use the source captured at load, not a later environment value"
+        );
+    }
+
+    #[test]
+    fn warm_resident_cache_is_fenced_then_released_before_staging() {
+        struct DropWitness(std::sync::Arc<Mutex<Vec<&'static str>>>);
+        impl Drop for DropWitness {
+            fn drop(&mut self) {
+                candle_gen::lock_recover(&self.0).push("drop-cache");
+            }
+        }
+
+        let log = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let cache = Mutex::new(Some(DropWitness(log.clone())));
+        assert!(release_warm_cache_for_staged(&cache, || {
+            candle_gen::lock_recover(&log).push("synchronize");
+            Ok(())
+        })
+        .unwrap());
+        assert!(candle_gen::lock_recover(&cache).is_none());
+        assert_eq!(
+            *candle_gen::lock_recover(&log),
+            ["synchronize", "drop-cache"],
+            "queued resident work must be fenced before cached weights are dropped"
+        );
+
+        let retained = Mutex::new(Some(7_u8));
+        assert!(release_warm_cache_for_staged(&retained, || {
+            Err(CandleError::Msg("fence failed".into()))
+        })
+        .is_err());
+        assert_eq!(
+            *candle_gen::lock_recover(&retained),
+            Some(7),
+            "a failed fence must retain the warm cache and fail closed"
+        );
+    }
+
+    #[test]
+    fn resident_vae_variant_swap_fences_before_drop_and_retains_on_fence_failure() {
+        #[derive(Clone)]
+        struct CachedVariant {
+            id: &'static str,
+            log: std::sync::Arc<Mutex<Vec<&'static str>>>,
+        }
+        impl Drop for CachedVariant {
+            fn drop(&mut self) {
+                if self.id == "old" {
+                    candle_gen::lock_recover(&self.log).push("drop-old");
+                }
+            }
+        }
+
+        let log = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let cache = Mutex::new(Some(CachedVariant {
+            id: "old",
+            log: log.clone(),
+        }));
+        let replacement = load_or_replace_cached_variant(
+            &cache,
+            |cached| cached.id != "new",
+            || {
+                candle_gen::lock_recover(&log).push("synchronize");
+                Ok(())
+            },
+            || {
+                candle_gen::lock_recover(&log).push("load-new");
+                Ok(CachedVariant {
+                    id: "new",
+                    log: log.clone(),
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(replacement.id, "new");
+        assert_eq!(candle_gen::lock_recover(&cache).as_ref().unwrap().id, "new");
+        assert_eq!(
+            *candle_gen::lock_recover(&log),
+            ["synchronize", "drop-old", "load-new"],
+            "queued work must be fenced before the old resident VAE is dropped and replaced"
+        );
+
+        let retained = Mutex::new(Some(7_u8));
+        assert!(load_or_replace_cached_variant(
+            &retained,
+            |_| true,
+            || Err(CandleError::Msg("fence failed".into())),
+            || Ok(9),
+        )
+        .is_err());
+        assert_eq!(
+            *candle_gen::lock_recover(&retained),
+            Some(7),
+            "a failed fence must retain the old resident VAE variant"
+        );
+    }
+
+    #[test]
+    fn request_lifecycle_serializes_resident_to_staged_transitions() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let lifecycle = std::sync::Arc::new(Mutex::new(()));
+        let active = std::sync::Arc::new(AtomicUsize::new(0));
+        let max_active = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut threads = Vec::new();
+        for _ in 0..2 {
+            let lifecycle = lifecycle.clone();
+            let active = active.clone();
+            let max_active = max_active.clone();
+            threads.push(std::thread::spawn(move || {
+                run_serialized_request(&lifecycle, || {
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_active.fetch_max(now, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .unwrap();
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(max_active.load(Ordering::SeqCst), 1);
     }
 
     /// A liveness witness for the sequential-offload residency tests, mirroring the drop-order witnesses

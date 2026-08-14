@@ -31,6 +31,13 @@ use crate::vae16::WanVae16;
 use crate::wan14b::staged_expert_swap;
 
 pub const MODEL_ID_VACE_FUN: &str = "wan2_2_vace_fun_14b";
+pub type ProviderVae = WanVae16;
+
+/// Resolve the VACE-Fun route's load-bearing z16 VAE geometry.
+pub fn vae_tiling(provider_id: &str) -> Option<candle_gen::gen_core::tiling::VaeTiling> {
+    (provider_id == MODEL_ID_VACE_FUN).then_some(ProviderVae::VAE_TILING)
+}
+
 const DIT_DTYPE: DType = DType::BF16;
 const ENC_DTYPE: DType = DType::BF16;
 const VAE_DTYPE: DType = DType::F32;
@@ -73,7 +80,7 @@ fn weighted_control_scale(control_scale: Option<f32>, masking_strength: f32) -> 
 #[derive(Clone)]
 struct SharedComponents {
     te: Arc<Umt5Encoder>,
-    vae: Arc<WanVae16>,
+    vae: Arc<ProviderVae>,
     tok: Arc<candle_gen::gen_core::tokenizer::TextTokenizer>,
 }
 
@@ -643,6 +650,7 @@ pub fn descriptor() -> ModelDescriptor {
             supports_kv_cache: false,
             requires_sigma_shift: false,
             supports_sequential_offload: true,
+            unconditionally_engages_staged_residency: false,
             supports_preview: false,
             supports_prompt_enhancement: false,
             supports_streaming: false,

@@ -6,7 +6,7 @@
 //! continuity, and VAE-decode each segment back to pixels.
 //!
 //! Reuse map — the heavy components are `mlx-gen-wan`'s (SCAIL-2 *is* Wan2.1-14B I2V): the z16
-//! [`WanVae`] (encode/decode), the [`Umt5Encoder`] text encoder, and the flow-matching
+//! [`ProviderVae`] (encode/decode), the [`Umt5Encoder`] text encoder, and the flow-matching
 //! [`make_scheduler`] (UniPC/DPM++). SCAIL-2's own pieces are the [`Scail2Dit`] forward, the
 //! open-CLIP [`ScailClip`] image encode, the 28-channel [`extract_and_compress_mask_to_latent`] mask
 //! build, and the [`interpolate`]/[`downsample_half`] resizes — all already parity-gated.
@@ -27,7 +27,6 @@ use mlx_gen::{AdapterSpec, CancelFlag, Error, GenerationOutput, Image, Progress,
 use mlx_gen_wan::pipeline::auto_tiling_budgeted_z16_quality_overlap;
 use mlx_gen_wan::{
     frames_to_images, load_tokenizer, make_scheduler, DitMemoryConfig, SolverKind, Umt5Encoder,
-    WanVae,
 };
 use mlx_rs::ops::{add, concatenate_axis, maximum, minimum, multiply, subtract};
 use mlx_rs::{random, Array, Dtype};
@@ -37,6 +36,7 @@ use crate::config::Scail2Config;
 use crate::model::{Scail2Dit, Scail2Inputs};
 use crate::preprocess::{extract_and_compress_mask_to_latent, TEMPORAL_STRIDE};
 use crate::resize::{clip_preprocess, downsample_half, interpolate, Interp};
+use crate::{ProviderVae, VAE_TILING};
 
 /// Wan2.1 flow-matching training horizon (upstream `config.num_train_timesteps`).
 const NUM_TRAIN_TIMESTEPS: usize = 1000;
@@ -74,7 +74,7 @@ const SCAIL2_MEM_DEFAULT: DitMemoryConfig = DitMemoryConfig {
 ///
 /// `pub(crate)` because the geometry gate in `pipeline.rs` (sc-16167) must judge the rendered
 /// geometry on the same lattice [`align`] snaps it to, not on the pre-alignment request.
-pub(crate) const DIM_ALIGN: u32 = 32;
+pub(crate) const DIM_ALIGN: u32 = VAE_TILING.spatial_scale as u32 * 4;
 
 /// One masked character reference (the primary subject or an extra character): an RGB image paired
 /// with its color-coded segmentation mask.
@@ -201,7 +201,7 @@ fn stack_masks(masks: &[Image], tw: usize, th: usize) -> Result<Array> {
 
 /// VAE-encode an `[3, T, H, W]` pixel clip (`[-1,1]`) → `[16, T_lat, H/8, W/8]` (drops the batch dim
 /// the `WanVae` API carries).
-fn vae_encode_cthw(vae: &WanVae, cthw: &Array) -> Result<Array> {
+fn vae_encode_cthw(vae: &ProviderVae, cthw: &Array) -> Result<Array> {
     let s = cthw.shape();
     let z = vae.encode(&cthw.reshape(&[1, s[0], s[1], s[2], s[3]])?)?;
     let zs = z.shape(); // [1,16,T_lat,h,w]
@@ -385,7 +385,7 @@ pub fn generate(
     // --- VAE (kept resident: per-segment pose encode + final decode) ---
     let vae = {
         let w = Weights::from_file(root.join("vae.safetensors"))?;
-        WanVae::from_weights(&w)?
+        ProviderVae::from_weights(&w)?
     };
 
     // Reference char latent + its 28-ch mask (1 latent frame).
@@ -673,10 +673,13 @@ pub fn generate(
         on_progress(Progress::Decoding);
         let zs = latent.shape();
         let z = latent.reshape(&[1, zs[0], zs[1], zs[2], zs[3]])?;
-        let out_frames = (seg_end - seg_start) as i32;
+        let z_shape = z.shape();
+        let out_frames = z_shape[2] * VAE_TILING.temporal_scale;
+        let out_height = z_shape[3] * VAE_TILING.spatial_scale;
+        let out_width = z_shape[4] * VAE_TILING.spatial_scale;
         let video = {
             // `Err` is the catchable over-budget signal (raised before the decode, not as a SIGKILL).
-            let cfg = decode_tiling(th as i32, tw as i32, out_frames)?;
+            let cfg = decode_tiling(out_height, out_width, out_frames)?;
             match cfg.as_ref() {
                 // [1,3,T_out,H,W]; `decode_tiled` also falls back to a single pass if it doesn't tile.
                 Some(cfg) => vae.decode_tiled(&z, cfg, Some(cancel))?,

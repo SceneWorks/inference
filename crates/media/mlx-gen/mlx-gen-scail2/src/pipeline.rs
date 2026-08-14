@@ -86,8 +86,10 @@ pub fn descriptor() -> ModelDescriptor {
             component_precision_floors: &[],
             supports_kv_cache: true,
             requires_sigma_shift: false,
-            // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
+            // The root-only provider always stages UMT5 + CLIP ahead of the DiT and has no
+            // request-selectable Resident mode. This is physical staging, not a shared control.
             supports_sequential_offload: false,
+            unconditionally_engages_staged_residency: true,
             supports_preview: false,
             supports_prompt_enhancement: false,
             supports_streaming: false,
@@ -493,6 +495,17 @@ impl Scail2 {
 mod tests {
     use super::*;
     use mlx_gen::ReplacementMode;
+
+    #[test]
+    fn declares_unconditional_staged_residency_without_a_selectable_control() {
+        let capabilities = descriptor().capabilities;
+        assert!(!capabilities.supports_sequential_offload);
+        assert!(capabilities.unconditionally_engages_staged_residency);
+        assert_eq!(
+            capabilities.staged_residency_availability(),
+            mlx_gen::StagedResidencyAvailability::UnconditionallyEngaged,
+        );
+    }
 
     /// A weights-free [`Scail2`] whose [`Scail2::run`] hits the shared floor before any load. Sound
     /// because every check under test runs before `root` is touched, and a *passing* request errors
