@@ -347,115 +347,60 @@ mod tests {
         );
     }
 
-    /// A file under `candle-gen-catalog/`, read from disk rather than linked. (`candle-gen-catalog`
-    /// does **not** depend on this crate today — that is exactly the state these tests exist to
-    /// detect the end of.) `CARGO_MANIFEST_DIR` is stable under `cargo test` and both crates sit in
-    /// `crates/media/candle-gen`, which is the same resolution `candle-gen-catalog`'s own
-    /// cross-crate source scans use (its `candle_gen_root`).
-    fn catalog_file(relative: &str) -> String {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("candle-gen-minimax-h3 sits inside crates/media/candle-gen")
-            .join("candle-gen-catalog")
-            .join(relative);
-        std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
-    }
-
-    /// Does `candle-gen-catalog`'s manifest declare a dependency on this crate?
-    ///
-    /// A manifest needle rather than a source scan. Two spellings are read:
-    ///
-    /// - this crate's name in any non-comment line of the catalog's own manifest;
-    /// - a `[workspace.dependencies]` entry that **renames** this crate under some other key, which
-    ///   the catalog then inherits with `workspace = true`. `cargo metadata` reports that edge, and
-    ///   the catalog's own manifest need not name this crate at all, so the first needle alone can
-    ///   miss it (sc-18659).
-    ///
-    /// Comment lines are skipped: a `#` line cannot create a dependency edge, and the catalog
-    /// already carries prose about this crate's deliberate absence (`licenses.rs`).
-    ///
-    /// What is guarded is the pair above. A route that reaches this crate without naming it in
-    /// either manifest — an intermediate crate that re-exports it, for instance — is not covered.
-    fn catalog_depends_on_this_crate() -> bool {
-        let catalog = catalog_file("Cargo.toml");
-        catalog
-            .lines()
-            .filter(|line| !line.trim_start().starts_with('#'))
-            .any(|line| line.contains(THIS_CRATE))
-            || workspace_aliases_for_this_crate()
-                .iter()
-                .any(|alias| manifest_declares_key(&catalog, alias))
-    }
-
-    /// This crate's package name, as a dependency key would spell it.
+    /// This crate's package name, as `cargo metadata` reports it.
     const THIS_CRATE: &str = "candle-gen-minimax-h3";
 
-    /// The workspace root manifest, read from disk. This crate sits four levels below it, at
-    /// `crates/media/candle-gen/candle-gen-minimax-h3`.
-    fn workspace_root_manifest() -> String {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+    /// The catalog crate whose dependency edge on this one is the tripwire.
+    const CATALOG_CRATE: &str = "candle-gen-catalog";
+
+    /// Does `candle-gen-catalog` declare a dependency on this crate?
+    ///
+    /// Asked of `cargo metadata --no-deps --offline`, which is Cargo's own parse of the workspace
+    /// manifests. Every workspace member reports its declared dependencies with each dependency's
+    /// **package** name already resolved, so renames, quoting style, dotted keys,
+    /// `workspace = true` inheritance and the `dev-`/`build-`/`target.'cfg(…)'` sections all arrive
+    /// in the same `name` field and fall to one comparison. Lexing the TOML by hand instead is what
+    /// let four spellings of the documented rename route go green (sc-18659).
+    ///
+    /// `--no-deps` scopes the answer to what the catalog *itself* declares: a route that reaches
+    /// this crate transitively, through an intermediate crate that depends on it, is not covered.
+    fn catalog_depends_on_this_crate() -> bool {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .ancestors()
             .nth(4)
-            .expect("candle-gen-minimax-h3 sits four levels under the workspace root")
-            .join("Cargo.toml");
-        std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
-    }
-
-    /// The keys `[workspace.dependencies]` gives this crate under some *other* name — both the
-    /// inline `alias = { package = "candle-gen-minimax-h3", … }` form and the
-    /// `[workspace.dependencies.alias]` table form.
-    fn workspace_aliases_for_this_crate() -> Vec<String> {
-        let manifest = workspace_root_manifest();
-        let renamed = format!("package = \"{THIS_CRATE}\"");
-        let mut aliases = Vec::new();
-        // `Some(None)` is the inline `[workspace.dependencies]` table; `Some(Some(alias))` is a
-        // `[workspace.dependencies.alias]` section; `None` is anywhere else in the manifest.
-        let mut section: Option<Option<String>> = None;
-        for line in manifest.lines().map(str::trim) {
-            if line.starts_with('#') {
-                continue;
-            }
-            if let Some(header) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-                section = match header {
-                    "workspace.dependencies" => Some(None),
-                    _ => header
-                        .strip_prefix("workspace.dependencies.")
-                        .map(|alias| Some(alias.to_string())),
-                };
-                continue;
-            }
-            if !line.contains(&renamed) {
-                continue;
-            }
-            match &section {
-                // `alias = { package = "…", … }`
-                Some(None) => {
-                    if let Some((key, _)) = line.split_once('=') {
-                        aliases.push(key.trim().to_string());
-                    }
-                }
-                // `[workspace.dependencies.alias]` … `package = "…"`
-                Some(Some(alias)) => aliases.push(alias.clone()),
-                None => {}
-            }
-        }
-        aliases
-    }
-
-    /// Whether `manifest` declares a dependency keyed `name`, as either a `name = …` entry or a
-    /// `[…dependencies.name]` section header.
-    fn manifest_declares_key(manifest: &str, name: &str) -> bool {
-        manifest.lines().map(str::trim).any(|line| {
-            if line.starts_with('#') {
-                return false;
-            }
-            match line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-                Some(header) => header.ends_with(&format!(".{name}")),
-                None => line
-                    .strip_prefix(name)
-                    .is_some_and(|rest| rest.trim_start().starts_with('=')),
-            }
-        })
+            .expect("candle-gen-minimax-h3 sits four levels under the workspace root");
+        let output = std::process::Command::new(env!("CARGO"))
+            .args([
+                "metadata",
+                "--no-deps",
+                "--offline",
+                "--format-version",
+                "1",
+                "--manifest-path",
+            ])
+            .arg(root.join("Cargo.toml"))
+            .output()
+            .unwrap_or_else(|error| panic!("cargo metadata: {error}"));
+        assert!(
+            output.status.success(),
+            "cargo metadata failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("cargo metadata emits JSON");
+        let catalog = metadata["packages"]
+            .as_array()
+            .expect("cargo metadata reports a `packages` array")
+            .iter()
+            .find(|package| package["name"] == CATALOG_CRATE)
+            .unwrap_or_else(|| {
+                panic!("{CATALOG_CRATE} is not a workspace member — this check would answer `false` for the wrong reason")
+            });
+        catalog["dependencies"]
+            .as_array()
+            .expect("a package reports a `dependencies` array")
+            .iter()
+            .any(|dependency| dependency["name"] == THIS_CRATE)
     }
 
     /// Every `.rs` under `candle-gen-catalog/src`, at any depth, concatenated — used only to check
@@ -480,13 +425,23 @@ mod tests {
     }
 
     /// Appends the text of every `.rs` file at or below `dir`.
+    ///
+    /// Symlinks are skipped. `Path::is_dir` resolves them, so a link would be followed into whatever
+    /// tree it points at, and a broken `*.rs` link would panic in `read_to_string`.
     fn push_rs_sources(dir: &Path, sources: &mut Vec<String>) {
         let entries = std::fs::read_dir(dir)
             .unwrap_or_else(|error| panic!("{}: {error}", dir.display()))
             .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap_or_else(|error| panic!("{}: {error}", dir.display()));
-        for path in entries.iter().map(|entry| entry.path()) {
-            if path.is_dir() {
+        for entry in &entries {
+            let path = entry.path();
+            let file_type = entry
+                .file_type()
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
                 push_rs_sources(&path, sources);
             } else if path.extension().is_some_and(|ext| ext == "rs") {
                 sources.push(
@@ -512,9 +467,9 @@ mod tests {
     /// the safety property the declaration's doc comment claims, actually guarded: the failure
     /// message names the line to add.
     ///
-    /// The `Err` arm's needle is the catalog's *manifest*, not its sources — see
-    /// [`catalog_depends_on_this_crate`] for the two spellings it reads and the route it does not
-    /// cover. Sources are the wrong needle here: a generator registered straight from the catalog
+    /// The `Err` arm's needle is the catalog's declared *dependencies*, not its sources — see
+    /// [`catalog_depends_on_this_crate`] for what that covers and the one route it does not.
+    /// Sources are the wrong needle here: a generator registered straight from the catalog
     /// would never pass through this crate's inventory and would leave the memory contract
     /// unregistered, and it could be written in any catalog module, so a scan of `lib.rs` alone
     /// goes green in exactly the state this test exists to catch.

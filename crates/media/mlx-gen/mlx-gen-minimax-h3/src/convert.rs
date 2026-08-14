@@ -173,7 +173,7 @@ impl AdaLnTierPolicy {
     /// | q8 | 53.07 GB | 71.0 | 1.83 |
     /// | bf16 | 52.81 GB | 71.1 | 1.80 |
     ///
-    /// **bf16 carries a 26_020_915_200 B AdaLN and peaks the same as q4's**, and the
+    /// **bf16 carries a 26_020_915_200 B AdaLN and peaks the same as q4 does**, and the
     /// column is flat across tier **by construction**: the dense Qwen3-VL-32B text encoder runs
     /// first and masks every later stage, so while the conditioning stage binds, no DiT-side width
     /// — AdaLN's or any other group's — can move the number. That is the whole of what this table
