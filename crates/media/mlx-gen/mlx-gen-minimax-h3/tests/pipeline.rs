@@ -10,15 +10,19 @@
 //!
 //! The obvious repair — time the call, time the readback, gate the ratio — reaches for the right
 //! property through the wrong instrument. A wall-clock ratio moves with *host load*, not with the
-//! code, and this test carried two of them. Reproducing the reported flake under deliberate load
-//! (sc-19452) pinned down which one actually breaks, and it is not the one the reports named: the
-//! **mutation arm's** ratio, which gates an eval-free render at `< 50%` and reads ~25% on a quiet
-//! machine, came back at **72.9 / 75.0%**. Its in-region half is pure CPU graph-building, which
-//! starves under CPU contention, while its deferred half is GPU compute, which does not starve in
-//! step — so a busy host makes the *deliberately uncancellable* implementation look cancellable.
-//! That also fits the three reported readings (65.9 / 74.1 / 76.8) far better than the real path's
-//! ratio does: that one held at 94.8-99.1% across every loaded run measured here, well clear of
-//! its `> 90.0` floor. Three false reds, each charged to whatever unrelated PR was in flight.
+//! code, and this test carried two of them. Reproducing the flake deliberately (sc-19452) showed
+//! **both** break, and that the more fragile one is not the one the reports named. Sixteen loaded
+//! runs of the pre-fix test produced five failures: four in the **mutation arm** — the control that
+//! gates an eval-free render at `< 50%` and reads ~25% on a quiet machine — at 52.1 / 72.9 / 75.0%,
+//! and one in the real path's `> 90.0`, at 86.3%. The mutant arm is the weaker of the two because
+//! its in-region half is pure CPU graph-building, which starves under contention, while its
+//! deferred half is GPU compute, which does not starve in step: a busy host makes the
+//! *deliberately uncancellable* implementation look cancellable, so the guard's own control is what
+//! load breaks first. The three readings the story reports (65.9 / 74.1 / 76.8) sit in that band
+//! rather than the real path's. Either way, three false reds charged to unrelated PRs in flight.
+//!
+//! Neither ratio moves under CPU load alone — five runs at load average 18 stayed green, because
+//! CPU contention scales both halves together. It took *cross-process* Metal contention on top.
 //!
 //! The false-green side was **measured rather than inferred**: with the terminal `eval` in
 //! [`render_latents`] deleted — a real regression in exactly the region under test — the old
@@ -35,7 +39,8 @@
 //! places — every step's inputs, [`mlx_gen_minimax_h3::denoise_av`]'s outputs, and
 //! [`render_latents`]'s outputs — and its mutation arm shows all three readings inverted for an
 //! eval-free render, so the instrument is demonstrated to discriminate rather than assumed to. No
-//! clock is involved, so no amount of host load can move any of it.
+//! clock is involved, so no amount of host load can move any of it — see [`is_materialized`] for
+//! the one production property that guarantee rests on.
 
 mod common;
 
@@ -66,17 +71,30 @@ fn layout(g: &RequestGeometry) -> PackedLayout {
 /// produces it has actually happened, rather than sitting in an unscheduled graph waiting for
 /// somebody to force it.
 ///
-/// `_mlx_array_is_available` is mlx-c's accessor for `mlx::core::array::is_available()`, which is
-/// `false` for every array an op returned until an `eval` (or a host readback) schedules it *and*
-/// its completion event signals. That makes it a direct, binary reading of the exact property the
-/// cancellation contract depends on, with no clock and therefore no load sensitivity: an `eval`
-/// inside the cancel-checked region flips it to `true` before the region ends, and a render that
-/// defers its compute past every check leaves it `false`.
+/// `_mlx_array_is_available` is mlx-c's accessor for `mlx::core::array::is_available()`: the status
+/// is `available`, or it is `evaluated` with the completion event signalled or absent. A
+/// **synchronous** `mlx_rs::transforms::eval` — the only kind this crate uses — attaches no event
+/// and marks its outputs `evaluated` before returning, so the reading is exact and clock-free. That
+/// is where the load-insensitivity comes from, and it is conditional: if a production `eval` here
+/// were ever switched to `async_eval`, this would become a race against the event signal and would
+/// have to `wait()` first. Anyone making that change has to revisit this test.
+///
+/// Two precision notes, because the obvious paraphrases are both wrong:
+///
+/// * it is **not** "`false` for anything an op returned". MLX short-circuits identity ops — a
+///   `reshape` to the same shape, a full-range `slice`, an `astype` to the same dtype — by
+///   returning the *input*, which keeps the input's status. A view defers no compute, so the
+///   reading stays semantically right, but the mechanism is not "every op yields unscheduled";
+/// * it is **not** a pure read. `is_available()` detaches the event and promotes the status on the
+///   shared descriptor, non-atomically. Harmless under this repo's forced `RUST_TEST_THREADS = 1`,
+///   but do not treat it as a race-free probe of an `Array` shared across threads.
 ///
 /// mlx-rs exposes no safe wrapper, so the call goes through `mlx-sys` — the same binding crate
 /// `mlx_rs::Array` is built on, so [`Array::as_ptr`] hands back exactly the `mlx_array` this
-/// signature wants. The `unsafe` obligation is only that the handle outlive the call, which the
-/// `&Array` borrow guarantees; the C side merely reads a status word.
+/// signature wants. Two obligations, not one: the handle must outlive the call, which the `&Array`
+/// borrow guarantees; and some mlx-rs op must already have run on this thread, because mlx-rs
+/// installs its error handler lazily inside its own wrappers and mlx-c's default handler is
+/// `exit(-1)` rather than a status return. Every call site here runs after `initial_latents`.
 fn is_materialized(array: &Array) -> bool {
     let mut available = false;
     let status = unsafe { mlx_sys::_mlx_array_is_available(&mut available, array.as_ptr()) };
@@ -87,10 +105,16 @@ fn is_materialized(array: &Array) -> bool {
     available
 }
 
-/// A velocity model that pays real GPU work per step **and records what it was handed**.
+/// A velocity model that does real GPU work per step **and records what it was handed**.
+///
+/// The work needs to be *real* — a genuine multi-primitive graph the loop has to force — but no
+/// longer needs to be *large*: every surviving assertion reads a status bit, which is independent
+/// of how long the graph takes. `DIM`/`MATMULS` were sized for the wall-clock version, whose
+/// companion guard (`total.as_millis() >= 8`, "too cheap to measure on this machine; raise
+/// DIM/MATMULS") went out with the clock, so they are now sized for a cheap test instead.
 ///
 /// Returns a scaled multiple of its input so the loop's arithmetic stays well-conditioned, but pays
-/// `matmuls` square matmuls first — the synthetic stand-in for 50 transformer blocks. Every forward
+/// `matmuls` square matmuls first. Every forward
 /// also stamps [`is_materialized`] over the two latent blocks it received, *before* touching them,
 /// which is what turns "the loop forces each step inside itself" from a timing inference into an
 /// observation: at step `i` those latents are step `i - 1`'s output, so a `false` says step
@@ -170,8 +194,8 @@ impl JointVelocity for Costly {
 #[test]
 fn the_render_core_keeps_its_compute_inside_the_cancel_checked_region() {
     const EVALS: usize = 6;
-    const DIM: i32 = 1536;
-    const MATMULS: usize = 8;
+    const DIM: i32 = 256;
+    const MATMULS: usize = 2;
 
     let g = geometry();
     let l = layout(&g);
@@ -289,8 +313,9 @@ fn the_render_core_keeps_its_compute_inside_the_cancel_checked_region() {
     assert_eq!(
         mutant.inputs_materialized[0],
         (true, true),
-        "the mutant's first step still receives the caller's already-materialized latents; if this \
-         flipped, the readings below would be `false` for a reason other than the missing evals"
+        "the mutant's first step is still handed the caller's already-materialized latents — the \
+         baseline the readings below are a departure from, and the thing that would break first if \
+         this reimplementation stopped starting from the same place the real loop does"
     );
     assert!(
         mutant.inputs_materialized[1..]
@@ -301,9 +326,35 @@ fn the_render_core_keeps_its_compute_inside_the_cancel_checked_region() {
         mutant.inputs_materialized
     );
     assert!(
+        !is_materialized(&mv) && !is_materialized(&ma),
+        "an eval-free loop must leave even its final rows unscheduled — asserted on the loop's own \
+         outputs, not just on the unpacked ones, so the reading does not depend on whether the \
+         unpatchify happens to be a view over them"
+    );
+    assert!(
         !is_materialized(&unpacked) && !is_materialized(&audio_unpacked),
         "an eval-free render must leave its whole schedule for the caller's first readback; it \
          does not, so this reading cannot tell a cancellable tail from an uncancellable one"
+    );
+
+    // The other direction of the control, and the coverage the timing version got for free by
+    // forcing the mutant with `.sum().item()`. Read it back **after** every assertion above, so
+    // the forcing cannot contaminate them, and assert two things: the eval-free reimplementation is
+    // computable end to end rather than merely constructible, and the instrument flips `false` ->
+    // `true` when compute is genuinely forced. Without this it could be stuck at `false` and every
+    // mutant reading above would still pass.
+    let video_sum = unpacked.sum(None).unwrap().item::<f32>();
+    let audio_sum = audio_unpacked.sum(None).unwrap().item::<f32>();
+    assert!(
+        video_sum.is_finite() && audio_sum.is_finite(),
+        "the eval-free mutant must still be a runnable stand-in for the real loop, not just a \
+         graph that builds: got {video_sum} / {audio_sum}"
+    );
+    assert!(
+        is_materialized(&unpacked) && is_materialized(&audio_unpacked),
+        "the readback forced the mutant's whole schedule, so the instrument must now read `true` \
+         for exactly the arrays it read `false` for a moment ago; if it does not, it is stuck low \
+         and every `false` above was worthless"
     );
 }
 
