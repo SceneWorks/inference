@@ -154,18 +154,15 @@ impl AdaLnTierPolicy {
     /// [`crate::dit::adaln::AdaLnCache::precompute`] reads and evaluates all 50 projections
     /// **before** eviction, so a wider AdaLN raises the precompute transient by the same +6.5 GB.
     /// An earlier pass discharged that by asserting the precompute peak "stays under the denoise
-    /// peak, comfortably". That DiT-internal inequality is **retracted** (sc-18659) on two counts.
-    /// Nothing asserts it: `tests/adaln_evict_real_weights.rs` computes `peak_precompute` and
+    /// peak, comfortably". That DiT-internal inequality is **retracted** (sc-18659): nothing
+    /// asserts it. `tests/adaln_evict_real_weights.rs` computes `peak_precompute` and
     /// `peak_denoise` separately, but pins only the post-evict drop, and against the *pre-eviction
-    /// resident* rather than against `peak_precompute`. And the one in-repo measurement of the
-    /// precompute side points the other way —
-    /// [`ADALN_EVICTED_BYTES`](crate::memory_strategy::ADALN_EVICTED_BYTES) records the evict as
-    /// `64.56 -> 38.70 GB` active, so the precompute side sits **above** the residency that
-    /// follows it, not under it.
+    /// resident* rather than against `peak_precompute`.
     ///
     /// What the renders below do establish is the quantity this trade actually spends: the
-    /// **process** high-water. Across a 3.5x span of AdaLN width — 7.3 GB at q4 to
-    /// 26_020_915_200 B at bf16 — it does not move, because the conditioning stage sets it first at
+    /// **process** high-water. Across the full q4-to-bf16 span of AdaLN width — bf16's AdaLN is
+    /// [`26_020_915_200 B`](crate::memory_strategy::ADALN_EVICTED_BYTES) — it does not move,
+    /// because the conditioning stage sets it first at
     /// [`53.07 GB`](crate::memory_strategy::CONDITIONING_STAGE_PEAK_BYTES). Four real renders at
     /// `576x320 / 124 frames / 50 steps`:
     ///
@@ -176,7 +173,7 @@ impl AdaLnTierPolicy {
     /// | q8 | 53.07 GB | 71.0 | 1.83 |
     /// | bf16 | 52.81 GB | 71.1 | 1.80 |
     ///
-    /// **bf16 carries a 26_020_915_200 B AdaLN and peaks the same as q4's 7.3 GB one**, and the
+    /// **bf16 carries a 26_020_915_200 B AdaLN and peaks the same as q4's**, and the
     /// column is flat across tier **by construction**: the dense Qwen3-VL-32B text encoder runs
     /// first and masks every later stage, so while the conditioning stage binds, no DiT-side width
     /// — AdaLN's or any other group's — can move the number. That is the whole of what this table
