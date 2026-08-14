@@ -221,6 +221,10 @@ pub fn safety_check(
 /// root that does not exist — the exact "provider contract with no executable owner" that seam
 /// exists to prevent. The constant is exercised by this module's conformance tests today and gets
 /// its catalog line the moment the generator lands.
+///
+/// That last sentence is a guard, not a hope: it is registered by [`crate::register_providers`],
+/// and `tests::a_generator_landing_here_forces_the_catalog_line` builds *that* inventory, so a
+/// generator joining it flips the test to demanding the catalog line.
 pub const MEMORY_REGISTRATION: candle_gen::gen_core::MemoryRegistration =
     candle_gen::gen_core::MemoryRegistration {
         provider_id: MODEL_ID,
@@ -343,23 +347,76 @@ mod tests {
         );
     }
 
-    /// The registration is deliberately **not** wired into `candle-gen-catalog` yet, and this pins
-    /// why: `build()` rejects a memory strategy whose id has no matching generator, and this crate
-    /// ships none (sc-17156). If a generator ever lands without the catalog line being added, this
-    /// test starts failing and says so.
+    /// `candle-gen-catalog`'s `register_providers` source — the file the missing line belongs in.
+    ///
+    /// Read from disk rather than linked, because the dependency only runs the other way: the
+    /// catalog depends on this crate, so this crate cannot call into it. `CARGO_MANIFEST_DIR` is
+    /// stable under `cargo test` and both crates sit in `crates/media/candle-gen`, which is the same
+    /// resolution `candle-gen-catalog`'s own cross-crate source scans use.
+    fn catalog_source() -> String {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("candle-gen-minimax-h3 sits inside crates/media/candle-gen")
+            .join("candle-gen-catalog/src/lib.rs");
+        std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+    }
+
+    /// **The tripwire on the missing catalog line**, and it reads the crate's *real* registration
+    /// inventory — [`crate::register_providers`], the one function a catalog line would call —
+    /// rather than a builder assembled inside the test, which could never contain a generator and
+    /// so could never detect one arriving.
+    ///
+    /// Today: that inventory has no generator, `build()` rejects the memory strategy for exactly
+    /// that reason, and the catalog therefore must **not** carry the line (it would break
+    /// `candle_gen_catalog::provider_registry()`). Both halves are asserted, so wiring the line
+    /// early fails here too.
+    ///
+    /// The moment sc-17156 adds `.register_generator(…)` to `register_providers`, `build()`
+    /// succeeds, this test takes its other arm, and it fails until the catalog line exists. That is
+    /// the safety property the declaration's doc comment claims, actually guarded: the failure
+    /// message names the line to add.
+    ///
+    /// The `Err` arm deliberately tests the **broader** needle — any `candle_gen_minimax_h3` path
+    /// in the catalog, not only a `register_providers` call. That is what closes the bypass: a
+    /// generator registered straight from the catalog would never pass through this crate's
+    /// inventory, would leave the memory contract unregistered, and would satisfy a narrower check.
     #[test]
-    fn catalog_wiring_waits_on_the_generator_that_does_not_exist_yet() {
-        let orphan = ProviderRegistryBuilder::new()
-            .register_memory_strategy(MEMORY_REGISTRATION)
-            .register_memory_contract_fixture(MEMORY_CONTRACT_FIXTURE)
-            .build();
-        let Err(error) = orphan else {
-            panic!("a memory strategy with no generator must not build");
-        };
-        assert!(
-            error.to_string().contains("no matching generator"),
-            "unexpected rejection: {error}"
-        );
+    fn a_generator_landing_here_forces_the_catalog_line() {
+        let catalog = catalog_source();
+        let reached = catalog.contains("candle_gen_minimax_h3");
+        let wired = catalog.contains("candle_gen_minimax_h3::register_providers");
+        match crate::register_providers(ProviderRegistryBuilder::new()).build() {
+            Err(error) => {
+                assert!(
+                    error.to_string().contains("no matching generator"),
+                    "unexpected rejection: {error}"
+                );
+                assert!(
+                    !reached,
+                    "candle-gen-catalog already reaches candle-gen-minimax-h3, but this crate's \
+                     own `register_providers` still registers no generator. Either the catalog \
+                     line landed early — `provider_registry()` cannot build a memory strategy with \
+                     no matching generator — or a generator was registered straight from the \
+                     catalog and bypassed this crate's inventory, leaving MEMORY_REGISTRATION \
+                     unregistered. Register generators in `candle_gen_minimax_h3::register_providers` \
+                     (sc-17156)"
+                );
+            }
+            Ok(registry) => {
+                let generators: Vec<&str> = registry
+                    .generators()
+                    .map(|registration| (registration.descriptor)().id)
+                    .collect();
+                assert!(
+                    wired,
+                    "this crate now registers generator(s) {generators:?}, so its memory contract \
+                     is finally wirable — add `let registry = \
+                     candle_gen_minimax_h3::register_providers(registry);` to \
+                     candle-gen-catalog's `register_providers` (and the matching `ProviderCrate` \
+                     row), or the contract stays unreachable at runtime (sc-17156)"
+                );
+            }
+        }
     }
 
     // --- AC2: nothing optimized is declared, and nothing optimized is reachable ------------------

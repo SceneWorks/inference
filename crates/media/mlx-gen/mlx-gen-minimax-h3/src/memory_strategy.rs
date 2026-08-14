@@ -1138,8 +1138,30 @@ mod tests {
     /// The stage-attributed peaks, and the relationships between them that the epic measured. The
     /// point of this test is the **attribution**: it fails if someone re-labels the ~53 GB floor as
     /// the DiT's, or drops the tiering win the flat process-wide peak once hid.
+    ///
+    /// Two layers, and both are needed. The **literals** pin each stage peak to the number that
+    /// stage was actually measured at; the **identities** pin the relationships the epic's argument
+    /// rests on. Identities alone are not sufficient: they are relative, so a consistent re-basing
+    /// of the constants — or an edit that moves a constant and its own identity literal together —
+    /// satisfies every one of them while silently re-writing a measurement. These are the three
+    /// numbers most exposed to the mis-attribution class, so they get the same literal anchor the
+    /// AdaLN figure already had.
     #[test]
     fn measured_peaks_stay_attributed_to_the_stage_that_produced_them() {
+        // Each stage peak against the literal it was measured at, independent of the others.
+        assert_eq!(
+            CONDITIONING_STAGE_PEAK_BYTES, 53_070_000_000,
+            "conditioning stage: the dense Qwen3-VL-32B text encoder measured in isolation at \
+             53.07 GB"
+        );
+        assert_eq!(
+            DENOISE_RESIDENT_BF16_BYTES, 40_430_000_000,
+            "denoise stage: bf16 DiT residency after the AdaLN precompute-and-evict, 40.43 GB"
+        );
+        assert_eq!(
+            DENOISE_RESIDENT_Q4_BYTES, 11_630_000_000,
+            "denoise stage: the same residency at q4, 11.63 GB"
+        );
         // The floor is the conditioning stage, not the denoise one.
         const {
             assert!(

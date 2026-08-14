@@ -163,8 +163,15 @@ impl AdaLnTierPolicy {
     /// | q8 | 53.07 GB | 71.0 | 1.83 |
     /// | bf16 | 52.81 GB | 71.1 | 1.80 |
     ///
-    /// **bf16 carries a 26_020_915_200 B AdaLN and peaks the same as q4's 7.3 GB one.** At video
-    /// geometry the peak is activation-dominated, so AdaLN width does not move it at any tier.
+    /// **bf16 carries a 26_020_915_200 B AdaLN and peaks the same as q4's 7.3 GB one.** The
+    /// conclusion holds — AdaLN width does not move the peak at any tier — but the *cause*
+    /// originally recorded here ("the peak is activation-dominated") is **retracted** (sc-18659).
+    /// The dense Qwen3-VL-32B text encoder runs first and sets a
+    /// [`53.07 GB`](crate::memory_strategy::CONDITIONING_STAGE_PEAK_BYTES) process high-water that
+    /// masks every later stage, so this column is flat across tier **by construction**: while the
+    /// conditioning stage binds, no DiT-side width — AdaLN's or any other group's — can move the
+    /// number, and the flatness says nothing about activation pressure. sc-19120's packed TE tier
+    /// is what makes the column informative again.
     ///
     /// # So the decision rests on quality per byte, and there uniform wins clearly
     ///
