@@ -683,9 +683,18 @@ fn the_tile_geometry_changes_the_result() {
 // Surface
 // ---------------------------------------------------------------------------------------------
 
-/// Malformed encode inputs are typed errors, not silent reshapes.
+/// Malformed encode inputs are typed errors, not silent reshapes — **on both tiling settings**,
+/// which are two different code paths.
+///
+/// With tiling on, `encode_clip` goes through `encode_clip_tiled_2d`, which checks the rank up
+/// front. With tiling off it goes through `encode_clip_untiled`, which — unlike
+/// `decode_clip_untiled` — has **no rank check of its own**, so the rejection comes from
+/// `reflect_pad_axis` inside the first causal conv instead. That is still a typed error naming what
+/// is wrong, and never a silent wrong answer, so the untiled path does not need a check added; it
+/// needs covering, which is what the second half of this test does.
 #[test]
 fn encode_rejects_malformed_input() {
+    use candle_gen_minimax_h3::spatial_tiling::SpatialTiling;
     let f = fixture();
     let v = vae(&f, 3);
     let dev = Device::Cpu;
@@ -705,6 +714,24 @@ fn encode_rejects_malformed_input() {
     // Zero frames.
     let empty = Tensor::zeros((1, 3, 0, 8, 8), DType::F32, &dev).unwrap();
     assert!(v.encode(&empty).is_err());
+
+    // …and with tiling DISABLED, where `encode_clip` reaches `encode_clip_untiled` and there is no
+    // up-front rank check to catch it. The rejection must still be typed and must still name the
+    // axis it could not pad, rather than reshaping the tensor into something plausible.
+    let off = vae(&f, 3).with_tiling(SpatialTiling::disabled());
+    assert!(!off.tiling().enabled);
+    off.encode(&ok)
+        .expect("a well-formed keyframe still encodes");
+    let msg = off
+        .encode_clip(&rank1)
+        .expect_err("an untiled encode of a rank-1 tensor must be refused")
+        .to_string();
+    assert!(
+        msg.contains("reflect pad axis 3 is outside a rank-1 tensor"),
+        "the untiled path must reject it by name, got: {msg}"
+    );
+    assert!(off.encode(&rgba).is_err());
+    assert!(off.encode(&empty).is_err());
 }
 
 /// A VAE built from a weight map **without** the encode half decodes but cannot encode, and says
@@ -872,4 +899,96 @@ fn the_tiling_knobs_select_the_paths_they_name_on_the_encode_half() {
     // default must agree with the untiled path, exactly as it does for decode.
     assert!(f.shape("in.encode_clip.pixels")[3] < TILE_SAMPLE_MIN_SIZE);
     assert_eq!(flat(&base.encode_clip(&pixels).expect("default")), untiled);
+}
+
+/// **The latent-alignment guard is reachable from the ENCODE half's public API**, not merely from
+/// decode's — the twin of `video_vae_parity.rs::a_tile_geometry_the_latent_grid_cannot_express_is_
+/// refused`.
+///
+/// This is a **new error surface on this side**. The encode lane used to carry its own `TilePlan`
+/// with no alignment clause, and `encode_clip` used to pass the shipped constants rather than
+/// `self.tiling`; sharing `spatial_tiling::TilePlan::split` and reading the knobs is what puts
+/// `enable_tiling` in front of this guard for encode. The decode twin gates only its own half — the
+/// decode fixture carries no encoder — so without this test the clause could be neutered on the
+/// encode path alone and every other assertion in both suites would still pass.
+///
+/// The encode fixture's ratio is **4**, not the decode fixture's 2, so the geometries refused here
+/// are the ones 4 refuses.
+#[test]
+fn an_encode_tile_geometry_the_latent_grid_cannot_express_is_refused() {
+    let f = fixture();
+    let pixels = f.tensor("in.encode_clip.pixels");
+    let ratio = encode_fixture_config(3).patch_size;
+    assert_eq!(
+        ratio, 4,
+        "this test's odd tile sizes are only misaligned at ratio 4"
+    );
+
+    // A misaligned TILE, at an aligned overlap.
+    let err = vae(&f, 3)
+        .encode_clip_tiled(&pixels, 6, 4)
+        .expect_err("a 6 px tile is 1.5 latent cells and must be refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains(&format!("{ratio}x spatial compression ratio")),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("silently truncated"),
+        "the error must say WHY: {msg}"
+    );
+
+    // A misaligned OVERLAP, at an aligned tile. Asserted on the message, not merely on `is_err`:
+    // a misaligned plan that gets built usually *does* fail somewhere downstream, so a bare
+    // `is_err()` here passes with the clause deleted and gates nothing (measured — it survived the
+    // mutation).
+    let msg = vae(&f, 3)
+        .encode_clip_tiled(&pixels, 8, 2)
+        .expect_err("a 2 px overlap is half a latent cell and must be refused")
+        .to_string();
+    assert!(
+        msg.contains(&format!("{ratio}x spatial compression ratio")),
+        "the overlap must be refused BY THE GUARD, not blow up downstream: {msg}"
+    );
+
+    // …and it reaches through `enable_tiling` / `encode_clip`, which is the surface a caller uses,
+    // and the surface `fl2va` keyframe conditioning goes through.
+    let mut misaligned = vae(&f, 3);
+    misaligned.enable_tiling(Some(3), Some(3), Some(2), Some(2));
+    let msg = misaligned
+        .encode_clip(&pixels)
+        .expect_err("enable_tiling must not be able to smuggle a misaligned plan into encode")
+        .to_string();
+    assert!(
+        msg.contains(&format!("{ratio}x spatial compression ratio")),
+        "{msg}"
+    );
+
+    // **The guard binds BEFORE the sub-tile short circuit.** `TilePlan::split` returns one span
+    // covering the axis whenever `tile_size >= length`, so on a canvas no larger than one tile a
+    // misaligned geometry never reaches the division it would corrupt — it is refused anyway. That
+    // is a behaviour change on this public surface rather than pure strengthening, and it is
+    // deliberate: it is what decode has done since sc-18786.
+    let (h, w) = (
+        f.shape("in.encode_clip.pixels")[3],
+        f.shape("in.encode_clip.pixels")[4],
+    );
+    let sub_tile = h.max(w) * ratio + 1;
+    assert!(
+        sub_tile > h.max(w) && !sub_tile.is_multiple_of(ratio),
+        "the probe must be both misaligned and larger than the {h}x{w} canvas"
+    );
+    let msg = vae(&f, 3)
+        .encode_clip_tiled(&pixels, sub_tile, 0)
+        .expect_err("a misaligned tile is refused even where tiling would be inert")
+        .to_string();
+    assert!(
+        msg.contains(&format!("{ratio}x spatial compression ratio")),
+        "a {sub_tile} px tile over a {h}x{w} canvas must be refused by the guard, not \
+         short-circuited past it: {msg}"
+    );
+
+    // The aligned geometry still encodes, so the guard refuses the misalignment and nothing else.
+    let (tile, overlap) = encode_fixture_tiles(&f);
+    assert!(vae(&f, 3).encode_clip_tiled(&pixels, tile, overlap).is_ok());
 }

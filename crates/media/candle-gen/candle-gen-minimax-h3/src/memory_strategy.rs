@@ -12,9 +12,9 @@
 //!    optimized selection when the identity is absent.
 //! 2. **No staged residency.** MLX declares [`MemoryStrategy::StagedResidency`] `Implemented`
 //!    because `MiniMaxH3::generate_impl` releases each heavy component before mapping the next.
-//!    This crate has **no pipeline at all** — it ships the DiT, the joint denoise and the two VAE
-//!    decoders, and no text encoder and no generator (sc-17156 owns the end-to-end path). There is
-//!    nothing to stage, so rung 1 is `Missing`.
+//!    This crate has **no pipeline at all** — it ships the DiT, the joint denoise, the two VAE
+//!    decoders and the video VAE encoder, and no text encoder and no generator (sc-17156 owns the
+//!    end-to-end path). There is nothing to stage, so rung 1 is `Missing`.
 //! 3. **No fused streaming SDPA.** The MLX verdict that attention scratch is already streamed —
 //!    peak tracking `4·B·H·S·D` with no materialized score tensor — is a property of *MLX's* fused
 //!    kernel and **must not be copied here**. Candle materializes scores, so bounding attention
