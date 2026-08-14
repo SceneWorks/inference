@@ -37,6 +37,7 @@ use mlx_gen::gen_core::{
     GenerationRequest, Generator, KeyframeRef, LoadSpec, Modality, ModelDescriptor, Precision,
     Progress, Quant, SizeFloor, WeightsSource,
 };
+use mlx_gen::runtime::AdapterSpec;
 use mlx_gen::weights::Weights;
 use mlx_gen::{default_seed, Error, Result};
 use mlx_gen_boogu::vision::VisionTower;
@@ -121,8 +122,15 @@ pub fn descriptor() -> ModelDescriptor {
                 ConditioningKind::ReferenceVideo,
                 ConditioningKind::ReferenceAudio,
             ],
-            supports_lora: false,
-            supports_lokr: false,
+            // sc-18724. Every attention/FFN projection in the 50-block stack and the 2-block token
+            // refiner is an `AdaptableLinear` on **every** tier, so the lightx2v turbo LoRAs fold as
+            // forward-time residuals with no dequantization — see [`crate::adapters`], which also
+            // owns the per-file alpha resolution those checkpoints need.
+            supports_lora: true,
+            // LoKr routes through the shared LyCORIS seam on the same host
+            // ([`crate::adapters::apply_minimax_h3_adapters`]); no MiniMax-H3 LoKr is published, but
+            // the surface is real rather than declared, so this is not advertising a stub.
+            supports_lokr: true,
             // The tiers exist and load (sc-17150) — packed offline by `crate::convert` and staged
             // as the [`DIT_COMPONENT`]. `spec.quantize` is reconciled against the staged tier's
             // marker rather than triggering a load-time quantize; see [`reconcile_tier`].
@@ -243,6 +251,10 @@ pub struct MiniMaxH3 {
     /// shared component still comes from the upstream root. See [`resolve_dit_dir`].
     dit_dir: PathBuf,
     dtype: Dtype,
+    /// Adapter files to fold into whichever DiT partition a render maps (sc-18724). Held as specs,
+    /// not as loaded factors: `t2va`/`fl2va` and `ref2va` run different checkpoints, and the DiT is
+    /// mapped and released per render, so the install belongs beside the load rather than here.
+    adapters: Vec<AdapterSpec>,
 }
 
 /// The staged-component id for the **tiered** DiT directory (sc-17150).
@@ -563,10 +575,34 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         }
     };
     reject_unknown_components(spec, &[DIT_COMPONENT], MODEL_ID)?;
-    if !spec.adapters.is_empty() {
-        return Err(Error::Unsupported(format!(
-            "{MODEL_ID}: adapters are not supported"
-        )));
+    // Adapter paths are probed at load so a mistyped one fails here rather than 20 minutes into a
+    // render, after the DiT is mapped. The factors themselves are read and installed per render,
+    // onto the task's own DiT (sc-18724) — `t2va`/`fl2va` and `ref2va` are different checkpoints.
+    for adapter in &spec.adapters {
+        if !adapter.path.is_file() {
+            return Err(Error::Msg(format!(
+                "{MODEL_ID}: adapter {} does not exist",
+                adapter.path.display()
+            )));
+        }
+        // Two shared-spec knobs no MiniMax-H3 path can honor. Surfaced rather than silently ignored,
+        // per their own contract: `pass_scales` is LTX's per-distilled-stage strength and this
+        // denoise is single-pass, `moe_expert` addresses a dual-expert Wan MoE and this DiT is
+        // single-stream.
+        if adapter.pass_scales.is_some() {
+            return Err(Error::Unsupported(format!(
+                "{MODEL_ID}: adapter {} sets per-pass scales, which only LTX's two-stage denoise \
+                 has; this model runs one transformer pass per step — use a uniform `scale`",
+                adapter.path.display()
+            )));
+        }
+        if adapter.moe_expert.is_some() {
+            return Err(Error::Unsupported(format!(
+                "{MODEL_ID}: adapter {} targets a MoE expert; this DiT is single-stream and has \
+                 none",
+                adapter.path.display()
+            )));
+        }
     }
     // The DiT is the one tiered component, so it is probed at its resolved location rather than
     // under the root — a split install has no `root/transformer` at all.
@@ -629,6 +665,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         root,
         dit_dir,
         dtype,
+        adapters: spec.adapters.clone(),
     }))
 }
 
@@ -670,6 +707,26 @@ impl MiniMaxH3 {
     /// The block stack's precision.
     pub fn dtype(&self) -> Dtype {
         self.dtype
+    }
+
+    /// Map `task`'s DiT partition and fold in every configured adapter (sc-18724).
+    ///
+    /// The **single** seam both denoise paths go through, so a LoRA cannot be honored on `t2va` and
+    /// forgotten on `ref2va`. The install happens here rather than in [`load`] because the two tasks
+    /// run different checkpoints and the DiT is mapped and released per render — and it happens
+    /// *before* `JointDit::new`, whose `PrecomputeAndEvict` consumes the model. That ordering is
+    /// safe: nothing in the published turbo set targets `adaln_proj`, and
+    /// [`crate::adapters`] cannot reach it anyway, so the eviction lever is untouched.
+    ///
+    /// The install is **strict**: an unmatched target, or a spec list that matched nothing at all,
+    /// fails the render here rather than producing a plausible one the LoRA barely touched. The
+    /// returned report can therefore carry nothing a caller has to act on, and is dropped.
+    fn load_task_dit(&self, task: MiniMaxH3Task) -> Result<MiniMaxH3Dit> {
+        let mut dit = MiniMaxH3Dit::load_dir(self.task_dit_dir(task), self.dtype)?;
+        if !self.adapters.is_empty() {
+            crate::adapters::apply_minimax_h3_adapters(&mut dit, &self.adapters)?;
+        }
+        Ok(dit)
     }
 
     /// Map the text-encoder shards a presentation needs.
@@ -868,7 +925,7 @@ impl MiniMaxH3 {
         }
 
         // --- 2. denoise ---------------------------------------------------------------------
-        let dit = MiniMaxH3Dit::load_dir(self.task_dit_dir(task), self.dtype)?;
+        let dit = self.load_task_dit(task)?;
         let patch = dit.config().patch_size;
         let layout = if anchors.is_empty() {
             t2va_layout(&geometry, context.shape()[1], patch)?
@@ -1083,7 +1140,7 @@ impl MiniMaxH3 {
             .transpose()?;
 
         // --- 3. denoise on `transformer_ref` ----------------------------------------------------
-        let dit = MiniMaxH3Dit::load_dir(self.task_dit_dir(task), self.dtype)?;
+        let dit = self.load_task_dit(task)?;
         let patch = dit.config().patch_size;
         let layout = ref2va_layout(geometry, &text_tags, &geometries, patch)?;
         let (video_rows, audio_rows) = initial_latents(geometry, patch, seed)?;
@@ -1328,6 +1385,7 @@ mlx_gen::register_generators! {
 mod tests {
     use super::*;
     use mlx_gen::gen_core::CancelFlag;
+    use mlx_gen::runtime::{AdapterKind, MoeExpert};
 
     fn request(width: u32, height: u32) -> GenerationRequest {
         GenerationRequest {
@@ -1345,6 +1403,7 @@ mod tests {
             root: PathBuf::from("/snap"),
             dit_dir: PathBuf::from(dit_dir),
             dtype: Dtype::Bfloat16,
+            adapters: Vec::new(),
         }
     }
 
@@ -1791,6 +1850,111 @@ mod tests {
         let file = LoadSpec::new(WeightsSource::File(dir.path().join("x.safetensors")));
         let e = message(&file);
         assert!(e.contains("directory"), "{e}");
+    }
+
+    /// sc-18724 — the adapter surface is **declared and reachable**, and the two shared-spec knobs
+    /// this model cannot honor are refused rather than silently ignored.
+    ///
+    /// `supports_lora` alone proves nothing: before this slice `load` rejected every adapter spec
+    /// outright, so a `true` there would have advertised a path no request could take.
+    #[test]
+    fn the_adapter_surface_is_declared_and_the_unusable_knobs_are_refused() {
+        let caps = descriptor().capabilities;
+        assert!(caps.supports_lora);
+        assert!(caps.supports_lokr);
+
+        let dir = tempfile::tempdir().unwrap();
+        let message = |spec: &LoadSpec| match load(spec) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("this spec must not load"),
+        };
+        let missing = dir.path().join("nope.safetensors");
+        let with = |adapter: AdapterSpec| {
+            let mut spec = LoadSpec::new(WeightsSource::Dir(dir.path().to_path_buf()));
+            spec.adapters = vec![adapter];
+            spec
+        };
+
+        // A mistyped path fails at load, naming the file — not 20 minutes into a render.
+        let e = message(&with(AdapterSpec::new(
+            missing.clone(),
+            1.0,
+            AdapterKind::Lora,
+        )));
+        assert!(e.contains("does not exist"), "{e}");
+        assert!(e.contains("nope.safetensors"), "{e}");
+
+        // A real file gets past the adapter gate and fails on the (absent) snapshot instead, which
+        // is what proves the gate no longer refuses adapters wholesale.
+        let real = dir.path().join("real.safetensors");
+        std::fs::write(&real, b"not-really-safetensors").unwrap();
+        let e = message(&with(AdapterSpec::new(
+            real.clone(),
+            1.0,
+            AdapterKind::Lora,
+        )));
+        assert!(
+            e.contains("transformer") && !e.contains("adapter"),
+            "an existing adapter must fall through to the snapshot probe; got {e}"
+        );
+
+        // LTX's per-pass strengths and Wan's MoE expert selector have no meaning here.
+        let mut per_pass = AdapterSpec::new(real.clone(), 1.0, AdapterKind::Lora);
+        per_pass.pass_scales = Some(vec![1.0, 0.5]);
+        let e = message(&with(per_pass));
+        assert!(e.contains("per-pass scales"), "{e}");
+        let mut expert = AdapterSpec::new(real, 1.0, AdapterKind::Lora);
+        expert.moe_expert = Some(MoeExpert::High);
+        let e = message(&with(expert));
+        assert!(e.contains("MoE expert"), "{e}");
+    }
+
+    /// sc-18724 — the render-path seam: `load_task_dit` really folds the configured adapters into
+    /// the DiT it maps, on the partition the task selects. The install itself is gated in
+    /// `tests/turbo_lora.rs`; what this adds is that the **generator** reaches it at all.
+    ///
+    /// `MINIMAX_H3_TURBO_DIT` is a `transformer/` directory (any tier) and `MINIMAX_H3_TURBO_LORA`
+    /// the downloaded `lightx2v/Minimax-h3-Turbo` dir.
+    #[test]
+    #[ignore = "needs a real MiniMax-H3 transformer/ (MINIMAX_H3_TURBO_DIT) + the turbo LoRA \
+                (MINIMAX_H3_TURBO_LORA) + Metal"]
+    fn the_render_path_folds_the_configured_adapters() {
+        use mlx_gen::adapters::AdaptableHost;
+
+        let dit_dir = std::env::var("MINIMAX_H3_TURBO_DIT").unwrap_or_default();
+        assert!(
+            !dit_dir.is_empty(),
+            "MINIMAX_H3_TURBO_DIT must point at a MiniMax-H3 `transformer/` directory"
+        );
+        let lora_dir = std::env::var("MINIMAX_H3_TURBO_LORA").unwrap_or_default();
+        assert!(
+            !lora_dir.is_empty(),
+            "MINIMAX_H3_TURBO_LORA must point at a lightx2v/Minimax-h3-Turbo snapshot dir"
+        );
+        let lora =
+            PathBuf::from(lora_dir).join("minimax_h3_fl2v_turbo_8step_v1.0_bf16.safetensors");
+        assert!(lora.is_file(), "missing {}", lora.display());
+
+        let mut gen = generator_at(&dit_dir);
+        gen.adapters = vec![AdapterSpec::new(lora, 1.0, AdapterKind::Lora)];
+        let mut dit = gen
+            .load_task_dit(MiniMaxH3Task::T2va)
+            .unwrap_or_else(|e| panic!("load_task_dit: {e}"));
+
+        // Every one of the 312 published targets carries exactly one residual, reached through the
+        // generator rather than by calling the installer directly.
+        let cfg = dit.config().clone();
+        let mut adapted = 0usize;
+        for path in crate::adapters::adapter_target_paths(&cfg) {
+            let segs: Vec<&str> = path.split('.').collect();
+            let lin = dit
+                .adaptable_mut(&segs)
+                .unwrap_or_else(|| panic!("unreachable target {path}"));
+            assert_eq!(lin.adapters().len(), 1, "{path}");
+            adapted += 1;
+        }
+        println!("[render seam] {adapted} module(s) folded via MiniMaxH3::load_task_dit");
+        assert_eq!(adapted, 312);
     }
 
     /// The requested step count is model EVALUATIONS; the schedule adds the terminal σ = 0.
