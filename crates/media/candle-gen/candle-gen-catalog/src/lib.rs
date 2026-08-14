@@ -87,6 +87,65 @@ pub fn provider_registry() -> candle_gen::gen_core::Result<ProviderRegistry> {
     register_providers(ProviderRegistryBuilder::new()).build()
 }
 
+/// Resolve the load-bearing VAE geometry for a modelled Candle video generator.
+///
+/// Each provider owns its id-to-decoder assignment. Mochi uses a different decode architecture and
+/// is outside the video-memory-ladder scope.
+pub fn vae_tiling(provider_id: &str) -> Option<media::gen_core::tiling::VaeTiling> {
+    candle_gen_ltx::vae_tiling(provider_id)
+        .or_else(|| candle_gen_wan::vae_tiling(provider_id))
+        .or_else(|| candle_gen_bernini::vae_tiling(provider_id))
+        .or_else(|| candle_gen_scail2::vae_tiling(provider_id))
+        .or_else(|| candle_gen_svd::vae_tiling(provider_id))
+}
+
+/// Resolve a provider-owned conservative single-pass VAE decode memory profile.
+///
+/// This composes the calibrated cost functions used by provider budget planners. The result excludes
+/// DiT/text-encoder weights. LTX's calibrated fixed term mixes decoder/base/runtime costs, so it is
+/// retained in full and identifies zero substitutable decoder-resident bytes; Wan-family profiles
+/// contain activation/accumulator work and likewise identify zero resident bytes. Use
+/// [`media::VideoDecodeMemoryProfile::checked_composed_peak`] for checked composition and any declared
+/// substitution. With LTX's zero attribution the whole mixed floor is deliberately preserved, even
+/// though that may conservatively overlap a contract decoder charge. Unsupported ids, zero
+/// dimensions, and arithmetic overflow return `None`. SVD currently exports its exact tiling
+/// geometry but not a profile here: its actual peak depends on both the request's decode-chunk size
+/// and its live-free-VRAM tile selection. SceneWorks' 8-frame product chunk is below the 14-frame
+/// write cap at both shipped SVD geometries, while the provider library's 25-frame default is over
+/// it; publishing one budget-independent scalar would conflate those regimes.
+pub fn conservative_video_decode_memory_profile(
+    provider_id: &str,
+    width: u32,
+    height: u32,
+    frames: u32,
+) -> Option<media::VideoDecodeMemoryProfile> {
+    candle_gen_ltx::conservative_video_decode_memory_profile(provider_id, width, height, frames)
+        .or_else(|| {
+            candle_gen_wan::conservative_video_decode_memory_profile(
+                provider_id,
+                width,
+                height,
+                frames,
+            )
+        })
+        .or_else(|| {
+            candle_gen_bernini::conservative_video_decode_memory_profile(
+                provider_id,
+                width,
+                height,
+                frames,
+            )
+        })
+        .or_else(|| {
+            candle_gen_scail2::conservative_video_decode_memory_profile(
+                provider_id,
+                width,
+                height,
+                frames,
+            )
+        })
+}
+
 // -------------------------------------------------------------------------------------------------
 // Model-weight licence surface (sc-16667) — the Candle media half.
 //
@@ -3527,81 +3586,36 @@ mod preview_advertising {
              of them"
         );
 
-        // Grounded in the providers. Each pair is (file, must-contain, must-NOT-contain), and the
-        // negative half is what makes it a separation rather than a coincidence of shared imports.
-        for (file, present, absent) in [
-            // The 5B provider: z48 only.
-            (
-                "candle-gen-wan/src/lib.rs",
-                &["VaeConfig::ti2v_5b()", "use vae::WanVae;"][..],
-                &["WanVae16"][..],
-            ),
-            // The A14B pair and VACE: z16 only.
-            (
-                "candle-gen-wan/src/wan14b.rs",
-                &["Vae16Config::wan21()", "vae16::WanVae16"][..],
-                &["VaeConfig::ti2v_5b"][..],
-            ),
-            (
-                "candle-gen-wan/src/model_vace.rs",
-                &["Vae16Config::wan21()", "vae16::WanVae16"][..],
-                &["VaeConfig::ti2v_5b"][..],
-            ),
-            // The two crates that reuse candle-gen-wan's z16 VAE.
-            (
-                "candle-gen-bernini/src/components.rs",
-                &["WanVae16::new_with_encoder(&Vae16Config::wan21()"][..],
-                &["VaeConfig::ti2v_5b"][..],
-            ),
-            (
-                "candle-gen-scail2/src/pipeline.rs",
-                &["WanVae16::new_with_encoder(", "Vae16Config::wan21()"][..],
-                &["VaeConfig::ti2v_5b"][..],
-            ),
-            // The two configs really are different spaces, in the file that declares both.
-            (
-                "candle-gen-wan/src/config.rs",
-                &["z_dim: 48", "z_dim: 16", "pub fn wan21()"][..],
-                &[][..],
-            ),
-        ] {
-            let path = candle_gen_root().join(file);
-            let source = std::fs::read_to_string(&path)
-                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-            for needle in present {
-                assert!(
-                    source.contains(needle),
-                    "{file} no longer contains {needle:?}, so the recorded Wan latent-space lineage \
-                     is no longer grounded in the source it claims. Re-derive which space each route \
-                     builds before editing PREVIEW_INERT_ROUTE_IDS."
-                );
-            }
-            for needle in absent {
-                assert!(
-                    !source.contains(needle),
-                    "{file} now contains {needle:?} — the z16/z48 separation this record depends on \
-                     has moved. sc-16637 closed on exactly that distinction; re-derive it rather \
-                     than relaxing this assertion."
-                );
-            }
+        // Grounded in the typed provider assignments consumed by the actual decode paths. Unlike
+        // the former source-token scan, changing a provider-local VAE alias changes this value.
+        let z48 = candle_gen_wan::WAN_Z48_VAE_TILING;
+        let z16 = candle_gen_wan::WAN_Z16_VAE_TILING;
+        assert_ne!(z48, z16);
+        assert_eq!(z48.full_res_channels, 64);
+        assert_eq!(z16.full_res_channels, 96);
+        for id in by_variant(NoGo::WanZ48) {
+            assert_eq!(super::vae_tiling(id), Some(z48), "{id}");
+        }
+        for id in by_variant(NoGo::WanZ16) {
+            assert_eq!(super::vae_tiling(id), Some(z16), "{id}");
         }
 
         // And the two reasons stay distinguishable to a reader who only ever sees a failure message.
-        let (z16, z48) = (NoGo::WanZ16.reason(), NoGo::WanZ48.reason());
+        let (z16_reason, z48_reason) = (NoGo::WanZ16.reason(), NoGo::WanZ48.reason());
         assert!(
-            z16.contains("z16")
-                && z16.contains("vae16::WanVae16")
-                && z16.contains("Vae16Config::wan21")
-                && !z16.contains("VaeConfig::ti2v_5b"),
-            "the z16 reason must name its own VAE and config and never the 5B's: {z16}"
+            z16_reason.contains("z16")
+                && z16_reason.contains("vae16::WanVae16")
+                && z16_reason.contains("Vae16Config::wan21")
+                && !z16_reason.contains("VaeConfig::ti2v_5b"),
+            "the z16 reason must name its own VAE and config and never the 5B's: {z16_reason}"
         );
         assert!(
-            z48.contains("z48")
-                && z48.contains("vae::WanVae")
-                && z48.contains("VaeConfig::ti2v_5b")
-                && z48.contains("distinct from the z16"),
+            z48_reason.contains("z48")
+                && z48_reason.contains("vae::WanVae")
+                && z48_reason.contains("VaeConfig::ti2v_5b")
+                && z48_reason.contains("distinct from the z16"),
             "the z48 reason must name its own VAE and config, and say plainly that it is not the z16 \
-             space, since that confusion is the whole reason this variant exists: {z48}"
+             space, since that confusion is the whole reason this variant exists: {z48_reason}"
         );
     }
 
@@ -3745,6 +3759,146 @@ mod preview_advertising {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn modelled_video_provider_ids_have_typed_vae_assignments() {
+        let registry = super::provider_registry().unwrap();
+        let registered: Vec<&str> = registry
+            .generators()
+            .map(|registration| (registration.descriptor)().id)
+            .collect();
+        let expected = [
+            (
+                candle_gen_ltx::config::MODEL_ID,
+                candle_gen_ltx::VAE_TILING,
+                Some(2_725_804_800),
+            ),
+            (
+                candle_gen_wan::config::MODEL_ID,
+                candle_gen_wan::WAN_Z48_VAE_TILING,
+                Some(382_730_240),
+            ),
+            (
+                candle_gen_wan::config::MODEL_ID_T2V_14B,
+                candle_gen_wan::WAN_Z16_VAE_TILING,
+                Some(265_830_400),
+            ),
+            (
+                candle_gen_wan::config::MODEL_ID_I2V_14B,
+                candle_gen_wan::WAN_Z16_VAE_TILING,
+                Some(265_830_400),
+            ),
+            (
+                candle_gen_wan::config::MODEL_ID_VACE,
+                candle_gen_wan::WAN_Z16_VAE_TILING,
+                Some(265_830_400),
+            ),
+            (
+                candle_gen_bernini::MODEL_ID,
+                candle_gen_bernini::VAE_TILING,
+                Some(265_830_400),
+            ),
+            (
+                candle_gen_bernini::bernini::MODEL_ID,
+                candle_gen_bernini::VAE_TILING,
+                Some(265_830_400),
+            ),
+            (
+                candle_gen_scail2::MODEL_ID,
+                candle_gen_scail2::VAE_TILING,
+                Some(265_830_400),
+            ),
+            (
+                candle_gen_svd::config::MODEL_ID,
+                candle_gen_svd::VAE_TILING,
+                None,
+            ),
+        ];
+
+        for (provider_id, tiling, peak_bytes) in expected {
+            assert!(
+                registered.contains(&provider_id),
+                "unregistered {provider_id}"
+            );
+            assert_eq!(
+                super::vae_tiling(provider_id),
+                Some(tiling),
+                "{provider_id}"
+            );
+            assert_eq!(
+                super::conservative_video_decode_memory_profile(provider_id, 64, 64, 9)
+                    .map(|profile| profile.working_set_bytes()),
+                peak_bytes,
+                "{provider_id}"
+            );
+        }
+        assert_eq!(super::vae_tiling("ltx_2_3"), None);
+        assert_eq!(super::vae_tiling(candle_gen_mochi::MODEL_ID), None);
+        assert_eq!(super::vae_tiling("wan2_2_vace_fun_14b"), None);
+        assert_eq!(super::vae_tiling("krea_realtime_14b"), None);
+        assert_eq!(super::vae_tiling("not_a_provider"), None);
+        for provider_id in [
+            "ltx_2_3",
+            candle_gen_svd::config::MODEL_ID,
+            candle_gen_mochi::MODEL_ID,
+            "wan2_2_vace_fun_14b",
+            "krea_realtime_14b",
+            "not_a_provider",
+        ] {
+            assert_eq!(
+                super::conservative_video_decode_memory_profile(provider_id, 64, 64, 9),
+                None
+            );
+        }
+        assert_eq!(
+            super::conservative_video_decode_memory_profile(
+                candle_gen_ltx::config::MODEL_ID,
+                64,
+                0,
+                9,
+            ),
+            None
+        );
+        assert_eq!(
+            super::conservative_video_decode_memory_profile(
+                candle_gen_wan::config::MODEL_ID_T2V_14B,
+                u32::MAX,
+                u32::MAX,
+                u32::MAX,
+            ),
+            None
+        );
+
+        let ltx = super::conservative_video_decode_memory_profile(
+            candle_gen_ltx::config::MODEL_ID,
+            64,
+            64,
+            9,
+        )
+        .unwrap();
+        assert_eq!(ltx.resident_decoder_bytes_included(), 0);
+        assert_eq!(
+            ltx.checked_composed_peak(2_500_000_000, 2_500_000_000),
+            Some(5_225_804_800)
+        );
+        assert_eq!(
+            ltx.checked_composed_peak(2_900_000_000, 2_900_000_000),
+            Some(5_625_804_800)
+        );
+
+        let wan = super::conservative_video_decode_memory_profile(
+            candle_gen_wan::config::MODEL_ID_T2V_14B,
+            64,
+            64,
+            9,
+        )
+        .unwrap();
+        assert_eq!(wan.resident_decoder_bytes_included(), 0);
+        assert_eq!(
+            wan.checked_composed_peak(1_000_000_000, 600_000_000),
+            Some(1_265_830_400)
+        );
+    }
+
     #[test]
     fn every_registered_memory_strategy_rejects_cross_route_decode_geometry() {
         let registry = super::provider_registry().unwrap();

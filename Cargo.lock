@@ -931,6 +931,7 @@ dependencies = [
  "rand_distr",
  "safetensors 0.7.0",
  "sceneworks-gen-core-testkit",
+ "serde_json",
  "tempfile",
  "tokenizers 0.22.2",
 ]
@@ -2399,6 +2400,7 @@ dependencies = [
  "image",
  "mlx-gen",
  "pmetal-mlx-rs",
+ "sceneworks-gen-core-testkit",
  "serde_json",
  "tempfile",
 ]
@@ -2576,6 +2578,7 @@ dependencies = [
  "image",
  "mlx-gen",
  "pmetal-mlx-rs",
+ "sceneworks-gen-core-testkit",
  "serde_json",
  "tempfile",
  "unicode-normalization",

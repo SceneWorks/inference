@@ -35,7 +35,7 @@ use candle_gen::{CandleError, Result as CResult};
 use crate::config::{
     TextEncoderConfig, Vae16Config, WanVaceConfig, DEFAULT_FPS_VACE, DEFAULT_GUIDANCE_VACE,
     DEFAULT_STEPS_VACE, MAX_AREA_14B, MODEL_ID_VACE, NEGATIVE_FALLBACK, SIZE_MULTIPLE_14B,
-    VACE_FLOW_SHIFT, VAE16_STRIDE_TEMPORAL,
+    VACE_FLOW_SHIFT,
 };
 use crate::pipeline::{create_noise, frames_to_images};
 use crate::rope::WanRope;
@@ -44,7 +44,13 @@ use crate::text_encoder::Umt5Encoder;
 use crate::vace::{
     build_vace_control, denoise_vace, prepare_masks, prepare_video_latents, WanVaceTransformer,
 };
-use crate::vae16::WanVae16;
+/// Concrete z16 VAE assigned to the VACE route.
+pub type ProviderVae = crate::vae16::WanVae16;
+
+/// Resolve the VACE route's load-bearing VAE geometry.
+pub fn vae_tiling(provider_id: &str) -> Option<candle_gen::gen_core::tiling::VaeTiling> {
+    (provider_id == MODEL_ID_VACE).then_some(ProviderVae::VAE_TILING)
+}
 use crate::wan14b::preprocess_i2v_image;
 
 const DIT_DTYPE: DType = DType::BF16;
@@ -53,13 +59,13 @@ const DIT_DTYPE: DType = DType::BF16;
 const ENC_DTYPE: DType = DType::BF16;
 const VAE_DTYPE: DType = DType::F32;
 const Z_DIM: usize = 16;
-const VAE_T: usize = VAE16_STRIDE_TEMPORAL as usize;
+const VAE_T: usize = ProviderVae::VAE_TILING.temporal_scale as usize;
 
 #[derive(Clone)]
 struct Components {
     te: Arc<Umt5Encoder>,
     dit: Arc<WanVaceTransformer>,
-    vae: Arc<WanVae16>,
+    vae: Arc<ProviderVae>,
     /// UMT5 tokenizer, loaded+parsed **once** at component load and reused across encodes (sc-8991 /
     /// F-011) instead of re-parsing `tokenizer.json` per prompt/branch.
     tok: Arc<candle_gen::gen_core::tokenizer::TextTokenizer>,
@@ -101,7 +107,8 @@ impl Pipeline {
         let dit =
             WanVaceTransformer::new(&self.vace_cfg, self.component_vb("transformer", DIT_DTYPE)?)?;
         // The control encode needs the VAE encoder.
-        let vae = WanVae16::new_with_encoder(&self.vae_cfg, self.component_vb("vae", VAE_DTYPE)?)?;
+        let vae =
+            ProviderVae::new_with_encoder(&self.vae_cfg, self.component_vb("vae", VAE_DTYPE)?)?;
         let tok = crate::text_encode::build_umt5_tokenizer(&self.root, &self.te_cfg, "wan-vace")?;
         Ok(Components {
             te: Arc::new(te),
@@ -426,6 +433,7 @@ pub fn descriptor() -> ModelDescriptor {
             supports_kv_cache: false,
             requires_sigma_shift: false,
             supports_sequential_offload: false,
+            unconditionally_engages_staged_residency: false,
             supports_preview: false,
             supports_streaming: false,
             supports_multi_speaker: false,
@@ -484,6 +492,17 @@ candle_gen::register_generators! {
 mod tests {
     use super::*;
     use candle_gen::gen_core::ReplacementMode;
+
+    #[test]
+    fn descriptor_does_not_claim_staged_residency() {
+        let caps = descriptor().capabilities;
+        assert!(!caps.unconditionally_engages_staged_residency);
+        assert!(!caps.supports_sequential_offload);
+        assert_eq!(
+            caps.staged_residency_availability(),
+            candle_gen::gen_core::StagedResidencyAvailability::Absent
+        );
+    }
 
     fn control_req() -> GenerationRequest {
         let frame = Image {

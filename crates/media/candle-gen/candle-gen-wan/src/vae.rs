@@ -424,6 +424,9 @@ pub struct WanVae {
 }
 
 impl WanVae {
+    /// Geometry owned by the concrete causal z48 decoder.
+    pub const VAE_TILING: VaeTiling = VaeTiling::WAN22;
+
     pub fn new(cfg: &VaeConfig, vb: VarBuilder) -> Result<Self> {
         let device = vb.device();
         let mean = Tensor::from_vec(LATENTS_MEAN.to_vec(), (1, 48, 1, 1, 1), device)?;
@@ -587,7 +590,7 @@ impl WanVae {
         // `VaeTiling::WAN22` geometry and the per-frame-streaming `decode` closure. With a
         // spatial-only `cfg`, `plan.t` is a single full-extent temporal tile, so the temporal loop
         // runs once and each `decode` call streams the whole clip.
-        vae_tiling::decode_tiled(VaeTiling::WAN22, "wan z48 vae22", z, cfg, |tile| {
+        vae_tiling::decode_tiled(Self::VAE_TILING, "wan z48 vae22", z, cfg, |tile| {
             self.decode_with_cancel(tile, cancel)
         })
     }
@@ -604,11 +607,28 @@ impl WanVae {
     }
 
     pub fn decode_budgeted_with_cancel(&self, z: &Tensor, cancel: &CancelFlag) -> CResult<Tensor> {
+        self.decode_budgeted_with_cancel_and_tile_cap(z, cancel, None)
+    }
+
+    /// Budgeted decode with an optional provider-admitted maximum spatial tile edge. The selected
+    /// cap is intersected with the same live free-VRAM budget as the automatic path; it never raises
+    /// the live planner's tile size or substitutes a fixed budget. A selected cap also forces an
+    /// actual tiled plan at Wan's supported render envelope.
+    pub fn decode_budgeted_with_cancel_and_tile_cap(
+        &self,
+        z: &Tensor,
+        cancel: &CancelFlag,
+        max_tile_edge: Option<u32>,
+    ) -> CResult<Tensor> {
         let (_b, _c, f, h, w) = z.dims5()?;
-        let out_f = 1 + (f as i32 - 1) * VaeTiling::WAN22.temporal_scale; // causal ×4
-        let out_h = h as i32 * VaeTiling::WAN22.spatial_scale; // ×16
-        let out_w = w as i32 * VaeTiling::WAN22.spatial_scale;
-        match auto_tiling_budgeted_wan22(out_h, out_w, out_f)? {
+        let out_f = 1 + (f as i32 - 1) * Self::VAE_TILING.temporal_scale; // causal ×4
+        let out_h = h as i32 * Self::VAE_TILING.spatial_scale; // ×16
+        let out_w = w as i32 * Self::VAE_TILING.spatial_scale;
+        let plan = match max_tile_edge {
+            Some(cap) => auto_tiling_budgeted_wan22_capped(out_h, out_w, out_f, cap)?,
+            None => auto_tiling_budgeted_wan22(out_h, out_w, out_f)?,
+        };
+        match plan {
             Some(cfg) => self.decode_tiled_with_cancel(z, &cfg, cancel),
             None => self.decode_with_cancel(z, cancel),
         }
@@ -711,8 +731,8 @@ const WAN22_VAE_DEFAULT_BUDGET_GIB: f64 = 16.0;
 // tile that OOMs. (The story's "even the conservative placeholder never OOMs" assumed the seed
 // over-estimated; the CUDA measurement shows it under-estimated by ~4×.) Re-run the sweep after a
 // decoder or candle-allocator change. See the `wan22_decode_peak_matches_cuda_anchors` test below.
-const WAN22_VAE_ACCUM_BYTES_PER_VOXEL: f64 = 160.0;
-const WAN22_VAE_FRAME_BYTES_PER_OUT_PX: f64 = 92_000.0;
+const WAN22_VAE_ACCUM_BYTES_PER_VOXEL: u64 = 160;
+const WAN22_VAE_FRAME_BYTES_PER_OUT_PX: u64 = 92_000;
 
 /// Candidate spatial tile sizes (output px, multiples of the vae22 ×16 scale, overlap 64). Matches the
 /// mlx `VAE22_SPATIAL_PX` grid.
@@ -737,8 +757,24 @@ fn estimated_wan22_decode_peak_gib(
 ) -> f64 {
     let out_voxels = (out_f * out_h * out_w) as f64;
     let frame_px = (tile_h * tile_w) as f64;
-    (WAN22_VAE_ACCUM_BYTES_PER_VOXEL * out_voxels + WAN22_VAE_FRAME_BYTES_PER_OUT_PX * frame_px)
+    (WAN22_VAE_ACCUM_BYTES_PER_VOXEL as f64 * out_voxels
+        + WAN22_VAE_FRAME_BYTES_PER_OUT_PX as f64 * frame_px)
         / GIB_F64
+}
+
+/// Conservative single-pass causal z48 VAE decode working-set peak in bytes.
+///
+/// This is the full-output case of the calibrated streaming cost function consumed by the actual
+/// budget planner. It excludes DiT and text-encoder composition weights.
+pub fn conservative_video_decode_peak_bytes(width: u32, height: u32, frames: u32) -> Option<u64> {
+    let frame_pixels = u64::from(width).checked_mul(u64::from(height))?;
+    let output_voxels = frame_pixels.checked_mul(u64::from(frames))?;
+    if output_voxels == 0 {
+        return None;
+    }
+    WAN22_VAE_ACCUM_BYTES_PER_VOXEL
+        .checked_mul(output_voxels)?
+        .checked_add(WAN22_VAE_FRAME_BYTES_PER_OUT_PX.checked_mul(frame_pixels)?)
 }
 
 /// The safe peak-GiB budget for the z48 vae22 decode tiler — **free-aware** (sc-12734). The decode
@@ -773,6 +809,25 @@ pub fn auto_tiling_budgeted_wan22(
     plan_wan22_tiling(height, width, out_frames, wan22_vae_safe_budget_gib())
 }
 
+/// Live-budgeted selector for an admitted rung-2 maximum tile edge. Unlike the legacy automatic
+/// path, the selected path cannot return a single-pass plan: every advertised edge is below Wan's
+/// minimum output side, and the full-frame cost is made ineligible while the ordinary candidate
+/// costs and accumulator floor remain unchanged.
+pub fn auto_tiling_budgeted_wan22_capped(
+    height: i32,
+    width: i32,
+    out_frames: i32,
+    max_tile_edge: u32,
+) -> Result<Option<TilingConfig>> {
+    plan_wan22_tiling_capped(
+        height,
+        width,
+        out_frames,
+        wan22_vae_safe_budget_gib(),
+        max_tile_edge,
+    )
+}
+
 /// Pure vae22 spatial tile selector (the `safe_gib` ceiling injected so it is unit-testable without a
 /// GPU). Supplies the vae22 candidate grid + cost model to the shared [`budgeted_plan`]; same
 /// `Ok(None)` / `Ok(Some)` / catchable-`Err` contract as the LTX half.
@@ -793,7 +848,7 @@ fn plan_wan22_tiling(
     };
     vae_tiling::plan_tiling(
         "wan z48 vae22 decode",
-        VaeTiling::WAN22,
+        WanVae::VAE_TILING,
         height,
         width,
         out_frames,
@@ -803,9 +858,89 @@ fn plan_wan22_tiling(
     )
 }
 
+fn plan_wan22_tiling_capped(
+    height: i32,
+    width: i32,
+    out_frames: i32,
+    safe_gib: f64,
+    max_tile_edge: u32,
+) -> Result<Option<TilingConfig>> {
+    let max_tile_edge = i32::try_from(max_tile_edge).map_err(|_| {
+        candle_gen::candle_core::Error::Msg("wan z48 decode tile cap exceeds i32".into())
+    })?;
+    let spatial = WAN22_VAE_SPATIAL_PX
+        .into_iter()
+        .filter(|&edge| edge <= max_tile_edge)
+        .collect::<Vec<_>>();
+    if spatial.is_empty() {
+        candle_gen::candle_core::bail!(
+            "wan z48 vae22 decode: tile cap {max_tile_edge} is below the smallest production candidate"
+        );
+    }
+    let candidates = TileCandidates {
+        spatial_px: &spatial,
+        spatial_overlap_px: 64,
+        temporal: &WAN22_VAE_TEMPORAL_FR,
+        temporal_overlap_policy: TemporalOverlapPolicy::Candidate,
+    };
+    let result = vae_tiling::plan_tiling(
+        "wan z48 vae22 decode",
+        WanVae::VAE_TILING,
+        height,
+        width,
+        out_frames,
+        safe_gib,
+        candidates,
+        |out_f, out_h, out_w, tile_f, tile_h, tile_w| {
+            if tile_h >= out_h && tile_w >= out_w {
+                f64::INFINITY
+            } else {
+                estimated_wan22_decode_peak_gib(out_f, out_h, out_w, tile_f, tile_h, tile_w)
+            }
+        },
+    )?;
+    result.map(Some).ok_or_else(|| {
+        candle_gen::candle_core::Error::Msg(
+            "wan z48 vae22 decode: selected bounded decode unexpectedly resolved to single pass"
+                .into(),
+        )
+    })
+}
+
 #[cfg(test)]
 mod budget_tests {
     use super::*;
+
+    #[test]
+    fn public_decode_peak_is_the_planners_full_output_case() {
+        assert_eq!(
+            conservative_video_decode_peak_bytes(64, 64, 9),
+            Some(382_730_240)
+        );
+        assert_eq!(conservative_video_decode_peak_bytes(64, 0, 9), None);
+        assert_eq!(
+            conservative_video_decode_peak_bytes(u32::MAX, u32::MAX, u32::MAX),
+            None
+        );
+    }
+
+    #[test]
+    fn selected_decode_cap_forces_tiling_and_intersects_the_live_budget() {
+        let generous = plan_wan22_tiling_capped(480, 832, 81, 100.0, 448)
+            .unwrap()
+            .expect("selected bounded decode must not fall through to single pass");
+        assert_eq!(generous.spatial.unwrap().tile_px, 448);
+
+        let tighter = plan_wan22_tiling_capped(480, 832, 81, 18.0, 448)
+            .unwrap()
+            .expect("a smaller candidate must satisfy the tighter live budget");
+        assert!(tighter.spatial.unwrap().tile_px < 448);
+
+        let selected_256 = plan_wan22_tiling_capped(480, 832, 81, 100.0, 256)
+            .unwrap()
+            .expect("the selected cap must constrain the candidate grid");
+        assert_eq!(selected_256.spatial.unwrap().tile_px, 256);
+    }
     use std::cell::Cell;
 
     #[test]

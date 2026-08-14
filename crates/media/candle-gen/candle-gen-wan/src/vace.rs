@@ -20,15 +20,15 @@ use candle_gen::candle_nn::{Linear, Module, VarBuilder};
 use candle_gen::gen_core::CancelFlag;
 use candle_gen::{CandleError, Result as CResult};
 
-use crate::config::{WanVaceConfig, VAE16_STRIDE_SPATIAL, VAE16_STRIDE_TEMPORAL};
+use crate::config::WanVaceConfig;
+use crate::model_vace::ProviderVae;
 use crate::pipeline::cfg;
 use crate::scheduler::{FlowScheduler, Sampler};
 use crate::transformer::{linear, ln_no_affine, timestep_sinusoid, Block};
-use crate::vae16::WanVae16;
 
 /// The z16 VAE temporal/spatial strides (Wan2.1; VACE is Wan2.1-based).
-const VAE_T: usize = VAE16_STRIDE_TEMPORAL as usize;
-const VAE_S: usize = VAE16_STRIDE_SPATIAL as usize;
+const VAE_T: usize = ProviderVae::VAE_TILING.temporal_scale as usize;
+const VAE_S: usize = ProviderVae::VAE_TILING.spatial_scale as usize;
 
 /// Squeeze a diffusers Conv3d patch-embedding weight `[dim, in, pt, ph, pw]` → a per-frame conv2d
 /// `[dim, in, ph, pw]` (the patch temporal kernel `pt` is 1 for Wan). Mirrors
@@ -408,7 +408,7 @@ pub fn prepare_masks(mask: &Tensor, patch: usize, num_ref: usize) -> Result<Tens
 /// reference `[1,3,1,H,W]` is encoded to one latent frame, `cat([ref, zeros])` to 32 ch, and prepended
 /// along the frame axis. Mirrors diffusers `WanVACEPipeline.prepare_video_latents` (single batch).
 pub fn prepare_video_latents(
-    vae: &WanVae16,
+    vae: &ProviderVae,
     video: &Tensor,
     mask: &Tensor,
     references: &[Tensor],

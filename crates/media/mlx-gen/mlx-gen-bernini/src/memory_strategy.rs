@@ -730,7 +730,8 @@ pub(crate) fn decode_tiling(req: &GenerationRequest) -> mlx_gen::Result<Option<T
 /// and `clear_cache`d before the source-VAE encode, the source-VAE encoder before the experts, and
 /// the experts before the decode. `GenerationMemory::stage_residency` therefore selects nothing —
 /// the provider is *structurally* always-staged, which is why both descriptors already advertise
-/// `supports_sequential_offload` and why `advertises_sequential_offload` pins it on each.
+/// `unconditionally_engages_staged_residency` and why each descriptor test pins the independent
+/// false/true selectable/unconditional combination.
 ///
 /// A resolver that branched on the flag would be a lever over behaviour that does not vary, i.e. a
 /// declaration with no enforcement behind it. The rung is `Implemented` because the synchronized

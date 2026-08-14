@@ -68,7 +68,7 @@ pub use generator::{
     ControlClipRef, ControlKind, ConversationRole, ConversationSession, ConversationTurn,
     GenerationMemory, GenerationOutput, GenerationPhase, GenerationRequest, Generator, KeyframeRef,
     Modality, ModelDescriptor, PhaseAdapter, PrecisionFloorComponent, ReplacementMode, SizeFloor,
-    SpeechSegment, TimeRegion, VideoClipRef,
+    SpeechSegment, StagedResidencyAvailability, TimeRegion, VideoClipRef,
 };
 pub use image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
 pub use json_constraint::JsonState;

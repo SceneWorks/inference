@@ -170,6 +170,7 @@ pub fn descriptor() -> ModelDescriptor {
             supports_kv_cache: false,
             requires_sigma_shift: false,
             supports_sequential_offload: false,
+            unconditionally_engages_staged_residency: false,
             // Per-step latent previews (epic 16948, sc-16955). Ideogram drives no shared sampler, so
             // its bespoke flow-match loop emits directly (`crate::preview`); the VAE it loads is the
             // FLUX.2 one tensor-for-tensor, so it reuses that fit rather than introducing one.

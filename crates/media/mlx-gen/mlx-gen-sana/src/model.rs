@@ -135,6 +135,7 @@ pub fn descriptor() -> ModelDescriptor {
             // before the Linear-DiT trunk + DC-AE load — bounding peak to `max(Gemma-TE, DiT+DC-AE)`.
             // The Gemma encoder is comparable to (often ≥) the DiT, so the drop is a large win.
             supports_sequential_offload: true,
+            unconditionally_engages_staged_residency: false,
             supports_preview: true,
             supports_streaming: false,
             supports_multi_speaker: false,
@@ -199,6 +200,7 @@ pub fn sprint_descriptor() -> ModelDescriptor {
             // Sprint drops the Gemma-2 CHI text encoder before the Sprint Linear-DiT trunk + DC-AE load,
             // bounding peak to `max(Gemma-TE, DiT+DC-AE)`.
             supports_sequential_offload: true,
+            unconditionally_engages_staged_residency: false,
             supports_preview: true,
             supports_streaming: false,
             supports_multi_speaker: false,

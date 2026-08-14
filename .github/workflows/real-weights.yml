@@ -4926,7 +4926,7 @@ jobs:
     env:
       # Three per-repo snapshot dirs the video->audio harness resolves the 5 components from
       # (tests/common/mod.rs): hkchengrex/MMAudio (synchformer + dit 16k/44k + vae 16k/44k + 16k
-      # vocoder), apple/DFN5B-CLIP (clip), nvidia/bigvgan (44k vocoder).
+      # vocoder), canonical apple/DFN5B-CLIP-ViT-H-14-378 (clip), nvidia/bigvgan (44k vocoder).
       MMAUDIO_MMAUDIO_SNAPSHOT: ${{ vars.MMAUDIO_MMAUDIO_SNAPSHOT }}
       MMAUDIO_CLIP_SNAPSHOT: ${{ vars.MMAUDIO_CLIP_SNAPSHOT }}
       # The nvidia 44k vocoder repo. The repository VARIABLE is still named MMAUDIO_BIGVGAN_SNAPSHOT
@@ -4985,6 +4985,8 @@ jobs:
           python scripts/release/ensure_model_snapshot.py --model mmaudio-vae-16k --snapshot "%MMAUDIO_MMAUDIO_SNAPSHOT%" || exit /b 1
           python scripts/release/ensure_model_snapshot.py --model mmaudio-vae-44k --snapshot "%MMAUDIO_MMAUDIO_SNAPSHOT%" || exit /b 1
           python scripts/release/ensure_model_snapshot.py --model mmaudio-bigvgan-16k --snapshot "%MMAUDIO_MMAUDIO_SNAPSHOT%" || exit /b 1
+          rem The stable catalog key still ends in 384 because MMAudio feeds 384px; its repository is
+          rem the canonical -378 checkpoint declared in release/real-weight-models.toml.
           python scripts/release/ensure_model_snapshot.py --model dfn5b-clip-vit-h14-384 --snapshot "%MMAUDIO_CLIP_SNAPSHOT%" || exit /b 1
           python scripts/release/ensure_model_snapshot.py --model nvidia-bigvgan-v2-44khz-128band-512x --snapshot "%MMAUDIO_BIGVGAN_V2_SNAPSHOT%" || exit /b 1
       - name: Run mmaudio real-weight renders

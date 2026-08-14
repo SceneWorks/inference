@@ -97,16 +97,43 @@ fn check_memory_registration(
     let contract_factory = contract_fixture
         .map(|fixture| fixture.contract)
         .unwrap_or(registration.contract);
+    // A catalog can legitimately compose providers with opposite materialization requirements.
+    // The caller-supplied spec carries all common fixture axes, but one global load shape cannot be
+    // valid for both a block-window image provider and an eager-only video provider. Resolve that
+    // single axis per registration and keep the successful spec for every subsequent behavior and
+    // safety probe; otherwise the conformance walk would either reject a valid mixed catalog or test
+    // a contract against a different load identity than the one used to construct it.
+    let mut alternate_spec = None;
     let contract = match contract_factory(spec) {
         Ok(contract) => contract,
-        Err(error) => {
-            errors.push(format!(
-                "{}: weights-free contract construction failed: {error}",
-                registration.provider_id
-            ));
-            return;
+        Err(primary_error) => {
+            let mut alternate = spec.clone();
+            alternate.load_shape = match spec.load_shape {
+                gen_core::LoadShape::EagerMaterialization => {
+                    gen_core::LoadShape::DeferredMaterialization
+                }
+                gen_core::LoadShape::DeferredMaterialization => {
+                    gen_core::LoadShape::EagerMaterialization
+                }
+            };
+            match contract_factory(&alternate) {
+                Ok(contract) => {
+                    alternate_spec = Some(alternate);
+                    contract
+                }
+                Err(alternate_error) => {
+                    errors.push(format!(
+                        "{}: weights-free contract construction failed for both {:?} ({primary_error}) and {:?} ({alternate_error})",
+                        registration.provider_id,
+                        spec.load_shape,
+                        alternate.load_shape,
+                    ));
+                    return;
+                }
+            }
         }
     };
+    let spec = alternate_spec.as_ref().unwrap_or(spec);
     if contract.provider_id != registration.provider_id {
         errors.push(format!(
             "{}: registration returned contract for {:?}",
@@ -566,6 +593,41 @@ mod tests {
         contract.strategies.pop();
         let errors = check_memory_strategy_contract(&contract).unwrap_err();
         assert!(errors.iter().any(|error| error.contains("exactly once")));
+    }
+
+    fn eager_only_contract(spec: &LoadSpec) -> gen_core::Result<MemoryProviderContract> {
+        if spec.load_shape != gen_core::LoadShape::EagerMaterialization {
+            return Err(gen_core::Error::Unsupported("eager only".into()));
+        }
+        let mut contract = MemoryProviderContract::compatibility_default("eager-only", backend());
+        contract.load_shape = spec.load_shape;
+        Ok(contract)
+    }
+
+    fn always_reject_safety(
+        _spec: &LoadSpec,
+        _contract: &MemoryProviderContract,
+        _context: &MemoryRunContext,
+    ) -> MemorySafetyDecision {
+        MemorySafetyDecision::Reject {
+            reason: "no optimized strategies".into(),
+        }
+    }
+
+    #[test]
+    fn mixed_catalog_conformance_uses_each_providers_valid_load_shape() {
+        let registration = MemoryRegistration {
+            provider_id: "eager-only",
+            contract: eager_only_contract,
+            safety_check: always_reject_safety,
+        };
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
+            .with_load_shape(gen_core::LoadShape::DeferredMaterialization);
+        let mut errors = Vec::new();
+
+        check_memory_registration(&registration, None, None, &spec, &mut errors);
+
+        assert_eq!(errors, Vec::<String>::new());
     }
 
     fn pid_contract(_spec: &LoadSpec) -> gen_core::Result<MemoryProviderContract> {
