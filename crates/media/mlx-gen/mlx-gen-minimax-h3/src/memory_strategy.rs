@@ -131,7 +131,9 @@ pub const DENOISE_RESIDENT_Q4_BYTES: u64 = 11_630_000_000;
 
 /// **Denoise stage.** Exact bytes the AdaLN precompute-and-evict drops (64.56 → 38.70 GB active):
 /// the 50-block stack's `adaln_proj` at bf16. Asserted against the loader in
-/// `crate::dit::adaln`.
+/// `crate::dit::adaln`. Both actives are measured in `tests/adaln_evict_real_weights.rs`, which
+/// force-materializes the whole stack first; the render path does not, so neither is a render-time
+/// resident.
 pub const ADALN_EVICTED_BYTES: u64 = 26_020_915_200;
 
 /// The load shape this loader actually has today, pinned rather than mirrored from the spec.
