@@ -826,6 +826,7 @@ impl Ltx {
         // cache so the VAE + audio decode run in the freed footprint (the AvDiT is the denoise peak and
         // nothing downstream needs it). Mirrors Wan's scope-block release before the VAE decode.
         mlx_rs::transforms::eval([&video_latents, &audio_latents])?;
+        finish_calibration_phase(req, mlx_gen::gen_core::MemoryPhase::Denoise, || Ok(()))?;
         drop(transformer);
         mlx_rs::memory::clear_cache();
 
@@ -850,6 +851,7 @@ impl Ltx {
                 &req.cancel,
             )?)
         };
+        finish_calibration_phase(req, mlx_gen::gen_core::MemoryPhase::Decode, || Ok(()))?;
         Ok(GenerationOutput::Video {
             frames: images,
             fps: req.fps.unwrap_or(24),
@@ -1187,6 +1189,30 @@ pub(crate) fn frames_to_images(frames: &Array) -> Result<Vec<Image>> {
         .collect())
 }
 
+/// Request-local calibration fault injection at a completed physical phase boundary.
+///
+/// The shared request floor accepts the hidden fault carrier only when a conformance harness pairs
+/// it with explicit authorization. Production requests leave it unset, so the hook is inert.
+/// Returning the completed value through
+/// this helper is deliberate: when the named fault fires, phase-local resources are dropped before
+/// the error reaches the caller, which is the cleanup behavior the harness measures with a warm
+/// follow-up request.
+fn finish_calibration_phase<T>(
+    req: &GenerationRequest,
+    phase: mlx_gen::gen_core::MemoryPhase,
+    work: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let value = work()?;
+    if req.memory.is_some_and(|memory| {
+        memory.calibration_fault_harness_authorized && memory.calibration_error_phase == Some(phase)
+    }) {
+        return Err(Error::Msg(format!(
+            "{MODEL_ID}: injected memory-strategy calibration error at {phase:?}"
+        )));
+    }
+    Ok(value)
+}
+
 // Hand-written rather than `impl_generator!`: SC-19109 makes the memory contract a property of the
 // loaded provider, not only a static registry row. The ordinary descriptor/validate/generate arms
 // are the same delegation the macro emitted.
@@ -1269,7 +1295,10 @@ impl Ltx {
         if req.cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
-        let (enhanced, video_ctx, audio_ctx) = self.stage_text_phase(req)?;
+        let (enhanced, video_ctx, audio_ctx) =
+            finish_calibration_phase(req, mlx_gen::gen_core::MemoryPhase::Conditioning, || {
+                self.stage_text_phase(req)
+            })?;
         // The TE is dropped; free the allocator cache so the DiT loads into the low-water footprint.
         mlx_rs::memory::clear_cache();
         let owned;
@@ -1329,6 +1358,187 @@ mlx_gen::register_generators! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn calibration_fault_is_request_local_and_phase_exact() {
+        use mlx_gen::gen_core::{GenerationMemory, MemoryPhase};
+
+        let plain = GenerationRequest::default();
+        for phase in [
+            MemoryPhase::Conditioning,
+            MemoryPhase::Denoise,
+            MemoryPhase::Decode,
+        ] {
+            assert_eq!(
+                finish_calibration_phase(&plain, phase, || Ok(17)).unwrap(),
+                17
+            );
+
+            let phase_without_authorization = GenerationRequest {
+                memory: Some(GenerationMemory {
+                    calibration_error_phase: Some(phase),
+                    calibration_fault_harness_authorized: false,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert_eq!(
+                finish_calibration_phase(&phase_without_authorization, phase, || Ok(19)).unwrap(),
+                19,
+                "the hidden phase carrier is inert without explicit harness authorization"
+            );
+
+            let authorization_without_phase = GenerationRequest {
+                memory: Some(GenerationMemory {
+                    calibration_error_phase: None,
+                    calibration_fault_harness_authorized: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert_eq!(
+                finish_calibration_phase(&authorization_without_phase, phase, || Ok(21)).unwrap(),
+                21,
+                "authorization alone must not invent a fault phase"
+            );
+
+            let mut memory = GenerationMemory::default();
+            memory.authorize_calibration_fault(phase);
+            let injected = GenerationRequest {
+                memory: Some(memory),
+                ..Default::default()
+            };
+            let error = finish_calibration_phase(&injected, phase, || Ok(17))
+                .expect_err("the selected physical phase must return a typed error")
+                .to_string();
+            assert!(error.contains(MODEL_ID), "got: {error}");
+            assert!(
+                error.contains("injected memory-strategy calibration error"),
+                "got: {error}"
+            );
+            assert!(error.contains(&format!("{phase:?}")), "got: {error}");
+
+            let other = if phase == MemoryPhase::Decode {
+                MemoryPhase::Denoise
+            } else {
+                MemoryPhase::Decode
+            };
+            assert_eq!(
+                finish_calibration_phase(&injected, other, || Ok(23)).unwrap(),
+                23,
+                "a request-local fault must not spill into another phase"
+            );
+        }
+    }
+
+    #[test]
+    fn calibration_fault_drops_completed_phase_state_before_warm_recovery() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        #[derive(Debug)]
+        struct DropWitness(Arc<AtomicUsize>);
+        impl Drop for DropWitness {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut memory = mlx_gen::gen_core::GenerationMemory::default();
+        memory.authorize_calibration_fault(mlx_gen::gen_core::MemoryPhase::Denoise);
+        let injected = GenerationRequest {
+            memory: Some(memory),
+            ..Default::default()
+        };
+        finish_calibration_phase(&injected, mlx_gen::gen_core::MemoryPhase::Denoise, || {
+            Ok(DropWitness(drops.clone()))
+        })
+        .expect_err("the injected request must fail after phase state exists");
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+        let warm = finish_calibration_phase(
+            &GenerationRequest::default(),
+            mlx_gen::gen_core::MemoryPhase::Denoise,
+            || Ok(DropWitness(drops.clone())),
+        )
+        .expect("an unmodified warm request must recover");
+        drop(warm);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn calibrated_scope_finishes_injected_error_and_a_fresh_scope_recovers() {
+        use mlx_gen::gen_core::{
+            LoadSpec, MemoryPhase, MemoryRunOutcome, MemoryStrategy, Quant, WeightsSource,
+        };
+
+        fn fixture() -> (
+            LoadSpec,
+            mlx_gen::gen_core::MemoryProviderContract,
+            mlx_gen::gen_core::MemoryBehaviorFixture,
+        ) {
+            let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent-ltx-fixture".into()))
+                .with_quant(Quant::Q8);
+            let contract = crate::memory_strategy::weights_free_memory_strategy_contract(&spec)
+                .expect("the provider-owned weights-free contract fixture");
+            let fixture = crate::memory_strategy::registered_valid_fixtures(
+                &spec,
+                &contract,
+                MemoryStrategy::StagedResidency,
+            )
+            .expect("the provider-owned behavior fixture")
+            .pop()
+            .expect("one staged-residency fixture");
+            (spec, contract, fixture)
+        }
+
+        let (spec, contract, fixture) = fixture();
+        let mut scope =
+            crate::memory_strategy::registered_begin_request(&spec, &contract, &fixture.context)
+                .unwrap()
+                .expect("the LTX provider must open a calibrated request scope");
+        let mut injected = fixture.request.clone();
+        scope.configure_request(&mut injected).unwrap();
+        injected
+            .memory
+            .as_mut()
+            .expect("the selected staged rung installs its request carrier")
+            .authorize_calibration_fault(MemoryPhase::Denoise);
+        scope.enter_phase(MemoryPhase::Conditioning).unwrap();
+        scope.leave_phase(MemoryPhase::Conditioning).unwrap();
+        scope.enter_phase(MemoryPhase::Denoise).unwrap();
+        let error = finish_calibration_phase(&injected, MemoryPhase::Denoise, || Ok(()))
+            .expect_err("the authorized provider fault must escape the physical boundary");
+        scope.leave_phase(MemoryPhase::Denoise).unwrap();
+        scope
+            .finish(MemoryRunOutcome::Error {
+                message: error.to_string(),
+            })
+            .expect("an injected provider error must complete scope cleanup");
+        assert!(
+            scope.finish(MemoryRunOutcome::Complete).is_err(),
+            "the error outcome must terminally finish the request scope"
+        );
+
+        let mut recovery =
+            crate::memory_strategy::registered_begin_request(&spec, &contract, &fixture.context)
+                .unwrap()
+                .expect("a fresh provider request scope must open after the injected error");
+        let mut recovered_request = fixture.request;
+        recovery.configure_request(&mut recovered_request).unwrap();
+        recovery.enter_phase(MemoryPhase::Conditioning).unwrap();
+        recovery.leave_phase(MemoryPhase::Conditioning).unwrap();
+        recovery.enter_phase(MemoryPhase::Denoise).unwrap();
+        finish_calibration_phase(&recovered_request, MemoryPhase::Denoise, || Ok(()))
+            .expect("the subsequent unmodified provider request must recover");
+        recovery.leave_phase(MemoryPhase::Denoise).unwrap();
+        recovery.enter_phase(MemoryPhase::Decode).unwrap();
+        finish_calibration_phase(&recovered_request, MemoryPhase::Decode, || Ok(()))
+            .expect("recovery must remain healthy through decode");
+        recovery.leave_phase(MemoryPhase::Decode).unwrap();
+        recovery.finish(MemoryRunOutcome::Complete).unwrap();
+    }
 
     #[test]
     fn replacement_mask_rejects_wrapping_u32_dimensions_without_panicking() {
