@@ -98,6 +98,49 @@ class DecodeQualityAdmissionCollectorTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "semantic allowlist"):
             collector.read_receipts([self.write_log(row)])
 
+    def test_input_root_deterministically_merges_isolated_geometry_logs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = root / "z-route" / "decode-quality-v2-sdxl-realvisxl-1024x1024.log"
+            second = root / "a-route" / "decode-quality-v2-sdxl-realvisxl-768x768.log"
+            first.parent.mkdir()
+            second.parent.mkdir()
+            for path, width in ((first, 1024), (second, 768)):
+                rows = [receipt(7, 1), receipt(99, 2)]
+                for row in rows:
+                    row["geometry"]["width"] = width
+                    row["geometry"]["height"] = width
+                path.write_text(
+                    "".join(f"DECODE_QUALITY_V2 {json.dumps(row)}\n" for row in rows),
+                    encoding="utf-8",
+                )
+            (root / "unrelated.log").write_text("ignored\n", encoding="utf-8")
+
+            paths = collector.receipt_log_paths([], root)
+            policies = collector.seal(collector.read_receipts(paths))
+
+        self.assertEqual(paths, [second, first])
+        self.assertEqual(
+            [policy["geometry"]["width"] for policy in policies],
+            [768, 1024],
+        )
+
+    def test_input_root_rejects_duplicate_explicit_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            log = root / "decode-quality-v2-sdxl-realvisxl-1024x1024.log"
+            log.write_text("unused\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "duplicate decode-quality"):
+                collector.receipt_log_paths([log], root)
+
+    def test_isolated_cell_shape_requires_one_row_with_all_five_seeds(self) -> None:
+        policies = collector.seal([receipt(seed, 1) for seed in (1234, 7, 99, 20260805, 424242)])
+        collector.require_policy_shape(policies, 1, 5)
+        with self.assertRaisesRegex(ValueError, "expected 4 fixtures"):
+            collector.require_policy_shape(policies, 1, 4)
+        with self.assertRaisesRegex(ValueError, "expected 2 policy"):
+            collector.require_policy_shape(policies, 2, 5)
+
     def test_rejects_malformed_semantic_coordinates(self) -> None:
         cases = [
             ("usePid", 0, "usePid must be a boolean"),

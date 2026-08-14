@@ -4,6 +4,7 @@
 //! clock, allocator counter, process footprint, or memory/calibration matrix. Its only output is an
 //! immutable semantic receipt for one exact route/geometry/tile coordinate and multiple fixed seeds.
 
+use std::io::Write as _;
 use std::path::PathBuf;
 
 use mlx_gen::{LoadSpec, WeightsSource};
@@ -201,6 +202,11 @@ fn production_latent_quality_admission() {
                     "observedError": max_delta(&dense_pixels, &tiled_pixels),
                 })
             );
+            std::io::stdout()
+                .flush()
+                .expect("flush Chroma quality receipt");
+            drop((latent, unpacked, dense, tiled, dense_pixels, tiled_pixels));
+            mlx_rs::memory::clear_cache();
         }
     }
 }

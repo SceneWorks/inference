@@ -560,6 +560,27 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
     return errors
 
 
+def decode_quality_candidate_rows(job: dict) -> tuple[list[str], list[str]]:
+    errors: list[str] = []
+    candidate_env = job.get("env", {}).get("DECODE_QUALITY_CANDIDATES", "")
+    if candidate_env != "${{ matrix.candidate.value }}":
+        return candidate_env.split(), errors
+    candidates = job.get("strategy", {}).get("matrix", {}).get("candidate", [])
+    rows: list[str] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict) or set(candidate) != {"geometry", "value"}:
+            errors.append(f"invalid candidate matrix row {candidate!r}")
+            continue
+        geometry, value = candidate["geometry"], candidate["value"]
+        if not isinstance(geometry, str) or not isinstance(value, str):
+            errors.append(f"candidate matrix row must use strings: {candidate!r}")
+            continue
+        if value.split(":", 1)[0] != geometry:
+            errors.append(f"candidate geometry label does not match value: {candidate!r}")
+        rows.append(value)
+    return rows, errors
+
+
 def decode_quality_candidate_policy_errors(workflow: str) -> list[str]:
     parsed = yaml.safe_load(workflow)
     jobs = parsed["jobs"]
@@ -572,9 +593,16 @@ def decode_quality_candidate_policy_errors(workflow: str) -> list[str]:
     }
     errors: list[str] = []
     for job, geometry_multiple in rules.items():
-        rows = jobs[job]["env"].get("DECODE_QUALITY_CANDIDATES", "").split()
+        job_config = jobs[job]
+        rows, matrix_errors = decode_quality_candidate_rows(job_config)
+        errors.extend(f"{job}: {error}" for error in matrix_errors)
+        strategy = job_config.get("strategy", {})
+        if strategy.get("fail-fast") is not False or strategy.get("max-parallel") != 1:
+            errors.append(f"{job}: quality cells must run serialized with fail-fast disabled")
         if not rows:
             errors.append(f"{job}: empty candidate grid")
+        if len(rows) != len(set(rows)):
+            errors.append(f"{job}: duplicate candidate matrix row")
         for row in rows:
             prefix = f"{job}: invalid candidate {row!r}"
             try:
@@ -772,7 +800,8 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             "mlx-decode-quality-chroma",
         ):
             geometries[job] = set()
-            rows = jobs[job]["env"]["DECODE_QUALITY_CANDIDATES"].split()
+            rows, errors = decode_quality_candidate_rows(jobs[job])
+            self.assertEqual(errors, [])
             for row in rows:
                 geometry = row.split(":", 1)[0]
                 width_text, height_text = geometry.split("x")
@@ -784,6 +813,42 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertNotIn((720, 1280), geometries["mlx-decode-quality-kolors"])
         self.assertIn((1280, 720), geometries["mlx-decode-quality-chroma"])
         self.assertIn((720, 1280), geometries["mlx-decode-quality-chroma"])
+
+        expected_cells = {
+            "mlx-decode-quality-kolors": 7,
+            "mlx-decode-quality-sdxl": 50,
+            "mlx-decode-quality-chroma": 12,
+        }
+        for job, cells in expected_cells.items():
+            with self.subTest(job=job):
+                config = jobs[job]
+                matrix = config["strategy"]["matrix"]
+                route_count = len(matrix.get("model", ["kolors"]))
+                self.assertEqual(route_count * len(matrix["candidate"]), cells)
+                self.assertEqual(
+                    config["env"]["DECODE_QUALITY_CANDIDATES"],
+                    "${{ matrix.candidate.value }}",
+                )
+                self.assertIn("${{ matrix.candidate.geometry }}", config["name"])
+                upload = next(
+                    step
+                    for step in config["steps"]
+                    if str(step.get("uses", "")).startswith("actions/upload-artifact@")
+                )
+                artifact_name = upload["with"]["name"]
+                self.assertTrue(artifact_name.startswith("decode-quality-v2-"))
+                self.assertIn("${{ matrix.candidate.geometry }}", artifact_name)
+                if job != "mlx-decode-quality-kolors":
+                    self.assertIn("${{ matrix.model.id }}", artifact_name)
+                self.assertEqual(upload["with"]["if-no-files-found"], "error")
+                collector_step = next(
+                    step["run"]
+                    for step in config["steps"]
+                    if "collect_decode_quality_admission.py" in step.get("run", "")
+                )
+                self.assertIn("--expected-policy-count 1", collector_step)
+                self.assertIn("--expected-fixture-count 5", collector_step)
+        self.assertEqual(sum(expected_cells.values()), 69)
 
         mutations = {
             "Kolors landscape geometry": ("1280x768:576:48", "1280x720:576:48"),

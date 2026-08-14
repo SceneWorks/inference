@@ -726,17 +726,27 @@ jobs:
   # or create calibration/performance data; the collector rejects every field outside the semantic
   # latent/output SHA + max-RGB allowlist before sealing ABI-2 policy rows.
   mlx-decode-quality-kolors:
-    name: Decode quality admission (Kolors)
+    name: Decode quality admission (Kolors ${{ matrix.candidate.geometry }})
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'decode-quality-kolors'
     runs-on: [self-hosted, macOS, ARM64, rw-chroma]
     timeout-minutes: 720
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        candidate:
+          - { geometry: "768x768", value: "768x768:576:48" }
+          - { geometry: "1024x1024", value: "1024x1024:768:64" }
+          - { geometry: "1280x768", value: "1280x768:576:48" }
+          - { geometry: "768x1280", value: "768x1280:576:48" }
+          - { geometry: "1280x1280", value: "1280x1280:960:80" }
+          - { geometry: "1536x1536", value: "1536x1536:1152:96" }
+          - { geometry: "2048x2048", value: "2048x2048:1536:128" }
     env:
       QUALITY_REPOSITORY: SceneWorks/kolors-mlx
       QUALITY_SOURCE_REVISION: aadbd49f53b66a33ef1be09384eac409cbc44061
       DECODE_QUALITY_TIER: q4
-      DECODE_QUALITY_CANDIDATES: >-
-        768x768:576:48 1024x1024:768:64 1280x768:576:48 768x1280:576:48
-        1280x1280:960:80 1536x1536:1152:96 2048x2048:1536:128
+      DECODE_QUALITY_CANDIDATES: ${{ matrix.candidate.value }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Toolchain versions
@@ -744,7 +754,7 @@ jobs:
       - name: Materialize exact Kolors q4 snapshot
         env:
           PYTHONPATH: ${{ runner.temp }}/huggingface-hub
-          QUALITY_ROOT: ${{ runner.temp }}/decode-quality-${{ github.run_id }}-${{ github.run_attempt }}-kolors
+          QUALITY_ROOT: ${{ runner.temp }}/decode-quality-${{ github.run_id }}-${{ github.run_attempt }}-kolors-${{ matrix.candidate.geometry }}
         run: |
           set -euo pipefail
           python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$PYTHONPATH" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
@@ -770,25 +780,26 @@ jobs:
         run: |
           set -euo pipefail
           python3.12 scripts/ci/decode_quality_implementation_fingerprint.py --check
-          log="$RUNNER_TEMP/decode-quality-kolors.log"
+          log="$RUNNER_TEMP/decode-quality-v2-kolors-kolors-${{ matrix.candidate.geometry }}.log"
           out="$(cargo test --locked --release -p mlx-gen-kolors \
             --test decode_quality_admission production_latent_quality_admission \
             -- --exact --ignored --test-threads=1 --nocapture 2>&1 | tee "$log" /dev/stderr)"
           grep -qE "test result: ok\. 1 passed" <<<"$out"
           python3.12 scripts/ci/collect_decode_quality_admission.py \
-            --input "$log" --output "$RUNNER_TEMP/decode-quality-kolors-policies.json"
+            --input "$log" --expected-policy-count 1 --expected-fixture-count 5 \
+            --output "$RUNNER_TEMP/decode-quality-v2-kolors-kolors-${{ matrix.candidate.geometry }}-policies.json"
       - name: Upload semantic quality receipts
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: decode-quality-kolors
+          name: decode-quality-v2-kolors-kolors-${{ matrix.candidate.geometry }}
           if-no-files-found: error
           path: |
-            ${{ runner.temp }}/decode-quality-kolors.log
-            ${{ runner.temp }}/decode-quality-kolors-policies.json
+            ${{ runner.temp }}/decode-quality-v2-kolors-kolors-${{ matrix.candidate.geometry }}.log
+            ${{ runner.temp }}/decode-quality-v2-kolors-kolors-${{ matrix.candidate.geometry }}-policies.json
 
   mlx-decode-quality-sdxl:
-    name: Decode quality admission (${{ matrix.model }})
+    name: Decode quality admission (${{ matrix.model.id }} ${{ matrix.candidate.geometry }})
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'decode-quality-sdxl'
     runs-on: [self-hosted, macOS, ARM64, rw-chroma]
     timeout-minutes: 720
@@ -796,45 +807,53 @@ jobs:
       fail-fast: false
       max-parallel: 1
       matrix:
-        include:
-          - model: sdxl
+        model:
+          - id: sdxl
             repository: SceneWorks/sdxl-base-mlx
             source_revision: 36699bb8a6353e61c920e3bf19f0e6f8e4151c55
             steps: 30
             guidance: 7.0
-          - model: realvisxl
+          - id: realvisxl
             repository: SceneWorks/realvisxl-mlx
             source_revision: e40202d63baef826c7df95a639a811698c1178d2
             steps: 30
             guidance: 7.0
-          - model: realvisxl_lightning
+          - id: realvisxl_lightning
             repository: SceneWorks/realvisxl-lightning-mlx
             source_revision: c09fd586989bdc3c658d4acd03e8ae81677ade8e
             steps: 5
             guidance: 1.0
             sampler: lightning
-          - model: illustrious_xl_v1
+          - id: illustrious_xl_v1
             repository: SceneWorks/illustrious-xl-v1-mlx
             source_revision: c5a92a902dd4e6ee99c2a57981ecf66209905dd1
             steps: 30
             guidance: 7.0
-          - model: illustrious_xl_v2
+          - id: illustrious_xl_v2
             repository: SceneWorks/illustrious-xl-v2-mlx
             source_revision: 7c5c8b2bb75a8f38a7365e70bdf84d38d6204473
             steps: 30
             guidance: 7.0
+        candidate:
+          - { geometry: "1024x1024", value: "1024x1024:896:192" }
+          - { geometry: "1152x896", value: "1152x896:768:160" }
+          - { geometry: "896x1152", value: "896x1152:768:160" }
+          - { geometry: "1216x832", value: "1216x832:704:160" }
+          - { geometry: "832x1216", value: "832x1216:704:160" }
+          - { geometry: "1344x768", value: "1344x768:640:128" }
+          - { geometry: "768x1344", value: "768x1344:640:128" }
+          - { geometry: "1280x1280", value: "1280x1280:1120:240" }
+          - { geometry: "1536x1536", value: "1536x1536:1344:288" }
+          - { geometry: "2048x2048", value: "2048x2048:1792:384" }
     env:
-      QUALITY_MODEL: ${{ matrix.model }}
-      QUALITY_REPOSITORY: ${{ matrix.repository }}
-      QUALITY_SOURCE_REVISION: ${{ matrix.source_revision }}
+      QUALITY_MODEL: ${{ matrix.model.id }}
+      QUALITY_REPOSITORY: ${{ matrix.model.repository }}
+      QUALITY_SOURCE_REVISION: ${{ matrix.model.source_revision }}
       DECODE_QUALITY_TIER: q4
-      DECODE_QUALITY_STEPS: ${{ matrix.steps }}
-      DECODE_QUALITY_GUIDANCE: ${{ matrix.guidance }}
-      DECODE_QUALITY_SAMPLER: ${{ matrix.sampler }}
-      DECODE_QUALITY_CANDIDATES: >-
-        1024x1024:896:192 1152x896:768:160 896x1152:768:160
-        1216x832:704:160 832x1216:704:160 1344x768:640:128 768x1344:640:128
-        1280x1280:1120:240 1536x1536:1344:288 2048x2048:1792:384
+      DECODE_QUALITY_STEPS: ${{ matrix.model.steps }}
+      DECODE_QUALITY_GUIDANCE: ${{ matrix.model.guidance }}
+      DECODE_QUALITY_SAMPLER: ${{ matrix.model.sampler }}
+      DECODE_QUALITY_CANDIDATES: ${{ matrix.candidate.value }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Toolchain versions
@@ -842,7 +861,7 @@ jobs:
       - name: Materialize exact SDXL-family q4 snapshot
         env:
           PYTHONPATH: ${{ runner.temp }}/huggingface-hub
-          QUALITY_ROOT: ${{ runner.temp }}/decode-quality-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model }}
+          QUALITY_ROOT: ${{ runner.temp }}/decode-quality-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model.id }}-${{ matrix.candidate.geometry }}
         run: |
           set -euo pipefail
           python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$PYTHONPATH" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
@@ -870,25 +889,26 @@ jobs:
         run: |
           set -euo pipefail
           python3.12 scripts/ci/decode_quality_implementation_fingerprint.py --check
-          log="$RUNNER_TEMP/decode-quality-$QUALITY_MODEL.log"
+          log="$RUNNER_TEMP/decode-quality-v2-sdxl-$QUALITY_MODEL-${{ matrix.candidate.geometry }}.log"
           out="$(cargo test --locked --release -p mlx-gen-sdxl \
             --test decode_quality_admission production_latent_quality_admission \
             -- --exact --ignored --test-threads=1 --nocapture 2>&1 | tee "$log" /dev/stderr)"
           grep -qE "test result: ok\. 1 passed" <<<"$out"
           python3.12 scripts/ci/collect_decode_quality_admission.py \
-            --input "$log" --output "$RUNNER_TEMP/decode-quality-$QUALITY_MODEL-policies.json"
+            --input "$log" --expected-policy-count 1 --expected-fixture-count 5 \
+            --output "$RUNNER_TEMP/decode-quality-v2-sdxl-$QUALITY_MODEL-${{ matrix.candidate.geometry }}-policies.json"
       - name: Upload semantic quality receipts
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: decode-quality-${{ matrix.model }}
+          name: decode-quality-v2-sdxl-${{ matrix.model.id }}-${{ matrix.candidate.geometry }}
           if-no-files-found: error
           path: |
-            ${{ runner.temp }}/decode-quality-${{ matrix.model }}.log
-            ${{ runner.temp }}/decode-quality-${{ matrix.model }}-policies.json
+            ${{ runner.temp }}/decode-quality-v2-sdxl-${{ matrix.model.id }}-${{ matrix.candidate.geometry }}.log
+            ${{ runner.temp }}/decode-quality-v2-sdxl-${{ matrix.model.id }}-${{ matrix.candidate.geometry }}-policies.json
 
   mlx-decode-quality-chroma:
-    name: Decode quality admission (${{ matrix.model }})
+    name: Decode quality admission (${{ matrix.model.id }} ${{ matrix.candidate.geometry }})
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'decode-quality-chroma'
     runs-on: [self-hosted, macOS, ARM64, rw-chroma]
     timeout-minutes: 720
@@ -896,41 +916,45 @@ jobs:
       fail-fast: false
       max-parallel: 1
       matrix:
-        include:
-          - model: chroma1_base
+        model:
+          - id: chroma1_base
             repository: SceneWorks/chroma1-base-mlx
             source_revision: e7330dda29d00ffdeeb719b28e92ee74cff0884c
             steps: 40
             guidance: 3.0
-          - model: chroma1_hd
+          - id: chroma1_hd
             repository: SceneWorks/chroma1-hd-mlx
             source_revision: 9d99afe1ebca67032476756bc70d4a7152bc1bd5
             steps: 40
             guidance: 3.0
-          - model: chroma1_flash
+          - id: chroma1_flash
             repository: SceneWorks/chroma1-flash-mlx
             source_revision: 6a9cb6178709559461506bf247f708d0d1008d00
             steps: 12
             guidance: 1.0
+        candidate:
+          - { geometry: "768x768", value: "768x768:640:192" }
+          - { geometry: "1024x1024", value: "1024x1024:832:256" }
+          - { geometry: "1280x720", value: "1280x720:576:192" }
+          - { geometry: "720x1280", value: "720x1280:576:192" }
     env:
-      QUALITY_MODEL: ${{ matrix.model }}
-      QUALITY_REPOSITORY: ${{ matrix.repository }}
-      QUALITY_SOURCE_REVISION: ${{ matrix.source_revision }}
+      QUALITY_MODEL: ${{ matrix.model.id }}
+      QUALITY_REPOSITORY: ${{ matrix.model.repository }}
+      QUALITY_SOURCE_REVISION: ${{ matrix.model.source_revision }}
       DECODE_QUALITY_TIER: q4
-      DECODE_QUALITY_STEPS: ${{ matrix.steps }}
-      DECODE_QUALITY_GUIDANCE: ${{ matrix.guidance }}
-      DECODE_QUALITY_CANDIDATES: >-
-        768x768:640:192 1024x1024:832:256 1280x720:576:192 720x1280:576:192
+      DECODE_QUALITY_STEPS: ${{ matrix.model.steps }}
+      DECODE_QUALITY_GUIDANCE: ${{ matrix.model.guidance }}
+      DECODE_QUALITY_CANDIDATES: ${{ matrix.candidate.value }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Toolchain versions
-        if: inputs.chroma_model == 'all' || inputs.chroma_model == matrix.model
+        if: inputs.chroma_model == 'all' || inputs.chroma_model == matrix.model.id
         run: rustc --version && cargo --version && python3.12 --version
       - name: Materialize exact Chroma q4 snapshot
-        if: inputs.chroma_model == 'all' || inputs.chroma_model == matrix.model
+        if: inputs.chroma_model == 'all' || inputs.chroma_model == matrix.model.id
         env:
           PYTHONPATH: ${{ runner.temp }}/huggingface-hub
-          QUALITY_ROOT: ${{ runner.temp }}/decode-quality-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model }}
+          QUALITY_ROOT: ${{ runner.temp }}/decode-quality-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model.id }}-${{ matrix.candidate.geometry }}
         run: |
           set -euo pipefail
           python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$PYTHONPATH" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
@@ -951,29 +975,30 @@ jobs:
           test -d "$QUALITY_ROOT/q4/vae"
           echo "CHROMA_QUALITY_ROOT=$QUALITY_ROOT" >> "$GITHUB_ENV"
       - name: Run production-latent quality admission
-        if: inputs.chroma_model == 'all' || inputs.chroma_model == matrix.model
+        if: inputs.chroma_model == 'all' || inputs.chroma_model == matrix.model.id
         env:
           CHROMA_QUALITY_ENTRY: ${{ env.QUALITY_MODEL }}
           DECODE_QUALITY_SOURCE_REVISION: ${{ env.QUALITY_SOURCE_REVISION }}
         run: |
           set -euo pipefail
           python3.12 scripts/ci/decode_quality_implementation_fingerprint.py --check
-          log="$RUNNER_TEMP/decode-quality-$QUALITY_MODEL.log"
+          log="$RUNNER_TEMP/decode-quality-v2-chroma-$QUALITY_MODEL-${{ matrix.candidate.geometry }}.log"
           out="$(cargo test --locked --release -p mlx-gen-chroma \
             --test decode_quality_admission production_latent_quality_admission \
             -- --exact --ignored --test-threads=1 --nocapture 2>&1 | tee "$log" /dev/stderr)"
           grep -qE "test result: ok\. 1 passed" <<<"$out"
           python3.12 scripts/ci/collect_decode_quality_admission.py \
-            --input "$log" --output "$RUNNER_TEMP/decode-quality-$QUALITY_MODEL-policies.json"
+            --input "$log" --expected-policy-count 1 --expected-fixture-count 5 \
+            --output "$RUNNER_TEMP/decode-quality-v2-chroma-$QUALITY_MODEL-${{ matrix.candidate.geometry }}-policies.json"
       - name: Upload semantic quality receipts
-        if: always() && (inputs.chroma_model == 'all' || inputs.chroma_model == matrix.model)
+        if: always() && (inputs.chroma_model == 'all' || inputs.chroma_model == matrix.model.id)
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: decode-quality-${{ matrix.model }}
+          name: decode-quality-v2-chroma-${{ matrix.model.id }}-${{ matrix.candidate.geometry }}
           if-no-files-found: error
           path: |
-            ${{ runner.temp }}/decode-quality-${{ matrix.model }}.log
-            ${{ runner.temp }}/decode-quality-${{ matrix.model }}-policies.json
+            ${{ runner.temp }}/decode-quality-v2-chroma-${{ matrix.model.id }}-${{ matrix.candidate.geometry }}.log
+            ${{ runner.temp }}/decode-quality-v2-chroma-${{ matrix.model.id }}-${{ matrix.candidate.geometry }}-policies.json
 
   # SC-15520: the Chroma1 memory ladder on real weights.
   #

@@ -3,6 +3,7 @@
 //! This target has no clock, peak-memory, allocator, process-footprint, or calibration-matrix API.
 //! It emits only immutable latent/output identities and the precommitted max-RGB error statistic.
 
+use std::io::Write as _;
 use std::path::PathBuf;
 
 use mlx_gen::gen_core::Progress;
@@ -263,6 +264,11 @@ fn production_latent_quality_admission() {
                     "observedError": max_delta(&dense.pixels, &tiled.pixels),
                 })
             );
+            std::io::stdout()
+                .flush()
+                .expect("flush Kolors quality receipt");
+            drop((latent, dense, tiled));
+            mlx_rs::memory::clear_cache();
         }
     }
 }

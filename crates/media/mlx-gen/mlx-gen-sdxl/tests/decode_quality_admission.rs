@@ -4,6 +4,7 @@
 //! captures the exact final latent from the ordinary `Sdxl::generate` denoise body and emits only
 //! immutable semantic identities plus the precommitted max-RGB error statistic.
 
+use std::io::Write as _;
 use std::path::PathBuf;
 
 use mlx_gen::{
@@ -212,6 +213,11 @@ fn production_latent_quality_admission() {
                     "observedError": max_delta(&sample.dense.pixels, &sample.tiled.pixels),
                 })
             );
+            std::io::stdout()
+                .flush()
+                .expect("flush SDXL quality receipt");
+            drop((production_pixels, sample));
+            mlx_rs::memory::clear_cache();
         }
     }
 }

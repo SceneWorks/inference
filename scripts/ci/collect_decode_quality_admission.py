@@ -3,7 +3,9 @@
 
 The collector deliberately accepts an exact semantic allowlist. A receipt containing timing,
 memory, allocator, footprint, or any other field is rejected rather than accidentally promoted into
-the quality artifact.
+the quality artifact. Geometry-isolated workflow artifacts use collision-free
+``decode-quality-v2-*.log`` names; ``--input-root`` recursively enumerates those names in lexical
+order and seals the complete downloaded route/geometry corpus deterministically.
 """
 
 from __future__ import annotations
@@ -191,6 +193,20 @@ def read_receipts(paths: Iterable[Path]) -> list[dict[str, Any]]:
     return receipts
 
 
+def receipt_log_paths(explicit: Iterable[Path], input_root: Path | None) -> list[Path]:
+    paths = list(explicit)
+    if input_root is not None:
+        _require(input_root.is_dir(), f"input root is not a directory: {input_root}")
+        paths.extend(sorted(input_root.rglob("decode-quality-v2-*.log")))
+    _require(bool(paths), "no decode-quality receipt logs selected")
+    normalized = [path.resolve() for path in paths]
+    _require(
+        len(normalized) == len(set(normalized)),
+        "duplicate decode-quality receipt log selected",
+    )
+    return paths
+
+
 def _coordinate(receipt: dict[str, Any]) -> tuple[str, ...]:
     return tuple(
         json.dumps(receipt[key], sort_keys=True, separators=(",", ":"))
@@ -312,12 +328,42 @@ def seal(receipts: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     return policies
 
 
+def require_policy_shape(
+    policies: list[dict[str, Any]],
+    expected_policy_count: int | None,
+    expected_fixture_count: int | None,
+) -> None:
+    if expected_policy_count is not None:
+        _require(
+            len(policies) == expected_policy_count,
+            f"expected {expected_policy_count} policy row(s), sealed {len(policies)}",
+        )
+    if expected_fixture_count is not None:
+        mismatched = [
+            len(policy["fixtures"])
+            for policy in policies
+            if len(policy["fixtures"]) != expected_fixture_count
+        ]
+        _require(
+            not mismatched,
+            f"expected {expected_fixture_count} fixtures per policy row, got {mismatched}",
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input", type=Path, action="append", required=True)
+    parser.add_argument("--input", type=Path, action="append", default=[])
+    parser.add_argument("--input-root", type=Path)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--expected-policy-count", type=int)
+    parser.add_argument("--expected-fixture-count", type=int)
     args = parser.parse_args()
-    policies = seal(read_receipts(args.input))
+    policies = seal(read_receipts(receipt_log_paths(args.input, args.input_root)))
+    require_policy_shape(
+        policies,
+        args.expected_policy_count,
+        args.expected_fixture_count,
+    )
     payload = json.dumps(policies, indent=2, ensure_ascii=False) + "\n"
     temporary = args.output.with_suffix(args.output.suffix + ".tmp")
     temporary.write_text(payload, encoding="utf-8")
