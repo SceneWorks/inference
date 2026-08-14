@@ -74,15 +74,6 @@ pub const DEFAULT_STEPS: u32 = 50;
 /// rather than a slow render.
 pub const MAX_STEPS: u32 = 200;
 
-/// Text-encoder shards the layer-50 tap needs. Shards 13-14 hold only the never-executed tail
-/// (layers 50-63 and `lm_head`), so mapping the whole 66.7 GB component would read 15 GB for
-/// nothing.
-const TE_SHARDS: std::ops::RangeInclusive<u32> = 1..=12;
-
-/// The shard holding the Qwen3-VL **vision tower**. All 351 `model.visual.*` tensors live in
-/// shard 14 and nowhere else, so [`TE_SHARDS`] excludes it for `t2va` and `fl2va` must add it back.
-const VISION_SHARD: u32 = 14;
-
 /// Quantization group size the shared vision tower is built with — the same value every other
 /// consumer of `mlx-gen-boogu`'s tower passes.
 const VISION_GROUP_SIZE: i32 = 64;
@@ -250,6 +241,10 @@ pub struct MiniMaxH3 {
     /// where the tiered DiT comes from `SceneWorks/minimax-h3-mlx/{tier}/transformer` while every
     /// shared component still comes from the upstream root. See [`resolve_dit_dir`].
     dit_dir: PathBuf,
+    /// The directory holding the text encoder's shards — `root.join("text_encoder")` in the flat
+    /// upstream layout, or the staged [`TEXT_ENCODER_COMPONENT`] when a **packed** TE tier is
+    /// installed (sc-19120). See [`resolve_text_encoder_dir`].
+    text_encoder_dir: PathBuf,
     dtype: Dtype,
     /// Adapter files to fold into whichever DiT partition a render maps (sc-18724). Held as specs,
     /// not as loaded factors: `t2va`/`fl2va` and `ref2va` run different checkpoints, and the DiT is
@@ -259,16 +254,40 @@ pub struct MiniMaxH3 {
 
 /// The staged-component id for the **tiered** DiT directory (sc-17150).
 ///
-/// Only the DiT is tiered: the text encoder, both VAEs and the tokenizer are dense in every tier and
-/// are shared as a co-requisite, so they always resolve against the upstream root. Redirecting just
-/// this one component is what lets a `q4` install hold one 18.8 GB DiT alongside the shared 66.7 GB
-/// text encoder without a second copy of anything.
+/// Both tiered components — this and [`TEXT_ENCODER_COMPONENT`] — are redirected individually so a
+/// `q4` install holds one 18.8 GB DiT and one packed text encoder while the two VAEs and the
+/// tokenizer still resolve against the upstream root, with no second copy of anything.
 ///
 /// Deliberately **not** in [`ModelDescriptor::required_components`]: it is needed only for a
 /// non-`bf16` tier, and a flat upstream snapshot must keep loading with nothing staged. That is the
 /// sensenova `distill_lora` convention — a conditionally-needed component is declared to
 /// [`reject_unknown_components`] per load, not advertised as a universal requirement.
 pub const DIT_COMPONENT: &str = "transformer";
+
+/// The staged-component id for the **tiered text encoder** (sc-19120).
+///
+/// # Why this component became tiered, when it was explicitly not before
+///
+/// The Qwen3-VL-32B condition encoder was shipped dense in every tier on the reasoning that a
+/// rehost bought nothing: its 14 shards are byte-identical to `Qwen/Qwen3-VL-32B-Instruct`
+/// (66_714_912_872 B, 14/14 SHA-256), so a mirror would add only bytes. That reasoning is intact
+/// **for a dense mirror** and is superseded for a packed one — a packed tier is a *derived*
+/// artifact that upstream does not publish and cannot be sourced from Qwen at any revision.
+///
+/// What changed is the measurement, not the argument: the ~53 GB process high-water this model was
+/// believed to have for activation reasons is
+/// [this stage](crate::memory_strategy::CONDITIONING_STAGE_PEAK_BYTES), running **before** the DiT
+/// is mapped, and it was dense at every tier — so the DiT's real 40.43 → 11.63 GB tiering was
+/// invisible underneath it.
+///
+/// # It is independent of the DiT's tier, on purpose
+///
+/// `reconcile_tier` makes `spec.quantize` an assertion about the staged DiT. This component is
+/// deliberately **not** held to that same assertion (see `reconcile_text_encoder`): the shipped
+/// manifest pairs one dense text encoder with all three DiT tiers, and coupling the two would break
+/// every existing install the moment a `q4` DiT was requested. The tier of what is staged here is
+/// whatever the `{base}.scales` in it say, and the loaders auto-detect it.
+pub const TEXT_ENCODER_COMPONENT: &str = "text_encoder";
 
 /// Resolve the DiT directory: the staged [`DIT_COMPONENT`] if the caller provided one, else
 /// `root/transformer` (the flat upstream layout).
@@ -279,6 +298,47 @@ fn resolve_dit_dir(root: &Path, spec: &LoadSpec) -> PathBuf {
         // produce the actionable "missing transformer/config.json" error against the root.
         _ => root.join(DIT_COMPONENT),
     }
+}
+
+/// Resolve the text-encoder directory: the staged [`TEXT_ENCODER_COMPONENT`] if the caller provided
+/// one, else `root/text_encoder`.
+fn resolve_text_encoder_dir(root: &Path, spec: &LoadSpec) -> PathBuf {
+    match spec.components.get(TEXT_ENCODER_COMPONENT) {
+        Some(WeightsSource::Dir(p)) => p.clone(),
+        _ => root.join(TEXT_ENCODER_COMPONENT),
+    }
+}
+
+/// Validate the staged text encoder's quantization marker, if it carries one.
+///
+/// Unlike [`reconcile_tier`] this does **not** compare against `spec.quantize` — see
+/// [`TEXT_ENCODER_COMPONENT`] for why the two components' tiers are independent. What it does check
+/// is the one thing a packed component can get wrong in a way no loader can detect: the **group
+/// size**.
+///
+/// [`mlx_gen::quant::packed_bits`] *infers* the bit width from the weight/scales column ratio
+/// **assuming** [`crate::text_encoder::GROUP_SIZE`]. A component packed at a different group size
+/// therefore does not fail cleanly — Mage's q8 vision tower (packed at 32, read at 64) derived
+/// "bits 16" from a perfectly good artifact and was diagnosed as a bad upload (sc-15154). Reading
+/// the declared group size and rejecting a mismatch by name turns that into one actionable line.
+fn reconcile_text_encoder(te_dir: &Path) -> Result<()> {
+    let Some(declared) = mlx_gen::quant::packed_quant_group_size_at(te_dir)? else {
+        // Dense, or packed without a declared group size — the loaders auto-detect on `.scales`
+        // and `packed_bits` will reject anything that does not divide cleanly at our own width.
+        return Ok(());
+    };
+    if declared != crate::text_encoder::GROUP_SIZE {
+        return Err(Error::Msg(format!(
+            "{MODEL_ID}: the staged text encoder in {} declares quantization group_size {declared}, \
+             but this engine reads packed text-encoder weights at {} — a mismatched group size does \
+             not fail cleanly (the inferred bit width comes out legal-looking and wrong), so it is \
+             rejected here; re-pack the tier at {}",
+            te_dir.display(),
+            crate::text_encoder::GROUP_SIZE,
+            crate::text_encoder::GROUP_SIZE
+        )));
+    }
+    Ok(())
 }
 
 /// Reconcile a caller's `spec.quantize` against the tier actually staged on disk.
@@ -588,7 +648,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
             )))
         }
     };
-    reject_unknown_components(spec, &[DIT_COMPONENT], MODEL_ID)?;
+    reject_unknown_components(spec, &[DIT_COMPONENT, TEXT_ENCODER_COMPONENT], MODEL_ID)?;
     // Adapter paths are probed at load so a mistyped one fails here rather than 20 minutes into a
     // render, after the DiT is mapped. The factors themselves are read and installed per render,
     // onto the task's own DiT (sc-18724) — `t2va`/`fl2va` and `ref2va` are different checkpoints.
@@ -650,10 +710,23 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         )));
     }
     reconcile_tier(&reference_dit, spec.quantize)?;
+    // The text encoder is the second tiered component (sc-19120), so it is probed at its resolved
+    // location like the DiT and not under the root: a split install that stages a packed TE has no
+    // `root/text_encoder` at all.
+    let text_encoder_dir = resolve_text_encoder_dir(&root, spec);
+    let te_config = text_encoder_dir.join("config.json");
+    if !te_config.is_file() {
+        return Err(Error::Msg(format!(
+            "{MODEL_ID}: missing {} — stage the tier's `text_encoder` directory as the \
+             '{TEXT_ENCODER_COMPONENT}' component, or point at a snapshot root that holds \
+             `text_encoder/`",
+            te_config.display()
+        )));
+    }
+    reconcile_text_encoder(&text_encoder_dir)?;
     for (partition, probe) in [
         ("vae", "config.json"),
         ("audio_vae", "config.json"),
-        ("text_encoder", "config.json"),
         ("tokenizer", "tokenizer.json"),
         // The audio VAE's *constructor* arguments live only in the three FL2VA source documents;
         // the repackaged root config carries none of them (see `MiniMaxH3AudioVaeConfig`).
@@ -678,6 +751,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         descriptor: descriptor(),
         root,
         dit_dir,
+        text_encoder_dir,
         dtype,
         adapters: spec.adapters.clone(),
     }))
@@ -743,35 +817,15 @@ impl MiniMaxH3 {
         Ok(dit)
     }
 
-    /// Map the text-encoder shards a presentation needs.
+    /// Map the text-encoder shards a presentation needs, out of the **resolved** text-encoder
+    /// directory — so a staged packed tier ([`TEXT_ENCODER_COMPONENT`], sc-19120) is mapped instead
+    /// of the dense root component.
     ///
-    /// `t2va` reads shards 1-12 ([`TE_SHARDS`]). `fl2va` additionally needs **shard 14**, which is
-    /// where all 351 `model.visual.*` tensors live — the vision tower is not spread across the
-    /// component, it sits entirely in the last shard alongside the never-executed decoder tail.
-    /// That is why the `t2va` window could stop at 12 and why a keyframe request cannot.
+    /// The window itself lives with the encoder ([`crate::text_encoder::map_shards`]), which is
+    /// also what the tier measurement drives, so a per-stage memory figure is taken from this exact
+    /// mapping rather than from a copy of it.
     fn map_te_shards(&self, with_vision: bool) -> Result<Weights> {
-        let dir = self.root.join("text_encoder");
-        let mut w = Weights::empty();
-        let shards: Vec<u32> = if with_vision {
-            TE_SHARDS.chain(std::iter::once(VISION_SHARD)).collect()
-        } else {
-            TE_SHARDS.collect()
-        };
-        for i in shards {
-            let shard = format!("model-{i:05}-of-00014.safetensors");
-            let part = Weights::from_file(dir.join(&shard))?;
-            let keys: Vec<String> = part.keys().map(str::to_owned).collect();
-            for k in keys {
-                // Shard 14 also holds layers 50-63 and `lm_head`, which are never executed. Keep
-                // only what the tower needs so the fl2va path does not carry 15 GB for nothing.
-                if with_vision && i == VISION_SHARD && !k.starts_with(VISION_PREFIX) {
-                    continue;
-                }
-                let t = part.require(&k)?.clone();
-                w.insert(k, t);
-            }
-        }
-        Ok(w)
+        crate::text_encoder::map_shards(&self.text_encoder_dir, with_vision)
     }
 
     /// Encode the prompt and immediately release the 66.7 GB text encoder.
@@ -913,6 +967,15 @@ impl MiniMaxH3 {
             crate::keyframe::fit_keyframes(&images, geometry.width, geometry.height)?
         };
 
+        // The two stage boundaries this model's residency seam actually has (sc-19120). H3 is a
+        // load→use→drop seam through and through, so `Progress::Loading` is the event its phases
+        // were specified for — `mlx-gen-krea-realtime` emits the same pair. Two things depend on
+        // it: a UI that would otherwise sit silent through a multi-GB text-encoder map with no
+        // `Step` to show, and `tests/te_tier_generate_stages.rs`, which resets the MLX peak at each
+        // boundary and so can attribute a high-water to the stage that set it. That attribution is
+        // the whole reason this story exists: for three measurements the conditioning stage's peak
+        // was read as the DiT's.
+        on_progress(Progress::Loading(mlx_gen::gen_core::LoadPhase::TextEncoder));
         let (context, text_tags) = if anchors.is_empty() {
             let context = self.encode_prompt(&req.prompt)?;
             let tags = vec![crate::denoise::TEXT_TAG; context.shape()[1] as usize];
@@ -956,6 +1019,7 @@ impl MiniMaxH3 {
         }
 
         // --- 2. denoise ---------------------------------------------------------------------
+        on_progress(Progress::Loading(mlx_gen::gen_core::LoadPhase::Renderer));
         let dit = self.load_task_dit(task)?;
         let patch = dit.config().patch_size;
         let layout = if anchors.is_empty() {
@@ -1082,6 +1146,7 @@ impl MiniMaxH3 {
         }
 
         // --- 1. the conditioner: vision tower over the visual references, then the 66.7 GB LM ---
+        on_progress(Progress::Loading(mlx_gen::gen_core::LoadPhase::TextEncoder));
         let (context, text_tags) = self.encode_prompt_ref2va(&req.prompt, &normalized)?;
         if req.cancel.is_cancelled() {
             return Err(Error::Canceled);
@@ -1171,6 +1236,7 @@ impl MiniMaxH3 {
             .transpose()?;
 
         // --- 3. denoise on `transformer_ref` ----------------------------------------------------
+        on_progress(Progress::Loading(mlx_gen::gen_core::LoadPhase::Renderer));
         let dit = self.load_task_dit(task)?;
         let patch = dit.config().patch_size;
         let layout = ref2va_layout(geometry, &text_tags, &geometries, patch)?;
@@ -1433,6 +1499,7 @@ mod tests {
             descriptor: descriptor(),
             root: PathBuf::from("/snap"),
             dit_dir: PathBuf::from(dit_dir),
+            text_encoder_dir: PathBuf::from("/snap/text_encoder"),
             dtype: Dtype::Bfloat16,
             adapters: Vec::new(),
         }

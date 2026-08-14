@@ -370,6 +370,54 @@ pub fn encode_grounded(
     encode_grounded_from_vision(&gv, tok, te, prompt)
 }
 
+/// Text-encoder shards the layer-50 tap needs. Shard 13 holds only the never-executed tail (layers
+/// 58-63), so mapping the whole 66.7 GB component would read 4.9 GB for nothing — and the shipped
+/// manifest does not even download it.
+pub const TE_SHARDS: std::ops::RangeInclusive<u32> = 1..=12;
+
+/// The shard holding the Qwen3-VL **vision tower**. All 351 `model.visual.*` tensors live in shard
+/// 14 and nowhere else, so [`TE_SHARDS`] excludes it for `t2va` and `fl2va` must add it back.
+pub const VISION_SHARD: u32 = 14;
+
+/// Map the text-encoder shards a presentation needs, out of `dir`.
+///
+/// `t2va` reads shards 1-12 ([`TE_SHARDS`]). `fl2va` / `ref2va` additionally need
+/// [`VISION_SHARD`], from which only `model.visual.*` is kept — shard 14 also holds layers 62-63,
+/// the final norm and `lm_head`, none of which is ever executed, so the grounded path would
+/// otherwise carry them for nothing.
+///
+/// # The shard file names are the addressing scheme, not a convention
+///
+/// This function does **not** glob: it names `model-{i:05}-of-00014.safetensors` for a fixed set of
+/// `i`. A packed tier
+/// ([`quantize_minimax_h3_text_encoder`](crate::convert::quantize_minimax_h3_text_encoder))
+/// therefore preserves the source shard names exactly — a re-sharded tier would silently map a
+/// different set of layers, and every downstream shape check would still pass.
+///
+/// Public so the sc-19120 tier measurement can exercise **this** mapping rather than a copy of it:
+/// a per-stage memory figure taken from a re-implementation measures the re-implementation.
+pub fn map_shards(dir: &Path, with_vision: bool) -> Result<Weights> {
+    let mut w = Weights::empty();
+    let shards: Vec<u32> = if with_vision {
+        TE_SHARDS.chain(std::iter::once(VISION_SHARD)).collect()
+    } else {
+        TE_SHARDS.collect()
+    };
+    for i in shards {
+        let shard = format!("model-{i:05}-of-00014.safetensors");
+        let part = Weights::from_file(dir.join(&shard))?;
+        let keys: Vec<String> = part.keys().map(str::to_owned).collect();
+        for k in keys {
+            if with_vision && i == VISION_SHARD && !k.starts_with(VISION_PREFIX) {
+                continue;
+            }
+            let t = part.require(&k)?.clone();
+            w.insert(k, t);
+        }
+    }
+    Ok(w)
+}
+
 /// Load a bias-less Qwen3 projection from its `{base}.weight` key, auto-detecting a pre-quantized
 /// snapshot (`{base}.scales` present) via the core loader.
 pub(crate) fn lin(w: &Weights, key: &str) -> Result<AdaptableLinear> {
@@ -380,6 +428,27 @@ pub(crate) fn lin(w: &Weights, key: &str) -> Result<AdaptableLinear> {
 /// Load a token embedding, auto-detecting a pre-quantized snapshot.
 pub(crate) fn embedding(w: &Weights, base: &str) -> Result<TokenEmbedding> {
     mlx_gen::quant::embedding(w, base, GROUP_SIZE)
+}
+
+/// The single packed width `group` shares, or `None` if any member is dense or they disagree.
+///
+/// Disagreement collapses to `None` rather than to the first member's width. A sub-module packed at
+/// two widths is a mis-built tier, and reporting *a* width would let it read as a valid one — the
+/// encoder-level [`MiniMaxH3TextEncoder::packed_bits`] turns the resulting `None`-among-`Some`s
+/// into a named error.
+pub(crate) fn uniform_packed_bits<'a>(
+    group: impl IntoIterator<Item = &'a AdaptableLinear>,
+) -> Option<i32> {
+    let mut seen: Option<i32> = None;
+    for l in group {
+        let (.., bits) = l.quantized_params()?;
+        match seen {
+            None => seen = Some(bits),
+            Some(b) if b != bits => return None,
+            Some(_) => {}
+        }
+    }
+    seen
 }
 
 /// The core key-join helper, re-exported so the block modules can spell `join_key(prefix, leaf)`

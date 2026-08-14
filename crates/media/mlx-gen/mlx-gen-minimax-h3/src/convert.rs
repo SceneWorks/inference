@@ -1,5 +1,5 @@
-//! Offline pre-quantization of the MiniMax-H3 DiT into the `q4` / `q8` tier artifacts the
-//! `SceneWorks/minimax-h3-mlx` mirror publishes (sc-17150).
+//! Offline pre-quantization of the MiniMax-H3 **DiT** (sc-17150) and **text encoder** (sc-19120)
+//! into the tier artifacts the `SceneWorks/minimax-h3-mlx` mirror publishes.
 //!
 //! Tiers ship **pre-quantized**; nothing quantizes at load. The packed weights auto-detect through
 //! [`mlx_gen::quant::lin`] on the `{base}.scales` signal, so one loader serves a dense `bf16/` tier
@@ -334,8 +334,26 @@ pub fn quantize_minimax_h3_dit(
     Ok(written)
 }
 
-/// Write the safetensors index describing the emitted shard set.
+/// Write the DiT's safetensors index describing the emitted shard set.
 fn write_index(dst: &Path, weight_map: &HashMap<String, String>, total_size: usize) -> Result<()> {
+    write_index_named(
+        dst,
+        "diffusion_pytorch_model.safetensors.index.json",
+        weight_map,
+        total_size,
+    )
+}
+
+/// Write a safetensors index under `name`. The two components ship different index stems —
+/// `diffusion_pytorch_model` for the DiT, `model` for the text encoder — and each tier must carry
+/// the one its source component did, or `scripts/release/verify_model_snapshot.py` cannot prove the
+/// hosted tier is complete.
+fn write_index_named(
+    dst: &Path,
+    name: &str,
+    weight_map: &HashMap<String, String>,
+    total_size: usize,
+) -> Result<()> {
     let mut entries: Vec<(&String, &String)> = weight_map.iter().collect();
     entries.sort_unstable_by_key(|(key, _)| *key);
     let map: serde_json::Map<String, serde_json::Value> = entries
@@ -348,11 +366,189 @@ fn write_index(dst: &Path, weight_map: &HashMap<String, String>, total_size: usi
     });
     let text = serde_json::to_string_pretty(&index)
         .map_err(|e| Error::Msg(format!("minimax-h3 convert: serialize index: {e}")))?;
-    std::fs::write(
-        dst.join("diffusion_pytorch_model.safetensors.index.json"),
-        text,
-    )?;
+    std::fs::write(dst.join(name), text)?;
     Ok(())
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+// The text encoder (sc-19120) — the stage that actually sets the process high-water
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Bases left dense in **every** text-encoder tier, matched by **suffix** (the TE's keys are
+/// indexed per layer / per vision block, so the DiT's exact-match list has no analogue here).
+///
+/// Two of these entries are load-bearing correctness, not tidiness:
+///
+/// * **`.pos_embed`** — `model.visual.pos_embed.weight` is `[2304, 1152]`. It is 2-D and its input
+///   width divides [`GROUP_SIZE`], so [`mlx_gen::quant::quantize_map`]'s shape guard would happily
+///   pack it — and [`mlx_gen_boogu::vision::VisionTower::from_weights`] reads it with a raw
+///   `Weights::require`. A packed tensor arriving there loads u32 codes where a float is expected
+///   and reports **no error at all**: precisely the Mage `pos_embed` failure (sc-14980). This is
+///   the one entry in the list that the shape guard does not already cover, and
+///   `pos_embed_is_dense_by_policy_not_by_shape` is its dedicated guard.
+/// * **`.patch_embed.proj`** — 5-D in the checkpoint, so the shape guard covers it today, but it is
+///   also read through a raw `require` + `reshape`, so it is declared rather than left to luck.
+///
+/// The rest are 1-D norms that [`mlx_gen::quant::quantize_map`] could not pack anyway; they are
+/// named so the policy is auditable against the 1058-tensor index instead of inferred.
+pub const TE_DENSE_BY_POLICY: &[&str] = &[
+    // Qwen3 decoder norms (`Qwen3DecoderLayer` / `Qwen3Attention` read these with `require`).
+    ".input_layernorm",
+    ".post_attention_layernorm",
+    ".q_norm",
+    ".k_norm",
+    // The final `model.language_model.norm`, plus every vision `merger.norm` /
+    // `deepstack_merger_list.{i}.norm`.
+    ".norm",
+    // Vision block LayerNorms.
+    ".norm1",
+    ".norm2",
+    // The two vision tensors above.
+    ".pos_embed",
+    ".patch_embed.proj",
+];
+
+/// Base suffixes packed at the tier width — the **positive** counterpart of the DiT's negative
+/// predicate, and deliberately so.
+///
+/// The DiT is one module in this crate, so "everything except the declared dense set" is safe
+/// there: a new tensor cannot appear without this crate's own loader gaining a reader for it. The
+/// text encoder is **two** towers and one of them ([`mlx_gen_boogu::vision::VisionTower`]) is a
+/// shared crate that other providers evolve. Under a negative predicate a tensor added there would
+/// default to *packed* and meet a raw `require` — the silent failure mode this whole policy exists
+/// to prevent. Under this one it defaults to *dense*, which is merely larger.
+///
+/// `.linear_fc1` / `.linear_fc2` cover the vision blocks' MLPs **and** the patch merger **and** the
+/// three deepstack mergers in one entry, because all four are the same `lin(...)`-loaded shape.
+pub const TE_PACK_SUFFIXES: &[&str] = &[
+    // Qwen3 decoder projections (`Qwen3Attention` / `Qwen3Mlp`, all bias-less).
+    ".self_attn.q_proj",
+    ".self_attn.k_proj",
+    ".self_attn.v_proj",
+    ".self_attn.o_proj",
+    ".mlp.gate_proj",
+    ".mlp.up_proj",
+    ".mlp.down_proj",
+    // The token table — packed through `TokenEmbedding::from_quantized_parts`, which reads the
+    // same `{base}.weight` / `.scales` / `.biases` triple a Linear does.
+    ".embed_tokens",
+    // Qwen3-VL vision tower.
+    ".attn.qkv",
+    ".attn.proj",
+    ".linear_fc1",
+    ".linear_fc2",
+];
+
+/// `true` iff `base` names a text-encoder tensor packed at the tier width.
+///
+/// `base` is the on-disk key minus its `.weight` suffix, as [`mlx_gen::quant::quantize_map`] passes
+/// it. The dense check runs **first** so a suffix that appears in both lists can never be packed;
+/// no such suffix exists today and `te_predicate_is_dense_first` keeps it that way.
+///
+/// # What is deliberately NOT a target
+///
+/// `lm_head` and decoder layers 50-63 pass through **dense**. They are the never-executed tail
+/// ([`SELECT_HIDDEN`](crate::text_encoder::SELECT_HIDDEN)): no loader in this crate reads them, so
+/// packing them would produce bytes nothing can validate. Trimming them outright is sc-17139's
+/// call, not this converter's — and the manifest already omits the shard that holds most of them.
+pub fn is_te_pack_target(base: &str) -> bool {
+    if TE_DENSE_BY_POLICY.iter().any(|s| base.ends_with(s)) {
+        return false;
+    }
+    TE_PACK_SUFFIXES.iter().any(|s| base.ends_with(s))
+}
+
+/// Pre-quantize a `text_encoder/` component directory into `dst`, **one source shard at a time**.
+///
+/// The memory shape is [`quantize_minimax_h3_dit`]'s and for the same reason: the component is
+/// [`66_714_912_872 B`](crate::memory_strategy::TEXT_ENCODER_BYTES) across 14 shards, so a
+/// whole-map convert would hold the dense source and the growing packed output together. Peak
+/// residency here is one source shard (~4.8 GB) plus its packed output.
+///
+/// # The shard file names are preserved verbatim, and that is a hard requirement
+///
+/// [`MiniMaxH3::map_te_shards`](crate::model) maps `model-{i:05}-of-00014.safetensors` for
+/// `i` in `1..=12` (the layer-50 tap) plus shard 14 (the whole vision tower), by name. It does not
+/// glob. A tier that renamed or re-sharded would load a *different set of layers* with no error, so
+/// this converter copies each source name through unchanged and
+/// [`quantize_minimax_h3_dit`]'s index-renaming shape is deliberately **not** reused.
+///
+/// A source directory missing shard 13 — which is the shape the shipped manifest downloads, since
+/// shard 13 holds only the never-executed tail — simply produces a tier without shard 13. Nothing
+/// special-cases it; the converter packs the shards it is given.
+///
+/// Writes, in `dst`: the packed shards under their source names, a `config.json` carrying the
+/// `quantization` marker, and a `model.safetensors.index.json` covering every emitted tensor.
+pub fn quantize_minimax_h3_text_encoder(
+    src: &Path,
+    dst: &Path,
+    bits: i32,
+    on_shard: &mut dyn FnMut(&Path) -> Result<()>,
+) -> Result<Vec<PathBuf>> {
+    if !matches!(bits, 4 | 8) {
+        return Err(Error::Msg(format!(
+            "minimax-h3 convert: tier width must be 4 or 8, got {bits}"
+        )));
+    }
+    let shards = source_shards(src)?;
+    std::fs::create_dir_all(dst)?;
+    write_quantized_config(src, dst, bits, GROUP_SIZE)?;
+
+    let mut written = Vec::with_capacity(shards.len());
+    let mut weight_map: HashMap<String, String> = HashMap::new();
+    let mut total_size: usize = 0;
+
+    for shard in &shards {
+        let name = shard
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| {
+                Error::Msg(format!(
+                    "minimax-h3 convert: shard {} has no usable file name",
+                    shard.display()
+                ))
+            })?
+            .to_string();
+
+        let source = Weights::from_file(shard)?;
+        let map: HashMap<String, Array> = source
+            .keys()
+            .map(|k| {
+                (
+                    k.to_string(),
+                    source.get(k).expect("key listed by `keys`").clone(),
+                )
+            })
+            .collect();
+        drop(source);
+
+        let packed = quantize_map(map, bits, GROUP_SIZE, is_te_pack_target)?;
+        let path = dst.join(&name);
+        mlx_gen::quant::save_map(&path, &packed)?;
+
+        for (key, tensor) in &packed {
+            total_size += tensor.nbytes();
+            weight_map.insert(key.clone(), name.clone());
+        }
+        drop(packed);
+
+        on_shard(&path)?;
+        written.push(path);
+        mlx_rs::memory::clear_cache();
+    }
+
+    write_te_index(dst, &weight_map, total_size)?;
+    Ok(written)
+}
+
+/// The text encoder's own index file name — the upstream `model` stem, not the DiT's
+/// `diffusion_pytorch_model` one.
+fn write_te_index(
+    dst: &Path,
+    weight_map: &HashMap<String, String>,
+    total_size: usize,
+) -> Result<()> {
+    write_index_named(dst, "model.safetensors.index.json", weight_map, total_size)
 }
 
 #[cfg(test)]
@@ -459,6 +655,175 @@ mod tests {
         assert_eq!(
             shard_name(13, 14),
             "diffusion_pytorch_model-00014-of-00014.safetensors"
+        );
+    }
+
+    // ── text encoder (sc-19120) ──────────────────────────────────────────────────────────────
+
+    /// Bases the published 1058-tensor `text_encoder/` index carries, collapsed over the layer and
+    /// vision-block axes, with the width the checkpoint stores them at. The ground truth
+    /// [`is_te_pack_target`] is audited against.
+    ///
+    /// `Some(in_width)` marks a pack target and carries the input width the checkpoint stores, so
+    /// the group-size guard below can be asserted against real shapes rather than invented ones.
+    const PUBLISHED_TE_BASES: &[(&str, Option<i32>)] = &[
+        // Qwen3 decoder — packed.
+        ("model.language_model.embed_tokens", Some(5120)),
+        ("model.language_model.layers.0.self_attn.q_proj", Some(5120)),
+        (
+            "model.language_model.layers.49.self_attn.k_proj",
+            Some(5120),
+        ),
+        ("model.language_model.layers.7.self_attn.v_proj", Some(5120)),
+        ("model.language_model.layers.3.self_attn.o_proj", Some(8192)),
+        ("model.language_model.layers.0.mlp.gate_proj", Some(5120)),
+        ("model.language_model.layers.0.mlp.up_proj", Some(5120)),
+        ("model.language_model.layers.0.mlp.down_proj", Some(25600)),
+        // Qwen3 decoder — dense norms, all read with a raw `Weights::require`.
+        ("model.language_model.layers.0.input_layernorm", None),
+        (
+            "model.language_model.layers.0.post_attention_layernorm",
+            None,
+        ),
+        ("model.language_model.layers.0.self_attn.q_norm", None),
+        ("model.language_model.layers.0.self_attn.k_norm", None),
+        ("model.language_model.norm", None),
+        // Qwen3-VL vision tower — packed.
+        ("model.visual.blocks.0.attn.qkv", Some(1152)),
+        ("model.visual.blocks.26.attn.proj", Some(1152)),
+        ("model.visual.blocks.0.mlp.linear_fc1", Some(1152)),
+        ("model.visual.merger.linear_fc1", Some(4608)),
+        (
+            "model.visual.deepstack_merger_list.0.linear_fc1",
+            Some(4608),
+        ),
+        // Vision tower — dense.
+        ("model.visual.blocks.0.norm1", None),
+        ("model.visual.blocks.0.norm2", None),
+        ("model.visual.merger.norm", None),
+        ("model.visual.deepstack_merger_list.2.norm", None),
+        ("model.visual.patch_embed.proj", None),
+        ("model.visual.pos_embed", None),
+        // The never-executed tail. Dense because no loader reads it — see `is_te_pack_target`.
+        ("lm_head", None),
+    ];
+
+    #[test]
+    fn te_predicate_matches_the_published_base_set() {
+        for (base, want) in PUBLISHED_TE_BASES {
+            assert_eq!(
+                is_te_pack_target(base),
+                want.is_some(),
+                "is_te_pack_target({base:?})"
+            );
+        }
+    }
+
+    /// **The sc-14980 guard.** `model.visual.pos_embed.weight` is `[2304, 1152]`: 2-D, and 1152
+    /// divides [`GROUP_SIZE`], so [`mlx_gen::quant::quantize_map`]'s shape guard would pack it
+    /// happily. And [`mlx_gen_boogu::vision::VisionTower::from_weights`] reads it with a raw
+    /// `Weights::require`, which would load u32 codes where a float is expected and report **no
+    /// error at all**.
+    ///
+    /// Three assertions, because the first one alone is blind. Under a *positive* predicate
+    /// `pos_embed` is dense twice over — it is named in [`TE_DENSE_BY_POLICY`] *and* matches
+    /// nothing in [`TE_PACK_SUFFIXES`] — so removing it from the dense list changes no behaviour
+    /// and `is_te_pack_target` alone cannot see the removal. The list-membership assertions are
+    /// what give this guard reach: the second fails if the entry is dropped (which is what a later
+    /// switch to the DiT's negative-predicate shape would then make live), the third fails if
+    /// anything is added to the pack list that reaches it.
+    #[test]
+    fn pos_embed_is_dense_by_policy_not_by_shape() {
+        const POS_EMBED: &str = "model.visual.pos_embed";
+        assert!(
+            !is_te_pack_target(POS_EMBED),
+            "pos_embed must be dense — a packed one loads silently as garbage"
+        );
+        assert!(
+            TE_DENSE_BY_POLICY.contains(&".pos_embed")
+                && TE_DENSE_BY_POLICY.contains(&".patch_embed.proj"),
+            "the two raw-`require` vision tensors must stay NAMED in the dense list, not merely \
+             unreached by the pack list"
+        );
+        assert!(
+            !TE_PACK_SUFFIXES.iter().any(|s| POS_EMBED.ends_with(s)),
+            "a pack suffix now reaches pos_embed"
+        );
+        // The shape guard `quantize_map` applies, restated: 2-D, input width a multiple of the
+        // group size and at least one group. `pos_embed` passes all three — shape would not have
+        // saved it.
+        let (rows, cols) = (2304, 1152);
+        assert!(rows > 0 && cols % GROUP_SIZE == 0 && cols >= GROUP_SIZE);
+    }
+
+    /// The dense list is consulted **before** the pack list, so a base matching both can never be
+    /// packed. No such base exists today; this is the guard that keeps it that way as either list
+    /// grows.
+    #[test]
+    fn te_predicate_is_dense_first() {
+        for dense in TE_DENSE_BY_POLICY {
+            for pack in TE_PACK_SUFFIXES {
+                let base = format!("model.language_model.layers.0{pack}{dense}");
+                assert!(
+                    !is_te_pack_target(&base),
+                    "{base:?} ends with the dense suffix {dense:?} and must not pack"
+                );
+            }
+        }
+    }
+
+    /// The TE predicate is **positive**: an unrecognized tensor defaults to dense. The vision tower
+    /// is a shared crate, so a tensor added there must fail towards "larger", never towards "packed
+    /// and read by a raw `require`".
+    #[test]
+    fn an_unknown_te_tensor_defaults_to_dense() {
+        for base in [
+            "model.visual.some_future_table",
+            "model.language_model.layers.0.self_attn.sink_weights",
+            "model.visual.blocks.0.attn.gate",
+            "",
+        ] {
+            assert!(!is_te_pack_target(base), "{base:?} must default to dense");
+        }
+    }
+
+    /// Every packable text-encoder input width divides [`GROUP_SIZE`] — otherwise
+    /// [`mlx_gen::quant::quantize_map`]'s shape guard would silently leave a declared target dense
+    /// and the tier would be quietly larger than its name.
+    ///
+    /// The vision blocks' `linear_fc2` is the deliberate exception: its input is 4304, which is
+    /// **not** a multiple of 64, so it passes through dense by shape. It is still declared a target
+    /// so the policy does not have to encode an upstream width that may change.
+    #[test]
+    fn every_declared_te_target_width_divides_the_group_size() {
+        for (base, width) in PUBLISHED_TE_BASES {
+            if let Some(w) = width {
+                assert_eq!(w % GROUP_SIZE, 0, "{base:?} width {w}");
+            }
+        }
+        assert_ne!(
+            4304 % GROUP_SIZE,
+            0,
+            "vision linear_fc2 stays dense by shape"
+        );
+    }
+
+    #[test]
+    fn te_tier_width_is_validated_before_any_file_is_touched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        let mut noop = |_: &Path| Ok(());
+        for bad in [0, 2, 16] {
+            assert!(
+                quantize_minimax_h3_text_encoder(&src, &dst, bad, &mut noop).is_err(),
+                "tier width {bad} must be rejected"
+            );
+        }
+        assert!(
+            !dst.exists(),
+            "a rejected width must not create the tier dir"
         );
     }
 
