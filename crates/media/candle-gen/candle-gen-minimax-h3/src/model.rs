@@ -878,6 +878,6 @@ mod tests {
     fn the_step_bound_is_enforced() {
         assert_eq!(DEFAULT_STEPS, 50);
         assert_eq!(MAX_STEPS, 200);
-        assert!(DEFAULT_STEPS < MAX_STEPS);
+        const { assert!(DEFAULT_STEPS < MAX_STEPS) };
     }
 }

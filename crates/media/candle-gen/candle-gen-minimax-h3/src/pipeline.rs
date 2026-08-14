@@ -152,7 +152,7 @@ pub fn resolve_geometry(width: u32, height: u32, num_frames: usize) -> Result<Re
             "minimax_h3: width/height must be positive, got {width}x{height}"
         )));
     }
-    if width % SPATIAL_STRIDE != 0 || height % SPATIAL_STRIDE != 0 {
+    if !width.is_multiple_of(SPATIAL_STRIDE) || !height.is_multiple_of(SPATIAL_STRIDE) {
         return Err(CandleError::Msg(format!(
             "minimax_h3: width/height must be a multiple of {SPATIAL_STRIDE} (the VAE's \
              {VAE_RATIO}x spatial compression times the DiT's width patch of {}), got \
@@ -176,7 +176,7 @@ pub fn resolve_geometry(width: u32, height: u32, num_frames: usize) -> Result<Re
     // the model was not trained at.
     video_latent_num_frames(num_frames)?;
     let seconds = num_frames as f64 / MINIMAX_H3_FPS;
-    if seconds < MIN_DURATION_SECONDS - 1e-9 || seconds > MAX_DURATION_SECONDS + 1e-9 {
+    if !(MIN_DURATION_SECONDS - 1e-9..=MAX_DURATION_SECONDS + 1e-9).contains(&seconds) {
         return Err(CandleError::Msg(format!(
             "minimax_h3: {num_frames} frames is {seconds:.4} s, outside the model's \
              {MIN_DURATION_SECONDS}-{MAX_DURATION_SECONDS} s range ({}-{} frames at \
@@ -419,7 +419,7 @@ pub fn fit_audio_to_video(track: AudioTrack, geometry: &RequestGeometry) -> Resu
             "minimax_h3 mux: the decoded soundtrack declares zero channels".into(),
         ));
     }
-    if track.samples.len() % channels != 0 {
+    if !track.samples.len().is_multiple_of(channels) {
         return Err(CandleError::Msg(format!(
             "minimax_h3 mux: {} interleaved samples is not a whole number of {channels}-channel \
              frames",

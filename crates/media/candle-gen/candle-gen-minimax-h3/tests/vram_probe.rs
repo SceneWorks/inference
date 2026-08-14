@@ -54,10 +54,15 @@ use std::path::PathBuf;
 use candle_gen::gen_core::{
     GenerationOutput, GenerationRequest, Image, LoadSpec, OffloadPolicy, Progress, WeightsSource,
 };
-use candle_gen::testkit::{cuda_mempool_used_high_bytes, reset_cuda_mempool_high_water, VramProbe};
+use candle_gen::testkit::{
+    cuda_mempool_used_high_bytes, probe_gpu, reset_cuda_mempool_high_water, used_mib, VramProbe,
+};
 
-use candle_gen_minimax_h3::model::{DEFAULT_STEPS, MODEL_ID};
+use candle_gen_minimax_h3::model::DEFAULT_STEPS;
 use candle_gen_minimax_h3::pipeline::{CANVAS_SHORT_EDGE, SMALLEST_LEGAL_FRAMES};
+// `MODEL_ID` comes from the crate ROOT, not from `model::` — `model.rs` only `use`s it privately,
+// so `candle_gen_minimax_h3::model::MODEL_ID` does not name a public path and will not compile.
+use candle_gen_minimax_h3::MODEL_ID;
 
 /// Max idle-baseline VRAM (GB) tolerated before the sampled peak is considered contaminated.
 const MAX_BASELINE_GB: f64 = 1.0;
@@ -148,6 +153,10 @@ fn measure(tier: &str) {
     );
 
     let mut probe = VramProbe::start_rendered();
+    // The PHYSICAL ordinal `start_rendered` sampled — derived from `CUDA_VISIBLE_DEVICES`, so a
+    // multi-GPU box cannot render on one card while this samples another. The box behind the
+    // `cuda` runner label has two cards and `default_device()` pins logical `cuda:0`.
+    let gpu = probe_gpu();
     if !reset_cuda_mempool_high_water(CANDLE_LOGICAL_DEVICE) {
         eprintln!(
             "[h3-vram] WARNING: could not reset the driver mempool USED_MEM_HIGH watermark; the \
@@ -172,9 +181,17 @@ fn measure(tier: &str) {
     let mut pre_decode_gb = 0.0f64;
     let mut denoise_high_bytes = 0u64;
     let started = std::time::Instant::now();
+    // **The generate phase must be BRACKETED**, exactly as the Wan sibling brackets it. `report()`
+    // folds the overall peak from the phases that were closed; a render measured without an
+    // `end_gen` reports the LOAD peak as the overall peak, and this provider's load is paths-only,
+    // so the published number would have been ~0 for a render that really peaks above 60 GB.
+    let generate_phase = probe.phase();
     let mut on_progress = |p: Progress| {
         if matches!(p, Progress::Decoding) {
-            pre_decode_gb = probe.current_peak_gb();
+            // Sample the device directly rather than asking the probe: the probe's overall peak is
+            // not folded until `end_gen`, so mid-render it does not yet know about this phase.
+            // Base-10 GB, the manifest unit, matching the Wan probe's derivation line for line.
+            pre_decode_gb = used_mib(gpu).unwrap_or(0) as f64 * 1048576.0 / 1.0e9;
             denoise_high_bytes = cuda_mempool_used_high_bytes(CANDLE_LOGICAL_DEVICE).unwrap_or(0);
             // Reset so the decode's concurrent-live peak is measured in isolation.
             reset_cuda_mempool_high_water(CANDLE_LOGICAL_DEVICE);
@@ -183,11 +200,11 @@ fn measure(tier: &str) {
     let out = generator
         .generate(&req, &mut on_progress)
         .unwrap_or_else(|e| panic!("generate {MODEL_ID} ({tier}): {e}"));
+    probe.end_gen(generate_phase);
     let secs = started.elapsed().as_secs_f64();
 
     let decode_high_bytes = cuda_mempool_used_high_bytes(CANDLE_LOGICAL_DEVICE).unwrap_or(0);
-    let report = probe.finish();
-    report.assert_trustworthy(MAX_BASELINE_GB);
+    let report = probe.report().assert_trustworthy(MAX_BASELINE_GB);
 
     let (out_frames, out_fps, out_audio) = match out {
         GenerationOutput::Video { frames, fps, audio } => (frames, fps, audio),
