@@ -32,6 +32,13 @@ tokenizers = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+# `_mlx_array_is_available` — mlx-c's accessor for `mlx::core::array::is_available()`, which
+# `tests/pipeline.rs` reads to observe DIRECTLY that the render's compute landed inside the
+# cancel-checked region, replacing a wall-clock ratio that moved with host load (sc-19452).
+# mlx-rs exposes no safe wrapper for it. Pinned to the same git rev as mlx-rs's own path dep (an
+# invariant `scripts/check-workspace.py` asserts), so cargo unifies on one copy and
+# `mlx_rs::Array::as_ptr` hands back exactly this crate's `mlx_array` handle.
+mlx-sys = { workspace = true }
 # RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on
 # `Drop` — including out of a panicking test, which is the only path the old
 # `env::temp_dir().join(..)` + trailing `remove_dir_all` shape ever leaked on.
