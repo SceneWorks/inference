@@ -16,6 +16,11 @@ const ROOT_ENV: &str = "KOLORS_QUALITY_ROOT";
 const DEFAULT_TIER: &str = "q4";
 const DEFAULT_STEPS: usize = 25;
 const SEEDS: [u64; 5] = [1234, 7, 99, 20260805, 424242];
+/// The correctness admission grid is deliberately the shipped common Kolors/SDXL bucket grid,
+/// stricter than the U-Net's minimum structural multiple. Keeping both axes on `/64` prevents an
+/// unreviewed odd-resolution coordinate from reaching an expensive real-weight run.
+const QUALITY_GEOMETRY_MULTIPLE: u32 = 64;
+const DECODER_PARAMETER_MULTIPLE: u32 = 8;
 
 fn tier() -> String {
     let tier = std::env::var("DECODE_QUALITY_TIER").unwrap_or_else(|_| DEFAULT_TIER.to_owned());
@@ -47,8 +52,13 @@ fn env_u32(name: &str, default: u32) -> u32 {
 }
 
 fn candidates() -> Vec<(u32, u32, u32, u32)> {
-    std::env::var("DECODE_QUALITY_CANDIDATES")
-        .unwrap_or_else(|_| format!("1024x1024:{}:{}", ms::DECODE_TILE_EDGE, ms::DECODE_OVERLAP))
+    let rows = std::env::var("DECODE_QUALITY_CANDIDATES")
+        .unwrap_or_else(|_| format!("1024x1024:{}:{}", ms::DECODE_TILE_EDGE, ms::DECODE_OVERLAP));
+    parse_candidates(&rows)
+}
+
+fn parse_candidates(rows: &str) -> Vec<(u32, u32, u32, u32)> {
+    let candidates = rows
         .split_ascii_whitespace()
         .map(|row| {
             let fields = row.split(':').collect::<Vec<_>>();
@@ -56,14 +66,65 @@ fn candidates() -> Vec<(u32, u32, u32, u32)> {
             let (width, height) = fields[0]
                 .split_once('x')
                 .unwrap_or_else(|| panic!("invalid quality geometry {:?}", fields[0]));
-            (
-                width.parse().expect("quality width"),
-                height.parse().expect("quality height"),
-                fields[1].parse().expect("quality tile edge"),
-                fields[2].parse().expect("quality overlap"),
-            )
+            let candidate = (
+                width.parse::<u32>().expect("quality width"),
+                height.parse::<u32>().expect("quality height"),
+                fields[1].parse::<u32>().expect("quality tile edge"),
+                fields[2].parse::<u32>().expect("quality overlap"),
+            );
+            let (width, height, tile_edge, overlap) = candidate;
+            assert!(
+                width > 0
+                    && height > 0
+                    && width.is_multiple_of(QUALITY_GEOMETRY_MULTIPLE)
+                    && height.is_multiple_of(QUALITY_GEOMETRY_MULTIPLE),
+                "Kolors quality geometry {width}x{height} must be positive and aligned to the shipped /{QUALITY_GEOMETRY_MULTIPLE} grid"
+            );
+            assert!(
+                overlap > 0
+                    && overlap < tile_edge
+                    && tile_edge <= width.min(height)
+                    && tile_edge.is_multiple_of(DECODER_PARAMETER_MULTIPLE)
+                    && overlap.is_multiple_of(DECODER_PARAMETER_MULTIPLE),
+                "Kolors quality tile {tile_edge}/{overlap} must satisfy 0 < overlap < tile <= min(width,height) and the decoder /{DECODER_PARAMETER_MULTIPLE} domain"
+            );
+            candidate
         })
-        .collect()
+        .collect::<Vec<_>>();
+    assert!(
+        !candidates.is_empty(),
+        "Kolors quality candidate grid is empty"
+    );
+    candidates
+}
+
+#[test]
+fn quality_candidate_domain_rejects_invalid_geometry_and_tile_axes() {
+    assert_eq!(
+        parse_candidates("768x768:576:48 1024x1024:768:64 1280x768:576:48 768x1280:576:48"),
+        [
+            (768, 768, 576, 48),
+            (1024, 1024, 768, 64),
+            (1280, 768, 576, 48),
+            (768, 1280, 576, 48),
+        ]
+    );
+    for invalid in [
+        "1280x720:576:48",
+        "720x1280:576:48",
+        "0x768:576:48",
+        "768x768:576:0",
+        "768x768:576:576",
+        "768x768:776:48",
+        "768x768:578:48",
+        "768x768:576:50",
+        "",
+    ] {
+        assert!(
+            std::panic::catch_unwind(|| parse_candidates(invalid)).is_err(),
+            "invalid candidate domain unexpectedly passed: {invalid:?}"
+        );
+    }
 }
 
 fn sha256(bytes: &[u8]) -> String {

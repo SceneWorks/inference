@@ -560,6 +560,46 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
     return errors
 
 
+def decode_quality_candidate_policy_errors(workflow: str) -> list[str]:
+    parsed = yaml.safe_load(workflow)
+    jobs = parsed["jobs"]
+    rules = {
+        "mlx-decode-quality-kolors": 64,
+        "mlx-decode-quality-sdxl": 64,
+        # Chroma is a DiT with an explicitly validated /16 image-id grid; unlike the
+        # Kolors/SDXL U-Net it has no mirrored downsample skip joins, so 720 remains valid.
+        "mlx-decode-quality-chroma": 16,
+    }
+    errors: list[str] = []
+    for job, geometry_multiple in rules.items():
+        rows = jobs[job]["env"].get("DECODE_QUALITY_CANDIDATES", "").split()
+        if not rows:
+            errors.append(f"{job}: empty candidate grid")
+        for row in rows:
+            prefix = f"{job}: invalid candidate {row!r}"
+            try:
+                geometry, tile_text, overlap_text = row.split(":")
+                width_text, height_text = geometry.split("x")
+                width, height = int(width_text), int(height_text)
+                tile, overlap = int(tile_text), int(overlap_text)
+            except (TypeError, ValueError):
+                errors.append(f"{prefix}: expected WIDTHxHEIGHT:TILE:OVERLAP")
+                continue
+            if width <= 0 or height <= 0:
+                errors.append(f"{prefix}: geometry must be positive")
+            if width % geometry_multiple or height % geometry_multiple:
+                errors.append(
+                    f"{prefix}: geometry must align to the family /{geometry_multiple} grid"
+                )
+            if not 0 < overlap < tile <= min(width, height):
+                errors.append(
+                    f"{prefix}: require 0 < overlap < tile <= min(width,height)"
+                )
+            if tile % 8 or overlap % 8:
+                errors.append(f"{prefix}: tile and overlap must align to the decoder /8 grid")
+    return errors
+
+
 def parse_binary_hashed_lock(lock: str) -> dict[str, tuple[str, str]]:
     """Parse the deliberately narrow one-wheel-per-package real-weight lock format."""
     lines = lock.splitlines()
@@ -719,6 +759,49 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             workflow,
             r"\bpip\s+install[^\n]*(?:huggingface[_-]hub|numpy|safetensors)==",
         )
+
+    def test_decode_quality_candidates_stay_inside_family_geometry_domains(self) -> None:
+        workflow_text = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        self.assertEqual(decode_quality_candidate_policy_errors(workflow_text), [])
+        workflow = yaml.safe_load(workflow_text)
+        jobs = workflow["jobs"]
+        geometries: dict[str, set[tuple[int, int]]] = {}
+        for job in (
+            "mlx-decode-quality-kolors",
+            "mlx-decode-quality-sdxl",
+            "mlx-decode-quality-chroma",
+        ):
+            geometries[job] = set()
+            rows = jobs[job]["env"]["DECODE_QUALITY_CANDIDATES"].split()
+            for row in rows:
+                geometry = row.split(":", 1)[0]
+                width_text, height_text = geometry.split("x")
+                geometries[job].add((int(width_text), int(height_text)))
+
+        self.assertIn((1280, 768), geometries["mlx-decode-quality-kolors"])
+        self.assertIn((768, 1280), geometries["mlx-decode-quality-kolors"])
+        self.assertNotIn((1280, 720), geometries["mlx-decode-quality-kolors"])
+        self.assertNotIn((720, 1280), geometries["mlx-decode-quality-kolors"])
+        self.assertIn((1280, 720), geometries["mlx-decode-quality-chroma"])
+        self.assertIn((720, 1280), geometries["mlx-decode-quality-chroma"])
+
+        mutations = {
+            "Kolors landscape geometry": ("1280x768:576:48", "1280x720:576:48"),
+            "Kolors portrait geometry": ("768x1280:576:48", "720x1280:576:48"),
+            "SDXL geometry": ("1216x832:704:160", "1216x816:704:160"),
+            "Chroma geometry": ("1280x720:576:192", "1280x722:576:192"),
+            "zero geometry": ("768x768:576:48", "0x768:576:48"),
+            "zero overlap": ("768x768:576:48", "768x768:576:0"),
+            "overlap equals tile": ("768x768:576:48", "768x768:576:576"),
+            "tile exceeds geometry": ("768x768:576:48", "768x768:776:48"),
+            "tile off decoder grid": ("768x768:576:48", "768x768:578:48"),
+            "overlap off decoder grid": ("768x768:576:48", "768x768:576:50"),
+        }
+        for label, (before, after) in mutations.items():
+            with self.subTest(mutation=label):
+                self.assertIn(before, workflow_text)
+                mutated = workflow_text.replace(before, after, 1)
+                self.assertTrue(decode_quality_candidate_policy_errors(mutated))
 
     def test_real_weight_macos_steps_name_the_reviewed_cpython(self) -> None:
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")

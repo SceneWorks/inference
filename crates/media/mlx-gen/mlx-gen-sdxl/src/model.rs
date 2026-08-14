@@ -1562,11 +1562,12 @@ impl Sdxl {
     }
 }
 
-/// SDXL works in latent space at /8, so both request dims must be multiples of 8. Exposed as the
-/// pinned-engine stride SceneWorks ties each advertised SDXL image bucket to (sc-12612), mirroring
-/// `wan::config::SIZE_MULTIPLE_14B`. `validate_request` enforces exactly this value, so the const
-/// cannot drift from the check.
-pub const SIZE_MULTIPLE: u32 = 8;
+/// SDXL's VAE produces a `/8` latent and the three-block U-Net applies two stride-2 downsamplers
+/// before mirroring them through exact skip concatenations. Each image axis must therefore be a
+/// multiple of `8 * 2² = 32`; accepting only the VAE stride can produce an odd intermediate whose
+/// upsampled extent no longer matches its skip tensor. `validate_request` enforces this structural
+/// multiple before production denoise.
+pub const SIZE_MULTIPLE: u32 = 32;
 
 /// Capability-driven request validation, factored out so it can be unit-tested without loaded
 /// weights. Rejects unsupported guidance / negative prompt / conditioning / size / count.
@@ -1583,7 +1584,7 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
     if req.prompt.is_empty() {
         return Err(Error::Msg("sdxl: prompt must not be empty".into()));
     }
-    // SDXL works in latent space at /8; both dims must be multiples of SIZE_MULTIPLE.
+    // The /8 VAE plus two exact U-Net downsample/upsample joins require SIZE_MULTIPLE.
     if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
         return Err(Error::Msg(format!(
             "sdxl: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
@@ -1841,24 +1842,24 @@ mod tests {
     }
 
     /// sc-12612: `SIZE_MULTIPLE` is the pinned stride SceneWorks ties every advertised SDXL bucket to.
-    /// Pin the value and mutation-check that a multiple of 4 which is not SIZE_MULTIPLE (8) is rejected
-    /// with the stride error, and an on-stride size passes.
+    /// Pin the value and mutation-check that a VAE-valid multiple of 8 which is not the full U-Net
+    /// multiple is rejected with the stride error, and an on-stride size passes.
     #[test]
     fn size_multiple_is_the_pinned_stride() {
-        assert_eq!(SIZE_MULTIPLE, 8);
+        assert_eq!(SIZE_MULTIPLE, 32);
         let caps = descriptor().capabilities;
         let off = validate_request(
             &caps,
             &GenerationRequest {
                 prompt: "a fox".into(),
-                width: 1020, // 255×4 — a multiple of 4 but not SIZE_MULTIPLE
+                width: 1000, // 125×8 — VAE-valid but not SIZE_MULTIPLE
                 height: 1024,
                 ..Default::default()
             },
         )
         .unwrap_err()
         .to_string();
-        assert!(off.contains("multiples of 8"), "got: {off}");
+        assert!(off.contains("multiples of 32"), "got: {off}");
         assert!(validate_request(
             &caps,
             &GenerationRequest {
@@ -1939,10 +1940,10 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_request(&caps, &req).is_ok());
-        // Non-multiple-of-8 size is rejected.
+        // VAE-valid but U-Net-invalid size is rejected.
         req = GenerationRequest {
             prompt: "a fox".into(),
-            width: 1020,
+            width: 1000,
             height: 1024,
             ..Default::default()
         };

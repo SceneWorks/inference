@@ -46,15 +46,23 @@ use crate::tokenizer::KolorsTokenizer;
 /// VAE spatial downscale (latent is image/8 per side).
 pub const SPATIAL_SCALE: i32 = 8;
 
+/// The Kolors/SDXL U-Net has three resolution blocks and two exact downsample/upsample skip joins.
+/// Combined with the `/8` VAE, each production image axis must be divisible by `8 * 2² = 32`.
+pub const PRODUCTION_SPATIAL_MULTIPLE: i32 = SPATIAL_SCALE * 4;
+
 /// Reject degenerate dimensions at the public struct-API boundary (F-020). The registered
-/// `KolorsGenerator::generate_impl` runs `validate_request` (multiple-of-8), but the `pub fn
-/// generate*`/`img2img` struct methods beneath it do not — a non-multiple-of-8 or non-positive
-/// dimension would otherwise silently produce a wrong latent shape (`width / SPATIAL_SCALE` truncates)
-/// or crash deep in an MLX op. Inert on every valid request (registry dims are always multiples of 8).
+/// `KolorsGenerator::generate_impl` runs `validate_request`, but the `pub fn generate*`/`img2img`
+/// struct methods beneath it do not. A non-positive dimension, a non-multiple of the VAE scale, or
+/// a VAE-valid dimension that becomes odd inside the U-Net would otherwise truncate or crash deep
+/// in an MLX concatenate.
 fn validate_dims(height: i32, width: i32) -> Result<()> {
-    if height <= 0 || width <= 0 || height % SPATIAL_SCALE != 0 || width % SPATIAL_SCALE != 0 {
+    if height <= 0
+        || width <= 0
+        || height % PRODUCTION_SPATIAL_MULTIPLE != 0
+        || width % PRODUCTION_SPATIAL_MULTIPLE != 0
+    {
         return Err(Error::Msg(format!(
-            "kolors: height and width must be positive multiples of {SPATIAL_SCALE} (got {height}x{width})"
+            "kolors: height and width must be positive multiples of {PRODUCTION_SPATIAL_MULTIPLE} (got {height}x{width})"
         )));
     }
     Ok(())
@@ -1346,7 +1354,7 @@ impl Kolors {
     }
 
     /// Full T2I: seed the RNG, draw the initial noise, encode the prompt + negative prompt, denoise,
-    /// and VAE-decode. `height`/`width` are pixels (multiples of 8). `cfg` ≤ 1 disables guidance.
+    /// and VAE-decode. `height`/`width` are pixels (multiples of 32). `cfg` ≤ 1 disables guidance.
     #[allow(clippy::too_many_arguments)]
     pub fn generate(
         &self,
@@ -1588,19 +1596,19 @@ mod tests {
     use super::*;
     use mlx_rs::ops::indexing::IndexOp;
 
-    /// F-020: the struct-API dim guard rejects non-positive / non-multiple-of-8 dimensions (which the
+    /// F-020: the struct-API dim guard rejects non-positive and U-Net-invalid dimensions (which the
     /// registry validates but the `pub fn generate*` methods previously did not).
     #[test]
     fn validate_dims_rejects_degenerate_dimensions() {
         assert!(validate_dims(1024, 768).is_ok());
-        assert!(validate_dims(8, 8).is_ok());
+        assert!(validate_dims(32, 32).is_ok());
         assert!(
-            validate_dims(513, 512).is_err(),
-            "513 is not a multiple of 8"
+            validate_dims(520, 512).is_err(),
+            "520 is VAE-valid but not a multiple of 32"
         );
         assert!(
-            validate_dims(512, 510).is_err(),
-            "510 is not a multiple of 8"
+            validate_dims(512, 520).is_err(),
+            "520 is VAE-valid but not a multiple of 32"
         );
         assert!(validate_dims(0, 512).is_err(), "0 is non-positive");
         assert!(validate_dims(512, -8).is_err(), "negative width");
