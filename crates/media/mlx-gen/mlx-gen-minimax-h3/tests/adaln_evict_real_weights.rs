@@ -27,6 +27,19 @@
 //! `clear_cache` is what rules the second out. The peak is reported for two distinct phases,
 //! because the precompute transiently holds the projections *and* the new table, while the number
 //! the product cares about is the high-water of the denoise that follows.
+//!
+//! # The two phase peaks are compared to each other (sc-19449)
+//!
+//! Both were measured and printed here and asserted against nothing; assertions (a)-(d) below all
+//! pin the post-evict drop against the pre-evict *resident*, which is a residency and not a phase
+//! peak. So this — the one test positioned to measure the precompute/denoise relationship on real
+//! weights — measured it and let it go, which is how `convert.rs` came to carry the backwards
+//! claim sc-18659 retracted. [`common::assert_adaln_phase_envelope`] now pins it, shared verbatim
+//! with the synthetic `tests/adaln_evict_memory.rs`; see that function for the direction, its
+//! derivation, and why the bound is an envelope whose tier and geometry have to be stated.
+//!
+//! The run prints one `ADALN PHASE PAIR [...]` line carrying the measured pair, the tier and the
+//! denoise geometry. **That line is the record sc-19449 asks for** — copy it onto the story.
 
 mod common;
 
@@ -43,7 +56,7 @@ use mlx_gen_minimax_h3::{
     MODALITY_NUM,
 };
 
-use common::snapshot;
+use common::{snapshot, AdaLnPhases};
 
 /// `50 × (96768·2688 + 96768) × 2 B` — the whole point of the story, as an arithmetic constant the
 /// run has to reproduce from the loaded tensors.
@@ -254,6 +267,22 @@ fn real_weight_adaln_evict_releases_26_gb() {
         gb(active_before),
         gb(released)
     );
+
+    // (e)/(f)/(g) THE PHASE PAIR — sc-19449. (a)-(d) all compare something to a *residency*; this
+    //     compares the two phase peaks to each other. The tier and the denoise geometry are part
+    //     of the label because the bound is only meaningful with them: `released` is a bf16
+    //     quantity, and `peak_denoise` carries this forward's working set at SEQ=512, which is
+    //     three orders of magnitude below a render's packed sequence.
+    common::assert_adaln_phase_envelope(&AdaLnPhases {
+        scale: "real transformer/, bf16, adaln_proj [96768, 2688] x 50, denoise SEQ=512, \
+                8-evaluation schedule",
+        active_before,
+        active_after,
+        peak_precompute,
+        peak_denoise,
+        released,
+        table: cache.bytes(),
+    });
 
     println!(
         "\n  REAL-WEIGHT ADALN EVICT: 50 x adaln_proj [96768, 2688] bf16 = {:.2} GB released; \

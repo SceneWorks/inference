@@ -30,6 +30,21 @@
 //! Dimensions here are synthetic and deliberately AdaLN-heavy — the real ratio, at a size that runs
 //! in a second. `tests/adaln_evict_real_weights.rs` is the same measurement on the real 62 GB
 //! `transformer/`.
+//!
+//! # The two phase peaks, and the envelope between them (sc-19449)
+//!
+//! Both peaks used to be measured, printed, and asserted against nothing. They are now pinned by
+//! [`common::assert_adaln_phase_envelope`], which both this file and the real-weight file call, so
+//! the synthetic and the real measurement cannot drift into pinning different things — see that
+//! function for the direction, its derivation, and why it is an envelope rather than a law.
+//!
+//! Arm 1b holds a ballast of exactly half the evicted bytes live across the *same* forward on the
+//! *same* stack, and shows the gap falls by it. That turns the envelope's geometry dependence from
+//! an argument about render-geometry numbers into a measurement, and it is also what keeps the
+//! `3/4` bound honest: a denoise working set of half the eviction breaks it, so the bound is not a
+//! constant that anything would satisfy.
+
+mod common;
 
 use std::collections::HashMap;
 
@@ -40,6 +55,8 @@ use mlx_rs::{Array, Dtype};
 
 use mlx_gen::weights::Weights;
 use mlx_gen_minimax_h3::{AdaLnCache, AdaLnResidency, DitBlock, MiniMaxH3DitConfig, MODALITY_NUM};
+
+use common::{AdaLnPhases, ADALN_GAP_DEN, ADALN_GAP_NUM};
 
 /// Blocks in the synthetic stack.
 const LAYERS: i32 = 8;
@@ -308,6 +325,80 @@ fn the_evicted_adaln_weights_leave_device_memory() {
         mib(peak_denoise),
         mib(active_before)
     );
+
+    // (e)/(f)/(g) THE PHASE PAIR — sc-19449. Everything above compares a peak to a *residency*;
+    //     this compares the two phase peaks to each other, which is the relationship a retracted
+    //     `convert.rs` claim got backwards while both of these tests were measuring it and
+    //     throwing it away.
+    let phases = AdaLnPhases {
+        scale: "synthetic 8-block stack, f32, adaln_proj [9216, 512], denoise SEQ=48",
+        active_before,
+        active_after,
+        peak_precompute,
+        peak_denoise,
+        released,
+        table: cache.bytes(),
+    };
+    common::assert_adaln_phase_envelope(&phases);
+
+    // ── arm 1b (envelope): the gap narrows one-for-one with the denoise phase's working set ──
+    // sc-19449 AC6. `gap ≈ released − denoise_working_set` is an identity, not an inequality, so
+    // the relationship is geometry- and tier-dependent and crosses at `denoise_working_set =
+    // released`. Hold a ballast of exactly half the evicted bytes live across the SAME forward on
+    // the SAME stack — everything else identical, so the difference is attributable — and the gap
+    // has to fall by it.
+    let ballast_bytes = released / 2;
+    let ballast = Array::zeros::<f32>(&[(ballast_bytes / 4) as i32]).unwrap();
+    mlx_rs::transforms::eval([&ballast]).unwrap();
+    reset_peak_memory();
+    let peak_denoise_ballasted = one_forward(&c, &blocks, &cache);
+    let gap = peak_precompute.saturating_sub(peak_denoise);
+    let gap_ballasted = peak_precompute.saturating_sub(peak_denoise_ballasted);
+    println!(
+        "  envelope: a {:.1} MiB denoise working set moves the denoise peak {:.1} -> {:.1} MiB \
+         and the gap {:.1} -> {:.1} MiB",
+        mib(ballast_bytes),
+        mib(peak_denoise),
+        mib(peak_denoise_ballasted),
+        mib(gap),
+        mib(gap_ballasted)
+    );
+
+    // The identity itself. Also the proof that the ballast landed at all: MLX materializes
+    // `zeros` through `full`, but a lazily-broadcast one would leave this at ~0.
+    let narrowed = gap.saturating_sub(gap_ballasted);
+    assert!(
+        narrowed >= ballast_bytes / 5 * 4,
+        "a {:.1} MiB denoise working set narrowed the phase gap by only {:.1} MiB — the gap is \
+         not `released − denoise_working_set`, so the envelope documented on \
+         `assert_adaln_phase_envelope` is wrong",
+        mib(ballast_bytes),
+        mib(narrowed)
+    );
+
+    // …and therefore the `3/4` bound is not a constant that anything would satisfy: half an
+    // eviction's worth of denoise working set breaks it. If this ever passes, the bound has
+    // stopped measuring the phase relationship and is being met by something else.
+    let want_gap = released / ADALN_GAP_DEN * ADALN_GAP_NUM;
+    assert!(
+        gap_ballasted < want_gap,
+        "the {ADALN_GAP_NUM}/{ADALN_GAP_DEN} gap bound ({:.1} MiB) still holds with a {:.1} MiB \
+         denoise working set in the way — it is not bounding the phase relationship",
+        mib(want_gap),
+        mib(ballast_bytes)
+    );
+
+    // The direction survives at half, because the crossing is at a FULL eviction's worth. This is
+    // what says the q4 + full-render-geometry case is near the crossing rather than past it.
+    assert!(
+        peak_precompute > peak_denoise_ballasted,
+        "the precompute peak {:.1} MiB fell to or below the ballasted denoise peak {:.1} MiB at \
+         half an eviction's working set — the crossing is not where the envelope says it is",
+        mib(peak_precompute),
+        mib(peak_denoise_ballasted)
+    );
+
+    drop(ballast);
     drop(cache);
     drop(blocks);
     clear_cache();
