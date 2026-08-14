@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import re
 import subprocess
@@ -172,6 +173,103 @@ PID_RUNG_TWO_MARKERS = (
     "BoundedDecode",
     "configure_decode",
 )
+
+# --- Cross-backend geometry parity (sc-19419) -----------------------------------------------------
+#
+# A model family implemented on two backends declares the same published geometry twice, in crates
+# that cannot see each other: `mlx-gen-*` builds on macOS only, so no dependency edge — in either
+# direction — can exist between the pair. Every existing guard is therefore per-crate, and a per-crate
+# assertion is structurally incapable of noticing that its sibling declares something else.
+#
+# It found exactly that: `candle-gen-minimax-h3` advertised `SIZE_MULTIPLE = 16` while
+# `mlx-gen-minimax-h3` advertised 32, and the candle crate's own test *asserted the 16* under a doc
+# comment claiming both backends pinned the same geometry. 16 is the VAE-only alignment, correct while
+# that crate was VAE-only and stale from the moment its DiT landed in sc-17155; 32 is
+# `vae_spatial_compression_ratio * patch_size[2]`. A 16-aligned canvas survives the VAE and then has an
+# odd number of latent columns with no patched representation at all.
+#
+# This gate lives here rather than in either crate because `scripts/ci/select_lanes.py` marks the
+# `workspace` lane "never skip" — it is the only enforcement point that runs on every change, on Linux,
+# without a macOS runner. A Rust test in the candle crate would be skipped by path-filtered lanes on an
+# mlx-only edit, and one in the mlx crate would not run on Linux at all.
+CROSS_BACKEND_GEOMETRY_PAIRS = (
+    (
+        "crates/media/candle-gen/candle-gen-minimax-h3",
+        "crates/media/mlx-gen/mlx-gen-minimax-h3",
+    ),
+)
+
+# Mirrored, path-for-path, in both crates of a pair. Listing the files rather than globbing is
+# deliberate: a missing file is a hard failure below, so moving a declaration out of this set reds the
+# gate instead of silently shrinking its coverage.
+CROSS_BACKEND_GEOMETRY_FILES = (
+    "src/lib.rs",
+    "src/config.rs",
+    "src/audio_config.rs",
+    "src/denoise/geometry.rs",
+    "src/denoise/packing.rs",
+    "src/denoise/schedule.rs",
+    "src/dit/config.rs",
+    "src/dit/positions.rs",
+)
+
+# Agreement alone is not correctness — the defect this gate exists for was two crates that would have
+# agreed perfectly had anyone "fixed" the red by copying the wrong value across. So the reference
+# values are pinned too, on BOTH sides, and they come from the released checkpoint read through the
+# diffusers reference (0.40.0.dev0 @ 7564fb01), never from either backend:
+#
+#   VAE_RATIO   = prod(vae/config.json spatial_downsample_factors [2,2,2,2,1,1])       = 16
+#   VAE_RATIO_T = prod(vae/config.json temporal_downsample_factors [1,2,2,1,1,1])      = 4
+#   SIZE_MULTIPLE = MiniMaxH3ModularPipeline.canvas_multiple, i.e.
+#                   vae_spatial_compression_ratio * transformer patch_size[2] = 16 * 2 = 32
+#                   (modular_pipeline.py:236; transformer/ and transformer_ref/ both ship [1, 2, 2])
+#   FRAMES_PER_CHUNK  = vae.config.clip_length          = 17  } the `17n + 5` lattice
+#   LATENTS_PER_CHUNK = vae.tokens_chunk_size           = 5   } (modular_pipeline.py:96-129)
+#   LATENT_CHANNELS   = vae/config.json latent_channels = 24
+#   TOKEN_DROP        = vae/config.json token_drop      = 3
+#   CLIP_LENGTH       = vae/config.json clip_length     = 17
+#   MINIMAX_H3_FPS    = modular_pipeline.py:31          = 24
+#   LEGAL_FRAME_COUNTS = the 14 `17n + 5` counts inside the 5.0-15.0 s envelope at 24 fps.
+CROSS_BACKEND_GEOMETRY_REFERENCE: dict[str, tuple[float, ...]] = {
+    "SIZE_MULTIPLE": (32.0,),
+    "VAE_RATIO": (16.0,),
+    "VAE_RATIO_T": (4.0,),
+    "LATENT_CHANNELS": (24.0,),
+    "TOKEN_DROP": (3.0,),
+    "CLIP_LENGTH": (17.0,),
+    "FRAMES_PER_CHUNK": (17.0,),
+    "LATENTS_PER_CHUNK": (5.0,),
+    "MINIMAX_H3_FPS": (24.0,),
+    "ENCODER_SPATIAL_DOWNSAMPLE_FACTORS": (2.0, 2.0, 2.0, 2.0, 1.0, 1.0),
+    "ENCODER_TEMPORAL_DOWNSAMPLE_FACTORS": (1.0, 2.0, 2.0, 1.0, 1.0, 1.0),
+    "LEGAL_FRAME_COUNTS": tuple(
+        float(17 * n + 5) for n in range(60) if 120 <= 17 * n + 5 <= 360
+    ),
+}
+
+# Relative max-abs-diff, never a norm, a cosine or a checksum — those went blind to real defects in
+# this family seven separate times. Effectively exact for source literals; its only job is to let
+# `1e-5` and `0.00001`, or `0.858_090_34` and `0.85809034`, compare equal.
+CROSS_BACKEND_GEOMETRY_TOLERANCE = 1e-12
+
+# Top-level `pub const NAME: TYPE = VALUE;`. Values run to the first `;` and may span lines (the
+# 24-element `LATENTS_MEAN`), hence DOTALL and `[^;]*`. The type may itself contain a `;` — `[f64; 5]`
+# — so only the value is `;`-bounded; the type is merely `=`-bounded, which no Rust type contains.
+RUST_PUB_CONST = re.compile(r"^pub const (\w+)\s*:\s*([^=]+?)\s*=\s*([^;]*);\s*$", re.M | re.S)
+
+# `VAE_RATIO as u32 * 2` and `AUDIO_TOKEN_RATE_HZ as i32` differ from their siblings only in the cast,
+# because the two backends spell the same number in different Rust types (`usize`/`i32`, `f64`/`f32`).
+# The cast carries no value, so it is removed before comparison.
+RUST_CONST_CAST = re.compile(r"\bas\s+\w+")
+
+# A digit separator, and *only* a digit separator: `32_000` and `0.858_090_34` normalize, while
+# `VAE_RATIO` keeps the underscores that make it a resolvable identifier.
+RUST_DIGIT_SEPARATOR = re.compile(r"(?<=\d)_(?=\d)")
+
+# An identifier to resolve, and never the `e` of a float literal: without the lookbehind, `1e-5`
+# reads as the identifier `e`, fails to resolve, and drops the constant to text-only comparison —
+# which silently costs it the reference pin and would false-red `1e-5` against `0.00001`.
+RUST_IDENTIFIER = re.compile(r"(?<![0-9.])[A-Za-z_][A-Za-z0-9_]*")
 
 _RAW_STRING_START = re.compile(r'(?:b?r)(#*)"')
 
@@ -1508,6 +1606,271 @@ def check_test_temp_dir_guards(root: Path) -> None:
         )
 
 
+def _rust_const_declarations(source: str) -> dict[str, str]:
+    """Map every top-level ``pub const`` in a Rust source to its value text.
+
+    Comment-stripped first, so a doc comment quoting a declaration — which these crates do
+    constantly, since every constant carries its provenance in prose — cannot be mistaken for one.
+    """
+    stripped = strip_rust_comments(source)
+    return {
+        match.group(1): " ".join(match.group(3).split())
+        for match in RUST_PUB_CONST.finditer(stripped)
+    }
+
+
+def _normalize_const_value(value: str) -> str:
+    """Strip what only spells a value (casts, digit separators, whitespace), never what it is."""
+    without_casts = RUST_CONST_CAST.sub("", value)
+    return RUST_DIGIT_SEPARATOR.sub("", without_casts).replace(" ", "")
+
+
+def _arithmetic_value(node: ast.AST) -> float | None:
+    """Fold a literal arithmetic AST to a float, or None if it is anything richer than that.
+
+    Deliberately an explicit walk rather than ``eval`` on an allowlisted tree: nothing in this
+    script should be able to execute text read out of a crate's sources, even text that passed a
+    filter.
+    """
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, bool) or not isinstance(node.value, (int, float)):
+            return None
+        return float(node.value)
+    if isinstance(node, ast.UnaryOp):
+        operand = _arithmetic_value(node.operand)
+        if operand is None:
+            return None
+        if isinstance(node.op, ast.USub):
+            return -operand
+        if isinstance(node.op, ast.UAdd):
+            return operand
+        return None
+    if isinstance(node, ast.BinOp):
+        left = _arithmetic_value(node.left)
+        right = _arithmetic_value(node.right)
+        if left is None or right is None:
+            return None
+        if isinstance(node.op, ast.Add):
+            return left + right
+        if isinstance(node.op, ast.Sub):
+            return left - right
+        if isinstance(node.op, ast.Mult):
+            return left * right
+        if isinstance(node.op, ast.Div):
+            return None if right == 0.0 else left / right
+        return None
+    return None
+
+
+def _const_numbers(
+    value: str, declarations: dict[str, str], depth: int = 0
+) -> tuple[float, ...] | None:
+    """Resolve a constant's value text to numbers, following identifiers *within the same crate*.
+
+    Same-crate resolution is the point: `SIZE_MULTIPLE = VAE_RATIO as u32 * 2` has to fold against
+    the `VAE_RATIO` its own backend declares, so that a crate which quietly redefines `VAE_RATIO`
+    still reports the `SIZE_MULTIPLE` it actually compiles to.
+
+    Returns None — never a default, never a zero — for anything that is not purely numeric (strings,
+    bools, enum paths, nested aggregates). Callers treat None as "cannot verify", which is a
+    violation wherever a number was required, and a fallback to text equality wherever it was not.
+    """
+    if depth > 8:
+        return None
+    text = _normalize_const_value(value)
+    if not text:
+        return None
+
+    is_array = text.startswith("[") and text.endswith("]")
+    is_tuple = text.startswith("(") and text.endswith(")") and "," in text
+    if is_array or is_tuple:
+        inner = text[1:-1]
+        if "[" in inner or "(" in inner:
+            return None  # nested aggregate — out of scope, compared as text instead
+        numbers: list[float] = []
+        for element in inner.split(","):
+            if not element:
+                continue  # trailing comma
+            resolved = _const_numbers(element, declarations, depth + 1)
+            if resolved is None or len(resolved) != 1:
+                return None
+            numbers.append(resolved[0])
+        return tuple(numbers) if numbers else None
+
+    unresolved = False
+
+    def _substitute(match: re.Match[str]) -> str:
+        nonlocal unresolved
+        name = match.group(0)
+        resolved = (
+            _const_numbers(declarations[name], declarations, depth + 1)
+            if name in declarations
+            else None
+        )
+        if resolved is None or len(resolved) != 1:
+            unresolved = True
+            return "0"
+        return repr(resolved[0])
+
+    substituted = RUST_IDENTIFIER.sub(_substitute, text)
+    if unresolved:
+        return None
+    try:
+        tree = ast.parse(substituted, mode="eval")
+    except (SyntaxError, ValueError, MemoryError, RecursionError):
+        return None
+    folded = _arithmetic_value(tree.body)
+    return None if folded is None else (folded,)
+
+
+def _relative_max_abs_diff(
+    left: tuple[float, ...], right: tuple[float, ...]
+) -> float:
+    """Worst elementwise ``|l - r| / max(|l|, |r|)``.
+
+    Relative max-abs-diff and nothing else. A norm, a cosine or a checksum over these vectors would
+    be blind to exactly the single-element defects this gate exists to catch — that failure has been
+    paid for repeatedly in this model family.
+    """
+    worst = 0.0
+    for lhs, rhs in zip(left, right):
+        difference = abs(lhs - rhs)
+        scale = max(abs(lhs), abs(rhs))
+        worst = max(worst, difference if scale == 0.0 else difference / scale)
+    return worst
+
+
+def check_cross_backend_geometry(root: Path) -> None:
+    """Fail when a family's two backends declare different published geometry.
+
+    Two things are checked, and the second is not redundant.
+
+    1. **The two crates agree.** Every ``pub const`` in the mirrored file set is compared by value,
+       so that `usize`/`i32` and `f64`/`f32` spellings of the same number pass while a genuine
+       difference reds. The declared *name sets* must match too — a constant added to one backend
+       only is the same drift one step earlier.
+
+    2. **Both agree with the reference.** Agreement alone would have been satisfiable by copying the
+       wrong value across, which is precisely the move this gate must not reward: the defect it was
+       written for (sc-19419) was a wrong value pinned *as if correct* by a test whose doc comment
+       claimed cross-backend coverage it could not have. So `CROSS_BACKEND_GEOMETRY_REFERENCE` holds
+       values read out of the released checkpoint through diffusers, and both sides are held to them.
+
+    Fail-closed throughout. A missing crate, a missing file, a file that parses to zero constants, a
+    duplicate declaration, or a required constant that will not resolve to a number is a failure, not
+    a skip — a gate that quietly stops comparing is worse than no gate, because it still reports
+    green. What it does *not* do is prove the two backends compute the same thing from these numbers;
+    that is what the `cross_backend.rs` fixture parity tests are for.
+    """
+    violations: list[str] = []
+    for candle_relative, mlx_relative in CROSS_BACKEND_GEOMETRY_PAIRS:
+        declared: dict[str, dict[str, str]] = {}
+        for relative in (candle_relative, mlx_relative):
+            crate = root / relative
+            if not crate.is_dir():
+                fail(
+                    f"cross-backend geometry: {relative} is not a directory, so the gate cannot "
+                    "compare the pair. Update CROSS_BACKEND_GEOMETRY_PAIRS if the crate moved."
+                )
+            declarations: dict[str, str] = {}
+            for name in CROSS_BACKEND_GEOMETRY_FILES:
+                path = crate / name
+                if not path.is_file():
+                    fail(
+                        f"cross-backend geometry: {relative}/{name} is missing. The file set is "
+                        "listed explicitly so a move reds this gate instead of silently shrinking "
+                        "its coverage — update CROSS_BACKEND_GEOMETRY_FILES."
+                    )
+                found = _rust_const_declarations(path.read_text(encoding="utf-8"))
+                if not found:
+                    fail(
+                        f"cross-backend geometry: parsed zero `pub const` declarations out of "
+                        f"{relative}/{name}, which has always had some. Either the declarations "
+                        "moved, or the parse broke — and a broken parse compares nothing while "
+                        "reporting green."
+                    )
+                for constant, value in found.items():
+                    if constant in declarations:
+                        fail(
+                            f"cross-backend geometry: {relative} declares `{constant}` twice across "
+                            f"{CROSS_BACKEND_GEOMETRY_FILES}; the gate cannot tell which one the "
+                            "sibling backend should be compared against."
+                        )
+                    declarations[constant] = value
+            declared[relative] = declarations
+
+        candle = declared[candle_relative]
+        mlx = declared[mlx_relative]
+
+        for constant in sorted(set(candle) - set(mlx)):
+            violations.append(
+                f"`{constant}` is declared in {candle_relative} but not in {mlx_relative}"
+            )
+        for constant in sorted(set(mlx) - set(candle)):
+            violations.append(
+                f"`{constant}` is declared in {mlx_relative} but not in {candle_relative}"
+            )
+
+        for constant in sorted(set(candle) & set(mlx)):
+            candle_numbers = _const_numbers(candle[constant], candle)
+            mlx_numbers = _const_numbers(mlx[constant], mlx)
+            if candle_numbers is not None and mlx_numbers is not None:
+                if len(candle_numbers) != len(mlx_numbers):
+                    violations.append(
+                        f"`{constant}` has {len(candle_numbers)} element(s) in {candle_relative} "
+                        f"and {len(mlx_numbers)} in {mlx_relative}"
+                    )
+                    continue
+                difference = _relative_max_abs_diff(candle_numbers, mlx_numbers)
+                if difference > CROSS_BACKEND_GEOMETRY_TOLERANCE:
+                    violations.append(
+                        f"`{constant}` diverges: {candle_relative} says {candle[constant]!r}, "
+                        f"{mlx_relative} says {mlx[constant]!r} "
+                        f"(relative max-abs-diff {difference:.3g})"
+                    )
+                continue
+            if _normalize_const_value(candle[constant]) != _normalize_const_value(mlx[constant]):
+                violations.append(
+                    f"`{constant}` diverges: {candle_relative} says {candle[constant]!r}, "
+                    f"{mlx_relative} says {mlx[constant]!r}"
+                )
+
+        for constant, expected in sorted(CROSS_BACKEND_GEOMETRY_REFERENCE.items()):
+            for relative, declarations in ((candle_relative, candle), (mlx_relative, mlx)):
+                if constant not in declarations:
+                    violations.append(
+                        f"{relative}: `{constant}` is pinned against the diffusers reference but is "
+                        f"not declared anywhere in {CROSS_BACKEND_GEOMETRY_FILES}"
+                    )
+                    continue
+                numbers = _const_numbers(declarations[constant], declarations)
+                if numbers is None:
+                    violations.append(
+                        f"{relative}: `{constant}` = {declarations[constant]!r} does not resolve to "
+                        "numbers, so the gate cannot hold it to the reference"
+                    )
+                    continue
+                if len(numbers) != len(expected) or (
+                    _relative_max_abs_diff(numbers, expected)
+                    > CROSS_BACKEND_GEOMETRY_TOLERANCE
+                ):
+                    violations.append(
+                        f"{relative}: `{constant}` = {declarations[constant]!r} resolves to "
+                        f"{numbers}, but the released checkpoint read through diffusers says "
+                        f"{expected}"
+                    )
+
+    if violations:
+        joined = "\n  ".join(violations)
+        fail(
+            "a model family's two backends disagree about published geometry, or disagree with the "
+            "released checkpoint. These crates cannot import each other (mlx-gen is macOS-only), so "
+            "no per-crate test can see this and a stale value survives as long as its own crate "
+            "keeps asserting it (sc-19419). Fix the backend that is wrong against the diffusers "
+            "reference — never by copying the other backend's number:\n  " + joined
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -1526,6 +1889,7 @@ def main() -> int:
         check_pid_decode_route_adoption(metadata, ROOT)
         check_snapshot_path_derivation(ROOT)
         check_test_temp_dir_guards(ROOT)
+        check_cross_backend_geometry(ROOT)
     except (AssertionError, json.JSONDecodeError) as error:
         print(f"workspace gate: FAIL: {error}", file=sys.stderr)
         return 1
@@ -1534,7 +1898,8 @@ def main() -> int:
         "workspace gate: OK "
         f"({EXPECTED_MEMBER_COUNT} path members, one lockfile, explicit registries, pinned backends, "
         "intentional tokenizer split, no network clients, no HF-cache references, "
-        "no $HOME-derived snapshot paths, no unguarded test temp roots)"
+        "no $HOME-derived snapshot paths, no unguarded test temp roots, "
+        "no cross-backend geometry drift)"
     )
     return 0
 
