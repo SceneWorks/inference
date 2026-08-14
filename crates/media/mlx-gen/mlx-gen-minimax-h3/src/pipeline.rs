@@ -43,12 +43,15 @@ use mlx_rs::{Array, Dtype};
 use mlx_gen::media::{AudioTrack, Image};
 use mlx_gen::{CancelFlag, Error, Result};
 
+use mlx_gen::gen_core::GenerationRequest;
+
 use crate::audio_config::{AUDIO_OUTPUT_CHANNELS, AUDIO_SAMPLE_RATE};
 use crate::config::{LATENT_CHANNELS, VAE_RATIO};
 use crate::denoise::{
     adaln_schedule, align_num_frames, denoise_av, video_latent_num_frames, JointGeometry,
     JointSchedule, JointVelocity, PackedLayout, MAX_AV_DRIFT_SECONDS, MINIMAX_H3_FPS,
 };
+use crate::spatial_tiling::SpatialTiling;
 
 /// What generated width and height must be a multiple of: the VAE's 16× spatial compression times
 /// the DiT's `patch_size[2]`.
@@ -359,6 +362,47 @@ pub fn unpack_audio_rows(
     // host readback (and therefore any test of this function) read the logical order.
     let ncl = per_channel.transpose_axes(&[0, 2, 1])?;
     mlx_gen::array::contiguous(&ncl.reshape(&[1, channels, latent_channels, num_audio_latents])?)
+}
+
+/// The spatial tiling one request decodes at — ladder rung 2's request-side reader (sc-18660).
+///
+/// Pure, so the rung's plumbing is testable without a 10.42 GB VAE. This is the function that makes
+/// [`MemoryStrategy::BoundedDecode`](mlx_gen::gen_core::MemoryStrategy) **reachable** rather than
+/// merely declared: without it the selector's `GenerationMemory` block would be built, validated,
+/// admitted, and then silently ignored by `decode_video` — the "declaration is not enforcement is
+/// not reachability" failure the ladder keeps producing.
+///
+/// # Why a request cannot widen the geometry
+///
+/// The returned tiling is always the reference's. A request naming the admitted pair gets it; a
+/// request naming anything else is **refused**, not quietly clamped, because the tile edge is an
+/// output-correctness input rather than a lever (see [`crate::memory_strategy`]). A request naming
+/// nothing gets [`SpatialTiling::default`], which is that same geometry — so the untouched path is
+/// byte-for-byte what it was before rung 2 existed.
+///
+/// The refusal is what makes this reader observable at all: since the admitted value *equals* the
+/// default, a test asserting "the default arrived" would be a false green. The rejected direction
+/// is the one that carries information, and it is what
+/// `a_request_that_names_an_unadmitted_decode_geometry_is_refused_before_the_weights_load` drives.
+pub fn decode_tiling_for(req: &GenerationRequest) -> Result<SpatialTiling> {
+    let Some(memory) = req.memory else {
+        return Ok(SpatialTiling::default());
+    };
+    if !memory.tile_vae_decode {
+        // The selector did not engage rung 2. The decode still tiles — tiling is the reference's
+        // released behaviour, not this rung's invention — so this is not a route to an untiled
+        // decode. `disable_tiling()` exists for that and is deliberately unreachable from a request.
+        return Ok(SpatialTiling::default());
+    }
+    let edge = memory
+        .decode_tile_edge
+        .unwrap_or(crate::memory_strategy::DECODE_TILE_EDGE);
+    let overlap = memory
+        .decode_overlap
+        .unwrap_or(crate::memory_strategy::DECODE_OVERLAP);
+    crate::memory_strategy::validate_decode_geometry(edge, overlap)
+        .map_err(|e| Error::Msg(e.to_string()))?;
+    Ok(SpatialTiling::square(edge as i32, overlap as i32))
 }
 
 /// Revert the video VAE's ImageNet pixel normalization and clamp to `[0, 1]`.

@@ -836,6 +836,190 @@ fn spatial_tiling_composes_with_the_temporal_chunk_plan() {
     );
 }
 
+// ---------------------------------------------------------------------------------------------
+// Rung 2 — bounded decode (sc-18660)
+// ---------------------------------------------------------------------------------------------
+
+/// Per-frame relative max-abs between two `[B, C, T, H, W]` videos.
+///
+/// Gated on **relative max-abs-diff** only. Norm, cosine and checksum were each blind to a real
+/// defect in this family and are deliberately absent from every assertion below.
+fn per_frame_rel(a: &Array, b: &Array) -> Vec<f32> {
+    let frames = a.shape()[2];
+    (0..frames)
+        .map(|t| {
+            let idx = Array::from_slice(&[t], &[1]);
+            let fa = a.take_axis(&idx, 2).unwrap();
+            let fb = b.take_axis(&idx, 2).unwrap();
+            rel(&fa, &fb).0
+        })
+        .collect()
+}
+
+/// The temporal derivative `v[t+1] - v[t]` — the field a *cross-frame* discrepancy lives in.
+///
+/// A per-frame metric can be satisfied by a video whose every frame is individually plausible
+/// while the motion between them is wrong, which is precisely the tile-starvation failure mode the
+/// story names: the corruption is visible across frames, not within one.
+fn temporal_delta(v: &Array) -> Array {
+    let t = v.shape()[2];
+    let head = mlx_gen_minimax_h3::tensor::slice_axis(v, 2, 1, t).unwrap();
+    let tail = mlx_gen_minimax_h3::tensor::slice_axis(v, 2, 0, t - 1).unwrap();
+    mlx_rs::ops::subtract(&head, &tail).unwrap()
+}
+
+/// **The bounded stitch is bit-identical to the full-grid stitch, through the real decoder.**
+///
+/// `spatial_tiling::tests::bounded_stitch_matches_the_full_grid_stitch` proves the equality on
+/// synthetic tiles; this proves the *decode path* takes it, by decoding the same grid by hand and
+/// stitching it the old way. If `decode_clip_tiled` ever streams a different grid — a transposed
+/// push order, a dropped tile, a strip captured after the blend instead of before — this separates
+/// while every parity assertion in this file stays green.
+#[test]
+fn the_bounded_stitch_reproduces_the_full_grid_decode_exactly() {
+    use mlx_gen_minimax_h3::spatial_tiling::{stitch_tiles, TilePlan};
+    let f = fixture();
+    let vae = vae(3);
+    let cfg = fixture_config(3);
+    let latent = f.require("in.decode.latent").unwrap();
+    let (ratio, tile, overlap) = (cfg.patch_size, 4, 2);
+
+    // Rebuild the grid the way the pre-rung-2 code did: decode every tile, hold them all, stitch.
+    let s = latent.shape();
+    let rows = TilePlan::split(s[3] * ratio, tile, overlap, ratio).unwrap();
+    let cols = TilePlan::split(s[4] * ratio, tile, overlap, ratio).unwrap();
+    assert!(
+        rows.len() > 1 && cols.len() > 1,
+        "the comparison is vacuous on a single-tile grid: got {}x{}",
+        rows.len(),
+        cols.len()
+    );
+    let mut grid = Vec::with_capacity(rows.len());
+    for (i, &y) in rows.starts.iter().enumerate() {
+        let mut row = Vec::with_capacity(cols.len());
+        for (j, &x) in cols.starts.iter().enumerate() {
+            let (y0, x0) = (y / ratio, x / ratio);
+            let t =
+                mlx_gen_minimax_h3::tensor::slice_axis(latent, 3, y0, y0 + rows.lengths[i] / ratio)
+                    .unwrap();
+            let t = mlx_gen_minimax_h3::tensor::slice_axis(&t, 4, x0, x0 + cols.lengths[j] / ratio)
+                .unwrap();
+            row.push(vae.decode_clip_untiled(&t).unwrap());
+        }
+        grid.push(row);
+    }
+    let full = stitch_tiles(&grid, &rows.overlaps, &cols.overlaps).unwrap();
+    let bounded = vae
+        .decode_clip_tiled(latent, tile, tile, overlap, overlap)
+        .unwrap();
+
+    assert_eq!(bounded.shape(), full.shape());
+    let (peak, _) = rel(&bounded, &full);
+    assert_eq!(
+        peak, 0.0,
+        "the bounded stitch must be BIT-identical to the full-grid stitch, got {peak:.3e}"
+    );
+}
+
+/// **A starved tile overlap corrupts the decode, and it does so across every frame** — the AC2
+/// correctness assertion, which no memory number can stand in for.
+///
+/// A zero overlap abuts the tiles with no cross-fade. Two tolerances are stated and both are
+/// violated by a wide margin:
+///
+/// * **per-frame** — `PER_FRAME_TOL`, the same 1e-2 mutation floor the rest of this file uses,
+///   ~10x the ~1e-3 reduced-precision noise. **Every** frame must exceed it, not merely the worst:
+///   a corruption confined to one frame would be a different (and much more visible) defect.
+/// * **cross-frame** — `CROSS_FRAME_TOL`, on the temporal derivative. This is the tolerance that
+///   makes the guard specific to the failure mode the story names, and it is the one a per-frame
+///   spot check cannot reach.
+///
+/// The overlap is the *only* thing that moves: same weights, same tile size, same latent, same
+/// temporal plan. And the run is over `in.temporal12.latent`, which spans multiple temporal chunks,
+/// so the frame sequence under test is a real one rather than a single clip.
+#[test]
+fn a_starved_tile_overlap_corrupts_the_decode_across_frames() {
+    /// Set from **this probe's own measured minimum**, not inherited from [`MUTATION_FLOOR`].
+    ///
+    /// Measured per-frame separation at this fixture geometry is 7.238e-3 … 3.324e-2 over 39
+    /// frames. The *worst* frame clears the 1e-2 house mutation floor comfortably, but the least
+    /// affected frame does not — so requiring 1e-2 of **every** frame would be a bound this probe
+    /// cannot show, and lowering the claim to "the worst frame moved" would let a corruption
+    /// confined to one frame pass. 5e-3 is ~1.45x below the measured minimum and ~5x above the
+    /// ~1e-3 reduced-precision noise floor this file documents.
+    const PER_FRAME_TOL: f32 = 5e-3;
+    /// The temporal-derivative bound, at the house mutation floor. Measured cross-frame separation
+    /// is **2.336e-2**, so the margin is ~2.3x — real, and deliberately not overstated. It is the
+    /// narrowest of the three margins here, which is expected: a seam that is stationary in the
+    /// canvas perturbs consecutive frames similarly, so much of the error cancels in the
+    /// difference. That it survives the cancellation at all is the signal.
+    const CROSS_FRAME_TOL: f32 = MUTATION_FLOOR;
+
+    let f = fixture();
+    let latent = f.require("in.temporal12.latent").unwrap();
+
+    let mut reference = vae(3);
+    reference.enable_tiling(Some(4), Some(4), Some(2), Some(2));
+    let mut starved = vae(3);
+    starved.enable_tiling(Some(4), Some(4), Some(0), Some(0));
+    assert_eq!(
+        starved.tiling().overlap_height,
+        0,
+        "this probe is only meaningful at a zero overlap"
+    );
+
+    let good = reference.decode(latent).unwrap();
+    let bad = starved.decode(latent).unwrap();
+    assert_eq!(
+        good.shape(),
+        bad.shape(),
+        "starvation must corrupt the picture, not the frame plan — a shape change would be caught \
+         by assertions that cannot see the corruption itself"
+    );
+    assert!(
+        good.shape()[2] > 2,
+        "a cross-frame metric needs more than two frames, got {}",
+        good.shape()[2]
+    );
+
+    let frames = per_frame_rel(&bad, &good);
+    let worst = frames.iter().copied().fold(0.0f32, f32::max);
+    let least = frames.iter().copied().fold(f32::INFINITY, f32::min);
+    println!(
+        "STARVED OVERLAP per-frame rel-max-abs: worst={worst:.3e} least={least:.3e} over {} frames",
+        frames.len()
+    );
+    assert!(
+        least > PER_FRAME_TOL,
+        "frame {} moved by only {least:.3e}; a starved seam must corrupt EVERY frame, not one",
+        frames.iter().position(|&v| v == least).unwrap()
+    );
+
+    let (cross, _) = rel(&temporal_delta(&bad), &temporal_delta(&good));
+    println!("STARVED OVERLAP cross-frame (temporal-derivative) rel-max-abs: {cross:.3e}");
+    assert!(
+        cross > CROSS_FRAME_TOL,
+        "the temporal derivative moved by only {cross:.3e}; the cross-frame guard is inert"
+    );
+
+    // Non-vacuity: the SAME two metrics report zero when nothing is starved, so a green run above
+    // is the metric firing rather than the metric being unable to report a small number.
+    let again = reference.decode(latent).unwrap();
+    assert_eq!(
+        per_frame_rel(&again, &good)
+            .iter()
+            .copied()
+            .fold(0.0f32, f32::max),
+        0.0,
+        "the per-frame metric must report 0.0 for an identical decode"
+    );
+    assert_eq!(
+        rel(&temporal_delta(&again), &temporal_delta(&good)).0,
+        0.0,
+        "the cross-frame metric must report 0.0 for an identical decode"
+    );
+}
+
 /// **The latent-alignment guard is reachable from the public API**, not merely declared on
 /// `TilePlan::split`.
 ///

@@ -1002,7 +1002,7 @@ impl MiniMaxH3 {
         if req.cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
-        let frames = self.decode_video(&rendered.video)?;
+        let frames = self.decode_video(req, &rendered.video)?;
         let audio = self.decode_audio(&rendered.audio)?;
         let audio = fit_audio_to_video(audio, &geometry)?;
         if audio.sample_rate != AUDIO_SAMPLE_RATE || audio.channels != AUDIO_OUTPUT_CHANNELS {
@@ -1212,7 +1212,7 @@ impl MiniMaxH3 {
         if req.cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
-        let frames = self.decode_video(&rendered.video)?;
+        let frames = self.decode_video(req, &rendered.video)?;
         let audio = self.decode_audio(&rendered.audio)?;
         let audio = fit_audio_to_video(audio, geometry)?;
         if frames.len() != geometry.joint.num_frames as usize {
@@ -1364,8 +1364,20 @@ impl MiniMaxH3 {
         Ok((context, tags))
     }
 
-    fn decode_video(&self, latents: &mlx_rs::Array) -> Result<Vec<mlx_gen::media::Image>> {
-        let vae = MiniMaxH3VideoVae::load(&self.root, self.dtype)?;
+    /// Decode the video latent, at the tiling the request's rung-2 selection admits.
+    ///
+    /// **The tiling is resolved BEFORE the 10.42 GB VAE is mapped**, deliberately. An unadmitted
+    /// geometry is a caller error, and answering it with a file-load error (or worse, after paying
+    /// the load) would hide which of the two actually failed. It is also what lets the reachability
+    /// test prove this call site exists without a snapshot: the refusal fires on a root that has no
+    /// weights at all.
+    fn decode_video(
+        &self,
+        req: &GenerationRequest,
+        latents: &mlx_rs::Array,
+    ) -> Result<Vec<mlx_gen::media::Image>> {
+        let tiling = crate::pipeline::decode_tiling_for(req)?;
+        let vae = MiniMaxH3VideoVae::load(&self.root, self.dtype)?.with_tiling(tiling);
         let decoded = vae.decode(latents)?;
         let pixels = revert_pixel_normalization(&decoded)?;
         mlx_rs::transforms::eval([&pixels])?;
@@ -1436,6 +1448,77 @@ mod tests {
             dtype: Dtype::Bfloat16,
             adapters: Vec::new(),
         }
+    }
+
+    /// **`decode_video` consults the request's rung-2 selection, and does so before it maps the
+    /// 10.42 GB VAE** (sc-18660 AC4).
+    ///
+    /// This is the call-site half of reachability. `memory_strategy` proves the selection travels
+    /// as far as `pipeline::decode_tiling_for`; nothing there can prove `decode_video` *calls* it —
+    /// a doc comment saying so is not evidence. This drives the real method on a root with no
+    /// weights at all and pins **which** error comes back:
+    ///
+    /// * an unadmitted geometry ⇒ the tiling refusal, proving the resolution ran;
+    /// * an admitted geometry ⇒ the missing-`config.json` error, proving the refusal is not a
+    ///   blanket failure and that the method proceeds to the load.
+    ///
+    /// Deleting the `decode_tiling_for` call turns the first arm into the second and fails here.
+    #[test]
+    fn decode_video_resolves_the_requests_tiling_before_it_loads_the_vae() {
+        use mlx_gen::gen_core::GenerationMemory;
+        let generator = generator_at("/snap/transformer");
+        let latents = mlx_rs::Array::from_slice(&[0.0f32; 24], &[1, 24, 1, 1, 1]);
+        let request = |edge: u32, overlap: u32| GenerationRequest {
+            prompt: "a slow pan across a rainy street at night".into(),
+            memory: Some(GenerationMemory {
+                tile_vae_decode: true,
+                decode_tile_edge: Some(edge),
+                decode_overlap: Some(overlap),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let refused = generator
+            .decode_video(&request(128, 32), &latents)
+            .expect_err("an unadmitted tile must be refused")
+            .to_string();
+        assert!(
+            refused.contains("bounded decode admits only the reference geometry"),
+            "expected the rung-2 refusal, got: {refused}"
+        );
+        assert!(
+            !refused.contains("config.json"),
+            "the refusal must fire BEFORE the VAE load, got: {refused}"
+        );
+
+        // A starved overlap takes the same path — the corruption it causes is cross-frame and no
+        // memory number could see it, so admission is the only place it can be stopped.
+        let starved = generator
+            .decode_video(
+                &request(crate::memory_strategy::DECODE_TILE_EDGE, 0),
+                &latents,
+            )
+            .expect_err("a zero overlap must be refused")
+            .to_string();
+        assert!(starved.contains("bounded decode admits only the reference geometry"));
+
+        // The control arm: an ADMITTED geometry gets past the resolution and fails at the load,
+        // which is what proves the refusal above is specific rather than a blanket rejection.
+        let loaded = generator
+            .decode_video(
+                &request(
+                    crate::memory_strategy::DECODE_TILE_EDGE,
+                    crate::memory_strategy::DECODE_OVERLAP,
+                ),
+                &latents,
+            )
+            .expect_err("there are no weights at /snap")
+            .to_string();
+        assert!(
+            loaded.contains("config.json"),
+            "an admitted geometry must proceed to the load, got: {loaded}"
+        );
     }
 
     /// `ref2va` reads its partition from **beside the resolved DiT**, not from under the root.

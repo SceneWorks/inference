@@ -40,13 +40,40 @@
 //! that residency *enforced* rather than merely observed; the mechanism itself is live in every
 //! render today, which is why it is declared `Implemented` and not `Missing`.
 //!
-//! Rungs 2, 3 and 4 are declared [`MemoryStrategySupport::Missing`] — honestly, because none is
+//! # Rung 2 is implemented with a domain of exactly one geometry (sc-18660)
+//!
+//! [`MemoryStrategy::BoundedDecode`] is `Implemented`, and its published domain is the single pair
+//! ([`DECODE_TILE_EDGE`], [`DECODE_OVERLAP`]) = 256 px / 64 px. **That singleton is the finding, not
+//! a placeholder.**
+//!
+//! The video VAE decode is bounded two ways, and *neither* geometry is a memory lever:
+//!
+//! * **temporally**, by the reference's own `decode_temporal` ([`crate::chunking`]) — derived from
+//!   `clip_length` 17, `token_drop` 3 and `vae_ratio_t` 4, which are checkpoint facts;
+//! * **spatially**, by the reference's own `_decode_clip` ([`crate::spatial_tiling`]) — 256 px tiles
+//!   at a 64 px overlap with a linear cross-fade, on by default.
+//!
+//! sc-18786 measured what happens if the spatial geometry is treated as tunable: the released
+//! frames *are* the blended-tile ones, and decoding the shipped canvas in one pass moved both
+//! backends by a rel-max-abs of ~0.647. It then pinned a test asserting that a tile smaller than
+//! the canvas **changes** the decode. So the usual rung-2 move — shrink the tile until the request
+//! fits — would silently reintroduce that defect, and no memory assertion would catch it. The
+//! contract says so in the only way a consumer honors: `validate_selection` admits 256/64 and
+//! refuses every other value, and [`route_gate`] refuses it again at admission.
+//!
+//! What rung 2 *does* bound here is the decoder scratch that is genuinely free: the number of
+//! decoded tiles held live during the stitch. [`crate::spatial_tiling::BoundedStitch`] streams the
+//! grid row-major and retains `O(cols)` overlap strips instead of the `O(rows × cols)` whole grid
+//! `stitch_tiles` holds — bit-identical output, asserted at `max|Δ| == 0.0`.
+//!
+//! **The audio VAE (0.61 GB) is explicitly out of scope**, and that is a declaration rather than an
+//! omission: see [`AUDIO_VAE_IS_OUT_OF_SCOPE_FOR_TILING`]. It is a DAC-lineage 1-D stack whose
+//! decode is a BigVGAN vocoder over a waveform, with no spatial grid to tile and a footprint 17×
+//! below the video VAE's.
+//!
+//! Rungs 3 and 4 are declared [`MemoryStrategySupport::Missing`] — honestly, because neither is
 //! built:
 //!
-//! * **Rung 2 (`BoundedDecode`)** — sc-18660. The video VAE decode is chunked *temporally* today,
-//!   but that is the reference's own `decode_temporal` algorithm ([`crate::chunking`]) and is
-//!   unconditional; it is not a selectable bound and there is no spatial tiling at all. The audio
-//!   VAE is 0.61 GB and is explicitly out of scope for tiling.
 //! * **Rung 3 (`BoundedAttention`)** — sc-18661. Deliberately **not**
 //!   [`MemoryStrategySupport::StructurallyNotApplicable`], even though MLX's fused SDPA already
 //!   streams the scores: measured peak tracks `4·B·H·S·D` (5.966 GB measured against 5.965 GB
@@ -136,6 +163,34 @@ pub const DENOISE_RESIDENT_Q4_BYTES: u64 = 11_630_000_000;
 /// resident.
 pub const ADALN_EVICTED_BYTES: u64 = 26_020_915_200;
 
+// --- rung 2: the bounded-decode domain ---------------------------------------------------------
+
+/// The **only** decode tile edge this provider admits, in output pixels.
+///
+/// Derived from [`crate::spatial_tiling::TILE_SAMPLE_MIN_SIZE`] rather than re-typed, so a change
+/// to the reference geometry cannot leave the contract publishing a domain the decode no longer
+/// executes. It is a singleton because the tile edge is an **output-correctness** input copied from
+/// the published model (sc-18786), not a tunable — see the module docs.
+pub const DECODE_TILE_EDGE: u32 = crate::spatial_tiling::TILE_SAMPLE_MIN_SIZE as u32;
+
+/// The **only** decode tile overlap this provider admits, in output pixels. Derived from
+/// [`crate::spatial_tiling::TILE_SAMPLE_MIN_OVERLAP`] for the same reason as [`DECODE_TILE_EDGE`].
+///
+/// A zero overlap is the tile-starvation failure mode this rung must not be able to select: it
+/// abuts the tiles with no cross-fade, and the corruption shows up **across frames** rather than
+/// within one, so no memory number can see it. `validate_ranges` independently forbids a zero
+/// entry in a published range, so the domain cannot be widened to include it by accident.
+pub const DECODE_OVERLAP: u32 = crate::spatial_tiling::TILE_SAMPLE_MIN_OVERLAP as u32;
+
+/// The audio VAE is out of scope for rung 2, declared rather than implied.
+///
+/// It is 0.61 GB against the video VAE's 10.42 GB (17× smaller), and structurally has nothing to
+/// tile: `crate::audio_vae` is a DAC-lineage 1-D stack whose decode is a BigVGAN vocoder over a
+/// waveform. There is no spatial grid, so the `decode_tile_edge` / `decode_overlap` domain has no
+/// meaning for it and the rung's mechanism does not run on that path. Named as a constant so the
+/// boundary is greppable and testable rather than a sentence in a doc comment.
+pub const AUDIO_VAE_IS_OUT_OF_SCOPE_FOR_TILING: bool = true;
+
 /// The load shape this loader actually has today, pinned rather than mirrored from the spec.
 ///
 /// [`LoadShape::DeferredMaterialization`] means *transformer blocks are materialized through a
@@ -210,16 +265,27 @@ fn strategies() -> Vec<MemoryStrategyCapability> {
         .map(|strategy| MemoryStrategyCapability {
             strategy,
             support: match strategy {
-                MemoryStrategy::Resident | MemoryStrategy::StagedResidency => {
-                    MemoryStrategySupport::Implemented
-                }
-                // sc-18660 / sc-18661 / sc-18662. See the module docs for why rung 3 is `Missing`
-                // and not `StructurallyNotApplicable` despite the fused-SDPA measurement.
-                MemoryStrategy::BoundedDecode
-                | MemoryStrategy::BoundedAttention
+                MemoryStrategy::Resident
+                | MemoryStrategy::StagedResidency
+                // sc-18660. The mechanism is `crate::spatial_tiling::BoundedStitch` behind
+                // `MiniMaxH3VideoVae::decode_clip`; the domain is one geometry, because the tile
+                // edge is an output-correctness input rather than a lever (module docs).
+                | MemoryStrategy::BoundedDecode => MemoryStrategySupport::Implemented,
+                // sc-18661 / sc-18662. See the module docs for why rung 3 is `Missing` and not
+                // `StructurallyNotApplicable` despite the fused-SDPA measurement.
+                MemoryStrategy::BoundedAttention
                 | MemoryStrategy::BoundedTransformerResidency => MemoryStrategySupport::Missing,
             },
-            parameters: MemoryParameterRanges::default(),
+            parameters: match strategy {
+                MemoryStrategy::BoundedDecode => MemoryParameterRanges {
+                    decode_tile_edges: vec![DECODE_TILE_EDGE],
+                    decode_overlaps: vec![DECODE_OVERLAP],
+                    ..Default::default()
+                },
+                // `validate_owned_parameter_domain` enforces this in BOTH directions: an
+                // implemented rung that does not own the decode parameters must publish none.
+                _ => MemoryParameterRanges::default(),
+            },
         })
         .collect()
 }
@@ -257,7 +323,10 @@ fn build_contract(components: &ComponentBytes) -> MemoryProviderContract {
         lifecycle: MemoryLifecycleCapabilities {
             phases: phases(),
             synchronized_phase_release: true,
-            decode_tiling: false,
+            // sc-18660. `conformance_errors` requires this hook whenever rung 2 is `Implemented`,
+            // and its converse forbids declaring rung 2 `StructurallyNotApplicable` while it is
+            // set — so the pair cannot drift apart.
+            decode_tiling: true,
             attention_chunking: false,
             transformer_window_materialization: false,
         },
@@ -276,6 +345,11 @@ fn build_contract(components: &ComponentBytes) -> MemoryProviderContract {
                 MemoryFormulaVariable::PixelCount,
                 MemoryFormulaVariable::FrameCount,
                 MemoryFormulaVariable::ConditioningTokenCount,
+                // sc-18660. The decode phase's scratch is a function of the tile area, not the
+                // canvas area — one 256 px tile is decoded at a time regardless of canvas. The
+                // variable is declared because the phase expression needs it; its coefficient is
+                // calibration evidence and is NOT measured yet (see the sc-18660 notes).
+                MemoryFormulaVariable::DecodeTileArea,
             ],
         },
         calibration: Some(MemoryCalibrationIdentity::new(
@@ -340,6 +414,31 @@ fn routes() -> Vec<(MemoryMode, u32)> {
     ]
 }
 
+/// Admit a bounded-decode geometry — **the** rung-2 predicate, and the only one.
+///
+/// Both admission seams call this: [`route_gate`] (the `safety_check` half) and the request scope's
+/// `decode_validator` (the `configure_decode` half). Sharing one predicate is not tidiness — it is
+/// what stops the pair drifting, which is the failure this family has already shipped twice, most
+/// recently when `encode_clip` hardcoded its tile constants while `decode_clip` read `self.tiling`
+/// so `disable_tiling()` disabled only half the VAE (sc-19008).
+///
+/// The domain is a singleton, so this refuses everything except the reference geometry. The message
+/// names *why* rather than only *what*, because a caller reaching it has asked for the one thing
+/// this rung cannot trade: output fidelity for memory.
+pub fn validate_decode_geometry(edge: u32, overlap: u32) -> mlx_gen::gen_core::Result<()> {
+    if edge == DECODE_TILE_EDGE && overlap == DECODE_OVERLAP {
+        return Ok(());
+    }
+    Err(CoreError::Unsupported(format!(
+        "{MODEL_ID}: bounded decode admits only the reference geometry {DECODE_TILE_EDGE}px tile / \
+         {DECODE_OVERLAP}px overlap, got {edge}/{overlap}. The tile geometry is an output-\
+         correctness input copied from the published VAE, not a memory lever: MiniMax-H3 was \
+         released with tiling on and the released frames are the blended-tile ones, so a budgeted \
+         tile would change the output (sc-18786). A zero overlap additionally starves the seams, \
+         and that corruption is visible across frames rather than within one."
+    )))
+}
+
 /// Reject a run context whose geometry the render itself would refuse.
 ///
 /// This is the non-vacuous half of admission: the lattice and canvas gates are the same ones
@@ -350,6 +449,20 @@ fn route_gate(context: &MemoryRunContext) -> mlx_gen::gen_core::Result<()> {
         return Err(CoreError::Unsupported(format!(
             "{MODEL_ID} has no PiD decode route"
         )));
+    }
+    // sc-18660. Guarded by contract-aware engagement rather than an ordinal compare, so a rung the
+    // contract does not implement never demands its parameters.
+    if context
+        .selection
+        .strategy
+        .engages(MemoryStrategy::BoundedDecode)
+    {
+        if let (Some(edge), Some(overlap)) = (
+            context.selection.parameters.decode_tile_edge,
+            context.selection.parameters.decode_overlap,
+        ) {
+            validate_decode_geometry(edge, overlap)?;
+        }
     }
     let geometry = context.geometry;
     if !LEGAL_FRAME_COUNTS.contains(&(geometry.frames as i32)) {
@@ -460,14 +573,9 @@ fn begin_request_with_cleanup(
         contract.generation_memory(&context.selection),
         context.use_pid,
         DIT_BLOCKS as usize,
-        // Rung 2 is not implemented, so every decode geometry is outside the admitted domain. This
-        // is a refusal, not a placeholder: a caller that reaches it has selected a lever this
-        // provider does not have.
-        |_use_pid, edge, overlap| {
-            Err(CoreError::Unsupported(format!(
-                "{MODEL_ID} has no bounded decode route (sc-18660); refused tile {edge} / overlap {overlap}"
-            )))
-        },
+        // sc-18660. The same predicate the `safety_check` route gate uses, so `configure_decode`
+        // and admission cannot disagree about what is legal.
+        |_use_pid, edge, overlap| validate_decode_geometry(edge, overlap),
     )?;
     Ok(Some(Box::new(
         mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(config, cleanup),
@@ -771,14 +879,219 @@ mod tests {
         }
     }
 
+    // --- sc-18660 AC4: rung 2 is REACHABLE, not merely declared --------------------------------
+
+    /// **The whole rung-2 chain, executed.** Contract → selection → `safety_check` → scope →
+    /// `configure_decode` → `GenerationRequest.memory` → the pipeline's own reader.
+    ///
+    /// The chain ends at [`crate::pipeline::decode_tiling_for`], which is the function
+    /// `MiniMaxH3::decode_video` calls. Nothing here asserts that a *default* arrived — the
+    /// admitted edge equals the default, so such an assertion would pass with the plumbing deleted
+    /// (`test_asserting_a_default_value_is_a_false_green`). What is asserted instead is that the
+    /// selection's values travel intact **and** that the two negative directions are refused.
+    #[test]
+    fn bounded_decode_reaches_the_decode_call_through_the_request() {
+        let spec = weightless_spec();
+        let contract = declared();
+        let tier = MemoryNumericTier {
+            precision: spec.precision,
+            quant: spec.quantize,
+            component_precision_floors: &[],
+        };
+        let mut context = mlx_gen::gen_core::standard_memory_behavior_context(
+            &contract,
+            MemoryStrategy::BoundedDecode,
+            tier,
+            MemoryBehaviorRoute {
+                mode: MemoryMode::TextToImage,
+                reference_count: 0,
+                use_pid: false,
+                has_phases: true,
+                overlay: None,
+            },
+        )
+        .expect("behavior context");
+        context.geometry = MemoryGeometry {
+            width: FIXTURE_WIDTH,
+            height: FIXTURE_HEIGHT,
+            batch: 1,
+            frames: FIXTURE_FRAMES,
+            reference_count: 0,
+        };
+
+        // The representative selection carries the published domain, not a hardcoded pair.
+        assert_eq!(
+            (
+                context.selection.parameters.decode_tile_edge,
+                context.selection.parameters.decode_overlap
+            ),
+            (Some(DECODE_TILE_EDGE), Some(DECODE_OVERLAP)),
+            "the representative rung-2 selection must carry the published domain"
+        );
+        assert_eq!(
+            safety_check(&spec, &contract, &context),
+            MemorySafetyDecision::Accept,
+            "rung 2 must admit its own published geometry"
+        );
+
+        let mut scope = registered_begin_request(&spec, &contract, &context)
+            .expect("begin_request")
+            .expect("scope");
+        // The scope's own decode hook admits it — this is the seam registry conformance drives.
+        scope
+            .configure_decode(DECODE_TILE_EDGE, DECODE_OVERLAP, context.geometry)
+            .expect("the published geometry must configure");
+        // …and refuses a budgeted substitute, which is the direction that carries information.
+        let refused = scope
+            .configure_decode(128, 32, context.geometry)
+            .expect_err("a smaller tile must be refused, not silently clamped");
+        assert!(
+            refused.to_string().contains("output-correctness"),
+            "the refusal must name WHY the geometry is pinned, got: {refused}"
+        );
+
+        let mut request = GenerationRequest {
+            prompt: "a slow pan across a rainy street at night".into(),
+            width: FIXTURE_WIDTH,
+            height: FIXTURE_HEIGHT,
+            frames: Some(FIXTURE_FRAMES),
+            ..Default::default()
+        };
+        scope.configure_request(&mut request).expect("configure");
+        let memory = request
+            .memory
+            .expect("a rung-2 request carries a memory block");
+        assert!(memory.tile_vae_decode, "rung 2 must set the decode signal");
+        assert_eq!(
+            (memory.decode_tile_edge, memory.decode_overlap),
+            (Some(DECODE_TILE_EDGE), Some(DECODE_OVERLAP)),
+            "the selected geometry must survive onto the request"
+        );
+
+        // The pipeline reader accepts the block the scope built, and produces the reference
+        // geometry — the same one `decode_clip` executes.
+        let tiling = crate::pipeline::decode_tiling_for(&request).expect("admitted block resolves");
+        assert!(tiling.enabled);
+        assert_eq!(
+            (tiling.tile_height, tiling.tile_width),
+            (DECODE_TILE_EDGE as i32, DECODE_TILE_EDGE as i32)
+        );
+        assert_eq!(
+            (tiling.overlap_height, tiling.overlap_width),
+            (DECODE_OVERLAP as i32, DECODE_OVERLAP as i32)
+        );
+        scope.finish(MemoryRunOutcome::Complete).expect("finish");
+    }
+
+    /// **The reader is not a constant folder.** A hand-built block naming an unadmitted geometry —
+    /// including the starved zero overlap — must be refused by the same predicate admission uses.
+    ///
+    /// This is the half that goes red if `decode_tiling_for` is replaced by
+    /// `Ok(SpatialTiling::default())`: every positive assertion above would still pass, because the
+    /// admitted value *is* the default.
+    #[test]
+    fn the_pipeline_reader_refuses_every_unadmitted_decode_geometry() {
+        use mlx_gen::gen_core::GenerationMemory;
+        let request = |edge: Option<u32>, overlap: Option<u32>| GenerationRequest {
+            prompt: "p".into(),
+            width: FIXTURE_WIDTH,
+            height: FIXTURE_HEIGHT,
+            frames: Some(FIXTURE_FRAMES),
+            memory: Some(GenerationMemory {
+                tile_vae_decode: true,
+                decode_tile_edge: edge,
+                decode_overlap: overlap,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        // A budgeted tile — the substitution that would reintroduce sc-18786's defect.
+        for edge in [64u32, 128, 192, 320, 512, 2048] {
+            assert!(
+                crate::pipeline::decode_tiling_for(&request(Some(edge), Some(DECODE_OVERLAP)))
+                    .is_err(),
+                "a {edge}px tile must be refused: it changes the decode"
+            );
+        }
+        // **A starved overlap**, the failure mode this rung must not be able to select.
+        for overlap in [0u32, 16, 32, 128] {
+            assert!(
+                crate::pipeline::decode_tiling_for(&request(Some(DECODE_TILE_EDGE), Some(overlap)))
+                    .is_err(),
+                "a {overlap}px overlap must be refused"
+            );
+        }
+        // The admitted pair resolves, so the guard rejects the geometry and not the request shape.
+        assert!(crate::pipeline::decode_tiling_for(&request(
+            Some(DECODE_TILE_EDGE),
+            Some(DECODE_OVERLAP)
+        ))
+        .is_ok());
+        // A request that engages no rung, or names no geometry, gets the shipped default — the
+        // pre-sc-18660 behaviour, byte for byte.
+        for plain in [
+            GenerationRequest::default(),
+            GenerationRequest {
+                memory: Some(GenerationMemory::default()),
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(
+                crate::pipeline::decode_tiling_for(&plain).expect("plain request resolves"),
+                crate::spatial_tiling::SpatialTiling::default()
+            );
+        }
+    }
+
+    /// A zero overlap cannot be published, independent of the reader: `validate_ranges` forbids a
+    /// zero entry in any declared range. Two guards, one failure mode, neither relying on the other.
+    #[test]
+    fn a_starved_overlap_cannot_be_published_as_a_candidate() {
+        let mut starved = declared();
+        for entry in &mut starved.strategies {
+            if entry.strategy == MemoryStrategy::BoundedDecode {
+                entry.parameters.decode_overlaps = vec![0];
+            }
+        }
+        let errors = starved.conformance_errors();
+        assert!(
+            !errors.is_empty(),
+            "a zero decode overlap must fail conformance, not ship as a candidate"
+        );
+        // And the shipped domain is the geometry the decode actually runs — read back through
+        // `SpatialTiling::default()`, which is what `decode_clip` consults, rather than off the
+        // constants, since a constant compared with itself proves nothing.
+        let tiling = crate::spatial_tiling::SpatialTiling::default();
+        assert!(tiling.enabled);
+        assert_eq!(
+            (DECODE_TILE_EDGE as i32, DECODE_OVERLAP as i32),
+            (tiling.tile_height, tiling.overlap_height),
+            "the published domain must be the geometry decode_clip executes"
+        );
+        assert_eq!(
+            (DECODE_TILE_EDGE as i32, DECODE_OVERLAP as i32),
+            (tiling.tile_width, tiling.overlap_width),
+            "the domain is square; a per-axis split would need two more candidates"
+        );
+        // The audio VAE's exclusion is a size-and-shape fact, not a preference: an order of
+        // magnitude smaller, and a waveform has no spatial grid a tile edge could mean anything on.
+        // Both operands are constants, so this is a compile-time guard — which is the stronger
+        // form, since the premise cannot then drift into a runtime-only check nobody runs.
+        const _: () = assert!(
+            VIDEO_VAE_BYTES > AUDIO_VAE_BYTES * 10,
+            "the audio-VAE exclusion assumes it is an order of magnitude smaller"
+        );
+    }
+
     /// Reachability has a negative half: a rung this provider does not implement must be refused by
     /// the same admission path, not silently accepted.
     #[test]
     fn unimplemented_rungs_are_refused_at_admission() {
         let spec = weightless_spec();
         let contract = declared();
+        // sc-18660 landed rung 2, so it is no longer in this list. Rungs 3 and 4 remain unbuilt —
+        // see the module docs for why rung 3 is `Missing` rather than `StructurallyNotApplicable`.
         for strategy in [
-            MemoryStrategy::BoundedDecode,
             MemoryStrategy::BoundedAttention,
             MemoryStrategy::BoundedTransformerResidency,
         ] {
@@ -1025,13 +1338,27 @@ mod tests {
     // --- AC5: parameter ranges are declared exactly where they are owned ------------------------
 
     /// Both directions: an implemented lever publishes its domain, and a rung that does not own a
-    /// parameter publishes none. The shipped contract implements no numeric lever, so the positive
-    /// half is that every entry is legitimately empty and conformance still passes.
+    /// parameter publishes none.
+    ///
+    /// Since sc-18660 the positive half is real rather than vacuous — rung 2 publishes exactly the
+    /// reference geometry — while every other rung is still legitimately empty.
     #[test]
     fn parameter_ranges_are_owned_by_the_rung_that_consumes_them() {
         let contract = declared();
         assert!(contract.conformance_errors().is_empty());
         for capability in &contract.strategies {
+            if capability.strategy == MemoryStrategy::BoundedDecode {
+                assert_eq!(
+                    capability.parameters,
+                    MemoryParameterRanges {
+                        decode_tile_edges: vec![DECODE_TILE_EDGE],
+                        decode_overlaps: vec![DECODE_OVERLAP],
+                        ..Default::default()
+                    },
+                    "rung 2 publishes the reference geometry and nothing else"
+                );
+                continue;
+            }
             assert_eq!(
                 capability.parameters,
                 MemoryParameterRanges::default(),

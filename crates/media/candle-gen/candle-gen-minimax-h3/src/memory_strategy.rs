@@ -128,8 +128,20 @@ fn strategies() -> Vec<MemoryStrategyCapability> {
             strategy,
             support: match strategy {
                 MemoryStrategy::Resident => MemoryStrategySupport::Implemented,
-                // Rung 1: sc-17156 (there is no pipeline to stage). Rungs 2/3/4: sc-18660 /
-                // sc-18661 / sc-18662.
+                // Rung 1: sc-17156 (there is no pipeline to stage).
+                //
+                // Rung 2 (sc-18660) is the interesting one, and it is **not** a porting gap: the
+                // mechanism is present — `MiniMaxH3VideoVae::decode_clip` tiles at the reference
+                // 256/64 through `crate::spatial_tiling::BoundedStitch`, the same seam the MLX
+                // sibling declares `Implemented` on. It stays `Missing` here because an optimized
+                // rung needs a weights-free `MemoryBehaviorRegistration`, that needs a
+                // `MemoryBehaviorFixture`, and that needs a `calibration` identity this crate does
+                // not have (see `contract.calibration`). The blocker is therefore the absent
+                // pipeline, one link behind the seam — a seam cannot be written before the
+                // identity exists. `an_optimized_rung_here_is_blocked_by_the_missing_calibration_\
+                // identity_not_the_seam` drives that chain and fails the moment it is removed.
+                //
+                // Rungs 3/4: sc-18661 / sc-18662.
                 _ => MemoryStrategySupport::Missing,
             },
             parameters: MemoryParameterRanges::default(),
@@ -871,6 +883,76 @@ mod tests {
         let resolved =
             contract_for(&LoadSpec::new(WeightsSource::Dir(root.path().into()))).expect("contract");
         assert_eq!(resolved.asset_facts.decoder_bytes, AUDIO_VAE_BYTES);
+    }
+
+    /// **What actually blocks an optimized rung on this backend, executed rather than asserted**
+    /// (sc-18660).
+    ///
+    /// The MLX sibling declares rung 2 `Implemented` because its spatial tiling is reachable from a
+    /// request. **The mechanism exists here too** — `MiniMaxH3VideoVae::decode_clip` tiles at the
+    /// same reference geometry, through the same `BoundedStitch` — so the natural conclusion is
+    /// that this crate under-declares, and the natural fix is to add the weights-free
+    /// `MemoryBehaviorRegistration` seam the MLX sibling has.
+    ///
+    /// **That fix is not available on this tree, and the reason is one link further back than the
+    /// seam.** The chain, each link driven below rather than described:
+    ///
+    /// 1. this crate has no pipeline and no measurements, so `calibration` is `None`;
+    /// 2. `standard_memory_behavior_context` **requires** a calibration identity, so no
+    ///    `MemoryBehaviorFixture` can be constructed at all;
+    /// 3. without a fixture there is no `MemoryBehaviorRegistration`;
+    /// 4. `check_memory_strategy_contract` rejects a contract implementing any *optimized* rung
+    ///    with no behavior seam.
+    ///
+    /// So the blocker is the absent pipeline (sc-17156), not the seam — the seam cannot be written
+    /// before the identity exists. This test **fails the moment a calibration identity lands**,
+    /// which is exactly when the flip becomes possible, and it names the rungs waiting on it.
+    #[test]
+    fn an_optimized_rung_here_is_blocked_by_the_missing_calibration_identity_not_the_seam() {
+        let contract = declared();
+
+        // Link 1 — load-bearing, not incidental.
+        assert!(
+            contract.calibration.is_none(),
+            "a calibration identity landed: rungs 1 and 2 can now be declared here. Add the \
+             weights-free MemoryBehaviorRegistration seam (model it on \
+             mlx_gen_minimax_h3::memory_strategy::MEMORY_BEHAVIOR) and flip them — the mechanisms \
+             already exist in this crate."
+        );
+
+        // Link 2 — executed. This is the call every behavior seam must make, and it errors here.
+        let refused = candle_gen::gen_core::standard_memory_behavior_context(
+            &contract,
+            MemoryStrategy::BoundedDecode,
+            MemoryNumericTier {
+                precision: candle_gen::gen_core::Precision::Bf16,
+                quant: None,
+                component_precision_floors: &[],
+            },
+            candle_gen::gen_core::MemoryBehaviorRoute {
+                mode: candle_gen::gen_core::MemoryMode::TextToImage,
+                reference_count: 0,
+                use_pid: false,
+                has_phases: false,
+                overlay: None,
+            },
+        )
+        .expect_err("a behavior context must not be constructible without a calibration identity");
+        assert!(
+            refused.to_string().contains("calibration identity"),
+            "expected the identity refusal, got: {refused}"
+        );
+
+        // …while the MECHANISM rung 2 would declare is genuinely present in this crate today, so
+        // the gap is a declaration gap and not a porting gap.
+        // Read through `Default`, not off the constants: comparing a constant with itself would
+        // pass with the mechanism deleted.
+        let tiling = crate::spatial_tiling::SpatialTiling::default();
+        assert!(tiling.enabled, "the shipped candle VAE must tile by default");
+        assert_eq!((tiling.tile_height, tiling.tile_width), (256, 256));
+        assert_eq!((tiling.overlap_height, tiling.overlap_width), (64, 64));
+        // …and the stitcher rung 2 would declare is constructible here today.
+        assert!(crate::spatial_tiling::BoundedStitch::new(2, 2, &[1], &[1]).is_ok());
     }
 
     /// The three ways this backend's declaration diverges from the MLX sibling's, pinned so a later

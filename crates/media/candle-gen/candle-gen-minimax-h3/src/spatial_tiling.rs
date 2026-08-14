@@ -320,10 +320,315 @@ pub fn stitch_tiles(
     Ok(Tensor::cat(&result_rows, h_axis)?)
 }
 
+/// The streaming, scratch-bounded equivalent of [`stitch_tiles`] — ladder rung 2 (sc-18660).
+///
+/// The Candle twin of `mlx_gen_minimax_h3::spatial_tiling::BoundedStitch`, here for the same
+/// reason: the tile **geometry** is pinned by output correctness (sc-18786) and cannot be a memory
+/// lever, so what rung 2 bounds at this seam is the number of decoded tiles held live.
+/// [`stitch_tiles`] takes the whole `rows x cols` grid by reference; this consumes tiles row-major
+/// and retains only the trailing windows [`blend`] will actually read — `O(cols)` strips.
+///
+/// # Bit-identical, and why
+///
+/// [`blend`] reads exactly `a.narrow(axis, a_len - extent, extent)` of its first argument. A strip
+/// that *is* that window yields the same `a_ov`, and its shorter `a_len` cannot change `extent`,
+/// which is already clamped to the strip's own length by construction.
+///
+/// # Candle storage sharing
+///
+/// Every retained strip is `contiguous()`, so it owns its bytes and the parent tile's storage is
+/// released when the tile drops. A bare `narrow` is a view over the parent's `Arc` storage, which
+/// would leave the bound structural only — the same class of mistake as `released_bytes` reporting
+/// frees that did not happen.
+pub struct BoundedStitch {
+    rows: usize,
+    cols: usize,
+    height_overlaps: Vec<usize>,
+    width_overlaps: Vec<usize>,
+    /// Trailing height strips of the previous row's original tiles, indexed by column.
+    carry: Vec<Option<Tensor>>,
+    /// Trailing width strip of the current row's previous original tile.
+    left: Option<Tensor>,
+    result_row: Vec<Tensor>,
+    result_rows: Vec<Tensor>,
+    seen: usize,
+    rank: Option<usize>,
+}
+
+impl BoundedStitch {
+    /// Start a stitch over a `rows` x `cols` grid at the given per-seam overlaps.
+    pub fn new(
+        rows: usize,
+        cols: usize,
+        height_overlaps: &[usize],
+        width_overlaps: &[usize],
+    ) -> Result<Self> {
+        if rows == 0 || cols == 0 {
+            return Err(CandleError::Msg(
+                "minimax-h3 tiling: cannot stitch an empty tile grid".into(),
+            ));
+        }
+        if rows > 1 && height_overlaps.len() + 1 != rows {
+            return Err(CandleError::Msg(format!(
+                "minimax-h3 tiling: {rows} tile rows need {} height overlaps, got {}",
+                rows - 1,
+                height_overlaps.len()
+            )));
+        }
+        if cols > 1 && width_overlaps.len() + 1 != cols {
+            return Err(CandleError::Msg(format!(
+                "minimax-h3 tiling: {cols} tile columns need {} width overlaps, got {}",
+                cols - 1,
+                width_overlaps.len()
+            )));
+        }
+        Ok(Self {
+            rows,
+            cols,
+            height_overlaps: height_overlaps.to_vec(),
+            width_overlaps: width_overlaps.to_vec(),
+            carry: (0..cols).map(|_| None).collect(),
+            left: None,
+            result_row: Vec::with_capacity(cols),
+            result_rows: Vec::with_capacity(rows),
+            seen: 0,
+            rank: None,
+        })
+    }
+
+    /// Elements retained as **blend scratch** — the quantity rung 2 bounds. Exact and weights-free;
+    /// under [`stitch_tiles`] the equivalent is the whole undecoded-yet-unconsumed grid.
+    pub fn scratch_elements(&self) -> usize {
+        let count = |t: &Tensor| t.dims().iter().product::<usize>();
+        self.carry.iter().flatten().map(count).sum::<usize>() + self.left.as_ref().map_or(0, count)
+    }
+
+    /// Feed the next tile, in row-major order.
+    pub fn push(&mut self, tile: Tensor) -> Result<()> {
+        if self.seen >= self.rows * self.cols {
+            return Err(CandleError::Msg(format!(
+                "minimax-h3 tiling: pushed more than the {} tiles this {}x{} grid declared",
+                self.rows * self.cols,
+                self.rows,
+                self.cols
+            )));
+        }
+        let rank = tile.dims().len();
+        if rank < 2 {
+            return Err(CandleError::Msg(format!(
+                "minimax-h3 tiling: a tile needs height and width axes, got rank {rank}"
+            )));
+        }
+        match self.rank {
+            None => self.rank = Some(rank),
+            Some(first) if first != rank => {
+                return Err(CandleError::Msg(format!(
+                    "minimax-h3 tiling: tile rank {rank} does not match the grid's {first}"
+                )));
+            }
+            Some(_) => {}
+        }
+        let (h_axis, w_axis) = (rank - 2, rank - 1);
+        let (i, j) = (self.seen / self.cols, self.seen % self.cols);
+        let extent = |o: usize| -> Result<i32> {
+            i32::try_from(o).map_err(|_| {
+                CandleError::Msg(format!(
+                    "minimax-h3 tiling: overlap {o} does not fit an i32"
+                ))
+            })
+        };
+
+        // Capture the trailing windows from the ORIGINAL tile, before either blend rewrites it.
+        let next_left = if j + 1 < self.cols {
+            Some(Self::trailing(&tile, w_axis, self.width_overlaps[j])?)
+        } else {
+            None
+        };
+        let next_carry = if i + 1 < self.rows {
+            Some(Self::trailing(&tile, h_axis, self.height_overlaps[i])?)
+        } else {
+            None
+        };
+
+        let mut t = tile;
+        if i > 0 {
+            let above = self.carry[j].as_ref().ok_or_else(|| {
+                CandleError::Msg(format!(
+                    "minimax-h3 tiling: row {i} column {j} has no retained strip from the row above"
+                ))
+            })?;
+            t = blend(above, &t, extent(self.height_overlaps[i - 1])?, h_axis)?;
+        }
+        if j > 0 {
+            let left = self.left.as_ref().ok_or_else(|| {
+                CandleError::Msg(format!(
+                    "minimax-h3 tiling: row {i} column {j} has no retained strip from its left \
+                     neighbour"
+                ))
+            })?;
+            t = blend(left, &t, extent(self.width_overlaps[j - 1])?, w_axis)?;
+        }
+        // The trim uses THIS tile's own overlap, not the neighbour's — the two differ whenever the
+        // round-robin slack distribution landed unevenly.
+        if i + 1 < self.rows {
+            let n = t.dims()[h_axis];
+            t = t.narrow(h_axis, 0, n - self.height_overlaps[i])?;
+        }
+        if j + 1 < self.cols {
+            let n = t.dims()[w_axis];
+            t = t.narrow(w_axis, 0, n - self.width_overlaps[j])?;
+        }
+
+        self.left = next_left;
+        if i + 1 < self.rows {
+            self.carry[j] = next_carry;
+        }
+        self.result_row.push(t.contiguous()?);
+        self.seen += 1;
+
+        if j + 1 == self.cols {
+            let row = std::mem::take(&mut self.result_row);
+            self.result_rows.push(Tensor::cat(&row, w_axis)?);
+            self.left = None;
+        }
+        Ok(())
+    }
+
+    /// The trailing `extent` slice along `axis`, materialized so the parent can be released.
+    fn trailing(tile: &Tensor, axis: usize, extent: usize) -> Result<Tensor> {
+        let len = tile.dims()[axis];
+        let extent = extent.min(len);
+        Ok(tile.narrow(axis, len - extent, extent)?.contiguous()?)
+    }
+
+    /// Concatenate the completed rows. Fails if fewer tiles were pushed than declared.
+    pub fn finish(self) -> Result<Tensor> {
+        let expected = self.rows * self.cols;
+        if self.seen != expected {
+            return Err(CandleError::Msg(format!(
+                "minimax-h3 tiling: {}x{} grid expected {expected} tiles, got {}",
+                self.rows, self.cols, self.seen
+            )));
+        }
+        let rank = self.rank.expect("a complete grid pushed at least one tile");
+        Ok(Tensor::cat(&self.result_rows, rank - 2)?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use candle_gen::candle_core::Device;
+
+    /// A deterministic non-constant tile grid: a constant grid cannot see a weighting error, and a
+    /// separable one cannot see a transposed axis.
+    fn grid(rows: usize, cols: usize, shape: &[usize]) -> Vec<Vec<Tensor>> {
+        let n: usize = shape.iter().product();
+        (0..rows)
+            .map(|i| {
+                (0..cols)
+                    .map(|j| {
+                        let base = (i * 31 + j * 7) as f32;
+                        let vals: Vec<f32> = (0..n)
+                            .map(|k| base + (k as f32) * 0.5 + ((k * k) % 13) as f32)
+                            .collect();
+                        Tensor::from_vec(vals, shape, &Device::Cpu).unwrap()
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// **The bounded stitch is BIT-identical to the full-grid stitch** — the guard that rung 2's
+    /// scratch bound did not move the output.
+    #[test]
+    fn bounded_stitch_matches_the_full_grid_stitch() {
+        for (rows, cols, ho, wo) in [
+            (1usize, 1usize, vec![], vec![]),
+            (1, 3, vec![], vec![2usize, 1]),
+            (3, 1, vec![2usize, 1], vec![]),
+            (2, 2, vec![1usize], vec![1usize]),
+            (4, 7, vec![3usize, 2, 2], vec![2usize, 2, 1, 2, 1, 2]),
+        ] {
+            let tiles = grid(rows, cols, &[1, 2, 6, 5]);
+            let full = stitch_tiles(&tiles, &ho, &wo).unwrap();
+            let mut s = BoundedStitch::new(rows, cols, &ho, &wo).unwrap();
+            for row in &tiles {
+                for tile in row {
+                    s.push(tile.clone()).unwrap();
+                }
+            }
+            let bounded = s.finish().unwrap();
+            assert_eq!(bounded.dims(), full.dims(), "{rows}x{cols}: shape moved");
+            let a = full.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let b = bounded.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let peak = a
+                .iter()
+                .zip(&b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max);
+            assert_eq!(
+                peak, 0.0,
+                "{rows}x{cols}: bounded stitch differs by {peak:.3e}; it must be bit-identical"
+            );
+        }
+    }
+
+    /// **The bound is `O(cols)`**: retained blend scratch must not grow with the row count.
+    #[test]
+    fn retained_scratch_is_bounded_by_one_row_of_strips() {
+        let shape = [1usize, 2, 16, 16];
+        let tile_elems: usize = shape.iter().product();
+        let (rows, cols) = (4usize, 7usize);
+        let (ho, wo) = (vec![6usize, 5, 5], vec![5usize, 5, 5, 5, 4, 4]);
+
+        let worst = |rows: usize, ho: &[usize]| {
+            let tiles = grid(rows, cols, &shape);
+            let mut s = BoundedStitch::new(rows, cols, ho, &wo).unwrap();
+            let mut worst = 0usize;
+            for row in &tiles {
+                for tile in row {
+                    s.push(tile.clone()).unwrap();
+                    worst = worst.max(s.scratch_elements());
+                }
+            }
+            s.finish().unwrap();
+            worst
+        };
+
+        // The derived ceiling contains **no `rows` term** — that absence is the property under test.
+        let strip = |overlap: usize| tile_elems / 16 * overlap;
+        let ceiling = cols * strip(*ho.iter().max().unwrap()) + strip(*wo.iter().max().unwrap());
+        let short = worst(rows, &ho);
+        assert!(
+            short <= ceiling,
+            "retained scratch {short} exceeded the O(cols) ceiling {ceiling}"
+        );
+        assert!(
+            short * 4 < rows * cols * tile_elems,
+            "retained scratch {short} is not a material bound on the grid `stitch_tiles` holds"
+        );
+        let tall_ho = vec![6usize, 5, 5, 6, 5, 5, 6];
+        assert_eq!(tall_ho.iter().max(), ho.iter().max());
+        assert!(
+            worst(8, &tall_ho) <= ceiling,
+            "doubling the rows pushed scratch over the row-independent ceiling {ceiling}"
+        );
+    }
+
+    /// The arity checks are the full-grid stitcher's, moved to construction time.
+    #[test]
+    fn bounded_stitch_rejects_a_mismatched_overlap_count() {
+        assert!(BoundedStitch::new(2, 2, &[1], &[1]).is_ok());
+        assert!(BoundedStitch::new(2, 2, &[], &[1]).is_err());
+        assert!(BoundedStitch::new(2, 2, &[1], &[1, 1]).is_err());
+        assert!(BoundedStitch::new(0, 2, &[], &[1]).is_err());
+        // An incomplete grid is a typed error, not a wrong-sized tensor.
+        assert!(BoundedStitch::new(2, 2, &[1], &[1])
+            .unwrap()
+            .finish()
+            .is_err());
+    }
 
     /// The shipped defaults, pinned against the reference's `__init__`.
     #[test]
