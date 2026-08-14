@@ -328,6 +328,51 @@ pub fn assert_parity(got: &Array, want: &Array, tol: f32, what: &str) {
     );
 }
 
+/// **The materialization instrument** (sc-19452, shared by sc-19505). Whether MLX has already
+/// *materialized* this array — whether the compute that produces it has actually happened, rather
+/// than sitting in an unscheduled graph waiting for somebody to force it.
+///
+/// `_mlx_array_is_available` is mlx-c's accessor for `mlx::core::array::is_available()`: the status
+/// is `available`, or it is `evaluated` with the completion event signalled or absent. A
+/// **synchronous** `mlx_rs::transforms::eval` — the only kind this crate uses — attaches no event
+/// and marks its outputs `evaluated` before returning, so the reading is exact and clock-free. That
+/// is where the load-insensitivity comes from, and it is conditional: if a production `eval` here
+/// were ever switched to `async_eval`, this would become a race against the event signal and would
+/// have to `wait()` first. Anyone making that change has to revisit every caller of this function.
+///
+/// Two precision notes, because the obvious paraphrases are both wrong:
+///
+/// * it is **not** "`false` for anything an op returned". MLX short-circuits identity ops — a
+///   `reshape` to the same shape, a full-range `slice`, an `astype` to the same dtype — by
+///   returning the *input*, which keeps the input's status. A view defers no compute, so the
+///   reading stays semantically right, but the mechanism is not "every op yields unscheduled";
+/// * it is **not** a pure read. `is_available()` detaches the event and promotes the status on the
+///   shared descriptor, non-atomically. Harmless under this repo's forced `RUST_TEST_THREADS = 1`,
+///   but do not treat it as a race-free probe of an `Array` shared across threads.
+///
+/// mlx-rs exposes no safe wrapper, so the call goes through `mlx-sys` — the same binding crate
+/// `mlx_rs::Array` is built on, so [`Array::as_ptr`] hands back exactly the `mlx_array` this
+/// signature wants. Two obligations, not one: the handle must outlive the call, which the `&Array`
+/// borrow guarantees; and some mlx-rs op must already have run on this thread, because mlx-rs
+/// installs its error handler lazily inside its own wrappers and mlx-c's default handler is
+/// `exit(-1)` rather than a status return. Every caller must therefore read *after* it has built
+/// or loaded the arrays under test, which every current call site does.
+///
+/// # Why this lives here rather than in one test file
+///
+/// Two test binaries read it — `pipeline.rs` (sc-19452) and `joint_denoise.rs` (sc-19505) — and the
+/// preconditions above are subtle enough that a second copy of them would drift. `mod common;` is
+/// compiled into each binary, so there is one function and one set of caveats.
+pub fn is_materialized(array: &Array) -> bool {
+    let mut available = false;
+    let status = unsafe { mlx_sys::_mlx_array_is_available(&mut available, array.as_ptr()) };
+    assert_eq!(
+        status, 0,
+        "_mlx_array_is_available failed on a live array handle"
+    );
+    available
+}
+
 /// Standard deviation of a tensor — a golden whose expected output is ~constant proves nothing.
 pub fn std_dev(x: &Array) -> f32 {
     let x = x.as_dtype(mlx_rs::Dtype::Float32).unwrap();
