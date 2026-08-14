@@ -372,7 +372,13 @@ mod tests {
     fn every_registered_memory_strategy_rejects_cross_route_decode_geometry() {
         let registry = super::provider_registry().unwrap();
         gen_core_testkit::memory_contract_surface_registry_conformance(&registry);
-        assert_eq!(registry.memory_strategy_registrations().len(), 45);
+        assert_eq!(registry.memory_strategy_registrations().len(), 46);
+        assert_eq!(registry.memory_contract_fixture_registrations().len(), 45);
+        let resident_only: Vec<_> = registry
+            .resident_only_memory_contract_registrations()
+            .map(|registration| registration.provider_id)
+            .collect();
+        assert_eq!(resident_only, ["flux2_dev_control"]);
         let surfaces = registry.memory_contract_surfaces().unwrap();
         assert_eq!(surfaces.len(), 45 * 12);
         assert!(surfaces.iter().all(|surface| !surface.composed));

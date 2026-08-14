@@ -1348,7 +1348,7 @@ pub fn register_memory_contract_surfaces(
         .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
             surface_specs: gen_core::candle_memory_contract_surface_specs,
             provider_id: "qwen_image_edit",
-            contract: registered_qwen_edit_memory_contract,
+            contract: weights_free_qwen_edit_memory_contract,
         })
 }
 
@@ -1367,12 +1367,13 @@ fn registered_qwen_edit_memory_contract(
 fn weights_free_qwen_image_memory_contract(
     spec: &LoadSpec,
 ) -> gen_core::Result<gen_core::MemoryProviderContract> {
-    // Production validates whether a concrete source can serve an on-the-fly quant request. The
-    // registry surface names an already-provisioned numeric tier, so do not reinterpret Q4/Q8 as a
-    // request to quantize absent fixture weights.
-    let mut contract = memory_strategy::provider_contract("qwen_image_contract_surface", spec)?;
-    contract.provider_id = MODEL_ID.to_owned();
-    Ok(contract)
+    memory_strategy::weights_free_memory_strategy_contract(MODEL_ID, spec)
+}
+
+fn weights_free_qwen_edit_memory_contract(
+    spec: &LoadSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    memory_strategy::weights_free_memory_strategy_contract("qwen_image_edit", spec)
 }
 
 const QWEN_IMAGE_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {

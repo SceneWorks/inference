@@ -131,8 +131,8 @@ pub use registry::{
     MemoryBehaviorRegistration, MemoryContractFixtureRegistration, MemoryContractSurface,
     MemoryContractSurfaceSelector, MemoryContractSurfaceSpec, MemoryContractSurfaceTier,
     MemoryRegistration, ModelRegistration, PerComponentBytes, ProviderRegistry,
-    ProviderRegistryBuilder, TextEmbedderRegistration, TrainerRegistration,
-    TranscriberRegistration, TransformRegistration, VoiceEmbedderRegistration,
+    ProviderRegistryBuilder, ResidentOnlyMemoryContractRegistration, TextEmbedderRegistration,
+    TrainerRegistration, TranscriberRegistration, TransformRegistration, VoiceEmbedderRegistration,
 };
 pub use residency::{Residency, ResidencyRuntime, StagedHeavy};
 pub use runtime::{

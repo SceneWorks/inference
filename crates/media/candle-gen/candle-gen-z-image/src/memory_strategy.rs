@@ -75,7 +75,6 @@ fn single_file_tensor_bytes(path: &std::path::Path, component: &str) -> gen_core
     imported_tensor_headers_bytes(&headers, component, &path.display().to_string())
 }
 
-#[cfg(any(feature = "cuda", test))]
 fn imported_tensor_headers_bytes(
     headers: &[gen_core::weightsmeta::SafetensorsTensorHeader],
     component: &str,
@@ -98,7 +97,6 @@ fn imported_tensor_headers_bytes(
     Ok(bytes)
 }
 
-#[cfg(any(feature = "cuda", test))]
 fn materialized_text_encoder_headers_bytes(
     headers: &[gen_core::weightsmeta::SafetensorsTensorHeader],
 ) -> gen_core::Result<u64> {
@@ -162,7 +160,6 @@ fn materialized_text_encoder_headers_bytes(
     Ok(bytes)
 }
 
-#[cfg(any(feature = "cuda", test))]
 fn selected_encoder_has_authoritative_config(source: &WeightsSource) -> bool {
     match source {
         WeightsSource::File(path) => path
@@ -178,7 +175,6 @@ fn selected_encoder_has_authoritative_config(source: &WeightsSource) -> bool {
 /// executable encoder contract. `None` preserves the catalog's weights-free declaration seam for a
 /// path that has no authored config yet; any real, authored source is validated and projected from
 /// the precise 36-layer language surface rather than its raw shard inventory.
-#[cfg(any(feature = "cuda", test))]
 fn validated_materialized_text_encoder_bytes(
     source: &WeightsSource,
     comfyui_file: bool,
@@ -204,7 +200,6 @@ fn validated_materialized_text_encoder_bytes(
     materialized_text_encoder_headers_bytes(&headers).map(Some)
 }
 
-#[cfg(any(feature = "cuda", test))]
 fn combined_file_components(path: &std::path::Path) -> gen_core::Result<PerComponentBytes> {
     let mut components = PerComponentBytes::default();
     let mut mapped_text_encoder_headers = Vec::new();

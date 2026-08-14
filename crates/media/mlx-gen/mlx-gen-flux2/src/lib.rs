@@ -129,6 +129,13 @@ pub fn register_providers(
         })
         .register_generator(model_control::DEV_CONTROL_REGISTRATION)
         .register_memory_strategy(model_control::DEV_CONTROL_MEMORY_REGISTRATION)
+        .register_resident_only_memory_contract(
+            mlx_gen::gen_core::ResidentOnlyMemoryContractRegistration {
+                surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+                provider_id: FLUX2_DEV_CONTROL_ID,
+                contract: memory_strategy::registered_dev_control_contract,
+            },
+        )
 }
 
 /// Build the complete explicit MLX FLUX.2 provider catalog.

@@ -7,7 +7,10 @@ use crate::audio_transform::{AudioTransform, AudioTransformDescriptor, AudioTran
 use crate::caption::{Captioner, CaptionerDescriptor};
 use crate::generator::{ConditioningKind, Generator, Modality, ModelDescriptor};
 use crate::image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
-use crate::memory_strategy::{MemoryProviderContract, MemoryRunContext, MemorySafetyDecision};
+use crate::memory_strategy::{
+    MemoryProviderContract, MemoryRunContext, MemorySafetyDecision, MemoryStrategy,
+    MemoryStrategySupport,
+};
 use crate::runtime::{LoadSpec, Quant, WeightsSource};
 use crate::text_embed::{TextEmbedder, TextEmbedderDescriptor};
 use crate::train::{Trainer, TrainerDescriptor};
@@ -215,6 +218,18 @@ pub struct MemoryContractFixtureRegistration {
     /// availability changes with numeric tier, residency policy, or materialization shape.  The
     /// provider therefore owns an explicit finite witness set.  Catalog dumps and conformance walk
     /// every witness; they never substitute one convenient default spec.
+    pub surface_specs: fn() -> Vec<MemoryContractSurfaceSpec>,
+}
+
+/// Explicit, weights-free proof that a [`MemoryRegistration`] has no optimized contract surface.
+///
+/// Resident-only providers still participate in the reconciliation gate: they must publish this
+/// typed witness rather than disappearing from the inventory by omission. Every declared selector
+/// is constructed and checked to ensure all non-resident strategies remain [`MemoryStrategySupport::Missing`].
+#[derive(Clone, Copy)]
+pub struct ResidentOnlyMemoryContractRegistration {
+    pub provider_id: &'static str,
+    pub contract: fn(&LoadSpec) -> Result<MemoryProviderContract>,
     pub surface_specs: fn() -> Vec<MemoryContractSurfaceSpec>,
 }
 
@@ -570,6 +585,7 @@ pub struct ProviderRegistryBuilder {
     encoder_contract_routes: Vec<EncoderContractRouteRegistration>,
     memory_strategy: Vec<MemoryRegistration>,
     memory_contract_fixture: Vec<MemoryContractFixtureRegistration>,
+    resident_only_memory_contract: Vec<ResidentOnlyMemoryContractRegistration>,
     memory_behavior: Vec<MemoryBehaviorRegistration>,
     activation_memory: Vec<ActivationMemoryRegistration>,
     composed_memory_strategy_ids: Vec<&'static str>,
@@ -625,6 +641,11 @@ impl ProviderRegistryBuilder {
         register_memory_contract_fixture,
         memory_contract_fixture,
         MemoryContractFixtureRegistration
+    );
+    builder_registration_method!(
+        register_resident_only_memory_contract,
+        resident_only_memory_contract,
+        ResidentOnlyMemoryContractRegistration
     );
     builder_registration_method!(
         register_memory_behavior,
@@ -865,6 +886,31 @@ impl ProviderRegistryBuilder {
                     )));
                 }
             }
+            let mut resident_only_ids = std::collections::BTreeSet::new();
+            for registration in &self.resident_only_memory_contract {
+                if !resident_only_ids.insert(registration.provider_id) {
+                    return Err(Error::Msg(format!(
+                        "duplicate resident-only memory-contract witness provider id '{}'",
+                        registration.provider_id
+                    )));
+                }
+                if ids.contains(registration.provider_id) {
+                    return Err(Error::Msg(format!(
+                        "memory-strategy registration '{}' has both a contract-surface fixture and a resident-only witness",
+                        registration.provider_id
+                    )));
+                }
+                if !self
+                    .memory_strategy
+                    .iter()
+                    .any(|memory| memory.provider_id == registration.provider_id)
+                {
+                    return Err(Error::Msg(format!(
+                        "resident-only memory-contract witness '{}' has no matching memory strategy",
+                        registration.provider_id
+                    )));
+                }
+            }
         }
         {
             let mut ids = std::collections::BTreeSet::new();
@@ -933,6 +979,7 @@ impl ProviderRegistryBuilder {
             encoder_contract_routes: self.encoder_contract_routes.into_boxed_slice(),
             memory_strategy: self.memory_strategy.into_boxed_slice(),
             memory_contract_fixture: self.memory_contract_fixture.into_boxed_slice(),
+            resident_only_memory_contract: self.resident_only_memory_contract.into_boxed_slice(),
             memory_behavior: self.memory_behavior.into_boxed_slice(),
             activation_memory: self.activation_memory.into_boxed_slice(),
             composed_memory_strategy_ids: self.composed_memory_strategy_ids.into_boxed_slice(),
@@ -957,6 +1004,7 @@ pub struct ProviderRegistry {
     encoder_contract_routes: Box<[EncoderContractRouteRegistration]>,
     memory_strategy: Box<[MemoryRegistration]>,
     memory_contract_fixture: Box<[MemoryContractFixtureRegistration]>,
+    resident_only_memory_contract: Box<[ResidentOnlyMemoryContractRegistration]>,
     memory_behavior: Box<[MemoryBehaviorRegistration]>,
     activation_memory: Box<[ActivationMemoryRegistration]>,
     composed_memory_strategy_ids: Box<[&'static str]>,
@@ -1092,30 +1140,51 @@ impl ProviderRegistry {
         self.memory_contract_fixture.iter()
     }
 
+    pub fn resident_only_memory_contract_registrations(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &ResidentOnlyMemoryContractRegistration> {
+        self.resident_only_memory_contract.iter()
+    }
+
     /// Construct every provider-owned registry-load contract witness without opening weights.
     ///
     /// Coverage is fail-closed in both directions: each memory registration must have exactly one
-    /// paired fixture (builder validation already rejects duplicate/orphan fixtures), each fixture
-    /// must publish a non-empty unique selector set, and every selector must construct a contract
-    /// for the paired provider id. This is the inventory seam consumed by generated capability
-    /// dumps; it deliberately has no caller-supplied `LoadSpec`.
+    /// paired surface fixture or explicit resident-only witness (builder validation rejects overlap
+    /// and orphans). Every declaration must publish a non-empty unique selector set and construct a
+    /// contract for the paired provider id. Resident-only declarations are checked across the same
+    /// axes but omitted from the returned optimized-surface inventory. This is the seam consumed by
+    /// generated capability dumps; it deliberately has no caller-supplied `LoadSpec`.
     pub fn memory_contract_surfaces(&self) -> Result<Vec<MemoryContractSurface>> {
         let mut out = Vec::new();
         for registration in &self.memory_strategy {
             let fixture = self
                 .memory_contract_fixture
                 .iter()
-                .find(|fixture| fixture.provider_id == registration.provider_id)
-                .ok_or_else(|| {
-                    Error::Msg(format!(
-                        "memory-strategy registration '{}' has no weights-free contract-surface fixture",
+                .find(|fixture| fixture.provider_id == registration.provider_id);
+            let resident_only = self
+                .resident_only_memory_contract
+                .iter()
+                .find(|witness| witness.provider_id == registration.provider_id);
+            let (surface_specs, contract_factory, is_resident_only) = match (fixture, resident_only) {
+                (Some(fixture), None) => (fixture.surface_specs, fixture.contract, false),
+                (None, Some(witness)) => (witness.surface_specs, witness.contract, true),
+                (None, None) => {
+                    return Err(Error::Msg(format!(
+                        "memory-strategy registration '{}' has neither a weights-free contract-surface fixture nor a resident-only witness",
                         registration.provider_id
-                    ))
-                })?;
-            let surface_specs = (fixture.surface_specs)();
+                    )))
+                }
+                (Some(_), Some(_)) => {
+                    return Err(Error::Msg(format!(
+                        "memory-strategy registration '{}' has both a contract-surface fixture and a resident-only witness",
+                        registration.provider_id
+                    )))
+                }
+            };
+            let surface_specs = surface_specs();
             if surface_specs.is_empty() {
                 return Err(Error::Msg(format!(
-                    "memory-contract fixture '{}' publishes no surface selectors",
+                    "memory-contract witness '{}' publishes no surface selectors",
                     registration.provider_id
                 )));
             }
@@ -1123,32 +1192,57 @@ impl ProviderRegistry {
             for surface in surface_specs {
                 if !surface.selector.matches_spec(&surface.spec) {
                     return Err(Error::Msg(format!(
-                        "memory-contract fixture '{}' selector '{}' does not match its LoadSpec",
+                        "memory-contract witness '{}' selector '{}' does not match its LoadSpec",
                         registration.provider_id,
                         surface.selector.id()
                     )));
                 }
                 if !selectors.insert(surface.selector.id()) {
                     return Err(Error::Msg(format!(
-                        "memory-contract fixture '{}' repeats surface selector '{}'",
+                        "memory-contract witness '{}' repeats surface selector '{}'",
                         registration.provider_id,
                         surface.selector.id()
                     )));
                 }
-                let contract = (fixture.contract)(&surface.spec).map_err(|error| {
+                let contract = contract_factory(&surface.spec).map_err(|error| {
                     Error::Msg(format!(
-                        "memory-contract fixture '{}' failed surface '{}': {error}",
+                        "memory-contract witness '{}' failed surface '{}': {error}",
                         registration.provider_id,
                         surface.selector.id()
                     ))
                 })?;
                 if contract.provider_id != registration.provider_id {
                     return Err(Error::Msg(format!(
-                        "memory-contract fixture '{}' surface '{}' returned contract for '{}'",
+                        "memory-contract witness '{}' surface '{}' returned contract for '{}'",
                         registration.provider_id,
                         surface.selector.id(),
                         contract.provider_id
                     )));
+                }
+                if is_resident_only {
+                    let optimized = contract.strategies.iter().find(|capability| {
+                        capability.strategy != MemoryStrategy::Resident
+                            && capability.support != MemoryStrategySupport::Missing
+                    });
+                    if let Some(capability) = optimized {
+                        return Err(Error::Msg(format!(
+                            "resident-only memory-contract witness '{}' surface '{}' exposes {:?} as {:?}",
+                            registration.provider_id,
+                            surface.selector.id(),
+                            capability.strategy,
+                            capability.support
+                        )));
+                    }
+                    let errors = contract.conformance_errors();
+                    if !errors.is_empty() {
+                        return Err(Error::Msg(format!(
+                            "resident-only memory-contract witness '{}' surface '{}' is malformed: {}",
+                            registration.provider_id,
+                            surface.selector.id(),
+                            errors.join("; ")
+                        )));
+                    }
+                    continue;
                 }
                 out.push(MemoryContractSurface {
                     selector: surface.selector,
@@ -2519,6 +2613,24 @@ mod tests {
             surface_specs: mlx_memory_contract_surface_specs,
         };
 
+    const DUMMY_RESIDENT_ONLY_WITNESS: ResidentOnlyMemoryContractRegistration =
+        ResidentOnlyMemoryContractRegistration {
+            provider_id: "dummy_weights_free_route",
+            contract: weights_free_fixture_contract,
+            surface_specs: mlx_memory_contract_surface_specs,
+        };
+
+    fn false_resident_only_contract(spec: &LoadSpec) -> Result<MemoryProviderContract> {
+        let mut contract = weights_free_fixture_contract(spec)?;
+        contract
+            .strategies
+            .iter_mut()
+            .find(|capability| capability.strategy == MemoryStrategy::BoundedDecode)
+            .unwrap()
+            .support = MemoryStrategySupport::Implemented;
+        Ok(contract)
+    }
+
     fn empty_surface_specs() -> Vec<MemoryContractSurfaceSpec> {
         Vec::new()
     }
@@ -2605,7 +2717,9 @@ mod tests {
             .expect("a missing fixture must fail")
             .to_string();
         assert!(
-            missing.contains("no weights-free contract-surface fixture"),
+            missing.contains(
+                "neither a weights-free contract-surface fixture nor a resident-only witness"
+            ),
             "{missing}"
         );
 
@@ -2649,6 +2763,71 @@ mod tests {
         assert!(
             wrong_provider.contains("returned contract for 'wrong_provider'"),
             "{wrong_provider}"
+        );
+    }
+
+    #[test]
+    fn resident_only_witnesses_are_explicit_excluded_and_mutation_checked() {
+        let orphan = ProviderRegistryBuilder::new()
+            .register_resident_only_memory_contract(DUMMY_RESIDENT_ONLY_WITNESS)
+            .build()
+            .err()
+            .expect("a resident-only witness must pair with a memory strategy")
+            .to_string();
+        assert!(
+            orphan.contains("has no matching memory strategy"),
+            "{orphan}"
+        );
+
+        let registry = ProviderRegistryBuilder::new()
+            .register_composed_memory_strategy(DUMMY_WEIGHTS_FREE_MEMORY_REGISTRATION)
+            .register_resident_only_memory_contract(DUMMY_RESIDENT_ONLY_WITNESS)
+            .build()
+            .unwrap();
+        assert_eq!(
+            registry.resident_only_memory_contract_registrations().len(),
+            1
+        );
+        assert!(registry.memory_contract_surfaces().unwrap().is_empty());
+
+        let overlap = ProviderRegistryBuilder::new()
+            .register_composed_memory_strategy(DUMMY_WEIGHTS_FREE_MEMORY_REGISTRATION)
+            .register_memory_contract_fixture(DUMMY_WEIGHTS_FREE_CONTRACT_FIXTURE)
+            .register_resident_only_memory_contract(DUMMY_RESIDENT_ONLY_WITNESS)
+            .build()
+            .err()
+            .expect("a route cannot be both enumerated and resident-only")
+            .to_string();
+        assert!(overlap.contains("has both a contract-surface fixture and a resident-only witness"));
+
+        let duplicate = ProviderRegistryBuilder::new()
+            .register_composed_memory_strategy(DUMMY_WEIGHTS_FREE_MEMORY_REGISTRATION)
+            .register_resident_only_memory_contract(DUMMY_RESIDENT_ONLY_WITNESS)
+            .register_resident_only_memory_contract(DUMMY_RESIDENT_ONLY_WITNESS)
+            .build()
+            .err()
+            .expect("resident-only witnesses must be unique")
+            .to_string();
+        assert!(
+            duplicate.contains("duplicate resident-only memory-contract witness provider id"),
+            "{duplicate}"
+        );
+
+        let mutated = ProviderRegistryBuilder::new()
+            .register_composed_memory_strategy(DUMMY_WEIGHTS_FREE_MEMORY_REGISTRATION)
+            .register_resident_only_memory_contract(ResidentOnlyMemoryContractRegistration {
+                contract: false_resident_only_contract,
+                ..DUMMY_RESIDENT_ONLY_WITNESS
+            })
+            .build()
+            .unwrap()
+            .memory_contract_surfaces()
+            .err()
+            .expect("an optimized rung cannot hide behind a resident-only witness")
+            .to_string();
+        assert!(
+            mutated.contains("exposes BoundedDecode as Implemented"),
+            "{mutated}"
         );
     }
 
