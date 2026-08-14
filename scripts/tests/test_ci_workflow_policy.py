@@ -2107,13 +2107,35 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             )
 
         # bash-only: the Windows lane is `cmd`, where the equivalent is `|| exit /b 1` per call.
+        #
+        # The predicate is the step's SCRIPT, not its NAME. This counted steps named `- name: Run `
+        # as a proxy for "steps that run cargo", and the proxy left a hole of exactly the class the
+        # guard exists to close: a cargo step named anything else, added with a run-count assertion
+        # but no `set -o pipefail`, moved NEITHER side of that equality and shipped green. Without
+        # `pipefail` a piped cargo's exit status is `tee`'s rather than cargo's, which is how a lane
+        # reports ok having tested nothing.
+        #
+        # The population is selected from the parsed steps by the same predicate the assertion
+        # checks, so there is no literal to drift when a step is added, renamed or removed -- and
+        # the emptiness check is what keeps a predicate that stops matching from passing vacuously.
         mlx = "\n".join(bodies["mlx-minimax-h3"])
-        self.assertEqual(
-            mlx.count("set -o pipefail"),
-            len([line for line in mlx.splitlines() if line.strip().startswith("- name: Run ")]),
-            "mlx-minimax-h3: every step that runs cargo test needs its own `set -o pipefail`, or "
-            "`| tee /dev/stderr` swallows cargo's exit status",
+        mlx_cargo_steps = [
+            step
+            for step in yaml.safe_load(workflow)["jobs"]["mlx-minimax-h3"]["steps"]
+            if "cargo test " in (step.get("run") or "")
+        ]
+        self.assertTrue(
+            mlx_cargo_steps,
+            "mlx-minimax-h3: no step runs `cargo test`, so this guard is asserting nothing",
         )
+        for step in mlx_cargo_steps:
+            with self.subTest(step=step.get("name")):
+                self.assertIn(
+                    "set -o pipefail",
+                    step["run"],
+                    f"mlx-minimax-h3: step {step.get('name')!r} runs cargo test without its own "
+                    "`set -o pipefail`, so `| tee /dev/stderr` swallows cargo's exit status",
+                )
         # The sc-18740 gate runs LAST and behind its own fail-closed check, so an operator who has
         # not staged the reference artifact still gets the other eight verdicts first.
         self.assertLess(

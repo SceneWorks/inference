@@ -2800,8 +2800,23 @@ jobs:
   # MEASURED ON nax-macos 2026-08-13, release profile, warm weights: all nine invocations below
   # total ~3.0 s of test time (the five header/config gates ~0.1 s, the three decodes 0.74 + 0.35 +
   # 0.11 s, the parity gate 0.30 s). MLX mmaps and materializes per tensor, so "load the 9.7 GB VAE"
-  # is 22 ms. The budget below is therefore ENTIRELY cold build (5m36s for the mlx-gen tree measured
-  # here) plus a possible 11.640 GB first transfer — not test time.
+  # is 22 ms. The `timeout-minutes` below is therefore ENTIRELY cold build (5m36s for the mlx-gen
+  # tree measured here) plus a possible 11.640 GB first transfer — not test time.
+  #
+  # TIME IS NOT THE ONLY BUDGET, and this block recorded only the time one. The largest memory
+  # consumer here is the LAST step, not the decodes: the sc-18740 parity gate builds the video VAE
+  # at `Dtype::Float32` — deliberately, to keep the comparison about layout rather than about bf16
+  # rounding — so it holds ~19.4 GB of parameters (the 9.7 GB bf16 `vae/` materialized at f32; the
+  # test's own note rounds that to ~20 GB) against ~10 GB for the three bf16 decode smokes and
+  # ~0.6 GB for the audio one. That is a figure DECLARED by the crate and derivable from the
+  # component size, not one measured on either runner.
+  #
+  # It matters because `rw-mage` is registered on BOTH Macs (below) and this lane has never run on
+  # either. The only host figure this repository carries for `nax-macos-2` is the ~101 GiB in
+  # `scripts/ci/s18_memory_preflight.py`, and that was inferred from `active+wired` sampling during
+  # an S18 sweep rather than read off the box — and it is a physical-RAM-shaped number, which is not
+  # the Metal working-set budget. `Record the macOS device inventory` below prints both, labelled
+  # separately, so this lane's first run retires the constant instead of leaving it as an errand.
   #
   # `rw-mage` rather than a new label: a label no runner carries does not fail, it queues silently
   # until the run is cancelled (see this file's header), and `rw-mage` is registered on BOTH Macs.
@@ -2861,6 +2876,47 @@ jobs:
         run: >-
           scripts/ci/report_runner_disk_headroom.sh
           MINIMAX_H3_SNAPSHOT MINIMAX_H3_VIDEO_VAE_REFERENCE
+      # Report-only, and it exists to RETIRE an unmeasured constant rather than leave it as a human
+      # errand — the same job `Record the CUDA device inventory` does for the Windows lane below,
+      # in the shape that step uses: a presence guard, `continue-on-error: true`, and no assertion
+      # of any kind. The step above measures DISK; this one measures the other axis. `rw-mage` is on
+      # both Macs, this lane's parity gate holds ~20 GB at f32, and the only host figure this
+      # repository carries for `nax-macos-2` is a ~101 GiB number inferred from sampling in
+      # `scripts/ci/s18_memory_preflight.py`. One run puts a real one in the log, for ~1 s.
+      #
+      # THE TWO NUMBERS ARE DIFFERENT QUANTITIES and neither is derivable from the other, so both
+      # are printed and both are labelled. `hw.memsize` is physical RAM. Metal's
+      # `recommendedMaxWorkingSetSize` is the per-device working-set budget the driver advertises,
+      # and it is the one an MLX allocation is actually sized against — on `nax-macos` (Mac17,6)
+      # they read 128.00 GiB and 107.52 GiB respectively, measured on the box 2026-08-13. Sizing a
+      # Metal workload against the RAM figure overstates the budget by ~20 GiB on that box alone.
+      #
+      # `swift` because there is no sysctl for the Metal figure: it comes from `MTLDevice`, and
+      # `system_profiler SPDisplaysDataType` (used by the SA3 lanes here) does not report it. A
+      # runner without the toolchain prints the RAM half and says so rather than failing.
+      - name: Record the macOS device inventory
+        continue-on-error: true
+        run: |
+          sysctl -n hw.model hw.memsize | awk '
+            NR == 1 { print "host.hw_model=" $0 }
+            NR == 2 { printf "host.hw_memsize=%.2f GiB (%s bytes, physical RAM)\n", $0 / 1073741824, $0 }'
+          if ! command -v swift > /dev/null 2>&1; then
+            echo "metal.recommendedMaxWorkingSetSize=<not captured — swift is not on this runner's PATH>"
+            exit 0
+          fi
+          swift - <<'SWIFT'
+          import Foundation
+          import Metal
+
+          if let device = MTLCreateSystemDefaultDevice() {
+              let bytes = device.recommendedMaxWorkingSetSize
+              print("metal.device=\(device.name)")
+              print(String(format: "metal.recommendedMaxWorkingSetSize=%.2f GiB (%llu bytes, NOT hw.memsize)",
+                           Double(bytes) / 1073741824.0, bytes))
+          } else {
+              print("metal.recommendedMaxWorkingSetSize=<not captured — no default Metal device>")
+          }
+          SWIFT
       # Fetches the 11.640 GB `download_files` slice of the 196 GB repository, never the whole thing;
       # see the `minimax-h3` row in release/real-weight-models.toml for the per-component breakdown
       # and for which two components are deliberately left out.
@@ -2892,8 +2948,10 @@ jobs:
           run_one published_audio_configs_reproduce_the_declared_geometry
           run_one te_layer_50_tap_is_exhaustive_and_the_tail_is_trimmable
           run_one real_tokenizer_resolves_the_minimax_special_tokens
-      # The decodes. ~10 GB resident for the video VAE and ~0.6 GB for the audio one on MLX — an order
-      # of magnitude under the f32 candle figures in the crate docs, because MLX loads bf16 lazily.
+      # The decodes. ~10 GB resident for the video VAE and ~0.6 GB for the audio one on MLX — well
+      # under the f32 candle figures in the crate docs, because these load the checkpoint's own bf16
+      # lazily. That is true of THESE THREE only: the parity gate below is f32 and is this lane's
+      # memory peak, so this is not the step to size the runner against.
       - name: Run MiniMax-H3 VAE decode smokes
         run: |
           set -o pipefail
@@ -2935,6 +2993,17 @@ jobs:
             echo "MINIMAX_H3_VIDEO_VAE_REFERENCE names no non-empty file on this runner: $MINIMAX_H3_VIDEO_VAE_REFERENCE" >&2
             exit 1
           fi
+      # THIS LANE'S MEMORY PEAK, and the reason the job header carries a memory budget at all. The
+      # test builds the VAE at `Dtype::Float32` (`tests/real_weights.rs`, the `f32 to keep the
+      # comparison about layout rather than about bf16 rounding` line) rather than at the
+      # checkpoint's bf16, so it is ~19.4 GB of parameters — the 9.7 GB bf16 `vae/` materialized at
+      # f32, which the test's own note rounds to ~20 GB — where the three smokes above are ~10 GB.
+      # Casting it down would be cheaper and would also delete the gate: at bf16 the residual this
+      # compares against diffusers is dominated by rounding rather than by layout.
+      #
+      # DECLARED, not measured on a runner: `Record the macOS device inventory` above is what puts a
+      # real capacity for the box that claimed this job in the log, and `hw.memsize` and the Metal
+      # working-set budget are reported there as the two separate numbers they are.
       - name: Run MiniMax-H3 video VAE parity against official diffusers
         run: |
           set -o pipefail
