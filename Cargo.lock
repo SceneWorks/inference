@@ -2435,6 +2435,7 @@ dependencies = [
  "mlx-gen",
  "mlx-gen-boogu",
  "pmetal-mlx-rs",
+ "pmetal-mlx-sys",
  "sceneworks-gen-core-testkit",
  "serde_json",
  "tempfile",
