@@ -539,8 +539,10 @@ pub struct RenderedLatents {
 /// without it the unpatchify — and, if the caller chains it, the decode — would be deferred to the
 /// caller's first host readback, which sits **outside** every cancel check. `denoise_av` already
 /// forces each step for the same reason; this closes the same hole for the tail.
-/// `tests/pipeline.rs::the_render_core_keeps_its_compute_inside_the_cancel_checked_region` measures
-/// the fraction rather than asserting the property, and its mutation arm removes this `eval`.
+/// `tests/pipeline.rs::the_render_core_keeps_its_compute_inside_the_cancel_checked_region` gates it
+/// **directly** — it reads back whether the returned latents are materialized, rather than timing
+/// the call against the caller's readback as it once did (sc-19452: that ratio moved with host
+/// load, and deleting this very line left it passing at 97.8%).
 #[allow(clippy::too_many_arguments)]
 pub fn render_latents(
     model: &mut dyn JointVelocity,
