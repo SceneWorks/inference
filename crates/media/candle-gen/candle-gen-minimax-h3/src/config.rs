@@ -443,6 +443,22 @@ impl MiniMaxH3VaeConfig {
                 "minimax-h3 vae: downsample factors must be positive".into(),
             ));
         }
+        // **Only 1 and 2 are expressible spatially.** The strided downsampler is a kernel-3 conv
+        // with no spatial padding, preceded by an asymmetric bottom/right pad of exactly 1 — which
+        // makes the output `ceil(size / 2)` for a stride of 2 and is applied for **that stride
+        // alone** (`DownBlock3d::pads_bottom_right`, mirroring the reference's own
+        // `if self.spatial_stride == 2`). A stride of 3 or more needs a different pad, and without
+        // it the conv silently CROPS instead of compressing. A validator that admits a factor the
+        // forward pass mishandles is how silent wrongness gets in, so reject it here rather than
+        // let it load (sc-19008 review). The temporal factor has no such cap: its front-only pad
+        // of 2 against a kernel of 3 yields `ceil(frames / stride)` at any stride.
+        if let Some(&bad) = self.spatial_downsample_factors.iter().find(|&&f| f > 2) {
+            return Err(CandleError::Msg(format!(
+                "minimax-h3 vae: spatial downsample factor {bad} is not expressible — the \
+                 encoder's asymmetric bottom/right pad of 1 only produces ceil(size / 2), so only \
+                 factors 1 and 2 compress rather than crop"
+            )));
+        }
         let spatial: usize = self.spatial_downsample_factors.iter().product();
         let temporal: usize = self.temporal_downsample_factors.iter().product();
         if spatial != self.patch_size || temporal != self.patch_size_t {
@@ -684,6 +700,69 @@ mod tests {
         let mut c = base;
         c.norm_num_groups = 0;
         assert!(c.validate_encoder().is_err(), "zero groups");
+    }
+
+    /// A spatial factor above 2 must be **rejected**, not loaded and silently cropped.
+    ///
+    /// `DownBlock3d`'s asymmetric bottom/right pad is applied for `spatial == 2` alone, so a level
+    /// with a spatial factor of 4 would load, skip the pad, and have its kernel-3 stride-4 conv
+    /// crop instead of compress. Before sc-19008's review the validator accepted **any** positive
+    /// factor, which is an asymmetry between what it admits and what the forward pass handles.
+    ///
+    /// The mutation deliberately keeps the spatial cumprod at the shipped 16 (`[4, 2, 2, 1, 1, 1]`
+    /// rather than the shipped `[2, 2, 2, 2, 1, 1]`) so it still satisfies the compression-vs-patch
+    /// guard: a config that tripped *that* check instead would prove nothing about this one. The
+    /// error text is asserted for the same reason.
+    #[test]
+    fn validate_encoder_rejects_a_spatial_factor_the_pad_cannot_express() {
+        let base = MiniMaxH3VaeConfig::default();
+        base.validate_encoder().unwrap();
+        let shipped: usize = base.spatial_downsample_factors.iter().product();
+
+        let mut c = base.clone();
+        c.spatial_downsample_factors = vec![4, 2, 2, 1, 1, 1];
+        let mutated: usize = c.spatial_downsample_factors.iter().product();
+        assert_eq!(
+            mutated, shipped,
+            "the mutation must leave the cumprod at the shipped {shipped}x, or the \
+             compression-vs-patch guard is what rejects it"
+        );
+        assert_eq!(
+            c.spatial_downsample_factors.len(),
+            base.spatial_downsample_factors.len(),
+            "the mutation must not also make the per-level lists ragged"
+        );
+        let err = c
+            .validate_encoder()
+            .expect_err("a spatial factor of 4 is not expressible")
+            .to_string();
+        assert!(
+            err.contains("spatial downsample factor 4"),
+            "the rejection must name the offending factor, got: {err}"
+        );
+        assert!(
+            err.contains("crop"),
+            "the rejection must say what goes wrong, got: {err}"
+        );
+
+        // 3 is rejected for the same reason — the cap is "> 2", not "!= 4".
+        let mut c = base.clone();
+        c.spatial_downsample_factors = vec![3, 2, 2, 1, 1, 1];
+        c.patch_size = 12;
+        assert!(
+            c.validate_encoder().is_err(),
+            "an odd spatial factor above 2 is equally inexpressible"
+        );
+
+        // And the cap is SPATIAL only: the temporal front-pad of 2 against a kernel of 3 gives
+        // `ceil(frames / stride)` at any stride, so a temporal 4 must still be accepted. Without
+        // this arm, a validator that rejected every factor above 2 on both axes would pass the
+        // assertions above while forbidding a config the forward pass handles correctly.
+        let mut c = base;
+        c.temporal_downsample_factors = vec![4, 2, 1, 1, 1, 1];
+        c.patch_size_t = 8;
+        c.validate_encoder()
+            .expect("a temporal factor of 4 is expressible and must not be rejected");
     }
 
     /// A `vae/config.json` that omits an encoder key is an error, not a silently-defaulted

@@ -41,14 +41,35 @@ const VAE_ENCODE_TENSORS: usize = 118;
 
 /// Peak-relative bound for the real-weight encode against the official diffusers implementation.
 ///
-/// Both sides run f32 over the same published bytes, so this is a round-off comparison over a
-/// 12-resnet conv stack — but the reference is torch and this is candle, with different reduction
-/// orders in every convolution, so it cannot be held to the committed fixture suite's 1e-5. `2e-2`
-/// is the house value for a real-weight cross-implementation comparison in this crate (the decode
-/// sibling uses the same), and every defect class this epic has actually shipped — the sc-18740
+/// **Derived from this arm's own measured floor, not inherited.** Both sides run f32 over the same
+/// published bytes, so this is a round-off comparison over a 12-resnet conv stack — but the
+/// reference is torch and this is candle, with different reduction orders in every convolution, so
+/// it cannot be held to the committed fixture suite's 1e-5 either. Measured worst across the three
+/// probes on the CPU lane:
+///
+/// | probe | mean | std |
+/// |---|---|---|
+/// | `keyframe` (1 frame, tiled at 320 px) | 1.355e-5 | 5.690e-6 |
+/// | `clip` (17 frames, untiled) | 6.949e-6 | 1.137e-5 |
+/// | `multiclip` (20 frames, padded to 2 clips) | 4.899e-6 | **1.730e-5** |
+///
+/// so the floor is **1.730e-5**, and this bound is ~11.6x it. That is deliberately looser than the
+/// ~7x [`TOL`] takes over the fixture lane's floor, for one stated reason: those numbers were
+/// measured **here, on the CPU lane**, and this arm also runs on the `--features cuda` Windows
+/// runner (sc-18677), whose reduction orders differ again and whose own floor has not been
+/// measured. The headroom covers a device change; it is not a claim about one.
+///
+/// What it is *not* is the 2e-2 house value it replaced (sc-19008 review): that sat 1155x above the
+/// measurement and so stated a convention in the voice of a derivation. The band between the two is
+/// not hypothetical — a 1e-3 relative drift injected into the encoder output measures 1.862e-3,
+/// which **passes** at 2e-2 and fails here. If the CUDA lane ever lands above this, the fix is to
+/// re-derive from a measurement taken there, not to restore a convention.
+///
+/// Every defect class this epic has actually shipped is still orders clear either way: the sc-18740
 /// half-swap at 0.86-0.99, a symmetric downsampler pad at 1.8, a global GroupNorm at 1.6, an
-/// untiled encode at ~5e-1 — is one to two orders clear of it.
-const REAL_WEIGHT_ENCODE_TOL: f32 = 2e-2;
+/// interleaved-vs-contiguous GroupNorm grouping at 1.1, an untiled encode at ~5e-1, a front pad at
+/// 6.9e-1, and a first-frame-instead-of-last repeat at 2.8e-1.
+const REAL_WEIGHT_ENCODE_TOL: f32 = 2e-4;
 /// Total tensors in the published `audio_vae/` component (encode + decode).
 const AUDIO_TENSOR_COUNT: usize = 1087;
 /// Of those, the decode half this crate ports.
@@ -492,6 +513,27 @@ fn real_weight_decode_matches_the_official_diffusers_vae() {
 /// keyframe golden is 320 px, so the reference genuinely tiled it, and the tiled result differs
 /// from an untiled one by far more than this bound.
 ///
+/// The three probes cover three different paths, and the third exists because the other two — and
+/// every committed fixture, all of which are 1, 5 or exactly 17 frames — leave it dark:
+///
+/// | probe | frames | what only it reaches |
+/// |---|---|---|
+/// | `keyframe` | 1 | the single-frame short circuit, and the 256/64 spatial tiling at 320 px |
+/// | `clip` | 17 | the temporal strides and the `token_drop` tail trim, untiled |
+/// | `multiclip` | 20 | the **frame-repeat pad** to a multiple of `clip_length` and the clip-by-clip concatenation |
+///
+/// 20 is deliberately ragged: it pads by 14 to 34 = 2 clips. A front pad, a zero pad, or a
+/// `token_drop` applied per-clip instead of once at the tail all yield the identical *shape*, so
+/// the shape assertions below cannot separate them and only the reference values can (sc-19008
+/// review).
+///
+/// **20 rather than any other ragged count**, because `token_drop` otherwise hides the pad: it
+/// keeps only the first 2 of the final clip's 5 latent frames, which reach back over 5 clip-local
+/// pixels, so a final clip with more than 5 real frames pads entirely inside the dropped tail. At
+/// 25 frames, repeating the *first* frame instead of the last leaves the encode **bit-identical** —
+/// measured, not reasoned. The assertion below derives the condition from the shipped config so it
+/// cannot silently stop holding.
+///
 /// Generate the reference with the MLX lane's `tools/dump_minimax_h3_video_vae_encode_real.py`
 /// (a few MB, deliberately not committed) and point `MINIMAX_H3_VIDEO_VAE_ENCODE_REFERENCE` at it.
 /// Like every test in this file it **asserts** rather than skipping, so a missing reference cannot
@@ -543,7 +585,7 @@ fn real_weight_encode_matches_the_official_diffusers_vae() {
     assert_eq!(cfg.block_out_channels, vec![128, 256, 256, 512, 512, 1024]);
 
     let mut worst = 0.0f32;
-    for name in ["keyframe", "clip"] {
+    for name in ["keyframe", "clip", "multiclip"] {
         let pixels = reference
             .tensor(&format!("in.{name}.pixels"))
             .to_device(&dev)
@@ -595,6 +637,47 @@ fn real_weight_encode_matches_the_official_diffusers_vae() {
     // weights, not only in the fixture.
     assert_eq!(reference.shape("out.keyframe.mean")[2], 1);
     assert!(reference.shape("out.clip.mean")[2] > 1);
+
+    // The multiclip probe has to actually be ragged, or the two branches it exists to gate are
+    // never entered and the comparison above is a third copy of the `clip` probe. Both facts are
+    // read off the reference and the shipped config rather than restated as literals.
+    let clip_length = usize::try_from(cfg.clip_length).expect("a positive clip_length");
+    let frames = reference.shape("in.multiclip.pixels")[2];
+    assert!(
+        !frames.is_multiple_of(clip_length),
+        "the multiclip probe is {frames} frames, a whole number of {clip_length}-frame clips; it \
+         never reaches the frame-repeat pad"
+    );
+    let clips = frames.div_ceil(clip_length);
+    assert!(
+        clips > 1,
+        "the multiclip probe pads to {clips} clip(s); it never reaches the clip-by-clip \
+         concatenation"
+    );
+    // `clips` chunks of `ceil(clip_length / patch_size_t)` latent frames, `token_drop` removed ONCE
+    // at the tail. A per-clip drop, or a concat that kept only the last chunk, lands elsewhere.
+    let per_clip = clip_length.div_ceil(cfg.patch_size_t);
+    let drop = usize::try_from(cfg.token_drop).expect("a non-negative token_drop");
+    // **And the repeated frames must be observable.** `token_drop` removes all but the first
+    // `per_clip - drop` latent frames of the final clip, and those reach back over clip-local
+    // pixels `0 ..= (per_clip - drop - 1) * patch_size_t` only. A ragged count whose final clip
+    // carries more real frames than that pads *entirely inside the dropped tail*: measured, at 25
+    // frames repeating the FIRST frame instead of the LAST leaves the encode bit-identical, so a
+    // 25-frame probe would gate the pad's position but not its content. 20 leaves 3.
+    let pad_reach = (per_clip - drop - 1) * cfg.patch_size_t;
+    let tail_real = frames % clip_length;
+    assert!(
+        tail_real <= pad_reach,
+        "the multiclip probe leaves {tail_real} real frames in its final clip, past the \
+         {pad_reach}-pixel reach of the latents that survive token_drop; every repeated frame \
+         would be dropped and the probe could not tell a last-frame repeat from any other"
+    );
+    assert_eq!(
+        reference.shape("out.multiclip.mean")[2],
+        clips * per_clip - drop,
+        "a {frames}-frame encode is {clips} clips of {per_clip} latent frames less the {drop} \
+         dropped once at the tail"
+    );
     println!(
         "real-weight encode: worst peak-relative {worst:.3e} (bound {REAL_WEIGHT_ENCODE_TOL:.0e})"
     );

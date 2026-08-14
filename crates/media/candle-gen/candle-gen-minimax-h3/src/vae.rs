@@ -235,8 +235,11 @@ impl MiniMaxH3VideoVae {
     /// Load **only the decode half** from a snapshot root.
     ///
     /// The 116-tensor conv encoder never lands on the device, which is what a decode-only caller
-    /// (video output, the sc-17154 smokes) wants — the encode half is ~0.4 GB at f32 and pure
-    /// waste there. `encode` on the result reports a typed error naming the missing half.
+    /// (video output, the sc-17154 smokes) wants — the encode half is **180,337,888 parameters,
+    /// 0.67 GiB / 0.72 GB at f32**, and pure waste there. That is the sum over the published shard
+    /// headers of the 116 `encoder.*` plus 2 `quant_conv.*` tensors, all of which ship F32; the
+    /// remaining 585 decode tensors are 9.03 GiB of the component's 9.70 GiB. `encode` on the
+    /// result reports a typed error naming the missing half.
     pub fn load_decode_only(root: impl AsRef<Path>, device: &Device, dtype: DType) -> Result<Self> {
         let dir = root.as_ref().join("vae");
         let config_path = dir.join("config.json");
@@ -369,7 +372,14 @@ impl MiniMaxH3VideoVae {
     /// keyframe.
     ///
     /// Longer inputs are padded up to a multiple of `clip_length` by **repeating the last frame**,
-    /// encoded clip by clip, and have `token_drop` trailing latent frames removed.
+    /// encoded clip by clip, and have `token_drop` trailing latent frames removed — once, at the
+    /// tail of the concatenation, not per clip.
+    ///
+    /// The pad and the multi-clip concatenation are gated by the `multiclip` probe of
+    /// `real_weight_encode_matches_the_official_diffusers_vae` (25 frames, deliberately ragged).
+    /// Every committed fixture is 1, 5 or exactly 17 frames and reaches neither, and a front pad, a
+    /// zero pad or a per-clip `token_drop` all give the identical output *shape* — so only a
+    /// reference from the official implementation separates them (sc-19008 review).
     pub fn encode(&self, pixels: &Tensor) -> Result<DiagonalGaussian> {
         self.encode_half()?;
         let s = pixels.dims().to_vec();

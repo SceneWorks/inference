@@ -529,6 +529,12 @@ pub struct DownBlock3d {
     resnets: Vec<ResnetBlock3d>,
     downsampler: Option<CausalConv3d>,
     /// Whether the downsampler is preceded by the asymmetric bottom/right pad.
+    ///
+    /// True for a spatial factor of exactly 2 — the reference's own condition is likewise
+    /// `if self.spatial_stride == 2`. **Only 1 and 2 are expressible here:** the pad is a literal
+    /// 1, which makes a kernel-3 stride-2 conv produce `ceil(size / 2)`, and a factor of 3 or more
+    /// would take the `false` arm and crop. `MiniMaxH3VaeConfig::validate_encoder` rejects those
+    /// rather than leave the mismatch to be discovered as a wrong latent shape (sc-19008 review).
     pads_bottom_right: bool,
 }
 

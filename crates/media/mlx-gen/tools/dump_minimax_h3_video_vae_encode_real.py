@@ -17,6 +17,10 @@ the *same published bytes* can gate that.
 It is also the only way to exercise the shipped 256/64 **spatial tiling** on the real stack: the
 committed fixture has to shrink the tile geometry to stay committable.
 
+Three probes, each for a path the other two leave dark: a tiled single frame (``keyframe``), one
+whole ``clip_length`` (``clip``), and a **ragged** frame count (``multiclip``) that is the only one
+to reach the frame-repeat pad and the clip-by-clip concatenation.
+
 The output is a few MB and is deliberately **not** committed: point the Rust test at it with
 ``MINIMAX_H3_VIDEO_VAE_ENCODE_REFERENCE``. Keep it outside the repository.
 
@@ -57,6 +61,31 @@ KEYFRAME_HW = 320
 CLIP_FRAMES = 17
 CLIP_HW = 128
 
+# The MULTICLIP probe (sc-19008 review) — DELIBERATELY not a multiple of `clip_length`, so the
+# reference has to run the two paths that 1 / 5 / 17 frames all leave dark:
+#
+#   * the pad-up-to-a-multiple-of-`clip_length`-by-repeating-the-LAST-frame branch, and
+#   * the clip-by-clip encode and `dim=2` concatenation of more than one chunk.
+#
+# 20 frames pads by 14 to 34 = 2 x 17. Neither branch changes the output *shape*: a front pad, a
+# zero pad, or a per-clip `token_drop` all produce exactly the same geometry, so only a reference
+# from the official implementation separates them.
+#
+# **Why 20 and not any other ragged count.** `token_drop` removes 3 latent frames from the tail, so
+# only the first `tokens_chunk_size - token_drop` = 2 latent frames of the final clip survive, and
+# those reach back over clip-local pixels `0 .. (2 - 1) * 4 = 4` only. If the final clip carries
+# more than 5 real frames, every repeated frame sits beyond that reach and the repeat's *content*
+# is unobservable — measured, not assumed: at 25 frames, repeating the FIRST frame instead of the
+# LAST leaves the encode bit-identical. The probe therefore needs
+# `MULTICLIP_FRAMES % clip_length <= (tokens_chunk_size - token_drop - 1) * temporal_ratio`, which
+# 20 satisfies (3 real trailing frames, pads from index 3) and 25 does not. Asserted below from the
+# loaded config rather than restated as a literal.
+#
+# Kept at 64 px — untiled, and the smallest canvas that still runs all four spatial downsamples
+# (64 / 16 = 4) — because this probe is about the temporal seam, not the spatial one.
+MULTICLIP_FRAMES = 20
+MULTICLIP_HW = 64
+
 
 def main() -> None:
     ap = argparse.ArgumentParser()
@@ -84,8 +113,29 @@ def main() -> None:
     assert CLIP_HW <= vae.tile_sample_min_height, (
         f"{CLIP_HW}px would tile; the clip reference is meant to isolate the temporal path"
     )
+    assert MULTICLIP_HW <= vae.tile_sample_min_height, (
+        f"{MULTICLIP_HW}px would tile; the multiclip reference is meant to isolate the temporal seam"
+    )
+    tail_real = MULTICLIP_FRAMES % vae.config.clip_length
+    assert tail_real != 0, (
+        f"{MULTICLIP_FRAMES} is a whole number of {vae.config.clip_length}-frame clips; the "
+        "multiclip reference would never reach the frame-repeat pad"
+    )
+    assert MULTICLIP_FRAMES // vae.config.clip_length >= 1, (
+        f"{MULTICLIP_FRAMES} frames pads to a SINGLE clip; the multiclip reference would never "
+        "reach the clip-by-clip concatenation"
+    )
     ratio = vae.spatial_compression_ratio
     ratio_t = vae.temporal_compression_ratio
+    # The repeated frames must land where a SURVIVING latent can see them — see the note on
+    # MULTICLIP_FRAMES. Derived from the config, so a config change breaks this rather than
+    # silently producing a reference that cannot tell one repeat from another.
+    pad_reach = (vae.tokens_chunk_size - vae.config.token_drop - 1) * ratio_t
+    assert 0 < tail_real <= pad_reach, (
+        f"{MULTICLIP_FRAMES} frames leaves {tail_real} real frames in the final clip, past the "
+        f"{pad_reach}-pixel reach of the latents that survive token_drop; the repeated frames "
+        "would be invisible and the reference could not tell a last-frame repeat from any other"
+    )
     print(
         f"vae: {ratio}x spatial / {ratio_t}x temporal, tiling {vae.tile_sample_min_height}px "
         f"/ {vae.tile_sample_min_overlap_height}px overlap"
@@ -121,6 +171,20 @@ def main() -> None:
     clip = torch.randn(1, 3, CLIP_FRAMES, CLIP_HW, CLIP_HW, generator=generator)
     encode("clip", clip)
     assert tensors["out.clip.mean"].shape[2] > 1, "the clip golden must keep a temporal axis"
+
+    # (c) the frame-repeat pad and the multi-clip concatenation — a ragged frame count.
+    multiclip = torch.randn(1, 3, MULTICLIP_FRAMES, MULTICLIP_HW, MULTICLIP_HW, generator=generator)
+    encode("multiclip", multiclip)
+    clips = -(-MULTICLIP_FRAMES // vae.config.clip_length)
+    want_t = clips * vae.tokens_chunk_size - vae.config.token_drop
+    assert tensors["out.multiclip.mean"].shape[2] == want_t, (
+        f"a {MULTICLIP_FRAMES}-frame encode must pad to {clips} clips and yield {want_t} latent "
+        f"frames, got {tensors['out.multiclip.mean'].shape[2]}"
+    )
+    assert tensors["out.multiclip.mean"].shape[2] > tensors["out.clip.mean"].shape[2], (
+        "the multiclip golden must carry MORE latent frames than one clip, or the concatenation "
+        "it exists to gate is not in the output"
+    )
 
     meta = {
         "provenance": "converted-checkpoint",
