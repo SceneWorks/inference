@@ -750,6 +750,71 @@ mod tests {
         assert!(msg.contains("LoRA/LoKr"), "{msg}");
     }
 
+    /// **A `ref2va` request is REFUSED on the RENDER PATH, not merely absent from the descriptor.**
+    ///
+    /// `the_descriptor_advertises_only_the_ported_surface` asserts the three reference kinds are
+    /// missing from the allowlist — but a missing entry is a DECLARATION, and this crate has already
+    /// been bitten once by assuming a declaration gates anything (`supports_lora` gates nothing at
+    /// all, which is why [`load`] carries an explicit check). This exercises the actual seam:
+    /// `Generator::validate`, which `generate_impl` calls on every render, must turn a reference
+    /// request into a typed `Unsupported` that NAMES the kind.
+    #[test]
+    fn a_ref2va_request_is_refused_on_the_render_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = staged_root(&tmp);
+        let generator = load(&LoadSpec::new(WeightsSource::Dir(root))).unwrap();
+
+        let base = GenerationRequest {
+            prompt: "a cellist on a rooftop".into(),
+            width: 1344,
+            height: 768,
+            ..Default::default()
+        };
+        // Control: the same request without reference conditioning passes validation, so the
+        // refusal below is attributable to the conditioning and not to some other floor check.
+        generator
+            .validate(&base)
+            .expect("the bare request must validate — otherwise the refusal proves nothing");
+
+        for kind in [
+            candle_gen::gen_core::Conditioning::Reference {
+                image: Image {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0, 0, 0],
+                },
+                strength: Some(1.0),
+            },
+            candle_gen::gen_core::Conditioning::ReferenceVideo {
+                frames: vec![Image {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0, 0, 0],
+                }],
+                fps: 24.0,
+                audio: None,
+            },
+        ] {
+            let named = format!("{:?}", kind.kind());
+            let req = GenerationRequest {
+                conditioning: vec![kind],
+                ..base.clone()
+            };
+            let err = generator
+                .validate(&req)
+                .expect_err("a ref2va request must be refused");
+            assert!(
+                matches!(err, candle_gen::gen_core::Error::Unsupported(_)),
+                "{named}: must be a typed Unsupported, got {err:?}"
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&named),
+                "the refusal must NAME the kind so a caller knows what to drop: {msg}"
+            );
+        }
+    }
+
     /// **A tier request is REFUSED, not silently rendered dense.**
     ///
     /// `supported_quants: &[]` is likewise enforced nowhere in gen-core. Mutating this guard away
