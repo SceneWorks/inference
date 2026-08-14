@@ -31,8 +31,8 @@ mod common;
 use std::collections::HashMap;
 
 use common::{
-    audio_fixture_config, dit_fixture_config, fixture_config, to_nlc, AUDIO_FIXTURE, DIT_FIXTURE,
-    FIXTURE,
+    audio_fixture_config, dit_fixture_config, encode_fixture_config, encode_fixture_tiles,
+    fixture_config, to_nlc, AUDIO_FIXTURE, DIT_FIXTURE, ENCODE_FIXTURE, FIXTURE,
 };
 
 use mlx_rs::{Array, Dtype};
@@ -161,6 +161,43 @@ fn record_mlx_decode_for_the_candle_cross_backend_gate() {
                 .unwrap(),
         ));
     }
+
+    // ---- video ENCODE (sc-19008) --------------------------------------------------------------
+    // A separate fixture with its own geometry — see `common::ENCODE_FIXTURE` for why the encode
+    // half cannot share the decode goldens'. All five records go through `MiniMaxH3VideoVae`, so
+    // the candle twin is held against this lane's own tiling, causal padding, frame-isolated
+    // GroupNorm and posterior clamp rather than only against the shared reference.
+    let ef = Weights::from_file(ENCODE_FIXTURE).unwrap();
+    let ecfg = encode_fixture_config(3);
+    let (etile, eoverlap) = encode_fixture_tiles(&ef);
+    let mut ew = model_weights(ENCODE_FIXTURE, &["src.", "in.", "out.", "const."]);
+    let evae = MiniMaxH3VideoVae::from_weights(&mut ew, &ecfg, Dtype::Float32).unwrap();
+    assert!(
+        evae.can_encode(),
+        "the encode fixture must carry `encoder.*` / `quant_conv.*`"
+    );
+    let eclip = ef.require("in.encode_clip.pixels").unwrap();
+    // A tile wider than the canvas degenerates to a single span — that IS the untiled path.
+    record.push((
+        "video.encode.params".into(),
+        evae.encode_clip_tiled(eclip, 4096, 64).unwrap(),
+    ));
+    record.push((
+        "video.encode_tiled.params".into(),
+        evae.encode_clip_tiled(eclip, etile, eoverlap).unwrap(),
+    ));
+    let keyframe = evae
+        .encode(ef.require("in.encode_single.pixels").unwrap())
+        .unwrap();
+    record.push(("video.encode_single.mean".into(), keyframe.mean().clone()));
+    record.push(("video.encode_single.std".into(), keyframe.std().clone()));
+    record.push((
+        "video.encode_chunked.mean".into(),
+        evae.encode(ef.require("in.encode_chunked.pixels").unwrap())
+            .unwrap()
+            .mean()
+            .clone(),
+    ));
 
     // ---- audio ------------------------------------------------------------------------------
     let af = Weights::from_file(AUDIO_FIXTURE).unwrap();
@@ -378,8 +415,12 @@ fn record_mlx_decode_for_the_candle_cross_backend_gate() {
     let mut metadata: HashMap<String, String> = HashMap::new();
     metadata.insert("backend".into(), "mlx".into());
     metadata.insert("dtype".into(), "float32".into());
-    metadata.insert("story".into(), "sc-17154, sc-17155".into());
+    metadata.insert("story".into(), "sc-17154, sc-17155, sc-19008".into());
     metadata.insert("video_fixture_fnv1a64".into(), digest(FIXTURE));
+    metadata.insert(
+        "video_encode_fixture_fnv1a64".into(),
+        digest(ENCODE_FIXTURE),
+    );
     metadata.insert("audio_fixture_fnv1a64".into(), digest(AUDIO_FIXTURE));
     metadata.insert("dit_fixture_fnv1a64".into(), digest(DIT_FIXTURE));
     metadata.insert("denoise_fixture_fnv1a64".into(), digest(DENOISE_FIXTURE));

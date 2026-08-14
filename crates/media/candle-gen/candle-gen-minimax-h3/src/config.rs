@@ -52,6 +52,22 @@ pub const DECODER_ROPE_DIM_RATIO: f32 = 0.75;
 /// `eps` for the decoder's RMSNorms and its output LayerNorm (`decoder_norm_eps`).
 pub const DECODER_NORM_EPS: f64 = 1e-5;
 
+/// Encoded pixel channels.
+pub const ENCODER_IN_CHANNELS: usize = 3;
+/// Channels each encoder down-block emits (`block_out_channels`).
+pub const ENCODER_BLOCK_OUT_CHANNELS: [usize; 6] = [128, 256, 256, 512, 512, 1024];
+/// Residual blocks per encoder down-block (`layers_per_block`).
+pub const ENCODER_LAYERS_PER_BLOCK: usize = 2;
+/// Per-level spatial stride. Their product is [`VAE_RATIO`]; levels 4 and 5 have **no**
+/// downsampler, which is why the product is not `2^len`.
+pub const ENCODER_SPATIAL_DOWNSAMPLE_FACTORS: [usize; 6] = [2, 2, 2, 2, 1, 1];
+/// Per-level temporal stride. Their product is [`VAE_RATIO_T`].
+pub const ENCODER_TEMPORAL_DOWNSAMPLE_FACTORS: [usize; 6] = [1, 2, 2, 1, 1, 1];
+/// Groups in every encoder `GroupNorm`.
+pub const ENCODER_NORM_NUM_GROUPS: usize = 32;
+/// The encoder's norm epsilon — **1e-6**, not the decoder's 1e-5.
+pub const ENCODER_NORM_EPS: f64 = 1e-6;
+
 /// Per-channel latent de-normalization mean (`latents_mean`, 24 entries).
 pub const LATENTS_MEAN: [f32; LATENT_CHANNELS] = [
     0.858_090_34,
@@ -144,6 +160,28 @@ pub struct MiniMaxH3VaeConfig {
     pub latents_mean: Vec<f32>,
     /// Per-channel de-normalization standard deviation.
     pub latents_std: Vec<f32>,
+
+    // --- the CNN encoder half (sc-19008) -----------------------------------------------------
+    // The decoder is a 36-layer ViT and needs none of these; the encoder is a 3-D causal CNN and
+    // needs all of them. `patch_size` / `patch_size_t` above are the *products* of the two factor
+    // lists, which is all the decoder ever wanted — the per-level lists are kept separately
+    // because the encoder's shape at level `i` depends on the individual factors, not the product.
+    /// Encoded pixel channels — 3.
+    pub in_channels: usize,
+    /// Channels each down-block emits. `len()` is the number of levels.
+    pub block_out_channels: Vec<usize>,
+    /// Residual blocks per down-block.
+    pub layers_per_block: usize,
+    /// Per-level spatial stride. A level with factor 1 has **no** downsampler at all.
+    pub spatial_downsample_factors: Vec<usize>,
+    /// Per-level temporal stride, applied by the same downsampler conv.
+    pub temporal_downsample_factors: Vec<usize>,
+    /// Groups in every encoder `GroupNorm` — 32.
+    pub norm_num_groups: usize,
+    /// The **encoder's** norm epsilon, 1e-6. Distinct from [`Self::norm_eps`], which is the
+    /// decoder's 1e-5; `vae/config.json` ships both (`norm_eps` and `decoder_norm_eps`) and using
+    /// one for the other is a silent numeric change.
+    pub encoder_norm_eps: f64,
 }
 
 impl Default for MiniMaxH3VaeConfig {
@@ -166,6 +204,13 @@ impl Default for MiniMaxH3VaeConfig {
             token_drop: TOKEN_DROP,
             latents_mean: LATENTS_MEAN.to_vec(),
             latents_std: LATENTS_STD.to_vec(),
+            in_channels: ENCODER_IN_CHANNELS,
+            block_out_channels: ENCODER_BLOCK_OUT_CHANNELS.to_vec(),
+            layers_per_block: ENCODER_LAYERS_PER_BLOCK,
+            spatial_downsample_factors: ENCODER_SPATIAL_DOWNSAMPLE_FACTORS.to_vec(),
+            temporal_downsample_factors: ENCODER_TEMPORAL_DOWNSAMPLE_FACTORS.to_vec(),
+            norm_num_groups: ENCODER_NORM_NUM_GROUPS,
+            encoder_norm_eps: ENCODER_NORM_EPS,
         }
     }
 }
@@ -230,24 +275,24 @@ impl MiniMaxH3VaeConfig {
                 })
                 .collect()
         };
-        let prod = |key: &str| -> Result<usize> {
+        let vec_usize = |key: &str| -> Result<Vec<usize>> {
             let arr = v
                 .get(key)
                 .and_then(serde_json::Value::as_array)
                 .ok_or_else(|| {
                     CandleError::Msg(format!("minimax-h3 vae/config.json: missing {key}"))
                 })?;
-            let mut acc: usize = 1;
-            for e in arr {
-                let f = e.as_u64().ok_or_else(|| {
-                    CandleError::Msg(format!(
-                        "minimax-h3 vae/config.json: non-positive-integer in {key}"
-                    ))
-                })?;
-                acc *= f as usize;
-            }
-            Ok(acc)
+            arr.iter()
+                .map(|e| {
+                    e.as_u64().map(|f| f as usize).ok_or_else(|| {
+                        CandleError::Msg(format!(
+                            "minimax-h3 vae/config.json: non-positive-integer in {key}"
+                        ))
+                    })
+                })
+                .collect()
         };
+        let prod = |key: &str| -> Result<usize> { Ok(vec_usize(key)?.iter().product()) };
 
         let cfg = Self {
             latent_channels: usize_of("latent_channels")?,
@@ -266,6 +311,14 @@ impl MiniMaxH3VaeConfig {
             token_drop: num("token_drop")? as i32,
             latents_mean: vec_f32("latents_mean")?,
             latents_std: vec_f32("latents_std")?,
+            in_channels: usize_of("in_channels")?,
+            block_out_channels: vec_usize("block_out_channels")?,
+            layers_per_block: usize_of("layers_per_block")?,
+            spatial_downsample_factors: vec_usize("spatial_downsample_factors")?,
+            temporal_downsample_factors: vec_usize("temporal_downsample_factors")?,
+            norm_num_groups: usize_of("norm_num_groups")?,
+            // `norm_eps` is the ENCODER's; the decoder's ships separately as `decoder_norm_eps`.
+            encoder_norm_eps: num("norm_eps")?,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -304,6 +357,121 @@ impl MiniMaxH3VaeConfig {
         if self.token_drop < 0 {
             return Err(CandleError::Msg(
                 "minimax-h3 vae: token_drop must be >= 0".into(),
+            ));
+        }
+        self.validate_encoder()
+    }
+
+    /// Levels in the CNN encoder.
+    pub fn num_encoder_levels(&self) -> usize {
+        self.block_out_channels.len()
+    }
+
+    /// Input channels of encoder level `i` — `block_out_channels[i - 1]`, and
+    /// `block_out_channels[0]` at level 0 (`conv_in` already lifts 3 → 128).
+    pub fn encoder_level_in_channels(&self, level: usize) -> usize {
+        if level == 0 {
+            self.block_out_channels[0]
+        } else {
+            self.block_out_channels[level - 1]
+        }
+    }
+
+    /// Whether level `i` carries a `downsamplers.0`.
+    ///
+    /// The reference's condition is `temporal_factor · spatial_factor > 1` — **the product**, not
+    /// the spatial factor alone. Levels 4 and 5 of the shipped config are `1 · 1` and have no
+    /// downsampler module at all, so a loader that emits `downsamplers.0.conv.*` names for them
+    /// asks for tensors the checkpoint does not have. A hypothetical temporal-only level
+    /// (`spatial 1`, `temporal 2`) does carry one, which is why the spatial factor alone is the
+    /// wrong predicate.
+    pub fn encoder_level_has_downsampler(&self, level: usize) -> bool {
+        self.temporal_downsample_factors[level] * self.spatial_downsample_factors[level] > 1
+    }
+
+    /// Reject encoder configs the CNN half cannot express.
+    ///
+    /// The two factor lists' products **must** equal [`Self::patch_size`] / [`Self::patch_size_t`],
+    /// which the decoder already depends on: the encoder's compression and the decoder's patch are
+    /// the same two numbers, and a config in which they disagree produces latents the decoder
+    /// silently reshapes into the wrong geometry.
+    pub fn validate_encoder(&self) -> Result<()> {
+        let levels = self.num_encoder_levels();
+        if levels == 0 {
+            return Err(CandleError::Msg(
+                "minimax-h3 vae: the encoder needs at least one level".into(),
+            ));
+        }
+        if self.spatial_downsample_factors.len() != levels
+            || self.temporal_downsample_factors.len() != levels
+        {
+            return Err(CandleError::Msg(format!(
+                "minimax-h3 vae: {levels} block_out_channels but {}/{} spatial/temporal \
+                 downsample factors — the three lists are per-level and must agree",
+                self.spatial_downsample_factors.len(),
+                self.temporal_downsample_factors.len()
+            )));
+        }
+        if self.in_channels == 0 || self.layers_per_block == 0 {
+            return Err(CandleError::Msg(
+                "minimax-h3 vae: in_channels and layers_per_block must be positive".into(),
+            ));
+        }
+        if self.norm_num_groups == 0 {
+            return Err(CandleError::Msg(
+                "minimax-h3 vae: norm_num_groups must be positive".into(),
+            ));
+        }
+        if let Some(bad) = self
+            .block_out_channels
+            .iter()
+            .find(|&&c| c == 0 || !c.is_multiple_of(self.norm_num_groups))
+        {
+            return Err(CandleError::Msg(format!(
+                "minimax-h3 vae: encoder channel width {bad} must be a positive multiple of the \
+                 {} GroupNorm groups",
+                self.norm_num_groups
+            )));
+        }
+        if self
+            .spatial_downsample_factors
+            .iter()
+            .chain(&self.temporal_downsample_factors)
+            .any(|&f| f == 0)
+        {
+            return Err(CandleError::Msg(
+                "minimax-h3 vae: downsample factors must be positive".into(),
+            ));
+        }
+        // **Only 1 and 2 are expressible spatially.** The strided downsampler is a kernel-3 conv
+        // with no spatial padding, preceded by an asymmetric bottom/right pad of exactly 1 — which
+        // makes the output `ceil(size / 2)` for a stride of 2 and is applied for **that stride
+        // alone** (`DownBlock3d::pads_bottom_right`, mirroring the reference's own
+        // `if self.spatial_stride == 2`). A stride of 3 or more needs a different pad, and without
+        // it the conv silently CROPS instead of compressing. A validator that admits a factor the
+        // forward pass mishandles is how silent wrongness gets in, so reject it here rather than
+        // let it load (sc-19008 review). The temporal factor has no such cap: its front-only pad
+        // of 2 against a kernel of 3 yields `ceil(frames / stride)` at any stride.
+        if let Some(&bad) = self.spatial_downsample_factors.iter().find(|&&f| f > 2) {
+            return Err(CandleError::Msg(format!(
+                "minimax-h3 vae: spatial downsample factor {bad} is not expressible — the \
+                 encoder's asymmetric bottom/right pad of 1 only produces ceil(size / 2), so only \
+                 factors 1 and 2 compress rather than crop"
+            )));
+        }
+        let spatial: usize = self.spatial_downsample_factors.iter().product();
+        let temporal: usize = self.temporal_downsample_factors.iter().product();
+        if spatial != self.patch_size || temporal != self.patch_size_t {
+            return Err(CandleError::Msg(format!(
+                "minimax-h3 vae: the encoder compresses {spatial}x spatially and {temporal}x \
+                 temporally, but the decoder patch is {}x / {}x — encode and decode must be \
+                 inverse geometries",
+                self.patch_size, self.patch_size_t
+            )));
+        }
+        if self.encoder_norm_eps <= 0.0 {
+            return Err(CandleError::Msg(
+                "minimax-h3 vae: encoder_norm_eps must be positive".into(),
             ));
         }
         Ok(())
@@ -382,6 +550,8 @@ mod tests {
             "decoder_ffn_mult": 4, "decoder_rope_theta": 100.0,
             "decoder_rope_dim_ratio": 0.75, "decoder_norm_eps": 1e-05,
             "clip_length": 17, "token_drop": 3,
+            "in_channels": 3, "block_out_channels": [128,256,256,512,512,1024],
+            "layers_per_block": 2, "norm_num_groups": 32, "norm_eps": 1e-06,
             "latents_mean": [0.858090341091156,-0.9606591463088989,1.0661640167236328,-0.5090325474739075,-0.2727581858634949,-1.3675414323806763,-0.2553254961967468,-0.26907554268836975,-0.5376840829849243,-0.0464097298681736,0.6657370328903198,0.19690127670764923,-0.5460608005523682,-0.4035342037677765,-0.23683024942874908,0.25928452610969543,-0.30133944749832153,0.211341992020607,-1.1206848621368408,0.3581933379173279,-0.04225143790245056,0.2604829967021942,0.22864092886447906,0.7056031823158264],
             "latents_std": [1.2223774194717407,1.2767263650894165,1.6831774711608887,1.7549455165863037,1.5636216402053833,2.194143533706665,0.9653137922286987,1.0569885969161987,0.841948926448822,0.7729952931404114,1.8955937623977661,0.946841835975647,0.7996809482574463,0.44988900423049927,0.7197399735450745,0.6936293244361877,2.961095094680786,2.7694199085235596,3.0496184825897217,2.1088054180145264,3.276226282119751,3.1627357006073,2.2816812992095947,2.6127843856811523]
         }"#;
@@ -416,5 +586,220 @@ mod tests {
     fn a_malformed_config_is_an_error_not_a_default() {
         assert!(MiniMaxH3VaeConfig::from_diffusers_json("{").is_err());
         assert!(MiniMaxH3VaeConfig::from_diffusers_json("{}").is_err());
+    }
+
+    /// AC (sc-19008): the shipped encoder geometry, and the two facts about it a port is most
+    /// likely to get wrong — the encoder's epsilon is **not** the decoder's, and the downsampler
+    /// predicate is the **product** of the two factors.
+    #[test]
+    fn shipped_encoder_geometry_is_pinned() {
+        let cfg = MiniMaxH3VaeConfig::default();
+        assert_eq!(cfg.num_encoder_levels(), 6);
+        assert_eq!(cfg.block_out_channels, vec![128, 256, 256, 512, 512, 1024]);
+        assert_eq!(cfg.layers_per_block, 2);
+        assert_eq!(cfg.in_channels, 3);
+        assert_eq!(cfg.norm_num_groups, 32);
+        // The encoder's eps is 1e-6 and the decoder's is 1e-5. Using one for the other is a silent
+        // numeric change that no shape or key-mapping proof can see.
+        assert_eq!(cfg.encoder_norm_eps, 1e-6);
+        assert_eq!(cfg.norm_eps, 1e-5);
+        assert_ne!(cfg.encoder_norm_eps, cfg.norm_eps);
+
+        // Level 0 takes `block_out_channels[0]` because `conv_in` already lifted 3 -> 128.
+        assert_eq!(cfg.encoder_level_in_channels(0), 128);
+        for level in 1..6 {
+            assert_eq!(
+                cfg.encoder_level_in_channels(level),
+                cfg.block_out_channels[level - 1]
+            );
+        }
+        // Downsamplers on 0..4, none on 4 and 5 (both factors 1).
+        for level in 0..4 {
+            assert!(cfg.encoder_level_has_downsampler(level), "level {level}");
+        }
+        for level in [4, 5] {
+            assert!(!cfg.encoder_level_has_downsampler(level), "level {level}");
+        }
+    }
+
+    /// The downsampler predicate is `temporal · spatial > 1`, **not** `spatial > 1`. A
+    /// temporal-only level really does carry a downsampler, so the two predicates are genuinely
+    /// different and only one of them matches the checkpoint.
+    #[test]
+    fn a_temporal_only_level_still_carries_a_downsampler() {
+        let cfg = MiniMaxH3VaeConfig {
+            block_out_channels: vec![32, 32],
+            spatial_downsample_factors: vec![1, 1],
+            temporal_downsample_factors: vec![2, 1],
+            patch_size: 1,
+            patch_size_t: 2,
+            norm_num_groups: 32,
+            layers_per_block: 1,
+            ..Default::default()
+        };
+        cfg.validate_encoder().unwrap();
+        assert!(
+            cfg.encoder_level_has_downsampler(0),
+            "spatial 1 / temporal 2 downsamples in time and MUST declare its conv"
+        );
+        assert!(!cfg.encoder_level_has_downsampler(1));
+    }
+
+    /// Each encoder guard, mutated **individually** — mutating the set would only prove the set.
+    #[test]
+    fn validate_encoder_rejects_each_inconsistency_on_its_own() {
+        let base = MiniMaxH3VaeConfig::default();
+        base.validate_encoder().unwrap();
+
+        // Per-level lists that disagree in length.
+        let mut c = base.clone();
+        c.spatial_downsample_factors.pop();
+        assert!(c.validate_encoder().is_err(), "ragged spatial factors");
+
+        let mut c = base.clone();
+        c.temporal_downsample_factors.pop();
+        assert!(c.validate_encoder().is_err(), "ragged temporal factors");
+
+        // A width that is not a multiple of the GroupNorm groups cannot be normalized.
+        let mut c = base.clone();
+        c.block_out_channels[2] = 130;
+        assert!(c.validate_encoder().is_err(), "width vs groups");
+
+        // The encoder's compression must be the decoder's patch, or the two halves are not
+        // inverse geometries.
+        let mut c = base.clone();
+        c.spatial_downsample_factors[4] = 2;
+        assert!(c.validate_encoder().is_err(), "spatial cumprod vs patch");
+
+        let mut c = base.clone();
+        c.temporal_downsample_factors[4] = 2;
+        assert!(c.validate_encoder().is_err(), "temporal cumprod vs patch");
+
+        let mut c = base.clone();
+        c.encoder_norm_eps = 0.0;
+        assert!(c.validate_encoder().is_err(), "non-positive eps");
+
+        let mut c = base.clone();
+        c.layers_per_block = 0;
+        assert!(c.validate_encoder().is_err(), "zero layers per block");
+
+        let mut c = base.clone();
+        c.in_channels = 0;
+        assert!(c.validate_encoder().is_err(), "zero input channels");
+
+        let mut c = base.clone();
+        c.block_out_channels.clear();
+        c.spatial_downsample_factors.clear();
+        c.temporal_downsample_factors.clear();
+        assert!(c.validate_encoder().is_err(), "no levels at all");
+
+        let mut c = base.clone();
+        c.spatial_downsample_factors[0] = 0;
+        assert!(c.validate_encoder().is_err(), "zero downsample factor");
+
+        let mut c = base;
+        c.norm_num_groups = 0;
+        assert!(c.validate_encoder().is_err(), "zero groups");
+    }
+
+    /// A spatial factor above 2 must be **rejected**, not loaded and silently cropped.
+    ///
+    /// `DownBlock3d`'s asymmetric bottom/right pad is applied for `spatial == 2` alone, so a level
+    /// with a spatial factor of 4 would load, skip the pad, and have its kernel-3 stride-4 conv
+    /// crop instead of compress. Before sc-19008's review the validator accepted **any** positive
+    /// factor, which is an asymmetry between what it admits and what the forward pass handles.
+    ///
+    /// The mutation deliberately keeps the spatial cumprod at the shipped 16 (`[4, 2, 2, 1, 1, 1]`
+    /// rather than the shipped `[2, 2, 2, 2, 1, 1]`) so it still satisfies the compression-vs-patch
+    /// guard: a config that tripped *that* check instead would prove nothing about this one. The
+    /// error text is asserted for the same reason.
+    #[test]
+    fn validate_encoder_rejects_a_spatial_factor_the_pad_cannot_express() {
+        let base = MiniMaxH3VaeConfig::default();
+        base.validate_encoder().unwrap();
+        let shipped: usize = base.spatial_downsample_factors.iter().product();
+
+        let mut c = base.clone();
+        c.spatial_downsample_factors = vec![4, 2, 2, 1, 1, 1];
+        let mutated: usize = c.spatial_downsample_factors.iter().product();
+        assert_eq!(
+            mutated, shipped,
+            "the mutation must leave the cumprod at the shipped {shipped}x, or the \
+             compression-vs-patch guard is what rejects it"
+        );
+        assert_eq!(
+            c.spatial_downsample_factors.len(),
+            base.spatial_downsample_factors.len(),
+            "the mutation must not also make the per-level lists ragged"
+        );
+        let err = c
+            .validate_encoder()
+            .expect_err("a spatial factor of 4 is not expressible")
+            .to_string();
+        assert!(
+            err.contains("spatial downsample factor 4"),
+            "the rejection must name the offending factor, got: {err}"
+        );
+        assert!(
+            err.contains("crop"),
+            "the rejection must say what goes wrong, got: {err}"
+        );
+
+        // 3 is rejected for the same reason — the cap is "> 2", not "!= 4".
+        let mut c = base.clone();
+        c.spatial_downsample_factors = vec![3, 2, 2, 1, 1, 1];
+        c.patch_size = 12;
+        assert!(
+            c.validate_encoder().is_err(),
+            "an odd spatial factor above 2 is equally inexpressible"
+        );
+
+        // And the cap is SPATIAL only: the temporal front-pad of 2 against a kernel of 3 gives
+        // `ceil(frames / stride)` at any stride, so a temporal 4 must still be accepted. Without
+        // this arm, a validator that rejected every factor above 2 on both axes would pass the
+        // assertions above while forbidding a config the forward pass handles correctly.
+        let mut c = base;
+        c.temporal_downsample_factors = vec![4, 2, 1, 1, 1, 1];
+        c.patch_size_t = 8;
+        c.validate_encoder()
+            .expect("a temporal factor of 4 is expressible and must not be rejected");
+    }
+
+    /// A `vae/config.json` that omits an encoder key is an error, not a silently-defaulted
+    /// encoder. This is the class the epic has been bitten by: a config key with no tensor behind
+    /// it loads cleanly and is wrong.
+    #[test]
+    fn a_config_missing_an_encoder_key_is_rejected() {
+        let full = r#"{
+            "latent_channels": 24, "out_channels": 3,
+            "spatial_downsample_factors": [2,2,2,2,1,1],
+            "temporal_downsample_factors": [1,2,2,1,1,1],
+            "decoder_num_layers": 36, "decoder_num_attention_heads": 32,
+            "decoder_attention_head_dim": 64, "decoder_num_register_tokens": 4,
+            "decoder_ffn_mult": 4, "decoder_rope_theta": 100.0,
+            "decoder_rope_dim_ratio": 0.75, "decoder_norm_eps": 1e-05,
+            "clip_length": 17, "token_drop": 3,
+            "in_channels": 3, "block_out_channels": [128,256,256,512,512,1024],
+            "layers_per_block": 2, "norm_num_groups": 32, "norm_eps": 1e-06,
+            "latents_mean": [0.858090341091156,-0.9606591463088989,1.0661640167236328,-0.5090325474739075,-0.2727581858634949,-1.3675414323806763,-0.2553254961967468,-0.26907554268836975,-0.5376840829849243,-0.0464097298681736,0.6657370328903198,0.19690127670764923,-0.5460608005523682,-0.4035342037677765,-0.23683024942874908,0.25928452610969543,-0.30133944749832153,0.211341992020607,-1.1206848621368408,0.3581933379173279,-0.04225143790245056,0.2604829967021942,0.22864092886447906,0.7056031823158264],
+            "latents_std": [1.2223774194717407,1.2767263650894165,1.6831774711608887,1.7549455165863037,1.5636216402053833,2.194143533706665,0.9653137922286987,1.0569885969161987,0.841948926448822,0.7729952931404114,1.8955937623977661,0.946841835975647,0.7996809482574463,0.44988900423049927,0.7197399735450745,0.6936293244361877,2.961095094680786,2.7694199085235596,3.0496184825897217,2.1088054180145264,3.276226282119751,3.1627357006073,2.2816812992095947,2.6127843856811523]
+        }"#;
+        assert!(MiniMaxH3VaeConfig::from_diffusers_json(full).is_ok());
+        for key in [
+            "\"in_channels\": 3,",
+            "\"layers_per_block\": 2,",
+            "\"norm_num_groups\": 32,",
+            "\"norm_eps\": 1e-06,",
+        ] {
+            let without = full.replace(key, "");
+            assert_ne!(without, full, "the probe must actually remove `{key}`");
+            let err = MiniMaxH3VaeConfig::from_diffusers_json(&without)
+                .expect_err(&format!("dropping {key} must be an error"))
+                .to_string();
+            assert!(err.contains("missing"), "unexpected error for {key}: {err}");
+        }
+        // `block_out_channels` is a list, so drop it separately.
+        let without = full.replace("\"block_out_channels\": [128,256,256,512,512,1024],", "");
+        assert!(MiniMaxH3VaeConfig::from_diffusers_json(&without).is_err());
     }
 }

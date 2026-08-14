@@ -9,14 +9,20 @@
 //! `.safetensors`, and cross-backend agreement is inferred as the sum of two independent residuals.
 //!
 //! This file does that *and* one thing stronger. `fixtures_are_byte_identical_to_the_mlx_lanes`
-//! pins the shared-golden half over all four goldens. Then
+//! pins the shared-golden half over all five goldens. Then
 //! `mlx-gen-minimax-h3/tests/cross_backend_record.rs` — an `#[ignore]`d generator run on Metal —
 //! records the MLX lane's **own** decode/forward/denoise of those goldens into
 //! `tests/fixtures/mlx_cross_backend.safetensors`, and the tests below compare this port's tensors
 //! against MLX's directly. So the headline number is measured, not bounded.
 //!
-//! Coverage is the two VAEs (sc-17154) plus the DiT, the MM-RoPE tables, the token refiner, the
-//! whole-model velocity and the joint denoise loop (sc-17155) — 20 recorded tensors.
+//! Coverage is the two VAEs' decode halves (sc-17154), the DiT, the MM-RoPE tables, the token
+//! refiner, the whole-model velocity and the joint denoise loop (sc-17155), and the video VAE's
+//! **encode** half (sc-19008) — 25 recorded tensors.
+//!
+//! The encode half is the strongest of the video comparisons, because the two ports do not share a
+//! tensor layout there: MLX runs the causal CNN in NDHWC through `mlx_gen::nn::conv3d`, this port
+//! runs it in NCTHW through a `kt`-tap `conv2d` decomposition (candle ships no `conv3d`). Measured
+//! at **8.8e-4** worst — inside the same Metal-set floor as everything else here.
 //!
 //! # The tolerance, the floor, and what the floor is made of
 //!
@@ -76,8 +82,9 @@
 mod common;
 
 use common::{
-    audio_fixture_config, cosine, dit_fixture_config, fixture_config, l2_norm, rel, weights,
-    Golden, AUDIO_FIXTURE, DENOISE_FIXTURE, DIT_FIXTURE, FIXTURE, MLX_FIXTURE_DIR, MLX_RECORD,
+    audio_fixture_config, cosine, dit_fixture_config, encode_fixture_config, encode_fixture_tiles,
+    fixture_config, l2_norm, rel, weights, Golden, AUDIO_FIXTURE, DENOISE_FIXTURE, DIT_FIXTURE,
+    ENCODE_FIXTURE, FIXTURE, MLX_FIXTURE_DIR, MLX_RECORD,
 };
 
 use candle_gen::candle_core::{DType, Device, Tensor};
@@ -119,6 +126,10 @@ fn record() -> Golden {
     Golden::load(MLX_RECORD)
 }
 
+fn video_encode() -> Golden {
+    Golden::load(ENCODE_FIXTURE)
+}
+
 // ---------------------------------------------------------------------------------------------
 // The shared-golden half
 // ---------------------------------------------------------------------------------------------
@@ -133,6 +144,7 @@ fn record() -> Golden {
 fn fixtures_are_byte_identical_to_the_mlx_lanes() {
     for name in [
         "video_vae_decode",
+        "video_vae_encode",
         "audio_vae_decode",
         "dit_block",
         "av_denoise",
@@ -175,6 +187,7 @@ fn mlx_record_is_bound_to_these_fixtures() {
     assert_eq!(r.meta("dtype"), Some("float32"));
     for (key, path) in [
         ("video_fixture_fnv1a64", FIXTURE),
+        ("video_encode_fixture_fnv1a64", ENCODE_FIXTURE),
         ("audio_fixture_fnv1a64", AUDIO_FIXTURE),
         ("dit_fixture_fnv1a64", DIT_FIXTURE),
         ("denoise_fixture_fnv1a64", DENOISE_FIXTURE),
@@ -276,6 +289,92 @@ fn video_decode_agrees_with_the_mlx_lane() {
 
     assert_eq!(checked, 5, "every recorded video tensor must be compared");
     println!("VIDEO cross-backend worst peak-relative: {worst:.3e} (bound {CROSS_TOL:.0e})");
+}
+
+/// Every video **encode** tensor the MLX lane recorded, reproduced here and compared directly
+/// (sc-19008).
+///
+/// Like the audio half, this is strong rather than tautological evidence: the two ports do not
+/// share a tensor layout. MLX runs the causal CNN in **NDHWC** through `mlx_gen::nn::conv3d`; this
+/// port runs it in **NCTHW** through a `kt`-tap `conv2d` decomposition, because candle ships no
+/// `conv3d` at all. Agreement here is two genuinely different computations landing on the same
+/// numbers, over the tiling, the asymmetric downsampler pad, the frame-isolated GroupNorm, the
+/// single-frame short circuit and the posterior clamp.
+#[test]
+fn video_encode_agrees_with_the_mlx_lane() {
+    let f = video_encode();
+    let r = record();
+    let cfg = encode_fixture_config(3);
+    let (tile, overlap) = encode_fixture_tiles(&f);
+    let vae = MiniMaxH3VideoVae::from_weights(
+        &weights(f.model_map(&["src.", "in.", "out.", "const."])),
+        &cfg,
+        &Device::Cpu,
+        DType::F32,
+    )
+    .expect("vae");
+    assert!(
+        vae.can_encode(),
+        "the encode fixture carries the encode half"
+    );
+
+    let mut checked = 0usize;
+    let mut worst = 0.0f32;
+    let mut report = |name: &str, got: &Tensor| {
+        let want = r.tensor(name);
+        assert_eq!(got.dims(), want.dims(), "{name}: shape");
+        let (peak, mean) = rel(got, &want);
+        println!(
+            "  {name}: candle-vs-mlx peak rel {peak:.3e} (mean {mean:.3e}, cosine {:.7})",
+            cosine(got, &want)
+        );
+        assert!(
+            peak < CROSS_TOL,
+            "{name}: the two backends disagree by {peak:.3e}, over the {CROSS_TOL:.0e} bound"
+        );
+        checked += 1;
+        worst = worst.max(peak);
+    };
+
+    let clip = f.tensor("in.encode_clip.pixels");
+    report(
+        "video.encode.params",
+        &vae.encode_clip_tiled(&clip, 4096, 64).expect("untiled"),
+    );
+    report(
+        "video.encode_tiled.params",
+        &vae.encode_clip_tiled(&clip, tile, overlap).expect("tiled"),
+    );
+    let keyframe = vae
+        .encode(&f.tensor("in.encode_single.pixels"))
+        .expect("keyframe encode");
+    report("video.encode_single.mean", keyframe.mean());
+    report("video.encode_single.std", keyframe.std());
+    report(
+        "video.encode_chunked.mean",
+        vae.encode(&f.tensor("in.encode_chunked.pixels"))
+            .expect("chunked encode")
+            .mean(),
+    );
+
+    assert_eq!(
+        checked, 5,
+        "every recorded video-encode tensor must be compared"
+    );
+    // The two recorded encodes must not be the same tensor, or two of the five comparisons are one.
+    let (tiled_vs_untiled, _) = rel(
+        &r.tensor("video.encode_tiled.params"),
+        &r.tensor("video.encode.params"),
+    );
+    assert!(
+        tiled_vs_untiled > CROSS_TOL * 5.0,
+        "the MLX lane's tiled and untiled encodes agree to {tiled_vs_untiled:.3e}; the record \
+         cannot gate the tile blend across backends"
+    );
+    println!(
+        "VIDEO ENCODE cross-backend worst peak-relative: {worst:.3e} (bound {CROSS_TOL:.0e}); \
+         MLX's own tiled-vs-untiled separation {tiled_vs_untiled:.3e}"
+    );
 }
 
 /// Every audio-side tensor the MLX lane recorded, reproduced here and compared directly.

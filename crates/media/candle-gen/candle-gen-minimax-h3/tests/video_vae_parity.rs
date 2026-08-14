@@ -492,16 +492,37 @@ fn fixture_provenance_records_the_converted_path() {
 /// Set equality is the whole proof in both directions: `from_weights` `require`s every declared
 /// name (so a declared-but-absent key is a load error), and a fixture key outside the declared set
 /// would be a tensor nothing reads.
+///
+/// **This fixture is the DECODE half only** — its bytes are shared with the MLX lane and carry no
+/// `encoder.*` / `quant_conv.*`, so the comparison is against
+/// [`MiniMaxH3VideoVae::decode_tensor_names`]. The encode half (sc-19008) has its own exhaustive
+/// proof in `video_vae_encode_parity.rs`, and `real_weights.rs` proves the union is exactly the
+/// published 703 against the real checkpoint. The disjointness of the two halves is asserted here
+/// so this test cannot quietly stop covering the whole declared set.
 #[test]
 fn weight_mapping_is_exhaustive() {
     let f = fixture();
     let cfg = fixture_config(3);
     let present: BTreeSet<String> = model_map(&f).keys().cloned().collect();
-    let declared: BTreeSet<String> = MiniMaxH3VideoVae::tensor_names(&cfg).into_iter().collect();
+    let declared: BTreeSet<String> = MiniMaxH3VideoVae::decode_tensor_names(&cfg)
+        .into_iter()
+        .collect();
     assert_eq!(
         declared, present,
-        "declared tensor names differ from the checkpoint's"
+        "declared decode tensor names differ from the checkpoint's"
     );
+    // The two halves partition the whole declared set, so nothing falls between them.
+    let whole: BTreeSet<String> = MiniMaxH3VideoVae::tensor_names(&cfg).into_iter().collect();
+    let encode: BTreeSet<String> = MiniMaxH3VideoVae::encode_tensor_names(&cfg)
+        .into_iter()
+        .collect();
+    assert_eq!(&declared | &encode, whole);
+    assert!((&declared & &encode).is_empty());
+    assert!(
+        present.is_disjoint(&encode),
+        "this fixture must NOT carry the encode half — its bytes are shared with the MLX lane"
+    );
+
     // ...and the load really does require all of them.
     let _vae = vae(&f, 3);
     let mut short = model_map(&f);

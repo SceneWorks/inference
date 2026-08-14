@@ -21,6 +21,30 @@ pub const FIXTURE: &str = concat!(
     "/tests/fixtures/video_vae_decode.safetensors"
 );
 
+/// The committed video-VAE **encode** fixture (sc-19008), produced by the MLX lane's
+/// `tools/dump_minimax_h3_video_vae_encode.py` running the official diffusers
+/// `AutoencoderKLMiniMaxH3` — the converted-checkpoint layout, and copied byte-for-byte from the
+/// MLX lane (`cross_backend.rs` asserts that).
+///
+/// # Why the encode half has its own file
+///
+/// Its geometry cannot be [`FIXTURE`]'s. The encoder must not **crop**: a level that strides time
+/// without also striding space convolves a 3-wide kernel with no spatial padding and loses two
+/// columns instead of halving, which breaks the tiled encode outright (the stitch assumes
+/// `latent = pixel / ratio`). The original MiniMax module asserts `time_stride in [1, 2]`, so
+/// `patch_size_t` 4 needs TWO time-strided levels — each of which must therefore also be
+/// spatial-strided, making the spatial cumprod 4 rather than [`FIXTURE`]'s 2.
+///
+/// Regenerating [`FIXTURE`] at that geometry was the obvious move and is the wrong one: its bytes
+/// are shared across both lanes and `cross_backend.rs` digests them, and re-randomizing it
+/// perturbs every decoder weight — which measurably eroded this crate's
+/// `a_gated_ffn_half_swap_is_loud_against_the_mlx_record` mutation gate from ~1.2e-1 to 8.4e-2
+/// against its 1e-1 floor the last time it happened.
+pub const ENCODE_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/video_vae_encode.safetensors"
+);
+
 /// The committed audio parity fixture, produced by `tools/dump_minimax_h3_audio_vae.py` running
 /// the same snapshot's `FL2VA/audio_vae` bundle (`DacAudioVAE` / `BigVGAN` / `SnakeBeta` /
 /// `kaiser_sinc_filter1d`).
@@ -259,6 +283,20 @@ impl Golden {
             .unwrap_or_else(|e| panic!("indices {key}: {e}"))
     }
 
+    /// An `int32` tensor's values as a host slice. The encode fixture stores its tile geometry
+    /// this way (`const.encode_tile`), so [`Self::f32`]'s dtype assertion would reject it.
+    pub fn i32_vec(&self, key: &str) -> Vec<i32> {
+        let e = self
+            .entries
+            .get(key)
+            .unwrap_or_else(|| panic!("missing tensor {key}"));
+        assert_eq!(e.dtype, "I32", "{key} is {}, not I32", e.dtype);
+        self.raw(key)
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes(c.try_into().expect("4 bytes")))
+            .collect()
+    }
+
     /// The same values as a host slice.
     pub fn u32_vec(&self, key: &str) -> Vec<u32> {
         self.f32(key)
@@ -328,7 +366,47 @@ pub fn fixture_config(token_drop: i32) -> MiniMaxH3VaeConfig {
         // The REAL 24-entry de-normalization statistics, not placeholders.
         latents_mean: shipped.latents_mean.clone(),
         latents_std: shipped.latents_std.clone(),
+        // The encoder half of this fixture's geometry. `video_vae_decode.safetensors` carries no
+        // `encoder.*` tensors at all, so nothing loads against these — they are here because
+        // `MiniMaxH3VaeConfig::validate` covers both halves and the shape must be self-consistent.
+        // See [`ENCODE_FIXTURE`] for why the encode goldens needed a different one.
+        in_channels: 3,
+        block_out_channels: vec![32, 32, 32, 32],
+        layers_per_block: 1,
+        spatial_downsample_factors: vec![2, 1, 1, 1],
+        temporal_downsample_factors: vec![1, 2, 2, 1],
+        norm_num_groups: 32,
+        encoder_norm_eps: 1e-6,
     }
+}
+
+/// The geometry [`ENCODE_FIXTURE`] was dumped at, mirroring
+/// `tools/dump_minimax_h3_video_vae_encode.py`. Identical to the MLX lane's
+/// `encode_fixture_config` — the two backends must agree about the fixture's shape before either
+/// compares a tensor.
+///
+/// Differs from [`fixture_config`] in exactly the ways the encode half forces (see
+/// [`ENCODE_FIXTURE`]): every downsampling level is spatial-strided, so nothing crops and the
+/// spatial cumprod — and therefore `patch_size` — is 4. The width also changes at the last level,
+/// so `conv_shortcut` is actually built rather than left unexercised.
+pub fn encode_fixture_config(token_drop: i32) -> MiniMaxH3VaeConfig {
+    MiniMaxH3VaeConfig {
+        patch_size: 4,
+        block_out_channels: vec![32, 32, 32, 64],
+        spatial_downsample_factors: vec![1, 2, 2, 1],
+        temporal_downsample_factors: vec![1, 2, 2, 1],
+        ..fixture_config(token_drop)
+    }
+}
+
+/// The tile geometry [`ENCODE_FIXTURE`]'s tiled golden was dumped at — deliberately smaller than
+/// the shipped 256/64 so a committable canvas spans more than one tile. Read from the fixture
+/// rather than typed here, so a regenerated fixture cannot silently disagree with the test.
+pub fn encode_fixture_tiles(g: &Golden) -> (usize, usize) {
+    let t = g.i32_vec("const.encode_tile");
+    assert_eq!(t.len(), 2, "const.encode_tile is [tile_size, min_overlap]");
+    assert!(t[0] > 0 && t[1] >= 0, "nonsensical tile geometry {t:?}");
+    (t[0] as usize, t[1] as usize)
 }
 
 /// The tiny audio geometry the fixture was dumped at.
