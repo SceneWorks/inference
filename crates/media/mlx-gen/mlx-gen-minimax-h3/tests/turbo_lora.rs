@@ -33,6 +33,7 @@ mod common;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use mlx_rs::ops::{matmul, subtract};
 use mlx_rs::{Array, Dtype};
@@ -44,7 +45,7 @@ use mlx_gen_minimax_h3::adapters::{
     adapter_target_paths, alpha_rank_fold, apply_minimax_h3_adapters, is_comfyui_key_space,
     resolve_alpha, resolve_rank, DEFAULT_LORA_ALPHA,
 };
-use mlx_gen_minimax_h3::{MiniMaxH3Dit, MiniMaxH3DitConfig};
+use mlx_gen_minimax_h3::{MiniMaxH3Dit, MiniMaxH3DitConfig, SMALLEST_LEGAL_FRAMES};
 
 use common::{dit_fixture_config, DIT_FIXTURE};
 
@@ -848,4 +849,454 @@ fn the_real_turbo_lora_folds_onto_the_real_dit() {
     assert_eq!(resolve_alpha(&w).unwrap(), 8.0);
     assert_eq!(alpha_rank_fold(8.0, 128.0), 0.0625);
     println!("[turbo e2e] EXAMINED the real DiT at fold 0.0625");
+}
+
+// ─── sc-18729: the measured render ─────────────────────────────────────────────────────────────
+//
+// The fold gates above prove the LoRA lands on the right 312 modules at the right strength. They
+// say nothing about whether a 4-step schedule actually produces a clip, what it costs, or what it
+// costs in quality — which is the whole reason the toggle exists. This section renders.
+//
+// **The sampling recipe is documented, not guessed.** `lightx2v/Minimax-h3-Turbo`'s README points
+// at `github.com/ModelTC/Minimax-H3-Turbo`, whose model-specs table lists per-variant training
+// shifts (video / audio) and recommended inference steps, and whose
+// `DIFFUSERS_SETUP_AND_INFERENCE.md` gives the invocation verbatim:
+//
+// ```text
+// python inference_minimax_h3.py --jobs-json examples/prompts_t2va_test.json \
+//   --lora-path minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors \
+//   --inference-steps 4 --video-shift 6 --lora-alpha 128 \
+//   --megapixels 1.0 --aspect-ratio 16:9 --output-dir outputs/lora_4nfe_768p
+// ```
+//
+// | variant | steps | video / audio shift |
+// |---|---|---|
+// | base | 50 | 12 / 3 |
+// | `4step_v0.1`, `8step_v1.0` (544p) | 4 / 8 | 12 / 3 |
+// | `4step_v1.0_768p` | 4 | **6** / 3 |
+//
+// `--lora-alpha 128` is the reference script working around its own hardcoded default of 8; this
+// engine resolves alpha from the file's `__metadata__`, so it is not a knob here and must not
+// become one (sc-18724). The audio shift never moves across the published set, which is why
+// `scheduler_shift` overrides the video half only.
+
+/// Env var, empty-as-absent.
+fn render_env(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|v| !v.trim().is_empty())
+}
+
+fn render_env_f32(key: &str) -> Option<f32> {
+    render_env(key).map(|v| {
+        v.parse()
+            .unwrap_or_else(|e| panic!("{key}={v} is not a float: {e}"))
+    })
+}
+
+fn render_env_u32(key: &str) -> Option<u32> {
+    render_env(key).map(|v| {
+        v.parse()
+            .unwrap_or_else(|e| panic!("{key}={v} is not an integer: {e}"))
+    })
+}
+
+/// What one render cost and produced.
+struct RenderReceipt {
+    frames: Vec<mlx_gen::gen_core::Image>,
+    audio: mlx_gen::gen_core::AudioTrack,
+    fps: u32,
+    /// `generate` entry → **first** `Progress::Step`. Text-encoder map + prompt encode + TE release
+    /// + DiT map + **LoRA fold** + AdaLN precompute-and-evict — **and the first model evaluation**,
+    /// because `render_latents` reports a step only once that evaluation has finished. One bucket
+    /// because that is the granularity `Progress` exposes on the `Resident` path; H3 emits no
+    /// `Loading` phases.
+    setup_and_first_eval_s: f64,
+    /// First → last `Progress::Step`. This spans `steps − 1` evaluations, **not** `steps` — the
+    /// off-by-one that would otherwise understate `s_per_step` by 25 % on a 4-step render.
+    denoise_tail_s: f64,
+    /// `Progress::Decoding` → return: video VAE + audio VAE + the A/V fit.
+    decode_s: f64,
+    /// Seconds per model evaluation, over the `steps − 1` intervals actually bounded by two ticks.
+    /// `None` for a single-step render, where no interval exists and any figure would be invented.
+    s_per_step: Option<f64>,
+    /// Wall-clock of each interval, in order — so a warm-up outlier is visible rather than averaged
+    /// into a headline number.
+    step_intervals_s: Vec<f64>,
+    wall_s: f64,
+    peak_bytes: u64,
+    steps_seen: u32,
+}
+
+/// Render once at an explicit recipe, staging the tier exactly as a split install does.
+///
+/// `lora` is `None` for the base arm. When `Some`, the alpha is resolved from the file header here
+/// too — printed, not passed — so the receipt records the strength the engine independently
+/// resolved rather than one this harness supplied.
+fn render_once(
+    root: &Path,
+    dit: Option<&Path>,
+    lora: Option<&Path>,
+    steps: u32,
+    shift: Option<f32>,
+    (width, height, frames): (u32, u32, u32),
+    seed: u64,
+    prompt: &str,
+) -> RenderReceipt {
+    use mlx_gen::gen_core::{
+        CancelFlag, GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
+    };
+    use mlx_gen_minimax_h3::model::{load, DIT_COMPONENT};
+
+    let mut load_spec = LoadSpec::new(WeightsSource::Dir(root.to_path_buf()));
+    if let Some(d) = dit {
+        load_spec = load_spec.with_component(DIT_COMPONENT, WeightsSource::Dir(d.to_path_buf()));
+    }
+    // `spec.quantize` is deliberately left unset: `reconcile_tier` treats the on-disk marker as
+    // authoritative, and asserting `Q4` would additionally demand a q4-marked `transformer_ref`,
+    // which the `t2va` path never reads. The tier that loads is still whatever is staged.
+    if let Some(p) = lora {
+        let w = Weights::from_file(p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()));
+        let alpha = resolve_alpha(&w).unwrap_or_else(|e| panic!("alpha: {e}"));
+        println!(
+            "[render] adapter {} — {} tensors, resolved alpha {alpha}, fold {} at rank 128",
+            p.file_name().unwrap_or_default().to_string_lossy(),
+            w.len(),
+            alpha_rank_fold(alpha, 128.0)
+        );
+        assert!(
+            !is_comfyui_key_space(&w),
+            "the ComfyUI twin fuses qkv and swaps the SwiGLU halves; use the diffusers file"
+        );
+        load_spec = load_spec.with_adapters(vec![spec(p.to_path_buf(), 1.0)]);
+    }
+    let model = load(&load_spec).unwrap_or_else(|e| panic!("load: {e}"));
+
+    let req = GenerationRequest {
+        prompt: prompt.into(),
+        width,
+        height,
+        frames: Some(frames),
+        steps: Some(steps),
+        scheduler_shift: shift,
+        seed: Some(seed),
+        cancel: CancelFlag::default(),
+        ..Default::default()
+    };
+    model.validate(&req).expect("the recipe must validate");
+
+    mlx_rs::memory::clear_cache();
+    mlx_rs::memory::reset_peak_memory();
+    let started = Instant::now();
+    // Every tick, not just the first and last: `s_per_step` is then an average over intervals that
+    // really exist, and a warm-up outlier stays visible instead of being smeared into the headline.
+    let mut ticks: Vec<Instant> = Vec::new();
+    let mut decoding_at: Option<Instant> = None;
+    let mut steps_seen = 0u32;
+    let out = model
+        .generate(&req, &mut |p| match p {
+            Progress::Step { current, total } => {
+                steps_seen += 1;
+                let now = Instant::now();
+                if let Some(prev) = ticks.last() {
+                    println!(
+                        "[render]   step {current}/{total} (+{:.1} s)",
+                        now.duration_since(*prev).as_secs_f64()
+                    );
+                } else {
+                    println!(
+                        "[render]   step {current}/{total} — setup + first eval took {:.1} s",
+                        now.duration_since(started).as_secs_f64()
+                    );
+                }
+                ticks.push(now);
+            }
+            Progress::Decoding => decoding_at = Some(Instant::now()),
+            Progress::Loading(_) => {}
+        })
+        .unwrap_or_else(|e| panic!("generate: {e}"));
+    let wall_s = started.elapsed().as_secs_f64();
+    // Read the peak only after `generate` has returned. Every product below is a **host** buffer —
+    // `Vec<u8>` pixels and `Vec<f32>` samples — which cannot exist unless the whole graph was
+    // materialized inside the timed region. That is what makes this peak meaningful: the epic's
+    // recorded trap is a bare `MiniMaxH3Dit::load` reporting 33 KB because MLX mmaps lazily and
+    // nothing forced the tensors. Nothing here is unforced.
+    let peak_bytes = mlx_rs::memory::get_peak_memory() as u64;
+
+    let (frames, fps, audio) = match out {
+        GenerationOutput::Video { frames, fps, audio } => (frames, fps, audio),
+        other => panic!("expected a Video output, got {other:?}"),
+    };
+    let audio = audio.expect("MiniMax-H3 always produces a soundtrack");
+
+    let first = *ticks
+        .first()
+        .expect("the denoise must report at least one step");
+    let last = *ticks
+        .last()
+        .expect("the denoise must report at least one step");
+    let dec = decoding_at.expect("the decode phase must be reported");
+    let step_intervals_s: Vec<f64> = ticks
+        .windows(2)
+        .map(|w| w[1].duration_since(w[0]).as_secs_f64())
+        .collect();
+    let denoise_tail_s = last.duration_since(first).as_secs_f64();
+    RenderReceipt {
+        setup_and_first_eval_s: first.duration_since(started).as_secs_f64(),
+        denoise_tail_s,
+        decode_s: wall_s - dec.duration_since(started).as_secs_f64(),
+        // Divided by the interval count, which is `steps − 1`. Dividing by `steps` is the
+        // 25 %-at-4-steps error this harness must not make.
+        s_per_step: (!step_intervals_s.is_empty())
+            .then(|| denoise_tail_s / step_intervals_s.len() as f64),
+        step_intervals_s,
+        wall_s,
+        peak_bytes,
+        steps_seen,
+        frames,
+        audio,
+        fps,
+    }
+}
+
+/// Per-frame stddev and inter-frame motion, on the 0-255 scale — the "is this a picture, and is it
+/// one scene" evidence. Same statistic `quant_tiers_real` gates tiers on, so the rows compare.
+fn clip_stats(frames: &[mlx_gen::gen_core::Image]) -> (f64, f64) {
+    let mut sd_sum = 0.0;
+    let mut motion_sum = 0.0;
+    for (i, f) in frames.iter().enumerate() {
+        let n = f.pixels.len() as f64;
+        let mean = f.pixels.iter().map(|&p| f64::from(p)).sum::<f64>() / n;
+        sd_sum += (f
+            .pixels
+            .iter()
+            .map(|&p| (f64::from(p) - mean).powi(2))
+            .sum::<f64>()
+            / n)
+            .sqrt();
+        if i > 0 {
+            let prev = &frames[i - 1].pixels;
+            motion_sum += f
+                .pixels
+                .iter()
+                .zip(prev.iter())
+                .map(|(&a, &b)| (f64::from(a) - f64::from(b)).abs())
+                .sum::<f64>()
+                / n;
+        }
+    }
+    (
+        sd_sum / frames.len() as f64,
+        motion_sum / (frames.len() - 1) as f64,
+    )
+}
+
+/// **The sc-18729 render.** One clip, fully measured, written to disk.
+///
+/// Every knob is an env var so the same binary produces each arm of the comparison in its **own
+/// process** — which is not a convenience: MLX's peak counter is process-wide, and two renders in
+/// one process would report the larger one's high-water for both.
+///
+/// ```sh
+/// MINIMAX_H3_SNAPSHOT=<upstream root> \
+/// MINIMAX_H3_DIT=<tier>/transformer \
+/// MINIMAX_H3_TURBO_LORA=<lightx2v/Minimax-h3-Turbo dir> \
+/// MINIMAX_H3_RENDER_LORA=minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16 \
+/// MINIMAX_H3_RENDER_STEPS=4 MINIMAX_H3_RENDER_SHIFT=6 \
+/// MINIMAX_H3_RENDER_WIDTH=1344 MINIMAX_H3_RENDER_HEIGHT=768 \
+/// MINIMAX_H3_RENDER_OUT=<dir> MINIMAX_H3_RENDER_LABEL=turbo4-768p \
+///   cargo test -p mlx-gen-minimax-h3 --test turbo_lora -- --ignored --nocapture \
+///   --test-threads=1 turbo_render_records_a_measured_clip
+/// ```
+///
+/// `MINIMAX_H3_RENDER_LORA=none` renders the base arm at the same geometry, which is what makes the
+/// speedup a measurement rather than arithmetic.
+///
+/// The artifacts are raw (`frames.rgb`, `audio.f32le`) rather than an encoded container: this crate
+/// has no muxer and must not grow one for a validation harness. `receipt.json` carries everything
+/// needed to encode them and everything measured.
+#[test]
+#[ignore = "sc-18729: needs MINIMAX_H3_SNAPSHOT + the turbo LoRA + Metal; the 1344x768 4-step arm is ~15 min, the 50-step base at that canvas ~2 h"]
+fn turbo_render_records_a_measured_clip() {
+    let root = PathBuf::from(
+        render_env("MINIMAX_H3_SNAPSHOT").expect("MINIMAX_H3_SNAPSHOT=<upstream snapshot root>"),
+    );
+    let dit = render_env("MINIMAX_H3_DIT").map(PathBuf::from);
+    let lora_stem = render_env("MINIMAX_H3_RENDER_LORA").expect(
+        "MINIMAX_H3_RENDER_LORA=<file stem>, or `none` for the base arm — an unset value would \
+         silently render the base and be recorded as turbo",
+    );
+    let lora = if lora_stem == "none" {
+        None
+    } else {
+        let p = turbo_dir().join(format!("{lora_stem}.safetensors"));
+        assert!(p.is_file(), "missing {}", p.display());
+        Some(p)
+    };
+    let steps = render_env_u32("MINIMAX_H3_RENDER_STEPS").unwrap_or(4);
+    let shift = render_env_f32("MINIMAX_H3_RENDER_SHIFT");
+    let width = render_env_u32("MINIMAX_H3_RENDER_WIDTH").unwrap_or(1344);
+    let height = render_env_u32("MINIMAX_H3_RENDER_HEIGHT").unwrap_or(768);
+    let frames_req =
+        render_env_u32("MINIMAX_H3_RENDER_FRAMES").unwrap_or(SMALLEST_LEGAL_FRAMES as u32);
+    let seed = render_env_u32("MINIMAX_H3_RENDER_SEED").unwrap_or(18_729) as u64;
+    let label = render_env("MINIMAX_H3_RENDER_LABEL").unwrap_or_else(|| "render".into());
+    let out_dir = PathBuf::from(
+        render_env("MINIMAX_H3_RENDER_OUT").expect("MINIMAX_H3_RENDER_OUT=<output dir>"),
+    );
+    std::fs::create_dir_all(&out_dir).expect("create the output dir");
+
+    // A prompt with picture AND sound in it — the model is a joint AV generator and an A/B that
+    // only looks at pixels cannot speak to half of what distillation might have cost.
+    let prompt = render_env("MINIMAX_H3_RENDER_PROMPT").unwrap_or_else(|| {
+        "a lighthouse on a rocky coast at dusk, waves breaking against the rocks, seagulls calling"
+            .into()
+    });
+
+    println!(
+        "\n[render] {label}: {width}x{height} / {frames_req} frames / {steps} steps / video shift \
+         {} / seed {seed}\n[render]   root {}\n[render]   dit  {}\n[render]   lora {}",
+        shift.map_or("12 (default)".to_string(), |s| s.to_string()),
+        root.display(),
+        dit.as_ref().map_or("<flat root/transformer>".into(), |d| d
+            .display()
+            .to_string()),
+        lora.as_ref()
+            .map_or("<none — base arm>".into(), |l| l.display().to_string()),
+    );
+
+    let r = render_once(
+        &root,
+        dit.as_deref(),
+        lora.as_deref(),
+        steps,
+        shift,
+        (width, height, frames_req),
+        seed,
+        &prompt,
+    );
+
+    // --- evidence the render happened ---------------------------------------------------------
+    assert_eq!(r.frames.len(), frames_req as usize, "decoded frame count");
+    assert_eq!(r.steps_seen, steps, "one progress tick per evaluation");
+    assert_eq!(r.fps, 24);
+    for (i, f) in r.frames.iter().enumerate() {
+        assert_eq!((f.width, f.height), (width, height), "frame {i} size");
+        assert_eq!(f.pixels.len(), (width * height * 3) as usize, "frame {i}");
+    }
+    assert!(
+        r.peak_bytes > 1_000_000_000,
+        "MLX peak {} B is too small for a real 33 B forward — nothing was materialized",
+        r.peak_bytes
+    );
+    let (mean_sd, motion) = clip_stats(&r.frames);
+    let rms = {
+        let s: f64 = r
+            .audio
+            .samples
+            .iter()
+            .map(|&v| f64::from(v) * f64::from(v))
+            .sum();
+        (s / r.audio.samples.len() as f64).sqrt()
+    };
+    assert!(
+        r.audio.samples.iter().all(|s| s.is_finite()),
+        "the soundtrack carries NaN/Inf"
+    );
+
+    // --- the artifacts ------------------------------------------------------------------------
+    let rgb_path = out_dir.join(format!("{label}.frames.rgb"));
+    let pcm_path = out_dir.join(format!("{label}.audio.f32le"));
+    {
+        use std::io::Write;
+        let mut f = std::io::BufWriter::new(
+            std::fs::File::create(&rgb_path).expect("create the frame file"),
+        );
+        for frame in &r.frames {
+            f.write_all(&frame.pixels).expect("write frames");
+        }
+        f.flush().expect("flush frames");
+        let mut a =
+            std::io::BufWriter::new(std::fs::File::create(&pcm_path).expect("create the pcm file"));
+        for s in &r.audio.samples {
+            a.write_all(&s.to_le_bytes()).expect("write pcm");
+        }
+        a.flush().expect("flush pcm");
+    }
+
+    let per_channel = r.audio.samples.len() / usize::from(r.audio.channels);
+    let audio_seconds = per_channel as f64 / f64::from(r.audio.sample_rate);
+    let video_seconds = f64::from(frames_req) / f64::from(r.fps);
+    let intervals = r
+        .step_intervals_s
+        .iter()
+        .map(|v| format!("{v:.3}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let s_per_step = r.s_per_step.map_or("null".into(), |v| format!("{v:.4}"));
+    let receipt = format!(
+        "{{\n  \"label\": \"{label}\",\n  \"width\": {width},\n  \"height\": {height},\n  \
+         \"frames\": {frames_req},\n  \"fps\": {},\n  \"steps\": {steps},\n  \
+         \"video_shift\": {},\n  \"audio_shift\": 3.0,\n  \"seed\": {seed},\n  \
+         \"lora\": \"{lora_stem}\",\n  \"tier_dir\": \"{}\",\n  \
+         \"wall_s\": {:.3},\n  \"setup_and_first_eval_s\": {:.3},\n  \
+         \"denoise_tail_s\": {:.3},\n  \"denoise_tail_evals\": {},\n  \
+         \"decode_s\": {:.3},\n  \"s_per_step\": {s_per_step},\n  \
+         \"step_intervals_s\": [{intervals}],\n  \"peak_bytes\": {},\n  \
+         \"peak_gb\": {:.3},\n  \"mean_frame_stddev\": {mean_sd:.4},\n  \
+         \"inter_frame_motion\": {motion:.4},\n  \"audio_rms\": {rms:.6},\n  \
+         \"audio_seconds\": {audio_seconds:.5},\n  \"video_seconds\": {video_seconds:.5},\n  \
+         \"sample_rate\": {},\n  \"channels\": {},\n  \"prompt\": \"{}\"\n}}\n",
+        r.fps,
+        shift.unwrap_or(12.0),
+        dit.as_ref()
+            .map_or(String::new(), |d| d.display().to_string()),
+        r.wall_s,
+        r.setup_and_first_eval_s,
+        r.denoise_tail_s,
+        r.step_intervals_s.len(),
+        r.decode_s,
+        r.peak_bytes,
+        r.peak_bytes as f64 / 1e9,
+        r.audio.sample_rate,
+        r.audio.channels,
+        prompt.replace('"', "'"),
+    );
+    let receipt_path = out_dir.join(format!("{label}.receipt.json"));
+    std::fs::write(&receipt_path, &receipt).expect("write the receipt");
+
+    println!(
+        "\n[render] {label} DONE\n  wall {:.1} s = (setup + eval 1) {:.1} + {} further eval(s) \
+         {:.1} + decode {:.1}\n  s/step {} over {} interval(s): [{intervals}]\n  MLX peak {:.2} \
+         GB\n  frame stddev {mean_sd:.2}, inter-frame motion {motion:.3}, audio rms {rms:.4} \
+         ({audio_seconds:.4} s vs {video_seconds:.4} s of picture)\n  {}\n  {}\n  {}",
+        r.wall_s,
+        r.setup_and_first_eval_s,
+        r.step_intervals_s.len(),
+        r.denoise_tail_s,
+        r.decode_s,
+        s_per_step,
+        r.step_intervals_s.len(),
+        r.peak_bytes as f64 / 1e9,
+        rgb_path.display(),
+        pcm_path.display(),
+        receipt_path.display(),
+    );
+
+    // Structure gates last, so the artifacts and the receipt survive a failing one and can be
+    // inspected. A turbo arm that renders mush is a *result*, not a lost run.
+    assert!(
+        mean_sd > 8.0,
+        "{label}: frames are nearly flat (stddev {mean_sd:.2}) — the render collapsed"
+    );
+    assert!(
+        motion > 0.05,
+        "{label}: frozen clip (inter-frame motion {motion:.4})"
+    );
+    assert!(
+        motion < 60.0,
+        "{label}: per-frame noise, not video (inter-frame motion {motion:.2})"
+    );
+    assert!(
+        rms > 1e-4,
+        "{label}: the soundtrack is silent (rms {rms:.3e})"
+    );
 }

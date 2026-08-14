@@ -44,7 +44,7 @@ use mlx_gen_boogu::vision::VisionTower;
 
 use crate::audio_config::{MiniMaxH3AudioVaeConfig, AUDIO_OUTPUT_CHANNELS, AUDIO_SAMPLE_RATE};
 use crate::audio_vae::MiniMaxH3AudioVae;
-use crate::denoise::{JointSchedule, MIN_INFERENCE_STEPS};
+use crate::denoise::{JointSchedule, AUDIO_SIGMA_SHIFT, MIN_INFERENCE_STEPS, VIDEO_SIGMA_SHIFT};
 use crate::dit::adaln::AdaLnResidency;
 use crate::dit::model::{JointDit, MiniMaxH3Dit};
 use crate::pipeline::{
@@ -326,6 +326,20 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
         if steps == 0 || steps > MAX_STEPS {
             return Err(Error::Msg(format!(
                 "{MODEL_ID}: steps must be in 1..={MAX_STEPS}, got {steps}"
+            )));
+        }
+    }
+    // The video sigma-shift override (sc-18729), refused **here** rather than 20 minutes downstream
+    // where `SigmaSchedule::with_shift` would finally reject it — `validate` is the only gate that
+    // runs before the 53 GB text encoder maps. The shared float floor in `caps.validate_request`
+    // already rejects NaN/±inf for every knob; this adds the sign, which is specific to a shift
+    // (`σ' = s·σ / (1 + (s − 1)·σ)` has a pole and flips sign for `s <= 0`).
+    if let Some(shift) = req.scheduler_shift {
+        if shift <= 0.0 {
+            return Err(Error::Msg(format!(
+                "{MODEL_ID}: scheduler_shift is the video sigma shift and must be positive, got \
+                 {shift} (the base checkpoint ships {VIDEO_SIGMA_SHIFT}; the 768p 4-step turbo \
+                 variant is trained at 6.0)"
             )));
         }
     }
@@ -847,7 +861,24 @@ impl MiniMaxH3 {
         let geometry = request_geometry(req)?;
         let evaluations = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
         // `num_inference_steps` counts the terminal σ = 0, at which the model is never evaluated.
-        let schedule = JointSchedule::new(evaluations + 1)?;
+        //
+        // **The video shift is a per-request knob** (sc-18729). The base checkpoint's published
+        // 12.0 is the default, but the distilled turbo variants are trained against their own
+        // shift and are simply wrong on 12.0 — `lightx2v/Minimax-h3-Turbo`'s own
+        // `DIFFUSERS_SETUP_AND_INFERENCE.md` passes `--video-shift 6` for the 4-step 768p file,
+        // and its model-specs table lists the training shifts per variant (12/3 for the 544p
+        // 4-step and 8-step files, 6/3 for the 768p one). `scheduler_shift` is the shared
+        // request-level home for exactly this (`mlx-gen-wan`, `mlx-gen-scail2` and
+        // `mlx-gen-sensenova` already read it), so a turbo render needs no bespoke surface.
+        //
+        // Only the **video** shift is overridable, because only the video shift moves across the
+        // published set: every documented variant keeps audio at 3.0, and the reference's
+        // `--audio-shift` is a separate flag this knob is not. `AUDIO_SIGMA_SHIFT` is therefore
+        // passed explicitly rather than defaulted, so the pair this call builds is visible at the
+        // call site instead of hiding behind `JointSchedule::new`'s "both at their own published
+        // shifts".
+        let video_shift = req.scheduler_shift.unwrap_or(VIDEO_SIGMA_SHIFT);
+        let schedule = JointSchedule::with_shifts(evaluations + 1, video_shift, AUDIO_SIGMA_SHIFT)?;
         if schedule.num_evals() == 0 {
             return Err(Error::Msg(format!(
                 "{MODEL_ID}: a {evaluations}-step schedule collapsed to no model evaluations \
@@ -1503,6 +1534,70 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    /// sc-18729 — **the video sigma shift is a per-request override, and the default is a byte-exact
+    /// no-op.**
+    ///
+    /// Three claims, because two of them are individually satisfiable by a wrong implementation:
+    ///
+    /// 1. `scheduler_shift: None` builds exactly what `JointSchedule::new` builds. An implementation
+    ///    that quietly defaulted to, say, 6.0 would still "honor the knob" by every other check
+    ///    here — this is the arm that pins the base checkpoint's schedule unchanged.
+    /// 2. `Some(6.0)` moves the **video** grid and leaves the **audio** grid alone. Asserting only
+    ///    that something changed would pass an implementation that fed one shift to both modalities,
+    ///    which is the sc-17146 defect: it moves audio 1.81e-1 at cosine 0.9846.
+    /// 3. A non-positive shift is refused at `validate`, not 20 minutes later inside
+    ///    `SigmaSchedule::with_shift` — `validate` is the only gate that runs before the 53 GB text
+    ///    encoder maps.
+    #[test]
+    fn the_video_sigma_shift_is_overridable_and_defaults_to_the_published_grid() {
+        let caps = descriptor().capabilities;
+
+        // (1) The default path is the published pair, exactly.
+        let default = JointSchedule::with_shifts(9, VIDEO_SIGMA_SHIFT, AUDIO_SIGMA_SHIFT).unwrap();
+        assert_eq!(
+            default,
+            JointSchedule::new(9).unwrap(),
+            "an unset scheduler_shift must reproduce the base checkpoint's schedule exactly"
+        );
+
+        // (2) The turbo 768p shift moves the video grid and only the video grid.
+        let turbo = JointSchedule::with_shifts(5, 6.0, AUDIO_SIGMA_SHIFT).unwrap();
+        assert_ne!(
+            turbo.video(),
+            default.video(),
+            "shift 6.0 must produce a different video sigma grid than 12.0"
+        );
+        assert_eq!(
+            turbo.audio().shift(),
+            AUDIO_SIGMA_SHIFT,
+            "the audio shift must stay at its published 3.0 — the override is video-only"
+        );
+
+        // (3) Refused at the contract boundary, with the knob named.
+        for bad in [0.0f32, -1.0] {
+            let req = GenerationRequest {
+                frames: Some(124),
+                scheduler_shift: Some(bad),
+                ..request(576, 320)
+            };
+            let e = validate_request(&caps, &req).unwrap_err().to_string();
+            assert!(
+                e.contains("scheduler_shift") && e.contains("positive"),
+                "shift {bad}: {e}"
+            );
+        }
+        // ...and the documented turbo value passes.
+        validate_request(
+            &caps,
+            &GenerationRequest {
+                frames: Some(124),
+                scheduler_shift: Some(6.0),
+                ..request(576, 320)
+            },
+        )
+        .expect("the documented 768p turbo shift must validate");
     }
 
     /// `frames` is exact and `duration` is aligned — the split, pinned in both directions.
