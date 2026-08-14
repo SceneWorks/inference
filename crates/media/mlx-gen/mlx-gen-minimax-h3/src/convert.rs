@@ -152,12 +152,23 @@ impl AdaLnTierPolicy {
     /// # The memory objection is real; the measurement answers a narrower question
     ///
     /// [`crate::dit::adaln::AdaLnCache::precompute`] reads and evaluates all 50 projections
-    /// **before** eviction, so a wider AdaLN raises the precompute transient by the same +6.5 GB.
-    /// An earlier pass discharged that by asserting the precompute peak "stays under the denoise
-    /// peak, comfortably". That DiT-internal inequality is **retracted** (sc-18659): nothing
-    /// asserts it. `tests/adaln_evict_real_weights.rs` computes `peak_precompute` and
-    /// `peak_denoise` separately, but pins only the post-evict drop, and against the *pre-eviction
-    /// resident* rather than against `peak_precompute`.
+    /// **before** eviction, so a wider AdaLN raises the precompute *phase peak* by the same
+    /// +6.5 GB: the projections are resident when that phase's window opens. An earlier pass
+    /// discharged that by asserting the precompute peak "stays under the denoise peak,
+    /// comfortably". That DiT-internal inequality is **retracted** (sc-18659), and sc-19449
+    /// asserts its negation: `common::assert_adaln_phase_envelope`, called by both
+    /// `tests/adaln_evict_memory.rs` and `tests/adaln_evict_real_weights.rs`, now pins
+    /// `peak_denoise` against `peak_precompute` rather than against the pre-eviction resident. The
+    /// precompute side is the high-water. Measured on the real `transformer/` at bf16, the drop
+    /// from the precompute peak to the denoise peak is **0.995x** the 26_020_915_200 B evicted
+    /// (0.97-1.01x on the synthetic stack, whose denoise peak is the noisier reading), so the
+    /// eviction is very nearly the whole of the gap.
+    ///
+    /// What that leaves is a narrower version of the same objection, and it survives: the +6.5 GB
+    /// is paid, at the precompute instant, on top of a residency that already holds every
+    /// projection. It is the precompute's own *transient* — the modulation table plus the
+    /// projection-output intermediates, measured at 0.008x the eviction and 1.331x the retained
+    /// table — that a wider AdaLN leaves untouched.
     ///
     /// What the renders below do establish is the quantity this trade actually spends: the
     /// **process** high-water. Across the full q4-to-bf16 span of AdaLN width — bf16's AdaLN is

@@ -36,13 +36,15 @@
 //! Both peaks used to be measured, printed, and asserted against nothing. They are now pinned by
 //! [`common::assert_adaln_phase_envelope`], which both this file and the real-weight file call, so
 //! the synthetic and the real measurement cannot drift into pinning different things — see that
-//! function for the direction, its derivation, and why it is an envelope rather than a law.
+//! function for the identity the bounds are stated against and why that makes them tier-,
+//! geometry- and schedule-free.
 //!
 //! Arm 1b holds a ballast of exactly half the evicted bytes live across the *same* forward on the
-//! *same* stack, and shows the gap falls by it. That turns the envelope's geometry dependence from
-//! an argument about render-geometry numbers into a measurement, and it is also what keeps the
-//! `3/4` bound honest: a denoise working set of half the eviction breaks it, so the bound is not a
-//! constant that anything would satisfy.
+//! *same* stack, so the denoise phase's working set really is half an eviction, and everything
+//! else is identical. Three things are then measured rather than argued: the gap falls by the
+//! ballast (the identity), the shipped bound still closes on the ballasted pair (which is what
+//! "geometry-free" means), and the fixed-fraction form the review retired
+//! ([`common::ADALN_RETIRED_GAP_NUM`]) goes red on it — the reason the form changed, executing.
 
 mod common;
 
@@ -56,7 +58,7 @@ use mlx_rs::{Array, Dtype};
 use mlx_gen::weights::Weights;
 use mlx_gen_minimax_h3::{AdaLnCache, AdaLnResidency, DitBlock, MiniMaxH3DitConfig, MODALITY_NUM};
 
-use common::{AdaLnPhases, ADALN_GAP_DEN, ADALN_GAP_NUM};
+use common::{AdaLnPhases, ADALN_RETIRED_GAP_DEN, ADALN_RETIRED_GAP_NUM};
 
 /// Blocks in the synthetic stack.
 const LAYERS: i32 = 8;
@@ -331,7 +333,8 @@ fn the_evicted_adaln_weights_leave_device_memory() {
     //     `convert.rs` claim got backwards while both of these tests were measuring it and
     //     throwing it away.
     let phases = AdaLnPhases {
-        scale: "synthetic 8-block stack, f32, adaln_proj [9216, 512], denoise SEQ=48",
+        scale: "synthetic 8-block stack, f32, adaln_proj [9216, 512], denoise: 8 blocks @ SEQ=48, \
+                cache: 6-evaluation schedule",
         active_before,
         active_after,
         peak_precompute,
@@ -342,13 +345,20 @@ fn the_evicted_adaln_weights_leave_device_memory() {
     common::assert_adaln_phase_envelope(&phases);
 
     // ── arm 1b (envelope): the gap narrows one-for-one with the denoise phase's working set ──
-    // sc-19449 AC6. `gap ≈ released − denoise_working_set` is an identity, not an inequality, so
-    // the relationship is geometry- and tier-dependent and crosses at `denoise_working_set =
-    // released`. Hold a ballast of exactly half the evicted bytes live across the SAME forward on
-    // the SAME stack — everything else identical, so the difference is attributable — and the gap
-    // has to fall by it.
+    // sc-19449 AC6, and the evidence for the *form* (f) has. `gap = freed + precompute_transient −
+    // denoise_working_set` is an identity, not an inequality: the denoise phase's working set
+    // moves the gap one-for-one, so any bound stated as a fixed fraction of `released` is
+    // geometry-bound. Hold a ballast of exactly half the evicted bytes live across the SAME
+    // forward on the SAME stack — everything else identical, so the difference is attributable.
     let ballast_bytes = released / 2;
-    let ballast = Array::zeros::<f32>(&[(ballast_bytes / 4) as i32]).unwrap();
+    // `try_into` rather than `as`: `released` is the one number this file exists to let vary, and
+    // a memory-derived `usize -> i32` cast truncates silently. 2^31 f32 elements is 8 GiB, which
+    // this synthetic stack cannot reach — but that is a fact about today's geometry, not a
+    // property of the cast.
+    let ballast_elems: i32 = (ballast_bytes / 4)
+        .try_into()
+        .expect("the synthetic ballast must fit an MLX i32 element count");
+    let ballast = Array::zeros::<f32>(&[ballast_elems]).unwrap();
     mlx_rs::transforms::eval([&ballast]).unwrap();
     reset_peak_memory();
     let peak_denoise_ballasted = one_forward(&c, &blocks, &cache);
@@ -369,22 +379,33 @@ fn the_evicted_adaln_weights_leave_device_memory() {
     let narrowed = gap.saturating_sub(gap_ballasted);
     assert!(
         narrowed >= ballast_bytes / 5 * 4,
-        "a {:.1} MiB denoise working set narrowed the phase gap by only {:.1} MiB — the gap is \
-         not `released − denoise_working_set`, so the envelope documented on \
+        "a {:.1} MiB denoise working set narrowed the phase gap by only {:.1} MiB — the gap does \
+         not track `released − denoise_working_set`, so the identity documented on \
          `assert_adaln_phase_envelope` is wrong",
         mib(ballast_bytes),
         mib(narrowed)
     );
 
-    // …and therefore the `3/4` bound is not a constant that anything would satisfy: half an
-    // eviction's worth of denoise working set breaks it. If this ever passes, the bound has
-    // stopped measuring the phase relationship and is being met by something else.
-    let want_gap = released / ADALN_GAP_DEN * ADALN_GAP_NUM;
+    // The shipped bounds still close on the ballasted pair — the same function, on a pair whose
+    // denoise working set is half the eviction. That is what "geometry-free by construction"
+    // means, measured rather than argued.
+    common::assert_adaln_phase_envelope(&AdaLnPhases {
+        scale: "synthetic 8-block stack, arm 1b: + a released/2 ballast held live across the \
+                denoise forward",
+        peak_denoise: peak_denoise_ballasted,
+        ..phases
+    });
+
+    // …and the retired fixed-fraction form does NOT. This is why the form changed: half an
+    // eviction's worth of denoise working set false-reds it, and at bf16 render geometry the real
+    // model has only 2.8% of margin against it. If this ever passes, the ballast stopped landing.
+    let retired_gap = released / ADALN_RETIRED_GAP_DEN * ADALN_RETIRED_GAP_NUM;
     assert!(
-        gap_ballasted < want_gap,
-        "the {ADALN_GAP_NUM}/{ADALN_GAP_DEN} gap bound ({:.1} MiB) still holds with a {:.1} MiB \
-         denoise working set in the way — it is not bounding the phase relationship",
-        mib(want_gap),
+        gap_ballasted < retired_gap,
+        "the retired {ADALN_RETIRED_GAP_NUM}/{ADALN_RETIRED_GAP_DEN} fixed-fraction gap bound \
+         ({:.1} MiB) still holds with a {:.1} MiB denoise working set in the way — the ballast is \
+         not reaching the denoise phase, so this arm is not demonstrating anything",
+        mib(retired_gap),
         mib(ballast_bytes)
     );
 
