@@ -39,3 +39,5 @@ tempfile = { workspace = true }
 # The real-weight smoke reads the shard index to prove the loader's key set is exhaustive against
 # the published checkpoint, not just against the committed fixture.
 serde_json = { workspace = true }
+# The shared weights-free memory-contract and registry conformance checks (sc-18659).
+sceneworks-gen-core-testkit = { workspace = true }

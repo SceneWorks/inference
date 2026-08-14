@@ -167,6 +167,7 @@ pub mod denoise;
 pub mod dit;
 pub mod keyframe;
 pub mod layout;
+pub mod memory_strategy;
 pub mod model;
 pub mod pipeline;
 pub mod quant;
@@ -264,10 +265,18 @@ pub const MODEL_ID: &str = "minimax_h3";
 pub const SIZE_MULTIPLE: u32 = VAE_RATIO as u32 * 2;
 
 /// Add the MLX MiniMax-H3 generator to an explicit media registry builder.
+///
+/// The three memory registrations join the ladder (sc-18659). `register_memory_strategy` errors at
+/// `build()` for an id with no matching generator, and the contract fixture and behavior seams error
+/// for an id with no matching memory strategy, so the four are wired together or not at all.
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
-    registry.register_generator(model::REGISTRATION)
+    registry
+        .register_generator(model::REGISTRATION)
+        .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(memory_strategy::MEMORY_CONTRACT_FIXTURE)
+        .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR)
 }
 
 /// Build the complete explicit MLX MiniMax-H3 provider catalog.

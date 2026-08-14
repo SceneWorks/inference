@@ -95,6 +95,7 @@ pub mod decoder;
 pub mod denoise;
 pub mod dit;
 pub mod layout;
+pub mod memory_strategy;
 pub mod nn;
 pub mod rope;
 pub mod tensor;

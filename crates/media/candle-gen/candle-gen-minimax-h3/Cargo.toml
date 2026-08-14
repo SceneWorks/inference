@@ -28,3 +28,7 @@ cuda = ["candle-gen/cuda"]
 tempfile = { workspace = true }
 # Shared test-support helpers (`candle_gen::testkit`).
 candle-gen = { path = "../candle-gen", features = ["testkit"] }
+# The shared weights-free memory-contract conformance checks (sc-18659). This is the same
+# `check_memory_strategy_contract` the registry path calls, so this crate's contract is held to the
+# catalog's standard even though it has no generator to register against yet.
+sceneworks-gen-core-testkit = { workspace = true }
