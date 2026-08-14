@@ -12,7 +12,11 @@
 //!   arithmetic;
 //! - [`rope`] implements the 3-D **partial** rotary embedding and its normalized token ids;
 //! - [`blocks`] and [`decoder`] implement the 36-layer transformer decoder;
-//! - [`vae`] assembles the de-normalize → chunk → decode → cross-fade decode path.
+//! - [`vae_encoder`] is the 3-D causal CNN **encode** half — 118 published tensors, `fl2va`'s
+//!   keyframe path (sc-19008), including the reference's spatial tiling, which is **on by
+//!   default**;
+//! - [`vae`] assembles the de-normalize → chunk → decode → cross-fade decode path and the
+//!   `encode` → `quant_conv` → posterior path.
 //!
 //! The video VAE is unusual: the encoder is a 3-D causal CNN but the **decoder is a transformer**
 //! (36 layers, 2048 dim, ~5.2 B params) that performs all 16× spatial and 4× temporal upsampling
@@ -80,10 +84,9 @@
 //!
 //! ## Not in this crate
 //!
-//! The 3-D causal CNN video encoder (ported on the MLX side by sc-17148; the candle twin is a
-//! tracked follow-up), the Qwen3-VL-32B text encoder, the pipeline and measured `vramGbByTier`
-//! (sc-17156), and Ref2VA (sc-17157). Nothing is registered with `candle-gen-catalog` — there is no
-//! generator to ship until the pipeline lands, which is exactly the state of the MLX sibling.
+//! The Qwen3-VL-32B text encoder, the pipeline and measured `vramGbByTier` (sc-17156), and Ref2VA
+//! (sc-17157). Nothing is registered with `candle-gen-catalog` — there is no generator to ship
+//! until the pipeline lands, which is exactly the state of the MLX sibling.
 
 pub mod alias_free;
 pub mod audio_config;
@@ -99,6 +102,7 @@ pub mod nn;
 pub mod rope;
 pub mod tensor;
 pub mod vae;
+pub mod vae_encoder;
 
 pub use alias_free::{kaiser_sinc_filter1d, Activation1d, LowPassFilter1d, SnakeBeta, UpSample1d};
 pub use audio_config::{
@@ -111,8 +115,11 @@ pub use blocks::{blend, TransformerBlock};
 pub use chunking::{ChunkSpan, TemporalGeometry, TemporalPlan};
 pub use config::{
     MiniMaxH3VaeConfig, CLIP_LENGTH, DECODER_HEAD_DIM, DECODER_NUM_HEADS, DECODER_NUM_LAYERS,
-    DECODER_NUM_REGISTER_TOKENS, DECODER_ROPE_DIM_RATIO, DECODER_ROPE_THETA, LATENTS_MEAN,
-    LATENTS_STD, LATENT_CHANNELS, TOKEN_DROP, VAE_RATIO, VAE_RATIO_T,
+    DECODER_NUM_REGISTER_TOKENS, DECODER_ROPE_DIM_RATIO, DECODER_ROPE_THETA,
+    ENCODER_BLOCK_OUT_CHANNELS, ENCODER_IN_CHANNELS, ENCODER_LAYERS_PER_BLOCK, ENCODER_NORM_EPS,
+    ENCODER_NORM_NUM_GROUPS, ENCODER_SPATIAL_DOWNSAMPLE_FACTORS,
+    ENCODER_TEMPORAL_DOWNSAMPLE_FACTORS, LATENTS_MEAN, LATENTS_STD, LATENT_CHANNELS, TOKEN_DROP,
+    VAE_RATIO, VAE_RATIO_T,
 };
 pub use decoder::ViT3dDecoder;
 pub use denoise::{
@@ -131,6 +138,12 @@ pub use layout::{
 };
 pub use rope::{create_token_ids, Rope3d, RopeTables};
 pub use vae::{split_fused_qkv, MiniMaxH3VideoVae};
+pub use vae_encoder::{
+    conv3d_ncthw, reflect_pad_axis, stitch_tiles, zero_pad_front_time, CausalConv3d,
+    DiagonalGaussian, DownBlock3d, FrameIsolatedGroupNorm, ResnetBlock3d, TilePlan, VideoEncoder3d,
+    ENCODER_TEMPORAL_PADDING, ENCODER_TILING_IS_ON_BY_DEFAULT, LOGVAR_CLAMP,
+    TILE_SAMPLE_MIN_OVERLAP, TILE_SAMPLE_MIN_SIZE,
+};
 
 /// The published model id this crate targets. Matches the MLX sibling's, so a manifest entry names
 /// one family across both backends.
