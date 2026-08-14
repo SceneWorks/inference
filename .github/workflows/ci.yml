@@ -350,6 +350,12 @@ jobs:
         run: >-
           cargo test --locked --lib --tests
           -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos
+      - name: Reclaim broad MLX test artifacts before bundle profiles
+        # The complete MLX test graph has already passed. Its linked test artifacts do not fit on
+        # the hosted macOS image alongside the separately compiled runtime bundle profiles and the
+        # Candle Metal Clippy graph, so discard them before continuing with those unchanged gates.
+        # This mirrors the hosted Linux lane's post-Clippy reclamation boundary.
+        run: cargo clean
       - name: Test LLM-only macOS bundle
         run: cargo test --locked --no-default-features --lib -p runtime-macos
       # The decided sc-12835 feature wiring: audio is its own additive bundle feature, so the
