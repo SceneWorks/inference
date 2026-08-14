@@ -57,8 +57,8 @@ pub use loader::{
     resolve_vae_weight_file,
 };
 pub use model::{
-    descriptor, load, load_from_ldm_file, Sdxl, LDM_TOKENIZER_COMPONENT, MODEL_ID, PID_BACKBONE,
-    SIZE_MULTIPLE,
+    descriptor, load, load_concrete, load_from_ldm_file, DecodeQualitySample, Sdxl,
+    LDM_TOKENIZER_COMPONENT, MODEL_ID, PID_BACKBONE, SIZE_MULTIPLE,
 };
 pub use pipeline::{
     decode_image, decode_image_tiled, decoded_to_image, denoise, denoise_cfgpp,
@@ -84,6 +84,7 @@ pub use vision_encoder::{ClipVisionEncoder, VisionConfig};
 /// Availability never substitutes for the request-local `Applied` receipt required by P6.
 pub const BENCHMARK_TOGGLE_CAPABILITIES: &[&str] = &[
     mlx_gen::diagnostics::RETAINED_COMPILATION,
+    mlx_gen::diagnostics::GEOMETRY_AWARE_DECODE,
     mlx_gen::diagnostics::EXACT_EPILOGUES,
 ];
 

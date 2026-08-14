@@ -803,6 +803,7 @@ mod tests {
         let calibration = contract.calibration.expect("calibration");
         let bytes = |gb: f64| (gb * 1024.0 * 1024.0 * 1024.0).round() as u64;
         MemoryRunContext {
+            optimization_authority: mlx_gen::gen_core::MemoryOptimizationAuthority::Calibrated,
             selection: MemorySelection {
                 strategy: MemoryStrategy::Resident,
                 parameters: Default::default(),

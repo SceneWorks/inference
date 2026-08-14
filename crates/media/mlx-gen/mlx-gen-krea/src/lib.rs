@@ -525,6 +525,7 @@ mod explicit_registry_tests {
         std::fs::remove_dir_all(root).ok();
 
         let context = mlx_gen::gen_core::MemoryRunContext {
+            optimization_authority: mlx_gen::gen_core::MemoryOptimizationAuthority::Calibrated,
             selection: mlx_gen::gen_core::MemorySelection {
                 strategy: mlx_gen::gen_core::MemoryStrategy::BoundedDecode,
                 parameters: mlx_gen::gen_core::MemoryStrategyParameters {

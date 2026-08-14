@@ -23,6 +23,11 @@
 //! | 3 bounded attention | `sdpa_budgeted_bhsd` on both block stacks | bounds the phase; **not the binding one** | Missing, see [`ATTENTION_SUPPORT`] |
 //! | 4 bounded transformer residency | `run_windowed` over the two DiT sub-stacks | **14.6932 GiB (−23.50% on rung 1)** | Implemented |
 //!
+//! The rung-2 row is the route-blind legacy default. A caller may now replace it for one exact
+//! catalog route, tier, mode, overlay and output geometry by packaging a sealed production-latent
+//! quality policy. Coordinates absent from that table remain refused; an empty table preserves the
+//! default and the existing estimated-fit fallback.
+//!
 //! Rung 4's saving is attributed rather than assumed: 4.5133 GiB measured against a 4.5125 GiB
 //! windowable block weight set read from the snapshot's own safetensors `data_offsets` — the whole
 //! set, to within 0.8 MiB, which is what a window that replaces the resident stack should buy and
@@ -478,7 +483,17 @@ fn build_contract(
     variant_for(provider_id)?;
     let staged = spec.offload_policy == OffloadPolicy::Sequential;
     let clean = clean(spec);
-    let decode = DECODE_SUPPORT && clean;
+    let decode_policies = spec.decode_geometry_policies_for_loaded_contract(
+        mlx_gen::gen_core::MemoryBackend::Mlx,
+        loaded_tier(spec),
+    )?;
+    let geometry_decode = decode_policies.iter().any(|policy| {
+        matches!(
+            policy.disposition,
+            mlx_gen::gen_core::MemoryDecodeQualityDisposition::Admitted
+        )
+    });
+    let decode = (DECODE_SUPPORT && clean) || geometry_decode;
     let attention = ATTENTION_SUPPORT && clean;
     let routes = decode_routes(provider_id)?;
     let mut contract = MemoryProviderContract::compatibility_default(
@@ -566,6 +581,8 @@ fn build_contract(
             _ => MemoryStrategySupport::Missing,
         };
     }
+    contract.decode_geometry_policy_authoritative = spec.decode_geometry_policy_authoritative;
+    contract.adopt_decode_geometry_policies("chroma", decode_policies)?;
     if streamable {
         contract.additional_prerequisites.push((
             MemoryStrategy::BoundedTransformerResidency,
@@ -658,6 +675,30 @@ pub fn weights_free_contract(
     )
 }
 
+/// Numeric tier the loaded Chroma artifact actually carries. Turnkey Chroma tiers deliberately keep
+/// `spec.quantize == None` so their dense T5 tower is never repacked; the transformer marker is the
+/// authoritative q4/q8 identity used by both calibration and decode-quality admission.
+fn loaded_tier(spec: &LoadSpec) -> MemoryNumericTier {
+    let packed = match &spec.weights {
+        WeightsSource::Dir(root) if spec.quantize.is_none() => {
+            mlx_gen::quant::packed_quant_bits_at(&root.join("transformer"))
+                .ok()
+                .flatten()
+                .and_then(|bits| match bits {
+                    4 => Some(mlx_gen::Quant::Q4),
+                    8 => Some(mlx_gen::Quant::Q8),
+                    _ => None,
+                })
+        }
+        _ => None,
+    };
+    MemoryNumericTier {
+        precision: spec.precision,
+        quant: spec.quantize.or(packed),
+        component_precision_floors: &[],
+    }
+}
+
 pub(crate) fn safety_check(
     spec: &LoadSpec,
     contract: &MemoryProviderContract,
@@ -680,7 +721,11 @@ pub(crate) fn safety_check(
                 contract.provider_id
             )));
         }
-        if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
+        if contract.engages_selection(&context.selection, MemoryStrategy::BoundedDecode)
+            && contract
+                .capability(MemoryStrategy::BoundedDecode)
+                .is_none_or(|capability| capability.parameters.decode_geometry_policies.is_empty())
+        {
             decode_routes(&contract.provider_id)?
                 .validate(
                     context.use_pid,
@@ -714,11 +759,7 @@ pub(crate) fn safety_check(
     standard_memory_strategy_safety_check(
         contract,
         context,
-        Some(MemoryNumericTier {
-            precision: spec.precision,
-            quant: spec.quantize,
-            component_precision_floors: &[],
-        }),
+        Some(loaded_tier(spec)),
         Some(&route_gate),
     )
 }
@@ -741,11 +782,7 @@ pub(crate) fn registered_fixture(
     let context = mlx_gen::gen_core::standard_memory_behavior_context(
         contract,
         strategy,
-        MemoryNumericTier {
-            precision: spec.precision,
-            quant: spec.quantize,
-            component_precision_floors: &[],
-        },
+        loaded_tier(spec),
         mlx_gen::gen_core::MemoryBehaviorRoute {
             mode,
             reference_count,
@@ -780,6 +817,8 @@ fn begin_request_with_cleanup(
                 .map_err(CoreError::Unsupported)
         },
     )?;
+    config.load_shape = context.load_shape;
+    mlx_gen::request_scope::authorize_selected_geometry_decode(&mut config, contract, context)?;
     config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
     config.transformer_window = contract
         .engages(
@@ -893,6 +932,7 @@ pub(crate) fn transformer_window(
 /// Rung 2's plan. Unselected requests return `None`, keeping the historical one-pass decode exactly
 /// intact. PiD is handled before this plan at the decode call site and never inherits native VAE
 /// geometry.
+#[cfg(test)]
 pub(crate) fn decode_tiling(
     req: &GenerationRequest,
     provider_id: &str,
@@ -911,6 +951,60 @@ pub(crate) fn decode_tiling(
         .map_err(|error| mlx_gen::Error::Unsupported(error.to_string()))?
         .validate(req.use_pid, Some(edge), Some(overlap))
         .map_err(mlx_gen::Error::Unsupported)?;
+    Ok(Some(TilingConfig::spatial_only(
+        edge as i32,
+        overlap as i32,
+    )))
+}
+
+/// Production rung-2 resolution. The mechanism helper above remains available to correctness-only
+/// tests, but a real request may tile only under an exact sealed geometry row selected and armed by
+/// its request scope.
+pub(crate) fn decode_tiling_for_contract(
+    req: &GenerationRequest,
+    provider_id: &'static str,
+    contract: &MemoryProviderContract,
+) -> mlx_gen::Result<Option<TilingConfig>> {
+    let Some(memory) = req.memory.filter(|memory| memory.tile_vae_decode) else {
+        mlx_gen::diagnostics::record_geometry_decode_decision(
+            mlx_gen::diagnostics::DecodePolicyDisposition::Unchanged,
+            mlx_gen::diagnostics::DecodePathDisposition::Dense,
+            None,
+        );
+        return Ok(None);
+    };
+    if req.cancel.is_cancelled() {
+        return Err(mlx_gen::Error::Canceled);
+    }
+    let has_quality_table = contract
+        .capability(MemoryStrategy::BoundedDecode)
+        .is_some_and(|capability| !capability.parameters.decode_geometry_policies.is_empty());
+    if !has_quality_table {
+        return Err(mlx_gen::Error::Unsupported(format!(
+            "{provider_id}: bounded decode is withheld until an exact production-latent geometry-quality row is packaged for this loaded route"
+        )));
+    }
+    let edge = memory.decode_tile_edge.ok_or_else(|| {
+        mlx_gen::Error::Unsupported(format!(
+            "{provider_id}: geometry-aware bounded decode requires an exact tile edge"
+        ))
+    })?;
+    let overlap = memory.decode_overlap.ok_or_else(|| {
+        mlx_gen::Error::Unsupported(format!(
+            "{provider_id}: geometry-aware bounded decode requires an exact overlap"
+        ))
+    })?;
+    let evidence = mlx_gen::request_scope::validate_geometry_decode_authorization(
+        provider_id,
+        req,
+        edge,
+        overlap,
+    )?;
+    mlx_gen::diagnostics::record_geometry_decode_decision(
+        mlx_gen::diagnostics::DecodePolicyDisposition::GeometryTiled,
+        mlx_gen::diagnostics::DecodePathDisposition::Tiled,
+        Some(&evidence),
+    );
     Ok(Some(TilingConfig::spatial_only(
         edge as i32,
         overlap as i32,

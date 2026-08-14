@@ -1752,6 +1752,7 @@ fn build_krea_turbo_memory_strategy_contract(spec: &LoadSpec) -> gen_core::Memor
                 },
             })
             .collect(),
+        decode_geometry_policy_authoritative: false,
         pid_decode_routes: None,
         load_shape: LoadShape::DeferredMaterialization,
         // Every higher-rung Krea control is executed by `render_three_stage`: the provider reloads
@@ -2402,6 +2403,7 @@ mod tests {
     ) -> gen_core::MemoryRunContext {
         let calibration = contract.calibration.as_ref().unwrap();
         gen_core::MemoryRunContext {
+            optimization_authority: gen_core::MemoryOptimizationAuthority::Calibrated,
             selection: gen_core::MemorySelection {
                 strategy: gen_core::MemoryStrategy::Resident,
                 parameters: Default::default(),

@@ -22,6 +22,8 @@ tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 safetensors = { workspace = true }
 # JSON parse for the PEFT/diffusers `lora_adapter_metadata` header blob in weightsmeta (sc-5513).
 serde_json = { workspace = true }
+# Canonical production-latent tiled-decode quality receipts (SC-18325). This hashes semantic
+# fixture/output bytes only and does not introduce tensor, timing, or memory-measurement code.
 # Canonical semantic fingerprints bind complete alternate snapshots to the retained tokenizer.
 sha2 = { workspace = true }
 # The independent LLM-serving contract (epic 7153, sc-7189). gen-core re-exports it as

@@ -8,6 +8,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use crate::memory_strategy::{
+    MemoryBackend, MemoryDecodeGeometryPolicy, MemoryDecodeQualityRuntimeIdentity,
+    MemoryNumericTier,
+};
+
 /// Conditional [`LoadSpec::components`] id used when [`LoadSpec::weights`] is a single-file DiT.
 ///
 /// A provider whose ordinary form is a multi-component snapshot can keep the same provider id and
@@ -520,6 +525,23 @@ pub enum LoadShape {
 #[derive(Clone, Debug)]
 pub struct LoadSpec {
     pub weights: WeightsSource,
+    /// Exact caller-resolved catalog route served by a shared provider. `None` preserves the
+    /// historical provider-id identity; callers that route several catalog entries through one
+    /// engine (for example the five SDXL entries) set this so route-specific quality evidence can
+    /// never authorize a sibling checkpoint.
+    pub resolved_route: Option<String>,
+    /// Sealed production-latent quality rows packaged by the caller for this exact loaded route.
+    /// Empty preserves every provider's historical bounded-decode declaration. Providers accept
+    /// rows only when their route/backend/numeric-tier contract validates them; the semantic records
+    /// are independent from model-memory calibration evidence.
+    pub decode_geometry_policies: Vec<MemoryDecodeGeometryPolicy>,
+    /// True once a caller declares quality policy for this route, even if exact tier/load-shape
+    /// projection or an independently audited binding leaves zero usable rows. Providers use this
+    /// to distinguish fail-closed semantic scope from a genuinely legacy empty table.
+    pub decode_geometry_policy_authoritative: bool,
+    /// Independently resolved runtime identity for the packaged quality rows. A non-empty table
+    /// without this binding is malformed and fails closed before provider construction.
+    pub decode_quality_runtime_identity: Option<MemoryDecodeQualityRuntimeIdentity>,
     /// Caller-prepared identities for every single-file source carried by this spec.
     ///
     /// SceneWorks resolves and confines primary weights, controls, adapters, typed auxiliaries, and
@@ -695,6 +717,10 @@ impl LoadSpec {
     pub fn new(weights: WeightsSource) -> Self {
         Self {
             weights,
+            resolved_route: None,
+            decode_geometry_policies: Vec::new(),
+            decode_geometry_policy_authoritative: false,
+            decode_quality_runtime_identity: None,
             prepared_file_pins: PreparedFilePins::default(),
             prepared_receipt_paths: BTreeSet::new(),
             prepared_encoder_receipt: None,
@@ -711,6 +737,147 @@ impl LoadSpec {
             load_shape: LoadShape::EagerMaterialization,
             components: BTreeMap::new(),
         }
+    }
+
+    /// Bind this load to the exact caller-resolved catalog route.
+    pub fn with_resolved_route(mut self, resolved_route: impl Into<String>) -> Self {
+        self.resolved_route = Some(resolved_route.into());
+        self
+    }
+
+    /// Attach caller-packaged, sealed decode-quality rows for this load.
+    pub fn with_decode_geometry_policies(
+        mut self,
+        policies: Vec<MemoryDecodeGeometryPolicy>,
+    ) -> Self {
+        self.decode_geometry_policy_authoritative |= !policies.is_empty();
+        self.decode_geometry_policies = policies;
+        self
+    }
+
+    /// Preserve a caller-audited semantic scope when its rows were stripped after a typed binding
+    /// refusal. Setting this false never erases authority already established by attached rows.
+    pub fn with_decode_geometry_policy_authority(mut self, authoritative: bool) -> Self {
+        self.decode_geometry_policy_authoritative |= authoritative;
+        self
+    }
+
+    /// Bind packaged decode-quality rows to the artifact and source closure actually being loaded.
+    pub fn with_decode_quality_runtime_identity(
+        mut self,
+        identity: MemoryDecodeQualityRuntimeIdentity,
+    ) -> Self {
+        self.decode_quality_runtime_identity = Some(identity);
+        self
+    }
+
+    /// Return only a route-bound quality table. A shared engine must never infer the catalog route
+    /// from its provider id when semantic decode evidence is present.
+    pub fn route_bound_decode_geometry_policies(
+        &self,
+    ) -> crate::Result<Vec<MemoryDecodeGeometryPolicy>> {
+        if self.decode_geometry_policies.is_empty() {
+            return Ok(Vec::new());
+        }
+        let policies = self.route_and_family_bound_decode_geometry_policies()?;
+        self.validate_decode_quality_runtime_identity(&policies)?;
+        Ok(policies)
+    }
+
+    fn route_and_family_bound_decode_geometry_policies(
+        &self,
+    ) -> crate::Result<Vec<MemoryDecodeGeometryPolicy>> {
+        self.decode_quality_runtime_identity.as_ref().ok_or_else(|| {
+            crate::Error::Unsupported(
+                "decode-quality policies require independently resolved artifact and implementation identity"
+                    .to_owned(),
+            )
+        })?;
+        let route = self.resolved_route.as_deref().ok_or_else(|| {
+            crate::Error::Unsupported(
+                "decode-quality policies require an exact caller-resolved route".to_owned(),
+            )
+        })?;
+        if route.trim().is_empty() {
+            return Err(crate::Error::Unsupported(
+                "decode-quality policies require a non-empty caller-resolved route".to_owned(),
+            ));
+        }
+        if let Some(foreign) = self
+            .decode_geometry_policies
+            .iter()
+            .find(|policy| policy.resolved_route != route)
+        {
+            return Err(crate::Error::Unsupported(format!(
+                "decode-quality policy route {:?} cannot authorize loaded route {:?}",
+                foreign.resolved_route, route
+            )));
+        }
+        if let Some(first) = self.decode_geometry_policies.first() {
+            if let Some(foreign) = self
+                .decode_geometry_policies
+                .iter()
+                .find(|policy| policy.family != first.family)
+            {
+                return Err(crate::Error::Unsupported(format!(
+                    "decode-quality table for route {:?} cannot mix families {:?} and {:?}",
+                    route, first.family, foreign.family
+                )));
+            }
+        }
+        Ok(self.decode_geometry_policies.clone())
+    }
+
+    fn validate_decode_quality_runtime_identity(
+        &self,
+        policies: &[MemoryDecodeGeometryPolicy],
+    ) -> crate::Result<()> {
+        let identity = self.decode_quality_runtime_identity.as_ref().ok_or_else(|| {
+            crate::Error::Unsupported(
+                "decode-quality policies require independently resolved artifact and implementation identity"
+                    .to_owned(),
+            )
+        })?;
+        if let Some(foreign) = policies.iter().find(|policy| {
+            policy.artifact != identity.artifact
+                || policy.implementation_fingerprint != identity.implementation_fingerprint
+        }) {
+            return Err(crate::Error::Unsupported(format!(
+                "decode-quality policy artifact/source identity {:?}/{} cannot authorize loaded identity {:?}/{}",
+                foreign.artifact,
+                foreign.implementation_fingerprint,
+                identity.artifact,
+                identity.implementation_fingerprint,
+            )));
+        }
+        Ok(())
+    }
+
+    /// Select the rows applicable to one concrete loaded provider contract. A manifest table may
+    /// contain several shipped numeric tiers and load shapes for the same catalog route; only the
+    /// exact loaded tier and shape enter the runtime contract. A different backend is a malformed
+    /// table, not an unrelated row to ignore.
+    pub fn decode_geometry_policies_for_loaded_contract(
+        &self,
+        backend: MemoryBackend,
+        tier: MemoryNumericTier,
+    ) -> crate::Result<Vec<MemoryDecodeGeometryPolicy>> {
+        if self.decode_geometry_policies.is_empty() {
+            return Ok(Vec::new());
+        }
+        let policies = self.route_and_family_bound_decode_geometry_policies()?;
+        if let Some(foreign) = policies.iter().find(|policy| policy.backend != backend) {
+            return Err(crate::Error::Unsupported(format!(
+                "decode-quality policy backend {:?} cannot authorize loaded backend {:?}",
+                foreign.backend, backend
+            )));
+        }
+        let selected = policies
+            .into_iter()
+            .filter(|policy| policy.tier == tier && policy.load_shape == self.load_shape)
+            .collect::<Vec<_>>();
+        self.validate_decode_quality_runtime_identity(&selected)?;
+        Ok(selected)
     }
 
     /// Read-only view of the prepared File identities carried by this spec.

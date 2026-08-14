@@ -556,6 +556,7 @@ fn memory_strategy_contract_with_asset_facts(
                 },
             })
             .collect(),
+        decode_geometry_policy_authoritative: false,
         pid_decode_routes: Some(mlx_gen::gen_core::MemoryPidDecodeRoutes {
             native: mlx_gen::gen_core::MemoryDecodeRouteDomain {
                 tile_edges: routes.native_edges().to_vec(),
@@ -1546,6 +1547,7 @@ mod tests {
 
     fn context_for(strategy: MemoryStrategy, use_pid: bool) -> MemoryRunContext {
         MemoryRunContext {
+            optimization_authority: mlx_gen::gen_core::MemoryOptimizationAuthority::Calibrated,
             selection: selection_for(strategy, use_pid),
             calibration_abi: MEMORY_CALIBRATION_ABI,
             calibration_fingerprint: MEMORY_CALIBRATION_FINGERPRINT.to_owned(),

@@ -2243,6 +2243,7 @@ dependencies = [
  "mlx-gen-z-image",
  "pmetal-mlx-rs",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 
@@ -2349,6 +2350,7 @@ dependencies = [
  "safetensors 0.4.5",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 
@@ -2534,6 +2536,7 @@ dependencies = [
  "regex",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 

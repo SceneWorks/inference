@@ -176,6 +176,7 @@ fn context(
         * 1_000_000_000.0)
         .round() as u64;
     MemoryRunContext {
+        optimization_authority: mlx_gen::gen_core::MemoryOptimizationAuthority::Calibrated,
         selection,
         calibration_abi: mlx_gen::gen_core::MEMORY_CALIBRATION_ABI,
         calibration_fingerprint: mlx_gen_mage::model::MEMORY_CALIBRATION_FINGERPRINT.to_owned(),

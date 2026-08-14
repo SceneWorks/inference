@@ -449,6 +449,7 @@ pub(crate) fn composed_provider_contract_for(
             block_materialization: MemoryWindowMaterialization::DeviceFormatTransfer,
         },
         strategies,
+        decode_geometry_policy_authoritative: false,
         pid_decode_routes: None,
         load_shape: spec.load_shape,
         // This provider's constrained implementations load request-scoped phases. The explicit

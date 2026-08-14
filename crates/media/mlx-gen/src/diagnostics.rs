@@ -421,6 +421,24 @@ pub fn record_decode_policy(
     ));
 }
 
+/// Emit P9's complete activation receipt for one concrete decoder decision.
+///
+/// Providers call this only at the point where their request-local decoder path has been resolved.
+/// Keeping the `Applied` toggle and semantic policy record together prevents an implementation from
+/// accidentally satisfying only half of the P6 receipt contract. Outside an active scope, or when
+/// P9 was not requested, this is a no-op and ordinary generation remains untouched.
+pub fn record_geometry_decode_decision(
+    disposition: DecodePolicyDisposition,
+    decode_path: DecodePathDisposition,
+    production_evidence_sha256: Option<&str>,
+) {
+    if !toggle_requested(GEOMETRY_AWARE_DECODE) {
+        return;
+    }
+    record_toggle(GEOMETRY_AWARE_DECODE, ToggleDisposition::Applied);
+    record_decode_policy(disposition, decode_path, production_evidence_sha256);
+}
+
 /// Record and synchronously publish one provider-neutral phase boundary. No-op outside an active
 /// request, so the production path pays only the request-local diagnostic branch.
 pub fn record_phase_boundary(boundary: BenchmarkPhaseBoundary) {
@@ -723,6 +741,40 @@ mod tests {
                 production_evidence_sha256: Some(evidence),
                 count: 1,
             }]
+        );
+    }
+
+    #[test]
+    fn geometry_decode_decision_is_atomic_and_request_scoped() {
+        record_geometry_decode_decision(
+            DecodePolicyDisposition::Unchanged,
+            DecodePathDisposition::Dense,
+            None,
+        );
+
+        let scope =
+            begin_request_with_toggles("geometry", "sdxl", &[GEOMETRY_AWARE_DECODE]).unwrap();
+        record_geometry_decode_decision(
+            DecodePolicyDisposition::Unchanged,
+            DecodePathDisposition::Dense,
+            None,
+        );
+        let report = scope.finish();
+        assert_eq!(
+            report.counters,
+            vec![
+                DiagnosticCounter::Toggle {
+                    toggle: GEOMETRY_AWARE_DECODE,
+                    disposition: ToggleDisposition::Applied,
+                    count: 1,
+                },
+                DiagnosticCounter::DecodePolicy {
+                    disposition: DecodePolicyDisposition::Unchanged,
+                    decode_path: DecodePathDisposition::Dense,
+                    production_evidence_sha256: None,
+                    count: 1,
+                },
+            ]
         );
     }
 

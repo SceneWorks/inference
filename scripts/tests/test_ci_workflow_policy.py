@@ -539,13 +539,14 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
             errors.append(f"{prefix}: unexpected argument after requirement lock")
 
     expected_lock_counts = {
+        # 33 since sc-18325 added the three correctness-only decode-quality jobs;
         # 30 since sc-18315 added pinned Krea license materialization;
         # 29 since sc-18249 added the `mlx-sana-drift-ceiling` job
         # (28 since sc-15520 added the `mlx-chroma-memory-ladder` job;
         # 27 since sc-17284 added the `mlx-qwen-image`, `mlx-qwen-image-pid` and
         # `mlx-qwen-image-producers` jobs; 24 since sc-17250 added the JoyCaption and
         # MOSS-TTS-Realtime jobs; 22 before).
-        MACOS_HUB_LOCK: 30,
+        MACOS_HUB_LOCK: 33,
         WINDOWS_HUB_LOCK: 10,
         WINDOWS_MAGE_LOCK: 1,
         MACOS_MAGE_LOCK: 1,
@@ -556,6 +557,74 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
             f"pip install lock counts differ: expected {expected_lock_counts}, "
             f"got {actual_lock_counts}"
         )
+    return errors
+
+
+def decode_quality_candidate_rows(job: dict) -> tuple[list[str], list[str]]:
+    errors: list[str] = []
+    candidate_env = job.get("env", {}).get("DECODE_QUALITY_CANDIDATES", "")
+    if candidate_env != "${{ matrix.candidate.value }}":
+        return candidate_env.split(), errors
+    candidates = job.get("strategy", {}).get("matrix", {}).get("candidate", [])
+    rows: list[str] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict) or set(candidate) != {"geometry", "value"}:
+            errors.append(f"invalid candidate matrix row {candidate!r}")
+            continue
+        geometry, value = candidate["geometry"], candidate["value"]
+        if not isinstance(geometry, str) or not isinstance(value, str):
+            errors.append(f"candidate matrix row must use strings: {candidate!r}")
+            continue
+        if value.split(":", 1)[0] != geometry:
+            errors.append(f"candidate geometry label does not match value: {candidate!r}")
+        rows.append(value)
+    return rows, errors
+
+
+def decode_quality_candidate_policy_errors(workflow: str) -> list[str]:
+    parsed = yaml.safe_load(workflow)
+    jobs = parsed["jobs"]
+    rules = {
+        "mlx-decode-quality-kolors": 64,
+        "mlx-decode-quality-sdxl": 64,
+        # Chroma is a DiT with an explicitly validated /16 image-id grid; unlike the
+        # Kolors/SDXL U-Net it has no mirrored downsample skip joins, so 720 remains valid.
+        "mlx-decode-quality-chroma": 16,
+    }
+    errors: list[str] = []
+    for job, geometry_multiple in rules.items():
+        job_config = jobs[job]
+        rows, matrix_errors = decode_quality_candidate_rows(job_config)
+        errors.extend(f"{job}: {error}" for error in matrix_errors)
+        strategy = job_config.get("strategy", {})
+        if strategy.get("fail-fast") is not False or strategy.get("max-parallel") != 1:
+            errors.append(f"{job}: quality cells must run serialized with fail-fast disabled")
+        if not rows:
+            errors.append(f"{job}: empty candidate grid")
+        if len(rows) != len(set(rows)):
+            errors.append(f"{job}: duplicate candidate matrix row")
+        for row in rows:
+            prefix = f"{job}: invalid candidate {row!r}"
+            try:
+                geometry, tile_text, overlap_text = row.split(":")
+                width_text, height_text = geometry.split("x")
+                width, height = int(width_text), int(height_text)
+                tile, overlap = int(tile_text), int(overlap_text)
+            except (TypeError, ValueError):
+                errors.append(f"{prefix}: expected WIDTHxHEIGHT:TILE:OVERLAP")
+                continue
+            if width <= 0 or height <= 0:
+                errors.append(f"{prefix}: geometry must be positive")
+            if width % geometry_multiple or height % geometry_multiple:
+                errors.append(
+                    f"{prefix}: geometry must align to the family /{geometry_multiple} grid"
+                )
+            if not 0 < overlap < tile <= min(width, height):
+                errors.append(
+                    f"{prefix}: require 0 < overlap < tile <= min(width,height)"
+                )
+            if tile % 8 or overlap % 8:
+                errors.append(f"{prefix}: tile and overlap must align to the decoder /8 grid")
     return errors
 
 
@@ -711,13 +780,93 @@ class CiWorkflowPolicyTests(unittest.TestCase):
     def test_real_weight_python_installs_are_binary_hash_locked(self) -> None:
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
         self.assertEqual(real_weight_pip_policy_errors(workflow), [])
-        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 30)
+        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 33)
         self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 10)
         self.assertEqual(workflow.count(WINDOWS_MAGE_LOCK), 1)
         self.assertNotRegex(
             workflow,
             r"\bpip\s+install[^\n]*(?:huggingface[_-]hub|numpy|safetensors)==",
         )
+
+    def test_decode_quality_candidates_stay_inside_family_geometry_domains(self) -> None:
+        workflow_text = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        self.assertEqual(decode_quality_candidate_policy_errors(workflow_text), [])
+        workflow = yaml.safe_load(workflow_text)
+        jobs = workflow["jobs"]
+        geometries: dict[str, set[tuple[int, int]]] = {}
+        for job in (
+            "mlx-decode-quality-kolors",
+            "mlx-decode-quality-sdxl",
+            "mlx-decode-quality-chroma",
+        ):
+            geometries[job] = set()
+            rows, errors = decode_quality_candidate_rows(jobs[job])
+            self.assertEqual(errors, [])
+            for row in rows:
+                geometry = row.split(":", 1)[0]
+                width_text, height_text = geometry.split("x")
+                geometries[job].add((int(width_text), int(height_text)))
+
+        self.assertIn((1280, 768), geometries["mlx-decode-quality-kolors"])
+        self.assertIn((768, 1280), geometries["mlx-decode-quality-kolors"])
+        self.assertNotIn((1280, 720), geometries["mlx-decode-quality-kolors"])
+        self.assertNotIn((720, 1280), geometries["mlx-decode-quality-kolors"])
+        self.assertIn((1280, 720), geometries["mlx-decode-quality-chroma"])
+        self.assertIn((720, 1280), geometries["mlx-decode-quality-chroma"])
+
+        expected_cells = {
+            "mlx-decode-quality-kolors": 7,
+            "mlx-decode-quality-sdxl": 50,
+            "mlx-decode-quality-chroma": 12,
+        }
+        for job, cells in expected_cells.items():
+            with self.subTest(job=job):
+                config = jobs[job]
+                matrix = config["strategy"]["matrix"]
+                route_count = len(matrix.get("model", ["kolors"]))
+                self.assertEqual(route_count * len(matrix["candidate"]), cells)
+                self.assertEqual(
+                    config["env"]["DECODE_QUALITY_CANDIDATES"],
+                    "${{ matrix.candidate.value }}",
+                )
+                self.assertIn("${{ matrix.candidate.geometry }}", config["name"])
+                upload = next(
+                    step
+                    for step in config["steps"]
+                    if str(step.get("uses", "")).startswith("actions/upload-artifact@")
+                )
+                artifact_name = upload["with"]["name"]
+                self.assertTrue(artifact_name.startswith("decode-quality-v2-"))
+                self.assertIn("${{ matrix.candidate.geometry }}", artifact_name)
+                if job != "mlx-decode-quality-kolors":
+                    self.assertIn("${{ matrix.model.id }}", artifact_name)
+                self.assertEqual(upload["with"]["if-no-files-found"], "error")
+                collector_step = next(
+                    step["run"]
+                    for step in config["steps"]
+                    if "collect_decode_quality_admission.py" in step.get("run", "")
+                )
+                self.assertIn("--expected-policy-count 1", collector_step)
+                self.assertIn("--expected-fixture-count 5", collector_step)
+        self.assertEqual(sum(expected_cells.values()), 69)
+
+        mutations = {
+            "Kolors landscape geometry": ("1280x768:576:48", "1280x720:576:48"),
+            "Kolors portrait geometry": ("768x1280:576:48", "720x1280:576:48"),
+            "SDXL geometry": ("1216x832:704:160", "1216x816:704:160"),
+            "Chroma geometry": ("1280x720:576:192", "1280x722:576:192"),
+            "zero geometry": ("768x768:576:48", "0x768:576:48"),
+            "zero overlap": ("768x768:576:48", "768x768:576:0"),
+            "overlap equals tile": ("768x768:576:48", "768x768:576:576"),
+            "tile exceeds geometry": ("768x768:576:48", "768x768:776:48"),
+            "tile off decoder grid": ("768x768:576:48", "768x768:578:48"),
+            "overlap off decoder grid": ("768x768:576:48", "768x768:576:50"),
+        }
+        for label, (before, after) in mutations.items():
+            with self.subTest(mutation=label):
+                self.assertIn(before, workflow_text)
+                mutated = workflow_text.replace(before, after, 1)
+                self.assertTrue(decode_quality_candidate_policy_errors(mutated))
 
     def test_real_weight_macos_steps_name_the_reviewed_cpython(self) -> None:
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")

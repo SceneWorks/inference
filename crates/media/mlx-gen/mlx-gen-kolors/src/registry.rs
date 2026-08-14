@@ -54,11 +54,10 @@ const DEFAULT_CONTROLNET_SCALE: f32 = 1.0;
 const POSE_IMG2IMG_STRENGTH: f32 = 1.0;
 /// The single Kolors sampler — diffusers `EulerDiscreteScheduler` (leading), see [`KolorsEulerSampler`].
 const SAMPLER: &str = "euler_discrete";
-/// Kolors' VAE downsamples by 8, so both image dims must be multiples of **8** for a clean latent
-/// shape. Exposed as the pinned-engine stride SceneWorks ties each advertised Kolors image bucket to
-/// (sc-12612). `validate_request` enforces exactly this value, so the const cannot drift from the
-/// check. (Distinct from the `i32` `model::SPATIAL_SCALE`, which is the same 8 in latent math.)
-pub const SIZE_MULTIPLE: u32 = 8;
+/// Kolors' `/8` VAE feeds an SDXL U-Net with two exact downsample/upsample skip joins, so both image
+/// dims must be multiples of **32**. Exposed as the pinned-engine stride SceneWorks ties each
+/// advertised Kolors image bucket to (sc-12612); the model and registry share the same constant.
+pub const SIZE_MULTIPLE: u32 = crate::model::PRODUCTION_SPATIAL_MULTIPLE as u32;
 
 /// Kolors' identity + capabilities — constructible without loading weights (registry
 /// introspection). Advertises **only** the wired + parity-proven surface (the false-capability
@@ -547,7 +546,8 @@ impl KolorsGenerator {
                     .into(),
             ));
         }
-        let decode_tiling = crate::memory_strategy::decode_tiling(req)?;
+        let decode_tiling =
+            crate::memory_strategy::decode_tiling_for_contract(req, &self.memory_strategy)?;
         let forward_plan =
             SdxlForwardPlan::with_attention(crate::memory_strategy::attention_plan(req)?)
                 .with_window(dit_window.map(|size| SdxlBlockWindow {
@@ -1001,7 +1001,7 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
             )));
         }
     }
-    // Kolors VAE downsamples by 8; non-multiple-of-8 dims would mismatch latent shapes.
+    // The /8 VAE plus two exact U-Net downsample/upsample joins require SIZE_MULTIPLE.
     if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
         return Err(Error::Msg(format!(
             "kolors: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
@@ -1163,9 +1163,9 @@ mod tests {
     #[test]
     fn validate_ties_size_multiple_to_pinned_stride() {
         // sc-12612: `SIZE_MULTIPLE` is the pinned stride SceneWorks ties every advertised Kolors
-        // bucket to. Pin the value and mutation-check that a size which is a multiple of 4 but not
-        // SIZE_MULTIPLE (8) is still rejected with the stride error, and an on-stride size passes.
-        assert_eq!(SIZE_MULTIPLE, 8);
+        // bucket to. Pin the value and mutation-check that a VAE-valid size which is not the full
+        // U-Net multiple is rejected with the stride error, and an on-stride size passes.
+        assert_eq!(SIZE_MULTIPLE, 32);
         let caps = descriptor().capabilities;
         let base = GenerationRequest {
             prompt: "a fox".into(),
@@ -1175,20 +1175,20 @@ mod tests {
         let off_stride = validate_request(
             &caps,
             &GenerationRequest {
-                width: 1020, // 255×4 — a multiple of 4 but not SIZE_MULTIPLE
+                width: 1000, // 125×8 — VAE-valid but not SIZE_MULTIPLE
                 ..base.clone()
             },
         )
         .unwrap_err()
         .to_string();
         assert!(
-            off_stride.contains("multiples of 8"),
+            off_stride.contains("multiples of 32"),
             "expected the stride error, got: {off_stride}"
         );
         assert!(validate_request(
             &caps,
             &GenerationRequest {
-                width: 1024, // 128×8 — on-stride
+                width: 1024, // 32×32 — on-stride
                 ..base.clone()
             },
         )

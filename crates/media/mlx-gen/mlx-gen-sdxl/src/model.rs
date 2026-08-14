@@ -253,6 +253,21 @@ pub struct Sdxl {
     memory_strategy: mlx_gen::gen_core::MemoryProviderContract,
 }
 
+/// One correctness-only production-latent decode comparison.
+///
+/// This test seam deliberately carries no duration, allocator, peak-memory, or calibration field.
+/// The latent is captured from the normal [`Sdxl::generate_impl`] denoise path immediately before
+/// its production decode, then decoded once densely and once with the caller's candidate tiling.
+#[doc(hidden)]
+pub struct DecodeQualitySample {
+    pub production_latent: mlx_rs::Array,
+    pub dense: Image,
+    pub tiled: Image,
+}
+
+type FinalLatentObserver<'a> =
+    &'a mut dyn FnMut(&Autoencoder, &mlx_rs::Array, Option<&dyn LatentDecoder>) -> Result<()>;
+
 /// The heavy render-phase components (everything but the text encoders): the U-Net, its ControlNet
 /// branches / IP-Adapter, the VAE, and the optional PiD decoder. Owned by the `Resident` components
 /// (held for the whole job) or by a `Sequential` generate (loaded after the encoders are dropped,
@@ -316,8 +331,6 @@ impl SdxlHeavyOwned {
 /// The lower-level `load_unet`/`load_text_encoder_*` keep an f32 path for the tight stage gates.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     if spec.precision != Precision::Bf16 {
-        // `Precision::Bf16` is the registry's dense sentinel; the dense path runs fp16 (the
-        // production dtype). A non-default precision flag is rejected rather than silently ignored.
         return Err(Error::Msg(
             "sdxl: precision override is not wired; the dense path runs fp16 (the production \
              reference dtype) — drop the precision override"
@@ -341,6 +354,22 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
             }
         };
         return load_from_ldm_file(spec, tokenizer_root);
+    }
+    Ok(Box::new(load_concrete(spec)?))
+}
+
+/// Construct the concrete generator for the correctness-only production-latent admission harness.
+/// Normal registry callers should use [`load`].
+#[doc(hidden)]
+pub fn load_concrete(spec: &LoadSpec) -> Result<Sdxl> {
+    if spec.precision != Precision::Bf16 {
+        // `Precision::Bf16` is the registry's dense sentinel; the dense path runs fp16 (the
+        // production dtype). A non-default precision flag is rejected rather than silently ignored.
+        return Err(Error::Msg(
+            "sdxl: precision override is not wired; the dense path runs fp16 (the production \
+             reference dtype) — drop the precision override"
+                .into(),
+        ));
     }
     // Resolve the snapshot dir up front — a fail-fast for BOTH residencies (Sequential defers the
     // heavy component build to each generate, but a single-file source is still wrong, so reject it
@@ -368,7 +397,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     }
     let residency = build_residency(spec)?;
     let memory_strategy = crate::memory_strategy::memory_strategy_contract(descriptor().id, spec)?;
-    Ok(Box::new(Sdxl {
+    Ok(Sdxl {
         descriptor: descriptor(),
         default_stage_residency: crate::memory_strategy::default_stage_residency(spec),
         streamable: crate::memory_strategy::streamable(spec),
@@ -379,7 +408,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         alpha_schedule,
         control_count,
         residency,
-    }))
+    })
 }
 
 /// Load a fused SDXL LDM/A1111 checkpoint in memory. The fused file supplies both text encoders,
@@ -790,6 +819,44 @@ impl mlx_gen::gen_core::Generator for Sdxl {
 }
 
 impl Sdxl {
+    /// Run the ordinary production denoise path and compare the exact final latent under dense and
+    /// candidate tiled decode. This is an explicit correctness-only seam for admission tooling; it
+    /// does not read clocks or allocator/memory counters and does not change the production output.
+    #[doc(hidden)]
+    pub fn generate_decode_quality(
+        &self,
+        req: &GenerationRequest,
+        tiling: &mlx_gen::tiling::TilingConfig,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<(GenerationOutput, Vec<DecodeQualitySample>)> {
+        let mut samples = Vec::new();
+        let output = {
+            let mut capture = |vae: &Autoencoder,
+                               latent: &mlx_rs::Array,
+                               pid: Option<&dyn LatentDecoder>|
+             -> Result<()> {
+                latent.eval()?;
+                let dense =
+                    crate::pipeline::decode_image_tiled(vae, latent, pid, None, Some(&req.cancel))?;
+                let tiled = crate::pipeline::decode_image_tiled(
+                    vae,
+                    latent,
+                    pid,
+                    Some(tiling),
+                    Some(&req.cancel),
+                )?;
+                samples.push(DecodeQualitySample {
+                    production_latent: latent.clone(),
+                    dense,
+                    tiled,
+                });
+                Ok(())
+            };
+            self.generate_impl_with_final_latent_observer(req, on_progress, Some(&mut capture))?
+        };
+        Ok((output, samples))
+    }
+
     /// The rich-`Result` body behind [`Generator::generate`]. Kept on the crate's own
     /// [`mlx_gen::Error`] so the `?` operator lifts both `mlx_rs` device exceptions and the family
     /// helpers transparently; the trait wrapper bridges the tail into [`gen_core::Error`] (epic 3720).
@@ -802,6 +869,15 @@ impl Sdxl {
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationOutput> {
+        self.generate_impl_with_final_latent_observer(req, on_progress, None)
+    }
+
+    fn generate_impl_with_final_latent_observer(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+        mut final_latent_observer: Option<FinalLatentObserver<'_>>,
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
 
@@ -935,7 +1011,8 @@ impl Sdxl {
                     .into(),
             ));
         }
-        let decode_tiling = crate::memory_strategy::decode_tiling(req)?;
+        let decode_tiling =
+            crate::memory_strategy::decode_tiling_for_contract(req, &self.memory_strategy)?;
         let forward_plan = crate::plan::SdxlForwardPlan::with_attention(
             crate::memory_strategy::attention_plan(req)?,
         )
@@ -1207,6 +1284,9 @@ impl Sdxl {
                     Some(p) => multiply(&latents, scalar(p.rescale))?,
                     None => latents,
                 };
+                if let Some(observer) = final_latent_observer.as_deref_mut() {
+                    observer(heavy.vae, &latents, pid_ref)?;
+                }
                 mlx_gen::diagnostics::record_phase_boundary(
                     mlx_gen::diagnostics::BenchmarkPhaseBoundary::DecodeStart,
                 );
@@ -1360,6 +1440,10 @@ impl Sdxl {
                 )?
             };
 
+            if let Some(observer) = final_latent_observer.as_deref_mut() {
+                observer(heavy.vae, &latents, pid_ref)?;
+            }
+
             mlx_gen::diagnostics::record_phase_boundary(
                 mlx_gen::diagnostics::BenchmarkPhaseBoundary::DecodeStart,
             );
@@ -1478,11 +1562,12 @@ impl Sdxl {
     }
 }
 
-/// SDXL works in latent space at /8, so both request dims must be multiples of 8. Exposed as the
-/// pinned-engine stride SceneWorks ties each advertised SDXL image bucket to (sc-12612), mirroring
-/// `wan::config::SIZE_MULTIPLE_14B`. `validate_request` enforces exactly this value, so the const
-/// cannot drift from the check.
-pub const SIZE_MULTIPLE: u32 = 8;
+/// SDXL's VAE produces a `/8` latent and the three-block U-Net applies two stride-2 downsamplers
+/// before mirroring them through exact skip concatenations. Each image axis must therefore be a
+/// multiple of `8 * 2² = 32`; accepting only the VAE stride can produce an odd intermediate whose
+/// upsampled extent no longer matches its skip tensor. `validate_request` enforces this structural
+/// multiple before production denoise.
+pub const SIZE_MULTIPLE: u32 = 32;
 
 /// Capability-driven request validation, factored out so it can be unit-tested without loaded
 /// weights. Rejects unsupported guidance / negative prompt / conditioning / size / count.
@@ -1499,7 +1584,7 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
     if req.prompt.is_empty() {
         return Err(Error::Msg("sdxl: prompt must not be empty".into()));
     }
-    // SDXL works in latent space at /8; both dims must be multiples of SIZE_MULTIPLE.
+    // The /8 VAE plus two exact U-Net downsample/upsample joins require SIZE_MULTIPLE.
     if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
         return Err(Error::Msg(format!(
             "sdxl: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
@@ -1757,24 +1842,24 @@ mod tests {
     }
 
     /// sc-12612: `SIZE_MULTIPLE` is the pinned stride SceneWorks ties every advertised SDXL bucket to.
-    /// Pin the value and mutation-check that a multiple of 4 which is not SIZE_MULTIPLE (8) is rejected
-    /// with the stride error, and an on-stride size passes.
+    /// Pin the value and mutation-check that a VAE-valid multiple of 8 which is not the full U-Net
+    /// multiple is rejected with the stride error, and an on-stride size passes.
     #[test]
     fn size_multiple_is_the_pinned_stride() {
-        assert_eq!(SIZE_MULTIPLE, 8);
+        assert_eq!(SIZE_MULTIPLE, 32);
         let caps = descriptor().capabilities;
         let off = validate_request(
             &caps,
             &GenerationRequest {
                 prompt: "a fox".into(),
-                width: 1020, // 255×4 — a multiple of 4 but not SIZE_MULTIPLE
+                width: 1000, // 125×8 — VAE-valid but not SIZE_MULTIPLE
                 height: 1024,
                 ..Default::default()
             },
         )
         .unwrap_err()
         .to_string();
-        assert!(off.contains("multiples of 8"), "got: {off}");
+        assert!(off.contains("multiples of 32"), "got: {off}");
         assert!(validate_request(
             &caps,
             &GenerationRequest {
@@ -1855,10 +1940,10 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_request(&caps, &req).is_ok());
-        // Non-multiple-of-8 size is rejected.
+        // VAE-valid but U-Net-invalid size is rejected.
         req = GenerationRequest {
             prompt: "a fox".into(),
-            width: 1020,
+            width: 1000,
             height: 1024,
             ..Default::default()
         };

@@ -6,12 +6,33 @@
 //! and the finished-state guard for every lifecycle hook.
 
 use crate::gen_core::{
-    Error, GenerationMemory, GenerationRequest, MemoryGeometry, MemoryPhase, MemoryRequestScope,
-    MemoryRunOutcome, Result,
+    Error, GenerationMemory, GenerationRequest, LoadShape, MemoryDecodeArtifactIdentity,
+    MemoryDecodeGeometryPolicy, MemoryDecodePolicyQuery, MemoryDecodeQualityDisposition,
+    MemoryGeometry, MemoryPhase, MemoryProviderContract, MemoryRequestScope, MemoryRunContext,
+    MemoryRunOutcome, MemoryStrategy, Result, MEMORY_DECODE_QUALITY_IMPLEMENTATION_FINGERPRINT,
 };
+use std::cell::RefCell;
 
 type DecodeValidator = Box<dyn Fn(bool, u32, u32) -> Result<()> + 'static>;
 type CleanupAction = Box<dyn FnMut() -> Result<()> + 'static>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GeometryDecodeAuthorization {
+    provider_id: &'static str,
+    geometry: MemoryGeometry,
+    load_shape: LoadShape,
+    artifact: MemoryDecodeArtifactIdentity,
+    implementation_fingerprint: String,
+    use_pid: bool,
+    tile_edge: u32,
+    overlap: u32,
+    production_evidence_sha256: String,
+}
+
+thread_local! {
+    static GEOMETRY_DECODE_AUTHORIZATION: RefCell<Option<GeometryDecodeAuthorization>> =
+        const { RefCell::new(None) };
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LifecycleState {
@@ -24,6 +45,7 @@ enum LifecycleState {
 pub struct MlxRequestScopeConfig {
     pub provider_id: &'static str,
     pub geometry: MemoryGeometry,
+    pub load_shape: LoadShape,
     pub memory: Option<GenerationMemory>,
     pub use_pid: bool,
     pub attention_chunk_size: Option<u32>,
@@ -31,6 +53,7 @@ pub struct MlxRequestScopeConfig {
     /// The layer count read from the provider's model configuration.
     pub transformer_blocks: u32,
     pub decode_validator: DecodeValidator,
+    decode_authorization: Option<GeometryDecodeAuthorization>,
 }
 
 impl MlxRequestScopeConfig {
@@ -50,14 +73,163 @@ impl MlxRequestScopeConfig {
         Ok(Self {
             provider_id,
             geometry,
+            load_shape: LoadShape::EagerMaterialization,
             memory,
             use_pid,
             attention_chunk_size: None,
             transformer_window: None,
             transformer_blocks,
             decode_validator: Box::new(decode_validator),
+            decode_authorization: None,
         })
     }
+
+    /// Bind the exact policy row admitted by the shared safety gate to this request scope. The
+    /// production decoder consumes the request-local authorization; a hand-built
+    /// `GenerationMemory` with no scope cannot replay the tile pair on another coordinate.
+    pub fn authorize_geometry_decode(&mut self, policy: &MemoryDecodeGeometryPolicy) -> Result<()> {
+        if !matches!(policy.disposition, MemoryDecodeQualityDisposition::Admitted) {
+            return Err(Error::Unsupported(format!(
+                "{}: cannot authorize a refused decode-quality row",
+                self.provider_id
+            )));
+        }
+        if policy.artifact.repository.trim().is_empty()
+            || policy.artifact.revision.len() != 40
+            || !policy
+                .artifact
+                .revision
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || policy.artifact.variant.trim().is_empty()
+            || policy.artifact.fingerprint.trim().is_empty()
+            || policy.implementation_fingerprint != MEMORY_DECODE_QUALITY_IMPLEMENTATION_FINGERPRINT
+        {
+            return Err(Error::Unsupported(format!(
+                "{}: decode-quality authorization has stale artifact/source identity",
+                self.provider_id
+            )));
+        }
+        let memory = self
+            .memory
+            .filter(|memory| memory.tile_vae_decode)
+            .ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "{}: decode-quality authorization requires bounded decode selected",
+                    self.provider_id
+                ))
+            })?;
+        if policy.geometry != self.geometry
+            || policy.load_shape != self.load_shape
+            || policy.use_pid != self.use_pid
+            || memory.decode_tile_edge != Some(policy.tile_edge)
+            || memory.decode_overlap != Some(policy.overlap)
+        {
+            return Err(Error::Unsupported(format!(
+                "{}: decode-quality authorization does not match the request geometry/parameters",
+                self.provider_id
+            )));
+        }
+        self.decode_authorization = Some(GeometryDecodeAuthorization {
+            provider_id: self.provider_id,
+            geometry: policy.geometry,
+            load_shape: policy.load_shape,
+            artifact: policy.artifact.clone(),
+            implementation_fingerprint: policy.implementation_fingerprint.clone(),
+            use_pid: policy.use_pid,
+            tile_edge: policy.tile_edge,
+            overlap: policy.overlap,
+            production_evidence_sha256: policy.production_evidence_sha256.clone(),
+        });
+        let expected_use_pid = policy.use_pid;
+        let expected_edge = policy.tile_edge;
+        let expected_overlap = policy.overlap;
+        let provider_id = self.provider_id;
+        self.decode_validator = Box::new(move |use_pid, edge, overlap| {
+            if (use_pid, edge, overlap) == (expected_use_pid, expected_edge, expected_overlap) {
+                Ok(())
+            } else {
+                Err(Error::Unsupported(format!(
+                    "{provider_id}: decode parameters do not match the admitted geometry-quality row"
+                )))
+            }
+        });
+        Ok(())
+    }
+}
+
+/// Install the exact shared-contract quality row selected for this request, when bounded decode is
+/// engaged. Legacy providers with an empty policy table retain their existing validator path.
+pub fn authorize_selected_geometry_decode(
+    config: &mut MlxRequestScopeConfig,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> Result<()> {
+    if !contract.engages_selection(&context.selection, MemoryStrategy::BoundedDecode) {
+        return Ok(());
+    }
+    if let Some(policy) = contract.decode_geometry_policy(
+        MemoryDecodePolicyQuery {
+            tier: context.selection.tier,
+            load_shape: context.load_shape,
+            mode_key: context.mode.as_key(),
+            overlay: context.overlay.as_deref(),
+            geometry: context.geometry,
+            use_pid: context.use_pid,
+        },
+        Some(context.selection.parameters),
+    )? {
+        config.authorize_geometry_decode(policy)?;
+    }
+    Ok(())
+}
+
+/// Validate and consume the active request scope's exact geometry-quality authority.
+///
+/// The authorization remains active for all images in the request count and is cleared only when
+/// the surrounding [`MlxRequestScopeCore`] finishes or drops.
+pub fn validate_geometry_decode_authorization(
+    provider_id: &'static str,
+    request: &GenerationRequest,
+    tile_edge: u32,
+    overlap: u32,
+) -> Result<String> {
+    GEOMETRY_DECODE_AUTHORIZATION.with(|slot| {
+        let binding = slot.borrow();
+        let binding = binding.as_ref().ok_or_else(|| {
+            Error::Unsupported(format!(
+                "{provider_id}: bounded decode requires request-scoped production-latent quality authorization"
+            ))
+        })?;
+        let geometry = MemoryGeometry {
+            width: request.width,
+            height: request.height,
+            batch: request.count,
+            frames: 1,
+            reference_count: request.image_reference_count(),
+        };
+        if binding.provider_id != provider_id
+            || binding.geometry != geometry
+            || !matches!(
+                binding.load_shape,
+                LoadShape::EagerMaterialization | LoadShape::DeferredMaterialization
+            )
+            || binding.artifact.repository.trim().is_empty()
+            || binding.artifact.revision.trim().is_empty()
+            || binding.artifact.variant.trim().is_empty()
+            || binding.artifact.fingerprint.trim().is_empty()
+            || binding.implementation_fingerprint
+                != MEMORY_DECODE_QUALITY_IMPLEMENTATION_FINGERPRINT
+            || binding.use_pid != request.use_pid
+            || binding.tile_edge != tile_edge
+            || binding.overlap != overlap
+        {
+            return Err(Error::Unsupported(format!(
+                "{provider_id}: bounded decode does not match the active geometry-quality authorization"
+            )));
+        }
+        Ok(binding.production_evidence_sha256.clone())
+    })
 }
 
 /// Terminal-cleanup policy. `None` is used only by weights-free behavior probes.
@@ -72,6 +244,7 @@ pub struct MlxRequestScopeCore {
     config: MlxRequestScopeConfig,
     cleanup: CleanupAction,
     state: LifecycleState,
+    decode_authorization_armed: bool,
 }
 
 impl MlxRequestScopeCore {
@@ -98,6 +271,7 @@ impl MlxRequestScopeCore {
             config,
             cleanup,
             state: LifecycleState::Active,
+            decode_authorization_armed: false,
         }
     }
 
@@ -178,6 +352,20 @@ impl MemoryRequestScope for MlxRequestScopeCore {
                 self.config.geometry.reference_count
             )));
         }
+        if let Some(authorization) = self.config.decode_authorization.clone() {
+            GEOMETRY_DECODE_AUTHORIZATION.with(|slot| {
+                let mut active = slot.borrow_mut();
+                if active.is_some() {
+                    return Err(Error::Unsupported(format!(
+                        "{}: a geometry-decode authorization is already active on this thread",
+                        self.config.provider_id
+                    )));
+                }
+                *active = Some(authorization);
+                Ok(())
+            })?;
+            self.decode_authorization_armed = true;
+        }
         request.memory = self.config.memory;
         Ok(())
     }
@@ -246,6 +434,10 @@ impl MemoryRequestScope for MlxRequestScopeCore {
 
     fn finish(&mut self, _outcome: MemoryRunOutcome) -> Result<()> {
         self.ensure_active()?;
+        if self.decode_authorization_armed {
+            GEOMETRY_DECODE_AUTHORIZATION.with(|slot| *slot.borrow_mut() = None);
+            self.decode_authorization_armed = false;
+        }
         self.state = LifecycleState::CleanupPending;
         self.cleanup_pending()
     }
@@ -253,6 +445,10 @@ impl MemoryRequestScope for MlxRequestScopeCore {
 
 impl Drop for MlxRequestScopeCore {
     fn drop(&mut self) {
+        if self.decode_authorization_armed {
+            GEOMETRY_DECODE_AUTHORIZATION.with(|slot| *slot.borrow_mut() = None);
+            self.decode_authorization_armed = false;
+        }
         if self.state == LifecycleState::Active {
             self.state = LifecycleState::CleanupPending;
         }
@@ -265,7 +461,11 @@ impl Drop for MlxRequestScopeCore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gen_core::{Conditioning, Image, MemoryRunOutcome};
+    use crate::gen_core::{
+        Conditioning, Image, MemoryBackend, MemoryDecodeArtifactIdentity,
+        MemoryDecodeQualityFixture, MemoryMode, MemoryNumericTier, MemoryRunOutcome, Precision,
+        Quant, MEMORY_DECODE_QUALITY_ABI,
+    };
     use std::cell::Cell;
     use std::rc::Rc;
 
@@ -300,6 +500,103 @@ mod tests {
             },
             strength: None,
         }
+    }
+
+    fn quality_policy(geometry: MemoryGeometry) -> MemoryDecodeGeometryPolicy {
+        MemoryDecodeGeometryPolicy {
+            quality_abi: MEMORY_DECODE_QUALITY_ABI,
+            family: "fixture".to_owned(),
+            resolved_route: "fixture-route".to_owned(),
+            backend: MemoryBackend::Mlx,
+            tier: MemoryNumericTier {
+                precision: Precision::Bf16,
+                quant: Some(Quant::Q4),
+                component_precision_floors: &[],
+            },
+            load_shape: LoadShape::EagerMaterialization,
+            artifact: MemoryDecodeArtifactIdentity {
+                repository: "SceneWorks/fixture".to_owned(),
+                revision: "a".repeat(40),
+                variant: "q4".to_owned(),
+                fingerprint: format!("SceneWorks/fixture@{}:q4", "a".repeat(40)),
+            },
+            implementation_fingerprint: MEMORY_DECODE_QUALITY_IMPLEMENTATION_FINGERPRINT.to_owned(),
+            mode: MemoryMode::TextToImage,
+            overlay: None,
+            geometry,
+            use_pid: false,
+            tile_edge: 32,
+            overlap: 4,
+            metric: "max_abs_rgb_u8".to_owned(),
+            maximum_error: 48,
+            fixtures: [7_u64, 99]
+                .into_iter()
+                .map(|seed| MemoryDecodeQualityFixture {
+                    seed,
+                    production_latent_provenance: format!("fixture@revision seed={seed}"),
+                    production_latent_sha256: "a".repeat(64),
+                    dense_output_sha256: "b".repeat(64),
+                    tiled_output_sha256: "c".repeat(64),
+                    observed_error: 31,
+                })
+                .collect(),
+            production_evidence_sha256: String::new(),
+            disposition: MemoryDecodeQualityDisposition::Admitted,
+        }
+        .seal()
+    }
+
+    #[test]
+    fn geometry_decode_authority_is_exact_request_scoped_and_cleared() {
+        let mut cfg = config(7);
+        cfg.memory = Some(GenerationMemory {
+            tile_vae_decode: true,
+            decode_tile_edge: Some(32),
+            decode_overlap: Some(4),
+            ..Default::default()
+        });
+        let policy = quality_policy(cfg.geometry);
+        let evidence = policy.production_evidence_sha256.clone();
+        cfg.authorize_geometry_decode(&policy).unwrap();
+        let mut scope = MlxRequestScopeCore::with_cleanup(cfg, MlxScopeCleanup::None);
+        let mut request = GenerationRequest {
+            width: 64,
+            height: 64,
+            count: 3,
+            ..Default::default()
+        };
+        scope.configure_request(&mut request).unwrap();
+        assert_eq!(
+            validate_geometry_decode_authorization("fixture", &request, 32, 4).unwrap(),
+            evidence
+        );
+        assert!(validate_geometry_decode_authorization("fixture", &request, 48, 4).is_err());
+        scope.finish(MemoryRunOutcome::Complete).unwrap();
+        assert!(validate_geometry_decode_authorization("fixture", &request, 32, 4).is_err());
+    }
+
+    #[test]
+    fn geometry_decode_authority_rejects_load_shape_and_source_identity_drift() {
+        let mut cfg = config(7);
+        cfg.memory = Some(GenerationMemory {
+            tile_vae_decode: true,
+            decode_tile_edge: Some(32),
+            decode_overlap: Some(4),
+            ..Default::default()
+        });
+        let policy = quality_policy(cfg.geometry);
+
+        cfg.load_shape = LoadShape::DeferredMaterialization;
+        assert!(cfg.authorize_geometry_decode(&policy).is_err());
+        cfg.load_shape = LoadShape::EagerMaterialization;
+
+        let mut stale_source = policy.clone();
+        stale_source.implementation_fingerprint = "f".repeat(64);
+        assert!(cfg.authorize_geometry_decode(&stale_source).is_err());
+
+        let mut stale_artifact = policy;
+        stale_artifact.artifact.revision = "not-a-revision".to_owned();
+        assert!(cfg.authorize_geometry_decode(&stale_artifact).is_err());
     }
 
     #[test]

@@ -756,6 +756,7 @@ mod tests {
     ) -> MemoryRunContext {
         let calibration = contract.calibration.as_ref().unwrap();
         MemoryRunContext {
+            optimization_authority: mlx_gen::gen_core::MemoryOptimizationAuthority::Calibrated,
             selection: MemorySelection {
                 strategy: MemoryStrategy::Resident,
                 parameters: MemoryStrategyParameters::default(),
