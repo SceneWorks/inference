@@ -684,6 +684,7 @@ mod tests {
         tier: MemoryNumericTier,
     ) -> MemoryRunContext {
         MemoryRunContext {
+            optimization_authority: mlx_gen::gen_core::MemoryOptimizationAuthority::Estimated,
             selection: MemorySelection {
                 strategy: MemoryStrategy::Resident,
                 parameters: Default::default(),

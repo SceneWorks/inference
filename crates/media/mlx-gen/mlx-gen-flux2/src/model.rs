@@ -1931,6 +1931,7 @@ mod tests {
             .expect("loaded Dev generator memory contract");
         let calibration = contract.calibration.as_ref().expect("Dev calibration");
         MemoryRunContext {
+            optimization_authority: mlx_gen::gen_core::MemoryOptimizationAuthority::Calibrated,
             selection: MemorySelection {
                 strategy: MemoryStrategy::Resident,
                 parameters: Default::default(),

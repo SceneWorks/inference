@@ -779,7 +779,15 @@ impl LoadSpec {
         if self.decode_geometry_policies.is_empty() {
             return Ok(Vec::new());
         }
-        let identity = self.decode_quality_runtime_identity.as_ref().ok_or_else(|| {
+        let policies = self.route_and_family_bound_decode_geometry_policies()?;
+        self.validate_decode_quality_runtime_identity(&policies)?;
+        Ok(policies)
+    }
+
+    fn route_and_family_bound_decode_geometry_policies(
+        &self,
+    ) -> crate::Result<Vec<MemoryDecodeGeometryPolicy>> {
+        self.decode_quality_runtime_identity.as_ref().ok_or_else(|| {
             crate::Error::Unsupported(
                 "decode-quality policies require independently resolved artifact and implementation identity"
                     .to_owned(),
@@ -817,7 +825,20 @@ impl LoadSpec {
                 )));
             }
         }
-        if let Some(foreign) = self.decode_geometry_policies.iter().find(|policy| {
+        Ok(self.decode_geometry_policies.clone())
+    }
+
+    fn validate_decode_quality_runtime_identity(
+        &self,
+        policies: &[MemoryDecodeGeometryPolicy],
+    ) -> crate::Result<()> {
+        let identity = self.decode_quality_runtime_identity.as_ref().ok_or_else(|| {
+            crate::Error::Unsupported(
+                "decode-quality policies require independently resolved artifact and implementation identity"
+                    .to_owned(),
+            )
+        })?;
+        if let Some(foreign) = policies.iter().find(|policy| {
             policy.artifact != identity.artifact
                 || policy.implementation_fingerprint != identity.implementation_fingerprint
         }) {
@@ -829,7 +850,7 @@ impl LoadSpec {
                 identity.implementation_fingerprint,
             )));
         }
-        Ok(self.decode_geometry_policies.clone())
+        Ok(())
     }
 
     /// Select the rows applicable to one concrete loaded provider contract. A manifest table may
@@ -841,17 +862,22 @@ impl LoadSpec {
         backend: MemoryBackend,
         tier: MemoryNumericTier,
     ) -> crate::Result<Vec<MemoryDecodeGeometryPolicy>> {
-        let policies = self.route_bound_decode_geometry_policies()?;
+        if self.decode_geometry_policies.is_empty() {
+            return Ok(Vec::new());
+        }
+        let policies = self.route_and_family_bound_decode_geometry_policies()?;
         if let Some(foreign) = policies.iter().find(|policy| policy.backend != backend) {
             return Err(crate::Error::Unsupported(format!(
                 "decode-quality policy backend {:?} cannot authorize loaded backend {:?}",
                 foreign.backend, backend
             )));
         }
-        Ok(policies
+        let selected = policies
             .into_iter()
             .filter(|policy| policy.tier == tier && policy.load_shape == self.load_shape)
-            .collect())
+            .collect::<Vec<_>>();
+        self.validate_decode_quality_runtime_identity(&selected)?;
+        Ok(selected)
     }
 
     /// Read-only view of the prepared File identities carried by this spec.

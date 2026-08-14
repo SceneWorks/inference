@@ -1,8 +1,8 @@
 import importlib.util
 import json
+import tempfile
+import unittest
 from pathlib import Path
-
-import pytest
 
 
 SCRIPT = Path(__file__).parents[1] / "ci" / "collect_decode_quality_admission.py"
@@ -50,124 +50,123 @@ def receipt(seed: int, error: int) -> dict:
     }
 
 
-def test_seals_a_multi_seed_coordinate_and_retains_failure_reason(tmp_path: Path) -> None:
-    log = tmp_path / "quality.log"
-    log.write_text(
-        "noise\n"
-        + "\n".join(
-            f"test output DECODE_QUALITY_V2 {json.dumps(row)}"
-            for row in (receipt(7, 47), receipt(99, 52))
+class DecodeQualityAdmissionCollectorTests(unittest.TestCase):
+    def write_log(self, row: dict) -> Path:
+        temporary = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False)
+        self.addCleanup(Path(temporary.name).unlink, missing_ok=True)
+        with temporary:
+            temporary.write(f"DECODE_QUALITY_V2 {json.dumps(row)}\n")
+        return Path(temporary.name)
+
+    def test_seals_a_multi_seed_coordinate_and_retains_failure_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            log = Path(temporary) / "quality.log"
+            log.write_text(
+                "noise\n"
+                + "\n".join(
+                    f"test output DECODE_QUALITY_V2 {json.dumps(row)}"
+                    for row in (receipt(7, 47), receipt(99, 52))
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            policies = collector.seal(collector.read_receipts([log]))
+
+        self.assertEqual(len(policies), 1)
+        policy = policies[0]
+        self.assertEqual([fixture["seed"] for fixture in policy["fixtures"]], [7, 99])
+        self.assertEqual(
+            policy["disposition"],
+            {
+                "kind": "refused",
+                "reason": "max_abs_rgb_u8 exceeded 48: seed 99=52",
+            },
         )
-        + "\n",
-        encoding="utf-8",
-    )
-
-    policies = collector.seal(collector.read_receipts([log]))
-
-    assert len(policies) == 1
-    policy = policies[0]
-    assert [fixture["seed"] for fixture in policy["fixtures"]] == [7, 99]
-    assert policy["disposition"] == {
-        "kind": "refused",
-        "reason": "max_abs_rgb_u8 exceeded 48: seed 99=52",
-    }
-    assert len(policy["productionEvidenceSha256"]) == 64
-    assert policy["productionEvidenceSha256"] == collector.seal(
-        [receipt(99, 52), receipt(7, 47)]
-    )[0]["productionEvidenceSha256"]
-
-
-def test_rejects_nonsemantic_fields_instead_of_absorbing_measurements(tmp_path: Path) -> None:
-    row = receipt(7, 47)
-    row["elapsedMs"] = 12
-    log = tmp_path / "quality.log"
-    log.write_text(
-        f"DECODE_QUALITY_V2 {json.dumps(row)}\n",
-        encoding="utf-8",
-    )
-
-    with pytest.raises(ValueError, match="semantic allowlist"):
-        collector.read_receipts([log])
-
-
-@pytest.mark.parametrize(
-    ("field", "value", "message"),
-    [
-        ("usePid", 0, "usePid must be a boolean"),
-        ("overlay", "bad=value", "overlay must be"),
-        ("tileEdge", 128, "tileEdge must exceed"),
-    ],
-)
-def test_rejects_malformed_semantic_coordinates(
-    tmp_path: Path, field: str, value: object, message: str
-) -> None:
-    row = receipt(7, 47)
-    if field == "tileEdge":
-        row["overlap"] = 128
-    row[field] = value
-    log = tmp_path / "quality.log"
-    log.write_text(f"DECODE_QUALITY_V2 {json.dumps(row)}\n", encoding="utf-8")
-
-    with pytest.raises(ValueError, match=message):
-        collector.read_receipts([log])
-
-
-def test_load_shape_artifact_implementation_and_tile_pair_are_exact_coordinates() -> None:
-    rows = [receipt(7, 1), receipt(99, 2)]
-    variants: list[dict] = []
-    for mutate in (
-        lambda row: row.update(loadShape="eager_materialization"),
-        lambda row: row["artifact"].update(variant="q8"),
-        lambda row: row.update(tileEdge=768, overlap=128),
-    ):
-        pair = [receipt(7, 1), receipt(99, 2)]
-        for row in pair:
-            mutate(row)
-        variants.extend(pair)
-
-    policies = collector.seal([*rows, *variants])
-    assert len(policies) == 4
-    coordinates = {
-        (
-            policy["loadShape"],
-            policy["artifact"]["variant"],
-            policy["implementationFingerprint"],
-            policy["tileEdge"],
-            policy["overlap"],
+        self.assertEqual(len(policy["productionEvidenceSha256"]), 64)
+        self.assertEqual(
+            policy["productionEvidenceSha256"],
+            collector.seal([receipt(99, 52), receipt(7, 47)])[0][
+                "productionEvidenceSha256"
+            ],
         )
-        for policy in policies
-    }
-    assert len(coordinates) == 4
+
+    def test_rejects_nonsemantic_fields_instead_of_absorbing_measurements(self) -> None:
+        row = receipt(7, 47)
+        row["elapsedMs"] = 12
+
+        with self.assertRaisesRegex(ValueError, "semantic allowlist"):
+            collector.read_receipts([self.write_log(row)])
+
+    def test_rejects_malformed_semantic_coordinates(self) -> None:
+        cases = [
+            ("usePid", 0, "usePid must be a boolean"),
+            ("overlay", "bad=value", "overlay must be"),
+            ("tileEdge", 128, "tileEdge must exceed"),
+        ]
+        for field, value, message in cases:
+            with self.subTest(field=field):
+                row = receipt(7, 47)
+                if field == "tileEdge":
+                    row["overlap"] = 128
+                row[field] = value
+                with self.assertRaisesRegex(ValueError, message):
+                    collector.read_receipts([self.write_log(row)])
+
+    def test_load_shape_artifact_implementation_and_tile_pair_are_exact_coordinates(self) -> None:
+        rows = [receipt(7, 1), receipt(99, 2)]
+        variants: list[dict] = []
+        for mutate in (
+            lambda row: row.update(loadShape="eager_materialization"),
+            lambda row: row["artifact"].update(variant="q8"),
+            lambda row: row.update(tileEdge=768, overlap=128),
+        ):
+            pair = [receipt(7, 1), receipt(99, 2)]
+            for row in pair:
+                mutate(row)
+            variants.extend(pair)
+
+        policies = collector.seal([*rows, *variants])
+        self.assertEqual(len(policies), 4)
+        coordinates = {
+            (
+                policy["loadShape"],
+                policy["artifact"]["variant"],
+                policy["implementationFingerprint"],
+                policy["tileEdge"],
+                policy["overlap"],
+            )
+            for policy in policies
+        }
+        self.assertEqual(len(coordinates), 4)
+
+    def test_rejects_malformed_load_and_source_identity(self) -> None:
+        cases = [
+            (lambda row: row.update(loadShape="deferred"), "unsupported loadShape"),
+            (
+                lambda row: row["artifact"].update(revision="A" * 40),
+                "artifact.revision",
+            ),
+            (
+                lambda row: row["artifact"].update(extra="ambient"),
+                "exact ABI-2 identity axes",
+            ),
+            (
+                lambda row: row.update(implementationFingerprint="g" * 64),
+                "implementationFingerprint",
+            ),
+            (
+                lambda row: row.update(implementationFingerprint="f" * 64),
+                "running inference source closure",
+            ),
+        ]
+        for mutate, message in cases:
+            with self.subTest(message=message):
+                row = receipt(7, 1)
+                mutate(row)
+                with self.assertRaisesRegex(ValueError, message):
+                    collector.read_receipts([self.write_log(row)])
 
 
-@pytest.mark.parametrize(
-    ("mutate", "message"),
-    [
-        (lambda row: row.update(loadShape="deferred"), "unsupported loadShape"),
-        (
-            lambda row: row["artifact"].update(revision="A" * 40),
-            "artifact.revision",
-        ),
-        (
-            lambda row: row["artifact"].update(extra="ambient"),
-            "exact ABI-2 identity axes",
-        ),
-        (
-            lambda row: row.update(implementationFingerprint="g" * 64),
-            "implementationFingerprint",
-        ),
-        (
-            lambda row: row.update(implementationFingerprint="f" * 64),
-            "running inference source closure",
-        ),
-    ],
-)
-def test_rejects_malformed_load_and_source_identity(
-    tmp_path: Path, mutate, message: str
-) -> None:
-    row = receipt(7, 1)
-    mutate(row)
-    log = tmp_path / "quality.log"
-    log.write_text(f"DECODE_QUALITY_V2 {json.dumps(row)}\n", encoding="utf-8")
-    with pytest.raises(ValueError, match=message):
-        collector.read_receipts([log])
+if __name__ == "__main__":
+    unittest.main()

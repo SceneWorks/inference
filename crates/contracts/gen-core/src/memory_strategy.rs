@@ -148,10 +148,10 @@ pub const MEMORY_DECODE_QUALITY_ABI: u32 = 2;
 /// merge commit have different object ids but the same implementation. The digest changes only
 /// when the quality-relevant source bytes change.
 pub const MEMORY_DECODE_QUALITY_IMPLEMENTATION_FINGERPRINT: &str =
-    "ca8ac2f47e2179dfe1c5985da84127943f63a25056afef4a6810a9c39e0edd79";
+    "da11e3ff292b9927bbe7c2695c247016dd91497fde4879e95d52f4e13957d7be";
 #[cfg(test)]
 const MEMORY_DECODE_QUALITY_CANONICAL_FIXTURE_SHA256: &str =
-    "39a95d34c5f2c874c48de5af43864ce774c44c268bc459c54589d6692702ac11";
+    "dcf29f895c72f1114ca20c9fb62edc4fd1cc253813aa67fde1bb20ad1ffa01c2";
 
 /// Prefix for the single-line calibration observation protocol consumed by release tooling.
 ///
@@ -4071,11 +4071,16 @@ mod tests {
         q4 = q4.seal();
         let mut q8 = q4.clone();
         q8.tier.quant = Some(Quant::Q8);
+        q8.artifact.variant = "q8".to_owned();
+        q8.artifact.fingerprint = format!(
+            "{}@{}:{}",
+            q8.artifact.repository, q8.artifact.revision, q8.artifact.variant
+        );
         q8 = q8.seal();
 
         let spec = LoadSpec::new(WeightsSource::Dir("/models/sdxl".into()))
             .with_resolved_route("realvisxl")
-            .with_decode_geometry_policies(vec![q4.clone(), q8])
+            .with_decode_geometry_policies(vec![q4.clone(), q8.clone()])
             .with_decode_quality_runtime_identity(decode_quality_runtime_identity(&q4))
             .with_quant(Quant::Q4)
             .with_load_shape(LoadShape::DeferredMaterialization);
@@ -4090,6 +4095,22 @@ mod tests {
             )
             .unwrap(),
             [q4.clone()]
+        );
+        let q8_spec = spec
+            .clone()
+            .with_decode_quality_runtime_identity(decode_quality_runtime_identity(&q8));
+        assert_eq!(
+            q8_spec
+                .decode_geometry_policies_for_loaded_contract(
+                    MemoryBackend::Mlx,
+                    MemoryNumericTier {
+                        precision: Precision::Bf16,
+                        quant: Some(Quant::Q8),
+                        component_precision_floors: &[],
+                    },
+                )
+                .unwrap(),
+            [q8]
         );
         let eager = spec.with_load_shape(LoadShape::EagerMaterialization);
         assert!(
