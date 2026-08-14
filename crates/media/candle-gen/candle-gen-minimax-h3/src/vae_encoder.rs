@@ -95,6 +95,12 @@ pub const LOGVAR_CLAMP: (f64, f64) = (-30.0, 20.0);
 /// already within an order of the ceiling.
 const IM2COL_BUDGET: usize = 128 * 1024 * 1024;
 
+/// The point past which **batch splitting cannot help**: one frame's im2col alone would exceed what
+/// candle can address in a single launch. Beyond this the answer is to tile, not to chunk, so
+/// `chunked_conv2d` raises a typed error naming that rather than truncating to `u32` and leaving an
+/// uninitialized output tail.
+const IM2COL_HARD_CEILING: usize = u32::MAX as usize;
+
 // -------------------------------------------------------------------------------------------
 // Padding
 // -------------------------------------------------------------------------------------------
@@ -164,12 +170,39 @@ fn checked_product(values: &[usize], what: &str) -> Result<usize> {
 
 /// `x.conv2d(w, padding = 0, stride)`, split across the batch axis so no im2col buffer can enter
 /// candle's u32-overflow band.
+///
+/// Batch splitting cannot help when a **single** frame's im2col already exceeds `u32::MAX`, so that
+/// case is a typed error rather than a silently truncated launch. Production never reaches it —
+/// tiling is on by default, and a 256 px tile at 1024 channels is ~1.5e9 columns — but
+/// [`crate::vae::MiniMaxH3VideoVae::encode_clip_tiled`] takes a caller-supplied tile size, and a
+/// caller who disables tiling on a 2048 px canvas would otherwise get a corrupt output tail on CUDA
+/// with nothing to indicate it.
 fn chunked_conv2d(x: &Tensor, w: &Tensor, stride: usize, budget: usize) -> Result<Tensor> {
+    chunked_conv2d_ceilinged(x, w, stride, budget, IM2COL_HARD_CEILING)
+}
+
+/// [`chunked_conv2d`] with an explicit addressable ceiling, so the guard can be exercised without
+/// allocating the multi-gigabyte tensor that would trip the real one.
+fn chunked_conv2d_ceilinged(
+    x: &Tensor,
+    w: &Tensor,
+    stride: usize,
+    budget: usize,
+    ceiling: usize,
+) -> Result<Tensor> {
     let (n, c, h, wd) = x.dims4()?;
     let (_o, _i, kh, kw) = w.dims4()?;
     let h_out = h.saturating_sub(kh) / stride + 1;
     let w_out = wd.saturating_sub(kw) / stride + 1;
     let cols_per_frame = checked_product(&[h_out, w_out, c, kh, kw], "im2col frame")?.max(1);
+    if cols_per_frame > ceiling {
+        return Err(CandleError::Msg(format!(
+            "minimax-h3 encoder: one {h_out}x{w_out}x{c} frame needs {cols_per_frame} im2col \
+             columns, over the {ceiling} candle can address in a single launch; encode with \
+             spatial tiling (the shipped default is {TILE_SAMPLE_MIN_SIZE}px) rather than in one \
+             pass"
+        )));
+    }
     let max_batch = (budget / cols_per_frame).clamp(1, n.max(1));
     if n <= max_batch {
         return Ok(x.conv2d(w, 0, stride, 1, 1)?);
@@ -973,6 +1006,41 @@ mod tests {
             .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
         assert!(max_err < 1e-5, "chunked conv diverged: {max_err:.3e}");
         assert!(checked_product(&[usize::MAX, 2], "probe").is_err());
+    }
+
+    /// **The shipped tile fits, and a frame that cannot is an error rather than a corrupt tail.**
+    ///
+    /// Batch splitting is powerless once one frame alone exceeds what candle can address, so the
+    /// only honest answers are "tile" or "fail loudly". Computed against the encoder's real widest
+    /// stage so the headroom claim is a number, not a hope.
+    #[test]
+    fn a_single_frame_over_the_addressable_ceiling_is_an_error_not_a_corrupt_tail() {
+        // The encoder's heaviest per-frame im2col at the shipped 256px tile: `conv1` of the last
+        // level, 1024 channels over a 3x3 kernel at the level's own resolution.
+        let cfg = MiniMaxH3VaeConfig::default();
+        let widest = *cfg.block_out_channels.last().expect("levels");
+        let at_tile = TILE_SAMPLE_MIN_SIZE * TILE_SAMPLE_MIN_SIZE * widest * 3 * 3;
+        assert!(
+            at_tile < IM2COL_HARD_CEILING,
+            "a shipped {TILE_SAMPLE_MIN_SIZE}px tile needs {at_tile} columns, over the ceiling"
+        );
+        const { assert!(IM2COL_BUDGET < IM2COL_HARD_CEILING) };
+
+        // A frame that really is over the ceiling errors, and says to tile.
+        let dev = Device::Cpu;
+        let x = Tensor::zeros((1, 4, 5, 5), DType::F32, &dev).unwrap();
+        let w = Tensor::zeros((2, 4, 3, 3), DType::F32, &dev).unwrap();
+        // 3*3*4*3*3 = 324 columns per frame; a ceiling of 1 forces the guard.
+        let err = super::chunked_conv2d_ceilinged(&x, &w, 1, IM2COL_BUDGET, 1)
+            .expect_err("a frame over the ceiling must be rejected")
+            .to_string();
+        assert!(err.contains("im2col columns"), "unexpected error: {err}");
+        assert!(
+            err.contains("tiling"),
+            "the error must name the fix, got: {err}"
+        );
+        // …and the same call under the real ceiling succeeds.
+        assert!(chunked_conv2d(&x, &w, 1, IM2COL_BUDGET).is_ok());
     }
 
     /// A conv3d cannot invent samples: a kernel that does not fit the (already padded) volume is a
