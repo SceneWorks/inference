@@ -515,6 +515,7 @@ dependencies = [
  "candle-gen-lens",
  "candle-gen-ltx",
  "candle-gen-mage",
+ "candle-gen-minimax-h3",
  "candle-gen-mochi",
  "candle-gen-pid",
  "candle-gen-pulid",
@@ -751,9 +752,13 @@ name = "candle-gen-minimax-h3"
 version = "0.0.0"
 dependencies = [
  "candle-gen",
+ "candle-gen-boogu",
+ "image",
+ "rand",
  "sceneworks-gen-core-testkit",
  "serde_json",
  "tempfile",
+ "tokenizers 0.22.2",
 ]
 
 [[package]]
