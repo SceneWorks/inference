@@ -5401,10 +5401,25 @@ jobs:
       #      `cuda:0`, so both listeners contend on the SAME card while GPU 1 idles. This render
       #      sequentially stages a 66.7 GB conditioner and a 66.3 GB DiT; a co-tenant job would
       #      contaminate the high-water. `VramProbe::assert_trustworthy(1.0)` makes that a RED
-      #      rather than a quiet lie, but a red costs the whole multi-hour render, so the probe is
-      #      dispatched ALONE by construction instead of relying on luck.
+      #      rather than a quiet lie, but a red costs the whole multi-hour render.
       #   2. The shipped 1344x768 canvas at the 124-frame lattice floor and `DEFAULT_STEPS = 50` is
       #      measured in HOURS. That has no business inside a weekly sweep.
+      #
+      # ⚠️ THIS INPUT GATE IS A NARROWING, NOT EXCLUSIVITY, and the difference is load-bearing.
+      # It guarantees the probe never rides a bulk `all` / `media` sweep — the likeliest in-workflow
+      # co-tenant — and nothing more. It does NOT hold the box:
+      #   * this workflow's `concurrency` group is keyed on `${{ inputs.profile }}`, so a dispatch of
+      #     a DIFFERENT profile is a different group and runs concurrently; and
+      #   * it does not scope `ci.yml` at all, whose `Candle CUDA compile check (Windows)` lands on
+      #     the same two listeners. On 2026-08-14 two such compile jobs (PRs #608 and #610) running
+      #     together CRASHED THE COMPILER on this box, which is the proof that "the card is big
+      #     enough" is not the same claim as "the box is free".
+      # So this lane must be dispatched when the box is known idle, and a run that reds on
+      # `assert_trustworthy` should be read as contention rather than as a model fact. Giving it real
+      # exclusivity means one concurrency group shared by EVERY CUDA-consuming job across `ci.yml`
+      # and this file, or a dedicated listener/label for the probe. Both serialize CUDA CI
+      # repo-wide, which is a throughput decision for the box owner and is deliberately NOT taken
+      # here as a side effect of landing a probe.
       #
       # THE WEEKLY CANNOT REACH THIS STEP. GitHub runs `schedule:` only from the DEFAULT branch, so
       # while epic 17137 lives on `feature/sc-17137-minimax-h3` the entire job is dispatch-only.
