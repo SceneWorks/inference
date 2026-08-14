@@ -14,11 +14,12 @@
 use mlx_rs::{
     module::Param,
     nn::{Linear, QuantizedLinear},
-    ops::{add, addmm, einsum, kron, matmul, multiply, quantized_matmul},
+    ops::{add, addmm, einsum, kron, matmul, multiply},
     Array, Dtype,
 };
 
 use crate::array::scalar;
+use crate::nn::quantized_matmul_with_bias;
 use crate::Result;
 
 pub mod loader;
@@ -510,19 +511,15 @@ impl LinearBase {
                 // feeding bf16 activations straight in matches the fork's own quantized compute dtype
                 // (bf16 latents → `quantized_matmul` → bf16), so it is strictly *more* faithful, not less.
                 // Weights stay Q4/Q8 throughout. (`q8_smoke.rs` exercises the bf16-activation path.)
-                let mut y = quantized_matmul(
+                quantized_matmul_with_bias(
                     x,
                     &q.inner.weight.value,
                     &q.scales.value,
                     &q.biases.value,
-                    true,
+                    q.inner.bias.value.as_ref(),
                     q.group_size,
                     q.bits,
-                )?;
-                if let Some(b) = q.inner.bias.value.as_ref() {
-                    y = add(&y, b)?;
-                }
-                y
+                )?
             }
         })
     }

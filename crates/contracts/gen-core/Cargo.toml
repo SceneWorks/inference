@@ -24,6 +24,7 @@ safetensors = { workspace = true }
 serde_json = { workspace = true }
 # Canonical production-latent tiled-decode quality receipts (SC-18325). This hashes semantic
 # fixture/output bytes only and does not introduce tensor, timing, or memory-measurement code.
+# Canonical semantic fingerprints bind complete alternate snapshots to the retained tokenizer.
 sha2 = { workspace = true }
 # The independent LLM-serving contract (epic 7153, sc-7189). gen-core re-exports it as
 # `gen_core::core_llm` so the gen-ai side consumes the unified `core_llm::TextLlm` engine. core-llm is

@@ -17,11 +17,14 @@ mlx-rs = { workspace = true }
 # backbone, so `decode_and_collect` routes through a `mlx_gen_pid::PidDecoder` when `req.use_pid` is
 # set. `mlx-gen-pid` depends only on core (no dep on this crate), so the dependency is acyclic.
 mlx-gen-pid = { path = "../mlx-gen-pid" }
+# Experimental Wan 2.1 z16 alternate decoder; only the caller-staged standalone VAE is loaded.
+mlx-gen-wan = { path = "../mlx-gen-wan" }
 # Offline pre-quantization converter (sc-8670): annotate the packed tier's `config.json` with the
 # `quantization` block (HF/diffusers-compat; the loader auto-detects via `{base}.scales`).
 serde_json = { workspace = true }
 
 [dev-dependencies]
+sceneworks-gen-core-testkit = { workspace = true }
 # RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on
 # `Drop` — including out of a panicking test, which is the only path the old
 # `env::temp_dir().join(..)` + trailing `remove_dir_all` shape ever leaked on.

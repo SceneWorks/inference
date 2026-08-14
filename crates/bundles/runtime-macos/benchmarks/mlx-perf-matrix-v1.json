@@ -1,5 +1,5 @@
 {
-  "schemaVersion": "sceneworks.mlx-perf-matrix.v3",
+  "schemaVersion": "sceneworks.mlx-perf-matrix.v4",
   "benchmarkId": "sc-18321-cross-family-v1",
   "warmupRuns": 1,
   "measuredRuns": 3,
@@ -117,6 +117,13 @@
         "wan::transformer::gelu_ffn",
         "wan::transformer::modulate"
       ],
+      "expectedP3ExactEpilogueOperations": [
+        "conv2d_bias",
+        "conv3d_bias",
+        "gelu_tanh",
+        "quantized_matmul_bias",
+        "silu"
+      ],
       "artifactKey": "wan_q4",
       "repository": "SceneWorks/wan2.2-ti2v-5b-mlx",
       "tier": "q4",
@@ -142,6 +149,13 @@
         "wan::transformer::gated",
         "wan::transformer::gelu_ffn",
         "wan::transformer::modulate"
+      ],
+      "expectedP3ExactEpilogueOperations": [
+        "conv2d_bias",
+        "conv3d_bias",
+        "gelu_tanh",
+        "quantized_matmul_bias",
+        "silu"
       ],
       "artifactKey": "wan_q4",
       "repository": "SceneWorks/wan2.2-ti2v-5b-mlx",
@@ -169,6 +183,13 @@
         "wan::transformer::gelu_ffn",
         "wan::transformer::modulate"
       ],
+      "expectedP3ExactEpilogueOperations": [
+        "conv2d_bias",
+        "conv3d_bias",
+        "gelu_tanh",
+        "quantized_matmul_bias",
+        "silu"
+      ],
       "artifactKey": "wan_q4",
       "repository": "SceneWorks/wan2.2-ti2v-5b-mlx",
       "tier": "q4",
@@ -195,6 +216,12 @@
         "qwen_image::block::modulate",
         "qwen_image::feed_forward::gelu_ffn"
       ],
+      "expectedP3ExactEpilogueOperations": [
+        "conv2d_bias",
+        "conv3d_bias",
+        "quantized_matmul_bias",
+        "silu"
+      ],
       "artifactKey": "qwen_image_q4",
       "repository": "SceneWorks/qwen-image-mlx",
       "tier": "q4",
@@ -218,6 +245,12 @@
         "qwen_image::block::gated",
         "qwen_image::block::modulate",
         "qwen_image::feed_forward::gelu_ffn"
+      ],
+      "expectedP3ExactEpilogueOperations": [
+        "conv2d_bias",
+        "conv3d_bias",
+        "quantized_matmul_bias",
+        "silu"
       ],
       "artifactKey": "qwen_image_q4",
       "repository": "SceneWorks/qwen-image-mlx",
@@ -243,6 +276,12 @@
         "qwen_image::block::modulate",
         "qwen_image::feed_forward::gelu_ffn"
       ],
+      "expectedP3ExactEpilogueOperations": [
+        "conv2d_bias",
+        "conv3d_bias",
+        "quantized_matmul_bias",
+        "silu"
+      ],
       "artifactKey": "qwen_image_q4",
       "repository": "SceneWorks/qwen-image-mlx",
       "tier": "q4",
@@ -265,6 +304,11 @@
         "mlx_gen::nn::gelu_exact",
         "mlx_gen::nn::gelu_quick",
         "sdxl::silu_glue"
+      ],
+      "expectedP3ExactEpilogueOperations": [
+        "conv2d_bias",
+        "group_norm_affine",
+        "silu"
       ],
       "artifactKey": "sdxl_bf16",
       "repository": "SceneWorks/sdxl-base-mlx",
@@ -289,6 +333,11 @@
         "mlx_gen::nn::gelu_quick",
         "sdxl::silu_glue"
       ],
+      "expectedP3ExactEpilogueOperations": [
+        "conv2d_bias",
+        "group_norm_affine",
+        "silu"
+      ],
       "artifactKey": "sdxl_bf16",
       "repository": "SceneWorks/sdxl-base-mlx",
       "tier": "bf16",
@@ -311,6 +360,11 @@
         "mlx_gen::nn::gelu_exact",
         "mlx_gen::nn::gelu_quick",
         "sdxl::silu_glue"
+      ],
+      "expectedP3ExactEpilogueOperations": [
+        "conv2d_bias",
+        "group_norm_affine",
+        "silu"
       ],
       "artifactKey": "sdxl_bf16",
       "repository": "SceneWorks/sdxl-base-mlx",

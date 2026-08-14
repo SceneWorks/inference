@@ -45,7 +45,9 @@
 //! (29.2% lower), with max/mean pixel delta zero. Native and PiD decode domains remain disjoint and
 //! are validated against `use_pid` at both admission and request-scope configuration.
 
-use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
+use mlx_gen::asset_facts::{
+    projected_safetensors_bytes, projected_tensor_headers_bytes, ResidentProjection,
+};
 #[cfg(test)]
 use mlx_gen::gen_core::MemoryGeometry;
 use mlx_gen::gen_core::{
@@ -62,6 +64,19 @@ pub const DECODE_OVERLAP: u32 = 64;
 pub const ATTENTION_CHUNK_SIZE: u32 = mlx_gen::attention::CONSTRAINED_ATTN_SCORES_BUDGET as u32;
 pub const MEMORY_CALIBRATION_FINGERPRINT: &str =
     "krea-2-mlx-full-ladder-native-pid-attn64m-window1-2026-08-03-v3";
+/// The Wan terminal decoder has not been measured as part of Krea's whole-request ladder. A separate
+/// identity prevents native-decoder evidence from being reused and forces conservative
+/// asset-facts + headroom estimation (including SceneWorks' estimate margin).
+pub const WAN_DECODER_CALIBRATION_FINGERPRINT: &str =
+    "krea-2-mlx-wan21-decoder-unmeasured-composite-2026-08-10-v1";
+
+fn calibration_fingerprint(spec: &LoadSpec) -> &'static str {
+    if spec.components.contains_key(mlx_gen::VAE_COMPONENT) {
+        WAN_DECODER_CALIBRATION_FINGERPRINT
+    } else {
+        MEMORY_CALIBRATION_FINGERPRINT
+    }
+}
 
 fn decode_routes(provider_id: &str) -> CoreResult<mlx_gen_pid::DecodeRoutes> {
     mlx_gen_pid::DecodeRoutes::new_core(provider_id, [DECODE_TILE_EDGE], DECODE_OVERLAP)
@@ -116,12 +131,13 @@ pub(crate) fn memory_strategy_contract_with_plan(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> CoreResult<(MemoryProviderContract, crate::model::ResolvedLoadPlan)> {
-    let _ = crate::model::component_footprint(spec)?;
+    let _ = crate::model::component_footprint_for(provider_id, spec)?;
     let WeightsSource::Dir(root) = &spec.weights else {
         return Err(CoreError::Msg(
             "krea memory facts require a snapshot directory".to_owned(),
         ));
     };
+    let plan = resolved_load_plan(provider_id, spec)?;
     let project = |path: &std::path::Path, select: &dyn Fn(&str) -> bool| -> CoreResult<u64> {
         projected_safetensors_bytes(path, |tensor| {
             if let Some(quant) = spec.quantize.filter(|_| select(&tensor.name)) {
@@ -134,17 +150,50 @@ pub(crate) fn memory_strategy_contract_with_plan(
             }
         })
     };
+    let alternate_decoder_bytes = match spec.components.get(mlx_gen::VAE_COMPONENT) {
+        Some(WeightsSource::Dir(path)) => {
+            projected_safetensors_bytes(path, |_| ResidentProjection::Stored)?
+        }
+        Some(WeightsSource::File(path)) => spec.read_file_unchanged_if_prepared(path, |p| {
+            projected_safetensors_bytes(p, |_| ResidentProjection::Stored)
+        })?,
+        None => 0,
+    };
+    let selected_text_encoder = crate::model::ENCODER_CONTRACT.source_for_load(spec, root)?;
+    let language_bytes = crate::model::selected_language_resident_bytes(
+        &selected_text_encoder,
+        plan.effective_quant.map(mlx_gen::Quant::bits),
+        provider_id,
+    )?;
+    let mut vision_bytes = 0;
+    if matches!(
+        provider_id,
+        crate::model::KREA_2_EDIT_ID | crate::model::KREA_2_TURBO_EDIT_ID
+    ) {
+        let vision = crate::model::ENCODER_CONTRACT
+            .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)?;
+        let vision_headers = vision.materialized_vision_tensor_headers(
+            &crate::model::VISION_ENCODER_CONTRACT,
+            &crate::model::ENCODER_CONTRACT,
+        )?;
+        vision_bytes =
+            projected_tensor_headers_bytes(&vision_headers, |_| ResidentProjection::Stored)?;
+    }
+    let selected_text_encoder_bytes =
+        language_bytes.checked_add(vision_bytes).ok_or_else(|| {
+            CoreError::Msg(format!(
+                "{provider_id}: selected language plus builtin vision resident byte overflow"
+            ))
+        })?;
     let components = mlx_gen::PerComponentBytes {
-        text_encoder: project(
-            &root.join("text_encoder"),
-            &crate::convert::is_text_encoder_quant_target,
-        )?,
+        text_encoder: selected_text_encoder_bytes,
         dit: project(&root.join("transformer"), &|name| {
             crate::convert::is_transformer_quant_target(name)
         })?,
-        vae: project(&root.join("vae"), &|_| false)?,
+        // The native Qwen VAE remains resident for reference/edit encoding; Wan is an additive
+        // terminal decoder, so the contract prices both rather than reusing native measurements.
+        vae: project(&root.join("vae"), &|_| false)?.saturating_add(alternate_decoder_bytes),
     };
-    let plan = resolved_load_plan(provider_id, spec)?;
     Ok((
         memory_strategy_contract_with_components(
             provider_id,
@@ -204,7 +253,7 @@ fn memory_strategy_contract_with_components(
         ],
     };
     contract.calibration = Some(MemoryCalibrationIdentity::new(
-        MEMORY_CALIBRATION_FINGERPRINT,
+        calibration_fingerprint(spec),
         spec.load_shape,
     ));
     contract.asset_facts.base_bytes = components
@@ -314,34 +363,50 @@ pub(crate) fn native_memory_strategy_contract_from_spec(
             )))
         }
     };
-    let text_plan =
-        crate::model::resolve_load_plan_for_component(spec, base_snapshot_dir, provider_id, false)?;
-    let text_encoder =
-        projected_safetensors_bytes(base_snapshot_dir.join("text_encoder"), |tensor| {
-            if let Some(bits) = text_plan
-                .load_time_quant_bits
-                .filter(|_| crate::convert::is_text_encoder_quant_target(&tensor.name))
-            {
-                ResidentProjection::GroupQuantized {
-                    bits,
-                    group_size: crate::quant::GROUP_SIZE as usize,
-                }
-            } else {
-                ResidentProjection::Stored
-            }
-        })
-        .map_err(|error| {
+    let alternate_decoder_bytes = match spec.components.get(mlx_gen::VAE_COMPONENT) {
+        Some(WeightsSource::Dir(path)) => stored(path, "alternate Wan decoder")?,
+        Some(WeightsSource::File(path)) => {
+            spec.read_file_unchanged_if_prepared(path, |p| stored(p, "alternate Wan decoder"))?
+        }
+        None => 0,
+    };
+    let selected_text_encoder =
+        crate::model::ENCODER_CONTRACT.source_for_load(spec, base_snapshot_dir)?;
+    let expected_language_bits =
+        crate::model::native_text_encoder_expected_quant_bits(base_snapshot_dir)?;
+    let language_bytes = crate::model::selected_language_resident_bytes(
+        &selected_text_encoder,
+        expected_language_bits,
+        provider_id,
+    )?;
+    let mut vision_bytes = 0;
+    if matches!(
+        provider_id,
+        crate::model::KREA_2_EDIT_ID | crate::model::KREA_2_TURBO_EDIT_ID
+    ) {
+        let builtin = crate::model::ENCODER_CONTRACT.validate_source_against_base(
+            &WeightsSource::Dir(base_snapshot_dir.join("text_encoder")),
+            base_snapshot_dir,
+        )?;
+        let headers = builtin.materialized_vision_tensor_headers(
+            &crate::model::VISION_ENCODER_CONTRACT,
+            &crate::model::ENCODER_CONTRACT,
+        )?;
+        vision_bytes = projected_tensor_headers_bytes(&headers, |_| ResidentProjection::Stored)?;
+    }
+    let selected_text_encoder_bytes =
+        language_bytes.checked_add(vision_bytes).ok_or_else(|| {
             CoreError::Msg(format!(
-                "{provider_id}: native base text-encoder asset facts for '{}': {error}",
-                base_snapshot_dir.join("text_encoder").display()
+                "{provider_id}: selected language plus builtin vision resident byte overflow"
             ))
         })?;
     let components = mlx_gen::PerComponentBytes {
-        text_encoder,
+        text_encoder: selected_text_encoder_bytes,
         dit: spec.read_file_unchanged_if_prepared(dit_file, |p| {
             native_dit_transformer_bytes(provider_id, p, spec.quantize)
         })?,
-        vae: stored(&base_snapshot_dir.join("vae"), "base VAE")?,
+        vae: stored(&base_snapshot_dir.join("vae"), "base VAE")?
+            .saturating_add(alternate_decoder_bytes),
     };
     memory_strategy_contract_with_components(provider_id, spec, components, streamable)
 }
@@ -607,6 +672,12 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             write_minimal_safetensors(&dir.join("model.safetensors"));
         }
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            crate::model::ENCODER_CONTRACT,
+            crate::model::VISION_ENCODER_CONTRACT,
+        )
+        .expect("validation-complete text encoder fixture");
         std::fs::write(
             root.join("transformer/config.json"),
             r#"{"quantization":{"bits":4,"group_size":64}}"#,
@@ -645,6 +716,38 @@ mod tests {
             eager.calibration.as_ref().unwrap().load_shape
         );
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn alternate_decoder_is_additive_to_native_decoder_asset_facts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_root, spec) = fixture(&tmp);
+        let native = memory_strategy_contract("krea_2_turbo", &spec).unwrap();
+        let donor = tmp.path().join("wan-vae.safetensors");
+        write_minimal_safetensors(&donor);
+        let composite = memory_strategy_contract(
+            "krea_2_turbo",
+            &spec.with_component(mlx_gen::VAE_COMPONENT, WeightsSource::File(donor)),
+        )
+        .unwrap();
+        assert_eq!(
+            composite.asset_facts.decoder_bytes,
+            native.asset_facts.decoder_bytes + 2,
+            "Krea keeps its Qwen VAE for conditioning and adds the Wan terminal decoder"
+        );
+        assert_eq!(
+            composite.asset_facts.base_bytes,
+            native.asset_facts.base_bytes + 2
+        );
+        assert_eq!(
+            composite.calibration.as_ref().unwrap().fingerprint,
+            WAN_DECODER_CALIBRATION_FINGERPRINT,
+            "native whole-request measurements must not authorize the composite decoder path"
+        );
+        assert_eq!(
+            native.calibration.as_ref().unwrap().fingerprint,
+            MEMORY_CALIBRATION_FINGERPRINT
+        );
     }
 
     fn resident_context(
@@ -910,7 +1013,15 @@ mod tests {
                     error.contains(component) || error.contains("safetensors"),
                     "{component}/{case}: {error}"
                 );
-                write_minimal_safetensors(&file);
+                if component == "text_encoder" {
+                    gen_core_testkit::write_encoder_contract_fixture(
+                        &root.join("text_encoder"),
+                        crate::model::ENCODER_CONTRACT,
+                    )
+                    .expect("restore validation-complete text encoder fixture");
+                } else {
+                    write_minimal_safetensors(&file);
+                }
             }
         }
         std::fs::remove_dir_all(root).ok();
@@ -1088,7 +1199,13 @@ mod tests {
         let mut identity = valid.clone();
         identity.identity = Some(mlx_gen::gen_core::IdentityWeights::default());
         let mut text_encoder = valid.clone();
-        text_encoder.text_encoder = Some(WeightsSource::Dir(root.join("external-text")));
+        let external_text_encoder = root.join("external-text");
+        gen_core_testkit::write_encoder_contract_fixture(
+            &external_text_encoder,
+            crate::model::ENCODER_CONTRACT,
+        )
+        .expect("validation-complete selected text encoder fixture");
+        text_encoder.text_encoder = Some(WeightsSource::Dir(external_text_encoder));
         let mut unknown_component = valid.clone();
         unknown_component.components.insert(
             "unknown".into(),
@@ -1121,7 +1238,7 @@ mod tests {
             ("extra_control", extra_control, false),
             ("ip_adapter", ip_adapter, false),
             ("identity", identity, false),
-            ("text_encoder", text_encoder, false),
+            ("text_encoder", text_encoder, true),
             ("unknown_component", unknown_component, false),
             ("missing_base", missing_base, false),
         ] {
@@ -1139,10 +1256,10 @@ mod tests {
         let native = root.join("native.safetensors");
         write_native_i8_safetensors(&native);
         let contract = native_memory_strategy_contract("krea_2_turbo", &native, &root).unwrap();
-        assert_eq!(contract.asset_facts.conditioning_bytes, 2);
+        assert_eq!(contract.asset_facts.conditioning_bytes, 7_843_069_440);
         assert_eq!(contract.asset_facts.decoder_bytes, 2);
         assert_eq!(contract.asset_facts.transformer_bytes, 2 * 64 * 2);
-        assert_eq!(contract.asset_facts.base_bytes, 260);
+        assert_eq!(contract.asset_facts.base_bytes, 7_843_069_698);
         for strategy in [
             MemoryStrategy::Resident,
             MemoryStrategy::BoundedDecode,
@@ -1166,5 +1283,32 @@ mod tests {
         }
         assert!(contract.conformance_errors().is_empty());
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn edit_prices_the_materialized_vision_surface_while_t2i_excludes_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, spec) = fixture(&tmp);
+        let (t2i, _) = memory_strategy_contract_with_plan(crate::model::KREA_2_TURBO_ID, &spec)
+            .expect("t2i contract");
+        let (edit, _) = memory_strategy_contract_with_plan(crate::model::KREA_2_EDIT_ID, &spec)
+            .expect("edit contract");
+        let vision = crate::model::ENCODER_CONTRACT
+            .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), &root)
+            .unwrap();
+        let vision_bytes = projected_tensor_headers_bytes(
+            &vision
+                .materialized_vision_tensor_headers(
+                    &crate::model::VISION_ENCODER_CONTRACT,
+                    &crate::model::ENCODER_CONTRACT,
+                )
+                .unwrap(),
+            |_| ResidentProjection::Stored,
+        )
+        .unwrap();
+        assert_eq!(
+            edit.asset_facts.conditioning_bytes - t2i.asset_facts.conditioning_bytes,
+            vision_bytes
+        );
     }
 }

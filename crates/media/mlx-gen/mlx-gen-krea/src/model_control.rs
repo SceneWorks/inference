@@ -14,9 +14,11 @@
 use mlx_gen::gen_core;
 use mlx_gen::{
     require_base_snapshot, require_control, AcceptedControlKinds, ConditioningKind, ControlBranch,
-    Error, GenerationOutput, GenerationRequest, Generator, LoadSpec, ModelDescriptor, Precision,
-    Progress, Quant, Residency, Result, WeightsSource, BASE_SNAPSHOT_COMPONENT,
+    Error, GenerationOutput, GenerationRequest, Generator, LatentDecoder, LoadSpec,
+    ModelDescriptor, Precision, Progress, Quant, Residency, Result, WeightsSource,
+    BASE_SNAPSHOT_COMPONENT, VAE_COMPONENT,
 };
+use mlx_gen_wan::OwnedWanSingleFrameDecoder;
 
 use mlx_gen::default_seed;
 
@@ -88,6 +90,7 @@ pub struct KreaTurboControl {
 struct ControlHeavyOwned {
     heavy: KreaHeavy,
     branch: Krea2ControlBranch,
+    alternate_decoder: Option<OwnedWanSingleFrameDecoder>,
     /// The effective base-DiT quant tier (`None` = dense bf16). Captured at load so the render-time
     /// geometry safety check can weigh the resident-weight footprint without re-deriving it from the
     /// (post-quant) modules.
@@ -105,6 +108,7 @@ struct ControlHeavyOwned {
 struct ControlHeavyRef<'a> {
     heavy: &'a KreaHeavy,
     branch: &'a Krea2ControlBranch,
+    alternate_decoder: Option<&'a OwnedWanSingleFrameDecoder>,
 }
 
 impl ControlHeavyOwned {
@@ -112,6 +116,7 @@ impl ControlHeavyOwned {
         ControlHeavyRef {
             heavy: &self.heavy,
             branch: &self.branch,
+            alternate_decoder: self.alternate_decoder.as_ref(),
         }
     }
 }
@@ -327,8 +332,6 @@ fn build_native_krea_control_from_spec(spec: &LoadSpec) -> Result<KreaTurboContr
         .weights_file_pin()?
         .expect("File weights must resolve to a pin");
     let base = require_base_snapshot(spec, KREA_2_TURBO_CONTROL_ID)?.to_path_buf();
-    let text_load_plan =
-        crate::model::resolve_load_plan_for_component(spec, &base, KREA_2_TURBO_CONTROL_ID, false)?;
     let pinned_control =
         match require_control(spec, KREA_2_TURBO_CONTROL_ID, "Krea 2 pose control overlay")? {
             WeightsSource::File(path) => Some(spec.file_pin_for(path)?),
@@ -357,14 +360,23 @@ fn build_native_krea_control_from_spec(spec: &LoadSpec) -> Result<KreaTurboContr
         None => build_memory_contract(),
     })?;
     let text_base = base.clone();
+    let text_encoder_source = crate::model::ENCODER_CONTRACT.source_for_load(spec, &base)?;
+    let expected_text_encoder_bits = crate::model::native_text_encoder_expected_quant_bits(&base)?;
+    let text_encoder_load_time_quant_bits = text_encoder_source
+        .load_time_quant_bits(expected_text_encoder_bits, KREA_2_TURBO_CONTROL_ID)?;
     let heavy_base = base;
     let heavy_spec = spec.clone();
     let heavy_dit = native_dit.clone();
     let heavy_control = pinned_control.clone();
-    let text_quant_bits = text_load_plan.load_time_quant_bits;
     let residency = Residency::from_policy(
         spec.offload_policy,
-        move || crate::model::load_krea_text_resolved(&text_base, text_quant_bits),
+        move || {
+            crate::model::load_krea_text_resolved(
+                &text_base,
+                &text_encoder_source,
+                text_encoder_load_time_quant_bits,
+            )
+        },
         move |_use_pid| {
             load_native_control_heavy(
                 &heavy_spec,
@@ -428,9 +440,11 @@ fn load_native_control_heavy(
         (None, Some(bits)) => Krea2ControlBranch::from_source_bounded(control, &cfg, bits)?,
         (None, None) => Krea2ControlBranch::from_source(control, &cfg)?,
     };
+    let alternate_decoder = mlx_gen_wan::load_selected_single_frame_decoder(spec, &descriptor())?;
     Ok(ControlHeavyOwned {
         heavy,
         branch,
+        alternate_decoder,
         base_tier: tier_from_bits(base_bits),
         branch_tier: tier_from_bits(branch_bits),
         cfg,
@@ -451,20 +465,20 @@ pub(crate) fn validate_control_spec(spec: &LoadSpec) -> Result<()> {
     }
     mlx_gen::gen_core::reject_unknown_components(
         spec,
-        &[BASE_SNAPSHOT_COMPONENT],
+        &[BASE_SNAPSHOT_COMPONENT, VAE_COMPONENT],
         KREA_2_TURBO_CONTROL_ID,
     )?;
+    mlx_gen_wan::validate_selected_single_frame_decoder(spec, &descriptor())?;
     let _ = require_base_snapshot(spec, KREA_2_TURBO_CONTROL_ID)?;
     let _ = require_control(spec, KREA_2_TURBO_CONTROL_ID, "Krea 2 pose control overlay")?;
     if matches!(spec.weights, WeightsSource::File(_))
         && (spec.ip_adapter.is_some()
             || !spec.extra_controls.is_empty()
             || spec.pid.is_some()
-            || spec.identity.is_some()
-            || spec.text_encoder.is_some())
+            || spec.identity.is_some())
     {
         return Err(Error::Unsupported(format!(
-            "{KREA_2_TURBO_CONTROL_ID}: imported pose control does not accept IP-adapter, extra-control, PiD, identity, or external text-encoder fields"
+            "{KREA_2_TURBO_CONTROL_ID}: imported pose control does not accept IP-adapter, extra-control, PiD, or identity fields"
         )));
     }
     Ok(())
@@ -584,9 +598,11 @@ fn load_control_heavy(
         (None, None) => Krea2ControlBranch::from_source(control, &cfg)?,
     };
     let branch_tier = tier_from_bits(branch_bits);
+    let alternate_decoder = mlx_gen_wan::load_selected_single_frame_decoder(spec, &descriptor())?;
     Ok(ControlHeavyOwned {
         heavy,
         branch,
+        alternate_decoder,
         base_tier,
         branch_tier,
         cfg,
@@ -739,6 +755,9 @@ impl KreaTurboControl {
                         &plan,
                         heavy.branch,
                         control_scale,
+                        heavy
+                            .alternate_decoder
+                            .map(|decoder| decoder as &dyn LatentDecoder),
                         decode_tiling.as_ref(),
                         req.memory.and_then(|memory| memory.calibration_error_phase),
                         &opts,
@@ -810,7 +829,7 @@ impl Generator for KreaTurboControl {
 // the plain delegation `impl_generator!` expresses (the z-image control precedent).
 mlx_gen::register_generators! {
     pub(crate) const CONTROL_REGISTRATION = descriptor => load;
-    footprint = crate::model::component_footprint
+    footprint = crate::model::control_component_footprint
 }
 
 pub const MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
@@ -856,6 +875,11 @@ mod tests {
         let base = tmp.path().join("incomplete-base");
         std::fs::create_dir_all(base.join("transformer")).unwrap();
         std::fs::write(base.join("transformer/config.json"), "{}").unwrap();
+        gen_core_testkit::write_encoder_contract_fixture(
+            &base.join("text_encoder"),
+            crate::model::ENCODER_CONTRACT,
+        )
+        .expect("validation-complete text encoder fixture");
         let dit = tmp.path().join("native-dit.safetensors");
         let control = tmp.path().join("control.safetensors");
         write_minimal_safetensors(&dit);
@@ -872,6 +896,11 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             write_minimal_safetensors(&dir.join("model.safetensors"));
         }
+        gen_core_testkit::write_encoder_contract_fixture(
+            &base.join("text_encoder"),
+            crate::model::ENCODER_CONTRACT,
+        )
+        .expect("validation-complete text encoder fixture");
         let dit = tmp.path().join("dit.safetensors");
         let control = tmp.path().join("control.safetensors");
         write_minimal_safetensors(&dit);
@@ -1040,7 +1069,7 @@ mod tests {
             .expect("missing base snapshot → err")
             .to_string();
         assert!(
-            e.contains("native base text-encoder asset facts"),
+            e.contains("native base VAE asset facts"),
             "expected the missing-base inventory error, got: {e}"
         );
     }
@@ -1069,7 +1098,7 @@ mod tests {
             "adapters must be accepted by the native control loader, got: {e}"
         );
         assert!(
-            e.contains("native base text-encoder asset facts"),
+            e.contains("native base VAE asset facts"),
             "expected the missing-base inventory error, got: {e}"
         );
     }
@@ -1087,7 +1116,7 @@ mod tests {
             .expect("missing required components must fail")
             .to_string();
         assert!(
-            e.contains("native base text-encoder asset facts"),
+            e.contains("native base VAE asset facts"),
             "expected the fail-closed base asset-sizing stage, got: {e}"
         );
         assert!(!e.contains("config.json"), "config was valid, got: {e}");

@@ -217,6 +217,51 @@ pub fn latent_spaces_compatible(
     matches!((denoiser_output, decoder_input), (Some(output), Some(input)) if output.is_compatible_with(input))
 }
 
+/// One weights-free alternate-decoder choice exposed through provider introspection.
+///
+/// The option carries both sides of the contract: the component id a caller must stage in
+/// [`crate::LoadSpec::components`] and the exact latent space the decoder consumes. Provider
+/// eligibility is deliberately explicit; latent compatibility is necessary but does not claim that
+/// a provider has wired the alternate decoder into its render path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecoderOption {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub component_id: &'static str,
+    pub input_latent_space: &'static LatentSpace,
+    pub eligible_backends: &'static [&'static str],
+    pub eligible_provider_ids: &'static [&'static str],
+    pub license_component: &'static str,
+    pub experimental: bool,
+}
+
+/// Stable request value for the Wan 2.1 z16 image-decoder substitution.
+pub const WAN_2_1_VAE_DECODER_ID: &str = "wan_2_1_vae";
+
+const WAN_2_1_VAE_ELIGIBLE_PROVIDERS: &[&str] = &[
+    "krea_2_turbo",
+    "krea_2_raw",
+    "krea_2_edit",
+    "krea_2_turbo_edit",
+    "krea_2_turbo_control",
+    "qwen_image",
+    "qwen_image_control",
+    "qwen_image_edit",
+];
+
+/// The complete alternate-decoder registry. Consumers derive menus from this table through
+/// [`crate::ModelDescriptor::compatible_decoder_options`]; they must not reproduce provider-id lists.
+pub const DECODER_OPTIONS: &[DecoderOption] = &[DecoderOption {
+    id: WAN_2_1_VAE_DECODER_ID,
+    label: "Wan 2.1 VAE",
+    component_id: crate::VAE_COMPONENT,
+    input_latent_space: &WAN_Z16_LATENT_SPACE,
+    eligible_backends: &["mlx"],
+    eligible_provider_ids: WAN_2_1_VAE_ELIGIBLE_PROVIDERS,
+    license_component: "wan2_1_t2v_14b_diffusers",
+    experimental: true,
+}];
+
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x00000100000001b3;
 
@@ -603,5 +648,31 @@ mod tests {
             MOCHI_VIDEO_LATENT_SPACE.temporal_law,
             LatentTemporalLaw::Causal6x
         );
+    }
+
+    #[test]
+    fn alternate_decoder_registry_is_explicit_experimental_and_z16_only() {
+        assert_eq!(DECODER_OPTIONS.len(), 1);
+        let option = DECODER_OPTIONS[0];
+        assert_eq!(option.id, WAN_2_1_VAE_DECODER_ID);
+        assert_eq!(option.component_id, crate::VAE_COMPONENT);
+        assert!(
+            option.experimental,
+            "alternate lane must remain default-off"
+        );
+        assert_eq!(option.eligible_backends, &["mlx"]);
+        assert!(option.eligible_provider_ids.contains(&"qwen_image"));
+        assert!(option.eligible_provider_ids.contains(&"krea_2_turbo"));
+        assert!(option
+            .eligible_provider_ids
+            .contains(&"krea_2_turbo_control"));
+        assert!(latent_spaces_compatible(
+            Some(&QWEN_KREA_Z16_LATENT_SPACE),
+            Some(option.input_latent_space)
+        ));
+        assert!(!latent_spaces_compatible(
+            Some(&WAN_Z48_LATENT_SPACE),
+            Some(option.input_latent_space)
+        ));
     }
 }

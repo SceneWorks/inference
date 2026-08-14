@@ -47,7 +47,7 @@ use mlx_rs::{Array, Dtype};
 use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::attention::{slice_axis, AttentionBudget};
 use mlx_gen::block_residency::BlockPlan;
-use mlx_gen::nn::{gelu_tanh, silu, timestep_sincos};
+use mlx_gen::nn::{conv2d_general, gelu_tanh, silu, timestep_sincos};
 use mlx_gen::weights::Weights;
 use mlx_gen::{CancelFlag, Error, Result};
 
@@ -190,18 +190,15 @@ impl Conv {
     }
 
     fn forward(&self, x: &Array) -> Result<Array> {
-        let y = mlx_rs::ops::conv2d(
+        conv2d_general(
             x,
             &self.w,
+            self.b.as_ref(),
             (self.stride, self.stride),
             (self.padding, self.padding),
             (1, 1),
             self.groups,
-        )?;
-        match &self.b {
-            Some(b) => Ok(add(&y, b)?),
-            None => Ok(y),
-        }
+        )
     }
 }
 

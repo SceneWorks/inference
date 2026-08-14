@@ -31,7 +31,7 @@ use mlx_gen::array::scalar;
 use mlx_gen::weights::Weights;
 use mlx_gen::{CancelFlag, Error, Result};
 use mlx_rs::fast::{layer_norm, rms_norm, scaled_dot_product_attention};
-use mlx_rs::ops::{add, concatenate_axis, cos, gt, multiply, sigmoid, sin, split, subtract};
+use mlx_rs::ops::{add, concatenate_axis, cos, gt, multiply, sin, split, subtract};
 use mlx_rs::{Array, Dtype};
 
 use crate::config::WanVaceConfig;
@@ -56,7 +56,7 @@ fn ln(x: &Array, eps: f32) -> Result<Array> {
 
 /// SiLU `x·σ(x)` (the `condition_embedder`'s `nn.SiLU`), dtype-preserving.
 fn silu(x: &Array) -> Result<Array> {
-    Ok(multiply(x, &sigmoid(x)?)?)
+    mlx_gen::nn::silu(x)
 }
 
 /// Load a biased diffusers `nn.Linear` (`{prefix}.weight` `[out, in]` + `{prefix}.bias`). The

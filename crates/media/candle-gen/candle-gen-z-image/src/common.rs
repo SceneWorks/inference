@@ -110,9 +110,24 @@ pub(crate) fn tokenizer_config() -> TokenizerConfig {
 
 /// Build the Z-Image Qwen tokenizer from `root/tokenizer/tokenizer.json`. `label` names the site in the
 /// error (`"z-image"`, `"z-image edit"`, `"z-image control"`).
-pub(crate) fn build_tokenizer(root: &std::path::Path, label: &str) -> Result<TextTokenizer> {
-    TextTokenizer::from_file(root.join("tokenizer/tokenizer.json"), tokenizer_config())
-        .map_err(|e| CandleError::Msg(format!("{label}: load tokenizer: {e}")))
+pub(crate) fn build_tokenizer(
+    source: &candle_gen::gen_core::ValidatedTokenizerSource,
+    label: &str,
+) -> Result<TextTokenizer> {
+    source.read_unchanged(|path| {
+        TextTokenizer::from_file(path, tokenizer_config())
+            .map_err(|e| CandleError::Msg(format!("{label}: load tokenizer: {e}")))
+    })
+}
+
+pub(crate) fn build_tokenizer_from_base(
+    root: &std::path::Path,
+    label: &str,
+) -> Result<TextTokenizer> {
+    let source = crate::ENCODER_CONTRACT
+        .tokenizer_for_base(root)
+        .map_err(CandleError::from)?;
+    build_tokenizer(&source, label)
 }
 
 /// Prompt → the Qwen chat-template token ids (non-empty), erroring on an empty tokenization. Shared by

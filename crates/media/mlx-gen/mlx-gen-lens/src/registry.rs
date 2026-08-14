@@ -116,6 +116,7 @@ fn text_encoder_storage(root: &Path) -> Result<TextEncoderStorage> {
 /// quant (gpt-oss MoE experts sc-3172 + DiT linears sc-3175).
 fn descriptor_for(id: &'static str) -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
         denoiser_output_latent_space: Some(&mlx_gen::gen_core::FLUX2_PACKED_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],

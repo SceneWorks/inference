@@ -1545,6 +1545,9 @@ pub enum Modality {
 /// constructible without loading weights (registry introspection).
 #[derive(Clone, Debug)]
 pub struct ModelDescriptor {
+    /// Exact text-encoder architecture/output contract for safe [`crate::LoadSpec::text_encoder`]
+    /// substitution. `None` means the provider has not advertised a substitutable encoder.
+    pub encoder_contract: Option<crate::EncoderContract>,
     /// The exact latent tensor emitted by the denoiser at its decoder boundary. `None` means the
     /// provider has not advertised enough information; consumers must treat it as incompatible with
     /// every decoder rather than infer compatibility from family names or channel counts.
@@ -1601,6 +1604,25 @@ pub struct ModelDescriptor {
     ///
     /// [`Conditioning::Control`]: Conditioning::Control
     pub control_kinds: Option<crate::control::AcceptedControlKinds>,
+}
+
+impl ModelDescriptor {
+    /// Alternate decoders this exact provider has wired and whose input space is compatible with its
+    /// advertised denoiser output. Missing/learned normalization evidence therefore fails closed.
+    pub fn compatible_decoder_options(&self) -> Vec<crate::latent::DecoderOption> {
+        crate::latent::DECODER_OPTIONS
+            .iter()
+            .copied()
+            .filter(|option| option.eligible_backends.contains(&self.backend))
+            .filter(|option| option.eligible_provider_ids.contains(&self.id))
+            .filter(|option| {
+                crate::latent::latent_spaces_compatible(
+                    self.denoiser_output_latent_space,
+                    Some(option.input_latent_space),
+                )
+            })
+            .collect()
+    }
 }
 
 /// How a model's advertised size range is enforced.

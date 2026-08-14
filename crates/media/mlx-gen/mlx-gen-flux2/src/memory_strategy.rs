@@ -20,10 +20,11 @@ use mlx_gen::gen_core::{
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::{GenerationRequest, OffloadPolicy, WeightsSource};
 
-use crate::config::{Flux2Variant, FLUX2_DEV_EDIT_ID, FLUX2_DEV_ID};
+use crate::config::{Flux2Variant, FLUX2_DEV_CONTROL_ID, FLUX2_DEV_EDIT_ID, FLUX2_DEV_ID};
 
 pub const CALIBRATION_FINGERPRINT: &str = "sc-16593-flux2-dev-edit-evidence-v2";
 pub const DEV_T2I_CALIBRATION_FINGERPRINT: &str = "sc-18218-flux2-dev-t2i-resident-evidence-v1";
+pub const DEV_CONTROL_OVERLAY: &str = "control";
 
 pub fn contract_for_variant(
     variant: Flux2Variant,
@@ -91,6 +92,38 @@ fn build_dev_t2i_contract() -> MemoryProviderContract {
         DEV_T2I_CALIBRATION_FINGERPRINT,
         LoadShape::EagerMaterialization,
     ));
+    contract
+}
+
+/// Honest pre-calibration contract for the standalone MLX Fun-Controlnet route.
+///
+/// The provider has a real resident execution path and a registered component-footprint fallback,
+/// but no control-specific optimization evidence. Keep every optimized rung Missing and calibration
+/// absent rather than borrowing the base Dev receipt. The route/tier safety gate below remains fully
+/// load-exact. Asset facts deliberately remain empty: the registry fallback prices the base split,
+/// while its consumer adds the control checkpoint. Relabelling that estimate as provider load-exact
+/// facts would hide the runtime distinction between an effective packed base and a dense control
+/// branch when no explicit quantization request was made.
+fn build_dev_control_contract(spec: &LoadSpec) -> MemoryProviderContract {
+    let mut contract = MemoryProviderContract::compatibility_default(
+        FLUX2_DEV_CONTROL_ID,
+        MemoryBackendRealization::MlxMetal {
+            bounded_wired_residency: false,
+            lazy_or_mmap_materialization: true,
+            explicit_evaluation_and_synchronization: true,
+            cache_eviction: true,
+        },
+    );
+    contract.load_shape = spec.load_shape;
+    contract.lifecycle = MemoryLifecycleCapabilities {
+        phases: vec![
+            MemoryPhase::Conditioning,
+            MemoryPhase::Denoise,
+            MemoryPhase::Decode,
+        ],
+        synchronized_phase_release: matches!(spec.offload_policy, OffloadPolicy::Sequential),
+        ..Default::default()
+    };
     contract
 }
 
@@ -179,6 +212,52 @@ pub fn safety_check(
     }
 }
 
+pub fn dev_control_safety_check(
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    expected_tier: MemoryNumericTier,
+) -> MemorySafetyDecision {
+    let route_gate = || {
+        if contract.provider_id != FLUX2_DEV_CONTROL_ID {
+            return Err(CoreError::Unsupported(format!(
+                "{FLUX2_DEV_CONTROL_ID}: memory contract resolved the wrong provider route {}",
+                contract.provider_id
+            )));
+        }
+        if context.mode != MemoryMode::TextToImage
+            || context.has_reference
+            || context.geometry.reference_count != 0
+            || context.overlay.as_deref() != Some(DEV_CONTROL_OVERLAY)
+        {
+            return Err(CoreError::Unsupported(format!(
+                "{FLUX2_DEV_CONTROL_ID}: memory-safety context must describe reference-free text-to-image with the control overlay"
+            )));
+        }
+        if context.load_shape != contract.load_shape {
+            return Err(CoreError::Unsupported(format!(
+                "{FLUX2_DEV_CONTROL_ID}: memory context load shape does not match the loaded contract"
+            )));
+        }
+        if context.use_pid {
+            return Err(CoreError::Unsupported(format!(
+                "{FLUX2_DEV_CONTROL_ID}: PiD decode is not implemented for the control route"
+            )));
+        }
+        if context.has_phases {
+            return Err(CoreError::Unsupported(format!(
+                "{FLUX2_DEV_CONTROL_ID}: multi-phase denoise is not implemented for the control route"
+            )));
+        }
+        if expected_tier.quant == Some(Quant::Nvfp4) {
+            return Err(CoreError::Unsupported(format!(
+                "{FLUX2_DEV_CONTROL_ID}: NVFP4 is not implemented by the MLX provider"
+            )));
+        }
+        Ok(())
+    };
+    standard_memory_strategy_safety_check(contract, context, Some(expected_tier), Some(&route_gate))
+}
+
 pub fn registered_dev_contract(
     _spec: &LoadSpec,
 ) -> mlx_gen::gen_core::Result<MemoryProviderContract> {
@@ -190,15 +269,12 @@ pub fn registered_dev_safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    safety_check(
-        contract,
-        context,
-        MemoryNumericTier {
-            precision: spec.precision,
-            quant: spec.quantize,
-            component_precision_floors: &[],
+    match crate::model::effective_dev_memory_numeric_tier(spec, FLUX2_DEV_EDIT_ID) {
+        Ok(tier) => safety_check(contract, context, tier),
+        Err(error) => MemorySafetyDecision::Reject {
+            reason: error.to_string(),
         },
-    )
+    }
 }
 
 pub fn registered_dev_t2i_contract(
@@ -212,15 +288,40 @@ pub fn registered_dev_t2i_safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    dev_t2i_safety_check(
-        contract,
-        context,
-        MemoryNumericTier {
-            precision: spec.precision,
-            quant: spec.quantize,
-            component_precision_floors: &[],
+    match crate::model::effective_dev_memory_numeric_tier(spec, FLUX2_DEV_ID) {
+        Ok(tier) => dev_t2i_safety_check(contract, context, tier),
+        Err(error) => MemorySafetyDecision::Reject {
+            reason: error.to_string(),
         },
-    )
+    }
+}
+
+pub fn registered_dev_control_contract(
+    spec: &LoadSpec,
+) -> mlx_gen::gen_core::Result<MemoryProviderContract> {
+    Ok(build_dev_control_contract(spec))
+}
+
+pub fn registered_dev_control_safety_check(
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> MemorySafetyDecision {
+    if let Err(error) = mlx_gen::require_control(
+        spec,
+        FLUX2_DEV_CONTROL_ID,
+        "FLUX.2-dev-Fun-Controlnet-Union",
+    ) {
+        return MemorySafetyDecision::Reject {
+            reason: error.to_string(),
+        };
+    }
+    match crate::model::effective_dev_memory_numeric_tier(spec, FLUX2_DEV_CONTROL_ID) {
+        Ok(tier) => dev_control_safety_check(contract, context, tier),
+        Err(error) => MemorySafetyDecision::Reject {
+            reason: error.to_string(),
+        },
+    }
 }
 
 // ---- FLUX.2 Klein shared image-memory ladder (SC-15518) -------------------------------

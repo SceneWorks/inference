@@ -34,12 +34,12 @@ use mlx_rs::fast::{rms_norm, scaled_dot_product_attention};
 use mlx_rs::module::Param;
 use mlx_rs::nn::{Linear, QuantizedLinear};
 use mlx_rs::ops::{
-    add, addmm, concatenate_axis, cos as cos_op, dequantize, matmul, multiply, quantized_matmul,
-    sin as sin_op, split, subtract,
+    add, addmm, concatenate_axis, cos as cos_op, dequantize, matmul, multiply, sin as sin_op,
+    split, subtract,
 };
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::nn::silu;
+use mlx_gen::nn::{quantized_matmul_with_bias, silu};
 use mlx_gen::quant::{packed_bits, DEFAULT_GROUP_SIZE};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
@@ -207,13 +207,7 @@ impl ChatGlmLinear {
                 group,
                 bits,
                 bias,
-            } => {
-                let y = quantized_matmul(x, q, scales, qbias, true, *group, *bits)?;
-                match bias {
-                    Some(b) => Ok(add(&y, b)?),
-                    None => Ok(y),
-                }
-            }
+            } => quantized_matmul_with_bias(x, q, scales, qbias, bias.as_ref(), *group, *bits),
         }
     }
 

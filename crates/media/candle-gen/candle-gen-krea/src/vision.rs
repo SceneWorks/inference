@@ -15,6 +15,7 @@
 use std::path::Path;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
+use candle_gen::gen_core::WeightsSource;
 use candle_gen::Result;
 use candle_gen_boogu::loader::Weights as BooguWeights;
 pub use candle_gen_boogu::vision::preprocess::preprocess_image;
@@ -38,17 +39,22 @@ const VISION_DTYPE: DType = DType::F32;
 /// `[5, 11, 17]` (vs `[8, 16, 24]`). Everything else (heads 16, patch 16, merge 2, temporal 2,
 /// position-embeddings 2304, in-channels 3) matches.
 pub fn krea_vision_config() -> VisionConfig {
+    let contract = crate::VISION_ENCODER_CONTRACT;
     VisionConfig {
-        hidden_size: 1024,
-        num_heads: 16,
-        depth: 24,
-        out_hidden_size: 2560,
-        patch_size: 16,
-        temporal_patch_size: 2,
-        spatial_merge_size: 2,
-        in_channels: 3,
-        num_position_embeddings: 2304,
-        deepstack_visual_indexes: vec![5, 11, 17],
+        hidden_size: contract.hidden_size,
+        num_heads: contract.num_attention_heads,
+        depth: contract.num_hidden_layers,
+        out_hidden_size: contract.output_width,
+        norm_eps: contract.normalization_eps.get(),
+        rope_theta: contract.rope_theta.get() as f32,
+        patch_size: contract.patch_size,
+        temporal_patch_size: contract.temporal_patch_size,
+        spatial_merge_size: contract.spatial_merge_size,
+        in_channels: contract.in_channels,
+        num_position_embeddings: contract
+            .num_position_embeddings
+            .expect("Qwen3-VL contract requires learned position embeddings"),
+        deepstack_visual_indexes: contract.deepstack_visual_indexes.to_vec(),
     }
 }
 
@@ -58,8 +64,24 @@ pub fn krea_vision_config() -> VisionConfig {
 /// over that dir at f32 with prefix `"visual"`. On a packed Krea tier the LM is packed but the vision
 /// tower stays dense bf16 (loaded → f32 here), which boogu's `VisionTower::load` guards for.
 pub fn load_vision_tower(root: impl AsRef<Path>, device: &Device) -> Result<VisionTower> {
-    let dir = root.as_ref().join("text_encoder");
-    let w = BooguWeights::from_dir(&dir, device, VISION_DTYPE)?;
+    let root = root.as_ref();
+    let selected = crate::ENCODER_CONTRACT
+        .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)
+        .map_err(candle_gen::CandleError::from)?;
+    selected
+        .validate_vision(&crate::VISION_ENCODER_CONTRACT, &crate::ENCODER_CONTRACT)
+        .map_err(candle_gen::CandleError::from)?;
+    selected.read_unchanged(|source| load_vision_tower_from_source(source, device))
+}
+
+pub(crate) fn load_vision_tower_from_source(
+    source: &WeightsSource,
+    device: &Device,
+) -> Result<VisionTower> {
+    let w = match source {
+        WeightsSource::Dir(path) => BooguWeights::from_dir(path, device, VISION_DTYPE)?,
+        WeightsSource::File(path) => BooguWeights::from_file(path, device, VISION_DTYPE)?,
+    };
     Ok(VisionTower::load(&w, krea_vision_config(), "visual")?)
 }
 
@@ -97,6 +119,14 @@ mod tests {
         assert_eq!(c.num_heads, 16);
         assert_eq!(c.out_hidden_size, 2560);
         assert_eq!(c.deepstack_visual_indexes, vec![5, 11, 17]);
+        assert_eq!(
+            c.rope_theta as f64,
+            crate::VISION_ENCODER_CONTRACT.rope_theta.get()
+        );
+        assert_eq!(
+            c.norm_eps,
+            crate::VISION_ENCODER_CONTRACT.normalization_eps.get()
+        );
         // head_dim = 1024/16 = 64.
         assert_eq!(c.head_dim(), 64);
     }
@@ -121,5 +151,55 @@ mod tests {
         // 512² → grid [1, 32, 32] → merged (32/2)·(32/2) = 256.
         assert_eq!(merged_token_count([1, 32, 32], 2), 256);
         assert_eq!(merged_token_count([1, 4, 2], 2), 2);
+    }
+
+    #[test]
+    fn qwen3_vision_behavior_defaults_are_accepted_but_explicit_conflicts_fail() {
+        let write_fixture = || {
+            let fixture = tempfile::tempdir().unwrap();
+            let component = fixture.path().join("text_encoder");
+            gen_core_testkit::write_multimodal_encoder_contract_fixture(
+                &component,
+                crate::ENCODER_CONTRACT,
+                crate::VISION_ENCODER_CONTRACT,
+            )
+            .unwrap();
+            (fixture, component)
+        };
+
+        let (_fixture, component) = write_fixture();
+        let config_path = component.join("config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        config["vision_config"]
+            .as_object_mut()
+            .unwrap()
+            .remove("rope_theta");
+        config["vision_config"]
+            .as_object_mut()
+            .unwrap()
+            .remove("layer_norm_eps");
+        std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        crate::ENCODER_CONTRACT
+            .validate_source(&WeightsSource::Dir(component))
+            .unwrap()
+            .validate_vision(&crate::VISION_ENCODER_CONTRACT, &crate::ENCODER_CONTRACT)
+            .expect("omission must resolve to the exact Qwen3-VL runtime defaults");
+
+        for (field, value) in [("rope_theta", 9_999.0), ("layer_norm_eps", 1e-5)] {
+            let (_fixture, component) = write_fixture();
+            let config_path = component.join("config.json");
+            let mut config: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+            config["vision_config"][field] = serde_json::json!(value);
+            std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+            let error = crate::ENCODER_CONTRACT
+                .validate_source(&WeightsSource::Dir(component))
+                .unwrap()
+                .validate_vision(&crate::VISION_ENCODER_CONTRACT, &crate::ENCODER_CONTRACT)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(field), "{error}");
+        }
     }
 }

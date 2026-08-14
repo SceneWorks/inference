@@ -43,6 +43,7 @@ const MAX_ASPECT: u32 = 6;
 /// introspection / capability advertisement).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
         denoiser_output_latent_space: Some(&mlx_gen::gen_core::FLUX2_PACKED_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],

@@ -76,7 +76,10 @@ pub(crate) const MAX_WAN_CONDITIONING_LATENTS: usize = 257;
 
 /// Shared-optimization toggles whose production call sites this provider can actually execute.
 /// Availability never substitutes for the request-local `Applied` receipt required by P6.
-pub const BENCHMARK_TOGGLE_CAPABILITIES: &[&str] = &[mlx_gen::diagnostics::RETAINED_COMPILATION];
+pub const BENCHMARK_TOGGLE_CAPABILITIES: &[&str] = &[
+    mlx_gen::diagnostics::RETAINED_COMPILATION,
+    mlx_gen::diagnostics::EXACT_EPILOGUES,
+];
 
 pub(crate) fn combined_conditioning_latents(
     control_frames: usize,
@@ -113,17 +116,210 @@ pub use scheduler::{
     compute_sigmas, make_scheduler, FlowDpmpp2m, FlowMatchEuler, FlowUniPC, SolverKind,
     WanScheduler,
 };
-pub use vae::{WanSingleFrameDecoder, WanVideoDecoder};
+pub use vae::{OwnedWanSingleFrameDecoder, WanSingleFrameDecoder, WanVideoDecoder};
+
+/// Load the request-selected Wan z16 image decoder from `LoadSpec.components["vae"]`.
+///
+/// The component is optional: absence is the native decoder path. Presence is file-only, mutually
+/// exclusive with PiD, and checked against the provider's typed latent-space descriptor before any
+/// weight load. That makes z48 and unknown/learned normalization fail closed with an actionable
+/// compatibility error rather than reaching tensor execution.
+pub fn load_selected_single_frame_decoder(
+    spec: &mlx_gen::LoadSpec,
+    descriptor: &mlx_gen::ModelDescriptor,
+) -> mlx_gen::Result<Option<OwnedWanSingleFrameDecoder>> {
+    let Some(path) = validate_selected_single_frame_decoder(spec, descriptor)? else {
+        return Ok(None);
+    };
+    let source = spec.file_pin_for(path)?;
+    Ok(Some(OwnedWanSingleFrameDecoder::from_pinned(source)?))
+}
+
+/// Validate an alternate Wan decoder selection without opening its weights.
+///
+/// Providers call this from their public load entrypoint so deferred-residency loads still reject a
+/// z48/unknown latent space, a directory component, or a PiD conflict immediately. The returned path
+/// is safe to hand to [`OwnedWanSingleFrameDecoder::from_file`] when the heavy phase is materialized.
+pub fn validate_selected_single_frame_decoder<'a>(
+    spec: &'a mlx_gen::LoadSpec,
+    descriptor: &mlx_gen::ModelDescriptor,
+) -> mlx_gen::Result<Option<&'a std::path::Path>> {
+    use mlx_gen::{WeightsSource, VAE_COMPONENT};
+
+    let Some(source) = spec.components.get(VAE_COMPONENT) else {
+        return Ok(None);
+    };
+    if spec.pid.is_some() {
+        return Err(mlx_gen::Error::Unsupported(format!(
+            "{}: alternate decoder component '{VAE_COMPONENT}' cannot be combined with PiD; select exactly one decoder",
+            descriptor.id
+        )));
+    }
+    let path = match source {
+        WeightsSource::File(path) => path,
+        WeightsSource::Dir(path) => {
+            return Err(mlx_gen::Error::Unsupported(format!(
+                "{}: alternate decoder component '{VAE_COMPONENT}' must be the standalone pinned Wan z16 .safetensors file, got directory {}",
+                descriptor.id,
+                path.display()
+            )))
+        }
+    };
+    if !mlx_gen::gen_core::latent_spaces_compatible(
+        descriptor.denoiser_output_latent_space,
+        Some(&mlx_gen::gen_core::WAN_Z16_LATENT_SPACE),
+    ) {
+        return Err(mlx_gen::Error::Unsupported(format!(
+            "{}: Wan 2.1 VAE decoder is incompatible with the provider's declared latent space",
+            descriptor.id
+        )));
+    }
+    if !descriptor
+        .compatible_decoder_options()
+        .iter()
+        .any(|option| option.id == mlx_gen::gen_core::WAN_2_1_VAE_DECODER_ID)
+    {
+        return Err(mlx_gen::Error::Unsupported(format!(
+            "{}: decoder '{}' is not registered for this provider",
+            descriptor.id,
+            mlx_gen::gen_core::WAN_2_1_VAE_DECODER_ID
+        )));
+    }
+    Ok(Some(path.as_path()))
+}
 pub use vae22::Wan22VideoDecoder;
 
 #[cfg(test)]
 mod conditioning_budget_tests {
+    use mlx_gen::{LoadSpec, WeightsSource, VAE_COMPONENT};
+
     #[test]
     fn combined_conditioning_latents_is_checked() {
         assert_eq!(super::combined_conditioning_latents(1025, 0), Some(257));
         assert_eq!(super::combined_conditioning_latents(5, 255), Some(257));
         assert_eq!(super::combined_conditioning_latents(5, usize::MAX), None);
         assert_eq!(super::combined_conditioning_latents(0, 0), None);
+    }
+
+    #[test]
+    fn alternate_decoder_validation_accepts_z16_without_opening_weights() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/base".into())).with_component(
+            VAE_COMPONENT,
+            WeightsSource::File("/nonexistent/standalone-wan-vae.safetensors".into()),
+        );
+        let mut descriptor = super::model::descriptor();
+        descriptor.id = "qwen_image";
+        descriptor.denoiser_output_latent_space =
+            Some(&mlx_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE);
+
+        let path = super::validate_selected_single_frame_decoder(&spec, &descriptor)
+            .expect("z16 selection should pass its weights-free contract")
+            .expect("component was selected");
+        assert_eq!(
+            path,
+            std::path::Path::new("/nonexistent/standalone-wan-vae.safetensors"),
+            "validation must not stat or load the donor"
+        );
+    }
+
+    #[test]
+    fn alternate_decoder_validation_rejects_z48_before_opening_weights() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/base".into())).with_component(
+            VAE_COMPONENT,
+            WeightsSource::File("/nonexistent/standalone-wan-vae.safetensors".into()),
+        );
+        let error =
+            super::validate_selected_single_frame_decoder(&spec, &super::model::descriptor())
+                .expect_err("Wan 2.2 z48 must fail closed against the Wan 2.1 z16 decoder")
+                .to_string();
+        assert!(error.contains("incompatible"), "got: {error}");
+        assert!(error.contains(super::MODEL_ID), "got: {error}");
+    }
+
+    #[test]
+    fn alternate_decoder_validation_rejects_same_space_provider_without_registry_eligibility() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/base".into())).with_component(
+            VAE_COMPONENT,
+            WeightsSource::File("/nonexistent/standalone-wan-vae.safetensors".into()),
+        );
+        let mut descriptor = super::model::descriptor();
+        descriptor.id = "same_space_but_unwired";
+        descriptor.denoiser_output_latent_space =
+            Some(&mlx_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE);
+
+        let error = super::validate_selected_single_frame_decoder(&spec, &descriptor)
+            .expect_err("latent compatibility alone must not invent provider eligibility")
+            .to_string();
+        assert!(error.contains("not registered"), "got: {error}");
+        assert!(error.contains("same_space_but_unwired"), "got: {error}");
+    }
+
+    #[test]
+    fn absent_alternate_decoder_is_the_native_noop_path() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/base".into()));
+        assert!(
+            super::validate_selected_single_frame_decoder(&spec, &super::model::descriptor())
+                .expect("absence is valid")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn alternate_decoder_rejects_directory_and_pid_composition_before_weights() {
+        let mut descriptor = super::model::descriptor();
+        descriptor.id = "qwen_image";
+        descriptor.denoiser_output_latent_space =
+            Some(&mlx_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE);
+        let directory = LoadSpec::new(WeightsSource::Dir("/nonexistent/base".into()))
+            .with_component(
+                VAE_COMPONENT,
+                WeightsSource::Dir("/nonexistent/not-a-file".into()),
+            );
+        let error = super::validate_selected_single_frame_decoder(&directory, &descriptor)
+            .expect_err("the donor is a pinned standalone file")
+            .to_string();
+        assert!(error.contains("standalone pinned"), "got: {error}");
+
+        let pid = LoadSpec::new(WeightsSource::Dir("/nonexistent/base".into()))
+            .with_component(
+                VAE_COMPONENT,
+                WeightsSource::File("/nonexistent/standalone-wan-vae.safetensors".into()),
+            )
+            .with_pid(
+                WeightsSource::File("/nonexistent/pid.safetensors".into()),
+                WeightsSource::Dir("/nonexistent/gemma".into()),
+            );
+        let error = super::validate_selected_single_frame_decoder(&pid, &descriptor)
+            .expect_err("PiD and alternate VAE are mutually exclusive")
+            .to_string();
+        assert!(
+            error.contains("cannot be combined with PiD"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn alternate_decoder_consumes_the_callers_prepared_file_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let donor = tmp.path().join("wan-vae.safetensors");
+        std::fs::write(&donor, b"original").unwrap();
+        let mut descriptor = super::model::descriptor();
+        descriptor.id = "qwen_image";
+        descriptor.denoiser_output_latent_space =
+            Some(&mlx_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE);
+        let mut spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/base".into()))
+            .with_component(VAE_COMPONENT, WeightsSource::File(donor.clone()));
+        spec.prepare_file_sources().unwrap();
+
+        std::fs::write(&donor, b"replacement").unwrap();
+        let path = super::validate_selected_single_frame_decoder(&spec, &descriptor)
+            .unwrap()
+            .unwrap();
+        let error = spec
+            .file_pin_for(path)
+            .expect_err("the prepared donor identity must fail closed after replacement")
+            .to_string();
+        assert!(error.contains("changed after load"), "got: {error}");
     }
 }
 #[doc(hidden)]

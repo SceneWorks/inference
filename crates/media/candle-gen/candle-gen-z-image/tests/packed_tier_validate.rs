@@ -744,6 +744,7 @@ fn load_packed_base_control(snapshot_env: &str, tier: &str) {
 
     ZImageControl::load(&ZImageControlPaths {
         snapshot,
+        text_encoder: None,
         control,
         base: true,
     })
@@ -801,6 +802,7 @@ fn packed_base_control_q4_honors_control_cfg_warm_repeat_and_cleanup() {
     );
     let model = ZImageControl::load(&ZImageControlPaths {
         snapshot,
+        text_encoder: None,
         control,
         base: true,
     })

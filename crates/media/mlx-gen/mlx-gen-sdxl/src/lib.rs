@@ -85,6 +85,7 @@ pub use vision_encoder::{ClipVisionEncoder, VisionConfig};
 pub const BENCHMARK_TOGGLE_CAPABILITIES: &[&str] = &[
     mlx_gen::diagnostics::RETAINED_COMPILATION,
     mlx_gen::diagnostics::GEOMETRY_AWARE_DECODE,
+    mlx_gen::diagnostics::EXACT_EPILOGUES,
 ];
 
 // sc-2963 compiled-glue toggle: when on, the UNet's remaining fusable elementwise glue — the **SiLU**

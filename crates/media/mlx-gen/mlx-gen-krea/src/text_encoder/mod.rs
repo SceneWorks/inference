@@ -46,18 +46,28 @@ use mlx_gen_boogu::{vision::preprocess::preprocess_image, VisionConfig, VisionTo
 /// so the parity-critical tower is not duplicated. `out_hidden_size` MUST equal the LM `hidden_size`
 /// (2560) so the merged image embeds splice straight into the token stream.
 pub fn krea_vision_config() -> VisionConfig {
+    let contract = crate::model::VISION_ENCODER_CONTRACT;
     VisionConfig {
-        hidden_size: 1024,
-        num_heads: 16,
-        intermediate_size: 4096,
-        depth: 24,
-        out_hidden_size: 2560,
-        patch_size: 16,
-        temporal_patch_size: 2,
-        spatial_merge_size: 2,
-        in_channels: 3,
-        num_position_embeddings: 2304,
-        deepstack_visual_indexes: vec![5, 11, 17],
+        hidden_size: contract.hidden_size as i32,
+        num_heads: contract.num_attention_heads as i32,
+        intermediate_size: contract.intermediate_size as i32,
+        depth: contract.num_hidden_layers as i32,
+        out_hidden_size: contract.output_width as i32,
+        norm_eps: contract.normalization_eps.get() as f32,
+        rope_theta: contract.rope_theta.get() as f32,
+        patch_size: contract.patch_size as i32,
+        temporal_patch_size: contract.temporal_patch_size as i32,
+        spatial_merge_size: contract.spatial_merge_size as i32,
+        in_channels: contract.in_channels as i32,
+        num_position_embeddings: contract
+            .num_position_embeddings
+            .expect("Qwen3-VL contract requires learned position embeddings")
+            as i32,
+        deepstack_visual_indexes: contract
+            .deepstack_visual_indexes
+            .iter()
+            .map(|&index| index as i32)
+            .collect(),
     }
 }
 
@@ -191,7 +201,8 @@ impl KreaTeConfig {
     }
 
     /// Parse `<root>/text_encoder/config.json` (`text_config`) + `<root>/model_index.json`
-    /// (`text_encoder_select_layers`); missing scalars fall back to [`Self::qwen3_vl_4b`].
+    /// (`text_encoder_select_layers`). Architecture scalars are required; only the published
+    /// checkpoint's explicitly-null rope-theta keeps the Qwen3-VL default.
     pub fn from_snapshot(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
         let path = root.join("text_encoder").join("config.json");
@@ -201,25 +212,37 @@ impl KreaTeConfig {
             .map_err(|e| Error::Msg(format!("krea te: parse {}: {e}", path.display())))?;
         let tc = v.get("text_config").unwrap_or(&v);
         let d = Self::qwen3_vl_4b();
-        let u = |k: &str, dflt: i32| {
+        let required_i32 = |k: &str| -> Result<i32> {
             tc.get(k)
                 .and_then(serde_json::Value::as_i64)
-                .map(|n| n as i32)
-                .unwrap_or(dflt)
+                .and_then(|n| i32::try_from(n).ok())
+                .ok_or_else(|| {
+                    Error::Msg(format!(
+                        "krea te: {} missing required integer {k}",
+                        path.display()
+                    ))
+                })
+        };
+        let required_f32 = |k: &str| -> Result<f32> {
+            tc.get(k)
+                .and_then(serde_json::Value::as_f64)
+                .map(|n| n as f32)
+                .ok_or_else(|| {
+                    Error::Msg(format!(
+                        "krea te: {} missing required number {k}",
+                        path.display()
+                    ))
+                })
         };
 
         let mut cfg = Self {
-            hidden_size: u("hidden_size", d.hidden_size),
-            num_layers: u("num_hidden_layers", d.num_layers),
-            num_heads: u("num_attention_heads", d.num_heads),
-            num_kv_heads: u("num_key_value_heads", d.num_kv_heads),
-            head_dim: u("head_dim", d.head_dim),
-            intermediate_size: u("intermediate_size", d.intermediate_size),
-            rms_norm_eps: tc
-                .get("rms_norm_eps")
-                .and_then(serde_json::Value::as_f64)
-                .map(|n| n as f32)
-                .unwrap_or(d.rms_norm_eps),
+            hidden_size: required_i32("hidden_size")?,
+            num_layers: required_i32("num_hidden_layers")?,
+            num_heads: required_i32("num_attention_heads")?,
+            num_kv_heads: required_i32("num_key_value_heads")?,
+            head_dim: required_i32("head_dim")?,
+            intermediate_size: required_i32("intermediate_size")?,
+            rms_norm_eps: required_f32("rms_norm_eps")?,
             // `text_config.rope_theta` is null on disk; honor `rope_parameters`/`rope_scaling` if set,
             // else the qwen3_vl_text default (5e6).
             rope_theta: tc
@@ -237,8 +260,13 @@ impl KreaTeConfig {
             image_token_id: v
                 .get("image_token_id")
                 .and_then(serde_json::Value::as_i64)
-                .map(|n| n as i32)
-                .unwrap_or(d.image_token_id),
+                .and_then(|n| i32::try_from(n).ok())
+                .ok_or_else(|| {
+                    Error::Msg(format!(
+                        "krea te: {} missing required integer image_token_id",
+                        path.display()
+                    ))
+                })?,
             mrope_section: tc
                 .get("rope_parameters")
                 .or_else(|| tc.get("rope_scaling"))
@@ -251,7 +279,12 @@ impl KreaTeConfig {
                         .collect();
                     <[i32; 3]>::try_from(sec).ok()
                 })
-                .unwrap_or(d.mrope_section),
+                .ok_or_else(|| {
+                    Error::Msg(format!(
+                        "krea te: {} missing required three-value mrope_section",
+                        path.display()
+                    ))
+                })?,
         };
 
         // `text_encoder_select_layers` lives in the pipeline manifest.
@@ -292,5 +325,16 @@ pub(crate) fn join(prefix: &str, name: &str) -> String {
         name.to_string()
     } else {
         format!("{prefix}.{name}")
+    }
+}
+
+#[cfg(test)]
+mod vision_contract_tests {
+    #[test]
+    fn runtime_vision_config_consumes_the_provider_behavior_contract() {
+        let config = super::krea_vision_config();
+        let contract = crate::model::VISION_ENCODER_CONTRACT;
+        assert_eq!(config.rope_theta, contract.rope_theta.get() as f32);
+        assert_eq!(config.norm_eps, contract.normalization_eps.get() as f32);
     }
 }

@@ -17,6 +17,7 @@ pub mod audio_transform;
 pub mod block_window;
 pub mod caption;
 pub mod control;
+pub mod encoder_contract;
 pub mod error;
 pub mod face;
 pub mod generator;
@@ -41,6 +42,7 @@ pub mod tokenizer;
 pub mod train;
 pub mod transcribe;
 pub mod transform;
+pub mod vision_encoder_contract;
 pub mod voice_embed;
 pub mod weightsmeta;
 
@@ -61,6 +63,13 @@ pub use control::{
     reject_unknown_components, require_base_dir, require_base_snapshot, require_component,
     require_component_file, require_control, AcceptedControlKinds, ControlBranch,
 };
+pub use encoder_contract::{
+    read_text_encoder_source_unchanged, text_encoder_packed_quant_bits, text_encoder_source_bytes,
+    EncoderConfigBool, EncoderConfigFloat, EncoderContract, EncoderPackingContract,
+    EncoderPromptExecutionContract, EncoderPromptLengthPolicy, EncoderPromptPadding,
+    EncoderPromptTemplate, EncoderRequiredToken, EncoderTokenizerBinding, EncoderTokenizerContract,
+    EncoderTokenizerDisposition, ValidatedEncoderSource, ValidatedTokenizerSource,
+};
 pub use error::{Error, Result};
 pub use face::{DetectedFace, FaceEmbedder, FaceEmbedderDescriptor};
 pub use generator::{
@@ -74,21 +83,21 @@ pub use generator::{
 pub use image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
 pub use json_constraint::JsonState;
 pub use latent::{
-    latent_spaces_compatible, normalization_vectors_hash, LatentNormalization,
+    latent_spaces_compatible, normalization_vectors_hash, DecoderOption, LatentNormalization,
     LatentNormalizationStats, LatentPatchLayout, LatentSpace, LatentTemporalLaw,
-    SpatialCompression, FLUX1_LATENT_SPACE, FLUX2_PACKED_LATENT_SPACE, LTX_VIDEO_LATENT_SPACE,
-    MAGE_LATENT_SPACE, MOCHI_VIDEO_LATENT_SPACE, QWEN_KREA_Z16_LATENT_SPACE, QWEN_WAN_Z16_MEAN,
-    QWEN_WAN_Z16_NORMALIZATION, QWEN_WAN_Z16_STD, SANA_LATENT_SPACE, SD3_LATENT_SPACE,
-    SDXL_LATENT_SPACE, SEEDVR2_VIDEO_LATENT_SPACE, SVD_LATENT_SPACE, WAN_Z16_LATENT_SPACE,
-    WAN_Z16_VIDEO_LATENT_SPACE, WAN_Z48_LATENT_SPACE, WAN_Z48_MEAN, WAN_Z48_NORMALIZATION,
-    WAN_Z48_STD,
+    SpatialCompression, DECODER_OPTIONS, FLUX1_LATENT_SPACE, FLUX2_PACKED_LATENT_SPACE,
+    LTX_VIDEO_LATENT_SPACE, MAGE_LATENT_SPACE, MOCHI_VIDEO_LATENT_SPACE,
+    QWEN_KREA_Z16_LATENT_SPACE, QWEN_WAN_Z16_MEAN, QWEN_WAN_Z16_NORMALIZATION, QWEN_WAN_Z16_STD,
+    SANA_LATENT_SPACE, SD3_LATENT_SPACE, SDXL_LATENT_SPACE, SEEDVR2_VIDEO_LATENT_SPACE,
+    SVD_LATENT_SPACE, WAN_2_1_VAE_DECODER_ID, WAN_Z16_LATENT_SPACE, WAN_Z16_VIDEO_LATENT_SPACE,
+    WAN_Z48_LATENT_SPACE, WAN_Z48_MEAN, WAN_Z48_NORMALIZATION, WAN_Z48_STD,
 };
 pub use license::components::MEDIA_COMPONENT_LICENSES;
 pub use license::families::LICENSE_FAMILIES;
 pub use license::{
-    component_licenses_manifest_json, license_table_conformance_errors, provider_terms,
-    resolve_component, resolve_family, CeilingBoundary, ComponentLicense, LicenseFamily,
-    LicenseTerm, ProviderComponents,
+    component_licenses_manifest_json, decoder_license_conformance_errors,
+    license_table_conformance_errors, provider_terms, resolve_component, resolve_family,
+    CeilingBoundary, ComponentLicense, LicenseFamily, LicenseTerm, ProviderComponents,
 };
 pub use media::{AudioChunk, AudioStem, AudioTrack, Image};
 pub use memory_strategy::{
@@ -115,11 +124,11 @@ pub use memory_strategy::{
 };
 pub use registry::{
     ActivationMemoryRegistration, AudioEmbedderRegistration, AudioTransformRegistration,
-    CaptionerRegistration, ImageEmbedderRegistration, ImportedModelOperation,
-    ImportedModelRegistration, ImportedModelSource, MemoryBehaviorBeginRequest,
-    MemoryBehaviorFixture, MemoryBehaviorRegistration, MemoryContractFixtureRegistration,
-    MemoryRegistration, ModelRegistration, PerComponentBytes, ProviderRegistry,
-    ProviderRegistryBuilder, TextEmbedderRegistration, TrainerRegistration,
+    CaptionerRegistration, EncoderContractRouteRegistration, ImageEmbedderRegistration,
+    ImportedModelOperation, ImportedModelRegistration, ImportedModelSource,
+    MemoryBehaviorBeginRequest, MemoryBehaviorFixture, MemoryBehaviorRegistration,
+    MemoryContractFixtureRegistration, MemoryRegistration, ModelRegistration, PerComponentBytes,
+    ProviderRegistry, ProviderRegistryBuilder, TextEmbedderRegistration, TrainerRegistration,
     TranscriberRegistration, TransformRegistration, VoiceEmbedderRegistration,
 };
 pub use residency::{Residency, ResidencyRuntime, StagedHeavy};
@@ -128,10 +137,12 @@ pub use runtime::{
     LoadPhase, LoadShape, LoadSpec, MoeExpert, OffloadPolicy, PidWeights, PinnedWeightsFile,
     Precision, PreparedFilePins, PreviewFrame, PreviewSink, Progress, Quant, WeightsSource,
     BASE_SNAPSHOT_COMPONENT, COMFYUI_TEXT_ENCODER_COMPONENT, COMFYUI_VAE_COMPONENT,
+    KREA_CONVROT_DIT_COMPONENT, VAE_COMPONENT,
 };
 pub use text_embed::{TextEmbedder, TextEmbedderDescriptor};
 pub use tier_integrity::{control_branch_tier, is_above_selected_tier};
 pub use tiling::{TilingConfig, VaeTiling};
+pub use vision_encoder_contract::{VisionEncoderArchitecture, VisionEncoderContract};
 pub use voice_embed::{VoiceEmbedder, VoiceEmbedderDescriptor, VoiceEmbedding};
 pub use weightsmeta::{
     safetensors_dir_bytes, safetensors_path_bytes, safetensors_path_tensor_headers,

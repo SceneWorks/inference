@@ -44,6 +44,94 @@ pub mod transformer;
 pub mod transformer_block;
 pub mod vae;
 
+pub const TOKENIZER_CONTRACT: mlx_gen::gen_core::EncoderTokenizerContract =
+    mlx_gen::gen_core::EncoderTokenizerContract {
+        family: "qwen3",
+        binding: mlx_gen::gen_core::EncoderTokenizerBinding::RetainBase,
+        artifact_candidates: &["tokenizer/tokenizer.json"],
+        required_tokens: &[
+            mlx_gen::gen_core::EncoderRequiredToken {
+                role: "qwen_endoftext",
+                literal: "<|endoftext|>",
+                id: 151_643,
+                config_field: Some("bos_token_id"),
+            },
+            mlx_gen::gen_core::EncoderRequiredToken {
+                role: "qwen_im_start",
+                literal: "<|im_start|>",
+                id: 151_644,
+                config_field: None,
+            },
+            mlx_gen::gen_core::EncoderRequiredToken {
+                role: "qwen_im_end",
+                literal: "<|im_end|>",
+                id: 151_645,
+                config_field: Some("eos_token_id"),
+            },
+        ],
+    };
+pub const PROMPT_EXECUTIONS: &[mlx_gen::gen_core::EncoderPromptExecutionContract] = &[
+    mlx_gen::gen_core::EncoderPromptExecutionContract {
+        purpose: "z_image_prompt",
+        template: mlx_gen::gen_core::EncoderPromptTemplate::QwenInstruct,
+        add_special_tokens: true,
+        length: mlx_gen::gen_core::EncoderPromptLengthPolicy::RightTruncate { max_tokens: 512 },
+        padding: mlx_gen::gen_core::EncoderPromptPadding::RightToMax {
+            pad_token_id: 151_643,
+        },
+        prefix_trim: 0,
+    },
+    mlx_gen::gen_core::EncoderPromptExecutionContract {
+        purpose: "z_image_empty_negative",
+        template: mlx_gen::gen_core::EncoderPromptTemplate::QwenInstruct,
+        add_special_tokens: true,
+        length: mlx_gen::gen_core::EncoderPromptLengthPolicy::Unbounded,
+        padding: mlx_gen::gen_core::EncoderPromptPadding::None,
+        prefix_trim: 0,
+    },
+];
+
+pub const ENCODER_CONTRACT: mlx_gen::gen_core::EncoderContract =
+    mlx_gen::gen_core::EncoderContract {
+        architecture: "qwen3",
+        hidden_size: 2560,
+        intermediate_size: 9728,
+        num_hidden_layers: 36,
+        num_attention_heads: 32,
+        num_key_value_heads: 8,
+        head_dim: 128,
+        vocab_size: 151_936,
+        output_width: 2560,
+        loaded_hidden_layers: 36,
+        requires_final_norm: false,
+        requires_lm_head: false,
+        hidden_activation: "silu",
+        attention_dropout: mlx_gen::gen_core::EncoderConfigFloat::new(0.0),
+        rms_norm_eps: mlx_gen::gen_core::EncoderConfigFloat::new(1e-6),
+        qk_norm_eps: Some(mlx_gen::gen_core::EncoderConfigFloat::new(1e-5)),
+        rope_theta: mlx_gen::gen_core::EncoderConfigFloat::new(1_000_000.0),
+        max_position_embeddings: 40_960,
+        attention_bias: mlx_gen::gen_core::EncoderConfigBool::Required(false),
+        tie_word_embeddings: mlx_gen::gen_core::EncoderConfigBool::Required(true),
+        tokenizer: TOKENIZER_CONTRACT,
+        prompt_executions: PROMPT_EXECUTIONS,
+        bos_token_id: Some(151_643),
+        eos_token_id: Some(151_645),
+        image_token_id: None,
+        vision_start_token_id: None,
+        vision_end_token_id: None,
+        mrope_section: &[],
+        mrope_interleaved: None,
+        selected_hidden_layers: &[35],
+        packing: Some(mlx_gen::gen_core::EncoderPackingContract {
+            group_size: 64,
+            pack_embedding: true,
+            pack_lm_head: false,
+            supports_file: true,
+        }),
+        dense_storage_dtype_probe: None,
+    };
+
 pub use adapters::apply_z_image_adapters;
 pub use context_block::ZImageContextBlock;
 pub use control_transformer::{ZImageControlTransformer, CONTROL_IN_DIM};
@@ -196,11 +284,16 @@ mod explicit_registry_tests {
 
     fn snapshot(tmp: &tempfile::TempDir, tag: &str) -> std::path::PathBuf {
         let root = tmp.path().join(format!("z-image-{tag}"));
-        for component in ["text_encoder", "transformer", "vae"] {
+        for component in ["transformer", "vae"] {
             let dir = root.join(component);
             std::fs::create_dir_all(&dir).unwrap();
             write_minimal_safetensors(&dir.join("model.safetensors"));
         }
+        gen_core_testkit::write_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            super::ENCODER_CONTRACT,
+        )
+        .unwrap();
         root
     }
 

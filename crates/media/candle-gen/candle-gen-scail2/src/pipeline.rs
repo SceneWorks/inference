@@ -54,6 +54,7 @@ pub const MODEL_ID: &str = "scail2_14b";
 /// `backend = "candle"`, `mac_only = false` (the off-Mac CUDA lane).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
         denoiser_output_latent_space: Some(&candle_gen::gen_core::WAN_Z16_VIDEO_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],

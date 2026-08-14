@@ -28,9 +28,6 @@ use candle_gen::candle_nn::{LayerNorm, Linear, Module};
 
 use crate::loader::Weights;
 
-const LN_EPS: f64 = 1e-6;
-const ROPE_THETA: f32 = 10000.0;
-
 /// Qwen3-VL vision-tower config (the `vision_config` block of `mllm/config.json`).
 #[derive(Clone, Debug)]
 pub struct VisionConfig {
@@ -38,6 +35,8 @@ pub struct VisionConfig {
     pub num_heads: usize,
     pub depth: usize,
     pub out_hidden_size: usize,
+    pub norm_eps: f64,
+    pub rope_theta: f32,
     pub patch_size: usize,
     pub temporal_patch_size: usize,
     pub spatial_merge_size: usize,
@@ -54,6 +53,8 @@ impl VisionConfig {
             num_heads: 16,
             depth: 27,
             out_hidden_size: 4096,
+            norm_eps: 1e-6,
+            rope_theta: 10_000.0,
             patch_size: 16,
             temporal_patch_size: 2,
             spatial_merge_size: 2,
@@ -79,10 +80,10 @@ impl VisionConfig {
 }
 
 /// Affine LayerNorm over the last dim (eps 1e-6), built from a `Weights` `{prefix}.weight`/`.bias`.
-fn layer_norm(w: &Weights, prefix: &str) -> Result<LayerNorm> {
+fn layer_norm(w: &Weights, prefix: &str, eps: f64) -> Result<LayerNorm> {
     let weight = w.get_f32(&format!("{prefix}.weight"))?;
     let bias = w.get_f32(&format!("{prefix}.bias"))?;
-    Ok(LayerNorm::new(weight, bias, LN_EPS))
+    Ok(LayerNorm::new(weight, bias, eps))
 }
 
 /// Load an unpacked vision projection in f32 regardless of the surrounding language-model store
@@ -119,8 +120,8 @@ impl Block {
     fn load(w: &Weights, prefix: &str, cfg: &VisionConfig) -> Result<Self> {
         let head_dim = cfg.head_dim();
         Ok(Self {
-            norm1: layer_norm(w, &format!("{prefix}.norm1"))?,
-            norm2: layer_norm(w, &format!("{prefix}.norm2"))?,
+            norm1: layer_norm(w, &format!("{prefix}.norm1"), cfg.norm_eps)?,
+            norm2: layer_norm(w, &format!("{prefix}.norm2"), cfg.norm_eps)?,
             qkv: vision_linear(w, &format!("{prefix}.attn.qkv"), true)?,
             proj: vision_linear(w, &format!("{prefix}.attn.proj"), true)?,
             fc1: vision_linear(w, &format!("{prefix}.mlp.linear_fc1"), true)?,
@@ -195,9 +196,15 @@ struct Merger {
 }
 
 impl Merger {
-    fn load(w: &Weights, prefix: &str, postshuffle: bool, merged_dim: usize) -> Result<Self> {
+    fn load(
+        w: &Weights,
+        prefix: &str,
+        postshuffle: bool,
+        merged_dim: usize,
+        norm_eps: f64,
+    ) -> Result<Self> {
         Ok(Self {
-            norm: layer_norm(w, &format!("{prefix}.norm"))?,
+            norm: layer_norm(w, &format!("{prefix}.norm"), norm_eps)?,
             fc1: vision_linear(w, &format!("{prefix}.linear_fc1"), true)?,
             fc2: vision_linear(w, &format!("{prefix}.linear_fc2"), true)?,
             postshuffle,
@@ -269,7 +276,13 @@ impl VisionTower {
             .collect::<Result<Vec<_>>>()?;
 
         let merged_dim = cfg.hidden_size * cfg.merge_unit();
-        let merger = Merger::load(w, &format!("{prefix}.merger"), false, merged_dim)?;
+        let merger = Merger::load(
+            w,
+            &format!("{prefix}.merger"),
+            false,
+            merged_dim,
+            cfg.norm_eps,
+        )?;
         let deepstack_mergers = (0..cfg.deepstack_visual_indexes.len())
             .map(|i| {
                 Merger::load(
@@ -277,6 +290,7 @@ impl VisionTower {
                     &format!("{prefix}.deepstack_merger_list.{i}"),
                     true,
                     merged_dim,
+                    cfg.norm_eps,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -306,7 +320,7 @@ impl VisionTower {
         let nfreq = rd / 2; // inv_freq length (= head_dim/4)
         let side = c.num_grid_per_side() as i32;
         let inv: Vec<f32> = (0..nfreq)
-            .map(|j| ROPE_THETA.powf(-((2 * j) as f32) / rd as f32))
+            .map(|j| c.rope_theta.powf(-((2 * j) as f32) / rd as f32))
             .collect();
 
         let mut seq = 0usize;

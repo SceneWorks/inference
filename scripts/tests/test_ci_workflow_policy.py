@@ -17,6 +17,18 @@ from pathlib import Path
 
 WORKFLOW = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml"
 REAL_WEIGHTS_WORKFLOW = WORKFLOW.with_name("real-weights.yml")
+KREA_ALTERNATE_DECODER_SMOKE = (
+    WORKFLOW.parents[2] / "scripts" / "ci" / "run_krea_alternate_decoder_smoke.sh"
+)
+KREA_ALTERNATE_DECODER_EXAMPLE = (
+    WORKFLOW.parents[2]
+    / "crates"
+    / "media"
+    / "mlx-gen"
+    / "mlx-gen-krea"
+    / "examples"
+    / "alternate_decoder_characterization.rs"
+)
 MODEL_MANIFEST = WORKFLOW.parents[2] / "release" / "real-weight-models.toml"
 # An `unwired_reason` has to carry an actual explanation. "n/a" or "todo" would silence the gate
 # while recording nothing, which is precisely the failure this exists to prevent -- a deliberate
@@ -527,13 +539,14 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
             errors.append(f"{prefix}: unexpected argument after requirement lock")
 
     expected_lock_counts = {
-        # 32 since sc-18325 added the three correctness-only decode-quality jobs;
+        # 33 since sc-18325 added the three correctness-only decode-quality jobs;
+        # 30 since sc-18315 added pinned Krea license materialization;
         # 29 since sc-18249 added the `mlx-sana-drift-ceiling` job
         # (28 since sc-15520 added the `mlx-chroma-memory-ladder` job;
         # 27 since sc-17284 added the `mlx-qwen-image`, `mlx-qwen-image-pid` and
         # `mlx-qwen-image-producers` jobs; 24 since sc-17250 added the JoyCaption and
         # MOSS-TTS-Realtime jobs; 22 before).
-        MACOS_HUB_LOCK: 32,
+        MACOS_HUB_LOCK: 33,
         WINDOWS_HUB_LOCK: 10,
         WINDOWS_MAGE_LOCK: 1,
         MACOS_MAGE_LOCK: 1,
@@ -699,7 +712,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
     def test_real_weight_python_installs_are_binary_hash_locked(self) -> None:
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
         self.assertEqual(real_weight_pip_policy_errors(workflow), [])
-        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 32)
+        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 33)
         self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 10)
         self.assertEqual(workflow.count(WINDOWS_MAGE_LOCK), 1)
         self.assertNotRegex(
@@ -1025,8 +1038,13 @@ class CiWorkflowPolicyTests(unittest.TestCase):
     def test_sa3_snapshot_paths_are_manifest_derived(self) -> None:
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
         self.assertNotRegex(workflow, r"SA3_[A-Z0-9_]+[^\n]*[0-9a-f]{40}")
-        # Thirteen SA3/SAME exporters plus SC-18309's one exact SDXL-VAE projection.
-        self.assertEqual(workflow.count("export_model_snapshot_paths.py"), 14)
+        # Thirteen SA3/SAME exporters, SC-18309's exact SDXL-VAE projection, and SC-18315's
+        # q4 Krea correctness projection and standalone Wan donor plus exact-file materialization.
+        self.assertEqual(workflow.count("export_model_snapshot_paths.py"), 15)
+        self.assertEqual(workflow.count("--model krea-2-turbo-mlx-q4"), 2)
+        self.assertEqual(
+            workflow.count("--model krea-realtime-14b-mlx-wan-z16-vae-q8"), 2
+        )
         self.assertEqual(workflow.count("--model sdxl-base-mlx-vae-bf16"), 2)
         expected_models = {
             "same-l-metal": ("same-l",),
@@ -1975,6 +1993,89 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         # No SANA verifier exists; the day one appears this pin should flip to a positive
         # requirement rather than being deleted.
         self.assertNotIn("verify_residency_ab.py", job)
+
+    def test_krea_alternate_decoder_smoke_is_explicit_and_correctness_only(self) -> None:
+        """SC-18315 keeps its model smoke distinct from memory/calibration capture."""
+        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        jobs = workflow_job_bodies(workflow)
+        job = "\n".join(jobs["mlx-krea-alternate-decoder"])
+        job_header = job.split("steps:", 1)[0]
+        inputs = yaml.safe_load(workflow)[True]["workflow_dispatch"]["inputs"]
+        choices = inputs["profile"]["options"]
+
+        self.assertEqual(choices.count("krea-alternate-decoder"), 1)
+        self.assertIn(
+            "if: github.event_name == 'workflow_dispatch' && "
+            "inputs.profile == 'krea-alternate-decoder'",
+            job,
+        )
+        self.assertNotIn("github.event_name == 'schedule'", job_header)
+        self.assertNotIn("inputs.profile == 'all'", job_header)
+        self.assertIn(
+            "runs-on: [self-hosted, macOS, ARM64, nax, rw-sa3]", job
+        )
+        self.assertIn("scripts/ci/run_krea_alternate_decoder_smoke.sh", job)
+        self.assertLess(
+            job.index("--model krea-2-turbo-mlx-q4"),
+            job.index("scripts/ci/run_krea_alternate_decoder_smoke.sh"),
+        )
+        self.assertIn("scripts/release/ensure_model_snapshot_file.py", job)
+        self.assertIn("--file LICENSE.pdf", job)
+        self.assertIn("--model krea-realtime-14b-mlx-wan-z16-vae-q8", job)
+        self.assertIn("--file q8/vae.safetensors", job)
+        self.assertLess(
+            job.index("scripts/release/ensure_model_snapshot_file.py"),
+            job.index("scripts/ci/run_krea_alternate_decoder_smoke.sh"),
+        )
+        self.assertIn("actions/upload-artifact@", job)
+        self.assertIn("if-no-files-found: error", job)
+        self.assertNotIn("xcrun metal --version", job)
+        self.assertNotIn("gpu_fault_evidence.sh", job)
+        self.assertNotIn("memory.csv", job)
+        self.assertNotIn("--inventory-output", job)
+
+        models = {
+            model["key"]: model
+            for model in tomllib.loads(MODEL_MANIFEST.read_text(encoding="utf-8"))["models"]
+        }
+        donor = models["krea-realtime-14b-mlx-wan-z16-vae-q8"]
+        self.assertEqual(donor["repository"], "SceneWorks/krea-realtime-14b-mlx")
+        self.assertEqual(
+            donor["revision"], "e68e9a3d98187fdf6936838ffcf6df5aa48d6626"
+        )
+        self.assertEqual(donor["download_files"], ["q8/vae.safetensors"])
+        self.assertEqual(donor["expected_files"], ["q8/vae.safetensors"])
+        self.assertEqual(
+            donor["environment"], ["KREA_ALTERNATE_DECODER_WAN_VAE_SNAPSHOT"]
+        )
+
+        script = KREA_ALTERNATE_DECODER_SMOKE.read_text(encoding="utf-8")
+        self.assertTrue(os.access(KREA_ALTERNATE_DECODER_SMOKE, os.X_OK))
+        self.assertIn("d009674080cc1bccf2b629d834c34bf5eccdb723", script)
+        self.assertIn("e68e9a3d98187fdf6936838ffcf6df5aa48d6626", script)
+        self.assertIn(
+            "42159a8b571dbeb3ea40327b88a6161a5342c0511202af7c031360629757163d",
+            script,
+        )
+        self.assertIn("run_characterization 512 0", script)
+        self.assertIn("run_characterization 768 1", script)
+        self.assertEqual(script.count(".png\n"), 4)
+        self.assertIn("sha256.txt", script)
+        self.assertIn("provenance.txt", script)
+        self.assertNotIn("get_peak_memory", script)
+        self.assertNotIn("reset_peak_memory", script)
+        self.assertNotIn("gpu_fault_evidence", script)
+        self.assertIn('!= "$RUNNER_TEMP"/*', script)
+
+        example = KREA_ALTERNATE_DECODER_EXAMPLE.read_text(encoding="utf-8")
+        self.assertIn("KREA_AB_OUTPUT_DIR", example)
+        self.assertNotIn("get_peak_memory", example)
+        self.assertNotIn("reset_peak_memory", example)
+        self.assertNotIn("std::time::Instant", example)
+        self.assertEqual(example.count("validate_rgb_output("), 3)
+        self.assertIn("usize::try_from(size)", example)
+        self.assertIn(".checked_mul(edge)", example)
+        self.assertIn("pixels.checked_mul(3)", example)
 
     def test_krea_s18_sweep_is_operator_dispatched_and_keeps_its_evidence(self) -> None:
         """sc-17276: the S18 coherence sweep is a measurement lane, not a regression gate.
