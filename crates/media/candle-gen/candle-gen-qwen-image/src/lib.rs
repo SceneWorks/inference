@@ -1327,39 +1327,55 @@ pub fn register_providers(
             inherit_adapters: true,
         });
     #[cfg(feature = "cuda")]
-    let registry = registry
-        .register_memory_strategy(QWEN_IMAGE_MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
-            provider_id: MODEL_ID,
-            contract: |spec| memory_strategy::weights_free_memory_strategy_contract(MODEL_ID, spec),
-        })
+    let registry = register_memory_contract_surfaces(registry)
         .register_memory_behavior(QWEN_IMAGE_MEMORY_BEHAVIOR)
-        .register_composed_memory_strategy(QWEN_EDIT_MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
-            provider_id: "qwen_image_edit",
-            contract: |spec| {
-                memory_strategy::weights_free_memory_strategy_contract("qwen_image_edit", spec)
-            },
-        })
         .register_memory_behavior(QWEN_EDIT_MEMORY_BEHAVIOR);
     registry
 }
 
-#[cfg(feature = "cuda")]
+/// Register the exhaustive weights-free memory-contract surface on every build platform.
+pub fn register_memory_contract_surfaces(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_memory_strategy(QWEN_IMAGE_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            surface_specs: gen_core::candle_memory_contract_surface_specs,
+            provider_id: MODEL_ID,
+            contract: weights_free_qwen_image_memory_contract,
+        })
+        .register_composed_memory_strategy(QWEN_EDIT_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            surface_specs: gen_core::candle_memory_contract_surface_specs,
+            provider_id: "qwen_image_edit",
+            contract: weights_free_qwen_edit_memory_contract,
+        })
+}
+
 fn registered_qwen_image_memory_contract(
     spec: &LoadSpec,
 ) -> gen_core::Result<gen_core::MemoryProviderContract> {
     memory_strategy::provider_contract(MODEL_ID, spec)
 }
 
-#[cfg(feature = "cuda")]
 fn registered_qwen_edit_memory_contract(
     spec: &LoadSpec,
 ) -> gen_core::Result<gen_core::MemoryProviderContract> {
     memory_strategy::provider_contract("qwen_image_edit", spec)
 }
 
-#[cfg(feature = "cuda")]
+fn weights_free_qwen_image_memory_contract(
+    spec: &LoadSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    memory_strategy::weights_free_memory_strategy_contract(MODEL_ID, spec)
+}
+
+fn weights_free_qwen_edit_memory_contract(
+    spec: &LoadSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    memory_strategy::weights_free_memory_strategy_contract("qwen_image_edit", spec)
+}
+
 const QWEN_IMAGE_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
     provider_id: MODEL_ID,
     contract: registered_qwen_image_memory_contract,
@@ -1376,7 +1392,6 @@ const QWEN_IMAGE_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
         },
     };
 
-#[cfg(feature = "cuda")]
 const QWEN_EDIT_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
     provider_id: "qwen_image_edit",
     contract: registered_qwen_edit_memory_contract,

@@ -116,6 +116,7 @@ pub fn register_providers(
         .register_generator(model::TURBO_EDIT_REGISTRATION)
         .register_memory_strategy(model::TURBO_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
             provider_id: KREA_2_TURBO_ID,
             contract: |spec| {
                 block_memory_strategy::weights_free_memory_strategy_contract(KREA_2_TURBO_ID, spec)
@@ -124,6 +125,7 @@ pub fn register_providers(
         .register_memory_behavior(model::TURBO_MEMORY_BEHAVIOR)
         .register_memory_strategy(model::RAW_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
             provider_id: KREA_2_RAW_ID,
             contract: |spec| {
                 block_memory_strategy::weights_free_memory_strategy_contract(KREA_2_RAW_ID, spec)
@@ -132,6 +134,7 @@ pub fn register_providers(
         .register_memory_behavior(model::RAW_MEMORY_BEHAVIOR)
         .register_memory_strategy(model::EDIT_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
             provider_id: KREA_2_EDIT_ID,
             contract: |spec| {
                 block_memory_strategy::weights_free_memory_strategy_contract(KREA_2_EDIT_ID, spec)
@@ -140,6 +143,7 @@ pub fn register_providers(
         .register_memory_behavior(model::EDIT_MEMORY_BEHAVIOR)
         .register_memory_strategy(model::TURBO_EDIT_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
             provider_id: KREA_2_TURBO_EDIT_ID,
             contract: |spec| {
                 block_memory_strategy::weights_free_memory_strategy_contract(
@@ -152,6 +156,7 @@ pub fn register_providers(
         .register_generator(model_control::CONTROL_REGISTRATION)
         .register_memory_strategy(model_control::MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
             provider_id: KREA_2_TURBO_CONTROL_ID,
             contract: |spec| {
                 memory_strategy::weights_free_memory_strategy_contract(

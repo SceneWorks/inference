@@ -65,6 +65,7 @@ pub fn register_providers(
         .register_generator(model::SCHNELL_REGISTRATION)
         .register_memory_strategy(model::SCHNELL_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
             provider_id: FLUX1_SCHNELL_ID,
             contract: |spec| {
                 memory_strategy::weights_free_memory_strategy_contract(FLUX1_SCHNELL_ID, spec)
@@ -74,6 +75,7 @@ pub fn register_providers(
         .register_generator(model::DEV_REGISTRATION)
         .register_memory_strategy(model::DEV_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
             provider_id: FLUX1_DEV_ID,
             contract: |spec| {
                 memory_strategy::weights_free_memory_strategy_contract(FLUX1_DEV_ID, spec)
@@ -84,6 +86,7 @@ pub fn register_providers(
         .register_generator(model_control::DEV_CONTROL_REGISTRATION)
         .register_memory_strategy(model_control::DEV_CONTROL_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
             provider_id: FLUX1_DEV_CONTROL_ID,
             contract: |spec| {
                 memory_strategy::weights_free_memory_strategy_contract(FLUX1_DEV_CONTROL_ID, spec)

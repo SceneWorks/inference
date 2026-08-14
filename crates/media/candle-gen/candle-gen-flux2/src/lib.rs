@@ -1480,22 +1480,37 @@ pub fn register_providers(
             inherit_adapters: true,
         });
     #[cfg(feature = "cuda")]
-    let registry = registry
-        .register_memory_strategy(KLEIN_MEMORY_REGISTRATION)
+    let registry = register_memory_contract_surfaces(registry)
         .register_memory_behavior(KLEIN_MEMORY_BEHAVIOR)
-        .register_memory_strategy(DEV_MEMORY_REGISTRATION)
         .register_memory_behavior(DEV_MEMORY_BEHAVIOR);
     registry
 }
 
-#[cfg(feature = "cuda")]
+/// Register only weights-free memory-contract surfaces; safe on every build platform.
+pub fn register_memory_contract_surfaces(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_memory_strategy(KLEIN_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            surface_specs: gen_core::candle_memory_contract_surface_specs,
+            provider_id: config::FLUX2_KLEIN_9B_ID,
+            contract: memory_strategy::klein_provider_contract,
+        })
+        .register_memory_strategy(DEV_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            surface_specs: gen_core::candle_memory_contract_surface_specs,
+            provider_id: config::FLUX2_DEV_ID,
+            contract: memory_strategy::provider_contract,
+        })
+}
+
 const DEV_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
     provider_id: config::FLUX2_DEV_ID,
     contract: memory_strategy::provider_contract,
     safety_check: memory_strategy::registered_safety_check,
 };
 
-#[cfg(feature = "cuda")]
 const KLEIN_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
     provider_id: config::FLUX2_KLEIN_9B_ID,
     contract: memory_strategy::klein_provider_contract,

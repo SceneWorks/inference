@@ -94,6 +94,7 @@ pub fn register_providers(
         .register_generator(model::QUALITY_REGISTRATION)
         .register_memory_strategy(model::QUALITY_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
             provider_id: MODEL_ID,
             contract: |spec| memory_strategy::weights_free_memory_strategy_contract(MODEL_ID, spec),
         })
@@ -102,6 +103,7 @@ pub fn register_providers(
         .register_generator(model::FAST_REGISTRATION)
         .register_memory_strategy(model::FAST_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
             provider_id: MODEL_ID_FAST,
             contract: |spec| {
                 memory_strategy::weights_free_memory_strategy_contract(MODEL_ID_FAST, spec)

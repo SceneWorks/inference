@@ -87,6 +87,47 @@ pub fn memory_strategy_registry_conformance(registry: &ProviderRegistry, spec: &
     }
 }
 
+/// Exhaustive, caller-independent conformance over every registered contract surface.
+///
+/// Unlike [`check_memory_strategy_registry`], this accepts no `LoadSpec`: the paired provider
+/// fixture owns the complete registry-load witness matrix. Missing fixtures, duplicate selectors,
+/// construction errors, and provider-id drift are reported by
+/// [`ProviderRegistry::memory_contract_surfaces`] before static contract conformance runs.
+pub fn check_memory_contract_surface_registry(
+    registry: &ProviderRegistry,
+) -> Result<(), Vec<String>> {
+    let surfaces = registry
+        .memory_contract_surfaces()
+        .map_err(|error| vec![error.to_string()])?;
+    let mut errors = Vec::new();
+    for surface in surfaces {
+        if let Err(contract_errors) = check_memory_strategy_contract(&surface.contract) {
+            errors.extend(contract_errors.into_iter().map(|error| {
+                format!(
+                    "{} [{}]: {error}",
+                    surface.contract.provider_id,
+                    surface.selector.id()
+                )
+            }));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+/// Panic-on-failure entry point for complete catalog contract-surface inventories.
+pub fn memory_contract_surface_registry_conformance(registry: &ProviderRegistry) {
+    if let Err(errors) = check_memory_contract_surface_registry(registry) {
+        panic!(
+            "memory-contract surface registry conformance FAILED:\n- {}",
+            errors.join("\n- ")
+        );
+    }
+}
+
 fn check_memory_registration(
     registration: &MemoryRegistration,
     contract_fixture: Option<&MemoryContractFixtureRegistration>,
@@ -776,6 +817,7 @@ mod tests {
         let contract_fixture = MemoryContractFixtureRegistration {
             provider_id: "pid-provider",
             contract: pid_contract,
+            surface_specs: gen_core::mlx_memory_contract_surface_specs,
         };
         let mut errors = Vec::new();
         check_memory_registration(

@@ -33,6 +33,13 @@ pub fn register_providers(
     registry
         .register_generator(crate::registry::REGISTRATION)
         .register_memory_strategy(crate::registry::MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+            provider_id: MODEL_ID,
+            contract: |spec| {
+                crate::memory_strategy::weights_free_memory_strategy_contract(MODEL_ID, spec)
+            },
+        })
         .register_memory_behavior(crate::registry::MEMORY_BEHAVIOR_REGISTRATION)
         .register_trainer(training::TRAINER_REGISTRATION)
 }

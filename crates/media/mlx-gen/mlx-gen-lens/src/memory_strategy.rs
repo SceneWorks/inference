@@ -110,8 +110,46 @@ pub fn memory_strategy_contract(
 ) -> CoreResult<MemoryProviderContract> {
     let text_streamable = can_stream_text(spec)?;
     let dit_streamable = can_stream_dit(spec)?;
-    let calibration_route = calibration_route(provider_id, spec, text_streamable, dit_streamable);
     let footprint = crate::registry::component_footprint(spec)?;
+    memory_strategy_contract_with_surface_facts(
+        provider_id,
+        spec,
+        text_streamable,
+        dit_streamable,
+        footprint,
+    )
+}
+
+/// Declaration-equivalent registry contract with no filesystem traversal.
+///
+/// SceneWorks catalog tiers are provisioned snapshot directories. Their q4/q8 subtrees are already
+/// packed, so the weights-free surface treats a deferred directory as re-openable rather than
+/// asking `needs_load_time_quant` to inspect a nonexistent witness path.
+pub fn weights_free_memory_strategy_contract(
+    provider_id: &str,
+    spec: &LoadSpec,
+) -> CoreResult<MemoryProviderContract> {
+    let base_streamable = matches!(spec.weights, WeightsSource::Dir(_))
+        && spec.load_shape == LoadShape::DeferredMaterialization
+        && spec.precision == Precision::Bf16
+        && spec.pid.is_none();
+    memory_strategy_contract_with_surface_facts(
+        provider_id,
+        spec,
+        base_streamable,
+        base_streamable && spec.adapters.is_empty(),
+        mlx_gen::gen_core::PerComponentBytes::default(),
+    )
+}
+
+fn memory_strategy_contract_with_surface_facts(
+    provider_id: &str,
+    spec: &LoadSpec,
+    text_streamable: bool,
+    dit_streamable: bool,
+    footprint: mlx_gen::gen_core::PerComponentBytes,
+) -> CoreResult<MemoryProviderContract> {
+    let calibration_route = calibration_route(provider_id, spec, text_streamable, dit_streamable);
     let mut contract = MemoryProviderContract::compatibility_default(
         provider_id,
         MemoryBackendRealization::MlxMetal {

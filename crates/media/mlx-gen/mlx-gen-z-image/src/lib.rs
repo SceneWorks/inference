@@ -184,6 +184,7 @@ pub fn register_providers(
         .register_generator(model_control::REGISTRATION)
         .register_memory_strategy(model::MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
             provider_id: model::MODEL_ID,
             contract: |spec| {
                 memory_strategy::weights_free_memory_strategy_contract(model::MODEL_ID, spec)
@@ -192,6 +193,7 @@ pub fn register_providers(
         .register_memory_behavior(model::MEMORY_BEHAVIOR_REGISTRATION)
         .register_memory_strategy(model_base::MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
             provider_id: model_base::MODEL_ID,
             contract: |spec| {
                 memory_strategy::weights_free_memory_strategy_contract(model_base::MODEL_ID, spec)
@@ -200,6 +202,7 @@ pub fn register_providers(
         .register_memory_behavior(model_base::MEMORY_BEHAVIOR_REGISTRATION)
         .register_memory_strategy(model_base_control::MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
             provider_id: model_base_control::MODEL_ID,
             contract: |spec| {
                 memory_strategy::weights_free_memory_strategy_contract(
@@ -211,6 +214,7 @@ pub fn register_providers(
         .register_memory_behavior(model_base_control::MEMORY_BEHAVIOR_REGISTRATION)
         .register_memory_strategy(model_control::MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
             provider_id: model_control::MODEL_ID,
             contract: |spec| {
                 memory_strategy::weights_free_memory_strategy_contract(

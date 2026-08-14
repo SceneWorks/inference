@@ -51,6 +51,19 @@ fn media_registry() -> gen_core::Result<gen_core::ProviderRegistry> {
     }
 }
 
+/// Complete weights-free memory-contract surface for capability generation and reconciliation.
+pub fn memory_contract_surface_registry() -> gen_core::Result<gen_core::ProviderRegistry> {
+    #[cfg(feature = "media")]
+    {
+        mlx_gen_catalog::provider_registry()
+    }
+
+    #[cfg(not(feature = "media"))]
+    {
+        gen_core::ProviderRegistryBuilder::new().build()
+    }
+}
+
 /// The bundle's explicit audio lane (sc-12835): the complete Candle audio catalog from the audio
 /// composition root — never `mlx-gen-catalog` — plus the lane's **candle** snapshot preparer
 /// carried in the lane. The main preparer registry stays mlx-only (the single-backend invariant

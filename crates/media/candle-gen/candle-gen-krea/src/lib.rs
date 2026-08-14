@@ -1690,7 +1690,6 @@ candle_gen::register_generators! {
 /// Krea Turbo's provider-owned half of the shared memory-strategy handshake. The measured phase
 /// coefficients and exact fit boundaries stay in SceneWorks generated evidence; this declaration
 /// pins the executable structure that makes those measurements valid.
-#[cfg(any(feature = "cuda", test))]
 fn build_krea_turbo_memory_strategy_contract(spec: &LoadSpec) -> gen_core::MemoryProviderContract {
     use gen_core::{
         LoadShape, MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind,
@@ -1812,7 +1811,6 @@ fn build_krea_turbo_memory_strategy_contract(spec: &LoadSpec) -> gen_core::Memor
     }
 }
 
-#[cfg(any(feature = "cuda", test))]
 fn validated_krea_turbo_memory_strategy_contract(
     spec: &LoadSpec,
 ) -> gen_core::Result<gen_core::MemoryProviderContract> {
@@ -1820,11 +1818,16 @@ fn validated_krea_turbo_memory_strategy_contract(
     Ok(build_krea_turbo_memory_strategy_contract(spec))
 }
 
-#[cfg(feature = "cuda")]
 fn registered_krea_turbo_memory_strategy_contract(
     spec: &LoadSpec,
 ) -> gen_core::Result<gen_core::MemoryProviderContract> {
     validated_krea_turbo_memory_strategy_contract(spec)
+}
+
+fn weights_free_krea_turbo_memory_strategy_contract(
+    spec: &LoadSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    Ok(build_krea_turbo_memory_strategy_contract(spec))
 }
 
 #[cfg(test)]
@@ -1886,7 +1889,6 @@ fn actual_quant_tier(spec: &LoadSpec, id: &str) -> gen_core::Result<Option<Quant
     }
 }
 
-#[cfg(any(feature = "cuda", test))]
 fn registered_krea_safety_check(
     spec: &LoadSpec,
     contract: &gen_core::MemoryProviderContract,
@@ -2020,7 +2022,6 @@ fn krea_memory_strategy_safety_check(
     )
 }
 
-#[cfg(feature = "cuda")]
 const TURBO_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
     provider_id: KREA_2_TURBO_ID,
     contract: registered_krea_turbo_memory_strategy_contract,
@@ -2037,10 +2038,16 @@ const TURBO_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
 /// Provider-owned executable capabilities for SceneWorks' composed Krea Turbo + pose-ControlNet
 /// route. The worker owns measured evidence and live-budget selection; this declaration owns which
 /// controls the provider can actually execute.
-#[cfg(any(feature = "cuda", test))]
 fn build_krea_control_memory_strategy_contract(
     spec: &LoadSpec,
 ) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    let quant = actual_quant_tier(spec, "krea_2_turbo_control")?;
+    Ok(build_krea_control_memory_strategy_contract_for_tier(quant))
+}
+
+fn build_krea_control_memory_strategy_contract_for_tier(
+    quant: Option<Quant>,
+) -> gen_core::MemoryProviderContract {
     use gen_core::{
         LoadShape, MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind,
         MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryParameterRanges, MemoryPhase,
@@ -2125,7 +2132,7 @@ fn build_krea_control_memory_strategy_contract(
         )
     })
     .collect();
-    if actual_quant_tier(spec, "krea_2_turbo_control")? != Some(Quant::Q4) {
+    if quant != Some(Quant::Q4) {
         // SC-16013's direct 1024² calibration found no decode-tail peak on q8, bf16, or
         // INT8-ConvRot. Attention chunking is independently executable there, so forcing tiled decode
         // underneath it adds a speed cost with no measured memory saving. Q4 retains the cumulative
@@ -2140,17 +2147,23 @@ fn build_krea_control_memory_strategy_contract(
                     .to_owned(),
         });
     }
-    Ok(contract)
+    contract
 }
 
-#[cfg(feature = "cuda")]
 fn registered_krea_control_memory_strategy_contract(
     spec: &LoadSpec,
 ) -> gen_core::Result<gen_core::MemoryProviderContract> {
     build_krea_control_memory_strategy_contract(spec)
 }
 
-#[cfg(feature = "cuda")]
+fn weights_free_krea_control_memory_strategy_contract(
+    spec: &LoadSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    Ok(build_krea_control_memory_strategy_contract_for_tier(
+        spec.quantize,
+    ))
+}
+
 const CONTROL_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
     provider_id: "krea_2_turbo_control",
     contract: registered_krea_control_memory_strategy_contract,
@@ -2178,18 +2191,9 @@ pub fn register_providers(
             provider_id: KREA_2_TURBO_ID,
         });
     #[cfg(feature = "cuda")]
-    let registry = registry
-        .register_memory_strategy(TURBO_MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
-            provider_id: KREA_2_TURBO_ID,
-            contract: |spec| Ok(build_krea_turbo_memory_strategy_contract(spec)),
-        })
+    let registry = register_memory_contract_surfaces(registry)
         .register_memory_behavior(TURBO_MEMORY_BEHAVIOR)
-        // The direct CUDA control runtime composes the registered Krea base with a native control
-        // overlay in SceneWorks; it is a real route, but not a standalone gen-core Generator.
-        .register_composed_memory_strategy(CONTROL_MEMORY_REGISTRATION);
-    #[cfg(feature = "cuda")]
-    let registry = registry.register_memory_behavior(CONTROL_MEMORY_BEHAVIOR);
+        .register_memory_behavior(CONTROL_MEMORY_BEHAVIOR);
     registry
         .register_imported_model(gen_core::ImportedModelRegistration {
             family: "krea_2",
@@ -2217,6 +2221,27 @@ pub fn register_providers(
         })
         .register_trainer(training::TRAINER_REGISTRATION)
         .register_trainer(control_trainer::CONTROL_TRAINER_REGISTRATION)
+}
+
+/// Register only weights-free memory-contract surfaces; safe on every build platform.
+pub fn register_memory_contract_surfaces(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_memory_strategy(TURBO_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            surface_specs: gen_core::candle_nvfp4_memory_contract_surface_specs,
+            provider_id: KREA_2_TURBO_ID,
+            contract: weights_free_krea_turbo_memory_strategy_contract,
+        })
+        // The direct CUDA control runtime composes the registered Krea base with a native control
+        // overlay in SceneWorks; it is a real route, but not a standalone gen-core Generator.
+        .register_composed_memory_strategy(CONTROL_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            surface_specs: gen_core::candle_nvfp4_memory_contract_surface_specs,
+            provider_id: "krea_2_turbo_control",
+            contract: weights_free_krea_control_memory_strategy_contract,
+        })
 }
 
 /// Build the complete explicit Candle Krea provider catalog.
