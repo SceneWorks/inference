@@ -149,12 +149,25 @@ impl AdaLnTierPolicy {
     /// "zero denoise-resident cost". Both halves of that trade were measured on the real weights
     /// rather than argued, and they disagree with the reasoning that was recorded for it.
     ///
-    /// # The memory objection was well-posed, and it does not bite
+    /// # The memory objection is real; the measurement answers a narrower question
     ///
     /// [`crate::dit::adaln::AdaLnCache::precompute`] reads and evaluates all 50 projections
-    /// **before** eviction, so a wider AdaLN raises the precompute transient by the same +6.5 GB —
-    /// free only while the precompute peak stays under the denoise peak, an inequality nobody had
-    /// measured. It **holds, comfortably**. Four real renders at `576x320 / 124 frames / 50 steps`:
+    /// **before** eviction, so a wider AdaLN raises the precompute transient by the same +6.5 GB.
+    /// An earlier pass discharged that by asserting the precompute peak "stays under the denoise
+    /// peak, comfortably". That DiT-internal inequality is **retracted** (sc-18659) on two counts.
+    /// Nothing asserts it: `tests/adaln_evict_real_weights.rs` computes `peak_precompute` and
+    /// `peak_denoise` separately, but pins only the post-evict drop, and against the *pre-eviction
+    /// resident* rather than against `peak_precompute`. And the one in-repo measurement of the
+    /// precompute side points the other way —
+    /// [`ADALN_EVICTED_BYTES`](crate::memory_strategy::ADALN_EVICTED_BYTES) records the evict as
+    /// `64.56 -> 38.70 GB` active, so the precompute side sits **above** the residency that
+    /// follows it, not under it.
+    ///
+    /// What the renders below do establish is the quantity this trade actually spends: the
+    /// **process** high-water. Across a 3.5x span of AdaLN width — 7.3 GB at q4 to
+    /// 26_020_915_200 B at bf16 — it does not move, because the conditioning stage sets it first at
+    /// [`53.07 GB`](crate::memory_strategy::CONDITIONING_STAGE_PEAK_BYTES). Four real renders at
+    /// `576x320 / 124 frames / 50 steps`:
     ///
     /// | variant | MLX peak | frame stddev | inter-frame motion |
     /// |---|---:|---:|---:|
@@ -163,15 +176,16 @@ impl AdaLnTierPolicy {
     /// | q8 | 53.07 GB | 71.0 | 1.83 |
     /// | bf16 | 52.81 GB | 71.1 | 1.80 |
     ///
-    /// **bf16 carries a 26_020_915_200 B AdaLN and peaks the same as q4's 7.3 GB one.** The
-    /// conclusion holds — AdaLN width does not move the peak at any tier — but the *cause*
-    /// originally recorded here ("the peak is activation-dominated") is **retracted** (sc-18659).
-    /// The dense Qwen3-VL-32B text encoder runs first and sets a
-    /// [`53.07 GB`](crate::memory_strategy::CONDITIONING_STAGE_PEAK_BYTES) process high-water that
-    /// masks every later stage, so this column is flat across tier **by construction**: while the
-    /// conditioning stage binds, no DiT-side width — AdaLN's or any other group's — can move the
-    /// number, and the flatness says nothing about activation pressure. sc-19120's packed TE tier
-    /// is what makes the column informative again.
+    /// **bf16 carries a 26_020_915_200 B AdaLN and peaks the same as q4's 7.3 GB one**, and the
+    /// column is flat across tier **by construction**: the dense Qwen3-VL-32B text encoder runs
+    /// first and masks every later stage, so while the conditioning stage binds, no DiT-side width
+    /// — AdaLN's or any other group's — can move the number. That is the whole of what this table
+    /// licenses. It says nothing about activation pressure (the cause originally recorded here,
+    /// "the peak is activation-dominated", is **retracted** — sc-18659), and it cannot see a
+    /// DiT-side peak relationship either: bf16 denoise residency is
+    /// [`40.43 GB`](crate::memory_strategy::DENOISE_RESIDENT_BF16_BYTES) against the conditioning
+    /// stage's 53.07 GB mark, leaving a **12.64 GB window** inside which a DiT-side transient
+    /// moves invisibly. sc-19120's packed TE tier is what makes the column informative again.
     ///
     /// # So the decision rests on quality per byte, and there uniform wins clearly
     ///

@@ -347,18 +347,65 @@ mod tests {
         );
     }
 
-    /// `candle-gen-catalog`'s `register_providers` source — the file the missing line belongs in.
+    /// A file under `candle-gen-catalog/`, read from disk.
     ///
-    /// Read from disk rather than linked, because the dependency only runs the other way: the
-    /// catalog depends on this crate, so this crate cannot call into it. `CARGO_MANIFEST_DIR` is
+    /// Read from disk rather than linked because the dependency edge will only ever run the other
+    /// way: once sc-17156 lands, `candle-gen-catalog` will depend on this crate, so a
+    /// dev-dependency back-edge from here would cycle. (It does **not** depend on this crate today
+    /// — that is exactly the state these tests exist to detect the end of.) `CARGO_MANIFEST_DIR` is
     /// stable under `cargo test` and both crates sit in `crates/media/candle-gen`, which is the same
     /// resolution `candle-gen-catalog`'s own cross-crate source scans use.
-    fn catalog_source() -> String {
+    fn catalog_file(relative: &str) -> String {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("candle-gen-minimax-h3 sits inside crates/media/candle-gen")
-            .join("candle-gen-catalog/src/lib.rs");
+            .join("candle-gen-catalog")
+            .join(relative);
         std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+    }
+
+    /// **The choke point**: does `candle-gen-catalog`'s manifest declare a dependency on this crate?
+    ///
+    /// This, not a source scan, is what "the catalog reaches this crate" means. No file anywhere in
+    /// `candle-gen-catalog` — `lib.rs`, `licenses.rs`, or a module that does not exist yet — can
+    /// name `candle_gen_minimax_h3` without this entry, so the needle is immune to the module
+    /// reshuffling that defeats scanning one source file. Comment lines are skipped: a `#` line
+    /// cannot create a dependency edge, and the catalog already carries prose about this crate's
+    /// deliberate absence (`licenses.rs`).
+    fn catalog_depends_on_this_crate() -> bool {
+        catalog_file("Cargo.toml")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .any(|line| line.contains("candle-gen-minimax-h3"))
+    }
+
+    /// Every `.rs` under `candle-gen-catalog/src`, concatenated — used only to check that the
+    /// registration *call* landed, never to decide reachability. Reachability is
+    /// [`catalog_depends_on_this_crate`]; scanning sources for that would reintroduce the bypass.
+    fn catalog_sources() -> String {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("candle-gen-minimax-h3 sits inside crates/media/candle-gen")
+            .join("candle-gen-catalog/src");
+        let entries = std::fs::read_dir(&dir)
+            .unwrap_or_else(|error| panic!("{}: {error}", dir.display()))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap_or_else(|error| panic!("{}: {error}", dir.display()));
+        assert!(
+            !entries.is_empty(),
+            "{} is empty — the source scan would vacuously pass",
+            dir.display()
+        );
+        entries
+            .iter()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+            .map(|path| {
+                std::fs::read_to_string(&path)
+                    .unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// **The tripwire on the missing catalog line**, and it reads the crate's *real* registration
@@ -376,15 +423,21 @@ mod tests {
     /// the safety property the declaration's doc comment claims, actually guarded: the failure
     /// message names the line to add.
     ///
-    /// The `Err` arm deliberately tests the **broader** needle — any `candle_gen_minimax_h3` path
-    /// in the catalog, not only a `register_providers` call. That is what closes the bypass: a
-    /// generator registered straight from the catalog would never pass through this crate's
-    /// inventory, would leave the memory contract unregistered, and would satisfy a narrower check.
+    /// The `Err` arm deliberately tests the **broadest** needle — the catalog's *manifest*, not its
+    /// sources. That is what closes the bypass: a generator registered straight from the catalog
+    /// would never pass through this crate's inventory and would leave the memory contract
+    /// unregistered, and it could be written in any catalog module, so a scan of `lib.rs` alone
+    /// goes green in exactly the state this test exists to catch. A `Cargo.toml` dependency is the
+    /// one thing no such bypass can omit.
+    ///
+    /// A known, accepted wart: a bare `pub use candle_gen_minimax_h3 as …;` re-export — which needs
+    /// the dependency but registers nothing — false-reds the `Err` arm. That is the correct
+    /// trade-off for a needle with no false *greens*, and the message says what to check.
     #[test]
     fn a_generator_landing_here_forces_the_catalog_line() {
-        let catalog = catalog_source();
-        let reached = catalog.contains("candle_gen_minimax_h3");
-        let wired = catalog.contains("candle_gen_minimax_h3::register_providers");
+        let reached = catalog_depends_on_this_crate();
+        let wired =
+            reached && catalog_sources().contains("candle_gen_minimax_h3::register_providers");
         match crate::register_providers(ProviderRegistryBuilder::new()).build() {
             Err(error) => {
                 assert!(
@@ -393,13 +446,15 @@ mod tests {
                 );
                 assert!(
                     !reached,
-                    "candle-gen-catalog already reaches candle-gen-minimax-h3, but this crate's \
-                     own `register_providers` still registers no generator. Either the catalog \
-                     line landed early — `provider_registry()` cannot build a memory strategy with \
-                     no matching generator — or a generator was registered straight from the \
-                     catalog and bypassed this crate's inventory, leaving MEMORY_REGISTRATION \
-                     unregistered. Register generators in `candle_gen_minimax_h3::register_providers` \
-                     (sc-17156)"
+                    "candle-gen-catalog's Cargo.toml now depends on candle-gen-minimax-h3, but \
+                     this crate's own `register_providers` still registers no generator. Either \
+                     the catalog line landed early — `provider_registry()` cannot build a memory \
+                     strategy with no matching generator — or a generator was registered straight \
+                     from the catalog (in any module) and bypassed this crate's inventory, leaving \
+                     MEMORY_REGISTRATION unregistered. Register generators in \
+                     `candle_gen_minimax_h3::register_providers` (sc-17156). A dependency added \
+                     for a bare re-export with no registration trips this too — drop it until the \
+                     generator exists"
                 );
             }
             Ok(registry) => {
@@ -410,10 +465,11 @@ mod tests {
                 assert!(
                     wired,
                     "this crate now registers generator(s) {generators:?}, so its memory contract \
-                     is finally wirable — add `let registry = \
-                     candle_gen_minimax_h3::register_providers(registry);` to \
-                     candle-gen-catalog's `register_providers` (and the matching `ProviderCrate` \
-                     row), or the contract stays unreachable at runtime (sc-17156)"
+                     is finally wirable — add `candle-gen-minimax-h3` to candle-gen-catalog's \
+                     Cargo.toml (reached: {reached}) and `let registry = \
+                     candle_gen_minimax_h3::register_providers(registry);` to its \
+                     `register_providers` (and the matching `ProviderCrate` row), or the contract \
+                     stays unreachable at runtime (sc-17156)"
                 );
             }
         }
