@@ -517,11 +517,11 @@ impl MiniMaxH3VideoVae {
                 // against **13.617 GiB** for the single-pass decode this replaced; the same three,
                 // in that order, at 512x320 are **10.615 / 10.835 / 10.525**. So tiling lowers the
                 // decode peak at the shipped canvas either way, and the eval buys ~0.10 GiB (~1 %)
-                // on top of that — but at 512x320 tiling COSTS ~0.09 GiB against the single pass,
-                // which is the order of the six decoded 256 px tiles the grid holds until
-                // `stitch_tiles` consumes them (6 x [1, 3, 17, 256, 256] f32 = 0.07 GiB). Tiling
-                // pays for itself only above roughly one tile grid's worth of work; below that it
-                // is a small net cost, kept regardless because it is what the reference does.
+                // on top of that — but at 512x320 tiling with this eval COSTS ~0.09 GiB against the
+                // single pass, which is the order of the six decoded 256 px tiles the grid holds
+                // until `stitch_tiles` consumes them (6 x [1, 3, 17, 256, 256] f32 = 0.07 GiB). The
+                // crossover therefore sits above 6 tiles and at or below 28, and is not measured
+                // here; tiling is kept regardless because it is what the reference does.
                 mlx_rs::transforms::eval([&decoded])?;
                 row.push(decoded);
             }
