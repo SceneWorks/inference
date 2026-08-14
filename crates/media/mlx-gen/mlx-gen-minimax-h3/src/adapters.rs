@@ -62,8 +62,14 @@
 //! | `…_4step_v0.1` | *(none)* | 128 | **0.0625** (the default alpha) |
 //!
 //! Rank comes from the **factor shapes** (`lora_A` is `[r, in]`), as upstream's
-//! `_validate_lora_state_dict` derives it — never from a metadata string. A `__metadata__["rank"]`
-//! that disagrees with the shapes is a hard error, not a silent pick.
+//! `_validate_lora_state_dict` derives it — never from a metadata string. **Both** declared spellings
+//! are cross-checks only, never sources: a `__metadata__["rank"]` string *and* a PEFT
+//! `lora_adapter_metadata` `r` / `rank_pattern` that disagrees with the shapes is a hard error, not
+//! a silent pick. That is a deliberate divergence from the shared loader, which takes
+//! `cfg_rank.unwrap_or(factor_rank)` and so lets a blob `{"r": 8}` over rank-128 factors fold at
+//! `8/8 = 1.0` instead of `8/128 = 0.0625` — the same 16× class as the alpha trap below, and just as
+//! silent. PEFT writes `r` equal to the factor rank, so rejecting a disagreement rejects nothing
+//! legitimate; no published turbo file carries a blob at all.
 
 use std::collections::BTreeMap;
 
@@ -327,16 +333,25 @@ fn apply_one_lora(
             continue;
         };
         let (blob_alpha, blob_rank) = blob.as_ref().map_or((None, None), |c| c.effective(&path));
-        let shape_rank = resolve_rank(&path, &down, meta_rank)?;
-        let rank = blob_rank.unwrap_or(shape_rank);
-        // `resolve_rank` already guarded the shape-derived value; a blob-supplied one has not been,
-        // and a zero or NaN there would make `alpha/rank` non-finite and NaN-poison the residual
-        // while the load reported success (the F-141 class).
-        if rank <= 0.0 || !rank.is_finite() {
-            return Err(Error::Msg(format!(
-                "minimax_h3 adapter '{path}': lora_adapter_metadata declares rank {rank}; it must \
-                 be finite and > 0"
-            )));
+        let rank = resolve_rank(&path, &down, meta_rank)?;
+        // A PEFT blob's `r`/`rank_pattern` goes through the SAME disagreement check as
+        // `__metadata__["rank"]`, and for the same reason: the shapes are authoritative. PEFT itself
+        // writes `r` equal to the factor rank, so a consistent blob is accepted and an inconsistent
+        // one is a malformed file — never a silent override. Honouring it (what the shared loader
+        // does at `loader.rs`'s `cfg_rank.unwrap_or(factor_rank)`) would let `{"r": 8}` over rank-128
+        // factors fold at `8/8 = 1.0` instead of `8/128 = 0.0625`: exactly the 16x class this module
+        // exists to close, with no error. `!=` also covers the F-141 non-finite class without a
+        // second guard: `LoraAdapterMeta::from_metadata` already drops a `≤ 0` or NaN `r`, and an
+        // INFINITE one — which it keeps — cannot equal the finite, positive shape rank, so it is
+        // rejected here instead of folding a non-finite `alpha/rank` into the residual.
+        if let Some(declared) = blob_rank {
+            if declared != rank {
+                return Err(Error::Msg(format!(
+                    "minimax_h3 adapter '{path}': lora_adapter_metadata declares rank {declared} \
+                     but the lora_A factor is rank {rank}; the shapes are authoritative, so this \
+                     file is inconsistent rather than merely under-specified"
+                )));
+            }
         }
         // Precedence: per-target `.alpha` tensor → the PEFT blob → the file's top-level
         // `__metadata__["alpha"]` → `DEFAULT_LORA_ALPHA`. Only the last two differ from the shared
@@ -348,12 +363,17 @@ fn apply_one_lora(
                 // Residual form: a = downᵀ [in, rank], b = upᵀ [rank, out], with `alpha/rank` folded
                 // into `b` exactly as the shared `install_lora_groups` does. Factors keep their
                 // loaded (bf16) dtype so the residual promotes against the activation like the
-                // reference — and so it cannot widen the host Linear's output dtype.
+                // reference does.
                 let a = down.t();
                 let fold = alpha_rank_fold(alpha, rank);
-                // A **dtype-matched** scalar keeps the factor's dtype (the reference's weak-float
-                // multiply), exactly as `mlx-gen-sdxl`'s and `mlx-gen-wan`'s installs do. A bare f32
-                // scalar would promote a bf16 `b` to f32 and widen the whole residual.
+                // A **dtype-matched** scalar keeps `b` at the factor's dtype (the reference's
+                // weak-float multiply), exactly as `mlx-gen-sdxl`'s and `mlx-gen-wan`'s installs do.
+                // The property at stake is FORK PARITY, not host widening: every published turbo
+                // file is bf16, so a bare f32 scalar would promote `b` to f32 and run the whole
+                // low-rank `(x·A)·B` matmul in f32 where the reference runs it in bf16 — a silent
+                // numeric deviation. It could NOT widen the host Linear's output, because
+                // `AdaptableLinear::apply_adapters` (sc-15265) narrows every residual to
+                // `out.dtype()` before the add; that seam is where widening is prevented.
                 let b = up.t().multiply(scalar(fold).as_dtype(up.dtype())?)?;
                 lin.push(Adapter::Lora {
                     a,
@@ -370,8 +390,17 @@ fn apply_one_lora(
 
 /// Install every adapter in `specs` onto a MiniMax-H3 DiT, stacking in order.
 ///
-/// **Strict, like every other family's install:** an unmatched target path or a spec list that
-/// matched nothing is an error, never a silent partial fold. Routing is by the **file**, not by
+/// **Strict, like every other family's install:** an unmatched target path, or **any single file**
+/// that matched nothing, is an error, never a silent partial fold. The zero-match check is
+/// **per-spec** and deliberately not an aggregate over the whole list: an aggregate
+/// `report.applied == 0` lets `[good.safetensors, junk.safetensors]` return `Ok`, silently ignoring
+/// the junk file. Most wrong-model files are caught anyway — their `.lora_A.weight` keys resolve to
+/// no module and trip the unmatched guard below — but a file with **no recognized LoRA suffix at
+/// all** (a merged LoRA, a base checkpoint, a textual inversion) contributes neither an `applied`
+/// nor an `unmatched_path`, so only a per-spec check can see it. Downstream, the aggregate form
+/// reaches a user as "my second LoRA did nothing, and there was no error".
+///
+/// Routing is by the **file**, not by
 /// `spec.kind`: a genuine LoKr (`networkType=lokr`, or bare `lokr_*` keys) goes to the shared
 /// LyCORIS seam, and everything else goes to the diffusers LoRA path above. That ordering is what
 /// keeps the turbo files off `wmeta::parse_rank_alpha` — they carry an `alpha` string and no
@@ -382,6 +411,7 @@ pub fn apply_minimax_h3_adapters(
 ) -> Result<MiniMaxH3LoraReport> {
     let mut report = MiniMaxH3LoraReport::default();
     for spec in specs {
+        let before = report.applied;
         let w = Weights::from_file(&spec.path)?;
         if is_comfyui_key_space(&w) {
             return Err(Error::Msg(format!(
@@ -401,24 +431,26 @@ pub fn apply_minimax_h3_adapters(
             } = apply_lokr(host, &w, spec.scale)?;
             report.applied += applied;
             report.unmatched_paths.extend(unmatched_paths);
-            continue;
+        } else {
+            if spec.kind == AdapterKind::Lokr {
+                return Err(Error::Msg(format!(
+                    "minimax_h3 adapter {}: declared LoKr but the file carries no `lokr_*` factors \
+                     and no `networkType=lokr` stamp",
+                    spec.path.display()
+                )));
+            }
+            apply_one_lora(host, &w, spec, &mut report)?;
         }
-        if spec.kind == AdapterKind::Lokr {
+        // Per-spec, NOT aggregate: this file, on its own, must have folded onto something. See the
+        // doc comment — an aggregate check passes a junk file riding alongside a good one.
+        if report.applied == before {
             return Err(Error::Msg(format!(
-                "minimax_h3 adapter {}: declared LoKr but the file carries no `lokr_*` factors and \
-                 no `networkType=lokr` stamp",
+                "minimax_h3 adapter {}: no target modules matched in this file — expected the \
+                 diffusers key space (`transformer_blocks.{{i}}.…` / `token_refiner.…` with \
+                 `.lora_A.default.weight` / `.lora_B.default.weight`)",
                 spec.path.display()
             )));
         }
-        apply_one_lora(host, &w, spec, &mut report)?;
-    }
-    if !specs.is_empty() && report.applied == 0 {
-        return Err(Error::Msg(format!(
-            "minimax_h3 adapters: no target modules matched across {} adapter file(s) — expected \
-             the diffusers key space (`transformer_blocks.{{i}}.…` / `token_refiner.…` with \
-             `.lora_A.default.weight` / `.lora_B.default.weight`)",
-            specs.len()
-        )));
     }
     if !report.unmatched_paths.is_empty() {
         return Err(Error::Msg(format!(
@@ -646,10 +678,16 @@ mod tests {
         );
     }
 
-    /// Mutation guard on the fold's dtype handling: a bf16 up-factor scaled by an exact power of two
-    /// stays exact, so the 0.0625 fold is not quietly rounded away.
+    /// A property of **bf16 itself**, not of the install: scaling a bf16 array by an exact power of
+    /// two is lossless, so the 0.0625 fold is not quietly rounded away and the bf16 test fixtures can
+    /// assert exact folds.
+    ///
+    /// This test reimplements the multiply and therefore **cannot** see a change to the install's
+    /// fold scalar — that guard is
+    /// `turbo_lora::the_installed_fold_keeps_the_bf16_factor_dtype`, which asserts the dtype of the
+    /// array `apply_minimax_h3_adapters` actually installed.
     #[test]
-    fn the_fold_is_exact_on_a_bf16_up_factor() {
+    fn a_bf16_array_scaled_by_a_power_of_two_is_exact() {
         let up = Array::from_slice(&[1.0f32, 2.0, 4.0, 8.0], &[2, 2])
             .as_dtype(Dtype::Bfloat16)
             .unwrap();

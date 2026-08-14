@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 use mlx_rs::ops::{matmul, subtract};
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::adapters::AdaptableHost;
+use mlx_gen::adapters::{AdaptableHost, Adapter};
 use mlx_gen::gen_core::runtime::{AdapterKind, AdapterSpec};
 use mlx_gen::weights::Weights;
 use mlx_gen_minimax_h3::adapters::{
@@ -66,6 +66,11 @@ fn tensor(shape: &[i32], seed: f32) -> Array {
     Array::from_slice(&v, shape)
 }
 
+/// Cast to `bf16` — the dtype **every** tensor in **every** published turbo file carries.
+fn bf16(a: &Array) -> Array {
+    a.as_dtype(Dtype::Bfloat16).expect("cast to bf16")
+}
+
 /// The `[out, in]` logical shape of each of the six adaptable leaves at `cfg`'s geometry.
 fn target_shape(cfg: &MiniMaxH3DitConfig, target: &str) -> (i32, i32) {
     match target {
@@ -84,7 +89,27 @@ fn target_shape(cfg: &MiniMaxH3DitConfig, target: &str) -> (i32, i32) {
 /// geometry, keyed exactly as the published files are — `.lora_A.default.weight` /
 /// `.lora_B.default.weight`, no namespace prefix — with `alpha` stamped into the top-level
 /// `__metadata__` only when `alpha` is `Some`.
+///
+/// **The factors are written `bf16`, not `f32`.** All 624 tensors in every published turbo file are
+/// bf16, and that is the only dtype under which the install's dtype-matched fold scalar
+/// (`scalar(fold).as_dtype(up.dtype())`) has any effect at all — with f32 fixtures the cast is a
+/// no-op and the property is unguarded (sc-18724 review). Every fold asserted below is an exact
+/// power of two, so bf16 storage costs the assertions no exactness: scaling a bf16 factor by `1.0`
+/// or `0.0625` is representable without rounding.
 fn write_lora(dir: &Path, name: &str, cfg: &MiniMaxH3DitConfig, alpha: Option<&str>) -> PathBuf {
+    write_lora_with_meta(dir, name, cfg, alpha, &[])
+}
+
+/// [`write_lora`] plus arbitrary extra `__metadata__` entries — the `lora_adapter_metadata` blob
+/// arms need one, and everything else about the file must stay identical so the arms differ in
+/// exactly the metadata under test.
+fn write_lora_with_meta(
+    dir: &Path,
+    name: &str,
+    cfg: &MiniMaxH3DitConfig,
+    alpha: Option<&str>,
+    extra: &[(&str, &str)],
+) -> PathBuf {
     let path = dir.join(name);
     let mut arrays: Vec<(String, Array)> = Vec::new();
     for target in adapter_target_paths(cfg) {
@@ -94,11 +119,11 @@ fn write_lora(dir: &Path, name: &str, cfg: &MiniMaxH3DitConfig, alpha: Option<&s
         let seed = target.len() as f32;
         arrays.push((
             format!("{target}.lora_A.default.weight"),
-            tensor(&[PUBLISHED_RANK, inn], seed),
+            bf16(&tensor(&[PUBLISHED_RANK, inn], seed)),
         ));
         arrays.push((
             format!("{target}.lora_B.default.weight"),
-            tensor(&[out, PUBLISHED_RANK], seed + 0.5),
+            bf16(&tensor(&[out, PUBLISHED_RANK], seed + 0.5)),
         ));
     }
     let mut meta: HashMap<String, String> = HashMap::new();
@@ -106,6 +131,9 @@ fn write_lora(dir: &Path, name: &str, cfg: &MiniMaxH3DitConfig, alpha: Option<&s
     meta.insert("floating_dtype".into(), "bfloat16".into());
     if let Some(a) = alpha {
         meta.insert("alpha".into(), a.into());
+    }
+    for (k, v) in extra {
+        meta.insert((*k).into(), (*v).into());
     }
     let entries: Vec<(&str, &Array)> = arrays.iter().map(|(k, v)| (k.as_str(), v)).collect();
     Array::save_safetensors(entries, Some(&meta), &path).expect("write the tiny turbo LoRA");
@@ -223,6 +251,62 @@ fn the_three_published_alphas_fold_at_one_and_one_sixteenth() {
         (vs_rank_fallback - 0.0625).abs() < 1e-5,
         "…and it must NOT equal the alpha = rank fallback (which would give 1.0), got \
          {vs_rank_fallback}"
+    );
+}
+
+/// **The fold scalar is dtype-matched — and only an assertion on the INSTALLED adapter can see it.**
+///
+/// `apply_one_lora` folds `alpha/rank` into `b` with `scalar(fold).as_dtype(up.dtype())`. Dropping
+/// the `as_dtype` is numerically **invisible**: every published fold is an exact power of two, so the
+/// bf16 and f32 products carry identical values, and every numeric arm above would stay green. What
+/// changes is the dtype of `b` — and with it, the dtype the low-rank `(x·A)·B` matmul runs in: f32
+/// where the reference runs bf16, a silent fork-parity deviation. (It is *not* a host-widening
+/// question: `AdaptableLinear::apply_adapters` narrows every residual to `out.dtype()` before the
+/// add, sc-15265.)
+///
+/// So this test asserts the dtype of the array the loader actually installed, reached through
+/// `apply_minimax_h3_adapters` — it never recomputes the multiply, because a test that reimplements
+/// the thing under test validates only the reimplementation.
+#[test]
+fn the_installed_fold_keeps_the_bf16_factor_dtype() {
+    let cfg = dit_fixture_config();
+    let dir = tempfile::tempdir().expect("fixture dir");
+    let lora = write_lora(dir.path(), "bf16.safetensors", &cfg, Some("8"));
+
+    // The fixture must really carry the published dtype, or the assertion below is vacuous — this is
+    // exactly the hole the f32 fixtures left.
+    let w = Weights::from_file(&lora).expect("read back");
+    for suffix in ["lora_A", "lora_B"] {
+        let f = w
+            .require(&format!("{PROBE}.{suffix}.default.weight"))
+            .unwrap();
+        assert_eq!(
+            f.dtype(),
+            Dtype::Bfloat16,
+            "{suffix}: the fixture must be bf16 like every published turbo tensor"
+        );
+    }
+
+    let mut dit = tiny_dit(&cfg);
+    let report = apply_minimax_h3_adapters(&mut dit, &[spec(lora, 1.0)]).expect("install");
+    assert_eq!(report.applied, adapter_target_paths(&cfg).len());
+    let segs: Vec<&str> = PROBE.split('.').collect();
+    let installed = dit.adaptable_mut(&segs).expect("probe module").adapters();
+    assert_eq!(installed.len(), 1, "exactly one residual per module");
+    let Adapter::Lora { a, b, scale } = &installed[0] else {
+        panic!("the diffusers path must install a LoRA residual, not a LoKr one");
+    };
+    assert_eq!(*scale, 1.0);
+    assert_eq!(
+        a.dtype(),
+        Dtype::Bfloat16,
+        "the down factor is installed untouched, so it keeps its loaded dtype"
+    );
+    assert_eq!(
+        b.dtype(),
+        Dtype::Bfloat16,
+        "the alpha/rank fold must NOT promote the up factor to f32 — a bare `scalar(fold)` would, \
+         running the low-rank matmul in f32 where the reference runs it in bf16"
     );
 }
 
@@ -382,20 +466,126 @@ fn a_genuine_lokr_routes_to_the_shared_seam_and_the_turbo_files_do_not() {
     );
 }
 
-/// A file that matches nothing at all names the key space it expected.
+/// A file that matches nothing at all names the key space it expected — **per file**, including when
+/// it rides alongside a file that matched everything.
+///
+/// The zero-match check must be per-spec, not an aggregate `report.applied == 0` over the whole
+/// list: with an aggregate, `[good, junk]` returns `Ok` and the junk file is silently ignored. The
+/// hole is specifically files carrying **no recognized LoRA suffix at all** — a merged LoRA, a base
+/// checkpoint, a textual inversion. A wrong-model file whose keys *do* end in `.lora_A.weight` is
+/// caught either way, by the unmatched-target guard.
 #[test]
 fn a_file_matching_nothing_names_the_expected_key_space() {
     let cfg = dit_fixture_config();
     let dir = tempfile::tempdir().expect("fixture dir");
     let path = dir.path().join("empty.safetensors");
     let t = tensor(&[2, 2], 1.0);
+    // No recognized LoRA suffix at all, so this contributes neither an `applied` nor an
+    // `unmatched_path` — only a per-spec count can see it.
     Array::save_safetensors(vec![("some.base.weight", &t)], None, &path).expect("write");
     let mut dit = tiny_dit(&cfg);
-    let msg = apply_minimax_h3_adapters(&mut dit, &[spec(path, 1.0)])
+    let msg = apply_minimax_h3_adapters(&mut dit, &[spec(path.clone(), 1.0)])
         .expect_err("must fail")
         .to_string();
     assert!(msg.contains("no target modules matched"), "got {msg}");
     assert!(msg.contains("lora_A.default.weight"), "got {msg}");
+    assert!(msg.contains("empty.safetensors"), "got {msg}");
+
+    // Two specs, junk SECOND: the good file folds 24 modules, and an aggregate check would return
+    // Ok(applied = 24) right here.
+    let good = write_lora(dir.path(), "good.safetensors", &cfg, Some("8"));
+    assert_eq!(adapter_target_paths(&cfg).len(), 24);
+    let mut dit = tiny_dit(&cfg);
+    let msg = apply_minimax_h3_adapters(
+        &mut dit,
+        &[spec(good.clone(), 1.0), spec(path.clone(), 1.0)],
+    )
+    .expect_err("a junk file riding alongside a good one must still fail")
+    .to_string();
+    assert!(msg.contains("no target modules matched"), "got {msg}");
+    assert!(
+        msg.contains("empty.safetensors") && !msg.contains("good.safetensors"),
+        "the error must name the OFFENDING file, not the list; got {msg}"
+    );
+
+    // …and junk FIRST, so the check cannot be an end-of-loop artifact of spec order.
+    let mut dit = tiny_dit(&cfg);
+    let msg = apply_minimax_h3_adapters(&mut dit, &[spec(path, 1.0), spec(good.clone(), 1.0)])
+        .expect_err("junk first must fail too")
+        .to_string();
+    assert!(msg.contains("empty.safetensors"), "got {msg}");
+
+    // The control: two GOOD files stack without error, so the per-spec check is not simply rejecting
+    // every multi-spec install.
+    let good2 = write_lora(dir.path(), "good2.safetensors", &cfg, Some("128"));
+    let mut dit = tiny_dit(&cfg);
+    let report = apply_minimax_h3_adapters(&mut dit, &[spec(good, 1.0), spec(good2, 1.0)])
+        .expect("two good files must stack");
+    assert_eq!(report.applied, 2 * adapter_target_paths(&cfg).len());
+    let segs: Vec<&str> = PROBE.split('.').collect();
+    assert_eq!(dit.adaptable_mut(&segs).unwrap().adapters().len(), 2);
+}
+
+/// A PEFT `lora_adapter_metadata` blob whose `r` disagrees with the factor shapes is a **hard
+/// error**, exactly like a disagreeing `__metadata__["rank"]` string — never a silent override.
+///
+/// The shared loader takes `cfg_rank.unwrap_or(factor_rank)`, so a `{"r": 8}` blob over rank-128
+/// factors folds at `8/8 = 1.0` instead of `8/128 = 0.0625`: the same 16× overshoot this module
+/// exists to close, arriving through a different door. PEFT writes `r` equal to the factor rank, so
+/// the consistent arm below shows the check rejects nothing legitimate.
+#[test]
+fn a_peft_blob_rank_disagreeing_with_the_factors_is_refused() {
+    let cfg = dit_fixture_config();
+    let dir = tempfile::tempdir().expect("fixture dir");
+
+    let bad = write_lora_with_meta(
+        dir.path(),
+        "blob_r8.safetensors",
+        &cfg,
+        None,
+        &[(
+            "lora_adapter_metadata",
+            r#"{"r": 8, "lora_alpha": 8, "peft_type": "LORA"}"#,
+        )],
+    );
+    let mut dit = tiny_dit(&cfg);
+    let msg = apply_minimax_h3_adapters(&mut dit, &[spec(bad, 1.0)])
+        .expect_err("a blob rank that disagrees with the factors must be refused")
+        .to_string();
+    assert!(msg.contains("lora_adapter_metadata"), "got {msg}");
+    assert!(msg.contains("declares rank 8"), "got {msg}");
+    assert!(msg.contains("rank 128"), "got {msg}");
+    assert!(msg.contains("shapes are authoritative"), "got {msg}");
+
+    // A CONSISTENT blob is still honored, and still supplies the alpha. `lora_alpha` is 128 here,
+    // NOT 8, so the arm cannot pass by falling through to `DEFAULT_LORA_ALPHA`: it must equal the
+    // top-level `alpha = "128"` sibling (fold 1.0) and differ 16x from the `alpha = "8"` one.
+    // Compared against those sibling files rather than against a recomputed scalar.
+    let x = tensor(&[3, cfg.hidden_size], 0.7);
+    let blob = write_lora_with_meta(
+        dir.path(),
+        "blob_r128.safetensors",
+        &cfg,
+        None,
+        &[("lora_adapter_metadata", r#"{"r": 128, "lora_alpha": 128}"#)],
+    );
+    let top = write_lora(dir.path(), "top_alpha128.safetensors", &cfg, Some("128"));
+    let r_blob = probe_residual(&cfg, &blob, 1.0, &x);
+    let r_top = probe_residual(&cfg, &top, 1.0, &x);
+    let drift = max_abs(&subtract(&r_blob, &r_top).unwrap()) / max_abs(&r_top);
+    println!("[peft blob] rel-max-abs vs top-level alpha=128 = {drift:.3e}");
+    assert!(
+        drift < 1e-6,
+        "a consistent PEFT blob must fold at alpha 128 / rank 128 like the top-level stamp; got \
+         {drift:.3e}"
+    );
+    let default_fallback = write_lora(dir.path(), "no_alpha.safetensors", &cfg, None);
+    let ratio = max_abs(&probe_residual(&cfg, &default_fallback, 1.0, &x)) / max_abs(&r_blob);
+    assert!(
+        (ratio - 0.0625).abs() < 1e-5,
+        "…and the blob alpha must WIN over DEFAULT_LORA_ALPHA, which would have given 1.0; got \
+         {ratio}"
+    );
 }
 
 /// **The `_comfyui_` twin is refused by name**, not half-applied. Its `qkv_proj` is fused and its
@@ -568,7 +758,8 @@ fn published_turbo_files_resolve_to_dit_targets_at_the_measured_alphas() {
 /// modules matched, at the measured 0.0625 — and the adapted forward differs from the base one.
 ///
 /// `MINIMAX_H3_TURBO_DIT` points at a `transformer/` directory (any tier: the fold is
-/// tier-independent, and the `q4` one is ~9 GB against bf16's ~62 GB).
+/// tier-independent). Budget the disk and the load before running it — **measured**, the `q4`
+/// `transformer/` is **~17.5 GB across 14 shards** (1.28–1.49 GB each) against bf16's ~62 GB.
 #[test]
 #[ignore = "needs a real MiniMax-H3 transformer/ (MINIMAX_H3_TURBO_DIT) + the turbo LoRA + Metal"]
 fn the_real_turbo_lora_folds_onto_the_real_dit() {
