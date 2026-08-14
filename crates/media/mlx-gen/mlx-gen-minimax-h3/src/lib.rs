@@ -172,6 +172,7 @@ pub mod pipeline;
 pub mod quant;
 pub mod reference;
 pub mod rope;
+pub mod spatial_tiling;
 pub mod tensor;
 pub mod text_encoder;
 pub mod vae;

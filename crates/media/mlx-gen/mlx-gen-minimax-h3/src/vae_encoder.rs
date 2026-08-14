@@ -46,6 +46,11 @@
 //! canvas wider than 256 px. [`TilePlan`] is the reference's `_split_tiles` and
 //! [`stitch_tiles`] its `_blend` / `_stitch_tiles`.
 //!
+//! Both now live in [`crate::spatial_tiling`] and are re-exported here. sc-17148 ported them for
+//! encode only; **decode tiles from the same flag and the same geometry** (sc-18786), so keeping
+//! two copies would let the halves drift. The one asymmetry between the halves is the units the
+//! stitch runs in — latent here, pixel there — and it is documented at [`stitch_tiles`].
+//!
 //! # What this module does NOT do
 //!
 //! It stops at the posterior parameters. Sampling the posterior, the fp16 round-trip and the
@@ -60,23 +65,22 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
 use crate::config::MiniMaxH3VaeConfig;
+// `_split_tiles` / `_stitch_tiles` and the shipped geometry live in [`crate::spatial_tiling`]
+// because **decode tiles too** (sc-18786) and the two halves must not drift apart. Re-exported
+// here so the sc-17148 call sites and fixtures keep their paths.
+pub use crate::spatial_tiling::{
+    stitch_tiles, TilePlan, TILE_SAMPLE_MIN_OVERLAP, TILE_SAMPLE_MIN_SIZE, TILING_IS_ON_BY_DEFAULT,
+};
 
 /// Temporal padding every 3×3×3 encoder conv applies, front-only. The reference's literal.
 pub const ENCODER_TEMPORAL_PADDING: i32 = 2;
 
-/// Default tile edge, in pixels, for the spatially-tiled encode (`tile_sample_min_height/width`).
-pub const TILE_SAMPLE_MIN_SIZE: i32 = 256;
-
-/// Default minimum tile overlap, in pixels (`tile_sample_min_overlap_height/width`).
-pub const TILE_SAMPLE_MIN_OVERLAP: i32 = 64;
-
 /// Whether the shipped VAE encodes with spatial tiling enabled.
 ///
-/// Pinned as a constant because it is a **default**, and defaults are the class of fact that gets
-/// assumed rather than read. `AutoencoderKLMiniMaxH3` turns tiling on in `__init__`; almost every
-/// other diffusers autoencoder leaves it off until `enable_tiling()` is called. Encoding a
-/// 768×1344 keyframe untiled is a 28-tile difference in the result.
-pub const ENCODER_TILING_IS_ON_BY_DEFAULT: bool = true;
+/// Encoding a 768×1344 keyframe untiled is a 28-tile difference in the result. Encode and decode
+/// share one `use_tiling` flag upstream, so this is an alias for
+/// [`crate::spatial_tiling::TILING_IS_ON_BY_DEFAULT`] kept for the sc-17148 call sites.
+pub const ENCODER_TILING_IS_ON_BY_DEFAULT: bool = TILING_IS_ON_BY_DEFAULT;
 
 /// Reflect-pad `x` along `axis` by `before` / `after`, matching `torch.nn.functional.pad(mode =
 /// "reflect")`.
@@ -522,150 +526,6 @@ impl VideoEncoder3d {
     }
 }
 
-/// Where one axis's tiles start, how long each is, and the overlap between consecutive tiles.
-///
-/// This is the reference's `_split_tiles`. The tile count is the smallest whose union covers the
-/// axis at the minimum overlap; the slack is then distributed round-robin over the overlaps in
-/// whole `spatial_compression_ratio` steps, so every tile boundary stays latent-aligned.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TilePlan {
-    /// Pixel index each tile starts at.
-    pub starts: Vec<i32>,
-    /// Pixel length of each tile.
-    pub lengths: Vec<i32>,
-    /// Pixel overlap between tile `i` and tile `i + 1`; `starts.len() - 1` entries.
-    pub overlaps: Vec<i32>,
-}
-
-impl TilePlan {
-    /// Lay `tile_size`-wide tiles over `length` pixels at at least `min_overlap` overlap.
-    pub fn split(
-        length: i32,
-        tile_size: i32,
-        min_overlap: i32,
-        spatial_compression_ratio: i32,
-    ) -> Result<Self> {
-        if length <= 0 || tile_size <= 0 || spatial_compression_ratio <= 0 {
-            return Err(Error::Msg(format!(
-                "minimax-h3 encoder: tile plan needs positive length/tile/ratio, got \
-                 {length}/{tile_size}/{spatial_compression_ratio}"
-            )));
-        }
-        if min_overlap < 0 || min_overlap >= tile_size {
-            return Err(Error::Msg(format!(
-                "minimax-h3 encoder: tile overlap {min_overlap} must be within [0, {tile_size})"
-            )));
-        }
-        if tile_size >= length {
-            return Ok(Self {
-                starts: vec![0],
-                lengths: vec![length],
-                overlaps: Vec::new(),
-            });
-        }
-        let mut num_tiles = (length + tile_size - 1) / tile_size;
-        while tile_size * num_tiles - min_overlap * (num_tiles - 1) - length < 0 {
-            num_tiles += 1;
-        }
-        let mut overlaps = vec![min_overlap; (num_tiles - 1) as usize];
-        let remaining: i32 = tile_size * num_tiles - overlaps.iter().sum::<i32>() - length;
-        for i in 0..(remaining / spatial_compression_ratio) {
-            let slot = (i as usize) % overlaps.len();
-            overlaps[slot] += spatial_compression_ratio;
-        }
-        let mut starts = vec![0i32];
-        for i in 0..(num_tiles - 1) as usize {
-            starts.push(starts[i] + tile_size - overlaps[i]);
-        }
-        Ok(Self {
-            starts,
-            lengths: vec![tile_size; num_tiles as usize],
-            overlaps,
-        })
-    }
-
-    /// Tiles on this axis.
-    pub fn len(&self) -> usize {
-        self.starts.len()
-    }
-
-    /// Whether the axis is a single untiled span.
-    pub fn is_empty(&self) -> bool {
-        self.starts.is_empty()
-    }
-}
-
-/// Linear cross-fade of `a`'s trailing `blend_extent` positions into `b`'s leading ones, then the
-/// rest of `b` — the reference's `_blend`.
-fn blend(a: &Array, b: &Array, blend_extent: i32, axis: i32) -> Result<Array> {
-    let rank = a.shape().len() as i32;
-    let ax = if axis < 0 { rank + axis } else { axis };
-    let n_a = a.shape()[ax as usize];
-    let n_b = b.shape()[ax as usize];
-    let extent = blend_extent.min(n_a).min(n_b);
-    if extent <= 0 {
-        return Ok(b.clone());
-    }
-    let mut shape = vec![1i32; rank as usize];
-    shape[ax as usize] = extent;
-    let positions: Vec<f32> = (0..extent).map(|i| i as f32 / extent as f32).collect();
-    let w_b = Array::from_slice(&positions, &shape).as_dtype(b.dtype())?;
-    let w_a = Array::from_slice(
-        &positions.iter().map(|p| 1.0 - p).collect::<Vec<f32>>(),
-        &shape,
-    )
-    .as_dtype(a.dtype())?;
-
-    let tail_a = crate::tensor::slice_axis(a, ax, n_a - extent, n_a)?;
-    let head_b = crate::tensor::slice_axis(b, ax, 0, extent)?;
-    let blended = tail_a.multiply(&w_a)?.add(&head_b.multiply(&w_b)?)?;
-    if extent == n_b {
-        return Ok(blended);
-    }
-    let rest = crate::tensor::slice_axis(b, ax, extent, n_b)?;
-    Ok(concatenate_axis(&[blended, rest], ax)?)
-}
-
-/// Blend and concatenate a grid of latent tiles back into one tensor — the reference's
-/// `_stitch_tiles`. Overlaps are in **latent** units. Axes are `-2` (height) and `-1` (width).
-pub fn stitch_tiles(
-    tiles: &[Vec<Array>],
-    height_overlaps: &[i32],
-    width_overlaps: &[i32],
-) -> Result<Array> {
-    if tiles.is_empty() || tiles[0].is_empty() {
-        return Err(Error::Msg(
-            "minimax-h3 encoder: cannot stitch an empty tile grid".into(),
-        ));
-    }
-    let rank = tiles[0][0].shape().len() as i32;
-    let (h_axis, w_axis) = (rank - 2, rank - 1);
-    let mut result_rows = Vec::with_capacity(tiles.len());
-    for (i, row) in tiles.iter().enumerate() {
-        let mut result_row = Vec::with_capacity(row.len());
-        for (j, tile) in row.iter().enumerate() {
-            let mut t = tile.clone();
-            if i > 0 {
-                t = blend(&tiles[i - 1][j], &t, height_overlaps[i - 1], h_axis)?;
-            }
-            if j > 0 {
-                t = blend(&row[j - 1], &t, width_overlaps[j - 1], w_axis)?;
-            }
-            if i < tiles.len() - 1 {
-                let n = t.shape()[h_axis as usize];
-                t = crate::tensor::slice_axis(&t, h_axis, 0, n - height_overlaps[i])?;
-            }
-            if j < row.len() - 1 {
-                let n = t.shape()[w_axis as usize];
-                t = crate::tensor::slice_axis(&t, w_axis, 0, n - width_overlaps[j])?;
-            }
-            result_row.push(t);
-        }
-        result_rows.push(concatenate_axis(&result_row, w_axis)?);
-    }
-    Ok(concatenate_axis(&result_rows, h_axis)?)
-}
-
 /// The posterior a `DiagonalGaussianDistribution` is parameterized by.
 ///
 /// `mean` and `logvar` are the two channel halves of the `quant_conv` output; `logvar` is clamped
@@ -728,6 +588,9 @@ impl DiagonalGaussian {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `_blend` now lives with the rest of the temporal/spatial cross-fade in `blocks`; this module
+    // no longer carries its own copy.
+    use crate::blocks::blend;
 
     /// Torch's reflect pad does **not** repeat the edge sample. Written against a ramp so an
     /// edge-replicating or symmetric ("reflect-101 off by one") implementation cannot pass.

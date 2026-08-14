@@ -97,6 +97,7 @@ pub mod dit;
 pub mod layout;
 pub mod nn;
 pub mod rope;
+pub mod spatial_tiling;
 pub mod tensor;
 pub mod vae;
 
