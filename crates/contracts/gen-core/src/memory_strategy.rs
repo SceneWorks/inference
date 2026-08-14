@@ -138,20 +138,20 @@ pub const MEMORY_CALIBRATION_ABI: u32 = 3;
 /// captured or refreshed.
 pub const MEMORY_DECODE_QUALITY_ABI: u32 = 2;
 
-/// Source-closure fingerprint for the production decode paths and correctness-only harness that
-/// define [`MEMORY_DECODE_QUALITY_ABI`]. The repository test beside the collector re-derives this
-/// value from the exact source allowlist; changing a decoder, request authority seam, provider
-/// harness, or collector without updating the fingerprint fails CI instead of silently reusing old
-/// semantic receipts.
+/// Conservative source-closure fingerprint for the production decode paths and correctness-only
+/// harness that define [`MEMORY_DECODE_QUALITY_ABI`]. The repository test beside the collector
+/// recursively re-derives this value from a fail-closed superset of the involved shared/provider
+/// crate sources, manifests, and embedded assets. Changing any included byte invalidates receipts,
+/// even when a particular route does not exercise that source.
 ///
 /// This is intentionally independent from a Git commit: a reviewed head and its byte-identical
-/// merge commit have different object ids but the same implementation. The digest changes only
-/// when the quality-relevant source bytes change.
+/// merge commit have different object ids but the same implementation. Derivation reads source
+/// bytes only; it does not execute measurement code or consume measurement artifacts.
 pub const MEMORY_DECODE_QUALITY_IMPLEMENTATION_FINGERPRINT: &str =
-    "0c29718b98a697a4423d149dd36194919a1b4a747f2f14a930f4d4b7e8e68b35";
+    "800d06acf579a36e604d91955fd6a6852ec70bc39701f7a320f1fdd2bf5ff29d";
 #[cfg(test)]
 const MEMORY_DECODE_QUALITY_CANONICAL_FIXTURE_SHA256: &str =
-    "0176e6d9348ecc10780136e85dcdf3058e36a1b9b073f2c6a0869316c1a38349";
+    "9ba0f5e53efdbde53a8b2c9d809b6b3f663c0fea09a844286f824274f42232a1";
 
 /// Prefix for the single-line calibration observation protocol consumed by release tooling.
 ///
