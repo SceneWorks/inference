@@ -830,30 +830,30 @@ impl Sdxl {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<(GenerationOutput, Vec<DecodeQualitySample>)> {
         let mut samples = Vec::new();
-        let mut capture = |vae: &Autoencoder,
-                           latent: &mlx_rs::Array,
-                           pid: Option<&dyn LatentDecoder>|
-         -> Result<()> {
-            latent.eval()?;
-            let dense =
-                crate::pipeline::decode_image_tiled(vae, latent, pid, None, Some(&req.cancel))?;
-            let tiled = crate::pipeline::decode_image_tiled(
-                vae,
-                latent,
-                pid,
-                Some(tiling),
-                Some(&req.cancel),
-            )?;
-            samples.push(DecodeQualitySample {
-                production_latent: latent.clone(),
-                dense,
-                tiled,
-            });
-            Ok(())
+        let output = {
+            let mut capture = |vae: &Autoencoder,
+                               latent: &mlx_rs::Array,
+                               pid: Option<&dyn LatentDecoder>|
+             -> Result<()> {
+                latent.eval()?;
+                let dense =
+                    crate::pipeline::decode_image_tiled(vae, latent, pid, None, Some(&req.cancel))?;
+                let tiled = crate::pipeline::decode_image_tiled(
+                    vae,
+                    latent,
+                    pid,
+                    Some(tiling),
+                    Some(&req.cancel),
+                )?;
+                samples.push(DecodeQualitySample {
+                    production_latent: latent.clone(),
+                    dense,
+                    tiled,
+                });
+                Ok(())
+            };
+            self.generate_impl_with_final_latent_observer(req, on_progress, Some(&mut capture))?
         };
-        let output =
-            self.generate_impl_with_final_latent_observer(req, on_progress, Some(&mut capture))?;
-        drop(capture);
         Ok((output, samples))
     }
 

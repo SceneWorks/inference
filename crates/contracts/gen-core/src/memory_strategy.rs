@@ -148,10 +148,10 @@ pub const MEMORY_DECODE_QUALITY_ABI: u32 = 2;
 /// merge commit have different object ids but the same implementation. The digest changes only
 /// when the quality-relevant source bytes change.
 pub const MEMORY_DECODE_QUALITY_IMPLEMENTATION_FINGERPRINT: &str =
-    "0cc04c2edefd2b69c8a458d5e6b6bbb32425896a55f6781dcc685b9a0571307d";
+    "ca8ac2f47e2179dfe1c5985da84127943f63a25056afef4a6810a9c39e0edd79";
 #[cfg(test)]
 const MEMORY_DECODE_QUALITY_CANONICAL_FIXTURE_SHA256: &str =
-    "9bf4109526a06fcdcca19f0f314694ae49e65890d87dd675945ec9892670bf83";
+    "39a95d34c5f2c874c48de5af43864ce774c44c268bc459c54589d6692702ac11";
 
 /// Prefix for the single-line calibration observation protocol consumed by release tooling.
 ///
