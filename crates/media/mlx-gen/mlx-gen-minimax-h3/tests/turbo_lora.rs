@@ -904,11 +904,11 @@ struct RenderReceipt {
     frames: Vec<mlx_gen::gen_core::Image>,
     audio: mlx_gen::gen_core::AudioTrack,
     fps: u32,
-    /// `generate` entry → **first** `Progress::Step`. Text-encoder map + prompt encode + TE release
-    /// + DiT map + **LoRA fold** + AdaLN precompute-and-evict — **and the first model evaluation**,
-    /// because `render_latents` reports a step only once that evaluation has finished. One bucket
-    /// because that is the granularity `Progress` exposes on the `Resident` path; H3 emits no
-    /// `Loading` phases.
+    /// `generate` entry → **first** `Progress::Step`: the text-encoder map, the prompt encode, the
+    /// TE release, the DiT map, the **LoRA fold**, the AdaLN precompute-and-evict — **and the first
+    /// model evaluation**, because `render_latents` reports a step only once that evaluation has
+    /// finished. One bucket because that is the granularity `Progress` exposes on the `Resident`
+    /// path; H3 emits no `Loading` phases.
     setup_and_first_eval_s: f64,
     /// First → last `Progress::Step`. This spans `steps − 1` evaluations, **not** `steps` — the
     /// off-by-one that would otherwise understate `s_per_step` by 25 % on a 4-step render.
@@ -926,21 +926,44 @@ struct RenderReceipt {
     steps_seen: u32,
 }
 
+/// Everything one arm of the comparison varies. A struct rather than a parameter list because the
+/// arms differ in one or two fields at a time, and a positional call site of eight values is how a
+/// canvas ends up transposed against a frame count with nothing to catch it.
+struct RenderRecipe<'a> {
+    /// The upstream snapshot root — text encoder, tokenizer, both VAEs.
+    root: &'a Path,
+    /// The staged tier's `transformer/`, or `None` for a flat `root/transformer` install.
+    dit: Option<&'a Path>,
+    /// The turbo file, or `None` for the base arm.
+    lora: Option<&'a Path>,
+    steps: u32,
+    /// The **video** sigma shift. `None` keeps the base checkpoint's published 12.0.
+    shift: Option<f32>,
+    width: u32,
+    height: u32,
+    frames: u32,
+    seed: u64,
+    prompt: &'a str,
+}
+
 /// Render once at an explicit recipe, staging the tier exactly as a split install does.
 ///
-/// `lora` is `None` for the base arm. When `Some`, the alpha is resolved from the file header here
-/// too — printed, not passed — so the receipt records the strength the engine independently
+/// `recipe.lora` is `None` for the base arm. When `Some`, the alpha is resolved from the file header
+/// here too — printed, not passed — so the receipt records the strength the engine independently
 /// resolved rather than one this harness supplied.
-fn render_once(
-    root: &Path,
-    dit: Option<&Path>,
-    lora: Option<&Path>,
-    steps: u32,
-    shift: Option<f32>,
-    (width, height, frames): (u32, u32, u32),
-    seed: u64,
-    prompt: &str,
-) -> RenderReceipt {
+fn render_once(recipe: &RenderRecipe<'_>) -> RenderReceipt {
+    let &RenderRecipe {
+        root,
+        dit,
+        lora,
+        steps,
+        shift,
+        width,
+        height,
+        frames,
+        seed,
+        prompt,
+    } = recipe;
     use mlx_gen::gen_core::{
         CancelFlag, GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
     };
@@ -1163,16 +1186,18 @@ fn turbo_render_records_a_measured_clip() {
             .map_or("<none — base arm>".into(), |l| l.display().to_string()),
     );
 
-    let r = render_once(
-        &root,
-        dit.as_deref(),
-        lora.as_deref(),
+    let r = render_once(&RenderRecipe {
+        root: &root,
+        dit: dit.as_deref(),
+        lora: lora.as_deref(),
         steps,
         shift,
-        (width, height, frames_req),
+        width,
+        height,
+        frames: frames_req,
         seed,
-        &prompt,
-    );
+        prompt: &prompt,
+    });
 
     // --- evidence the render happened ---------------------------------------------------------
     assert_eq!(r.frames.len(), frames_req as usize, "decoded frame count");
