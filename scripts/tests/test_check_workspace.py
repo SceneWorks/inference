@@ -915,5 +915,255 @@ class SnapshotPathDerivationTests(unittest.TestCase):
             )
         )
 
+class CrossBackendGeometryTests(unittest.TestCase):
+    """`check_cross_backend_geometry` must catch each clause of its contract on its own.
+
+    Every test below mutates **one** thing and asserts **which** message comes back. Mutating several
+    at once would only prove the set fires, not that each member does, and a bare "it failed" assert
+    goes inert the moment the tree would have failed for an unrelated reason.
+
+    The pair here is synthetic on purpose: it exercises the mechanism (cast stripping, `usize`/`i32`
+    spellings, same-crate identifier folding, arrays, strings) without pinning these tests to the
+    real crates' current contents. `CrossBackendGeometryLiveTests` covers the real tree.
+    """
+
+    A = "backends/backend-a"
+    B = "backends/backend-b"
+
+    LIB = (
+        'pub const MODEL_ID: &str = "demo";\n'
+        "pub const SIZE_MULTIPLE: u32 = VAE_RATIO as u32 * 2;\n"
+    )
+    CONFIG_A = (
+        "pub const VAE_RATIO: usize = 16;\n"
+        "pub const FACTORS: [usize; 3] = [2, 2, 4];\n"
+        "pub const SAMPLE_RATE: usize = 32_000;\n"
+        "pub const NORM_EPS: f64 = 1e-5;\n"
+    )
+    CONFIG_B = (
+        "pub const VAE_RATIO: i32 = 16;\n"
+        "pub const FACTORS: [i32; 3] = [2, 2, 4];\n"
+        "pub const SAMPLE_RATE: i32 = 32000;\n"
+        "pub const NORM_EPS: f32 = 0.00001;\n"
+    )
+
+    def setUp(self) -> None:
+        self.gate = load_gate_module()
+        self.gate.CROSS_BACKEND_GEOMETRY_PAIRS = ((self.A, self.B),)
+        self.gate.CROSS_BACKEND_GEOMETRY_FILES = ("src/lib.rs", "src/config.rs")
+        self.gate.CROSS_BACKEND_GEOMETRY_REFERENCE = {
+            "SIZE_MULTIPLE": (32.0,),
+            "VAE_RATIO": (16.0,),
+            "FACTORS": (2.0, 2.0, 4.0),
+        }
+
+    def check(self, **overrides: str):
+        """Build the pair, apply at most one override, and return the failure text or None.
+
+        Keys are ``"<crate>/<file>"``; a value of None deletes the file, and a crate key alone
+        ("a" / "b") deletes the whole crate.
+        """
+        files = {
+            "a/src/lib.rs": self.LIB,
+            "a/src/config.rs": self.CONFIG_A,
+            "b/src/lib.rs": self.LIB,
+            "b/src/config.rs": self.CONFIG_B,
+        }
+        drop_crate = overrides.pop("drop_crate", None)
+        files.update(overrides)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for key, source in files.items():
+                crate = self.A if key.startswith("a/") else self.B
+                if drop_crate is not None and key.startswith(f"{drop_crate}/"):
+                    continue
+                if source is None:
+                    continue
+                path = root / crate / key.split("/", 1)[1]
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(source, encoding="utf-8")
+            try:
+                self.gate.check_cross_backend_geometry(root)
+            except AssertionError as error:
+                return str(error)
+            return None
+
+    def test_the_unmutated_pair_passes(self) -> None:
+        """Without this every "it failed" below would prove nothing."""
+        self.assertIsNone(self.check())
+
+    def test_type_and_digit_separator_spellings_are_not_divergence(self) -> None:
+        """`usize` vs `i32` and `32_000` vs `32000` are the same number; a gate that red-flagged them
+        would be turned off within a week."""
+        self.assertIsNone(self.check())
+
+    def test_scientific_notation_folds_to_a_number(self) -> None:
+        """`1e-5` and `0.00001` are the same eps, and the baseline pair spells it both ways.
+
+        The subtlety this pins: an identifier pattern that does not exclude the `e` of a float
+        literal reads `1e-5` as the identifier `e`, fails to resolve it, and quietly demotes the
+        constant to text-only comparison — losing both the numeric compare and any reference pin,
+        while still reporting green."""
+        self.assertIsNone(self.check())
+        self.assertEqual(self.gate._const_numbers("1e-5", {}), (1e-5,))
+        self.assertEqual(self.gate._const_numbers("0.00001", {}), (1e-5,))
+
+    def test_a_diverging_eps_is_still_caught(self) -> None:
+        failure = self.check(**{"b/src/config.rs": self.CONFIG_B.replace("0.00001", "0.000001")})
+        self.assertIsNotNone(failure)
+        self.assertIn("`NORM_EPS` diverges", failure)
+
+    def test_a_diverging_scalar_is_caught(self) -> None:
+        """The sc-19419 defect itself: 16 on one backend, 32 on the other."""
+        failure = self.check(**{"a/src/lib.rs": self.LIB.replace(" * 2;", ";")})
+        self.assertIsNotNone(failure)
+        self.assertIn("`SIZE_MULTIPLE` diverges", failure)
+
+    def test_both_backends_agreeing_on_the_wrong_value_is_still_caught(self) -> None:
+        """The clause that makes this gate more than a consistency check. "Fixing" a divergence by
+        copying the wrong number across must not buy a green — that is how the original defect would
+        have been resolved by anyone reading only the red."""
+        wrong = self.LIB.replace(" * 2;", ";")
+        failure = self.check(**{"a/src/lib.rs": wrong, "b/src/lib.rs": wrong})
+        self.assertIsNotNone(failure)
+        self.assertIn("released checkpoint read through diffusers says (32.0,)", failure)
+
+    def test_an_identifier_folds_against_its_own_crates_declaration(self) -> None:
+        """`SIZE_MULTIPLE = VAE_RATIO * 2` must fold against the `VAE_RATIO` its *own* backend
+        declares, so a crate that quietly redefines the base still reports what it compiles to."""
+        failure = self.check(
+            **{"b/src/config.rs": self.CONFIG_B.replace("VAE_RATIO: i32 = 16", "VAE_RATIO: i32 = 8")}
+        )
+        self.assertIsNotNone(failure)
+        self.assertIn("`SIZE_MULTIPLE` diverges", failure)
+        self.assertIn("`VAE_RATIO`", failure)
+
+    def test_a_single_array_element_is_caught(self) -> None:
+        """Elementwise relative max-abs-diff, not a norm or a checksum over the vector — those went
+        blind to exactly this in this family."""
+        failure = self.check(**{"a/src/config.rs": self.CONFIG_A.replace("[2, 2, 4]", "[2, 3, 4]")})
+        self.assertIsNotNone(failure)
+        self.assertIn("`FACTORS`", failure)
+
+    def test_a_changed_array_length_is_caught(self) -> None:
+        failure = self.check(
+            **{"b/src/config.rs": self.CONFIG_B.replace("[i32; 3] = [2, 2, 4]", "[i32; 2] = [2, 2]")}
+        )
+        self.assertIsNotNone(failure)
+        self.assertIn("`FACTORS`", failure)
+
+    def test_a_diverging_non_numeric_constant_is_caught(self) -> None:
+        """Strings, bools and enum paths fall back to normalized-text equality rather than being
+        skipped — a skipped constant is an uncovered one."""
+        failure = self.check(**{"b/src/lib.rs": self.LIB.replace('"demo"', '"other"')})
+        self.assertIsNotNone(failure)
+        self.assertIn("`MODEL_ID` diverges", failure)
+
+    def test_a_constant_present_only_on_the_second_backend_is_caught(self) -> None:
+        """Drift one step earlier than a value difference. Paired with the test below so that *both*
+        directions of the name-set comparison are covered — one test can only exercise one of them,
+        and a single-direction suite left the other clause free to be deleted."""
+        failure = self.check(
+            **{"b/src/config.rs": self.CONFIG_B + "pub const ONLY_HERE: i32 = 1;\n"}
+        )
+        self.assertIsNotNone(failure)
+        self.assertIn("`ONLY_HERE` is declared in", failure)
+
+    def test_a_constant_present_only_on_the_first_backend_is_caught(self) -> None:
+        failure = self.check(
+            **{
+                "b/src/config.rs": self.CONFIG_B.replace(
+                    "pub const SAMPLE_RATE: i32 = 32000;\n", ""
+                )
+            }
+        )
+        self.assertIsNotNone(failure)
+        self.assertIn("`SAMPLE_RATE` is declared in", failure)
+
+    def test_a_declaration_inside_a_block_comment_is_not_a_declaration(self) -> None:
+        """The load-bearing test for comment stripping.
+
+        A `///` line cannot reach column 0, so a doc comment could never have satisfied the parser
+        anyway and a test built on one proves nothing about the stripper. A *block* comment can hold
+        a line starting at column 0, so this is the shape that actually distinguishes a gate reading
+        stripped source from one reading raw text: without stripping, `GHOST` parses as a real
+        declaration on one backend only and the pair reds for no reason at all."""
+        self.assertIsNone(
+            self.check(
+                **{
+                    "a/src/config.rs": "/*\npub const GHOST: usize = 1;\n*/\n" + self.CONFIG_A
+                }
+            )
+        )
+
+    def test_prose_claiming_the_right_value_does_not_excuse_the_wrong_one(self) -> None:
+        """The exact shape of the sc-19419 defect: a comment asserting agreement that the code does
+        not have. The comment is ignored and the declaration is what is judged."""
+        failure = self.check(
+            **{
+                "a/src/config.rs": "/// Matches the sibling backend: 16.\n"
+                + self.CONFIG_A.replace("VAE_RATIO: usize = 16", "VAE_RATIO: usize = 8")
+            }
+        )
+        self.assertIsNotNone(failure)
+        self.assertIn("`VAE_RATIO`", failure)
+
+    def test_a_moved_file_fails_rather_than_shrinking_coverage(self) -> None:
+        """A file that quietly stops being read is a gate that quietly stops gating."""
+        failure = self.check(**{"b/src/config.rs": None})
+        self.assertIsNotNone(failure)
+        self.assertIn("is missing", failure)
+
+    def test_a_file_that_parses_to_no_declarations_fails(self) -> None:
+        """A broken parse compares nothing while reporting green; it has to be loud instead."""
+        failure = self.check(**{"a/src/config.rs": "// no declarations left\n"})
+        self.assertIsNotNone(failure)
+        self.assertIn("parsed zero `pub const` declarations", failure)
+
+    def test_a_duplicate_declaration_within_one_crate_fails(self) -> None:
+        failure = self.check(**{"a/src/lib.rs": self.LIB + "pub const VAE_RATIO: usize = 16;\n"})
+        self.assertIsNotNone(failure)
+        self.assertIn("declares `VAE_RATIO` twice", failure)
+
+    def test_a_missing_crate_fails(self) -> None:
+        failure = self.check(drop_crate="b")
+        self.assertIsNotNone(failure)
+        self.assertIn("is not a directory", failure)
+
+
+class CrossBackendGeometryLiveTests(unittest.TestCase):
+    """The synthetic pair proves the mechanism; this proves it is pointed at the real crates."""
+
+    def setUp(self) -> None:
+        self.gate = load_gate_module()
+
+    def test_the_shipped_workspace_has_no_cross_backend_geometry_drift(self) -> None:
+        self.gate.check_cross_backend_geometry(ROOT)
+
+    def test_the_reference_pins_the_value_settled_against_diffusers(self) -> None:
+        """`SIZE_MULTIPLE` is 32 — `vae_spatial_compression_ratio * patch_size[2]` = 16 * 2 — and the
+        16 the candle crate shipped until sc-19419 was the VAE-only alignment. Pinned here as well as
+        in the gate so that relaxing the gate's table is itself a red."""
+        reference = self.gate.CROSS_BACKEND_GEOMETRY_REFERENCE
+        self.assertEqual(reference["SIZE_MULTIPLE"], (32.0,))
+        self.assertEqual(reference["VAE_RATIO"], (16.0,))
+        self.assertEqual(reference["VAE_RATIO_T"], (4.0,))
+        self.assertEqual(reference["FRAMES_PER_CHUNK"], (17.0,))
+        self.assertEqual(reference["LATENTS_PER_CHUNK"], (5.0,))
+        self.assertEqual(len(reference["LEGAL_FRAME_COUNTS"]), 14)
+        self.assertEqual(reference["LEGAL_FRAME_COUNTS"][0], 124.0)
+        self.assertEqual(reference["LEGAL_FRAME_COUNTS"][-1], 345.0)
+
+    def test_both_minimax_h3_crates_are_covered(self) -> None:
+        """A pair table that lost its only entry would pass every other test in this class."""
+        self.assertIn(
+            (
+                "crates/media/candle-gen/candle-gen-minimax-h3",
+                "crates/media/mlx-gen/mlx-gen-minimax-h3",
+            ),
+            self.gate.CROSS_BACKEND_GEOMETRY_PAIRS,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

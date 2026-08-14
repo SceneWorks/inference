@@ -153,8 +153,23 @@ pub use vae_encoder::{
 /// one family across both backends.
 pub const MODEL_ID: &str = "minimax_h3";
 
-/// Frame/pixel alignment the video decode implies — `VAE_RATIO` spatially.
-pub const SIZE_MULTIPLE: u32 = VAE_RATIO as u32;
+/// Pixel alignment a generated canvas must satisfy — the VAE's [`VAE_RATIO`] spatial compression
+/// **times the DiT's width patch of 2**, i.e. 32. Same number as `mlx_gen_minimax_h3::SIZE_MULTIPLE`.
+///
+/// This is the reference's own product, not a guess: diffusers 0.40.0.dev0 @ 7564fb01 computes
+/// `MiniMaxH3ModularPipeline.canvas_multiple` as `vae_spatial_compression_ratio * patch_size[2]`
+/// (`modular_pipelines/minimax_h3/modular_pipeline.py:236`), and the released checkpoint supplies
+/// both factors — `vae/config.json` has `spatial_downsample_factors = [2, 2, 2, 2, 1, 1]`, whose
+/// product is the 16 of [`VAE_RATIO`], and `transformer/config.json` (and `transformer_ref/`) has
+/// `patch_size = [1, 2, 2]`. The reference *rejects* an unaligned canvas rather than rounding it
+/// (`before_denoise.py:389`, `before_encoder.py:393`).
+///
+/// Consumers read this for `requiresDimensionsMultipleOf`, so it must be the number the engine
+/// actually enforces, not the looser VAE-only one. A 16-aligned canvas survives the VAE and then
+/// has an odd number of latent columns, which has no patched representation at all. Until sc-19419
+/// this crate advertised that looser 16 — correct while it was VAE-only, stale from the moment the
+/// DiT landed in sc-17155 — and its own test pinned the stale value as if it were right.
+pub const SIZE_MULTIPLE: u32 = VAE_RATIO as u32 * 2;
 
 /// Add every provider this crate ships to an explicit registry builder — the sibling of
 /// `mlx_gen_minimax_h3::register_providers`, and **the exact function `candle-gen-catalog` will
@@ -186,13 +201,29 @@ mod tests {
     use super::*;
 
     /// The crate ships no generator yet, so it is deliberately absent from `candle-gen-catalog`.
-    /// This pins the compression contract the later pipeline slices will build on, and it is the
-    /// same set of numbers `mlx-gen-minimax-h3` pins — the two backends must not disagree about the
-    /// geometry before a single tensor is read.
+    /// This pins the compression contract the later pipeline slices will build on.
+    ///
+    /// **What this test does and does not guarantee.** It pins *this* crate's numbers against the
+    /// diffusers reference (see [`SIZE_MULTIPLE`] for the provenance of the 32). It is blind, by
+    /// construction, to whether `mlx-gen-minimax-h3` declares the same numbers — nothing in a
+    /// per-crate assertion can see the sibling backend, which is exactly how the two crates came to
+    /// disagree about `SIZE_MULTIPLE` (16 here vs 32 there) while this test stayed green on the
+    /// wrong value and its comment claimed otherwise (sc-19419).
+    ///
+    /// The cross-backend claim is made where it can actually be checked: `check_cross_backend_geometry`
+    /// in `scripts/check-workspace.py`, which reads both crates' sources and holds them to the
+    /// released checkpoint. It lives there because the `workspace` lane is the one CI never skips —
+    /// a Rust test here would not run on an mlx-only change, and one in the mlx crate would not run
+    /// on Linux at all.
+    ///
+    /// Note the assertions below are *literals* on purpose. Restating `SIZE_MULTIPLE` as
+    /// `VAE_RATIO * 2` would only repeat its own definition and could never fail.
     #[test]
     fn published_surface_is_the_vae_decode_contract() {
         assert_eq!(MODEL_ID, "minimax_h3");
-        assert_eq!(SIZE_MULTIPLE, 16);
+        // 32, not the VAE-only 16: diffusers' `canvas_multiple` is
+        // `vae_spatial_compression_ratio * patch_size[2]` = 16 * 2.
+        assert_eq!(SIZE_MULTIPLE, 32);
         assert_eq!(VAE_RATIO, 16);
         assert_eq!(VAE_RATIO_T, 4);
         assert_eq!(LATENT_CHANNELS, 24);
