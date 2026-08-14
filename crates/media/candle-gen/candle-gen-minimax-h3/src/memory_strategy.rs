@@ -948,7 +948,10 @@ mod tests {
         // Read through `Default`, not off the constants: comparing a constant with itself would
         // pass with the mechanism deleted.
         let tiling = crate::spatial_tiling::SpatialTiling::default();
-        assert!(tiling.enabled, "the shipped candle VAE must tile by default");
+        assert!(
+            tiling.enabled,
+            "the shipped candle VAE must tile by default"
+        );
         assert_eq!((tiling.tile_height, tiling.tile_width), (256, 256));
         assert_eq!((tiling.overlap_height, tiling.overlap_width), (64, 64));
         // …and the stitcher rung 2 would declare is constructible here today.
