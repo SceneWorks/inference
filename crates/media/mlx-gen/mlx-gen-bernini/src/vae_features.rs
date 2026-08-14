@@ -11,8 +11,8 @@
 
 use mlx_rs::Array;
 
+use crate::ProviderVae;
 use mlx_gen::Result;
-use mlx_gen_wan::WanVae;
 
 /// Reshape a source-media tensor to the VAE's `[1, 3, T, H, W]` (`get_vae_features`): a `[3, H, W]`
 /// image gains a length-1 temporal axis (reference `x.ndim==3 -> x.unsqueeze(1)`), a `[3, T, H, W]`
@@ -32,14 +32,14 @@ pub fn to_vae_input(x: &Array) -> Result<Array> {
 
 /// **Image** source → normalized VAE latent via `.mode()` (the Gaussian mean). `image` is `[3, H, W]`
 /// (or already `[3, 1, H, W]`) in `[-1, 1]`.
-pub fn image_vae_latent(vae: &WanVae, image: &Array) -> Result<Array> {
+pub fn image_vae_latent(vae: &ProviderVae, image: &Array) -> Result<Array> {
     vae.encode(&to_vae_input(image)?)
 }
 
 /// **Video** source → normalized VAE latent via `.sample()` (`mean + exp(0.5·logvar)·ε`). `video` is
 /// `[3, T, H, W]` (T = 1 + 4·k) in `[-1, 1]`; `eps` is standard-normal noise of the latent shape
 /// `[1, z, T_lat, H/8, W/8]`, supplied by the caller so the encode is deterministic.
-pub fn video_vae_latent(vae: &WanVae, video: &Array, eps: &Array) -> Result<Array> {
+pub fn video_vae_latent(vae: &ProviderVae, video: &Array, eps: &Array) -> Result<Array> {
     vae.encode_sample(&to_vae_input(video)?, eps)
 }
 

@@ -63,9 +63,9 @@ use crate::config::{AudioVaeConfig, LtxConfig, LtxVaeConfig, SplitModel, Vocoder
 use crate::enhance::{self, EnhanceConfig, SampleParams};
 use crate::gemma::{GemmaConfig, GemmaModel, GemmaQuant};
 use crate::pipeline::{
-    decode_audio_track, decode_to_frames, generate_av_latents, generate_av_latents_iclora,
-    preprocess_conditioning_clip, preprocess_conditioning_image, StageClip, StageKeyframe,
-    STAGE1_SIGMAS, STAGE2_SIGMAS,
+    decode_audio_track, decode_to_frames_with_tiling, generate_av_latents,
+    generate_av_latents_iclora, preprocess_conditioning_clip, preprocess_conditioning_image,
+    StageClip, StageKeyframe, STAGE1_SIGMAS, STAGE2_SIGMAS,
 };
 use crate::positions::{compute_audio_frames, create_audio_position_grid, create_position_grid};
 use crate::text_encoder::LtxTextEncoder;
@@ -148,7 +148,9 @@ const TEMPORAL_SCALE: u32 = 8;
 /// audio buffers directly from the request, so an unbounded `frames` (e.g. a hostile `8_000_001`,
 /// which still satisfies `frames % 8 == 1`) would drive multi-hundred-GB allocations before any
 /// error. `1025` (= 1 + 8·128, ~40 s at 25 fps) is far above any realistic request.
-const MAX_FRAMES: u32 = 1025;
+pub(crate) const MAX_FRAMES: u32 = 1025;
+pub(crate) const MIN_SIZE: u32 = 64;
+pub(crate) const MAX_SIZE: u32 = 1280;
 /// VAE spatial compression (32×); stage-1 additionally halves resolution.
 const SPATIAL_SCALE: u32 = 32;
 /// The request width/height multiple `validate_request` enforces: `2 × SPATIAL_SCALE` (= 64).
@@ -260,14 +262,18 @@ pub fn descriptor() -> ModelDescriptor {
             schedulers: Vec::new(),
             // height/width must be divisible by SIZE_MULTIPLE (= 2×SPATIAL_SCALE; stage-1 runs at //2//32).
             supported_guidance_methods: vec![],
-            min_size: 64,
-            max_size: 1280,
+            min_size: MIN_SIZE,
+            max_size: MAX_SIZE,
             max_count: 1,
             mac_only: true,
             supports_kv_cache: false,
             requires_sigma_shift: false,
             // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
             supports_sequential_offload: false,
+            // sc-18816: every generate builds/evaluates/drops Gemma before materializing the AvDiT,
+            // then drops the AvDiT before VAE/audio decode. This is physical default behavior, not a
+            // selectable Sequential control and not an evidence-composition edge.
+            unconditionally_engages_staged_residency: true,
             supports_preview: false,
             supports_prompt_enhancement: false,
             supports_streaming: false,
@@ -293,6 +299,9 @@ pub fn descriptor() -> ModelDescriptor {
 /// `--no-audio` (`req.video_mode == "no_audio"`).
 pub struct Ltx {
     descriptor: ModelDescriptor,
+    memory_strategy: Option<mlx_gen::gen_core::MemoryProviderContract>,
+    memory_tier: Option<mlx_gen::gen_core::MemoryNumericTier>,
+    memory_overlay: Option<String>,
     tokenizer: LtxTokenizer,
     // sc-10976 (epic 10975): the two GIANTS — the ~24 GB Gemma-3-12B text encoder and the AvDiT — are
     // NOT held resident. They are built on demand inside `generate` (load → use → drop), mirroring
@@ -488,6 +497,16 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
             )));
         }
     }
+    // SC-19109: bind the canonical dense-bf16 Gemma route to the same resolved split manifest,
+    // component paths and additive overlays the engine below will materialize. Quantized Gemma is a
+    // supported generator route but has no matching evidence identity yet, so it deliberately loads
+    // without a memory contract rather than borrowing the canonical route's measurements.
+    let loaded_memory =
+        crate::memory_strategy::contract_for_loaded(spec, &split, &gemma_dir, gemma_quant)?;
+    let (memory_strategy, memory_tier, memory_overlay) = match loaded_memory {
+        Some((contract, tier, overlay)) => (Some(contract), Some(tier), overlay),
+        None => (None, None, None),
+    };
 
     // The small components (each ≪ the TE / DiT) stay resident. The VAE *decoder* + audio VAE + vocoder
     // load here; the VAE *encoder* is still lazy on first I2V encode (F-048).
@@ -516,6 +535,9 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 
     Ok(Box::new(Ltx {
         descriptor: descriptor(),
+        memory_strategy,
+        memory_tier,
+        memory_overlay,
         tokenizer,
         root: root.clone(),
         config,
@@ -809,7 +831,13 @@ impl Ltx {
         mlx_rs::memory::clear_cache();
 
         on_progress(Progress::Decoding);
-        let frames = decode_to_frames(&self.vae, &video_latents, &req.cancel)?;
+        let selected_tiling = crate::memory_strategy::decode_tiling(req)?;
+        let frames = decode_to_frames_with_tiling(
+            &self.vae,
+            &video_latents,
+            &req.cancel,
+            selected_tiling.as_ref(),
+        )?;
         let images = frames_to_images(&frames)?;
         // Audio always denoised (it conditions the video); decode it unless `--no-audio`.
         let audio = if Self::no_audio(req) {
@@ -1247,10 +1275,69 @@ pub(crate) fn frames_to_images(frames: &Array) -> Result<Vec<Image>> {
         .collect())
 }
 
-mlx_gen::impl_generator!(Ltx {
-    validate: |s, req| validate_request(&s.descriptor.capabilities, req),
-    generate: generate_impl,
-});
+// Hand-written rather than `impl_generator!`: SC-19109 makes the memory contract a property of the
+// loaded provider, not only a static registry row. The ordinary descriptor/validate/generate arms
+// are the same delegation the macro emitted.
+impl Generator for Ltx {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
+        validate_request(&self.descriptor.capabilities, req).map_err(Into::into)
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
+        self.memory_strategy.as_ref()
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::MemorySafetyDecision {
+        let (Some(contract), Some(tier)) = (self.memory_strategy.as_ref(), self.memory_tier) else {
+            return if context.selection.strategy == mlx_gen::gen_core::MemoryStrategy::Resident {
+                mlx_gen::gen_core::MemorySafetyDecision::Accept
+            } else {
+                mlx_gen::gen_core::MemorySafetyDecision::Reject {
+                    reason: "ltx_2_3 loaded route has no calibrated memory-strategy contract"
+                        .into(),
+                }
+            };
+        };
+        crate::memory_strategy::safety_check(
+            contract,
+            tier,
+            self.memory_overlay.as_deref(),
+            context,
+        )
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::Result<Option<Box<dyn mlx_gen::gen_core::MemoryRequestScope + '_>>>
+    {
+        let (Some(contract), Some(tier)) = (self.memory_strategy.as_ref(), self.memory_tier) else {
+            return Ok(None);
+        };
+        crate::memory_strategy::begin_request(
+            contract,
+            tier,
+            self.memory_overlay.as_deref(),
+            self.config.num_layers as usize,
+            context,
+        )
+    }
+}
 
 impl Ltx {
     /// The rich-`Result` body behind [`Generator::generate`]. Kept on the crate's own
@@ -1410,6 +1497,16 @@ mod tests {
         assert!(
             caps.schedulers.is_empty(),
             "LTX is sampler-only (no scheduler axis — the distilled schedule is baked)"
+        );
+    }
+
+    #[test]
+    fn descriptor_declares_unconditional_staging_without_selectable_sequential_control() {
+        let caps = descriptor().capabilities;
+        assert!(!caps.supports_sequential_offload);
+        assert_eq!(
+            caps.staged_residency_availability(),
+            mlx_gen::StagedResidencyAvailability::UnconditionallyEngaged
         );
     }
 

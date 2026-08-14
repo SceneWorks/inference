@@ -313,6 +313,15 @@ const WAN_QUANT_SUFFIXES: &[&str] = &[
     ".ffn.fc2",
 ];
 
+/// Whether a sanitized Wan transformer linear belongs to the converter/runtime packed surface.
+/// Memory admission shares this predicate so its projected resident bytes cannot drift from the
+/// exact linears `quantize_wan_transformer` packs.
+pub(crate) fn is_wan_quantized_linear(base: &str) -> bool {
+    WAN_QUANT_SUFFIXES
+        .iter()
+        .any(|suffix| base.ends_with(suffix))
+}
+
 /// Port of `sanitize_wan_vae_weights` (the Wan2.1 z16 VAE — `convert_wan.py`): channels-last conv
 /// transposes only (Conv3d/Conv2d weights gated on `"weight" in key`), **no** key renames. Distinct
 /// from the bespoke z48 [`sanitize_wan22_vae`].
@@ -341,7 +350,7 @@ pub fn quantize_wan_transformer(
     let mut out = HashMap::with_capacity(map.len());
     for (k, v) in map {
         let base = k.strip_suffix(".weight");
-        let is_q = base.is_some_and(|b| WAN_QUANT_SUFFIXES.iter().any(|s| b.ends_with(s)));
+        let is_q = base.is_some_and(is_wan_quantized_linear);
         if let (true, Some(base)) = (is_q, base) {
             let (wq, scales, biases) = quantize(&v, group_size, bits)?;
             out.insert(format!("{base}.weight"), wq);

@@ -7,6 +7,7 @@
 pub use core_llm;
 pub use gen_core;
 pub use gen_core::memory_strategy;
+pub use gen_core::tiling::VideoDecodeMemoryProfile;
 
 use core_llm::{SnapshotPreparerRegistry, TextLlmRegistry};
 use gen_core::{
@@ -807,6 +808,26 @@ impl RuntimeCatalogSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_profile_composes_decoder_residency_exactly_once() {
+        let profile = VideoDecodeMemoryProfile::new(1_000, 400).unwrap();
+        assert_eq!(VideoDecodeMemoryProfile::new(399, 400), None);
+        // Contract decoder below the calibrated resident floor preserves the uncovered excess.
+        assert_eq!(
+            profile.incremental_above_contract_decoder_bytes(250),
+            Some(750)
+        );
+        assert_eq!(profile.checked_composed_peak(1_250, 250), Some(2_000));
+        // Contract decoder above the floor is retained once; only non-resident decode work is added.
+        assert_eq!(
+            profile.incremental_above_contract_decoder_bytes(600),
+            Some(600)
+        );
+        assert_eq!(profile.checked_composed_peak(1_600, 600), Some(2_200));
+        assert_eq!(profile.checked_composed_peak(399, 400), None);
+        assert_eq!(profile.checked_composed_peak(u64::MAX, 600), None);
+    }
 
     fn candle_descriptor() -> core_llm::TextLlmDescriptor {
         core_llm::TextLlmDescriptor {

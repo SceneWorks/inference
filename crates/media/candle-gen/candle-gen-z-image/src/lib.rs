@@ -438,6 +438,7 @@ pub fn descriptor() -> ModelDescriptor {
             supports_kv_cache: false,
             requires_sigma_shift: false,
             supports_sequential_offload: true,
+            unconditionally_engages_staged_residency: false,
             // Per-step latent previews (epic 16948, sc-16957). Every Turbo render lane emits: the
             // resident and staged txt2img/img2img routes hand `run_flow_sampler` a projector hook, and
             // the name-driven control + edit providers' bespoke Euler loops emit directly. The

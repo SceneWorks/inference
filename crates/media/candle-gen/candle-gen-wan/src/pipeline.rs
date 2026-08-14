@@ -6,7 +6,7 @@ use candle_gen::gen_core::Image;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 
-use crate::config::{VAE_STRIDE_SPATIAL, VAE_STRIDE_TEMPORAL};
+use crate::Ti2vProviderVae;
 
 fn py_round(x: f64) -> usize {
     let floor = x.floor();
@@ -57,9 +57,11 @@ pub fn preprocess_ti2v_image(
 
 /// Latent dims `(t_lat, h_lat, w_lat)` for `frames × height × width`.
 pub fn latent_dims(frames: u32, width: u32, height: u32) -> (usize, usize, usize) {
-    let t_lat = (frames - 1) / VAE_STRIDE_TEMPORAL + 1;
-    let h_lat = height / VAE_STRIDE_SPATIAL;
-    let w_lat = width / VAE_STRIDE_SPATIAL;
+    let temporal_scale = Ti2vProviderVae::VAE_TILING.temporal_scale as u32;
+    let spatial_scale = Ti2vProviderVae::VAE_TILING.spatial_scale as u32;
+    let t_lat = (frames - 1) / temporal_scale + 1;
+    let h_lat = height / spatial_scale;
+    let w_lat = width / spatial_scale;
     (t_lat as usize, h_lat as usize, w_lat as usize)
 }
 

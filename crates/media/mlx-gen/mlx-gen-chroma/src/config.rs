@@ -141,6 +141,7 @@ impl ChromaVariant {
                 // drops the T5-XXL encoder after the prompt encode so peak unified memory is bounded
                 // to `max(T5, DiT+VAE)` instead of their sum.
                 supports_sequential_offload: true,
+                unconditionally_engages_staged_residency: false,
                 supports_preview: true,
                 supports_prompt_enhancement: false,
                 supports_streaming: false,

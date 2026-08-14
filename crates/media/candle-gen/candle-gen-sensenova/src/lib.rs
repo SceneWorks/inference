@@ -159,6 +159,7 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             // Flow-match schedule uses a timestep shift (mapped from scheduler_shift).
             requires_sigma_shift: true,
             supports_sequential_offload: false,
+            unconditionally_engages_staged_residency: false,
             // Per-step latent previews (epic 16948, sc-16960). Both ids reach the one bespoke
             // flow-match denoise loop in `t2i.rs`, which emits directly through
             // `PreviewHook::emit_step`; `preview` owns the fit and the pool to the token grid.

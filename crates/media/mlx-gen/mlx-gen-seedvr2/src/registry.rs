@@ -74,6 +74,7 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             requires_sigma_shift: false,
             // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
             supports_sequential_offload: false,
+            unconditionally_engages_staged_residency: false,
             supports_preview: false,
             supports_prompt_enhancement: false,
             supports_streaming: false,

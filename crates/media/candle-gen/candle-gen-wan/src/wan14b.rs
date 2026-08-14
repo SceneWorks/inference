@@ -40,14 +40,30 @@ use crate::config::{
     DEFAULT_STEPS_14B, I2V_14B_BOUNDARY, I2V_14B_FLOW_SHIFT, I2V_14B_GUIDANCE_HIGH,
     I2V_14B_GUIDANCE_LOW, MAX_AREA_14B, MODEL_ID_I2V_14B, MODEL_ID_T2V_14B, NEGATIVE_FALLBACK,
     NUM_TRAIN_TIMESTEPS, SIZE_MULTIPLE_14B, T2V_14B_BOUNDARY, T2V_14B_FLOW_SHIFT,
-    T2V_14B_GUIDANCE_HIGH, T2V_14B_GUIDANCE_LOW, VAE16_STRIDE_SPATIAL, VAE16_STRIDE_TEMPORAL,
+    T2V_14B_GUIDANCE_HIGH, T2V_14B_GUIDANCE_LOW,
 };
 use crate::pipeline::{cfg, create_noise, frames_to_images};
 use crate::rope::WanRope;
 use crate::scheduler::{FlowScheduler, Sampler};
 use crate::text_encoder::Umt5Encoder;
 use crate::transformer::WanTransformer;
-use crate::vae16::WanVae16;
+/// Concrete z16 VAE assigned to both A14B routes.
+pub type ProviderVae = crate::vae16::WanVae16;
+
+/// Resolve either A14B route's load-bearing VAE geometry.
+pub fn vae_tiling(provider_id: &str) -> Option<candle_gen::gen_core::tiling::VaeTiling> {
+    matches!(provider_id, MODEL_ID_T2V_14B | MODEL_ID_I2V_14B).then_some(ProviderVae::VAE_TILING)
+}
+
+/// Runtime latent geometry for either A14B route, derived from the assigned VAE.
+pub(crate) fn latent_dims(frames: u32, width: u32, height: u32) -> (usize, usize, usize) {
+    let temporal_scale = ProviderVae::VAE_TILING.temporal_scale as u32;
+    let spatial_scale = ProviderVae::VAE_TILING.spatial_scale as u32;
+    let t_lat = (frames - 1) / temporal_scale + 1;
+    let h_lat = height / spatial_scale;
+    let w_lat = width / spatial_scale;
+    (t_lat as usize, h_lat as usize, w_lat as usize)
+}
 
 /// The experts run bf16 (the diffusers fp32 weights load as bf16, the 5B regime); UMT5 runs bf16
 /// (sc-12778 — halving the f32 encoder resident + its ENCODE-stage transient; the DiT `embed_text`
@@ -59,7 +75,7 @@ use crate::vae16::WanVae16;
 /// floor, independent of the VAE spatial-tile budget** (weights + the un-tileable f32 decode
 /// activations, not something tiling can shrink). Running the z16 VAE bf16 ~halves that floor → it fits
 /// a 24 GiB card. bf16 keeps f32's 8-bit exponent (no fp16 overflow risk), and the L2/softmax
-/// reductions stay f32-reduced in [`WanVae16`], so decode parity holds (GPU-checked ≥35 dB PSNR vs f32).
+/// reductions stay f32-reduced in [`ProviderVae`], so decode parity holds (GPU-checked ≥35 dB PSNR vs f32).
 const DIT_DTYPE: DType = DType::BF16;
 const ENC_DTYPE: DType = DType::BF16;
 const VAE_DTYPE: DType = DType::BF16;
@@ -123,7 +139,7 @@ struct Components {
     high: Arc<WanTransformer>,
     /// `transformer_2/` — the **low-noise** expert (timestep < boundary).
     low: Arc<WanTransformer>,
-    vae: Arc<WanVae16>,
+    vae: Arc<ProviderVae>,
     /// UMT5 tokenizer, loaded+parsed **once** at component load and reused across encodes (sc-8991 /
     /// F-011) instead of re-parsing `tokenizer.json` per prompt/branch.
     tok: Arc<candle_gen::gen_core::tokenizer::TextTokenizer>,
@@ -210,13 +226,13 @@ impl Pipeline {
     /// `VarBuilder::from_tensors` at [`VAE_DTYPE`] (**bf16**, sc-12818 — the weights load bf16, the
     /// decode-floor win; `get` casts each tensor to that dtype). I2V builds the encoder too (the
     /// conditioning image's first-frame latent).
-    fn build_vae_comfyui(&self, file: &Path) -> CResult<WanVae16> {
+    fn build_vae_comfyui(&self, file: &Path) -> CResult<ProviderVae> {
         let map = cst::load(file, &Device::Cpu)?;
         let map = crate::comfyui::remap_vae_wan_to_diffusers(map)?;
         let vb = VarBuilder::from_tensors(map, VAE_DTYPE, &self.device);
         match self.variant {
-            Variant::I2v => Ok(WanVae16::new_with_encoder(&self.vae_cfg, vb)?),
-            Variant::T2v => Ok(WanVae16::new(&self.vae_cfg, vb)?),
+            Variant::I2v => Ok(ProviderVae::new_with_encoder(&self.vae_cfg, vb)?),
+            Variant::T2v => Ok(ProviderVae::new(&self.vae_cfg, vb)?),
         }
     }
 
@@ -325,15 +341,15 @@ impl Pipeline {
     /// reads it from the user's tree (native→diffusers key remap); else the snapshot `vae/`. I2V builds
     /// the encoder too (the conditioning image's first-frame latent). Shared by the resident and staged
     /// paths (sc-12733).
-    fn load_vae(&self) -> CResult<WanVae16> {
+    fn load_vae(&self) -> CResult<ProviderVae> {
         match self.comfyui.as_ref().and_then(|c| c.vae_file.as_deref()) {
             Some(vae_file) => self.build_vae_comfyui(vae_file),
             None => {
                 let vae_vb = self.component_vb("vae", VAE_DTYPE)?;
                 match self.variant {
                     // I2V needs the VAE encoder (the conditioning image's first-frame latent).
-                    Variant::I2v => Ok(WanVae16::new_with_encoder(&self.vae_cfg, vae_vb)?),
-                    Variant::T2v => Ok(WanVae16::new(&self.vae_cfg, vae_vb)?),
+                    Variant::I2v => Ok(ProviderVae::new_with_encoder(&self.vae_cfg, vae_vb)?),
+                    Variant::T2v => Ok(ProviderVae::new(&self.vae_cfg, vae_vb)?),
                 }
             }
         }
@@ -413,7 +429,7 @@ impl Pipeline {
     /// `generate_wan.py`'s `is_i2v_channel_concat` setup. Constant across denoise steps + both experts.
     fn build_i2v_y(
         &self,
-        vae: &WanVae16,
+        vae: &ProviderVae,
         image: &Image,
         frames: u32,
         width: u32,
@@ -487,9 +503,7 @@ impl Pipeline {
         req: &GenerationRequest,
         frames: u32,
     ) -> CResult<(usize, usize, usize, Tensor, Tensor)> {
-        let t_lat = ((frames - 1) / VAE16_STRIDE_TEMPORAL + 1) as usize;
-        let h_lat = (req.height / VAE16_STRIDE_SPATIAL) as usize;
-        let w_lat = (req.width / VAE16_STRIDE_SPATIAL) as usize;
+        let (t_lat, h_lat, w_lat) = latent_dims(frames, req.width, req.height);
         let (pt, ph, pw) = self.dit_cfg.patch;
         let (ppf, pph, ppw) = (t_lat / pt, h_lat / ph, w_lat / pw);
         let (cos, sin) = WanRope::new(&self.dit_cfg).cos_sin(ppf, pph, ppw, &self.device)?;
@@ -1161,6 +1175,7 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             // resident (never both), dropping the pre-decode peak on a 24 GB card. Advertised so the
             // worker's fit-gate can tell "bounds peak here" from a no-op fallback.
             supports_sequential_offload: true,
+            unconditionally_engages_staged_residency: false,
             supports_preview: false,
             supports_prompt_enhancement: false,
             supports_streaming: false,
@@ -1635,6 +1650,23 @@ mod tests {
             assert!(
                 d.capabilities.supports_sequential_offload,
                 "A14B must advertise sequential offload (sc-12733)"
+            );
+        }
+    }
+
+    #[test]
+    fn descriptors_classify_staging_as_selectable_not_unconditional() {
+        for descriptor in [descriptor_t2v_14b(), descriptor_i2v_14b()] {
+            assert!(
+                !descriptor
+                    .capabilities
+                    .unconditionally_engages_staged_residency
+            );
+            assert_eq!(
+                descriptor.capabilities.staged_residency_availability(),
+                candle_gen::gen_core::StagedResidencyAvailability::Selectable,
+                "{} only stages when the selectable policy is requested",
+                descriptor.id
             );
         }
     }

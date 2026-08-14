@@ -6,7 +6,7 @@
 //! and VAE-decode each segment back to pixels.
 //!
 //! Reuse map — the heavy components are `candle-gen-wan`'s (SCAIL-2 *is* Wan2.1-14B I2V): the z16
-//! [`WanVae16`] (encode/decode; its decode already streams one latent frame at a time = the
+//! [`ProviderVae`] (encode/decode; its decode already streams one latent frame at a time = the
 //! temporal-tiled decode the high-res fix needs), the [`Umt5Encoder`] text encoder, and the
 //! flow-matching [`FlowScheduler`] (UniPC). SCAIL-2's own pieces are the [`Scail2Dit`] forward, the
 //! open-CLIP [`ScailClip`] image encode, the 28-channel [`extract_and_compress_mask_to_latent`] mask
@@ -23,23 +23,23 @@ use candle_gen_wan::config::TextEncoderConfig;
 use candle_gen_wan::pipeline::frames_to_images;
 use candle_gen_wan::scheduler::{FlowScheduler, Sampler};
 use candle_gen_wan::text_encoder::Umt5Encoder;
-use candle_gen_wan::vae16::WanVae16;
 
 use crate::clip::ScailClip;
 use crate::model::{Scail2Dit, Scail2Inputs};
 use crate::preprocess::{extract_and_compress_mask_to_latent, TEMPORAL_STRIDE};
 use crate::resize::{clip_preprocess, downsample_half, interpolate, Interp};
+use crate::ProviderVae;
 
 /// Inputs must be divisible by 32: the pose path halves spatially (→ ÷16) before the ÷8 VAE stride, and
 /// the 28-channel mask pools 8×, so both the full and half grids stay integer + even.
-pub(crate) const DIM_ALIGN: u32 = 32;
+pub(crate) const DIM_ALIGN: u32 = crate::VAE_TILING.spatial_scale as u32 * 4;
 
 /// The loaded SCAIL-2 components (resident in the [`crate::pipeline::Scail2`] generator's cache). All
 /// run f32 (the DiT's high-token-length NaN avoidance, and z16 VAE / UMT5 / CLIP are f32 anyway).
 pub struct Components {
     pub te: Umt5Encoder,
     pub dit: Scail2Dit,
-    pub vae: WanVae16,
+    pub vae: ProviderVae,
     pub clip: ScailClip,
     /// UMT5 tokenizer, loaded+parsed **once** at component load and reused across the pos/neg encodes
     /// (sc-8991 / F-011) instead of re-parsing `tokenizer.json` per generate call.
@@ -161,7 +161,7 @@ fn stack_masks(masks: &[Image], tw: usize, th: usize) -> CResult<Tensor> {
 }
 
 /// VAE-encode a `[3, T, H, W]` pixel clip (`[-1,1]`) → `[16, T_lat, H/8, W/8]` (drops the batch dim).
-fn vae_encode_cthw(vae: &WanVae16, cthw: &Tensor) -> CResult<Tensor> {
+fn vae_encode_cthw(vae: &ProviderVae, cthw: &Tensor) -> CResult<Tensor> {
     let (c, t, h, w) = cthw.dims4()?;
     let z = vae.encode(&cthw.reshape((1, c, t, h, w))?)?; // [1,16,T_lat,h,w]
     let (_, zc, zt, zh, zw) = z.dims5()?;

@@ -64,6 +64,7 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             // `max(Qwen3-TE, DiT+conditioner+VAE)`. Q4/Q8 are packed convert-at-install tiers (no
             // load-time re-quant), so no F-181 dense-requant advisory is needed (mirrors SANA).
             supports_sequential_offload: true,
+            unconditionally_engages_staged_residency: false,
             supports_preview: true,
             supports_prompt_enhancement: false,
             supports_streaming: false,

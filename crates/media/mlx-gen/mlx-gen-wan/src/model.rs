@@ -17,6 +17,7 @@
 use std::path::PathBuf;
 
 use mlx_gen::gen_core::{adapter_stack_resident_bytes, AdapterResidencyMode};
+use mlx_gen::tiling::VaeTiling;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     AdapterSpec, CancelFlag, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
@@ -32,18 +33,40 @@ use crate::adapters::{
 };
 use crate::config::{WanModelConfig, WanQuant, MIN_SIZE};
 use crate::pipeline::{
-    align_dim, auto_tiling_budgeted, auto_tiling_budgeted_z16, build_i2v_y, build_ti2v_keyframe_z,
-    build_ti2v_mask, build_ti2v_multi_mask, crossing_index, decode_to_frames, decode_to_frames_22,
-    denoise, denoise_curated, denoise_moe, denoise_moe_curated, denoise_moe_curated_swapped,
-    denoise_range, denoise_ti2v, frames_to_images, latent_shape, preflight_denoise_memory_guard,
+    align_dim, auto_tiling_budgeted_z16, build_i2v_y, build_ti2v_keyframe_z, build_ti2v_mask,
+    build_ti2v_multi_mask, crossing_index, decode_to_frames, decode_to_frames_22, denoise,
+    denoise_curated, denoise_moe, denoise_moe_curated, denoise_moe_curated_swapped, denoise_range,
+    denoise_ti2v, frames_to_images, latent_shape, preflight_denoise_memory_guard,
     preprocess_ti2v_image, reject_off_grid, reject_over_area, resolve_sampler_knobs, seq_len,
     staged_expert_swap, ti2v_blend_init, Expert,
 };
 use crate::scheduler::{make_scheduler, SolverKind, WanScheduler};
 use crate::text_encoder::encode_text_staged_for_tier;
 use crate::transformer::WanTransformer;
-use crate::vae::WanVae;
-use crate::vae22::Wan22Vae;
+
+/// Concrete z48 VAE assigned to the TI2V-5B route.
+pub type Ti2vProviderVae = crate::vae22::Wan22Vae;
+/// Concrete z16 VAE assigned to both A14B routes.
+pub type A14bProviderVae = crate::vae::WanVae;
+
+const fn provider_vae_stride(vae: VaeTiling) -> (usize, usize, usize) {
+    (
+        vae.temporal_scale as usize,
+        vae.spatial_scale as usize,
+        vae.spatial_scale as usize,
+    )
+}
+
+/// Resolve the TI2V-5B route's load-bearing VAE geometry.
+pub fn ti2v_vae_tiling(provider_id: &str) -> Option<mlx_gen::tiling::VaeTiling> {
+    (provider_id == MODEL_ID).then_some(Ti2vProviderVae::VAE_TILING)
+}
+
+/// Resolve either A14B route's load-bearing VAE geometry.
+pub fn a14b_vae_tiling(provider_id: &str) -> Option<mlx_gen::tiling::VaeTiling> {
+    matches!(provider_id, MODEL_ID_T2V_14B | MODEL_ID_I2V_14B)
+        .then_some(A14bProviderVae::VAE_TILING)
+}
 
 /// The curated unified solvers (epic 7114, sc-7121) every Wan generator exposes ADDITIVELY beyond its
 /// native solvers — the gen-core-only solvers, routed through `run_flow_sampler` over Wan's own flow-σ
@@ -127,7 +150,7 @@ pub fn descriptor() -> ModelDescriptor {
             max_count: 1,
             mac_only: true,
             supported_quants: &[Quant::Q4, Quant::Q8],
-            component_precision_floors: &[],
+            component_precision_floors: crate::memory_strategy::COMPONENT_PRECISION_FLOORS,
             // Cross-attention text K/V is cached across denoise steps.
             supports_kv_cache: true,
             // Wan pins a static `sample_shift` from config (not the empirical per-resolution mu).
@@ -139,6 +162,9 @@ pub fn descriptor() -> ModelDescriptor {
             // wired-memory pressure) through denoise + decode. Advertised so the worker's fit-gate can
             // tell "bounds footprint here" from a no-op fallback.
             supports_sequential_offload: true,
+            // TE → DiT → z48 VAE is phase-staged on every request; Sequential additionally flushes
+            // dead allocator cache between those already-staged phases.
+            unconditionally_engages_staged_residency: true,
             supports_preview: false,
             supports_prompt_enhancement: false,
             supports_streaming: false,
@@ -164,7 +190,7 @@ pub fn descriptor() -> ModelDescriptor {
 /// GiB** — well under the epic's <16 GB-with-margin target — so we floor the TE at Q8 even when the DiT
 /// tier is Q4: the user's Q4 *DiT* creative choice is untouched, and the TE stays regression-free (the
 /// extra ~2 GiB a Q4 TE would save is not needed and not worth the drift).
-const TE_QUANT_BITS: i32 = 8;
+pub(crate) const TE_QUANT_BITS: i32 = 8;
 
 /// The effective UMT5 text-encoder quantization for a Wan tier (sc-12831). The DiT is packed on an
 /// MLX-affine tier iff a pre-quantized snapshot manifest is present (`config.quantization`) **or** a
@@ -208,6 +234,10 @@ pub struct Wan {
     /// follow — bounding the unified-memory RSS / wired footprint. No expert swap (single dense DiT).
     /// Captured from [`LoadSpec::offload_policy`] at load.
     offload_policy: OffloadPolicy,
+    /// Load-exact memory contract and numeric tier for the one calibrated plain Resident/Eager
+    /// route. Other supported Wan loads remain available but deliberately publish no contract.
+    memory_strategy: Option<mlx_gen::gen_core::MemoryProviderContract>,
+    memory_tier: Option<mlx_gen::gen_core::MemoryNumericTier>,
 }
 
 impl Wan {
@@ -307,6 +337,10 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         )));
     }
     let quant = resolve_load_time_quant(MODEL_ID, &config, spec.quantize)?;
+    let memory = crate::memory_strategy::contract_for_loaded(spec).map_err(Error::from)?;
+    let (memory_strategy, memory_tier) = memory
+        .map(|(contract, tier)| (Some(contract), Some(tier)))
+        .unwrap_or((None, None));
     Ok(Box::new(Wan {
         descriptor: descriptor(),
         config,
@@ -314,13 +348,64 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         adapters: spec.adapters.clone(),
         quant,
         offload_policy: spec.offload_policy,
+        memory_strategy,
+        memory_tier,
     }))
 }
 
-mlx_gen::impl_generator!(Wan {
-    validate: |s, req| s.validate_impl(req),
-    generate: generate_impl,
-});
+// Hand-written so the load-exact SC-19236 contract is a property of the loaded provider. The
+// descriptor/validation/generation arms are otherwise the same delegation emitted by
+// `impl_generator!` for the other Wan routes.
+impl Generator for Wan {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
+        self.validate_impl(req).map_err(Into::into)
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
+        self.memory_strategy.as_ref()
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::MemorySafetyDecision {
+        let (Some(contract), Some(tier)) = (self.memory_strategy.as_ref(), self.memory_tier) else {
+            return if context.selection.strategy == mlx_gen::gen_core::MemoryStrategy::Resident {
+                mlx_gen::gen_core::MemorySafetyDecision::Accept
+            } else {
+                mlx_gen::gen_core::MemorySafetyDecision::Reject {
+                    reason: format!(
+                        "{MODEL_ID} loaded route has no calibrated memory-strategy contract"
+                    ),
+                }
+            };
+        };
+        crate::memory_strategy::safety_check(contract, tier, context)
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::Result<Option<Box<dyn mlx_gen::gen_core::MemoryRequestScope + '_>>>
+    {
+        let (Some(contract), Some(tier)) = (self.memory_strategy.as_ref(), self.memory_tier) else {
+            return Ok(None);
+        };
+        crate::memory_strategy::begin_request(contract, tier, context)
+    }
+}
 
 impl Wan {
     /// Validate body — kept on the crate's own [`mlx_gen::Error`] so `?` on the capability check
@@ -352,7 +437,7 @@ impl Wan {
         // request means one geometry on both backends. sc-12607: the 32-px grid stride (candle rejects
         // via `is_multiple_of(SIZE_MULTIPLE)`). sc-12308: the 5B's OWN 901 120 area budget — its 32-px
         // grid makes 1280×704 the geometry it genuinely renders.
-        let (dw, dh) = grid(&self.config);
+        let (dw, dh) = grid(&self.config, Ti2vProviderVae::VAE_TILING);
         reject_off_grid(MODEL_ID, req, dw, dh)?;
         reject_over_area(MODEL_ID, req, dw, dh, self.config.max_area)?;
         // The TI2V mask-blend path (the `ti2v = Some(_)` branch of `generate_impl`) is entered by
@@ -426,9 +511,10 @@ impl Wan {
         // --- Resolve request knobs against config defaults ---
         let frames = req.frames.map(|f| f as usize).unwrap_or(cfg.frame_num);
         let trim = req.trim_first_frames.unwrap_or(0) as usize;
-        let trim_out = trim * cfg.vae_stride.0; // discarded output frames = trim · 4
+        let vae_stride = provider_vae_stride(Ti2vProviderVae::VAE_TILING);
+        let trim_out = trim * vae_stride.0; // discarded output frames = trim · 4
         let gen_frames = frames + trim_out;
-        let (width, height) = resolve_capped_dims(req, cfg);
+        let (width, height) = resolve_capped_dims(req, cfg, Ti2vProviderVae::VAE_TILING);
         let (steps, shift, kind, seed) =
             resolve_sampler_knobs(req, cfg.sample_steps, cfg.sample_shift);
         // The 5B is dense → a single guidance scale (config Single(5.0), overridable per request).
@@ -439,7 +525,7 @@ impl Wan {
             .clone()
             .unwrap_or_else(|| cfg.sample_neg_prompt.clone());
 
-        let lat = latent_shape(gen_frames, height, width, cfg.vae_z_dim, cfg.vae_stride)?;
+        let lat = latent_shape(gen_frames, height, width, cfg.vae_z_dim, vae_stride)?;
 
         // sc-4986 — fail fast (catchable) if the DiT-denoise stage won't fit, before any heavy load.
         // sc-12796: this is policy-INdependent for the dense 5B (unlike the A14B's `moe_denoise_resident_bytes`,
@@ -475,8 +561,15 @@ impl Wan {
         // catchably *before* the heavy denoise rather than OOM-ing in the post-loop decode stage.
         // sc-5039 — the decode runs **bf16** (visually lossless, cosine 0.999954 real-weight; lower
         // peak ⇒ the budget fits bigger tiles), so the plan uses the bf16 cost coefficient.
-        let decode_tiling =
-            auto_tiling_budgeted(height as i32, width as i32, gen_frames as i32, true)?;
+        let out_frames = 1 + (lat[1] - 1) * Ti2vProviderVae::VAE_TILING.temporal_scale;
+        let out_height = lat[2] * Ti2vProviderVae::VAE_TILING.spatial_scale;
+        let out_width = lat[3] * Ti2vProviderVae::VAE_TILING.spatial_scale;
+        let decode_tiling = crate::memory_strategy::decode_tiling(
+            req,
+            out_width as u32,
+            out_height as u32,
+            out_frames as u32,
+        )?;
 
         // --- Stage 1: UMT5 text encode (loaded → used → freed) ---
         let (context, context_null) = encode_text_staged_for_tier(
@@ -507,7 +600,7 @@ impl Wan {
         // (`[z,T,h,w]`, 0 at frame 0) + per-token mask (`[1,L]`), and blend `(1−mask)·z_img +
         // mask·noise`. Without an image this is pure-noise T2V.
         // Channels-first `[z,1,h,w]` latent for one preprocessed TI2V image (z48-VAE-encode → reshape).
-        let encode_kf = |vae: &Wan22Vae, image: &Image| -> Result<Array> {
+        let encode_kf = |vae: &Ti2vProviderVae, image: &Image| -> Result<Array> {
             let img_thwc = preprocess_ti2v_image(image, width, height)?; // [1,1,H,W,3]
             let z = vae.encode(&img_thwc)?; // [1,1,h,w,z]
             Ok(z.reshape(&z.shape()[1..])?.transpose_axes(&[3, 0, 1, 2])?) // [z,1,h,w]
@@ -518,7 +611,7 @@ impl Wan {
             // Wan-native first_last_frame / multi-keyframe (sc-3357): pin each Keyframe's latent frame
             // via the mask-blend (frame_idx is a latent index, negative-from-end → `-1` = last frame).
             let w = Weights::from_file(self.root.join("vae.safetensors"))?;
-            let vae = Wan22Vae::from_weights(&w)?;
+            let vae = Ti2vProviderVae::from_weights(&w)?;
             let mut frames: Vec<(Array, usize)> = Vec::with_capacity(keyframes.len());
             let mut indices: Vec<usize> = Vec::with_capacity(keyframes.len());
             for kf in &keyframes {
@@ -548,7 +641,7 @@ impl Wan {
                 Some(image) => {
                     let z_img = {
                         let w = Weights::from_file(self.root.join("vae.safetensors"))?;
-                        let vae = Wan22Vae::from_weights(&w)?;
+                        let vae = Ti2vProviderVae::from_weights(&w)?;
                         encode_kf(&vae, image)?
                     };
                     let (mask, mask_tokens) =
@@ -690,7 +783,7 @@ impl Wan {
         let frames_u8 = {
             let mut w = Weights::from_file(self.root.join("vae.safetensors"))?;
             w.cast_all(mlx_rs::Dtype::Bfloat16)?;
-            let vae = Wan22Vae::from_weights(&w)?;
+            let vae = Ti2vProviderVae::from_weights(&w)?;
             decode_to_frames_22(&vae, &latents, decode_tiling.as_ref(), Some(&req.cancel))?
         };
         let mut images = frames_to_images(&frames_u8)?;
@@ -759,6 +852,9 @@ pub fn descriptor_t2v_14b() -> ModelDescriptor {
             // off-GPU during denoise, dropping the unified-memory peak to ~one expert. Advertised so
             // the worker's fit-gate can tell "bounds peak here" from a no-op fallback.
             supports_sequential_offload: true,
+            // TE/VAE and the active expert are phase-staged even under Resident; Sequential adds the
+            // stronger cache-flush/expert-residency controls described above.
+            unconditionally_engages_staged_residency: true,
             supports_preview: false,
             supports_prompt_enhancement: false,
             supports_streaming: false,
@@ -1166,7 +1262,7 @@ impl Wan14b {
         // sc-12607: the 16-px grid stride (candle rejects via `is_multiple_of(SIZE_MULTIPLE_14B)`).
         // sc-12308: the area cap (T2V was uncapped entirely; I2V refit 1280×720 → 1264×704). Both A14B
         // variants share the 14B family's 921 600 budget.
-        let (dw, dh) = grid(&self.config);
+        let (dw, dh) = grid(&self.config, A14bProviderVae::VAE_TILING);
         reject_off_grid(id, req, dw, dh)?;
         reject_over_area(id, req, dw, dh, self.config.max_area)?;
         // I2V channel-concat requires a single reference image (the first conditioning frame), and
@@ -1217,11 +1313,12 @@ impl Wan14b {
         // decode, so the first kept frame sees a full temporal receptive field (port of
         // generate_wan.py). gen_frames stays 1+4k since frames is and we add a multiple of 4.
         let trim = req.trim_first_frames.unwrap_or(0) as usize;
-        let trim_out = trim * cfg.vae_stride.0; // discarded output frames = trim · 4
-        let gen_frames = frames + trim * cfg.vae_stride.0;
+        let vae_stride = provider_vae_stride(A14bProviderVae::VAE_TILING);
+        let trim_out = trim * vae_stride.0; // discarded output frames = trim · 4
+        let gen_frames = frames + trim * vae_stride.0;
         // validate() already rejected sub-tile + bad frame counts; round H/W down to the grid, then
         // enforce the model's max-area cap (I2V-14B / TI2V-5B: 704×1280; no-op for T2V's max_area 0).
-        let (width, height) = resolve_capped_dims(req, cfg);
+        let (width, height) = resolve_capped_dims(req, cfg, A14bProviderVae::VAE_TILING);
         let (steps, shift, kind, seed) =
             resolve_sampler_knobs(req, cfg.sample_steps, cfg.sample_shift);
         // A scalar request `guidance` overrides both experts; otherwise use the config (low, high).
@@ -1233,7 +1330,7 @@ impl Wan14b {
 
         // Init-noise latent geometry: [z_dim, t_lat, h_lat, w_lat] for the (possibly trim-extended)
         // generation length.
-        let lat = latent_shape(gen_frames, height, width, cfg.vae_z_dim, cfg.vae_stride)?;
+        let lat = latent_shape(gen_frames, height, width, cfg.vae_z_dim, vae_stride)?;
 
         // sc-4986 — fail fast (catchable) if the DiT-denoise stage won't fit, before any heavy load.
         // sc-12736/sc-12795: every `Sequential` route keeps only ONE expert resident; `Resident`
@@ -1309,8 +1406,8 @@ impl Wan14b {
                 ))
             })?;
             let w = Weights::from_file(self.root.join("vae.safetensors"))?;
-            let vae = WanVae::from_weights(&w)?;
-            let y = build_i2v_y(&vae, image, frames, height, width, cfg.vae_stride)?;
+            let vae = A14bProviderVae::from_weights(&w)?;
+            let y = build_i2v_y(&vae, image, frames, height, width, vae_stride)?;
             mlx_rs::transforms::eval([&y])?;
             Some(y)
         } else {
@@ -1480,11 +1577,13 @@ impl Wan14b {
         // `TilingConfig::auto` that could pick an over-budget tile and OOM the largest-resident model.
         // `Ok(None)` for small outputs → single-pass; an over-budget decode returns a catchable error
         // here instead of a SIGKILL in the decode. decode_to_frames re-checks `needs_tiling`.
-        let out_frames = lat[1] * cfg.vae_stride.0 as i32;
-        let tiling = auto_tiling_budgeted_z16(height as i32, width as i32, out_frames)?;
+        let out_frames = lat[1] * A14bProviderVae::VAE_TILING.temporal_scale;
+        let out_height = lat[2] * A14bProviderVae::VAE_TILING.spatial_scale;
+        let out_width = lat[3] * A14bProviderVae::VAE_TILING.spatial_scale;
+        let tiling = auto_tiling_budgeted_z16(out_height, out_width, out_frames)?;
         let frames_u8 = {
             let w = Weights::from_file(self.root.join("vae.safetensors"))?;
-            let vae = WanVae::from_weights(&w)?;
+            let vae = A14bProviderVae::from_weights(&w)?;
             decode_to_frames(&vae, &latents, tiling.as_ref(), Some(&req.cancel))?
         };
         let mut images = frames_to_images(&frames_u8)?;
@@ -1657,17 +1756,23 @@ fn i2v_reference(req: &GenerationRequest) -> Option<&Image> {
 /// **sc-12607:** `validate_impl` now *also* rejects an off-grid `width`/`height` (via
 /// [`reject_off_grid`], matching candle), so a validated request is already grid-aligned and this
 /// rounding is a defensive identity — it never silently snaps a geometry the caller chose.
-fn resolve_capped_dims(req: &GenerationRequest, cfg: &WanModelConfig) -> (u32, u32) {
-    let width = align_dim(req.width, cfg.patch_size.2, cfg.vae_stride.2);
-    let height = align_dim(req.height, cfg.patch_size.1, cfg.vae_stride.1);
+fn resolve_capped_dims(
+    req: &GenerationRequest,
+    cfg: &WanModelConfig,
+    vae: VaeTiling,
+) -> (u32, u32) {
+    let stride = provider_vae_stride(vae);
+    let width = align_dim(req.width, cfg.patch_size.2, stride.2);
+    let height = align_dim(req.height, cfg.patch_size.1, stride.1);
     (width, height)
 }
 
 /// The model's `(dw, dh)` pixel grid = `patch · vae_stride` — the lattice every Wan geometry sits on.
-fn grid(cfg: &WanModelConfig) -> (u32, u32) {
+fn grid(cfg: &WanModelConfig, vae: VaeTiling) -> (u32, u32) {
+    let stride = provider_vae_stride(vae);
     (
-        (cfg.patch_size.2 * cfg.vae_stride.2) as u32,
-        (cfg.patch_size.1 * cfg.vae_stride.1) as u32,
+        (cfg.patch_size.2 * stride.2) as u32,
+        (cfg.patch_size.1 * stride.1) as u32,
     )
 }
 
@@ -1709,6 +1814,9 @@ pub fn descriptor_i2v_14b() -> ModelDescriptor {
             // off-GPU during denoise, dropping the unified-memory peak to ~one expert. Advertised so
             // the worker's fit-gate can tell "bounds peak here" from a no-op fallback.
             supports_sequential_offload: true,
+            // TE/VAE and the active expert are phase-staged even under Resident; Sequential adds the
+            // stronger cache-flush/expert-residency controls described above.
+            unconditionally_engages_staged_residency: true,
             supports_preview: false,
             supports_prompt_enhancement: false,
             supports_streaming: false,
@@ -1797,13 +1905,25 @@ mod tests {
     fn resolve_capped_dims_aligns_down_only() {
         // 14B aligns to patch.{1,2}·vae_stride.{1,2} = 2·8 = 16, so 130 → 128 on both axes.
         let cfg = WanModelConfig::wan22_t2v_14b();
-        assert_eq!(resolve_capped_dims(&req(130, 130), &cfg), (128, 128));
+        assert_eq!(
+            resolve_capped_dims(&req(130, 130), &cfg, A14bProviderVae::VAE_TILING),
+            (128, 128)
+        );
         // Already on-grid → unchanged.
-        assert_eq!(resolve_capped_dims(&req(128, 256), &cfg), (128, 256));
+        assert_eq!(
+            resolve_capped_dims(&req(128, 256), &cfg, A14bProviderVae::VAE_TILING),
+            (128, 256)
+        );
         // The 5B's z48 VAE gives a 32-px grid instead.
         let five_b = WanModelConfig::wan22_ti2v_5b();
-        assert_eq!(resolve_capped_dims(&req(720, 720), &five_b), (704, 704));
-        assert_eq!(resolve_capped_dims(&req(512, 512), &five_b), (512, 512));
+        assert_eq!(
+            resolve_capped_dims(&req(720, 720), &five_b, Ti2vProviderVae::VAE_TILING),
+            (704, 704)
+        );
+        assert_eq!(
+            resolve_capped_dims(&req(512, 512), &five_b, Ti2vProviderVae::VAE_TILING),
+            (512, 512)
+        );
     }
 
     #[test]
@@ -1844,7 +1964,10 @@ mod tests {
         let cfg = WanModelConfig::wan22_ti2v_5b();
         // The geometry `validate_impl` would have rejected passes through UNCHANGED (bar alignment)
         // rather than being silently refit to something the caller never asked for.
-        assert_eq!(resolve_capped_dims(&req(2048, 2048), &cfg), (2048, 2048));
+        assert_eq!(
+            resolve_capped_dims(&req(2048, 2048), &cfg, Ti2vProviderVae::VAE_TILING),
+            (2048, 2048)
+        );
         assert!(
             2048 * 2048 > cfg.max_area,
             "the guard belongs to validate, not to this function"
@@ -1852,7 +1975,10 @@ mod tests {
 
         // The 14B family's canonical 720p is at its cap and is a fixed point of the alignment.
         let a14b = WanModelConfig::wan22_i2v_14b();
-        assert_eq!(resolve_capped_dims(&req(1280, 720), &a14b), (1280, 720));
+        assert_eq!(
+            resolve_capped_dims(&req(1280, 720), &a14b, A14bProviderVae::VAE_TILING),
+            (1280, 720)
+        );
         assert_eq!(1280 * 720, a14b.max_area);
     }
 
@@ -1880,6 +2006,20 @@ mod tests {
             "the dense TI2V-5B must advertise sequential offload (sc-12796) — the staged TE/VAE \
              clear_cache flush bounds its unified-memory footprint"
         );
+    }
+
+    #[test]
+    fn all_registered_base_wan_variants_also_declare_unconditional_phase_staging() {
+        for descriptor in [descriptor(), descriptor_t2v_14b(), descriptor_i2v_14b()] {
+            assert_eq!(
+                descriptor.capabilities.staged_residency_availability(),
+                mlx_gen::StagedResidencyAvailability::UnconditionallyEngaged,
+                "{} must distinguish its always-staged physical path from the stronger selectable \
+                 Sequential controls it also supports",
+                descriptor.id
+            );
+            assert!(descriptor.capabilities.supports_sequential_offload);
+        }
     }
 
     /// sc-12736: the sc-4986 pre-flight denoise guard's expert-byte accounting must track the ACTUAL
@@ -1985,6 +2125,8 @@ mod tests {
             adapters: vec![],
             quant: None,
             offload_policy: OffloadPolicy::Resident,
+            memory_strategy: None,
+            memory_tier: None,
         }
     }
 
@@ -2063,15 +2205,24 @@ mod tests {
     fn pinned_stride_consts_match_the_enforced_lattice() {
         use crate::config::{SIZE_MULTIPLE, SIZE_MULTIPLE_14B};
         assert_eq!(
-            grid(&WanModelConfig::wan22_ti2v_5b()),
+            grid(
+                &WanModelConfig::wan22_ti2v_5b(),
+                Ti2vProviderVae::VAE_TILING
+            ),
             (SIZE_MULTIPLE, SIZE_MULTIPLE)
         );
         assert_eq!(
-            grid(&WanModelConfig::wan22_t2v_14b()),
+            grid(
+                &WanModelConfig::wan22_t2v_14b(),
+                A14bProviderVae::VAE_TILING
+            ),
             (SIZE_MULTIPLE_14B, SIZE_MULTIPLE_14B)
         );
         assert_eq!(
-            grid(&WanModelConfig::wan22_i2v_14b()),
+            grid(
+                &WanModelConfig::wan22_i2v_14b(),
+                A14bProviderVae::VAE_TILING
+            ),
             (SIZE_MULTIPLE_14B, SIZE_MULTIPLE_14B)
         );
     }
@@ -2443,6 +2594,8 @@ mod tests {
             adapters,
             quant: None,
             offload_policy: OffloadPolicy::Resident,
+            memory_strategy: None,
+            memory_tier: None,
         }
     }
 

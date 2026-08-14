@@ -98,6 +98,7 @@ pub fn descriptor() -> ModelDescriptor {
             supports_kv_cache: false,
             requires_sigma_shift: false,
             supports_sequential_offload: false,
+            unconditionally_engages_staged_residency: false,
             // Per-step latent previews (epic 16948, sc-16954): both lanes of this registered route
             // emit -- the curated driver lane and the native leading-Euler loop -- as do the
             // name-driven pose-control and IP-Adapter providers. Kolors adds no fit of its own; it
