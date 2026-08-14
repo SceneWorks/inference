@@ -82,7 +82,14 @@ for var in "$@"; do
   seen_paths[${#seen_paths[@]}]="$path"
   seen_owners[${#seen_owners[@]}]="$var"
 
-  if [[ ! -d "$path" ]]; then
+  if [[ -f "$path" ]]; then
+    # A SINGLE FILE, not a directory: `MINIMAX_H3_VIDEO_VAE_REFERENCE` (sc-18932) is the ~840 KB
+    # operator-produced diffusers decode reference. Without this arm the `! -d` test below reported
+    # a file that is present, readable and about to be consumed as "ABSENT — not present on this
+    # runner", which is worse than not reporting it: the one asset in that lane that cannot
+    # self-heal would look missing on every run that has it.
+    echo "$var: resident, $(du -shL "$path" 2>/dev/null | awk '{print $1}') (single file)"
+  elif [[ ! -d "$path" ]]; then
     # Only a Hugging Face cache path is self-healing. `MAGE_ORACLE_SEED_DIR` is the frozen
     # Torch oracle bundle that `real-weights.yml` says exists on no Hub and that this
     # workflow deliberately refuses to regenerate, so "materializes from the Hub" would be

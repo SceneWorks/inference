@@ -149,9 +149,27 @@
 //! trade — [`dit::heads`] reads those tensors with a raw `Weights::require`, which would load u32
 //! codes as floats with no error at all (sc-14980).
 //!
+//! ## LoRA adapters and the turbo alpha (sc-18724)
+//!
+//! - [`adapters`] carries the key→module map for the **diffusers** key space the lightx2v turbo
+//!   checkpoints publish, and the alpha resolution those checkpoints need: rank from the factor
+//!   shapes, alpha from the top-level `__metadata__`, and a fallback of **8** — upstream's
+//!   `DEFAULT_LORA_ALPHA` — rather than the rank.
+//!
+//! That fallback is the whole slice. `lightx2v/Minimax-h3-Turbo` stamps alpha as a bare
+//! `__metadata__` string with no `rank` key, no per-target `.alpha` and no `lora_adapter_metadata`
+//! blob, and **both** pre-existing in-tree alpha paths mishandle that silently: the PEFT one folds an
+//! `alpha=8, rank=128` file 16× too strong, `parse_rank_alpha` 128×. Alpha also differs *per file
+//! inside one repo* — 128 on the 4-step 768p export, 8 on the 8-step and ref2v ones, absent on
+//! `4step_v0.1` — so it is read from each file rather than pinned per family. Two further facts:
+//! 24 of each file's 624 tensors target the **token refiner**, which is a second reason it cannot be
+//! stubbed; and the `_comfyui_` twin of each file is a different model shape (fused `qkv_proj`,
+//! swapped SwiGLU halves), refused by name rather than half-applied.
+//!
 //! Not in this crate yet: either CNN encoder, `fl2va` conditioning (sc-17148), Ref2VA's
 //! `transformer_ref` (sc-17149) and sequential residency (sc-17151).
 
+pub mod adapters;
 pub mod alias_free;
 pub mod audio_config;
 pub mod audio_vae;
@@ -167,6 +185,7 @@ pub mod denoise;
 pub mod dit;
 pub mod keyframe;
 pub mod layout;
+pub mod memory_strategy;
 pub mod model;
 pub mod pipeline;
 pub mod quant;
@@ -178,6 +197,11 @@ pub mod text_encoder;
 pub mod vae;
 pub mod vae_encoder;
 
+pub use adapters::{
+    adapter_target_paths, alpha_rank_fold, apply_minimax_h3_adapters, is_comfyui_key_space,
+    normalize_minimax_h3_key, resolve_alpha, resolve_rank, MiniMaxH3LoraReport, ALPHA_METADATA_KEY,
+    BLOCK_TARGETS, DEFAULT_LORA_ALPHA, PREFIXES, RANK_METADATA_KEY,
+};
 pub use alias_free::{kaiser_sinc_filter1d, Activation1d, LowPassFilter1d, SnakeBeta, UpSample1d};
 pub use audio_config::{
     BigVganConfig, MiniMaxH3AudioVaeConfig, ACTIVATION_KERNEL_SIZE, ACTIVATION_RESAMPLE_RATIO,
@@ -265,10 +289,18 @@ pub const MODEL_ID: &str = "minimax_h3";
 pub const SIZE_MULTIPLE: u32 = VAE_RATIO as u32 * 2;
 
 /// Add the MLX MiniMax-H3 generator to an explicit media registry builder.
+///
+/// The three memory registrations join the ladder (sc-18659). `register_memory_strategy` errors at
+/// `build()` for an id with no matching generator, and the contract fixture and behavior seams error
+/// for an id with no matching memory strategy, so the four are wired together or not at all.
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
-    registry.register_generator(model::REGISTRATION)
+    registry
+        .register_generator(model::REGISTRATION)
+        .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(memory_strategy::MEMORY_CONTRACT_FIXTURE)
+        .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR)
 }
 
 /// Build the complete explicit MLX MiniMax-H3 provider catalog.

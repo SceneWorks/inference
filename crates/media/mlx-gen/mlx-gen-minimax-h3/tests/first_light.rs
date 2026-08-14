@@ -41,6 +41,10 @@ use common::snapshot;
 /// The gating canvas: the smallest sensible 32-aligned 16:9-ish frame. The spike measured this
 /// geometry at ~21-24 s/step; peak barely moves with canvas, so a bigger one buys nothing but
 /// wall-clock.
+///
+/// That flatness is the **conditioning** stage's high-water masking every later one
+/// (`mlx_gen_minimax_h3::memory_strategy::CONDITIONING_STAGE_PEAK_BYTES`), not a property of the
+/// denoise loop — so it must not be read as "canvas is free" once sc-19120 packs the text encoder.
 const WIDTH: u32 = 576;
 const HEIGHT: u32 = 320;
 
