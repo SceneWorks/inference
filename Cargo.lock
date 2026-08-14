@@ -751,6 +751,7 @@ name = "candle-gen-minimax-h3"
 version = "0.0.0"
 dependencies = [
  "candle-gen",
+ "sceneworks-gen-core-testkit",
  "serde_json",
  "tempfile",
 ]
@@ -2434,6 +2435,7 @@ dependencies = [
  "mlx-gen",
  "mlx-gen-boogu",
  "pmetal-mlx-rs",
+ "sceneworks-gen-core-testkit",
  "serde_json",
  "tempfile",
  "tokenizers 0.22.2",

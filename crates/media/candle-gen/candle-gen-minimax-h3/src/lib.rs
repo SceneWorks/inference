@@ -83,7 +83,9 @@
 //! The 3-D causal CNN video encoder (ported on the MLX side by sc-17148; the candle twin is a
 //! tracked follow-up), the Qwen3-VL-32B text encoder, the pipeline and measured `vramGbByTier`
 //! (sc-17156), and Ref2VA (sc-17157). Nothing is registered with `candle-gen-catalog` — there is no
-//! generator to ship until the pipeline lands, which is exactly the state of the MLX sibling.
+//! generator to ship until the pipeline lands. **The MLX sibling is not in this state**: it ships
+//! `model::REGISTRATION` and `mlx-gen-catalog` calls its `register_providers`, which is what lets
+//! its memory contract reach the registry while this crate's cannot (see [`register_providers`]).
 
 pub mod alias_free;
 pub mod audio_config;
@@ -95,6 +97,7 @@ pub mod decoder;
 pub mod denoise;
 pub mod dit;
 pub mod layout;
+pub mod memory_strategy;
 pub mod nn;
 pub mod rope;
 pub mod tensor;
@@ -138,6 +141,31 @@ pub const MODEL_ID: &str = "minimax_h3";
 
 /// Frame/pixel alignment the video decode implies — `VAE_RATIO` spatially.
 pub const SIZE_MULTIPLE: u32 = VAE_RATIO as u32;
+
+/// Add every provider this crate ships to an explicit registry builder — the sibling of
+/// `mlx_gen_minimax_h3::register_providers`, and **the exact function `candle-gen-catalog` will
+/// call** once there is something to call it for.
+///
+/// It registers the memory contract and its weights-free fixture and **no generator**, because this
+/// crate has none: sc-17156 owns the pipeline. A builder in that state cannot `build()` —
+/// `ProviderRegistryBuilder::build` rejects a memory-strategy registration whose `provider_id` has
+/// no matching generator — which is precisely why the catalog line is still absent, and why adding
+/// it today would break `candle_gen_catalog::provider_registry()` rather than wire anything up.
+///
+/// This function exists so that state is a **fact the tests can read off the crate's real
+/// registration inventory** rather than a claim in a comment:
+/// `memory_strategy::tests::a_generator_landing_here_forces_the_catalog_line` builds what this
+/// returns, and the moment a `.register_generator(…)` line joins it the build succeeds and that
+/// test demands the catalog line. Registering a generator straight from the catalog instead would
+/// leave [`memory_strategy::MEMORY_REGISTRATION`] unregistered, so the same test also fails if the
+/// catalog reaches this crate by any path while this function still ships no generator.
+pub fn register_providers(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(memory_strategy::MEMORY_CONTRACT_FIXTURE)
+}
 
 #[cfg(test)]
 mod tests {

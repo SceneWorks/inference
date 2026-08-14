@@ -580,10 +580,13 @@ fn the_default_canvas_is_bounded_by_area_not_by_duration() {
         "a 50-block forward cannot take {:.3} s",
         p.fastest_step()
     );
-    // Peak is load-bound at the gating canvas (a flat ~53 GB across the whole duration range). At
-    // the default canvas the activation transient is 5.3x larger, so this is where it would first
-    // show — and the measurement says whether the peak column of the table above generalizes to
-    // the canvas axis or only to the duration one.
+    // The flat ~53 GB across the whole duration range belongs to the **conditioning** stage: the
+    // dense text encoder runs before the DiT is mapped and sets the process high-water
+    // (`mlx_gen_minimax_h3::memory_strategy::CONDITIONING_STAGE_PEAK_BYTES`), so every later stage
+    // is masked. It is NOT an activation-dominated peak — that attribution was retracted
+    // (sc-18659). At the default canvas the activation transient is 5.3x larger, so this is the
+    // first place a denoise-side cost could out-grow that mask, and the measurement says whether
+    // the peak column of the table above generalizes to the canvas axis or only to the duration one.
     eprintln!(
         "  peak vs the gating canvas's flat ~53.1 GB: {:+.2} GB ({:+.1}%)",
         (p.peak_bytes as f64 - 53_070_000_000.0) / 1e9,
