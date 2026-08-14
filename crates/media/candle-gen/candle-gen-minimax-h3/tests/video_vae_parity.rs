@@ -774,3 +774,190 @@ fn a_different_rotary_fraction_breaks_parity() {
          not reaching the rotary"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Spatial tiling (sc-18786)
+// ---------------------------------------------------------------------------------------------
+//
+// `AutoencoderKLMiniMaxH3` ships with `use_tiling = True` and upstream is explicit that **the
+// released frames are the blended-tile ones, so disabling tiling changes the output**. sc-17154
+// decoded the whole canvas in one pass, which is the reference only below one 256 px tile.
+//
+// These are the *committed* gates — they run on every CI pass, without a snapshot. They cannot
+// prove the tiled numbers are right (only real weights against diffusers can, see
+// `real_weights.rs::real_weight_tiled_decode_matches_the_official_diffusers_vae`); what they prove
+// is that tiling is inert where the committed fixtures live, and that the new path is nevertheless
+// reachable and distinguishable rather than untested by construction.
+
+/// The fixture canvas is 6x8 px (a 3x4 latent at the fixture's 2x ratio) — far below one 256 px
+/// tile. So `decode_clip` with the shipped defaults must be **bit**-identical to the untiled path,
+/// which is what keeps every reference-backed decode assertion in this file valid across the
+/// tiling change.
+#[test]
+fn shipped_tiling_is_on_by_default_and_bit_inert_below_one_tile() {
+    let f = fixture();
+    let vae = vae(&f, 3);
+    let t = vae.tiling();
+    assert!(t.enabled, "the shipped VAE tiles by default");
+    assert_eq!((t.tile_height, t.tile_width), (256, 256));
+    assert_eq!((t.overlap_height, t.overlap_width), (64, 64));
+
+    let latent = f.tensor("in.decode.latent");
+    assert_eq!(latent.dims()[3..], [3, 4], "fixture latent is 3x4");
+
+    let tiled = vae.decode_clip(&latent).unwrap();
+    let untiled = vae.decode_clip_untiled(&latent).unwrap();
+    assert_eq!(tiled.dims(), untiled.dims());
+    assert_eq!(
+        flat(&tiled),
+        flat(&untiled),
+        "below one tile the tiled path must be BIT-identical"
+    );
+}
+
+/// The plan the fixture canvas takes at a shrunk tile, against the reference's own `_split_tiles`.
+///
+/// 6 px of height at a 4 px tile is 2 rows; 8 px of width is **3** columns, not 2 — two 4 px tiles
+/// at a 2 px overlap span only 6 px. The grid is deliberately non-square so a transposed plan is
+/// not accidentally correct.
+#[test]
+fn the_fixture_canvas_tiles_into_the_reference_grid() {
+    use candle_gen_minimax_h3::spatial_tiling::TilePlan;
+    let rows = TilePlan::split(6, 4, 2, 2).unwrap();
+    assert_eq!(rows.starts, vec![0, 2]);
+    assert_eq!(rows.lengths, vec![4, 4]);
+    assert_eq!(rows.overlaps, vec![2]);
+
+    let cols = TilePlan::split(8, 4, 2, 2).unwrap();
+    assert_eq!(
+        cols.starts,
+        vec![0, 2, 4],
+        "8 px at a 4/2 tile is three columns"
+    );
+    assert_eq!(cols.lengths, vec![4, 4, 4]);
+    assert_eq!(cols.overlaps, vec![2, 2]);
+    assert_eq!(cols.coverage(), 8);
+}
+
+/// **The tiled path is reachable and it changes the answer.** Without this, the tiling code could
+/// be a no-op — or never entered at all — and every other assertion in this file would still pass.
+/// That is exactly how sc-18740 shipped a broken FFN layout.
+///
+/// The decoder is a ViT whose attention is global over the whole clip, so a tile sees a strictly
+/// smaller context than the full canvas and cannot agree with it.
+#[test]
+fn a_tile_smaller_than_the_canvas_changes_the_decode() {
+    let f = fixture();
+    let vae = vae(&f, 3);
+    let latent = f.tensor("in.decode.latent");
+
+    let untiled = vae.decode_clip_untiled(&latent).unwrap();
+    let tiled = vae.decode_clip_tiled(&latent, 4, 4, 2, 2).unwrap();
+    assert_eq!(
+        tiled.dims(),
+        untiled.dims(),
+        "tiling must not change the shape"
+    );
+
+    let (peak, mean) = rel(&tiled, &untiled);
+    println!("SPATIAL TILING 4/2 vs untiled: rel-max-abs={peak:.3e} rel-mean-abs={mean:.3e}");
+    assert!(
+        peak > MUTATION_FLOOR,
+        "a 2x3 tile grid moved the decode by only {peak:.3e}; the tiled path is not being taken"
+    );
+}
+
+/// The `enable_tiling` / `disable_tiling` knobs select the paths they name.
+#[test]
+fn the_tiling_knobs_select_the_paths_they_name() {
+    use candle_gen_minimax_h3::spatial_tiling::SpatialTiling;
+    let f = fixture();
+    let latent = f.tensor("in.decode.latent");
+    let base = vae(&f, 3);
+    let untiled = flat(&base.decode_clip_untiled(&latent).unwrap());
+    let tiled = flat(&base.decode_clip_tiled(&latent, 4, 4, 2, 2).unwrap());
+    assert_ne!(tiled, untiled, "the two reference paths must differ");
+
+    let mut on = vae(&f, 3);
+    on.enable_tiling(Some(4), Some(4), Some(2), Some(2));
+    assert_eq!(flat(&on.decode_clip(&latent).unwrap()), tiled);
+
+    let mut off = vae(&f, 3);
+    off.enable_tiling(Some(4), Some(4), Some(2), Some(2));
+    off.disable_tiling();
+    assert!(!off.tiling().enabled);
+    assert_eq!(flat(&off.decode_clip(&latent).unwrap()), untiled);
+
+    let built = vae(&f, 3).with_tiling(SpatialTiling::disabled());
+    assert_eq!(flat(&built.decode_clip(&latent).unwrap()), untiled);
+    let built_on = vae(&f, 3).with_tiling(SpatialTiling::square(4, 2));
+    assert_eq!(flat(&built_on.decode_clip(&latent).unwrap()), tiled);
+}
+
+/// **The latent-alignment guard is reachable from the public API**, not merely declared on
+/// `TilePlan::split`.
+///
+/// `enable_tiling` takes pixel tile sizes, and `decode_clip_tiled` indexes the latent with
+/// `start / ratio` and `length / ratio`. At the fixture's ratio of 2 an odd tile or overlap would
+/// truncate every tile and stitch it with overlaps derived from the un-truncated size — a
+/// wrong-sized video and no error at all. Both clauses are probed separately so removing either
+/// one alone fails here, and the aligned geometry is decoded to show the guard is not simply
+/// rejecting everything.
+#[test]
+fn a_tile_geometry_the_latent_grid_cannot_express_is_refused() {
+    let f = fixture();
+    let latent = f.tensor("in.decode.latent");
+    assert_eq!(
+        fixture_config(3).patch_size,
+        2,
+        "this test's odd tile sizes are only misaligned at ratio 2"
+    );
+
+    // A misaligned TILE, at an aligned overlap.
+    let err = vae(&f, 3)
+        .decode_clip_tiled(&latent, 3, 4, 2, 2)
+        .expect_err("a 3 px tile is 1.5 latent cells and must be refused");
+    let msg = err.to_string();
+    assert!(msg.contains("2x spatial compression ratio"), "{msg}");
+    assert!(
+        msg.contains("silently truncated"),
+        "the error must say WHY: {msg}"
+    );
+
+    // A misaligned OVERLAP, at an aligned tile.
+    assert!(
+        vae(&f, 3).decode_clip_tiled(&latent, 4, 4, 1, 2).is_err(),
+        "a 1 px overlap is half a latent cell and must be refused"
+    );
+
+    // …and it reaches through `enable_tiling` / `decode_clip`, which is the surface a caller uses.
+    let mut misaligned = vae(&f, 3);
+    misaligned.enable_tiling(Some(3), Some(3), Some(2), Some(2));
+    assert!(misaligned.decode_clip(&latent).is_err());
+
+    // The aligned geometry still decodes, so the guard rejects the misalignment and nothing else.
+    assert!(vae(&f, 3).decode_clip_tiled(&latent, 4, 4, 2, 2).is_ok());
+}
+
+/// Tiling composes with the temporal chunking rather than replacing it: `decode` still produces the
+/// planned frame count at a canvas that tiles spatially.
+#[test]
+fn spatial_tiling_composes_with_the_temporal_chunk_plan() {
+    let f = fixture();
+    let mut vae = vae(&f, 3);
+    vae.enable_tiling(Some(4), Some(4), Some(2), Some(2));
+    let latent = f.tensor("in.temporal12.latent");
+    let want = f.tensor("out.temporal12.video");
+    let got = vae.decode(&latent).unwrap();
+    assert_eq!(
+        got.dims(),
+        want.dims(),
+        "the spatial grid must not disturb the temporal frame plan"
+    );
+    let (peak, _) = rel(&got, &want);
+    println!("TILED multi-chunk decode vs untiled golden: rel-max-abs={peak:.3e}");
+    assert!(
+        peak > MUTATION_FLOOR,
+        "the spatial grid was not applied under chunking"
+    );
+}

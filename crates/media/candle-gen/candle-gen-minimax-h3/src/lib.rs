@@ -100,6 +100,7 @@ pub mod layout;
 pub mod memory_strategy;
 pub mod nn;
 pub mod rope;
+pub mod spatial_tiling;
 pub mod tensor;
 pub mod vae;
 

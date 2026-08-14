@@ -29,11 +29,9 @@ use crate::blocks::blend;
 use crate::chunking::{TemporalGeometry, TemporalPlan};
 use crate::config::MiniMaxH3VaeConfig;
 use crate::decoder::ViT3dDecoder;
+use crate::spatial_tiling::{stitch_tiles, SpatialTiling, TilePlan};
 use crate::tensor::slice_axis;
-use crate::vae_encoder::{
-    stitch_tiles, DiagonalGaussian, TilePlan, VideoEncoder3d, TILE_SAMPLE_MIN_OVERLAP,
-    TILE_SAMPLE_MIN_SIZE,
-};
+use crate::vae_encoder::{DiagonalGaussian, VideoEncoder3d};
 
 /// Split a fused `to_qkv` tensor into the published checkpoint's `to_q`/`to_k`/`to_v`.
 ///
@@ -95,6 +93,9 @@ pub struct MiniMaxH3VideoVae {
     latents_std: Array,
     cfg: MiniMaxH3VaeConfig,
     dtype: Dtype,
+    /// `use_tiling` plus the four `tile_sample_min_*` knobs, shared by encode and decode exactly as
+    /// upstream shares them. Defaults to the shipped 256/64 with tiling **on**.
+    tiling: SpatialTiling,
 }
 
 impl MiniMaxH3VideoVae {
@@ -154,7 +155,44 @@ impl MiniMaxH3VideoVae {
             latents_std: Array::from_slice(&cfg.latents_std, &[1, c, 1, 1, 1]).as_dtype(dtype)?,
             cfg: cfg.clone(),
             dtype,
+            tiling: SpatialTiling::default(),
         })
+    }
+
+    /// The tiling knobs in force, for both halves.
+    pub fn tiling(&self) -> SpatialTiling {
+        self.tiling
+    }
+
+    /// The reference's `enable_tiling(...)`: turn spatial tiling on, overriding only what is given.
+    ///
+    /// Tiling is already on by default, so this is only needed to change the geometry or to undo a
+    /// [`Self::disable_tiling`].
+    pub fn enable_tiling(
+        &mut self,
+        tile_height: Option<i32>,
+        tile_width: Option<i32>,
+        overlap_height: Option<i32>,
+        overlap_width: Option<i32>,
+    ) {
+        self.tiling
+            .enable(tile_height, tile_width, overlap_height, overlap_width);
+    }
+
+    /// The reference's `disable_tiling()`.
+    ///
+    /// **This changes the output.** MiniMax-H3 was released with tiling enabled and the released
+    /// frames are the blended-tile ones, so an untiled decode is a different — not merely a
+    /// slower or larger — result at any canvas above one tile. It exists because the reference
+    /// exposes it and the parity tests need to demonstrate the difference.
+    pub fn disable_tiling(&mut self) {
+        self.tiling.disable();
+    }
+
+    /// Builder form of [`Self::enable_tiling`] / [`Self::disable_tiling`], for the fixtures.
+    pub fn with_tiling(mut self, tiling: SpatialTiling) -> Self {
+        self.tiling = tiling;
+        self
     }
 
     /// Every tensor name the VAE consumes — the exhaustive mapping over **both** halves. Any
@@ -236,7 +274,26 @@ impl MiniMaxH3VideoVae {
     /// behaviour, not an opt-in memory optimization. At a canvas no larger than one tile the plan
     /// degenerates to a single span and the result is bit-identical to an untiled encode.
     pub fn encode_clip(&self, pixels: &Array) -> Result<Array> {
-        self.encode_clip_tiled(pixels, TILE_SAMPLE_MIN_SIZE, TILE_SAMPLE_MIN_OVERLAP)
+        if !self.tiling.enabled {
+            return self.encode_clip_untiled(pixels);
+        }
+        // Encode and decode read the SAME knobs, because upstream has one `use_tiling` and one set
+        // of `tile_sample_min_*` shared by both halves. `fl2va` keyframe conditioning encodes
+        // through this path, so a caller that retunes tiling for decode retunes it for the
+        // conditioning encode too — which is upstream's behaviour, not an accident of this port.
+        self.encode_clip_tiled_2d(
+            pixels,
+            self.tiling.tile_height,
+            self.tiling.tile_width,
+            self.tiling.overlap_height,
+            self.tiling.overlap_width,
+        )
+    }
+
+    /// The encoder and `quant_conv` in ONE pass — the reference's `use_tiling = False` branch.
+    pub fn encode_clip_untiled(&self, pixels: &Array) -> Result<Array> {
+        let half = self.encode_half()?;
+        self.quant_conv(half, &half.encoder.forward(pixels)?)
     }
 
     /// [`Self::encode_clip`] at an explicit tile geometry.
@@ -251,6 +308,19 @@ impl MiniMaxH3VideoVae {
         tile_size: i32,
         min_overlap: i32,
     ) -> Result<Array> {
+        self.encode_clip_tiled_2d(pixels, tile_size, tile_size, min_overlap, min_overlap)
+    }
+
+    /// [`Self::encode_clip_tiled`] with the height and width geometry given separately, as the
+    /// reference's four `tile_sample_min_*` fields allow.
+    pub fn encode_clip_tiled_2d(
+        &self,
+        pixels: &Array,
+        tile_height: i32,
+        tile_width: i32,
+        overlap_height: i32,
+        overlap_width: i32,
+    ) -> Result<Array> {
         let half = self.encode_half()?;
         let s = pixels.shape();
         if s.len() != 5 {
@@ -260,8 +330,8 @@ impl MiniMaxH3VideoVae {
         }
         let (height, width) = (s[3], s[4]);
         let ratio = self.cfg.patch_size;
-        let rows = TilePlan::split(height, tile_size, min_overlap, ratio)?;
-        let cols = TilePlan::split(width, tile_size, min_overlap, ratio)?;
+        let rows = TilePlan::split(height, tile_height, overlap_height, ratio)?;
+        let cols = TilePlan::split(width, tile_width, overlap_width, ratio)?;
 
         let mut grid = Vec::with_capacity(rows.len());
         for (i, &y) in rows.starts.iter().enumerate() {
@@ -371,8 +441,118 @@ impl MiniMaxH3VideoVae {
         DiagonalGaussian::from_parameters(&out)
     }
 
-    /// `post_quant_conv` then the ViT decoder — the reference's `decode`, on ONE chunk.
+    /// `post_quant_conv` then the ViT decoder on ONE temporal clip, **spatially tiled** — the
+    /// reference's `_decode_clip`.
+    ///
+    /// Tiling is on by default in the shipped VAE
+    /// ([`crate::spatial_tiling::TILING_IS_ON_BY_DEFAULT`]), and upstream is explicit that **the
+    /// released frames are the blended-tile ones, so disabling tiling changes the output**. This is
+    /// therefore released behaviour, not an opt-in memory optimization: decoding the shipped
+    /// 1344×768 canvas in one pass differs from the reference over a 7×4 grid of tiles.
+    ///
+    /// At a canvas no larger than one tile the plan degenerates to a single full-length span and
+    /// the result is bit-identical to [`Self::decode_clip_untiled`] — which is why the sub-tile
+    /// fixtures committed for sc-17140/sc-18740 stayed valid across this change.
     pub fn decode_clip(&self, z: &Array) -> Result<Array> {
+        if !self.tiling.enabled {
+            return self.decode_clip_untiled(z);
+        }
+        self.decode_clip_tiled(
+            z,
+            self.tiling.tile_height,
+            self.tiling.tile_width,
+            self.tiling.overlap_height,
+            self.tiling.overlap_width,
+        )
+    }
+
+    /// [`Self::decode_clip`] at an explicit tile geometry, ignoring `use_tiling`.
+    ///
+    /// Production always uses the shipped 256/64. This exists because a fixture canvas large enough
+    /// to tile at 256 px would not be committable, so the parity fixtures shrink the tile geometry
+    /// to exercise **this same code path** at fixture scale — the alternative being a tiling
+    /// implementation that nothing gates. It mirrors [`Self::encode_clip_tiled`].
+    pub fn decode_clip_tiled(
+        &self,
+        z: &Array,
+        tile_height: i32,
+        tile_width: i32,
+        overlap_height: i32,
+        overlap_width: i32,
+    ) -> Result<Array> {
+        let s = z.shape();
+        if s.len() != 5 {
+            return Err(Error::Msg(format!(
+                "minimax-h3 vae: expected [B, C, T, H, W], got {s:?}"
+            )));
+        }
+        // **Tiles are laid out in PIXEL space and then mapped back onto the latent grid** — the
+        // tile size is a pixel quantity, so planning on the latent extent directly would tile at
+        // 16× the intended granularity.
+        let ratio = self.cfg.patch_size;
+        let rows = TilePlan::split(s[3] * ratio, tile_height, overlap_height, ratio)?;
+        let cols = TilePlan::split(s[4] * ratio, tile_width, overlap_width, ratio)?;
+
+        let mut grid = Vec::with_capacity(rows.len());
+        for (i, &y) in rows.starts.iter().enumerate() {
+            let mut row = Vec::with_capacity(cols.len());
+            for (j, &x) in cols.starts.iter().enumerate() {
+                // Each bound is divided SEPARATELY — `start / ratio` and `start / ratio +
+                // length / ratio` — exactly as the reference indexes. `(start + length) / ratio`
+                // is the same number for a latent-aligned geometry and a different one otherwise,
+                // and silently disagreeing with the reference on the ragged case is precisely the
+                // class of bug this port keeps finding.
+                let (y0, x0) = (y / ratio, x / ratio);
+                let tile = slice_axis(z, 3, y0, y0 + rows.lengths[i] / ratio)?;
+                let tile = slice_axis(&tile, 4, x0, x0 + cols.lengths[j] / ratio)?;
+                let decoded = self.decode_clip_untiled(&tile)?;
+                // Force each tile before starting the next, the same convention as the per-step
+                // `eval` in [`crate::denoise`]. MLX is lazily evaluated, so without this the whole
+                // grid is still one unevaluated graph when `stitch_tiles` forces it — but the
+                // evaluator's topological walk already frees per-tile transients as it goes, so
+                // this is a small genuine win rather than the difference between bounded and
+                // unbounded. Measured on the published weights in f32
+                // (`mlx_rs::memory::get_peak_memory`, forced): at the shipped 1344x768 canvas
+                // (28 tiles) the peak is **11.030 GiB with this eval and 11.126 GiB without**,
+                // against **13.617 GiB** for the single-pass decode this replaced; the same three,
+                // in that order, at 512x320 are **10.615 / 10.835 / 10.525**. So tiling lowers the
+                // decode peak at the shipped canvas either way, and the eval buys ~0.10 GiB (~1 %)
+                // on top of that — but at 512x320 tiling with this eval COSTS ~0.09 GiB against the
+                // single pass, which is the order of the six decoded 256 px tiles the grid holds
+                // until `stitch_tiles` consumes them (6 x [1, 3, 17, 256, 256] f32 = 0.07 GiB). The
+                // crossover therefore sits above 6 tiles and at or below 28, and is not measured
+                // here; tiling is kept regardless because it is what the reference does.
+                mlx_rs::transforms::eval([&decoded])?;
+                row.push(decoded);
+            }
+            grid.push(row);
+        }
+        // **The overlaps are used UNDIVIDED here**, unlike [`Self::encode_clip_tiled`], which
+        // divides them by `ratio`. The plan is in pixels either way; what differs is that a decoded
+        // tile comes back out in pixel space while an encoded one comes back in latent space.
+        // Dividing here would blend over a 16×-too-narrow seam AND trim 16× too little, so the
+        // stitched tensor comes out the wrong size: mutating the divide back in at the 512×320
+        // parity canvas returns [1, 3, 17, 752, 500] instead of [1, 3, 17, 512, 320].
+        stitch_tiles(&grid, &rows.overlaps, &cols.overlaps)
+    }
+
+    /// `post_quant_conv` then the ViT decoder in ONE pass over the whole canvas.
+    ///
+    /// This is the reference's `use_tiling = False` branch. It does **not** reproduce the released
+    /// frames above one tile; see [`Self::decode_clip`].
+    ///
+    /// # There is deliberately no `MAX_WRITABLE_ELEMS` guard here
+    ///
+    /// `heads · tokens²` at the shipped 1344×768 canvas is 1.30e10, 6.06× over
+    /// [`mlx_gen::tiling::MAX_WRITABLE_ELEMS`], and gating on it looks obviously right. It is the
+    /// trap [`crate::cost`] already documents for the DiT: **that tensor is never written.** This
+    /// attention takes MLX's fused `scaled_dot_product_attention` (head_dim 64, no mask — see
+    /// [`crate::blocks`]), which streams the scores. Measured: a probe at exactly `H=32,
+    /// N=20 160, D=64` peaks at 0.615 GiB where a materialized `[1, 32, 20160, 20160]` f32 would
+    /// be 48.4 GiB, and the real untiled 1344×768 decode completes at 13.617 GiB with plausible
+    /// output. A guard keyed to `heads · tokens²` would refuse a geometry MLX handles — and the
+    /// untiled/tiled A/B at the shipped canvas is exactly what sc-18660's memory work needs.
+    pub fn decode_clip_untiled(&self, z: &Array) -> Result<Array> {
         let s = z.shape();
         if s.len() != 5 {
             return Err(Error::Msg(format!(
