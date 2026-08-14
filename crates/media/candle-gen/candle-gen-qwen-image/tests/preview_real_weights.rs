@@ -642,6 +642,7 @@ fn control_fun_preview_frames_evolve_toward_the_final_image() {
     let model = QwenFunControl::load(&QwenFunControlPaths {
         qwen_base,
         controlnet,
+        adapters: Vec::new(),
     })
     .expect("load QwenFunControl");
 

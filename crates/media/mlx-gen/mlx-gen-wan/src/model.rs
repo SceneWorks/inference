@@ -166,6 +166,7 @@ pub fn descriptor() -> ModelDescriptor {
             // dead allocator cache between those already-staged phases.
             unconditionally_engages_staged_residency: true,
             supports_preview: false,
+            supports_prompt_enhancement: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
@@ -855,6 +856,7 @@ pub fn descriptor_t2v_14b() -> ModelDescriptor {
             // stronger cache-flush/expert-residency controls described above.
             unconditionally_engages_staged_residency: true,
             supports_preview: false,
+            supports_prompt_enhancement: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
@@ -1816,6 +1818,7 @@ pub fn descriptor_i2v_14b() -> ModelDescriptor {
             // stronger cache-flush/expert-residency controls described above.
             unconditionally_engages_staged_residency: true,
             supports_preview: false,
+            supports_prompt_enhancement: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,

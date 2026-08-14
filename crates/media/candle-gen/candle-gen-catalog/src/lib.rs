@@ -370,7 +370,7 @@ mod preview_advertising {
     ///
     /// Ideogram is also this table's first genuine `Denoise::Bespoke` **wired** crate: it drives no
     /// shared sampler anywhere, so it becomes visible below through a direct emission call rather than
-    /// through a hooked call site. That is the case `DIRECT_EMISSION_CALLS` was hardened for.
+    /// through a hooked call site. That is the case the direct-emission scanner was hardened for.
     ///
     /// `candle-gen-boogu` is deliberately absent, and its absence is a measurement rather than an
     /// omission: the epic groups it with FLUX.2, but it loads a plain 244-tensor **16-channel**
@@ -576,7 +576,8 @@ mod preview_advertising {
         /// The Wan **z16** space — `candle_gen_wan::vae16::WanVae16`, built from
         /// `Vae16Config::wan21()` (`z_dim: 16`, `base_dim: 96`, non-residual, no spatial patchify).
         /// **Never measured**; closed under the temporal program gate. Only `wan2_2_t2v_14b`,
-        /// `wan2_2_i2v_14b` and `wan_vace` occupy it inside `candle-gen-wan`; Bernini and Scail2
+        /// `wan2_2_i2v_14b`, `wan_vace`, and `wan2_2_vace_fun_14b` occupy it inside
+        /// `candle-gen-wan`; Bernini and Scail2
         /// build the same VAE from that crate, so they ride this row rather than any measured one.
         ///
         /// **Not** the 5B's space — see [`NoGo::WanZ48`]. `vae16.rs`'s own module docs enumerate three
@@ -734,6 +735,7 @@ mod preview_advertising {
         ("wan2_2_t2v_14b", NoGo::WanZ16),
         ("wan2_2_i2v_14b", NoGo::WanZ16),
         ("wan_vace", NoGo::WanZ16),
+        ("wan2_2_vace_fun_14b", NoGo::WanZ16),
         ("ltx_2_3_distilled", NoGo::Ltx),
         ("mochi_1", NoGo::Mochi),
         ("mage_flow", NoGo::Mage),
@@ -1242,19 +1244,17 @@ mod preview_advertising {
             // direct emission call rather than a driver argument.
             register: candle_gen_sensenova::register_providers,
             denoise: Denoise::Bespoke,
-            // sc-16960's inventory: ONE direct emission, in the registered T2I denoise loop that both
-            // ids reach through `T2iModel::generate`. No hooked site anywhere — there is no shared
-            // sampler call in this crate to hook, which is what `Denoise::Bespoke` above declares —
-            // and therefore no dark site either. `preview.rs` gets no row: it carries only the
+            // Two direct emissions live in `t2i.rs`: the registered T2I loop and the registered
+            // reference/MultiReference it2i loop. Both ids reach those routes through
+            // `T2iModel::{generate, it2i_generate}`; neither drives a shared sampler, which is
+            // what `Denoise::Bespoke` above declares. `preview.rs` gets no row: it carries only the
             // measured three-channel pixel-space fit and the pool to the token grid, so it neither
-            // drives a sampler nor emits. The crate's OTHER denoise loop, `it2i_denoise`, is the
-            // off-registry understanding surface (VQA / interleave), is advertised by no descriptor,
-            // and is deliberately unwired — `candle-gen-sensenova/src/preview.rs` pins that it holds
-            // no emission, which is what keeps this count at 1.
+            // drives a sampler nor emits. The understanding/VQA interleave entry point reuses the
+            // same it2i loop rather than adding a third emission site.
             routes: &[FileRoutes {
                 file: "t2i.rs",
                 hooked: 0,
-                direct: 1,
+                direct: 2,
                 dark: &[],
             }],
         },
@@ -1474,8 +1474,8 @@ mod preview_advertising {
     /// `emit_preview_at` are the free functions underneath. Listing only the free functions was the
     /// original hole — a bespoke loop written the canonical way was invisible, which would have hit
     /// SenseNova (sc-16960) and Ideogram (sc-16955), the two crates the constant exists for.
-    const DIRECT_EMISSION_CALLS: &[&str] =
-        &["emit_preview(", "emit_preview_at(", ".emit(", ".emit_step("];
+    const DIRECT_EMISSION_FUNCTION_CALLS: &[&str] = &["emit_preview(", "emit_preview_at("];
+    const DIRECT_EMISSION_METHOD_CALLS: &[(&str, usize)] = &[(".emit(", 4), (".emit_step(", 3)];
 
     /// One shared-sampler call site found in a provider crate's sources.
     struct SamplerSite {
@@ -2309,6 +2309,47 @@ mod preview_advertising {
         sites
     }
 
+    /// Count direct preview emissions without treating every unrelated `.emit(...)` method as a
+    /// preview. Free preview functions have unique names. Method calls must have both the canonical
+    /// preview receiver (`*hook*` / `*preview*`) and the exact `PreviewHook::{emit,emit_step}` arity.
+    /// This remains a lexical source guard, but it is tied to the actual preview call context rather
+    /// than to a generic Rust method name shared by request-local provenance sinks.
+    fn direct_emission_count(file: &str, code: &str) -> usize {
+        let mut count: usize = DIRECT_EMISSION_FUNCTION_CALLS
+            .iter()
+            .map(|call| code.matches(call).count())
+            .sum();
+        for &(call, arity) in DIRECT_EMISSION_METHOD_CALLS {
+            let mut cursor = 0usize;
+            while let Some(offset) = code[cursor..].find(call) {
+                let method_at = cursor + offset;
+                let receiver = method_receiver(&code[..method_at]);
+                let args_start = method_at + call.len();
+                let site = format!("{file}: {receiver}{call}");
+                let args = call_arguments(&site, &code[args_start..]);
+                if (receiver.contains("hook") || receiver.contains("preview"))
+                    && args.len() == arity
+                {
+                    count += 1;
+                }
+                cursor = args_start;
+            }
+        }
+        count
+    }
+
+    /// Last identifier before a method-call dot. The source is already stripped of comments and
+    /// literals; whitespace between receiver and dot is accepted.
+    fn method_receiver(before_dot: &str) -> &str {
+        let trimmed = before_dot.trim_end();
+        let start = trimmed
+            .char_indices()
+            .rev()
+            .find_map(|(index, ch)| (!ch.is_ascii_alphanumeric() && ch != '_').then_some(index + 1))
+            .unwrap_or(0);
+        &trimmed[start..]
+    }
+
     /// Read one provider crate's preview wiring out of its **shipped** module tree.
     ///
     /// Keyed on the directory rather than on a `ProviderCrate`, so the descriptor-less
@@ -2330,10 +2371,7 @@ mod preview_advertising {
         };
         for (relative, code) in &tree.shipped {
             wiring.sites.extend(sampler_sites(relative, code));
-            let count: usize = DIRECT_EMISSION_CALLS
-                .iter()
-                .map(|call| code.matches(call).count())
-                .sum();
+            let count = direct_emission_count(relative, code);
             if count > 0 {
                 wiring.direct.push(DirectEmission {
                     file: relative.clone(),
@@ -2645,7 +2683,7 @@ mod preview_advertising {
                     advertised.is_empty(),
                     "{} advertises supports_preview on {advertised:?} but nothing in its shipped \
                      sources emits: no sampler call site passes a preview hook and no bespoke loop \
-                     calls {DIRECT_EMISSION_CALLS:?}",
+                     calls the direct preview functions/methods",
                     provider.dir
                 );
             }
@@ -2904,6 +2942,18 @@ mod preview_advertising {
              assertion in this module would then be vacuously satisfied by a scanner that read \
              nothing"
         );
+    }
+
+    #[test]
+    fn direct_preview_scan_ignores_prompt_report_emit_but_counts_preview_context() {
+        let code = r#"
+            req.prompt_enhancement.emit(report);
+            hook.emit(&counter, &sigmas, sigma, &latents);
+            preview.emit_step(&counter, step, &state);
+            candle_gen::preview::emit_preview_at(&sink, &counter, step, || frame());
+            audit_hook.emit(one, two, three);
+        "#;
+        assert_eq!(direct_emission_count("synthetic.rs", code), 3);
     }
 
     /// Out-of-line `#[cfg(test)] mod NAME;` files are excluded from the scan.
@@ -3248,11 +3298,11 @@ mod preview_advertising {
             classified.difference(&registered).collect::<Vec<_>>()
         );
 
-        // The shape at sc-16961: 51 registered generators = 29 wired + 19 no-go + 3 deferred. This
-        // story moves the wired count by ZERO — it measures nothing and wires nothing.
+        // VACE-Fun occupies the already-settled Wan z16 no-go space: 52 registered generators =
+        // 29 wired + 20 no-go + 3 deferred.
         assert_eq!(
             (registered.len(), wired.len(), no_go.len(), deferred.len()),
-            (51, 29, 19, 3),
+            (52, 29, 20, 3),
             "moving a route between preview classes is a decision that must be written down here"
         );
     }
@@ -3577,6 +3627,7 @@ mod preview_advertising {
                 "wan2_2_t2v_14b",
                 "wan2_2_i2v_14b",
                 "wan_vace",
+                "wan2_2_vace_fun_14b",
                 "bernini_renderer",
                 "bernini",
                 "scail2_14b",
@@ -3759,6 +3810,8 @@ mod preview_advertising {
 
 #[cfg(test)]
 mod tests {
+    use candle_gen::gen_core::ConditioningKind;
+
     #[test]
     fn modelled_video_provider_ids_have_typed_vae_assignments() {
         let registry = super::provider_registry().unwrap();
@@ -3790,6 +3843,11 @@ mod tests {
             (
                 candle_gen_wan::config::MODEL_ID_VACE,
                 candle_gen_wan::WAN_Z16_VAE_TILING,
+                Some(265_830_400),
+            ),
+            (
+                candle_gen_wan::model_vace_fun::MODEL_ID_VACE_FUN,
+                candle_gen_wan::model_vace_fun::ProviderVae::VAE_TILING,
                 Some(265_830_400),
             ),
             (
@@ -3833,14 +3891,12 @@ mod tests {
         }
         assert_eq!(super::vae_tiling("ltx_2_3"), None);
         assert_eq!(super::vae_tiling(candle_gen_mochi::MODEL_ID), None);
-        assert_eq!(super::vae_tiling("wan2_2_vace_fun_14b"), None);
         assert_eq!(super::vae_tiling("krea_realtime_14b"), None);
         assert_eq!(super::vae_tiling("not_a_provider"), None);
         for provider_id in [
             "ltx_2_3",
             candle_gen_svd::config::MODEL_ID,
             candle_gen_mochi::MODEL_ID,
-            "wan2_2_vace_fun_14b",
             "krea_realtime_14b",
             "not_a_provider",
         ] {
@@ -3941,13 +3997,14 @@ mod tests {
             let capabilities = descriptor(id).capabilities;
             assert!(capabilities.supports_guidance, "{id}");
             assert!(!capabilities.supports_negative_prompt, "{id}");
-            assert!(
-                !capabilities.supports_true_cfg,
-                "{id} has no Candle reference/image-CFG path"
-            );
-            assert!(
-                capabilities.conditioning.is_empty(),
-                "{id} is Candle txt2img only"
+            assert!(capabilities.supports_true_cfg, "{id} image CFG");
+            assert_eq!(
+                capabilities.conditioning,
+                vec![
+                    ConditioningKind::Reference,
+                    ConditioningKind::MultiReference,
+                ],
+                "{id} registered conditioned-image surface"
             );
         }
     }
@@ -4039,6 +4096,7 @@ mod tests {
                 "wan2_2_t2v_14b",
                 "wan2_2_i2v_14b",
                 "wan_vace",
+                "wan2_2_vace_fun_14b",
                 "z_image_turbo",
                 "z_image",
             ]
@@ -4046,12 +4104,19 @@ mod tests {
         assert_eq!(
             trainers,
             [
+                "anima_base",
+                "kolors",
                 "krea_2_raw",
                 "krea_2_control",
                 "lens",
                 "ltx_2_3",
+                "mage_flow_base",
+                "sd3_5_large",
+                "sd3_5_medium",
                 "sdxl",
                 "wan2_2_t2v_14b",
+                "wan2_2_i2v_14b",
+                "wan2_2_ti2v_5b",
                 "z_image_turbo",
             ]
         );
@@ -4063,10 +4128,10 @@ mod tests {
         assert_eq!(text_embedders, ["clip_vit_l14_text"]);
 
         // sc-16667: the pinned surface and the model-weight licence mapping move together — this is
-        // where a surface change and a mapping change meet. Five of the seven trainer ids are also
-        // generator ids, which is why 51 + 7 + 1 + 2 registrations are 56 distinct ids.
+        // where a surface change and a mapping change meet. Twelve of the fourteen trainer ids are
+        // also generator ids, which is why 52 + 14 + 1 + 2 registrations are 57 distinct ids.
         //
-        // Registration is never conditioned on the mapping: 47 < 56 because nine ids load nothing
+        // Registration is never conditioned on the mapping: 48 < 57 because nine ids load nothing
         // the shared checkpoint table covers, and they ship exactly as before. That gap is a hole in
         // our metadata for CI to report, and `licenses::tests` pins which nine and why — as
         // `#[cfg(test)]` data, so no gate can read it and suppress them.
@@ -4077,8 +4142,8 @@ mod tests {
             .chain(&image_embedders)
             .chain(&text_embedders)
             .collect();
-        assert_eq!(distinct.len(), 56);
-        assert_eq!(super::provider_components().len(), 47);
+        assert_eq!(distinct.len(), 57);
+        assert_eq!(super::provider_components().len(), 48);
     }
 
     /// The manifest emitter runs on **this** catalog's three slices, and its output is

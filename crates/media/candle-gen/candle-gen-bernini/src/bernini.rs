@@ -566,8 +566,8 @@ pub fn descriptor() -> ModelDescriptor {
                 ConditioningKind::MultiReference,
                 ConditioningKind::VideoClip,
             ],
-            supports_lora: false,
-            supports_lokr: false,
+            supports_lora: true,
+            supports_lokr: true,
             samplers: vec!["uni_pc", "unipc"],
             schedulers: Vec::new(),
             supported_guidance_methods: vec![],
@@ -582,6 +582,7 @@ pub fn descriptor() -> ModelDescriptor {
             supports_sequential_offload: false,
             unconditionally_engages_staged_residency: false,
             supports_preview: false,
+            supports_prompt_enhancement: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
@@ -606,6 +607,7 @@ pub struct Bernini {
     knobs: BerniniKnobs,
     root: PathBuf,
     device: Device,
+    adapters: Vec<candle_gen::gen_core::AdapterSpec>,
     components: Mutex<Option<Arc<RendererComponents>>>,
 }
 
@@ -619,6 +621,7 @@ impl Bernini {
                 &self.root,
                 &self.device,
                 MODEL_ID,
+                &self.adapters,
             )?))
         })
     }
@@ -651,6 +654,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         knobs,
         root,
         device,
+        adapters: spec.adapters.clone(),
         components: Mutex::new(None),
     }))
 }

@@ -29,6 +29,9 @@ MACOS_HUB_LOCK = (
 WINDOWS_HUB_LOCK = (
     ".github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt"
 )
+WINDOWS_SCAIL_HUB_LOCK = (
+    ".github/requirements/real-weights-huggingface-hub-windows-x64-py314.txt"
+)
 WINDOWS_MAGE_LOCK = (
     ".github/requirements/real-weights-mage-verify-windows-x64-py312.txt"
 )
@@ -39,6 +42,7 @@ MACOS_INTERPRETER = "python3.12"
 APPROVED_REAL_WEIGHT_LOCKS = {
     MACOS_HUB_LOCK,
     WINDOWS_HUB_LOCK,
+    WINDOWS_SCAIL_HUB_LOCK,
     WINDOWS_MAGE_LOCK,
     MACOS_MAGE_LOCK,
 }
@@ -324,7 +328,14 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
     if not pip_lines:
         return ["real-weight workflow has no pip commands"]
 
-    install_lines: list[tuple[int, str, re.Match[str]]] = []
+    install_lines: list[tuple[int, str, str | None, re.Match[str]]] = []
+    current_job: str | None = None
+    job_at_line: dict[int, str | None] = {}
+    for line_number, line in enumerate(workflow.splitlines(), start=1):
+        job_match = re.fullmatch(r"  ([A-Za-z0-9_-]+):", line)
+        if job_match is not None:
+            current_job = job_match.group(1)
+        job_at_line[line_number] = current_job
     for line_number, command in pip_lines:
         first_pip = pip_token.search(command)
         assert first_pip is not None
@@ -335,10 +346,10 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
                 "single-line install"
             )
             continue
-        install_lines.append((line_number, command, match))
+        install_lines.append((line_number, command, job_at_line[line_number], match))
 
     locks_seen: list[str] = []
-    for line_number, command, install_match in install_lines:
+    for line_number, command, job, install_match in install_lines:
         prefix = f"line {line_number}"
         for required_flag in ("--only-binary=:all:", "--require-hashes"):
             if required_flag not in command:
@@ -363,7 +374,11 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
         elif f"{MACOS_INTERPRETER} -m pip" in command:
             expected_lock = MACOS_HUB_LOCK
         elif "python -m pip" in command:
-            expected_lock = WINDOWS_HUB_LOCK
+            expected_lock = (
+                WINDOWS_SCAIL_HUB_LOCK
+                if job == "candle-scail2-shared"
+                else WINDOWS_HUB_LOCK
+            )
         if expected_lock != lock:
             errors.append(
                 f"{prefix}: install target expects {expected_lock}, got {lock}"
@@ -395,6 +410,7 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
         # MOSS-TTS-Realtime jobs; 22 before).
         MACOS_HUB_LOCK: 29,
         WINDOWS_HUB_LOCK: 10,
+        WINDOWS_SCAIL_HUB_LOCK: 1,
         WINDOWS_MAGE_LOCK: 1,
         MACOS_MAGE_LOCK: 1,
     }
@@ -561,6 +577,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertEqual(real_weight_pip_policy_errors(workflow), [])
         self.assertEqual(workflow.count(MACOS_HUB_LOCK), 29)
         self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 10)
+        self.assertEqual(workflow.count(WINDOWS_SCAIL_HUB_LOCK), 1)
         self.assertEqual(workflow.count(WINDOWS_MAGE_LOCK), 1)
         self.assertNotRegex(
             workflow,
@@ -699,6 +716,12 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             ),
             HUB_LOCK_PACKAGES | {"colorama"},
         )
+        scail_windows = validate_binary_hashed_lock(
+            (REAL_WEIGHT_REQUIREMENTS / Path(WINDOWS_SCAIL_HUB_LOCK).name).read_text(
+                encoding="utf-8"
+            ),
+            HUB_LOCK_PACKAGES | {"colorama"},
+        )
         mage = validate_binary_hashed_lock(
             (REAL_WEIGHT_REQUIREMENTS / Path(WINDOWS_MAGE_LOCK).name).read_text(
                 encoding="utf-8"
@@ -707,8 +730,17 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         )
         self.assertEqual(macos["huggingface-hub"][0], "1.20.1")
         self.assertEqual(windows["huggingface-hub"][0], "1.20.1")
+        self.assertEqual(scail_windows["huggingface-hub"][0], "1.20.1")
+        self.assertEqual(scail_windows["hf-xet"][0], "1.6.0")
+        self.assertEqual(scail_windows["packaging"][0], "26.3")
         self.assertNotEqual(macos["hf-xet"][1], windows["hf-xet"][1])
         self.assertNotEqual(macos["pyyaml"][1], windows["pyyaml"][1])
+        self.assertNotEqual(windows["pyyaml"][1], scail_windows["pyyaml"][1])
+        scail_lock = (
+            REAL_WEIGHT_REQUIREMENTS / Path(WINDOWS_SCAIL_HUB_LOCK).name
+        ).read_text(encoding="utf-8")
+        self.assertIn("--platform win_amd64 --python-version 3.14", scail_lock)
+        self.assertIn("--implementation cp --abi cp314", scail_lock)
 
     def test_real_weight_lock_policy_discriminates_mutations(self) -> None:
         lock = (REAL_WEIGHT_REQUIREMENTS / Path(MACOS_HUB_LOCK).name).read_text(
@@ -894,6 +926,9 @@ class CiWorkflowPolicyTests(unittest.TestCase):
 
     def test_mage_media_lane_requires_verified_operator_cpu_oracles(self) -> None:
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        mage_job = workflow[
+            workflow.index("  mlx-media:") : workflow.index("\n  mlx-qwen-image:")
+        ]
         self.assertIn('MAGE_REQUIRE_GOLDENS: "1"', workflow)
         self.assertIn(
             'echo "MAGE_GOLDEN_DIR=$RUNNER_TEMP/mage-flow-oracles" >> "$GITHUB_ENV"',
@@ -912,7 +947,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             "UV_PYTHON_INSTALL_DIR: ${{ runner.temp }}/python-install",
             workflow,
         )
-        self.assertNotIn("uses: actions/setup-python", workflow)
+        self.assertNotIn("uses: actions/setup-python", mage_job)
         self.assertNotIn("3.12.11", workflow)
         self.assertIn("Run Mage-Flow text-encoder parity", workflow)
         self.assertIn("Run Mage-VAE all-geometry parity", workflow)
@@ -1351,6 +1386,133 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("z-image-turbo-model-inventory.json", job)
         self.assertIn("verifier-result.txt", job)
         self.assertIn("memory-evidence-v1-z-image-${{ github.sha }}", job)
+
+    def test_scail2_shared_cuda_lane_is_exact_revision_provider_exercised_and_measured(self) -> None:
+        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        start = workflow.index("  candle-scail2-shared:")
+        end = workflow.index("\n  candle-media:", start)
+        job = workflow[start:end]
+
+        self.assertIn("scail2", workflow.split("jobs:", 1)[0])
+        self.assertIn(
+            "if: github.event_name == 'workflow_dispatch' && inputs.profile == 'scail2'",
+            job,
+        )
+        self.assertNotIn("github.event_name == 'schedule'", job)
+        self.assertIn('SCAIL2_REPOSITORY: "SceneWorks/scail2-mlx"', job)
+        self.assertIn(
+            'SCAIL2_REVISION: "ce88cfdb1008f395e9c820e525e6db7b6695f7b3"', job
+        )
+        self.assertIn('allow_patterns=["bf16/**"]', job)
+        self.assertIn("models--SceneWorks--scail2-mlx", job)
+        git_bash = job.index("Select Git Bash")
+        validate_python = job.index("Validate runner-provisioned CPython 3.14 x64")
+        toolchain = job.index("uses: dtolnay/rust-toolchain@")
+        initialize_evidence = job.index("Initialize exact SCAIL CUDA evidence")
+        provision = job.index("Provision the exact public shared bf16 package")
+        self.assertLess(git_bash, toolchain)
+        self.assertLess(git_bash, initialize_evidence)
+        self.assertLess(initialize_evidence, validate_python)
+        self.assertLess(validate_python, toolchain)
+        self.assertLess(validate_python, provision)
+        self.assertLess(initialize_evidence, provision)
+        self.assertIn(r'C:\Program Files\Git\bin\bash.exe', job)
+        self.assertNotIn("actions/setup-python@", job)
+        self.assertNotIn("py -3.12", job)
+        self.assertIn("sys.implementation.name", job)
+        self.assertIn("platform.python_version()", job)
+        self.assertIn("platform.machine()", job)
+        self.assertIn("struct.calcsize('P') * 8", job)
+        self.assertIn("$python -notmatch '\\|cpython\\|3\\.14\\.\\d+\\|AMD64\\|64$'", job)
+        self.assertIn(WINDOWS_SCAIL_HUB_LOCK, job)
+        self.assertNotIn(WINDOWS_HUB_LOCK, job)
+        for required in (
+            "config.json",
+            "dit.safetensors",
+            "t5_encoder.safetensors",
+            "tokenizer.json",
+            "clip.safetensors",
+            "vae.safetensors",
+        ):
+            self.assertIn(required, job)
+        self.assertIn(
+            "pipeline::tests::shared_bf16_real_weights_cuda_loads_and_renders_with_measured_peak",
+            job,
+        )
+        self.assertIn("Load through the production provider", job)
+        self.assertIn("[[SCAIL2_CUDA_VRAM]]", job)
+        self.assertIn("-- --ignored --exact --nocapture", job)
+        self.assertIn('"provision_status=validating_python"', job)
+        self.assertIn('"provision_status=complete"', job)
+        # Windows PowerShell 5.1 promotes a successful native command's stderr
+        # (including Cargo build warnings) to NativeCommandError under Actions'
+        # stop-on-error wrapper. Keep PowerShell evidence capture on its valid
+        # FilePath parameter set, but run the Cargo profile through the selected
+        # Git Bash with pipefail so warnings are logged and real failures still
+        # propagate through tee.
+        profile_start = job.index(
+            "- name: Load through the production provider, minimally render, and measure the shared package"
+        )
+        profile_end = job.index("- name: Upload exact SCAIL CUDA evidence", profile_start)
+        profile = job[profile_start:profile_end]
+        self.assertIn("shell: bash", profile)
+        self.assertIn("set -o pipefail", profile)
+        self.assertIn(
+            'evidence_log="$(cygpath -u "$RUNNER_TEMP")/scail2-shared-cuda.log"',
+            profile,
+        )
+        self.assertIn('export PATH="$(cygpath -u "$CUDA_PATH")/bin:$PATH"', profile)
+        self.assertIn("cargo test --locked --release", profile)
+        self.assertIn('tee -a "$evidence_log"', profile)
+        self.assertNotIn("shell: powershell", profile)
+        self.assertNotIn("Tee-Object", profile)
+
+        def idle_evidence_errors(value: str) -> list[str]:
+            errors = []
+            for required in (
+                'profile_gpu="${CUDA_VISIBLE_DEVICES%%,*}"',
+                'profile_gpu="${profile_gpu:-0}"',
+                '[[CUDA_IDLE_RAW]] profileGpu=$profile_gpu',
+                "--query-gpu=index,name,driver_version,pstate,utilization.gpu,memory.used,memory.total",
+                "for _ in 1 2 3 4 5 6; do",
+                'nvidia-smi pmon -i "$profile_gpu" -c 1 -s um',
+            ):
+                if required not in value:
+                    errors.append(f"missing {required}")
+            if value.count('-i "$profile_gpu"') != 3:
+                errors.append("every raw GPU query must use the rendered physical ordinal")
+            return errors
+
+        self.assertEqual(idle_evidence_errors(profile), [])
+        for mutation, changed in {
+            "missing raw samples": profile.replace("for _ in 1 2 3 4 5 6; do", "for _ in 1; do"),
+            "missing process evidence": profile.replace(
+                'nvidia-smi pmon -i "$profile_gpu" -c 1 -s um', "echo pmon-omitted"
+            ),
+            "wrong process GPU": profile.replace(
+                'nvidia-smi pmon -i "$profile_gpu"', 'nvidia-smi pmon -i "0"'
+            ),
+            "missing evidence marker": profile.replace("[[CUDA_IDLE_RAW]]", "[[CUDA_IDLE_OMITTED]]"),
+        }.items():
+            with self.subTest(idle_evidence_mutation=mutation):
+                self.assertTrue(idle_evidence_errors(changed))
+        self.assertEqual(job.count("Tee-Object -FilePath $log -Append"), 3)
+        self.assertNotIn("Tee-Object -LiteralPath $log -Append", job)
+        self.assertIn("actions/upload-artifact@", job)
+        self.assertIn("scail2-shared-cuda-${{ github.sha }}", job)
+
+        for name, mutated_job in {
+            "py312 lock substitution": job.replace(
+                WINDOWS_SCAIL_HUB_LOCK, WINDOWS_HUB_LOCK, 1
+            ),
+            "shared macOS lock substitution": job.replace(
+                WINDOWS_SCAIL_HUB_LOCK, MACOS_HUB_LOCK, 1
+            ),
+            "unhashed install": job.replace(" --require-hashes", "", 1),
+        }.items():
+            with self.subTest(mutation=name):
+                mutated = workflow[:start] + mutated_job + workflow[end:]
+                self.assertTrue(real_weight_pip_policy_errors(mutated))
 
     def test_sana_drift_ceiling_lane_is_operator_dispatched_and_keeps_its_evidence(self) -> None:
         """sc-18249: the SANA 6.0 drift ceiling must be enforced by a lane a workflow can run.

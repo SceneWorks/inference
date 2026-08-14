@@ -610,6 +610,7 @@ version = "0.0.0"
 dependencies = [
  "candle-gen",
  "candle-gen-pid",
+ "candle-llm",
  "candle-transformers",
  "image",
  "rand",
@@ -738,6 +739,7 @@ dependencies = [
  "candle-transformers",
  "image",
  "rand",
+ "safetensors 0.7.0",
  "sceneworks-gen-core",
  "sceneworks-gen-core-testkit",
  "serde_json",
@@ -839,6 +841,7 @@ dependencies = [
  "safetensors 0.7.0",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "tempfile",
  "tokenizers 0.22.2",
 ]
 

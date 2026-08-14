@@ -1,11 +1,11 @@
-//! The candle **Wan2.2 A14B MoE LoRA/LoKr trainer** (sc-5167) — the candle twin of `mlx-gen-wan`'s
+//! The Candle **Wan2.2 LoRA trainer** — the Candle twin of `mlx-gen-wan`'s
 //! `WanMoeTrainer`, implementing the backend-neutral [`gen_core::Trainer`](candle_gen::gen_core::train::Trainer)
 //! with `backend = "candle"`. It retires the worker's Python torch `WanMoeLoraTrainer` (the dual-expert
 //! path of epic 5164) and reuses the shared [`candle_gen::train`] harness the SDXL/Z-Image stories
 //! established, building on [`crate::dit_train`]'s vendored trainable DiT.
 //!
-//! Registered under `"wan2_2_t2v_14b"` — the **T2V** A14B. (The I2V channel-concat conditioning and the
-//! dense 5B path — the latter blocked on a z48 VAE *encoder* port — are sc-5167 follow-ups.)
+//! Registered for dense TI2V-5B and both A14B MoE variants. T2V-A14B retains its established
+//! LoRA/LoKr contract; TI2V-5B and I2V-A14B are deliberately LoRA-only.
 //!
 //! ## Why Wan keeps a bespoke loop (sc-7787)
 //!
@@ -50,7 +50,7 @@ use candle_gen::gen_core::tokenizer::TextTokenizer;
 use candle_gen::gen_core::train::{
     Trainer, TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
 };
-use candle_gen::gen_core::{self, Image, LoadSpec, Modality, Progress, WeightsSource};
+use candle_gen::gen_core::{self, Image, LoadSpec, Modality, NetworkType, Progress, WeightsSource};
 use candle_gen::train::checkpoint::file_stem;
 use candle_gen::train::dataset::{bucket_resolution, load_image_tensor};
 use candle_gen::train::flow_match::{self, validate_flow_match_request, velocity_loss};
@@ -61,14 +61,16 @@ use candle_gen::train::schedule::schedule_updates;
 use candle_gen::{CandleError, Result};
 
 use crate::config::{
-    TextEncoderConfig, TransformerConfig, Vae16Config, MODEL_ID_T2V_14B, NUM_TRAIN_TIMESTEPS,
-    T2V_14B_BOUNDARY, T2V_14B_FLOW_SHIFT, VAE16_STRIDE_SPATIAL,
+    TextEncoderConfig, TransformerConfig, Vae16Config, VaeConfig, I2V_14B_BOUNDARY, MODEL_ID,
+    MODEL_ID_I2V_14B, MODEL_ID_T2V_14B, NUM_TRAIN_TIMESTEPS, T2V_14B_BOUNDARY, T2V_14B_FLOW_SHIFT,
+    VAE16_STRIDE_SPATIAL,
 };
 use crate::dit_train::{WanTransformerTrain, WAN_ATTN_TARGETS};
 use crate::pipeline::{create_noise, frames_to_images};
 use crate::rope::WanRope;
 use crate::scheduler::flow_sigmas;
 use crate::text_encoder::Umt5Encoder;
+use crate::vae::WanVae;
 use crate::vae16::WanVae16;
 
 /// Error-message prefix shared by [`validate_flow_match_request`] and the component-IO helpers.
@@ -93,8 +95,8 @@ fn sample_band_timestep(
 /// Which expert trains at `step` (1-based): odd steps → high-noise (`experts[0]`), even → low-noise
 /// (`experts[1]`). The two experts alternate so both accumulate roughly `steps/2` micro-steps.
 #[inline]
-fn expert_index(step: u32) -> usize {
-    if step % 2 == 1 {
+fn expert_index(step: u32, dual: bool) -> usize {
+    if !dual || step % 2 == 1 {
         0
     } else {
         1
@@ -111,8 +113,25 @@ fn expert_index(step: u32) -> usize {
 /// (sc-11157 / F-082). Advancing by the per-expert visit count instead makes each expert walk the
 /// full dataset in order (`0, 1, 2, …` cycling at `N`), independent of its parity.
 #[inline]
-fn expert_item_index(step: u32, cache_len: usize) -> usize {
-    (((step - 1) / 2) as usize) % cache_len
+fn expert_item_index(step: u32, dual: bool, cache_len: usize) -> usize {
+    let experts = if dual { 2 } else { 1 };
+    (((step - 1) / experts) as usize) % cache_len
+}
+
+#[inline]
+fn pending_micro_count(micro_steps: u32, configured: u32) -> Option<u32> {
+    let pending = micro_steps % configured.max(1);
+    (pending > 0).then_some(pending)
+}
+
+#[inline]
+fn use_checkpointed_backward(cfg: &TrainingConfig) -> bool {
+    cfg.gradient_checkpointing
+}
+
+#[inline]
+fn expert_schedule_inputs(steps: u32, expert_count: u32, warmup_steps: u32) -> (u32, u32) {
+    ((steps / expert_count.max(1)).max(1), warmup_steps)
 }
 
 /// One micro-step's forward+backward over one expert's installed adapter `Var`s: build the noised
@@ -141,9 +160,24 @@ fn compute_loss_grads(
     mae: bool,
     compute_dtype: DType,
     use_checkpoint: bool,
+    y_channels: usize,
 ) -> Result<(f32, GradStore)> {
     let (x_t, target) = flow_match::build_batch(x0, noise, t)?;
-    let x_t = x_t.to_dtype(compute_dtype)?;
+    let mut x_t = x_t.to_dtype(compute_dtype)?;
+    if y_channels > 0 {
+        // The still image is the clean training target, not a separate I2V source. Match the MLX
+        // trainer by zero-padding the inference-only source-conditioning channels: Wan LoRA targets
+        // attention projections downstream of patch embedding, so their trained surface is independent
+        // of these padded channels. A separately supplied `control_image_path` is rejected in
+        // `validate` and can therefore never be silently discarded here.
+        let (batch, _, frames, height, width) = x_t.dims5()?;
+        let zeros = Tensor::zeros(
+            (batch, y_channels, frames, height, width),
+            compute_dtype,
+            x_t.device(),
+        )?;
+        x_t = Tensor::cat(&[&x_t, &zeros], 1)?;
+    }
     // Text context + timestep are adapter-free constants the blocks consume.
     let ctx = dit.embed_text(umt5)?;
     let timestep = t * NUM_TRAIN_TIMESTEPS as f64;
@@ -197,6 +231,9 @@ fn encode_caption(
 
 /// Insert `.{suffix}` before the extension of `file_name` (`a.safetensors` → `a.high_noise.safetensors`).
 fn with_expert_suffix(file_name: &str, suffix: &str) -> String {
+    if suffix.is_empty() {
+        return file_name.to_string();
+    }
     match file_name.rsplit_once('.') {
         Some((stem, ext)) => format!("{stem}.{suffix}.{ext}"),
         None => format!("{file_name}.{suffix}"),
@@ -334,28 +371,106 @@ fn render_one_preview(
         .ok_or_else(|| CandleError::Msg("wan: preview decode yielded no frame".into()))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TrainVariant {
+    T2v14b,
+    I2v14b,
+    Ti2v5b,
+}
+
+impl TrainVariant {
+    fn id(self) -> &'static str {
+        match self {
+            Self::T2v14b => MODEL_ID_T2V_14B,
+            Self::I2v14b => MODEL_ID_I2V_14B,
+            Self::Ti2v5b => MODEL_ID,
+        }
+    }
+
+    fn descriptor(self) -> TrainerDescriptor {
+        TrainerDescriptor {
+            id: self.id(),
+            family: "wan",
+            backend: "candle",
+            modality: Modality::Video,
+            supports_lora: true,
+            supports_lokr: self == Self::T2v14b,
+            supports_control: false,
+            supports_full_finetune: false,
+        }
+    }
+
+    fn dit_config(self) -> TransformerConfig {
+        match self {
+            Self::T2v14b => TransformerConfig::t2v_14b(),
+            Self::I2v14b => TransformerConfig::i2v_14b(),
+            Self::Ti2v5b => TransformerConfig::ti2v_5b(),
+        }
+    }
+
+    fn dual(self) -> bool {
+        self != Self::Ti2v5b
+    }
+
+    fn latent_channels(self) -> usize {
+        if self == Self::Ti2v5b {
+            48
+        } else {
+            16
+        }
+    }
+
+    fn boundary(self) -> f64 {
+        match self {
+            Self::T2v14b => T2V_14B_BOUNDARY,
+            Self::I2v14b => I2V_14B_BOUNDARY,
+            Self::Ti2v5b => 0.0,
+        }
+    }
+}
+
+enum TrainVae {
+    Z16(WanVae16),
+    Z48(WanVae),
+}
+
+impl TrainVae {
+    fn load(variant: TrainVariant, root: &std::path::Path, device: &Device) -> Result<Self> {
+        let vb = flow_match::component_vb(root, "vae", device, DType::F32, LABEL)?;
+        Ok(match variant {
+            TrainVariant::Ti2v5b => Self::Z48(WanVae::new_with_encoder(&VaeConfig::ti2v_5b(), vb)?),
+            TrainVariant::T2v14b | TrainVariant::I2v14b => {
+                Self::Z16(WanVae16::new_with_encoder(&Vae16Config::wan21(), vb)?)
+            }
+        })
+    }
+
+    fn encode(&self, video: &Tensor) -> Result<Tensor> {
+        Ok(match self {
+            Self::Z16(vae) => vae.encode(video),
+            Self::Z48(vae) => vae.encode(video),
+        }?)
+    }
+}
+
 /// Identity + capabilities of the candle Wan A14B trainer: LoRA + LoKr, `backend = "candle"`.
 pub fn trainer_descriptor() -> TrainerDescriptor {
-    TrainerDescriptor {
-        id: MODEL_ID_T2V_14B,
-        family: "wan",
-        backend: "candle",
-        modality: Modality::Video,
-        supports_lora: true,
-        supports_lokr: true,
-        // sc-10894 lockstep catch-up: gen-core gained `TrainerDescriptor.supports_control` (mirrors
-        // mlx-gen-wan's `false`).
-        supports_control: false,
-        // Adapter-only: no full base fine-tune path (sc-14056). The shared
-        // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
-        supports_full_finetune: false,
-    }
+    TrainVariant::T2v14b.descriptor()
+}
+
+pub fn trainer_descriptor_i2v_14b() -> TrainerDescriptor {
+    TrainVariant::I2v14b.descriptor()
+}
+
+pub fn trainer_descriptor_ti2v_5b() -> TrainerDescriptor {
+    TrainVariant::Ti2v5b.descriptor()
 }
 
 /// A loaded candle Wan A14B (T2V) MoE trainer. Loading is **lazy** — the heavy VAE / text-encoder / two
 /// experts are built inside [`train`](Trainer::train) at the request's compute dtype.
 pub struct WanMoeTrainer {
     descriptor: TrainerDescriptor,
+    variant: TrainVariant,
     root: PathBuf,
     device: Device,
 }
@@ -363,26 +478,116 @@ pub struct WanMoeTrainer {
 /// Construct the (lazy) candle Wan A14B trainer from a [`LoadSpec`] whose `weights` is the A14B snapshot
 /// directory (`tokenizer/ text_encoder/ transformer/ transformer_2/ vae/`).
 pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
-    let root =
-        match &spec.weights {
-            WeightsSource::Dir(p) => p.clone(),
-            WeightsSource::File(_) => return Err(CandleError::Msg(
-                "wan2_2_t2v_14b trainer expects a snapshot directory (tokenizer/ text_encoder/ \
-                 transformer/ transformer_2/ vae/), not a single .safetensors file"
-                    .into(),
-            )),
-        };
+    load_variant(spec, TrainVariant::T2v14b)
+}
+
+pub fn load_trainer_i2v_14b(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
+    load_variant(spec, TrainVariant::I2v14b)
+}
+
+pub fn load_trainer_ti2v_5b(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
+    load_variant(spec, TrainVariant::Ti2v5b)
+}
+
+fn load_variant(spec: &LoadSpec, variant: TrainVariant) -> Result<Box<dyn Trainer>> {
+    let root = match &spec.weights {
+        WeightsSource::Dir(p) => p.clone(),
+        WeightsSource::File(_) => {
+            return Err(CandleError::Msg(format!(
+                "{} trainer expects a snapshot directory, not a single .safetensors file",
+                variant.id()
+            )))
+        }
+    };
+    if spec.quantize.is_some() {
+        return Err(CandleError::Msg(format!(
+            "{} trainer requires dense weights; explicit quantization is unsupported",
+            variant.id()
+        )));
+    }
+    let components: &[&str] = if variant.dual() {
+        &["transformer", "transformer_2"]
+    } else {
+        &["transformer"]
+    };
+    for component in components {
+        if packed_component(&root, component)? {
+            return Err(CandleError::Msg(format!(
+                "{} trainer requires dense weights; {component} is physically packed/quantized",
+                variant.id()
+            )));
+        }
+    }
     Ok(Box::new(WanMoeTrainer {
-        descriptor: trainer_descriptor(),
+        descriptor: variant.descriptor(),
+        variant,
         root,
         device: candle_gen::default_device()?,
     }))
+}
+
+fn packed_component(root: &std::path::Path, component: &str) -> Result<bool> {
+    let component_dir = root.join(component);
+    let config_path = component_dir.join("config.json");
+    let bytes = match std::fs::read(&config_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => {
+            return Err(CandleError::Msg(format!(
+                "{LABEL}: read {}: {error}",
+                config_path.display()
+            )))
+        }
+    };
+    if !bytes.is_empty() {
+        let config: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+            CandleError::Msg(format!("{LABEL}: parse {}: {error}", config_path.display()))
+        })?;
+        if candle_gen::quant::PackedConfig::from_config(&config).is_some() {
+            return Ok(true);
+        }
+    }
+    if !component_dir.is_dir() {
+        return Ok(false);
+    }
+    for entry in std::fs::read_dir(&component_dir).map_err(|error| {
+        CandleError::Msg(format!(
+            "{LABEL}: read {}: {error}",
+            component_dir.display()
+        ))
+    })? {
+        let path = entry
+            .map_err(|error| CandleError::Msg(format!("{LABEL}: read directory entry: {error}")))?
+            .path();
+        if path.extension().and_then(|value| value.to_str()) != Some("safetensors") {
+            continue;
+        }
+        // SAFETY: header-only, read-only mapping of a process-owned checkpoint file.
+        let tensors =
+            unsafe { candle_gen::candle_core::safetensors::MmapedSafetensors::new(&path)? };
+        if tensors
+            .tensors()
+            .into_iter()
+            .any(|(name, _)| name.ends_with(".scales"))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 // `register_trainer!` defines the explicit trainer constant and bridges the crate's rich `Result`
 // into `gen_core::Result` via `Into::into`.
 candle_gen::register_trainer! {
     pub(crate) const TRAINER_REGISTRATION = trainer_descriptor => load_trainer
+}
+candle_gen::register_trainer! {
+    pub(crate) const I2V_14B_TRAINER_REGISTRATION =
+        trainer_descriptor_i2v_14b => load_trainer_i2v_14b
+}
+candle_gen::register_trainer! {
+    pub(crate) const TI2V_5B_TRAINER_REGISTRATION =
+        trainer_descriptor_ti2v_5b => load_trainer_ti2v_5b
 }
 
 impl Trainer for WanMoeTrainer {
@@ -394,7 +599,39 @@ impl Trainer for WanMoeTrainer {
         // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
         // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA
         // adapter the caller did not ask for (F-006/F-055).
+        gen_core::train::validate_control_request(self.descriptor(), req)?;
         gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
+        if !self.descriptor.supports_lokr && req.config.network_type == NetworkType::Lokr {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{} trainer is LoRA-only",
+                self.variant.id()
+            )));
+        }
+        if req.config.resume {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{} trainer does not yet support resume",
+                self.variant.id()
+            )));
+        }
+        if req
+            .items
+            .iter()
+            .any(|item| item.control_image_path.is_some())
+        {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{} trainer does not consume per-item control/source images",
+                self.variant.id()
+            )));
+        }
+        if self.variant != TrainVariant::T2v14b
+            && req.config.sample_every > 0
+            && !req.config.sample_prompts.is_empty()
+        {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{} trainer does not support in-training previews",
+                self.variant.id()
+            )));
+        }
         validate_flow_match_request(req, LABEL).map_err(Into::into)
     }
 
@@ -403,6 +640,7 @@ impl Trainer for WanMoeTrainer {
         req: &TrainingRequest,
         on_progress: &mut dyn FnMut(TrainingProgress),
     ) -> gen_core::Result<TrainingOutput> {
+        self.validate(req)?;
         self.train_impl(req, on_progress).map_err(Into::into)
     }
 }
@@ -419,15 +657,14 @@ impl WanMoeTrainer {
         on_progress(TrainingProgress::Preparing);
         let edge = bucket_resolution(cfg.resolution);
         let compute_dtype = flow_match::parse_compute_dtype(&cfg.train_dtype);
-        let dit_cfg = TransformerConfig::t2v_14b();
+        let variant = self.variant;
+        let dit_cfg = variant.dit_config();
+        let dual = variant.dual();
+        let y_channels = dit_cfg.in_channels - variant.latent_channels();
 
         // --- load + cache: z16 VAE latent means + UMT5 caption embeds (both f32) ---
         on_progress(TrainingProgress::LoadingModel);
-        let vae_cfg = Vae16Config::wan21();
-        let vae = WanVae16::new_with_encoder(
-            &vae_cfg,
-            flow_match::component_vb(&self.root, "vae", device, DType::F32, LABEL)?,
-        )?;
+        let vae = TrainVae::load(variant, &self.root, device)?;
         let te_cfg = TextEncoderConfig::umt5_xxl();
         // Load the UMT5 encoder at bf16 for caching (11 GB vs 22 GB at f32) — it only produces the
         // cached caption embeds (kept f32 in the cache), and is dropped before the experts load.
@@ -481,7 +718,7 @@ impl WanMoeTrainer {
                 // Resident DECODE-ONLY z16 VAE (the cache VAE carried the encoder for latent caching; the
                 // preview path needs only the decoder). Loaded f32, like inference's VAE.
                 let preview_vae = WanVae16::new(
-                    &vae_cfg,
+                    &Vae16Config::wan21(),
                     flow_match::component_vb(&self.root, "vae", device, DType::F32, LABEL)?,
                 )?;
                 Some(WanSampleState {
@@ -516,19 +753,25 @@ impl WanMoeTrainer {
         let accum = cfg.gradient_accumulation.max(1);
         let weight_decay = flow_match::effective_weight_decay(cfg);
         let mae = flow_match::is_mae(cfg);
-        let boundary = T2V_14B_BOUNDARY;
-
-        // odd steps → high (≈ ceil(steps/2) micro-steps), even → low (≈ floor(steps/2)).
-        let high_micro = cfg.steps.div_ceil(2);
-        let low_micro = cfg.steps / 2;
-        let mut experts: Vec<ExpertState> = Vec::with_capacity(2);
-        for (idx, (sub, suffix, band, micro)) in [
-            ("transformer", "high_noise", (boundary, 1.0), high_micro),
-            ("transformer_2", "low_noise", (0.0, boundary), low_micro),
-        ]
-        .into_iter()
-        .enumerate()
-        {
+        let boundary = variant.boundary();
+        let plans = if dual {
+            vec![
+                (
+                    "transformer",
+                    "high_noise",
+                    (boundary, 1.0),
+                    cfg.steps.div_ceil(2),
+                ),
+                ("transformer_2", "low_noise", (0.0, boundary), cfg.steps / 2),
+            ]
+        } else {
+            vec![("transformer", "", (0.0, 1.0), cfg.steps)]
+        };
+        let expert_count = plans.len() as u32;
+        let (expert_schedule_micro, expert_warmup) =
+            expert_schedule_inputs(cfg.steps, expert_count, cfg.lr_warmup_steps);
+        let mut experts: Vec<ExpertState> = Vec::with_capacity(plans.len());
+        for (idx, (sub, suffix, band, _micro)) in plans.into_iter().enumerate() {
             let mut dit = WanTransformerTrain::new(
                 &dit_cfg,
                 flow_match::component_vb(&self.root, sub, device, compute_dtype, LABEL)?,
@@ -545,7 +788,7 @@ impl WanMoeTrainer {
                 weight_decay,
             )?;
             let (total_updates, warmup_updates) =
-                schedule_updates(micro.max(1), accum, cfg.lr_warmup_steps / 2);
+                schedule_updates(expert_schedule_micro, accum, expert_warmup);
             experts.push(ExpertState {
                 dit,
                 set,
@@ -561,19 +804,20 @@ impl WanMoeTrainer {
         }
 
         // --- train loop (alternating experts) ---
-        // The 14B experts' dense backward is infeasible (candle materializes a grad for every frozen
-        // base weight too), so training always uses the gradient-checkpointed backward.
-        let use_checkpoint = true;
+        // Checkpointing is strictly request-controlled. Production 14B runs should opt in because
+        // Candle's dense backward materializes frozen-base gradients, but a false flag must retain
+        // the dense kernel rather than silently changing the requested execution semantics.
+        let use_checkpoint = use_checkpointed_backward(cfg);
         let mut last_loss = 0.0f32;
         let mut steps_run = 0u32;
         for step in 1..=cfg.steps {
             if req.cancel.is_cancelled() {
                 break;
             }
-            let ei = expert_index(step); // odd → high (experts[0]), even → low
-                                         // Index by the expert's own visit count, not the raw step — else on an even-sized
-                                         // dataset each expert stays parity-locked to a disjoint half (sc-11157 / F-082).
-            let (x0, cap) = &cache[expert_item_index(step, cache.len())];
+            let ei = expert_index(step, dual); // dual: odd → high; dense: the single expert
+                                               // Index by the expert's own visit count, not the raw step — else on an even-sized
+                                               // dataset each expert stays parity-locked to a disjoint half (sc-11157 / F-082).
+            let (x0, cap) = &cache[expert_item_index(step, dual, cache.len())];
             let band = experts[ei].band;
             let t = sample_band_timestep(
                 &cfg.timestep_type,
@@ -598,6 +842,7 @@ impl WanMoeTrainer {
                 mae,
                 compute_dtype,
                 use_checkpoint,
+                y_channels,
             )?;
             last_loss = loss;
             steps_run = step;
@@ -679,7 +924,9 @@ impl WanMoeTrainer {
         // Flush any expert's pending (sub-`accum`) accumulation so the final partial step is applied.
         for ex in &mut experts {
             if ex.accumulated.is_some() {
-                apply_update(ex, accum, cfg)?;
+                let pending = pending_micro_count(ex.micro, accum)
+                    .expect("an accumulated tail has at least one pending micro-step");
+                apply_update(ex, pending, cfg)?;
             }
         }
 
@@ -692,12 +939,12 @@ impl WanMoeTrainer {
                 .output_dir
                 .join(with_expert_suffix(&req.file_name, ex.suffix));
             flow_match::save_adapter(&ex.set, &HashMap::new(), &path)?;
-            if ex.suffix == "high_noise" {
+            if ex.suffix == "high_noise" || ex.suffix.is_empty() {
                 primary = Some(path);
             }
         }
         Ok(TrainingOutput {
-            adapter_path: primary.expect("the high-noise expert is always present"),
+            adapter_path: primary.expect("a trained expert is always present"),
             steps: steps_run,
             final_loss: last_loss,
         })
@@ -707,12 +954,12 @@ impl WanMoeTrainer {
 /// Fire one optimizer update for `ex`: delegates the average-clip-step to the shared
 /// [`flow_match::apply_update`] (over `ex`'s own optimizer/accumulation/schedule), then advances the
 /// expert's update counter.
-fn apply_update(ex: &mut ExpertState, accum: u32, cfg: &TrainingConfig) -> Result<()> {
+fn apply_update(ex: &mut ExpertState, micro_count: u32, cfg: &TrainingConfig) -> Result<()> {
     flow_match::apply_update(
         &mut ex.opt,
         &mut ex.accumulated,
         &ex.set,
-        accum,
+        micro_count,
         cfg,
         ex.update_idx,
         ex.total_updates,
@@ -726,6 +973,7 @@ fn apply_update(ex: &mut ExpertState, accum: u32, cfg: &TrainingConfig) -> Resul
 mod tests {
     use super::*;
     use candle_gen::candle_nn::{VarBuilder, VarMap};
+    use candle_gen::gen_core::Quant;
     use candle_gen::train::lora::build_lora_targets;
     use candle_gen::train::optim::clip_grad_norm;
 
@@ -746,6 +994,119 @@ mod tests {
             eps: 1e-6,
             rope_theta: 10000.0,
             rope_max_seq_len: 1024,
+        }
+    }
+
+    fn tiny_i2v_cfg() -> TransformerConfig {
+        TransformerConfig {
+            in_channels: 36,
+            out_channels: 16,
+            ..tiny_cfg()
+        }
+    }
+
+    #[test]
+    fn nondivisible_accumulation_uses_each_experts_actual_tail_count() {
+        assert_eq!(pending_micro_count(5, 4), Some(1), "single-expert tail");
+        assert_eq!(
+            pending_micro_count(4, 4),
+            None,
+            "complete windows have no tail"
+        );
+
+        let mut visits = [0u32; 2];
+        for step in 1..=10 {
+            visits[expert_index(step, true)] += 1;
+        }
+        assert_eq!(visits, [5, 5]);
+        assert_eq!(pending_micro_count(visits[0], 2), Some(1));
+        assert_eq!(pending_micro_count(visits[1], 2), Some(1));
+    }
+
+    #[test]
+    fn checkpoint_kernel_selection_is_strictly_opt_in_for_all_wan_training_cells() {
+        for (variant, network) in [
+            (TrainVariant::Ti2v5b, NetworkType::Lora),
+            (TrainVariant::I2v14b, NetworkType::Lora),
+            (TrainVariant::T2v14b, NetworkType::Lora),
+            (TrainVariant::T2v14b, NetworkType::Lokr),
+        ] {
+            let mut config = TrainingConfig {
+                network_type: network,
+                ..Default::default()
+            };
+            assert!(
+                !use_checkpointed_backward(&config),
+                "{variant:?} {network:?}"
+            );
+            config.gradient_checkpointing = true;
+            assert!(
+                use_checkpointed_backward(&config),
+                "{variant:?} {network:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dual_experts_share_the_mlx_floor_divided_schedule_and_full_warmup() {
+        assert_eq!(expert_schedule_inputs(21, 2, 7), (10, 7));
+        assert_eq!(expert_schedule_inputs(1, 2, 3), (1, 3));
+        let high = schedule_updates(10, 2, 7);
+        let low = schedule_updates(10, 2, 7);
+        assert_eq!(high, low);
+        assert_eq!(high, (5, 4));
+        assert!(
+            (candle_gen::train::schedule::lr_multiplier(
+                candle_gen::gen_core::train::LrSchedule::Constant,
+                0,
+                high.0,
+                high.1,
+            ) - 0.2)
+                .abs()
+                < 1e-6
+        );
+    }
+
+    #[test]
+    fn load_rejects_explicit_and_physical_packed_experts_before_training() {
+        let empty = tempfile::tempdir().unwrap();
+        let mut explicit = LoadSpec::new(WeightsSource::Dir(empty.path().into()));
+        explicit.quantize = Some(Quant::Q8);
+        assert!(load_variant(&explicit, TrainVariant::Ti2v5b)
+            .err()
+            .expect("explicit quantization must be rejected")
+            .to_string()
+            .contains("explicit quantization"));
+
+        for (variant, component, config_marker) in [
+            (TrainVariant::Ti2v5b, "transformer", true),
+            (TrainVariant::I2v14b, "transformer_2", false),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join(component);
+            std::fs::create_dir_all(&dir).unwrap();
+            if config_marker {
+                std::fs::write(
+                    dir.join("config.json"),
+                    r#"{"quantization":{"bits":8,"group_size":64}}"#,
+                )
+                .unwrap();
+            } else {
+                candle_gen::candle_core::safetensors::save(
+                    &HashMap::from([(
+                        "blocks.0.attn.to_q.scales".to_string(),
+                        Tensor::zeros(1, DType::F32, &Device::Cpu).unwrap(),
+                    )]),
+                    dir.join("model.safetensors"),
+                )
+                .unwrap();
+            }
+            let spec = LoadSpec::new(WeightsSource::Dir(root.path().into()));
+            let error = load_variant(&spec, variant)
+                .err()
+                .expect("physical packed expert must be rejected")
+                .to_string();
+            assert!(error.contains(component), "{variant:?}: {error}");
         }
     }
 
@@ -855,8 +1216,8 @@ mod tests {
             let mut hi_seen = std::collections::BTreeSet::new();
             let mut lo_seen = std::collections::BTreeSet::new();
             for step in 1..=steps {
-                let idx = expert_item_index(step, n);
-                match expert_index(step) {
+                let idx = expert_item_index(step, true, n);
+                match expert_index(step, true) {
                     0 => hi_seen.insert(idx),
                     _ => lo_seen.insert(idx),
                 };
@@ -881,8 +1242,8 @@ mod tests {
     fn even_dataset_expert_is_not_parity_locked() {
         let n = 10usize;
         let mut hi_indices = Vec::new();
-        for step in (1..=(4 * n as u32)).filter(|s| expert_index(*s) == 0) {
-            hi_indices.push(expert_item_index(step, n));
+        for step in (1..=(4 * n as u32)).filter(|s| expert_index(*s, true) == 0) {
+            hi_indices.push(expert_item_index(step, true, n));
         }
         assert!(
             hi_indices.iter().any(|i| i % 2 == 1),
@@ -924,6 +1285,7 @@ mod tests {
             false,
             DType::F32,
             false,
+            0,
         )
         .unwrap();
         assert!(loss.is_finite(), "loss must be finite, got {loss}");
@@ -947,6 +1309,43 @@ mod tests {
         );
         // 4 projections × 2 attentions (attn1 self + attn2 cross) × num_layers, ×2 factors.
         assert_eq!(set.vars.len(), 4 * 2 * cfg.num_layers * 2);
+    }
+
+    #[test]
+    fn i2v_channel_padding_reaches_lora_factors() {
+        let dev = Device::Cpu;
+        let cfg = tiny_i2v_cfg();
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+        let mut dit = WanTransformerTrain::new(&cfg, vb).unwrap();
+        randomize_base(&vm, &dev);
+        let suffixes: Vec<String> = WAN_ATTN_TARGETS.iter().map(|s| s.to_string()).collect();
+        let set = build_lora_targets(&mut dit, &suffixes, 4, 8.0, 7, &dev).unwrap();
+        for v in &set.vars {
+            v.set(&Tensor::randn(0f32, 0.02f32, v.as_tensor().dims(), &dev).unwrap())
+                .unwrap();
+        }
+        let x0 = Tensor::randn(0f32, 1f32, (1, 16, 1, 4, 4), &dev).unwrap();
+        let noise = Tensor::randn(0f32, 1f32, x0.dims(), &dev).unwrap();
+        let umt5 = Tensor::randn(0f32, 1f32, (1, 3, cfg.text_dim), &dev).unwrap();
+        let (cos, sin) = WanRope::new(&cfg).cos_sin(1, 2, 2, &dev).unwrap();
+        let (loss, grads) = compute_loss_grads(
+            &dit,
+            &set.vars,
+            &x0,
+            &umt5,
+            0.5,
+            &noise,
+            &cos,
+            &sin,
+            false,
+            DType::F32,
+            false,
+            20,
+        )
+        .unwrap();
+        assert!(loss.is_finite());
+        assert!(set.vars.iter().any(|v| grads.get(v.as_tensor()).is_some()));
     }
 
     /// The correctness gate for the gradient-checkpointed backward (the path real training always uses):
@@ -980,6 +1379,7 @@ mod tests {
             false,
             DType::F32,
             false,
+            0,
         )
         .unwrap();
         let (loss_c, g_c) = compute_loss_grads(
@@ -994,6 +1394,7 @@ mod tests {
             false,
             DType::F32,
             true,
+            0,
         )
         .unwrap();
         assert!(
@@ -1060,6 +1461,7 @@ mod tests {
             false,
             DType::F32,
             false,
+            0,
         )
         .unwrap();
         for _ in 0..5 {
@@ -1077,6 +1479,7 @@ mod tests {
                 false,
                 DType::F32,
                 false,
+                0,
             )
             .unwrap();
             grads = g;
@@ -1093,6 +1496,7 @@ mod tests {
             false,
             DType::F32,
             false,
+            0,
         )
         .unwrap();
         assert!(
@@ -1114,6 +1518,16 @@ mod tests {
         assert_eq!(t.descriptor().backend, "candle");
         assert_eq!(t.descriptor().modality, Modality::Video);
         assert!(t.descriptor().supports_lora && t.descriptor().supports_lokr);
+
+        for id in [MODEL_ID_I2V_14B, MODEL_ID] {
+            let t = crate::provider_registry()
+                .unwrap()
+                .load_trainer(id, &spec)
+                .unwrap_or_else(|e| panic!("{id} trainer must resolve: {e}"));
+            assert_eq!(t.descriptor().id, id);
+            assert!(t.descriptor().supports_lora);
+            assert!(!t.descriptor().supports_lokr);
+        }
     }
 
     /// `validate` rejects an empty dataset, zero rank/steps, an unsupported optimizer, and unrecognized
@@ -1151,11 +1565,38 @@ mod tests {
         bad(&|r| r.config.optimizer = "lion".into());
         bad(&|r| r.config.timestep_type = "bogus".into());
         bad(&|r| r.config.loss_type = "huber".into());
+        bad(&|r| r.items[0].control_image_path = Some("/source.png".into()));
+        bad(&|r| r.config.resume = true);
+
+        for id in [MODEL_ID_I2V_14B, MODEL_ID] {
+            let t = crate::provider_registry()
+                .unwrap()
+                .load_trainer(id, &spec)
+                .unwrap();
+            assert!(t.validate(&base).is_ok());
+            let mut conditioned = base.clone();
+            conditioned.items[0].control_image_path = Some("/source.png".into());
+            assert!(t.validate(&conditioned).is_err());
+            let mut resume = base.clone();
+            resume.config.resume = true;
+            assert!(
+                t.validate(&resume).is_err(),
+                "{id} must fail closed on resume"
+            );
+            let mut lokr = base.clone();
+            lokr.config.network_type = NetworkType::Lokr;
+            let err = t.validate(&lokr).unwrap_err().to_string();
+            assert!(err.contains("LoRA-only"), "{id}: {err}");
+        }
     }
 
     /// The expert-suffix filename insertion lands before the extension.
     #[test]
     fn expert_suffix_naming() {
+        assert_eq!(
+            with_expert_suffix("mylora.safetensors", ""),
+            "mylora.safetensors"
+        );
         assert_eq!(
             with_expert_suffix("mylora.safetensors", "high_noise"),
             "mylora.high_noise.safetensors"
@@ -1168,5 +1609,16 @@ mod tests {
             with_expert_suffix("noext", "high_noise"),
             "noext.high_noise"
         );
+    }
+
+    #[test]
+    fn dense_variant_uses_one_expert_and_walks_every_item() {
+        let seen: Vec<usize> = (1..=8)
+            .map(|step| {
+                assert_eq!(expert_index(step, false), 0);
+                expert_item_index(step, false, 4)
+            })
+            .collect();
+        assert_eq!(seen, [0, 1, 2, 3, 0, 1, 2, 3]);
     }
 }

@@ -363,6 +363,7 @@ fn assert_pulid_previews_converge(
         pulid_weights: env_path("PULID_PREVIEW_WEIGHTS"),
         eva_weights: env_path("PULID_PREVIEW_EVA"),
         face_dir: env_path("PULID_PREVIEW_FACE_DIR"),
+        adapters: Vec::new(),
     };
     let model = PulidFlux::load(&paths).expect("PulidFlux::load");
     let reference = candle_gen::testkit::read_ppm(&env_path("PULID_PREVIEW_REF"));

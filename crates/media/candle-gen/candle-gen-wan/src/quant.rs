@@ -18,8 +18,8 @@
 //! DiT loader / transformer / additive installer keep their `crate::quant::QLinear` references
 //! unchanged. The additive mechanism + its parity tests now live in `candle-gen/src/quant/adapt.rs`.
 //! The Wan-native LoKr **fold** (dense base) still routes through `crate::adapters::merge_adapters`;
-//! the packed additive path pushes plain LoRA residuals (LoKr/LoHa on packed stay rejected —
-//! sc-10050/10051).
+//! packed tiers keep their base quantized while structured LoKr and plain LoRA ride as additive
+//! residuals. LoHa remains rejected because no product descriptor advertises that adapter kind.
 //!
 //! ## Per-component packed / dense split (mirrors the MLX build: only the DiT experts quantize)
 //!

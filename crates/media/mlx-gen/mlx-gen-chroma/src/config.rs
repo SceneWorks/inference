@@ -143,6 +143,7 @@ impl ChromaVariant {
                 supports_sequential_offload: true,
                 unconditionally_engages_staged_residency: false,
                 supports_preview: true,
+                supports_prompt_enhancement: false,
                 supports_streaming: false,
                 supports_multi_speaker: false,
                 supports_conversation_history: false,

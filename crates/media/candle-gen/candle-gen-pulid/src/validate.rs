@@ -73,6 +73,7 @@ fn real_weight_memory_rung() {
         pulid_weights: env_path("PULID_WEIGHTS"),
         eva_weights: env_path("PULID_EVA"),
         face_dir: env_path("PULID_FACE_DIR"),
+        adapters: Vec::new(),
     };
     let strategy = memory_strategy_from_env();
     let contract = crate::memory_strategy::provider_contract(&paths).unwrap();
@@ -173,6 +174,7 @@ fn real_weight_pulid() {
         pulid_weights: env_path("PULID_WEIGHTS"),
         eva_weights: env_path("PULID_EVA"),
         face_dir: env_path("PULID_FACE_DIR"),
+        adapters: Vec::new(),
     };
 
     eprintln!("loading PulidFlux (FLUX.1-dev + PuLID + EVA-CLIP + face stack) ...");
@@ -229,6 +231,35 @@ fn real_weight_pulid() {
         .expect("pulid generate (id_weight 1.0)");
     eprintln!("[id] {:?}", t.elapsed());
     write_ppm(&out_dir.join("pulid_id.ppm"), &with_id);
+    if let Some(adapter) = std::env::var_os("PULID_LORA") {
+        drop(model);
+        drop(face);
+        let adapted = PulidFlux::load(&PulidFluxPaths {
+            flux_base: env_path("PULID_FLUX_BASE"),
+            pulid_weights: env_path("PULID_WEIGHTS"),
+            eva_weights: env_path("PULID_EVA"),
+            face_dir: env_path("PULID_FACE_DIR"),
+            adapters: vec![candle_gen::gen_core::AdapterSpec::new(
+                adapter.into(),
+                1.0,
+                candle_gen::gen_core::AdapterKind::Lora,
+            )],
+        })
+        .expect("load adapter-conditioned PuLID");
+        let with_adapter = adapted
+            .generate(&base, &reference, &mut make_progress())
+            .expect("pulid generate (identity + LoRA)");
+        assert_eq!(
+            (with_adapter.width, with_adapter.height),
+            (with_id.width, with_id.height)
+        );
+        assert_ne!(
+            with_adapter.pixels, with_id.pixels,
+            "selected PuLID adapter must change output"
+        );
+        write_ppm(&out_dir.join("pulid_id_lora.ppm"), &with_adapter);
+        return;
+    }
     let id_cos = output_cosine(&face, &ref_emb, &with_id, "id");
 
     // --- 2) no-id ablation (id_weight 0.0 ⇒ plain FLUX, same seed/prompt) ---

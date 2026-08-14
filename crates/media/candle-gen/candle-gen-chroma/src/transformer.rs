@@ -152,6 +152,15 @@ impl FeedForward {
         // candle's `gelu` is the tanh approximation (matches diffusers `gelu-approximate`).
         self.lin2.forward(&self.lin1.forward(x)?.gelu()?)
     }
+
+    fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        visitor: &mut dyn FnMut(&str, &mut candle_gen::quant::AdaptLinear) -> Result<()>,
+    ) -> Result<()> {
+        visitor(&format!("{prefix}.net.0.proj"), self.lin1.adaptable_mut())?;
+        visitor(&format!("{prefix}.net.2"), self.lin2.adaptable_mut())
+    }
 }
 
 // ============================ embeddings + Approximator ============================
@@ -245,6 +254,30 @@ impl Approximator {
         }
         self.out_proj.forward(&x)
     }
+
+    fn visit_adaptable_mut(
+        &mut self,
+        visitor: &mut dyn FnMut(&str, &mut candle_gen::quant::AdaptLinear) -> Result<()>,
+    ) -> Result<()> {
+        visitor(
+            "distilled_guidance_layer.in_proj",
+            self.in_proj.adaptable_mut(),
+        )?;
+        for (index, (linear_1, linear_2)) in self.layers.iter_mut().enumerate() {
+            visitor(
+                &format!("distilled_guidance_layer.layers.{index}.linear_1"),
+                linear_1.adaptable_mut(),
+            )?;
+            visitor(
+                &format!("distilled_guidance_layer.layers.{index}.linear_2"),
+                linear_2.adaptable_mut(),
+            )?;
+        }
+        visitor(
+            "distilled_guidance_layer.out_proj",
+            self.out_proj.adaptable_mut(),
+        )
+    }
 }
 
 // ============================ blocks ============================
@@ -331,6 +364,26 @@ impl DoubleAttn {
             self.to_add_out.forward(&txt.contiguous()?)?,
         ))
     }
+
+    fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        visitor: &mut dyn FnMut(&str, &mut candle_gen::quant::AdaptLinear) -> Result<()>,
+    ) -> Result<()> {
+        for (name, linear) in [
+            ("to_q", &mut self.to_q),
+            ("to_k", &mut self.to_k),
+            ("to_v", &mut self.to_v),
+            ("to_out.0", &mut self.to_out),
+            ("add_q_proj", &mut self.add_q),
+            ("add_k_proj", &mut self.add_k),
+            ("add_v_proj", &mut self.add_v),
+            ("to_add_out", &mut self.to_add_out),
+        ] {
+            visitor(&format!("{prefix}.{name}"), linear.adaptable_mut())?;
+        }
+        Ok(())
+    }
 }
 
 struct DoubleBlock {
@@ -375,6 +428,19 @@ impl DoubleBlock {
         let encoder = gated(&encoder, &row(temb, 11)?, &self.ff_context.forward(&ne)?)?;
 
         Ok((encoder, hidden))
+    }
+
+    fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        visitor: &mut dyn FnMut(&str, &mut candle_gen::quant::AdaptLinear) -> Result<()>,
+    ) -> Result<()> {
+        self.attn
+            .visit_adaptable_mut(&format!("{prefix}.attn"), visitor)?;
+        self.ff
+            .visit_adaptable_mut(&format!("{prefix}.ff"), visitor)?;
+        self.ff_context
+            .visit_adaptable_mut(&format!("{prefix}.ff_context"), visitor)
     }
 }
 
@@ -421,6 +487,16 @@ impl SingleAttn {
         let v = to_heads(&self.to_v.forward(x)?, h, hd, None)?;
         attention(&q, &k, &v, hd)
     }
+
+    fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        visitor: &mut dyn FnMut(&str, &mut candle_gen::quant::AdaptLinear) -> Result<()>,
+    ) -> Result<()> {
+        visitor(&format!("{prefix}.to_q"), self.to_q.adaptable_mut())?;
+        visitor(&format!("{prefix}.to_k"), self.to_k.adaptable_mut())?;
+        visitor(&format!("{prefix}.to_v"), self.to_v.adaptable_mut())
+    }
 }
 
 struct SingleBlock {
@@ -457,6 +533,17 @@ impl SingleBlock {
             .proj_out
             .forward(&Tensor::cat(&[&attn, &mlp], D::Minus1)?)?;
         gated(hidden, &row(temb, 2)?, &proj)
+    }
+
+    fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        visitor: &mut dyn FnMut(&str, &mut candle_gen::quant::AdaptLinear) -> Result<()>,
+    ) -> Result<()> {
+        self.attn
+            .visit_adaptable_mut(&format!("{prefix}.attn"), visitor)?;
+        visitor(&format!("{prefix}.proj_mlp"), self.proj_mlp.adaptable_mut())?;
+        visitor(&format!("{prefix}.proj_out"), self.proj_out.adaptable_mut())
     }
 }
 
@@ -517,6 +604,22 @@ impl ChromaTransformer {
             proj_out: QLinear::linear_detect_gs(inner, cfg.in_channels, &vb, "proj_out", true, gs)?,
             cfg,
         })
+    }
+
+    pub fn visit_adaptable_mut(
+        &mut self,
+        visitor: &mut dyn FnMut(&str, &mut candle_gen::quant::AdaptLinear) -> Result<()>,
+    ) -> Result<()> {
+        visitor("x_embedder", self.x_embedder.adaptable_mut())?;
+        visitor("context_embedder", self.context_embedder.adaptable_mut())?;
+        self.approximator.visit_adaptable_mut(visitor)?;
+        for (index, block) in self.double_blocks.iter_mut().enumerate() {
+            block.visit_adaptable_mut(&format!("transformer_blocks.{index}"), visitor)?;
+        }
+        for (index, block) in self.single_blocks.iter_mut().enumerate() {
+            block.visit_adaptable_mut(&format!("single_transformer_blocks.{index}"), visitor)?;
+        }
+        visitor("proj_out", self.proj_out.adaptable_mut())
     }
 
     /// `pooled_temb [B, mod_index_len, inner]` for a **raw** (unscaled) timestep `[B]`. Depends only

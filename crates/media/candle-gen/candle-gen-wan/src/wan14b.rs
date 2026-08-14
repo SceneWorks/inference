@@ -255,8 +255,8 @@ impl Pipeline {
     ///   `merge_adapters` hard-errors on its own zero-match (the report is otherwise discarded, F-051).
     /// - **Packed** q4/q8 tier (sc-10095): a packed tier has **no dense `W`** to fold into, so the
     ///   adapters attach as forward-time **additive** residuals on the packed `QLinear`
-    ///   ([`crate::adapters::install_additive`], sc-10094) — the base weight stays q4/q8. LoKr/LoHa on a
-    ///   packed tier is rejected there (deferred to sc-10050/10051).
+    ///   ([`crate::adapters::install_additive`], sc-10094) — the base weight stays q4/q8. Structured
+    ///   LoKr is packed-safe; LoHa fails closed because it has no truthful additive representation.
     ///
     /// Returns the expert plus `Some(applied)` on the packed path (the count of attached residuals, for
     /// the caller's cross-expert zero-match guard) or `None` on the dense/no-adapter paths (which
@@ -904,7 +904,7 @@ struct SwapState<'a> {
 /// emit their [`Progress::Loading`] before the (heavy) load; the use closures receive `&mut St` to
 /// advance the shared scheduler/latents.
 #[allow(clippy::too_many_arguments)]
-fn staged_expert_swap<E, St>(
+pub(crate) fn staged_expert_swap<E, St>(
     k: usize,
     steps: usize,
     state: &mut St,
@@ -1177,6 +1177,7 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             supports_sequential_offload: true,
             unconditionally_engages_staged_residency: false,
             supports_preview: false,
+            supports_prompt_enhancement: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
