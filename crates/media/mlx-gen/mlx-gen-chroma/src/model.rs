@@ -240,8 +240,8 @@ fn load_heavy(
     let root = resolve_root(variant, spec)?;
     if streamable && !crate::memory_strategy::structurally_streamable(spec) {
         return Err(Error::Unsupported(format!(
-            "{}: bounded transformer residency requires OffloadPolicy::Sequential + \
-             LoadShape::DeferredMaterialization over a clean, already-packed (or dense) snapshot \
+            "{}: bounded transformer residency requires a staged request over \
+             LoadShape::DeferredMaterialization with a clean, already-packed (or dense) snapshot \
              directory — this load cannot stream its blocks",
             variant.id()
         )));
@@ -1129,8 +1129,7 @@ impl Chroma {
         {
             return Err(Error::Unsupported(format!(
                 "{}: this load cannot stream its blocks — bounded transformer residency needs \
-                 OffloadPolicy::Sequential + LoadShape::DeferredMaterialization on a clean base \
-                 route",
+                 a staged request with LoadShape::DeferredMaterialization on a clean base route",
                 self.descriptor.id
             )));
         }

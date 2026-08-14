@@ -519,6 +519,25 @@ pub enum LoadShape {
     DeferredMaterialization,
 }
 
+/// Authoritative result of a caller-owned declaration check for [`LoadShape`].
+///
+/// This is deliberately separate from [`LoadShape`] itself. A declaration-aware caller may refuse
+/// deferred materialization and keep the historical eager shape; carrying that refusal prevents a
+/// later legacy shaper from treating the eager value as "not evaluated yet" and re-admitting the
+/// same route. Providers continue to consume [`LoadSpec::load_shape`]; orchestration layers own and
+/// propagate this authority marker across cache and cold-load boundaries.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum LoadShapeDeclarationResult {
+    /// No authoritative declaration check has run. Legacy shaping may still apply.
+    #[default]
+    NotEvaluated,
+    /// The declaration check admitted and applied its selected load shape.
+    Applied,
+    /// The declaration check authoritatively refused its selected load shape. Legacy shaping must
+    /// not override this result.
+    Refused,
+}
+
 /// How to load a model. `weights` is required; everything else defaults to dense bf16. The
 /// device is the process-default Metal GPU — the crate runs single-device (the MLX default
 /// device is not thread-safe; the worker serializes jobs per thread).
@@ -627,6 +646,12 @@ pub struct LoadSpec {
     /// The default preserves the historical eager/warm path. A deferred shape is meaningful only
     /// for providers with a re-openable source such as a snapshot directory.
     pub load_shape: LoadShape,
+    /// Caller-owned declaration authority for [`load_shape`](Self::load_shape). This participates
+    /// in request-scoped execution-policy identity whenever orchestration reconstructs a
+    /// [`LoadSpec`], so an authoritative refusal cannot alias a not-yet-evaluated eager load. It is
+    /// not immutable weight identity: residency and materialization policy do not change the model
+    /// bytes.
+    pub load_shape_declaration_result: LoadShapeDeclarationResult,
     /// **Named, caller-provisioned model components** (epic 13657) — the generic, additive home for
     /// the extra weight artifacts a model needs beyond its base `weights` and the typed overlays
     /// above, keyed by a stable component id. The complement of
@@ -735,6 +760,7 @@ impl LoadSpec {
             text_encoder: None,
             offload_policy: OffloadPolicy::Resident,
             load_shape: LoadShape::EagerMaterialization,
+            load_shape_declaration_result: LoadShapeDeclarationResult::NotEvaluated,
             components: BTreeMap::new(),
         }
     }
@@ -1431,6 +1457,42 @@ impl LoadSpec {
         self
     }
 
+    /// Atomically record that a declaration admitted deferred materialization.
+    pub fn with_applied_load_shape_declaration(mut self) -> Self {
+        self.load_shape = LoadShape::DeferredMaterialization;
+        self.load_shape_declaration_result = LoadShapeDeclarationResult::Applied;
+        self
+    }
+
+    /// Atomically record that a declaration refused deferred materialization.
+    ///
+    /// The eager compatibility shape is retained, but the authoritative refusal prevents a later
+    /// legacy shaper from re-admitting the route.
+    pub fn with_refused_load_shape_declaration(mut self) -> Self {
+        self.load_shape = LoadShape::EagerMaterialization;
+        self.load_shape_declaration_result = LoadShapeDeclarationResult::Refused;
+        self
+    }
+
+    /// Validate the declaration authority and materialization shape as one fail-closed contract.
+    ///
+    /// [`LoadShapeDeclarationResult::NotEvaluated`] permits either historical shape because legacy
+    /// shapers may already have run. Declaration-aware callers must use the atomic builders above
+    /// and may validate again after cache or cold-load reconstruction.
+    pub fn validate_load_shape_declaration(&self) -> crate::Result<()> {
+        match (self.load_shape_declaration_result, self.load_shape) {
+            (LoadShapeDeclarationResult::NotEvaluated, _)
+            | (LoadShapeDeclarationResult::Applied, LoadShape::DeferredMaterialization)
+            | (LoadShapeDeclarationResult::Refused, LoadShape::EagerMaterialization) => Ok(()),
+            (LoadShapeDeclarationResult::Applied, LoadShape::EagerMaterialization) => {
+                Err("applied load-shape declaration must use deferred materialization".into())
+            }
+            (LoadShapeDeclarationResult::Refused, LoadShape::DeferredMaterialization) => {
+                Err("refused load-shape declaration must retain eager materialization".into())
+            }
+        }
+    }
+
     /// Builder-style control-branch overlay (the ControlNet checkpoint over the base `weights`).
     pub fn with_control(mut self, control: WeightsSource) -> Self {
         self.control = Some(control);
@@ -1712,8 +1774,72 @@ pub enum LoadPhase {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use std::io::Read;
     use std::sync::{Barrier, Mutex};
+
+    #[test]
+    fn load_shape_declaration_result_defaults_clones_hashes_and_validates() {
+        let spec = LoadSpec::new(WeightsSource::Dir("snapshot".into()));
+        assert_eq!(
+            spec.load_shape_declaration_result,
+            LoadShapeDeclarationResult::NotEvaluated
+        );
+        assert_eq!(spec.load_shape, LoadShape::EagerMaterialization);
+
+        spec.validate_load_shape_declaration()
+            .expect("default declaration state is valid");
+
+        let applied = spec.clone().with_applied_load_shape_declaration();
+        assert_eq!(
+            applied.load_shape_declaration_result,
+            LoadShapeDeclarationResult::Applied
+        );
+        assert_eq!(applied.load_shape, LoadShape::DeferredMaterialization);
+        applied
+            .validate_load_shape_declaration()
+            .expect("applied declaration is valid");
+        assert_eq!(
+            applied.clone().load_shape_declaration_result,
+            LoadShapeDeclarationResult::Applied,
+            "clone must carry declaration authority across a cold-load boundary"
+        );
+
+        let refused = spec.with_refused_load_shape_declaration();
+        assert_eq!(
+            refused.load_shape_declaration_result,
+            LoadShapeDeclarationResult::Refused
+        );
+        assert_eq!(
+            refused.load_shape,
+            LoadShape::EagerMaterialization,
+            "an authoritative refusal keeps the compatibility shape"
+        );
+        refused
+            .validate_load_shape_declaration()
+            .expect("refused declaration is valid");
+
+        let cache_axes: HashSet<_> = [
+            LoadShapeDeclarationResult::NotEvaluated,
+            LoadShapeDeclarationResult::Applied,
+            LoadShapeDeclarationResult::Refused,
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(cache_axes.len(), 3);
+
+        let mut contradictory_applied = applied;
+        contradictory_applied.load_shape = LoadShape::EagerMaterialization;
+        assert!(contradictory_applied
+            .validate_load_shape_declaration()
+            .is_err());
+
+        let mut contradictory_refused = refused;
+        contradictory_refused.load_shape = LoadShape::DeferredMaterialization;
+        assert!(contradictory_refused
+            .validate_load_shape_declaration()
+            .is_err());
+    }
 
     #[test]
     fn pinned_weights_file_detects_target_mutation() {

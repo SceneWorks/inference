@@ -67,7 +67,8 @@ use mlx_gen::gen_core::{
     MemoryComponentKind, MemoryFormulaKind, MemoryFormulaVariable, MemoryLifecycleCapabilities,
     MemoryMode, MemoryNumericTier, MemoryPhase, MemoryPrerequisiteScope, MemoryProviderContract,
     MemoryRequestScope, MemoryResidentComponent, MemoryRunContext, MemorySafetyDecision,
-    MemoryStrategy, MemoryStrategyPrerequisite, MemoryStrategySupport, TransformerComponent,
+    MemoryStrategy, MemoryStrategyPrerequisite, MemoryStrategySupport, ResidentRequestMemory,
+    TransformerComponent,
 };
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::{GenerationRequest, OffloadPolicy, WeightsSource};
@@ -464,9 +465,32 @@ fn route_mode_and_references(spec: &LoadSpec) -> (MemoryMode, u32) {
 /// `{base}.scales`), so the production Q4/Q8 route is admitted and only the re-quantizing one is not.
 pub fn structurally_streamable(spec: &LoadSpec) -> bool {
     WINDOW_SUPPORT
-        && spec.offload_policy == OffloadPolicy::Sequential
         && spec.load_shape == LoadShape::DeferredMaterialization
         && spec.quantize.is_none()
+        && clean(spec)
+        && matches!(spec.weights, WeightsSource::Dir(_))
+}
+
+/// Weights-free counterpart of [`structurally_streamable`] for the finite registry surface.
+///
+/// On a real load `spec.quantize` means "pack this dense source now" and is therefore refused by
+/// [`structurally_streamable`]. In a [`MemoryContractSurfaceSpec`](mlx_gen::gen_core::MemoryContractSurfaceSpec),
+/// however, that same field is the tensor-free witness for the selector's already-resolved artifact
+/// tier. Q4/Q8 catalog tiers are prepacked and reach production with `quantize == None`; treating the
+/// witness as load-time quantization would erase both shipped tiers from generated capabilities.
+fn weights_free_structurally_streamable(
+    surface: &mlx_gen::gen_core::MemoryContractSurfaceSpec,
+) -> bool {
+    let resolved_artifact_tier = surface.resolved_artifact_tier();
+    let spec = &surface.spec;
+    WINDOW_SUPPORT
+        && matches!(
+            resolved_artifact_tier,
+            mlx_gen::gen_core::MemoryContractSurfaceTier::Bf16
+                | mlx_gen::gen_core::MemoryContractSurfaceTier::Q4
+                | mlx_gen::gen_core::MemoryContractSurfaceTier::Q8
+        )
+        && spec.load_shape == LoadShape::DeferredMaterialization
         && clean(spec)
         && matches!(spec.weights, WeightsSource::Dir(_))
 }
@@ -481,7 +505,6 @@ fn build_contract(
     overlays: Vec<MemoryResidentComponent>,
 ) -> mlx_gen::gen_core::Result<MemoryProviderContract> {
     variant_for(provider_id)?;
-    let staged = spec.offload_policy == OffloadPolicy::Sequential;
     let clean = clean(spec);
     let decode_policies = spec.decode_geometry_policies_for_loaded_contract(
         mlx_gen::gen_core::MemoryBackend::Mlx,
@@ -554,7 +577,9 @@ fn build_contract(
             MemoryPhase::Denoise,
             MemoryPhase::Decode,
         ],
-        synchronized_phase_release: staged,
+        // Chroma uses request_scoped_from_policy: load-time offload is only the default and every
+        // cached generator can execute a staged request that evicts its warm pair first.
+        synchronized_phase_release: true,
         decode_tiling: decode,
         attention_chunking: attention,
         transformer_window_materialization: streamable,
@@ -562,7 +587,7 @@ fn build_contract(
     for capability in &mut contract.strategies {
         capability.support = match capability.strategy {
             MemoryStrategy::Resident => MemoryStrategySupport::Implemented,
-            MemoryStrategy::StagedResidency if staged => MemoryStrategySupport::Implemented,
+            MemoryStrategy::StagedResidency => MemoryStrategySupport::Implemented,
             MemoryStrategy::BoundedDecode if decode => {
                 capability.parameters.decode_tile_edges = routes.native_edges().to_vec();
                 capability.parameters.decode_overlaps = vec![DECODE_OVERLAP];
@@ -581,6 +606,7 @@ fn build_contract(
             _ => MemoryStrategySupport::Missing,
         };
     }
+    contract.resident_request_memory = ResidentRequestMemory::ExplicitResident;
     contract.decode_geometry_policy_authoritative = spec.decode_geometry_policy_authoritative;
     contract.adopt_decode_geometry_policies("chroma", decode_policies)?;
     if streamable {
@@ -675,6 +701,28 @@ pub fn weights_free_contract(
     )
 }
 
+/// Selector-aware finite-surface resolver. The selector's tier is the explicit resolved artifact
+/// tier; downstream consumers never need to reinterpret `LoadSpec::quantize` as a packed-source
+/// fact. Production continues to call [`contract_for`] and inspect the real source marker.
+#[doc(hidden)]
+pub fn weights_free_surface_contract(
+    provider_id: &str,
+    surface: &mlx_gen::gen_core::MemoryContractSurfaceSpec,
+) -> mlx_gen::gen_core::Result<MemoryProviderContract> {
+    let route = variant_for(provider_id)?.id().replace('_', "-");
+    build_contract(
+        provider_id,
+        &surface.spec,
+        weights_free_structurally_streamable(surface),
+        Some(MemoryCalibrationIdentity::new(
+            format!("{STATIC_CALIBRATION}-{route}"),
+            surface.spec.load_shape,
+        )),
+        Default::default(),
+        Vec::new(),
+    )
+}
+
 /// Numeric tier the loaded Chroma artifact actually carries. Turnkey Chroma tiers deliberately keep
 /// `spec.quantize == None` so their dense T5 tower is never repacked; the transformer marker is the
 /// authoritative q4/q8 identity used by both calibration and decode-quality admission.
@@ -740,8 +788,8 @@ pub(crate) fn safety_check(
         ) {
             if !contract.lifecycle.transformer_window_materialization || !context.has_phases {
                 return Err(CoreError::Unsupported(format!(
-                    "{}: bounded transformer residency requires the Sequential + \
-                     DeferredMaterialization route with rung 1 engaged in the same request",
+                    "{}: bounded transformer residency requires DeferredMaterialization with \
+                     staged residency engaged in the same request",
                     contract.provider_id
                 )));
             }
@@ -787,7 +835,8 @@ pub(crate) fn registered_fixture(
             mode,
             reference_count,
             use_pid: false,
-            has_phases: spec.offload_policy == OffloadPolicy::Sequential,
+            // Request-scoped residency exposes phase boundaries under either load-time default.
+            has_phases: true,
             overlay: route_overlay(spec),
         },
     )?;
@@ -1320,6 +1369,11 @@ mod tests {
             ),
         ];
         for spec in cases {
+            assert!(
+                !structurally_streamable(&spec),
+                "production predicate must reject {:?}",
+                route_overlay(&spec)
+            );
             let contract = weights_free_contract(crate::CHROMA1_BASE_ID, &spec).unwrap();
             assert!(contract.conformance_errors().is_empty());
             for strategy in [
@@ -1341,13 +1395,17 @@ mod tests {
     }
 
     #[test]
-    fn rung_four_needs_sequential_deferred_and_a_non_requantizing_tier() {
+    fn production_rung_four_needs_deferred_directory_clean_route_and_no_requantization() {
         assert!(structurally_streamable(&streamable_spec()));
+        assert!(
+            structurally_streamable(
+                &streamable_spec().with_offload_policy(OffloadPolicy::Resident)
+            ),
+            "materialization shape is independent from phase offload policy"
+        );
         for spec in [
             // Eager materialization: no reopenable stream.
             sequential_spec(),
-            // Resident: rung 1 cannot be engaged in the same request.
-            streamable_spec().with_offload_policy(OffloadPolicy::Resident),
             // A dense source the loader would re-quantize per window.
             streamable_spec().with_quant(Quant::Q4),
             // A single-file checkpoint has no component tree to reopen.
@@ -1356,15 +1414,138 @@ mod tests {
                 .with_load_shape(LoadShape::DeferredMaterialization),
         ] {
             assert!(!structurally_streamable(&spec));
-            assert_eq!(
-                weights_free_contract(crate::CHROMA1_BASE_ID, &spec)
-                    .unwrap()
-                    .capability(MemoryStrategy::BoundedTransformerResidency)
-                    .unwrap()
-                    .support,
-                MemoryStrategySupport::Missing
-            );
         }
+    }
+
+    #[test]
+    fn production_packed_and_dense_artifact_tiers_share_the_deferred_source_predicate() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (tag, bits) in [("bf16", None), ("q4", Some(4)), ("q8", Some(8))] {
+            let root = tier_root(&tmp, tag, bits);
+            for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
+                let spec = tier_spec(&root)
+                    .with_offload_policy(policy)
+                    .with_load_shape(LoadShape::DeferredMaterialization);
+                assert!(
+                    structurally_streamable(&spec),
+                    "{tag} {policy:?} resolved artifact"
+                );
+                assert!(
+                    !structurally_streamable(&spec.clone().with_quant(Quant::Q4)),
+                    "a real load-time quantization request remains distinct from the resolved artifact tier"
+                );
+                let mut external_te = spec;
+                external_te.text_encoder = Some(WeightsSource::Dir("/external-text".into()));
+                assert!(
+                    !structurally_streamable(&external_te),
+                    "external text encoder must remain fail-closed"
+                );
+            }
+            std::fs::remove_dir_all(root).ok();
+        }
+    }
+
+    #[test]
+    fn weights_free_resolved_tiers_expose_both_deferred_load_policies() {
+        for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
+            for tier in [
+                mlx_gen::gen_core::MemoryContractSurfaceTier::Bf16,
+                mlx_gen::gen_core::MemoryContractSurfaceTier::Q4,
+                mlx_gen::gen_core::MemoryContractSurfaceTier::Q8,
+            ] {
+                let surface = mlx_gen::gen_core::mlx_memory_contract_surface_specs()
+                    .into_iter()
+                    .find(|surface| {
+                        surface.selector.tier == tier
+                            && surface.selector.offload_policy == policy
+                            && surface.selector.load_shape == LoadShape::DeferredMaterialization
+                    })
+                    .unwrap();
+                let contract =
+                    weights_free_surface_contract(crate::CHROMA1_BASE_ID, &surface).unwrap();
+                assert_eq!(
+                    contract
+                        .capability(MemoryStrategy::BoundedTransformerResidency)
+                        .unwrap()
+                        .support,
+                    MemoryStrategySupport::Implemented,
+                    "{policy:?} {tier:?} is a resolved prepacked surface"
+                );
+                assert!(contract
+                    .requires(MemoryStrategy::BoundedTransformerResidency)
+                    .any(|prerequisite| matches!(
+                        prerequisite,
+                        MemoryStrategyPrerequisite::Rung {
+                            rung: MemoryStrategy::StagedResidency,
+                            scope: MemoryPrerequisiteScope::EngagedInSameRequest,
+                        }
+                    )));
+
+                let eager = mlx_gen::gen_core::mlx_memory_contract_surface_specs()
+                    .into_iter()
+                    .find(|candidate| {
+                        candidate.selector.tier == tier
+                            && candidate.selector.offload_policy == policy
+                            && candidate.selector.load_shape == LoadShape::EagerMaterialization
+                    })
+                    .unwrap();
+                assert_eq!(
+                    weights_free_surface_contract(crate::CHROMA1_BASE_ID, &eager)
+                        .unwrap()
+                        .capability(MemoryStrategy::BoundedTransformerResidency)
+                        .unwrap()
+                        .support,
+                    MemoryStrategySupport::Missing
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resident_deferred_rung_four_selection_engages_request_scoped_staging() {
+        let surface = mlx_gen::gen_core::mlx_memory_contract_surface_specs()
+            .into_iter()
+            .find(|surface| {
+                surface.selector.tier == mlx_gen::gen_core::MemoryContractSurfaceTier::Q4
+                    && surface.selector.offload_policy == OffloadPolicy::Resident
+                    && surface.selector.load_shape == LoadShape::DeferredMaterialization
+            })
+            .unwrap();
+        let contract = weights_free_surface_contract(crate::CHROMA1_BASE_ID, &surface).unwrap();
+        assert_eq!(
+            contract
+                .capability(MemoryStrategy::StagedResidency)
+                .unwrap()
+                .support,
+            MemoryStrategySupport::Implemented
+        );
+        assert!(contract.lifecycle.synchronized_phase_release);
+        assert_eq!(
+            contract.resident_request_memory,
+            ResidentRequestMemory::ExplicitResident
+        );
+
+        let mut fixture = registered_fixture(
+            &surface.spec,
+            &contract,
+            MemoryStrategy::BoundedTransformerResidency,
+        )
+        .unwrap()
+        .remove(0);
+        contract
+            .validate_selection(&fixture.context.selection)
+            .unwrap();
+        assert!(matches!(
+            safety_check(&surface.spec, &contract, &fixture.context),
+            MemorySafetyDecision::Accept
+        ));
+        let mut scope = registered_begin_request(&surface.spec, &contract, &fixture.context)
+            .unwrap()
+            .unwrap();
+        scope.configure_request(&mut fixture.request).unwrap();
+        let memory = fixture.request.memory.expect("rung 4 request memory");
+        assert!(memory.stage_residency);
+        assert!(memory.stream_transformer_blocks);
     }
 
     #[test]

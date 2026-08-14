@@ -129,18 +129,19 @@ pub use registry::{
     ImageEmbedderRegistration, ImportedModelOperation, ImportedModelRegistration,
     ImportedModelSource, MemoryBehaviorBeginRequest, MemoryBehaviorFixture,
     MemoryBehaviorRegistration, MemoryContractFixtureRegistration, MemoryContractSurface,
-    MemoryContractSurfaceSelector, MemoryContractSurfaceSpec, MemoryContractSurfaceTier,
-    MemoryRegistration, ModelRegistration, PerComponentBytes, ProviderRegistry,
-    ProviderRegistryBuilder, ResidentOnlyMemoryContractRegistration, TextEmbedderRegistration,
-    TrainerRegistration, TranscriberRegistration, TransformRegistration, VoiceEmbedderRegistration,
+    MemoryContractSurfaceResolverRegistration, MemoryContractSurfaceSelector,
+    MemoryContractSurfaceSpec, MemoryContractSurfaceTier, MemoryRegistration, ModelRegistration,
+    PerComponentBytes, ProviderRegistry, ProviderRegistryBuilder,
+    ResidentOnlyMemoryContractRegistration, TextEmbedderRegistration, TrainerRegistration,
+    TranscriberRegistration, TransformRegistration, VoiceEmbedderRegistration,
 };
 pub use residency::{Residency, ResidencyRuntime, StagedHeavy};
 pub use runtime::{
     AdapterApplyReport, AdapterKind, AdapterSpec, CancelFlag, FileStatFingerprint, IdentityWeights,
-    LoadPhase, LoadShape, LoadSpec, MoeExpert, OffloadPolicy, PidWeights, PinnedWeightsFile,
-    Precision, PreparedFilePins, PreviewFrame, PreviewSink, Progress, Quant, WeightsSource,
-    BASE_SNAPSHOT_COMPONENT, COMFYUI_TEXT_ENCODER_COMPONENT, COMFYUI_VAE_COMPONENT,
-    KREA_CONVROT_DIT_COMPONENT, VAE_COMPONENT,
+    LoadPhase, LoadShape, LoadShapeDeclarationResult, LoadSpec, MoeExpert, OffloadPolicy,
+    PidWeights, PinnedWeightsFile, Precision, PreparedFilePins, PreviewFrame, PreviewSink,
+    Progress, Quant, WeightsSource, BASE_SNAPSHOT_COMPONENT, COMFYUI_TEXT_ENCODER_COMPONENT,
+    COMFYUI_VAE_COMPONENT, KREA_CONVROT_DIT_COMPONENT, VAE_COMPONENT,
 };
 pub use text_embed::{TextEmbedder, TextEmbedderDescriptor};
 pub use tier_integrity::{control_branch_tier, is_above_selected_tier};

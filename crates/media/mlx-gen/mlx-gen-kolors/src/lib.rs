@@ -40,6 +40,14 @@ pub fn register_providers(
                 crate::memory_strategy::weights_free_memory_strategy_contract(MODEL_ID, spec)
             },
         })
+        .register_memory_contract_surface_resolver(
+            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
+                provider_id: MODEL_ID,
+                contract: |surface| {
+                    crate::memory_strategy::weights_free_surface_contract(MODEL_ID, surface)
+                },
+            },
+        )
         .register_memory_behavior(crate::registry::MEMORY_BEHAVIOR_REGISTRATION)
         .register_trainer(training::TRAINER_REGISTRATION)
 }
