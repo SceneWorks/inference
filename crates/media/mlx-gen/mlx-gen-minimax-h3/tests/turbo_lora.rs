@@ -759,7 +759,8 @@ fn published_turbo_files_resolve_to_dit_targets_at_the_measured_alphas() {
 ///
 /// `MINIMAX_H3_TURBO_DIT` points at a `transformer/` directory (any tier: the fold is
 /// tier-independent). Budget the disk and the load before running it — **measured**, the `q4`
-/// `transformer/` is **~17.5 GB across 14 shards** (1.28–1.49 GB each) against bf16's ~62 GB.
+/// `transformer/` is **~17.5 GiB (18.8 GB)** across 14 shards (1.28–1.49 GB each) against bf16's
+/// **~61.7 GiB (66.3 GB)**.
 #[test]
 #[ignore = "needs a real MiniMax-H3 transformer/ (MINIMAX_H3_TURBO_DIT) + the turbo LoRA + Metal"]
 fn the_real_turbo_lora_folds_onto_the_real_dit() {
