@@ -117,17 +117,25 @@ impl ComponentBytes {
     }
 }
 
-/// The five capability entries. Rungs 0 and 1 are implemented on this backend; 2-4 are not.
+/// The five capability entries. **Exactly one is `Implemented` — rung 0, `Resident`. Rungs 1-4 are
+/// all `Missing`**, which is what the `match` below returns and what the ladder reads.
 ///
-/// **Rung 1 became true in sc-17156** and its truth is enforced, not asserted: `MiniMaxH3` forces
+/// Rung 1 is the one that needs stating carefully, because the pipeline and the declaration disagree
+/// **on purpose**. sc-17156 made the staging real — `MiniMaxH3::generate_impl` drops each heavy
+/// component and synchronizes the device before mapping the next, and `MiniMaxH3` forces
 /// [`OffloadPolicy::Sequential`](candle_gen::gen_core::OffloadPolicy) whatever the caller asks for,
-/// and `generate_impl` drops each heavy component and synchronizes the device before mapping the
-/// next. Before that this crate had no pipeline at all, so there was nothing to stage.
+/// so a caller cannot opt out. The *declaration* deliberately did not follow: the rung stays
+/// `Missing` until its executable weights-free behavior seam lands (sc-18660). The long note on the
+/// arm below gives the full reasoning, and the module header says the same thing.
+///
+/// So "implemented in the pipeline" and "declared `Implemented`" are two different facts here, and
+/// only the first is true. Reading this as rung 1 being available to the ladder would be wrong in
+/// the direction that matters: nothing is admitted on the strength of it.
 ///
 /// Every entry publishes an empty [`MemoryParameterRanges`], which is correct in both directions:
-/// rungs 0 and 1 own no numeric parameters, and a `Missing` rung must not publish a domain it
-/// cannot honor. Flipping any of rungs 2-4 to `Implemented` without filling its domain is a
-/// conformance error, not a silent under-declaration.
+/// rung 0 owns no numeric parameters, and a `Missing` rung must not publish a domain it cannot
+/// honor. Flipping any of rungs 1-4 to `Implemented` without filling its domain is a conformance
+/// error, not a silent under-declaration.
 fn strategies() -> Vec<MemoryStrategyCapability> {
     MemoryStrategy::ALL
         .into_iter()
@@ -543,13 +551,14 @@ mod tests {
 
     // --- AC2: nothing optimized is declared, and nothing optimized is reachable ------------------
 
-    /// Rungs 2-4 are `Missing` and each is independently refused at selection. Rung 1 is
-    /// `Implemented` since sc-17156 and therefore passes the declaration check — but with no
-    /// calibration identity the shared safety check **still refuses it at admission**, which is the
-    /// honest state: the staging mechanism exists on this backend and nothing has measured it here.
+    /// **Rungs 1-4 are all declared `Missing`, and each is independently refused at selection.**
     ///
-    /// The two halves are asserted separately on purpose. Collapsing them would hide exactly the
-    /// transition this story caused, where a rung became implemented without becoming admittable.
+    /// Rung 1 is the interesting member: sc-17156 made the staging real in `generate_impl` and
+    /// forced the offload policy, but the declaration deliberately did not follow (see
+    /// `strategies`), so it is refused here exactly like 2-4. **Two** independent things would each
+    /// have to change before it became admittable — the declaration itself, and the `calibration`
+    /// identity that is `None` — and the assertions below check the declaration and the admission
+    /// decision separately so a change to either is visible rather than absorbed by the other.
     #[test]
     fn no_optimized_rung_is_declared_or_selectable() {
         let contract = declared();
@@ -558,9 +567,10 @@ mod tests {
             "candle has no fitted curve for this family"
         );
         for strategy in MemoryStrategy::ALL {
-            // Rungs 0 and 1 are implemented as of sc-17156; 2-4 are not. `is_optimized()` is what
-            // decides selectability below, and `StagedResidency` is not in it — so this test still
-            // says exactly what its name says.
+            // Only rung 0 is declared `Implemented`; 1-4 are `Missing`. `is_optimized()` — which
+            // decides which arms below run — is `!matches!(self, Resident)`, so `StagedResidency`
+            // IS optimized and the refusal arms DO exercise rung 1. That is the point of the test,
+            // not an exception to it: the rung whose mechanism exists is refused all the same.
             let expected = if strategy == MemoryStrategy::Resident {
                 MemoryStrategySupport::Implemented
             } else {

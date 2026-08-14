@@ -8,7 +8,7 @@
 //!
 //! The three heavy components are **66.71 GB** of Qwen3-VL-32B text encoder, **66.28 GB** of DiT
 //! (40.43 GB once the AdaLN projections are evicted) and **10.42 GB** of video VAE. Holding any two
-//! of them at once does not fit a card that exists, so [`MiniMaxH3::generate_impl`] builds each
+//! of them at once does not fit a card that exists, so `MiniMaxH3::generate_impl` builds each
 //! phase's component, uses it, drops it and synchronizes the device before the next.
 //! [`load`](MiniMaxH3::load) therefore holds **paths**, not tensors: it validates that every
 //! partition the render needs is present and defers the reads.
@@ -25,7 +25,16 @@
 //! caller could ask for `Resident` and get it, the same manifest number would admit a render whose
 //! true peak is the **sum** of the three components rather than their max — 143 GB against a
 //! published ~40 GB. The number is only truthful because the load is pinned to match it, so the pin
-//! is enforced here and [`crate::tests`]' tripwire fails if it stops holding.
+//! is enforced here and **two** guards in this module's `tests` watch it, because the policy field
+//! and the staging it stands for are separate facts:
+//!
+//! * `the_offload_policy_is_forced_sequential_even_when_resident_is_requested` pins the reported
+//!   policy — a `load` that started echoing `spec.offload_policy` reds.
+//! * `every_heavy_component_is_released_before_the_next_one_is_mapped` pins the **staging itself**.
+//!   `self.offload` is read by no render path, so the first guard alone stays green if every
+//!   `drop` / `release_device_memory` below is deleted. The second one reads this file's own
+//!   production source and reds on the deletion of any single one of them. See its doc comment for
+//!   what a source scan can and cannot see.
 //!
 //! # Geometry: `frames` is a lattice point, `duration` is a request
 //!
@@ -49,22 +58,24 @@
 //!
 //! * **`ref2va` is refused by the descriptor.** The three `ref2va` conditioning kinds are absent
 //!   from [`descriptor`]'s `conditioning` allowlist, and `Capabilities::validate_request` — which
-//!   [`MiniMaxH3::generate_impl`] calls on every render — enforces that allowlist, so a reference
+//!   `MiniMaxH3::generate_impl` calls on every render — enforces that allowlist, so a reference
 //!   request gets a typed `Unsupported` naming the kind.
-//! * **The turbo LoRA seam and the quant tiers are refused by [`load`].** `supports_lora`,
-//!   `supports_lokr` and `supported_quants` are *declarations that gen-core reads on no path*: no
-//!   validator and no registry code inspects them. They are advertisements to a weights-free
-//!   consumer, not gates. The gates are the explicit `spec.adapters` / `spec.quantize` checks in
-//!   [`load`]; without them a spec carrying either loaded clean and rendered with the caller's knob
-//!   silently discarded. See [`load`] for the full note.
+//! * **The turbo LoRA seam, the quant tiers and every unread `LoadSpec` slot are refused by
+//!   [`load`].** `supports_lora`, `supports_lokr` and `supported_quants` are *declarations that
+//!   gen-core reads on no path*: no validator and no registry code inspects them. They are
+//!   advertisements to a weights-free consumer, not gates. The gates are the explicit
+//!   `spec.adapters` / `spec.quantize` checks in [`load`], plus `reject_unread_slots` for the
+//!   seven remaining slots this provider does not read; without them a spec carrying any of those
+//!   loaded clean and rendered with the caller's knob silently discarded. See [`load`] for the
+//!   full note.
 
 use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::{
     reject_unknown_components, Capabilities, GenerationOutput, GenerationRequest, Generator,
-    LoadSpec, MemoryProviderContract, Modality, ModelDescriptor, OffloadPolicy, Progress,
-    SizeFloor, WeightsSource,
+    LoadSpec, MemoryProviderContract, Modality, ModelDescriptor, OffloadPolicy, Precision,
+    Progress, SizeFloor, WeightsSource,
 };
 use candle_gen::gen_core::{ConditioningKind, Image};
 use candle_gen::{CandleError, Result};
@@ -140,6 +151,24 @@ pub fn descriptor() -> ModelDescriptor {
             // no tier loader of its own yet, so it advertises none rather than accepting a
             // `spec.quantize` it would ignore.
             supported_quants: &[],
+            // **The discovery signal, and it is true here.** gen-core makes
+            // `OffloadPolicy::Sequential` advisory, so an unwired engine silently stays resident and
+            // the fallback is invisible from outside; this bit is what a consumer reads to know
+            // which it got. `candle-gen-krea` states the rule as a lockstep contract — "never flip
+            // this on ahead of the wiring", because advertising a lane that would really run
+            // resident makes the fit-gate under-predict its peak and admit a job that then OOMs.
+            //
+            // The wiring is here and is *stronger* than honoring: `generate_impl` releases every
+            // heavy component and synchronizes the device before mapping the next, and
+            // `OFFLOAD_POLICY` forces `Sequential` so a caller cannot even opt out. Leaving this
+            // `false` was the divergence worth closing — SceneWorks' manifest already declares
+            // `supportsSequentialOffload: true`, and a `false` bit here would tell the worker to
+            // size this render at the ~143 GB SUM of the components rather than their max.
+            //
+            // Note this is a *separate* question from the memory-ladder rung-1 declaration in
+            // `crate::memory_strategy`, which stays `Missing` pending its behavior seam (sc-18660).
+            // That declaration gates ladder ADMISSION; this bit describes the residency lifecycle.
+            supports_sequential_offload: true,
             max_count: 1,
             component_precision_floors: &[],
             samplers: Vec::new(),
@@ -640,7 +669,13 @@ impl Generator for MiniMaxH3 {
 ///
 /// This is the `candle-gen-mochi` idiom — refuse at the registry entry point, which returns
 /// `gen_core::Result` and can therefore carry the contract-load-bearing
-/// [`gen_core::Error::Unsupported`] that `CandleError` has no variant for.
+/// [`candle_gen::gen_core::Error::Unsupported`] that `CandleError` has no variant for.
+///
+/// # Every other `LoadSpec` slot is decided too
+///
+/// The two checks below were the ones this crate shipped first, but "declared and unenforced" is a
+/// *class*, not two instances. `reject_unread_slots` closes the rest of it, and the three slots
+/// that are **not** refused are each accounted for there rather than left to inference.
 pub fn load(spec: &LoadSpec) -> candle_gen::gen_core::Result<Box<dyn Generator>> {
     if !spec.adapters.is_empty() {
         return Err(candle_gen::gen_core::Error::Unsupported(format!(
@@ -657,7 +692,76 @@ pub fn load(spec: &LoadSpec) -> candle_gen::gen_core::Result<Box<dyn Generator>>
              so a tier request is refused rather than silently rendered dense."
         )));
     }
+    reject_unread_slots(spec)?;
     Ok(Box::new(MiniMaxH3::load(spec)?))
+}
+
+/// **Refuse every `LoadSpec` slot this provider does not read**, naming the ones the caller set.
+///
+/// The same defect class as the `adapters` / `quantize` checks above, one field over. A caller that
+/// stages a ControlNet, an IP-Adapter, a PiD decoder, a face-ID bundle or an external text-encoder
+/// snapshot for this model gets weights that **nothing in this crate ever opens** — grep `src/` and
+/// `tests/` for any of these fields and the only hits are this function and the guard that proves
+/// it. Silently discarding them is precisely what this provider was already caught doing with
+/// `spec.adapters`.
+///
+/// This is the `candle-gen-flux2` accumulate-and-name idiom (`edit_provider.rs`), which reports
+/// *every* offending slot in one message rather than only the first: a caller fixing them one round
+/// trip at a time is a worse contract than one that lists them. The refusal is
+/// `Error::Unsupported`, matching the sibling refusals in `candle-gen-mochi`, `candle-gen-wan` and
+/// `candle-gen-ltx` for `control` / `extra_controls` / `ip_adapter`.
+///
+/// # The three slots that are deliberately NOT here
+///
+/// * **`spec.components`** — already refused, by `reject_unknown_components` inside
+///   [`MiniMaxH3::load`], against this model's (empty) `required_components`.
+/// * **`spec.offload_policy`** — deliberately *overridden*, not ignored: [`OFFLOAD_POLICY`] wins and
+///   [`MiniMaxH3::offload_policy`] reports the enforced value, so the override is observable rather
+///   than silent. Refusing a `Resident` request would break every caller that never asked for
+///   staging; see the module docs.
+/// * **`spec.load_shape`** — same shape. `crate::memory_strategy::LOAD_SHAPE` is pinned to the
+///   loader this crate actually has and published on the memory contract whatever the spec says,
+///   which `load_shape_is_pinned_to_the_loader_not_taken_from_the_spec` asserts. sc-18662 changes
+///   the loader, not this decision.
+fn reject_unread_slots(spec: &LoadSpec) -> candle_gen::gen_core::Result<()> {
+    let mut unread: Vec<&str> = Vec::new();
+    if spec.control.is_some() {
+        unread.push("control");
+    }
+    if !spec.extra_controls.is_empty() {
+        unread.push("extra_controls");
+    }
+    if spec.ip_adapter.is_some() {
+        unread.push("ip_adapter");
+    }
+    if spec.pid.is_some() {
+        unread.push("pid");
+    }
+    if spec.identity.is_some() {
+        unread.push("identity");
+    }
+    if spec.text_encoder.is_some() {
+        unread.push("text_encoder");
+    }
+    // `Precision::Bf16` is gen-core's "no override" sentinel, not a literal request, so only `Fp32`
+    // is an ask. This provider hardcodes `DType::BF16` to match the published checkpoint's block
+    // store; gen-core's own field docs say a provider that has not wired the override "rejects it
+    // at `load`", which is what this is.
+    if spec.precision != Precision::Bf16 {
+        unread.push("precision");
+    }
+    if unread.is_empty() {
+        return Ok(());
+    }
+    Err(candle_gen::gen_core::Error::Unsupported(format!(
+        "{MODEL_ID}: the candle lane reads none of these LoadSpec slots — {}. No code in this \
+         crate opens them, so honoring the load would render as though they were never set. \
+         `control`/`extra_controls`/`ip_adapter` need the conditioning branches this lane has not \
+         ported; `pid` and `identity` have no seam in this latent space; `text_encoder` is \
+         co-located under the snapshot root and is not relocatable here; `precision` is pinned to \
+         the checkpoint's bf16 block store. Drop the slot or pick a model that reads it.",
+        unread.join(", ")
+    )))
 }
 
 candle_gen::register_generators! {
@@ -699,6 +803,226 @@ mod tests {
         );
         assert_eq!(OFFLOAD_POLICY, OffloadPolicy::Sequential);
         assert_ne!(model.offload_policy(), spec.offload_policy);
+    }
+
+    /// This file's **production** source: the test module removed, then full-line comments stripped.
+    ///
+    /// Both exclusions are load-bearing, and each was observed to matter:
+    ///
+    /// * **The test module goes first.** This module's own staging table names every anchor the
+    ///   guard searches for, so scanning the whole file finds the guard's own string literals and
+    ///   the scan proves nothing about the code. The MLX sibling drops it for the same reason.
+    /// * **Then comments.** Prose legitimately narrates the call sites — the module docs discuss
+    ///   `drop` and the device release directly — so counting comment lines would make the gate
+    ///   track the documentation rather than the code.
+    fn production_source() -> String {
+        let whole = include_str!("model.rs");
+        let production = whole
+            .split_once("\n#[cfg(test)]\n")
+            .map_or(whole, |(before, _)| before);
+        assert!(
+            production.len() < whole.len(),
+            "expected a `#[cfg(test)]` module in model.rs; if it moved, this scan is reading the \
+             whole file and would match the test module's own anchor literals"
+        );
+        production
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The brace-matched body of one function, located by a signature that must be unique.
+    fn body_of(src: &str, signature: &str) -> String {
+        let start = src.find(signature).unwrap_or_else(|| {
+            panic!(
+                "model.rs no longer contains `{signature}`. This guard would otherwise silently \
+                 stop watching a renamed function, so it fails instead of passing vacuously"
+            )
+        });
+        assert!(
+            !src[start + signature.len()..].contains(signature),
+            "`{signature}` appears more than once; this scan reads only the first"
+        );
+        let open = start
+            + src[start..]
+                .find('{')
+                .expect("a function signature is followed by a body");
+        let mut depth = 0usize;
+        for (i, c) in src[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return src[open..open + i + 1].to_owned();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced braces while extracting `{signature}`")
+    }
+
+    /// **The staging itself is pinned — not merely the policy field.**
+    ///
+    /// The test above asserts `MiniMaxH3::offload_policy()`, and that is a real guard against a
+    /// `load` that starts echoing `spec.offload_policy`. It is also *all* it is: `self.offload` is
+    /// read by nothing on any render path. Delete every `drop` and every device release from
+    /// `generate_impl` and that test stays green, while the manifest's measured `vramGbByTier`
+    /// silently stops describing the render — the true peak becomes the ~143 GB **sum** of the
+    /// components instead of their max, and the worker admits cards against a number 3.5x too small.
+    ///
+    /// So this guard walks the staged phases of the three staging functions in this file's own
+    /// production source. Each phase must map its component, drop it, and release the device —
+    /// **before** the next phase maps anything. Deleting any single `drop(...)`, or any single
+    /// `crate::dit::release_device_memory(...)`, makes this red on its own; each was mutated
+    /// individually to prove it, not as a set.
+    ///
+    /// # What a source scan can and cannot see
+    ///
+    /// It **cannot** observe device bytes. It proves the releases are written and ordered, not that
+    /// the allocator returned pages, and it says nothing about a component held alive by a path it
+    /// does not name. The thing that *would* observe that is a weights-free behavioral seam — the
+    /// MLX sibling's `MemoryBehaviorRegistration` shape, with per-route fixtures a harness executes
+    /// without a checkpoint — and that is sc-18660's scope. Nothing in this crate can execute
+    /// `generate_impl` without a ~143 GB snapshot, so this is the strongest guard available at this
+    /// size: deliberately blunt, in exchange for being exact about the regression that was live.
+    #[test]
+    fn every_heavy_component_is_released_before_the_next_one_is_mapped() {
+        /// The explicit device release. Dropping the Rust binding alone is not enough — candle
+        /// hands the pages back to its own allocator, so without this the next phase maps on top.
+        const RELEASE: &str = "crate::dit::release_device_memory(";
+        /// The two bindings every text-encoder phase holds: the weight map and the tower built
+        /// from it. The tower is built *before* the map is dropped, necessarily, so a phase is a
+        /// group of maps and a group of releases rather than one pair.
+        const TE_MAPS: &[&str] = &[
+            "Weights::from_files_filtered",
+            "MiniMaxH3TextEncoder::from_weights",
+        ];
+
+        /// One staged phase: a name for the message, the source anchors that MAP its component,
+        /// and the source anchors that RELEASE it.
+        type Phase = (
+            &'static str,
+            &'static [&'static str],
+            &'static [&'static str],
+        );
+
+        // (function, its phases in source order).
+        let staged: [(&str, &[Phase]); 3] = [
+            (
+                "fn encode_prompt(",
+                &[(
+                    "the 66.7 GB Qwen3-VL-32B text encoder",
+                    TE_MAPS,
+                    &["drop(w);", "drop(te);"],
+                )],
+            ),
+            (
+                "fn encode_prompt_grounded(",
+                &[
+                    (
+                        "the Qwen3-VL vision tower",
+                        &["load_vision_tower("],
+                        &["drop(vision);"],
+                    ),
+                    (
+                        "the 66.7 GB Qwen3-VL-32B text encoder",
+                        TE_MAPS,
+                        &["drop(w);", "drop(te);", "drop(grounded);"],
+                    ),
+                ],
+            ),
+            (
+                "fn generate_impl(",
+                &[
+                    (
+                        "the 10.4 GB video VAE, keyframe encode",
+                        &["MiniMaxH3VideoVae::load("],
+                        &["drop(vae);"],
+                    ),
+                    (
+                        "the 66.3 GB DiT",
+                        &["MiniMaxH3Dit::load("],
+                        &["drop(model);"],
+                    ),
+                    (
+                        "the 10.4 GB video VAE, decode",
+                        &["MiniMaxH3VideoVae::load_decode_only("],
+                        &["drop(vae);"],
+                    ),
+                    (
+                        "the audio VAE, decode",
+                        &["self.load_audio_vae(", "MiniMaxH3AudioVae::from_weights("],
+                        &["drop(w);", "drop(vae);"],
+                    ),
+                ],
+            ),
+        ];
+
+        let src = production_source();
+        for (signature, phases) in staged {
+            let body = body_of(&src, signature);
+            // An unbalanced brace inside a string literal defeats the matcher, and a body that ran
+            // long would scan a sibling's staging as its own. Fail loudly on that rather than
+            // passing on borrowed evidence. (Overrunning the last function instead hits EOF, which
+            // `body_of` reports as unbalanced braces.)
+            for (other, _) in staged {
+                assert!(
+                    other == signature || !body.contains(other),
+                    "the extracted body of `{signature}` ran into `{other}`"
+                );
+            }
+
+            let mut cursor = 0usize;
+            for (phase, maps, releases) in phases {
+                let mut first_map = usize::MAX;
+                for m in *maps {
+                    let at = cursor
+                        + body[cursor..].find(m).unwrap_or_else(|| {
+                            panic!(
+                                "{signature} / {phase}: `{m}` no longer appears after the previous \
+                                 phase's device release. Either the component is gone or the phase \
+                                 order changed, and the measured sequential peak describes neither"
+                            )
+                        });
+                    first_map = first_map.min(at);
+                }
+                let mut last_release = first_map;
+                for r in *releases {
+                    let at = first_map
+                        + body[first_map..].find(r).unwrap_or_else(|| {
+                            panic!(
+                                "{signature} / {phase}: `{r}` is missing after the component is \
+                                 mapped. A heavy component mapped and never dropped turns the \
+                                 sequential peak into a SUM, and the manifest's measured \
+                                 vramGbByTier admits cards against the max"
+                            )
+                        });
+                    last_release = last_release.max(at);
+                }
+                cursor = last_release
+                    + body[last_release..].find(RELEASE).unwrap_or_else(|| {
+                        panic!(
+                            "{signature} / {phase}: no `{RELEASE}` between this phase's last drop \
+                             and the end of the function"
+                        )
+                    })
+                    + RELEASE.len();
+            }
+
+            // Exhaustive for this function: a phase added without a release must not be able to
+            // hide behind the phases that have one.
+            let found = body.matches(RELEASE).count();
+            assert_eq!(
+                found,
+                phases.len(),
+                "{signature} has {found} `{RELEASE}` call(s) for {} pinned phase(s) — if a phase \
+                 was added, add it to the table in this test so it is pinned too",
+                phases.len()
+            );
+        }
     }
 
     /// A staged snapshot root with all four component dirs — enough for `load` to succeed.
@@ -842,6 +1166,112 @@ mod tests {
         assert!(msg.contains("no tier loader"), "{msg}");
     }
 
+    /// **Every `LoadSpec` slot this provider does not read is refused, and each is proven alone.**
+    ///
+    /// `spec.adapters` and `spec.quantize` were the two this crate shipped first, but "declared and
+    /// unenforced" is a *class*. `control`, `extra_controls` and `ip_adapter` are explicitly refused
+    /// by `candle-gen-mochi`, `candle-gen-wan` and `candle-gen-ltx` — the very sibling idiom this
+    /// provider cites — and H3 reads none of them, nor `pid`, `identity`, `text_encoder` or a
+    /// non-default `precision`. Staging any of them produced a clean load and a render that behaved
+    /// as though the caller had never set it.
+    ///
+    /// Each pass mutates exactly ONE slot against a control that loads the SAME fixture with the
+    /// slot unset, so a refusal cannot be credited to a different slot or to a broken root. The
+    /// message assertion reads the generated slot LIST, not the static prose (which names several
+    /// slots and would satisfy a substring check even with the guard deleted) — so deleting any one
+    /// `if` in `reject_unread_slots` fails exactly one pass.
+    #[test]
+    fn every_unread_loadspec_slot_is_refused_and_names_itself() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = staged_root(&tmp);
+        let src = || WeightsSource::Dir(root.clone());
+
+        for slot in [
+            "control",
+            "extra_controls",
+            "ip_adapter",
+            "pid",
+            "identity",
+            "text_encoder",
+            "precision",
+        ] {
+            // The control, re-run every pass: the same root with the slot unset must still load.
+            load(&LoadSpec::new(src())).unwrap_or_else(|e| {
+                panic!(
+                    "{slot}: the bare spec must load — otherwise the refusal proves nothing: {e}"
+                )
+            });
+
+            let mut spec = LoadSpec::new(src());
+            match slot {
+                "control" => spec.control = Some(src()),
+                "extra_controls" => spec.extra_controls = vec![src()],
+                "ip_adapter" => spec.ip_adapter = Some(src()),
+                "pid" => {
+                    spec.pid = Some(candle_gen::gen_core::PidWeights {
+                        checkpoint: src(),
+                        gemma: src(),
+                    })
+                }
+                "identity" => {
+                    spec.identity = Some(candle_gen::gen_core::IdentityWeights {
+                        encoder: Some(src()),
+                        eva: None,
+                        face_dir: None,
+                    })
+                }
+                "text_encoder" => spec.text_encoder = Some(src()),
+                // `Precision::Bf16` is gen-core's "no override" sentinel, so `Fp32` is the only ask.
+                "precision" => spec.precision = Precision::Fp32,
+                other => unreachable!("unhandled slot `{other}`"),
+            }
+
+            let err = match load(&spec) {
+                Ok(_) => panic!(
+                    "`{slot}` was set and the load SUCCEEDED — nothing in this crate reads it, so \
+                     the render would silently ignore the caller's weights"
+                ),
+                Err(e) => e,
+            };
+            assert!(
+                matches!(err, candle_gen::gen_core::Error::Unsupported(_)),
+                "{slot}: must be the contract-load-bearing Unsupported, not an opaque Msg: {err:?}"
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&format!("slots — {slot}.")),
+                "the refusal must NAME the offending slot in its list so a caller knows what to \
+                 drop: {msg}"
+            );
+        }
+    }
+
+    /// The three `LoadSpec` slots that are decided but deliberately **not** refused stay that way.
+    ///
+    /// `offload_policy` and `load_shape` are *overridden and reported*, not ignored — refusing them
+    /// would break every caller that never asked for staging — and `components` is refused a layer
+    /// down by `reject_unknown_components`. This pins that a bare spec carrying the non-default
+    /// residency knobs still loads, so the refusal list above cannot quietly grow to cover them.
+    #[test]
+    fn the_residency_knobs_are_overridden_rather_than_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = staged_root(&tmp);
+        let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
+            .with_offload_policy(OffloadPolicy::Resident)
+            .with_load_shape(candle_gen::gen_core::LoadShape::DeferredMaterialization);
+        load(&spec).unwrap_or_else(|e| {
+            panic!("the residency knobs are honored by override, not refused, but load failed: {e}")
+        });
+
+        // ...and an unknown named component IS refused, one layer down.
+        let unknown = LoadSpec::new(WeightsSource::Dir(root.clone()))
+            .with_component("transformer_ref", WeightsSource::Dir(root));
+        assert!(
+            load(&unknown).is_err(),
+            "an unrecognized named component must be refused by reject_unknown_components"
+        );
+    }
+
     /// A snapshot missing any one of the four component directories fails at `load`, naming the
     /// component — not twenty minutes later inside a phase.
     #[test]
@@ -894,6 +1324,12 @@ mod tests {
         assert!(!d.capabilities.supports_lora);
         assert!(!d.capabilities.supports_lokr);
         assert!(d.capabilities.supported_quants.is_empty());
+        // The residency lifecycle IS wired — and forced — so the discovery signal says so. This is
+        // the bit a consumer reads to know whether `OffloadPolicy::Sequential` bounds the peak here
+        // or is a silent no-op; `false` would tell the fit-gate to size this render at the SUM of
+        // the components. It moves in lockstep with `OFFLOAD_POLICY` and the staging tripwire.
+        assert!(d.capabilities.supports_sequential_offload);
+        assert_eq!(OFFLOAD_POLICY, OffloadPolicy::Sequential);
         assert_eq!(
             d.capabilities.size_floor,
             SizeFloor::RangeCheckedOnGrid { multiple: 32 }

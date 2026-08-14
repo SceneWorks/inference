@@ -75,6 +75,13 @@ const CANDLE_LOGICAL_DEVICE: i32 = 0;
 /// engine failed silently and the peak describes a broken run.
 const DEGENERATE_STD_FLOOR: f64 = 3.0;
 
+/// How much the decode must add over the pre-decode sample before the peak is attributed to it.
+///
+/// Both sides of the difference are **over the idle baseline** (see `measure`), so this is a noise
+/// margin, not a bias allowance. It has to stay well under the smallest decode this could plausibly
+/// see — the video VAE alone is 10.42 GB — while being above nvidia-smi's sampling jitter.
+const DECODE_OWNER_THRESHOLD_GB: f64 = 0.5;
+
 /// The long edge of the shipped canvas: `768 · 16/9` snapped to the 32 stride.
 const CANVAS_LONG_EDGE: u32 = 1344;
 
@@ -178,7 +185,10 @@ fn measure(tier: &str) {
     // Split the render at the DECODE boundary. For H3 the 36-layer transformer VAE decoder is a real
     // candidate for the peak, unlike Wan where the denoise bound — so a single overall number cannot
     // say which stage it describes, and the manifest comment has to.
-    let mut pre_decode_gb = 0.0f64;
+    // **Absolute** device usage at the decode boundary — NOT baseline-subtracted, because the probe
+    // is sampled directly here and `report.baseline_gb` is not available until the report is folded.
+    // It is put on the same footing as `report.peak_gb` below, before anything is derived from it.
+    let mut pre_decode_abs_gb = 0.0f64;
     let mut denoise_high_bytes = 0u64;
     let started = std::time::Instant::now();
     // **The generate phase must be BRACKETED**, exactly as the Wan sibling brackets it. `report()`
@@ -191,7 +201,7 @@ fn measure(tier: &str) {
             // Sample the device directly rather than asking the probe: the probe's overall peak is
             // not folded until `end_gen`, so mid-render it does not yet know about this phase.
             // Base-10 GB, the manifest unit, matching the Wan probe's derivation line for line.
-            pre_decode_gb = used_mib(gpu).unwrap_or(0) as f64 * 1048576.0 / 1.0e9;
+            pre_decode_abs_gb = used_mib(gpu).unwrap_or(0) as f64 * 1048576.0 / 1.0e9;
             denoise_high_bytes = cuda_mempool_used_high_bytes(CANDLE_LOGICAL_DEVICE).unwrap_or(0);
             // Reset so the decode's concurrent-live peak is measured in isolation.
             reset_cuda_mempool_high_water(CANDLE_LOGICAL_DEVICE);
@@ -237,15 +247,27 @@ fn measure(tier: &str) {
     let denoise_high_gib = gib(denoise_high_bytes);
     let decode_high_gib = gib(decode_high_bytes);
     let true_mem_high_gib = denoise_high_gib.max(decode_high_gib);
+    // **Put both sides of the difference on the same footing before differencing them.**
+    // `report.peak_gb` is over the idle baseline (`VramProbe::report` subtracts it); the mid-render
+    // sample above is absolute. Differencing them directly carried up to a full baseline of bias —
+    // and `MAX_BASELINE_GB` is 1.0 GB, twice `DECODE_OWNER_THRESHOLD_GB`, so on a card with a
+    // tolerated-but-nonzero baseline the bias alone could flip `peakOwner` from decode to denoise.
+    // The story asks the manifest comment to NAME the peak-owning phase, so that is a published
+    // fact, not a log line — the Wan sibling shares this derivation but only prints it.
+    let pre_decode_gb = (pre_decode_abs_gb - report.baseline_gb).max(0.0);
     let decode_gb = (report.peak_gb - pre_decode_gb).max(0.0);
-    let owner = if decode_gb > 0.5 { "decode" } else { "denoise" };
+    let owner = if decode_gb > DECODE_OWNER_THRESHOLD_GB {
+        "decode"
+    } else {
+        "denoise"
+    };
 
     eprintln!(
         "\n[h3-vram] {MODEL_ID} {tier}: {report} | TRUE concurrent-live peak (USED_MEM_HIGH) \
          {true_mem_high_gib:.2} GiB = max(denoise {denoise_high_gib:.2}, decode \
-         {decode_high_gib:.2}) | pre-decode {pre_decode_gb:.1} GB | decode adds (nvidia-smi) \
-         {decode_gb:.1} GB | peak owner: {owner} | {} frames + {:.2}s audio in {secs:.0}s | \
-         middle-frame std {std:.1}",
+         {decode_high_gib:.2}) | pre-decode {pre_decode_gb:.1} GB over baseline (abs \
+         {pre_decode_abs_gb:.1}) | decode adds (nvidia-smi) {decode_gb:.1} GB | peak owner: \
+         {owner} | {} frames + {:.2}s audio in {secs:.0}s | middle-frame std {std:.1}",
         out_frames.len(),
         audio.samples.len() as f64
             / f64::from(audio.sample_rate.max(1))
@@ -254,12 +276,14 @@ fn measure(tier: &str) {
     // Machine-parseable — scrape `[[H3_VRAM]]`. `peakGb` is the nvidia-smi POOL high-water (base-10
     // GB, the manifest unit); `trueMemHighGib` is the driver mempool USED_MEM_HIGH concurrent-live
     // peak (base-2 GiB), split into `denoiseMemHighGib` / `decodeMemHighGib` so the owning stage is
-    // attributable rather than guessed.
+    // attributable rather than guessed. `preDecodeGb` is over the idle baseline, like `peakGb`;
+    // `preDecodeAbsGb` is the raw device sample it came from, kept as provenance for the scrape.
     println!(
         "[[H3_VRAM]] {{\"model\":\"{MODEL_ID}\",\"tier\":\"{tier}\",\"peakGb\":{:.3},\
          \"trueMemHighGib\":{true_mem_high_gib:.2},\"denoiseMemHighGib\":{denoise_high_gib:.2},\
          \"decodeMemHighGib\":{decode_high_gib:.2},\"peakOwner\":\"{owner}\",\
-         \"preDecodeGb\":{pre_decode_gb:.1},\"decodeGb\":{decode_gb:.1},\
+         \"preDecodeGb\":{pre_decode_gb:.1},\"preDecodeAbsGb\":{pre_decode_abs_gb:.1},\
+         \"decodeGb\":{decode_gb:.1},\
          \"steadyGb\":{:.1},\"loadPeakGb\":{:.1},\"baselineGb\":{:.2},\
          \"vramMeasuredPixels\":{},\"frames\":{},\"width\":{width},\"height\":{height},\
          \"steps\":{steps},\"middleFrameStd\":{std:.1},\"seconds\":{secs:.0}}}",

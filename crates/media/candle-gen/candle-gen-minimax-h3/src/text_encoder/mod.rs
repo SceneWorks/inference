@@ -35,7 +35,7 @@
 //! expressed as a **key prefix set** instead: [`lm_prefixes`] names `embed_tokens` and layers
 //! `0..select_hidden` and nothing else, so `{prefix}.norm.weight`, layers 50-63 and `lm_head.weight`
 //! are never materialized on any device. The two backends therefore arrive at the same ~53 GB
-//! conditioning working set by different routes, and [`tests::lm_prefixes_stop_at_the_selected_layer`]
+//! conditioning working set by different routes, and `tests::lm_prefixes_stop_at_the_selected_layer`
 //! pins that the prefix list cannot silently widen.
 //!
 //! The **vision tower** is consumed from `candle-gen-boogu` rather than duplicated — H3's
@@ -129,7 +129,7 @@ pub struct MiniMaxH3TeConfig {
     /// assignment (frequency `j` belongs to axis `j % 3` within the section span) over the
     /// *contiguous* blocking older Qwen-VL used. `candle_gen::grounding::mrope_cos_sin` implements
     /// the interleaved form and only that form, so this field is a **parse assertion** here rather
-    /// than a dispatch: [`tests::mrope_interleaved_is_load_bearing`] pins the parse and
+    /// than a dispatch: `tests::mrope_interleaved_is_load_bearing` pins the parse and
     /// [`encoder::MiniMaxH3TextEncoder::from_weights`] refuses a config that declares `false`,
     /// because silently running the interleaved kernel under a contiguous declaration is exactly the
     /// class of divergence nothing downstream can see.
@@ -291,7 +291,7 @@ pub fn lm_prefixes(prefix: &str, cfg: &MiniMaxH3TeConfig) -> Vec<String> {
 /// has no such field because its tower infers the MLP width from the `linear_fc1` / `linear_fc2`
 /// weight shapes. That is a loader difference, not a geometry one — the same 4304 is read off the
 /// checkpoint either way — so there is nothing to declare here, and
-/// [`tests::vision_config_matches_boogu_except_the_lm_width`] compares only fields that exist on
+/// `tests::vision_config_matches_boogu_except_the_lm_width` compares only fields that exist on
 /// both.
 pub fn minimax_h3_vision_config() -> VisionConfig {
     VisionConfig {
