@@ -27,6 +27,7 @@
 use mlx_rs::ops::add;
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
@@ -143,6 +144,36 @@ impl TokenRefiner {
     /// Blocks loaded — `num_refiner_layers`.
     pub fn num_layers(&self) -> usize {
         self.blocks.len()
+    }
+}
+
+/// `attn.*` / `ff.*` — the same six adaptable leaves a [`crate::dit::block::DitBlock`] exposes.
+/// `norm1` / `norm2` are RMSNorm gains and are deliberately unreachable (sc-18724).
+impl AdaptableHost for TokenRefinerBlock {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["attn", rest @ ..] => self.attn.adaptable_mut(rest),
+            ["ff", rest @ ..] => self.ff.adaptable_mut(rest),
+            _ => None,
+        }
+    }
+}
+
+/// `refiner_blocks.{i}.…`.
+///
+/// **The refiner is load-bearing for the turbo LoRA and must never be stubbed** (sc-18724): 24 of the
+/// 624 lightx2v turbo tensors target `token_refiner.refiner_blocks.{0,1}`, so a stubbed refiner puts
+/// them in `unmatched_paths` and fails the strict install. sc-17144 already required a real refiner
+/// for parity; this is a second, independent reason.
+impl AdaptableHost for TokenRefiner {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["refiner_blocks", i, rest @ ..] => {
+                let idx: usize = i.parse().ok()?;
+                self.blocks.get_mut(idx)?.adaptable_mut(rest)
+            }
+            _ => None,
+        }
     }
 }
 
