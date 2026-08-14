@@ -12,6 +12,10 @@ name: Real-weight validation
 #   rw-mage     Qwen-Image + Qwen-Image-Edit + Fun-Controlnet-Union  ~170 GiB  BOTH boxes
 #               MLX re-hosts, both PiD students, Gemma-2-2B,
 #               FLUX.1-dev, two lightx2v Lightning LoRAs  (sc-17284)
+#   rw-mage     MiniMax-H3 upstream slice: vae/ + audio_vae/ +        ~10.8 GiB BOTH boxes
+#               FL2VA/audio_vae/ + tokenizer/ + the TE shard index,
+#               PLUS the ~840 KB operator diffusers VAE reference
+#               (`MINIMAX_H3_VIDEO_VAE_REFERENCE`)  (sc-18932)
 #   rw-sa3      Stable Audio 3 / SAME                                ~0        nax-macos
 #   rw-krea     Krea Realtime 14B + Wan style/distill LoRAs          ~20 GiB   nax-macos-2
 #   rw-audio    Kokoro, MOSS SFX/TTSD/TTS-Realtime, ACE-Step, ...    ~42 GiB   nax-macos-2
@@ -42,6 +46,14 @@ name: Real-weight validation
 # in Actions, so it cannot self-heal. Therefore: **every box carrying `rw-mage` must have the bundle
 # provisioned by hand, and adding the label to a box without it is what actually breaks `mlx-media`
 # — not moving the label around.**
+#
+# sc-18932 added a SECOND asset in that class, and it is a per-box requirement for the same reason:
+# `MINIMAX_H3_VIDEO_VAE_REFERENCE`, the ~840 KB `(latent, decoded)` pair produced by running the
+# official diffusers `AutoencoderKLMiniMaxH3` over the real `vae/`. It exists on no Hub, this
+# workflow refuses to regenerate it (no approved wheel lock is a torch environment), and without it
+# `mlx-minimax-h3` fails closed on its last step — deliberately, because that step is the only gate
+# in either backend that can catch a layout error against real weights. Producer command and the
+# variable convention are in that job.
 #
 # Both boxes have the bundle, confirmed 2026-08-05. `nax-macos` was checked from a shell on the box:
 # 461 MB, all 18 required files present as regular non-symlink files, which is exactly what `Require
@@ -106,7 +118,7 @@ on:
         default: all
         # `audio` still runs every audio family. The `audio-*` entries are the per-family split
         # (sc-16981) — dispatch one provider family without taking the Metal runner for the rest.
-        options: [all, llm, llm-joycaption, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-s18-sweep, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base]
+        options: [all, llm, llm-joycaption, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-s18-sweep, minimax-h3, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base]
       sceneworks_revision:
         description: Exact lowercase SceneWorks commit paired with memory-evidence-v1
         type: string
@@ -2778,6 +2790,231 @@ jobs:
             ${{ runner.temp }}/gpu-fault-evidence/memory.csv
             ${{ runner.temp }}/gpu-fault-evidence/gpu-events.txt
 
+  # sc-18932 — the FIRST MiniMax-H3 lane in this repository, and what it fixes is narrower than
+  # "missing coverage". `MINIMAX_H3_SNAPSHOT` is read by ~30 `#[ignore]`d tests across BOTH backends
+  # and was referenced by no workflow at all, so not one of them could run anywhere except by hand on
+  # a dev box. The tests themselves are correct — they ASSERT on the variable rather than returning
+  # early, so an unset snapshot fails at exit 101 instead of printing `ok` in 0.00 s — which is why
+  # this was invisible: there was never a vacuous green to notice, just silence.
+  #
+  # MEASURED ON nax-macos 2026-08-13, release profile, warm weights: all nine invocations below
+  # total ~3.0 s of test time (the five header/config gates ~0.1 s, the three decodes 0.74 + 0.35 +
+  # 0.11 s, the parity gate 0.30 s). MLX mmaps and materializes per tensor, so "load the 9.7 GB VAE"
+  # is 22 ms. The `timeout-minutes` below is therefore ENTIRELY cold build (5m36s for the mlx-gen
+  # tree measured here) plus a possible 11.640 GB first transfer — not test time.
+  #
+  # TIME IS NOT THE ONLY BUDGET, and this block recorded only the time one. The largest memory
+  # consumer here is the LAST step, not the decodes: the sc-18740 parity gate builds the video VAE
+  # at `Dtype::Float32` — deliberately, to keep the comparison about layout rather than about bf16
+  # rounding — so it holds ~19.4 GB of parameters (the 9.7 GB bf16 `vae/` materialized at f32; the
+  # test's own note rounds that to ~20 GB) against ~10 GB for the three bf16 decode smokes and
+  # ~0.6 GB for the audio one. That is a figure DECLARED by the crate and derivable from the
+  # component size, not one measured on either runner.
+  #
+  # It matters because `rw-mage` is registered on BOTH Macs (below) and this lane has never run on
+  # either. The only host figure this repository carries for `nax-macos-2` is the ~101 GiB in
+  # `scripts/ci/s18_memory_preflight.py`, and that was inferred from `active+wired` sampling during
+  # an S18 sweep rather than read off the box — and it is a physical-RAM-shaped number, which is not
+  # the Metal working-set budget. `Record the macOS device inventory` below prints both, labelled
+  # separately, so this lane's first run retires the constant instead of leaving it as an errand.
+  #
+  # `rw-mage` rather than a new label: a label no runner carries does not fail, it queues silently
+  # until the run is cancelled (see this file's header), and `rw-mage` is registered on BOTH Macs.
+  # The 11.640 GB `minimax-h3` slice self-heals from the Hub on either box. The diffusers VAE
+  # reference does NOT — see the step that requires it.
+  mlx-minimax-h3:
+    name: MLX MiniMax-H3 real weights
+    # Selectable on its own so the 11.6 GB fetch does not require running the Mage-oracle job that
+    # shares the `media` profile — the same split `krea-realtime` gets, for the same reason.
+    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'media' || inputs.profile == 'minimax-h3'
+    runs-on: [self-hosted, macOS, ARM64, rw-mage]
+    timeout-minutes: 60
+    env:
+      # The snapshot ROOT — the directory holding `vae/`, not `vae/` itself. Every test in the family
+      # joins its own component onto this (`vae/`, `audio_vae/`, `FL2VA/audio_vae/`, `tokenizer/`,
+      # `text_encoder/`), so pointing it one level in silently breaks all of them at once.
+      MINIMAX_H3_SNAPSHOT: ${{ vars.MINIMAX_H3_SNAPSHOT }}
+      # An OPERATOR-PROVISIONED file, not a snapshot: the `(latent, decoded)` pair
+      # `crates/media/mlx-gen/tools/dump_minimax_h3_video_vae_real.py` writes by running the official
+      # diffusers `AutoencoderKLMiniMaxH3` over the real `vae/`. ~840 KB, deliberately uncommitted
+      # (real-weight bytes). Same class as `MAGE_ORACLE_SEED_DIR`: it exists on no Hub, this workflow
+      # deliberately refuses to regenerate it in Actions (that would need a pinned torch+diffusers
+      # environment, and none of the four approved wheel locks is one), and it cannot self-heal.
+      MINIMAX_H3_VIDEO_VAE_REFERENCE: ${{ vars.MINIMAX_H3_VIDEO_VAE_REFERENCE }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      # Repository variables hold ONE value for every runner in a label pool, but the two
+      # macOS boxes do not share a home directory. A `~/`-relative value is resolved here
+      # against the home of whichever runner actually claimed this job; absolute values
+      # pass through untouched, so variables can be flipped one at a time.
+      - name: Resolve runner-local snapshot paths
+        run: >-
+          python3.12 scripts/release/resolve_snapshot_paths.py
+          MINIMAX_H3_SNAPSHOT MINIMAX_H3_VIDEO_VAE_REFERENCE
+      - name: Toolchain versions
+        run: rustc --version && cargo --version
+      # An unset repo variable would otherwise reach `ensure_model_snapshot.py` as an empty path and
+      # fail as a confusing "revision mismatch" rather than "you did not configure this lane".
+      - name: Require the operator-provisioned snapshot path
+        run: |
+          if [[ -z "$MINIMAX_H3_SNAPSHOT" ]]; then
+            echo "Repository variable MINIMAX_H3_SNAPSHOT is unset; this lane cannot resolve its snapshot path" >&2
+            exit 1
+          fi
+          if [[ "$MINIMAX_H3_SNAPSHOT" != /* ]]; then
+            echo "MINIMAX_H3_SNAPSHOT must be an absolute path, got: $MINIMAX_H3_SNAPSHOT" >&2
+            exit 1
+          fi
+      # Both variables, matching `Resolve runner-local snapshot paths` exactly — a lane that resolves
+      # a path the report omits is silently exempt from the only disk accounting either Mac gets
+      # (`test_every_resolving_lane_reports_what_it_costs`). The reference file is ~840 KB rather than
+      # a snapshot, so what its line is worth here is PRESENCE, not bytes: it is the one asset in this
+      # lane that cannot self-heal, and the run log is the only place its absence is visible before
+      # the last step fails on it.
+      - name: Report runner disk headroom
+        continue-on-error: true
+        run: >-
+          scripts/ci/report_runner_disk_headroom.sh
+          MINIMAX_H3_SNAPSHOT MINIMAX_H3_VIDEO_VAE_REFERENCE
+      # Report-only, and it exists to RETIRE an unmeasured constant rather than leave it as a human
+      # errand — the same job `Record the CUDA device inventory` does for the Windows lane below,
+      # in the shape that step uses: a presence guard, `continue-on-error: true`, and no assertion
+      # of any kind. The step above measures DISK; this one measures the other axis. `rw-mage` is on
+      # both Macs, this lane's parity gate holds ~20 GB at f32, and the only host figure this
+      # repository carries for `nax-macos-2` is a ~101 GiB number inferred from sampling in
+      # `scripts/ci/s18_memory_preflight.py`. One run puts a real one in the log, for ~1 s.
+      #
+      # THE TWO NUMBERS ARE DIFFERENT QUANTITIES and neither is derivable from the other, so both
+      # are printed and both are labelled. `hw.memsize` is physical RAM. Metal's
+      # `recommendedMaxWorkingSetSize` is the per-device working-set budget the driver advertises,
+      # and it is the one an MLX allocation is actually sized against — on `nax-macos` (Mac17,6)
+      # they read 128.00 GiB and 107.52 GiB respectively, measured on the box 2026-08-13. Sizing a
+      # Metal workload against the RAM figure overstates the budget by ~20 GiB on that box alone.
+      #
+      # `swift` because there is no sysctl for the Metal figure: it comes from `MTLDevice`, and
+      # `system_profiler SPDisplaysDataType` (used by the SA3 lanes here) does not report it. A
+      # runner without the toolchain prints the RAM half and says so rather than failing.
+      - name: Record the macOS device inventory
+        continue-on-error: true
+        run: |
+          sysctl -n hw.model hw.memsize | awk '
+            NR == 1 { print "host.hw_model=" $0 }
+            NR == 2 { printf "host.hw_memsize=%.2f GiB (%s bytes, physical RAM)\n", $0 / 1073741824, $0 }'
+          if ! command -v swift > /dev/null 2>&1; then
+            echo "metal.recommendedMaxWorkingSetSize=<not captured — swift is not on this runner's PATH>"
+            exit 0
+          fi
+          swift - <<'SWIFT'
+          import Foundation
+          import Metal
+
+          if let device = MTLCreateSystemDefaultDevice() {
+              let bytes = device.recommendedMaxWorkingSetSize
+              print("metal.device=\(device.name)")
+              print(String(format: "metal.recommendedMaxWorkingSetSize=%.2f GiB (%llu bytes, NOT hw.memsize)",
+                           Double(bytes) / 1073741824.0, bytes))
+          } else {
+              print("metal.recommendedMaxWorkingSetSize=<not captured — no default Metal device>")
+          }
+          SWIFT
+      # Fetches the 11.640 GB `download_files` slice of the 196 GB repository, never the whole thing;
+      # see the `minimax-h3` row in release/real-weight-models.toml for the per-component breakdown
+      # and for which two components are deliberately left out.
+      - name: Materialize and verify immutable snapshot
+        run: |
+          python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model minimax-h3 --snapshot "$MINIMAX_H3_SNAPSHOT"
+      # Name-selected with `--exact` AFTER the `--` plus a run-count assertion, never `--ignored` as a
+      # blanket. `--exact` before the `--` is REJECTED by cargo, which reports the rejection as exit 0;
+      # and with the flag accepted but no count assertion a rename yields "0 passed; N filtered out"
+      # and still exits 0, so the step would go green gating nothing. Both halves are required.
+      #
+      # These five read safetensors HEADERS and JSON only — no weight I/O, no Metal — which is why
+      # they run on every invocation of this lane rather than behind a dispatch profile.
+      - name: Run MiniMax-H3 header and config gates
+        run: |
+          set -o pipefail
+          run_one() {
+            local name="$1" out
+            out="$(cargo test --locked --release -p mlx-gen-minimax-h3 --test real_weights \
+              "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+            if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
+              echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
+              return 1
+            fi
+          }
+          run_one declared_tensor_names_match_the_published_checkpoint
+          run_one declared_audio_tensor_names_match_the_published_checkpoint
+          run_one published_audio_configs_reproduce_the_declared_geometry
+          run_one te_layer_50_tap_is_exhaustive_and_the_tail_is_trimmable
+          run_one real_tokenizer_resolves_the_minimax_special_tokens
+      # The decodes. ~10 GB resident for the video VAE and ~0.6 GB for the audio one on MLX — well
+      # under the f32 candle figures in the crate docs, because these load the checkpoint's own bf16
+      # lazily. That is true of THESE THREE only: the parity gate below is f32 and is this lane's
+      # memory peak, so this is not the step to size the runner against.
+      - name: Run MiniMax-H3 VAE decode smokes
+        run: |
+          set -o pipefail
+          run_one() {
+            local name="$1" out
+            out="$(cargo test --locked --release -p mlx-gen-minimax-h3 --test real_weights \
+              "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+            if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
+              echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
+              return 1
+            fi
+          }
+          run_one real_weight_decode_produces_a_plausible_video
+          run_one real_weight_multi_chunk_decode_blends_the_seam
+          run_one real_weight_audio_decode_produces_a_plausible_stereo_track
+      # LAST, and deliberately so. This is the only gate in either backend that can catch a LAYOUT
+      # error against real weights — the sc-18740 class, where an FFN gate/value half-swap shipped
+      # green because every self-generated number simply re-derived whatever the port did. It needs an
+      # artifact this workflow cannot produce, so an operator who has not placed that file yet gets a
+      # red AFTER the other eight gates have already reported, rather than instead of them.
+      #
+      # Produce it on a box that holds the full snapshot, from a torch+diffusers environment:
+      #   MINIMAX_H3_SNAPSHOT=<root> python3 crates/media/mlx-gen/tools/dump_minimax_h3_video_vae_real.py \
+      #     --out ~/minimax-h3-real-vae-reference.safetensors
+      # then set the repository variable to `~/minimax-h3-real-vae-reference.safetensors` (the leading
+      # `~/` is resolved per-runner above). EVERY box carrying `rw-mage` needs its own copy, exactly
+      # as this file's header says of the Mage oracle bundle.
+      - name: Require the operator-provisioned diffusers VAE reference
+        run: |
+          if [[ -z "$MINIMAX_H3_VIDEO_VAE_REFERENCE" ]]; then
+            echo "Repository variable MINIMAX_H3_VIDEO_VAE_REFERENCE is unset; the sc-18740 layout gate cannot run and this lane refuses to report green without it" >&2
+            exit 1
+          fi
+          if [[ "$MINIMAX_H3_VIDEO_VAE_REFERENCE" != /* ]]; then
+            echo "MINIMAX_H3_VIDEO_VAE_REFERENCE must be an absolute path, got: $MINIMAX_H3_VIDEO_VAE_REFERENCE" >&2
+            exit 1
+          fi
+          if [[ ! -s "$MINIMAX_H3_VIDEO_VAE_REFERENCE" ]]; then
+            echo "MINIMAX_H3_VIDEO_VAE_REFERENCE names no non-empty file on this runner: $MINIMAX_H3_VIDEO_VAE_REFERENCE" >&2
+            exit 1
+          fi
+      # THIS LANE'S MEMORY PEAK, and the reason the job header carries a memory budget at all. The
+      # test builds the VAE at `Dtype::Float32` (`tests/real_weights.rs`, the `f32 to keep the
+      # comparison about layout rather than about bf16 rounding` line) rather than at the
+      # checkpoint's bf16, so it is ~19.4 GB of parameters — the 9.7 GB bf16 `vae/` materialized at
+      # f32, which the test's own note rounds to ~20 GB — where the three smokes above are ~10 GB.
+      # Casting it down would be cheaper and would also delete the gate: at bf16 the residual this
+      # compares against diffusers is dominated by rounding rather than by layout.
+      #
+      # DECLARED, not measured on a runner: `Record the macOS device inventory` above is what puts a
+      # real capacity for the box that claimed this job in the log, and `hw.memsize` and the Metal
+      # working-set budget are reported there as the two separate numbers they are.
+      - name: Run MiniMax-H3 video VAE parity against official diffusers
+        run: |
+          set -o pipefail
+          name=real_weight_decode_matches_the_official_diffusers_vae
+          out="$(cargo test --locked --release -p mlx-gen-minimax-h3 --test real_weights \
+            "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+          if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
+            echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
+            exit 1
+          fi
+
   # sc-16981: this was ONE `Candle audio real weights` job running 30 real-weight invocations back
   # to back. The 2026-08-02 weekly (run 30741567385) was the first time it actually executed since
   # the snapshot-path fix, and it consumed GitHub's 360-minute default WITHOUT hanging — 17 of 30
@@ -5039,4 +5276,102 @@ jobs:
           cargo test --locked -p candle-audio-mmaudio --features cuda --release --test %~1 %~2 -- --ignored --exact --nocapture > "%log%" 2>&1 || (type "%log%" & exit /b 1)
           type "%log%"
           findstr /C:"test result: ok. 1 passed" "%log%" >nul || (echo ::error::%~2 did not run exactly one passing test - a rename would make this step vacuously green & exit /b 1)
+          exit /b 0
+
+  # sc-18932 — the candle half of the MiniMax-H3 wiring. Same defect as `mlx-minimax-h3` above:
+  # `candle-gen-minimax-h3/tests/real_weights.rs` (sc-17154) reads `MINIMAX_H3_SNAPSHOT` and no
+  # workflow set it, so its eight tests ran nowhere. This is NOT sc-18677 — that story provisioned
+  # the weights on this runner and generalized `windows-candle.yml`, which lives in the SceneWorks
+  # repository; the inference-side inventory row and this lane are what was left over.
+  #
+  # WHAT THIS RUNS: the four gates that read safetensors headers, published JSON, and four 12-tap
+  # filter buffers. Measured 2026-08-13 on nax-macos (same code, CPU device, release): 0.00 s each.
+  # `--features cuda` is carried anyway because compiling this crate on the CUDA lane is itself
+  # coverage nothing else provides — no existing job builds `candle-gen-minimax-h3` with it.
+  #
+  # WHAT THIS DOES NOT RUN, named so it is not rediscovered as an oversight:
+  #   * the three decode smokes — the crate loads at f32 to stay comparable with the committed
+  #     fixture lane, so they are ~19.4 GB (video) and ~1.2 GB (audio) resident, and with
+  #     `--features cuda` that lands on the GPU. This repository records no VRAM figure for this box
+  #     anywhere, and sizing a lane against an unmeasured constant is how the sc-16981 defect
+  #     happened. The `Record the CUDA device inventory` step below prints that number on the first
+  #     run of this lane, so the decision is one run away rather than one investigation away.
+  #   * `real_weight_decode_matches_the_official_diffusers_vae` — additionally needs the operator
+  #     reference artifact the macOS lane requires, which has never been placed on this box.
+  #   * `declared_dit_tensor_names_match_the_published_checkpoint` and
+  #     `the_adaln_projections_are_the_documented_twenty_six_gigabytes` — header-only, but they need
+  #     the 62 GB `transformer/` component, which the `minimax-h3` row deliberately does not fetch.
+  candle-minimax-h3:
+    name: Candle MiniMax-H3 real weights (CUDA)
+    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'media' || inputs.profile == 'minimax-h3'
+    runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 120
+    env:
+      # Repository variables hold runner-local absolute paths, so the Windows box needs its own value
+      # — `vars.MINIMAX_H3_SNAPSHOT` is the macOS `~/`-relative one. The name on the LEFT is what the
+      # crate reads and what the manifest wiring gate counts; a bare `${{ vars.X }}` would not wire it.
+      # sc-18677 provisioned the snapshot here at
+      # `E:\huggingface\hub\models--MiniMaxAI--MiniMax-H3\snapshots\939557dc319dd91227e30195a763f272ba7f8765`.
+      MINIMAX_H3_SNAPSHOT: ${{ vars.CANDLE_MINIMAX_H3_SNAPSHOT }}
+      # 80 on the Ampere runner; set 120 on a Blackwell runner (matches the other CUDA jobs here).
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Select Git Bash
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+          components: rustfmt, clippy
+      - name: Require operator-provided MiniMax-H3 snapshot
+        shell: cmd
+        run: |
+          if "%MINIMAX_H3_SNAPSHOT%"=="" (
+            echo Missing repository variable CANDLE_MINIMAX_H3_SNAPSHOT for the Windows CUDA runner.
+            exit /b 1
+          )
+      # Report-only, and it exists to RETIRE the "unmeasured constant" above rather than to leave it
+      # for someone to go and look up. The three decode smokes are excluded here solely because this
+      # repository records no VRAM figure for this box anywhere — `CUDA_COMPUTE_CAP: "80"` names an
+      # architecture, not a capacity. This prints one, on the first run of this lane, at zero cost;
+      # `continue-on-error` because a step that only produces a record must never red a lane, and
+      # `where` first because `nvidia-smi` is not on PATH on every CUDA host.
+      - name: Record the CUDA device inventory
+        continue-on-error: true
+        shell: cmd
+        run: |
+          where nvidia-smi >nul 2>&1 || (echo nvidia-smi not on PATH; exit /b 0)
+          nvidia-smi --query-gpu=index,name,memory.total,memory.free --format=csv
+      - name: Materialize and verify immutable snapshot
+        shell: cmd
+        run: |
+          python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt
+          set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
+          rem MiniMaxAI/MiniMax-H3 is a ~196 GB repo; the `minimax-h3` row carries a `download_files`
+          rem allow-list so only the 11.640 GB the tests below read is fetched.
+          python scripts/release/ensure_model_snapshot.py --model minimax-h3 --snapshot "%MINIMAX_H3_SNAPSHOT%" || exit /b 1
+      # Name-selected with `--exact` AFTER the `--` plus a run-count assertion, for the reasons the
+      # `candle-mmaudio` job above spells out: `--exact` before the `--` is rejected by cargo and the
+      # rejection is reported as exit 0, and without the count a rename yields "0 passed; N filtered
+      # out" and still exits 0.
+      - name: Run MiniMax-H3 header and config gates
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          call :run_one declared_tensor_names_match_the_published_checkpoint || exit /b 1
+          call :run_one declared_audio_tensor_names_match_the_published_checkpoint || exit /b 1
+          call :run_one published_audio_configs_reproduce_the_declared_geometry || exit /b 1
+          call :run_one stored_kaiser_filters_match_the_derivation_on_real_weights || exit /b 1
+          exit /b 0
+
+          :run_one
+          set "log=%RUNNER_TEMP%\minimax-h3-%~1.log"
+          cargo test --locked -p candle-gen-minimax-h3 --features cuda --release --test real_weights %~1 -- --ignored --exact --nocapture > "%log%" 2>&1 || (type "%log%" & exit /b 1)
+          type "%log%"
+          findstr /C:"test result: ok. 1 passed" "%log%" >nul || (echo ::error::%~1 did not run exactly one passing test - a rename would make this step vacuously green & exit /b 1)
           exit /b 0
