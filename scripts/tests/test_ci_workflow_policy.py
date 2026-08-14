@@ -2172,6 +2172,18 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                     expected,
                 )
 
+    def test_windows_cuda_jobs_cap_cargo_parallelism_for_shared_host(self) -> None:
+        jobs = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]
+
+        for job_name in ("windows-cuda-check", "windows-cuda"):
+            with self.subTest(job=job_name):
+                self.assertEqual(
+                    jobs[job_name]["env"].get("CARGO_BUILD_JOBS"),
+                    "12",
+                    "both Windows CUDA listeners share one 48-thread host; an uncapped Cargo "
+                    "process on each listener can overwhelm Windows with rustc launches",
+                )
+
     def test_merge_queue_speculative_ref_can_reach_the_workflow(self) -> None:
         triggers = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))[True]
         self.assertIn(

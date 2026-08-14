@@ -427,6 +427,10 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: [self-hosted, windows, cuda]
     env:
+      # Two listeners share this 48-thread host. Leaving Cargo at its per-process default lets
+      # overlapping CI runs launch roughly 96 compilers and trigger Windows DLL-init failures.
+      # Twelve jobs per listener leaves headroom for sccache, linkers, nvcc, and the runner itself.
+      CARGO_BUILD_JOBS: "12"
       CUDA_COMPUTE_CAP: "80"
       CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
@@ -489,6 +493,8 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && needs.changes.outputs.windows_cuda == 'true'
     runs-on: [self-hosted, windows, cuda]
     env:
+      # Keep manual runs inside the same per-listener budget as the automatic compile check.
+      CARGO_BUILD_JOBS: "12"
       CUDA_COMPUTE_CAP: "80"
       CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
