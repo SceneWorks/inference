@@ -376,7 +376,9 @@ impl MiniMaxH3VideoVae {
     /// tail of the concatenation, not per clip.
     ///
     /// The pad and the multi-clip concatenation are gated by the `multiclip` probe of
-    /// `real_weight_encode_matches_the_official_diffusers_vae` (25 frames, deliberately ragged).
+    /// `real_weight_encode_matches_the_official_diffusers_vae` (20 frames, deliberately ragged; 25
+    /// was measured inert — the pad lands inside the dropped tail, see the note in
+    /// `real_weights.rs`).
     /// Every committed fixture is 1, 5 or exactly 17 frames and reaches neither, and a front pad, a
     /// zero pad or a per-clip `token_drop` all give the identical output *shape* — so only a
     /// reference from the official implementation separates them (sc-19008 review).

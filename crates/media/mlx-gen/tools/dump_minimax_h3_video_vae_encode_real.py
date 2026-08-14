@@ -73,10 +73,10 @@ CLIP_HW = 128
 #
 # **Why 20 and not any other ragged count.** `token_drop` removes 3 latent frames from the tail, so
 # only the first `tokens_chunk_size - token_drop` = 2 latent frames of the final clip survive, and
-# those reach back over clip-local pixels `0 .. (2 - 1) * 4 = 4` only. If the final clip carries
-# more than 5 real frames, every repeated frame sits beyond that reach and the repeat's *content*
-# is unobservable — measured, not assumed: at 25 frames, repeating the FIRST frame instead of the
-# LAST leaves the encode bit-identical. The probe therefore needs
+# those reach back over clip-local pixels `0 .. pad_reach = (2 - 1) * 4 = 4` only. If the final clip
+# carries more than `pad_reach` real frames, every repeated frame sits beyond that reach and the
+# repeat's *content* is unobservable — measured, not assumed: at 25 frames, repeating the FIRST
+# frame instead of the LAST leaves the encode bit-identical. The probe therefore needs
 # `MULTICLIP_FRAMES % clip_length <= (tokens_chunk_size - token_drop - 1) * temporal_ratio`, which
 # 20 satisfies (3 real trailing frames, pads from index 3) and 25 does not. Asserted below from the
 # loaded config rather than restated as a literal.

@@ -59,6 +59,12 @@ const VAE_ENCODE_TENSORS: usize = 118;
 /// runner (sc-18677), whose reduction orders differ again and whose own floor has not been
 /// measured. The headroom covers a device change; it is not a claim about one.
 ///
+/// **The exposure sits on exactly the quantity that already sets the floor**: the worst entry in
+/// the table is a `std`, and `std` is `exp(0.5 * logvar)` (`vae_encoder.rs`), so an absolute wobble
+/// in `logvar` comes back as a *relative* one in `std`, magnified by the exponential — and a device
+/// change is what reorders the reductions in the conv stack feeding it. That is a reason to expect
+/// movement there first, not a measurement of it.
+///
 /// What it is *not* is the 2e-2 house value it replaced (sc-19008 review): that sat 1155x above the
 /// measurement and so stated a convention in the voice of a derivation. The band between the two is
 /// not hypothetical — a 1e-3 relative drift injected into the encoder output measures 1.862e-3,
@@ -528,11 +534,11 @@ fn real_weight_decode_matches_the_official_diffusers_vae() {
 /// review).
 ///
 /// **20 rather than any other ragged count**, because `token_drop` otherwise hides the pad: it
-/// keeps only the first 2 of the final clip's 5 latent frames, which reach back over 5 clip-local
-/// pixels, so a final clip with more than 5 real frames pads entirely inside the dropped tail. At
-/// 25 frames, repeating the *first* frame instead of the last leaves the encode **bit-identical** —
-/// measured, not reasoned. The assertion below derives the condition from the shipped config so it
-/// cannot silently stop holding.
+/// keeps only the first 2 of the final clip's 5 latent frames, which reach back over clip-local
+/// pixels `0 ..= pad_reach` only, so a final clip with more than `pad_reach` real frames pads
+/// entirely inside the dropped tail. At 25 frames, repeating the *first* frame instead of the last
+/// leaves the encode **bit-identical** — measured, not reasoned. The assertion below derives
+/// `pad_reach` from the shipped config so it cannot silently stop holding.
 ///
 /// Generate the reference with the MLX lane's `tools/dump_minimax_h3_video_vae_encode_real.py`
 /// (a few MB, deliberately not committed) and point `MINIMAX_H3_VIDEO_VAE_ENCODE_REFERENCE` at it.
