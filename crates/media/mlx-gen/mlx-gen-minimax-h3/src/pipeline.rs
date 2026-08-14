@@ -513,12 +513,17 @@ pub const PAD_JOIN_RAMP_SECONDS: f64 = 0.001;
 
 /// Fit one interleaved buffer to `want` frames per channel: truncate if long, fade-then-pad if
 /// short, leave alone if exact. See [`fit_audio_to_video`] for why only the pad direction fades.
+///
+/// Compares SAMPLE counts, not frame counts. Only the parent track is checked for being a whole
+/// number of channel-frames; a stem that is not would floor to the same frame count as a correctly
+/// sized one and skip a truncation this has always performed.
 fn fit_tail(samples: &mut Vec<f32>, channels: usize, want: usize, sample_rate: u32) {
-    let have = samples.len() / channels;
-    match have.cmp(&want) {
-        std::cmp::Ordering::Greater => samples.truncate(want * channels),
+    let target = want * channels;
+    match samples.len().cmp(&target) {
+        std::cmp::Ordering::Greater => samples.truncate(target),
         std::cmp::Ordering::Equal => {}
         std::cmp::Ordering::Less => {
+            let have = samples.len() / channels;
             let ramp =
                 ((f64::from(sample_rate) * PAD_JOIN_RAMP_SECONDS).round() as usize).min(have);
             for k in 0..ramp {
@@ -535,7 +540,7 @@ fn fit_tail(samples: &mut Vec<f32>, channels: usize, want: usize, sample_rate: u
                     samples[frame * channels + c] *= gain as f32;
                 }
             }
-            samples.resize(want * channels, 0.0);
+            samples.resize(target, 0.0);
         }
     }
 }
@@ -1136,6 +1141,27 @@ mod tests {
             corrected, 9,
             "9 of the 14 legal durations need a correction; 141/192/243/294/345 are exact"
         );
+
+        // Stems are delivered at the picture's length too — including one whose length is not a
+        // whole number of channel-frames, which only the track itself is validated for. Comparing
+        // FRAME counts rather than sample counts floors this to the target and skips the truncation
+        // (sc-19425); the odd sample is the whole point of the case.
+        let g = resolve_geometry(576, 320, 124).unwrap();
+        let want = g.delivered_audio_samples();
+        let fitted = fit_audio_to_video(
+            AudioTrack {
+                samples: vec![0.5; (g.joint.num_audio_latents * 800) as usize * 2],
+                sample_rate: AUDIO_SAMPLE_RATE,
+                channels: 2,
+                stems: vec![mlx_gen::media::AudioStem {
+                    name: "long".into(),
+                    samples: vec![0.5; want * 2 + 1],
+                }],
+            },
+            &g,
+        )
+        .unwrap();
+        assert_eq!(fitted.stems[0].samples.len(), want * 2);
     }
 
     /// **The pad join carries no step (sc-19425).** At the four counts where the decoder emits
