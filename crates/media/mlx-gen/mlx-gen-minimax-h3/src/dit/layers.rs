@@ -10,7 +10,7 @@ use mlx_rs::fast::{rms_norm, scaled_dot_product_attention};
 use mlx_rs::ops::multiply;
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::adapters::AdaptableLinear;
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::nn::silu;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
@@ -73,6 +73,17 @@ impl LinearNoBias {
     /// contract the `PUBLISHED_DIT_TENSORS` audit compares to.
     pub fn names(prefix: &str) -> [String; 1] {
         [format!("{prefix}.weight")]
+    }
+
+    /// The adapter-bearing base, so a LoRA residual can be stacked on this projection
+    /// ([`crate::adapters`], sc-18724).
+    ///
+    /// **Tier-independent by construction.** The inner [`AdaptableLinear`] is the *same* type whether
+    /// [`crate::quant::lin`] built it dense or from a packed `q4`/`q8` triple, and the forward is
+    /// `base(x) + Σ adapter.residual(x)` with the base never mutated — so the turbo LoRA folds at
+    /// identical strength on every tier, which is what a creative knob has to guarantee.
+    pub fn adaptable_mut(&mut self) -> &mut AdaptableLinear {
+        &mut self.inner
     }
 }
 
@@ -255,5 +266,37 @@ impl RmsNorm {
 
     pub fn names(prefix: &str) -> [String; 1] {
         [format!("{prefix}.weight")]
+    }
+}
+
+/// The four attention projections, addressed exactly as the published checkpoint spells them —
+/// including `to_out.0`, whose trailing `0` is a `nn.Sequential` index and therefore arrives as its
+/// **own** path segment (sc-18724).
+///
+/// `norm_q` / `norm_k` are deliberately unreachable: they are bare `[head_dim]` RMSNorm gains, not
+/// Linears, and no published MiniMax-H3 adapter targets them. A key that names one surfaces as
+/// unmatched (loud) rather than being dropped — see [`crate::adapters`].
+impl AdaptableHost for DitAttention {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["to_q"] => Some(self.to_q.adaptable_mut()),
+            ["to_k"] => Some(self.to_k.adaptable_mut()),
+            ["to_v"] => Some(self.to_v.adaptable_mut()),
+            ["to_out", "0"] => Some(self.to_out.adaptable_mut()),
+            _ => None,
+        }
+    }
+}
+
+/// The two feed-forward projections. `net.0.proj` is the SwiGLU input (`[value | gate]` in the
+/// published layout — see [`crate::layout`]) and `net.2` the output; the `net.N` segments are
+/// `nn.Sequential` indices, so they arrive split exactly as written.
+impl AdaptableHost for DitFeedForward {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["net", "0", "proj"] => Some(self.proj.adaptable_mut()),
+            ["net", "2"] => Some(self.out.adaptable_mut()),
+            _ => None,
+        }
     }
 }

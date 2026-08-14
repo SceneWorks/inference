@@ -37,6 +37,7 @@ use std::path::Path;
 
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
@@ -246,6 +247,30 @@ impl MiniMaxH3Dit {
             seq_len,
         )?)?;
         Ok((video_out, audio_out))
+    }
+}
+
+/// The DiT's LoRA target surface (sc-18724): `transformer_blocks.{i}.…` and `token_refiner.…`,
+/// spelled exactly as the published diffusers checkpoint — and therefore exactly as the lightx2v
+/// turbo LoRAs key their 624 factors.
+///
+/// **The 17 input/output projections of [`DitProjections`] are not on this surface.** They are
+/// [`crate::dit::heads::LinearBias`], a raw weight/bias pair rather than an
+/// [`AdaptableLinear`], because they are the mixed-precision half of the checkpoint (twelve ship
+/// float32) and [`crate::dit::heads`] reads them with a bare `Weights::require` precisely so a
+/// packed tensor cannot be loaded as floats (sc-14980). No published MiniMax-H3 adapter targets
+/// them; one that did would surface in `unmatched_paths` and fail the strict install rather than
+/// fold onto nothing. See [`crate::adapters`].
+impl AdaptableHost for MiniMaxH3Dit {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["transformer_blocks", i, rest @ ..] => {
+                let idx: usize = i.parse().ok()?;
+                self.blocks.get_mut(idx)?.adaptable_mut(rest)
+            }
+            ["token_refiner", rest @ ..] => self.refiner.adaptable_mut(rest),
+            _ => None,
+        }
     }
 }
 

@@ -1188,3 +1188,241 @@ fn the_adaln_projections_are_the_documented_twenty_six_gigabytes() {
         (params * 2) as f64 / 1e9
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Spatial tiling on real weights (sc-18786)
+// ---------------------------------------------------------------------------------------------
+
+/// **The gate for sc-18786.** `AutoencoderKLMiniMaxH3` ships with `use_tiling = True` (256 px
+/// tiles, 64 px minimum overlap) for both halves, and upstream states the consequence outright:
+/// MiniMax-H3 was released with tiling enabled and *the released frames are the blended-tile ones,
+/// so disabling tiling changes the output*. sc-17154 decoded the whole canvas in one pass.
+///
+/// # Why the sc-18740 reference could not catch this
+///
+/// `tools/dump_minimax_h3_video_vae_real.py` decodes a 4x4 latent to 64x64 px and calls
+/// `disable_tiling()` first, because at that canvas the two paths are bit-identical anyway. It is
+/// inert at its own geometry by construction, so its residual is genuine but blind here.
+///
+/// This test uses a second reference (`mlx-gen/tools/dump_minimax_h3_video_vae_tiling.py` — one
+/// artifact serves both lanes) at a **512x320** canvas: 3 tile rows x 2 tile columns, non-square so
+/// a transposed plan is not accidentally correct, with a genuine interior row that a 2x2 grid never
+/// exercises. The generator measured the reference's own tiled-vs-untiled separation there at
+/// **rel-max-abs 6.470e-1** — the size of the defect, a 65 % error rather than a rounding
+/// difference — and it is re-derived below rather than trusted.
+///
+/// The MLX `i32` write cap does not apply to this lane (`gen-core::tiling::MAX_WRITABLE_ELEMS` is
+/// documented as MLX-only; candle uses its own tensor library), and the reference itself is torch.
+#[test]
+#[ignore = "needs a real snapshot + a tiling reference (MINIMAX_H3_VIDEO_VAE_TILING_REFERENCE)"]
+fn real_weight_tiled_decode_matches_the_official_diffusers_vae() {
+    use candle_gen_minimax_h3::spatial_tiling::{SpatialTiling, TilePlan};
+
+    let root = snapshot();
+    let raw = std::env::var("MINIMAX_H3_VIDEO_VAE_TILING_REFERENCE").unwrap_or_default();
+    assert!(
+        !raw.is_empty(),
+        "MINIMAX_H3_VIDEO_VAE_TILING_REFERENCE must point at the output of \
+         mlx-gen/tools/dump_minimax_h3_video_vae_tiling.py. This test asserts rather than skips so \
+         a missing reference cannot be mistaken for a pass."
+    );
+    let r = common::Golden::load(&raw);
+    assert_eq!(
+        r.meta("reference").unwrap_or_default(),
+        "diffusers.AutoencoderKLMiniMaxH3",
+        "the reference must come from the official converted-checkpoint class"
+    );
+    for key in ["in.latent", "out.video.tiled", "out.video.untiled"] {
+        assert!(
+            r.has(key),
+            "{raw} has no `{key}`; it is not a tiling reference"
+        );
+    }
+
+    // The reference records what the shipped model actually does. Pin it here rather than trusting
+    // this crate's own constants — the only way the port's defaults are gated against the model
+    // instead of against themselves.
+    let shipped = r.meta("shipped_tiling").unwrap_or_default().to_string();
+    for expected in [
+        "\"use_tiling\": true",
+        "\"tile_sample_min_height\": 256",
+        "\"tile_sample_min_width\": 256",
+        "\"tile_sample_min_overlap_height\": 64",
+        "\"tile_sample_min_overlap_width\": 64",
+    ] {
+        assert!(
+            shipped.contains(expected),
+            "the shipped VAE no longer reports {expected}; recorded defaults were {shipped}"
+        );
+    }
+    let defaults = SpatialTiling::default();
+    assert!(defaults.enabled, "this port must tile by default too");
+    assert_eq!((defaults.tile_height, defaults.tile_width), (256, 256));
+    assert_eq!((defaults.overlap_height, defaults.overlap_width), (64, 64));
+
+    let dev = device();
+    let vae = MiniMaxH3VideoVae::load_decode_only(&root, &dev, DType::F32)
+        .expect("load the real video VAE");
+    let latent = r.tensor("in.latent").to_device(&dev).expect("latent");
+    let want = r.tensor("out.video.tiled");
+    let want_untiled = r.tensor("out.video.untiled");
+
+    // The canvas must genuinely tile in BOTH axes, or this test proves nothing at all.
+    let ls = latent.dims().to_vec();
+    let (lat_h, lat_w) = (ls[3], ls[4]);
+    let ratio = vae.config().patch_size;
+    let rows = TilePlan::split(lat_h * ratio, 256, 64, ratio).unwrap();
+    let cols = TilePlan::split(lat_w * ratio, 256, 64, ratio).unwrap();
+    assert!(
+        rows.len() > 1 && cols.len() > 1,
+        "the reference canvas is {}x{} px = {} rows x {} cols; it does not cross a tile boundary \
+         on both axes and cannot gate spatial tiling",
+        lat_h * ratio,
+        lat_w * ratio,
+        rows.len(),
+        cols.len()
+    );
+    let plan = r.meta("tile_plan").unwrap_or_default().to_string();
+    assert!(
+        plan.contains(&format!("{:?}", rows.starts))
+            && plan.contains(&format!("{:?}", cols.starts)),
+        "the port's tile starts (rows {:?}, cols {:?}) are not the reference's: {plan}",
+        rows.starts,
+        cols.starts
+    );
+
+    let got = vae
+        .decode(&latent)
+        .expect("decode")
+        .to_device(&Device::Cpu)
+        .expect("to cpu");
+    assert_eq!(got.dims(), want.dims(), "decoded shape");
+
+    // **The pre-fix behaviour, measured on this same port.** sc-17154 decoded the whole canvas in
+    // one pass, which is exactly what `disable_tiling()` selects. Running it here turns "the new
+    // code is necessary" from a claim into an assertion: if tiling were a no-op, or if the tiled
+    // and untiled paths converged, `before` would pass the same gate `after` does and this test
+    // would be proving nothing.
+    let before = {
+        let mut off = vae.clone();
+        off.disable_tiling();
+        let out = off
+            .decode(&latent)
+            .expect("untiled decode")
+            .to_device(&Device::Cpu)
+            .expect("to cpu");
+        rel(&out, &want).0
+    };
+
+    let (against_tiled, mean_tiled) = rel(&got, &want);
+    let (against_untiled, _) = rel(&got, &want_untiled);
+    let (reference_separation, _) = rel(&want_untiled, &want);
+    println!(
+        "real-weight TILED decode ({} rows x {} cols at {}x{} px) vs diffusers \
+         AutoencoderKLMiniMaxH3: BEFORE (untiled, sc-17154) {before:.3e} -> AFTER (tiled) \
+         {against_tiled:.3e} (mean {mean_tiled:.3e}), both vs the TILED reference. Our tiled \
+         decode vs the UNTILED reference {against_untiled:.3e}; the reference's own tiled/untiled \
+         separation {reference_separation:.3e}",
+        rows.len(),
+        cols.len(),
+        lat_h * ratio,
+        lat_w * ratio,
+    );
+
+    // (0) The single-pass decode this story replaced **fails** this gate. Without this the whole
+    // test could pass on a canvas where tiling happened not to matter.
+    assert!(
+        before > 2e-2,
+        "an UNTILED decode is within {before:.3e} of the tiled reference, so this canvas cannot \
+         distinguish the pre-sc-18786 behaviour from the fix"
+    );
+    assert!(
+        against_tiled < before / 10.0,
+        "tiling only improved the residual from {before:.3e} to {against_tiled:.3e}; that is not \
+         the reference's geometry"
+    );
+
+    // (1) The canvas actually separates the two implementations. Without this the rest is vacuous.
+    assert!(
+        reference_separation > 1e-2,
+        "the reference's own tiled and untiled decodes differ by only {reference_separation:.3e} \
+         at this canvas; regenerate the reference at a canvas that crosses a tile boundary"
+    );
+    // (2) We match the TILED reference — the released frames. 2e-2 is this file's bar for the
+    // real-weight comparison (the reference may be dumped at bf16 or f32).
+    assert!(
+        against_tiled < 2e-2,
+        "the tiled decode diverges from the official diffusers VAE by {against_tiled:.3e}; gate on \
+         rel-max-abs, never on norm or cosine (sc-18740)"
+    );
+    // (3) …and are decisively closer to it than to the untiled one, so a regression back to a
+    // single-pass decode fails here rather than merely loosening a tolerance.
+    assert!(
+        against_untiled > 1e-2,
+        "the decode is within {against_untiled:.3e} of the UNTILED reference too, so this test \
+         cannot tell the two paths apart"
+    );
+    assert!(
+        std_dev(&want) > 1e-3,
+        "the reference decode is ~constant; it would gate nothing"
+    );
+}
+
+/// The mirror assertion, on real weights: **below one tile the tiled and untiled paths agree
+/// exactly**, which is what keeps sc-17154's sub-tile fixtures valid across this change. The
+/// reference asserts the same thing on its side (`subtile_delta_max_abs == 0`).
+#[test]
+#[ignore = "needs a real snapshot + a tiling reference (MINIMAX_H3_VIDEO_VAE_TILING_REFERENCE)"]
+fn real_weight_tiling_is_inert_below_one_tile() {
+    let root = snapshot();
+    let raw = std::env::var("MINIMAX_H3_VIDEO_VAE_TILING_REFERENCE").unwrap_or_default();
+    assert!(
+        !raw.is_empty(),
+        "MINIMAX_H3_VIDEO_VAE_TILING_REFERENCE must point at the output of \
+         mlx-gen/tools/dump_minimax_h3_video_vae_tiling.py"
+    );
+    let r = common::Golden::load(&raw);
+    assert_eq!(
+        r.meta("subtile_delta_max_abs").unwrap_or_default(),
+        "0.000000e+00",
+        "the reference itself no longer finds tiling inert below one tile"
+    );
+
+    let dev = device();
+    let vae = MiniMaxH3VideoVae::load_decode_only(&root, &dev, DType::F32)
+        .expect("load the real video VAE");
+    let latent = r
+        .tensor("in.latent.subtile")
+        .to_device(&dev)
+        .expect("latent");
+    let want = r.tensor("out.video.subtile.tiled");
+    let s = latent.dims().to_vec();
+    let ratio = vae.config().patch_size;
+    assert!(
+        s[3] * ratio <= 256 && s[4] * ratio <= 256,
+        "the sub-tile control is not below one tile"
+    );
+
+    let tiled = vae
+        .decode(&latent)
+        .unwrap()
+        .to_device(&Device::Cpu)
+        .unwrap();
+    let untiled = {
+        let mut off = vae.clone();
+        off.disable_tiling();
+        off.decode(&latent)
+            .unwrap()
+            .to_device(&Device::Cpu)
+            .unwrap()
+    };
+    assert_eq!(
+        flat(&tiled),
+        flat(&untiled),
+        "below one tile the two paths must be BIT-identical"
+    );
+
+    let (peak, _) = rel(&tiled, &want);
+    println!("real-weight SUB-TILE parity: rel-max-abs={peak:.3e} (tiling inert, delta 0)");
+    assert!(peak < 2e-2, "the sub-tile decode diverges by {peak:.3e}");
+}

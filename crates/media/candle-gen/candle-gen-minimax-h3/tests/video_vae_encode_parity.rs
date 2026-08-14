@@ -819,3 +819,57 @@ fn the_shipped_tile_geometry_is_pinned() {
          one tile"
     );
 }
+
+/// **The `enable_tiling` / `disable_tiling` knobs reach the ENCODE half**, not only the decode one.
+///
+/// Upstream has a single `use_tiling` and a single set of `tile_sample_min_*` shared by both
+/// halves, so a caller that retunes tiling for decode retunes the `fl2va` conditioning encode with
+/// it. The decode twin of this test lives in `video_vae_parity.rs`, whose fixture carries no
+/// encoder — so this is the only place the encode side of that sharing is observable, and without
+/// it `encode_clip` could keep reading the shipped constants directly while `decode_clip` follows
+/// the knobs, which compiles and leaves every other assertion in both suites passing.
+#[test]
+fn the_tiling_knobs_select_the_paths_they_name_on_the_encode_half() {
+    use candle_gen_minimax_h3::spatial_tiling::SpatialTiling;
+    let f = fixture();
+    let pixels = f.tensor("in.encode_clip.pixels");
+    let (tile, overlap) = encode_fixture_tiles(&f);
+    let base = vae(&f, 3);
+
+    let untiled = flat(&base.encode_clip_untiled(&pixels).expect("untiled"));
+    let tiled = flat(
+        &base
+            .encode_clip_tiled(&pixels, tile, overlap)
+            .expect("tiled"),
+    );
+    assert_ne!(
+        tiled, untiled,
+        "the two reference paths must differ or this test proves nothing"
+    );
+
+    // `enable_tiling` at the fixture geometry routes `encode_clip` to the tiled path, exactly.
+    let mut on = vae(&f, 3);
+    on.enable_tiling(Some(tile), Some(tile), Some(overlap), Some(overlap));
+    assert_eq!(flat(&on.encode_clip(&pixels).expect("on")), tiled);
+
+    // `disable_tiling` routes it to the untiled path even at a geometry that would tile.
+    let mut off = vae(&f, 3);
+    off.enable_tiling(Some(tile), Some(tile), Some(overlap), Some(overlap));
+    off.disable_tiling();
+    assert!(!off.tiling().enabled);
+    assert_eq!(flat(&off.encode_clip(&pixels).expect("off")), untiled);
+
+    // …and the builder form agrees with the setters.
+    let built = vae(&f, 3).with_tiling(SpatialTiling::disabled());
+    assert_eq!(flat(&built.encode_clip(&pixels).expect("built")), untiled);
+    let built_on = vae(&f, 3).with_tiling(SpatialTiling::square(tile, overlap));
+    assert_eq!(
+        flat(&built_on.encode_clip(&pixels).expect("built_on")),
+        tiled
+    );
+
+    // The shipped default tiles at 256/64, which this sub-tile fixture canvas cannot span — so the
+    // default must agree with the untiled path, exactly as it does for decode.
+    assert!(f.shape("in.encode_clip.pixels")[3] < TILE_SAMPLE_MIN_SIZE);
+    assert_eq!(flat(&base.encode_clip(&pixels).expect("default")), untiled);
+}

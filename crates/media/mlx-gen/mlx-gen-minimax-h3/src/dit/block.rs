@@ -39,7 +39,7 @@
 use mlx_rs::ops::{add, multiply};
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::adapters::AdaptableLinear;
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::nn::silu;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
@@ -394,6 +394,23 @@ impl DitBlock {
     ) -> Result<Array> {
         let modulation = self.modulation(temb)?;
         self.forward(x, &modulation, adaln_indices, rope, tables)
+    }
+}
+
+/// `attn.*` / `ff.*` — the six adaptable leaves per block (sc-18724).
+///
+/// **`adaln_proj` is deliberately unreachable.** No published MiniMax-H3 LoRA targets it, and it is
+/// the one projection [`DitBlock::evict_adaln`] *removes* mid-render (sc-17145): an adapter installed on
+/// it would be silently discarded with the eviction on the precompute path but survive on the
+/// resident one, making the same file produce two different models. `norm1`/`norm2` are RMSNorm
+/// gains, not Linears. Either key surfaces as unmatched (loud) — see [`crate::adapters`].
+impl AdaptableHost for DitBlock {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["attn", rest @ ..] => self.attn.adaptable_mut(rest),
+            ["ff", rest @ ..] => self.ff.adaptable_mut(rest),
+            _ => None,
+        }
     }
 }
 
