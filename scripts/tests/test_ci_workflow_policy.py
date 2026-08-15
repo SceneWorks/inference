@@ -781,12 +781,17 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
         steps = workflow["jobs"]["macos-metal"]["steps"]
         names = [step.get("name") for step in steps]
+        pre_test_reclaim = "Reclaim Clippy and rustdoc artifacts before linking MLX tests"
         reclaim = "Reclaim broad MLX test artifacts before bundle profiles"
+        self.assertEqual(names.count(pre_test_reclaim), 1)
         self.assertEqual(names.count(reclaim), 1)
+        self.assertLess(names.index("Rustdoc macOS MLX packages"), names.index(pre_test_reclaim))
+        self.assertLess(names.index(pre_test_reclaim), names.index("Test MLX packages"))
         self.assertLess(names.index("Test MLX packages"), names.index(reclaim))
         self.assertLess(names.index(reclaim), names.index("Test LLM-only macOS bundle"))
         self.assertLess(names.index(reclaim), names.index("Test LLM+audio macOS bundle"))
         self.assertLess(names.index(reclaim), names.index("Clippy Candle Metal packages"))
+        self.assertEqual(steps[names.index(pre_test_reclaim)]["run"], "cargo clean")
         self.assertEqual(steps[names.index(reclaim)]["run"], "cargo clean")
 
     def test_real_weight_python_installs_are_binary_hash_locked(self) -> None:
