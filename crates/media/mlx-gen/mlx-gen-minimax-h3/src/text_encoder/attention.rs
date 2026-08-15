@@ -62,6 +62,22 @@ impl Qwen3Attention {
         Ok(())
     }
 
+    /// The packed width shared by all four projections, or `None` if any loaded dense or they
+    /// disagree.
+    pub fn packed_bits(&self) -> Option<i32> {
+        super::uniform_packed_bits([&self.q_w, &self.k_w, &self.v_w, &self.o_w])
+    }
+
+    /// Device bytes the four projections plus the two dense q/k norms hold.
+    pub fn nbytes(&self) -> usize {
+        [&self.q_w, &self.k_w, &self.v_w, &self.o_w]
+            .into_iter()
+            .map(crate::quant::nbytes)
+            .sum::<usize>()
+            + self.q_norm.nbytes()
+            + self.k_norm.nbytes()
+    }
+
     /// `x`: `[b, s, hidden]`; `cos`/`sin`: `[1, s, head_dim]`; `mask`: additive `[b, 1, s, s]`.
     pub fn forward(&self, x: &Array, cos: &Array, sin: &Array, mask: &Array) -> Result<Array> {
         let sh = x.shape();
