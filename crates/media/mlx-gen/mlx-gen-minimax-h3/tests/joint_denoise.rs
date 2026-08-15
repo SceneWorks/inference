@@ -23,8 +23,6 @@
 
 mod common;
 
-use std::time::Instant;
-
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::weights::Weights;
@@ -35,7 +33,7 @@ use mlx_gen_minimax_h3::denoise::{
 };
 use mlx_gen_minimax_h3::dit::positions::KeyframeAnchor;
 
-use common::{assert_parity, cosine, l2_norm, rel, std_dev};
+use common::{assert_parity, cosine, is_materialized, l2_norm, rel, std_dev};
 
 /// The committed joint-denoise fixture.
 const FIXTURE: &str = concat!(
@@ -658,6 +656,10 @@ struct Costly {
     x: Array,
     matmuls: usize,
     calls: usize,
+    /// `(video_rows, audio_rows)` materialization, one entry per forward, in call order. Stamped
+    /// **before** the forward touches what it was handed, so each entry describes what the loop
+    /// handed over rather than what this forward built on top of it.
+    inputs_materialized: Vec<(bool, bool)>,
 }
 
 impl Costly {
@@ -669,6 +671,7 @@ impl Costly {
             x: Array::from_slice(&v, &[dim, dim]),
             matmuls,
             calls: 0,
+            inputs_materialized: Vec::new(),
         }
     }
 }
@@ -676,6 +679,13 @@ impl Costly {
 impl JointVelocity for Costly {
     fn forward(&mut self, step: &JointStep<'_>) -> Result<(Array, Array)> {
         self.calls += 1;
+        // Read the incoming latents' state FIRST — everything below builds new graph on top of
+        // them. At step `i` these are step `i - 1`'s output, so a `false` says step `i - 1`'s
+        // compute was still an unscheduled graph when the cancel check at the top of step `i` ran.
+        self.inputs_materialized.push((
+            is_materialized(step.video_rows),
+            is_materialized(step.audio_rows),
+        ));
         // Real work, folded into the returned velocity so it cannot be optimized away and so it
         // lands in the same graph the loop evaluates.
         let mut acc = self.x.clone();
@@ -691,7 +701,7 @@ impl JointVelocity for Costly {
     }
 }
 
-/// **The cancellation proof — measured.**
+/// **The cancellation proof — observed, not timed.**
 ///
 /// # What asserting `Err(Canceled)` would not prove
 ///
@@ -705,20 +715,54 @@ impl JointVelocity for Costly {
 /// # The property that actually matters
 ///
 /// A cancel can only be observed while control is inside the loop, because that is where the check
-/// is. So the question is not "how fast does a cancel return" but **what fraction of the render's
-/// compute happens inside the cancellable window**.
+/// is. So the question is not "how fast does a cancel return" but **whether the render's compute
+/// happens inside the cancellable window**.
 ///
-/// With the per-step `eval`, essentially all of it does, and the caller's first readback is free.
-/// Without it, the loop returns in graph-construction time and the entire schedule lands in the
-/// caller's next operation — a VAE decode, which has no cancel check — so the window in which a
-/// cancel means anything shrinks to nothing while `Err(Canceled)` keeps being returned promptly.
+/// With the per-step `eval`, all of it does, and the caller's first readback is free. Without it,
+/// the loop returns in graph-construction time and the entire schedule lands in the caller's next
+/// operation — a VAE decode, which has no cancel check — so the window in which a cancel means
+/// anything shrinks to nothing while `Err(Canceled)` keeps being returned promptly.
 ///
-/// Both numbers come from one run on one machine, so the assertion encodes no absolute duration.
+/// # Why the wall clock is the wrong instrument for it (sc-19505)
+///
+/// This test used to reach for that property through three timing assertions — `total.as_millis()
+/// >= 8`, `in_loop > deferred * 4`, and `cancelled < total / 2` — and its doc claimed "the
+/// assertion encodes no absolute duration", which was plainly false of the first. sc-19452 measured
+/// the identical shape one layer up in `pipeline.rs` and found both failure directions:
+///
+/// * **false reds** — a wall-clock ratio moves with *host load*, not with the code. Sixteen loaded
+///   runs produced five failures on a machine that routinely has several agents building at once,
+///   each charged to whatever unrelated PR was in flight. CPU contention alone was not enough; it
+///   took *cross-process* Metal contention, because CPU pressure scales both halves of a ratio
+///   together;
+/// * **false greens** — with a production `eval` deleted, the timing version *passed*, because the
+///   surviving evals still dominated the clock. A margin that swings twenty points for reasons
+///   unrelated to the code cannot also resolve the code.
+///
+/// So nothing here is timed. Lazy evaluation — the thing that makes timing treacherous — is what
+/// makes the property *directly* observable: an MLX array carries an unscheduled graph until
+/// something forces it, and [`is_materialized`] reads that bit straight off the array. Compute that
+/// happened inside the cancel-checked region leaves its outputs materialized when the region ends;
+/// compute deferred to the caller's readback leaves them unmaterialized.
+///
+/// # What this adds over `pipeline.rs`
+///
+/// `pipeline.rs` reads the same instrument over the whole render core at a synthetic 32x32
+/// geometry, and carries the eval-free-loop mutant arm that proves the reading separates a
+/// cancellable implementation from an uncancellable one. This test drives [`denoise_av`] at the
+/// **committed fixture's packed layout** instead — real keyframe anchors, text tokens and
+/// condition rows, so `step_generated_tail`'s conditioned/generated split is on the path — and
+/// owns the cancel half: that a trip stops the loop at a step boundary, counted in model forwards
+/// rather than timed.
 #[test]
 fn cancellation_is_observed_within_a_step() {
+    // Sized for a cheap test. Every assertion below reads a status bit, which is independent of how
+    // long the graph takes; the old 1536/8 was sized for a clock, by the very guard
+    // (`total.as_millis() >= 8`, "too cheap to measure on this machine; raise DIM/MATMULS") that
+    // went out with it.
     const STEPS: usize = 6;
-    const DIM: i32 = 1536;
-    const MATMULS: usize = 8;
+    const DIM: i32 = 256;
+    const MATMULS: usize = 2;
 
     let f = fixture();
     let l = layout();
@@ -728,25 +772,32 @@ fn cancellation_is_observed_within_a_step() {
     let video = batched(&f, "in.video_latents");
     let audio = batched(&f, "in.audio_latents");
 
-    // Warm the kernels so the measured run is not timing compilation.
-    let mut warm = Costly::new(DIM, MATMULS);
-    let (wv, wa) = denoise_av(
-        &mut warm,
-        &l,
-        &joint,
-        &adaln,
-        &video,
-        &audio,
-        &CancelFlag::default(),
-        &mut |_| {},
-    )
-    .unwrap();
-    mlx_rs::transforms::eval([&wv, &wa]).unwrap();
+    // Materialize the caller's latents before anything under test runs: step 0 would otherwise
+    // legitimately observe an unscheduled graph, saying nothing about the loop.
+    mlx_rs::transforms::eval([&video, &audio]).unwrap();
 
-    // The measurement: time inside the loop (cancellable) against time the caller's first readback
-    // still has to pay (not cancellable).
+    // --- the instrument's own control, both directions -------------------------------------------
+    // Cheap, local, and load-free. Without it every `true` below could come from a reading stuck
+    // high and every `false` from one stuck low, and the test would be a false green either way.
+    // (`multiply` by a scalar is not one of the identity ops MLX short-circuits, so it really does
+    // yield a fresh unscheduled array rather than handing `video` back.)
+    assert!(
+        is_materialized(&video) && is_materialized(&audio),
+        "the instrument reads low on arrays `eval` just forced, so every `true` below is worthless"
+    );
+    let unforced = mlx_rs::ops::multiply(&video, Array::from_f32(2.0)).unwrap();
+    assert!(
+        !is_materialized(&unforced),
+        "the instrument reads high on an unforced graph, so every `false` below is worthless"
+    );
+    mlx_rs::transforms::eval([&unforced]).unwrap();
+    assert!(
+        is_materialized(&unforced),
+        "the instrument did not flip once the graph was forced, so it is not reading anything"
+    );
+
+    // --- the loop keeps its compute inside the cancel-checked region ----------------------------
     let mut model = Costly::new(DIM, MATMULS);
-    let start = Instant::now();
     let (v, a) = denoise_av(
         &mut model,
         &l,
@@ -758,39 +809,48 @@ fn cancellation_is_observed_within_a_step() {
         &mut |_| {},
     )
     .unwrap();
-    let in_loop = start.elapsed();
-    mlx_rs::transforms::eval([&v, &a]).unwrap();
-    let deferred = start.elapsed() - in_loop;
-    let total = in_loop + deferred;
-
     println!(
-        "  {STEPS} steps: {in_loop:?} inside the loop, {deferred:?} deferred to the caller's \
-         readback ({:.1}% cancellable)",
-        100.0 * in_loop.as_secs_f64() / total.as_secs_f64()
+        "  {STEPS} steps at the fixture layout: step inputs materialized {:?}",
+        model.inputs_materialized
     );
-    // A floor on the measurement itself, not on the property: below a few ms the split is timer
-    // noise. Kept well under the ~20 ms this model costs so that a mutant — which is *faster*
-    // overall, having skipped the per-step synchronization — still clears it and is judged by the
-    // assertion below rather than accidentally reddening here.
-    assert!(
-        total.as_millis() >= 8,
-        "the synthetic model is too cheap to measure on this machine ({total:?}); raise \
-         DIM/MATMULS"
+    assert_eq!(
+        model.calls, STEPS,
+        "one forward per evaluation, no CFG pair"
+    );
+    assert_eq!(
+        model.inputs_materialized,
+        vec![(true, true); STEPS],
+        "every step must be handed latents whose compute has already landed. A `false` at index i \
+         means step i-1's compute was still an unscheduled graph when the cancel check at the top \
+         of step i ran, so a trip there would have stopped nothing — the per-step \
+         `mlx_rs::transforms::eval` at the bottom of `denoise_av`'s loop is what makes that check \
+         a real seam"
     );
     assert!(
-        in_loop > deferred * 4,
-        "only {in_loop:?} of the {total:?} render happened inside the loop — {deferred:?} was \
-         deferred to the caller's first readback, where there is no cancel check. The per-step \
-         `mlx_rs::transforms::eval` is what keeps the compute inside the cancellable window; \
-         without it a cancel still returns promptly but stops nothing."
+        is_materialized(&v) && is_materialized(&a),
+        "the LAST step's compute must land inside the loop too, before `denoise_av` returns; it is \
+         the one step no per-step reading can attribute to the loop rather than to the caller"
     );
 
-    // ...and the cancel itself: tripped from the progress tick, the loop stops at the boundary,
-    // the model is not called again, and the caller waits about one step rather than six.
+    // --- ...and the cancel itself ----------------------------------------------------------------
+    // Tripped from the progress tick once two steps have completed. The old form of this —
+    // `cancelled < total / 2` — was reaching for "the caller waits about one step rather than six",
+    // which is a *count*, not a duration: the loop either ran the remaining steps or it did not.
+    // Counting forwards says so exactly, and says it the same way on a busy machine. It was also
+    // the weakest of the three timing assertions this test carried: over 380 runs under deliberate
+    // cross-process Metal contention it failed 53 times, with the one-step `cancelled` sometimes
+    // exceeding the whole six-step schedule it was compared against (112.7 ms against a 49.5 ms
+    // `total`).
+    //
+    // Tripped after the *second* step rather than the first on purpose: it makes the second
+    // materialization reading load-bearing. The first forward is handed the caller's already-forced
+    // latents and reads `true` however broken the loop is; the second is handed the first step's
+    // output, so a `true` there is the loop's own doing, and is what makes the cancel check that
+    // the second step passed a real seam rather than an inert one.
     let cancel = CancelFlag::default();
     let trip = cancel.clone();
     let mut model = Costly::new(DIM, MATMULS);
-    let start = Instant::now();
+    let mut ticks = Vec::new();
     let err = denoise_av(
         &mut model,
         &l,
@@ -799,20 +859,33 @@ fn cancellation_is_observed_within_a_step() {
         &video,
         &audio,
         &cancel,
-        &mut |i| {
-            if i == 1 {
+        &mut |completed| {
+            ticks.push(completed);
+            if completed == 2 {
                 trip.cancel();
             }
         },
     )
     .unwrap_err();
-    let cancelled = start.elapsed();
     assert!(matches!(err, Error::Canceled), "{err}");
-    assert_eq!(model.calls, 1, "the model must not run after the cancel");
-    assert!(
-        cancelled < total / 2,
-        "a cancel at step 1 of {STEPS} must cost far less than the whole schedule ({cancelled:?} \
-         vs {total:?})"
+    assert_eq!(
+        model.calls,
+        2,
+        "a cancel tripped after 2 of {STEPS} steps must stop the loop at that boundary; the model \
+         ran {} more time(s), so the remaining schedule was paid anyway",
+        model.calls.saturating_sub(2)
     );
-    println!("  cancelled after 1 of {STEPS} steps in {cancelled:?} (whole schedule {total:?})");
+    assert_eq!(
+        ticks,
+        vec![1, 2],
+        "one progress tick per completed step and none after the trip"
+    );
+    assert_eq!(
+        model.inputs_materialized,
+        vec![(true, true); 2],
+        "each step the loop did run before the cancel must have been handed landed compute — \
+         otherwise the check it passed was inert and the trip stopped a loop that had computed \
+         nothing yet"
+    );
+    println!("  cancelled after 2 of {STEPS} steps (ticks {ticks:?})");
 }

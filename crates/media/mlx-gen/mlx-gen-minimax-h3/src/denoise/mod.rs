@@ -49,9 +49,19 @@
 //!
 //! The `eval` is therefore not a memory optimization that happens to help; it is what makes the
 //! step boundary a real point in time. `tests/joint_denoise.rs::cancellation_is_observed_within_a_step`
-//! **measures** this — it compares the time at which `on_step(1)` fires against the measured mean
-//! cost of a step, self-calibrating so the assertion does not encode this machine's speed — rather
-//! than asserting that a cancel returns `Canceled`, which it does either way.
+//! **observes** this rather than asserting that a cancel returns `Canceled`, which it does either
+//! way: the velocity model reads `array::is_available()` over the latents each step was handed,
+//! *before* touching them, so a `false` at step `i` says step `i - 1`'s compute was still an
+//! unscheduled graph when the cancel check at the top of step `i` ran — a check that would then
+//! have stopped nothing. Deleting the `eval` below flips every reading after the first.
+//!
+//! It used to *time* this instead, gating a wall-clock ratio of in-loop against deferred work.
+//! That instrument measured host load rather than the code, in both directions: false reds charged
+//! to unrelated PRs on a busy machine, and a false green in which a deleted production `eval` left
+//! the surviving ones still dominating the clock (sc-19452, sc-19505). Reading the status bit is
+//! exact and clock-free — but only because the `eval` here is **synchronous**. Switching this call
+//! to `async_eval` would turn the reading into a race against the completion event and must
+//! revisit `tests/joint_denoise.rs` and `tests/pipeline.rs` together.
 
 pub mod geometry;
 pub mod packing;

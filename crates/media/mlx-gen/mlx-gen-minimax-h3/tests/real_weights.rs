@@ -902,8 +902,12 @@ fn real_weight_te_context_matches_the_official_conditioner() {
     let diff = mlx_rs::ops::subtract(&got, want).unwrap().abs().unwrap();
     let peak: f32 = want.abs().unwrap().max(None).unwrap().item();
     let rel_max: f32 = diff.max(None).unwrap().item::<f32>() / peak;
+    // Reported, never asserted on (sc-19505). A `fwd_ms > 0` gate here only ever said "the clock
+    // ticked": it cannot fail except on a broken timer, and it certainly cannot say the forward was
+    // evaluated — `rel_max` above already forced the graph through `.item()`, and the `rel_max`
+    // gate below is what actually holds this test up. This is the same call
+    // `real_weight_dit_block_runs_one_forward` already made for its own `fwd_ms`.
     let fwd_ms = t1.elapsed().as_millis();
-    assert!(fwd_ms > 0, "the timer did not span the evaluation");
 
     println!(
         "REAL-WEIGHT TE PARITY vs {} ({}): prompt {prompt:?} -> {seq} ids -> context {:?}; \
@@ -996,10 +1000,10 @@ fn real_weight_te_forward_runs_at_the_published_geometry() {
         "context peak {peak} is not finite/positive"
     );
     assert!(spread > 1e-3, "context is ~constant (std {spread:.3e})");
-    assert!(
-        fwd_ms > 0,
-        "forward reported 0 ms — the timer did not span the evaluation"
-    );
+    // `fwd_ms` is reported, never asserted on (sc-19505) — see the note at the parity smoke above.
+    // What it was reaching for, "the forward really was evaluated", is already held by `spread` and
+    // `peak`: both come from `.item()`, which forces the graph, and both are numeric properties of
+    // the computed context rather than of the clock.
 
     println!(
         "REAL-WEIGHT TE SMOKE: loaded {loaded} tensors in {load_ms} ms; 4 layers at the published \

@@ -47,6 +47,11 @@ mod common;
 use mlx_rs::ops::matmul;
 use mlx_rs::Array;
 
+// The instrument itself lives in `common` because `joint_denoise.rs` reads it too (sc-19505); its
+// preconditions — synchronous `eval`, identity-op short-circuiting, the lazily installed mlx-rs
+// error handler — are documented there, once.
+use common::is_materialized;
+
 use mlx_gen::{CancelFlag, Result};
 use mlx_gen_minimax_h3::denoise::{JointStep, JointVelocity, PackedLayout};
 use mlx_gen_minimax_h3::{
@@ -65,44 +70,6 @@ fn geometry() -> RequestGeometry {
 
 fn layout(g: &RequestGeometry) -> PackedLayout {
     mlx_gen_minimax_h3::t2va_layout(g, 6, PATCH_SIZE).expect("t2va layout")
-}
-
-/// **The instrument.** Whether MLX has already *materialized* this array — whether the compute that
-/// produces it has actually happened, rather than sitting in an unscheduled graph waiting for
-/// somebody to force it.
-///
-/// `_mlx_array_is_available` is mlx-c's accessor for `mlx::core::array::is_available()`: the status
-/// is `available`, or it is `evaluated` with the completion event signalled or absent. A
-/// **synchronous** `mlx_rs::transforms::eval` — the only kind this crate uses — attaches no event
-/// and marks its outputs `evaluated` before returning, so the reading is exact and clock-free. That
-/// is where the load-insensitivity comes from, and it is conditional: if a production `eval` here
-/// were ever switched to `async_eval`, this would become a race against the event signal and would
-/// have to `wait()` first. Anyone making that change has to revisit this test.
-///
-/// Two precision notes, because the obvious paraphrases are both wrong:
-///
-/// * it is **not** "`false` for anything an op returned". MLX short-circuits identity ops — a
-///   `reshape` to the same shape, a full-range `slice`, an `astype` to the same dtype — by
-///   returning the *input*, which keeps the input's status. A view defers no compute, so the
-///   reading stays semantically right, but the mechanism is not "every op yields unscheduled";
-/// * it is **not** a pure read. `is_available()` detaches the event and promotes the status on the
-///   shared descriptor, non-atomically. Harmless under this repo's forced `RUST_TEST_THREADS = 1`,
-///   but do not treat it as a race-free probe of an `Array` shared across threads.
-///
-/// mlx-rs exposes no safe wrapper, so the call goes through `mlx-sys` — the same binding crate
-/// `mlx_rs::Array` is built on, so [`Array::as_ptr`] hands back exactly the `mlx_array` this
-/// signature wants. Two obligations, not one: the handle must outlive the call, which the `&Array`
-/// borrow guarantees; and some mlx-rs op must already have run on this thread, because mlx-rs
-/// installs its error handler lazily inside its own wrappers and mlx-c's default handler is
-/// `exit(-1)` rather than a status return. Every call site here runs after `initial_latents`.
-fn is_materialized(array: &Array) -> bool {
-    let mut available = false;
-    let status = unsafe { mlx_sys::_mlx_array_is_available(&mut available, array.as_ptr()) };
-    assert_eq!(
-        status, 0,
-        "_mlx_array_is_available failed on a live array handle"
-    );
-    available
 }
 
 /// A velocity model that does real GPU work per step **and records what it was handed**.
