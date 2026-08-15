@@ -2804,12 +2804,20 @@ jobs:
   # tree measured here) plus a possible 11.640 GB first transfer — not test time.
   #
   # TIME IS NOT THE ONLY BUDGET, and this block recorded only the time one. The largest memory
-  # consumer here is the LAST step, not the decodes: the sc-18740 parity gate builds the video VAE
-  # at `Dtype::Float32` — deliberately, to keep the comparison about layout rather than about bf16
-  # rounding — so it holds ~19.4 GB of parameters (the 9.7 GB bf16 `vae/` materialized at f32; the
-  # test's own note rounds that to ~20 GB) against ~10 GB for the three bf16 decode smokes and
-  # ~0.6 GB for the audio one. That is a figure DECLARED by the crate and derivable from the
-  # component size, not one measured on either runner.
+  # consumer here is the LAST step, not the decodes — but by half what this comment used to claim,
+  # and the reason it used to claim it was a dtype error worth stating plainly. MEASURED from the
+  # published safetensors headers (snapshot 939557dc): **`vae/` ships F32 — all 703 tensors, 0 of
+  # them bf16, 9.7002 GiB / 10.4155 GB.** So the sc-18740 parity gate's `Dtype::Float32` — carried
+  # deliberately, to keep the comparison about layout rather than about bf16 rounding — is a NO-OP
+  # CAST holding ~9.70 GiB, NOT the ~19.4 GB that a "9.7 GB bf16 `vae/` materialized at f32" reading
+  # produces; there is no doubling because there is no bf16 to double. The bf16 component in this
+  # checkpoint is `transformer/` (626 of 638 tensors BF16, 61.73 GiB / 66.28 GB), which this lane
+  # does not load. The two video decode smokes cast the OTHER way — `Dtype::Bfloat16` downcasts that
+  # same F32 component — so they materialize about half the parity gate, out of the same ~10 GB of
+  # mapped source bytes their `#[ignore]` strings quote. `audio_vae/` is likewise all F32 (1087
+  # tensors, 0.5637 GiB) and is loaded at f32 with nothing to cast, so its ~0.6 GB is right as
+  # written. These are component sizes derived from the published headers, not peaks measured on
+  # either runner.
   #
   # It matters because `rw-mage` is registered on BOTH Macs (below) and this lane has never run on
   # either. The only host figure this repository carries for `nax-macos-2` is the ~101 GiB in
@@ -2880,8 +2888,9 @@ jobs:
       # errand — the same job `Record the CUDA device inventory` does for the Windows lane below,
       # in the shape that step uses: a presence guard, `continue-on-error: true`, and no assertion
       # of any kind. The step above measures DISK; this one measures the other axis. `rw-mage` is on
-      # both Macs, this lane's parity gate holds ~20 GB at f32, and the only host figure this
-      # repository carries for `nax-macos-2` is a ~101 GiB number inferred from sampling in
+      # both Macs, this lane's parity gate holds ~9.70 GiB at f32 (the all-F32 `vae/` component, no
+      # doubling — see the header; ~20 GB was the pre-sc-19414 misreading), and the only host figure
+      # this repository carries for `nax-macos-2` is a ~101 GiB number inferred from sampling in
       # `scripts/ci/s18_memory_preflight.py`. One run puts a real one in the log, for ~1 s.
       #
       # THE TWO NUMBERS ARE DIFFERENT QUANTITIES and neither is derivable from the other, so both
@@ -2995,11 +3004,13 @@ jobs:
           fi
       # THIS LANE'S MEMORY PEAK, and the reason the job header carries a memory budget at all. The
       # test builds the VAE at `Dtype::Float32` (`tests/real_weights.rs`, the `f32 to keep the
-      # comparison about layout rather than about bf16 rounding` line) rather than at the
-      # checkpoint's bf16, so it is ~19.4 GB of parameters — the 9.7 GB bf16 `vae/` materialized at
-      # f32, which the test's own note rounds to ~20 GB — where the three smokes above are ~10 GB.
-      # Casting it down would be cheaper and would also delete the gate: at bf16 the residual this
-      # compares against diffusers is dominated by rounding rather than by layout.
+      # comparison about layout rather than about bf16 rounding` line). **The checkpoint is ALREADY
+      # F32** — 703 of 703 `vae/` tensors, measured from the published headers — so that is a no-op
+      # cast holding ~9.70 GiB / 10.42 GB of parameters, not the ~19.4 GB this comment used to
+      # claim; `vae/` was never bf16, and nothing here doubles. It is still this lane's peak,
+      # because the two video smokes above DOWNCAST the same component to bf16 and so materialize
+      # about half of it. Casting this one down too would be cheaper and would also delete the gate:
+      # at bf16 the residual it compares against diffusers is dominated by rounding, not by layout.
       #
       # DECLARED, not measured on a runner: `Record the macOS device inventory` above is what puts a
       # real capacity for the box that claimed this job in the log, and `hw.memsize` and the Metal
@@ -5423,20 +5434,83 @@ jobs:
   # the weights on this runner and generalized `windows-candle.yml`, which lives in the SceneWorks
   # repository; the inference-side inventory row and this lane are what was left over.
   #
-  # WHAT THIS RUNS: the four gates that read safetensors headers, published JSON, and four 12-tap
-  # filter buffers. Measured 2026-08-13 on nax-macos (same code, CPU device, release): 0.00 s each.
-  # `--features cuda` is carried anyway because compiling this crate on the CUDA lane is itself
-  # coverage nothing else provides — no existing job builds `candle-gen-minimax-h3` with it.
+  # WHAT THIS RUNS:
+  #   * the five gates that read safetensors headers, published JSON, and four 12-tap filter
+  #     buffers. Measured 2026-08-13 on nax-macos (same code, CPU device, release): 0.00 s each for
+  #     the four that existed then; `declared_encoder_shapes_match_the_published_checkpoint` landed
+  #     later (sc-19008, 2026-08-14) and is the same shape — `shard_shapes` reads the `vae/` headers
+  #     and nothing else, so it touches no device and needs no component this row does not fetch.
+  #     `--features cuda` is carried anyway because compiling this crate on the CUDA lane is itself
+  #     coverage nothing else provides — no existing job builds `candle-gen-minimax-h3` with it.
+  #   * the three f32 decode smokes (sc-19414). They were held out of the original wiring for one
+  #     stated reason — no VRAM figure for this box existed anywhere — and that reason is now
+  #     retired by measurement rather than by assumption or by a guessed constant.
   #
-  # WHAT THIS DOES NOT RUN, named so it is not rediscovered as an oversight:
-  #   * the three decode smokes — the crate loads at f32 to stay comparable with the committed
-  #     fixture lane, so they are ~19.4 GB (video) and ~1.2 GB (audio) resident, and with
-  #     `--features cuda` that lands on the GPU. This repository records no VRAM figure for this box
-  #     anywhere, and sizing a lane against an unmeasured constant is how the sc-16981 defect
-  #     happened. The `Record the CUDA device inventory` step below prints that number on the first
-  #     run of this lane, so the decision is one run away rather than one investigation away.
-  #   * `real_weight_decode_matches_the_official_diffusers_vae` — additionally needs the operator
-  #     reference artifact the macOS lane requires, which has never been placed on this box.
+  # THE VRAM DECISION (sc-19414). Two independent numbers, and BOTH had to be measured; the first
+  # version of this paragraph measured only the supply side and inherited the demand side from a
+  # pre-existing comment that was wrong.
+  #
+  # SUPPLY. `CUDA_COMPUTE_CAP` names an architecture, never a capacity, so the number had to come
+  # off the hardware. It did, from `nvidia-smi` in the "Toolchain and hardware versions" step of
+  # OTHER jobs in this same `[self-hosted, windows, cuda, real-weights]` pool, in run 31353865709
+  # (the 2026-08-10 weekly): job 93349696046 on `cuda-windows` and job 93349696033 on
+  # `cuda-windows-2`. Both report `Machine name: 'MICHAEL-TRX50'` — the two `real-weights` CUDA
+  # listeners are two agents on ONE physical box, sharing one pair of GPUs:
+  #
+  #   GPU 0  NVIDIA RTX PRO 6000 Blackwell     19 MiB / 97887 MiB
+  #   GPU 1  NVIDIA RTX PRO 6000 Blackwell   1370 MiB / 97887 MiB     driver 596.36, CUDA 13.2
+  #
+  # 97887 MiB is 95.59 GiB per card, and `candle_gen::default_device()` is compile-time
+  # `Device::new_cuda(0)`, so every decode here lands on GPU 0 — the card with 19 MiB in use.
+  #
+  # DEMAND, measured from the published safetensors HEADERS of snapshot 939557dc (no weights read):
+  # **`vae/` is entirely F32** — 703 tensors, 0 of them bf16, 9.7002 GiB / 10.4155 GB. Loading it at
+  # f32 is therefore a NO-OP CAST, not a doubling. The bf16 component in this checkpoint is
+  # `transformer/` (626 of 638 tensors BF16, 61.73 GiB / 66.28 GB), which this row does not fetch.
+  # The two video decodes call `MiniMaxH3VideoVae::load_decode_only`, whose
+  # `["decoder.", "post_quant_conv."]` filter selects 585 of the 703 — **9.03 GiB / 9.69 GB** of
+  # parameters, not the ~19.4 GB the old comment claimed. `audio_vae/` is likewise all F32 (1087
+  # tensors, 0.5637 GiB); the audio test's `["dec_in_proj.", "decoder."]` filter selects 914 —
+  # **0.242 GiB / 0.26 GB**, not ~1.2 GB. `crates/.../candle-gen-minimax-h3/src/vae.rs` states the
+  # same split in its `load_decode_only` doc; the old figures contradicted the crate they described.
+  #
+  # AGAINST THE CARD, then: a video decode is 9.03 GiB of 95.59 GiB — **9.4% occupancy, 10.6x
+  # headroom** — and the audio decode is 0.242 GiB, 0.25%. Activations sit on top of those and are
+  # not included: the smokes decode a 2x3 latent grid to 17 frames at 32x48 px and a 12-token grid
+  # to 39 frames at 32x32 px, which is why the parameter figure is the one that governs here. Each
+  # selection runs in its own `cargo test` process, so the peak is one decode and not their sum, and
+  # even the pathological case — both listeners on this box driving a video decode at GPU 0 at the
+  # same time — is 18.1 GiB of 95.59 GiB. All three fit, with more room than the first sizing
+  # claimed; there was no partial-win tradeoff left to make.
+  #
+  # `Record the CUDA device inventory` below is KEPT, and is now a RECORD against the paragraph
+  # above rather than the errand that produces it. Read what it is and is not: it prints
+  # `memory.total` for whichever box claims this job, and NOTHING compares that against the 95.59
+  # GiB assumed here, so a shrunk or re-pointed pool yields the log line AND the OOM — it explains a
+  # failure after the fact, it does not prevent one. It has never fired, and a dispatch today still
+  # would not reach it: `Require operator-provided MiniMax-H3 snapshot` sits ABOVE it and exits 1
+  # when `CANDLE_MINIMAX_H3_SNAPSHOT` is unset, which it currently is (the variable does not exist
+  # on this repository). Dispatching this workflow on a non-default ref is otherwise routine — 176
+  # of the 204 `workflow_dispatch` runs on record used one, `feature/*` included, and `minimax-h3`
+  # is in this workflow's `profile` options — so the ref is NOT the obstacle, whatever an earlier
+  # note here said; the missing repository variable is. (The weekly `schedule` is a separate matter:
+  # that genuinely only fires from the default branch, so it cannot reach this lane until the epic
+  # merges.) The figures above come from jobs that DO exist on `main`, on the
+  # same pool, which is the only reason a number exists to read at all.
+  #
+  # WHAT THIS DOES NOT RUN. Seven of the fifteen `#[ignore]`d tests in `tests/real_weights.rs` (the
+  # other eight are selected by the two steps below), all seven named so none is rediscovered as an
+  # oversight:
+  #   * `real_weight_decode_matches_the_official_diffusers_vae` — needs the operator reference
+  #     artifact the macOS lane requires, which has never been placed on this box. It is the only
+  #     gate in either backend that can catch a LAYOUT error against real weights; its MLX twin IS
+  #     wired and green, so the sc-18740 class is covered — just not on candle.
+  #   * `real_weight_encode_matches_the_official_diffusers_vae` and `real_weight_tiling_changes_the_encode`
+  #     — same class, blocked on a second operator artifact (`MINIMAX_H3_VIDEO_VAE_ENCODE_REFERENCE`).
+  #   * `real_weight_tiled_decode_matches_the_official_diffusers_vae` and
+  #     `real_weight_tiling_is_inert_below_one_tile` — same class again, blocked on a third
+  #     (`MINIMAX_H3_VIDEO_VAE_TILING_REFERENCE`). All four are cheap in memory and unreachable here
+  #     only because the artifacts have only ever been produced on `nax-macos`.
   #   * `declared_dit_tensor_names_match_the_published_checkpoint` and
   #     `the_adaln_projections_are_the_documented_twenty_six_gigabytes` — header-only, but they need
   #     the 62 GB `transformer/` component, which the `minimax-h3` row deliberately does not fetch.
@@ -5444,6 +5518,24 @@ jobs:
     name: Candle MiniMax-H3 real weights (CUDA)
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'media' || inputs.profile == 'minimax-h3'
     runs-on: [self-hosted, windows, cuda, real-weights]
+    # There is no "house value" to appeal to and an earlier version of this comment invented one:
+    # of the 42 jobs in this file, 26 carry 120 and 16 do not (2x30, 4x60, 90, 150, 2x180, 300,
+    # 4x360, 480). 120 is the plurality, not the rule, so it has to be argued rather than cited.
+    #
+    # The argument is the observed cost of THIS pool, since this lane has never executed. Across the
+    # five scheduled runs on record, the largest CUDA real-weight job on this box is 52.0 min
+    # (`sa3-base-identity-cuda`, run 30787887176, 2026-08-03; the same job took 42.0 min in
+    # 30741567385 and failed at 23.2 min in 31353865709), and the closest analogue by shape —
+    # `candle-media`, a candle crate built with `--features cuda` on the same runner — is 15.3 min
+    # (run 30196371019; it was skipped in 31353865709, so that run yields no figure for it).
+    #
+    # The nearest sibling is `mlx-minimax-h3`, same model and same three decode names, and it
+    # carries 60. That is NOT the value to copy: its 60 was sized on a 5m36s cold Metal build plus
+    # ~3.0 s of measured test time, whereas this lane pays an nvcc/MSVC cold build for
+    # `candle-gen-minimax-h3` that has never been timed anywhere, on a box where a real-weight job
+    # has already been observed at 52.0 min. 60 would leave 1.15x over that observation; 120 leaves
+    # 2.3x. For a never-executed lane a `timeout-minutes` is a runaway guard, not a budget, so the
+    # slack is the point. Re-size it DOWN from the first run that actually completes here.
     timeout-minutes: 120
     env:
       # Repository variables hold runner-local absolute paths, so the Windows box needs its own value
@@ -5452,7 +5544,12 @@ jobs:
       # sc-18677 provisioned the snapshot here at
       # `E:\huggingface\hub\models--MiniMaxAI--MiniMax-H3\snapshots\939557dc319dd91227e30195a763f272ba7f8765`.
       MINIMAX_H3_SNAPSHOT: ${{ vars.CANDLE_MINIMAX_H3_SNAPSHOT }}
-      # 80 on the Ampere runner; set 120 on a Blackwell runner (matches the other CUDA jobs here).
+      # sm_80 is Ampere, and MEASURED 2026-08-10 this pool's box is 2x RTX PRO 6000 Blackwell —
+      # sm_120 — so the old "80 on the Ampere runner" reading of this value described hardware that
+      # is not here (see the VRAM paragraph above). The value is left at "80" deliberately: it is
+      # what every CUDA job in this repository sets, and the jobs that set it pass on this exact
+      # hardware today. Raising it is a repo-wide change owed its own measurement on this box, not
+      # something for one lane to do unilaterally as a side effect of wiring three tests.
       CUDA_COMPUTE_CAP: "80"
       CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
@@ -5474,10 +5571,16 @@ jobs:
             echo Missing repository variable CANDLE_MINIMAX_H3_SNAPSHOT for the Windows CUDA runner.
             exit /b 1
           )
-      # Report-only, and it exists to RETIRE the "unmeasured constant" above rather than to leave it
-      # for someone to go and look up. The three decode smokes are excluded here solely because this
-      # repository records no VRAM figure for this box anywhere — `CUDA_COMPUTE_CAP: "80"` names an
-      # architecture, not a capacity. This prints one, on the first run of this lane, at zero cost;
+      # Report-only, and report-only is the whole of it. It was added (sc-18932) to RETIRE the
+      # "unmeasured constant" that kept the decode smokes out; sc-19414 retired it from the pool's
+      # existing run logs instead, so what is left is a RECORD next to the sizing paragraph above:
+      # it prints `memory.total` for whichever box claims this job. It does NOT compare that against
+      # the 95.59 GiB that paragraph assumes, and it could not act on the comparison if it did —
+      # `continue-on-error: true` means this step cannot red the lane. A pool change that breaks the
+      # assumption therefore produces this log line AND, later, a mid-decode OOM; the line explains
+      # the OOM after the fact rather than heading it off. That is deliberate: a threshold here
+      # would be a Windows-`cmd` assertion on a lane that has never run, unexercisable anywhere it
+      # could be proven to fire, and an unverified guard is worth less than an honest record.
       # `continue-on-error` because a step that only produces a record must never red a lane, and
       # `where` first because `nvidia-smi` is not on PATH on every CUDA host.
       - name: Record the CUDA device inventory
@@ -5503,9 +5606,47 @@ jobs:
         run: |
           call "%VCVARS%"
           call :run_one declared_tensor_names_match_the_published_checkpoint || exit /b 1
+          call :run_one declared_encoder_shapes_match_the_published_checkpoint || exit /b 1
           call :run_one declared_audio_tensor_names_match_the_published_checkpoint || exit /b 1
           call :run_one published_audio_configs_reproduce_the_declared_geometry || exit /b 1
           call :run_one stored_kaiser_filters_match_the_derivation_on_real_weights || exit /b 1
+          exit /b 0
+
+          :run_one
+          set "log=%RUNNER_TEMP%\minimax-h3-%~1.log"
+          cargo test --locked -p candle-gen-minimax-h3 --features cuda --release --test real_weights %~1 -- --ignored --exact --nocapture > "%log%" 2>&1 || (type "%log%" & exit /b 1)
+          type "%log%"
+          findstr /C:"test result: ok. 1 passed" "%log%" >nul || (echo ::error::%~1 did not run exactly one passing test - a rename would make this step vacuously green & exit /b 1)
+          exit /b 0
+
+      # sc-19414 — the f32 decodes, wired on the VRAM measurement recorded in this job's header.
+      # A SEPARATE step from the header gates above, for two reasons: a decode failure then reads as
+      # a decode failure rather than as one entry in a list of eight, and an operator gets the five
+      # cheap verdicts before the expensive ones start (the same ordering `mlx-minimax-h3` uses).
+      #
+      # Same `run_one` shape and the same traps: `--exact` AFTER the `--`, because cargo rejects it
+      # in its own argument position and reports the rejection as exit 0; plus the run-count
+      # assertion, because a renamed test yields "0 passed; N filtered out" and cargo exits 0 for
+      # that too. One `cargo test` invocation and one `findstr` per selection is also what
+      # `test_minimax_h3_lanes_select_tests_that_exist_and_pin_their_run_count` counts.
+      #
+      # WHAT THESE ACTUALLY COST (headers of snapshot 939557dc, measured — see the job header). The
+      # `vae/` component ships **F32, all 703 tensors**, so asking for `DType::F32` here is a no-op
+      # cast and NOT the doubling an earlier version of this comment described: the two video
+      # decodes load the 585-tensor decode half, 9.03 GiB / 9.69 GB, and the audio decode loads the
+      # 914-tensor half of the likewise-all-F32 `audio_vae/`, 0.242 GiB / 0.26 GB. With
+      # `--features cuda` that is device memory on GPU 0, against 95.59 GiB — 9.4% for a video
+      # decode. f32 is still the deliberate choice, because it is the dtype the committed-fixture
+      # lane compares against; it is simply free here rather than expensive. NEVER EXECUTED ANYWHERE
+      # YET on candle: the twin numbers quoted on sc-18932 (289 ms video, 73 ms audio) are the MLX
+      # lane's, on Metal.
+      - name: Run MiniMax-H3 VAE decode smokes
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          call :run_one real_weight_decode_produces_a_plausible_video || exit /b 1
+          call :run_one real_weight_multi_chunk_decode_blends_the_seam || exit /b 1
+          call :run_one real_weight_audio_decode_produces_a_plausible_stereo_track || exit /b 1
           exit /b 0
 
           :run_one
