@@ -2186,6 +2186,13 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                     (
                         # Header/config only -- no weight I/O, no Metal.
                         "declared_tensor_names_match_the_published_checkpoint",
+                        # sc-19445. The key-set proof above cannot see a tensor read at the wrong
+                        # LEVEL; this derives all 118 encode shapes from the config and judges them
+                        # against the published headers. The committed fixture cannot: it is a
+                        # four-level 32-channel toy whose spatial and temporal downsample factor
+                        # lists are the SAME list, so a level predicate that reads the wrong one of
+                        # them is the identity there and mis-strides the shipped six-level stack.
+                        "declared_encoder_shapes_match_the_published_checkpoint",
                         "declared_audio_tensor_names_match_the_published_checkpoint",
                         "published_audio_configs_reproduce_the_declared_geometry",
                         "te_layer_50_tap_is_exhaustive_and_the_tail_is_trimmable",
@@ -2197,6 +2204,14 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                         # The sc-18740 layout gate -- the ONLY test in either backend that compares
                         # against an independent implementation on the published bytes.
                         "real_weight_decode_matches_the_official_diffusers_vae",
+                        # sc-19445 / sc-19438 -- the other two comparisons against an independent
+                        # implementation, each behind its own fail-closed operator-artifact check.
+                        # The ENCODE half had no real-weight gate at all between sc-17148 and
+                        # sc-19445. The conditioner's gate existed but asserted on an artifact that
+                        # had never been produced, so this lane could not run it: absent variable
+                        # meant hard failure and set variable meant nothing to point it at.
+                        "real_weight_encode_matches_the_official_diffusers_vae",
+                        "real_weight_te_context_matches_the_official_conditioner",
                     ),
                 ),
             ),
@@ -2328,15 +2343,62 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                     f"mlx-minimax-h3: step {step.get('name')!r} runs cargo test without its own "
                     "`set -o pipefail`, so `| tee /dev/stderr` swallows cargo's exit status",
                 )
-        # The sc-18740 gate runs LAST and behind its own fail-closed check, so an operator who has
-        # not staged the reference artifact still gets the other eight verdicts first.
-        self.assertLess(
-            mlx.index("Require the operator-provisioned diffusers VAE reference"),
-            mlx.index("real_weight_decode_matches_the_official_diffusers_vae"),
-        )
+        # The three operator-artifact gates run LAST and each sits behind its OWN fail-closed
+        # check, so an operator who has staged none of them still gets every self-healing verdict
+        # first, and one missing artifact does not hide the other two.
+        #
+        # This ordering is not cosmetic. The Windows lane's `Require operator-provided MiniMax-H3
+        # snapshot` sits before `Record the CUDA device inventory` with a hard `exit /b 1`, which
+        # is exactly why that inventory has never once fired. Every reporting step in this job --
+        # disk headroom and the macOS device inventory -- therefore precedes all three checks
+        # below, and this asserts it rather than trusting the file to stay in order.
+        for artifact, gate in (
+            (
+                "Require the operator-provisioned diffusers VAE reference",
+                "real_weight_decode_matches_the_official_diffusers_vae",
+            ),
+            (
+                "Require the operator-provisioned diffusers VAE ENCODE reference",
+                "real_weight_encode_matches_the_official_diffusers_vae",
+            ),
+            (
+                "Require the operator-provisioned conditioner reference",
+                "real_weight_te_context_matches_the_official_conditioner",
+            ),
+        ):
+            with self.subTest(artifact=artifact):
+                self.assertIn(artifact, mlx, f"{artifact} was renamed or removed")
+                # `name=<gate>` is the selection; the require step must precede it.
+                self.assertLess(
+                    mlx.index(artifact),
+                    mlx.index(f"name={gate}"),
+                    f"{gate} runs before the step that fails closed on its artifact",
+                )
+                # …and every report-only step must precede the hard check.
+                for report in ("Report runner disk headroom", "Record the macOS device inventory"):
+                    self.assertLess(
+                        mlx.index(report),
+                        mlx.index(artifact),
+                        f"{artifact} can exit non-zero before {report!r} has run, which is the "
+                        "shape that has kept the Windows lane's device inventory from ever firing",
+                    )
+        # The self-healing verdicts all land before the first artifact check.
         self.assertLess(
             mlx.index("run_one real_weight_audio_decode_produces_a_plausible_stereo_track"),
             mlx.index("Require the operator-provisioned diffusers VAE reference"),
+        )
+        # Both manifest rows are materialized, and the text-encoder one only here: the shared
+        # `minimax-h3` row is `media-cuda` too, and 51.5 GB of text encoder on the Windows box
+        # would buy that lane nothing.
+        self.assertIn(
+            "ensure_model_snapshot.py\n          --model minimax-h3-text-encoder",
+            mlx,
+            "mlx-minimax-h3 does not materialize the text-encoder shards its conditioner gate maps",
+        )
+        self.assertNotIn(
+            "minimax-h3-text-encoder",
+            "\n".join(bodies["candle-minimax-h3"]),
+            "the Windows CUDA lane must not fetch 51.5 GB of text encoder it never reads",
         )
         # Both lanes materialize from the manifest row rather than assuming a hand-placed tree.
         for job in selected:
