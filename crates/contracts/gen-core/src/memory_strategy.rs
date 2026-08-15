@@ -148,10 +148,10 @@ pub const MEMORY_DECODE_QUALITY_ABI: u32 = 2;
 /// merge commit have different object ids but the same implementation. Derivation reads source
 /// bytes only; it does not execute measurement code or consume measurement artifacts.
 pub const MEMORY_DECODE_QUALITY_IMPLEMENTATION_FINGERPRINT: &str =
-    "abe89d13c0d547dd12c9f9ac70ee06295a228f857eeffd453bf9c6042be8bdac";
+    "63c6f89da806e02f098598c595d1e5b46a619d05f3beb269fe40334e60c39cd9";
 #[cfg(test)]
 const MEMORY_DECODE_QUALITY_CANONICAL_FIXTURE_SHA256: &str =
-    "2af49ba113667a9400d86e7661fbbdba5137a9650157e1df44a45f7ad87228b4";
+    "87e9ecca9ab5d9d3721a316c22fed63dfb8c5aac519ddb66cf0a80384425d6fb";
 
 /// Prefix for the single-line calibration observation protocol consumed by release tooling.
 ///
