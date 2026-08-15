@@ -95,12 +95,19 @@ use crate::nn::{layer_norm, linear};
 /// mismatch, produces a runnable model with a wrong soundtrack conditioning.
 ///
 /// **Bound to a published document, not to itself.**
-/// [`MiniMaxH3AudioVaeConfig::cross_check_diffusers_json`] compares this constant against
-/// `audio_vae/config.json`'s `num_attention_heads` and refuses a checkpoint that disagrees. That
-/// check runs weights-free over the published config text in `crate::audio_config`'s own tests and
-/// against the real snapshot's `audio_vae/config.json` in `tests/real_weights.rs`. Before that it
-/// was pinned only by `assert_eq!(ATTN_PROJ_HEADS, 8)` — a literal restating itself — while every
-/// executed test built the encoder at the fixture's 2 heads.
+/// [`MiniMaxH3AudioVaeConfig::cross_check_diffusers_json`] reads `audio_vae/config.json`'s
+/// `num_attention_heads`, compares it to this constant, and refuses a checkpoint that disagrees —
+/// including one that OMITS the key, which is refused rather than defaulted. That check runs
+/// weights-free over the published config text in `crate::audio_config`'s
+/// `diffusers_root_config_cross_checks`, which asserts the refusal in both directions (4 and 16),
+/// so a comparison hardcoded to 8 on either side fails one of them; and against the real
+/// snapshot's own `audio_vae/config.json` in `tests/real_weights.rs`.
+///
+/// Before that it was pinned only by `assert_eq!(ATTN_PROJ_HEADS, 8)` — a literal restating itself
+/// — while every executed test built the encoder at the fixture's 2 heads. An earlier revision of
+/// THIS doc claimed the cross-check already compared the key. It did not: `cross_check_diffusers_json`
+/// never read `num_attention_heads`, and `audio_config.rs` was not in that commit. The comparison
+/// exists now; this paragraph stays as the reason not to describe a binding before writing it.
 pub const ATTN_PROJ_HEADS: usize = 8;
 
 /// **The dtype the encode half is always built at**, whatever the provider's own store dtype is.
@@ -1195,11 +1202,18 @@ mod tests {
         assert!(p.sample_with(&bad).is_err());
     }
 
-    /// The three declared constants, pinned. None of them is in the FL2VA source triple, so nothing
-    /// else in the crate can catch a drift.
+    /// The declared constants, pinned. None of them is in the FL2VA source triple, so nothing else
+    /// in the crate can catch a drift.
+    ///
+    /// These are literals restating themselves and they cannot be anything else: a constant that
+    /// appears in no document has nothing to be compared TO, and every executed test builds the
+    /// encoder at the fixture's 2 heads / small dims rather than at these. That is exactly why
+    /// [`ATTN_PROJ_HEADS`] is no longer in this list — the diffusers repackaging publishes it as
+    /// `audio_vae/config.json`'s `num_attention_heads`, so it is bound to that document by
+    /// [`MiniMaxH3AudioVaeConfig::cross_check_diffusers_json`] and asserted against a real snapshot
+    /// in `tests/real_weights.rs`, which is a strictly stronger pin than restating `8` here.
     #[test]
     fn the_declared_constants_are_the_references() {
-        assert_eq!(ATTN_PROJ_HEADS, 8);
         assert_eq!(MLP_RATIO, 2);
         assert_eq!(LAYER_NORM_EPS, 1e-5);
         assert_eq!(RESIDUAL_DILATIONS, [1, 3, 9]);

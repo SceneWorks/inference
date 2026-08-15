@@ -924,19 +924,71 @@ mod tests {
     #[test]
     fn a_staged_dit_component_is_charged_at_its_own_size() {
         let root = tempfile::tempdir().expect("tempdir");
-        sparse_snapshot(root.path(), &[("transformer", DIT_BF16_BYTES)]);
+        sparse_snapshot(root.path(), &[(BASE_DIT_PARTITION, DIT_BF16_BYTES)]);
         let staged = tempfile::tempdir().expect("tempdir");
         const Q4_BYTES: u64 = 18_779_970_678;
-        sparse_snapshot(staged.path(), &[("transformer", Q4_BYTES)]);
+        sparse_snapshot(staged.path(), &[(BASE_DIT_PARTITION, Q4_BYTES)]);
 
         let contract = contract_for(
             &LoadSpec::new(WeightsSource::Dir(root.path().into())).with_component(
-                DIT_COMPONENT,
-                WeightsSource::Dir(staged.path().join(DIT_COMPONENT)),
+                BASE_DIT_PARTITION,
+                WeightsSource::Dir(staged.path().join(BASE_DIT_PARTITION)),
             ),
         )
         .expect("contract");
         assert_eq!(contract.asset_facts.transformer_bytes, Q4_BYTES);
+    }
+
+    /// **A `ref2va` snapshot is charged for the partition a `ref2va` render actually reads.**
+    ///
+    /// `ComponentBytes::resolve` sized `root.join("transformer")` unconditionally, so a snapshot
+    /// carrying only `transformer_ref/` was charged ZERO for its 66 GB DiT — a contract that
+    /// under-reports by 66 GB admits a render that then OOMs. The three cases below are the ones
+    /// that distinguish "the base partition" from "the partition this snapshot can serve".
+    #[test]
+    fn the_dit_charge_covers_the_reference_partition_too() {
+        const REF_BYTES: u64 = 66_280_504_216;
+        const SMALL: u64 = 1_000_000;
+
+        // Reference partition ALONE: charged for it, not zero.
+        let only_ref = tempfile::tempdir().expect("tempdir");
+        sparse_snapshot(only_ref.path(), &[(REFERENCE_DIT_PARTITION, REF_BYTES)]);
+        let c = contract_for(&LoadSpec::new(WeightsSource::Dir(only_ref.path().into())))
+            .expect("contract");
+        assert_eq!(
+            c.asset_facts.transformer_bytes, REF_BYTES,
+            "a ref2va-only snapshot was charged {} for a {REF_BYTES}-byte DiT",
+            c.asset_facts.transformer_bytes
+        );
+
+        // Base partition alone is unchanged — sc-19517's pure-q4 install.
+        let only_base = tempfile::tempdir().expect("tempdir");
+        sparse_snapshot(only_base.path(), &[(BASE_DIT_PARTITION, SMALL)]);
+        let c = contract_for(&LoadSpec::new(WeightsSource::Dir(only_base.path().into())))
+            .expect("contract");
+        assert_eq!(c.asset_facts.transformer_bytes, SMALL);
+
+        // Both present: a render loads exactly ONE, so the larger is the bound, and it is charged
+        // ONCE rather than summed. Asymmetric sizes, so "max" and "sum" cannot coincide.
+        let both = tempfile::tempdir().expect("tempdir");
+        sparse_snapshot(
+            both.path(),
+            &[
+                (BASE_DIT_PARTITION, SMALL),
+                (REFERENCE_DIT_PARTITION, REF_BYTES),
+            ],
+        );
+        let c =
+            contract_for(&LoadSpec::new(WeightsSource::Dir(both.path().into()))).expect("contract");
+        assert_eq!(
+            c.asset_facts.transformer_bytes, REF_BYTES,
+            "with both partitions present the charge is the larger, once"
+        );
+        assert_ne!(
+            c.asset_facts.transformer_bytes,
+            SMALL + REF_BYTES,
+            "the two partitions must not be summed; only one is ever resident"
+        );
     }
 
     // --- the declaration facts that are easy to get wrong ----------------------------------------
