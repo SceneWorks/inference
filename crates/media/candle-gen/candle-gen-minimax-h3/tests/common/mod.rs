@@ -10,6 +10,132 @@ use candle_gen::Weights;
 
 use candle_gen_minimax_h3::{BigVganConfig, MiniMaxH3AudioVaeConfig, MiniMaxH3VaeConfig};
 
+// --- Cross-backend fixture geometry (sc-19496) ---------------------------------------------------
+//
+// Every fixture under `tests/fixtures/` here is byte-identical to the one `mlx-gen-minimax-h3`
+// commits under the same name. Both lanes therefore load the same bytes through their own hand-typed
+// geometry, so a drift in either one leaves both lanes internally consistent and both parity suites
+// green while the two backends compare tensors dumped at one shape against a model built at another.
+// Nothing could see that: the two crates cannot import each other, because `mlx-gen-*` builds on
+// macOS only.
+//
+// The numbers the two lanes must agree on are declared here as `SHARED_FIXTURE_*` constants, and the
+// constructors below build from them rather than repeating literals. `check_cross_backend_geometry`
+// in `scripts/check-workspace.py` compares every `SHARED_FIXTURE_*` declaration in this file against
+// the MLX crate's, by name set and by value — so the doc comments that used to assert agreement in
+// prose now describe something enforced.
+
+/// DiT attention heads — `MiniMaxH3DitConfig::num_attention_heads`.
+pub const SHARED_FIXTURE_DIT_NUM_ATTENTION_HEADS: usize = 4;
+/// DiT per-head width. `heads · head_dim` (96) stays wider than `hidden_size` (64), as it is in the
+/// shipped model.
+pub const SHARED_FIXTURE_DIT_ATTENTION_HEAD_DIM: usize = 24;
+/// DiT residual width.
+pub const SHARED_FIXTURE_DIT_HIDDEN_SIZE: usize = 64;
+/// DiT transformer depth.
+pub const SHARED_FIXTURE_DIT_NUM_LAYERS: usize = 2;
+/// DiT refiner depth.
+pub const SHARED_FIXTURE_DIT_NUM_REFINER_LAYERS: usize = 2;
+/// DiT feed-forward width.
+pub const SHARED_FIXTURE_DIT_FFN_DIM: usize = 32;
+/// DiT text-conditioning width.
+pub const SHARED_FIXTURE_DIT_TEXT_DIM: usize = 40;
+/// DiT sinusoidal timestep-embedding width.
+pub const SHARED_FIXTURE_DIT_FREQ_DIM: usize = 16;
+/// DiT timestep-embedding hidden width.
+pub const SHARED_FIXTURE_DIT_TIME_EMBED_HIDDEN_DIM: usize = 64;
+/// DiT timestep-embedding output width.
+pub const SHARED_FIXTURE_DIT_TIME_EMBED_DIM: usize = 48;
+/// DiT rotary width. 2 keeps the rotary **partial** — `2 · 3 · rope_freq_dim` (12) of the 24 head
+/// channels — which is the path under test.
+pub const SHARED_FIXTURE_DIT_ROPE_FREQ_DIM: usize = 2;
+
+/// Packed text rows in the DiT fixture's `layout.*` tensors.
+pub const SHARED_FIXTURE_LAYOUT_NUM_TEXT_TOKENS: usize = 5;
+/// Audio latents **per channel**.
+pub const SHARED_FIXTURE_LAYOUT_NUM_AUDIO_LATENTS: usize = 3;
+/// Channels the soundtrack is packed channel-major over.
+pub const SHARED_FIXTURE_LAYOUT_AUDIO_CHANNELS: usize = 2;
+/// Target video latent frames.
+pub const SHARED_FIXTURE_LAYOUT_NUM_LATENT_FRAMES: usize = 3;
+/// Target latent height.
+pub const SHARED_FIXTURE_LAYOUT_LATENT_HEIGHT: usize = 4;
+/// Target latent width.
+pub const SHARED_FIXTURE_LAYOUT_LATENT_WIDTH: usize = 6;
+
+/// Video-VAE latent channels — the shipped 24, not a shrunk stand-in.
+pub const SHARED_FIXTURE_VAE_LATENT_CHANNELS: usize = 24;
+/// Video-VAE decoded channels (RGB).
+pub const SHARED_FIXTURE_VAE_OUT_CHANNELS: usize = 3;
+/// Video-VAE transformer depth.
+pub const SHARED_FIXTURE_VAE_NUM_LAYERS: usize = 2;
+/// Video-VAE attention heads.
+pub const SHARED_FIXTURE_VAE_NUM_HEADS: usize = 2;
+/// Video-VAE per-head width.
+pub const SHARED_FIXTURE_VAE_HEAD_DIM: usize = 16;
+/// Video-VAE register tokens.
+pub const SHARED_FIXTURE_VAE_NUM_REGISTER_TOKENS: usize = 4;
+/// Video-VAE feed-forward multiplier.
+pub const SHARED_FIXTURE_VAE_FFN_MULT: usize = 4;
+/// Video-VAE rotary base.
+pub const SHARED_FIXTURE_VAE_ROPE_THETA: f32 = 100.0;
+/// Video-VAE rotary coverage, the shipped ratio.
+pub const SHARED_FIXTURE_VAE_ROPE_DIM_RATIO: f32 = 0.75;
+/// Video-VAE decoder norm epsilon.
+pub const SHARED_FIXTURE_VAE_NORM_EPS: f64 = 1e-5;
+/// Video-VAE spatial patch — the decode fixture's spatial cumprod.
+pub const SHARED_FIXTURE_VAE_PATCH_SIZE: usize = 2;
+/// Video-VAE temporal patch — the **production** value, so the chunk plan is the real one.
+pub const SHARED_FIXTURE_VAE_PATCH_SIZE_T: usize = 4;
+/// Video-VAE clip length — the **production** 17, the `17n + 5` lattice's period.
+pub const SHARED_FIXTURE_VAE_CLIP_LENGTH: i32 = 17;
+/// Video-VAE encoded channels (RGB).
+pub const SHARED_FIXTURE_VAE_IN_CHANNELS: usize = 3;
+/// Video-VAE encoder level widths for the decode fixture.
+pub const SHARED_FIXTURE_VAE_BLOCK_OUT_CHANNELS: [usize; 4] = [32, 32, 32, 32];
+/// Video-VAE ResNet blocks per level.
+pub const SHARED_FIXTURE_VAE_LAYERS_PER_BLOCK: usize = 1;
+/// Video-VAE spatial strides per level for the decode fixture.
+pub const SHARED_FIXTURE_VAE_SPATIAL_DOWNSAMPLE_FACTORS: [usize; 4] = [2, 1, 1, 1];
+/// Video-VAE temporal strides per level for the decode fixture.
+pub const SHARED_FIXTURE_VAE_TEMPORAL_DOWNSAMPLE_FACTORS: [usize; 4] = [1, 2, 2, 1];
+/// Video-VAE encoder GroupNorm groups.
+pub const SHARED_FIXTURE_VAE_NORM_NUM_GROUPS: usize = 32;
+/// Video-VAE encoder norm epsilon.
+pub const SHARED_FIXTURE_VAE_ENCODER_NORM_EPS: f64 = 1e-6;
+
+/// Encode-fixture spatial patch: every level is spatial-strided there, so the cumprod is 4.
+pub const SHARED_FIXTURE_ENCODE_PATCH_SIZE: usize = 4;
+/// Encode-fixture level widths — the last level changes width so `conv_shortcut` is built.
+pub const SHARED_FIXTURE_ENCODE_BLOCK_OUT_CHANNELS: [usize; 4] = [32, 32, 32, 64];
+/// Encode-fixture spatial strides.
+pub const SHARED_FIXTURE_ENCODE_SPATIAL_DOWNSAMPLE_FACTORS: [usize; 4] = [1, 2, 2, 1];
+/// Encode-fixture temporal strides.
+pub const SHARED_FIXTURE_ENCODE_TEMPORAL_DOWNSAMPLE_FACTORS: [usize; 4] = [1, 2, 2, 1];
+
+/// Audio-VAE sample rate — the shipped 32 kHz, which is what selects the production BigVGAN branch.
+pub const SHARED_FIXTURE_AUDIO_SAMPLE_RATE: u32 = 32_000;
+/// Audio-VAE output channels.
+pub const SHARED_FIXTURE_AUDIO_OUTPUT_CHANNELS: u16 = 2;
+/// Audio-VAE latent channels — the shipped 32.
+pub const SHARED_FIXTURE_AUDIO_LATENT_CHANNELS: usize = 32;
+/// Audio-VAE encoder width.
+pub const SHARED_FIXTURE_AUDIO_ENCODER_DIM: usize = 8;
+/// Audio-VAE encoder strides.
+pub const SHARED_FIXTURE_AUDIO_ENCODER_RATES: [usize; 2] = [2, 2];
+/// Audio-VAE decoder strides — the shipped seven upsample stages.
+pub const SHARED_FIXTURE_AUDIO_DECODER_RATES: [usize; 7] = [5, 5, 2, 2, 2, 2, 2];
+/// Audio-VAE decoder width, shrunk to the smallest that survives all seven halvings.
+pub const SHARED_FIXTURE_AUDIO_DECODER_DIM: usize = 128;
+/// Audio-VAE attention projection.
+pub const SHARED_FIXTURE_AUDIO_ATTN_PROJ: bool = true;
+/// Audio-VAE decoder branch.
+pub const SHARED_FIXTURE_AUDIO_DECODER_TYPE: &str = "bigvgan";
+/// BigVGAN mel bands the fixture was dumped with.
+pub const SHARED_FIXTURE_AUDIO_BIGVGAN_NUM_MELS: usize = 64;
+/// BigVGAN decoder width the fixture was dumped with.
+pub const SHARED_FIXTURE_AUDIO_BIGVGAN_DECODER_DIM: usize = 128;
+
 /// The committed video-VAE parity fixture, produced by the MLX lane's
 /// `tools/dump_minimax_h3_video_vae.py` running the **official diffusers**
 /// `AutoencoderKLMiniMaxH3` — the converted-checkpoint layout production loads. It carries the
@@ -98,9 +224,11 @@ pub const DENOISE_FIXTURE: &str = concat!(
     "/tests/fixtures/av_denoise.safetensors"
 );
 
-/// The tiny DiT geometry the fixture was dumped at. Mirrors `dump_minimax_h3_dit.py`, and is the
-/// same set of numbers the MLX lane's `dit_fixture_config` uses — the two lanes must agree about
-/// the fixture's shape before either compares a tensor.
+/// The tiny DiT geometry the fixture was dumped at. Mirrors `dump_minimax_h3_dit.py`.
+///
+/// Built from the `SHARED_FIXTURE_DIT_*` constants, which `check_cross_backend_geometry` holds equal
+/// to the MLX lane's — the two lanes load byte-identical fixture bytes and must agree about their
+/// shape before either compares a tensor.
 ///
 /// Structurally identical to the shipped model where it matters: `rope_freq_dim` 2 still makes the
 /// rotary **partial** (12 of 24 head channels), `inner_dim` (96) is still **wider** than
@@ -108,17 +236,17 @@ pub const DENOISE_FIXTURE: &str = concat!(
 /// ones. Only the widths and depths are shrunk so the weights are committable.
 pub fn dit_fixture_config() -> candle_gen_minimax_h3::MiniMaxH3DitConfig {
     candle_gen_minimax_h3::MiniMaxH3DitConfig {
-        num_attention_heads: 4,
-        attention_head_dim: 24,
-        hidden_size: 64,
-        num_layers: 2,
-        num_refiner_layers: 2,
-        ffn_dim: 32,
-        text_dim: 40,
-        freq_dim: 16,
-        time_embed_hidden_dim: 64,
-        time_embed_dim: 48,
-        rope_freq_dim: 2,
+        num_attention_heads: SHARED_FIXTURE_DIT_NUM_ATTENTION_HEADS,
+        attention_head_dim: SHARED_FIXTURE_DIT_ATTENTION_HEAD_DIM,
+        hidden_size: SHARED_FIXTURE_DIT_HIDDEN_SIZE,
+        num_layers: SHARED_FIXTURE_DIT_NUM_LAYERS,
+        num_refiner_layers: SHARED_FIXTURE_DIT_NUM_REFINER_LAYERS,
+        ffn_dim: SHARED_FIXTURE_DIT_FFN_DIM,
+        text_dim: SHARED_FIXTURE_DIT_TEXT_DIM,
+        freq_dim: SHARED_FIXTURE_DIT_FREQ_DIM,
+        time_embed_hidden_dim: SHARED_FIXTURE_DIT_TIME_EMBED_HIDDEN_DIM,
+        time_embed_dim: SHARED_FIXTURE_DIT_TIME_EMBED_DIM,
+        rope_freq_dim: SHARED_FIXTURE_DIT_ROPE_FREQ_DIM,
         ..candle_gen_minimax_h3::MiniMaxH3DitConfig::default()
     }
 }
@@ -135,12 +263,12 @@ pub struct DitLayout {
 
 /// The DiT fixture's layout, mirroring `dump_minimax_h3_dit.py`.
 pub const DIT_LAYOUT: DitLayout = DitLayout {
-    num_text_tokens: 5,
-    num_audio_latents: 3,
-    audio_channels: 2,
-    num_latent_frames: 3,
-    latent_height: 4,
-    latent_width: 6,
+    num_text_tokens: SHARED_FIXTURE_LAYOUT_NUM_TEXT_TOKENS,
+    num_audio_latents: SHARED_FIXTURE_LAYOUT_NUM_AUDIO_LATENTS,
+    audio_channels: SHARED_FIXTURE_LAYOUT_AUDIO_CHANNELS,
+    num_latent_frames: SHARED_FIXTURE_LAYOUT_NUM_LATENT_FRAMES,
+    latent_height: SHARED_FIXTURE_LAYOUT_LATENT_HEIGHT,
+    latent_width: SHARED_FIXTURE_LAYOUT_LATENT_WIDTH,
 };
 
 // -------------------------------------------------------------------------------------------
@@ -349,19 +477,19 @@ pub fn weights(map: HashMap<String, Tensor>) -> Weights {
 pub fn fixture_config(token_drop: i32) -> MiniMaxH3VaeConfig {
     let shipped = MiniMaxH3VaeConfig::default();
     MiniMaxH3VaeConfig {
-        latent_channels: 24,
-        out_channels: 3,
-        num_layers: 2,
-        num_heads: 2,
-        head_dim: 16,
-        num_register_tokens: 4,
-        ffn_mult: 4,
-        rope_theta: 100.0,
-        rope_dim_ratio: 0.75,
-        norm_eps: 1e-5,
-        patch_size: 2,
-        patch_size_t: 4,
-        clip_length: 17,
+        latent_channels: SHARED_FIXTURE_VAE_LATENT_CHANNELS,
+        out_channels: SHARED_FIXTURE_VAE_OUT_CHANNELS,
+        num_layers: SHARED_FIXTURE_VAE_NUM_LAYERS,
+        num_heads: SHARED_FIXTURE_VAE_NUM_HEADS,
+        head_dim: SHARED_FIXTURE_VAE_HEAD_DIM,
+        num_register_tokens: SHARED_FIXTURE_VAE_NUM_REGISTER_TOKENS,
+        ffn_mult: SHARED_FIXTURE_VAE_FFN_MULT,
+        rope_theta: SHARED_FIXTURE_VAE_ROPE_THETA,
+        rope_dim_ratio: SHARED_FIXTURE_VAE_ROPE_DIM_RATIO,
+        norm_eps: SHARED_FIXTURE_VAE_NORM_EPS,
+        patch_size: SHARED_FIXTURE_VAE_PATCH_SIZE,
+        patch_size_t: SHARED_FIXTURE_VAE_PATCH_SIZE_T,
+        clip_length: SHARED_FIXTURE_VAE_CLIP_LENGTH,
         token_drop,
         // The REAL 24-entry de-normalization statistics, not placeholders.
         latents_mean: shipped.latents_mean.clone(),
@@ -370,20 +498,19 @@ pub fn fixture_config(token_drop: i32) -> MiniMaxH3VaeConfig {
         // `encoder.*` tensors at all, so nothing loads against these — they are here because
         // `MiniMaxH3VaeConfig::validate` covers both halves and the shape must be self-consistent.
         // See [`ENCODE_FIXTURE`] for why the encode goldens needed a different one.
-        in_channels: 3,
-        block_out_channels: vec![32, 32, 32, 32],
-        layers_per_block: 1,
-        spatial_downsample_factors: vec![2, 1, 1, 1],
-        temporal_downsample_factors: vec![1, 2, 2, 1],
-        norm_num_groups: 32,
-        encoder_norm_eps: 1e-6,
+        in_channels: SHARED_FIXTURE_VAE_IN_CHANNELS,
+        block_out_channels: SHARED_FIXTURE_VAE_BLOCK_OUT_CHANNELS.to_vec(),
+        layers_per_block: SHARED_FIXTURE_VAE_LAYERS_PER_BLOCK,
+        spatial_downsample_factors: SHARED_FIXTURE_VAE_SPATIAL_DOWNSAMPLE_FACTORS.to_vec(),
+        temporal_downsample_factors: SHARED_FIXTURE_VAE_TEMPORAL_DOWNSAMPLE_FACTORS.to_vec(),
+        norm_num_groups: SHARED_FIXTURE_VAE_NORM_NUM_GROUPS,
+        encoder_norm_eps: SHARED_FIXTURE_VAE_ENCODER_NORM_EPS,
     }
 }
 
 /// The geometry [`ENCODE_FIXTURE`] was dumped at, mirroring
-/// `tools/dump_minimax_h3_video_vae_encode.py`. Identical to the MLX lane's
-/// `encode_fixture_config` — the two backends must agree about the fixture's shape before either
-/// compares a tensor.
+/// `tools/dump_minimax_h3_video_vae_encode.py`. Built from the `SHARED_FIXTURE_ENCODE_*` constants,
+/// which `check_cross_backend_geometry` holds equal to the MLX lane's.
 ///
 /// Differs from [`fixture_config`] in exactly the ways the encode half forces (see
 /// [`ENCODE_FIXTURE`]): every downsampling level is spatial-strided, so nothing crops and the
@@ -391,10 +518,10 @@ pub fn fixture_config(token_drop: i32) -> MiniMaxH3VaeConfig {
 /// so `conv_shortcut` is actually built rather than left unexercised.
 pub fn encode_fixture_config(token_drop: i32) -> MiniMaxH3VaeConfig {
     MiniMaxH3VaeConfig {
-        patch_size: 4,
-        block_out_channels: vec![32, 32, 32, 64],
-        spatial_downsample_factors: vec![1, 2, 2, 1],
-        temporal_downsample_factors: vec![1, 2, 2, 1],
+        patch_size: SHARED_FIXTURE_ENCODE_PATCH_SIZE,
+        block_out_channels: SHARED_FIXTURE_ENCODE_BLOCK_OUT_CHANNELS.to_vec(),
+        spatial_downsample_factors: SHARED_FIXTURE_ENCODE_SPATIAL_DOWNSAMPLE_FACTORS.to_vec(),
+        temporal_downsample_factors: SHARED_FIXTURE_ENCODE_TEMPORAL_DOWNSAMPLE_FACTORS.to_vec(),
         ..fixture_config(token_drop)
     }
 }
@@ -419,18 +546,23 @@ pub fn encode_fixture_tiles(g: &Golden) -> (usize, usize) {
 pub fn audio_fixture_config() -> MiniMaxH3AudioVaeConfig {
     let shipped = MiniMaxH3AudioVaeConfig::default();
     MiniMaxH3AudioVaeConfig {
-        sample_rate: 32_000,
-        output_channels: 2,
-        latent_channels: 32,
-        encoder_dim: 8,
-        encoder_rates: vec![2, 2],
-        decoder_rates: vec![5, 5, 2, 2, 2, 2, 2],
-        decoder_dim: 128,
-        attn_proj: true,
-        decoder_type: "bigvgan".into(),
+        sample_rate: SHARED_FIXTURE_AUDIO_SAMPLE_RATE,
+        output_channels: SHARED_FIXTURE_AUDIO_OUTPUT_CHANNELS,
+        latent_channels: SHARED_FIXTURE_AUDIO_LATENT_CHANNELS,
+        encoder_dim: SHARED_FIXTURE_AUDIO_ENCODER_DIM,
+        encoder_rates: SHARED_FIXTURE_AUDIO_ENCODER_RATES.to_vec(),
+        decoder_rates: SHARED_FIXTURE_AUDIO_DECODER_RATES.to_vec(),
+        decoder_dim: SHARED_FIXTURE_AUDIO_DECODER_DIM,
+        attn_proj: SHARED_FIXTURE_AUDIO_ATTN_PROJ,
+        decoder_type: SHARED_FIXTURE_AUDIO_DECODER_TYPE.into(),
         latents_mean: shipped.latents_mean.clone(),
         latents_std: shipped.latents_std.clone(),
-        bigvgan: BigVganConfig::for_sample_rate(32_000, 64, 128).expect("32 kHz is supported"),
+        bigvgan: BigVganConfig::for_sample_rate(
+            SHARED_FIXTURE_AUDIO_SAMPLE_RATE,
+            SHARED_FIXTURE_AUDIO_BIGVGAN_NUM_MELS,
+            SHARED_FIXTURE_AUDIO_BIGVGAN_DECODER_DIM,
+        )
+        .expect("32 kHz is supported"),
     }
 }
 

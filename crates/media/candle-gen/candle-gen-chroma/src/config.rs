@@ -18,7 +18,15 @@ pub const CHROMA1_HD_ID: &str = "chroma1_hd";
 pub const CHROMA1_BASE_ID: &str = "chroma1_base";
 pub const CHROMA1_FLASH_ID: &str = "chroma1_flash";
 
-/// The base flow-match sampler name (matches the mlx descriptor's advertised sampler).
+/// The base flow-match sampler name.
+///
+/// It does **not** match the mlx descriptor's advertised sampler, which this doc comment claimed
+/// until sc-19496: `mlx-gen-chroma`'s `DEFAULT_SAMPLER` is `"euler"`. Both menus are built with
+/// `menu_with_aliases`, under which `flow_match` is a legacy alias falling back to euler (see the
+/// `samplers:` comment below), so the advertised *strings* differ while the integrator does not.
+/// Which string is right against the released checkpoint is sc-19495; `check_cross_backend_geometry`
+/// carries an exemption naming that story rather than letting either backend's value be copied
+/// across to buy a green.
 pub const DEFAULT_SAMPLER: &str = "flow_match";
 
 /// Chroma works in the VAE's /8 latent and the DiT packs that 2×2, so both image dims must be
