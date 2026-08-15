@@ -2175,79 +2175,96 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         """
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
         repository = REAL_WEIGHTS_WORKFLOW.parents[2]
+        # job -> the (source file, selected names) pairs it draws from. A job may select out of more
+        # than ONE test binary: sc-17156 added the VRAM probe, which lives in its own `vram_probe.rs`
+        # rather than in `real_weights.rs`, and binding it here is what stops that selection from
+        # silently rotting the way the sc-18932 orphans did.
         selected = {
             "mlx-minimax-h3": (
-                "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/real_weights.rs",
                 (
-                    # Header/config only -- no weight I/O, no Metal.
-                    "declared_tensor_names_match_the_published_checkpoint",
-                    "declared_audio_tensor_names_match_the_published_checkpoint",
-                    "published_audio_configs_reproduce_the_declared_geometry",
-                    "te_layer_50_tap_is_exhaustive_and_the_tail_is_trimmable",
-                    "real_tokenizer_resolves_the_minimax_special_tokens",
-                    # Decodes: ~10 GB and ~0.6 GB resident on MLX.
-                    "real_weight_decode_produces_a_plausible_video",
-                    "real_weight_multi_chunk_decode_blends_the_seam",
-                    "real_weight_audio_decode_produces_a_plausible_stereo_track",
-                    # The sc-18740 layout gate -- the ONLY test in either backend that compares
-                    # against an independent implementation on the published bytes.
-                    "real_weight_decode_matches_the_official_diffusers_vae",
+                    "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/real_weights.rs",
+                    (
+                        # Header/config only -- no weight I/O, no Metal.
+                        "declared_tensor_names_match_the_published_checkpoint",
+                        "declared_audio_tensor_names_match_the_published_checkpoint",
+                        "published_audio_configs_reproduce_the_declared_geometry",
+                        "te_layer_50_tap_is_exhaustive_and_the_tail_is_trimmable",
+                        "real_tokenizer_resolves_the_minimax_special_tokens",
+                        # Decodes: ~10 GB and ~0.6 GB resident on MLX.
+                        "real_weight_decode_produces_a_plausible_video",
+                        "real_weight_multi_chunk_decode_blends_the_seam",
+                        "real_weight_audio_decode_produces_a_plausible_stereo_track",
+                        # The sc-18740 layout gate -- the ONLY test in either backend that compares
+                        # against an independent implementation on the published bytes.
+                        "real_weight_decode_matches_the_official_diffusers_vae",
+                    ),
                 ),
             ),
             "candle-minimax-h3": (
-                "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs",
                 (
-                    "declared_tensor_names_match_the_published_checkpoint",
-                    # Header-only and device-free like its neighbours; added by sc-19008 and
-                    # wired by sc-19414, which found it selected by no lane at all.
-                    "declared_encoder_shapes_match_the_published_checkpoint",
-                    "declared_audio_tensor_names_match_the_published_checkpoint",
-                    "published_audio_configs_reproduce_the_declared_geometry",
-                    "stored_kaiser_filters_match_the_derivation_on_real_weights",
-                    # Decodes, landing on GPU 0 under `--features cuda`. Wired by sc-19414
-                    # against a MEASURED 97887 MiB card rather than against `CUDA_COMPUTE_CAP`,
-                    # which names an architecture and never a capacity. BOTH sides of that
-                    # comparison are measured: `vae/` and `audio_vae/` ship entirely F32, so the
-                    # f32 loads are no-op casts, and the decode halves are 9.03 GiB and
-                    # 0.242 GiB -- not the ~19.4 GB / ~1.2 GB the pre-sc-19414 comments claimed.
-                    "real_weight_decode_produces_a_plausible_video",
-                    "real_weight_multi_chunk_decode_blends_the_seam",
-                    "real_weight_audio_decode_produces_a_plausible_stereo_track",
+                    "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs",
+                    (
+                        "declared_tensor_names_match_the_published_checkpoint",
+                        # Header-only and device-free like its neighbours; added by sc-19008 and
+                        # wired by sc-19414, which found it selected by no lane at all.
+                        "declared_encoder_shapes_match_the_published_checkpoint",
+                        "declared_audio_tensor_names_match_the_published_checkpoint",
+                        "published_audio_configs_reproduce_the_declared_geometry",
+                        "stored_kaiser_filters_match_the_derivation_on_real_weights",
+                        # Decodes, landing on GPU 0 under `--features cuda`. Wired by sc-19414
+                        # against a MEASURED 97887 MiB card rather than against `CUDA_COMPUTE_CAP`,
+                        # which names an architecture and never a capacity. BOTH sides of that
+                        # comparison are measured: `vae/` and `audio_vae/` ship entirely F32, so the
+                        # f32 loads are no-op casts, and the decode halves are 9.03 GiB and
+                        # 0.242 GiB -- not the ~19.4 GB / ~1.2 GB the pre-sc-19414 comments claimed.
+                        "real_weight_decode_produces_a_plausible_video",
+                        "real_weight_multi_chunk_decode_blends_the_seam",
+                        "real_weight_audio_decode_produces_a_plausible_stereo_track",
+                    ),
+                ),
+                (
+                    # sc-17156 -- the measured `vramGbByTier` datum. Operator-dispatched behind the
+                    # `minimax_h3_vram_probe` input (it renders for hours on a card both listeners
+                    # share), but the SELECTION still has to name a test that exists and is still
+                    # `#[ignore]`d, which is exactly what this binding checks.
+                    "crates/media/candle-gen/candle-gen-minimax-h3/tests/vram_probe.rs",
+                    ("minimax_h3_vram_bf16",),
                 ),
             ),
         }
 
         bodies = workflow_job_bodies(workflow)
-        for job, (source, names) in selected.items():
+        for job, sources in selected.items():
             self.assertIn(job, bodies, f"{job} was renamed or removed")
             body = "\n".join(bodies[job])
-            text = (repository / source).read_text(encoding="utf-8")
-            for name in names:
-                with self.subTest(job=job, test=name):
-                    # `run_one <name>` in the bash lane, `call :run_one <name> || exit /b 1` in the
-                    # cmd one, `name=<name>` in the single-selection step. The trailing negative
-                    # class is load-bearing: without it a longer test name that merely STARTS with
-                    # this one would satisfy the check for both.
-                    self.assertRegex(
-                        body,
-                        rf"(?:run_one |name=){re.escape(name)}(?![A-Za-z0-9_])",
-                        f"{job}: {name} is no longer selected by name",
-                    )
-                    # `\bfn <name>(` -- the definition, not a `--skip` or a doc-comment mention.
-                    definition = re.search(
-                        rf"(?m)^(?P<attributes>(?:#\[[^\n]*\]\n)*)fn {re.escape(name)}\(",
-                        text,
-                    )
-                    self.assertIsNotNone(
-                        definition,
-                        f"{job} selects {name}, which no longer exists in {source}",
-                    )
-                    self.assertIn(
-                        "#[ignore",
-                        definition.group("attributes"),
-                        f"{name} is no longer #[ignore]d, so `--ignored` filters it OUT and the "
-                        f"{job} step would report `0 passed`",
-                    )
+            for source, names in sources:
+                text = (repository / source).read_text(encoding="utf-8")
+                for name in names:
+                    with self.subTest(job=job, test=name):
+                        # `run_one <name>` in the bash lane, `call :run_one <name> || exit /b 1` in
+                        # the cmd one, `name=<name>` in the single-selection step. The trailing
+                        # negative class is load-bearing: without it a longer test name that merely
+                        # STARTS with this one would satisfy the check for both.
+                        self.assertRegex(
+                            body,
+                            rf"(?:run_one |name=){re.escape(name)}(?![A-Za-z0-9_])",
+                            f"{job}: {name} is no longer selected by name",
+                        )
+                        # `\bfn <name>(` -- the definition, not a `--skip` or doc-comment mention.
+                        definition = re.search(
+                            rf"(?m)^(?P<attributes>(?:#\[[^\n]*\]\n)*)fn {re.escape(name)}\(",
+                            text,
+                        )
+                        self.assertIsNotNone(
+                            definition,
+                            f"{job} selects {name}, which no longer exists in {source}",
+                        )
+                        self.assertIn(
+                            "#[ignore",
+                            definition.group("attributes"),
+                            f"{name} is no longer #[ignore]d, so `--ignored` filters it OUT and "
+                            f"the {job} step would report `0 passed`",
+                        )
             # Join `\`-continued shell lines first: the macOS invocations span several, and a
             # per-LINE check cannot see that `--exact` moved from after the `--` to before it —
             # the whole trap this is here to catch would be invisible.

@@ -264,6 +264,15 @@ pub const PROVIDER_COMPONENTS: &[ProviderComponents] = &[
         provider_id: "ltx_2_3_distilled",
         components: &["ltx_2_3", "gemma_3_12b_it"],
     },
+    // --- minimax-h3 -------------------------------------------------------------------------
+    // One repository, two licences: the DiT / VAEs / tokenizer are the territorially-exclusive
+    // MiniMax H3 Community License, while the bundled `text_encoder/` is byte-identical upstream
+    // Qwen3-VL-32B-Instruct under Apache-2.0. Both are rowed, because both are loaded. Identical to
+    // the MLX sibling's row: these are facts about the checkpoint, not about a backend.
+    ProviderComponents {
+        provider_id: "minimax_h3",
+        components: &["minimax_h3", "qwen3_vl_32b_instruct"],
+    },
     // --- mochi ------------------------------------------------------------------------------
     // The AsymmVAE ships inside the Mochi snapshot and rides its row; the T5-XXL encoder is the
     // same `google/t5-v1_1-xxl` FLUX and Chroma condition on, which is what the crate names
@@ -712,6 +721,7 @@ mod tests {
                 "chroma1_hd",
                 "ltx_2_3",
                 "ltx_2_3_distilled",
+                "minimax_h3",
                 "mochi_1",
                 "sana_1600m",
                 "sana_sprint_1600m",
@@ -783,13 +793,6 @@ mod tests {
             "krea_realtime_video",
             "wan2_1_t2v_14b_diffusers",
             "wan2_1_vace_1_3b_diffusers",
-            // MiniMax-H3 registers a provider id on MLX only: sc-17147 wired `minimax_h3` there.
-            // sc-17154 has since landed `candle-gen-minimax-h3` with BOTH VAE decoders, but that
-            // crate ships no generator and is deliberately absent from this catalog until the
-            // pipeline lands (sc-17155 DiT, sc-17156 e2e) — so neither the model's own row nor the
-            // Qwen3-VL-32B encoder it bundles is reached on this backend yet.
-            "minimax_h3",
-            "qwen3_vl_32b_instruct",
             // The bespoke Candle PuLID path and the overlay crates (sc-16668), which register
             // no provider id on this backend. Candle has no `sam2` crate at all, so both SAM 2.1
             // rows are unreached here as well.

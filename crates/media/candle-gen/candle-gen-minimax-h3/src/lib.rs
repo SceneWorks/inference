@@ -82,29 +82,49 @@
 //!   [`denoise::packing`] the packed sequence, and the loop itself, which runs **one** forward per
 //!   step because the checkpoint is guidance-distilled.
 //!
+//! ## The conditioner, the pipeline and the generator (sc-17156)
+//!
+//! - [`text_encoder`] is the Qwen3-VL-32B condition encoder — a **layer-50 tap**, so it loads and
+//!   runs 50 of the checkpoint's 64 decoder layers and never touches the final norm or `lm_head`;
+//!   its vision half is the shared `candle-gen-boogu` tower rather than a fifth copy;
+//! - [`keyframe`] and [`conditioning`] are `fl2va`'s two keyframe paths — the canvas the keyframe
+//!   BINDS plus its pixel prep, and the VAE-encoded conditioning rows that lead the video stream;
+//! - [`pipeline`] is the geometry lattice, the packed-row transforms, the cancellable render core
+//!   and the delivery-time AV length policy;
+//! - [`model`] is the `Generator`: staged phases, a **forced** `OffloadPolicy::Sequential`, and the
+//!   `t2va` / `fl2va` split.
+//!
+//! The crate is registered with `candle-gen-catalog` as of sc-17156. The generator and the
+//! memory-strategy registration necessarily landed together: `ProviderRegistryBuilder::build`
+//! rejects a memory-strategy registration whose `provider_id` has no matching generator, which is
+//! why the catalog line could not be added before (see [`register_providers`]).
+//!
 //! ## Not in this crate
 //!
-//! The Qwen3-VL-32B text encoder, the pipeline and measured `vramGbByTier` (sc-17156), and Ref2VA
-//! (sc-17157). Nothing is registered with `candle-gen-catalog` — there is no generator to ship
-//! until the pipeline lands. **The MLX sibling is not in this state**: it ships
-//! `model::REGISTRATION` and `mlx-gen-catalog` calls its `register_providers`, which is what lets
-//! its memory contract reach the registry while this crate's cannot (see [`register_providers`]).
+//! Ref2VA (sc-17157) — the `transformer_ref` partition, the omni-reference presentation and the
+//! audio VAE **encoder** — and the turbo LoRA seam. Both are default-denied in [`model::descriptor`]
+//! rather than silently ignored.
 
 pub mod alias_free;
 pub mod audio_config;
 pub mod audio_vae;
 pub mod blocks;
 pub mod chunking;
+pub mod conditioning;
 pub mod config;
 pub mod decoder;
 pub mod denoise;
 pub mod dit;
+pub mod keyframe;
 pub mod layout;
 pub mod memory_strategy;
+pub mod model;
 pub mod nn;
+pub mod pipeline;
 pub mod rope;
 pub mod spatial_tiling;
 pub mod tensor;
+pub mod text_encoder;
 pub mod vae;
 pub mod vae_encoder;
 
@@ -117,6 +137,11 @@ pub use audio_config::{
 pub use audio_vae::{AmpBlock1, BigVgan, MiniMaxH3AudioVae};
 pub use blocks::{blend, TransformerBlock};
 pub use chunking::{ChunkSpan, TemporalGeometry, TemporalPlan};
+pub use conditioning::{
+    build_condition_rows, encode_keyframe_condition, fp16_round_trip, keyframe_condition_rows,
+    scale_noise, validate_condition_arity, KeyframeNoise, KEYFRAME_ENCODE_SEED,
+    KEYFRAME_NOISE_AUG_T,
+};
 pub use config::{
     MiniMaxH3VaeConfig, CLIP_LENGTH, DECODER_HEAD_DIM, DECODER_NUM_HEADS, DECODER_NUM_LAYERS,
     DECODER_NUM_REGISTER_TOKENS, DECODER_ROPE_DIM_RATIO, DECODER_ROPE_THETA,
@@ -136,11 +161,31 @@ pub use dit::{
     MiniMaxH3Dit, MiniMaxH3DitConfig, MmRope, TimestepSchedule, TokenRefiner, MODALITY_NUM,
     PUBLISHED_DIT_TENSORS,
 };
+pub use keyframe::{
+    anchors_for, fit_keyframe, fit_keyframes, keyframe_to_vae_pixels, resolve_canvas_size,
+    resolve_keyframe_canvas, round_half_to_even, KeyframeFit, MAX_ASPECT_RATIO, MIN_ASPECT_RATIO,
+};
 pub use layout::{
     split_gate_value, swap_gated_halves, GatedFfnLayout, AUDIO_VAE_IS_UNCONVERTED,
     PUBLISHED_GATED_FFN_LAYOUT,
 };
+pub use model::{
+    descriptor, keyframe_anchors, MiniMaxH3, DEFAULT_STEPS, MAX_STEPS, OFFLOAD_POLICY,
+};
+pub use pipeline::{
+    align_frames_for_duration, fit_audio_to_video, fl2va_layout, frames_to_images, initial_latents,
+    patchify_video_latents, prepend_condition_rows, render_latents, resolve_geometry,
+    revert_pixel_normalization, t2va_layout, unpack_audio_rows, unpatchify_video_rows,
+    RenderedLatents, RequestGeometry, CANVAS_MAX_PIXELS, CANVAS_SHORT_EDGE, MAX_DURATION_SECONDS,
+    MIN_DURATION_SECONDS, PATCH_SIZE, PIXEL_MEAN, PIXEL_STD, SMALLEST_LEGAL_FRAMES, SPATIAL_STRIDE,
+};
 pub use rope::{create_token_ids, Rope3d, RopeTables};
+pub use text_encoder::{
+    encode_grounded, encode_grounded_from_vision, lm_prefixes, load_vision_tower,
+    minimax_h3_vision_config, run_vision, GroundedVision, MiniMaxH3TeConfig, MiniMaxH3TextEncoder,
+    MiniMaxH3Tokenizer, APPLIES_CHAT_TEMPLATE, LM_PREFIX, MINIMAX_ADDED_SPECIALS, SELECT_HIDDEN,
+    VISION_PREFIX,
+};
 pub use vae::{split_fused_qkv, MiniMaxH3VideoVae};
 pub use vae_encoder::{
     conv3d_ncthw, reflect_pad_axis, stitch_tiles, zero_pad_front_time, CausalConv3d,
@@ -175,25 +220,29 @@ pub const SIZE_MULTIPLE: u32 = VAE_RATIO as u32 * 2;
 /// `mlx_gen_minimax_h3::register_providers`, and **the exact function `candle-gen-catalog` will
 /// call** once there is something to call it for.
 ///
-/// It registers the memory contract and its weights-free fixture and **no generator**, because this
-/// crate has none: sc-17156 owns the pipeline. A builder in that state cannot `build()` —
-/// `ProviderRegistryBuilder::build` rejects a memory-strategy registration whose `provider_id` has
-/// no matching generator — which is precisely why the catalog line is still absent, and why adding
-/// it today would break `candle_gen_catalog::provider_registry()` rather than wire anything up.
+/// It registers the generator, the memory contract and the contract's weights-free fixture. The
+/// three are one unit by construction: `ProviderRegistryBuilder::build` rejects a memory-strategy
+/// registration whose `provider_id` has no matching generator, so before sc-17156 this function
+/// returned a builder that could not `build()` at all — which is why the catalog line was absent
+/// until the generator existed to join it.
 ///
-/// This function exists so that state is a **fact the tests can read off the crate's real
-/// registration inventory** rather than a claim in a comment:
+/// That coupling is still the guarantee, in the other direction:
 /// `memory_strategy::tests::a_generator_landing_here_forces_the_catalog_line` builds what this
-/// returns, and the moment a `.register_generator(…)` line joins it the build succeeds and that
-/// test demands the catalog line. Registering a generator straight from the catalog instead would
-/// leave [`memory_strategy::MEMORY_REGISTRATION`] unregistered, so the same test also fails if the
-/// catalog reaches this crate by any path while this function still ships no generator.
+/// returns, so a future change that registered the generator straight from the catalog — leaving
+/// [`memory_strategy::MEMORY_REGISTRATION`] behind — fails here rather than shipping a provider
+/// whose memory contract the ladder cannot see.
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
     registry
+        .register_generator(model::REGISTRATION)
         .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
         .register_memory_contract_fixture(memory_strategy::MEMORY_CONTRACT_FIXTURE)
+}
+
+/// Build the complete explicit Candle MiniMax-H3 provider catalog.
+pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core::ProviderRegistry> {
+    register_providers(candle_gen::gen_core::ProviderRegistryBuilder::new()).build()
 }
 
 #[cfg(test)]

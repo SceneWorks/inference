@@ -10,11 +10,13 @@
 //!    can run its resident path and can never claim a verified optimized fit — which is exactly
 //!    the truth here, and is enforced: `standard_memory_strategy_safety_check` refuses any
 //!    optimized selection when the identity is absent.
-//! 2. **No staged residency.** MLX declares [`MemoryStrategy::StagedResidency`] `Implemented`
-//!    because `MiniMaxH3::generate_impl` releases each heavy component before mapping the next.
-//!    This crate has **no pipeline at all** — it ships the DiT, the joint denoise, the two VAE
-//!    decoders and the video VAE encoder, and no text encoder and no generator (sc-17156 owns the
-//!    end-to-end path). There is nothing to stage, so rung 1 is `Missing`.
+//! 2. **Staged residency is implemented but under-declared (sc-17156 / sc-18660).** MLX declares
+//!    [`MemoryStrategy::StagedResidency`] `Implemented`. This lane now *does the same thing* —
+//!    `MiniMaxH3::generate_impl` releases each heavy component before mapping the next, and the
+//!    provider **forces** `OffloadPolicy::Sequential` so a caller cannot opt out — but the rung
+//!    stays declared `Missing` until its executable behavior seam lands (sc-18660). An implemented
+//!    optimized rung without a seam fails catalog conformance, and under-declaring is the safe
+//!    direction: the staging still happens, and nothing is admitted on an unexercisable claim.
 //! 3. **No fused streaming SDPA.** The MLX verdict that attention scratch is already streamed —
 //!    peak tracking `4·B·H·S·D` with no materialized score tensor — is a property of *MLX's* fused
 //!    kernel and **must not be copied here**. Candle materializes scores, so bounding attention
@@ -115,11 +117,24 @@ impl ComponentBytes {
     }
 }
 
-/// The five capability entries. Only the resident baseline is implemented on this backend.
+/// The five capability entries. **Exactly one is `Implemented` — rung 0, `Resident`. Rungs 1-4 are
+/// all `Missing`**, which is what the `match` below returns and what the ladder reads.
+///
+/// Rung 1 is the one that needs stating carefully, because the pipeline and the declaration disagree
+/// **on purpose**. sc-17156 made the staging real — `MiniMaxH3::generate_impl` drops each heavy
+/// component and synchronizes the device before mapping the next, and `MiniMaxH3` forces
+/// [`OffloadPolicy::Sequential`](candle_gen::gen_core::OffloadPolicy) whatever the caller asks for,
+/// so a caller cannot opt out. The *declaration* deliberately did not follow: the rung stays
+/// `Missing` until its executable weights-free behavior seam lands (sc-18660). The long note on the
+/// arm below gives the full reasoning, and the module header says the same thing.
+///
+/// So "implemented in the pipeline" and "declared `Implemented`" are two different facts here, and
+/// only the first is true. Reading this as rung 1 being available to the ladder would be wrong in
+/// the direction that matters: nothing is admitted on the strength of it.
 ///
 /// Every entry publishes an empty [`MemoryParameterRanges`], which is correct in both directions:
 /// rung 0 owns no numeric parameters, and a `Missing` rung must not publish a domain it cannot
-/// honor. Flipping any of rungs 2-4 to `Implemented` without filling its domain is a conformance
+/// honor. Flipping any of rungs 1-4 to `Implemented` without filling its domain is a conformance
 /// error, not a silent under-declaration.
 fn strategies() -> Vec<MemoryStrategyCapability> {
     MemoryStrategy::ALL
@@ -128,8 +143,22 @@ fn strategies() -> Vec<MemoryStrategyCapability> {
             strategy,
             support: match strategy {
                 MemoryStrategy::Resident => MemoryStrategySupport::Implemented,
-                // Rung 1: sc-17156 (there is no pipeline to stage). Rungs 2/3/4: sc-18660 /
-                // sc-18661 / sc-18662.
+                // Rung 1 is **implemented in code** as of sc-17156 — `MiniMaxH3::generate_impl`
+                // stages all three phases and the offload policy is forced — but it stays declared
+                // `Missing` here, and that is a deliberate under-declaration, not an oversight.
+                //
+                // `check_memory_strategy_contract` requires every *implemented optimized* rung to
+                // carry an executable weights-free **behavior seam** (a `MemoryBehaviorRegistration`
+                // with per-route fixtures, the MLX sibling's `MEMORY_BEHAVIOR`). Declaring the rung
+                // without it fails catalog conformance — correctly: an optimized declaration with no
+                // seam is a capability claim nothing can execute against.
+                //
+                // Under-declaring is the safe direction. `Missing` means the ladder never *selects*
+                // staged residency for this provider, so the staging still happens (it is forced)
+                // and nothing is admitted on the strength of an unproven declaration. The reverse —
+                // declaring it and having the seam absent — would let admission believe a rung it
+                // cannot exercise. sc-18660 owns landing the seam and flipping this. Rungs 2/3/4:
+                // sc-18660 / sc-18661 / sc-18662.
                 _ => MemoryStrategySupport::Missing,
             },
             parameters: MemoryParameterRanges::default(),
@@ -160,10 +189,11 @@ fn build_contract(components: &ComponentBytes) -> MemoryProviderContract {
         additional_prerequisites: Vec::new(),
         default_engagement_exclusions: Vec::new(),
         resident_request_memory: ResidentRequestMemory::PreserveLoadDefaults,
-        // No phases and no hooks: nothing in this crate releases a component at a phase boundary,
-        // tiles a decode, chunks attention or windows the block stack. Declaring a hook here would
-        // be the false-declaration case `conformance_errors` cannot catch, because a hook flag is
-        // not checked against an implementation.
+        // Empty, and paired with the `Missing` rung-1 declaration above for the same reason: the
+        // phases ARE implemented (`generate_impl` releases each component and synchronizes the
+        // device via `crate::dit::release_device_memory`), but the rung they belong to cannot be
+        // declared until its behavior seam exists, and a lifecycle block attached to a `Missing`
+        // rung is a claim with no rung to hang on. sc-18660 lands both together.
         lifecycle: MemoryLifecycleCapabilities::default(),
         // The floor arm, and only the floor arm.
         formula: MemoryFormulaKind::AssetBytesPlusHeadroom,
@@ -521,9 +551,14 @@ mod tests {
 
     // --- AC2: nothing optimized is declared, and nothing optimized is reachable ------------------
 
-    /// Every optimized rung is `Missing`, and each is independently refused at selection. With no
-    /// calibration identity the shared safety check refuses them a second time, so the declaration
-    /// and the admission path agree.
+    /// **Rungs 1-4 are all declared `Missing`, and each is independently refused at selection.**
+    ///
+    /// Rung 1 is the interesting member: sc-17156 made the staging real in `generate_impl` and
+    /// forced the offload policy, but the declaration deliberately did not follow (see
+    /// `strategies`), so it is refused here exactly like 2-4. **Two** independent things would each
+    /// have to change before it became admittable — the declaration itself, and the `calibration`
+    /// identity that is `None` — and the assertions below check the declaration and the admission
+    /// decision separately so a change to either is visible rather than absorbed by the other.
     #[test]
     fn no_optimized_rung_is_declared_or_selectable() {
         let contract = declared();
@@ -532,6 +567,10 @@ mod tests {
             "candle has no fitted curve for this family"
         );
         for strategy in MemoryStrategy::ALL {
+            // Only rung 0 is declared `Implemented`; 1-4 are `Missing`. `is_optimized()` — which
+            // decides which arms below run — is `!matches!(self, Resident)`, so `StagedResidency`
+            // IS optimized and the refusal arms DO exercise rung 1. That is the point of the test,
+            // not an exception to it: the rung whose mechanism exists is refused all the same.
             let expected = if strategy == MemoryStrategy::Resident {
                 MemoryStrategySupport::Implemented
             } else {
@@ -881,7 +920,9 @@ mod tests {
         // 1. No fitted curve: the floor arm only, and no calibration identity.
         assert_eq!(contract.formula, MemoryFormulaKind::AssetBytesPlusHeadroom);
         assert!(contract.calibration.is_none());
-        // 2. No staged residency: there is no pipeline to stage, so no phases and no hooks.
+        // 2. Staged residency is IMPLEMENTED IN CODE as of sc-17156 but still declared `Missing`,
+        //    because an implemented optimized rung needs a behavior seam this lane does not have
+        //    yet (sc-18660). Under-declaring is the safe direction — see `strategies`.
         assert_eq!(contract.lifecycle, MemoryLifecycleCapabilities::default());
         assert!(contract.lifecycle.phases.is_empty());
         assert!(!contract.lifecycle.synchronized_phase_release);
@@ -913,7 +954,11 @@ mod tests {
     }
 
     /// A phase hook declared without an implementation is the false declaration conformance cannot
-    /// catch. This pins the honest state: no phase is declared at all.
+    /// catch. This pins the honest state: no phase is declared, because the rung they belong to is
+    /// not declared either (sc-18660 lands the behavior seam and flips both together).
+    ///
+    /// The release primitive the phases WILL declare is exercised here anyway, so this test also
+    /// fails if it is removed while the declaration is pending.
     #[test]
     fn no_lifecycle_phase_is_declared_without_an_implementation() {
         let contract = declared();
@@ -924,9 +969,11 @@ mod tests {
         ] {
             assert!(
                 !contract.lifecycle.phases.contains(&phase),
-                "{phase:?} must not be declared until something releases it at a boundary"
+                "{phase:?} must not be declared while StagedResidency is Missing"
             );
         }
+        crate::dit::release_device_memory(&candle_gen::candle_core::Device::Cpu)
+            .expect("the phase-release primitive must exist and succeed");
         assert!(!contract.lifecycle.decode_tiling);
         assert!(!contract.lifecycle.attention_chunking);
         assert!(!contract.lifecycle.transformer_window_materialization);

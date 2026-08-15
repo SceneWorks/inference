@@ -31,6 +31,7 @@ pub mod providers {
     pub use candle_gen_lens as lens;
     pub use candle_gen_ltx as ltx;
     pub use candle_gen_mage as mage;
+    pub use candle_gen_minimax_h3 as minimax_h3;
     pub use candle_gen_mochi as mochi;
     pub use candle_gen_pid as pid;
     pub use candle_gen_pulid as pulid;
@@ -69,6 +70,10 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
     let registry = candle_gen_lens::register_providers(registry);
     let registry = candle_gen_ltx::register_providers(registry);
     let registry = candle_gen_mage::register_providers(registry);
+    // sc-17156: the generator and the memory-strategy registration land TOGETHER.
+    // `ProviderRegistryBuilder::build` rejects a memory-strategy registration whose `provider_id`
+    // has no matching generator, so this line was absent while the crate shipped only the contract.
+    let registry = candle_gen_minimax_h3::register_providers(registry);
     let registry = candle_gen_mochi::register_providers(registry);
     let registry = candle_gen_qwen_image::register_providers(registry);
     let registry = candle_gen_sana::register_providers(registry);
@@ -604,13 +609,20 @@ mod preview_advertising {
         /// over a low-resolution input has no multi-step progression to preview. No holdout R² was
         /// ever measured for it and none is quoted.
         Seedvr2SuperResolution,
+        /// MiniMax-H3's **joint audio+video** space (sc-17156). Excluded on its shape, not on a
+        /// number: the video half decodes through a 36-layer *transformer* whose output projection
+        /// performs all 16x spatial and 4x temporal upsampling, so there is no per-frame linear map
+        /// from a latent to a preview frame the way there is for a CNN VAE — and the packed sequence
+        /// interleaves audio rows that have no picture at all. No holdout R^2 was ever measured for
+        /// it and none is quoted.
+        MinimaxH3Joint,
     }
 
     impl NoGo {
         /// Every variant, so a test can quantify over the whole enum rather than over a hand-listed
         /// subset that a new variant silently escapes. `the_recorded_no_go_measurements_stay_labelled_
         /// fit_versus_holdout` iterates this and pins which rows carry numbers.
-        const ALL: [NoGo; 7] = [
+        const ALL: [NoGo; 8] = [
             NoGo::Ltx,
             NoGo::Mage,
             NoGo::Mochi,
@@ -618,6 +630,7 @@ mod preview_advertising {
             NoGo::WanZ48,
             NoGo::SvdTemporal,
             NoGo::Seedvr2SuperResolution,
+            NoGo::MinimaxH3Joint,
         ];
 
         /// Exactly the variants epic 16624 put a number on. Kept beside [`NoGo::measured`] so the
@@ -645,6 +658,7 @@ mod preview_advertising {
                      candle-side adjudication sc-16954",
                 ),
                 NoGo::Seedvr2SuperResolution => None,
+                NoGo::MinimaxH3Joint => None,
             }
         }
 
@@ -660,9 +674,11 @@ mod preview_advertising {
                 NoGo::Ltx => Some(("0.984291", "0.618575")),
                 NoGo::Mage => Some(("0.938091", "0.806216")),
                 NoGo::Mochi => Some(("0.846932", "0.807202")),
-                NoGo::WanZ16 | NoGo::WanZ48 | NoGo::SvdTemporal | NoGo::Seedvr2SuperResolution => {
-                    None
-                }
+                NoGo::WanZ16
+                | NoGo::WanZ48
+                | NoGo::SvdTemporal
+                | NoGo::Seedvr2SuperResolution
+                | NoGo::MinimaxH3Joint => None,
             }
         }
 
@@ -693,6 +709,13 @@ mod preview_advertising {
                         "a temporal video space (AutoencoderKLTemporalDecoder, four channels behind a \
                          temporal decoder) — NEVER measured, same program gate; not SDXL's \
                          four-channel space"
+                    }
+                    NoGo::MinimaxH3Joint => {
+                        "MiniMax-H3's joint audio+video space — NEVER measured, and excluded on its \
+                         SHAPE: the video half decodes through a 36-layer transformer whose output \
+                         projection performs all 16x spatial and 4x temporal upsampling, so there \
+                         is no per-frame linear latent→pixel map to fit, and the packed sequence \
+                         interleaves audio rows that carry no picture at all"
                     }
                     NoGo::Seedvr2SuperResolution => {
                         "a one-step super-resolution upscaler over a low-resolution input — no \
@@ -737,6 +760,7 @@ mod preview_advertising {
         ("wan_vace", NoGo::WanZ16),
         ("wan2_2_vace_fun_14b", NoGo::WanZ16),
         ("ltx_2_3_distilled", NoGo::Ltx),
+        ("minimax_h3", NoGo::MinimaxH3Joint),
         ("mochi_1", NoGo::Mochi),
         ("mage_flow", NoGo::Mage),
         ("mage_flow_base", NoGo::Mage),
@@ -1091,6 +1115,12 @@ mod preview_advertising {
         ProviderCrate {
             dir: "candle-gen-mage",
             register: candle_gen_mage::register_providers,
+            denoise: Denoise::Bespoke,
+            routes: &[],
+        },
+        ProviderCrate {
+            dir: "candle-gen-minimax-h3",
+            register: candle_gen_minimax_h3::register_providers,
             denoise: Denoise::Bespoke,
             routes: &[],
         },
@@ -3359,13 +3389,14 @@ mod preview_advertising {
                 "candle-gen-bernini",
                 "candle-gen-ltx",
                 "candle-gen-mage",
+                "candle-gen-minimax-h3",
                 "candle-gen-mochi",
                 "candle-gen-scail2",
                 "candle-gen-seedvr2",
                 "candle-gen-svd",
                 "candle-gen-wan",
             ],
-            "the 19 no-go ids must resolve to exactly these eight crates — a mismatch means an id \
+            "the 20 no-go ids must resolve to exactly these nine crates — a mismatch means an id \
              moved crates or a crate acquired a route that is not accounted for"
         );
 
@@ -4077,6 +4108,7 @@ mod tests {
                 "mage_flow_edit",
                 "mage_flow_edit_base",
                 "mage_flow_edit_turbo",
+                "minimax_h3",
                 "mochi_1",
                 "qwen_image",
                 "sana_1600m",

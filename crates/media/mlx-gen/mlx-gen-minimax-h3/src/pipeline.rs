@@ -139,8 +139,12 @@ impl RequestGeometry {
     }
 
     /// Samples **per channel** the delivered soundtrack carries — see [`fit_audio_to_video`].
+    ///
+    /// Delegates to [`crate::denoise::delivered_audio_samples`] rather than recomputing the round:
+    /// the policy's target length is a geometry fact both backends have to agree on, and the second
+    /// copy is where they would stop agreeing (sc-19425).
     pub fn delivered_audio_samples(&self) -> usize {
-        (self.duration_seconds() * f64::from(AUDIO_SAMPLE_RATE)).round() as usize
+        crate::denoise::delivered_audio_samples(self.joint.num_frames) as usize
     }
 }
 
@@ -435,10 +439,33 @@ pub fn frames_to_images(video: &Array) -> Result<Vec<Image>> {
 ///    [`crate::denoise::JointGeometry::validate`] exists to prevent, and it changes the creative
 ///    payload rather than an inaudible tail.
 ///
+/// # The pad join is faded, not butted (sc-19425)
+///
+/// The four points above are about the *duration* the correction moves, and none of them reach the
+/// artefact padding introduces in the *waveform*. Appending silence to a track whose final decoded
+/// sample is non-zero splices a full-amplitude step into the middle of the delivered signal — an
+/// edge that is then encoded into the AAC stream, 8.34 ms before the end of the clip, and heard as
+/// a click. Its audibility scales with that sample's amplitude, which is content-dependent and
+/// unbounded, so "the correction is only 8.34 ms" says nothing about it: a clip ending on a loud
+/// beat is exactly the case where the step is largest.
+///
+/// So the last [`PAD_JOIN_RAMP_SECONDS`] of content is faded to zero before the silence begins.
+/// That is 32 samples of a 165 000+ sample track — three orders of magnitude *under* the ±8.33 ms
+/// of tail the policy above already declares inaudible — and it removes the step for **any** final
+/// amplitude rather than for the amplitudes we happen to be able to measure.
+///
+/// The trim and exact paths are deliberately left alone. Padding is where this function *creates*
+/// a discontinuity that was not in the decoder's output; a trim just moves an ending that the
+/// decoded track already had, with nothing following it in the file. Fading there would modify
+/// content to fix a defect that is not present, including at the five counts where the fit is
+/// currently a no-op.
+///
 /// Enforced rather than documented: this function is the only path from decoded PCM to the delivered
 /// [`AudioTrack`], it computes the target from `num_frames` and `fps` alone, and it **errors** if the
 /// correction it would apply exceeds [`MAX_AV_DRIFT_SECONDS`] — a correction that large means the
-/// geometry is wrong, not that the mux policy has work to do.
+/// geometry is wrong, not that the mux policy has work to do. The fade is pinned by
+/// `the_pad_join_is_faded_rather_than_stepped`, which measures the largest single-sample jump in the
+/// delivered track and is red at 1.0 without it.
 pub fn fit_audio_to_video(track: AudioTrack, geometry: &RequestGeometry) -> Result<AudioTrack> {
     let channels = usize::from(track.channels);
     if channels == 0 {
@@ -467,19 +494,55 @@ pub fn fit_audio_to_video(track: AudioTrack, geometry: &RequestGeometry) -> Resu
     }
 
     let mut out = track;
-    match have.cmp(&want) {
-        std::cmp::Ordering::Greater => out.samples.truncate(want * channels),
-        std::cmp::Ordering::Less => out.samples.resize(want * channels, 0.0),
-        std::cmp::Ordering::Equal => {}
-    }
+    let rate = out.sample_rate;
+    fit_tail(&mut out.samples, channels, want, rate);
     for stem in &mut out.stems {
-        match stem.samples.len().cmp(&(want * channels)) {
-            std::cmp::Ordering::Greater => stem.samples.truncate(want * channels),
-            std::cmp::Ordering::Less => stem.samples.resize(want * channels, 0.0),
-            std::cmp::Ordering::Equal => {}
-        }
+        // Stems carry the parent's rate and channel count and are separately renderable, so the
+        // same join in a stem is the same click. One code path rather than two.
+        fit_tail(&mut stem.samples, channels, want, rate);
     }
     Ok(out)
+}
+
+/// How much content is faded to zero before appended silence — see [`fit_audio_to_video`].
+///
+/// 1 ms: long enough that the fade itself is not a step (its steepest single-sample increment is
+/// `π / 2(R − 1)` ≈ 0.05 of full scale at 32 kHz, ~26 dB down on the 1.0 edge it replaces) and short
+/// enough to be three orders of magnitude under the ±8.33 ms of tail the policy already moves.
+pub const PAD_JOIN_RAMP_SECONDS: f64 = 0.001;
+
+/// Fit one interleaved buffer to `want` frames per channel: truncate if long, fade-then-pad if
+/// short, leave alone if exact. See [`fit_audio_to_video`] for why only the pad direction fades.
+///
+/// Compares SAMPLE counts, not frame counts. Only the parent track is checked for being a whole
+/// number of channel-frames; a stem that is not would floor to the same frame count as a correctly
+/// sized one and skip a truncation this has always performed.
+fn fit_tail(samples: &mut Vec<f32>, channels: usize, want: usize, sample_rate: u32) {
+    let target = want * channels;
+    match samples.len().cmp(&target) {
+        std::cmp::Ordering::Greater => samples.truncate(target),
+        std::cmp::Ordering::Equal => {}
+        std::cmp::Ordering::Less => {
+            let have = samples.len() / channels;
+            let ramp =
+                ((f64::from(sample_rate) * PAD_JOIN_RAMP_SECONDS).round() as usize).min(have);
+            for k in 0..ramp {
+                // Raised cosine over the last `ramp` frames of content. Exactly 1.0 at k = 0 and
+                // exactly 0.0 at k = ramp - 1, so neither end of the fade is itself an edge: the
+                // content before it is untouched and the silence after it joins zero to zero.
+                let gain = if ramp == 1 {
+                    0.0
+                } else {
+                    0.5 * (1.0 + (std::f64::consts::PI * k as f64 / (ramp - 1) as f64).cos())
+                };
+                let frame = have - ramp + k;
+                for c in 0..channels {
+                    samples[frame * channels + c] *= gain as f32;
+                }
+            }
+            samples.resize(target, 0.0);
+        }
+    }
 }
 
 /// The two latent blocks a request starts from, drawn from one seed.
@@ -821,7 +884,7 @@ pub fn prepend_condition_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::denoise::LEGAL_FRAME_COUNTS;
+    use crate::denoise::{LEGAL_FRAME_COUNTS, MAX_DELIVERED_AV_RESIDUAL_SECONDS};
 
     /// **The stride is 32, not 16.** A 16-aligned canvas that is an odd number of latent columns has
     /// no patched representation, and the crate's `SIZE_MULTIPLE` advertises the same number.
@@ -1063,10 +1126,13 @@ mod tests {
             if decoded != want {
                 corrected += 1;
             }
-            // The delivered duration matches frames/fps to well inside one 25 ms audio token.
+            // The delivered duration matches frames/fps to under HALF A SAMPLE. Not "inside one
+            // 25 ms token" as this once asserted — a millisecond of slack is 32 samples, and a
+            // `floor`, a `ceil`, or a length taken off the decoder rather than off `num_frames`
+            // would all have passed it (sc-19425).
             let delivered = want as f64 / f64::from(AUDIO_SAMPLE_RATE);
             assert!(
-                (delivered - g.duration_seconds()).abs() < 0.001,
+                (delivered - g.duration_seconds()).abs() <= MAX_DELIVERED_AV_RESIDUAL_SECONDS,
                 "{frames} frames: {delivered} s of sound against {} s of picture",
                 g.duration_seconds()
             );
@@ -1074,6 +1140,118 @@ mod tests {
         assert_eq!(
             corrected, 9,
             "9 of the 14 legal durations need a correction; 141/192/243/294/345 are exact"
+        );
+
+        // Stems are delivered at the picture's length too — including one whose length is not a
+        // whole number of channel-frames, which only the track itself is validated for. Comparing
+        // FRAME counts rather than sample counts floors this to the target and skips the truncation
+        // (sc-19425); the odd sample is the whole point of the case.
+        let g = resolve_geometry(576, 320, 124).unwrap();
+        let want = g.delivered_audio_samples();
+        let fitted = fit_audio_to_video(
+            AudioTrack {
+                samples: vec![0.5; (g.joint.num_audio_latents * 800) as usize * 2],
+                sample_rate: AUDIO_SAMPLE_RATE,
+                channels: 2,
+                stems: vec![mlx_gen::media::AudioStem {
+                    name: "long".into(),
+                    samples: vec![0.5; want * 2 + 1],
+                }],
+            },
+            &g,
+        )
+        .unwrap();
+        assert_eq!(fitted.stems[0].samples.len(), want * 2);
+    }
+
+    /// **The pad join carries no step (sc-19425).** At the four counts where the decoder emits
+    /// fewer samples than the picture needs (158/209/260/311) the fit appends up to 8.34 ms of
+    /// digital silence directly after the final decoded sample. Butted, that is a full-amplitude
+    /// edge *inside* the AAC stream — a click whose loudness tracks the final sample's amplitude,
+    /// which the duration argument in [`fit_audio_to_video`]'s docs does not bound.
+    ///
+    /// Measured on a DC track, so every first difference in the delivered output is something the
+    /// fit did rather than something the content did. Three mutations, each verified red on its
+    /// own: **butting the join** (largest jump 1.0 against 0.05 faded); **widening the declared
+    /// [`PAD_JOIN_RAMP_SECONDS`] to 100 ms**; and **widening the implementation's ramp while
+    /// leaving the constant at 1 ms** — which only the untouched-content assertion catches, since
+    /// the test derives its own `ramp` from the same constant the other two move. The trim and
+    /// exact counts must come through untouched entirely.
+    #[test]
+    fn the_pad_join_is_faded_rather_than_stepped() {
+        let ramp = (f64::from(AUDIO_SAMPLE_RATE) * PAD_JOIN_RAMP_SECONDS).round() as usize;
+        assert_eq!(ramp, 32, "1 ms at 32 kHz");
+        let mut padded = 0;
+        let mut trimmed = 0;
+        for &frames in &LEGAL_FRAME_COUNTS {
+            let g = resolve_geometry(576, 320, frames).unwrap();
+            let decoded = (g.joint.num_audio_latents * 800) as usize;
+            let want = g.delivered_audio_samples();
+            let track = AudioTrack {
+                samples: vec![1.0; decoded * 2],
+                sample_rate: AUDIO_SAMPLE_RATE,
+                channels: 2,
+                stems: vec![mlx_gen::media::AudioStem {
+                    name: "probe".into(),
+                    samples: vec![1.0; decoded * 2],
+                }],
+            };
+            let fitted = fit_audio_to_video(track, &g).unwrap();
+
+            // The largest single-sample jump anywhere in the delivered track, per channel.
+            let biggest_step = |s: &[f32]| {
+                (0..2)
+                    .flat_map(|c| (1..want).map(move |i| (s[i * 2 + c] - s[(i - 1) * 2 + c]).abs()))
+                    .fold(0.0f32, f32::max)
+            };
+            let step = biggest_step(&fitted.samples);
+
+            if decoded < want {
+                padded += 1;
+                assert!(
+                    step < 0.1,
+                    "{frames} frames: the pad join steps by {step} of full scale — butted, not \
+                     faded"
+                );
+                // ...and the fade lands on exactly zero, so the silence joins zero to zero.
+                assert_eq!(fitted.samples[(decoded - 1) * 2], 0.0, "{frames} frames");
+                assert_eq!(
+                    fitted.samples[(decoded - 1) * 2 + 1],
+                    0.0,
+                    "{frames} frames"
+                );
+                // ...and it is 1 ms, not a fade-out of the clip: the sample before the ramp is
+                // untouched content. This is what a longer ramp would fail.
+                assert_eq!(
+                    fitted.samples[(decoded - ramp - 1) * 2],
+                    1.0,
+                    "{frames} frames: the fade reaches further back than {ramp} samples"
+                );
+                // The stem carries the same join and gets the same treatment.
+                assert_eq!(
+                    biggest_step(&fitted.stems[0].samples),
+                    step,
+                    "{frames} frames"
+                );
+            } else {
+                if decoded > want {
+                    trimmed += 1;
+                }
+                // Nothing was spliced, so nothing is faded — the tail is the decoder's own.
+                assert_eq!(
+                    step, 0.0,
+                    "{frames} frames: a fit that only trims must not fade"
+                );
+                assert_eq!(fitted.samples[(want - 1) * 2], 1.0, "{frames} frames");
+            }
+        }
+        assert_eq!(
+            padded, 4,
+            "158/209/260/311 are the four counts the fit pads"
+        );
+        assert_eq!(
+            trimmed, 5,
+            "and five where it trims; the other five are exact"
         );
     }
 
