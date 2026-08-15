@@ -75,6 +75,22 @@
 //! `8/8 = 1.0` instead of `8/128 = 0.0625` — the same 16× class as the alpha trap below, and just as
 //! silent. PEFT writes `r` equal to the factor rank, so rejecting a disagreement rejects nothing
 //! legitimate; no published turbo file carries a blob at all.
+//!
+//! ## The precedence chain, in one place
+//!
+//! Alpha reaches a target through exactly one ordering, [`resolve_target_alpha`]:
+//!
+//! ```text
+//! per-target `.alpha` tensor  →  PEFT `lora_adapter_metadata`  →  __metadata__["alpha"]  →  DEFAULT_LORA_ALPHA
+//! ```
+//!
+//! **[`convert_comfyui_key_space`] resolves the same chain**, before it splits a fused `qkv_proj`,
+//! and emits the split-adjusted result as an explicit per-target `.alpha`. That is not a tidiness
+//! point: the conversion's block-diagonal `÷3` is what holds `alpha/rank` fixed across the un-fuse,
+//! and a conversion that could only see the in-band `.alpha` tensor let the other three spellings
+//! route around it — installing `Ok` and folding attention 3× too strong against the same file's
+//! FFN. Since **no published file for this family carries an in-band `.alpha` at all**, that was the
+//! dominant path, not an edge case.
 
 use std::collections::BTreeMap;
 
@@ -288,6 +304,26 @@ pub fn alpha_rank_fold(alpha: f32, rank: f32) -> f32 {
     (alpha as f64 / rank as f64) as f32
 }
 
+/// **The one alpha precedence chain**, used by both the install and the ComfyUI conversion:
+///
+/// ```text
+/// per-target `.alpha` tensor  →  PEFT `lora_adapter_metadata`  →  __metadata__["alpha"]  →  DEFAULT_LORA_ALPHA
+/// ```
+///
+/// Factored out because the *conversion* has to resolve it too, and resolving only part of it there
+/// is the sc-19443 review's measured silent-corruption bug: `convert_comfyui_key_space` used to see
+/// nothing but the in-band `.alpha` tensor, so a ComfyUI file whose alpha lived in the PEFT blob or
+/// in `__metadata__` (the **dominant** spelling for this family — every published lightx2v file
+/// stamps it there and ships no `.alpha` tensor at all) emitted no per-target alpha, and the
+/// block-diagonal `÷3` that holds `alpha/rank` fixed across the qkv un-fuse never ran. The file then
+/// installed `Ok`, with no error, folding attention **3× too strong** against its own FFN.
+///
+/// `file_alpha` is the caller's already-resolved [`resolve_alpha`] result, so a malformed
+/// `__metadata__["alpha"]` is still an error rather than a fall-through to the default.
+pub fn resolve_target_alpha(in_band: Option<f32>, blob_alpha: Option<f32>, file_alpha: f32) -> f32 {
+    in_band.or(blob_alpha).unwrap_or(file_alpha)
+}
+
 // ─── sc-19443: the ComfyUI key space ───────────────────────────────────────────────────────────
 
 /// The ComfyUI container prefix for the 50-block stack. Its diffusers spelling is
@@ -309,10 +345,34 @@ fn normalize_comfy_container(path: &str) -> String {
     }
 }
 
+/// The four ComfyUI module names a MiniMax-H3 LoRA can name.
+///
+/// An **enum, not a `&str`**: `split_comfy_leaf` can only ever return one of these four, so a
+/// `match` on the string form needed a catch-all arm that no input could reach — an unreachable arm
+/// reads like a runtime guard while guarding nothing. With the enum the match is exhaustive by the
+/// type system, and a fifth ComfyUI module cannot be added without the compiler naming every site
+/// that must handle it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ComfyLeaf {
+    /// `attn.qkv_proj` — the fused q/k/v projection, split into three diffusers targets.
+    Qkv,
+    /// `attn.out_proj` → `attn.to_out.0`, a pure rename.
+    OutProj,
+    /// `mlp.fc1` → `ff.net.0.proj`, renamed **and** SwiGLU-half-swapped.
+    Fc1,
+    /// `mlp.fc2` → `ff.net.2`, a pure rename.
+    Fc2,
+}
+
 /// Split `path` into `(container, comfy_leaf)` on the last ComfyUI module name it carries.
-fn split_comfy_leaf(path: &str) -> Option<(&str, &str)> {
-    for leaf in ["attn.qkv_proj", "attn.out_proj", "mlp.fc1", "mlp.fc2"] {
-        if let Some(head) = path.strip_suffix(leaf) {
+fn split_comfy_leaf(path: &str) -> Option<(&str, ComfyLeaf)> {
+    for (name, leaf) in [
+        ("attn.qkv_proj", ComfyLeaf::Qkv),
+        ("attn.out_proj", ComfyLeaf::OutProj),
+        ("mlp.fc1", ComfyLeaf::Fc1),
+        ("mlp.fc2", ComfyLeaf::Fc2),
+    ] {
+        if let Some(head) = path.strip_suffix(name) {
             return Some((head.trim_end_matches('.'), leaf));
         }
     }
@@ -377,11 +437,23 @@ fn is_block_diagonal(up: &Array, out: i32, r: i32) -> Result<bool> {
 ///    told apart by measuring the bytes (`is_block_diagonal`) rather than assumed:
 ///    * **Block-diagonal** (`A [3r, in]`, `B [3·out, 3r]`, the lightx2v twins' form): split both,
 ///      giving factors byte-identical to the diffusers twin's, per-projection rank `r`, and an alpha
-///      divided by 3. The published `.alpha = 24` becomes `8`, which against rank 128 is the same
-///      `0.0625` the twin folds at — `24/384 == 8/128`.
+///      divided by 3. The published `24` becomes `8`, which against rank 128 is the same `0.0625`
+///      the twin folds at — `24/384 == 8/128`.
 ///    * **Shared-`A`** (`A [r, in]`, `B [3·out, r]`, what a LoRA trained natively on the fused
 ///      module looks like): split `B`'s rows only and reuse `A`, rank `r`, alpha unchanged. Also
 ///      exact.
+///
+///      **The alpha that gets divided is the fully resolved one.** It comes from
+///      [`resolve_target_alpha`], read off `w`'s own header: the in-band `.alpha` tensor, else the
+///      PEFT `lora_adapter_metadata` blob, else the top-level `__metadata__["alpha"]`, else
+///      [`DEFAULT_LORA_ALPHA`] — and a per-target `.alpha` is emitted on **every** converted qkv
+///      target, unconditionally. Resolving only the in-band spelling here (sc-19443's first cut)
+///      left the other three routing around the `÷3` entirely: the file installed `Ok` and folded
+///      attention 3× too strong, measured at rel-max-abs `2.007e0` against its own diffusers twin.
+///      On this lane **two** routes bypassed it — the PEFT blob and `__metadata__` — because
+///      `apply_one_lora` honors both. That is not an edge case for this family: **no published
+///      lightx2v file carries an in-band `.alpha` at all**, and none ships a `rank` key either, so
+///      the rank cross-check could not catch it.
 /// 2. **`mlp.fc1` → `ff.net.0.proj` with the SwiGLU halves swapped** (`swap_row_halves`): the DiT
 ///    emits `[value | gate]` and ComfyUI `[gate | value]`, and a LoRA's `lora_B` is the output-side
 ///    factor, so the swap lands on its rows and `lora_A` is untouched.
@@ -390,11 +462,19 @@ fn is_block_diagonal(up: &Array, out: i32, r: i32) -> Result<bool> {
 /// The container prefix is normalized too (`blocks.{i}` → `transformer_blocks.{i}`).
 ///
 /// **The returned `Weights` carries no metadata**, because it is rebuilt key by key. The caller must
-/// keep reading the file-level alpha from the ORIGINAL file — [`apply_minimax_h3_adapters`] does.
+/// keep reading the file-level alpha from the ORIGINAL file — [`apply_minimax_h3_adapters`] does —
+/// and every converted qkv target carries its own explicit `.alpha`, which wins over that file-level
+/// value at the install and is the only thing keeping the split-adjusted number reachable.
 ///
 /// **What this does not do.** It does not claim any *other* key space. A kohya (`lora_unet_`) or BFL
 /// export still reaches the strict install and fails there, loudly.
 pub fn convert_comfyui_key_space(w: &Weights) -> Result<Weights> {
+    // The file-level alpha sources, resolved ONCE, off the ORIGINAL header — `w` is the file the
+    // user supplied, so the conversion needs no second parameter to reach them. `resolve_alpha`
+    // still errors on a malformed stamp, so a typo'd `__metadata__["alpha"]` fails here rather than
+    // folding at the default.
+    let file_alpha = resolve_alpha(w)?;
+    let blob = LoraAdapterMeta::from_metadata(w.metadata(LORA_ADAPTER_METADATA_KEY));
     let mut converted = Weights::empty();
     let suffix = |role: Role| match role {
         Role::Down => ".lora_A.weight",
@@ -417,7 +497,7 @@ pub fn convert_comfyui_key_space(w: &Weights) -> Result<Weights> {
             continue;
         };
         match leaf {
-            "attn.qkv_proj" => {
+            ComfyLeaf::Qkv => {
                 let slot = fused.entry(container.to_string()).or_default();
                 match role {
                     Role::Down => slot.down = Some(t),
@@ -425,10 +505,10 @@ pub fn convert_comfyui_key_space(w: &Weights) -> Result<Weights> {
                     Role::Alpha => slot.alpha = Some(read_alpha_tensor(&path, &t)?),
                 }
             }
-            "attn.out_proj" => {
+            ComfyLeaf::OutProj => {
                 converted.insert(format!("{container}.attn.to_out.0{}", suffix(role)), t);
             }
-            "mlp.fc1" => {
+            ComfyLeaf::Fc1 => {
                 let target = format!("{container}.ff.net.0.proj{}", suffix(role));
                 let v = match role {
                     Role::Up => swap_row_halves(&target, &t)?,
@@ -436,13 +516,8 @@ pub fn convert_comfyui_key_space(w: &Weights) -> Result<Weights> {
                 };
                 converted.insert(target, v);
             }
-            "mlp.fc2" => {
+            ComfyLeaf::Fc2 => {
                 converted.insert(format!("{container}.ff.net.2{}", suffix(role)), t);
-            }
-            other => {
-                return Err(Error::Msg(format!(
-                    "minimax_h3 adapter '{path}': unrecognized ComfyUI module '{other}'"
-                )));
             }
         }
     }
@@ -479,6 +554,15 @@ pub fn convert_comfyui_key_space(w: &Weights) -> Result<Weights> {
         let out_dim = rows / 3;
         let block_diagonal =
             r_fused > 0 && r_fused % 3 == 0 && is_block_diagonal(&up, out_dim, r_fused / 3)?;
+        // **Resolve the alpha BEFORE the split, through the whole chain.** The fused module is the
+        // one the file's alpha describes, so the value that must be divided is the one that would
+        // have folded onto `attn.qkv_proj` — whichever of the four spellings carried it. A PEFT
+        // `alpha_pattern` is keyed on the module the file names, which is the fused one.
+        let fused_path = format!("{container}.attn.qkv_proj");
+        let (blob_alpha, _) = blob
+            .as_ref()
+            .map_or((None, None), |c| c.effective(&fused_path));
+        let fused_alpha = resolve_target_alpha(parts.alpha, blob_alpha, file_alpha);
         for (i, name) in ["to_q", "to_k", "to_v"].iter().enumerate() {
             let i = i as i32;
             let stem = format!("{container}.attn.{name}");
@@ -497,15 +581,24 @@ pub fn convert_comfyui_key_space(w: &Weights) -> Result<Weights> {
             };
             converted.insert(format!("{stem}.lora_A.weight"), a);
             converted.insert(format!("{stem}.lora_B.weight"), b);
-            if let Some(alpha) = parts.alpha {
-                // **The alpha division is the block-diagonal case's, and only its.** Splitting a
-                // `[3r, in]` `A` divides the per-projection rank by three, so the alpha must divide
-                // by three to hold `alpha/rank` fixed: the published `24/384` becomes `8/128`, both
-                // `0.0625`. The shared-`A` form keeps rank `r`, so its alpha is unchanged —
-                // dividing there would fold three times too weak.
-                let scaled = if block_diagonal { alpha / 3.0 } else { alpha };
-                converted.insert(format!("{stem}.alpha"), Array::from_slice(&[scaled], &[1]));
-            }
+            // **The alpha division is the block-diagonal case's, and only its.** Splitting a
+            // `[3r, in]` `A` divides the per-projection rank by three, so the alpha must divide by
+            // three to hold `alpha/rank` fixed: the published `24/384` becomes `8/128`, both
+            // `0.0625`. The shared-`A` form keeps rank `r`, so its alpha is unchanged — dividing
+            // there would fold three times too weak.
+            //
+            // **Emitted unconditionally**, not `if let Some(parts.alpha)`. The conditional form was
+            // the sc-19443 review's blocker: with no in-band `.alpha` the target carried none, and
+            // `apply_one_lora` re-applied the *undivided* blob-or-`__metadata__` alpha at the
+            // *already split* rank — 3× too strong, `Ok`, no error. An explicit per-target alpha on
+            // every converted qkv target is what makes the conversion closed: the install's own
+            // precedence chain reads this value first and cannot reach a stale file-level one.
+            let scaled = if block_diagonal {
+                fused_alpha / 3.0
+            } else {
+                fused_alpha
+            };
+            converted.insert(format!("{stem}.alpha"), Array::from_slice(&[scaled], &[1]));
         }
     }
     Ok(converted)
@@ -605,8 +698,11 @@ fn apply_one_lora(
         }
         // Precedence: per-target `.alpha` tensor → the PEFT blob → the file's top-level
         // `__metadata__["alpha"]` → `DEFAULT_LORA_ALPHA`. Only the last two differ from the shared
-        // loader, and the last one is the correction: it never falls back to `rank`.
-        let alpha = parts.alpha.or(blob_alpha).unwrap_or(file_alpha);
+        // loader, and the last one is the correction: it never falls back to `rank`. A converted
+        // ComfyUI file always carries a per-target `.alpha` on its qkv targets, so the
+        // split-adjusted value wins here and neither of the two file-level routes can reach an
+        // undivided one — see [`convert_comfyui_key_space`].
+        let alpha = resolve_target_alpha(parts.alpha, blob_alpha, file_alpha);
         let segs: Vec<&str> = path.split('.').collect();
         match host.adaptable_mut(&segs) {
             Some(lin) => {
