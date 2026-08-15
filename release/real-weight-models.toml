@@ -1800,12 +1800,11 @@ unwired_reason = "sc-15528 landed the Bernini ladder mechanism; the real-weight 
 # claim the pin describes bytes no revision can. It lives in the `mlx-minimax-h3` job instead, the
 # way `MAGE_ORACLE_SEED_DIR` lives only in `mlx-media` — recorded here so a census reader finds it.
 #
-# NOT COVERED, and named here rather than left to be rediscovered: the two candle DiT header gates
-# (`declared_dit_tensor_names_match_the_published_checkpoint`,
-# `the_adaln_projections_are_the_documented_twenty_six_gigabytes`) read only headers but need the
-# 62 GB `transformer/` component to exist, and `real_weight_te_context_matches_the_official_conditioner`
-# needs the 62 GB `text_encoder/`. Adding either would multiply this row's disk cost by six. They stay
-# hand-driven on a box that already holds the full snapshot.
+# THE TWO HEAVY COMPONENTS ARE NOT IN THIS ROW, AND THAT IS STILL THE RIGHT SHAPE. Adding
+# `transformer/*` or `text_encoder/*` here would multiply the cost of the row EVERY H3 lane fetches
+# by six, for gates only some of them run. sc-19558 gives them their own keys instead —
+# `minimax-h3-dit` and `minimax-h3-text-encoder` below — the same per-key split `minimax-h3-mlx-*`
+# already uses over one repository, so a lane provisions exactly the components its selections read.
 [[models]]
 key = "minimax-h3"
 repository = "MiniMaxAI/MiniMax-H3"
@@ -1833,6 +1832,66 @@ expected_files = [
   "tokenizer/tokenizer.json",
   "tokenizer/tokenizer_config.json",
 ]
+
+# ── MiniMax-H3 DiT component (sc-19558) ──────────────────────────────────────────────────────────
+#
+# THE GAP THIS CLOSES. Two `#[ignore]`d candle gates read HEADERS ONLY and were nevertheless
+# unreachable in CI, because the component whose headers they read was in no row:
+# `declared_dit_tensor_names_match_the_published_checkpoint` and
+# `the_adaln_projections_are_the_documented_twenty_six_gigabytes` need `transformer/`. They were
+# recorded as "hand-driven on a box that already holds the full snapshot", which describes an
+# operator habit rather than a lane — and an operator habit is not coverage.
+#
+# WHY A SEPARATE KEY AND NOT A WIDER `minimax-h3`. `download_files` is per ROW, so widening the
+# shared row would put 132.6 GB on every box that fetches ANY H3 slice, including the macOS lane
+# whose selections read none of it. Keying per component is the `minimax-h3-mlx-*` shape already in
+# this file: one `ensure_model_snapshot.py --model <key>` per component a lane actually reads, into
+# the SAME snapshot directory, so a lane pays for what it selects and nothing more.
+#
+# ⚠️ MARGINAL COST ON THE BOX THAT RUNS THIS IS NOT 132.6 GB. `ensure_model_snapshot.py` is
+# incremental — it fetches what is missing and verifies the rest — and sc-18677 provisioned the FULL
+# upstream snapshot on the Windows CUDA box at
+# `E:\huggingface\hub\models--MiniMaxAI--MiniMax-H3\snapshots\939557dc…`. On a box that already has
+# the bytes this key VERIFIES rather than downloads. On a fresh box it does cost the full component,
+# which is the honest price of a gate that reads that component's headers.
+#
+# `expected_files` lists `config.json` + the safetensors index per component and nothing else, for
+# the reason the tier block below spells out: `verify_model_snapshot.py` parses any `*.index.json` in
+# `expected_files` and checks every shard the `weight_map` names, so the index covers a re-shard that
+# a hand-maintained list of fourteen shard names would silently stop covering.
+
+[[models]]
+key = "minimax-h3-dit"
+repository = "MiniMaxAI/MiniMax-H3"
+revision = "939557dc319dd91227e30195a763f272ba7f8765"
+license = "MiniMax H3 Community License Agreement"
+size_class = "very-large"
+profiles = ["media-cuda"]
+environment = ["MINIMAX_H3_SNAPSHOT"]
+# BOTH partitions, 66.281 GB each measured by `os.stat` over the pinned snapshot with symlinks
+# dereferenced. `transformer_ref/` is included because `declared_dit_tensor_names_match_the_published_checkpoint`
+# reads the declared name set against the published one and the two partitions are structurally
+# identical — a gate that only ever saw `transformer/` could not catch a divergence in the other.
+download_files = [
+  "transformer/*",
+  "transformer_ref/*",
+]
+expected_files = [
+  "transformer/config.json",
+  "transformer/diffusion_pytorch_model.safetensors.index.json",
+  "transformer_ref/config.json",
+  "transformer_ref/diffusion_pytorch_model.safetensors.index.json",
+]
+
+# NO `minimax-h3-text-encoder` KEY, and the reason is NOT the bytes — this is the correction of
+# record sc-19558 owed. `real_weight_te_context_matches_the_official_conditioner` was recorded above
+# as blocked because it "needs the 62 GB `text_encoder/`", and a key exactly like `minimax-h3-dit`
+# would supply those bytes in one line. It would not make the gate run: the test ALSO requires
+# `MINIMAX_H3_TE_REFERENCE`, an UNSET repository variable pointing at a ~220 KB context artifact an
+# operator produces by hand with `tools/dump_minimax_h3_te_real.py`, and it asserts rather than skips
+# when that is absent — so a key added today would fetch 62 GB per run and then red the lane. It is
+# blocked on the reference artifact and the repository variable, not on the allow-list. Add the key
+# in the same change that sets the variable.
 
 # ── MiniMax-H3 DiT tiers (sc-17150) ─────────────────────────────────────────────────────────────
 # `SceneWorks/minimax-h3-mlx` hosts ONLY the tiered DiT. The text encoder, both VAEs and the

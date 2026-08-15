@@ -2211,6 +2211,13 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                         "declared_audio_tensor_names_match_the_published_checkpoint",
                         "published_audio_configs_reproduce_the_declared_geometry",
                         "stored_kaiser_filters_match_the_derivation_on_real_weights",
+                        # Header-only and device-free, wired by sc-19558. These two were listed as
+                        # NOT COVERED for exactly one reason -- `transformer/` was in no manifest
+                        # row, so `ensure_model_snapshot.py` could not materialize what they read.
+                        # The `minimax-h3-dit` key supplies it without widening the 11.640 GB slice
+                        # every other H3 lane fetches.
+                        "declared_dit_tensor_names_match_the_published_checkpoint",
+                        "the_adaln_projections_are_the_documented_twenty_six_gigabytes",
                         # Decodes, landing on GPU 0 under `--features cuda`. Wired by sc-19414
                         # against a MEASURED 97887 MiB card rather than against `CUDA_COMPUTE_CAP`,
                         # which names an architecture and never a capacity. BOTH sides of that
