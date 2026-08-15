@@ -129,6 +129,17 @@ on:
         type: boolean
         required: false
         default: false
+      # sc-17156 — OFF by default and deliberately not a `profile` option, so it can never ride a
+      # bulk `all` sweep. The two reasons are in the step itself; the short version is that the box
+      # behind `[self-hosted, windows, cuda, real-weights]` is ONE machine (`MICHAEL-TRX50`) with two
+      # listeners, `default_device()` hardcodes `cuda:0`, and the probe's own idle-baseline guard
+      # turns a co-tenant into a red rather than a wrong number — so a multi-hour render must be
+      # dispatched alone rather than raced against whatever else the sweep put on the card.
+      minimax_h3_vram_probe:
+        description: Measure MiniMax-H3 candle vramGbByTier (minimax-h3 profile; needs the FULL snapshot and an idle card)
+        type: boolean
+        required: false
+        default: false
       publish_chroma_artifacts:
         description: Publish validated Chroma q4/q8 artifacts (chroma-auxiliary profile only)
         type: boolean
@@ -5516,3 +5527,107 @@ jobs:
           type "%log%"
           findstr /C:"test result: ok. 1 passed" "%log%" >nul || (echo ::error::%~1 did not run exactly one passing test - a rename would make this step vacuously green & exit /b 1)
           exit /b 0
+      # ---------------------------------------------------------------------------------------
+      # sc-17156 — THE MEASURED `vramGbByTier` DATUM.
+      #
+      # Everything above this line reads HEADERS. This runs a real render, and the story's
+      # acceptance criterion is a MEASURED number, so it is wired here rather than left to be
+      # produced by hand on someone's desk.
+      #
+      # WHY IT IS GATED ON ITS OWN INPUT AND NOT ON A `profile`:
+      #   1. The pool `[self-hosted, windows, cuda, real-weights]` is ONE physical box
+      #      (`MICHAEL-TRX50`, 2x RTX PRO 6000 Blackwell @ 95.6 GiB) exposed as TWO listeners,
+      #      `cuda-windows` and `cuda-windows-2`. `candle_gen::default_device()` hardcodes
+      #      `cuda:0`, so both listeners contend on the SAME card while GPU 1 idles. This render
+      #      sequentially stages a 66.7 GB conditioner and a 66.3 GB DiT; a co-tenant job would
+      #      contaminate the high-water. `VramProbe::assert_trustworthy(1.0)` makes that a RED
+      #      rather than a quiet lie, but a red costs the whole multi-hour render.
+      #   2. The shipped 1344x768 canvas at the 124-frame lattice floor and `DEFAULT_STEPS = 50` is
+      #      measured in HOURS. That has no business inside a weekly sweep.
+      #
+      # ⚠️ THIS INPUT GATE IS A NARROWING, NOT EXCLUSIVITY, and the difference is load-bearing.
+      # It guarantees the probe never rides a bulk `all` / `media` sweep — the likeliest in-workflow
+      # co-tenant — and nothing more. It does NOT hold the box:
+      #   * this workflow's `concurrency` group is keyed on `${{ inputs.profile }}`, so a dispatch of
+      #     a DIFFERENT profile is a different group and runs concurrently; and
+      #   * it does not scope `ci.yml` at all, whose `Candle CUDA compile check (Windows)` lands on
+      #     the same two listeners. On 2026-08-14 two such compile jobs (PRs #608 and #610) running
+      #     together CRASHED THE COMPILER on this box, which is the proof that "the card is big
+      #     enough" is not the same claim as "the box is free".
+      # So this lane must be dispatched when the box is known idle, and a run that reds on
+      # `assert_trustworthy` should be read as contention rather than as a model fact. Giving it real
+      # exclusivity means one concurrency group shared by EVERY CUDA-consuming job across `ci.yml`
+      # and this file, or a dedicated listener/label for the probe. Both serialize CUDA CI
+      # repo-wide, which is a throughput decision for the box owner and is deliberately NOT taken
+      # here as a side effect of landing a probe.
+      #
+      # THE WEEKLY CANNOT REACH THIS STEP. GitHub runs `schedule:` only from the DEFAULT branch, so
+      # while epic 17137 lives on `feature/sc-17137-minimax-h3` the entire job is dispatch-only.
+      # Stated here so nobody waits on a Monday run that cannot fire.
+      #
+      # THE COMPUTE CAP IS NOT A HAZARD FOR THIS NUMBER. `CUDA_COMPUTE_CAP: "80"` names Ampere on a
+      # Blackwell (sm_120) box, which is a known latent hazard for QUANTIZED matmuls returning
+      # zeros. This lane advertises `supported_quants: &[]` and the probe measures the DENSE bf16
+      # checkpoint, so it touches no quantized kernel. The probe's `DEGENERATE_STD_FLOOR` middle-
+      # frame check would fail an all-zeros render anyway. Retiring the cap mismatch itself is
+      # filed separately and is deliberately NOT done here.
+      - name: Require the FULL MiniMax-H3 snapshot before measuring
+        if: inputs.minimax_h3_vram_probe
+        shell: cmd
+        run: |
+          rem The pinned `minimax-h3` row in release/real-weight-models.toml carries a `download_files`
+          rem ALLOW-LIST -- vae/, audio_vae/, FL2VA/audio_vae/, tokenizer/ and the TE shard INDEX,
+          rem ~11.6 GB total -- and deliberately EXCLUDES `transformer/` and the fourteen text-encoder
+          rem shards, because listing them would multiply that row's disk cost roughly sixfold. The
+          rem materialize step above therefore CANNOT supply what a render needs. Fail here, naming the
+          rem missing component, rather than inside `MiniMaxH3::load` after a dispatch has been queued.
+          for %%C in (text_encoder transformer vae audio_vae) do (
+            if not exist "%MINIMAX_H3_SNAPSHOT%\%%C" (
+              echo ::error::%MINIMAX_H3_SNAPSHOT%\%%C is missing. The VRAM probe RENDERS, so it needs the FULL snapshot - not the ~11.6 GB allow-listed slice the pinned row fetches. Provision the full snapshot on this runner.
+              exit /b 1
+            )
+          )
+          rem The shard index alone satisfies the directory check above, so probe for real shard bytes.
+          if not exist "%MINIMAX_H3_SNAPSHOT%\text_encoder\*.safetensors" (
+            echo ::error::text_encoder/ holds no .safetensors shards - only the shard INDEX is in the pinned allow-list, and the probe needs the ~62 GB of shards themselves.
+            exit /b 1
+          )
+      - name: Measure candle vramGbByTier (bf16, shipped geometry)
+        if: inputs.minimax_h3_vram_probe
+        shell: cmd
+        env:
+          # The probe reads its own dir variable; `MINIMAX_H3_SNAPSHOT` above is the same path, but
+          # naming it explicitly keeps the probe runnable against a hand-staged root without editing
+          # the job. Real files, not HF blob symlinks -- candle's memmap cannot traverse Windows
+          # reparse points.
+          MINIMAX_H3_VRAM_DIR: ${{ vars.CANDLE_MINIMAX_H3_SNAPSHOT }}
+          # Belt-and-braces: the provider FORCES `OffloadPolicy::Sequential` regardless (pinned by
+          # `the_offload_policy_is_forced_sequential_even_when_resident_is_requested`). Set anyway so
+          # the invocation matches the Wan runbook line for line.
+          CANDLE_GEN_OFFLOAD: sequential
+        run: |
+          call "%VCVARS%"
+          rem Record the card state IMMEDIATELY before the render: the probe's 1 GB idle-baseline
+          rem assertion is what rejects a contaminated number, and this is the evidence for why.
+          nvidia-smi --query-gpu=index,name,memory.total,memory.used --format=csv
+          rem `name=` is the single-selection vocabulary
+          rem `test_minimax_h3_lanes_select_tests_that_exist_and_pin_their_run_count` binds against,
+          rem so this selection is checked to name a test that still EXISTS and is still `#[ignore]`d.
+          set "name=minimax_h3_vram_bf16"
+          set "log=%RUNNER_TEMP%\minimax-h3-vram-bf16.log"
+          cargo test --locked -p candle-gen-minimax-h3 --features cuda --release --test vram_probe %name% -- --ignored --exact --nocapture > "%log%" 2>&1 || (type "%log%" & exit /b 1)
+          type "%log%"
+          findstr /C:"test result: ok. 1 passed" "%log%" >nul || (echo ::error::minimax_h3_vram_bf16 did not run exactly one passing test - a rename would make this step vacuously green & exit /b 1)
+          rem The machine-parseable datum is the whole point of the run; a green step that produced
+          rem no `[[H3_VRAM]]` line has measured nothing anyone can transcribe into the manifest.
+          findstr /C:"[[H3_VRAM]]" "%log%" > "%RUNNER_TEMP%\minimax-h3-vram-bf16.json" || (echo ::error::the probe printed no [[H3_VRAM]] datum & exit /b 1)
+          type "%RUNNER_TEMP%\minimax-h3-vram-bf16.json"
+      - name: Keep the VRAM evidence
+        if: inputs.minimax_h3_vram_probe && !cancelled()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: minimax-h3-candle-vram-bf16
+          path: |
+            ${{ runner.temp }}/minimax-h3-vram-bf16.log
+            ${{ runner.temp }}/minimax-h3-vram-bf16.json
+          if-no-files-found: error
