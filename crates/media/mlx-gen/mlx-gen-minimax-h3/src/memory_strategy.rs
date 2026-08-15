@@ -587,22 +587,12 @@ pub fn registered_fixture(
                 frames: FIXTURE_FRAMES,
                 reference_count,
             };
-            let mut fixture = MemoryBehaviorFixture::new(context);
-            // `MemoryBehaviorFixture::new` derives the request from `context.geometry` for width,
-            // height, batch and reference count, but **not** for `frames`, which falls through to
-            // `GenerationRequest::default()` and lands at `None` (== a single frame). That is
-            // invisible to every provider whose legal geometry includes one frame; this family is
-            // the first whose lattice excludes it, so the defaulted request gets re-graded against
-            // the 124-frame geometry admitted just above and refused as off-lattice — a
-            // self-inconsistent fixture failing its own provider. Restate the frame count so the
-            // request and the geometry it is meant to represent agree.
-            //
-            // Any future provider whose legal frame counts exclude 1 must do the same until the
-            // shared builder propagates `frames` itself. Deliberately not fixed there: that builder
-            // is a main-owned contract read by every provider on the ladder and needs its own
-            // reviewed PR, coordinated with the epics that own memory admission.
-            fixture.request.frames = Some(FIXTURE_FRAMES);
-            Ok(fixture)
+            // `MemoryBehaviorFixture::new` carries `frames` across from `context.geometry` along
+            // with width, height, batch and reference count (sc-19591), so the request this family
+            // is graded against declares `FIXTURE_FRAMES` rather than the one-frame default that
+            // would be refused as off-lattice. Asserted by
+            // `the_fixture_request_declares_the_lattice_frame_count` below; no post-hoc override.
+            Ok(MemoryBehaviorFixture::new(context))
         })
         .collect()
 }
@@ -1718,5 +1708,34 @@ mod tests {
                 .expect("fixtures")
                 .is_empty()
         );
+    }
+
+    /// sc-19591. The conformance walk feeds `fixture.request` back through `configure_request`,
+    /// which re-grades it against the geometry the same fixture admitted. This family's lattice
+    /// excludes 1, so a request left at `GenerationRequest::default()`'s `None` is refused as
+    /// off-lattice — see the `LEGAL_FRAME_COUNTS` gate in `safety_check`. The frame count reaches
+    /// the request from `context.geometry` through `gen_core::MemoryBehaviorFixture::new`; this
+    /// asserts that propagation actually reaches this provider, with no post-hoc override here.
+    #[test]
+    fn the_fixture_request_declares_the_lattice_frame_count() {
+        // The premise: 1 is off this family's lattice, so the propagated value can never be
+        // confused with the one-frame default it replaces.
+        assert!(!LEGAL_FRAME_COUNTS.contains(&1));
+        assert_eq!(GenerationRequest::default().frames, None);
+
+        let spec = weightless_spec();
+        let contract = declared();
+        let fixtures = registered_fixture(&spec, &contract, MemoryStrategy::StagedResidency)
+            .expect("fixtures");
+        assert!(!fixtures.is_empty(), "every render route drives a fixture");
+        for fixture in &fixtures {
+            assert_eq!(
+                fixture.request.frames,
+                Some(fixture.context.geometry.frames),
+                "the request must restate the geometry it was admitted against"
+            );
+            assert_eq!(fixture.request.frames, Some(FIXTURE_FRAMES));
+            assert!(LEGAL_FRAME_COUNTS.contains(&(fixture.request.frames.expect("frames") as i32)));
+        }
     }
 }

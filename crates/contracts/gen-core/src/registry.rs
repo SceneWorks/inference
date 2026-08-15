@@ -167,25 +167,40 @@ pub struct MemoryBehaviorFixture {
 impl MemoryBehaviorFixture {
     /// Build a fixture whose request mirrors `context.geometry`.
     ///
-    /// **Known gap — `frames` is not propagated.** Width, height, batch and reference count are
-    /// carried across; `frames` is not, so it takes `GenerationRequest::default()` (`None`, i.e. a
-    /// single frame) regardless of `context.geometry.frames`. For providers whose legal geometry
-    /// includes one frame this is harmless, which is why it went unnoticed. A provider whose frame
-    /// lattice **excludes** 1 gets a self-inconsistent fixture: the conformance walk calls
-    /// `configure_request` with a 1-frame request against the multi-frame geometry the same fixture
-    /// admitted, and the provider correctly refuses it as off-lattice. Such a provider must set
-    /// `fixture.request.frames` itself after calling this — see
-    /// `mlx-gen-minimax-h3/src/memory_strategy.rs` (`17n+5` lattice, minimum 124 frames), the first
-    /// provider to hit it.
+    /// All five geometry axes are carried across: width, height, batch (as
+    /// [`count`](crate::GenerationRequest::count)), reference count (as that many
+    /// [`Conditioning::Reference`](crate::Conditioning::Reference) entries) and
+    /// [`frames`](crate::GenerationRequest::frames). The fixture is therefore self-consistent by
+    /// construction — a provider re-grading the request against the geometry it just admitted sees
+    /// the same numbers on both sides.
     ///
-    /// Propagating `frames` here is the better fix and is deliberately deferred to its own reviewed
-    /// PR rather than folded into an unrelated change: this builder is read by every provider on the
-    /// memory ladder.
+    /// **The `frames` mapping is `u32` → `Option<u32>` (sc-19591).**
+    /// [`MemoryGeometry::frames`](crate::MemoryGeometry) is a concrete frame count, while
+    /// [`GenerationRequest::frames`](crate::GenerationRequest::frames) is optional, where `None`
+    /// means *unstated* and delegates to the provider's own default clip length — every consumer
+    /// resolves it as `request.frames.unwrap_or(<that provider's default>)`, which is
+    /// `default_frames` in `MlxRequestScopeCore::configure_request` and
+    /// `CandleRequestScopeCore::configure_request`, and `1` in, for example,
+    /// `candle_gen_flux2::memory_strategy`. A shared builder cannot know that per-provider default,
+    /// so it *states* the geometry's count instead of delegating: `Some(frames)` re-reads as the
+    /// admitted geometry for every provider, whereas `None` would only do so for one whose default
+    /// happens to equal the geometry. A geometry of zero frames states no clip length at all and no
+    /// provider can render zero frames, so it maps back to the unstated `None` rather than to an
+    /// explicit zero-frame request.
+    ///
+    /// Providers whose frame lattice excludes 1 — `mlx-gen-minimax-h3` (`17n+5`, minimum 124
+    /// frames) is the first — need only declare the frame count on `context.geometry`; no post-hoc
+    /// override of `fixture.request.frames` is required. Guarded in `memory_strategy.rs`'s tests,
+    /// alongside `behavior_fixture_preserves_exact_reference_cardinality`, by
+    /// `behavior_fixture_propagates_a_multi_frame_geometry`,
+    /// `behavior_fixture_propagates_a_single_frame_geometry` and
+    /// `behavior_fixture_leaves_a_zero_frame_geometry_unstated`.
     pub fn new(context: crate::MemoryRunContext) -> Self {
         let mut request = crate::GenerationRequest {
             width: context.geometry.width,
             height: context.geometry.height,
             count: context.geometry.batch,
+            frames: (context.geometry.frames > 0).then_some(context.geometry.frames),
             use_pid: context.use_pid,
             ..Default::default()
         };
