@@ -388,6 +388,67 @@ mod tests {
     }
 
     #[test]
+    fn sc18457_deferred_provider_population_is_derived_from_typed_surfaces() {
+        use mlx_gen::gen_core::{LoadShape, MemoryStrategy, MemoryStrategySupport};
+        use std::collections::BTreeSet;
+
+        let registry = super::provider_registry().unwrap();
+        let surfaces = registry.memory_contract_surfaces().unwrap();
+        let expected: BTreeSet<_> = [
+            "bf16:resident:deferred",
+            "bf16:sequential:deferred",
+            "q4:resident:deferred",
+            "q4:sequential:deferred",
+            "q8:resident:deferred",
+            "q8:sequential:deferred",
+        ]
+        .into_iter()
+        .collect();
+
+        for provider in [
+            "anima_base",
+            "anima_aesthetic",
+            "anima_turbo",
+            "chroma1_hd",
+            "chroma1_base",
+            "chroma1_flash",
+            "kolors",
+            "z_image",
+        ] {
+            let deferred: BTreeSet<_> = surfaces
+                .iter()
+                .filter(|surface| {
+                    surface.contract.provider_id == provider
+                        && surface.selector.load_shape == LoadShape::DeferredMaterialization
+                        && surface
+                            .contract
+                            .capability(MemoryStrategy::BoundedTransformerResidency)
+                            .unwrap()
+                            .support
+                            == MemoryStrategySupport::Implemented
+                })
+                .map(|surface| surface.selector.id())
+                .collect();
+            assert_eq!(
+                deferred, expected,
+                "{provider} must derive every shipped resolved tier and both independent load policies"
+            );
+            assert!(surfaces
+                .iter()
+                .filter(|surface| {
+                    surface.contract.provider_id == provider
+                        && surface.selector.load_shape == LoadShape::EagerMaterialization
+                })
+                .all(|surface| surface
+                    .contract
+                    .capability(MemoryStrategy::BoundedTransformerResidency)
+                    .unwrap()
+                    .support
+                    == MemoryStrategySupport::Missing));
+        }
+    }
+
+    #[test]
     fn cfg_capability_matrix_matches_the_registered_mlx_render_paths() {
         let registry = super::provider_registry().unwrap();
         let descriptor = |id: &str| {

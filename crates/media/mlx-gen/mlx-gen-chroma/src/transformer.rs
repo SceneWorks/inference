@@ -777,8 +777,7 @@ impl ChromaTransformer {
         let stream = self.block_stream.as_ref().ok_or_else(|| {
             Error::Unsupported(
                 "chroma: bounded transformer residency needs a snapshot-backed block stream — load \
-                 with OffloadPolicy::Sequential + LoadShape::DeferredMaterialization on a clean \
-                 base route"
+                 with a staged request and LoadShape::DeferredMaterialization on a clean base route"
                     .to_owned(),
             )
         })?;

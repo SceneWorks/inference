@@ -221,6 +221,20 @@ pub struct MemoryContractFixtureRegistration {
     pub surface_specs: fn() -> Vec<MemoryContractSurfaceSpec>,
 }
 
+/// Optional selector-aware resolver for a [`MemoryContractFixtureRegistration`].
+///
+/// Most providers can construct a weights-free contract from the witness [`LoadSpec`] alone. A
+/// prepacked provider cannot: `LoadSpec::quantize` means "pack this dense source at load time", while
+/// [`MemoryContractSurfaceSelector::tier`] names the already-resolved artifact tier. Those are
+/// deliberately different production shapes. Registering this additive resolver lets such a
+/// provider consume the explicit selector tier without overloading `LoadSpec::quantize` or teaching
+/// a downstream capability consumer a provider-specific interpretation.
+#[derive(Clone, Copy)]
+pub struct MemoryContractSurfaceResolverRegistration {
+    pub provider_id: &'static str,
+    pub contract: fn(&MemoryContractSurfaceSpec) -> Result<MemoryProviderContract>,
+}
+
 /// Explicit, weights-free proof that a [`MemoryRegistration`] has no optimized contract surface.
 ///
 /// Resident-only providers still participate in the reconciliation gate: they must publish this
@@ -262,6 +276,8 @@ impl MemoryContractSurfaceTier {
 /// ad-hoc loader surface and are intentionally not allowed to stand in for the catalog contract.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MemoryContractSurfaceSelector {
+    /// Numeric tier of the already-resolved catalog artifact. This is an output fact, not a request
+    /// to quantize a dense [`LoadSpec`] at load time.
     pub tier: MemoryContractSurfaceTier,
     pub offload_policy: crate::OffloadPolicy,
     pub load_shape: crate::LoadShape,
@@ -374,12 +390,26 @@ pub struct MemoryContractSurfaceSpec {
     pub spec: LoadSpec,
 }
 
+impl MemoryContractSurfaceSpec {
+    /// Explicit resolved artifact tier supplied to selector-aware provider fixtures.
+    pub const fn resolved_artifact_tier(&self) -> MemoryContractSurfaceTier {
+        self.selector.tier
+    }
+}
+
 /// One fully constructed contract surface returned by [`ProviderRegistry::memory_contract_surfaces`].
 pub struct MemoryContractSurface {
     pub selector: MemoryContractSurfaceSelector,
     pub spec: LoadSpec,
     pub contract: MemoryProviderContract,
     pub composed: bool,
+}
+
+impl MemoryContractSurface {
+    /// Explicit resolved artifact tier emitted to downstream capability facts.
+    pub const fn resolved_artifact_tier(&self) -> MemoryContractSurfaceTier {
+        self.selector.tier
+    }
 }
 
 fn registry_memory_contract_surface_specs(
@@ -585,6 +615,7 @@ pub struct ProviderRegistryBuilder {
     encoder_contract_routes: Vec<EncoderContractRouteRegistration>,
     memory_strategy: Vec<MemoryRegistration>,
     memory_contract_fixture: Vec<MemoryContractFixtureRegistration>,
+    memory_contract_surface_resolver: Vec<MemoryContractSurfaceResolverRegistration>,
     resident_only_memory_contract: Vec<ResidentOnlyMemoryContractRegistration>,
     memory_behavior: Vec<MemoryBehaviorRegistration>,
     activation_memory: Vec<ActivationMemoryRegistration>,
@@ -641,6 +672,11 @@ impl ProviderRegistryBuilder {
         register_memory_contract_fixture,
         memory_contract_fixture,
         MemoryContractFixtureRegistration
+    );
+    builder_registration_method!(
+        register_memory_contract_surface_resolver,
+        memory_contract_surface_resolver,
+        MemoryContractSurfaceResolverRegistration
     );
     builder_registration_method!(
         register_resident_only_memory_contract,
@@ -886,6 +922,21 @@ impl ProviderRegistryBuilder {
                     )));
                 }
             }
+            let mut resolver_ids = std::collections::BTreeSet::new();
+            for registration in &self.memory_contract_surface_resolver {
+                if !resolver_ids.insert(registration.provider_id) {
+                    return Err(Error::Msg(format!(
+                        "duplicate memory-contract surface resolver provider id '{}'",
+                        registration.provider_id
+                    )));
+                }
+                if !ids.contains(registration.provider_id) {
+                    return Err(Error::Msg(format!(
+                        "memory-contract surface resolver '{}' has no matching contract-surface fixture",
+                        registration.provider_id
+                    )));
+                }
+            }
             let mut resident_only_ids = std::collections::BTreeSet::new();
             for registration in &self.resident_only_memory_contract {
                 if !resident_only_ids.insert(registration.provider_id) {
@@ -979,6 +1030,9 @@ impl ProviderRegistryBuilder {
             encoder_contract_routes: self.encoder_contract_routes.into_boxed_slice(),
             memory_strategy: self.memory_strategy.into_boxed_slice(),
             memory_contract_fixture: self.memory_contract_fixture.into_boxed_slice(),
+            memory_contract_surface_resolver: self
+                .memory_contract_surface_resolver
+                .into_boxed_slice(),
             resident_only_memory_contract: self.resident_only_memory_contract.into_boxed_slice(),
             memory_behavior: self.memory_behavior.into_boxed_slice(),
             activation_memory: self.activation_memory.into_boxed_slice(),
@@ -1004,6 +1058,7 @@ pub struct ProviderRegistry {
     encoder_contract_routes: Box<[EncoderContractRouteRegistration]>,
     memory_strategy: Box<[MemoryRegistration]>,
     memory_contract_fixture: Box<[MemoryContractFixtureRegistration]>,
+    memory_contract_surface_resolver: Box<[MemoryContractSurfaceResolverRegistration]>,
     resident_only_memory_contract: Box<[ResidentOnlyMemoryContractRegistration]>,
     memory_behavior: Box<[MemoryBehaviorRegistration]>,
     activation_memory: Box<[ActivationMemoryRegistration]>,
@@ -1140,6 +1195,12 @@ impl ProviderRegistry {
         self.memory_contract_fixture.iter()
     }
 
+    pub fn memory_contract_surface_resolver_registrations(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &MemoryContractSurfaceResolverRegistration> {
+        self.memory_contract_surface_resolver.iter()
+    }
+
     pub fn resident_only_memory_contract_registrations(
         &self,
     ) -> impl ExactSizeIterator<Item = &ResidentOnlyMemoryContractRegistration> {
@@ -1165,6 +1226,10 @@ impl ProviderRegistry {
                 .resident_only_memory_contract
                 .iter()
                 .find(|witness| witness.provider_id == registration.provider_id);
+            let surface_resolver = self
+                .memory_contract_surface_resolver
+                .iter()
+                .find(|resolver| resolver.provider_id == registration.provider_id);
             let (surface_specs, contract_factory, is_resident_only) = match (fixture, resident_only) {
                 (Some(fixture), None) => (fixture.surface_specs, fixture.contract, false),
                 (None, Some(witness)) => (witness.surface_specs, witness.contract, true),
@@ -1204,7 +1269,11 @@ impl ProviderRegistry {
                         surface.selector.id()
                     )));
                 }
-                let contract = contract_factory(&surface.spec).map_err(|error| {
+                let contract = match surface_resolver {
+                    Some(resolver) => (resolver.contract)(&surface),
+                    None => contract_factory(&surface.spec),
+                }
+                .map_err(|error| {
                     Error::Msg(format!(
                         "memory-contract witness '{}' failed surface '{}': {error}",
                         registration.provider_id,
@@ -2613,6 +2682,36 @@ mod tests {
             surface_specs: mlx_memory_contract_surface_specs,
         };
 
+    fn selector_aware_fixture_contract(
+        surface: &MemoryContractSurfaceSpec,
+    ) -> Result<MemoryProviderContract> {
+        let mut contract = weights_free_fixture_contract(&surface.spec)?;
+        contract.load_shape = surface.spec.load_shape;
+        if surface.selector.tier == MemoryContractSurfaceTier::Q4
+            && surface.selector.load_shape == crate::LoadShape::DeferredMaterialization
+        {
+            let capability = contract
+                .strategies
+                .iter_mut()
+                .find(|capability| {
+                    capability.strategy == MemoryStrategy::BoundedTransformerResidency
+                })
+                .unwrap();
+            capability.support = MemoryStrategySupport::Implemented;
+            capability.parameters.transformer_window_sizes = vec![1];
+            capability.parameters.transformer_window_components =
+                vec![crate::memory_strategy::TransformerComponent::Dit];
+            contract.lifecycle.transformer_window_materialization = true;
+        }
+        Ok(contract)
+    }
+
+    const DUMMY_SURFACE_RESOLVER: MemoryContractSurfaceResolverRegistration =
+        MemoryContractSurfaceResolverRegistration {
+            provider_id: "dummy_weights_free_route",
+            contract: selector_aware_fixture_contract,
+        };
+
     const DUMMY_RESIDENT_ONLY_WITNESS: ResidentOnlyMemoryContractRegistration =
         ResidentOnlyMemoryContractRegistration {
             provider_id: "dummy_weights_free_route",
@@ -2703,6 +2802,60 @@ mod tests {
         assert!(
             duplicate.contains("duplicate memory-contract fixture provider id"),
             "{duplicate}"
+        );
+
+        let orphan_resolver = ProviderRegistryBuilder::new()
+            .register_composed_memory_strategy(DUMMY_WEIGHTS_FREE_MEMORY_REGISTRATION)
+            .register_memory_contract_surface_resolver(DUMMY_SURFACE_RESOLVER)
+            .build()
+            .err()
+            .expect("a selector-aware resolver without a finite fixture must fail")
+            .to_string();
+        assert!(orphan_resolver.contains("has no matching contract-surface fixture"));
+
+        let duplicate_resolver = ProviderRegistryBuilder::new()
+            .register_composed_memory_strategy(DUMMY_WEIGHTS_FREE_MEMORY_REGISTRATION)
+            .register_memory_contract_fixture(DUMMY_WEIGHTS_FREE_CONTRACT_FIXTURE)
+            .register_memory_contract_surface_resolver(DUMMY_SURFACE_RESOLVER)
+            .register_memory_contract_surface_resolver(DUMMY_SURFACE_RESOLVER)
+            .build()
+            .err()
+            .expect("duplicate selector-aware resolvers must fail")
+            .to_string();
+        assert!(duplicate_resolver.contains("duplicate memory-contract surface resolver"));
+    }
+
+    #[test]
+    fn selector_aware_resolver_receives_the_explicit_resolved_artifact_tier() {
+        let registry = ProviderRegistryBuilder::new()
+            .register_composed_memory_strategy(DUMMY_WEIGHTS_FREE_MEMORY_REGISTRATION)
+            .register_memory_contract_fixture(DUMMY_WEIGHTS_FREE_CONTRACT_FIXTURE)
+            .register_memory_contract_surface_resolver(DUMMY_SURFACE_RESOLVER)
+            .build()
+            .unwrap();
+        let surfaces = registry.memory_contract_surfaces().unwrap();
+        let implemented: Vec<_> = surfaces
+            .iter()
+            .filter(|surface| {
+                surface
+                    .contract
+                    .capability(MemoryStrategy::BoundedTransformerResidency)
+                    .unwrap()
+                    .support
+                    == MemoryStrategySupport::Implemented
+            })
+            .map(|surface| surface.selector)
+            .collect();
+        assert_eq!(implemented.len(), 2);
+        assert!(implemented.iter().all(|selector| {
+            selector.tier == MemoryContractSurfaceTier::Q4
+                && selector.load_shape == crate::LoadShape::DeferredMaterialization
+        }));
+        assert_eq!(
+            registry
+                .memory_contract_surface_resolver_registrations()
+                .len(),
+            1
         );
     }
 

@@ -637,6 +637,7 @@ pub fn memory_strategy_contract(
     contract_with_asset_facts(
         provider_id,
         spec,
+        streamable(spec),
         components.text_encoder,
         components.dit,
         components.vae,
@@ -782,18 +783,84 @@ pub(crate) fn weights_free_memory_strategy_contract(
 ) -> CoreResult<MemoryProviderContract> {
     // No overlays either: sizing one means opening its checkpoint, and this path exists precisely to
     // produce the declaration without touching a weight file.
-    contract_with_asset_facts(provider_id, spec, 0, 0, 0, Vec::new())
+    contract_with_asset_facts(provider_id, spec, streamable(spec), 0, 0, 0, Vec::new())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResolvedSurfaceMaterialization {
+    unet_blocks_lazy: bool,
+    text_encoder_blocks_lazy: bool,
+    adapters_replayable: bool,
+}
+
+/// Source-derived load facts for each shipped resolved artifact tier. Keeping the U-Net and
+/// ChatGLM3 facts separate mirrors the two independent production marker probes: either component
+/// becoming dense must withdraw the all-or-nothing rung.
+fn resolved_surface_materialization(
+    tier: mlx_gen::gen_core::MemoryContractSurfaceTier,
+) -> ResolvedSurfaceMaterialization {
+    use mlx_gen::gen_core::MemoryContractSurfaceTier::{Bf16, Nvfp4, Q4, Q8};
+    match tier {
+        Bf16 => ResolvedSurfaceMaterialization {
+            unet_blocks_lazy: true,
+            text_encoder_blocks_lazy: true,
+            adapters_replayable: false,
+        },
+        Q4 | Q8 => ResolvedSurfaceMaterialization {
+            unet_blocks_lazy: true,
+            text_encoder_blocks_lazy: true,
+            adapters_replayable: true,
+        },
+        Nvfp4 => ResolvedSurfaceMaterialization {
+            unet_blocks_lazy: false,
+            text_encoder_blocks_lazy: false,
+            adapters_replayable: false,
+        },
+    }
+}
+
+fn weights_free_surface_streamable_with(
+    surface: &mlx_gen::gen_core::MemoryContractSurfaceSpec,
+    materialization: ResolvedSurfaceMaterialization,
+) -> bool {
+    let spec = &surface.spec;
+    matches!(spec.load_shape, LoadShape::DeferredMaterialization)
+        && matches!(spec.weights, WeightsSource::Dir(_))
+        && materialization.unet_blocks_lazy
+        && materialization.text_encoder_blocks_lazy
+        && (spec.adapters.is_empty() || materialization.adapters_replayable)
+}
+
+/// Selector-aware finite-surface resolver. The explicit selector tier names the resolved artifact;
+/// production continues to call [`memory_strategy_contract`] and probes both real component markers.
+#[doc(hidden)]
+pub fn weights_free_surface_contract(
+    provider_id: &str,
+    surface: &mlx_gen::gen_core::MemoryContractSurfaceSpec,
+) -> CoreResult<MemoryProviderContract> {
+    contract_with_asset_facts(
+        provider_id,
+        &surface.spec,
+        weights_free_surface_streamable_with(
+            surface,
+            resolved_surface_materialization(surface.resolved_artifact_tier()),
+        ),
+        0,
+        0,
+        0,
+        Vec::new(),
+    )
 }
 
 fn contract_with_asset_facts(
     provider_id: &str,
     spec: &LoadSpec,
+    streamable: bool,
     conditioning_bytes: u64,
     transformer_bytes: u64,
     decoder_bytes: u64,
     overlays: Vec<MemoryResidentComponent>,
 ) -> CoreResult<MemoryProviderContract> {
-    let streamable = streamable(spec);
     let decode_policies = spec.decode_geometry_policies_for_loaded_contract(
         mlx_gen::gen_core::MemoryBackend::Mlx,
         loaded_tier(spec),
@@ -1739,6 +1806,10 @@ mod tests {
             !load_leaves_blocks_lazy(&spec) || !text_encoder_leaves_blocks_lazy(&spec),
             "the gate registry::load uses must fire on this snapshot"
         );
+        assert!(
+            !streamable(&spec),
+            "one lazy component cannot stand in for the provider's two-scope contract"
+        );
 
         // The control: a fully packed snapshot re-packs nothing and must stay quiet, which is the
         // narrowing sc-15521 made and which this must not undo.
@@ -1749,6 +1820,7 @@ mod tests {
         .unwrap();
         assert!(load_leaves_blocks_lazy(&spec));
         assert!(text_encoder_leaves_blocks_lazy(&spec));
+        assert!(streamable(&spec));
     }
 
     /// The `TextEncoder` scope's stack is 28 blocks deep, so the window domain the shared request
@@ -1781,6 +1853,21 @@ mod tests {
         weights_free_memory_strategy_contract(crate::MODEL_ID, &spec(shape)).unwrap()
     }
 
+    fn surface(
+        tier: mlx_gen::gen_core::MemoryContractSurfaceTier,
+        policy: OffloadPolicy,
+        shape: LoadShape,
+    ) -> mlx_gen::gen_core::MemoryContractSurfaceSpec {
+        mlx_gen::gen_core::mlx_memory_contract_surface_specs()
+            .into_iter()
+            .find(|surface| {
+                surface.selector.tier == tier
+                    && surface.selector.offload_policy == policy
+                    && surface.selector.load_shape == shape
+            })
+            .unwrap()
+    }
+
     #[test]
     fn a_deferred_load_publishes_the_full_ladder_and_conforms() {
         let contract = contract(LoadShape::DeferredMaterialization);
@@ -1798,6 +1885,105 @@ mod tests {
                 contract.capability(strategy).unwrap().support,
                 MemoryStrategySupport::Implemented,
                 "{strategy:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn weights_free_resolved_tiers_expose_both_deferred_load_policies() {
+        for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
+            for tier in [
+                mlx_gen::gen_core::MemoryContractSurfaceTier::Bf16,
+                mlx_gen::gen_core::MemoryContractSurfaceTier::Q4,
+                mlx_gen::gen_core::MemoryContractSurfaceTier::Q8,
+            ] {
+                let deferred = surface(tier, policy, LoadShape::DeferredMaterialization);
+                let contract = weights_free_surface_contract(crate::MODEL_ID, &deferred).unwrap();
+                assert_eq!(
+                    contract
+                        .capability(MemoryStrategy::BoundedTransformerResidency)
+                        .unwrap()
+                        .support,
+                    MemoryStrategySupport::Implemented,
+                    "{policy:?} {tier:?} is a resolved packed surface"
+                );
+
+                let eager = surface(tier, policy, LoadShape::EagerMaterialization);
+                assert_eq!(
+                    weights_free_surface_contract(crate::MODEL_ID, &eager)
+                        .unwrap()
+                        .capability(MemoryStrategy::BoundedTransformerResidency)
+                        .unwrap()
+                        .support,
+                    MemoryStrategySupport::Missing
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn weights_free_adapter_replayability_tracks_the_resolved_tier() {
+        let adapter = AdapterSpec {
+            path: "/nonexistent/lora.safetensors".into(),
+            scale: 1.0,
+            kind: mlx_gen::AdapterKind::Lora,
+            pass_scales: None,
+            moe_expert: None,
+        };
+        for (tier, expected) in [
+            (
+                mlx_gen::gen_core::MemoryContractSurfaceTier::Bf16,
+                MemoryStrategySupport::Missing,
+            ),
+            (
+                mlx_gen::gen_core::MemoryContractSurfaceTier::Q4,
+                MemoryStrategySupport::Implemented,
+            ),
+            (
+                mlx_gen::gen_core::MemoryContractSurfaceTier::Q8,
+                MemoryStrategySupport::Implemented,
+            ),
+        ] {
+            let mut surface = surface(
+                tier,
+                OffloadPolicy::Resident,
+                LoadShape::DeferredMaterialization,
+            );
+            surface.spec.adapters = vec![adapter.clone()];
+            assert_eq!(
+                weights_free_surface_contract(crate::MODEL_ID, &surface)
+                    .unwrap()
+                    .capability(MemoryStrategy::BoundedTransformerResidency)
+                    .unwrap()
+                    .support,
+                expected,
+                "{tier:?} adapter replayability"
+            );
+        }
+    }
+
+    #[test]
+    fn either_non_lazy_component_withdraws_the_weights_free_rung() {
+        let surface = surface(
+            mlx_gen::gen_core::MemoryContractSurfaceTier::Q4,
+            OffloadPolicy::Resident,
+            LoadShape::DeferredMaterialization,
+        );
+        let exact = resolved_surface_materialization(surface.selector.tier);
+        assert!(weights_free_surface_streamable_with(&surface, exact));
+        for changed in [
+            ResolvedSurfaceMaterialization {
+                unet_blocks_lazy: false,
+                ..exact
+            },
+            ResolvedSurfaceMaterialization {
+                text_encoder_blocks_lazy: false,
+                ..exact
+            },
+        ] {
+            assert!(
+                !weights_free_surface_streamable_with(&surface, changed),
+                "both independently probed component stacks must remain lazy"
             );
         }
     }
