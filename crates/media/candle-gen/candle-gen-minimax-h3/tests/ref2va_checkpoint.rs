@@ -339,11 +339,31 @@ fn every_dit_load_site_in_the_crate_is_driven_by_the_task() {
          arm and the ref2va arm), which are mutually exclusive branches: {sites:?}",
         sites.len()
     );
+    // `src/model.rs` specifically — and NOT `src/dit/model.rs`, which is where `MiniMaxH3Dit::load`
+    // is *defined*. `path.ends_with("model.rs")` was a string-suffix test that both files satisfy,
+    // so a load site that migrated into the DiT module — the one other file where it is most
+    // plausible — read as "in model.rs" and passed. `Path::ends_with` matches whole components, so
+    // `src/model.rs` rejects `src/dit/model.rs`; the assertion below proves that discrimination is
+    // live rather than assumed.
+    let render_path = Path::new("src").join("model.rs");
+    assert!(
+        sources
+            .iter()
+            .any(|(p, _)| Path::new(p).ends_with(Path::new("src").join("dit").join("model.rs"))),
+        "the crate no longer has a `src/dit/model.rs`; it is the file this check discriminates \
+         `src/model.rs` FROM, so without it the component match below is untested"
+    );
+    assert!(
+        !Path::new("/x/src/dit/model.rs").ends_with(&render_path),
+        "`Path::ends_with` stopped matching whole components; the load-site check is a suffix trap \
+         again"
+    );
     for (path, span) in &sites {
         assert!(
-            path.ends_with("model.rs"),
-            "a DiT load site appeared in {path}; the render path's two sites are both in model.rs, \
-             and a third one elsewhere is how a ref2va render reads the wrong 66 GB"
+            Path::new(path).ends_with(&render_path),
+            "a DiT load site appeared in {path}; the render path's two sites are both in \
+             src/model.rs, and a third one elsewhere — `src/dit/model.rs` included — is how a \
+             ref2va render reads the wrong 66 GB"
         );
         assert!(
             span.contains("task.partition()"),
@@ -361,23 +381,28 @@ fn every_dit_load_site_in_the_crate_is_driven_by_the_task() {
          from the one the request resolved to"
     );
 
-    // ...and neither partition literal appears anywhere outside its own `const` declaration.
+    // ...and neither partition literal appears anywhere outside its own `pub const` declaration.
     for literal in ["\"transformer\"", "\"transformer_ref\""] {
         let uses: Vec<String> = sources
             .iter()
             .flat_map(|(path, src)| {
                 src.lines()
-                    // A `const` DECLARATION of the literal is the one place it may appear. The
-                    // filter read `!l.contains("pub const")`, which missed `memory_strategy.rs`'s
-                    // private `const DIT_COMPONENT: &str = "transformer";` — invisible while this
-                    // scan read only `model.rs`, and a guaranteed red the moment it was broadened
-                    // to the whole crate. Visibility is not what makes a line a declaration.
+                    // The `pub const` DECLARATION in `model.rs` is the ONE place either literal may
+                    // appear; every other reader names `BASE_DIT_PARTITION` or
+                    // `REFERENCE_DIT_PARTITION`.
+                    //
+                    // This exemption is deliberately narrow, and it has to STAY narrow. Broadening
+                    // the scan from `model.rs` to the whole crate made `memory_strategy.rs`'s
+                    // private `const DIT_COMPONENT: &str = "transformer";` red, and the exemption
+                    // was relaxed from `pub const` to ANY `const` so that line could stay green.
+                    // That red was a TRUE POSITIVE: a second, private restatement of the base
+                    // partition, which sized `transformer/` for a `ref2va` render that never opens
+                    // it. Widening a guard to admit the defect it exists to catch turns the guard
+                    // into decoration. `memory_strategy.rs` imports the two `pub const`s now, so
+                    // this filter is green on a FIXED crate rather than on a relaxed rule.
                     .filter(move |l| {
                         let decl = l.trim_start();
-                        l.contains(literal)
-                            && !decl.starts_with("const ")
-                            && !decl.starts_with("pub const ")
-                            && !decl.starts_with("pub(crate) const ")
+                        l.contains(literal) && !decl.starts_with("pub const ")
                     })
                     .map(move |l| format!("{path}: {}", l.trim()))
             })

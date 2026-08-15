@@ -46,6 +46,7 @@ use candle_gen::gen_core::{
     MemoryStrategySupport, MemoryWindowMaterialization, ResidentRequestMemory, WeightsSource,
 };
 
+use crate::model::{BASE_DIT_PARTITION, REFERENCE_DIT_PARTITION};
 use crate::MODEL_ID;
 
 // --- measured asset facts -------------------------------------------------------------------
@@ -79,8 +80,25 @@ pub const ADALN_EVICTED_BYTES: u64 = 26_020_915_200;
 /// [`LoadShape::EagerMaterialization`] whatever a caller asks for. sc-18662 changes it.
 pub const LOAD_SHAPE: LoadShape = LoadShape::EagerMaterialization;
 
-/// The DiT component directory a flat snapshot carries.
-const DIT_COMPONENT: &str = "transformer";
+/// The DiT partition directories a flat snapshot may carry, in the order a tie is broken.
+///
+/// **Both, not just the base one.** This read `const DIT_COMPONENT: &str = "transformer"` and sized
+/// `root.join("transformer")` unconditionally, so a `ref2va` render — which denoises from
+/// [`REFERENCE_DIT_PARTITION`] and never opens `transformer/` — was charged for a directory it does
+/// not read, and a snapshot carrying only the reference partition was charged **zero** for its DiT.
+/// A contract that under-reports 66 GB admits a render that then OOMs, which is the failure the
+/// ladder exists to prevent.
+///
+/// The contract is built once per *load*, from a [`LoadSpec`] alone, and the task is a property of
+/// each later *request* — so there is no single partition that is "the" DiT here. `resolve` takes
+/// the **larger** of the two present: a render loads exactly one of them, so charging the larger is
+/// both a true bound for whichever task arrives and still "charged once", which is what
+/// [`DIT_BF16_BYTES`] means. An absent partition measures 0 and simply loses the max, so the
+/// base-only install of sc-19517 is charged exactly as it was.
+///
+/// Named through `crate::model`'s own `pub const`s rather than restating the literals, so
+/// `tests/ref2va_checkpoint.rs`'s bare-literal ban has exactly one declaration site to exempt.
+const DIT_PARTITIONS: [&str; 2] = [BASE_DIT_PARTITION, REFERENCE_DIT_PARTITION];
 
 struct ComponentBytes {
     text_encoder: u64,
@@ -95,13 +113,22 @@ impl ComponentBytes {
             WeightsSource::Dir(root) => root.clone(),
             WeightsSource::File(path) => path.parent().unwrap_or(path).to_path_buf(),
         };
-        let dit = match spec.components.get(DIT_COMPONENT) {
-            Some(WeightsSource::Dir(staged)) => staged.clone(),
-            _ => root.join(DIT_COMPONENT),
-        };
+        // The larger of the two DiT partitions this snapshot carries — see [`DIT_PARTITIONS`]. A
+        // staged override is honored per partition, exactly as the single-partition form did.
+        let dit = DIT_PARTITIONS
+            .iter()
+            .map(|partition| {
+                let dir = match spec.components.get(*partition) {
+                    Some(WeightsSource::Dir(staged)) => staged.clone(),
+                    _ => root.join(partition),
+                };
+                safetensors_path_bytes(dir)
+            })
+            .max()
+            .unwrap_or(0);
         Self {
             text_encoder: safetensors_path_bytes(root.join("text_encoder")),
-            dit: safetensors_path_bytes(dit),
+            dit,
             video_vae: safetensors_path_bytes(root.join("vae")),
             audio_vae: safetensors_path_bytes(root.join("audio_vae")),
         }

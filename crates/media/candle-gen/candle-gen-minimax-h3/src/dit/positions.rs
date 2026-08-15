@@ -322,14 +322,6 @@ pub type ReferenceBlockRows = (Vec<[f64; 3]>, Vec<[f64; 3]>, f64);
 ///   [`temporal_grid`] from the same origin, advancing by
 ///   `max(num_audio_latents, video_span)` so a clip and its sound stay rotary-aligned.
 ///
-/// # The summation order is sequential here, and pairwise in [`keyframe_anchor_time`]
-///
-/// `video_span` is summed **sequentially** in f64. The reference implementation sums the same series
-/// with numpy's *pairwise* summation at the `fl2va` last-frame anchor and sequentially on this
-/// path, keeping both — the two differ in the last ulp of f64 from 16 latent frames onwards. This
-/// crate keeps the distinction at the same two call sites even though
-/// `keyframe_anchor_summation_order_is_invisible_after_the_f32_narrow` shows it cannot survive the
-/// f32 narrow, so that the port matches structurally and not only numerically.
 pub fn reference_block_position_ids(
     geometry: &ReferenceLatentGeometry,
     origin: f64,
@@ -385,7 +377,9 @@ pub fn reference_block_position_ids(
                     for &t in &times {
                         video_rows.extend(grid.iter().map(|&[h, w]| [t, h, w]));
                     }
-                    // Sequential f64 sum — see the doc comment.
+                    // The same series [`keyframe_anchor_time`] sums, summed the same plain
+                    // sequential way — see that function's note on why the reference's
+                    // pairwise/sequential split is not replicated anywhere in this crate.
                     let span: f64 = (0..geometry.num_latent_frames)
                         .map(|i| {
                             ROPE_FRAME_RESCALE
