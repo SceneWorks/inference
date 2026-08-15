@@ -219,6 +219,67 @@ pub(crate) fn weights_free_memory_strategy_contract(
     )
 }
 
+fn surface_selector_matches_spec(
+    surface: &mlx_gen::gen_core::MemoryContractSurfaceSpec,
+) -> CoreResult<()> {
+    let tier_matches = match surface.resolved_artifact_tier() {
+        mlx_gen::gen_core::MemoryContractSurfaceTier::Bf16 => {
+            surface.spec.precision == Precision::Bf16 && surface.spec.quantize.is_none()
+        }
+        mlx_gen::gen_core::MemoryContractSurfaceTier::Q4 => {
+            surface.spec.quantize == Some(mlx_gen::Quant::Q4)
+        }
+        mlx_gen::gen_core::MemoryContractSurfaceTier::Q8 => {
+            surface.spec.quantize == Some(mlx_gen::Quant::Q8)
+        }
+        mlx_gen::gen_core::MemoryContractSurfaceTier::Nvfp4 => false,
+    };
+    if tier_matches
+        && matches!(surface.spec.weights, WeightsSource::Dir(_))
+        && surface.selector.offload_policy == surface.spec.offload_policy
+        && surface.selector.load_shape == surface.spec.load_shape
+    {
+        Ok(())
+    } else {
+        Err(CoreError::Msg(format!(
+            "Krea memory surface selector '{}' does not match its weights-free LoadSpec",
+            surface.selector.id()
+        )))
+    }
+}
+
+/// Resolve the finite catalog surface from its explicit already-packed artifact tier.
+///
+/// The generic Q4/Q8 witness carries `LoadSpec::quantize` only so its selector is self-checking. A
+/// real Krea turnkey has a matching packed marker and therefore reaches production with
+/// `load_time_quant_bits == None`; interpreting the synthetic witness as a dense source would falsely
+/// withdraw both packed tiers. This resolver publishes only the source-derived load eligibility and
+/// deliberately retains zero asset facts. Production contract construction remains responsible for
+/// proving the selected snapshot marker and tensor inventory.
+pub(crate) fn weights_free_memory_strategy_surface_contract(
+    provider_id: &str,
+    surface: &mlx_gen::gen_core::MemoryContractSurfaceSpec,
+) -> CoreResult<MemoryProviderContract> {
+    surface_selector_matches_spec(surface)?;
+    crate::model::validate_base_krea_load_axes(&surface.spec, provider_id)
+        .map_err(|error| CoreError::Msg(error.to_string()))?;
+    let streamable = matches!(
+        surface.resolved_artifact_tier(),
+        mlx_gen::gen_core::MemoryContractSurfaceTier::Bf16
+            | mlx_gen::gen_core::MemoryContractSurfaceTier::Q4
+            | mlx_gen::gen_core::MemoryContractSurfaceTier::Q8
+    ) && surface.spec.precision == Precision::Bf16
+        && matches!(surface.spec.offload_policy, OffloadPolicy::Sequential)
+        && matches!(surface.spec.load_shape, LoadShape::DeferredMaterialization)
+        && !crate::model::adapters_have_diff_patch_for_spec(&surface.spec)?;
+    memory_strategy_contract_with_components(
+        provider_id,
+        &surface.spec,
+        Default::default(),
+        streamable,
+    )
+}
+
 fn memory_strategy_contract_with_components(
     provider_id: &str,
     spec: &LoadSpec,
@@ -512,42 +573,50 @@ pub(crate) fn registered_valid_fixture(
         return Ok(Vec::new());
     }
     let quant = crate::model::effective_base_quant_tier(spec, &contract.provider_id)?;
-    let is_edit = contract.provider_id.contains("edit");
     let tier = MemoryNumericTier {
         precision: spec.precision,
         quant,
         component_precision_floors: &[],
     };
-    let route = |use_pid| mlx_gen::gen_core::MemoryBehaviorRoute {
-        mode: if is_edit {
-            mlx_gen::gen_core::MemoryMode::Edit
-        } else {
-            mlx_gen::gen_core::MemoryMode::TextToImage
-        },
-        reference_count: u32::from(is_edit),
-        use_pid,
-        has_phases: false,
-        overlay: None,
+    let routes = if contract.provider_id == crate::model::KREA_2_RAW_ID {
+        vec![
+            (mlx_gen::gen_core::MemoryMode::TextToImage, 0),
+            (mlx_gen::gen_core::MemoryMode::ImageToImage, 1),
+        ]
+    } else if contract.provider_id.contains("edit") {
+        vec![(mlx_gen::gen_core::MemoryMode::Edit, 1)]
+    } else {
+        vec![(mlx_gen::gen_core::MemoryMode::TextToImage, 0)]
     };
-    let mut fixtures = vec![mlx_gen::gen_core::MemoryBehaviorFixture::new(
-        mlx_gen::gen_core::standard_memory_behavior_context(
-            contract,
-            strategy,
-            tier,
-            route(false),
-        )?,
-    )];
-    if contract.pid_decode_routes.is_some()
-        && contract.engages(strategy, MemoryStrategy::BoundedDecode)
-    {
+    let mut fixtures = Vec::new();
+    for (mode, reference_count) in routes {
+        let route = |use_pid| mlx_gen::gen_core::MemoryBehaviorRoute {
+            mode: mode.clone(),
+            reference_count,
+            use_pid,
+            has_phases: false,
+            overlay: None,
+        };
         fixtures.push(mlx_gen::gen_core::MemoryBehaviorFixture::new(
             mlx_gen::gen_core::standard_memory_behavior_context(
                 contract,
                 strategy,
                 tier,
-                route(true),
+                route(false),
             )?,
         ));
+        if contract.pid_decode_routes.is_some()
+            && contract.engages(strategy, MemoryStrategy::BoundedDecode)
+        {
+            fixtures.push(mlx_gen::gen_core::MemoryBehaviorFixture::new(
+                mlx_gen::gen_core::standard_memory_behavior_context(
+                    contract,
+                    strategy,
+                    tier,
+                    route(true),
+                )?,
+            ));
+        }
     }
     Ok(fixtures)
 }
@@ -697,6 +766,110 @@ mod tests {
         bytes.extend_from_slice(header);
         bytes.extend_from_slice(&0.0_f32.to_le_bytes());
         std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn raw_selector_surfaces_publish_all_prepacked_tiers_and_fail_closed_on_mutation() {
+        let mut implemented = 0;
+        for surface in mlx_gen::gen_core::mlx_memory_contract_surface_specs() {
+            let contract = weights_free_memory_strategy_surface_contract(
+                crate::model::KREA_2_RAW_ID,
+                &surface,
+            )
+            .unwrap();
+            let expected = surface.selector.offload_policy == OffloadPolicy::Sequential
+                && surface.selector.load_shape == LoadShape::DeferredMaterialization;
+            assert_eq!(
+                contract
+                    .capability(MemoryStrategy::BoundedTransformerResidency)
+                    .unwrap()
+                    .support,
+                if expected {
+                    MemoryStrategySupport::Implemented
+                } else {
+                    MemoryStrategySupport::Missing
+                },
+                "{}",
+                surface.selector.id()
+            );
+            implemented += usize::from(expected);
+            assert_eq!(contract.provider_id, crate::model::KREA_2_RAW_ID);
+            assert_eq!(contract.asset_facts, Default::default());
+        }
+        assert_eq!(implemented, 3, "bf16, q4, and q8 must all be represented");
+
+        let q4 = mlx_gen::gen_core::mlx_memory_contract_surface_specs()
+            .into_iter()
+            .find(|surface| {
+                surface.resolved_artifact_tier() == mlx_gen::gen_core::MemoryContractSurfaceTier::Q4
+                    && surface.selector.offload_policy == OffloadPolicy::Sequential
+                    && surface.selector.load_shape == LoadShape::DeferredMaterialization
+            })
+            .expect("q4 sequential deferred surface");
+
+        let mut tier_mismatch = mlx_gen::gen_core::MemoryContractSurfaceSpec {
+            selector: q4.selector,
+            spec: q4.spec.clone(),
+        };
+        tier_mismatch.spec.quantize = Some(Quant::Q8);
+        assert!(weights_free_memory_strategy_surface_contract(
+            crate::model::KREA_2_RAW_ID,
+            &tier_mismatch,
+        )
+        .is_err());
+
+        let mut file_source = mlx_gen::gen_core::MemoryContractSurfaceSpec {
+            selector: q4.selector,
+            spec: q4.spec.clone(),
+        };
+        file_source.spec.weights = WeightsSource::File("/krea.safetensors".into());
+        assert!(weights_free_memory_strategy_surface_contract(
+            crate::model::KREA_2_RAW_ID,
+            &file_source,
+        )
+        .is_err());
+
+        let mut control = mlx_gen::gen_core::MemoryContractSurfaceSpec {
+            selector: q4.selector,
+            spec: q4.spec.clone(),
+        };
+        control.spec.control = Some(WeightsSource::File("/control.safetensors".into()));
+        assert!(weights_free_memory_strategy_surface_contract(
+            crate::model::KREA_2_RAW_ID,
+            &control,
+        )
+        .is_err());
+
+        let mut unknown_component = mlx_gen::gen_core::MemoryContractSurfaceSpec {
+            selector: q4.selector,
+            spec: q4.spec.clone(),
+        };
+        unknown_component.spec.components.insert(
+            "unknown".into(),
+            WeightsSource::File("/unknown.safetensors".into()),
+        );
+        assert!(weights_free_memory_strategy_surface_contract(
+            crate::model::KREA_2_RAW_ID,
+            &unknown_component,
+        )
+        .is_err());
+
+        let mut wan_vae = q4;
+        wan_vae.spec.components.insert(
+            mlx_gen::VAE_COMPONENT.into(),
+            WeightsSource::File("/wan-vae.safetensors".into()),
+        );
+        let wan_contract =
+            weights_free_memory_strategy_surface_contract(crate::model::KREA_2_RAW_ID, &wan_vae)
+                .expect("supported Wan VAE component must remain selector-admissible");
+        assert_eq!(
+            wan_contract
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .support,
+            MemoryStrategySupport::Implemented
+        );
+        assert_eq!(wan_contract.asset_facts, Default::default());
     }
 
     #[test]

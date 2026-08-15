@@ -535,12 +535,7 @@ pub(crate) fn build_native_krea(
 /// selects the variant (Turbo vs Raw vs edit) the returned [`Krea`] renders.
 fn load_variant(spec: &LoadSpec, descriptor: ModelDescriptor) -> Result<Box<dyn Generator>> {
     spec.validate_prepared_file_pins()?;
-    let allowed_components: &[&str] = if matches!(spec.weights, WeightsSource::File(_)) {
-        &[BASE_SNAPSHOT_COMPONENT, VAE_COMPONENT]
-    } else {
-        &[VAE_COMPONENT]
-    };
-    mlx_gen::gen_core::reject_unknown_components(spec, allowed_components, descriptor.id)?;
+    validate_base_krea_load_axes(spec, descriptor.id)?;
     mlx_gen_wan::validate_selected_single_frame_decoder(spec, &descriptor)?;
     if matches!(spec.weights, WeightsSource::File(_)) {
         return Ok(Box::new(build_native_krea_from_spec(spec, descriptor)?));
@@ -562,28 +557,32 @@ fn load_variant(spec: &LoadSpec, descriptor: ModelDescriptor) -> Result<Box<dyn 
     }))
 }
 
-pub(crate) fn validate_native_krea_spec(spec: &LoadSpec, provider_id: &str) -> Result<()> {
-    mlx_gen::gen_core::reject_unknown_components(
-        spec,
-        &[BASE_SNAPSHOT_COMPONENT, VAE_COMPONENT],
-        provider_id,
-    )?;
-    mlx_gen_wan::validate_selected_single_frame_decoder(spec, &descriptor_for_id(provider_id))?;
-    if spec.precision != Precision::Bf16 {
-        return Err(Error::Msg(format!(
-            "{}: only the default dense precision is wired (drop the precision override)",
-            provider_id
-        )));
-    }
+pub(crate) fn validate_base_krea_load_axes(spec: &LoadSpec, provider_id: &str) -> Result<()> {
+    let allowed_components: &[&str] = if matches!(spec.weights, WeightsSource::File(_)) {
+        &[BASE_SNAPSHOT_COMPONENT, VAE_COMPONENT]
+    } else {
+        &[VAE_COMPONENT]
+    };
+    mlx_gen::gen_core::reject_unknown_components(spec, allowed_components, provider_id)?;
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
         return Err(Error::Unsupported(format!(
-            "{}: the base single-file provider does not accept control/IP-adapter overlays",
-            provider_id
+            "{provider_id}: the base Krea provider does not accept control/IP-adapter overlays"
         )));
     }
     if spec.identity.is_some() {
         return Err(Error::Unsupported(format!(
-            "{}: imported single-file weights do not accept identity fields",
+            "{provider_id}: the base Krea provider does not accept identity fields"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_native_krea_spec(spec: &LoadSpec, provider_id: &str) -> Result<()> {
+    validate_base_krea_load_axes(spec, provider_id)?;
+    mlx_gen_wan::validate_selected_single_frame_decoder(spec, &descriptor_for_id(provider_id))?;
+    if spec.precision != Precision::Bf16 {
+        return Err(Error::Msg(format!(
+            "{}: only the default dense precision is wired (drop the precision override)",
             provider_id
         )));
     }
@@ -1761,6 +1760,10 @@ pub(crate) fn component_footprint_for(
     provider_id: &str,
     spec: &mlx_gen::LoadSpec,
 ) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    if provider_id != crate::model_control::KREA_2_TURBO_CONTROL_ID {
+        validate_base_krea_load_axes(spec, provider_id)
+            .map_err(|error| mlx_gen::gen_core::Error::Msg(error.to_string()))?;
+    }
     let base = mlx_gen::require_base_snapshot(spec, "krea_2 imported provider")?;
     let expected_language_bits = match &spec.weights {
         WeightsSource::Dir(root) => resolve_load_plan(spec, root, provider_id)?

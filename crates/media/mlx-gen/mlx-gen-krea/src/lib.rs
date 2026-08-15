@@ -131,6 +131,17 @@ pub fn register_providers(
                 block_memory_strategy::weights_free_memory_strategy_contract(KREA_2_RAW_ID, spec)
             },
         })
+        .register_memory_contract_surface_resolver(
+            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
+                provider_id: KREA_2_RAW_ID,
+                contract: |surface| {
+                    block_memory_strategy::weights_free_memory_strategy_surface_contract(
+                        KREA_2_RAW_ID,
+                        surface,
+                    )
+                },
+            },
+        )
         .register_memory_behavior(model::RAW_MEMORY_BEHAVIOR)
         .register_memory_strategy(model::EDIT_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
@@ -454,6 +465,145 @@ mod explicit_registry_tests {
                     .is_some(),
                 "{id} must retain its memory contract with a compatible selected encoder"
             );
+        }
+    }
+
+    #[test]
+    fn raw_directory_load_contract_and_footprint_reject_ignored_axes_and_preserve_supported_ones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = super::provider_registry().unwrap();
+        let root = snapshot(&tmp, "raw-dir-typed-fields");
+        let base = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(root.clone()))
+            .with_offload_policy(mlx_gen::OffloadPolicy::Sequential)
+            .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization);
+
+        let mut identity = base.clone();
+        identity.identity = Some(mlx_gen::IdentityWeights::default());
+        let unknown_component = base.clone().with_component(
+            "unknown",
+            mlx_gen::WeightsSource::File("/unknown.safetensors".into()),
+        );
+        let unsupported = [
+            base.clone()
+                .with_control(mlx_gen::WeightsSource::File("/control.safetensors".into())),
+            base.clone()
+                .with_extra_control(mlx_gen::WeightsSource::File(
+                    "/extra-control.safetensors".into(),
+                )),
+            base.clone().with_ip_adapter(mlx_gen::WeightsSource::File(
+                "/ip-adapter.safetensors".into(),
+            )),
+            identity,
+            unknown_component,
+        ];
+        for spec in unsupported {
+            for error in [
+                registry
+                    .memory_strategy_contract(crate::KREA_2_RAW_ID, &spec)
+                    .expect_err("contract must reject unsupported Raw axis")
+                    .to_string(),
+                registry
+                    .footprint(crate::KREA_2_RAW_ID, &spec)
+                    .expect_err("footprint must reject unsupported Raw axis")
+                    .to_string(),
+                registry
+                    .load(crate::KREA_2_RAW_ID, &spec)
+                    .err()
+                    .expect("load must reject unsupported Raw axis")
+                    .to_string(),
+            ] {
+                assert!(!error.is_empty(), "fail-closed rejection must be explicit");
+            }
+        }
+
+        let low_rank = root.join("low-rank.safetensors");
+        write_minimal_safetensors(&low_rank);
+        let lora = base.clone().with_adapters(vec![mlx_gen::AdapterSpec::new(
+            low_rank,
+            1.0,
+            mlx_gen::AdapterKind::Lora,
+        )]);
+        let lokr_file = root.join("low-rank-lokr.safetensors");
+        write_minimal_safetensors(&lokr_file);
+        let lokr = base.clone().with_adapters(vec![mlx_gen::AdapterSpec::new(
+            lokr_file,
+            1.0,
+            mlx_gen::AdapterKind::Lokr,
+        )]);
+
+        let external_text_encoder = tmp.path().join("raw-external-text-encoder");
+        gen_core_testkit::write_encoder_contract_fixture(
+            &external_text_encoder,
+            crate::model::ENCODER_CONTRACT,
+        )
+        .expect("validation-complete selected text encoder fixture");
+        let mut selected_encoder = base.clone();
+        selected_encoder.text_encoder = Some(mlx_gen::WeightsSource::Dir(external_text_encoder));
+
+        let pid = base.clone().with_pid(
+            mlx_gen::WeightsSource::File("/pid.safetensors".into()),
+            mlx_gen::WeightsSource::Dir("/pid-text-encoder".into()),
+        );
+
+        let wan_vae = tmp.path().join("wan-vae.safetensors");
+        write_minimal_safetensors(&wan_vae);
+        let alternate_decoder = base.clone().with_component(
+            mlx_gen::VAE_COMPONENT,
+            mlx_gen::WeightsSource::File(wan_vae),
+        );
+
+        let behavior = registry
+            .memory_behavior_registrations()
+            .find(|registration| registration.provider_id == crate::KREA_2_RAW_ID)
+            .expect("Raw memory behavior registration");
+        for (profile, spec) in [
+            ("plain", base),
+            ("lora", lora),
+            ("lokr", lokr),
+            ("external_text_encoder", selected_encoder),
+            ("pid", pid),
+            ("wan_vae", alternate_decoder),
+        ] {
+            let contract = registry
+                .memory_strategy_contract(crate::KREA_2_RAW_ID, &spec)
+                .unwrap()
+                .expect("supported Raw load must retain its memory contract");
+            assert_eq!(
+                contract
+                    .capability(mlx_gen::gen_core::MemoryStrategy::BoundedTransformerResidency)
+                    .expect("complete Raw ladder")
+                    .support,
+                mlx_gen::gen_core::MemoryStrategySupport::Implemented,
+                "{profile}"
+            );
+            let fixtures = (behavior.valid_fixtures)(
+                &spec,
+                &contract,
+                mlx_gen::gen_core::MemoryStrategy::BoundedTransformerResidency,
+            )
+            .unwrap();
+            for (mode, references) in [
+                (mlx_gen::gen_core::MemoryMode::TextToImage, 0),
+                (mlx_gen::gen_core::MemoryMode::ImageToImage, 1),
+            ] {
+                for use_pid in [false, true] {
+                    assert!(
+                        fixtures.iter().any(|fixture| {
+                            fixture.context.mode == mode
+                                && fixture.context.geometry.reference_count == references
+                                && fixture.context.use_pid == use_pid
+                        }),
+                        "{profile} must expose {mode:?} with use_pid={use_pid}"
+                    );
+                }
+            }
+            assert!(
+                fixtures.iter().any(|fixture| fixture.context.use_pid),
+                "{profile}: provider-owned behavior inventory must preserve the PiD route"
+            );
+            registry
+                .load(crate::KREA_2_RAW_ID, &spec)
+                .unwrap_or_else(|error| panic!("supported Raw {profile} load rejected: {error}"));
         }
     }
 
