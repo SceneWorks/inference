@@ -13,7 +13,7 @@ use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     gen_core, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
     GenerationRequest, Generator, Image, LatentDecoder, LoadSpec, Modality, ModelDescriptor,
-    OffloadPolicy, Precision, Progress, Quant, Residency, Result, SizeFloor, WeightsSource,
+    OffloadPolicy, Precision, Progress, Quant, Residency, Result, WeightsSource,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 use std::path::Path;
@@ -68,36 +68,17 @@ pub fn descriptor() -> ModelDescriptor {
             // Euler path; any name outside the menu is rejected in `validate_request`.
             samplers: qwen_samplers(),
             schedulers: qwen_schedulers(),
-            supported_guidance_methods: vec![],
             min_size: 256,
             max_size: 2048,
             max_count: 8,
-            // Not a distilled fixed-schedule model: any step count the shared sanity caps
-            // admit is renderable (sc-19502).
-            supported_steps: Vec::new(),
             mac_only: true,
             supported_quants: &[Quant::Q4, Quant::Q8],
-            component_precision_floors: &[],
-            supports_kv_cache: false,
             // Flow-match schedule uses the resolution-dependent sigma shift.
             requires_sigma_shift: true,
             // Wired onto the shared `Residency` seam; honors Sequential offload (F-176).
             supports_sequential_offload: true,
-            unconditionally_engages_staged_residency: false,
             supports_preview: true,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
+            ..Default::default()
         },
     }
 }

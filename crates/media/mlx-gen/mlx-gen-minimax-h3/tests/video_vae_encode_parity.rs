@@ -434,6 +434,20 @@ fn the_tile_geometry_changes_the_result() {
 }
 
 /// Malformed encode inputs are typed errors, not silent reshapes.
+///
+/// # Each rejection is asserted by MESSAGE, not by `is_err()` (sc-19488)
+///
+/// Every input below would fail *somewhere* with the guard deleted — a rank-1 tensor has no `s[1]`
+/// to read, 4 channels meets a 3-channel `CausalConv3d`, and a 0-frame tensor reflect-pads off an
+/// axis of length 0. So `assert!(..is_err())` passes here whether or not `encode`'s entry guards
+/// exist, which makes it inert: it is satisfied by an error that has nothing to do with the
+/// property under test. That is not hypothetical on this crate — the sibling tile probe in
+/// `video_vae_parity.rs` survived its own mutation for exactly this reason, failing downstream with
+/// "cannot reflect-pad 1/1 off an axis of length 1".
+///
+/// Naming the guard's own message is what makes each of these bite: delete the matching arm of
+/// `MiniMaxH3VideoVae::encode` and the input still errors, but with a different string, and the
+/// assertion goes red.
 #[test]
 fn encode_rejects_malformed_input() {
     let v = vae(3);
@@ -441,16 +455,44 @@ fn encode_rejects_malformed_input() {
     v.encode(&ok).unwrap();
 
     // Wrong rank.
-    assert!(v.encode(&Array::from_slice(&[1.0f32], &[1])).is_err());
+    let msg = v
+        .encode(&Array::from_slice(&[1.0f32], &[1]))
+        .expect_err("a rank-1 tensor is not [B, 3, T, H, W]")
+        .to_string();
+    assert!(
+        // Full prefix, not the bare shape tail — `src/pipeline.rs`'s decode guard spells the same
+        // `expected [B, 3, T, H, W]`, so the short form would go inert if encode ever delegated
+        // through it (sc-19488).
+        msg.contains("minimax-h3 vae encode: expected [B, 3, T, H, W]"),
+        "the rank guard must be what rejects this, not a downstream shape fault: {msg}"
+    );
+
     // Wrong channel count — 4 channels is a plausible RGBA mistake.
     let rgba = Array::from_slice(&vec![0.5f32; 4 * 8 * 8], &[1, 4, 1, 8, 8]);
+    let msg = v
+        .encode(&rgba)
+        .expect_err("an RGBA-shaped input must be rejected rather than convolved")
+        .to_string();
+    // The substring is deliberately the guard's FULL prefix, not the bare phrase "input channels".
+    // Measured (sc-19488): with this guard disabled the RGBA tensor reaches the encoder stack and
+    // mlx rejects it with `[conv] Expect the input channels in the input and weight array to match`
+    // — which CONTAINS "input channels", so the shorter substring stayed green under its own
+    // mutation and was still inert. Matching `minimax-h3 vae encode:` pins it to this crate's guard.
     assert!(
-        v.encode(&rgba).is_err(),
-        "an RGBA-shaped input must be rejected rather than convolved"
+        msg.contains("minimax-h3 vae encode: expected 3 input channels"),
+        "the channel guard must be what rejects this, not the 3-channel conv failing later: {msg}"
     );
+
     // Zero frames.
     let empty = Array::from_slice(&Vec::<f32>::new(), &[1, 3, 0, 8, 8]);
-    assert!(v.encode(&empty).is_err());
+    let msg = v
+        .encode(&empty)
+        .expect_err("a zero-frame clip must be refused")
+        .to_string();
+    assert!(
+        msg.contains("at least one frame"),
+        "the frame-count guard must be what rejects this, not the reflect pad: {msg}"
+    );
 }
 
 /// The posterior sample is `mean + std · noise`, and the noise is genuinely load-bearing — a
@@ -483,9 +525,21 @@ fn the_posterior_sample_depends_on_its_noise() {
         "the posterior noise is inert ({delta:.3e}); std must be a real spread"
     );
 
-    // A shape mismatch is rejected rather than broadcast.
+    // A shape mismatch is rejected rather than broadcast. Asserted by message (sc-19488): with the
+    // guard deleted, `[1, 1, 1, 1, 1]` would BROADCAST cleanly against the mean on some shapes and
+    // fail on others, so `is_err()` alone reports the guard's absence inconsistently. The asserted
+    // text is the FULL unique prefix: `does not match the mean` alone is emitted by three guards
+    // (this one, the audio encoder's, and the candle twin), so the short form would not identify
+    // which one fired.
     let wrong = mlx_rs::ops::zeros_dtype(&[1, 1, 1, 1, 1], Dtype::Float32).unwrap();
-    assert!(posterior.sample_with(&wrong).is_err());
+    let msg = posterior
+        .sample_with(&wrong)
+        .expect_err("noise of the wrong shape must be refused, not broadcast")
+        .to_string();
+    assert!(
+        msg.contains("minimax-h3 encoder: posterior noise"),
+        "the VIDEO encoder's own noise-shape guard must be what rejects this: {msg}"
+    );
     let _ = DiagonalGaussian::from_parameters(&Array::from_slice(&[0.0f32, 0.0], &[1, 2, 1, 1, 1]))
         .unwrap();
 }

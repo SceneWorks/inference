@@ -119,7 +119,7 @@ use candle_gen::gen_core::OffloadPolicy;
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
     GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Progress, Quant,
-    SizeFloor, WeightsSource,
+    WeightsSource,
 };
 
 /// Registry id for the Krea 2 Turbo text-to-image variant. Matches the SceneWorks worker's
@@ -824,10 +824,8 @@ pub fn descriptor() -> ModelDescriptor {
         backend: "candle",
         modality: Modality::Image,
         capabilities: Capabilities {
-            supports_negative_prompt: false,
             // CFG-free distilled student (like Ideogram Turbo / Boogu Turbo / SDXL-Lightning).
             supports_guidance: false,
-            supports_true_cfg: false,
             // Turbo img2img reference-guided latent-init (sc-10134, epic 8588): a single
             // `Conditioning::Reference { image, strength }` seeds the denoise from the VAE-encoded
             // reference (`pipeline::render_img2img`). A MultiReference is NOT accepted here (that is the
@@ -843,21 +841,13 @@ pub fn descriptor() -> ModelDescriptor {
             // native distilled loop stays the byte-exact default (`req.sampler == None`).
             samplers: candle_gen::curated_sampler_names(),
             schedulers: candle_gen::curated_scheduler_names(),
-            supported_guidance_methods: vec![],
             min_size: RES_MIN,
             max_size: RES_MAX,
             max_count: MAX_COUNT,
-            // Not a distilled fixed-schedule model: any step count the shared sanity caps
-            // admit is renderable (sc-19502).
-            supported_steps: Vec::new(),
-            mac_only: false,
             // sc-9607: advertise the packed tiers so the worker's A-B quant toggle engages off-Mac.
             // The resolved q4/q8/bf16 turnkey subdir self-describes its tier (`loader::linear_detect`,
             // sc-9411); `build` no-ops the requested quant, and it composes with a merged LoRA overlay.
             supported_quants: &[Quant::Q4, Quant::Q8],
-            component_precision_floors: &[],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
             // sc-12089 (epic 10765 Phase 1c): the Turbo txt2img lane wires the load→encode→drop
             // residency lifecycle (`pipeline::render_sequential`), so it advertises the discovery bit
             // the worker's fit-gate reads. `raw_descriptor` inherits this for its CFG twin, and
@@ -869,7 +859,6 @@ pub fn descriptor() -> ModelDescriptor {
             // actually run resident makes the gate under-predict its real peak — an admitted job that
             // then OOMs. Never flip this on ahead of the wiring.
             supports_sequential_offload: true,
-            unconditionally_engages_staged_residency: false,
             // sc-16951 (epic 16948): sc-16950 wired EVERY shipped Krea render route — the seven
             // `pipeline` sites (Turbo three-stage / t2i / img2img, Raw t2i / multi-phase / img2img,
             // and the shared Turbo+Raw edit) plus the pose-control provider — to hand
@@ -883,19 +872,7 @@ pub fn descriptor() -> ModelDescriptor {
             // direction. The trainer's periodic sample render is deliberately outside that set: it
             // renders from a synthetic request that carries no sink.
             supports_preview: true,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
+            ..Default::default()
         },
     }
 }

@@ -145,7 +145,7 @@ use candle_gen::gen_core::tokenizer::TextTokenizer;
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
     GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, MoeExpert,
-    OffloadPolicy, Progress, Quant, SizeFloor, WeightsSource,
+    OffloadPolicy, Progress, Quant, WeightsSource,
 };
 use candle_gen::{check_cancel, run_three_stage_sequential, CandleError, Result as CResult};
 
@@ -1131,7 +1131,6 @@ pub fn descriptor() -> ModelDescriptor {
         capabilities: Capabilities {
             supports_negative_prompt: true,
             supports_guidance: true,
-            supports_true_cfg: false,
             conditioning: vec![ConditioningKind::Reference, ConditioningKind::Keyframe],
             // LoRA/LoKr apply at load (sc-10095): folded on a dense tier, or as additive residuals on a
             // packed q4/q8 tier. Structured LoKr is packed-safe; LoHa fails closed. The env-only native
@@ -1153,42 +1152,19 @@ pub fn descriptor() -> ModelDescriptor {
                 "ddim",
                 "unipc",
             ],
-            schedulers: vec![],
-            supported_guidance_methods: vec![],
             // Per-side floor 480 (= a 15×15 latent-token grid): below it the z48 vae22's coarse
             // effective 32× stride starves the DiT, which renders rainbow garbage at ANY flow-shift
             // (dense + packed alike, sc-10306). Enforced by `Capabilities::validate_request`.
             min_size: MIN_SIZE,
             max_size: 1280,
             max_count: 1,
-            // Not a distilled fixed-schedule model: any step count the shared sanity caps
-            // admit is renderable (sc-19502).
-            supported_steps: Vec::new(),
-            mac_only: false,
             supported_quants: &[Quant::Q4, Quant::Q8],
-            component_precision_floors: &[],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
             // The TI2V-5B honors `OffloadPolicy::Sequential` (epic 12732, sc-12757): the staged
             // `render_sequential` keeps the ~11 GB bf16 UMT5 encoder off-GPU for the whole denoise and
             // frees the dense DiT before the VAE loads, bounding the pre-decode peak. Advertised so the
             // worker's fit-gate can tell "bounds peak here" from a no-op fallback.
             supports_sequential_offload: true,
-            unconditionally_engages_staged_residency: false,
-            supports_preview: false,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
+            ..Default::default()
         },
     }
 }

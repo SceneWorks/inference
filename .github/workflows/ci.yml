@@ -157,6 +157,14 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Validate normalized workspace
         run: ./scripts/check-workspace.py
+      # sc-19556. A RATCHET against scripts/clock_assertions_baseline.txt, not a zero-gate: the
+      # residual clock-bound assertions are real and tracked, and a gate demanding zero would be
+      # switched off within a week. This reds only when a file's count RISES or a newly flagged
+      # file appears — i.e. when a PR adds an assertion whose truth depends on how busy the runner
+      # was. `workspace` is the right lane because select_lanes.py never skips it, so the ratchet
+      # sees every PR regardless of which crates it touched.
+      - name: Ratchet wall-clock-dependent assertions
+        run: python3 scripts/check_clock_assertions.py --check-baseline .
       # Installed BEFORE the tooling tests, not after: `test_mmaudio_reference.py` regenerates the
       # MMAudio parity fixtures' deterministic inputs (a 28 MP synthetic clip) and compares digests,
       # which needs numpy. Leaving this after the discover step would turn that gate into an import

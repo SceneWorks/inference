@@ -50,11 +50,15 @@
 //! deliberate quantization to ~11 mantissa bits, not an artifact of a dtype it happened to be in;
 //! skipping it changes the anchor. [`fp16_round_trip`] is it.
 //!
-//! # Not here: the `ref2va` half
+//! # The `ref2va` half (sc-17157)
 //!
-//! The MLX sibling's `reference_clip_to_vae_pixels`, `encode_reference_condition`,
-//! `snap_reference_frames_down` and `reference_audio_rows` are **sc-17157**, and this crate has
-//! neither a `reference` module nor an audio VAE encoder for them to call.
+//! [`reference_clip_to_vae_pixels`], [`encode_reference_condition`],
+//! [`snap_reference_frames_down`] and [`reference_audio_rows`] are the reference-conditioning
+//! counterparts of the keyframe entry points above. They deliberately share the keyframe
+//! arithmetic — the reference implementation calls **one** `encode_vae_condition` for a keyframe,
+//! a reference image and a reference clip alike — so the only difference is arity (more than one
+//! frame) and, for a soundtrack, that the posterior's **mode** rides clean rather than being
+//! noise-augmented. See [`crate::reference`].
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::seed::seeded_normal_vec;
@@ -282,6 +286,111 @@ pub fn build_condition_rows(
     Ok(Some(Tensor::cat(&rows, 1)?))
 }
 
+/// A `ref2va` reference clip's pixels in the video VAE's space — `[1, 3, F, H, W]`.
+///
+/// The multi-frame sibling of [`crate::keyframe::keyframe_to_vae_pixels`], and it applies the same
+/// `x/255` + ImageNet normalization, because a reference takes the same two preprocessing paths a
+/// keyframe does (the VAE's here, the vision tower's `0.5/0.5` separately).
+///
+/// **Every frame must share one size.** A ragged clip would encode to a latent whose geometry does
+/// not match what the layout reserved, and the mismatch first surfaces as a shape error deep inside
+/// the DiT.
+pub fn reference_clip_to_vae_pixels(
+    frames: &[candle_gen::gen_core::Image],
+    device: &Device,
+) -> Result<Tensor> {
+    let Some(first) = frames.first() else {
+        return Err(CandleError::Msg(
+            "minimax-h3 conditioning: a reference clip has no frames".into(),
+        ));
+    };
+    let (w, h) = (first.width, first.height);
+    let mut per_frame = Vec::with_capacity(frames.len());
+    for (i, f) in frames.iter().enumerate() {
+        if f.width != w || f.height != h {
+            return Err(CandleError::Msg(format!(
+                "minimax-h3 conditioning: reference clip frame {i} is {}x{}, but frame 0 is {w}x{h} \
+                 — every frame of a clip shares one size",
+                f.width, f.height
+            )));
+        }
+        // `[1, 3, 1, H, W]` each; concatenating on the temporal axis gives `[1, 3, F, H, W]`.
+        per_frame.push(crate::keyframe::keyframe_to_vae_pixels(f, device)?);
+    }
+    Ok(Tensor::cat(&per_frame, 2)?.contiguous()?)
+}
+
+/// One `ref2va` reference's conditioning latent: encode, sample, fp16, normalize.
+///
+/// The multi-frame sibling of [`encode_keyframe_condition`] and deliberately the *same* arithmetic
+/// — the reference implementation calls one `encode_vae_condition` for a keyframe, a reference image
+/// and a reference clip alike, so this differs from the keyframe entry point only in accepting more
+/// than one frame.
+///
+/// `pixels` is `[1, 3, F, H, W]`. The result is `[1, latent_channels, F', H/16, W/16]` at **this
+/// reference's own resolution** — references are not fitted to the generated canvas.
+pub fn encode_reference_condition(
+    vae: &MiniMaxH3VideoVae,
+    pixels: &Tensor,
+    noise: &KeyframeNoise,
+    index: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    let s = pixels.dims();
+    if s.len() != 5 || s[0] != 1 || s[1] != 3 || s[2] < 1 {
+        return Err(CandleError::Msg(format!(
+            "minimax-h3 conditioning: a reference is [1, 3, F, H, W] with F >= 1, got {s:?}"
+        )));
+    }
+    let posterior: DiagonalGaussian = vae.encode(pixels)?;
+    let (sample_noise, _) = noise.draw(posterior.mean().dims(), index, device)?;
+    let sampled = posterior.sample_with(&sample_noise)?;
+    vae.normalize(&fp16_round_trip(&sampled)?)
+}
+
+/// Snap a reference clip's frame count **down** to the `17n + 5` lattice the video VAE encodes
+/// without padding.
+///
+/// Down, not up: padding a short reference would condition on frames that do not exist. This only
+/// bites when the reference is shorter than the target, whose own count already has that form.
+///
+/// The floor is `n = 1`, i.e. **22** frames — not `5`. `n = 0` would ask the VAE for a chunkless
+/// clip, so the `max(1)` below is a floor rather than a clamp to the lattice's zeroth point, and the
+/// caller pairs this with `.min(frames.len())` so a shorter clip is never over-read.
+pub fn snap_reference_frames_down(num_frames: usize) -> usize {
+    // `17n + 5` in the VAE's own terms: `frames_per_chunk = 17`, `latents_per_chunk = 5`.
+    const FRAMES_PER_CHUNK: usize = 17;
+    const LATENTS_PER_CHUNK: usize = 5;
+    let n = num_frames.saturating_sub(LATENTS_PER_CHUNK) / FRAMES_PER_CHUNK;
+    n.max(1) * FRAMES_PER_CHUNK + LATENTS_PER_CHUNK
+}
+
+/// The **clean** reference-soundtrack rows of one encoded soundtrack, reshaped channel-major.
+///
+/// `normalized` is the audio VAE posterior's **mean**, already normalized by the component's
+/// `latents_mean` / `latents_std`, shaped `[channels, num_audio_latents, audio_latent_channels]`.
+/// The result is `[1, channels · num_audio_latents, audio_latent_channels]`.
+///
+/// # Two things here are deliberate and neither is obvious
+///
+/// * **The posterior is never sampled.** A soundtrack takes the distribution's *mode*, unlike a
+///   visual condition which draws a sample at [`KEYFRAME_ENCODE_SEED`]. Sampling it would make a
+///   reference soundtrack vary per call for no reason the model was trained with.
+/// * **The rows ride clean, at `t = 1.0`.** They are *not* noise-augmented to
+///   [`KEYFRAME_NOISE_AUG_T`] the way visual anchors are — that is what
+///   [`crate::denoise::RowClass::ConditionAudio`] exists to express, and applying the visual
+///   augmentation here would be the plausible wrong answer.
+pub fn reference_audio_rows(normalized: &Tensor) -> Result<Tensor> {
+    let s = normalized.dims();
+    if s.len() != 3 {
+        return Err(CandleError::Msg(format!(
+            "minimax-h3 conditioning: reference audio latents are [channels, latents, features], \
+             got {s:?}"
+        )));
+    }
+    Ok(normalized.contiguous()?.reshape((1, s[0] * s[1], s[2]))?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -406,5 +515,38 @@ mod tests {
         assert!(validate_condition_arity(2, &[Last, Last]).is_err());
         // Reversed packed order is rejected rather than silently mislabelling the two ends.
         assert!(validate_condition_arity(2, &[Last, First]).is_err());
+    }
+
+    /// A reference clip's frame count snaps **DOWN** to `17n + 5`, and the floor is `n = 1`.
+    ///
+    /// Both halves matter. Snapping *up* would pad the clip with frames that do not exist, and the
+    /// floor is 22 rather than the lattice's `5` — `n = 0` would ask the VAE for a chunkless clip.
+    /// The doc comment on this function used to say `5`, which is the arithmetic without the
+    /// `max(1)`, so this is pinned rather than restated.
+    #[test]
+    fn a_reference_clip_snaps_down_to_the_seventeen_n_plus_five_lattice() {
+        // Exactly on the lattice: unchanged.
+        for on in [22usize, 39, 56, 124] {
+            assert_eq!(snap_reference_frames_down(on), on, "{on} is 17n + 5");
+        }
+        // Between two lattice points: DOWN to the lower one, never up.
+        assert_eq!(snap_reference_frames_down(38), 22);
+        assert_eq!(snap_reference_frames_down(55), 39);
+        assert_eq!(snap_reference_frames_down(123), 107);
+        // The floor: anything shorter than one chunk still asks for one chunk, and the caller
+        // pairs this with `.min(frames.len())` so a 3-frame clip is not over-read.
+        for short in [0usize, 1, 5, 6, 21] {
+            assert_eq!(
+                snap_reference_frames_down(short),
+                22,
+                "{short} frames must floor at ONE chunk (22), not at the lattice base 5"
+            );
+        }
+        // Every result really is on the lattice.
+        for n in 0usize..200 {
+            let snapped = snap_reference_frames_down(n);
+            assert_eq!((snapped - 5) % 17, 0, "{n} -> {snapped} is off the lattice");
+            assert!(snapped <= n.max(22));
+        }
     }
 }

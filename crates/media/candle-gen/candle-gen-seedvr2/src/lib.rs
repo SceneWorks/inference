@@ -36,7 +36,7 @@ use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::{
     self, default_seed, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
     GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Precision, Progress,
-    Quant, SizeFloor, WeightsSource,
+    Quant, WeightsSource,
 };
 
 use config::{DitConfig, VAE_SCALE};
@@ -69,13 +69,12 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
         backend: "candle",
         modality: Modality::Both, // image (Reference) + video (VideoClip) upscaling
         capabilities: Capabilities {
-            supports_negative_prompt: false, // precomputed neg-embed; no prompt surface
-            supports_guidance: false,        // one-step, guidance fixed at 1.0
+            // `supports_negative_prompt` is deferred to its `false` default rather than declared:
+            // SeedVR2 carries a precomputed negative embedding and exposes no prompt surface.
+            supports_guidance: false, // one-step, guidance fixed at 1.0
             supports_true_cfg: false,
             // the LR input image (image upscale) or LR frame sequence (video upscale)
             conditioning: vec![ConditioningKind::Reference, ConditioningKind::VideoClip],
-            supports_lora: false,
-            supports_lokr: false,
             // Bespoke-by-architecture (epic 7114 P4, sc-7123): SeedVR2 is a ONE-STEP restoration
             // transformer (fixed timestep 1000.0, `denoised = noise − dit_out`), NOT a multi-step
             // rectified-flow ODE — there is no sigma schedule to integrate and no sampler/scheduler axis
@@ -83,34 +82,12 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             // curated solvers/schedulers do not apply.
             samplers: vec!["seedvr2_euler"],
             schedulers: vec!["seedvr2_euler"],
-            supported_guidance_methods: vec![],
             min_size: VAE_SCALE,
             max_size: 4096,
             max_count: 8,
-            // Not a distilled fixed-schedule model: any step count the shared sanity caps
-            // admit is renderable (sc-19502).
-            supported_steps: Vec::new(),
-            mac_only: false,
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
-            supports_sequential_offload: false,
-            unconditionally_engages_staged_residency: false,
-            supports_preview: false,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
             supported_quants: &[Quant::Q4, Quant::Q8], // Linear-only DiT quant (sc-5927)
             component_precision_floors: &[],
-            size_floor: SizeFloor::RangeChecked,
+            ..Default::default()
         },
     }
 }

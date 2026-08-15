@@ -20,7 +20,7 @@ use mlx_rs::Dtype;
 use mlx_gen::{
     default_seed, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
     GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Precision, Progress,
-    Quant, Result, SizeFloor, WeightsSource,
+    Quant, Result, WeightsSource,
 };
 
 use crate::config::DitConfig;
@@ -54,44 +54,23 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
         backend: "mlx",
         modality: Modality::Both, // image (Reference) + video (VideoClip) upscaling
         capabilities: Capabilities {
-            supports_negative_prompt: false, // precomputed neg-embed; no prompt surface
-            supports_guidance: false,        // one-step, guidance fixed at 1.0
+            // `supports_negative_prompt` is deferred to its `false` default rather than declared:
+            // SeedVR2 carries a precomputed negative embedding and exposes no prompt surface.
+            supports_guidance: false, // one-step, guidance fixed at 1.0
             supports_true_cfg: false,
             // the LR input image (image upscale) or LR frame sequence (video upscale)
             conditioning: vec![ConditioningKind::Reference, ConditioningKind::VideoClip],
-            supports_lora: false,
-            supports_lokr: false,
             samplers: vec!["seedvr2_euler"],
             schedulers: vec!["seedvr2_euler"],
-            supported_guidance_methods: vec![],
             min_size: VAE_SCALE,
             max_size: 4096,
             max_count: 8,
-            // Not a distilled fixed-schedule model: any step count the shared sanity caps
-            // admit is renderable (sc-19502).
-            supported_steps: Vec::new(),
             mac_only: true,
             supported_quants: &[Quant::Q4, Quant::Q8], // Linear-only DiT quant (sc-5198)
             component_precision_floors: &[],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
             // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
             supports_sequential_offload: false,
-            unconditionally_engages_staged_residency: false,
-            supports_preview: false,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
+            ..Default::default()
         },
     }
 }

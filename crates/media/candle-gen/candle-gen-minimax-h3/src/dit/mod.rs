@@ -77,9 +77,10 @@ pub use heads::{
 pub use layers::{DitAttention, DitFeedForward, LinearNoBias, RmsNorm};
 pub use model::{BlockModulation, JointDit, MiniMaxH3Dit, PackedForward, PUBLISHED_DIT_TENSORS};
 pub use positions::{
-    audio_position_ids, frame_grid, keyframe_anchor_time, keyframe_position_ids, spatial_axis_grid,
-    temporal_grid, text_position_ids, video_position_ids, KeyframeAnchor, AUDIO_CHANNELS,
-    ROPE_FRAMES_PER_LATENT, ROPE_FRAME_RESCALE, ROPE_SPATIAL_SCALE,
+    audio_position_ids, frame_grid, keyframe_anchor_time, keyframe_position_ids,
+    reference_block_position_ids, spatial_axis_grid, temporal_grid, text_position_ids,
+    video_position_ids, KeyframeAnchor, ReferenceBlockRows, ReferenceLatentGeometry,
+    AUDIO_CHANNELS, ROPE_FRAMES_PER_LATENT, ROPE_FRAME_RESCALE, ROPE_SPATIAL_SCALE,
 };
 pub use refiner::{TokenRefiner, TokenRefinerBlock};
 pub use rope::{MmRope, MmRopeTables};

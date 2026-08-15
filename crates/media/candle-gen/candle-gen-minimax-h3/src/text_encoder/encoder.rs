@@ -34,8 +34,7 @@
 
 use candle_gen::candle_core::{DType, IndexOp, Tensor};
 use candle_gen::grounding::{
-    causal_mask, image_blocks, mrope_cos_sin, mrope_positions, repeat_kv, replace_seq, slice_seq,
-    Rotary,
+    causal_mask, mrope_cos_sin, repeat_kv, replace_seq, slice_seq, Rotary,
 };
 use candle_gen::{CandleError, Result, Weights};
 
@@ -244,6 +243,9 @@ pub struct MiniMaxH3TextEncoder {
     /// 0-indexed decoder layer whose output is the context (`select_hidden - 1`).
     out_layer: usize,
     image_token_id: u32,
+    /// `<|video_pad|>`'s id — read only by [`Self::forward_with_references`]; `fl2va` never emits
+    /// this pad, which is what keeps the two grounded paths distinguishable.
+    video_token_id: u32,
     mrope_section: [usize; 3],
     head_dim: usize,
     rope_theta: f32,
@@ -299,6 +301,7 @@ impl MiniMaxH3TextEncoder {
             rotary: Rotary::new(cfg.head_dim, cfg.rope_theta, MAX_TEXT_POSITIONS, &device)?,
             out_layer,
             image_token_id: cfg.image_token_id,
+            video_token_id: cfg.video_token_id,
             mrope_section: cfg.mrope_section,
             head_dim: cfg.head_dim,
             rope_theta: cfg.rope_theta,
@@ -357,8 +360,9 @@ impl MiniMaxH3TextEncoder {
     /// interleaved MRoPE — the image block carries its 2-D merged grid position, text stays
     /// sequential. Returns the same `[b, s, hidden]` context. `b = 1`.
     ///
-    /// `<|video_pad|>` runs are **not** scanned: they belong to `ref2va` (sc-17157), which needs a
-    /// multi-pad run scan the shared `candle_gen::grounding` helpers do not yet have.
+    /// `<|video_pad|>` runs are **not** scanned here: they belong to `ref2va`, and mixing them into
+    /// the `fl2va` scan would let a stray video pad consume a keyframe's embeds. See
+    /// [`Self::forward_with_references`].
     pub fn forward_with_images(
         &self,
         input_ids: &Tensor,
@@ -366,6 +370,59 @@ impl MiniMaxH3TextEncoder {
         image_embeds: &[Tensor],
         deepstack: &[Vec<Tensor>],
         grids: &[[i32; 3]],
+    ) -> Result<Tensor> {
+        self.forward_grounded(
+            input_ids,
+            attention_mask,
+            image_embeds,
+            deepstack,
+            grids,
+            &[self.image_token_id],
+        )
+    }
+
+    /// The **`ref2va`** grounded forward (sc-17157): splice reference features into runs of *both*
+    /// `<|image_pad|>` and `<|video_pad|>`.
+    ///
+    /// `embeds`, `deepstack` and `grids` are in **sequence order** — the order the pad runs appear
+    /// in the presentation, which for `ref2va` is request order across modalities.
+    ///
+    /// # Why sequence order reproduces the reference's per-modality batching
+    ///
+    /// Qwen3-VL batches vision tensors *per modality* and fills the n-th pad run of a modality with
+    /// the n-th entry of that modality's batch. Relative order **within** a modality is preserved by
+    /// request order, so walking runs in sequence order while consuming features in request order
+    /// yields exactly the same assignment — with one cursor instead of two, and therefore no way
+    /// for the two to drift apart on an interleaved request.
+    ///
+    /// A run never spans two *different* pads, so an image block immediately followed by a video
+    /// block stays two runs and two references.
+    pub fn forward_with_references(
+        &self,
+        input_ids: &Tensor,
+        attention_mask: &Tensor,
+        embeds: &[Tensor],
+        deepstack: &[Vec<Tensor>],
+        grids: &[[i32; 3]],
+    ) -> Result<Tensor> {
+        self.forward_grounded(
+            input_ids,
+            attention_mask,
+            embeds,
+            deepstack,
+            grids,
+            &[self.image_token_id, self.video_token_id],
+        )
+    }
+
+    fn forward_grounded(
+        &self,
+        input_ids: &Tensor,
+        attention_mask: &Tensor,
+        image_embeds: &[Tensor],
+        deepstack: &[Vec<Tensor>],
+        grids: &[[i32; 3]],
+        pad_ids: &[u32],
     ) -> Result<Tensor> {
         let (b, s) = input_ids.dims2()?;
         if b != 1 {
@@ -375,7 +432,7 @@ impl MiniMaxH3TextEncoder {
         }
         let ids: Vec<u32> = input_ids.i(0)?.to_dtype(DType::U32)?.to_vec1::<u32>()?;
 
-        let blocks = image_blocks(&ids, self.image_token_id);
+        let blocks = vision_pad_runs(&ids, pad_ids);
         if blocks.is_empty() {
             return Err(CandleError::Msg(
                 "minimax-h3 te (grounded): presentation has no vision-pad tokens".into(),
@@ -406,7 +463,7 @@ impl MiniMaxH3TextEncoder {
             hidden = replace_seq(&hidden, &img, start, start + len, s)?;
         }
 
-        let (pt, ph, pw) = mrope_positions(&ids, self.image_token_id, grids);
+        let (pt, ph, pw) = mrope_positions_multi(&ids, pad_ids, grids);
         let (cos, sin) = mrope_cos_sin(
             self.head_dim,
             self.mrope_section,
@@ -477,6 +534,76 @@ impl MiniMaxH3TextEncoder {
             .reshape((b, 1, 1, s))?;
         Ok(causal.broadcast_add(&pad)?)
     }
+}
+
+/// Vision spatial merge — the LM sees one token per `merge²` patches (Qwen3-VL
+/// `spatial_merge_size`). Mirrors the shared `candle_gen::grounding` constant, which is private.
+const SPATIAL_MERGE: i32 = 2;
+
+/// Contiguous runs of **any** of `pad_ids`, as `(start, len)` in sequence order.
+///
+/// The multi-pad generalization of `candle_gen::grounding::image_blocks`, which takes exactly one
+/// pad id. `ref2va` interleaves `<|image_pad|>` and `<|video_pad|>` blocks, and a run **never spans
+/// two different pads** — an image block immediately followed by a video block is two runs and two
+/// references, so the run is broken on the id it started with rather than on "is a pad".
+fn vision_pad_runs(ids: &[u32], pad_ids: &[u32]) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    let mut i = 0usize;
+    while i < ids.len() {
+        if pad_ids.contains(&ids[i]) {
+            let start = i;
+            let first = ids[i];
+            while i < ids.len() && ids[i] == first {
+                i += 1;
+            }
+            runs.push((start, i - start));
+        } else {
+            i += 1;
+        }
+    }
+    runs
+}
+
+/// Multi-pad 3-D MRoPE positions (mirrors Qwen3-VL `get_rope_index`): text tokens advance
+/// `(i, i, i)`; the `k`-th vision block at offset `cur` gets `t = cur`, `h = cur + row`,
+/// `w = cur + col` over its `(h/merge)×(w/merge)` merged grid, then `cur += max(h, w) / merge`.
+///
+/// The multi-pad generalization of `candle_gen::grounding::mrope_positions`; the single-pad case
+/// is byte-identical to it, which `the_multi_pad_scan_reduces_to_the_shared_single_pad_one` pins.
+fn mrope_positions_multi(
+    ids: &[u32],
+    pad_ids: &[u32],
+    grids: &[[i32; 3]],
+) -> (Vec<i64>, Vec<i64>, Vec<i64>) {
+    let (mut pt, mut ph, mut pw) = (Vec::new(), Vec::new(), Vec::new());
+    let mut cur = 0i64;
+    let mut img_k = 0usize;
+    let mut i = 0usize;
+    while i < ids.len() {
+        if pad_ids.contains(&ids[i]) && img_k < grids.len() {
+            let g = grids[img_k];
+            let (llm_h, llm_w) = (
+                i64::from(g[1] / SPATIAL_MERGE),
+                i64::from(g[2] / SPATIAL_MERGE),
+            );
+            let step = i64::from(g[1].max(g[2]) / SPATIAL_MERGE);
+            for idx in 0..(llm_h * llm_w) {
+                pt.push(cur);
+                ph.push(cur + idx / llm_w);
+                pw.push(cur + idx % llm_w);
+            }
+            cur += step;
+            i += (llm_h * llm_w) as usize;
+            img_k += 1;
+        } else {
+            pt.push(cur);
+            ph.push(cur);
+            pw.push(cur);
+            cur += 1;
+            i += 1;
+        }
+    }
+    (pt, ph, pw)
 }
 
 #[cfg(test)]
@@ -851,5 +978,71 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("rotary table"), "unexpected error: {e}");
+    }
+
+    const IMG: u32 = 151_655;
+    const VID: u32 = 151_656;
+
+    /// **A run never spans two different pads.** An `<|image_pad|>` block immediately followed by a
+    /// `<|video_pad|>` block is two references, and merging them would splice one reference's
+    /// embeds across both — which is shape-legal exactly when their token counts happen to sum.
+    #[test]
+    fn a_vision_run_never_spans_two_different_pads() {
+        let ids = [9u32, IMG, IMG, VID, VID, VID, 9, VID, 9];
+        assert_eq!(
+            vision_pad_runs(&ids, &[IMG, VID]),
+            vec![(1, 2), (3, 3), (7, 1)],
+            "adjacent image and video pads are separate runs"
+        );
+        // The single-pad scan sees only its own pad — this is what keeps `fl2va` from consuming a
+        // video block as a keyframe.
+        assert_eq!(vision_pad_runs(&ids, &[IMG]), vec![(1, 2)]);
+        assert!(vision_pad_runs(&[1, 2, 3], &[IMG, VID]).is_empty());
+    }
+
+    /// The multi-pad scans reduce **exactly** to the shared single-pad helpers on a presentation
+    /// that carries only `<|image_pad|>`, so `fl2va` is unchanged by the `ref2va` generalization.
+    ///
+    /// Asserted against `candle_gen::grounding`'s own functions rather than against a transcribed
+    /// expectation, so this cannot pass by agreeing with a copy of itself.
+    #[test]
+    fn the_multi_pad_scan_reduces_to_the_shared_single_pad_one() {
+        use candle_gen::grounding::{image_blocks, mrope_positions};
+        // Two image blocks whose merged grids are 2x2 and 1x2 tokens.
+        let grids = [[1, 4, 4], [1, 2, 4]];
+        let ids = [7u32, IMG, IMG, IMG, IMG, 7, 7, IMG, IMG, 7];
+        assert_eq!(vision_pad_runs(&ids, &[IMG]), image_blocks(&ids, IMG));
+        assert_eq!(
+            mrope_positions_multi(&ids, &[IMG], &grids),
+            mrope_positions(&ids, IMG, &grids)
+        );
+        // …and the shared helper genuinely produced non-trivial positions, so the equality above is
+        // not two empty vectors agreeing.
+        let (pt, ph, pw) = mrope_positions_multi(&ids, &[IMG], &grids);
+        assert_eq!(pt.len(), ids.len());
+        assert_ne!(ph, pt, "an image block must move the H axis off the T ramp");
+        assert_ne!(pw, pt);
+    }
+
+    /// A `ref2va` presentation's video blocks advance the same rotary clock the image blocks do,
+    /// and each block consumes exactly one `grids` entry in **sequence** order.
+    #[test]
+    fn video_pad_blocks_consume_grids_in_sequence_order() {
+        // image block (2x2 = 4 tokens), then a video block (1x2 = 2 tokens).
+        let grids = [[1, 4, 4], [1, 2, 4]];
+        let ids = [7u32, IMG, IMG, IMG, IMG, VID, VID, 7];
+        let (pt, ph, pw) = mrope_positions_multi(&ids, &[IMG, VID], &grids);
+        assert_eq!(pt.len(), ids.len());
+        // token 0 is text at 0; the image block occupies cur = 1 with a 2x2 merged grid and
+        // advances the clock by max(4,4)/2 = 2 to cur = 3; the video block's 1x2 merged grid sits
+        // there and advances by max(2,4)/2 = 2 to cur = 5, where the trailing text token lands.
+        assert_eq!(pt, vec![0, 1, 1, 1, 1, 3, 3, 5]);
+        assert_eq!(ph, vec![0, 1, 1, 2, 2, 3, 3, 5]);
+        assert_eq!(pw, vec![0, 1, 2, 1, 2, 3, 4, 5]);
+
+        // Scanning with the image pad alone leaves the video pads as TEXT rows — the concrete
+        // reason `forward_with_references` exists rather than reusing the `fl2va` path.
+        let (image_only, _, _) = mrope_positions_multi(&ids, &[IMG], &grids);
+        assert_ne!(image_only, pt);
     }
 }

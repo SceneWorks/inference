@@ -1484,9 +1484,17 @@ fn the_render_seam_folds_the_staged_adapter_onto_the_dit() {
     let cfg = dit_fixture_config();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
-    // `MiniMaxH3::load` validates that every component dir exists before it reads anything.
-    for c in ["text_encoder", "transformer", "vae", "audio_vae"] {
-        std::fs::create_dir_all(root.join(c)).unwrap();
+    // `MiniMaxH3::load` validates every component dir before it reads anything — and since
+    // sc-17157's review a dir must carry a **shard**, because an empty one loaded clean and failed
+    // in the middle of the render. A zero-byte stub satisfies that check, which never opens the
+    // file. `transformer/` is deliberately NOT stubbed: it gets the real fixture shard below, and
+    // the DiT loader reads **every** `.safetensors` in its partition, so a stub there is a
+    // "header too small" parse error rather than a satisfied precondition.
+    std::fs::create_dir_all(root.join("transformer")).unwrap();
+    for c in ["text_encoder", "vae", "audio_vae"] {
+        let dir = root.join(c);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("model-00001-of-00001.safetensors"), []).unwrap();
     }
     // A real `transformer/` partition at the fixture geometry: the committed tensors plus the
     // diffusers `config.json` the loader parses.

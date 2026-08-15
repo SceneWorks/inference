@@ -2976,6 +2976,77 @@ mod tests {
             .all(|conditioning| matches!(conditioning, crate::Conditioning::Reference { .. })));
     }
 
+    /// Build a weights-free behavior context whose geometry declares `frames`, leaving every other
+    /// axis at [`standard_memory_behavior_context`]'s values.
+    fn behavior_context_with_frames(frames: u32) -> MemoryRunContext {
+        let contract = adopted_contract();
+        let mut context = standard_memory_behavior_context(
+            &contract,
+            MemoryStrategy::Resident,
+            MemoryNumericTier {
+                precision: Precision::Bf16,
+                quant: Some(Quant::Q4),
+                component_precision_floors: &[],
+            },
+            MemoryBehaviorRoute {
+                mode: MemoryMode::TextToImage,
+                reference_count: 0,
+                use_pid: false,
+                has_phases: false,
+                overlay: None,
+            },
+        )
+        .expect("behavior context");
+        context.geometry.frames = frames;
+        context
+    }
+
+    /// sc-19591. A multi-frame geometry reaches the request, so a provider re-grading the request
+    /// against the geometry the same fixture admitted sees the same count on both sides. Before
+    /// propagation `request.frames` was `GenerationRequest::default()`'s `None` for every geometry,
+    /// which is why the expectation here is the *input* frame count rather than a literal restated
+    /// on both sides, and why several counts are walked — no single constant satisfies them all,
+    /// and none of them is the default.
+    #[test]
+    fn behavior_fixture_propagates_a_multi_frame_geometry() {
+        let default_frames = crate::GenerationRequest::default().frames;
+        assert_eq!(
+            default_frames, None,
+            "the defaulted request states no frames"
+        );
+        for frames in [17u32, 81, 124, 145, 345] {
+            let fixture = crate::MemoryBehaviorFixture::new(behavior_context_with_frames(frames));
+            assert_eq!(fixture.request.frames, Some(frames));
+            assert_eq!(
+                fixture.request.frames,
+                Some(fixture.context.geometry.frames)
+            );
+            assert_ne!(fixture.request.frames, default_frames);
+        }
+    }
+
+    /// sc-19591. A one-frame geometry — [`standard_memory_behavior_context`]'s own value, and what
+    /// every image provider on the ladder declares — states that one frame explicitly. `Some(1)`
+    /// and `None` resolve identically for those providers, since each reads the field as
+    /// `request.frames.unwrap_or(<its own default>)` and theirs is 1; stating it keeps the fixture
+    /// self-consistent for a provider whose default is not 1.
+    #[test]
+    fn behavior_fixture_propagates_a_single_frame_geometry() {
+        let fixture = crate::MemoryBehaviorFixture::new(behavior_context_with_frames(1));
+        assert_eq!(fixture.context.geometry.frames, 1);
+        assert_eq!(fixture.request.frames, Some(1));
+    }
+
+    /// sc-19591. Zero frames states no clip length at all and no provider can render it, so it maps
+    /// back to the unstated `None` rather than to an explicit zero-frame request that would ask
+    /// every provider for something unrenderable.
+    #[test]
+    fn behavior_fixture_leaves_a_zero_frame_geometry_unstated() {
+        let fixture = crate::MemoryBehaviorFixture::new(behavior_context_with_frames(0));
+        assert_eq!(fixture.context.geometry.frames, 0);
+        assert_eq!(fixture.request.frames, None);
+    }
+
     #[test]
     fn default_safety_check_rejects_mutated_calibration_handshake() {
         let contract = adopted_contract();

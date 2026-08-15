@@ -304,7 +304,10 @@ pub fn encode_reference_condition(
 ///
 /// Down, not up: padding a short reference would condition on frames that do not exist. This only
 /// bites when the reference is shorter than the target, whose own count already has that form.
-/// Returns at least [`crate::denoise::LEGAL_FRAME_COUNTS`]'s lattice base, `5`.
+///
+/// The floor is `n = 1`, i.e. **22** frames — not `5`. `n = 0` would ask the VAE for a chunkless
+/// clip, so the `max(1)` below is a floor rather than a clamp to the lattice's zeroth point, and the
+/// caller pairs this with `.min(frames.len())` so a shorter clip is never over-read.
 pub fn snap_reference_frames_down(num_frames: usize) -> usize {
     // `17n + 5` in the VAE's own terms: `frames_per_chunk = 17`, `latents_per_chunk = 5`.
     const FRAMES_PER_CHUNK: usize = 17;

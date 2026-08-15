@@ -13,8 +13,7 @@ use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, resolve_flow_schedule,
     ActivationMemoryAnchor, Capabilities, ConditioningKind, Error, FlowMatchEuler,
     GenerationOutput, GenerationRequest, Generator, LatentDecoder, LoadSpec, Modality,
-    ModelDescriptor, Precision, Progress, Quant, Residency, Result, SizeFloor, StagedHeavy,
-    WeightsSource,
+    ModelDescriptor, Precision, Progress, Quant, Residency, Result, StagedHeavy, WeightsSource,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidDecoder, PidEngine};
 use mlx_rs::Dtype;
@@ -73,11 +72,8 @@ pub fn descriptor() -> ModelDescriptor {
         modality: Modality::Image,
         capabilities: Capabilities {
             supported_quants: &[Quant::Q4, Quant::Q8],
-            component_precision_floors: &[],
             // Turbo is guidance-distilled: no CFG, no negative prompt.
             supports_negative_prompt: false,
-            supports_guidance: false,
-            supports_true_cfg: false,
             // img2img reference; ControlNet is a separate variant (sc-2349).
             conditioning: vec![ConditioningKind::Reference],
             supports_lora: true,
@@ -88,33 +84,14 @@ pub fn descriptor() -> ModelDescriptor {
             // Scheduler axis (epic 7114): the static-shift schedule is the byte-exact default (an unset
             // `req.scheduler`); a curated name re-shapes the σ schedule over the same `shift=3.0`.
             schedulers: curated_scheduler_names(),
-            supported_guidance_methods: vec![],
             min_size: 256,
             max_size: 2048,
             max_count: 8,
-            // Not a distilled fixed-schedule model: any step count the shared sanity caps
-            // admit is renderable (sc-19502).
-            supported_steps: Vec::new(),
             mac_only: true,
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
             // Wired onto the shared `Residency` seam; honors Sequential offload (F-176).
             supports_sequential_offload: true,
-            unconditionally_engages_staged_residency: false,
             supports_preview: true,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
+            ..Default::default()
         },
     }
 }

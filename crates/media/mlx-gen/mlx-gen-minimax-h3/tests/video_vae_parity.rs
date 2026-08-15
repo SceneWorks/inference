@@ -1050,16 +1050,33 @@ fn a_tile_geometry_the_latent_grid_cannot_express_is_refused() {
         "the error must say WHY: {msg}"
     );
 
-    // A misaligned OVERLAP, at an aligned tile.
+    // A misaligned OVERLAP, at an aligned tile. Asserted by MESSAGE for the same reason as the tile
+    // clause above (sc-19488): a 1 px overlap that reached the decode would fail anyway, downstream
+    // and for an unrelated reason, so `is_err()` alone is satisfied with the guard deleted and the
+    // probe is inert. `TilePlan::split` checks tile and overlap in ONE arm, so the message is shared
+    // — what distinguishes this clause from the tile clause is the geometry it passes, not the text.
+    let err = vae(3)
+        .decode_clip_tiled(latent, 4, 4, 1, 2)
+        .expect_err("a 1 px overlap is half a latent cell and must be refused");
+    let msg = err.to_string();
+    assert!(msg.contains("2x spatial compression ratio"), "{msg}");
     assert!(
-        vae(3).decode_clip_tiled(latent, 4, 4, 1, 2).is_err(),
-        "a 1 px overlap is half a latent cell and must be refused"
+        msg.contains("silently truncated"),
+        "the error must say WHY: {msg}"
     );
 
     // …and it reaches through `enable_tiling` / `decode_clip`, which is the surface a caller uses.
     let mut misaligned = vae(3);
     misaligned.enable_tiling(Some(3), Some(3), Some(2), Some(2));
-    assert!(misaligned.decode_clip(latent).is_err());
+    let msg = misaligned
+        .decode_clip(latent)
+        .expect_err("the guard must reach the public tiling surface")
+        .to_string();
+    assert!(
+        msg.contains("2x spatial compression ratio"),
+        "reached through enable_tiling/decode_clip this must still be the ALIGNMENT guard, not a \
+         downstream shape fault: {msg}"
+    );
 
     // The aligned geometry still decodes, so the guard rejects the misalignment and nothing else.
     assert!(vae(3).decode_clip_tiled(latent, 4, 4, 2, 2).is_ok());
