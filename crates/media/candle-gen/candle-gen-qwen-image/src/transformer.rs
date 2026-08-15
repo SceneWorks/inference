@@ -1638,7 +1638,8 @@ mod tests {
         let base_dit = QwenTransformer::new(&cfg, random_vb(7)).unwrap();
         let mut adapted = QwenTransformer::new(&cfg, random_vb(7)).unwrap();
         let spec = AdapterSpec::new(tmp.clone(), 1.0, AdapterKind::Lora);
-        let report = crate::adapters::install_additive(&mut adapted, &[spec]).unwrap();
+        let report =
+            crate::adapters::install_additive(&mut adapted, std::slice::from_ref(&spec)).unwrap();
         assert_eq!(
             report.applied, 2,
             "both projections must receive a residual"
@@ -1710,6 +1711,55 @@ mod tests {
             crate::adapters::install_additive(&mut dit2, &[miss_spec]).is_err(),
             "an all-miss adapter surface must error, not render unadapted"
         );
+
+        let mut stacked = QwenTransformer::new(&cfg, random_vb(7)).unwrap();
+        let error = crate::adapters::install_additive(
+            &mut stacked,
+            &[
+                spec.clone(),
+                AdapterSpec::new(miss.clone(), 1.0, AdapterKind::Lora),
+            ],
+        )
+        .expect_err("a valid first adapter must not hide a later zero-match selection");
+        assert!(error.to_string().contains(&miss.display().to_string()));
+
+        let lokr = miss_tmp.path().join("declared-lokr.safetensors");
+        let lokr_tensors = Map::from([
+            (
+                "transformer_blocks.0.attn.to_q.lokr_w1".to_string(),
+                Tensor::ones((inner, inner), DType::F32, &dev).unwrap(),
+            ),
+            (
+                "transformer_blocks.0.attn.to_q.lokr_w2".to_string(),
+                Tensor::ones((1, 1), DType::F32, &dev).unwrap(),
+            ),
+        ]);
+        safetensors::serialize_to_file(
+            lokr_tensors.into_iter().collect::<Vec<_>>(),
+            Some(Map::from([
+                ("networkType".to_string(), "lokr".to_string()),
+                ("rank".to_string(), "1".to_string()),
+                ("alpha".to_string(), "1".to_string()),
+            ])),
+            &lokr,
+        )
+        .unwrap();
+        let mut mismatch = QwenTransformer::new(&cfg, random_vb(7)).unwrap();
+        assert!(crate::adapters::install_additive(
+            &mut mismatch,
+            &[AdapterSpec::new(lokr, 1.0, AdapterKind::Lora)]
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("declared LoRA"));
+        let mut mismatch = QwenTransformer::new(&cfg, random_vb(7)).unwrap();
+        assert!(crate::adapters::install_additive(
+            &mut mismatch,
+            &[AdapterSpec::new(tmp.clone(), 1.0, AdapterKind::Lokr)]
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("declared LoKr"));
         std::fs::remove_file(&miss).ok();
     }
 

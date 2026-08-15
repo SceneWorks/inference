@@ -41,6 +41,9 @@ MACOS_HUB_LOCK = (
 WINDOWS_HUB_LOCK = (
     ".github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt"
 )
+WINDOWS_SCAIL_HUB_LOCK = (
+    ".github/requirements/real-weights-huggingface-hub-windows-x64-py314.txt"
+)
 WINDOWS_MAGE_LOCK = (
     ".github/requirements/real-weights-mage-verify-windows-x64-py312.txt"
 )
@@ -61,9 +64,20 @@ WINDOWS_UV_FIND = (
 )
 WINDOWS_PYTHON_EXPORT = 'echo REVIEWED_PYTHON=%REVIEWED_PYTHON%>>"%GITHUB_ENV%"'
 WINDOWS_INTERPRETER = r'"%REVIEWED_PYTHON%"'
+# sc-18804 pins every Windows real-weight job to the uv-managed reviewed CPython 3.12.10 so a
+# runner restart cannot swap the interpreter out from under a hash-locked requirements file.
+# `candle-scail2-shared` predates that convention: it provisions against the runner's OWN CPython
+# 3.14 under its own py314 hash lock, and hard-fails the job when the runner is not exactly
+# CPython 3.14 x64 (`test_scail2_shared_cuda_lane_is_exact_revision_provider_exercised_and_measured`
+# mutation-guards both the version assertion and the lock). That is a different answer to the same
+# hazard, not an absence of one, so it is recorded here as a named exception rather than silently
+# tolerated. `windows_reviewed_interpreter_exemption_errors` below re-proves the exempt job still
+# carries its own pinning, so the exemption cannot decay into an unpinned job.
+WINDOWS_REVIEWED_INTERPRETER_EXEMPT_JOBS = {"candle-scail2-shared"}
 APPROVED_REAL_WEIGHT_LOCKS = {
     MACOS_HUB_LOCK,
     WINDOWS_HUB_LOCK,
+    WINDOWS_SCAIL_HUB_LOCK,
     WINDOWS_MAGE_LOCK,
     MACOS_MAGE_LOCK,
 }
@@ -331,6 +345,70 @@ def real_weight_macos_interpreter_errors(workflow: str) -> list[str]:
     return errors
 
 
+def windows_reviewed_interpreter_exemption_errors(job: str, lines: list[str]) -> list[str]:
+    """Re-prove that an exempt Windows job still pins its own interpreter.
+
+    The exemption in ``WINDOWS_REVIEWED_INTERPRETER_EXEMPT_JOBS`` is a recorded exception, not a
+    hole: an exempt job must still (a) refuse the registry-dependent ``setup-python``, (b) assert
+    the exact interpreter it was hash-locked against and abort when the runner does not match, and
+    (c) terminate the job on a failed hash-locked install. Delete any of those and this fails, so
+    the exemption cannot quietly decay into an unpinned job.
+    """
+    errors: list[str] = []
+    body = "\n".join(lines)
+    if any(
+        re.search(r"\buses:\s*actions/setup-python@", line.split("#", 1)[0])
+        for line in lines
+    ):
+        errors.append(
+            f"{job}: Windows jobs must not invoke the registry-dependent setup-python"
+        )
+    if not re.search(r"sys\.version_info|platform\.python_version\(\)", body):
+        errors.append(
+            f"{job}: an exempt Windows job must assert its exact interpreter version"
+        )
+    if not re.search(r"platform\.machine\(\)", body):
+        errors.append(
+            f"{job}: an exempt Windows job must assert its exact interpreter architecture"
+        )
+    # The abort has to live in the SAME step as the interpreter assertion. Checking the whole job
+    # would be satisfied by any unrelated `exit /b 1` — the Git Bash selection carries one — which
+    # would let the validation step be gutted while this still passed.
+    step_boundary = re.compile(r"^      - ")
+    validation_starts = [
+        index
+        for index, line in enumerate(lines)
+        if re.search(r"sys\.version_info|platform\.python_version\(\)", line)
+    ]
+    for start in validation_starts:
+        step_start = start
+        while step_start > 0 and not step_boundary.match(lines[step_start]):
+            step_start -= 1
+        step_end = start + 1
+        while step_end < len(lines) and not step_boundary.match(lines[step_end]):
+            step_end += 1
+        step = "\n".join(lines[step_start:step_end])
+        if not re.search(r"\bthrow\b|exit /b 1|exit \$LASTEXITCODE", step):
+            errors.append(
+                f"{job}: an exempt Windows job must abort when its interpreter check fails"
+            )
+    if not validation_starts:
+        errors.append(
+            f"{job}: an exempt Windows job must abort when its interpreter check fails"
+        )
+    for line in lines:
+        command = line.split("#", 1)[0]
+        if not re.search(r"\s-m\s+pip\s+install\b", command, re.IGNORECASE):
+            continue
+        if "--require-hashes" not in command:
+            errors.append(f"{job}: exempt install must stay hash-locked: {command.strip()!r}")
+    if re.search(r"-m\s+pip\s+install", body, re.IGNORECASE) and not re.search(
+        r"\$LASTEXITCODE -ne 0|\|\|\s+exit /b 1", body
+    ):
+        errors.append(f"{job}: exempt install must terminate the job on failure")
+    return errors
+
+
 def real_weight_windows_interpreter_errors(workflow: str) -> list[str]:
     """Pin every Windows real-weight Python command to the reviewed CPython 3.12.
 
@@ -341,6 +419,10 @@ def real_weight_windows_interpreter_errors(workflow: str) -> list[str]:
     producer and consumer, not only pip: mixing interpreters around a shared ``PYTHONPATH`` is
     equally unsafe. ``cmd`` also continues after a failed command, so every hash-locked install must
     explicitly terminate the step.
+
+    Jobs in ``WINDOWS_REVIEWED_INTERPRETER_EXEMPT_JOBS`` answer the same hazard with their own
+    hard interpreter validation instead; they are checked by
+    ``windows_reviewed_interpreter_exemption_errors`` rather than skipped outright.
     """
     errors: list[str] = []
     interpreter = re.compile(
@@ -357,6 +439,9 @@ def real_weight_windows_interpreter_errors(workflow: str) -> list[str]:
     for job, lines in workflow_job_bodies(workflow).items():
         runs_on = next((line for line in lines if line.startswith("    runs-on:")), "")
         if "windows" not in runs_on.lower():
+            continue
+        if job in WINDOWS_REVIEWED_INTERPRETER_EXEMPT_JOBS:
+            errors.extend(windows_reviewed_interpreter_exemption_errors(job, lines))
             continue
         setup_indices = [
             index
@@ -475,7 +560,14 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
     if not pip_lines:
         return ["real-weight workflow has no pip commands"]
 
-    install_lines: list[tuple[int, str, re.Match[str]]] = []
+    install_lines: list[tuple[int, str, str | None, re.Match[str]]] = []
+    current_job: str | None = None
+    job_at_line: dict[int, str | None] = {}
+    for line_number, line in enumerate(workflow.splitlines(), start=1):
+        job_match = re.fullmatch(r"  ([A-Za-z0-9_-]+):", line)
+        if job_match is not None:
+            current_job = job_match.group(1)
+        job_at_line[line_number] = current_job
     for line_number, command in pip_lines:
         first_pip = pip_token.search(command)
         assert first_pip is not None
@@ -486,10 +578,10 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
                 "single-line install"
             )
             continue
-        install_lines.append((line_number, command, match))
+        install_lines.append((line_number, command, job_at_line[line_number], match))
 
     locks_seen: list[str] = []
-    for line_number, command, install_match in install_lines:
+    for line_number, command, job, install_match in install_lines:
         prefix = f"line {line_number}"
         for required_flag in ("--only-binary=:all:", "--require-hashes"):
             if required_flag not in command:
@@ -515,6 +607,13 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
             expected_lock = MACOS_HUB_LOCK
         elif f"{WINDOWS_INTERPRETER} -m pip" in command:
             expected_lock = WINDOWS_HUB_LOCK
+        elif "python -m pip" in command:
+            # Only the SCAIL-2 shared-package job is allowed to reach the runner's own CPython;
+            # see WINDOWS_REVIEWED_INTERPRETER_EXEMPT_JOBS. Any other job spelling it this way
+            # has no expected lock and fails below.
+            expected_lock = (
+                WINDOWS_SCAIL_HUB_LOCK if job == "candle-scail2-shared" else None
+            )
         if expected_lock != lock:
             errors.append(
                 f"{prefix}: install target expects {expected_lock}, got {lock}"
@@ -548,6 +647,7 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
         # MOSS-TTS-Realtime jobs; 22 before).
         MACOS_HUB_LOCK: 33,
         WINDOWS_HUB_LOCK: 10,
+        WINDOWS_SCAIL_HUB_LOCK: 1,
         WINDOWS_MAGE_LOCK: 1,
         MACOS_MAGE_LOCK: 1,
     }
@@ -799,6 +899,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertEqual(real_weight_pip_policy_errors(workflow), [])
         self.assertEqual(workflow.count(MACOS_HUB_LOCK), 33)
         self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 10)
+        self.assertEqual(workflow.count(WINDOWS_SCAIL_HUB_LOCK), 1)
         self.assertEqual(workflow.count(WINDOWS_MAGE_LOCK), 1)
         self.assertNotRegex(
             workflow,
@@ -987,6 +1088,39 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         )
         self.assertTrue(real_weight_windows_interpreter_errors(wrong_version_comment_decoy))
 
+    def test_windows_reviewed_interpreter_exemption_still_requires_its_own_pinning(self) -> None:
+        """The sc-18804 exemption for `candle-scail2-shared` must not be a blank hole.
+
+        The exempt job answers the same hazard its own way — it hard-validates the runner's
+        CPython 3.14 x64 and installs from a matching py314 hash lock. Each of those properties is
+        mutated ONE AT A TIME: mutating them together would only prove the set is load-bearing,
+        not that any individual member is.
+        """
+        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        self.assertEqual(real_weight_windows_interpreter_errors(workflow), [])
+        bodies = workflow_job_bodies(workflow)
+        for job in WINDOWS_REVIEWED_INTERPRETER_EXEMPT_JOBS:
+            self.assertIn(job, bodies, f"exempt job {job} no longer exists — drop the exemption")
+            lines = bodies[job]
+            self.assertEqual(windows_reviewed_interpreter_exemption_errors(job, lines), [])
+            mutations = {
+                "version assertion dropped": ("platform.python_version()", "'3.14.0'"),
+                "architecture assertion dropped": ("platform.machine()", "'AMD64'"),
+                "hash lock dropped": ("--require-hashes", ""),
+                "failure no longer aborts": ("throw ", "Write-Host "),
+                "registry setup-python reintroduced": (
+                    "- uses: dtolnay/rust-toolchain@",
+                    "- uses: actions/setup-python@v5\n      - uses: dtolnay/rust-toolchain@",
+                ),
+            }
+            for mutation, (needle, replacement) in mutations.items():
+                with self.subTest(job=job, mutation=mutation):
+                    mutated = [line.replace(needle, replacement) for line in lines]
+                    self.assertNotEqual(mutated, lines, f"{mutation} changed nothing")
+                    self.assertTrue(
+                        windows_reviewed_interpreter_exemption_errors(job, mutated)
+                    )
+
     def test_real_weight_macos_interpreter_policy_discriminates_mutations(self) -> None:
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
         mutations = {
@@ -1102,6 +1236,12 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             ),
             HUB_LOCK_PACKAGES | {"colorama"},
         )
+        scail_windows = validate_binary_hashed_lock(
+            (REAL_WEIGHT_REQUIREMENTS / Path(WINDOWS_SCAIL_HUB_LOCK).name).read_text(
+                encoding="utf-8"
+            ),
+            HUB_LOCK_PACKAGES | {"colorama"},
+        )
         mage = validate_binary_hashed_lock(
             (REAL_WEIGHT_REQUIREMENTS / Path(WINDOWS_MAGE_LOCK).name).read_text(
                 encoding="utf-8"
@@ -1110,8 +1250,17 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         )
         self.assertEqual(macos["huggingface-hub"][0], "1.20.1")
         self.assertEqual(windows["huggingface-hub"][0], "1.20.1")
+        self.assertEqual(scail_windows["huggingface-hub"][0], "1.20.1")
+        self.assertEqual(scail_windows["hf-xet"][0], "1.6.0")
+        self.assertEqual(scail_windows["packaging"][0], "26.3")
         self.assertNotEqual(macos["hf-xet"][1], windows["hf-xet"][1])
         self.assertNotEqual(macos["pyyaml"][1], windows["pyyaml"][1])
+        self.assertNotEqual(windows["pyyaml"][1], scail_windows["pyyaml"][1])
+        scail_lock = (
+            REAL_WEIGHT_REQUIREMENTS / Path(WINDOWS_SCAIL_HUB_LOCK).name
+        ).read_text(encoding="utf-8")
+        self.assertIn("--platform win_amd64 --python-version 3.14", scail_lock)
+        self.assertIn("--implementation cp --abi cp314", scail_lock)
 
     def test_real_weight_lock_policy_discriminates_mutations(self) -> None:
         lock = (REAL_WEIGHT_REQUIREMENTS / Path(MACOS_HUB_LOCK).name).read_text(
@@ -2086,6 +2235,133 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("verifier-result.txt", job)
         self.assertIn("memory-evidence-v1-z-image-${{ github.sha }}", job)
 
+    def test_scail2_shared_cuda_lane_is_exact_revision_provider_exercised_and_measured(self) -> None:
+        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        start = workflow.index("  candle-scail2-shared:")
+        end = workflow.index("\n  candle-media:", start)
+        job = workflow[start:end]
+
+        self.assertIn("scail2", workflow.split("jobs:", 1)[0])
+        self.assertIn(
+            "if: github.event_name == 'workflow_dispatch' && inputs.profile == 'scail2'",
+            job,
+        )
+        self.assertNotIn("github.event_name == 'schedule'", job)
+        self.assertIn('SCAIL2_REPOSITORY: "SceneWorks/scail2-mlx"', job)
+        self.assertIn(
+            'SCAIL2_REVISION: "ce88cfdb1008f395e9c820e525e6db7b6695f7b3"', job
+        )
+        self.assertIn('allow_patterns=["bf16/**"]', job)
+        self.assertIn("models--SceneWorks--scail2-mlx", job)
+        git_bash = job.index("Select Git Bash")
+        validate_python = job.index("Validate runner-provisioned CPython 3.14 x64")
+        toolchain = job.index("uses: dtolnay/rust-toolchain@")
+        initialize_evidence = job.index("Initialize exact SCAIL CUDA evidence")
+        provision = job.index("Provision the exact public shared bf16 package")
+        self.assertLess(git_bash, toolchain)
+        self.assertLess(git_bash, initialize_evidence)
+        self.assertLess(initialize_evidence, validate_python)
+        self.assertLess(validate_python, toolchain)
+        self.assertLess(validate_python, provision)
+        self.assertLess(initialize_evidence, provision)
+        self.assertIn(r'C:\Program Files\Git\bin\bash.exe', job)
+        self.assertNotIn("actions/setup-python@", job)
+        self.assertNotIn("py -3.12", job)
+        self.assertIn("sys.implementation.name", job)
+        self.assertIn("platform.python_version()", job)
+        self.assertIn("platform.machine()", job)
+        self.assertIn("struct.calcsize('P') * 8", job)
+        self.assertIn("$python -notmatch '\\|cpython\\|3\\.14\\.\\d+\\|AMD64\\|64$'", job)
+        self.assertIn(WINDOWS_SCAIL_HUB_LOCK, job)
+        self.assertNotIn(WINDOWS_HUB_LOCK, job)
+        for required in (
+            "config.json",
+            "dit.safetensors",
+            "t5_encoder.safetensors",
+            "tokenizer.json",
+            "clip.safetensors",
+            "vae.safetensors",
+        ):
+            self.assertIn(required, job)
+        self.assertIn(
+            "pipeline::tests::shared_bf16_real_weights_cuda_loads_and_renders_with_measured_peak",
+            job,
+        )
+        self.assertIn("Load through the production provider", job)
+        self.assertIn("[[SCAIL2_CUDA_VRAM]]", job)
+        self.assertIn("-- --ignored --exact --nocapture", job)
+        self.assertIn('"provision_status=validating_python"', job)
+        self.assertIn('"provision_status=complete"', job)
+        # Windows PowerShell 5.1 promotes a successful native command's stderr
+        # (including Cargo build warnings) to NativeCommandError under Actions'
+        # stop-on-error wrapper. Keep PowerShell evidence capture on its valid
+        # FilePath parameter set, but run the Cargo profile through the selected
+        # Git Bash with pipefail so warnings are logged and real failures still
+        # propagate through tee.
+        profile_start = job.index(
+            "- name: Load through the production provider, minimally render, and measure the shared package"
+        )
+        profile_end = job.index("- name: Upload exact SCAIL CUDA evidence", profile_start)
+        profile = job[profile_start:profile_end]
+        self.assertIn("shell: bash", profile)
+        self.assertIn("set -o pipefail", profile)
+        self.assertIn(
+            'evidence_log="$(cygpath -u "$RUNNER_TEMP")/scail2-shared-cuda.log"',
+            profile,
+        )
+        self.assertIn('export PATH="$(cygpath -u "$CUDA_PATH")/bin:$PATH"', profile)
+        self.assertIn("cargo test --locked --release", profile)
+        self.assertIn('tee -a "$evidence_log"', profile)
+        self.assertNotIn("shell: powershell", profile)
+        self.assertNotIn("Tee-Object", profile)
+
+        def idle_evidence_errors(value: str) -> list[str]:
+            errors = []
+            for required in (
+                'profile_gpu="${CUDA_VISIBLE_DEVICES%%,*}"',
+                'profile_gpu="${profile_gpu:-0}"',
+                '[[CUDA_IDLE_RAW]] profileGpu=$profile_gpu',
+                "--query-gpu=index,name,driver_version,pstate,utilization.gpu,memory.used,memory.total",
+                "for _ in 1 2 3 4 5 6; do",
+                'nvidia-smi pmon -i "$profile_gpu" -c 1 -s um',
+            ):
+                if required not in value:
+                    errors.append(f"missing {required}")
+            if value.count('-i "$profile_gpu"') != 3:
+                errors.append("every raw GPU query must use the rendered physical ordinal")
+            return errors
+
+        self.assertEqual(idle_evidence_errors(profile), [])
+        for mutation, changed in {
+            "missing raw samples": profile.replace("for _ in 1 2 3 4 5 6; do", "for _ in 1; do"),
+            "missing process evidence": profile.replace(
+                'nvidia-smi pmon -i "$profile_gpu" -c 1 -s um', "echo pmon-omitted"
+            ),
+            "wrong process GPU": profile.replace(
+                'nvidia-smi pmon -i "$profile_gpu"', 'nvidia-smi pmon -i "0"'
+            ),
+            "missing evidence marker": profile.replace("[[CUDA_IDLE_RAW]]", "[[CUDA_IDLE_OMITTED]]"),
+        }.items():
+            with self.subTest(idle_evidence_mutation=mutation):
+                self.assertTrue(idle_evidence_errors(changed))
+        self.assertEqual(job.count("Tee-Object -FilePath $log -Append"), 3)
+        self.assertNotIn("Tee-Object -LiteralPath $log -Append", job)
+        self.assertIn("actions/upload-artifact@", job)
+        self.assertIn("scail2-shared-cuda-${{ github.sha }}", job)
+
+        for name, mutated_job in {
+            "py312 lock substitution": job.replace(
+                WINDOWS_SCAIL_HUB_LOCK, WINDOWS_HUB_LOCK, 1
+            ),
+            "shared macOS lock substitution": job.replace(
+                WINDOWS_SCAIL_HUB_LOCK, MACOS_HUB_LOCK, 1
+            ),
+            "unhashed install": job.replace(" --require-hashes", "", 1),
+        }.items():
+            with self.subTest(mutation=name):
+                mutated = workflow[:start] + mutated_job + workflow[end:]
+                self.assertTrue(real_weight_pip_policy_errors(mutated))
+
     def test_sana_drift_ceiling_lane_is_operator_dispatched_and_keeps_its_evidence(self) -> None:
         """sc-18249: the SANA 6.0 drift ceiling must be enforced by a lane a workflow can run.
 
@@ -2825,6 +3101,18 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                         head_repository=head_repository,
                     ),
                     expected,
+                )
+
+    def test_windows_cuda_jobs_cap_cargo_parallelism_for_shared_host(self) -> None:
+        jobs = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]
+
+        for job_name in ("windows-cuda-check", "windows-cuda"):
+            with self.subTest(job=job_name):
+                self.assertEqual(
+                    jobs[job_name]["env"].get("CARGO_BUILD_JOBS"),
+                    "12",
+                    "both Windows CUDA listeners share one 48-thread host; an uncapped Cargo "
+                    "process on each listener can overwhelm Windows with rustc launches",
                 )
 
     def test_merge_queue_speculative_ref_can_reach_the_workflow(self) -> None:

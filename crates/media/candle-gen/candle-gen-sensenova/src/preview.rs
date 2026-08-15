@@ -62,10 +62,11 @@
 //!   ever the running image, so there is no unconditional half to project.
 //! * **Text tokens never reach a frame.** The prompt lives entirely in the prefilled KV cache; the
 //!   running state is the image grid alone.
-//! * **The it2i / interleave loop is not wired.** [`crate::T2iModel`]'s second denoise
-//!   (`it2i_denoise`, reached only through [`crate::T2iModel::interleave_gen`]) is the off-registry
-//!   understanding surface, is not advertised by either descriptor, and is out of scope for sc-16960
-//!   — the edit path is known-corrupted. It emits nothing, deliberately.
+//! * **The registered it2i path shares this projector.** Its running state has the same pixel-space
+//!   layout as txt2img and forwards the request hook into the shared dual-guidance loop. The direct
+//!   preview-aware interleave API takes a caller-supplied hook too. Its source-compatible legacy
+//!   wrapper deliberately supplies an inert hook because that older API has no preview carrier; this
+//!   never replaces the registered request's sink.
 //!
 //! A stale or absent fit degrades preview colour only; the denoise path never reads these constants.
 
@@ -259,6 +260,21 @@ pub(crate) fn t2i_hook(sink: &PreviewSink, cell: usize) -> PreviewHook<'_> {
     PreviewHook::new(sink, move |image: &Tensor| {
         project_running_image(image, cell)
     })
+}
+
+/// Run a direct, off-registry operation with an inert SenseNova preview hook.
+///
+/// [`crate::T2iModel::interleave_gen`] predates preview support and must preserve its public source
+/// signature. Keeping the inert sink construction here lets that compatibility wrapper delegate to
+/// [`crate::T2iModel::interleave_gen_with_preview`] without teaching `t2i.rs` how to construct or
+/// replace preview plumbing on the registered request path.
+pub(crate) fn with_inert_t2i_preview<T>(
+    cell: usize,
+    run: impl FnOnce(&PreviewHook<'_>) -> Result<T>,
+) -> Result<T> {
+    let sink = PreviewSink::default();
+    let preview = t2i_hook(&sink, cell);
+    run(&preview)
 }
 
 #[cfg(test)]
@@ -663,11 +679,40 @@ mod tests {
         source.lines().filter(|line| line.trim() == WANT).count()
     }
 
+    #[test]
+    fn legacy_interleave_signature_delegates_to_the_preview_aware_method() {
+        let t2i = shipped_t2i();
+        let legacy_at = t2i.find("    pub fn interleave_gen(").unwrap();
+        let preview_at = t2i.find("    pub fn interleave_gen_with_preview(").unwrap();
+        let wrapper = &t2i[legacy_at..preview_at];
+        let legacy_signature = wrapper
+            .split_once(") -> Result<InterleaveOutput>")
+            .expect("legacy interleave_gen declaration must end at its return type")
+            .0;
+
+        assert!(
+            !legacy_signature.contains("PreviewHook") && !legacy_signature.contains("preview:"),
+            "the legacy interleave_gen signature must remain callable without a preview argument"
+        );
+        assert_eq!(
+            wrapper
+                .matches("crate::preview::with_inert_t2i_preview(")
+                .count(),
+            1,
+            "legacy interleave_gen must build its inert compatibility hook only through preview.rs"
+        );
+        assert_eq!(
+            wrapper.matches("self.interleave_gen_with_preview(").count(),
+            1,
+            "legacy interleave_gen must delegate exactly once to the preview-aware implementation"
+        );
+    }
+
     /// **The whole hook path, guarded.** The registered lane builds its hook over the *request's* sink
     /// and every hop between that sink and the emission carries it as a non-`Option` reference.
     ///
     /// Both halves are load-bearing and neither implies the other. `candle-gen-catalog`'s
-    /// `preview_advertising` inventory can only see that `t2i.rs` makes one direct emission call — it
+    /// `preview_advertising` inventory can only see that `t2i.rs` makes direct emission calls — it
     /// cannot see what sink reached it, and there is no shared-driver argument to classify because
     /// this crate drives no shared sampler at all. sc-16958 and sc-16959 each showed a reviewer taking
     /// a family's lanes dark with the full CPU suite green:
@@ -794,7 +839,13 @@ mod tests {
         }
 
         // Every hop takes the hook by non-`Option` reference, counted by whole line.
-        for declaration in ["    pub fn generate(", "    fn denoise("] {
+        for declaration in [
+            "    pub fn generate(",
+            "    pub fn it2i_generate(",
+            "    fn denoise(",
+            "    fn it2i_denoise(",
+            "    pub fn interleave_gen_with_preview(",
+        ] {
             assert_eq!(
                 preview_parameter(t2i, declaration),
                 WANT,
@@ -805,9 +856,9 @@ mod tests {
         }
         assert_eq!(
             hook_parameters(t2i),
-            2,
-            "`generate` and `denoise` must both take `&PreviewHook` under that exact name — a hop \
-             renamed `_preview:` is one that no longer uses it"
+            5,
+            "the registered txt2img and it2i routes plus interleave must carry `&PreviewHook` under \
+             that exact name — a hop renamed `_preview:` is one that no longer uses it"
         );
     }
 
@@ -890,7 +941,7 @@ mod tests {
         }
     }
 
-    /// The bespoke loop emits **exactly once**, keyed on the loop's own 0-based step index, over a
+    /// Each bespoke loop emits **exactly once**, keyed on its own 0-based step index, over a
     /// counter built from the very step count the loop iterates and `Progress::Step` reports.
     ///
     /// This crate drives no shared sampler, so there is no call-site argument to inspect; the
@@ -898,12 +949,12 @@ mod tests {
     /// `Denoise::Bespoke` row declares. The needle is assembled at compile time so this scan does not
     /// match its own source.
     #[test]
-    fn the_bespoke_denoise_loop_emits_exactly_once_per_step() {
+    fn both_bespoke_denoise_loops_emit_exactly_once_per_step() {
         let t2i = shipped_t2i();
         assert_eq!(
             t2i.matches(concat!(".emit", "_step(")).count(),
-            1,
-            "the bespoke loop must make exactly one direct emission call"
+            2,
+            "the txt2img and it2i loops must each make exactly one direct emission call"
         );
         assert!(
             t2i.contains("preview.emit_step(&preview_counter, i, &image);"),
@@ -913,14 +964,13 @@ mod tests {
             t2i.contains(concat!("PreviewCounter::", "with_steps(steps)")),
             "the counter must be step-index keyed over the loop's own step count"
         );
-        // The it2i / interleave loop is the crate's OTHER denoise and is deliberately unwired.
+        // The it2i / interleave loop is the crate's other denoise and must use the same forwarded hook.
         let it2i = t2i
             .find("fn it2i_denoise(")
             .expect("the understanding-surface loop must still exist");
         assert!(
-            !t2i[it2i..].contains("preview"),
-            "the it2i / interleave loop is the off-registry understanding surface and is out of \
-             scope for sc-16960 — it must emit nothing"
+            t2i[it2i..].contains("preview.emit_step(&preview_counter, i, &image);"),
+            "the it2i loop must emit through the caller's forwarded hook"
         );
         // No shared sampler anywhere in the crate: the fact that makes this crate Denoise::Bespoke.
         for (file, code) in [

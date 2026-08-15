@@ -45,7 +45,8 @@ use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::{
-    GenerationMemory, Image, LoadPhase, PidWeights, PreviewSink, Progress, WeightsSource,
+    AdapterSpec, GenerationMemory, Image, LoadPhase, PidWeights, PreviewSink, Progress,
+    WeightsSource,
 };
 use candle_gen::{CandleError, Result};
 use candle_gen_pid::{PidDecoder, PidEngine};
@@ -149,6 +150,9 @@ pub struct ZImageControlPaths {
     /// The Fun-Controlnet-Union checkpoint — a single `.safetensors` file or a dir containing it
     /// (`Z-Image-Turbo-Fun-Controlnet-Union-2.1` for Turbo, `Z-Image-Fun-Controlnet-Union-2.1` for base).
     pub control: PathBuf,
+    /// User-selected LoRA/LoKr stack applied to the base Z-Image transformer before the VACE
+    /// control branch is composed. The control checkpoint itself is never an adapter target.
+    pub adapters: Vec<AdapterSpec>,
     /// Select the **base** (undistilled, full-CFG) treatment (sc-8680): shift-6.0 scheduler,
     /// ~50-step default, and real classifier-free guidance in the control denoise (the candle sibling of
     /// `mlx-gen-z-image::model_base_control`). `false` = the original distilled Turbo path (no CFG,
@@ -689,11 +693,11 @@ impl ZImageControl {
                     .to_owned(),
             ));
         }
-        if !spec.adapters.is_empty() {
-            return Err(CandleError::Msg(
-                "z-image control does not apply LoRA or LoKr adapters".to_owned(),
-            ));
-        }
+        // NOTE: adapters are deliberately NOT rejected here. sc-18477 wired the ordered LoRA/LoKr
+        // stack through `ZImageControlPaths::adapters` -> `control_pipeline` ->
+        // `Pipeline::load_transformer`, which installs them additively over the base DiT before the
+        // VACE branch composes. Rejecting them on this route while the direct `load` route applies
+        // them would make the same request succeed or fail purely on which entry point was used.
         if !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() || spec.identity.is_some() {
             return Err(CandleError::Msg(
                 "z-image control accepts exactly one control overlay and no IP-adapter or identity weights"
@@ -719,6 +723,7 @@ impl ZImageControl {
                     snapshot: paths.snapshot.clone(),
                     text_encoder: spec.text_encoder.clone(),
                     control,
+                    adapters: spec.adapters.clone(),
                     base: paths.base,
                 },
                 memory,
@@ -1453,7 +1458,7 @@ fn control_pipeline(paths: &ZImageControlPaths, device: &Device) -> Result<Pipel
         validated,
         device,
         DTYPE,
-        &[],
+        &paths.adapters,
         None,
     ))
 }
@@ -1575,6 +1580,7 @@ mod tests {
             snapshot: "/z-image".into(),
             text_encoder: None,
             control: "/control.safetensors".into(),
+            adapters: Vec::new(),
             base: false,
         };
         let base = || {
@@ -1584,13 +1590,11 @@ mod tests {
 
         let mut identity = base();
         identity.identity = Some(candle_gen::gen_core::IdentityWeights::default());
+        // `with_adapters` is deliberately absent from this list: sc-18477 implemented the additive
+        // LoRA/LoKr stack on this provider, so an adapter-bearing spec is now a SUPPORTED axis and
+        // is covered by `strict_control_pipeline_preserves_the_ordered_base_adapter_stack` below.
         let unsupported = [
             base().with_quant(candle_gen::gen_core::Quant::Q4),
-            base().with_adapters(vec![candle_gen::gen_core::AdapterSpec::new(
-                "/adapter.safetensors".into(),
-                1.0,
-                candle_gen::gen_core::AdapterKind::Lora,
-            )]),
             base().with_extra_control(WeightsSource::File("/extra.safetensors".into())),
             base().with_ip_adapter(WeightsSource::File("/ip.safetensors".into())),
             identity,
@@ -1641,6 +1645,7 @@ mod tests {
                 snapshot: root,
                 text_encoder: None,
                 control,
+                adapters: Vec::new(),
                 base: false,
             },
             &spec,
@@ -1661,6 +1666,53 @@ mod tests {
             error.contains("receipt changed") || error.contains("pinned weights"),
             "unexpected mutation error: {error}"
         );
+    }
+
+    #[test]
+    fn strict_control_pipeline_preserves_the_ordered_base_adapter_stack() {
+        use candle_gen::gen_core::AdapterKind;
+
+        let adapters = vec![
+            AdapterSpec::new(
+                PathBuf::from("pose-style.safetensors"),
+                0.4,
+                AdapterKind::Lora,
+            ),
+            AdapterSpec::new(
+                PathBuf::from("identity.safetensors"),
+                0.9,
+                AdapterKind::Lokr,
+            ),
+        ];
+        // "Weight-free" no longer means "path-free": `control_pipeline` admits the bundled encoder
+        // against `ENCODER_CONTRACT` before it builds the base, so the snapshot needs the same
+        // `text_encoder` fixture the sibling construction tests use. The control overlay and the
+        // adapter files stay unwritten, which is what keeps the assertion weight-free.
+        let snapshot = tempfile::tempdir().unwrap();
+        gen_core_testkit::write_encoder_contract_fixture(
+            &snapshot.path().join("text_encoder"),
+            crate::ENCODER_CONTRACT,
+        )
+        .unwrap();
+        let paths = ZImageControlPaths {
+            snapshot: snapshot.path().to_path_buf(),
+            text_encoder: None,
+            control: PathBuf::from("control.safetensors"),
+            adapters: adapters.clone(),
+            base: false,
+        };
+
+        // Both resident `load` and staged `load_with_memory` construct their base through this single
+        // seam. Keeping the assertion weight-free catches either route regressing to an empty stack.
+        let pipeline = control_pipeline(&paths, &Device::Cpu)
+            .expect("a bundled encoder needs no override validation");
+        assert_eq!(pipeline.adapter_specs().len(), 2);
+        assert_eq!(pipeline.adapter_specs()[0].path, adapters[0].path);
+        assert_eq!(pipeline.adapter_specs()[0].scale, 0.4);
+        assert_eq!(pipeline.adapter_specs()[0].kind, AdapterKind::Lora);
+        assert_eq!(pipeline.adapter_specs()[1].path, adapters[1].path);
+        assert_eq!(pipeline.adapter_specs()[1].scale, 0.9);
+        assert_eq!(pipeline.adapter_specs()[1].kind, AdapterKind::Lokr);
     }
 
     #[test]
@@ -1690,6 +1742,7 @@ mod tests {
             snapshot: snapshot.path().to_path_buf(),
             text_encoder: Some(WeightsSource::Dir(encoder.path().to_path_buf())),
             control: snapshot.path().join("control.safetensors"),
+            adapters: Vec::new(),
             base: false,
         };
         let pipeline = control_pipeline(&paths, &Device::Cpu).expect("valid override");
@@ -1714,6 +1767,7 @@ mod tests {
             snapshot: snapshot.path().to_path_buf(),
             text_encoder: Some(WeightsSource::Dir(encoder.path().to_path_buf())),
             control: snapshot.path().join("control.safetensors"),
+            adapters: Vec::new(),
             base: false,
         };
         let error = control_pipeline(&paths, &Device::Cpu)

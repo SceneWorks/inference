@@ -1582,11 +1582,13 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             // The Lens schedule computes its own empirical-μ shift internally (not a loader hint).
             requires_sigma_shift: false,
             supports_sequential_offload: true,
+            unconditionally_engages_staged_residency: false,
             // Per-step latent previews (epic 16948, sc-16955). Lens denoises the FLUX.2 32-channel
             // latent space in the same packed token layout, and loads a VAE whose 250 learned tensors
             // round exactly onto the fit donor's — so both render lanes hand the shared sampler a
             // `candle_gen_flux2::preview` hook and no fit of its own is introduced.
             supports_preview: true,
+            supports_prompt_enhancement: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,

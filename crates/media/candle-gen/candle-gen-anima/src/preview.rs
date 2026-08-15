@@ -791,6 +791,7 @@ mod tests {
             ("rope.rs", include_str!("rope.rs")),
             ("text_encoder.rs", include_str!("text_encoder.rs")),
             ("tokenizer.rs", include_str!("tokenizer.rs")),
+            ("training.rs", include_str!("training.rs")),
             ("transformer.rs", include_str!("transformer.rs")),
             ("vae.rs", include_str!("vae.rs")),
         ] {
@@ -833,6 +834,7 @@ mod tests {
                 "rope.rs",
                 "text_encoder.rs",
                 "tokenizer.rs",
+                "training.rs",
                 "transformer.rs",
                 "vae.rs",
             ],

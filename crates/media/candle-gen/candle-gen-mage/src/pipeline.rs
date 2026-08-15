@@ -9,7 +9,7 @@ use crate::config::LATENT_CHANNELS;
 use crate::rope::{ImgShape, PackLayout};
 use crate::scheduler;
 use crate::{MageComponentDirs, MageConfig, MageTextEncoder, MageTransformer, MageVae};
-use candle_gen::gen_core::{GenerationMemory, Quant};
+use candle_gen::gen_core::{AdapterSpec, GenerationMemory, Quant};
 
 pub(crate) struct MageEncoded {
     positive: Tensor,
@@ -33,16 +33,23 @@ impl MagePipeline {
     }
 
     pub fn load_with_quant(root: &Path, quant: Option<Quant>, device: &Device) -> Result<Self> {
-        Self::load_components(&MageComponentDirs::flat(root), quant, device)
+        Self::load_components(&MageComponentDirs::flat(root), quant, device, &[])
     }
 
     pub(crate) fn load_components(
         dirs: &MageComponentDirs,
         quant: Option<Quant>,
         device: &Device,
+        adapters: &[AdapterSpec],
     ) -> Result<Self> {
         let cfg_text = std::fs::read_to_string(dirs.transformer.join("config.json"))?;
         let cfg = MageConfig::from_json(&cfg_text)?;
+        let mut transformer =
+            MageTransformer::load_with_quant(&dirs.transformer, &cfg, quant, device)?;
+        candle_gen::quant::install_dotted_adapters("mage", adapters, device, |visitor| {
+            transformer.visit_adaptable_mut(visitor)
+        })
+        .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
         Ok(Self {
             text: MageTextEncoder::load_component_with_quant(
                 &dirs.text_encoder,
@@ -50,7 +57,7 @@ impl MagePipeline {
                 quant,
                 device,
             )?,
-            transformer: MageTransformer::load_with_quant(&dirs.transformer, &cfg, quant, device)?,
+            transformer,
             vae: MageVae::load(&dirs.vae, device)?,
         })
     }
@@ -69,14 +76,24 @@ impl MagePipeline {
         device: &Device,
         stream_transformer_blocks: bool,
         cancel: &candle_gen::gen_core::CancelFlag,
+        adapters: &[AdapterSpec],
     ) -> Result<MageHeavy> {
         let cfg_text = std::fs::read_to_string(dirs.transformer.join("config.json"))?;
         let cfg = MageConfig::from_json(&cfg_text)?;
-        let transformer = if stream_transformer_blocks {
+        if stream_transformer_blocks && !adapters.is_empty() {
+            candle_core::bail!(
+                "Mage adapters require resident transformer blocks; disable block streaming"
+            );
+        }
+        let mut transformer = if stream_transformer_blocks {
             MageTransformer::load_block_streamed(&dirs.transformer, &cfg, quant, device, cancel)?
         } else {
             MageTransformer::load_with_quant(&dirs.transformer, &cfg, quant, device)?
         };
+        candle_gen::quant::install_dotted_adapters("mage", adapters, device, |visitor| {
+            transformer.visit_adaptable_mut(visitor)
+        })
+        .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
         Ok(MageHeavy {
             transformer,
             vae: MageVae::load(&dirs.vae, device)?,

@@ -86,7 +86,8 @@ pub use adapters::{
 };
 pub use config::Krea2Config;
 pub use control_provider::{
-    Krea2Control, Krea2ControlPaths, Krea2ControlRequest, DEFAULT_CONTROL_SCALE,
+    load_control_from_native_dit_file, Krea2Control, Krea2ControlPaths, Krea2ControlRequest,
+    DEFAULT_CONTROL_SCALE,
 };
 // The resident aggregate. It splits internally into `pipeline::KreaText` (tokenizer + Qwen3-VL-4B TE)
 // and `pipeline::KreaHeavy` (DiT + VAE + optional PiD) so the `Sequential` path can drop the first
@@ -1141,6 +1142,7 @@ pub fn descriptor() -> ModelDescriptor {
             // actually run resident makes the gate under-predict its real peak — an admitted job that
             // then OOMs. Never flip this on ahead of the wiring.
             supports_sequential_offload: true,
+            unconditionally_engages_staged_residency: false,
             // sc-16951 (epic 16948): sc-16950 wired EVERY shipped Krea render route — the seven
             // `pipeline` sites (Turbo three-stage / t2i / img2img, Raw t2i / multi-phase / img2img,
             // and the shared Turbo+Raw edit) plus the pose-control provider — to hand
@@ -1154,6 +1156,7 @@ pub fn descriptor() -> ModelDescriptor {
             // direction. The trainer's periodic sample render is deliberately outside that set: it
             // renders from a synthetic request that carries no sink.
             supports_preview: true,
+            supports_prompt_enhancement: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
@@ -1444,13 +1447,11 @@ fn validate_load_spec(spec: &LoadSpec, id: &str) -> gen_core::Result<ValidatedKr
             id
         )));
     }
-    // The ConvRot consume path (sc-9300) is DiT-only and does not thread LoRA/LoKr or PiD overlays — the
-    // int8 checkpoint replaces the dense transformer wholesale. Reject the combination up front so the
-    // worker gets a clear error instead of silently dropping the overlay.
-    if convrot_dit.is_some() && (!spec.adapters.is_empty() || spec.pid.is_some()) {
+    // PiD still cannot compose with the DiT-only ConvRot artifact. LoRA/LoKr ride as forward-time
+    // residuals over the int8 base, preserving the checkpoint's packed/rotated representation.
+    if convrot_dit.is_some() && spec.pid.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
-            "candle {}: the INT8-ConvRot DiT path does not support LoRA/LoKr adapters or a PiD decoder \
-             overlay",
+            "candle {}: the INT8-ConvRot DiT path does not support a PiD decoder overlay",
             id
         )));
     }
@@ -1596,6 +1597,7 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
                         &resident_text_encoder,
                         convrot_dit,
                         &resident_device,
+                        &resident_adapters,
                     ),
                     (None, None) => pipeline::load_components_with_encoder(
                         &resident_root,
@@ -1659,15 +1661,18 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
                         candle_gen::check_cancel(cancel)?;
                         Ok(heavy)
                     }
-                    // ConvRot: the int8 DiT from the single file + VAE (no adapters/PiD — the lane rejects
-                    // both, sc-9300). The TE was already loaded, encoded, and dropped by the text phase, so
-                    // this loads into that freed pool — the whole point of going sequential here.
+                    // ConvRot: the int8 DiT from the single file + additive adapters + VAE (PiD is
+                    // still rejected for this lane, sc-9300; LoRA/LoKr install as residuals over the
+                    // frozen int8 base since sc-18477). The TE was already loaded, encoded, and dropped
+                    // by the text phase, so this loads into that freed pool — the whole point of going
+                    // sequential here.
                     (None, Some(convrot_dit)) => {
                         candle_gen::check_cancel(cancel)?;
                         let heavy = pipeline::load_residency_heavy_convrot(
                             &heavy_root,
                             convrot_dit,
                             &heavy_device,
+                            &heavy_adapters,
                         )?;
                         candle_gen::check_cancel(cancel)?;
                         Ok(heavy)
@@ -1697,8 +1702,9 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
         root,
         text_encoder_source,
         native_dit,
-        // The multi-phase diff-patch guard input (sc-13887): read the adapter file keys at load. The
-        // ConvRot path already rejected adapters above, so `spec.adapters` is empty there ⇒ `false`.
+        // The multi-phase diff-patch guard input (sc-13887): read adapter keys for every registered
+        // tier, through the prepared-file pin so a swap between prepare and load is caught. ConvRot
+        // low-rank adapters remain additive while any diff patch still drives residency policy.
         has_diff_patch: spec.read_prepared_files_unchanged(|| {
             Ok::<_, gen_core::Error>(crate::adapters::any_diff_patch(&spec.adapters))
         })?,
@@ -1714,8 +1720,8 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
 /// `transformer/`, pass the ConvRot DiT single-file checkpoint as
 /// `spec.components[KREA_CONVROT_DIT_COMPONENT] = WeightsSource::File(convrot_dit.safetensors)` while keeping
 /// `spec.weights = WeightsSource::Dir(canonical_snapshot)` (which supplies the tokenizer / TE / VAE /
-/// config). The ConvRot path enforces the sm_89 compute-cap floor and does not combine with LoRA/LoKr
-/// or PiD overlays.
+/// config). The ConvRot path enforces the sm_89 compute-cap floor, applies LoRA/LoKr additively over the
+/// frozen int8 DiT, and does not combine with PiD overlays.
 pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     build(spec, descriptor())
 }
@@ -1724,7 +1730,8 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 /// snapshot assembly to [`load`] — the Raw + Turbo turnkeys share the exact architecture / weight layout
 /// (only distilled-vs-base DiT weights differ), so one `build` serves both — but stores the CFG-capable
 /// [`raw_descriptor`] so `generate` runs the full-CFG [`pipeline::render_base`] path. Accepts the same
-/// LoRA/LoKr, PiD, and packed-quant surface as Turbo; the ConvRot / ControlNet rejections are shared.
+/// LoRA/LoKr, PiD, and packed-quant surface as Turbo; ConvRot supports low-rank adapters but still
+/// rejects PiD, while ControlNet/IP overlays remain outside this registered base generator.
 pub fn load_raw(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     build(spec, raw_descriptor())
 }
@@ -1758,19 +1765,28 @@ pub fn load_turbo_edit(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> 
 /// unmapped/missing/foreign key) before assembly; the TE / VAE / tokenizer load from `base_snapshot_dir`
 /// exactly as [`load`] does. The result renders through the same provider pipeline as a snapshot load.
 /// `descriptor` selects the surface — Turbo [`descriptor()`] is the natural default (variant5 is a
-/// distilled-Turbo dense merge). This compatibility entrypoint supplies no adapters; callers needing
-/// the full registered adapter/PiD/residency surface should build the equivalent File [`LoadSpec`] and
-/// call [`load`].
+/// distilled-Turbo dense merge).
+///
+/// `adapters` is the caller-selected user stack. Dense and plain-int8 native DiTs use the same
+/// canonical Krea target names as the snapshot route: diff-patches fold before assembly and
+/// LoRA/LoKr residuals install additively, with per-selected-file apply-or-reject.
+///
+/// This routes through the equivalent File [`LoadSpec`] and the crate-private `build` rather than
+/// assembling a bespoke resident generator, so the caller gets the FULL registered surface —
+/// including the pinned-file validation and the native `Sequential` block-streaming route that
+/// `native_file_streamable` admits — instead of being pinned to warm-`Resident`.
 pub fn load_from_native_dit_file(
     dit_file: impl AsRef<std::path::Path>,
     base_snapshot_dir: impl AsRef<std::path::Path>,
+    adapters: &[AdapterSpec],
     descriptor: ModelDescriptor,
 ) -> gen_core::Result<Box<dyn Generator>> {
     let mut spec = LoadSpec::new(WeightsSource::File(dit_file.as_ref().to_path_buf()))
         .with_component(
             BASE_SNAPSHOT_COMPONENT,
             WeightsSource::Dir(base_snapshot_dir.as_ref().to_path_buf()),
-        );
+        )
+        .with_adapters(adapters.to_vec());
     spec.prepare_file_sources()?;
     build(&spec, descriptor)
 }
@@ -4337,7 +4353,7 @@ mod tests {
     }
 
     #[test]
-    fn load_accepts_convrot_and_rejects_convrot_with_overlays() {
+    fn load_accepts_convrot_adapters_and_rejects_only_pid_overlay() {
         use candle_gen::gen_core::{AdapterKind, AdapterSpec};
         // A ConvRot-selecting spec loads (lazily — the int8 DiT + snapshot load at first `generate`).
         let fixture = tempfile::tempdir().unwrap();
@@ -4346,7 +4362,7 @@ mod tests {
             load(&convrot).is_ok(),
             "a ConvRot LoadSpec is accepted + lazy (sc-9300)"
         );
-        // ConvRot does not thread LoRA/LoKr — the int8 checkpoint replaces the dense DiT wholesale.
+        // ConvRot LoRA/LoKr stays lazy and installs as a residual over the int8 DiT at generation.
         let convrot_lora = valid_directory_spec(fixture.path())
             .with_convrot_text_encoder()
             .with_adapters(vec![AdapterSpec::new(
@@ -4355,8 +4371,8 @@ mod tests {
                 AdapterKind::Lora,
             )]);
         assert!(
-            load(&convrot_lora).is_err(),
-            "ConvRot + LoRA is rejected (the int8 DiT path is not adapter-wired)"
+            load(&convrot_lora).is_ok(),
+            "ConvRot + LoRA must be admitted to the adapter-wired int8 DiT path"
         );
         // ConvRot does not thread a PiD decoder overlay either.
         let convrot_pid = valid_directory_spec(fixture.path())

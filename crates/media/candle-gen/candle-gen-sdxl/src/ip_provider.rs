@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::{schedule_sigmas, DiscreteModelSampling, Scheduler, Solver};
-use candle_gen::gen_core::{Image, PreviewSink, Progress, WeightsSource};
+use candle_gen::gen_core::{AdapterSpec, Image, PreviewSink, Progress, WeightsSource};
 // Shared ancestral-step RNG salt (`seed + STEP_RNG_SALT`) — one home in `candle-gen` (sc-9043 / F-059).
 // `LatentDecoder` is the decode seam the optional PiD student implements (epic 7840, sc-8044).
 use candle_gen::gen_core::PidWeights;
@@ -36,7 +36,7 @@ use crate::denoise::{
     text_time_ids, Denoiser,
 };
 use crate::ip_adapter::{load_ip_kv_pairs, IpImageEncoder, Resampler, ResamplerConfig};
-use crate::loaders::{load_instantid_unet, load_sdxl_vae};
+use crate::loaders::{load_instantid_unet_with_adapters, load_sdxl_vae};
 use crate::pipeline::sdxl_alpha_schedule;
 use crate::sampler::EulerAncestralSampler;
 use crate::unet::UNet2DConditionModel;
@@ -69,6 +69,9 @@ pub struct IpAdapterSdxlPaths {
     pub tokenizer_clip_bigg: WeightsSource,
     /// The fp16-stable VAE component (`vae_fp16_fix`) — the `.safetensors` file or its dir.
     pub vae_fp16_fix: WeightsSource,
+    /// User-selected SDXL LoRA/LoKr stack, applied to the base UNet before the decoupled IP-Adapter
+    /// K/V pairs are installed. A non-empty non-matching stack fails closed in the shared loader.
+    pub adapters: Vec<AdapterSpec>,
 }
 
 /// One SDXL IP-Adapter generation request.
@@ -187,7 +190,7 @@ impl IpAdapterSdxl {
             &paths.tokenizer_clip_l,
             &paths.tokenizer_clip_bigg,
         )?;
-        let mut unet = load_instantid_unet(root, &device, DTYPE)?;
+        let mut unet = load_instantid_unet_with_adapters(root, &device, DTYPE, &paths.adapters)?;
 
         // IP-Adapter-Plus bundle: the Resampler (`image_proj.*`) + the decoupled K/V pairs
         // (`ip_adapter.*`), both at the UNet dtype.

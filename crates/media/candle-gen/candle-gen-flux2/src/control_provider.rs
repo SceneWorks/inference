@@ -53,6 +53,7 @@ pub struct Flux2ControlPaths {
     pub root: PathBuf,
     /// The Fun-Controlnet-Union control checkpoint (`.safetensors` file or a dir containing it).
     pub control: PathBuf,
+    pub adapters: Vec<candle_gen::gen_core::AdapterSpec>,
 }
 
 /// One FLUX.2-dev strict-pose control request. dev is guidance-distilled — `guidance` is the embedded
@@ -216,6 +217,7 @@ impl Flux2Control {
             text_encoder_source,
             &device,
             None,
+            paths.adapters.clone(),
         );
 
         // Base DiT + Mistral TE. Packed MLX tier → build directly on the GPU from the packed parts
@@ -907,6 +909,7 @@ mod tests {
         let paths = Flux2ControlPaths {
             root: root.clone(),
             control: overlay.clone(),
+            adapters: Vec::new(),
         };
         let matching = candle_gen::gen_core::LoadSpec::new(
             candle_gen::gen_core::WeightsSource::Dir(root.clone()),
@@ -962,6 +965,7 @@ mod tests {
         let paths = Flux2ControlPaths {
             root: PathBuf::from("/missing-flux2-dev"),
             control: PathBuf::from("/missing-control.safetensors"),
+            adapters: Vec::new(),
         };
         let error = Flux2Control::load_with_memory(
             &paths,
@@ -997,6 +1001,7 @@ mod tests {
         let paths = Flux2ControlPaths {
             root: root.clone(),
             control: control.clone(),
+            adapters: Vec::new(),
         };
         let spec =
             candle_gen::gen_core::LoadSpec::new(candle_gen::gen_core::WeightsSource::Dir(root))

@@ -136,6 +136,111 @@ pub fn provider_registry() -> mlx_gen::gen_core::Result<ProviderRegistry> {
         .build()
 }
 
+/// Resolve a provider-owned, load-exact numeric tier for calibrated MLX video admission. Today only
+/// Wan TI2V-5B exposes this surface; every other route returns `None` rather than synthesizing a tier
+/// from the requested quantization field.
+pub fn resolved_video_memory_numeric_tier(
+    provider_id: &str,
+    spec: &media::LoadSpec,
+) -> media::gen_core::Result<Option<media::gen_core::MemoryNumericTier>> {
+    mlx_gen_wan::resolved_video_memory_numeric_tier(provider_id, spec)
+}
+
+/// Resolve the working-set profile for a worker-selected bounded-decode edge using the provider's
+/// real live-budget planner. Unsupported provider ids return `Ok(None)`.
+pub fn selected_video_decode_memory_profile(
+    provider_id: &str,
+    width: u32,
+    height: u32,
+    frames: u32,
+    tile_edge: u32,
+    overlap: u32,
+) -> media::gen_core::Result<Option<media::VideoDecodeMemoryProfile>> {
+    mlx_gen_wan::selected_video_decode_memory_profile(
+        provider_id,
+        width,
+        height,
+        frames,
+        tile_edge,
+        overlap,
+    )
+}
+
+/// Resolve the load-bearing VAE geometry for a modelled MLX video generator.
+///
+/// Each provider owns its id-to-decoder assignment. SVD is explicitly unmodelled: its MLX decode
+/// path consumes temporal chunks but no `VaeTiling` or spatial planner, so copying the Candle
+/// decoder's 256-channel geometry here would claim an enforcement seam that does not exist. See
+/// [`vae_tiling_unmodelled_reason`]. Mochi uses a different decode architecture and is outside the
+/// video-memory-ladder scope.
+pub fn vae_tiling(provider_id: &str) -> Option<media::gen_core::tiling::VaeTiling> {
+    mlx_gen_ltx::vae_tiling(provider_id)
+        .or_else(|| mlx_gen_wan::vae_tiling(provider_id))
+        .or_else(|| mlx_gen_bernini::vae_tiling(provider_id))
+        .or_else(|| mlx_gen_scail2::vae_tiling(provider_id))
+        .or_else(|| mlx_gen_krea_realtime::vae_tiling(provider_id))
+}
+
+/// Resolve a provider-owned reason that a registered MLX video route deliberately exposes no VAE
+/// write-bound authority. `None` means either modelled, outside this surface, or unknown; callers
+/// use [`vae_tiling`] for the actual modelled result.
+pub fn vae_tiling_unmodelled_reason(provider_id: &str) -> Option<&'static str> {
+    mlx_gen_svd::vae_tiling_unmodelled_reason(provider_id)
+}
+
+/// Resolve a provider-owned conservative single-pass VAE decode memory profile.
+///
+/// This composes provider-owned calibrated VAE cost functions. For planner-backed routes it is the
+/// planner's full-output case; MLX Bernini retains its established auto/explicit tiling policy and
+/// reports the same Wan-z16 single-pass cost as a proven monotone upper bound instead. The result
+/// excludes DiT/text-encoder weights. LTX's calibrated fixed term mixes decoder/base/runtime costs,
+/// so it is retained in full and identifies zero substitutable decoder-resident bytes; Wan-family
+/// profiles contain activation/accumulator work and likewise identify zero resident bytes. Use
+/// [`media::VideoDecodeMemoryProfile::checked_composed_peak`] for checked composition and any declared
+/// substitution. With LTX's zero attribution the whole mixed floor is deliberately preserved, even
+/// though that may conservatively overlap a contract decoder charge. Unsupported ids, zero
+/// dimensions, and arithmetic overflow return `None`.
+pub fn conservative_video_decode_memory_profile(
+    provider_id: &str,
+    width: u32,
+    height: u32,
+    frames: u32,
+) -> Option<media::VideoDecodeMemoryProfile> {
+    mlx_gen_ltx::conservative_video_decode_memory_profile(provider_id, width, height, frames)
+        .or_else(|| {
+            mlx_gen_wan::conservative_video_decode_memory_profile(
+                provider_id,
+                width,
+                height,
+                frames,
+            )
+        })
+        .or_else(|| {
+            mlx_gen_bernini::conservative_video_decode_memory_profile(
+                provider_id,
+                width,
+                height,
+                frames,
+            )
+        })
+        .or_else(|| {
+            mlx_gen_scail2::conservative_video_decode_memory_profile(
+                provider_id,
+                width,
+                height,
+                frames,
+            )
+        })
+        .or_else(|| {
+            mlx_gen_krea_realtime::conservative_video_decode_memory_profile(
+                provider_id,
+                width,
+                height,
+                frames,
+            )
+        })
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -158,6 +263,194 @@ mod tests {
             );
         }
         assert!(super::benchmark_toggle_capabilities("not-a-provider").is_none());
+    }
+
+    #[test]
+    fn selected_video_memory_apis_do_not_expand_beyond_wan_ti2v_5b() {
+        let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir("/nonexistent".into()));
+        for provider in [
+            "unknown",
+            mlx_gen_wan::MODEL_ID_T2V_14B,
+            mlx_gen_wan::MODEL_ID_I2V_14B,
+            mlx_gen_wan::MODEL_ID_VACE,
+            mlx_gen_wan::MODEL_ID_VACE_FUN,
+        ] {
+            assert_eq!(
+                super::resolved_video_memory_numeric_tier(provider, &spec).unwrap(),
+                None
+            );
+            assert_eq!(
+                super::selected_video_decode_memory_profile(provider, 480, 480, 1, 448, 64)
+                    .unwrap(),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn modelled_video_provider_ids_have_typed_vae_assignments() {
+        let registry = super::provider_registry().unwrap();
+        let registered: Vec<&str> = registry
+            .generators()
+            .map(|registration| (registration.descriptor)().id)
+            .collect();
+        let expected = [
+            (
+                mlx_gen_ltx::MODEL_ID,
+                mlx_gen_ltx::VAE_TILING,
+                3_312_533_760,
+            ),
+            (
+                mlx_gen_wan::MODEL_ID,
+                mlx_gen_wan::WAN_Z48_VAE_TILING,
+                126_812_160,
+            ),
+            (
+                mlx_gen_wan::MODEL_ID_T2V_14B,
+                mlx_gen_wan::WAN_Z16_VAE_TILING,
+                322_633_728,
+            ),
+            (
+                mlx_gen_wan::MODEL_ID_I2V_14B,
+                mlx_gen_wan::WAN_Z16_VAE_TILING,
+                322_633_728,
+            ),
+            (
+                mlx_gen_wan::MODEL_ID_VACE,
+                mlx_gen_wan::WAN_Z16_VAE_TILING,
+                322_633_728,
+            ),
+            (
+                mlx_gen_wan::MODEL_ID_VACE_FUN,
+                mlx_gen_wan::WAN_Z16_VAE_TILING,
+                322_633_728,
+            ),
+            (
+                mlx_gen_bernini::pipeline::MODEL_ID,
+                mlx_gen_bernini::VAE_TILING,
+                322_633_728,
+            ),
+            (
+                mlx_gen_bernini::bernini::MODEL_ID,
+                mlx_gen_bernini::VAE_TILING,
+                322_633_728,
+            ),
+            (
+                mlx_gen_scail2::pipeline::MODEL_ID,
+                mlx_gen_scail2::VAE_TILING,
+                322_633_728,
+            ),
+            (
+                mlx_gen_krea_realtime::MODEL_ID,
+                mlx_gen_krea_realtime::VAE_TILING,
+                322_633_728,
+            ),
+        ];
+
+        for (provider_id, tiling, peak_bytes) in expected {
+            assert!(
+                registered.contains(&provider_id),
+                "unregistered {provider_id}"
+            );
+            assert_eq!(
+                super::vae_tiling(provider_id),
+                Some(tiling),
+                "{provider_id}"
+            );
+            assert_eq!(
+                super::conservative_video_decode_memory_profile(provider_id, 64, 64, 9)
+                    .map(|profile| profile.working_set_bytes()),
+                Some(peak_bytes),
+                "{provider_id}"
+            );
+        }
+        assert_eq!(super::vae_tiling(mlx_gen_svd::MODEL_ID), None);
+        assert_eq!(
+            super::vae_tiling_unmodelled_reason(mlx_gen_svd::MODEL_ID),
+            Some(mlx_gen_svd::VAE_TILING_UNMODELLED_REASON),
+            "SVD's missing MLX geometry must be an explicit provider-owned result"
+        );
+        assert_eq!(super::vae_tiling(mlx_gen_mochi::MODEL_ID), None);
+        assert_eq!(
+            super::vae_tiling_unmodelled_reason(mlx_gen_mochi::MODEL_ID),
+            None
+        );
+        assert_eq!(super::vae_tiling("not_a_provider"), None);
+        assert_eq!(super::vae_tiling_unmodelled_reason("not_a_provider"), None);
+        for provider_id in [
+            mlx_gen_svd::MODEL_ID,
+            mlx_gen_mochi::MODEL_ID,
+            "not_a_provider",
+        ] {
+            assert_eq!(
+                super::conservative_video_decode_memory_profile(provider_id, 64, 64, 9),
+                None
+            );
+        }
+        assert_eq!(
+            super::conservative_video_decode_memory_profile(mlx_gen_ltx::MODEL_ID, 0, 64, 9),
+            None
+        );
+        assert_eq!(
+            super::conservative_video_decode_memory_profile(
+                mlx_gen_wan::MODEL_ID_T2V_14B,
+                u32::MAX,
+                u32::MAX,
+                u32::MAX,
+            ),
+            None
+        );
+
+        let ltx = super::conservative_video_decode_memory_profile(mlx_gen_ltx::MODEL_ID, 64, 64, 9)
+            .unwrap();
+        assert_eq!(ltx.resident_decoder_bytes_included(), 0);
+        assert_eq!(
+            ltx.checked_composed_peak(3_100_000_000, 3_100_000_000),
+            Some(6_412_533_760)
+        );
+        assert_eq!(
+            ltx.checked_composed_peak(3_500_000_000, 3_500_000_000),
+            Some(6_812_533_760)
+        );
+
+        let wan = super::conservative_video_decode_memory_profile(
+            mlx_gen_wan::MODEL_ID_T2V_14B,
+            64,
+            64,
+            9,
+        )
+        .unwrap();
+        assert_eq!(wan.resident_decoder_bytes_included(), 0);
+        assert_eq!(
+            wan.checked_composed_peak(1_000_000_000, 600_000_000),
+            Some(1_322_633_728)
+        );
+
+        let z16_ids = [
+            mlx_gen_wan::MODEL_ID_T2V_14B,
+            mlx_gen_wan::MODEL_ID_I2V_14B,
+            mlx_gen_wan::MODEL_ID_VACE,
+            mlx_gen_wan::MODEL_ID_VACE_FUN,
+            mlx_gen_bernini::pipeline::MODEL_ID,
+            mlx_gen_bernini::bernini::MODEL_ID,
+            mlx_gen_scail2::pipeline::MODEL_ID,
+            mlx_gen_krea_realtime::MODEL_ID,
+        ];
+        for id in z16_ids {
+            for (requested_frames, expected_bytes) in [
+                (1, Some(107_544_576)),
+                (9, Some(322_633_728)),
+                (81, Some(2_258_436_096)),
+                (u32::MAX, None),
+            ] {
+                assert_eq!(
+                    super::conservative_video_decode_memory_profile(id, 64, 64, requested_frames,)
+                        .map(|profile| profile.working_set_bytes()),
+                    expected_bytes,
+                    "{id} at {requested_frames} requested frames",
+                );
+            }
+        }
     }
 
     const PREVIEW_PROVIDER_IDS: [&str; 38] = [
@@ -372,15 +665,20 @@ mod tests {
     fn every_registered_memory_strategy_rejects_cross_route_decode_geometry() {
         let registry = super::provider_registry().unwrap();
         gen_core_testkit::memory_contract_surface_registry_conformance(&registry);
-        assert_eq!(registry.memory_strategy_registrations().len(), 47);
-        assert_eq!(registry.memory_contract_fixture_registrations().len(), 46);
+        assert_eq!(registry.memory_strategy_registrations().len(), 49);
+        assert_eq!(registry.memory_contract_fixture_registrations().len(), 48);
         let resident_only: Vec<_> = registry
             .resident_only_memory_contract_registrations()
             .map(|registration| registration.provider_id)
             .collect();
         assert_eq!(resident_only, ["flux2_dev_control"]);
         let surfaces = registry.memory_contract_surfaces().unwrap();
-        assert_eq!(surfaces.len(), 46 * 12);
+        // 46 providers witness the complete 3-tier x 2-policy x 2-shape MLX surface. The two video
+        // providers publish narrower, truthful inventories instead: LTX has no deferred/block-window
+        // loader, so it witnesses the eager half; TI2V-5B admits only a BF16 Resident/Eager load, so
+        // it witnesses one selector per tier. Spelling the sum out this way keeps a future provider's
+        // narrowing visible in the diff rather than folded into a single total.
+        assert_eq!(surfaces.len(), 46 * 12 + 6 + 3);
         assert!(surfaces.iter().all(|surface| !surface.composed));
         let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir("/nonexistent".into()))
             .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization);

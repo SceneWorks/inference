@@ -176,6 +176,66 @@ impl VaeTiling {
     }
 }
 
+/// A backend-neutral, composable conservative VAE decode-phase memory profile.
+///
+/// `resident_decoder_bytes_included` is the portion of `working_set_bytes` substitutable by decoder
+/// resident bytes already charged in a model contract. It is part of, not additional to, the working
+/// set, and the checked constructor enforces `included <= working_set`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VideoDecodeMemoryProfile {
+    /// Conservative decode-phase working set, including any resident decoder bytes identified below.
+    working_set_bytes: u64,
+    /// Portion of `working_set_bytes` substitutable by decoder bytes already present in a contract.
+    resident_decoder_bytes_included: u64,
+}
+
+impl VideoDecodeMemoryProfile {
+    /// Build a valid profile, returning `None` when the included resident portion exceeds the total.
+    pub fn new(working_set_bytes: u64, resident_decoder_bytes_included: u64) -> Option<Self> {
+        (resident_decoder_bytes_included <= working_set_bytes).then_some(Self {
+            working_set_bytes,
+            resident_decoder_bytes_included,
+        })
+    }
+
+    /// Conservative decode-phase working set in bytes.
+    pub const fn working_set_bytes(self) -> u64 {
+        self.working_set_bytes
+    }
+
+    /// Portion of the working set substitutable by decoder bytes already charged in a contract.
+    pub const fn resident_decoder_bytes_included(self) -> u64 {
+        self.resident_decoder_bytes_included
+    }
+
+    /// Bytes to add to a composition that already includes `contract_decoder_bytes`.
+    ///
+    /// If the contract decoder is below the included floor, the uncovered portion remains. If it is
+    /// above the floor, the contract decoder is charged once and only non-resident decode work is
+    /// added. Arithmetic overflow returns `None`.
+    pub fn incremental_above_contract_decoder_bytes(
+        self,
+        contract_decoder_bytes: u64,
+    ) -> Option<u64> {
+        self.working_set_bytes
+            .checked_sub(contract_decoder_bytes.min(self.resident_decoder_bytes_included))
+    }
+
+    /// Add this profile to an already-accounted contract composition with checked arithmetic.
+    /// Returns `None` when the declared decoder component exceeds the composition that contains it.
+    pub fn checked_composed_peak(
+        self,
+        composition_bytes: u64,
+        contract_decoder_bytes: u64,
+    ) -> Option<u64> {
+        if contract_decoder_bytes > composition_bytes {
+            return None;
+        }
+        composition_bytes
+            .checked_add(self.incremental_above_contract_decoder_bytes(contract_decoder_bytes)?)
+    }
+}
+
 /// Per-frame spatial tiling (tile + overlap in **output pixels**).
 #[derive(Clone, Copy, Debug)]
 pub struct SpatialTiling {
@@ -938,6 +998,33 @@ pub fn budgeted_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_memory_profile_composes_contract_decoder_exactly_once() {
+        assert_eq!(VideoDecodeMemoryProfile::new(399, 400), None);
+
+        let profile = VideoDecodeMemoryProfile::new(1_000, 400).unwrap();
+        assert_eq!(
+            profile.incremental_above_contract_decoder_bytes(0),
+            Some(1_000)
+        );
+        assert_eq!(
+            profile.incremental_above_contract_decoder_bytes(250),
+            Some(750)
+        );
+        assert_eq!(profile.checked_composed_peak(1_250, 250), Some(2_000));
+        assert_eq!(
+            profile.incremental_above_contract_decoder_bytes(400),
+            Some(600)
+        );
+        assert_eq!(
+            profile.incremental_above_contract_decoder_bytes(600),
+            Some(600)
+        );
+        assert_eq!(profile.checked_composed_peak(1_600, 600), Some(2_200));
+        assert_eq!(profile.checked_composed_peak(399, 400), None);
+        assert_eq!(profile.checked_composed_peak(u64::MAX, 600), None);
+    }
 
     #[test]
     fn trapezoid_no_ramp_is_all_ones() {

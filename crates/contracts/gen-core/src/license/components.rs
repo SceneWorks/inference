@@ -1056,7 +1056,7 @@ pub const WAN2_2_TI2V_5B_GGUF: ComponentLicense = ComponentLicense {
     retrieved: "2026-08-02",
 };
 
-/// `alibaba-pai/Wan2.2-VACE-Fun-A14B` — two VACE expert checkpoints, MLX only today.
+/// `alibaba-pai/Wan2.2-VACE-Fun-A14B` — two VACE expert checkpoints used by both backends.
 pub const WAN2_2_VACE_FUN_A14B: ComponentLicense = ComponentLicense {
     component: "wan2_2_vace_fun_a14b",
     source_url: "https://huggingface.co/alibaba-pai/Wan2.2-VACE-Fun-A14B",

@@ -1,9 +1,12 @@
-//! Real-weight conformance for the candle DFN5B-CLIP ViT-H/14-384 encoder (sc-13437).
+//! Real-weight conformance for the candle DFN5B-CLIP ViT-H/14-378 checkpoint as MMAudio uses it
+//! with 384×384 inputs (sc-13437).
 //!
 //! ## What this gates on real weights
 //!
-//! Loads the pinned `apple/DFN5B-CLIP-ViT-H-14-384` `open_clip_pytorch_model.bin` (~3.9 GB), builds
-//! both towers, and asserts the ported forward produces the features MMAudio consumes:
+//! Loads the pinned canonical `apple/DFN5B-CLIP-ViT-H-14-378`
+//! `open_clip_pytorch_model.bin` (~3.9 GB), builds both towers, and asserts the ported forward
+//! produces the features MMAudio consumes. The checkpoint is 378-native, while MMAudio's 384 px
+//! input produces the same 27×27 patch grid because the visual stem uses patch 14 with stride 14:
 //!
 //! - [`dfn_clip_visual_shape_finite_deterministic`] — synthetic 384² frames →
 //!   `encode_image` → `(N, 1024)`, every value finite, unit-norm (L2-normalized), byte-identical

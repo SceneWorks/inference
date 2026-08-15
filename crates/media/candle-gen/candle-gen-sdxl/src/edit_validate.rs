@@ -83,6 +83,7 @@ fn real_weight_edit() {
         tokenizer_clip_l: WeightsSource::Dir(env_path("SDXL_TOKENIZER_CLIP_L_DIR")),
         tokenizer_clip_bigg: WeightsSource::Dir(env_path("SDXL_TOKENIZER_CLIP_BIGG_DIR")),
         vae_fp16_fix: WeightsSource::Dir(env_path("SDXL_VAE_FP16_FIX_DIR")),
+        adapters: Vec::new(),
     };
     let source = read_ppm(&env_path("EDIT_SRC"));
     println!(
@@ -142,6 +143,41 @@ fn real_weight_edit() {
         .expect("generate (img2img hi)");
     println!("[img2img s=0.8] {:?}", t.elapsed());
     write_ppm(&out_dir.join("img2img_hi.ppm"), &img_hi);
+    if let Some(adapter) = std::env::var_os("EDIT_SDXL_LORA") {
+        drop(model);
+        let adapted = SdxlEdit::load(&SdxlEditPaths {
+            sdxl_base: env_path("EDIT_SDXL_BASE"),
+            tokenizer_clip_l: WeightsSource::Dir(env_path("SDXL_TOKENIZER_CLIP_L_DIR")),
+            tokenizer_clip_bigg: WeightsSource::Dir(env_path("SDXL_TOKENIZER_CLIP_BIGG_DIR")),
+            vae_fp16_fix: WeightsSource::Dir(env_path("SDXL_VAE_FP16_FIX_DIR")),
+            adapters: vec![candle_gen::gen_core::AdapterSpec::new(
+                adapter.into(),
+                1.0,
+                candle_gen::gen_core::AdapterKind::Lora,
+            )],
+        })
+        .expect("load adapter-conditioned SDXL edit");
+        let with_adapter = adapted
+            .generate(
+                &SdxlEditRequest {
+                    strength: 0.8,
+                    ..base.clone()
+                },
+                &source,
+                &mut noop,
+            )
+            .expect("generate (img2img + LoRA)");
+        assert_eq!(
+            (with_adapter.width, with_adapter.height),
+            (img_hi.width, img_hi.height)
+        );
+        assert_ne!(
+            with_adapter.pixels, img_hi.pixels,
+            "selected SDXL edit adapter must change output"
+        );
+        write_ppm(&out_dir.join("img2img_hi_lora.ppm"), &with_adapter);
+        return;
+    }
 
     let img_lo = model
         .generate(

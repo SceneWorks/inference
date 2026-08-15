@@ -64,8 +64,9 @@ providers, recorded per component in `release/real-weight-models.toml`:
   * MMAudio MM-DiT (small_16k, large_44k_v2) and both mel-VAEs (v1-16, v1-44),
     plus the 16 kHz BigVGAN — hkchengrex/MMAudio, CC-BY-NC-4.0
     (non-commercial).
-  * DFN5B-CLIP-ViT-H-14-384 — apple/DFN5B-CLIP-ViT-H-14-384, under the Apple
-    Machine Learning Research Model License.
+  * DFN5B-CLIP-ViT-H-14-378 — apple/DFN5B-CLIP-ViT-H-14-378, under the Apple
+    Machine Learning Research Model License. MMAudio supplies 384×384 inputs to this 378-native
+    checkpoint; both resolutions produce the same 27×27 patch grid with its patch-14 convolution.
   * Synchformer — hkchengrex/MMAudio, MIT.
   * BigVGAN v2 44 kHz — nvidia/bigvgan_v2_44khz_128band_512x, MIT.
 

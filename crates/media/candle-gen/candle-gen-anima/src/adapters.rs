@@ -24,7 +24,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use candle_gen::candle_core::{DType, Tensor};
 use candle_gen::gen_core::{AdapterKind, AdapterSpec};
-use candle_gen::train::lora::{reconstruct_lokr_delta, reconstruct_lora_delta};
+use candle_gen::train::lora::{
+    parse_lokr_metadata, reconstruct_lokr_delta, reconstruct_lora_delta,
+};
 use candle_gen::train::merge::{
     merge_into, no_target_matched, read_adapter, read_scalar, AdapterFile, LoraTriple, MergeReport,
     Role,
@@ -154,16 +156,10 @@ fn merge_lokr_file(
     routed: &mut Vec<String>,
     unrouted: &mut Vec<String>,
 ) -> Result<()> {
-    let rank = af
-        .meta
-        .get("rank")
-        .and_then(|s| s.parse::<f32>().ok())
-        .unwrap_or(1.0);
-    let alpha = af
-        .meta
-        .get("alpha")
-        .and_then(|s| s.parse::<f32>().ok())
-        .unwrap_or(rank);
+    let (rank, alpha) = parse_lokr_metadata(
+        af.meta.get("rank").map(String::as_str),
+        af.meta.get("alpha").map(String::as_str),
+    )?;
 
     let mut grouped: BTreeMap<String, BTreeMap<&'static str, Tensor>> = BTreeMap::new();
     for (key, t) in &af.tensors {
@@ -362,16 +358,10 @@ fn resolve_lokr_file(
     pending: &mut BTreeMap<String, Vec<PendingLokr>>,
     skipped_keys: &mut usize,
 ) -> Result<()> {
-    let rank = af
-        .meta
-        .get("rank")
-        .and_then(|s| s.parse::<f32>().ok())
-        .unwrap_or(1.0);
-    let alpha = af
-        .meta
-        .get("alpha")
-        .and_then(|s| s.parse::<f32>().ok())
-        .unwrap_or(rank);
+    let (rank, alpha) = parse_lokr_metadata(
+        af.meta.get("rank").map(String::as_str),
+        af.meta.get("alpha").map(String::as_str),
+    )?;
     // FULL effective scale — mirrors `reconstruct_lokr_delta`'s `(alpha/rank)·scale`, but baked into the
     // structured factors rather than split across a delta (alpha/rank) + an Adapter scale (strength).
     let full = (alpha as f64 / rank as f64) * scale as f64;

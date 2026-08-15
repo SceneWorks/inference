@@ -45,7 +45,7 @@ use candle_gen::quant as shared;
 // Re-export the shared type under the crate-local `QLinear` name the transformer / text_encoder
 // reference. `is_packed`/`is_quantized`/`to_device`/`quantize_onto`/`linear_detect` are all inherent
 // methods on the shared type now.
-pub use candle_gen::quant::QLinear;
+pub use candle_gen::quant::AdaptLinear as QLinear;
 
 /// The GGUF block type a [`Quant`] level maps to — `Q4_0` / `Q8_0` (block size 32). Every dev TE/DiT
 /// projection's `in_features` is divisible by 32 (128 / 256 / 4096 / 5120 / 6144 / 15360 / 24576 /
@@ -117,10 +117,11 @@ mod tests {
     use super::*;
     use candle_gen::candle_core::DType;
     use candle_gen::candle_nn::Linear;
-    use candle_gen::quant::{DenseLinear, MatmulStrategy};
+    use candle_gen::quant::MatmulStrategy;
 
     fn dense_from(w: &Tensor, b: Option<&Tensor>) -> QLinear {
-        QLinear::from_dense(DenseLinear::Linear(Linear::new(w.clone(), b.cloned())))
+        let (out_dim, in_dim) = w.dims2().unwrap();
+        QLinear::from_dense(Linear::new(w.clone(), b.cloned()), in_dim, out_dim)
     }
 
     /// A `[64, 32]` projection quantizes and forwards near-losslessly at Q8 / coherently at Q4 vs the
@@ -175,7 +176,7 @@ mod tests {
         let mut lin = dense_from(&w, None);
         lin.quantize_onto(Quant::Q8, &dev).unwrap();
         lin.quantize_onto(Quant::Q8, &dev).unwrap(); // no-op, must not error
-        assert!(matches!(lin, QLinear::Quantized { bias: None, .. }));
+        assert!(lin.is_quantized());
     }
 
     // ---- sc-9087 packed-detect (from an MLX-packed tier, no dense staging) --------------------
@@ -269,13 +270,14 @@ mod tests {
 
         // `to_q` — dense (no `.scales`), path unchanged.
         let dense = QLinear::linear_detect(in_dim, out_dim, &attn, "to_q", false)?;
-        assert!(matches!(dense, QLinear::Dense(_)), "no `.scales` ⇒ dense");
+        assert!(!dense.is_packed(), "no `.scales` ⇒ dense");
 
         // The packed forward reproduces the affine grid (bit-exact repack + dequant-on-forward).
-        let grid_lin = QLinear::from_dense(DenseLinear::Linear(Linear::new(
-            Tensor::from_vec(grid, (out_dim, in_dim), &dev)?,
-            None,
-        )));
+        let grid_lin = QLinear::from_dense(
+            Linear::new(Tensor::from_vec(grid, (out_dim, in_dim), &dev)?, None),
+            in_dim,
+            out_dim,
+        );
         let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
         let cos = cosine(&packed.forward(&x)?, &grid_lin.forward(&x)?);
         assert!(cos > 0.99999, "packed vs affine-grid cosine {cos:.6}");
@@ -292,7 +294,8 @@ mod tests {
         let (wq, s, b, _grid) = q4_packed(out_dim, in_dim);
 
         // A packed load (dequant-dense) built straight from the packed parts.
-        let mut lin = QLinear::from_packed(&wq, &s, &b, None, &dev)?;
+        let base = candle_gen::quant::QLinear::from_packed(&wq, &s, &b, None, &dev)?;
+        let mut lin = QLinear::from_packed(base, in_dim, out_dim);
         assert_eq!(lin.matmul_strategy(), Some(MatmulStrategy::DequantDense));
         let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
         let before = lin.forward(&x)?;
