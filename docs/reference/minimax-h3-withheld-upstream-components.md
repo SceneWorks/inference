@@ -38,20 +38,25 @@ read and its own manifest entry — not a change to these crates' conditioning p
 
 **Withheld.** "Up to 2K" is a property of the hosted product, not of these weights.
 
-**What the port does.** It advertises and *enforces* a 1344-pixel ceiling per edge, well below 2K:
-`max_size: 1344` in both `candle-gen-minimax-h3/src/model.rs` and `mlx-gen-minimax-h3/src/model.rs`,
-bounded on each edge by `resolve_geometry` rather than merely declared, with
-`CANVAS_MAX_PIXELS = 768 * 1344` bounding the area independently. An over-size request is refused,
-not silently refitted.
+**What the port does.** It *enforces* a canvas envelope rather than merely advertising one, in two
+separate places that are not the same constraint. The per-edge bound is `Capabilities::max_size`,
+checked at the shared capability floor in `gen-core/src/generator.rs`. The area bound is
+`CANVAS_MAX_PIXELS` in each crate's `pipeline.rs`, checked as a *product* by `resolve_geometry` —
+whose own comment records why the two are distinct: a square inside the per-edge cap can still be
+far over the area the model generates at. Either check refuses; an over-size request is never
+silently refitted. No number is quoted here, because sc-17152 is moving the per-edge ceiling — read
+the constants.
 
 **The decision.** The advertised ceiling is the one the weights generate at. The engine exposes no
 2K path and claims none. Whether the product offers a *post-hoc upscale* (SeedVR2 / real-esrgan /
 aura-sr are already separate providers) is a catalog-side choice about a separate model — it would
-be an upscale of a 1344px render, and must be labelled as one rather than as native 2K.
+be an upscale of a render made inside the envelope above, and must be labelled as one rather than as
+native 2K.
 
-**If upstream publishes it.** The ceiling constants above are the single place the envelope is
-declared, and `check_cross_backend_geometry` in `scripts/check-workspace.py` holds both backends to
-the same geometry, so raising it is a change in one reviewed place per backend rather than a hunt.
+**If upstream publishes it.** `check_cross_backend_geometry` in `scripts/check-workspace.py`
+compares every visibility-carrying `const` under each crate's `src/` by value, so a bound that lives
+in a named constant cannot be raised on one backend and forgotten on the other. A bound written as a
+bare literal in a struct initializer is outside that comparison.
 
 ## 3. Sparse-attention inference
 
@@ -102,6 +107,6 @@ repository rather than here:
 - whether a 2K *upscale* path is offered alongside this model, and whether prompt refinement is
   offered as a visible, opt-in control.
 
-The engine facts those decisions need are the four sections above: a 1344-pixel enforced ceiling, no
-prompt rewriting, a lattice-derived 5.1667–14.375 s envelope, and seven tokenizable but semantically
-inert markers.
+The engine facts those decisions need are the four sections above: an enforced canvas envelope —
+per-edge and area, both refusing rather than refitting — no prompt rewriting, a lattice-derived
+5.1667–14.375 s envelope, and seven tokenizable but semantically inert markers.
