@@ -3328,11 +3328,11 @@ mod preview_advertising {
             classified.difference(&registered).collect::<Vec<_>>()
         );
 
-        // VACE-Fun occupies the already-settled Wan z16 no-go space: 52 registered generators =
-        // 29 wired + 20 no-go + 3 deferred.
+        // VACE-Fun occupies the already-settled Wan z16 no-go space, and MiniMax-H3 opens its own
+        // joint-space no-go: 53 registered generators = 29 wired + 21 no-go + 3 deferred.
         assert_eq!(
             (registered.len(), wired.len(), no_go.len(), deferred.len()),
-            (52, 29, 20, 3),
+            (53, 29, 21, 3),
             "moving a route between preview classes is a decision that must be written down here"
         );
     }
@@ -4161,9 +4161,9 @@ mod tests {
 
         // sc-16667: the pinned surface and the model-weight licence mapping move together — this is
         // where a surface change and a mapping change meet. Twelve of the fourteen trainer ids are
-        // also generator ids, which is why 52 + 14 + 1 + 2 registrations are 57 distinct ids.
+        // also generator ids, which is why 53 + 14 + 1 + 2 registrations are 58 distinct ids.
         //
-        // Registration is never conditioned on the mapping: 48 < 57 because nine ids load nothing
+        // Registration is never conditioned on the mapping: 49 < 58 because nine ids load nothing
         // the shared checkpoint table covers, and they ship exactly as before. That gap is a hole in
         // our metadata for CI to report, and `licenses::tests` pins which nine and why — as
         // `#[cfg(test)]` data, so no gate can read it and suppress them.
@@ -4174,8 +4174,8 @@ mod tests {
             .chain(&image_embedders)
             .chain(&text_embedders)
             .collect();
-        assert_eq!(distinct.len(), 57);
-        assert_eq!(super::provider_components().len(), 48);
+        assert_eq!(distinct.len(), 58);
+        assert_eq!(super::provider_components().len(), 49);
     }
 
     /// The manifest emitter runs on **this** catalog's three slices, and its output is

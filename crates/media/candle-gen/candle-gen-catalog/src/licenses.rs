@@ -535,7 +535,7 @@ mod tests {
     /// failing.
     #[test]
     fn mapping_is_sorted_and_every_key_resolves() {
-        assert_eq!(PROVIDER_COMPONENTS.len(), 48);
+        assert_eq!(PROVIDER_COMPONENTS.len(), 49);
         let ids: Vec<&str> = PROVIDER_COMPONENTS.iter().map(|p| p.provider_id).collect();
         let mut sorted = ids.clone();
         sorted.sort_unstable();
@@ -567,8 +567,8 @@ mod tests {
         let registered = registered_ids();
         assert_eq!(
             registered.len(),
-            57,
-            "57 distinct Candle provider ids: 52 generators + 7 trainers (5 of them also generator \
+            58,
+            "58 distinct Candle provider ids: 53 generators + 7 trainers (5 of them also generator \
              ids) + 1 captioner + 2 embedders"
         );
 
