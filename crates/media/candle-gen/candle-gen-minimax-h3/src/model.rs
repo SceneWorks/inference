@@ -1406,7 +1406,6 @@ impl Generator for MiniMaxH3 {
                 }
             }
         }
->>>>>>> origin/feature/sc-17137-minimax-h3
         Ok(())
     }
 
