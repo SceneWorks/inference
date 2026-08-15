@@ -1746,8 +1746,10 @@ unwired_reason = "sc-15528 landed the Bernini ladder mechanism; the real-weight 
 # snapshot fails loudly (exit 101) rather than printing `ok` in 0.00 s. Nothing could supply the
 # variable, which is a different defect from a vacuous green and is why it survived so long.
 #
-# `download_files` is a deliberate 11.640 GB slice of the 196 GB (measured 2026-08-13 with
-# `os.stat` over the snapshot on nax-macos, symlinks dereferenced):
+# `download_files` is a deliberate 11.638 GB slice of the 196 GB (measured 2026-08-13 with
+# `os.stat` over the snapshot on nax-macos, symlinks dereferenced; the TOTAL was re-summed
+# 2026-08-15 for sc-19445 and is 11.638 — what the rows below actually add to — not the 11.640 this
+# line used to carry):
 #
 #   vae/                                       10.416 GB  video VAE: 3 shards + index + config
 #   audio_vae/                                  0.605 GB  the diffusers-repackaged audio VAE
@@ -1801,20 +1803,32 @@ unwired_reason = "sc-15528 landed the Bernini ladder mechanism; the real-weight 
 # and consumed instead: `te_layer_50_tap_is_exhaustive_and_the_tail_is_trimmable` panics on a missing
 # index, so its absence is loud at the test rather than at verification.
 #
-# `MINIMAX_H3_VIDEO_VAE_REFERENCE` is deliberately NOT an `environment` entry here, and the omission
-# is a category judgement rather than an oversight. `environment` names variables that point a test
-# at THIS PINNED SNAPSHOT; that one points at a ~840 KB artifact an operator PRODUCES from the
-# snapshot with `crates/media/mlx-gen/tools/dump_minimax_h3_video_vae_real.py`. Listing it would
-# claim the pin describes bytes no revision can. It lives in the `mlx-minimax-h3` job instead, the
-# way `MAGE_ORACLE_SEED_DIR` lives only in `mlx-media` — recorded here so a census reader finds it.
+# THE THREE OPERATOR ARTIFACTS are deliberately NOT `environment` entries here, and the omission is
+# a category judgement rather than an oversight. `environment` names variables that point a test at
+# THIS PINNED SNAPSHOT; `MINIMAX_H3_VIDEO_VAE_REFERENCE` (~840 KB),
+# `MINIMAX_H3_VIDEO_VAE_ENCODE_REFERENCE` (~5.7 MB, sc-19445) and `MINIMAX_H3_TE_REFERENCE`
+# (~226 KB, sc-19438) each point at a file an operator PRODUCES from the snapshot with a
+# `crates/media/mlx-gen/tools/dump_minimax_h3_*_real.py` script. Listing them would claim the pin
+# describes bytes no revision can. They live in the `mlx-minimax-h3` job instead, the way
+# `MAGE_ORACLE_SEED_DIR` lives only in `mlx-media` — recorded here so a census reader finds them.
 #
 # THE TWO HEAVY COMPONENTS ARE NOT IN THIS ROW, AND THAT IS STILL THE RIGHT SHAPE. Adding
 # `transformer/*` or `text_encoder/*` here would multiply the cost of the row EVERY H3 lane fetches
-# by six, for gates only some of them run. sc-19558 gives the DiT its own key instead —
-# `minimax-h3-dit` below — the same per-key split `minimax-h3-mlx-*` already uses over one
-# repository, so a lane provisions exactly the components its selections read. There is no
-# text-encoder key in THIS change; the block below `minimax-h3-dit` records why, and sc-19438
-# (inference #637) is the change that adds one, together with the variable that makes it reachable.
+# by six, for gates only some of them run. Each gets its OWN key instead — `minimax-h3-dit`
+# (sc-19558) and `minimax-h3-text-encoder` (sc-19438) below — the same per-key split
+# `minimax-h3-mlx-*` already uses over one repository, so a lane provisions exactly the components
+# its selections read.
+#
+# THIS ROW THEREFORE STAYS AT ITS 11.638 GB SLICE, and the split is the whole point: this row is
+# `profiles = ["media-macos", "media-cuda"]` and the Windows CUDA lane materializes it by key, so
+# folding the text-encoder row's 58.568 GB of shards into it would put those bytes on a shared dev
+# box whose lane reads not one of them — and folding the DiT's 132.6 GB in would do the same to the
+# macOS lane.
+#
+# THE TWO CANDLE DiT HEADER GATES (`declared_dit_tensor_names_match_the_published_checkpoint`,
+# `the_adaln_projections_are_the_documented_twenty_six_gigabytes`) are no longer hand-driven: they
+# read only headers but need the `transformer/` component to exist, and `minimax-h3-dit` below is
+# the row that supplies it.
 [[models]]
 key = "minimax-h3"
 repository = "MiniMaxAI/MiniMax-H3"
@@ -1841,6 +1855,88 @@ expected_files = [
   "FL2VA/audio_vae/model.safetensors",
   "tokenizer/tokenizer.json",
   "tokenizer/tokenizer_config.json",
+]
+
+# ── MiniMax-H3 text encoder, layer-50 tap only (sc-19438) ───────────────────────────────────────
+# The SAME repository and the SAME pinned revision as `minimax-h3` above, materialized into the
+# SAME `MINIMAX_H3_SNAPSHOT` directory. It is a separate key rather than more entries on that row
+# for one reason: that row is `media-macos` AND `media-cuda`, and the Windows CUDA lane
+# materializes it by key. Folding these 58.568 GB of text encoder into it would put those bytes on
+# a shared dev box whose lane reads not one of them. Only `mlx-minimax-h3` materializes this key.
+#
+# WHY IT IS FETCHED AT ALL. `real_weight_te_context_matches_the_official_conditioner` is the only
+# executable parity gate on the component that sets this family's entire ~53 GB memory floor. Its
+# `select_hidden = 50` and its no-chat-template presentation are documented in the MODEL CARD
+# ALONE, and the absence of this gate is how sc-18741 shipped a chat-template prefix into the
+# conditioning the DiT sees. sc-18932 deliberately scoped the fetch out and was right to for an
+# inventory story; the consequence was that the gate asserted-rather-than-skipped on an artifact
+# nobody could point it at, which is a red lane, not coverage.
+#
+# TWELVE OF THE FOURTEEN SHARDS, and twelve is a MIRROR of production rather than a derived
+# minimum: it is exactly `TE_SHARDS` (`1..=12`, declared at
+# `crates/media/mlx-gen/mlx-gen-minimax-h3/src/text_encoder/mod.rs:376`), the range the `t2va`
+# loader itself maps. ELEVEN would in fact serve the layer-50 tap — measured from this revision's
+# own shard headers, `embed_tokens` and decoder layers 0-49 live entirely in shards 1-11 (53.692
+# GB), and shard 12 carries only layers 53-58, none of which the tap executes. Fetching `TE_SHARDS`
+# verbatim is what stops this row and the loader drifting apart; it is not a floor.
+#
+# WHAT THE TRIM SAVES, measured from the same headers: shards 13-14, **8.147 GB**, so 58.568 GB
+# fetched rather than the component's full 66.715 GB. That is NOT the 15.209 GB
+# `te_layer_50_tap_is_exhaustive_and_the_tail_is_trimmable` asserts — that is a different quantity,
+# the TENSOR bytes of layers 50-63 + `lm_head` + `norm`, which straddle shards 11-14 and therefore
+# cannot all be dropped at shard granularity. Nor is that test this list's keeper: it reads
+# `weight_map` KEYS and config dims only, never which shard a tensor lives in, so it passes
+# bit-identically under any re-sharding. The keeper is
+# `real_weight_te_context_matches_the_official_conditioner`, which maps
+# `model-00001-of-00014` .. `model-00012-of-00014` by literal filename and panics on a missing one.
+#
+# DROPPING SHARD 14 DROPS THE WHOLE QWEN3-VL VISION TOWER: all 351 `model.visual.*` tensors live in
+# shard 14 and nowhere else (`VISION_SHARD = 14`, same module). Nothing this lane runs today reads
+# one of them, so the omission is correct as it stands — but the first `fl2va` / `ref2va` gate
+# needs the vision half, and will need a thirteenth entry here to get it.
+#
+# `expected_files` names two shards rather than the index. Listing
+# `text_encoder/model.safetensors.index.json` would make `verify_model_snapshot.py` walk its
+# `weight_map` and demand all fourteen — including the two this row deliberately does not fetch.
+# The first and twelfth are the two ends of the range, so a truncated transfer fails here rather
+# than 50 layers into a Metal forward.
+#
+# THE BYTES WERE NEVER THE ONLY BLOCKER, and sc-19558 was right to say so: this gate also needs
+# `MINIMAX_H3_TE_REFERENCE`, a ~226 KB context artifact an operator produces by hand with
+# `crates/media/mlx-gen/tools/dump_minimax_h3_te_real.py`, and it asserts rather than skips when
+# that is absent — so a key added on its own would fetch 58.568 GB per run and then red the lane.
+# sc-19558 closed with "add the key in the same change that sets the variable"; THIS is that change.
+# The `mlx-minimax-h3` job passes `vars.MINIMAX_H3_TE_REFERENCE` into the test environment and
+# preflights it — unset, non-absolute or empty fails the job with a named message BEFORE the fetch,
+# so the lane refuses to report green without it rather than paying 58.568 GB to red.
+[[models]]
+key = "minimax-h3-text-encoder"
+repository = "MiniMaxAI/MiniMax-H3"
+revision = "939557dc319dd91227e30195a763f272ba7f8765"
+license = "MiniMax H3 Community License Agreement"
+size_class = "very-large"
+profiles = ["media-macos"]
+environment = ["MINIMAX_H3_SNAPSHOT"]
+download_files = [
+  "text_encoder/config.json",
+  "text_encoder/model.safetensors.index.json",
+  "text_encoder/model-00001-of-00014.safetensors",
+  "text_encoder/model-00002-of-00014.safetensors",
+  "text_encoder/model-00003-of-00014.safetensors",
+  "text_encoder/model-00004-of-00014.safetensors",
+  "text_encoder/model-00005-of-00014.safetensors",
+  "text_encoder/model-00006-of-00014.safetensors",
+  "text_encoder/model-00007-of-00014.safetensors",
+  "text_encoder/model-00008-of-00014.safetensors",
+  "text_encoder/model-00009-of-00014.safetensors",
+  "text_encoder/model-00010-of-00014.safetensors",
+  "text_encoder/model-00011-of-00014.safetensors",
+  "text_encoder/model-00012-of-00014.safetensors",
+]
+expected_files = [
+  "text_encoder/config.json",
+  "text_encoder/model-00001-of-00014.safetensors",
+  "text_encoder/model-00012-of-00014.safetensors",
 ]
 
 # ── MiniMax-H3 DiT component (sc-19558) ──────────────────────────────────────────────────────────
@@ -1892,16 +1988,6 @@ expected_files = [
   "transformer_ref/config.json",
   "transformer_ref/diffusion_pytorch_model.safetensors.index.json",
 ]
-
-# NO `minimax-h3-text-encoder` KEY, and the reason is NOT the bytes — this is the correction of
-# record sc-19558 owed. `real_weight_te_context_matches_the_official_conditioner` was recorded above
-# as blocked because it "needs the 62 GB `text_encoder/`", and a key exactly like `minimax-h3-dit`
-# would supply those bytes in one line. It would not make the gate run: the test ALSO requires
-# `MINIMAX_H3_TE_REFERENCE`, an UNSET repository variable pointing at a ~220 KB context artifact an
-# operator produces by hand with `tools/dump_minimax_h3_te_real.py`, and it asserts rather than skips
-# when that is absent — so a key added today would fetch 62 GB per run and then red the lane. It is
-# blocked on the reference artifact and the repository variable, not on the allow-list. Add the key
-# in the same change that sets the variable.
 
 # ── MiniMax-H3 DiT tiers (sc-17150) ─────────────────────────────────────────────────────────────
 # `SceneWorks/minimax-h3-mlx` hosts ONLY the tiered DiT. The text encoder, both VAEs and the
