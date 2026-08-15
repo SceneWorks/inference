@@ -999,8 +999,11 @@ fn the_comfyui_key_space_is_still_detected_and_the_diffusers_one_is_not() {
 /// `__metadata__`, PEFT-blob and no-alpha routes — the first of which is the ONLY spelling any
 /// published file for this family uses — never reached the block-diagonal `÷3` and folded attention
 /// 3× too strong at rel-max-abs `2.007e0`, installing `Ok`.
-#[test]
-fn a_converted_comfyui_file_folds_like_its_diffusers_twin() {
+///
+/// Each spelling is **its own `#[test]`** (see the generated arms below) rather than an inner loop,
+/// so a regression names the route it broke instead of only the gate, and a mutation can be shown to
+/// red one route while leaving the others green.
+fn assert_twin_equivalence(spelling: AlphaSpelling) {
     let cfg = dit_fixture_config();
     let dir = tempfile::tempdir().unwrap();
     let (qkv, fc1) = twin_factors(&cfg);
@@ -1019,77 +1022,130 @@ fn a_converted_comfyui_file_folds_like_its_diffusers_twin() {
         (true, &qkv, "block-diagonal (the lightx2v twin shape)"),
         (false, &shared_qkv, "shared-A (natively fused training)"),
     ] {
-        for spelling in ALPHA_SPELLINGS {
-            // The diffusers control declares, per target, exactly what the conversion must arrive
-            // at: `FUSED_ALPHA/3` (or `DEFAULT_LORA_ALPHA/3`) on a block-diagonal un-fuse, and the
-            // undivided value when the rank was not split.
-            let want_alpha = expected_target_alpha(spelling, block_diagonal);
-            let label = format!("{form} / {spelling:?} (per-target alpha {want_alpha})");
-            let diffusers = write_diffusers_twin(
-                dir.path(),
-                &format!("twin_{block_diagonal}_{spelling:?}.safetensors"),
-                want_alpha,
-                twin_qkv,
-                (&fc1.0, &fc1.1),
+        // The diffusers control declares, per target, exactly what the conversion must arrive at:
+        // `FUSED_ALPHA/3` (or `DEFAULT_LORA_ALPHA/3`) on a block-diagonal un-fuse, and the undivided
+        // value when the rank was not split.
+        let want_alpha = expected_target_alpha(spelling, block_diagonal);
+        let label = format!("{form} / {spelling:?} (per-target alpha {want_alpha})");
+        let diffusers = write_diffusers_twin(
+            dir.path(),
+            &format!("twin_{block_diagonal}_{spelling:?}.safetensors"),
+            want_alpha,
+            twin_qkv,
+            (&fc1.0, &fc1.1),
+        );
+        let comfy = write_comfyui_twin(
+            dir.path(),
+            &format!("comfy_{block_diagonal}_{spelling:?}.safetensors"),
+            &cfg,
+            FUSED_ALPHA,
+            spelling,
+            block_diagonal,
+            twin_qkv,
+            (&fc1.0, &fc1.1),
+        );
+
+        for probe in [
+            "transformer_blocks.0.attn.to_q",
+            "transformer_blocks.0.attn.to_k",
+            "transformer_blocks.0.attn.to_v",
+            "transformer_blocks.0.ff.net.0.proj",
+        ] {
+            let segs: Vec<&str> = probe.split('.').collect();
+            let (_, inn) = target_shape(&cfg, probe);
+            let x = tensor(&[1, 4, inn], 0.31);
+
+            // The bare base is the same for both files, so it is computed once per probe.
+            let mut base = tiny_dit(&cfg);
+            let y0 = base.adaptable_mut(&segs).unwrap().forward(&x).unwrap();
+            let residual = |file: &Path| -> Tensor {
+                let mut adapted = tiny_dit(&cfg);
+                apply_minimax_h3_adapters(&mut adapted, &[spec(file.to_path_buf(), 1.0)])
+                    .expect("install");
+                let y1 = adapted.adaptable_mut(&segs).unwrap().forward(&x).unwrap();
+                (y1 - &y0).unwrap()
+            };
+
+            let want = residual(&diffusers);
+            let got = residual(&comfy);
+            assert!(
+                max_abs(&want) > 1e-4,
+                "{probe}: the twin's own residual must be non-trivial, else the comparison is \
+                 vacuous"
             );
-            let comfy = write_comfyui_twin(
-                dir.path(),
-                &format!("comfy_{block_diagonal}_{spelling:?}.safetensors"),
-                &cfg,
-                FUSED_ALPHA,
-                spelling,
-                block_diagonal,
-                twin_qkv,
-                (&fc1.0, &fc1.1),
+            let drift = rel_max_abs(&got, &want);
+            // The **fold ratio** is the quantity the defect is stated in — an undivided alpha on a
+            // block-diagonal split reads 3.007×, and the fix reads 1.000×. Printed alongside the
+            // gated relative max-abs-diff (never cosine: a pure fold-ratio error is exactly a scale
+            // error, and cosine is scale-invariant).
+            let ratio = max_abs(&got) / max_abs(&want);
+            println!(
+                "[{label}] {probe}: fold ratio {ratio:.4}x, converted-vs-twin rel-max-abs = \
+                 {drift:.3e}"
             );
-
-            for probe in [
-                "transformer_blocks.0.attn.to_q",
-                "transformer_blocks.0.attn.to_k",
-                "transformer_blocks.0.attn.to_v",
-                "transformer_blocks.0.ff.net.0.proj",
-            ] {
-                let segs: Vec<&str> = probe.split('.').collect();
-                let (_, inn) = target_shape(&cfg, probe);
-                let x = tensor(&[1, 4, inn], 0.31);
-
-                // The bare base is the same for both files, so it is computed once per probe.
-                let mut base = tiny_dit(&cfg);
-                let y0 = base.adaptable_mut(&segs).unwrap().forward(&x).unwrap();
-                let residual = |file: &Path| -> Tensor {
-                    let mut adapted = tiny_dit(&cfg);
-                    apply_minimax_h3_adapters(&mut adapted, &[spec(file.to_path_buf(), 1.0)])
-                        .expect("install");
-                    let y1 = adapted.adaptable_mut(&segs).unwrap().forward(&x).unwrap();
-                    (y1 - &y0).unwrap()
-                };
-
-                let want = residual(&diffusers);
-                let got = residual(&comfy);
-                assert!(
-                    max_abs(&want) > 1e-4,
-                    "{probe}: the twin's own residual must be non-trivial, else the comparison is \
-                     vacuous"
-                );
-                let drift = rel_max_abs(&got, &want);
-                // The **fold ratio** is the quantity the defect is stated in — an undivided alpha
-                // on a block-diagonal split reads 3.007×, and the fix reads 1.000×. Printed
-                // alongside the gated relative max-abs-diff (never cosine: a pure fold-ratio error
-                // is exactly a scale error, and cosine is scale-invariant).
-                let ratio = max_abs(&got) / max_abs(&want);
-                println!(
-                    "[{label}] {probe}: fold ratio {ratio:.4}x, converted-vs-twin rel-max-abs = \
-                     {drift:.3e}"
-                );
-                assert!(
-                    drift < 1e-2,
-                    "{label} / {probe}: a converted ComfyUI file must fold like its diffusers twin \
-                     whatever spelling carried its alpha; got fold ratio {ratio:.4}x, rel-max-abs \
-                     {drift:.3e}"
-                );
-            }
+            assert!(
+                drift < 1e-2,
+                "{label} / {probe}: a converted ComfyUI file must fold like its diffusers twin \
+                 whatever spelling carried its alpha; got fold ratio {ratio:.4}x, rel-max-abs \
+                 {drift:.3e}"
+            );
         }
     }
+}
+
+/// One `#[test]` per alpha spelling, for both the residual gate and the emitted-alpha gate.
+///
+/// The point of the split is diagnostic resolution: the sc-19443 blocker made exactly three of the
+/// four routes wrong, and a single test covering all four can only say "the gate failed".
+macro_rules! per_alpha_spelling {
+    ($($name:ident, $chain:ident => $spelling:expr;)+) => {
+        /// Exactly the spellings the arms below were generated for — cross-checked against
+        /// [`ALPHA_SPELLINGS`] by `every_alpha_spelling_has_generated_arms`.
+        const GENERATED_SPELLINGS: &[AlphaSpelling] = &[$($spelling),+];
+        $(
+            #[test]
+            fn $name() {
+                assert_twin_equivalence($spelling);
+            }
+
+            #[test]
+            fn $chain() {
+                assert_alpha_resolves_before_the_split($spelling);
+            }
+        )+
+    };
+}
+
+per_alpha_spelling! {
+    a_converted_comfyui_file_folds_like_its_diffusers_twin_in_band,
+        the_in_band_alpha_resolves_before_the_qkv_split => AlphaSpelling::InBand;
+    a_converted_comfyui_file_folds_like_its_diffusers_twin_peft_blob,
+        the_peft_blob_alpha_resolves_before_the_qkv_split => AlphaSpelling::PeftBlob;
+    a_converted_comfyui_file_folds_like_its_diffusers_twin_metadata,
+        the_metadata_alpha_resolves_before_the_qkv_split => AlphaSpelling::TopLevelMetadata;
+    a_converted_comfyui_file_folds_like_its_diffusers_twin_absent,
+        an_absent_alpha_resolves_before_the_qkv_split => AlphaSpelling::Absent;
+}
+
+/// **Every `AlphaSpelling` gets generated arms.** A fifth spelling added to the enum breaks the
+/// exhaustive `match` below until it is listed in [`ALPHA_SPELLINGS`], and the membership check then
+/// forces it into the `per_alpha_spelling!` list too — so the gate cannot silently go back to
+/// covering a subset, which is precisely how it missed the `__metadata__` route.
+#[test]
+fn every_alpha_spelling_has_generated_arms() {
+    for s in ALPHA_SPELLINGS {
+        match s {
+            AlphaSpelling::InBand
+            | AlphaSpelling::PeftBlob
+            | AlphaSpelling::TopLevelMetadata
+            | AlphaSpelling::Absent => {}
+        }
+        assert!(
+            GENERATED_SPELLINGS.contains(&s),
+            "{s:?} has no generated twin-equivalence arm"
+        );
+    }
+    assert_eq!(GENERATED_SPELLINGS.len(), ALPHA_SPELLINGS.len());
 }
 
 /// **The alpha is resolved through the WHOLE chain before the qkv split, in every spelling.**
@@ -1107,8 +1163,7 @@ fn a_converted_comfyui_file_folds_like_its_diffusers_twin() {
 /// * its value is the resolved alpha divided by three **iff** the rank was;
 /// * `fc1`'s alpha is untouched by the qkv spelling, so the division is not a blanket file-level
 ///   rescale that happens to land right on q/k/v.
-#[test]
-fn every_alpha_spelling_resolves_before_the_qkv_split() {
+fn assert_alpha_resolves_before_the_split(spelling: AlphaSpelling) {
     let cfg = dit_fixture_config();
     let dir = tempfile::tempdir().unwrap();
     let (qkv, fc1) = twin_factors(&cfg);
@@ -1126,50 +1181,60 @@ fn every_alpha_spelling_resolves_before_the_qkv_split() {
     };
 
     for block_diagonal in [true, false] {
-        for spelling in ALPHA_SPELLINGS {
-            let f = write_comfyui_twin(
-                dir.path(),
-                &format!("chain_{block_diagonal}_{spelling:?}.safetensors"),
-                &cfg,
-                FUSED_ALPHA,
-                spelling,
-                block_diagonal,
-                &qkv,
-                (&fc1.0, &fc1.1),
-            );
-            let want = expected_target_alpha(spelling, block_diagonal);
-            for n in ["to_q", "to_k", "to_v"] {
-                let got = read(&f, &format!("transformer_blocks.0.attn.{n}.alpha"));
-                assert_eq!(
-                    got, want,
-                    "{spelling:?} / block_diagonal={block_diagonal} / {n}: the fused alpha must be \
-                     resolved through in-band → PEFT blob → __metadata__ → DEFAULT_LORA_ALPHA and \
-                     THEN divided by three iff the rank was; got {got}, want {want}"
-                );
-            }
-            // The unfused feed-forward alpha rides along untouched, in every arm.
+        let f = write_comfyui_twin(
+            dir.path(),
+            &format!("chain_{block_diagonal}_{spelling:?}.safetensors"),
+            &cfg,
+            FUSED_ALPHA,
+            spelling,
+            block_diagonal,
+            &qkv,
+            (&fc1.0, &fc1.1),
+        );
+        let want = expected_target_alpha(spelling, block_diagonal);
+        for n in ["to_q", "to_k", "to_v"] {
+            let got = read(&f, &format!("transformer_blocks.0.attn.{n}.alpha"));
             assert_eq!(
-                read(&f, "transformer_blocks.0.ff.net.0.proj.alpha"),
-                FC1_ALPHA,
-                "{spelling:?}: an unfused module's alpha must not be divided"
+                got, want,
+                "{spelling:?} / block_diagonal={block_diagonal} / {n}: the fused alpha must be \
+                 resolved through in-band → PEFT blob → __metadata__ → DEFAULT_LORA_ALPHA and THEN \
+                 divided by three iff the rank was; got {got}, want {want}"
             );
-            // Non-vacuity: on the block-diagonal form no arm may land on the default fold, or a
-            // converter that dropped the alpha entirely would pass. (`FUSED_ALPHA/3 = 16` and
-            // `DEFAULT_LORA_ALPHA/3 = 8/3`; neither is `DEFAULT_LORA_ALPHA`.)
-            if block_diagonal {
-                assert_ne!(
-                    want, DEFAULT_LORA_ALPHA,
-                    "{spelling:?}: this arm must not assert the default alpha"
-                );
-            }
+        }
+        // The unfused feed-forward alpha rides along untouched, in every arm.
+        assert_eq!(
+            read(&f, "transformer_blocks.0.ff.net.0.proj.alpha"),
+            FC1_ALPHA,
+            "{spelling:?}: an unfused module's alpha must not be divided"
+        );
+        // Non-vacuity: on the block-diagonal form no arm may land on the default alpha, or a
+        // converter that dropped the alpha entirely would pass. (`FUSED_ALPHA/3 = 16` and
+        // `DEFAULT_LORA_ALPHA/3 = 8/3`; neither is `DEFAULT_LORA_ALPHA`.)
+        if block_diagonal {
+            assert_ne!(
+                want, DEFAULT_LORA_ALPHA,
+                "{spelling:?}: this arm must not assert the default alpha"
+            );
         }
     }
+}
 
-    // The published pairing, stated as the invariant the division exists to hold.
+/// The published pairing, stated as the invariant the block-diagonal division exists to hold.
+#[test]
+fn the_alpha_division_holds_alpha_over_rank_fixed_across_the_unfuse() {
     assert_eq!(
         alpha_rank_fold(24.0, 3.0 * PUBLISHED_RANK as f32),
         alpha_rank_fold(8.0, PUBLISHED_RANK as f32),
         "the division exists to hold alpha/rank fixed across the un-fuse"
+    );
+    assert_eq!(
+        alpha_rank_fold(FUSED_ALPHA / 3.0, PUBLISHED_RANK as f32),
+        0.125
+    );
+    assert_ne!(
+        alpha_rank_fold(FUSED_ALPHA / 3.0, PUBLISHED_RANK as f32),
+        alpha_rank_fold(DEFAULT_LORA_ALPHA, PUBLISHED_RANK as f32),
+        "FUSED_ALPHA is chosen so no arm asserts the default fold"
     );
 }
 

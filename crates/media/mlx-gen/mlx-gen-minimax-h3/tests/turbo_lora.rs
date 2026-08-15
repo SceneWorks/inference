@@ -591,13 +591,81 @@ fn a_peft_blob_rank_disagreeing_with_the_factors_is_refused() {
 
 // ─── sc-19443: the ComfyUI key space ───────────────────────────────────────────────────────────
 
+/// **Where a ComfyUI export stamps the alpha of its fused `attn.qkv_proj`.**
+///
+/// The fixture generator used to emit the in-band `.alpha` tensor and nothing else, which made the
+/// twin-equivalence gate — a well-built gate — span exactly **one of four** spellings. The other
+/// three routed around the conversion's block-diagonal `÷3` and folded attention 3× too strong with
+/// no error, and the gate could not see any of them. The generator is parameterized over this so
+/// every arm below runs four times.
+///
+/// The `__metadata__` spelling is not a hypothetical: it is what **every published lightx2v file**
+/// uses, and none of them carries an in-band `.alpha` at all. On this lane the PEFT blob is a second
+/// bypass, because `apply_one_lora` honors it too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AlphaSpelling {
+    /// A per-target `.alpha` tensor beside the factors — the kohya / ComfyUI in-band convention,
+    /// and the only spelling the original fixture generator could write.
+    InBand,
+    /// A PEFT `lora_adapter_metadata` JSON blob in the top-level `__metadata__` (sc-5513).
+    PeftBlob,
+    /// A bare top-level `__metadata__["alpha"]` string — the lightx2v spelling.
+    TopLevelMetadata,
+    /// No alpha anywhere; resolution must land on `DEFAULT_LORA_ALPHA` **and still divide it**.
+    Absent,
+}
+
+/// Every spelling, so an arm cannot quietly cover three of four.
+const ALPHA_SPELLINGS: [AlphaSpelling; 4] = [
+    AlphaSpelling::InBand,
+    AlphaSpelling::PeftBlob,
+    AlphaSpelling::TopLevelMetadata,
+    AlphaSpelling::Absent,
+];
+
+/// The alpha the fused `qkv_proj` declares, in whichever spelling is under test.
+///
+/// **48, not the published 24.** `24/3 = 8` is `DEFAULT_LORA_ALPHA`, so the published pairing cannot
+/// distinguish "divided the resolved alpha" from "dropped the alpha and defaulted". `48/3 = 16`
+/// distinguishes them.
+const FUSED_ALPHA: f32 = 48.0;
+
+/// The in-band alpha the twin's `mlp.fc1` carries, in **every** arm.
+///
+/// `fc1` is not fused, so its alpha is never divided and its spelling is not what is under test. It
+/// is pinned in-band — where it outranks every file-level source — so that varying the *qkv*
+/// spelling changes exactly one thing. Non-default, and different from every qkv value, so a
+/// conversion that crossed the two alphas over is visible rather than symmetric.
+const FC1_ALPHA: f32 = 32.0;
+
+/// What the converted per-target `.alpha` **must** be: the resolved fused alpha, divided by three
+/// exactly when the block-diagonal un-fuse divided the rank by three.
+///
+/// Written out here rather than read back from the converter, so this is an independent statement of
+/// the rule and not a restatement of the implementation.
+fn expected_target_alpha(spelling: AlphaSpelling, block_diagonal: bool) -> f32 {
+    let resolved = match spelling {
+        AlphaSpelling::Absent => DEFAULT_LORA_ALPHA,
+        _ => FUSED_ALPHA,
+    };
+    if block_diagonal {
+        resolved / 3.0
+    } else {
+        resolved
+    }
+}
+
 /// Write a **ComfyUI** twin of one block's modules, built from the same factors a diffusers twin
 /// would carry, so any difference in the folded result is the conversion's fault.
+///
+/// `block_diagonal` selects which of the two legitimate fused forms to write; `spelling` selects
+/// **where the fused alpha lives**, which is the axis the equivalence gate was blind along.
 fn write_comfyui_twin(
     dir: &Path,
     name: &str,
     cfg: &MiniMaxH3DitConfig,
     alpha: f32,
+    spelling: AlphaSpelling,
     block_diagonal: bool,
     qkv: &[(Array, Array); 3],
     fc1: (&Array, &Array),
@@ -636,10 +704,13 @@ fn write_comfyui_twin(
             .expect("concat B");
         arrays.push(("blocks.0.attn.qkv_proj.lora_B.weight".into(), b));
     }
-    arrays.push((
-        "blocks.0.attn.qkv_proj.alpha".into(),
-        Array::from_slice(&[alpha], &[1]),
-    ));
+    // The fused alpha, written into exactly ONE of the four places it can live.
+    if spelling == AlphaSpelling::InBand {
+        arrays.push((
+            "blocks.0.attn.qkv_proj.alpha".into(),
+            Array::from_slice(&[alpha], &[1]),
+        ));
+    }
 
     // `mlp.fc1` carries the SwiGLU halves the OTHER way round — `[gate | value]` where the DiT is
     // `[value | gate]` — so the twin's B is the diffusers B with its row halves swapped.
@@ -651,23 +722,50 @@ fn write_comfyui_twin(
     let swapped = concatenate_axis(&[bottom, top], 0).expect("swap halves");
     arrays.push(("blocks.0.mlp.fc1.lora_A.weight".into(), fc1_a.clone()));
     arrays.push(("blocks.0.mlp.fc1.lora_B.weight".into(), swapped));
+    // `fc1` is unfused, so its alpha is never divided — pinned in-band in every arm so the only
+    // thing `spelling` varies is the fused module's.
+    arrays.push((
+        "blocks.0.mlp.fc1.alpha".into(),
+        Array::from_slice(&[FC1_ALPHA], &[1]),
+    ));
 
-    let meta: HashMap<String, String> = [(
+    let mut meta: HashMap<String, String> = [(
         "target_format".to_string(),
         "ComfyUI generic LoRA".to_string(),
     )]
     .into_iter()
     .collect();
+    match spelling {
+        // The in-band tensor is already written above; nothing goes in the header.
+        AlphaSpelling::InBand | AlphaSpelling::Absent => {}
+        // `r` equals the per-target factor rank on BOTH fused forms (a block-diagonal `[3r, in]` A
+        // splits into three rank-`r` ones), so this blob is self-consistent and is not rejected by
+        // the rank cross-check — it is the alpha, and only the alpha, that is under test.
+        AlphaSpelling::PeftBlob => {
+            meta.insert(
+                "lora_adapter_metadata".to_string(),
+                format!(r#"{{"lora_alpha": {alpha}, "r": {PUBLISHED_RANK}}}"#),
+            );
+        }
+        AlphaSpelling::TopLevelMetadata => {
+            meta.insert("alpha".to_string(), alpha.to_string());
+        }
+    }
     let entries: Vec<(&str, &Array)> = arrays.iter().map(|(k, v)| (k.as_str(), v)).collect();
     Array::save_safetensors(entries, Some(&meta), &path).expect("write the comfyui twin");
     path
 }
 
 /// Write the **diffusers** counterpart of [`write_comfyui_twin`]'s modules, from the same factors.
+///
+/// Every target carries an explicit in-band `.alpha`: `qkv_alpha` on q/k/v and [`FC1_ALPHA`] on the
+/// feed-forward input. The header's `alpha` is deliberately a value **no target should ever reach**
+/// — if the control itself started falling through to a file-level alpha, its residual would move
+/// and the comparison would stop meaning what it claims.
 fn write_diffusers_twin(
     dir: &Path,
     name: &str,
-    alpha: f32,
+    qkv_alpha: f32,
     qkv: &[(Array, Array); 3],
     fc1: (&Array, &Array),
 ) -> PathBuf {
@@ -684,7 +782,7 @@ fn write_diffusers_twin(
         ));
         arrays.push((
             format!("transformer_blocks.0.attn.{n}.alpha"),
-            Array::from_slice(&[alpha], &[1]),
+            Array::from_slice(&[qkv_alpha], &[1]),
         ));
     }
     arrays.push((
@@ -695,7 +793,11 @@ fn write_diffusers_twin(
         "transformer_blocks.0.ff.net.0.proj.lora_B.default.weight".into(),
         fc1.1.clone(),
     ));
-    let meta: HashMap<String, String> = [("alpha".to_string(), alpha.to_string())]
+    arrays.push((
+        "transformer_blocks.0.ff.net.0.proj.alpha".into(),
+        Array::from_slice(&[FC1_ALPHA], &[1]),
+    ));
+    let meta: HashMap<String, String> = [("alpha".to_string(), "1".to_string())]
         .into_iter()
         .collect();
     let entries: Vec<(&str, &Array)> = arrays.iter().map(|(k, v)| (k.as_str(), v)).collect();
@@ -739,8 +841,17 @@ fn twin_factors(cfg: &MiniMaxH3DitConfig) -> ([(Array, Array); 3], (Array, Array
 /// **Both fused forms are covered.** Block-diagonal is the lightx2v twins' shape; shared-`A` is what
 /// a LoRA trained natively on the fused module looks like, and it carries a DIFFERENT adapter (one
 /// down factor shared by all three projections), so it gets its own twin.
-#[test]
-fn a_converted_comfyui_file_folds_like_its_diffusers_twin() {
+///
+/// **And all four alpha spellings are covered**, which is the sc-19443 review's finding. The gate
+/// itself was sound; its fixture generator only ever wrote the in-band `.alpha` tensor, so the
+/// `__metadata__`, PEFT-blob and no-alpha routes — the first of which is the ONLY spelling any
+/// published file for this family uses — never reached the block-diagonal `÷3` and folded attention
+/// 3× too strong at rel-max-abs `2.007e0`, installing `Ok`.
+///
+/// Each spelling is **its own `#[test]`** (see the generated arms below) rather than an inner loop,
+/// so a regression names the route it broke instead of only the gate, and a mutation can be shown to
+/// red one route while leaving the others green.
+fn assert_twin_equivalence(spelling: AlphaSpelling) {
     let cfg = dit_fixture_config();
     let dir = tempfile::tempdir().expect("fixture dir");
     let (qkv, fc1) = twin_factors(&cfg);
@@ -750,34 +861,28 @@ fn a_converted_comfyui_file_folds_like_its_diffusers_twin() {
         (qkv[0].0.clone(), qkv[2].1.clone()),
     ];
 
-    // Both arms land on a per-target alpha of 8: the published `24 / 3` for the block-diagonal
-    // form, and an unchanged `8` for the shared-`A` one. Both fold at 8/128 = 0.0625.
-    for (block_diagonal, fused_alpha, twin_qkv, label) in [
-        (
-            true,
-            24.0f32,
-            &qkv,
-            "block-diagonal (the lightx2v twin shape)",
-        ),
-        (
-            false,
-            8.0f32,
-            &shared_qkv,
-            "shared-A (natively fused training)",
-        ),
+    for (block_diagonal, twin_qkv, form) in [
+        (true, &qkv, "block-diagonal (the lightx2v twin shape)"),
+        (false, &shared_qkv, "shared-A (natively fused training)"),
     ] {
+        // The diffusers control declares, per target, exactly what the conversion must arrive at:
+        // `FUSED_ALPHA/3` (or `DEFAULT_LORA_ALPHA/3`) on a block-diagonal un-fuse, and the undivided
+        // value when the rank was not split.
+        let want_alpha = expected_target_alpha(spelling, block_diagonal);
+        let label = format!("{form} / {spelling:?} (per-target alpha {want_alpha})");
         let diffusers = write_diffusers_twin(
             dir.path(),
-            &format!("twin_{block_diagonal}.safetensors"),
-            8.0,
+            &format!("twin_{block_diagonal}_{spelling:?}.safetensors"),
+            want_alpha,
             twin_qkv,
             (&fc1.0, &fc1.1),
         );
         let comfy = write_comfyui_twin(
             dir.path(),
-            &format!("comfy_{block_diagonal}.safetensors"),
+            &format!("comfy_{block_diagonal}_{spelling:?}.safetensors"),
             &cfg,
-            fused_alpha,
+            FUSED_ALPHA,
+            spelling,
             block_diagonal,
             twin_qkv,
             (&fc1.0, &fc1.1),
@@ -792,13 +897,14 @@ fn a_converted_comfyui_file_folds_like_its_diffusers_twin() {
             let segs: Vec<&str> = probe.split('.').collect();
             let x = tensor(&[1, 4, cfg.hidden_size], 0.31);
 
+            // The bare base is the same for both files, so it is computed once per probe.
+            let mut base = tiny_dit(&cfg);
+            let y0 = base
+                .adaptable_mut(&segs)
+                .expect("probe")
+                .forward(&x)
+                .expect("base forward");
             let residual = |file: &Path| -> Array {
-                let mut base = tiny_dit(&cfg);
-                let y0 = base
-                    .adaptable_mut(&segs)
-                    .expect("probe")
-                    .forward(&x)
-                    .expect("base forward");
                 let mut adapted = tiny_dit(&cfg);
                 apply_minimax_h3_adapters(&mut adapted, &[spec(file.to_path_buf(), 1.0)])
                     .expect("install");
@@ -817,14 +923,167 @@ fn a_converted_comfyui_file_folds_like_its_diffusers_twin() {
                 "{probe}: the twin's own residual must be non-trivial, else this is vacuous"
             );
             let drift = max_abs(&subtract(&got, &want).unwrap()) / max_abs(&want);
-            println!("[{label}] {probe}: converted-vs-twin rel-max-abs = {drift:.3e}");
+            // The **fold ratio** is the quantity the defect is stated in — an undivided alpha on a
+            // block-diagonal split reads 3.007×, and the fix reads 1.000×. Printed alongside the
+            // gated relative max-abs-diff (never cosine: a pure fold-ratio error is exactly a scale
+            // error, and cosine is scale-invariant).
+            let ratio = max_abs(&got) / max_abs(&want);
+            println!(
+                "[{label}] {probe}: fold ratio {ratio:.4}x, converted-vs-twin rel-max-abs = \
+                 {drift:.3e}"
+            );
             assert!(
                 drift < 1e-2,
-                "{label} / {probe}: a converted ComfyUI file must fold like its diffusers twin; \
-                 got rel-max-abs {drift:.3e}"
+                "{label} / {probe}: a converted ComfyUI file must fold like its diffusers twin \
+                 whatever spelling carried its alpha; got fold ratio {ratio:.4}x, rel-max-abs \
+                 {drift:.3e}"
             );
         }
     }
+}
+
+/// One `#[test]` per alpha spelling, for both the residual gate and the emitted-alpha gate.
+///
+/// The point of the split is diagnostic resolution: the sc-19443 blocker made exactly three of the
+/// four routes wrong, and a single test covering all four can only say "the gate failed".
+macro_rules! per_alpha_spelling {
+    ($($name:ident, $chain:ident => $spelling:expr;)+) => {
+        /// Exactly the spellings the arms below were generated for — cross-checked against
+        /// [`ALPHA_SPELLINGS`] by `every_alpha_spelling_has_generated_arms`.
+        const GENERATED_SPELLINGS: &[AlphaSpelling] = &[$($spelling),+];
+        $(
+            #[test]
+            fn $name() {
+                assert_twin_equivalence($spelling);
+            }
+
+            #[test]
+            fn $chain() {
+                assert_alpha_resolves_before_the_split($spelling);
+            }
+        )+
+    };
+}
+
+per_alpha_spelling! {
+    a_converted_comfyui_file_folds_like_its_diffusers_twin_in_band,
+        the_in_band_alpha_resolves_before_the_qkv_split => AlphaSpelling::InBand;
+    a_converted_comfyui_file_folds_like_its_diffusers_twin_peft_blob,
+        the_peft_blob_alpha_resolves_before_the_qkv_split => AlphaSpelling::PeftBlob;
+    a_converted_comfyui_file_folds_like_its_diffusers_twin_metadata,
+        the_metadata_alpha_resolves_before_the_qkv_split => AlphaSpelling::TopLevelMetadata;
+    a_converted_comfyui_file_folds_like_its_diffusers_twin_absent,
+        an_absent_alpha_resolves_before_the_qkv_split => AlphaSpelling::Absent;
+}
+
+/// **Every `AlphaSpelling` gets generated arms.** A fifth spelling added to the enum breaks the
+/// exhaustive `match` below until it is listed in [`ALPHA_SPELLINGS`], and the membership check then
+/// forces it into the `per_alpha_spelling!` list too — so the gate cannot silently go back to
+/// covering a subset, which is precisely how it missed the `__metadata__` route.
+#[test]
+fn every_alpha_spelling_has_generated_arms() {
+    for s in ALPHA_SPELLINGS {
+        match s {
+            AlphaSpelling::InBand
+            | AlphaSpelling::PeftBlob
+            | AlphaSpelling::TopLevelMetadata
+            | AlphaSpelling::Absent => {}
+        }
+        assert!(
+            GENERATED_SPELLINGS.contains(&s),
+            "{s:?} has no generated twin-equivalence arm"
+        );
+    }
+    assert_eq!(GENERATED_SPELLINGS.len(), ALPHA_SPELLINGS.len());
+}
+
+/// **The alpha is resolved through the WHOLE chain before the qkv split, in every spelling.**
+///
+/// The residual gate above proves the end-to-end fold; this one names the number, so a failure says
+/// *which* link broke rather than only that the folds disagree. It reads the `.alpha` the converter
+/// emitted, for all four spellings × both fused forms, and it is the guard that would have caught
+/// the sc-19443 blocker on its own.
+///
+/// Three claims per arm:
+///
+/// * a per-target `.alpha` is emitted **at all** — the old converter emitted none unless the file
+///   carried an in-band tensor, and "no alpha" is exactly how the undivided file-level value leaked
+///   back in downstream;
+/// * its value is the resolved alpha divided by three **iff** the rank was;
+/// * `fc1`'s alpha is untouched by the qkv spelling, so the division is not a blanket file-level
+///   rescale that happens to land right on q/k/v.
+fn assert_alpha_resolves_before_the_split(spelling: AlphaSpelling) {
+    let cfg = dit_fixture_config();
+    let dir = tempfile::tempdir().expect("fixture dir");
+    let (qkv, fc1) = twin_factors(&cfg);
+
+    let read = |file: &PathBuf, key: &str| -> f32 {
+        let w = Weights::from_file(file).unwrap();
+        let converted = convert_comfyui_key_space(&w).unwrap();
+        converted
+            .require(key)
+            .unwrap_or_else(|_| panic!("no converted alpha at {key}"))
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .as_slice::<f32>()[0]
+    };
+
+    for block_diagonal in [true, false] {
+        let f = write_comfyui_twin(
+            dir.path(),
+            &format!("chain_{block_diagonal}_{spelling:?}.safetensors"),
+            &cfg,
+            FUSED_ALPHA,
+            spelling,
+            block_diagonal,
+            &qkv,
+            (&fc1.0, &fc1.1),
+        );
+        let want = expected_target_alpha(spelling, block_diagonal);
+        for n in ["to_q", "to_k", "to_v"] {
+            let got = read(&f, &format!("transformer_blocks.0.attn.{n}.alpha"));
+            assert_eq!(
+                got, want,
+                "{spelling:?} / block_diagonal={block_diagonal} / {n}: the fused alpha must be \
+                 resolved through in-band → PEFT blob → __metadata__ → DEFAULT_LORA_ALPHA and THEN \
+                 divided by three iff the rank was; got {got}, want {want}"
+            );
+        }
+        // The unfused feed-forward alpha rides along untouched, in every arm.
+        assert_eq!(
+            read(&f, "transformer_blocks.0.ff.net.0.proj.alpha"),
+            FC1_ALPHA,
+            "{spelling:?}: an unfused module's alpha must not be divided"
+        );
+        // Non-vacuity: on the block-diagonal form no arm may land on the default alpha, or a
+        // converter that dropped the alpha entirely would pass. (`FUSED_ALPHA/3 = 16` and
+        // `DEFAULT_LORA_ALPHA/3 = 8/3`; neither is `DEFAULT_LORA_ALPHA`.)
+        if block_diagonal {
+            assert_ne!(
+                want, DEFAULT_LORA_ALPHA,
+                "{spelling:?}: this arm must not assert the default alpha"
+            );
+        }
+    }
+}
+
+/// The published pairing, stated as the invariant the block-diagonal division exists to hold.
+#[test]
+fn the_alpha_division_holds_alpha_over_rank_fixed_across_the_unfuse() {
+    assert_eq!(
+        alpha_rank_fold(24.0, 3.0 * PUBLISHED_RANK as f32),
+        alpha_rank_fold(8.0, PUBLISHED_RANK as f32),
+        "the division exists to hold alpha/rank fixed across the un-fuse"
+    );
+    assert_eq!(
+        alpha_rank_fold(FUSED_ALPHA / 3.0, PUBLISHED_RANK as f32),
+        0.125
+    );
+    assert_ne!(
+        alpha_rank_fold(FUSED_ALPHA / 3.0, PUBLISHED_RANK as f32),
+        alpha_rank_fold(DEFAULT_LORA_ALPHA, PUBLISHED_RANK as f32),
+        "FUSED_ALPHA is chosen so no arm asserts the default fold"
+    );
 }
 
 /// **The alpha division tracks the rank split, and lands on a NON-default number.**
@@ -858,6 +1117,7 @@ fn the_alpha_division_tracks_the_rank_split_and_is_not_the_default() {
         "a48.safetensors",
         &cfg,
         48.0,
+        AlphaSpelling::InBand,
         true,
         &qkv,
         (&fc1.0, &fc1.1),
@@ -876,6 +1136,7 @@ fn the_alpha_division_tracks_the_rank_split_and_is_not_the_default() {
         "a24.safetensors",
         &cfg,
         24.0,
+        AlphaSpelling::InBand,
         true,
         &qkv,
         (&fc1.0, &fc1.1),
@@ -892,6 +1153,7 @@ fn the_alpha_division_tracks_the_rank_split_and_is_not_the_default() {
         "shared.safetensors",
         &cfg,
         48.0,
+        AlphaSpelling::InBand,
         false,
         &qkv,
         (&fc1.0, &fc1.1),
@@ -916,6 +1178,7 @@ fn the_conversion_leaves_no_comfyui_module_behind() {
         "c.safetensors",
         &cfg,
         24.0,
+        AlphaSpelling::InBand,
         true,
         &qkv,
         (&fc1.0, &fc1.1),
@@ -1077,13 +1340,27 @@ fn published_turbo_files_resolve_to_dit_targets_at_the_measured_alphas() {
         adapter_target_paths(&cfg).into_iter().collect();
     assert_eq!(targets.len(), 312);
 
-    // file stem → (expected alpha, expected fold at rank 128). Measured off the published headers.
-    let expected: [(&str, f32); 4] = [
-        ("minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16", 128.0),
-        ("minimax_h3_fl2v_turbo_8step_v1.0_bf16", 8.0),
-        ("minimax_h3_ref2v_turbo_4step_v0.1_bf16", 8.0),
+    // file stem → (expected alpha, whether the file DECLARES it). Measured off the published
+    // headers.
+    //
+    // **The `declared` flag is what makes three of these four arms mean anything.** Three published
+    // files resolve to `8.0`, which *is* `DEFAULT_LORA_ALPHA` — so `alpha == 8.0` passes whether
+    // resolution read the header or fell straight through to the fallback, and the arms would be
+    // vacuous on their own. The published alphas cannot be changed to non-default values without
+    // making the fixture a lie about real files, so provenance is asserted instead: a `declared`
+    // file must carry a parseable `__metadata__["alpha"]` that equals the resolved value, and the
+    // undeclared one must carry no such key at all. Between the two claims, an implementation that
+    // ignored the header and always returned the default fails every `declared` arm.
+    let expected: [(&str, f32, bool); 4] = [
+        ("minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16", 128.0, true),
+        ("minimax_h3_fl2v_turbo_8step_v1.0_bf16", 8.0, true),
+        ("minimax_h3_ref2v_turbo_4step_v0.1_bf16", 8.0, true),
         // Ships NO alpha — resolves through DEFAULT_LORA_ALPHA.
-        ("minimax_h3_fl2v_turbo_4step_v0.1", DEFAULT_LORA_ALPHA),
+        (
+            "minimax_h3_fl2v_turbo_4step_v0.1",
+            DEFAULT_LORA_ALPHA,
+            false,
+        ),
     ];
     let comfy = [
         "minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16",
@@ -1092,7 +1369,7 @@ fn published_turbo_files_resolve_to_dit_targets_at_the_measured_alphas() {
     ];
 
     let mut examined = 0usize;
-    for (stem, want_alpha) in expected {
+    for (stem, want_alpha, declared) in expected {
         let path = dir.join(format!("{stem}.safetensors"));
         assert!(path.is_file(), "missing {}", path.display());
         let w = Weights::from_file(&path).unwrap_or_else(|e| panic!("read {stem}: {e}"));
@@ -1104,6 +1381,41 @@ fn published_turbo_files_resolve_to_dit_targets_at_the_measured_alphas() {
 
         let alpha = resolve_alpha(&w).unwrap_or_else(|e| panic!("{stem} alpha: {e}"));
         assert_eq!(alpha, want_alpha, "{stem} alpha");
+        // Provenance, so the three `8.0` arms are not just re-asserting `DEFAULT_LORA_ALPHA`.
+        let raw = w.metadata("alpha");
+        assert_eq!(
+            raw.is_some(),
+            declared,
+            "{stem}: expected __metadata__[\"alpha\"] to be {}, got {raw:?}",
+            if declared { "present" } else { "absent" }
+        );
+        match raw {
+            Some(s) => assert_eq!(
+                s.trim().parse::<f32>().ok(),
+                Some(want_alpha),
+                "{stem}: the resolved alpha must come FROM the header, not from the fallback"
+            ),
+            None => assert_eq!(
+                alpha, DEFAULT_LORA_ALPHA,
+                "{stem} declares no alpha, so it must resolve through DEFAULT_LORA_ALPHA"
+            ),
+        }
+        // No published file carries a per-target `.alpha` tensor or a PEFT blob — the two higher
+        // links of the chain — which is exactly why the `__metadata__` route has to work.
+        assert!(
+            !w.keys().any(|k| k.ends_with(".alpha")),
+            "{stem}: no published file carries an in-band .alpha"
+        );
+        assert!(
+            w.metadata("lora_adapter_metadata").is_none(),
+            "{stem}: no published file carries a PEFT blob"
+        );
+        assert!(
+            w.metadata(mlx_gen_minimax_h3::adapters::RANK_METADATA_KEY)
+                .is_none(),
+            "{stem}: no published file carries a rank key, so the rank cross-check cannot be \
+             relied on to catch an alpha error"
+        );
 
         // Collapse the 624 factor keys to module paths through the real suffix table, and check each
         // against the DiT's target surface.
@@ -1160,9 +1472,31 @@ fn published_turbo_files_resolve_to_dit_targets_at_the_measured_alphas() {
         let w = Weights::from_file(&path).unwrap_or_else(|e| panic!("read {stem}: {e}"));
         assert!(
             is_comfyui_key_space(&w),
-            "{stem} must be detected as the comfyui key space and refused"
+            "{stem} must be detected as the comfyui key space and converted"
         );
-        println!("[turbo lora] {stem}: comfyui key space — refused, use the diffusers twin");
+        // sc-19443 converts these rather than refusing them. The alpha lives in `__metadata__` on
+        // the real files too, so this is the exact route the review found unguarded.
+        let converted = convert_comfyui_key_space(&w).unwrap_or_else(|e| panic!("{stem}: {e}"));
+        assert!(
+            !is_comfyui_key_space(&converted),
+            "{stem}: the conversion must leave no ComfyUI module behind"
+        );
+        let fused_alpha = resolve_alpha(&w).unwrap_or_else(|e| panic!("{stem} alpha: {e}"));
+        let per_target = converted
+            .require("transformer_blocks.0.attn.to_q.alpha")
+            .unwrap_or_else(|_| panic!("{stem}: no per-target alpha emitted"))
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .as_slice::<f32>()[0];
+        println!(
+            "[turbo lora] {stem}: comfyui key space — converted, fused alpha {fused_alpha} => \
+             per-target {per_target}"
+        );
+        assert_eq!(
+            per_target,
+            fused_alpha / 3.0,
+            "{stem}: these files are block-diagonal, so the resolved alpha must divide by three"
+        );
         examined += 1;
     }
 
