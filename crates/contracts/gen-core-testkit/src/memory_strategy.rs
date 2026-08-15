@@ -1,10 +1,9 @@
 //! Weights-free conformance checks for the shared memory-strategy provider contract.
 
 use gen_core::{
-    LoadSpec, MemoryBehaviorRegistration, MemoryBudget, MemoryCacheState, MemoryCleanupSemantics,
-    MemoryContractFixtureRegistration, MemoryGeometry, MemoryMode, MemoryNumericTier,
-    MemoryOptimizationAuthority, MemoryPhase, MemoryProviderContract, MemoryRegistration,
-    MemoryRunContext, MemoryRunOutcome, MemorySafetyDecision, MemorySelection, MemoryStrategy,
+    LoadSpec, MemoryBehaviorRegistration, MemoryBudget, MemoryCleanupSemantics,
+    MemoryContractFixtureRegistration, MemoryPhase, MemoryProviderContract, MemoryRegistration,
+    MemoryRunContext, MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy,
     MemoryStrategyParameters, MemoryStrategySupport, Precision, ProviderRegistry,
 };
 
@@ -53,9 +52,11 @@ pub fn memory_strategy_conformance(contract: &MemoryProviderContract) {
 /// Weights-free behavioral walk over every memory-strategy registration in an explicit catalog.
 ///
 /// Static contract conformance runs for every registration. A contract that declares native/PiD
-/// decode routes receives four admission probes: each route's own geometry must be accepted, and the
-/// same geometry presented to the opposite route must be rejected. The matching-route controls keep
-/// the rejection proof non-vacuous — an always-rejecting safety check does not conform.
+/// decode routes receives four admission probes, starting from its provider-owned native/PiD
+/// behavior contexts: each route's own geometry must be accepted, and the same geometry presented to
+/// the opposite route must be rejected. Using those exact contexts keeps mode, reference, phase, and
+/// overlay axes truthful. The matching-route controls keep the rejection proof non-vacuous — an
+/// always-rejecting safety check does not conform.
 pub fn check_memory_strategy_registry(
     registry: &ProviderRegistry,
     spec: &LoadSpec,
@@ -188,13 +189,34 @@ fn check_memory_registration(
     let Some(routes) = contract.pid_decode_routes.as_ref() else {
         return;
     };
-    let Some(calibration) = contract.calibration.as_ref() else {
+    let Some(_) = contract.calibration.as_ref() else {
         errors.push(format!(
             "{}: PiD route conformance needs a calibration identity for a valid admission probe",
             registration.provider_id
         ));
         return;
     };
+    let Some(behavior) = behavior else {
+        errors.push(format!(
+            "{}: decode-route conformance needs provider-owned behavior fixtures",
+            registration.provider_id
+        ));
+        return;
+    };
+    let decode_contexts =
+        match (behavior.valid_fixtures)(spec, &contract, MemoryStrategy::BoundedDecode) {
+            Ok(fixtures) => fixtures
+                .into_iter()
+                .map(|fixture| fixture.context)
+                .collect::<Vec<_>>(),
+            Err(error) => {
+                errors.push(format!(
+                    "{}: decode-route conformance could not build provider-owned contexts: {error}",
+                    registration.provider_id
+                ));
+                return;
+            }
+        };
     let mut edges = routes.native.tile_edges.clone();
     edges.extend_from_slice(&routes.pid.tile_edges);
     edges.sort_unstable();
@@ -204,20 +226,24 @@ fn check_memory_registration(
     overlaps.dedup();
 
     for use_pid in [false, true] {
+        let Some(base_context) = decode_contexts
+            .iter()
+            .find(|context| context.use_pid == use_pid)
+        else {
+            errors.push(format!(
+                "{}: decode-route conformance lacks a provider-owned {} context",
+                registration.provider_id,
+                if use_pid { "PiD" } else { "native" }
+            ));
+            continue;
+        };
         let target = if use_pid { &routes.pid } else { &routes.native };
         let route_name = if use_pid { "PiD" } else { "native" };
         for &edge in &edges {
             for &overlap in &overlaps {
                 let expected_accept =
                     target.tile_edges.contains(&edge) && overlap == target.tile_overlap;
-                let context = route_context(
-                    calibration.abi,
-                    &calibration.fingerprint,
-                    calibration.load_shape,
-                    edge,
-                    overlap,
-                    use_pid,
-                );
+                let context = decode_probe_context(base_context, edge, overlap);
                 let decision = (registration.safety_check)(spec, &contract, &context);
                 let conforms = matches!(
                     (expected_accept, &decision),
@@ -526,54 +552,15 @@ fn check_behavior_fixture(
     }
 }
 
-fn route_context(
-    calibration_abi: u32,
-    calibration_fingerprint: &str,
-    load_shape: gen_core::LoadShape,
-    edge: u32,
-    overlap: u32,
-    use_pid: bool,
-) -> MemoryRunContext {
-    MemoryRunContext {
-        selection: MemorySelection {
-            strategy: MemoryStrategy::BoundedDecode,
-            parameters: MemoryStrategyParameters {
-                decode_tile_edge: Some(edge),
-                decode_overlap: Some(overlap),
-                ..Default::default()
-            },
-            tier: MemoryNumericTier {
-                precision: Precision::Bf16,
-                quant: None,
-                component_precision_floors: &[],
-            },
-        },
-        optimization_authority: MemoryOptimizationAuthority::Calibrated,
-        calibration_abi,
-        calibration_fingerprint: calibration_fingerprint.to_owned(),
-        load_shape,
-        mode: MemoryMode::TextToImage,
-        has_reference: false,
-        use_pid,
-        has_phases: true,
-        geometry: MemoryGeometry {
-            width: 1024,
-            height: 1024,
-            batch: 1,
-            frames: 1,
-            reference_count: 0,
-        },
-        overlay: None,
-        budget: MemoryBudget {
-            total_bytes: 8 * 1024 * 1024 * 1024,
-            committed_bytes: 0,
-            reclaimable_bytes: 0,
-            reserved_headroom_bytes: 0,
-        },
-        predicted_peak_bytes: 1024 * 1024 * 1024,
-        cache_state: MemoryCacheState::Cold,
-        evidence_revision: "weights-free-registry-conformance".to_owned(),
-    }
+fn decode_probe_context(base: &MemoryRunContext, edge: u32, overlap: u32) -> MemoryRunContext {
+    let mut context = base.clone();
+    context.selection.strategy = MemoryStrategy::BoundedDecode;
+    context.selection.parameters = MemoryStrategyParameters {
+        decode_tile_edge: Some(edge),
+        decode_overlap: Some(overlap),
+        ..Default::default()
+    };
+    context
 }
 
 #[cfg(test)]
@@ -581,10 +568,62 @@ mod tests {
     use super::*;
     use gen_core::{
         standard_memory_strategy_safety_check, MemoryBackendRealization,
-        MemoryBehaviorBeginRequest, MemoryCalibrationIdentity, MemoryDecodeRouteDomain,
-        MemoryLifecycleCapabilities, MemoryParameterRanges, MemoryPidDecodeRoutes,
-        MemoryRequestScope, MemoryRunOutcome, MemoryStrategyCapability, WeightsSource,
+        MemoryBehaviorBeginRequest, MemoryCacheState, MemoryCalibrationIdentity,
+        MemoryDecodeRouteDomain, MemoryGeometry, MemoryLifecycleCapabilities, MemoryMode,
+        MemoryNumericTier, MemoryOptimizationAuthority, MemoryParameterRanges,
+        MemoryPidDecodeRoutes, MemoryRequestScope, MemoryRunOutcome, MemorySelection,
+        MemoryStrategyCapability, WeightsSource,
     };
+
+    fn route_context(
+        calibration_abi: u32,
+        calibration_fingerprint: &str,
+        load_shape: gen_core::LoadShape,
+        edge: u32,
+        overlap: u32,
+        use_pid: bool,
+    ) -> MemoryRunContext {
+        MemoryRunContext {
+            selection: MemorySelection {
+                strategy: MemoryStrategy::BoundedDecode,
+                parameters: MemoryStrategyParameters {
+                    decode_tile_edge: Some(edge),
+                    decode_overlap: Some(overlap),
+                    ..Default::default()
+                },
+                tier: MemoryNumericTier {
+                    precision: Precision::Bf16,
+                    quant: None,
+                    component_precision_floors: &[],
+                },
+            },
+            optimization_authority: MemoryOptimizationAuthority::Calibrated,
+            calibration_abi,
+            calibration_fingerprint: calibration_fingerprint.to_owned(),
+            load_shape,
+            mode: MemoryMode::TextToImage,
+            has_reference: false,
+            use_pid,
+            has_phases: true,
+            geometry: MemoryGeometry {
+                width: 1024,
+                height: 1024,
+                batch: 1,
+                frames: 1,
+                reference_count: 0,
+            },
+            overlay: None,
+            budget: MemoryBudget {
+                total_bytes: 8 * 1024 * 1024 * 1024,
+                committed_bytes: 0,
+                reclaimable_bytes: 0,
+                reserved_headroom_bytes: 0,
+            },
+            predicted_peak_bytes: 1024 * 1024 * 1024,
+            cache_state: MemoryCacheState::Cold,
+            evidence_revision: "weights-free-registry-conformance".to_owned(),
+        }
+    }
 
     fn backend() -> MemoryBackendRealization {
         MemoryBackendRealization::MlxMetal {

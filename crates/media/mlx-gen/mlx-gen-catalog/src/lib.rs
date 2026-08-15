@@ -449,7 +449,7 @@ mod tests {
     }
 
     #[test]
-    fn krea_raw_publishes_exact_prepacked_sequential_deferred_surfaces() {
+    fn krea_base_providers_publish_exact_prepacked_sequential_deferred_surfaces() {
         use mlx_gen::gen_core::{
             LoadShape, MemoryContractSurfaceTier, MemoryStrategy, MemoryStrategySupport,
             OffloadPolicy,
@@ -457,44 +457,152 @@ mod tests {
 
         let registry = super::provider_registry().unwrap();
         let surfaces = registry.memory_contract_surfaces().unwrap();
-        let raw: Vec<_> = surfaces
-            .iter()
-            .filter(|surface| surface.contract.provider_id == "krea_2_raw")
-            .collect();
-        assert_eq!(raw.len(), 12);
+        for provider_id in [
+            "krea_2_turbo",
+            "krea_2_raw",
+            "krea_2_edit",
+            "krea_2_turbo_edit",
+        ] {
+            let provider: Vec<_> = surfaces
+                .iter()
+                .filter(|surface| surface.contract.provider_id == provider_id)
+                .collect();
+            assert_eq!(provider.len(), 12, "{provider_id}");
 
-        let mut implemented = 0;
-        for surface in raw {
-            let expected = matches!(
-                surface.resolved_artifact_tier(),
-                MemoryContractSurfaceTier::Bf16
-                    | MemoryContractSurfaceTier::Q4
-                    | MemoryContractSurfaceTier::Q8
-            ) && surface.selector.offload_policy == OffloadPolicy::Sequential
-                && surface.selector.load_shape == LoadShape::DeferredMaterialization;
-            assert_eq!(
-                surface
-                    .contract
-                    .capability(MemoryStrategy::BoundedTransformerResidency)
-                    .expect("complete Krea ladder")
-                    .support,
-                if expected {
-                    MemoryStrategySupport::Implemented
-                } else {
-                    MemoryStrategySupport::Missing
-                },
-                "{}",
-                surface.selector.id()
-            );
-            implemented += usize::from(expected);
-            assert!(!surface.composed);
-            assert_eq!(surface.contract.asset_facts, Default::default());
-            assert_eq!(
-                surface.contract.calibration.as_ref().unwrap().fingerprint,
-                mlx_gen_krea::block_memory_strategy::MEMORY_CALIBRATION_FINGERPRINT
-            );
+            let mut implemented = 0;
+            for surface in provider {
+                let expected = matches!(
+                    surface.resolved_artifact_tier(),
+                    MemoryContractSurfaceTier::Bf16
+                        | MemoryContractSurfaceTier::Q4
+                        | MemoryContractSurfaceTier::Q8
+                ) && surface.selector.offload_policy == OffloadPolicy::Sequential
+                    && surface.selector.load_shape == LoadShape::DeferredMaterialization;
+                assert_eq!(
+                    surface
+                        .contract
+                        .capability(MemoryStrategy::BoundedTransformerResidency)
+                        .expect("complete Krea ladder")
+                        .support,
+                    if expected {
+                        MemoryStrategySupport::Implemented
+                    } else {
+                        MemoryStrategySupport::Missing
+                    },
+                    "{provider_id}: {}",
+                    surface.selector.id()
+                );
+                implemented += usize::from(expected);
+                assert!(!surface.composed);
+                assert_eq!(surface.contract.asset_facts, Default::default());
+                assert_eq!(
+                    surface.contract.calibration.as_ref().unwrap().fingerprint,
+                    mlx_gen_krea::block_memory_strategy::MEMORY_CALIBRATION_FINGERPRINT
+                );
+            }
+            assert_eq!(implemented, 3, "{provider_id}");
         }
-        assert_eq!(implemented, 3);
+    }
+
+    #[test]
+    fn krea_base_behavior_inventory_preserves_typed_request_axes_without_overlays() {
+        use mlx_gen::gen_core::{
+            LoadShape, MemoryContractSurfaceTier, MemoryMode, MemoryStrategy, OffloadPolicy,
+        };
+
+        let registry = super::provider_registry().unwrap();
+        let surfaces = registry.memory_contract_surfaces().unwrap();
+        let behavior = |provider_id| {
+            registry
+                .memory_behavior_registrations()
+                .find(|registration| registration.provider_id == provider_id)
+                .unwrap_or_else(|| panic!("{provider_id} missing memory behavior registration"))
+        };
+        let fixtures = |provider_id| {
+            let surface = surfaces
+                .iter()
+                .find(|surface| {
+                    surface.contract.provider_id == provider_id
+                        && surface.resolved_artifact_tier() == MemoryContractSurfaceTier::Q4
+                        && surface.selector.offload_policy == OffloadPolicy::Sequential
+                        && surface.selector.load_shape == LoadShape::DeferredMaterialization
+                })
+                .unwrap_or_else(|| panic!("{provider_id} missing q4 sequential deferred surface"));
+            (behavior(provider_id).valid_fixtures)(
+                &surface.spec,
+                &surface.contract,
+                MemoryStrategy::BoundedTransformerResidency,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|fixture| {
+                assert_eq!(fixture.context.overlay, None, "{provider_id}");
+                assert_eq!(
+                    fixture.request.use_pid, fixture.context.use_pid,
+                    "{provider_id}"
+                );
+                assert_eq!(
+                    fixture.request.phases.is_some(),
+                    fixture.context.has_phases,
+                    "{provider_id}"
+                );
+                if let Some(phases) = &fixture.request.phases {
+                    assert_eq!(phases.len(), 2, "{provider_id}");
+                    assert!(phases.iter().all(|phase| phase.steps > 0), "{provider_id}");
+                }
+                let request_shape_matches = match (
+                    &fixture.context.mode,
+                    fixture.context.geometry.reference_count,
+                ) {
+                    (MemoryMode::TextToImage, 0) => fixture.request.conditioning.is_empty(),
+                    (MemoryMode::ImageToImage, 1) => matches!(
+                        fixture.request.conditioning.as_slice(),
+                        [mlx_gen::Conditioning::Reference {
+                            strength: Some(_),
+                            ..
+                        }]
+                    ),
+                    (MemoryMode::Edit, 1) => matches!(
+                        fixture.request.conditioning.as_slice(),
+                        [mlx_gen::Conditioning::Reference { strength: None, .. }]
+                    ),
+                    (MemoryMode::Edit, 2) => matches!(
+                        fixture.request.conditioning.as_slice(),
+                        [mlx_gen::Conditioning::MultiReference { images }] if images.len() == 2
+                    ),
+                    _ => false,
+                };
+                assert!(request_shape_matches, "{provider_id}");
+                (
+                    fixture.context.mode,
+                    fixture.context.geometry.reference_count,
+                    fixture.context.use_pid,
+                    fixture.context.has_phases,
+                )
+            })
+            .collect::<Vec<_>>()
+        };
+
+        let generation = vec![
+            (MemoryMode::TextToImage, 0, false, false),
+            (MemoryMode::TextToImage, 0, true, false),
+            (MemoryMode::ImageToImage, 1, false, false),
+            (MemoryMode::ImageToImage, 1, true, false),
+        ];
+        assert_eq!(fixtures("krea_2_turbo"), generation);
+
+        let mut raw = generation;
+        raw.push((MemoryMode::TextToImage, 0, false, true));
+        assert_eq!(fixtures("krea_2_raw"), raw);
+
+        let edit = vec![
+            (MemoryMode::Edit, 1, false, false),
+            (MemoryMode::Edit, 1, true, false),
+            (MemoryMode::Edit, 2, false, false),
+            (MemoryMode::Edit, 2, true, false),
+        ];
+        assert_eq!(fixtures("krea_2_edit"), edit);
+        assert_eq!(fixtures("krea_2_turbo_edit"), edit);
     }
 
     #[test]

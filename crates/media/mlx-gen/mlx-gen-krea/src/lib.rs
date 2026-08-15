@@ -122,6 +122,17 @@ pub fn register_providers(
                 block_memory_strategy::weights_free_memory_strategy_contract(KREA_2_TURBO_ID, spec)
             },
         })
+        .register_memory_contract_surface_resolver(
+            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
+                provider_id: KREA_2_TURBO_ID,
+                contract: |surface| {
+                    block_memory_strategy::weights_free_memory_strategy_surface_contract(
+                        KREA_2_TURBO_ID,
+                        surface,
+                    )
+                },
+            },
+        )
         .register_memory_behavior(model::TURBO_MEMORY_BEHAVIOR)
         .register_memory_strategy(model::RAW_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
@@ -151,6 +162,17 @@ pub fn register_providers(
                 block_memory_strategy::weights_free_memory_strategy_contract(KREA_2_EDIT_ID, spec)
             },
         })
+        .register_memory_contract_surface_resolver(
+            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
+                provider_id: KREA_2_EDIT_ID,
+                contract: |surface| {
+                    block_memory_strategy::weights_free_memory_strategy_surface_contract(
+                        KREA_2_EDIT_ID,
+                        surface,
+                    )
+                },
+            },
+        )
         .register_memory_behavior(model::EDIT_MEMORY_BEHAVIOR)
         .register_memory_strategy(model::TURBO_EDIT_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
@@ -163,6 +185,17 @@ pub fn register_providers(
                 )
             },
         })
+        .register_memory_contract_surface_resolver(
+            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
+                provider_id: KREA_2_TURBO_EDIT_ID,
+                contract: |surface| {
+                    block_memory_strategy::weights_free_memory_strategy_surface_contract(
+                        KREA_2_TURBO_EDIT_ID,
+                        surface,
+                    )
+                },
+            },
+        )
         .register_memory_behavior(model::TURBO_EDIT_MEMORY_BEHAVIOR)
         .register_generator(model_control::CONTROL_REGISTRATION)
         .register_memory_strategy(model_control::MEMORY_REGISTRATION)
