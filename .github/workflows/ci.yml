@@ -456,22 +456,19 @@ jobs:
       # ladder is sm_80 (this value) + sm_90 + sm_120 SASS + `compute_120` PTX, so this pool's
       # cards are covered natively.
       #
-      # Both halves are guarded, and neither restates this comment:
-      #   * statically, `scripts/ci/cuda_arch_support.py` derives this value from build.rs's OWN
-      #     predicates and `test_every_cuda_job_declares_the_build_derived_compute_cap` holds all
-      #     15 sites to it;
-      #   * on the box, `candle-gen/tests/cuda_quant_smoke.rs` reads the device's real compute
-      #     capability and proves BY VALUE that Q4/Q8 matmuls are not returning zeros.
-      #
       # KNOWN GAP, recorded so it is not rediscovered: **datacenter Blackwell sm_100 (B100/B200) is
       # NOT covered** on the quant path. Major 10 is served neither by the sm_9x/sm_12x cubins
       # (SASS is compatible only upward WITHIN one major) nor by the `compute_120` PTX floor (120 >
-      # 100). build.rs states this is deliberate. If such a card ever joins this pool the guard
-      # above fails loudly -- add `code=sm_100` to build.rs, do NOT touch this value.
+      # 100). build.rs states this is deliberate. If such a card ever joins this pool, quantized
+      # matmuls return zeros silently -- add `code=sm_100` to build.rs, do NOT touch this value.
       #
-      # sm_120 for the current cards was a SPEC fact rather than a CI measurement when sc-19545
-      # looked: no lane had ever queried `compute_cap`. The smoke's device read is the first thing
-      # in this repository that does.
+      # sm_120 for the current cards is a SPEC fact, not a CI measurement: no lane has ever queried
+      # `compute_cap`, and nothing in this repository does. `nvidia-smi` here reports only the
+      # truncated model name and memory.
+      #
+      # NOTHING ENFORCES ANY OF THIS. sc-19545 verified it by hand and wrote it down; a drift guard
+      # was explicitly scoped out. If someone edits this value, the first symptom is black
+      # renders on customer GPUs, not a red build.
       CUDA_COMPUTE_CAP: "80"
       CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"

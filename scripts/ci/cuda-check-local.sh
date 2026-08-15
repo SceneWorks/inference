@@ -100,10 +100,7 @@ export PATH="$stub_dir:$PATH"
 # the next reader concludes the cap is arbitrary, which is the misreading that produced this story.
 # 80 is the packaging baseline: the bottom rung of the arch ladder in
 # `crates/media/candle-gen/vendor/candle-kernels/build.rs`, NOT a description of anyone's GPU.
-# Derived from the same module CI's policy gate uses, so this script cannot drift from the lane it
-# mirrors; the literal fallback keeps it working if python is unavailable.
-CUDA_COMPUTE_CAP="${CUDA_COMPUTE_CAP:-$(python3 -c 'import sys; sys.path.insert(0, "'"$repo_root"'/scripts/ci"); import cuda_arch_support as m; print(m.expected_baseline())' 2>/dev/null || echo 80)}"
-export CUDA_COMPUTE_CAP
+export CUDA_COMPUTE_CAP="${CUDA_COMPUTE_CAP:-80}"
 
 # See the cached-build-script-failure gotcha above.
 target_dir="${CARGO_TARGET_DIR:-$repo_root/target}"

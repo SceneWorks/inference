@@ -14,8 +14,6 @@ import unittest
 import yaml
 from pathlib import Path
 
-from scripts.ci import cuda_arch_support
-
 
 WORKFLOW = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml"
 REAL_WEIGHTS_WORKFLOW = WORKFLOW.with_name("real-weights.yml")
@@ -2300,37 +2298,8 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                 if not stripped.endswith("\\"):
                     joined.append(buffer)
                     buffer = ""
-            all_invocations = [command for command in joined if "cargo test " in command]
-            # sc-19545 -- the weightless quant smoke is a DIFFERENT kind of invocation and must not
-            # be forced into this shape. Everything below governs real-weight SELECTIONS: one
-            # `#[ignore]`d test named with `--exact`, asserted to report exactly `1 passed`. The
-            # smoke runs a whole test binary of NON-`#[ignore]`d tests, so `--ignored` would filter
-            # both of them out and `--exact` has nothing to select. Marking them `#[ignore]` to fit
-            # here would be a net LOSS of reach: they would then also stop running in `ci.yml`'s
-            # `windows-cuda` blanket `cargo test`, and an `#[ignore]`d smoke that is never passed
-            # `--ignored` skips and reports success, which is the failure this whole file exists to
-            # prevent. It carries its own equivalent guards instead, asserted just below.
-            smoke = [c for c in all_invocations if "--test cuda_quant_smoke" in c]
-            invocations = [c for c in all_invocations if c not in smoke]
+            invocations = [command for command in joined if "cargo test " in command]
             self.assertTrue(invocations, f"{job}: no cargo test invocation")
-            if job == "candle-minimax-h3":
-                self.assertEqual(
-                    len(smoke), 1, f"{job}: expected exactly one cuda_quant_smoke invocation"
-                )
-                # A skip and a pass are the same exit code here -- both smokes no-op when
-                # `default_device()` is not CUDA -- so the step has to assert it reached a GPU, and
-                # assert the count so a rename cannot report `0 passed` and exit 0.
-                self.assertIn(
-                    'findstr /c:"[quant-smoke] device=Cuda"',
-                    body,
-                    f"{job}: the quant smoke does not assert it ran on a CUDA device, so a skip "
-                    f"is indistinguishable from a pass",
-                )
-                self.assertIn(
-                    'findstr /c:"2 passed"',
-                    body,
-                    f"{job}: the quant smoke does not pin its run count",
-                )
             for command in invocations:
                 cargo_arguments, separator, libtest = command.partition(" -- ")
                 self.assertTrue(separator, f"{job}: cargo test invocation has no `--`: {command}")
@@ -2440,149 +2409,6 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                     "both Windows CUDA listeners share one 48-thread host; an uncapped Cargo "
                     "process on each listener can overwhelm Windows with rustc launches",
                 )
-
-    def test_every_cuda_job_declares_the_build_derived_compute_cap(self) -> None:
-        # sc-19545. `CUDA_COMPUTE_CAP` is declared once per CUDA job -- 15 jobs across the two
-        # workflows as of this commit -- and the temptation on finding "80 (Ampere)" on a Blackwell
-        # box is to "correct" it to 120. That is a REGRESSION, not a fix, and the reasons are in
-        # `scripts/ci/cuda_arch_support.py`. The short version: the cap seeds the BOTTOM rung of an
-        # architecture ladder, so raising it to the runner's own arch deletes the Ampere rung from
-        # the quant fatbin and lifts the dense PTX floor to `compute_120` -- the shipped worker then
-        # runs on Blackwell and nothing else.
-        #
-        # The expected value is DERIVED from the file that emits the flags
-        # (`vendor/candle-kernels/build.rs`), not restated here. Restating it would let build.rs and
-        # CI drift apart while this test stayed green, which is the whole failure mode.
-        expected = str(cuda_arch_support.expected_baseline())
-
-        declared: dict[str, str | None] = {}
-        for workflow in (WORKFLOW, REAL_WEIGHTS_WORKFLOW):
-            jobs = yaml.safe_load(workflow.read_text(encoding="utf-8"))["jobs"]
-            for job_name, job in jobs.items():
-                runs_on = job.get("runs-on")
-                # The `env` block is the only thing candle-kernels' build script reads. A job that
-                # merely *mentions* cuda in a step is irrelevant; a job SCHEDULED onto the CUDA
-                # pool is what compiles kernels.
-                if not isinstance(runs_on, list) or "cuda" not in runs_on:
-                    continue
-                declared[f"{workflow.name}:{job_name}"] = (job.get("env") or {}).get(
-                    "CUDA_COMPUTE_CAP"
-                )
-
-        self.assertEqual(
-            len(declared),
-            15,
-            "the CUDA job count moved. That is allowed -- but the new job has to appear in this "
-            "assertion deliberately, because a CUDA job that reaches the pool without an explicit "
-            "CUDA_COMPUTE_CAP is the silent half of this bug: candle-kernels then DETECTS the cap "
-            "off the runner (cudaforge shells `nvidia-smi`), emits a single sm_120 gencode, and "
-            "the fatbin quietly loses its sm_80 rung with no error anywhere",
-        )
-
-        for site, value in sorted(declared.items()):
-            with self.subTest(site=site):
-                self.assertIsNotNone(
-                    value,
-                    f"{site} runs on the CUDA pool but declares no CUDA_COMPUTE_CAP, so "
-                    f"candle-kernels auto-detects it off the runner's own GPU and drops the "
-                    f"packaging baseline rung",
-                )
-                self.assertEqual(
-                    value,
-                    expected,
-                    f"{site} declares CUDA_COMPUTE_CAP={value!r}; the value derived from "
-                    f"vendor/candle-kernels/build.rs is {expected!r}. See "
-                    f"scripts/ci/cuda_arch_support.py -- matching this to the runner's hardware is "
-                    f"the regression, not the fix",
-                )
-
-    def test_cuda_arch_coverage_predicate_discriminates_mutations(self) -> None:
-        # sc-19545 AC5: mutate each guard INDIVIDUALLY and record which assertion goes red. A
-        # predicate that cannot be made to fail is not a guard, and this family has shipped several
-        # of those -- so every mutation below is applied on its own, against the real build.rs.
-        source = cuda_arch_support._read()
-
-        # Control: unmutated, the real ladder covers the hardware actually in the pool, and rejects
-        # the two archs build.rs deliberately does not target.
-        self.assertEqual(cuda_arch_support.expected_baseline(source), 80)
-        self.assertEqual(
-            cuda_arch_support.quant_path_arches(80, source),
-            (frozenset({80, 90, 120}), frozenset({120})),
-        )
-        self.assertTrue(cuda_arch_support.quant_path_covers(120, 80, source)[0])
-        self.assertTrue(cuda_arch_support.quant_path_covers(86, 80, source)[0])
-        # Datacenter Blackwell B100/B200 is major 10: no sm_9x or sm_12x cubin serves it and the
-        # compute_120 PTX floor is above it. build.rs says this is out of scope on purpose.
-        self.assertFalse(cuda_arch_support.quant_path_covers(100, 80, source)[0])
-        # Turing is below the dense PTX floor as well as the SASS ladder.
-        self.assertFalse(cuda_arch_support.quant_path_covers(75, 80, source)[0])
-        self.assertFalse(cuda_arch_support.dense_path_covers(75, 80)[0])
-
-        # Mutation 1 -- sc-7544's fatbin is reverted (the three appended `-gencode`s deleted, the
-        # state that shipped the original silent zeros). The runner's own sm_120 stops being
-        # covered, and `baseline_bounds` loses the upper bound it derives from the ladder.
-        reverted = re.sub(r'\n\s*\.arg\("-gencode=[^"]*"\)', "", source)
-        self.assertNotEqual(reverted, source, "mutation 1 matched nothing")
-        self.assertEqual(
-            cuda_arch_support.explicit_arches(reverted), (frozenset(), frozenset())
-        )
-        self.assertFalse(cuda_arch_support.quant_path_covers(120, 80, reverted)[0])
-        with self.assertRaises(ValueError):
-            cuda_arch_support.expected_baseline(reverted)
-
-        # Mutation 2 -- only the Blackwell SASS rung is dropped, leaving Hopper and the PTX floor.
-        # This is the realistic re-vendor slip: someone re-copies build.rs on a candle pin bump and
-        # restores two of the three lines. compute_120 PTX still JITs to sm_120, so the device stays
-        # covered -- and saying so is the point, because a guard that cried wolf here would be
-        # deleted.
-        no_sm120 = source.replace('.arg("-gencode=arch=compute_120,code=sm_120")\n', "", 1)
-        self.assertNotEqual(no_sm120, source, "mutation 2 matched nothing")
-        self.assertEqual(
-            cuda_arch_support.quant_path_arches(80, no_sm120),
-            (frozenset({80, 90}), frozenset({120})),
-        )
-        self.assertTrue(cuda_arch_support.quant_path_covers(120, 80, no_sm120)[0])
-
-        # Mutation 3 -- the PTX floor is dropped as well as the SASS rung. NOW sm_120 has neither a
-        # cubin nor anything to JIT, which is exactly the silent-zeros condition.
-        no_blackwell = no_sm120.replace(
-            '.arg("-gencode=arch=compute_120,code=compute_120")', '.arg("-std=c++17")', 1
-        )
-        self.assertNotEqual(no_blackwell, no_sm120, "mutation 3 matched nothing")
-        covered, reason = cuda_arch_support.quant_path_covers(120, 80, no_blackwell)
-        self.assertFalse(covered)
-        self.assertIn("SILENTLY RETURN ZEROS", reason)
-
-        # Mutation 4 -- the bf16 floor moves. The declared cap is derived from it, so the value CI
-        # must carry moves with it rather than staying pinned to a literal 80.
-        bf16_moved = source.replace("if compute_cap < 80 {", "if compute_cap < 86 {", 1)
-        self.assertNotEqual(bf16_moved, source, "mutation 4 matched nothing")
-        self.assertEqual(cuda_arch_support.expected_baseline(bf16_moved), 86)
-
-        # Mutation 5 -- the bf16 guard is deleted outright. The lower bound is then underivable, and
-        # the module must refuse rather than fall back to a hardcoded 80.
-        bf16_gone = source.replace("if compute_cap < 80 {", "if false {", 1)
-        self.assertNotEqual(bf16_gone, source, "mutation 5 matched nothing")
-        with self.assertRaises(ValueError):
-            cuda_arch_support.expected_baseline(bf16_gone)
-
-        # Mutation 6 -- the ladder is quoted in a COMMENT but no longer emitted. A parser anchored
-        # on the bare `-gencode` text would still report full coverage here; anchoring on the
-        # `.arg("...")` call is what makes this mutation visible.
-        commented = re.sub(r'\.arg\("(-gencode=[^"]*)"\)', r"// \1", source)
-        self.assertNotEqual(commented, source, "mutation 6 matched nothing")
-        self.assertIn("-gencode=arch=compute_120", commented)
-        self.assertEqual(
-            cuda_arch_support.explicit_arches(commented), (frozenset(), frozenset())
-        )
-        self.assertFalse(cuda_arch_support.quant_path_covers(120, 80, commented)[0])
-
-        # Mutation 7 -- the "fix" this story was filed to request: raise the declared cap to the
-        # runner's own arch. The Ampere rung disappears from the fatbin and the dense PTX floor
-        # rises to compute_120, so every pre-Blackwell GPU loses BOTH paths.
-        self.assertNotIn(80, cuda_arch_support.quant_path_arches(120, source)[0])
-        self.assertFalse(cuda_arch_support.quant_path_covers(86, 120, source)[0])
-        self.assertFalse(cuda_arch_support.dense_path_covers(86, 120)[0])
 
     def test_merge_queue_speculative_ref_can_reach_the_workflow(self) -> None:
         triggers = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))[True]
