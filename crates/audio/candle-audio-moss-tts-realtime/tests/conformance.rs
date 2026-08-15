@@ -182,10 +182,18 @@ fn moss_tts_realtime_is_incremental() {
     // implementation — including the "emit everything at the end" one the assertion named as the
     // case it existed to catch.
     //
-    // Incrementality is observable directly from the callback stream, with no clock. A loop that
-    // decodes frame by frame reports `Step { current }` once per frame, in order, one per frame it
-    // ultimately returns. A loop that computed everything and then announced it cannot produce
-    // that sequence without also producing the frames it is announcing.
+    // What replaces it is a PROGRESS-CADENCE check, read from the callback stream with no clock:
+    // `Step { current }` must arrive once per returned frame, starting at 1 and advancing by one.
+    // That catches a decode whose reporting has come loose from its production — a wrong count, a
+    // skipped or repeated index, an out-of-order stream, or no reporting at all.
+    //
+    // SCOPE, stated plainly because the assertion being replaced overclaimed at exactly this point:
+    // this does NOT catch the buffer-everything implementation. A decode that computed every frame
+    // first and then fired N callbacks 1..N satisfies the count, first-index and consecutiveness
+    // checks below. Separating that case from a real incremental decode needs evidence that the
+    // callback fires BEFORE the remaining frames exist, which is either a clock — just removed here
+    // for being degenerate — or a seam this generator does not expose. So the cadence claim is the
+    // one the stream can actually support, and it is the only one made.
     let mut steps: Vec<u32> = Vec::new();
     let result = gen
         .rvq_frames(&request(1.6), &mut |p| {
@@ -282,10 +290,17 @@ fn moss_tts_realtime_streaming_gate() {
     // returns, so any implementation that emits a chunk at all satisfies it, including the
     // buffer-everything one it named.
     //
-    // The property it reached for — the caller gets usable audio BEFORE the whole track exists — is
-    // a statement about what the first chunk CONTAINS, and that is directly observable. A
-    // non-streaming implementation that buffers and flushes at the end puts the entire track in one
-    // chunk; a real stream's first chunk is a proper prefix of it.
+    // What replaces it is a CHUNKING-AND-REASSEMBLY check, with no clock: the first chunk carries
+    // audio, it is strictly smaller than the finished track, and the chunks sum to exactly the
+    // track that was returned. The reassembly law is genuinely new coverage — nothing here
+    // previously tied the emitted chunks to the returned track at all, so a stream that dropped,
+    // duplicated or rescaled samples relative to the track passed.
+    //
+    // SCOPE, stated plainly for the same reason as its AR-stage twin above: this does NOT catch the
+    // buffer-everything implementation either. One that generated the whole track and then sliced
+    // it into >= 2 chunks satisfies non-empty-first, first < track, and exact reassembly. What is
+    // gated is that the chunk stream is a faithful partition of the track, not that it was produced
+    // before the track existed — the latter needs a clock or a seam this generator does not expose.
     let first_chunk = chunks.first().expect("at least one chunk was emitted");
     assert!(
         !first_chunk.samples.is_empty(),

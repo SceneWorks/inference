@@ -804,7 +804,10 @@ fn normalization_is_the_decoders_exact_inverse() {
         .expect_err("16 channels disagrees with the config's 32")
         .to_string();
     assert!(
-        msg.contains("config declares"),
+        // Matched on the guard's FULL prefix, not the bare "config declares" tail: the audio VAE's
+        // own de-normalize guard (`src/audio_vae.rs`) emits that same tail, so the short form would
+        // go inert the moment this entry point delegated there (sc-19488).
+        msg.contains("minimax-h3 audio encoder: latent has"),
         "the channel-count guard must be what rejects this, not a broadcast fault: {msg}"
     );
     let msg = enc

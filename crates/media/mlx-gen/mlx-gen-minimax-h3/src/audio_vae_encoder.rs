@@ -1077,9 +1077,15 @@ mod tests {
         }
         // Shape mismatches are typed errors, not broadcasts.
         assert!(fuse_weight_norm(&Array::from_slice(&[1.0f32, 1.0], &[2]), &v).is_err());
+        // Asserted by MESSAGE (sc-19488): a rank-2 `v` makes the guard's own `sum_axes(&[1, 2])`
+        // an out-of-range axis, so this errors with the guard deleted too. (The `[2]`-shaped `g`
+        // above stays a bare probe on purpose — it broadcasts cleanly, so it discriminates.)
+        let msg = fuse_weight_norm(&g, &Array::from_slice(&[1.0f32, 2.0], &[2, 1]))
+            .expect_err("weight_v must be rank 3")
+            .to_string();
         assert!(
-            fuse_weight_norm(&g, &Array::from_slice(&[1.0f32, 2.0], &[2, 1])).is_err(),
-            "weight_v must be rank 3"
+            msg.contains("minimax-h3 audio encoder: weight_v must be rank 3"),
+            "the rank guard must be what rejects this, not the sum_axes below it: {msg}"
         );
     }
 
@@ -1148,7 +1154,15 @@ mod tests {
             let pooled = adaptive_avg_pool_last_axis(&spread(&[2, 3, len]), out).unwrap();
             assert_eq!(pooled.shape(), &[2, 3, out]);
         }
-        assert!(adaptive_avg_pool_last_axis(&spread(&[2, 4]), 0).is_err());
+        // Asserted by MESSAGE (sc-19488): with the guard deleted the window loop runs `0..0` and
+        // hands `concatenate_axis` an empty slice, which errors on its own.
+        let msg = adaptive_avg_pool_last_axis(&spread(&[2, 4]), 0)
+            .expect_err("pooling to zero outputs is not a valid request")
+            .to_string();
+        assert!(
+            msg.contains("minimax-h3 adaptive pool:"),
+            "the pooling-validity guard must be what rejects this, not an empty concat: {msg}"
+        );
     }
 
     /// 48 → 32 really does overlap and 44 → 32 really does vary in width, so the fixture cases
@@ -1299,8 +1313,20 @@ mod tests {
             p.sample_with(&zero).unwrap().as_slice::<f32>(),
             p.mean().as_slice::<f32>()
         );
+        // Asserted by MESSAGE, not by `is_err()` (sc-19488). The mean here is `[1, 2, 1]` and this
+        // noise is `[1, 3, 1]`: delete the shape guard in `sample_with` and `mean + std * noise`
+        // broadcasts 2 against 3, which mlx rejects on its own — so a bare `is_err()` is satisfied
+        // by a downstream fault and stays green with the guard gone. Binding the assertion to the
+        // guard's own wording is what makes it discriminate.
         let wrong = mlx_rs::ops::zeros_dtype(&[1, 3, 1], Dtype::Float32).unwrap();
-        assert!(p.sample_with(&wrong).is_err());
+        let msg = p
+            .sample_with(&wrong)
+            .expect_err("noise of the wrong shape must be refused, not broadcast")
+            .to_string();
+        assert!(
+            msg.contains("does not match the mean"),
+            "the noise-shape guard must be what rejects this: {msg}"
+        );
         assert!(
             AudioDiagonalGaussian::new(
                 Array::from_slice(&[1.0f32], &[1]),

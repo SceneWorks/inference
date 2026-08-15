@@ -25,7 +25,7 @@ use candle_core::{DType, Device, Tensor};
 use candle_llm::config::ModelConfig;
 use candle_llm::device::{compute_dtype, select_device};
 use candle_llm::models::CausalLm;
-use candle_llm::primitives::{input_ids, QuantSpec, Weights};
+use candle_llm::primitives::{input_ids, KvCache, QuantSpec, Weights};
 
 const PREFILL_TOKENS: usize = 256;
 const DECODE_STEPS: usize = 128;
@@ -113,15 +113,24 @@ fn bench_variant(dir: &str, device: &Device, v: &Variant) {
     //
     // What this bench must still gate is that both halves actually produced usable output, which is
     // observable directly and without a clock. Prefill is already covered by `assert_finite(&logits)`
-    // above; the decode half was covered by nothing, because it dropped every result. So it is
-    // gated the same way as prefill now, plus the cache offset, which is what makes the decode a
-    // continuation of the prefilled cache rather than DECODE_STEPS independent one-token forwards.
+    // above; the decode half was covered by nothing, because it dropped every result.
+    //
+    // The width read below is `cache.offset()` — the CACHE's own accounting, which
+    // `ContiguousKvCache` derives from the sequence axis of the keys it actually holds. An earlier
+    // revision of this gate compared the test's LOCAL `offset` counter against
+    // `PREFILL_TOKENS + WARMUP_DECODE_STEPS + DECODE_STEPS`. That was arithmetic over three
+    // constants on a variable this test increments itself and the model never writes, so it could
+    // not fail for any implementation of `decode_logits` — exactly the kind of inert assertion
+    // sc-19556 exists to remove, and it would have been one more of them. Reading the cache instead
+    // discriminates: a decode that dropped its writes, restarted the cache, or double-appended
+    // reports a different width here.
     let decoded = last_decode_logits.expect("DECODE_STEPS must be > 0");
     assert_finite(&decoded);
     assert_eq!(
-        offset as usize,
+        cache.offset() as usize,
         PREFILL_TOKENS + WARMUP_DECODE_STEPS + DECODE_STEPS,
-        "{}: every decode step must advance the cache offset exactly once",
+        "{}: the KV cache must hold every prefilled and decoded position — each decode step \
+         appends exactly one, continuing the prefilled cache rather than starting a new one",
         v.label
     );
 }

@@ -207,6 +207,16 @@ mod tests {
     fn a_wrong_leading_dim_is_rejected() {
         let t = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0], &[5, 1]);
         assert!(split_thirds(&t, 2, 1).is_err());
-        assert!(reorder_interleaved(&t, 2, 1).is_err());
+        // Asserted by MESSAGE (sc-19488): with the guard deleted, `reshape(&[2, 3, 1, 1])` wants
+        // 6 elements from this 5-element array and errors on its own, so `is_err()` alone is
+        // satisfied by the downstream fault. (The `split_thirds` probe above needs no such
+        // treatment — `split_axis` SUCCEEDS on a length-5 axis, so it genuinely discriminates.)
+        let msg = reorder_interleaved(&t, 2, 1)
+            .expect_err("a leading dim of 5 is not 3 x 2")
+            .to_string();
+        assert!(
+            msg.contains("minimax-h3 dit qkv reorder: expected leading dim"),
+            "the leading-dim guard must be what rejects this, not the reshape below it: {msg}"
+        );
     }
 }

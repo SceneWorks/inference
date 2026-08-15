@@ -156,6 +156,42 @@ fn measure(dir: &std::path::Path, tier: &str, shape: LoadShape, req: &Generation
     }
 }
 
+/// Measured runs per cadence in the rung-4 sweep, reduced by taking the FASTEST row (sc-19556).
+///
+/// Two is the cheapest count that can tell "this run was descheduled" from "this cadence is slow".
+/// Each run is a full render on a freshly loaded generator, so the cost is real and the count is
+/// deliberately small.
+const TIMED_RUNS: usize = 2;
+
+/// [`measure`] repeated [`TIMED_RUNS`] times, returning the row of the FASTEST run.
+///
+/// sc-19556: the sweep used to take one sample per cadence and ratio two of them, minutes and a
+/// model load apart, so the two arms need not even see the same host load. Every run here performs
+/// the identical render, so contention can only ever push a run SLOWER — the fastest of several runs
+/// is a lower bound on what the hardware did rather than a sample of a noisy distribution, and
+/// ratioing two lower bounds is what lets the latency gate below keep its measured margin (2.77x at
+/// 1024², 3.43x at 768²) instead of being relaxed until a 5% fluctuation could satisfy it.
+///
+/// Returning the fastest run's row wholesale (rather than splicing a min wall onto another run's
+/// peak) is safe precisely because the peak column is the reproducible one: it repeats to the
+/// millibyte across runs, which is the claim the 1% flatness bound below exists to check.
+#[track_caller]
+fn measure_fastest(
+    dir: &std::path::Path,
+    tier: &str,
+    shape: LoadShape,
+    req: &GenerationRequest,
+) -> Row {
+    let mut best: Option<Row> = None;
+    for _ in 0..TIMED_RUNS {
+        let row = measure(dir, tier, shape, req);
+        if best.as_ref().is_none_or(|b: &Row| row.wall < b.wall) {
+            best = Some(row);
+        }
+    }
+    best.expect("TIMED_RUNS must be > 0")
+}
+
 /// Milliseconds per denoise step for a row, which is the unit rung 4's re-materialization cost is
 /// actually paid in: the window re-opens the snapshot once per sub-stack per step, so the overhead
 /// scales with steps rather than with the request.
@@ -1162,7 +1198,7 @@ fn transformer_window_sweep_and_streamed_output_identity() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1024);
-    let control = measure(&dir, tier, deferred, &request(Some(staged()), edge, STEPS));
+    let control = measure_fastest(&dir, tier, deferred, &request(Some(staged()), edge, STEPS));
     println!(
         "[sc-15525 rung4 {tier} {edge}²] staged, no window (attribution control) {:.3} GiB, \
          {:.0} ms/step",
@@ -1171,7 +1207,7 @@ fn transformer_window_sweep_and_streamed_output_identity() {
     );
     let mut rows: Vec<(u32, f64, f64)> = Vec::new();
     for window in &probe_order() {
-        let row = measure(
+        let row = measure_fastest(
             &dir,
             tier,
             deferred,
@@ -1283,21 +1319,27 @@ fn transformer_window_sweep_and_streamed_output_identity() {
     // (b) And widening it buys time back. Measured 3654 -> 1318 ms/step (2.77x) at 1024² and
     //     3355 -> 979 (3.43x) at 768².
     //
-    //     sc-19556: the floor moved from 0.75 to 0.95. The old comment justified 0.75 by a
-    //     "run-to-run latency spread is ~4%" figure, but that spread was measured on a QUIET
-    //     machine; this box routinely runs several agents at once, and `tight_ms` / `wide_ms` are
-    //     one sample each from renders minutes apart, so they need not even see the same load.
-    //     sc-19505 measured the same class of margin failing 53 of 380 runs under deliberate
-    //     contention. A margin that moves that much with the host cannot also resolve the code.
+    //     sc-19556: the FLOOR IS UNCHANGED at 0.75; what changed is the instrument feeding it.
+    //     `tight_ms` and `wide_ms` used to be one sample each, from renders minutes and a model load
+    //     apart, so on a box that routinely runs several agents at once the two arms need not even
+    //     see the same load. Both now come from `measure_fastest`: the fastest of `TIMED_RUNS`
+    //     identical renders, which is a lower bound on the hardware rather than an arbitrary point
+    //     in a noisy distribution. That is the contention tolerance, and it costs no margin.
+    //
+    //     Relaxing the floor to ~0.95 instead was the wrong trade and is not repeated here. It
+    //     drops the required speedup from 1.33x to 1.053x against a MEASURED 2.77-3.43x: to
+    //     false-RED at 0.75 contention must inflate the ratio by 2.6x, whereas to false-GREEN at
+    //     0.95 a 5% fluctuation suffices. The 53-of-380 flake evidence that motivated it was
+    //     measured on `joint_denoise.rs` in a different crate, and this is an `#[ignore]`d
+    //     real-weight test run in a deliberate campaign, not on the contended CI path.
     //
     //     The memory half of this frontier is gated CLOCK-FREE just above — `(peak - tight_peak)
     //     .abs() < tight_peak * 0.01` reads an allocator high-water, not a duration — and that is
     //     the assertion carrying the flat-peak claim. This one keeps a duration because "widening
-    //     buys time back" is a published latency claim, but at a floor contention cannot clear: a
-    //     `BlockPlan` that ignored the window entirely lands at ~1.0, which still reds here, while
-    //     the measured 2.77-3.43x has enormous headroom and is REPORTED on the line below.
+    //     buys time back" is a published latency claim; a `BlockPlan` that ignored the window
+    //     entirely lands at ~1.0 and still reds here.
     assert!(
-        probing || wide_ms < tight_ms * 0.95,
+        probing || wide_ms < tight_ms * 0.75,
         "widening the cadence {tightest} -> {widest} did not buy time back ({tight_ms:.0} -> \
          {wide_ms:.0} ms/step). The domain is published as a time/memory frontier; if every cadence \
          costs the same, it is not one and only the tightest should ship"

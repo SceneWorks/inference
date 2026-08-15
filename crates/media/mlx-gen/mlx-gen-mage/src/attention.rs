@@ -423,7 +423,15 @@ mod tests {
             cos: Array::from_slice(&[1.0f32; 2], &[1, 2]),
             sin: Array::from_slice(&[0.0f32; 2], &[1, 2]),
         };
-        assert!(apply_rope(&x, &rope).is_err());
+        // Asserted by MESSAGE (sc-19488): delete the guard and `rope.cos.reshape(&[2, 1, 2])`
+        // wants 4 elements from a 2-element table, so it errors anyway.
+        let msg = apply_rope(&x, &rope)
+            .expect_err("a [1, 2] msrope table cannot rotate this stream")
+            .to_string();
+        assert!(
+            msg.contains("mage_flow: msrope table is"),
+            "the table-shape guard must be what rejects this, not the reshape below it: {msg}"
+        );
     }
 
     /// A tiny 1-head, head_dim-4 joint attention (dim 4) built from zeroed weights — enough to

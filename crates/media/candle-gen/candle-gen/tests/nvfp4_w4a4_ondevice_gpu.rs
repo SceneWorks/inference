@@ -797,24 +797,41 @@ fn nvfp4_quantize_activation_perf_krea_shapes() {
         // This is a REPORTING benchmark and the table above is its deliverable, so what must still
         // be gated is that the kernels it times actually computed something. `black_box` keeps the
         // results from being optimized away but never looks at them, so until now nothing did.
-        let timed = lt.matmul_nvfp4_staged(&w_stg, &x_stg).unwrap();
-        let vals = timed
-            .to_dtype(DType::F32)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1::<f32>()
+        //
+        // ALL THREE timed kernels are gated, not just the GEMM. The two quantizers are this bench's
+        // actual subjects — `ms_quant` / `ms_fused` and the speedup between them are the numbers
+        // sc-12078's fused-kernel target is derived from — so leaving them inspected by nothing
+        // would mean the fused quantizer could be fast because it was wrong. They are checked the
+        // way the correctness tests above check them: stage each, run the same GEMM against the same
+        // resident weight, and require the two routes to agree.
+        let x_unfused = lt.quantize_nvfp4_activation(&x, w_pk.cols_padded).unwrap();
+        let x_fused = lt
+            .quantize_nvfp4_activation_fused(&x, w_pk.cols_padded)
             .unwrap();
+        let y_unfused = to_vec_f32(&lt.matmul_nvfp4_staged(&w_stg, &x_unfused).unwrap());
+        let y_fused = to_vec_f32(&lt.matmul_nvfp4_staged(&w_stg, &x_fused).unwrap());
+
+        for (label, vals) in [("unfused", &y_unfused), ("fused", &y_fused)] {
+            assert!(
+                vals.iter().all(|v| v.is_finite()),
+                "the timed {label} FP4 path produced NaN/Inf at M={m} K={k} N={n}"
+            );
+            let lo = vals.iter().copied().fold(f32::INFINITY, f32::min);
+            let hi = vals.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            assert!(
+                hi > lo,
+                "the timed {label} FP4 path returned a constant buffer ({lo}) at M={m} K={k} \
+                 N={n} — the kernels are fast because they computed nothing"
+            );
+        }
+        // The fused quantizer must agree with the unfused one it is timed against. Same tolerance
+        // as the sc-12078 correctness test above, which compares these same two routes.
+        let rr = rel_rms(&y_fused, &y_unfused);
         assert!(
-            vals.iter().all(|v| v.is_finite()),
-            "the timed FP4 GEMM produced NaN/Inf at M={m} K={k} N={n}"
-        );
-        let lo = vals.iter().copied().fold(f32::INFINITY, f32::min);
-        let hi = vals.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        assert!(
-            hi > lo,
-            "the timed FP4 GEMM returned a constant buffer ({lo}) at M={m} K={k} N={n} — the \
-             kernels are fast because they computed nothing"
+            rr < 0.02,
+            "the timed fused quantizer diverges from the unfused one it is benchmarked against \
+             (rel-RMS {rr:.6}) at M={m} K={k} N={n} — the speedup is measured against a different \
+             computation"
         );
     }
     eprintln!(

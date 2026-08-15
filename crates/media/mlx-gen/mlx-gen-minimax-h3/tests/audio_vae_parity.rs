@@ -563,7 +563,10 @@ fn mis_packed_latents_are_rejected() {
         .expect_err("the mono entry point takes [B, C, T]")
         .to_string();
     assert!(
-        msg.contains("decode: expected"),
+        // Full prefix, not the bare "decode: expected" tail — `src/pipeline.rs` emits that same
+        // tail from two video-side guards, so the short form would go inert if this path ever
+        // delegated through them (sc-19488).
+        msg.contains("minimax-h3 audio vae decode: expected"),
         "the mono decode shape guard must be what rejects this, not the transpose below it: {msg}"
     );
     // B > 1 cannot be interleaved into one track.

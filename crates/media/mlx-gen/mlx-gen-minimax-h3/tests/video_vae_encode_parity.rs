@@ -460,7 +460,10 @@ fn encode_rejects_malformed_input() {
         .expect_err("a rank-1 tensor is not [B, 3, T, H, W]")
         .to_string();
     assert!(
-        msg.contains("expected [B, 3, T, H, W]"),
+        // Full prefix, not the bare shape tail — `src/pipeline.rs`'s decode guard spells the same
+        // `expected [B, 3, T, H, W]`, so the short form would go inert if encode ever delegated
+        // through it (sc-19488).
+        msg.contains("minimax-h3 vae encode: expected [B, 3, T, H, W]"),
         "the rank guard must be what rejects this, not a downstream shape fault: {msg}"
     );
 

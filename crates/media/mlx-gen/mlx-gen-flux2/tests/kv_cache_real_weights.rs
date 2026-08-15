@@ -136,11 +136,28 @@ fn time_generate(id: &str, size: u32, nref: usize) -> f64 {
     // Warmup: first call pays kernel compilation / lazy graph setup.
     let _ = gen.generate(&req, &mut |_| {}).unwrap();
     let mut fastest = f64::INFINITY;
+    let mut last: Option<Image> = None;
     for _ in 0..TIMED_RUNS {
         let t0 = Instant::now();
-        let _ = gen.generate(&req, &mut |_| {}).unwrap();
+        let out = gen.generate(&req, &mut |_| {}).unwrap();
         fastest = fastest.min(t0.elapsed().as_secs_f64());
+        let GenerationOutput::Images(mut images) = out else {
+            panic!("expected images");
+        };
+        last = images.pop();
     }
+    // The timed path must produce a real image, not merely a fast one: a generator that returned
+    // early would read as an excellent speedup (sc-19556). This gates the run that was ACTUALLY
+    // TIMED, on BOTH arms of the ratio, and costs nothing extra — the output was already being
+    // computed and thrown away with `let _ =`. Re-rendering the id in the test body to check the
+    // same thing would instead have cost a third ~49 GB model load and covered only one arm.
+    let img = last.expect("TIMED_RUNS must be > 0");
+    let (mean, std) = coherence(&img);
+    assert!(
+        mean > 2.0 && mean < 253.0 && std > 5.0,
+        "the timed `{id}` output is degenerate (mean={mean:.1}, std={std:.1}) — a speedup measured \
+         against garbage is not a speedup"
+    );
     fastest
 }
 
@@ -190,7 +207,8 @@ fn q8_kv_cache_edit_is_coherent() {
 }
 
 #[test]
-#[ignore = "needs the real FLUX.2-klein-9b-kv snapshot (~49 GB); heavy (4 generates)"]
+#[ignore = "needs the real FLUX.2-klein-9b-kv snapshot (~49 GB); heavy (6 generates: 2 arms × 1 \
+            warmup + TIMED_RUNS timed)"]
 fn kv_cache_delivers_edit_speedup() {
     let (size, nref) = (res(), nref());
     // Same -kv weights, cache OFF (plain edit id) vs cache ON (kv edit id).
@@ -202,16 +220,9 @@ fn kv_cache_delivers_edit_speedup() {
          {t_on:.2}s → {speedup:.2}× (fastest of {TIMED_RUNS} runs per arm; fork fair A/B: ~1.4× \
          single-ref, higher multi-ref)"
     );
-    // The cache must also produce a real image on this path, not just a faster one — otherwise a
-    // cache that returned early would read as an excellent speedup (sc-19556). `kv_cache_edit_is_
-    // coherent` gates the cache-on output, but not on the id pair timed here.
-    let cached = render("flux2_klein_9b_kv_edit", size, nref);
-    let (mean, std) = coherence(&cached);
-    assert!(
-        mean > 2.0 && mean < 253.0 && std > 5.0,
-        "the timed cache-on path produced a degenerate image (mean={mean}, std={std}) — a speedup \
-         measured against garbage is not a speedup"
-    );
+    // Coherence of the timed output is gated inside `time_generate`, on the run that was actually
+    // timed and on both arms — see the comment there for why it does not happen here.
+    //
     // The cache must materially reduce work. The steady-state single-ref effect is ~1.4× at 1024²
     // (verified equal to the fork); the floor is set below that to tolerate timing noise, and scales
     // up with reference count (each extra ref adds `target`-many cached-away tokens).
