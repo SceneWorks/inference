@@ -265,6 +265,9 @@ pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
             min_size: 256,
             max_size: 2048,
             max_count: 8,
+            // Not a distilled fixed-schedule model: any step count the shared sanity caps
+            // admit is renderable (sc-19502).
+            supported_steps: Vec::new(),
             mac_only: false,
             // The MMDiT projections fold to Q4_0/Q8_0 at load (sc-7879, dequant-on-forward); the TE +
             // VAE stay dense. All three variants share the quant path.

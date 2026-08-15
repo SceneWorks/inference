@@ -172,6 +172,9 @@ pub fn descriptor() -> ModelDescriptor {
             min_size: RES_MIN,
             max_size: RES_MAX,
             max_count: 8,
+            // Not a distilled fixed-schedule model: any step count the shared sanity caps
+            // admit is renderable (sc-19502).
+            supported_steps: Vec::new(),
             mac_only: false,
             // sc-9607: advertise the packed tiers so the worker's `resolve_quant` / A-B quant toggle
             // engages off-Mac (the resolved q4/q8 turnkey subdir self-describes; `build` no-ops the

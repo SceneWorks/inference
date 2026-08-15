@@ -277,6 +277,9 @@ pub fn descriptor() -> ModelDescriptor {
             min_size: 256,
             max_size: 1024,
             max_count: 1,
+            // Not a distilled fixed-schedule model: any step count the shared sanity caps
+            // admit is renderable (sc-19502).
+            supported_steps: Vec::new(),
             mac_only: false,
             supports_kv_cache: false,
             requires_sigma_shift: false,

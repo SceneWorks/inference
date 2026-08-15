@@ -54,6 +54,20 @@ pub const STAGE1_SIGMAS: [f32; 9] = [
 /// stage-transition re-noise scale.
 pub const STAGE2_SIGMAS: [f32; 4] = [0.909_375, 0.725, 0.421_875, 0.0];
 
+/// The number of denoise steps the distilled [`STAGE1_SIGMAS`] schedule performs (`len − 1`), and
+/// therefore the ONLY value of `req.steps` this engine can honor (sc-19502).
+///
+/// **Stage-1, deliberately, not the 8+3 total.** `steps` is the caller's denoise-step knob and the
+/// catalog's `defaults.steps` is 8; folding the stage-2 refinement passes into it would advertise a
+/// legal value (11) that neither the catalog nor the candle lane agrees with, re-opening the exact
+/// divergence this const exists to close.
+///
+/// Derived from the σ table rather than written as `8` for the same reason candle's twin is: the σ
+/// waypoints are baked into training, so a literal could silently disagree with the schedule
+/// actually being run. This table is byte-identical to `candle-gen-ltx`'s `STAGE1_SIGMAS`, which is
+/// what makes one lane-agnostic catalog entry legitimate rather than a papered-over difference.
+pub const NATIVE_STEPS: u32 = STAGE1_SIGMAS.len() as u32 - 1;
+
 fn scalar(v: f32) -> Array {
     Array::from_slice(&[v], &[1])
 }

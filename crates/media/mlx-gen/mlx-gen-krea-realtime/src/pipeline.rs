@@ -123,6 +123,9 @@ pub fn descriptor() -> ModelDescriptor {
             min_size: 16,
             max_size: 1280,
             max_count: 1,
+            // Not a distilled fixed-schedule model: any step count the shared sanity caps
+            // admit is renderable (sc-19502).
+            supported_steps: Vec::new(),
             mac_only: true,
             // Three tiers (sc-15203, S19): **Q4** (~7 GB) / **Q8** (~14 GB) / **bf16** (~28 GB, the
             // absence of a `Quant`). A 14B bf16 DiT is ~28 GB resident and barely runnable on Mac, so the

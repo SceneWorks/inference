@@ -432,6 +432,9 @@ pub fn descriptor() -> ModelDescriptor {
             max_size: 2048,
             max_count: 8,
             // candle is the Windows/CUDA backend — NOT Mac-only (the MLX provider sets this true).
+            // Not a distilled fixed-schedule model: any step count the shared sanity caps
+            // admit is renderable (sc-19502).
+            supported_steps: Vec::new(),
             mac_only: false,
             supported_quants: &[],
             component_precision_floors: &[],

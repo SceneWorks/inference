@@ -782,18 +782,10 @@ impl Generator for LtxGenerator {
                 req.width, req.height
             )));
         }
-        // `req.steps` (sc-9027 / F-043): the distilled model bakes the fixed `STAGE1_SIGMAS` σ waypoints
-        // into training, so the only supported step count is `NATIVE_STEPS`. Reject any other explicit
-        // override with a clear diagnostic instead of silently running the baked schedule — a
-        // `steps: 30` request must not quietly render at 8 steps. `None` uses the distilled default.
-        if let Some(s) = req.steps {
-            if s != NATIVE_STEPS {
-                return Err(gen_core::Error::Msg(format!(
-                    "ltx: this distilled model runs a fixed {NATIVE_STEPS}-step schedule and cannot \
-                     honor steps={s}; omit `steps` (or pass {NATIVE_STEPS}) to use the baked schedule"
-                )));
-            }
-        }
+        // `req.steps` (sc-9027 / F-043) is enforced by the shared floor above, from
+        // `Capabilities::supported_steps` — NOT by an `if` here. It used to be one, and that is
+        // exactly how the two lanes drifted: candle refused `steps: 30` while mlx never read the
+        // field (sc-19502). One declaration, one enforcement site, both lanes.
         Ok(())
     }
 
@@ -850,6 +842,15 @@ pub fn descriptor() -> ModelDescriptor {
             min_size: SIZE_MULTIPLE,
             max_size: 1280,
             max_count: 1,
+            // The distilled σ waypoints are baked into training, so 8 is not a default — it is the
+            // ONLY renderable count (sc-9027 / F-043). Advertised rather than re-checked in
+            // `validate` (sc-19502): the shared floor now owns the rejection, so `mlx-gen-ltx`
+            // enforces the identical constraint from the identical declaration instead of, as it
+            // did, never reading `req.steps` and silently rendering this same schedule anyway.
+            //
+            // Derived from the σ table rather than written as `vec![8]`, so re-baking the schedule
+            // moves the advertised surface with it instead of leaving a stale literal behind.
+            supported_steps: vec![NATIVE_STEPS],
             mac_only: false,
             supported_quants: &[] as &[Quant],
             component_precision_floors: &[],

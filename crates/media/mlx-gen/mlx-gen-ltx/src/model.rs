@@ -265,6 +265,17 @@ pub fn descriptor() -> ModelDescriptor {
             min_size: MIN_SIZE,
             max_size: MAX_SIZE,
             max_count: 1,
+            // sc-19502 — THE FIX for this lane. `req.steps` was never read here at all: a
+            // `steps: 30` request was accepted, the knob did nothing, and the baked 8-step stage-1
+            // schedule rendered anyway, while the candle lane refused the same request outright.
+            // A control that is binding on one backend and silently inert on the other is the
+            // sc-11993 silent-coercion class, and the silent side is the worse one.
+            //
+            // The distilled schedule genuinely cannot be resampled to an arbitrary count without
+            // going out-of-distribution, so the honest resolution is an explicit refusal on BOTH
+            // lanes — not a knob that pretends to work here. Same derived constant, same shared
+            // floor, same message as candle.
+            supported_steps: vec![crate::pipeline::NATIVE_STEPS],
             mac_only: true,
             supports_kv_cache: false,
             requires_sigma_shift: false,
@@ -1446,6 +1457,8 @@ mlx_gen::register_generators! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // sc-19502: the derived stage-1 step count the descriptor advertises.
+    use crate::pipeline::NATIVE_STEPS;
 
     #[test]
     fn calibration_fault_is_request_local_and_phase_exact() {
@@ -1869,6 +1882,76 @@ mod tests {
             }
         )
         .is_err());
+    }
+
+    /// sc-19502 — this lane used to accept ANY `req.steps` and render the baked 8-step schedule
+    /// regardless, while candle refused the same request. Both now refuse it.
+    ///
+    /// Goes through `validate_request`, the function the generator actually calls
+    /// (`impl_generator!`'s `validate` arm), rather than asserting on `descriptor().capabilities`
+    /// directly — a declaration that no request path consults is exactly the inert-key failure this
+    /// story exists to fix, and reading the field back would prove only that a struct literal
+    /// contains what it contains.
+    #[test]
+    fn validate_request_refuses_an_off_schedule_step_count() {
+        let caps = descriptor().capabilities;
+        let base = GenerationRequest {
+            prompt: "a".into(),
+            width: 512,
+            height: 512,
+            frames: Some(9),
+            ..Default::default()
+        };
+        let at = |steps: Option<u32>| {
+            validate_request(
+                &caps,
+                &GenerationRequest {
+                    steps,
+                    ..base.clone()
+                },
+            )
+        };
+
+        // The advertised count and "the model picks" are both admitted — the common path (the
+        // catalog's `defaults.steps` is 8) must not regress into a rejection.
+        assert!(at(Some(NATIVE_STEPS)).is_ok());
+        assert!(at(None).is_ok());
+
+        // 30 is the case the story names: previously accepted here and silently ignored, refused on
+        // candle. 1 and 4 cover the under side, which a FLOOR-shaped key would have admitted.
+        for steps in [1u32, 4, 7, 9, 30, 50] {
+            let err = at(Some(steps))
+                .expect_err("an off-schedule step count must be refused, not silently ignored")
+                .to_string();
+            assert!(
+                err.contains(MODEL_ID) && err.contains(&format!("steps={steps}")),
+                "the refusal must name the model and the request: {err}"
+            );
+            assert!(
+                err.contains(&NATIVE_STEPS.to_string()),
+                "the refusal must name the legal value: {err}"
+            );
+        }
+    }
+
+    /// sc-19502 — the advertised step surface is DERIVED from the σ table this engine actually runs,
+    /// so re-baking the schedule cannot leave a stale advertised count behind.
+    ///
+    /// The cross-lane half (that candle advertises the same 8) cannot be asserted here: no crate
+    /// depends on both `mlx-gen-ltx` and `candle-gen-ltx`, and mlx is macOS-only. SceneWorks owns
+    /// that guard, where one catalog entry demonstrably drives both backends.
+    #[test]
+    fn advertised_steps_are_derived_from_the_baked_schedule() {
+        assert_eq!(
+            NATIVE_STEPS as usize,
+            crate::pipeline::STAGE1_SIGMAS.len() - 1
+        );
+        assert_eq!(NATIVE_STEPS, 8, "the distilled stage-1 schedule is 8 steps");
+        assert_eq!(
+            descriptor().capabilities.supported_steps,
+            vec![NATIVE_STEPS],
+            "the descriptor must advertise exactly the baked schedule"
+        );
     }
 
     #[test]

@@ -47,6 +47,9 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             min_size: RES_MIN,
             max_size: RES_MAX,
             max_count: MAX_COUNT,
+            // Not a distilled fixed-schedule model: any step count the shared sanity caps
+            // admit is renderable (sc-19502).
+            supported_steps: Vec::new(),
             mac_only: true,
             // Q4/Q8 quant tiers (sc-10517). Anima is convert-at-install: the SceneWorks worker packs
             // the Cosmos DiT on-device (the conditioner + Qwen3 TE + VAE stay dense bf16), and this

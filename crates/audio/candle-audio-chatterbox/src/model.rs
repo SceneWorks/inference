@@ -191,6 +191,9 @@ pub fn descriptor() -> ModelDescriptor {
             min_size: 0,
             max_size: 0,
             max_count: 1,
+            // Not a distilled fixed-schedule model: any step count the shared sanity caps
+            // admit is renderable (sc-19502).
+            supported_steps: Vec::new(),
             mac_only: false,
             audio_sample_rates: vec![S3GEN_SR],
             max_audio_duration_secs: Some(MAX_DURATION_SECS),

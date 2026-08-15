@@ -111,6 +111,9 @@ pub fn descriptor() -> ModelDescriptor {
             min_size: SIZE_MULTIPLE,
             max_size: 1280,
             max_count: 1,
+            // Not a distilled fixed-schedule model: any step count the shared sanity caps
+            // admit is renderable (sc-19502).
+            supported_steps: Vec::new(),
             mac_only: false,
             // Quant tiers are pre-quantized per-tier checkpoints (epic 1788 / A6) — NOT on-the-fly requant.
             supported_quants: &[] as &[Quant],

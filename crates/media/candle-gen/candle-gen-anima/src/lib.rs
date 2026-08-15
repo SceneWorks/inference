@@ -105,6 +105,9 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             max_size: RES_MAX,
             max_count: MAX_COUNT,
             // The whole point of the candle port: Anima is no longer Mac-only.
+            // Not a distilled fixed-schedule model: any step count the shared sanity caps
+            // admit is renderable (sc-19502).
+            supported_steps: Vec::new(),
             mac_only: false,
             // Q4 + Q8 (the candle counterpart of MLX sc-10517): the DiT packed-detects and runs the
             // dequant-dense forward (CPU-capable — NOT the CUDA-only int8 fast GEMM); conditioner /

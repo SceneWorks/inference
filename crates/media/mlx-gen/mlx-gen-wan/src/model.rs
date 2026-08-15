@@ -148,6 +148,9 @@ pub fn descriptor() -> ModelDescriptor {
             min_size: MIN_SIZE,
             max_size: 1280,
             max_count: 1,
+            // Not a distilled fixed-schedule model: any step count the shared sanity caps
+            // admit is renderable (sc-19502).
+            supported_steps: Vec::new(),
             mac_only: true,
             supported_quants: &[Quant::Q4, Quant::Q8],
             component_precision_floors: crate::memory_strategy::COMPONENT_PRECISION_FLOORS,
@@ -841,6 +844,9 @@ pub fn descriptor_t2v_14b() -> ModelDescriptor {
             min_size: 16,
             max_size: 1280,
             max_count: 1,
+            // Not a distilled fixed-schedule model: any step count the shared sanity caps
+            // admit is renderable (sc-19502).
+            supported_steps: Vec::new(),
             mac_only: true,
             supported_quants: &[Quant::Q4, Quant::Q8],
             component_precision_floors: &[],
@@ -1804,6 +1810,9 @@ pub fn descriptor_i2v_14b() -> ModelDescriptor {
             min_size: 16,
             max_size: 1280,
             max_count: 1,
+            // Not a distilled fixed-schedule model: any step count the shared sanity caps
+            // admit is renderable (sc-19502).
+            supported_steps: Vec::new(),
             mac_only: true,
             supported_quants: &[Quant::Q4, Quant::Q8],
             component_precision_floors: &[],

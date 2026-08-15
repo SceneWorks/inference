@@ -163,6 +163,9 @@ pub fn descriptor() -> ModelDescriptor {
             max_size: RES_MAX,
             max_count: MAX_COUNT,
             // candle is the Windows/CUDA backend — NOT Mac-only (the MLX provider sets this true).
+            // Not a distilled fixed-schedule model: any step count the shared sanity caps
+            // admit is renderable (sc-19502).
+            supported_steps: Vec::new(),
             mac_only: false,
             // SANA is the f32/bf16 weight path; no load-time quantization is wired yet.
             supported_quants: &[],
@@ -227,6 +230,9 @@ pub fn sprint_descriptor() -> ModelDescriptor {
             min_size: RES_MIN,
             max_size: RES_MAX,
             max_count: MAX_COUNT,
+            // Not a distilled fixed-schedule model: any step count the shared sanity caps
+            // admit is renderable (sc-19502).
+            supported_steps: Vec::new(),
             mac_only: false,
             supported_quants: &[],
             component_precision_floors: &[],

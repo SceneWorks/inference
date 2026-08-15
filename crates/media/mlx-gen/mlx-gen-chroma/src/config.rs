@@ -133,6 +133,9 @@ impl ChromaVariant {
                 min_size: 256,
                 max_size: 2048,
                 max_count: 8,
+                // Not a distilled fixed-schedule model: any step count the shared sanity caps
+                // admit is renderable (sc-19502).
+                supported_steps: Vec::new(),
                 mac_only: true,
                 supports_kv_cache: false,
                 // FLUX-style flow-match sigma shift (calculate_shift) is applied in the generate path.

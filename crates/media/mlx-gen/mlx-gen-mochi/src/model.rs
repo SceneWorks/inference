@@ -80,6 +80,9 @@ pub fn descriptor() -> ModelDescriptor {
             min_size: 16,
             max_size: 1280,
             max_count: 1,
+            // Not a distilled fixed-schedule model: any step count the shared sanity caps
+            // admit is renderable (sc-19502).
+            supported_steps: Vec::new(),
             mac_only: true,
             // Quant tiers are pre-quantized per-tier checkpoints (epic 1788 / A6 sc-11990), selected by
             // pointing `WeightsSource` at the tier dir — NOT on-the-fly requant. So no on-the-fly levels.
