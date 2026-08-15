@@ -1965,6 +1965,52 @@ mod tests {
         }
     }
 
+    /// **Every render arm evicts the AdaLN projections, so the contract's exclusion is honest.**
+    ///
+    /// `memory_strategy::adaln_component` declares 26.02 GB of DiT weights as
+    /// `PrecomputedThenEvicted` and states that `crate::model` passes
+    /// [`AdaLnResidency::PrecomputeAndEvict`] as a *literal*, so nothing a request carries can
+    /// re-resident them. That was a one-arm claim when sc-18665 wrote it. sc-17157 then added a
+    /// **second** `JointDit::new` call site — `generate_ref2va`, which denoises the reference
+    /// partition — and a doc comment cannot see it. An arm that passed
+    /// [`AdaLnResidency::Resident`] would leave the contract declaring a saving that render does
+    /// not deliver, which is the OOM direction and exactly the half-of-a-pair-moved shape sc-17150
+    /// and sc-19008 both shipped.
+    ///
+    /// So: scan the production source, and require every `JointDit::new(` construction to carry the
+    /// evicting literal. The count is derived, not maintained — a third arm is covered the moment
+    /// it is written.
+    #[test]
+    fn every_joint_dit_construction_evicts_the_adaln_projections() {
+        const CONSTRUCTION: &str = "JointDit::new(";
+        const EVICTING: &str = "AdaLnResidency::PrecomputeAndEvict";
+
+        let src = production_source();
+        let sites: Vec<usize> = src.match_indices(CONSTRUCTION).map(|(i, _)| i).collect();
+        assert!(
+            sites.len() >= 2,
+            "expected at least the base and ref2va render arms to construct a `{CONSTRUCTION}`, \
+             found {}. If the constructor was renamed this guard stopped watching anything",
+            sites.len()
+        );
+        for start in sites {
+            // The residency is the last argument, so the literal lives between the constructor and
+            // the closing paren of that call.
+            let tail = &src[start..];
+            let end = tail
+                .find(")?")
+                .expect("a JointDit::new call is closed and fallible");
+            assert!(
+                tail[..end].contains(EVICTING),
+                "a `{CONSTRUCTION}` at byte {start} does not pass `{EVICTING}`. \
+                 memory_strategy::adaln_component declares the eviction unconditionally, so an arm \
+                 that keeps the projections resident makes the published contract over-declare its \
+                 saving by up to 26.02 GB:\n{}",
+                &tail[..end]
+            );
+        }
+    }
+
     /// **No heavy component is mapped outside a staged phase.**
     ///
     /// The table in [`staged_phases`] is hand-written, so on its own it pins only what someone

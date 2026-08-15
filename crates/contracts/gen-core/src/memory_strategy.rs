@@ -690,10 +690,58 @@ impl MemoryCalibrationIdentity {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MemoryComponentKind {
     Transformer(TransformerComponent),
+    /// A named sub-stack **inside** one of the base model's transformers: a set of layers or
+    /// projections whose bytes are already part of [`MemoryAssetFacts::transformer_bytes`] rather
+    /// than a network standing beside it (SC-18665).
+    ///
+    /// [`Self::Transformer`] cannot express this — it names a whole transformer, so declaring a
+    /// projection stack with it would charge the same bytes twice on a provider that also declares
+    /// the transformer. It is not auxiliary for the same reason: the bytes are inside the
+    /// base-model total already, so `overlay_bytes` must not move for one.
+    TransformerSubStack(TransformerComponent),
     ControlBranch,
     AdapterStack,
     IpAdapter,
     IdentityEncoder,
+}
+
+/// How long one declared component's bytes stay resident within a single render (SC-18665).
+///
+/// Before this existed a declaration had exactly one meaning — resident from load until the render
+/// finishes — and [`Self::WholeRender`] *is* that meaning, spelled out rather than assumed.
+///
+/// [`Self::PrecomputedThenEvicted`] exists because MiniMax-H3's AdaLN projections are the first
+/// component on the ladder that is materialized, consumed to derive something smaller, and then
+/// dropped: 26_020_915_200 B of a 66 GB DiT partition, released before the denoise loop's first
+/// step. Charging that as resident leaves every estimate for the work that follows wrong by 26 GB
+/// in the conservative direction, which suppresses configurations that do in fact fit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MemoryComponentResidency {
+    /// Resident from load until the render finishes.
+    WholeRender,
+    /// Materialized at the head of `precomputed_in`, consumed to derive a smaller artifact, and
+    /// released before that phase's steady-state work runs. The phase's own peak therefore covers
+    /// the full `resident_bytes`, while its steady state — and every later phase — holds only
+    /// `retained_bytes`.
+    ///
+    /// Deliberately **not** a [`MemoryStrategy`]. A rung is something a selection engages or
+    /// declines; a provider may perform this drop unconditionally, as MiniMax-H3 does.
+    /// [`MemoryResidentComponent::bounded_by`] remains the seam for a rung-selected residency, and
+    /// the two are independent.
+    PrecomputedThenEvicted {
+        /// The phase whose steady state runs without this component. Conformance requires it to be
+        /// a declared lifecycle phase, so the drop is ordered against a phase the provider runs
+        /// rather than against a stage nobody else can see.
+        precomputed_in: MemoryPhase,
+        /// Bytes of the derived artifact kept in the component's place. **The evict is not free**;
+        /// declaring it as free overstates the win by exactly this much.
+        retained_bytes: u64,
+        /// The executable measurement or loader assertion that established the drop. Required for
+        /// the same reason [`MemoryStrategyEngagementExclusion::evidence`] is: this removes bytes
+        /// from an estimate, and an unevidenced removal is how an estimate stops being
+        /// conservative. Its **truth** cannot be checked here, only its presence.
+        evidence: String,
+    },
 }
 
 /// Whether adapter factors remain independently resident after a provider finishes loading.
@@ -743,10 +791,39 @@ pub struct MemoryResidentComponent {
     /// may hold several distinct [`MemoryComponentKind::ControlBranch`] components at once.
     pub id: String,
     pub kind: MemoryComponentKind,
+    /// Bytes at this component's **widest** instant: what it costs while fully materialized.
     pub resident_bytes: u64,
-    /// The rung that bounds this component's residency, if any. `None` means it remains fully
-    /// resident for every strategy the provider declares.
+    /// The rung that bounds this component's residency, if any. `None` means no *rung* bounds it —
+    /// which is not the same as staying resident, since [`Self::residency`] may declare an
+    /// unconditional drop that no selection can decline (SC-18665).
     pub bounded_by: Option<MemoryStrategy>,
+    /// How long those bytes actually stay (SC-18665).
+    ///
+    /// Required rather than defaulted, following the SC-16090 precedent on
+    /// [`MemoryBackendRealization::CandleCuda::block_materialization`]: a default is an opt-out
+    /// that reads as a declaration, and every existing site states
+    /// [`MemoryComponentResidency::WholeRender`] explicitly, which is byte-for-byte the meaning it
+    /// already had.
+    pub residency: MemoryComponentResidency,
+}
+
+impl MemoryResidentComponent {
+    /// Bytes this component still holds once its phase reaches steady state.
+    pub fn steady_state_bytes(&self) -> u64 {
+        match &self.residency {
+            MemoryComponentResidency::WholeRender => self.resident_bytes,
+            MemoryComponentResidency::PrecomputedThenEvicted { retained_bytes, .. } => {
+                (*retained_bytes).min(self.resident_bytes)
+            }
+        }
+    }
+
+    /// Bytes it drops getting there — **zero** for every [`MemoryComponentResidency::WholeRender`]
+    /// declaration, which is why adopting this field cannot move an existing provider's arithmetic.
+    pub fn evicted_bytes(&self) -> u64 {
+        self.resident_bytes
+            .saturating_sub(self.steady_state_bytes())
+    }
 }
 
 /// A scalar predicted peak with the resident auxiliary contributions exposed separately.
@@ -971,6 +1048,40 @@ impl MemoryProviderContract {
     /// Typed resident component declarations, empty for every non-adopting provider.
     pub fn resident_components(&self) -> &[MemoryResidentComponent] {
         self.formula.resident_components()
+    }
+
+    /// Bytes the declared components drop before their phase reaches steady state (SC-18665).
+    ///
+    /// **Zero** for every provider that declares only [`MemoryComponentResidency::WholeRender`], so
+    /// this reads the same on a contract written before the field existed as it did before.
+    pub fn evicted_component_bytes(&self) -> u64 {
+        self.resident_components()
+            .iter()
+            .fold(0_u64, |total, component| {
+                total.saturating_add(component.evicted_bytes())
+            })
+    }
+
+    /// [`MemoryAssetFacts::transformer_bytes`] corrected for declared intra-transformer evictions:
+    /// the transformer residency an estimate for the **post-precompute steady state** should
+    /// charge, rather than the load-exact total that is only true at the precompute instant.
+    ///
+    /// Only [`MemoryComponentKind::TransformerSubStack`] declarations move this. An auxiliary
+    /// network's residency is not inside `transformer_bytes` and must not be subtracted from it,
+    /// and a whole-[`MemoryComponentKind::Transformer`] declaration has nothing to drop. So this
+    /// returns `asset_facts.transformer_bytes` **unchanged** for every provider that has not
+    /// adopted the sub-stack vocabulary.
+    pub fn steady_state_transformer_bytes(&self) -> u64 {
+        let evicted = self
+            .resident_components()
+            .iter()
+            .filter(|component| {
+                matches!(component.kind, MemoryComponentKind::TransformerSubStack(_))
+            })
+            .fold(0_u64, |total, component| {
+                total.saturating_add(component.evicted_bytes())
+            });
+        self.asset_facts.transformer_bytes.saturating_sub(evicted)
     }
 
     /// Load-exact bytes attributable to auxiliary component declarations.
@@ -1377,6 +1488,46 @@ impl MemoryProviderContract {
                 if !implemented(strategy) {
                     errors.push(format!(
                         "resident component {:?} is bounded by {strategy:?}, but that strategy is not implemented",
+                        component.id
+                    ));
+                }
+            }
+            // SC-18665. A sub-stack is part of the transformer total, so it cannot exceed it. Only
+            // checked against a RESOLVED footprint: a weights-free fixture legitimately declares an
+            // architecture-derived sub-stack against zero asset facts.
+            if matches!(component.kind, MemoryComponentKind::TransformerSubStack(_))
+                && self.asset_facts.transformer_bytes > 0
+                && component.resident_bytes > self.asset_facts.transformer_bytes
+            {
+                errors.push(format!(
+                    "resident component {:?} declares {} B inside a transformer charged at {} B; a \
+                     sub-stack cannot exceed the stack that contains it",
+                    component.id, component.resident_bytes, self.asset_facts.transformer_bytes
+                ));
+            }
+            if let MemoryComponentResidency::PrecomputedThenEvicted {
+                precomputed_in,
+                retained_bytes,
+                evidence,
+            } = &component.residency
+            {
+                if *retained_bytes >= component.resident_bytes {
+                    errors.push(format!(
+                        "resident component {:?} retains {retained_bytes} B of its {} B, so its \
+                         declared eviction excludes nothing",
+                        component.id, component.resident_bytes
+                    ));
+                }
+                if evidence.trim().is_empty() {
+                    errors.push(format!(
+                        "resident component {:?} declares an eviction with no verification evidence",
+                        component.id
+                    ));
+                }
+                if !self.lifecycle.phases.contains(precomputed_in) {
+                    errors.push(format!(
+                        "resident component {:?} is precomputed in {precomputed_in:?}, which is not \
+                         a declared lifecycle phase",
                         component.id
                     ));
                 }
@@ -3265,6 +3416,246 @@ mod tests {
         ));
     }
 
+    // --- SC-18665: intra-transformer evictable sub-stacks -------------------------------------
+
+    /// A contract carrying only `WholeRender` declarations reads **byte-identically** through every
+    /// accessor SC-18665 added, so adopting the field cannot move a provider that did not opt in.
+    ///
+    /// The auxiliary component here declares 7 B against a 40 B transformer, and the assertions
+    /// name those literals rather than a default: comparing `evicted_component_bytes()` with `0` on
+    /// a contract that declares no components at all would pass with the whole feature deleted.
+    #[test]
+    fn a_whole_render_declaration_leaves_every_derived_quantity_unmoved() {
+        let mut contract = adopted_contract();
+        contract.asset_facts = MemoryAssetFacts {
+            base_bytes: 60,
+            conditioning_bytes: 10,
+            transformer_bytes: 40,
+            decoder_bytes: 10,
+            overlay_bytes: 7,
+        };
+        contract.formula = MemoryFormulaKind::ComponentPhaseEnvelope {
+            phases: contract.lifecycle.phases.clone(),
+            variables: vec![
+                MemoryFormulaVariable::AssetBytes,
+                MemoryFormulaVariable::OverlayBytes,
+            ],
+            resident_components: vec![MemoryResidentComponent {
+                id: "control".to_owned(),
+                kind: MemoryComponentKind::ControlBranch,
+                resident_bytes: 7,
+                bounded_by: None,
+                residency: MemoryComponentResidency::WholeRender,
+            }],
+        };
+        assert!(contract.conformance_errors().is_empty());
+
+        let component = &contract.resident_components()[0];
+        assert_eq!(component.steady_state_bytes(), 7, "nothing is dropped");
+        assert_eq!(component.evicted_bytes(), 0);
+        assert_eq!(contract.evicted_component_bytes(), 0);
+        assert_eq!(
+            contract.steady_state_transformer_bytes(),
+            40,
+            "the transformer charge is the declared 40 B, untouched by an auxiliary component"
+        );
+        assert_eq!(contract.auxiliary_resident_bytes(), 7);
+        assert_eq!(contract.total_resident_bytes(), 67);
+        assert_eq!(
+            contract.decompose_predicted_peak(1_000).unattributed_bytes,
+            993
+        );
+    }
+
+    /// An intra-transformer sub-stack removes its **net** bytes from the transformer charge, and
+    /// only from there: the aggregate `asset_facts` fields and the auxiliary accounting are
+    /// untouched, because a sub-stack is not an auxiliary network.
+    #[test]
+    fn a_precomputed_sub_stack_reduces_only_the_steady_state_transformer_charge() {
+        let mut contract = adopted_contract();
+        contract.asset_facts = MemoryAssetFacts {
+            base_bytes: 160,
+            conditioning_bytes: 10,
+            transformer_bytes: 140,
+            decoder_bytes: 10,
+            overlay_bytes: 0,
+        };
+        contract.formula = MemoryFormulaKind::ComponentPhaseEnvelope {
+            phases: contract.lifecycle.phases.clone(),
+            variables: vec![MemoryFormulaVariable::AssetBytes],
+            resident_components: vec![MemoryResidentComponent {
+                id: "adaln".to_owned(),
+                kind: MemoryComponentKind::TransformerSubStack(TransformerComponent::Dit),
+                resident_bytes: 100,
+                bounded_by: None,
+                residency: MemoryComponentResidency::PrecomputedThenEvicted {
+                    precomputed_in: MemoryPhase::Denoise,
+                    retained_bytes: 30,
+                    evidence: "a measurement".to_owned(),
+                },
+            }],
+        };
+        assert_eq!(contract.conformance_errors(), Vec::<String>::new());
+
+        let component = &contract.resident_components()[0];
+        assert_eq!(component.steady_state_bytes(), 30);
+        assert_eq!(component.evicted_bytes(), 70, "net, not the gross 100");
+        assert_eq!(contract.evicted_component_bytes(), 70);
+        assert_eq!(contract.steady_state_transformer_bytes(), 140 - 70);
+        // A sub-stack is inside the base-model total, so none of this may touch the overlay legs.
+        assert_eq!(contract.auxiliary_resident_bytes(), 0);
+        assert_eq!(contract.total_resident_bytes(), 160);
+        assert_eq!(contract.asset_facts.transformer_bytes, 140);
+    }
+
+    /// Every SC-18665 conformance rule, mutated **one at a time** off a known-good contract, so
+    /// each guard is shown to detect its own breakage rather than the set detecting something.
+    #[test]
+    fn each_sub_stack_eviction_rule_is_independently_detected() {
+        fn good() -> MemoryProviderContract {
+            let mut contract = adopted_contract();
+            contract.asset_facts = MemoryAssetFacts {
+                base_bytes: 160,
+                conditioning_bytes: 10,
+                transformer_bytes: 140,
+                decoder_bytes: 10,
+                overlay_bytes: 0,
+            };
+            contract.formula = MemoryFormulaKind::ComponentPhaseEnvelope {
+                phases: contract.lifecycle.phases.clone(),
+                variables: vec![MemoryFormulaVariable::AssetBytes],
+                resident_components: vec![MemoryResidentComponent {
+                    id: "adaln".to_owned(),
+                    kind: MemoryComponentKind::TransformerSubStack(TransformerComponent::Dit),
+                    resident_bytes: 100,
+                    bounded_by: None,
+                    residency: MemoryComponentResidency::PrecomputedThenEvicted {
+                        precomputed_in: MemoryPhase::Denoise,
+                        retained_bytes: 30,
+                        evidence: "a measurement".to_owned(),
+                    },
+                }],
+            };
+            contract
+        }
+        fn residency(contract: &mut MemoryProviderContract) -> &mut MemoryComponentResidency {
+            match &mut contract.formula {
+                MemoryFormulaKind::ComponentPhaseEnvelope {
+                    resident_components,
+                    ..
+                } => &mut resident_components[0].residency,
+                other => panic!("the control declares a component envelope, got {other:?}"),
+            }
+        }
+        assert!(
+            good().conformance_errors().is_empty(),
+            "the control must conform, or every mutation below is vacuous"
+        );
+
+        /// One named mutation, the error substring it must produce, and the edit itself.
+        type SubStackMutation = (&'static str, &'static str, fn(&mut MemoryProviderContract));
+
+        let mutations: Vec<SubStackMutation> = vec![
+            (
+                "retaining everything it materialized",
+                "excludes nothing",
+                |c| {
+                    if let MemoryComponentResidency::PrecomputedThenEvicted {
+                        retained_bytes, ..
+                    } = residency(c)
+                    {
+                        *retained_bytes = 100;
+                    }
+                },
+            ),
+            ("an unevidenced eviction", "no verification evidence", |c| {
+                if let MemoryComponentResidency::PrecomputedThenEvicted { evidence, .. } =
+                    residency(c)
+                {
+                    *evidence = "   ".to_owned();
+                }
+            }),
+            (
+                "a precompute phase the provider does not run",
+                "not a declared lifecycle phase",
+                |c| {
+                    // The formula's own phase list is left alone: what this mutates is the
+                    // provider's declared lifecycle, which is what the rule reads.
+                    c.lifecycle.phases.retain(|p| *p != MemoryPhase::Denoise);
+                },
+            ),
+            (
+                "a sub-stack larger than the stack containing it",
+                "cannot exceed the stack that contains it",
+                |c| c.asset_facts.transformer_bytes = 99,
+            ),
+        ];
+
+        for (name, expected, mutate) in mutations {
+            let mut contract = good();
+            mutate(&mut contract);
+            let errors = contract.conformance_errors();
+            assert!(
+                errors.iter().any(|error| error.contains(expected)),
+                "conformance must reject {name} with an error naming {expected:?}, got {errors:?}"
+            );
+        }
+    }
+
+    /// The containment rule is skipped, not tripped, by a weights-free fixture: an
+    /// architecture-derived sub-stack against zero asset facts is a legitimate declaration, and if
+    /// this errored no adopting provider could publish a catalog-conformance fixture.
+    #[test]
+    fn a_weights_free_fixture_may_declare_a_sub_stack_against_zero_asset_facts() {
+        let mut contract = adopted_contract();
+        contract.formula = MemoryFormulaKind::ComponentPhaseEnvelope {
+            phases: contract.lifecycle.phases.clone(),
+            variables: vec![MemoryFormulaVariable::AssetBytes],
+            resident_components: vec![MemoryResidentComponent {
+                id: "adaln".to_owned(),
+                kind: MemoryComponentKind::TransformerSubStack(TransformerComponent::Dit),
+                // Obviously synthetic round numbers. These used to be MiniMax-H3's real 26.02 GB
+                // stack beside `3_890_073_600` — a mis-transcription of that provider's
+                // `ADALN_MODULATION_TABLE_MAX_BYTES` (3_870_720_000). A near-miss copy of a real
+                // provider's figures reads as authoritative and is the harder defect: gen-core owns
+                // the rule, not any provider's bytes, and nothing here grades a magnitude.
+                resident_bytes: 4_000_000_000,
+                bounded_by: None,
+                residency: MemoryComponentResidency::PrecomputedThenEvicted {
+                    precomputed_in: MemoryPhase::Denoise,
+                    retained_bytes: 1_000_000_000,
+                    evidence: "a measurement".to_owned(),
+                },
+            }],
+        };
+        assert_eq!(contract.asset_facts, MemoryAssetFacts::default());
+        assert_eq!(contract.conformance_errors(), Vec::<String>::new());
+        // …and the accessor saturates rather than wrapping when the fixture charges nothing.
+        assert_eq!(contract.steady_state_transformer_bytes(), 0);
+    }
+
+    /// A sub-stack is not auxiliary. If it were, every adopting provider would have to move its
+    /// bytes into `overlay_bytes` — where they would be charged a second time, on top of the
+    /// transformer that already contains them.
+    #[test]
+    fn a_transformer_sub_stack_is_not_auxiliary() {
+        assert!(
+            !MemoryComponentKind::TransformerSubStack(TransformerComponent::Dit).is_auxiliary()
+        );
+        assert!(!MemoryComponentKind::Transformer(TransformerComponent::Dit).is_auxiliary());
+        for auxiliary in [
+            MemoryComponentKind::ControlBranch,
+            MemoryComponentKind::AdapterStack,
+            MemoryComponentKind::IpAdapter,
+            MemoryComponentKind::IdentityEncoder,
+        ] {
+            assert!(
+                auxiliary.is_auxiliary(),
+                "{auxiliary:?} must stay auxiliary"
+            );
+        }
+    }
+
     #[test]
     fn asset_facts_reject_overlay_contamination_and_ambiguous_overlay_formulas() {
         let mut contract = adopted_contract();
@@ -3286,6 +3677,7 @@ mod tests {
                 kind: MemoryComponentKind::ControlBranch,
                 resident_bytes: 7,
                 bounded_by: None,
+                residency: MemoryComponentResidency::WholeRender,
             }],
         };
         assert!(contract.conformance_errors().is_empty());
