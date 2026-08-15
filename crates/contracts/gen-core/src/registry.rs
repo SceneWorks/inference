@@ -5,7 +5,7 @@
 use crate::audio_embed::{AudioEmbedder, AudioEmbedderDescriptor};
 use crate::audio_transform::{AudioTransform, AudioTransformDescriptor, AudioTransformKind};
 use crate::caption::{Captioner, CaptionerDescriptor};
-use crate::generator::{ConditioningKind, Generator, Modality, ModelDescriptor};
+use crate::generator::{ConditioningKind, Generator, Modality, ModelDescriptor, StepSupport};
 use crate::image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
 use crate::memory_strategy::{MemoryProviderContract, MemoryRunContext, MemorySafetyDecision};
 use crate::runtime::{LoadSpec, Quant, WeightsSource};
@@ -940,6 +940,46 @@ pub fn model_descriptor_errors(d: &ModelDescriptor) -> Vec<String> {
                 "{ctx}: explicit-size multiple {multiple} > max_size {} — no explicit size can pass",
                 caps.max_size
             ));
+        }
+    }
+    // The advertised step surface must be satisfiable (sc-19559). Each of these declares a
+    // constraint that refuses EVERY step count, which the shared floor would then enforce on every
+    // request — the descriptor mistake is silent otherwise, because `Unconstrained` (the common
+    // case) never reaches here.
+    match &caps.supported_steps {
+        StepSupport::Unconstrained => {}
+        StepSupport::Exact(counts) => {
+            if counts.is_empty() {
+                errs.push(format!(
+                    "{ctx}: supported_steps is an EMPTY exact menu — no step count would be \
+                     admitted; use StepSupport::Unconstrained for 'no constraint'"
+                ));
+            }
+            if counts.contains(&0) {
+                errs.push(format!(
+                    "{ctx}: supported_steps advertises 0 steps, which the shared floor always \
+                     refuses (an explicit 0 renders undenoised noise)"
+                ));
+            }
+            for (i, c) in counts.iter().enumerate() {
+                if counts[..i].contains(c) {
+                    errs.push(format!("{ctx}: duplicate supported step count {c}"));
+                }
+            }
+        }
+        StepSupport::Range { min, max } => {
+            if *min == 0 {
+                errs.push(format!(
+                    "{ctx}: supported_steps range starts at 0, which the shared floor always \
+                     refuses (an explicit 0 renders undenoised noise)"
+                ));
+            }
+            if min > max {
+                errs.push(format!(
+                    "{ctx}: supported_steps range {min}..={max} is empty — no step count would be \
+                     admitted"
+                ));
+            }
         }
     }
     check_name_list(&mut errs, &ctx, "sampler", &caps.samplers);
@@ -2872,6 +2912,58 @@ mod tests {
         assert!(unmeasured
             .activation_memory_bytes_1024("no_such_model")
             .is_err());
+    }
+
+    /// sc-19559 — an unsatisfiable step declaration is a descriptor mistake, not a runtime
+    /// surprise. Each shape refuses EVERY step count, and the shared floor would enforce it on
+    /// every request, so the sweep has to name it before a catalog ships.
+    ///
+    /// Each case is built and asserted individually: a single descriptor carrying all of them at
+    /// once would pass even if only one check fired.
+    #[test]
+    fn model_descriptor_errors_flags_an_unsatisfiable_step_declaration() {
+        let with = |steps: StepSupport| ModelDescriptor {
+            capabilities: Capabilities {
+                supported_steps: steps,
+                ..dummy_descriptor().capabilities
+            },
+            ..dummy_descriptor()
+        };
+        let errs = |steps: StepSupport| model_descriptor_errors(&with(steps));
+
+        // The baseline: the coherent descriptor this varies from is clean, so every message below
+        // is attributable to the step declaration alone.
+        assert!(errs(StepSupport::Unconstrained).is_empty());
+        assert!(errs(StepSupport::Exact(vec![8])).is_empty());
+        assert!(errs(StepSupport::Range { min: 1, max: 200 }).is_empty());
+
+        let empty_menu = errs(StepSupport::Exact(Vec::new()));
+        assert!(
+            empty_menu.iter().any(|e| e.contains("EMPTY exact menu")),
+            "{empty_menu:?}"
+        );
+        let zero_menu = errs(StepSupport::Exact(vec![0, 8]));
+        assert!(
+            zero_menu.iter().any(|e| e.contains("advertises 0 steps")),
+            "{zero_menu:?}"
+        );
+        let dupe_menu = errs(StepSupport::Exact(vec![8, 8]));
+        assert!(
+            dupe_menu
+                .iter()
+                .any(|e| e.contains("duplicate supported step count 8")),
+            "{dupe_menu:?}"
+        );
+        let zero_range = errs(StepSupport::Range { min: 0, max: 200 });
+        assert!(
+            zero_range.iter().any(|e| e.contains("range starts at 0")),
+            "{zero_range:?}"
+        );
+        let inverted = errs(StepSupport::Range { min: 30, max: 8 });
+        assert!(
+            inverted.iter().any(|e| e.contains("30..=8 is empty")),
+            "{inverted:?}"
+        );
     }
 
     /// Each per-descriptor invariant fires: identity shape, zero/inverted bounds, duplicate or

@@ -20,7 +20,8 @@ use mlx_gen::{
     curated_scheduler_names, default_seed, schedule_sigmas, AlphaSchedule, Capabilities,
     Conditioning, ConditioningKind, ControlKind, DiscreteModelSampling, Error, GenerationOutput,
     GenerationRequest, Generator, Image, LatentDecoder, LoadSpec, Modality, ModelDescriptor,
-    OffloadPolicy, Progress, Quant, Residency, Result, Scheduler, SizeFloor, Solver, WeightsSource,
+    OffloadPolicy, Progress, Quant, Residency, Result, Scheduler, Solver, StepSupport,
+    WeightsSource,
 };
 
 use mlx_gen_pid::{resolve_pid_decoder_at_sigma, PidEngine};
@@ -77,7 +78,6 @@ pub fn descriptor() -> ModelDescriptor {
             // Kolors uses real classifier-free guidance over the ChatGLM3 conditioning.
             supports_negative_prompt: true,
             supports_guidance: true,
-            supports_true_cfg: false,
             // Reference = img2img init (sc-3095) OR the IP-Adapter image prompt when an IP-Adapter is
             // loaded (sc-3098); Control = the Kolors ControlNet-pose branch (sc-3097).
             conditioning: vec![ConditioningKind::Reference, ConditioningKind::Control],
@@ -110,18 +110,19 @@ pub fn descriptor() -> ModelDescriptor {
                 s.extend(curated_scheduler_names());
                 s
             },
-            supported_guidance_methods: vec![],
             min_size: 512,
             max_size: 2048,
             max_count: 8,
-            // Not a distilled fixed-schedule model: any step count the shared sanity caps
-            // admit is renderable (sc-19502).
-            supported_steps: Vec::new(),
+            // Kolors' train-timestep count is a real upper bound: above it `step_ratio` floors to
+            // 0 and every timestep collapses to 1 — silent garbage, not an error (F-124). It was
+            // checked only inside `validate_request` below; declaring it makes it discoverable
+            // (sc-19559).
+            supported_steps: StepSupport::Range {
+                min: 1,
+                max: NUM_TRAIN_TIMESTEPS as u32,
+            },
             mac_only: true,
             supported_quants: &[Quant::Q4, Quant::Q8],
-            component_precision_floors: &[],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
             // Wired onto the shared `Residency` seam (epic 10834, sc-10840); honors Sequential offload
             // (F-176). The monolithic `Kolors` was split into a droppable `KolorsText` (6B ChatGLM3 +
             // tokenizer) phase and a `KolorsHeavy` (SDXL U-Net + VAE) phase (`crate::model`): under
@@ -131,21 +132,8 @@ pub fn descriptor() -> ModelDescriptor {
             // DENSE at load, so a `Sequential` + `quantize` load re-quantizes each generate (F-181
             // advisory in `load`).
             supports_sequential_offload: true,
-            unconditionally_engages_staged_residency: false,
             supports_preview: true,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
+            ..Default::default()
         },
     }
 }
@@ -1143,10 +1131,11 @@ mod tests {
 
     #[test]
     fn validate_rejects_bad_steps() {
-        // `steps == 0` would divide by zero in the sampler — now rejected by the shared floor (F-007,
-        // message "steps must be >= 1"). `steps > NUM_TRAIN_TIMESTEPS` collapses every timestep to 1 —
-        // still Kolors' own upper-bound check (F-124). Both must be rejected; `None` and an in-range
-        // count pass.
+        // `steps == 0` would divide by zero in the sampler — rejected by the shared floor (F-007,
+        // message "steps must be >= 1"). `steps > NUM_TRAIN_TIMESTEPS` collapses every timestep to
+        // 1 — also the shared floor now, from the advertised range (sc-19559), which is derived
+        // from the same `NUM_TRAIN_TIMESTEPS` Kolors' own F-124 check uses. Both must be rejected;
+        // `None` and an in-range count pass.
         let caps = descriptor().capabilities;
         let base = GenerationRequest {
             prompt: "a fox".into(),
@@ -1161,13 +1150,19 @@ mod tests {
         };
         let err = validate_request(&caps, &zero).unwrap_err().to_string();
         assert!(err.contains("steps must be >= 1"), "steps=0 got: {err}");
-        // steps > NUM_TRAIN_TIMESTEPS is rejected by Kolors' upper-bound check.
+        // steps > NUM_TRAIN_TIMESTEPS is now rejected by the SHARED floor, from the range this
+        // descriptor advertises (sc-19559) — the same constant Kolors' own check below uses, so
+        // the two cannot disagree. Asserting the shared message rather than the provider's is the
+        // point: the bound moved onto the advertised surface, where a consumer can read it.
         let over = GenerationRequest {
             steps: Some(NUM_TRAIN_TIMESTEPS as u32 + 1),
             ..base.clone()
         };
         let err = validate_request(&caps, &over).unwrap_err().to_string();
-        assert!(err.contains("steps must be in"), "over-max got: {err}");
+        assert!(
+            err.contains(&format!("1..={NUM_TRAIN_TIMESTEPS}")),
+            "over-max got: {err}"
+        );
         for ok in [None, Some(1), Some(50), Some(NUM_TRAIN_TIMESTEPS as u32)] {
             let req = GenerationRequest {
                 steps: ok,

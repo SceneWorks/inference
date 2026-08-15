@@ -1834,9 +1834,118 @@ pub enum StagedResidencyAvailability {
     UnconditionallyEngaged,
 }
 
-/// What a model supports — drives `validate()` and consumer UI. `Default` is "supports
-/// nothing"; a model turns on what it offers (`Capabilities { supports_guidance: true,
-/// ..Default::default() }`).
+/// The denoise step counts a model can render — the ONE representation for every step-count
+/// shape the catalog has needed (sc-19559).
+///
+/// Three shapes accreted before this type existed: a **minimum** (SceneWorks'
+/// `limits.hardMinSteps`, sc-19426), an **exact set** (`supported_steps: Vec<u32>`, sc-19502),
+/// and a **ceiling**, which nothing could express at all — SVD's `MAX_STEPS = 200` lived only
+/// inside `mlx-gen-svd`'s and `candle-gen-svd`'s `validate`, so a consumer could not learn the
+/// bound without dispatching a job. Rather than adding a fourth key, the shapes collapse here:
+/// a model is unconstrained, pinned to an exact menu, or bounded by an inclusive range.
+///
+/// **Rejected alternatives.** A separate `max_steps: Option<u32>` beside the existing `Vec<u32>`
+/// was cheaper but lets a descriptor declare `supported_steps: [8]` *and* `max_steps: 4` — a
+/// contradiction only a cross-check could catch, and it leaves the minimum still unexpressible,
+/// so the next model needing a floor adds a fourth key. Extending `Vec<u32>` to enumerate
+/// `1..=200` as 200 elements is a set pretending to be a range: it makes the ceiling
+/// undiscoverable as a *bound*, and Kolors' `1..=1100` would be an 1100-element vector in every
+/// descriptor snapshot.
+///
+/// **Polarity.** [`Unconstrained`](Self::Unconstrained) is the `Default` and means **no
+/// constraint** — deliberately the opposite of [`Capabilities::samplers`], where empty means
+/// "reject any explicit value". A model opts *in* to being constrained. Inverting it would make
+/// a bare `Default::default()` refuse every step count in the repo.
+///
+/// Only an EXPLICIT `req.steps` is judged; `None` means "the model picks its baked default" and
+/// always passes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum StepSupport {
+    /// No advertised constraint: any count the shared sanity caps admit.
+    #[default]
+    Unconstrained,
+    /// The **only** legal counts. A distilled model bakes its σ waypoints into training, so the
+    /// step count is not a knob at all — LTX-2.3 runs a fixed 8-step stage-1 schedule
+    /// (`STAGE1_SIGMAS`, 9 waypoints) and cannot honor any other count without going
+    /// out-of-distribution.
+    ///
+    /// An empty set would refuse every count including the model's own default, which no model
+    /// wants; [`model_descriptor_errors`](crate::registry::model_descriptor_errors) rejects it as
+    /// a descriptor mistake.
+    Exact(Vec<u32>),
+    /// Any count in `min..=max`, inclusive on both ends. This is the shape a model with a real
+    /// engine bound has: SVD-XT's 200-step ceiling, ACE-Step's 200, MMAudio's 500, Kolors'
+    /// 1100 train timesteps.
+    ///
+    /// `min > max` is an unsatisfiable declaration and is rejected by
+    /// [`model_descriptor_errors`](crate::registry::model_descriptor_errors).
+    Range { min: u32, max: u32 },
+}
+
+impl StepSupport {
+    /// Whether this model can render exactly `steps` denoise steps.
+    pub fn admits(&self, steps: u32) -> bool {
+        match self {
+            Self::Unconstrained => true,
+            Self::Exact(counts) => counts.contains(&steps),
+            Self::Range { min, max } => (*min..=*max).contains(&steps),
+        }
+    }
+
+    /// The largest step count this model renders, or `None` when it advertises no ceiling.
+    ///
+    /// This is the weights-free ceiling read: a consumer sizing a Steps control asks the
+    /// descriptor rather than dispatching a job and reading the failure. An
+    /// [`Exact`](Self::Exact) menu's ceiling is its largest member; an empty menu has none.
+    pub fn ceiling(&self) -> Option<u32> {
+        match self {
+            Self::Unconstrained => None,
+            Self::Exact(counts) => counts.iter().copied().max(),
+            Self::Range { max, .. } => Some(*max),
+        }
+    }
+
+    /// The smallest step count this model renders, or `None` when it advertises no floor.
+    ///
+    /// ⚠️ This is a **bound, not a default**. A consumer must not seed a Steps control with it:
+    /// omitting `steps` selects the model's own baked default, which is generally not the floor.
+    pub fn floor(&self) -> Option<u32> {
+        match self {
+            Self::Unconstrained => None,
+            Self::Exact(counts) => counts.iter().copied().min(),
+            Self::Range { min, .. } => Some(*min),
+        }
+    }
+
+    /// Whether this advertises no step constraint at all (the `Default`).
+    pub fn is_unconstrained(&self) -> bool {
+        matches!(self, Self::Unconstrained)
+    }
+}
+
+/// What a model supports — drives `validate()` and consumer UI.
+///
+/// `Default` is "supports nothing"; a model **turns on only what it offers** and defers every
+/// other field, which is what makes adding a capability additive instead of a repo-wide compile
+/// break (sc-19561):
+///
+/// ```
+/// # use gen_core::Capabilities;
+/// Capabilities {
+///     supports_guidance: true,
+///     max_count: 1,
+///     ..Default::default()
+/// }
+/// # ;
+/// ```
+///
+/// This is not a style preference. Every descriptor in the workspace constructs `Capabilities`
+/// from another crate, so a new field lands in ~70 files at once unless each construction ends in
+/// `..Default::default()` (or another base). `#[non_exhaustive]` cannot enforce it — that
+/// attribute makes cross-crate construction impossible outright (E0639), and so does a private
+/// field (E0451) — so the invariant is enforced by the
+/// `capabilities_are_constructed_additively` integration test instead, which reads every `.rs`
+/// file in the workspace and fails on any `Capabilities { .. }` literal with no base expression.
 #[derive(Clone, Debug, Default)]
 pub struct Capabilities {
     pub supports_negative_prompt: bool,
@@ -1854,19 +1963,18 @@ pub struct Capabilities {
     pub min_size: u32,
     pub max_size: u32,
     pub max_count: u32,
-    /// The **only** denoise step counts this model can render, or empty for "any count the sanity
-    /// caps admit" (sc-19502).
+    /// The denoise step counts this model can render (sc-19502 for the exact menu, sc-19559 for
+    /// the range) — see [`StepSupport`] for the representation and the rejected alternatives.
     ///
-    /// ⚠️ **Opposite polarity to [`samplers`](Self::samplers) / [`audio_voices`](Self::audio_voices),
-    /// deliberately.** For those, empty means "no selectable surface, reject any explicit value".
-    /// Here empty means **no constraint** — every model that leaves it unset accepts whatever the
-    /// sanity caps admit, exactly as before this field existed. Inverting it would make a bare
-    /// `Default::default()` refuse every step count in the repo. A model opts *in* to being
-    /// constrained, it does not opt out.
+    /// [`StepSupport::Unconstrained`] (the `Default`) means **no constraint**, deliberately the
+    /// opposite polarity to [`samplers`](Self::samplers) / [`audio_voices`](Self::audio_voices),
+    /// where empty means "no selectable surface, reject any explicit value". A model opts *in* to
+    /// being constrained.
     ///
-    /// Non-empty ⇒ an explicit `req.steps` outside the set is rejected by the shared floor. `None`
-    /// on the request always passes: that is "use the model's baked default", not a step count
-    /// anyone chose.
+    /// Constrained ⇒ an explicit `req.steps` outside the menu/range is rejected by the shared
+    /// floor. `None` on the request always passes: that is "use the model's baked default", not a
+    /// step count anyone chose. A declared bound is therefore **never a default** — read
+    /// [`StepSupport::floor`] as a bound only.
     ///
     /// # Why this is on `Capabilities` rather than in each provider's `validate`
     ///
@@ -1885,7 +1993,18 @@ pub struct Capabilities {
     /// inspection rather than by dispatching a job and reading the failure — the same
     /// discoverability argument [`size_floor`](Self::size_floor) makes for the size axis.
     ///
-    pub supported_steps: Vec<u32>,
+    /// The same argument carries the ceiling (sc-19559): SVD-XT refuses `steps > 200` in both
+    /// lanes' `validate`, but nothing said so on the advertised surface, so the only way to learn
+    /// the bound was to dispatch a job. A [`StepSupport::Range`] declaration makes the shared
+    /// floor the enforcing site and the descriptor the discoverable one.
+    ///
+    /// # Conformance coupling
+    ///
+    /// `gen-core-testkit`'s `check_validate_honesty` validates at `profile.steps`, so a model
+    /// declaring a constraint must align its conformance `Profile` — LTX pins 8. A declaration
+    /// whose model default falls outside its own menu is a descriptor mistake
+    /// caught by [`model_descriptor_errors`](crate::registry::model_descriptor_errors).
+    pub supported_steps: StepSupport,
     pub mac_only: bool,
     /// How this model's size range is enforced — and therefore whether
     /// `min_size`/`max_size` are a bound a caller may rely on, plus any explicit-size grid the
@@ -2234,11 +2353,12 @@ impl Capabilities {
                 )));
             }
         }
-        // The advertised exact-step surface (sc-19502). Distinct from the sanity cap above: that one
-        // is a footgun guard every model shares, this one is a per-model declaration that the step
-        // count is not a knob at all. Empty ⇒ unconstrained, so this is inert for every model that
-        // does not opt in (see `Capabilities::supported_steps` for why the polarity is inverted
-        // relative to `samplers`).
+        // The advertised step surface — an exact menu (sc-19502) or an inclusive range (sc-19559).
+        // Distinct from the sanity cap above: that one is a footgun guard every model shares, this
+        // one is the model's own declaration, either that the step count is not a knob at all or
+        // that its engine bound is `min..=max`. `Unconstrained` is the `Default`, so this is inert
+        // for every model that does not opt in (see `Capabilities::supported_steps` for why the
+        // polarity is inverted relative to `samplers`).
         //
         // **Reject, never snap to the nearest legal count.** Quietly rewriting `steps: 30` to 8
         // would deliver a render the caller did not ask for with no error and no signal — the
@@ -2248,27 +2368,41 @@ impl Capabilities {
         // Only an EXPLICIT count is judged. `None` means "the model picks", so there is nothing to
         // refuse; that is what keeps the common path (omit `steps`, get the baked schedule) working
         // and is why a distilled model is still usable without the caller knowing its magic number.
-        if !self.supported_steps.is_empty() {
-            if let Some(steps) = req.steps {
-                if !self.supported_steps.contains(&steps) {
+        if let Some(steps) = req.steps {
+            if !self.supported_steps.admits(steps) {
+                return Err(Error::Msg(match &self.supported_steps {
+                    // Unreachable: `admits` is always true here, but spelling the arm keeps the
+                    // match exhaustive without an `unreachable!` on a request path.
+                    StepSupport::Unconstrained => format!("{id}: steps {steps} is not supported"),
                     // Singular reads as the original per-provider message it replaces ("a fixed
                     // 8-step schedule"), because one legal count is the case that actually ships;
                     // the plural arm keeps the set readable rather than emitting "count(s)".
-                    let schedule = match self.supported_steps.as_slice() {
-                        [only] => format!("a fixed {only}-step schedule"),
-                        many => format!(
-                            "a fixed schedule ({} steps only)",
-                            many.iter()
-                                .map(u32::to_string)
-                                .collect::<Vec<_>>()
-                                .join(" or ")
-                        ),
-                    };
-                    return Err(Error::Msg(format!(
-                        "{id}: this distilled model runs {schedule} and cannot honor \
-                         steps={steps}; omit `steps` to use the baked schedule."
-                    )));
-                }
+                    StepSupport::Exact(counts) => {
+                        let schedule = match counts.as_slice() {
+                            [only] => format!("a fixed {only}-step schedule"),
+                            many => format!(
+                                "a fixed schedule ({} steps only)",
+                                many.iter()
+                                    .map(u32::to_string)
+                                    .collect::<Vec<_>>()
+                                    .join(" or ")
+                            ),
+                        };
+                        format!(
+                            "{id}: this distilled model runs {schedule} and cannot honor \
+                             steps={steps}; omit `steps` to use the baked schedule."
+                        )
+                    }
+                    // The advertised RANGE (sc-19559). Distinct from the shared sanity cap above:
+                    // that one is a footgun guard every model shares, this is the model's own
+                    // engine bound — SVD-XT's 200, Kolors' 1100 train timesteps — which used to
+                    // live only inside a provider `validate` and so was undiscoverable
+                    // weights-free.
+                    StepSupport::Range { min, max } => format!(
+                        "{id}: steps {steps} is outside this model's supported range \
+                         {min}..={max}; omit `steps` to use the model's default."
+                    ),
+                }));
             }
         }
         if let Some(frames) = req.frames {
@@ -3540,7 +3674,7 @@ mod tests {
     #[test]
     fn advertised_supported_steps_reject_every_off_schedule_count() {
         let distilled = Capabilities {
-            supported_steps: vec![8],
+            supported_steps: StepSupport::Exact(vec![8]),
             ..caps()
         };
         let at = |steps: Option<u32>| {
@@ -3583,7 +3717,7 @@ mod tests {
     fn an_unconstrained_model_admits_every_step_count_the_sanity_caps_admit() {
         let c = caps();
         assert!(
-            c.supported_steps.is_empty(),
+            c.supported_steps.is_unconstrained(),
             "the default must be unconstrained"
         );
         for steps in [1, 2, 8, 30, MAX_STEPS] {
@@ -3609,7 +3743,7 @@ mod tests {
     #[test]
     fn supported_steps_is_a_set_not_a_range() {
         let two_schedules = Capabilities {
-            supported_steps: vec![4, 8],
+            supported_steps: StepSupport::Exact(vec![4, 8]),
             ..caps()
         };
         let at = |steps: u32| {
@@ -3630,6 +3764,83 @@ mod tests {
         assert!(
             gap.contains("4 or 8") && gap.contains("steps=6"),
             "the multi-schedule refusal must list the legal counts: {gap}"
+        );
+    }
+
+    /// sc-19559 — the ceiling. SVD-XT's `MAX_STEPS = 200` used to live only inside the two SVD
+    /// providers' `validate`; the shared floor now enforces the advertised range, and refuses on
+    /// BOTH ends of it.
+    ///
+    /// The `200` boundary pair is the load-bearing part: an off-by-one that made the range
+    /// exclusive would refuse the model's own top count, and one that never fired would admit
+    /// `201` — asserting only the far-outside `10_000` would catch neither.
+    #[test]
+    fn an_advertised_step_range_refuses_both_ends_and_admits_the_interior() {
+        let bounded = Capabilities {
+            supported_steps: StepSupport::Range { min: 2, max: 200 },
+            ..caps()
+        };
+        let at = |steps: Option<u32>| {
+            bounded.validate_request(
+                "svd_xt",
+                &GenerationRequest {
+                    steps,
+                    ..base_req()
+                },
+            )
+        };
+
+        for ok in [2, 3, 25, 199, 200] {
+            assert!(at(Some(ok)).is_ok(), "{ok} is inside 2..=200 and must pass");
+        }
+        assert!(
+            at(None).is_ok(),
+            "an omitted count must use the model's default, not be refused"
+        );
+
+        for bad in [1, 201, 10_000] {
+            let err = at(Some(bad)).unwrap_err().to_string();
+            assert!(
+                err.contains("svd_xt") && err.contains(&bad.to_string()) && err.contains("2..=200"),
+                "the refusal must name the model, the request and the legal range: {err}"
+            );
+        }
+    }
+
+    /// sc-19559 — the ceiling is readable from the descriptor, which is the whole point: a
+    /// consumer must not have to dispatch a job to learn the bound.
+    ///
+    /// Also pins that a bound is NOT a default: `floor()` is the smallest legal count, and the
+    /// step count a request omitting `steps` actually gets is the model's own baked default,
+    /// which the capability surface deliberately does not carry.
+    #[test]
+    fn a_declared_bound_is_readable_and_is_not_a_default() {
+        assert_eq!(StepSupport::Unconstrained.ceiling(), None);
+        assert_eq!(StepSupport::Unconstrained.floor(), None);
+
+        let range = StepSupport::Range { min: 2, max: 200 };
+        assert_eq!(range.ceiling(), Some(200));
+        assert_eq!(range.floor(), Some(2));
+
+        // An exact menu's ceiling is its largest member, not its declaration order.
+        let menu = StepSupport::Exact(vec![8, 4]);
+        assert_eq!(menu.ceiling(), Some(8));
+        assert_eq!(menu.floor(), Some(4));
+
+        // A model that declares a bound still renders its own default when `steps` is omitted —
+        // the floor never substitutes the bound for the missing value.
+        let bounded = Capabilities {
+            supported_steps: range,
+            ..caps()
+        };
+        let req = GenerationRequest {
+            steps: None,
+            ..base_req()
+        };
+        assert!(bounded.validate_request("m", &req).is_ok());
+        assert_eq!(
+            req.steps, None,
+            "validation must not seed `steps` from a bound"
         );
     }
 

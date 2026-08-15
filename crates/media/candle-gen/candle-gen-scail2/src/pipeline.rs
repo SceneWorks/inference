@@ -126,7 +126,6 @@ pub fn descriptor() -> ModelDescriptor {
         capabilities: Capabilities {
             supports_negative_prompt: true,
             supports_guidance: true,
-            supports_true_cfg: false,
             // Reference character image (Reference) + its color-coded segmentation mask (Mask); the
             // driving video + its per-frame color masks map to ControlClip. `MultiReference` (extra
             // characters) is deliberately NOT advertised: gen-core's `Conditioning::MultiReference`
@@ -147,39 +146,16 @@ pub fn descriptor() -> ModelDescriptor {
             // candle's FlowScheduler is UniPC/Euler; "dpm++" resolves to UniPC (bh2). Advertised to
             // match the mlx-gen-scail2 descriptor for cross-backend routing parity.
             samplers: vec!["unipc", "dpm++"],
-            schedulers: Vec::new(),
-            supported_guidance_methods: vec![],
             min_size: 32,
             max_size: 1280,
             max_count: 1,
-            // Not a distilled fixed-schedule model: any step count the shared sanity caps
-            // admit is renderable (sc-19502).
-            supported_steps: Vec::new(),
-            mac_only: false,
             supported_quants: &[] as &[Quant],
-            component_precision_floors: &[],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
-            supports_sequential_offload: false,
-            unconditionally_engages_staged_residency: false,
-            supports_preview: false,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
             // Match the MLX sibling: `0×0` resolves from the driving clip, while every explicit
             // request remains exact-or-rejected on SCAIL-2's 32-pixel render lattice (sc-16199).
             size_floor: SizeFloor::ResolvedDownstreamExplicitGrid {
                 multiple: DIM_ALIGN,
             },
+            ..Default::default()
         },
     }
 }

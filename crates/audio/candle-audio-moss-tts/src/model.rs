@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use candle_audio::candle_core::DType;
 use candle_audio::gen_core::{
     self, AudioTrack, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec,
-    Modality, ModelDescriptor, Progress, SizeFloor, SpeechSegment, WeightsSource,
+    Modality, ModelDescriptor, Progress, SpeechSegment, WeightsSource,
 };
 use candle_nn::VarBuilder;
 use tokenizers::Tokenizer;
@@ -124,41 +124,13 @@ pub fn descriptor() -> ModelDescriptor {
         backend: "candle",
         modality: Modality::Audio,
         capabilities: Capabilities {
-            supports_negative_prompt: false,
-            supports_guidance: false,
-            supports_true_cfg: false,
-            conditioning: Vec::new(),
-            supports_lora: false,
-            supports_lokr: false,
-            samplers: vec![],
-            schedulers: vec![],
-            supported_guidance_methods: vec![],
-            min_size: 0,
-            max_size: 0,
             max_count: 1,
-            // Not a distilled fixed-schedule model: any step count the shared sanity caps
-            // admit is renderable (sc-19502).
-            supported_steps: Vec::new(),
-            mac_only: false,
             audio_sample_rates: vec![SAMPLE_RATE],
             max_audio_duration_secs: Some(MAX_DURATION_SECS),
-            audio_voices: vec![],
             audio_languages: LANGUAGES.to_vec(),
-            audio_edit_modes: vec![],
-            supported_quants: &[],
-            component_precision_floors: &[],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
-            supports_sequential_offload: false,
-            unconditionally_engages_staged_residency: false,
-            supports_preview: false,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
             supports_multi_speaker: true,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
             max_speakers: Some(MAX_SPEAKERS),
-            size_floor: SizeFloor::RangeChecked,
+            ..Default::default()
         },
     }
 }

@@ -16,7 +16,7 @@
 
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, Capabilities, ConditioningKind, Modality,
-    ModelDescriptor, Quant, SizeFloor,
+    ModelDescriptor, Quant,
 };
 
 pub const SD3_5_LARGE_ID: &str = "sd3_5_large";
@@ -216,7 +216,6 @@ impl Sd3Variant {
                 // separate request.true_cfg field is not read by any SD3.5 MLX render path.
                 supports_negative_prompt: self.uses_classifier_free_guidance(),
                 supports_guidance: self.uses_classifier_free_guidance(),
-                supports_true_cfg: false,
                 // Reference-image conditioning = img2img latent-init (epic 8588 slice A4, sc-10189):
                 // a single `Conditioning::Reference { image, strength }` seeds the flow-match denoise
                 // from the VAE-encoded reference (see model.rs `generate_impl` → pipeline
@@ -225,7 +224,6 @@ impl Sd3Variant {
                 // distilled Large-Turbo all support it; inpaint/mask remains a later story.
                 conditioning: vec![ConditioningKind::Reference],
                 supported_quants: &[Quant::Q4, Quant::Q8],
-                component_precision_floors: &[],
                 supports_lora: true,
                 supports_lokr: true,
                 samplers: {
@@ -238,15 +236,10 @@ impl Sd3Variant {
                     s.push("linear");
                     s
                 },
-                supported_guidance_methods: vec![],
                 min_size: 256,
                 max_size: 1440,
                 max_count: 8,
-                // Not a distilled fixed-schedule model: any step count the shared sanity caps
-                // admit is renderable (sc-19502).
-                supported_steps: Vec::new(),
                 mac_only: true,
-                supports_kv_cache: false,
                 // SD3.5 uses a STATIC flow-match shift of 3.0 (FlowMatchEulerDiscreteScheduler
                 // { shift: 3.0 }, no dynamic shifting) baked into the schedule — resolution-
                 // independent, identical to the Z-Image path. So this loader hint is false: a
@@ -258,21 +251,8 @@ impl Sd3Variant {
                 // encoded, materialized, then dropped before the MMDiT + VAE load — bounding peak to
                 // `max(triple-TE, MMDiT+VAE)`. T5-XXL alone is the biggest TE-drop in the family.
                 supports_sequential_offload: true,
-                unconditionally_engages_staged_residency: false,
                 supports_preview: true,
-                supports_prompt_enhancement: false,
-                supports_streaming: false,
-                supports_multi_speaker: false,
-                supports_conversation_history: false,
-                supports_conversation_session: false,
-                max_speakers: None,
-                // No audio surface (sc-12834): pure image/video model.
-                audio_sample_rates: vec![],
-                max_audio_duration_secs: None,
-                audio_voices: vec![],
-                audio_languages: vec![],
-                audio_edit_modes: vec![],
-                size_floor: SizeFloor::RangeChecked,
+                ..Default::default()
             },
         }
     }

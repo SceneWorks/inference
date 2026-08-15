@@ -48,7 +48,7 @@ use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, GenerationOutput, GenerationRequest, Generator, Image,
     LoadSpec, Modality, ModelDescriptor, OffloadPolicy, PidWeights, Precision, Progress, Quant,
-    SizeFloor, WeightsSource,
+    WeightsSource,
 };
 use candle_gen::{CandleError, LatentDecoder, Result as CResult};
 use candle_gen_pid::PidEngine;
@@ -1548,8 +1548,7 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
         capabilities: Capabilities {
             supports_negative_prompt: true,
             supports_guidance: true,
-            supports_true_cfg: false,
-            conditioning: vec![], // pure T2I — no img2img / control / IP in the Lens port
+            // pure T2I — no img2img / control / IP in the Lens port
             supports_lora: true,
             supports_lokr: true,
             // Unified curated sampler/scheduler menu (epic 7114 P4, sc-7123) + the legacy aliases
@@ -1567,35 +1566,16 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             min_size: 256,
             max_size: 2080,
             max_count: 8,
-            // Not a distilled fixed-schedule model: any step count the shared sanity caps
-            // admit is renderable (sc-19502).
-            supported_steps: Vec::new(),
-            mac_only: false,
             supported_quants: &[Quant::Q4, Quant::Q8],
-            component_precision_floors: &[],
-            supports_kv_cache: false,
             // The Lens schedule computes its own empirical-μ shift internally (not a loader hint).
             requires_sigma_shift: false,
             supports_sequential_offload: true,
-            unconditionally_engages_staged_residency: false,
             // Per-step latent previews (epic 16948, sc-16955). Lens denoises the FLUX.2 32-channel
             // latent space in the same packed token layout, and loads a VAE whose 250 learned tensors
             // round exactly onto the fit donor's — so both render lanes hand the shared sampler a
             // `candle_gen_flux2::preview` hook and no fit of its own is introduced.
             supports_preview: true,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
+            ..Default::default()
         },
     }
 }
