@@ -88,7 +88,7 @@ use crate::dit::positions::KeyframeAnchor;
 use crate::pipeline::{
     align_frames_for_duration, fit_audio_to_video, fl2va_layout, frames_to_images, initial_latents,
     prepend_condition_rows, render_latents, resolve_geometry, revert_pixel_normalization,
-    t2va_layout, RequestGeometry, CANVAS_SHORT_EDGE, PATCH_SIZE, SPATIAL_STRIDE,
+    t2va_layout, RequestGeometry, CANVAS_SHORT_EDGE, MAX_CANVAS_EDGE, PATCH_SIZE, SPATIAL_STRIDE,
 };
 use crate::text_encoder::{
     lm_prefixes, load_vision_tower, MiniMaxH3TeConfig, MiniMaxH3TextEncoder, MiniMaxH3Tokenizer,
@@ -174,7 +174,11 @@ pub fn descriptor() -> ModelDescriptor {
             samplers: Vec::new(),
             schedulers: Vec::new(),
             min_size: SPATIAL_STRIDE,
-            max_size: 1344,
+            // The widest edge `crate::keyframe::resolve_canvas_size` can put a picture on, at the
+            // 4:1 aspect ceiling. A per-edge cap is NOT the area budget — `CANVAS_MAX_PIXELS` is
+            // checked as a product by `resolve_geometry` and still refuses 1536x1536 / 1344x1344,
+            // which sit inside this ceiling on both edges. See `MAX_CANVAS_EDGE` (sc-17152).
+            max_size: MAX_CANVAS_EDGE,
             // The stride is advertised, not hidden in provider code, so a weights-free consumer can
             // predict that an unaligned canvas is REFUSED rather than quietly refit.
             size_floor: SizeFloor::RangeCheckedOnGrid {
@@ -634,6 +638,20 @@ impl Generator for MiniMaxH3 {
                 "{MODEL_ID}: prompt must not be empty"
             )));
         }
+        // **The area budget runs HERE, not only inside `generate`** (sc-17152).
+        //
+        // `Capabilities::max_size` is a per-edge bound and can never constrain a product, so it was
+        // never the area gate — it only *looked* like one while it sat at 1344, because a square
+        // inside the budget was arithmetically impossible above it. Raising it to
+        // [`MAX_CANVAS_EDGE`] removes that accident, and without this call `1536 x 1536` (2.3x the
+        // budget) would pass `validate` and be refused only once `request_geometry` ran, deep
+        // inside a render that has already mapped the text encoder.
+        //
+        // The MLX provider has always run the gate at its validate boundary
+        // (`mlx-gen-minimax-h3::model::validate_request`); this is the Candle lane converging on it
+        // rather than a new rule. `request_geometry` is the same helper `generate` resolves
+        // through, so the two cannot disagree about what is renderable.
+        self.request_geometry(req)?;
         Ok(())
     }
 

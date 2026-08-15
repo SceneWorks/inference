@@ -66,13 +66,35 @@ pub const CANVAS_SHORT_EDGE: u32 = 768;
 /// Area budget of the released checkpoint's canvas, `768 · 1344` = 1 032 192 px.
 ///
 /// **Enforced by [`resolve_geometry`] since sc-17152.** It was declared and unused, and the gap was
-/// not cosmetic: `Capabilities::max_size` bounds each edge at 1344 independently, so `1344 x 1344`
+/// not cosmetic: the per-edge `Capabilities::max_size` never constrains a product, so `1344 x 1344`
 /// passed every check at 1.75x this budget. Canvas area is the *dominant* term in the packed
 /// sequence — it sets rows per latent frame, and attention is quadratic in the sequence — so an
 /// unbounded area is an unbounded render cost regardless of what the duration bound says.
 /// Together with [`MAX_DURATION_SECONDS`] this closes the envelope: the longest sequence any
 /// accepted request can build is **104 030 rows** ([`crate::cost`]).
 pub const CANVAS_MAX_PIXELS: u32 = 768 * 1344;
+
+/// Widest edge any canvas this model resolves to can carry — **2016**, the long edge at the 4:1
+/// aspect ceiling. This is what `Capabilities::max_size` declares (sc-17152).
+///
+/// # Derived from the canvas resolver, not picked
+///
+/// [`crate::keyframe::resolve_canvas_size`] is the model's own arithmetic for turning an aspect
+/// ratio into a canvas: it lays the short edge at [`CANVAS_SHORT_EDGE`], scales both edges by
+/// `sqrt(CANVAS_MAX_PIXELS / area)` once the area is over budget, then snaps each axis to
+/// [`SPATIAL_STRIDE`]. At [`crate::keyframe::MAX_ASPECT_RATIO`] — the widest ratio the model
+/// accepts at all — that yields `512 x 2016`. So 2016 is the widest edge the model will ever put
+/// a picture on, and a per-edge ceiling below it would refuse a canvas the model resolves to on
+/// its own. `capability_ceiling_is_the_widest_canvas_the_resolver_emits` pins the two together so
+/// this constant cannot drift from the resolver that justifies it.
+///
+/// # This does not widen the envelope
+///
+/// [`CANVAS_MAX_PIXELS`] still carries the real constraint and is checked as a *product*. Raising
+/// the per-edge ceiling admits exactly one shape it did not before — `2016 x 512` and its
+/// transpose, which is **exactly** at the area budget — and continues to refuse `1536 x 1536` and
+/// `1344 x 1344`, both of which are inside this ceiling on both edges and far over the area.
+pub const MAX_CANVAS_EDGE: u32 = 2016;
 
 /// Shortest clip the released model generates, in seconds — **the lattice floor**, 124 frames.
 ///
@@ -972,7 +994,8 @@ mod tests {
 
     /// **The canvas area budget is enforced, not just declared** (sc-17152).
     ///
-    /// `Capabilities::max_size` caps each edge at 1344 *independently*, so the square 1344×1344 was
+    /// `Capabilities::max_size` caps each edge *independently* and cannot bound a product, so the
+    /// square 1344×1344 was
     /// accepted at 1.75× the area the checkpoint generates at — and area is the dominant term in the
     /// packed sequence length, hence in an attention cost that is quadratic in it.
     #[test]

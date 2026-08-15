@@ -50,7 +50,8 @@ use crate::dit::model::{JointDit, MiniMaxH3Dit};
 use crate::pipeline::{
     fit_audio_to_video, fl2va_layout, frames_to_images, initial_latents, prepend_condition_rows,
     render_latents, resolve_geometry, revert_pixel_normalization, t2va_layout, RequestGeometry,
-    MAX_DURATION_SECONDS, MIN_DURATION_SECONDS, SMALLEST_LEGAL_FRAMES, SPATIAL_STRIDE,
+    MAX_CANVAS_EDGE, MAX_DURATION_SECONDS, MIN_DURATION_SECONDS, SMALLEST_LEGAL_FRAMES,
+    SPATIAL_STRIDE,
 };
 use crate::reference::{Ref2VaReference, Ref2VaReferences, VideoReference};
 use crate::text_encoder::{
@@ -131,7 +132,11 @@ pub fn descriptor() -> ModelDescriptor {
             schedulers: Vec::new(),
             supported_guidance_methods: vec![],
             min_size: SPATIAL_STRIDE,
-            max_size: 1344,
+            // The widest edge `crate::keyframe::resolve_canvas_size` can put a picture on, at the
+            // 4:1 aspect ceiling. A per-edge cap is NOT the area budget — `CANVAS_MAX_PIXELS` is
+            // checked as a product by `resolve_geometry` and still refuses 1536x1536 / 1344x1344,
+            // which sit inside this ceiling on both edges. See `MAX_CANVAS_EDGE` (sc-17152).
+            max_size: MAX_CANVAS_EDGE,
             max_count: 1,
             // Not a distilled fixed-schedule model: any step count the shared sanity caps
             // admit is renderable (sc-19502).
