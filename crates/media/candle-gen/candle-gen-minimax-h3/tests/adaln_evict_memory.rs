@@ -8,6 +8,45 @@
 //! `tests/*.rs` its own process, and this file holds a **single** test that runs every arm
 //! sequentially, so the measurement is uncontended without needing `--test-threads=1`.
 //!
+//! # The contaminant that survived that isolation — sc-19544
+//!
+//! Process isolation is necessary and was **not** sufficient, and the shape of the miss is worth
+//! recording because "one test, its own process" reads like it settles the question.
+//!
+//! Measured 2026-08-15: this test passes 6/6 run on its own and failed 3/3 when other test binaries
+//! were running at the same time, on both branches. The variable was neither machine load nor
+//! another test's allocations — it was **which rayon workers happened to participate in this
+//! process's own matmuls**.
+//!
+//! `candle_core::cpu_backend`'s matmul reads `utils::get_num_threads()` on every call and, above 1,
+//! hands `gemm` `Parallelism::Rayon(n)`. Every worker that executes a panel allocates ~2.67 MiB of
+//! packing scratch **the first time it participates** and never returns it. Measured directly, by
+//! varying `RAYON_NUM_THREADS` over a run of this binary:
+//!
+//! | `RAYON_NUM_THREADS` | 1 | 2 | 4 | 8 | 12 | 16 |
+//! |---|---|---|---|---|---|---|
+//! | scratch [`warm_up`] pays | 2.68 | 8.02 | 13.37 | 24.06 | 34.76 | 45.45 MiB |
+//!
+//! — dead linear at 2.673 MiB per thread. On this 18-CPU box an idle run engages all of them plus
+//! the calling thread and [`warm_up`] pays 50.80 MiB; under contention one worker sits the warm-up
+//! out, [`warm_up`] pays 48.13 MiB, and that worker's 2.67 MiB is then allocated **inside the
+//! measured window** — where it counts against the eviction as memory that was not freed. The
+//! observed failure was exactly one worker wide: `freed 14.55 MiB` against a `>= 15.51 MiB` gate,
+//! i.e. 17.22 − 2.67.
+//!
+//! So the defect was in the *baseline*, not in anything under test, and the two obvious responses
+//! are both wrong. `--test-threads=1` changes nothing: the contending threads are inside this
+//! process and are gemm's, not libtest's (and the root `.cargo/config.toml` already force-sets
+//! `RUST_TEST_THREADS = 1`). Loosening the bound by one worker's scratch would have to loosen it by
+//! *N* workers' scratch, which on a 64-core CI box is 170 MiB against an 18 MiB quantity.
+//!
+//! The fix is [`pin_matmul_to_one_thread`]: with the count pinned at 1 candle selects
+//! `Parallelism::None`, the only thread that can hold packing scratch is the one [`warm_up`] runs
+//! on, and the whole measurement becomes deterministic — verified at 12 concurrent copies of this
+//! binary, all 12 green and reporting byte-identical figures, against 5 of 12 red without it. The
+//! release it measures is unchanged at **17.22 MiB**, the same figure an uncontended 18-worker run
+//! reports, because a `Tensor` storage release does not depend on how a matmul is scheduled.
+//!
 //! # What is measured, and why it is not what the MLX lane measures
 //!
 //! sc-17145 measured MLX's `get_active_memory` / `get_cache_memory` and had to defeat two MLX
@@ -38,6 +77,15 @@
 //! # What this file does NOT establish
 //!
 //! Stated plainly rather than left to inference:
+//!
+//! * **No CI lane executes this file on an ordinary PR.** Recorded because everything below is
+//!   written as though it runs somewhere, and the assertions added by sc-19544 are worth exactly
+//!   the runs they get. `candle-cpu`'s test step is `cargo test --lib`, which skips every
+//!   `tests/*.rs` target in the candle-gen tree; `--lib --tests` appears only on
+//!   `windows-cuda-check`, which passes `--no-run`, and on the `workflow_dispatch`-only CUDA job.
+//!   So this file is **compiled, Clippy-linted with `--all-targets`, and rustdoc'd** on every PR
+//!   that touches the lane, and **run** only when someone runs it. Whether to give it a lane is
+//!   Michael's call, not this file's.
 //!
 //! * **No CUDA measurement was taken.** This Mac has no CUDA device and `cargo check --features
 //!   cuda` is unreachable here (`cudarc`'s build script panics on a missing toolkit root).
@@ -72,17 +120,35 @@
 //!
 //! # A measured candle property this test had to be built around
 //!
-//! **candle's CPU matmul takes ~48 MiB of process-lifetime scratch on first use and never returns
-//! it.** Measured here while building this test: a cold process that builds the 18.98 MiB stack,
-//! evicts, and then drops *everything* still holds 48.14 MiB. That is `gemm`'s thread-pool and
-//! per-thread packing buffers, not a leak in this crate — it is allocated once and reused — but it
-//! is far larger than the quantity under test, so a cold measurement reports the eviction as
-//! freeing **0.00 MiB** while the release is in fact happening.
+//! **candle's CPU matmul takes ~2.67 MiB of process-lifetime scratch per participating thread on
+//! that thread's first use, and never returns it.** Measured here while building this test: a cold
+//! process that builds the 18.98 MiB stack, evicts, and then drops *everything* still holds
+//! 48.14 MiB with the default 18-worker pool. That is `gemm`'s thread-pool and per-thread packing
+//! buffers, not a leak in this crate — it is allocated once and reused — but it is far larger than
+//! the quantity under test, so a cold measurement reports the eviction as freeing **0.00 MiB**
+//! while the release is in fact happening.
 //!
-//! [`warm_up`] therefore pays that cost before any baseline is taken. On the warm process the same
-//! eviction frees **17.22 of 18.07 MiB**, the 0.85 MiB difference being exactly the newly allocated
-//! cache table. Taking the baseline cold would have produced a red test for a correct port — and,
-//! worse, a green one for an incorrect port under any bound loose enough to absorb 48 MiB.
+//! [`warm_up`] therefore pays that cost before any baseline is taken, and
+//! [`pin_matmul_to_one_thread`] first reduces the bill to the single thread [`warm_up`] can prove
+//! it paid — the per-thread half of this property is what made the test contention-dependent until
+//! sc-19544, and it is spelt out above. On the warm process the eviction frees **17.22 of
+//! 18.07 MiB**, the 0.85 MiB difference being exactly the newly allocated cache table. Taking the
+//! baseline cold would have produced a red test for a correct port — and, worse, a green one for an
+//! incorrect port under any bound loose enough to absorb 48 MiB.
+//!
+//! # What each assertion grades (sc-19544)
+//!
+//! | guard | claim | proven to bite by |
+//! |---|---|---|
+//! | [`pin_matmul_to_one_thread`]'s `assert_eq!` | the matmul pin took, so the baseline is complete | deleting the `set_var` |
+//! | (0) | the projections passed through the counting allocator at all | eight blocks sharing one `adaln_proj.linear.weight` buffer |
+//! | (a) | the release happened | deleting the drop in `AdaLnCache::precompute_and_evict` |
+//! | (b) | what stays resident is materially below what was resident | — (pre-existing, sc-17155) |
+//! | (c) | the denoise phase's **high-water mark** does not contain the projections | removing the timestep deduplication, which doubles the cache table |
+//! | (c-control) | (c)'s ceiling excludes the arm where nothing was freed, so (c) grades something | loosening (c)'s ceiling |
+//!
+//! Each was mutated **individually**: mutating them together cannot tell a live guard from a dead
+//! one, and three of the five above sit downstream of a guard that would otherwise mask them.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::HashMap;
@@ -102,6 +168,15 @@ use candle_gen_minimax_h3::{
 /// Net live bytes the process has taken from the system allocator.
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 
+/// High-water mark of [`LIVE`] since the last [`reset_peak`].
+///
+/// Without this the "peak" the post-eviction forward reports is not a peak at all: reading [`live`]
+/// *after* the forward returns observes a moment when every transient has already been freed, so it
+/// reproduces the post-eviction resident figure and says nothing about what the denoise phase
+/// actually demands. A VRAM admission gate has to budget the high-water mark, not the resting
+/// figure, so that is what is recorded and asserted here (sc-19544).
+static PEAK: AtomicUsize = AtomicUsize::new(0);
+
 /// A pass-through allocator that keeps a running total of live bytes.
 ///
 /// This is the CPU device's memory counter, and it is **exact** in a way a sampler is not: it
@@ -110,11 +185,16 @@ static LIVE: AtomicUsize = AtomicUsize::new(0);
 /// transients; a `#[global_allocator]` is the tool that does not.)
 struct Counting;
 
+/// Record a rise in [`LIVE`] against the [`PEAK`] high-water mark.
+fn bump_peak(new_live: usize) {
+    PEAK.fetch_max(new_live, Ordering::Relaxed);
+}
+
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let p = unsafe { System.alloc(layout) };
         if !p.is_null() {
-            LIVE.fetch_add(layout.size(), Ordering::Relaxed);
+            bump_peak(LIVE.fetch_add(layout.size(), Ordering::Relaxed) + layout.size());
         }
         p
     }
@@ -127,7 +207,7 @@ unsafe impl GlobalAlloc for Counting {
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         let p = unsafe { System.realloc(ptr, layout, new_size) };
         if !p.is_null() {
-            LIVE.fetch_add(new_size, Ordering::Relaxed);
+            bump_peak(LIVE.fetch_add(new_size, Ordering::Relaxed) + new_size);
             LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
         }
         p
@@ -141,6 +221,16 @@ fn live() -> usize {
     LIVE.load(Ordering::Relaxed)
 }
 
+/// Arm the high-water mark at the current live figure, so the next [`peak`] reports the maximum
+/// reached *since this call* rather than since process start.
+fn reset_peak() {
+    PEAK.store(live(), Ordering::Relaxed);
+}
+
+fn peak() -> usize {
+    PEAK.load(Ordering::Relaxed)
+}
+
 fn mib(bytes: usize) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
 }
@@ -151,6 +241,32 @@ fn mib(bytes: usize) -> f64 {
 
 /// Blocks in the synthetic stack.
 const LAYERS: usize = 8;
+
+/// Packed-sequence length the measured forwards run at.
+const SEQ: usize = 48;
+
+/// Distinct timesteps [`schedule`] resolves to, stated **independently of
+/// [`TimestepSchedule::num_distinct_timesteps`]**.
+///
+/// This is the deduplicated union of the 6 × 4 `(step, row class)` pairs [`schedule`] builds: the
+/// conditioning class is `max(video_t, 0.999)`, which is `0.999` at every step, and the
+/// reference-audio class is a constant `1.0`, so 24 pairs collapse to 12 — the ~2× cache saving
+/// [`TimestepSchedule::distinct_timesteps`] documents, here exactly 2×.
+///
+/// Stated as a literal on purpose. The (c) ceiling below is sized on the cache this implies, and
+/// reading the figure back off the schedule would make the ceiling rise in lockstep with any
+/// regression that stopped deduplicating — a bound that grades a value by comparing it against
+/// itself. Deriving it from the fixture instead is what lets (c) catch that regression.
+const EXPECTED_DISTINCT_TIMESTEPS: usize = 12;
+
+/// Bytes the post-eviction forward may allocate transiently, as a multiple of the activation it
+/// carries: `[1, SEQ, hidden_size]` at f32.
+///
+/// The claim behind the number is that the denoise phase's transients scale with the **sequence**,
+/// not with the weights — the six modulated row-gathers, the attention intermediates and the RoPE
+/// tables are all activation-shaped. 32× is ~2.4× headroom over the 0.32 MiB actually measured
+/// across all 8 blocks.
+const TRANSIENT_ACTIVATIONS: usize = 32;
 
 /// An AdaLN-dominated geometry mirroring the shipped model's *ratio*: `adaln_proj` is `[2304, 256]`
 /// — 2.25 MiB per block against ~0.13 MiB of block body — where the real model has 26.02 GB of
@@ -276,7 +392,6 @@ fn embed<'a>(
 
 /// One real block forward against the cached table — the post-eviction denoise phase in miniature.
 fn one_forward(c: &MiniMaxH3DitConfig, blocks: &[DitBlock], cache: &AdaLnCache, device: &Device) {
-    const SEQ: usize = 48;
     let rope = MmRope::new(c.rope_freq_dim, c.rope_theta).unwrap();
     let pos: Vec<f32> = (0..SEQ * 3).map(|i| (i % 7) as f32).collect();
     let tables = rope
@@ -315,6 +430,42 @@ fn one_forward(c: &MiniMaxH3DitConfig, blocks: &[DitBlock], cache: &AdaLnCache, 
 // The measurement
 // ---------------------------------------------------------------------------------------------
 
+/// Make candle's CPU matmul run on the calling thread only, so the scratch [`warm_up`] pays for is
+/// the *whole* scratch bill this process will ever incur.
+///
+/// **This is the sc-19544 fix and it is a measurement fix, not a serialization workaround.** See the
+/// module docs for the measurement; the mechanism is:
+///
+/// `candle_core::cpu_backend`'s matmul reads `utils::get_num_threads()` (which honours
+/// `RAYON_NUM_THREADS`, defaulting to `num_cpus::get()`) **on every call** and, when it exceeds 1,
+/// hands `gemm` `Parallelism::Rayon(n)`. Every rayon worker that ends up executing a panel of that
+/// matmul allocates ~2.67 MiB of packing scratch **the first time it participates**, and never
+/// returns it. Which workers participate is a work-stealing decision: on an idle machine all of
+/// them do and [`warm_up`] pays the entire bill, but under contention a worker can sit out the
+/// warm-up and first participate *inside the measured window*, where its 2.67 MiB lands as an
+/// allocation the eviction did not make and subtracts one-for-one from the measured release.
+///
+/// With the count pinned at 1 candle selects `Parallelism::None`, so the only thread that can hold
+/// packing scratch is this one — the same thread [`warm_up`] runs on. The quantity under test is a
+/// `Tensor` storage release, which is independent of how a matmul is scheduled: the measured
+/// release is byte-identical (17.22 MiB) to what an uncontended 18-worker run reports. What the pin
+/// removes is the *baseline noise*, not any part of the measurement.
+///
+/// `set_var` is sound here: the root `.cargo/config.toml` force-sets `RUST_TEST_THREADS = 1`, this
+/// binary holds a single test, and this call is the first statement in it, so no other thread in
+/// the process is reading the environment.
+fn pin_matmul_to_one_thread() {
+    std::env::set_var("RAYON_NUM_THREADS", "1");
+    // Verify the knob took rather than assuming it. `get_num_threads` is the exact predicate the
+    // matmul dispatches on, so this reads the gate's own function rather than a restatement of it.
+    assert_eq!(
+        candle_gen::candle_core::utils::get_num_threads(),
+        1,
+        "the matmul thread pin did not take: the measured window can then absorb ~2.67 MiB of \
+         first-touch gemm packing scratch per worker thread and the release will read short"
+    );
+}
+
 /// Pay candle's one-time CPU-matmul scratch before any baseline is taken.
 ///
 /// See the module docs: `gemm` allocates ~48 MiB of thread-pool and packing buffers on first use
@@ -338,6 +489,8 @@ fn warm_up(c: &MiniMaxH3DitConfig, device: &Device) {
 
 #[test]
 fn the_evicted_adaln_weights_leave_memory() {
+    pin_matmul_to_one_thread();
+
     let c = cfg();
     let device = Device::Cpu;
 
@@ -367,6 +520,26 @@ fn the_evicted_adaln_weights_leave_memory() {
     let mut blocks = stack(&c, &device);
     let body_bytes: usize = blocks.iter().map(DitBlock::body_nbytes).sum();
     let live_before = live();
+    let before_net = live_before.saturating_sub(warm);
+
+    // (0) MATERIALIZATION, VERIFIED RATHER THAN ASSUMED. Every byte of every projection must have
+    //     passed through the counting allocator *before* the eviction runs. This is the one check
+    //     that makes the three below mean anything: a stack whose projections were lazily mapped,
+    //     or eight blocks sharing one buffer, would leave the counter blind to the very bytes whose
+    //     release is under test, and a blind counter reports a perfect eviction (18.07 MiB
+    //     "released", 0.00 MiB actually resident to begin with) for a port that never held them.
+    //     `expected_release` is config arithmetic — `adaln_out_features × time_embed_dim + bias`,
+    //     f32, per block — so this compares the measurement against an independent figure rather
+    //     than against anything the object under test reports about itself.
+    assert!(
+        before_net >= expected_release,
+        "the counting allocator observed only {:.2} MiB of model-attributable bytes before the \
+         eviction, against {:.2} MiB of adaln_proj the config says must be resident. The stack is \
+         not materialized — the projections are lazily mapped, or the blocks share one buffer — so \
+         every release figure below would be measuring an eviction of bytes that were never there",
+        mib(before_net),
+        mib(expected_release)
+    );
 
     let (cache, released) = AdaLnCache::precompute_and_evict(
         &mut blocks,
@@ -417,7 +590,6 @@ fn the_evicted_adaln_weights_leave_memory() {
     //     50 MiB of matmul scratch is neither attributable to the model nor releasable. Comparing
     //     the gross figures would be comparing "the model plus a fixed 50 MiB" against itself and
     //     would fail for a correct port at any realistic stack size.
-    let before_net = live_before.saturating_sub(warm);
     let after_net = live_after.saturating_sub(warm);
     println!(
         "  model-attributable resident: {:.2} -> {:.2} MiB ({:.1}x reduction), net of the {:.2} \
@@ -435,13 +607,79 @@ fn the_evicted_adaln_weights_leave_memory() {
         mib(before_net)
     );
 
-    // (c) …and the post-eviction stack still runs, against the cached table, producing finite
-    //     output. An eviction that broke the forward would be a memory win nobody could use.
+    // (c) THE DENOISE PHASE'S HIGH-WATER MARK — the figure this file used to print and not gate
+    //     (sc-19544). The post-eviction stack still runs against the cached table and produces
+    //     finite output (an eviction that broke the forward would be a memory win nobody could
+    //     use), and the **peak** it reaches while doing so is bounded.
+    //
+    //     Peak, not resting. Reading `live()` after the forward returns — which is what this line
+    //     used to print under the label "peak live during it" — observes a moment when every
+    //     transient has already been freed, so it reproduces (b)'s `after_net` and gates nothing
+    //     new. What a VRAM admission gate has to budget is the high-water mark, so [`PEAK`] records
+    //     it across the forward and that is the figure asserted.
+    let live_before_forward = live();
+    reset_peak();
     one_forward(&c, &blocks, &cache, &device);
+    let forward_peak = peak();
+    let forward_peak_net = forward_peak.saturating_sub(warm);
     println!(
-        "  post-eviction forward over {} blocks: finite; peak live during it {:.2} MiB",
+        "  post-eviction forward over {} blocks: finite; PEAK live during it {:.2} MiB \
+         ({:.2} MiB net of scratch, of which {:.2} MiB transient; resting {:.2} MiB; \
+         cache table {:.2} + block bodies {:.2} MiB)",
         blocks.len(),
-        mib(live())
+        mib(forward_peak),
+        mib(forward_peak_net),
+        mib(forward_peak.saturating_sub(live_before_forward)),
+        mib(live()),
+        mib(cache.bytes()),
+        mib(body_bytes),
+    );
+
+    //     THE BOUND, term by term. The ceiling is the complete list of what the denoise phase is
+    //     entitled to hold, and **not one term of it is read off an object the eviction produced**:
+    //
+    //     * `before_net - expected_release` — everything that was resident before the eviction and
+    //       is not a projection, i.e. the block bodies. Measured pre-eviction (0.91 MiB).
+    //     * `expected_cache` — the cache table the schedule and the config imply:
+    //       `LAYERS · distinct · MODALITY_NUM · 6 · hidden_size` at f32 (0.84 MiB). Derived from
+    //       [`EXPECTED_DISTINCT_TIMESTEPS`], *not* from `cache.bytes()`.
+    //     * the transient allowance — [`TRANSIENT_ACTIVATIONS`] activations (0.75 MiB).
+    //
+    //     Writing the ceiling as a multiple of `cache.bytes()` would have been the false-green
+    //     shape this epic has already been bitten by twice: the graded value would set its own
+    //     ceiling, and a cache that doubled would sail through. As written, it does not — see the
+    //     mutation record on sc-19544.
+    //
+    //     Measured: 2.04 MiB against a 2.51 MiB ceiling, of which 0.88 MiB bodies, 0.84 MiB cache
+    //     table and 0.32 MiB of transients. The figure is deterministic to the byte — 12 concurrent
+    //     copies of this binary reported the same one — so the 23 % margin is margin, not noise.
+    //
+    //     The direction it gates is the product claim the eviction exists for: the denoise phase's
+    //     high-water mark must not contain the projections. It is **not** satisfiable by bytes that
+    //     were merely *reported* released — the Arc-shared control arm below runs this same
+    //     measurement and comes in at 20.12 MiB, 8x over this ceiling.
+    let expected_cache =
+        LAYERS * EXPECTED_DISTINCT_TIMESTEPS * MODALITY_NUM * 6 * c.hidden_size * 4;
+    let transient_allowance = TRANSIENT_ACTIVATIONS * SEQ * c.hidden_size * 4;
+    let peak_ceiling =
+        before_net.saturating_sub(expected_release) + expected_cache + transient_allowance;
+    assert!(
+        forward_peak_net <= peak_ceiling,
+        "the post-eviction denoise phase peaked at {:.2} MiB of model-attributable memory against \
+         a {:.2} MiB ceiling = {:.2} MiB of block bodies (the pre-eviction {:.2} MiB less the \
+         {:.2} MiB of projections) + {:.2} MiB of cache table the schedule implies + {:.2} MiB of \
+         transient allowance. Either the projections are back in the denoise footprint, the cache \
+         table has grown past what {EXPECTED_DISTINCT_TIMESTEPS} distinct timesteps imply (it \
+         measures {:.2} MiB), or the forward's transients have grown into the headroom the \
+         eviction was taken for",
+        mib(forward_peak_net),
+        mib(peak_ceiling),
+        mib(before_net.saturating_sub(expected_release)),
+        mib(before_net),
+        mib(expected_release),
+        mib(expected_cache),
+        mib(transient_allowance),
+        mib(cache.bytes()),
     );
 
     drop(cache);
@@ -479,6 +717,46 @@ fn the_evicted_adaln_weights_leave_memory() {
         mib(released_pinned),
     );
 
+    // (c-control) THE SAME PEAK MEASUREMENT, ON THE ARM WHERE NOTHING WAS ACTUALLY FREED.
+    //
+    // This is what makes (c) above a gate rather than a number that happens to be small. The
+    // failure mode (c) has to exclude is the candle-specific one: `released_bytes` reports the full
+    // 18.07 MiB in *both* arms because it is the blocks' arithmetic, so a bound written against a
+    // reported release figure passes while the storage is still pinned by a surviving `Weights`
+    // map. Run (c)'s measurement here and it comes in an order of magnitude the other side of the
+    // ceiling — the projections are in the denoise phase's high-water mark, exactly as they are in
+    // production when the loader map outlives the load.
+    //
+    // Asserted before the release assertions below so that a change to candle's storage sharing
+    // reds *this* first, naming the peak, rather than being masked by the coarser `freed_pinned`
+    // check.
+    reset_peak();
+    one_forward(&c, &blocks, &cache, &device);
+    let pinned_forward_peak_net = peak().saturating_sub(warm);
+    println!(
+        "  arm 2 forward PEAK {:.2} MiB net of scratch, against arm 1's {:.2} MiB and the {:.2} \
+         MiB ceiling (c) applies",
+        mib(pinned_forward_peak_net),
+        mib(forward_peak_net),
+        mib(peak_ceiling),
+    );
+    // Asserted against **(c)'s own ceiling**, not against a figure of its own. That is what makes
+    // this a proof about (c) rather than a second measurement that happens to be large: it says
+    // the ceiling (c) applies EXCLUDES the arm where `released_bytes` reported 18.07 MiB and the
+    // allocator gave back 0.00. Loosen (c) until it stops discriminating and this reds, which is
+    // the one direction a bound like (c) actually rots in.
+    assert!(
+        pinned_forward_peak_net > peak_ceiling,
+        "the pinned arm's denoise phase peaked at {:.2} MiB, inside (c)'s {:.2} MiB ceiling. (c) \
+         is then satisfiable by an arm in which `released_bytes` reported the full {:.2} MiB and \
+         the allocator gave back 0.00 — it grades nothing. Either (c)'s ceiling has been loosened \
+         past the point of discriminating, or this arm is no longer performing the trap (candle's \
+         storage sharing changed and a surviving `Weights` map no longer pins the projections)",
+        mib(pinned_forward_peak_net),
+        mib(peak_ceiling),
+        mib(expected_release),
+    );
+
     // The API reports the same number in both arms — that is exactly the point.
     assert_eq!(
         released_pinned, expected_release,
@@ -497,6 +775,7 @@ fn the_evicted_adaln_weights_leave_memory() {
         mib(freed_pinned),
         mib(released_pinned)
     );
+
     drop(cache);
     drop(blocks);
     drop(w);
