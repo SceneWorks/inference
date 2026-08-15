@@ -1743,7 +1743,35 @@ mod tests {
         )
         .expect("contract");
         assert_eq!(contract.asset_facts.transformer_bytes, Q4_BYTES);
+        // The original blocker was a contract that resolved its asset facts to the staged tier while
+        // still declaring the bf16 sub-stack against them — a sub-stack larger than the stack
+        // containing it, which `Registry::memory_strategy_contract` turns into a q4 render that
+        // cannot resolve a contract at all. Reading the field without grading the contract cannot
+        // see that, so this is the assertion that would have caught it.
+        assert!(
+            contract.conformance_errors().is_empty(),
+            "a staged tier must resolve a conformant contract: {:?}",
+            contract.conformance_errors()
+        );
+        // This snapshot carries no `config.json`, so the marker leg is absent and the **footprint**
+        // leg is what sized the sub-stack. Pinned so the two legs cannot be confused for one another:
+        // the marker leg is driven separately by
+        // `the_marker_leg_sizes_the_sub_stack_from_the_staged_tiers_own_quantization_block`.
+        assert_eq!(
+            contract.resident_components()[0].resident_bytes,
+            Q4_FOOTPRINT_LEG_BYTES,
+            "with no quantization marker the footprint leg must be what wins"
+        );
     }
+
+    /// The q4 sub-stack the **footprint** leg derives: `ADALN_EVICTED_BYTES · Q4_BYTES /
+    /// DIT_BF16_BYTES`.
+    ///
+    /// It sits 0.648 % above the marker leg's exact 7,325,337,600 B because `crate::convert` leaves
+    /// the f32 I/O heads, `context_embedder` and the norms dense in every tier, so the whole-DiT
+    /// ratio shrinks slightly more slowly than the projections' own. That gap is the entire reason
+    /// `resolved_adaln_bytes` takes the **minimum** rather than either leg alone.
+    const Q4_FOOTPRINT_LEG_BYTES: u64 = 7_372_786_768;
 
     /// The stage-attributed peaks, and the relationships between them that the epic measured. The
     /// point of this test is the **attribution**: it fails if someone re-labels the ~53 GB floor as
@@ -1925,12 +1953,300 @@ mod tests {
         assert!(!resident_components.is_empty());
         stripped.formula = MemoryFormulaKind::PhaseEnvelope { phases, variables };
         assert_eq!(stripped.evicted_component_bytes(), 0);
-        assert_eq!(
-            stripped.steady_state_transformer_bytes(),
-            stripped.asset_facts.transformer_bytes,
-            "a plain PhaseEnvelope has nowhere to record the drop — this is the pre-sc-18665 state"
-        );
         assert_ne!(declared().evicted_component_bytes(), 0);
+
+        // The steady-state half must be graded on a **resolved** contract. `declared()` is the
+        // weights-free one, whose `transformer_bytes` is 0, so asserting the two equal there is
+        // `0 == 0` — it passes whether or not the accessor consulted the formula at all.
+        let mut resolved = staged_contract(DIT_BF16_BYTES, None);
+        let net = ADALN_EVICTED_BYTES - ADALN_MODULATION_TABLE_MAX_BYTES;
+        assert_ne!(resolved.asset_facts.transformer_bytes, 0);
+        assert_eq!(
+            resolved.steady_state_transformer_bytes(),
+            DIT_BF16_BYTES - net,
+            "the resolved contract charges the post-precompute steady state"
+        );
+        let MemoryFormulaKind::ComponentPhaseEnvelope {
+            phases, variables, ..
+        } = resolved.formula.clone()
+        else {
+            panic!("the shipped formula is a component envelope");
+        };
+        resolved.formula = MemoryFormulaKind::PhaseEnvelope { phases, variables };
+        assert_eq!(
+            resolved.steady_state_transformer_bytes(),
+            DIT_BF16_BYTES,
+            "a plain PhaseEnvelope has nowhere to record the drop — this is the pre-sc-18665 state, \
+             and the delta against the assertion above is the whole of what sc-18665 adds"
+        );
+        assert_eq!(resolved.evicted_component_bytes(), 0);
+    }
+
+    /// A contract resolved off a staged DiT of `dit_bytes`, optionally carrying a real packed
+    /// `quantization` marker of `bits`.
+    ///
+    /// Those are exactly the two inputs [`resolved_adaln_bytes`] reads, and the marker is written as
+    /// a genuine `config.json` in the staged component directory — the same file
+    /// `mlx_gen::quant::packed_quant_bits_at` parses on the load path. Nothing here reaches the bit
+    /// width through a test-only seam, which is the point: before this helper existed no test wrote a
+    /// `quantization` block at all, so `packed_quant_bits_at` always returned `Ok(None)` and the
+    /// marker leg was never executed.
+    fn staged_contract(dit_bytes: u64, bits: Option<i32>) -> MemoryProviderContract {
+        let root = tempfile::tempdir().expect("tempdir");
+        sparse_snapshot(root.path(), &[("transformer", DIT_BF16_BYTES)]);
+        let staged = tempfile::tempdir().expect("tempdir");
+        sparse_snapshot(staged.path(), &[("transformer", dit_bytes)]);
+        if let Some(bits) = bits {
+            std::fs::write(
+                staged.path().join(DIT_COMPONENT).join("config.json"),
+                format!(
+                    "{{\"quantization\":{{\"bits\":{bits},\"group_size\":{}}}}}",
+                    crate::quant::GROUP_SIZE
+                ),
+            )
+            .expect("quantization marker");
+        }
+        contract_for(
+            &LoadSpec::new(WeightsSource::Dir(root.path().into())).with_component(
+                DIT_COMPONENT,
+                WeightsSource::Dir(staged.path().join(DIT_COMPONENT)),
+            ),
+        )
+        .expect("contract")
+    }
+
+    /// The staged q4 DiT partition's measured on-disk footprint — 18.78 GB.
+    const Q4_DIT_BYTES: u64 = 18_779_970_678;
+
+    /// The three published tier figures are [`adaln_stack_bytes`]'s own output at the three shipped
+    /// widths, derived from the shipped configuration at the group size the **loader** loads at.
+    ///
+    /// Before this guard, [`ADALN_EVICTED_Q8_BYTES`] and [`ADALN_EVICTED_Q4_BYTES`] were referenced
+    /// by nothing but their own doc comments: two 8- and 13-digit literals no execution could
+    /// contradict. The bindings here are the ones that actually bite —
+    ///
+    /// * the constants against the function, so a re-typed digit reds;
+    /// * the function's three **inputs** against `MiniMaxH3DitConfig::default()` and
+    ///   [`crate::quant::GROUP_SIZE`], so a config or group-size change moves the constants or reds
+    ///   (the function reads them, so grading its output alone would not see a config edit);
+    /// * the packed figures against the **code-buffer-only** total, which is the distinct claim the
+    ///   docs make at [`ADALN_EVICTED_Q8_BYTES`]: the published figure carries the per-group bf16
+    ///   scale and bias that `crate::quant::nbytes` sums and the packed triple cannot run without,
+    ///   so it must NOT equal the 13.01 GB code buffer.
+    ///
+    /// The bf16 arm is anchored independently of all of this: `ADALN_EVICTED_BYTES` is asserted
+    /// against the sum over the 50 real `adaln_proj` tensors by
+    /// `tests/adaln_evict_real_weights.rs`, so binding the packed arms to the same function carries
+    /// that anchor onto them.
+    #[test]
+    fn the_packed_tier_stack_sizes_are_the_loaders_own_accounting() {
+        let config = crate::dit::MiniMaxH3DitConfig::default();
+        let out = config.adaln_out_features() as u64;
+        let inp = config.time_embed_dim as u64;
+
+        // The derivation's inputs, pinned to the shipped configuration and the loader's group size.
+        assert_eq!(out, 96_768, "6 modulation params x 3 x hidden_size 5376");
+        assert_eq!(inp, 2688, "time_embed_dim");
+        assert_eq!(DIT_BLOCKS as i32, config.num_layers);
+        assert_eq!(
+            crate::quant::GROUP_SIZE,
+            64,
+            "adaln_stack_bytes charges one bf16 scale and one bf16 bias per input group; a loader \
+             that packed at a different group size would hold a different number of them"
+        );
+
+        // The three published figures ARE this function's output.
+        assert_eq!(adaln_stack_bytes(16), ADALN_EVICTED_BYTES);
+        assert_eq!(adaln_stack_bytes(8), ADALN_EVICTED_Q8_BYTES);
+        assert_eq!(adaln_stack_bytes(4), ADALN_EVICTED_Q4_BYTES);
+
+        // The packed figures count the group metadata, and that is what separates them from the
+        // code-buffer figure `crate::quant` quotes.
+        for (bits, published) in [(8_i32, ADALN_EVICTED_Q8_BYTES), (4, ADALN_EVICTED_Q4_BYTES)] {
+            let code_only = DIT_BLOCKS as u64 * out * inp * bits as u64 / 8;
+            assert!(
+                published > code_only,
+                "the q{bits} figure must carry the per-group scales and biases on top of the \
+                 {code_only} B code buffer, or it is not what is resident"
+            );
+        }
+        assert_eq!(
+            DIT_BLOCKS as u64 * out * inp,
+            13_005_619_200,
+            "the 13.01 GB code buffer the crate::quant docs quote for q8"
+        );
+        assert_ne!(
+            ADALN_EVICTED_Q8_BYTES, 13_005_619_200,
+            "the published q8 figure is the resident triple, not the code buffer alone"
+        );
+
+        // Monotone in the tier, and every packed tier strictly below the bf16 stack it replaces.
+        assert!(ADALN_EVICTED_Q4_BYTES < ADALN_EVICTED_Q8_BYTES);
+        assert!(ADALN_EVICTED_Q8_BYTES < ADALN_EVICTED_BYTES);
+        // `packed_quant_bits_at` admits only 4 and 8, so those are the only packed widths this
+        // function is ever called at; 16 is the dense arm.
+        assert_eq!(adaln_stack_bytes(16), adaln_stack_bytes(32));
+    }
+
+    /// **The marker leg, driven.** The staged tier's own `config.json` `quantization` block sizes
+    /// the sub-stack, at q4 **and** q8.
+    ///
+    /// This closes the coverage hole that made the tier fix unproven where it matters: no test wrote
+    /// a `quantization` block, so `mlx_gen::quant::packed_quant_bits_at` always returned `Ok(None)`,
+    /// `adaln_stack_bytes(bits < 16)` never executed, and the q4 case passed on the **footprint**
+    /// leg instead. Both legs are now driven against the same footprint, and they differ, so the
+    /// assertions grade which leg ran rather than only what it returned.
+    ///
+    /// **The q8 cell is deliberately stated as a leg property, not as a shipped-artifact figure.**
+    /// No q8 DiT on-disk footprint constant exists in this repo, so which leg wins for the real q8
+    /// artifact cannot be settled by reading — it needs a q8 snapshot. What is settled here is the
+    /// crossover: above a staged footprint of 35.22 GB the q8 marker leg wins and below it the
+    /// footprint leg does, and both sides are executed. The shipped q8 artifact's own size is not
+    /// claimed in either direction.
+    #[test]
+    fn the_marker_leg_sizes_the_sub_stack_from_the_staged_tiers_own_quantization_block() {
+        // --- q4: the shipped tier, where the marker leg genuinely wins ---------------------------
+        let marked = staged_contract(Q4_DIT_BYTES, Some(4));
+        assert!(
+            marked.conformance_errors().is_empty(),
+            "a marked q4 tier must resolve a conformant contract: {:?}",
+            marked.conformance_errors()
+        );
+        assert_eq!(
+            marked.resident_components()[0].resident_bytes,
+            ADALN_EVICTED_Q4_BYTES,
+            "the q4 marker leg's exact stack must win over the footprint leg"
+        );
+        // The same footprint with the marker removed resolves HIGHER, which is what proves the
+        // marker leg is what decided the number above rather than the footprint leg agreeing by
+        // coincidence.
+        assert_eq!(
+            staged_contract(Q4_DIT_BYTES, None).resident_components()[0].resident_bytes,
+            Q4_FOOTPRINT_LEG_BYTES
+        );
+        assert!(
+            ADALN_EVICTED_Q4_BYTES < Q4_FOOTPRINT_LEG_BYTES,
+            "the marker leg is exact and the footprint leg over-declares by the dense f32 heads and \
+             norms crate::convert leaves in every tier"
+        );
+
+        // --- q8: both sides of the crossover, executed ------------------------------------------
+        // Above the crossover the marker leg wins, so `adaln_stack_bytes(8)` is what produced this.
+        let q8_marked = staged_contract(DIT_BF16_BYTES, Some(8));
+        assert!(
+            q8_marked.conformance_errors().is_empty(),
+            "a marked q8 tier must resolve a conformant contract: {:?}",
+            q8_marked.conformance_errors()
+        );
+        assert_eq!(
+            q8_marked.resident_components()[0].resident_bytes,
+            ADALN_EVICTED_Q8_BYTES
+        );
+        // Below it the footprint leg wins, which is the `min` doing its job rather than the marker
+        // leg simply always being taken.
+        let q8_small = staged_contract(20_000_000_000, Some(8));
+        assert_eq!(
+            q8_small.resident_components()[0].resident_bytes,
+            7_851_755_356,
+            "under the crossover the scaled footprint is the smaller, and safety takes the minimum"
+        );
+        assert!(q8_small.conformance_errors().is_empty());
+        // u128: the numerator is ~9.2e20 and overflows u64, the same reason `resolved_adaln_bytes`
+        // widens its own footprint-leg multiply.
+        assert_eq!(
+            ADALN_EVICTED_Q8_BYTES as u128 * DIT_BF16_BYTES as u128
+                / ADALN_EVICTED_BYTES as u128
+                + 1,
+            35_223_071_970,
+            "the staged footprint above which the q8 marker leg wins; the shipped q8 artifact's own \
+             footprint is not recorded in this repo, so which side it falls on is UNDETERMINED"
+        );
+
+        // An unreadable marker must not be mistaken for a dense tier: `packed_quant_bits_at` errors,
+        // `resolved_adaln_bytes` falls back to the bf16 figure, and the footprint leg is what keeps
+        // that from declaring 26 GB against an 18.78 GB DiT.
+        let root = tempfile::tempdir().expect("tempdir");
+        sparse_snapshot(root.path(), &[("transformer", DIT_BF16_BYTES)]);
+        let staged = tempfile::tempdir().expect("tempdir");
+        sparse_snapshot(staged.path(), &[("transformer", Q4_DIT_BYTES)]);
+        std::fs::write(
+            staged.path().join(DIT_COMPONENT).join("config.json"),
+            "{ not json",
+        )
+        .expect("damaged marker");
+        let damaged = contract_for(
+            &LoadSpec::new(WeightsSource::Dir(root.path().into())).with_component(
+                DIT_COMPONENT,
+                WeightsSource::Dir(staged.path().join(DIT_COMPONENT)),
+            ),
+        )
+        .expect("contract");
+        assert_eq!(
+            damaged.resident_components()[0].resident_bytes,
+            Q4_FOOTPRINT_LEG_BYTES,
+            "a damaged marker must fall through to the footprint leg, never to the bf16 constant"
+        );
+        assert!(damaged.conformance_errors().is_empty());
+    }
+
+    /// Every shipped tier resolves an eviction that still excludes something, and the floor below
+    /// which it would not is real rather than rhetorical.
+    ///
+    /// `conformance_errors` refuses a `PrecomputedThenEvicted` component whose retained table is at
+    /// or above its resident bytes — the eviction would declare a saving of zero or less. The scaled
+    /// footprint leg falls below [`ADALN_MODULATION_TABLE_MAX_BYTES`] once the resolved DiT drops
+    /// under ~9.86 GB, so that floor is a property of the arithmetic and not a hypothetical. The
+    /// shipped tiers sit clear of it: q4's 18.78 GB is 1.90x above.
+    #[test]
+    fn the_shipped_tiers_sit_clear_of_the_floor_where_the_eviction_stops_excluding_anything() {
+        for (what, dit_bytes, bits, expected) in [
+            ("bf16", DIT_BF16_BYTES, None, ADALN_EVICTED_BYTES),
+            ("q4", Q4_DIT_BYTES, Some(4), ADALN_EVICTED_Q4_BYTES),
+            ("q8", DIT_BF16_BYTES, Some(8), ADALN_EVICTED_Q8_BYTES),
+        ] {
+            let contract = staged_contract(dit_bytes, bits);
+            let component = &contract.resident_components()[0];
+            assert_eq!(component.resident_bytes, expected, "{what}");
+            assert!(
+                ADALN_MODULATION_TABLE_MAX_BYTES < component.resident_bytes,
+                "{what}: the retained table must stay strictly below the resident stack, or the \
+                 declared eviction excludes nothing"
+            );
+            assert!(
+                component.resident_bytes <= contract.asset_facts.transformer_bytes,
+                "{what}: a sub-stack cannot exceed the stack that contains it"
+            );
+            assert!(
+                contract.conformance_errors().is_empty(),
+                "{what}: {:?}",
+                contract.conformance_errors()
+            );
+        }
+
+        // The floor is real: a DiT under it resolves a sub-stack below the retained table, and
+        // conformance says exactly that rather than passing quietly.
+        const FLOOR_DIT_BYTES: u64 = 9_859_502_300;
+        assert_eq!(
+            ADALN_MODULATION_TABLE_MAX_BYTES as u128 * DIT_BF16_BYTES as u128
+                / ADALN_EVICTED_BYTES as u128,
+            FLOOR_DIT_BYTES as u128,
+            "below this resolved DiT footprint the scaled stack falls under the retained table"
+        );
+        let starved = staged_contract(9_000_000_000, None);
+        assert_eq!(
+            starved.resident_components()[0].resident_bytes,
+            3_533_289_910
+        );
+        let errors = starved.conformance_errors();
+        assert!(
+            errors.iter().any(|e| e.contains("excludes nothing")),
+            "a sub-stack under the retained table must be refused, got {errors:?}"
+        );
+        // ...and the shipped tier's margin above that floor, stated as a number.
+        assert!(
+            Q4_DIT_BYTES > FLOOR_DIT_BYTES * 19 / 10,
+            "q4's {Q4_DIT_BYTES} B sits 1.90x above the {FLOOR_DIT_BYTES} B floor"
+        );
     }
 
     /// **AC2.** The saving the contract claims may not exceed the saving the runtime was measured
@@ -1980,6 +2296,36 @@ mod tests {
             ADALN_EVICTED_BYTES - measured_drop <= ADALN_MODULATION_TABLE_MAX_BYTES,
             "{} B of the eviction is unaccounted for once the retained table is allowed for",
             ADALN_EVICTED_BYTES - measured_drop
+        );
+
+        // --- the same bracket on the q4 tier ------------------------------------------------------
+        //
+        // Grading bf16 alone leaves the tier the story exists to fix ungraded, and the q4 bracket is
+        // the *tight* one: the shortfall against the measured q4 drop is 175,366,922 B, i.e. the
+        // retained table covers it with only 4.5 % of itself to spare, where bf16 has 22.15 GB of
+        // slack. A tier-scaling error that bf16 cannot see lands here.
+        let q4 = staged_contract(Q4_DIT_BYTES, Some(4));
+        let q4_claimed = q4.evicted_component_bytes();
+        assert_eq!(
+            q4_claimed,
+            ADALN_EVICTED_Q4_BYTES - ADALN_MODULATION_TABLE_MAX_BYTES,
+            "the q4 claim is the resolved stack net of the table, which does NOT scale with the tier"
+        );
+        let q4_measured_drop = Q4_DIT_BYTES - DENOISE_RESIDENT_Q4_BYTES;
+        assert!(
+            q4_claimed <= q4_measured_drop,
+            "q4: the contract claims {q4_claimed} B against a measured {q4_measured_drop} B drop"
+        );
+        assert!(
+            q4_claimed + ADALN_MODULATION_TABLE_MAX_BYTES >= q4_measured_drop,
+            "q4: the shortfall {} B exceeds the {ADALN_MODULATION_TABLE_MAX_BYTES} B table",
+            q4_measured_drop.saturating_sub(q4_claimed)
+        );
+        assert_eq!(
+            q4_claimed + ADALN_MODULATION_TABLE_MAX_BYTES - q4_measured_drop,
+            175_366_922,
+            "the q4 margin, pinned: this is the tightest cell in the table and the one a tier \
+             mis-scaling moves first"
         );
     }
 
