@@ -4100,9 +4100,21 @@ mod tests {
         let registry = super::provider_registry().unwrap();
         let contract_registry = super::memory_contract_surface_registry().unwrap();
         gen_core_testkit::memory_contract_surface_registry_conformance(&contract_registry);
-        assert_eq!(contract_registry.memory_strategy_registrations().len(), 23);
+        // Candle Wan's TI2V-5B memory registration is `#[cfg(any(feature = "cuda", test))]`, so the
+        // CUDA catalog carries one provider the CPU catalog does not. It contributes six selectors,
+        // not twelve: TI2V-5B has no deferred block loader, so it witnesses only the eager half of
+        // the common Candle surface. Keep both arms rather than a `cfg!` sum — the CPU lane and the
+        // Windows CUDA lane each read exactly the total they can observe.
+        #[cfg(feature = "cuda")]
+        let (expected_registrations, expected_surfaces) = (24, 21 * 12 + 2 * 16 + 6);
+        #[cfg(not(feature = "cuda"))]
+        let (expected_registrations, expected_surfaces) = (23, 21 * 12 + 2 * 16);
+        assert_eq!(
+            contract_registry.memory_strategy_registrations().len(),
+            expected_registrations
+        );
         let surfaces = contract_registry.memory_contract_surfaces().unwrap();
-        assert_eq!(surfaces.len(), 21 * 12 + 2 * 16);
+        assert_eq!(surfaces.len(), expected_surfaces);
         assert_eq!(
             surfaces
                 .iter()
