@@ -33,18 +33,22 @@
 //! silently revert to a no-op.
 //!
 //! `two_checkpoints_are_never_co_resident` therefore forces a fixed ~3.8 GB slab of **each**
-//! partition in turn and gates on the peak across the pair. Measured: phase A peak one slab, active
-//! back to **0** after the retried drain, phase B peak one slab — not two.
+//! partition in turn and gates on the peak across the pair. Measured: phase A peak one slab,
+//! footprint back to **0** after the retried drain, phase B peak one slab — not two.
 //!
 //! What it can show: the release is real and the two partitions do not accumulate. What it
 //! *cannot*: anything about a caller holding both handles at once, or about the remaining 62 GB of
 //! each checkpoint. The first is structural, gated by `every_dit_load_site_is_driven_by_the_task`.
 //!
 //! The second is now gated too: `two_full_checkpoints_are_never_co_resident` (sc-17151) runs the
-//! identical property over **every tensor of both partitions**, releasing through the production
-//! drain and reading active **plus cache**. The slab test is kept because it is the affordable arm
-//! — it runs on ~7.6 GB rather than ~133 GB — and because its bound is the tighter of the two
-//! relative to what it materializes.
+//! identical property over **every tensor of both partitions**. The slab test is kept because it is
+//! the affordable arm — ~7.6 GB rather than ~133 GB, so it is the one that can be re-run under a
+//! source mutation. It is **not** the tighter of the two: the full-scale arm is tighter on both
+//! bounds (peak `bytes + bytes/8`, 1.125x, against the slab's `2 * slab`, 2.00x; residual
+//! `bytes_a/16`, 6.25%, against the slab's `slab/4`, 25%). Both now release through the same
+//! `mlx_gen::residency::drain_allocator_cache` and read active **plus cache**; the slab arm did not
+//! until sc-17151's review, which is how it came to name `get_active_memory`-alone blindness in its
+//! own assertion string while measuring with it.
 
 mod common;
 
@@ -234,17 +238,26 @@ fn force_slab(root: &Path, partition: &str) -> (Vec<mlx_rs::Array>, u64) {
 /// structural property, gated by `every_dit_load_site_is_driven_by_the_task`. It also cannot speak
 /// to the *whole* 66 GB, only to the slab — the full-checkpoint residency contract is sc-17151.
 ///
-/// The forced evaluation, the `.item()` reduction and the retried drain are each individually
-/// necessary; sc-17145 established all three, and the 33 KB reading above is what a build without
-/// the first one looks like.
+/// The `.item()` reduction and the retried drain are what sc-17145 established, and the 33 KB
+/// reading above is what a build that forces neither looks like. The bulk `eval` that precedes the
+/// reduction is *not* separately established — every tensor is held and then individually reduced,
+/// so it may be redundant — and no measurement here distinguishes them.
 #[test]
 #[ignore = "materializes ~3.8 GB from each of the two DiT partitions (MINIMAX_H3_SNAPSHOT)"]
 fn two_checkpoints_are_never_co_resident() {
     let root = common::snapshot();
 
-    mlx_rs::memory::clear_cache();
+    // Active **plus cache**, and the shared retried drain — the same two the full-scale sibling
+    // below uses. This arm carried neither until sc-17151's review: it ran a bare
+    // `for _ in 0..4 { clear_cache(); }` and read `get_active_memory` alone, while its own residual
+    // assertion named reading active alone as the sc-17145 failure. A no-op drain migrates the slab
+    // from active into the allocator cache, which is invisible to the counter it was using.
+    let footprint =
+        || (mlx_rs::memory::get_active_memory() + mlx_rs::memory::get_cache_memory()) as u64;
+
+    mlx_gen::residency::drain_allocator_cache();
     mlx_rs::memory::reset_peak_memory();
-    let baseline = mlx_rs::memory::get_active_memory() as u64;
+    let baseline = footprint();
 
     // --- phase A: the ref2va partition ------------------------------------------------------
     let (held_a, slab) = force_slab(&root, MiniMaxH3Task::Ref2va.partition());
@@ -254,19 +267,18 @@ fn two_checkpoints_are_never_co_resident() {
         "peak {peak_a} is implausibly small for a {slab}-byte slab — nothing was materialized, so \
          this test would pass on a no-op (a bare `load` reads 33 KB)"
     );
-    let active_a = mlx_rs::memory::get_active_memory() as u64;
+    let resident_a = footprint();
 
-    // --- release, with the retried drain ------------------------------------------------------
+    // --- release, through the production drain --------------------------------------------------
     drop(held_a);
-    for _ in 0..4 {
-        mlx_rs::memory::clear_cache();
-    }
-    let after_release = mlx_rs::memory::get_active_memory() as u64;
+    mlx_gen::residency::drain_allocator_cache();
+    let after_release = footprint();
     assert!(
         after_release < baseline + slab / 4,
-        "after releasing partition A, active memory is {after_release} against a {baseline} \
-         baseline and a {slab}-byte slab — the checkpoint did not leave, and `get_active_memory` \
-         alone reporting success while buffers sit in the cache is exactly the sc-17145 failure"
+        "after releasing partition A, active+cached memory is {after_release} against a {baseline} \
+         baseline and a {slab}-byte slab — the checkpoint did not leave. This reads active PLUS \
+         cache because `get_active_memory` alone reporting success while buffers sit in the cache \
+         is exactly the sc-17145 failure"
     );
 
     // --- phase B: the base partition ----------------------------------------------------------
@@ -287,21 +299,20 @@ fn two_checkpoints_are_never_co_resident() {
         2 * slab
     );
     drop(held_b);
-    for _ in 0..4 {
-        mlx_rs::memory::clear_cache();
-    }
+    mlx_gen::residency::drain_allocator_cache();
 
     println!(
-        "slab {slab} B | phase A peak {peak_a} active {active_a} | released to {after_release} | \
-         phase B peak {peak_b}"
+        "slab {slab} B | phase A peak {peak_a} active+cache {resident_a} | released to \
+         {after_release} | phase B peak {peak_b}"
     );
 }
 
 /// Materialize a **whole** DiT partition and hold it, returning the handles and their byte count.
 ///
-/// The full-scale counterpart of [`force_slab`]: same two forcing steps, every tensor. `eval` alone
-/// can leave a mapped tensor unrealized and the `.item()` reduction is what reads the bytes, so
-/// both are needed or the 33 KB reading in this file's header is what comes back.
+/// The full-scale counterpart of [`force_slab`]: same forcing steps, every tensor. The `.item()`
+/// reduction is the step that reads the bytes — without it the 33 KB reading in this file's header
+/// is what comes back. The bulk `eval` that precedes it is kept because it is the shape the
+/// production loaders use, not because removing it was measured to change a reading.
 fn force_partition(root: &Path, partition: &str) -> (Vec<mlx_rs::Array>, u64) {
     let w = Weights::from_dir(root.join(partition)).unwrap();
     let mut keys: Vec<String> = w.keys().map(str::to_owned).collect();

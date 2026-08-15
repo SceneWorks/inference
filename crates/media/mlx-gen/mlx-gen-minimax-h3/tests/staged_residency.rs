@@ -5,6 +5,23 @@
 //!   cargo test -p mlx-gen-minimax-h3 --test staged_residency -- --ignored --nocapture
 //! ```
 //!
+//! # Two arms run in CI; the rest are OPERATOR-ONLY, and that is a disk fact
+//!
+//! [`the_video_decoder_hands_off_cleanly`] and [`a_held_decoder_trips_both_handoff_gates`] are
+//! selected by name from the `mlx-minimax-h3` job in `.github/workflows/real-weights.yml`, and
+//! `test_minimax_h3_lanes_select_tests_that_exist_and_pin_their_run_count` binds those two names on
+//! every PR. They are what CI pulls because `release/real-weight-models.toml` fetches an 11.640 GB
+//! slice of the 196 GB repository that holds `vae/` and `audio_vae/` whole and carries **neither
+//! `transformer/` nor `text_encoder/` shards** — and every arm below that touches either would fail
+//! inside `Weights::from_dir` rather than at a gate. Those arms, plus every `#[ignore]`d arm of
+//! `ref2va_checkpoint.rs` and `te_tier_generate_stages.rs`, are **operator-only**: they run where
+//! someone holds the full snapshot, with the command above.
+//!
+//! [`a_phase_that_skips_the_reduction_fails_the_materialization_gate`] is the exception on both
+//! counts — it reads only `audio_vae/`, so the lane's bytes could run it, and it is deliberately not
+//! selected: it is a control arm whose *expected* outcome is unmeasured (see [`force`]), and a lane
+//! is not where an open question belongs.
+//!
 //! # The mechanism shipped before the enforcement did
 //!
 //! `crate::model`'s render paths have always been staged — text encoder forced then released, the
@@ -38,6 +55,30 @@
 //! render order is pinned by `te_tier_generate_stages.rs`, and the structural
 //! "there is only one DiT load site" property by `ref2va_checkpoint.rs`.
 //!
+//! # THIS IS A LARGE-LEAK GATE. Its floor is ~2.15 GB, and that is deliberate
+//!
+//! sc-17151 asked for a tripwire on *component* residency — a phase holding its predecessor's 66 GB
+//! weights — so the thresholds are sized to components. The arithmetic is stated here rather than
+//! left implied, because "every handoff is protected" reads as a general claim and is not one.
+//!
+//! [`handoff_is_clean`] takes `RESIDUAL_ALLOWANCE.min(bytes / 2)`, and the **smallest thing any
+//! gated phase here sheds is the ~8.5 GB bounded slab** (the rest are 10.42, 11.02, 66.28 and
+//! 66.72 GB), so `bytes / 2` is never below 4.25 GB, the `min` always selects the constant, and the
+//! threshold is always the flat **2.147 GB**. Concretely invisible to it, each a figure measured
+//! elsewhere in this crate:
+//!
+//! | leak | size | under the 2.147 GB floor by |
+//! |---|---|---|
+//! | the AdaLN projection table | 0.164 GB | 13.1x |
+//! | the measured AdaLN precompute transient (218,988,544 B) | 0.219 GB | 9.8x |
+//! | the `audio_vae/` decode half | 0.242 GiB / 0.26 GB | 8.3x |
+//!
+//! `tests/adaln_evict_memory.rs` and `tests/adaln_evict_real_weights.rs` are what gate the AdaLN
+//! sizes; nothing in *this* file would notice any of the three going resident. Reaching them needs
+//! a different instrument — a per-phase output budget rather than one constant, since a released
+//! phase legitimately leaves hundreds of MB of text context, condition rows or latents behind — and
+//! is deliberately not attempted here.
+//!
 //! `a_held_component_trips_both_handoff_gates` is the control arm: it holds a phase's weights
 //! across the boundary on purpose and asserts the gates' **own predicates** come back false. Both
 //! arms call the same [`handoff_is_clean`] / [`peak_is_one_component`] functions, so the control
@@ -55,16 +96,29 @@ use mlx_gen::weights::Weights;
 /// from, before the handoff counts as dirty.
 ///
 /// A released phase legitimately leaves its *output* behind — a text context, a set of condition
-/// rows, the latents — which are hundreds of MB at the geometries this model runs. Every component
-/// this file sheds is at least 0.6 GB and the two big ones are 66 GB, so the allowance discriminates
-/// a leftover output from a leftover component by more than an order of magnitude on every phase.
+/// rows, the latents — which are hundreds of MB at the geometries this model runs.
+///
+/// The discrimination it actually buys, as ratios rather than as "an order of magnitude" (which was
+/// true of the 66 GB phases and of nothing else): the smallest full-scale phase sheds the 11.02 GB
+/// decode pair, so **5.1x**; the bounded slab arms shed ~8.5 GB, so **~4x**. And the `bytes / 2`
+/// branch of [`handoff_is_clean`] would take over below a ~4.3 GB component, where the margin
+/// collapses toward **2x** — no arm here is that small today, so the constant is what binds
+/// everywhere. See the module header for what this floor cannot see at all.
 const RESIDUAL_ALLOWANCE: u64 = 2 << 30;
 
 /// Slack over a component's own size that its materialization peak may reach: allocator alignment
-/// and the reduction transients, not another component. 1/8 of 66 GB is 8 GB; the smallest thing a
-/// held prior phase would add here is 11 GB.
+/// and the reduction transients, not another component.
+///
+/// **1/8, and nothing added.** [`RESIDUAL_ALLOWANCE`] used to be a third term here and it should not
+/// have been: peak already tolerates a leftover output by construction (the leftover is part of the
+/// `bytes` the next phase is measured against), so adding it again spent the discrimination twice.
+/// With it, the ceiling on the 66.28 GB DiT was 76.71 GB — 10.43 GB of slack against the 11.02 GB
+/// decode pair, a **0.59 GB / 5% margin**, which a slightly larger decode pair or a quantized DiT
+/// tier would have flipped to a pass. Without it the slack is 8.29 GB and the margin is **2.74 GB /
+/// 33%**, and the bound is the same `bytes + bytes / 8` that `ref2va_checkpoint.rs`'s
+/// `two_full_checkpoints_are_never_co_resident` measured against at 66 GB scale.
 fn peak_ceiling(bytes: u64) -> u64 {
-    bytes + bytes / 8 + RESIDUAL_ALLOWANCE
+    bytes + bytes / 8
 }
 
 /// **The handoff gate's predicate.** `residual` is the footprint growth over the baseline after the
@@ -103,13 +157,20 @@ fn gb(bytes: u64) -> f64 {
 
 /// Bytes one tensor occupies once materialized. The dtype is **read**, not assumed, so a precision
 /// change moves the bound rather than silently invalidating it.
+///
+/// **Exhaustive, with no `_` arm.** A catch-all sized the 8-byte dtypes (`Int64`, `Uint64`,
+/// `Complex64`) at 2, undercounting them 4x, and `bytes` is on both sides of the gates: too small a
+/// `bytes` loosens [`was_materialized`] and tightens [`peak_is_one_component`] into a false red.
+/// `mlx_rs::Dtype` is not `#[non_exhaustive]`, so listing every variant makes a future dtype a
+/// compile error here rather than a silent 4x error in a bound.
 fn tensor_bytes(t: &mlx_rs::Array) -> u64 {
+    use mlx_rs::Dtype::*;
     let elems: u64 = t.shape().iter().map(|&d| d as u64).product();
     let width = match t.dtype() {
-        mlx_rs::Dtype::Float64 => 8u64,
-        mlx_rs::Dtype::Float32 | mlx_rs::Dtype::Int32 | mlx_rs::Dtype::Uint32 => 4,
-        mlx_rs::Dtype::Int8 | mlx_rs::Dtype::Uint8 | mlx_rs::Dtype::Bool => 1,
-        _ => 2,
+        Complex64 | Float64 | Int64 | Uint64 => 8u64,
+        Float32 | Int32 | Uint32 => 4,
+        Bfloat16 | Float16 | Int16 | Uint16 => 2,
+        Bool | Int8 | Uint8 => 1,
     };
     elems * width
 }
@@ -125,9 +186,27 @@ struct Resident {
 /// `take` bounds how many tensors per directory are forced, so the cheap arms of this file drive
 /// the identical code path over a few GB instead of 66. `None` is the whole component.
 ///
-/// Both forcing steps are load-bearing and were established by sc-17145: `eval` alone can leave a
-/// mapped tensor unrealized, and the `.item()` reduction is what actually reads the bytes.
+/// The `.item()` reduction is the step sc-17145 established as load-bearing: `eval` alone can leave
+/// a mapped tensor unrealized, and the reduction is what actually reads the bytes.
+///
+/// The bulk `eval(refs)` below it is **not** separately established, and this used to claim both
+/// steps were. Every tensor is retained in `held` and then individually `sum` → `eval` → `item`ed,
+/// so the bulk pass may be entirely redundant; it is kept because it is the shape the production
+/// loaders use, not because removing it was measured to change any reading here.
+/// `a_phase_that_skips_the_reduction_fails_the_materialization_gate` is what would settle it — if
+/// that arm passes the reduction is the whole of the forcing, and if it reds the bulk `eval` is.
 fn force(dirs: &[PathBuf], take: Option<usize>) -> Resident {
+    force_with(dirs, take, true)
+}
+
+/// [`force`], with the `.item()` reduction switchable off.
+///
+/// `reduce: false` is the shape a build that stopped forcing has — it maps and `eval`s and puts
+/// (nearly) nothing on the device — and it exists so
+/// `a_phase_that_skips_the_reduction_fails_the_materialization_gate` can drive
+/// [`was_materialized`] to **false** through the same loader the real arms use. Nothing in
+/// production calls it with `false`.
+fn force_with(dirs: &[PathBuf], take: Option<usize>, reduce: bool) -> Resident {
     let mut held: Vec<mlx_rs::Array> = Vec::new();
     let mut bytes = 0u64;
     for dir in dirs {
@@ -152,10 +231,12 @@ fn force(dirs: &[PathBuf], take: Option<usize>) -> Resident {
     }
     let refs: Vec<&mlx_rs::Array> = held.iter().collect();
     mlx_rs::transforms::eval(refs).unwrap();
-    for t in &held {
-        let s = t.sum(None).unwrap();
-        mlx_rs::transforms::eval([&s]).unwrap();
-        let _ = s.item::<f32>();
+    if reduce {
+        for t in &held {
+            let s = t.sum(None).unwrap();
+            mlx_rs::transforms::eval([&s]).unwrap();
+            let _ = s.item::<f32>();
+        }
     }
     Resident { held, bytes }
 }
@@ -218,6 +299,146 @@ fn components(root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
         vec![root.join("transformer")],
         vec![root.join("vae"), root.join("audio_vae")],
     )
+}
+
+// ── the two arms CI can actually run ───────────────────────────────────────────────────────────
+//
+// The bounded slab arms below look like the cheap ones to wire into a lane, and they are cheap in
+// MEMORY (60 tensors each) and not in DISK: `Weights::from_dir` opens the whole component directory,
+// and `release/real-weight-models.toml` provisions a deliberate 11.640 GB slice of the 196 GB
+// `minimax-h3` repository carrying NO `transformer/` shards and NO `text_encoder/` shards (only the
+// TE index). They would fail inside `from_dir`, before reaching a gate; provisioning the shards is
+// +124 GB on both Macs and is a separate decision from this story.
+//
+// The two arms here run the identical `phase` helper and the identical predicates over the
+// components that slice DOES carry whole: `vae/` (10.42 GB) and `audio_vae/` (0.605 GB).
+
+/// **The CI-runnable clean arm.** Two successive materializations of the video VAE, gated exactly as
+/// the full-scale phases are.
+///
+/// The second phase re-loads the *same* component rather than a different one because the lane's
+/// slice carries only one component over 1 GB. That is a constraint, not a preference, and what it
+/// costs is worth naming: if MLX ever returned phase A's buffers for phase B, phase B's peak would
+/// read as one component and this arm would pass while the control arm below went red. Each phase
+/// is a separate [`Weights::from_dir`] over freshly mapped shards, so it should allocate its own
+/// buffers — but that is an expectation about the runtime, not something this arm proves.
+///
+/// What it does buy: both phases are exactly the same size, so `peak_ceiling` is exact for each
+/// rather than approximate for a small one.
+///
+/// What goes red: a `drain_allocator_cache` that stopped draining leaves phase A's 10.42 GB in the
+/// allocator cache, which `handoff_is_clean` reads (active **+ cache**) and fails on.
+#[test]
+#[ignore = "materializes the 10.42 GB video VAE twice in turn (MINIMAX_H3_SNAPSHOT)"]
+fn the_video_decoder_hands_off_cleanly() {
+    let root = common::snapshot();
+    let vae = vec![root.join("vae")];
+
+    let base = baseline();
+    let (peak_a, bytes_a) = phase("decode A (vae)", &vae, None, base);
+    let (peak_b, bytes_b) = phase("decode B (vae, reloaded)", &vae, None, base);
+    assert_eq!(
+        bytes_a, bytes_b,
+        "the same component loaded twice must size identically, or the two phases are not \
+         comparable and the bound below means something else"
+    );
+    println!(
+        "video VAE handoff: {:.2} GB component | phase A peak {:.2} GB | phase B peak {:.2} GB | \
+         baseline {:.2} GB",
+        gb(bytes_a),
+        gb(peak_a),
+        gb(peak_b),
+        gb(base)
+    );
+}
+
+/// **The CI-runnable control arm: both handoff predicates come back false on a held component.**
+///
+/// The counterpart of [`a_held_component_trips_both_handoff_gates`] on the lane's own bytes. It
+/// holds the 10.42 GB video VAE across the boundary and materializes the 0.605 GB audio VAE behind
+/// it, so both predicates are violated by a wide margin (residual 10.42 GB against a 2.147 GB
+/// allowance; peak ~11.0 GB against a 0.68 GB one-component ceiling) rather than by a few percent.
+#[test]
+#[ignore = "holds the 10.42 GB video VAE while materializing the audio VAE (MINIMAX_H3_SNAPSHOT)"]
+fn a_held_decoder_trips_both_handoff_gates() {
+    let root = common::snapshot();
+    let base = baseline();
+
+    // Phase A, deliberately NOT released.
+    reset_peak_memory();
+    let held_a = force(&[root.join("vae")], None);
+    let bytes_a = held_a.bytes;
+    assert!(
+        was_materialized(get_peak_memory() as u64, bytes_a),
+        "the control arm materialized nothing, so it proves nothing"
+    );
+
+    mlx_gen::residency::drain_allocator_cache();
+    let residual = footprint().saturating_sub(base);
+    assert!(
+        !handoff_is_clean(residual, bytes_a),
+        "holding a {:.2} GB component left only {:.2} GB of residual footprint, which the handoff \
+         gate calls clean — the gate cannot see a held component",
+        gb(bytes_a),
+        gb(residual)
+    );
+
+    reset_peak_memory();
+    let held_b = force(&[root.join("audio_vae")], None);
+    let peak_b = get_peak_memory() as u64;
+    assert!(
+        !peak_is_one_component(peak_b, held_b.bytes),
+        "a {:.2} GB peak while holding {:.2} GB from the previous phase and materializing {:.2} GB \
+         still reads as one component — the accumulation gate is inert",
+        gb(peak_b),
+        gb(bytes_a),
+        gb(held_b.bytes)
+    );
+
+    println!(
+        "decoder control: held {:.2} GB, residual {:.2} GB, second-phase peak {:.2} GB",
+        gb(bytes_a),
+        gb(residual),
+        gb(peak_b)
+    );
+
+    drop((held_a, held_b));
+    mlx_gen::residency::drain_allocator_cache();
+}
+
+/// **The third predicate's control arm: [`was_materialized`] comes back false when nothing was.**
+///
+/// [`a_held_component_trips_both_handoff_gates`] deflects the other two, and without this one the
+/// materialization gate is the only predicate in the file asserted exclusively in the direction that
+/// passes — which is the shape a gate wired to a constant `true` would also have.
+///
+/// [`force_with`]`(.., false)` maps and `eval`s but skips the `.item()` reduction: the 33 KB shape
+/// this file's header describes. Cheap — it is the arm that allocates nothing by construction.
+#[test]
+#[ignore = "maps the audio VAE without reducing it (MINIMAX_H3_SNAPSHOT)"]
+fn a_phase_that_skips_the_reduction_fails_the_materialization_gate() {
+    let root = common::snapshot();
+    baseline();
+
+    reset_peak_memory();
+    let unreduced = force_with(&[root.join("audio_vae")], None, false);
+    let peak = get_peak_memory() as u64;
+    assert!(
+        !was_materialized(peak, unreduced.bytes),
+        "mapping a {:.2} GB component without reducing it still peaked at {:.2} GB, over half of \
+         it — so the materialization gate cannot come back false and every use of it above is a \
+         formality",
+        gb(unreduced.bytes),
+        gb(peak)
+    );
+    println!(
+        "unreduced: peak {:.2} GB against a {:.2} GB mapped component",
+        gb(peak),
+        gb(unreduced.bytes)
+    );
+
+    drop(unreduced);
+    mlx_gen::residency::drain_allocator_cache();
 }
 
 /// **The tripwire, at full component scale.** Conditioning → denoise → decode, each component

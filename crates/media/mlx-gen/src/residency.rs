@@ -63,7 +63,23 @@ fn drain_while_active_falls(mut clear: impl FnMut(), mut active: impl FnMut() ->
 }
 
 /// Return a shed component's buffers to the system allocator, retrying while MLX keeps handing
-/// them back. **The one drain every MLX component-release site calls** (sc-17151).
+/// them back. **The drain called by [`MlxResidencyRuntime`]'s `after_component_drop` and by both
+/// MiniMax-H3 render-path drain sites** — its `model::release` helper (which its eight phase
+/// boundaries all shed through) and the AdaLN eviction in `dit::adaln` (sc-17151).
+///
+/// # Scope, because the wider reading is false and was written here once
+///
+/// This is *not* "the one drain every MLX component-release site calls". Counted on this commit,
+/// **72 production `clear_cache()` call sites remain across 18 `mlx-gen` crates** — `mlx-gen-wan`
+/// (12), `mlx-gen-lens` (7), `mlx-gen-z-image` and `mlx-gen-ltx` (6 each), `mlx-gen-sdxl` and
+/// `mlx-gen-mage` (5 each), and so on down — plus `mlx-gen`'s own
+/// [`crate::request_scope`] `MlxScopeCleanup::Device`, which is a *shared* seam that still sheds
+/// through one sweep behind an eval barrier. Every one of them is a single sweep with the
+/// straggler exposure described below.
+///
+/// Widening the drain to them changes every other family's release behavior and belongs in its own
+/// reviewed change, not in this story. MiniMax-H3's `convert.rs` is deliberately excluded too: its
+/// two sweeps bound an offline shard-at-a-time conversion, not a render component handoff.
 ///
 /// # One [`mlx_rs::memory::clear_cache`] is not reliably enough
 ///
@@ -126,9 +142,23 @@ fn active_bytes() -> usize {
 /// The script is the shape a straggler produces: active falls on the first [`stub::FALLS`] sweeps
 /// of a release and then plateaus, so the loop must make `FALLS + 1` sweeps to observe the plateau.
 /// A single-sweep drain makes exactly one, which is what the mutation check turns on.
+///
+/// # It is process-global, so its tests must not run concurrently
+///
+/// `ACTIVE` and `SWEEPS_THIS_RELEASE` are not counters the tests merely read — they are what the
+/// retry loop's exit condition reads, so a second test entering [`begin_release`] mid-loop resets
+/// `ACTIVE` upward and changes how many sweeps the first one observes. That is a red rather than a
+/// false green, but a guard on the shared ladder seam that goes red at random gets muted, so every
+/// stub-backed test takes [`LOCK`] for its whole body. `cargo test` runs a binary's tests on
+/// several threads by default and nothing in this crate passes `--test-threads=1`.
 #[cfg(test)]
 mod stub {
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    /// Serializes every test that drives the stub. Poisoning is recovered from rather than
+    /// propagated: one panicking test must not turn the rest into confusing secondary failures.
+    pub static LOCK: Mutex<()> = Mutex::new(());
 
     /// Sweeps for which the scripted allocator keeps releasing before it plateaus.
     pub const FALLS: usize = 3;
@@ -178,8 +208,18 @@ mod tests {
     use super::*;
     use crate::{CancelFlag, Result};
 
-    fn reset_counters() {
+    /// Take the stub lock **and** zero the counters, in that order.
+    ///
+    /// The guard is returned rather than dropped here, so the caller holds it for the rest of the
+    /// test body. It must be bound to a NAME (`let _stub = …`); `let _ = …` drops it immediately and
+    /// restores the race this exists to close, which is why the `#[must_use]` below names that.
+    #[must_use = "the returned guard is what serializes the test; dropping it here reopens the race"]
+    fn reset_counters() -> std::sync::MutexGuard<'static, ()> {
+        let guard = stub::LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         stub::reset();
+        guard
     }
 
     /// Sweeps the scripted allocator makes the retry loop perform for one release point: it falls
@@ -195,7 +235,7 @@ mod tests {
     /// assertion that goes red on that shape.
     #[test]
     fn a_component_release_sweeps_until_active_stops_falling() {
-        reset_counters();
+        let _stub = reset_counters();
         let sweeps = drain_allocator_cache();
         assert_eq!(
             sweeps,
@@ -253,7 +293,7 @@ mod tests {
 
     #[test]
     fn staged_run_flushes_after_both_component_release_points() {
-        reset_counters();
+        let _stub = reset_counters();
         let residency = Residency::request_scoped(|_| Ok(2u8), |_, _| Ok(3u8));
         let output = residency
             .run_request_scoped(
@@ -277,7 +317,7 @@ mod tests {
 
     #[test]
     fn warm_to_staged_flushes_eviction_text_and_heavy() {
-        reset_counters();
+        let _stub = reset_counters();
         let residency = Residency::request_scoped(|_| Ok(2u8), |_, _| Ok(3u8));
         let run = |stage| -> Result<u8> {
             residency.run_request_scoped(
@@ -299,7 +339,7 @@ mod tests {
 
     #[test]
     fn staged_error_still_flushes_the_loaded_phase() {
-        reset_counters();
+        let _stub = reset_counters();
         let residency = Residency::<u8, u8>::request_scoped(|_| Ok(2), |_, _| Ok(3));
         let output: Result<()> = residency.run_request_scoped(
             true,

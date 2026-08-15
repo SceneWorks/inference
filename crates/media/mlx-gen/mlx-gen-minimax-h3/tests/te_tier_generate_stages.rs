@@ -38,16 +38,28 @@
 //! conditioning stage closed holding 50.32 GB instead of 0.00 — and **all 481 of the crate's
 //! non-ignored tests still passed**.
 //!
-//! The gates below are what fails on that. They are ratios of each stage's active-at-close against
-//! that stage's own peak, so they hold for a quantized tier as well as for the dense components,
-//! and both duration extremes are rendered because sc-17151's acceptance names both.
+//! The gates below are what fails on that. They are ratios of each stage's **active + cache** at
+//! close against that stage's own peak, so they hold for a quantized tier as well as for the dense
+//! components, and both duration extremes are rendered because sc-17151's acceptance names both.
 //! `tests/staged_residency.rs` gates the same property directly on the components, at full 66 GB
 //! scale and without a render.
+//!
+//! **Active alone would not have been enough, and this is the file where that mattered.** A drain
+//! turned into a no-op migrates a shed component from active into MLX's allocator cache: active
+//! reads ~0.00 GB at close and both gates below stay green while 66 GB is still held. That is the
+//! sc-17145 failure mode, it is the reason `drain_allocator_cache` exists, and this is the only arm
+//! of the story that drives the shipped `generate` — so the readings come from [`footprint`].
+//!
+//! Scope, because two of the four stages carry no handoff gate: only `conditioning` and `denoise`
+//! are gated. `dit-load + adaln-precompute` is exempt on purpose (its DiT is *supposed* to survive
+//! into `denoise`, so a 1/4 rule there would be inverted, and `tests/adaln_evict_real_weights.rs`
+//! is what gates the AdaLN eviction), and `decode` is the terminal stage with no following boundary.
+//! The comment beside the gate loop says the same thing where the code is.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use mlx_rs::memory::{get_active_memory, get_peak_memory, reset_peak_memory};
+use mlx_rs::memory::{get_active_memory, get_cache_memory, get_peak_memory, reset_peak_memory};
 
 use mlx_gen::gen_core::{
     CancelFlag, GenerationOutput, GenerationRequest, LoadPhase, LoadSpec, Progress, WeightsSource,
@@ -77,6 +89,18 @@ const FLOOR: usize = 1 << 30;
 /// component closes at ~1/1 of it.
 const HANDOFF_RATIO: usize = 4;
 
+/// Active **plus cached** device memory — what a stage's close is read against.
+///
+/// `get_active_memory` alone is the sc-17145 blindness, and this file is the arm where it mattered
+/// most: it is the one that drives the production `generate`. With `active` alone, making
+/// `release()`'s drain a no-op (or deleting the drain and keeping the `drop`) migrates the buffers
+/// from active into MLX's allocator cache, active-at-close still reads ~0.00 GB, and **both handoff
+/// gates below stay green** — the file would have named the failure mode in its own assertion string
+/// while using the counter that cannot see it. `get_cache_memory` is the other half.
+fn footprint() -> usize {
+    get_active_memory() + get_cache_memory()
+}
+
 fn env(key: &str) -> Option<PathBuf> {
     std::env::var(key)
         .ok()
@@ -88,15 +112,15 @@ fn gb(bytes: usize) -> f64 {
     bytes as f64 / 1e9
 }
 
-/// Close the stage named `open`, recording its peak, and open the next one.
+/// Close the stage named `open`, recording its peak and its [`footprint`], and open the next one.
 fn rotate(
     stages: &mut BTreeMap<usize, (&'static str, usize, usize)>,
     open: &mut (usize, &'static str),
     next: &'static str,
 ) {
     let peak = get_peak_memory();
-    let active = get_active_memory();
-    stages.insert(open.0, (open.1, peak, active));
+    let held = footprint();
+    stages.insert(open.0, (open.1, peak, held));
     *open = (open.0 + 1, next);
     reset_peak_memory();
 }
@@ -145,7 +169,7 @@ fn stage_the_render(frames: u32) {
         ..Default::default()
     };
 
-    // stage index → (name, peak, active-at-close)
+    // stage index → (name, peak, active+cache at close)
     let mut stages: BTreeMap<usize, (&'static str, usize, usize)> = BTreeMap::new();
     let mut open = (0usize, "pre-generate");
     let mut first_step_seen = false;
@@ -173,19 +197,20 @@ fn stage_the_render(frames: u32) {
     let out = generator
         .generate(&req, &mut on_progress)
         .expect("generate");
-    // Close the final stage.
-    stages.insert(open.0, (open.1, get_peak_memory(), get_active_memory()));
+    // Close the final stage — same two readings `rotate` records, or `decode` would be the one row
+    // of the table measured on a different counter from every other.
+    stages.insert(open.0, (open.1, get_peak_memory(), footprint()));
 
     let elapsed = started.elapsed().as_secs_f64();
     println!("── generate, per stage ────────────────────────────────────────");
     println!("  text encoder   {:?}", env("MINIMAX_H3_TE"));
     println!("  dit            {:?}", env("MINIMAX_H3_DIT"));
     println!("  {WIDTH}x{HEIGHT} / {frames} frames / {STEPS} steps  in {elapsed:.1}s");
-    println!("  {:<28} {:>10} {:>10}", "stage", "peak GB", "active GB");
+    println!("  {:<28} {:>10} {:>14}", "stage", "peak GB", "act+cache GB");
     let mut process_peak = 0usize;
     let mut conditioning = 0usize;
-    for (name, peak, active) in stages.values() {
-        println!("  {name:<28} {:>10.2} {:>10.2}", gb(*peak), gb(*active));
+    for (name, peak, held) in stages.values() {
+        println!("  {name:<28} {:>10.2} {:>14.2}", gb(*peak), gb(*held));
         process_peak = process_peak.max(*peak);
         if *name == "conditioning" {
             conditioning = *peak;
@@ -229,7 +254,7 @@ fn stage_the_render(frames: u32) {
         stages
             .values()
             .find(|(name, ..)| *name == want)
-            .map(|(_, peak, active)| (*peak, *active))
+            .map(|(_, peak, held)| (*peak, *held))
             .unwrap_or_else(|| panic!("no {want} stage"))
     };
     // Materialization guard, first: under lazy mmap a 66 GB map leaves peak at 33 KB, and every
@@ -247,24 +272,103 @@ fn stage_the_render(frames: u32) {
         );
     }
 
-    // **The handoff gates.** Each heavy stage closes at the boundary *after* its own component was
-    // released — `encode_prompt` forces the context, drops the 66.7 GB encoder and drains before
-    // `Progress::Loading(Renderer)`; `release((model, video_rows, audio_rows))` runs before
-    // `Progress::Decoding`. So each stage's active-at-close must be a small fraction of what it had
-    // resident. A stage that carried its component into the next one closes at roughly its own
-    // peak, which is the regression this whole file existed to *describe* and now fails on.
+    // **The handoff gates — on TWO of the four stages, deliberately.** Each of the two closes at the
+    // boundary *after* its own component was released: `encode_prompt` forces the context, drops the
+    // 66.7 GB encoder and drains before `Progress::Loading(Renderer)`;
+    // `release((model, video_rows, audio_rows))` runs before `Progress::Decoding`. So each one's
+    // active+cache at close must be a small fraction of what it had resident. A stage that carried
+    // its component into the next one closes at roughly its own peak, which is the regression this
+    // whole file existed to *describe* and now fails on.
+    //
+    // THE OTHER TWO ARE EXEMPT, and the exemption is principled rather than an oversight:
+    //
+    // * `dit-load + adaln-precompute` is *supposed* to survive into `denoise` — the DiT it maps is
+    //   the component the next stage runs. A 1/4 rule there would be inverted: it would fail on the
+    //   correct behaviour and pass on a build that dropped the DiT before using it. What that stage
+    //   is really gated on is the AdaLN eviction, separately and by name, in
+    //   `tests/adaln_evict_real_weights.rs` — this file only attributes its peak.
+    // * `decode` is the last stage and closes after `generate` returns, with no following boundary
+    //   for a handoff to be measured across. It carries **no residency gate at all here**; its
+    //   components are gated directly by `staged_residency.rs`'s decode phase.
     //
     // The bound is a ratio against the stage's own peak rather than an absolute size, so it holds
     // for a quantized tier as well as for the dense bf16 components.
     for (name, keeps) in [("conditioning", "text encoder"), ("denoise", "DiT")] {
-        let (peak, active) = stage(name);
+        let (peak, held) = stage(name);
         assert!(
-            active * HANDOFF_RATIO < peak,
-            "the {name} stage closed holding {:.2} GB against its own {:.2} GB peak — more than \
-             1/{HANDOFF_RATIO} of what it had resident survived the boundary, so the {keeps} was \
-             not released before the next phase loaded",
-            gb(active),
+            held * HANDOFF_RATIO < peak,
+            "the {name} stage closed holding {:.2} GB of active+cached memory against its own \
+             {:.2} GB peak — more than 1/{HANDOFF_RATIO} of what it had resident survived the \
+             boundary, so the {keeps} was not released before the next phase loaded",
+            gb(held),
             gb(peak)
         );
     }
+}
+
+// ── end of the measured region ────────────────────────────────────────────────────────────────
+//
+// Everything ABOVE this line is the measurement. The guard below scans exactly that prefix, so its
+// own body — which necessarily names both counters, in filters and in an error message — cannot
+// satisfy the property it is checking. Moving the guard above this marker makes it self-satisfying.
+
+/// The split point [`every_memory_reading_in_this_file_sums_active_and_cache`] scans up to.
+///
+/// Declared *after* the marker comment it names, so `split_once` finds the marker rather than this
+/// declaration. If it moved above, the scanned prefix would end here and cover nothing.
+const MEASURED_REGION_END: &str = "// ── end of the measured region ──";
+
+/// **The counter cannot silently revert to active-only.**
+///
+/// Every gate in this file needs a real snapshot, a DiT tier, Metal and a full render, so *nothing
+/// runnable in ordinary CI executes any of them*. That makes the one change deciding whether they
+/// can see a cache-resident leak at all — reading active + cache rather than active — a change no
+/// automated run would catch going away again. This is device-free and not `#[ignore]`d, so it runs
+/// on every PR.
+///
+/// It asserts a **shape**, and it is honest about which: every code line above the marker that
+/// reads `get_active_memory` also reads `get_cache_memory`. That is true of the `use` and of
+/// [`footprint`], and false the moment a reading goes back to active alone. Comment lines are
+/// excluded — the prose above legitimately names `get_active_memory` as the counter *not* to use,
+/// and counting it would make the guard track the docs rather than the code.
+///
+/// What it cannot do, stated because a source scan invites the wider reading: it does not show that
+/// the summed reading is correct, and it does not run the gates. Only an operator with the full
+/// snapshot can do either — see this file's header.
+#[test]
+fn every_memory_reading_in_this_file_sums_active_and_cache() {
+    let whole = include_str!("te_tier_generate_stages.rs");
+    let (measured, rest) = whole.split_once(MEASURED_REGION_END).expect(
+        "the end-of-measured-region marker is gone; this scan would cover the guard itself",
+    );
+    assert!(
+        !rest.trim().is_empty() && measured.len() < whole.len(),
+        "the marker is at the end of the file, so the guard's own body is inside the scanned \
+         region and the property below is self-satisfying"
+    );
+
+    let code = || {
+        measured
+            .lines()
+            .map(str::trim_start)
+            .filter(|line| !line.starts_with("//"))
+    };
+    let active = code().filter(|l| l.contains("get_active_memory")).count();
+    let paired = code()
+        .filter(|l| l.contains("get_active_memory") && l.contains("get_cache_memory"))
+        .count();
+    assert!(
+        active > 0,
+        "no code line above the marker reads get_active_memory; the readings moved somewhere this \
+         guard cannot see, and it is now asserting nothing"
+    );
+    assert_eq!(
+        active,
+        paired,
+        "{} of {active} code line(s) reading get_active_memory do not also read get_cache_memory. \
+         `get_peak_memory` and `get_active_memory` are BOTH active-only: a drain that stopped \
+         draining moves a shed component into MLX's allocator cache, where an active-only reading \
+         shows 0.00 GB and every handoff gate in this file stays green on a 66 GB leak (sc-17145)",
+        active - paired
+    );
 }
