@@ -2012,9 +2012,16 @@ mod tests {
     #[test]
     fn load_accepts_adapters_and_rejects_unwired_quant() {
         use candle_gen::gen_core::{AdapterKind, AdapterSpec};
-        let lora = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_adapters(vec![
-            AdapterSpec::new("/lora.safetensors".into(), 1.0, AdapterKind::Lora),
-        ]);
+        // Adapters are a wired surface, so this spec must reach a generator; the load path now
+        // admits the selected text encoder against `ENCODER_CONTRACT` first, so the accepted case
+        // needs a real fixture root. The rejected case below still fails on the unwired quant
+        // before any snapshot read, which is what that half of the test is for.
+        let fixture = tempfile::tempdir().unwrap();
+        let lora = valid_directory_spec(fixture.path()).with_adapters(vec![AdapterSpec::new(
+            "/lora.safetensors".into(),
+            1.0,
+            AdapterKind::Lora,
+        )]);
         assert!(load(&lora).is_ok());
         let quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q8);
         assert!(matches!(

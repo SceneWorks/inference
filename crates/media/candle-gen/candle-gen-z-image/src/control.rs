@@ -1684,8 +1684,18 @@ mod tests {
                 AdapterKind::Lokr,
             ),
         ];
+        // "Weight-free" no longer means "path-free": `control_pipeline` admits the bundled encoder
+        // against `ENCODER_CONTRACT` before it builds the base, so the snapshot needs the same
+        // `text_encoder` fixture the sibling construction tests use. The control overlay and the
+        // adapter files stay unwritten, which is what keeps the assertion weight-free.
+        let snapshot = tempfile::tempdir().unwrap();
+        gen_core_testkit::write_encoder_contract_fixture(
+            &snapshot.path().join("text_encoder"),
+            crate::ENCODER_CONTRACT,
+        )
+        .unwrap();
         let paths = ZImageControlPaths {
-            snapshot: PathBuf::from("snapshot"),
+            snapshot: snapshot.path().to_path_buf(),
             text_encoder: None,
             control: PathBuf::from("control.safetensors"),
             adapters: adapters.clone(),

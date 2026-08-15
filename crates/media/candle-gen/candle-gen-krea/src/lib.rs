@@ -1771,10 +1771,10 @@ pub fn load_turbo_edit(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> 
 /// canonical Krea target names as the snapshot route: diff-patches fold before assembly and
 /// LoRA/LoKr residuals install additively, with per-selected-file apply-or-reject.
 ///
-/// This routes through the equivalent File [`LoadSpec`] and [`build`] rather than assembling a
-/// bespoke resident generator, so the caller gets the FULL registered surface — including the
-/// pinned-file validation and the native `Sequential` block-streaming route that
-/// [`native_file_streamable`] admits — instead of being pinned to warm-`Resident`.
+/// This routes through the equivalent File [`LoadSpec`] and the crate-private `build` rather than
+/// assembling a bespoke resident generator, so the caller gets the FULL registered surface —
+/// including the pinned-file validation and the native `Sequential` block-streaming route that
+/// `native_file_streamable` admits — instead of being pinned to warm-`Resident`.
 pub fn load_from_native_dit_file(
     dit_file: impl AsRef<std::path::Path>,
     base_snapshot_dir: impl AsRef<std::path::Path>,

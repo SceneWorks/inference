@@ -665,15 +665,20 @@ mod tests {
     fn every_registered_memory_strategy_rejects_cross_route_decode_geometry() {
         let registry = super::provider_registry().unwrap();
         gen_core_testkit::memory_contract_surface_registry_conformance(&registry);
-        assert_eq!(registry.memory_strategy_registrations().len(), 47);
-        assert_eq!(registry.memory_contract_fixture_registrations().len(), 46);
+        assert_eq!(registry.memory_strategy_registrations().len(), 49);
+        assert_eq!(registry.memory_contract_fixture_registrations().len(), 48);
         let resident_only: Vec<_> = registry
             .resident_only_memory_contract_registrations()
             .map(|registration| registration.provider_id)
             .collect();
         assert_eq!(resident_only, ["flux2_dev_control"]);
         let surfaces = registry.memory_contract_surfaces().unwrap();
-        assert_eq!(surfaces.len(), 46 * 12);
+        // 46 providers witness the complete 3-tier x 2-policy x 2-shape MLX surface. The two video
+        // providers publish narrower, truthful inventories instead: LTX has no deferred/block-window
+        // loader, so it witnesses the eager half; TI2V-5B admits only a BF16 Resident/Eager load, so
+        // it witnesses one selector per tier. Spelling the sum out this way keeps a future provider's
+        // narrowing visible in the diff rather than folded into a single total.
+        assert_eq!(surfaces.len(), 46 * 12 + 6 + 3);
         assert!(surfaces.iter().all(|surface| !surface.composed));
         let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir("/nonexistent".into()))
             .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization);

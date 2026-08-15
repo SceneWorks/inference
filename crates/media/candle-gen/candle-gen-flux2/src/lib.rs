@@ -2233,10 +2233,17 @@ mod tests {
 
     #[test]
     fn prompt_enhancement_is_dev_only_and_validates_before_weights() {
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        // "Before weights" now means before the DiT/VAE are read, not before the filesystem is
+        // touched at all: the load path resolves the substitutable text encoder through the
+        // provider's `EncoderContract` first, so each variant needs its own contract fixture root.
+        // The bare nonexistent path this used to pass no longer reaches a generator.
+        let dev_fixture = tempfile::tempdir().unwrap();
+        let klein_fixture = tempfile::tempdir().unwrap();
+        let dev_spec = valid_directory_spec(dev_fixture.path(), Flux2Variant::Dev, None);
+        let klein_spec = valid_directory_spec(klein_fixture.path(), Flux2Variant::Klein9b, None);
         let registry = crate::provider_registry().unwrap();
-        let dev = registry.load(FLUX2_DEV_ID, &spec).unwrap();
-        let klein = registry.load(FLUX2_KLEIN_9B_ID, &spec).unwrap();
+        let dev = registry.load(FLUX2_DEV_ID, &dev_spec).unwrap();
+        let klein = registry.load(FLUX2_KLEIN_9B_ID, &klein_spec).unwrap();
         let enhanced = GenerationRequest {
             prompt: "a portrait".into(),
             enhance_prompt: true,
@@ -2277,9 +2284,17 @@ mod tests {
     #[test]
     fn load_rejects_unwired_surfaces() {
         use candle_gen::gen_core::{AdapterKind, AdapterSpec, IdentityWeights};
-        let lora = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_adapters(vec![
-            AdapterSpec::new("/lora.safetensors".into(), 1.0, AdapterKind::Lora),
-        ]);
+        // Adapters are a wired surface, so this spec must reach a generator — and reaching one now
+        // means clearing the eager encoder-contract admission, hence a real fixture root rather
+        // than a bare path. The rejecting specs below still fail on the unwired field first, so
+        // they keep proving rejection precedes any snapshot read.
+        let lora_fixture = tempfile::tempdir().unwrap();
+        let lora = valid_directory_spec(lora_fixture.path(), Flux2Variant::Klein9b, None)
+            .with_adapters(vec![AdapterSpec::new(
+                "/lora.safetensors".into(),
+                1.0,
+                AdapterKind::Lora,
+            )]);
         assert!(load_klein(&lora).is_ok());
         let mut identity = LoadSpec::new(WeightsSource::Dir("/snap".into()));
         identity.identity = Some(IdentityWeights::default());

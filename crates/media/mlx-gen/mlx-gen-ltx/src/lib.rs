@@ -128,6 +128,7 @@ pub fn register_providers(
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
             provider_id: MODEL_ID,
             contract: memory_strategy::weights_free_memory_strategy_contract,
+            surface_specs: memory_strategy::memory_contract_surface_specs,
         })
         .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR)
         .register_trainer(training::TRAINER_REGISTRATION)

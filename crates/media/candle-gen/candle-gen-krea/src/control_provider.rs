@@ -783,9 +783,14 @@ mod tests {
         );
         assert!(control_dit_source(Some(convrot), Some(native)).is_err());
 
+        // Lazy means the DiT, VAE, and overlay stay unread — the base snapshot's text encoder is
+        // admitted against `ENCODER_CONTRACT` at construction, so the base needs the same fixture
+        // every other construction test in this module uses. The overlay and adapter paths stay
+        // nonexistent, which is what keeps the laziness claim honest.
+        let (_base, base_paths) = validation_complete_paths(OffloadPolicy::Resident);
         let model = load_control_from_native_dit_file(
             native,
-            "/nonexistent/krea-base",
+            &base_paths.root,
             "/nonexistent/control.safetensors",
             &[AdapterSpec::new(
                 "/nonexistent/user.safetensors".into(),

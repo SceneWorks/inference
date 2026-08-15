@@ -887,6 +887,10 @@ mod tests {
     #[test]
     fn generator_capability_snapshot_tracks_descriptor_mutations() {
         let descriptor = gen_core::ModelDescriptor {
+            // Synthetic image parity probe: it advertises no substitutable text encoder and no
+            // decoder boundary, which is the fail-closed default both fields document.
+            encoder_contract: None,
+            denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
             id: "parity-probe",

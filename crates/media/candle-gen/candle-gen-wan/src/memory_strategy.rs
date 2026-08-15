@@ -950,14 +950,27 @@ pub(crate) const MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::M
     safety_check: registered_safety_check,
 };
 
+/// TI2V-5B advertises `supported_quants: [Q4, Q8]` plus the dense bf16 tier under both offload
+/// policies, so it witnesses the common Candle registry tiers — but only the eager half of the
+/// materialization axis. The provider has no deferred block loader: `validate_contract_route`
+/// rejects `DeferredMaterialization` on the production route and on the weights-free route alike,
+/// so publishing the deferred selectors would advertise a load surface no contract can be built
+/// for. The witness set is deliberately the provider's own finite inventory, not the shared
+/// default.
+#[cfg(any(feature = "cuda", test))]
+fn memory_contract_surface_specs() -> Vec<gen_core::MemoryContractSurfaceSpec> {
+    gen_core::candle_memory_contract_surface_specs()
+        .into_iter()
+        .filter(|surface| surface.selector.load_shape == LoadShape::EagerMaterialization)
+        .collect()
+}
+
 #[cfg(any(feature = "cuda", test))]
 pub(crate) const MEMORY_FIXTURE: gen_core::MemoryContractFixtureRegistration =
     gen_core::MemoryContractFixtureRegistration {
         provider_id: MODEL_ID,
         contract: weights_free_memory_strategy_contract,
-        // TI2V-5B advertises `supported_quants: [Q4, Q8]` plus the dense bf16 tier — exactly the
-        // common Candle registry surface every other candle provider witnesses.
-        surface_specs: gen_core::candle_memory_contract_surface_specs,
+        surface_specs: memory_contract_surface_specs,
     };
 
 #[cfg(any(feature = "cuda", test))]
@@ -1413,6 +1426,41 @@ mod tests {
         let loaded = crate::build_generator_with_source(&spec, source.clone()).unwrap();
         assert_eq!(loaded.memory_strategy_contract(), None);
         assert_eq!(loaded.dit_source, source);
+    }
+
+    /// The registry conformance walk constructs a weights-free contract for **every** selector the
+    /// fixture publishes and fails the whole catalog when one errors. That walk only runs in the
+    /// CUDA catalog lane, so this asserts the same property here, where it is reachable on CPU: the
+    /// published witness set is exactly the set this provider can build, and the deferred half the
+    /// shared Candle default would add is genuinely absent rather than silently dropped.
+    #[test]
+    fn every_published_contract_surface_builds_and_no_deferred_surface_is_published() {
+        // Walk the registration itself, not the local helper: the registry reads this field, and a
+        // registration pointed back at the shared Candle default is exactly the regression.
+        let surfaces = (MEMORY_FIXTURE.surface_specs)();
+        assert_eq!(
+            surfaces.len(),
+            gen_core::candle_memory_contract_surface_specs().len() / 2,
+            "the witness set is the eager half of the shared Candle surface"
+        );
+        for surface in &surfaces {
+            assert_eq!(
+                surface.selector.load_shape,
+                LoadShape::EagerMaterialization,
+                "{} has no deferred block loader",
+                surface.selector.id()
+            );
+            (MEMORY_FIXTURE.contract)(&surface.spec).unwrap_or_else(|error| {
+                panic!("surface {} must build: {error}", surface.selector.id())
+            });
+        }
+        assert!(
+            gen_core::candle_memory_contract_surface_specs()
+                .into_iter()
+                .filter(|surface| surface.selector.load_shape == LoadShape::DeferredMaterialization)
+                .all(|surface| weights_free_memory_strategy_contract(&surface.spec).is_err()),
+            "a deferred surface that now builds must be published, not filtered out"
+        );
     }
 
     #[test]
