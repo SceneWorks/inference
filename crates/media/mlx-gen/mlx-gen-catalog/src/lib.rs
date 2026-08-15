@@ -449,6 +449,55 @@ mod tests {
     }
 
     #[test]
+    fn krea_raw_publishes_exact_prepacked_sequential_deferred_surfaces() {
+        use mlx_gen::gen_core::{
+            LoadShape, MemoryContractSurfaceTier, MemoryStrategy, MemoryStrategySupport,
+            OffloadPolicy,
+        };
+
+        let registry = super::provider_registry().unwrap();
+        let surfaces = registry.memory_contract_surfaces().unwrap();
+        let raw: Vec<_> = surfaces
+            .iter()
+            .filter(|surface| surface.contract.provider_id == "krea_2_raw")
+            .collect();
+        assert_eq!(raw.len(), 12);
+
+        let mut implemented = 0;
+        for surface in raw {
+            let expected = matches!(
+                surface.resolved_artifact_tier(),
+                MemoryContractSurfaceTier::Bf16
+                    | MemoryContractSurfaceTier::Q4
+                    | MemoryContractSurfaceTier::Q8
+            ) && surface.selector.offload_policy == OffloadPolicy::Sequential
+                && surface.selector.load_shape == LoadShape::DeferredMaterialization;
+            assert_eq!(
+                surface
+                    .contract
+                    .capability(MemoryStrategy::BoundedTransformerResidency)
+                    .expect("complete Krea ladder")
+                    .support,
+                if expected {
+                    MemoryStrategySupport::Implemented
+                } else {
+                    MemoryStrategySupport::Missing
+                },
+                "{}",
+                surface.selector.id()
+            );
+            implemented += usize::from(expected);
+            assert!(!surface.composed);
+            assert_eq!(surface.contract.asset_facts, Default::default());
+            assert_eq!(
+                surface.contract.calibration.as_ref().unwrap().fingerprint,
+                mlx_gen_krea::block_memory_strategy::MEMORY_CALIBRATION_FINGERPRINT
+            );
+        }
+        assert_eq!(implemented, 3);
+    }
+
+    #[test]
     fn cfg_capability_matrix_matches_the_registered_mlx_render_paths() {
         let registry = super::provider_registry().unwrap();
         let descriptor = |id: &str| {
