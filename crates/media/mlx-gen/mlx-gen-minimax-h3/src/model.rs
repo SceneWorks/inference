@@ -773,9 +773,16 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 
 /// Release a component's device memory for real: drop the Rust handle, then drain MLX's allocator
 /// cache so the buffers go back to the system rather than migrating active → cache.
+///
+/// The drain is the **shared retried** one ([`mlx_gen::residency::drain_allocator_cache`]), not a
+/// bare `clear_cache()`. sc-17145 measured a single sweep leaving a straggler counted as active in
+/// roughly one run in five under load, because the Metal command buffer that used the weights had
+/// not retired by the time `eval` returned; every phase boundary in [`MiniMaxH3::generate_impl`]
+/// and [`MiniMaxH3::generate_ref2va`] hands 10–67 GB back through this function, so the straggler
+/// is a whole component's worth.
 fn release<T>(component: T) {
     drop(component);
-    mlx_rs::memory::clear_cache();
+    mlx_gen::residency::drain_allocator_cache();
 }
 
 impl MiniMaxH3 {
