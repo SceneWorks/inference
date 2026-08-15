@@ -785,6 +785,70 @@ mod tests {
         assert_trained_lora_inference_roundtrip(Device::Cpu, "cpu");
     }
 
+    /// A valid Eros/distill adapter must not hide a second selected adapter that contributes no LTX
+    /// projection residuals. Before the per-spec accounting in `install_ltx_adapters`, the valid
+    /// member made the aggregate `report.applied` nonzero and this mixed stack was silently accepted.
+    #[test]
+    fn mixed_valid_and_invalid_adapter_stack_rejects_zero_apply_member() {
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        let mut inference = AvDiT::new(
+            VarBuilder::from_tensors(weights(&cfg, &dev), DType::F32, &dev),
+            &cfg,
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let valid_path = dir.path().join("eros-distill.safetensors");
+        let invalid_path = dir.path().join("selected-but-unrelated.safetensors");
+        candle_gen::candle_core::safetensors::save(
+            &HashMap::from([
+                (
+                    "transformer_blocks.0.attn1.to_q.lora_A.weight".to_owned(),
+                    Tensor::ones((1, cfg.video.inner_dim()), DType::F32, &dev).unwrap(),
+                ),
+                (
+                    "transformer_blocks.0.attn1.to_q.lora_B.weight".to_owned(),
+                    Tensor::ones((cfg.video.inner_dim(), 1), DType::F32, &dev).unwrap(),
+                ),
+            ]),
+            &valid_path,
+        )
+        .unwrap();
+        candle_gen::candle_core::safetensors::save(
+            &HashMap::from([(
+                "unrelated_model.embedding.weight".to_owned(),
+                Tensor::ones((2, 2), DType::F32, &dev).unwrap(),
+            )]),
+            &invalid_path,
+        )
+        .unwrap();
+
+        let specs = [
+            candle_gen::gen_core::AdapterSpec::new(
+                valid_path,
+                1.0,
+                candle_gen::gen_core::AdapterKind::Lora,
+            ),
+            candle_gen::gen_core::AdapterSpec::new(
+                invalid_path.clone(),
+                1.0,
+                candle_gen::gen_core::AdapterKind::Lora,
+            ),
+        ];
+        let error = crate::adapters::install_ltx_adapters(&mut inference, &specs)
+            .expect_err("every selected adapter must apply at least one projection")
+            .to_string();
+        assert!(error.contains("selected adapter #2"), "{error}");
+        assert!(
+            error.contains(invalid_path.file_name().unwrap().to_str().unwrap()),
+            "{error}"
+        );
+        assert!(
+            error.contains("applied zero projection residuals"),
+            "{error}"
+        );
+    }
+
     /// CUDA execution gate for the actual train→save→inference-load path. Ignored by default because
     /// feature-enabled compile runners need not have a GPU; run explicitly on a CUDA host.
     #[cfg(feature = "cuda")]

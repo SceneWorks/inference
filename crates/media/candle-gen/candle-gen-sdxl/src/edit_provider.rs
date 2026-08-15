@@ -29,7 +29,7 @@ use std::path::PathBuf;
 use candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::imageops::{resize_lanczos_u8, resize_nearest_u8};
 use candle_gen::gen_core::runtime::CancelFlag;
-use candle_gen::gen_core::{Image, PreviewSink, Progress, WeightsSource};
+use candle_gen::gen_core::{AdapterSpec, Image, PreviewSink, Progress, WeightsSource};
 // Shared ancestral-step RNG salt (`seed + STEP_RNG_SALT`) — one home in `candle-gen` (sc-9043 / F-059).
 // `LatentDecoder` is the decode seam the optional PiD student implements (epic 7840, sc-8044).
 use candle_gen::gen_core::PidWeights;
@@ -41,7 +41,7 @@ use rand::SeedableRng;
 
 use crate::conditioning::SdxlConditioner;
 use crate::denoise::{decode_image, text_time_ids, SPATIAL_SCALE};
-use crate::loaders::{load_instantid_unet, load_sdxl_vae, load_sdxl_vae_encoder};
+use crate::loaders::{load_instantid_unet_with_adapters, load_sdxl_vae, load_sdxl_vae_encoder};
 use crate::sampler::EulerAncestralSampler;
 use crate::unet::{UNet2DConditionModel, VaeMomentsEncoder};
 use crate::{AutoEncoderKL, PID_BACKBONE};
@@ -89,6 +89,10 @@ pub struct SdxlEditPaths {
     pub tokenizer_clip_bigg: WeightsSource,
     /// The fp16-stable VAE component (`vae_fp16_fix`) — the `.safetensors` file or its dir.
     pub vae_fp16_fix: WeightsSource,
+    /// User-selected SDXL LoRA/LoKr stack. The edit provider uses the same packed/dense additive
+    /// installer as the registered txt2img route, so a non-empty stack is either applied to the
+    /// UNet or rejected when no target matches.
+    pub adapters: Vec<AdapterSpec>,
 }
 
 /// One SDXL edit request.
@@ -170,7 +174,7 @@ impl SdxlEdit {
             &paths.tokenizer_clip_l,
             &paths.tokenizer_clip_bigg,
         )?;
-        let unet = load_instantid_unet(root, &device, DTYPE)?;
+        let unet = load_instantid_unet_with_adapters(root, &device, DTYPE, &paths.adapters)?;
         let vae = load_sdxl_vae(&paths.vae_fp16_fix, &device, DTYPE)?;
         let vae_encoder = load_sdxl_vae_encoder(&paths.vae_fp16_fix, &device, DTYPE)?;
         Ok(Self {
@@ -489,6 +493,7 @@ mod tests {
                 "/nonexistent/clip_bigg/tokenizer.json".into(),
             ),
             vae_fp16_fix: WeightsSource::File("/nonexistent/vae.safetensors".into()),
+            adapters: Vec::new(),
         };
         let err = SdxlEdit::load(&paths)
             .err()

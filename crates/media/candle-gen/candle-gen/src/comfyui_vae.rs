@@ -69,6 +69,163 @@ pub fn remap_vae_wan_to_diffusers(src: HashMap<String, Tensor>) -> Result<HashMa
     Ok(out)
 }
 
+/// Remap the exact 194-tensor native WAN-VAE shipped in the shared MLX SCAIL tier and transpose its
+/// convolution kernels from MLX layout to Candle layout.
+///
+/// Unlike [`remap_vae_wan_to_diffusers`], this entry point is deliberately fail-closed: the shared
+/// package is a product-owned, revision-pinned artifact, so foreign keys, missing/extra tensors,
+/// duplicate projections, or unexpected ranks/kernel shapes are release drift. MLX stores Conv3d
+/// kernels as `[O,kD,kH,kW,I]` and Conv2d kernels as `[O,kH,kW,I]`; Candle consumes
+/// `[O,I,kD,kH,kW]` and `[O,I,kH,kW]` respectively. Biases and channel-norm gammas are already in
+/// the layout Candle expects.
+pub fn remap_vae_wan_mlx_to_diffusers(
+    src: HashMap<String, Tensor>,
+) -> Result<HashMap<String, Tensor>> {
+    const EXPECTED_TENSORS: usize = 194;
+    if src.len() != EXPECTED_TENSORS {
+        return Err(CandleError::Msg(format!(
+            "shared MLX WAN-VAE: expected exactly {EXPECTED_TENSORS} tensors, got {}",
+            src.len()
+        )));
+    }
+
+    let mut out = HashMap::with_capacity(src.len());
+    let mut weights = 0usize;
+    let mut biases = 0usize;
+    let mut gammas = 0usize;
+    for (native_key, tensor) in src {
+        let mapped_key = shared_mlx_vae_key(&native_key)?;
+        let tensor = convert_shared_mlx_vae_tensor(&native_key, &mapped_key, tensor)?;
+        match native_key.rsplit_once('.').map(|(_, leaf)| leaf) {
+            Some("weight") => weights += 1,
+            Some("bias") => biases += 1,
+            Some("gamma") => gammas += 1,
+            _ => {
+                return Err(CandleError::Msg(format!(
+                    "shared MLX WAN-VAE: unexpected tensor leaf {native_key:?}"
+                )))
+            }
+        }
+        if out.insert(mapped_key.clone(), tensor).is_some() {
+            return Err(CandleError::Msg(format!(
+                "shared MLX WAN-VAE: duplicate mapped tensor {mapped_key:?}"
+            )));
+        }
+    }
+    if (weights, biases, gammas) != (71, 71, 52) {
+        return Err(CandleError::Msg(format!(
+            "shared MLX WAN-VAE: expected tensor classes weights=71,biases=71,gammas=52; got \
+             weights={weights},biases={biases},gammas={gammas}"
+        )));
+    }
+
+    validate_shared_mlx_vae_pairs(&out)?;
+    Ok(out)
+}
+
+fn shared_mlx_vae_key(native_key: &str) -> Result<String> {
+    remap_vae_key(native_key)?.ok_or_else(|| {
+        CandleError::Msg(format!(
+            "shared MLX WAN-VAE: foreign/unrecognized tensor {native_key:?}"
+        ))
+    })
+}
+
+/// Every convolution in the pinned architecture has a bias. Validate the output-channel axis after
+/// conversion so a same-rank but wrong-axis artifact cannot slip through to device load.
+fn validate_shared_mlx_vae_pairs(out: &HashMap<String, Tensor>) -> Result<()> {
+    for (key, tensor) in out {
+        let Some(prefix) = key.strip_suffix(".weight") else {
+            continue;
+        };
+        let bias_key = format!("{prefix}.bias");
+        let bias = out.get(&bias_key).ok_or_else(|| {
+            CandleError::Msg(format!(
+                "shared MLX WAN-VAE: {key:?} has no paired {bias_key:?}"
+            ))
+        })?;
+        if bias.dims() != [tensor.dim(0)?] {
+            return Err(CandleError::Msg(format!(
+                "shared MLX WAN-VAE: {bias_key:?} shape {:?} does not match {key:?} output {}",
+                bias.dims(),
+                tensor.dim(0)?
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn convert_shared_mlx_vae_tensor(
+    native_key: &str,
+    mapped_key: &str,
+    tensor: Tensor,
+) -> Result<Tensor> {
+    let dims = tensor.dims();
+    if native_key.ends_with(".bias") {
+        if dims.len() != 1 || dims[0] == 0 {
+            return Err(CandleError::Msg(format!(
+                "shared MLX WAN-VAE: bias {native_key:?} must be non-empty rank 1, got {dims:?}"
+            )));
+        }
+        return Ok(tensor);
+    }
+    if native_key.ends_with(".gamma") {
+        let expected_rank = if mapped_key.contains(".attentions.0.norm.gamma") {
+            3
+        } else {
+            4
+        };
+        if dims.len() != expected_rank || dims[0] == 0 || dims[1..].iter().any(|&dim| dim != 1) {
+            return Err(CandleError::Msg(format!(
+                "shared MLX WAN-VAE: norm {native_key:?} must be [C{}], got {dims:?}",
+                ",1".repeat(expected_rank - 1)
+            )));
+        }
+        return Ok(tensor);
+    }
+    if !native_key.ends_with(".weight") {
+        return Err(CandleError::Msg(format!(
+            "shared MLX WAN-VAE: unexpected tensor leaf {native_key:?}"
+        )));
+    }
+
+    let is_conv2d = mapped_key.contains(".resample.1.weight")
+        || mapped_key.ends_with(".to_qkv.weight")
+        || mapped_key.ends_with(".proj.weight");
+    if is_conv2d {
+        let expected_kernel = if mapped_key.contains(".resample.1.weight") {
+            [3, 3]
+        } else {
+            [1, 1]
+        };
+        if dims.len() != 4 || dims[0] == 0 || dims[3] == 0 || dims[1..3] != expected_kernel {
+            return Err(CandleError::Msg(format!(
+                "shared MLX WAN-VAE: Conv2d {native_key:?} must use MLX [O,{},{},I], got {dims:?}",
+                expected_kernel[0], expected_kernel[1]
+            )));
+        }
+        return Ok(tensor.permute((0, 3, 1, 2))?.contiguous()?);
+    }
+
+    let expected_kernel = if mapped_key.contains(".time_conv.weight") {
+        [3, 1, 1]
+    } else if mapped_key == "quant_conv.weight"
+        || mapped_key == "post_quant_conv.weight"
+        || mapped_key.ends_with(".conv_shortcut.weight")
+    {
+        [1, 1, 1]
+    } else {
+        [3, 3, 3]
+    };
+    if dims.len() != 5 || dims[0] == 0 || dims[4] == 0 || dims[1..4] != expected_kernel {
+        return Err(CandleError::Msg(format!(
+            "shared MLX WAN-VAE: Conv3d {native_key:?} must use MLX [O,{},{},{},I], got {dims:?}",
+            expected_kernel[0], expected_kernel[1], expected_kernel[2]
+        )));
+    }
+    Ok(tensor.permute((0, 4, 1, 2, 3))?.contiguous()?)
+}
+
 /// Map one native WAN-VAE key to its diffusers spelling, or `None` when the key is not a recognized
 /// native top-level (`conv1`/`conv2`/`encoder.`/`decoder.`). A key *under* `{encoder,decoder}.` whose
 /// sub-shape is unrecognized is an `Err` (structural drift), not a silent pass-through.
@@ -355,5 +512,78 @@ mod tests {
         assert!(remap_vae_key("decoder.middle.0.residual.9.weight").is_err());
         assert!(remap_vae_key("decoder.upsamples.0.mystery.weight").is_err());
         assert!(remap_vae_key("encoder.bogus.0.weight").is_err());
+    }
+
+    #[test]
+    fn shared_mlx_conv3d_transpose_preserves_values() {
+        let values: Vec<f32> = (0..216).map(|v| v as f32).collect();
+        let native = Tensor::from_vec(values, (2, 3, 3, 3, 4), &Device::Cpu).unwrap();
+        let candle = convert_shared_mlx_vae_tensor(
+            "decoder.middle.0.residual.2.weight",
+            "decoder.mid_block.resnets.0.conv1.weight",
+            native,
+        )
+        .unwrap();
+        assert_eq!(candle.dims(), &[2, 4, 3, 3, 3]);
+        let flat = candle.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        // Candle [o=1,i=2,d=0,h=1,w=2] comes from MLX [o=1,d=0,h=1,w=2,i=2].
+        let candle_idx = 167; // flatten [o=1,i=2,d=0,h=1,w=2] in [2,4,3,3,3].
+        let mlx_idx = 130; // flatten [o=1,d=0,h=1,w=2,i=2] in [2,3,3,3,4].
+        assert_eq!(flat[candle_idx], mlx_idx as f32);
+    }
+
+    #[test]
+    fn shared_mlx_conv2d_transpose_preserves_values() {
+        let values: Vec<f32> = (0..72).map(|v| v as f32).collect();
+        let native = Tensor::from_vec(values, (2, 3, 3, 4), &Device::Cpu).unwrap();
+        let candle = convert_shared_mlx_vae_tensor(
+            "decoder.upsamples.3.resample.1.weight",
+            "decoder.up_blocks.0.upsamplers.0.resample.1.weight",
+            native,
+        )
+        .unwrap();
+        assert_eq!(candle.dims(), &[2, 4, 3, 3]);
+        let flat = candle.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        // Candle [o=1,i=2,h=1,w=0] comes from MLX [o=1,h=1,w=0,i=2].
+        let candle_idx = 57; // flatten [o=1,i=2,h=1,w=0] in [2,4,3,3].
+        let mlx_idx = 50; // flatten [o=1,h=1,w=0,i=2] in [2,3,3,4].
+        assert_eq!(flat[candle_idx], mlx_idx as f32);
+    }
+
+    #[test]
+    fn shared_mlx_layout_rejects_shape_and_artifact_drift() {
+        let bad_kernel = Tensor::zeros((16, 1, 3, 1, 16), DType::F32, &Device::Cpu).unwrap();
+        assert!(convert_shared_mlx_vae_tensor(
+            "conv2.weight",
+            "post_quant_conv.weight",
+            bad_kernel,
+        )
+        .is_err());
+
+        let bad_rank = Tensor::zeros((16, 1, 1, 16), DType::F32, &Device::Cpu).unwrap();
+        assert!(
+            convert_shared_mlx_vae_tensor("conv2.weight", "post_quant_conv.weight", bad_rank,)
+                .is_err()
+        );
+
+        let mut truncated = HashMap::new();
+        truncated.insert(
+            "conv2.bias".to_owned(),
+            Tensor::zeros(16, DType::F32, &Device::Cpu).unwrap(),
+        );
+        assert!(remap_vae_wan_mlx_to_diffusers(truncated).is_err());
+
+        assert!(shared_mlx_vae_key("foreign.weight").is_err());
+
+        let mut mismatched_pair = HashMap::new();
+        mismatched_pair.insert(
+            "decoder.conv_in.weight".to_owned(),
+            Tensor::zeros((2, 4, 3, 3, 3), DType::F32, &Device::Cpu).unwrap(),
+        );
+        mismatched_pair.insert(
+            "decoder.conv_in.bias".to_owned(),
+            Tensor::zeros(3, DType::F32, &Device::Cpu).unwrap(),
+        );
+        assert!(validate_shared_mlx_vae_pairs(&mismatched_pair).is_err());
     }
 }

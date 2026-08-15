@@ -30,12 +30,13 @@ use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::{
     GenerationMemory, Image, MemoryProviderContract, MemoryRunContext, PidWeights, PreviewSink,
-    Progress, Quant,
+    Progress, PromptEnhancementSink, Quant,
 };
 // `LatentDecoder` brings the `PidDecoder::decode` trait method into scope (sc-8044).
 use candle_gen::{CandleError, LatentDecoder, Result};
 use candle_gen_pid::{PidDecoder, PidEngine};
 
+use crate::caption_upsample::CaptionUpsampler;
 use crate::config::{Flux2Variant, DEFAULT_GUIDANCE, DEFAULT_STEPS, SIZE_MULTIPLE};
 use crate::text_encoder::Flux2PromptEncoder;
 use crate::transformer::Flux2Transformer;
@@ -49,6 +50,7 @@ use crate::{pipeline, to_image, Pipeline, PID_BACKBONE};
 pub struct Flux2EditPaths {
     /// FLUX.2 diffusers snapshot dir (klein or dev).
     pub root: PathBuf,
+    pub adapters: Vec<candle_gen::gen_core::AdapterSpec>,
 }
 
 /// One FLUX.2-klein edit request.
@@ -63,6 +65,10 @@ pub struct Flux2EditRequest {
     /// Guidance scale. 1.0 (klein default) = a single CFG-free forward; > 1.0 adds a negative pass.
     pub guidance: f32,
     pub seed: u64,
+    pub enhance_prompt: bool,
+    pub enhance_max_tokens: Option<u32>,
+    pub enhance_temperature: Option<f32>,
+    pub prompt_enhancement: PromptEnhancementSink,
     /// Opt into the PiD super-resolving decoder (epic 7840, sc-8044): when `true` **and** the model was
     /// loaded with [`with_pid`](Flux2Edit::with_pid), the final latent is decoded by the `flux2` PiD
     /// student (4× SR → 2K/4K) instead of the native FLUX.2 VAE. `false` (default) keeps the VAE decode.
@@ -90,6 +96,10 @@ impl Default for Flux2EditRequest {
             steps: DEFAULT_STEPS as usize,
             guidance: DEFAULT_GUIDANCE,
             seed: 0,
+            enhance_prompt: false,
+            enhance_max_tokens: None,
+            enhance_temperature: None,
+            prompt_enhancement: PromptEnhancementSink::default(),
             use_pid: false,
             preview: PreviewSink::default(),
             cancel: CancelFlag::default(),
@@ -105,6 +115,7 @@ pub struct Flux2Edit {
     pipe: Pipeline,
     variant: Flux2Variant,
     te: Option<Flux2PromptEncoder>,
+    upsampler: Option<CaptionUpsampler>,
     /// Prompt tokenizer, loaded+parsed **once** at load and reused across encodes (sc-8991 / F-011)
     /// instead of re-parsing `tokenizer.json` per prompt/branch.
     tokenizer: candle_gen::gen_core::tokenizer::TextTokenizer,
@@ -251,23 +262,32 @@ impl Flux2Edit {
         let device = candle_gen::default_device()?;
         // PiD (super-resolving decode) is wired only through the txt2img render path (epic 7840 /
         // sc-7853); the edit provider passes `None`.
-        let pipe = Pipeline::load(variant, loaded_quant, &paths.root, &device, None);
+        let pipe = Pipeline::load(
+            variant,
+            loaded_quant,
+            &paths.root,
+            &device,
+            None,
+            paths.adapters.clone(),
+        );
         // Packed MLX tier → build directly on the GPU from the packed parts (sc-9087, no ~105 GB dense
         // CPU staging); dense tier → the legacy CPU-stage → quantize-onto-GPU path. Shared TE+DiT loader
         // with txt2img / control (F-024, sc-9004). The VAE *with encoder* (the reference encode) is the
         // per-site addition.
-        let (te, transformer, vae) = if memory.stage_residency {
-            (None, None, None)
+        let (te, upsampler, transformer, vae) = if memory.stage_residency {
+            (None, None, None, None)
         } else {
             let (te, transformer) = pipe.load_te_and_dit()?;
+            let upsampler = pipe.load_caption_upsampler(true)?;
             let vae = Flux2Vae::new_with_encoder(pipe.component_vb("vae")?)?;
-            (Some(te), Some(transformer), Some(vae))
+            (Some(te), upsampler, Some(transformer), Some(vae))
         };
         let tokenizer = pipe.build_tokenizer()?;
         Ok(Self {
             pipe,
             variant,
             te,
+            upsampler,
             tokenizer,
             transformer,
             vae,
@@ -380,7 +400,7 @@ impl Flux2Edit {
                 "flux2 edit: at least one reference image is required".into(),
             ));
         }
-        validate_request(req)?;
+        validate_request(req, self.variant)?;
 
         if self.memory.stage_residency && req.use_pid {
             return Err(CandleError::Msg(
@@ -397,8 +417,28 @@ impl Flux2Edit {
         let cfg_on = !embedded_guidance && guidance > 1.0;
 
         // Prompt embeds are seed-independent: encode once. Negative only under klein CFG.
-        let encode_prompt = |te: &Flux2PromptEncoder| -> Result<(Tensor, Option<Tensor>)> {
-            let prompt = self.pipe.encode(te, &self.tokenizer, &req.prompt)?;
+        let encode_prompt = |te: &Flux2PromptEncoder,
+                             upsampler: Option<&CaptionUpsampler>|
+         -> Result<(Tensor, Option<Tensor>)> {
+            let enhancement_request = candle_gen::gen_core::GenerationRequest {
+                prompt: req.prompt.clone(),
+                seed: Some(req.seed),
+                enhance_prompt: req.enhance_prompt,
+                enhance_max_tokens: req.enhance_max_tokens,
+                enhance_temperature: req.enhance_temperature,
+                prompt_enhancement: req.prompt_enhancement.clone(),
+                cancel: req.cancel.clone(),
+                ..Default::default()
+            };
+            let effective = self.pipe.effective_prompt(
+                te,
+                &self.tokenizer,
+                upsampler,
+                &enhancement_request,
+                references,
+            )?;
+            candle_gen::check_cancel(&req.cancel)?;
+            let prompt = self.pipe.encode(te, &self.tokenizer, &effective)?;
             let negative = if cfg_on {
                 let neg = if req.negative.trim().is_empty() {
                     " "
@@ -412,12 +452,14 @@ impl Flux2Edit {
             Ok((prompt, negative))
         };
         let (prompt_embeds, negative) = if let Some(te) = self.te.as_ref() {
-            encode_prompt(te)?
+            encode_prompt(te, self.upsampler.as_ref())?
         } else {
             candle_gen::check_cancel(&req.cancel)?;
             let te = self.pipe.load_te_seq()?;
-            let result = encode_prompt(&te);
+            let upsampler = self.pipe.load_caption_upsampler(true)?;
+            let result = encode_prompt(&te, upsampler.as_ref());
             let result = candle_gen::synchronize_result(&self.pipe.device, result);
+            drop(upsampler);
             drop(te);
             result?
         };
@@ -689,9 +731,6 @@ fn validate_memory_load_spec(
     spec: &candle_gen::gen_core::LoadSpec,
 ) -> Result<()> {
     let mut unsupported = Vec::new();
-    if !spec.adapters.is_empty() {
-        unsupported.push("adapters");
-    }
     if spec.control.is_some() {
         unsupported.push("control");
     }
@@ -804,7 +843,7 @@ fn validate_memory_request(
 /// provider: `gen_core::TextTokenizer::tokenize("")` short-circuits to a (1, 0) encoding BEFORE the
 /// chat template runs, so an empty prompt would reach the TE as a zero-length sequence and surface
 /// as a deep tensor-shape error (or degenerate conditioning) instead of a clean validation error.
-fn validate_request(req: &Flux2EditRequest) -> Result<()> {
+fn validate_request(req: &Flux2EditRequest, variant: Flux2Variant) -> Result<()> {
     if req.prompt.trim().is_empty() {
         return Err(CandleError::Msg("flux2 edit: prompt is required".into()));
     }
@@ -816,6 +855,40 @@ fn validate_request(req: &Flux2EditRequest) -> Result<()> {
     }
     if req.steps == 0 {
         return Err(CandleError::Msg("flux2 edit: steps must be >= 1".into()));
+    }
+    if req.enhance_prompt && !variant.is_dev() {
+        return Err(CandleError::Msg(
+            "flux2 klein edit: prompt enhancement is not supported".into(),
+        ));
+    }
+    if let Some(tokens) = req.enhance_max_tokens {
+        if !req.enhance_prompt {
+            return Err(CandleError::Msg(
+                "flux2 edit: enhance_max_tokens requires enhance_prompt=true".into(),
+            ));
+        }
+        if tokens == 0 || tokens > candle_gen::gen_core::generator::MAX_ENHANCE_TOKENS {
+            return Err(CandleError::Msg(format!(
+                "flux2 edit: enhance_max_tokens {tokens} outside supported range 1..={}",
+                candle_gen::gen_core::generator::MAX_ENHANCE_TOKENS
+            )));
+        }
+    }
+    if let Some(temperature) = req.enhance_temperature {
+        if !req.enhance_prompt {
+            return Err(CandleError::Msg(
+                "flux2 edit: enhance_temperature requires enhance_prompt=true".into(),
+            ));
+        }
+        if !temperature.is_finite()
+            || !(0.0..=candle_gen::gen_core::generator::MAX_ENHANCE_TEMPERATURE)
+                .contains(&temperature)
+        {
+            return Err(CandleError::Msg(format!(
+                "flux2 edit: enhance_temperature {temperature} outside supported range 0..={}",
+                candle_gen::gen_core::generator::MAX_ENHANCE_TEMPERATURE
+            )));
+        }
     }
     Ok(())
 }
@@ -919,6 +992,7 @@ mod tests {
     fn admitted_edit_binds_the_runtime_base_path() {
         let paths = Flux2EditPaths {
             root: PathBuf::from("/runtime"),
+            adapters: Vec::new(),
         };
         let matching = candle_gen::gen_core::LoadSpec::new(
             candle_gen::gen_core::WeightsSource::Dir(paths.root.clone()),
@@ -946,6 +1020,7 @@ mod tests {
             1.0,
             AdapterKind::Lora,
         ));
+        assert!(validate_memory_load_spec(Flux2Variant::Klein9b, &adapters).is_ok());
         let mut control = base();
         control.control = Some(WeightsSource::File(PathBuf::from("control.safetensors")));
         let mut extra_controls = base();
@@ -971,7 +1046,6 @@ mod tests {
         );
 
         for (field, spec) in [
-            ("adapters", adapters),
             ("control", control),
             ("extra_controls", extra_controls),
             ("ip_adapter", ip_adapter),
@@ -990,6 +1064,7 @@ mod tests {
     fn legacy_edit_constructor_rejects_constrained_memory_without_context() {
         let paths = Flux2EditPaths {
             root: PathBuf::from("/missing-flux2-dev"),
+            adapters: Vec::new(),
         };
         let error = Flux2Edit::load_dev_with_memory(
             &paths,
@@ -1019,21 +1094,21 @@ mod tests {
     #[test]
     fn validate_request_rejects_empty_prompt() {
         let empty = Flux2EditRequest::default();
-        let err = validate_request(&empty).unwrap_err();
+        let err = validate_request(&empty, Flux2Variant::Klein9b).unwrap_err();
         assert!(err.to_string().contains("prompt is required"), "{err}");
 
         let whitespace = Flux2EditRequest {
             prompt: " \t\n".into(),
             ..Default::default()
         };
-        let err = validate_request(&whitespace).unwrap_err();
+        let err = validate_request(&whitespace, Flux2Variant::Klein9b).unwrap_err();
         assert!(err.to_string().contains("prompt is required"), "{err}");
 
         let ok = Flux2EditRequest {
             prompt: "a portrait".into(),
             ..Default::default()
         };
-        assert!(validate_request(&ok).is_ok());
+        assert!(validate_request(&ok, Flux2Variant::Klein9b).is_ok());
     }
 
     /// The size/steps guards moved into `validate_request` still fire (no regression from the
@@ -1045,7 +1120,7 @@ mod tests {
             width: 1000,
             ..Default::default()
         };
-        assert!(validate_request(&odd)
+        assert!(validate_request(&odd, Flux2Variant::Klein9b)
             .unwrap_err()
             .to_string()
             .contains("multiples"));
@@ -1055,10 +1130,48 @@ mod tests {
             steps: 0,
             ..Default::default()
         };
-        assert!(validate_request(&zero_steps)
+        assert!(validate_request(&zero_steps, Flux2Variant::Klein9b)
             .unwrap_err()
             .to_string()
             .contains("steps"));
+    }
+
+    #[test]
+    fn prompt_enhancement_is_dev_edit_only_and_tuning_is_bounded() {
+        let enhanced = Flux2EditRequest {
+            prompt: "make the portrait cinematic".into(),
+            enhance_prompt: true,
+            enhance_max_tokens: Some(512),
+            enhance_temperature: Some(0.15),
+            ..Default::default()
+        };
+        assert!(validate_request(&enhanced, Flux2Variant::Dev).is_ok());
+        let error = validate_request(&enhanced, Flux2Variant::Klein9b)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not supported"), "{error}");
+
+        for request in [
+            Flux2EditRequest {
+                prompt: "edit".into(),
+                enhance_max_tokens: Some(512),
+                ..Default::default()
+            },
+            Flux2EditRequest {
+                prompt: "edit".into(),
+                enhance_prompt: true,
+                enhance_max_tokens: Some(2049),
+                ..Default::default()
+            },
+            Flux2EditRequest {
+                prompt: "edit".into(),
+                enhance_prompt: true,
+                enhance_temperature: Some(f32::INFINITY),
+                ..Default::default()
+            },
+        ] {
+            assert!(validate_request(&request, Flux2Variant::Dev).is_err());
+        }
     }
 
     /// `preprocess_ref` lays a same-size RGB8 reference out as NCHW `[1,3,H,W]` in `[-1,1]`: white → 1,

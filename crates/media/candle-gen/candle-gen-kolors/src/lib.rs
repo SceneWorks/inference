@@ -4,18 +4,20 @@
 //! of `mlx-gen-kolors`. It implements the backend-neutral [`gen_core::Generator`] contract and
 //! exposes the candle Kolors generator through its explicit family catalog.
 //!
-//! **txt2img:** Kolors is a bilingual (Chinese/English) SDXL-family T2I model — the SDXL UNet + SDXL
-//! VAE with a **ChatGLM3-6B** text encoder in place of dual CLIP. `pipeline` runs it through the
-//! contract: ChatGLM3 encode (penultimate hidden state → cross-attention context, last-token
-//! last-layer state → pooled add-embedding) → the Kolors UNet (real CFG over the leading-Euler
-//! 1100-step schedule) → the SDXL VAE, emitting `Progress`, honoring `req.cancel`, with
-//! **deterministic CPU-seeded noise** (sc-3673) so output is launch-portable per seed.
+//! **txt2img + source-image img2img:** Kolors is a bilingual (Chinese/English) SDXL-family model —
+//! the SDXL UNet + SDXL VAE with a **ChatGLM3-6B** text encoder in place of dual CLIP. `pipeline`
+//! runs it through the contract: ChatGLM3 encode (penultimate hidden state → cross-attention
+//! context, last-token last-layer state → pooled add-embedding) → either seeded noise or a
+//! VAE-encoded reference plus the selected schedule tail → the Kolors UNet (real CFG over the
+//! leading-Euler 1100-step schedule) → the SDXL VAE, emitting `Progress`, honoring `req.cancel`,
+//! with **deterministic CPU-seeded noise** (sc-3673) so output is launch-portable per seed.
 //!
-//! The descriptor advertises the wired surface — txt2img (negative prompt + CFG guidance) and packed
-//! **Q4/Q8** MLX-tier inference (sc-10819, epic 9083) — but NOT LoRA/LoKr, ControlNet-pose, or
-//! IP-Adapter (all wired in the mlx provider), so the worker routes the rest to the Python fallback
-//! rather than the candle backend silently dropping a control (the false-capability trap, exactly as
-//! the SDXL / FLUX / Z-Image / Chroma slices did). `backend` is `"candle"` and `mac_only` is `false`.
+//! The descriptor advertises the wired surface — txt2img, single-reference img2img, and packed
+//! **Q4/Q8** MLX-tier inference (sc-10819, epic 9083), plus user LoRA/LoKr on the SDXL-family UNet.
+//! ControlNet-pose and
+//! IP-Adapter remain separately wired bespoke Candle providers and are deliberately rejected by the
+//! registered base/img2img loader rather than silently dropped. `backend` is `"candle"` and
+//! `mac_only` is `false`.
 
 mod chatglm3;
 // Shared Kolors pipeline scaffolding (sc-9001 / F-021): the time_ids / initial-noise / decode /
@@ -29,6 +31,7 @@ mod pipeline;
 pub mod preview;
 mod sampler;
 mod tokenizer;
+mod training;
 mod unet;
 
 // IP-Adapter-Plus reference-image (identity) provider (sc-5488, epic 5480) — CLIP ViT-L/14-336 image
@@ -58,8 +61,8 @@ use std::sync::Mutex;
 
 use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{
-    self, GenerationOutput, GenerationRequest, Generator, LoadSpec, ModelDescriptor, PidWeights,
-    Progress, WeightsSource,
+    self, Conditioning, GenerationOutput, GenerationRequest, Generator, LoadSpec, ModelDescriptor,
+    PidWeights, Progress, WeightsSource,
 };
 
 pub use config::{descriptor, MODEL_ID, SIZE_MULTIPLE};
@@ -81,6 +84,7 @@ pub struct KolorsGenerator {
     /// The `LoadSpec::pid` component captured at load (epic 7840 / sc-7853), threaded into the lazy
     /// component build so the PiD engine loads once alongside the base model. `None` when not opted in.
     pid_spec: Option<PidWeights>,
+    adapters: Vec<candle_gen::gen_core::AdapterSpec>,
     components: Mutex<Option<Components>>,
 }
 
@@ -99,11 +103,25 @@ impl Generator for KolorsGenerator {
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        // The shared capability floor (count/size range, negative_prompt + guidance; since the
-        // descriptor advertises NO conditioning, any conditioning entry is rejected here).
+        // The shared capability floor accepts only the registered Reference img2img conditioning.
         self.descriptor
             .capabilities
             .validate_request(MODEL_ID, req)?;
+        let reference_count = req
+            .conditioning
+            .iter()
+            .filter(|conditioning| matches!(conditioning, Conditioning::Reference { .. }))
+            .count();
+        if reference_count > 1 {
+            return Err(gen_core::Error::Msg(
+                "kolors: multiple reference images are not supported".into(),
+            ));
+        }
+        if req.strength.is_some() && reference_count == 0 {
+            return Err(gen_core::Error::Unsupported(
+                "kolors: img2img strength requires Reference conditioning".into(),
+            ));
+        }
         if req.prompt.trim().is_empty() {
             return Err(gen_core::Error::Msg(
                 "kolors: prompt must not be empty".into(),
@@ -133,7 +151,17 @@ impl Generator for KolorsGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
-        let pipe = Pipeline::load(&self.root, &self.device, self.pid_spec.clone());
+        // A pre-canceled request must not trigger the lazy multi-gigabyte component load. Render
+        // has additional checkpoints after request setup, at every image, and before decode.
+        if req.cancel.is_cancelled() {
+            return Err(gen_core::Error::Canceled);
+        }
+        let pipe = Pipeline::load(
+            &self.root,
+            &self.device,
+            self.pid_spec.clone(),
+            self.adapters.clone(),
+        );
         let components = self.components(&pipe)?;
         let images = pipe.render(req, &components, on_progress)?;
         Ok(GenerationOutput::Images(images))
@@ -157,19 +185,14 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
             ));
         }
     };
-    if !spec.adapters.is_empty() {
-        return Err(gen_core::Error::Unsupported(
-            "candle kolors does not support LoRA/LoKr yet — refusing to silently drop the adapters"
-                .into(),
-        ));
-    }
     // Packed q4/q8 MLX tiers are wired end-to-end (sc-10819, epic 9083): the tier is packed-detected
     // from disk (`unet/` & `text_encoder/` `config.json` `quantization` blocks; see
     // `pipeline::load_components`), so the `LoadSpec::quantize` overlay is an advisory no-op on an
     // already-packed tier — exactly as SDXL/boogu/flux2-dev treat it. No reject here.
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
         return Err(gen_core::Error::Unsupported(
-            "candle kolors does not support control / IP-adapter overlays yet (txt2img only)"
+            "candle kolors registered base/img2img generator does not accept control / IP-adapter \
+             overlays; use the dedicated Kolors control or IP-Adapter provider"
                 .into(),
         ));
     }
@@ -182,6 +205,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         // any) so the lazy component build loads the engine once. Unlike adapters/quant/control above,
         // it is not rejected — `None` simply keeps the byte-exact native-VAE path.
         pid_spec: spec.pid.clone(),
+        adapters: spec.adapters.clone(),
         components: Mutex::new(None),
     }))
 }
@@ -196,7 +220,9 @@ candle_gen::register_generators! {
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    registry.register_generator(REGISTRATION)
+    registry
+        .register_generator(REGISTRATION)
+        .register_trainer(training::TRAINER_REGISTRATION)
 }
 
 /// Build the complete explicit Candle Kolors provider catalog.
@@ -215,6 +241,11 @@ mod explicit_registry_tests {
             .collect();
 
         assert_eq!(explicit, ["kolors"]);
+        let trainers: Vec<String> = registry
+            .trainers()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+        assert_eq!(trainers, ["kolors"]);
     }
 }
 
@@ -237,7 +268,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_accepts_txt2img_and_rejects_unsupported() {
+    fn validate_accepts_txt2img_and_single_reference_img2img() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
         let g = crate::provider_registry()
             .unwrap()
@@ -251,6 +282,21 @@ mod tests {
             ..Default::default()
         };
         assert!(g.validate(&ok).is_ok());
+
+        let reference = GenerationRequest {
+            prompt: "restyle the source as watercolor".into(),
+            strength: Some(0.45),
+            conditioning: vec![Conditioning::Reference {
+                image: Image {
+                    width: 8,
+                    height: 8,
+                    pixels: vec![127; 8 * 8 * 3],
+                },
+                strength: Some(0.6),
+            }],
+            ..Default::default()
+        };
+        assert!(g.validate(&reference).is_ok());
 
         for bad in [
             GenerationRequest::default(), // empty prompt
@@ -271,10 +317,21 @@ mod tests {
             },
             GenerationRequest {
                 prompt: "x".into(),
-                conditioning: vec![Conditioning::Reference {
-                    image: Image::default(),
-                    strength: None,
-                }],
+                conditioning: vec![
+                    Conditioning::Reference {
+                        image: Image::default(),
+                        strength: None,
+                    },
+                    Conditioning::Reference {
+                        image: Image::default(),
+                        strength: None,
+                    },
+                ],
+                ..Default::default()
+            },
+            GenerationRequest {
+                prompt: "x".into(),
+                strength: Some(0.5),
                 ..Default::default()
             },
         ] {
@@ -304,6 +361,39 @@ mod tests {
                 ..Default::default()
             })
             .is_ok());
+    }
+
+    #[test]
+    fn pre_cancelled_zero_strength_native_and_curated_skip_component_load() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID, &spec)
+            .unwrap();
+
+        for sampler in [None, Some("dpmpp_2m".to_string())] {
+            let request = GenerationRequest {
+                prompt: "edit the reference".into(),
+                width: 512,
+                height: 512,
+                steps: Some(10),
+                sampler,
+                conditioning: vec![Conditioning::Reference {
+                    image: Image {
+                        width: 8,
+                        height: 8,
+                        pixels: vec![127; 8 * 8 * 3],
+                    },
+                    strength: Some(0.0),
+                }],
+                ..Default::default()
+            };
+            request.cancel.cancel();
+            let err = g
+                .generate(&request, &mut |_| {})
+                .expect_err("pre-cancellation must win before the missing snapshot is opened");
+            assert!(matches!(err, gen_core::Error::Canceled));
+        }
     }
 
     /// sc-7124: the curated ε/DDPM menu is advertised, so `validate` accepts a curated sampler +
@@ -345,14 +435,11 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_unwired_surfaces_and_single_file() {
+    fn load_accepts_adapters_and_rejects_single_file() {
         let lora = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_adapters(vec![
             AdapterSpec::new("/lora.safetensors".into(), 1.0, AdapterKind::Lora),
         ]);
-        assert!(matches!(
-            load(&lora).err().expect("err"),
-            gen_core::Error::Unsupported(_)
-        ));
+        assert!(load(&lora).is_ok());
 
         // sc-10819: a packed q4/q8 tier is auto-detected from disk, so `quantize` is NO LONGER a load
         // reject (contrast the LoRA/control overlays above). Load is lazy (no file I/O), so a quant-only

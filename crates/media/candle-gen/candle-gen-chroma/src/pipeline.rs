@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::{self, GenerationRequest, Image, PidWeights, Progress};
+use candle_gen::gen_core::{self, AdapterSpec, GenerationRequest, Image, PidWeights, Progress};
 // Shared per-image batch seed (`base + index`) — one home in `candle-gen` (sc-9043 / F-059).
 use candle_gen::{CandleError, LatentDecoder, Result};
 use candle_gen_pid::{PidDecoder, PidEngine};
@@ -58,6 +58,7 @@ pub(crate) struct Pipeline {
     /// The `LoadSpec::pid` component captured at load (epic 7840 / sc-7853), built into the cached
     /// [`Components`] so the PiD engine loads once alongside the base model. `None` ⇒ native VAE decode.
     pid_spec: Option<PidWeights>,
+    adapters: Vec<AdapterSpec>,
 }
 
 /// The loaded Chroma components, `Arc`-shared so the generator can cache them across `generate`
@@ -80,12 +81,14 @@ impl Pipeline {
         root: &Path,
         device: &Device,
         pid_spec: Option<PidWeights>,
+        adapters: Vec<AdapterSpec>,
     ) -> Self {
         Self {
             variant,
             root: root.to_path_buf(),
             device: device.clone(),
             pid_spec,
+            adapters,
         }
     }
 
@@ -106,7 +109,13 @@ impl Pipeline {
         let t5 = text::load_t5(&self.root, &self.device)?;
         let dit_dir = self.root.join("transformer");
         let gs = self.transformer_group_size(&dit_dir);
-        let transformer = ChromaTransformer::new_gs(cfg, self.vb(&dit_dir, DType::F32)?, gs)?;
+        let mut transformer = ChromaTransformer::new_gs(cfg, self.vb(&dit_dir, DType::F32)?, gs)?;
+        candle_gen::quant::install_dotted_adapters(
+            "chroma",
+            &self.adapters,
+            &self.device,
+            |visitor| transformer.visit_adaptable_mut(visitor),
+        )?;
         let vae_dtype = crate::native_component_dtype(crate::NativeComponent::Vae);
         let vae = Vae::new(self.vb(&self.root.join("vae"), vae_dtype)?)?;
         // Load the optional PiD super-resolving decoder once (epic 7840 / sc-7853) when the caller opted
@@ -404,7 +413,7 @@ mod tests {
         let tmp = tmp_guard.path().to_path_buf();
         let dir = tmp.join("transformer");
         std::fs::create_dir_all(&dir).ok();
-        let pipe = Pipeline::load(ChromaVariant::Base, &tmp, &Device::Cpu, None);
+        let pipe = Pipeline::load(ChromaVariant::Base, &tmp, &Device::Cpu, None, Vec::new());
 
         // A real Chroma packed tier: bits 4, group 64.
         std::fs::write(
@@ -446,7 +455,13 @@ mod tests {
     /// HD's static shift moves the interior sigmas but keeps a descending 1→0 schedule of length N+1.
     #[test]
     fn hd_sigmas_descend_with_shift() {
-        let pipe = Pipeline::load(ChromaVariant::Hd, Path::new("/x"), &Device::Cpu, None);
+        let pipe = Pipeline::load(
+            ChromaVariant::Hd,
+            Path::new("/x"),
+            &Device::Cpu,
+            None,
+            Vec::new(),
+        );
         let s = pipe.sigmas(8);
         assert_eq!(s.len(), 9);
         assert!(
@@ -462,7 +477,13 @@ mod tests {
     /// Flash uses shift 1.0 → the schedule is the raw `linspace(1, 1/N, N)` + trailing 0.
     #[test]
     fn flash_sigmas_are_unshifted_linspace() {
-        let pipe = Pipeline::load(ChromaVariant::Flash, Path::new("/x"), &Device::Cpu, None);
+        let pipe = Pipeline::load(
+            ChromaVariant::Flash,
+            Path::new("/x"),
+            &Device::Cpu,
+            None,
+            Vec::new(),
+        );
         let s = pipe.sigmas(4);
         // linspace(1, 1/4, 4) = [1, 0.75, 0.5, 0.25], then 0.
         let want = [1.0, 0.75, 0.5, 0.25, 0.0];
@@ -474,7 +495,13 @@ mod tests {
     /// Base routes through the beta-spaced schedule (distinct from the linspace).
     #[test]
     fn base_sigmas_use_beta_schedule() {
-        let pipe = Pipeline::load(ChromaVariant::Base, Path::new("/x"), &Device::Cpu, None);
+        let pipe = Pipeline::load(
+            ChromaVariant::Base,
+            Path::new("/x"),
+            &Device::Cpu,
+            None,
+            Vec::new(),
+        );
         let s = pipe.sigmas(4);
         assert_eq!(s, crate::beta::base_sigmas(4));
         // 0.79344 (beta) ≠ 0.75 (linspace) at index 1.

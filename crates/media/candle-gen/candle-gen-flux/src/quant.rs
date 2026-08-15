@@ -37,7 +37,7 @@ use candle_gen::quant as shared;
 // projections take the shared [`MatmulStrategy::DequantDense`] arm (sc-7702-safe, no int8 activation
 // quant), built by `QLinear::linear_detect` on an MLX tier. Re-export the shared type under the
 // crate-local `QLinear` name the vendored DiT / T5 / CLIP reference.
-pub use candle_gen::quant::QLinear;
+pub use candle_gen::quant::AdaptLinear as QLinear;
 
 /// A token embedding that is **dense** (`candle_nn::Embedding`) or **packed** (loaded straight from an
 /// MLX-packed tier's embedding triple via the shared [`candle_gen::quant::QEmbedding`], sc-9407). The
@@ -115,7 +115,6 @@ mod tests {
     use candle_gen::candle_core::safetensors::MmapedSafetensors;
     use candle_gen::candle_core::{DType, Device};
     use candle_gen::candle_nn::Linear;
-    use candle_gen::quant::{DenseLinear, MatmulStrategy};
     use std::collections::HashMap;
 
     /// Test-side MLX Q4 packer: per-element 4-bit codes → MLX u32 words (LSB-first nibbles), group 64.
@@ -199,22 +198,21 @@ mod tests {
         // `to_out.0` — packed-detected through the remapped base (never `.pp("0")` past the sibling).
         // The packed load must take the sc-7702-safe dequant-dense arm, NOT the int8-fast fold arm.
         let packed = QLinear::linear_detect(in_dim, out_dim, &attn, "to_out.0", false)?;
-        assert_eq!(
-            packed.matmul_strategy(),
-            Some(MatmulStrategy::DequantDense),
+        assert!(
+            packed.is_packed(),
             "`.scales` under to_out.0 ⇒ packed dequant-dense load"
         );
 
         // `to_q` — dense (no `.scales`), path unchanged.
         let dense = QLinear::linear_detect(in_dim, out_dim, &attn, "to_q", false)?;
-        assert!(!dense.is_quantized(), "no `.scales` ⇒ dense path unchanged");
-        assert!(matches!(dense, QLinear::Dense(_)));
+        assert!(!dense.is_packed(), "no `.scales` ⇒ dense path unchanged");
 
         // The packed forward reproduces the affine grid (bit-exact repack + dequant-on-forward).
-        let grid_lin = QLinear::from_dense(DenseLinear::Linear(Linear::new(
-            Tensor::from_vec(grid, (out_dim, in_dim), &dev)?,
-            None,
-        )));
+        let grid_lin = QLinear::from_dense(
+            Linear::new(Tensor::from_vec(grid, (out_dim, in_dim), &dev)?, None),
+            in_dim,
+            out_dim,
+        );
         let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
         let cos = cosine(&packed.forward(&x)?, &grid_lin.forward(&x)?);
         assert!(cos > 0.99999, "packed vs affine-grid cosine {cos:.6}");

@@ -10,7 +10,7 @@ use candle_core::{Device, Result, Tensor};
 use candle_gen::gen_core::{
     effective_component_quant, ComponentPrecisionFloor, PrecisionFloorComponent, Quant,
 };
-use candle_gen::quant::{DenseLinear, QLinear};
+use candle_gen::quant::AdaptLinear as QLinear;
 use candle_gen_boogu::loader::Weights;
 use candle_nn::Linear;
 
@@ -47,14 +47,20 @@ pub(crate) fn linear(weights: &Weights, base: &str, bias: bool) -> Result<QLinea
         } else {
             None
         };
-        return QLinear::from_packed_gs(
+        let base = candle_gen::quant::QLinear::from_packed_gs(
             &packed,
             &scales,
             &biases,
             dense_bias,
             config.group_size as usize,
             weights.device(),
-        );
+        )?;
+        let (out_dim, groups) = scales.dims2()?;
+        return Ok(QLinear::from_packed(
+            base,
+            groups * config.group_size as usize,
+            out_dim,
+        ));
     }
     let weight = weights.get(&format!("{base}.weight"))?;
     let bias = if bias {
@@ -62,9 +68,12 @@ pub(crate) fn linear(weights: &Weights, base: &str, bias: bool) -> Result<QLinea
     } else {
         None
     };
-    Ok(QLinear::from_dense(DenseLinear::Linear(Linear::new(
-        weight, bias,
-    ))))
+    let (out_dim, in_dim) = weight.dims2()?;
+    Ok(QLinear::from_dense(
+        Linear::new(weight, bias),
+        in_dim,
+        out_dim,
+    ))
 }
 
 /// Fold one projection to the requested tier on `device`.
@@ -114,7 +123,7 @@ mod tests {
             &Device::Cpu,
         )
         .unwrap();
-        QLinear::from_dense(DenseLinear::Linear(Linear::new(weight, None)))
+        QLinear::from_dense(Linear::new(weight, None), 32, 64)
     }
 
     #[test]

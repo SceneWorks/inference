@@ -112,6 +112,7 @@ impl Attention {
             &mut self.to_k,
             &mut self.to_v,
             &mut self.to_out,
+            &mut self.gate,
         ] {
             let path = linear.path().to_string();
             f(&path, linear)?;
@@ -208,6 +209,17 @@ impl FeedForward {
         // tanh-approx gelu.
         self.proj_out.forward(&self.proj_in.forward(x)?.gelu()?)
     }
+
+    fn visit_adaptable_mut(
+        &mut self,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> Result<()>,
+    ) -> Result<()> {
+        for linear in [&mut self.proj_in, &mut self.proj_out] {
+            let path = linear.path().to_string();
+            f(&path, linear)?;
+        }
+        Ok(())
+    }
 }
 
 struct AdaLayerNormSingle {
@@ -235,6 +247,17 @@ impl AdaLayerNormSingle {
         let embedded = self.ts_lin2.forward(&h)?;
         let scale_shift = self.linear.forward(&embedded.silu()?)?;
         Ok((scale_shift, embedded))
+    }
+
+    fn visit_adaptable_mut(
+        &mut self,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> Result<()>,
+    ) -> Result<()> {
+        for linear in [&mut self.ts_lin1, &mut self.ts_lin2, &mut self.linear] {
+            let path = linear.path().to_string();
+            f(&path, linear)?;
+        }
+        Ok(())
     }
 }
 
@@ -308,33 +331,88 @@ impl AvStream {
         })
     }
 
+    fn visit_adaptable_mut(
+        &mut self,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> Result<()>,
+    ) -> Result<()> {
+        for linear in [&mut self.patchify, &mut self.proj_out] {
+            let path = linear.path().to_string();
+            f(&path, linear)?;
+        }
+        self.adaln.visit_adaptable_mut(f)?;
+        self.prompt_adaln.visit_adaptable_mut(f)?;
+        self.cross_ss_adaln.visit_adaptable_mut(f)?;
+        self.cross_gate_adaln.visit_adaptable_mut(f)
+    }
+
     /// adaLN-single + prompt/cross controllers for a uniform T2V timestep `sigma`.
     fn ts_embeds(&self, sigma: f64, ts_mult: f64, b: usize, device: &Device) -> Result<AvTs> {
-        let inner = self.inner;
         let ts_scaled = (sigma * ts_mult) as f32;
         let ts_flat = Tensor::from_vec(vec![ts_scaled; b], (b,), device)?;
-        let (ss, emb) = self.adaln.forward(&ts_flat, device)?;
-        let (pss, _) = self.prompt_adaln.forward(&ts_flat, device)?;
-        let (css, _) = self.cross_ss_adaln.forward(&ts_flat, device)?;
-        let (cgs, _) = self.cross_gate_adaln.forward(&ts_flat, device)?;
+        self.ts_embeds_flat(&ts_flat, &ts_flat, b, 1, device)
+    }
+
+    /// adaLN-single controllers for a per-token video timestep table `[B, S]`.
+    ///
+    /// LTX image/keyframe and IC-LoRA conditioning feeds `sigma * denoise_mask` per token. Keeping
+    /// that table here (instead of collapsing it to a scalar) is load-bearing: fully pinned tokens
+    /// receive timestep zero while generation tokens receive the current schedule sigma.
+    fn ts_embeds_tokens(&self, timesteps: &Tensor, ts_mult: f64, device: &Device) -> Result<AvTs> {
+        let (b, s) = timesteps.dims2()?;
+        let ts_flat = (timesteps.to_dtype(DType::F32)? * ts_mult)?
+            .flatten_all()?
+            .contiguous()?;
+        // Prompt adaLN uses one shared modulation per sample (`timestep[:, :1]`), not one per latent
+        // token; otherwise its sequence length would not broadcast over the text context.
+        let prompt_flat = (timesteps.narrow(1, 0, 1)?.to_dtype(DType::F32)? * ts_mult)?
+            .flatten_all()?
+            .contiguous()?;
+        self.ts_embeds_flat(&ts_flat, &prompt_flat, b, s, device)
+    }
+
+    fn ts_embeds_flat(
+        &self,
+        ts_flat: &Tensor,
+        prompt_flat: &Tensor,
+        b: usize,
+        s: usize,
+        device: &Device,
+    ) -> Result<AvTs> {
+        let inner = self.inner;
+        let (ss, emb) = self.adaln.forward(ts_flat, device)?;
+        let (pss, _) = self.prompt_adaln.forward(prompt_flat, device)?;
+        let (css, _) = self.cross_ss_adaln.forward(ts_flat, device)?;
+        let (cgs, _) = self.cross_gate_adaln.forward(ts_flat, device)?;
         Ok(AvTs {
-            ts_emb: ss.reshape((b, 1, self.coeff * inner))?,
-            emb_ts: emb.reshape((b, 1, inner))?,
+            ts_emb: ss.reshape((b, s, self.coeff * inner))?,
+            emb_ts: emb.reshape((b, s, inner))?,
             prompt_ts: pss.reshape((b, 1, 2 * inner))?,
-            cross_ss_ts: css.reshape((b, 1, 4 * inner))?,
-            cross_gate_ts: cgs.reshape((b, 1, inner))?,
+            cross_ss_ts: css.reshape((b, s, 4 * inner))?,
+            cross_gate_ts: cgs.reshape((b, s, inner))?,
         })
     }
 
     fn output_head(&self, h: &Tensor, emb_ts: &Tensor) -> Result<Tensor> {
-        let b = h.dim(0)?;
-        let table = self.scale_shift_table.reshape((1, 1, 2, self.inner))?;
-        let ss = table.broadcast_add(&emb_ts.reshape((b, 1, 1, self.inner))?)?;
-        let shift = ss.narrow(2, 0, 1)?.squeeze(2)?;
-        let scale = ss.narrow(2, 1, 1)?.squeeze(2)?;
+        let (scale, shift) = output_scale_shift(&self.scale_shift_table, emb_ts, self.inner)?;
         let normed = layer_norm_noaffine(h, self.eps)?;
         self.proj_out.forward(&modulate(&normed, &scale, &shift)?)
     }
+}
+
+/// Broadcast the output adaLN table across the full token-wise timestep embedding `[B,S,D]`.
+/// Uniform T2V has `S=1`; conditioned I2V/keyframe/clip paths carry one embedding per video token.
+fn output_scale_shift(table: &Tensor, emb_ts: &Tensor, inner: usize) -> Result<(Tensor, Tensor)> {
+    let (b, s, d) = emb_ts.dims3()?;
+    if d != inner {
+        return Err(candle_gen::candle_core::Error::Msg(format!(
+            "LTX output timestep width {d} does not match stream width {inner}"
+        )));
+    }
+    let table = table.reshape((1, 1, 2, inner))?;
+    let ss = table.broadcast_add(&emb_ts.reshape((b, s, 1, inner))?)?;
+    let shift = ss.narrow(2, 0, 1)?.squeeze(2)?;
+    let scale = ss.narrow(2, 1, 1)?.squeeze(2)?;
+    Ok((scale, shift))
 }
 
 /// Borrowed per-stream args threaded into an [`AvBlock`].
@@ -348,6 +426,31 @@ struct AvStreamArgs<'a> {
     cross_sin: &'a Tensor,
     cross_ss_ts: &'a Tensor,
     cross_gate_ts: &'a Tensor,
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conditioned_output_head_preserves_every_token_timestep() -> Result<()> {
+        let device = Device::Cpu;
+        let table = Tensor::zeros((2, 4), DType::F32, &device)?;
+        let emb = Tensor::arange(0f32, 24f32, &device)?.reshape((2, 3, 4))?;
+        let (scale, shift) = output_scale_shift(&table, &emb, 4)?;
+        assert_eq!(scale.dims(), &[2, 3, 4]);
+        assert_eq!(shift.dims(), &[2, 3, 4]);
+        assert_eq!(
+            scale.flatten_all()?.to_vec1::<f32>()?,
+            emb.flatten_all()?.to_vec1::<f32>()?
+        );
+        assert_eq!(
+            shift.flatten_all()?.to_vec1::<f32>()?,
+            emb.flatten_all()?.to_vec1::<f32>()?
+        );
+        Ok(())
+    }
 }
 
 /// `4·scale-shift + 1·gate` cross-modal adaLN values from the pre-split tables → `(scale_a2v,
@@ -424,14 +527,21 @@ impl AvBlock {
         })
     }
 
-    /// Visit only the canonical video `attn1` / `attn2` adapter surface. Audio and cross-modal
-    /// projections deliberately remain frozen because the native trainer is video-only.
-    fn visit_video_adaptable_mut(
+    /// Visit the complete LTX-2.3 AudioVideo block adapter surface. The official Eros distill LoRA
+    /// includes feed-forward, gated attention, audio, and cross-modal projections in addition to
+    /// the video attention leaves emitted by SceneWorks' native trainer.
+    fn visit_adaptable_mut(
         &mut self,
         f: &mut dyn FnMut(&str, &mut QLinear) -> Result<()>,
     ) -> Result<()> {
         self.attn1.visit_adaptable_mut(f)?;
-        self.attn2.visit_adaptable_mut(f)
+        self.attn2.visit_adaptable_mut(f)?;
+        self.ff.visit_adaptable_mut(f)?;
+        self.a_attn1.visit_adaptable_mut(f)?;
+        self.a_attn2.visit_adaptable_mut(f)?;
+        self.a_ff.visit_adaptable_mut(f)?;
+        self.a2v.visit_adaptable_mut(f)?;
+        self.v2a.visit_adaptable_mut(f)
     }
 
     /// Self-attn (RoPE) → prompt-modulated text cross-attention (no RoPE), for one modality.
@@ -605,14 +715,16 @@ impl AvDiT {
         })
     }
 
-    /// Walk the exact inference adapter surface trained by [`crate::dit_train::LtxDiT`]:
-    /// `transformer_blocks.{i}.attn{1,2}.{to_q,to_k,to_v,to_out.0}`.
-    pub(crate) fn visit_video_adaptable_mut(
+    /// Walk the complete LTX-2.3 AudioVideo inference adapter surface. This is a superset of the
+    /// native video-attention training surface and is required by the official Eros distill LoRA.
+    pub(crate) fn visit_adaptable_mut(
         &mut self,
         f: &mut dyn FnMut(&str, &mut QLinear) -> Result<()>,
     ) -> Result<()> {
+        self.video.visit_adaptable_mut(f)?;
+        self.audio.visit_adaptable_mut(f)?;
         for block in &mut self.blocks {
-            block.visit_video_adaptable_mut(f)?;
+            block.visit_adaptable_mut(f)?;
         }
         Ok(())
     }
@@ -722,6 +834,72 @@ impl AvDiT {
         let v_ts = self.video.ts_embeds(sigma, ts_mult, b, device)?;
         let a_ts = self.audio.ts_embeds(sigma, ts_mult, b, device)?;
 
+        self.forward_with_ts(
+            video_latent,
+            audio_latent,
+            video_context,
+            audio_context,
+            video_grid,
+            audio_grid,
+            &v_ts,
+            &a_ts,
+        )
+    }
+
+    /// Joint velocity forward with per-token video timesteps `[B, Sv]` and a uniform audio sigma.
+    /// Used by every LTX image/keyframe/clip-conditioned lane.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_conditioned(
+        &self,
+        video_latent: &Tensor,
+        audio_latent: &Tensor,
+        video_timesteps: &Tensor,
+        audio_sigma: f64,
+        video_context: &Tensor,
+        audio_context: &Tensor,
+        video_grid: &Tensor,
+        audio_grid: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        let b = video_latent.dim(0)?;
+        if video_timesteps.dims2()? != (b, video_latent.dim(1)?) {
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "ltx: video timestep shape {:?} must be [batch={}, tokens={}]",
+                video_timesteps.dims(),
+                b,
+                video_latent.dim(1)?
+            )));
+        }
+        let ts_mult = self.cfg.video.timestep_scale_multiplier;
+        let v_ts = self
+            .video
+            .ts_embeds_tokens(video_timesteps, ts_mult, &self.device)?;
+        let a_ts = self
+            .audio
+            .ts_embeds(audio_sigma, ts_mult, b, &self.device)?;
+        self.forward_with_ts(
+            video_latent,
+            audio_latent,
+            video_context,
+            audio_context,
+            video_grid,
+            audio_grid,
+            &v_ts,
+            &a_ts,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_with_ts(
+        &self,
+        video_latent: &Tensor,
+        audio_latent: &Tensor,
+        video_context: &Tensor,
+        audio_context: &Tensor,
+        video_grid: &Tensor,
+        audio_grid: &Tensor,
+        v_ts: &AvTs,
+        a_ts: &AvTs,
+    ) -> Result<(Tensor, Tensor)> {
         // The four split-RoPE tables are step-invariant (fixed position grids), so cache them per
         // render and reuse across every step (sc-8992).
         let [(v_cos, v_sin), (vc_cos, vc_sin), (a_cos, a_sin), (ac_cos, ac_sin)] =

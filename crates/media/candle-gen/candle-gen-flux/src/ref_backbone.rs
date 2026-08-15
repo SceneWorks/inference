@@ -27,7 +27,7 @@ use std::path::Path;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
-use candle_gen::gen_core::{CancelFlag, GenerationMemory, Image};
+use candle_gen::gen_core::{AdapterSpec, CancelFlag, GenerationMemory, Image};
 use candle_gen::Result;
 use candle_gen_pid::PidDecoder;
 
@@ -85,7 +85,14 @@ impl FluxRefBackbone {
     /// No PiD spec is captured — the reference provider owns its PiD decoder separately (see
     /// [`decode`](Self::decode)).
     pub fn load(root: &Path, variant: Variant, device: &Device, dtype: DType) -> Result<Self> {
-        Self::load_with_memory(root, variant, device, dtype, GenerationMemory::default())
+        Self::load_with_memory(
+            root,
+            variant,
+            device,
+            dtype,
+            GenerationMemory::default(),
+            Vec::new(),
+        )
     }
 
     /// Load resident components for the baseline, or retain only the lightweight snapshot handle when
@@ -97,6 +104,7 @@ impl FluxRefBackbone {
         device: &Device,
         dtype: DType,
         memory: GenerationMemory,
+        adapters: Vec<AdapterSpec>,
     ) -> Result<Self> {
         let optimized =
             memory.tile_vae_decode || memory.chunk_attention || memory.stream_transformer_blocks;
@@ -105,7 +113,7 @@ impl FluxRefBackbone {
                 "FLUX reference memory rungs require staged residency".into(),
             ));
         }
-        let pipeline = Pipeline::load(variant, root, device, dtype, None);
+        let pipeline = Pipeline::load(variant, root, device, dtype, None, adapters);
         let components = if memory.stage_residency {
             None
         } else {

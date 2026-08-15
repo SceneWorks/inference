@@ -879,6 +879,7 @@ fn the_control_routes_preview_their_target_latent() {
             let paths = ZImageControlPaths {
                 snapshot: required_path(snapshot_var),
                 control: required_path(net_var),
+                adapters: Vec::new(),
                 base,
             };
             let memory = if staged {
