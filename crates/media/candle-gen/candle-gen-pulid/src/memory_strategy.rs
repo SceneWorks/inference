@@ -5,8 +5,9 @@
 //! FLUX evidence must therefore never authorize this route.
 
 use candle_gen::gen_core::{
-    self, LoadShape, LoadSpec, MemoryComponentKind, MemoryMode, MemoryProviderContract,
-    MemoryResidentComponent, MemoryRunContext, MemorySafetyDecision, OffloadPolicy, WeightsSource,
+    self, LoadShape, LoadSpec, MemoryComponentKind, MemoryComponentResidency, MemoryMode,
+    MemoryProviderContract, MemoryResidentComponent, MemoryRunContext, MemorySafetyDecision,
+    OffloadPolicy, WeightsSource,
 };
 
 use crate::PulidFluxPaths;
@@ -92,6 +93,7 @@ fn resident_component(
         kind: MemoryComponentKind::IdentityEncoder,
         resident_bytes,
         bounded_by: None,
+        residency: MemoryComponentResidency::WholeRender,
     })
 }
 

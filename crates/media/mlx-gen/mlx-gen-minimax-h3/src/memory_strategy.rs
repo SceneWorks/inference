@@ -86,20 +86,38 @@
 //!   [`LoadShape::DeferredMaterialization`], which this loader does not implement (see
 //!   [`LOAD_SHAPE`]).
 //!
-//! The 26.02 GB AdaLN eviction is a *typed resident-component exclusion* the ladder should be able
-//! to see; that is sc-18665, and it lands as [`MemoryFormulaKind::ComponentPhaseEnvelope`] with a
-//! `bounded_by` component. Until then the formula stays a plain [`MemoryFormulaKind::PhaseEnvelope`]
-//! rather than declaring a component axis it cannot yet populate truthfully.
+//! # The AdaLN eviction is declared, and it is declared NET (sc-18665)
+//!
+//! The formula is [`MemoryFormulaKind::ComponentPhaseEnvelope`], carrying one
+//! [`MemoryComponentKind::TransformerSubStack`] component: the 50-block `adaln_proj` stack, at
+//! [`ADALN_EVICTED_BYTES`] resident and [`ADALN_MODULATION_TABLE_MAX_BYTES`] retained, with
+//! [`MemoryComponentResidency::PrecomputedThenEvicted`] naming [`MemoryPhase::Denoise`] as the
+//! phase whose steady state runs without it.
+//!
+//! Three things that shape decides deliberately:
+//!
+//! * **`TransformerSubStack`, not `Transformer`.** The projections are *inside*
+//!   `asset_facts.transformer_bytes`; declaring them as a whole transformer would charge 26 GB
+//!   twice. They are not auxiliary either, so `overlay_bytes` stays 0.
+//! * **`residency`, not `default_engagement_exclusions`.** That list excludes a *rung* from
+//!   cost-order engagement; it cannot remove bytes from a formula, and there is no rung here to
+//!   exclude. `bounded_by` is `None` for the same reason — the drop is unconditional on the shipped
+//!   path.
+//! * **Net, not gross.** The precompute keeps a modulation table in the projections' place, so the
+//!   declared exclusion is `ADALN_EVICTED_BYTES − ADALN_MODULATION_TABLE_MAX_BYTES`. Declaring the
+//!   flat 26.02 GB claims a saving the runtime does not deliver, and the declared-versus-measured
+//!   guard goes red on it.
 
 use mlx_gen::gen_core::{
     safetensors_path_bytes, standard_memory_behavior_context,
     standard_memory_strategy_safety_check, Error as CoreError, LoadShape, LoadSpec,
     MemoryAssetFacts, MemoryBackendRealization, MemoryBehaviorFixture, MemoryBehaviorRoute,
-    MemoryCalibrationIdentity, MemoryFormulaKind, MemoryFormulaVariable, MemoryGeometry,
-    MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryParameterRanges, MemoryPhase,
-    MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemorySafetyDecision,
+    MemoryCalibrationIdentity, MemoryComponentKind, MemoryComponentResidency, MemoryFormulaKind,
+    MemoryFormulaVariable, MemoryGeometry, MemoryLifecycleCapabilities, MemoryMode,
+    MemoryNumericTier, MemoryParameterRanges, MemoryPhase, MemoryProviderContract,
+    MemoryRequestScope, MemoryResidentComponent, MemoryRunContext, MemorySafetyDecision,
     MemoryStrategy, MemoryStrategyCapability, MemoryStrategySupport, ResidentRequestMemory,
-    WeightsSource,
+    TransformerComponent, WeightsSource,
 };
 
 use crate::denoise::LEGAL_FRAME_COUNTS;
@@ -196,6 +214,29 @@ pub const DENOISE_RESIDENT_Q4_BYTES: u64 = 11_630_000_000;
 /// force-materializes the whole stack first; the render path does not, so neither is a render-time
 /// resident.
 pub const ADALN_EVICTED_BYTES: u64 = 26_020_915_200;
+
+/// **Denoise stage.** Bytes of the modulation table the precompute keeps in the projections' place,
+/// at the **longest schedule this model admits** — `MODULATION_PARAMS · modulation_rows ·
+/// hidden_size · DIT_BLOCKS` elements at bf16, with `modulation_rows` read off a real
+/// [`crate::model::MAX_STEPS`]-evaluation schedule rather than derived by hand
+/// (`the_retained_table_is_the_worst_case_over_the_admitted_schedule`).
+///
+/// **The evict is not free, and this is the price.** [`ADALN_EVICTED_BYTES`] is what the projections
+/// cost; this is what replaces them. The contract declares the *net* difference, because declaring
+/// the gross figure claims a saving the runtime does not deliver — the exact overstatement
+/// `the_declared_saving_does_not_exceed_the_measured_residency_drop` refuses.
+///
+/// **Why the worst case rather than the default schedule.** The table is linear in the schedule's
+/// distinct-timestep count and independent of resolution and duration (nothing in it has a token
+/// axis — `AdaLnCache::bytes`). The contract is static and has no request to read a step count
+/// from, so it must pick one point of that line. Under-declaring what the precompute keeps
+/// over-declares the saving, and an over-declared saving turns a suppressed configuration into an
+/// OOM; over-declaring it only leaves some of the win on the table. The asymmetry picks the end.
+pub const ADALN_MODULATION_TABLE_MAX_BYTES: u64 = 3_870_720_000;
+
+/// Contract-stable identity of the evictable AdaLN sub-stack, so a consumer can find the
+/// declaration by name rather than by matching on bytes.
+pub const ADALN_COMPONENT_ID: &str = "dit_adaln_proj_stack";
 
 // --- rung 2: the bounded-decode domain ---------------------------------------------------------
 
@@ -324,12 +365,54 @@ fn strategies() -> Vec<MemoryStrategyCapability> {
         .collect()
 }
 
+/// The AdaLN projection stack as a typed, evictable intra-transformer component (sc-18665).
+///
+/// Every field is an architecture or checkpoint fact rather than a resolved footprint, so this is
+/// identical in the production and weights-free contracts — which is what lets catalog conformance
+/// see the exclusion without a snapshot.
+///
+/// * `kind` is [`MemoryComponentKind::TransformerSubStack`], not `Transformer`: these bytes are
+///   already inside `asset_facts.transformer_bytes`, and naming a whole transformer would charge
+///   them twice.
+/// * `bounded_by` is `None` because **no rung bounds this**. `crate::model::generate_impl` passes
+///   [`crate::dit::adaln::AdaLnResidency::PrecomputeAndEvict`] as a *literal*, so nothing a request
+///   can select reaches the other arm, and `AdaLnCache::precompute_and_evict` refuses `Resident`
+///   outright. The type is not vacuous — `crate::dit::model` implements a live `Resident` arm for a
+///   solver whose evaluation timesteps are not enumerable up front, and `tests/adaln_cache.rs`
+///   drives it — but no shipped render selects it, which is what makes the exclusion declarable as
+///   an unconditional property of this provider rather than as a lever.
+fn adaln_component() -> MemoryResidentComponent {
+    MemoryResidentComponent {
+        id: ADALN_COMPONENT_ID.to_owned(),
+        kind: MemoryComponentKind::TransformerSubStack(TransformerComponent::Dit),
+        resident_bytes: ADALN_EVICTED_BYTES,
+        bounded_by: None,
+        residency: MemoryComponentResidency::PrecomputedThenEvicted {
+            // The projections are mapped with the rest of the DiT at the head of the denoise phase,
+            // consumed once to project the whole schedule's modulation, and released before the
+            // first denoise step. There is no earlier phase they survive into and no later one.
+            precomputed_in: MemoryPhase::Denoise,
+            retained_bytes: ADALN_MODULATION_TABLE_MAX_BYTES,
+            evidence: format!(
+                "tests/adaln_evict_real_weights.rs and tests/adaln_evict_memory.rs drive \
+                 AdaLnCache::precompute_and_evict and pin the phase pair through \
+                 common::assert_adaln_phase_envelope (sc-19449); the {ADALN_EVICTED_BYTES} B is \
+                 asserted against the sum over the 50 real adaln_proj tensors in crate::dit::adaln"
+            ),
+        },
+    }
+}
+
 fn build_contract(components: &ComponentBytes) -> MemoryProviderContract {
     MemoryProviderContract {
         provider_id: MODEL_ID.to_owned(),
         backend: MemoryBackendRealization::MlxMetal {
-            // The AdaLN evict and every phase release drain the allocator cache rather than
-            // migrating active → cache, so residency here is genuinely bounded.
+            // The AdaLN evict drains the allocator cache rather than migrating active → cache:
+            // `crate::dit::adaln::drain_allocator_cache` repeats `clear_cache()` while active is
+            // still falling. `model::release` and `mlx_gen::residency::clear_allocator_cache` call
+            // `clear_cache()` exactly once each, so this flag is NOT the claim it used to carry
+            // — that "the AdaLN evict AND EVERY PHASE RELEASE" drain — and the retracted half is
+            // deleted rather than restated. sc-17151 owns making the other two sites match.
             bounded_wired_residency: true,
             // MLX mmaps and materializes per tensor: a bare 66 GB `MiniMaxH3Dit::load` leaves peak
             // memory at 33 KB. This is the *intra-tensor* fact, and it is independent of
@@ -348,6 +431,13 @@ fn build_contract(components: &ComponentBytes) -> MemoryProviderContract {
         additional_prerequisites: Vec::new(),
         // Nothing to exclude: the cost-order default never drags in an unimplemented rung, because
         // `MemoryProviderContract::engages` already intersects with declared support.
+        //
+        // sc-18665 asked whether the AdaLN evict belongs here. It does not, and the two are not
+        // alternatives: a `MemoryStrategyEngagementExclusion` removes a *rung* from a selection's
+        // engaged composition, and the evict is not a rung — it removes *bytes* from a formula.
+        // Conformance would refuse the attempt anyway, since both ends of an exclusion must be
+        // implemented strategies. The evict is declared on the formula's resident component instead
+        // (`adaln_component`), which is also where its unconditionality is recorded.
         default_engagement_exclusions: Vec::new(),
         // The staged phase order is hardcoded in `generate_impl`, not a load-time default a
         // `GenerationMemory` block could switch off, so an explicit all-disabled block would
@@ -364,15 +454,22 @@ fn build_contract(components: &ComponentBytes) -> MemoryProviderContract {
             attention_chunking: false,
             transformer_window_materialization: false,
         },
-        // `PhaseEnvelope` is *max over phases*, which is the whole point for this family: the floor
-        // is `max(TE, DiT, VAE)`, never the sum, because the three are never co-resident.
+        // A phase envelope is *max over phases*, which is the whole point for this family: the
+        // floor is `max(TE, DiT, VAE)`, never the sum, because the three are never co-resident.
         //
-        // `FrameCount` is the axis no image family needed. It is declared even though today's
-        // observed peak is flat across duration, because that flatness belongs to the conditioning
-        // stage: the denoise and decode phase expressions are genuinely frame-dependent, and a
-        // formula that omitted the variable would be unable to express them once sc-19120 removes
-        // the TE's mark. `ConditioningTokenCount` is the conditioning phase's only real input.
-        formula: MemoryFormulaKind::PhaseEnvelope {
+        // `FrameCount` is the axis no image family needed. It is declared even though the peak
+        // sc-18659 observed was flat across duration, because that flatness belonged to the
+        // conditioning stage: the denoise and decode phase expressions are genuinely
+        // frame-dependent. sc-19120's packed text-encoder tiers landed and removed the TE's mark
+        // (see `CONDITIONING_STAGE_PEAK_Q4_BYTES`), so the later stages are legible and the
+        // variable is load-bearing rather than anticipatory. `ConditioningTokenCount` is the
+        // conditioning phase's only real input.
+        //
+        // sc-18665 makes this the *component* variant. The AdaLN projections are the one part of
+        // the DiT that does not survive into the denoise steady state, and a plain `PhaseEnvelope`
+        // has nowhere to say so — `asset_facts.transformer_bytes` is a single load-exact scalar, so
+        // an estimate built from it charges 26 GB the runtime does not hold.
+        formula: MemoryFormulaKind::ComponentPhaseEnvelope {
             phases: phases(),
             variables: vec![
                 MemoryFormulaVariable::AssetBytes,
@@ -385,6 +482,7 @@ fn build_contract(components: &ComponentBytes) -> MemoryProviderContract {
                 // calibration evidence and is NOT measured yet (see the sc-18660 notes).
                 MemoryFormulaVariable::DecodeTileArea,
             ],
+            resident_components: vec![adaln_component()],
         },
         calibration: Some(MemoryCalibrationIdentity::new(
             MEMORY_CALIBRATION_FINGERPRINT,
@@ -769,7 +867,10 @@ mod tests {
             "the fallback carries no calibration identity"
         );
         assert!(
-            matches!(contract.formula, MemoryFormulaKind::PhaseEnvelope { .. }),
+            matches!(
+                contract.formula,
+                MemoryFormulaKind::ComponentPhaseEnvelope { .. }
+            ),
             "the fallback formula is AssetBytesPlusHeadroom, got {:?}",
             contract.formula
         );
@@ -1605,6 +1706,299 @@ mod tests {
                 "the evicted projections are part of the DiT partition"
             )
         };
+    }
+
+    // --- sc-18665: the AdaLN evict as a typed intra-transformer exclusion -----------------------
+
+    /// The declared component, resolved off the shipped contract rather than off `adaln_component`,
+    /// so every assertion below travels the same seam a consumer does.
+    fn adaln_declaration() -> mlx_gen::gen_core::MemoryResidentComponent {
+        let components = declared().resident_components().to_vec();
+        assert_eq!(
+            components.len(),
+            1,
+            "the contract declares exactly one resident component: the AdaLN sub-stack"
+        );
+        assert_eq!(components[0].id, ADALN_COMPONENT_ID);
+        components[0].clone()
+    }
+
+    /// **AC1.** The 26.02 GB drop is in the declared formula, and the steady-state transformer
+    /// charge is lower than the load-exact one by exactly the net exclusion.
+    ///
+    /// Two literals, because a ratio alone would survive a consistent re-basing: the gross figure is
+    /// the loader's own [`ADALN_EVICTED_BYTES`] and the retained figure is
+    /// [`ADALN_MODULATION_TABLE_MAX_BYTES`]. Deleting the component, or flipping the formula back to
+    /// a plain `PhaseEnvelope`, takes the delta to zero and this red.
+    #[test]
+    fn the_declared_formula_carries_the_adaln_exclusion_as_a_typed_sub_stack() {
+        let root = tempfile::tempdir().expect("tempdir");
+        sparse_snapshot(root.path(), &[("transformer", DIT_BF16_BYTES)]);
+        let contract =
+            contract_for(&LoadSpec::new(WeightsSource::Dir(root.path().into()))).expect("contract");
+        assert!(contract.conformance_errors().is_empty());
+
+        let component = adaln_declaration();
+        assert_eq!(component.resident_bytes, ADALN_EVICTED_BYTES);
+        assert_eq!(
+            component.steady_state_bytes(),
+            ADALN_MODULATION_TABLE_MAX_BYTES
+        );
+        assert_eq!(
+            component.kind,
+            MemoryComponentKind::TransformerSubStack(TransformerComponent::Dit),
+            "these bytes are INSIDE transformer_bytes; a whole-Transformer kind charges them twice"
+        );
+
+        // The number the ladder's arithmetic sees change.
+        let net = ADALN_EVICTED_BYTES - ADALN_MODULATION_TABLE_MAX_BYTES;
+        assert_eq!(contract.evicted_component_bytes(), net);
+        assert_eq!(
+            contract.asset_facts.transformer_bytes - contract.steady_state_transformer_bytes(),
+            net,
+            "the post-precompute charge must be the load-exact one minus the net exclusion"
+        );
+        assert_eq!(
+            contract.steady_state_transformer_bytes(),
+            DIT_BF16_BYTES - net
+        );
+        // The exclusion is not free, and the contract says by how much.
+        assert!(
+            net < ADALN_EVICTED_BYTES,
+            "declaring the gross {ADALN_EVICTED_BYTES} B would claim a saving the precompute does \
+             not deliver: it keeps a modulation table in the projections' place"
+        );
+        // A sub-stack must not leak into the auxiliary legs — those are for networks beside the
+        // base model, and `overlay_bytes` would charge these bytes a second time.
+        assert_eq!(contract.auxiliary_resident_bytes(), 0);
+        assert_eq!(contract.asset_facts.overlay_bytes, 0);
+        assert_eq!(
+            contract.total_resident_bytes(),
+            contract.asset_facts.base_bytes
+        );
+    }
+
+    /// **AC1's negative half.** With the component removed the delta collapses to zero, so the
+    /// assertions above are grading the declaration rather than an accessor's arithmetic.
+    #[test]
+    fn removing_the_component_takes_the_declared_exclusion_to_zero() {
+        let mut stripped = declared();
+        let MemoryFormulaKind::ComponentPhaseEnvelope {
+            phases,
+            variables,
+            resident_components,
+        } = stripped.formula.clone()
+        else {
+            panic!("the shipped formula is a component envelope");
+        };
+        assert!(!resident_components.is_empty());
+        stripped.formula = MemoryFormulaKind::PhaseEnvelope { phases, variables };
+        assert_eq!(stripped.evicted_component_bytes(), 0);
+        assert_eq!(
+            stripped.steady_state_transformer_bytes(),
+            stripped.asset_facts.transformer_bytes,
+            "a plain PhaseEnvelope has nowhere to record the drop — this is the pre-sc-18665 state"
+        );
+        assert_ne!(declared().evicted_component_bytes(), 0);
+    }
+
+    /// **AC2.** The saving the contract claims may not exceed the saving the runtime was measured
+    /// to deliver, and may not fall short of it by more than the table the precompute retains.
+    ///
+    /// The tolerance is [`ADALN_MODULATION_TABLE_MAX_BYTES`] — a quantity the schedule domain fixes,
+    /// pinned to the real schedule by `the_retained_table_is_the_worst_case_over_the_admitted_schedule`
+    /// — not a window sized to fit the numbers. Both directions carry information:
+    ///
+    /// * **upper** — declaring the gross [`ADALN_EVICTED_BYTES`] as if the evict were free puts the
+    ///   claim 170_410_984 B above the measured drop, and this red. That is the overstatement the
+    ///   story's own measurement warned about.
+    /// * **lower** — declaring no eviction, or retaining more than the table, puts the claim below
+    ///   the measured drop by more than the table, and this red.
+    #[test]
+    fn the_declared_saving_does_not_exceed_the_measured_residency_drop() {
+        let contract = declared();
+        let claimed = contract.evicted_component_bytes();
+        // What the measurement says the drop was worth: the load-exact DiT against the residency
+        // measured through the denoise loop, after the precompute-and-evict.
+        let measured_drop = DIT_BF16_BYTES - DENOISE_RESIDENT_BF16_BYTES;
+
+        assert!(
+            claimed <= measured_drop,
+            "the contract claims a {claimed} B saving against a measured {measured_drop} B drop \
+             ({} B over). A declaration may under-claim; over-claiming turns a suppressed \
+             configuration into an OOM",
+            claimed.saturating_sub(measured_drop)
+        );
+        assert!(
+            claimed + ADALN_MODULATION_TABLE_MAX_BYTES >= measured_drop,
+            "the contract claims only {claimed} B of a measured {measured_drop} B drop; the \
+             shortfall {} B exceeds the {ADALN_MODULATION_TABLE_MAX_BYTES} B modulation table, \
+             which is the only thing that is supposed to account for it",
+            measured_drop.saturating_sub(claimed)
+        );
+
+        // The gross figure is bracketed the same way, which is the sharper statement: the whole
+        // disagreement between the projections' exact bytes and the measured residency drop is the
+        // retained table, and nothing else.
+        assert!(
+            ADALN_EVICTED_BYTES >= measured_drop,
+            "the evict cannot have released fewer bytes ({ADALN_EVICTED_BYTES}) than the residency \
+             it caused to drop ({measured_drop})"
+        );
+        assert!(
+            ADALN_EVICTED_BYTES - measured_drop <= ADALN_MODULATION_TABLE_MAX_BYTES,
+            "{} B of the eviction is unaccounted for once the retained table is allowed for",
+            ADALN_EVICTED_BYTES - measured_drop
+        );
+    }
+
+    /// **AC2's constants are bound to the code, not typed twice.**
+    ///
+    /// [`ADALN_EVICTED_BYTES`] is re-derived from the shipped DiT configuration the way
+    /// `crate::dit::adaln` derives it — `num_layers · (out_features · time_embed_dim + out_features)`
+    /// at 2 B — so a config change moves both together or this goes red. And
+    /// [`ADALN_MODULATION_TABLE_MAX_BYTES`] is read off a **real** [`crate::model::MAX_STEPS`]
+    /// schedule rather than from a row count guessed by hand.
+    #[test]
+    fn the_retained_table_is_the_worst_case_over_the_admitted_schedule() {
+        let config = crate::dit::MiniMaxH3DitConfig::default();
+        let out = config.adaln_out_features() as u64;
+        let derived = DIT_BLOCKS as u64 * (out * config.time_embed_dim as u64 + out) * 2;
+        assert_eq!(
+            derived, ADALN_EVICTED_BYTES,
+            "the declared eviction must be the shipped config's own projection bytes"
+        );
+
+        // `num_inference_steps` counts the terminal sigma = 0, at which the model is never
+        // evaluated, so the longest admitted run is `MAX_STEPS + 1` inference steps.
+        let longest = crate::denoise::JointSchedule::new(crate::model::MAX_STEPS as usize + 1)
+            .expect("the longest admitted schedule");
+        assert_eq!(longest.num_evals(), crate::model::MAX_STEPS as usize);
+        let rows = crate::denoise::adaln_schedule(&longest)
+            .expect("adaln schedule")
+            .modulation_rows() as u64;
+        let widest = crate::dit::config::MODULATION_PARAMS as u64
+            * rows
+            * config.hidden_size as u64
+            * DIT_BLOCKS as u64
+            * 2;
+        assert_eq!(
+            widest, ADALN_MODULATION_TABLE_MAX_BYTES,
+            "the declared retained table must be the widest one the admitted schedule can produce"
+        );
+
+        // …and it really is the worst case: a shorter schedule keeps strictly less. Without this
+        // the constant could be any figure at all and the equality above would still hold.
+        let default = crate::denoise::JointSchedule::new(crate::model::DEFAULT_STEPS as usize + 1)
+            .expect("the default schedule");
+        let default_rows = crate::denoise::adaln_schedule(&default)
+            .expect("adaln schedule")
+            .modulation_rows() as u64;
+        assert!(
+            default_rows < rows,
+            "the default schedule's {default_rows} rows must sit below the admitted maximum's \
+             {rows}, or the declaration is not conservative"
+        );
+    }
+
+    /// **AC5.** The evict is reachable on the real generate path, and the declaration is not merely
+    /// a statement about a mechanism nobody calls.
+    ///
+    /// This constructs what it watches rather than describing it: `AdaLnResidency` is the enum
+    /// `crate::model::generate_impl` passes, and `AdaLnCache::precompute_and_evict` is the function
+    /// that releases the bytes. It refuses [`crate::dit::adaln::AdaLnResidency::Resident`]
+    /// **before** touching the block stack, which is why an empty stack reaches the residency guard
+    /// here and not the "empty stack" one — so the arm that keeps 26 GB resident cannot be selected
+    /// by accident. The end-to-end drop itself is measured by `tests/adaln_evict_memory.rs` and
+    /// `tests/adaln_evict_real_weights.rs` through `common::assert_adaln_phase_envelope`.
+    #[test]
+    fn the_declared_eviction_is_reachable_on_the_generate_path() {
+        use crate::dit::adaln::{AdaLnCache, AdaLnResidency};
+
+        let schedule =
+            crate::denoise::adaln_schedule(&crate::denoise::JointSchedule::new(9).expect("joint"))
+                .expect("adaln schedule");
+        let refused =
+            AdaLnCache::precompute_and_evict(&mut [], schedule, AdaLnResidency::Resident, |_| {
+                unreachable!("the residency guard runs before the stack is touched")
+            })
+            .expect_err("Resident must not precompute");
+        assert!(
+            refused.to_string().contains("does not precompute"),
+            "the Resident arm must refuse rather than silently evict: {refused}"
+        );
+
+        // The contract's evidence string names the tests that drive the positive direction, so a
+        // reader can follow the declaration to an executable measurement.
+        let MemoryComponentResidency::PrecomputedThenEvicted { evidence, .. } =
+            adaln_declaration().residency
+        else {
+            panic!("the AdaLN component declares an eviction");
+        };
+        for named in ["adaln_evict_real_weights.rs", "assert_adaln_phase_envelope"] {
+            assert!(
+                evidence.contains(named),
+                "the declared evidence must name {named}, got: {evidence}"
+            );
+        }
+    }
+
+    /// **AC6.** The evict is **unconditional**, not opt-in and not rung-selected, and the contract
+    /// says so in the only two places that can carry it.
+    ///
+    /// `default_engagement_exclusions` is asserted empty on purpose: it is the seam the story
+    /// offered as an alternative, and it is not applicable. An exclusion removes a *rung* from a
+    /// selection's engaged composition — conformance requires both ends to be implemented
+    /// strategies — where this removes *bytes* from a formula. The last arm proves that is not
+    /// merely an opinion: attempting to express the eviction there is refused.
+    #[test]
+    fn adaln_eviction_is_unconditional_not_rung_selected() {
+        let root = tempfile::tempdir().expect("tempdir");
+        sparse_snapshot(root.path(), &[("transformer", DIT_BF16_BYTES)]);
+        let contract =
+            contract_for(&LoadSpec::new(WeightsSource::Dir(root.path().into()))).expect("contract");
+        assert!(
+            contract.default_engagement_exclusions.is_empty(),
+            "an engagement exclusion removes a rung, not bytes"
+        );
+        assert_eq!(
+            adaln_declaration().bounded_by,
+            None,
+            "no rung bounds this: crate::model passes PrecomputeAndEvict as a literal, so there is \
+             no selection that keeps the projections loaded"
+        );
+        // The charge is the same whatever a request selects, including the plain resident rung —
+        // which is what "unconditional" means, and would be false if the drop were a lever. Read
+        // through `engaged_composition` so the loop covers compositions a caller can actually
+        // select rather than an enum this accessor never sees.
+        for strategy in MemoryStrategy::ALL {
+            assert!(
+                !contract
+                    .engaged_composition(strategy)
+                    .iter()
+                    .any(|rung| adaln_declaration().bounded_by == Some(*rung)),
+                "{strategy:?} must not engage a rung that bounds the AdaLN stack — there is none"
+            );
+            assert_eq!(
+                contract.steady_state_transformer_bytes(),
+                DIT_BF16_BYTES - (ADALN_EVICTED_BYTES - ADALN_MODULATION_TABLE_MAX_BYTES),
+                "{strategy:?} must not change the AdaLN charge"
+            );
+        }
+
+        // And the alternative seam is genuinely closed rather than merely unused.
+        let mut misdeclared = declared();
+        misdeclared.default_engagement_exclusions.push(
+            mlx_gen::gen_core::MemoryStrategyEngagementExclusion {
+                selection: MemoryStrategy::StagedResidency,
+                excluded_rung: MemoryStrategy::BoundedAttention,
+                evidence: "the AdaLN evict".to_owned(),
+            },
+        );
+        assert!(
+            !misdeclared.conformance_errors().is_empty(),
+            "an exclusion naming a rung this provider does not implement must fail conformance"
+        );
     }
 
     // --- the declaration facts that are easy to get wrong ----------------------------------------
