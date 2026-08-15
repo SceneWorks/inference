@@ -858,7 +858,20 @@ impl MiniMaxH3 {
                         // crate says what the encoder does.
                         let keep = crate::conditioning::snap_reference_frames_down(v.frames.len())
                             .min(v.frames.len());
-                        debug_assert!(keep >= crate::reference::MIN_REFERENCE_CLIP_FRAMES);
+                        // A hard refusal, not a `debug_assert!` — for the same reason stated at the
+                        // task check above: release builds strip those, so the one configuration
+                        // that would actually encode off the lattice is the one with no check. The
+                        // two upstream floors (`validate` and `normalize_reference_clip`) make this
+                        // unreachable; that is the argument for it being cheap, not for it being
+                        // absent.
+                        if keep < crate::reference::MIN_REFERENCE_CLIP_FRAMES {
+                            return Err(CandleError::Msg(format!(
+                                "{MODEL_ID}: reference {i} snapped to {keep} frames, below the \
+                                 {}-frame `17n + 5` floor — the normalized clip reached the \
+                                 encoder off the lattice",
+                                crate::reference::MIN_REFERENCE_CLIP_FRAMES
+                            )));
+                        }
                         let pixels = reference_clip_to_vae_pixels(&v.frames[..keep], &self.device)?;
                         let c = encode_reference_condition(
                             &vae,
@@ -1327,7 +1340,43 @@ impl Generator for MiniMaxH3 {
         // This is also where the task's OWN checkpoint is required to be present: `ref2va` needs
         // `transformer_ref/`, and this runs before a single weight is read. See
         // [`task_component_dirs`] for why that is not a `load`-time check.
-        self.resolve_task(req)?;
+        let (_, references) = self.resolve_task(req)?;
+
+        // **The clip-length floor, on the same side of the boundary as everything else** (sc-17157).
+        //
+        // `MIN_REFERENCE_CLIP_FRAMES` was enforced only inside `normalize_reference_clip`, whose
+        // sole production caller is `generate_ref2va`. So `validate` ADMITTED a short clip that
+        // `generate` then refused — precisely the late failure this method exists to prevent, and
+        // one the crate's own tests had frozen in place by building 4-frame clips and asserting
+        // they validate.
+        //
+        // # Why here and not in `resolve_task`
+        //
+        // The surviving frame count depends on the request's `num_frames`, so the check needs the
+        // geometry. Putting it in `resolve_task` would mean calling `request_geometry` there, and
+        // `resolve_task` is reached from `generate_impl` too — geometry would be resolved twice per
+        // render, and a t2va/fl2va request carrying no clip at all would start failing INSIDE task
+        // selection on an error that has nothing to do with which checkpoint it needs.
+        //
+        // `validate` is where request admission already lives, and the "single decision point"
+        // property `resolve_task` is documented for is about the CHECKPOINT, which is untouched.
+        // The reference caps — 9 images, 3 clips, 12 total, audio-never-alone — are likewise
+        // enforced outside `resolve_task`, in `Ref2VaReferences::new`. So this follows the crate's
+        // existing shape rather than departing from it, and error ordering stays legible: the
+        // task's own checkpoint first, then the geometry-dependent admission.
+        if let Some(references) = references {
+            let geometry = self.request_geometry(req)?;
+            for r in references.as_slice() {
+                if let Ref2VaReference::Video(v) = r {
+                    crate::reference::normalized_clip_frame_count(
+                        v.frames.len(),
+                        v.fps,
+                        geometry.joint.num_frames,
+                        MINIMAX_H3_FPS,
+                    )?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -2005,7 +2054,9 @@ mod tests {
 
         let image = ref_conditioning();
         let video = Conditioning::ReferenceVideo {
-            frames: vec![ref_image(64, 64); 4],
+            // 24, not 4: at 24 fps source == kept, and `MIN_REFERENCE_CLIP_FRAMES` is 22.
+            // A 4-frame clip is REFUSED by `validate` now, which is the point of the floor.
+            frames: vec![ref_image(64, 64); 24],
             fps: 24.0,
             audio: None,
         };
@@ -2091,7 +2142,9 @@ mod tests {
 
         let image = || ref_conditioning();
         let video = || Conditioning::ReferenceVideo {
-            frames: vec![ref_image(64, 64); 4],
+            // 24, not 4: at 24 fps source == kept, and `MIN_REFERENCE_CLIP_FRAMES` is 22.
+            // A 4-frame clip is REFUSED by `validate` now, which is the point of the floor.
+            frames: vec![ref_image(64, 64); 24],
             fps: 24.0,
             audio: None,
         };
@@ -2199,7 +2252,8 @@ mod tests {
             prompt: "p".into(),
             conditioning: vec![
                 Conditioning::ReferenceVideo {
-                    frames: vec![ref_image(64, 64); 4],
+                    // 30 at 30 fps normalizes to 24 frames, clearing the 22-frame floor.
+                    frames: vec![ref_image(64, 64); 30],
                     fps: 30.0,
                     audio: None,
                 },
@@ -2498,7 +2552,8 @@ mod tests {
             (
                 "video",
                 vec![Conditioning::ReferenceVideo {
-                    frames: vec![ref_image(64, 64); 4],
+                    // 24 frames at 24 fps — see the floor note above.
+                    frames: vec![ref_image(64, 64); 24],
                     fps: 24.0,
                     audio: None,
                 }],
@@ -2547,6 +2602,93 @@ mod tests {
             .unwrap();
         assert_eq!(task, MiniMaxH3Task::Fl2va);
         assert_eq!(task.partition(), BASE_DIT_PARTITION);
+    }
+
+    /// **`validate` refuses exactly the clips `generate` would refuse** (sc-17157).
+    ///
+    /// `MIN_REFERENCE_CLIP_FRAMES` used to be enforced only inside `normalize_reference_clip`,
+    /// which runs deep inside `generate_ref2va`. `validate` therefore ADMITTED a short clip that
+    /// `generate` then rejected, after the video VAE and the audio encoder had been mapped — the
+    /// late-failure shape this whole story removes. Four tests in this module had frozen the defect
+    /// in place by building 4-frame clips and asserting they validate; they now build clips that
+    /// clear the floor, and this is the negative half they were missing.
+    ///
+    /// The last loop drives BOTH sides on the same inputs, so "the boundary and the render agree"
+    /// is executed rather than asserted.
+    #[test]
+    fn validate_refuses_a_clip_shorter_than_the_vae_chunk_floor() {
+        use candle_gen::gen_core::Conditioning;
+
+        use crate::reference::MIN_REFERENCE_CLIP_FRAMES;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = staged_root_with_reference(&tmp);
+        let model = MiniMaxH3::load(&LoadSpec::new(WeightsSource::Dir(root.clone()))).unwrap();
+        let generator = load(&LoadSpec::new(WeightsSource::Dir(root))).unwrap();
+        let base = GenerationRequest {
+            prompt: "a cellist on a rooftop".into(),
+            width: 1344,
+            height: 768,
+            ..Default::default()
+        };
+        let clip = |frames: usize, fps: f32| GenerationRequest {
+            conditioning: vec![Conditioning::ReferenceVideo {
+                frames: vec![ref_image(64, 64); frames],
+                fps,
+                audio: None,
+            }],
+            ..base.clone()
+        };
+
+        // The default geometry is well above the floor, so it is the FLOOR that bites below and not
+        // the `num_frames` truncation.
+        let num_frames = model.request_geometry(&base).unwrap().joint.num_frames;
+        assert!(num_frames > MIN_REFERENCE_CLIP_FRAMES, "{num_frames}");
+
+        // Clips that normalize BELOW 22, including the 13..=21 window the floor exists for —
+        // `sample_video_condition_frames`' own minimum is 13, so that window was reachable.
+        for (frames, fps) in [(4usize, 24.0f32), (21, 24.0), (4, 30.0), (26, 30.0)] {
+            let e = match generator.validate(&clip(frames, fps)) {
+                Ok(()) => panic!(
+                    "{frames} frames at {fps} fps normalizes below the floor and must be refused \
+                     by validate, not by generate"
+                ),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                e.contains(&format!("{MIN_REFERENCE_CLIP_FRAMES}-frame floor"))
+                    && e.contains("17n + 5"),
+                "{frames}@{fps}: the refusal must name the floor it hit: {e}"
+            );
+        }
+
+        // Controls: AT the floor is admitted, so this is a floor and not a ban on clips.
+        for (frames, fps) in [(22usize, 24.0f32), (24, 24.0), (28, 30.0)] {
+            generator.validate(&clip(frames, fps)).unwrap_or_else(|e| {
+                panic!("{frames}@{fps} clears the floor and must validate: {e}")
+            });
+        }
+
+        // **The two sides agree on the same input.** What `validate` admits the render path admits,
+        // and what it refuses the render path refuses. That gap IS the defect, so it is the thing
+        // asserted rather than each side's behavior separately.
+        for (frames, fps) in [(4usize, 24.0f32), (21, 24.0), (22, 24.0), (30, 30.0)] {
+            let by_validate = generator.validate(&clip(frames, fps)).is_ok();
+            let by_render = crate::reference::normalize_reference_clip(
+                &vec![ref_image(64, 64); frames],
+                f64::from(fps),
+                num_frames,
+                SPATIAL_STRIDE as i32,
+                CANVAS_SHORT_EDGE as i32,
+                i64::from(crate::pipeline::CANVAS_MAX_PIXELS),
+                MINIMAX_H3_FPS,
+            )
+            .is_ok();
+            assert_eq!(
+                by_validate, by_render,
+                "{frames}@{fps}: validate and the render path disagree — that gap IS the defect"
+            );
+        }
     }
 
     /// The descriptor advertises what this lane can actually do — and, just as load-bearing, does

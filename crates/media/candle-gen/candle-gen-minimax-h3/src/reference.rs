@@ -237,6 +237,87 @@ pub fn normalize_reference_image(image: &Image, canvas_multiple: i32) -> Result<
     crate::keyframe::fit_keyframe(image, tw, th, crate::keyframe::KeyframeFit::Stretch)
 }
 
+/// How many output frames each source frame is held for — `ffmpeg`'s `fps` filter schedule.
+///
+/// Pixel-free and shared: [`normalized_clip_frame_count`] sums it and [`normalize_reference_clip`]
+/// expands it, so the count the engine boundary admits and the count the render produces are the
+/// same arithmetic rather than two copies of it.
+fn resample_repeats(source_len: usize, fps: f64, target_fps: f64) -> Vec<usize> {
+    if (fps - target_fps).abs() < f64::EPSILON {
+        return vec![1; source_len];
+    }
+    let scale = target_fps / fps;
+    let slot = |i: usize| (i as f64 * scale + 0.5).floor() as i64;
+    let end = (source_len as f64 * scale + 0.5).floor() as i64;
+    (0..source_len)
+        .map(|i| {
+            let next = if i + 1 < source_len { slot(i + 1) } else { end };
+            (next - slot(i)).max(0) as usize
+        })
+        .collect()
+}
+
+/// **The frame count [`normalize_reference_clip`] will produce, decided without a pixel.**
+///
+/// Steps 1 and 2 of the normalization — resample onto `target_fps`, truncate to `num_frames` — plus
+/// every refusal that depends only on counts: an empty clip, a non-positive rate, a resample that
+/// leaves nothing, and the [`MIN_REFERENCE_CLIP_FRAMES`] floor.
+///
+/// # Why this is a separate function
+///
+/// The floor used to be enforced only inside `normalize_reference_clip`, whose sole production
+/// caller is `crate::model::generate_ref2va`. So `Generator::validate` **admitted** a short clip
+/// that `generate` then refused — the late-failure shape the rest of sc-17157 removes, and one the
+/// crate's own tests had frozen in place by building 4-frame clips and asserting they validate.
+///
+/// The surviving count depends on the request's `num_frames`, which is why `Ref2VaReferences::new`
+/// cannot check it: the reference list is built before the geometry is resolved. `validate` has
+/// both, so it calls this; see `MiniMaxH3::validate` for why it lands there rather than inside
+/// `resolve_task`.
+///
+/// Splitting the decision out is what keeps the two callers from drifting: `normalize_reference_clip`
+/// does not re-derive the count, it *consumes* the one this returns.
+pub fn normalized_clip_frame_count(
+    source_len: usize,
+    fps: f64,
+    num_frames: usize,
+    target_fps: f64,
+) -> Result<usize> {
+    if source_len == 0 {
+        return Err(CandleError::Msg(
+            "minimax-h3 ref2va: cannot normalize a clip with no frames".into(),
+        ));
+    }
+    if !fps.is_finite() || fps <= 0.0 {
+        return Err(CandleError::Msg(format!(
+            "minimax-h3 ref2va: a reference clip must carry a positive frame rate, got {fps}"
+        )));
+    }
+    // 1. onto the 24 fps grid, and 2. truncate to the generated duration.
+    let total: usize = resample_repeats(source_len, fps, target_fps).iter().sum();
+    let kept = total.min(num_frames);
+    if kept == 0 {
+        return Err(CandleError::Msg(format!(
+            "minimax-h3 ref2va: resampling a {source_len}-frame clip from {fps} onto \
+             {target_fps} fps left no frames"
+        )));
+    }
+    // 2b. **One whole VAE chunk, or nothing.** `crate::model::generate_ref2va` snaps the kept count
+    // DOWN to the `17n + 5` lattice and then takes `.min(frames.len())`, so a normalized clip
+    // between `sample_video_condition_frames`' own 13-frame minimum and 21 would reach the encoder
+    // OFF the lattice — a regime nothing in this crate specifies, tests or bounds. Refused here,
+    // where the caller can still be told, rather than composed into an untested encode.
+    if kept < MIN_REFERENCE_CLIP_FRAMES {
+        return Err(CandleError::Msg(format!(
+            "minimax-h3 ref2va: a {source_len}-frame clip at {fps} fps normalizes to {kept} frames \
+             at {target_fps} fps, below the {MIN_REFERENCE_CLIP_FRAMES}-frame floor — the video \
+             VAE encodes on a `17n + 5` lattice whose smallest chunk is \
+             {MIN_REFERENCE_CLIP_FRAMES} frames, and a shorter clip would be encoded off it"
+        )));
+    }
+    Ok(kept)
+}
+
 /// Resample a **video** reference's frames onto MiniMax-H3's own 24 fps, truncate to the generated
 /// frame count, and put them on the canvas their own aspect ratio resolves to.
 ///
@@ -246,6 +327,10 @@ pub fn normalize_reference_image(image: &Image, canvas_multiple: i32) -> Result<
 /// output frames — `ffmpeg`'s `fps` filter, which is what the released model was conditioned
 /// through. Nothing is blended: a reference at 30 fps has frames **dropped**, one at 12 fps has
 /// frames **duplicated**. Interpolating instead would invent motion the model never saw.
+///
+/// Steps 1-2 and every count-only refusal live in [`normalized_clip_frame_count`], which
+/// `Generator::validate` calls on the same inputs — so this function cannot admit a clip the
+/// boundary refused, or refuse one it admitted.
 ///
 /// The canvas here is the *shared* canvas rule (short edge and area cap), unlike
 /// [`normalize_reference_image`] — a clip is put on a canvas, a still is not.
@@ -259,59 +344,15 @@ pub fn normalize_reference_clip(
     canvas_max_pixels: i64,
     target_fps: f64,
 ) -> Result<Vec<Image>> {
-    if frames.is_empty() {
-        return Err(CandleError::Msg(
-            "minimax-h3 ref2va: cannot normalize a clip with no frames".into(),
-        ));
-    }
-    if !fps.is_finite() || fps <= 0.0 {
-        return Err(CandleError::Msg(format!(
-            "minimax-h3 ref2va: a reference clip must carry a positive frame rate, got {fps}"
-        )));
-    }
-    // 1. onto the 24 fps grid.
-    let resampled: Vec<&Image> = if (fps - target_fps).abs() < f64::EPSILON {
-        frames.iter().collect()
-    } else {
-        let scale = target_fps / fps;
-        let slot = |i: usize| (i as f64 * scale + 0.5).floor() as i64;
-        let end = (frames.len() as f64 * scale + 0.5).floor() as i64;
-        let mut out: Vec<&Image> = Vec::new();
-        for (i, f) in frames.iter().enumerate() {
-            let next = if i + 1 < frames.len() {
-                slot(i + 1)
-            } else {
-                end
-            };
-            let repeat = (next - slot(i)).max(0);
-            out.extend(std::iter::repeat_n(f, repeat as usize));
-        }
-        out
-    };
-    // 2. truncate to the generated duration.
-    let kept: Vec<&Image> = resampled.into_iter().take(num_frames).collect();
-    if kept.is_empty() {
-        return Err(CandleError::Msg(format!(
-            "minimax-h3 ref2va: resampling a {}-frame clip from {fps} onto {target_fps} fps left \
-             no frames",
-            frames.len()
-        )));
-    }
-    // 2b. **One whole VAE chunk, or nothing.** `crate::model::generate_ref2va` snaps the kept count
-    // DOWN to the `17n + 5` lattice and then takes `.min(frames.len())`, so a normalized clip
-    // between `sample_video_condition_frames`' own 13-frame minimum and 21 would reach the encoder
-    // OFF the lattice — a regime nothing in this crate specifies, tests or bounds. Refused here,
-    // where the caller can still be told, rather than composed into an untested encode.
-    if kept.len() < MIN_REFERENCE_CLIP_FRAMES {
-        return Err(CandleError::Msg(format!(
-            "minimax-h3 ref2va: a {}-frame clip at {fps} fps normalizes to {} frames at \
-             {target_fps} fps, below the {MIN_REFERENCE_CLIP_FRAMES}-frame floor — the video VAE \
-             encodes on a `17n + 5` lattice whose smallest chunk is \
-             {MIN_REFERENCE_CLIP_FRAMES} frames, and a shorter clip would be encoded off it",
-            frames.len(),
-            kept.len()
-        )));
-    }
+    // Steps 1-2 and every count-only refusal, decided once. The count is CONSUMED rather than
+    // re-derived, so this function and `Generator::validate` cannot disagree about a clip.
+    let keep = normalized_clip_frame_count(frames.len(), fps, num_frames, target_fps)?;
+    let kept: Vec<&Image> = frames
+        .iter()
+        .zip(resample_repeats(frames.len(), fps, target_fps))
+        .flat_map(|(f, repeat)| std::iter::repeat_n(f, repeat))
+        .take(keep)
+        .collect();
     // 3. onto the canvas its OWN aspect ratio resolves to.
     let (h, w) = crate::keyframe::resolve_canvas_size(
         f64::from(kept[0].width),
