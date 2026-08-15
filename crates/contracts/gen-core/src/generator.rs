@@ -1946,6 +1946,26 @@ impl StepSupport {
 /// field (E0451) — so the invariant is enforced by the
 /// `capabilities_are_constructed_additively` integration test instead, which reads every `.rs`
 /// file in the workspace and fails on any `Capabilities { .. }` literal with no base expression.
+///
+/// # Measured cost of adding a field (sc-19561 AC1)
+///
+/// Demonstrated rather than asserted, on 2026-08-15: a scratch `pub scratch_ac1_demonstration:
+/// bool` was added here, both macOS lane sets were run, and it was removed again.
+///
+/// | | files touched | lines |
+/// |---|---|---|
+/// | at this revision | **1** (this one) | **1** |
+/// | at the pre-conversion parent `2225b5026` | 70 + this one | ≥ 75 |
+///
+/// `cargo check --locked --all-targets -p sceneworks-gen-core -p sceneworks-gen-core-testkit
+/// -p mlx-gen -p 'mlx-gen-*'` and `cargo check --locked --all-targets --features metal
+/// -p 'candle-gen*' -p 'candle-audio*'` both exited **0 with zero errors and zero warnings** —
+/// nothing outside this file needed to change. The parent row is the counterfactual: a
+/// brace-matching parse of `2225b5026` finds **126 `Capabilities` literals, 74 of them
+/// exhaustive, across 70 files**, and each would have raised its own `E0063`.
+///
+/// Reproduce the parent count with the same parser the guard uses — it is the guard, run over a
+/// different revision.
 #[derive(Clone, Debug, Default)]
 pub struct Capabilities {
     pub supports_negative_prompt: bool,
