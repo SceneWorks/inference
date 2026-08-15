@@ -144,8 +144,42 @@ pub const AUDIO_VAE_BYTES: u64 = 605_429_340;
 // so the attribution is greppable, testable and cannot silently drift.
 
 /// **Conditioning stage.** The dense Qwen3-VL-32B text encoder measured in isolation: 53.07 GB.
-/// This, not the DiT, is the ~53 GB floor. sc-19120 publishes a packed TE tier that removes it.
+/// This, not the DiT, is the ~53 GB floor.
 pub const CONDITIONING_STAGE_PEAK_BYTES: u64 = 53_070_000_000;
+
+/// **Conditioning stage, packed `q4` tier** — 14.43 GB (sc-19120), against the 53.07 GB dense
+/// datum. A **38.64 GB** reduction, and the single largest memory change in this model.
+///
+/// Measured by `tests/te_tier_real_weights.rs` on the stage in its own process, with the encoder
+/// forced through a forward first: MLX mmaps lazily, and a bare 66 GB load leaves the peak at
+/// ~33 KB. The same run's `get_active_memory` is 14.19 GB against the encoder's own
+/// `nbytes()` accounting of 14.15 GB, so essentially nothing dense survives the tiering.
+///
+/// End to end at `384x224 / 124 frames`, per stage (`tests/te_tier_generate_stages.rs`):
+///
+/// | stage | dense TE | q8 TE | q4 TE |
+/// |---|---:|---:|---:|
+/// | conditioning | **52.80** | **26.91** | **14.68** |
+/// | DiT load + AdaLN precompute | 12.66 | 12.66 | 12.66 |
+/// | denoise (q4 DiT) | 12.75 | 12.75 | 12.75 |
+/// | decode | 5.77 | 5.77 | 5.77 |
+/// | **process** | **52.80** | **26.91** | **14.68** |
+///
+/// Two things that table settles. The DiT column is finally *legible* — every later stage was
+/// sitting under a 40 GB shadow before. And the conditioning stage is still the tallest one even
+/// packed, but by 1.93 GB rather than 40.05 GB, so the model's floor is now the DiT's residency
+/// rather than its conditioner's.
+///
+/// **This is not the 12 GB ComfyUI footprint and does not claim to be.** The whole DiT is still
+/// held resident through the denoise; bounding *that* is sc-18662's block streaming, and the two
+/// stories are a pair — neither reaches consumer hardware alone.
+pub const CONDITIONING_STAGE_PEAK_Q4_BYTES: u64 = 14_430_000_000;
+
+/// **Conditioning stage, packed `q8` tier** — 26.94 GB in isolation (26.91 GB end to end).
+///
+/// Sits between the two: half the dense stage, and still above the q4 DiT's 12.75 GB denoise, so
+/// q8 leaves the conditioner as the binding stage by a wide margin where q4 does not.
+pub const CONDITIONING_STAGE_PEAK_Q8_BYTES: u64 = 26_940_000_000;
 
 /// **Denoise stage.** DiT weights resident through the denoise loop at bf16, after the AdaLN
 /// precompute-and-evict: 40.43 GB — 12.64 GB *below* the conditioning stage's mark.
@@ -1514,6 +1548,42 @@ mod tests {
             ADALN_EVICTED_BYTES, 26_020_915_200,
             "the exact bytes crate::dit::adaln releases"
         );
+
+        // --- the packed text-encoder tiers (sc-19120) ---------------------------------------
+        assert_eq!(
+            CONDITIONING_STAGE_PEAK_Q4_BYTES, 14_430_000_000,
+            "conditioning stage on the packed q4 text-encoder tier, measured in isolation"
+        );
+        assert_eq!(
+            CONDITIONING_STAGE_PEAK_Q8_BYTES, 26_940_000_000,
+            "conditioning stage on the packed q8 text-encoder tier, measured in isolation"
+        );
+        assert_eq!(
+            CONDITIONING_STAGE_PEAK_BYTES - CONDITIONING_STAGE_PEAK_Q4_BYTES,
+            38_640_000_000,
+            "dense -> q4 conditioning-stage reduction: the largest single memory change in this \
+             model, and larger than the DiT's own 28.80 GB"
+        );
+        // The tier ladder is monotone and the stage really is tiered — a packed TE that measured
+        // at or above the dense datum would mean the pack never engaged.
+        const {
+            assert!(
+                CONDITIONING_STAGE_PEAK_Q4_BYTES < CONDITIONING_STAGE_PEAK_Q8_BYTES
+                    && CONDITIONING_STAGE_PEAK_Q8_BYTES < CONDITIONING_STAGE_PEAK_BYTES,
+                "the conditioning stage must fall monotonically q4 < q8 < dense"
+            )
+        };
+        // **What the pair still owes.** Packed q4 puts the conditioner (14.43 GB) within 2.8 GB of
+        // the q4 DiT's own denoise residency (11.63 GB), so the floor is now the DiT's — which
+        // sc-18662's bounded transformer residency is what bounds. Neither story reaches a
+        // consumer-GPU footprint alone, and this assertion is the reason why, in executable form.
+        const {
+            assert!(
+                CONDITIONING_STAGE_PEAK_Q4_BYTES > DENOISE_RESIDENT_Q4_BYTES,
+                "if the packed conditioner ever fell below the q4 denoise residency, the DiT would \
+                 be the sole floor and this comment would be stale"
+            )
+        };
         const {
             assert!(
                 ADALN_EVICTED_BYTES < DIT_BF16_BYTES,

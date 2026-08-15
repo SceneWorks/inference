@@ -11,9 +11,14 @@
 //!
 //! On the self-hosted Windows CUDA runner (sc-18677) the snapshot is provisioned at
 //! `E:\huggingface\hub\models--MiniMaxAI--MiniMax-H3\snapshots\939557dc319dd91227e30195a763f272ba7f8765`.
-//! Everything loads at **f32** so the numbers are comparable with the committed-fixture lane; that
-//! is ~19.4 GB resident for the video decoder and ~1.2 GB for the audio one. Two of the tests below
-//! read only safetensors headers and cost no weight I/O at all.
+//! Everything loads at **f32** so the numbers are comparable with the committed-fixture lane. That
+//! is FREE rather than expensive, which earlier revisions of this note had backwards: both
+//! components ship F32 already — `vae/` is 703 of 703 tensors F32 and `audio_vae/` 1087 of 1087,
+//! measured from the published headers — so `DType::F32` is a no-op cast, not a doubling. The
+//! decode halves these tests load are **9.03 GiB** (585 `decoder.*` + `post_quant_conv.*` tensors)
+//! and **0.242 GiB** (914 `dec_in_proj.*` + `decoder.*`), where this file used to claim ~19.4 GB
+//! and ~1.2 GB. The bf16 component in this checkpoint is `transformer/`, which none of these load.
+//! Several of the tests below read only safetensors headers and cost no weight I/O at all.
 //!
 //! **A skipped run must not look like a passing one.** An `#[ignore]`d test that returns early when
 //! its input is missing prints `ok` in 0.00s, which reads exactly like success. Every test here
@@ -394,7 +399,7 @@ fn declared_encoder_shapes_match_the_published_checkpoint() {
 
 /// Load the real 36-layer decoder and decode a small latent end to end.
 #[test]
-#[ignore = "needs a real MiniMax-H3 snapshot (MINIMAX_H3_SNAPSHOT); ~19.4 GB resident at f32"]
+#[ignore = "needs a real MiniMax-H3 snapshot (MINIMAX_H3_SNAPSHOT); 9.03 GiB of all-F32 decode-half parameters"]
 fn real_weight_decode_produces_a_plausible_video() {
     let root = snapshot();
     let dev = device();
@@ -755,7 +760,7 @@ fn real_weight_tiling_changes_the_encode() {
 /// cross-fade, so this exercises the blend and the chunk-advance arithmetic that the single-chunk
 /// smoke above never reaches.
 #[test]
-#[ignore = "needs a real MiniMax-H3 snapshot (MINIMAX_H3_SNAPSHOT); ~19.4 GB resident at f32"]
+#[ignore = "needs a real MiniMax-H3 snapshot (MINIMAX_H3_SNAPSHOT); 9.03 GiB of all-F32 decode-half parameters"]
 fn real_weight_multi_chunk_decode_blends_the_seam() {
     let root = snapshot();
     let dev = device();
@@ -898,7 +903,7 @@ fn declared_audio_tensor_names_match_the_published_checkpoint() {
 
 /// Load the real ~605 MB audio VAE and decode a stereo latent end to end.
 #[test]
-#[ignore = "needs a real MiniMax-H3 snapshot (MINIMAX_H3_SNAPSHOT); ~1.2 GB resident at f32"]
+#[ignore = "needs a real MiniMax-H3 snapshot (MINIMAX_H3_SNAPSHOT); 0.242 GiB of all-F32 decode-half parameters"]
 fn real_weight_audio_decode_produces_a_plausible_stereo_track() {
     let root = snapshot();
     let dev = device();
