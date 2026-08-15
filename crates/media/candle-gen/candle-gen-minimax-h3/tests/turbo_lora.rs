@@ -791,22 +791,55 @@ fn expected_target_alpha(spelling: AlphaSpelling, block_diagonal: bool) -> f32 {
     }
 }
 
+/// How a ComfyUI twin declares its fused `attn.qkv_proj`: the alpha, **where** that alpha lives, and
+/// which of the two legitimate fused shapes to write.
+#[derive(Clone, Copy, Debug)]
+struct FusedQkvSpec {
+    alpha: f32,
+    spelling: AlphaSpelling,
+    block_diagonal: bool,
+}
+
+impl FusedQkvSpec {
+    /// The standard fixture: [`FUSED_ALPHA`] in `spelling`, at the chosen fused shape.
+    fn new(spelling: AlphaSpelling, block_diagonal: bool) -> Self {
+        Self {
+            alpha: FUSED_ALPHA,
+            spelling,
+            block_diagonal,
+        }
+    }
+
+    /// The same, at an explicit alpha — for the arms that pin the published `24 → 8` pairing.
+    fn at(alpha: f32, block_diagonal: bool) -> Self {
+        Self {
+            alpha,
+            spelling: AlphaSpelling::InBand,
+            block_diagonal,
+        }
+    }
+}
+
 /// Build a **ComfyUI** twin of a diffusers module set, at one block, from the same underlying
 /// factors — so the two files describe the *same* adapter and any difference in the folded result is
 /// the conversion's fault.
 ///
-/// `block_diagonal` selects which of the two legitimate fused forms to write; `spelling` selects
-/// **where the fused alpha lives**, which is the axis the AC2 gate was blind along.
+/// `fused.block_diagonal` selects which of the two legitimate fused forms to write;
+/// `fused.spelling` selects **where the fused alpha lives**, which is the axis the AC2 gate was
+/// blind along.
 fn write_comfyui_twin(
     dir: &Path,
     name: &str,
     cfg: &MiniMaxH3DitConfig,
-    alpha: f32,
-    spelling: AlphaSpelling,
-    block_diagonal: bool,
+    fused: FusedQkvSpec,
     qkv: &[(Tensor, Tensor); 3],
     fc1: (&Tensor, &Tensor),
 ) -> PathBuf {
+    let FusedQkvSpec {
+        alpha,
+        spelling,
+        block_diagonal,
+    } = fused;
     let path = dir.join(name);
     let r = PUBLISHED_RANK;
     let out = cfg.inner_dim();
@@ -1038,9 +1071,7 @@ fn assert_twin_equivalence(spelling: AlphaSpelling) {
             dir.path(),
             &format!("comfy_{block_diagonal}_{spelling:?}.safetensors"),
             &cfg,
-            FUSED_ALPHA,
-            spelling,
-            block_diagonal,
+            FusedQkvSpec::new(spelling, block_diagonal),
             twin_qkv,
             (&fc1.0, &fc1.1),
         );
@@ -1185,9 +1216,7 @@ fn assert_alpha_resolves_before_the_split(spelling: AlphaSpelling) {
             dir.path(),
             &format!("chain_{block_diagonal}_{spelling:?}.safetensors"),
             &cfg,
-            FUSED_ALPHA,
-            spelling,
-            block_diagonal,
+            FusedQkvSpec::new(spelling, block_diagonal),
             &qkv,
             (&fc1.0, &fc1.1),
         );
@@ -1270,9 +1299,7 @@ fn the_alpha_division_tracks_the_rank_split_and_is_not_the_default() {
         dir.path(),
         "a48.safetensors",
         &cfg,
-        48.0,
-        AlphaSpelling::InBand,
-        true,
+        FusedQkvSpec::at(48.0, true),
         &qkv,
         (&fc1.0, &fc1.1),
     );
@@ -1293,9 +1320,7 @@ fn the_alpha_division_tracks_the_rank_split_and_is_not_the_default() {
         dir.path(),
         "a24.safetensors",
         &cfg,
-        24.0,
-        AlphaSpelling::InBand,
-        true,
+        FusedQkvSpec::at(24.0, true),
         &qkv,
         (&fc1.0, &fc1.1),
     );
@@ -1311,9 +1336,7 @@ fn the_alpha_division_tracks_the_rank_split_and_is_not_the_default() {
         dir.path(),
         "shared.safetensors",
         &cfg,
-        48.0,
-        AlphaSpelling::InBand,
-        false,
+        FusedQkvSpec::at(48.0, false),
         &qkv,
         (&fc1.0, &fc1.1),
     );
@@ -1336,9 +1359,7 @@ fn the_conversion_leaves_no_comfyui_module_behind() {
         dir.path(),
         "c.safetensors",
         &cfg,
-        24.0,
-        AlphaSpelling::InBand,
-        true,
+        FusedQkvSpec::at(24.0, true),
         &qkv,
         (&fc1.0, &fc1.1),
     );
