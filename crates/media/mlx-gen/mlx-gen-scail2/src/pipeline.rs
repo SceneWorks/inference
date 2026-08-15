@@ -59,7 +59,6 @@ pub fn descriptor() -> ModelDescriptor {
             },
             supports_negative_prompt: true,
             supports_guidance: true,
-            supports_true_cfg: false,
             // Reference character image (Reference) + its color-coded segmentation mask (Mask); extra
             // characters (MultiReference, experimental); the driving video + its per-frame color masks
             // map to ControlClip.
@@ -76,36 +75,17 @@ pub fn descriptor() -> ModelDescriptor {
             supports_lora: true,
             supports_lokr: true,
             samplers: vec!["unipc", "dpm++"],
-            schedulers: Vec::new(),
-            supported_guidance_methods: vec![],
             min_size: 32,
             max_size: 1280,
             max_count: 1,
-            // Not a distilled fixed-schedule model: any step count the shared sanity caps
-            // admit is renderable (sc-19502).
-            supported_steps: Vec::new(),
             mac_only: true,
             supported_quants: &[Quant::Q4, Quant::Q8],
-            component_precision_floors: &[],
             supports_kv_cache: true,
-            requires_sigma_shift: false,
             // The root-only provider always stages UMT5 + CLIP ahead of the DiT and has no
             // request-selectable Resident mode. This is physical staging, not a shared control.
             supports_sequential_offload: false,
             unconditionally_engages_staged_residency: true,
-            supports_preview: false,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
+            ..Default::default()
         },
     }
 }

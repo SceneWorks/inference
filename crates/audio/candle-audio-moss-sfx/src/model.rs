@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex};
 
 use candle_audio::gen_core::{
     self, AudioTrack, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec,
-    Modality, ModelDescriptor, Progress, SizeFloor, WeightsSource,
+    Modality, ModelDescriptor, Progress, StepSupport, WeightsSource,
 };
 
 use crate::pipeline::{
@@ -104,50 +104,31 @@ pub fn descriptor() -> ModelDescriptor {
             // `cfg_scale` pair).
             supports_negative_prompt: true,
             supports_guidance: true,
-            supports_true_cfg: false,
-            conditioning: Vec::new(),
-            supports_lora: false,
-            supports_lokr: false,
             // The native flow-match Euler integrator is the only sampler; no selectable
             // sampler/scheduler surface is advertised (an explicit request is a typed
             // Unsupported via the shared floor).
             samplers: vec![],
-            schedulers: vec![],
-            supported_guidance_methods: vec![],
             // Audio models skip the size floor (validate_request_audio); these bounds are the
             // audio-lane convention for a size-less descriptor.
             // Pure audio: no width/height. The descriptor sweep exempts Audio from the size floor
             // (sc-13314) and `validate_request_audio` skips the range, so these stay at the natural
             // unused 0 rather than a nominal placeholder bound.
             min_size: 0,
-            max_size: 0,
             // One clip per request (GenerationOutput::Audio carries a single track).
             max_count: 1,
-            // Not a distilled fixed-schedule model: any step count the shared sanity caps
-            // admit is renderable (sc-19502).
-            supported_steps: Vec::new(),
-            mac_only: false,
+            // The 1000-timestep training grid's ceiling, advertised rather than hidden
+            // (sc-19559).
+            supported_steps: StepSupport::Range {
+                min: 1,
+                max: MAX_STEPS,
+            },
             audio_sample_rates: vec![SAMPLE_RATE],
             max_audio_duration_secs: Some(MAX_DURATION_SECS),
             // No voice surface — this is SFX/ambience, not TTS; an explicit `audio.voice`
             // is rejected by the shared floor as Unsupported.
             audio_voices: vec![],
             audio_languages: LANGUAGES.to_vec(),
-            audio_edit_modes: vec![],
-            supported_quants: &[],
-            component_precision_floors: &[],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
-            supports_sequential_offload: false,
-            unconditionally_engages_staged_residency: false,
-            supports_preview: false,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            size_floor: SizeFloor::RangeChecked,
+            ..Default::default()
         },
     }
 }

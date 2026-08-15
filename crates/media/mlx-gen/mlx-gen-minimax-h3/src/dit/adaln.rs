@@ -401,45 +401,15 @@ impl TimestepSchedule {
     }
 }
 
-/// Drain attempts [`drain_allocator_cache`] makes before giving up. 8 × 2 ms bounds the whole drain
-/// at ~16 ms, against a denoise measured in minutes.
-const DRAIN_ATTEMPTS: usize = 8;
-
 /// Return the evicted buffers to the system allocator, retrying while MLX's cache keeps refilling.
 ///
-/// **One [`mlx_rs::memory::clear_cache`] is not reliably enough.** A buffer reaches MLX's allocator
-/// cache when its last reference drops, but the Metal command buffer that used it retains its
-/// resources until it is retired, and that retirement is not guaranteed to have happened by the
-/// time [`mlx_rs::transforms::eval`] returns. A single drain can therefore run *before* some of the
-/// weights have been handed back, and those land in the cache with nothing left to sweep them.
-///
-/// Measured on a synthetic 8-block stack under concurrent test load: a single drain left one
-/// block's 18 MiB projection still counted as **active** — its last real reference being an
-/// unretired command buffer — in roughly one run in five, while the same measurement in isolation
-/// released all 8 every time.
-///
-/// The loop therefore watches **active**, not the cache. Stopping as soon as the cache reads empty
-/// would return on the first pass — the seven already-freed buffers sweep cleanly and the cache
-/// *is* empty — leaving the straggler to reach the cache a moment later with nothing left to sweep
-/// it. Stopping when active stops falling is the condition that actually describes "the runtime has
-/// finished handing buffers back".
-///
-/// This cannot mask a real leak: a buffer that is still referenced never reaches the cache at all,
-/// so no amount of draining releases it, and the loop exits after two passes having freed nothing.
-/// `tests/adaln_evict_memory.rs`'s control arm is the proof — with the forced evaluation removed
-/// the drain frees 0.0 of 144.3 MiB, however many times it runs.
+/// This *was* the retry loop's only home. sc-17151 hoisted it verbatim into
+/// [`mlx_gen::residency::drain_allocator_cache`] — where the module docs, the sc-17145 measurement
+/// behind the retry, and the CPU-side sweep-count tests now live — so that this eviction, the
+/// shared `MlxResidencyRuntime::after_component_drop` seam and `crate::model`'s per-phase `release`
+/// all sweep the same way instead of two of the three sweeping once.
 fn drain_allocator_cache() {
-    let mut previous = usize::MAX;
-    for _ in 0..DRAIN_ATTEMPTS {
-        mlx_rs::memory::clear_cache();
-        let active = mlx_rs::memory::get_active_memory();
-        if active >= previous {
-            return;
-        }
-        previous = active;
-        std::thread::sleep(std::time::Duration::from_millis(2));
-    }
-    mlx_rs::memory::clear_cache();
+    mlx_gen::residency::drain_allocator_cache();
 }
 
 /// Reject an index tensor that would gather out of bounds. See [`TimestepSchedule::adaln_indices`].

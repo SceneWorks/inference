@@ -82,6 +82,7 @@ use candle_gen::candle_core::{Device, Tensor};
 use candle_gen::{CandleError, Result};
 
 use crate::denoise::packing::{TEXT_TAG, VIDEO_TAG};
+use crate::reference::ReferencePresentation;
 
 /// The seven specials MiniMax adds over upstream Qwen, in the exact order they appear in
 /// `tokenizer_config.json`'s `additional_special_tokens`. **Order is the id assignment**, so this
@@ -137,6 +138,29 @@ const PAD_TOKEN_ID: u32 = 151643;
 const VISION_START: &str = "<|vision_start|>";
 const VISION_END: &str = "<|vision_end|>";
 const IMAGE_PAD: &str = "<|image_pad|>";
+/// The pad `ref2va` video references use. `fl2va` uses [`IMAGE_PAD`] and never this one, which is
+/// what lets the grounded forward tell a clip's blocks from a still's.
+const VIDEO_PAD: &str = "<|video_pad|>";
+
+/// One entry of the `ref2va` presentation, before any vocabulary is consulted.
+///
+/// See [`MiniMaxH3Tokenizer::ref2va_emit_plan`]. The two variants correspond to the reference
+/// conditioner's two emit closures, and the distinction is load-bearing at the **tag** level: a
+/// `Text` run is tagged [`TEXT_TAG`] and a `Vision` block — start marker, pads and end marker alike
+/// — is tagged [`VIDEO_TAG`], which addresses a different block of the DiT's AdaLN modulation table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ref2VaEmit {
+    /// A literal string, tokenized verbatim with no special tokens.
+    Text(String),
+    /// One `<|vision_start|>` … pads … `<|vision_end|>` block.
+    Vision {
+        /// `true` for `<|video_pad|>` (a clip's block), `false` for `<|image_pad|>` (a still's).
+        /// The two pads are what let the grounded forward tell a clip's blocks from a still's.
+        video_pad: bool,
+        /// Merged vision tokens between the two markers.
+        num_tokens: usize,
+    },
+}
 
 /// The resolved id for every special token this crate names, derived from the shipped
 /// `tokenizer_config.json` rather than hardcoded.
@@ -396,6 +420,163 @@ impl MiniMaxH3Tokenizer {
         Ok((input_ids, mask, tags))
     }
 
+    /// Render one video reference's per-block timestamp label, `"<0.2 seconds>"`.
+    ///
+    /// The reference spells this `f"<{timestamp:.1f} seconds>"`, and Python's `format` rounds
+    /// **half to even** on the exact binary value — which is why a 2 fps pair's mean renders as
+    /// `"<0.2 seconds>"` rather than `"<0.3 seconds>"`. Rust's `{:.1}` uses the same rule on the
+    /// same value, verified over the half-way cases by
+    /// `the_timestamp_label_rounds_half_to_even_like_python`. Wrapped in a named function so the
+    /// claim has one place to be pinned rather than being an invisible property of a format string.
+    pub fn timestamp_label(seconds: f64) -> String {
+        format!("<{seconds:.1} seconds>")
+    }
+
+    /// The **`ref2va` presentation** with its per-row modality tags —
+    /// `(input_ids, attention_mask, token_tags)`.
+    ///
+    /// The sibling of [`Self::encode_fl2va`], and the differences are all semantic:
+    ///
+    /// * **Three modalities, numbered independently from 1.** `"<Picture i>"`, `"<Audio j>"` and
+    ///   `"<Video k>"` each carry their own counter, so the third image is `<Picture 3>` however
+    ///   many clips preceded it.
+    /// * **A reference that carries sound emits `"<Audio j>: "` BEFORE its visual label**, mirroring
+    ///   the order its rows are packed in. For a standalone audio reference that label is the whole
+    ///   contribution.
+    /// * **A waveform never reaches the conditioner.** An audio reference contributes a text label
+    ///   and *no* vision block — [`ReferencePresentation::Audio`] carries no token count because
+    ///   there is nothing to count.
+    /// * **A video reference emits one timestamped vision block per merged frame pair**, each
+    ///   `"<t seconds>"` label followed by its own `<|video_pad|>` block. `<|video_pad|>` appears
+    ///   only here; `fl2va` uses `<|image_pad|>` and nothing else.
+    ///
+    /// Ids and tags are built in lockstep for the same reason [`Self::encode_fl2va`] does it:
+    /// a vision block's rows are tagged **video** ([`VIDEO_TAG`]) and address a different block of
+    /// the AdaLN modulation table than the text rows around them, and that split cannot be
+    /// recovered from a finished id vector without re-scanning for pad ids.
+    pub fn encode_ref2va(
+        &self,
+        prompt: &str,
+        references: &[ReferencePresentation],
+        device: &Device,
+    ) -> Result<(Tensor, Tensor, Vec<u32>)> {
+        let (start, end) = (self.special_id(VISION_START)?, self.special_id(VISION_END)?);
+        let (image_pad, video_pad) = (self.special_id(IMAGE_PAD)?, self.special_id(VIDEO_PAD)?);
+
+        let mut ids: Vec<u32> = Vec::new();
+        let mut tags: Vec<u32> = Vec::new();
+        for emit in Self::ref2va_emit_plan(prompt, references)? {
+            match emit {
+                Ref2VaEmit::Text(s) => {
+                    let t = self.encode(&s)?;
+                    tags.extend(std::iter::repeat_n(TEXT_TAG, t.len()));
+                    ids.extend(t);
+                }
+                Ref2VaEmit::Vision {
+                    video_pad: is_video,
+                    num_tokens,
+                } => {
+                    let pad = if is_video { video_pad } else { image_pad };
+                    ids.push(start);
+                    ids.extend(std::iter::repeat_n(pad, num_tokens));
+                    ids.push(end);
+                    // `<|vision_start|>`, every pad and `<|vision_end|>` are ALL video rows.
+                    tags.extend(std::iter::repeat_n(VIDEO_TAG, num_tokens + 2));
+                }
+            }
+        }
+
+        if ids.len() != tags.len() {
+            return Err(CandleError::Msg(format!(
+                "minimax-h3 tokenizer: {} ids against {} tags",
+                ids.len(),
+                tags.len()
+            )));
+        }
+        let (input_ids, mask) = Self::to_arrays(ids, device)?;
+        Ok((input_ids, mask, tags))
+    }
+
+    /// The **ordered emit plan** [`Self::encode_ref2va`] tokenizes — every label and vision block,
+    /// in sequence order, with no vocabulary involved.
+    ///
+    /// Split out because it is the whole of the presentation's *semantics* — the per-modality
+    /// numbering, the audio-label-leads rule, one timestamped block per merged frame pair — and none
+    /// of it needs a tokenizer. Keeping it inline would leave those rules reachable only through a
+    /// path that requires a real `tokenizer.json`, so the only available test would be one that
+    /// re-implemented the rules and then agreed with itself.
+    ///
+    /// The `prompt` is the final [`Ref2VaEmit::Text`], appended verbatim.
+    pub fn ref2va_emit_plan(
+        prompt: &str,
+        references: &[ReferencePresentation],
+    ) -> Result<Vec<Ref2VaEmit>> {
+        let mut plan: Vec<Ref2VaEmit> = Vec::new();
+        let (mut n_image, mut n_video, mut n_audio) = (0usize, 0usize, 0usize);
+
+        for (i, r) in references.iter().enumerate() {
+            // The `<Audio j>` label leads for every reference that contributes audio rows —
+            // a standalone audio reference and a video reference carrying its own soundtrack alike.
+            let has_audio = matches!(
+                r,
+                ReferencePresentation::Audio
+                    | ReferencePresentation::Video {
+                        has_audio: true,
+                        ..
+                    }
+            );
+            if has_audio {
+                n_audio += 1;
+                plan.push(Ref2VaEmit::Text(format!("<Audio {n_audio}>: ")));
+            }
+            match r {
+                ReferencePresentation::Audio => {}
+                ReferencePresentation::Image { num_tokens } => {
+                    if *num_tokens == 0 {
+                        return Err(CandleError::Msg(format!(
+                            "minimax-h3 tokenizer: reference {i} is an image contributing no \
+                             vision tokens"
+                        )));
+                    }
+                    n_image += 1;
+                    plan.push(Ref2VaEmit::Text(format!("<Picture {n_image}>: ")));
+                    plan.push(Ref2VaEmit::Vision {
+                        video_pad: false,
+                        num_tokens: *num_tokens,
+                    });
+                }
+                ReferencePresentation::Video {
+                    num_tokens,
+                    timestamps,
+                    ..
+                } => {
+                    if *num_tokens == 0 {
+                        return Err(CandleError::Msg(format!(
+                            "minimax-h3 tokenizer: reference {i} is a clip whose vision blocks \
+                             contribute no tokens"
+                        )));
+                    }
+                    if timestamps.is_empty() {
+                        return Err(CandleError::Msg(format!(
+                            "minimax-h3 tokenizer: reference {i} is a clip with no vision blocks"
+                        )));
+                    }
+                    n_video += 1;
+                    plan.push(Ref2VaEmit::Text(format!("<Video {n_video}>: ")));
+                    for &t in timestamps {
+                        plan.push(Ref2VaEmit::Text(Self::timestamp_label(t)));
+                        plan.push(Ref2VaEmit::Vision {
+                            video_pad: true,
+                            num_tokens: *num_tokens,
+                        });
+                    }
+                }
+            }
+        }
+        plan.push(Ref2VaEmit::Text(prompt.to_owned()));
+        Ok(plan)
+    }
+
     /// Build the `[1, L]` id / mask pair on `device`.
     ///
     /// Both tensors are **u32**: the ids because candle's embedding lookup is an `index_select`,
@@ -576,5 +757,130 @@ mod tests {
             !r.contains("<|im_start|>"),
             "no chat template on the grounded path either"
         );
+    }
+
+    /// **`{:.1}` rounds half to EVEN, matching Python's `format`** — which is what makes a 2 fps
+    /// pair's mean render as `"<0.2 seconds>"` rather than `"<0.3 seconds>"`.
+    ///
+    /// The exact-half cases are the whole point, and they are the only ones where half-to-even and
+    /// half-away-from-zero disagree. `0.25` is the value the first merged block of every video
+    /// reference actually carries (`(0.0 + 0.5) / 2`), so this is not a synthetic corner: a port
+    /// that formatted with half-away-from-zero mislabels the first block of every clip.
+    ///
+    /// Note `0.15` and `0.35` are NOT exact halves in binary — `0.15` is just below and `0.35` just
+    /// above — so their correct renderings are `0.1` and `0.3`, decided by the stored value rather
+    /// than by the tie rule. They are included because a port that "fixed" the tie rule by adding an
+    /// epsilon would break exactly these.
+    #[test]
+    fn the_timestamp_label_rounds_half_to_even_like_python() {
+        // Exact binary halves: ties go to the EVEN neighbour.
+        assert_eq!(
+            MiniMaxH3Tokenizer::timestamp_label(0.25),
+            "<0.2 seconds>",
+            "0.25 ties DOWN to the even 0.2 — the first block of every 2 fps clip"
+        );
+        assert_eq!(MiniMaxH3Tokenizer::timestamp_label(0.75), "<0.8 seconds>");
+        assert_eq!(MiniMaxH3Tokenizer::timestamp_label(1.25), "<1.2 seconds>");
+        assert_eq!(MiniMaxH3Tokenizer::timestamp_label(2.75), "<2.8 seconds>");
+        // Half-away-from-zero would have given 0.3 / 0.8 / 1.3 / 2.8 — so the first three
+        // assertions above each discriminate the two rules.
+
+        // Not exact halves: the stored double decides, not the tie rule.
+        assert_eq!(MiniMaxH3Tokenizer::timestamp_label(0.15), "<0.1 seconds>");
+        assert_eq!(MiniMaxH3Tokenizer::timestamp_label(0.35), "<0.3 seconds>");
+
+        // Whole and integral values keep their one decimal place.
+        assert_eq!(MiniMaxH3Tokenizer::timestamp_label(0.0), "<0.0 seconds>");
+        assert_eq!(MiniMaxH3Tokenizer::timestamp_label(1.0), "<1.0 seconds>");
+        assert_eq!(MiniMaxH3Tokenizer::timestamp_label(12.5), "<12.5 seconds>");
+    }
+
+    /// The **`ref2va` presentation plan**, driven through the shipped
+    /// [`MiniMaxH3Tokenizer::ref2va_emit_plan`] rather than reconstructed here.
+    ///
+    /// Four things are pinned at once, and each is a rule a plausible port gets wrong:
+    ///
+    /// * the three modality counters advance **independently** — the second image is
+    ///   `<Picture 2>` however many clips preceded it;
+    /// * a reference that carries audio emits its `"<Audio j>: "` label **before** its visual one,
+    ///   mirroring the order its rows are packed in;
+    /// * a video reference emits **one timestamped block per merged frame pair**, on the VIDEO pad;
+    /// * an audio reference contributes a label and **no vision block at all**.
+    #[test]
+    fn the_reference_presentation_numbers_per_modality_and_leads_with_audio() {
+        use crate::reference::ReferencePresentation;
+
+        let refs = [
+            ReferencePresentation::Image { num_tokens: 4 },
+            ReferencePresentation::Video {
+                num_tokens: 2,
+                timestamps: vec![0.25, 1.0],
+                has_audio: true,
+            },
+            ReferencePresentation::Audio,
+            ReferencePresentation::Image { num_tokens: 1 },
+        ];
+        let plan = MiniMaxH3Tokenizer::ref2va_emit_plan("a cellist", &refs).unwrap();
+
+        let text = |s: &str| Ref2VaEmit::Text(s.to_owned());
+        let image_block = |n| Ref2VaEmit::Vision {
+            video_pad: false,
+            num_tokens: n,
+        };
+        let video_block = |n| Ref2VaEmit::Vision {
+            video_pad: true,
+            num_tokens: n,
+        };
+        assert_eq!(
+            plan,
+            vec![
+                text("<Picture 1>: "),
+                image_block(4),
+                // The clip's soundtrack label LEADS its visual label.
+                text("<Audio 1>: "),
+                text("<Video 1>: "),
+                text("<0.2 seconds>"),
+                video_block(2),
+                text("<1.0 seconds>"),
+                video_block(2),
+                // A standalone audio reference is a label and nothing else.
+                text("<Audio 2>: "),
+                // ...and the image counter did not advance past it.
+                text("<Picture 2>: "),
+                image_block(1),
+                // The prompt is appended verbatim, with no cue after it.
+                text("a cellist"),
+            ]
+        );
+
+        // Degenerate presentations are refused rather than emitting an empty block, which would
+        // tokenize into a `<|vision_start|><|vision_end|>` pair the model has never seen.
+        for (bad, expect) in [
+            (
+                vec![ReferencePresentation::Image { num_tokens: 0 }],
+                "contributing no",
+            ),
+            (
+                vec![ReferencePresentation::Video {
+                    num_tokens: 0,
+                    timestamps: vec![0.0],
+                    has_audio: false,
+                }],
+                "contribute no tokens",
+            ),
+            (
+                vec![ReferencePresentation::Video {
+                    num_tokens: 2,
+                    timestamps: Vec::new(),
+                    has_audio: false,
+                }],
+                "no vision blocks",
+            ),
+        ] {
+            let e = MiniMaxH3Tokenizer::ref2va_emit_plan("p", &bad)
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains(expect), "expected {expect:?}, got {e}");
+        }
     }
 }

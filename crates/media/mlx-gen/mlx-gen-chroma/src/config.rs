@@ -10,7 +10,6 @@
 
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, Capabilities, Modality, ModelDescriptor, Quant,
-    SizeFloor,
 };
 
 pub const CHROMA1_HD_ID: &str = "chroma1_hd";
@@ -108,7 +107,6 @@ impl ChromaVariant {
                 // v1 = T2I only. ControlNet / IP-Adapter / img2img are later ports.
                 conditioning: vec![],
                 supported_quants: &[Quant::Q4, Quant::Q8],
-                component_precision_floors: &[],
                 // LoRA/LoKr via the shared core adapter seam (sc-3842), over the diffusers/peft
                 // (and kohya) `transformer_blocks.*`/`single_transformer_blocks.*` paths.
                 supports_lora: true,
@@ -129,36 +127,18 @@ impl ChromaVariant {
                     s.push("linear");
                     s
                 },
-                supported_guidance_methods: vec![],
                 min_size: 256,
                 max_size: 2048,
                 max_count: 8,
-                // Not a distilled fixed-schedule model: any step count the shared sanity caps
-                // admit is renderable (sc-19502).
-                supported_steps: Vec::new(),
                 mac_only: true,
-                supports_kv_cache: false,
                 // FLUX-style flow-match sigma shift (calculate_shift) is applied in the generate path.
                 requires_sigma_shift: true,
                 // Wired onto the shared `Residency` seam (sc-10840); honors Sequential offload —
                 // drops the T5-XXL encoder after the prompt encode so peak unified memory is bounded
                 // to `max(T5, DiT+VAE)` instead of their sum.
                 supports_sequential_offload: true,
-                unconditionally_engages_staged_residency: false,
                 supports_preview: true,
-                supports_prompt_enhancement: false,
-                supports_streaming: false,
-                supports_multi_speaker: false,
-                supports_conversation_history: false,
-                supports_conversation_session: false,
-                max_speakers: None,
-                // No audio surface (sc-12834): pure image/video model.
-                audio_sample_rates: vec![],
-                max_audio_duration_secs: None,
-                audio_voices: vec![],
-                audio_languages: vec![],
-                audio_edit_modes: vec![],
-                size_floor: SizeFloor::RangeChecked,
+                ..Default::default()
             },
         }
     }

@@ -44,7 +44,7 @@ use std::sync::{Arc, Mutex};
 use candle_gen::candle_core::{Device, Tensor};
 use candle_gen::gen_core::{
     self, Capabilities, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest,
-    Generator, Image, LoadSpec, Modality, ModelDescriptor, PidWeights, Progress, Quant, SizeFloor,
+    Generator, Image, LoadSpec, Modality, ModelDescriptor, PidWeights, Progress, Quant,
     WeightsSource,
 };
 use candle_transformers::models::z_image::vae::Encoder;
@@ -295,51 +295,24 @@ pub fn descriptor() -> ModelDescriptor {
         backend: "candle",
         modality: Modality::Image,
         capabilities: Capabilities {
-            supports_negative_prompt: false,
             supports_guidance: true,
-            supports_true_cfg: false,
             // Base/Turbo are text-to-image, and a single `Reference` opts them into img2img latent-init
             // (sc-11786): VAE-encode the reference + noise-blend at a strength-derived start step. The
             // multi-image instruction-edit path is the Edit checkpoint's (`descriptor_edit`).
             conditioning: vec![ConditioningKind::Reference],
-            supports_lora: false,
-            supports_lokr: false,
             // Base is rectified-flow Euler over the static-shift schedule, routed through the unified
             // curated-sampler framework (epic 7114).
             samplers: candle_gen::curated_sampler_names(),
             schedulers: candle_gen::curated_scheduler_names(),
-            supported_guidance_methods: vec![],
             min_size: 256,
             max_size: 2048,
             max_count: 8,
-            // Not a distilled fixed-schedule model: any step count the shared sanity caps
-            // admit is renderable (sc-19502).
-            supported_steps: Vec::new(),
-            mac_only: false,
             // sc-9607: advertise the packed tiers so the worker's A-B quant toggle engages off-Mac.
             // The resolved `base/`-`-q4/`-`-bf16/` turnkey subdir self-describes its tier
             // (`loader::linear_detect`, sc-9410, group-size-aware); `build` no-ops the requested quant.
             // Turbo + edit inherit this via `descriptor()`.
             supported_quants: &[Quant::Q4, Quant::Q8],
-            component_precision_floors: &[],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
-            supports_sequential_offload: false,
-            unconditionally_engages_staged_residency: false,
-            supports_preview: false,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
+            ..Default::default()
         },
     }
 }

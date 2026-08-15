@@ -35,7 +35,7 @@ use mlx_rs::Dtype;
 use mlx_gen::gen_core::{
     reject_unknown_components, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
     GenerationRequest, Generator, KeyframeRef, LoadSpec, Modality, ModelDescriptor, Precision,
-    Progress, Quant, SizeFloor, WeightsSource,
+    Progress, Quant, StepSupport, WeightsSource,
 };
 use mlx_gen::runtime::AdapterSpec;
 use mlx_gen::weights::Weights;
@@ -90,8 +90,6 @@ pub fn descriptor() -> ModelDescriptor {
         capabilities: Capabilities {
             // Guidance-distilled: no unconditional branch exists anywhere in the checkpoint.
             supports_negative_prompt: false,
-            supports_guidance: false,
-            supports_true_cfg: false,
             // **One kind covers all three keyframe shapes.** `Keyframe` carries a `frame_idx`, and
             // first-only / last-only / first+last are one, one and two of them — see
             // [`keyframe_anchors`] for why last-frame-only is a payload shape rather than a mode
@@ -126,20 +124,17 @@ pub fn descriptor() -> ModelDescriptor {
             // as the [`DIT_COMPONENT`]. `spec.quantize` is reconciled against the staged tier's
             // marker rather than triggering a load-time quantize; see [`reconcile_tier`].
             supported_quants: &[Quant::Q4, Quant::Q8],
-            component_precision_floors: &[],
-            samplers: Vec::new(),
-            schedulers: Vec::new(),
-            supported_guidance_methods: vec![],
             min_size: SPATIAL_STRIDE,
             max_size: 1344,
             max_count: 1,
-            // Not a distilled fixed-schedule model: any step count the shared sanity caps
-            // admit is renderable (sc-19502).
-            supported_steps: Vec::new(),
+            // The provider's step bound, advertised rather than hidden (sc-19559). `validate`
+            // below still refuses the same counts; this is what makes the bound readable
+            // weights-free, which matters most for a model whose text encoder is ~53 GB.
+            supported_steps: StepSupport::Range {
+                min: 1,
+                max: MAX_STEPS,
+            },
             mac_only: true,
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
-            supports_sequential_offload: false,
             // The TE → DiT → VAE phase order is hardcoded in `generate_impl`, not a load-time
             // default a `GenerationMemory` block could switch off, so every generate stages
             // physically whatever residency the request selects. This is why
@@ -148,23 +143,13 @@ pub fn descriptor() -> ModelDescriptor {
             // `supports_sequential_offload` above: the staging is unconditional, but no *selectable*
             // Sequential control is wired onto the shared residency seam.
             unconditionally_engages_staged_residency: true,
-            supports_preview: false,
             // No enhancement surface exists in this crate: `enhance_prompt` is ignored, so
             // advertising it would describe a toggle a UI must not present as effective.
             supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
             // The audio surface describes a *selectable* audio request (voice / language / rate),
             // which a video model has none of — the soundtrack rides `GenerationOutput::Video`.
             audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
+            ..Default::default()
         },
     }
 }
@@ -773,9 +758,16 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 
 /// Release a component's device memory for real: drop the Rust handle, then drain MLX's allocator
 /// cache so the buffers go back to the system rather than migrating active → cache.
+///
+/// The drain is the **shared retried** one ([`mlx_gen::residency::drain_allocator_cache`]), not a
+/// bare `clear_cache()`. sc-17145 measured a single sweep leaving a straggler counted as active in
+/// roughly one run in five under load, because the Metal command buffer that used the weights had
+/// not retired by the time `eval` returned; every phase boundary in [`MiniMaxH3::generate_impl`]
+/// and [`MiniMaxH3::generate_ref2va`] hands 10–67 GB back through this function, so the straggler
+/// is a whole component's worth.
 fn release<T>(component: T) {
     drop(component);
-    mlx_rs::memory::clear_cache();
+    mlx_gen::residency::drain_allocator_cache();
 }
 
 impl MiniMaxH3 {
@@ -1831,7 +1823,8 @@ mod tests {
     fn track() -> mlx_gen::media::AudioTrack {
         mlx_gen::media::AudioTrack {
             samples: vec![0.0; 64],
-            sample_rate: 24_000,
+            // The engine ships no resampler, so `Ref2VaReferences::new` admits only this rate.
+            sample_rate: AUDIO_SAMPLE_RATE,
             channels: 1,
             stems: Vec::new(),
         }

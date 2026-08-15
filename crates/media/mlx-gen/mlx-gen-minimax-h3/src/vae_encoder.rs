@@ -624,7 +624,15 @@ mod tests {
         let p = zero_pad_front_time(&x, 2).unwrap();
         assert_eq!(p.shape(), &[1, 4, 1, 1, 1]);
         assert_eq!(p.as_slice::<f32>(), &[0.0, 0.0, 1.0, 2.0]);
-        assert!(zero_pad_front_time(&x, -1).is_err());
+        // Asserted by MESSAGE (sc-19488): a negative pad reaches `zeros_dtype` as a negative
+        // dimension with the guard deleted, which mlx rejects on its own.
+        let msg = zero_pad_front_time(&x, -1)
+            .expect_err("a negative temporal pad must be refused")
+            .to_string();
+        assert!(
+            msg.contains("minimax-h3 encoder: temporal pad must be non-negative"),
+            "the sign guard must be what rejects this, not a negative-dimension fault: {msg}"
+        );
         // A non-NDHWC tensor is a typed error, not a silent reshape.
         assert!(zero_pad_front_time(&Array::from_slice(&[1.0f32], &[1]), 1).is_err());
     }

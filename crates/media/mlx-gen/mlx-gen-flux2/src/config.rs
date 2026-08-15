@@ -9,7 +9,7 @@
 
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, Capabilities, ConditioningKind, Modality,
-    ModelDescriptor, Quant, SizeFloor,
+    ModelDescriptor, Quant,
 };
 
 pub const FLUX2_KLEIN_9B_ID: &str = "flux2_klein_9b";
@@ -186,14 +186,12 @@ impl Flux2Variant {
                 // Dev consumes guidance as an embedded scalar and never takes that negative pass.
                 supports_negative_prompt: !self.uses_embedded_guidance(),
                 supports_guidance: true,
-                supports_true_cfg: false,
                 conditioning,
                 // Transformer-only LoRA/LoKr (sc-2646): both variants share the `Flux2Transformer`,
                 // which hosts the adapters; the VAE + Qwen3 TE are not adapter targets.
                 supports_lora: true,
                 supports_lokr: true,
                 supported_quants: &[Quant::Q4, Quant::Q8],
-                component_precision_floors: &[],
                 // Curated unified-framework integrator menu (epic 7114 P3). An unset `req.sampler` is
                 // the curated Euler over the resolution-shifted flow schedule.
                 samplers: curated_sampler_names(),
@@ -204,13 +202,9 @@ impl Flux2Variant {
                     s.push("flow_match_euler");
                     s
                 },
-                supported_guidance_methods: vec![],
                 min_size: 256,
                 max_size: 2048,
                 max_count: 8,
-                // Not a distilled fixed-schedule model: any step count the shared sanity caps
-                // admit is renderable (sc-19502).
-                supported_steps: Vec::new(),
                 mac_only: true,
                 // Only the 9b-kv edit variant runs the reference-K/V cache (sc-2347).
                 supports_kv_cache: self.is_kv(),
@@ -222,23 +216,11 @@ impl Flux2Variant {
                 // bounding peak to `max(TE, DiT+VAE)`. The edit variants' reference conditioning that
                 // must persist through denoise is VAE-encoded in the heavy phase (after the TE drop).
                 supports_sequential_offload: true,
-                unconditionally_engages_staged_residency: false,
                 supports_preview: true,
                 // Dev (txt2img + edit) loads the Mistral3/Pixtral caption upsampler and consults
                 // `GenerationRequest::enhance_prompt`; Klein returns the raw prompt unchanged.
                 supports_prompt_enhancement: self.is_dev(),
-                supports_streaming: false,
-                supports_multi_speaker: false,
-                supports_conversation_history: false,
-                supports_conversation_session: false,
-                max_speakers: None,
-                // No audio surface (sc-12834): pure image/video model.
-                audio_sample_rates: vec![],
-                max_audio_duration_secs: None,
-                audio_voices: vec![],
-                audio_languages: vec![],
-                audio_edit_modes: vec![],
-                size_floor: SizeFloor::RangeChecked,
+                ..Default::default()
             },
         }
     }

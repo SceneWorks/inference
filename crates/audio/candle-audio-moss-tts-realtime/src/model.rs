@@ -22,7 +22,7 @@ use candle_audio::candle_core::DType;
 use candle_audio::gen_core::{
     self, AudioChunk, AudioTrack, CancelFlag, Capabilities, ConversationSession, ConversationTurn,
     GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, Progress,
-    SizeFloor, WeightsSource,
+    WeightsSource,
 };
 use candle_nn::VarBuilder;
 use tokenizers::Tokenizer;
@@ -111,9 +111,6 @@ pub fn descriptor() -> ModelDescriptor {
         backend: "candle",
         modality: Modality::Audio,
         capabilities: Capabilities {
-            supports_negative_prompt: false,
-            supports_guidance: false,
-            supports_true_cfg: false,
             // Voice cloning (sc-14149): a reference clip is supplied as `Conditioning::ReferenceAudio`
             // and encoded into the timbre prompt. Absent it, the model uses its default voice.
             // Multi-turn (sc-14151): a `Conditioning::ConversationHistory` drives the stateless path A
@@ -122,39 +119,16 @@ pub fn descriptor() -> ModelDescriptor {
                 gen_core::ConditioningKind::ReferenceAudio,
                 gen_core::ConditioningKind::ConversationHistory,
             ],
-            supports_lora: false,
-            supports_lokr: false,
-            samplers: vec![],
-            schedulers: vec![],
-            supported_guidance_methods: vec![],
-            min_size: 0,
-            max_size: 0,
             max_count: 1,
-            // Not a distilled fixed-schedule model: any step count the shared sanity caps
-            // admit is renderable (sc-19502).
-            supported_steps: Vec::new(),
-            mac_only: false,
             audio_sample_rates: vec![SAMPLE_RATE],
             max_audio_duration_secs: Some(MAX_DURATION_SECS),
-            audio_voices: vec![],
             audio_languages: LANGUAGES.to_vec(),
-            audio_edit_modes: vec![],
-            supported_quants: &[],
-            component_precision_floors: &[],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
-            supports_sequential_offload: false,
-            unconditionally_engages_staged_residency: false,
-            supports_preview: false,
-            supports_prompt_enhancement: false,
             supports_streaming: true,
-            supports_multi_speaker: false,
             // Multi-turn conversational continuation (sc-14151), both selectable shapes: the stateless
             // history-in-request path (A) and the stateful warm-KV session (B).
             supports_conversation_history: true,
             supports_conversation_session: true,
-            max_speakers: None,
-            size_floor: SizeFloor::RangeChecked,
+            ..Default::default()
         },
     }
 }

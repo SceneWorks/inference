@@ -76,7 +76,7 @@ use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use candle_gen::gen_core::{
     self, Capabilities, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality,
-    ModelDescriptor, PidWeights, Progress, Quant, SizeFloor, WeightsSource,
+    ModelDescriptor, PidWeights, Progress, Quant, WeightsSource,
 };
 use candle_gen::{CandleError, LatentDecoder, Result as CResult};
 use candle_gen_pid::{PidDecoder, PidEngine};
@@ -1166,7 +1166,6 @@ fn descriptor(variant: Flux2Variant) -> ModelDescriptor {
             // classifier-free negative pass when guidance > 1.
             supports_negative_prompt: !variant.uses_embedded_guidance(),
             supports_guidance: true,
-            supports_true_cfg: false,
             // txt2img only in this slice — the mlx edit/Reference surface is deferred.
             conditioning: vec![],
             supports_lora: true,
@@ -1178,24 +1177,16 @@ fn descriptor(variant: Flux2Variant) -> ModelDescriptor {
                 candle_gen::curated_scheduler_names(),
                 &["flow_match_euler"],
             ),
-            supported_guidance_methods: vec![],
             min_size: 256,
             max_size: 2048,
             max_count: 8,
-            // Not a distilled fixed-schedule model: any step count the shared sanity caps
-            // admit is renderable (sc-19502).
-            supported_steps: Vec::new(),
-            mac_only: false,
             // Both quantize on-the-fly (CPU-stage → quantize-onto-GPU): dev folds the 32B DiT + Mistral
             // TE to fit the memory ceiling; klein (sc-11031) folds only the 9B DiT and keeps the Qwen3
             // TE dense bf16 (epic 8506 DENSE_TE, `Pipeline::te_quant`).
             supported_quants: &[Quant::Q4, Quant::Q8],
-            component_precision_floors: &[],
-            supports_kv_cache: false,
             // FLUX.2 uses the empirical-mu shifted flow-match schedule.
             requires_sigma_shift: true,
             supports_sequential_offload: true,
-            unconditionally_engages_staged_residency: false,
             // Per-step latent previews (epic 16948, sc-16955): every shipped FLUX.2 lane hands the
             // shared sampler a `crate::preview` hook that projects the raw 32-channel latent through
             // the epic-16624 fit. `candle-gen-catalog`'s `preview_advertising` guard derives this
@@ -1204,18 +1195,7 @@ fn descriptor(variant: Flux2Variant) -> ModelDescriptor {
             // FLUX.2-dev owns the native Mistral3/Pixtral caption-upsample path. Klein and strict
             // control descriptors remain false and fail closed before loading weights.
             supports_prompt_enhancement: variant.is_dev(),
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
+            ..Default::default()
         },
     }
 }

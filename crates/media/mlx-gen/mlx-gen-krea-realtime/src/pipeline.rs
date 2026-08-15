@@ -98,8 +98,6 @@ pub fn descriptor() -> ModelDescriptor {
             // CFG-off model: the AR few-step denoise runs a single batch-1 forward per step with no
             // unconditional branch, so there is no negative-prompt / guidance axis (sc-8437 S4).
             supports_negative_prompt: false,
-            supports_guidance: false,
-            supports_true_cfg: false,
             // i2v / v2v conditioning (sc-8440 S7): a `Reference` still warms the AR KV cache
             // (image-to-video, like the sibling `svd_xt` image→video), and a `VideoClip` source drives
             // the strength-controlled AR init (video-to-video, like `bernini`'s v2v). Both are wired in
@@ -117,15 +115,10 @@ pub fn descriptor() -> ModelDescriptor {
             supports_lora: true,
             supports_lokr: true,
             samplers: vec![SELF_FORCING_SAMPLER],
-            schedulers: Vec::new(),
-            supported_guidance_methods: vec![],
             // H/W align to patch×vae_stride = 16 (z16 VAE spatial stride 8, patch 2); mirror Wan's cap.
             min_size: 16,
             max_size: 1280,
             max_count: 1,
-            // Not a distilled fixed-schedule model: any step count the shared sanity caps
-            // admit is renderable (sc-19502).
-            supported_steps: Vec::new(),
             mac_only: true,
             // Three tiers (sc-15203, S19): **Q4** (~7 GB) / **Q8** (~14 GB) / **bf16** (~28 GB, the
             // absence of a `Quant`). A 14B bf16 DiT is ~28 GB resident and barely runnable on Mac, so the
@@ -142,31 +135,20 @@ pub fn descriptor() -> ModelDescriptor {
             // conflicts with a packed snapshot's own tier is a hard error rather than a silent downgrade
             // (`load::resolve_load_time_quant`). Both are what this slice advertises.
             supported_quants: &[Quant::Q4, Quant::Q8],
-            component_precision_floors: &[],
             // The AR regime is built on a rolling causal KV cache (sc-8436 S3 / sc-8438 S5).
             supports_kv_cache: true,
-            requires_sigma_shift: false,
             // Every route calls `stage_components`: UMT5 is loaded, evaluated, and dropped before
             // the DiT + VAE phase. There is no request-selectable Resident mode.
             supports_sequential_offload: false,
             unconditionally_engages_staged_residency: true,
             // Batch whole-clip form in S6; the realtime streaming decode is the streaming epic.
             supports_preview: false,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
             // No audio surface: pure video model.
             audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
             // z16 VAE stride 8 × the Wan DiT's 2×2 latent patch: explicit dimensions must land
             // on a 16px grid or integer division would silently render a smaller clip.
             size_floor: SizeFloor::RangeCheckedOnGrid { multiple: 16 },
+            ..Default::default()
         },
     }
 }

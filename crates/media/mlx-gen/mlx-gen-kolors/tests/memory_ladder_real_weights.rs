@@ -149,7 +149,14 @@ fn request(memory: Option<GenerationMemory>, edge: u32, steps: u32) -> Generatio
 /// `wall` exists because rung 4's re-materialization latency is a real hazard — 70 blocks across 11
 /// re-opens, once per denoise step — and a peak-only row cannot answer it. It is a wall clock, so it
 /// is the softest number in this file: it moves with thermal state and with whatever else the
-/// machine is doing. It is therefore *reported* and bounded loosely, never asserted tightly.
+/// machine is doing.
+///
+/// It is nonetheless asserted at one site, and the shape of that assertion is what makes it safe:
+/// the cadence frontier's published `speedup > 1.5` bound is taken over the **fastest** of
+/// `TIMED_RUNS` runs per arm (`measure_fastest`). Contention can only make a run slower, so the
+/// minimum is a lower bound on the hardware rather than a sample of a noisy distribution. A
+/// single-shot `wall` could not carry that bound; a min-reduced one can. Every other use of `wall`
+/// in this file is *reported* only, never asserted.
 struct Row {
     peak_gib: f64,
     pixels: Vec<u8>,
@@ -189,6 +196,45 @@ fn measure(dir: &std::path::Path, tier: &str, shape: LoadShape, req: &Generation
         pixels,
         wall,
     }
+}
+
+/// Measured runs per cadence in the rung-4 sweep, reduced by taking the FASTEST row (sc-19556).
+///
+/// Two is the cheapest count that can tell "this run was descheduled" from "this cadence is slow".
+/// Each run is a full render on a freshly loaded generator, so the cost is real and the count is
+/// deliberately small.
+const TIMED_RUNS: usize = 2;
+
+/// [`measure`] repeated [`TIMED_RUNS`] times, returning the row of the FASTEST run.
+///
+/// sc-19556: the sweep used to take one sample per cadence and ratio two of them, minutes and a
+/// model load apart, on a machine that routinely runs several agents at once — so the two arms need
+/// not even see the same load. Every run here performs the identical render, so contention can only
+/// ever push a run SLOWER: the fastest of several runs is a lower bound on what the hardware did,
+/// not a sample of a noisy distribution. Ratioing two lower bounds is what lets the latency gate
+/// below keep the margin the crate PUBLISHES (`memory_strategy`: 1024² q4 3745 → 1507 ms/step,
+/// 2.5x) instead of being relaxed until it no longer resolves the code. The published ratio has
+/// never been observed near the bound — a busier pass measured 4268 → 1621, i.e. 2.63x, so load
+/// moved the ratio UP, not down.
+///
+/// Returning the fastest run's row wholesale (rather than splicing a min wall onto another run's
+/// peak) is safe precisely because the peak column is the reproducible one: it repeats to the
+/// millibyte across runs, which is the claim `spread < 1.0` in the sweep exists to check.
+#[track_caller]
+fn measure_fastest(
+    dir: &std::path::Path,
+    tier: &str,
+    shape: LoadShape,
+    req: &GenerationRequest,
+) -> Row {
+    let mut best: Option<Row> = None;
+    for _ in 0..TIMED_RUNS {
+        let row = measure(dir, tier, shape, req);
+        if best.as_ref().is_none_or(|b: &Row| row.wall < b.wall) {
+            best = Some(row);
+        }
+    }
+    best.expect("TIMED_RUNS must be > 0")
 }
 
 fn ms_per_step(row: &Row, steps: u32) -> f64 {
@@ -1003,7 +1049,7 @@ fn transformer_window_sweep_and_streamed_output_identity() {
     let dir = require_tier(&tier);
     warm_up(&dir, &tier);
 
-    let control = measure(
+    let control = measure_fastest(
         &dir,
         &tier,
         LoadShape::DeferredMaterialization,
@@ -1017,7 +1063,7 @@ fn transformer_window_sweep_and_streamed_output_identity() {
 
     let mut rows = Vec::new();
     for window in ms::TRANSFORMER_WINDOW_SIZES {
-        let row = measure(
+        let row = measure_fastest(
             &dir,
             &tier,
             LoadShape::DeferredMaterialization,
@@ -1094,10 +1140,32 @@ fn transformer_window_sweep_and_streamed_output_identity() {
          TRANSFORMER_WINDOW_SIZES' flat column and the phase-separation mechanism it rests on must \
          be re-derived before the domain is published again"
     );
+    // sc-19556. `speedup` is `tightest.wall / widest.wall`, and the complaint against it was real:
+    // it used to be ONE sample per arm, two renders apart, on a machine that routinely has several
+    // agents building at once. The fix is the INSTRUMENT, not the threshold — both arms now come
+    // from `measure_fastest`, so each is the fastest of `TIMED_RUNS` identical renders and therefore
+    // a lower bound on the hardware rather than an arbitrary point in a noisy distribution.
+    //
+    // The bound itself stays at the crate's PUBLISHED effect. `memory_strategy` records 1024² q4 at
+    // 3745 → 1507 ms/step (2.5x), and records that a busier pass measured 4268 → 1621 — 2.63x, so
+    // load moved the ratio UP and it has never been observed near 1.5. Relaxing this to ~1.05 would
+    // have left the gate green while the published number was wrong by more than 2x, which is the
+    // one failure this assertion exists to prevent.
+    //
+    // The memory half of this frontier is gated CLOCK-FREE, directly above: `spread < 1.0` reads
+    // `peak_gib`, an allocator high-water that does not move with host load. That is the assertion
+    // carrying the "every cadence bounds the peak identically" claim; this one carries the latency
+    // claim, which is genuinely a duration and so keeps one.
+    //
+    // A cadence-count instrument would be better still: the mechanism is block RE-OPENS per step,
+    // and `Row` exposes only `peak_gib` / `pixels` / `wall`. Counting re-opens means instrumenting
+    // the shared mlx-gen block-plan seam and re-validating every ladder that reads it, on real
+    // weights — out of scope here, and the min-reduced ratio holds the published margin meanwhile.
     assert!(
         speedup > 1.5,
-        "widening the cadence no longer buys time back ({speedup:.2}×) — the domain is a frontier \
-         only if it does, otherwise it is four spellings of one choice"
+        "widening the cadence no longer buys time back ({speedup:.2}× at the FASTEST of \
+         {TIMED_RUNS} runs per arm, against a published 2.5×) — the domain is a frontier only if it \
+         does, otherwise it is four spellings of one choice"
     );
 }
 
