@@ -51,6 +51,30 @@
 //! [`MAX_AV_DRIFT_SECONDS`] bounds it. This is a **muxing** concern, not a denoise one — the
 //! delivered mp4 needs a pad/trim policy.
 //!
+//! Which five are exact is **derived, not tabulated**: [`av_grids_align_exactly`] asks whether
+//! `num_frames · 40 / 24` needs the `round` at all, which reduces to `3 | num_frames`. A hardcoded
+//! `[141, 192, 243, 294, 345]` would pass for any policy that happened to fit those five and says
+//! nothing about the other nine — the exact case that makes an AV test a false green (sc-19425).
+//!
+//! # The mux policy lives here, in the counts, not in either backend's pipeline
+//!
+//! [`delivered_audio_samples`] is the length the delivered soundtrack **must** be: the picture's,
+//! `round(num_frames / 24 · 32000)`. [`decoded_audio_samples`] is what the audio VAE actually emits.
+//! They differ at nine of the fourteen, by at most [`MAX_AV_DRIFT_SECONDS`], and **the audio is the
+//! side corrected** — the picture's frame count is on the model's own `17n + 5` lattice and its
+//! duration is exact, while the audio count is a `round` of it, so correcting the audio corrects the
+//! side that carries the error. Trimming or silence-padding at the tail costs at most 400 samples of
+//! a 165 000-sample track; moving a frame instead would take `num_frames` off the lattice that
+//! [`JointGeometry::validate`] exists to protect.
+//!
+//! **This crate has no pipeline yet (sc-17156 owns it), so nothing here calls these functions.**
+//! They are stated in this module rather than left for that slice precisely so it inherits the MLX
+//! lane's decision instead of re-deriving one: `scripts/check-workspace.py::check_cross_backend_geometry`
+//! compares every `pub const` in this file against `mlx-gen-minimax-h3`'s, so
+//! [`AUDIO_SAMPLES_PER_LATENT`] and [`MAX_DELIVERED_AV_RESIDUAL_SECONDS`] cannot drift apart —
+//! which is the failure sc-19419 shipped with `SIZE_MULTIPLE` while both crates' own tests stayed
+//! green (sc-19425).
+//!
 //! # Duration does not buy memory back (sc-17152)
 //!
 //! The MLX lane measured peak memory **flat to 0.5 % across both duration and canvas**, with
@@ -61,7 +85,7 @@
 
 use candle_gen::{CandleError, Result};
 
-use crate::audio_config::AUDIO_TOKEN_RATE_HZ;
+use crate::audio_config::{AUDIO_SAMPLE_RATE, AUDIO_TOKEN_RATE_HZ};
 use crate::dit::positions::{ROPE_FRAMES_PER_LATENT, ROPE_FRAME_RESCALE};
 
 /// Frame rate every MiniMax-H3 duration is expressed at. `MINIMAX_H3_FPS`.
@@ -85,6 +109,20 @@ pub const ROPE_UNITS_PER_SECOND: f64 = 40.0;
 /// The worst AV length residual the `round` in [`audio_latent_num_frames`] can produce: half a
 /// rotary unit at [`ROPE_UNITS_PER_SECOND`], i.e. 12.5 ms.
 pub const MAX_AV_DRIFT_SECONDS: f64 = 0.5 / ROPE_UNITS_PER_SECOND;
+
+/// Audio samples one latent token decodes to — the audio VAE's hop, `32000 / 40`.
+pub const AUDIO_SAMPLES_PER_LATENT: u32 = AUDIO_SAMPLE_RATE / AUDIO_TOKEN_RATE_HZ;
+
+/// The worst residual the **delivered** soundtrack can carry against the picture, once
+/// [`delivered_audio_samples`] has been applied: half a sample at [`AUDIO_SAMPLE_RATE`], i.e.
+/// 15.625 µs.
+///
+/// Three orders of magnitude under [`MAX_AV_DRIFT_SECONDS`], which is the point — the mux policy's
+/// job is to move the AV residual off the audio-latent grid (±8.33 ms) and onto the sample grid,
+/// where it is smaller than one sample and cannot be expressed in a container at all. A test that
+/// admits a millisecond of slack here would pass for a `floor`, a `ceil`, or a delivered length
+/// derived from the decoder's output rather than from `num_frames`.
+pub const MAX_DELIVERED_AV_RESIDUAL_SECONDS: f64 = 0.5 / AUDIO_SAMPLE_RATE as f64;
 
 /// Every frame count the released model accepts — `17n + 5` clamped to the hardcoded 5–15 s
 /// duration range. Nothing else is legal.
@@ -140,6 +178,37 @@ pub fn video_latent_num_frames(num_frames: usize) -> Result<usize> {
 /// The `round` is what makes the two tracks differ in length; see [`MAX_AV_DRIFT_SECONDS`].
 pub fn audio_latent_num_frames(num_frames: usize) -> usize {
     (num_frames as f64 / MINIMAX_H3_FPS * f64::from(AUDIO_LATENTS_PER_SECOND)).round() as usize
+}
+
+/// Whether the two grids land on the **same instant exactly** for `num_frames`, i.e. whether the
+/// `round` in [`audio_latent_num_frames`] has anything to do.
+///
+/// Asked as the gate's own arithmetic — is `num_frames · AUDIO_LATENTS_PER_SECOND` a whole number of
+/// [`MINIMAX_H3_FPS`]? — rather than by matching against the five counts it happens to be true at.
+/// The two rates are what decide it, so if either ever moves this follows and a tabulated set would
+/// not. At today's 40 and 24 it reduces to `3 | num_frames`, which over [`LEGAL_FRAME_COUNTS`] is
+/// exactly 141, 192, 243, 294 and 345.
+pub fn av_grids_align_exactly(num_frames: usize) -> bool {
+    (num_frames * AUDIO_LATENTS_PER_SECOND as usize).is_multiple_of(MINIMAX_H3_FPS as usize)
+}
+
+/// Samples **per channel** the audio VAE actually decodes for `num_frames`:
+/// `audio_latent_num_frames · AUDIO_SAMPLES_PER_LATENT`.
+///
+/// This is the length the soundtrack arrives at, **not** the length it is delivered at — see
+/// [`delivered_audio_samples`].
+pub fn decoded_audio_samples(num_frames: usize) -> usize {
+    audio_latent_num_frames(num_frames) * AUDIO_SAMPLES_PER_LATENT as usize
+}
+
+/// **The AV mux policy's target length**: samples **per channel** the delivered soundtrack carries,
+/// `round(num_frames / MINIMAX_H3_FPS · AUDIO_SAMPLE_RATE)`.
+///
+/// A function of the frame count alone. Deriving it from the decoded track instead would make the
+/// delivered clip's length depend on the audio grid — which is the ±8.33 ms this whole module
+/// exists to keep off the delivered file.
+pub fn delivered_audio_samples(num_frames: usize) -> usize {
+    (num_frames as f64 / MINIMAX_H3_FPS * f64::from(AUDIO_SAMPLE_RATE)).round() as usize
 }
 
 /// The frame / latent / audio-token counts one joint request is denoised at.
@@ -340,6 +409,114 @@ mod tests {
         assert_eq!(g.num_latent_frames, 37);
         assert!((g.duration_seconds() - 5.16667).abs() < 1e-4);
         assert!((g.audio_rope_span() / ROPE_UNITS_PER_SECOND - 5.175).abs() < 1e-9);
+    }
+
+    /// **The exactly-aligned set is derived, not tabulated.** [`av_grids_align_exactly`] is asked
+    /// about all fourteen and must agree, count by count, with the residual actually measured off
+    /// [`JointGeometry::av_drift_seconds`] — which is what makes it a derivation of the two grid
+    /// rates rather than a restatement of the five counts it is true at.
+    #[test]
+    fn the_exactly_aligned_durations_are_derived_not_tabulated() {
+        let mut exact = Vec::new();
+        for &frames in &LEGAL_FRAME_COUNTS {
+            // The integer statement of "no rounding happened": the rounded latent count, put back
+            // on the frame clock, lands exactly on the frame count. Formulated by MULTIPLYING where
+            // `av_grids_align_exactly` divides, so the two are not the same expression twice.
+            let round_tripped = audio_latent_num_frames(frames) * MINIMAX_H3_FPS as usize
+                == frames * AUDIO_LATENTS_PER_SECOND as usize;
+            assert_eq!(
+                av_grids_align_exactly(frames),
+                round_tripped,
+                "{frames}: the predicate and the round-trip disagree"
+            );
+            // ...and the same claim measured off the rotary spans. `video_rope_span` sums 47 f64
+            // terms, so "exact" here means under the summation's own noise (~3.6e-15 s at 141), six
+            // orders of magnitude below the ±8.33 ms the inexact counts carry.
+            let drift = JointGeometry::new(frames, 20, 36)
+                .unwrap()
+                .av_drift_seconds();
+            assert_eq!(
+                av_grids_align_exactly(frames),
+                drift.abs() < 1e-9,
+                "{frames}: the predicate says {} but the measured residual is {drift} s",
+                av_grids_align_exactly(frames)
+            );
+            if av_grids_align_exactly(frames) {
+                exact.push(frames);
+            }
+        }
+        assert_eq!(exact, vec![141, 192, 243, 294, 345]);
+        // ...and the other NINE are off by the full ±8.33 ms, not by something negligible. Without
+        // this the predicate could be true everywhere and the assertion above would still hold.
+        assert_eq!(LEGAL_FRAME_COUNTS.len() - exact.len(), 9);
+        for &frames in LEGAL_FRAME_COUNTS
+            .iter()
+            .filter(|&&f| !av_grids_align_exactly(f))
+        {
+            let ms = JointGeometry::new(frames, 20, 36)
+                .unwrap()
+                .av_drift_seconds()
+                * 1e3;
+            assert!((ms.abs() - 8.3333).abs() < 1e-3, "{frames}: {ms} ms");
+        }
+        // The predicate is the two RATES, so it must answer off the lattice too — `3 | num_frames`
+        // is a consequence, never the definition.
+        for frames in [3, 6, 24, 48, 120, 360] {
+            assert!(av_grids_align_exactly(frames), "{frames}");
+        }
+        for frames in [1, 2, 4, 5, 7, 100, 121, 361] {
+            assert!(!av_grids_align_exactly(frames), "{frames}");
+        }
+    }
+
+    /// **The AV mux policy, stated in counts.** The soundtrack is DELIVERED at the picture's length
+    /// at every one of the fourteen — including the nine where the decoder hands back a different
+    /// one — and the residual that survives is under half a sample.
+    ///
+    /// Held here even though this crate ships no pipeline: sc-17156's delivery path must trim/pad to
+    /// [`delivered_audio_samples`], and this is what stops it inventing a second answer.
+    #[test]
+    fn the_delivered_soundtrack_length_is_the_pictures_at_every_legal_count() {
+        assert_eq!(AUDIO_SAMPLES_PER_LATENT, 800);
+        let mut corrected = 0;
+        for &frames in &LEGAL_FRAME_COUNTS {
+            let picture = frames as f64 / MINIMAX_H3_FPS;
+            let delivered = delivered_audio_samples(frames);
+            let residual = delivered as f64 / f64::from(AUDIO_SAMPLE_RATE) - picture;
+            assert!(
+                residual.abs() <= MAX_DELIVERED_AV_RESIDUAL_SECONDS,
+                "{frames}: the delivered track is {residual:+.9} s off the picture, over the \
+                 half-sample bound"
+            );
+
+            // What the decoder emits, and therefore what the correction costs.
+            let decoded = decoded_audio_samples(frames);
+            let correction = (decoded as f64 - delivered as f64) / f64::from(AUDIO_SAMPLE_RATE);
+            assert!(
+                correction.abs() <= MAX_AV_DRIFT_SECONDS + 1e-12,
+                "{frames}: correction {correction:+.5} s exceeds the audio-latent rounding bound"
+            );
+            assert_eq!(
+                decoded == delivered,
+                av_grids_align_exactly(frames),
+                "{frames}: whether a correction is needed IS whether the grids align"
+            );
+            if decoded != delivered {
+                corrected += 1;
+                // The correction is the audio-latent residual (±8.3333 ms) plus the sub-sample
+                // residual `delivered`'s own round leaves — at 124 that is 267 samples = 8.34375 ms.
+                assert!(
+                    (correction.abs() - 8.3333e-3).abs() <= MAX_DELIVERED_AV_RESIDUAL_SECONDS,
+                    "{frames}: {correction} s is not the ±8.3333 ms residual within a half-sample"
+                );
+            }
+        }
+        assert_eq!(corrected, 9, "nine of the fourteen need a correction");
+        // The measured pair from the spike: 124 frames is 5.1667 s of picture, 207 latents =
+        // 165 600 decoded samples = 5.175 s of sound, delivered as 165 333.
+        assert_eq!(decoded_audio_samples(124), 165_600);
+        assert_eq!(delivered_audio_samples(124), 165_333);
+        assert_eq!(decoded_audio_samples(141), delivered_audio_samples(141));
     }
 
     /// **The drift gate.** A `num_latent_frames` derived the obvious wrong way is still a positive
