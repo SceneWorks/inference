@@ -122,6 +122,27 @@ pub mod pipeline;
 pub mod scheduler;
 pub mod t2v;
 
+/// The single VAE implementation used by Krea Realtime.
+pub type ProviderVae = mlx_gen_wan::WanVae;
+/// Krea Realtime's provider-facing geometry, derived from its concrete VAE assignment.
+pub const VAE_TILING: mlx_gen::tiling::VaeTiling = ProviderVae::VAE_TILING;
+
+/// Resolve Krea Realtime VAE geometry by registered generator id.
+pub fn vae_tiling(provider_id: &str) -> Option<mlx_gen::tiling::VaeTiling> {
+    (provider_id == MODEL_ID).then_some(VAE_TILING)
+}
+
+/// Resolve Krea Realtime's provider-owned conservative VAE decode working-set peak.
+pub fn conservative_video_decode_memory_profile(
+    provider_id: &str,
+    width: u32,
+    height: u32,
+    frames: u32,
+) -> Option<mlx_gen::VideoDecodeMemoryProfile> {
+    vae_tiling(provider_id)?;
+    mlx_gen_wan::conservative_video_decode_memory_profile_for_vae(VAE_TILING, width, height, frames)
+}
+
 pub use causal::{
     block_causal_mask, build_block_causal_mask, CausalKreaTransformer, CausalKvCache,
 };
@@ -208,5 +229,22 @@ mod explicit_registry_tests {
             unknown.contains("no generator registered"),
             "got: {unknown}"
         );
+    }
+
+    #[test]
+    fn provider_id_is_bound_to_the_wan_z16_geometry() {
+        assert_eq!(super::VAE_TILING, super::ProviderVae::VAE_TILING);
+        assert_eq!(super::VAE_TILING, mlx_gen::tiling::VaeTiling::WAN);
+        assert_eq!(super::vae_tiling(super::MODEL_ID), Some(super::VAE_TILING));
+        assert_eq!(
+            super::conservative_video_decode_memory_profile(super::MODEL_ID, 64, 64, 9).map(
+                |profile| (
+                    profile.working_set_bytes(),
+                    profile.resident_decoder_bytes_included()
+                )
+            ),
+            Some((322_633_728, 0))
+        );
+        assert_eq!(super::vae_tiling("not_krea_realtime"), None);
     }
 }

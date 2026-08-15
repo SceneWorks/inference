@@ -103,6 +103,7 @@ pub struct PulidFluxPaths {
     pub eva_weights: PathBuf,
     /// The native face-stack dir (`scrfd_10g` / `arcface_iresnet100` / `bisenet_parsing`).
     pub face_dir: PathBuf,
+    pub adapters: Vec<candle_gen::gen_core::AdapterSpec>,
 }
 
 /// One PuLID-FLUX generation request.
@@ -251,6 +252,7 @@ impl PulidFlux {
             &device,
             dtype,
             memory,
+            paths.adapters.clone(),
         )?;
 
         // EVA-CLIP tower (f32 conditioning path).

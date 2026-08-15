@@ -24,3 +24,4 @@ image = { workspace = true }
 # `Drop` — including out of a panicking test, which is the only path the old
 # `env::temp_dir().join(..)` + trailing `remove_dir_all` shape ever leaked on.
 tempfile = { workspace = true }
+sceneworks-gen-core-testkit = { workspace = true }

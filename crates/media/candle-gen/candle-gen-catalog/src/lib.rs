@@ -92,6 +92,65 @@ pub fn provider_registry() -> candle_gen::gen_core::Result<ProviderRegistry> {
     register_providers(ProviderRegistryBuilder::new()).build()
 }
 
+/// Resolve the load-bearing VAE geometry for a modelled Candle video generator.
+///
+/// Each provider owns its id-to-decoder assignment. Mochi uses a different decode architecture and
+/// is outside the video-memory-ladder scope.
+pub fn vae_tiling(provider_id: &str) -> Option<media::gen_core::tiling::VaeTiling> {
+    candle_gen_ltx::vae_tiling(provider_id)
+        .or_else(|| candle_gen_wan::vae_tiling(provider_id))
+        .or_else(|| candle_gen_bernini::vae_tiling(provider_id))
+        .or_else(|| candle_gen_scail2::vae_tiling(provider_id))
+        .or_else(|| candle_gen_svd::vae_tiling(provider_id))
+}
+
+/// Resolve a provider-owned conservative single-pass VAE decode memory profile.
+///
+/// This composes the calibrated cost functions used by provider budget planners. The result excludes
+/// DiT/text-encoder weights. LTX's calibrated fixed term mixes decoder/base/runtime costs, so it is
+/// retained in full and identifies zero substitutable decoder-resident bytes; Wan-family profiles
+/// contain activation/accumulator work and likewise identify zero resident bytes. Use
+/// [`media::VideoDecodeMemoryProfile::checked_composed_peak`] for checked composition and any declared
+/// substitution. With LTX's zero attribution the whole mixed floor is deliberately preserved, even
+/// though that may conservatively overlap a contract decoder charge. Unsupported ids, zero
+/// dimensions, and arithmetic overflow return `None`. SVD currently exports its exact tiling
+/// geometry but not a profile here: its actual peak depends on both the request's decode-chunk size
+/// and its live-free-VRAM tile selection. SceneWorks' 8-frame product chunk is below the 14-frame
+/// write cap at both shipped SVD geometries, while the provider library's 25-frame default is over
+/// it; publishing one budget-independent scalar would conflate those regimes.
+pub fn conservative_video_decode_memory_profile(
+    provider_id: &str,
+    width: u32,
+    height: u32,
+    frames: u32,
+) -> Option<media::VideoDecodeMemoryProfile> {
+    candle_gen_ltx::conservative_video_decode_memory_profile(provider_id, width, height, frames)
+        .or_else(|| {
+            candle_gen_wan::conservative_video_decode_memory_profile(
+                provider_id,
+                width,
+                height,
+                frames,
+            )
+        })
+        .or_else(|| {
+            candle_gen_bernini::conservative_video_decode_memory_profile(
+                provider_id,
+                width,
+                height,
+                frames,
+            )
+        })
+        .or_else(|| {
+            candle_gen_scail2::conservative_video_decode_memory_profile(
+                provider_id,
+                width,
+                height,
+                frames,
+            )
+        })
+}
+
 // -------------------------------------------------------------------------------------------------
 // Model-weight licence surface (sc-16667) — the Candle media half.
 //
@@ -316,7 +375,7 @@ mod preview_advertising {
     ///
     /// Ideogram is also this table's first genuine `Denoise::Bespoke` **wired** crate: it drives no
     /// shared sampler anywhere, so it becomes visible below through a direct emission call rather than
-    /// through a hooked call site. That is the case `DIRECT_EMISSION_CALLS` was hardened for.
+    /// through a hooked call site. That is the case the direct-emission scanner was hardened for.
     ///
     /// `candle-gen-boogu` is deliberately absent, and its absence is a measurement rather than an
     /// omission: the epic groups it with FLUX.2, but it loads a plain 244-tensor **16-channel**
@@ -522,7 +581,8 @@ mod preview_advertising {
         /// The Wan **z16** space — `candle_gen_wan::vae16::WanVae16`, built from
         /// `Vae16Config::wan21()` (`z_dim: 16`, `base_dim: 96`, non-residual, no spatial patchify).
         /// **Never measured**; closed under the temporal program gate. Only `wan2_2_t2v_14b`,
-        /// `wan2_2_i2v_14b` and `wan_vace` occupy it inside `candle-gen-wan`; Bernini and Scail2
+        /// `wan2_2_i2v_14b`, `wan_vace`, and `wan2_2_vace_fun_14b` occupy it inside
+        /// `candle-gen-wan`; Bernini and Scail2
         /// build the same VAE from that crate, so they ride this row rather than any measured one.
         ///
         /// **Not** the 5B's space — see [`NoGo::WanZ48`]. `vae16.rs`'s own module docs enumerate three
@@ -698,6 +758,7 @@ mod preview_advertising {
         ("wan2_2_t2v_14b", NoGo::WanZ16),
         ("wan2_2_i2v_14b", NoGo::WanZ16),
         ("wan_vace", NoGo::WanZ16),
+        ("wan2_2_vace_fun_14b", NoGo::WanZ16),
         ("ltx_2_3_distilled", NoGo::Ltx),
         ("minimax_h3", NoGo::MinimaxH3Joint),
         ("mochi_1", NoGo::Mochi),
@@ -1213,19 +1274,17 @@ mod preview_advertising {
             // direct emission call rather than a driver argument.
             register: candle_gen_sensenova::register_providers,
             denoise: Denoise::Bespoke,
-            // sc-16960's inventory: ONE direct emission, in the registered T2I denoise loop that both
-            // ids reach through `T2iModel::generate`. No hooked site anywhere — there is no shared
-            // sampler call in this crate to hook, which is what `Denoise::Bespoke` above declares —
-            // and therefore no dark site either. `preview.rs` gets no row: it carries only the
+            // Two direct emissions live in `t2i.rs`: the registered T2I loop and the registered
+            // reference/MultiReference it2i loop. Both ids reach those routes through
+            // `T2iModel::{generate, it2i_generate}`; neither drives a shared sampler, which is
+            // what `Denoise::Bespoke` above declares. `preview.rs` gets no row: it carries only the
             // measured three-channel pixel-space fit and the pool to the token grid, so it neither
-            // drives a sampler nor emits. The crate's OTHER denoise loop, `it2i_denoise`, is the
-            // off-registry understanding surface (VQA / interleave), is advertised by no descriptor,
-            // and is deliberately unwired — `candle-gen-sensenova/src/preview.rs` pins that it holds
-            // no emission, which is what keeps this count at 1.
+            // drives a sampler nor emits. The understanding/VQA interleave entry point reuses the
+            // same it2i loop rather than adding a third emission site.
             routes: &[FileRoutes {
                 file: "t2i.rs",
                 hooked: 0,
-                direct: 1,
+                direct: 2,
                 dark: &[],
             }],
         },
@@ -1445,8 +1504,8 @@ mod preview_advertising {
     /// `emit_preview_at` are the free functions underneath. Listing only the free functions was the
     /// original hole — a bespoke loop written the canonical way was invisible, which would have hit
     /// SenseNova (sc-16960) and Ideogram (sc-16955), the two crates the constant exists for.
-    const DIRECT_EMISSION_CALLS: &[&str] =
-        &["emit_preview(", "emit_preview_at(", ".emit(", ".emit_step("];
+    const DIRECT_EMISSION_FUNCTION_CALLS: &[&str] = &["emit_preview(", "emit_preview_at("];
+    const DIRECT_EMISSION_METHOD_CALLS: &[(&str, usize)] = &[(".emit(", 4), (".emit_step(", 3)];
 
     /// One shared-sampler call site found in a provider crate's sources.
     struct SamplerSite {
@@ -2280,6 +2339,47 @@ mod preview_advertising {
         sites
     }
 
+    /// Count direct preview emissions without treating every unrelated `.emit(...)` method as a
+    /// preview. Free preview functions have unique names. Method calls must have both the canonical
+    /// preview receiver (`*hook*` / `*preview*`) and the exact `PreviewHook::{emit,emit_step}` arity.
+    /// This remains a lexical source guard, but it is tied to the actual preview call context rather
+    /// than to a generic Rust method name shared by request-local provenance sinks.
+    fn direct_emission_count(file: &str, code: &str) -> usize {
+        let mut count: usize = DIRECT_EMISSION_FUNCTION_CALLS
+            .iter()
+            .map(|call| code.matches(call).count())
+            .sum();
+        for &(call, arity) in DIRECT_EMISSION_METHOD_CALLS {
+            let mut cursor = 0usize;
+            while let Some(offset) = code[cursor..].find(call) {
+                let method_at = cursor + offset;
+                let receiver = method_receiver(&code[..method_at]);
+                let args_start = method_at + call.len();
+                let site = format!("{file}: {receiver}{call}");
+                let args = call_arguments(&site, &code[args_start..]);
+                if (receiver.contains("hook") || receiver.contains("preview"))
+                    && args.len() == arity
+                {
+                    count += 1;
+                }
+                cursor = args_start;
+            }
+        }
+        count
+    }
+
+    /// Last identifier before a method-call dot. The source is already stripped of comments and
+    /// literals; whitespace between receiver and dot is accepted.
+    fn method_receiver(before_dot: &str) -> &str {
+        let trimmed = before_dot.trim_end();
+        let start = trimmed
+            .char_indices()
+            .rev()
+            .find_map(|(index, ch)| (!ch.is_ascii_alphanumeric() && ch != '_').then_some(index + 1))
+            .unwrap_or(0);
+        &trimmed[start..]
+    }
+
     /// Read one provider crate's preview wiring out of its **shipped** module tree.
     ///
     /// Keyed on the directory rather than on a `ProviderCrate`, so the descriptor-less
@@ -2301,10 +2401,7 @@ mod preview_advertising {
         };
         for (relative, code) in &tree.shipped {
             wiring.sites.extend(sampler_sites(relative, code));
-            let count: usize = DIRECT_EMISSION_CALLS
-                .iter()
-                .map(|call| code.matches(call).count())
-                .sum();
+            let count = direct_emission_count(relative, code);
             if count > 0 {
                 wiring.direct.push(DirectEmission {
                     file: relative.clone(),
@@ -2616,7 +2713,7 @@ mod preview_advertising {
                     advertised.is_empty(),
                     "{} advertises supports_preview on {advertised:?} but nothing in its shipped \
                      sources emits: no sampler call site passes a preview hook and no bespoke loop \
-                     calls {DIRECT_EMISSION_CALLS:?}",
+                     calls the direct preview functions/methods",
                     provider.dir
                 );
             }
@@ -2875,6 +2972,18 @@ mod preview_advertising {
              assertion in this module would then be vacuously satisfied by a scanner that read \
              nothing"
         );
+    }
+
+    #[test]
+    fn direct_preview_scan_ignores_prompt_report_emit_but_counts_preview_context() {
+        let code = r#"
+            req.prompt_enhancement.emit(report);
+            hook.emit(&counter, &sigmas, sigma, &latents);
+            preview.emit_step(&counter, step, &state);
+            candle_gen::preview::emit_preview_at(&sink, &counter, step, || frame());
+            audit_hook.emit(one, two, three);
+        "#;
+        assert_eq!(direct_emission_count("synthetic.rs", code), 3);
     }
 
     /// Out-of-line `#[cfg(test)] mod NAME;` files are excluded from the scan.
@@ -3219,11 +3328,11 @@ mod preview_advertising {
             classified.difference(&registered).collect::<Vec<_>>()
         );
 
-        // The shape at sc-16961: 51 registered generators = 29 wired + 19 no-go + 3 deferred. This
-        // story moves the wired count by ZERO — it measures nothing and wires nothing.
+        // VACE-Fun occupies the already-settled Wan z16 no-go space, and MiniMax-H3 opens its own
+        // joint-space no-go: 53 registered generators = 29 wired + 21 no-go + 3 deferred.
         assert_eq!(
             (registered.len(), wired.len(), no_go.len(), deferred.len()),
-            (52, 29, 20, 3),
+            (53, 29, 21, 3),
             "moving a route between preview classes is a decision that must be written down here"
         );
     }
@@ -3549,6 +3658,7 @@ mod preview_advertising {
                 "wan2_2_t2v_14b",
                 "wan2_2_i2v_14b",
                 "wan_vace",
+                "wan2_2_vace_fun_14b",
                 "bernini_renderer",
                 "bernini",
                 "scail2_14b",
@@ -3558,81 +3668,36 @@ mod preview_advertising {
              of them"
         );
 
-        // Grounded in the providers. Each pair is (file, must-contain, must-NOT-contain), and the
-        // negative half is what makes it a separation rather than a coincidence of shared imports.
-        for (file, present, absent) in [
-            // The 5B provider: z48 only.
-            (
-                "candle-gen-wan/src/lib.rs",
-                &["VaeConfig::ti2v_5b()", "use vae::WanVae;"][..],
-                &["WanVae16"][..],
-            ),
-            // The A14B pair and VACE: z16 only.
-            (
-                "candle-gen-wan/src/wan14b.rs",
-                &["Vae16Config::wan21()", "vae16::WanVae16"][..],
-                &["VaeConfig::ti2v_5b"][..],
-            ),
-            (
-                "candle-gen-wan/src/model_vace.rs",
-                &["Vae16Config::wan21()", "vae16::WanVae16"][..],
-                &["VaeConfig::ti2v_5b"][..],
-            ),
-            // The two crates that reuse candle-gen-wan's z16 VAE.
-            (
-                "candle-gen-bernini/src/components.rs",
-                &["WanVae16::new_with_encoder(&Vae16Config::wan21()"][..],
-                &["VaeConfig::ti2v_5b"][..],
-            ),
-            (
-                "candle-gen-scail2/src/pipeline.rs",
-                &["WanVae16::new_with_encoder(", "Vae16Config::wan21()"][..],
-                &["VaeConfig::ti2v_5b"][..],
-            ),
-            // The two configs really are different spaces, in the file that declares both.
-            (
-                "candle-gen-wan/src/config.rs",
-                &["z_dim: 48", "z_dim: 16", "pub fn wan21()"][..],
-                &[][..],
-            ),
-        ] {
-            let path = candle_gen_root().join(file);
-            let source = std::fs::read_to_string(&path)
-                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-            for needle in present {
-                assert!(
-                    source.contains(needle),
-                    "{file} no longer contains {needle:?}, so the recorded Wan latent-space lineage \
-                     is no longer grounded in the source it claims. Re-derive which space each route \
-                     builds before editing PREVIEW_INERT_ROUTE_IDS."
-                );
-            }
-            for needle in absent {
-                assert!(
-                    !source.contains(needle),
-                    "{file} now contains {needle:?} — the z16/z48 separation this record depends on \
-                     has moved. sc-16637 closed on exactly that distinction; re-derive it rather \
-                     than relaxing this assertion."
-                );
-            }
+        // Grounded in the typed provider assignments consumed by the actual decode paths. Unlike
+        // the former source-token scan, changing a provider-local VAE alias changes this value.
+        let z48 = candle_gen_wan::WAN_Z48_VAE_TILING;
+        let z16 = candle_gen_wan::WAN_Z16_VAE_TILING;
+        assert_ne!(z48, z16);
+        assert_eq!(z48.full_res_channels, 64);
+        assert_eq!(z16.full_res_channels, 96);
+        for id in by_variant(NoGo::WanZ48) {
+            assert_eq!(super::vae_tiling(id), Some(z48), "{id}");
+        }
+        for id in by_variant(NoGo::WanZ16) {
+            assert_eq!(super::vae_tiling(id), Some(z16), "{id}");
         }
 
         // And the two reasons stay distinguishable to a reader who only ever sees a failure message.
-        let (z16, z48) = (NoGo::WanZ16.reason(), NoGo::WanZ48.reason());
+        let (z16_reason, z48_reason) = (NoGo::WanZ16.reason(), NoGo::WanZ48.reason());
         assert!(
-            z16.contains("z16")
-                && z16.contains("vae16::WanVae16")
-                && z16.contains("Vae16Config::wan21")
-                && !z16.contains("VaeConfig::ti2v_5b"),
-            "the z16 reason must name its own VAE and config and never the 5B's: {z16}"
+            z16_reason.contains("z16")
+                && z16_reason.contains("vae16::WanVae16")
+                && z16_reason.contains("Vae16Config::wan21")
+                && !z16_reason.contains("VaeConfig::ti2v_5b"),
+            "the z16 reason must name its own VAE and config and never the 5B's: {z16_reason}"
         );
         assert!(
-            z48.contains("z48")
-                && z48.contains("vae::WanVae")
-                && z48.contains("VaeConfig::ti2v_5b")
-                && z48.contains("distinct from the z16"),
+            z48_reason.contains("z48")
+                && z48_reason.contains("vae::WanVae")
+                && z48_reason.contains("VaeConfig::ti2v_5b")
+                && z48_reason.contains("distinct from the z16"),
             "the z48 reason must name its own VAE and config, and say plainly that it is not the z16 \
-             space, since that confusion is the whole reason this variant exists: {z48}"
+             space, since that confusion is the whole reason this variant exists: {z48_reason}"
         );
     }
 
@@ -3776,6 +3841,151 @@ mod preview_advertising {
 
 #[cfg(test)]
 mod tests {
+    use candle_gen::gen_core::ConditioningKind;
+
+    #[test]
+    fn modelled_video_provider_ids_have_typed_vae_assignments() {
+        let registry = super::provider_registry().unwrap();
+        let registered: Vec<&str> = registry
+            .generators()
+            .map(|registration| (registration.descriptor)().id)
+            .collect();
+        let expected = [
+            (
+                candle_gen_ltx::config::MODEL_ID,
+                candle_gen_ltx::VAE_TILING,
+                Some(2_725_804_800),
+            ),
+            (
+                candle_gen_wan::config::MODEL_ID,
+                candle_gen_wan::WAN_Z48_VAE_TILING,
+                Some(382_730_240),
+            ),
+            (
+                candle_gen_wan::config::MODEL_ID_T2V_14B,
+                candle_gen_wan::WAN_Z16_VAE_TILING,
+                Some(265_830_400),
+            ),
+            (
+                candle_gen_wan::config::MODEL_ID_I2V_14B,
+                candle_gen_wan::WAN_Z16_VAE_TILING,
+                Some(265_830_400),
+            ),
+            (
+                candle_gen_wan::config::MODEL_ID_VACE,
+                candle_gen_wan::WAN_Z16_VAE_TILING,
+                Some(265_830_400),
+            ),
+            (
+                candle_gen_wan::model_vace_fun::MODEL_ID_VACE_FUN,
+                candle_gen_wan::model_vace_fun::ProviderVae::VAE_TILING,
+                Some(265_830_400),
+            ),
+            (
+                candle_gen_bernini::MODEL_ID,
+                candle_gen_bernini::VAE_TILING,
+                Some(265_830_400),
+            ),
+            (
+                candle_gen_bernini::bernini::MODEL_ID,
+                candle_gen_bernini::VAE_TILING,
+                Some(265_830_400),
+            ),
+            (
+                candle_gen_scail2::MODEL_ID,
+                candle_gen_scail2::VAE_TILING,
+                Some(265_830_400),
+            ),
+            (
+                candle_gen_svd::config::MODEL_ID,
+                candle_gen_svd::VAE_TILING,
+                None,
+            ),
+        ];
+
+        for (provider_id, tiling, peak_bytes) in expected {
+            assert!(
+                registered.contains(&provider_id),
+                "unregistered {provider_id}"
+            );
+            assert_eq!(
+                super::vae_tiling(provider_id),
+                Some(tiling),
+                "{provider_id}"
+            );
+            assert_eq!(
+                super::conservative_video_decode_memory_profile(provider_id, 64, 64, 9)
+                    .map(|profile| profile.working_set_bytes()),
+                peak_bytes,
+                "{provider_id}"
+            );
+        }
+        assert_eq!(super::vae_tiling("ltx_2_3"), None);
+        assert_eq!(super::vae_tiling(candle_gen_mochi::MODEL_ID), None);
+        assert_eq!(super::vae_tiling("krea_realtime_14b"), None);
+        assert_eq!(super::vae_tiling("not_a_provider"), None);
+        for provider_id in [
+            "ltx_2_3",
+            candle_gen_svd::config::MODEL_ID,
+            candle_gen_mochi::MODEL_ID,
+            "krea_realtime_14b",
+            "not_a_provider",
+        ] {
+            assert_eq!(
+                super::conservative_video_decode_memory_profile(provider_id, 64, 64, 9),
+                None
+            );
+        }
+        assert_eq!(
+            super::conservative_video_decode_memory_profile(
+                candle_gen_ltx::config::MODEL_ID,
+                64,
+                0,
+                9,
+            ),
+            None
+        );
+        assert_eq!(
+            super::conservative_video_decode_memory_profile(
+                candle_gen_wan::config::MODEL_ID_T2V_14B,
+                u32::MAX,
+                u32::MAX,
+                u32::MAX,
+            ),
+            None
+        );
+
+        let ltx = super::conservative_video_decode_memory_profile(
+            candle_gen_ltx::config::MODEL_ID,
+            64,
+            64,
+            9,
+        )
+        .unwrap();
+        assert_eq!(ltx.resident_decoder_bytes_included(), 0);
+        assert_eq!(
+            ltx.checked_composed_peak(2_500_000_000, 2_500_000_000),
+            Some(5_225_804_800)
+        );
+        assert_eq!(
+            ltx.checked_composed_peak(2_900_000_000, 2_900_000_000),
+            Some(5_625_804_800)
+        );
+
+        let wan = super::conservative_video_decode_memory_profile(
+            candle_gen_wan::config::MODEL_ID_T2V_14B,
+            64,
+            64,
+            9,
+        )
+        .unwrap();
+        assert_eq!(wan.resident_decoder_bytes_included(), 0);
+        assert_eq!(
+            wan.checked_composed_peak(1_000_000_000, 600_000_000),
+            Some(1_265_830_400)
+        );
+    }
+
     #[test]
     fn every_registered_memory_strategy_rejects_cross_route_decode_geometry() {
         let registry = super::provider_registry().unwrap();
@@ -3818,13 +4028,14 @@ mod tests {
             let capabilities = descriptor(id).capabilities;
             assert!(capabilities.supports_guidance, "{id}");
             assert!(!capabilities.supports_negative_prompt, "{id}");
-            assert!(
-                !capabilities.supports_true_cfg,
-                "{id} has no Candle reference/image-CFG path"
-            );
-            assert!(
-                capabilities.conditioning.is_empty(),
-                "{id} is Candle txt2img only"
+            assert!(capabilities.supports_true_cfg, "{id} image CFG");
+            assert_eq!(
+                capabilities.conditioning,
+                vec![
+                    ConditioningKind::Reference,
+                    ConditioningKind::MultiReference,
+                ],
+                "{id} registered conditioned-image surface"
             );
         }
     }
@@ -3917,6 +4128,7 @@ mod tests {
                 "wan2_2_t2v_14b",
                 "wan2_2_i2v_14b",
                 "wan_vace",
+                "wan2_2_vace_fun_14b",
                 "z_image_turbo",
                 "z_image",
             ]
@@ -3924,12 +4136,19 @@ mod tests {
         assert_eq!(
             trainers,
             [
+                "anima_base",
+                "kolors",
                 "krea_2_raw",
                 "krea_2_control",
                 "lens",
                 "ltx_2_3",
+                "mage_flow_base",
+                "sd3_5_large",
+                "sd3_5_medium",
                 "sdxl",
                 "wan2_2_t2v_14b",
+                "wan2_2_i2v_14b",
+                "wan2_2_ti2v_5b",
                 "z_image_turbo",
             ]
         );
@@ -3941,10 +4160,10 @@ mod tests {
         assert_eq!(text_embedders, ["clip_vit_l14_text"]);
 
         // sc-16667: the pinned surface and the model-weight licence mapping move together — this is
-        // where a surface change and a mapping change meet. Five of the seven trainer ids are also
-        // generator ids, which is why 51 + 7 + 1 + 2 registrations are 56 distinct ids.
+        // where a surface change and a mapping change meet. Twelve of the fourteen trainer ids are
+        // also generator ids, which is why 53 + 14 + 1 + 2 registrations are 58 distinct ids.
         //
-        // Registration is never conditioned on the mapping: 47 < 56 because nine ids load nothing
+        // Registration is never conditioned on the mapping: 49 < 58 because nine ids load nothing
         // the shared checkpoint table covers, and they ship exactly as before. That gap is a hole in
         // our metadata for CI to report, and `licenses::tests` pins which nine and why — as
         // `#[cfg(test)]` data, so no gate can read it and suppress them.
@@ -3955,8 +4174,8 @@ mod tests {
             .chain(&image_embedders)
             .chain(&text_embedders)
             .collect();
-        assert_eq!(distinct.len(), 57);
-        assert_eq!(super::provider_components().len(), 48);
+        assert_eq!(distinct.len(), 58);
+        assert_eq!(super::provider_components().len(), 49);
     }
 
     /// The manifest emitter runs on **this** catalog's three slices, and its output is

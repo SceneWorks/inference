@@ -23,6 +23,16 @@ use mlx_rs::{Array, Dtype};
 
 use mlx_gen::{Error, Result};
 
+/// Convert a request's resolved latent-frame index into the output-frame coordinate consumed by
+/// `VideoConditionByKeyframeIndex` RoPE positions.
+pub fn latent_frame_to_output_offset(frame_idx: i32, temporal_scale: i64) -> Result<i32> {
+    let offset = i64::from(frame_idx)
+        .checked_mul(temporal_scale)
+        .ok_or_else(|| Error::Msg("ltx: conditioning frame offset overflow".into()))?;
+    i32::try_from(offset)
+        .map_err(|_| Error::Msg("ltx: conditioning frame offset exceeds i32".into()))
+}
+
 /// A scalar in `dt` (the dtype-preserving `mx.array(v, dtype=…)`).
 fn scalar(v: f32, dt: Dtype) -> Result<Array> {
     Ok(Array::from_slice(&[v], &[1]).as_dtype(dt)?)
@@ -267,22 +277,22 @@ pub fn token_timesteps(denoise_mask: &Array, dtype: Dtype, sigma: f32) -> Result
 }
 
 /// Build the RoPE positions for an appended keyframe clip of latent shape `(cf, h, w)` placed at
-/// `frame_idx` — port of `VideoConditionByKeyframeIndex`'s `get_pixel_coords(get_patch_grid_bounds…)`
-/// then `+= frame_idx`, `÷ fps` on the frame axis. The causal first-frame fix is applied **only when
-/// `frame_idx == 0`** (matching the reference). Output `(1, 3, cf·h·w, 2)`, f32, token order C-major
+/// `frame_offset` — port of `VideoConditionByKeyframeIndex`'s output-frame coordinate. The causal
+/// first-frame fix is applied only when the output-frame offset is zero, matching the reference.
+/// Output `(1, 3, cf·h·w, 2)`, f32, token order C-major
 /// over `(frame, height, width)` with `[start, end]` last. Spatial axes are not divided by fps.
 pub fn keyframe_append_positions(
     cf: usize,
     h: usize,
     w: usize,
-    frame_idx: i32,
+    frame_offset: i32,
     temporal_scale: i64,
     spatial_scale: i64,
     fps: f32,
 ) -> Array {
     let hw = h * w;
     let num = cf * hw;
-    let causal = frame_idx == 0;
+    let causal = frame_offset == 0;
     let mut data = vec![0f32; 3 * num * 2];
     for p in 0..num {
         let t = (p / hw) as i64;
@@ -290,12 +300,12 @@ pub fn keyframe_append_positions(
         let hh = (rem / w) as i64;
         let ww = (rem % w) as i64;
         for e in 0..2i64 {
-            // frame axis: latent·scale → causal-fix (frame_idx==0 only) → += frame_idx (int) → /fps.
+            // frame axis: latent·scale → conditional causal fix → output-frame offset → /fps.
             let mut frame_pix = (t + e) * temporal_scale;
             if causal {
                 frame_pix = (frame_pix + 1 - temporal_scale).max(0);
             }
-            frame_pix += frame_idx as i64;
+            frame_pix += frame_offset as i64;
             let frame_f = frame_pix as f32 / fps;
             let height_f = ((hh + e) * spatial_scale) as f32;
             let width_f = ((ww + e) * spatial_scale) as f32;
@@ -316,7 +326,7 @@ pub fn keyframe_append_positions(
 pub fn append_keyframe_clip(
     state: &VideoTokenState,
     clip_latent: &Array,
-    frame_idx: i32,
+    frame_offset: i32,
     strength: f32,
     temporal_scale: i64,
     spatial_scale: i64,
@@ -332,7 +342,7 @@ pub fn append_keyframe_clip(
         &[b, n, 1],
     )?;
     let positions =
-        keyframe_append_positions(cf, h, w, frame_idx, temporal_scale, spatial_scale, fps);
+        keyframe_append_positions(cf, h, w, frame_offset, temporal_scale, spatial_scale, fps);
     let positions = if b > 1 {
         broadcast_to(&positions, &[b, 3, n, 2])?
     } else {
@@ -504,6 +514,24 @@ mod tests {
         // frame start = (0+3)/24; end = (8+3)/24.
         assert!((v[0] - 3.0 / 24.0).abs() < 1e-7);
         assert!((v[1] - 11.0 / 24.0).abs() < 1e-7);
+    }
+
+    #[test]
+    fn negative_one_bridge_resolves_to_the_target_output_tail() {
+        let target = crate::positions::create_position_grid(1, 7, 1, 1);
+        let target_values = target.as_slice::<f32>();
+        let target_tail_end = target_values[(6 * 2) + 1];
+        let raw_frame_idx = -1i32;
+        let latent_frames = 7i32;
+        let resolved_latent_idx = latent_frames + raw_frame_idx;
+        assert_eq!(resolved_latent_idx, 6);
+        let offset = latent_frame_to_output_offset(resolved_latent_idx, 8).unwrap();
+        assert_eq!(offset, 48);
+        let appended = keyframe_append_positions(1, 1, 1, offset, 8, 32, 24.0);
+        let append_start = appended.as_slice::<f32>()[0];
+        assert!((append_start - (target_tail_end - 1.0 / 24.0)).abs() < 1e-7);
+        assert!((append_start - 48.0 / 24.0).abs() < 1e-7);
+        assert!((append_start - 6.0 / 24.0).abs() > 1.0);
     }
 
     #[test]

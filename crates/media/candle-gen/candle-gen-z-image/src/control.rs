@@ -44,7 +44,9 @@ use candle_gen::candle_nn::{self as nn, Linear, Module, VarBuilder};
 use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::{GenerationMemory, Image, LoadPhase, PidWeights, PreviewSink, Progress};
+use candle_gen::gen_core::{
+    AdapterSpec, GenerationMemory, Image, LoadPhase, PidWeights, PreviewSink, Progress,
+};
 use candle_gen::{CandleError, Result};
 use candle_gen_pid::{PidDecoder, PidEngine};
 use candle_transformers::models::z_image::preprocess::prepare_inputs;
@@ -143,11 +145,18 @@ pub struct ZImageControlPaths {
     /// The Fun-Controlnet-Union checkpoint — a single `.safetensors` file or a dir containing it
     /// (`Z-Image-Turbo-Fun-Controlnet-Union-2.1` for Turbo, `Z-Image-Fun-Controlnet-Union-2.1` for base).
     pub control: PathBuf,
+    /// User-selected LoRA/LoKr stack applied to the base Z-Image transformer before the VACE
+    /// control branch is composed. The control checkpoint itself is never an adapter target.
+    pub adapters: Vec<AdapterSpec>,
     /// Select the **base** (undistilled, full-CFG) treatment (sc-8680): shift-6.0 scheduler,
     /// ~50-step default, and real classifier-free guidance in the control denoise (the candle sibling of
     /// `mlx-gen-z-image::model_base_control`). `false` = the original distilled Turbo path (no CFG,
     /// 4-step shift-3.0), byte-unchanged. The control transformer architecture is identical either way.
     pub base: bool,
+}
+
+fn control_pipeline(paths: &ZImageControlPaths, device: &Device) -> Pipeline {
+    Pipeline::load(&paths.snapshot, device, DTYPE, &paths.adapters, None)
 }
 
 /// One Z-Image Fun-ControlNet generation request.
@@ -581,9 +590,7 @@ impl ZImageControl {
     /// runs f32.
     pub fn load(paths: &ZImageControlPaths) -> Result<Self> {
         let device = candle_gen::default_device()?;
-        let root = paths.snapshot.clone();
-
-        let pipeline = Pipeline::load(&root, &device, DTYPE, &[], None);
+        let pipeline = control_pipeline(paths, &device);
         let text = pipeline.load_text_phase()?;
         let dit_cfg = DitConfig::z_image_turbo();
         let base =
@@ -626,7 +633,7 @@ impl ZImageControl {
             return Self::load(paths);
         }
         let device = candle_gen::default_device()?;
-        let pipeline = Pipeline::load(&paths.snapshot, &device, DTYPE, &[], None);
+        let pipeline = control_pipeline(paths, &device);
         let control_file = resolve_control_file(&paths.control)?;
         let vae_cfg = VaeConfig::z_image();
         Ok(Self {
@@ -1403,6 +1410,41 @@ fn control_file_score(path: &Path) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strict_control_pipeline_preserves_the_ordered_base_adapter_stack() {
+        use candle_gen::gen_core::AdapterKind;
+
+        let adapters = vec![
+            AdapterSpec::new(
+                PathBuf::from("pose-style.safetensors"),
+                0.4,
+                AdapterKind::Lora,
+            ),
+            AdapterSpec::new(
+                PathBuf::from("identity.safetensors"),
+                0.9,
+                AdapterKind::Lokr,
+            ),
+        ];
+        let paths = ZImageControlPaths {
+            snapshot: PathBuf::from("snapshot"),
+            control: PathBuf::from("control.safetensors"),
+            adapters: adapters.clone(),
+            base: false,
+        };
+
+        // Both resident `load` and staged `load_with_memory` construct their base through this single
+        // seam. Keeping the assertion weight-free catches either route regressing to an empty stack.
+        let pipeline = control_pipeline(&paths, &Device::Cpu);
+        assert_eq!(pipeline.adapter_specs().len(), 2);
+        assert_eq!(pipeline.adapter_specs()[0].path, adapters[0].path);
+        assert_eq!(pipeline.adapter_specs()[0].scale, 0.4);
+        assert_eq!(pipeline.adapter_specs()[0].kind, AdapterKind::Lora);
+        assert_eq!(pipeline.adapter_specs()[1].path, adapters[1].path);
+        assert_eq!(pipeline.adapter_specs()[1].scale, 0.9);
+        assert_eq!(pipeline.adapter_specs()[1].kind, AdapterKind::Lokr);
+    }
 
     #[test]
     fn request_defaults() {

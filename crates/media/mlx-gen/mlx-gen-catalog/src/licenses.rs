@@ -469,8 +469,7 @@ pub const MLX_MEDIA_PROVIDER_COMPONENTS: &[ProviderComponents] = &[
     // Each Wan repository ships its own VAE and tokenizer, so the repository row covers them; only
     // UMT5-XXL is keyed separately, being one of the few auxiliaries whose upstream the code writes
     // down. The GGUF re-host is a Candle-only path and is deliberately absent here. Both VACE routes
-    // share the base Wan2.2 14B trio (`mlx-gen-wan/src/convert.rs:489`, `:561`), and
-    // `wan2_2_vace_fun_14b` is MLX-only.
+    // share the base Wan2.2 14B trio (`mlx-gen-wan/src/convert.rs:489`, `:561`).
     ProviderComponents {
         provider_id: "wan2_2_ti2v_5b",
         components: &["wan2_2_ti2v_5b", "umt5_xxl"],
@@ -978,7 +977,7 @@ mod tests {
         // FLUX.2's separately distilled kv checkpoint is MLX-only.
         assert!(components("flux2_klein_9b_kv_edit").contains(&"flux2_klein_9b_kv"));
         assert!(!components("flux2_klein_9b").contains(&"flux2_klein_9b_kv"));
-        // The VACE-Fun route and both Z-Image control checkpoints are MLX-only.
+        // Pin the VACE-Fun expert checkpoint map; both Z-Image control checkpoints are MLX-only.
         assert!(components("wan2_2_vace_fun_14b").contains(&"wan2_2_vace_fun_a14b"));
         assert!(components("z_image_control").contains(&"z_image_fun_controlnet_union_2_1"));
         assert!(

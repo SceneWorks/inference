@@ -19,7 +19,7 @@ use candle_gen::candle_core::{DType, Device};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::Result;
 
-pub use candle_gen_qwen_image::vae::QwenVae;
+pub use candle_gen_qwen_image::vae::{QwenVae, QwenVaeEncoder};
 
 /// Port of the Anima convert script's `rename_residual_key` (diffusers resnet leaf names).
 fn rename_residual_key(key: &str) -> String {
@@ -98,6 +98,18 @@ pub fn load_vae(path: impl AsRef<Path>, device: &Device) -> Result<QwenVae> {
     }
     let vb = VarBuilder::from_tensors(map, DType::F32, device);
     QwenVae::new(vb).map_err(Into::into)
+}
+
+/// Load only Anima's Qwen-Image VAE encoder for training-time image caching.
+pub fn load_vae_encoder(path: impl AsRef<Path>, device: &Device) -> Result<QwenVaeEncoder> {
+    let src = candle_gen::Weights::from_file(path.as_ref(), device, DType::F32)?;
+    let keys: Vec<String> = src.keys().cloned().collect();
+    let mut map: HashMap<String, _> = HashMap::with_capacity(keys.len());
+    for k in &keys {
+        map.insert(convert_vae_key(k), src.require(k)?);
+    }
+    let vb = VarBuilder::from_tensors(map, DType::F32, device);
+    QwenVaeEncoder::new(vb).map_err(Into::into)
 }
 
 #[cfg(test)]

@@ -209,6 +209,14 @@ class MMAudioReferenceFixtureTests(unittest.TestCase):
             self.assertEqual(model["key"], key)
             self.assertRegex(model["revision"], r"^[0-9a-f]{40}$")
 
+    def test_clip_fixture_key_resolves_to_the_canonical_repository(self) -> None:
+        """The 384 identity is stable, while acquisition must use Apple's canonical 378 repo."""
+        key = "dfn5b-clip-vit-h14-384"
+        self.assertIn(key, ref.MANIFEST_KEYS)
+        model = ref.load_model(ref.MANIFEST_PATH, key)
+        self.assertEqual(model["repository"], "apple/DFN5B-CLIP-ViT-H-14-378")
+        self.assertEqual(ref.read_metadata()["snapshotRevisions"][key], model["revision"])
+
 
 class MMAudioReferenceVerifierDiscriminationTests(unittest.TestCase):
     """Each check must reject a targeted corruption — a verifier that cannot fail proves nothing."""

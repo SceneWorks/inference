@@ -121,6 +121,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .ok()
             .filter(|value| !value.trim().is_empty())
             .map(PathBuf::from),
+        native_dit: None,
         control: a.ckpt,
         adapters: Vec::new(),
         branch_tier: a.branch_tier,

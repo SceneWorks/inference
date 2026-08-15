@@ -144,7 +144,9 @@ pub fn descriptor() -> ModelDescriptor {
             supports_kv_cache: false,
             requires_sigma_shift: false,
             supports_sequential_offload: false,
+            unconditionally_engages_staged_residency: false,
             supports_preview: false,
+            supports_prompt_enhancement: false,
             supports_streaming: true,
             supports_multi_speaker: false,
             // Multi-turn conversational continuation (sc-14151), both selectable shapes: the stateless

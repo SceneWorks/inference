@@ -43,7 +43,7 @@ Regenerating (dev box with the three snapshots materialized)::
       -r crates/audio/candle-audio-mmaudio/_vendor/requirements-oracles.txt
 
     export MMAUDIO_MMAUDIO_SNAPSHOT=/path/to/models--hkchengrex--MMAudio/snapshots/<rev>
-    export MMAUDIO_CLIP_SNAPSHOT=/path/to/models--apple--DFN5B-CLIP-ViT-H-14-384/snapshots/<rev>
+    export MMAUDIO_CLIP_SNAPSHOT=/path/to/models--apple--DFN5B-CLIP-ViT-H-14-378/snapshots/<rev>
     export MMAUDIO_BIGVGAN_V2_SNAPSHOT=/path/to/models--nvidia--bigvgan_v2_.../snapshots/<rev>
     /tmp/mmaudio-reference/bin/python scripts/reference/mmaudio_reference.py dump
 
@@ -109,7 +109,8 @@ BIGVGAN_V2_SNAPSHOT_ENV = "MMAUDIO_BIGVGAN_V2_SNAPSHOT"
 
 #: manifest key -> the snapshot environment variable that supplies it. Every revision written into
 #: the fixture metadata is read back out of the manifest through `verify_model_snapshot.load_model`,
-#: never restated here, so a pin bump cannot drift from the fixture.
+#: never restated here, so a pin bump cannot drift from the fixture. The `...-384` CLIP key is a
+#: stable fixture/catalog identity; its manifest row points at the canonical `...-378` repository.
 MANIFEST_KEYS = {
     "mmaudio-small-16k": MMAUDIO_SNAPSHOT_ENV,
     "mmaudio-large-44k-v2": MMAUDIO_SNAPSHOT_ENV,
@@ -578,10 +579,12 @@ def _load_reference() -> Any:
 def _clip_model(torch: Any) -> tuple[Any, Any]:
     """Build the DFN5B CLIP tower from the local snapshot, never from the hub.
 
-    open_clip's own entry point for this checkpoint is `hf-hub:apple/DFN5B-CLIP-ViT-H-14-384`,
-    which resolves through the Hugging Face hub. The snapshot already on disk carries both halves
-    it needs — `open_clip_config.json` and `open_clip_pytorch_model.bin` — so the config is
-    registered under a private name and the weights are loaded from the explicit path. The
+    The frozen MMAudio reference names the historical
+    `hf-hub:apple/DFN5B-CLIP-ViT-H-14-384` alias. The canonical repository is
+    `apple/DFN5B-CLIP-ViT-H-14-378`; MMAudio still feeds 384px, which gives the same 27x27 patch
+    grid as native 378px under patch-14 convolution. The canonical snapshot already on disk carries
+    both halves it needs — `open_clip_config.json` and `open_clip_pytorch_model.bin` — so the config
+    is registered under a private name and the weights are loaded from the explicit path. The
     vendored reference is not edited to achieve this (the Mage precedent): `FeaturesUtils` is
     constructed with `enable_conditions=False` and the encoders are attached here.
     """
@@ -590,6 +593,8 @@ def _clip_model(torch: Any) -> tuple[Any, Any]:
 
     snapshot = snapshot_dir(CLIP_SNAPSHOT_ENV)
     config = json.loads((snapshot / "open_clip_config.json").read_text(encoding="utf-8"))
+    # Local registration identity only: keep the established 384 name alongside the stable fixture
+    # key. It never performs a Hub lookup; `pretrained` below is the canonical snapshot file.
     name = "sceneworks-dfn5b-clip-vit-h-14-384"
     factory._MODEL_CONFIGS[name] = config["model_cfg"]
     model = factory.create_model(

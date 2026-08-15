@@ -222,7 +222,11 @@ impl Flux2Variant {
                 // bounding peak to `max(TE, DiT+VAE)`. The edit variants' reference conditioning that
                 // must persist through denoise is VAE-encoded in the heavy phase (after the TE drop).
                 supports_sequential_offload: true,
+                unconditionally_engages_staged_residency: false,
                 supports_preview: true,
+                // Dev (txt2img + edit) loads the Mistral3/Pixtral caption upsampler and consults
+                // `GenerationRequest::enhance_prompt`; Klein returns the raw prompt unchanged.
+                supports_prompt_enhancement: self.is_dev(),
                 supports_streaming: false,
                 supports_multi_speaker: false,
                 supports_conversation_history: false,
@@ -407,6 +411,7 @@ mod tests {
         assert!(!caps.supports_negative_prompt);
         assert!(!caps.supports_true_cfg);
         assert!(!caps.supports_kv_cache);
+        assert!(caps.supports_prompt_enhancement);
         assert!(caps.accepts(ConditioningKind::Reference));
         // config() now returns the dev dims, not klein's (the previous hardcode was a latent bug).
         assert_eq!(v.config().num_single_layers, 48);
@@ -434,6 +439,7 @@ mod tests {
             caps.supports_guidance && !caps.supports_negative_prompt && !caps.supports_true_cfg
         );
         assert!(!caps.supports_kv_cache);
+        assert!(caps.supports_prompt_enhancement);
         assert!(caps.mac_only);
     }
 
@@ -443,6 +449,7 @@ mod tests {
         assert!(kv.is_edit());
         assert!(kv.is_kv());
         assert!(!Flux2Variant::Klein9bEdit.is_kv());
+        assert!(!kv.descriptor().capabilities.supports_prompt_enhancement);
         assert!(!Flux2Variant::Klein9b.is_kv());
         // Only the kv variant advertises the cache; it loads the distinct -kv checkpoint.
         assert!(kv.descriptor().capabilities.supports_kv_cache);

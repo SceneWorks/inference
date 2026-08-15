@@ -328,6 +328,20 @@ impl Pipeline {
         })
     }
 
+    /// Training-only staged text-encoder load. Callers cache every caption and drop this before the
+    /// dense MMDiT is loaded.
+    pub(crate) fn load_training_encoders(&self) -> Result<Sd3TextEncoders> {
+        Sd3TextEncoders::load(&self.root, self.cfg.t5_seq_len, &self.device, self.dtype)
+    }
+
+    /// Training-only dense MMDiT load with no inference adapters or quantization.
+    pub(crate) fn load_training_transformer(&self) -> Result<Sd3Transformer> {
+        Ok(Sd3Transformer::new(
+            &self.cfg,
+            self.component_vb_on("transformer", &self.device)?,
+        )?)
+    }
+
     /// Resolve the sorted list of `.safetensors` files in the snapshot component subdir `sub`
     /// (single-file or sharded), erroring if the dir or files are missing.
     fn component_files(&self, sub: &str) -> Result<Vec<PathBuf>> {

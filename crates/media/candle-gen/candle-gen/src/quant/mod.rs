@@ -48,6 +48,7 @@ pub mod nvfp4;
 // on a packed q4/q8 tier. The one core that candle-gen-wan (sc-10094) + candle-gen-anima (sc-10640)
 // collapse into and that qwen-image-edit Lightning adopts. Pure candle ops → builds everywhere.
 pub mod adapt;
+pub mod adapters;
 
 // The ConvRot online rotation leg (sc-9601): the regular-Hadamard activation rotation `RHT(x) = x·R`
 // a community INT8-ConvRot checkpoint needs before the int8 IGEMM (its stored weight is `W·R`). Pure
@@ -77,6 +78,7 @@ pub mod nvfp4_linear;
 pub mod nvfp4_outlier;
 
 pub use adapt::{AdaptLinear, LokrFactors};
+pub use adapters::{install_dotted_adapters, AdditiveAdapterReport};
 pub use convrot::{convrot_rotate, is_power_of_four, regular_hadamard};
 pub use nvfp4::{
     e2m1_from_f32, e4m3_from_f32, e4m3_to_f32, Nvfp4Tensor, E2M1_LUT, E2M1_MAX, E4M3_MAX,

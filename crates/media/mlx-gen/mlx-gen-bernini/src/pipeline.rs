@@ -24,7 +24,7 @@ use mlx_gen_wan::config::WanModelConfig;
 use mlx_gen_wan::pipeline::{align_dim, decode_to_frames, frames_to_images, latent_shape};
 use mlx_gen_wan::scheduler::{make_scheduler, SolverKind};
 use mlx_gen_wan::text_encoder::{load_tokenizer, Umt5Encoder};
-use mlx_gen_wan::{WanBlockStream, WanTransformer, WanVae};
+use mlx_gen_wan::{WanBlockStream, WanTransformer};
 
 use crate::config::{resolve_mode, validate_bernini_geometry, BerniniKnobs, Defaults};
 use crate::forward::{
@@ -33,6 +33,7 @@ use crate::forward::{
 };
 use crate::guidance::MomentumBuffer;
 use crate::preprocess::{encode_image, encode_videoclip};
+use crate::{decoded_output_geometry, ProviderVae, PROVIDER_VAE_STRIDE};
 
 pub const MODEL_ID: &str = "bernini_renderer";
 
@@ -80,11 +81,12 @@ pub fn descriptor() -> ModelDescriptor {
             // z16 VAE — dropping BOTH encoders (+ `clear_cache()`) before the experts, so peak unified
             // memory is already bounded to the dominant expert phase. The shared per-component footprint
             // reports the two experts as the DiT phase (the peak), so the fit-gate's staged estimate is
-            // sound. `OffloadPolicy` is not consumed — there is no Resident-warm mode to toggle. (This id
-            // is `Modality::Video`; the worker's image fit-gate does not gate on it, so advertising the
-            // flag is honest discovery parity + memory hygiene, not a behavior change.)
-            supports_sequential_offload: true,
+            // sound. `OffloadPolicy` is not consumed — there is no Resident-warm mode to toggle, so this
+            // is unconditional physical staging rather than a selectable offload control.
+            supports_sequential_offload: false,
+            unconditionally_engages_staged_residency: true,
             supports_preview: false,
+            supports_prompt_enhancement: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
@@ -152,10 +154,10 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 /// TE/DiT/VAE render split (they are still in the worker's whole-model total). Shared by `bernini` +
 /// `bernini_renderer`.
 ///
-/// Both ids advertise `supports_sequential_offload` (sc-10840) — each is structurally always-staged
+/// Both ids declare unconditional staged residency — each is structurally always-staged
 /// (the encoders are dropped + `clear_cache()`d before the two co-resident experts load), and this split
 /// is the staged peak the fit-gate bounds (`max(encoders, DiT+VAE)`, dominated by the experts). The
-/// worker's fit-gate keys on that descriptor capability bit (there is no allowlist) and consumes this
+/// worker can consume that physical fact independently of the false selectable-control bit and this
 /// split generically through the registered footprint seam (this crate reports the bytes; the worker
 /// decides how to use them).
 pub(crate) fn component_footprint(
@@ -442,8 +444,8 @@ impl BerniniRenderer {
         // sc-12500 (F-040): `validate_impl` rejects any off-grid width/height, so the reference's
         // align-down is a no-op here — assert that instead of silently refitting the request
         // (1000×1000 used to render 992×992 with no diagnostic while candle errored).
-        let width = align_dim(req.width, cfg.patch_size.2, cfg.vae_stride.2);
-        let height = align_dim(req.height, cfg.patch_size.1, cfg.vae_stride.1);
+        let width = align_dim(req.width, cfg.patch_size.2, PROVIDER_VAE_STRIDE.2);
+        let height = align_dim(req.height, cfg.patch_size.1, PROVIDER_VAE_STRIDE.1);
         debug_assert_eq!(
             (width, height),
             (req.width, req.height),
@@ -475,7 +477,7 @@ impl BerniniRenderer {
             norm_threshold: [Defaults::NORM_THRESHOLD, Defaults::NORM_THRESHOLD],
         };
 
-        let lat = latent_shape(frames, height, width, cfg.vae_z_dim, cfg.vae_stride)?;
+        let lat = latent_shape(frames, height, width, cfg.vae_z_dim, PROVIDER_VAE_STRIDE)?;
 
         // --- Stage 1: UMT5 text encode (loaded → used → freed) ---
         let tokenizer = load_tokenizer(self.root.join("tokenizer.json"), cfg.text_len)?;
@@ -503,7 +505,7 @@ impl BerniniRenderer {
         // --- Stage 1b: VAE-encode source media → conditioning latents (→ encoder freed) ---
         let (videos, images) = if has_video || has_image {
             let w = Weights::from_file(self.root.join("vae.safetensors"))?;
-            let vae = WanVae::from_weights(&w)?;
+            let vae = ProviderVae::from_weights(&w)?;
             let mut videos = Vec::new();
             let mut images = Vec::new();
             for c in &req.conditioning {
@@ -645,15 +647,15 @@ impl BerniniRenderer {
 
         // --- Stage 3: z16 VAE decode → RGB8 frames ---
         on_progress(Progress::Decoding);
-        let out_frames = lat[1] * cfg.vae_stride.0 as i32;
+        let (out_frames, out_height, out_width) = decoded_output_geometry(lat[1], lat[2], lat[3])?;
         // Ladder rung 2 (sc-15528) — see the note on the full pipeline's decode.
         let tiling = match crate::memory_strategy::decode_tiling(req)? {
             Some(explicit) => Some(explicit),
-            None => TilingConfig::auto(height as i32, width as i32, out_frames),
+            None => TilingConfig::auto(out_height, out_width, out_frames),
         };
         let frames_u8 = {
             let w = Weights::from_file(self.root.join("vae.safetensors"))?;
-            let vae = WanVae::from_weights(&w)?;
+            let vae = ProviderVae::from_weights(&w)?;
             decode_to_frames(&vae, &latents, tiling.as_ref(), Some(&req.cancel))?
         };
         let images_out = frames_to_images(&frames_u8)?;
@@ -682,16 +684,18 @@ mod tests {
     use super::*;
     use mlx_rs::ops::multiply;
 
-    /// Component residency (epic 10834, sc-10840): the renderer advertises `supports_sequential_offload`
-    /// because it is structurally always-staged — `generate_impl` drops the UMT5 text encoder and the
+    /// Component residency (epic 10834, sc-10840): the renderer is structurally always-staged —
+    /// `generate_impl` drops the UMT5 text encoder and the
     /// source-VAE encoder (each + `clear_cache()`) before loading the two co-resident MoE experts, so
     /// peak unified memory is already bounded to the dominant expert phase (the footprint's DiT split).
     #[test]
-    fn advertises_sequential_offload() {
-        assert!(
-            descriptor().capabilities.supports_sequential_offload,
-            "bernini_renderer is always-staged (UMT5 + source-VAE dropped before the experts); it must \
-             advertise supports_sequential_offload so the fit-gate consumes the staged footprint"
+    fn declares_unconditional_staged_residency_without_a_selectable_control() {
+        let capabilities = descriptor().capabilities;
+        assert!(!capabilities.supports_sequential_offload);
+        assert!(capabilities.unconditionally_engages_staged_residency);
+        assert_eq!(
+            capabilities.staged_residency_availability(),
+            mlx_gen::StagedResidencyAvailability::UnconditionallyEngaged,
         );
     }
 

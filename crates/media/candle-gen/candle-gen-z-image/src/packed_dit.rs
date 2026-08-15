@@ -1376,8 +1376,7 @@ mod parity_tests {
         let old = QLinear::linear_detect(64, 4, &vb, "to_q", true)?;
         let missing =
             streamed_linear_detect(64, 4, &vb, "to_q", true, &sidecars, "layers.1.attention")
-                .err()
-                .expect("a packed streamed projection must not fall back to source conversion");
+                .expect_err("a packed streamed projection must not fall back to source conversion");
         assert!(missing
             .to_string()
             .contains("no prepared device-format sidecar"));

@@ -165,6 +165,22 @@ pub struct MemoryBehaviorFixture {
 }
 
 impl MemoryBehaviorFixture {
+    /// Build a fixture whose request mirrors `context.geometry`.
+    ///
+    /// **Known gap — `frames` is not propagated.** Width, height, batch and reference count are
+    /// carried across; `frames` is not, so it takes `GenerationRequest::default()` (`None`, i.e. a
+    /// single frame) regardless of `context.geometry.frames`. For providers whose legal geometry
+    /// includes one frame this is harmless, which is why it went unnoticed. A provider whose frame
+    /// lattice **excludes** 1 gets a self-inconsistent fixture: the conformance walk calls
+    /// `configure_request` with a 1-frame request against the multi-frame geometry the same fixture
+    /// admitted, and the provider correctly refuses it as off-lattice. Such a provider must set
+    /// `fixture.request.frames` itself after calling this — see
+    /// `mlx-gen-minimax-h3/src/memory_strategy.rs` (`17n+5` lattice, minimum 124 frames), the first
+    /// provider to hit it.
+    ///
+    /// Propagating `frames` here is the better fix and is deliberately deferred to its own reviewed
+    /// PR rather than folded into an unrelated change: this builder is read by every provider on the
+    /// memory ladder.
     pub fn new(context: crate::MemoryRunContext) -> Self {
         let mut request = crate::GenerationRequest {
             width: context.geometry.width,

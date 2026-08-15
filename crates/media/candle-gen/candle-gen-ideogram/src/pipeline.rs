@@ -27,7 +27,9 @@ use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::imageops::{resize_lanczos_u8, resize_nearest_u8};
 use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
-use candle_gen::gen_core::{self, Conditioning, GenerationRequest, Image, PidWeights, Progress};
+use candle_gen::gen_core::{
+    self, AdapterSpec, Conditioning, GenerationRequest, Image, PidWeights, Progress,
+};
 use candle_gen::{CandleError, LatentDecoder, Result as CResult};
 use candle_gen_flux2::vae::Flux2Vae;
 use candle_gen_pid::{PidDecoder, PidEngine};
@@ -155,19 +157,33 @@ pub fn load_components(
     root: &Path,
     device: &Device,
     pid_spec: Option<&PidWeights>,
+    adapters: &[AdapterSpec],
 ) -> CResult<Components> {
     let dit = Ideogram4DitConfig::v4();
     let te_cfg = Ideogram4TextEncoderConfig::qwen3_vl_8b();
 
     let cond = crate::loader::Weights::from_dir(&root.join("transformer"), device, DIT_DTYPE)?;
-    let cond = Ideogram4Transformer::load(&cond, &dit)?;
+    let mut cond = Ideogram4Transformer::load(&cond, &dit)?;
+    candle_gen::quant::install_dotted_adapters(
+        "ideogram quality conditional",
+        adapters,
+        device,
+        |visitor| cond.visit_adaptable_mut(visitor),
+    )?;
 
     let uncond = crate::loader::Weights::from_dir(
         &root.join("unconditional_transformer"),
         device,
         DIT_DTYPE,
     )?;
-    let uncond = Some(Ideogram4Transformer::load(&uncond, &dit)?);
+    let mut uncond = Ideogram4Transformer::load(&uncond, &dit)?;
+    candle_gen::quant::install_dotted_adapters(
+        "ideogram quality unconditional",
+        adapters,
+        device,
+        |visitor| uncond.visit_adaptable_mut(visitor),
+    )?;
+    let uncond = Some(uncond);
 
     let te = Ideogram4TextEncoder::new(
         &te_cfg,
@@ -208,6 +224,7 @@ pub fn load_components_turbo(
     root: &Path,
     device: &Device,
     pid_spec: Option<&PidWeights>,
+    adapters: &[AdapterSpec],
 ) -> CResult<Components> {
     let dit = Ideogram4DitConfig::v4();
     let te_cfg = Ideogram4TextEncoderConfig::qwen3_vl_8b();
@@ -223,6 +240,9 @@ pub fn load_components_turbo(
         &root.join(TURBO_LORA_FILE),
         TURBO_LORA_SCALE,
     )?;
+    candle_gen::quant::install_dotted_adapters("ideogram turbo", adapters, device, |visitor| {
+        cond.visit_adaptable_mut(visitor)
+    })?;
 
     let te = Ideogram4TextEncoder::new(
         &te_cfg,
