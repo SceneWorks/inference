@@ -1838,7 +1838,8 @@ mod tests {
     fn track() -> mlx_gen::media::AudioTrack {
         mlx_gen::media::AudioTrack {
             samples: vec![0.0; 64],
-            sample_rate: 24_000,
+            // The engine ships no resampler, so `Ref2VaReferences::new` admits only this rate.
+            sample_rate: AUDIO_SAMPLE_RATE,
             channels: 1,
             stems: Vec::new(),
         }

@@ -61,7 +61,7 @@ use crate::denoise::{
     JointSchedule, JointVelocity, PackedLayout, LEGAL_FRAME_COUNTS, MAX_AV_DRIFT_SECONDS,
     MINIMAX_H3_FPS, TEXT_TAG,
 };
-use crate::dit::positions::KeyframeAnchor;
+use crate::dit::positions::{KeyframeAnchor, ReferenceLatentGeometry};
 
 /// What generated width and height must be a multiple of: the VAE's 16× spatial compression times
 /// the DiT's `patch_size[2]`.
@@ -608,6 +608,87 @@ pub fn fl2va_layout(
     )
 }
 
+/// A reference soundtrack as the audio VAE encoder's input: `[channels, 1, samples]`,
+/// **de-interleaved**.
+///
+/// # The model is mono, and stereo is a BATCH axis
+///
+/// `AudioTrack` carries interleaved PCM (`L R L R …`), and the audio VAE is mono — a stereo
+/// reference is encoded as **two batch items** through the same weights, exactly as
+/// [`crate::audio_vae::MiniMaxH3AudioVae::decode_stereo`] emits them. So this de-interleaves rather
+/// than reshaping: handing the encoder `[1, 1, 2·n]` would encode the two channels as one waveform
+/// at twice the rate, which runs, produces latents of a plausible shape, and is wrong.
+///
+/// The sample **rate** is not resampled here. The reference resamples a soundtrack onto the audio
+/// VAE's own rate before encoding, and a track arriving at another rate is rejected rather than
+/// silently encoded at the wrong speed.
+pub fn audio_track_to_encoder_input(track: &AudioTrack, device: &Device) -> Result<Tensor> {
+    let channels = track.channels as usize;
+    if channels == 0 {
+        return Err(CandleError::Msg(
+            "minimax_h3: a reference soundtrack declares zero channels".into(),
+        ));
+    }
+    if track.samples.is_empty() {
+        return Err(CandleError::Msg(
+            "minimax_h3: a reference soundtrack carries no samples".into(),
+        ));
+    }
+    if !track.samples.len().is_multiple_of(channels) {
+        return Err(CandleError::Msg(format!(
+            "minimax_h3: a {}-channel soundtrack cannot hold {} interleaved samples",
+            channels,
+            track.samples.len()
+        )));
+    }
+    if track.sample_rate != AUDIO_SAMPLE_RATE {
+        return Err(CandleError::Msg(format!(
+            "minimax_h3: a reference soundtrack must be resampled onto the audio VAE's \
+             {AUDIO_SAMPLE_RATE} Hz before encoding, got {} Hz",
+            track.sample_rate
+        )));
+    }
+    let per_channel = track.samples.len() / channels;
+    // De-interleave into channel-major order: every sample of channel 0, then channel 1.
+    let mut planar = Vec::with_capacity(track.samples.len());
+    for c in 0..channels {
+        planar.extend(track.samples.iter().skip(c).step_by(channels).copied());
+    }
+    Ok(Tensor::from_vec(
+        planar,
+        (channels, 1, per_channel),
+        device,
+    )?)
+}
+
+/// Build the packed layout for a **`ref2va`** request — ordered multi-modal reference blocks.
+///
+/// `references` is in packed order and carries the *encoded* latent geometry of every reference, so
+/// the layout and the conditioning rows are described once. See
+/// [`PackedLayout::build_ref2va`] for why this is a separate constructor rather than an option on
+/// the `fl2va` one, and [`crate::reference`] for why the order is semantic.
+pub fn ref2va_layout(
+    geometry: &RequestGeometry,
+    text_token_tags: &[u32],
+    references: &[ReferenceLatentGeometry],
+    patch: [usize; 3],
+    device: &Device,
+) -> Result<PackedLayout> {
+    if text_token_tags.is_empty() {
+        return Err(CandleError::Msg(
+            "minimax_h3: the packed sequence needs at least one text row".into(),
+        ));
+    }
+    PackedLayout::build_ref2va(
+        geometry.joint,
+        patch,
+        text_token_tags,
+        AUDIO_CHANNELS,
+        references,
+        device,
+    )
+}
+
 /// Prepend a request's conditioning rows to its freshly-drawn video rows.
 ///
 /// `MiniMaxH3FL2VAPrepareLatentsStep` in one line: the anchors **lead** the video row stream, and
@@ -621,24 +702,60 @@ pub fn prepend_condition_rows(
     condition_rows: Option<&Tensor>,
     video_rows: &Tensor,
 ) -> Result<Tensor> {
-    let want = layout.num_condition_video_rows();
-    match (want, condition_rows) {
-        (0, None) => Ok(video_rows.clone()),
-        (0, Some(_)) => Err(CandleError::Msg(
-            "minimax_h3: conditioning rows were supplied for a layout that reserves none".into(),
-        )),
+    prepend_rows(
+        layout.num_condition_video_rows(),
+        condition_rows,
+        video_rows,
+        "conditioning video",
+    )
+}
+
+/// Prepend a `ref2va` request's **reference soundtrack** rows to its freshly-drawn audio rows.
+///
+/// The audio sibling of [`prepend_condition_rows`], and checked against the layout for the same
+/// reason: a soundtrack block of the wrong height concatenates cleanly and produces a runnable,
+/// silently misaligned sequence. `t2va` / `fl2va` reserve zero such rows and pass `None`.
+///
+/// The reference rows ride at a clean [`crate::denoise::REFERENCE_AUDIO_TIMESTEP`] (`1.0`) rather
+/// than the `0.999` visual anchors sit at — the audio conditioning is genuinely clean, and that
+/// difference is a real class in [`crate::denoise::RowClass`], not a rounding of the same idea.
+pub fn prepend_condition_audio_rows(
+    layout: &PackedLayout,
+    condition_rows: Option<&Tensor>,
+    audio_rows: &Tensor,
+) -> Result<Tensor> {
+    prepend_rows(
+        layout.num_condition_audio_rows(),
+        condition_rows,
+        audio_rows,
+        "reference soundtrack",
+    )
+}
+
+/// The shape-and-count contract both prepends share.
+fn prepend_rows(
+    expected: usize,
+    condition_rows: Option<&Tensor>,
+    generated: &Tensor,
+    what: &str,
+) -> Result<Tensor> {
+    match (expected, condition_rows) {
+        (0, None) => Ok(generated.clone()),
+        (0, Some(_)) => Err(CandleError::Msg(format!(
+            "minimax_h3: {what} rows were supplied for a layout that reserves none"
+        ))),
         (n, None) => Err(CandleError::Msg(format!(
-            "minimax_h3: the layout reserves {n} conditioning video row(s) but none were supplied"
+            "minimax_h3: the layout reserves {n} {what} row(s) but none were supplied"
         ))),
         (n, Some(rows)) => {
             let d = rows.dims();
-            if d.len() != 3 || d[0] != 1 || d[1] != n || d[2] != video_rows.dim(2)? {
+            if d.len() != 3 || d[0] != 1 || d[1] != n || d[2] != generated.dim(2)? {
                 return Err(CandleError::Msg(format!(
-                    "minimax_h3: expected [1, {n}, {}] conditioning rows, got {d:?}",
-                    video_rows.dim(2)?
+                    "minimax_h3: expected [1, {n}, {}] {what} rows, got {d:?}",
+                    generated.dim(2)?
                 )));
             }
-            Ok(Tensor::cat(&[&rows.to_dtype(video_rows.dtype())?, video_rows], 1)?.contiguous()?)
+            Ok(Tensor::cat(&[&rows.to_dtype(generated.dtype())?, generated], 1)?.contiguous()?)
         }
     }
 }
