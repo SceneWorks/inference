@@ -253,8 +253,8 @@ pub use pipeline::{
     align_frames_for_duration, fit_audio_to_video, frames_to_images, initial_latents,
     patchify_video_latents, render_latents, resolve_geometry, revert_pixel_normalization,
     t2va_layout, unpack_audio_rows, unpatchify_video_rows, RenderedLatents, RequestGeometry,
-    CANVAS_MAX_PIXELS, CANVAS_SHORT_EDGE, MAX_DURATION_SECONDS, MIN_DURATION_SECONDS, PATCH_SIZE,
-    PIXEL_MEAN, PIXEL_STD, SMALLEST_LEGAL_FRAMES, SPATIAL_STRIDE,
+    CANVAS_MAX_PIXELS, CANVAS_SHORT_EDGE, MAX_CANVAS_EDGE, MAX_DURATION_SECONDS,
+    MIN_DURATION_SECONDS, PATCH_SIZE, PIXEL_MEAN, PIXEL_STD, SMALLEST_LEGAL_FRAMES, SPATIAL_STRIDE,
 };
 pub use reference::{
     AudioReference, Ref2VaReference, Ref2VaReferences, ReferenceCounts, ReferenceKind,

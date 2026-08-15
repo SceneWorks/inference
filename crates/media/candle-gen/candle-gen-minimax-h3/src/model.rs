@@ -110,7 +110,7 @@ use crate::dit::positions::KeyframeAnchor;
 use crate::pipeline::{
     align_frames_for_duration, fit_audio_to_video, fl2va_layout, frames_to_images, initial_latents,
     prepend_condition_rows, render_latents, resolve_geometry, revert_pixel_normalization,
-    t2va_layout, RequestGeometry, CANVAS_SHORT_EDGE, PATCH_SIZE, SPATIAL_STRIDE,
+    t2va_layout, RequestGeometry, CANVAS_SHORT_EDGE, MAX_CANVAS_EDGE, PATCH_SIZE, SPATIAL_STRIDE,
 };
 use crate::reference::{Ref2VaReference, Ref2VaReferences, VideoReference};
 use crate::text_encoder::{
@@ -354,7 +354,11 @@ pub fn descriptor() -> ModelDescriptor {
             samplers: Vec::new(),
             schedulers: Vec::new(),
             min_size: SPATIAL_STRIDE,
-            max_size: 1344,
+            // The widest edge `crate::keyframe::resolve_canvas_size` can put a picture on, at the
+            // 4:1 aspect ceiling. A per-edge cap is NOT the area budget — `CANVAS_MAX_PIXELS` is
+            // checked as a product by `resolve_geometry` and still refuses 1536x1536 / 1344x1344,
+            // which sit inside this ceiling on both edges. See `MAX_CANVAS_EDGE` (sc-17152).
+            max_size: MAX_CANVAS_EDGE,
             // The stride is advertised, not hidden in provider code, so a weights-free consumer can
             // predict that an unaligned canvas is REFUSED rather than quietly refit.
             size_floor: SizeFloor::RangeCheckedOnGrid {
@@ -1412,6 +1416,25 @@ impl Generator for MiniMaxH3 {
         // [`task_component_dirs`] for why that is not a `load`-time check.
         let (_, references) = self.resolve_task(req)?;
 
+        // **The area budget runs HERE, not only inside `generate`** (sc-17152).
+        //
+        // `Capabilities::max_size` is a per-edge bound and can never constrain a product, so it was
+        // never the area gate — it only *looked* like one while it sat at 1344, because a square
+        // inside the budget was arithmetically impossible above it. Raising it to
+        // [`MAX_CANVAS_EDGE`] removes that accident, and without this call `1536 x 1536` (2.3x the
+        // budget) would pass `validate` and be refused only once `request_geometry` ran, deep
+        // inside a render that has already mapped the text encoder.
+        //
+        // The MLX provider has always run the gate at its validate boundary
+        // (`mlx-gen-minimax-h3::model::validate_request`); this is the Candle lane converging on it
+        // rather than a new rule. `request_geometry` is the same helper `generate` resolves
+        // through, so the two cannot disagree about what is renderable.
+        //
+        // It runs *after* `resolve_task` so sc-17157's error ordering is unchanged — the task's own
+        // checkpoint is still reported before any geometry-dependent refusal — and the resolved
+        // geometry is reused by the clip-length floor below rather than resolved a second time.
+        let geometry = self.request_geometry(req)?;
+
         // **The clip-length floor, on the same side of the boundary as everything else** (sc-17157).
         //
         // `MIN_REFERENCE_CLIP_FRAMES` was enforced only inside `normalize_reference_clip`, whose
@@ -1435,7 +1458,6 @@ impl Generator for MiniMaxH3 {
         // existing shape rather than departing from it, and error ordering stays legible: the
         // task's own checkpoint first, then the geometry-dependent admission.
         if let Some(references) = references {
-            let geometry = self.request_geometry(req)?;
             for r in references.as_slice() {
                 if let Ref2VaReference::Video(v) = r {
                     crate::reference::normalized_clip_frame_count(
@@ -1642,6 +1664,165 @@ mod tests {
         );
         assert_eq!(OFFLOAD_POLICY, OffloadPolicy::Sequential);
         assert_ne!(model.offload_policy(), spec.offload_policy);
+    }
+
+    /// Every resolution SceneWorks advertises for `minimax_h3` and `minimax_h3_ref`.
+    ///
+    /// Copied from `config/manifests/builtin.models.jsonc` — both partitions declare this exact
+    /// list, and it drives the resolution `<select>` in `apps/web/src/resolutionOverride.js`. A
+    /// bucket the menu offers and the engine refuses is a submit error the user cannot avoid, so
+    /// this list is the acceptance criterion rather than an illustration.
+    const ADVERTISED_BUCKETS: [(u32, u32); 9] = [
+        (1536, 672),
+        (672, 1536),
+        (1344, 768),
+        (768, 1344),
+        (1024, 768),
+        (768, 1024),
+        (768, 768),
+        (576, 320),
+        (320, 576),
+    ];
+
+    /// A generator over a staged-but-empty snapshot — enough to drive `validate`, which reads no
+    /// weights.
+    ///
+    /// It stages through [`staged_root`] rather than bare `create_dir_all`: sc-19573's
+    /// [`require_component`] refuses a component directory carrying no `.safetensors` shard, so a
+    /// directory-only root no longer loads at all.
+    fn validator() -> MiniMaxH3 {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = staged_root(&tmp);
+        let model = MiniMaxH3::load(&LoadSpec::new(WeightsSource::Dir(root))).unwrap();
+        // The tempdir may drop here: for the `t2va` requests this drives, `validate` touches no
+        // filesystem — `task_component_dirs(T2va)` is empty — which is the point.
+        model
+    }
+
+    fn request(width: u32, height: u32) -> GenerationRequest {
+        GenerationRequest {
+            prompt: "a slow pan across a rainy street at night".into(),
+            width,
+            height,
+            frames: Some(124),
+            ..Default::default()
+        }
+    }
+
+    /// **The per-edge ceiling is the widest canvas the model's own resolver emits** (sc-17152).
+    ///
+    /// The number is *derived here*, not restated: a maintained literal inside the test that exists
+    /// to catch a wrong literal proves nothing. The sweep walks the model's whole legal aspect
+    /// range and asks [`crate::keyframe::resolve_canvas_size`] — the arithmetic that turns a
+    /// reference's ratio into a canvas — for each canvas, then asserts `max_size` equals the widest
+    /// edge that came back. A ceiling below it would refuse a canvas the model resolves to on its
+    /// own; above it would advertise an edge nothing can produce.
+    #[test]
+    fn the_capability_ceiling_is_the_widest_canvas_the_resolver_emits() {
+        const STEPS: u32 = 40_000;
+        let mut widest = 0u32;
+        for i in 0..=STEPS {
+            let ratio = crate::keyframe::MIN_ASPECT_RATIO
+                + (crate::keyframe::MAX_ASPECT_RATIO - crate::keyframe::MIN_ASPECT_RATIO)
+                    * f64::from(i)
+                    / f64::from(STEPS);
+            let (h, w) = crate::keyframe::resolve_canvas_size(
+                ratio,
+                1.0,
+                SPATIAL_STRIDE as i32,
+                CANVAS_SHORT_EDGE as i32,
+                i64::from(crate::pipeline::CANVAS_MAX_PIXELS),
+            )
+            .unwrap();
+            widest = widest.max(w as u32).max(h as u32);
+        }
+        assert_eq!(
+            descriptor().capabilities.max_size,
+            widest,
+            "max_size must be the widest edge `resolve_canvas_size` can emit across 1:4..=4:1"
+        );
+        assert_eq!(descriptor().capabilities.max_size, MAX_CANVAS_EDGE);
+
+        // The advertised menu must fit under it — this is the defect the story was filed for.
+        let advertised = ADVERTISED_BUCKETS
+            .iter()
+            .flat_map(|&(w, h)| [w, h])
+            .max()
+            .unwrap();
+        assert!(
+            advertised <= descriptor().capabilities.max_size,
+            "SceneWorks advertises a {advertised} px edge; the engine ceiling is {}",
+            descriptor().capabilities.max_size
+        );
+    }
+
+    /// **Every advertised bucket validates** — the user-visible half of sc-17152.
+    #[test]
+    fn every_advertised_resolution_bucket_validates() {
+        let model = validator();
+        for (w, h) in ADVERTISED_BUCKETS {
+            // The manifest list must itself be inside the checkpoint's envelope, or the engine is
+            // right to refuse and the manifest is the thing that is wrong.
+            assert!(
+                u64::from(w) * u64::from(h) <= u64::from(crate::pipeline::CANVAS_MAX_PIXELS),
+                "{w}x{h} is over the area budget"
+            );
+            model
+                .validate(&request(w, h))
+                .unwrap_or_else(|e| panic!("{w}x{h} is advertised but refused: {e}"));
+        }
+    }
+
+    /// **Raising the per-edge ceiling did not widen the area envelope** (sc-17152).
+    ///
+    /// Both shapes here are *inside* `max_size` on both edges and 32-aligned, so the per-edge gate
+    /// and the stride gate are both satisfied and only the area gate can refuse them — asserted
+    /// explicitly, because a refusal that came from the edge gate would make this test pass while
+    /// proving the opposite of what it claims. The error is named rather than checked with
+    /// `is_err`.
+    ///
+    /// This also pins that the area gate runs from **`validate`** on this lane. Before sc-17152 it
+    /// did not: `validate` ran only the shared capability floor, and `resolve_geometry` was reached
+    /// only once `generate` resolved geometry. That was invisible while `max_size` was 1344,
+    /// because no square inside a 1344 ceiling can exceed the area budget.
+    #[test]
+    fn an_over_area_canvas_is_still_refused_by_the_area_gate() {
+        let model = validator();
+        let caps = &model.descriptor().capabilities;
+        for (w, h) in [(1536u32, 1536u32), (1344u32, 1344u32)] {
+            assert!(
+                w <= caps.max_size && h <= caps.max_size,
+                "{w}x{h} must be INSIDE the per-edge ceiling or this proves nothing"
+            );
+            assert!(w.is_multiple_of(SPATIAL_STRIDE) && h.is_multiple_of(SPATIAL_STRIDE));
+            assert!(u64::from(w) * u64::from(h) > u64::from(crate::pipeline::CANVAS_MAX_PIXELS));
+
+            let e = model.validate(&request(w, h)).unwrap_err().to_string();
+            assert!(e.contains("canvas budget"), "{w}x{h}: {e}");
+            assert!(
+                !e.contains("outside supported range"),
+                "{w}x{h} must be refused by the AREA gate, not the per-edge gate: {e}"
+            );
+        }
+
+        // The one shape the raised ceiling newly admits: the 4:1 canvas the resolver itself emits.
+        // The short edge is derived — the ceiling divides the area budget exactly, which is what
+        // makes `MAX_CANVAS_EDGE x short` sit at the budget rather than over it.
+        let short = crate::pipeline::CANVAS_MAX_PIXELS / MAX_CANVAS_EDGE;
+        assert_eq!(short * MAX_CANVAS_EDGE, crate::pipeline::CANVAS_MAX_PIXELS);
+        assert!(short.is_multiple_of(SPATIAL_STRIDE));
+        for (w, h) in [(MAX_CANVAS_EDGE, short), (short, MAX_CANVAS_EDGE)] {
+            model
+                .validate(&request(w, h))
+                .unwrap_or_else(|e| panic!("{w}x{h} is the resolver's own 4:1 canvas: {e}"));
+        }
+
+        // …and one stride past it on the long edge is outside the per-edge ceiling again.
+        let e = model
+            .validate(&request(MAX_CANVAS_EDGE + SPATIAL_STRIDE, short))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("outside supported range"), "{e}");
     }
 
     /// This file's **production** source: the test module removed, then full-line comments stripped.
