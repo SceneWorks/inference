@@ -71,6 +71,11 @@ struct Stub {
     /// (`Capabilities::validate_request_skip_size`) instead of the full `validate_request` — the
     /// audio-lane / auto-size stance where `width`/`height` are not range-checked (sc-13705).
     skip_size: bool,
+    /// sc-19502: when set, the honest `validate` runs the floor against a Capabilities whose
+    /// `supported_steps` has been CLEARED — so the descriptor advertises a fixed schedule that
+    /// `validate` never enforces. That is precisely the `mlx-gen-ltx` defect this story fixed
+    /// (advertised != enforced), and `check_validate_honesty` must catch it.
+    unenforced_steps: bool,
     /// Per-instance call counter — the nondeterministic variant fills pixels from this.
     runs: Cell<u32>,
 }
@@ -146,6 +151,7 @@ impl Stub {
             desc: stub_desc(id),
             behavior,
             skip_size: false,
+            unenforced_steps: false,
             runs: Cell::new(0),
         }
     }
@@ -161,6 +167,7 @@ impl Stub {
             desc: guided_stub_desc(id),
             behavior,
             skip_size: false,
+            unenforced_steps: false,
             runs: Cell::new(0),
         }
     }
@@ -173,12 +180,28 @@ impl Stub {
             desc: audio_stub_desc(id),
             behavior,
             skip_size: true,
+            unenforced_steps: false,
             runs: Cell::new(0),
         }
     }
 
     fn boxed_audio(id: &'static str, behavior: Behavior) -> Box<dyn Generator> {
         Box::new(Self::audio(id, behavior))
+    }
+
+    /// sc-19502: a stub advertising a fixed 8-step schedule. `enforced = false` is the
+    /// `mlx-gen-ltx` defect shape — the descriptor claims the constraint, `validate` never applies
+    /// it, and the engine silently renders its baked schedule for whatever count arrives.
+    fn fixed_schedule(id: &'static str, enforced: bool) -> Self {
+        let mut desc = stub_desc(id);
+        desc.capabilities.supported_steps = vec![8];
+        Self {
+            desc,
+            behavior: Behavior::good(),
+            skip_size: false,
+            unenforced_steps: !enforced,
+            runs: Cell::new(0),
+        }
     }
 
     /// An **image** stub that (wrongly) validates through the size-skipping floor while still
@@ -190,6 +213,7 @@ impl Stub {
             desc: stub_desc(id),
             behavior,
             skip_size: true,
+            unenforced_steps: false,
             runs: Cell::new(0),
         }
     }
@@ -205,6 +229,12 @@ impl Generator for Stub {
             return Ok(());
         }
         let caps = &self.desc.capabilities;
+        if self.unenforced_steps {
+            // Advertises the schedule, enforces everything BUT it (sc-19502).
+            let mut lax = caps.clone();
+            lax.supported_steps.clear();
+            return lax.validate_request(self.desc.id, req);
+        }
         if self.skip_size {
             // The audio-lane / auto-size floor: every shared check except the width/height range.
             caps.validate_request_skip_size(self.desc.id, req)
@@ -385,6 +415,50 @@ fn image_provider_oversize_probe_still_fires_after_audio_exemption() {
     let g = Stub::image_skipping_size(STUB_ID, Behavior::good());
     let err = check_validate_honesty(&g, &cheap()).unwrap_err();
     assert!(err.contains("above max_size"), "got: {err}");
+}
+
+/// sc-19502 — a descriptor that ADVERTISES a fixed step schedule but whose `validate` never
+/// enforces it must fail the honesty check.
+///
+/// This is the `mlx-gen-ltx` defect in miniature and the reason the sweep needs its negative half:
+/// a lane that ignores `req.steps` entirely satisfies the positive half trivially (every advertised
+/// count "validates", because everything validates). Only probing an OFF-menu count catches it.
+#[test]
+fn advertising_a_fixed_schedule_without_enforcing_it_fails_validate_honesty() {
+    // The profile's steps must sit ON the advertised menu, or the harness's first positive check
+    // would fail for an honest provider too — the LTX conformance profile already pins 8.
+    let profile = Profile {
+        steps: 8,
+        ..cheap()
+    };
+
+    let dishonest = Stub::fixed_schedule(STUB_ID, false);
+    let err = check_validate_honesty(&dishonest, &profile)
+        .expect_err("advertising a schedule it does not enforce must be caught");
+    assert!(
+        err.contains("advertised set") && err.contains("silently ignores"),
+        "the failure must name the defect: {err}"
+    );
+
+    // …and the honest twin passes, so the check is not simply rejecting every declaring provider.
+    check_validate_honesty(&Stub::fixed_schedule(STUB_ID, true), &profile)
+        .expect("a provider that enforces what it advertises is honest");
+}
+
+/// sc-19502 — `check_cancellation` must not hand a fixed-schedule provider the profile's headroom
+/// `cancel_steps`, which is off its menu and would surface a step-count REJECTION as a cancellation
+/// defect. It falls back to the largest advertised count instead.
+#[test]
+fn cancellation_uses_an_advertised_step_count_for_a_fixed_schedule_provider() {
+    let profile = Profile {
+        steps: 8,
+        // 6 is the default headroom and is deliberately OFF the advertised [8] menu.
+        cancel_steps: 6,
+        ..cheap()
+    };
+    let g = Stub::fixed_schedule(STUB_ID, true);
+    check_cancellation(&g, &profile)
+        .expect("cancellation must run at an advertised count, not the off-menu headroom");
 }
 
 #[test]

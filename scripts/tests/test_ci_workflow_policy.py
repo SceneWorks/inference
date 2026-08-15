@@ -2042,9 +2042,21 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                     "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs",
                     (
                         "declared_tensor_names_match_the_published_checkpoint",
+                        # Header-only and device-free like its neighbours; added by sc-19008 and
+                        # wired by sc-19414, which found it selected by no lane at all.
+                        "declared_encoder_shapes_match_the_published_checkpoint",
                         "declared_audio_tensor_names_match_the_published_checkpoint",
                         "published_audio_configs_reproduce_the_declared_geometry",
                         "stored_kaiser_filters_match_the_derivation_on_real_weights",
+                        # Decodes, landing on GPU 0 under `--features cuda`. Wired by sc-19414
+                        # against a MEASURED 97887 MiB card rather than against `CUDA_COMPUTE_CAP`,
+                        # which names an architecture and never a capacity. BOTH sides of that
+                        # comparison are measured: `vae/` and `audio_vae/` ship entirely F32, so the
+                        # f32 loads are no-op casts, and the decode halves are 9.03 GiB and
+                        # 0.242 GiB -- not the ~19.4 GB / ~1.2 GB the pre-sc-19414 comments claimed.
+                        "real_weight_decode_produces_a_plausible_video",
+                        "real_weight_multi_chunk_decode_blends_the_seam",
+                        "real_weight_audio_decode_produces_a_plausible_stereo_track",
                     ),
                 ),
                 (

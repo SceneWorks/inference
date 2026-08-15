@@ -116,6 +116,9 @@ pub fn descriptor() -> ModelDescriptor {
             min_size: RES_MIN,
             max_size: RES_MAX,
             max_count: MAX_COUNT,
+            // Not a distilled fixed-schedule model: any step count the shared sanity caps
+            // admit is renderable (sc-19502).
+            supported_steps: Vec::new(),
             mac_only: true,
             // SANA ships pre-quantized Q4/Q8 turnkey tiers (sc-8489, epic 8506): the Linear-DiT
             // transformer + the Gemma-2 CHI TE are packed and PACKED-DETECTED on load (the DC-AE VAE
@@ -187,6 +190,9 @@ pub fn sprint_descriptor() -> ModelDescriptor {
             min_size: RES_MIN,
             max_size: RES_MAX,
             max_count: MAX_COUNT,
+            // Not a distilled fixed-schedule model: any step count the shared sanity caps
+            // admit is renderable (sc-19502).
+            supported_steps: Vec::new(),
             mac_only: true,
             // Same Q4/Q8 packed turnkey tiers as base SANA (sc-8489): the Sprint Linear-DiT trunk +
             // Gemma-2 TE are packed/packed-detected, DC-AE VAE dense. Advertise Q4/Q8 for standard

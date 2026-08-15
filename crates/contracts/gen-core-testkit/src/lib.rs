@@ -254,6 +254,43 @@ pub fn check_validate_honesty(g: &dyn Generator, profile: &Profile) -> Result<()
         }
     }
 
+    // Positive + negative: the advertised exact-step surface must be honest (sc-19502). Every count
+    // in `supported_steps` must validate, and a count outside it must be refused — the pair is the
+    // point, because each half alone is satisfiable by a broken provider: a lane that ignores
+    // `req.steps` entirely (which `mlx-gen-ltx` did) passes the positive half trivially, and a lane
+    // that rejects everything passes the negative half trivially.
+    //
+    // Skipped entirely for the unconstrained majority (empty ⇒ no constraint), so this adds no
+    // requirement to a model that never opted in.
+    if !caps.supported_steps.is_empty() {
+        for &steps in &caps.supported_steps {
+            let mut r = base_request(profile);
+            r.steps = Some(steps);
+            if let Err(e) = g.validate(&r) {
+                return Err(format!(
+                    "validate-honesty[{id}]: advertised step count {steps} was rejected by validate(): {e}"
+                ));
+            }
+        }
+        // The smallest positive count the model does NOT advertise. Searching for a GAP rather than
+        // always probing `max + 1` keeps this meaningful for a model with a discontinuous set (a
+        // range check would admit the gap but still refuse `max + 1`). The bound is `max + 1`, which
+        // is never in the set, so the search always finds something.
+        let ceiling = caps.supported_steps.iter().copied().max().unwrap_or(0) + 1;
+        if let Some(off) = (1..=ceiling).find(|s| !caps.supported_steps.contains(s)) {
+            let mut r = base_request(profile);
+            r.steps = Some(off);
+            if g.validate(&r).is_ok() {
+                return Err(format!(
+                    "validate-honesty[{id}]: step count {off} is not in the advertised set {:?} but \
+                     was accepted by validate() — an advertised fixed schedule that admits other \
+                     counts silently ignores the caller's `steps`",
+                    caps.supported_steps
+                ));
+            }
+        }
+    }
+
     // Negative: a size above max_size must be rejected — but only for providers whose contract
     // includes a size axis. Audio-lane providers (Modality::Audio) legitimately do NOT range-check
     // width/height: those fields are meaningless for audio, so a conformant audio model validates
@@ -458,7 +495,16 @@ pub fn check_progress_contract_with(
 /// steps (≤ 2), and produces no partial output.
 pub fn check_cancellation(g: &dyn Generator, profile: &Profile) -> Result<(), String> {
     let mut req = base_request(profile);
-    req.steps = Some(profile.cancel_steps);
+    // `cancel_steps` is headroom, not a knob every model has (sc-19502). A model advertising a fixed
+    // schedule (`Capabilities::supported_steps`) refuses any other count, so handing it the profile's
+    // headroom value would fail `validate` and report a CANCELLATION defect for a step-count
+    // rejection. Fall back to the largest advertised count — it is the most headroom the model can
+    // legally be given, and for the distilled LTX schedule that is 8, well past the ≥ 3 this needs.
+    let caps = &g.descriptor().capabilities;
+    req.steps = Some(match caps.supported_steps.iter().max() {
+        Some(&native) if !caps.supported_steps.contains(&profile.cancel_steps) => native,
+        _ => profile.cancel_steps,
+    });
     check_cancellation_with(g, &req)
 }
 
