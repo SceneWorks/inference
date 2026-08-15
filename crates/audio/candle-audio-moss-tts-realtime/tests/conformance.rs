@@ -8,13 +8,18 @@
 //!   seeded sampler), and non-degenerate (not a single collapsed id). A broken backbone / weight
 //!   mapping / RoPE / multi-embedding sum / local-transformer head wiring would produce empty,
 //!   out-of-range, or all-identical frames and fail here.
-//! - [`moss_tts_realtime_is_incremental`] — the AR loop is genuinely incremental: the time to the
-//!   **first** RVQ frame is materially less than the time to the **full** budget.
+//! - [`moss_tts_realtime_is_incremental`] — the AR loop's progress reporting is one-per-frame:
+//!   `Progress::Step { current }` arrives once per returned frame, starting at 1 and advancing by
+//!   one. sc-19556 replaced the former "time to the first frame < time to the full budget" bound,
+//!   which was degenerate as well as clock-bound; see the note at the assertion. This does NOT
+//!   distinguish an incremental decode from a buffer-everything one.
 //! - [`moss_tts_realtime_streaming_gate`] — the sc-13334 streaming acceptance gate, now released by
 //!   the codec: `gen_core_testkit::check_audio_streaming` against the **real** registered provider
 //!   ((a) ≥ 2 PCM chunks before completion; (b) concat(chunks) == one-shot `generate()`
 //!   byte-identical; (c) valid 24 kHz mono track), plus (c) full audio non-silent / speech-shaped
-//!   and (d) first-chunk latency < full-generation latency, and it writes a playable demo WAV.
+//!   and (d) the chunk stream is a faithful partition of the returned track — non-empty first
+//!   chunk, strictly smaller than the track, and the chunks reassemble to it exactly. It also
+//!   writes a playable demo WAV. sc-19556 replaced the former first-chunk-latency bound here too.
 //! - [`moss_tts_realtime_asr_roundtrip_fidelity`] — the sc-13433 **text-fidelity** gate: a curated
 //!   fixed prompt set is synthesized at the shipped sampling default and transcribed back with
 //!   `whisper_base`; each transcript must match its prompt within a character-error-rate bound (and
@@ -233,8 +238,9 @@ fn moss_tts_realtime_is_incremental() {
 
 /// The streaming acceptance gate (sc-13334, released by the sc-13392 codec): the shared
 /// `check_audio_streaming` suite against the **real registered provider** (chunk-count, reassembly
-/// law, one-shot == stream), plus the DoD extras — first-chunk latency < full-generation latency,
-/// non-silent speech-shaped 24 kHz audio, and a playable demo WAV.
+/// law, one-shot == stream), plus the DoD extras — the chunk stream is a faithful partition of the
+/// returned track, non-silent speech-shaped 24 kHz audio, and a playable demo WAV. The first-chunk
+/// latency bound this used to carry was removed as degenerate in sc-19556; see the note inline.
 #[test]
 #[ignore = "real weights: needs the ~4.66 GB AR + ~7.1 GB codec snapshots; run with --ignored"]
 fn moss_tts_realtime_streaming_gate() {
@@ -264,7 +270,7 @@ fn moss_tts_realtime_streaming_gate() {
     gen_core_testkit::check_audio_streaming(generator.as_ref(), &profile)
         .expect("check_audio_streaming against the real MOSS-TTS-Realtime provider");
 
-    // (d) first-chunk latency < full-generation latency, measured directly.
+    // (d) the chunk stream is a faithful partition of the returned track, checked directly.
     let req = request(seconds);
     let mut chunks: Vec<AudioChunk> = Vec::new();
     let out = generator

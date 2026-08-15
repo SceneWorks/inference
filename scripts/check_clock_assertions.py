@@ -67,20 +67,51 @@ USAGE
     scripts/check_clock_assertions.py                 # whole repo, human-readable
     scripts/check_clock_assertions.py crates/llm      # a subtree
     scripts/check_clock_assertions.py --summary       # counts per file, no detail
+    scripts/check_clock_assertions.py --check-baseline   # CI ratchet, see BASELINE below
+    scripts/check_clock_assertions.py --write-baseline   # re-record it after a real reduction
 
-VALIDATION (sc-19556)
----------------------
-The tool was validated by running it against the tree BEFORE the sc-19556 edits and confirming
-that every site the story fixed by hand appears in its output, then re-running after. Reproduce
-with:
+MEASURED RECALL AND COUNTS (sc-19556) — read before quoting any number from this tool
+-------------------------------------------------------------------------------------
+Every figure below was produced by **this file as committed**, on 2026-08-15. An earlier,
+uncommitted iteration of the scanner (no `DURATION_SHAPED` accessor matching) reported different
+and much smaller totals; those older numbers are not reproducible here and must not be cited.
 
-    git stash                                          # or check out the pre-fix revision
-    scripts/check_clock_assertions.py --summary
-    git stash pop
-    scripts/check_clock_assertions.py --summary
+Reproduce the baseline side with the pre-#607 tree — `c3e9eef40^` is main immediately before
+PR #607 merged — exported somewhere outside the repo:
 
-Exit status is 0 when no assertion is flagged and 1 otherwise, so it can gate a lane — but note
-the limitations above before wiring it to one.
+    git archive 'c3e9eef40^' | tar -x -C /tmp/pre607
+    scripts/check_clock_assertions.py --summary /tmp/pre607
+    scripts/check_clock_assertions.py --summary .
+
+| tree | flagged assertions | files | .rs scanned |
+|---|---|---|---|
+| pre-#607 (`c3e9eef40^`) | **204** | 62 | 2360 |
+| sc-19488/sc-19556 head  | **207** | 55 | 2390 |
+
+**The raw total went UP, and that is expected.** The sc-19556 fixes replaced single-shot
+durations with `min`-over-N reductions, which introduce `fastest`/`TIMED_RUNS` bindings that
+`DURATION_SHAPED` matches. The total is a triage inbox size, NOT a defect count, and a change
+in it means nothing on its own. The per-site table in the story is the accounting.
+
+**Recall on the known-positive set: 12 of 13.** On the pre-#607 tree this file finds
+`mlx-gen-minimax-h3/tests/joint_denoise.rs` :775 / :780 / :812, `.../real_weights.rs` :906 /
+:999, `candle-gen/tests/cublaslt_nvfp4_gemm.rs` :228, and six of the seven
+`.../duration_sweep_real.rs` sites. The **miss** is `duration_sweep_real.rs:530` (head offsets)
+`second_half < first_half * 3.0`: both operands are sums over `p.step_times`, and neither
+`first_half`, `second_half` nor `step_times` matches a clock token or `DURATION_SHAPED`. That is
+the container limitation above, demonstrated rather than asserted — do not read a clean run as
+proof.
+
+BASELINE
+--------
+`--check-baseline` compares the per-file counts against `scripts/clock_assertions_baseline.txt`
+and fails **only when a file's count rises or a new flagged file appears**. It is a ratchet, not
+a zero-gate: the residual sites are real and tracked (`duration_sweep_real.rs` needs a ~50-minute
+`#[ignore]`d real-weight run to retune), and a gate demanding zero would simply be turned off.
+A count that FELL is reported and passes; re-record with `--write-baseline`.
+
+Exit status: 0 when nothing is flagged (or, under `--check-baseline`, when nothing regressed),
+1 otherwise.
 """
 
 from __future__ import annotations
@@ -309,10 +340,52 @@ def analyze_scope(src: str, base: int, body: str) -> list[tuple[int, str, str]]:
     return hits
 
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+BASELINE_PATH = REPO_ROOT / "scripts" / "clock_assertions_baseline.txt"
+
+
+def baseline_key(path: Path) -> str:
+    """Repo-relative POSIX path, so the ratchet holds however the scan root was spelled.
+
+    `--check-baseline .` and `--check-baseline /abs/path/to/repo` must produce the same keys;
+    without this every file reads as NEW and the ratchet reds on an unchanged tree. Found by
+    `scripts/tests/test_clock_assertions.py`, which runs the check with an absolute root.
+    """
+    resolved = path.resolve()
+    try:
+        return resolved.relative_to(REPO_ROOT).as_posix()
+    except ValueError:
+        return path.as_posix().removeprefix("./")
+
+
+def read_baseline() -> dict[str, int]:
+    """`path: count` lines, `#` comments. Missing file is an empty baseline (everything is new)."""
+    counts: dict[str, int] = {}
+    if not BASELINE_PATH.exists():
+        return counts
+    for raw in BASELINE_PATH.read_text(encoding="utf-8").splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        path, _, count = line.rpartition(":")
+        counts[path.strip()] = int(count.strip())
+    return counts
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("roots", nargs="*", default=["."], help="paths to scan (default: repo root)")
     ap.add_argument("--summary", action="store_true", help="counts per file only")
+    ap.add_argument(
+        "--check-baseline",
+        action="store_true",
+        help=f"ratchet against {BASELINE_PATH.name}: fail only if a count rose or a file is new",
+    )
+    ap.add_argument(
+        "--write-baseline",
+        action="store_true",
+        help="re-record the baseline from the current tree (run from the repo root)",
+    )
     args = ap.parse_args()
 
     files: list[Path] = []
@@ -325,21 +398,74 @@ def main() -> int:
 
     files = [f for f in files if "target" not in f.parts]
 
+    ratchet = args.check_baseline or args.write_baseline
+    quiet = args.summary or ratchet
+
     total = 0
     touched = 0
+    measured: dict[str, int] = {}
     for f in files:
         hits = analyze(f)
         if not hits:
             continue
         touched += 1
         total += len(hits)
-        if args.summary:
-            print(f"{f}: {len(hits)}")
+        measured[baseline_key(f)] = len(hits)
+        if quiet:
+            if args.summary:
+                print(f"{f}: {len(hits)}")
             continue
         print(f"\n{f}")
         for line_no, cond, why in hits:
             print(f"  {line_no}: {cond}")
             print(f"      ^ {why}")
+
+    if args.write_baseline:
+        body = "".join(f"{p}: {n}\n" for p, n in sorted(measured.items()))
+        BASELINE_PATH.write_text(
+            "# Per-file counts from scripts/check_clock_assertions.py (sc-19556).\n"
+            "# A RATCHET, not a zero-gate: --check-baseline fails only when a count RISES or a new\n"
+            "# flagged file appears. See that script's header for why zero is not the target and\n"
+            "# why the total is a triage inbox size rather than a defect count.\n"
+            f"# {total} assertion(s) across {touched} file(s); {len(files)} .rs file(s) scanned.\n"
+            + body,
+            encoding="utf-8",
+        )
+        print(f"wrote {BASELINE_PATH} ({total} across {touched} files)", file=sys.stderr)
+        return 0
+
+    if args.check_baseline:
+        expected = read_baseline()
+        regressions = [
+            (p, expected.get(p, 0), n) for p, n in sorted(measured.items()) if n > expected.get(p, 0)
+        ]
+        improvements = [
+            (p, expected[p], measured.get(p, 0))
+            for p in sorted(expected)
+            if measured.get(p, 0) < expected[p]
+        ]
+        for path, was, now in improvements:
+            print(f"IMPROVED {path}: {was} -> {now}", file=sys.stderr)
+        for path, was, now in regressions:
+            print(f"REGRESSED {path}: {was} -> {now}", file=sys.stderr)
+        if regressions:
+            print(
+                "\nA clock-dependent assertion was added or multiplied. Either give it a clock-free\n"
+                "reading, or reduce the duration with `min` over N identical runs and record why at\n"
+                "the site. Run `scripts/check_clock_assertions.py <file>` for the detail. If the new\n"
+                "assertion is genuinely the right instrument, re-record with --write-baseline and\n"
+                "say so in the PR.",
+                file=sys.stderr,
+            )
+            return 1
+        if improvements:
+            print(
+                "\nCounts fell and nothing regressed: passing. Re-record with --write-baseline to\n"
+                "tighten the ratchet.",
+                file=sys.stderr,
+            )
+        print(f"clock-assertion ratchet OK ({total} flagged, baseline held).", file=sys.stderr)
+        return 0
 
     print(
         f"\n{total} clock-dependent assertion(s) across {touched} file(s); "

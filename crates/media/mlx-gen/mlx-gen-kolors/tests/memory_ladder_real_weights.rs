@@ -149,7 +149,14 @@ fn request(memory: Option<GenerationMemory>, edge: u32, steps: u32) -> Generatio
 /// `wall` exists because rung 4's re-materialization latency is a real hazard — 70 blocks across 11
 /// re-opens, once per denoise step — and a peak-only row cannot answer it. It is a wall clock, so it
 /// is the softest number in this file: it moves with thermal state and with whatever else the
-/// machine is doing. It is therefore *reported* and bounded loosely, never asserted tightly.
+/// machine is doing.
+///
+/// It is nonetheless asserted at one site, and the shape of that assertion is what makes it safe:
+/// the cadence frontier's published `speedup > 1.5` bound is taken over the **fastest** of
+/// `TIMED_RUNS` runs per arm (`measure_fastest`). Contention can only make a run slower, so the
+/// minimum is a lower bound on the hardware rather than a sample of a noisy distribution. A
+/// single-shot `wall` could not carry that bound; a min-reduced one can. Every other use of `wall`
+/// in this file is *reported* only, never asserted.
 struct Row {
     peak_gib: f64,
     pixels: Vec<u8>,

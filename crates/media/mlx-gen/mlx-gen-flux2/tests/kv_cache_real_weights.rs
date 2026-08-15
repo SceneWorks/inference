@@ -151,7 +151,15 @@ fn time_generate(id: &str, size: u32, nref: usize) -> f64 {
     // TIMED, on BOTH arms of the ratio, and costs nothing extra — the output was already being
     // computed and thrown away with `let _ =`. Re-rendering the id in the test body to check the
     // same thing would instead have cost a third ~49 GB model load and covered only one arm.
-    let img = last.expect("TIMED_RUNS must be > 0");
+    // `last` is `None` for two distinct reasons and the panic must not misname which: the timed
+    // loop never ran (`TIMED_RUNS == 0`), or the final run returned `Images(vec![])`. The second is
+    // a real generator fault and the likelier one, so it is named first.
+    let img = last.unwrap_or_else(|| {
+        panic!(
+            "`{id}` produced no image on the timed run — `generate` returned an empty `Images(..)`, \
+             or TIMED_RUNS ({TIMED_RUNS}) is 0 and nothing was timed"
+        )
+    });
     let (mean, std) = coherence(&img);
     assert!(
         mean > 2.0 && mean < 253.0 && std > 5.0,

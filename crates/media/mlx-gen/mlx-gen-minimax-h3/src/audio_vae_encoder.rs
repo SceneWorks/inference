@@ -1317,15 +1317,17 @@ mod tests {
         // noise is `[1, 3, 1]`: delete the shape guard in `sample_with` and `mean + std * noise`
         // broadcasts 2 against 3, which mlx rejects on its own — so a bare `is_err()` is satisfied
         // by a downstream fault and stays green with the guard gone. Binding the assertion to the
-        // guard's own wording is what makes it discriminate.
+        // guard's own wording is what makes it discriminate — and the wording must be the FULL
+        // unique prefix, because `does not match the mean` alone is emitted by three separate
+        // guards (this one, `vae_encoder::DiagonalGaussian::sample_with`, and the candle twin).
         let wrong = mlx_rs::ops::zeros_dtype(&[1, 3, 1], Dtype::Float32).unwrap();
         let msg = p
             .sample_with(&wrong)
             .expect_err("noise of the wrong shape must be refused, not broadcast")
             .to_string();
         assert!(
-            msg.contains("does not match the mean"),
-            "the noise-shape guard must be what rejects this: {msg}"
+            msg.contains("minimax-h3 audio encoder: posterior noise"),
+            "the AUDIO encoder's own noise-shape guard must be what rejects this: {msg}"
         );
         assert!(
             AudioDiagonalGaussian::new(

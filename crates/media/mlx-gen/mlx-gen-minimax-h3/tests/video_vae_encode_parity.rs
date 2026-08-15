@@ -527,15 +527,18 @@ fn the_posterior_sample_depends_on_its_noise() {
 
     // A shape mismatch is rejected rather than broadcast. Asserted by message (sc-19488): with the
     // guard deleted, `[1, 1, 1, 1, 1]` would BROADCAST cleanly against the mean on some shapes and
-    // fail on others, so `is_err()` alone reports the guard's absence inconsistently.
+    // fail on others, so `is_err()` alone reports the guard's absence inconsistently. The asserted
+    // text is the FULL unique prefix: `does not match the mean` alone is emitted by three guards
+    // (this one, the audio encoder's, and the candle twin), so the short form would not identify
+    // which one fired.
     let wrong = mlx_rs::ops::zeros_dtype(&[1, 1, 1, 1, 1], Dtype::Float32).unwrap();
     let msg = posterior
         .sample_with(&wrong)
         .expect_err("noise of the wrong shape must be refused, not broadcast")
         .to_string();
     assert!(
-        msg.contains("does not match the mean"),
-        "the noise-shape guard must be what rejects this: {msg}"
+        msg.contains("minimax-h3 encoder: posterior noise"),
+        "the VIDEO encoder's own noise-shape guard must be what rejects this: {msg}"
     );
     let _ = DiagonalGaussian::from_parameters(&Array::from_slice(&[0.0f32, 0.0], &[1, 2, 1, 1, 1]))
         .unwrap();
