@@ -8,13 +8,18 @@
 //!   seeded sampler), and non-degenerate (not a single collapsed id). A broken backbone / weight
 //!   mapping / RoPE / multi-embedding sum / local-transformer head wiring would produce empty,
 //!   out-of-range, or all-identical frames and fail here.
-//! - [`moss_tts_realtime_is_incremental`] — the AR loop is genuinely incremental: the time to the
-//!   **first** RVQ frame is materially less than the time to the **full** budget.
+//! - [`moss_tts_realtime_is_incremental`] — the AR loop's progress reporting is one-per-frame:
+//!   `Progress::Step { current }` arrives once per returned frame, starting at 1 and advancing by
+//!   one. sc-19556 replaced the former "time to the first frame < time to the full budget" bound,
+//!   which was degenerate as well as clock-bound; see the note at the assertion. This does NOT
+//!   distinguish an incremental decode from a buffer-everything one.
 //! - [`moss_tts_realtime_streaming_gate`] — the sc-13334 streaming acceptance gate, now released by
 //!   the codec: `gen_core_testkit::check_audio_streaming` against the **real** registered provider
 //!   ((a) ≥ 2 PCM chunks before completion; (b) concat(chunks) == one-shot `generate()`
 //!   byte-identical; (c) valid 24 kHz mono track), plus (c) full audio non-silent / speech-shaped
-//!   and (d) first-chunk latency < full-generation latency, and it writes a playable demo WAV.
+//!   and (d) the chunk stream is a faithful partition of the returned track — non-empty first
+//!   chunk, strictly smaller than the track, and the chunks reassemble to it exactly. It also
+//!   writes a playable demo WAV. sc-19556 replaced the former first-chunk-latency bound here too.
 //! - [`moss_tts_realtime_asr_roundtrip_fidelity`] — the sc-13433 **text-fidelity** gate: a curated
 //!   fixed prompt set is synthesized at the shipped sampling default and transcribed back with
 //!   `whisper_base`; each transcript must match its prompt within a character-error-rate bound (and
@@ -42,7 +47,6 @@
 //! `WHISPER_SNAPSHOT` (the ~150 MB snapshot dir), also a passed-in path, never a hub fetch.
 
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
 
 use candle_audio_moss_tts_realtime as moss;
 use candle_audio_moss_tts_realtime::gen_core::{
@@ -177,39 +181,66 @@ fn moss_tts_realtime_is_incremental() {
         .expect("warm-up decode");
 
     use candle_audio_moss_tts_realtime::gen_core::Progress;
-    let mut first_frame_at: Option<std::time::Duration> = None;
-    let start = Instant::now();
+    // sc-19556: this used to compare `first_frame_at` against the total elapsed decode. That
+    // comparison was DEGENERATE as well as clock-bound: `total` is sampled after `rvq_frames`
+    // returns, and the callback necessarily fires before then, so `first < total` held for ANY
+    // implementation — including the "emit everything at the end" one the assertion named as the
+    // case it existed to catch.
+    //
+    // What replaces it is a PROGRESS-CADENCE check, read from the callback stream with no clock:
+    // `Step { current }` must arrive once per returned frame, starting at 1 and advancing by one.
+    // That catches a decode whose reporting has come loose from its production — a wrong count, a
+    // skipped or repeated index, an out-of-order stream, or no reporting at all.
+    //
+    // SCOPE, stated plainly because the assertion being replaced overclaimed at exactly this point:
+    // this does NOT catch the buffer-everything implementation. A decode that computed every frame
+    // first and then fired N callbacks 1..N satisfies the count, first-index and consecutiveness
+    // checks below. Separating that case from a real incremental decode needs evidence that the
+    // callback fires BEFORE the remaining frames exist, which is either a clock — just removed here
+    // for being degenerate — or a seam this generator does not expose. So the cadence claim is the
+    // one the stream can actually support, and it is the only one made.
+    let mut steps: Vec<u32> = Vec::new();
     let result = gen
         .rvq_frames(&request(1.6), &mut |p| {
-            if let Progress::Step { current: 1, .. } = p {
-                first_frame_at = Some(start.elapsed());
+            if let Progress::Step { current, .. } = p {
+                steps.push(current);
             }
         })
-        .expect("timed AR decode");
-    let total = start.elapsed();
-    let first = first_frame_at.expect("at least one frame was decoded");
+        .expect("AR decode");
     eprintln!(
-        "first frame at {:.3?}, full {} frames at {:.3?}",
-        first,
-        result.frames.len(),
-        total
+        "progress steps {:?} for {} frames",
+        steps,
+        result.frames.len()
     );
     assert!(
         result.frames.len() >= 2,
         "need ≥ 2 frames to demonstrate incrementality"
     );
-    // The first frame must arrive strictly (and materially) before the full budget — the streaming
-    // premise. A non-incremental "emit everything at the end" implementation would fail this.
+    // One report per frame, strictly increasing, starting at the first frame: the AR loop announced
+    // each frame as it produced it.
+    assert_eq!(
+        steps.len(),
+        result.frames.len(),
+        "the AR loop must report progress once per frame, got {} reports for {} frames",
+        steps.len(),
+        result.frames.len()
+    );
+    assert_eq!(
+        steps.first().copied(),
+        Some(1),
+        "the first progress report must be frame 1, got {steps:?}"
+    );
     assert!(
-        first < total,
-        "first-frame latency {first:.3?} was not less than the full-decode latency {total:.3?}"
+        steps.windows(2).all(|w| w[1] == w[0] + 1),
+        "progress must advance one frame at a time and in order, got {steps:?}"
     );
 }
 
 /// The streaming acceptance gate (sc-13334, released by the sc-13392 codec): the shared
 /// `check_audio_streaming` suite against the **real registered provider** (chunk-count, reassembly
-/// law, one-shot == stream), plus the DoD extras — first-chunk latency < full-generation latency,
-/// non-silent speech-shaped 24 kHz audio, and a playable demo WAV.
+/// law, one-shot == stream), plus the DoD extras — the chunk stream is a faithful partition of the
+/// returned track, non-silent speech-shaped 24 kHz audio, and a playable demo WAV. The first-chunk
+/// latency bound this used to carry was removed as degenerate in sc-19556; see the note inline.
 #[test]
 #[ignore = "real weights: needs the ~4.66 GB AR + ~7.1 GB codec snapshots; run with --ignored"]
 fn moss_tts_realtime_streaming_gate() {
@@ -239,41 +270,61 @@ fn moss_tts_realtime_streaming_gate() {
     gen_core_testkit::check_audio_streaming(generator.as_ref(), &profile)
         .expect("check_audio_streaming against the real MOSS-TTS-Realtime provider");
 
-    // (d) first-chunk latency < full-generation latency, measured directly.
+    // (d) the chunk stream is a faithful partition of the returned track, checked directly.
     let req = request(seconds);
-    let start = Instant::now();
-    let mut first_chunk_at: Option<Duration> = None;
     let mut chunks: Vec<AudioChunk> = Vec::new();
     let out = generator
-        .generate_streaming(
-            &req,
-            &mut |c| {
-                if first_chunk_at.is_none() {
-                    first_chunk_at = Some(start.elapsed());
-                }
-                chunks.push(c);
-            },
-            &mut |_| {},
-        )
+        .generate_streaming(&req, &mut |c| chunks.push(c), &mut |_| {})
         .expect("streaming generate");
-    let full = start.elapsed();
-    let first = first_chunk_at.expect("at least one chunk was emitted");
     let track = match out {
         GenerationOutput::Audio(t) => t,
         other => panic!("expected GenerationOutput::Audio, got {other:?}"),
     };
     eprintln!(
-        "streaming: {} chunks, first chunk at {first:.3?}, full generation {full:.3?}",
-        chunks.len()
+        "streaming: {} chunks, first chunk {} samples, full track {} samples",
+        chunks.len(),
+        chunks.first().map(|c| c.samples.len()).unwrap_or(0),
+        track.samples.len()
     );
     assert!(
         chunks.len() >= 2,
         "expected >= 2 stream chunks, got {}",
         chunks.len()
     );
+    // sc-19556: `first < full` (first-chunk latency vs full-generation latency) was replaced. Like
+    // its AR-stage twin above it was degenerate — `full` is sampled after `generate_streaming`
+    // returns, so any implementation that emits a chunk at all satisfies it, including the
+    // buffer-everything one it named.
+    //
+    // What replaces it is a CHUNKING-AND-REASSEMBLY check, with no clock: the first chunk carries
+    // audio, it is strictly smaller than the finished track, and the chunks sum to exactly the
+    // track that was returned. The reassembly law is genuinely new coverage — nothing here
+    // previously tied the emitted chunks to the returned track at all, so a stream that dropped,
+    // duplicated or rescaled samples relative to the track passed.
+    //
+    // SCOPE, stated plainly for the same reason as its AR-stage twin above: this does NOT catch the
+    // buffer-everything implementation either. One that generated the whole track and then sliced
+    // it into >= 2 chunks satisfies non-empty-first, first < track, and exact reassembly. What is
+    // gated is that the chunk stream is a faithful partition of the track, not that it was produced
+    // before the track existed — the latter needs a clock or a seam this generator does not expose.
+    let first_chunk = chunks.first().expect("at least one chunk was emitted");
     assert!(
-        first < full,
-        "first-chunk latency {first:.3?} was not less than full-generation latency {full:.3?}"
+        !first_chunk.samples.is_empty(),
+        "the first chunk must carry audio, not an empty priming chunk"
+    );
+    assert!(
+        first_chunk.samples.len() < track.samples.len(),
+        "the first chunk carries {} of the track's {} samples — a first chunk holding the whole \
+         track is a buffered generate wearing a streaming signature",
+        first_chunk.samples.len(),
+        track.samples.len()
+    );
+    // The reassembly law (`check_audio_streaming` gates it too) is what makes the size comparison
+    // above mean "a prefix" rather than "a differently-shaped buffer".
+    assert_eq!(
+        chunks.iter().map(|c| c.samples.len()).sum::<usize>(),
+        track.samples.len(),
+        "the chunks must reassemble to exactly the returned track"
     );
 
     // (c) valid 24 kHz mono track, finite, non-empty.
@@ -341,10 +392,11 @@ fn moss_tts_realtime_streaming_gate() {
     candle_audio::wav::write_wav_pcm16(&out_path, &track).expect("write demo WAV");
     println!(
         "moss_tts_realtime_streaming_gate: wrote {} ({secs:.2}s @ 24 kHz mono, {} chunks, peak \
-         {peak:.4}, interior RMS {rms:.4}, frame-RMS CV {cv:.3}, first-chunk {first:.3?} < full \
-         {full:.3?})",
+         {peak:.4}, interior RMS {rms:.4}, frame-RMS CV {cv:.3}, first chunk {} of {} samples)",
         out_path.display(),
         chunks.len(),
+        chunks.first().map(|c| c.samples.len()).unwrap_or(0),
+        track.samples.len(),
     );
 }
 

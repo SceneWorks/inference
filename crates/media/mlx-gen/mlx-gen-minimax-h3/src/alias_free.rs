@@ -643,7 +643,17 @@ mod tests {
         let x = spread(&[1, 4, 3]);
         let a = Array::from_slice(&[0.1f32, 0.2], &[2]);
         let b = Array::from_slice(&[0.1f32, 0.2], &[2]);
-        assert!(SnakeBeta::new(a, b, true).unwrap().forward(&x).is_err());
+        // Asserted by MESSAGE (sc-19488): delete the channel guard and `alpha.reshape(&[1, 1, 3])`
+        // wants 3 elements from a 2-element alpha, so it errors anyway.
+        let msg = SnakeBeta::new(a, b, true)
+            .unwrap()
+            .forward(&x)
+            .expect_err("2 channels of alpha cannot serve a 3-channel input")
+            .to_string();
+        assert!(
+            msg.contains("minimax-h3 snakebeta:") && msg.contains("channels of alpha"),
+            "the channel-count guard must be what rejects this, not the reshape below it: {msg}"
+        );
         let a = Array::from_slice(&[0.1f32, 0.2], &[2]);
         let b = Array::from_slice(&[0.1f32, 0.2, 0.3], &[3]);
         assert!(SnakeBeta::new(a, b, true).is_err());

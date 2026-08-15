@@ -1105,7 +1105,17 @@ mod tests {
                 );
             }
         }
-        assert!(patchify_video_latents(&latent, [1, 5, 5]).is_err());
+        // Asserted by MESSAGE (sc-19488): with the guard deleted the integer-truncating reshape
+        // no longer matches the element count and errors anyway. (The `unpatchify` probe below
+        // stays bare on purpose — there the element counts coincide, so removing its guard returns
+        // a wrong-but-Ok tensor and the probe genuinely discriminates.)
+        let msg = patchify_video_latents(&latent, [1, 5, 5])
+            .expect_err("this latent is not divisible by a [1, 5, 5] patch")
+            .to_string();
+        assert!(
+            msg.contains("minimax_h3 patchify:"),
+            "the divisibility guard must be what rejects this, not the reshape below it: {msg}"
+        );
         assert!(unpatchify_video_rows(&rows, c, t, h, w, [1, 1, 1]).is_err());
     }
 
@@ -1135,7 +1145,15 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("indistinguishable by shape"), "{e}");
-        assert!(unpack_audio_rows(&rows, latents + 1, channels, chan_dim).is_err());
+        // Asserted by MESSAGE (sc-19488): one latent too many makes the reshape below the guard
+        // ask for more elements than `rows` holds, so it errors with the guard deleted too.
+        let msg = unpack_audio_rows(&rows, latents + 1, channels, chan_dim)
+            .expect_err("one latent too many must be refused")
+            .to_string();
+        assert!(
+            msg.contains("minimax_h3 audio unpack: expected"),
+            "the row-count guard must be what rejects this, not the reshape below it: {msg}"
+        );
     }
 
     /// **The AV mux policy.** The delivered track is exactly `round(num_frames / fps · 32000)`
