@@ -1802,9 +1802,11 @@ unwired_reason = "sc-15528 landed the Bernini ladder mechanism; the real-weight 
 #
 # THE TWO HEAVY COMPONENTS ARE NOT IN THIS ROW, AND THAT IS STILL THE RIGHT SHAPE. Adding
 # `transformer/*` or `text_encoder/*` here would multiply the cost of the row EVERY H3 lane fetches
-# by six, for gates only some of them run. sc-19558 gives them their own keys instead —
-# `minimax-h3-dit` and `minimax-h3-text-encoder` below — the same per-key split `minimax-h3-mlx-*`
-# already uses over one repository, so a lane provisions exactly the components its selections read.
+# by six, for gates only some of them run. sc-19558 gives the DiT its own key instead —
+# `minimax-h3-dit` below — the same per-key split `minimax-h3-mlx-*` already uses over one
+# repository, so a lane provisions exactly the components its selections read. There is no
+# text-encoder key in THIS change; the block below `minimax-h3-dit` records why, and sc-19438
+# (inference #637) is the change that adds one, together with the variable that makes it reachable.
 [[models]]
 key = "minimax-h3"
 repository = "MiniMaxAI/MiniMax-H3"
