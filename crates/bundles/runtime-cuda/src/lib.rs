@@ -16,6 +16,11 @@ pub mod providers {
     pub use candle_gen_catalog::providers::*;
 }
 
+/// Descriptor-less provider memory routes that the CUDA bundle intentionally reconciles outside
+/// the ordinary generator registry.
+#[cfg(feature = "media")]
+pub use candle_gen_catalog::{BespokeMemoryRouteWaiver, BESPOKE_MEMORY_ROUTE_WAIVERS};
+
 /// The advanced quant tiers this CUDA runtime surfaces beyond affine `Q4`/`Q8` — the NVFP4 FP4
 /// tensor-core tier (epic 11037, sc-11042 Option A) on consumer Blackwell `sm_120`. Re-exported from
 /// the media catalog so a product/worker reads the served tier off the runtime bundle; empty when the
@@ -275,5 +280,16 @@ mod tests {
     fn cuda_bundle_surfaces_nvfp4_tier() {
         use super::gen_core::Quant;
         assert_eq!(super::nvfp4_quant_tiers(), &[Quant::Nvfp4]);
+    }
+
+    #[cfg(feature = "media")]
+    #[test]
+    fn cuda_bundle_reexports_the_exact_bespoke_memory_route_waiver() {
+        let [waiver]: &[super::BespokeMemoryRouteWaiver] = super::BESPOKE_MEMORY_ROUTE_WAIVERS
+        else {
+            panic!("CUDA bundle must expose exactly one bespoke memory-route waiver");
+        };
+        assert_eq!(waiver.provider_id, "pulid_flux");
+        assert_eq!(waiver.crate_name, "pulid");
     }
 }

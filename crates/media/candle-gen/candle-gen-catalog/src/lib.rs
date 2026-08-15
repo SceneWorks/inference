@@ -53,6 +53,33 @@ pub mod providers {
 /// registered generator. Note `pulid` is bespoke here, whereas MLX ships it as `pulid_flux`.
 pub const BESPOKE_UTILITY_CRATES: &[&str] = &["depth", "face", "instantid", "pid", "pulid", "sam3"];
 
+/// Machine-readable disposition for a provider-owned memory contract that intentionally cannot be
+/// represented by an ordinary [`candle_gen::gen_core::MemoryRegistration`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BespokeMemoryRouteWaiver {
+    pub provider_id: &'static str,
+    pub crate_name: &'static str,
+    pub owner: &'static str,
+    pub reason: &'static str,
+    pub contract_path: &'static str,
+    pub verification_path: &'static str,
+}
+
+/// Descriptor-less Candle memory routes excluded from ordinary registry reconciliation.
+///
+/// PuLID is worker-owned and constructs a path-shaped FLUX + identity-stack contract through
+/// `PulidFlux::load_with_memory_context`; inventing a generator registration would make the public
+/// provider topology false. Consumers must reconcile this explicit waiver instead.
+pub const BESPOKE_MEMORY_ROUTE_WAIVERS: &[BespokeMemoryRouteWaiver] =
+    &[BespokeMemoryRouteWaiver {
+        provider_id: candle_gen_pulid::memory_strategy::PROVIDER_ID,
+        crate_name: "pulid",
+        owner: "candle-gen-pulid",
+        reason: "worker-owned bespoke route with a path-shaped memory contract and no LoadSpec/Generator registration",
+        contract_path: "crates/media/candle-gen/candle-gen-pulid/src/memory_strategy.rs",
+        verification_path: "crates/media/candle-gen/candle-gen-pulid/src/pulid_flux.rs",
+    }];
+
 /// Add every provider shipped by the Candle media platform to an explicit registry builder.
 pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistryBuilder {
     let registry = candle_gen_anima::register_providers(registry);
@@ -3082,6 +3109,43 @@ mod preview_advertising {
         );
     }
 
+    #[test]
+    fn every_descriptorless_memory_route_has_one_machine_readable_waiver() {
+        let waivers = super::BESPOKE_MEMORY_ROUTE_WAIVERS;
+        assert_eq!(waivers.len(), 1);
+        let waiver = waivers[0];
+        assert_eq!(waiver.provider_id, "pulid_flux");
+        assert_eq!(waiver.crate_name, "pulid");
+        assert!(super::BESPOKE_UTILITY_CRATES.contains(&waiver.crate_name));
+        assert_eq!(waiver.owner, "candle-gen-pulid");
+        for field in [
+            waiver.reason,
+            waiver.contract_path,
+            waiver.verification_path,
+        ] {
+            assert!(!field.trim().is_empty());
+        }
+
+        let waived_crates = waivers
+            .iter()
+            .map(|waiver| format!("candle-gen-{}", waiver.crate_name))
+            .collect::<BTreeSet<_>>();
+        let descriptorless_memory_crates = BESPOKE_PROVIDER_CRATES
+            .iter()
+            .filter(|provider| scan(provider.dir).emits())
+            .map(|provider| provider.dir.to_owned())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(waived_crates, descriptorless_memory_crates);
+
+        let registry = super::memory_contract_surface_registry().unwrap();
+        assert!(registry
+            .generators()
+            .all(|registration| !matches!((registration.descriptor)().id, "pulid" | "pulid_flux")));
+        assert!(registry
+            .memory_strategy_registrations()
+            .all(|registration| registration.provider_id != waiver.provider_id));
+    }
+
     /// The carried-over no-go set stays outside advertising, by exact id, and stays out of the
     /// allowlist. The reason is a settled finding (see [`NoGo`]), not an open question — candle must
     /// not re-run those fits.
@@ -3822,9 +3886,9 @@ mod tests {
         let registry = super::provider_registry().unwrap();
         let contract_registry = super::memory_contract_surface_registry().unwrap();
         gen_core_testkit::memory_contract_surface_registry_conformance(&contract_registry);
-        assert_eq!(contract_registry.memory_strategy_registrations().len(), 20);
+        assert_eq!(contract_registry.memory_strategy_registrations().len(), 23);
         let surfaces = contract_registry.memory_contract_surfaces().unwrap();
-        assert_eq!(surfaces.len(), 18 * 12 + 2 * 16);
+        assert_eq!(surfaces.len(), 21 * 12 + 2 * 16);
         assert_eq!(
             surfaces
                 .iter()
@@ -3838,6 +3902,64 @@ mod tests {
             "/nonexistent".into(),
         ));
         gen_core_testkit::memory_strategy_registry_conformance(&registry, &spec);
+    }
+
+    #[test]
+    fn krea_raw_and_edit_publish_exact_request_scoped_candle_surfaces() {
+        use candle_gen::gen_core::{
+            MemoryContractSurfaceTier, MemoryStrategy, MemoryStrategySupport,
+        };
+
+        let registry = super::memory_contract_surface_registry().unwrap();
+        let surfaces = registry.memory_contract_surfaces().unwrap();
+        for provider_id in ["krea_2_raw", "krea_2_edit", "krea_2_turbo_edit"] {
+            let provider_surfaces: Vec<_> = surfaces
+                .iter()
+                .filter(|surface| surface.contract.provider_id == provider_id)
+                .collect();
+            assert_eq!(provider_surfaces.len(), 12, "{provider_id}");
+            let tiers = provider_surfaces
+                .iter()
+                .map(|surface| surface.resolved_artifact_tier())
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(
+                tiers,
+                [
+                    MemoryContractSurfaceTier::Bf16,
+                    MemoryContractSurfaceTier::Q4,
+                    MemoryContractSurfaceTier::Q8,
+                ]
+                .into_iter()
+                .collect(),
+                "{provider_id}"
+            );
+            for surface in provider_surfaces {
+                assert!(!surface.composed, "{provider_id}");
+                assert_eq!(
+                    surface.contract.asset_facts,
+                    candle_gen::gen_core::MemoryAssetFacts::default(),
+                    "{provider_id}"
+                );
+                assert_eq!(
+                    surface.contract.calibration.as_ref().unwrap().fingerprint,
+                    "krea-candle-request-scoped-staged-residency-v1",
+                    "{provider_id}"
+                );
+                for strategy in MemoryStrategy::ALL {
+                    let expected = matches!(
+                        strategy,
+                        MemoryStrategy::Resident | MemoryStrategy::StagedResidency
+                    );
+                    assert_eq!(
+                        surface.contract.capability(strategy).unwrap().support
+                            == MemoryStrategySupport::Implemented,
+                        expected,
+                        "{provider_id}:{}:{strategy:?}",
+                        surface.selector.id()
+                    );
+                }
+            }
+        }
     }
 
     #[test]
