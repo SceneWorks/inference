@@ -1159,9 +1159,14 @@ mod tests {
             ..base.clone()
         };
         let err = validate_request(&caps, &over).unwrap_err().to_string();
+        // Asserted by the SHARED guard's own unique wording, not by `1..=1100`: BOTH messages
+        // contain that substring (`kolors: steps must be in 1..=1100 (got 1101)` is the provider's),
+        // so the short form would not say which one fired — and which one fires is the whole claim.
         assert!(
-            err.contains(&format!("1..={NUM_TRAIN_TIMESTEPS}")),
-            "over-max got: {err}"
+            err.contains(&format!(
+                "is outside this model's supported range 1..={NUM_TRAIN_TIMESTEPS}"
+            )),
+            "over-max must be refused by the SHARED range guard, got: {err}"
         );
         for ok in [None, Some(1), Some(50), Some(NUM_TRAIN_TIMESTEPS as u32)] {
             let req = GenerationRequest {
@@ -1170,6 +1175,44 @@ mod tests {
             };
             assert!(validate_request(&caps, &req).is_ok(), "steps={ok:?}");
         }
+    }
+
+    /// Kolors' own F-124 over-max branch is **shadowed, not dead** — and this proves it still works.
+    ///
+    /// `validate_rejects_bad_steps` above shows the shared range guard now fires first for a real
+    /// `descriptor()`, which leaves the provider's `steps must be in 1..=N` branch unreachable from
+    /// that path and its wording asserted nowhere. Deleting it would be wrong: it is the backstop
+    /// for a descriptor whose advertised range regressed to `Unconstrained`, which is a one-line
+    /// edit away. `validate_request` takes `caps` by argument, so that exact regression is
+    /// constructible — and under it the request must STILL be refused, by Kolors' own message.
+    #[test]
+    fn the_provider_over_max_branch_still_refuses_when_the_advertised_range_regresses() {
+        let unadvertised = Capabilities {
+            supported_steps: StepSupport::Unconstrained,
+            ..descriptor().capabilities
+        };
+        let over = GenerationRequest {
+            prompt: "a fox".into(),
+            width: 1024,
+            height: 1024,
+            steps: Some(NUM_TRAIN_TIMESTEPS as u32 + 1),
+            ..Default::default()
+        };
+        let err = validate_request(&unadvertised, &over)
+            .expect_err("an over-max step count must be refused even with no advertised range")
+            .to_string();
+        assert!(
+            err.contains(&format!(
+                "kolors: steps must be in 1..={NUM_TRAIN_TIMESTEPS}"
+            )),
+            "the PROVIDER's F-124 branch must be what refuses this: {err}"
+        );
+        // And it must not over-reach: the same unadvertised caps still admit the boundary count.
+        let at_max = GenerationRequest {
+            steps: Some(NUM_TRAIN_TIMESTEPS as u32),
+            ..over.clone()
+        };
+        assert!(validate_request(&unadvertised, &at_max).is_ok());
     }
 
     #[test]

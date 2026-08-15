@@ -212,9 +212,18 @@ fn literal_sites(src: &str) -> Vec<Site> {
     sites
 }
 
-/// Whether a literal body carries a top-level `..base` tail. Nested literals inside a field value
-/// (a `GenerationRequest { ..base_req() }` in a test fixture) must not count, so only depth 0 is
-/// inspected.
+/// Whether a literal body carries a top-level `..base` tail.
+///
+/// Two things are checked, and both are load-bearing:
+///
+/// * **Depth 0.** A nested literal inside a field value (a `GenerationRequest { ..base_req() }` in
+///   a test fixture) must not satisfy the outer literal.
+/// * **Element position.** The `..` must begin a top-level element — the byte before it, skipping
+///   whitespace, is the start of the body or a `,`. Without this, ANY depth-0 `..` counts, so an
+///   exhaustive literal whose last field happens to be range-valued (`steps: 1..=50`, or a future
+///   `size_range: 256..2048`) would be waved through as additive. There is no such field today, so
+///   the hole is latent rather than live — which is exactly when it is cheap to close, and the
+///   guard's whole job is to stay correct as fields are ADDED.
 fn has_base_expression(inner: &str) -> bool {
     let b = inner.as_bytes();
     let mut depth = 0i32;
@@ -223,7 +232,16 @@ fn has_base_expression(inner: &str) -> bool {
         match b[i] {
             b'(' | b'[' | b'{' => depth += 1,
             b')' | b']' | b'}' => depth -= 1,
-            b'.' if depth == 0 && i + 1 < b.len() && b[i + 1] == b'.' => return true,
+            b'.' if depth == 0 && i + 1 < b.len() && b[i + 1] == b'.' => {
+                let starts_element = b[..i]
+                    .iter()
+                    .rposition(|c| !c.is_ascii_whitespace())
+                    .is_none_or(|p| b[p] == b',');
+                if starts_element {
+                    return true;
+                }
+                i += 1; // a range operator; skip its second dot so `..=` is not re-examined
+            }
             _ => {}
         }
         i += 1;
@@ -355,6 +373,23 @@ fn a_nested_base_expression_does_not_satisfy_the_outer_literal() {
         !sites[0].additive,
         "a `..` nested inside a field value is not the literal's own base expression"
     );
+}
+
+#[test]
+fn a_range_valued_last_field_does_not_pass_as_a_base_expression() {
+    // The other half of the same trap, and the one that survives to depth 0: an EXHAUSTIVE literal
+    // whose last field is range-valued. `..` alone is not the discriminator — where it sits is. No
+    // `Capabilities` field is range-valued today, so this is a latent hole rather than a live one;
+    // it is closed here because the guard exists precisely to survive new fields being added.
+    for tail in ["steps: 1..=50", "sizes: 256..2048", "steps: (1..=50).len()"] {
+        let src = format!("let c = Capabilities {{\n    max_count: 1,\n    {tail},\n}};\n");
+        let sites = literal_sites(&src);
+        assert_eq!(sites.len(), 1, "one literal for {tail}, got {sites:?}");
+        assert!(
+            !sites[0].additive,
+            "`{tail}` is a range, not a base expression — this literal is exhaustive"
+        );
+    }
 }
 
 #[test]

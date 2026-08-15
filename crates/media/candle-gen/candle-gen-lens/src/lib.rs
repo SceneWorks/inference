@@ -1548,7 +1548,8 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
         capabilities: Capabilities {
             supports_negative_prompt: true,
             supports_guidance: true,
-            // pure T2I — no img2img / control / IP in the Lens port
+            // `conditioning` is deferred to its empty default: pure T2I — no img2img / control /
+            // IP in the Lens port.
             supports_lora: true,
             supports_lokr: true,
             // Unified curated sampler/scheduler menu (epic 7114 P4, sc-7123) + the legacy aliases

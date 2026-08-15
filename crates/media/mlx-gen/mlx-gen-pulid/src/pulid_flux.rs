@@ -61,14 +61,10 @@ pub fn descriptor() -> ModelDescriptor {
             // pos/neg identity branches) and `req.negative_prompt` (the negative branch text). The
             // descriptor must advertise what `generate` actually honors, else the shared floor (which
             // `validate` now delegates to, F-026) would reject the very request that drives the feature.
-            supports_negative_prompt: true,
-            // honored in the real-CFG branch (sc-3075)
-            supports_guidance: true,
-            // FLUX.1-dev guidance-distilled CFG (default ~4.0)
-            supports_true_cfg: true,
-            // >1 enables real-CFG pos/neg identity branches (sc-3075)
-            conditioning: vec![ConditioningKind::Reference],
-            // the reference face
+            supports_negative_prompt: true, // honored in the real-CFG branch (sc-3075)
+            supports_guidance: true,        // FLUX.1-dev guidance-distilled CFG (default ~4.0)
+            supports_true_cfg: true, // >1 enables real-CFG pos/neg identity branches (sc-3075)
+            conditioning: vec![ConditioningKind::Reference], // the reference face
             supports_lora: false,
             // Epic 7114 (sc-7297): PuLID delegates its denoise to the FLUX.1-dev backbone
             // (`generate_with_injector_cfg` → `run_denoise` → `run_flow_sampler`), which already
@@ -94,8 +90,7 @@ pub fn descriptor() -> ModelDescriptor {
             max_size: 2048,
             max_count: 8,
             mac_only: true,
-            requires_sigma_shift: true,
-            // dev
+            requires_sigma_shift: true, // dev
             supports_sequential_offload: true,
             supports_preview: true,
             supported_quants: &[Quant::Q4, Quant::Q8],

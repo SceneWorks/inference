@@ -54,9 +54,9 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
         backend: "mlx",
         modality: Modality::Both, // image (Reference) + video (VideoClip) upscaling
         capabilities: Capabilities {
-            // precomputed neg-embed; no prompt surface
-            supports_guidance: false,
-            // one-step, guidance fixed at 1.0
+            // `supports_negative_prompt` is deferred to its `false` default rather than declared:
+            // SeedVR2 carries a precomputed negative embedding and exposes no prompt surface.
+            supports_guidance: false, // one-step, guidance fixed at 1.0
             supports_true_cfg: false,
             // the LR input image (image upscale) or LR frame sequence (video upscale)
             conditioning: vec![ConditioningKind::Reference, ConditioningKind::VideoClip],
@@ -66,8 +66,7 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             max_size: 4096,
             max_count: 8,
             mac_only: true,
-            supported_quants: &[Quant::Q4, Quant::Q8],
-            // Linear-only DiT quant (sc-5198)
+            supported_quants: &[Quant::Q4, Quant::Q8], // Linear-only DiT quant (sc-5198)
             component_precision_floors: &[],
             // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
             supports_sequential_offload: false,

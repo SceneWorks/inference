@@ -126,7 +126,8 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             // The norm-rescaled CFG path is always present; turbo simply defaults guidance to 1.0.
             supports_negative_prompt: true,
             supports_guidance: true,
-            // pure T2I — no img2img / control / IP in the Lens port
+            // `conditioning` is deferred to its empty default: pure T2I — no img2img / control /
+            // IP in the Lens port.
             // sc-3174: LoRA + LoKr merge into the DiT's joint-attention projections at load.
             supports_lora: true,
             supports_lokr: true,
