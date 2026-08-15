@@ -10,11 +10,14 @@
 //!    can run its resident path and can never claim a verified optimized fit — which is exactly
 //!    the truth here, and is enforced: `standard_memory_strategy_safety_check` refuses any
 //!    optimized selection when the identity is absent.
-//! 2. **No staged residency.** MLX declares [`MemoryStrategy::StagedResidency`] `Implemented`
-//!    because `MiniMaxH3::generate_impl` releases each heavy component before mapping the next.
-//!    This crate has **no pipeline at all** — it ships the DiT, the joint denoise, the two VAE
-//!    decoders and the video VAE encoder, and no text encoder and no generator (sc-17156 owns the
-//!    end-to-end path). There is nothing to stage, so rung 1 is `Missing`.
+//! 2. **Staged residency is implemented but under-declared (sc-17156 / sc-18660).** MLX declares
+//!    [`MemoryStrategy::StagedResidency`] `Implemented`. This lane now *does the same thing* —
+//!    `MiniMaxH3::generate_impl` releases each heavy component before mapping the next, and the
+//!    provider **forces** `OffloadPolicy::Sequential` so a caller cannot opt out — but the rung
+//!    stays declared `Missing` until its executable behavior seam lands, and that seam is itself
+//!    gated on a `calibration` identity this backend does not have. An implemented optimized rung
+//!    without a seam fails catalog conformance, and under-declaring is the safe direction: the
+//!    staging still happens, and nothing is admitted on an unexercisable claim.
 //! 3. **No fused streaming SDPA.** The MLX verdict that attention scratch is already streamed —
 //!    peak tracking `4·B·H·S·D` with no materialized score tensor — is a property of *MLX's* fused
 //!    kernel and **must not be copied here**. Candle materializes scores, so bounding attention
@@ -32,8 +35,9 @@
 //!
 //! The ~53 GB memory floor measured for this family is the **conditioning** stage — the dense text
 //! encoder in isolation — not the DiT and not activation pressure. The DiT's own denoise-resident
-//! cost is a separate, genuinely tiered quantity. Those measurements were taken on MLX; this
-//! backend has none of its own yet (sc-17156), which is the other reason `calibration` is `None`.
+//! cost is a separate, genuinely tiered quantity. Those measurements were taken on MLX; sc-17156
+//! landed this backend's pipeline but no fitted curve of its own, which is the other reason
+//! `calibration` is `None`.
 
 use candle_gen::gen_core::{
     safetensors_path_bytes, LoadShape, LoadSpec, MemoryAssetFacts, MemoryBackendRealization,
@@ -115,11 +119,25 @@ impl ComponentBytes {
     }
 }
 
-/// The five capability entries. Only the resident baseline is implemented on this backend.
+/// The five capability entries. **Exactly one is `Implemented` — rung 0, `Resident`. Rungs 1-4 are
+/// all `Missing`**, which is what the `match` below returns and what the ladder reads.
+///
+/// Rung 1 is the one that needs stating carefully, because the pipeline and the declaration disagree
+/// **on purpose**. sc-17156 made the staging real — `MiniMaxH3::generate_impl` drops each heavy
+/// component and synchronizes the device before mapping the next, and `MiniMaxH3` forces
+/// [`OffloadPolicy::Sequential`](candle_gen::gen_core::OffloadPolicy) whatever the caller asks for,
+/// so a caller cannot opt out. The *declaration* deliberately did not follow: the rung stays
+/// `Missing` until its executable weights-free behavior seam lands, and that seam is gated on a
+/// `calibration` identity this crate does not have (sc-18660 pinned that chain in a test). The long
+/// note on the arm below gives the full reasoning, and the module header says the same thing.
+///
+/// So "implemented in the pipeline" and "declared `Implemented`" are two different facts here, and
+/// only the first is true. Reading this as rung 1 being available to the ladder would be wrong in
+/// the direction that matters: nothing is admitted on the strength of it.
 ///
 /// Every entry publishes an empty [`MemoryParameterRanges`], which is correct in both directions:
 /// rung 0 owns no numeric parameters, and a `Missing` rung must not publish a domain it cannot
-/// honor. Flipping any of rungs 2-4 to `Implemented` without filling its domain is a conformance
+/// honor. Flipping any of rungs 1-4 to `Implemented` without filling its domain is a conformance
 /// error, not a silent under-declaration.
 fn strategies() -> Vec<MemoryStrategyCapability> {
     MemoryStrategy::ALL
@@ -128,18 +146,33 @@ fn strategies() -> Vec<MemoryStrategyCapability> {
             strategy,
             support: match strategy {
                 MemoryStrategy::Resident => MemoryStrategySupport::Implemented,
-                // Rung 1: sc-17156 (there is no pipeline to stage).
+                // Rung 1 is **implemented in code** as of sc-17156 — `MiniMaxH3::generate_impl`
+                // stages all three phases and the offload policy is forced — but it stays declared
+                // `Missing` here, and that is a deliberate under-declaration, not an oversight.
                 //
-                // Rung 2 (sc-18660) is the interesting one, and it is **not** a porting gap: the
-                // mechanism is present — `MiniMaxH3VideoVae::decode_clip` tiles at the reference
-                // 256/64 through `crate::spatial_tiling::BoundedStitch`, the same seam the MLX
-                // sibling declares `Implemented` on. It stays `Missing` here because an optimized
-                // rung needs a weights-free `MemoryBehaviorRegistration`, that needs a
-                // `MemoryBehaviorFixture`, and that needs a `calibration` identity this crate does
-                // not have (see `contract.calibration`). The blocker is therefore the absent
-                // pipeline, one link behind the seam — a seam cannot be written before the
-                // identity exists. `an_optimized_rung_here_is_blocked_by_the_missing_calibration_\
-                // identity_not_the_seam` drives that chain and fails the moment it is removed.
+                // `check_memory_strategy_contract` requires every *implemented optimized* rung to
+                // carry an executable weights-free **behavior seam** (a `MemoryBehaviorRegistration`
+                // with per-route fixtures, the MLX sibling's `MEMORY_BEHAVIOR`). Declaring the rung
+                // without it fails catalog conformance — correctly: an optimized declaration with no
+                // seam is a capability claim nothing can execute against.
+                //
+                // Under-declaring is the safe direction. `Missing` means the ladder never *selects*
+                // staged residency for this provider, so the staging still happens (it is forced)
+                // and nothing is admitted on the strength of an unproven declaration. The reverse —
+                // declaring it and having the seam absent — would let admission believe a rung it
+                // cannot exercise.
+                //
+                // Rung 2 (sc-18660) is `Missing` for the very same reason, and it too is **not** a
+                // porting gap: the mechanism is present — `MiniMaxH3VideoVae::decode_clip` tiles at
+                // the reference 256/64 through `crate::spatial_tiling::BoundedStitch`, the same
+                // seam the MLX sibling declares `Implemented` on. What this backend lacks is one
+                // link further back than the seam: a weights-free `MemoryBehaviorRegistration`
+                // needs a `MemoryBehaviorFixture`, and that needs a `calibration` identity this
+                // crate does not have (see `contract.calibration`). So the blocker for **both**
+                // rungs is the absent calibration identity — not the seam, and not the mechanism.
+                // A seam cannot be written before the identity exists.
+                // `an_optimized_rung_here_is_blocked_by_the_missing_calibration_identity_not_the_\
+                // seam` drives that chain and fails the moment it is removed.
                 //
                 // Rungs 3/4: sc-18661 / sc-18662.
                 _ => MemoryStrategySupport::Missing,
@@ -172,10 +205,12 @@ fn build_contract(components: &ComponentBytes) -> MemoryProviderContract {
         additional_prerequisites: Vec::new(),
         default_engagement_exclusions: Vec::new(),
         resident_request_memory: ResidentRequestMemory::PreserveLoadDefaults,
-        // No phases and no hooks: nothing in this crate releases a component at a phase boundary,
-        // tiles a decode, chunks attention or windows the block stack. Declaring a hook here would
-        // be the false-declaration case `conformance_errors` cannot catch, because a hook flag is
-        // not checked against an implementation.
+        // Empty, and paired with the `Missing` rung-1 declaration above for the same reason: the
+        // phases ARE implemented (`generate_impl` releases each component and synchronizes the
+        // device via `crate::dit::release_device_memory`), but the rung they belong to cannot be
+        // declared until its behavior seam exists, and a lifecycle block attached to a `Missing`
+        // rung is a claim with no rung to hang on. The seam waits on a `calibration` identity, so
+        // the rung and this block flip together when one lands.
         lifecycle: MemoryLifecycleCapabilities::default(),
         // The floor arm, and only the floor arm.
         formula: MemoryFormulaKind::AssetBytesPlusHeadroom,
@@ -215,7 +250,8 @@ pub fn weights_free_contract(
 ///
 /// The shared check is sufficient here and a route gate would be a lie: with no optimized rung and
 /// no calibration identity, every admission this provider can accept is the resident baseline, and
-/// the geometry gates belong to the pipeline that sc-17156 has yet to write.
+/// the geometry gates belong to the pipeline sc-17156 landed (`crate::denoise::geometry`), not to
+/// this contract.
 pub fn safety_check(
     _spec: &LoadSpec,
     contract: &MemoryProviderContract,
@@ -226,17 +262,18 @@ pub fn safety_check(
 
 /// The memory-strategy registration for `minimax_h3` on candle.
 ///
-/// **Not yet reachable from `candle-gen-catalog`**, and that is deliberate rather than an
-/// oversight: `ProviderRegistryBuilder::build` rejects a memory-strategy registration whose
-/// `provider_id` has no matching generator, and this crate ships no generator (sc-17156). Wiring it
-/// through `register_composed_memory_strategy` would satisfy the builder by declaring a composition
-/// root that does not exist — the exact "provider contract with no executable owner" that seam
-/// exists to prevent. The constant is exercised by this module's conformance tests today and gets
-/// its catalog line the moment the generator lands.
+/// **Reachable from `candle-gen-catalog` as of sc-17156.** It was not before, and that was
+/// deliberate rather than an oversight: `ProviderRegistryBuilder::build` rejects a memory-strategy
+/// registration whose `provider_id` has no matching generator, and this crate shipped no generator.
+/// Wiring it through `register_composed_memory_strategy` would have satisfied the builder by
+/// declaring a composition root that did not exist — the exact "provider contract with no
+/// executable owner" that seam exists to prevent. The generator landed with sc-17156, so the
+/// catalog line landed with it.
 ///
-/// That last sentence is a guard, not a hope: it is registered by [`crate::register_providers`],
-/// and `tests::a_generator_landing_here_forces_the_catalog_line` builds *that* inventory, so a
-/// generator joining it flips the test to demanding the catalog line.
+/// That coupling was a guard rather than a hope, and it still holds in the other direction: this
+/// constant is registered by [`crate::register_providers`], and
+/// `tests::a_generator_landing_here_forces_the_catalog_line` builds *that* inventory, so a
+/// generator registered around it — leaving this registration behind — fails there.
 pub const MEMORY_REGISTRATION: candle_gen::gen_core::MemoryRegistration =
     candle_gen::gen_core::MemoryRegistration {
         provider_id: MODEL_ID,
@@ -469,15 +506,15 @@ mod tests {
     /// rather than a builder assembled inside the test, which could never contain a generator and
     /// so could never detect one arriving.
     ///
-    /// Today: that inventory has no generator, `build()` rejects the memory strategy for exactly
-    /// that reason, and the catalog therefore must **not** carry the line (it would break
-    /// `candle_gen_catalog::provider_registry()`). Both halves are asserted, so wiring the line
-    /// early fails here too.
+    /// sc-17156 added `.register_generator(…)` to `register_providers`, so `build()` now succeeds
+    /// and this test takes its `Ok` arm: it demands the catalog line, and that line exists. Before
+    /// then, `build()` rejected the memory strategy for want of a generator and the `Err` arm
+    /// asserted the catalog must **not** carry the line (it would break
+    /// `candle_gen_catalog::provider_registry()`), so wiring the line early failed here too.
     ///
-    /// The moment sc-17156 adds `.register_generator(…)` to `register_providers`, `build()`
-    /// succeeds, this test takes its other arm, and it fails until the catalog line exists. That is
-    /// the safety property the declaration's doc comment claims, actually guarded: the failure
-    /// message names the line to add.
+    /// Both arms stay live, which is the safety property the declaration's doc comment claims,
+    /// actually guarded: removing the catalog line while the generator is still registered fails
+    /// here, and the failure message names the line to add.
     ///
     /// The `Err` arm's needle is the catalog's declared *dependencies*, not its sources — see
     /// [`catalog_depends_on_this_crate`] for what that covers and the one route it does not.
@@ -533,9 +570,14 @@ mod tests {
 
     // --- AC2: nothing optimized is declared, and nothing optimized is reachable ------------------
 
-    /// Every optimized rung is `Missing`, and each is independently refused at selection. With no
-    /// calibration identity the shared safety check refuses them a second time, so the declaration
-    /// and the admission path agree.
+    /// **Rungs 1-4 are all declared `Missing`, and each is independently refused at selection.**
+    ///
+    /// Rung 1 is the interesting member: sc-17156 made the staging real in `generate_impl` and
+    /// forced the offload policy, but the declaration deliberately did not follow (see
+    /// `strategies`), so it is refused here exactly like 2-4. **Two** independent things would each
+    /// have to change before it became admittable — the declaration itself, and the `calibration`
+    /// identity that is `None` — and the assertions below check the declaration and the admission
+    /// decision separately so a change to either is visible rather than absorbed by the other.
     #[test]
     fn no_optimized_rung_is_declared_or_selectable() {
         let contract = declared();
@@ -544,6 +586,10 @@ mod tests {
             "candle has no fitted curve for this family"
         );
         for strategy in MemoryStrategy::ALL {
+            // Only rung 0 is declared `Implemented`; 1-4 are `Missing`. `is_optimized()` — which
+            // decides which arms below run — is `!matches!(self, Resident)`, so `StagedResidency`
+            // IS optimized and the refusal arms DO exercise rung 1. That is the point of the test,
+            // not an exception to it: the rung whose mechanism exists is refused all the same.
             let expected = if strategy == MemoryStrategy::Resident {
                 MemoryStrategySupport::Implemented
             } else {
@@ -897,16 +943,18 @@ mod tests {
     /// **That fix is not available on this tree, and the reason is one link further back than the
     /// seam.** The chain, each link driven below rather than described:
     ///
-    /// 1. this crate has no pipeline and no measurements, so `calibration` is `None`;
+    /// 1. this backend has no fitted curve of its own — sc-17156 landed the pipeline, not
+    ///    measurements — so `calibration` is `None`;
     /// 2. `standard_memory_behavior_context` **requires** a calibration identity, so no
     ///    `MemoryBehaviorFixture` can be constructed at all;
     /// 3. without a fixture there is no `MemoryBehaviorRegistration`;
     /// 4. `check_memory_strategy_contract` rejects a contract implementing any *optimized* rung
     ///    with no behavior seam.
     ///
-    /// So the blocker is the absent pipeline (sc-17156), not the seam — the seam cannot be written
-    /// before the identity exists. This test **fails the moment a calibration identity lands**,
-    /// which is exactly when the flip becomes possible, and it names the rungs waiting on it.
+    /// So the blocker is the absent calibration identity — not the seam, and not the mechanism. The
+    /// seam cannot be written before the identity exists. This test **fails the moment a
+    /// calibration identity lands**, which is exactly when the flip becomes possible, and it names
+    /// the rungs waiting on it.
     #[test]
     fn an_optimized_rung_here_is_blocked_by_the_missing_calibration_identity_not_the_seam() {
         let contract = declared();
@@ -966,7 +1014,11 @@ mod tests {
         // 1. No fitted curve: the floor arm only, and no calibration identity.
         assert_eq!(contract.formula, MemoryFormulaKind::AssetBytesPlusHeadroom);
         assert!(contract.calibration.is_none());
-        // 2. No staged residency: there is no pipeline to stage, so no phases and no hooks.
+        // 2. Staged residency is IMPLEMENTED IN CODE as of sc-17156 but still declared `Missing`,
+        //    because an implemented optimized rung needs a behavior seam this lane does not have
+        //    yet, and that seam waits on a `calibration` identity (see
+        //    `an_optimized_rung_here_is_blocked_by_the_missing_calibration_identity_not_the_seam`).
+        //    Under-declaring is the safe direction — see `strategies`.
         assert_eq!(contract.lifecycle, MemoryLifecycleCapabilities::default());
         assert!(contract.lifecycle.phases.is_empty());
         assert!(!contract.lifecycle.synchronized_phase_release);
@@ -998,7 +1050,12 @@ mod tests {
     }
 
     /// A phase hook declared without an implementation is the false declaration conformance cannot
-    /// catch. This pins the honest state: no phase is declared at all.
+    /// catch. This pins the honest state: no phase is declared, because the rung they belong to is
+    /// not declared either — the behavior seam that would carry both waits on a `calibration`
+    /// identity this backend does not have.
+    ///
+    /// The release primitive the phases WILL declare is exercised here anyway, so this test also
+    /// fails if it is removed while the declaration is pending.
     #[test]
     fn no_lifecycle_phase_is_declared_without_an_implementation() {
         let contract = declared();
@@ -1009,9 +1066,11 @@ mod tests {
         ] {
             assert!(
                 !contract.lifecycle.phases.contains(&phase),
-                "{phase:?} must not be declared until something releases it at a boundary"
+                "{phase:?} must not be declared while StagedResidency is Missing"
             );
         }
+        crate::dit::release_device_memory(&candle_gen::candle_core::Device::Cpu)
+            .expect("the phase-release primitive must exist and succeed");
         assert!(!contract.lifecycle.decode_tiling);
         assert!(!contract.lifecycle.attention_chunking);
         assert!(!contract.lifecycle.transformer_window_materialization);
