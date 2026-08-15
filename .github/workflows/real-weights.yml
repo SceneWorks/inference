@@ -4285,9 +4285,9 @@ jobs:
       # `vendor/candle-kernels/build.rs` appends sm_90, sm_120 and `compute_120` PTX above it
       # (sc-7544), so `libmoe.a` is a fatbin covering Ampere -> Blackwell from one binary. Setting
       # this to the runner's own 120 deletes the Ampere rung and lifts the dense PTX floor with it.
-      # NOTHING ENFORCES THIS. sc-19545 verified all 15 sites (13 here, 2 in `ci.yml`) by hand and
-      # a drift guard was deliberately scoped out, so the value is load-bearing but unguarded: an
-      # edit here surfaces as black renders on customer GPUs, never as a red build.
+      # `scripts/ci/cuda_arch_support.py` derives the value from build.rs and
+      # `test_every_cuda_job_declares_the_build_derived_compute_cap` holds all 15 sites (13 here,
+      # 2 in `ci.yml`) to it, so this is enforced rather than merely written down.
       CUDA_COMPUTE_CAP: "80"
       CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
@@ -5616,6 +5616,40 @@ jobs:
         with:
           toolchain: 1.96.0
           components: rustfmt, clippy
+      # sc-19545 -- the quantized-matmul canary, and it runs HERE for three reasons.
+      #
+      # REACH. `candle-gen/tests/cuda_quant_smoke.rs` is the guard against sc-7544's silent zeros:
+      # when `libmoe.a` holds no cubin for the runner's arch, every Q4/Q8 `QMatMul` returns zeros,
+      # nothing errors, and the job goes green. That canary had never executed in CI. The only
+      # AUTOMATED CUDA lane, `ci.yml`'s `windows-cuda-check`, compiles with `--no-run`, so it builds
+      # this binary and throws it away. The lane that would run it, `ci.yml`'s `windows-cuda`, is
+      # `workflow_dispatch`-only and was skipped in all 25 most recent ci.yml runs. The comments
+      # claiming it ran "in the CUDA gate" meant `scripts/check-cuda.ps1`, which NO workflow
+      # invokes.
+      #
+      # POSITION. Deliberately ABOVE the snapshot gate below. The smoke is weightless -- no
+      # checkpoint, no repository variable, seconds -- so here it is reachable on any dispatch of
+      # this profile, INCLUDING the dispatches that then stop at that gate for want of
+      # `CANDLE_MINIMAX_H3_SNAPSHOT` (which does not exist on this repository today). Below the gate
+      # it would inherit that unreachability and be a guard in name only.
+      #
+      # COST. Near zero on this lane specifically: this job already builds `candle-gen-minimax-h3`
+      # with `--features cuda`, so `candle-gen` and its `libmoe.a` are in the graph either way and
+      # only the test binary is extra.
+      #
+      # The two `findstr` lines are the skip-detector. BOTH tests no-op gracefully when
+      # `default_device` is not CUDA, so a green run that never touched a GPU is possible -- assert
+      # the device line rather than the exit code. The count assertion is there because a rename
+      # yields "0 passed; N filtered out" and still exits 0.
+      - name: Prove quantized CUDA matmuls are not silently returning zeros
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          set "log=%RUNNER_TEMP%\cuda-quant-smoke.log"
+          cargo test --locked -p candle-gen --features cuda --test cuda_quant_smoke -- --nocapture > "%log%" 2>&1 || (type "%log%" & exit /b 1)
+          type "%log%"
+          findstr /c:"[quant-smoke] device=Cuda" "%log%" >nul || (echo ::error::cuda_quant_smoke skipped instead of running on a CUDA device, and a skip here is indistinguishable from a pass. & exit /b 1)
+          findstr /c:"2 passed" "%log%" >nul || (echo ::error::expected exactly 2 passing tests from cuda_quant_smoke. & exit /b 1)
       - name: Require operator-provided MiniMax-H3 snapshot
         shell: cmd
         run: |
@@ -5766,9 +5800,9 @@ jobs:
       # Two independent reasons this probe could not have hit it regardless: the lane advertises
       # `supported_quants: &[]` and measures the DENSE bf16 checkpoint, so no quantized kernel is
       # reachable; and the probe's `DEGENERATE_STD_FLOOR` middle-frame check would fail an
-      # all-zeros render anyway. sc-19545 closed the diagnosis but deliberately added no CI guard,
-      # so the general case is still covered only by `candle-gen/tests/cuda_quant_smoke.rs` -- which
-      # no workflow currently executes. See that file's header.
+      # all-zeros render anyway. The general case is now covered too -- see the `Prove quantized
+      # CUDA matmuls are not silently returning zeros` step in this job, and
+      # `scripts/ci/cuda_arch_support.py`.
       - name: Require the FULL MiniMax-H3 snapshot before measuring
         if: inputs.minimax_h3_vram_probe
         shell: cmd

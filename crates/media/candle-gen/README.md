@@ -632,7 +632,8 @@ candle pin is upstream (not a fork), so candle-kernels is **locally forked** in 
 workspace `[patch]`. nvcc accumulates `-gencode` flags, so `libmoe.a` becomes a real fatbin embedding
 **sm_80 + sm_90 + sm_120 SASS + `compute_120` PTX** — one binary that runs natively Ampere → Ada →
 Hopper → Blackwell and JITs forward to newer archs. Keep `CUDA_COMPUTE_CAP=80` in the recipes (it
-seeds the sm_80 baseline for both paths). Verified on RTX PRO 6000 (sm_120): `cuobjdump --list-elf`
+seeds the sm_80 baseline for both paths — `scripts/ci/cuda_arch_support.py` derives that value
+from `build.rs` and holds every CI site to it). Verified on RTX PRO 6000 (sm_120): `cuobjdump --list-elf`
 shows sm_80/sm_90/sm_120 cubin per kernel, and `candle-gen`'s `cuda_quant_smoke` test has the Q4/Q8
 `QMatMul` matching the CPU reference (vs all-zeros before). **Re-vendor on every candle pin bump** —
 see `vendor/candle-kernels/VENDORED.md`.
@@ -643,9 +644,9 @@ Two corrections from sc-19545, both of which had made this paragraph read strong
   `scripts/check-cuda.ps1`, a LOCAL, manual script that no workflow invokes (`grep -rn check-cuda
   .github/` is empty). The only automated CUDA lane compiles with `--no-run` and discards the
   binary, and the lane that would execute it (`windows-cuda`) is `workflow_dispatch`-only and was
-  skipped in all 25 most recent ci.yml runs. **The canary against a silent-zeros regression has
-  never been fired by CI.** Wiring it into an executing lane was scoped out of sc-19545 and remains
-  open — until then, running `check-cuda.ps1` by hand is the only thing that exercises it.
+  skipped in all 25 most recent ci.yml runs. **The canary against a silent-zeros regression had
+  never been fired by CI.** sc-19545 wired it into the `candle-minimax-h3` real-weights job, which
+  asserts it reached a CUDA device rather than trusting the exit code.
 * **Cosine was the wrong comparison.** cos ≈ 1.0 is not evidence of correctness: cosine is
   scale-invariant, so a kernel returning `2 × reference`, or the right values under a wrong dequant
   scale, scores 1.0. The test now asserts on relative max-abs-diff plus an explicit all-zeros check
@@ -655,10 +656,11 @@ Two corrections from sc-19545, both of which had made this paragraph read strong
 The invariant is **not** that `CUDA_COMPUTE_CAP` matches the GPU — it deliberately does not, and
 "correcting" 80 to the runner's 120 deletes the ladder's bottom rung, breaking quantized models on
 every pre-Blackwell GPU and lifting the dense PTX floor to `compute_120`. What must hold is that the
-runner's arch is served by *some* rung. Note that **datacenter Blackwell sm_100 (B100/B200) is not
-covered** on the quant path — major 10 is served by neither the sm_9x/sm_12x cubins nor the
-`compute_120` PTX floor. `build.rs` says this is deliberate; it is recorded here because such a card
-joining the pool would render black rather than fail. None of this is enforced by any check.
+runner's arch is served by *some* rung — `the_fatbin_covers_this_runners_gpu` checks exactly that,
+reading the device's real compute capability against the `-gencode` ladder parsed out of `build.rs`.
+Note that **datacenter Blackwell sm_100 (B100/B200) is not covered** on the quant path — major 10 is
+served by neither the sm_9x/sm_12x cubins nor the `compute_120` PTX floor. `build.rs` says this is
+deliberate; the guard now says so loudly instead of rendering black.
 
 ### Build
 
