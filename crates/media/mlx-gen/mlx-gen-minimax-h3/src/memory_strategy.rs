@@ -59,7 +59,7 @@
 //! the canvas **changes** the decode. So the usual rung-2 move — shrink the tile until the request
 //! fits — would silently reintroduce that defect, and no memory assertion would catch it. The
 //! contract says so in the only way a consumer honors: `validate_selection` admits 256/64 and
-//! refuses every other value, and [`route_gate`] refuses it again at admission.
+//! refuses every other value, and `route_gate` refuses it again at admission.
 //!
 //! What rung 2 *does* bound here is the decoder scratch that is genuinely free: the number of
 //! decoded tiles held live during the stitch. [`crate::spatial_tiling::BoundedStitch`] streams the
@@ -450,7 +450,7 @@ fn routes() -> Vec<(MemoryMode, u32)> {
 
 /// Admit a bounded-decode geometry — **the** rung-2 predicate, and the only one.
 ///
-/// Both admission seams call this: [`route_gate`] (the `safety_check` half) and the request scope's
+/// Both admission seams call this: `route_gate` (the `safety_check` half) and the request scope's
 /// `decode_validator` (the `configure_decode` half). Sharing one predicate is not tidiness — it is
 /// what stops the pair drifting, which is the failure this family has already shipped twice, most
 /// recently when `encode_clip` hardcoded its tile constants while `decode_clip` read `self.tiling`
