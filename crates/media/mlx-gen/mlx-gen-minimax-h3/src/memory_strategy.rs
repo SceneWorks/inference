@@ -543,12 +543,18 @@ fn build_contract(components: &ComponentBytes) -> MemoryProviderContract {
     MemoryProviderContract {
         provider_id: MODEL_ID.to_owned(),
         backend: MemoryBackendRealization::MlxMetal {
-            // The AdaLN evict drains the allocator cache rather than migrating active → cache:
+            // This flag rests on the AdaLN evict and nothing else. That evict drains the allocator
+            // cache rather than migrating active → cache, because
             // `crate::dit::adaln::drain_allocator_cache` repeats `clear_cache()` while active is
-            // still falling. `model::release` and `mlx_gen::residency::clear_allocator_cache` call
-            // `clear_cache()` exactly once each, so this flag is NOT the claim it used to carry
-            // — that "the AdaLN evict AND EVERY PHASE RELEASE" drain — and the retracted half is
-            // deleted rather than restated. sc-17151 owns making the other two sites match.
+            // still falling — and it is the one site sc-18665's exclusion is declared against, so
+            // the declaration stands on a drain that is real where the bytes are claimed.
+            //
+            // It is deliberately NOT the claim it used to carry — that "the AdaLN evict AND EVERY
+            // PHASE RELEASE" drain — and the retracted half is deleted rather than restated. The
+            // phase releases are a separate question, owned by sc-17151. This comment therefore
+            // states no `clear_cache()` call count for them: such a count is a fact about another
+            // story's code, and it would go stale the moment sc-17151 lands — that story moves the
+            // release path onto a shared retrying drain, which can only strengthen this flag.
             bounded_wired_residency: true,
             // MLX mmaps and materializes per tensor: a bare 66 GB `MiniMaxH3Dit::load` leaves peak
             // memory at 33 KB. This is the *intra-tensor* fact, and it is independent of

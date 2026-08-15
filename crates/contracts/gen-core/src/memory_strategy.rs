@@ -3543,11 +3543,16 @@ mod tests {
             resident_components: vec![MemoryResidentComponent {
                 id: "adaln".to_owned(),
                 kind: MemoryComponentKind::TransformerSubStack(TransformerComponent::Dit),
-                resident_bytes: 26_020_915_200,
+                // Obviously synthetic round numbers. These used to be MiniMax-H3's real 26.02 GB
+                // stack beside `3_890_073_600` — a mis-transcription of that provider's
+                // `ADALN_MODULATION_TABLE_MAX_BYTES` (3_870_720_000). A near-miss copy of a real
+                // provider's figures reads as authoritative and is the harder defect: gen-core owns
+                // the rule, not any provider's bytes, and nothing here grades a magnitude.
+                resident_bytes: 4_000_000_000,
                 bounded_by: None,
                 residency: MemoryComponentResidency::PrecomputedThenEvicted {
                     precomputed_in: MemoryPhase::Denoise,
-                    retained_bytes: 3_890_073_600,
+                    retained_bytes: 1_000_000_000,
                     evidence: "a measurement".to_owned(),
                 },
             }],
