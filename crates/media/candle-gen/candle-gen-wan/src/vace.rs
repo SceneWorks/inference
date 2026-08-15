@@ -20,15 +20,15 @@ use candle_gen::candle_nn::{Linear, Module, VarBuilder};
 use candle_gen::gen_core::CancelFlag;
 use candle_gen::{CandleError, Result as CResult};
 
-use crate::config::{WanVaceConfig, VAE16_STRIDE_SPATIAL, VAE16_STRIDE_TEMPORAL};
+use crate::config::WanVaceConfig;
+use crate::model_vace::ProviderVae;
 use crate::pipeline::cfg;
 use crate::scheduler::{FlowScheduler, Sampler};
 use crate::transformer::{linear, ln_no_affine, timestep_sinusoid, Block};
-use crate::vae16::WanVae16;
 
 /// The z16 VAE temporal/spatial strides (Wan2.1; VACE is Wan2.1-based).
-const VAE_T: usize = VAE16_STRIDE_TEMPORAL as usize;
-const VAE_S: usize = VAE16_STRIDE_SPATIAL as usize;
+const VAE_T: usize = ProviderVae::VAE_TILING.temporal_scale as usize;
+const VAE_S: usize = ProviderVae::VAE_TILING.spatial_scale as usize;
 
 /// Squeeze a diffusers Conv3d patch-embedding weight `[dim, in, pt, ph, pw]` → a per-frame conv2d
 /// `[dim, in, ph, pw]` (the patch temporal kernel `pt` is 1 for Wan). Mirrors
@@ -408,7 +408,7 @@ pub fn prepare_masks(mask: &Tensor, patch: usize, num_ref: usize) -> Result<Tens
 /// reference `[1,3,1,H,W]` is encoded to one latent frame, `cat([ref, zeros])` to 32 ch, and prepended
 /// along the frame axis. Mirrors diffusers `WanVACEPipeline.prepare_video_latents` (single batch).
 pub fn prepare_video_latents(
-    vae: &WanVae16,
+    vae: &ProviderVae,
     video: &Tensor,
     mask: &Tensor,
     references: &[Tensor],
@@ -489,6 +489,73 @@ pub fn denoise_vace(
     Ok(latents)
 }
 
+/// First denoise step below the Wan2.2 expert boundary. Pure CPU structural seam shared by resident
+/// selection tests and the staged VACE-Fun expert swap.
+pub fn crossing_index(timesteps: &[f64], boundary_timestep: f64) -> usize {
+    timesteps
+        .iter()
+        .position(|&timestep| timestep < boundary_timestep)
+        .unwrap_or(timesteps.len())
+}
+
+/// Run a contiguous denoise range on one VACE expert while preserving a single scheduler across the
+/// high→low boundary. The expert embeds its own text/control projections once for its range.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_vace_range(
+    transformer: &WanVaceTransformer,
+    control: &Tensor,
+    scales: &[f32],
+    scheduler: &mut FlowScheduler,
+    guidance: f64,
+    ctx_pos: &Tensor,
+    ctx_neg: Option<&Tensor>,
+    latents: &mut Tensor,
+    timesteps: &[f64],
+    range: std::ops::Range<usize>,
+    cos: &Tensor,
+    sin: &Tensor,
+    cancel: &CancelFlag,
+    on_step: &mut dyn FnMut(usize),
+) -> CResult<()> {
+    let (_b, _c, f, hl, wl) = latents.dims5()?;
+    let (pt, ph, pw) = transformer.cfg.base.patch;
+    let l = (f / pt) * (hl / ph) * (wl / pw);
+    let control_emb = transformer.embed_control(control, l)?;
+    for i in range {
+        if cancel.is_cancelled() {
+            return Err(CandleError::Canceled);
+        }
+        let timestep = timesteps[i];
+        let cond = transformer.forward_cached(
+            latents,
+            timestep,
+            &control_emb,
+            ctx_pos,
+            scales,
+            cos,
+            sin,
+        )?;
+        let velocity = match ctx_neg {
+            Some(negative) => {
+                let uncond = transformer.forward_cached(
+                    latents,
+                    timestep,
+                    &control_emb,
+                    negative,
+                    scales,
+                    cos,
+                    sin,
+                )?;
+                cfg(&cond, &uncond, guidance)?
+            }
+            None => cond,
+        };
+        *latents = scheduler.step(&velocity, latents)?;
+        on_step(i + 1);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -548,6 +615,18 @@ mod tests {
             .to_vec1::<f32>()
             .unwrap();
         assert!(frame1.iter().all(|&v| v == 1.0));
+    }
+
+    #[test]
+    fn vace_fun_boundary_selects_one_high_prefix() {
+        let timesteps = [999.0, 910.0, 874.0, 500.0, 0.0];
+        let crossing = crossing_index(&timesteps, 875.0);
+        assert_eq!(crossing, 2);
+        let selected = timesteps
+            .iter()
+            .map(|&t| if t >= 875.0 { "high" } else { "low" })
+            .collect::<Vec<_>>();
+        assert_eq!(selected, vec!["high", "high", "low", "low", "low"]);
     }
 
     #[test]

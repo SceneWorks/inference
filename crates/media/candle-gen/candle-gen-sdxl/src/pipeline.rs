@@ -752,9 +752,9 @@ impl Pipeline {
                     &table,
                     build_device,
                 )?;
-                crate::adapters::guard_additive_matched(
-                    self.adapters.len(),
-                    linear.applied + conv.applied,
+                crate::adapters::guard_each_adapter_matched(
+                    &self.adapters,
+                    &[&linear.applied_by_spec, &conv.applied_by_spec],
                 )?;
             }
             if let Some(quant) = self.quant {
@@ -896,7 +896,10 @@ impl Pipeline {
         let add =
             crate::adapters::install_additive(&mut unet, &self.adapters, &table, &self.device)?;
         // A non-empty spec set that neither folded a conv nor installed a residual is a misconfiguration.
-        crate::adapters::guard_additive_matched(self.adapters.len(), conv.merged + add.applied)?;
+        crate::adapters::guard_each_adapter_matched(
+            &self.adapters,
+            &[&conv.applied_by_spec, &add.applied_by_spec],
+        )?;
         Ok(unet)
     }
 
@@ -937,7 +940,10 @@ impl Pipeline {
             &table,
             &self.device,
         )?;
-        crate::adapters::guard_additive_matched(self.adapters.len(), lin.applied + conv.applied)?;
+        crate::adapters::guard_each_adapter_matched(
+            &self.adapters,
+            &[&lin.applied_by_spec, &conv.applied_by_spec],
+        )?;
         Ok(unet)
     }
 

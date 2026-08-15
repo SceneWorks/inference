@@ -88,6 +88,7 @@ fn real_weight_ip_adapter() {
     let paths = IpAdapterKolorsPaths {
         kolors_base: env_path("IP_KOLORS_BASE"),
         ip_adapter: ip_adapter.clone(),
+        adapters: Vec::new(),
     };
     let reference = read_ppm(&env_path("IP_KOLORS_REF"));
     println!(
@@ -126,6 +127,32 @@ fn real_weight_ip_adapter() {
         .expect("generate (ip)");
     println!("[ip] {:?}", t.elapsed());
     write_ppm(&out_dir.join("kolors_ip.ppm"), &out_ip);
+    if let Some(adapter) = std::env::var_os("IP_KOLORS_LORA") {
+        drop(model);
+        let mut adapted = IpAdapterKolors::load(&IpAdapterKolorsPaths {
+            kolors_base: env_path("IP_KOLORS_BASE"),
+            ip_adapter: ip_adapter.clone(),
+            adapters: vec![candle_gen::gen_core::AdapterSpec::new(
+                adapter.into(),
+                1.0,
+                candle_gen::gen_core::AdapterKind::Lora,
+            )],
+        })
+        .expect("load adapter-conditioned Kolors IP");
+        let with_adapter = adapted
+            .generate(&base, &reference, &mut noop)
+            .expect("generate (ip + LoRA)");
+        assert_eq!(
+            (with_adapter.width, with_adapter.height),
+            (out_ip.width, out_ip.height)
+        );
+        assert_ne!(
+            with_adapter.pixels, out_ip.pixels,
+            "selected Kolors IP adapter must change output"
+        );
+        write_ppm(&out_dir.join("kolors_ip_lora.ppm"), &with_adapter);
+        return;
+    }
 
     // Without IP (scale 0 → branch gated off → plain Kolors at the same seed/prompt).
     let plain_req = IpAdapterKolorsRequest {

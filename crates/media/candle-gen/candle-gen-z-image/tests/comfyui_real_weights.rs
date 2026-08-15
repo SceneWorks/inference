@@ -74,6 +74,7 @@ fn comfyui_zimage_renders_in_place() {
         &text_encoder,
         &vae,
         &tokenizer_dir,
+        Vec::new(),
     )
     .expect("load_from_comfyui_components");
     eprintln!("[comfyui] load handle {:.2}s", load.elapsed().as_secs_f32());
@@ -104,6 +105,39 @@ fn comfyui_zimage_renders_in_place() {
     };
     assert_eq!(images.len(), 1, "expected 1 image");
     assert_coherent(&images[0], "comfyui");
+
+    if let Some(adapter) = std::env::var_os("ZIMAGE_COMFYUI_LORA") {
+        drop(gen);
+        let adapted = candle_gen_z_image::load_from_comfyui_components(
+            &transformer,
+            &text_encoder,
+            &vae,
+            &tokenizer_dir,
+            vec![candle_gen::gen_core::AdapterSpec::new(
+                adapter.into(),
+                1.0,
+                candle_gen::gen_core::AdapterKind::Lora,
+            )],
+        )
+        .expect("load adapter-conditioned ComfyUI Z-Image");
+        let out = adapted
+            .generate(&req, &mut on_progress)
+            .expect("comfyui z-image generate with LoRA");
+        let adapted_images = match out {
+            GenerationOutput::Images(images) => images,
+            _ => panic!("expected images, got video"),
+        };
+        assert_eq!(adapted_images.len(), 1);
+        assert_eq!(
+            (adapted_images[0].width, adapted_images[0].height),
+            (images[0].width, images[0].height)
+        );
+        assert_ne!(
+            adapted_images[0].pixels, images[0].pixels,
+            "selected ComfyUI Z-Image adapter must change output"
+        );
+        return;
+    }
 
     if let Some(buf) =
         image::RgbImage::from_raw(images[0].width, images[0].height, images[0].pixels.clone())

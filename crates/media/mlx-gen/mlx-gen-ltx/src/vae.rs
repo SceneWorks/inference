@@ -537,6 +537,9 @@ pub struct LtxVideoVae {
 }
 
 impl LtxVideoVae {
+    /// Geometry owned by the concrete decoder and consumed by its planner and tiled driver.
+    pub const VAE_TILING: VaeTiling = VaeTiling::LTX;
+
     /// Build the decoder from `decoder_w` and (optionally) the encoder from `encoder_w` — both eager.
     pub fn from_weights(
         decoder_w: &Weights,
@@ -619,10 +622,10 @@ impl LtxVideoVae {
     ) -> Result<Array> {
         let sh = latent.shape();
         let (f, h, w) = (sh[2], sh[3], sh[4]);
-        if !cfg.needs_tiling(VaeTiling::LTX, f, h, w) {
+        if !cfg.needs_tiling(Self::VAE_TILING, f, h, w) {
             return self.decode(latent);
         }
-        let plan = cfg.plan(VaeTiling::LTX, f, h, w);
+        let plan = cfg.plan(Self::VAE_TILING, f, h, w);
 
         // Full-size accumulators (the reference allocates these too); pad-and-add each tile in turn.
         // `output` carries the batch; `weights` stays `b=1` and broadcasts on the final divide.

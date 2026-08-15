@@ -131,6 +131,7 @@ fn measure_z_image_base_control_tier() {
         snapshot,
         text_encoder: None,
         control,
+        adapters: Vec::new(),
         base: true,
     };
     let model = ZImageControl::load_with_memory(&paths, memory)

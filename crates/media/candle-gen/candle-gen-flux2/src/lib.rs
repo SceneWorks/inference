@@ -37,6 +37,7 @@
 //! wired: the klein weight-variant edits (`flux2_klein_9b_kv_edit`) and LoRA/LoKr. `backend =
 //! "candle"`, `mac_only = false`.
 
+pub mod caption_upsample;
 pub mod config;
 pub mod control_provider;
 pub mod convert;
@@ -50,6 +51,7 @@ pub mod quant;
 pub mod text_encoder;
 pub mod transformer;
 pub mod vae;
+pub mod vision;
 
 /// Re-export the pinned width/height stride at the crate root so SceneWorks can tie each advertised
 /// FLUX.2 image bucket to `candle_gen_flux2::SIZE_MULTIPLE` (sc-12612) instead of a hand-copied literal.
@@ -62,7 +64,7 @@ pub use transformer::{
 };
 
 /// Content identity for the CUDA resident/staged real-weight calibration harness.
-pub const RESIDENCY_CALIBRATION_FINGERPRINT: &str = "flux2-cuda-residency-v1";
+pub const RESIDENCY_CALIBRATION_FINGERPRINT: &str = "flux2-cuda-residency-caption-upsample-v2";
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -80,6 +82,7 @@ use candle_gen::gen_core::{
 use candle_gen::{CandleError, LatentDecoder, Result as CResult};
 use candle_gen_pid::{PidDecoder, PidEngine};
 
+use caption_upsample::CaptionUpsampler;
 use config::{Flux2Config, Flux2Variant};
 use text_encoder::Flux2PromptEncoder;
 use vae::Flux2Vae;
@@ -104,9 +107,16 @@ struct Components {
     /// and reused across every prompt/branch encode (sc-8991 / F-011) instead of re-parsing
     /// `tokenizer.json` per request.
     tokenizer: Arc<TextTokenizer>,
+    upsampler: Option<Arc<CaptionUpsampler>>,
     /// Optional NVIDIA PiD super-resolving decoder (epic 7840 / sc-7853), loaded once when the model
     /// was loaded with `LoadSpec::pid`. `None` ⇒ the native `Flux2Vae::decode_packed` (the default path).
     pid: Option<Arc<PidEngine>>,
+}
+
+struct SeqText {
+    te: Flux2PromptEncoder,
+    tokenizer: TextTokenizer,
+    upsampler: Option<CaptionUpsampler>,
 }
 
 /// The just-loaded heavy phase owned by the sequential path — the DiT + VAE + the optional PiD engine,
@@ -124,7 +134,7 @@ struct SeqHeavy {
 
 enum TextPhase {
     Resident(Components),
-    Sequential(Box<(Flux2PromptEncoder, TextTokenizer)>),
+    Sequential(Box<SeqText>),
 }
 
 enum HeavyPhase {
@@ -211,6 +221,13 @@ fn run_comfyui_dit_load_test_hook(
     })
 }
 
+fn sanitize_log_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect()
+}
+
 /// A txt2img pipeline handle: snapshot root + device + the f32 compute dtype. `pub(crate)` so the
 /// edit provider ([`edit_provider`]) reuses the snapshot mmap + prompt-encode scaffolding.
 #[derive(Clone)]
@@ -234,6 +251,7 @@ pub(crate) struct Pipeline {
     /// encoder / VAE / tokenizer still come from the resident snapshot `root`. `None` on every other
     /// path (registry txt2img, edit, control).
     pub(crate) comfyui_dit: Option<PinnedWeightsFile>,
+    pub(crate) adapters: Vec<gen_core::AdapterSpec>,
 }
 
 impl Pipeline {
@@ -244,6 +262,7 @@ impl Pipeline {
         root: &Path,
         device: &Device,
         pid_spec: Option<PidWeights>,
+        adapters: Vec<gen_core::AdapterSpec>,
     ) -> Self {
         Self {
             variant,
@@ -259,6 +278,7 @@ impl Pipeline {
             quant,
             pid_spec,
             comfyui_dit: None,
+            adapters,
         }
     }
 
@@ -269,6 +289,7 @@ impl Pipeline {
         text_encoder_source: gen_core::ValidatedEncoderSource,
         device: &Device,
         pid_spec: Option<PidWeights>,
+        adapters: Vec<gen_core::AdapterSpec>,
     ) -> Self {
         Self {
             variant,
@@ -280,6 +301,7 @@ impl Pipeline {
             quant,
             pid_spec,
             comfyui_dit: None,
+            adapters,
         }
     }
 
@@ -294,6 +316,7 @@ impl Pipeline {
         device: &Device,
         comfyui_dit: PinnedWeightsFile,
         pid_spec: Option<PidWeights>,
+        adapters: Vec<gen_core::AdapterSpec>,
     ) -> CResult<Self> {
         comfyui_dit.ensure_unchanged().map_err(|error| {
             CandleError::Msg(format!(
@@ -312,6 +335,7 @@ impl Pipeline {
             quant,
             pid_spec,
             comfyui_dit: Some(comfyui_dit),
+            adapters,
         })
     }
 
@@ -322,8 +346,10 @@ impl Pipeline {
         device: &Device,
         comfyui_dit: PinnedWeightsFile,
         pid_spec: Option<PidWeights>,
+        adapters: Vec<gen_core::AdapterSpec>,
     ) -> CResult<Self> {
-        let mut pipeline = Self::load_comfyui(quant, root, device, comfyui_dit, pid_spec)?;
+        let mut pipeline =
+            Self::load_comfyui(quant, root, device, comfyui_dit, pid_spec, adapters)?;
         pipeline.text_encoder_source = TextEncoderSource::Validated(Box::new(text_encoder_source));
         Ok(pipeline)
     }
@@ -411,10 +437,17 @@ impl Pipeline {
     /// A staging-strategy change (e.g. pre-quantized snapshot consumption) now lives in one place. Use
     /// [`Self::load_quantizable`] directly only if a future caller needs non-default module builders.
     pub(crate) fn load_te_and_dit(&self) -> CResult<(Flux2PromptEncoder, Flux2Transformer)> {
-        self.load_quantizable(
+        let (te, mut dit) = self.load_quantizable(
             |cfg, vb| Ok(Flux2PromptEncoder::new(cfg, vb)?),
             |cfg, vb| Ok(Flux2Transformer::new(cfg, vb)?),
-        )
+        )?;
+        candle_gen::quant::install_dotted_adapters(
+            "flux2",
+            &self.adapters,
+            &self.device,
+            |visitor| dit.visit_adaptable_mut(visitor),
+        )?;
+        Ok((te, dit))
     }
 
     /// Load ONLY the text encoder for the sequential-residency path (epic 10765 Phase 1c, sc-10868) —
@@ -431,11 +464,21 @@ impl Pipeline {
         )
     }
 
+    fn load_caption_upsampler(&self, include_vision: bool) -> CResult<Option<CaptionUpsampler>> {
+        if !self.variant.is_dev() {
+            return Ok(None);
+        }
+        Ok(Some(CaptionUpsampler::new(
+            self.component_vb_on("text_encoder", &self.device)?,
+            include_vision,
+        )?))
+    }
+
     /// Load ONLY the DiT for the sequential path (sc-10868) — loaded after the text encoder was dropped,
     /// so it reuses the TE's freed allocator pool (capping peak at DiT+VAE, not TE+DiT+VAE). Same per-tier
     /// routing as the paired [`load_te_and_dit`](Self::load_te_and_dit) DiT half.
     pub(crate) fn load_dit_seq(&self) -> CResult<Flux2Transformer> {
-        match &self.comfyui_dit {
+        let mut dit = match &self.comfyui_dit {
             Some(dit_file) => self.load_comfyui_dit(dit_file),
             None => self.load_one_quantizable(
                 "transformer",
@@ -443,7 +486,14 @@ impl Pipeline {
                 |vb| Ok(Flux2Transformer::new(&self.cfg, vb)?),
                 |m, q, d| Ok(m.quantize(q, d)?),
             ),
-        }
+        }?;
+        candle_gen::quant::install_dotted_adapters(
+            "flux2",
+            &self.adapters,
+            &self.device,
+            |visitor| dit.visit_adaptable_mut(visitor),
+        )?;
+        Ok(dit)
     }
 
     /// Which PiD spec [`load_pid`](Self::load_pid) should actually load: the spec the caller opted into
@@ -501,6 +551,12 @@ impl Pipeline {
     ) -> CResult<Flux2Transformer> {
         if !stream_transformer_blocks {
             return self.load_dit_seq();
+        }
+        if !self.adapters.is_empty() {
+            return Err(CandleError::Msg(
+                "FLUX.2 adapters require resident transformer blocks; disable block streaming"
+                    .into(),
+            ));
         }
         if self.comfyui_dit.is_some() {
             return Err(CandleError::Msg(
@@ -659,6 +715,7 @@ impl Pipeline {
         };
         let vae = Flux2Vae::new(self.component_vb("vae")?)?;
         let tokenizer = self.build_tokenizer()?;
+        let upsampler = self.load_caption_upsampler(false)?.map(Arc::new);
         // Load the optional PiD super-resolving decoder once (epic 7840 / sc-7853) when the caller
         // opted in via `LoadSpec::pid`; otherwise `None` and the render path uses the native Flux2Vae.
         // Resident: this set is cached across requests, so the overlay must be loaded for whichever later
@@ -669,6 +726,7 @@ impl Pipeline {
             transformer: Arc::new(transformer),
             vae: Arc::new(vae),
             tokenizer: Arc::new(tokenizer),
+            upsampler,
             pid,
         })
     }
@@ -748,18 +806,25 @@ impl Pipeline {
         req: &GenerationRequest,
     ) -> CResult<(Tensor, Option<Tensor>, f32)> {
         let guidance = req.guidance.unwrap_or(self.variant.default_guidance());
-        let encode = |te: &Flux2PromptEncoder, tok: &TextTokenizer| -> CResult<_> {
+        let encode = |te: &Flux2PromptEncoder,
+                      tok: &TextTokenizer,
+                      upsampler: Option<&CaptionUpsampler>|
+         -> CResult<_> {
+            let prompt = self.effective_prompt(te, tok, upsampler, req, &[])?;
+            candle_gen::check_cancel(&req.cancel)?;
             Ok((
-                self.encode(te, tok, &req.prompt)?,
+                self.encode(te, tok, &prompt)?,
                 self.encode_negative(te, tok, req, guidance)?,
                 guidance,
             ))
         };
         let encoded = match phase {
-            TextPhase::Resident(comps) => encode(&comps.te, &comps.tokenizer),
+            TextPhase::Resident(comps) => {
+                encode(&comps.te, &comps.tokenizer, comps.upsampler.as_deref())
+            }
             TextPhase::Sequential(text) => {
-                let (te, tokenizer) = text.as_ref();
-                encode(te, tokenizer)
+                let text = text.as_ref();
+                encode(&text.te, &text.tokenizer, text.upsampler.as_ref())
             }
         }?;
         // The sc-12195 post-encode boundary sync used to live here as a local `device.synchronize()`:
@@ -770,6 +835,84 @@ impl Pipeline {
         // and before the text phase drops, so every sequential consumer inherits it (sc-12453). Do
         // not re-add a local sync here; the seam is the single point of enforcement.
         Ok(encoded)
+    }
+
+    fn effective_prompt(
+        &self,
+        te: &Flux2PromptEncoder,
+        tokenizer: &TextTokenizer,
+        upsampler: Option<&CaptionUpsampler>,
+        req: &GenerationRequest,
+        references: &[Image],
+    ) -> CResult<String> {
+        if !req.enhance_prompt {
+            req.prompt_enhancement
+                .emit(gen_core::PromptEnhancementReport::absent(&req.prompt));
+            return Ok(req.prompt.clone());
+        }
+        let Some(upsampler) = upsampler else {
+            req.prompt_enhancement
+                .emit(gen_core::PromptEnhancementReport::fallback(
+                    &req.prompt,
+                    "component_unavailable",
+                ));
+            return Ok(req.prompt.clone());
+        };
+        let result = upsampler.upsample_prompt(
+            tokenizer,
+            te,
+            &req.prompt,
+            references,
+            req.enhance_temperature
+                .unwrap_or(caption_upsample::DEFAULT_TEMPERATURE),
+            req.enhance_max_tokens
+                .map(|value| value as usize)
+                .unwrap_or(caption_upsample::DEFAULT_MAX_NEW_TOKENS),
+            req.seed
+                .expect("caption enhancement request seed must be resolved"),
+            &req.cancel,
+        );
+        match result {
+            Ok(prompt) if !prompt.trim().is_empty() && prompt != req.prompt => {
+                eprintln!("ENHANCED_PROMPT:{}", sanitize_log_text(&prompt));
+                req.prompt_enhancement
+                    .emit(gen_core::PromptEnhancementReport::enhanced(
+                        &req.prompt,
+                        &prompt,
+                    ));
+                Ok(prompt)
+            }
+            Ok(prompt) => {
+                let reason = if prompt.trim().is_empty() {
+                    "empty_output"
+                } else {
+                    "unchanged_output"
+                };
+                eprintln!("ENHANCER_FALLBACK:{reason}");
+                req.prompt_enhancement
+                    .emit(gen_core::PromptEnhancementReport::fallback(
+                        &req.prompt,
+                        reason,
+                    ));
+                Ok(req.prompt.clone())
+            }
+            Err(CandleError::Canceled) => Err(CandleError::Canceled),
+            Err(error) => {
+                // A backend error can race with a cancel check. Cancellation wins over the safe
+                // original-prompt fallback so diffusion never begins after the caller cancelled.
+                candle_gen::check_cancel(&req.cancel)?;
+                eprintln!(
+                    "ENHANCER_FALLBACK:{}",
+                    sanitize_log_text(&error.to_string())
+                );
+                req.prompt_enhancement
+                    .emit(gen_core::PromptEnhancementReport::fallback(
+                        &req.prompt,
+                        "enhancer_error",
+                    ));
+                Ok(req.prompt.clone())
+            }
+        }
     }
 
     fn render_phase(
@@ -783,7 +926,7 @@ impl Pipeline {
             .steps
             .map(|s| s as usize)
             .unwrap_or(self.variant.default_steps() as usize);
-        let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+        let base_seed = req.seed.expect("request seed was resolved before phases");
         let (prompt_embeds, negative, guidance) = encoded;
         let (transformer, vae, pid) = match phase {
             HeavyPhase::Resident(comps) => (
@@ -1103,6 +1246,11 @@ impl Generator for Flux2Generator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
+        // Resolve an omitted seed once for the whole request. The same value must drive both the
+        // autoregressive caption sampler and diffusion so the persisted recipe is reproducible.
+        let mut resolved_req = req.clone();
+        resolved_req.seed = Some(req.seed.unwrap_or_else(gen_core::default_seed));
+        let req = &resolved_req;
         let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
         self.memory_admission.consume_for_generate(req)?;
         let stage_residency = req
@@ -1183,8 +1331,8 @@ fn descriptor(variant: Flux2Variant) -> ModelDescriptor {
             supports_true_cfg: false,
             // txt2img only in this slice — the mlx edit/Reference surface is deferred.
             conditioning: vec![],
-            supports_lora: false,
-            supports_lokr: false,
+            supports_lora: true,
+            supports_lokr: true,
             // Curated sampler/scheduler menu (epic 7114 P4, sc-7123). The legacy `flow_match_euler`
             // scheduler alias is retained and falls back to the native schedule via the N3 path.
             samplers: candle_gen::curated_sampler_names(),
@@ -1206,11 +1354,15 @@ fn descriptor(variant: Flux2Variant) -> ModelDescriptor {
             // FLUX.2 uses the empirical-mu shifted flow-match schedule.
             requires_sigma_shift: true,
             supports_sequential_offload: true,
+            unconditionally_engages_staged_residency: false,
             // Per-step latent previews (epic 16948, sc-16955): every shipped FLUX.2 lane hands the
             // shared sampler a `crate::preview` hook that projects the raw 32-channel latent through
             // the epic-16624 fit. `candle-gen-catalog`'s `preview_advertising` guard derives this
             // flag from the sources, so it cannot be set ahead of the wiring or left behind it.
             supports_preview: true,
+            // FLUX.2-dev owns the native Mistral3/Pixtral caption-upsample path. Klein and strict
+            // control descriptors remain false and fail closed before loading weights.
+            supports_prompt_enhancement: variant.is_dev(),
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
@@ -1266,11 +1418,16 @@ fn generator_from_pipeline(
             ))
         },
         move |_| {
+            let build = || {
+                Ok::<_, CandleError>(SeqText {
+                    te: text_pipe.load_te_seq()?,
+                    tokenizer: text_pipe.build_tokenizer()?,
+                    upsampler: text_pipe.load_caption_upsampler(false)?,
+                })
+            };
             let text = match &text_file_spec {
-                Some(spec) => spec.read_files_unchanged(spec.file_source_paths(), || {
-                    Ok::<_, CandleError>((text_pipe.load_te_seq()?, text_pipe.build_tokenizer()?))
-                })?,
-                None => (text_pipe.load_te_seq()?, text_pipe.build_tokenizer()?),
+                Some(spec) => spec.read_files_unchanged(spec.file_source_paths(), build)?,
+                None => build()?,
             };
             Ok(TextPhase::Sequential(Box::new(text)))
         },
@@ -1352,11 +1509,9 @@ pub(crate) fn validate_load_spec(
             gen_core::reject_unknown_components(spec, &[BASE_SNAPSHOT_COMPONENT], id)?;
         }
     }
-    if !spec.adapters.is_empty() {
-        return Err(gen_core::Error::Unsupported(format!(
-            "candle {id} does not support LoRA/LoKr yet"
-        )));
-    }
+    // NOTE: `spec.adapters` is deliberately NOT rejected here — sc-18477 wired candle LoRA/LoKr on
+    // this provider, and the specs are threaded through `Pipeline::{load,load_comfyui}` below.
+    // `spec.text_encoder` is likewise supported: it resolves through the variant's encoder contract.
     if spec.identity.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
             "candle {id} does not support identity weights"
@@ -1398,6 +1553,7 @@ fn load_variant_concrete(
             text_encoder_source,
             &device,
             spec.pid.clone(),
+            spec.adapters.clone(),
         ),
         WeightsSource::File(_) => {
             let dit = spec
@@ -1410,6 +1566,7 @@ fn load_variant_concrete(
                 &device,
                 dit,
                 spec.pid.clone(),
+                spec.adapters.clone(),
             )?
         }
     };
@@ -1424,17 +1581,21 @@ fn load_variant_concrete(
 /// FLUX.2-dev diffusers snapshot supplying the Mistral text encoder, VAE, and tokenizer (none of which
 /// are in the single DiT file). `quant` (Q4/Q8) folds the dequanted DiT + the Mistral TE onto the GPU —
 /// the 32B dev does not fit dense — matching the resident dev path; `None` is fixture-only. txt2img
-/// only; no adapters / control / edit. PiD, when requested in the registry `LoadSpec`, follows the
-/// same provider lifecycle as the directory-backed path.
+/// only; user LoRA/LoKr applies to the remapped DiT, while control / edit use their dedicated
+/// providers rather than this source-specific entry point. PiD, when requested in the registry
+/// `LoadSpec`, follows the same provider lifecycle as the directory-backed path.
 pub fn load_from_comfyui_dit(
     transformer_file: impl Into<PathBuf>,
     snapshot_dir: impl Into<PathBuf>,
     quant: Option<Quant>,
+    adapters: Vec<gen_core::AdapterSpec>,
 ) -> gen_core::Result<Box<dyn Generator>> {
-    let mut spec = LoadSpec::new(WeightsSource::File(transformer_file.into())).with_component(
-        BASE_SNAPSHOT_COMPONENT,
-        WeightsSource::Dir(snapshot_dir.into()),
-    );
+    let mut spec = LoadSpec::new(WeightsSource::File(transformer_file.into()))
+        .with_component(
+            BASE_SNAPSHOT_COMPONENT,
+            WeightsSource::Dir(snapshot_dir.into()),
+        )
+        .with_adapters(adapters);
     if let Some(quant) = quant {
         spec = spec.with_quant(quant);
     }
@@ -1612,7 +1773,8 @@ mod tests {
         }
         let source_pin = PinnedWeightsFile::pin(&source).unwrap();
         let pipeline =
-            Pipeline::load_comfyui(None, tmp.path(), &Device::Cpu, source_pin, None).unwrap();
+            Pipeline::load_comfyui(None, tmp.path(), &Device::Cpu, source_pin, None, Vec::new())
+                .unwrap();
 
         let payload_consumed = Arc::new(AtomicBool::new(false));
         let first_consumed = Arc::new(Barrier::new(2));
@@ -1924,8 +2086,22 @@ mod tests {
             gemma: WeightsSource::Dir("/gemma".into()),
         };
         let root = Path::new("/nonexistent");
-        let with = Pipeline::load(Flux2Variant::Klein9b, None, root, &Device::Cpu, Some(spec));
-        let without = Pipeline::load(Flux2Variant::Klein9b, None, root, &Device::Cpu, None);
+        let with = Pipeline::load(
+            Flux2Variant::Klein9b,
+            None,
+            root,
+            &Device::Cpu,
+            Some(spec),
+            Vec::new(),
+        );
+        let without = Pipeline::load(
+            Flux2Variant::Klein9b,
+            None,
+            root,
+            &Device::Cpu,
+            None,
+            Vec::new(),
+        );
 
         // Opted in at load AND wanted by this request → load it.
         assert!(with.pid_to_load(true).is_some());
@@ -1963,8 +2139,9 @@ mod tests {
         assert!(d.capabilities.requires_sigma_shift);
         assert!(!d.capabilities.mac_only);
         assert!(d.capabilities.conditioning.is_empty());
-        assert!(!d.capabilities.supports_lora);
+        assert!(d.capabilities.supports_lora);
         assert!(!d.capabilities.supports_kv_cache);
+        assert!(!d.capabilities.supports_prompt_enhancement);
         // klein now quantizes its DiT on-the-fly (sc-11031); the Qwen3 TE stays dense (`te_quant`).
         assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
         assert!(!d.capabilities.accepts(ConditioningKind::Reference));
@@ -1990,6 +2167,7 @@ mod tests {
         assert!(!d.capabilities.mac_only);
         assert!(d.capabilities.conditioning.is_empty());
         assert!(d.capabilities.requires_sigma_shift);
+        assert!(d.capabilities.supports_prompt_enhancement);
         // dev and klein both advertise Q4/Q8 now (CPU-stage → quantize-onto-GPU); klein keeps its Qwen3
         // TE dense (`te_quant`), dev folds the Mistral TE with the DiT (sc-11031).
         assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
@@ -2054,15 +2232,55 @@ mod tests {
     }
 
     #[test]
+    fn prompt_enhancement_is_dev_only_and_validates_before_weights() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let registry = crate::provider_registry().unwrap();
+        let dev = registry.load(FLUX2_DEV_ID, &spec).unwrap();
+        let klein = registry.load(FLUX2_KLEIN_9B_ID, &spec).unwrap();
+        let enhanced = GenerationRequest {
+            prompt: "a portrait".into(),
+            enhance_prompt: true,
+            enhance_max_tokens: Some(512),
+            enhance_temperature: Some(0.15),
+            ..Default::default()
+        };
+        assert!(dev.validate(&enhanced).is_ok());
+        let error = klein.validate(&enhanced).unwrap_err().to_string();
+        assert!(
+            error.contains("prompt enhancement is not supported"),
+            "{error}"
+        );
+
+        for request in [
+            GenerationRequest {
+                prompt: "a portrait".into(),
+                enhance_max_tokens: Some(512),
+                ..Default::default()
+            },
+            GenerationRequest {
+                prompt: "a portrait".into(),
+                enhance_prompt: true,
+                enhance_max_tokens: Some(0),
+                ..Default::default()
+            },
+            GenerationRequest {
+                prompt: "a portrait".into(),
+                enhance_prompt: true,
+                enhance_temperature: Some(f32::NAN),
+                ..Default::default()
+            },
+        ] {
+            assert!(dev.validate(&request).is_err(), "should reject {request:?}");
+        }
+    }
+
+    #[test]
     fn load_rejects_unwired_surfaces() {
         use candle_gen::gen_core::{AdapterKind, AdapterSpec, IdentityWeights};
         let lora = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_adapters(vec![
             AdapterSpec::new("/lora.safetensors".into(), 1.0, AdapterKind::Lora),
         ]);
-        assert!(matches!(
-            load_klein(&lora).err().expect("err"),
-            gen_core::Error::Unsupported(_)
-        ));
+        assert!(load_klein(&lora).is_ok());
         let mut identity = LoadSpec::new(WeightsSource::Dir("/snap".into()));
         identity.identity = Some(IdentityWeights::default());
         let named_component = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_component(
@@ -2111,7 +2329,14 @@ mod tests {
     fn component_is_packed_reads_quantization_block() {
         let dir_tmp = tempfile::tempdir().unwrap();
         let dir = dir_tmp.path().to_path_buf();
-        let pipe = Pipeline::load(Flux2Variant::Dev, Some(Quant::Q4), &dir, &Device::Cpu, None);
+        let pipe = Pipeline::load(
+            Flux2Variant::Dev,
+            Some(Quant::Q4),
+            &dir,
+            &Device::Cpu,
+            None,
+            Vec::new(),
+        );
 
         let packed = dir.join("transformer");
         std::fs::create_dir_all(&packed).unwrap();
@@ -2169,6 +2394,7 @@ mod tests {
             selected,
             &Device::Cpu,
             None,
+            Vec::new(),
         );
 
         std::fs::write(selected_root.join("config.json"), b"{}\n").unwrap();
@@ -2239,7 +2465,14 @@ mod tests {
 
         // no quant → configured device, no staging call.
         write_shard("text_encoder", false);
-        let pipe = Pipeline::load(Flux2Variant::Klein9b, None, &dir, &Device::Cpu, None);
+        let pipe = Pipeline::load(
+            Flux2Variant::Klein9b,
+            None,
+            &dir,
+            &Device::Cpu,
+            None,
+            Vec::new(),
+        );
         let p = pipe
             .load_one_quantizable("text_encoder", None, build, quantize)
             .unwrap();
@@ -2248,7 +2481,14 @@ mod tests {
         assert!(!p.quantized.get(), "no-quant path must not quantize");
 
         // dense tier + quant → the builder sees the CPU (staging), then quantize runs onto the device.
-        let dense = Pipeline::load(Flux2Variant::Dev, Some(Quant::Q4), &dir, &Device::Cpu, None);
+        let dense = Pipeline::load(
+            Flux2Variant::Dev,
+            Some(Quant::Q4),
+            &dir,
+            &Device::Cpu,
+            None,
+            Vec::new(),
+        );
         let p = dense
             .load_one_quantizable("text_encoder", Some(Quant::Q4), build, quantize)
             .unwrap();
@@ -2263,7 +2503,14 @@ mod tests {
 
         // packed tier + quant → the builder sees the configured device directly (no dense staging).
         write_shard("transformer", true);
-        let packed = Pipeline::load(Flux2Variant::Dev, Some(Quant::Q4), &dir, &Device::Cpu, None);
+        let packed = Pipeline::load(
+            Flux2Variant::Dev,
+            Some(Quant::Q4),
+            &dir,
+            &Device::Cpu,
+            None,
+            Vec::new(),
+        );
         let p = packed
             .load_one_quantizable("transformer", Some(Quant::Q4), build, quantize)
             .unwrap();
@@ -2285,9 +2532,16 @@ mod tests {
         let dir_tmp = tempfile::tempdir().unwrap();
         let dir = dir_tmp.path().to_path_buf();
         for q in [None, Some(Quant::Q4), Some(Quant::Q8)] {
-            let klein = Pipeline::load(Flux2Variant::Klein9b, q, &dir, &Device::Cpu, None);
+            let klein = Pipeline::load(
+                Flux2Variant::Klein9b,
+                q,
+                &dir,
+                &Device::Cpu,
+                None,
+                Vec::new(),
+            );
             assert_eq!(klein.te_quant(), None, "klein TE stays dense at {q:?}");
-            let dev = Pipeline::load(Flux2Variant::Dev, q, &dir, &Device::Cpu, None);
+            let dev = Pipeline::load(Flux2Variant::Dev, q, &dir, &Device::Cpu, None, Vec::new());
             assert_eq!(dev.te_quant(), q, "dev folds its TE with the DiT at {q:?}");
         }
     }
@@ -2301,7 +2555,14 @@ mod tests {
         let dir_tmp = tempfile::tempdir().unwrap();
         let dir = dir_tmp.path().to_path_buf();
         // No component dirs written → the shared loader must error on the missing text_encoder/.
-        let pipe = Pipeline::load(Flux2Variant::Klein9b, None, &dir, &Device::Cpu, None);
+        let pipe = Pipeline::load(
+            Flux2Variant::Klein9b,
+            None,
+            &dir,
+            &Device::Cpu,
+            None,
+            Vec::new(),
+        );
         let err = pipe
             .load_te_and_dit()
             .err()
@@ -2344,7 +2605,7 @@ mod tests {
             &dit,
         )
         .unwrap();
-        let g = load_from_comfyui_dit(&dit, &snapshot, Some(Quant::Q8))
+        let g = load_from_comfyui_dit(&dit, &snapshot, Some(Quant::Q8), Vec::new())
             .expect("comfyui dev generator builds lazily");
         assert_eq!(g.descriptor().id, FLUX2_DEV_ID);
         assert_eq!(g.descriptor().family, "flux2");
@@ -2363,6 +2624,7 @@ mod tests {
             &Device::Cpu,
             PinnedWeightsFile::pin(&selected).unwrap(),
             None,
+            Vec::new(),
         )
         .expect("pin selected file");
         let error = pipe
@@ -2888,9 +3150,15 @@ mod tests {
         );
         let mut probe = candle_gen::testkit::VramProbe::start_rendered();
         let load_phase = probe.phase();
-        let model =
-            Flux2Edit::load_klein_with_memory_context(&Flux2EditPaths { root }, &spec, &context)
-                .expect("load context-bound Klein edit");
+        let model = Flux2Edit::load_klein_with_memory_context(
+            &Flux2EditPaths {
+                root,
+                adapters: Vec::new(),
+            },
+            &spec,
+            &context,
+        )
+        .expect("load context-bound Klein edit");
         probe.end_load(load_phase);
 
         let mut stale = context.clone();

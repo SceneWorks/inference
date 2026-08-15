@@ -624,11 +624,13 @@ pub fn descriptor() -> ModelDescriptor {
             supports_kv_cache: false,
             requires_sigma_shift: false,
             supports_sequential_offload: true,
+            unconditionally_engages_staged_residency: false,
             // Per-step latent previews (epic 16948, sc-16957). Every Turbo render lane emits: the
             // resident and staged txt2img/img2img routes hand `run_flow_sampler` a projector hook, and
             // the name-driven control + edit providers' bespoke Euler loops emit directly. The
             // projection reuses the epic-16624 Z-Image 16-channel fit — see [`crate::preview`].
             supports_preview: true,
+            supports_prompt_enhancement: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
@@ -851,9 +853,9 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 /// separate ComfyUI component files + the directory holding our shipped `tokenizer/tokenizer.json` (the
 /// one tiny file a ComfyUI tree does not ship). The DiT and VAE are key-remapped in memory at first
 /// `generate` (`comfyui`) and the Qwen3 encoder loads verbatim — read in place, no copy, no
-/// re-download. Dense bf16, plain fp8, and scalar-companion scaled-fp8 files all
-/// normalize to bf16 before assembly; unsupported packed integer formats remain
-/// typed load errors.
+/// re-download. Dense bf16, plain fp8, and scalar-companion scaled-fp8 files all normalize to bf16
+/// before assembly; unsupported packed integer formats remain typed load errors. `adapters` is the
+/// ordered LoRA/LoKr stack applied to the remapped base DiT before generation.
 ///
 /// Retained as a compatibility shim: it constructs the registry [`LoadSpec`] and delegates to
 /// [`load`], so there is no second provider lifecycle.
@@ -862,6 +864,7 @@ pub fn load_from_comfyui_components(
     text_encoder_file: impl Into<PathBuf>,
     vae_file: impl Into<PathBuf>,
     tokenizer_dir: impl Into<PathBuf>,
+    adapters: Vec<AdapterSpec>,
 ) -> gen_core::Result<Box<dyn Generator>> {
     let mut spec = LoadSpec::new(WeightsSource::File(transformer_file.into()))
         .with_component(
@@ -869,22 +872,26 @@ pub fn load_from_comfyui_components(
             WeightsSource::Dir(tokenizer_dir.into()),
         )
         .with_text_encoder(WeightsSource::File(text_encoder_file.into()))
-        .with_component(COMFYUI_VAE_COMPONENT, WeightsSource::File(vae_file.into()));
+        .with_component(COMFYUI_VAE_COMPONENT, WeightsSource::File(vae_file.into()))
+        .with_adapters(adapters);
     spec.prepare_file_sources()?;
     load(&spec)
 }
 
-/// Construct a Z-Image generator from one fused community checkpoint containing
-/// transformer, Qwen3 text-encoder, and VAE tensors. The tokenizer remains a
-/// model-agnostic JSON asset supplied by `tokenizer_dir`.
+/// Construct a Z-Image generator from one fused community checkpoint containing transformer, Qwen3
+/// text-encoder, and VAE tensors. The tokenizer remains a model-agnostic JSON asset supplied by
+/// `tokenizer_dir`; `adapters` is applied to the remapped base DiT in order.
 pub fn load_from_comfyui_checkpoint(
     checkpoint_file: impl Into<PathBuf>,
     tokenizer_dir: impl Into<PathBuf>,
+    adapters: Vec<AdapterSpec>,
 ) -> gen_core::Result<Box<dyn Generator>> {
-    let mut spec = LoadSpec::new(WeightsSource::File(checkpoint_file.into())).with_component(
-        BASE_SNAPSHOT_COMPONENT,
-        WeightsSource::Dir(tokenizer_dir.into()),
-    );
+    let mut spec = LoadSpec::new(WeightsSource::File(checkpoint_file.into()))
+        .with_component(
+            BASE_SNAPSHOT_COMPONENT,
+            WeightsSource::Dir(tokenizer_dir.into()),
+        )
+        .with_adapters(adapters);
     spec.prepare_file_sources()?;
     load(&spec)
 }

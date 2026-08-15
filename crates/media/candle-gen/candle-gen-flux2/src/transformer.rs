@@ -549,6 +549,85 @@ impl Flux2Transformer {
         Self::new_with_blocks(cfg, vb, false, None, None)
     }
 
+    pub fn visit_adaptable_mut(
+        &mut self,
+        visitor: &mut dyn FnMut(&str, &mut candle_gen::quant::AdaptLinear) -> Result<()>,
+    ) -> Result<()> {
+        visitor("x_embedder", &mut self.x_embedder)?;
+        visitor("context_embedder", &mut self.context_embedder)?;
+        visitor(
+            "time_guidance_embed.timestep_embedder.linear_1",
+            &mut self.time_embed.timestep.linear_1,
+        )?;
+        visitor(
+            "time_guidance_embed.timestep_embedder.linear_2",
+            &mut self.time_embed.timestep.linear_2,
+        )?;
+        if let Some(guidance) = &mut self.time_embed.guidance {
+            visitor(
+                "time_guidance_embed.guidance_embedder.linear_1",
+                &mut guidance.linear_1,
+            )?;
+            visitor(
+                "time_guidance_embed.guidance_embedder.linear_2",
+                &mut guidance.linear_2,
+            )?;
+        }
+        visitor(
+            "double_stream_modulation_img.linear",
+            &mut self.mod_img.linear,
+        )?;
+        visitor(
+            "double_stream_modulation_txt.linear",
+            &mut self.mod_txt.linear,
+        )?;
+        visitor(
+            "single_stream_modulation.linear",
+            &mut self.mod_single.linear,
+        )?;
+        match &mut self.blocks {
+            Flux2Blocks::Resident { double, single } => {
+                for (index, block) in double.iter_mut().enumerate() {
+                    let prefix = format!("transformer_blocks.{index}");
+                    for (name, linear) in [
+                        ("to_q", &mut block.attn.to_q),
+                        ("to_k", &mut block.attn.to_k),
+                        ("to_v", &mut block.attn.to_v),
+                        ("to_out.0", &mut block.attn.to_out),
+                        ("add_q_proj", &mut block.attn.add_q),
+                        ("add_k_proj", &mut block.attn.add_k),
+                        ("add_v_proj", &mut block.attn.add_v),
+                        ("to_add_out", &mut block.attn.to_add_out),
+                    ] {
+                        visitor(&format!("{prefix}.attn.{name}"), linear)?;
+                    }
+                    visitor(&format!("{prefix}.ff.linear_in"), &mut block.ff.linear_in)?;
+                    visitor(&format!("{prefix}.ff.linear_out"), &mut block.ff.linear_out)?;
+                    visitor(
+                        &format!("{prefix}.ff_context.linear_in"),
+                        &mut block.ff_context.linear_in,
+                    )?;
+                    visitor(
+                        &format!("{prefix}.ff_context.linear_out"),
+                        &mut block.ff_context.linear_out,
+                    )?;
+                }
+                for (index, block) in single.iter_mut().enumerate() {
+                    let prefix = format!("single_transformer_blocks.{index}.attn");
+                    visitor(&format!("{prefix}.to_qkv_mlp_proj"), &mut block.to_qkv_mlp)?;
+                    visitor(&format!("{prefix}.to_out"), &mut block.to_out)?;
+                }
+            }
+            Flux2Blocks::Streamed { .. } => {
+                candle_gen::candle_core::bail!(
+                    "FLUX.2 adapters require resident transformer blocks; disable block streaming"
+                )
+            }
+        }
+        visitor("norm_out.linear", &mut self.norm_out.linear)?;
+        visitor("proj_out", &mut self.proj_out)
+    }
+
     /// Build only the non-block FLUX.2 trunk and retain host-backed block weights. Each forward
     /// materializes one admitted window, executes it, synchronizes, and releases it before advancing.
     pub fn new_block_streamed(

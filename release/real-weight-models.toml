@@ -1271,8 +1271,10 @@ environment = ["MMAUDIO_BIGVGAN_SNAPSHOT"]
 expected_files = ["ext_weights/best_netG.pt"]
 download_files = ["ext_weights/best_netG.pt"]
 [[models]]
-# DFN5B-CLIP ViT-H/14-384 (sc-13437, epic sc-12833): the CLIP model MMAudio conditions on — Apple's
-# open_clip ViT-H/14 quickgelu DFN5B variant, ported natively in candle-audio-mmaudio::clip. Visual
+# DFN5B-CLIP ViT-H/14-378 (sc-13437, epic sc-12833): the CLIP model MMAudio conditions on — Apple's
+# open_clip ViT-H/14 quickgelu DFN5B variant, ported natively in candle-audio-mmaudio::clip. MMAudio
+# deliberately feeds 384×384 frames to the 378-native checkpoint; patch 14 with stride 14 produces
+# the same 27×27 patch grid at both resolutions. The stable catalog key remains `...-384`. Visual
 # tower -> 1024-d per-frame features (encode_image, normalize=True); 77-token text tower ->
 # per-token (77,1024) last-hidden-state (MMAudio's patched encode_text). ~3.9 GB open_clip pickle.
 # Weights are Apple Machine Learning Research Model License (research / non-commercial only). Gated
@@ -1280,7 +1282,7 @@ download_files = ["ext_weights/best_netG.pt"]
 # deterministic, discriminative) + an open_clip numerical-parity test (cos>0.999). Parity validated
 # locally at cos=1.000000 (image) / 1.000000 (text) — see PR sc-13437.
 key = "dfn5b-clip-vit-h14-384"
-repository = "apple/DFN5B-CLIP-ViT-H-14-384"
+repository = "apple/DFN5B-CLIP-ViT-H-14-378"
 revision = "01b771ed0d1395ca5ffdd279897d665ebe00dfd2"
 license = "Apple Machine Learning Research Model License"
 size_class = "very-large"

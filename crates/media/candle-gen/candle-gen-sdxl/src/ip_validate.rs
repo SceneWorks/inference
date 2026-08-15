@@ -169,6 +169,7 @@ fn real_weight_ip_adapter() {
         tokenizer_clip_l: WeightsSource::Dir(env_path("SDXL_TOKENIZER_CLIP_L_DIR")),
         tokenizer_clip_bigg: WeightsSource::Dir(env_path("SDXL_TOKENIZER_CLIP_BIGG_DIR")),
         vae_fp16_fix: WeightsSource::Dir(env_path("SDXL_VAE_FP16_FIX_DIR")),
+        adapters: Vec::new(),
     };
     let reference = read_ppm(&env_path("IP_REF"));
     println!(
@@ -209,6 +210,36 @@ fn real_weight_ip_adapter() {
         .expect("generate (ip)");
     println!("[ip] {:?}", t.elapsed());
     write_ppm(&out_dir.join("ip.ppm"), &out_ip);
+    if let Some(adapter) = std::env::var_os("IP_SDXL_LORA") {
+        drop(model);
+        let mut adapted = IpAdapterSdxl::load(&IpAdapterSdxlPaths {
+            sdxl_base: env_path("IP_SDXL_BASE"),
+            ip_adapter: ip_component("IP_BUNDLE", IP_BUNDLE_REL),
+            image_encoder: image_encoder.clone(),
+            tokenizer_clip_l: WeightsSource::Dir(env_path("SDXL_TOKENIZER_CLIP_L_DIR")),
+            tokenizer_clip_bigg: WeightsSource::Dir(env_path("SDXL_TOKENIZER_CLIP_BIGG_DIR")),
+            vae_fp16_fix: WeightsSource::Dir(env_path("SDXL_VAE_FP16_FIX_DIR")),
+            adapters: vec![candle_gen::gen_core::AdapterSpec::new(
+                adapter.into(),
+                1.0,
+                candle_gen::gen_core::AdapterKind::Lora,
+            )],
+        })
+        .expect("load adapter-conditioned SDXL IP");
+        let with_adapter = adapted
+            .generate(&base, &reference, &mut noop)
+            .expect("generate (ip + LoRA)");
+        assert_eq!(
+            (with_adapter.width, with_adapter.height),
+            (out_ip.width, out_ip.height)
+        );
+        assert_ne!(
+            with_adapter.pixels, out_ip.pixels,
+            "selected SDXL IP adapter must change output"
+        );
+        write_ppm(&out_dir.join("ip_lora.ppm"), &with_adapter);
+        return;
+    }
 
     // Without IP (scale 0 → branch gated off → plain SDXL at the same seed/prompt).
     let plain_req = IpAdapterSdxlRequest {

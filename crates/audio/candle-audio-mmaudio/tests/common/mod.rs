@@ -14,7 +14,7 @@
 //! | Env var | HF repo | Components it supplies |
 //! |---------|---------|------------------------|
 //! | `MMAUDIO_MMAUDIO_SNAPSHOT` | `hkchengrex/MMAudio` | `synchformer`, `dit`, `vae`, 16k `vocoder` |
-//! | `MMAUDIO_CLIP_SNAPSHOT`    | `apple/DFN5B-CLIP-ViT-H-14-384` | `clip` |
+//! | `MMAUDIO_CLIP_SNAPSHOT`    | `apple/DFN5B-CLIP-ViT-H-14-378` | `clip` |
 //! | `MMAUDIO_BIGVGAN_V2_SNAPSHOT` | `nvidia/bigvgan_v2_44khz_128band_512x` | 44k `vocoder` |
 //!
 //! The 44k vocoder var is `MMAUDIO_BIGVGAN_V2_SNAPSHOT`, NOT `MMAUDIO_BIGVGAN_SNAPSHOT` (sc-17266).
@@ -117,7 +117,7 @@ pub fn abs_max(v: &[f32]) -> f64 {
 
 /// `hkchengrex/MMAudio` repo snapshot dir (synchformer + dit + vae + 16k vocoder).
 pub const MMAUDIO_SNAPSHOT_ENV: &str = "MMAUDIO_MMAUDIO_SNAPSHOT";
-/// `apple/DFN5B-CLIP-ViT-H-14-384` repo snapshot dir (clip).
+/// Canonical `apple/DFN5B-CLIP-ViT-H-14-378` repo snapshot dir (clip).
 pub const CLIP_SNAPSHOT_ENV: &str = "MMAUDIO_CLIP_SNAPSHOT";
 /// `nvidia/bigvgan_v2_44khz_128band_512x` repo snapshot dir (44k vocoder). Distinct from
 /// `MMAUDIO_BIGVGAN_SNAPSHOT`, which names hkchengrex/MMAudio's 16k BigVGAN (sc-17266).

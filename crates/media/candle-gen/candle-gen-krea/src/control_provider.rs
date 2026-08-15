@@ -66,8 +66,12 @@ pub struct Krea2ControlPaths {
     pub root: PathBuf,
     /// Optional INT8-ConvRot DiT single-file. When present, it replaces `root/transformer` while the
     /// tokenizer, Qwen3-VL text encoder, and Qwen-Image VAE continue to load from `root`, matching the
-    /// registered Krea provider's validated ConvRot route. ConvRot does not support adapters.
+    /// registered Krea provider's validated ConvRot route. User LoRA/LoKr residuals apply over the
+    /// frozen int8 projections before the control branch is composed.
     pub convrot_dit: Option<PathBuf>,
+    /// Optional caller-owned native-mmdit Krea DiT. This is mutually exclusive with
+    /// [`convrot_dit`](Self::convrot_dit) and composes with the same pose branch and adapter stack.
+    pub native_dit: Option<PathBuf>,
     /// The trained control-branch overlay checkpoint (`.safetensors`, e.g. `control_step5000.safetensors`).
     pub control: PathBuf,
     /// User LoRA/LoKr adapters applied **additively** to the frozen base DiT (sc-11720) — a character /
@@ -207,10 +211,13 @@ impl Krea2Control {
         paths: &Krea2ControlPaths,
         text_encoder: Option<WeightsSource>,
     ) -> Result<Self> {
-        if paths.convrot_dit.is_some() && !paths.adapters.is_empty() {
+        // NOTE: the former "INT8-ConvRot does not support LoRA/LoKr" rejection is gone on purpose —
+        // sc-18477 wired `install_additive` into the ConvRot arm of `load_control_heavy`, so the
+        // combination is now implemented rather than merely accepted. The remaining guard is the
+        // one that still holds: at most ONE replacement DiT may be selected.
+        if paths.convrot_dit.is_some() && paths.native_dit.is_some() {
             return Err(CandleError::Msg(
-                "krea control: INT8-ConvRot does not support LoRA/LoKr or diff-patch adapters"
-                    .into(),
+                "krea control: select at most one replacement DiT (ConvRot or native)".into(),
             ));
         }
         let text_root = paths.root.clone();
@@ -221,6 +228,7 @@ impl Krea2Control {
         let text_device = device.clone();
         let heavy_root = paths.root.clone();
         let heavy_convrot_dit = paths.convrot_dit.clone();
+        let heavy_native_dit = paths.native_dit.clone();
         let heavy_control = paths.control.clone();
         let heavy_adapters = paths.adapters.clone();
         let heavy_branch_tier = paths.branch_tier;
@@ -232,6 +240,7 @@ impl Krea2Control {
                 load_control_heavy(
                     &heavy_root,
                     heavy_convrot_dit.as_deref(),
+                    heavy_native_dit.as_deref(),
                     &heavy_control,
                     &heavy_adapters,
                     heavy_branch_tier,
@@ -270,6 +279,10 @@ impl Krea2Control {
                 &Krea2ControlPaths {
                     root: paths.root.clone(),
                     convrot_dit,
+                    // `validate_spec_root` above rejects a `File` base, so a native DiT can only
+                    // arrive through the runtime paths — carry the caller's selection rather than
+                    // silently dropping it to `None`.
+                    native_dit: paths.native_dit.clone(),
                     control,
                     adapters: spec.adapters.clone(),
                     branch_tier: paths.branch_tier,
@@ -358,6 +371,27 @@ fn validate_spec_root(
     }
 }
 
+/// Load strict-pose control around a caller-owned native-mmdit Krea DiT. The imported transformer,
+/// selected adapter stack, and control branch are all retained by one resident provider; every
+/// selected adapter must apply to the imported base or loading the heavy phase fails loudly.
+pub fn load_control_from_native_dit_file(
+    dit_file: impl AsRef<Path>,
+    base_snapshot_dir: impl AsRef<Path>,
+    control: impl AsRef<Path>,
+    adapters: &[AdapterSpec],
+) -> Result<Krea2Control> {
+    Krea2Control::load(&Krea2ControlPaths {
+        root: base_snapshot_dir.as_ref().to_path_buf(),
+        convrot_dit: None,
+        native_dit: Some(dit_file.as_ref().to_path_buf()),
+        control: control.as_ref().to_path_buf(),
+        adapters: adapters.to_vec(),
+        branch_tier: None,
+        chunk_attention: false,
+        offload_policy: OffloadPolicy::Resident,
+    })
+}
+
 /// Load the Qwen3-VL text phase exactly once per resident model or once per sequential generation.
 fn load_control_text(
     _root: &Path,
@@ -395,9 +429,11 @@ fn resolve_control_text_encoder_source(
 }
 
 /// Load the render phase after the text value has dropped on the sequential path.
+#[allow(clippy::too_many_arguments)]
 fn load_control_heavy(
     root: &Path,
     convrot_dit: Option<&Path>,
+    native_dit: Option<&Path>,
     control: &Path,
     adapters: &[AdapterSpec],
     branch_tier: Option<Quant>,
@@ -405,7 +441,7 @@ fn load_control_heavy(
     device: &Device,
 ) -> Result<Krea2ControlHeavy> {
     let cfg = Krea2Config::from_snapshot(root)?;
-    let mut dit = match control_dit_source(convrot_dit) {
+    let mut dit = match control_dit_source(convrot_dit, native_dit)? {
         ControlDitSource::Snapshot => {
             let mut dit_w = Weights::from_dir(&root.join("transformer"), device, DType::BF16)?;
             // Diff-patch (`.diff`/`.diff_b`) deltas fold into the dense baseline weights before the DiT
@@ -415,7 +451,11 @@ fn load_control_heavy(
             let mut dit = KreaTrainDit::load_inference(&dit_w, &cfg)?;
             drop(dit_w);
             if !adapters.is_empty() {
-                crate::adapters::install_additive(&mut dit, adapters, diff.merged)?;
+                crate::adapters::install_additive_with_diff(
+                    &mut dit,
+                    adapters,
+                    &diff.applied_by_spec,
+                )?;
             }
             dit
         }
@@ -427,7 +467,25 @@ fn load_control_heavy(
             let dit_w = Weights::from_convrot_file(convrot_dit, device, DType::BF16)?
                 .with_int8_context(int8);
             crate::convert::validate_transformer(&dit_w, &cfg)?;
-            KreaTrainDit::load_inference(&dit_w, &cfg)?
+            let mut dit = KreaTrainDit::load_inference(&dit_w, &cfg)?;
+            if !adapters.is_empty() {
+                crate::adapters::install_additive(&mut dit, adapters, 0)?;
+            }
+            dit
+        }
+        ControlDitSource::Native(native_dit) => {
+            let mut dit_w = Weights::from_native_file(native_dit, device, DType::BF16)?;
+            crate::convert::validate_native_transformer(&dit_w, &cfg)?;
+            let diff = crate::adapters::fold_diff_patch(&mut dit_w, adapters)?;
+            let mut dit = KreaTrainDit::load_inference(&dit_w, &cfg)?;
+            if !adapters.is_empty() {
+                crate::adapters::install_additive_with_diff(
+                    &mut dit,
+                    adapters,
+                    &diff.applied_by_spec,
+                )?;
+            }
+            dit
         }
     };
 
@@ -462,12 +520,20 @@ fn load_control_heavy(
 enum ControlDitSource<'a> {
     Snapshot,
     ConvRot(&'a Path),
+    Native(&'a Path),
 }
 
-fn control_dit_source(convrot_dit: Option<&Path>) -> ControlDitSource<'_> {
-    match convrot_dit {
-        Some(path) => ControlDitSource::ConvRot(path),
-        None => ControlDitSource::Snapshot,
+fn control_dit_source<'a>(
+    convrot_dit: Option<&'a Path>,
+    native_dit: Option<&'a Path>,
+) -> Result<ControlDitSource<'a>> {
+    match (convrot_dit, native_dit) {
+        (Some(_), Some(_)) => Err(CandleError::Msg(
+            "krea control: select at most one replacement DiT (ConvRot or native)".into(),
+        )),
+        (Some(path), None) => Ok(ControlDitSource::ConvRot(path)),
+        (None, Some(path)) => Ok(ControlDitSource::Native(path)),
+        (None, None) => Ok(ControlDitSource::Snapshot),
     }
 }
 
@@ -605,6 +671,7 @@ mod tests {
         let paths = Krea2ControlPaths {
             root: fixture.path().to_path_buf(),
             convrot_dit: None,
+            native_dit: None,
             control: PathBuf::from("/nonexistent/krea-control-residency-test-overlay.safetensors"),
             adapters: Vec::new(),
             branch_tier: None,
@@ -697,16 +764,48 @@ mod tests {
     fn convrot_identity_selects_the_convrot_dit_loader() {
         let path = Path::new("/models/krea2_turbo_int8_convrot.safetensors");
         assert_eq!(
-            control_dit_source(Some(path)),
+            control_dit_source(Some(path), None).unwrap(),
             ControlDitSource::ConvRot(path)
         );
-        assert_eq!(control_dit_source(None), ControlDitSource::Snapshot);
+        assert_eq!(
+            control_dit_source(None, None).unwrap(),
+            ControlDitSource::Snapshot
+        );
     }
 
-    /// ConvRot + adapters is unsupported and must reject before lazy model construction can silently
-    /// substitute the standard transformer or render without the requested adapter.
     #[test]
-    fn convrot_rejects_adapters_before_loading_weights() {
+    fn native_identity_selects_native_and_conflicts_fail_closed() {
+        let native = Path::new("/models/community-krea.safetensors");
+        let convrot = Path::new("/models/krea-convrot.safetensors");
+        assert_eq!(
+            control_dit_source(None, Some(native)).unwrap(),
+            ControlDitSource::Native(native)
+        );
+        assert!(control_dit_source(Some(convrot), Some(native)).is_err());
+
+        let model = load_control_from_native_dit_file(
+            native,
+            "/nonexistent/krea-base",
+            "/nonexistent/control.safetensors",
+            &[AdapterSpec::new(
+                "/nonexistent/user.safetensors".into(),
+                0.75,
+                candle_gen::gen_core::AdapterKind::Lora,
+            )],
+        )
+        .expect("native control construction stays lazy while retaining its complete route");
+        assert!(model
+            .residency
+            .with_resident_parts(|_, _| ())
+            .unwrap()
+            .is_none());
+    }
+
+    /// ConvRot + adapters is admitted and retained for the lazy heavy-phase loader.
+    #[test]
+    fn convrot_retains_adapters_for_lazy_heavy_load() {
+        // `validation_complete_paths` (not the old `missing_paths`): the loader now validates the
+        // selected text encoder up front, so the root must carry a real encoder fixture.
         let (_fixture, mut paths) = validation_complete_paths(OffloadPolicy::Resident);
         paths.convrot_dit = Some(PathBuf::from(
             "/nonexistent/krea2_turbo_int8_convrot.safetensors",
@@ -716,11 +815,7 @@ mod tests {
             1.0,
             candle_gen::gen_core::AdapterKind::Lora,
         ));
-        let error = Krea2Control::load(&paths)
-            .err()
-            .expect("ConvRot plus an adapter must reject")
-            .to_string();
-        assert!(error.contains("INT8-ConvRot does not support"), "{error}");
+        Krea2Control::load(&paths).expect("ConvRot plus an adapter must remain lazily loadable");
     }
 
     /// The request defaults match the Turbo control production knobs (1024², 8 CFG-free steps,
@@ -864,6 +959,7 @@ mod tests {
         let paths = Krea2ControlPaths {
             root,
             convrot_dit,
+            native_dit: None,
             control,
             adapters: Vec::new(),
             branch_tier,

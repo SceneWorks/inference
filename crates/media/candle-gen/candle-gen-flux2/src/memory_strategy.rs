@@ -39,7 +39,7 @@ pub const BASE_SINGLE_BLOCKS: u32 = 48;
 pub const BASE_TRANSFORMER_BLOCKS: u32 = BASE_DOUBLE_BLOCKS + BASE_SINGLE_BLOCKS;
 pub const CONTROL_BLOCKS: u32 = 4;
 pub const CALIBRATION_FINGERPRINT: &str =
-    "flux2-dev-cuda-staged-host-full-edge-decode-bounded-attention-device-format-blocks-v2";
+    "flux2-dev-cuda-caption-upsample-staged-host-full-edge-decode-bounded-attention-device-format-blocks-v3";
 pub const CONTROL_OVERLAY: &str = "control";
 
 /// Full output edge at the representative 1024px cell. The FLUX.2 upsampling tail contains spatial

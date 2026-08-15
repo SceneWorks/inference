@@ -627,8 +627,9 @@ impl Flux2 {
     /// before encoding (the diffusers `upsample_prompt`), gated on `req.enhance_prompt` — the
     /// LTX-2.3 prompt-enhancement contract field (sc-2845), reused here for the image-aware analog.
     /// Returns the rewritten prompt, or the original `req.prompt` when the gate is off, the variant
-    /// isn't dev, or on **any** upsampler failure / empty output (reference-faithful fallback, like
-    /// `generate_av.py`'s try/except). Logs the LTX `ENHANCED_PROMPT:` / `ENHANCER_FALLBACK:` tokens.
+    /// isn't dev, or on an ordinary upsampler failure / empty output (reference-faithful fallback,
+    /// like `generate_av.py`'s try/except). Cancellation remains typed and never falls through to
+    /// diffusion. Logs the LTX `ENHANCED_PROMPT:` / `ENHANCER_FALLBACK:` tokens.
     ///
     /// Runs in the residency seam's phase-A (with the text encoder + vision tower), so it takes them
     /// as arguments rather than reaching a resident field (sc-10840).
@@ -637,25 +638,59 @@ impl Flux2 {
         tokenizer: &TextTokenizer,
         text: &Flux2TextOwned,
         req: &GenerationRequest,
-    ) -> String {
-        if !req.enhance_prompt || !self.variant.is_dev() {
-            return req.prompt.clone();
+    ) -> Result<String> {
+        if !req.enhance_prompt {
+            req.prompt_enhancement
+                .emit(mlx_gen::gen_core::PromptEnhancementReport::absent(
+                    &req.prompt,
+                ));
+            return Ok(req.prompt.clone());
         }
-        match self.run_upsample(tokenizer, text, req) {
-            Ok(p) if !p.trim().is_empty() => {
+        if !self.variant.is_dev() {
+            req.prompt_enhancement
+                .emit(mlx_gen::gen_core::PromptEnhancementReport::fallback(
+                    &req.prompt,
+                    "unsupported_variant",
+                ));
+            return Ok(req.prompt.clone());
+        }
+        match self
+            .run_upsample(tokenizer, text, req)
+            .map(|output| classify_upsample_output(&req.prompt, output))
+        {
+            Ok(Ok(p)) => {
                 // The log record is machine-parsed on the `ENHANCED_PROMPT:` prefix; sanitize the
                 // model-generated text so an embedded newline can't split the record or forge a
                 // second prefix line (the returned `p` itself is unchanged) (L-log-injection).
                 eprintln!("ENHANCED_PROMPT:{}", sanitize_log_text(&p));
-                p
+                req.prompt_enhancement
+                    .emit(mlx_gen::gen_core::PromptEnhancementReport::enhanced(
+                        &req.prompt,
+                        &p,
+                    ));
+                Ok(p)
             }
-            Ok(_) => {
-                eprintln!("ENHANCER_FALLBACK:EmptyOutput:caption upsampler returned empty output");
-                req.prompt.clone()
+            Ok(Err(reason)) => {
+                eprintln!("ENHANCER_FALLBACK:{reason}");
+                req.prompt_enhancement
+                    .emit(mlx_gen::gen_core::PromptEnhancementReport::fallback(
+                        &req.prompt,
+                        reason,
+                    ));
+                Ok(req.prompt.clone())
             }
+            Err(Error::Canceled) => Err(Error::Canceled),
             Err(e) => {
+                if req.cancel.is_cancelled() {
+                    return Err(Error::Canceled);
+                }
                 eprintln!("ENHANCER_FALLBACK:{}", sanitize_log_text(&e.to_string()));
-                req.prompt.clone()
+                req.prompt_enhancement
+                    .emit(mlx_gen::gen_core::PromptEnhancementReport::fallback(
+                        &req.prompt,
+                        "enhancer_error",
+                    ));
+                Ok(req.prompt.clone())
             }
         }
     }
@@ -686,7 +721,9 @@ impl Flux2 {
         // Clamp the requested decode length to a hard ceiling (F-012): each step is a full ~32B forward
         // over a growing KV cache, so an unclamped `enhance_max_tokens` is an effectively unbounded job.
         let max_new_tokens = caption_upsample::clamp_max_new_tokens(req.enhance_max_tokens);
-        let seed = req.seed.unwrap_or_else(default_seed);
+        let seed = req
+            .seed
+            .expect("caption enhancement request seed must be resolved");
         caption_upsample::upsample_prompt(
             tokenizer,
             &text.text_encoder,
@@ -918,6 +955,21 @@ fn encode_cfg_negative_with<T, E>(
         .transpose()
 }
 
+/// Normalize a successful caption-upsample decode into the two honest report states. The model can
+/// legally echo its input; that is a fallback, not an enhancement.
+fn classify_upsample_output(
+    original: &str,
+    output: String,
+) -> std::result::Result<String, &'static str> {
+    if output.trim().is_empty() {
+        Err("empty_output")
+    } else if output == original {
+        Err("unchanged_output")
+    } else {
+        Ok(output)
+    }
+}
+
 impl Flux2 {
     /// The rich-`Result` body behind [`Generator::generate`]. Kept on the crate's own
     /// [`mlx_gen::Error`] so the `?` operator lifts both `mlx_rs` device exceptions and the family
@@ -928,6 +980,12 @@ impl Flux2 {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
+        // Resolve an omitted seed exactly once, then share it with both the autoregressive caption
+        // sampler and diffusion. Calling `default_seed` independently in those phases makes a
+        // request irreproducible and lets its provenance name only one of two actual seeds.
+        let mut resolved_req = req.clone();
+        resolved_req.seed = Some(req.seed.unwrap_or_else(default_seed));
+        let req = &resolved_req;
         let tokenizer = self
             .tokenizer
             .as_ref()
@@ -937,7 +995,7 @@ impl Flux2 {
         if req.cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
-        let base_seed = req.seed.unwrap_or_else(default_seed);
+        let base_seed = req.seed.expect("request seed was resolved above");
         let steps = req.steps.unwrap_or(self.variant.default_steps()) as usize;
         let guidance = req.guidance.unwrap_or(self.variant.default_guidance());
         // dev is guidance-DISTILLED: the scale is an embedded scalar fed into the transformer's
@@ -960,7 +1018,7 @@ impl Flux2 {
                 // FLUX.2-dev caption upsampling (sc-6030): optionally rewrite the prompt with the
                 // Mistral3 multimodal LLM (using any reference images) before encoding, gated on
                 // `enhance_prompt`. A no-op (returns `req.prompt`) for klein, gate off, or any failure.
-                let prompt = self.maybe_upsample(tokenizer, text, req);
+                let prompt = self.maybe_upsample(tokenizer, text, req)?;
                 if req.cancel.is_cancelled() {
                     return Err(Error::Canceled);
                 }
@@ -1660,6 +1718,22 @@ pub(crate) const KLEIN_KV_EDIT_MEMORY_BEHAVIOR: mlx_gen::gen_core::MemoryBehavio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn caption_output_classification_never_calls_an_echo_enhanced() {
+        assert_eq!(
+            classify_upsample_output("a fox", "a fox".into()),
+            Err("unchanged_output")
+        );
+        assert_eq!(
+            classify_upsample_output("a fox", " \n\t".into()),
+            Err("empty_output")
+        );
+        assert_eq!(
+            classify_upsample_output("a fox", "a detailed red fox".into()),
+            Ok("a detailed red fox".into())
+        );
+    }
     use crate::config::{
         DEFAULT_GUIDANCE_DEV, DEFAULT_STEPS_DEV, FLUX2_DEV_EDIT_ID, FLUX2_DEV_ID,
         FLUX2_KLEIN_9B_EDIT_ID, FLUX2_KLEIN_9B_ID, FLUX2_KLEIN_9B_KV_EDIT_ID,

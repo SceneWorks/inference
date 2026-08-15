@@ -18,7 +18,6 @@ use crate::quant::QLinear;
 #[cfg(test)]
 use candle_gen::gen_core::attention_budget::AttentionBudget;
 use candle_gen::gen_core::attention_budget::AttentionPlan;
-use candle_gen::quant::AdaptLinear;
 
 fn plan_from_budget(budget: usize) -> AttentionPlan<'static> {
     AttentionPlan::budgeted(candle_gen::attention::attention_budget_from_usize(budget))
@@ -318,12 +317,12 @@ impl GatedAttention {
     }
 
     /// Visit the five gated-attention projections under `{prefix}` (`to_q/to_k/to_v/to_gate/to_out.0`) —
-    /// the surface a user LoRA/LoKr adapts (sc-11105). The q/k RMS scales are not projections. An
-    /// int8-ConvRot projection is skipped (never adaptable; the ConvRot lane rejects adapters).
+    /// the surface a user LoRA/LoKr adapts (sc-11105). The q/k RMS scales are not projections. Dense,
+    /// packed, and int8-ConvRot projections all host additive residuals.
     pub fn visit_adaptable_mut(
         &mut self,
         prefix: &str,
-        f: &mut dyn FnMut(&str, &mut AdaptLinear) -> candle_gen::Result<()>,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> candle_gen::Result<()>,
     ) -> candle_gen::Result<()> {
         for (leaf, proj) in [
             ("to_q", &mut self.q),
@@ -332,7 +331,7 @@ impl GatedAttention {
             ("to_gate", &mut self.gate),
             ("to_out.0", &mut self.o),
         ] {
-            if let Some(a) = proj.as_adapt_mut() {
+            if let Some(a) = proj.as_additive_mut() {
                 f(&join(prefix, leaf), a)?;
             }
         }
@@ -403,14 +402,14 @@ impl SwiGlu {
     pub fn visit_adaptable_mut(
         &mut self,
         prefix: &str,
-        f: &mut dyn FnMut(&str, &mut AdaptLinear) -> candle_gen::Result<()>,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> candle_gen::Result<()>,
     ) -> candle_gen::Result<()> {
         for (leaf, proj) in [
             ("gate", &mut self.gate),
             ("up", &mut self.up),
             ("down", &mut self.down),
         ] {
-            if let Some(a) = proj.as_adapt_mut() {
+            if let Some(a) = proj.as_additive_mut() {
                 f(&join(prefix, leaf), a)?;
             }
         }
@@ -507,7 +506,7 @@ impl TextFusionBlock {
     pub fn visit_adaptable_mut(
         &mut self,
         prefix: &str,
-        f: &mut dyn FnMut(&str, &mut AdaptLinear) -> candle_gen::Result<()>,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> candle_gen::Result<()>,
     ) -> candle_gen::Result<()> {
         self.attn.visit_adaptable_mut(&join(prefix, "attn"), f)?;
         self.mlp.visit_adaptable_mut(&join(prefix, "ff"), f)?;
@@ -675,7 +674,7 @@ impl SingleStreamBlock {
     pub fn visit_adaptable_mut(
         &mut self,
         prefix: &str,
-        f: &mut dyn FnMut(&str, &mut AdaptLinear) -> candle_gen::Result<()>,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> candle_gen::Result<()>,
     ) -> candle_gen::Result<()> {
         self.attn.visit_adaptable_mut(&join(prefix, "attn"), f)?;
         self.mlp.visit_adaptable_mut(&join(prefix, "ff"), f)?;
@@ -825,7 +824,7 @@ impl TextFusionTransformer {
     /// stays out of the surface (matching `merge_surface_keys`).
     pub fn visit_adaptable_mut(
         &mut self,
-        f: &mut dyn FnMut(&str, &mut AdaptLinear) -> candle_gen::Result<()>,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> candle_gen::Result<()>,
     ) -> candle_gen::Result<()> {
         for (i, blk) in self.layerwise.iter_mut().enumerate() {
             blk.visit_adaptable_mut(&format!("text_fusion.layerwise_blocks.{i}"), f)?;

@@ -46,7 +46,6 @@ use candle_gen::{CandleError, Result as CResult};
 
 use candle_gen_wan::config::{
     TextEncoderConfig, TransformerConfig, DEFAULT_FRAMES_14B, NUM_TRAIN_TIMESTEPS,
-    VAE16_STRIDE_SPATIAL, VAE16_STRIDE_TEMPORAL,
 };
 use candle_gen_wan::pipeline::{create_noise, frames_to_images};
 use candle_gen_wan::rope::assign_source_ids;
@@ -68,6 +67,7 @@ use crate::forward::{
     num_vit_momentum_buffers, vit_one_step, PackedForward, VitGuidanceParams, VitMode, VitStreams,
 };
 use crate::guidance::MomentumBuffer;
+use crate::latent_dims;
 use crate::mar::{mar_schedule, post_process_input_embeds, sample_vit_embed, StreamState, VitCfg};
 use crate::preprocess::{encode_image, encode_videoclip};
 use crate::process::{
@@ -568,8 +568,8 @@ pub fn descriptor() -> ModelDescriptor {
                 ConditioningKind::MultiReference,
                 ConditioningKind::VideoClip,
             ],
-            supports_lora: false,
-            supports_lokr: false,
+            supports_lora: true,
+            supports_lokr: true,
             samplers: vec!["uni_pc", "unipc"],
             schedulers: Vec::new(),
             supported_guidance_methods: vec![],
@@ -582,7 +582,9 @@ pub fn descriptor() -> ModelDescriptor {
             supports_kv_cache: false,
             requires_sigma_shift: false,
             supports_sequential_offload: false,
+            unconditionally_engages_staged_residency: false,
             supports_preview: false,
+            supports_prompt_enhancement: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
@@ -607,6 +609,7 @@ pub struct Bernini {
     knobs: BerniniKnobs,
     root: PathBuf,
     device: Device,
+    adapters: Vec<candle_gen::gen_core::AdapterSpec>,
     components: Mutex<Option<Arc<RendererComponents>>>,
 }
 
@@ -620,6 +623,7 @@ impl Bernini {
                 &self.root,
                 &self.device,
                 MODEL_ID,
+                &self.adapters,
             )?))
         })
     }
@@ -652,6 +656,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         knobs,
         root,
         device,
+        adapters: spec.adapters.clone(),
         components: Mutex::new(None),
     }))
 }
@@ -942,9 +947,7 @@ impl Bernini {
         let pe_wotxt_wovit = concat_with_zero_init(&t5_neg, &s_wotxt_wovit, max_seq)?;
 
         // --- Stage 3: load both experts, ViT-conditioned APG denoise ---
-        let t_lat = ((frames as u32 - 1) / VAE16_STRIDE_TEMPORAL + 1) as usize;
-        let h_lat = (height / VAE16_STRIDE_SPATIAL) as usize;
-        let w_lat = (width / VAE16_STRIDE_SPATIAL) as usize;
+        let (t_lat, h_lat, w_lat) = latent_dims(frames as u32, width, height);
         let init_noise = create_noise(seed, Z_DIM, t_lat, h_lat, w_lat, dev)?;
 
         // Source ids (videos first, then images — mirrors the packing order).
@@ -1268,6 +1271,16 @@ mod tests {
         assert_eq!(g.descriptor().backend, "candle");
         assert_eq!(g.descriptor().modality, Modality::Video);
         assert!(!g.descriptor().capabilities.mac_only);
+        assert!(!g.descriptor().capabilities.supports_sequential_offload);
+        assert!(
+            !g.descriptor()
+                .capabilities
+                .unconditionally_engages_staged_residency
+        );
+        assert_eq!(
+            g.descriptor().capabilities.staged_residency_availability(),
+            candle_gen::gen_core::StagedResidencyAvailability::Absent,
+        );
     }
 
     /// sc-11061 layout contract (loader side): the exact on-disk paths [`BerniniPlanner::load`] reads

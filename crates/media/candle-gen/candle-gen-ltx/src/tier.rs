@@ -27,7 +27,8 @@
 //!                                       crate-native spelling (`to_out.0`, `ff.net.0.proj`, `ff.net.2`)
 //!   vae_decoder.safetensors    DENSE  — `up_blocks.*` / `conv_in` / `conv_out` / `per_channel_statistics`,
 //!                                       conv weights CHANNELS-LAST `[O,kt,kh,kw,I]`, stats `mean`/`std`
-//!   vae_encoder audio_vae vocoder upsampler   DENSE  (not needed for the T2V DiT render)
+//!   vae_encoder audio_vae vocoder upsampler   DENSE  (encoder loaded for conditioning; the remaining
+//!                                                    components are outside the current tier decode)
 //! <snapshot>/gemma/            DENSE  — standard `language_model.model.*` 5-shard set + tokenizer.json
 //! ```
 //!

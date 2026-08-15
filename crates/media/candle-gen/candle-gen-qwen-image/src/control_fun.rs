@@ -24,7 +24,9 @@ use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::runtime::CancelFlag;
-use candle_gen::gen_core::{Image, PreviewSink, Progress, ValidatedEncoderSource, WeightsSource};
+use candle_gen::gen_core::{
+    AdapterSpec, Image, PreviewSink, Progress, ValidatedEncoderSource, WeightsSource,
+};
 use candle_gen::{CandleError, Result};
 
 use crate::config::{TextEncoderConfig, TransformerConfig, NEGATIVE_FALLBACK};
@@ -62,6 +64,8 @@ pub struct QwenFunControlPaths {
     /// The alibaba-pai `Qwen-Image-2512-Fun-Controlnet-Union` checkpoint — a single `.safetensors`
     /// file or a dir of shards.
     pub controlnet: PathBuf,
+    /// User LoRA/LoKr stack applied to the base MMDiT before the VACE control branch.
+    pub adapters: Vec<AdapterSpec>,
 }
 
 /// One Qwen-Image 2512-Fun (pose/canny/depth) generation request. The control **kind** is implicit in
@@ -174,11 +178,14 @@ impl QwenFunControl {
         // The base 2512 MMDiT packed-detects (a packed MLX base tier loads straight from the packed
         // parts; a dense base snapshot unchanged) at the `group_size` read from `transformer/config.json`.
         let gs = crate::transformer_group_size(&root.join("transformer"));
-        let transformer = QwenTransformer::new_gs(
+        let mut transformer = QwenTransformer::new_gs(
             &dit_cfg,
             control_common::component_vb(&root, "transformer", DIT_DTYPE, &device, LABEL)?,
             gs,
         )?;
+        if !paths.adapters.is_empty() {
+            let _ = crate::adapters::install_additive(&mut transformer, &paths.adapters)?;
+        }
         let vae = QwenVae::new(control_common::component_vb(
             &root, "vae", ENC_DTYPE, &device, LABEL,
         )?)?;
@@ -237,6 +244,7 @@ impl QwenFunControl {
                 qwen_base: paths.qwen_base.clone(),
                 text_encoder: spec.text_encoder.clone(),
                 controlnet,
+                adapters: spec.adapters.clone(),
             })
         })
     }
@@ -495,6 +503,7 @@ mod tests {
                     qwen_base: base,
                     text_encoder: None,
                     controlnet: control,
+                    adapters: Vec::new(),
                 },
                 &spec,
             )

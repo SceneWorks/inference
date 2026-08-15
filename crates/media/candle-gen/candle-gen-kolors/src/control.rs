@@ -30,14 +30,14 @@ use std::path::{Path, PathBuf};
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::{self as nn, Linear, Module, VarBuilder};
 use candle_gen::gen_core::runtime::CancelFlag;
-use candle_gen::gen_core::{Image, PidWeights, PreviewSink, Progress};
+use candle_gen::gen_core::{AdapterSpec, Image, PidWeights, PreviewSink, Progress};
 use candle_gen::{CandleError, Result};
 use candle_gen_pid::{PidDecoder, PidEngine};
 use candle_transformers::models::stable_diffusion::vae::AutoEncoderKL;
 
 use candle_gen_sdxl::{
-    denoise_curated, preprocess_control_image, sdxl_unet_config, ControlContext, ControlNet,
-    ControlNetConfig, UNet2DConditionModel,
+    denoise_curated, load_vendored_unet_with_adapters, preprocess_control_image, ControlContext,
+    ControlNet, ControlNetConfig, UNet2DConditionModel,
 };
 
 use crate::chatglm3::ChatGlmModel;
@@ -75,6 +75,8 @@ pub struct KolorsControlPaths {
     /// The `Kwai-Kolors/Kolors-ControlNet-Pose` checkpoint — a single `.safetensors` file or a dir
     /// (`diffusion_pytorch_model.safetensors`).
     pub controlnet: PathBuf,
+    /// User LoRA/LoKr stack applied to the base Kolors UNet before ControlNet residuals.
+    pub adapters: Vec<AdapterSpec>,
 }
 
 /// One Kolors ControlNet (strict-pose) generation request.
@@ -200,8 +202,14 @@ impl KolorsControl {
         // `encoder_hid_proj` (all in the same checkpoint). NOTE: no `install_ip_adapter` — `forward_instantid`
         // then runs as a plain SDXL UNet (its decoupled-attn branch is `None`-guarded) + control residuals.
         let vs = f32_vb(&base.join("unet"), &device)?;
-        let unet = UNet2DConditionModel::new(vs.clone(), 4, 4, false, sdxl_unet_config())?
-            .with_add_embedding(vs.clone(), ADDITION_TIME_EMBED_DIM, PROJECTION_INPUT_DIM)?;
+        let unet = load_vendored_unet_with_adapters(
+            base,
+            &device,
+            DTYPE,
+            &paths.adapters,
+            ADDITION_TIME_EMBED_DIM,
+            PROJECTION_INPUT_DIM,
+        )?;
         let encoder_hid_proj =
             nn::linear(CONTEXT_DIM, CROSS_ATTENTION_DIM, vs.pp("encoder_hid_proj"))?;
 

@@ -185,8 +185,9 @@ pub const PROVIDER_COMPONENTS: &[ProviderComponents] = &[
     },
     // --- flux2 (FLUX.2) ---------------------------------------------------------------------
     // Candle registers two of MLX's six; edit and control are bespoke and unregistered. The
-    // 32-channel VAE ships inside each FLUX.2 snapshot and rides its row; the Qwen3 and Mistral3
-    // towers are pinned holes.
+    // 32-channel VAE ships inside each FLUX.2 snapshot and rides its row. The Qwen3 tower is a
+    // pinned hole; dev's native enhancement route additionally loads the Mistral3 language tower,
+    // Pixtral vision tower, and multimodal projector, all explicitly pinned as unresolved holes.
     ProviderComponents {
         provider_id: "flux2_dev",
         components: &["flux2_dev"],
@@ -376,8 +377,8 @@ pub const PROVIDER_COMPONENTS: &[ProviderComponents] = &[
         components: &["stable_video_diffusion_img2vid_xt"],
     },
     // --- wan --------------------------------------------------------------------------------
-    // Candle registers four generators and one trainer; `wan2_2_vace_fun_14b` is MLX-only. The
-    // GGUF re-host is a Candle-only provisioning of the 5B DiT and is listed because a run may
+    // Candle registers five generators and one trainer. The GGUF re-host is a Candle-only
+    // provisioning of the 5B DiT and is listed because a run may
     // load it in place of the safetensors tree. `wan_vace` is 14B-only on Candle (no 1.3B preset
     // exists in `candle-gen-wan/src/config.rs`) and its repository ships the transformer alone, so
     // it also rides the stock Wan UMT5 and the z16 VAE `candle-gen-wan/src/vae16.rs` ports from
@@ -393,6 +394,10 @@ pub const PROVIDER_COMPONENTS: &[ProviderComponents] = &[
     ProviderComponents {
         provider_id: "wan2_2_ti2v_5b",
         components: &["wan2_2_ti2v_5b", "wan2_2_ti2v_5b_gguf", "umt5_xxl"],
+    },
+    ProviderComponents {
+        provider_id: "wan2_2_vace_fun_14b",
+        components: &["wan2_2_vace_fun_a14b", "wan2_2_t2v_a14b", "umt5_xxl"],
     },
     ProviderComponents {
         provider_id: "wan_vace",
@@ -630,7 +635,14 @@ mod tests {
             ),
             ("flux1_dev", &["clip_vit_large_patch14"]),
             ("flux1_schnell", &["clip_vit_large_patch14"]),
-            ("flux2_dev", &["flux2_dev_mistral3_tower"]),
+            (
+                "flux2_dev",
+                &[
+                    "flux2_dev_mistral3_tower",
+                    "flux2_dev_pixtral_vision_tower",
+                    "flux2_dev_multimodal_projector",
+                ],
+            ),
             ("flux2_klein_9b", &["flux2_klein_qwen3_text_encoder"]),
             ("ideogram_4", &["ideogram_qwen3_vl_8b"]),
             ("ideogram_4_turbo", &["ideogram_qwen3_vl_8b"]),
@@ -718,6 +730,7 @@ mod tests {
                 "wan2_2_i2v_14b",
                 "wan2_2_t2v_14b",
                 "wan2_2_ti2v_5b",
+                "wan2_2_vace_fun_14b",
                 "wan_vace",
             ]
         );
@@ -767,7 +780,6 @@ mod tests {
         let pinned_elsewhere: BTreeSet<&str> = BTreeSet::from([
             // MLX-registered generator ids with no Candle sibling.
             "flux2_klein_9b_kv",
-            "wan2_2_vace_fun_a14b",
             "z_image_fun_controlnet_union_2_1",
             "z_image_turbo_fun_controlnet_union_2_1",
             "qwen_image_2512",
