@@ -25,6 +25,10 @@ use mlx_rs::{Array, Dtype};
 use mlx_gen::weights::Weights;
 use mlx_gen_sana::{SanaTransformer, SanaTransformerConfig};
 
+mod common;
+
+use common::{tiny_config, tiny_sprint_config};
+
 fn f32(x: &Array) -> Array {
     x.as_dtype(Dtype::Float32).unwrap()
 }
@@ -50,30 +54,6 @@ fn weights_with_w_prefix(golden: &Weights) -> Weights {
         }
     }
     w
-}
-
-/// Tiny config matching `dump_sana_transformer_golden.py`'s tiny instance.
-fn tiny_config() -> SanaTransformerConfig {
-    SanaTransformerConfig {
-        in_channels: 4,
-        out_channels: 4,
-        num_attention_heads: 2,
-        attention_head_dim: 8, // inner = 16
-        num_layers: 2,
-        num_cross_attention_heads: 2,
-        cross_attention_head_dim: 8,
-        caption_channels: 24,
-        mlp_ratio: 2.5,
-        patch_size: 1,
-        norm_eps: 1e-6,
-        caption_norm_eps: 1e-5,
-        attn_qk_norm_eps: 1e-5,
-        attn_eps: 1e-15,
-        // Base SANA tiny config — guidance embedder + qk-norm OFF (these are the Sprint deltas).
-        guidance_embeds: false,
-        guidance_embeds_scale: 0.1,
-        qk_norm: false,
-    }
 }
 
 #[test]
@@ -106,17 +86,6 @@ fn trunk_matches_diffusers_tiny() {
         "mean_rel {mean} too high — that IS a port bug, not rounding"
     );
     assert!(peak < 5e-2, "peak_rel {peak} above the precision ceiling");
-}
-
-/// Tiny SANA-**Sprint** config matching `dump_sana_sprint_golden.py`'s tiny instance (guidance
-/// embedder + qk-norm ON, cross_attention_dim = inner = 16).
-fn tiny_sprint_config() -> SanaTransformerConfig {
-    SanaTransformerConfig {
-        guidance_embeds: true,
-        guidance_embeds_scale: 0.1,
-        qk_norm: true,
-        ..tiny_config()
-    }
 }
 
 /// SANA-Sprint **guidance-embed trunk** parity vs diffusers `SanaTransformer2DModel(guidance_embeds=
