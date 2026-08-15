@@ -386,7 +386,11 @@ pub struct KreaGenerator {
 struct KreaMemoryScope {
     device: Device,
     memory: Option<gen_core::GenerationMemory>,
-    requires_reference: bool,
+    provider_id: String,
+    mode: gen_core::MemoryMode,
+    reference_count: u32,
+    use_pid: bool,
+    has_phases: bool,
     finished: bool,
 }
 
@@ -415,15 +419,42 @@ impl KreaMemoryScope {
 impl gen_core::MemoryRequestScope for KreaMemoryScope {
     fn configure_request(&mut self, request: &mut GenerationRequest) -> gen_core::Result<()> {
         self.ensure_active()?;
-        let has_reference = img2img_reference(request).is_some();
-        if has_reference != self.requires_reference
-            || request.phases.is_some()
-            || request.use_pid
-            || (!self.requires_reference && !request.conditioning.is_empty())
+        let reference_count =
+            request.conditioning.iter().try_fold(0_u32, |count, item| {
+                let additional =
+                    match item {
+                        Conditioning::Reference { .. } => 1,
+                        Conditioning::MultiReference { images } => u32::try_from(images.len())
+                            .map_err(|_| {
+                                gen_core::Error::Unsupported(
+                                    "krea: reference count exceeds the typed memory-route domain"
+                                        .to_owned(),
+                                )
+                            })?,
+                        _ => return Err(gen_core::Error::Unsupported(
+                            "krea: request conditioning does not match the admitted memory route"
+                                .to_owned(),
+                        )),
+                    };
+                count.checked_add(additional).ok_or_else(|| {
+                    gen_core::Error::Unsupported(
+                        "krea: reference count exceeds the typed memory-route domain".to_owned(),
+                    )
+                })
+            })?;
+        if reference_count != self.reference_count
+            || request.phases.is_some() != self.has_phases
+            || request.use_pid != self.use_pid
         {
             return Err(gen_core::Error::Unsupported(
-                "krea: request conditioning does not match the admitted base/control memory route"
-                    .to_owned(),
+                format!(
+                    "{}: request mode/reference/PiD/phase shape does not match the admitted {} r{} pid={} phases={} memory route",
+                    self.provider_id,
+                    self.mode.as_key(),
+                    self.reference_count,
+                    self.use_pid,
+                    self.has_phases,
+                ),
             ));
         }
         // The shared selection is authoritative and request-scoped. Overwrite any state left on a
@@ -447,6 +478,15 @@ impl gen_core::MemoryRequestScope for KreaMemoryScope {
         _geometry: gen_core::MemoryGeometry,
     ) -> gen_core::Result<()> {
         self.ensure_active()?;
+        if matches!(
+            self.provider_id.as_str(),
+            KREA_2_RAW_ID | KREA_2_EDIT_ID | KREA_2_TURBO_EDIT_ID
+        ) {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: bounded decode is not implemented",
+                self.provider_id
+            )));
+        }
         if SUPPORTED_DECODE_TILE_EDGES.contains(&tile_edge)
             && SUPPORTED_DECODE_OVERLAPS.contains(&overlap)
         {
@@ -460,6 +500,15 @@ impl gen_core::MemoryRequestScope for KreaMemoryScope {
 
     fn configure_attention(&mut self, chunk_size: u32) -> gen_core::Result<()> {
         self.ensure_active()?;
+        if matches!(
+            self.provider_id.as_str(),
+            KREA_2_RAW_ID | KREA_2_EDIT_ID | KREA_2_TURBO_EDIT_ID
+        ) {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: bounded attention is not implemented",
+                self.provider_id
+            )));
+        }
         if SUPPORTED_ATTENTION_CHUNK_SIZES.contains(&chunk_size) {
             Ok(())
         } else {
@@ -476,6 +525,15 @@ impl gen_core::MemoryRequestScope for KreaMemoryScope {
         block_count: u32,
     ) -> gen_core::Result<()> {
         self.ensure_active()?;
+        if matches!(
+            self.provider_id.as_str(),
+            KREA_2_RAW_ID | KREA_2_EDIT_ID | KREA_2_TURBO_EDIT_ID
+        ) {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: bounded transformer residency is not implemented",
+                self.provider_id
+            )));
+        }
         if SUPPORTED_TRANSFORMER_WINDOWS.contains(&block_count) {
             Ok(())
         } else {
@@ -585,6 +643,61 @@ fn validate_memory_parameters(
     Ok(())
 }
 
+fn validate_krea_memory_route(
+    provider_id: &str,
+    context: &gen_core::MemoryRunContext,
+) -> gen_core::Result<()> {
+    let references = context.geometry.reference_count;
+    let plain_overlay = context.overlay.is_none();
+    let supported = match provider_id {
+        KREA_2_TURBO_ID => {
+            context.mode == gen_core::MemoryMode::TextToImage
+                && references == 0
+                && !context.use_pid
+                && !context.has_phases
+                && plain_overlay
+        }
+        KREA_2_RAW_ID => {
+            plain_overlay
+                && ((!context.has_phases
+                    && matches!(
+                        (&context.mode, references),
+                        (gen_core::MemoryMode::TextToImage, 0)
+                            | (gen_core::MemoryMode::ImageToImage, 1)
+                    ))
+                    || (context.has_phases
+                        && context.mode == gen_core::MemoryMode::TextToImage
+                        && references == 0
+                        && !context.use_pid))
+        }
+        KREA_2_EDIT_ID | KREA_2_TURBO_EDIT_ID => {
+            context.mode == gen_core::MemoryMode::Edit
+                && matches!(references, 1 | 2)
+                && !context.has_phases
+                && plain_overlay
+        }
+        "krea_2_turbo_control" => {
+            context.mode == gen_core::MemoryMode::ImageToImage
+                && references == 1
+                && !context.use_pid
+                && !context.has_phases
+                && context.overlay.as_deref() == Some("pose-control")
+        }
+        _ => false,
+    };
+    if supported {
+        Ok(())
+    } else {
+        Err(gen_core::Error::Unsupported(format!(
+            "{provider_id}: memory route does not support mode={} references={references} pid={} phases={} overlay={:?}",
+            context.mode.as_key(),
+            context.use_pid,
+            context.has_phases,
+            context.overlay,
+        )))
+    }
+}
+
 impl Generator for KreaGenerator {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
@@ -617,20 +730,6 @@ impl Generator for KreaGenerator {
     ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
         #[cfg(feature = "cuda")]
         {
-            if self.descriptor.id != KREA_2_TURBO_ID {
-                return Ok(None);
-            }
-            if context.mode != gen_core::MemoryMode::TextToImage
-                || context.has_reference
-                || context.use_pid
-                || context.has_phases
-            {
-                return Err(gen_core::Error::Unsupported(
-                    "krea_2_turbo: optimized memory strategies cover ordinary text-to-image \
-                     only (no reference, PiD, or multi-phase request)"
-                        .to_owned(),
-                ));
-            }
             if let gen_core::MemorySafetyDecision::Reject { reason } =
                 self.memory_strategy_safety_check(context)
             {
@@ -642,7 +741,11 @@ impl Generator for KreaGenerator {
                     .memory_contract
                     .as_ref()
                     .and_then(|contract| contract.generation_memory(&context.selection)),
-                requires_reference: false,
+                provider_id: self.descriptor.id.to_owned(),
+                mode: context.mode.clone(),
+                reference_count: context.geometry.reference_count,
+                use_pid: context.use_pid,
+                has_phases: context.has_phases,
                 finished: false,
             })))
         }
@@ -1300,10 +1403,9 @@ fn validate_load_spec(spec: &LoadSpec, id: &str) -> gen_core::Result<ValidatedKr
         id,
     )?;
     let (root, native_dit) = resolved_base_and_native(spec, id)?;
-    if native_dit.is_some() && spec.identity.is_some() {
+    if spec.identity.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
-            "candle {}: imported single-file weights do not accept identity fields",
-            id
+            "candle {id}: Krea providers do not accept identity fields"
         )));
     }
     // sc-9300 seam: select the community **INT8-ConvRot** DiT consume path when the spec carries a
@@ -1427,10 +1529,12 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
     let (root, native_dit, convrot_dit, loaded_quant, text_encoder_source) =
         validate_load_spec(spec, descriptor.id)?;
     #[cfg(any(feature = "cuda", test))]
-    let memory_contract = if descriptor.id == KREA_2_TURBO_ID {
-        Some(validated_krea_turbo_memory_strategy_contract(spec)?)
-    } else {
-        None
+    let memory_contract = match descriptor.id {
+        KREA_2_TURBO_ID => Some(validated_krea_turbo_memory_strategy_contract(spec)?),
+        KREA_2_RAW_ID | KREA_2_EDIT_ID | KREA_2_TURBO_EDIT_ID => Some(
+            validated_krea_request_scoped_memory_strategy_contract(descriptor.id, spec)?,
+        ),
+        _ => None,
     };
     let device = candle_gen::default_device()?;
     let resident_root = root.clone();
@@ -1830,6 +1934,133 @@ fn weights_free_krea_turbo_memory_strategy_contract(
     Ok(build_krea_turbo_memory_strategy_contract(spec))
 }
 
+const REQUEST_SCOPED_MEMORY_FINGERPRINT: &str = "krea-candle-request-scoped-staged-residency-v1";
+
+fn is_request_scoped_memory_provider(provider_id: &str) -> bool {
+    matches!(
+        provider_id,
+        KREA_2_RAW_ID | KREA_2_EDIT_ID | KREA_2_TURBO_EDIT_ID
+    )
+}
+
+/// Source-derived contract shared by the Raw and both Edit execution paths.
+///
+/// These generators all execute request-scoped component staging, but deliberately reject Turbo's
+/// decode tiling, attention chunking, and block-window controls. The fingerprint identifies this
+/// structural execution seam; it is not a performance, capacity, or real-weight claim.
+fn build_krea_request_scoped_memory_strategy_contract(
+    provider_id: &str,
+    spec: &LoadSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    use gen_core::{
+        MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind,
+        MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryPhase, MemoryProviderContract,
+        MemoryStrategy, MemoryStrategySupport, MemoryWindowMaterialization,
+    };
+
+    if !is_request_scoped_memory_provider(provider_id) {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{provider_id}: no Krea request-scoped structural memory contract is registered"
+        )));
+    }
+    let mut contract = MemoryProviderContract::compatibility_default(
+        provider_id,
+        MemoryBackendRealization::CandleCuda {
+            device_residency: true,
+            host_backed_weights: true,
+            host_to_device_block_materialization: false,
+            block_materialization: MemoryWindowMaterialization::DeviceFormatTransfer,
+        },
+    );
+    contract.load_shape = spec.load_shape;
+    contract.lifecycle = MemoryLifecycleCapabilities {
+        phases: vec![
+            MemoryPhase::Conditioning,
+            MemoryPhase::Denoise,
+            MemoryPhase::Decode,
+        ],
+        synchronized_phase_release: true,
+        decode_tiling: false,
+        attention_chunking: false,
+        transformer_window_materialization: false,
+    };
+    contract.formula = MemoryFormulaKind::PhaseEnvelope {
+        phases: contract.lifecycle.phases.clone(),
+        variables: vec![
+            MemoryFormulaVariable::AssetBytes,
+            MemoryFormulaVariable::PixelCount,
+            MemoryFormulaVariable::BatchCount,
+            MemoryFormulaVariable::ConditioningTokenCount,
+        ],
+    };
+    contract.calibration = Some(MemoryCalibrationIdentity::new(
+        REQUEST_SCOPED_MEMORY_FINGERPRINT,
+        spec.load_shape,
+    ));
+    contract
+        .strategies
+        .iter_mut()
+        .find(|capability| capability.strategy == MemoryStrategy::StagedResidency)
+        .expect("compatibility contract contains every strategy")
+        .support = MemoryStrategySupport::Implemented;
+    Ok(contract)
+}
+
+fn validated_krea_request_scoped_memory_strategy_contract(
+    provider_id: &str,
+    spec: &LoadSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    validate_load_spec(spec, provider_id)?;
+    build_krea_request_scoped_memory_strategy_contract(provider_id, spec)
+}
+
+fn surface_selector_matches_request_scoped_spec(
+    surface: &gen_core::MemoryContractSurfaceSpec,
+) -> gen_core::Result<()> {
+    let tier_matches = match surface.resolved_artifact_tier() {
+        gen_core::MemoryContractSurfaceTier::Bf16 => {
+            surface.spec.precision == gen_core::Precision::Bf16 && surface.spec.quantize.is_none()
+        }
+        gen_core::MemoryContractSurfaceTier::Q4 => surface.spec.quantize == Some(Quant::Q4),
+        gen_core::MemoryContractSurfaceTier::Q8 => surface.spec.quantize == Some(Quant::Q8),
+        gen_core::MemoryContractSurfaceTier::Nvfp4 => false,
+    };
+    let exact_base_axes = surface.spec.resolved_route.is_none()
+        && surface.spec.decode_geometry_policies.is_empty()
+        && !surface.spec.decode_geometry_policy_authoritative
+        && surface.spec.decode_quality_runtime_identity.is_none()
+        && surface.spec.precision == gen_core::Precision::Bf16
+        && matches!(surface.spec.weights, WeightsSource::Dir(_))
+        && surface.selector.offload_policy == surface.spec.offload_policy
+        && surface.selector.load_shape == surface.spec.load_shape
+        && surface.spec.control.is_none()
+        && surface.spec.extra_controls.is_empty()
+        && surface.spec.ip_adapter.is_none()
+        && surface.spec.identity.is_none()
+        && surface.spec.text_encoder.is_none()
+        && surface.spec.components.is_empty();
+    if tier_matches && exact_base_axes {
+        Ok(())
+    } else {
+        Err(gen_core::Error::Msg(format!(
+            "Krea request-scoped memory surface selector '{}' does not match its weights-free LoadSpec",
+            surface.selector.id()
+        )))
+    }
+}
+
+fn weights_free_krea_request_scoped_surface_contract(
+    provider_id: &str,
+    surface: &gen_core::MemoryContractSurfaceSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    surface_selector_matches_request_scoped_spec(surface)?;
+    let mut production_spec = surface.spec.clone();
+    // Q4/Q8 are already-packed artifact tiers. The generic fixture uses this field only to make its
+    // selector self-checking; the real Krea directory loader resolves the packed marker itself.
+    production_spec.quantize = None;
+    build_krea_request_scoped_memory_strategy_contract(provider_id, &production_spec)
+}
+
 #[cfg(test)]
 fn krea_turbo_memory_strategy_contract() -> &'static gen_core::MemoryProviderContract {
     static CONTRACT: std::sync::OnceLock<gen_core::MemoryProviderContract> =
@@ -1911,28 +2142,86 @@ fn registered_krea_valid_fixture(
     if !strategy.is_optimized() {
         return Ok(Vec::new());
     }
-    let is_control = contract.provider_id.ends_with("_control");
-    let context = gen_core::standard_memory_behavior_context(
-        contract,
-        strategy,
-        gen_core::MemoryNumericTier {
-            precision: gen_core::Precision::Bf16,
-            quant: actual_quant_tier(spec, &contract.provider_id)?,
-            component_precision_floors: &[],
-        },
-        gen_core::MemoryBehaviorRoute {
-            mode: if is_control {
-                gen_core::MemoryMode::ImageToImage
-            } else {
-                gen_core::MemoryMode::TextToImage
+    let tier = gen_core::MemoryNumericTier {
+        precision: gen_core::Precision::Bf16,
+        quant: actual_quant_tier(spec, &contract.provider_id)?,
+        component_precision_floors: &[],
+    };
+    let routes: Vec<gen_core::MemoryBehaviorRoute> = match contract.provider_id.as_str() {
+        KREA_2_RAW_ID => vec![
+            (gen_core::MemoryMode::TextToImage, 0, false, false),
+            (gen_core::MemoryMode::TextToImage, 0, true, false),
+            (gen_core::MemoryMode::ImageToImage, 1, false, false),
+            (gen_core::MemoryMode::ImageToImage, 1, true, false),
+            (gen_core::MemoryMode::TextToImage, 0, false, true),
+        ]
+        .into_iter()
+        .map(
+            |(mode, reference_count, use_pid, has_phases)| gen_core::MemoryBehaviorRoute {
+                mode,
+                reference_count,
+                use_pid,
+                has_phases,
+                overlay: None,
             },
-            reference_count: u32::from(is_control),
+        )
+        .collect(),
+        KREA_2_EDIT_ID | KREA_2_TURBO_EDIT_ID => [1, 2]
+            .into_iter()
+            .flat_map(|reference_count| {
+                [false, true].map(move |use_pid| gen_core::MemoryBehaviorRoute {
+                    mode: gen_core::MemoryMode::Edit,
+                    reference_count,
+                    use_pid,
+                    has_phases: false,
+                    overlay: None,
+                })
+            })
+            .collect(),
+        "krea_2_turbo_control" => vec![gen_core::MemoryBehaviorRoute {
+            mode: gen_core::MemoryMode::ImageToImage,
+            reference_count: 1,
             use_pid: false,
             has_phases: false,
-            overlay: is_control.then(|| "pose-control".to_owned()),
-        },
-    )?;
-    Ok(vec![gen_core::MemoryBehaviorFixture::new(context)])
+            overlay: Some("pose-control".to_owned()),
+        }],
+        KREA_2_TURBO_ID => vec![gen_core::MemoryBehaviorRoute {
+            mode: gen_core::MemoryMode::TextToImage,
+            reference_count: 0,
+            use_pid: false,
+            has_phases: false,
+            overlay: None,
+        }],
+        provider_id => {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{provider_id}: no Krea memory behavior route is registered"
+            )))
+        }
+    };
+    routes
+        .into_iter()
+        .map(|route| {
+            let has_phases = route.has_phases;
+            let edit = route.mode == gen_core::MemoryMode::Edit;
+            let context =
+                gen_core::standard_memory_behavior_context(contract, strategy, tier, route)?;
+            let mut fixture = gen_core::MemoryBehaviorFixture::new(context);
+            if edit {
+                for conditioning in &mut fixture.request.conditioning {
+                    if let Conditioning::Reference { strength, .. } = conditioning {
+                        *strength = None;
+                    }
+                }
+            }
+            if has_phases {
+                fixture.request.phases = Some(vec![gen_core::GenerationPhase {
+                    steps: 1,
+                    ..Default::default()
+                }]);
+            }
+            Ok(fixture)
+        })
+        .collect()
 }
 
 #[cfg(any(feature = "cuda", test))]
@@ -1949,7 +2238,11 @@ fn registered_krea_begin_request(
     Ok(Some(Box::new(KreaMemoryScope {
         device: Device::Cpu,
         memory: contract.generation_memory(&context.selection),
-        requires_reference: contract.provider_id.ends_with("_control"),
+        provider_id: contract.provider_id.clone(),
+        mode: context.mode.clone(),
+        reference_count: context.geometry.reference_count,
+        use_pid: context.use_pid,
+        has_phases: context.has_phases,
         finished: false,
     })))
 }
@@ -1957,6 +2250,215 @@ fn registered_krea_begin_request(
 #[cfg(test)]
 mod weights_free_behavior_tests {
     use super::*;
+
+    fn surface_copy(
+        surface: &gen_core::MemoryContractSurfaceSpec,
+    ) -> gen_core::MemoryContractSurfaceSpec {
+        gen_core::MemoryContractSurfaceSpec {
+            selector: surface.selector,
+            spec: surface.spec.clone(),
+        }
+    }
+
+    #[test]
+    fn raw_and_edit_catalog_surfaces_are_exact_and_only_publish_request_scoped_staging() {
+        let registry = register_memory_contract_surfaces(register_providers(
+            gen_core::ProviderRegistryBuilder::new(),
+        ))
+        .build()
+        .unwrap();
+        assert_eq!(registry.memory_strategy_registrations().len(), 5);
+        let surfaces = registry.memory_contract_surfaces().unwrap();
+        assert_eq!(surfaces.len(), 2 * 16 + 3 * 12);
+        for provider_id in [KREA_2_RAW_ID, KREA_2_EDIT_ID, KREA_2_TURBO_EDIT_ID] {
+            let provider_surfaces: Vec<_> = surfaces
+                .iter()
+                .filter(|surface| surface.contract.provider_id == provider_id)
+                .collect();
+            assert_eq!(provider_surfaces.len(), 12, "{provider_id}");
+            for surface in provider_surfaces {
+                assert!(!surface.composed, "{provider_id}");
+                assert_eq!(
+                    surface.contract.asset_facts,
+                    gen_core::MemoryAssetFacts::default(),
+                    "{provider_id}: weights-free catalog surfaces cannot claim inventory"
+                );
+                assert_eq!(
+                    surface.contract.calibration.as_ref().unwrap().fingerprint,
+                    REQUEST_SCOPED_MEMORY_FINGERPRINT,
+                    "{provider_id}"
+                );
+                for strategy in gen_core::MemoryStrategy::ALL {
+                    let support = &surface.contract.capability(strategy).unwrap().support;
+                    let expected = matches!(
+                        strategy,
+                        gen_core::MemoryStrategy::Resident
+                            | gen_core::MemoryStrategy::StagedResidency
+                    );
+                    assert_eq!(
+                        support == &gen_core::MemoryStrategySupport::Implemented,
+                        expected,
+                        "{provider_id}:{}:{strategy:?}",
+                        surface.selector.id()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn request_scoped_surface_resolver_uses_explicit_tier_and_fails_closed_on_axis_mutation() {
+        let q4 = gen_core::candle_memory_contract_surface_specs()
+            .into_iter()
+            .find(|surface| {
+                surface.resolved_artifact_tier() == gen_core::MemoryContractSurfaceTier::Q4
+                    && surface.selector.offload_policy == gen_core::OffloadPolicy::Sequential
+                    && surface.selector.load_shape == gen_core::LoadShape::DeferredMaterialization
+            })
+            .unwrap();
+        let contract = weights_free_krea_request_scoped_surface_contract(KREA_2_RAW_ID, &q4)
+            .expect("prepacked Q4 surface");
+        assert_eq!(contract.provider_id, KREA_2_RAW_ID);
+        assert_eq!(contract.load_shape, q4.selector.load_shape);
+
+        let mut composed = surface_copy(&q4);
+        composed.spec.adapters.push(gen_core::AdapterSpec::new(
+            "/nonexistent/adapter.safetensors".into(),
+            1.0,
+            gen_core::AdapterKind::Lora,
+        ));
+        composed.spec.pid = Some(gen_core::PidWeights {
+            checkpoint: WeightsSource::File("/nonexistent/pid.safetensors".into()),
+            gemma: WeightsSource::Dir("/nonexistent/gemma".into()),
+        });
+        weights_free_krea_request_scoped_surface_contract(KREA_2_RAW_ID, &composed)
+            .expect("LoRA + PiD remains a valid Krea composition");
+
+        let mut mutations = Vec::new();
+        let mut tier = surface_copy(&q4);
+        tier.spec.quantize = Some(Quant::Q8);
+        mutations.push(tier);
+        let mut source = surface_copy(&q4);
+        source.spec.weights = WeightsSource::File("/nonexistent/krea.safetensors".into());
+        mutations.push(source);
+        let mut precision = surface_copy(&q4);
+        precision.spec.precision = gen_core::Precision::Fp32;
+        mutations.push(precision);
+        let mut offload = surface_copy(&q4);
+        offload.spec.offload_policy = gen_core::OffloadPolicy::Resident;
+        mutations.push(offload);
+        let mut shape = surface_copy(&q4);
+        shape.spec.load_shape = gen_core::LoadShape::EagerMaterialization;
+        mutations.push(shape);
+        let mut route = surface_copy(&q4);
+        route.spec.resolved_route = Some(KREA_2_EDIT_ID.to_owned());
+        mutations.push(route);
+        let mut control = surface_copy(&q4);
+        control.spec.control = Some(WeightsSource::File(
+            "/nonexistent/control.safetensors".into(),
+        ));
+        mutations.push(control);
+        let mut external_te = surface_copy(&q4);
+        external_te.spec.text_encoder = Some(WeightsSource::Dir("/nonexistent/te".into()));
+        mutations.push(external_te);
+        let mut component = surface_copy(&q4);
+        component.spec.components.insert(
+            "unknown".to_owned(),
+            WeightsSource::Dir("/nonexistent".into()),
+        );
+        mutations.push(component);
+        let mut identity = surface_copy(&q4);
+        identity.spec.identity = Some(gen_core::IdentityWeights::default());
+        mutations.push(identity);
+        for mutation in mutations {
+            assert!(
+                weights_free_krea_request_scoped_surface_contract(KREA_2_RAW_ID, &mutation)
+                    .is_err(),
+                "mutated surface must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn request_scoped_behaviors_cover_raw_edit_and_turbo_edit_routes_exactly() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/krea".into()));
+        for (provider_id, expected) in [
+            (KREA_2_RAW_ID, 5),
+            (KREA_2_EDIT_ID, 4),
+            (KREA_2_TURBO_EDIT_ID, 4),
+        ] {
+            let contract =
+                build_krea_request_scoped_memory_strategy_contract(provider_id, &spec).unwrap();
+            let fixtures = registered_krea_valid_fixture(
+                &spec,
+                &contract,
+                gen_core::MemoryStrategy::StagedResidency,
+            )
+            .unwrap();
+            assert_eq!(fixtures.len(), expected, "{provider_id}");
+            for mut fixture in fixtures {
+                validate_krea_memory_route(provider_id, &fixture.context).unwrap();
+                let mut scope = registered_krea_begin_request(&spec, &contract, &fixture.context)
+                    .unwrap()
+                    .unwrap();
+                scope.configure_request(&mut fixture.request).unwrap();
+                assert_eq!(
+                    fixture.request.memory,
+                    Some(gen_core::GenerationMemory {
+                        stage_residency: true,
+                        ..Default::default()
+                    })
+                );
+                assert!(scope
+                    .configure_decode(512, 128, fixture.context.geometry)
+                    .is_err());
+                assert!(scope.configure_attention(128 * 1024 * 1024).is_err());
+                assert!(scope.materialize_transformer_window(0, 1).is_err());
+                scope.finish(gen_core::MemoryRunOutcome::Complete).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn request_scoped_route_mutations_cannot_cross_provider_mode_or_geometry() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/krea".into()));
+        let contract =
+            build_krea_request_scoped_memory_strategy_contract(KREA_2_RAW_ID, &spec).unwrap();
+        let mut context = gen_core::standard_memory_behavior_context(
+            &contract,
+            gen_core::MemoryStrategy::StagedResidency,
+            gen_core::MemoryNumericTier {
+                precision: gen_core::Precision::Bf16,
+                quant: None,
+                component_precision_floors: &[],
+            },
+            gen_core::MemoryBehaviorRoute {
+                mode: gen_core::MemoryMode::TextToImage,
+                reference_count: 0,
+                use_pid: false,
+                has_phases: false,
+                overlay: None,
+            },
+        )
+        .unwrap();
+        validate_krea_memory_route(KREA_2_RAW_ID, &context).unwrap();
+        assert!(validate_krea_memory_route(KREA_2_EDIT_ID, &context).is_err());
+
+        context.mode = gen_core::MemoryMode::Edit;
+        assert!(validate_krea_memory_route(KREA_2_RAW_ID, &context).is_err());
+        context.mode = gen_core::MemoryMode::TextToImage;
+        context.geometry.reference_count = 1;
+        context.has_reference = true;
+        assert!(validate_krea_memory_route(KREA_2_RAW_ID, &context).is_err());
+        context.geometry.reference_count = 0;
+        context.has_reference = false;
+        context.overlay = Some("lora".to_owned());
+        assert!(validate_krea_memory_route(KREA_2_RAW_ID, &context).is_err());
+        context.overlay = None;
+        context.use_pid = true;
+        context.has_phases = true;
+        assert!(validate_krea_memory_route(KREA_2_RAW_ID, &context).is_err());
+    }
 
     #[test]
     fn catalog_contract_fixture_is_weights_free_but_production_admission_stays_strict() {
@@ -1970,6 +2472,12 @@ mod weights_free_behavior_tests {
             validated_krea_turbo_memory_strategy_contract(&spec).is_err(),
             "production admission must still validate Krea assets"
         );
+        for provider_id in [KREA_2_RAW_ID, KREA_2_EDIT_ID, KREA_2_TURBO_EDIT_ID] {
+            assert!(
+                validated_krea_request_scoped_memory_strategy_contract(provider_id, &spec).is_err(),
+                "{provider_id}: production admission must still validate Krea assets"
+            );
+        }
     }
 
     #[test]
@@ -2010,6 +2518,7 @@ fn krea_memory_strategy_safety_check(
 ) -> gen_core::MemorySafetyDecision {
     // Krea executes its dense tensors at the provider's BF16/default tier. `LoadSpec::precision`
     // is not wired into the loader, so it must not relabel the calibration evidence admitted here.
+    let route_gate = || validate_krea_memory_route(&contract.provider_id, context);
     gen_core::standard_memory_strategy_safety_check(
         contract,
         context,
@@ -2018,7 +2527,7 @@ fn krea_memory_strategy_safety_check(
             quant: loaded_quant,
             component_precision_floors: &[],
         }),
-        None,
+        Some(&route_gate),
     )
 }
 
@@ -2034,6 +2543,64 @@ const TURBO_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
         valid_fixtures: registered_krea_valid_fixture,
         begin_request: registered_krea_begin_request,
     };
+
+macro_rules! request_scoped_memory_registration {
+    (
+        $registration:ident,
+        $behavior:ident,
+        $registered_contract:ident,
+        $surface_contract:ident,
+        $provider_id:expr
+    ) => {
+        fn $registered_contract(
+            spec: &LoadSpec,
+        ) -> gen_core::Result<gen_core::MemoryProviderContract> {
+            validated_krea_request_scoped_memory_strategy_contract($provider_id, spec)
+        }
+
+        fn $surface_contract(
+            surface: &gen_core::MemoryContractSurfaceSpec,
+        ) -> gen_core::Result<gen_core::MemoryProviderContract> {
+            weights_free_krea_request_scoped_surface_contract($provider_id, surface)
+        }
+
+        const $registration: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
+            provider_id: $provider_id,
+            contract: $registered_contract,
+            safety_check: registered_krea_safety_check,
+        };
+
+        #[cfg(feature = "cuda")]
+        const $behavior: gen_core::MemoryBehaviorRegistration =
+            gen_core::MemoryBehaviorRegistration {
+                provider_id: $provider_id,
+                valid_fixtures: registered_krea_valid_fixture,
+                begin_request: registered_krea_begin_request,
+            };
+    };
+}
+
+request_scoped_memory_registration!(
+    RAW_MEMORY_REGISTRATION,
+    RAW_MEMORY_BEHAVIOR,
+    registered_krea_raw_memory_strategy_contract,
+    weights_free_krea_raw_surface_contract,
+    KREA_2_RAW_ID
+);
+request_scoped_memory_registration!(
+    EDIT_MEMORY_REGISTRATION,
+    EDIT_MEMORY_BEHAVIOR,
+    registered_krea_edit_memory_strategy_contract,
+    weights_free_krea_edit_surface_contract,
+    KREA_2_EDIT_ID
+);
+request_scoped_memory_registration!(
+    TURBO_EDIT_MEMORY_REGISTRATION,
+    TURBO_EDIT_MEMORY_BEHAVIOR,
+    registered_krea_turbo_edit_memory_strategy_contract,
+    weights_free_krea_turbo_edit_surface_contract,
+    KREA_2_TURBO_EDIT_ID
+);
 
 /// Provider-owned executable capabilities for SceneWorks' composed Krea Turbo + pose-ControlNet
 /// route. The worker owns measured evidence and live-budget selection; this declaration owns which
@@ -2193,6 +2760,9 @@ pub fn register_providers(
     #[cfg(feature = "cuda")]
     let registry = register_memory_contract_surfaces(registry)
         .register_memory_behavior(TURBO_MEMORY_BEHAVIOR)
+        .register_memory_behavior(RAW_MEMORY_BEHAVIOR)
+        .register_memory_behavior(EDIT_MEMORY_BEHAVIOR)
+        .register_memory_behavior(TURBO_EDIT_MEMORY_BEHAVIOR)
         .register_memory_behavior(CONTROL_MEMORY_BEHAVIOR);
     registry
         .register_imported_model(gen_core::ImportedModelRegistration {
@@ -2234,6 +2804,48 @@ pub fn register_memory_contract_surfaces(
             provider_id: KREA_2_TURBO_ID,
             contract: weights_free_krea_turbo_memory_strategy_contract,
         })
+        .register_memory_strategy(RAW_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            surface_specs: gen_core::candle_memory_contract_surface_specs,
+            provider_id: KREA_2_RAW_ID,
+            contract: |spec| {
+                build_krea_request_scoped_memory_strategy_contract(KREA_2_RAW_ID, spec)
+            },
+        })
+        .register_memory_contract_surface_resolver(
+            gen_core::MemoryContractSurfaceResolverRegistration {
+                provider_id: KREA_2_RAW_ID,
+                contract: weights_free_krea_raw_surface_contract,
+            },
+        )
+        .register_memory_strategy(EDIT_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            surface_specs: gen_core::candle_memory_contract_surface_specs,
+            provider_id: KREA_2_EDIT_ID,
+            contract: |spec| {
+                build_krea_request_scoped_memory_strategy_contract(KREA_2_EDIT_ID, spec)
+            },
+        })
+        .register_memory_contract_surface_resolver(
+            gen_core::MemoryContractSurfaceResolverRegistration {
+                provider_id: KREA_2_EDIT_ID,
+                contract: weights_free_krea_edit_surface_contract,
+            },
+        )
+        .register_memory_strategy(TURBO_EDIT_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            surface_specs: gen_core::candle_memory_contract_surface_specs,
+            provider_id: KREA_2_TURBO_EDIT_ID,
+            contract: |spec| {
+                build_krea_request_scoped_memory_strategy_contract(KREA_2_TURBO_EDIT_ID, spec)
+            },
+        })
+        .register_memory_contract_surface_resolver(
+            gen_core::MemoryContractSurfaceResolverRegistration {
+                provider_id: KREA_2_TURBO_EDIT_ID,
+                contract: weights_free_krea_turbo_edit_surface_contract,
+            },
+        )
         // The direct CUDA control runtime composes the registered Krea base with a native control
         // overlay in SceneWorks; it is a real route, but not a standalone gen-core Generator.
         .register_composed_memory_strategy(CONTROL_MEMORY_REGISTRATION)
@@ -2340,8 +2952,18 @@ mod explicit_registry_tests {
         ));
         #[cfg(feature = "cuda")]
         {
+            let production_tmp = tempfile::tempdir().unwrap();
+            gen_core_testkit::write_multimodal_encoder_contract_fixture(
+                &production_tmp.path().join("text_encoder"),
+                super::ENCODER_CONTRACT,
+                super::VISION_ENCODER_CONTRACT,
+            )
+            .unwrap();
+            let production_spec = candle_gen::gen_core::LoadSpec::new(
+                candle_gen::gen_core::WeightsSource::Dir(production_tmp.path().to_path_buf()),
+            );
             let contract = registry
-                .memory_strategy_contract(super::KREA_2_TURBO_ID, &spec)
+                .memory_strategy_contract(super::KREA_2_TURBO_ID, &production_spec)
                 .unwrap()
                 .expect("Krea Turbo must register its CUDA memory-strategy contract");
             assert_eq!(
@@ -2372,23 +2994,54 @@ mod explicit_registry_tests {
             ));
             gen_core_testkit::check_memory_strategy_contract(&control_contract).unwrap();
 
-            let edit_default = candle_gen::gen_core::MemoryProviderContract::compatibility_default(
+            for provider_id in [
+                super::KREA_2_RAW_ID,
                 super::KREA_2_EDIT_ID,
-                contract.backend.clone(),
-            );
-            gen_core_testkit::check_memory_strategy_contract(&edit_default).unwrap();
+                super::KREA_2_TURBO_EDIT_ID,
+            ] {
+                let contract = registry
+                    .memory_strategy_contract(provider_id, &production_spec)
+                    .unwrap()
+                    .unwrap_or_else(|| {
+                        panic!("{provider_id} must register its CUDA memory-strategy contract")
+                    });
+                assert_eq!(
+                    contract.calibration.as_ref().unwrap().fingerprint,
+                    super::REQUEST_SCOPED_MEMORY_FINGERPRINT,
+                    "{provider_id}"
+                );
+                for strategy in candle_gen::gen_core::MemoryStrategy::ALL {
+                    let expected = matches!(
+                        strategy,
+                        candle_gen::gen_core::MemoryStrategy::Resident
+                            | candle_gen::gen_core::MemoryStrategy::StagedResidency
+                    );
+                    assert_eq!(
+                        contract.capability(strategy).unwrap().support
+                            == candle_gen::gen_core::MemoryStrategySupport::Implemented,
+                        expected,
+                        "{provider_id}: {strategy:?}"
+                    );
+                }
+                gen_core_testkit::check_memory_strategy_contract(&contract).unwrap();
+            }
         }
         #[cfg(not(feature = "cuda"))]
-        assert!(registry
-            .memory_strategy_contract(super::KREA_2_TURBO_ID, &spec)
-            .unwrap()
-            .is_none());
-
-        for id in [super::KREA_2_RAW_ID, super::KREA_2_EDIT_ID] {
-            assert!(registry
-                .memory_strategy_contract(id, &spec)
-                .unwrap()
-                .is_none());
+        {
+            for provider_id in [
+                super::KREA_2_TURBO_ID,
+                super::KREA_2_RAW_ID,
+                super::KREA_2_EDIT_ID,
+                super::KREA_2_TURBO_EDIT_ID,
+            ] {
+                assert!(
+                    registry
+                        .memory_strategy_contract(provider_id, &spec)
+                        .unwrap()
+                        .is_none(),
+                    "{provider_id} must not register a CUDA contract without the CUDA feature"
+                );
+            }
         }
     }
 }
@@ -2420,6 +3073,55 @@ mod tests {
             BASE_SNAPSHOT_COMPONENT,
             WeightsSource::Dir(root.to_path_buf()),
         )
+    }
+
+    #[test]
+    fn raw_and_edit_contract_validation_preserves_low_rank_adapter_plus_pid_compositions() {
+        for kind in [gen_core::AdapterKind::Lora, gen_core::AdapterKind::Lokr] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut spec = valid_directory_spec(tmp.path());
+            spec.adapters.push(gen_core::AdapterSpec::new(
+                tmp.path().join("adapter.safetensors"),
+                0.75,
+                kind,
+            ));
+            spec.pid = Some(gen_core::PidWeights {
+                checkpoint: WeightsSource::File(tmp.path().join("pid.safetensors")),
+                gemma: WeightsSource::Dir(tmp.path().join("gemma")),
+            });
+            for provider_id in [KREA_2_RAW_ID, KREA_2_EDIT_ID, KREA_2_TURBO_EDIT_ID] {
+                let contract =
+                    validated_krea_request_scoped_memory_strategy_contract(provider_id, &spec)
+                        .unwrap_or_else(|error| {
+                            panic!("{provider_id} rejected {kind:?} + PiD: {error}")
+                        });
+                assert_eq!(
+                    contract
+                        .capability(gen_core::MemoryStrategy::StagedResidency)
+                        .unwrap()
+                        .support,
+                    gen_core::MemoryStrategySupport::Implemented
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn directory_loads_reject_identity_for_every_krea_variant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut spec = valid_directory_spec(tmp.path());
+        spec.identity = Some(gen_core::IdentityWeights::default());
+        for provider_id in [
+            KREA_2_TURBO_ID,
+            KREA_2_RAW_ID,
+            KREA_2_EDIT_ID,
+            KREA_2_TURBO_EDIT_ID,
+        ] {
+            let error = validate_load_spec(&spec, provider_id)
+                .expect_err("identity must fail closed for directory loads")
+                .to_string();
+            assert!(error.contains("identity"), "{provider_id}: {error}");
+        }
     }
 
     fn resident_memory_context(
@@ -2646,7 +3348,11 @@ mod tests {
                 chunk_attention: true,
                 ..Default::default()
             }),
-            requires_reference: false,
+            provider_id: KREA_2_TURBO_ID.to_owned(),
+            mode: gen_core::MemoryMode::TextToImage,
+            reference_count: 0,
+            use_pid: false,
+            has_phases: false,
             finished: false,
         };
         scope
@@ -3243,7 +3949,11 @@ mod tests {
         let mut scope = KreaMemoryScope {
             device: Device::Cpu,
             memory: Some(attention_memory),
-            requires_reference: false,
+            provider_id: KREA_2_TURBO_ID.to_owned(),
+            mode: gen_core::MemoryMode::TextToImage,
+            reference_count: 0,
+            use_pid: false,
+            has_phases: false,
             finished: false,
         };
         let mut request = GenerationRequest {
@@ -3273,7 +3983,11 @@ mod tests {
         let mut rejected = KreaMemoryScope {
             device: Device::Cpu,
             memory: Some(attention_memory),
-            requires_reference: false,
+            provider_id: KREA_2_TURBO_ID.to_owned(),
+            mode: gen_core::MemoryMode::TextToImage,
+            reference_count: 0,
+            use_pid: false,
+            has_phases: false,
             finished: false,
         };
         let mut img2img = GenerationRequest {

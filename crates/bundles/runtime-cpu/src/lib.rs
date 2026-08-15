@@ -16,6 +16,11 @@ pub mod providers {
     pub use candle_gen_catalog::providers::*;
 }
 
+/// Descriptor-less provider memory routes that the CPU bundle intentionally reconciles outside the
+/// ordinary generator registry.
+#[cfg(feature = "media")]
+pub use candle_gen_catalog::{BespokeMemoryRouteWaiver, BESPOKE_MEMORY_ROUTE_WAIVERS};
+
 /// Platform label for this bundle; matches `RuntimeCatalog::platform`.
 pub const PLATFORM: &str = "cpu";
 /// The single tensor backend every media, LLM, and snapshot-preparer provider in this bundle uses.
@@ -282,5 +287,16 @@ mod tests {
                 "the supported CPU-only resolution must NOT surface the NVFP4 tier"
             );
         }
+    }
+
+    #[cfg(feature = "media")]
+    #[test]
+    fn cpu_bundle_reexports_the_exact_bespoke_memory_route_waiver() {
+        let [waiver]: &[super::BespokeMemoryRouteWaiver] = super::BESPOKE_MEMORY_ROUTE_WAIVERS
+        else {
+            panic!("CPU bundle must expose exactly one bespoke memory-route waiver");
+        };
+        assert_eq!(waiver.provider_id, "pulid_flux");
+        assert_eq!(waiver.crate_name, "pulid");
     }
 }
