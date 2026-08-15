@@ -1592,16 +1592,18 @@ mod tests {
         (320, 576),
     ];
 
-    /// A generator over an empty snapshot — enough to drive `validate`, which reads no weights.
+    /// A generator over a staged-but-empty snapshot — enough to drive `validate`, which reads no
+    /// weights.
+    ///
+    /// It stages through [`staged_root`] rather than bare `create_dir_all`: sc-19573's
+    /// [`require_component`] refuses a component directory carrying no `.safetensors` shard, so a
+    /// directory-only root no longer loads at all.
     fn validator() -> MiniMaxH3 {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        for c in REQUIRED_COMPONENT_DIRS {
-            std::fs::create_dir_all(root.join(c)).unwrap();
-        }
-        let model =
-            MiniMaxH3::load(&LoadSpec::new(WeightsSource::Dir(root.to_path_buf()))).unwrap();
-        // The tempdir may drop here: `validate` never touches the filesystem, which is the point.
+        let root = staged_root(&tmp);
+        let model = MiniMaxH3::load(&LoadSpec::new(WeightsSource::Dir(root))).unwrap();
+        // The tempdir may drop here: for the `t2va` requests this drives, `validate` touches no
+        // filesystem — `task_component_dirs(T2va)` is empty — which is the point.
         model
     }
 
