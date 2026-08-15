@@ -2087,8 +2087,13 @@ mod tests {
         );
 
         // Monotone in the tier, and every packed tier strictly below the bf16 stack it replaces.
-        assert!(ADALN_EVICTED_Q4_BYTES < ADALN_EVICTED_Q8_BYTES);
-        assert!(ADALN_EVICTED_Q8_BYTES < ADALN_EVICTED_BYTES);
+        const {
+            assert!(
+                ADALN_EVICTED_Q4_BYTES < ADALN_EVICTED_Q8_BYTES
+                    && ADALN_EVICTED_Q8_BYTES < ADALN_EVICTED_BYTES,
+                "the sub-stack must fall monotonically q4 < q8 < bf16"
+            )
+        };
         // `packed_quant_bits_at` admits only 4 and 8, so those are the only packed widths this
         // function is ever called at; 16 is the dense arm.
         assert_eq!(adaln_stack_bytes(16), adaln_stack_bytes(32));
@@ -2130,11 +2135,13 @@ mod tests {
             staged_contract(Q4_DIT_BYTES, None).resident_components()[0].resident_bytes,
             Q4_FOOTPRINT_LEG_BYTES
         );
-        assert!(
-            ADALN_EVICTED_Q4_BYTES < Q4_FOOTPRINT_LEG_BYTES,
-            "the marker leg is exact and the footprint leg over-declares by the dense f32 heads and \
-             norms crate::convert leaves in every tier"
-        );
+        const {
+            assert!(
+                ADALN_EVICTED_Q4_BYTES < Q4_FOOTPRINT_LEG_BYTES,
+                "the marker leg is exact and the footprint leg over-declares by the dense f32 \
+                 heads and norms crate::convert leaves in every tier"
+            )
+        };
 
         // --- q8: both sides of the crossover, executed ------------------------------------------
         // Above the crossover the marker leg wins, so `adaln_stack_bytes(8)` is what produced this.
@@ -2249,10 +2256,12 @@ mod tests {
             "a sub-stack under the retained table must be refused, got {errors:?}"
         );
         // ...and the shipped tier's margin above that floor, stated as a number.
-        assert!(
-            Q4_DIT_BYTES > FLOOR_DIT_BYTES * 19 / 10,
-            "q4's {Q4_DIT_BYTES} B sits 1.90x above the {FLOOR_DIT_BYTES} B floor"
-        );
+        const {
+            assert!(
+                Q4_DIT_BYTES > FLOOR_DIT_BYTES * 19 / 10,
+                "the shipped q4 DiT must sit at least 1.90x above the floor"
+            )
+        };
     }
 
     /// **AC2.** The saving the contract claims may not exceed the saving the runtime was measured
