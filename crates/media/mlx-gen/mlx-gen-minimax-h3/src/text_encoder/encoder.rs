@@ -91,12 +91,87 @@ impl MiniMaxH3TextEncoder {
     }
 
     /// Quantize the token table + every loaded projection in place. Norms stay dense.
+    ///
+    /// **This is the definition [`crate::convert::is_te_pack_target`] is held against**, not a
+    /// render path. Nothing on the render path calls it and nothing should: quantizing at load
+    /// requires the dense weights resident first, which is the 53.07 GB this model's tiering exists
+    /// to avoid ([`crate::memory_strategy::CONDITIONING_STAGE_PEAK_BYTES`]). Tiers ship
+    /// **pre-quantized**; a packed `text_encoder/` auto-detects through
+    /// [`mlx_gen::quant::lin`] / [`mlx_gen::quant::embedding`] with no dense transient.
+    ///
+    /// What it *is* good for is stating the pack set in executable form. `tests/quant_policy.rs`
+    /// builds one encoder by quantizing in place and another from a
+    /// [`quantize_minimax_h3_text_encoder`](crate::convert::quantize_minimax_h3_text_encoder)
+    /// artifact and asserts the two are bit-identical, so the converter's suffix list cannot drift
+    /// away from the modules' own idea of what is packable.
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
         self.embed_tokens.quantize(bits, true)?;
         for layer in &mut self.layers {
             layer.quantize(bits)?;
         }
         Ok(())
+    }
+
+    /// The bit width every packed projection in this encoder was built at, or `None` if it loaded
+    /// dense.
+    ///
+    /// `Err` when the loaded layers disagree — a tier assembled from a mixture of widths is a
+    /// mis-built artifact, and reporting the first layer's width would hide it. The token table is
+    /// checked separately by [`Self::token_table_is_quantized`]: it is the one tensor that a
+    /// converter can leave dense while every Linear packs.
+    pub fn packed_bits(&self) -> Result<Option<i32>> {
+        let mut seen: Option<Option<i32>> = None;
+        for (i, layer) in self.layers.iter().enumerate() {
+            let bits = layer.packed_bits();
+            match seen {
+                None => seen = Some(bits),
+                Some(first) if first != bits => {
+                    return Err(Error::Msg(format!(
+                        "minimax-h3 te: layer {i} is {bits:?}-bit but layer 0 is {first:?}-bit — \
+                         the staged tier mixes quantization widths"
+                    )))
+                }
+                Some(_) => {}
+            }
+        }
+        Ok(seen.flatten())
+    }
+
+    /// `true` when the encoder's projections loaded packed rather than dense.
+    pub fn is_quantized(&self) -> Result<bool> {
+        Ok(self.packed_bits()?.is_some())
+    }
+
+    /// `true` when the token table loaded packed. Reported separately from [`Self::packed_bits`]
+    /// because the embedding takes a different loader
+    /// ([`mlx_gen::quant::embedding`]) and a converter can miss it while packing every Linear.
+    pub fn token_table_is_quantized(&self) -> bool {
+        self.embed_tokens.is_quantized()
+    }
+
+    /// Device bytes this encoder holds — packed triples summed as they actually sit in memory, not
+    /// as the logical shape they decode to.
+    ///
+    /// This is the quantity a tier is judged on. `get_active_memory` after a forced materialization
+    /// must land within a small margin of it; anything larger means something dense is still
+    /// resident that the tier believed it had packed.
+    pub fn nbytes(&self) -> usize {
+        self.embed_tokens_nbytes()
+            + self
+                .layers
+                .iter()
+                .map(Qwen3DecoderLayer::nbytes)
+                .sum::<usize>()
+    }
+
+    fn embed_tokens_nbytes(&self) -> usize {
+        use mlx_gen::nn::TokenEmbedding;
+        match &self.embed_tokens {
+            TokenEmbedding::Dense(w) => w.nbytes(),
+            TokenEmbedding::Quantized {
+                wq, scales, biases, ..
+            } => wq.nbytes() + scales.nbytes() + biases.nbytes(),
+        }
     }
 
     /// Text-only (t2va) conditioning. `input_ids` / `attention_mask`: `[b, s]` int32. Returns the
