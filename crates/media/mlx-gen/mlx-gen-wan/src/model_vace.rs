@@ -314,6 +314,7 @@ pub fn descriptor_vace() -> ModelDescriptor {
             // every request even though this provider exposes no selectable Sequential control.
             unconditionally_engages_staged_residency: true,
             supports_preview: false,
+            supports_prompt_enhancement: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,

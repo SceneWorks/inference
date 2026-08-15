@@ -44,6 +44,7 @@ pub mod preview;
 pub mod rope;
 pub mod text_encoder;
 pub mod tokenizer;
+pub mod training;
 pub mod transformer;
 pub mod vae;
 
@@ -119,6 +120,7 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             // source-verified bidirectional guard in `candle-gen-catalog` (sc-16951), which derives
             // from this crate's shipped sources whether it actually emits.
             supports_preview: true,
+            supports_prompt_enhancement: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
@@ -362,6 +364,7 @@ pub fn register_providers(
         .register_generator(BASE_REGISTRATION)
         .register_generator(AESTHETIC_REGISTRATION)
         .register_generator(TURBO_REGISTRATION)
+        .register_trainer(training::TRAINER_REGISTRATION)
 }
 
 /// Build the complete explicit Candle Anima provider catalog.

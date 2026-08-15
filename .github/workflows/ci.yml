@@ -153,8 +153,35 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Install pinned Rust toolchain
         run: rustup show
+      # SAVE ONLY ON `main`. This is the canonical note; every other cache step in this file that
+      # runs on pull requests carries the same input and points here. The manual lanes deliberately
+      # do not — see `macos-nax` and `windows-cuda`.
+      #
+      # GitHub scopes an Actions cache to the ref that wrote it: a `refs/pull/N/merge` entry is
+      # readable only from inside PR N, while a `refs/heads/main` entry is readable from every
+      # branch and every PR. Left at the default (`save-if: true`) each PR job writes its own copy,
+      # so the repo accumulates one cache per lane per open PR and almost nothing another PR can
+      # use. Measured 2026-08-15, before this change: 12 of 13 caches were PR-scoped and exactly one
+      # sat on main (`macos-metal`), against a 16 GB ceiling the repo was filling to ~11 GB.
+      #
+      # The failure is a RATCHET, not a steady state. Eviction is LRU and fires on the PEAK, so a
+      # burst of concurrent PRs pushes the repo over the ceiling and drops the least-recently-read
+      # entries. A main baseline that PRs still read has its access time refreshed and survives —
+      # which is exactly why `macos-metal`'s survived and nothing else did. One that gets dropped
+      # can never come back, because refreshing it requires a read and the entry is gone; it stays
+      # dead until the next successful push to main, and those are days apart here. Main's
+      # `candle-cpu` baseline was full-matched at 2026-08-14T23:33 and gone by the next morning,
+      # after which every PR rebuilt the whole candle dependency graph inside its test step: the
+      # run at 2026-08-15T10:20 logged "No cache found", then spent ~18 of that step's 20 minutes
+      # compiling `candle-core` and its dependents.
+      #
+      # Restricting saves to main keeps exactly one baseline per lane, which is the only kind a PR
+      # can read anyway. A PR whose Cargo.lock differs from main's gets rust-cache's prefix restore
+      # instead of a full match: partial, and far better than cold.
       - name: Cache Cargo graph
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Validate normalized workspace
         run: ./scripts/check-workspace.py
       # Installed BEFORE the tooling tests, not after: `test_mmaudio_reference.py` regenerates the
@@ -181,6 +208,9 @@ jobs:
           rustup component add clippy
       - name: Cache Cargo
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          # Save only on `main` — see the note on the `workspace` job's cache step.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # Formatting is enforced whole-workspace by the always-run `format` job
       # (`cargo fmt --all --check`) now that the imported trees are normalized (sc-13275),
       # so the former gen-core-only `cargo fmt --check` step here is redundant.
@@ -196,8 +226,34 @@ jobs:
           -p core-llm -p core-llm-testkit
           -p sceneworks-gen-core -p sceneworks-gen-core-testkit
 
-  candle-cpu:
-    name: Candle CPU packages (Linux)
+  # THE LINUX CPU LANE, SPLIT ACROSS FOUR RUNNERS. This was one `candle-cpu` job running every step
+  # in sequence at a ~40-minute median. Nothing was dropped: the four jobs below carry the same
+  # steps, with the same commands and the same step names, and all four are gated on the same
+  # `changes.outputs.candle_cpu` and listed in the `gate` job's `needs:`.
+  #
+  # Why split rather than trim: the serial ordering was never a correctness requirement. Measured
+  # over nine successful PR runs on 2026-08-15, the steps were independent and the job was bounded
+  # by their SUM — clippy 2.5m, rustdoc 2.3m, package tests 18.4m, conformance 7.4m, SA3 1.2m,
+  # bundles 1.7m + 2.9m + 2.6m. Split, the lane is bounded by the longest single piece instead.
+  #
+  # Splitting also relieves the constraint that produced the `cargo clean` below: the all-target
+  # Clippy tree and the test tree no longer share a disk. The `-j 1` on the test invocations is
+  # RETAINED — that one bounds lld's link-time memory, which the original step observed "even after
+  # the Clippy target tree has been reclaimed", so it is independent of the split. Do not drop it
+  # without reproducing the SIGBUS.
+  #
+  # The SA3 weight-free step moved to `candle-cpu-conformance` unchanged. Its coverage guard,
+  # scripts/tests/test_sa3_ci_target_coverage.py, finds it by STEP NAME rather than by job, and a
+  # second policy test caps that step's comment block at four lines — so the note explaining the
+  # move lives here rather than on the step.
+  #
+  # Cache note: rust-cache derives its key from the job, so these four save four separate baselines
+  # instead of one. That is affordable only because `save-if` below restricts saving to `main` —
+  # without it, four jobs would write four PR-scoped caches per open PR. See the `save-if` note on
+  # the `workspace` job's cache step.
+
+  candle-cpu-lint:
+    name: Candle CPU lint + docs (Linux)
     needs: changes
     if: needs.changes.outputs.candle_cpu == 'true'
     runs-on: ubuntu-latest
@@ -209,6 +265,8 @@ jobs:
           rustup component add clippy
       - name: Cache Cargo
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # `candle-audio/testkit` is compiled here explicitly: until the first audio provider
       # dev-depends on it (sc-12836), no target in the graph pulls the feature in, so without
       # this flag the testkit module would be merged unguarded (the sc-11990 cfg-hole shape).
@@ -219,9 +277,11 @@ jobs:
           --features candle-audio/testkit
           --all-targets -- -D warnings
       - name: Reclaim Clippy artifacts before linking tests
-        # The complete all-target Clippy graph and the test graph do not fit concurrently on the
-        # hosted Linux runner. Clippy has already succeeded, so discard its target artifacts before
-        # rebuilding the narrower lib/test profile below.
+        # RETAINED, and still between Clippy and rustdoc where it has always sat. The package tests
+        # that used to follow now run on their own runners, so this no longer protects them — but
+        # whether the all-target Clippy tree and the doc build fit together on one hosted runner has
+        # never been measured, and the ordering here is known-good. Dropping it is a separate
+        # change with its own evidence, not a freebie to take while splitting the lane.
         run: cargo clean
       - name: Rustdoc Linux CPU packages
         # Public contracts and provider docs are link-heavy API surface. Keep their intra-doc graph
@@ -229,11 +289,6 @@ jobs:
         # cannot pass --features cuda and does not check `#[cfg(feature = "cuda")]` docs; the
         # `windows-cuda-check` lane covers that feature configuration. Metal/MLX docs remain
         # genuinely ungated: no lane documents them.
-        # No reclaim step follows on purpose: unlike Clippy's --all-targets tree, this --no-deps doc
-        # build's dependency artifacts are exactly the ones the lib/test profile below reuses (so the
-        # test step skips recompiling the provider graph), and they stay well under the reclaimed
-        # Clippy high-water mark this runner already tolerates. The -j 1 below is what bounds the lld
-        # memory limit; leftover doc artifacts add no concurrent-link pressure.
         env:
           RUSTDOCFLAGS: "-D warnings"
         run: >-
@@ -242,14 +297,52 @@ jobs:
           -p sceneworks-gen-core -p sceneworks-gen-core-testkit
           -p candle-llm -p 'candle-gen*' -p 'candle-audio*'
           -p runtime-cpu -p runtime-catalog
+      # The three guards ride the lint job rather than a test job: `check-lock-poison.sh` shells out
+      # to no build tool at all and `check-gen-core-skew.sh` only runs `cargo tree`, so neither
+      # needs a compiled target dir and neither belongs on the critical path.
+      - name: Guard poison-tolerant shared locks
+        run: bash crates/media/candle-gen/scripts/check-lock-poison.sh
+      - name: Self-test the gen-core skew verdict
+        run: bash crates/media/candle-gen/scripts/check-gen-core-skew.sh --self-test
+      - name: Guard the real Candle gen-core graph
+        run: bash crates/media/candle-gen/scripts/check-gen-core-skew.sh candle-gen
+
+  candle-cpu-test:
+    name: Candle CPU package tests (Linux)
+    needs: changes
+    if: needs.changes.outputs.candle_cpu == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Test Candle packages
-        # All-target Clippy above checks every integration and real-weight target. Execute the
-        # package unit/catalog suites one linker at a time: concurrently linking several provider
-        # test binaries exceeds the hosted runner's memory-backed linker capacity and crashes lld
-        # with SIGBUS even after the Clippy target tree has been reclaimed.
+        # All-target Clippy in `candle-cpu-lint` checks every integration and real-weight target.
+        # Execute the package unit/catalog suites one linker at a time: concurrently linking several
+        # provider test binaries exceeds the hosted runner's memory-backed linker capacity and
+        # crashes lld with SIGBUS. That was observed even with the Clippy tree already reclaimed, so
+        # moving Clippy to its own runner does not lift it.
         run: >-
           cargo test --locked --lib -j 1
           -p candle-llm -p 'candle-gen*' -p 'candle-audio*' -p runtime-cpu
+
+  candle-cpu-conformance:
+    name: Candle CPU conformance + SA3 gates (Linux)
+    needs: changes
+    if: needs.changes.outputs.candle_cpu == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Test Candle LLM conformance
         run: cargo test --locked -j 1 -p candle-llm --test conformance
       - name: Test Stable Audio 3 weight-free quality gates
@@ -265,6 +358,24 @@ jobs:
           --test listening_stimuli --test reference_audio --test reference_window --test audio_edit
           --test adapters
           -- --nocapture
+
+  candle-cpu-bundles:
+    name: Candle CPU bundle profiles (Linux)
+    needs: changes
+    if: needs.changes.outputs.candle_cpu == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # These three resolve `runtime-cpu` under three different feature sets, so they share almost
+      # no artifacts with each other or with the default-feature build in `candle-cpu-test` — which
+      # is why they cost ~7m combined even when they ran straight after it. Grouping them keeps that
+      # feature thrash on one runner instead of spreading it.
       - name: Test LLM-only CPU bundle
         run: cargo test --locked --no-default-features --lib -p runtime-cpu
       # The decided sc-12835 feature wiring: audio is its own additive bundle feature, so the
@@ -275,12 +386,6 @@ jobs:
       # the audio lane must keep composing — one lane covers it, on the cheapest platform.
       - name: Test media-only CPU bundle
         run: cargo test --locked --no-default-features --features media --lib -p runtime-cpu
-      - name: Guard poison-tolerant shared locks
-        run: bash crates/media/candle-gen/scripts/check-lock-poison.sh
-      - name: Self-test the gen-core skew verdict
-        run: bash crates/media/candle-gen/scripts/check-gen-core-skew.sh --self-test
-      - name: Guard the real Candle gen-core graph
-        run: bash crates/media/candle-gen/scripts/check-gen-core-skew.sh candle-gen
 
   macos-metal:
     name: MLX + Candle Metal packages (macOS)
@@ -311,6 +416,11 @@ jobs:
           rustup component add clippy
       - name: Cache Cargo and MLX native build
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          # Save only on `main` — see the note on the `workspace` job's cache step. This lane's
+          # baseline is the 2 GB one that survived the 2026-08-15 eviction; the point of this input
+          # is that the others get to survive alongside it.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Clippy MLX packages
         run: >-
           cargo clippy --locked
@@ -381,6 +491,10 @@ jobs:
           xcrun metal --version
           rustc --version
           cargo --version
+      # DELIBERATELY NO `save-if: main`, unlike the PR lanes (see the note on the `workspace` job's
+      # cache step). `macos-nax` is manual and never runs on `main`, so a main-only save would leave
+      # it nothing to restore; it also contributed no entry to the 2026-08-15 cache inventory. Do
+      # not re-symmetrise it with `macos-metal`.
       - name: Cache Cargo and MLX native build
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
@@ -427,6 +541,10 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: [self-hosted, windows, cuda]
     env:
+      # Two listeners share this 48-thread host. Leaving Cargo at its per-process default lets
+      # overlapping CI runs launch roughly 96 compilers and trigger Windows DLL-init failures.
+      # Twelve jobs per listener leaves headroom for sccache, linkers, nvcc, and the runner itself.
+      CARGO_BUILD_JOBS: "12"
       CUDA_COMPUTE_CAP: "80"
       CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
@@ -449,6 +567,10 @@ jobs:
           # proxies dangling. This is the real cause of the breakage that
           # scripts/win/use-real-rust-toolchain.cmd works around in the app repo.
           cache-bin: "false"
+          # Save only on `main` — see the note on the `workspace` job's cache step. Unlike the
+          # `windows-cuda` lane below, this one runs on every PR that touches the CUDA paths, so it
+          # is one of the lanes that was writing a PR-scoped cache nothing else could read.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Compile Candle CUDA packages and test binaries (no GPU required)
         shell: cmd
         run: |
@@ -489,6 +611,8 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && needs.changes.outputs.windows_cuda == 'true'
     runs-on: [self-hosted, windows, cuda]
     env:
+      # Keep manual runs inside the same per-listener budget as the automatic compile check.
+      CARGO_BUILD_JOBS: "12"
       CUDA_COMPUTE_CAP: "80"
       CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
@@ -503,6 +627,12 @@ jobs:
         with:
           toolchain: 1.96.0
           components: rustfmt, clippy
+      # DELIBERATELY NO `save-if: main`, unlike the PR lanes (see the note on the `workspace` job's
+      # cache step). This lane is manual — `windows-cuda` runs only on `workflow_dispatch` — so its
+      # runs are operator iterations on whatever ref they dispatch, where a ref-scoped cache is the
+      # point. It never runs on `main`, so a main-only save would leave it nothing to restore and
+      # cold on every dispatch, and it contributed no entry to the 2026-08-15 cache inventory that
+      # was starving the PR lanes. Do not re-symmetrise it with `windows-cuda-check` above.
       - name: Cache Cargo and CUDA objects
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
@@ -549,6 +679,8 @@ jobs:
           add-rust-environment-hash-key: "false"
           cache-targets: "false"
           cache-bin: "true"
+          # Save only on `main` — see the note on the `workspace` job's cache step.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install cargo-deny
         if: steps.cargo-deny-cache.outputs.cache-hit != 'true'
         run: cargo install cargo-deny --locked --version 0.19.9
@@ -574,6 +706,9 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Cache Cargo graph
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          # Save only on `main` — see the note on the `workspace` job's cache step.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build dry-run release metadata
         run: >-
           python3 scripts/release/build_release.py
@@ -590,6 +725,11 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Cache Cargo graph
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          # Save only on `main` — see the note on the `workspace` job's cache step. This lane is
+          # tag-gated (`refs/tags/runtime-*`), and a tag-scoped cache is readable from no other ref
+          # at all, so saving here only ever consumed budget the PR lanes needed.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build tagged source bundle
         run: python3 scripts/release/build_release.py --tag "$GITHUB_REF_NAME"
       - name: Verify and consume source bundle externally
@@ -625,7 +765,10 @@ jobs:
       - format
       - workspace
       - contracts
-      - candle-cpu
+      - candle-cpu-lint
+      - candle-cpu-test
+      - candle-cpu-conformance
+      - candle-cpu-bundles
       - macos-metal
       - macos-nax
       - windows-cuda-check

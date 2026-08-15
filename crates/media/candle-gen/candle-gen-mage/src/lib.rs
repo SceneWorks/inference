@@ -13,6 +13,7 @@ pub mod quant;
 pub mod rope;
 pub mod scheduler;
 pub mod text_encoder;
+pub mod training;
 pub mod transformer;
 pub mod vae;
 
@@ -123,11 +124,15 @@ pub(crate) fn component_footprint(
         }
     };
     let dirs = resolve_component_dirs(root, spec)?;
-    Ok(gen_core::PerComponentBytes {
-        text_encoder: gen_core::safetensors_path_bytes(dirs.text_encoder),
-        dit: gen_core::safetensors_path_bytes(dirs.transformer),
-        vae: gen_core::safetensors_path_bytes(dirs.vae),
-    })
+    Ok(component_footprint_from_dirs(&dirs))
+}
+
+fn component_footprint_from_dirs(dirs: &MageComponentDirs) -> gen_core::PerComponentBytes {
+    gen_core::PerComponentBytes {
+        text_encoder: gen_core::safetensors_path_bytes(&dirs.text_encoder),
+        dit: gen_core::safetensors_path_bytes(&dirs.transformer),
+        vae: gen_core::safetensors_path_bytes(&dirs.vae),
+    }
 }
 
 fn generation_descriptor(
@@ -154,6 +159,8 @@ fn generation_descriptor(
                 candle_gen::gen_core::Quant::Q8,
             ],
             component_precision_floors: quant::COMPONENT_PRECISION_FLOORS,
+            supports_lora: true,
+            supports_lokr: true,
             ..Default::default()
         },
     }
@@ -183,6 +190,7 @@ pub struct MageGenerator {
     loaded_quant: Option<candle_gen::gen_core::Quant>,
     memory_strategy: Option<gen_core::MemoryProviderContract>,
     memory_admission: memory_strategy::AdmissionRegistry,
+    adapters: Vec<gen_core::AdapterSpec>,
 }
 
 pub struct MageEditGenerator {
@@ -197,15 +205,21 @@ pub struct MageEditGenerator {
     loaded_quant: Option<candle_gen::gen_core::Quant>,
     memory_strategy: Option<gen_core::MemoryProviderContract>,
     memory_admission: memory_strategy::AdmissionRegistry,
+    adapters: Vec<gen_core::AdapterSpec>,
 }
 
 impl MageEditGenerator {
     fn components(&self) -> gen_core::Result<Arc<MageEdit>> {
         candle_gen::cached(&self.components, || {
             verify_edit_checkpoint(&self.root, self.variant)?;
-            MageEdit::load_components(&self.component_dirs, self.quant, &self.device)
-                .map(Arc::new)
-                .map_err(candle_gen::CandleError::from)
+            MageEdit::load_components(
+                &self.component_dirs,
+                self.quant,
+                &self.device,
+                &self.adapters,
+            )
+            .map(Arc::new)
+            .map_err(candle_gen::CandleError::from)
         })
         .map_err(Into::into)
     }
@@ -482,6 +496,7 @@ impl Generator for MageEditGenerator {
                             &device,
                             stream_transformer_blocks,
                             &req.cancel,
+                            &self.adapters,
                         ),
                         &req.cancel,
                     )
@@ -552,9 +567,14 @@ fn resolve_edit_references(
 impl MageGenerator {
     fn components(&self) -> gen_core::Result<Arc<MagePipeline>> {
         candle_gen::cached(&self.components, || {
-            MagePipeline::load_components(&self.component_dirs, self.quant, &self.device)
-                .map(Arc::new)
-                .map_err(candle_gen::CandleError::from)
+            MagePipeline::load_components(
+                &self.component_dirs,
+                self.quant,
+                &self.device,
+                &self.adapters,
+            )
+            .map(Arc::new)
+            .map_err(candle_gen::CandleError::from)
         })
         .map_err(Into::into)
     }
@@ -713,6 +733,7 @@ impl Generator for MageGenerator {
                             &device,
                             stream_transformer_blocks,
                             &req.cancel,
+                            &self.adapters,
                         ),
                         &req.cancel,
                     )
@@ -743,38 +764,30 @@ impl Generator for MageGenerator {
     }
 }
 
-fn load_generation_variant(
+fn load_generation_from_dirs(
     spec: &LoadSpec,
     descriptor: ModelDescriptor,
     default_steps: u32,
     default_guidance: f32,
+    component_dirs: MageComponentDirs,
 ) -> gen_core::Result<Box<dyn Generator>> {
     if matches!(spec.quantize, Some(candle_gen::gen_core::Quant::Nvfp4)) {
         return Err(gen_core::Error::Unsupported(
             "mage_flow does not support NVFP4".into(),
         ));
     }
-    let root = match &spec.weights {
-        WeightsSource::Dir(path) => path.clone(),
-        WeightsSource::File(_) => {
-            return Err(gen_core::Error::Msg(
-                "mage_flow expects a diffusers snapshot directory".into(),
-            ))
-        }
-    };
-    let component_dirs = resolve_component_dirs(&root, spec)?;
-    if !spec.adapters.is_empty()
-        || spec.control.is_some()
-        || !spec.extra_controls.is_empty()
-        || spec.ip_adapter.is_some()
-    {
+    if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
         return Err(gen_core::Error::Unsupported(
-            "mage_flow RL generation does not accept adapters or control overlays".into(),
+            "mage_flow RL generation does not accept control or IP-Adapter overlays".into(),
         ));
     }
     let device = candle_gen::default_device()?;
     #[cfg(any(feature = "cuda", test))]
-    let memory_strategy = Some(memory_strategy::provider_contract_for(descriptor.id, spec)?);
+    let memory_strategy = Some(memory_strategy::provider_contract_with_components(
+        descriptor.id,
+        spec,
+        component_footprint_from_dirs(&component_dirs),
+    )?);
     #[cfg(not(any(feature = "cuda", test)))]
     let memory_strategy = None;
     Ok(Box::new(MageGenerator {
@@ -789,7 +802,119 @@ fn load_generation_variant(
         lifecycle: Mutex::new(()),
         loaded_quant: spec.quantize,
         memory_strategy,
+        adapters: spec.adapters.clone(),
     }))
+}
+
+fn load_generation_variant(
+    spec: &LoadSpec,
+    descriptor: ModelDescriptor,
+    default_steps: u32,
+    default_guidance: f32,
+) -> gen_core::Result<Box<dyn Generator>> {
+    let root = match &spec.weights {
+        WeightsSource::Dir(path) => path.clone(),
+        WeightsSource::File(_) => {
+            return Err(gen_core::Error::Msg(
+                "mage_flow expects a diffusers snapshot directory".into(),
+            ))
+        }
+    };
+    let component_dirs = resolve_component_dirs(&root, spec)?;
+    load_generation_from_dirs(
+        spec,
+        descriptor,
+        default_steps,
+        default_guidance,
+        component_dirs,
+    )
+}
+
+/// Published Mage sampling identity inherited by a caller-owned full fine-tune.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MageVariant {
+    Base,
+}
+
+/// Load a full-fine-tuned Mage transformer emitted by the Candle trainer. `spec.weights` is the
+/// transformer component directory itself (`config.json` plus
+/// `diffusion_pytorch_model.safetensors`), while the unchanged text encoder and VAE must be staged
+/// explicitly through `LoadSpec::components`. This is intentionally outside the published-model
+/// registry because the transformer is a caller-owned artifact at an arbitrary confined path.
+pub fn load_finetuned(
+    variant: MageVariant,
+    spec: &LoadSpec,
+) -> gen_core::Result<Box<dyn Generator>> {
+    if spec.precision != gen_core::Precision::Bf16 {
+        return Err(gen_core::Error::Unsupported(
+            "mage_flow fine-tuned checkpoints load as bf16".into(),
+        ));
+    }
+    if !spec.adapters.is_empty() {
+        return Err(gen_core::Error::Unsupported(
+            "mage_flow fine-tuned checkpoints cannot take LoRA/LoKr adapters".into(),
+        ));
+    }
+    if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
+        return Err(gen_core::Error::Unsupported(
+            "mage_flow fine-tuned checkpoints do not accept control or IP-Adapter overlays".into(),
+        ));
+    }
+    if spec.pid.is_some() || spec.identity.is_some() {
+        return Err(gen_core::Error::Unsupported(
+            "mage_flow fine-tuned checkpoints do not accept PiD or identity overlays".into(),
+        ));
+    }
+    if spec.text_encoder.is_some() {
+        return Err(gen_core::Error::Unsupported(
+            "mage_flow fine-tuned checkpoints require the named text_encoder component, not the typed text_encoder overlay".into(),
+        ));
+    }
+    gen_core::reject_unknown_components(spec, REQUIRED_COMPONENTS, config::FAMILY)?;
+    let transformer = match &spec.weights {
+        WeightsSource::Dir(path) => path.clone(),
+        WeightsSource::File(path) => {
+            return Err(gen_core::Error::Msg(format!(
+                "mage_flow fine-tuned checkpoint must be a transformer directory, got {}",
+                path.display()
+            )))
+        }
+    };
+    for file in [
+        transformer.join("config.json"),
+        transformer.join("diffusion_pytorch_model.safetensors"),
+    ] {
+        if !file.is_file() {
+            return Err(gen_core::Error::Msg(format!(
+                "mage_flow fine-tuned checkpoint is incomplete: missing {}",
+                file.display()
+            )));
+        }
+    }
+    let staged_dir = |id: &str| -> gen_core::Result<PathBuf> {
+        match spec.components.get(id) {
+            Some(WeightsSource::Dir(path)) if path.is_dir() => Ok(path.clone()),
+            Some(WeightsSource::Dir(path)) => Err(gen_core::Error::Msg(format!(
+                "mage_flow fine-tuned component '{id}' directory does not exist: {}",
+                path.display()
+            ))),
+            Some(WeightsSource::File(path)) => Err(gen_core::Error::Msg(format!(
+                "mage_flow fine-tuned component '{id}' must be a directory, got {}",
+                path.display()
+            ))),
+            None => Err(gen_core::Error::Msg(format!(
+                "mage_flow fine-tuned checkpoint requires staged '{id}' from the installed base"
+            ))),
+        }
+    };
+    let dirs = MageComponentDirs {
+        transformer,
+        text_encoder: staged_dir(COMPONENT_TEXT_ENCODER)?,
+        vae: staged_dir(COMPONENT_VAE)?,
+    };
+    match variant {
+        MageVariant::Base => load_generation_from_dirs(spec, descriptor_base(), 30, 5.0, dirs),
+    }
 }
 
 pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
@@ -831,6 +956,8 @@ pub fn edit_descriptor(variant: MageEditVariant) -> ModelDescriptor {
                 candle_gen::gen_core::Quant::Q8,
             ],
             component_precision_floors: quant::COMPONENT_PRECISION_FLOORS,
+            supports_lora: true,
+            supports_lokr: true,
             ..Default::default()
         },
     }
@@ -858,13 +985,9 @@ fn load_edit_variant(
             variant.id()
         )));
     }
-    if !spec.adapters.is_empty()
-        || spec.control.is_some()
-        || !spec.extra_controls.is_empty()
-        || spec.ip_adapter.is_some()
-    {
+    if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
-            "{} does not accept adapters or control overlays",
+            "{} does not accept control or IP-Adapter overlays",
             variant.id()
         )));
     }
@@ -896,6 +1019,7 @@ fn load_edit_variant(
         lifecycle: Mutex::new(()),
         loaded_quant: spec.quantize,
         memory_strategy,
+        adapters: spec.adapters.clone(),
     }))
 }
 
@@ -939,7 +1063,8 @@ pub fn register_providers(
         .register_generator(TURBO_REGISTRATION)
         .register_generator(EDIT_REGISTRATION)
         .register_generator(EDIT_BASE_REGISTRATION)
-        .register_generator(EDIT_TURBO_REGISTRATION);
+        .register_generator(EDIT_TURBO_REGISTRATION)
+        .register_trainer(training::TRAINER_REGISTRATION);
     #[cfg(feature = "cuda")]
     let registry = registry
         .register_memory_strategy(RL_MEMORY_REGISTRATION)
@@ -1035,6 +1160,11 @@ mod registry_tests {
                 "mage_flow_edit_turbo"
             ]
         );
+        let trainers: Vec<_> = registry
+            .trainers()
+            .map(|registration| (registration.descriptor)().id)
+            .collect();
+        assert_eq!(trainers, [config::BASE_MODEL_ID]);
         let g = registry
             .load(
                 MODEL_ID,
@@ -1231,6 +1361,111 @@ mod registry_tests {
         assert_eq!(edit.asset_facts.conditioning_bytes, 30);
         assert_eq!(generation.asset_facts.base_bytes, 41);
         assert_eq!(edit.asset_facts.base_bytes, 41);
+    }
+
+    #[test]
+    fn trainer_emitted_full_checkpoint_loads_as_the_transformer_component() {
+        let root = tempfile::tempdir().unwrap();
+        let transformer = root.path().join("trained-model");
+        let text = root.path().join("base/text_encoder");
+        let vae = root.path().join("base/vae");
+        for directory in [&transformer, &text, &vae] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        std::fs::write(transformer.join("config.json"), b"{}").unwrap();
+        std::fs::write(
+            transformer.join("diffusion_pytorch_model.safetensors"),
+            vec![0u8; 23],
+        )
+        .unwrap();
+        std::fs::write(text.join("model.safetensors"), vec![0u8; 13]).unwrap();
+        std::fs::write(vae.join("model.safetensors"), vec![0u8; 17]).unwrap();
+
+        let spec = LoadSpec::new(WeightsSource::Dir(transformer.clone()))
+            .with_component(COMPONENT_TEXT_ENCODER, WeightsSource::Dir(text))
+            .with_component(COMPONENT_VAE, WeightsSource::Dir(vae));
+        let generator = load_finetuned(MageVariant::Base, &spec).expect(
+            "the trainer output directory is the transformer component, not a snapshot root",
+        );
+        let contract = generator
+            .memory_strategy_contract()
+            .expect("fine-tuned load publishes exact admission facts");
+        assert_eq!(contract.asset_facts.base_bytes, 53);
+        assert_eq!(contract.asset_facts.conditioning_bytes, 13);
+
+        let old_shape = LoadSpec::new(WeightsSource::Dir(root.path().join("missing")))
+            .with_component(
+                COMPONENT_TEXT_ENCODER,
+                WeightsSource::Dir(root.path().join("base/text_encoder")),
+            )
+            .with_component(
+                COMPONENT_VAE,
+                WeightsSource::Dir(root.path().join("base/vae")),
+            );
+        assert!(load_finetuned(MageVariant::Base, &old_shape)
+            .err()
+            .expect("an incomplete checkpoint must fail")
+            .to_string()
+            .contains("incomplete"));
+    }
+
+    #[test]
+    fn fine_tuned_load_rejects_every_unconsumed_overlay() {
+        let root = tempfile::tempdir().unwrap();
+        let transformer = root.path().join("trained-model");
+        let text = root.path().join("base/text_encoder");
+        let vae = root.path().join("base/vae");
+        for directory in [&transformer, &text, &vae] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        std::fs::write(transformer.join("config.json"), b"{}").unwrap();
+        std::fs::write(
+            transformer.join("diffusion_pytorch_model.safetensors"),
+            vec![0u8; 23],
+        )
+        .unwrap();
+        std::fs::write(text.join("model.safetensors"), vec![0u8; 13]).unwrap();
+        std::fs::write(vae.join("model.safetensors"), vec![0u8; 17]).unwrap();
+
+        let spec = LoadSpec::new(WeightsSource::Dir(transformer))
+            .with_component(COMPONENT_TEXT_ENCODER, WeightsSource::Dir(text))
+            .with_component(COMPONENT_VAE, WeightsSource::Dir(vae));
+        let rejected = |candidate: &LoadSpec, needle: &str| {
+            let error = load_finetuned(MageVariant::Base, candidate)
+                .err()
+                .expect("an unsupported fine-tuned overlay must fail closed");
+            assert!(
+                error.to_string().contains(needle),
+                "unexpected error: {error}"
+            );
+        };
+
+        let mut candidate = spec.clone();
+        candidate.control = Some(WeightsSource::File("control.safetensors".into()));
+        rejected(&candidate, "control or IP-Adapter");
+
+        let mut candidate = spec.clone();
+        candidate.extra_controls = vec![WeightsSource::File("extra.safetensors".into())];
+        rejected(&candidate, "control or IP-Adapter");
+
+        let mut candidate = spec.clone();
+        candidate.ip_adapter = Some(WeightsSource::File("ip.safetensors".into()));
+        rejected(&candidate, "control or IP-Adapter");
+
+        let mut candidate = spec.clone();
+        candidate.pid = Some(gen_core::PidWeights {
+            checkpoint: WeightsSource::File("pid.safetensors".into()),
+            gemma: WeightsSource::Dir("gemma".into()),
+        });
+        rejected(&candidate, "PiD or identity");
+
+        let mut candidate = spec.clone();
+        candidate.identity = Some(gen_core::IdentityWeights::default());
+        rejected(&candidate, "PiD or identity");
+
+        let mut candidate = spec.clone();
+        candidate.text_encoder = Some(WeightsSource::Dir("typed-text-encoder".into()));
+        rejected(&candidate, "named text_encoder component");
     }
 
     #[test]

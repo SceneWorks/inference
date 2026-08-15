@@ -20,7 +20,7 @@
 
 use candle_core::{DType, IndexOp, Result, Tensor, D};
 use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
-use candle_nn::{LayerNorm, Linear, RmsNorm, VarBuilder};
+use candle_nn::{LayerNorm, RmsNorm, VarBuilder};
 
 pub use candle_transformers::models::flux::model::Config;
 
@@ -209,14 +209,14 @@ impl candle_core::Module for EmbedNd {
 
 #[derive(Debug, Clone)]
 struct MlpEmbedder {
-    in_layer: Linear,
-    out_layer: Linear,
+    in_layer: QLinear,
+    out_layer: QLinear,
 }
 
 impl MlpEmbedder {
     fn new(in_sz: usize, h_sz: usize, vb: VarBuilder) -> Result<Self> {
-        let in_layer = candle_nn::linear(in_sz, h_sz, vb.pp("in_layer"))?;
-        let out_layer = candle_nn::linear(h_sz, h_sz, vb.pp("out_layer"))?;
+        let in_layer = QLinear::linear(in_sz, h_sz, vb.pp("in_layer"))?;
+        let out_layer = QLinear::linear(h_sz, h_sz, vb.pp("out_layer"))?;
         Ok(Self {
             in_layer,
             out_layer,
@@ -226,7 +226,7 @@ impl MlpEmbedder {
 
 impl candle_core::Module for MlpEmbedder {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        xs.apply(&self.in_layer)?.silu()?.apply(&self.out_layer)
+        self.out_layer.forward(&self.in_layer.forward(xs)?.silu()?)
     }
 }
 
@@ -268,12 +268,12 @@ impl ModulationOut {
 
 #[derive(Debug, Clone)]
 struct Modulation1 {
-    lin: Linear,
+    lin: QLinear,
 }
 
 impl Modulation1 {
     fn new(dim: usize, vb: VarBuilder) -> Result<Self> {
-        let lin = candle_nn::linear(dim, 3 * dim, vb.pp("lin"))?;
+        let lin = QLinear::linear(dim, 3 * dim, vb.pp("lin"))?;
         Ok(Self { lin })
     }
 
@@ -296,12 +296,12 @@ impl Modulation1 {
 
 #[derive(Debug, Clone)]
 struct Modulation2 {
-    lin: Linear,
+    lin: QLinear,
 }
 
 impl Modulation2 {
     fn new(dim: usize, vb: VarBuilder) -> Result<Self> {
-        let lin = candle_nn::linear(dim, 6 * dim, vb.pp("lin"))?;
+        let lin = QLinear::linear(dim, 6 * dim, vb.pp("lin"))?;
         Ok(Self { lin })
     }
 
@@ -557,14 +557,14 @@ impl SingleStreamBlock {
 struct LastLayer {
     norm_final: LayerNorm,
     linear: QLinear,
-    ada_ln_modulation: Linear,
+    ada_ln_modulation: QLinear,
 }
 
 impl LastLayer {
     fn new(h_sz: usize, p_sz: usize, out_c: usize, vb: VarBuilder) -> Result<Self> {
         let norm_final = layer_norm(h_sz, vb.pp("norm_final"))?;
         let linear = QLinear::linear_detect(h_sz, p_sz * p_sz * out_c, &vb, "linear", true)?;
-        let ada_ln_modulation = candle_nn::linear(h_sz, 2 * h_sz, vb.pp("adaLN_modulation.1"))?;
+        let ada_ln_modulation = QLinear::linear(h_sz, 2 * h_sz, vb.pp("adaLN_modulation.1"))?;
         Ok(Self {
             norm_final,
             linear,
@@ -618,6 +618,63 @@ impl IpFlux {
             FluxBlocks::Resident { double, .. } => double.len(),
             FluxBlocks::Streamed { config, .. } => config.depth,
         }
+    }
+
+    /// Walk the native BFL-layout FLUX.1 adapter surface. This includes the fused qkv/linear1
+    /// projections used by native BFL/ComfyUI LoRAs and all global embedders/modulation projections.
+    pub fn visit_adaptable_mut(
+        &mut self,
+        visitor: &mut dyn FnMut(&str, &mut candle_gen::quant::AdaptLinear) -> Result<()>,
+    ) -> Result<()> {
+        visitor("img_in", &mut self.img_in)?;
+        visitor("txt_in", &mut self.txt_in)?;
+        for (prefix, embedder) in [
+            ("time_in", &mut self.time_in),
+            ("vector_in", &mut self.vector_in),
+        ] {
+            visitor(&format!("{prefix}.in_layer"), &mut embedder.in_layer)?;
+            visitor(&format!("{prefix}.out_layer"), &mut embedder.out_layer)?;
+        }
+        if let Some(embedder) = &mut self.guidance_in {
+            visitor("guidance_in.in_layer", &mut embedder.in_layer)?;
+            visitor("guidance_in.out_layer", &mut embedder.out_layer)?;
+        }
+        match &mut self.blocks {
+            FluxBlocks::Resident { double, single } => {
+                for (index, block) in double.iter_mut().enumerate() {
+                    let prefix = format!("double_blocks.{index}");
+                    visitor(&format!("{prefix}.img_mod.lin"), &mut block.img_mod.lin)?;
+                    visitor(&format!("{prefix}.img_attn.qkv"), &mut block.img_attn.qkv)?;
+                    visitor(&format!("{prefix}.img_attn.proj"), &mut block.img_attn.proj)?;
+                    visitor(&format!("{prefix}.img_mlp.0"), &mut block.img_mlp.lin1)?;
+                    visitor(&format!("{prefix}.img_mlp.2"), &mut block.img_mlp.lin2)?;
+                    visitor(&format!("{prefix}.txt_mod.lin"), &mut block.txt_mod.lin)?;
+                    visitor(&format!("{prefix}.txt_attn.qkv"), &mut block.txt_attn.qkv)?;
+                    visitor(&format!("{prefix}.txt_attn.proj"), &mut block.txt_attn.proj)?;
+                    visitor(&format!("{prefix}.txt_mlp.0"), &mut block.txt_mlp.lin1)?;
+                    visitor(&format!("{prefix}.txt_mlp.2"), &mut block.txt_mlp.lin2)?;
+                }
+                for (index, block) in single.iter_mut().enumerate() {
+                    let prefix = format!("single_blocks.{index}");
+                    visitor(&format!("{prefix}.linear1"), &mut block.linear1)?;
+                    visitor(&format!("{prefix}.linear2"), &mut block.linear2)?;
+                    visitor(
+                        &format!("{prefix}.modulation.lin"),
+                        &mut block.modulation.lin,
+                    )?;
+                }
+            }
+            FluxBlocks::Streamed { .. } => {
+                candle_core::bail!(
+                    "FLUX adapters require resident transformer blocks; disable block streaming"
+                )
+            }
+        }
+        visitor("final_layer.linear", &mut self.final_layer.linear)?;
+        visitor(
+            "final_layer.adaLN_modulation.1",
+            &mut self.final_layer.ada_ln_modulation,
+        )
     }
 
     pub fn new(cfg: &Config, vb: VarBuilder<'static>) -> Result<Self> {

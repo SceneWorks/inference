@@ -38,7 +38,7 @@ use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
 use candle_gen::gen_core::imageops::resize_lanczos_u8;
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::{GenerationMemory, Image, PreviewSink, Progress};
+use candle_gen::gen_core::{AdapterSpec, GenerationMemory, Image, PreviewSink, Progress};
 use candle_gen::preview::PreviewHook;
 use candle_gen::{CandleError, Result};
 
@@ -73,6 +73,7 @@ pub struct Flux1ControlPaths {
     /// The `FLUX.1-dev-ControlNet-Union-Pro-2.0` checkpoint (a single `.safetensors`
     /// `diffusion_pytorch_model.safetensors`, or a dir containing it).
     pub control: PathBuf,
+    pub adapters: Vec<AdapterSpec>,
 }
 
 /// One FLUX.1-dev strict-control request. dev is guidance-distilled — `guidance` is the embedded scalar
@@ -208,7 +209,14 @@ impl Flux1DevControl {
         let root = paths.flux_base.clone();
         let variant = Variant::Dev; // the Shakker control is FLUX.1-dev only.
 
-        let backbone = FluxRefBackbone::load_with_memory(&root, variant, &device, dtype, memory)?;
+        let backbone = FluxRefBackbone::load_with_memory(
+            &root,
+            variant,
+            &device,
+            dtype,
+            memory,
+            paths.adapters.clone(),
+        )?;
 
         // The Shakker control overlay (diffusers layout, un-prefixed keys). The branch shares the base
         // FLUX config's dims (hidden / heads / RoPE) so its residuals align with the base image tokens.

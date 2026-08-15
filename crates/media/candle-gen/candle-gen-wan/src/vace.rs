@@ -489,6 +489,73 @@ pub fn denoise_vace(
     Ok(latents)
 }
 
+/// First denoise step below the Wan2.2 expert boundary. Pure CPU structural seam shared by resident
+/// selection tests and the staged VACE-Fun expert swap.
+pub fn crossing_index(timesteps: &[f64], boundary_timestep: f64) -> usize {
+    timesteps
+        .iter()
+        .position(|&timestep| timestep < boundary_timestep)
+        .unwrap_or(timesteps.len())
+}
+
+/// Run a contiguous denoise range on one VACE expert while preserving a single scheduler across the
+/// high→low boundary. The expert embeds its own text/control projections once for its range.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_vace_range(
+    transformer: &WanVaceTransformer,
+    control: &Tensor,
+    scales: &[f32],
+    scheduler: &mut FlowScheduler,
+    guidance: f64,
+    ctx_pos: &Tensor,
+    ctx_neg: Option<&Tensor>,
+    latents: &mut Tensor,
+    timesteps: &[f64],
+    range: std::ops::Range<usize>,
+    cos: &Tensor,
+    sin: &Tensor,
+    cancel: &CancelFlag,
+    on_step: &mut dyn FnMut(usize),
+) -> CResult<()> {
+    let (_b, _c, f, hl, wl) = latents.dims5()?;
+    let (pt, ph, pw) = transformer.cfg.base.patch;
+    let l = (f / pt) * (hl / ph) * (wl / pw);
+    let control_emb = transformer.embed_control(control, l)?;
+    for i in range {
+        if cancel.is_cancelled() {
+            return Err(CandleError::Canceled);
+        }
+        let timestep = timesteps[i];
+        let cond = transformer.forward_cached(
+            latents,
+            timestep,
+            &control_emb,
+            ctx_pos,
+            scales,
+            cos,
+            sin,
+        )?;
+        let velocity = match ctx_neg {
+            Some(negative) => {
+                let uncond = transformer.forward_cached(
+                    latents,
+                    timestep,
+                    &control_emb,
+                    negative,
+                    scales,
+                    cos,
+                    sin,
+                )?;
+                cfg(&cond, &uncond, guidance)?
+            }
+            None => cond,
+        };
+        *latents = scheduler.step(&velocity, latents)?;
+        on_step(i + 1);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -548,6 +615,18 @@ mod tests {
             .to_vec1::<f32>()
             .unwrap();
         assert!(frame1.iter().all(|&v| v == 1.0));
+    }
+
+    #[test]
+    fn vace_fun_boundary_selects_one_high_prefix() {
+        let timesteps = [999.0, 910.0, 874.0, 500.0, 0.0];
+        let crossing = crossing_index(&timesteps, 875.0);
+        assert_eq!(crossing, 2);
+        let selected = timesteps
+            .iter()
+            .map(|&t| if t >= 875.0 { "high" } else { "low" })
+            .collect::<Vec<_>>();
+        assert_eq!(selected, vec!["high", "high", "low", "low", "low"]);
     }
 
     #[test]

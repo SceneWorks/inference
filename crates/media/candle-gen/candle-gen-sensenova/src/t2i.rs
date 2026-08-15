@@ -1,6 +1,6 @@
-//! Text-to-image generation — the candle port of `mlx-gen-sensenova`'s `t2i.rs` `t2i_generate` spine,
-//! scoped to the **non-think T2I** path the `Generator` contract drives (it2i / VQA / interleave /
-//! think-mode are the understanding surface → Phase 6).
+//! Image generation — the candle port of `mlx-gen-sensenova`'s T2I and it2i spines. The registered
+//! `Generator` drives non-think text-to-image plus instruction-edit / Character-Studio reference
+//! conditioning; VQA and mixed text/image interleave remain direct concrete-model APIs.
 //!
 //! The flow:
 //! 1. Build the `neo1_0` query ([`build_neo1_query`] + [`SYSTEM_MESSAGE_FOR_GEN`] + the no-think
@@ -388,6 +388,120 @@ impl T2iModel {
         Ok(image)
     }
 
+    /// Image-conditioned generation for instruction edit and Character Studio. Source images are
+    /// decoded RGB tensors `[3,H,W]` in `[0,1]`, already smart-resized to the model's 32-pixel grid.
+    /// Text guidance (`cfg_scale`) and image guidance (`img_cfg_scale`) use the same three-cache blend
+    /// as the reference implementation and [`Self::interleave_gen`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn it2i_generate(
+        &self,
+        tokenizer: &SenseNovaTokenizer,
+        prompt: &str,
+        images: &[Tensor],
+        width: usize,
+        height: usize,
+        opts: &T2iOptions,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+        preview: &PreviewHook<'_>,
+    ) -> Result<Tensor> {
+        let cell = self.cell();
+        if !width.is_multiple_of(cell) || !height.is_multiple_of(cell) {
+            return Err(CandleError::Msg(format!(
+                "sensenova it2i: width/height must be multiples of {cell}, got {width}x{height}"
+            )));
+        }
+        if images.is_empty() {
+            return Err(CandleError::Msg(
+                "sensenova it2i requires at least one source image".into(),
+            ));
+        }
+        if opts.think_mode {
+            return Err(CandleError::Msg(
+                "sensenova it2i: think mode is not available through the image Generator route"
+                    .into(),
+            ));
+        }
+
+        let mut pv_parts = Vec::with_capacity(images.len());
+        let mut grids = Vec::with_capacity(images.len());
+        for image in images {
+            let (patches, grid) = self.preprocess_image(image)?;
+            pv_parts.push(patches);
+            grids.push(grid);
+        }
+        let pv_refs: Vec<&Tensor> = pv_parts.iter().collect();
+        let pixel_values = Tensor::cat(&pv_refs, 0)?;
+
+        let marker_count = prompt.matches("<image>").count();
+        let mut question = prompt.to_owned();
+        if images.len() > marker_count {
+            let missing = images.len() - marker_count;
+            let prefix = if marker_count == 0 && images.len() > 1 {
+                (0..images.len())
+                    .map(|index| format!("Image-{}:<image>\n", index + 1))
+                    .collect::<String>()
+            } else {
+                "<image>\n".repeat(missing)
+            };
+            question = format!("{prefix}{question}");
+        }
+
+        let (needs_img, needs_uncond) = it2i_cache_requirements(opts.cfg_scale, opts.img_cfg_scale);
+
+        let cond_query = format!(
+            "{}<think>\n\n</think>\n\n<img>",
+            build_neo1_query(&question, SYSTEM_MESSAGE_FOR_GEN)
+        );
+        let cond_ids = self.build_it2i_query_ids(tokenizer, &cond_query, &grids)?;
+        let (cond_embeds, cond_t, cond_h, cond_w) =
+            self.build_it2i_prefix(&cond_ids, Some(&pixel_values), &grids)?;
+        let (mut cache_cond, _, cond_temporal) =
+            self.prefill_prefix(&cond_embeds, &cond_t, &cond_h, &cond_w)?;
+
+        let mut cache_img = if needs_img {
+            let query = format!(
+                "{}<img>",
+                build_neo1_query(&"<image>".repeat(images.len()), "")
+            );
+            let ids = self.build_it2i_query_ids(tokenizer, &query, &grids)?;
+            let (embeds, t, h, w) = self.build_it2i_prefix(&ids, Some(&pixel_values), &grids)?;
+            let (cache, _, temporal) = self.prefill_prefix(&embeds, &t, &h, &w)?;
+            Some((cache, temporal))
+        } else {
+            None
+        };
+
+        let mut cache_uncond = if needs_uncond {
+            let query = format!("{}<img>", build_neo1_query("", ""));
+            let ids = tokenizer.encode_ids(&query, true)?;
+            let (embeds, t, h, w) = self.build_it2i_prefix(&ids, None, &[])?;
+            let (cache, _, temporal) = self.prefill_prefix(&embeds, &t, &h, &w)?;
+            Some((cache, temporal))
+        } else {
+            None
+        };
+
+        let img_temporal = cache_img.as_ref().map_or(0, |(_, temporal)| *temporal);
+        let uncond_temporal = cache_uncond.as_ref().map_or(0, |(_, temporal)| *temporal);
+        let base_noise = gaussian((1, 3, height, width), opts.seed, &self.device)?;
+        self.it2i_denoise(
+            &mut cache_cond,
+            cond_temporal,
+            cache_img.as_mut().map(|(cache, _)| cache),
+            img_temporal,
+            cache_uncond.as_mut().map(|(cache, _)| cache),
+            uncond_temporal,
+            width,
+            height,
+            &base_noise,
+            opts,
+            cancel,
+            on_progress,
+            preview,
+        )
+    }
+
     /// The flow-matching denoise loop. Returns the final model-space image `[1,3,H,W]`.
     ///
     /// This is SenseNova-U1's **only registered denoise lane** and it is genuinely bespoke: the crate
@@ -537,39 +651,70 @@ impl T2iModel {
         &self,
         ids: &[i32],
         grids: &[(usize, usize)],
-    ) -> (Vec<i32>, Vec<i32>, Vec<i32>) {
-        let n = ids.len();
-        let mut t = Vec::with_capacity(n);
-        let mut acc = 0i32;
-        for i in 0..n {
-            let shift = i32::from(i > 0 && ids[i - 1] == self.img_start_id);
-            let not_img = i32::from(ids[i] != self.img_context_id);
-            acc += shift + not_img;
-            t.push(acc - 1);
-        }
-        // Merged-grid (row=y, col=x) coordinates, concatenated across images in order.
-        let merge = self.merge_size;
-        let mut abs = Vec::new();
-        for &(gh, gw) in grids {
-            let (mh, mw) = (gh / merge, gw / merge);
-            for idx in 0..(mh * mw) {
-                abs.push(((idx / mw) as i32, (idx % mw) as i32));
-            }
-        }
-        let mut h = vec![0i32; n];
-        let mut w = vec![0i32; n];
-        let mut k = 0usize;
-        for i in 0..n {
-            if ids[i] == self.img_context_id {
-                let (y, x) = abs[k];
-                h[i] = y;
-                w[i] = x;
-                k += 1;
-            }
-        }
-        (t, h, w)
+    ) -> CResult<(Vec<i32>, Vec<i32>, Vec<i32>)> {
+        thw_indexes(
+            ids,
+            grids,
+            self.img_start_id,
+            self.img_context_id,
+            self.merge_size,
+        )
     }
+}
 
+/// Pure position builder shared by the production it2i prefix path and its token-level regressions.
+/// It fails closed when tokenizer-produced image markers disagree with the supplied vision grids;
+/// user text can otherwise introduce a reserved `<IMG_CONTEXT>` token before vision features exist.
+fn thw_indexes(
+    ids: &[i32],
+    grids: &[(usize, usize)],
+    img_start_id: i32,
+    img_context_id: i32,
+    merge_size: usize,
+) -> CResult<(Vec<i32>, Vec<i32>, Vec<i32>)> {
+    let n = ids.len();
+    let mut t = Vec::with_capacity(n);
+    let mut acc = 0i32;
+    for i in 0..n {
+        let shift = i32::from(i > 0 && ids[i - 1] == img_start_id);
+        let not_img = i32::from(ids[i] != img_context_id);
+        acc += shift + not_img;
+        t.push(acc - 1);
+    }
+    // Merged-grid (row=y, col=x) coordinates, concatenated across images in order.
+    let mut abs = Vec::new();
+    for &(gh, gw) in grids {
+        let (mh, mw) = (gh / merge_size, gw / merge_size);
+        for idx in 0..(mh * mw) {
+            abs.push(((idx / mw) as i32, (idx % mw) as i32));
+        }
+    }
+    let context_count = ids.iter().filter(|&&id| id == img_context_id).count();
+    if context_count != abs.len() {
+        return Err(candle_gen::candle_core::Error::Msg(format!(
+            "sensenova it2i: {context_count} <IMG_CONTEXT> tokens but {} merged-grid positions",
+            abs.len()
+        )));
+    }
+    let mut h = vec![0i32; n];
+    let mut w = vec![0i32; n];
+    let mut k = 0usize;
+    for i in 0..n {
+        if ids[i] == img_context_id {
+            let (y, x) = abs.get(k).copied().ok_or_else(|| {
+                candle_gen::candle_core::Error::Msg(format!(
+                    "sensenova it2i: <IMG_CONTEXT> position {k} has no merged-grid coordinate"
+                ))
+            })?;
+            h[i] = y;
+            w[i] = x;
+            k += 1;
+        }
+    }
+    Ok((t, h, w))
+}
+
+impl T2iModel {
     /// Embed `ids` and splice the understanding vision features into the `<IMG_CONTEXT>` positions
     /// (the reference `_build_it2i_inputs`). Returns the prefix embeds `[1, S, hidden]` and its
     /// `(t, h, w)` rows. Scatter is a one-hot selection matmul (no in-place index assignment).
@@ -582,7 +727,7 @@ impl T2iModel {
     ) -> CResult<(Tensor, Vec<i32>, Vec<i32>, Vec<i32>)> {
         let s = ids.len();
         let mut embeds = self.backbone.embed(ids)?; // [1, S, H]
-        let (t, h, w) = self.get_thw_indexes(ids, grids);
+        let (t, h, w) = self.get_thw_indexes(ids, grids)?;
 
         if let Some(pv) = pixel_values {
             let vit = self.und_vision_features(pv, grids)?; // [n_ctx, H]
@@ -825,6 +970,7 @@ impl T2iModel {
         opts: &T2iOptions,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
+        preview: &PreviewHook<'_>,
     ) -> Result<Tensor> {
         let cell = self.cell();
         let token_h = height / cell;
@@ -868,11 +1014,13 @@ impl T2iModel {
             Some(c) => Some(self.prepare_gen(token_h, token_w, uncond_t, c.len())?),
             None => None,
         };
+        let preview_counter = PreviewCounter::with_steps(steps);
 
         for i in 0..steps {
             if cancel.is_cancelled() {
                 return Err(CandleError::Canceled);
             }
+            preview.emit_step(&preview_counter, i, &image);
             let t = timesteps[i];
             let t_next = timesteps[i + 1];
             // it2i CFG-interval gate: **exclusive** `(i0, i1)` OR an `i0 == 0` always-on override —
@@ -945,6 +1093,41 @@ impl T2iModel {
         max_new_tokens: usize,
         max_images: usize,
         cancel: &CancelFlag,
+    ) -> Result<InterleaveOutput> {
+        crate::preview::with_inert_t2i_preview(self.cell(), |preview| {
+            self.interleave_gen_with_preview(
+                tokenizer,
+                prompt,
+                input_images,
+                width,
+                height,
+                opts,
+                system_message,
+                max_new_tokens,
+                max_images,
+                cancel,
+                preview,
+            )
+        })
+    }
+
+    /// Preview-aware sibling of [`Self::interleave_gen`]. The legacy method preserves the original
+    /// public signature and delegates here with an inert hook; callers with a preview carrier use
+    /// this method to receive frames from the same interleave denoise loop.
+    #[allow(clippy::too_many_arguments)]
+    pub fn interleave_gen_with_preview(
+        &self,
+        tokenizer: &SenseNovaTokenizer,
+        prompt: &str,
+        input_images: &[Tensor],
+        width: usize,
+        height: usize,
+        opts: &T2iOptions,
+        system_message: &str,
+        max_new_tokens: usize,
+        max_images: usize,
+        cancel: &CancelFlag,
+        preview: &PreviewHook<'_>,
     ) -> Result<InterleaveOutput> {
         let cell = self.cell();
         if !width.is_multiple_of(cell) || !height.is_multiple_of(cell) {
@@ -1064,6 +1247,7 @@ impl T2iModel {
                 opts,
                 cancel,
                 &mut sink,
+                preview,
             )?;
 
             // Re-encode the generated image back into the condition + text-uncondition caches.
@@ -1254,6 +1438,32 @@ mod tests {
 
     fn flat(t: &Tensor) -> Vec<f32> {
         t.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+    }
+
+    #[test]
+    fn thw_indexes_rejects_token_grid_mismatch_without_panicking() {
+        // These are the production tokenizer ids. A literal reserved marker in user text used to
+        // add this context id without a vision grid and index past the empty coordinate vector.
+        let injected = [tokens::IMG_START, tokens::IMG_CONTEXT, tokens::IMG_END];
+        let err = thw_indexes(&injected, &[], tokens::IMG_START, tokens::IMG_CONTEXT, 2)
+            .expect_err("a tokenizer marker without a vision grid must be a typed error");
+        assert_eq!(
+            err.to_string(),
+            "sensenova it2i: 1 <IMG_CONTEXT> tokens but 0 merged-grid positions"
+        );
+
+        let exact = [
+            tokens::IMG_START,
+            tokens::IMG_CONTEXT,
+            tokens::IMG_CONTEXT,
+            tokens::IMG_CONTEXT,
+            tokens::IMG_CONTEXT,
+            tokens::IMG_END,
+        ];
+        let (_, h, w) =
+            thw_indexes(&exact, &[(4, 4)], tokens::IMG_START, tokens::IMG_CONTEXT, 2).unwrap();
+        assert_eq!(h, vec![0, 0, 0, 1, 1, 0]);
+        assert_eq!(w, vec![0, 0, 1, 0, 1, 0]);
     }
 
     #[test]

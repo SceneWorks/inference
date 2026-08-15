@@ -73,7 +73,9 @@ pub use clip::{ClipVisionConfig, ScailClip};
 pub use config::Scail2Config;
 pub use generate::{generate, CharacterRef, Components, Scail2Job};
 pub use model::{Scail2Dit, Scail2Inputs};
-pub use pipeline::{descriptor, load, MODEL_ID};
+pub use pipeline::{
+    descriptor, load, snapshot_layout, SnapshotLayout, MODEL_ID, SHARED_TIER_FILES,
+};
 pub use preprocess::extract_and_compress_mask_to_latent;
 pub use resize::{clip_preprocess, downsample_half, interpolate, Interp};
 pub use rope::ScailRope;

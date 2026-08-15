@@ -43,16 +43,17 @@
 use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
+use candle_gen::gen_core::imageops::resize_lanczos_u8;
 use candle_gen::gen_core::sampling::{build_flow_sigmas, TimestepConvention};
 use candle_gen::gen_core::{CancelFlag, Image, PreviewSink, Progress};
 use candle_gen::{
-    resolve_flow_schedule, run_flow_sampler, run_scm_sampler, CandleError, Result, ScmScheduler,
-    Weights,
+    resolve_flow_schedule, run_flow_sampler, run_scm_sampler, run_scm_sampler_from, CandleError,
+    Result, ScmScheduler, Weights,
 };
 use candle_gen_pid::{Gemma2, Gemma2Config};
 
 use crate::config::{DcAeConfig, SanaTransformerConfig};
-use crate::dc_ae::DcAeDecoder;
+use crate::dc_ae::{DcAeDecoder, DcAeEncoder};
 use crate::text_encoder::SanaTextEncoder;
 use crate::transformer::SanaTransformer;
 
@@ -68,6 +69,56 @@ pub const SCHEDULE_SHIFT: f32 = 3.0;
 pub const DEFAULT_STEPS: usize = 20;
 /// diffusers `SanaPipeline` default `guidance_scale`.
 pub const DEFAULT_GUIDANCE: f32 = 4.5;
+/// Shared SANA img2img strength when neither the reference nor request supplies one.
+pub const DEFAULT_IMG2IMG_STRENGTH: f32 = 0.5;
+
+/// Resolve the product img2img strength precedence. Explicit zero is preserved as txt2img.
+pub fn resolve_strength(reference: Option<f32>, request: Option<f32>) -> f32 {
+    reference.or(request).unwrap_or(DEFAULT_IMG2IMG_STRENGTH)
+}
+
+/// Resolve the product img2img start-step convention: positive strength selects
+/// `max(1, floor(steps * strength))`, clamped to the schedule; non-positive is txt2img.
+pub fn init_time_step(num_steps: usize, strength: Option<f32>) -> usize {
+    match strength {
+        Some(s) if s > 0.0 => ((num_steps as f32 * s.clamp(0.0, 1.0)) as usize).max(1),
+        _ => 0,
+    }
+}
+
+fn resolve_init_start(init_image: Option<&Image>, steps: usize, strength: Option<f32>) -> usize {
+    init_image
+        .map(|_| init_time_step(steps, strength))
+        .unwrap_or(0)
+}
+
+fn blend_flow_init(clean: &Tensor, noise: &Tensor, sigmas: &[f32], start: usize) -> Result<Tensor> {
+    let sigma = *sigmas.get(start).ok_or_else(|| {
+        CandleError::Msg(format!(
+            "sana img2img: start step {start} out of range for {}-element schedule",
+            sigmas.len()
+        ))
+    })? as f64;
+    Ok((clean.affine(1.0 - sigma, 0.0)? + noise.affine(sigma, 0.0)?)?)
+}
+
+fn renoise_sprint_init(
+    clean: &Tensor,
+    noise: &Tensor,
+    scheduler: &ScmScheduler,
+    start: usize,
+) -> Result<Tensor> {
+    let t = *scheduler.timesteps.get(start).ok_or_else(|| {
+        CandleError::Msg(format!(
+            "sana sprint img2img: start step {start} out of range for {}-element angle schedule",
+            scheduler.timesteps.len()
+        ))
+    })?;
+    let sd = scheduler.sigma_data as f64;
+    Ok(clean
+        .affine(sd * t.cos() as f64, 0.0)?
+        .add(&noise.affine(sd * t.sin() as f64, 0.0)?)?)
+}
 
 /// Seeded txt2img latent noise — shape `[1, 32, height/32, width/32]`, f32. diffusers
 /// `randn_tensor([B, 32, H/32, W/32])`; we draw f32 on CPU (launch-portable, sc-3673) then move to
@@ -127,6 +178,40 @@ pub fn denoise_cfg(
     on_progress: &mut dyn FnMut(Progress),
     preview: &candle_gen::preview::PreviewHook<'_>,
 ) -> Result<Tensor> {
+    denoise_cfg_from(
+        transformer,
+        sigmas,
+        sampler_name,
+        0,
+        seed,
+        latents,
+        cond,
+        uncond,
+        guidance_scale,
+        device,
+        cancel,
+        on_progress,
+        preview,
+    )
+}
+
+/// Base SANA flow-match denoise starting at `start_step` in the supplied sigma schedule.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_cfg_from(
+    transformer: &SanaTransformer,
+    sigmas: &[f32],
+    sampler_name: Option<&str>,
+    start_step: usize,
+    seed: u64,
+    latents: Tensor,
+    cond: &Tensor,
+    uncond: Option<&Tensor>,
+    guidance_scale: f32,
+    device: &Device,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &candle_gen::preview::PreviewHook<'_>,
+) -> Result<Tensor> {
     let predict = |x: &Tensor, timestep: f32| -> Result<Tensor> {
         // The unified flow sampler hands `timestep = σ`; the SANA trunk embeds `σ·1000`.
         let t = Tensor::from_vec(vec![timestep * NUM_TRAIN_TIMESTEPS], (1,), device)?;
@@ -144,7 +229,7 @@ pub fn denoise_cfg(
     run_flow_sampler(
         sampler_name,
         TimestepConvention::Sigma,
-        sigmas,
+        &sigmas[start_step.min(sigmas.len().saturating_sub(1))..],
         latents,
         seed,
         cancel,
@@ -188,6 +273,7 @@ pub fn decode_to_image(decoder: &DcAeDecoder, cfg: &DcAeConfig, latents: &Tensor
 pub struct SanaPipeline {
     text_encoder: SanaTextEncoder,
     transformer: SanaTransformer,
+    encoder: DcAeEncoder,
     decoder: DcAeDecoder,
     dc_ae_cfg: DcAeConfig,
 }
@@ -207,6 +293,9 @@ pub struct SanaGenerateRequest<'a> {
     pub sampler: Option<&'a str>,
     /// Optional curated epic-7114 scheduler name re-shaping σ over the same `mu = ln(shift)`.
     pub scheduler: Option<&'a str>,
+    /// Optional img2img source. A positive `strength` encodes and renoises it; zero is txt2img.
+    pub init_image: Option<&'a Image>,
+    pub strength: Option<f32>,
 }
 
 /// Seed-independent base-SANA prompt conditioning, prepared once for a whole image batch.
@@ -228,6 +317,8 @@ impl<'a> SanaGenerateRequest<'a> {
             seed: None,
             sampler: None,
             scheduler: None,
+            init_image: None,
+            strength: None,
         }
     }
 }
@@ -238,12 +329,14 @@ impl SanaPipeline {
     pub fn new(
         text_encoder: SanaTextEncoder,
         transformer: SanaTransformer,
+        encoder: DcAeEncoder,
         decoder: DcAeDecoder,
         dc_ae_cfg: DcAeConfig,
     ) -> Self {
         Self {
             text_encoder,
             transformer,
+            encoder,
             decoder,
             dc_ae_cfg,
         }
@@ -265,11 +358,12 @@ impl SanaPipeline {
         let dcfg = DcAeConfig::sana_f32c32();
         let vae_files = resolve_component_files(&root.join("vae"))?;
         let vae_w = Weights::from_files(&vae_files, device, DType::F32)?;
+        let encoder = DcAeEncoder::from_weights(&vae_w, &dcfg)?;
         let decoder = DcAeDecoder::from_weights(&vae_w, dcfg.clone())?;
 
         let te = load_text_encoder(root, device)?;
 
-        Ok(Self::new(te, trunk, decoder, dcfg))
+        Ok(Self::new(te, trunk, encoder, decoder, dcfg))
     }
 
     /// Run the full prompt→image pipeline with caller-supplied cancellation + progress (the seam the
@@ -325,11 +419,27 @@ impl SanaPipeline {
         // keeps it byte-exact; a curated name re-shapes σ over the same mu=ln(3).
         let sigmas = sana_sigmas(req.scheduler, steps);
 
-        let latents = create_noise(device, seed, req.width, req.height)?;
-        let latents = denoise_cfg(
+        let noise = create_noise(device, seed, req.width, req.height)?;
+        let start_step = resolve_init_start(req.init_image, steps, req.strength);
+        let latents = if start_step > 0 {
+            let clean = encode_init_latents(
+                &self.encoder,
+                &self.dc_ae_cfg,
+                req.init_image.expect("positive start requires init image"),
+                req.width,
+                req.height,
+                device,
+                cancel,
+            )?;
+            blend_flow_init(&clean, &noise, &sigmas, start_step)?
+        } else {
+            noise
+        };
+        let latents = denoise_cfg_from(
             &self.transformer,
             &sigmas,
             req.sampler,
+            start_step,
             seed,
             latents,
             &conditioning.cond,
@@ -525,6 +635,7 @@ pub fn denoise_sprint(
 pub struct SanaSprintPipeline {
     text_encoder: SanaTextEncoder,
     transformer: SanaTransformer,
+    encoder: DcAeEncoder,
     decoder: DcAeDecoder,
     dc_ae_cfg: DcAeConfig,
     /// The trunk config's `guidance_embeds_scale` (`0.1`), pre-multiplied into the guidance scalar.
@@ -537,6 +648,7 @@ impl SanaSprintPipeline {
     pub fn new(
         text_encoder: SanaTextEncoder,
         transformer: SanaTransformer,
+        encoder: DcAeEncoder,
         decoder: DcAeDecoder,
         dc_ae_cfg: DcAeConfig,
         guidance_embeds_scale: f32,
@@ -544,6 +656,7 @@ impl SanaSprintPipeline {
         Self {
             text_encoder,
             transformer,
+            encoder,
             decoder,
             dc_ae_cfg,
             guidance_embeds_scale,
@@ -565,11 +678,19 @@ impl SanaSprintPipeline {
         let dcfg = DcAeConfig::sana_f32c32();
         let vae_files = resolve_component_files(&root.join("vae"))?;
         let vae_w = Weights::from_files(&vae_files, device, DType::F32)?;
+        let encoder = DcAeEncoder::from_weights(&vae_w, &dcfg)?;
         let decoder = DcAeDecoder::from_weights(&vae_w, dcfg.clone())?;
 
         let te = load_text_encoder(root, device)?;
 
-        Ok(Self::new(te, trunk, decoder, dcfg, guidance_embeds_scale))
+        Ok(Self::new(
+            te,
+            trunk,
+            encoder,
+            decoder,
+            dcfg,
+            guidance_embeds_scale,
+        ))
     }
 
     /// Run the full Sprint prompt→image path. Encodes the prompt ONCE (no uncond — Sprint is
@@ -608,10 +729,26 @@ impl SanaSprintPipeline {
         let seed = req.seed.unwrap_or(0);
 
         let scheduler = ScmScheduler::new(steps);
-        let latents = create_noise(device, seed, req.width, req.height)?;
-        let latents = denoise_sprint(
+        let noise = create_noise(device, seed, req.width, req.height)?;
+        let start_step = resolve_init_start(req.init_image, steps, req.strength);
+        let latents = if start_step > 0 {
+            let clean = encode_init_latents(
+                &self.encoder,
+                &self.dc_ae_cfg,
+                req.init_image.expect("positive start requires init image"),
+                req.width,
+                req.height,
+                device,
+                cancel,
+            )?;
+            renoise_sprint_init(&clean, &noise, &scheduler, start_step)?
+        } else {
+            noise.affine(scheduler.sigma_data as f64, 0.0)?
+        };
+        let latents = denoise_sprint_from(
             &self.transformer,
             &scheduler,
+            start_step,
             seed,
             latents,
             cond,
@@ -639,6 +776,99 @@ impl SanaSprintPipeline {
     }
 }
 
+/// RGB8 init image -> denoise-space DC-AE latent, matching the MLX SANA contract.
+pub fn encode_init_latents(
+    encoder: &DcAeEncoder,
+    cfg: &DcAeConfig,
+    image: &Image,
+    width: u32,
+    height: u32,
+    device: &Device,
+    cancel: &CancelFlag,
+) -> Result<Tensor> {
+    if cancel.is_cancelled() {
+        return Err(CandleError::Canceled);
+    }
+    let image = preprocess_init_image(image, width, height, device)?;
+    let latent = encoder
+        .encode(&image)?
+        .affine(cfg.scaling_factor as f64, 0.0)?;
+    if cancel.is_cancelled() {
+        return Err(CandleError::Canceled);
+    }
+    Ok(latent)
+}
+
+/// LANCZOS fit and `[0,255] -> [-1,1]` HWC-to-NCHW preprocessing used by MLX SANA.
+pub fn preprocess_init_image(
+    image: &Image,
+    width: u32,
+    height: u32,
+    device: &Device,
+) -> Result<Tensor> {
+    let (iw, ih) = (image.width as usize, image.height as usize);
+    let expected =
+        candle_gen::gen_core::imageops::checked_image_buffer_len(iw, ih, 3).unwrap_or(usize::MAX);
+    if image.pixels.len() != expected {
+        return Err(CandleError::Msg(format!(
+            "sana: reference pixel buffer {} != {}x{}x3 ({expected})",
+            image.pixels.len(),
+            image.width,
+            image.height
+        )));
+    }
+    let (tw, th) = (width as usize, height as usize);
+    let resized = if (iw, ih) == (tw, th) {
+        image.pixels.iter().map(|&p| p as f32).collect()
+    } else {
+        resize_lanczos_u8(&image.pixels, ih, iw, th, tw)?
+    };
+    let mut nchw = vec![0.0f32; 3 * th * tw];
+    for y in 0..th {
+        for x in 0..tw {
+            for c in 0..3 {
+                nchw[c * th * tw + y * tw + x] = resized[(y * tw + x) * 3 + c] / 127.5 - 1.0;
+            }
+        }
+    }
+    Ok(Tensor::from_vec(nchw, (1, 3, th, tw), device)?)
+}
+
+/// Sprint SCM/TrigFlow tail over an already sigma-data-scaled img2img or txt2img latent.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_sprint_from(
+    transformer: &SanaTransformer,
+    scheduler: &ScmScheduler,
+    start_step: usize,
+    seed: u64,
+    latents: Tensor,
+    cond: &Tensor,
+    guidance_scale: f32,
+    guidance_embeds_scale: f32,
+    device: &Device,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &candle_gen::preview::PreviewHook<'_>,
+) -> Result<Tensor> {
+    let guidance = Tensor::from_vec(vec![guidance_scale * guidance_embeds_scale], (1,), device)?;
+    let predict = |lat_in: &Tensor, scm_t: f32| -> Result<Tensor> {
+        let t = Tensor::from_vec(vec![scm_t], (1,), device)?;
+        transformer
+            .forward_with_guidance(lat_in, cond, &t, Some(&guidance))
+            .map_err(CandleError::from)
+    };
+    run_scm_sampler_from(
+        scheduler,
+        start_step,
+        latents,
+        seed,
+        cancel,
+        on_progress,
+        Some(preview),
+        predict,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -663,6 +893,78 @@ mod tests {
         let v = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert_eq!(v(&a), v(&b), "same seed reproduces");
         assert_ne!(v(&a), v(&c), "diff seed differs");
+    }
+
+    #[test]
+    fn img2img_strength_law_matches_mlx() {
+        assert_eq!(resolve_strength(Some(0.7), Some(0.3)), 0.7);
+        assert_eq!(resolve_strength(None, Some(0.3)), 0.3);
+        assert_eq!(resolve_strength(None, None), DEFAULT_IMG2IMG_STRENGTH);
+        assert_eq!(init_time_step(20, None), 0);
+        assert_eq!(init_time_step(20, Some(0.0)), 0);
+        assert_eq!(init_time_step(20, Some(0.5)), 10);
+        assert_eq!(init_time_step(20, Some(0.01)), 1);
+        assert_eq!(init_time_step(20, Some(1.0)), 20);
+        assert_eq!(init_time_step(20, Some(2.0)), 20);
+
+        let image = Image {
+            width: 1,
+            height: 1,
+            pixels: vec![0; 3],
+        };
+        assert_eq!(resolve_init_start(Some(&image), 20, Some(0.0)), 0);
+        assert_eq!(resolve_init_start(None, 20, Some(0.8)), 0);
+        assert_eq!(resolve_init_start(Some(&image), 20, Some(0.5)), 10);
+    }
+
+    #[test]
+    fn base_and_sprint_img2img_init_math_matches_the_contract() {
+        let clean = Tensor::from_vec(vec![2.0f32, -2.0], (2,), &Device::Cpu).unwrap();
+        let noise = Tensor::from_vec(vec![10.0f32, 6.0], (2,), &Device::Cpu).unwrap();
+        let flow = blend_flow_init(&clean, &noise, &[1.0, 0.5, 0.0], 1)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_eq!(flow, vec![6.0, 2.0]);
+        assert!(blend_flow_init(&clean, &noise, &[1.0, 0.0], 2).is_err());
+
+        let scheduler = ScmScheduler::new(2);
+        let sprint = renoise_sprint_init(&clean, &noise, &scheduler, 1)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let t = scheduler.timesteps[1];
+        let sd = scheduler.sigma_data;
+        for ((got, x0), eps) in sprint.iter().zip([2.0f32, -2.0]).zip([10.0f32, 6.0]) {
+            let want = sd * (t.cos() * x0 + t.sin() * eps);
+            assert!((got - want).abs() < 1e-6, "got {got}, want {want}");
+        }
+        assert!(renoise_sprint_init(&clean, &noise, &scheduler, 3).is_err());
+    }
+
+    #[test]
+    fn img2img_preprocess_resizes_normalizes_and_rejects_bad_shape() {
+        let white = Image {
+            width: 2,
+            height: 3,
+            pixels: vec![255; 2 * 3 * 3],
+        };
+        let tensor = preprocess_init_image(&white, 4, 4, &Device::Cpu).unwrap();
+        assert_eq!(tensor.dims(), &[1, 3, 4, 4]);
+        assert!(tensor
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .all(|value| (*value - 1.0).abs() < 1e-6));
+
+        let bad = Image {
+            width: 2,
+            height: 2,
+            pixels: vec![0; 11],
+        };
+        assert!(preprocess_init_image(&bad, 4, 4, &Device::Cpu).is_err());
     }
 
     #[test]

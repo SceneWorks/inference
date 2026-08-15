@@ -75,6 +75,7 @@ fn run_control_validation(
     let paths = ZImageControlPaths {
         snapshot: env_path("ZIMG_CTRL_BASE"),
         control: env_path("ZIMG_CTRL_NET"),
+        adapters: Vec::new(),
         base,
     };
     let skeleton = read_ppm(&env_path("ZIMG_CTRL_POSE"));
@@ -117,6 +118,36 @@ fn run_control_validation(
         &out_dir.join(format!("zimage_control_{tag}.ppm")),
         &out_ctrl,
     );
+    if let Some(adapter) = std::env::var_os("ZIMG_CTRL_LORA") {
+        drop(model);
+        let adapted = ZImageControl::load(&ZImageControlPaths {
+            snapshot: env_path("ZIMG_CTRL_BASE"),
+            control: env_path("ZIMG_CTRL_NET"),
+            adapters: vec![candle_gen::gen_core::AdapterSpec::new(
+                adapter.into(),
+                1.0,
+                candle_gen::gen_core::AdapterKind::Lora,
+            )],
+            base,
+        })
+        .expect("load adapter-conditioned Z-Image strict control");
+        let with_adapter = adapted
+            .generate(&req, &skeleton, &mut noop)
+            .expect("generate (control + LoRA)");
+        assert_eq!(
+            (with_adapter.width, with_adapter.height),
+            (out_ctrl.width, out_ctrl.height)
+        );
+        assert_ne!(
+            with_adapter.pixels, out_ctrl.pixels,
+            "selected Z-Image control adapter must change output"
+        );
+        write_ppm(
+            &out_dir.join(format!("zimage_control_{tag}_lora.ppm")),
+            &with_adapter,
+        );
+        return;
+    }
 
     // Without control (scale 0 → the VACE hints contribute zero → plain Z-Image at the same seed/prompt).
     let plain_req = ZImageControlRequest {

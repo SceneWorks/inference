@@ -34,6 +34,7 @@ pub mod memory;
 pub mod pipeline;
 pub mod preview;
 pub mod quant;
+pub mod training;
 pub mod transformer;
 pub mod vae;
 
@@ -279,6 +280,7 @@ pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
             // one `run_flow_sampler` site, so the flag is variant-independent — see [`crate::preview`]
             // for the lane enumeration and the reused epic-16624 16-channel fit.
             supports_preview: true,
+            supports_prompt_enhancement: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
@@ -376,6 +378,8 @@ pub fn register_providers(
         .register_generator(LARGE_REGISTRATION)
         .register_generator(TURBO_REGISTRATION)
         .register_generator(MEDIUM_REGISTRATION)
+        .register_trainer(training::LARGE_TRAINER_REGISTRATION)
+        .register_trainer(training::MEDIUM_TRAINER_REGISTRATION)
 }
 
 /// Build the complete explicit Candle SD3 provider catalog.

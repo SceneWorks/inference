@@ -569,6 +569,7 @@ pub fn descriptor() -> ModelDescriptor {
             supports_sequential_offload: false,
             unconditionally_engages_staged_residency: true,
             supports_preview: false,
+            supports_prompt_enhancement: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
