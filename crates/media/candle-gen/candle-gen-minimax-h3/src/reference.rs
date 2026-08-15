@@ -1035,7 +1035,9 @@ mod tests {
                 fps: 24.0,
                 audio: Some(at(rate)),
             });
-            let e = Ref2VaReferences::new(vec![sounded]).unwrap_err().to_string();
+            let e = Ref2VaReferences::new(vec![sounded])
+                .unwrap_err()
+                .to_string();
             assert!(e.contains("no resampler"), "{rate} on a clip: {e}");
         }
     }

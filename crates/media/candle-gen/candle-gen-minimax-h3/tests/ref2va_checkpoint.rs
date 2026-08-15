@@ -238,10 +238,7 @@ fn production_sources() -> Vec<(String, String)> {
             } else if path.extension().is_some_and(|e| e == "rs") {
                 let whole = std::fs::read_to_string(&path)
                     .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-                out.push((
-                    path.display().to_string(),
-                    production_text(&whole),
-                ));
+                out.push((path.display().to_string(), production_text(&whole)));
             }
         }
     }
@@ -286,7 +283,12 @@ fn call_spans(src: &str, anchor: &str) -> Vec<String> {
             }
         }
         let end = end.unwrap_or_else(|| panic!("unbalanced parens after `{anchor}`"));
-        out.push(src[open..end].chars().filter(|c| !c.is_whitespace()).collect());
+        out.push(
+            src[open..end]
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect(),
+        );
         from = end;
     }
     out

@@ -138,12 +138,7 @@ pub const REFERENCE_DIT_PARTITION: &str = "transformer_ref";
 /// The component directories **every** task reads, in phase order.
 ///
 /// [`REFERENCE_DIT_PARTITION`] is deliberately **not** here — see [`task_component_dirs`].
-const REQUIRED_COMPONENT_DIRS: [&str; 4] = [
-    "text_encoder",
-    BASE_DIT_PARTITION,
-    "vae",
-    "audio_vae",
-];
+const REQUIRED_COMPONENT_DIRS: [&str; 4] = ["text_encoder", BASE_DIT_PARTITION, "vae", "audio_vae"];
 
 /// The component directories a given task reads, on top of [`REQUIRED_COMPONENT_DIRS`].
 ///
@@ -1842,14 +1837,18 @@ mod tests {
 
         for anchor in MAP_ANCHORS {
             let total = src.matches(anchor).count();
-            let inside: usize = covered.iter().map(|body| body.matches(anchor).count()).sum();
+            let inside: usize = covered
+                .iter()
+                .map(|body| body.matches(anchor).count())
+                .sum();
             assert!(
                 total > 0,
                 "`{anchor}` no longer appears in model.rs; if the component moved, this scan is \
                  watching nothing"
             );
             assert_eq!(
-                inside, total,
+                inside,
+                total,
                 "{} of {total} `{anchor}` occurrence(s) in model.rs sit OUTSIDE every staged \
                  phase. A heavy component mapped outside the staging is invisible to the phase \
                  table and turns the measured sequential peak into a sum",
@@ -2402,7 +2401,10 @@ mod tests {
                 Ok(_) => panic!("an empty `{missing}/` must not load — it fails mid-render"),
                 Err(e) => e.to_string(),
             };
-            assert!(e.contains(&path) && e.contains("no `.safetensors` shard"), "{e}");
+            assert!(
+                e.contains(&path) && e.contains("no `.safetensors` shard"),
+                "{e}"
+            );
 
             // Control: the same root with a shard in it loads, so the refusals are attributable.
             stage_component(&root, missing);
