@@ -141,11 +141,18 @@ impl KreaBlockStream {
                 let mut per_path = Vec::new();
                 for path in block.adaptable_paths() {
                     let segments: Vec<&str> = path.split('.').collect();
-                    if let Some(target) = block.adaptable_mut(&segments) {
-                        let adapters = target.adapters();
-                        if !adapters.is_empty() {
-                            per_path.push((path, adapters.to_vec()));
-                        }
+                    // SC-18319 — a capture walks EVERY projection, so it resolves through the PROBE
+                    // half and takes the `&mut` only where something is actually installed.
+                    if block
+                        .adaptable_facts(&segments)
+                        .is_some_and(|f| f.adapter_count > 0)
+                    {
+                        let adapters = block
+                            .adaptable_mut(&segments)
+                            .expect("resolved through the probe above")
+                            .adapters()
+                            .to_vec();
+                        per_path.push((path, adapters));
                     }
                 }
                 BlockAdapters { per_path }

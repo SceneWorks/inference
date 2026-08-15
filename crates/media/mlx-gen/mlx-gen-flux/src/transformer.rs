@@ -2023,7 +2023,8 @@ mod tests {
 
     fn resolves(host: &mut impl AdaptableHost, path: &str) -> bool {
         let segs: Vec<&str> = path.split('.').collect();
-        host.adaptable_mut(&segs).is_some()
+        // SC-18319 — reachability is a probe question.
+        host.adaptable_facts(&segs).is_some()
     }
 
     /// The full fork `FluxLoRAMapping` surface — joint + single block linears INCLUDING the adaLN
