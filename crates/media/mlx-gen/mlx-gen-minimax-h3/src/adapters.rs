@@ -374,7 +374,7 @@ fn is_block_diagonal(up: &Array, out: i32, r: i32) -> Result<bool> {
 /// Three transforms, each separately capable of producing a runnable, wrong model:
 ///
 /// 1. **`attn.qkv_proj` → `attn.to_q` / `to_k` / `to_v`.** Two fused forms are legitimate and are
-///    told apart by [`is_block_diagonal`] rather than assumed:
+///    told apart by measuring the bytes (`is_block_diagonal`) rather than assumed:
 ///    * **Block-diagonal** (`A [3r, in]`, `B [3·out, 3r]`, the lightx2v twins' form): split both,
 ///      giving factors byte-identical to the diffusers twin's, per-projection rank `r`, and an alpha
 ///      divided by 3. The published `.alpha = 24` becomes `8`, which against rank 128 is the same
@@ -382,7 +382,9 @@ fn is_block_diagonal(up: &Array, out: i32, r: i32) -> Result<bool> {
 ///    * **Shared-`A`** (`A [r, in]`, `B [3·out, r]`, what a LoRA trained natively on the fused
 ///      module looks like): split `B`'s rows only and reuse `A`, rank `r`, alpha unchanged. Also
 ///      exact.
-/// 2. **`mlp.fc1` → `ff.net.0.proj` with the SwiGLU halves swapped** — see [`swap_row_halves`].
+/// 2. **`mlp.fc1` → `ff.net.0.proj` with the SwiGLU halves swapped** (`swap_row_halves`): the DiT
+///    emits `[value | gate]` and ComfyUI `[gate | value]`, and a LoRA's `lora_B` is the output-side
+///    factor, so the swap lands on its rows and `lora_A` is untouched.
 /// 3. **`attn.out_proj` → `attn.to_out.0`** and **`mlp.fc2` → `ff.net.2`** — pure renames.
 ///
 /// The container prefix is normalized too (`blocks.{i}` → `transformer_blocks.{i}`).

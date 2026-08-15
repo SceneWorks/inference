@@ -2,7 +2,8 @@
 //! **alpha resolution rule** the lightx2v turbo checkpoints need, and the **ComfyUI key-space
 //! conversion** (sc-19443).
 //!
-//! The twin of [`mlx_gen_minimax_h3::adapters`]. Every rule below is the same rule the MLX lane
+//! The twin of `mlx_gen_minimax_h3::adapters` (not linkable — the MLX crate is not a dependency
+//! of this one). Every rule below is the same rule the MLX lane
 //! enforces, because a LoRA that folded at a different strength per backend would make the quant
 //! tier — a creative choice in this product — decide the picture.
 //!
@@ -373,7 +374,7 @@ fn is_block_diagonal(up: &Tensor, out: usize, r: usize) -> Result<bool> {
 /// runnable, wrong model:
 ///
 /// 1. **`attn.qkv_proj` → `attn.to_q` / `to_k` / `to_v`.** Two fused forms are legitimate and are
-///    told apart by [`is_block_diagonal`] rather than assumed:
+///    told apart by measuring the bytes (`is_block_diagonal`) rather than assumed:
 ///    * **Block-diagonal** (`A [3r, in]`, `B [3·out, 3r]`, the lightx2v twins' form): split both,
 ///      giving factors byte-identical to the diffusers twin's, per-projection rank `r`, and an alpha
 ///      divided by 3. The published `.alpha = 24` becomes `8`, which against rank 128 is the same
@@ -384,7 +385,9 @@ fn is_block_diagonal(up: &Tensor, out: usize, r: usize) -> Result<bool> {
 ///
 ///      An `A` and `B` whose inner dims disagree, or a `[3·out, 3r]` `B` that is neither
 ///      block-diagonal nor shared-`A`-shaped, is an error — not a guess.
-/// 2. **`mlp.fc1` → `ff.net.0.proj` with the SwiGLU halves swapped** — see [`swap_row_halves`].
+/// 2. **`mlp.fc1` → `ff.net.0.proj` with the SwiGLU halves swapped** (`swap_row_halves`): the DiT
+///    emits `[value | gate]` and ComfyUI `[gate | value]`, and a LoRA's `lora_B` is the output-side
+///    factor, so the swap lands on its rows and `lora_A` is untouched.
 /// 3. **`attn.out_proj` → `attn.to_out.0`** and **`mlp.fc2` → `ff.net.2`** — pure renames; both
 ///    projections are unfused and unswapped on both sides.
 ///
