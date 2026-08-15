@@ -1,20 +1,28 @@
-//! Produce the physical per-tier MiniMax-H3 DiT artifacts `SceneWorks/minimax-h3-mlx` hosts
-//! (sc-17150).
+//! Produce the physical per-tier MiniMax-H3 artifacts `SceneWorks/minimax-h3-mlx` hosts — the DiT
+//! (sc-17150) and the text encoder (sc-19120).
 //!
-//! Only the **DiT** is tiered — the text encoder, both VAEs and the tokenizer are dense in every
-//! tier and shared as a co-requisite, so this driver takes one DiT component directory
-//! (`transformer/` or `transformer_ref/`) and writes one tier of it.
+//! Two components are tiered; both VAEs and the tokenizer are dense in every tier and shared as
+//! co-requisites. This driver takes **one** component directory and writes one tier of it.
 //!
 //! ```sh
+//! # DiT (`transformer/` or `transformer_ref/`)
 //! MINIMAX_H3_SRC=<snapshot>/transformer \
-//! MINIMAX_H3_OUT=/tmp/minimax-h3-tiers/q4/transformer \
+//! MINIMAX_H3_OUT=<scratch>/minimax-h3-tiers/q4/transformer \
 //! MINIMAX_H3_TIER=q4 \
+//!   cargo run --release --example minimax_h3_prequant -p mlx-gen-minimax-h3
+//!
+//! # Text encoder — the stage that sets the process high-water
+//! MINIMAX_H3_SRC=<snapshot>/text_encoder \
+//! MINIMAX_H3_OUT=<scratch>/minimax-h3-tiers/q4/text_encoder \
+//! MINIMAX_H3_TIER=q4 \
+//! MINIMAX_H3_COMPONENT=text_encoder \
 //!   cargo run --release --example minimax_h3_prequant -p mlx-gen-minimax-h3
 //! ```
 //!
-//! `MINIMAX_H3_ADALN_BITS` overrides the AdaLN projection width independently of the tier — the
-//! [`AdaLnTierPolicy`](mlx_gen_minimax_h3::convert::AdaLnTierPolicy) knob. Default is the tier's own
-//! width; see that type for the measurement behind the default.
+//! `MINIMAX_H3_COMPONENT` selects which converter runs (`transformer`, the default, or
+//! `text_encoder`). `MINIMAX_H3_ADALN_BITS` overrides the AdaLN projection width independently of
+//! the tier — the [`AdaLnTierPolicy`](mlx_gen_minimax_h3::convert::AdaLnTierPolicy) knob, DiT only.
+//! Default is the tier's own width; see that type for the measurement behind the default.
 //!
 //! Paths are passed in, never derived (the epic-13657 boundary `check-workspace.py` enforces). An
 //! output directory that already exists is a hard error rather than a silent overwrite: a tier is a
@@ -29,7 +37,10 @@
 
 use std::path::PathBuf;
 
-use mlx_gen_minimax_h3::convert::{quantize_minimax_h3_dit, tier_bits, AdaLnTierPolicy};
+use mlx_gen_minimax_h3::convert::{
+    quantize_minimax_h3_dit, quantize_minimax_h3_text_encoder, tier_bits, AdaLnTierPolicy,
+};
+use mlx_gen_minimax_h3::model::{DIT_COMPONENT, TEXT_ENCODER_COMPONENT};
 
 fn env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.trim().is_empty())
@@ -43,6 +54,12 @@ fn main() {
         env("MINIMAX_H3_OUT").expect("MINIMAX_H3_OUT=<destination dir for this tier's DiT>"),
     );
     let tier = env("MINIMAX_H3_TIER").expect("MINIMAX_H3_TIER=q4|q8");
+    let component = env("MINIMAX_H3_COMPONENT").unwrap_or_else(|| DIT_COMPONENT.to_string());
+    assert!(
+        component == DIT_COMPONENT || component == TEXT_ENCODER_COMPONENT,
+        "MINIMAX_H3_COMPONENT must be {DIT_COMPONENT:?} or {TEXT_ENCODER_COMPONENT:?}, got \
+         {component:?}"
+    );
 
     assert!(
         src.is_dir(),
@@ -66,7 +83,7 @@ fn main() {
     };
 
     println!(
-        "[start] tier {tier} (weights {bits}-bit, adaln {}-bit) {} -> {}",
+        "[start] {component} tier {tier} (weights {bits}-bit, adaln {}-bit) {} -> {}",
         adaln.bits,
         src.display(),
         dst.display()
@@ -84,8 +101,13 @@ fn main() {
         Ok(())
     };
 
-    let written = quantize_minimax_h3_dit(&src, &dst, bits, adaln, &mut on_shard)
-        .expect("quantize_minimax_h3_dit");
+    let written = if component == TEXT_ENCODER_COMPONENT {
+        quantize_minimax_h3_text_encoder(&src, &dst, bits, &mut on_shard)
+            .expect("quantize_minimax_h3_text_encoder")
+    } else {
+        quantize_minimax_h3_dit(&src, &dst, bits, adaln, &mut on_shard)
+            .expect("quantize_minimax_h3_dit")
+    };
 
     // The hosted size the manifest records is the WHOLE directory — shards plus `config.json` plus
     // the index — not just the tensor bytes, because that is what a user downloads.
@@ -97,7 +119,7 @@ fn main() {
         }
     }
     println!(
-        "[done] tier {tier}: {} shards, {hosted} B hosted, {:.1}s",
+        "[done] {component} tier {tier}: {} shards, {hosted} B hosted, {:.1}s",
         written.len(),
         started.elapsed().as_secs_f64()
     );

@@ -63,4 +63,21 @@ impl Qwen3DecoderLayer {
         self.mlp.quantize(bits)?;
         Ok(())
     }
+
+    /// The packed width of this layer's projections, or `None` if any of them loaded dense.
+    ///
+    /// `None` rather than a per-projection report: a layer's seven projections are packed by one
+    /// converter pass at one width, so a partially packed layer is a mis-built artifact and the
+    /// caller only needs to know it is not uniformly packed.
+    pub fn packed_bits(&self) -> Option<i32> {
+        let a = self.attn.packed_bits()?;
+        let m = self.mlp.packed_bits()?;
+        (a == m).then_some(a)
+    }
+
+    /// Device bytes this layer holds, including the two dense-by-policy norms — the layer's real
+    /// residency, not just its packable part.
+    pub fn nbytes(&self) -> usize {
+        self.input_ln.nbytes() + self.post_ln.nbytes() + self.attn.nbytes() + self.mlp.nbytes()
+    }
 }

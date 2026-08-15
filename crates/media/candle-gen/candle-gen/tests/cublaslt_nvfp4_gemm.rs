@@ -12,8 +12,15 @@
 //!    scale correctly — including the **multi-row-atom** shapes (>128 rows) that are the only regime
 //!    exercising the scale-atom tiling order (**handoff item (a)**). Also asserts no NaN/Inf.
 //! 2. **NVFP4 end-to-end error** vs the original bf16 dense matmul stays within NVFP4 tolerance.
-//! 3. **Throughput** — the staged, algo-cached FP4 GEMM vs the bf16 dense path on a compute-bound
-//!    shape; reports the measured multiple (the spike saw 1.9–3.7×).
+//! 3. **The staged, algo-cached FP4 path** on a compute-bound DiT shape — that cuBLASLt dispatches
+//!    an FP4 kernel for it at all, and that the result is still numerically right there, gated
+//!    both in aggregate (rel-RMS) and pointwise (rel-max-abs, which is what can see a fault
+//!    localised to a single scale atom). The throughput multiple against bf16 dense is
+//!    **reported, not gated** (the spike saw 1.9–3.7×); see the note in
+//!    `nvfp4_gemm_throughput_vs_bf16` for why a wall-clock ratio cannot be an assertion
+//!    (sc-19505). ⚠️ That demotion **gives up** the "is it faster" half of this item — a
+//!    driver/algo regression returning a working-but-slow FP4 algo is now gated nowhere, and
+//!    needs an algo-identity instrument to recover (sc-19556).
 //! 4. **K-alignment** (**handoff item (b)**) — the GPU-confirmed requirement is K a multiple of 32
 //!    (K∈{16,48} → `NOT_SUPPORTED`; K∈{32,64,128} accepted); this pins the enforced bound.
 
@@ -222,13 +229,110 @@ fn nvfp4_gemm_throughput_vs_bf16() {
         1e3 * fp4_s / iters as f64,
         1e3 * bf16_s / iters as f64
     );
-    // The FP4 GEMM must at least not regress vs bf16 dense (a hard regression would mean cuBLASLt is
-    // not on the FP4 tensor-core kernel). The spike measured 1.9–3.7×; we assert only "not slower" so
-    // the gate is robust across driver/algo variation.
+    // `mult` is REPORTED, never asserted on (sc-19505). It is a ratio of two `Instant::elapsed()`
+    // values, and the old gate — a bare `mult > 1.0` — had no margin whatsoever: any contended
+    // runner that happened to deschedule the FP4 loop rather than the bf16 one flips it, and the
+    // failure lands on whatever PR is in flight. "Robust across driver/algo variation" is what a
+    // threshold with zero headroom looks like from the inside; sc-19452 measured the same shape one
+    // repo over and found it fails in *both* directions, false-red and false-green alike.
+    //
+    // The failure this test names — "cuBLASLt may not be dispatching the FP4 tensor-core kernel" —
+    // is already gated deterministically, and by the lines above rather than by the clock:
+    // `matmul_nvfp4_staged` runs the cuBLASLt heuristic search against the FP4 descriptor, and an
+    // empty result surfaces as an `Err` (`quant/cublaslt.rs`, the `get_matmul_algo_heuristic`
+    // arm) — so a device that cannot deliver an FP4 kernel panics at those `.unwrap()`s and never
+    // reaches a timer. `nvfp4_device()` has already screened out the pre-Blackwell case above.
+    //
+    // ⚠️ But one real claim DOES lapse here, and it is not noise. `mult > 1.0` also covered a
+    // driver/algo regression in which cuBLASLt returns *an* FP4 algo that is SLOWER than bf16
+    // dense. The `.unwrap()`s above cannot see that — a slow algo is still an algo, and the
+    // heuristic search succeeds. That is this file's own published item 3, "is it faster"
+    // (sc-11039), and after this change it is gated NOWHERE. It is given up deliberately, not
+    // covered by something else: re-gating it needs an instrument that names what the heuristic
+    // actually selected — an algo-identity / kernel-name assertion — rather than a throughput
+    // ratio, which is unfixable on a shared runner at any threshold. Tracked in sc-19556, and not
+    // attempted here because no lane can execute this file to validate a replacement (below).
+    //
+    // What the clock did carry, and the unwraps do not, is that this staged/algo-cached path is
+    // still numerically right at a DiT shape — the round-trip test only reaches 256³ through the
+    // *unstaged* entry point. So gate that directly instead, against the bf16 dense output on the
+    // same operands, at the same NVFP4 end-to-end tolerance the round-trip test uses.
+    let fp4 = lt
+        .matmul_nvfp4_staged(&w_stg, &x_stg)
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    let dense = x_bf16
+        .matmul(&w_bf16.t().unwrap())
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    assert_eq!(fp4.len(), m * n, "staged FP4 GEMM returned the wrong shape");
     assert!(
-        mult > 1.0,
-        "NVFP4 GEMM ({fp4_s:.4}s) was not faster than bf16 dense ({bf16_s:.4}s) — cuBLASLt may not \
-         be dispatching the FP4 tensor-core kernel"
+        fp4.iter().all(|v| v.is_finite()),
+        "staged NVFP4 GEMM produced NaN/Inf at ({m},{k},{n})"
+    );
+    // A mis-dispatched or no-op kernel most plausibly returns a constant (usually zero) buffer, and
+    // a relative bound alone would accept that whenever the reference is small.
+    let lo = fp4.iter().copied().fold(f32::INFINITY, f32::min);
+    let hi = fp4.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    assert!(
+        hi > lo,
+        "staged NVFP4 GEMM returned a constant buffer ({lo}) at ({m},{k},{n}) — the kernel ran but \
+         computed nothing"
+    );
+    // rel-RMS alone is the BLIND instrument for the defect this shape exists to expose. It is a
+    // global averaging norm over m*n = 4.19M elements, so a fault confined to one 64-column scale
+    // atom out of 4096 — precisely the multi-row-atom / scale-atom tiling-order regime of handoff
+    // item (a) — touches only f = 64/4096 = 1/64 of the output and moves rel-RMS by at most
+    // sqrt(f) = 0.125 if that atom is zeroed, or sqrt(2f) = 0.177 if it holds garbage at reference
+    // magnitude. Both clear the 0.2 bound below while that atom is entirely wrong.
+    //
+    // So gate the POINTWISE error alongside it, on the epic's convention — max|diff| normalised by
+    // the reference's own peak (`real_weights.rs`'s `rel_max` / `peak`). Correct NVFP4 noise is
+    // spread homogeneously and lands near rel-RMS; a localised atom fault puts this at ~0.85,
+    // because the bad block's extreme and the matrix's extreme are drawn from the same
+    // distribution. The two bounds fail on disjoint defect shapes, which is the point of keeping
+    // both.
+    let rr = rel_rms(&fp4, &dense);
+    let peak = dense.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+    let rel_max = fp4
+        .iter()
+        .zip(&dense)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max)
+        / peak;
+    eprintln!(
+        "[sc-11039] staged FP4 vs bf16 dense ({m}x{k}x{n}): rel-RMS = {rr:.5}, rel-max-abs = {rel_max:.5}"
+    );
+    // ⚠️ NEITHER BOUND IS MEASURED AT THIS SHAPE, and no CI lane can measure them. The 0.2 is this
+    // file's own NVFP4 end-to-end tolerance from `nvfp4_gemm_round_trip_and_error`, where it was
+    // calibrated at 256x256x256; reusing it at 1024x4096x4096 rests on NVFP4's error being
+    // per-block and therefore not growing with K — an argument, not a measurement. The 0.5 is
+    // derived from the separation reasoned out above (correct path near rel-RMS, atom fault ~0.85),
+    // also not from hardware. The `windows-cuda-check` lane compiles and clippies `--features cuda`
+    // but has no sm_120 device, so `nvfp4_device()` returns `None` there and this body never runs.
+    // The first real execution will be someone's Blackwell box. CONFIRM AND RETUNE BOTH ON THAT
+    // FIRST sm_120 RUN (sc-19556) — a red there is as likely to be an unvalidated constant as a
+    // regression, and must not be read as the latter without checking.
+    assert!(
+        rr < 0.2,
+        "staged NVFP4 GEMM differs from bf16 dense by rel-RMS {rr:.5} at ({m},{k},{n}) — beyond \
+         NVFP4 tolerance, so the algo-cached staged path is not computing this shape correctly"
+    );
+    assert!(
+        rel_max < 0.5,
+        "staged NVFP4 GEMM's worst pointwise error is {rel_max:.5} of the reference peak at \
+         ({m},{k},{n}) (rel-RMS {rr:.5} — if that one is small, the error is LOCALISED, which is \
+         the scale-atom tiling-order signature of handoff item (a))"
     );
 }
 
