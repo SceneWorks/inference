@@ -401,10 +401,11 @@ impl MiniMaxH3 {
     ///
     /// Returns the task *and* the reference list together because they are one decision: the list's
     /// presence is what makes the task `ref2va`, and re-deriving either half separately is how the
-    /// two would drift. [`Generator::validate`] and [`Self::generate_impl`] both consume exactly
-    /// this value, and `tests/ref2va_checkpoint.rs` asserts that `MiniMaxH3Task::resolve` is called
-    /// from nowhere else in the crate — so a weights-free test that drives this function is testing
-    /// the render path's own decision rather than a parallel restatement of it.
+    /// two would drift. [`Generator::validate`] and `Self::generate_impl` (private, hence not
+    /// linked) both consume exactly this value, and `tests/ref2va_checkpoint.rs` asserts that
+    /// `MiniMaxH3Task::resolve` is called from nowhere else in the crate — so a weights-free test
+    /// that drives this function is testing the render path's own decision rather than a parallel
+    /// restatement of it.
     pub fn resolve_task(
         &self,
         req: &GenerationRequest,
