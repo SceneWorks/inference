@@ -5639,6 +5639,12 @@ jobs:
           rem MiniMaxAI/MiniMax-H3 is a ~196 GB repo; the `minimax-h3` row carries a `download_files`
           rem allow-list so only the 11.640 GB the tests below read is fetched.
           python scripts/release/ensure_model_snapshot.py --model minimax-h3 --snapshot "%MINIMAX_H3_SNAPSHOT%" || exit /b 1
+          rem sc-19558 — the DiT component, on its OWN key so the shared row above stays 11.640 GB
+          rem for every lane that does not read it. 132.6 GB for both partitions on a cold box;
+          rem sc-18677 provisioned the full upstream snapshot on THIS runner, so here it verifies
+          rem rather than fetches. It is what makes the two DiT header gates below reachable at all —
+          rem they read headers only, and were unreachable purely because the bytes were in no row.
+          python scripts/release/ensure_model_snapshot.py --model minimax-h3-dit --snapshot "%MINIMAX_H3_SNAPSHOT%" || exit /b 1
       # Name-selected with `--exact` AFTER the `--` plus a run-count assertion, for the reasons the
       # `candle-mmaudio` job above spells out: `--exact` before the `--` is rejected by cargo and the
       # rejection is reported as exit 0, and without the count a rename yields "0 passed; N filtered
@@ -5652,6 +5658,11 @@ jobs:
           call :run_one declared_audio_tensor_names_match_the_published_checkpoint || exit /b 1
           call :run_one published_audio_configs_reproduce_the_declared_geometry || exit /b 1
           call :run_one stored_kaiser_filters_match_the_derivation_on_real_weights || exit /b 1
+          rem sc-19558 — the two DiT header gates. Header-only and device-free, so they cost the
+          rem materialize step above and nothing else; they were listed as NOT COVERED for exactly
+          rem one reason, that `transformer/` was in no row, and `minimax-h3-dit` is that row.
+          call :run_one declared_dit_tensor_names_match_the_published_checkpoint || exit /b 1
+          call :run_one the_adaln_projections_are_the_documented_twenty_six_gigabytes || exit /b 1
           exit /b 0
 
           :run_one
