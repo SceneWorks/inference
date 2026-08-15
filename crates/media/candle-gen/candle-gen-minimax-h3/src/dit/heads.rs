@@ -128,6 +128,16 @@ impl LinearBias {
             + self.bias.elem_count() * self.bias.dtype().size_in_bytes()
     }
 
+    /// The loaded bias, as read off disk.
+    ///
+    /// Exposed for `tests/ref2va_checkpoint.rs` (sc-17157): `transformer/` and `transformer_ref/`
+    /// are structurally identical and differ only in their **values**, so the only thing that can
+    /// tell a `ref2va` load from a base one is a tensor read back off the loaded model.
+    /// `proj_in.bias` is the probe — float32, `[inner_dim]`, and different between the two.
+    pub fn bias(&self) -> &Tensor {
+        &self.bias
+    }
+
     /// `y = x · Wᵀ + b`, with `x` cast to the weight's own dtype first.
     ///
     /// The cast mirrors the reference's explicit `x.to(get_parameter_dtype(module))` and is what

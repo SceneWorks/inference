@@ -9,7 +9,7 @@
 //! `.safetensors`, and cross-backend agreement is inferred as the sum of two independent residuals.
 //!
 //! This file does that *and* one thing stronger. `fixtures_are_byte_identical_to_the_mlx_lanes`
-//! pins the shared-golden half over all five goldens. Then
+//! pins the shared-golden half over all six goldens. Then
 //! `mlx-gen-minimax-h3/tests/cross_backend_record.rs` — an `#[ignore]`d generator run on Metal —
 //! records the MLX lane's **own** decode/forward/denoise of those goldens into
 //! `tests/fixtures/mlx_cross_backend.safetensors`, and the tests below compare this port's tensors
@@ -146,6 +146,10 @@ fn fixtures_are_byte_identical_to_the_mlx_lanes() {
         "video_vae_decode",
         "video_vae_encode",
         "audio_vae_decode",
+        // The Ref2VA soundtrack path's golden (sc-17157). MLX and candle cannot coexist in one
+        // process, so this shared-bytes identity plus each lane's own residual against it IS the
+        // cross-backend agreement argument for the audio VAE's encode half.
+        "audio_vae_encode",
         "dit_block",
         "av_denoise",
     ] {

@@ -49,25 +49,27 @@
 //!
 //! When both are present `frames` wins, because it is the exact one.
 //!
+//! # `ref2va` is here (sc-17157), and it moves the checkpoint
+//!
+//! A request carrying image / video / audio **references** is a third task, [`MiniMaxH3Task::Ref2va`],
+//! and it denoises from a **different 66 GB partition** — [`REFERENCE_DIT_PARTITION`]. The two
+//! partitions ship the same `config.json` and the same 638 tensor names and differ only in their
+//! values, so [`MiniMaxH3Task`] is the single thing standing between a reference request and a
+//! plausible render off the wrong checkpoint. See that type.
+//!
+//! `generate_ref2va` has **four** staged phases rather than three, and the DiT is still mapped last,
+//! so the two DiT partitions are never co-resident: a render loads exactly one of them.
+//!
 //! # Not here
 //!
-//! `ref2va` (sc-17157) — the `transformer_ref` partition, the omni-reference presentation and the
-//! audio VAE encoder — and the turbo LoRA seam (the candle twin of `mlx_gen_minimax_h3::adapters`).
-//! Both are refused rather than silently ignored, but by **two different mechanisms**, and the
-//! distinction matters because only one of them is carried by the descriptor:
-//!
-//! * **`ref2va` is refused by the descriptor.** The three `ref2va` conditioning kinds are absent
-//!   from [`descriptor`]'s `conditioning` allowlist, and `Capabilities::validate_request` — which
-//!   `MiniMaxH3::generate_impl` calls on every render — enforces that allowlist, so a reference
-//!   request gets a typed `Unsupported` naming the kind.
-//! * **The turbo LoRA seam, the quant tiers and every unread `LoadSpec` slot are refused by
-//!   [`load`].** `supports_lora`, `supports_lokr` and `supported_quants` are *declarations that
-//!   gen-core reads on no path*: no validator and no registry code inspects them. They are
-//!   advertisements to a weights-free consumer, not gates. The gates are the explicit
-//!   `spec.adapters` / `spec.quantize` checks in [`load`], plus `reject_unread_slots` for the
-//!   seven remaining slots this provider does not read; without them a spec carrying any of those
-//!   loaded clean and rendered with the caller's knob silently discarded. See [`load`] for the
-//!   full note.
+//! The turbo LoRA seam (the candle twin of `mlx_gen_minimax_h3::adapters`), the quant tiers and
+//! every unread `LoadSpec` slot are refused by [`load`]. `supports_lora`, `supports_lokr` and
+//! `supported_quants` are *declarations that gen-core reads on no path*: no validator and no
+//! registry code inspects them. They are advertisements to a weights-free consumer, not gates. The
+//! gates are the explicit `spec.adapters` / `spec.quantize` checks in [`load`], plus
+//! `reject_unread_slots` for the seven remaining slots this provider does not read; without them a
+//! spec carrying any of those loaded clean and rendered with the caller's knob silently discarded.
+//! See [`load`] for the full note.
 
 use std::path::{Path, PathBuf};
 
@@ -90,6 +92,7 @@ use crate::pipeline::{
     prepend_condition_rows, render_latents, resolve_geometry, revert_pixel_normalization,
     t2va_layout, RequestGeometry, CANVAS_SHORT_EDGE, PATCH_SIZE, SPATIAL_STRIDE,
 };
+use crate::reference::{Ref2VaReference, Ref2VaReferences, VideoReference};
 use crate::text_encoder::{
     lm_prefixes, load_vision_tower, MiniMaxH3TeConfig, MiniMaxH3TextEncoder, MiniMaxH3Tokenizer,
     LM_PREFIX, TE_STORE_DTYPE,
@@ -115,11 +118,97 @@ pub const MAX_STEPS: u32 = 200;
 /// number is only truthful if the load cannot be talked out of the staging it was measured under.
 pub const OFFLOAD_POLICY: OffloadPolicy = OffloadPolicy::Sequential;
 
-/// The DiT partition a `t2va` / `fl2va` render denoises from. (`transformer_ref` is sc-17157's.)
+/// The DiT partition a `t2va` / `fl2va` render denoises from.
 pub const BASE_DIT_PARTITION: &str = "transformer";
 
+/// The DiT partition a `ref2va` render denoises from.
+pub const REFERENCE_DIT_PARTITION: &str = "transformer_ref";
+
 /// The component directories a render reads, in phase order.
-const REQUIRED_COMPONENT_DIRS: [&str; 4] = ["text_encoder", BASE_DIT_PARTITION, "vae", "audio_vae"];
+///
+/// [`REFERENCE_DIT_PARTITION`] is in here rather than probed lazily: `ref2va` is a first-class task
+/// of this engine, so a snapshot missing the partition must fail at **load**, naming the path,
+/// rather than twenty minutes into a render when the reference arm finally reaches for it. That
+/// also makes the sc-19517 hosting gap — `SceneWorks/minimax-h3-mlx` publishes no
+/// `q4/transformer_ref`, so a pure-`q4` install cannot stage Ref2VA — a loud, specific failure
+/// instead of a silent degradation to the base checkpoint.
+const REQUIRED_COMPONENT_DIRS: [&str; 5] = [
+    "text_encoder",
+    BASE_DIT_PARTITION,
+    REFERENCE_DIT_PARTITION,
+    "vae",
+    "audio_vae",
+];
+
+/// Which MiniMax-H3 **task** a request is, and therefore which DiT partition it loads.
+///
+/// # The two checkpoints are structurally indistinguishable
+///
+/// `transformer/` and `transformer_ref/` ship **the same `config.json`** (byte-identical) and **the
+/// same 638 tensor names**. Nothing structural separates them — not a shape check, not a
+/// key-mapping proof, not a config diff. Only the *values* differ. That is the same hazard class
+/// [`crate::layout`] documents for the gated-FFN half-swap: a port that loads the wrong one gets a
+/// model that runs, produces plausible video, and is wrong.
+///
+/// So the partition is selected by this typed enum rather than by a bare string at the call site,
+/// and `tests/ref2va_checkpoint.rs` pins the selection — structurally without weights, and against
+/// the real bytes of a tensor that differs between the two under `#[ignore]`.
+///
+/// # Why the task is not simply "are there keyframes"
+///
+/// `t2va` and `fl2va` share `transformer/`; only `ref2va` moves. A request carrying **both**
+/// keyframes and references is refused rather than silently resolved to one of them — the two
+/// condition the video stream through different mechanisms at different rotary times, and picking
+/// one would discard conditioning the caller asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MiniMaxH3Task {
+    /// Text only. `transformer/`.
+    T2va,
+    /// First / last frame keyframes. `transformer/`.
+    Fl2va,
+    /// Multi-modal references. **`transformer_ref/`.**
+    Ref2va,
+}
+
+impl MiniMaxH3Task {
+    /// The snapshot subdirectory this task's DiT is read from.
+    pub fn partition(self) -> &'static str {
+        match self {
+            Self::T2va | Self::Fl2va => BASE_DIT_PARTITION,
+            Self::Ref2va => REFERENCE_DIT_PARTITION,
+        }
+    }
+
+    /// Whether this task reads the vision tower as part of its presentation.
+    ///
+    /// `t2va` does not; `fl2va` runs the tower over its keyframes and `ref2va` over its image and
+    /// video references. An audio reference contributes **no** vision block, so a `ref2va` request
+    /// whose only visual references are absent cannot occur — [`crate::reference`] refuses an
+    /// audio-only list precisely so this stays true.
+    pub fn needs_vision_tower(self) -> bool {
+        matches!(self, Self::Fl2va | Self::Ref2va)
+    }
+
+    /// Derive the task from what the request actually conditions on.
+    ///
+    /// `has_keyframes` and `has_references` are passed rather than read off the request so this
+    /// stays a pure, exhaustively testable function — the story requires the selection to be
+    /// covered by a test, and a function that reaches into a `GenerationRequest` can only be
+    /// tested by building one.
+    pub fn resolve(has_keyframes: bool, has_references: bool) -> Result<Self> {
+        match (has_keyframes, has_references) {
+            (false, false) => Ok(Self::T2va),
+            (true, false) => Ok(Self::Fl2va),
+            (false, true) => Ok(Self::Ref2va),
+            (true, true) => Err(CandleError::Msg(format!(
+                "{MODEL_ID}: a request carries both keyframes and references, which are different \
+                 tasks on different checkpoints — `fl2va` pins a literal frame of the generated \
+                 clip from `transformer/`, `ref2va` conditions on unpositioned references from \
+                 `transformer_ref/`. Send one or the other."
+            ))),
+        }
+    }
+}
 
 /// The identity, modality and capability surface.
 pub fn descriptor() -> ModelDescriptor {
@@ -138,11 +227,23 @@ pub fn descriptor() -> ModelDescriptor {
             // **One kind covers all three keyframe shapes.** `Keyframe` carries a `frame_idx`, and
             // first-only / last-only / first+last are one, one and two of them.
             //
-            // The `ref2va` kinds the MLX sibling advertises (`Reference`, `ReferenceVideo`,
-            // `ReferenceAudio`) are deliberately ABSENT until sc-17157 lands the
-            // `transformer_ref` path here: default-deny turns a reference request into a typed
-            // `Unsupported` instead of a render that silently ignored it.
-            conditioning: vec![ConditioningKind::Keyframe],
+            // The three `ref2va` kinds (sc-17157) are the omni-reference surface on
+            // `transformer_ref`. They are three kinds rather than one because gen-core has no
+            // heterogeneous-reference variant and `conditioning` is an **ordered** `Vec`, so the
+            // request's own order carries the semantics `ref2va` needs — see
+            // [`crate::reference`] on why order is not incidental, and [`request_references`] for
+            // why the video one is `ReferenceVideo` and not `VideoClip` or `VideoSync`.
+            //
+            // `VideoClip` is deliberately **not** advertised. Nothing here reads it, and leaving it
+            // in the allowlist would let an in-context clip through to a model that has no
+            // in-context clip mechanism; default-deny turns it into the typed
+            // `Error::Unsupported` instead.
+            conditioning: vec![
+                ConditioningKind::Keyframe,
+                ConditioningKind::Reference,
+                ConditioningKind::ReferenceVideo,
+                ConditioningKind::ReferenceAudio,
+            ],
             // The candle turbo-LoRA seam is not ported (the MLX sibling's `adapters`), and
             // advertising it would accept a file this lane cannot fold.
             supports_lora: false,
@@ -392,6 +493,15 @@ impl MiniMaxH3 {
 
         // --- 1. conditioning -----------------------------------------------------------------
         let keyframes = req.keyframes();
+        let references = request_references(req)?;
+        // **The checkpoint decision.** Resolved once, here, and carried to the single
+        // `MiniMaxH3Dit::load` call site — the two partitions are byte-different and structurally
+        // identical, so this is the only thing standing between a `ref2va` request and a plausible
+        // render off the wrong 66 GB. See [`MiniMaxH3Task`].
+        let task = MiniMaxH3Task::resolve(!keyframes.is_empty(), references.is_some())?;
+        if let Some(refs) = &references {
+            return self.generate_ref2va(req, refs, task, &geometry, &schedule, seed, on_progress);
+        }
         let anchors = keyframe_anchors(&keyframes, geometry.joint.num_frames)?;
         // Fitted ONCE, here, and shared by both keyframe paths. The vision tower and the VAE encode
         // must see the same pixels — resizing separately per path would let a resampling difference
@@ -444,7 +554,7 @@ impl MiniMaxH3 {
         }
 
         // --- 2. denoise -----------------------------------------------------------------------
-        let dit = MiniMaxH3Dit::load(&self.root, BASE_DIT_PARTITION, &self.device, self.dtype)?;
+        let dit = MiniMaxH3Dit::load(&self.root, task.partition(), &self.device, self.dtype)?;
         let patch = dit.config().patch_size;
         let layout = if anchors.is_empty() {
             t2va_layout(&geometry, context.dims()[1], patch, &self.device)?
@@ -536,9 +646,387 @@ impl MiniMaxH3 {
             audio: Some(audio),
         })
     }
+
+    /// The **`ref2va` render** — ordered multi-modal references on the `transformer_ref`
+    /// checkpoint (sc-17157).
+    ///
+    /// The phase order is the same staged one `t2va` / `fl2va` use, for the same memory reason, but
+    /// it has **four** heavy phases rather than three: the vision tower, the 66.7 GB conditioner,
+    /// then the two VAEs, then the 66.3 GB `transformer_ref`. Each is released before the next is
+    /// mapped, and the DiT is mapped last so it is never resident alongside the conditioner — and
+    /// only ONE of the two 66 GB partitions is ever mapped by a render, because
+    /// [`MiniMaxH3Task::partition`] picks exactly one.
+    #[allow(clippy::too_many_arguments)]
+    fn generate_ref2va(
+        &self,
+        req: &GenerationRequest,
+        references: &Ref2VaReferences,
+        task: MiniMaxH3Task,
+        geometry: &RequestGeometry,
+        schedule: &JointSchedule,
+        seed: u64,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationOutput> {
+        use crate::conditioning::{
+            encode_reference_condition, keyframe_condition_rows, reference_audio_rows,
+            reference_clip_to_vae_pixels, KeyframeNoise,
+        };
+        use crate::dit::positions::ReferenceLatentGeometry;
+        use crate::pipeline::{
+            audio_track_to_encoder_input, prepend_condition_audio_rows, ref2va_layout,
+            CANVAS_MAX_PIXELS,
+        };
+
+        // --- 0. normalize every reference onto the model's own rates and resolutions ------------
+        // References do NOT bind the canvas: the geometry was already resolved (16:9 by default)
+        // and each reference is put on its own resolution here.
+        let mut normalized: Vec<Ref2VaReference> = Vec::with_capacity(references.len());
+        for r in references.as_slice() {
+            normalized.push(match r {
+                Ref2VaReference::Image(img) => Ref2VaReference::Image(
+                    crate::reference::normalize_reference_image(img, SPATIAL_STRIDE as i32)?,
+                ),
+                Ref2VaReference::Video(v) => Ref2VaReference::Video(VideoReference {
+                    frames: crate::reference::normalize_reference_clip(
+                        &v.frames,
+                        v.fps,
+                        geometry.joint.num_frames,
+                        SPATIAL_STRIDE as i32,
+                        CANVAS_SHORT_EDGE as i32,
+                        i64::from(CANVAS_MAX_PIXELS),
+                        MINIMAX_H3_FPS,
+                    )?,
+                    fps: MINIMAX_H3_FPS,
+                    audio: v.audio.clone(),
+                }),
+                Ref2VaReference::Audio(a) => Ref2VaReference::Audio(a.clone()),
+            });
+        }
+        if req.cancel.is_cancelled() {
+            return Err(CandleError::Canceled);
+        }
+
+        // --- 1. the conditioner: vision tower over the visual references, then the 66.7 GB LM ---
+        let (context, text_tags) = self.encode_prompt_ref2va(&req.prompt, &normalized)?;
+        if req.cancel.is_cancelled() {
+            return Err(CandleError::Canceled);
+        }
+
+        // --- 2. the VAEs: one conditioning latent per visual reference, one soundtrack per -------
+        //        audio-bearing reference. Done before the DiT is mapped.
+        let mut condition_rows: Vec<candle_gen::candle_core::Tensor> = Vec::new();
+        let mut audio_rows_per_ref: Vec<candle_gen::candle_core::Tensor> = Vec::new();
+        let mut geometries: Vec<ReferenceLatentGeometry> = Vec::new();
+        {
+            let vae = MiniMaxH3VideoVae::load(&self.root, &self.device, self.dtype)?;
+            let audio_enc = self.load_audio_encoder()?;
+            for (i, r) in normalized.iter().enumerate() {
+                // Audio FIRST, mirroring the packed row order.
+                let num_audio_latents = if let Some(track) = r.audio() {
+                    let wave = audio_track_to_encoder_input(track, &self.device)?;
+                    let posterior = audio_enc.encode(&wave)?;
+                    // The MODE, never a sample — a soundtrack is deterministic conditioning.
+                    let normed = audio_enc.normalize(posterior.mode())?;
+                    // `[B, latent_channels, latents]` -> `[channels, latents, features]`.
+                    let t = normed.permute((0, 2, 1))?.contiguous()?;
+                    let latents = t.dims()[1];
+                    audio_rows_per_ref.push(reference_audio_rows(&t)?);
+                    latents
+                } else {
+                    0
+                };
+
+                let (frames, height, width) = match r {
+                    Ref2VaReference::Audio(_) => (0, 0, 0),
+                    Ref2VaReference::Image(img) => {
+                        let pixels =
+                            reference_clip_to_vae_pixels(std::slice::from_ref(img), &self.device)?;
+                        let c = encode_reference_condition(
+                            &vae,
+                            &pixels,
+                            &KeyframeNoise::Seeded,
+                            i,
+                            &self.device,
+                        )?;
+                        let s = c.dims().to_vec();
+                        condition_rows.push(keyframe_condition_rows(
+                            &c,
+                            PATCH_SIZE,
+                            &KeyframeNoise::Seeded,
+                            i,
+                            &self.device,
+                        )?);
+                        (s[2], s[3], s[4])
+                    }
+                    Ref2VaReference::Video(v) => {
+                        // Snap DOWN to the VAE's `17n + 5` lattice so nothing is padded.
+                        let keep = crate::conditioning::snap_reference_frames_down(v.frames.len())
+                            .min(v.frames.len());
+                        let pixels = reference_clip_to_vae_pixels(&v.frames[..keep], &self.device)?;
+                        let c = encode_reference_condition(
+                            &vae,
+                            &pixels,
+                            &KeyframeNoise::Seeded,
+                            i,
+                            &self.device,
+                        )?;
+                        let s = c.dims().to_vec();
+                        condition_rows.push(keyframe_condition_rows(
+                            &c,
+                            PATCH_SIZE,
+                            &KeyframeNoise::Seeded,
+                            i,
+                            &self.device,
+                        )?);
+                        (s[2], s[3], s[4])
+                    }
+                };
+                geometries.push(ReferenceLatentGeometry {
+                    kind: r.kind(),
+                    num_latent_frames: frames,
+                    latent_height: height,
+                    latent_width: width,
+                    num_audio_latents,
+                });
+            }
+            drop(vae);
+            drop(audio_enc);
+            crate::dit::release_device_memory(&self.device)?;
+        }
+        if req.cancel.is_cancelled() {
+            return Err(CandleError::Canceled);
+        }
+        let condition_video = if condition_rows.is_empty() {
+            None
+        } else {
+            Some(candle_gen::candle_core::Tensor::cat(&condition_rows, 1)?.contiguous()?)
+        };
+        let condition_audio = if audio_rows_per_ref.is_empty() {
+            None
+        } else {
+            Some(candle_gen::candle_core::Tensor::cat(&audio_rows_per_ref, 1)?.contiguous()?)
+        };
+
+        // --- 3. denoise on `transformer_ref` ----------------------------------------------------
+        let dit = MiniMaxH3Dit::load(&self.root, task.partition(), &self.device, self.dtype)?;
+        let patch = dit.config().patch_size;
+        let layout = ref2va_layout(geometry, &text_tags, &geometries, patch, &self.device)?;
+        let (video_rows, audio_rows) = initial_latents(geometry, patch, seed, &self.device)?;
+        let video_rows = prepend_condition_rows(&layout, condition_video.as_ref(), &video_rows)?;
+        let audio_rows =
+            prepend_condition_audio_rows(&layout, condition_audio.as_ref(), &audio_rows)?;
+        let adaln = crate::denoise::adaln_schedule(schedule)?;
+        let mut model = JointDit::new(
+            dit,
+            layout.clone(),
+            &context,
+            adaln,
+            AdaLnResidency::PrecomputeAndEvict,
+        )?;
+        drop(context);
+
+        let total = schedule.num_evals() as u32;
+        let mut on_step = |completed: usize| {
+            on_progress(Progress::Step {
+                current: completed as u32,
+                total,
+            });
+        };
+        let rendered = render_latents(
+            &mut model,
+            &layout,
+            schedule,
+            &video_rows,
+            &audio_rows,
+            patch,
+            &self.device,
+            &req.cancel,
+            &mut on_step,
+        )?;
+        drop(model);
+        drop(video_rows);
+        drop(audio_rows);
+        crate::dit::release_device_memory(&self.device)?;
+
+        // --- 4. decode --------------------------------------------------------------------------
+        on_progress(Progress::Decoding);
+        if req.cancel.is_cancelled() {
+            return Err(CandleError::Canceled);
+        }
+        let frames = {
+            let vae = MiniMaxH3VideoVae::load_decode_only(&self.root, &self.device, self.dtype)?;
+            let video = vae.decode(&rendered.video)?;
+            drop(vae);
+            crate::dit::release_device_memory(&self.device)?;
+            frames_to_images(&revert_pixel_normalization(&video)?)?
+        };
+        let audio = {
+            let (cfg, w) = self.load_audio_vae()?;
+            let vae = crate::audio_vae::MiniMaxH3AudioVae::from_weights(
+                &w,
+                &cfg,
+                &self.device,
+                self.dtype,
+            )?;
+            drop(w);
+            let track = vae.decode_audio_track(&rendered.audio)?;
+            drop(vae);
+            crate::dit::release_device_memory(&self.device)?;
+            track
+        };
+        let audio = fit_audio_to_video(audio, geometry)?;
+        if frames.len() != geometry.joint.num_frames {
+            return Err(CandleError::Msg(format!(
+                "{MODEL_ID}: decoded {} frames for a {}-frame ref2va request",
+                frames.len(),
+                geometry.joint.num_frames
+            )));
+        }
+        Ok(GenerationOutput::Video {
+            frames,
+            fps: MINIMAX_H3_FPS as u32,
+            audio: Some(audio),
+        })
+    }
+
+    /// The `ref2va` presentation: the vision tower over every **visual** reference, spliced into
+    /// the `<Picture i>` / `<Audio j>` / `<Video k>` presentation.
+    ///
+    /// A waveform never reaches the tower — a standalone audio reference contributes its label and
+    /// nothing else, which is why the tower's sources and the presentation entries are built in one
+    /// pass rather than zipped afterwards.
+    fn encode_prompt_ref2va(
+        &self,
+        prompt: &str,
+        references: &[Ref2VaReference],
+    ) -> Result<(candle_gen::candle_core::Tensor, Vec<u32>)> {
+        use crate::reference::{
+            sample_video_condition_frames, ReferencePresentation, VIDEO_SAMPLE_FPS,
+            VISION_TEMPORAL_PATCH,
+        };
+
+        let tok = MiniMaxH3Tokenizer::from_snapshot(&self.root)?;
+        let cfg = MiniMaxH3TeConfig::from_snapshot(&self.root)?;
+
+        // The tower's sources, in **sequence order** — the order the pad runs appear in, which is
+        // what `forward_with_references` consumes them in.
+        let mut sources: Vec<&Image> = Vec::new();
+        // Per reference: how many tower sources it contributes, and its block timestamps.
+        let mut plan: Vec<(usize, Vec<f64>)> = Vec::new();
+        for r in references {
+            match r {
+                Ref2VaReference::Audio(_) => plan.push((0, Vec::new())),
+                Ref2VaReference::Image(img) => {
+                    sources.push(img);
+                    plan.push((1, Vec::new()));
+                }
+                Ref2VaReference::Video(v) => {
+                    let (indices, timestamps) = sample_video_condition_frames(
+                        v.frames.len(),
+                        MINIMAX_H3_FPS,
+                        VIDEO_SAMPLE_FPS,
+                        VISION_TEMPORAL_PATCH,
+                    )?;
+                    for &i in &indices {
+                        sources.push(&v.frames[i]);
+                    }
+                    plan.push((indices.len(), timestamps));
+                }
+            }
+        }
+        if sources.is_empty() {
+            return Err(CandleError::Msg(format!(
+                "{MODEL_ID}: a ref2va request carries no visual reference for the conditioner — a \
+                 waveform never reaches it"
+            )));
+        }
+
+        let vision = load_vision_tower(&self.root, &self.device)?;
+        let grounded = crate::text_encoder::run_vision(&vision, &sources, &self.device)?;
+        drop(vision);
+        crate::dit::release_device_memory(&self.device)?;
+
+        // The presentation, from the tower's per-source counts.
+        let mut cursor = 0usize;
+        let mut presentation: Vec<ReferencePresentation> = Vec::with_capacity(references.len());
+        for (r, (n_sources, timestamps)) in references.iter().zip(&plan) {
+            match r {
+                Ref2VaReference::Audio(_) => presentation.push(ReferencePresentation::Audio),
+                Ref2VaReference::Image(_) => {
+                    presentation.push(ReferencePresentation::Image {
+                        num_tokens: grounded.counts[cursor],
+                    });
+                    cursor += 1;
+                }
+                Ref2VaReference::Video(v) => {
+                    // One block per merged frame pair; every block of one clip shares a token count.
+                    let num_tokens = grounded.counts[cursor];
+                    presentation.push(ReferencePresentation::Video {
+                        num_tokens,
+                        timestamps: timestamps.clone(),
+                        has_audio: v.audio.is_some(),
+                    });
+                    cursor += n_sources;
+                }
+            }
+        }
+
+        let (ids, mask, tags) = tok.encode_ref2va(prompt, &presentation, &self.device)?;
+        let shards = candle_gen::loader::sorted_safetensors(
+            &self.root.join("text_encoder"),
+            "minimax-h3 te",
+        )?;
+        let prefixes = lm_prefixes(LM_PREFIX, &cfg);
+        let refs: Vec<&str> = prefixes.iter().map(String::as_str).collect();
+        let w =
+            candle_gen::Weights::from_files_filtered(&shards, &self.device, TE_STORE_DTYPE, &refs)?;
+        let te = MiniMaxH3TextEncoder::from_weights(&w, LM_PREFIX, &cfg, TE_STORE_DTYPE)?;
+        drop(w);
+        let context = te.forward_with_references(
+            &ids,
+            &mask,
+            &grounded.embeds,
+            &grounded.deepstack,
+            &grounded.grids,
+        )?;
+        drop(te);
+        drop(grounded);
+        crate::dit::release_device_memory(&self.device)?;
+
+        if context.dims()[1] != tags.len() {
+            return Err(CandleError::Msg(format!(
+                "{MODEL_ID}: the ref2va context has {} rows but {} modality tags",
+                context.dims()[1],
+                tags.len()
+            )));
+        }
+        Ok((context, tags))
+    }
 }
 
 impl MiniMaxH3 {
+    /// The audio VAE **encoder**, built from the same three FL2VA source documents the decoder
+    /// reads its constructor arguments from.
+    ///
+    /// Loaded at **f32**, not `self.dtype`. diffusers pins this component with
+    /// `_keep_in_fp32_modules = ["encoder", …, "mean_proj", "logs_proj"]` — the weight-normed
+    /// convolutions and Snake activations degrade audibly under bf16 — and a reference soundtrack
+    /// encoded at the wrong precision conditions the render with no diagnostic.
+    fn load_audio_encoder(&self) -> Result<crate::audio_vae_encoder::MiniMaxH3AudioVaeEncoder> {
+        let cfg = self.audio_vae_config()?;
+        let shards = candle_gen::loader::sorted_safetensors(
+            &self.root.join("audio_vae"),
+            "minimax-h3 audio vae",
+        )?;
+        let w = candle_gen::Weights::from_files(&shards, &self.device, DType::F32)?;
+        crate::audio_vae_encoder::MiniMaxH3AudioVaeEncoder::from_weights(
+            &w,
+            &cfg,
+            &self.device,
+            DType::F32,
+        )
+    }
+
     /// The audio VAE's config triple plus its weight map.
     ///
     /// The config comes from the FL2VA **source triple** (`config.json` + `config.yaml` +
@@ -552,30 +1040,38 @@ impl MiniMaxH3 {
         crate::audio_config::MiniMaxH3AudioVaeConfig,
         candle_gen::Weights,
     )> {
-        let src = self.root.join("FL2VA").join("audio_vae");
-        let cfg = if src.join("config.yaml").is_file() {
-            let read = |name: &str| -> Result<String> {
-                std::fs::read_to_string(src.join(name)).map_err(|e| {
-                    CandleError::Msg(format!(
-                        "{MODEL_ID}: read {}: {e}",
-                        src.join(name).display()
-                    ))
-                })
-            };
-            crate::audio_config::MiniMaxH3AudioVaeConfig::from_source_files(
-                &read("config.json")?,
-                &read("config.yaml")?,
-                &read("metadata.json")?,
-            )?
-        } else {
-            crate::audio_config::MiniMaxH3AudioVaeConfig::default()
-        };
+        let cfg = self.audio_vae_config()?;
         let shards = candle_gen::loader::sorted_safetensors(
             &self.root.join("audio_vae"),
             "minimax-h3 audio vae",
         )?;
         let w = candle_gen::Weights::from_files(&shards, &self.device, self.dtype)?;
         Ok((cfg, w))
+    }
+
+    /// The audio VAE's constructor arguments, shared by the decode and encode halves.
+    ///
+    /// Split out so the two halves cannot disagree about the geometry — `encoder_rates` fixes the
+    /// hop length the encode half pads to *and* the `decoder_rates` the decode half upsamples by,
+    /// and two independent readers of the same triple is exactly how those drift.
+    fn audio_vae_config(&self) -> Result<crate::audio_config::MiniMaxH3AudioVaeConfig> {
+        let src = self.root.join("FL2VA").join("audio_vae");
+        if !src.join("config.yaml").is_file() {
+            return Ok(crate::audio_config::MiniMaxH3AudioVaeConfig::default());
+        }
+        let read = |name: &str| -> Result<String> {
+            std::fs::read_to_string(src.join(name)).map_err(|e| {
+                CandleError::Msg(format!(
+                    "{MODEL_ID}: read {}: {e}",
+                    src.join(name).display()
+                ))
+            })
+        };
+        crate::audio_config::MiniMaxH3AudioVaeConfig::from_source_files(
+            &read("config.json")?,
+            &read("config.yaml")?,
+            &read("metadata.json")?,
+        )
     }
 }
 
@@ -620,6 +1116,69 @@ pub fn keyframe_anchors(
     Ok(out)
 }
 
+/// Map a request's **ordered** conditioning onto `ref2va`'s reference list.
+///
+/// Returns `None` when the request carries no reference of any modality, which is what makes this
+/// the `t2va` / `fl2va` discriminator as well.
+///
+/// # Order is taken from the request and never re-sorted
+///
+/// [`GenerationRequest::conditioning`] is a `Vec`, and `ref2va`'s order is semantic — it fixes the
+/// `"<Picture i>"` / `"<Audio j>"` / `"<Video k>"` labels **and** advances the shared rotary clock.
+/// So this walks the vector once and preserves position. Grouping by modality first (the obvious
+/// implementation, and what [`keyframe_anchors`] legitimately does for `fl2va`'s two fixed slots)
+/// would silently rewrite the request.
+///
+/// # The `ReferenceVideo` decision, and the two carriers it replaced
+///
+/// A `ref2va` video reference maps to `Conditioning::ReferenceVideo` — a carrier added to gen-core
+/// for this task, rather than either of the two video variants that already existed:
+///
+/// * **`VideoSync` is the wrong meaning.** Its contract is video→audio Foley — the whole-clip
+///   visual condition an audio decoder attends to for a *silent clip* — and its own docs say the
+///   frames "are **not** spliced into a video latent". Both halves are false here.
+/// * **`VideoClip` is the right *mechanism* but the wrong *vocabulary*.** Its payload is
+///   `{frames, frame_idx, strength}`, and a reference can use none of the latter two: `frame_idx`
+///   is a position in the generated timeline, which is exactly what a reference does not have, and
+///   `strength` is a `1 − strength` denoise mask, where reference rows are fully pinned at the
+///   checkpoint's own conditioning timestep. It also cannot carry a clip's **own frame rate** or
+///   **own soundtrack**, both of which [`crate::reference::VideoReference`] requires: a rate that
+///   was lost is a reference conditioned on at the wrong speed with nothing to raise about it.
+pub(crate) fn request_references(req: &GenerationRequest) -> Result<Option<Ref2VaReferences>> {
+    use candle_gen::gen_core::Conditioning;
+
+    let mut refs: Vec<Ref2VaReference> = Vec::new();
+    for c in &req.conditioning {
+        match c {
+            Conditioning::Reference { image, .. } => {
+                refs.push(Ref2VaReference::Image(image.clone()));
+            }
+            Conditioning::ReferenceAudio { audio, .. } => {
+                refs.push(Ref2VaReference::Audio(crate::reference::AudioReference {
+                    audio: audio.clone(),
+                }));
+            }
+            Conditioning::ReferenceVideo { frames, fps, audio } => {
+                refs.push(Ref2VaReference::Video(VideoReference {
+                    frames: frames.clone(),
+                    // The clip's own rate, carried by the variant. Range-checked by
+                    // `Ref2VaReferences::new`, which owns every ref2va rule at the engine boundary.
+                    fps: f64::from(*fps),
+                    audio: audio.clone(),
+                }));
+            }
+            // Keyframes belong to `fl2va` and are resolved by `keyframe_anchors`; everything else
+            // is refused upstream by `Capabilities::validate_request`, which default-denies any
+            // kind this descriptor does not advertise.
+            _ => {}
+        }
+    }
+    if refs.is_empty() {
+        return Ok(None);
+    }
+    Ref2VaReferences::new(refs).map(Some)
+}
+
 impl Generator for MiniMaxH3 {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
@@ -634,6 +1193,17 @@ impl Generator for MiniMaxH3 {
                 "{MODEL_ID}: prompt must not be empty"
             )));
         }
+        // **The `ref2va` reference gate, at the engine boundary** (sc-17157). Every cap — 9 images,
+        // 3 clips, 3 audio, 12 combined — plus the audio-is-never-alone rule and the
+        // both-tasks-at-once refusal, all before a single weight is read.
+        //
+        // Enforced here and not only at the API for the reason the whole epic exists: a pipeline
+        // handed conditioning it cannot consume does not fail, it renders a plausible clip that
+        // silently ignored the thirteenth reference. `Ref2VaReferences` is constructible only
+        // through its validating constructor, so the render path cannot reach a reference list
+        // that skipped this.
+        let references = request_references(req)?;
+        MiniMaxH3Task::resolve(!req.keyframes().is_empty(), references.is_some())?;
         Ok(())
     }
 
@@ -910,7 +1480,7 @@ mod tests {
         );
 
         // (function, its phases in source order).
-        let staged: [(&str, &[Phase]); 3] = [
+        let staged: [(&str, &[Phase]); 5] = [
             (
                 "fn encode_prompt(",
                 &[(
@@ -944,6 +1514,53 @@ mod tests {
                     ),
                     (
                         "the 66.3 GB DiT",
+                        &["MiniMaxH3Dit::load("],
+                        &["drop(model);"],
+                    ),
+                    (
+                        "the 10.4 GB video VAE, decode",
+                        &["MiniMaxH3VideoVae::load_decode_only("],
+                        &["drop(vae);"],
+                    ),
+                    (
+                        "the audio VAE, decode",
+                        &["self.load_audio_vae(", "MiniMaxH3AudioVae::from_weights("],
+                        &["drop(w);", "drop(vae);"],
+                    ),
+                ],
+            ),
+            // The `ref2va` presentation (sc-17157). Same two components as `encode_prompt_grounded`
+            // — the tower, then the LM — but a separate function, so a release deleted here would
+            // not be caught by that entry.
+            (
+                "fn encode_prompt_ref2va(",
+                &[
+                    (
+                        "the Qwen3-VL vision tower",
+                        &["load_vision_tower("],
+                        &["drop(vision);"],
+                    ),
+                    (
+                        "the 66.7 GB Qwen3-VL-32B text encoder",
+                        TE_MAPS,
+                        &["drop(w);", "drop(te);", "drop(grounded);"],
+                    ),
+                ],
+            ),
+            // The `ref2va` render. **The DiT phase is the one that matters for sc-17157**: it maps
+            // ONE 66 GB partition, chosen by `MiniMaxH3Task::partition()`, and drops it before the
+            // decode VAEs. The two partitions are byte-identical in size, so a build that mapped
+            // both would double the sequential peak the manifest admits cards against.
+            (
+                "fn generate_ref2va(",
+                &[
+                    (
+                        "the 10.4 GB video VAE + the audio VAE encoder, reference encode",
+                        &["MiniMaxH3VideoVae::load(", "self.load_audio_encoder("],
+                        &["drop(vae);", "drop(audio_enc);"],
+                    ),
+                    (
+                        "the 66.3 GB task DiT",
                         &["MiniMaxH3Dit::load("],
                         &["drop(model);"],
                     ),
@@ -1074,16 +1691,41 @@ mod tests {
         assert!(msg.contains("LoRA/LoKr"), "{msg}");
     }
 
-    /// **A `ref2va` request is REFUSED on the RENDER PATH, not merely absent from the descriptor.**
+    /// A solid RGB image of the given extent, for the reference-request fixtures.
+    fn ref_image(w: u32, h: u32) -> Image {
+        Image {
+            width: w,
+            height: h,
+            pixels: vec![0u8; (w * h * 3) as usize],
+        }
+    }
+
+    fn ref_track() -> candle_gen::gen_core::AudioTrack {
+        candle_gen::gen_core::AudioTrack {
+            samples: vec![0.0; 64],
+            sample_rate: 32_000,
+            channels: 1,
+            stems: Vec::new(),
+        }
+    }
+
+    fn ref_conditioning() -> candle_gen::gen_core::Conditioning {
+        candle_gen::gen_core::Conditioning::Reference {
+            image: ref_image(64, 64),
+            strength: Some(1.0),
+        }
+    }
+
+    /// **All three reference modalities BIND, individually and combined** — the descriptor
+    /// advertises them and `Generator::validate` admits them (sc-17157).
     ///
-    /// `the_descriptor_advertises_only_the_ported_surface` asserts the three reference kinds are
-    /// missing from the allowlist — but a missing entry is a DECLARATION, and this crate has already
-    /// been bitten once by assuming a declaration gates anything (`supports_lora` gates nothing at
-    /// all, which is why [`load`] carries an explicit check). This exercises the actual seam:
-    /// `Generator::validate`, which `generate_impl` calls on every render, must turn a reference
-    /// request into a typed `Unsupported` that NAMES the kind.
+    /// The control is the point: before this story every one of these was a typed `Unsupported`,
+    /// so a build that reverted the descriptor entry fails here rather than silently dropping
+    /// Ref2VA back to a refusal.
     #[test]
-    fn a_ref2va_request_is_refused_on_the_render_path() {
+    fn every_reference_modality_binds_individually_and_combined() {
+        use candle_gen::gen_core::Conditioning;
+
         let tmp = tempfile::tempdir().unwrap();
         let root = staged_root(&tmp);
         let generator = load(&LoadSpec::new(WeightsSource::Dir(root))).unwrap();
@@ -1094,49 +1736,238 @@ mod tests {
             height: 768,
             ..Default::default()
         };
-        // Control: the same request without reference conditioning passes validation, so the
-        // refusal below is attributable to the conditioning and not to some other floor check.
-        generator
-            .validate(&base)
-            .expect("the bare request must validate — otherwise the refusal proves nothing");
+        generator.validate(&base).expect("the bare request");
 
-        for kind in [
-            candle_gen::gen_core::Conditioning::Reference {
-                image: Image {
-                    width: 1,
-                    height: 1,
-                    pixels: vec![0, 0, 0],
-                },
-                strength: Some(1.0),
-            },
-            candle_gen::gen_core::Conditioning::ReferenceVideo {
-                frames: vec![Image {
-                    width: 1,
-                    height: 1,
-                    pixels: vec![0, 0, 0],
-                }],
-                fps: 24.0,
-                audio: None,
-            },
+        let image = ref_conditioning();
+        let video = Conditioning::ReferenceVideo {
+            frames: vec![ref_image(64, 64); 4],
+            fps: 24.0,
+            audio: None,
+        };
+        let audio = Conditioning::ReferenceAudio {
+            audio: ref_track(),
+            strength: None,
+        };
+
+        // Individually. Audio is never alone (`crate::reference`), so it is paired with an image —
+        // and that pairing rule is asserted on its own below.
+        for (name, conditioning) in [
+            ("image", vec![image.clone()]),
+            ("video", vec![video.clone()]),
+            ("audio", vec![image.clone(), audio.clone()]),
         ] {
-            let named = format!("{:?}", kind.kind());
             let req = GenerationRequest {
-                conditioning: vec![kind],
+                conditioning,
                 ..base.clone()
             };
-            let err = generator
+            generator
                 .validate(&req)
-                .expect_err("a ref2va request must be refused");
-            assert!(
-                matches!(err, candle_gen::gen_core::Error::Unsupported(_)),
-                "{named}: must be a typed Unsupported, got {err:?}"
-            );
-            let msg = err.to_string();
-            assert!(
-                msg.contains(&named),
-                "the refusal must NAME the kind so a caller knows what to drop: {msg}"
-            );
+                .unwrap_or_else(|e| panic!("a {name} reference must bind: {e}"));
         }
+
+        // Combined, at the per-modality caps: 9 images + 2 clips + 1 audio = 12, the combined cap.
+        let mut combined = vec![image.clone(); 9];
+        combined.extend(vec![video.clone(); 2]);
+        combined.push(audio.clone());
+        assert_eq!(combined.len(), 12);
+        generator
+            .validate(&GenerationRequest {
+                conditioning: combined,
+                ..base.clone()
+            })
+            .expect("all three modalities combined, exactly at the 12-reference cap");
+
+        // An audio-only request is refused — a waveform never reaches the conditioner.
+        let e = generator
+            .validate(&GenerationRequest {
+                conditioning: vec![audio],
+                ..base.clone()
+            })
+            .expect_err("audio alone leaves the visual stream unconditioned");
+        assert!(e.to_string().contains("cannot be used on its own"), "{e}");
+
+        // Keyframes and references together are two different checkpoints, so the request is
+        // refused rather than silently resolved to one of them.
+        let keyframe = Conditioning::Keyframe {
+            image: ref_image(64, 64),
+            frame_idx: 0,
+            strength: 1.0,
+        };
+        let e = generator
+            .validate(&GenerationRequest {
+                conditioning: vec![keyframe, image],
+                ..base
+            })
+            .expect_err("fl2va and ref2va are different checkpoints");
+        assert!(
+            e.to_string().contains("both keyframes and references"),
+            "{e}"
+        );
+    }
+
+    /// **Over-cap is rejected at the ENGINE boundary**, with a message naming the cap it tripped.
+    ///
+    /// Each pass sends exactly one reference over one cap against a control at that same cap, so a
+    /// refusal cannot be credited to a different gate — and the `12 = 9 + 2 + 1` control above
+    /// shows the combined cap is not simply refusing everything.
+    #[test]
+    fn an_over_cap_reference_request_is_rejected_at_the_engine_boundary() {
+        use candle_gen::gen_core::Conditioning;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = staged_root(&tmp);
+        let generator = load(&LoadSpec::new(WeightsSource::Dir(root))).unwrap();
+        let base = GenerationRequest {
+            prompt: "a cellist on a rooftop".into(),
+            width: 1344,
+            height: 768,
+            ..Default::default()
+        };
+
+        let image = || ref_conditioning();
+        let video = || Conditioning::ReferenceVideo {
+            frames: vec![ref_image(64, 64); 4],
+            fps: 24.0,
+            audio: None,
+        };
+        let audio = || Conditioning::ReferenceAudio {
+            audio: ref_track(),
+            strength: None,
+        };
+
+        // (name, at-cap request, over-cap request, the substring the refusal must carry)
+        let mut over_total = vec![image(); 9];
+        over_total.extend(vec![video(); 3]);
+        over_total.extend(vec![audio(); 3]);
+        let mut at_total = vec![image(); 9];
+        at_total.extend(vec![video(); 2]);
+        at_total.push(audio());
+
+        let mut audio_at = vec![image()];
+        audio_at.extend(vec![audio(); 3]);
+        let mut audio_over = vec![image()];
+        audio_over.extend(vec![audio(); 4]);
+
+        for (name, at_cap, over_cap, expect) in [
+            (
+                "images",
+                vec![image(); 9],
+                vec![image(); 10],
+                "at most 9 image",
+            ),
+            (
+                "clips",
+                vec![video(); 3],
+                vec![video(); 4],
+                "at most 3 video",
+            ),
+            ("audio", audio_at, audio_over, "at most 3 audio"),
+            (
+                "combined",
+                at_total,
+                over_total,
+                "at most 12 references in total",
+            ),
+        ] {
+            generator
+                .validate(&GenerationRequest {
+                    conditioning: at_cap,
+                    ..base.clone()
+                })
+                .unwrap_or_else(|e| {
+                    panic!("{name}: the AT-cap request must be admitted, else the gate is off by one: {e}")
+                });
+            let e = match generator.validate(&GenerationRequest {
+                conditioning: over_cap,
+                ..base.clone()
+            }) {
+                Ok(()) => panic!("{name}: the over-cap request must be refused"),
+                Err(e) => e.to_string(),
+            };
+            assert!(e.contains(expect), "{name}: {e}");
+        }
+    }
+
+    /// **The task selects the checkpoint, and only `ref2va` moves.**
+    ///
+    /// The two partitions are structurally indistinguishable — same config, same 638 tensor names —
+    /// so this mapping is the *only* thing standing between a `ref2va` request and a plausible
+    /// render off the wrong 66 GB.
+    #[test]
+    fn the_task_picks_the_partition_and_only_ref2va_moves() {
+        assert_eq!(MiniMaxH3Task::T2va.partition(), BASE_DIT_PARTITION);
+        assert_eq!(MiniMaxH3Task::Fl2va.partition(), BASE_DIT_PARTITION);
+        assert_eq!(MiniMaxH3Task::Ref2va.partition(), REFERENCE_DIT_PARTITION);
+        assert_ne!(BASE_DIT_PARTITION, REFERENCE_DIT_PARTITION);
+
+        assert_eq!(
+            MiniMaxH3Task::resolve(false, false).unwrap(),
+            MiniMaxH3Task::T2va
+        );
+        assert_eq!(
+            MiniMaxH3Task::resolve(true, false).unwrap(),
+            MiniMaxH3Task::Fl2va
+        );
+        assert_eq!(
+            MiniMaxH3Task::resolve(false, true).unwrap(),
+            MiniMaxH3Task::Ref2va
+        );
+        let e = MiniMaxH3Task::resolve(true, true).unwrap_err().to_string();
+        assert!(e.contains("both keyframes and references"), "{e}");
+
+        // Only the reference task runs the tower over references; `t2va` has no visual source.
+        assert!(!MiniMaxH3Task::T2va.needs_vision_tower());
+        assert!(MiniMaxH3Task::Fl2va.needs_vision_tower());
+        assert!(MiniMaxH3Task::Ref2va.needs_vision_tower());
+    }
+
+    /// `request_references` preserves the request's **order** across modalities, because that order
+    /// fixes the presentation labels and advances the shared rotary clock.
+    ///
+    /// The assertion is on the interleaved sequence, not on counts: a grouping implementation (the
+    /// obvious one) produces the same counts and a different request.
+    #[test]
+    fn the_reference_list_keeps_the_requests_order_across_modalities() {
+        use candle_gen::gen_core::Conditioning;
+
+        let req = GenerationRequest {
+            prompt: "p".into(),
+            conditioning: vec![
+                Conditioning::ReferenceVideo {
+                    frames: vec![ref_image(64, 64); 4],
+                    fps: 30.0,
+                    audio: None,
+                },
+                ref_conditioning(),
+                Conditioning::ReferenceAudio {
+                    audio: ref_track(),
+                    strength: None,
+                },
+                ref_conditioning(),
+            ],
+            ..Default::default()
+        };
+        let refs = request_references(&req).unwrap().expect("references");
+        let kinds: Vec<crate::reference::ReferenceKind> =
+            refs.as_slice().iter().map(|r| r.kind()).collect();
+        use crate::reference::ReferenceKind::{Audio, Image as I, Video};
+        assert_eq!(kinds, vec![Video, I, Audio, I]);
+
+        // The clip's OWN rate survives the mapping — `VideoClip` could not carry it, and a rate
+        // silently defaulted to 24 plays a 30 fps reference 25% fast with nothing to raise.
+        match &refs.as_slice()[0] {
+            crate::reference::Ref2VaReference::Video(v) => assert_eq!(v.fps, 30.0),
+            other => panic!("expected a clip, got {other:?}"),
+        }
+
+        // A request with no reference of any modality is `None`, which is the t2va/fl2va
+        // discriminator.
+        assert!(request_references(&GenerationRequest {
+            prompt: "p".into(),
+            ..Default::default()
+        })
+        .unwrap()
+        .is_none());
     }
 
     /// **A tier request is REFUSED, not silently rendered dense.**
@@ -1272,8 +2103,13 @@ mod tests {
         );
     }
 
-    /// A snapshot missing any one of the four component directories fails at `load`, naming the
+    /// A snapshot missing any one of the five component directories fails at `load`, naming the
     /// component — not twenty minutes later inside a phase.
+    ///
+    /// `transformer_ref` is one of them (sc-17157): a snapshot that ships only the base partition
+    /// — which is what a pure-`q4` install is today, since `SceneWorks/minimax-h3-mlx` publishes no
+    /// `q4/transformer_ref` (sc-19517) — must fail LOUDLY here rather than degrade to the base
+    /// checkpoint when a reference request arrives.
     #[test]
     fn a_missing_component_fails_the_load_and_names_itself() {
         for missing in REQUIRED_COMPONENT_DIRS {
@@ -1303,23 +2139,22 @@ mod tests {
         assert!(!d.capabilities.supports_negative_prompt);
         assert!(!d.capabilities.supports_guidance);
         assert!(!d.capabilities.supports_true_cfg);
-        // fl2va only; ref2va (sc-17157) is default-denied rather than silently ignored.
+        // `fl2va` plus all three `ref2va` kinds (sc-17157) — and NOT `VideoClip`, which this model
+        // has no in-context-clip mechanism for and which default-deny turns into a typed
+        // `Unsupported`.
         assert_eq!(
             d.capabilities.conditioning,
-            vec![ConditioningKind::Keyframe]
+            vec![
+                ConditioningKind::Keyframe,
+                ConditioningKind::Reference,
+                ConditioningKind::ReferenceVideo,
+                ConditioningKind::ReferenceAudio,
+            ]
         );
         assert!(!d
             .capabilities
             .conditioning
-            .contains(&ConditioningKind::Reference));
-        assert!(!d
-            .capabilities
-            .conditioning
-            .contains(&ConditioningKind::ReferenceVideo));
-        assert!(!d
-            .capabilities
-            .conditioning
-            .contains(&ConditioningKind::ReferenceAudio));
+            .contains(&ConditioningKind::VideoClip));
         // The turbo LoRA seam is not ported here.
         assert!(!d.capabilities.supports_lora);
         assert!(!d.capabilities.supports_lokr);

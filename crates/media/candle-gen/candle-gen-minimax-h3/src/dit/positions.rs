@@ -272,6 +272,149 @@ pub fn keyframe_position_ids(
     Ok(frame_rows.iter().map(|&[h, w]| [t, h, w]).collect())
 }
 
+/// The **latent** geometry one `ref2va` reference block occupies — what the encoders actually
+/// produced for it, not what the request asked for.
+///
+/// Taken from the encoded latents rather than re-derived from the source media, so the layout and
+/// the conditioning rows can never disagree about a reference's row count. The reference
+/// implementation is explicit about this ("the geometry of every reference block is the shape of
+/// what the encoder produced for it, so the two can never disagree"), and a mismatch here surfaces
+/// as an `index_copy` shape error 50 layers deep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReferenceLatentGeometry {
+    /// Which modality this reference is — it decides both the time layout and the clock advance.
+    pub kind: crate::reference::ReferenceKind,
+    /// Video latent frames. `1` for an image, the encoded count for a clip, `0` for audio.
+    pub num_latent_frames: usize,
+    /// Latent height of **this reference's own** encode — references are encoded at their own
+    /// resolution and do not share the target canvas.
+    pub latent_height: usize,
+    /// Latent width of this reference's own encode.
+    pub latent_width: usize,
+    /// Audio latents **per channel**. Non-zero for a standalone audio reference and for a clip
+    /// carrying its own soundtrack; `0` otherwise.
+    pub num_audio_latents: usize,
+}
+
+/// One `ref2va` reference block's contribution: `(audio_rows, video_rows, clock_advance)`.
+///
+/// Named rather than spelled inline because the tuple's *order* is load-bearing — audio first,
+/// mirroring the packed row order — and an unnamed triple of two identical vector types is exactly
+/// the shape a caller silently swaps.
+pub type ReferenceBlockRows = (Vec<[f64; 3]>, Vec<[f64; 3]>, f64);
+
+/// One `ref2va` reference block's rows and the rotary time it consumes.
+///
+/// Returns `(audio_rows, video_rows, advance)` — **audio first**, because a clip's soundtrack rows
+/// are packed immediately *before* its video rows and share their origin, exactly as the generated
+/// audio and video do.
+///
+/// # The three modalities advance the shared clock differently
+///
+/// `rotary_time` is one clock shared by audio and video. It starts where the text rows end and every
+/// block pushes it forward by the time that block occupies:
+///
+/// * **image** — a single frame at a single **constant** time, advancing the clock by exactly
+///   `1.0`. Not `5/3`: an image takes one integer rotary slot rather than a latent frame's span.
+/// * **audio** — `num_audio_latents` rows pinned to the *target* canvas's width extremes, advancing
+///   by `num_audio_latents`.
+/// * **video** — its soundtrack (on **its own** width grid, not the target's), then its frames on a
+///   [`temporal_grid`] from the same origin, advancing by
+///   `max(num_audio_latents, video_span)` so a clip and its sound stay rotary-aligned.
+///
+/// # The summation order is sequential here, and pairwise in [`keyframe_anchor_time`]
+///
+/// `video_span` is summed **sequentially** in f64. The reference implementation sums the same series
+/// with numpy's *pairwise* summation at the `fl2va` last-frame anchor and sequentially on this
+/// path, keeping both — the two differ in the last ulp of f64 from 16 latent frames onwards. This
+/// crate keeps the distinction at the same two call sites even though
+/// `keyframe_anchor_summation_order_is_invisible_after_the_f32_narrow` shows it cannot survive the
+/// f32 narrow, so that the port matches structurally and not only numerically.
+pub fn reference_block_position_ids(
+    geometry: &ReferenceLatentGeometry,
+    origin: f64,
+    patch_h: usize,
+    patch_w: usize,
+    audio_channels: usize,
+    target_width_grid: &[f64],
+) -> Result<ReferenceBlockRows> {
+    use crate::reference::ReferenceKind;
+
+    if !origin.is_finite() {
+        return Err(CandleError::Msg(format!(
+            "minimax-h3 dit positions: the reference rotary clock is at {origin}"
+        )));
+    }
+    let mut audio_rows = Vec::new();
+    let mut video_rows = Vec::new();
+    let mut advance = 0.0f64;
+
+    // The visual half, and the width grid this reference's audio is pinned to. A standalone audio
+    // reference has no grid of its own and borrows the target's.
+    let width_grid: Vec<f64> = match geometry.kind {
+        ReferenceKind::Audio => target_width_grid.to_vec(),
+        ReferenceKind::Image | ReferenceKind::Video => {
+            if geometry.num_latent_frames == 0 {
+                return Err(CandleError::Msg(format!(
+                    "minimax-h3 dit positions: a {} reference must occupy at least one latent \
+                     frame, got 0",
+                    geometry.kind.noun()
+                )));
+            }
+            let (grid, w) = frame_grid(
+                geometry.latent_height,
+                geometry.latent_width,
+                patch_h,
+                patch_w,
+            )?;
+            match geometry.kind {
+                ReferenceKind::Image => {
+                    // An image is one frame at ONE constant time — not a temporal grid.
+                    if geometry.num_latent_frames != 1 {
+                        return Err(CandleError::Msg(format!(
+                            "minimax-h3 dit positions: an image reference is a single latent \
+                             frame, got {}",
+                            geometry.num_latent_frames
+                        )));
+                    }
+                    video_rows.extend(grid.iter().map(|&[h, w]| [origin, h, w]));
+                    advance = 1.0;
+                }
+                _ => {
+                    let times = temporal_grid(geometry.num_latent_frames, origin)?;
+                    for &t in &times {
+                        video_rows.extend(grid.iter().map(|&[h, w]| [t, h, w]));
+                    }
+                    // Sequential f64 sum — see the doc comment.
+                    let span: f64 = (0..geometry.num_latent_frames)
+                        .map(|i| {
+                            ROPE_FRAME_RESCALE
+                                * ROPE_FRAMES_PER_LATENT[i % ROPE_FRAMES_PER_LATENT.len()]
+                        })
+                        .sum();
+                    advance = span;
+                }
+            }
+            w
+        }
+    };
+
+    if geometry.num_audio_latents > 0 {
+        // `audio_position_ids` takes its origin as a token count; the shared clock is a float, so
+        // the rows are built at origin 0 and shifted. Equivalent by construction and it keeps one
+        // implementation of the channel-major / width-extreme convention.
+        let rows = audio_position_ids(0, geometry.num_audio_latents, audio_channels, &width_grid)?;
+        audio_rows.extend(rows.into_iter().map(|[t, h, w]| [t + origin, h, w]));
+        advance = advance.max(geometry.num_audio_latents as f64);
+    } else if geometry.kind == ReferenceKind::Audio {
+        return Err(CandleError::Msg(
+            "minimax-h3 dit positions: an audio reference occupies no audio latents".into(),
+        ));
+    }
+
+    Ok((audio_rows, video_rows, advance))
+}
+
 /// Target video rows, frame-major: each latent frame contributes the whole [`frame_grid`] at that
 /// frame's [`temporal_grid`] time.
 pub fn video_position_ids(
