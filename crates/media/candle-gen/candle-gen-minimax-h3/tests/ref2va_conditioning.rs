@@ -48,7 +48,10 @@ use candle_gen_minimax_h3::conditioning::{
     reference_clip_to_vae_pixels, KeyframeNoise,
 };
 use candle_gen_minimax_h3::denoise::{REFERENCE_AUDIO_TIMESTEP, TEXT_TAG};
-use candle_gen_minimax_h3::dit::positions::ReferenceLatentGeometry;
+use candle_gen_minimax_h3::dit::positions::{
+    audio_position_ids, frame_grid, reference_block_position_ids, temporal_grid,
+    ReferenceLatentGeometry, ROPE_FRAMES_PER_LATENT, ROPE_FRAME_RESCALE,
+};
 use candle_gen_minimax_h3::pipeline::{prepend_condition_audio_rows, prepend_condition_rows};
 use candle_gen_minimax_h3::reference::{
     AudioReference, Ref2VaReference, Ref2VaReferences, ReferenceKind, VideoReference,
@@ -370,11 +373,19 @@ fn an_audio_reference_binds_as_clean_condition_rows() {
     for &row in audio_idx.iter().skip(reserved) {
         assert_eq!(classes[row as usize], RowClass::Audio as u32);
     }
+    // **The literal, not the constant.** `PackedLayout::row_timesteps` returns
+    // `REFERENCE_AUDIO_TIMESTEP` verbatim, so asserting the row against that same constant held for
+    // ANY value of it: set the constant to 0.5 and this test stayed green while every reference
+    // soundtrack rode half-noised. `1.0` is the claim, so `1.0` is what is written.
     let t = PackedLayout::row_timesteps(0.3, 0.6);
     assert_eq!(
         t[RowClass::ConditionAudio as usize],
-        REFERENCE_AUDIO_TIMESTEP,
+        1.0,
         "a reference soundtrack rides CLEAN at 1.0, not at the visual 0.999"
+    );
+    assert_eq!(
+        REFERENCE_AUDIO_TIMESTEP, 1.0,
+        "the constant the packer reads is no longer the clean timestep"
     );
     assert_ne!(
         t[RowClass::ConditionAudio as usize],
@@ -702,4 +713,262 @@ fn the_ref2va_layout_is_not_the_base_layout() {
     .unwrap_err()
     .to_string();
     assert!(e.contains("at least one reference"), "{e}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// 4. `reference_block_position_ids`, directly
+// ---------------------------------------------------------------------------------------------
+//
+// Everything above reaches this function only through `PackedLayout::build_ref2va`, and only ever
+// with `image_geometry()` — one latent frame, no soundtrack. Two whole branches were asserted
+// nowhere: the **video** branch's `advance = span` and the audio `advance.max(num_audio_latents)`.
+//
+// Worse, `geometry()`, `image_geometry()` and `clip_geometry()` were ALL 6x6, so every reference's
+// grid was bit-identical to the target's and a version of this function that ignored the
+// reference's own geometry and used the TARGET grid unconditionally passed the entire file. The
+// references below are deliberately on their own, different canvas.
+
+/// A reference canvas that is **not** the target's.
+///
+/// The target is 6x6 latent at [`PATCH`] `[1, 2, 2]`, i.e. a 3x3 = 9-row frame grid. This is 4x10,
+/// i.e. 2x5 = 10 rows — a different row COUNT, a different aspect, and different width extremes, so
+/// "used the reference's grid" and "used the target's grid" cannot produce the same answer.
+const REF_LATENT_H: usize = 4;
+const REF_LATENT_W: usize = 10;
+
+/// The target's own width grid, which a **standalone audio** reference borrows and a clip does not.
+fn target_width_grid() -> Vec<f64> {
+    frame_grid(6, 6, PATCH[1], PATCH[2]).unwrap().1
+}
+
+/// This reference's own width grid — the one a clip's soundtrack must be pinned to.
+fn ref_width_grid() -> Vec<f64> {
+    frame_grid(REF_LATENT_H, REF_LATENT_W, PATCH[1], PATCH[2])
+        .unwrap()
+        .1
+}
+
+fn off_canvas(
+    kind: ReferenceKind,
+    num_latent_frames: usize,
+    num_audio_latents: usize,
+) -> ReferenceLatentGeometry {
+    ReferenceLatentGeometry {
+        kind,
+        num_latent_frames,
+        latent_height: REF_LATENT_H,
+        latent_width: REF_LATENT_W,
+        num_audio_latents,
+    }
+}
+
+fn block(g: &ReferenceLatentGeometry, origin: f64) -> (Vec<[f64; 3]>, Vec<[f64; 3]>, f64) {
+    reference_block_position_ids(
+        g,
+        origin,
+        PATCH[1],
+        PATCH[2],
+        AUDIO_CHANNELS,
+        &target_width_grid(),
+    )
+    .unwrap()
+}
+
+/// The sum the video branch advances the clock by, spelled out independently of the implementation.
+fn span(num_latent_frames: usize) -> f64 {
+    (0..num_latent_frames)
+        .map(|i| ROPE_FRAME_RESCALE * ROPE_FRAMES_PER_LATENT[i % ROPE_FRAMES_PER_LATENT.len()])
+        .sum()
+}
+
+/// **A reference is laid out on its OWN grid, not the target's.**
+///
+/// The row count and the width extremes both come from the reference's 4x10 canvas. Against the
+/// old all-6x6 fixtures this claim was unfalsifiable.
+#[test]
+fn a_reference_block_uses_the_references_own_canvas_not_the_targets() {
+    let origin = 7.0;
+    let g = off_canvas(ReferenceKind::Image, 1, 0);
+    let (audio, video, advance) = block(&g, origin);
+
+    let (own_grid, own_w) = frame_grid(REF_LATENT_H, REF_LATENT_W, PATCH[1], PATCH[2]).unwrap();
+    let target = target_width_grid();
+    assert_ne!(
+        own_w, target,
+        "the fixture no longer distinguishes the two canvases; this whole section is vacuous"
+    );
+    assert_eq!(own_grid.len(), 10, "4x10 at patch 2x2 is a 2x5 grid");
+    assert_eq!(
+        video.len(),
+        own_grid.len(),
+        "an image reference contributes its OWN grid's rows, not the target's {}",
+        target.len()
+    );
+    // …and the spatial half of each row IS that grid, in order.
+    for (row, own) in video.iter().zip(&own_grid) {
+        assert_eq!([row[1], row[2]], *own);
+    }
+    assert!(audio.is_empty(), "an image reference has no soundtrack");
+    // An image is ONE constant time, and advances the clock by exactly 1.0 — not a frame's span.
+    assert!(video.iter().all(|r| (r[0] - origin).abs() < 1e-12));
+    assert_eq!(advance, 1.0);
+}
+
+/// **The video branch: `advance = span`, and the frames ride a non-uniform [`temporal_grid`].**
+///
+/// Previously asserted nowhere — the only exercise of this function passed `image_geometry()`,
+/// which takes the image arm and returns before `span` is ever computed.
+#[test]
+fn a_clip_reference_advances_the_clock_by_its_temporal_span() {
+    let origin = 3.0;
+    for frames in [2usize, 3, 5, 7] {
+        let g = off_canvas(ReferenceKind::Video, frames, 0);
+        let (audio, video, advance) = block(&g, origin);
+
+        assert!(audio.is_empty());
+        let grid_rows = frame_grid(REF_LATENT_H, REF_LATENT_W, PATCH[1], PATCH[2])
+            .unwrap()
+            .0
+            .len();
+        assert_eq!(video.len(), frames * grid_rows, "{frames} frames");
+        assert_eq!(advance, span(frames), "{frames} frames");
+
+        // The times are the temporal grid's, frame-major — NOT a uniform ramp.
+        let times = temporal_grid(frames, origin).unwrap();
+        for (f, &t) in times.iter().enumerate() {
+            for row in &video[f * grid_rows..(f + 1) * grid_rows] {
+                assert!((row[0] - t).abs() < 1e-12, "frame {f}");
+            }
+        }
+        if frames >= 3 {
+            // Non-vacuity for the grid itself: the spacing is 5/3 then 20/3, so a uniform ramp
+            // would satisfy the count check above but not this.
+            let d0 = times[1] - times[0];
+            let d1 = times[2] - times[1];
+            assert!((d1 - 4.0 * d0).abs() < 1e-12, "{frames}: {d0} then {d1}");
+        }
+    }
+}
+
+/// **The audio `max`: a clip and its soundtrack stay rotary-aligned, whichever is longer.**
+///
+/// `advance = advance.max(num_audio_latents)` — the line finding 9 named. The two cases below
+/// straddle it, so a build that dropped the `.max` (keeping `span`) fails the second, and one that
+/// overwrote `advance` with `num_audio_latents` fails the first.
+#[test]
+fn a_clips_advance_is_the_max_of_its_span_and_its_soundtrack() {
+    let origin = 2.0;
+    let frames = 3;
+    let s = span(frames); // 5/3 + 20/3 + 20/3 = 15.0
+    assert!(
+        s > 4.0 && s < 20.0,
+        "the fixture must straddle the max: {s}"
+    );
+
+    // Soundtrack SHORTER than the span → the span wins.
+    let (audio, _, advance) = block(&off_canvas(ReferenceKind::Video, frames, 4), origin);
+    assert_eq!(advance, s, "a short soundtrack must not shorten the clip");
+    assert_eq!(audio.len(), 4 * AUDIO_CHANNELS);
+
+    // Soundtrack LONGER than the span → the soundtrack wins.
+    let (audio, _, advance) = block(&off_canvas(ReferenceKind::Video, frames, 20), origin);
+    assert_eq!(
+        advance, 20.0,
+        "a soundtrack outlasting the clip must advance the shared clock past it"
+    );
+    assert_eq!(audio.len(), 20 * AUDIO_CHANNELS);
+
+    // …and a clip's soundtrack is pinned to the CLIP's width grid, not the target's — the second
+    // half of finding 8, on the audio path.
+    let own_w = ref_width_grid();
+    let expected = audio_position_ids(0, 20, AUDIO_CHANNELS, &own_w).unwrap();
+    for (got, want) in audio.iter().zip(&expected) {
+        assert_eq!(
+            got[2], want[2],
+            "clip soundtrack rides the clip's width grid"
+        );
+        assert!((got[0] - (want[0] + origin)).abs() < 1e-12);
+    }
+    assert_ne!(
+        own_w.last(),
+        target_width_grid().last(),
+        "the two canvases share a right extreme; the check above cannot discriminate"
+    );
+}
+
+/// **A standalone audio reference borrows the TARGET's width grid** — it has no canvas of its own —
+/// and advances by its latent count.
+#[test]
+fn a_standalone_audio_reference_borrows_the_target_grid_and_advances_by_its_latents() {
+    let origin = 11.0;
+    let g = ReferenceLatentGeometry {
+        kind: ReferenceKind::Audio,
+        num_latent_frames: 0,
+        latent_height: 0,
+        latent_width: 0,
+        num_audio_latents: 6,
+    };
+    let (audio, video, advance) = block(&g, origin);
+
+    assert!(video.is_empty(), "a waveform contributes no vision rows");
+    assert_eq!(advance, 6.0);
+    let expected = audio_position_ids(0, 6, AUDIO_CHANNELS, &target_width_grid()).unwrap();
+    assert_eq!(audio.len(), expected.len());
+    for (got, want) in audio.iter().zip(&expected) {
+        assert!((got[0] - (want[0] + origin)).abs() < 1e-12);
+        assert_eq!([got[1], got[2]], [want[1], want[2]]);
+    }
+
+    // The refusals, each named rather than lumped into `is_err()`.
+    let silent = ReferenceLatentGeometry {
+        num_audio_latents: 0,
+        ..g
+    };
+    let e = reference_block_position_ids(
+        &silent,
+        origin,
+        PATCH[1],
+        PATCH[2],
+        AUDIO_CHANNELS,
+        &target_width_grid(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("occupies no audio latents"), "{e}");
+
+    let e = reference_block_position_ids(
+        &off_canvas(ReferenceKind::Video, 0, 0),
+        origin,
+        PATCH[1],
+        PATCH[2],
+        AUDIO_CHANNELS,
+        &target_width_grid(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("at least one latent frame"), "{e}");
+
+    let e = reference_block_position_ids(
+        &off_canvas(ReferenceKind::Image, 2, 0),
+        origin,
+        PATCH[1],
+        PATCH[2],
+        AUDIO_CHANNELS,
+        &target_width_grid(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("single latent frame"), "{e}");
+
+    let e = reference_block_position_ids(
+        &off_canvas(ReferenceKind::Image, 1, 0),
+        f64::NAN,
+        PATCH[1],
+        PATCH[2],
+        AUDIO_CHANNELS,
+        &target_width_grid(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("rotary clock is at"), "{e}");
 }
