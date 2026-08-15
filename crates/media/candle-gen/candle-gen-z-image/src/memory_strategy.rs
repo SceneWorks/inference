@@ -32,6 +32,111 @@ pub(crate) const CALIBRATION_FINGERPRINT: &str =
 pub(crate) const CONTROL_CALIBRATION_FINGERPRINT: &str =
     "z-image-cuda-base-control-host-decode-streamed-device-format-blocks-v2";
 
+fn ordinary_streamable(spec: &LoadSpec) -> bool {
+    spec.precision == Precision::Bf16
+        && matches!(spec.load_shape, LoadShape::DeferredMaterialization)
+        && matches!(spec.weights, WeightsSource::Dir(_))
+        && spec.quantize.is_none()
+        && spec.pid.is_none()
+        && spec.control.is_none()
+        && spec.extra_controls.is_empty()
+        && spec.ip_adapter.is_none()
+        && spec.identity.is_none()
+        && spec.components.is_empty()
+}
+
+fn control_streamable(spec: &LoadSpec) -> bool {
+    spec.precision == Precision::Bf16
+        && matches!(spec.load_shape, LoadShape::DeferredMaterialization)
+        && matches!(spec.weights, WeightsSource::Dir(_))
+        && spec.quantize.is_none()
+        && spec.adapters.is_empty()
+        && spec.pid.is_none()
+        && spec.control.is_some()
+        && spec.extra_controls.is_empty()
+        && spec.ip_adapter.is_none()
+        && spec.identity.is_none()
+        && spec.components.is_empty()
+}
+
+fn set_transformer_streamability(contract: &mut MemoryProviderContract, streamable: bool) {
+    let capability = contract
+        .strategies
+        .iter_mut()
+        .find(|capability| capability.strategy == MemoryStrategy::BoundedTransformerResidency)
+        .expect("Z-Image contracts always publish the complete strategy ladder");
+    capability.support = if streamable {
+        MemoryStrategySupport::Implemented
+    } else {
+        MemoryStrategySupport::Missing
+    };
+    capability.parameters.transformer_window_sizes = if streamable {
+        TRANSFORMER_WINDOW_SIZES.to_vec()
+    } else {
+        Vec::new()
+    };
+    contract.lifecycle.transformer_window_materialization = streamable;
+}
+
+fn surface_selector_matches_spec(
+    surface: &gen_core::MemoryContractSurfaceSpec,
+) -> gen_core::Result<()> {
+    let tier_matches = match surface.resolved_artifact_tier() {
+        gen_core::MemoryContractSurfaceTier::Bf16 => {
+            surface.spec.precision == Precision::Bf16 && surface.spec.quantize.is_none()
+        }
+        gen_core::MemoryContractSurfaceTier::Q4 => surface.spec.quantize == Some(Quant::Q4),
+        gen_core::MemoryContractSurfaceTier::Q8 => surface.spec.quantize == Some(Quant::Q8),
+        gen_core::MemoryContractSurfaceTier::Nvfp4 => false,
+    };
+    if tier_matches
+        && surface.selector.offload_policy == surface.spec.offload_policy
+        && surface.selector.load_shape == surface.spec.load_shape
+    {
+        Ok(())
+    } else {
+        Err(gen_core::Error::Msg(format!(
+            "Z-Image memory surface selector '{}' does not match its weights-free LoadSpec",
+            surface.selector.id()
+        )))
+    }
+}
+
+/// Convert the generic finite-surface witness into the executable Z-Image load shape.
+///
+/// Q4/Q8 are already-packed artifact tiers selected before provider load. They therefore reach the
+/// real loader with `quantize == None`; retaining the generic witness' `Some(Q4|Q8)` here would mean
+/// unsupported on-the-fly packing of a dense source.
+fn normalized_surface_spec(
+    surface: &gen_core::MemoryContractSurfaceSpec,
+) -> gen_core::Result<LoadSpec> {
+    surface_selector_matches_spec(surface)?;
+    let mut spec = surface.spec.clone();
+    spec.quantize = None;
+    Ok(spec)
+}
+
+pub(crate) fn weights_free_surface_contract(
+    provider_id: &str,
+    surface: &gen_core::MemoryContractSurfaceSpec,
+) -> gen_core::Result<MemoryProviderContract> {
+    let spec = normalized_surface_spec(surface)?;
+    provider_contract(provider_id, &spec)
+}
+
+pub(crate) fn weights_free_control_surface_contract(
+    provider_id: &str,
+    surface: &gen_core::MemoryContractSurfaceSpec,
+) -> gen_core::Result<MemoryProviderContract> {
+    let spec = normalized_surface_spec(surface)?;
+    if spec.control.is_none() {
+        return Err(gen_core::Error::Msg(format!(
+            "{provider_id}: control contract surface is missing its mandatory control source"
+        )));
+    }
+    control_contract(provider_id, &spec)
+}
+
 fn imported_tensor_bytes(
     tensor: &gen_core::weightsmeta::SafetensorsTensorHeader,
     loaded_name: &str,
@@ -364,8 +469,7 @@ pub(crate) fn provider_contract(
     // phase graph, and output semantics are the same. The promoted matrix has no load-source axis,
     // however, so only Dir advertises rung 4 until the pinned/re-openable File path has its own real
     // measurement. A Dir rung-4 cell must never be relabeled as File evidence.
-    let streamable = matches!(spec.load_shape, LoadShape::DeferredMaterialization)
-        && matches!(spec.weights, gen_core::WeightsSource::Dir(_));
+    let streamable = ordinary_streamable(spec);
     let explicit_text_encoder = spec.text_encoder.as_ref();
     let legacy_text_encoder = spec
         .components
@@ -514,6 +618,7 @@ pub(crate) fn control_contract(
     spec: &LoadSpec,
 ) -> gen_core::Result<MemoryProviderContract> {
     let mut contract = provider_contract(provider_id, spec)?;
+    set_transformer_streamability(&mut contract, control_streamable(spec));
     let overlay_bytes = match spec.control.as_ref() {
         Some(gen_core::WeightsSource::Dir(path)) => gen_core::safetensors_path_bytes(path),
         Some(gen_core::WeightsSource::File(path)) => spec
@@ -746,6 +851,117 @@ mod tests {
         let mut spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
         spec.load_shape = LoadShape::DeferredMaterialization;
         spec
+    }
+
+    fn rung_four_support(contract: &MemoryProviderContract) -> MemoryStrategySupport {
+        contract
+            .capability(MemoryStrategy::BoundedTransformerResidency)
+            .expect("rung four")
+            .support
+            .clone()
+    }
+
+    #[test]
+    fn production_streamability_fails_closed_on_unsupported_load_axes() {
+        let eligible = spec();
+        assert!(ordinary_streamable(&eligible));
+
+        let mut adapted = eligible.clone();
+        adapted.adapters.push(gen_core::AdapterSpec::new(
+            "/adapter.safetensors".into(),
+            1.0,
+            gen_core::AdapterKind::Lora,
+        ));
+        assert!(ordinary_streamable(&adapted), "plain Z replays adapters");
+
+        let mut external_text_encoder = eligible.clone();
+        external_text_encoder.text_encoder = Some(WeightsSource::Dir("/text-encoder".into()));
+        assert!(
+            ordinary_streamable(&external_text_encoder),
+            "validated external text encoders remain a supported Z surface"
+        );
+
+        let mut identity = eligible.clone();
+        identity.identity = Some(gen_core::IdentityWeights::default());
+        let ineligible = [
+            eligible.clone().with_quant(Quant::Q4),
+            eligible.clone().with_pid(
+                WeightsSource::File("/pid.safetensors".into()),
+                WeightsSource::Dir("/gemma".into()),
+            ),
+            eligible
+                .clone()
+                .with_control(WeightsSource::File("/control.safetensors".into())),
+            eligible
+                .clone()
+                .with_extra_control(WeightsSource::File("/control-2.safetensors".into())),
+            eligible
+                .clone()
+                .with_ip_adapter(WeightsSource::File("/ip-adapter.safetensors".into())),
+            identity,
+            eligible.clone().with_component(
+                "unknown",
+                WeightsSource::File("/component.safetensors".into()),
+            ),
+            LoadSpec::new(WeightsSource::File("/model.safetensors".into()))
+                .with_load_shape(LoadShape::DeferredMaterialization),
+        ];
+        for spec in ineligible {
+            assert!(!ordinary_streamable(&spec), "must fail closed: {spec:?}");
+        }
+
+        let control = eligible
+            .clone()
+            .with_control(WeightsSource::File("/control.safetensors".into()));
+        assert!(control_streamable(&control));
+        assert!(
+            !control_streamable(&eligible),
+            "control source is mandatory"
+        );
+        assert!(!control_streamable(&adapted.with_control(
+            WeightsSource::File("/control.safetensors".into())
+        )));
+    }
+
+    #[test]
+    fn selector_surface_normalizes_prepacked_tiers_and_requires_control_witness() {
+        for surface in gen_core::candle_memory_contract_surface_specs() {
+            let normalized = normalized_surface_spec(&surface).expect("valid common selector");
+            assert_eq!(
+                normalized.quantize,
+                None,
+                "{} must reach Z as an already-packed artifact tier",
+                surface.selector.id()
+            );
+        }
+
+        let mut q4 = gen_core::candle_memory_contract_surface_specs()
+            .into_iter()
+            .find(|surface| {
+                surface.resolved_artifact_tier() == gen_core::MemoryContractSurfaceTier::Q4
+                    && surface.selector.offload_policy == gen_core::OffloadPolicy::Resident
+                    && surface.selector.load_shape == LoadShape::DeferredMaterialization
+            })
+            .expect("q4 resident deferred surface");
+        let plain = weights_free_surface_contract(crate::MODEL_ID, &q4).unwrap();
+        assert_eq!(
+            rung_four_support(&plain),
+            MemoryStrategySupport::Implemented
+        );
+
+        assert!(weights_free_control_surface_contract("z_image_turbo_control", &q4).is_err());
+        q4.spec.control = Some(WeightsSource::Dir("/synthetic-control".into()));
+        let control = weights_free_control_surface_contract("z_image_turbo_control", &q4).unwrap();
+        assert_eq!(
+            rung_four_support(&control),
+            MemoryStrategySupport::Implemented
+        );
+
+        q4.spec.quantize = Some(Quant::Q8);
+        assert!(
+            weights_free_surface_contract(crate::MODEL_ID, &q4).is_err(),
+            "selector/quant mutation must fail closed"
+        );
     }
 
     fn write_safetensors(path: &std::path::Path, tensors: &[(&str, usize)]) {
@@ -1717,7 +1933,8 @@ mod tests {
     #[test]
     fn control_routes_publish_the_full_executable_ladder() {
         for id in ["z_image_turbo_control", "z_image_control"] {
-            let contract = control_contract(id, &spec()).unwrap();
+            let spec = spec().with_control(WeightsSource::Dir("/control".into()));
+            let contract = control_contract(id, &spec).unwrap();
             assert!(contract.conformance_errors().is_empty());
             assert_eq!(
                 contract.calibration.as_ref().unwrap().fingerprint,

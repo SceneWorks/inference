@@ -1776,6 +1776,9 @@ fn is_plain_measured_load(spec: &LoadSpec) -> bool {
         && spec.control.is_none()
         && spec.extra_controls.is_empty()
         && spec.ip_adapter.is_none()
+        && spec.identity.is_none()
+        && spec.text_encoder.is_none()
+        && spec.components.is_empty()
 }
 
 fn streams_text_encoder(spec: &LoadSpec) -> bool {
@@ -1845,6 +1848,24 @@ fn load_with(spec: &LoadSpec, defaults: Defaults) -> gen_core::Result<Box<dyn Ge
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
             "{}: ControlNet / IP-Adapter conditioning is not part of the Lens port",
+            defaults.id
+        )));
+    }
+    if spec.identity.is_some() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{}: identity weights are not part of the Lens port",
+            defaults.id
+        )));
+    }
+    if spec.text_encoder.is_some() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{}: an external text encoder is not part of the Lens port",
+            defaults.id
+        )));
+    }
+    if !spec.components.is_empty() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{}: named external components are not part of the Lens port",
             defaults.id
         )));
     }
@@ -1928,6 +1949,70 @@ fn weights_free_lens_memory_strategy_contract(
         )
         && is_plain_measured_load(spec);
     build_lens_memory_strategy_contract_with_eligibility(provider_id, spec, streamable)
+}
+
+fn surface_selector_matches_spec(
+    surface: &gen_core::MemoryContractSurfaceSpec,
+) -> gen_core::Result<()> {
+    let tier_matches = match surface.resolved_artifact_tier() {
+        gen_core::MemoryContractSurfaceTier::Bf16 => {
+            surface.spec.precision == Precision::Bf16 && surface.spec.quantize.is_none()
+        }
+        gen_core::MemoryContractSurfaceTier::Q4 => surface.spec.quantize == Some(Quant::Q4),
+        gen_core::MemoryContractSurfaceTier::Q8 => surface.spec.quantize == Some(Quant::Q8),
+        gen_core::MemoryContractSurfaceTier::Nvfp4 => false,
+    };
+    if tier_matches
+        && surface.selector.offload_policy == surface.spec.offload_policy
+        && surface.selector.load_shape == surface.spec.load_shape
+    {
+        Ok(())
+    } else {
+        Err(gen_core::Error::Msg(format!(
+            "Lens memory surface selector '{}' does not match its weights-free LoadSpec",
+            surface.selector.id()
+        )))
+    }
+}
+
+/// Resolve the finite Lens declaration without claiming that a synthetic path contains real packed
+/// tensors. The production callback remains authoritative for the matching text-encoder and DiT
+/// config/tensor inventories; this resolver publishes only the exact eligible load shape with zero
+/// asset facts.
+fn weights_free_lens_surface_contract(
+    provider_id: &'static str,
+    surface: &gen_core::MemoryContractSurfaceSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    surface_selector_matches_spec(surface)?;
+    let spec = &surface.spec;
+    let streamable = matches!(
+        surface.resolved_artifact_tier(),
+        gen_core::MemoryContractSurfaceTier::Q4 | gen_core::MemoryContractSurfaceTier::Q8
+    ) && spec.precision == Precision::Bf16
+        && matches!(spec.weights, WeightsSource::Dir(_))
+        && matches!(spec.offload_policy, OffloadPolicy::Sequential)
+        && matches!(
+            spec.load_shape,
+            gen_core::LoadShape::DeferredMaterialization
+        )
+        && is_plain_measured_load(spec);
+    Ok(build_lens_memory_strategy_contract_with_eligibility(
+        provider_id,
+        spec,
+        streamable,
+    ))
+}
+
+fn weights_free_lens_turbo_surface_contract(
+    surface: &gen_core::MemoryContractSurfaceSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    weights_free_lens_surface_contract(MODEL_ID_TURBO, surface)
+}
+
+fn weights_free_lens_base_surface_contract(
+    surface: &gen_core::MemoryContractSurfaceSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    weights_free_lens_surface_contract(MODEL_ID_BASE, surface)
 }
 
 fn weights_free_lens_turbo_memory_strategy_contract(
@@ -2121,6 +2206,91 @@ mod weights_free_behavior_tests {
     }
 
     #[test]
+    fn selector_resolver_and_loader_reject_unsupported_lens_axes() {
+        let surface = gen_core::candle_memory_contract_surface_specs()
+            .into_iter()
+            .find(|surface| {
+                surface.resolved_artifact_tier() == gen_core::MemoryContractSurfaceTier::Q4
+                    && surface.selector.offload_policy == OffloadPolicy::Sequential
+                    && surface.selector.load_shape == gen_core::LoadShape::DeferredMaterialization
+            })
+            .expect("q4 sequential deferred Lens surface");
+        assert_eq!(
+            rung_four(&weights_free_lens_base_surface_contract(&surface).unwrap()).support,
+            gen_core::MemoryStrategySupport::Implemented
+        );
+
+        let assert_missing = |surface: &gen_core::MemoryContractSurfaceSpec| {
+            assert_eq!(
+                rung_four(&weights_free_lens_base_surface_contract(surface).unwrap()).support,
+                gen_core::MemoryStrategySupport::Missing,
+                "mutated Lens load surface must fail closed"
+            );
+        };
+
+        let mut identity = surface.spec.clone();
+        identity.identity = Some(gen_core::IdentityWeights::default());
+        assert_missing(&gen_core::MemoryContractSurfaceSpec {
+            selector: surface.selector,
+            spec: identity,
+        });
+
+        let mut text_encoder = surface.spec.clone();
+        text_encoder.text_encoder = Some(WeightsSource::Dir("/external-text-encoder".into()));
+        assert_missing(&gen_core::MemoryContractSurfaceSpec {
+            selector: surface.selector,
+            spec: text_encoder,
+        });
+
+        let component = surface.spec.clone().with_component(
+            "unknown",
+            WeightsSource::File("/component.safetensors".into()),
+        );
+        assert_missing(&gen_core::MemoryContractSurfaceSpec {
+            selector: surface.selector,
+            spec: component,
+        });
+
+        let pid = surface.spec.clone().with_pid(
+            WeightsSource::File("/pid.safetensors".into()),
+            WeightsSource::Dir("/gemma".into()),
+        );
+        assert_missing(&gen_core::MemoryContractSurfaceSpec {
+            selector: surface.selector,
+            spec: pid,
+        });
+
+        let mut file_source = surface.spec.clone();
+        file_source.weights = WeightsSource::File("/lens.safetensors".into());
+        assert_missing(&gen_core::MemoryContractSurfaceSpec {
+            selector: surface.selector,
+            spec: file_source,
+        });
+
+        let mut mismatched = surface;
+        mismatched.spec.quantize = Some(Quant::Q8);
+        assert!(
+            weights_free_lens_base_surface_contract(&mismatched).is_err(),
+            "selector/quant mismatch must be rejected"
+        );
+
+        let mut unsupported_identity = LoadSpec::new(WeightsSource::Dir("/lens".into()));
+        unsupported_identity.identity = Some(gen_core::IdentityWeights::default());
+        assert!(load_turbo(&unsupported_identity).is_err());
+
+        let mut unsupported_text = LoadSpec::new(WeightsSource::Dir("/lens".into()));
+        unsupported_text.text_encoder = Some(WeightsSource::Dir("/text".into()));
+        assert!(load_turbo(&unsupported_text).is_err());
+
+        let unsupported_component = LoadSpec::new(WeightsSource::Dir("/lens".into()))
+            .with_component(
+                "unknown",
+                WeightsSource::File("/component.safetensors".into()),
+            );
+        assert!(load_turbo(&unsupported_component).is_err());
+    }
+
+    #[test]
     fn production_contract_still_requires_real_packed_lens_content() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/lens".into()))
             .with_quant(Quant::Q4)
@@ -2191,12 +2361,24 @@ pub fn register_memory_contract_surfaces(
             provider_id: MODEL_ID_TURBO,
             contract: weights_free_lens_turbo_memory_strategy_contract,
         })
+        .register_memory_contract_surface_resolver(
+            gen_core::MemoryContractSurfaceResolverRegistration {
+                provider_id: MODEL_ID_TURBO,
+                contract: weights_free_lens_turbo_surface_contract,
+            },
+        )
         .register_memory_strategy(BASE_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
             surface_specs: gen_core::candle_memory_contract_surface_specs,
             provider_id: MODEL_ID_BASE,
             contract: weights_free_lens_base_memory_strategy_contract,
         })
+        .register_memory_contract_surface_resolver(
+            gen_core::MemoryContractSurfaceResolverRegistration {
+                provider_id: MODEL_ID_BASE,
+                contract: weights_free_lens_base_surface_contract,
+            },
+        )
 }
 
 /// Build the complete explicit Candle Lens provider catalog.

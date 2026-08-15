@@ -683,6 +683,28 @@ impl ZImageControl {
                 ));
             }
         }
+        if spec.quantize.is_some() {
+            return Err(CandleError::Msg(
+                "z-image control does not quantize dense weights at load time; select an already-packed artifact tier"
+                    .to_owned(),
+            ));
+        }
+        if !spec.adapters.is_empty() {
+            return Err(CandleError::Msg(
+                "z-image control does not apply LoRA or LoKr adapters".to_owned(),
+            ));
+        }
+        if !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() || spec.identity.is_some() {
+            return Err(CandleError::Msg(
+                "z-image control accepts exactly one control overlay and no IP-adapter or identity weights"
+                    .to_owned(),
+            ));
+        }
+        if !spec.components.is_empty() {
+            return Err(CandleError::Msg(
+                "z-image control does not accept named external components".to_owned(),
+            ));
+        }
         let mut model = spec.read_prepared_files_unchanged(|| {
             let control = match spec.control.as_ref() {
                 Some(WeightsSource::Dir(path) | WeightsSource::File(path)) => path.clone(),
@@ -1545,6 +1567,45 @@ mod tests {
             candle_gen::gen_core::LoadSpec::new(WeightsSource::Dir(PathBuf::from("/z-image")));
         assert!(validate_prepared_pid(Some(&no_pid), &admitted, "z-image control").is_err());
         assert!(validate_prepared_pid(None, &admitted, "z-image control").is_ok());
+    }
+
+    #[test]
+    fn prepared_control_load_refuses_ignored_load_axes_before_materialization() {
+        let paths = ZImageControlPaths {
+            snapshot: "/z-image".into(),
+            text_encoder: None,
+            control: "/control.safetensors".into(),
+            base: false,
+        };
+        let base = || {
+            candle_gen::gen_core::LoadSpec::new(WeightsSource::Dir("/z-image".into()))
+                .with_control(WeightsSource::File("/control.safetensors".into()))
+        };
+
+        let mut identity = base();
+        identity.identity = Some(candle_gen::gen_core::IdentityWeights::default());
+        let unsupported = [
+            base().with_quant(candle_gen::gen_core::Quant::Q4),
+            base().with_adapters(vec![candle_gen::gen_core::AdapterSpec::new(
+                "/adapter.safetensors".into(),
+                1.0,
+                candle_gen::gen_core::AdapterKind::Lora,
+            )]),
+            base().with_extra_control(WeightsSource::File("/extra.safetensors".into())),
+            base().with_ip_adapter(WeightsSource::File("/ip.safetensors".into())),
+            identity,
+            base().with_component(
+                "unknown",
+                WeightsSource::File("/component.safetensors".into()),
+            ),
+        ];
+        for spec in unsupported {
+            assert!(
+                ZImageControl::load_with_memory_spec(&paths, &spec, GenerationMemory::default())
+                    .is_err(),
+                "unsupported load axis must fail before any file is opened: {spec:?}"
+            );
+        }
     }
 
     #[test]

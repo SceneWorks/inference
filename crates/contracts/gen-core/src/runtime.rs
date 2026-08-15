@@ -531,6 +531,11 @@ pub enum LoadShapeDeclarationResult {
     /// No authoritative declaration check has run. Legacy shaping may still apply.
     #[default]
     NotEvaluated,
+    /// The declaration and provider accepted deferred materialization, but the required residency
+    /// mode has not yet been selected. This marker is intentionally unbound and non-authorizing:
+    /// the current load shape remains eager, generic shapers must ignore it, and only a fresh exact
+    /// declaration evaluation may transition the load to [`Self::Applied`].
+    Eligible,
     /// The declaration check admitted and applied its selected load shape.
     Applied,
     /// The declaration check authoritatively refused its selected load shape. Legacy shaping must
@@ -1457,7 +1462,23 @@ impl LoadSpec {
         self
     }
 
-    /// Atomically record that a declaration admitted deferred materialization.
+    /// Atomically record declaration eligibility while retaining eager materialization.
+    ///
+    /// This state is used when the provider's deferred surface additionally requires a later exact
+    /// residency choice. It is not transition authority: a generic shaper must ignore it. The
+    /// caller may use
+    /// [`with_applied_load_shape_declaration`](Self::with_applied_load_shape_declaration) only after
+    /// re-evaluating the exact declaration and provider with that requirement satisfied.
+    pub fn with_eligible_load_shape_declaration(mut self) -> Self {
+        self.load_shape = LoadShape::EagerMaterialization;
+        self.load_shape_declaration_result = LoadShapeDeclarationResult::Eligible;
+        self
+    }
+
+    /// Atomically record that an exact declaration evaluation admitted deferred materialization.
+    ///
+    /// [`LoadShapeDeclarationResult::Eligible`] alone never authorizes this transition; callers
+    /// must re-evaluate the exact declaration/provider coordinates after any later policy choice.
     pub fn with_applied_load_shape_declaration(mut self) -> Self {
         self.load_shape = LoadShape::DeferredMaterialization;
         self.load_shape_declaration_result = LoadShapeDeclarationResult::Applied;
@@ -1482,8 +1503,12 @@ impl LoadSpec {
     pub fn validate_load_shape_declaration(&self) -> crate::Result<()> {
         match (self.load_shape_declaration_result, self.load_shape) {
             (LoadShapeDeclarationResult::NotEvaluated, _)
+            | (LoadShapeDeclarationResult::Eligible, LoadShape::EagerMaterialization)
             | (LoadShapeDeclarationResult::Applied, LoadShape::DeferredMaterialization)
             | (LoadShapeDeclarationResult::Refused, LoadShape::EagerMaterialization) => Ok(()),
+            (LoadShapeDeclarationResult::Eligible, LoadShape::DeferredMaterialization) => {
+                Err("eligible load-shape declaration must retain eager materialization until its exact policy requirement is satisfied".into())
+            }
             (LoadShapeDeclarationResult::Applied, LoadShape::EagerMaterialization) => {
                 Err("applied load-shape declaration must use deferred materialization".into())
             }
@@ -1790,6 +1815,16 @@ mod tests {
         spec.validate_load_shape_declaration()
             .expect("default declaration state is valid");
 
+        let eligible = spec.clone().with_eligible_load_shape_declaration();
+        assert_eq!(
+            eligible.load_shape_declaration_result,
+            LoadShapeDeclarationResult::Eligible
+        );
+        assert_eq!(eligible.load_shape, LoadShape::EagerMaterialization);
+        eligible
+            .validate_load_shape_declaration()
+            .expect("eligible declaration is valid while eager");
+
         let applied = spec.clone().with_applied_load_shape_declaration();
         assert_eq!(
             applied.load_shape_declaration_result,
@@ -1821,12 +1856,19 @@ mod tests {
 
         let cache_axes: HashSet<_> = [
             LoadShapeDeclarationResult::NotEvaluated,
+            LoadShapeDeclarationResult::Eligible,
             LoadShapeDeclarationResult::Applied,
             LoadShapeDeclarationResult::Refused,
         ]
         .into_iter()
         .collect();
-        assert_eq!(cache_axes.len(), 3);
+        assert_eq!(cache_axes.len(), 4);
+
+        let mut contradictory_eligible = eligible;
+        contradictory_eligible.load_shape = LoadShape::DeferredMaterialization;
+        assert!(contradictory_eligible
+            .validate_load_shape_declaration()
+            .is_err());
 
         let mut contradictory_applied = applied;
         contradictory_applied.load_shape = LoadShape::EagerMaterialization;
