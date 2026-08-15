@@ -205,6 +205,7 @@ fn wan_ti2v_5b_wedge_sweep() {
     let noise = random::normal::<f32>(&lat_shape, None, None, Some(&key)).unwrap();
     let z_img = random::normal::<f32>(&[z, 1, h_lat, w_lat], None, None, Some(&key)).unwrap();
     let (mask, mask_tokens) = build_ti2v_mask(
+        &[(0, 1.0)],
         cfg.vae_z_dim,
         t_lat as usize,
         h_lat as usize,
