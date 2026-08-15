@@ -332,6 +332,11 @@ jobs:
           -p mlx-llm -p mlx-llm-server
           -p mlx-gen -p 'mlx-gen-*'
           -p runtime-macos
+      - name: Reclaim Clippy and rustdoc artifacts before linking MLX tests
+        # The complete all-target Clippy graph plus rustdoc output exhausted the hosted macOS disk
+        # while the broad test graph was linking. Both gates have already succeeded, so rebuild the
+        # narrower lib/test profile from a clean target before the existing post-test reclamation.
+        run: cargo clean
       # Deliberately NOT given `-j 1` or `--test-threads` (sc-16049). Test concurrency is already
       # pinned at 1: the root `.cargo/config.toml` force-sets `RUST_TEST_THREADS = 1` (MLX's shared
       # Metal device is not thread-safe) and cargo runs test binaries one at a time, so exactly one
