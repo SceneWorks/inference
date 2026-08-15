@@ -22,7 +22,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{
     AdapterSpec, CancelFlag, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
     GenerationRequest, Generator, Image, LoadPhase, LoadSpec, Modality, ModelDescriptor, MoeExpert,
-    OffloadPolicy, Precision, Progress, Quant, Result, SizeFloor, WeightsSource,
+    OffloadPolicy, Precision, Progress, Quant, Result, WeightsSource,
 };
 use mlx_rs::random;
 use mlx_rs::Array;
@@ -132,7 +132,6 @@ pub fn descriptor() -> ModelDescriptor {
             // mask-blend, pinning the listed latent frames instead of only frame 0.
             supports_negative_prompt: true,
             supports_guidance: true,
-            supports_true_cfg: false,
             conditioning: vec![ConditioningKind::Reference, ConditioningKind::Keyframe],
             // Q4/Q8 (sc-2682) loads via `spec.quantize` (transformer-only); LoRA/LoKr merge onto the
             // single dense model at generate time (the reference `_loras_single` path — shared
@@ -140,7 +139,6 @@ pub fn descriptor() -> ModelDescriptor {
             supports_lora: true,
             supports_lokr: true,
             samplers: wan_samplers(),
-            schedulers: Vec::new(),
             // H/W align to patch×vae_stride = 32 (`reject_off_grid`); floor each side at MIN_SIZE = 480
             // (= 15·32 — the z48 vae22 renders garbage below a 15×15 latent grid, sc-10306/sc-12636),
             // matching candle; cap the long edge at 1280 (max_area 704×1280).
@@ -148,9 +146,6 @@ pub fn descriptor() -> ModelDescriptor {
             min_size: MIN_SIZE,
             max_size: 1280,
             max_count: 1,
-            // Not a distilled fixed-schedule model: any step count the shared sanity caps
-            // admit is renderable (sc-19502).
-            supported_steps: Vec::new(),
             mac_only: true,
             supported_quants: &[Quant::Q4, Quant::Q8],
             component_precision_floors: crate::memory_strategy::COMPONENT_PRECISION_FLOORS,
@@ -168,20 +163,7 @@ pub fn descriptor() -> ModelDescriptor {
             // TE → DiT → z48 VAE is phase-staged on every request; Sequential additionally flushes
             // dead allocator cache between those already-staged phases.
             unconditionally_engages_staged_residency: true,
-            supports_preview: false,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
+            ..Default::default()
         },
     }
 }
@@ -831,28 +813,20 @@ pub fn descriptor_t2v_14b() -> ModelDescriptor {
             // prompt. Pure text→video: no image conditioning.
             supports_negative_prompt: true,
             supports_guidance: true,
-            supports_true_cfg: false,
-            conditioning: Vec::new(),
             // LoRA + LoKr merge per-expert at generate time (sc-2683 / sc-2393, PEFT/kohya + LoKr,
             // MoE high/low); Q4/Q8 (sc-2682) loads via `spec.quantize` or a pre-quantized snapshot.
             supports_lora: true,
             supports_lokr: true,
             samplers: wan_samplers(),
-            schedulers: Vec::new(),
             // H/W align to patch×vae_stride = 16 (z16 VAE, spatial stride 8); long edge cap 1280.
             supported_guidance_methods: vec![],
             min_size: 16,
             max_size: 1280,
             max_count: 1,
-            // Not a distilled fixed-schedule model: any step count the shared sanity caps
-            // admit is renderable (sc-19502).
-            supported_steps: Vec::new(),
             mac_only: true,
             supported_quants: &[Quant::Q4, Quant::Q8],
-            component_precision_floors: &[],
             // Cross-attention text K/V is cached across denoise steps (per expert).
             supports_kv_cache: true,
-            requires_sigma_shift: false,
             // A14B honors `OffloadPolicy::Sequential` (epic 12732, sc-12736): the staged expert swap
             // holds only the ACTIVE MoE expert resident (never both) and frees the UMT5 TE / VAE
             // off-GPU during denoise, dropping the unified-memory peak to ~one expert. Advertised so
@@ -861,20 +835,7 @@ pub fn descriptor_t2v_14b() -> ModelDescriptor {
             // TE/VAE and the active expert are phase-staged even under Resident; Sequential adds the
             // stronger cache-flush/expert-residency controls described above.
             unconditionally_engages_staged_residency: true,
-            supports_preview: false,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
+            ..Default::default()
         },
     }
 }
@@ -1796,7 +1757,6 @@ pub fn descriptor_i2v_14b() -> ModelDescriptor {
         capabilities: Capabilities {
             supports_negative_prompt: true,
             supports_guidance: true,
-            supports_true_cfg: false,
             // A single image is channel-concatenated as the first-frame conditioning (in_dim 36).
             conditioning: vec![ConditioningKind::Reference],
             // LoRA + LoKr merge per-expert at generate time (sc-2683 / sc-2393, PEFT/kohya + LoKr,
@@ -1804,20 +1764,14 @@ pub fn descriptor_i2v_14b() -> ModelDescriptor {
             supports_lora: true,
             supports_lokr: true,
             samplers: wan_samplers(),
-            schedulers: Vec::new(),
             // H/W align to patch×vae_stride = 16 (z16 VAE, spatial stride 8); long edge cap 1280.
             supported_guidance_methods: vec![],
             min_size: 16,
             max_size: 1280,
             max_count: 1,
-            // Not a distilled fixed-schedule model: any step count the shared sanity caps
-            // admit is renderable (sc-19502).
-            supported_steps: Vec::new(),
             mac_only: true,
             supported_quants: &[Quant::Q4, Quant::Q8],
-            component_precision_floors: &[],
             supports_kv_cache: true,
-            requires_sigma_shift: false,
             // A14B honors `OffloadPolicy::Sequential` (epic 12732, sc-12736): the staged expert swap
             // holds only the ACTIVE MoE expert resident (never both) and frees the UMT5 TE / VAE
             // off-GPU during denoise, dropping the unified-memory peak to ~one expert. Advertised so
@@ -1826,20 +1780,7 @@ pub fn descriptor_i2v_14b() -> ModelDescriptor {
             // TE/VAE and the active expert are phase-staged even under Resident; Sequential adds the
             // stronger cache-flush/expert-residency controls described above.
             unconditionally_engages_staged_residency: true,
-            supports_preview: false,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
+            ..Default::default()
         },
     }
 }

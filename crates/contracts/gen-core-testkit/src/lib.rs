@@ -89,7 +89,7 @@ pub use voice_embedder::{
 
 use gen_core::{
     Capabilities, Conditioning, Error, GenerationOutput, GenerationRequest, Generator, Image,
-    Modality, Progress,
+    Modality, Progress, StepSupport,
 };
 
 /// The lax `Progress::Step` monotonicity contract used by the captioner conformance checks (6942;
@@ -254,16 +254,30 @@ pub fn check_validate_honesty(g: &dyn Generator, profile: &Profile) -> Result<()
         }
     }
 
-    // Positive + negative: the advertised exact-step surface must be honest (sc-19502). Every count
-    // in `supported_steps` must validate, and a count outside it must be refused — the pair is the
-    // point, because each half alone is satisfiable by a broken provider: a lane that ignores
-    // `req.steps` entirely (which `mlx-gen-ltx` did) passes the positive half trivially, and a lane
-    // that rejects everything passes the negative half trivially.
+    // Positive + negative: the advertised step surface must be honest — an exact menu (sc-19502) or
+    // an inclusive range (sc-19559). Every ADMITTED count must validate, and a count outside must be
+    // refused; the pair is the point, because each half alone is satisfiable by a broken provider: a
+    // lane that ignores `req.steps` entirely (which `mlx-gen-ltx` did) passes the positive half
+    // trivially, and a lane that rejects everything passes the negative half trivially.
     //
-    // Skipped entirely for the unconstrained majority (empty ⇒ no constraint), so this adds no
-    // requirement to a model that never opted in.
-    if !caps.supported_steps.is_empty() {
-        for &steps in &caps.supported_steps {
+    // Skipped entirely for the unconstrained majority, so this adds no requirement to a model that
+    // never opted in.
+    if !caps.supported_steps.is_unconstrained() {
+        // Probe the ENDPOINTS, not the whole interval: SVD's range is 1..=200 and Kolors' is
+        // 1..=1100, so enumerating every admitted count would run 1100 validate() calls for no
+        // extra signal. An exact menu is small, so it is probed in full.
+        let admitted: Vec<u32> = match &caps.supported_steps {
+            StepSupport::Unconstrained => Vec::new(),
+            StepSupport::Exact(counts) => counts.clone(),
+            StepSupport::Range { min, max } => {
+                if min == max {
+                    vec![*min]
+                } else {
+                    vec![*min, *max]
+                }
+            }
+        };
+        for steps in admitted {
             let mut r = base_request(profile);
             r.steps = Some(steps);
             if let Err(e) = g.validate(&r) {
@@ -272,19 +286,19 @@ pub fn check_validate_honesty(g: &dyn Generator, profile: &Profile) -> Result<()
                 ));
             }
         }
-        // The smallest positive count the model does NOT advertise. Searching for a GAP rather than
-        // always probing `max + 1` keeps this meaningful for a model with a discontinuous set (a
-        // range check would admit the gap but still refuse `max + 1`). The bound is `max + 1`, which
-        // is never in the set, so the search always finds something.
-        let ceiling = caps.supported_steps.iter().copied().max().unwrap_or(0) + 1;
-        if let Some(off) = (1..=ceiling).find(|s| !caps.supported_steps.contains(s)) {
+        // The smallest positive count the model does NOT admit. Searching for a GAP rather than
+        // always probing `ceiling + 1` keeps this meaningful for a model with a discontinuous menu
+        // (a range check would admit the gap but still refuse `ceiling + 1`). The search bound is
+        // `ceiling + 1`, which no constrained surface admits, so it always finds something.
+        let ceiling = caps.supported_steps.ceiling().unwrap_or(0) + 1;
+        if let Some(off) = (1..=ceiling).find(|s| !caps.supported_steps.admits(*s)) {
             let mut r = base_request(profile);
             r.steps = Some(off);
             if g.validate(&r).is_ok() {
                 return Err(format!(
-                    "validate-honesty[{id}]: step count {off} is not in the advertised set {:?} but \
-                     was accepted by validate() — an advertised fixed schedule that admits other \
-                     counts silently ignores the caller's `steps`",
+                    "validate-honesty[{id}]: step count {off} is outside the advertised surface \
+                     {:?} but was accepted by validate() — an advertised step constraint that \
+                     admits other counts silently ignores the caller's `steps`",
                     caps.supported_steps
                 ));
             }
@@ -501,9 +515,15 @@ pub fn check_cancellation(g: &dyn Generator, profile: &Profile) -> Result<(), St
     // rejection. Fall back to the largest advertised count — it is the most headroom the model can
     // legally be given, and for the distilled LTX schedule that is 8, well past the ≥ 3 this needs.
     let caps = &g.descriptor().capabilities;
-    req.steps = Some(match caps.supported_steps.iter().max() {
-        Some(&native) if !caps.supported_steps.contains(&profile.cancel_steps) => native,
-        _ => profile.cancel_steps,
+    req.steps = Some(if caps.supported_steps.admits(profile.cancel_steps) {
+        profile.cancel_steps
+    } else {
+        // The most headroom the model can legally be given. For the distilled LTX schedule that is
+        // 8, well past the ≥ 3 this needs; for a ranged model the profile value is admitted, so
+        // this arm is only reached by an exact menu.
+        caps.supported_steps
+            .ceiling()
+            .unwrap_or(profile.cancel_steps)
     });
     check_cancellation_with(g, &req)
 }

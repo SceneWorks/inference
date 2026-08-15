@@ -36,7 +36,7 @@ use std::sync::Mutex;
 use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{
     self, Capabilities, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest,
-    Generator, Image, LoadSpec, Modality, ModelDescriptor, Progress, SizeFloor, WeightsSource,
+    Generator, Image, LoadSpec, Modality, ModelDescriptor, Progress, WeightsSource,
 };
 
 use crate::pipeline::{SanaGenerateRequest, SanaPipeline, SanaSprintPipeline};
@@ -152,46 +152,23 @@ pub fn descriptor() -> ModelDescriptor {
             supports_true_cfg: true,
             // A singular reference is latent-init img2img; control/IP-adapter overlays remain unwired.
             conditioning: vec![ConditioningKind::Reference],
-            supports_lora: false,
-            supports_lokr: false,
             // Flow-match Euler over the unified curated sampler/scheduler framework (epic 7114); the
             // native loop (`req.sampler == None`) stays the byte-exact default.
             samplers: candle_gen::curated_sampler_names(),
             schedulers: candle_gen::curated_scheduler_names(),
-            supported_guidance_methods: vec![],
             min_size: RES_MIN,
             max_size: RES_MAX,
             max_count: MAX_COUNT,
-            // candle is the Windows/CUDA backend — NOT Mac-only (the MLX provider sets this true).
-            // Not a distilled fixed-schedule model: any step count the shared sanity caps
-            // admit is renderable (sc-19502).
-            supported_steps: Vec::new(),
-            mac_only: false,
             // SANA is the f32/bf16 weight path; no load-time quantization is wired yet.
             supported_quants: &[],
-            component_precision_floors: &[],
-            supports_kv_cache: false,
             // Static flow-match shift 3.0, resolution-independent (handled by the unified sampler).
             requires_sigma_shift: false,
             // No candle `render_sequential` residency seam wired (sc-11126).
             supports_sequential_offload: false,
-            unconditionally_engages_staged_residency: false,
             // sc-16959: the base flow lane emits per-step latent previews through
             // `crate::preview::base_hook` over the epic-16624 BASE DC-AE fit — not Sprint's.
             supports_preview: true,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
+            ..Default::default()
         },
     }
 }
@@ -217,10 +194,7 @@ pub fn sprint_descriptor() -> ModelDescriptor {
             // Embedded guidance scalar — honored knob, but NOT classifier-free (no uncond forward).
             supports_negative_prompt: false,
             supports_guidance: true,
-            supports_true_cfg: false,
             conditioning: vec![ConditioningKind::Reference],
-            supports_lora: false,
-            supports_lokr: false,
             // The SCM/TrigFlow consistency loop is a dedicated few-step sampler, not a curated
             // epic-7114 `Solver`; only the engine-default sentinel is advertised.
             samplers: vec!["default"],
@@ -230,33 +204,11 @@ pub fn sprint_descriptor() -> ModelDescriptor {
             min_size: RES_MIN,
             max_size: RES_MAX,
             max_count: MAX_COUNT,
-            // Not a distilled fixed-schedule model: any step count the shared sanity caps
-            // admit is renderable (sc-19502).
-            supported_steps: Vec::new(),
-            mac_only: false,
-            supported_quants: &[],
-            component_precision_floors: &[],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
-            supports_sequential_offload: false,
-            unconditionally_engages_staged_residency: false,
             // sc-16959: the SCM lane emits per-step latent previews through
             // `crate::preview::sprint_hook` over the epic-16624 SPRINT fit, with the `1/σ_data`
             // correction the SCM driver's pre-scaled running latent needs.
             supports_preview: true,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
+            ..Default::default()
         },
     }
 }

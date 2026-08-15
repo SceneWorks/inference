@@ -27,6 +27,11 @@ use mlx_gen::{Conditioning, GenerationOutput, GenerationRequest, LoadSpec, Quant
 
 const PROMPT: &str = "make it look like a cold winter morning";
 
+/// Measured runs per arm in [`time_generate`], reduced with `min` (sc-19556). Two is the cheapest
+/// count that can distinguish "this run was descheduled" from "this arm is slow"; each run here is
+/// a full 4-step edit, so the cost is real and the count is deliberately small.
+const TIMED_RUNS: usize = 2;
+
 fn kv_snapshot() -> PathBuf {
     let p = std::env::var("MLX_GEN_FLUX2_KV_SNAPSHOT").unwrap_or_else(|_| panic!("set MLX_GEN_FLUX2_KV_SNAPSHOT to the required snapshot dir; inference never self-fetches or derives a cache location (epic 13657)"));
     PathBuf::from(p)
@@ -112,7 +117,15 @@ fn render_quant(id: &str, size: u32, nref: usize, quant: Option<Quant>) -> Image
     images.pop().unwrap()
 }
 
-/// Wall-clock of a single warm generate for `id` (load + one warmup generate, then the timed one).
+/// Wall-clock of a warm generate for `id`, reduced with `min` over [`TIMED_RUNS`] measured runs.
+///
+/// sc-19556: this used to time ONE run. The cache's published effect is a wall-clock speedup, so
+/// this gate keeps a duration — but a single sample makes the ratio below a comparison of two
+/// arbitrary points on a contended machine, and the two arms are timed minutes apart with a ~30 GB
+/// model load in between, so they do not even see the same load. Each arm runs identical work every
+/// time, so contention can only push a run SLOWER and the fastest run is a lower bound on what the
+/// hardware did. The ratio of two lower bounds is the honest form of "the cache saves work".
+///
 /// The model is dropped before returning so only one ~30 GB model is resident at a time.
 fn time_generate(id: &str, size: u32, nref: usize) -> f64 {
     let gen = mlx_gen_flux2::provider_registry()
@@ -122,9 +135,38 @@ fn time_generate(id: &str, size: u32, nref: usize) -> f64 {
     let req = edit_request(size, nref);
     // Warmup: first call pays kernel compilation / lazy graph setup.
     let _ = gen.generate(&req, &mut |_| {}).unwrap();
-    let t0 = Instant::now();
-    let _ = gen.generate(&req, &mut |_| {}).unwrap();
-    t0.elapsed().as_secs_f64()
+    let mut fastest = f64::INFINITY;
+    let mut last: Option<Image> = None;
+    for _ in 0..TIMED_RUNS {
+        let t0 = Instant::now();
+        let out = gen.generate(&req, &mut |_| {}).unwrap();
+        fastest = fastest.min(t0.elapsed().as_secs_f64());
+        let GenerationOutput::Images(mut images) = out else {
+            panic!("expected images");
+        };
+        last = images.pop();
+    }
+    // The timed path must produce a real image, not merely a fast one: a generator that returned
+    // early would read as an excellent speedup (sc-19556). This gates the run that was ACTUALLY
+    // TIMED, on BOTH arms of the ratio, and costs nothing extra — the output was already being
+    // computed and thrown away with `let _ =`. Re-rendering the id in the test body to check the
+    // same thing would instead have cost a third ~49 GB model load and covered only one arm.
+    // `last` is `None` for two distinct reasons and the panic must not misname which: the timed
+    // loop never ran (`TIMED_RUNS == 0`), or the final run returned `Images(vec![])`. The second is
+    // a real generator fault and the likelier one, so it is named first.
+    let img = last.unwrap_or_else(|| {
+        panic!(
+            "`{id}` produced no image on the timed run — `generate` returned an empty `Images(..)`, \
+             or TIMED_RUNS ({TIMED_RUNS}) is 0 and nothing was timed"
+        )
+    });
+    let (mean, std) = coherence(&img);
+    assert!(
+        mean > 2.0 && mean < 253.0 && std > 5.0,
+        "the timed `{id}` output is degenerate (mean={mean:.1}, std={std:.1}) — a speedup measured \
+         against garbage is not a speedup"
+    );
+    fastest
 }
 
 /// Output coherence: finite, in range, and not degenerate (a flat/black frame would mean the cache
@@ -173,7 +215,8 @@ fn q8_kv_cache_edit_is_coherent() {
 }
 
 #[test]
-#[ignore = "needs the real FLUX.2-klein-9b-kv snapshot (~49 GB); heavy (4 generates)"]
+#[ignore = "needs the real FLUX.2-klein-9b-kv snapshot (~49 GB); heavy (6 generates: 2 arms × 1 \
+            warmup + TIMED_RUNS timed)"]
 fn kv_cache_delivers_edit_speedup() {
     let (size, nref) = (res(), nref());
     // Same -kv weights, cache OFF (plain edit id) vs cache ON (kv edit id).
@@ -182,8 +225,12 @@ fn kv_cache_delivers_edit_speedup() {
     let speedup = t_off / t_on;
     println!(
         "flux2 9b-kv edit ({size}², 4 steps, {nref} ref): cache-off {t_off:.2}s vs cache-on \
-         {t_on:.2}s → {speedup:.2}× (fork fair A/B: ~1.4× single-ref, higher multi-ref)"
+         {t_on:.2}s → {speedup:.2}× (fastest of {TIMED_RUNS} runs per arm; fork fair A/B: ~1.4× \
+         single-ref, higher multi-ref)"
     );
+    // Coherence of the timed output is gated inside `time_generate`, on the run that was actually
+    // timed and on both arms — see the comment there for why it does not happen here.
+    //
     // The cache must materially reduce work. The steady-state single-ref effect is ~1.4× at 1024²
     // (verified equal to the fork); the floor is set below that to tolerate timing noise, and scales
     // up with reference count (each extra ref adds `target`-many cached-away tokens).

@@ -21,7 +21,7 @@ use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, Capabilities, Conditioning,
     ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator, Image, LatentDecoder,
     LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision, Progress, Quant, Residency,
-    Result, SizeFloor, WeightsSource,
+    Result, WeightsSource,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 
@@ -83,54 +83,30 @@ pub fn descriptor() -> ModelDescriptor {
             // The CFG-negative is a fixed empty/drop instruction, not a user negative prompt.
             supports_negative_prompt: false,
             supports_guidance: true,
-            supports_true_cfg: false,
             // Base/Turbo are text-to-image, and a single `Reference` opts them into img2img
             // latent-init (epic 8588 A4.3, sc-10191): VAE-encode the reference + noise-blend at a
             // strength-derived start step. The instruction-edit MultiReference path (Qwen3-VL semantic
             // edit) is the Edit checkpoint's alone (`descriptor_edit`); Turbo inherits this via clone.
             conditioning: vec![ConditioningKind::Reference],
-            supports_lora: false,
-            supports_lokr: false,
             // Base/Edit are rectified-flow Euler over a static-shift (`mu = 1.15`) schedule, routed
             // through the unified curated-sampler framework (epic 7114). Turbo overrides these to empty
             // (its DMD distillation sampler is not an ODE — see `descriptor_turbo`).
             samplers: curated_sampler_names(),
             schedulers: curated_scheduler_names(),
-            supported_guidance_methods: vec![],
             min_size: RES_MIN,
             max_size: RES_MAX,
             max_count: MAX_COUNT,
-            // Not a distilled fixed-schedule model: any step count the shared sanity caps
-            // admit is renderable (sc-19502).
-            supported_steps: Vec::new(),
             mac_only: true,
             // The turnkey ships pre-packed Q8 (default) + bf16; load-time quantize (Q4/Q8) over the
             // dense bf16 build is a no-op on an already-packed snapshot. The DiT + Qwen3-VL text
             // tower are quantized; the FLUX.1 VAE + (edit-only) vision tower stay dense.
             supported_quants: &[Quant::Q4, Quant::Q8],
-            component_precision_floors: &[],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
             // Wired onto the shared `Residency` seam (epic 10834, sc-10840): under Sequential the
             // ~17.5 GB Qwen3-VL `mllm/` encoder is dropped after conditioning + `clear_cache()` before
             // the ~20.6 GB DiT + VAE load, bounding peak unified memory to `max(mllm, DiT+VAE)`. Cloned
             // onto Turbo/Edit below. The small PiD overlay + tokenizer stay resident on the generator.
             supports_sequential_offload: true,
-            unconditionally_engages_staged_residency: false,
-            supports_preview: false,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
+            ..Default::default()
         },
     }
 }

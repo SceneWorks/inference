@@ -55,7 +55,7 @@ use mlx_gen::weights::{to_dtype, Weights};
 use mlx_gen::{
     curated_sampler_names, default_seed, Capabilities, Conditioning, ConditioningKind, Error,
     GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor,
-    Precision as LoadPrecision, Progress, Result, SizeFloor, WeightsSource,
+    Precision as LoadPrecision, Progress, Result, StepSupport, WeightsSource,
 };
 
 use crate::audio_vae::AudioDecoder;
@@ -233,8 +233,6 @@ pub fn descriptor() -> ModelDescriptor {
             // I2V single-image conditioning (sc-2685) is wired via `Reference`; audio is always
             // produced (sc-2684). Q4/Q8-of-everything is a sibling slice.
             supports_negative_prompt: false,
-            supports_guidance: false,
-            supports_true_cfg: false,
             // Reference = single-image I2V (sc-2685); Keyframe = first_last_frame / multi-keyframe
             // (replace-latent, epic 3040); VideoClip = extend_clip / video_bridge (IC-LoRA
             // keyframe-append — requires an IC-LoRA adapter via `spec.adapters`).
@@ -251,7 +249,6 @@ pub fn descriptor() -> ModelDescriptor {
             // Quantization is checkpoint-driven (split_model.json); load() rejects on-the-fly
             // spec.quantize that disagrees with the manifest. No on-the-fly re-quant available.
             supported_quants: &[],
-            component_precision_floors: &[],
             // Curated unified solvers (epic 7114, sc-7122): LTX exposes the SAMPLER axis but NO scheduler
             // (matching ComfyUI) — it keeps its baked distilled σ schedule (8+3 steps) and only swaps the
             // integrator (over the two-stream `MlxAvLatentOps`, joint video+audio). LTX is distilled, so
@@ -259,7 +256,6 @@ pub fn descriptor() -> ModelDescriptor {
             // others are exposed for parity with ComfyUI's menu. T2V only — the I2V/keyframe/clip paths
             // (per-token σ + post-step blend) stay native.
             samplers: curated_sampler_names(),
-            schedulers: Vec::new(),
             // height/width must be divisible by SIZE_MULTIPLE (= 2×SPATIAL_SCALE; stage-1 runs at //2//32).
             supported_guidance_methods: vec![],
             min_size: MIN_SIZE,
@@ -275,30 +271,15 @@ pub fn descriptor() -> ModelDescriptor {
             // going out-of-distribution, so the honest resolution is an explicit refusal on BOTH
             // lanes — not a knob that pretends to work here. Same derived constant, same shared
             // floor, same message as candle.
-            supported_steps: vec![crate::pipeline::NATIVE_STEPS],
+            supported_steps: StepSupport::Exact(vec![crate::pipeline::NATIVE_STEPS]),
             mac_only: true,
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
             // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
             supports_sequential_offload: false,
             // sc-18816: every generate builds/evaluates/drops Gemma before materializing the AvDiT,
             // then drops the AvDiT before VAE/audio decode. This is physical default behavior, not a
             // selectable Sequential control and not an evidence-composition edge.
             unconditionally_engages_staged_residency: true,
-            supports_preview: false,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
+            ..Default::default()
         },
     }
 }
@@ -1949,7 +1930,7 @@ mod tests {
         assert_eq!(NATIVE_STEPS, 8, "the distilled stage-1 schedule is 8 steps");
         assert_eq!(
             descriptor().capabilities.supported_steps,
-            vec![NATIVE_STEPS],
+            StepSupport::Exact(vec![NATIVE_STEPS]),
             "the descriptor must advertise exactly the baked schedule"
         );
     }

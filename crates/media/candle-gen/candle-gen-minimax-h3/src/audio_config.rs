@@ -469,11 +469,25 @@ impl MiniMaxH3AudioVaeConfig {
                 self.sample_rate.to_string(),
             ));
         }
-        let checks: [(&str, i64, i64); 4] = [
+        let checks: [(&str, i64, i64); 5] = [
             (
                 "latent_channels",
                 int_of(&root, "latent_channels", ctx)?,
                 self.latent_channels as i64,
+            ),
+            // **`num_attention_heads` — the one key here that binds a CONSTANT rather than a
+            // field.** The original `DacAudioVAE` hardcodes `num_heads=8` and it appears in none of
+            // the source triple, so `MiniMaxH3AudioVaeConfig` has no field for it and
+            // `crate::audio_vae_encoder::ATTN_PROJ_HEADS` carries it. The diffusers repackaging
+            // DOES publish it, which makes this the only place the constant can be checked against
+            // a document instead of against itself. Changing the head count changes `head_dim`,
+            // hence the attention scale and the adaptive pool's window layout, while every tensor
+            // shape stays identical — a runnable model with a wrong soundtrack conditioning, which
+            // no shape assertion anywhere can catch.
+            (
+                "num_attention_heads",
+                int_of(&root, "num_attention_heads", ctx)?,
+                crate::audio_vae_encoder::ATTN_PROJ_HEADS as i64,
             ),
             (
                 "latent_dim",
@@ -831,6 +845,32 @@ mod tests {
         // A drifted architecture is rejected rather than absorbed.
         let bad = root.replace("[9,9,4,4,4,4,4]", "[9,9,4,4,4,4,8]");
         assert!(shipped().cross_check_diffusers_json(&bad).is_err());
+
+        // **`num_attention_heads` is genuinely compared, and names itself when it disagrees.**
+        // The doc on `ATTN_PROJ_HEADS` claims this check binds the constant to a published
+        // document; a check that is never shown to REJECT is not a binding. Both directions, so a
+        // comparison hardcoded to 8 on either side fails one of them.
+        for wrong in [4, 16] {
+            let drifted = root.replace(
+                "\"num_attention_heads\":8",
+                &format!("\"num_attention_heads\":{wrong}"),
+            );
+            let e = shipped()
+                .cross_check_diffusers_json(&drifted)
+                .expect_err("a drifted head count must be refused")
+                .to_string();
+            assert!(
+                e.contains("num_attention_heads") && e.contains(&wrong.to_string()),
+                "{wrong}: {e}"
+            );
+        }
+        // …and a config that OMITS it is refused rather than defaulted to the constant.
+        let absent = root.replace("\"num_attention_heads\":8,", "");
+        let e = shipped()
+            .cross_check_diffusers_json(&absent)
+            .expect_err("a missing head count must be refused")
+            .to_string();
+        assert!(e.contains("num_attention_heads"), "{e}");
     }
 
     /// A `sample_rate` the reference has no BigVGAN block for is an error, not a guess.

@@ -927,8 +927,8 @@ class CrossBackendGeometryTests(unittest.TestCase):
     real crates' current contents. `CrossBackendGeometryLiveTests` covers the real tree.
     """
 
-    A = "backends/backend-a"
-    B = "backends/backend-b"
+    A = "crates/media/candle-gen/candle-gen-demo"
+    B = "crates/media/mlx-gen/mlx-gen-demo"
 
     LIB = (
         'pub const MODEL_ID: &str = "demo";\n'
@@ -946,47 +946,65 @@ class CrossBackendGeometryTests(unittest.TestCase):
         "pub const SAMPLE_RATE: i32 = 32000;\n"
         "pub const NORM_EPS: f32 = 0.00001;\n"
     )
+    FIXTURES = "pub const SHARED_FIXTURE_DIM: usize = 8;\n"
+    FIXTURES_B = "pub const SHARED_FIXTURE_DIM: i32 = 8;\n"
 
     def setUp(self) -> None:
         self.gate = load_gate_module()
-        self.gate.CROSS_BACKEND_GEOMETRY_PAIRS = ((self.A, self.B),)
-        self.gate.CROSS_BACKEND_GEOMETRY_FILES = ("src/lib.rs", "src/config.rs")
+        self.gate.CROSS_BACKEND_GEOMETRY_EXEMPT_FAMILIES = {}
+        self.gate.CROSS_BACKEND_GEOMETRY_EXEMPTIONS = {}
+        self.gate.CROSS_BACKEND_GEOMETRY_NO_SHARED_CONSTANTS = {}
         self.gate.CROSS_BACKEND_GEOMETRY_REFERENCE = {
-            "SIZE_MULTIPLE": (32.0,),
-            "VAE_RATIO": (16.0,),
-            "FACTORS": (2.0, 2.0, 4.0),
+            "demo": {
+                "SIZE_MULTIPLE": (32.0,),
+                "VAE_RATIO": (16.0,),
+                "FACTORS": (2.0, 2.0, 4.0),
+            }
         }
 
-    def check(self, **overrides: str):
-        """Build the pair, apply at most one override, and return the failure text or None.
+    def check(self, **overrides):
+        """Build the pair, apply the overrides, and return the failure text or None.
 
-        Keys are ``"<crate>/<file>"``; a value of None deletes the file, and a crate key alone
-        ("a" / "b") deletes the whole crate.
+        Keys are ``"<crate>/<path>"``; a value of None deletes the file, and ``drop_crate="b"``
+        drops the whole crate from the workspace the way deleting it would.
         """
         files = {
             "a/src/lib.rs": self.LIB,
             "a/src/config.rs": self.CONFIG_A,
+            "a/tests/common/mod.rs": self.FIXTURES,
             "b/src/lib.rs": self.LIB,
             "b/src/config.rs": self.CONFIG_B,
+            "b/tests/common/mod.rs": self.FIXTURES_B,
         }
         drop_crate = overrides.pop("drop_crate", None)
         files.update(overrides)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            packages = []
             for key, source in files.items():
-                crate = self.A if key.startswith("a/") else self.B
-                if drop_crate is not None and key.startswith(f"{drop_crate}/"):
+                side, relative = key.split("/", 1)
+                if drop_crate == side:
                     continue
+                crate = self.A if side == "a" else self.B
                 if source is None:
                     continue
-                path = root / crate / key.split("/", 1)[1]
+                path = root / crate / relative
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(source, encoding="utf-8")
+            for side, crate in (("a", self.A), ("b", self.B)):
+                if drop_crate == side:
+                    continue
+                name = "candle-gen-demo" if side == "a" else "mlx-gen-demo"
+                packages.append(
+                    {"name": name, "manifest_path": str(root / crate / "Cargo.toml")}
+                )
             try:
-                self.gate.check_cross_backend_geometry(root)
+                self.gate.check_cross_backend_geometry({"packages": packages}, root)
             except AssertionError as error:
                 return str(error)
             return None
+
+    # --- the baseline ----------------------------------------------------------------------------
 
     def test_the_unmutated_pair_passes(self) -> None:
         """Without this every "it failed" below would prove nothing."""
@@ -1008,6 +1026,8 @@ class CrossBackendGeometryTests(unittest.TestCase):
         self.assertEqual(self.gate._const_numbers("1e-5", {}), (1e-5,))
         self.assertEqual(self.gate._const_numbers("0.00001", {}), (1e-5,))
 
+    # --- clause: the two crates agree ------------------------------------------------------------
+
     def test_a_diverging_eps_is_still_caught(self) -> None:
         failure = self.check(**{"b/src/config.rs": self.CONFIG_B.replace("0.00001", "0.000001")})
         self.assertIsNotNone(failure)
@@ -1018,15 +1038,6 @@ class CrossBackendGeometryTests(unittest.TestCase):
         failure = self.check(**{"a/src/lib.rs": self.LIB.replace(" * 2;", ";")})
         self.assertIsNotNone(failure)
         self.assertIn("`SIZE_MULTIPLE` diverges", failure)
-
-    def test_both_backends_agreeing_on_the_wrong_value_is_still_caught(self) -> None:
-        """The clause that makes this gate more than a consistency check. "Fixing" a divergence by
-        copying the wrong number across must not buy a green — that is how the original defect would
-        have been resolved by anyone reading only the red."""
-        wrong = self.LIB.replace(" * 2;", ";")
-        failure = self.check(**{"a/src/lib.rs": wrong, "b/src/lib.rs": wrong})
-        self.assertIsNotNone(failure)
-        self.assertIn("released checkpoint read through diffusers says (32.0,)", failure)
 
     def test_an_identifier_folds_against_its_own_crates_declaration(self) -> None:
         """`SIZE_MULTIPLE = VAE_RATIO * 2` must fold against the `VAE_RATIO` its *own* backend
@@ -1059,26 +1070,412 @@ class CrossBackendGeometryTests(unittest.TestCase):
         self.assertIsNotNone(failure)
         self.assertIn("`MODEL_ID` diverges", failure)
 
-    def test_a_constant_present_only_on_the_second_backend_is_caught(self) -> None:
-        """Drift one step earlier than a value difference. Paired with the test below so that *both*
-        directions of the name-set comparison are covered — one test can only exercise one of them,
-        and a single-direction suite left the other clause free to be deleted."""
-        failure = self.check(
-            **{"b/src/config.rs": self.CONFIG_B + "pub const ONLY_HERE: i32 = 1;\n"}
+    def test_a_constant_only_one_backend_declares_is_not_a_divergence(self) -> None:
+        """The two backends legitimately declare different constants — mlx-gen carries Metal memory
+        registrations candle has no analogue for. Only the shared names are a checkable claim, and a
+        gate that red-flagged the rest would be a permanent red rather than a signal."""
+        self.assertIsNone(
+            self.check(**{"b/src/config.rs": self.CONFIG_B + "pub const ONLY_HERE: i32 = 1;\n"})
         )
-        self.assertIsNotNone(failure)
-        self.assertIn("`ONLY_HERE` is declared in", failure)
 
-    def test_a_constant_present_only_on_the_first_backend_is_caught(self) -> None:
+    def test_a_constant_moved_to_another_file_is_still_compared(self) -> None:
+        """The reason the hand-maintained file list is gone: under it, moving a declaration out of
+        the listed set removed it from the comparison. Every `.rs` under `src/` is read now, so the
+        divergence follows the constant wherever it goes."""
         failure = self.check(
             **{
-                "b/src/config.rs": self.CONFIG_B.replace(
-                    "pub const SAMPLE_RATE: i32 = 32000;\n", ""
-                )
+                "b/src/config.rs": self.CONFIG_B.replace("VAE_RATIO: i32 = 16;\n", ""),
+                "b/src/nested/deep.rs": "pub const VAE_RATIO: i32 = 8;\n",
             }
         )
         self.assertIsNotNone(failure)
-        self.assertIn("`SAMPLE_RATE` is declared in", failure)
+        self.assertIn("`VAE_RATIO`", failure)
+
+    def test_a_name_declared_twice_compares_the_set_of_values(self) -> None:
+        """`MODEL_ID` is declared once per variant module in several real families. Two backends
+        agree when they declare the same values under a name, whichever module each puts them in —
+        and disagree when the sets differ, which is the z-image/qwen-image shape."""
+        both = 'pub const MODEL_ID: &str = "demo_turbo";\n'
+        self.assertIsNone(
+            self.check(**{"a/src/extra.rs": both, "b/src/extra.rs": both})
+        )
+        failure = self.check(**{"b/src/extra.rs": both})
+        self.assertIsNotNone(failure)
+        self.assertIn("`MODEL_ID` diverges", failure)
+
+    def test_a_module_path_qualifier_folds_to_the_same_crate_declaration(self) -> None:
+        """`config::VAE_RATIO` and a bare `VAE_RATIO` name the same constant; the path is how it is
+        reached, not what it is, and the two backends organize their modules differently."""
+        self.assertIsNone(
+            self.check(
+                **{"b/src/lib.rs": self.LIB.replace("VAE_RATIO as u32", "config::VAE_RATIO as u32")}
+            )
+        )
+
+    def test_the_backend_shim_prefix_folds(self) -> None:
+        """`candle_gen::gen_core::X` and `mlx_gen::gen_core::X` are the same item named through each
+        backend's own shim, so the shim segment carries no value."""
+        self.assertIsNone(
+            self.check(
+                **{
+                    "a/src/extra.rs": "pub const REG: T = candle_gen::gen_core::T { id: 1 };\n",
+                    "b/src/extra.rs": "pub const REG: T = mlx_gen::gen_core::T { id: 1 };\n",
+                }
+            )
+        )
+
+    def test_a_digit_separator_inside_an_identifier_is_not_stripped(self) -> None:
+        """The regression this replaced a lookbehind-only rule for: `SD3_5_LARGE_ID` became
+        `SD35_LARGE_ID`, resolved against nothing, and reported `sd3`'s `MODEL_ID` as a divergence
+        it did not have. The same rule collapsed the string `"ltx_2_3"` to `"ltx_23"`, which would
+        have compared *equal* to a genuinely different `"ltx_23"`."""
+        self.assertEqual(self.gate._normalize_const_value("SD3_5_LARGE_ID"), "SD3_5_LARGE_ID")
+        self.assertEqual(self.gate._normalize_const_value('"ltx_2_3"'), '"ltx_2_3"')
+        self.assertEqual(self.gate._normalize_const_value("32_000"), "32000")
+        self.assertEqual(self.gate._normalize_const_value("0.858_090_34"), "0.85809034")
+        self.assertIsNone(
+            self.check(
+                **{
+                    "a/src/extra.rs": 'pub const NAME: &str = "demo_2_3";\n',
+                    "b/src/extra.rs": (
+                        'pub const DEMO_2_3_ID: &str = "demo_2_3";\n'
+                        "pub const NAME: &str = crate::config::DEMO_2_3_ID;\n"
+                    ),
+                }
+            )
+        )
+
+    def test_a_cast_is_stripped_from_code_but_never_from_a_string(self) -> None:
+        """`as` is a keyword outside a literal and the word "as" inside one.
+
+        Both spellings below are live in the tree this PR now sweeps — `boogu`'s `SYSTEM_PROMPT_T2I`
+        ends "…the instructions are as follows." and `sensenova`'s `SYSTEM_MESSAGE_FOR_GEN` says
+        "as input" — so before this, two backends whose prose differed only after an " as " compared
+        equal."""
+        self.assertEqual(self.gate._normalize_const_value("VAE_RATIO as u32"), "VAE_RATIO")
+        self.assertNotEqual(
+            self.gate._normalize_const_value('"The instructions are as follows."'),
+            self.gate._normalize_const_value('"The instructions are."'),
+        )
+        self.assertEqual(
+            self.gate._normalize_const_value('"Use the image as input."'),
+            '"Use the image as input."',
+        )
+
+    def test_a_digit_separator_inside_a_string_is_not_a_digit_separator(self) -> None:
+        """HF-style repo ids are exactly where the digit rule bit: the lookbehind only stops a match
+        *starting* mid-identifier, and inside a string a digit run legitimately follows `/` or `-`.
+        The two pairs below are the shape the tree is full of."""
+        self.assertNotEqual(
+            self.gate._normalize_const_value('"model/2_3"'),
+            self.gate._normalize_const_value('"model/23"'),
+        )
+        self.assertNotEqual(
+            self.gate._normalize_const_value('"SceneWorks/wan-2_2"'),
+            self.gate._normalize_const_value('"SceneWorks/wan-22"'),
+        )
+        # ...while a real numeric literal in the code around them still normalizes.
+        self.assertEqual(self.gate._normalize_const_value("&[32_000, 1_024]"), "&[32000,1024]")
+
+    def test_whitespace_inside_a_string_is_content_not_layout(self) -> None:
+        """The pre-existing space strip compounded the two rules above: `"euler a"` is a sampler
+        name and `"eulera"` is not one, and `DEFAULT_SAMPLER` is a real cross-backend comparison in
+        this tree (`chroma` carries an exemption for it)."""
+        self.assertNotEqual(
+            self.gate._normalize_const_value('"euler a"'),
+            self.gate._normalize_const_value('"eulera"'),
+        )
+        self.assertEqual(self.gate._normalize_const_value("[2, 2, 4]"), "[2,2,4]")
+
+    def test_two_backends_whose_strings_differ_only_inside_a_literal_still_red(self) -> None:
+        """End to end, not just at the normalizer: the three rules above are only worth anything if
+        the divergence reaches the gate's own message."""
+        for candle_value, mlx_value in (
+            ('"do it as follows"', '"do it follows"'),
+            ('"SceneWorks/wan-2_2"', '"SceneWorks/wan-22"'),
+            ('"euler a"', '"eulera"'),
+        ):
+            with self.subTest(candle_value):
+                failure = self.check(
+                    **{
+                        "a/src/extra.rs": f"pub const PROSE: &str = {candle_value};\n",
+                        "b/src/extra.rs": f"pub const PROSE: &str = {mlx_value};\n",
+                    }
+                )
+                self.assertIsNotNone(failure)
+                self.assertIn("`PROSE` diverges", failure)
+
+    # --- clause: the parser reaches every *published* declaration ---------------------------------
+
+    def test_an_indented_pub_const_is_compared(self) -> None:
+        """`^pub const` was column-0-only, which left `bernini`'s nine `Defaults::*` guidance
+        scalars and minimax-h3's own `DitProjections::TENSOR_COUNT` unread on both sides at once."""
+        failure = self.check(
+            **{
+                "a/src/extra.rs": "impl Defaults {\n    pub const STEPS: usize = 40;\n}\n",
+                "b/src/extra.rs": "impl Defaults {\n    pub const STEPS: i32 = 20;\n}\n",
+            }
+        )
+        self.assertIsNotNone(failure)
+        self.assertIn("`STEPS` diverges", failure)
+
+    def test_a_pub_crate_const_is_compared(self) -> None:
+        """`qwen-image` and `z-image` declare their whole memory-strategy surface `pub(crate)` —
+        decode tiles, overlaps, attention chunk and the rung-4 window ladder."""
+        failure = self.check(
+            **{
+                "a/src/extra.rs": "pub(crate) const DECODE_OVERLAP: u32 = 64;\n",
+                "b/src/extra.rs": "pub(crate) const DECODE_OVERLAP: u32 = 128;\n",
+            }
+        )
+        self.assertIsNotNone(failure)
+        self.assertIn("`DECODE_OVERLAP` diverges", failure)
+
+    def test_every_visibility_spelling_is_reached(self) -> None:
+        """`pub(super)` and `pub(in path)` are the same declaration to a reader; a parser that
+        accepts two of the four spellings is a coverage claim nothing checks."""
+        for visibility in ("pub", "pub(crate)", "pub(super)", "pub(in crate::config)"):
+            with self.subTest(visibility):
+                failure = self.check(
+                    **{
+                        "a/src/extra.rs": f"    {visibility} const EDGE: u32 = 512;\n",
+                        "b/src/extra.rs": f"    {visibility} const EDGE: u32 = 256;\n",
+                    }
+                )
+                self.assertIsNotNone(failure)
+                self.assertIn("`EDGE` diverges", failure)
+
+    def test_a_private_const_is_deliberately_not_compared(self) -> None:
+        """The stated restriction, asserted rather than only written down. Two crates giving an
+        unexported module constant the same name have a name collision, not one published geometry
+        declared twice — `boogu`'s `IMG` is a token id on one side and an unrelated 999 on the
+        other. Extending here is sc-19696, and it has 45 divergences to triage first."""
+        self.assertIsNone(
+            self.check(
+                **{
+                    "a/src/extra.rs": "const IMG: u32 = 151655;\n",
+                    "b/src/extra.rs": "const IMG: u32 = 999;\n",
+                }
+            )
+        )
+
+    def test_an_anonymous_compile_time_assertion_is_not_a_declaration(self) -> None:
+        """`const _: () = assert!(..)` is a check, not a name. Comparing two crates' unrelated
+        assertions as if they were one constant would be a permanent red with no subject."""
+        self.assertIsNone(
+            self.check(
+                **{
+                    "a/src/extra.rs": "pub const _: () = assert!(VAE_RATIO == 16);\n",
+                    "b/src/extra.rs": "pub const _: () = assert!(FACTORS.len() == 3);\n",
+                }
+            )
+        )
+
+    # --- clause: a family compared against nothing is a failure -----------------------------------
+
+    EMPTY_PAIR = {
+        "a/src/lib.rs": "pub const ONLY_A: u32 = 1;\n",
+        "a/src/config.rs": None,
+        "a/tests/common/mod.rs": None,
+        "b/src/lib.rs": "pub const ONLY_B: u32 = 1;\n",
+        "b/src/config.rs": None,
+        "b/tests/common/mod.rs": None,
+    }
+
+    def test_a_family_sharing_no_constant_is_a_failure(self) -> None:
+        """The inert shape this gate exists to refuse. `joycaption` and `sam3` were in it — every
+        other clause green while the two crates were held to nothing — and so is any family the
+        parser stops reaching."""
+        self.gate.CROSS_BACKEND_GEOMETRY_REFERENCE = {}
+        failure = self.check(**dict(self.EMPTY_PAIR))
+        self.assertIsNotNone(failure)
+        self.assertIn("share no constant name, so the gate compared nothing", failure)
+
+    def test_a_recorded_empty_family_suppresses_that_failure(self) -> None:
+        self.gate.CROSS_BACKEND_GEOMETRY_REFERENCE = {}
+        self.gate.CROSS_BACKEND_GEOMETRY_NO_SHARED_CONSTANTS = {"demo": "nothing in common"}
+        self.assertIsNone(self.check(**dict(self.EMPTY_PAIR)))
+
+    def test_a_recorded_empty_family_that_now_shares_a_constant_is_caught(self) -> None:
+        """The half that keeps the record from rotting into a hole. A family listed there is
+        uncompared, so the listing has to expire the moment it stops being true."""
+        self.gate.CROSS_BACKEND_GEOMETRY_NO_SHARED_CONSTANTS = {"demo": "nothing in common"}
+        failure = self.check()
+        self.assertIsNotNone(failure)
+        self.assertIn("are now declared on both sides", failure)
+
+    def test_a_recorded_empty_family_that_does_not_exist_is_caught(self) -> None:
+        self.gate.CROSS_BACKEND_GEOMETRY_NO_SHARED_CONSTANTS = {"ghost": "gone"}
+        failure = self.check()
+        self.assertIsNotNone(failure)
+        self.assertIn("drop the entry", failure)
+
+    def test_an_index_into_an_array_constant_folds(self) -> None:
+        """`LEGAL_FRAME_COUNTS[0] as f64 / FPS` is a real declaration in both MiniMax-H3 crates. A
+        gate that cannot fold it compares two durations as text and passes on any pair of
+        spellings."""
+        self.assertIsNone(
+            self.check(
+                **{
+                    "a/src/extra.rs": "pub const LAST: usize = FACTORS[FACTORS.len() - 1];\n",
+                    "b/src/extra.rs": "pub const LAST: i32 = 4;\n",
+                }
+            )
+        )
+        failure = self.check(
+            **{
+                "a/src/extra.rs": "pub const LAST: usize = FACTORS[FACTORS.len() - 1];\n",
+                "b/src/extra.rs": "pub const LAST: i32 = 2;\n",
+            }
+        )
+        self.assertIsNotNone(failure)
+        self.assertIn("`LAST` diverges", failure)
+
+    # --- clause: both agree with the reference ---------------------------------------------------
+
+    def test_both_backends_agreeing_on_the_wrong_value_is_still_caught(self) -> None:
+        """The clause that makes this gate more than a consistency check. "Fixing" a divergence by
+        copying the wrong number across must not buy a green — that is how the original defect would
+        have been resolved by anyone reading only the red."""
+        wrong = self.LIB.replace(" * 2;", ";")
+        failure = self.check(**{"a/src/lib.rs": wrong, "b/src/lib.rs": wrong})
+        self.assertIsNotNone(failure)
+        self.assertIn("released checkpoint read through diffusers says (32.0,)", failure)
+
+    def test_a_reference_constant_that_is_not_declared_at_all_is_caught(self) -> None:
+        """Deleting a pinned constant from both sides must not read as agreement."""
+        stripped = self.CONFIG_A.replace("pub const FACTORS: [usize; 3] = [2, 2, 4];\n", "")
+        failure = self.check(
+            **{
+                "a/src/config.rs": stripped,
+                "b/src/config.rs": self.CONFIG_B.replace(
+                    "pub const FACTORS: [i32; 3] = [2, 2, 4];\n", ""
+                ),
+            }
+        )
+        self.assertIsNotNone(failure)
+        self.assertIn("is pinned against the diffusers reference but is not declared", failure)
+
+    def test_a_reference_constant_declared_twice_with_different_values_is_caught(self) -> None:
+        """Two values under one name leaves the gate unable to say which one the reference pins —
+        which is a failure, not a coin flip."""
+        failure = self.check(
+            **{"a/src/extra.rs": "pub const VAE_RATIO: usize = 8;\n"}
+        )
+        self.assertIsNotNone(failure)
+        self.assertIn("different values, so the gate cannot tell which one", failure)
+
+    def test_a_reference_constant_that_will_not_resolve_to_numbers_is_caught(self) -> None:
+        """"Cannot verify" is a violation wherever a number was required — never a pass."""
+        failure = self.check(
+            **{
+                "a/src/config.rs": self.CONFIG_A.replace(
+                    "VAE_RATIO: usize = 16", 'VAE_RATIO: &str = "sixteen"'
+                ),
+                "b/src/config.rs": self.CONFIG_B.replace(
+                    "VAE_RATIO: i32 = 16", 'VAE_RATIO: &str = "sixteen"'
+                ),
+            }
+        )
+        self.assertIsNotNone(failure)
+        self.assertIn("does not resolve to numbers", failure)
+
+    # --- clause: exemptions cannot outlive their subject -----------------------------------------
+
+    def test_an_exemption_suppresses_a_divergence_it_names(self) -> None:
+        self.gate.CROSS_BACKEND_GEOMETRY_EXEMPTIONS = {("demo", "MODEL_ID"): "per-variant id"}
+        self.assertIsNone(self.check(**{"b/src/lib.rs": self.LIB.replace('"demo"', '"other"')}))
+
+    def test_an_exemption_for_a_constant_that_now_agrees_is_caught(self) -> None:
+        """A stale exemption is a claim about the tree that the tree no longer supports. Left alone
+        it becomes a hole nobody remembers opening."""
+        self.gate.CROSS_BACKEND_GEOMETRY_EXEMPTIONS = {("demo", "MODEL_ID"): "per-variant id"}
+        failure = self.check()
+        self.assertIsNotNone(failure)
+        self.assertIn("the two backends now agree about it", failure)
+
+    def test_an_exemption_for_a_constant_no_longer_declared_on_both_sides_is_caught(self) -> None:
+        self.gate.CROSS_BACKEND_GEOMETRY_EXEMPTIONS = {("demo", "GONE"): "was different once"}
+        failure = self.check()
+        self.assertIsNotNone(failure)
+        self.assertIn("is no longer declared on both sides", failure)
+
+    def test_an_exemption_naming_a_family_that_does_not_exist_is_caught(self) -> None:
+        self.gate.CROSS_BACKEND_GEOMETRY_EXEMPTIONS = {("ghost", "X"): "gone"}
+        failure = self.check()
+        self.assertIsNotNone(failure)
+        self.assertIn("is not a dual-backend family any more", failure)
+
+    def test_a_reference_block_naming_a_family_that_does_not_exist_is_caught(self) -> None:
+        self.gate.CROSS_BACKEND_GEOMETRY_REFERENCE["ghost"] = {"X": (1.0,)}
+        failure = self.check()
+        self.assertIsNotNone(failure)
+        self.assertIn("drop the reference block", failure)
+
+    def test_a_family_exemption_naming_a_family_that_does_not_exist_is_caught(self) -> None:
+        self.gate.CROSS_BACKEND_GEOMETRY_EXEMPT_FAMILIES = {"ghost": "gone"}
+        failure = self.check()
+        self.assertIsNotNone(failure)
+        self.assertIn("drop the exemption", failure)
+
+    # --- clause: the fixture geometry agrees -----------------------------------------------------
+
+    def test_a_diverging_fixture_constant_is_caught(self) -> None:
+        """The second half of sc-19496: both crates commit byte-identical fixture bytes and load
+        them through their own hand-typed geometry, so a drift here leaves both lanes internally
+        consistent and both parity suites green on different shapes."""
+        failure = self.check(**{"b/tests/common/mod.rs": self.FIXTURES_B.replace("= 8", "= 9")})
+        self.assertIsNotNone(failure)
+        self.assertIn("fixture geometry `SHARED_FIXTURE_DIM` diverges", failure)
+
+    def test_a_fixture_constant_added_to_only_the_candle_side_is_caught(self) -> None:
+        """Drift one step earlier than a value difference. Paired with the test below so that *both*
+        directions of the name-set comparison are covered — one test can only exercise one of them,
+        and a single-direction suite leaves the other clause free to be deleted."""
+        failure = self.check(
+            **{"a/tests/common/mod.rs": self.FIXTURES + "pub const SHARED_FIXTURE_X: usize = 1;\n"}
+        )
+        self.assertIsNotNone(failure)
+        self.assertIn("`SHARED_FIXTURE_X` is declared in", failure)
+        self.assertIn("candle-gen-demo/tests but not in", failure)
+
+    def test_a_fixture_constant_added_to_only_the_mlx_side_is_caught(self) -> None:
+        failure = self.check(
+            **{"b/tests/common/mod.rs": self.FIXTURES_B + "pub const SHARED_FIXTURE_X: i32 = 1;\n"}
+        )
+        self.assertIsNotNone(failure)
+        self.assertIn("`SHARED_FIXTURE_X` is declared in", failure)
+        self.assertIn("mlx-gen-demo/tests but not in", failure)
+
+    def test_a_reference_pinned_family_with_no_fixture_constants_is_caught(self) -> None:
+        """Lifting the numbers back into function bodies would put them out of the gate's reach
+        again while every other clause stayed green."""
+        failure = self.check(**{"a/tests/common/mod.rs": "// nothing shared here\n"})
+        self.assertIsNotNone(failure)
+        self.assertIn("declares no `SHARED_FIXTURE_*` constants under tests/", failure)
+
+    def test_the_fixture_clause_reads_the_mlx_side_too(self) -> None:
+        failure = self.check(**{"b/tests/common/mod.rs": "// nothing shared here\n"})
+        self.assertIsNotNone(failure)
+        self.assertIn("declares no `SHARED_FIXTURE_*` constants under tests/", failure)
+
+    # --- clause: coverage is the workspace, not a list --------------------------------------------
+
+    def test_an_exempt_family_is_not_compared(self) -> None:
+        self.gate.CROSS_BACKEND_GEOMETRY_EXEMPT_FAMILIES = {"demo": "synthetic"}
+        self.assertIsNone(self.check(**{"b/src/lib.rs": self.LIB.replace('"demo"', '"other"')}))
+
+    def test_a_workspace_with_no_dual_backend_pair_fails(self) -> None:
+        """A gate that finds nothing to compare must be loud, not green: that is the exact failure
+        mode a curated pair table had, one family at a time."""
+        failure = self.check(drop_crate="b")
+        self.assertIsNotNone(failure)
+        self.assertIn("reported no candle-gen-X/mlx-gen-X pair at all", failure)
+
+    def test_a_crate_without_a_lib_rs_fails(self) -> None:
+        failure = self.check(**{"b/src/lib.rs": None})
+        self.assertIsNotNone(failure)
+        self.assertIn("src/lib.rs is missing", failure)
 
     def test_a_declaration_inside_a_block_comment_is_not_a_declaration(self) -> None:
         """The load-bearing test for comment stripping.
@@ -1087,12 +1484,10 @@ class CrossBackendGeometryTests(unittest.TestCase):
         anyway and a test built on one proves nothing about the stripper. A *block* comment can hold
         a line starting at column 0, so this is the shape that actually distinguishes a gate reading
         stripped source from one reading raw text: without stripping, `GHOST` parses as a real
-        declaration on one backend only and the pair reds for no reason at all."""
+        declaration on one backend only."""
         self.assertIsNone(
             self.check(
-                **{
-                    "a/src/config.rs": "/*\npub const GHOST: usize = 1;\n*/\n" + self.CONFIG_A
-                }
+                **{"a/src/config.rs": "/*\npub const GHOST: usize = 1;\n*/\n" + self.CONFIG_A}
             )
         )
 
@@ -1108,43 +1503,22 @@ class CrossBackendGeometryTests(unittest.TestCase):
         self.assertIsNotNone(failure)
         self.assertIn("`VAE_RATIO`", failure)
 
-    def test_a_moved_file_fails_rather_than_shrinking_coverage(self) -> None:
-        """A file that quietly stops being read is a gate that quietly stops gating."""
-        failure = self.check(**{"b/src/config.rs": None})
-        self.assertIsNotNone(failure)
-        self.assertIn("is missing", failure)
-
-    def test_a_file_that_parses_to_no_declarations_fails(self) -> None:
-        """A broken parse compares nothing while reporting green; it has to be loud instead."""
-        failure = self.check(**{"a/src/config.rs": "// no declarations left\n"})
-        self.assertIsNotNone(failure)
-        self.assertIn("parsed zero `pub const` declarations", failure)
-
-    def test_a_duplicate_declaration_within_one_crate_fails(self) -> None:
-        failure = self.check(**{"a/src/lib.rs": self.LIB + "pub const VAE_RATIO: usize = 16;\n"})
-        self.assertIsNotNone(failure)
-        self.assertIn("declares `VAE_RATIO` twice", failure)
-
-    def test_a_missing_crate_fails(self) -> None:
-        failure = self.check(drop_crate="b")
-        self.assertIsNotNone(failure)
-        self.assertIn("is not a directory", failure)
-
 
 class CrossBackendGeometryLiveTests(unittest.TestCase):
     """The synthetic pair proves the mechanism; this proves it is pointed at the real crates."""
 
     def setUp(self) -> None:
         self.gate = load_gate_module()
+        self.metadata = self.gate.cargo_metadata(True)
 
     def test_the_shipped_workspace_has_no_cross_backend_geometry_drift(self) -> None:
-        self.gate.check_cross_backend_geometry(ROOT)
+        self.gate.check_cross_backend_geometry(self.metadata, ROOT)
 
     def test_the_reference_pins_the_value_settled_against_diffusers(self) -> None:
         """`SIZE_MULTIPLE` is 32 — `vae_spatial_compression_ratio * patch_size[2]` = 16 * 2 — and the
         16 the candle crate shipped until sc-19419 was the VAE-only alignment. Pinned here as well as
         in the gate so that relaxing the gate's table is itself a red."""
-        reference = self.gate.CROSS_BACKEND_GEOMETRY_REFERENCE
+        reference = self.gate.CROSS_BACKEND_GEOMETRY_REFERENCE["minimax-h3"]
         self.assertEqual(reference["SIZE_MULTIPLE"], (32.0,))
         self.assertEqual(reference["VAE_RATIO"], (16.0,))
         self.assertEqual(reference["VAE_RATIO_T"], (4.0,))
@@ -1154,15 +1528,103 @@ class CrossBackendGeometryLiveTests(unittest.TestCase):
         self.assertEqual(reference["LEGAL_FRAME_COUNTS"][0], 124.0)
         self.assertEqual(reference["LEGAL_FRAME_COUNTS"][-1], 345.0)
 
-    def test_both_minimax_h3_crates_are_covered(self) -> None:
-        """A pair table that lost its only entry would pass every other test in this class."""
-        self.assertIn(
-            (
-                "crates/media/candle-gen/candle-gen-minimax-h3",
-                "crates/media/mlx-gen/mlx-gen-minimax-h3",
-            ),
-            self.gate.CROSS_BACKEND_GEOMETRY_PAIRS,
-        )
+    def test_every_dual_backend_family_in_the_workspace_is_reached(self) -> None:
+        """The sc-19496 clause, asserted with no maintained number: the families the gate compares
+        are exactly the `candle-gen-X`/`mlx-gen-X` pairs `cargo metadata` reports, minus whatever
+        carries a written exemption. A family added to the workspace is compared without anyone
+        remembering to list it."""
+        families = {family for family, _, _ in self.gate._dual_backend_families(self.metadata)}
+        names = {package["name"] for package in self.metadata["packages"]}
+        expected = {
+            name[len("candle-gen-") :]
+            for name in names
+            if name.startswith("candle-gen-")
+            and f"mlx-gen-{name[len('candle-gen-') :]}" in names
+        }
+        self.assertEqual(families, expected)
+        self.assertIn("minimax-h3", families)
+        self.assertEqual(self.gate.CROSS_BACKEND_GEOMETRY_EXEMPT_FAMILIES, {})
+
+    def test_every_exemption_names_a_family_that_exists(self) -> None:
+        """`check_cross_backend_geometry` enforces this too; asserted separately so that deleting
+        the enforcement does not go unnoticed."""
+        families = {family for family, _, _ in self.gate._dual_backend_families(self.metadata)}
+        for family, constant in self.gate.CROSS_BACKEND_GEOMETRY_EXEMPTIONS:
+            self.assertIn(family, families, f"{family}/{constant}")
+        for family in self.gate.CROSS_BACKEND_GEOMETRY_REFERENCE:
+            self.assertIn(family, families)
+
+    def test_every_family_is_either_compared_or_recorded_as_uncompared(self) -> None:
+        """Derived from the gate's own predicate, with no count kept here: for each swept family the
+        two crates either share a constant name or the family is written down as sharing none. A
+        family in neither state is one the gate holds to nothing while printing OK."""
+        recorded = set(self.gate.CROSS_BACKEND_GEOMETRY_NO_SHARED_CONSTANTS)
+        uncompared = set()
+        for family, candle, mlx in self.gate._dual_backend_families(self.metadata):
+            shared = set(self.gate._crate_pub_consts(candle, "src")) & set(
+                self.gate._crate_pub_consts(mlx, "src")
+            )
+            if not shared:
+                uncompared.add(family)
+            self.assertEqual(
+                bool(shared),
+                family not in recorded,
+                f"{family}: {len(shared)} shared constants, recorded as empty: {family in recorded}",
+            )
+        self.assertEqual(uncompared, recorded)
+
+    def test_the_parser_reaches_indented_and_pub_crate_declarations_in_the_real_tree(self) -> None:
+        """The column-0 restriction cost real coverage rather than hypothetical coverage, so the
+        proof is taken off the shipped crates. `bernini`'s guidance defaults sit in an `impl` block
+        on both sides and minimax-h3 declares `TENSOR_COUNT` as an associated const; neither is at
+        column 0 in either crate."""
+        families = {
+            family: (candle, mlx)
+            for family, candle, mlx in self.gate._dual_backend_families(self.metadata)
+        }
+        for family, constant in (("bernini", "OMEGA_TXT"), ("minimax-h3", "TENSOR_COUNT")):
+            candle, mlx = families[family]
+            left = self.gate._crate_pub_consts(candle, "src")
+            right = self.gate._crate_pub_consts(mlx, "src")
+            self.assertIn(constant, left, family)
+            self.assertIn(constant, right, family)
+            # Reached *and* compared: a name the gate reads but resolves to nothing on one side
+            # would be back to comparing text against text.
+            self.assertEqual(
+                self.gate._canonical_const_values(left[constant], left),
+                self.gate._canonical_const_values(right[constant], right),
+                f"{family}.{constant}",
+            )
+            for source, crate in ((left, candle), (right, mlx)):
+                self.assertFalse(
+                    any(
+                        line.startswith(f"pub const {constant}")
+                        for path in (crate / "src").rglob("*.rs")
+                        for line in path.read_text(encoding="utf-8").split("\n")
+                    ),
+                    f"{family}.{constant} is at column 0 in {crate.name}, so this proves nothing",
+                )
+
+    def test_the_minimax_h3_fixture_geometry_is_declared_on_both_sides(self) -> None:
+        """The hand-maintained fixture configs sc-19496 was filed for. Asserted structurally — equal
+        name sets and equal values, with no count kept here — because a maintained number is the
+        thing that goes stale."""
+        families = {
+            family: (candle, mlx)
+            for family, candle, mlx in self.gate._dual_backend_families(self.metadata)
+        }
+        candle, mlx = families["minimax-h3"]
+        prefix = self.gate.CROSS_BACKEND_FIXTURE_PREFIX
+        left = self.gate._crate_pub_consts(candle, "tests", prefix=prefix)
+        right = self.gate._crate_pub_consts(mlx, "tests", prefix=prefix)
+        self.assertTrue(left)
+        self.assertEqual(set(left), set(right))
+        for constant in left:
+            self.assertEqual(
+                self.gate._canonical_const_values(left[constant], left),
+                self.gate._canonical_const_values(right[constant], right),
+                constant,
+            )
 
 
 if __name__ == "__main__":

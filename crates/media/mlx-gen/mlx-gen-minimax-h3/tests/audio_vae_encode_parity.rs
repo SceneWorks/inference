@@ -709,14 +709,30 @@ fn mis_packed_waveforms_are_rejected() {
     let wave = f.require("in.encode.waveform").unwrap();
     assert!(enc.encode(wave).is_ok());
 
+    // Asserted by MESSAGE, not by `is_err()` (sc-19488). `encode`'s packing guard is one arm
+    // (`s.len() != 3 || s[1] != 1`), and with it deleted every input below still errors — the
+    // rank-2 and rank-4 cases fault on the `transpose_axes(&[0, 2, 1])` immediately after, and the
+    // `[1, 2, samples]` case reaches the encoder stack with a channel axis it was never built for.
+    // Naming the guard is what separates "the encoder is mono" from "something downstream tripped".
+    let expect_packing_guard = |z: &Array, what: &str| {
+        let msg = enc.encode(z).expect_err(what).to_string();
+        assert!(
+            msg.contains("expected [B, 1, samples]"),
+            "{what}: the mono packing guard must be what rejects this, not a downstream \
+             transpose/conv fault: {msg}"
+        );
+    };
     let stereo_packed = wave.reshape(&[1, 2, 320]).unwrap();
-    assert!(
-        enc.encode(&stereo_packed).is_err(),
-        "[1, 2, samples] must be rejected: the encoder is mono"
+    expect_packing_guard(
+        &stereo_packed,
+        "[1, 2, samples] must be rejected: the encoder is mono",
     );
     // Rank 2 and rank 4 are errors too.
-    assert!(enc.encode(&wave.reshape(&[2, 320]).unwrap()).is_err());
-    assert!(enc.encode(&wave.reshape(&[2, 1, 320, 1]).unwrap()).is_err());
+    expect_packing_guard(&wave.reshape(&[2, 320]).unwrap(), "rank 2 is not [B, 1, S]");
+    expect_packing_guard(
+        &wave.reshape(&[2, 1, 320, 1]).unwrap(),
+        "rank 4 is not [B, 1, S]",
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -778,9 +794,30 @@ fn normalization_is_the_decoders_exact_inverse() {
         "normalize -> denormalize (stereo packing)",
     );
 
-    // A latent whose channel count disagrees with the config is an error, not a broadcast.
-    assert!(enc.normalize(&z.reshape(&[2, 16, 64]).unwrap()).is_err());
-    assert!(enc.normalize(&Array::from_slice(&[1.0f32], &[1])).is_err());
+    // A latent whose channel count disagrees with the config is an error, not a broadcast. Both
+    // clauses assert the MESSAGE (sc-19488), and they target DIFFERENT arms of `normalize`: the
+    // first is the channel-count check, the second the rank check. `is_err()` alone could not tell
+    // them apart, and a 16-channel latent would broadcast silently against a 32-entry mean/std
+    // vector on some shapes rather than erroring at all.
+    let msg = enc
+        .normalize(&z.reshape(&[2, 16, 64]).unwrap())
+        .expect_err("16 channels disagrees with the config's 32")
+        .to_string();
+    assert!(
+        // Matched on the guard's FULL prefix, not the bare "config declares" tail: the audio VAE's
+        // own de-normalize guard (`src/audio_vae.rs`) emits that same tail, so the short form would
+        // go inert the moment this entry point delegated there (sc-19488).
+        msg.contains("minimax-h3 audio encoder: latent has"),
+        "the channel-count guard must be what rejects this, not a broadcast fault: {msg}"
+    );
+    let msg = enc
+        .normalize(&Array::from_slice(&[1.0f32], &[1]))
+        .expect_err("a rank-1 latent has no channel axis")
+        .to_string();
+    assert!(
+        msg.contains("cannot normalize a rank-1 latent"),
+        "the rank guard must be what rejects this: {msg}"
+    );
 }
 
 /// The audio posterior's second parameter is a log **standard deviation** with **no clamp** — not
