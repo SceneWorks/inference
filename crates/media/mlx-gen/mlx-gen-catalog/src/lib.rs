@@ -372,15 +372,15 @@ mod tests {
     fn every_registered_memory_strategy_rejects_cross_route_decode_geometry() {
         let registry = super::provider_registry().unwrap();
         gen_core_testkit::memory_contract_surface_registry_conformance(&registry);
-        assert_eq!(registry.memory_strategy_registrations().len(), 46);
-        assert_eq!(registry.memory_contract_fixture_registrations().len(), 45);
+        assert_eq!(registry.memory_strategy_registrations().len(), 47);
+        assert_eq!(registry.memory_contract_fixture_registrations().len(), 46);
         let resident_only: Vec<_> = registry
             .resident_only_memory_contract_registrations()
             .map(|registration| registration.provider_id)
             .collect();
         assert_eq!(resident_only, ["flux2_dev_control"]);
         let surfaces = registry.memory_contract_surfaces().unwrap();
-        assert_eq!(surfaces.len(), 45 * 12);
+        assert_eq!(surfaces.len(), 46 * 12);
         assert!(surfaces.iter().all(|surface| !surface.composed));
         let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir("/nonexistent".into()))
             .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization);
@@ -502,6 +502,157 @@ mod tests {
             }
             assert_eq!(implemented, 3, "{provider_id}");
         }
+    }
+
+    #[test]
+    fn flux2_klein_providers_publish_exact_prepacked_sequential_deferred_surfaces() {
+        use mlx_gen::gen_core::{
+            LoadShape, MemoryContractSurfaceTier, MemoryStrategy, MemoryStrategySupport,
+            OffloadPolicy,
+        };
+
+        let registry = super::provider_registry().unwrap();
+        let surfaces = registry.memory_contract_surfaces().unwrap();
+        for provider_id in [
+            "flux2_klein_9b",
+            "flux2_klein_9b_edit",
+            "flux2_klein_9b_kv_edit",
+        ] {
+            let provider: Vec<_> = surfaces
+                .iter()
+                .filter(|surface| surface.contract.provider_id == provider_id)
+                .collect();
+            assert_eq!(provider.len(), 12, "{provider_id}");
+
+            let mut implemented = 0;
+            for surface in provider {
+                let expected = matches!(
+                    surface.resolved_artifact_tier(),
+                    MemoryContractSurfaceTier::Bf16
+                        | MemoryContractSurfaceTier::Q4
+                        | MemoryContractSurfaceTier::Q8
+                ) && surface.selector.offload_policy == OffloadPolicy::Sequential
+                    && surface.selector.load_shape == LoadShape::DeferredMaterialization;
+                assert_eq!(
+                    surface
+                        .contract
+                        .capability(MemoryStrategy::BoundedTransformerResidency)
+                        .expect("complete FLUX.2 Klein ladder")
+                        .support,
+                    if expected {
+                        MemoryStrategySupport::Implemented
+                    } else {
+                        MemoryStrategySupport::Missing
+                    },
+                    "{provider_id}: {}",
+                    surface.selector.id()
+                );
+                implemented += usize::from(expected);
+                assert!(!surface.composed);
+                assert_eq!(surface.contract.asset_facts, Default::default());
+                assert_eq!(
+                    surface.contract.calibration.as_ref().unwrap().fingerprint,
+                    format!(
+                        "{}-{}",
+                        mlx_gen_flux2::memory_strategy::KLEIN_STATIC_BEHAVIOR_FINGERPRINT,
+                        provider_id.replace('_', "-")
+                    )
+                );
+            }
+            assert_eq!(implemented, 3, "{provider_id}");
+        }
+    }
+
+    #[test]
+    fn flux2_klein_behavior_inventory_is_exact_single_phase_and_executable() {
+        use mlx_gen::gen_core::{
+            LoadShape, MemoryContractSurfaceTier, MemoryMode, MemoryStrategy, OffloadPolicy,
+        };
+
+        let registry = super::provider_registry().unwrap();
+        let surfaces = registry.memory_contract_surfaces().unwrap();
+        let fixtures = |provider_id| {
+            let surface = surfaces
+                .iter()
+                .find(|surface| {
+                    surface.contract.provider_id == provider_id
+                        && surface.resolved_artifact_tier() == MemoryContractSurfaceTier::Q4
+                        && surface.selector.offload_policy == OffloadPolicy::Sequential
+                        && surface.selector.load_shape == LoadShape::DeferredMaterialization
+                })
+                .unwrap_or_else(|| panic!("{provider_id} missing q4 sequential deferred surface"));
+            let behavior = registry
+                .memory_behavior_registrations()
+                .find(|registration| registration.provider_id == provider_id)
+                .unwrap_or_else(|| panic!("{provider_id} missing memory behavior"));
+            (behavior.valid_fixtures)(
+                &surface.spec,
+                &surface.contract,
+                MemoryStrategy::BoundedTransformerResidency,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|fixture| {
+                assert_eq!(fixture.context.overlay, None, "{provider_id}");
+                assert!(!fixture.context.has_phases, "{provider_id}");
+                assert!(fixture.request.phases.is_none(), "{provider_id}");
+                assert!(!fixture.context.use_pid, "{provider_id}");
+                let shape = match (
+                    &fixture.context.mode,
+                    fixture.context.geometry.reference_count,
+                ) {
+                    (MemoryMode::TextToImage, 0) if fixture.request.conditioning.is_empty() => 0,
+                    (MemoryMode::ImageToImage, 1)
+                        if matches!(
+                            fixture.request.conditioning.as_slice(),
+                            [mlx_gen::Conditioning::Reference {
+                                strength: Some(_),
+                                ..
+                            }]
+                        ) =>
+                    {
+                        1
+                    }
+                    (MemoryMode::Edit, 1)
+                        if matches!(
+                            fixture.request.conditioning.as_slice(),
+                            [mlx_gen::Conditioning::Reference { strength: None, .. }]
+                        ) =>
+                    {
+                        1
+                    }
+                    (MemoryMode::Edit, count @ 2..=8)
+                        if matches!(
+                            fixture.request.conditioning.as_slice(),
+                            [mlx_gen::Conditioning::MultiReference { images }]
+                                if images.len() == count as usize
+                        ) =>
+                    {
+                        count
+                    }
+                    _ => panic!("{provider_id} published a non-executable behavior fixture"),
+                };
+                (
+                    fixture.context.mode,
+                    fixture.context.geometry.reference_count,
+                    shape,
+                )
+            })
+            .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            fixtures("flux2_klein_9b"),
+            vec![
+                (MemoryMode::TextToImage, 0, 0),
+                (MemoryMode::ImageToImage, 1, 1),
+            ]
+        );
+        let edit = (1..=8)
+            .map(|references| (MemoryMode::Edit, references, references))
+            .collect::<Vec<_>>();
+        assert_eq!(fixtures("flux2_klein_9b_edit"), edit);
+        assert_eq!(fixtures("flux2_klein_9b_kv_edit"), edit);
     }
 
     #[test]

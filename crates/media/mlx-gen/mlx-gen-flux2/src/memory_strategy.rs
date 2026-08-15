@@ -36,7 +36,10 @@ pub fn contract_for_variant(
     if variant == Flux2Variant::DevEdit {
         return Ok(Some(build_contract()));
     }
-    if matches!(variant, Flux2Variant::Klein9b | Flux2Variant::Klein9bEdit) {
+    if matches!(
+        variant,
+        Flux2Variant::Klein9b | Flux2Variant::Klein9bEdit | Flux2Variant::Klein9bKvEdit
+    ) {
         return Ok(Some(klein_contract_for(variant.id(), spec)?));
     }
     Ok(None)
@@ -326,7 +329,7 @@ pub fn registered_dev_control_safety_check(
 
 // ---- FLUX.2 Klein shared image-memory ladder (SC-15518) -------------------------------
 
-const KLEIN_STATIC_CALIBRATION: &str = "flux2-klein-static-registry-behavior-v1";
+pub const KLEIN_STATIC_BEHAVIOR_FINGERPRINT: &str = "flux2-klein-static-registry-behavior-v2";
 pub const KLEIN_MEMORY_CALIBRATION_FINGERPRINT: &str =
     "flux2-klein-9b-bf16-mlx-shared-ladder-t2i-v1";
 pub const KLEIN_CALIBRATED_REVISION: &str = "1d36c68041725a14c76566cdf6cea4270b264b03";
@@ -364,10 +367,13 @@ fn klein_overlay(spec: &LoadSpec) -> Option<String> {
     if spec.text_encoder.is_some() {
         axes.push("external-text-encoder");
     }
+    if !spec.components.is_empty() {
+        axes.push("components");
+    }
     (!axes.is_empty()).then(|| axes.join("-"))
 }
 
-fn klein_streamable(spec: &LoadSpec) -> bool {
+pub(crate) fn klein_streamable(spec: &LoadSpec) -> bool {
     spec.offload_policy == OffloadPolicy::Sequential
         && spec.load_shape == LoadShape::DeferredMaterialization
         && spec.quantize.is_none()
@@ -375,20 +381,11 @@ fn klein_streamable(spec: &LoadSpec) -> bool {
         && matches!(spec.weights, WeightsSource::Dir(_))
 }
 
-fn klein_route(provider_id: &str) -> mlx_gen::gen_core::Result<(MemoryMode, u32)> {
-    match provider_id {
-        crate::FLUX2_KLEIN_9B_ID => Ok((MemoryMode::TextToImage, 0)),
-        crate::FLUX2_KLEIN_9B_EDIT_ID => Ok((MemoryMode::Edit, 1)),
-        _ => Err(CoreError::Unsupported(format!(
-            "unknown FLUX.2 Klein memory provider {provider_id}"
-        ))),
-    }
-}
-
 fn klein_provider_static(provider_id: &str) -> mlx_gen::gen_core::Result<&'static str> {
     match provider_id {
         crate::FLUX2_KLEIN_9B_ID => Ok(crate::FLUX2_KLEIN_9B_ID),
         crate::FLUX2_KLEIN_9B_EDIT_ID => Ok(crate::FLUX2_KLEIN_9B_EDIT_ID),
+        crate::FLUX2_KLEIN_9B_KV_EDIT_ID => Ok(crate::FLUX2_KLEIN_9B_KV_EDIT_ID),
         _ => Err(CoreError::Unsupported(format!(
             "unknown FLUX.2 Klein memory provider {provider_id}"
         ))),
@@ -405,6 +402,7 @@ fn klein_calibration_fingerprint(
         }
         crate::FLUX2_KLEIN_9B_ID => "t2i",
         crate::FLUX2_KLEIN_9B_EDIT_ID => "edit",
+        crate::FLUX2_KLEIN_9B_KV_EDIT_ID => "kv-edit",
         _ => {
             return Err(CoreError::Unsupported(format!(
                 "unknown FLUX.2 Klein memory provider {provider_id}"
@@ -425,7 +423,7 @@ fn build_klein_contract(
 ) -> mlx_gen::gen_core::Result<MemoryProviderContract> {
     let staged = spec.offload_policy == OffloadPolicy::Sequential;
     let clean = klein_overlay(spec).is_none();
-    klein_route(provider_id)?;
+    klein_provider_static(provider_id)?;
     let routes = klein_decode_routes(provider_id)?;
     let mut contract = MemoryProviderContract::compatibility_default(
         provider_id,
@@ -472,7 +470,7 @@ fn build_klein_contract(
         attention_chunking: clean,
         transformer_window_materialization: streamable,
     };
-    if provider_id == crate::FLUX2_KLEIN_9B_ID && spec.pid.is_some() {
+    if spec.pid.is_some() {
         contract.pid_decode_routes = Some(mlx_gen::gen_core::MemoryPidDecodeRoutes {
             native: mlx_gen::gen_core::MemoryDecodeRouteDomain {
                 tile_edges: routes.native_edges().to_vec(),
@@ -525,24 +523,38 @@ pub fn klein_contract_for(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> mlx_gen::gen_core::Result<MemoryProviderContract> {
-    let inventory = crate::artifact_inventory::KleinArtifactInventory::verify(spec)?;
+    crate::model::validate_klein_load_axes(spec, provider_id)
+        .map_err(|error| CoreError::Unsupported(error.to_string()))?;
+    let inventory =
+        crate::artifact_inventory::KleinArtifactInventory::verify_for_provider(provider_id, spec)?;
     let streamable = inventory.is_some() && klein_streamable(spec);
-    let calibration = streamable
-        .then(|| {
-            klein_calibration_fingerprint(
-                provider_id,
-                inventory
-                    .as_ref()
-                    .expect("streamable inventory")
-                    .calibration_tag(),
-            )
-            .map(|fingerprint| MemoryCalibrationIdentity::new(fingerprint, spec.load_shape))
-        })
-        .transpose()?;
+    let calibration = if streamable {
+        let fingerprint = match inventory
+            .as_ref()
+            .expect("streamable requires an admitted inventory")
+            .calibration_tag()
+        {
+            Some(tag) => klein_calibration_fingerprint(provider_id, tag)?,
+            None => format!(
+                "{KLEIN_STATIC_BEHAVIOR_FINGERPRINT}-{}",
+                provider_id.replace('_', "-")
+            ),
+        };
+        Some(MemoryCalibrationIdentity::new(fingerprint, spec.load_shape))
+    } else {
+        None
+    };
     build_klein_contract(
         provider_id,
         spec,
-        crate::model::component_footprint(spec)?,
+        match provider_id {
+            crate::FLUX2_KLEIN_9B_ID => crate::model::component_footprint(spec)?,
+            crate::FLUX2_KLEIN_9B_EDIT_ID => crate::model::klein_edit_component_footprint(spec)?,
+            crate::FLUX2_KLEIN_9B_KV_EDIT_ID => {
+                crate::model::klein_kv_edit_component_footprint(spec)?
+            }
+            _ => unreachable!("validate_klein_load_axes rejects unknown providers"),
+        },
         streamable,
         calibration,
     )
@@ -563,7 +575,7 @@ pub(crate) fn weights_free_klein_contract(
         klein_streamable(spec),
         Some(MemoryCalibrationIdentity::new(
             format!(
-                "{KLEIN_STATIC_CALIBRATION}-{}",
+                "{KLEIN_STATIC_BEHAVIOR_FINGERPRINT}-{}",
                 provider_id.replace('_', "-")
             ),
             spec.load_shape,
@@ -571,22 +583,152 @@ pub(crate) fn weights_free_klein_contract(
     )
 }
 
+fn surface_selector_matches_spec(
+    surface: &mlx_gen::gen_core::MemoryContractSurfaceSpec,
+) -> mlx_gen::gen_core::Result<()> {
+    use mlx_gen::gen_core::MemoryContractSurfaceTier;
+
+    let tier_matches = match surface.resolved_artifact_tier() {
+        MemoryContractSurfaceTier::Bf16 => {
+            surface.spec.precision == mlx_gen::Precision::Bf16 && surface.spec.quantize.is_none()
+        }
+        MemoryContractSurfaceTier::Q4 => surface.spec.quantize == Some(Quant::Q4),
+        MemoryContractSurfaceTier::Q8 => surface.spec.quantize == Some(Quant::Q8),
+        MemoryContractSurfaceTier::Nvfp4 => false,
+    };
+    let plain = surface.spec.adapters.is_empty()
+        && surface.spec.control.is_none()
+        && surface.spec.extra_controls.is_empty()
+        && surface.spec.ip_adapter.is_none()
+        && surface.spec.identity.is_none()
+        && surface.spec.text_encoder.is_none()
+        && surface.spec.components.is_empty()
+        && surface.spec.pid.is_none();
+    if tier_matches
+        && surface.spec.precision == mlx_gen::Precision::Bf16
+        && plain
+        && matches!(surface.spec.weights, WeightsSource::Dir(_))
+        && surface.selector.offload_policy == surface.spec.offload_policy
+        && surface.selector.load_shape == surface.spec.load_shape
+    {
+        Ok(())
+    } else {
+        Err(CoreError::Unsupported(format!(
+            "FLUX.2 Klein memory surface selector '{}' does not match its plain registry LoadSpec",
+            surface.selector.id()
+        )))
+    }
+}
+
+/// Resolve the finite catalog surface from the already-selected artifact tier.
+///
+/// Packed Klein turnkeys reach production with `LoadSpec::quantize == None` because only the DiT is
+/// packed and the Qwen3 tower deliberately stays dense. The generic witness keeps Q4/Q8 in the
+/// synthetic `LoadSpec` solely to make the selector self-checking; this resolver consumes the typed
+/// selector and never reinterprets it as load-time quantization.
+pub(crate) fn weights_free_klein_surface_contract(
+    provider_id: &str,
+    surface: &mlx_gen::gen_core::MemoryContractSurfaceSpec,
+) -> mlx_gen::gen_core::Result<MemoryProviderContract> {
+    use mlx_gen::gen_core::MemoryContractSurfaceTier;
+
+    klein_provider_static(provider_id)?;
+    surface_selector_matches_spec(surface)?;
+    let supported_tier = matches!(
+        surface.resolved_artifact_tier(),
+        MemoryContractSurfaceTier::Bf16
+            | MemoryContractSurfaceTier::Q4
+            | MemoryContractSurfaceTier::Q8
+    );
+    let streamable = supported_tier
+        && surface.spec.offload_policy == OffloadPolicy::Sequential
+        && surface.spec.load_shape == LoadShape::DeferredMaterialization;
+    build_klein_contract(
+        provider_id,
+        &surface.spec,
+        Default::default(),
+        streamable,
+        Some(MemoryCalibrationIdentity::new(
+            format!(
+                "{KLEIN_STATIC_BEHAVIOR_FINGERPRINT}-{}",
+                provider_id.replace('_', "-")
+            ),
+            surface.spec.load_shape,
+        )),
+    )
+}
+
+fn klein_expected_tier(
+    provider_id: &str,
+    spec: &LoadSpec,
+) -> mlx_gen::gen_core::Result<MemoryNumericTier> {
+    let quant = match spec.quantize {
+        Some(quant) => Some(quant),
+        None => {
+            if let Some(inventory) =
+                crate::artifact_inventory::KleinArtifactInventory::verify_for_provider(
+                    provider_id,
+                    spec,
+                )?
+            {
+                inventory.resolved_quant()
+            } else {
+                let WeightsSource::Dir(root) = &spec.weights else {
+                    return Err(CoreError::Unsupported(format!(
+                        "{provider_id}: FLUX.2 Klein memory routes require a snapshot directory"
+                    )));
+                };
+                match crate::loader::read_component_quant(&root.join("transformer"))
+                    .map_err(|error| CoreError::Unsupported(error.to_string()))?
+                {
+                    Some(quant) if quant.bits == 4 && quant.group_size == 64 => Some(Quant::Q4),
+                    Some(quant) if quant.bits == 8 && quant.group_size == 64 => Some(Quant::Q8),
+                    Some(quant) => {
+                        return Err(CoreError::Unsupported(format!(
+                            "{provider_id}: unsupported packed transformer quantization bits={} group_size={}",
+                            quant.bits, quant.group_size
+                        )))
+                    }
+                    None => None,
+                }
+            }
+        }
+    };
+    Ok(MemoryNumericTier {
+        precision: spec.precision,
+        quant,
+        component_precision_floors: &[],
+    })
+}
+
 pub(crate) fn klein_safety_check(
     spec: &LoadSpec,
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
+    expected_tier: MemoryNumericTier,
 ) -> MemorySafetyDecision {
     let route_gate = || {
-        let (expected_mode, minimum_references) = klein_route(&contract.provider_id)?;
-        let route_matches = context.mode == expected_mode
-            && if minimum_references == 0 {
-                context.geometry.reference_count == 0
-            } else {
-                context.geometry.reference_count >= minimum_references
-            };
+        klein_provider_static(&contract.provider_id)?;
+        let reference_count = context.geometry.reference_count;
+        let route_matches = match contract.provider_id.as_str() {
+            crate::FLUX2_KLEIN_9B_ID => matches!(
+                (&context.mode, reference_count),
+                (MemoryMode::TextToImage, 0) | (MemoryMode::ImageToImage, 1)
+            ),
+            crate::FLUX2_KLEIN_9B_EDIT_ID | crate::FLUX2_KLEIN_9B_KV_EDIT_ID => {
+                context.mode == MemoryMode::Edit && (1..=8).contains(&reference_count)
+            }
+            _ => false,
+        } && context.has_reference == (reference_count > 0);
         if !route_matches {
             return Err(CoreError::Unsupported(format!(
                 "{}: memory route does not match the loaded provider mode/reference domain",
+                contract.provider_id
+            )));
+        }
+        if context.has_phases {
+            return Err(CoreError::Unsupported(format!(
+                "{}: FLUX.2 Klein memory routes are single-phase",
                 contract.provider_id
             )));
         }
@@ -613,7 +755,7 @@ pub(crate) fn klein_safety_check(
         if contract.engages(
             context.selection.strategy,
             MemoryStrategy::BoundedTransformerResidency,
-        ) && (!contract.lifecycle.transformer_window_materialization || !context.has_phases)
+        ) && !contract.lifecycle.transformer_window_materialization
         {
             return Err(CoreError::Unsupported(
                 "flux2 Klein transformer streaming requires Sequential + DeferredMaterialization"
@@ -622,16 +764,7 @@ pub(crate) fn klein_safety_check(
         }
         Ok(())
     };
-    standard_memory_strategy_safety_check(
-        contract,
-        context,
-        Some(MemoryNumericTier {
-            precision: spec.precision,
-            quant: spec.quantize,
-            component_precision_floors: &[],
-        }),
-        Some(&route_gate),
-    )
+    standard_memory_strategy_safety_check(contract, context, Some(expected_tier), Some(&route_gate))
 }
 
 pub(crate) fn registered_klein_safety_check(
@@ -639,7 +772,12 @@ pub(crate) fn registered_klein_safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    klein_safety_check(spec, contract, context)
+    match klein_expected_tier(&contract.provider_id, spec) {
+        Ok(tier) => klein_safety_check(spec, contract, context, tier),
+        Err(error) => MemorySafetyDecision::Reject {
+            reason: error.to_string(),
+        },
+    }
 }
 
 pub(crate) fn registered_klein_fixture(
@@ -650,41 +788,73 @@ pub(crate) fn registered_klein_fixture(
     if !strategy.is_optimized() {
         return Ok(Vec::new());
     }
-    let (mode, reference_count) = klein_route(&contract.provider_id)?;
-    let tier = MemoryNumericTier {
-        precision: spec.precision,
-        quant: spec.quantize,
-        component_precision_floors: &[],
+    let tier = klein_expected_tier(&contract.provider_id, spec)?;
+    let routes = match contract.provider_id.as_str() {
+        crate::FLUX2_KLEIN_9B_ID => {
+            vec![(MemoryMode::TextToImage, 0), (MemoryMode::ImageToImage, 1)]
+        }
+        crate::FLUX2_KLEIN_9B_EDIT_ID | crate::FLUX2_KLEIN_9B_KV_EDIT_ID => (1..=8)
+            .map(|references| (MemoryMode::Edit, references))
+            .collect(),
+        provider_id => {
+            return Err(CoreError::Unsupported(format!(
+                "unknown FLUX.2 Klein memory provider {provider_id}"
+            )))
+        }
     };
-    let route = |use_pid| mlx_gen::gen_core::MemoryBehaviorRoute {
-        mode: mode.clone(),
-        reference_count,
-        use_pid,
-        has_phases: spec.offload_policy == OffloadPolicy::Sequential,
-        overlay: klein_overlay(spec),
-    };
-    let mut fixtures = vec![mlx_gen::gen_core::MemoryBehaviorFixture::new(
-        mlx_gen::gen_core::standard_memory_behavior_context(
-            contract,
-            strategy,
-            tier,
-            route(false),
-        )?,
-    )];
-    if spec.pid.is_some()
+    let permits_pid = spec.pid.is_some()
         && contract.pid_decode_routes.is_some()
-        && contract.engages(strategy, MemoryStrategy::BoundedDecode)
-    {
-        fixtures.push(mlx_gen::gen_core::MemoryBehaviorFixture::new(
-            mlx_gen::gen_core::standard_memory_behavior_context(
-                contract,
-                strategy,
-                tier,
-                route(true),
-            )?,
-        ));
+        && contract.engages(strategy, MemoryStrategy::BoundedDecode);
+    let mut fixtures = Vec::new();
+    for (mode, reference_count) in routes {
+        for use_pid in [false, true]
+            .into_iter()
+            .filter(|use_pid| !*use_pid || permits_pid)
+        {
+            let route = mlx_gen::gen_core::MemoryBehaviorRoute {
+                mode: mode.clone(),
+                reference_count,
+                use_pid,
+                has_phases: false,
+                overlay: klein_overlay(spec),
+            };
+            let context = mlx_gen::gen_core::standard_memory_behavior_context(
+                contract, strategy, tier, route,
+            )?;
+            fixtures.push(executable_klein_fixture(context));
+        }
     }
     Ok(fixtures)
+}
+
+fn executable_klein_fixture(context: MemoryRunContext) -> mlx_gen::gen_core::MemoryBehaviorFixture {
+    let mut fixture = mlx_gen::gen_core::MemoryBehaviorFixture::new(context);
+    fixture.request.prompt = "weights-free FLUX.2 Klein memory behavior".to_owned();
+    let reference = || mlx_gen::media::Image {
+        width: 1,
+        height: 1,
+        pixels: vec![0, 0, 0],
+    };
+    fixture.request.conditioning = match (
+        &fixture.context.mode,
+        fixture.context.geometry.reference_count,
+    ) {
+        (MemoryMode::TextToImage, 0) => Vec::new(),
+        (MemoryMode::ImageToImage, 1) => vec![mlx_gen::Conditioning::Reference {
+            image: reference(),
+            strength: Some(1.0),
+        }],
+        (MemoryMode::Edit, 1) => vec![mlx_gen::Conditioning::Reference {
+            image: reference(),
+            strength: None,
+        }],
+        (MemoryMode::Edit, count @ 2..=8) => vec![mlx_gen::Conditioning::MultiReference {
+            images: (0..count).map(|_| reference()).collect(),
+        }],
+        _ => unreachable!("provider-owned route validation constructs only executable fixtures"),
+    };
+    fixture.request.phases = None;
+    fixture
 }
 
 pub(crate) fn registered_klein_begin_request(
@@ -719,7 +889,10 @@ fn begin_klein_request_with_cleanup(
     context: &MemoryRunContext,
     cleanup: mlx_gen::request_scope::MlxScopeCleanup,
 ) -> mlx_gen::gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
-    if let MemorySafetyDecision::Reject { reason } = klein_safety_check(spec, contract, context) {
+    let expected_tier = klein_expected_tier(&contract.provider_id, spec)?;
+    if let MemorySafetyDecision::Reject { reason } =
+        klein_safety_check(spec, contract, context, expected_tier)
+    {
         return Err(CoreError::Unsupported(reason));
     }
     let routes = klein_decode_routes(&contract.provider_id)?;
@@ -1157,17 +1330,26 @@ mod tests {
         let base = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
             .with_offload_policy(OffloadPolicy::Sequential)
             .with_load_shape(LoadShape::DeferredMaterialization);
-        let mut overlay = base.clone();
-        overlay.adapters.push(mlx_gen::AdapterSpec::new(
-            "/nonexistent/adapter.safetensors".into(),
+        let lora = base.clone().with_adapters(vec![mlx_gen::AdapterSpec::new(
+            "/nonexistent/lora.safetensors".into(),
             1.0,
             mlx_gen::AdapterKind::Lora,
-        ));
+        )]);
+        let lokr = base.clone().with_adapters(vec![mlx_gen::AdapterSpec::new(
+            "/nonexistent/lokr.safetensors".into(),
+            1.0,
+            mlx_gen::AdapterKind::Lokr,
+        )]);
+        let external_te = base
+            .clone()
+            .with_text_encoder(WeightsSource::Dir("/nonexistent/external-te".into()));
         for spec in [
             base.clone()
                 .with_load_shape(LoadShape::EagerMaterialization),
             base.with_quant(Quant::Q4),
-            overlay,
+            lora,
+            lokr,
+            external_te,
         ] {
             let contract = build_klein_contract(
                 crate::FLUX2_KLEIN_9B_ID,
@@ -1188,6 +1370,217 @@ mod tests {
     }
 
     #[test]
+    fn klein_selector_surfaces_are_exact_and_fail_closed_on_axis_mutation() {
+        let providers = [
+            crate::FLUX2_KLEIN_9B_ID,
+            crate::FLUX2_KLEIN_9B_EDIT_ID,
+            crate::FLUX2_KLEIN_9B_KV_EDIT_ID,
+        ];
+        for provider_id in providers {
+            let mut implemented = 0;
+            for surface in mlx_gen::gen_core::mlx_memory_contract_surface_specs() {
+                let contract = weights_free_klein_surface_contract(provider_id, &surface).unwrap();
+                let expected = surface.spec.offload_policy == OffloadPolicy::Sequential
+                    && surface.spec.load_shape == LoadShape::DeferredMaterialization;
+                assert_eq!(
+                    contract
+                        .capability(MemoryStrategy::BoundedTransformerResidency)
+                        .unwrap()
+                        .support,
+                    if expected {
+                        MemoryStrategySupport::Implemented
+                    } else {
+                        MemoryStrategySupport::Missing
+                    },
+                    "{provider_id}: {}",
+                    surface.selector.id()
+                );
+                implemented += usize::from(expected);
+                assert_eq!(contract.asset_facts, Default::default());
+            }
+            assert_eq!(implemented, 3, "{provider_id}");
+        }
+
+        let q4 = mlx_gen::gen_core::mlx_memory_contract_surface_specs()
+            .into_iter()
+            .find(|surface| {
+                surface.resolved_artifact_tier() == mlx_gen::gen_core::MemoryContractSurfaceTier::Q4
+                    && surface.spec.offload_policy == OffloadPolicy::Sequential
+                    && surface.spec.load_shape == LoadShape::DeferredMaterialization
+            })
+            .unwrap();
+        let mut mutations = Vec::new();
+        let copy = || mlx_gen::gen_core::MemoryContractSurfaceSpec {
+            selector: q4.selector,
+            spec: q4.spec.clone(),
+        };
+        let mut tier = copy();
+        tier.spec.quantize = Some(Quant::Q8);
+        mutations.push(tier);
+        let mut source = copy();
+        source.spec.weights = WeightsSource::File("/klein.safetensors".into());
+        mutations.push(source);
+        let mut precision = copy();
+        precision.spec.precision = Precision::Fp32;
+        mutations.push(precision);
+        let mut control = copy();
+        control.spec.control = Some(WeightsSource::File("/control.safetensors".into()));
+        mutations.push(control);
+        let mut component = copy();
+        component.spec.components.insert(
+            "unknown".to_owned(),
+            WeightsSource::File("/component.safetensors".into()),
+        );
+        mutations.push(component);
+        let mut pid = copy();
+        pid.spec = pid.spec.with_pid(
+            WeightsSource::File("/pid.safetensors".into()),
+            WeightsSource::Dir("/gemma".into()),
+        );
+        mutations.push(pid);
+        for provider_id in providers {
+            for mutation in &mutations {
+                assert!(
+                    weights_free_klein_surface_contract(provider_id, mutation).is_err(),
+                    "{provider_id} admitted mutated selector {}",
+                    mutation.selector.id()
+                );
+            }
+        }
+        assert!(weights_free_klein_surface_contract("flux2_klein_alias", &q4).is_err());
+    }
+
+    #[test]
+    fn klein_behavior_routes_are_executable_reachable_and_fail_closed() {
+        let q4 = mlx_gen::gen_core::mlx_memory_contract_surface_specs()
+            .into_iter()
+            .find(|surface| {
+                surface.resolved_artifact_tier() == mlx_gen::gen_core::MemoryContractSurfaceTier::Q4
+                    && surface.spec.offload_policy == OffloadPolicy::Sequential
+                    && surface.spec.load_shape == LoadShape::DeferredMaterialization
+            })
+            .unwrap();
+        for provider_id in [
+            crate::FLUX2_KLEIN_9B_ID,
+            crate::FLUX2_KLEIN_9B_EDIT_ID,
+            crate::FLUX2_KLEIN_9B_KV_EDIT_ID,
+        ] {
+            let spec = q4.spec.clone().with_pid(
+                WeightsSource::File("/pid.safetensors".into()),
+                WeightsSource::Dir("/gemma".into()),
+            );
+            let contract = build_klein_contract(
+                provider_id,
+                &spec,
+                Default::default(),
+                true,
+                Some(MemoryCalibrationIdentity::new(
+                    format!(
+                        "{KLEIN_STATIC_BEHAVIOR_FINGERPRINT}-{}",
+                        provider_id.replace('_', "-")
+                    ),
+                    spec.load_shape,
+                )),
+            )
+            .unwrap();
+            let fixtures = registered_klein_fixture(
+                &spec,
+                &contract,
+                MemoryStrategy::BoundedTransformerResidency,
+            )
+            .unwrap();
+            let expected_routes = if provider_id == crate::FLUX2_KLEIN_9B_ID {
+                4
+            } else {
+                16
+            };
+            assert_eq!(fixtures.len(), expected_routes, "{provider_id}");
+            assert!(fixtures.iter().any(|fixture| fixture.context.use_pid));
+            assert!(fixtures.iter().any(|fixture| !fixture.context.use_pid));
+
+            let (is_edit, is_kv) = (
+                provider_id != crate::FLUX2_KLEIN_9B_ID,
+                provider_id == crate::FLUX2_KLEIN_9B_KV_EDIT_ID,
+            );
+            let descriptor = match provider_id {
+                crate::FLUX2_KLEIN_9B_ID => crate::model::descriptor_klein_9b(),
+                crate::FLUX2_KLEIN_9B_EDIT_ID => crate::model::descriptor_klein_9b_edit(),
+                crate::FLUX2_KLEIN_9B_KV_EDIT_ID => crate::model::descriptor_klein_9b_kv_edit(),
+                _ => unreachable!(),
+            };
+            for fixture in &fixtures {
+                assert_eq!(
+                    registered_klein_safety_check(&spec, &contract, &fixture.context),
+                    MemorySafetyDecision::Accept,
+                    "{provider_id}: {:?}",
+                    fixture.context
+                );
+                let mut scope = registered_klein_begin_request(&spec, &contract, &fixture.context)
+                    .unwrap()
+                    .expect("optimized Klein fixture creates a request scope");
+                let mut configured = fixture.request.clone();
+                scope.configure_request(&mut configured).unwrap();
+                let memory = configured.memory.expect("request memory controls");
+                assert!(memory.stage_residency);
+                assert!(memory.tile_vae_decode);
+                assert!(memory.chunk_attention);
+                assert!(memory.stream_transformer_blocks);
+                assert_eq!(
+                    memory.transformer_window_size,
+                    Some(TRANSFORMER_WINDOW_SIZE)
+                );
+                assert_eq!(memory.attention_chunk_size, Some(ATTENTION_CHUNK_SIZE));
+                if fixture.context.use_pid {
+                    assert_eq!(memory.decode_tile_edge, Some(2048));
+                    assert_eq!(memory.decode_overlap, Some(256));
+                } else {
+                    assert!(memory
+                        .decode_tile_edge
+                        .is_some_and(|edge| DECODE_TILE_EDGES.contains(&edge)));
+                    assert_eq!(memory.decode_overlap, Some(DECODE_OVERLAP));
+                }
+                crate::model::validate_request(&descriptor, is_edit, is_kv, &fixture.request)
+                    .unwrap_or_else(|error| {
+                        panic!("{provider_id} fixture is not executable: {error}")
+                    });
+                assert_eq!(fixture.request.use_pid, fixture.context.use_pid);
+                assert!(fixture.request.phases.is_none());
+                assert!(!fixture.context.has_phases);
+            }
+
+            let exact = &fixtures[0].context;
+            let mut mutations = Vec::new();
+            let mut mode = exact.clone();
+            mode.mode = if is_edit {
+                MemoryMode::ImageToImage
+            } else {
+                MemoryMode::Edit
+            };
+            mutations.push(mode);
+            let mut references = exact.clone();
+            references.geometry.reference_count = if is_edit { 9 } else { 2 };
+            references.has_reference = true;
+            mutations.push(references);
+            let mut phases = exact.clone();
+            phases.has_phases = true;
+            mutations.push(phases);
+            let mut overlay = exact.clone();
+            overlay.overlay = Some("references:1".to_owned());
+            mutations.push(overlay);
+            let mut tier = exact.clone();
+            tier.selection.tier.quant = Some(Quant::Q8);
+            mutations.push(tier);
+            for mutation in mutations {
+                assert!(matches!(
+                    registered_klein_safety_check(&spec, &contract, &mutation),
+                    MemorySafetyDecision::Reject { .. }
+                ));
+                assert!(registered_klein_begin_request(&spec, &contract, &mutation).is_err());
+            }
+        }
+    }
+
+    #[test]
     fn klein_admission_binds_provider_route_and_loaded_pid() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
             .with_offload_policy(OffloadPolicy::Sequential)
@@ -1202,7 +1595,7 @@ mod tests {
             mode: MemoryMode::TextToImage,
             reference_count: 0,
             use_pid: false,
-            has_phases: true,
+            has_phases: false,
             overlay: None,
         };
         let mut context = mlx_gen::gen_core::standard_memory_behavior_context(
@@ -1217,7 +1610,7 @@ mod tests {
         context.has_reference = true;
         context.geometry.reference_count = 1;
         let MemorySafetyDecision::Reject { reason } =
-            klein_safety_check(&spec, &contract, &context)
+            klein_safety_check(&spec, &contract, &context, tier)
         else {
             panic!("base contract admitted an edit route");
         };
@@ -1231,7 +1624,7 @@ mod tests {
         context.geometry.reference_count = 0;
         context.use_pid = true;
         let MemorySafetyDecision::Reject { reason } =
-            klein_safety_check(&spec, &contract, &context)
+            klein_safety_check(&spec, &contract, &context, tier)
         else {
             panic!("base contract admitted PiD without loaded weights");
         };

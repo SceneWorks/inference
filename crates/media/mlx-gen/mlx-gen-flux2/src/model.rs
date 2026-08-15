@@ -167,6 +167,12 @@ pub fn load_dev_edit(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 }
 
 fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    if matches!(
+        variant,
+        Flux2Variant::Klein9b | Flux2Variant::Klein9bEdit | Flux2Variant::Klein9bKvEdit
+    ) {
+        validate_klein_load_axes(spec, variant.id())?;
+    }
     // Precision + snapshot-dir guard up front for BOTH policies (fail fast).
     let root = resolve_root(variant, spec)?;
     // Publish the tier the transformer actually realizes. A packed Dev turnkey selected without a
@@ -308,17 +314,21 @@ fn load_flux2_heavy(
     if !spec.adapters.is_empty() {
         crate::adapters::apply_flux2_adapters(&mut transformer, &spec.adapters)?;
     }
-    if matches!(variant, Flux2Variant::Klein9b | Flux2Variant::Klein9bEdit)
-        && spec.load_shape == mlx_gen::LoadShape::DeferredMaterialization
-        && spec.offload_policy == OffloadPolicy::Sequential
-        && spec.quantize.is_none()
-        && spec.adapters.is_empty()
+    if matches!(
+        variant,
+        Flux2Variant::Klein9b | Flux2Variant::Klein9bEdit | Flux2Variant::Klein9bKvEdit
+    ) && crate::memory_strategy::klein_streamable(spec)
     {
-        let inventory = crate::artifact_inventory::KleinArtifactInventory::verify(spec)?
-            .ok_or_else(|| Error::Unsupported(
-                "flux2 Klein deferred materialization requires the exact calibrated BF16 HF artifact"
+        let inventory = crate::artifact_inventory::KleinArtifactInventory::verify_for_provider(
+            variant.id(),
+            spec,
+        )?
+        .ok_or_else(|| {
+            Error::Unsupported(
+                "flux2 Klein deferred materialization requires an exact admitted base, re-host, True-V2, or KV artifact inventory"
                     .to_owned(),
-            ))?;
+            )
+        })?;
         let quant = crate::loader::read_component_quant(&root.join("transformer"))?;
         transformer = transformer.with_block_stream(inventory, variant.config(), quant);
         transformer.finalize_block_stream()?;
@@ -435,16 +445,12 @@ pub(crate) fn effective_base_quant(
 
 /// Resolve the exact numeric tier a loaded FLUX.2 generator publishes for memory admission.
 pub(crate) fn effective_memory_numeric_tier(
-    variant: Flux2Variant,
+    _variant: Flux2Variant,
     spec: &LoadSpec,
     root: &Path,
     provider_id: &str,
 ) -> Result<mlx_gen::gen_core::MemoryNumericTier> {
-    let quant = if variant.is_dev() {
-        effective_base_quant(spec, root, provider_id)?
-    } else {
-        spec.quantize
-    };
+    let quant = effective_base_quant(spec, root, provider_id)?;
     Ok(mlx_gen::gen_core::MemoryNumericTier {
         precision: spec.precision,
         quant,
@@ -853,19 +859,14 @@ impl Generator for Flux2 {
                     Flux2Variant::DevEdit => {
                         crate::memory_strategy::safety_check(contract, context, expected_tier)
                     }
-                    Flux2Variant::Klein9b | Flux2Variant::Klein9bEdit => {
-                        crate::memory_strategy::klein_safety_check(
-                            &self.loaded_spec,
-                            contract,
-                            context,
-                        )
-                    }
-                    _ => mlx_gen::gen_core::MemorySafetyDecision::Reject {
-                        reason: format!(
-                            "{} has no memory-safety implementation for its registered contract",
-                            self.descriptor.id
-                        ),
-                    },
+                    Flux2Variant::Klein9b
+                    | Flux2Variant::Klein9bEdit
+                    | Flux2Variant::Klein9bKvEdit => crate::memory_strategy::klein_safety_check(
+                        &self.loaded_spec,
+                        contract,
+                        context,
+                        expected_tier,
+                    ),
                 }
             },
         )
@@ -1389,6 +1390,13 @@ pub(crate) fn component_footprint_for(
     include_builtin_multimodal: bool,
     spec: &mlx_gen::LoadSpec,
 ) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    if matches!(
+        variant,
+        Flux2Variant::Klein9b | Flux2Variant::Klein9bEdit | Flux2Variant::Klein9bKvEdit
+    ) {
+        validate_klein_load_axes(spec, provider_id)
+            .map_err(|error| mlx_gen::gen_core::Error::Unsupported(error.to_string()))?;
+    }
     let root = match &spec.weights {
         WeightsSource::Dir(root) => root.as_path(),
         WeightsSource::File(_) => {
@@ -1464,6 +1472,41 @@ pub(crate) fn component_footprint_for(
     )?;
     footprint.text_encoder = conditioning_bytes;
     Ok(footprint)
+}
+
+pub(crate) fn validate_klein_load_axes(spec: &LoadSpec, provider_id: &str) -> Result<()> {
+    if !matches!(
+        provider_id,
+        crate::config::FLUX2_KLEIN_9B_ID
+            | crate::config::FLUX2_KLEIN_9B_EDIT_ID
+            | crate::config::FLUX2_KLEIN_9B_KV_EDIT_ID
+    ) {
+        return Err(Error::Unsupported(format!(
+            "unknown FLUX.2 Klein memory provider {provider_id}"
+        )));
+    }
+    if spec.precision != Precision::Bf16 {
+        return Err(Error::Unsupported(format!(
+            "{provider_id}: FLUX.2 Klein supports only BF16 execution precision"
+        )));
+    }
+    if !matches!(spec.weights, WeightsSource::Dir(_)) {
+        return Err(Error::Unsupported(format!(
+            "{provider_id}: FLUX.2 Klein requires a snapshot directory"
+        )));
+    }
+    mlx_gen::gen_core::reject_unknown_components(spec, &[], provider_id)?;
+    if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
+        return Err(Error::Unsupported(format!(
+            "{provider_id}: FLUX.2 Klein does not accept control or IP-adapter overlays"
+        )));
+    }
+    if spec.identity.is_some() {
+        return Err(Error::Unsupported(format!(
+            "{provider_id}: FLUX.2 Klein does not accept identity overlays"
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn component_footprint(
@@ -1581,6 +1624,18 @@ pub(crate) const KLEIN_EDIT_MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegist
         safety_check: crate::memory_strategy::registered_klein_safety_check,
     };
 
+pub(crate) const KLEIN_KV_EDIT_MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
+    mlx_gen::gen_core::MemoryRegistration {
+        provider_id: crate::config::FLUX2_KLEIN_9B_KV_EDIT_ID,
+        contract: |spec| {
+            crate::memory_strategy::klein_contract_for(
+                crate::config::FLUX2_KLEIN_9B_KV_EDIT_ID,
+                spec,
+            )
+        },
+        safety_check: crate::memory_strategy::registered_klein_safety_check,
+    };
+
 pub(crate) const KLEIN_MEMORY_BEHAVIOR: mlx_gen::gen_core::MemoryBehaviorRegistration =
     mlx_gen::gen_core::MemoryBehaviorRegistration {
         provider_id: crate::config::FLUX2_KLEIN_9B_ID,
@@ -1595,12 +1650,19 @@ pub(crate) const KLEIN_EDIT_MEMORY_BEHAVIOR: mlx_gen::gen_core::MemoryBehaviorRe
         begin_request: crate::memory_strategy::registered_klein_begin_request,
     };
 
+pub(crate) const KLEIN_KV_EDIT_MEMORY_BEHAVIOR: mlx_gen::gen_core::MemoryBehaviorRegistration =
+    mlx_gen::gen_core::MemoryBehaviorRegistration {
+        provider_id: crate::config::FLUX2_KLEIN_9B_KV_EDIT_ID,
+        valid_fixtures: crate::memory_strategy::registered_klein_fixture,
+        begin_request: crate::memory_strategy::registered_klein_begin_request,
+    };
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{
         DEFAULT_GUIDANCE_DEV, DEFAULT_STEPS_DEV, FLUX2_DEV_EDIT_ID, FLUX2_DEV_ID,
-        FLUX2_KLEIN_9B_EDIT_ID, FLUX2_KLEIN_9B_ID,
+        FLUX2_KLEIN_9B_EDIT_ID, FLUX2_KLEIN_9B_ID, FLUX2_KLEIN_9B_KV_EDIT_ID,
     };
     use mlx_gen::gen_core::{
         MemoryBudget, MemoryCacheState, MemoryGeometry, MemoryMode, MemoryNumericTier,
@@ -2367,6 +2429,13 @@ mod tests {
             "non-kv edit should honor image_guidance"
         );
 
+        let kv_edit = Flux2::new_for_tests(Flux2Variant::Klein9bKvEdit);
+        let err = kv_edit.validate(&edit_req).unwrap_err().to_string();
+        assert!(
+            err.contains("kv-edit variant") && err.contains("image_guidance"),
+            "kv edit must reject image_guidance, got: {err}"
+        );
+
         // A non-finite image_guidance is rejected by the shared floor's central finiteness guard
         // (F-001), even on the honoring edit path.
         let nan_req = GenerationRequest {
@@ -2378,6 +2447,71 @@ mod tests {
             err.contains("image_guidance") && err.contains("finite"),
             "non-finite image_guidance must be rejected, got: {err}"
         );
+    }
+
+    #[test]
+    fn klein_load_axes_preserve_supported_compositions_and_reject_ignored_fields() {
+        let base = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        for provider_id in [
+            FLUX2_KLEIN_9B_ID,
+            FLUX2_KLEIN_9B_EDIT_ID,
+            FLUX2_KLEIN_9B_KV_EDIT_ID,
+        ] {
+            for kind in [mlx_gen::AdapterKind::Lora, mlx_gen::AdapterKind::Lokr] {
+                let spec = base
+                    .clone()
+                    .with_adapters(vec![mlx_gen::AdapterSpec::new(
+                        "/adapter.safetensors".into(),
+                        1.0,
+                        kind,
+                    )])
+                    .with_pid(
+                        WeightsSource::File("/pid.safetensors".into()),
+                        WeightsSource::Dir("/gemma".into()),
+                    )
+                    .with_text_encoder(WeightsSource::Dir("/external-te".into()));
+                validate_klein_load_axes(&spec, provider_id)
+                    .unwrap_or_else(|error| panic!("{provider_id} {kind:?}: {error}"));
+            }
+
+            let mut refused = Vec::new();
+            refused.push(
+                base.clone()
+                    .with_control(WeightsSource::File("/control.safetensors".into())),
+            );
+            let mut extra_control = base.clone();
+            extra_control
+                .extra_controls
+                .push(WeightsSource::File("/extra-control.safetensors".into()));
+            refused.push(extra_control);
+            let mut ip = base.clone();
+            ip.ip_adapter = Some(WeightsSource::File("/ip.safetensors".into()));
+            refused.push(ip);
+            let mut identity = base.clone();
+            identity.identity = Some(mlx_gen::IdentityWeights {
+                encoder: Some(WeightsSource::File("/identity.safetensors".into())),
+                eva: Some(WeightsSource::File("/vision.safetensors".into())),
+                face_dir: Some(WeightsSource::Dir("/face".into())),
+            });
+            refused.push(identity);
+            refused.push(
+                base.clone()
+                    .with_component("unknown", WeightsSource::Dir("/component".into())),
+            );
+            refused.push(LoadSpec::new(WeightsSource::File(
+                "/model.safetensors".into(),
+            )));
+            let mut precision = base.clone();
+            precision.precision = Precision::Fp32;
+            refused.push(precision);
+            for spec in refused {
+                assert!(
+                    validate_klein_load_axes(&spec, provider_id).is_err(),
+                    "{provider_id}"
+                );
+            }
+        }
+        assert!(validate_klein_load_axes(&base, "flux2_klein_alias").is_err());
     }
 
     // ---- sc-5919 FLUX.2-dev edit (DiT-concat reference conditioning) ---------------------------
