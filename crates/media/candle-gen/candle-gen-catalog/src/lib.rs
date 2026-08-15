@@ -3841,6 +3841,113 @@ mod tests {
     }
 
     #[test]
+    fn z_image_and_lens_publish_exact_typed_candle_rung_four_surfaces() {
+        use candle_gen::gen_core::{
+            LoadShape, MemoryContractSurfaceTier, MemoryStrategy, MemoryStrategySupport,
+            OffloadPolicy,
+        };
+
+        let registry = super::memory_contract_surface_registry().unwrap();
+        let surfaces = registry.memory_contract_surfaces().unwrap();
+        for (provider_id, expected_count, composed, fingerprint) in [
+            (
+                "z_image",
+                6,
+                false,
+                "z-image-cuda-staged-tiled-decode-bounded-attention-device-format-blocks-v2",
+            ),
+            (
+                "z_image_turbo",
+                6,
+                false,
+                "z-image-cuda-staged-tiled-decode-bounded-attention-device-format-blocks-v2",
+            ),
+            (
+                "z_image_control",
+                6,
+                true,
+                "z-image-cuda-base-control-host-decode-streamed-device-format-blocks-v2",
+            ),
+            (
+                "z_image_turbo_control",
+                6,
+                true,
+                "z-image-cuda-base-control-host-decode-streamed-device-format-blocks-v2",
+            ),
+            (
+                "lens",
+                2,
+                false,
+                "lens-candle-cuda-shared-ladder-device-format-blocks-v1",
+            ),
+            (
+                "lens_turbo",
+                2,
+                false,
+                "lens-candle-cuda-shared-ladder-device-format-blocks-v1",
+            ),
+        ] {
+            let provider_surfaces: Vec<_> = surfaces
+                .iter()
+                .filter(|surface| surface.contract.provider_id == provider_id)
+                .collect();
+            assert_eq!(provider_surfaces.len(), 12, "{provider_id}");
+            let mut implemented = 0;
+            for surface in provider_surfaces {
+                let expected = if provider_id.starts_with("lens") {
+                    matches!(
+                        surface.resolved_artifact_tier(),
+                        MemoryContractSurfaceTier::Q4 | MemoryContractSurfaceTier::Q8
+                    ) && surface.selector.offload_policy == OffloadPolicy::Sequential
+                        && surface.selector.load_shape == LoadShape::DeferredMaterialization
+                } else {
+                    matches!(
+                        surface.resolved_artifact_tier(),
+                        MemoryContractSurfaceTier::Bf16
+                            | MemoryContractSurfaceTier::Q4
+                            | MemoryContractSurfaceTier::Q8
+                    ) && surface.selector.load_shape == LoadShape::DeferredMaterialization
+                };
+                let rung = surface
+                    .contract
+                    .capability(MemoryStrategy::BoundedTransformerResidency)
+                    .expect("complete Candle ladder");
+                assert_eq!(
+                    rung.support,
+                    if expected {
+                        MemoryStrategySupport::Implemented
+                    } else {
+                        MemoryStrategySupport::Missing
+                    },
+                    "{}:{}",
+                    provider_id,
+                    surface.selector.id()
+                );
+                implemented += usize::from(expected);
+                assert_eq!(surface.composed, composed, "{provider_id}");
+                assert_eq!(
+                    surface.contract.calibration.as_ref().unwrap().fingerprint,
+                    fingerprint,
+                    "{provider_id}"
+                );
+                assert_eq!(
+                    surface.contract.asset_facts,
+                    candle_gen::gen_core::MemoryAssetFacts::default(),
+                    "{provider_id}: weights-free surfaces cannot claim real inventory"
+                );
+                if composed {
+                    assert!(
+                        surface.spec.control.is_some(),
+                        "{provider_id}:{} missing mandatory control source",
+                        surface.selector.id()
+                    );
+                }
+            }
+            assert_eq!(implemented, expected_count, "{provider_id}");
+        }
+    }
+
+    #[test]
     fn cfg_capability_matrix_matches_the_registered_candle_render_paths() {
         let registry = super::provider_registry().unwrap();
         let descriptor = |id: &str| {

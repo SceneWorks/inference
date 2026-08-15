@@ -144,24 +144,60 @@ pub fn register_memory_contract_surfaces(
             provider_id: MODEL_ID,
             contract: weights_free_turbo_memory_contract,
         })
+        .register_memory_contract_surface_resolver(
+            gen_core::MemoryContractSurfaceResolverRegistration {
+                provider_id: MODEL_ID,
+                contract: weights_free_turbo_surface_contract,
+            },
+        )
         .register_memory_strategy(BASE_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
             surface_specs: gen_core::candle_memory_contract_surface_specs,
             provider_id: base::MODEL_ID,
             contract: registered_base_memory_contract,
         })
+        .register_memory_contract_surface_resolver(
+            gen_core::MemoryContractSurfaceResolverRegistration {
+                provider_id: base::MODEL_ID,
+                contract: weights_free_base_surface_contract,
+            },
+        )
         .register_composed_memory_strategy(TURBO_CONTROL_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
-            surface_specs: gen_core::candle_memory_contract_surface_specs,
+            surface_specs: control_memory_contract_surface_specs,
             provider_id: "z_image_turbo_control",
             contract: registered_turbo_control_memory_contract,
         })
+        .register_memory_contract_surface_resolver(
+            gen_core::MemoryContractSurfaceResolverRegistration {
+                provider_id: "z_image_turbo_control",
+                contract: weights_free_turbo_control_surface_contract,
+            },
+        )
         .register_composed_memory_strategy(BASE_CONTROL_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
-            surface_specs: gen_core::candle_memory_contract_surface_specs,
+            surface_specs: control_memory_contract_surface_specs,
             provider_id: "z_image_control",
             contract: registered_base_control_memory_contract,
         })
+        .register_memory_contract_surface_resolver(
+            gen_core::MemoryContractSurfaceResolverRegistration {
+                provider_id: "z_image_control",
+                contract: weights_free_base_control_surface_contract,
+            },
+        )
+}
+
+fn control_memory_contract_surface_specs() -> Vec<gen_core::MemoryContractSurfaceSpec> {
+    gen_core::candle_memory_contract_surface_specs()
+        .into_iter()
+        .map(|mut surface| {
+            surface.spec.control = Some(gen_core::WeightsSource::Dir(
+                "/__sceneworks_memory_contract_control_surface__".into(),
+            ));
+            surface
+        })
+        .collect()
 }
 
 /// Build the complete explicit Candle Z-Image provider catalog.
@@ -879,6 +915,30 @@ fn weights_free_turbo_memory_contract(
     Ok(contract)
 }
 
+fn weights_free_turbo_surface_contract(
+    surface: &gen_core::MemoryContractSurfaceSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    memory_strategy::weights_free_surface_contract(MODEL_ID, surface)
+}
+
+fn weights_free_base_surface_contract(
+    surface: &gen_core::MemoryContractSurfaceSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    memory_strategy::weights_free_surface_contract(base::MODEL_ID, surface)
+}
+
+fn weights_free_turbo_control_surface_contract(
+    surface: &gen_core::MemoryContractSurfaceSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    memory_strategy::weights_free_control_surface_contract("z_image_turbo_control", surface)
+}
+
+fn weights_free_base_control_surface_contract(
+    surface: &gen_core::MemoryContractSurfaceSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    memory_strategy::weights_free_control_surface_contract("z_image_control", surface)
+}
+
 fn registered_turbo_control_memory_contract(
     spec: &LoadSpec,
 ) -> gen_core::Result<gen_core::MemoryProviderContract> {
@@ -1073,6 +1133,87 @@ mod tests {
                     [Conditioning::Reference { .. }]
                 ));
             }
+        }
+    }
+
+    #[test]
+    fn catalog_surfaces_publish_exact_prepacked_z_image_routes() {
+        let registry = register_memory_contract_surfaces(
+            gen_core::ProviderRegistryBuilder::new()
+                .register_generator(REGISTRATION)
+                .register_generator(base::REGISTRATION),
+        )
+        .build()
+        .expect("Z-Image surface registry");
+        let surfaces = registry
+            .memory_contract_surfaces()
+            .expect("weights-free Z-Image surfaces");
+
+        for (provider_id, composed, fingerprint) in [
+            (MODEL_ID, false, memory_strategy::CALIBRATION_FINGERPRINT),
+            (
+                base::MODEL_ID,
+                false,
+                memory_strategy::CALIBRATION_FINGERPRINT,
+            ),
+            (
+                "z_image_turbo_control",
+                true,
+                memory_strategy::CONTROL_CALIBRATION_FINGERPRINT,
+            ),
+            (
+                "z_image_control",
+                true,
+                memory_strategy::CONTROL_CALIBRATION_FINGERPRINT,
+            ),
+        ] {
+            let provider_surfaces: Vec<_> = surfaces
+                .iter()
+                .filter(|surface| surface.contract.provider_id == provider_id)
+                .collect();
+            assert_eq!(provider_surfaces.len(), 12, "{provider_id}");
+            let mut rung_four = 0;
+            for surface in provider_surfaces {
+                let expected =
+                    surface.selector.load_shape == gen_core::LoadShape::DeferredMaterialization;
+                let capability = surface
+                    .contract
+                    .capability(gen_core::MemoryStrategy::BoundedTransformerResidency)
+                    .expect("rung four");
+                assert_eq!(
+                    capability.support,
+                    if expected {
+                        gen_core::MemoryStrategySupport::Implemented
+                    } else {
+                        gen_core::MemoryStrategySupport::Missing
+                    },
+                    "{}:{}",
+                    provider_id,
+                    surface.selector.id()
+                );
+                rung_four += usize::from(expected);
+                assert_eq!(surface.composed, composed, "{provider_id}");
+                assert_eq!(
+                    surface.contract.calibration.as_ref().unwrap().fingerprint,
+                    fingerprint,
+                    "{provider_id}"
+                );
+                assert_eq!(
+                    surface.contract.asset_facts,
+                    gen_core::MemoryAssetFacts::default(),
+                    "weights-free Z surfaces claim no asset bytes"
+                );
+                if composed {
+                    assert!(
+                        surface.spec.control.is_some(),
+                        "{provider_id}:{} must carry a control source",
+                        surface.selector.id()
+                    );
+                } else {
+                    assert!(surface.spec.control.is_none(), "{provider_id}");
+                }
+            }
+            assert_eq!(rung_four, 6, "{provider_id}");
         }
     }
 
