@@ -37,11 +37,11 @@
 use mlx_rs::ops::{concatenate_axis, split_sections};
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear, LinearFacts};
 use mlx_gen::attention::{sdpa_budgeted_bhsd, AttentionPlan};
 use mlx_gen::qkv::{
-    self, AttnPrepSpec, QkNormSpec, QkvHeads, QkvSource, RopeDtype, RopeSpec, RopeStyle,
-    RopeTables, StreamOrder,
+    self, AttnPrepSpec, FusedQkvProjection, QkNormSpec, QkvHeads, QkvPart, QkvSource, RopeDtype,
+    RopeSpec, RopeStyle, RopeTables, StreamOrder,
 };
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
@@ -67,13 +67,13 @@ pub struct DualStream {
 /// `Attention(query_dim=dim, added_kv_proj_dim=dim, …, processor=MageDoubleStreamAttnProcessor())`.
 #[derive(Debug, Clone)]
 pub struct MageJointAttention {
-    to_q: Linear,
-    to_k: Linear,
-    to_v: Linear,
+    /// SC-18319 P4: the image stream's `to_q`/`to_k`/`to_v` behind one adapter/quant-aware packed
+    /// matrix. All three read the SAME activation (`stream.img`), which is what makes them fusable;
+    /// the text triple below is a second, independent projection because it reads `stream.txt`.
+    img_qkv: FusedQkvProjection,
     to_out: Linear,
-    add_q_proj: Linear,
-    add_k_proj: Linear,
-    add_v_proj: Linear,
+    /// The text stream's `add_q_proj`/`add_k_proj`/`add_v_proj`, likewise packed.
+    txt_qkv: FusedQkvProjection,
     to_add_out: Linear,
     norm_q: Array,
     norm_k: Array,
@@ -87,35 +87,33 @@ pub struct MageJointAttention {
 
 impl MageJointAttention {
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
-        for linear in [
-            &mut self.to_q,
-            &mut self.to_k,
-            &mut self.to_v,
-            &mut self.to_out,
-            &mut self.add_q_proj,
-            &mut self.add_k_proj,
-            &mut self.add_v_proj,
-            &mut self.to_add_out,
-        ] {
+        // The fused projections unfuse, quantize each base and re-pack — the packed matrix is built
+        // from the bases, so it is not a view of them.
+        self.img_qkv.quantize(bits, None)?;
+        self.txt_qkv.quantize(bits, None)?;
+        for linear in [&mut self.to_out, &mut self.to_add_out] {
             linear.quantize(bits)?;
         }
         Ok(())
     }
 
+    /// Counts LOGICAL projections, still eight — a packed triple is one matrix but three
+    /// projections, and `part_facts` reports each one's tier without unfusing (SC-18319).
     pub(crate) fn quantized_linear_count(&self) -> usize {
-        [
-            &self.to_q,
-            &self.to_k,
-            &self.to_v,
-            &self.to_out,
-            &self.add_q_proj,
-            &self.add_k_proj,
-            &self.add_v_proj,
-            &self.to_add_out,
-        ]
-        .into_iter()
-        .filter(|linear| linear.is_quantized())
-        .count()
+        let fused = [&self.img_qkv, &self.txt_qkv]
+            .into_iter()
+            .flat_map(|proj| {
+                [QkvPart::Q, QkvPart::K, QkvPart::V]
+                    .into_iter()
+                    .map(move |part| proj.part_facts(part).is_quantized)
+            })
+            .filter(|q| *q)
+            .count();
+        fused
+            + [&self.to_out, &self.to_add_out]
+                .into_iter()
+                .filter(|linear| linear.is_quantized())
+                .count()
     }
 
     /// Load from `{prefix}.{to_q,to_k,to_v,to_out.0,add_q_proj,add_k_proj,add_v_proj,to_add_out}`
@@ -135,14 +133,18 @@ impl MageJointAttention {
         let norm = |name: &str| -> Result<Array> {
             Ok(w.require(&format!("{prefix}.{name}.weight"))?.clone())
         };
+        // The fused triples take the bare `AdaptableLinear` (`Linear`'s cached in/out/dtype are never
+        // read for q/k/v — only `forward` and the adapter handle are), so they load through the same
+        // `quant::lin` auto-detecting loader `Linear::from_weights` uses internally.
+        let raw = |name: &str| crate::quant::lin(w, &format!("{prefix}.{name}"), true);
         Ok(Self {
-            to_q: lin("to_q")?,
-            to_k: lin("to_k")?,
-            to_v: lin("to_v")?,
+            img_qkv: FusedQkvProjection::new(raw("to_q")?, raw("to_k")?, raw("to_v")?),
             to_out: lin("to_out.0")?,
-            add_q_proj: lin("add_q_proj")?,
-            add_k_proj: lin("add_k_proj")?,
-            add_v_proj: lin("add_v_proj")?,
+            txt_qkv: FusedQkvProjection::new(
+                raw("add_q_proj")?,
+                raw("add_k_proj")?,
+                raw("add_v_proj")?,
+            ),
             to_add_out: lin("to_add_out")?,
             norm_q: norm("norm_q")?,
             norm_k: norm("norm_k")?,
@@ -165,16 +167,9 @@ impl MageJointAttention {
     }
 
     pub fn cast_weights(&mut self, dtype: Dtype) -> Result<()> {
-        for lin in [
-            &mut self.to_q,
-            &mut self.to_k,
-            &mut self.to_v,
-            &mut self.to_out,
-            &mut self.add_q_proj,
-            &mut self.add_k_proj,
-            &mut self.add_v_proj,
-            &mut self.to_add_out,
-        ] {
+        self.img_qkv.cast_weights(dtype)?;
+        self.txt_qkv.cast_weights(dtype)?;
+        for lin in [&mut self.to_out, &mut self.to_add_out] {
             lin.cast_weights(dtype)?;
         }
         for norm in [
@@ -229,23 +224,19 @@ impl MageJointAttention {
                 dtype: RopeDtype::RestoreInput,
                 ..RopeSpec::default()
             });
+        // SC-18319 P4 — one matmul when the pack is engaged, three concatenated forwards when it is
+        // not. `prepare` splits the `[1, tokens, 3 * dim]` result at the offsets a `Separate` source
+        // would have carried, and a matmul's output rows are independent of one another, so the two
+        // arms are bit-identical.
         let img = qkv::prepare(
-            QkvSource::Separate {
-                q: &self.to_q.forward(&stream.img)?,
-                k: &self.to_k.forward(&stream.img)?,
-                v: &self.to_v.forward(&stream.img)?,
-            },
+            QkvSource::Packed(&self.img_qkv.forward_packed(&stream.img)?),
             &img_spec,
         )?;
         let txt_spec = AttnPrepSpec::new(self.heads, self.head_dim).with_qk_norm(
             QkNormSpec::per_head(&self.norm_added_q, &self.norm_added_k, self.eps),
         );
         let txt = qkv::prepare(
-            QkvSource::Separate {
-                q: &self.add_q_proj.forward(&stream.txt)?,
-                k: &self.add_k_proj.forward(&stream.txt)?,
-                v: &self.add_v_proj.forward(&stream.txt)?,
-            },
+            QkvSource::Packed(&self.txt_qkv.forward_packed(&stream.txt)?),
             &txt_spec,
         )?;
 
@@ -329,17 +320,36 @@ impl MageJointAttention {
 /// Diffusers names the image output `to_out.0` (an `nn.Sequential`, Linear at index 0) and the text
 /// output `to_add_out`; the six input projections are bare.
 impl AdaptableHost for MageJointAttention {
+    /// The MUTATION half: a q/k/v path resolves through [`FusedQkvProjection::part_mut`], which
+    /// unfuses first, so an adapter installed here can never be stranded behind a stale packed
+    /// matrix.
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
         match path {
-            ["to_q"] => Some(self.to_q.adaptable_mut()),
-            ["to_k"] => Some(self.to_k.adaptable_mut()),
-            ["to_v"] => Some(self.to_v.adaptable_mut()),
+            ["to_q"] => self.img_qkv.part_mut(QkvPart::Q).ok(),
+            ["to_k"] => self.img_qkv.part_mut(QkvPart::K).ok(),
+            ["to_v"] => self.img_qkv.part_mut(QkvPart::V).ok(),
             ["to_out", "0"] => Some(self.to_out.adaptable_mut()),
-            ["add_q_proj"] => Some(self.add_q_proj.adaptable_mut()),
-            ["add_k_proj"] => Some(self.add_k_proj.adaptable_mut()),
-            ["add_v_proj"] => Some(self.add_v_proj.adaptable_mut()),
+            ["add_q_proj"] => self.txt_qkv.part_mut(QkvPart::Q).ok(),
+            ["add_k_proj"] => self.txt_qkv.part_mut(QkvPart::K).ok(),
+            ["add_v_proj"] => self.txt_qkv.part_mut(QkvPart::V).ok(),
             ["to_add_out"] => Some(self.to_add_out.adaptable_mut()),
             _ => None,
+        }
+    }
+
+    /// The PROBE half (SC-18319): the six fused paths answer from
+    /// [`FusedQkvProjection::part_facts`], reading the packed representation instead of dismantling
+    /// it. This matters most for `block_stream.rs`'s adapter capture, which walks EVERY path in
+    /// every block.
+    fn adaptable_facts(&mut self, path: &[&str]) -> Option<LinearFacts> {
+        match path {
+            ["to_q"] => Some(self.img_qkv.part_facts(QkvPart::Q)),
+            ["to_k"] => Some(self.img_qkv.part_facts(QkvPart::K)),
+            ["to_v"] => Some(self.img_qkv.part_facts(QkvPart::V)),
+            ["add_q_proj"] => Some(self.txt_qkv.part_facts(QkvPart::Q)),
+            ["add_k_proj"] => Some(self.txt_qkv.part_facts(QkvPart::K)),
+            ["add_v_proj"] => Some(self.txt_qkv.part_facts(QkvPart::V)),
+            _ => self.adaptable_mut(path).map(|l| LinearFacts::of(l)),
         }
     }
 

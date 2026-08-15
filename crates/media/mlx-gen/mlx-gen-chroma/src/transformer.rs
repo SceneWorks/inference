@@ -14,7 +14,7 @@
 //! backend f32 floor is ~1e-3, see the parity tests). The masked T5 encode that *builds* the
 //! sequence mask is sc-3838; the generate path is sc-3839.
 
-use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear, LinearFacts};
 use mlx_gen::attention::{sdpa_budgeted_bhsd, AttentionPlan};
 use mlx_gen::nn::{gated, gelu_tanh, silu};
 /// Re-exported so the model's denoise loop can enable the shared `mx.compile` fusion of the DiT's
@@ -23,8 +23,8 @@ use mlx_gen::nn::{gated, gelu_tanh, silu};
 /// drop (F-007) instead of leaking the render thread's setting into later work.
 pub use mlx_gen::nn::{set_compile_glue, CompileGlueGuard};
 use mlx_gen::qkv::{
-    self, AttnPrepSpec, NormDtype, QkNormSpec, QkvSource, RopeDtype, RopeSpec, RopeStyle,
-    RopeTables, RotationAxes, StreamOrder,
+    self, AttnPrepSpec, FusedQkvProjection, NormDtype, QkNormSpec, QkvPart, QkvSource, RopeDtype,
+    RopeSpec, RopeStyle, RopeTables, RotationAxes, StreamOrder,
 };
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
@@ -84,6 +84,13 @@ impl Lin {
 
     fn inner_mut(&mut self) -> &mut AdaptableLinear {
         &mut self.0
+    }
+
+    /// Unwrap to the bare [`AdaptableLinear`], for the q/k/v triples that now live inside a
+    /// [`FusedQkvProjection`] (SC-18319). `Lin` adds no state over its inner linear, so this is the
+    /// whole of it.
+    fn into_inner(self) -> AdaptableLinear {
+        self.0
     }
 }
 
@@ -293,13 +300,13 @@ impl Approximator {
 // ============================ blocks ============================
 
 struct DoubleAttn {
-    to_q: Lin,
-    to_k: Lin,
-    to_v: Lin,
+    /// SC-18319 P4: the image stream's `to_q`/`to_k`/`to_v` behind one adapter/quant-aware packed
+    /// matrix. All three read the SAME activation (`hidden`), which is the precondition for packing
+    /// them; the text triple is a second, independent projection because it reads `encoder`.
+    img_qkv: FusedQkvProjection,
     to_out: Lin,
-    add_q: Lin,
-    add_k: Lin,
-    add_v: Lin,
+    /// The text stream's `add_q_proj`/`add_k_proj`/`add_v_proj`, likewise packed.
+    txt_qkv: FusedQkvProjection,
     to_add_out: Lin,
     norm_q: Array,
     norm_k: Array,
@@ -312,13 +319,17 @@ struct DoubleAttn {
 impl DoubleAttn {
     fn load(w: &Weights, p: &str, cfg: &ChromaTransformerConfig) -> Result<Self> {
         Ok(Self {
-            to_q: Lin::load(w, &format!("{p}.to_q"))?,
-            to_k: Lin::load(w, &format!("{p}.to_k"))?,
-            to_v: Lin::load(w, &format!("{p}.to_v"))?,
+            img_qkv: FusedQkvProjection::new(
+                Lin::load(w, &format!("{p}.to_q"))?.into_inner(),
+                Lin::load(w, &format!("{p}.to_k"))?.into_inner(),
+                Lin::load(w, &format!("{p}.to_v"))?.into_inner(),
+            ),
             to_out: Lin::load(w, &format!("{p}.to_out.0"))?,
-            add_q: Lin::load(w, &format!("{p}.add_q_proj"))?,
-            add_k: Lin::load(w, &format!("{p}.add_k_proj"))?,
-            add_v: Lin::load(w, &format!("{p}.add_v_proj"))?,
+            txt_qkv: FusedQkvProjection::new(
+                Lin::load(w, &format!("{p}.add_q_proj"))?.into_inner(),
+                Lin::load(w, &format!("{p}.add_k_proj"))?.into_inner(),
+                Lin::load(w, &format!("{p}.add_v_proj"))?.into_inner(),
+            ),
             to_add_out: Lin::load(w, &format!("{p}.to_add_out"))?,
             norm_q: w.require(&format!("{p}.norm_q.weight"))?.clone(),
             norm_k: w.require(&format!("{p}.norm_k.weight"))?.clone(),
@@ -345,21 +356,16 @@ impl DoubleAttn {
         // rotates each stream and then concatenates. Both are expressed as a call-order choice over
         // the same two primitives: `prepare` with `RopeStyle::None`, then `join`, then `apply_rope`.
         let spec = chroma_spec(self.heads, hd, &self.norm_q, &self.norm_k, None);
+        // SC-18319 P4 — one matmul per stream when the pack is engaged, three concatenated forwards
+        // when it is not. `prepare` splits the packed result at the offsets a `Separate` source would
+        // have carried, and a matmul's output rows are independent, so the two arms are bit-identical.
         let img = qkv::prepare(
-            QkvSource::Separate {
-                q: &self.to_q.forward(hidden)?,
-                k: &self.to_k.forward(hidden)?,
-                v: &self.to_v.forward(hidden)?,
-            },
+            QkvSource::Packed(&self.img_qkv.forward_packed(hidden)?),
             &spec,
         )?;
         let txt_spec = chroma_spec(self.heads, hd, &self.norm_added_q, &self.norm_added_k, None);
         let txt = qkv::prepare(
-            QkvSource::Separate {
-                q: &self.add_q.forward(encoder)?,
-                k: &self.add_k.forward(encoder)?,
-                v: &self.add_v.forward(encoder)?,
-            },
+            QkvSource::Packed(&self.txt_qkv.forward_packed(encoder)?),
             &txt_spec,
         )?;
         let joint = StreamOrder::TextFirst.join(&img, &txt)?;
@@ -373,34 +379,45 @@ impl DoubleAttn {
     }
 
     fn quantize(&mut self, bits: i32) -> Result<()> {
-        for l in [
-            &mut self.to_q,
-            &mut self.to_k,
-            &mut self.to_v,
-            &mut self.to_out,
-            &mut self.add_q,
-            &mut self.add_k,
-            &mut self.add_v,
-            &mut self.to_add_out,
-        ] {
+        self.img_qkv.quantize(bits, None)?;
+        self.txt_qkv.quantize(bits, None)?;
+        for l in [&mut self.to_out, &mut self.to_add_out] {
             l.quantize(bits)?;
         }
         Ok(())
     }
 
-    /// Resolve a diffusers adapter sub-path (within `…attn.`) to its linear (sc-3842).
+    /// Resolve a diffusers adapter sub-path (within `…attn.`) to its linear (sc-3842) — the
+    /// **MUTATION** half. A q/k/v path goes through [`FusedQkvProjection::part_mut`], which unfuses
+    /// first, so an adapter installed here can never be stranded behind a stale packed matrix.
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
         Some(match path {
-            ["to_q"] => self.to_q.inner_mut(),
-            ["to_k"] => self.to_k.inner_mut(),
-            ["to_v"] => self.to_v.inner_mut(),
+            ["to_q"] => return self.img_qkv.part_mut(QkvPart::Q).ok(),
+            ["to_k"] => return self.img_qkv.part_mut(QkvPart::K).ok(),
+            ["to_v"] => return self.img_qkv.part_mut(QkvPart::V).ok(),
             ["to_out", "0"] => self.to_out.inner_mut(),
-            ["add_q_proj"] => self.add_q.inner_mut(),
-            ["add_k_proj"] => self.add_k.inner_mut(),
-            ["add_v_proj"] => self.add_v.inner_mut(),
+            ["add_q_proj"] => return self.txt_qkv.part_mut(QkvPart::Q).ok(),
+            ["add_k_proj"] => return self.txt_qkv.part_mut(QkvPart::K).ok(),
+            ["add_v_proj"] => return self.txt_qkv.part_mut(QkvPart::V).ok(),
             ["to_add_out"] => self.to_add_out.inner_mut(),
             _ => return None,
         })
+    }
+
+    /// The **PROBE** half (SC-18319): the six fused paths answer from
+    /// [`FusedQkvProjection::part_facts`], reading the packed representation instead of dismantling
+    /// it. `block_stream.rs`'s capture and verify walks hit EVERY path in every block, so without
+    /// this a window scan would unfuse the whole stack.
+    fn adaptable_facts(&mut self, path: &[&str]) -> Option<LinearFacts> {
+        match path {
+            ["to_q"] => Some(self.img_qkv.part_facts(QkvPart::Q)),
+            ["to_k"] => Some(self.img_qkv.part_facts(QkvPart::K)),
+            ["to_v"] => Some(self.img_qkv.part_facts(QkvPart::V)),
+            ["add_q_proj"] => Some(self.txt_qkv.part_facts(QkvPart::Q)),
+            ["add_k_proj"] => Some(self.txt_qkv.part_facts(QkvPart::K)),
+            ["add_v_proj"] => Some(self.txt_qkv.part_facts(QkvPart::V)),
+            _ => self.adaptable_mut(path).map(|l| LinearFacts::of(l)),
+        }
     }
 }
 
@@ -465,8 +482,12 @@ pub(crate) trait StreamBlock: Sized {
     const ADAPTER_PATHS: &'static [&'static str];
     /// Rebuild block `index` from a snapshot view.
     fn from_view(view: &Weights, index: usize, cfg: &ChromaTransformerConfig) -> Result<Self>;
-    /// Resolve a block-local dotted path to its adapter carrier.
+    /// Resolve a block-local dotted path to its adapter carrier — the **MUTATION** half.
     fn adapter_target(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear>;
+    /// The **PROBE** half of the same block-local surface (SC-18319). The block stream's capture and
+    /// verify walks visit every entry of [`ADAPTER_PATHS`](Self::ADAPTER_PATHS) on every window, so
+    /// they must ask through here rather than through `adapter_target`, which unfuses.
+    fn adapter_facts(&mut self, path: &[&str]) -> Option<LinearFacts>;
 }
 
 impl StreamBlock for DoubleBlock {
@@ -479,6 +500,10 @@ impl StreamBlock for DoubleBlock {
     fn adapter_target(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
         self.adaptable_mut(path)
     }
+
+    fn adapter_facts(&mut self, path: &[&str]) -> Option<LinearFacts> {
+        self.adaptable_facts(path)
+    }
 }
 
 impl StreamBlock for SingleBlock {
@@ -490,6 +515,10 @@ impl StreamBlock for SingleBlock {
 
     fn adapter_target(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
         self.adaptable_mut(path)
+    }
+
+    fn adapter_facts(&mut self, path: &[&str]) -> Option<LinearFacts> {
+        self.adaptable_facts(path)
     }
 }
 
@@ -572,12 +601,21 @@ impl DoubleBlock {
             _ => return None,
         })
     }
+
+    /// SC-18319 — an intermediate hop to a fused leaf MUST forward the probe, or the `adaptable_mut`
+    /// fallback takes over here and unfuses the attention below it.
+    pub(crate) fn adaptable_facts(&mut self, path: &[&str]) -> Option<LinearFacts> {
+        match path {
+            ["attn", rest @ ..] => self.attn.adaptable_facts(rest),
+            _ => self.adaptable_mut(path).map(|l| LinearFacts::of(l)),
+        }
+    }
 }
 
 struct SingleAttn {
-    to_q: Lin,
-    to_k: Lin,
-    to_v: Lin,
+    /// SC-18319 P4: one packed q/k/v. The single-stream block is a true self-attention, so all three
+    /// read the same `x`.
+    qkv: FusedQkvProjection,
     norm_q: Array,
     norm_k: Array,
     heads: i32,
@@ -587,9 +625,11 @@ struct SingleAttn {
 impl SingleAttn {
     fn load(w: &Weights, p: &str, cfg: &ChromaTransformerConfig) -> Result<Self> {
         Ok(Self {
-            to_q: Lin::load(w, &format!("{p}.to_q"))?,
-            to_k: Lin::load(w, &format!("{p}.to_k"))?,
-            to_v: Lin::load(w, &format!("{p}.to_v"))?,
+            qkv: FusedQkvProjection::new(
+                Lin::load(w, &format!("{p}.to_q"))?.into_inner(),
+                Lin::load(w, &format!("{p}.to_k"))?.into_inner(),
+                Lin::load(w, &format!("{p}.to_v"))?.into_inner(),
+            ),
             norm_q: w.require(&format!("{p}.norm_q.weight"))?.clone(),
             norm_k: w.require(&format!("{p}.norm_k.weight"))?.clone(),
             heads: cfg.num_attention_heads as i32,
@@ -608,11 +648,7 @@ impl SingleAttn {
         // QK-RMSNorm computed in f32 with the whole stream (including `v`) promoted, adjacent-pair
         // rotation (knob 2) applied head-major, and a shared q/k table (knob 6 off).
         let heads = qkv::prepare(
-            QkvSource::Separate {
-                q: &self.to_q.forward(x)?,
-                k: &self.to_k.forward(x)?,
-                v: &self.to_v.forward(x)?,
-            },
+            QkvSource::Packed(&self.qkv.forward_packed(x)?),
             &chroma_spec(
                 self.heads,
                 self.head_dim,
@@ -625,18 +661,27 @@ impl SingleAttn {
     }
 
     fn quantize(&mut self, bits: i32) -> Result<()> {
-        self.to_q.quantize(bits)?;
-        self.to_k.quantize(bits)?;
-        self.to_v.quantize(bits)
+        self.qkv.quantize(bits, None)
     }
 
+    /// The MUTATION half — see [`DoubleAttn::adaptable_mut`].
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
-        Some(match path {
-            ["to_q"] => self.to_q.inner_mut(),
-            ["to_k"] => self.to_k.inner_mut(),
-            ["to_v"] => self.to_v.inner_mut(),
-            _ => return None,
-        })
+        match path {
+            ["to_q"] => self.qkv.part_mut(QkvPart::Q).ok(),
+            ["to_k"] => self.qkv.part_mut(QkvPart::K).ok(),
+            ["to_v"] => self.qkv.part_mut(QkvPart::V).ok(),
+            _ => None,
+        }
+    }
+
+    /// The PROBE half — see [`DoubleAttn::adaptable_facts`].
+    fn adaptable_facts(&mut self, path: &[&str]) -> Option<LinearFacts> {
+        match path {
+            ["to_q"] => Some(self.qkv.part_facts(QkvPart::Q)),
+            ["to_k"] => Some(self.qkv.part_facts(QkvPart::K)),
+            ["to_v"] => Some(self.qkv.part_facts(QkvPart::V)),
+            _ => None,
+        }
     }
 }
 
@@ -692,6 +737,14 @@ impl SingleBlock {
             ["proj_out"] => self.proj_out.inner_mut(),
             _ => return None,
         })
+    }
+
+    /// SC-18319 — see [`DoubleBlock::adaptable_facts`].
+    pub(crate) fn adaptable_facts(&mut self, path: &[&str]) -> Option<LinearFacts> {
+        match path {
+            ["attn", rest @ ..] => self.attn.adaptable_facts(rest),
+            _ => self.adaptable_mut(path).map(|l| LinearFacts::of(l)),
+        }
     }
 }
 
@@ -1139,6 +1192,23 @@ impl AdaptableHost for ChromaTransformer {
             ["proj_out"] => Some(self.proj_out.inner_mut()),
             ["distilled_guidance_layer", rest @ ..] => self.approximator.adaptable_mut(rest),
             _ => None,
+        }
+    }
+
+    /// SC-18319 — forward the probe down to the two block stacks; see
+    /// the `DoubleBlock` twin below. Anything else falls through to the `adaptable_mut`
+    /// delegation, which is what the trait default does and is correct for a plain linear.
+    fn adaptable_facts(&mut self, path: &[&str]) -> Option<LinearFacts> {
+        match path {
+            ["transformer_blocks", n, rest @ ..] => self
+                .double_blocks
+                .get_mut(n.parse::<usize>().ok()?)?
+                .adaptable_facts(rest),
+            ["single_transformer_blocks", n, rest @ ..] => self
+                .single_blocks
+                .get_mut(n.parse::<usize>().ok()?)?
+                .adaptable_facts(rest),
+            _ => self.adaptable_mut(path).map(|l| LinearFacts::of(l)),
         }
     }
 

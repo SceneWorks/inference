@@ -69,7 +69,7 @@ use mlx_rs::ops::{
 };
 use mlx_rs::{Array, Dtype};
 
-use crate::adapters::AdaptableLinear;
+use crate::adapters::{AdaptableLinear, LinearFacts};
 use crate::nn::rope_rotate;
 use crate::{Error, Result};
 
@@ -916,11 +916,36 @@ pub enum NoFusion {
     BiasMismatch,
 }
 
+/// Which of the three projections a host's routing arm addresses — the selector for
+/// [`FusedQkvProjection::part_mut`] (mutate) and [`FusedQkvProjection::part_facts`] (probe).
+///
+/// Named rather than positional: the pack order is `[q | k | v]` on the output axis and a swapped
+/// index yields a *running* model with garbage attention and no shape error whenever the three share
+/// an out width — which is every non-GQA family here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QkvPart {
+    Q,
+    K,
+    V,
+}
+
+impl QkvPart {
+    /// The projection's position in the packed row order.
+    fn index(self) -> usize {
+        match self {
+            QkvPart::Q => 0,
+            QkvPart::K => 1,
+            QkvPart::V => 2,
+        }
+    }
+}
+
 /// Three separate q/k/v projections, each applying its own adapter stack.
 ///
 /// Boxed inside [`Backing`] so the enum is not sized by its larger variant: a `FusedQkvProjection`
 /// is held per attention block, and paying the split variant's footprint on every packed block would
 /// give back part of what packing is for.
+#[derive(Clone)]
 struct SplitQkv {
     q: AdaptableLinear,
     k: AdaptableLinear,
@@ -929,6 +954,7 @@ struct SplitQkv {
 
 /// The representation a [`FusedQkvProjection`] currently holds. **Exactly one of the two** — the
 /// packed matrix is not a cache over the bases, it *replaces* them.
+#[derive(Clone)]
 enum Backing {
     Split(Box<SplitQkv>),
     /// One packed `[q_out + k_out + v_out, in]` matrix plus the two split points.
@@ -981,7 +1007,10 @@ enum Backing {
 /// axis (axis 0) of the weight, the scales and the biases together, which keeps every row's own
 /// groups intact and every stored scale attached to exactly the codes it came from — the packed
 /// matrix dequantizes to the byte-identical concatenation of the three originals, and
-/// [`Self::unfuse`] inverts it by the same row ranges.
+/// [`Self::unfuse`] inverts it by the same row ranges. That byte-level claim is exact on every
+/// host and is asserted on the **tensors** (`qkv/tests.rs`'s
+/// `unfusing_recovers_the_three_bases_exactly`), not inferred from a forward — see
+/// [`Self::forward_packed`] for why a forward comparison is the weaker instrument.
 ///
 /// The guard is deliberately **stricter** than that argument requires: a triple is packed only when
 /// every part shares `bits` and `group_size`, every `in_features` is group-aligned (which the affine
@@ -1010,10 +1039,24 @@ enum Backing {
 /// and it is what proves in-process that the fused path is not inert. It is recorded from the
 /// forward rather than from construction because a diagnostic scope is per request while a model is
 /// loaded outside one.
+#[derive(Clone)]
 pub struct FusedQkvProjection {
     backing: Backing,
     /// Why the pack was refused, when it was. `None` while packed.
     refusal: Option<NoFusion>,
+}
+
+impl std::fmt::Debug for FusedQkvProjection {
+    /// Reports the live representation, not the weights: which backing is held, the packed shape when
+    /// there is one, and the refusal when there is not. Hand-written because [`AdaptableLinear`] is not
+    /// `Debug` (an `Array` would dump its buffer).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FusedQkvProjection")
+            .field("fused", &self.fusion_engaged())
+            .field("packed_shape", &self.packed_shape())
+            .field("refusal", &self.refusal)
+            .finish()
+    }
 }
 
 impl FusedQkvProjection {
@@ -1115,6 +1158,64 @@ impl FusedQkvProjection {
         }
     }
 
+    /// **The mutation half** of a host's `to_q`/`to_k`/`to_v` routing — one projection, with the
+    /// same unpack-first contract as [`Self::parts_mut`]. A family's
+    /// [`AdaptableHost::adaptable_mut`](crate::adapters::AdaptableHost::adaptable_mut) arm resolves
+    /// through here, so installing an adapter leaves the block split and a later [`Self::repack`]
+    /// refuses while that adapter is live.
+    pub fn part_mut(&mut self, part: QkvPart) -> Result<&mut AdaptableLinear> {
+        self.unfuse()?;
+        match &mut self.backing {
+            Backing::Split(p) => Ok(match part {
+                QkvPart::Q => &mut p.q,
+                QkvPart::K => &mut p.k,
+                QkvPart::V => &mut p.v,
+            }),
+            Backing::Packed { .. } => unreachable!("unfuse leaves the split backing"),
+        }
+    }
+
+    /// **The probe half** — one projection's [`LinearFacts`] **without unfusing**, the answer a
+    /// family's
+    /// [`AdaptableHost::adaptable_facts`](crate::adapters::AdaptableHost::adaptable_facts) arm hands
+    /// back (SC-18319).
+    ///
+    /// While packed the facts are *derived*, never sliced: each part's `out` is its row range
+    /// (`splits` is exactly the row concatenation the pack performed), `in` is the shared input
+    /// width, and `is_quantized` / bias-presence are the packed matrix's own — because packing
+    /// carries its parts' quantization spec verbatim and concatenates the dense bias on the same
+    /// axis. `has_live_adapters` is `false` by construction: the pack predicate refuses a triple carrying
+    /// any live adapter, so a *packed* backing is itself the proof that none is installed.
+    ///
+    /// While split it is the part's own snapshot, so the two representations answer identically —
+    /// which is what makes a probe invisible to its caller.
+    pub fn part_facts(&self, part: QkvPart) -> LinearFacts {
+        let idx = part.index();
+        match &self.backing {
+            Backing::Split(p) => LinearFacts::of(match part {
+                QkvPart::Q => &p.q,
+                QkvPart::K => &p.k,
+                QkvPart::V => &p.v,
+            }),
+            Backing::Packed { linear, splits } => {
+                let shape = linear.base_shape();
+                let (rows, inp) = (shape[0], shape[1]);
+                let bounds = [0, splits[0], splits[1], rows];
+                let out = bounds[idx + 1] - bounds[idx];
+                LinearFacts {
+                    base_shape: vec![out, inp],
+                    is_quantized: linear.is_quantized(),
+                    // A packed backing *is* the no-adapter proof — `try_pack` refuses a triple
+                    // carrying any live adapter, and `parts_mut`/`part_mut` (the only route to an
+                    // installer) leave the backing split. So neither count can be non-zero here.
+                    has_live_adapters: false,
+                    adapter_count: 0,
+                    bias_shape: linear.bias().map(|_| vec![out]),
+                }
+            }
+        }
+    }
+
     /// Quantize all three bases and re-pack.
     pub fn quantize(&mut self, bits: i32, group_size: Option<i32>) -> Result<()> {
         {
@@ -1141,9 +1242,23 @@ impl FusedQkvProjection {
 
     /// One `[.., q_out + k_out + v_out]` projection output, ready for [`QkvSource::Packed`].
     ///
-    /// Packed: one matmul. Split: three forwards concatenated — **bit-identically**, because the
-    /// packed matrix is the row-wise concatenation of the three bases and a matmul's rows are
-    /// independent.
+    /// Packed: one matmul. Split: three forwards concatenated. The two are **algebraically
+    /// identical** — the packed matrix is the row-wise concatenation of the three bases and a
+    /// matmul's output rows are independent — and they are bit-identical whenever MLX selects the
+    /// same Metal GEMM kernel for both output widths.
+    ///
+    /// They are **not** bit-identical in general, and that is a property of the backend rather than
+    /// of this type: MLX chooses its GEMM tile shape (and therefore its accumulation order) from
+    /// `(M, N, K)`, the two arms differ in `N` by construction, and float addition is not
+    /// associative. The self-hosted macOS 26.2 NAX build agrees to the bit across every geometry
+    /// this tree ships; hosted CI (`macos-15-arm64`, `MACOSX_DEPLOYMENT_TARGET=15.0`) compiles a
+    /// different kernel set and can land a few ULP apart. `qkv/tests.rs`'s `agree` helper is where
+    /// that bound lives, and it is set far below what a *slicing* defect would produce, so a wrong
+    /// row range still fails loudly.
+    ///
+    /// The byte-level guarantee this feature actually rests on is one level down and is exact
+    /// everywhere: the packed **tensors** are the concatenation of the parts' tensors, and
+    /// [`Self::unfuse`] recovers each part byte-for-byte.
     pub fn forward_packed(&self, x: &Array) -> Result<Array> {
         match &self.backing {
             Backing::Packed { linear, .. } => {
@@ -1466,7 +1581,9 @@ pub const EXEMPTIONS: &[Exemption] = &[
         path: "mlx-gen-sana/src/transformer.rs",
         deviation: "`attn1` is ReLU **linear** attention — no softmax and no score tensor, so it is \
                     not SDPA at all; `attn2` hand-rolls matmul→mask→softmax→matmul for a chunked \
-                    mask. No RoPE anywhere.",
+                    mask. No RoPE anywhere. This exempts the PROLOGUE only: `attn1`'s q/k/v are \
+                    ordinary `AdaptableLinear`s reading one stream and DO go through \
+                    `FusedQkvProjection` (SC-18319 P4). `attn2` is cross-attention and must not.",
     },
     Exemption {
         path: "mlx-gen-seedvr2/src/dit.rs",

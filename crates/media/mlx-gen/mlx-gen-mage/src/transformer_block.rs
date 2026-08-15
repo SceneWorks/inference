@@ -26,7 +26,7 @@ use mlx_rs::fast::layer_norm;
 use mlx_rs::ops::split;
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
+use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear, LinearFacts};
 use mlx_gen::attention::AttentionPlan;
 use mlx_gen::weights::Weights;
 use mlx_gen::{nn, Error, Result};
@@ -212,6 +212,16 @@ impl AdaptableHost for MageTransformerBlock {
             ["img_mlp", rest @ ..] => self.img_mlp.adaptable_mut(rest),
             ["txt_mlp", rest @ ..] => self.txt_mlp.adaptable_mut(rest),
             _ => None,
+        }
+    }
+
+    /// SC-18319 — an intermediate hop on the way to a fused leaf MUST forward the probe; the trait's
+    /// default would delegate to `adaptable_mut` here and unfuse the attention below it. This block
+    /// is walked path-by-path by `block_stream.rs`'s adapter capture on every window.
+    fn adaptable_facts(&mut self, path: &[&str]) -> Option<LinearFacts> {
+        match path {
+            ["attn", rest @ ..] => self.attn.adaptable_facts(rest),
+            _ => self.adaptable_mut(path).map(|l| LinearFacts::of(l)),
         }
     }
 

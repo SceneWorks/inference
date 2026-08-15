@@ -14,9 +14,11 @@ use mlx_rs::ops::{add, concatenate_axis, multiply, zeros_dtype};
 use mlx_rs::transforms::checkpoint;
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
+use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear, LinearFacts};
 use mlx_gen::nn::{gelu_exact, TextRope, TokenEmbedding};
-use mlx_gen::qkv::{self, AttnPrepSpec, QkNormSpec, QkvSource, RopeSpec, RopeStyle, RopeTables};
+use mlx_gen::qkv::{self, AttnPrepSpec, QkNormSpec, QkvPart, RopeSpec, RopeStyle, RopeTables};
+
+use crate::transformer::Qkv;
 use mlx_gen::weights::{join, Weights};
 use mlx_gen::Result;
 
@@ -32,9 +34,11 @@ type Rope<'a> = (&'a Array, &'a Array);
 /// `AnimaTextConditionerAttention`: q/k/v/o projections (no bias), per-head q/k RMSNorm (eps 1e-6),
 /// half-split RoPE. Query positions and key positions can differ (cross-attn: target vs source).
 struct Attention {
-    q_proj: AdaptableLinear,
-    k_proj: AdaptableLinear,
-    v_proj: AdaptableLinear,
+    /// SC-18319 P4 — see [`crate::transformer::Qkv`]. `self_attn` is packed; `cross_attn` is not,
+    /// and cannot be: its `k`/`v` read the Qwen3 encoder stream while `q` reads the T5 target
+    /// stream. Both are 1024 wide here, so `try_pack` would happily accept the triple — the refusal
+    /// has to be the type, which is what `Qkv::Cross` is.
+    qkv: Qkv,
     o_proj: AdaptableLinear,
     q_norm: Array,
     k_norm: Array,
@@ -51,12 +55,24 @@ struct Attention {
 }
 
 impl Attention {
-    fn from_weights(w: &Weights, prefix: &str, cfg: &ConditionerConfig) -> Result<Self> {
+    fn from_weights(
+        w: &Weights,
+        prefix: &str,
+        cfg: &ConditionerConfig,
+        self_attention: bool,
+    ) -> Result<Self> {
         let hd = cfg.head_dim() as i32;
+        let (q, k, v) = (
+            lin(w, &join(prefix, "q_proj"), false)?,
+            lin(w, &join(prefix, "k_proj"), false)?,
+            lin(w, &join(prefix, "v_proj"), false)?,
+        );
         Ok(Self {
-            q_proj: lin(w, &join(prefix, "q_proj"), false)?,
-            k_proj: lin(w, &join(prefix, "k_proj"), false)?,
-            v_proj: lin(w, &join(prefix, "v_proj"), false)?,
+            qkv: if self_attention {
+                Qkv::self_attn(q, k, v)
+            } else {
+                Qkv::cross_attn(q, k, v)
+            },
             o_proj: lin(w, &join(prefix, "o_proj"), false)?,
             q_norm: w.require(&join(prefix, "q_norm.weight"))?.clone(),
             k_norm: w.require(&join(prefix, "k_norm.weight"))?.clone(),
@@ -83,6 +99,13 @@ impl Attention {
         k_rope: Rope,
     ) -> Result<Array> {
         let kv_src = encoder.unwrap_or(hidden);
+        // SC-18319 P4 — see the DiT twin: a fused (self) representation projects from ONE stream.
+        if self.qkv.is_self() && encoder.is_some() {
+            return Err(mlx_gen::Error::Msg(
+                "anima conditioner: a self-attention (fused q/k/v) was given an encoder stream"
+                    .into(),
+            ));
+        }
 
         // SC-18319 — the shared prologue. The conditioner is **knob 6's reference case**: `q_rope`
         // and `k_rope` are genuinely different position tables (cross-attention positions the query
@@ -99,14 +122,8 @@ impl Attention {
                 k: Some(RopeTables::new(k_rope.0, k_rope.1)),
                 ..RopeSpec::default()
             });
-        let heads = qkv::prepare(
-            QkvSource::Separate {
-                q: &self.q_proj.forward(hidden)?,
-                k: &self.k_proj.forward(kv_src)?,
-                v: &self.v_proj.forward(kv_src)?,
-            },
-            &spec,
-        )?;
+        let projected = self.qkv.project(hidden, kv_src)?;
+        let heads = qkv::prepare(projected.source(), &spec)?;
         let (q, k, v) = (heads.q, heads.k, heads.v);
         let o = if self.ckpt_sdpa {
             // sc-10576: checkpoint the SDPA (q/k/v threaded, scale captured) — recompute the seq²
@@ -143,9 +160,9 @@ impl Block {
     fn from_weights(w: &Weights, prefix: &str, cfg: &ConditionerConfig) -> Result<Self> {
         Ok(Self {
             norm_self_attn: w.require(&join(prefix, "norm_self_attn.weight"))?.clone(),
-            self_attn: Attention::from_weights(w, &join(prefix, "self_attn"), cfg)?,
+            self_attn: Attention::from_weights(w, &join(prefix, "self_attn"), cfg, true)?,
             norm_cross_attn: w.require(&join(prefix, "norm_cross_attn.weight"))?.clone(),
-            cross_attn: Attention::from_weights(w, &join(prefix, "cross_attn"), cfg)?,
+            cross_attn: Attention::from_weights(w, &join(prefix, "cross_attn"), cfg, false)?,
             norm_mlp: w.require(&join(prefix, "norm_mlp.weight"))?.clone(),
             mlp_in: lin(w, &join(prefix, "mlp.0"), true)?,
             mlp_out: lin(w, &join(prefix, "mlp.2"), true)?,
@@ -329,11 +346,21 @@ impl AnimaTextConditioner {
 impl AdaptableHost for Attention {
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
         match path {
-            ["q_proj"] => Some(&mut self.q_proj),
-            ["k_proj"] => Some(&mut self.k_proj),
-            ["v_proj"] => Some(&mut self.v_proj),
+            ["q_proj"] => self.qkv.part_mut(QkvPart::Q),
+            ["k_proj"] => self.qkv.part_mut(QkvPart::K),
+            ["v_proj"] => self.qkv.part_mut(QkvPart::V),
             ["o_proj"] => Some(&mut self.o_proj),
             _ => None,
+        }
+    }
+
+    /// The PROBE half (SC-18319). See the DiT twin.
+    fn adaptable_facts(&mut self, path: &[&str]) -> Option<LinearFacts> {
+        match path {
+            ["q_proj"] => Some(self.qkv.part_facts(QkvPart::Q)),
+            ["k_proj"] => Some(self.qkv.part_facts(QkvPart::K)),
+            ["v_proj"] => Some(self.qkv.part_facts(QkvPart::V)),
+            _ => self.adaptable_mut(path).map(|l| LinearFacts::of(l)),
         }
     }
 
@@ -414,10 +441,12 @@ mod structural {
         pub(crate) fn structural(cfg: ConditionerConfig) -> Self {
             let heads = cfg.num_attention_heads as i32;
             let head_dim = cfg.head_dim() as i32;
-            let attn = || Attention {
-                q_proj: ph_lin(),
-                k_proj: ph_lin(),
-                v_proj: ph_lin(),
+            let attn = |self_attention: bool| Attention {
+                qkv: if self_attention {
+                    Qkv::self_attn(ph_lin(), ph_lin(), ph_lin())
+                } else {
+                    Qkv::cross_attn(ph_lin(), ph_lin(), ph_lin())
+                },
                 o_proj: ph_lin(),
                 q_norm: ph_norm(),
                 k_norm: ph_norm(),
@@ -430,9 +459,9 @@ mod structural {
             let blocks = (0..cfg.num_layers)
                 .map(|_| Block {
                     norm_self_attn: ph_norm(),
-                    self_attn: attn(),
+                    self_attn: attn(true),
                     norm_cross_attn: ph_norm(),
-                    cross_attn: attn(),
+                    cross_attn: attn(false),
                     norm_mlp: ph_norm(),
                     mlp_in: ph_lin(),
                     mlp_out: ph_lin(),
@@ -479,12 +508,26 @@ pub(crate) mod synthetic {
             Array::ones::<f32>(&[d]).unwrap()
         }
 
-        fn attn(&mut self, heads: i32, head_dim: i32, kv_in: i32, eps: f32) -> Attention {
+        fn attn(
+            &mut self,
+            heads: i32,
+            head_dim: i32,
+            kv_in: i32,
+            eps: f32,
+            self_attention: bool,
+        ) -> Attention {
             let d = heads * head_dim;
+            let (q, k, v) = (
+                self.lin(d, d, false),
+                self.lin(d, kv_in, false),
+                self.lin(d, kv_in, false),
+            );
             Attention {
-                q_proj: self.lin(d, d, false),
-                k_proj: self.lin(d, kv_in, false),
-                v_proj: self.lin(d, kv_in, false),
+                qkv: if self_attention {
+                    Qkv::self_attn(q, k, v)
+                } else {
+                    Qkv::cross_attn(q, k, v)
+                },
                 o_proj: self.lin(d, d, false),
                 q_norm: self.norm(head_dim),
                 k_norm: self.norm(head_dim),
@@ -519,9 +562,11 @@ pub(crate) mod synthetic {
             let blocks = (0..cfg.num_layers)
                 .map(|_| Block {
                     norm_self_attn: r.norm(d),
-                    self_attn: r.attn(heads, head_dim, d, eps), // self: kv from hidden (model_dim)
+                    // self: kv from hidden (model_dim)
+                    self_attn: r.attn(heads, head_dim, d, eps, true),
                     norm_cross_attn: r.norm(d),
-                    cross_attn: r.attn(heads, head_dim, src, eps), // cross: kv from Qwen source_dim
+                    // cross: kv from Qwen source_dim
+                    cross_attn: r.attn(heads, head_dim, src, eps, false),
                     norm_mlp: r.norm(d),
                     mlp_in: r.lin(ff, d, true),
                     mlp_out: r.lin(d, ff, true),

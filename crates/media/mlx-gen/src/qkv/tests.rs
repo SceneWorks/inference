@@ -633,6 +633,59 @@ fn norming_before_and_after_the_sdpa_transpose_agrees_bit_for_bit() {
 
 // ── the fused projection ─────────────────────────────────────────────────────────────────────
 
+/// Compare two arrays that were produced by **differently shaped matmuls over the same numbers** —
+/// the fused arm's one `[.., 3*out]` GEMM against the unfused arm's three `[.., out]` GEMMs.
+///
+/// Bit-exactness is asserted whenever it holds, and it does hold on the self-hosted macOS 26.2 NAX
+/// build. It is **not** guaranteed in general: MLX picks its Metal GEMM kernel (and therefore its
+/// tile shape and accumulation order) from `(M, N, K)`, and the two arms differ in `N` by
+/// construction. Hosted CI (`macos-15-arm64`, `MACOSX_DEPLOYMENT_TARGET=15.0`) compiles a different
+/// kernel set from the dev host's 26.2 NAX build, and float addition is not associative, so the two
+/// arms can land a few ULP apart there.
+///
+/// The bound below is what separates the two failure modes, which is the whole point of this helper:
+///
+/// * **kernel variance** perturbs the last bits — a relative error at ULP scale;
+/// * **a slicing bug** (a wrong row range, a stride misread, an off-by-one partition) returns
+///   *different rows of the weight*, which is an O(1) relative error, not O(ulp).
+///
+/// So a genuine defect still fails this assertion loudly, and the message reports the magnitude so
+/// the next reader can tell the two apart without re-deriving anything.
+///
+/// The byte-level claim this feature actually rests on — that packing concatenates on the output
+/// axis and `unfuse` inverts it exactly — is asserted directly on the **tensors** by
+/// [`unfusing_recovers_the_three_bases_exactly`], with no matmul in the way.
+#[track_caller]
+fn agree(a: &Array, b: &Array, what: &str) {
+    assert_eq!(a.shape(), b.shape(), "{what}: shape");
+    assert_eq!(a.dtype(), b.dtype(), "{what}: dtype");
+    if array_eq(a, b, None).unwrap().item::<bool>() {
+        return;
+    }
+    let af = a.as_dtype(Dtype::Float32).unwrap();
+    let bf = b.as_dtype(Dtype::Float32).unwrap();
+    let diff = mlx_rs::ops::abs(mlx_rs::ops::subtract(&af, &bf).unwrap()).unwrap();
+    let max_abs = mlx_rs::ops::max(&diff, None).unwrap().item::<f32>();
+    let scale = mlx_rs::ops::max(mlx_rs::ops::abs(&af).unwrap(), None)
+        .unwrap()
+        .item::<f32>()
+        .max(f32::MIN_POSITIVE);
+    let rel = max_abs / scale;
+    // One ULP of bf16 is ~2^-8 relative; of f32 ~2^-23. Allow a handful of accumulation steps'
+    // worth, and nothing remotely close to "read the wrong rows".
+    let tol = if a.dtype() == Dtype::Bfloat16 {
+        1e-2
+    } else {
+        1e-5
+    };
+    assert!(
+        rel <= tol,
+        "{what}: the fused and unfused arms disagree by rel={rel:e} (max|delta|={max_abs:e}, \
+         scale={scale:e}), far beyond Metal GEMM kernel variance — this is a SLICING defect (a \
+         wrong row range or a stride misread), not accumulation order"
+    );
+}
+
 fn dense_parts(inp: i32, q_out: i32, kv_out: i32, bias: bool) -> [AdaptableLinear; 3] {
     let mk = |out: i32, scale: f32| {
         AdaptableLinear::dense(
@@ -712,11 +765,13 @@ fn fused_and_unfused_are_bit_exact_and_the_toggle_is_not_inert() {
             "bias={bias}: control"
         );
 
-        // The invariant: fused == unfused, exactly.
+        // The invariant: fused == unfused. Bit-exact where the Metal GEMM kernel is the same for
+        // both output widths; see `agree` for why that is asserted with a bound rather than
+        // assumed, and what a real slicing defect looks like against it.
         let (fq, fk, fv) = fused.forward(&x).unwrap();
-        assert!(exact(&rq, &fq), "bias={bias}: q");
-        assert!(exact(&rk, &fk), "bias={bias}: k");
-        assert!(exact(&rv, &fv), "bias={bias}: v");
+        agree(&rq, &fq, &format!("bias={bias}: q"));
+        agree(&rk, &fk, &format!("bias={bias}: k"));
+        agree(&rv, &fv, &format!("bias={bias}: v"));
 
         // Proof 2 — the activation receipt distinguishes the arms.
         let report = scope.finish();
@@ -764,9 +819,15 @@ fn forward_packed_matches_the_concatenated_separate_forwards() {
     };
     let (q, k, v) = unfused.forward(&x).unwrap();
     let reference = concatenate_axis(&[&q, &k, &v], 2).unwrap();
+    // The unfused arm concatenates its own three forwards, so this half IS bit-exact.
     assert!(exact(&unfused.forward_packed(&x).unwrap(), &reference));
     assert!(fused.fusion_engaged());
-    assert!(exact(&fused.forward_packed(&x).unwrap(), &reference));
+    // The fused arm runs ONE wider GEMM — see `agree`.
+    agree(
+        &fused.forward_packed(&x).unwrap(),
+        &reference,
+        "forward_packed",
+    );
 }
 
 /// The packed matrix is the SOLE retained copy of the three bases, so `unfuse` must recover them
@@ -789,12 +850,75 @@ fn unfusing_recovers_the_three_bases_exactly() {
 
         fused.unfuse().unwrap();
         assert_eq!(fused.packed_shape(), None);
-        let split = fused.forward(&x).unwrap();
-        assert!(exact(&packed.0, &split.0), "quant={quant:?}: q");
-        assert!(exact(&packed.1, &split.1), "quant={quant:?}: k");
-        assert!(exact(&packed.2, &split.2), "quant={quant:?}: v");
 
-        // …and re-packing returns to the identical numbers, so the round trip is closed.
+        // **The claim, asserted on the TENSORS.** `try_pack` concatenates on the output axis and
+        // `split_parts` slices at exactly those row ranges, so every recovered base must be
+        // byte-identical to the one that went in — dense weight and bias, and on a packed tier the
+        // codes, the scales, the affine biases and the declared `(bits, group)` too. This is the
+        // property the effective-bits argument rests on, and unlike an output comparison it has no
+        // matmul in the way, so it is exact on every host.
+        let reference = dense_parts(128, 128, 64, true);
+        let mut reference: Vec<AdaptableLinear> = reference.into_iter().collect();
+        if let Some(bits) = quant {
+            for r in reference.iter_mut() {
+                r.quantize(bits, Some(64)).unwrap();
+            }
+        }
+        for (i, name) in ["q", "k", "v"].iter().enumerate() {
+            let got = fused.part_mut(match i {
+                0 => QkvPart::Q,
+                1 => QkvPart::K,
+                _ => QkvPart::V,
+            });
+            let got = got.unwrap();
+            let want = &reference[i];
+            assert_eq!(
+                got.base_shape(),
+                want.base_shape(),
+                "quant={quant:?}: {name} shape"
+            );
+            assert_eq!(
+                got.is_quantized(),
+                want.is_quantized(),
+                "quant={quant:?}: {name} tier"
+            );
+            match (got.dense_weight(), want.dense_weight()) {
+                (Some((gw, gb)), Some((ww, wb))) => {
+                    assert!(exact(gw, ww), "quant={quant:?}: {name} dense weight");
+                    match (gb, wb) {
+                        (Some(gb), Some(wb)) => {
+                            assert!(exact(gb, wb), "quant={quant:?}: {name} dense bias")
+                        }
+                        (None, None) => {}
+                        _ => panic!("quant={quant:?}: {name} bias presence"),
+                    }
+                }
+                (None, None) => {
+                    let (gw, gs, gbi, gb, ggrp, gbits) = got.quantized_params().unwrap();
+                    let (ww, ws, wbi, wb, wgrp, wbits) = want.quantized_params().unwrap();
+                    assert!(exact(gw, ww), "quant={quant:?}: {name} codes");
+                    assert!(exact(gs, ws), "quant={quant:?}: {name} scales");
+                    assert!(exact(gbi, wbi), "quant={quant:?}: {name} affine biases");
+                    assert!(
+                        exact(gb.unwrap(), wb.unwrap()),
+                        "quant={quant:?}: {name} dense bias"
+                    );
+                    assert_eq!((ggrp, gbits), (wgrp, wbits), "quant={quant:?}: {name} spec");
+                }
+                _ => panic!("quant={quant:?}: {name} changed tier across the unfuse"),
+            }
+        }
+
+        // The forwards agree too — see `agree` for why that comparison is bounded rather than
+        // bit-exact while the tensor comparison above is not.
+        let split = fused.forward(&x).unwrap();
+        agree(&packed.0, &split.0, &format!("quant={quant:?}: q"));
+        agree(&packed.1, &split.1, &format!("quant={quant:?}: k"));
+        agree(&packed.2, &split.2, &format!("quant={quant:?}: v"));
+
+        // …and re-packing returns to the identical numbers, so the round trip is closed. This arm
+        // IS bit-exact by construction: both sides are the same packed representation, hence the
+        // same matmul shape.
         fused.repack();
         assert!(fused.fusion_engaged(), "quant={quant:?}: repack");
         let again = fused.forward(&x).unwrap();
@@ -911,9 +1035,9 @@ fn quantized_fusion_is_bit_exact_and_preserves_effective_bits() {
 
         let off = unfused.forward(&x).unwrap();
         let on = fused.forward(&x).unwrap();
-        assert!(exact(&off.0, &on.0), "Q{bits}: q");
-        assert!(exact(&off.1, &on.1), "Q{bits}: k");
-        assert!(exact(&off.2, &on.2), "Q{bits}: v");
+        agree(&off.0, &on.0, &format!("Q{bits}: q"));
+        agree(&off.1, &on.1, &format!("Q{bits}: k"));
+        agree(&off.2, &on.2, &format!("Q{bits}: v"));
 
         // Effective bits: the packed matrix declares the same (bits, group) as its parts, and its
         // logical shape has exactly the summed rows — no re-quantization, no regrouping.
@@ -1050,4 +1174,560 @@ fn every_structural_exemption_carries_a_specific_justification() {
     let before = paths.len();
     paths.dedup();
     assert_eq!(before, paths.len(), "duplicate exemption entries");
+}
+
+// ── the newly adopted families (SC-18319 P4) ─────────────────────────────────────────────────
+
+/// One adopted family's **production** projection geometry, as surveyed from its own config and
+/// offline packer. `inp`/`out` are the weight's real `[out, in]`; `group` is the family's own
+/// quantization group size.
+struct FamilyGeometry {
+    family: &'static str,
+    /// Which triple — a family with two joint streams contributes two rows.
+    stream: &'static str,
+    inp: i32,
+    out: i32,
+    group: i32,
+    /// Whether the family's q/k/v carry a dense bias (SD3/Mage/Chroma do; SANA/Anima do not).
+    bias: bool,
+}
+
+/// Every triple this story moved onto [`FusedQkvProjection`], at the width its checkpoint actually
+/// ships. The arithmetic in the table's own doc is asserted by
+/// [`every_adopted_family_geometry_is_group_aligned`] rather than trusted.
+const ADOPTED: &[FamilyGeometry] = &[
+    // SD3.5 Large: hidden = 38 heads x 64 = 2432, group 64 (`mlx-gen-sd3/src/transformer.rs`).
+    FamilyGeometry {
+        family: "sd3-large",
+        stream: "image",
+        inp: 2432,
+        out: 2432,
+        group: 64,
+        bias: true,
+    },
+    FamilyGeometry {
+        family: "sd3-large",
+        stream: "text",
+        inp: 2432,
+        out: 2432,
+        group: 64,
+        bias: true,
+    },
+    // SD3.5 Medium: hidden = 24 x 64 = 1536; `attn2` (MMDiT-X dual attention) is the same width.
+    FamilyGeometry {
+        family: "sd3-medium",
+        stream: "attn2",
+        inp: 1536,
+        out: 1536,
+        group: 64,
+        bias: true,
+    },
+    // Mage-Flow: hidden 3072 = 24 heads x 128, group 64 (`mlx-gen-mage/src/quant.rs`).
+    FamilyGeometry {
+        family: "mage",
+        stream: "image",
+        inp: 3072,
+        out: 3072,
+        group: 64,
+        bias: true,
+    },
+    FamilyGeometry {
+        family: "mage",
+        stream: "text",
+        inp: 3072,
+        out: 3072,
+        group: 64,
+        bias: true,
+    },
+    // Chroma: inner 3072 = 24 x 128, group 64. Double blocks carry two streams, single blocks one.
+    FamilyGeometry {
+        family: "chroma",
+        stream: "double-image",
+        inp: 3072,
+        out: 3072,
+        group: 64,
+        bias: true,
+    },
+    FamilyGeometry {
+        family: "chroma",
+        stream: "single",
+        inp: 3072,
+        out: 3072,
+        group: 64,
+        bias: true,
+    },
+    // Anima DiT self-attention: hidden 2048 = 16 x 128, group 64, bias-free.
+    FamilyGeometry {
+        family: "anima-dit",
+        stream: "self_attn",
+        inp: 2048,
+        out: 2048,
+        group: 64,
+        bias: false,
+    },
+    // Anima conditioner self-attention: model_dim 1024 = 16 x 64, bias-free (and always dense).
+    FamilyGeometry {
+        family: "anima-cond",
+        stream: "self_attn",
+        inp: 1024,
+        out: 1024,
+        group: 64,
+        bias: false,
+    },
+    // SANA 1600M attn1: inner 2240 = 70 heads x 32, group 64 (`mlx-gen-sana/src/quant.rs`).
+    // 2240 = 64 * 35 -- aligned on both axes despite the unusual head_dim.
+    FamilyGeometry {
+        family: "sana",
+        stream: "attn1",
+        inp: 2240,
+        out: 2240,
+        group: 64,
+        bias: false,
+    },
+];
+
+/// The group-alignment arithmetic each family's adoption rests on, checked rather than asserted in
+/// prose — including the **fused** row count, which is the number `try_pack` will actually see and
+/// the one a family could get wrong while each individual projection still looked fine.
+///
+/// The negative control is Boogu, whose kv `out = 840` is deliberately *not* group-aligned at its
+/// own `GROUP_SIZE = 32`; it must fail the very predicate every row above passes.
+#[test]
+fn every_adopted_family_geometry_is_group_aligned() {
+    for g in ADOPTED {
+        let who = format!("{}/{}", g.family, g.stream);
+        assert_eq!(g.inp % g.group, 0, "{who}: in {} % {}", g.inp, g.group);
+        assert_eq!(g.out % g.group, 0, "{who}: out {} % {}", g.out, g.group);
+        assert_eq!(
+            (3 * g.out) % g.group,
+            0,
+            "{who}: the FUSED out {} must stay group-aligned",
+            3 * g.out
+        );
+    }
+    // Negative control -- Boogu's real numbers, which must NOT satisfy the same predicate.
+    assert_ne!(840 % 32, 0, "boogu kv out 840 is the misaligned case");
+    assert_ne!(120 % 32, 0, "boogu head_dim 120 is the misaligned case");
+}
+
+/// **The per-family bit-exactness fixture**, at each adopted family's production projection width,
+/// run at **both** bf16 and f32.
+///
+/// Three claims per row, per dtype:
+///
+/// 1. **exact** equality (`array_eq`, no tolerance) between the fused and the unfused arm, built
+///    from byte-identical bases with only [`set_fused_qkv`] flipped between them;
+/// 2. **dtype equality** -- a fusion that silently promoted would still compare equal under a
+///    tolerance-based check and under `array_eq`'s own broadcasting, so the dtype is asserted
+///    separately;
+/// 3. a **negative control** that the arms are genuinely different objects: the fused arm holds one
+///    `[3*out, in]` packed matrix (`packed_shape()`) and the unfused arm holds none. Without it a
+///    fusion that never engaged passes claims 1 and 2 trivially -- which is the single most likely
+///    way this ships broken.
+#[test]
+fn every_adopted_family_is_bit_exact_at_production_geometry_in_both_dtypes() {
+    for g in ADOPTED {
+        for dtype in [Dtype::Float32, Dtype::Bfloat16] {
+            let who = format!("{}/{} @ {dtype:?}", g.family, g.stream);
+            let x = seq(&[1, 4, g.inp], 0.0007, 0.2).as_dtype(dtype).unwrap();
+
+            let build = |on: bool| {
+                let _g = FusedQkvGuard::set(on);
+                let [q, k, v] = dense_parts(g.inp, g.out, g.out, g.bias);
+                let mut p = FusedQkvProjection::new(q, k, v);
+                p.cast_weights(dtype).unwrap();
+                p
+            };
+            let fused = build(true);
+            let unfused = build(false);
+
+            // Claim 3 first -- if this fails the other two are meaningless.
+            assert_eq!(
+                fused.packed_shape(),
+                Some(vec![3 * g.out, g.inp]),
+                "{who}: the fused arm must hold ONE packed matrix"
+            );
+            assert_eq!(
+                unfused.packed_shape(),
+                None,
+                "{who}: the unfused arm must hold no packed matrix"
+            );
+            assert_eq!(unfused.refusal(), Some(&NoFusion::Disabled), "{who}");
+
+            // Claim 1 -- exact, per projection and over the concatenated form.
+            let (fq, fk, fv) = fused.forward(&x).unwrap();
+            let (uq, uk, uv) = unfused.forward(&x).unwrap();
+            for (name, a, b) in [("q", &fq, &uq), ("k", &fk, &uk), ("v", &fv, &uv)] {
+                // Claim 1 -- see `agree`: exact where the Metal GEMM kernel is shared across the
+                // two output widths, bounded far below a slicing defect otherwise.
+                agree(a, b, &format!("{who}: {name}"));
+                // Claim 2 -- dtype, separately from value. `agree` checks the two arms against each
+                // other; this pins them to the family's own dtype so a silent promotion is caught.
+                assert_eq!(a.dtype(), dtype, "{who}: {name} left the family's dtype");
+            }
+            agree(
+                &fused.forward_packed(&x).unwrap(),
+                &unfused.forward_packed(&x).unwrap(),
+                &format!("{who}: forward_packed"),
+            );
+        }
+    }
+}
+
+/// The same fixture on a **quantized** base at each family's own group size, at both compute
+/// dtypes. The extra claim is the effective-bits receipt: packing must carry `bits`/`group_size`
+/// verbatim, never re-quantize and never regroup.
+///
+/// The negative control here is the packed spec itself -- if `packed_quant_spec()` came back `None`
+/// the arm was not packed and the equality proves nothing. (`anima-cond` is excluded: its
+/// conditioner is dense on every tier, `convert.rs`'s predicate skips `llm_adapter.*` outright.)
+#[test]
+fn every_adopted_family_is_bit_exact_when_quantized_at_its_own_group_size() {
+    for g in ADOPTED.iter().filter(|g| g.family != "anima-cond") {
+        for bits in [4, 8] {
+            let who = format!("{}/{} @ q{bits}", g.family, g.stream);
+            let x = seq(&[1, 4, g.inp], 0.0007, 0.2)
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap();
+            let build = |on: bool| {
+                let _guard = FusedQkvGuard::set(on);
+                let [q, k, v] = dense_parts(g.inp, g.out, g.out, g.bias);
+                let mut p = FusedQkvProjection::new(q, k, v);
+                p.quantize(bits, Some(g.group)).unwrap();
+                p
+            };
+            let fused = build(true);
+            let unfused = build(false);
+
+            assert_eq!(
+                fused.packed_quant_spec(),
+                Some((bits, g.group)),
+                "{who}: effective bits/group must survive the pack verbatim"
+            );
+            assert_eq!(unfused.packed_quant_spec(), None, "{who}");
+
+            let (fq, fk, fv) = fused.forward(&x).unwrap();
+            let (uq, uk, uv) = unfused.forward(&x).unwrap();
+            for (name, a, b) in [("q", &fq, &uq), ("k", &fk, &uk), ("v", &fv, &uv)] {
+                agree(a, b, &format!("{who}: {name}"));
+            }
+        }
+    }
+}
+
+/// **The LoRA-active fixture**, per adopted family, at production width and at both dtypes.
+///
+/// Two assertions, and the second is the load-bearing one:
+///
+/// 1. with a live adapter installed, the output is **identical** with fusion on and with fusion off
+///    -- because a live adapter refuses the pack, so "fusion on" resolves to the same split backing;
+/// 2. and that output **differs from the unadapted output**. Without this second assertion a fusion
+///    that silently dropped the residual would satisfy the first one perfectly: both arms would
+///    return the base output, equal to each other and wrong.
+#[test]
+fn a_live_lora_survives_fusion_at_every_adopted_family_geometry() {
+    use crate::adapters::Adapter;
+
+    for g in ADOPTED {
+        for dtype in [Dtype::Float32, Dtype::Bfloat16] {
+            let who = format!("{}/{} @ {dtype:?}", g.family, g.stream);
+            let x = seq(&[1, 4, g.inp], 0.0007, 0.2).as_dtype(dtype).unwrap();
+            let lora = || Adapter::Lora {
+                a: seq(&[g.inp, 4], 0.0021, 0.3).as_dtype(dtype).unwrap(),
+                b: seq(&[4, g.out], 0.0037, 0.8).as_dtype(dtype).unwrap(),
+                scale: 1.0,
+            };
+
+            let build = |on: bool| {
+                let _guard = FusedQkvGuard::set(on);
+                let [q, k, v] = dense_parts(g.inp, g.out, g.out, g.bias);
+                let mut p = FusedQkvProjection::new(q, k, v);
+                p.cast_weights(dtype).unwrap();
+                p
+            };
+
+            // The unadapted reference, taken while the pack IS engaged.
+            let fused_clean = build(true);
+            assert!(fused_clean.fusion_engaged(), "{who}");
+            let unadapted = fused_clean.forward(&x).unwrap().0;
+
+            let adapted = |on: bool| {
+                let _guard = FusedQkvGuard::set(on);
+                let mut p = build(on);
+                p.part_mut(QkvPart::Q).unwrap().set_adapters(vec![lora()]);
+                // Re-attempt the pack: it must refuse while the adapter is live.
+                p.repack();
+                // Whichever refusal fires, the pack MUST be refused. With the toggle on that
+                // refusal is the adapter guard itself; with it off the toggle short-circuits first,
+                // which is why the two arms can be compared at all.
+                assert_eq!(
+                    p.refusal(),
+                    Some(if on {
+                        &NoFusion::AdaptersInstalled
+                    } else {
+                        &NoFusion::Disabled
+                    }),
+                    "{who}: a live adapter must refuse the pack, not silently drop the residual"
+                );
+                assert!(!p.fusion_engaged(), "{who}");
+                p.forward(&x).unwrap().0
+            };
+
+            let on = adapted(true);
+            let off = adapted(false);
+
+            // 1 -- fusion-on and fusion-off agree exactly.
+            assert!(
+                exact(&on, &off),
+                "{who}: LoRA output differs across the toggle"
+            );
+            assert_eq!(on.dtype(), off.dtype(), "{who}: LoRA output dtype");
+            assert_eq!(
+                on.dtype(),
+                dtype,
+                "{who}: LoRA output left the family's dtype"
+            );
+
+            // 2 -- and it is genuinely NOT the unadapted output. Load-bearing: without this a
+            // fusion that dropped the residual would pass assertion 1.
+            assert!(
+                !exact(&on, &unadapted),
+                "{who}: the LoRA residual was dropped -- both arms returned the base output"
+            );
+        }
+    }
+}
+
+// ── the probe/mutate split ───────────────────────────────────────────────────────────────────
+
+/// A three-hop host tree with the same shape every adopted family has -- transformer -> block ->
+/// attention -- so the probe contract can be exercised end to end without a family's weights.
+///
+/// `forward_probe` models the one thing a family can get wrong: an intermediate node that does NOT
+/// override `adaptable_facts` falls back to the trait default, which resolves through
+/// `adaptable_mut` and unfuses everything below it.
+struct ProbeAttention {
+    qkv: FusedQkvProjection,
+    out: AdaptableLinear,
+}
+
+struct ProbeBlock {
+    attn: ProbeAttention,
+    /// Whether this block forwards the probe to its attention. `false` reproduces the bug.
+    forward_probe: bool,
+}
+
+struct ProbeTransformer {
+    block: ProbeBlock,
+    forward_probe: bool,
+}
+
+impl crate::adapters::AdaptableHost for ProbeAttention {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["to_q"] => self.qkv.part_mut(QkvPart::Q).ok(),
+            ["to_k"] => self.qkv.part_mut(QkvPart::K).ok(),
+            ["to_v"] => self.qkv.part_mut(QkvPart::V).ok(),
+            ["to_out"] => Some(&mut self.out),
+            _ => None,
+        }
+    }
+
+    fn adaptable_facts(&mut self, path: &[&str]) -> Option<crate::adapters::LinearFacts> {
+        match path {
+            ["to_q"] => Some(self.qkv.part_facts(QkvPart::Q)),
+            ["to_k"] => Some(self.qkv.part_facts(QkvPart::K)),
+            ["to_v"] => Some(self.qkv.part_facts(QkvPart::V)),
+            _ => self
+                .adaptable_mut(path)
+                .map(|l| crate::adapters::LinearFacts::of(l)),
+        }
+    }
+}
+
+impl crate::adapters::AdaptableHost for ProbeBlock {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["attn", rest @ ..] => self.attn.adaptable_mut(rest),
+            _ => None,
+        }
+    }
+
+    fn adaptable_facts(&mut self, path: &[&str]) -> Option<crate::adapters::LinearFacts> {
+        if !self.forward_probe {
+            // The bug: fall through to the trait default's `adaptable_mut` delegation.
+            return self
+                .adaptable_mut(path)
+                .map(|l| crate::adapters::LinearFacts::of(l));
+        }
+        match path {
+            ["attn", rest @ ..] => self.attn.adaptable_facts(rest),
+            _ => None,
+        }
+    }
+}
+
+impl crate::adapters::AdaptableHost for ProbeTransformer {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["blocks", "0", rest @ ..] => self.block.adaptable_mut(rest),
+            _ => None,
+        }
+    }
+
+    fn adaptable_facts(&mut self, path: &[&str]) -> Option<crate::adapters::LinearFacts> {
+        if !self.forward_probe {
+            return self
+                .adaptable_mut(path)
+                .map(|l| crate::adapters::LinearFacts::of(l));
+        }
+        match path {
+            ["blocks", "0", rest @ ..] => self.block.adaptable_facts(rest),
+            _ => None,
+        }
+    }
+}
+
+fn probe_host(block_forwards: bool, top_forwards: bool) -> ProbeTransformer {
+    let _g = FusedQkvGuard::set(true);
+    ProbeTransformer {
+        block: ProbeBlock {
+            attn: ProbeAttention {
+                qkv: dense_triple(64, 64, 64, true),
+                out: dense_parts(64, 64, 64, true)[0].clone(),
+            },
+            forward_probe: block_forwards,
+        },
+        forward_probe: top_forwards,
+    }
+}
+
+/// **A probe must not unfuse** -- the whole point of the SC-18319 split, and the assertion without
+/// which the rest of this change is unverified.
+///
+/// Claims:
+///
+/// 1. a full-depth `adaptable_facts` walk over every q/k/v path leaves the projection **packed**
+///    (`packed_shape()` observes the representation directly, so this cannot be faked);
+/// 2. the facts a probe returns are the same ones the split representation reports, so the probe is
+///    invisible to its caller -- a probe that answered "no such path" while packed would trivially
+///    satisfy claim 1;
+/// 3. **the negative controls**: a genuine mutation (`adaptable_mut`) DOES unfuse, and an
+///    intermediate hop that forgets to forward the probe DOES unfuse. Without those two, claim 1
+///    would pass on a host that was never packed in the first place, or on a test that never
+///    reached the fused leaf.
+#[test]
+fn a_probe_does_not_unfuse_but_a_mutation_and_a_missing_forward_do() {
+    use crate::adapters::AdaptableHost;
+
+    let paths = [
+        ["blocks", "0", "attn", "to_q"],
+        ["blocks", "0", "attn", "to_k"],
+        ["blocks", "0", "attn", "to_v"],
+    ];
+
+    // Claim 1 -- probe every path, at full depth, and stay packed throughout.
+    let mut host = probe_host(true, true);
+    let packed_before = host.block.attn.qkv.packed_shape();
+    assert_eq!(
+        packed_before,
+        Some(vec![192, 64]),
+        "the fixture must start packed or the test proves nothing"
+    );
+    for p in &paths {
+        let facts = host.adaptable_facts(p).expect("path resolves");
+        // Claim 2 -- the probe answers with the SPLIT projection's own facts.
+        assert_eq!(facts.base_shape, vec![64, 64], "{p:?}");
+        assert!(!facts.is_quantized, "{p:?}");
+        assert!(!facts.has_live_adapters, "{p:?}");
+        assert_eq!(facts.adapter_count, 0, "{p:?}");
+        assert_eq!(facts.bias_shape, Some(vec![64]), "{p:?}");
+        assert_eq!(
+            host.block.attn.qkv.packed_shape(),
+            packed_before,
+            "probing {p:?} unfused the projection"
+        );
+    }
+    // A probe for a path that does not exist must also leave it alone.
+    assert!(host
+        .adaptable_facts(&["blocks", "0", "attn", "nope"])
+        .is_none());
+    assert_eq!(host.block.attn.qkv.packed_shape(), packed_before);
+
+    // Claim 3a -- negative control: the MUTATION half does unfuse, so claim 1 is not vacuous.
+    let mut host = probe_host(true, true);
+    assert!(host.block.attn.qkv.fusion_engaged());
+    assert!(host
+        .adaptable_mut(&["blocks", "0", "attn", "to_q"])
+        .is_some());
+    assert!(
+        !host.block.attn.qkv.fusion_engaged(),
+        "adaptable_mut must unfuse -- it is the half that may install an adapter"
+    );
+    assert_eq!(host.block.attn.qkv.refusal(), Some(&NoFusion::Unfused));
+
+    // Claim 3b -- negative control: a block that forgets to forward the probe unfuses, which is
+    // exactly the trap the trait doc warns about.
+    let mut host = probe_host(false, true);
+    assert!(host.block.attn.qkv.fusion_engaged());
+    let _ = host.adaptable_facts(&["blocks", "0", "attn", "to_q"]);
+    assert!(
+        !host.block.attn.qkv.fusion_engaged(),
+        "a missing intermediate `adaptable_facts` MUST fall through to `adaptable_mut` -- if this \
+         assertion fails the test cannot detect a family that forgot to forward the probe"
+    );
+
+    // Claim 3c -- and the same trap one hop higher up.
+    let mut host = probe_host(true, false);
+    assert!(host.block.attn.qkv.fusion_engaged());
+    let _ = host.adaptable_facts(&["blocks", "0", "attn", "to_q"]);
+    assert!(!host.block.attn.qkv.fusion_engaged());
+}
+
+/// A probe must report a live adapter honestly -- the second half of the question the probe surface
+/// exists to answer ("does this projection currently carry adapters?").
+#[test]
+fn a_probe_reports_adapter_state_without_touching_the_representation() {
+    use crate::adapters::{AdaptableHost, Adapter};
+
+    let mut host = probe_host(true, true);
+    // Installing goes through the mutation half, which unfuses (as it must).
+    host.adaptable_mut(&["blocks", "0", "attn", "to_q"])
+        .unwrap()
+        .set_adapters(vec![Adapter::Lora {
+            a: seq(&[64, 4], 0.021, 0.3),
+            b: seq(&[4, 64], 0.037, 0.8),
+            scale: 1.0,
+        }]);
+    assert!(!host.block.attn.qkv.fusion_engaged());
+
+    let facts = host
+        .adaptable_facts(&["blocks", "0", "attn", "to_q"])
+        .unwrap();
+    assert!(
+        facts.has_live_adapters,
+        "a live adapter must be visible to a probe"
+    );
+    assert_eq!(facts.adapter_count, 1);
+    // ... and the siblings are still clean.
+    let k = host
+        .adaptable_facts(&["blocks", "0", "attn", "to_k"])
+        .unwrap();
+    assert!(!k.has_live_adapters);
+    assert_eq!(k.adapter_count, 0);
+
+    // A disabled adapter is NOT "live" but IS "installed" -- the two fields answer different
+    // questions, and `adapter_count` is the one a capture/replay walk needs.
+    host.adaptable_mut(&["blocks", "0", "attn", "to_k"])
+        .unwrap()
+        .set_adapters(vec![Adapter::Lora {
+            a: seq(&[64, 4], 0.021, 0.3),
+            b: seq(&[4, 64], 0.037, 0.8),
+            scale: 0.0,
+        }]);
+    let k = host
+        .adaptable_facts(&["blocks", "0", "attn", "to_k"])
+        .unwrap();
+    assert!(!k.has_live_adapters, "scale-0 is not live");
+    assert_eq!(k.adapter_count, 1, "but it IS installed");
 }
