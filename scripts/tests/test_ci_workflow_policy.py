@@ -2404,7 +2404,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             mlx.index("Require the operator-provisioned diffusers VAE reference"),
         )
         # Both manifest rows are materialized, and the text-encoder one only here: the shared
-        # `minimax-h3` row is `media-cuda` too, and 51.5 GB of text encoder on the Windows box
+        # `minimax-h3` row is `media-cuda` too, and 58.6 GB of text encoder on the Windows box
         # would buy that lane nothing.
         self.assertIn(
             "ensure_model_snapshot.py\n          --model minimax-h3-text-encoder",
@@ -2414,7 +2414,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertNotIn(
             "minimax-h3-text-encoder",
             "\n".join(bodies["candle-minimax-h3"]),
-            "the Windows CUDA lane must not fetch 51.5 GB of text encoder it never reads",
+            "the Windows CUDA lane must not fetch 58.6 GB of text encoder it never reads",
         )
         # Both lanes materialize from the manifest row rather than assuming a hand-placed tree.
         for job in selected:

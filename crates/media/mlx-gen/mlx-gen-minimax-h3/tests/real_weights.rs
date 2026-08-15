@@ -343,7 +343,7 @@ fn real_weight_multi_chunk_decode_blends_the_seam() {
 //     block_out_channels          (32, 32, 32, 64)
 //     spatial_downsample_factors  (1, 2, 2, 1)
 //     temporal_downsample_factors (1, 2, 2, 1)      <- IDENTICAL to the spatial list
-//     norm_num_groups             32 == every width  <- every GroupNorm is an instance norm
+//     norm_num_groups             32 == the width at levels 0-2  <- instance norm on 3 of 4 levels
 //
 // against the shipped
 //
@@ -362,8 +362,9 @@ fn real_weight_multi_chunk_decode_blends_the_seam() {
 //    same absence of `conv_shortcut` — so swapping the CONFIG level between them is bit-inert
 //    there and is a load failure on the shipped stack, where level 1 changes width and level 2
 //    does not.
-//  * `groups == channels` makes the frame-isolated GroupNorm an instance norm, so the grouping is
-//    unobservable at fixture scale.
+//  * `groups == channels` at levels 0-2 makes the frame-isolated GroupNorm an instance norm there.
+//    Only level 3 groups at all, and only 2 channels to a group against the shipped 4 to 32, so
+//    the grouping is very nearly unobservable at fixture scale.
 //
 // The two tests below are the two halves the fixture leaves open: the published *shapes* against a
 // table derived from the config, and the published *values* against an independent implementation.
@@ -400,6 +401,14 @@ fn real_weight_multi_chunk_decode_blends_the_seam() {
 /// orders clear of it: the sc-18740 gate/value half-swap at 0.86-0.99, a symmetric downsampler pad
 /// at 1.8, a global GroupNorm at 1.6, a front pad at 6.9e-1, and an untiled encode at **9.430e-2**
 /// — that last one re-measured on this lane, below, as the discrimination check.
+///
+/// **WHAT 1e-2 DOES NOT BOUND.** Every class in that list is a LAYOUT or STRUCTURE defect, and each
+/// clears the bound by one to two orders; for those, 1e-2 is loose in the right direction. It is
+/// not a bound on SCALE or PRECISION defects at all. The metric is relative, so a uniform gain
+/// error anywhere up to ±1% sits under it by construction no matter what it does to the image —
+/// which is precisely the shape of the 2% scale drift this story demonstrates against (it fires at
+/// only 1.956e-2, ~2x the bound, while cosine reads exactly 1.0000000). Read 1e-2 as "the layout is
+/// right", never as "the numbers are right to 1%".
 const REAL_WEIGHT_ENCODE_TOL: f32 = 1e-2;
 
 /// `name -> shape` over the `vae/` shard headers, read without any weight I/O.
@@ -849,10 +858,12 @@ fn real_weight_encode_matches_the_official_diffusers_vae() {
          notice if it did"
     );
     let (untiled_delta, _) = rel(&untiled, &tiled);
-    // Measured 9.430e-2 here, i.e. 9.4x the bound and 53x the 1.789e-3 floor. The criterion is 5x
-    // the bound rather than that measurement, so a device whose reductions move this a little does
-    // not turn the control itself into a flake — but a port that silently stopped tiling, which
-    // would collapse this to ~0, is a red.
+    // Measured 9.430e-2 here: 9.4x the 1e-2 bound and 53x the 1.789e-3 floor. But the criterion
+    // asserted below is 5x the BOUND, i.e. 5.0e-2, so the margin this control actually runs on is
+    // **1.89x** — not the 9.4x the raw measurement suggests. Stated plainly because it is thin: a
+    // port that silently stopped tiling collapses this to ~0 and is a red, which is the point, but
+    // a device whose reductions halved the measurement would flake the control instead. If the
+    // second Mac lands materially below 9.4e-2, re-derive this criterion rather than loosening it.
     assert!(
         untiled_delta > 5.0 * REAL_WEIGHT_ENCODE_TOL,
         "an untiled encode of a {} px canvas agrees with the tiled one to {untiled_delta:.3e}, \
@@ -1238,7 +1249,9 @@ fn te_layer_50_tap_is_exhaustive_and_the_tail_is_trimmable() {
     assert_eq!(visual, TE_VISION_TENSORS);
     assert_eq!(lm + visual + 1, PUBLISHED_TE_TENSORS, "+1 for lm_head");
 
-    // 4. The trim arithmetic, in bytes, against the index's own declared total.
+    // 4. The trim arithmetic, in bytes, derived ENTIRELY from `cfg`'s dims and checked against a
+    //    literal. It does NOT read `metadata.total_size` from the index (66714780128 at snapshot
+    //    939557dc) — nothing here cross-checks the config against the published byte count.
     let hidden = cfg.hidden_size as u64;
     let inter = cfg.intermediate_size as u64;
     let vocab = cfg.vocab_size as u64;
@@ -1368,9 +1381,11 @@ fn real_tokenizer_resolves_the_minimax_special_tokens() {
 /// Generate the reference with `tools/dump_minimax_h3_te_real.py` (~220 KB, deliberately not
 /// committed) and point `MINIMAX_H3_TE_REFERENCE` at it. **Run this in its own process**: the
 /// conditioner is ~62 GB on the Python side and does not release inside a process on MPS, and this
-/// side holds ~51.5 GB for layers 0-49. Asserts rather than skips, like everything else here.
+/// side maps shards 1-12 whole — **58.568 GB**, of which the tap's own parameters (`embed_tokens`
+/// plus layers 0-49) are 50.316 GB. Both figures are byte sums over the published shard headers at
+/// snapshot `939557dc`. Asserts rather than skips, like everything else here.
 #[test]
-#[ignore = "needs a real MiniMax-H3 snapshot + a reference context (MINIMAX_H3_TE_REFERENCE); ~52 GB resident"]
+#[ignore = "needs a real MiniMax-H3 snapshot + a reference context (MINIMAX_H3_TE_REFERENCE); maps 58.6 GB"]
 fn real_weight_te_context_matches_the_official_conditioner() {
     let root = snapshot();
     let reference_path = std::env::var("MINIMAX_H3_TE_REFERENCE").unwrap_or_default();
@@ -1408,8 +1423,12 @@ fn real_weight_te_context_matches_the_official_conditioner() {
     let cfg = MiniMaxH3TeConfig::qwen3_vl_32b();
     assert_eq!(cfg.select_hidden, 50);
 
-    // Only the shards layers 0-49 need. `Weights::from_dir` would map all 14 (66.7 GB); the tap
-    // reads 51.5 GB of them and shards 12-14 serve only the never-executed tail.
+    // Shards 1-12, 58.568 GB, rather than `Weights::from_dir`'s all 14 (66.715 GB). The range
+    // mirrors production's `TE_SHARDS` (`1..=12`, `src/text_encoder/mod.rs`) rather than deriving a
+    // minimum: layers 0-49 and `embed_tokens` in fact fit in shards 1-11 (53.692 GB), and shard 12
+    // holds only layers 53-58. `from_file` panics on a missing shard, so this is what goes red if
+    // the manifest row that feeds it ever stops fetching one of the twelve. Shards 13-14 hold only
+    // the never-executed tail, plus — in 14 — the vision tower `t2va` does not use.
     let t0 = Instant::now();
     let mut w = Weights::empty();
     for i in 1..=12 {

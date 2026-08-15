@@ -1746,8 +1746,10 @@ unwired_reason = "sc-15528 landed the Bernini ladder mechanism; the real-weight 
 # snapshot fails loudly (exit 101) rather than printing `ok` in 0.00 s. Nothing could supply the
 # variable, which is a different defect from a vacuous green and is why it survived so long.
 #
-# `download_files` is a deliberate 11.640 GB slice of the 196 GB (measured 2026-08-13 with
-# `os.stat` over the snapshot on nax-macos, symlinks dereferenced):
+# `download_files` is a deliberate 11.638 GB slice of the 196 GB (measured 2026-08-13 with
+# `os.stat` over the snapshot on nax-macos, symlinks dereferenced; the TOTAL was re-summed
+# 2026-08-15 for sc-19445 and is 11.638 — what the rows below actually add to — not the 11.640 this
+# line used to carry):
 #
 #   vae/                                       10.416 GB  video VAE: 3 shards + index + config
 #   audio_vae/                                  0.605 GB  the diffusers-repackaged audio VAE
@@ -1810,12 +1812,12 @@ unwired_reason = "sc-15528 landed the Bernini ladder mechanism; the real-weight 
 # describes bytes no revision can. They live in the `mlx-minimax-h3` job instead, the way
 # `MAGE_ORACLE_SEED_DIR` lives only in `mlx-media` — recorded here so a census reader finds them.
 #
-# THIS ROW STAYS AT ITS 11.640 GB SLICE. The text-encoder SHARDS that
+# THIS ROW STAYS AT ITS 11.638 GB SLICE. The text-encoder SHARDS that
 # `real_weight_te_context_matches_the_official_conditioner` needs live in the separate
 # `minimax-h3-text-encoder` row below (sc-19438), NOT here, and the split is the whole point: this
 # row is `profiles = ["media-macos", "media-cuda"]` and the Windows CUDA lane materializes it by
-# key, so folding 51.5 GB of text encoder into it would put that on a shared dev box whose lane
-# reads not one byte of it.
+# key, so folding that row's 58.568 GB of text-encoder shards into it would put those bytes on a
+# shared dev box whose lane reads not one of them.
 #
 # STILL NOT COVERED, named here rather than left to be rediscovered: the two candle DiT header
 # gates (`declared_dit_tensor_names_match_the_published_checkpoint`,
@@ -1854,8 +1856,8 @@ expected_files = [
 # The SAME repository and the SAME pinned revision as `minimax-h3` above, materialized into the
 # SAME `MINIMAX_H3_SNAPSHOT` directory. It is a separate key rather than more entries on that row
 # for one reason: that row is `media-macos` AND `media-cuda`, and the Windows CUDA lane
-# materializes it by key. Folding 51.5 GB of text encoder into it would put that on a shared dev
-# box whose lane reads not one byte of it. Only `mlx-minimax-h3` materializes this key.
+# materializes it by key. Folding these 58.568 GB of text encoder into it would put those bytes on
+# a shared dev box whose lane reads not one of them. Only `mlx-minimax-h3` materializes this key.
 #
 # WHY IT IS FETCHED AT ALL. `real_weight_te_context_matches_the_official_conditioner` is the only
 # executable parity gate on the component that sets this family's entire ~53 GB memory floor. Its
@@ -1865,11 +1867,28 @@ expected_files = [
 # inventory story; the consequence was that the gate asserted-rather-than-skipped on an artifact
 # nobody could point it at, which is a red lane, not coverage.
 #
-# TWELVE OF THE FOURTEEN SHARDS, and that is a derivation rather than a rounding-down: the layer-50
-# tap reads 551 tensors, and shards 13-14 serve exclusively decoder layers 50-63, `lm_head` and the
-# final `norm` — none of which the tap executes. `te_layer_50_tap_is_exhaustive_and_the_tail_is_trimmable`
-# measures that tail at 15.209 GB and asserts it, so this list and that test hold each other up:
-# trimming here stays valid exactly as long as that test passes. 51.5 GB rather than 66.7 GB.
+# TWELVE OF THE FOURTEEN SHARDS, and twelve is a MIRROR of production rather than a derived
+# minimum: it is exactly `TE_SHARDS` (`1..=12`, declared at
+# `crates/media/mlx-gen/mlx-gen-minimax-h3/src/text_encoder/mod.rs:376`), the range the `t2va`
+# loader itself maps. ELEVEN would in fact serve the layer-50 tap — measured from this revision's
+# own shard headers, `embed_tokens` and decoder layers 0-49 live entirely in shards 1-11 (53.692
+# GB), and shard 12 carries only layers 53-58, none of which the tap executes. Fetching `TE_SHARDS`
+# verbatim is what stops this row and the loader drifting apart; it is not a floor.
+#
+# WHAT THE TRIM SAVES, measured from the same headers: shards 13-14, **8.147 GB**, so 58.568 GB
+# fetched rather than the component's full 66.715 GB. That is NOT the 15.209 GB
+# `te_layer_50_tap_is_exhaustive_and_the_tail_is_trimmable` asserts — that is a different quantity,
+# the TENSOR bytes of layers 50-63 + `lm_head` + `norm`, which straddle shards 11-14 and therefore
+# cannot all be dropped at shard granularity. Nor is that test this list's keeper: it reads
+# `weight_map` KEYS and config dims only, never which shard a tensor lives in, so it passes
+# bit-identically under any re-sharding. The keeper is
+# `real_weight_te_context_matches_the_official_conditioner`, which maps
+# `model-00001-of-00014` .. `model-00012-of-00014` by literal filename and panics on a missing one.
+#
+# DROPPING SHARD 14 DROPS THE WHOLE QWEN3-VL VISION TOWER: all 351 `model.visual.*` tensors live in
+# shard 14 and nowhere else (`VISION_SHARD = 14`, same module). Nothing this lane runs today reads
+# one of them, so the omission is correct as it stands — but the first `fl2va` / `ref2va` gate
+# needs the vision half, and will need a thirteenth entry here to get it.
 #
 # `expected_files` names two shards rather than the index. Listing
 # `text_encoder/model.safetensors.index.json` would make `verify_model_snapshot.py` walk its
