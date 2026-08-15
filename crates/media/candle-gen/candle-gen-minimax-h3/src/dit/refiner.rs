@@ -28,7 +28,7 @@ use candle_gen::candle_core::{DType, Tensor};
 use candle_gen::{CandleError, Result, Weights};
 
 use crate::dit::config::MiniMaxH3DitConfig;
-use crate::dit::layers::{DitAttention, DitFeedForward, RmsNorm};
+use crate::dit::layers::{DitAttention, DitFeedForward, LinearNoBias, RmsNorm};
 
 /// One refiner block: `x + attn(norm1(x))`, then `x + ff(norm2(x))`.
 #[derive(Debug, Clone)]
@@ -53,6 +53,22 @@ impl TokenRefinerBlock {
             norm2: RmsNorm::from_weights(w, &format!("{prefix}.norm2"), cfg.norm_eps, dtype)?,
             ff: DitFeedForward::from_weights(w, &format!("{prefix}.ff"), dtype)?,
         })
+    }
+
+    /// Resolve one adapter path segment run **relative to this refiner block** (sc-18728). The same
+    /// six leaves a transformer block exposes; a refiner block has no `adaln_proj` to exclude.
+    pub fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut LinearNoBias> {
+        match path {
+            ["attn", rest @ ..] => self.attn.adaptable_mut(rest),
+            ["ff", rest @ ..] => self.ff.adaptable_mut(rest),
+            _ => None,
+        }
+    }
+
+    /// Drop every residual attached anywhere in this refiner block.
+    pub fn clear_adapters(&mut self) {
+        self.attn.clear_adapters();
+        self.ff.clear_adapters();
     }
 
     /// The 10 tensors a refiner block consumes — a `transformer_blocks` entry's 12 minus
@@ -143,6 +159,30 @@ impl TokenRefiner {
     /// Blocks loaded — `num_refiner_layers`.
     pub fn num_layers(&self) -> usize {
         self.blocks.len()
+    }
+
+    /// Resolve one adapter path segment run **relative to `token_refiner`** (sc-18728).
+    ///
+    /// `final_norm` is not addressable — it is a `[hidden]` vector, not a projection.
+    ///
+    /// **24 of the 624 tensors in every published turbo file land here**, so a stubbed refiner is
+    /// not merely a parity risk: it puts those 12 modules in `unmatched_paths` and fails the strict
+    /// install outright.
+    pub fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut LinearNoBias> {
+        match path {
+            ["refiner_blocks", idx, rest @ ..] => {
+                let i: usize = idx.parse().ok()?;
+                self.blocks.get_mut(i)?.adaptable_mut(rest)
+            }
+            _ => None,
+        }
+    }
+
+    /// Drop every residual attached anywhere in the refiner.
+    pub fn clear_adapters(&mut self) {
+        for b in &mut self.blocks {
+            b.clear_adapters();
+        }
     }
 }
 

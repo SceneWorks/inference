@@ -294,19 +294,28 @@ fn call_spans(src: &str, anchor: &str) -> Vec<String> {
     out
 }
 
-/// **The whole crate maps a DiT at exactly two sites, and BOTH take their partition from the
-/// task.**
+/// **The whole crate maps a DiT at exactly one site — the adapter seam — and BOTH render arms
+/// reach it with the partition their task selected.**
 ///
 /// The structural half of the never-both-resident property, and the half a memory measurement
 /// cannot reach: measuring one load says nothing about a second load elsewhere. This reads **every**
 /// `.rs` file under `src/` and pins that there is nowhere else for a load site to be.
 ///
+/// **The shape changed when sc-18728's LoRA seam met sc-17157's reference render.** The two arms
+/// used to call `MiniMaxH3Dit::load` directly, so the count pinned here was two. They now both go
+/// through [`MiniMaxH3::load_task_dit`], which maps the partition **and** folds any staged adapter,
+/// leaving exactly one `MiniMaxH3Dit::load` — the seam's own. Both claims are still made, one level
+/// apart, and the pairing is strictly stronger than the old form: the old two-site count could not
+/// have noticed a render arm that mapped its own DiT and silently dropped the caller's LoRA, which
+/// is exactly what the reference arm did on first merge.
+///
 /// Source-scanning is a blunt instrument, so it is bounded and stated:
 ///
-/// * it asserts a whole-crate **count**, and where those sites are;
-/// * it asserts each site's argument span contains `task.partition()`, matched with whitespace
-///   removed so **rustfmt cannot red it** and after block comments are stripped so a commented-out
-///   call cannot satisfy it;
+/// * it asserts a whole-crate **count** for both anchors, and where those sites are;
+/// * it asserts each *seam call's* argument span contains `task.partition()`, and that the seam's
+///   own load takes the `partition` it was handed rather than a literal — both matched with
+///   whitespace removed so **rustfmt cannot red it**, and after block comments are stripped so a
+///   commented-out call cannot satisfy either;
 /// * it asserts `MiniMaxH3Dit` is never **aliased** on import, because `use … as D; D::load(…)`
 ///   would otherwise be a load site the anchor cannot see;
 /// * it asserts `MiniMaxH3Task::resolve` is called from exactly **one** place in the crate, so the
@@ -315,9 +324,12 @@ fn call_spans(src: &str, anchor: &str) -> Vec<String> {
 #[test]
 fn every_dit_load_site_in_the_crate_is_driven_by_the_task() {
     const ANCHOR: &str = "MiniMaxH3Dit::load(";
+    /// The seam both render arms map their DiT through — it folds the staged LoRA on the way.
+    const SEAM: &str = "self.load_task_dit(";
     let sources = production_sources();
 
     let mut sites: Vec<(String, String)> = Vec::new();
+    let mut seam_calls: Vec<(String, String)> = Vec::new();
     let mut resolve_calls = 0usize;
     for (path, src) in &sources {
         // `use candle_gen_minimax_h3::dit::model::MiniMaxH3Dit as D;` then `D::load(` is a load
@@ -329,16 +341,46 @@ fn every_dit_load_site_in_the_crate_is_driven_by_the_task() {
         for span in call_spans(src, ANCHOR) {
             sites.push((path.clone(), span));
         }
+        for span in call_spans(src, SEAM) {
+            seam_calls.push((path.clone(), span));
+        }
         resolve_calls += src.matches("MiniMaxH3Task::resolve(").count();
     }
 
+    // ── one map, and it is the seam's own.
     assert_eq!(
         sites.len(),
-        2,
-        "the crate has {} `{ANCHOR}` call site(s); the render path has exactly two (the t2va/fl2va \
-         arm and the ref2va arm), which are mutually exclusive branches: {sites:?}",
+        1,
+        "the crate has {} `{ANCHOR}` call site(s); there must be exactly one — inside \
+         `load_task_dit`, the seam that folds the staged LoRA — because a render arm that maps its \
+         own DiT renders with the caller's adapter silently dropped: {sites:?}",
         sites.len()
     );
+    assert!(
+        sites[0].1.contains("partition,"),
+        "the seam's own DiT load must take the `partition` it was handed, not a literal: {:?}",
+        sites[0]
+    );
+
+    // ── two render arms, both reaching it with the task's partition.
+    assert_eq!(
+        seam_calls.len(),
+        2,
+        "the crate has {} `{SEAM}` call site(s); the render path has exactly two (the t2va/fl2va \
+         arm and the ref2va arm), which are mutually exclusive branches: {seam_calls:?}",
+        seam_calls.len()
+    );
+    for (path, span) in &seam_calls {
+        assert!(
+            Path::new(path).ends_with(Path::new("src").join("model.rs")),
+            "a DiT seam call appeared in {path}; both render arms are in src/model.rs"
+        );
+        assert!(
+            span.contains("task.partition()"),
+            "{path}: a render arm does not take its partition from `task.partition()` — a \
+             hardcoded partition is how a ref2va render reads the wrong 66 GB: {span}"
+        );
+    }
     // `src/model.rs` specifically — and NOT `src/dit/model.rs`, which is where `MiniMaxH3Dit::load`
     // is *defined*. `path.ends_with("model.rs")` was a string-suffix test that both files satisfy,
     // so a load site that migrated into the DiT module — the one other file where it is most
@@ -358,17 +400,12 @@ fn every_dit_load_site_in_the_crate_is_driven_by_the_task() {
         "`Path::ends_with` stopped matching whole components; the load-site check is a suffix trap \
          again"
     );
-    for (path, span) in &sites {
+    for (path, _) in &sites {
         assert!(
             Path::new(path).ends_with(&render_path),
-            "a DiT load site appeared in {path}; the render path's two sites are both in \
-             src/model.rs, and a third one elsewhere — `src/dit/model.rs` included — is how a \
-             ref2va render reads the wrong 66 GB"
-        );
-        assert!(
-            span.contains("task.partition()"),
-            "{path}: a DiT load site does not take its partition from `task.partition()` — a \
-             hardcoded partition is how a ref2va render reads the wrong 66 GB: {span}"
+            "a DiT load site appeared in {path}; the only one is the seam in src/model.rs, and a \
+             second one elsewhere — `src/dit/model.rs` included — is how a ref2va render reads the \
+             wrong 66 GB, or folds no adapter at all"
         );
     }
 

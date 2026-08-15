@@ -54,7 +54,7 @@ use candle_gen::candle_core::{DType, Tensor};
 use candle_gen::{CandleError, Result, Weights};
 
 use crate::dit::config::{MiniMaxH3DitConfig, MODALITY_NUM, MODULATION_PARAMS};
-use crate::dit::layers::{DitAttention, DitFeedForward, RmsNorm};
+use crate::dit::layers::{DitAttention, DitFeedForward, LinearNoBias, RmsNorm};
 use crate::dit::rope::{MmRope, MmRopeTables};
 use crate::nn::{linear, silu};
 
@@ -304,6 +304,26 @@ impl DitBlock {
     /// Device bytes the block body holds — everything except `adaln_proj`.
     pub fn body_nbytes(&self) -> usize {
         self.attn.nbytes() + self.ff.nbytes()
+    }
+
+    /// Resolve one adapter path segment run **relative to this block** to its projection (sc-18728).
+    ///
+    /// **`adaln_proj` is deliberately unreachable.** Nothing in the published turbo set targets it,
+    /// and making it addressable would let a LoRA change the modulation table
+    /// [`crate::dit::adaln`] precomputes and then evicts — turning one checkpoint into two models
+    /// depending on whether the eviction had already run. The MLX sibling makes the same exclusion.
+    pub fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut LinearNoBias> {
+        match path {
+            ["attn", rest @ ..] => self.attn.adaptable_mut(rest),
+            ["ff", rest @ ..] => self.ff.adaptable_mut(rest),
+            _ => None,
+        }
+    }
+
+    /// Drop every residual attached anywhere in this block.
+    pub fn clear_adapters(&mut self) {
+        self.attn.clear_adapters();
+        self.ff.clear_adapters();
     }
 
     /// Take the AdaLN projection out of the block, **returning** it so the caller controls the drop

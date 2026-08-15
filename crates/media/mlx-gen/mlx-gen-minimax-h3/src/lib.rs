@@ -163,8 +163,9 @@
 //! inside one repo* — 128 on the 4-step 768p export, 8 on the 8-step and ref2v ones, absent on
 //! `4step_v0.1` — so it is read from each file rather than pinned per family. Two further facts:
 //! 24 of each file's 624 tensors target the **token refiner**, which is a second reason it cannot be
-//! stubbed; and the `_comfyui_` twin of each file is a different model shape (fused `qkv_proj`,
-//! swapped SwiGLU halves), refused by name rather than half-applied.
+//! stubbed; and the `_comfyui_` twin of each file is a different module shape (fused `qkv_proj`,
+//! swapped SwiGLU halves), detected on the keys and **converted** (sc-19443) rather than
+//! half-applied — folding one un-converted is shape-valid and numerically wrong.
 //!
 //! Not in this crate yet: either CNN encoder, `fl2va` conditioning (sc-17148), Ref2VA's
 //! `transformer_ref` (sc-17149) and sequential residency (sc-17151).

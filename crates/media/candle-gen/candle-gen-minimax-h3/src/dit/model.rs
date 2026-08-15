@@ -53,6 +53,7 @@ use crate::dit::adaln::{AdaLnCache, AdaLnResidency, TimestepSchedule};
 use crate::dit::block::DitBlock;
 use crate::dit::config::{MiniMaxH3DitConfig, MODALITY_NUM};
 use crate::dit::heads::{AdaLayerNormOut, DitProjections, NormOutModulation};
+use crate::dit::layers::LinearNoBias;
 use crate::dit::refiner::TokenRefiner;
 use crate::dit::rope::{MmRope, MmRopeTables};
 
@@ -179,6 +180,52 @@ impl MiniMaxH3Dit {
     /// Whether every block still holds its AdaLN projection.
     pub fn holds_adaln(&self) -> bool {
         self.blocks.iter().all(DitBlock::holds_adaln)
+    }
+
+    /// **The adapter addressing seam** (sc-18728) — resolve a dotted module path, pre-split into
+    /// segments, to the projection a LoRA residual attaches to.
+    ///
+    /// The candle twin of `mlx_gen::adapters::AdaptableHost::adaptable_mut`. It takes a segment
+    /// slice rather than a dotted string because `to_out.0` and `ff.net.0.proj` carry
+    /// `nn.Sequential` indices that are genuine path segments, so a naive rsplit on `.` would
+    /// mis-parse them.
+    ///
+    /// Reachable: `transformer_blocks.{i}.{attn.to_q|attn.to_k|attn.to_v|attn.to_out.0|
+    /// ff.net.0.proj|ff.net.2}` and the same six under `token_refiner.refiner_blocks.{i}`. Nothing
+    /// else — in particular not `adaln_proj`, not the 17 input/output projections, and not any norm.
+    /// See [`crate::adapters::adapter_target_paths`], which enumerates exactly this set from the
+    /// config and is asserted to resolve here.
+    pub fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut LinearNoBias> {
+        match path {
+            ["transformer_blocks", idx, rest @ ..] => {
+                let i: usize = idx.parse().ok()?;
+                self.blocks.get_mut(i)?.adaptable_mut(rest)
+            }
+            ["token_refiner", rest @ ..] => self.refiner.adaptable_mut(rest),
+            _ => None,
+        }
+    }
+
+    /// Drop every LoRA residual installed anywhere in the model, reverting it to the bare
+    /// checkpoint.
+    pub fn clear_adapters(&mut self) {
+        for b in &mut self.blocks {
+            b.clear_adapters();
+        }
+        self.refiner.clear_adapters();
+    }
+
+    /// How many projections currently carry at least one residual — the count a caller checks
+    /// against [`crate::adapters::MiniMaxH3LoraReport::applied`].
+    pub fn adapted_module_count(&mut self) -> usize {
+        let cfg = self.cfg.clone();
+        crate::adapters::adapter_target_paths(&cfg)
+            .iter()
+            .filter(|p| {
+                let segs: Vec<&str> = p.split('.').collect();
+                self.adaptable_mut(&segs).is_some_and(|l| l.is_adapted())
+            })
+            .count()
     }
 
     /// Bytes of `adaln_proj` weight the blocks currently hold — the eviction's headline number.
