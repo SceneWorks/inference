@@ -219,7 +219,7 @@ pub const ADALN_EVICTED_BYTES: u64 = 26_020_915_200;
 ///
 /// [`ADALN_EVICTED_BYTES`] is a **bf16** figure and the lever shrinks with the tier exactly as the
 /// DiT that contains it does (`crate::dit::block::AdaLnProjection::nbytes`). Derived rather than
-/// measured: [`adaln_stack_bytes`] re-derives it from the shipped configuration and
+/// measured: the private `adaln_stack_bytes` re-derives it from the shipped configuration and
 /// `the_packed_tier_stack_sizes_are_the_loaders_own_accounting` holds the two together.
 ///
 /// The 13.02 GB `crate::quant` quotes for this tier is the **code buffer only**; this figure also
@@ -449,8 +449,8 @@ fn resolved_adaln_bytes(dit_dir: &std::path::Path, dit_bytes: u64) -> u64 {
         .flatten()
         .map_or(ADALN_EVICTED_BYTES, adaln_stack_bytes);
     // u128 because `ADALN_EVICTED_BYTES · DIT_BF16_BYTES` is ~1.7e21 and overflows u64.
-    let scaled =
-        (u128::from(ADALN_EVICTED_BYTES) * u128::from(dit_bytes) / u128::from(DIT_BF16_BYTES)) as u64;
+    let scaled = (u128::from(ADALN_EVICTED_BYTES) * u128::from(dit_bytes)
+        / u128::from(DIT_BF16_BYTES)) as u64;
     marked.min(scaled)
 }
 
