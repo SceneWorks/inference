@@ -35,15 +35,15 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use mlx_rs::ops::{matmul, subtract};
+use mlx_rs::ops::{concatenate_axis, matmul, subtract};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::{AdaptableHost, Adapter};
 use mlx_gen::gen_core::runtime::{AdapterKind, AdapterSpec};
 use mlx_gen::weights::Weights;
 use mlx_gen_minimax_h3::adapters::{
-    adapter_target_paths, alpha_rank_fold, apply_minimax_h3_adapters, is_comfyui_key_space,
-    resolve_alpha, resolve_rank, DEFAULT_LORA_ALPHA,
+    adapter_target_paths, alpha_rank_fold, apply_minimax_h3_adapters, convert_comfyui_key_space,
+    is_comfyui_key_space, resolve_alpha, resolve_rank, DEFAULT_LORA_ALPHA,
 };
 use mlx_gen_minimax_h3::{MiniMaxH3Dit, MiniMaxH3DitConfig, SMALLEST_LEGAL_FRAMES};
 
@@ -589,44 +589,459 @@ fn a_peft_blob_rank_disagreeing_with_the_factors_is_refused() {
     );
 }
 
-/// **The `_comfyui_` twin is refused by name**, not half-applied. Its `qkv_proj` is fused and its
-/// `mlp.fc1` carries the SwiGLU halves the other way round, so a shape-valid fold would be
-/// numerically wrong in a way no key-coverage proof can see (the sc-18740 class).
-#[test]
-fn the_comfyui_export_is_refused_and_points_at_the_diffusers_twin() {
-    let cfg = dit_fixture_config();
-    let dir = tempfile::tempdir().expect("fixture dir");
-    let path = dir.path().join("turbo_comfyui_bf16.safetensors");
-    // The real comfyui shape: rank·3 concatenated A, block-diagonal B, alpha ×3, in-band `.alpha`.
-    let a = tensor(&[3 * PUBLISHED_RANK, cfg.hidden_size], 1.0);
-    let b = tensor(&[3 * cfg.inner_dim(), 3 * PUBLISHED_RANK], 2.0);
-    let alpha = Array::from_slice(&[24.0f32], &[]);
-    let entries: Vec<(&str, &Array)> = vec![
-        ("diffusion_model.blocks.0.attn.qkv_proj.lora_A.weight", &a),
-        ("diffusion_model.blocks.0.attn.qkv_proj.lora_B.weight", &b),
-        ("diffusion_model.blocks.0.attn.qkv_proj.alpha", &alpha),
-    ];
+// ─── sc-19443: the ComfyUI key space ───────────────────────────────────────────────────────────
+
+/// Write a **ComfyUI** twin of one block's modules, built from the same factors a diffusers twin
+/// would carry, so any difference in the folded result is the conversion's fault.
+fn write_comfyui_twin(
+    dir: &Path,
+    name: &str,
+    cfg: &MiniMaxH3DitConfig,
+    alpha: f32,
+    block_diagonal: bool,
+    qkv: &[(Array, Array); 3],
+    fc1: (&Array, &Array),
+) -> PathBuf {
+    let path = dir.join(name);
+    let r = PUBLISHED_RANK;
+    let out = cfg.inner_dim();
+    let mut arrays: Vec<(String, Array)> = Vec::new();
+
+    if block_diagonal {
+        let a = concatenate_axis(&[qkv[0].0.clone(), qkv[1].0.clone(), qkv[2].0.clone()], 0)
+            .expect("concat A");
+        let rows: Vec<Array> = (0..3usize)
+            .map(|i| {
+                let parts: Vec<Array> = (0..3usize)
+                    .map(|j| {
+                        if i == j {
+                            qkv[i].1.clone()
+                        } else {
+                            bf16(&Array::zeros::<f32>(&[out, r]).unwrap())
+                        }
+                    })
+                    .collect();
+                concatenate_axis(&parts, 1).expect("concat row")
+            })
+            .collect();
+        let b = concatenate_axis(&rows, 0).expect("concat B");
+        arrays.push(("blocks.0.attn.qkv_proj.lora_A.weight".into(), a));
+        arrays.push(("blocks.0.attn.qkv_proj.lora_B.weight".into(), b));
+    } else {
+        arrays.push((
+            "blocks.0.attn.qkv_proj.lora_A.weight".into(),
+            qkv[0].0.clone(),
+        ));
+        let b = concatenate_axis(&[qkv[0].1.clone(), qkv[1].1.clone(), qkv[2].1.clone()], 0)
+            .expect("concat B");
+        arrays.push(("blocks.0.attn.qkv_proj.lora_B.weight".into(), b));
+    }
+    arrays.push((
+        "blocks.0.attn.qkv_proj.alpha".into(),
+        Array::from_slice(&[alpha], &[1]),
+    ));
+
+    // `mlp.fc1` carries the SwiGLU halves the OTHER way round — `[gate | value]` where the DiT is
+    // `[value | gate]` — so the twin's B is the diffusers B with its row halves swapped.
+    let (fc1_a, fc1_b) = fc1;
+    let rows = fc1_b.shape()[0];
+    let half = rows / 2;
+    let top = mlx_gen_minimax_h3::tensor::slice_axis(fc1_b, 0, 0, half).expect("top half");
+    let bottom = mlx_gen_minimax_h3::tensor::slice_axis(fc1_b, 0, half, rows).expect("bottom half");
+    let swapped = concatenate_axis(&[bottom, top], 0).expect("swap halves");
+    arrays.push(("blocks.0.mlp.fc1.lora_A.weight".into(), fc1_a.clone()));
+    arrays.push(("blocks.0.mlp.fc1.lora_B.weight".into(), swapped));
+
     let meta: HashMap<String, String> = [(
         "target_format".to_string(),
         "ComfyUI generic LoRA".to_string(),
     )]
     .into_iter()
     .collect();
-    Array::save_safetensors(entries, Some(&meta), &path).expect("write");
+    let entries: Vec<(&str, &Array)> = arrays.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    Array::save_safetensors(entries, Some(&meta), &path).expect("write the comfyui twin");
+    path
+}
 
-    let w = Weights::from_file(&path).unwrap();
+/// Write the **diffusers** counterpart of [`write_comfyui_twin`]'s modules, from the same factors.
+fn write_diffusers_twin(
+    dir: &Path,
+    name: &str,
+    alpha: f32,
+    qkv: &[(Array, Array); 3],
+    fc1: (&Array, &Array),
+) -> PathBuf {
+    let path = dir.join(name);
+    let mut arrays: Vec<(String, Array)> = Vec::new();
+    for (i, n) in ["to_q", "to_k", "to_v"].iter().enumerate() {
+        arrays.push((
+            format!("transformer_blocks.0.attn.{n}.lora_A.default.weight"),
+            qkv[i].0.clone(),
+        ));
+        arrays.push((
+            format!("transformer_blocks.0.attn.{n}.lora_B.default.weight"),
+            qkv[i].1.clone(),
+        ));
+        arrays.push((
+            format!("transformer_blocks.0.attn.{n}.alpha"),
+            Array::from_slice(&[alpha], &[1]),
+        ));
+    }
+    arrays.push((
+        "transformer_blocks.0.ff.net.0.proj.lora_A.default.weight".into(),
+        fc1.0.clone(),
+    ));
+    arrays.push((
+        "transformer_blocks.0.ff.net.0.proj.lora_B.default.weight".into(),
+        fc1.1.clone(),
+    ));
+    let meta: HashMap<String, String> = [("alpha".to_string(), alpha.to_string())]
+        .into_iter()
+        .collect();
+    let entries: Vec<(&str, &Array)> = arrays.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    Array::save_safetensors(entries, Some(&meta), &path).expect("write the diffusers twin");
+    path
+}
+
+/// The factors both twins are built from — distinct per projection, so a conversion that mixes up
+/// q/k/v is observable rather than symmetric.
+fn twin_factors(cfg: &MiniMaxH3DitConfig) -> ([(Array, Array); 3], (Array, Array)) {
+    let r = PUBLISHED_RANK;
+    let qkv = [
+        (
+            bf16(&tensor(&[r, cfg.hidden_size], 1.0)),
+            bf16(&tensor(&[cfg.inner_dim(), r], 2.0)),
+        ),
+        (
+            bf16(&tensor(&[r, cfg.hidden_size], 3.0)),
+            bf16(&tensor(&[cfg.inner_dim(), r], 4.0)),
+        ),
+        (
+            bf16(&tensor(&[r, cfg.hidden_size], 5.0)),
+            bf16(&tensor(&[cfg.inner_dim(), r], 6.0)),
+        ),
+    ];
+    let fc1 = (
+        bf16(&tensor(&[r, cfg.hidden_size], 7.0)),
+        bf16(&tensor(&[2 * cfg.ffn_dim, r], 8.0)),
+    );
+    (qkv, fc1)
+}
+
+/// **A converted ComfyUI file folds to the SAME residual as its diffusers twin**, gated on relative
+/// max-abs-diff.
+///
+/// That equivalence is the only honest gate for this conversion, and it is what makes each of the
+/// three transforms individually load-bearing: un-fusing `qkv_proj` wrong mixes q/k/v, dropping the
+/// alpha division folds 3× strong, and skipping the SwiGLU swap computes `w2(silu(value)·gate)` —
+/// the sc-18740 defect, which shipped green at cosine 0.73–0.78. Cosine cannot see any of them.
+///
+/// **Both fused forms are covered.** Block-diagonal is the lightx2v twins' shape; shared-`A` is what
+/// a LoRA trained natively on the fused module looks like, and it carries a DIFFERENT adapter (one
+/// down factor shared by all three projections), so it gets its own twin.
+#[test]
+fn a_converted_comfyui_file_folds_like_its_diffusers_twin() {
+    let cfg = dit_fixture_config();
+    let dir = tempfile::tempdir().expect("fixture dir");
+    let (qkv, fc1) = twin_factors(&cfg);
+    let shared_qkv = [
+        (qkv[0].0.clone(), qkv[0].1.clone()),
+        (qkv[0].0.clone(), qkv[1].1.clone()),
+        (qkv[0].0.clone(), qkv[2].1.clone()),
+    ];
+
+    // Both arms land on a per-target alpha of 8: the published `24 / 3` for the block-diagonal
+    // form, and an unchanged `8` for the shared-`A` one. Both fold at 8/128 = 0.0625.
+    for (block_diagonal, fused_alpha, twin_qkv, label) in [
+        (
+            true,
+            24.0f32,
+            &qkv,
+            "block-diagonal (the lightx2v twin shape)",
+        ),
+        (
+            false,
+            8.0f32,
+            &shared_qkv,
+            "shared-A (natively fused training)",
+        ),
+    ] {
+        let diffusers = write_diffusers_twin(
+            dir.path(),
+            &format!("twin_{block_diagonal}.safetensors"),
+            8.0,
+            twin_qkv,
+            (&fc1.0, &fc1.1),
+        );
+        let comfy = write_comfyui_twin(
+            dir.path(),
+            &format!("comfy_{block_diagonal}.safetensors"),
+            &cfg,
+            fused_alpha,
+            block_diagonal,
+            twin_qkv,
+            (&fc1.0, &fc1.1),
+        );
+
+        for probe in [
+            "transformer_blocks.0.attn.to_q",
+            "transformer_blocks.0.attn.to_k",
+            "transformer_blocks.0.attn.to_v",
+            "transformer_blocks.0.ff.net.0.proj",
+        ] {
+            let segs: Vec<&str> = probe.split('.').collect();
+            let x = tensor(&[1, 4, cfg.hidden_size], 0.31);
+
+            let residual = |file: &Path| -> Array {
+                let mut base = tiny_dit(&cfg);
+                let y0 = base
+                    .adaptable_mut(&segs)
+                    .expect("probe")
+                    .forward(&x)
+                    .expect("base forward");
+                let mut adapted = tiny_dit(&cfg);
+                apply_minimax_h3_adapters(&mut adapted, &[spec(file.to_path_buf(), 1.0)])
+                    .expect("install");
+                let y1 = adapted
+                    .adaptable_mut(&segs)
+                    .expect("probe")
+                    .forward(&x)
+                    .expect("adapted forward");
+                subtract(&y1, &y0).expect("residual")
+            };
+
+            let want = residual(&diffusers);
+            let got = residual(&comfy);
+            assert!(
+                max_abs(&want) > 1e-4,
+                "{probe}: the twin's own residual must be non-trivial, else this is vacuous"
+            );
+            let drift = max_abs(&subtract(&got, &want).unwrap()) / max_abs(&want);
+            println!("[{label}] {probe}: converted-vs-twin rel-max-abs = {drift:.3e}");
+            assert!(
+                drift < 1e-2,
+                "{label} / {probe}: a converted ComfyUI file must fold like its diffusers twin; \
+                 got rel-max-abs {drift:.3e}"
+            );
+        }
+    }
+}
+
+/// **The alpha division tracks the rank split, and lands on a NON-default number.**
+///
+/// The published `24 → 8` is a trap for a test: `8` is also `DEFAULT_LORA_ALPHA`, so a converter
+/// that dropped the alpha entirely would land on the same fold and pass. The first arm therefore
+/// uses `48 → 16`, which is neither the default nor the fused value.
+///
+/// The shared-`A` arm is the other half of the claim: its rank is NOT divided, so dividing its alpha
+/// would fold it three times too weak.
+#[test]
+fn the_alpha_division_tracks_the_rank_split_and_is_not_the_default() {
+    let cfg = dit_fixture_config();
+    let dir = tempfile::tempdir().expect("fixture dir");
+    let (qkv, fc1) = twin_factors(&cfg);
+
+    let read_alpha = |file: &PathBuf| -> f32 {
+        let w = Weights::from_file(file).unwrap();
+        let converted = convert_comfyui_key_space(&w).unwrap();
+        converted
+            .require("transformer_blocks.0.attn.to_q.alpha")
+            .expect("the converted per-target alpha")
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .as_slice::<f32>()[0]
+    };
+
+    // Block-diagonal, a NON-default alpha: 48 / 3 = 16, and 16/128 = 0.125 ≠ the default's 0.0625.
+    let f48 = write_comfyui_twin(
+        dir.path(),
+        "a48.safetensors",
+        &cfg,
+        48.0,
+        true,
+        &qkv,
+        (&fc1.0, &fc1.1),
+    );
+    assert_eq!(read_alpha(&f48), 16.0);
+    assert_eq!(alpha_rank_fold(16.0, PUBLISHED_RANK as f32), 0.125);
+    assert_ne!(
+        alpha_rank_fold(16.0, PUBLISHED_RANK as f32),
+        alpha_rank_fold(DEFAULT_LORA_ALPHA, PUBLISHED_RANK as f32),
+        "this arm must not land on the default fold, or a converter that dropped the alpha passes"
+    );
+
+    // The published pairing: 24 / 3 = 8, holding `alpha/rank` at 24/384 == 8/128 == 0.0625.
+    let f24 = write_comfyui_twin(
+        dir.path(),
+        "a24.safetensors",
+        &cfg,
+        24.0,
+        true,
+        &qkv,
+        (&fc1.0, &fc1.1),
+    );
+    assert_eq!(read_alpha(&f24), 8.0);
+    assert_eq!(
+        alpha_rank_fold(24.0, 3.0 * PUBLISHED_RANK as f32),
+        alpha_rank_fold(8.0, PUBLISHED_RANK as f32)
+    );
+
+    // Shared-A keeps rank `r`, so its alpha is UNCHANGED.
+    let shared = write_comfyui_twin(
+        dir.path(),
+        "shared.safetensors",
+        &cfg,
+        48.0,
+        false,
+        &qkv,
+        (&fc1.0, &fc1.1),
+    );
+    assert_eq!(
+        read_alpha(&shared),
+        48.0,
+        "a shared-A fused LoRA is already at per-projection rank; dividing its alpha folds it 3x \
+         too weak"
+    );
+}
+
+/// The conversion renames every ComfyUI module, the trunk container included, and the report says it
+/// ran — a diffusers file must NOT be counted.
+#[test]
+fn the_conversion_leaves_no_comfyui_module_behind() {
+    let cfg = dit_fixture_config();
+    let dir = tempfile::tempdir().expect("fixture dir");
+    let (qkv, fc1) = twin_factors(&cfg);
+    let comfy = write_comfyui_twin(
+        dir.path(),
+        "c.safetensors",
+        &cfg,
+        24.0,
+        true,
+        &qkv,
+        (&fc1.0, &fc1.1),
+    );
+
+    let w = Weights::from_file(&comfy).unwrap();
     assert!(is_comfyui_key_space(&w));
+    let converted = convert_comfyui_key_space(&w).unwrap();
+    assert!(
+        !is_comfyui_key_space(&converted),
+        "the converted map must carry no ComfyUI module name at all"
+    );
+    assert!(converted
+        .keys()
+        .all(|k| k.starts_with("transformer_blocks.") || k.starts_with("token_refiner.")));
 
     let mut dit = tiny_dit(&cfg);
-    let msg = apply_minimax_h3_adapters(&mut dit, &[spec(path, 1.0)])
-        .expect_err("a comfyui export must be refused")
-        .to_string();
-    assert!(msg.contains("_comfyui_"), "got {msg}");
-    assert!(msg.contains("qkv_proj"), "got {msg}");
-    assert!(
-        msg.contains("diffusers twin"),
-        "the refusal must name the file to use instead; got {msg}"
+    let r = apply_minimax_h3_adapters(&mut dit, &[spec(comfy, 1.0)]).expect("install");
+    assert_eq!(r.converted_from_comfyui, 1);
+
+    let plain = write_lora(dir.path(), "plain.safetensors", &cfg, Some("8"));
+    let mut dit = tiny_dit(&cfg);
+    let r = apply_minimax_h3_adapters(&mut dit, &[spec(plain, 1.0)]).expect("install");
+    assert_eq!(
+        r.converted_from_comfyui, 0,
+        "a diffusers file must not go through the conversion"
     );
+}
+
+/// **Block-diagonality is measured on the BYTES, not inferred from the shape.**
+///
+/// A shared-`A` fused LoRA whose rank happens to divide by three has exactly the shape a
+/// block-diagonal one would, so a converter that took `r % 3 == 0` as proof would split it into
+/// three rank-`r/3` LoRAs and divide its alpha — folding it three times too weak, on factors it was
+/// never trained with. The rank here is 96 precisely so the shape alone cannot decide.
+#[test]
+fn block_diagonality_is_measured_on_the_bytes_not_inferred_from_the_shape() {
+    let cfg = dit_fixture_config();
+    let r: i32 = 96;
+    assert_eq!(r % 3, 0);
+    let out = cfg.inner_dim();
+
+    let mut w = Weights::empty();
+    w.insert(
+        "blocks.0.attn.qkv_proj.lora_A.weight",
+        bf16(&tensor(&[r, cfg.hidden_size], 1.0)),
+    );
+    // A DENSE `[3·out, r]` B — emphatically not block-diagonal.
+    w.insert(
+        "blocks.0.attn.qkv_proj.lora_B.weight",
+        bf16(&tensor(&[3 * out, r], 2.0)),
+    );
+    w.insert(
+        "blocks.0.attn.qkv_proj.alpha",
+        Array::from_slice(&[48.0f32], &[1]),
+    );
+
+    let converted = convert_comfyui_key_space(&w).unwrap();
+    let a = converted
+        .require("transformer_blocks.0.attn.to_q.lora_A.weight")
+        .unwrap();
+    assert_eq!(
+        a.shape()[0],
+        r,
+        "a shared-A fused LoRA keeps its full rank; splitting it uses factors it never had"
+    );
+    let alpha = converted
+        .require("transformer_blocks.0.attn.to_q.alpha")
+        .unwrap()
+        .as_dtype(Dtype::Float32)
+        .unwrap()
+        .as_slice::<f32>()[0];
+    assert_eq!(
+        alpha, 48.0,
+        "the alpha must NOT be divided when the rank was not split"
+    );
+}
+
+/// `Weights` is not `Debug`, so `unwrap_err` is unavailable — match the error out by hand.
+fn expect_conversion_error(w: &Weights) -> String {
+    match convert_comfyui_key_space(w) {
+        Ok(_) => panic!("a malformed fused qkv must be refused, not silently split"),
+        Err(e) => e.to_string(),
+    }
+}
+
+/// A fused `qkv_proj` whose factors do not compose, or whose `B` is not three equal projections, is
+/// an error naming the module — never a guessed split.
+#[test]
+fn a_malformed_fused_qkv_is_refused_by_name() {
+    let cfg = dit_fixture_config();
+    let r = PUBLISHED_RANK;
+    let out = cfg.inner_dim();
+
+    let mut w = Weights::empty();
+    w.insert(
+        "blocks.0.attn.qkv_proj.lora_A.weight",
+        bf16(&tensor(&[3 * r, cfg.hidden_size], 1.0)),
+    );
+    w.insert(
+        "blocks.0.attn.qkv_proj.lora_B.weight",
+        bf16(&tensor(&[3 * out, r], 2.0)),
+    );
+    let e = expect_conversion_error(&w);
+    assert!(e.contains("do not compose"), "{e}");
+    assert!(e.contains("qkv_proj"), "{e}");
+
+    let mut w = Weights::empty();
+    w.insert(
+        "blocks.0.attn.qkv_proj.lora_A.weight",
+        bf16(&tensor(&[r, cfg.hidden_size], 1.0)),
+    );
+    w.insert(
+        "blocks.0.attn.qkv_proj.lora_B.weight",
+        bf16(&tensor(&[3 * out + 1, r], 2.0)),
+    );
+    let e = expect_conversion_error(&w);
+    assert!(e.contains("three equal q/k/v projections"), "{e}");
+
+    let mut w = Weights::empty();
+    w.insert(
+        "blocks.0.attn.qkv_proj.lora_A.weight",
+        bf16(&tensor(&[r, cfg.hidden_size], 1.0)),
+    );
+    let e = expect_conversion_error(&w);
+    assert!(e.contains("needs both"), "{e}");
 }
 
 // ─── real weights ──────────────────────────────────────────────────────────────────────────────

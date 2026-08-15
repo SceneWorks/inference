@@ -30,14 +30,19 @@
 //!   install. sc-17144 already required a real refiner for parity — this is a second, independent
 //!   reason.
 //!
-//! The `_comfyui_` twin of each file is a **different model shape**, not a different spelling, and is
-//! [rejected by name][`is_comfyui_key_space`] rather than half-applied: it fuses `to_q/to_k/to_v`
-//! into one `attn.qkv_proj` (block-diagonal `B`, concatenated `A`, alpha ×3) and swaps the SwiGLU
-//! halves of `mlp.fc1` to `[gate | value]` — the published DiT is `[value | gate]`
-//! ([`crate::layout`]). Folding it un-swapped is shape-identical and computes
-//! `w2(silu(value)·gate)`: precisely the sc-18740 defect a fully green parity suite did not see. Every
-//! comfyui file has a byte-equivalent diffusers twin in the same repo, so rejecting it costs no
-//! capability at all.
+//! The `_comfyui_` twin of each file is a **different module shape**, not a different spelling: it
+//! fuses `to_q/to_k/to_v` into one `attn.qkv_proj` (block-diagonal `B`, concatenated `A`, alpha ×3)
+//! and swaps the SwiGLU halves of `mlp.fc1` to `[gate | value]` — the published DiT is
+//! `[value | gate]` ([`crate::layout`]). Folding it un-converted is shape-identical and computes
+//! `w2(silu(value)·gate)`: precisely the sc-18740 defect a fully green parity suite did not see.
+//!
+//! It is detected by [`is_comfyui_key_space`] and **converted** by [`convert_comfyui_key_space`]
+//! (sc-19443). sc-18724 refused it instead, which was correct for the *published* set — every
+//! comfyui file has a byte-equivalent diffusers twin in the same repo — but SceneWorks accepts
+//! **user-supplied** LoRAs (epics 15404 / 14015) and community adapters are frequently distributed
+//! in ComfyUI format only, so a refusal left a real input with no path forward. The detection itself
+//! is unchanged: a file reaching the fold path in the wrong key space is still a
+//! silent-corruption bug.
 //!
 //! # The alpha trap — why neither existing path can load these files
 //!
@@ -73,6 +78,7 @@
 
 use std::collections::BTreeMap;
 
+use mlx_rs::ops::concatenate_axis;
 use mlx_rs::Array;
 
 use mlx_gen::adapters::loader::{apply_lokr, is_lokr, is_lokr_keys, ApplyReport};
@@ -80,10 +86,11 @@ use mlx_gen::adapters::{AdaptableHost, Adapter};
 use mlx_gen::array::scalar;
 use mlx_gen::gen_core::weightsmeta::{LoraAdapterMeta, LORA_ADAPTER_METADATA_KEY};
 use mlx_gen::runtime::{AdapterKind, AdapterSpec};
-use mlx_gen::weights::Weights;
+use mlx_gen::weights::{to_f32, Weights};
 use mlx_gen::{Error, Result};
 
 use crate::dit::config::MiniMaxH3DitConfig;
+use crate::tensor::slice_axis;
 
 /// The alpha upstream's `inference_minimax_h3.py` assumes when a LoRA declares none —
 /// `DEFAULT_LORA_ALPHA = 8`.
@@ -158,6 +165,9 @@ pub struct MiniMaxH3LoraReport {
     /// Adapter module paths that resolved to no module — surfaced, never silently dropped.
     /// [`apply_minimax_h3_adapters`] refuses to return with this non-empty.
     pub unmatched_paths: Vec<String>,
+    /// How many specs arrived in the ComfyUI key space and were converted (sc-19443). Zero for
+    /// every published diffusers file.
+    pub converted_from_comfyui: usize,
 }
 
 /// Every module path a MiniMax-H3 adapter can address, at `cfg`'s geometry: `num_layers` transformer
@@ -198,9 +208,12 @@ pub fn normalize_minimax_h3_key(key: &str) -> String {
 /// `true` if `w` is a lightx2v **`_comfyui_`** export rather than the diffusers one.
 ///
 /// Detected on the **keys** (`attn.qkv_proj` / `attn.out_proj` / `mlp.fc{1,2}` — module names that do
-/// not exist in the diffusers layout at all) rather than only on the `target_format` metadata stamp, so
-/// a re-export that drops the stamp is still caught. See the module docs for why this is refused and
-/// not converted.
+/// not exist in the diffusers layout at all) rather than only on the `target_format` metadata stamp,
+/// so a re-export that drops the stamp is still caught.
+///
+/// **Not relaxed by sc-19443.** That story changed what happens *after* detection (convert instead
+/// of refuse), never the detection itself: a file that reaches the fold path in the wrong key space
+/// is a silent-corruption bug.
 pub fn is_comfyui_key_space(w: &Weights) -> bool {
     w.keys().any(|k| {
         k.contains(".attn.qkv_proj.") || k.contains(".attn.out_proj.") || k.contains(".mlp.fc")
@@ -275,6 +288,235 @@ pub fn alpha_rank_fold(alpha: f32, rank: f32) -> f32 {
     (alpha as f64 / rank as f64) as f32
 }
 
+// ─── sc-19443: the ComfyUI key space ───────────────────────────────────────────────────────────
+
+/// The ComfyUI container prefix for the 50-block stack. Its diffusers spelling is
+/// `transformer_blocks.`; the token refiner keeps its name in both.
+const COMFY_BLOCK_CONTAINER: &str = "blocks.";
+
+/// Map a ComfyUI *container* path onto the diffusers one, leaving an already-diffusers path alone.
+///
+/// Order matters: `token_refiner.refiner_blocks.` and `transformer_blocks.` both *contain*
+/// `blocks.`, so they are matched first and returned unchanged. Only a bare leading `blocks.` — the
+/// ComfyUI spelling of the trunk — is rewritten.
+fn normalize_comfy_container(path: &str) -> String {
+    if path.starts_with("transformer_blocks.") || path.starts_with("token_refiner.") {
+        return path.to_string();
+    }
+    match path.strip_prefix(COMFY_BLOCK_CONTAINER) {
+        Some(rest) => format!("transformer_blocks.{rest}"),
+        None => path.to_string(),
+    }
+}
+
+/// Split `path` into `(container, comfy_leaf)` on the last ComfyUI module name it carries.
+fn split_comfy_leaf(path: &str) -> Option<(&str, &str)> {
+    for leaf in ["attn.qkv_proj", "attn.out_proj", "mlp.fc1", "mlp.fc2"] {
+        if let Some(head) = path.strip_suffix(leaf) {
+            return Some((head.trim_end_matches('.'), leaf));
+        }
+    }
+    None
+}
+
+/// Swap the two row halves of an output-side factor — `[gate | value] → [value | gate]`.
+///
+/// The DiT's `ff.net.0.proj` emits `[value | gate]` ([`crate::layout`]); ComfyUI's `mlp.fc1` emits
+/// `[gate | value]`. A LoRA's `lora_B` is the **output-side** factor, so the swap lands on its rows
+/// and `lora_A` is untouched — the input contraction is unchanged.
+///
+/// Folding without this swap computes `w2(silu(value)·gate)`: shape-identical, plausible output, and
+/// the sc-18740 defect that shipped green at cosine 0.73–0.78.
+fn swap_row_halves(path: &str, t: &Array) -> Result<Array> {
+    let rows = t.shape()[0];
+    if rows % 2 != 0 {
+        return Err(Error::Msg(format!(
+            "minimax_h3 adapter '{path}': a gated projection factor must have an even row count, \
+             got {rows}"
+        )));
+    }
+    let half = rows / 2;
+    let gate = slice_axis(t, 0, 0, half)?;
+    let value = slice_axis(t, 0, half, rows)?;
+    Ok(concatenate_axis(&[value, gate], 0)?)
+}
+
+/// Whether `up` `[3·out, 3·r]` is **block-diagonal** at block `(out, r)` — every off-diagonal block
+/// exactly zero.
+///
+/// Measured on the bytes, never assumed. It is what distinguishes the two legitimate fused forms in
+/// [`convert_comfyui_key_space`], and a wrong answer in either direction changes the per-projection
+/// rank and therefore the fold.
+fn is_block_diagonal(up: &Array, out: i32, r: i32) -> Result<bool> {
+    for row_block in 0..3 {
+        for col_block in 0..3 {
+            if row_block == col_block {
+                continue;
+            }
+            let rows = slice_axis(up, 0, row_block * out, (row_block + 1) * out)?;
+            let b = slice_axis(&rows, 1, col_block * r, (col_block + 1) * r)?;
+            let m = to_f32(&b)?.abs()?.max(None)?.item::<f32>();
+            if m != 0.0 {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// **Convert a ComfyUI-key-space MiniMax-H3 LoRA into the diffusers key space** (sc-19443).
+///
+/// SceneWorks accepts user-supplied LoRAs (epics 15404 / 14015) and community adapters are
+/// frequently distributed in ComfyUI format only, so this is a real input path. sc-18724 shipped a
+/// hard refusal here; the refusal was *correct* but left the user with no path forward, and every
+/// transform below is exactly invertible, so the conversion is chosen over confirming the refusal.
+///
+/// Three transforms, each separately capable of producing a runnable, wrong model:
+///
+/// 1. **`attn.qkv_proj` → `attn.to_q` / `to_k` / `to_v`.** Two fused forms are legitimate and are
+///    told apart by [`is_block_diagonal`] rather than assumed:
+///    * **Block-diagonal** (`A [3r, in]`, `B [3·out, 3r]`, the lightx2v twins' form): split both,
+///      giving factors byte-identical to the diffusers twin's, per-projection rank `r`, and an alpha
+///      divided by 3. The published `.alpha = 24` becomes `8`, which against rank 128 is the same
+///      `0.0625` the twin folds at — `24/384 == 8/128`.
+///    * **Shared-`A`** (`A [r, in]`, `B [3·out, r]`, what a LoRA trained natively on the fused
+///      module looks like): split `B`'s rows only and reuse `A`, rank `r`, alpha unchanged. Also
+///      exact.
+/// 2. **`mlp.fc1` → `ff.net.0.proj` with the SwiGLU halves swapped** — see [`swap_row_halves`].
+/// 3. **`attn.out_proj` → `attn.to_out.0`** and **`mlp.fc2` → `ff.net.2`** — pure renames.
+///
+/// The container prefix is normalized too (`blocks.{i}` → `transformer_blocks.{i}`).
+///
+/// **The returned `Weights` carries no metadata**, because it is rebuilt key by key. The caller must
+/// keep reading the file-level alpha from the ORIGINAL file — [`apply_minimax_h3_adapters`] does.
+///
+/// **What this does not do.** It does not claim any *other* key space. A kohya (`lora_unet_`) or BFL
+/// export still reaches the strict install and fails there, loudly.
+pub fn convert_comfyui_key_space(w: &Weights) -> Result<Weights> {
+    let mut converted = Weights::empty();
+    let suffix = |role: Role| match role {
+        Role::Down => ".lora_A.weight",
+        Role::Up => ".lora_B.weight",
+        Role::Alpha => ".alpha",
+    };
+    let mut fused: BTreeMap<String, FusedQkv> = BTreeMap::new();
+
+    for key in w.keys().map(str::to_string).collect::<Vec<_>>() {
+        let Some((stem, role)) = SUFFIXES
+            .iter()
+            .find_map(|(suf, role)| key.strip_suffix(suf).map(|s| (s, *role)))
+        else {
+            continue;
+        };
+        let path = normalize_comfy_container(&normalize_minimax_h3_key(stem));
+        let t = w.require(&key)?.clone();
+        let Some((container, leaf)) = split_comfy_leaf(&path) else {
+            converted.insert(format!("{path}{}", suffix(role)), t);
+            continue;
+        };
+        match leaf {
+            "attn.qkv_proj" => {
+                let slot = fused.entry(container.to_string()).or_default();
+                match role {
+                    Role::Down => slot.down = Some(t),
+                    Role::Up => slot.up = Some(t),
+                    Role::Alpha => slot.alpha = Some(read_alpha_tensor(&path, &t)?),
+                }
+            }
+            "attn.out_proj" => {
+                converted.insert(format!("{container}.attn.to_out.0{}", suffix(role)), t);
+            }
+            "mlp.fc1" => {
+                let target = format!("{container}.ff.net.0.proj{}", suffix(role));
+                let v = match role {
+                    Role::Up => swap_row_halves(&target, &t)?,
+                    Role::Down | Role::Alpha => t,
+                };
+                converted.insert(target, v);
+            }
+            "mlp.fc2" => {
+                converted.insert(format!("{container}.ff.net.2{}", suffix(role)), t);
+            }
+            other => {
+                return Err(Error::Msg(format!(
+                    "minimax_h3 adapter '{path}': unrecognized ComfyUI module '{other}'"
+                )));
+            }
+        }
+    }
+
+    for (container, parts) in fused {
+        let (Some(down), Some(up)) = (parts.down, parts.up) else {
+            return Err(Error::Msg(format!(
+                "minimax_h3 adapter '{container}.attn.qkv_proj': a fused qkv LoRA needs both \
+                 lora_A and lora_B; one is missing"
+            )));
+        };
+        if down.shape().len() != 2 || up.shape().len() != 2 {
+            return Err(Error::Msg(format!(
+                "minimax_h3 adapter '{container}.attn.qkv_proj': factors must be 2-D, got \
+                 a={:?} b={:?}",
+                down.shape(),
+                up.shape()
+            )));
+        }
+        let r_fused = down.shape()[0];
+        let (rows, r_up) = (up.shape()[0], up.shape()[1]);
+        if r_fused != r_up {
+            return Err(Error::Msg(format!(
+                "minimax_h3 adapter '{container}.attn.qkv_proj': lora_A is rank {r_fused} but \
+                 lora_B is rank {r_up}; the two factors do not compose"
+            )));
+        }
+        if rows <= 0 || rows % 3 != 0 {
+            return Err(Error::Msg(format!(
+                "minimax_h3 adapter '{container}.attn.qkv_proj': lora_B has {rows} rows, which is \
+                 not three equal q/k/v projections"
+            )));
+        }
+        let out_dim = rows / 3;
+        let block_diagonal =
+            r_fused > 0 && r_fused % 3 == 0 && is_block_diagonal(&up, out_dim, r_fused / 3)?;
+        for (i, name) in ["to_q", "to_k", "to_v"].iter().enumerate() {
+            let i = i as i32;
+            let stem = format!("{container}.attn.{name}");
+            let (a, b) = if block_diagonal {
+                let r = r_fused / 3;
+                let rows_i = slice_axis(&up, 0, i * out_dim, (i + 1) * out_dim)?;
+                (
+                    slice_axis(&down, 0, i * r, (i + 1) * r)?,
+                    slice_axis(&rows_i, 1, i * r, (i + 1) * r)?,
+                )
+            } else {
+                (
+                    down.clone(),
+                    slice_axis(&up, 0, i * out_dim, (i + 1) * out_dim)?,
+                )
+            };
+            converted.insert(format!("{stem}.lora_A.weight"), a);
+            converted.insert(format!("{stem}.lora_B.weight"), b);
+            if let Some(alpha) = parts.alpha {
+                // **The alpha division is the block-diagonal case's, and only its.** Splitting a
+                // `[3r, in]` `A` divides the per-projection rank by three, so the alpha must divide
+                // by three to hold `alpha/rank` fixed: the published `24/384` becomes `8/128`, both
+                // `0.0625`. The shared-`A` form keeps rank `r`, so its alpha is unchanged —
+                // dividing there would fold three times too weak.
+                let scaled = if block_diagonal { alpha / 3.0 } else { alpha };
+                converted.insert(format!("{stem}.alpha"), Array::from_slice(&[scaled], &[1]));
+            }
+        }
+    }
+    Ok(converted)
+}
+
+/// The three parts of one fused `attn.qkv_proj` module, collected before the split.
+#[derive(Default)]
+struct FusedQkv {
+    down: Option<Array>,
+    up: Option<Array>,
+    alpha: Option<f32>,
+}
+
 /// The factors and optional per-target alpha grouped for one module path.
 #[derive(Default)]
 struct LoraParts {
@@ -294,9 +536,15 @@ fn read_alpha_tensor(path: &str, a: &Array) -> Result<f32> {
 }
 
 /// Install one diffusers-key-space LoRA file's residuals onto `host` at `spec.scale`.
+///
+/// `w` supplies the **factors**; `meta` supplies the file-level `__metadata__`. They are the same
+/// `Weights` for a native diffusers file and differ for a converted ComfyUI one (sc-19443), where
+/// the converted map is rebuilt key by key and carries no metadata of its own — the alpha must
+/// still come from the file the user supplied.
 fn apply_one_lora(
     host: &mut impl AdaptableHost,
     w: &Weights,
+    meta: &Weights,
     spec: &AdapterSpec,
     report: &mut MiniMaxH3LoraReport,
 ) -> Result<()> {
@@ -321,9 +569,9 @@ fn apply_one_lora(
     // `lora_adapter_metadata` blob (sc-5513) is honored when present because a peft-saved file is a
     // legitimate input; the turbo files carry none, so they land on the `__metadata__["alpha"]` read
     // and its `DEFAULT_LORA_ALPHA` fallback.
-    let blob = LoraAdapterMeta::from_metadata(w.metadata(LORA_ADAPTER_METADATA_KEY));
-    let file_alpha = resolve_alpha(w)?;
-    let meta_rank = w.metadata(RANK_METADATA_KEY);
+    let blob = LoraAdapterMeta::from_metadata(meta.metadata(LORA_ADAPTER_METADATA_KEY));
+    let file_alpha = resolve_alpha(meta)?;
+    let meta_rank = meta.metadata(RANK_METADATA_KEY);
 
     for (path, parts) in groups {
         let (Some(down), Some(up)) = (parts.down, parts.up) else {
@@ -413,16 +661,25 @@ pub fn apply_minimax_h3_adapters(
     for spec in specs {
         let before = report.applied;
         let w = Weights::from_file(&spec.path)?;
-        if is_comfyui_key_space(&w) {
-            return Err(Error::Msg(format!(
-                "minimax_h3 adapter {}: this is a lightx2v `_comfyui_` export (fused \
-                 `attn.qkv_proj`, and `mlp.fc1` carrying the SwiGLU halves as [gate | value] where \
-                 the published DiT is [value | gate]). Folding it would be shape-valid and \
-                 numerically wrong. Use the diffusers twin of the same adapter from the same repo \
-                 — the file of the same name WITHOUT `_comfyui_`.",
-                spec.path.display()
-            )));
-        }
+        // sc-19443: a `_comfyui_` export is CONVERTED, not refused. Folding it un-converted would
+        // be shape-valid and numerically wrong (the sc-18740 class), so the conversion — and its
+        // re-check below — is what stands between the user and a silently corrupt render.
+        let comfy = is_comfyui_key_space(&w);
+        let converted = if comfy {
+            let c = convert_comfyui_key_space(&w)?;
+            if is_comfyui_key_space(&c) {
+                return Err(Error::Msg(format!(
+                    "minimax_h3 adapter {}: the ComfyUI conversion left a fused or unrenamed \
+                     module behind — refusing rather than folding a half-converted file",
+                    spec.path.display()
+                )));
+            }
+            report.converted_from_comfyui += 1;
+            Some(c)
+        } else {
+            None
+        };
+        let factors = converted.as_ref().unwrap_or(&w);
         if is_lokr(&w) || is_lokr_keys(&w) {
             let ApplyReport {
                 applied,
@@ -439,7 +696,7 @@ pub fn apply_minimax_h3_adapters(
                     spec.path.display()
                 )));
             }
-            apply_one_lora(host, &w, spec, &mut report)?;
+            apply_one_lora(host, factors, &w, spec, &mut report)?;
         }
         // Per-spec, NOT aggregate: this file, on its own, must have folded onto something. See the
         // doc comment — an aggregate check passes a junk file riding alongside a good one.

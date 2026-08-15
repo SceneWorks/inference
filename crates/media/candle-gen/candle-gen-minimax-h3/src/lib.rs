@@ -102,9 +102,13 @@
 //! ## Not in this crate
 //!
 //! Ref2VA (sc-17157) — the `transformer_ref` partition, the omni-reference presentation and the
-//! audio VAE **encoder** — and the turbo LoRA seam. Both are default-denied in [`model::descriptor`]
-//! rather than silently ignored.
+//! audio VAE **encoder** — is default-denied in [`model::descriptor`] rather than silently ignored.
+//!
+//! The turbo LoRA seam **is** here as of sc-18728: [`adapters`] is the candle twin of
+//! `mlx_gen_minimax_h3::adapters`, carrying the same key map, the same alpha rule, and (sc-19443)
+//! the ComfyUI key-space conversion the MLX lane originally refused.
 
+pub mod adapters;
 pub mod alias_free;
 pub mod audio_config;
 pub mod audio_vae;
@@ -128,6 +132,11 @@ pub mod text_encoder;
 pub mod vae;
 pub mod vae_encoder;
 
+pub use adapters::{
+    adapter_target_paths, alpha_rank_fold, apply_minimax_h3_adapters, convert_comfyui_key_space,
+    is_comfyui_key_space, normalize_minimax_h3_key, resolve_alpha, resolve_rank,
+    MiniMaxH3LoraReport, BLOCK_TARGETS, DEFAULT_LORA_ALPHA,
+};
 pub use alias_free::{kaiser_sinc_filter1d, Activation1d, LowPassFilter1d, SnakeBeta, UpSample1d};
 pub use audio_config::{
     BigVganConfig, MiniMaxH3AudioVaeConfig, ACTIVATION_KERNEL_SIZE, ACTIVATION_RESAMPLE_RATIO,

@@ -52,22 +52,30 @@
 //! # Not here
 //!
 //! `ref2va` (sc-17157) — the `transformer_ref` partition, the omni-reference presentation and the
-//! audio VAE encoder — and the turbo LoRA seam (the candle twin of `mlx_gen_minimax_h3::adapters`).
-//! Both are refused rather than silently ignored, but by **two different mechanisms**, and the
-//! distinction matters because only one of them is carried by the descriptor:
+//! audio VAE encoder. It is refused **by the descriptor**: the three `ref2va` conditioning kinds are
+//! absent from [`descriptor`]'s `conditioning` allowlist, and `Capabilities::validate_request` —
+//! which `MiniMaxH3::generate_impl` calls on every render — enforces that allowlist, so a reference
+//! request gets a typed `Unsupported` naming the kind.
 //!
-//! * **`ref2va` is refused by the descriptor.** The three `ref2va` conditioning kinds are absent
-//!   from [`descriptor`]'s `conditioning` allowlist, and `Capabilities::validate_request` — which
-//!   `MiniMaxH3::generate_impl` calls on every render — enforces that allowlist, so a reference
-//!   request gets a typed `Unsupported` naming the kind.
-//! * **The turbo LoRA seam, the quant tiers and every unread `LoadSpec` slot are refused by
-//!   [`load`].** `supports_lora`, `supports_lokr` and `supported_quants` are *declarations that
-//!   gen-core reads on no path*: no validator and no registry code inspects them. They are
-//!   advertisements to a weights-free consumer, not gates. The gates are the explicit
-//!   `spec.adapters` / `spec.quantize` checks in [`load`], plus `reject_unread_slots` for the
-//!   seven remaining slots this provider does not read; without them a spec carrying any of those
-//!   loaded clean and rendered with the caller's knob silently discarded. See [`load`] for the
-//!   full note.
+//! # The turbo LoRA seam IS here (sc-18728), and the declaration still gates nothing
+//!
+//! [`crate::adapters`] is the candle twin of `mlx_gen_minimax_h3::adapters`, installed through the
+//! single [`MiniMaxH3::load_task_dit`] seam. `supports_lora` is now `true` — but it is worth keeping
+//! the original finding on the record, because it is what shapes the code around it:
+//!
+//! **`supports_lora`, `supports_lokr` and `supported_quants` are declarations gen-core reads on no
+//! path.** No validator and no registry code inspects them. They are advertisements to a
+//! weights-free consumer, not gates. So flipping `supports_lora` to `true` grants nothing and
+//! flipping it to `false` would forbid nothing; the behaviour is entirely in
+//! [`crate::adapters::apply_minimax_h3_adapters`], which is strict about unmatched targets and
+//! about a file that folded nothing. Symmetrically, `supports_lokr: false` is enforced twice in
+//! real code — by kind in [`load`] and by file content in the installer — precisely because the
+//! flag itself cannot refuse anything.
+//!
+//! The quant tiers and every unread `LoadSpec` slot are still refused by [`load`]: the explicit
+//! `spec.quantize` check plus `reject_unread_slots` for the seven slots this provider does not
+//! read. Without them a spec carrying any of those loaded clean and rendered with the caller's knob
+//! silently discarded.
 
 use std::path::{Path, PathBuf};
 
@@ -77,7 +85,7 @@ use candle_gen::gen_core::{
     LoadSpec, MemoryProviderContract, Modality, ModelDescriptor, OffloadPolicy, Precision,
     Progress, SizeFloor, WeightsSource,
 };
-use candle_gen::gen_core::{ConditioningKind, Image};
+use candle_gen::gen_core::{AdapterSpec, ConditioningKind, Image};
 use candle_gen::{CandleError, Result};
 
 use crate::audio_config::{AUDIO_OUTPUT_CHANNELS, AUDIO_SAMPLE_RATE};
@@ -143,9 +151,17 @@ pub fn descriptor() -> ModelDescriptor {
             // `transformer_ref` path here: default-deny turns a reference request into a typed
             // `Unsupported` instead of a render that silently ignored it.
             conditioning: vec![ConditioningKind::Keyframe],
-            // The candle turbo-LoRA seam is not ported (the MLX sibling's `adapters`), and
-            // advertising it would accept a file this lane cannot fold.
-            supports_lora: false,
+            // **The turbo-LoRA seam is ported** (sc-18728): `crate::adapters` is the candle twin
+            // of `mlx_gen_minimax_h3::adapters`, installed on the job-local DiT in
+            // `generate_impl`. This bit is a declaration gen-core reads on no path, so it is an
+            // advertisement to a weights-free consumer; the enforcement is
+            // `crate::adapters::apply_minimax_h3_adapters`, which is strict about both unmatched
+            // targets and a file that matched nothing.
+            supports_lora: true,
+            // **LoKr stays false, and here that is enforced twice.** This DiT's adapter seam
+            // installs `scale·((x·A)·B)` residuals only; a Kronecker delta is a different
+            // operation, so `load` refuses `AdapterKind::Lokr` and the installer refuses a file
+            // carrying `lokr_*` factors regardless of how it was declared.
             supports_lokr: false,
             // The pre-quantized tiers are packed offline by the MLX lane's `convert`; this lane has
             // no tier loader of its own yet, so it advertises none rather than accepting a
@@ -198,6 +214,10 @@ pub struct MiniMaxH3 {
     dtype: DType,
     offload: OffloadPolicy,
     contract: MemoryProviderContract,
+    /// The staged adapter specs, held as **paths and strengths** rather than tensors — the same
+    /// discipline the rest of this struct keeps. They are read once per render, in
+    /// [`MiniMaxH3::load_task_dit`], onto the job-local DiT.
+    adapters: Vec<AdapterSpec>,
 }
 
 impl MiniMaxH3 {
@@ -233,6 +253,7 @@ impl MiniMaxH3 {
             // **Not `spec.offload_policy`.** See [`OFFLOAD_POLICY`] and the module docs.
             offload: OFFLOAD_POLICY,
             contract: crate::memory_strategy::contract_for(spec)?,
+            adapters: spec.adapters.clone(),
         })
     }
 
@@ -257,6 +278,38 @@ impl MiniMaxH3 {
     /// The device every phase materializes on.
     pub fn device(&self) -> &Device {
         &self.device
+    }
+
+    /// The adapter specs this provider was loaded with.
+    pub fn adapters(&self) -> &[AdapterSpec] {
+        &self.adapters
+    }
+
+    /// **The single render seam that maps a DiT partition and folds the staged adapters onto it**
+    /// (sc-18728).
+    ///
+    /// One function rather than an install at each call site, so a future `ref2va` denoise path
+    /// (sc-17157) cannot acquire a DiT that skipped the adapters — the MLX sibling landed the same
+    /// single seam for exactly that reason. The DiT is **job-local**: residuals are pushed onto this
+    /// render's own copy, never onto a shared resident base, so two concurrent renders at different
+    /// strengths cannot see each other's fold.
+    ///
+    /// The install is strict — an unmatched target, or a file that folded nothing, is an error
+    /// rather than a partial render — and it runs **before** `JointDit` precomputes the AdaLN
+    /// tables. That ordering is required rather than incidental: `adaln_proj` is deliberately
+    /// unreachable to adapters ([`crate::dit::block::DitBlock::adaptable_mut`]), so the precompute
+    /// must observe the same projection whether or not a LoRA is staged.
+    /// **`pub` on purpose.** The property "a staged adapter reaches the DiT this render denoises
+    /// with" cannot be asserted from outside the crate unless this seam is callable, and a source
+    /// scan asserting the call site *looks* right is not evidence that it folds anything —
+    /// `tests/turbo_lora.rs::the_render_seam_folds_the_staged_adapter_onto_the_dit` calls this and
+    /// reads the residual back off the returned model.
+    pub fn load_task_dit(&self, partition: &str) -> Result<MiniMaxH3Dit> {
+        let mut dit = MiniMaxH3Dit::load(&self.root, partition, &self.device, self.dtype)?;
+        if !self.adapters.is_empty() {
+            crate::adapters::apply_minimax_h3_adapters(&mut dit, &self.adapters)?;
+        }
+        Ok(dit)
     }
 
     /// Resolve the request's geometry: `frames` wins over `duration`, and the canvas falls back to
@@ -444,7 +497,7 @@ impl MiniMaxH3 {
         }
 
         // --- 2. denoise -----------------------------------------------------------------------
-        let dit = MiniMaxH3Dit::load(&self.root, BASE_DIT_PARTITION, &self.device, self.dtype)?;
+        let dit = self.load_task_dit(BASE_DIT_PARTITION)?;
         let patch = dit.config().patch_size;
         let layout = if anchors.is_empty() {
             t2va_layout(&geometry, context.dims()[1], patch, &self.device)?
@@ -652,20 +705,23 @@ impl Generator for MiniMaxH3 {
 
 /// Registry entry point.
 ///
-/// # The two load-time refusals, and why the descriptor flags cannot stand in for them
+/// # The load-time refusals, and why the descriptor flags cannot stand in for them
 ///
-/// [`descriptor`] sets `supports_lora` / `supports_lokr` to `false` and `supported_quants` to `&[]`,
-/// and the module docs above promise a request carrying either "gets a typed `Unsupported` at the
-/// contract boundary instead of a plausible render that quietly dropped it". **Those three fields are
-/// declarations that gen-core reads on no path.** `Capabilities::validate_request` gates the
+/// [`descriptor`] sets `supports_lokr` to `false` and `supported_quants` to `&[]`. **Those fields
+/// are declarations that gen-core reads on no path.** `Capabilities::validate_request` gates the
 /// conditioning allowlist (which is what actually default-denies the `ref2va` kinds) but never looks
 /// at `supports_lora` or `supported_quants`, and `ProviderRegistryBuilder` does not inspect a
-/// `LoadSpec` either — so without the checks below, a spec carrying `adapters` or `quantize` loaded
-/// clean and rendered with the caller's knob silently discarded. That is the precise failure the
-/// docs claimed was impossible.
+/// `LoadSpec` either — so without the checks below, a spec carrying `quantize`, a LoKr adapter, or a
+/// per-pass / MoE adapter knob loaded clean and rendered with the caller's knob silently discarded.
 ///
-/// `reject_unknown_components` does not cover this: it validates `spec.components`, a different field
-/// from `spec.adapters` and `spec.quantize`.
+/// `reject_unknown_components` does not cover this: it validates `spec.components`, a different
+/// field from `spec.adapters` and `spec.quantize`.
+///
+/// Since sc-18728 `spec.adapters` is **read** rather than refused — see
+/// [`MiniMaxH3::load_task_dit`] — so the checks here narrowed to the three adapter-shaped knobs this
+/// lane still cannot honor: `AdapterKind::Lokr`, `pass_scales` (LTX's two-stage schedule) and
+/// `moe_expert` (Wan's dual-expert selector). Each is a field a caller can set on an
+/// otherwise-valid LoRA, and each would otherwise be dropped without a word.
 ///
 /// This is the `candle-gen-mochi` idiom — refuse at the registry entry point, which returns
 /// `gen_core::Result` and can therefore carry the contract-load-bearing
@@ -673,17 +729,43 @@ impl Generator for MiniMaxH3 {
 ///
 /// # Every other `LoadSpec` slot is decided too
 ///
-/// The two checks below were the ones this crate shipped first, but "declared and unenforced" is a
+/// The checks below were the ones this crate shipped first, but "declared and unenforced" is a
 /// *class*, not two instances. `reject_unread_slots` closes the rest of it, and the three slots
 /// that are **not** refused are each accounted for there rather than left to inference.
 pub fn load(spec: &LoadSpec) -> candle_gen::gen_core::Result<Box<dyn Generator>> {
-    if !spec.adapters.is_empty() {
-        return Err(candle_gen::gen_core::Error::Unsupported(format!(
-            "{MODEL_ID}: the candle lane does not support LoRA/LoKr adapters — {} staged, and the \
-             turbo seam (the MLX sibling's `adapters`) is not ported here. Refused rather than \
-             rendered without them.",
-            spec.adapters.len()
-        )));
+    for a in &spec.adapters {
+        // **LoKr is still refused**, by kind here and by file content in
+        // [`crate::adapters::apply_minimax_h3_adapters`]. This DiT's seam installs
+        // `scale·((x·A)·B)` residuals; a Kronecker delta is a different operation, so accepting one
+        // would be a wrong fold rather than a weak one. Refused at the registry entry point because
+        // that is the boundary carrying `Error::Unsupported`.
+        if a.kind == candle_gen::gen_core::AdapterKind::Lokr {
+            return Err(candle_gen::gen_core::Error::Unsupported(format!(
+                "{MODEL_ID}: {} is staged as LoKr; the candle lane installs LoRA residuals only. \
+                 Use a LoRA export of the same adapter.",
+                a.path.display()
+            )));
+        }
+        // `pass_scales` is LTX's per-distilled-stage knob and `moe_expert` is Wan's dual-expert
+        // selector. This checkpoint has one denoise pass and one expert, so either is a knob that
+        // would be silently discarded — the exact class `reject_unread_slots` exists to close, one
+        // field deeper.
+        if a.pass_scales.is_some() {
+            return Err(candle_gen::gen_core::Error::Unsupported(format!(
+                "{MODEL_ID}: adapter {} sets `pass_scales`, which only LTX's two-stage denoise \
+                 reads. MiniMax-H3 runs ONE forward per step, so a per-pass schedule has nowhere \
+                 to apply and would be silently dropped.",
+                a.path.display()
+            )));
+        }
+        if a.moe_expert.is_some() {
+            return Err(candle_gen::gen_core::Error::Unsupported(format!(
+                "{MODEL_ID}: adapter {} names a MoE expert, which only the Wan2.2 A14B dual-expert \
+                 denoiser reads. This checkpoint is single-stream, so the selection would be \
+                 silently dropped.",
+                a.path.display()
+            )));
+        }
     }
     if let Some(q) = spec.quantize {
         return Err(candle_gen::gen_core::Error::Unsupported(format!(
@@ -943,8 +1025,12 @@ mod tests {
                         &["drop(vae);"],
                     ),
                     (
+                        // `load_task_dit` is the single seam that maps the partition AND folds any
+                        // staged LoRA (sc-18728), so the anchor tracks it rather than the inner
+                        // `MiniMaxH3Dit::load` — which is now one call deeper and outside this
+                        // function's body, where a scan of `generate_impl` cannot see it.
                         "the 66.3 GB DiT",
-                        &["MiniMaxH3Dit::load("],
+                        &["self.load_task_dit("],
                         &["drop(model);"],
                     ),
                     (
@@ -1034,44 +1120,100 @@ mod tests {
         root
     }
 
-    /// **A staged LoRA is REFUSED, not dropped.**
+    /// A `LoadSpec` adapter spec at `kind`, with the two model-specific knobs optional.
+    fn adapter_spec(
+        kind: candle_gen::gen_core::AdapterKind,
+        pass_scales: Option<Vec<f32>>,
+        moe_expert: Option<candle_gen::gen_core::MoeExpert>,
+    ) -> AdapterSpec {
+        AdapterSpec {
+            path: PathBuf::from("/turbo.safetensors"),
+            scale: 1.0,
+            kind,
+            pass_scales,
+            moe_expert,
+        }
+    }
+
+    /// **A staged LoRA is CARRIED to the render, not dropped and not refused** (sc-18728).
     ///
-    /// `supports_lora: false` is a declaration gen-core reads on no path — neither
-    /// `validate_request` nor the registry builder inspects it — so before this guard a spec
-    /// carrying `adapters` loaded clean and rendered with the adapter silently discarded, which is
-    /// exactly what the module docs promised could not happen.
-    ///
-    /// The control is the point: the SAME root with no adapters must still load, so this proves the
-    /// adapter is what refuses rather than the fixture being broken.
+    /// The predecessor of this test asserted the opposite — that `spec.adapters` was refused —
+    /// because the seam did not exist. Now that it does, the property worth guarding flips: `load`
+    /// must accept the spec **and** the loaded provider must still be holding it, because "accepted
+    /// then discarded" is exactly the silent failure the old refusal existed to prevent, and it is
+    /// indistinguishable from success at the `load` boundary alone.
     #[test]
-    fn a_staged_lora_is_refused_rather_than_silently_dropped() {
+    fn a_staged_lora_survives_load_rather_than_being_dropped() {
         let tmp = tempfile::tempdir().unwrap();
         let root = staged_root(&tmp);
 
-        // Control: without adapters the very same spec loads.
-        load(&LoadSpec::new(WeightsSource::Dir(root.clone())))
-            .expect("the bare spec must load — otherwise the refusal below proves nothing");
+        // Control: without adapters the same root loads and holds none.
+        let bare = MiniMaxH3::load(&LoadSpec::new(WeightsSource::Dir(root.clone()))).unwrap();
+        assert!(bare.adapters().is_empty());
 
-        let spec = LoadSpec::new(WeightsSource::Dir(root)).with_adapters(vec![
-            candle_gen::gen_core::AdapterSpec {
-                path: PathBuf::from("/turbo.safetensors"),
-                scale: 1.0,
-                kind: candle_gen::gen_core::AdapterKind::Lora,
-                pass_scales: None,
-                moe_expert: None,
-            },
-        ]);
-        // `Box<dyn Generator>` is not `Debug`, so `expect_err` is unavailable.
-        let err = match load(&spec) {
-            Ok(_) => panic!("a staged LoRA must be refused, not silently dropped"),
-            Err(e) => e,
-        };
-        assert!(
-            matches!(err, candle_gen::gen_core::Error::Unsupported(_)),
-            "must be the contract-load-bearing Unsupported, not an opaque Msg: {err:?}"
+        let spec = LoadSpec::new(WeightsSource::Dir(root)).with_adapters(vec![adapter_spec(
+            candle_gen::gen_core::AdapterKind::Lora,
+            None,
+            None,
+        )]);
+        load(&spec).expect("a LoRA spec must load now that the seam is ported");
+
+        let model = MiniMaxH3::load(&spec).unwrap();
+        assert_eq!(
+            model.adapters().len(),
+            1,
+            "the spec's adapters must be RETAINED — a provider that accepted and forgot them would \
+             render at the base checkpoint with no error at all"
         );
-        let msg = err.to_string();
-        assert!(msg.contains("LoRA/LoKr"), "{msg}");
+        assert_eq!(model.adapters()[0].scale, 1.0);
+    }
+
+    /// **The three adapter-shaped knobs this lane still cannot honor are refused by name.**
+    ///
+    /// Each is a field a caller can set on an otherwise-valid LoRA spec, and each is read by nothing
+    /// in this crate. They are asserted **individually**, not as a set: a single "some knob is
+    /// refused" arm would stay green if two of the three checks were deleted.
+    ///
+    /// The control at the top is what makes the arms attributable — the same path, the same scale,
+    /// everything identical except the knob under test, loads cleanly.
+    #[test]
+    fn lokr_and_the_two_foreign_adapter_knobs_are_each_refused_individually() {
+        use candle_gen::gen_core::{AdapterKind, MoeExpert};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = staged_root(&tmp);
+        let with =
+            |a: AdapterSpec| LoadSpec::new(WeightsSource::Dir(root.clone())).with_adapters(vec![a]);
+
+        // Control: a plain LoRA with neither knob set loads.
+        load(&with(adapter_spec(AdapterKind::Lora, None, None)))
+            .expect("the plain LoRA control must load — otherwise the arms prove nothing");
+
+        for (spec, needle) in [
+            (adapter_spec(AdapterKind::Lokr, None, None), "LoKr"),
+            (
+                adapter_spec(AdapterKind::Lora, Some(vec![1.0, 0.5]), None),
+                "pass_scales",
+            ),
+            (
+                adapter_spec(AdapterKind::Lora, None, Some(MoeExpert::High)),
+                "MoE expert",
+            ),
+        ] {
+            // `Box<dyn Generator>` is not `Debug`, so `expect_err` is unavailable.
+            let err = match load(&with(spec)) {
+                Ok(_) => panic!("{needle} must be refused, not silently dropped"),
+                Err(e) => e,
+            };
+            assert!(
+                matches!(err, candle_gen::gen_core::Error::Unsupported(_)),
+                "must be the contract-load-bearing Unsupported, not an opaque Msg: {err:?}"
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains(needle),
+                "the refusal must name the knob it refused; wanted {needle:?}, got {msg}"
+            );
+        }
     }
 
     /// **A `ref2va` request is REFUSED on the RENDER PATH, not merely absent from the descriptor.**
@@ -1320,8 +1462,12 @@ mod tests {
             .capabilities
             .conditioning
             .contains(&ConditioningKind::ReferenceAudio));
-        // The turbo LoRA seam is not ported here.
-        assert!(!d.capabilities.supports_lora);
+        // **The turbo LoRA seam IS ported** (sc-18728) — and this bit is only an advertisement:
+        // gen-core reads `supports_lora` on no path, so what a consumer can rely on is
+        // `crate::adapters`, exercised end-to-end in `tests/turbo_lora.rs`.
+        assert!(d.capabilities.supports_lora);
+        // LoKr stays false and is enforced twice in real code (by kind in `load`, by file content
+        // in the installer) precisely because this flag refuses nothing on its own.
         assert!(!d.capabilities.supports_lokr);
         assert!(d.capabilities.supported_quants.is_empty());
         // The residency lifecycle IS wired — and forced — so the discovery signal says so. This is
