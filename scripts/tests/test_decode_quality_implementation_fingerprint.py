@@ -13,8 +13,22 @@ SPEC.loader.exec_module(fingerprint_module)
 
 
 class DecodeQualityImplementationFingerprintTests(unittest.TestCase):
-    def test_embedded_decode_quality_source_closure_is_current(self) -> None:
-        self.assertEqual(fingerprint_module.embedded(), fingerprint_module.fingerprint())
+    # `test_embedded_decode_quality_source_closure_is_current` used to live here. It asserted that a
+    # constant compiled into gen-core equalled the derived closure, so every dependency bump, pin
+    # bump, main sync, and unrelated `mlx-gen/src` edit turned this file red until someone pasted a
+    # new digest in by hand. sc-19728 deleted the constant: the stamp is now derived at measurement
+    # time and recorded rather than matched, so there is no second copy that can go stale and
+    # nothing here to keep current.
+    #
+    # `test_module_exposes_no_embedded_constant_reader` below is the negative control for that
+    # removal — it fails if `embedded()` comes back.
+
+    def test_module_exposes_no_embedded_constant_reader(self) -> None:
+        self.assertFalse(
+            hasattr(fingerprint_module, "embedded"),
+            "reintroducing embedded() means a hand-maintained copy of this digest exists again; "
+            "sc-19728 removed it deliberately",
+        )
         self.assertEqual(len(fingerprint_module.fingerprint()), 64)
 
     def test_source_closure_is_sorted_unique_and_excludes_build_artifacts(self) -> None:

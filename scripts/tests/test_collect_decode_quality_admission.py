@@ -11,6 +11,11 @@ assert SPEC and SPEC.loader
 collector = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(collector)
 
+# An arbitrary well-formed stamp. sc-19728: the collector records this value and checks its shape;
+# it deliberately does not derive one to compare against, because the closure it would derive spans
+# `Cargo.lock` and whole `src` trees and would refuse any receipt not from a byte-identical tree.
+STAMP = "0123456789abcdef" * 4
+
 
 def receipt(seed: int, error: int) -> dict:
     token = f"{seed:064x}"
@@ -26,7 +31,7 @@ def receipt(seed: int, error: int) -> dict:
             "variant": "q4",
             "fingerprint": f"SceneWorks/realvisxl-mlx@{'a' * 40}:q4",
         },
-        "implementationFingerprint": collector.IMPLEMENTATION_FINGERPRINT,
+        "implementationFingerprint": STAMP,
         "mode": "text_to_image",
         "overlay": None,
         "geometry": {
@@ -163,6 +168,7 @@ class DecodeQualityAdmissionCollectorTests(unittest.TestCase):
             lambda row: row.update(loadShape="eager_materialization"),
             lambda row: row["artifact"].update(variant="q8"),
             lambda row: row.update(tileEdge=768, overlap=128),
+            lambda row: row.update(implementationFingerprint="b" * 64),
         ):
             pair = [receipt(7, 1), receipt(99, 2)]
             for row in pair:
@@ -170,7 +176,7 @@ class DecodeQualityAdmissionCollectorTests(unittest.TestCase):
             variants.extend(pair)
 
         policies = collector.seal([*rows, *variants])
-        self.assertEqual(len(policies), 4)
+        self.assertEqual(len(policies), 5)
         coordinates = {
             (
                 policy["loadShape"],
@@ -181,7 +187,26 @@ class DecodeQualityAdmissionCollectorTests(unittest.TestCase):
             )
             for policy in policies
         }
-        self.assertEqual(len(coordinates), 4)
+        self.assertEqual(len(coordinates), 5)
+
+    def test_a_foreign_source_closure_stamp_is_sealed_rather_than_refused(self) -> None:
+        """sc-19728: the collector records the stamp it is given; it does not adjudicate currency.
+
+        Before this story the receipt had to equal a constant embedded in gen-core, and restoring
+        any equality check here — against that constant or against a freshly derived closure —
+        turns this red. `800d06ac...` is the stamp on the 69 shipped rows.
+        """
+        for foreign in ("800d06acf579a36e604d91955fd6a6852ec70bc39701f7a320f1fdd2bf5ff29d", "f" * 64):
+            with self.subTest(stamp=foreign):
+                rows = [receipt(7, 1), receipt(99, 2)]
+                for row in rows:
+                    row["implementationFingerprint"] = foreign
+                policies = collector.seal(
+                    collector.read_receipts([self.write_log(row) for row in rows])
+                )
+                self.assertEqual(len(policies), 1)
+                self.assertEqual(policies[0]["implementationFingerprint"], foreign)
+                self.assertEqual(policies[0]["disposition"], {"kind": "admitted"})
 
     def test_rejects_malformed_load_and_source_identity(self) -> None:
         cases = [
@@ -197,10 +222,6 @@ class DecodeQualityAdmissionCollectorTests(unittest.TestCase):
             (
                 lambda row: row.update(implementationFingerprint="g" * 64),
                 "implementationFingerprint",
-            ),
-            (
-                lambda row: row.update(implementationFingerprint="f" * 64),
-                "running inference source closure",
             ),
         ]
         for mutate, message in cases:

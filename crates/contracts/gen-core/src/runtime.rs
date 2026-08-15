@@ -793,7 +793,7 @@ impl LoadSpec {
         self
     }
 
-    /// Bind packaged decode-quality rows to the artifact and source closure actually being loaded.
+    /// Bind packaged decode-quality rows to the artifact actually being loaded.
     pub fn with_decode_quality_runtime_identity(
         mut self,
         identity: MemoryDecodeQualityRuntimeIdentity,
@@ -818,12 +818,14 @@ impl LoadSpec {
     fn route_and_family_bound_decode_geometry_policies(
         &self,
     ) -> crate::Result<Vec<MemoryDecodeGeometryPolicy>> {
-        self.decode_quality_runtime_identity.as_ref().ok_or_else(|| {
-            crate::Error::Unsupported(
-                "decode-quality policies require independently resolved artifact and implementation identity"
-                    .to_owned(),
-            )
-        })?;
+        self.decode_quality_runtime_identity
+            .as_ref()
+            .ok_or_else(|| {
+                crate::Error::Unsupported(
+                    "decode-quality policies require an independently resolved artifact identity"
+                        .to_owned(),
+                )
+            })?;
         let route = self.resolved_route.as_deref().ok_or_else(|| {
             crate::Error::Unsupported(
                 "decode-quality policies require an exact caller-resolved route".to_owned(),
@@ -863,22 +865,22 @@ impl LoadSpec {
         &self,
         policies: &[MemoryDecodeGeometryPolicy],
     ) -> crate::Result<()> {
-        let identity = self.decode_quality_runtime_identity.as_ref().ok_or_else(|| {
-            crate::Error::Unsupported(
-                "decode-quality policies require independently resolved artifact and implementation identity"
-                    .to_owned(),
-            )
-        })?;
-        if let Some(foreign) = policies.iter().find(|policy| {
-            policy.artifact != identity.artifact
-                || policy.implementation_fingerprint != identity.implementation_fingerprint
-        }) {
+        let identity = self
+            .decode_quality_runtime_identity
+            .as_ref()
+            .ok_or_else(|| {
+                crate::Error::Unsupported(
+                    "decode-quality policies require an independently resolved artifact identity"
+                        .to_owned(),
+                )
+            })?;
+        if let Some(foreign) = policies
+            .iter()
+            .find(|policy| policy.artifact != identity.artifact)
+        {
             return Err(crate::Error::Unsupported(format!(
-                "decode-quality policy artifact/source identity {:?}/{} cannot authorize loaded identity {:?}/{}",
-                foreign.artifact,
-                foreign.implementation_fingerprint,
-                identity.artifact,
-                identity.implementation_fingerprint,
+                "decode-quality policy artifact identity {:?} cannot authorize loaded identity {:?}",
+                foreign.artifact, identity.artifact,
             )));
         }
         Ok(())

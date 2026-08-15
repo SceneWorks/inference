@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
-"""Derive the conservative decode-quality implementation source closure.
+"""Derive the decode-quality implementation source closure recorded on each measurement.
 
-The closure recursively hashes a fail-closed superset of the involved shared and provider crate
-sources, manifests, and embedded assets. It intentionally over-invalidates when an included source
-is not exercised by a particular route. This script only reads source bytes: it never executes those
-sources, loads a model, samples memory, reads timing, or consumes calibration artifacts. The embedded
-Rust constant is normalized to zeros before hashing so the digest can self-identify without a
-recursive fixed-point problem.
+The digest names the source tree that produced a measurement. It is a **forensic stamp, not an
+admission gate** (sc-19728): the real-weight harness records it on every receipt, and nothing
+refuses a row for carrying a different one. Measurements stand until they are remeasured.
+
+That is what lets the closure stay a deliberately broad, fail-closed superset of the involved shared
+and provider crate sources, manifests, and embedded assets. As a gate the breadth was the defect —
+`Cargo.lock` and whole-crate `src` trees meant every dependency bump and main sync invalidated every
+measurement, and the constant it was compared against was re-derived by hand each time. As a stamp
+the same breadth is free: over-recording costs nothing and never blocks anyone.
+
+This script only reads source bytes. It never executes those sources, loads a model, samples memory,
+reads timing, or consumes calibration artifacts.
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
-import re
 from pathlib import Path
 
 
@@ -71,53 +76,30 @@ def semantic_source_closure(
 
 
 FILES = semantic_source_closure()
-CONSTANT = re.compile(
-    rb'(MEMORY_DECODE_QUALITY_IMPLEMENTATION_FINGERPRINT: &str =\s*\n?\s*")[0-9a-f]{64}(";)'
-)
-CANONICAL_FIXTURE = re.compile(
-    rb'(MEMORY_DECODE_QUALITY_CANONICAL_FIXTURE_SHA256: &str =\s*\n?\s*")[0-9a-f]{64}(";)'
-)
 
 
 def fingerprint() -> str:
+    """Hash the closure verbatim.
+
+    No byte is normalized away. The predecessor blanked two embedded Rust constants before hashing,
+    because the digest was written back into one of them and the other tracked it — a fixed point
+    that only existed because the value had to live in the binary to be compared against. Nothing
+    compares it now, so nothing writes it back, so the hash is over the sources as they are.
+    """
     digest = hashlib.sha256()
     for relative in FILES:
-        path = ROOT / relative
-        payload = path.read_bytes()
-        if relative.endswith("memory_strategy.rs") and "gen-core" in relative:
-            payload, replacements = CONSTANT.subn(rb"\g<1>" + b"0" * 64 + rb"\g<2>", payload)
-            if replacements != 1:
-                raise ValueError("could not normalize the embedded decode-quality fingerprint")
-            payload, replacements = CANONICAL_FIXTURE.subn(
-                rb"\g<1>" + b"0" * 64 + rb"\g<2>", payload
-            )
-            if replacements != 1:
-                raise ValueError("could not normalize the canonical decode-quality fixture hash")
         digest.update(relative.encode("utf-8"))
         digest.update(b"\0")
-        digest.update(payload)
+        digest.update((ROOT / relative).read_bytes())
         digest.update(b"\xff")
     return digest.hexdigest()
 
 
-def embedded() -> str:
-    payload = (ROOT / "crates/contracts/gen-core/src/memory_strategy.rs").read_bytes()
-    match = CONSTANT.search(payload)
-    if match is None:
-        raise ValueError("could not read the embedded decode-quality fingerprint")
-    return payload[match.start(0) : match.end(0)].decode("utf-8").split('"')[1]
-
-
 def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--check", action="store_true")
-    args = parser.parse_args()
-    actual = fingerprint()
-    if args.check and embedded() != actual:
-        raise SystemExit(
-            f"decode-quality implementation fingerprint is stale: embedded={embedded()} actual={actual}"
-        )
-    print(actual)
+    # Deliberately no flags. Parsing anyway rejects stray arguments, so a caller still passing the
+    # removed `--check` fails loudly instead of silently printing a digest it meant to verify.
+    argparse.ArgumentParser().parse_args()
+    print(fingerprint())
     return 0
 
 

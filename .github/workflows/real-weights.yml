@@ -779,7 +779,10 @@ jobs:
           DECODE_QUALITY_SOURCE_REVISION: ${{ env.QUALITY_SOURCE_REVISION }}
         run: |
           set -euo pipefail
-          python3.12 scripts/ci/decode_quality_implementation_fingerprint.py --check
+          # Stamp each receipt with the closure derived from this checkout (sc-19728). Recorded for
+          # forensics, not matched against the build: measurements stand until they are remeasured.
+          DECODE_QUALITY_IMPLEMENTATION_FINGERPRINT="$(python3.12 scripts/ci/decode_quality_implementation_fingerprint.py)"
+          export DECODE_QUALITY_IMPLEMENTATION_FINGERPRINT
           log="$RUNNER_TEMP/decode-quality-v2-kolors-kolors-${{ matrix.candidate.geometry }}.log"
           out="$(cargo test --locked --release -p mlx-gen-kolors \
             --test decode_quality_admission production_latent_quality_admission \
@@ -888,7 +891,10 @@ jobs:
           DECODE_QUALITY_SOURCE_REVISION: ${{ env.QUALITY_SOURCE_REVISION }}
         run: |
           set -euo pipefail
-          python3.12 scripts/ci/decode_quality_implementation_fingerprint.py --check
+          # Stamp each receipt with the closure derived from this checkout (sc-19728). Recorded for
+          # forensics, not matched against the build: measurements stand until they are remeasured.
+          DECODE_QUALITY_IMPLEMENTATION_FINGERPRINT="$(python3.12 scripts/ci/decode_quality_implementation_fingerprint.py)"
+          export DECODE_QUALITY_IMPLEMENTATION_FINGERPRINT
           log="$RUNNER_TEMP/decode-quality-v2-sdxl-$QUALITY_MODEL-${{ matrix.candidate.geometry }}.log"
           out="$(cargo test --locked --release -p mlx-gen-sdxl \
             --test decode_quality_admission production_latent_quality_admission \
@@ -981,7 +987,10 @@ jobs:
           DECODE_QUALITY_SOURCE_REVISION: ${{ env.QUALITY_SOURCE_REVISION }}
         run: |
           set -euo pipefail
-          python3.12 scripts/ci/decode_quality_implementation_fingerprint.py --check
+          # Stamp each receipt with the closure derived from this checkout (sc-19728). Recorded for
+          # forensics, not matched against the build: measurements stand until they are remeasured.
+          DECODE_QUALITY_IMPLEMENTATION_FINGERPRINT="$(python3.12 scripts/ci/decode_quality_implementation_fingerprint.py)"
+          export DECODE_QUALITY_IMPLEMENTATION_FINGERPRINT
           log="$RUNNER_TEMP/decode-quality-v2-chroma-$QUALITY_MODEL-${{ matrix.candidate.geometry }}.log"
           out="$(cargo test --locked --release -p mlx-gen-chroma \
             --test decode_quality_admission production_latent_quality_admission \
