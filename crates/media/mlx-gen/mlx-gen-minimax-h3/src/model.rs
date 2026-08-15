@@ -137,7 +137,18 @@ pub fn descriptor() -> ModelDescriptor {
             supports_kv_cache: false,
             requires_sigma_shift: false,
             supports_sequential_offload: false,
+            // The TE → DiT → VAE phase order is hardcoded in `generate_impl`, not a load-time
+            // default a `GenerationMemory` block could switch off, so every generate stages
+            // physically whatever residency the request selects. This is why
+            // [`crate::memory_strategy`] models the floor as `PhaseEnvelope` — `max(TE, DiT, VAE)`
+            // and never the sum, because the three are never co-resident. Independent of
+            // `supports_sequential_offload` above: the staging is unconditional, but no *selectable*
+            // Sequential control is wired onto the shared residency seam.
+            unconditionally_engages_staged_residency: true,
             supports_preview: false,
+            // No enhancement surface exists in this crate: `enhance_prompt` is ignored, so
+            // advertising it would describe a toggle a UI must not present as effective.
+            supports_prompt_enhancement: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
