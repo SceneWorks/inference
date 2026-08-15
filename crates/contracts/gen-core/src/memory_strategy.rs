@@ -138,20 +138,16 @@ pub const MEMORY_CALIBRATION_ABI: u32 = 3;
 /// captured or refreshed.
 pub const MEMORY_DECODE_QUALITY_ABI: u32 = 2;
 
-/// Conservative source-closure fingerprint for the production decode paths and correctness-only
-/// harness that define [`MEMORY_DECODE_QUALITY_ABI`]. The repository test beside the collector
-/// recursively re-derives this value from a fail-closed superset of the involved shared/provider
-/// crate sources, manifests, and embedded assets. Changing any included byte invalidates receipts,
-/// even when a particular route does not exercise that source.
+/// Canonical evidence digest of the fixed quality record built by this module's tests.
 ///
-/// This is intentionally independent from a Git commit: a reviewed head and its byte-identical
-/// merge commit have different object ids but the same implementation. Derivation reads source
-/// bytes only; it does not execute measurement code or consume measurement artifacts.
-pub const MEMORY_DECODE_QUALITY_IMPLEMENTATION_FINGERPRINT: &str =
-    "63c6f89da806e02f098598c595d1e5b46a619d05f3beb269fe40334e60c39cd9";
+/// This pins the *serialization* contract shared by Rust and the Python collector. It moves when
+/// [`MemoryDecodeGeometryPolicy::computed_evidence_sha256`] changes shape, or when the fixture it
+/// digests changes value — but, unlike before sc-19728, never in response to unrelated repository
+/// bytes, because the fixture's stamp is a literal rather than a constant tracking a source
+/// closure. See the note on `implementation_fingerprint` in [`MemoryDecodeGeometryPolicy`].
 #[cfg(test)]
 const MEMORY_DECODE_QUALITY_CANONICAL_FIXTURE_SHA256: &str =
-    "87e9ecca9ab5d9d3721a316c22fed63dfb8c5aac519ddb66cf0a80384425d6fb";
+    "481c5551c57be43823e74c5c9d85907b85fab2ba57dad9ac215ad005d56a34e8";
 
 /// Prefix for the single-line calibration observation protocol consumed by release tooling.
 ///
@@ -1938,11 +1934,9 @@ fn validate_decode_geometry_policies(contract: &MemoryProviderContract, errors: 
         } else {
             artifact = Some(&policy.artifact);
         }
-        if !is_lower_hex_sha256(&policy.implementation_fingerprint)
-            || policy.implementation_fingerprint != MEMORY_DECODE_QUALITY_IMPLEMENTATION_FINGERPRINT
-        {
+        if !is_lower_hex_sha256(&policy.implementation_fingerprint) {
             errors.push(
-                "decode quality implementation fingerprint does not match the running quality source closure"
+                "decode quality implementation fingerprint must be a lowercase SHA-256 stamp"
                     .to_owned(),
             );
         }
@@ -2545,13 +2539,19 @@ pub struct MemoryDecodeArtifactIdentity {
     pub fingerprint: String,
 }
 
-/// Independently resolved identity of the artifact and running quality implementation used by one
-/// concrete load. Callers attach this beside packaged rows; [`LoadSpec`](crate::LoadSpec) refuses to
-/// pass rows into a provider unless both halves match exactly.
+/// Independently resolved identity of the artifact used by one concrete load. Callers attach this
+/// beside packaged rows; [`LoadSpec`](crate::LoadSpec) refuses to pass rows into a provider unless
+/// it matches exactly.
+///
+/// This axis is *independent* of the packaged rows — the loader resolves it from the model tree it
+/// actually opened — which is what makes it able to discriminate. sc-19728 removed a parallel
+/// `implementation_fingerprint` axis from this struct: its only possible source was a constant
+/// compiled into the same build that also stamped the rows, so once currency enforcement was
+/// dropped it could only ever compare a value against itself. A vacuous axis that still reads as
+/// protection is worse than no axis, so it is gone rather than defanged.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemoryDecodeQualityRuntimeIdentity {
     pub artifact: MemoryDecodeArtifactIdentity,
-    pub implementation_fingerprint: String,
 }
 
 /// Geometry-aware tiled-decode policy and its immutable production-quality receipt.
@@ -2569,7 +2569,22 @@ pub struct MemoryDecodeGeometryPolicy {
     pub tier: MemoryNumericTier,
     pub load_shape: LoadShape,
     pub artifact: MemoryDecodeArtifactIdentity,
-    /// Exact quality-relevant inference/harness source closure.
+    /// Source closure that produced this measurement — **a forensic stamp, not an admission gate**.
+    ///
+    /// `scripts/ci/decode_quality_implementation_fingerprint.py` derives it from the repository at
+    /// collection time and the real-weight harness records it, so it always names the code that
+    /// actually ran. It is sealed into [`Self::production_evidence_sha256`], so it cannot be edited
+    /// after the fact, and it answers "was this row measured before or after the tiling rewrite?".
+    ///
+    /// It is deliberately **not** compared against the running build (sc-19728). That comparison
+    /// existed and was removed: the closure spans whole crates plus `Cargo.lock`, so every
+    /// dependency bump, pin bump, and main sync invalidated every measurement, and the constant was
+    /// re-derived by hand each time — a gate that is routinely restamped is not gating, it is
+    /// charging a round trip. Measurements now stand until they are remeasured. The properties that
+    /// still fail closed are the ones that discriminate: the ABI, the sealed evidence digest, the
+    /// measured error against [`Self::maximum_error`], and the artifact identity of the loaded
+    /// model. Restoring currency enforcement means bumping [`MEMORY_DECODE_QUALITY_ABI`] — a
+    /// deliberate, human-owned act at the granularity where invalidating every row is the intent.
     pub implementation_fingerprint: String,
     pub mode: MemoryMode,
     pub overlay: Option<String>,
@@ -3723,6 +3738,16 @@ mod tests {
         }
     }
 
+    /// An arbitrary well-formed source stamp, deliberately unrelated to anything in this build.
+    ///
+    /// Before sc-19728 this fixture read the compiled
+    /// `MEMORY_DECODE_QUALITY_IMPLEMENTATION_FINGERPRINT`, which is why
+    /// [`MEMORY_DECODE_QUALITY_CANONICAL_FIXTURE_SHA256`] churned every time an unrelated source
+    /// file changed. Pinning a literal here is what makes that canonical digest track the
+    /// serialization contract it is meant to pin, and nothing else.
+    const DECODE_QUALITY_STAMP: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
     fn decode_quality_policy(contract: &MemoryProviderContract) -> MemoryDecodeGeometryPolicy {
         MemoryDecodeGeometryPolicy {
             quality_abi: MEMORY_DECODE_QUALITY_ABI,
@@ -3741,7 +3766,7 @@ mod tests {
                 variant: "q4".to_owned(),
                 fingerprint: format!("SceneWorks/test-model@{}:q4", "a".repeat(40)),
             },
-            implementation_fingerprint: MEMORY_DECODE_QUALITY_IMPLEMENTATION_FINGERPRINT.to_owned(),
+            implementation_fingerprint: DECODE_QUALITY_STAMP.to_owned(),
             mode: MemoryMode::TextToImage,
             overlay: None,
             geometry: MemoryGeometry {
@@ -3780,7 +3805,6 @@ mod tests {
     ) -> MemoryDecodeQualityRuntimeIdentity {
         MemoryDecodeQualityRuntimeIdentity {
             artifact: policy.artifact.clone(),
-            implementation_fingerprint: policy.implementation_fingerprint.clone(),
         }
     }
 
@@ -3884,7 +3908,7 @@ mod tests {
     }
 
     #[test]
-    fn load_quality_table_requires_every_artifact_and_implementation_identity_axis() {
+    fn load_quality_table_requires_every_artifact_identity_axis() {
         let contract = adopted_contract();
         let mut policy = decode_quality_policy(&contract);
         policy.resolved_route = "realvisxl".to_owned();
@@ -3920,11 +3944,6 @@ mod tests {
                 value.artifact.fingerprint.push_str("-drift");
                 value
             }),
-            ("implementation", {
-                let mut value = exact.clone();
-                value.implementation_fingerprint = "f".repeat(64);
-                value
-            }),
         ] {
             let error = base
                 .clone()
@@ -3944,6 +3963,91 @@ mod tests {
                 .unwrap(),
             [policy]
         );
+    }
+
+    /// sc-19728: a row measured by a different source closure is **admitted**, not refused.
+    ///
+    /// This is the observable proof that currency enforcement is gone rather than merely
+    /// unreachable. Before sc-19728 each of these stamps made
+    /// [`MemoryProviderContract::adopt_decode_geometry_policies`] return `Err`, because
+    /// `validate_decode_geometry_policies` compared the row against a constant compiled into this
+    /// build. `"800d06ac…"` is the stamp on all 69 rows shipped in SceneWorks'
+    /// `builtin.models.jsonc`; it equals the constant at SceneWorks' current inference pin, which is
+    /// why tiled decode works there today and would have stopped working — silently, for every one
+    /// of the 69 — at the next pin bump. `"63c6f89d…"` is what the constant had already drifted to
+    /// on this branch. Flipping the removed comparison back on turns this test red.
+    #[test]
+    fn a_foreign_source_closure_stamp_no_longer_refuses_a_measured_row() {
+        for stamp in [
+            "800d06acf579a36e604d91955fd6a6852ec70bc39701f7a320f1fdd2bf5ff29d",
+            "63c6f89da806e02f098598c595d1e5b46a619d05f3beb269fe40334e60c39cd9",
+            &"f".repeat(64),
+        ] {
+            let mut contract = adopted_contract();
+            let mut policy = decode_quality_policy(&contract);
+            policy.implementation_fingerprint = stamp.to_owned();
+            let policy = policy.seal();
+
+            assert!(
+                contract
+                    .adopt_decode_geometry_policies("test-family", vec![policy.clone()])
+                    .expect("a measurement stands until it is remeasured"),
+                "{stamp}: bounded decode must remain admitted"
+            );
+            assert!(
+                contract.conformance_errors().is_empty(),
+                "{stamp}: {:?}",
+                contract.conformance_errors()
+            );
+
+            let query = MemoryDecodePolicyQuery {
+                tier: policy.tier,
+                load_shape: policy.load_shape,
+                mode_key: "text_to_image",
+                overlay: None,
+                geometry: policy.geometry,
+                use_pid: false,
+            };
+            assert_eq!(
+                contract
+                    .decode_geometry_policy(query, None)
+                    .unwrap()
+                    .expect("the row resolves")
+                    .implementation_fingerprint,
+                stamp,
+                "the stamp is recorded verbatim for forensics"
+            );
+        }
+    }
+
+    /// The guard that survived still discriminates: the stamp must be a real digest.
+    ///
+    /// Recording garbage would defeat the forensic purpose the field was kept for, so shape is
+    /// enforced even though currency is not. Each of these is rejected for a distinct reason —
+    /// empty, short, long, uppercase, and non-hex — so the test cannot pass on a length check alone.
+    #[test]
+    fn a_malformed_source_closure_stamp_is_still_refused() {
+        for malformed in [
+            "",
+            &"a".repeat(63),
+            &"a".repeat(65),
+            &"A".repeat(64),
+            &"g".repeat(64),
+        ] {
+            let mut contract = adopted_contract();
+            let mut policy = decode_quality_policy(&contract);
+            policy.implementation_fingerprint = malformed.to_owned();
+            let policy = policy.seal();
+
+            let error = contract
+                .adopt_decode_geometry_policies("test-family", vec![policy])
+                .expect_err(malformed)
+                .to_string();
+            assert!(
+                error.contains("must be a lowercase SHA-256 stamp"),
+                "{malformed:?}: {error}"
+            );
+        }
     }
 
     #[test]

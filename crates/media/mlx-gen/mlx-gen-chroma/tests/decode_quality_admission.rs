@@ -37,6 +37,29 @@ fn route() -> (&'static str, &'static str, mlx_gen_chroma::ChromaVariant) {
     }
 }
 
+/// The source-closure stamp recorded on every receipt this harness emits.
+///
+/// Derived by `scripts/ci/decode_quality_implementation_fingerprint.py` in the CI step that runs
+/// this test, so the stamp always names the tree that produced the measurement. It is recorded, not
+/// matched: sc-19728 removed the comparison against a constant compiled into the binary, because a
+/// closure spanning whole crates plus `Cargo.lock` invalidated every measurement on every
+/// dependency bump and main sync. Required rather than defaulted — an unstamped receipt is a
+/// receipt nobody can date.
+fn implementation_fingerprint() -> String {
+    let value = std::env::var("DECODE_QUALITY_IMPLEMENTATION_FINGERPRINT").expect(
+        "DECODE_QUALITY_IMPLEMENTATION_FINGERPRINT must carry the derived source-closure stamp \
+         (scripts/ci/decode_quality_implementation_fingerprint.py)",
+    );
+    assert!(
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+        "DECODE_QUALITY_IMPLEMENTATION_FINGERPRINT must be a lowercase SHA-256: {value:?}"
+    );
+    value
+}
+
 fn tier() -> String {
     let tier = std::env::var("DECODE_QUALITY_TIER").unwrap_or_else(|_| DEFAULT_TIER.to_owned());
     assert!(
@@ -185,7 +208,7 @@ fn production_latent_quality_admission() {
                         "variant": tier.as_str(),
                         "fingerprint": format!("{repository}@{revision}:{tier}"),
                     },
-                    "implementationFingerprint": mlx_gen::gen_core::MEMORY_DECODE_QUALITY_IMPLEMENTATION_FINGERPRINT,
+                    "implementationFingerprint": implementation_fingerprint(),
                     "mode": "text_to_image",
                     "overlay": null,
                     "geometry": { "width": width, "height": height, "batch": 1, "frames": 1, "referenceCount": 0 },
