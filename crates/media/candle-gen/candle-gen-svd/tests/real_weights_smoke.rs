@@ -2,7 +2,7 @@
 
 use std::ffi::OsString;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use candle_gen::gen_core::{
     CancelFlag, Conditioning, Error, GenerationOutput, GenerationRequest, Generator, Image,
@@ -78,7 +78,6 @@ struct StagePeaks {
 struct ProfileOutput {
     frames: Vec<Image>,
     fps: u32,
-    wall: Duration,
     peaks: StagePeaks,
 }
 
@@ -172,12 +171,7 @@ fn run_profile(
         gib(peaks.decode),
         gib(peaks.conditioning.max(peaks.unet).max(peaks.decode)),
     );
-    ProfileOutput {
-        frames,
-        fps,
-        wall,
-        peaks,
-    }
+    ProfileOutput { frames, fps, peaks }
 }
 
 /// Mandatory sc-14625 target-hardware gate. Run only on a real 32 GB CUDA card:
@@ -216,8 +210,10 @@ fn default_25_frame_profile_then_8_frame_control() {
     // reached for — that both profiles genuinely ran every stage — is already asserted inside
     // `run_profile`, for every profile it is called on and more strictly than a duration could:
     // `renderer_loads == 2`, `peaks.conditioning > 0 && peaks.unet > 0 && peaks.decode > 0`, and
-    // `assert_frames(&frames, expected_frames, ..)`. `wall` stays on `ProfileOutput` because the
-    // `[[SVD_32GB]]` line reports it.
+    // `assert_frames(&frames, expected_frames, ..)`. Deleting it left `ProfileOutput.wall` with no
+    // reader at all, which is `-D dead-code` on the CUDA lane, so the FIELD is gone too. The
+    // `[[SVD_32GB]]` line still reports `wallSeconds`: it prints `run_profile`'s local `wall`, and
+    // never read the struct field.
 }
 
 /// Error and mid-denoise cancellation must both leave the same generator healthy for a later job.
