@@ -140,6 +140,9 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             min_size: 256,
             max_size: 2048,
             max_count: 8,
+            // Not a distilled fixed-schedule model: any step count the shared sanity caps
+            // admit is renderable (sc-19502).
+            supported_steps: Vec::new(),
             mac_only: false,
             // The SceneWorks turnkey's pre-quantized q4/q8 tiers load natively (sc-14249): every
             // backbone projection packed-detects its MLX triple, so a Q4/Q8 here is a turnkey tier

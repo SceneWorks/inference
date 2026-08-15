@@ -87,6 +87,9 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             min_size: VAE_SCALE,
             max_size: 4096,
             max_count: 8,
+            // Not a distilled fixed-schedule model: any step count the shared sanity caps
+            // admit is renderable (sc-19502).
+            supported_steps: Vec::new(),
             mac_only: false,
             supports_kv_cache: false,
             requires_sigma_shift: false,
