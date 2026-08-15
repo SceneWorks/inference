@@ -38,8 +38,13 @@
 //!
 //! What it can show: the release is real and the two partitions do not accumulate. What it
 //! *cannot*: anything about a caller holding both handles at once, or about the remaining 62 GB of
-//! each checkpoint. The first is structural, gated by `every_dit_load_site_is_driven_by_the_task`;
-//! the second is the full-render residency contract, which is sc-17151.
+//! each checkpoint. The first is structural, gated by `every_dit_load_site_is_driven_by_the_task`.
+//!
+//! The second is now gated too: `two_full_checkpoints_are_never_co_resident` (sc-17151) runs the
+//! identical property over **every tensor of both partitions**, releasing through the production
+//! drain and reading active **plus cache**. The slab test is kept because it is the affordable arm
+//! — it runs on ~7.6 GB rather than ~133 GB — and because its bound is the tighter of the two
+//! relative to what it materializes.
 
 mod common;
 
@@ -289,6 +294,125 @@ fn two_checkpoints_are_never_co_resident() {
     println!(
         "slab {slab} B | phase A peak {peak_a} active {active_a} | released to {after_release} | \
          phase B peak {peak_b}"
+    );
+}
+
+/// Materialize a **whole** DiT partition and hold it, returning the handles and their byte count.
+///
+/// The full-scale counterpart of [`force_slab`]: same two forcing steps, every tensor. `eval` alone
+/// can leave a mapped tensor unrealized and the `.item()` reduction is what reads the bytes, so
+/// both are needed or the 33 KB reading in this file's header is what comes back.
+fn force_partition(root: &Path, partition: &str) -> (Vec<mlx_rs::Array>, u64) {
+    let w = Weights::from_dir(root.join(partition)).unwrap();
+    let mut keys: Vec<String> = w.keys().map(str::to_owned).collect();
+    keys.sort_unstable();
+    let mut held = Vec::with_capacity(keys.len());
+    let mut bytes = 0u64;
+    for key in &keys {
+        let t = w
+            .require(key)
+            .unwrap_or_else(|e| panic!("{key}: {e}"))
+            .clone();
+        let elems: u64 = t.shape().iter().map(|&d| d as u64).product();
+        let width = match t.dtype() {
+            Dtype::Float32 | Dtype::Int32 | Dtype::Uint32 => 4u64,
+            Dtype::Float64 => 8,
+            Dtype::Int8 | Dtype::Uint8 | Dtype::Bool => 1,
+            _ => 2,
+        };
+        bytes += elems * width;
+        held.push(t);
+    }
+    let refs: Vec<&mlx_rs::Array> = held.iter().collect();
+    mlx_rs::transforms::eval(refs).unwrap();
+    for t in &held {
+        let s = t.sum(None).unwrap();
+        mlx_rs::transforms::eval([&s]).unwrap();
+        let _ = s.item::<f32>();
+    }
+    (held, bytes)
+}
+
+/// **The two 66 GB checkpoints are never co-resident — at FULL checkpoint scale** (sc-17151).
+///
+/// `two_checkpoints_are_never_co_resident` above gates the same property over a ~3.8 GB slab, which
+/// is what sc-17149 could afford and what its own header defers from: the slab shows the release
+/// mechanism works, not that the *whole* checkpoint leaves. This materializes every tensor of
+/// `transformer_ref`, releases it through the production drain
+/// ([`mlx_gen::residency::drain_allocator_cache`]), and materializes every tensor of `transformer`.
+///
+/// The gate is the same one, at 17× the scale: peak while materializing the second partition must
+/// stay under one checkpoint plus slack. Two co-resident checkpoints are ~133 GB against this box's
+/// 107.52 GiB Metal `recommendedMaxWorkingSetSize`, so a regression here does not merely fail an
+/// assertion — but the assertion is what names it, rather than leaving an allocator abort to be
+/// interpreted.
+///
+/// The "implausibly small" guard is carried over verbatim, because it is the one that catches the
+/// lazy-mmap no-op: a bare load of either partition reads 33 KB and would satisfy every bound below.
+#[test]
+#[ignore = "materializes each of the two 66 GB DiT partitions in turn (MINIMAX_H3_SNAPSHOT)"]
+fn two_full_checkpoints_are_never_co_resident() {
+    let root = common::snapshot();
+
+    mlx_gen::residency::drain_allocator_cache();
+    mlx_rs::memory::reset_peak_memory();
+    // Active **plus cache**: `get_active_memory` alone reports a shed as complete while the buffers
+    // sit in MLX's allocator cache with RSS unmoved (sc-17145).
+    let footprint =
+        || (mlx_rs::memory::get_active_memory() + mlx_rs::memory::get_cache_memory()) as u64;
+    let baseline = footprint();
+
+    // --- phase A: the whole ref2va checkpoint -------------------------------------------------
+    let (held_a, bytes_a) = force_partition(&root, MiniMaxH3Task::Ref2va.partition());
+    let peak_a = mlx_rs::memory::get_peak_memory() as u64;
+    assert!(
+        peak_a > bytes_a / 2,
+        "peak {peak_a} is implausibly small for a {bytes_a}-byte checkpoint — nothing was \
+         materialized, so this test would pass on a no-op (a bare `load` reads 33 KB)"
+    );
+
+    // --- release, through the production drain --------------------------------------------------
+    drop(held_a);
+    mlx_gen::residency::drain_allocator_cache();
+    let after_release = footprint();
+    assert!(
+        after_release < baseline + bytes_a / 16,
+        "after releasing the whole {bytes_a}-byte transformer_ref, active+cached memory is \
+         {after_release} against a {baseline} baseline — the checkpoint did not leave"
+    );
+
+    // --- phase B: the whole base checkpoint -----------------------------------------------------
+    mlx_rs::memory::reset_peak_memory();
+    let (held_b, bytes_b) = force_partition(&root, MiniMaxH3Task::T2va.partition());
+    let peak_b = mlx_rs::memory::get_peak_memory() as u64;
+    assert_eq!(
+        bytes_a, bytes_b,
+        "the two partitions have identical geometry, so one bound covers both"
+    );
+    assert!(
+        peak_b > bytes_b / 2,
+        "partition B was not materialized either — peak {peak_b} for {bytes_b} bytes"
+    );
+
+    // **The gate.** One checkpoint plus allocator slack, never two.
+    let ceiling = bytes_b + bytes_b / 8;
+    assert!(
+        peak_b < ceiling,
+        "peak {peak_b} while materializing the second full checkpoint exceeded the {ceiling}-byte \
+         single-checkpoint ceiling — the two 66 GB checkpoints were co-resident"
+    );
+
+    drop(held_b);
+    mlx_gen::residency::drain_allocator_cache();
+
+    println!(
+        "full checkpoints: {:.2} GB each | phase A peak {:.2} GB | released to {:.2} GB (baseline \
+         {:.2} GB) | phase B peak {:.2} GB",
+        bytes_a as f64 / 1e9,
+        peak_a as f64 / 1e9,
+        after_release as f64 / 1e9,
+        baseline as f64 / 1e9,
+        peak_b as f64 / 1e9
     );
 }
 
