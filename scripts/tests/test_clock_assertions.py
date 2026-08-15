@@ -106,6 +106,7 @@ class Ratchet(unittest.TestCase):
             [sys.executable, str(SCRIPT), *args, str(root)],
             capture_output=True,
             text=True,
+            encoding="utf-8",
             check=False,
         )
 
@@ -129,6 +130,7 @@ class Ratchet(unittest.TestCase):
             [sys.executable, str(SCRIPT), "--check-baseline", str(repo)],
             capture_output=True,
             text=True,
+            encoding="utf-8",
             check=False,
             cwd=repo,
         )
