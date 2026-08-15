@@ -50,7 +50,8 @@ use crate::dit::model::{JointDit, MiniMaxH3Dit};
 use crate::pipeline::{
     fit_audio_to_video, fl2va_layout, frames_to_images, initial_latents, prepend_condition_rows,
     render_latents, resolve_geometry, revert_pixel_normalization, t2va_layout, RequestGeometry,
-    MAX_DURATION_SECONDS, MIN_DURATION_SECONDS, SMALLEST_LEGAL_FRAMES, SPATIAL_STRIDE,
+    MAX_CANVAS_EDGE, MAX_DURATION_SECONDS, MIN_DURATION_SECONDS, SMALLEST_LEGAL_FRAMES,
+    SPATIAL_STRIDE,
 };
 use crate::reference::{Ref2VaReference, Ref2VaReferences, VideoReference};
 use crate::text_encoder::{
@@ -125,7 +126,11 @@ pub fn descriptor() -> ModelDescriptor {
             // marker rather than triggering a load-time quantize; see [`reconcile_tier`].
             supported_quants: &[Quant::Q4, Quant::Q8],
             min_size: SPATIAL_STRIDE,
-            max_size: 1344,
+            // The widest edge `crate::keyframe::resolve_canvas_size` can put a picture on, at the
+            // 4:1 aspect ceiling. A per-edge cap is NOT the area budget — `CANVAS_MAX_PIXELS` is
+            // checked as a product by `resolve_geometry` and still refuses 1536x1536 / 1344x1344,
+            // which sit inside this ceiling on both edges. See `MAX_CANVAS_EDGE` (sc-17152).
+            max_size: MAX_CANVAS_EDGE,
             max_count: 1,
             // The provider's step bound, advertised rather than hidden (sc-19559). `validate`
             // below still refuses the same counts; this is what makes the bound readable
@@ -1690,6 +1695,157 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    /// Every resolution SceneWorks advertises for `minimax_h3` and `minimax_h3_ref`.
+    ///
+    /// Copied from `config/manifests/builtin.models.jsonc` — both partitions declare this exact
+    /// list, and it drives the resolution `<select>` in `apps/web/src/resolutionOverride.js`. A
+    /// bucket the menu offers and the engine refuses is a submit error the user cannot avoid, so
+    /// this list is the acceptance criterion rather than an illustration.
+    const ADVERTISED_BUCKETS: [(u32, u32); 9] = [
+        (1536, 672),
+        (672, 1536),
+        (1344, 768),
+        (768, 1344),
+        (1024, 768),
+        (768, 1024),
+        (768, 768),
+        (576, 320),
+        (320, 576),
+    ];
+
+    /// **The per-edge ceiling is the widest canvas the model's own resolver emits** (sc-17152).
+    ///
+    /// The number is *derived here*, not restated: a maintained literal inside the test that exists
+    /// to catch a wrong literal proves nothing. The sweep walks the model's whole legal aspect
+    /// range and asks [`crate::keyframe::resolve_canvas_size`] — the arithmetic that turns a
+    /// reference's ratio into a canvas — for each canvas, then asserts `max_size` equals the widest
+    /// edge that came back. A ceiling below it would refuse a canvas the model resolves to on its
+    /// own; above it would advertise an edge nothing can produce.
+    #[test]
+    fn the_capability_ceiling_is_the_widest_canvas_the_resolver_emits() {
+        const STEPS: u32 = 40_000;
+        let mut widest = 0u32;
+        for i in 0..=STEPS {
+            let ratio = crate::keyframe::MIN_ASPECT_RATIO
+                + (crate::keyframe::MAX_ASPECT_RATIO - crate::keyframe::MIN_ASPECT_RATIO)
+                    * f64::from(i)
+                    / f64::from(STEPS);
+            let (h, w) = crate::keyframe::resolve_canvas_size(
+                ratio,
+                1.0,
+                SPATIAL_STRIDE as i32,
+                crate::pipeline::CANVAS_SHORT_EDGE as i32,
+                i64::from(crate::pipeline::CANVAS_MAX_PIXELS),
+            )
+            .unwrap();
+            widest = widest.max(w as u32).max(h as u32);
+        }
+        assert_eq!(
+            descriptor().capabilities.max_size,
+            widest,
+            "max_size must be the widest edge `resolve_canvas_size` can emit across 1:4..=4:1"
+        );
+        assert_eq!(descriptor().capabilities.max_size, MAX_CANVAS_EDGE);
+
+        // The advertised menu must fit under it — this is the defect the story was filed for.
+        let advertised = ADVERTISED_BUCKETS
+            .iter()
+            .flat_map(|&(w, h)| [w, h])
+            .max()
+            .unwrap();
+        assert!(
+            advertised <= descriptor().capabilities.max_size,
+            "SceneWorks advertises a {advertised} px edge; the engine ceiling is {}",
+            descriptor().capabilities.max_size
+        );
+    }
+
+    /// **Every advertised bucket validates** — the user-visible half of sc-17152.
+    #[test]
+    fn every_advertised_resolution_bucket_validates() {
+        let caps = descriptor().capabilities;
+        for (w, h) in ADVERTISED_BUCKETS {
+            // The manifest list must itself be inside the checkpoint's envelope, or the engine is
+            // right to refuse and the manifest is the thing that is wrong.
+            assert!(
+                u64::from(w) * u64::from(h) <= u64::from(crate::pipeline::CANVAS_MAX_PIXELS),
+                "{w}x{h} is over the area budget"
+            );
+            validate_request(
+                &caps,
+                &GenerationRequest {
+                    frames: Some(124),
+                    ..request(w, h)
+                },
+            )
+            .unwrap_or_else(|e| panic!("{w}x{h} is advertised but refused: {e}"));
+        }
+    }
+
+    /// **Raising the per-edge ceiling did not widen the area envelope** (sc-17152).
+    ///
+    /// Both shapes here are *inside* `max_size` on both edges and 32-aligned, so the per-edge gate
+    /// and the stride gate are both satisfied and only the area gate can refuse them — asserted
+    /// explicitly, because a refusal that came from the edge gate would make this test pass while
+    /// proving the opposite of what it claims. The error is named rather than checked with
+    /// `is_err`.
+    #[test]
+    fn an_over_area_canvas_is_still_refused_by_the_area_gate() {
+        let caps = descriptor().capabilities;
+        for (w, h) in [(1536u32, 1536u32), (1344u32, 1344u32)] {
+            assert!(
+                w <= caps.max_size && h <= caps.max_size,
+                "{w}x{h} must be INSIDE the per-edge ceiling or this proves nothing"
+            );
+            assert!(w.is_multiple_of(SPATIAL_STRIDE) && h.is_multiple_of(SPATIAL_STRIDE));
+            assert!(u64::from(w) * u64::from(h) > u64::from(crate::pipeline::CANVAS_MAX_PIXELS));
+
+            let e = validate_request(
+                &caps,
+                &GenerationRequest {
+                    frames: Some(124),
+                    ..request(w, h)
+                },
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(e.contains("canvas budget"), "{w}x{h}: {e}");
+            assert!(
+                !e.contains("outside supported range"),
+                "{w}x{h} must be refused by the AREA gate, not the per-edge gate: {e}"
+            );
+        }
+
+        // The one shape the raised ceiling newly admits: the 4:1 canvas the resolver itself emits.
+        // The short edge is derived — the ceiling divides the area budget exactly, which is what
+        // makes `MAX_CANVAS_EDGE x short` sit at the budget rather than over it.
+        let short = crate::pipeline::CANVAS_MAX_PIXELS / MAX_CANVAS_EDGE;
+        assert_eq!(short * MAX_CANVAS_EDGE, crate::pipeline::CANVAS_MAX_PIXELS);
+        assert!(short.is_multiple_of(SPATIAL_STRIDE));
+        for (w, h) in [(MAX_CANVAS_EDGE, short), (short, MAX_CANVAS_EDGE)] {
+            validate_request(
+                &caps,
+                &GenerationRequest {
+                    frames: Some(124),
+                    ..request(w, h)
+                },
+            )
+            .unwrap_or_else(|e| panic!("{w}x{h} is the resolver's own 4:1 canvas: {e}"));
+        }
+
+        // …and one stride past it on the long edge is outside the per-edge ceiling again.
+        let e = validate_request(
+            &caps,
+            &GenerationRequest {
+                frames: Some(124),
+                ..request(MAX_CANVAS_EDGE + SPATIAL_STRIDE, short)
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("outside supported range"), "{e}");
     }
 
     /// sc-18729 — **the video sigma shift is a per-request override, and the default is a byte-exact

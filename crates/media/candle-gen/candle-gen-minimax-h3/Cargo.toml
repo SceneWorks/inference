@@ -48,6 +48,14 @@ cuda = ["candle-gen/cuda"]
 # RAII fixture roots for the real-weight helpers (sc-17791). A `TempDir` guard removes the tree on
 # `Drop` — including out of a panicking test.
 tempfile = { workspace = true }
+# The turbo-LoRA fixtures (sc-18728) must carry a top-level `__metadata__["alpha"]`, which is the
+# thing under test — candle's own `safetensors::save` writes no metadata at all, so the fixture
+# writer serializes through the `safetensors` crate directly.
+safetensors = { workspace = true }
+# The fixtures are written **bf16**, the dtype every published turbo file carries; with f32 fixtures
+# the install's dtype-preserving fold is unobservable (sc-18724 review). Reading a bf16 tensor's
+# bytes back needs the `WithDType` impl on `half::bf16`.
+half = "2"
 # Shared test-support helpers (`candle_gen::testkit`).
 candle-gen = { path = "../candle-gen", features = ["testkit"] }
 # The shared weights-free memory-contract conformance checks (sc-18659). This is the same

@@ -755,8 +755,10 @@ version = "0.0.0"
 dependencies = [
  "candle-gen",
  "candle-gen-boogu",
+ "half",
  "image",
  "rand",
+ "safetensors 0.4.5",
  "sceneworks-gen-core-testkit",
  "serde_json",
  "tempfile",

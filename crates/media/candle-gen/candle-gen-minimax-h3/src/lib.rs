@@ -99,16 +99,18 @@
 //! rejects a memory-strategy registration whose `provider_id` has no matching generator, which is
 //! why the catalog line could not be added before (see [`register_providers`]).
 //!
-//! ## Not in this crate
-//!
-//! The turbo LoRA seam (the MLX sibling's `adapters`). It is refused by [`model::load`] rather than
-//! silently ignored — `supports_lora: false` is a declaration gen-core reads on no path.
+//! ## Both of the former gaps are now closed
 //!
 //! Ref2VA **is** here as of sc-17157: [`mod@reference`] owns the caps and the ordered reference
-//! list,
-//! [`audio_vae_encoder`] the encode half of the audio VAE, and [`model::MiniMaxH3Task`] the
+//! list, [`audio_vae_encoder`] the encode half of the audio VAE, and [`model::MiniMaxH3Task`] the
 //! `transformer` / `transformer_ref` selection.
+//!
+//! The turbo LoRA seam **is** here as of sc-18728: [`adapters`] is the candle twin of
+//! `mlx_gen_minimax_h3::adapters`, carrying the same key map, the same alpha precedence chain, and
+//! (sc-19443) the ComfyUI key-space conversion the MLX lane originally refused. It reaches every
+//! task's DiT through the one [`model::MiniMaxH3::load_task_dit`] seam, `ref2va` included.
 
+pub mod adapters;
 pub mod alias_free;
 pub mod audio_config;
 pub mod audio_vae;
@@ -134,6 +136,11 @@ pub mod text_encoder;
 pub mod vae;
 pub mod vae_encoder;
 
+pub use adapters::{
+    adapter_target_paths, alpha_rank_fold, apply_minimax_h3_adapters, convert_comfyui_key_space,
+    is_comfyui_key_space, normalize_minimax_h3_key, resolve_alpha, resolve_rank,
+    MiniMaxH3LoraReport, BLOCK_TARGETS, DEFAULT_LORA_ALPHA,
+};
 pub use alias_free::{kaiser_sinc_filter1d, Activation1d, LowPassFilter1d, SnakeBeta, UpSample1d};
 pub use audio_config::{
     BigVganConfig, MiniMaxH3AudioVaeConfig, ACTIVATION_KERNEL_SIZE, ACTIVATION_RESAMPLE_RATIO,
@@ -190,8 +197,9 @@ pub use pipeline::{
     frames_to_images, initial_latents, patchify_video_latents, prepend_condition_audio_rows,
     prepend_condition_rows, ref2va_layout, render_latents, resolve_geometry,
     revert_pixel_normalization, t2va_layout, unpack_audio_rows, unpatchify_video_rows,
-    RenderedLatents, RequestGeometry, CANVAS_MAX_PIXELS, CANVAS_SHORT_EDGE, MAX_DURATION_SECONDS,
-    MIN_DURATION_SECONDS, PATCH_SIZE, PIXEL_MEAN, PIXEL_STD, SMALLEST_LEGAL_FRAMES, SPATIAL_STRIDE,
+    RenderedLatents, RequestGeometry, CANVAS_MAX_PIXELS, CANVAS_SHORT_EDGE, MAX_CANVAS_EDGE,
+    MAX_DURATION_SECONDS, MIN_DURATION_SECONDS, PATCH_SIZE, PIXEL_MEAN, PIXEL_STD,
+    SMALLEST_LEGAL_FRAMES, SPATIAL_STRIDE,
 };
 pub use reference::{
     normalize_reference_clip, normalize_reference_image, sample_video_condition_frames,

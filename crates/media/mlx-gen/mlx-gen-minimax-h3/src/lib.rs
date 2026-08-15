@@ -163,8 +163,9 @@
 //! inside one repo* — 128 on the 4-step 768p export, 8 on the 8-step and ref2v ones, absent on
 //! `4step_v0.1` — so it is read from each file rather than pinned per family. Two further facts:
 //! 24 of each file's 624 tensors target the **token refiner**, which is a second reason it cannot be
-//! stubbed; and the `_comfyui_` twin of each file is a different model shape (fused `qkv_proj`,
-//! swapped SwiGLU halves), refused by name rather than half-applied.
+//! stubbed; and the `_comfyui_` twin of each file is a different module shape (fused `qkv_proj`,
+//! swapped SwiGLU halves), detected on the keys and **converted** (sc-19443) rather than
+//! half-applied — folding one un-converted is shape-valid and numerically wrong.
 //!
 //! Not in this crate yet: either CNN encoder, `fl2va` conditioning (sc-17148), Ref2VA's
 //! `transformer_ref` (sc-17149) and sequential residency (sc-17151).
@@ -252,8 +253,8 @@ pub use pipeline::{
     align_frames_for_duration, fit_audio_to_video, frames_to_images, initial_latents,
     patchify_video_latents, render_latents, resolve_geometry, revert_pixel_normalization,
     t2va_layout, unpack_audio_rows, unpatchify_video_rows, RenderedLatents, RequestGeometry,
-    CANVAS_MAX_PIXELS, CANVAS_SHORT_EDGE, MAX_DURATION_SECONDS, MIN_DURATION_SECONDS, PATCH_SIZE,
-    PIXEL_MEAN, PIXEL_STD, SMALLEST_LEGAL_FRAMES, SPATIAL_STRIDE,
+    CANVAS_MAX_PIXELS, CANVAS_SHORT_EDGE, MAX_CANVAS_EDGE, MAX_DURATION_SECONDS,
+    MIN_DURATION_SECONDS, PATCH_SIZE, PIXEL_MEAN, PIXEL_STD, SMALLEST_LEGAL_FRAMES, SPATIAL_STRIDE,
 };
 pub use reference::{
     AudioReference, Ref2VaReference, Ref2VaReferences, ReferenceCounts, ReferenceKind,

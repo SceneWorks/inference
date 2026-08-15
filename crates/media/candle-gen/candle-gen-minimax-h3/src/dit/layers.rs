@@ -36,10 +36,79 @@ use crate::dit::rope::{MmRope, MmRopeTables};
 use crate::layout::split_gate_value;
 use crate::nn::{linear_nb, rms_weighted, sdpa, silu};
 
-/// `y = x · Wᵀ` for a stored `[out, in]` weight — an `nn.Linear(..., bias=False)`.
+/// A **forward-time additive LoRA residual** attached to a [`LinearNoBias`] (sc-18728).
+///
+/// `scale · ((x·a)·b)` with `a` `[in, rank]` (= `downᵀ`) and `b` `[rank, out]` (= `upᵀ` with
+/// `alpha/rank` already folded in at `b`'s own dtype). Deliberately the two-small-matmul form and
+/// never the `[out, in]` product, so the residual costs `rank·(in+out)` elements rather than a
+/// second copy of the projection — the property that lets the same install ride a packed tier
+/// unchanged when one lands.
+///
+/// **The base weight is never mutated.** That is the candle twin of the MLX lane's decision
+/// (`mlx_gen_minimax_h3::adapters` installs over `AdaptableLinear` and never merges), and it is what
+/// makes the fold strength independent of the quant tier: a merge would have to dequantize.
+#[derive(Debug, Clone)]
+pub struct LoraResidual {
+    /// `[in, rank]` — `downᵀ`, at the factor's loaded dtype.
+    a: Tensor,
+    /// `[rank, out]` — `upᵀ` scaled by `alpha/rank`, at the factor's loaded dtype.
+    b: Tensor,
+    /// The caller's per-adapter strength (`AdapterSpec::scale`), applied at the residual.
+    scale: f64,
+}
+
+impl LoraResidual {
+    /// `a`'s dtype — the loaded factor dtype. Read by
+    /// `adapters::tests::the_installed_fold_keeps_the_factor_dtype`, which is the **only** thing
+    /// that can see a stray `to_dtype` in the install: every published turbo fold is an exact power
+    /// of two, so bf16 and f32 products are bit-identical and no numeric assertion can distinguish
+    /// them.
+    pub fn dtype(&self) -> DType {
+        self.b.dtype()
+    }
+
+    /// The `(in, rank)` of the down factor and the `(rank, out)` of the up factor, for a guard that
+    /// wants to check the installed shapes without reaching into the tensors.
+    pub fn shapes(&self) -> ((usize, usize), (usize, usize)) {
+        let a = self.a.dims();
+        let b = self.b.dims();
+        ((a[0], a[1]), (b[0], b[1]))
+    }
+
+    /// The per-adapter strength this residual folds at.
+    pub fn scale(&self) -> f64 {
+        self.scale
+    }
+}
+
+/// `y = x · w` for a `[k, n]` factor and an `[.., k]` activation, folding every leading dim into the
+/// GEMM's `M`.
+///
+/// **Never `broadcast_matmul`.** candle materializes a broadcast rhs through `.contiguous()`, so a
+/// 2-D factor against a `[N, S, k]` activation is physically copied `N` times; the shared
+/// `candle_gen::quant::adapt` seam carries the measurement that made that pathological (a 5.4 GB
+/// copy per leg). Flattening is mathematically identical and issues one large-`M` GEMM.
+fn apply_factor(x: &Tensor, w: &Tensor) -> Result<Tensor> {
+    let dims = x.dims().to_vec();
+    let k = *dims.last().expect("apply_factor: x has no axes");
+    let rows = x.elem_count() / k;
+    let n = w.dim(1)?;
+    let mut out_dims = dims;
+    *out_dims.last_mut().expect("apply_factor: x has no axes") = n;
+    Ok(x.reshape((rows, k))?
+        .contiguous()?
+        .matmul(w)?
+        .reshape(out_dims)?)
+}
+
+/// `y = x · Wᵀ` for a stored `[out, in]` weight — an `nn.Linear(..., bias=False)` — plus any
+/// [`LoraResidual`] stacked onto it.
 #[derive(Debug, Clone)]
 pub struct LinearNoBias {
     weight: Tensor,
+    /// Forward-time additive residuals, applied in push order. Empty on every un-adapted render, in
+    /// which case [`Self::forward`] is byte-identical to the bare `linear_nb`.
+    adapters: Vec<LoraResidual>,
 }
 
 impl LinearNoBias {
@@ -47,17 +116,89 @@ impl LinearNoBias {
     pub fn from_weights(w: &Weights, prefix: &str, dtype: DType) -> Result<Self> {
         Ok(Self {
             weight: w.require(&format!("{prefix}.weight"))?.to_dtype(dtype)?,
+            adapters: Vec::new(),
         })
     }
 
-    /// `y = x · Wᵀ` over the last axis of `x`.
+    /// `y = x · Wᵀ` over the last axis of `x`, plus every attached residual.
+    ///
+    /// The residual runs at `x`'s dtype — matching [`linear_nb`], which upcasts the base weight the
+    /// same way — and is narrowed to the host output dtype before the add, exactly as MLX's
+    /// `AdaptableLinear::apply_adapters` does. A zero-scale residual is skipped entirely, so a
+    /// disabled adapter is byte-identical to the bare base.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        linear_nb(x, &self.weight)
+        let mut y = linear_nb(x, &self.weight)?;
+        let yd = y.dtype();
+        let xd = x.dtype();
+        for ad in &self.adapters {
+            if ad.scale == 0.0 {
+                continue;
+            }
+            let r = apply_factor(&apply_factor(x, &ad.a.to_dtype(xd)?)?, &ad.b.to_dtype(xd)?)?;
+            y = (y + (r * ad.scale)?.to_dtype(yd)?)?;
+        }
+        Ok(y)
     }
 
-    /// Device bytes this projection holds.
+    /// Attach a forward-time LoRA residual. `a` is `[in, rank]`, `b` is `[rank, out]` with
+    /// `alpha/rank` already folded in. Multiple pushes stack in order.
+    ///
+    /// Shape-checked against the projection's own `[out, in]`: a factor pair that would broadcast
+    /// into the wrong contraction is refused here rather than producing a runnable, wrong model.
+    pub fn push_lora(&mut self, a: Tensor, b: Tensor, scale: f64) -> Result<()> {
+        let (out, inn) = (self.weight.dim(0)?, self.weight.dim(1)?);
+        if a.rank() != 2 || b.rank() != 2 {
+            return Err(CandleError::Msg(format!(
+                "minimax-h3 adapter: LoRA factors must be 2-D, got a={:?} b={:?}",
+                a.dims(),
+                b.dims()
+            )));
+        }
+        let (a0, a1) = (a.dim(0)?, a.dim(1)?);
+        let (b0, b1) = (b.dim(0)?, b.dim(1)?);
+        if a0 != inn || b1 != out || a1 != b0 {
+            return Err(CandleError::Msg(format!(
+                "minimax-h3 adapter: factors a={:?} b={:?} do not compose onto a [{out}, {inn}] \
+                 projection — expected a [{inn}, rank] and b [rank, {out}]",
+                a.dims(),
+                b.dims()
+            )));
+        }
+        self.adapters.push(LoraResidual { a, b, scale });
+        Ok(())
+    }
+
+    /// Drop every attached residual, reverting to the bare base.
+    pub fn clear_adapters(&mut self) {
+        self.adapters.clear();
+    }
+
+    /// The residuals attached to this projection, in push order.
+    pub fn adapters(&self) -> &[LoraResidual] {
+        &self.adapters
+    }
+
+    /// Whether any residual is attached.
+    pub fn is_adapted(&self) -> bool {
+        !self.adapters.is_empty()
+    }
+
+    /// The projection's logical `(out_features, in_features)`.
+    pub fn base_shape(&self) -> Result<(usize, usize)> {
+        Ok((self.weight.dim(0)?, self.weight.dim(1)?))
+    }
+
+    /// Device bytes this projection holds — the frozen base plus every attached residual factor.
     pub fn nbytes(&self) -> usize {
-        self.weight.elem_count() * self.weight.dtype().size_in_bytes()
+        let base = self.weight.elem_count() * self.weight.dtype().size_in_bytes();
+        base + self
+            .adapters
+            .iter()
+            .map(|ad| {
+                ad.a.elem_count() * ad.a.dtype().size_in_bytes()
+                    + ad.b.elem_count() * ad.b.dtype().size_in_bytes()
+            })
+            .sum::<usize>()
     }
 
     /// The one tensor name this projection consumes.
@@ -145,6 +286,32 @@ impl DitAttention {
         v
     }
 
+    /// Resolve one adapter path segment run **relative to this attention** to its projection.
+    ///
+    /// The four spellings are the published diffusers ones, `to_out.0` included — that trailing `0`
+    /// is an `nn.Sequential` index and therefore a real path segment, which is why the lookup takes
+    /// a segment slice rather than a dotted string.
+    ///
+    /// `norm_q` / `norm_k` are deliberately **not** addressable: they are `[head_dim]` vectors, not
+    /// projections, and nothing in the published turbo set targets them.
+    pub fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut LinearNoBias> {
+        match path {
+            ["to_q"] => Some(&mut self.to_q),
+            ["to_k"] => Some(&mut self.to_k),
+            ["to_v"] => Some(&mut self.to_v),
+            ["to_out", "0"] => Some(&mut self.to_out),
+            _ => None,
+        }
+    }
+
+    /// Drop every residual on all four projections.
+    pub fn clear_adapters(&mut self) {
+        self.to_q.clear_adapters();
+        self.to_k.clear_adapters();
+        self.to_v.clear_adapters();
+        self.to_out.clear_adapters();
+    }
+
     /// Device bytes held.
     pub fn nbytes(&self) -> usize {
         self.to_q.nbytes()
@@ -223,6 +390,23 @@ impl DitFeedForward {
         let mut v = LinearNoBias::names(&format!("{prefix}.net.0.proj")).to_vec();
         v.extend(LinearNoBias::names(&format!("{prefix}.net.2")));
         v
+    }
+
+    /// Resolve one adapter path segment run **relative to this feed-forward** to its projection.
+    ///
+    /// `net.0.proj` and `net.2` keep their `nn.Sequential` indices, so both are multi-segment.
+    pub fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut LinearNoBias> {
+        match path {
+            ["net", "0", "proj"] => Some(&mut self.proj),
+            ["net", "2"] => Some(&mut self.out),
+            _ => None,
+        }
+    }
+
+    /// Drop every residual on both projections.
+    pub fn clear_adapters(&mut self) {
+        self.proj.clear_adapters();
+        self.out.clear_adapters();
     }
 
     /// Device bytes held.
