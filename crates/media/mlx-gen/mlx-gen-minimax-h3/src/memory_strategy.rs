@@ -215,6 +215,24 @@ pub const DENOISE_RESIDENT_Q4_BYTES: u64 = 11_630_000_000;
 /// resident.
 pub const ADALN_EVICTED_BYTES: u64 = 26_020_915_200;
 
+/// **The same 50 projections on the packed `q8` tier — 13.83 GB.**
+///
+/// [`ADALN_EVICTED_BYTES`] is a **bf16** figure and the lever shrinks with the tier exactly as the
+/// DiT that contains it does (`crate::dit::block::AdaLnProjection::nbytes`). Derived rather than
+/// measured: [`adaln_stack_bytes`] re-derives it from the shipped configuration and
+/// `the_packed_tier_stack_sizes_are_the_loaders_own_accounting` holds the two together.
+///
+/// The 13.02 GB `crate::quant` quotes for this tier is the **code buffer only**; this figure also
+/// carries the per-group bf16 scale and bias the packed triple cannot run without, which is what
+/// `crate::quant::nbytes` sums and therefore what is actually resident.
+pub const ADALN_EVICTED_Q8_BYTES: u64 = 13_828_147_200;
+
+/// **The same 50 projections on the packed `q4` tier — 7.33 GB.**
+///
+/// The figure `tests/common/mod.rs`'s (g) section quotes as "≈7.3 GB (≈6.5 GB if the group metadata
+/// is not counted)". See [`ADALN_EVICTED_Q8_BYTES`] for why the group metadata is counted here.
+pub const ADALN_EVICTED_Q4_BYTES: u64 = 7_325_337_600;
+
 /// **Denoise stage.** Bytes of the modulation table the precompute keeps in the projections' place,
 /// at the **longest schedule this model admits** — `MODULATION_PARAMS · modulation_rows ·
 /// hidden_size · DIT_BLOCKS` elements at bf16, with `modulation_rows` read off a real
@@ -232,6 +250,15 @@ pub const ADALN_EVICTED_BYTES: u64 = 26_020_915_200;
 /// from, so it must pick one point of that line. Under-declaring what the precompute keeps
 /// over-declares the saving, and an over-declared saving turns a suppressed configuration into an
 /// OOM; over-declaring it only leaves some of the win on the table. The asymmetry picks the end.
+///
+/// **This figure does NOT scale with the tier, and that asymmetry is the whole reason the two
+/// quantities are declared separately.** The table is the projections' *output*, so its dtype is the
+/// **compute** dtype — `crate::quant::compute_dtype`, which reads bf16 off a packed tier's own
+/// scales — not the tier's bit width. `tests/common/mod.rs`'s (f) section states the same fact from
+/// the measurement side ("tier-free … the retained table, whose dtype is the *compute* dtype …
+/// rather than the tier's bit width"). So the resident side falls 26.02 → 13.83 → 7.33 GB across
+/// bf16/q8/q4 while this stays at 3.87 GB, and applying one factor to both would be wrong at every
+/// tier but bf16.
 pub const ADALN_MODULATION_TABLE_MAX_BYTES: u64 = 3_870_720_000;
 
 /// Contract-stable identity of the evictable AdaLN sub-stack, so a consumer can find the
@@ -293,6 +320,11 @@ fn phases() -> Vec<MemoryPhase> {
 struct ComponentBytes {
     text_encoder: u64,
     dit: u64,
+    /// The AdaLN sub-stack's residency **on the tier that was actually resolved** — see
+    /// [`resolved_adaln_bytes`]. Carried alongside `dit` rather than recomputed in
+    /// [`adaln_component`] so that the weights-free contract, which resolves nothing, states its
+    /// architecture fact in one place instead of re-deriving it from a zero footprint.
+    adaln: u64,
     video_vae: u64,
     audio_vae: u64,
 }
@@ -307,11 +339,25 @@ impl ComponentBytes {
             Some(WeightsSource::Dir(staged)) => staged.clone(),
             _ => root.join(DIT_COMPONENT),
         };
+        let dit_bytes = safetensors_path_bytes(&dit);
         Self {
             text_encoder: safetensors_path_bytes(root.join("text_encoder")),
-            dit: safetensors_path_bytes(dit),
+            dit: dit_bytes,
+            adaln: resolved_adaln_bytes(&dit, dit_bytes),
             video_vae: safetensors_path_bytes(root.join("vae")),
             audio_vae: safetensors_path_bytes(root.join("audio_vae")),
+        }
+    }
+
+    /// The declaration-only footprint: no filesystem, no resolved tier, and therefore the
+    /// architecture's own bf16 figure for the sub-stack.
+    fn weights_free() -> Self {
+        Self {
+            text_encoder: 0,
+            dit: 0,
+            adaln: ADALN_EVICTED_BYTES,
+            video_vae: 0,
+            audio_vae: 0,
         }
     }
 
@@ -325,6 +371,87 @@ impl ComponentBytes {
             .saturating_add(self.dit)
             .saturating_add(self.decoder())
     }
+}
+
+/// Device bytes the 50-block `adaln_proj` stack holds on a tier packed at `bits`.
+///
+/// The same accounting `crate::quant::nbytes` performs on a *loaded* projection, done from the
+/// shipped configuration instead of from a device tensor, because a contract is resolved before
+/// anything is loaded. Per block:
+///
+/// * a packed tier holds the triple — `out · in · bits / 8` code bytes, plus a bf16 `scales` **and**
+///   `biases` entry per [`crate::quant::GROUP_SIZE`] input group, plus the dense `bias` row;
+/// * `bits >= 16` is the unpacked bf16 `weight` + `bias`, i.e. [`ADALN_EVICTED_BYTES`].
+///
+/// `crate::convert` packs the projections at the same width and group size as the rest of the DiT's
+/// linears, so this is a *tier* fact rather than a per-artifact measurement.
+fn adaln_stack_bytes(bits: i32) -> u64 {
+    let config = crate::dit::MiniMaxH3DitConfig::default();
+    let out = config.adaln_out_features() as u64;
+    let inp = config.time_embed_dim as u64;
+    let blocks = DIT_BLOCKS as u64;
+    if bits >= 16 {
+        return blocks * (out * inp + out) * 2;
+    }
+    let groups = inp / crate::quant::GROUP_SIZE as u64;
+    let codes = out * inp * bits.max(0) as u64 / 8;
+    // `scales` and `biases` are one bf16 element per output row per input group.
+    let group_metadata = out * groups * 2 * 2;
+    let dense_bias = out * 2;
+    blocks * (codes + group_metadata + dense_bias)
+}
+
+/// The AdaLN sub-stack's resident bytes **on the tier staged at `dit_dir`**, whose footprint is
+/// `dit_bytes`.
+///
+/// [`ADALN_EVICTED_BYTES`] is a bf16 figure. `ComponentBytes::resolve` already honours a staged tier
+/// for `transformer_bytes`, so declaring the flat 26.02 GB against an 18.78 GB q4 DiT declares a
+/// sub-stack larger than the stack containing it — which `conformance_errors` refuses and
+/// `Registry::memory_strategy_contract` turns into a hard error, i.e. a q4 render that cannot
+/// resolve a contract at all. **A quant tier is a whole-pipeline contract; this is the segment that
+/// was still reading bf16.**
+///
+/// Two independent legs, and the **smaller** wins:
+///
+/// * the **marker** leg reads the staged tier's own `config.json` `quantization.bits` — the exact
+///   authority `crate::model::reconcile_tier` treats as decisive about which tier is staged — and
+///   re-derives the stack at that width through [`adaln_stack_bytes`]. Exact at every shipped tier.
+/// * the **footprint** leg scales the bf16 stack by the resolved DiT's share of the bf16 DiT. Never
+///   exact — the f32 I/O heads, `context_embedder` and norms `crate::convert` leaves dense in every
+///   tier do not shrink, so the whole-DiT ratio sits ~0.7 % above the projections' own at q4 — but
+///   it reads nothing except a number `build_contract` already holds.
+///
+/// Taking the minimum is what makes this **safe** rather than merely accurate, and each leg closes
+/// the other's failure:
+///
+/// * marker alone reports 26.02 GB for a packed tier whose marker is missing or unreadable, which is
+///   BLOCKER 1 again;
+/// * footprint alone over-declares the eviction, and an over-declared saving is the OOM direction —
+///   the exact asymmetry [`ADALN_MODULATION_TABLE_MAX_BYTES`] is chosen on.
+///
+/// Containment holds unconditionally either way: [`ADALN_EVICTED_BYTES`] is 39.3 % of
+/// [`DIT_BF16_BYTES`], so the footprint leg is always strictly below `dit_bytes` and the minimum is
+/// therefore always below it too.
+///
+/// **The floor.** Below a resolved DiT of ~9.86 GB the scaled stack falls under the retained
+/// [`ADALN_MODULATION_TABLE_MAX_BYTES`] table and the declared eviction would genuinely exclude
+/// nothing, which conformance refuses. No shipped tier is close: `q4` is 18.78 GB, 1.9x above it —
+/// `the_shipped_tiers_sit_clear_of_the_floor_where_the_eviction_stops_excluding_anything` pins that.
+fn resolved_adaln_bytes(dit_dir: &std::path::Path, dit_bytes: u64) -> u64 {
+    if dit_bytes == 0 {
+        // Nothing was resolved, so there is no tier to scale to and the declaration falls back to
+        // the architecture fact. `conformance_errors` skips sub-stack containment against zero asset
+        // facts for exactly this case.
+        return ADALN_EVICTED_BYTES;
+    }
+    let marked = mlx_gen::quant::packed_quant_bits_at(dit_dir)
+        .ok()
+        .flatten()
+        .map_or(ADALN_EVICTED_BYTES, adaln_stack_bytes);
+    // u128 because `ADALN_EVICTED_BYTES · DIT_BF16_BYTES` is ~1.7e21 and overflows u64.
+    let scaled =
+        (u128::from(ADALN_EVICTED_BYTES) * u128::from(dit_bytes) / u128::from(DIT_BF16_BYTES)) as u64;
+    marked.min(scaled)
 }
 
 /// The five capability entries, with the parameter domain each implemented lever owns.
@@ -367,9 +494,17 @@ fn strategies() -> Vec<MemoryStrategyCapability> {
 
 /// The AdaLN projection stack as a typed, evictable intra-transformer component (sc-18665).
 ///
-/// Every field is an architecture or checkpoint fact rather than a resolved footprint, so this is
-/// identical in the production and weights-free contracts — which is what lets catalog conformance
-/// see the exclusion without a snapshot.
+/// Every field but `resident_bytes` is an architecture or checkpoint fact, so the shape of this
+/// component is identical in the production and weights-free contracts — which is what lets catalog
+/// conformance see the exclusion without a snapshot.
+///
+/// * `resident_bytes` is [`ComponentBytes::adaln`], i.e. the stack **on the tier that was actually
+///   resolved** — see [`resolved_adaln_bytes`]. It is passed in rather than read from
+///   [`ADALN_EVICTED_BYTES`] here because that constant is the **bf16** figure, and declaring it
+///   against an 18.78 GB q4 DiT declares a sub-stack larger than the stack containing it, which
+///   `conformance_errors` refuses and `Registry::memory_strategy_contract` turns into a hard error
+///   — a q4 render that cannot resolve a contract at all. The weights-free contract resolves
+///   nothing and so passes the architecture fact through [`ComponentBytes::weights_free`].
 ///
 /// * `kind` is [`MemoryComponentKind::TransformerSubStack`], not `Transformer`: these bytes are
 ///   already inside `asset_facts.transformer_bytes`, and naming a whole transformer would charge
@@ -381,11 +516,11 @@ fn strategies() -> Vec<MemoryStrategyCapability> {
 ///   solver whose evaluation timesteps are not enumerable up front, and `tests/adaln_cache.rs`
 ///   drives it — but no shipped render selects it, which is what makes the exclusion declarable as
 ///   an unconditional property of this provider rather than as a lever.
-fn adaln_component() -> MemoryResidentComponent {
+fn adaln_component(resident_bytes: u64) -> MemoryResidentComponent {
     MemoryResidentComponent {
         id: ADALN_COMPONENT_ID.to_owned(),
         kind: MemoryComponentKind::TransformerSubStack(TransformerComponent::Dit),
-        resident_bytes: ADALN_EVICTED_BYTES,
+        resident_bytes,
         bounded_by: None,
         residency: MemoryComponentResidency::PrecomputedThenEvicted {
             // The projections are mapped with the rest of the DiT at the head of the denoise phase,
@@ -396,8 +531,9 @@ fn adaln_component() -> MemoryResidentComponent {
             evidence: format!(
                 "tests/adaln_evict_real_weights.rs and tests/adaln_evict_memory.rs drive \
                  AdaLnCache::precompute_and_evict and pin the phase pair through \
-                 common::assert_adaln_phase_envelope (sc-19449); the {ADALN_EVICTED_BYTES} B is \
-                 asserted against the sum over the 50 real adaln_proj tensors in crate::dit::adaln"
+                 common::assert_adaln_phase_envelope (sc-19449); the bf16 {ADALN_EVICTED_BYTES} B \
+                 is asserted against the sum over the 50 real adaln_proj tensors in \
+                 crate::dit::adaln, and resident_bytes above is that stack on the resolved tier"
             ),
         },
     }
@@ -482,7 +618,7 @@ fn build_contract(components: &ComponentBytes) -> MemoryProviderContract {
                 // calibration evidence and is NOT measured yet (see the sc-18660 notes).
                 MemoryFormulaVariable::DecodeTileArea,
             ],
-            resident_components: vec![adaln_component()],
+            resident_components: vec![adaln_component(components.adaln)],
         },
         calibration: Some(MemoryCalibrationIdentity::new(
             MEMORY_CALIBRATION_FINGERPRINT,
@@ -513,12 +649,7 @@ pub fn contract_for(spec: &LoadSpec) -> mlx_gen::gen_core::Result<MemoryProvider
 pub fn weights_free_contract(
     _spec: &LoadSpec,
 ) -> mlx_gen::gen_core::Result<MemoryProviderContract> {
-    Ok(build_contract(&ComponentBytes {
-        text_encoder: 0,
-        dit: 0,
-        video_vae: 0,
-        audio_vae: 0,
-    }))
+    Ok(build_contract(&ComponentBytes::weights_free()))
 }
 
 /// The canvas the weights-free behavior fixtures admit: the shipped default, exactly at
