@@ -103,7 +103,7 @@ pub use generator::{
     default_seed, ActivationMemoryAnchor, Capabilities, Conditioning, ConditioningKind,
     ControlClipRef, ControlKind, GenerationOutput, GenerationPhase, GenerationRequest, Generator,
     KeyframeRef, Modality, ModelDescriptor, PhaseAdapter, ReplacementMode, SizeFloor,
-    StagedResidencyAvailability, VideoClipRef,
+    StagedResidencyAvailability, StepSupport, VideoClipRef,
 };
 pub use media::{AudioTrack, Image};
 pub use registry::{

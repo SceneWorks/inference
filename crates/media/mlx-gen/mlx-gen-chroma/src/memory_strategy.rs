@@ -59,10 +59,11 @@ use mlx_gen::attention::{AttentionBudget, AttentionPlan};
 use mlx_gen::gen_core::{
     adapter_stack_resident_bytes, standard_memory_strategy_safety_check, AdapterResidencyMode,
     Error as CoreError, LoadShape, LoadSpec, MemoryBackendRealization, MemoryCalibrationIdentity,
-    MemoryComponentKind, MemoryFormulaKind, MemoryFormulaVariable, MemoryLifecycleCapabilities,
-    MemoryMode, MemoryNumericTier, MemoryPhase, MemoryPrerequisiteScope, MemoryProviderContract,
-    MemoryRequestScope, MemoryResidentComponent, MemoryRunContext, MemorySafetyDecision,
-    MemoryStrategy, MemoryStrategyPrerequisite, MemoryStrategySupport, TransformerComponent,
+    MemoryComponentKind, MemoryComponentResidency, MemoryFormulaKind, MemoryFormulaVariable,
+    MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryPhase,
+    MemoryPrerequisiteScope, MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent,
+    MemoryRunContext, MemorySafetyDecision, MemoryStrategy, MemoryStrategyPrerequisite,
+    MemoryStrategySupport, TransformerComponent,
 };
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::{GenerationRequest, OffloadPolicy, WeightsSource};
@@ -388,6 +389,7 @@ fn push_overlay(
         // No published rung bounds an overlay here: rung 4's window covers the DiT's two block
         // sub-stacks (and, unpublished, the T5 encoder's), and nothing else.
         bounded_by: None,
+        residency: MemoryComponentResidency::WholeRender,
     });
 }
 

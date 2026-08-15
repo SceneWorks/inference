@@ -14,11 +14,11 @@ use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
 use mlx_gen::gen_core::MemoryGeometry;
 use mlx_gen::gen_core::{
     Error as CoreError, LoadSpec, MemoryAssetFacts, MemoryBackendRealization,
-    MemoryCalibrationIdentity, MemoryComponentKind, MemoryFormulaKind, MemoryFormulaVariable,
-    MemoryLifecycleCapabilities, MemoryNumericTier, MemoryParameterRanges, MemoryPhase,
-    MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent, MemoryRunContext,
-    MemoryRuntimeSemantics, MemorySafetyDecision, MemoryStrategy, MemoryStrategyCapability,
-    MemoryStrategySupport, Result as CoreResult, TransformerComponent,
+    MemoryCalibrationIdentity, MemoryComponentKind, MemoryComponentResidency, MemoryFormulaKind,
+    MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryNumericTier, MemoryParameterRanges,
+    MemoryPhase, MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent,
+    MemoryRunContext, MemoryRuntimeSemantics, MemorySafetyDecision, MemoryStrategy,
+    MemoryStrategyCapability, MemoryStrategySupport, Result as CoreResult, TransformerComponent,
 };
 
 pub const MEMORY_CALIBRATION_FINGERPRINT: &str =
@@ -220,6 +220,7 @@ pub(crate) fn native_memory_strategy_contract(
         kind: MemoryComponentKind::ControlBranch,
         resident_bytes: overlay_bytes,
         bounded_by: None,
+        residency: MemoryComponentResidency::WholeRender,
     }];
     let asset_facts = MemoryAssetFacts {
         base_bytes: conditioning_bytes
@@ -307,6 +308,7 @@ fn asset_facts(
             kind: MemoryComponentKind::ControlBranch,
             resident_bytes: overlay_bytes,
             bounded_by: None,
+            residency: MemoryComponentResidency::WholeRender,
         })
         .into_iter()
         .collect();

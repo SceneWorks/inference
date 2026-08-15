@@ -46,6 +46,7 @@ use mlx_rs::{Array, Dtype};
 use mlx_gen::media::{AudioTrack, Image};
 use mlx_gen::weights::Weights;
 use mlx_gen::CancelFlag;
+use mlx_gen_minimax_h3::audio_config::AUDIO_SAMPLE_RATE;
 use mlx_gen_minimax_h3::conditioning::{
     encode_reference_condition, keyframe_condition_rows, reference_audio_rows,
     reference_clip_to_vae_pixels, KeyframeNoise,
@@ -118,7 +119,8 @@ fn probe_audio(seed: u32) -> AudioTrack {
         samples: (0..512)
             .map(|i| (i as f32 * (0.05 + seed as f32 * 0.03)).sin())
             .collect(),
-        sample_rate: 24_000,
+        // The engine ships no resampler, so `Ref2VaReferences::new` admits only this rate.
+        sample_rate: AUDIO_SAMPLE_RATE,
         channels: 1,
         stems: Vec::new(),
     }

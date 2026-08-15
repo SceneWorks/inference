@@ -49,25 +49,47 @@
 //!
 //! When both are present `frames` wins, because it is the exact one.
 //!
-//! # Not here
+//! # `ref2va` is here (sc-17157), and it moves the checkpoint
 //!
-//! `ref2va` (sc-17157) — the `transformer_ref` partition, the omni-reference presentation and the
-//! audio VAE encoder — and the turbo LoRA seam (the candle twin of `mlx_gen_minimax_h3::adapters`).
-//! Both are refused rather than silently ignored, but by **two different mechanisms**, and the
-//! distinction matters because only one of them is carried by the descriptor:
+//! A request carrying image / video / audio **references** is a third task, [`MiniMaxH3Task::Ref2va`],
+//! and it denoises from a **different 66 GB partition** — [`REFERENCE_DIT_PARTITION`]. The two
+//! partitions ship the same `config.json` and the same 638 tensor names and differ only in their
+//! values, so [`MiniMaxH3Task`] is the single thing standing between a reference request and a
+//! plausible render off the wrong checkpoint. See that type.
 //!
-//! * **`ref2va` is refused by the descriptor.** The three `ref2va` conditioning kinds are absent
-//!   from [`descriptor`]'s `conditioning` allowlist, and `Capabilities::validate_request` — which
-//!   `MiniMaxH3::generate_impl` calls on every render — enforces that allowlist, so a reference
-//!   request gets a typed `Unsupported` naming the kind.
-//! * **The turbo LoRA seam, the quant tiers and every unread `LoadSpec` slot are refused by
-//!   [`load`].** `supports_lora`, `supports_lokr` and `supported_quants` are *declarations that
-//!   gen-core reads on no path*: no validator and no registry code inspects them. They are
-//!   advertisements to a weights-free consumer, not gates. The gates are the explicit
-//!   `spec.adapters` / `spec.quantize` checks in [`load`], plus `reject_unread_slots` for the
-//!   seven remaining slots this provider does not read; without them a spec carrying any of those
-//!   loaded clean and rendered with the caller's knob silently discarded. See [`load`] for the
-//!   full note.
+//! `generate_ref2va` has **four** conditioning phases rather than three. The DiT is mapped **after
+//! the conditioner and before the decode VAEs** — it is not the last component of the render, the
+//! decode video VAE and the audio VAE follow it — and only ONE of the two 66 GB partitions is ever
+//! mapped, because [`MiniMaxH3Task::partition`] picks exactly one.
+//!
+//! # `transformer_ref` is required **per task**, not per snapshot
+//!
+//! The reference partition is checked when a request resolves to [`MiniMaxH3Task::Ref2va`], at the
+//! engine boundary and before any weight is read — not unconditionally in [`load`]. That is
+//! deliberate: `SceneWorks/minimax-h3-mlx` publishes no `q4/transformer_ref` (sc-19517), so a
+//! pure-`q4` install carries only the base partition, and requiring the reference one at `load`
+//! would take `t2va` and `fl2va` offline as well. A `ref2va` request against such a snapshot is
+//! refused loudly, naming the missing directory; the other two tasks keep working.
+//!
+//! # The turbo LoRA seam IS here (sc-18728), and the declaration still gates nothing
+//!
+//! [`crate::adapters`] is the candle twin of `mlx_gen_minimax_h3::adapters`, installed through the
+//! single [`MiniMaxH3::load_task_dit`] seam. `supports_lora` is now `true` — but it is worth keeping
+//! the original finding on the record, because it is what shapes the code around it:
+//!
+//! **`supports_lora`, `supports_lokr` and `supported_quants` are declarations gen-core reads on no
+//! path.** No validator and no registry code inspects them. They are advertisements to a
+//! weights-free consumer, not gates. So flipping `supports_lora` to `true` grants nothing and
+//! flipping it to `false` would forbid nothing; the behaviour is entirely in
+//! [`crate::adapters::apply_minimax_h3_adapters`], which is strict about unmatched targets and
+//! about a file that folded nothing. Symmetrically, `supports_lokr: false` is enforced twice in
+//! real code — by kind in [`load`] and by file content in the installer — precisely because the
+//! flag itself cannot refuse anything.
+//!
+//! The quant tiers and every unread `LoadSpec` slot are still refused by [`load`]: the explicit
+//! `spec.quantize` check plus `reject_unread_slots` for the seven slots this provider does not
+//! read. Without them a spec carrying any of those loaded clean and rendered with the caller's knob
+//! silently discarded. See [`load`] for the full note.
 
 use std::path::{Path, PathBuf};
 
@@ -75,9 +97,9 @@ use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::{
     reject_unknown_components, Capabilities, GenerationOutput, GenerationRequest, Generator,
     LoadSpec, MemoryProviderContract, Modality, ModelDescriptor, OffloadPolicy, Precision,
-    Progress, SizeFloor, WeightsSource,
+    Progress, SizeFloor, StepSupport, WeightsSource,
 };
-use candle_gen::gen_core::{ConditioningKind, Image};
+use candle_gen::gen_core::{AdapterSpec, ConditioningKind, Image};
 use candle_gen::{CandleError, Result};
 
 use crate::audio_config::{AUDIO_OUTPUT_CHANNELS, AUDIO_SAMPLE_RATE};
@@ -88,8 +110,9 @@ use crate::dit::positions::KeyframeAnchor;
 use crate::pipeline::{
     align_frames_for_duration, fit_audio_to_video, fl2va_layout, frames_to_images, initial_latents,
     prepend_condition_rows, render_latents, resolve_geometry, revert_pixel_normalization,
-    t2va_layout, RequestGeometry, CANVAS_SHORT_EDGE, PATCH_SIZE, SPATIAL_STRIDE,
+    t2va_layout, RequestGeometry, CANVAS_SHORT_EDGE, MAX_CANVAS_EDGE, PATCH_SIZE, SPATIAL_STRIDE,
 };
+use crate::reference::{Ref2VaReference, Ref2VaReferences, VideoReference};
 use crate::text_encoder::{
     lm_prefixes, load_vision_tower, MiniMaxH3TeConfig, MiniMaxH3TextEncoder, MiniMaxH3Tokenizer,
     LM_PREFIX, TE_STORE_DTYPE,
@@ -115,11 +138,142 @@ pub const MAX_STEPS: u32 = 200;
 /// number is only truthful if the load cannot be talked out of the staging it was measured under.
 pub const OFFLOAD_POLICY: OffloadPolicy = OffloadPolicy::Sequential;
 
-/// The DiT partition a `t2va` / `fl2va` render denoises from. (`transformer_ref` is sc-17157's.)
+/// The DiT partition a `t2va` / `fl2va` render denoises from.
 pub const BASE_DIT_PARTITION: &str = "transformer";
 
-/// The component directories a render reads, in phase order.
+/// The DiT partition a `ref2va` render denoises from.
+pub const REFERENCE_DIT_PARTITION: &str = "transformer_ref";
+
+/// The component directories **every** task reads, in phase order.
+///
+/// [`REFERENCE_DIT_PARTITION`] is deliberately **not** here — see [`task_component_dirs`].
 const REQUIRED_COMPONENT_DIRS: [&str; 4] = ["text_encoder", BASE_DIT_PARTITION, "vae", "audio_vae"];
+
+/// The component directories a given task reads, on top of [`REQUIRED_COMPONENT_DIRS`].
+///
+/// # Why the reference partition is task-gated rather than load-gated
+///
+/// `ref2va` is a first-class task, so a snapshot missing `transformer_ref/` must fail **before any
+/// weight is read**, naming the path, rather than twenty minutes into a render when the reference
+/// arm finally reaches for it. The obvious implementation — put it in
+/// [`REQUIRED_COMPONENT_DIRS`] — is wrong, and its blast radius is larger than it looks:
+/// `SceneWorks/minimax-h3-mlx` publishes no `q4/transformer_ref` (sc-19517), so a pure-`q4` install
+/// carries **only** the base partition today. Requiring the reference one at `load` would fail
+/// provider construction outright and take `t2va` and `fl2va` offline with it, for a snapshot that
+/// serves both perfectly well.
+///
+/// So the check runs where the task is known: [`Generator::validate`], which
+/// [`MiniMaxH3::generate_impl`] calls first, and which runs before the geometry is resolved and long
+/// before the text encoder is mapped. Fail-loud is preserved for the request that actually needs the
+/// partition; the requests that do not are unaffected.
+fn task_component_dirs(task: MiniMaxH3Task) -> &'static [&'static str] {
+    match task {
+        MiniMaxH3Task::T2va | MiniMaxH3Task::Fl2va => &[],
+        MiniMaxH3Task::Ref2va => &[REFERENCE_DIT_PARTITION],
+    }
+}
+
+/// A component directory is present **and carries at least one `.safetensors` shard**.
+///
+/// `is_dir()` alone was the gate here, and it admitted an empty or shard-less `transformer_ref/` —
+/// which is exactly the mid-render failure the load-time check exists to eliminate. A snapshot whose
+/// download was interrupted leaves precisely that shape behind.
+fn require_component(root: &Path, component: &str) -> Result<()> {
+    let dir = root.join(component);
+    if !dir.is_dir() {
+        return Err(CandleError::Msg(format!(
+            "{MODEL_ID}: the snapshot has no `{component}/` component at {}",
+            dir.display()
+        )));
+    }
+    let shards = std::fs::read_dir(&dir)
+        .map_err(|e| CandleError::Msg(format!("{MODEL_ID}: read {}: {e}", dir.display())))?
+        .filter_map(std::result::Result::ok)
+        .filter(|e| {
+            e.path()
+                .extension()
+                .is_some_and(|x| x.eq_ignore_ascii_case("safetensors"))
+        })
+        .count();
+    if shards == 0 {
+        return Err(CandleError::Msg(format!(
+            "{MODEL_ID}: the `{component}/` component at {} carries no `.safetensors` shard — an \
+             empty component directory loads clean and fails in the middle of the render",
+            dir.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Which MiniMax-H3 **task** a request is, and therefore which DiT partition it loads.
+///
+/// # The two checkpoints are structurally indistinguishable
+///
+/// `transformer/` and `transformer_ref/` ship **the same `config.json`** (byte-identical) and **the
+/// same 638 tensor names**. Nothing structural separates them — not a shape check, not a
+/// key-mapping proof, not a config diff. Only the *values* differ. That is the same hazard class
+/// [`crate::layout`] documents for the gated-FFN half-swap: a port that loads the wrong one gets a
+/// model that runs, produces plausible video, and is wrong.
+///
+/// So the partition is selected by this typed enum rather than by a bare string at the call site,
+/// and `tests/ref2va_checkpoint.rs` pins the selection — structurally without weights, and against
+/// the real bytes of a tensor that differs between the two under `#[ignore]`.
+///
+/// # Why the task is not simply "are there keyframes"
+///
+/// `t2va` and `fl2va` share `transformer/`; only `ref2va` moves. A request carrying **both**
+/// keyframes and references is refused rather than silently resolved to one of them — the two
+/// condition the video stream through different mechanisms at different rotary times, and picking
+/// one would discard conditioning the caller asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MiniMaxH3Task {
+    /// Text only. `transformer/`.
+    T2va,
+    /// First / last frame keyframes. `transformer/`.
+    Fl2va,
+    /// Multi-modal references. **`transformer_ref/`.**
+    Ref2va,
+}
+
+impl MiniMaxH3Task {
+    /// The snapshot subdirectory this task's DiT is read from.
+    pub fn partition(self) -> &'static str {
+        match self {
+            Self::T2va | Self::Fl2va => BASE_DIT_PARTITION,
+            Self::Ref2va => REFERENCE_DIT_PARTITION,
+        }
+    }
+
+    /// Whether this task reads the vision tower as part of its presentation.
+    ///
+    /// `t2va` does not; `fl2va` runs the tower over its keyframes and `ref2va` over its image and
+    /// video references. An audio reference contributes **no** vision block, so a `ref2va` request
+    /// whose only visual references are absent cannot occur — [`crate::reference`] refuses an
+    /// audio-only list precisely so this stays true.
+    pub fn needs_vision_tower(self) -> bool {
+        matches!(self, Self::Fl2va | Self::Ref2va)
+    }
+
+    /// Derive the task from what the request actually conditions on.
+    ///
+    /// `has_keyframes` and `has_references` are passed rather than read off the request so this
+    /// stays a pure, exhaustively testable function — the story requires the selection to be
+    /// covered by a test, and a function that reaches into a `GenerationRequest` can only be
+    /// tested by building one.
+    pub fn resolve(has_keyframes: bool, has_references: bool) -> Result<Self> {
+        match (has_keyframes, has_references) {
+            (false, false) => Ok(Self::T2va),
+            (true, false) => Ok(Self::Fl2va),
+            (false, true) => Ok(Self::Ref2va),
+            (true, true) => Err(CandleError::Msg(format!(
+                "{MODEL_ID}: a request carries both keyframes and references, which are different \
+                 tasks on different checkpoints — `fl2va` pins a literal frame of the generated \
+                 clip from `transformer/`, `ref2va` conditions on unpositioned references from \
+                 `transformer_ref/`. Send one or the other."
+            ))),
+        }
+    }
+}
 
 /// The identity, modality and capability surface.
 pub fn descriptor() -> ModelDescriptor {
@@ -138,14 +292,34 @@ pub fn descriptor() -> ModelDescriptor {
             // **One kind covers all three keyframe shapes.** `Keyframe` carries a `frame_idx`, and
             // first-only / last-only / first+last are one, one and two of them.
             //
-            // The `ref2va` kinds the MLX sibling advertises (`Reference`, `ReferenceVideo`,
-            // `ReferenceAudio`) are deliberately ABSENT until sc-17157 lands the
-            // `transformer_ref` path here: default-deny turns a reference request into a typed
-            // `Unsupported` instead of a render that silently ignored it.
-            conditioning: vec![ConditioningKind::Keyframe],
-            // The candle turbo-LoRA seam is not ported (the MLX sibling's `adapters`), and
-            // advertising it would accept a file this lane cannot fold.
-            supports_lora: false,
+            // The three `ref2va` kinds (sc-17157) are the omni-reference surface on
+            // `transformer_ref`. They are three kinds rather than one because gen-core has no
+            // heterogeneous-reference variant and `conditioning` is an **ordered** `Vec`, so the
+            // request's own order carries the semantics `ref2va` needs — see
+            // [`crate::reference`] on why order is not incidental, and [`request_references`] for
+            // why the video one is `ReferenceVideo` and not `VideoClip` or `VideoSync`.
+            //
+            // `VideoClip` is deliberately **not** advertised. Nothing here reads it, and leaving it
+            // in the allowlist would let an in-context clip through to a model that has no
+            // in-context clip mechanism; default-deny turns it into the typed
+            // `Error::Unsupported` instead.
+            conditioning: vec![
+                ConditioningKind::Keyframe,
+                ConditioningKind::Reference,
+                ConditioningKind::ReferenceVideo,
+                ConditioningKind::ReferenceAudio,
+            ],
+            // **The turbo-LoRA seam is ported** (sc-18728): `crate::adapters` is the candle twin
+            // of `mlx_gen_minimax_h3::adapters`, installed on the job-local DiT through
+            // `load_task_dit` — which every task, `ref2va` included, goes through. This bit is a
+            // declaration gen-core reads on no path, so it is an advertisement to a weights-free
+            // consumer; the enforcement is `crate::adapters::apply_minimax_h3_adapters`, which is
+            // strict about both unmatched targets and a file that matched nothing.
+            supports_lora: true,
+            // **LoKr stays false, and here that is enforced twice.** This DiT's adapter seam
+            // installs `scale·((x·A)·B)` residuals only; a Kronecker delta is a different
+            // operation, so `load` refuses `AdapterKind::Lokr` and the installer refuses a file
+            // carrying `lokr_*` factors regardless of how it was declared.
             supports_lokr: false,
             // The pre-quantized tiers are packed offline by the MLX lane's `convert`; this lane has
             // no tier loader of its own yet, so it advertises none rather than accepting a
@@ -170,11 +344,21 @@ pub fn descriptor() -> ModelDescriptor {
             // That declaration gates ladder ADMISSION; this bit describes the residency lifecycle.
             supports_sequential_offload: true,
             max_count: 1,
+            // The provider's step bound, advertised rather than hidden (sc-19559) — the candle
+            // twin of `mlx-gen-minimax-h3`'s declaration, from this lane's own `MAX_STEPS`.
+            supported_steps: StepSupport::Range {
+                min: 1,
+                max: MAX_STEPS,
+            },
             component_precision_floors: &[],
             samplers: Vec::new(),
             schedulers: Vec::new(),
             min_size: SPATIAL_STRIDE,
-            max_size: 1344,
+            // The widest edge `crate::keyframe::resolve_canvas_size` can put a picture on, at the
+            // 4:1 aspect ceiling. A per-edge cap is NOT the area budget — `CANVAS_MAX_PIXELS` is
+            // checked as a product by `resolve_geometry` and still refuses 1536x1536 / 1344x1344,
+            // which sit inside this ceiling on both edges. See `MAX_CANVAS_EDGE` (sc-17152).
+            max_size: MAX_CANVAS_EDGE,
             // The stride is advertised, not hidden in provider code, so a weights-free consumer can
             // predict that an unaligned canvas is REFUSED rather than quietly refit.
             size_floor: SizeFloor::RangeCheckedOnGrid {
@@ -193,11 +377,14 @@ pub fn descriptor() -> ModelDescriptor {
 pub struct MiniMaxH3 {
     descriptor: ModelDescriptor,
     root: PathBuf,
-    dit_dir: PathBuf,
     device: Device,
     dtype: DType,
     offload: OffloadPolicy,
     contract: MemoryProviderContract,
+    /// The staged adapter specs, held as **paths and strengths** rather than tensors — the same
+    /// discipline the rest of this struct keeps. They are read once per render, in
+    /// [`MiniMaxH3::load_task_dit`], onto the job-local DiT.
+    adapters: Vec<AdapterSpec>,
 }
 
 impl MiniMaxH3 {
@@ -212,19 +399,11 @@ impl MiniMaxH3 {
                 .unwrap_or_else(|| p.clone()),
         };
         for component in REQUIRED_COMPONENT_DIRS {
-            let dir = root.join(component);
-            if !dir.is_dir() {
-                return Err(CandleError::Msg(format!(
-                    "{MODEL_ID}: the snapshot at {} has no `{component}/` component — a render \
-                     reads all of {REQUIRED_COMPONENT_DIRS:?}",
-                    root.display()
-                )));
-            }
+            require_component(&root, component)?;
         }
         let device = candle_gen::default_device()?;
         Ok(Self {
             descriptor: descriptor(),
-            dit_dir: root.join(BASE_DIT_PARTITION),
             root,
             device,
             // The DiT ships mixed f32/bf16 top-level tensors; bf16 is the block store, matching the
@@ -233,6 +412,7 @@ impl MiniMaxH3 {
             // **Not `spec.offload_policy`.** See [`OFFLOAD_POLICY`] and the module docs.
             offload: OFFLOAD_POLICY,
             contract: crate::memory_strategy::contract_for(spec)?,
+            adapters: spec.adapters.clone(),
         })
     }
 
@@ -249,14 +429,67 @@ impl MiniMaxH3 {
         &self.root
     }
 
-    /// The DiT partition directory this provider denoises from.
-    pub fn dit_dir(&self) -> &Path {
-        &self.dit_dir
+    /// **The single place a request becomes a checkpoint choice.**
+    ///
+    /// Returns the task *and* the reference list together because they are one decision: the list's
+    /// presence is what makes the task `ref2va`, and re-deriving either half separately is how the
+    /// two would drift. [`Generator::validate`] and `Self::generate_impl` (private, hence not
+    /// linked) both consume exactly this value, and `tests/ref2va_checkpoint.rs` asserts that
+    /// `MiniMaxH3Task::resolve` is called from nowhere else in the crate — so a weights-free test
+    /// that drives this function is testing the render path's own decision rather than a parallel
+    /// restatement of it.
+    pub fn resolve_task(
+        &self,
+        req: &GenerationRequest,
+    ) -> Result<(MiniMaxH3Task, Option<Ref2VaReferences>)> {
+        let references = request_references(req)?;
+        let task = MiniMaxH3Task::resolve(!req.keyframes().is_empty(), references.is_some())?;
+        for component in task_component_dirs(task) {
+            require_component(&self.root, component).map_err(|e| {
+                CandleError::Msg(format!(
+                    "{e} — this is the {task:?} task's own checkpoint (sc-19517: a pure-q4 install \
+                     carries no `{REFERENCE_DIT_PARTITION}` today). The other tasks are unaffected."
+                ))
+            })?;
+        }
+        Ok((task, references))
     }
 
     /// The device every phase materializes on.
     pub fn device(&self) -> &Device {
         &self.device
+    }
+
+    /// The adapter specs this provider was loaded with.
+    pub fn adapters(&self) -> &[AdapterSpec] {
+        &self.adapters
+    }
+
+    /// **The single render seam that maps a DiT partition and folds the staged adapters onto it**
+    /// (sc-18728).
+    ///
+    /// One function rather than an install at each call site, so a future `ref2va` denoise path
+    /// (sc-17157) cannot acquire a DiT that skipped the adapters — the MLX sibling landed the same
+    /// single seam for exactly that reason. The DiT is **job-local**: residuals are pushed onto this
+    /// render's own copy, never onto a shared resident base, so two concurrent renders at different
+    /// strengths cannot see each other's fold.
+    ///
+    /// The install is strict — an unmatched target, or a file that folded nothing, is an error
+    /// rather than a partial render — and it runs **before** `JointDit` precomputes the AdaLN
+    /// tables. That ordering is required rather than incidental: `adaln_proj` is deliberately
+    /// unreachable to adapters ([`crate::dit::block::DitBlock::adaptable_mut`]), so the precompute
+    /// must observe the same projection whether or not a LoRA is staged.
+    /// **`pub` on purpose.** The property "a staged adapter reaches the DiT this render denoises
+    /// with" cannot be asserted from outside the crate unless this seam is callable, and a source
+    /// scan asserting the call site *looks* right is not evidence that it folds anything —
+    /// `tests/turbo_lora.rs::the_render_seam_folds_the_staged_adapter_onto_the_dit` calls this and
+    /// reads the residual back off the returned model.
+    pub fn load_task_dit(&self, partition: &str) -> Result<MiniMaxH3Dit> {
+        let mut dit = MiniMaxH3Dit::load(&self.root, partition, &self.device, self.dtype)?;
+        if !self.adapters.is_empty() {
+            crate::adapters::apply_minimax_h3_adapters(&mut dit, &self.adapters)?;
+        }
+        Ok(dit)
     }
 
     /// Resolve the request's geometry: `frames` wins over `duration`, and the canvas falls back to
@@ -392,6 +625,16 @@ impl MiniMaxH3 {
 
         // --- 1. conditioning -----------------------------------------------------------------
         let keyframes = req.keyframes();
+        // **The checkpoint decision.** Resolved once, here, and carried to BOTH
+        // `MiniMaxH3Dit::load` call sites — the base arm below and the `ref2va` arm in
+        // `generate_ref2va` — each of which takes its partition from `task.partition()` and from
+        // nothing else. The two partitions are byte-different and structurally identical, so this
+        // is the only thing standing between a `ref2va` request and a plausible render off the
+        // wrong 66 GB. See [`MiniMaxH3Task`] and `tests/ref2va_checkpoint.rs`.
+        let (task, references) = self.resolve_task(req)?;
+        if let Some(refs) = &references {
+            return self.generate_ref2va(req, refs, task, &geometry, &schedule, seed, on_progress);
+        }
         let anchors = keyframe_anchors(&keyframes, geometry.joint.num_frames)?;
         // Fitted ONCE, here, and shared by both keyframe paths. The vision tower and the VAE encode
         // must see the same pixels — resizing separately per path would let a resampling difference
@@ -444,7 +687,11 @@ impl MiniMaxH3 {
         }
 
         // --- 2. denoise -----------------------------------------------------------------------
-        let dit = MiniMaxH3Dit::load(&self.root, BASE_DIT_PARTITION, &self.device, self.dtype)?;
+        // Through the adapter seam, at the partition THIS task selected — so `ref2va` (sc-17157)
+        // gets the staged LoRA folded onto `transformer_ref` exactly as `t2va` / `fl2va` get it on
+        // `transformer`. A bare `MiniMaxH3Dit::load` here would render a reference job with the
+        // adapter silently dropped.
+        let dit = self.load_task_dit(task.partition())?;
         let patch = dit.config().patch_size;
         let layout = if anchors.is_empty() {
             t2va_layout(&geometry, context.dims()[1], patch, &self.device)?
@@ -515,14 +762,7 @@ impl MiniMaxH3 {
             crate::dit::release_device_memory(&self.device)?;
             track
         };
-        let audio = fit_audio_to_video(audio, &geometry)?;
-        if audio.sample_rate != AUDIO_SAMPLE_RATE || audio.channels != AUDIO_OUTPUT_CHANNELS {
-            return Err(CandleError::Msg(format!(
-                "{MODEL_ID}: the decoded soundtrack is {} Hz / {} channels, expected \
-                 {AUDIO_SAMPLE_RATE} / {AUDIO_OUTPUT_CHANNELS}",
-                audio.sample_rate, audio.channels
-            )));
-        }
+        let audio = finish_audio(audio, &geometry)?;
         if frames.len() != geometry.joint.num_frames {
             return Err(CandleError::Msg(format!(
                 "{MODEL_ID}: decoded {} frames for a {}-frame request",
@@ -536,9 +776,443 @@ impl MiniMaxH3 {
             audio: Some(audio),
         })
     }
+
+    /// The **`ref2va` render** — ordered multi-modal references on the `transformer_ref`
+    /// checkpoint (sc-17157).
+    ///
+    /// The phase order is the same staged one `t2va` / `fl2va` use, for the same memory reason, but
+    /// it has **four** conditioning phases rather than three: the vision tower, the 66.7 GB
+    /// conditioner, then the two VAEs, then the 66.3 GB `transformer_ref`. Each is released before
+    /// the next is mapped, so the DiT is never resident alongside the conditioner. It is **not**
+    /// the last thing mapped — the decode video VAE and the audio VAE follow it — but it is the
+    /// last *66 GB* thing, and only ONE of the two 66 GB partitions is ever mapped by a render,
+    /// because [`MiniMaxH3Task::partition`] picks exactly one.
+    #[allow(clippy::too_many_arguments)]
+    fn generate_ref2va(
+        &self,
+        req: &GenerationRequest,
+        references: &Ref2VaReferences,
+        task: MiniMaxH3Task,
+        geometry: &RequestGeometry,
+        schedule: &JointSchedule,
+        seed: u64,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationOutput> {
+        use crate::conditioning::{
+            encode_reference_condition, keyframe_condition_rows, reference_audio_rows,
+            reference_clip_to_vae_pixels, KeyframeNoise,
+        };
+        use crate::dit::positions::ReferenceLatentGeometry;
+        use crate::pipeline::{
+            audio_track_to_encoder_input, prepend_condition_audio_rows, ref2va_layout,
+            CANVAS_MAX_PIXELS,
+        };
+
+        // **The task is the caller's resolved one, and it must be the reference task.** The
+        // parameter carries `resolve_task`'s decision rather than re-deriving it, but a `&self`
+        // method taking a `MiniMaxH3Task` will accept any of the three, and passing `T2va` here
+        // would denoise a reference request off `transformer/` — the exact failure this whole story
+        // exists to prevent. A hard refusal, not a `debug_assert`: release builds strip those.
+        if task != MiniMaxH3Task::Ref2va {
+            return Err(CandleError::Msg(format!(
+                "{MODEL_ID}: generate_ref2va was handed {task:?}, which denoises from `{}` — a \
+                 reference render must be `Ref2va` on `{REFERENCE_DIT_PARTITION}`",
+                task.partition()
+            )));
+        }
+
+        // --- 0. normalize every reference onto the model's own rates and resolutions ------------
+        // References do NOT bind the canvas: the geometry was already resolved (16:9 by default)
+        // and each reference is put on its own resolution here.
+        let mut normalized: Vec<Ref2VaReference> = Vec::with_capacity(references.len());
+        for r in references.as_slice() {
+            normalized.push(match r {
+                Ref2VaReference::Image(img) => Ref2VaReference::Image(
+                    crate::reference::normalize_reference_image(img, SPATIAL_STRIDE as i32)?,
+                ),
+                Ref2VaReference::Video(v) => Ref2VaReference::Video(VideoReference {
+                    frames: crate::reference::normalize_reference_clip(
+                        &v.frames,
+                        v.fps,
+                        geometry.joint.num_frames,
+                        SPATIAL_STRIDE as i32,
+                        CANVAS_SHORT_EDGE as i32,
+                        i64::from(CANVAS_MAX_PIXELS),
+                        MINIMAX_H3_FPS,
+                    )?,
+                    fps: MINIMAX_H3_FPS,
+                    audio: v.audio.clone(),
+                }),
+                Ref2VaReference::Audio(a) => Ref2VaReference::Audio(a.clone()),
+            });
+        }
+        // **Normalization must not lose a soundtrack.** A clip's own audio rides through
+        // `normalize_reference_clip` by clone, and a reference that arrived without it conditions
+        // the render on fewer audio rows *and* emits one fewer `<Audio j>` label — a shorter,
+        // perfectly runnable sequence. `Ref2VaReferences::audio_label_count` is the boundary's own
+        // count of audio-bearing references, so this is the two counts checked against each other
+        // rather than each side trusting itself.
+        let audio_blocks = normalized.iter().filter(|r| r.audio().is_some()).count();
+        if audio_blocks != references.audio_label_count() {
+            return Err(CandleError::Msg(format!(
+                "{MODEL_ID}: normalization left {audio_blocks} audio-bearing references of the \
+                 {} the request carried",
+                references.audio_label_count()
+            )));
+        }
+        if req.cancel.is_cancelled() {
+            return Err(CandleError::Canceled);
+        }
+
+        // --- 1. the conditioner: vision tower over the visual references, then the 66.7 GB LM ---
+        let (context, text_tags) = self.encode_prompt_ref2va(&req.prompt, &normalized)?;
+        if req.cancel.is_cancelled() {
+            return Err(CandleError::Canceled);
+        }
+
+        // --- 2. the VAEs: one conditioning latent per visual reference, one soundtrack per -------
+        //        audio-bearing reference. Done before the DiT is mapped.
+        let mut condition_rows: Vec<candle_gen::candle_core::Tensor> = Vec::new();
+        let mut audio_rows_per_ref: Vec<candle_gen::candle_core::Tensor> = Vec::new();
+        let mut geometries: Vec<ReferenceLatentGeometry> = Vec::new();
+        {
+            let vae = MiniMaxH3VideoVae::load(&self.root, &self.device, self.dtype)?;
+            let audio_enc = self.load_audio_encoder()?;
+            for (i, r) in normalized.iter().enumerate() {
+                // Audio FIRST, mirroring the packed row order.
+                let num_audio_latents = if let Some(track) = r.audio() {
+                    let wave = audio_track_to_encoder_input(track, &self.device)?;
+                    let posterior = audio_enc.encode(&wave)?;
+                    // The MODE, never a sample — a soundtrack is deterministic conditioning.
+                    let normed = audio_enc.normalize(posterior.mode())?;
+                    // `[B, latent_channels, latents]` -> `[channels, latents, features]`.
+                    let t = normed.permute((0, 2, 1))?.contiguous()?;
+                    let latents = t.dims()[1];
+                    audio_rows_per_ref.push(reference_audio_rows(&t)?);
+                    latents
+                } else {
+                    0
+                };
+
+                let (frames, height, width) = match r {
+                    Ref2VaReference::Audio(_) => (0, 0, 0),
+                    Ref2VaReference::Image(img) => {
+                        let pixels =
+                            reference_clip_to_vae_pixels(std::slice::from_ref(img), &self.device)?;
+                        let c = encode_reference_condition(
+                            &vae,
+                            &pixels,
+                            &KeyframeNoise::Seeded,
+                            i,
+                            &self.device,
+                        )?;
+                        let s = c.dims().to_vec();
+                        condition_rows.push(keyframe_condition_rows(
+                            &c,
+                            PATCH_SIZE,
+                            &KeyframeNoise::Seeded,
+                            i,
+                            &self.device,
+                        )?);
+                        (s[2], s[3], s[4])
+                    }
+                    Ref2VaReference::Video(v) => {
+                        // Snap DOWN to the VAE's `17n + 5` lattice so nothing is padded.
+                        //
+                        // The `.min` is what keeps a clip from being over-read, and it is safe
+                        // ONLY because `normalize_reference_clip` refuses a normalized clip shorter
+                        // than `MIN_REFERENCE_CLIP_FRAMES` (one whole chunk, 22). Without that
+                        // floor a 13..21-frame clip — 13 is `sample_video_condition_frames`' own
+                        // minimum — would reach the VAE OFF the lattice, where nothing in this
+                        // crate says what the encoder does.
+                        let keep = crate::conditioning::snap_reference_frames_down(v.frames.len())
+                            .min(v.frames.len());
+                        // A hard refusal, not a `debug_assert!` — for the same reason stated at the
+                        // task check above: release builds strip those, so the one configuration
+                        // that would actually encode off the lattice is the one with no check. The
+                        // two upstream floors (`validate` and `normalize_reference_clip`) make this
+                        // unreachable; that is the argument for it being cheap, not for it being
+                        // absent.
+                        if keep < crate::reference::MIN_REFERENCE_CLIP_FRAMES {
+                            return Err(CandleError::Msg(format!(
+                                "{MODEL_ID}: reference {i} snapped to {keep} frames, below the \
+                                 {}-frame `17n + 5` floor — the normalized clip reached the \
+                                 encoder off the lattice",
+                                crate::reference::MIN_REFERENCE_CLIP_FRAMES
+                            )));
+                        }
+                        let pixels = reference_clip_to_vae_pixels(&v.frames[..keep], &self.device)?;
+                        let c = encode_reference_condition(
+                            &vae,
+                            &pixels,
+                            &KeyframeNoise::Seeded,
+                            i,
+                            &self.device,
+                        )?;
+                        let s = c.dims().to_vec();
+                        condition_rows.push(keyframe_condition_rows(
+                            &c,
+                            PATCH_SIZE,
+                            &KeyframeNoise::Seeded,
+                            i,
+                            &self.device,
+                        )?);
+                        (s[2], s[3], s[4])
+                    }
+                };
+                geometries.push(ReferenceLatentGeometry {
+                    kind: r.kind(),
+                    num_latent_frames: frames,
+                    latent_height: height,
+                    latent_width: width,
+                    num_audio_latents,
+                });
+            }
+            drop(vae);
+            drop(audio_enc);
+            crate::dit::release_device_memory(&self.device)?;
+        }
+        if req.cancel.is_cancelled() {
+            return Err(CandleError::Canceled);
+        }
+        let condition_video = if condition_rows.is_empty() {
+            None
+        } else {
+            Some(candle_gen::candle_core::Tensor::cat(&condition_rows, 1)?.contiguous()?)
+        };
+        let condition_audio = if audio_rows_per_ref.is_empty() {
+            None
+        } else {
+            Some(candle_gen::candle_core::Tensor::cat(&audio_rows_per_ref, 1)?.contiguous()?)
+        };
+
+        // --- 3. denoise on `transformer_ref` ----------------------------------------------------
+        // Through `load_task_dit`, NOT a bare `MiniMaxH3Dit::load`. sc-17157 and sc-18728 landed on
+        // separate branches and met here: the reference render is the exact case the seam's doc
+        // comment names — a denoise path that maps its own DiT would render a `ref2va` job with the
+        // caller's staged LoRA silently dropped, `Ok` and with no error. `tests/turbo_lora.rs`
+        // covers the seam; the staging table below tracks this anchor.
+        let dit = self.load_task_dit(task.partition())?;
+        let patch = dit.config().patch_size;
+        let layout = ref2va_layout(geometry, &text_tags, &geometries, patch, &self.device)?;
+        let (video_rows, audio_rows) = initial_latents(geometry, patch, seed, &self.device)?;
+        let video_rows = prepend_condition_rows(&layout, condition_video.as_ref(), &video_rows)?;
+        let audio_rows =
+            prepend_condition_audio_rows(&layout, condition_audio.as_ref(), &audio_rows)?;
+        let adaln = crate::denoise::adaln_schedule(schedule)?;
+        let mut model = JointDit::new(
+            dit,
+            layout.clone(),
+            &context,
+            adaln,
+            AdaLnResidency::PrecomputeAndEvict,
+        )?;
+        drop(context);
+
+        let total = schedule.num_evals() as u32;
+        let mut on_step = |completed: usize| {
+            on_progress(Progress::Step {
+                current: completed as u32,
+                total,
+            });
+        };
+        let rendered = render_latents(
+            &mut model,
+            &layout,
+            schedule,
+            &video_rows,
+            &audio_rows,
+            patch,
+            &self.device,
+            &req.cancel,
+            &mut on_step,
+        )?;
+        drop(model);
+        drop(video_rows);
+        drop(audio_rows);
+        crate::dit::release_device_memory(&self.device)?;
+
+        // --- 4. decode --------------------------------------------------------------------------
+        on_progress(Progress::Decoding);
+        if req.cancel.is_cancelled() {
+            return Err(CandleError::Canceled);
+        }
+        let frames = {
+            let vae = MiniMaxH3VideoVae::load_decode_only(&self.root, &self.device, self.dtype)?;
+            let video = vae.decode(&rendered.video)?;
+            drop(vae);
+            crate::dit::release_device_memory(&self.device)?;
+            frames_to_images(&revert_pixel_normalization(&video)?)?
+        };
+        let audio = {
+            let (cfg, w) = self.load_audio_vae()?;
+            let vae = crate::audio_vae::MiniMaxH3AudioVae::from_weights(
+                &w,
+                &cfg,
+                &self.device,
+                self.dtype,
+            )?;
+            drop(w);
+            let track = vae.decode_audio_track(&rendered.audio)?;
+            drop(vae);
+            crate::dit::release_device_memory(&self.device)?;
+            track
+        };
+        let audio = finish_audio(audio, geometry)?;
+        if frames.len() != geometry.joint.num_frames {
+            return Err(CandleError::Msg(format!(
+                "{MODEL_ID}: decoded {} frames for a {}-frame ref2va request",
+                frames.len(),
+                geometry.joint.num_frames
+            )));
+        }
+        Ok(GenerationOutput::Video {
+            frames,
+            fps: MINIMAX_H3_FPS as u32,
+            audio: Some(audio),
+        })
+    }
+
+    /// The `ref2va` presentation: the vision tower over every **visual** reference, spliced into
+    /// the `<Picture i>` / `<Audio j>` / `<Video k>` presentation.
+    ///
+    /// A waveform never reaches the tower — a standalone audio reference contributes its label and
+    /// nothing else, which is why the tower's sources and the presentation entries are built in one
+    /// pass rather than zipped afterwards.
+    fn encode_prompt_ref2va(
+        &self,
+        prompt: &str,
+        references: &[Ref2VaReference],
+    ) -> Result<(candle_gen::candle_core::Tensor, Vec<u32>)> {
+        use crate::reference::{
+            sample_video_condition_frames, ReferencePresentation, VIDEO_SAMPLE_FPS,
+            VISION_TEMPORAL_PATCH,
+        };
+
+        let tok = MiniMaxH3Tokenizer::from_snapshot(&self.root)?;
+        let cfg = MiniMaxH3TeConfig::from_snapshot(&self.root)?;
+
+        // The tower's sources, in **sequence order** — the order the pad runs appear in, which is
+        // what `forward_with_references` consumes them in.
+        let mut sources: Vec<&Image> = Vec::new();
+        // Per reference: how many tower sources it contributes, and its block timestamps.
+        let mut plan: Vec<(usize, Vec<f64>)> = Vec::new();
+        for r in references {
+            match r {
+                Ref2VaReference::Audio(_) => plan.push((0, Vec::new())),
+                Ref2VaReference::Image(img) => {
+                    sources.push(img);
+                    plan.push((1, Vec::new()));
+                }
+                Ref2VaReference::Video(v) => {
+                    let (indices, timestamps) = sample_video_condition_frames(
+                        v.frames.len(),
+                        MINIMAX_H3_FPS,
+                        VIDEO_SAMPLE_FPS,
+                        VISION_TEMPORAL_PATCH,
+                    )?;
+                    for &i in &indices {
+                        sources.push(&v.frames[i]);
+                    }
+                    plan.push((indices.len(), timestamps));
+                }
+            }
+        }
+        if sources.is_empty() {
+            return Err(CandleError::Msg(format!(
+                "{MODEL_ID}: a ref2va request carries no visual reference for the conditioner — a \
+                 waveform never reaches it"
+            )));
+        }
+
+        let vision = load_vision_tower(&self.root, &self.device)?;
+        let grounded = crate::text_encoder::run_vision(&vision, &sources, &self.device)?;
+        drop(vision);
+        crate::dit::release_device_memory(&self.device)?;
+
+        // The presentation, from the tower's per-source counts.
+        let mut cursor = 0usize;
+        let mut presentation: Vec<ReferencePresentation> = Vec::with_capacity(references.len());
+        for (r, (n_sources, timestamps)) in references.iter().zip(&plan) {
+            match r {
+                Ref2VaReference::Audio(_) => presentation.push(ReferencePresentation::Audio),
+                Ref2VaReference::Image(_) => {
+                    presentation.push(ReferencePresentation::Image {
+                        num_tokens: grounded.counts[cursor],
+                    });
+                    cursor += 1;
+                }
+                Ref2VaReference::Video(v) => {
+                    // One block per merged frame pair; every block of one clip shares a token count.
+                    let num_tokens = grounded.counts[cursor];
+                    presentation.push(ReferencePresentation::Video {
+                        num_tokens,
+                        timestamps: timestamps.clone(),
+                        has_audio: v.audio.is_some(),
+                    });
+                    cursor += n_sources;
+                }
+            }
+        }
+
+        let (ids, mask, tags) = tok.encode_ref2va(prompt, &presentation, &self.device)?;
+        let shards = candle_gen::loader::sorted_safetensors(
+            &self.root.join("text_encoder"),
+            "minimax-h3 te",
+        )?;
+        let prefixes = lm_prefixes(LM_PREFIX, &cfg);
+        let refs: Vec<&str> = prefixes.iter().map(String::as_str).collect();
+        let w =
+            candle_gen::Weights::from_files_filtered(&shards, &self.device, TE_STORE_DTYPE, &refs)?;
+        let te = MiniMaxH3TextEncoder::from_weights(&w, LM_PREFIX, &cfg, TE_STORE_DTYPE)?;
+        drop(w);
+        let context = te.forward_with_references(
+            &ids,
+            &mask,
+            &grounded.embeds,
+            &grounded.deepstack,
+            &grounded.grids,
+        )?;
+        drop(te);
+        drop(grounded);
+        crate::dit::release_device_memory(&self.device)?;
+
+        if context.dims()[1] != tags.len() {
+            return Err(CandleError::Msg(format!(
+                "{MODEL_ID}: the ref2va context has {} rows but {} modality tags",
+                context.dims()[1],
+                tags.len()
+            )));
+        }
+        Ok((context, tags))
+    }
 }
 
 impl MiniMaxH3 {
+    /// The audio VAE **encoder**, built from the same three FL2VA source documents the decoder
+    /// reads its constructor arguments from.
+    ///
+    /// Loaded at [`crate::audio_vae_encoder::ENCODER_DTYPE`] — **f32, never `self.dtype`**.
+    /// diffusers pins this component with `_keep_in_fp32_modules = ["encoder", …, "mean_proj",
+    /// "logs_proj"]` — the weight-normed convolutions and Snake activations degrade audibly under
+    /// bf16 — and a reference soundtrack encoded at the wrong precision conditions the render with
+    /// no diagnostic. `the_audio_encoder_is_pinned_to_f32_not_the_provider_dtype` scans this body.
+    fn load_audio_encoder(&self) -> Result<crate::audio_vae_encoder::MiniMaxH3AudioVaeEncoder> {
+        use crate::audio_vae_encoder::ENCODER_DTYPE;
+        let cfg = self.audio_vae_config()?;
+        let shards = candle_gen::loader::sorted_safetensors(
+            &self.root.join("audio_vae"),
+            "minimax-h3 audio vae",
+        )?;
+        let w = candle_gen::Weights::from_files(&shards, &self.device, ENCODER_DTYPE)?;
+        crate::audio_vae_encoder::MiniMaxH3AudioVaeEncoder::from_weights(
+            &w,
+            &cfg,
+            &self.device,
+            ENCODER_DTYPE,
+        )
+    }
+
     /// The audio VAE's config triple plus its weight map.
     ///
     /// The config comes from the FL2VA **source triple** (`config.json` + `config.yaml` +
@@ -552,24 +1226,7 @@ impl MiniMaxH3 {
         crate::audio_config::MiniMaxH3AudioVaeConfig,
         candle_gen::Weights,
     )> {
-        let src = self.root.join("FL2VA").join("audio_vae");
-        let cfg = if src.join("config.yaml").is_file() {
-            let read = |name: &str| -> Result<String> {
-                std::fs::read_to_string(src.join(name)).map_err(|e| {
-                    CandleError::Msg(format!(
-                        "{MODEL_ID}: read {}: {e}",
-                        src.join(name).display()
-                    ))
-                })
-            };
-            crate::audio_config::MiniMaxH3AudioVaeConfig::from_source_files(
-                &read("config.json")?,
-                &read("config.yaml")?,
-                &read("metadata.json")?,
-            )?
-        } else {
-            crate::audio_config::MiniMaxH3AudioVaeConfig::default()
-        };
+        let cfg = self.audio_vae_config()?;
         let shards = candle_gen::loader::sorted_safetensors(
             &self.root.join("audio_vae"),
             "minimax-h3 audio vae",
@@ -577,6 +1234,53 @@ impl MiniMaxH3 {
         let w = candle_gen::Weights::from_files(&shards, &self.device, self.dtype)?;
         Ok((cfg, w))
     }
+
+    /// The audio VAE's constructor arguments, shared by the decode and encode halves.
+    ///
+    /// Split out so the two halves cannot disagree about the geometry — `encoder_rates` fixes the
+    /// hop length the encode half pads to *and* the `decoder_rates` the decode half upsamples by,
+    /// and two independent readers of the same triple is exactly how those drift.
+    fn audio_vae_config(&self) -> Result<crate::audio_config::MiniMaxH3AudioVaeConfig> {
+        let src = self.root.join("FL2VA").join("audio_vae");
+        if !src.join("config.yaml").is_file() {
+            return Ok(crate::audio_config::MiniMaxH3AudioVaeConfig::default());
+        }
+        let read = |name: &str| -> Result<String> {
+            std::fs::read_to_string(src.join(name)).map_err(|e| {
+                CandleError::Msg(format!(
+                    "{MODEL_ID}: read {}: {e}",
+                    src.join(name).display()
+                ))
+            })
+        };
+        crate::audio_config::MiniMaxH3AudioVaeConfig::from_source_files(
+            &read("config.json")?,
+            &read("config.yaml")?,
+            &read("metadata.json")?,
+        )
+    }
+}
+
+/// Fit the decoded soundtrack to the clip and **check what came back**, for every generate arm.
+///
+/// Hoisted rather than written twice. The two arms had diverged on exactly this: the base arm
+/// checked the decoded rate and channel count, the `ref2va` arm did not — so a decode that returned
+/// mono, or 16 kHz, produced a silently wrong soundtrack on one path and a typed error on the other.
+/// Two generate arms disagreeing about a sanity assertion is this epic's signature shape, so the
+/// assertion has one home.
+fn finish_audio(
+    audio: candle_gen::gen_core::AudioTrack,
+    geometry: &RequestGeometry,
+) -> Result<candle_gen::gen_core::AudioTrack> {
+    let audio = fit_audio_to_video(audio, geometry)?;
+    if audio.sample_rate != AUDIO_SAMPLE_RATE || audio.channels != AUDIO_OUTPUT_CHANNELS {
+        return Err(CandleError::Msg(format!(
+            "{MODEL_ID}: the decoded soundtrack is {} Hz / {} channels, expected \
+             {AUDIO_SAMPLE_RATE} / {AUDIO_OUTPUT_CHANNELS}",
+            audio.sample_rate, audio.channels
+        )));
+    }
+    Ok(audio)
 }
 
 /// Duration a request that names neither `frames` nor `duration` renders at — the lattice floor.
@@ -620,6 +1324,69 @@ pub fn keyframe_anchors(
     Ok(out)
 }
 
+/// Map a request's **ordered** conditioning onto `ref2va`'s reference list.
+///
+/// Returns `None` when the request carries no reference of any modality, which is what makes this
+/// the `t2va` / `fl2va` discriminator as well.
+///
+/// # Order is taken from the request and never re-sorted
+///
+/// [`GenerationRequest::conditioning`] is a `Vec`, and `ref2va`'s order is semantic — it fixes the
+/// `"<Picture i>"` / `"<Audio j>"` / `"<Video k>"` labels **and** advances the shared rotary clock.
+/// So this walks the vector once and preserves position. Grouping by modality first (the obvious
+/// implementation, and what [`keyframe_anchors`] legitimately does for `fl2va`'s two fixed slots)
+/// would silently rewrite the request.
+///
+/// # The `ReferenceVideo` decision, and the two carriers it replaced
+///
+/// A `ref2va` video reference maps to `Conditioning::ReferenceVideo` — a carrier added to gen-core
+/// for this task, rather than either of the two video variants that already existed:
+///
+/// * **`VideoSync` is the wrong meaning.** Its contract is video→audio Foley — the whole-clip
+///   visual condition an audio decoder attends to for a *silent clip* — and its own docs say the
+///   frames "are **not** spliced into a video latent". Both halves are false here.
+/// * **`VideoClip` is the right *mechanism* but the wrong *vocabulary*.** Its payload is
+///   `{frames, frame_idx, strength}`, and a reference can use none of the latter two: `frame_idx`
+///   is a position in the generated timeline, which is exactly what a reference does not have, and
+///   `strength` is a `1 − strength` denoise mask, where reference rows are fully pinned at the
+///   checkpoint's own conditioning timestep. It also cannot carry a clip's **own frame rate** or
+///   **own soundtrack**, both of which [`crate::reference::VideoReference`] requires: a rate that
+///   was lost is a reference conditioned on at the wrong speed with nothing to raise about it.
+pub(crate) fn request_references(req: &GenerationRequest) -> Result<Option<Ref2VaReferences>> {
+    use candle_gen::gen_core::Conditioning;
+
+    let mut refs: Vec<Ref2VaReference> = Vec::new();
+    for c in &req.conditioning {
+        match c {
+            Conditioning::Reference { image, .. } => {
+                refs.push(Ref2VaReference::Image(image.clone()));
+            }
+            Conditioning::ReferenceAudio { audio, .. } => {
+                refs.push(Ref2VaReference::Audio(crate::reference::AudioReference {
+                    audio: audio.clone(),
+                }));
+            }
+            Conditioning::ReferenceVideo { frames, fps, audio } => {
+                refs.push(Ref2VaReference::Video(VideoReference {
+                    frames: frames.clone(),
+                    // The clip's own rate, carried by the variant. Range-checked by
+                    // `Ref2VaReferences::new`, which owns every ref2va rule at the engine boundary.
+                    fps: f64::from(*fps),
+                    audio: audio.clone(),
+                }));
+            }
+            // Keyframes belong to `fl2va` and are resolved by `keyframe_anchors`; everything else
+            // is refused upstream by `Capabilities::validate_request`, which default-denies any
+            // kind this descriptor does not advertise.
+            _ => {}
+        }
+    }
+    if refs.is_empty() {
+        return Ok(None);
+    }
+    Ref2VaReferences::new(refs).map(Some)
+}
+
 impl Generator for MiniMaxH3 {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
@@ -633,6 +1400,74 @@ impl Generator for MiniMaxH3 {
             return Err(candle_gen::gen_core::Error::Msg(format!(
                 "{MODEL_ID}: prompt must not be empty"
             )));
+        }
+        // **The `ref2va` reference gate, at the engine boundary** (sc-17157). Every cap — 9 images,
+        // 3 clips, 3 audio, 12 combined — plus the audio-is-never-alone rule and the
+        // both-tasks-at-once refusal, all before a single weight is read.
+        //
+        // Enforced here and not only at the API for the reason the whole epic exists: a pipeline
+        // handed conditioning it cannot consume does not fail, it renders a plausible clip that
+        // silently ignored the thirteenth reference. `Ref2VaReferences` is constructible only
+        // through its validating constructor, so the render path cannot reach a reference list
+        // that skipped this.
+        //
+        // This is also where the task's OWN checkpoint is required to be present: `ref2va` needs
+        // `transformer_ref/`, and this runs before a single weight is read. See
+        // [`task_component_dirs`] for why that is not a `load`-time check.
+        let (_, references) = self.resolve_task(req)?;
+
+        // **The area budget runs HERE, not only inside `generate`** (sc-17152).
+        //
+        // `Capabilities::max_size` is a per-edge bound and can never constrain a product, so it was
+        // never the area gate — it only *looked* like one while it sat at 1344, because a square
+        // inside the budget was arithmetically impossible above it. Raising it to
+        // [`MAX_CANVAS_EDGE`] removes that accident, and without this call `1536 x 1536` (2.3x the
+        // budget) would pass `validate` and be refused only once `request_geometry` ran, deep
+        // inside a render that has already mapped the text encoder.
+        //
+        // The MLX provider has always run the gate at its validate boundary
+        // (`mlx-gen-minimax-h3::model::validate_request`); this is the Candle lane converging on it
+        // rather than a new rule. `request_geometry` is the same helper `generate` resolves
+        // through, so the two cannot disagree about what is renderable.
+        //
+        // It runs *after* `resolve_task` so sc-17157's error ordering is unchanged — the task's own
+        // checkpoint is still reported before any geometry-dependent refusal — and the resolved
+        // geometry is reused by the clip-length floor below rather than resolved a second time.
+        let geometry = self.request_geometry(req)?;
+
+        // **The clip-length floor, on the same side of the boundary as everything else** (sc-17157).
+        //
+        // `MIN_REFERENCE_CLIP_FRAMES` was enforced only inside `normalize_reference_clip`, whose
+        // sole production caller is `generate_ref2va`. So `validate` ADMITTED a short clip that
+        // `generate` then refused — precisely the late failure this method exists to prevent, and
+        // one the crate's own tests had frozen in place by building 4-frame clips and asserting
+        // they validate.
+        //
+        // # Why here and not in `resolve_task`
+        //
+        // The surviving frame count depends on the request's `num_frames`, so the check needs the
+        // geometry. Putting it in `resolve_task` would mean calling `request_geometry` there, and
+        // `resolve_task` is reached from `generate_impl` too — geometry would be resolved twice per
+        // render, and a t2va/fl2va request carrying no clip at all would start failing INSIDE task
+        // selection on an error that has nothing to do with which checkpoint it needs.
+        //
+        // `validate` is where request admission already lives, and the "single decision point"
+        // property `resolve_task` is documented for is about the CHECKPOINT, which is untouched.
+        // The reference caps — 9 images, 3 clips, 12 total, audio-never-alone — are likewise
+        // enforced outside `resolve_task`, in `Ref2VaReferences::new`. So this follows the crate's
+        // existing shape rather than departing from it, and error ordering stays legible: the
+        // task's own checkpoint first, then the geometry-dependent admission.
+        if let Some(references) = references {
+            for r in references.as_slice() {
+                if let Ref2VaReference::Video(v) = r {
+                    crate::reference::normalized_clip_frame_count(
+                        v.frames.len(),
+                        v.fps,
+                        geometry.joint.num_frames,
+                        MINIMAX_H3_FPS,
+                    )?;
+                }
+            }
         }
         Ok(())
     }
@@ -652,20 +1487,23 @@ impl Generator for MiniMaxH3 {
 
 /// Registry entry point.
 ///
-/// # The two load-time refusals, and why the descriptor flags cannot stand in for them
+/// # The load-time refusals, and why the descriptor flags cannot stand in for them
 ///
-/// [`descriptor`] sets `supports_lora` / `supports_lokr` to `false` and `supported_quants` to `&[]`,
-/// and the module docs above promise a request carrying either "gets a typed `Unsupported` at the
-/// contract boundary instead of a plausible render that quietly dropped it". **Those three fields are
-/// declarations that gen-core reads on no path.** `Capabilities::validate_request` gates the
+/// [`descriptor`] sets `supports_lokr` to `false` and `supported_quants` to `&[]`. **Those fields
+/// are declarations that gen-core reads on no path.** `Capabilities::validate_request` gates the
 /// conditioning allowlist (which is what actually default-denies the `ref2va` kinds) but never looks
 /// at `supports_lora` or `supported_quants`, and `ProviderRegistryBuilder` does not inspect a
-/// `LoadSpec` either — so without the checks below, a spec carrying `adapters` or `quantize` loaded
-/// clean and rendered with the caller's knob silently discarded. That is the precise failure the
-/// docs claimed was impossible.
+/// `LoadSpec` either — so without the checks below, a spec carrying `quantize`, a LoKr adapter, or a
+/// per-pass / MoE adapter knob loaded clean and rendered with the caller's knob silently discarded.
 ///
-/// `reject_unknown_components` does not cover this: it validates `spec.components`, a different field
-/// from `spec.adapters` and `spec.quantize`.
+/// `reject_unknown_components` does not cover this: it validates `spec.components`, a different
+/// field from `spec.adapters` and `spec.quantize`.
+///
+/// Since sc-18728 `spec.adapters` is **read** rather than refused — see
+/// [`MiniMaxH3::load_task_dit`] — so the checks here narrowed to the three adapter-shaped knobs this
+/// lane still cannot honor: `AdapterKind::Lokr`, `pass_scales` (LTX's two-stage schedule) and
+/// `moe_expert` (Wan's dual-expert selector). Each is a field a caller can set on an
+/// otherwise-valid LoRA, and each would otherwise be dropped without a word.
 ///
 /// This is the `candle-gen-mochi` idiom — refuse at the registry entry point, which returns
 /// `gen_core::Result` and can therefore carry the contract-load-bearing
@@ -673,17 +1511,43 @@ impl Generator for MiniMaxH3 {
 ///
 /// # Every other `LoadSpec` slot is decided too
 ///
-/// The two checks below were the ones this crate shipped first, but "declared and unenforced" is a
+/// The checks below were the ones this crate shipped first, but "declared and unenforced" is a
 /// *class*, not two instances. `reject_unread_slots` closes the rest of it, and the three slots
 /// that are **not** refused are each accounted for there rather than left to inference.
 pub fn load(spec: &LoadSpec) -> candle_gen::gen_core::Result<Box<dyn Generator>> {
-    if !spec.adapters.is_empty() {
-        return Err(candle_gen::gen_core::Error::Unsupported(format!(
-            "{MODEL_ID}: the candle lane does not support LoRA/LoKr adapters — {} staged, and the \
-             turbo seam (the MLX sibling's `adapters`) is not ported here. Refused rather than \
-             rendered without them.",
-            spec.adapters.len()
-        )));
+    for a in &spec.adapters {
+        // **LoKr is still refused**, by kind here and by file content in
+        // [`crate::adapters::apply_minimax_h3_adapters`]. This DiT's seam installs
+        // `scale·((x·A)·B)` residuals; a Kronecker delta is a different operation, so accepting one
+        // would be a wrong fold rather than a weak one. Refused at the registry entry point because
+        // that is the boundary carrying `Error::Unsupported`.
+        if a.kind == candle_gen::gen_core::AdapterKind::Lokr {
+            return Err(candle_gen::gen_core::Error::Unsupported(format!(
+                "{MODEL_ID}: {} is staged as LoKr; the candle lane installs LoRA residuals only. \
+                 Use a LoRA export of the same adapter.",
+                a.path.display()
+            )));
+        }
+        // `pass_scales` is LTX's per-distilled-stage knob and `moe_expert` is Wan's dual-expert
+        // selector. This checkpoint has one denoise pass and one expert, so either is a knob that
+        // would be silently discarded — the exact class `reject_unread_slots` exists to close, one
+        // field deeper.
+        if a.pass_scales.is_some() {
+            return Err(candle_gen::gen_core::Error::Unsupported(format!(
+                "{MODEL_ID}: adapter {} sets `pass_scales`, which only LTX's two-stage denoise \
+                 reads. MiniMax-H3 runs ONE forward per step, so a per-pass schedule has nowhere \
+                 to apply and would be silently dropped.",
+                a.path.display()
+            )));
+        }
+        if a.moe_expert.is_some() {
+            return Err(candle_gen::gen_core::Error::Unsupported(format!(
+                "{MODEL_ID}: adapter {} names a MoE expert, which only the Wan2.2 A14B dual-expert \
+                 denoiser reads. This checkpoint is single-stream, so the selection would be \
+                 silently dropped.",
+                a.path.display()
+            )));
+        }
     }
     if let Some(q) = spec.quantize {
         return Err(candle_gen::gen_core::Error::Unsupported(format!(
@@ -786,12 +1650,9 @@ mod tests {
     #[test]
     fn the_offload_policy_is_forced_sequential_even_when_resident_is_requested() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        for c in REQUIRED_COMPONENT_DIRS {
-            std::fs::create_dir_all(root.join(c)).unwrap();
-        }
-        let spec = LoadSpec::new(WeightsSource::Dir(root.to_path_buf()))
-            .with_offload_policy(OffloadPolicy::Resident);
+        let root = staged_root(&tmp);
+        let spec =
+            LoadSpec::new(WeightsSource::Dir(root)).with_offload_policy(OffloadPolicy::Resident);
         assert_eq!(spec.offload_policy, OffloadPolicy::Resident);
 
         let model = MiniMaxH3::load(&spec).unwrap();
@@ -803,6 +1664,165 @@ mod tests {
         );
         assert_eq!(OFFLOAD_POLICY, OffloadPolicy::Sequential);
         assert_ne!(model.offload_policy(), spec.offload_policy);
+    }
+
+    /// Every resolution SceneWorks advertises for `minimax_h3` and `minimax_h3_ref`.
+    ///
+    /// Copied from `config/manifests/builtin.models.jsonc` — both partitions declare this exact
+    /// list, and it drives the resolution `<select>` in `apps/web/src/resolutionOverride.js`. A
+    /// bucket the menu offers and the engine refuses is a submit error the user cannot avoid, so
+    /// this list is the acceptance criterion rather than an illustration.
+    const ADVERTISED_BUCKETS: [(u32, u32); 9] = [
+        (1536, 672),
+        (672, 1536),
+        (1344, 768),
+        (768, 1344),
+        (1024, 768),
+        (768, 1024),
+        (768, 768),
+        (576, 320),
+        (320, 576),
+    ];
+
+    /// A generator over a staged-but-empty snapshot — enough to drive `validate`, which reads no
+    /// weights.
+    ///
+    /// It stages through [`staged_root`] rather than bare `create_dir_all`: sc-19573's
+    /// [`require_component`] refuses a component directory carrying no `.safetensors` shard, so a
+    /// directory-only root no longer loads at all.
+    fn validator() -> MiniMaxH3 {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = staged_root(&tmp);
+        let model = MiniMaxH3::load(&LoadSpec::new(WeightsSource::Dir(root))).unwrap();
+        // The tempdir may drop here: for the `t2va` requests this drives, `validate` touches no
+        // filesystem — `task_component_dirs(T2va)` is empty — which is the point.
+        model
+    }
+
+    fn request(width: u32, height: u32) -> GenerationRequest {
+        GenerationRequest {
+            prompt: "a slow pan across a rainy street at night".into(),
+            width,
+            height,
+            frames: Some(124),
+            ..Default::default()
+        }
+    }
+
+    /// **The per-edge ceiling is the widest canvas the model's own resolver emits** (sc-17152).
+    ///
+    /// The number is *derived here*, not restated: a maintained literal inside the test that exists
+    /// to catch a wrong literal proves nothing. The sweep walks the model's whole legal aspect
+    /// range and asks [`crate::keyframe::resolve_canvas_size`] — the arithmetic that turns a
+    /// reference's ratio into a canvas — for each canvas, then asserts `max_size` equals the widest
+    /// edge that came back. A ceiling below it would refuse a canvas the model resolves to on its
+    /// own; above it would advertise an edge nothing can produce.
+    #[test]
+    fn the_capability_ceiling_is_the_widest_canvas_the_resolver_emits() {
+        const STEPS: u32 = 40_000;
+        let mut widest = 0u32;
+        for i in 0..=STEPS {
+            let ratio = crate::keyframe::MIN_ASPECT_RATIO
+                + (crate::keyframe::MAX_ASPECT_RATIO - crate::keyframe::MIN_ASPECT_RATIO)
+                    * f64::from(i)
+                    / f64::from(STEPS);
+            let (h, w) = crate::keyframe::resolve_canvas_size(
+                ratio,
+                1.0,
+                SPATIAL_STRIDE as i32,
+                CANVAS_SHORT_EDGE as i32,
+                i64::from(crate::pipeline::CANVAS_MAX_PIXELS),
+            )
+            .unwrap();
+            widest = widest.max(w as u32).max(h as u32);
+        }
+        assert_eq!(
+            descriptor().capabilities.max_size,
+            widest,
+            "max_size must be the widest edge `resolve_canvas_size` can emit across 1:4..=4:1"
+        );
+        assert_eq!(descriptor().capabilities.max_size, MAX_CANVAS_EDGE);
+
+        // The advertised menu must fit under it — this is the defect the story was filed for.
+        let advertised = ADVERTISED_BUCKETS
+            .iter()
+            .flat_map(|&(w, h)| [w, h])
+            .max()
+            .unwrap();
+        assert!(
+            advertised <= descriptor().capabilities.max_size,
+            "SceneWorks advertises a {advertised} px edge; the engine ceiling is {}",
+            descriptor().capabilities.max_size
+        );
+    }
+
+    /// **Every advertised bucket validates** — the user-visible half of sc-17152.
+    #[test]
+    fn every_advertised_resolution_bucket_validates() {
+        let model = validator();
+        for (w, h) in ADVERTISED_BUCKETS {
+            // The manifest list must itself be inside the checkpoint's envelope, or the engine is
+            // right to refuse and the manifest is the thing that is wrong.
+            assert!(
+                u64::from(w) * u64::from(h) <= u64::from(crate::pipeline::CANVAS_MAX_PIXELS),
+                "{w}x{h} is over the area budget"
+            );
+            model
+                .validate(&request(w, h))
+                .unwrap_or_else(|e| panic!("{w}x{h} is advertised but refused: {e}"));
+        }
+    }
+
+    /// **Raising the per-edge ceiling did not widen the area envelope** (sc-17152).
+    ///
+    /// Both shapes here are *inside* `max_size` on both edges and 32-aligned, so the per-edge gate
+    /// and the stride gate are both satisfied and only the area gate can refuse them — asserted
+    /// explicitly, because a refusal that came from the edge gate would make this test pass while
+    /// proving the opposite of what it claims. The error is named rather than checked with
+    /// `is_err`.
+    ///
+    /// This also pins that the area gate runs from **`validate`** on this lane. Before sc-17152 it
+    /// did not: `validate` ran only the shared capability floor, and `resolve_geometry` was reached
+    /// only once `generate` resolved geometry. That was invisible while `max_size` was 1344,
+    /// because no square inside a 1344 ceiling can exceed the area budget.
+    #[test]
+    fn an_over_area_canvas_is_still_refused_by_the_area_gate() {
+        let model = validator();
+        let caps = &model.descriptor().capabilities;
+        for (w, h) in [(1536u32, 1536u32), (1344u32, 1344u32)] {
+            assert!(
+                w <= caps.max_size && h <= caps.max_size,
+                "{w}x{h} must be INSIDE the per-edge ceiling or this proves nothing"
+            );
+            assert!(w.is_multiple_of(SPATIAL_STRIDE) && h.is_multiple_of(SPATIAL_STRIDE));
+            assert!(u64::from(w) * u64::from(h) > u64::from(crate::pipeline::CANVAS_MAX_PIXELS));
+
+            let e = model.validate(&request(w, h)).unwrap_err().to_string();
+            assert!(e.contains("canvas budget"), "{w}x{h}: {e}");
+            assert!(
+                !e.contains("outside supported range"),
+                "{w}x{h} must be refused by the AREA gate, not the per-edge gate: {e}"
+            );
+        }
+
+        // The one shape the raised ceiling newly admits: the 4:1 canvas the resolver itself emits.
+        // The short edge is derived — the ceiling divides the area budget exactly, which is what
+        // makes `MAX_CANVAS_EDGE x short` sit at the budget rather than over it.
+        let short = crate::pipeline::CANVAS_MAX_PIXELS / MAX_CANVAS_EDGE;
+        assert_eq!(short * MAX_CANVAS_EDGE, crate::pipeline::CANVAS_MAX_PIXELS);
+        assert!(short.is_multiple_of(SPATIAL_STRIDE));
+        for (w, h) in [(MAX_CANVAS_EDGE, short), (short, MAX_CANVAS_EDGE)] {
+            model
+                .validate(&request(w, h))
+                .unwrap_or_else(|e| panic!("{w}x{h} is the resolver's own 4:1 canvas: {e}"));
+        }
+
+        // …and one stride past it on the long edge is outside the per-edge ceiling again.
+        let e = model
+            .validate(&request(MAX_CANVAS_EDGE + SPATIAL_STRIDE, short))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("outside supported range"), "{e}");
     }
 
     /// This file's **production** source: the test module removed, then full-line comments stripped.
@@ -864,20 +1884,82 @@ mod tests {
         panic!("unbalanced braces while extracting `{signature}`")
     }
 
-    /// **The staging itself is pinned — not merely the policy field.**
+    /// The explicit device release. Dropping the Rust binding alone is not enough — candle
+    /// hands the pages back to its own allocator, so without this the next phase maps on top.
+    const RELEASE: &str = "crate::dit::release_device_memory(";
+
+    /// The two bindings every text-encoder phase holds: the weight map and the tower built
+    /// from it. The tower is built *before* the map is dropped, necessarily, so a phase is a
+    /// group of maps and a group of releases rather than one pair.
+    const TE_MAPS: &[&str] = &[
+        "Weights::from_files_filtered",
+        "MiniMaxH3TextEncoder::from_weights",
+    ];
+
+    /// One staged phase: a name for the message, the source anchors that MAP its component,
+    /// and the source anchors that RELEASE it.
+    type Phase = (
+        &'static str,
+        &'static [&'static str],
+        &'static [&'static str],
+    );
+
+    /// **Every heavy-component map anchor this file may contain.**
     ///
-    /// The test above asserts `MiniMaxH3::offload_policy()`, and that is a real guard against a
-    /// `load` that starts echoing `spec.offload_policy`. It is also *all* it is: `self.offload` is
-    /// read by nothing on any render path. Delete every `drop` and every device release from
-    /// `generate_impl` and that test stays green, while the manifest's measured `vramGbByTier`
-    /// silently stops describing the render — the true peak becomes the ~143 GB **sum** of the
-    /// components instead of their max, and the worker admits cards against a number 3.5x too small.
+    /// Read by `every_heavy_map_is_inside_a_staged_phase`, which asserts each occurrence in the
+    /// production source is inside a tabled staging function or inside a delegated helper. A new
+    /// heavy component must be added here *and* to [`staged_phases`], or the two disagree loudly.
+    const MAP_ANCHORS: &[&str] = &[
+        "MiniMaxH3Dit::load(",
+        "MiniMaxH3VideoVae::load(",
+        "MiniMaxH3VideoVae::load_decode_only(",
+        "load_vision_tower(",
+        "Weights::from_files(",
+        "Weights::from_files_filtered(",
+        "MiniMaxH3TextEncoder::from_weights(",
+        "MiniMaxH3AudioVae::from_weights(",
+        "MiniMaxH3AudioVaeEncoder::from_weights(",
+    ];
+
+    /// Helpers that are themselves a tabled map anchor: the phase that calls them owns their
+    /// staging, so the maps *inside* them are covered by the caller's entry.
     ///
-    /// So this guard walks the staged phases of the three staging functions in this file's own
+    /// `load_task_dit` is the third (sc-18728): it is the single seam that maps a DiT partition and
+    /// folds any staged LoRA onto it, so both render paths name `self.load_task_dit(` as their map
+    /// anchor and the inner `MiniMaxH3Dit::load` lives one call deeper. Exempting it here is only
+    /// safe because the pairing below is asserted in both directions — a helper listed here that no
+    /// phase actually names as a map would be an uncovered hole, and reds.
+    const DELEGATED_HELPERS: &[&str] = &[
+        "fn load_audio_encoder(",
+        "fn load_audio_vae(",
+        "fn load_task_dit(",
+    ];
+
+    /// **The staged phases of every staging function in this file, in source order** — the table
+    /// `every_heavy_component_is_released_before_the_next_one_is_mapped` walks.
+    ///
+    /// `the_offload_policy_is_forced_sequential_even_when_resident_is_requested` asserts
+    /// `MiniMaxH3::offload_policy()`, and that is a real guard against a `load` that starts echoing
+    /// `spec.offload_policy`. It is also *all* it is: `self.offload` is read by nothing on any
+    /// render path. Delete every `drop` and every device release from `generate_impl` and that test
+    /// stays green, while the manifest's measured `vramGbByTier` silently stops describing the
+    /// render — the true peak becomes the ~143 GB **sum** of the components instead of their max,
+    /// and the worker admits cards against a number 3.5x too small.
+    ///
+    /// So the guard walks the staged phases of the **five** staging functions in this file's own
     /// production source. Each phase must map its component, drop it, and release the device —
     /// **before** the next phase maps anything. Deleting any single `drop(...)`, or any single
-    /// `crate::dit::release_device_memory(...)`, makes this red on its own; each was mutated
+    /// `crate::dit::release_device_memory(...)`, makes it red on its own; each was mutated
     /// individually to prove it, not as a set.
+    ///
+    /// # The table is not trusted to be complete
+    ///
+    /// A hardcoded phase table is only as exhaustive as whoever last edited it, so
+    /// `every_heavy_map_is_inside_a_staged_phase` reads the same production source for **every**
+    /// heavy-component map anchor in [`MAP_ANCHORS`] and asserts each occurrence falls inside a
+    /// tabled function — or inside a helper that is itself a tabled map anchor. A sixth staging
+    /// function, or a heavy map hidden in a new helper like `load_audio_encoder`, reds there rather
+    /// than being silently uncovered.
     ///
     /// # What a source scan can and cannot see
     ///
@@ -888,29 +1970,8 @@ mod tests {
     /// without a checkpoint — and that is sc-18660's scope. Nothing in this crate can execute
     /// `generate_impl` without a ~143 GB snapshot, so this is the strongest guard available at this
     /// size: deliberately blunt, in exchange for being exact about the regression that was live.
-    #[test]
-    fn every_heavy_component_is_released_before_the_next_one_is_mapped() {
-        /// The explicit device release. Dropping the Rust binding alone is not enough — candle
-        /// hands the pages back to its own allocator, so without this the next phase maps on top.
-        const RELEASE: &str = "crate::dit::release_device_memory(";
-        /// The two bindings every text-encoder phase holds: the weight map and the tower built
-        /// from it. The tower is built *before* the map is dropped, necessarily, so a phase is a
-        /// group of maps and a group of releases rather than one pair.
-        const TE_MAPS: &[&str] = &[
-            "Weights::from_files_filtered",
-            "MiniMaxH3TextEncoder::from_weights",
-        ];
-
-        /// One staged phase: a name for the message, the source anchors that MAP its component,
-        /// and the source anchors that RELEASE it.
-        type Phase = (
-            &'static str,
-            &'static [&'static str],
-            &'static [&'static str],
-        );
-
-        // (function, its phases in source order).
-        let staged: [(&str, &[Phase]); 3] = [
+    fn staged_phases() -> [(&'static str, &'static [Phase]); 5] {
+        [
             (
                 "fn encode_prompt(",
                 &[(
@@ -943,8 +2004,12 @@ mod tests {
                         &["drop(vae);"],
                     ),
                     (
+                        // `load_task_dit` is the single seam that maps the partition AND folds any
+                        // staged LoRA (sc-18728), so the anchor tracks it rather than the inner
+                        // `MiniMaxH3Dit::load` — which is now one call deeper and outside this
+                        // function's body, where a scan of `generate_impl` cannot see it.
                         "the 66.3 GB DiT",
-                        &["MiniMaxH3Dit::load("],
+                        &["self.load_task_dit("],
                         &["drop(model);"],
                     ),
                     (
@@ -959,8 +2024,64 @@ mod tests {
                     ),
                 ],
             ),
-        ];
+            // The `ref2va` presentation (sc-17157). Same two components as `encode_prompt_grounded`
+            // — the tower, then the LM — but a separate function, so a release deleted here would
+            // not be caught by that entry.
+            (
+                "fn encode_prompt_ref2va(",
+                &[
+                    (
+                        "the Qwen3-VL vision tower",
+                        &["load_vision_tower("],
+                        &["drop(vision);"],
+                    ),
+                    (
+                        "the 66.7 GB Qwen3-VL-32B text encoder",
+                        TE_MAPS,
+                        &["drop(w);", "drop(te);", "drop(grounded);"],
+                    ),
+                ],
+            ),
+            // The `ref2va` render. **The DiT phase is the one that matters for sc-17157**: it maps
+            // ONE 66 GB partition, chosen by `MiniMaxH3Task::partition()`, and drops it before the
+            // decode VAEs. The two partitions are byte-identical in size, so a build that mapped
+            // both would double the sequential peak the manifest admits cards against.
+            (
+                "fn generate_ref2va(",
+                &[
+                    (
+                        "the 10.4 GB video VAE + the audio VAE encoder, reference encode",
+                        &["MiniMaxH3VideoVae::load(", "self.load_audio_encoder("],
+                        &["drop(vae);", "drop(audio_enc);"],
+                    ),
+                    (
+                        // Same seam as `generate_impl`'s DiT phase: `load_task_dit` maps the
+                        // partition AND folds any staged LoRA, so the inner `MiniMaxH3Dit::load`
+                        // is one call deeper and outside this function's body.
+                        "the 66.3 GB task DiT",
+                        &["self.load_task_dit("],
+                        &["drop(model);"],
+                    ),
+                    (
+                        "the 10.4 GB video VAE, decode",
+                        &["MiniMaxH3VideoVae::load_decode_only("],
+                        &["drop(vae);"],
+                    ),
+                    (
+                        "the audio VAE, decode",
+                        &["self.load_audio_vae(", "MiniMaxH3AudioVae::from_weights("],
+                        &["drop(w);", "drop(vae);"],
+                    ),
+                ],
+            ),
+        ]
+    }
 
+    /// **The staging itself is pinned — not merely the policy field.** See [`staged_phases`] and
+    /// the long note above it for what this scan can and cannot see.
+    #[test]
+    fn every_heavy_component_is_released_before_the_next_one_is_mapped() {
+        let staged = staged_phases();
         let src = production_source();
         for (signature, phases) in staged {
             let body = body_of(&src, signature);
@@ -1025,67 +2146,301 @@ mod tests {
         }
     }
 
-    /// A staged snapshot root with all four component dirs — enough for `load` to succeed.
+    /// **Every render arm evicts the AdaLN projections, so the contract's exclusion is honest.**
+    ///
+    /// `memory_strategy::adaln_component` declares 26.02 GB of DiT weights as
+    /// `PrecomputedThenEvicted` and states that `crate::model` passes
+    /// [`AdaLnResidency::PrecomputeAndEvict`] as a *literal*, so nothing a request carries can
+    /// re-resident them. That was a one-arm claim when sc-18665 wrote it. sc-17157 then added a
+    /// **second** `JointDit::new` call site — `generate_ref2va`, which denoises the reference
+    /// partition — and a doc comment cannot see it. An arm that passed
+    /// [`AdaLnResidency::Resident`] would leave the contract declaring a saving that render does
+    /// not deliver, which is the OOM direction and exactly the half-of-a-pair-moved shape sc-17150
+    /// and sc-19008 both shipped.
+    ///
+    /// So: scan the production source, and require every `JointDit::new(` construction to carry the
+    /// evicting literal. The count is derived, not maintained — a third arm is covered the moment
+    /// it is written.
+    #[test]
+    fn every_joint_dit_construction_evicts_the_adaln_projections() {
+        const CONSTRUCTION: &str = "JointDit::new(";
+        const EVICTING: &str = "AdaLnResidency::PrecomputeAndEvict";
+
+        let src = production_source();
+        let sites: Vec<usize> = src.match_indices(CONSTRUCTION).map(|(i, _)| i).collect();
+        assert!(
+            sites.len() >= 2,
+            "expected at least the base and ref2va render arms to construct a `{CONSTRUCTION}`, \
+             found {}. If the constructor was renamed this guard stopped watching anything",
+            sites.len()
+        );
+        for start in sites {
+            // The residency is the last argument, so the literal lives between the constructor and
+            // the closing paren of that call.
+            let tail = &src[start..];
+            let end = tail
+                .find(")?")
+                .expect("a JointDit::new call is closed and fallible");
+            assert!(
+                tail[..end].contains(EVICTING),
+                "a `{CONSTRUCTION}` at byte {start} does not pass `{EVICTING}`. \
+                 memory_strategy::adaln_component declares the eviction unconditionally, so an arm \
+                 that keeps the projections resident makes the published contract over-declare its \
+                 saving by up to 26.02 GB:\n{}",
+                &tail[..end]
+            );
+        }
+    }
+
+    /// **No heavy component is mapped outside a staged phase.**
+    ///
+    /// The table in [`staged_phases`] is hand-written, so on its own it pins only what someone
+    /// remembered to list. This closes that: every occurrence of every anchor in [`MAP_ANCHORS`]
+    /// must fall inside one of the tabled function bodies, or inside a [`DELEGATED_HELPERS`] body
+    /// whose caller lists it as a map anchor. A sixth staging function — or a heavy map dropped
+    /// into a new helper, which is exactly the shape `load_audio_encoder` has — reds here.
+    ///
+    /// Both halves of the pairing are asserted: every delegated helper must really be named as a
+    /// map anchor by some phase, so the exemption list cannot quietly grow into a hole.
+    #[test]
+    fn every_heavy_map_is_inside_a_staged_phase() {
+        let src = production_source();
+        let staged = staged_phases();
+
+        // The covered spans: the tabled function bodies, plus the delegated helpers'.
+        let mut covered: Vec<String> = staged
+            .iter()
+            .map(|(signature, _)| body_of(&src, signature))
+            .collect();
+        for helper in DELEGATED_HELPERS {
+            // `fn load_audio_vae(` -> `self.load_audio_vae(`, the anchor a phase must name.
+            let anchor = format!("self.{}", helper.trim_start_matches("fn "));
+            let named = staged
+                .iter()
+                .flat_map(|(_, phases)| phases.iter())
+                .any(|(_, maps, _)| maps.contains(&anchor.as_str()));
+            assert!(
+                named,
+                "`{helper}` is exempted as a delegated helper but no phase names `{anchor}` as a \
+                 map — the exemption would then be an uncovered hole"
+            );
+            covered.push(body_of(&src, helper));
+        }
+
+        for anchor in MAP_ANCHORS {
+            let total = src.matches(anchor).count();
+            let inside: usize = covered
+                .iter()
+                .map(|body| body.matches(anchor).count())
+                .sum();
+            assert!(
+                total > 0,
+                "`{anchor}` no longer appears in model.rs; if the component moved, this scan is \
+                 watching nothing"
+            );
+            assert_eq!(
+                inside,
+                total,
+                "{} of {total} `{anchor}` occurrence(s) in model.rs sit OUTSIDE every staged \
+                 phase. A heavy component mapped outside the staging is invisible to the phase \
+                 table and turns the measured sequential peak into a sum",
+                total - inside
+            );
+        }
+    }
+
+    /// **The audio VAE's encode half is pinned to f32 and does NOT follow the provider's dtype.**
+    ///
+    /// diffusers' `_keep_in_fp32_modules` is the contract, and the whole of it lives at one call
+    /// site. The plausible regression is a tidy-up to `self.dtype` — which is `BF16` — producing a
+    /// reference soundtrack encoded at the wrong precision with no diagnostic and no shape change.
+    /// Asserting `posterior.dtype() == F32` in the parity suite cannot see this: that follows from
+    /// the dtype the *test* passed in.
+    #[test]
+    fn the_audio_encoder_is_pinned_to_f32_not_the_provider_dtype() {
+        use crate::audio_vae_encoder::ENCODER_DTYPE;
+        assert_eq!(ENCODER_DTYPE, DType::F32);
+        // ...and the provider's own dtype is genuinely a different one, or the pin is vacuous.
+        let tmp = tempfile::tempdir().unwrap();
+        let model = MiniMaxH3::load(&LoadSpec::new(WeightsSource::Dir(staged_root(&tmp)))).unwrap();
+        assert_eq!(model.dtype, DType::BF16);
+        assert_ne!(model.dtype, ENCODER_DTYPE);
+
+        // Three: the `use`, the weight map, and the encoder itself. Both consumers must read it —
+        // a map at bf16 feeding an f32 encoder is the same defect one layer up.
+        let body = body_of(&production_source(), "fn load_audio_encoder(");
+        assert_eq!(
+            body.matches("ENCODER_DTYPE").count(),
+            3,
+            "both the weight map and the encoder must be built at ENCODER_DTYPE: {body}"
+        );
+        assert!(
+            !body.contains("self.dtype"),
+            "load_audio_encoder must not read the provider's bf16 store dtype: {body}"
+        );
+    }
+
+    /// A staged snapshot root with every unconditionally-required component dir — enough for
+    /// `load` to succeed.
+    ///
+    /// Each directory carries a **shard**, because a component dir is only satisfied by one: an
+    /// empty directory was accepted until sc-17157's review, which is the same mid-render failure
+    /// the load-time check exists to eliminate.
     fn staged_root(tmp: &tempfile::TempDir) -> PathBuf {
         let root = tmp.path().to_path_buf();
         for c in REQUIRED_COMPONENT_DIRS {
-            std::fs::create_dir_all(root.join(c)).unwrap();
+            stage_component(&root, c);
         }
         root
     }
 
-    /// **A staged LoRA is REFUSED, not dropped.**
-    ///
-    /// `supports_lora: false` is a declaration gen-core reads on no path — neither
-    /// `validate_request` nor the registry builder inspects it — so before this guard a spec
-    /// carrying `adapters` loaded clean and rendered with the adapter silently discarded, which is
-    /// exactly what the module docs promised could not happen.
-    ///
-    /// The control is the point: the SAME root with no adapters must still load, so this proves the
-    /// adapter is what refuses rather than the fixture being broken.
-    #[test]
-    fn a_staged_lora_is_refused_rather_than_silently_dropped() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = staged_root(&tmp);
-
-        // Control: without adapters the very same spec loads.
-        load(&LoadSpec::new(WeightsSource::Dir(root.clone())))
-            .expect("the bare spec must load — otherwise the refusal below proves nothing");
-
-        let spec = LoadSpec::new(WeightsSource::Dir(root)).with_adapters(vec![
-            candle_gen::gen_core::AdapterSpec {
-                path: PathBuf::from("/turbo.safetensors"),
-                scale: 1.0,
-                kind: candle_gen::gen_core::AdapterKind::Lora,
-                pass_scales: None,
-                moe_expert: None,
-            },
-        ]);
-        // `Box<dyn Generator>` is not `Debug`, so `expect_err` is unavailable.
-        let err = match load(&spec) {
-            Ok(_) => panic!("a staged LoRA must be refused, not silently dropped"),
-            Err(e) => e,
-        };
-        assert!(
-            matches!(err, candle_gen::gen_core::Error::Unsupported(_)),
-            "must be the contract-load-bearing Unsupported, not an opaque Msg: {err:?}"
-        );
-        let msg = err.to_string();
-        assert!(msg.contains("LoRA/LoKr"), "{msg}");
+    /// One component directory with a single (empty) `.safetensors` shard in it.
+    fn stage_component(root: &Path, component: &str) {
+        let dir = root.join(component);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("model-00001-of-00001.safetensors"), []).unwrap();
     }
 
-    /// **A `ref2va` request is REFUSED on the RENDER PATH, not merely absent from the descriptor.**
+    /// A staged root that also carries the `ref2va` reference partition.
+    fn staged_root_with_reference(tmp: &tempfile::TempDir) -> PathBuf {
+        let root = staged_root(tmp);
+        stage_component(&root, REFERENCE_DIT_PARTITION);
+        root
+    }
+
+    /// A `LoadSpec` adapter spec at `kind`, with the two model-specific knobs optional.
+    fn adapter_spec(
+        kind: candle_gen::gen_core::AdapterKind,
+        pass_scales: Option<Vec<f32>>,
+        moe_expert: Option<candle_gen::gen_core::MoeExpert>,
+    ) -> AdapterSpec {
+        AdapterSpec {
+            path: PathBuf::from("/turbo.safetensors"),
+            scale: 1.0,
+            kind,
+            pass_scales,
+            moe_expert,
+        }
+    }
+
+    /// **A staged LoRA is CARRIED to the render, not dropped and not refused** (sc-18728).
     ///
-    /// `the_descriptor_advertises_only_the_ported_surface` asserts the three reference kinds are
-    /// missing from the allowlist — but a missing entry is a DECLARATION, and this crate has already
-    /// been bitten once by assuming a declaration gates anything (`supports_lora` gates nothing at
-    /// all, which is why [`load`] carries an explicit check). This exercises the actual seam:
-    /// `Generator::validate`, which `generate_impl` calls on every render, must turn a reference
-    /// request into a typed `Unsupported` that NAMES the kind.
+    /// The predecessor of this test asserted the opposite — that `spec.adapters` was refused —
+    /// because the seam did not exist. Now that it does, the property worth guarding flips: `load`
+    /// must accept the spec **and** the loaded provider must still be holding it, because "accepted
+    /// then discarded" is exactly the silent failure the old refusal existed to prevent, and it is
+    /// indistinguishable from success at the `load` boundary alone.
     #[test]
-    fn a_ref2va_request_is_refused_on_the_render_path() {
+    fn a_staged_lora_survives_load_rather_than_being_dropped() {
         let tmp = tempfile::tempdir().unwrap();
         let root = staged_root(&tmp);
+
+        // Control: without adapters the same root loads and holds none.
+        let bare = MiniMaxH3::load(&LoadSpec::new(WeightsSource::Dir(root.clone()))).unwrap();
+        assert!(bare.adapters().is_empty());
+
+        let spec = LoadSpec::new(WeightsSource::Dir(root)).with_adapters(vec![adapter_spec(
+            candle_gen::gen_core::AdapterKind::Lora,
+            None,
+            None,
+        )]);
+        load(&spec).expect("a LoRA spec must load now that the seam is ported");
+
+        let model = MiniMaxH3::load(&spec).unwrap();
+        assert_eq!(
+            model.adapters().len(),
+            1,
+            "the spec's adapters must be RETAINED — a provider that accepted and forgot them would \
+             render at the base checkpoint with no error at all"
+        );
+        assert_eq!(model.adapters()[0].scale, 1.0);
+    }
+
+    /// **The three adapter-shaped knobs this lane still cannot honor are refused by name.**
+    ///
+    /// Each is a field a caller can set on an otherwise-valid LoRA spec, and each is read by nothing
+    /// in this crate. They are asserted **individually**, not as a set: a single "some knob is
+    /// refused" arm would stay green if two of the three checks were deleted.
+    ///
+    /// The control at the top is what makes the arms attributable — the same path, the same scale,
+    /// everything identical except the knob under test, loads cleanly.
+    #[test]
+    fn lokr_and_the_two_foreign_adapter_knobs_are_each_refused_individually() {
+        use candle_gen::gen_core::{AdapterKind, MoeExpert};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = staged_root(&tmp);
+        let with =
+            |a: AdapterSpec| LoadSpec::new(WeightsSource::Dir(root.clone())).with_adapters(vec![a]);
+
+        // Control: a plain LoRA with neither knob set loads.
+        load(&with(adapter_spec(AdapterKind::Lora, None, None)))
+            .expect("the plain LoRA control must load — otherwise the arms prove nothing");
+
+        for (spec, needle) in [
+            (adapter_spec(AdapterKind::Lokr, None, None), "LoKr"),
+            (
+                adapter_spec(AdapterKind::Lora, Some(vec![1.0, 0.5]), None),
+                "pass_scales",
+            ),
+            (
+                adapter_spec(AdapterKind::Lora, None, Some(MoeExpert::High)),
+                "MoE expert",
+            ),
+        ] {
+            // `Box<dyn Generator>` is not `Debug`, so `expect_err` is unavailable.
+            let err = match load(&with(spec)) {
+                Ok(_) => panic!("{needle} must be refused, not silently dropped"),
+                Err(e) => e,
+            };
+            assert!(
+                matches!(err, candle_gen::gen_core::Error::Unsupported(_)),
+                "must be the contract-load-bearing Unsupported, not an opaque Msg: {err:?}"
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains(needle),
+                "the refusal must name the knob it refused; wanted {needle:?}, got {msg}"
+            );
+        }
+    }
+
+    /// A solid RGB image of the given extent, for the reference-request fixtures.
+    fn ref_image(w: u32, h: u32) -> Image {
+        Image {
+            width: w,
+            height: h,
+            pixels: vec![0u8; (w * h * 3) as usize],
+        }
+    }
+
+    fn ref_track() -> candle_gen::gen_core::AudioTrack {
+        candle_gen::gen_core::AudioTrack {
+            samples: vec![0.0; 64],
+            sample_rate: 32_000,
+            channels: 1,
+            stems: Vec::new(),
+        }
+    }
+
+    fn ref_conditioning() -> candle_gen::gen_core::Conditioning {
+        candle_gen::gen_core::Conditioning::Reference {
+            image: ref_image(64, 64),
+            strength: Some(1.0),
+        }
+    }
+
+    /// **All three reference modalities BIND, individually and combined** — the descriptor
+    /// advertises them and `Generator::validate` admits them (sc-17157).
+    ///
+    /// The control is the point: before this story every one of these was a typed `Unsupported`,
+    /// so a build that reverted the descriptor entry fails here rather than silently dropping
+    /// Ref2VA back to a refusal.
+    #[test]
+    fn every_reference_modality_binds_individually_and_combined() {
+        use candle_gen::gen_core::Conditioning;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = staged_root_with_reference(&tmp);
         let generator = load(&LoadSpec::new(WeightsSource::Dir(root))).unwrap();
 
         let base = GenerationRequest {
@@ -1094,49 +2449,243 @@ mod tests {
             height: 768,
             ..Default::default()
         };
-        // Control: the same request without reference conditioning passes validation, so the
-        // refusal below is attributable to the conditioning and not to some other floor check.
-        generator
-            .validate(&base)
-            .expect("the bare request must validate — otherwise the refusal proves nothing");
+        generator.validate(&base).expect("the bare request");
 
-        for kind in [
-            candle_gen::gen_core::Conditioning::Reference {
-                image: Image {
-                    width: 1,
-                    height: 1,
-                    pixels: vec![0, 0, 0],
-                },
-                strength: Some(1.0),
-            },
-            candle_gen::gen_core::Conditioning::ReferenceVideo {
-                frames: vec![Image {
-                    width: 1,
-                    height: 1,
-                    pixels: vec![0, 0, 0],
-                }],
-                fps: 24.0,
-                audio: None,
-            },
+        let image = ref_conditioning();
+        let video = Conditioning::ReferenceVideo {
+            // 24, not 4: at 24 fps source == kept, and `MIN_REFERENCE_CLIP_FRAMES` is 22.
+            // A 4-frame clip is REFUSED by `validate` now, which is the point of the floor.
+            frames: vec![ref_image(64, 64); 24],
+            fps: 24.0,
+            audio: None,
+        };
+        let audio = Conditioning::ReferenceAudio {
+            audio: ref_track(),
+            strength: None,
+        };
+
+        // Individually. Audio is never alone (`crate::reference`), so it is paired with an image —
+        // and that pairing rule is asserted on its own below.
+        for (name, conditioning) in [
+            ("image", vec![image.clone()]),
+            ("video", vec![video.clone()]),
+            ("audio", vec![image.clone(), audio.clone()]),
         ] {
-            let named = format!("{:?}", kind.kind());
             let req = GenerationRequest {
-                conditioning: vec![kind],
+                conditioning,
                 ..base.clone()
             };
-            let err = generator
+            generator
                 .validate(&req)
-                .expect_err("a ref2va request must be refused");
-            assert!(
-                matches!(err, candle_gen::gen_core::Error::Unsupported(_)),
-                "{named}: must be a typed Unsupported, got {err:?}"
-            );
-            let msg = err.to_string();
-            assert!(
-                msg.contains(&named),
-                "the refusal must NAME the kind so a caller knows what to drop: {msg}"
-            );
+                .unwrap_or_else(|e| panic!("a {name} reference must bind: {e}"));
         }
+
+        // Combined, at the per-modality caps: 9 images + 2 clips + 1 audio = 12, the combined cap.
+        let mut combined = vec![image.clone(); 9];
+        combined.extend(vec![video.clone(); 2]);
+        combined.push(audio.clone());
+        assert_eq!(combined.len(), 12);
+        generator
+            .validate(&GenerationRequest {
+                conditioning: combined,
+                ..base.clone()
+            })
+            .expect("all three modalities combined, exactly at the 12-reference cap");
+
+        // An audio-only request is refused — a waveform never reaches the conditioner.
+        let e = generator
+            .validate(&GenerationRequest {
+                conditioning: vec![audio],
+                ..base.clone()
+            })
+            .expect_err("audio alone leaves the visual stream unconditioned");
+        assert!(e.to_string().contains("cannot be used on its own"), "{e}");
+
+        // Keyframes and references together are two different checkpoints, so the request is
+        // refused rather than silently resolved to one of them.
+        let keyframe = Conditioning::Keyframe {
+            image: ref_image(64, 64),
+            frame_idx: 0,
+            strength: 1.0,
+        };
+        let e = generator
+            .validate(&GenerationRequest {
+                conditioning: vec![keyframe, image],
+                ..base
+            })
+            .expect_err("fl2va and ref2va are different checkpoints");
+        assert!(
+            e.to_string().contains("both keyframes and references"),
+            "{e}"
+        );
+    }
+
+    /// **Over-cap is rejected at the ENGINE boundary**, with a message naming the cap it tripped.
+    ///
+    /// Each pass sends exactly one reference over one cap against a control at that same cap, so a
+    /// refusal cannot be credited to a different gate — and the `12 = 9 + 2 + 1` control above
+    /// shows the combined cap is not simply refusing everything.
+    #[test]
+    fn an_over_cap_reference_request_is_rejected_at_the_engine_boundary() {
+        use candle_gen::gen_core::Conditioning;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = staged_root_with_reference(&tmp);
+        let generator = load(&LoadSpec::new(WeightsSource::Dir(root))).unwrap();
+        let base = GenerationRequest {
+            prompt: "a cellist on a rooftop".into(),
+            width: 1344,
+            height: 768,
+            ..Default::default()
+        };
+
+        let image = || ref_conditioning();
+        let video = || Conditioning::ReferenceVideo {
+            // 24, not 4: at 24 fps source == kept, and `MIN_REFERENCE_CLIP_FRAMES` is 22.
+            // A 4-frame clip is REFUSED by `validate` now, which is the point of the floor.
+            frames: vec![ref_image(64, 64); 24],
+            fps: 24.0,
+            audio: None,
+        };
+        let audio = || Conditioning::ReferenceAudio {
+            audio: ref_track(),
+            strength: None,
+        };
+
+        // (name, at-cap request, over-cap request, the substring the refusal must carry)
+        let mut over_total = vec![image(); 9];
+        over_total.extend(vec![video(); 3]);
+        over_total.extend(vec![audio(); 3]);
+        let mut at_total = vec![image(); 9];
+        at_total.extend(vec![video(); 2]);
+        at_total.push(audio());
+
+        let mut audio_at = vec![image()];
+        audio_at.extend(vec![audio(); 3]);
+        let mut audio_over = vec![image()];
+        audio_over.extend(vec![audio(); 4]);
+
+        for (name, at_cap, over_cap, expect) in [
+            (
+                "images",
+                vec![image(); 9],
+                vec![image(); 10],
+                "at most 9 image",
+            ),
+            (
+                "clips",
+                vec![video(); 3],
+                vec![video(); 4],
+                "at most 3 video",
+            ),
+            ("audio", audio_at, audio_over, "at most 3 audio"),
+            (
+                "combined",
+                at_total,
+                over_total,
+                "at most 12 references in total",
+            ),
+        ] {
+            generator
+                .validate(&GenerationRequest {
+                    conditioning: at_cap,
+                    ..base.clone()
+                })
+                .unwrap_or_else(|e| {
+                    panic!("{name}: the AT-cap request must be admitted, else the gate is off by one: {e}")
+                });
+            let e = match generator.validate(&GenerationRequest {
+                conditioning: over_cap,
+                ..base.clone()
+            }) {
+                Ok(()) => panic!("{name}: the over-cap request must be refused"),
+                Err(e) => e.to_string(),
+            };
+            assert!(e.contains(expect), "{name}: {e}");
+        }
+    }
+
+    /// **The task selects the checkpoint, and only `ref2va` moves.**
+    ///
+    /// The two partitions are structurally indistinguishable — same config, same 638 tensor names —
+    /// so this mapping is the *only* thing standing between a `ref2va` request and a plausible
+    /// render off the wrong 66 GB.
+    #[test]
+    fn the_task_picks_the_partition_and_only_ref2va_moves() {
+        assert_eq!(MiniMaxH3Task::T2va.partition(), BASE_DIT_PARTITION);
+        assert_eq!(MiniMaxH3Task::Fl2va.partition(), BASE_DIT_PARTITION);
+        assert_eq!(MiniMaxH3Task::Ref2va.partition(), REFERENCE_DIT_PARTITION);
+        assert_ne!(BASE_DIT_PARTITION, REFERENCE_DIT_PARTITION);
+
+        assert_eq!(
+            MiniMaxH3Task::resolve(false, false).unwrap(),
+            MiniMaxH3Task::T2va
+        );
+        assert_eq!(
+            MiniMaxH3Task::resolve(true, false).unwrap(),
+            MiniMaxH3Task::Fl2va
+        );
+        assert_eq!(
+            MiniMaxH3Task::resolve(false, true).unwrap(),
+            MiniMaxH3Task::Ref2va
+        );
+        let e = MiniMaxH3Task::resolve(true, true).unwrap_err().to_string();
+        assert!(e.contains("both keyframes and references"), "{e}");
+
+        // Only the reference task runs the tower over references; `t2va` has no visual source.
+        assert!(!MiniMaxH3Task::T2va.needs_vision_tower());
+        assert!(MiniMaxH3Task::Fl2va.needs_vision_tower());
+        assert!(MiniMaxH3Task::Ref2va.needs_vision_tower());
+    }
+
+    /// `request_references` preserves the request's **order** across modalities, because that order
+    /// fixes the presentation labels and advances the shared rotary clock.
+    ///
+    /// The assertion is on the interleaved sequence, not on counts: a grouping implementation (the
+    /// obvious one) produces the same counts and a different request.
+    #[test]
+    fn the_reference_list_keeps_the_requests_order_across_modalities() {
+        use candle_gen::gen_core::Conditioning;
+
+        let req = GenerationRequest {
+            prompt: "p".into(),
+            conditioning: vec![
+                Conditioning::ReferenceVideo {
+                    // 30 at 30 fps normalizes to 24 frames, clearing the 22-frame floor.
+                    frames: vec![ref_image(64, 64); 30],
+                    fps: 30.0,
+                    audio: None,
+                },
+                ref_conditioning(),
+                Conditioning::ReferenceAudio {
+                    audio: ref_track(),
+                    strength: None,
+                },
+                ref_conditioning(),
+            ],
+            ..Default::default()
+        };
+        let refs = request_references(&req).unwrap().expect("references");
+        let kinds: Vec<crate::reference::ReferenceKind> =
+            refs.as_slice().iter().map(|r| r.kind()).collect();
+        use crate::reference::ReferenceKind::{Audio, Image as I, Video};
+        assert_eq!(kinds, vec![Video, I, Audio, I]);
+
+        // The clip's OWN rate survives the mapping — `VideoClip` could not carry it, and a rate
+        // silently defaulted to 24 plays a 30 fps reference 25% fast with nothing to raise.
+        match &refs.as_slice()[0] {
+            crate::reference::Ref2VaReference::Video(v) => assert_eq!(v.fps, 30.0),
+            other => panic!("expected a clip, got {other:?}"),
+        }
+
+        // A request with no reference of any modality is `None`, which is the t2va/fl2va
+        // discriminator.
+        assert!(request_references(&GenerationRequest {
+            prompt: "p".into(),
+            ..Default::default()
+        })
+        .unwrap()
+        .is_none());
     }
 
     /// **A tier request is REFUSED, not silently rendered dense.**
@@ -1272,22 +2821,272 @@ mod tests {
         );
     }
 
-    /// A snapshot missing any one of the four component directories fails at `load`, naming the
-    /// component — not twenty minutes later inside a phase.
+    /// A snapshot missing any one of the unconditionally-required component directories fails at
+    /// `load`, naming the **path** — not twenty minutes later inside a phase.
+    ///
+    /// The assertion is on `root.join(missing)`, not on the bare component name: the refusal
+    /// message used to interpolate `{REQUIRED_COMPONENT_DIRS:?}`, which names every component, so
+    /// `e.contains(missing)` could not fail whatever the loader did.
+    ///
+    /// An **empty** component directory is refused too, and by the same check. `is_dir()` alone was
+    /// the gate, so a shard-less `transformer_ref/` — the shape an interrupted download leaves —
+    /// loaded clean and failed mid-render, which is precisely what this check exists to prevent.
     #[test]
-    fn a_missing_component_fails_the_load_and_names_itself() {
+    fn a_missing_or_empty_component_fails_the_load_and_names_its_path() {
         for missing in REQUIRED_COMPONENT_DIRS {
             let tmp = tempfile::tempdir().unwrap();
-            let root = tmp.path();
+            let root = tmp.path().to_path_buf();
             for c in REQUIRED_COMPONENT_DIRS.iter().filter(|c| **c != missing) {
-                std::fs::create_dir_all(root.join(c)).unwrap();
+                stage_component(&root, c);
             }
-            let spec = LoadSpec::new(WeightsSource::Dir(root.to_path_buf()));
+            let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+            let path = root.join(missing).display().to_string();
+
             let e = match MiniMaxH3::load(&spec) {
                 Ok(_) => panic!("a snapshot without `{missing}/` must not load"),
                 Err(e) => e.to_string(),
             };
-            assert!(e.contains(missing), "{missing}: {e}");
+            assert!(e.contains(&path), "{missing} absent: {e}");
+
+            // Present but EMPTY: still refused, and the message says why.
+            std::fs::create_dir_all(root.join(missing)).unwrap();
+            let e = match MiniMaxH3::load(&spec) {
+                Ok(_) => panic!("an empty `{missing}/` must not load — it fails mid-render"),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                e.contains(&path) && e.contains("no `.safetensors` shard"),
+                "{e}"
+            );
+
+            // Control: the same root with a shard in it loads, so the refusals are attributable.
+            stage_component(&root, missing);
+            MiniMaxH3::load(&spec).expect("the control must load, else the refusals prove nothing");
+        }
+    }
+
+    /// **`transformer_ref` is required of the `ref2va` REQUEST, not of the snapshot** (sc-17157).
+    ///
+    /// The blast radius is the point. `SceneWorks/minimax-h3-mlx` publishes no `q4/transformer_ref`
+    /// (sc-19517), so a pure-`q4` install carries only the base partition today. Requiring the
+    /// reference partition in `load` would fail provider construction outright and take `t2va` and
+    /// `fl2va` offline with it — a whole model offline for a capability neither of them uses. So
+    /// this asserts both halves: such a snapshot **loads and serves the other two tasks**, and a
+    /// reference request against it is refused at the engine boundary, before a weight is read,
+    /// naming the missing directory.
+    #[test]
+    fn a_ref2va_request_needs_the_reference_partition_but_the_other_tasks_do_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = staged_root(&tmp);
+        assert!(!root.join(REFERENCE_DIT_PARTITION).exists());
+
+        let generator = load(&LoadSpec::new(WeightsSource::Dir(root.clone())))
+            .expect("a base-only snapshot must still construct the provider");
+
+        let base = GenerationRequest {
+            prompt: "a cellist on a rooftop".into(),
+            width: 1344,
+            height: 768,
+            ..Default::default()
+        };
+        generator.validate(&base).expect("t2va must still work");
+        generator
+            .validate(&GenerationRequest {
+                conditioning: vec![candle_gen::gen_core::Conditioning::Keyframe {
+                    image: ref_image(64, 64),
+                    frame_idx: 0,
+                    strength: 1.0,
+                }],
+                ..base.clone()
+            })
+            .expect("fl2va must still work");
+
+        // ...and the reference request is refused, naming the path it needs.
+        let e = match generator.validate(&GenerationRequest {
+            conditioning: vec![ref_conditioning()],
+            ..base.clone()
+        }) {
+            Ok(()) => panic!("a ref2va request must not be admitted without transformer_ref/"),
+            Err(e) => e.to_string(),
+        };
+        let path = root.join(REFERENCE_DIT_PARTITION).display().to_string();
+        assert!(e.contains(&path), "the refusal must name the path: {e}");
+        assert!(e.contains("sc-19517"), "{e}");
+
+        // Control: stage the partition and the very same request is admitted.
+        stage_component(&root, REFERENCE_DIT_PARTITION);
+        load(&LoadSpec::new(WeightsSource::Dir(root)))
+            .unwrap()
+            .validate(&GenerationRequest {
+                conditioning: vec![ref_conditioning()],
+                ..base
+            })
+            .expect("with transformer_ref/ present the request is admitted");
+    }
+
+    /// **A `ref2va` REQUEST resolves to the reference partition** — the request→loader half of the
+    /// checkpoint decision, weights-free.
+    ///
+    /// `tests/ref2va_checkpoint.rs` proves the DiT loader honours the partition it is handed and
+    /// that both load sites take theirs from `task.partition()` and from nowhere else. This is the
+    /// other end of that chain: a real [`GenerationRequest`] carrying each reference kind, driven
+    /// through the **same** `resolve_task` that `generate_impl` consumes. Neither half alone is the
+    /// claim; together they are.
+    #[test]
+    fn a_reference_request_resolves_to_the_reference_partition() {
+        use candle_gen::gen_core::Conditioning;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = staged_root_with_reference(&tmp);
+        let model = MiniMaxH3::load(&LoadSpec::new(WeightsSource::Dir(root))).unwrap();
+        let base = GenerationRequest {
+            prompt: "a cellist on a rooftop".into(),
+            width: 1344,
+            height: 768,
+            ..Default::default()
+        };
+
+        for (name, conditioning) in [
+            ("image", vec![ref_conditioning()]),
+            (
+                "video",
+                vec![Conditioning::ReferenceVideo {
+                    // 24 frames at 24 fps — see the floor note above.
+                    frames: vec![ref_image(64, 64); 24],
+                    fps: 24.0,
+                    audio: None,
+                }],
+            ),
+            (
+                "audio",
+                vec![
+                    ref_conditioning(),
+                    Conditioning::ReferenceAudio {
+                        audio: ref_track(),
+                        strength: None,
+                    },
+                ],
+            ),
+        ] {
+            let (task, references) = model
+                .resolve_task(&GenerationRequest {
+                    conditioning,
+                    ..base.clone()
+                })
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(task, MiniMaxH3Task::Ref2va, "{name}");
+            assert!(references.is_some(), "{name}");
+            assert_eq!(
+                task.partition(),
+                REFERENCE_DIT_PARTITION,
+                "{name}: a reference request must denoise from the reference partition"
+            );
+        }
+
+        // The negative halves: without references the very same call stays on the base partition.
+        let (task, references) = model.resolve_task(&base).unwrap();
+        assert_eq!(task, MiniMaxH3Task::T2va);
+        assert!(references.is_none());
+        assert_eq!(task.partition(), BASE_DIT_PARTITION);
+
+        let (task, _) = model
+            .resolve_task(&GenerationRequest {
+                conditioning: vec![Conditioning::Keyframe {
+                    image: ref_image(64, 64),
+                    frame_idx: 0,
+                    strength: 1.0,
+                }],
+                ..base
+            })
+            .unwrap();
+        assert_eq!(task, MiniMaxH3Task::Fl2va);
+        assert_eq!(task.partition(), BASE_DIT_PARTITION);
+    }
+
+    /// **`validate` refuses exactly the clips `generate` would refuse** (sc-17157).
+    ///
+    /// `MIN_REFERENCE_CLIP_FRAMES` used to be enforced only inside `normalize_reference_clip`,
+    /// which runs deep inside `generate_ref2va`. `validate` therefore ADMITTED a short clip that
+    /// `generate` then rejected, after the video VAE and the audio encoder had been mapped — the
+    /// late-failure shape this whole story removes. Four tests in this module had frozen the defect
+    /// in place by building 4-frame clips and asserting they validate; they now build clips that
+    /// clear the floor, and this is the negative half they were missing.
+    ///
+    /// The last loop drives BOTH sides on the same inputs, so "the boundary and the render agree"
+    /// is executed rather than asserted.
+    #[test]
+    fn validate_refuses_a_clip_shorter_than_the_vae_chunk_floor() {
+        use candle_gen::gen_core::Conditioning;
+
+        use crate::reference::MIN_REFERENCE_CLIP_FRAMES;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = staged_root_with_reference(&tmp);
+        let model = MiniMaxH3::load(&LoadSpec::new(WeightsSource::Dir(root.clone()))).unwrap();
+        let generator = load(&LoadSpec::new(WeightsSource::Dir(root))).unwrap();
+        let base = GenerationRequest {
+            prompt: "a cellist on a rooftop".into(),
+            width: 1344,
+            height: 768,
+            ..Default::default()
+        };
+        let clip = |frames: usize, fps: f32| GenerationRequest {
+            conditioning: vec![Conditioning::ReferenceVideo {
+                frames: vec![ref_image(64, 64); frames],
+                fps,
+                audio: None,
+            }],
+            ..base.clone()
+        };
+
+        // The default geometry is well above the floor, so it is the FLOOR that bites below and not
+        // the `num_frames` truncation.
+        let num_frames = model.request_geometry(&base).unwrap().joint.num_frames;
+        assert!(num_frames > MIN_REFERENCE_CLIP_FRAMES, "{num_frames}");
+
+        // Clips that normalize BELOW 22, including the 13..=21 window the floor exists for —
+        // `sample_video_condition_frames`' own minimum is 13, so that window was reachable.
+        for (frames, fps) in [(4usize, 24.0f32), (21, 24.0), (4, 30.0), (26, 30.0)] {
+            let e = match generator.validate(&clip(frames, fps)) {
+                Ok(()) => panic!(
+                    "{frames} frames at {fps} fps normalizes below the floor and must be refused \
+                     by validate, not by generate"
+                ),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                e.contains(&format!("{MIN_REFERENCE_CLIP_FRAMES}-frame floor"))
+                    && e.contains("17n + 5"),
+                "{frames}@{fps}: the refusal must name the floor it hit: {e}"
+            );
+        }
+
+        // Controls: AT the floor is admitted, so this is a floor and not a ban on clips.
+        for (frames, fps) in [(22usize, 24.0f32), (24, 24.0), (28, 30.0)] {
+            generator.validate(&clip(frames, fps)).unwrap_or_else(|e| {
+                panic!("{frames}@{fps} clears the floor and must validate: {e}")
+            });
+        }
+
+        // **The two sides agree on the same input.** What `validate` admits the render path admits,
+        // and what it refuses the render path refuses. That gap IS the defect, so it is the thing
+        // asserted rather than each side's behavior separately.
+        for (frames, fps) in [(4usize, 24.0f32), (21, 24.0), (22, 24.0), (30, 30.0)] {
+            let by_validate = generator.validate(&clip(frames, fps)).is_ok();
+            let by_render = crate::reference::normalize_reference_clip(
+                &vec![ref_image(64, 64); frames],
+                f64::from(fps),
+                num_frames,
+                SPATIAL_STRIDE as i32,
+                CANVAS_SHORT_EDGE as i32,
+                i64::from(crate::pipeline::CANVAS_MAX_PIXELS),
+                MINIMAX_H3_FPS,
+            )
+            .is_ok();
+            assert_eq!(
+                by_validate, by_render,
+                "{frames}@{fps}: validate and the render path disagree — that gap IS the defect"
+            );
         }
     }
 
@@ -1303,25 +3102,28 @@ mod tests {
         assert!(!d.capabilities.supports_negative_prompt);
         assert!(!d.capabilities.supports_guidance);
         assert!(!d.capabilities.supports_true_cfg);
-        // fl2va only; ref2va (sc-17157) is default-denied rather than silently ignored.
+        // `fl2va` plus all three `ref2va` kinds (sc-17157) — and NOT `VideoClip`, which this model
+        // has no in-context-clip mechanism for and which default-deny turns into a typed
+        // `Unsupported`.
         assert_eq!(
             d.capabilities.conditioning,
-            vec![ConditioningKind::Keyframe]
+            vec![
+                ConditioningKind::Keyframe,
+                ConditioningKind::Reference,
+                ConditioningKind::ReferenceVideo,
+                ConditioningKind::ReferenceAudio,
+            ]
         );
         assert!(!d
             .capabilities
             .conditioning
-            .contains(&ConditioningKind::Reference));
-        assert!(!d
-            .capabilities
-            .conditioning
-            .contains(&ConditioningKind::ReferenceVideo));
-        assert!(!d
-            .capabilities
-            .conditioning
-            .contains(&ConditioningKind::ReferenceAudio));
-        // The turbo LoRA seam is not ported here.
-        assert!(!d.capabilities.supports_lora);
+            .contains(&ConditioningKind::VideoClip));
+        // **The turbo LoRA seam IS ported** (sc-18728) — and this bit is only an advertisement:
+        // gen-core reads `supports_lora` on no path, so what a consumer can rely on is
+        // `crate::adapters`, exercised end-to-end in `tests/turbo_lora.rs`.
+        assert!(d.capabilities.supports_lora);
+        // LoKr stays false and is enforced twice in real code (by kind in `load`, by file content
+        // in the installer) precisely because this flag refuses nothing on its own.
         assert!(!d.capabilities.supports_lokr);
         assert!(d.capabilities.supported_quants.is_empty());
         // The residency lifecycle IS wired — and forced — so the discovery signal says so. This is

@@ -16,7 +16,7 @@ use mlx_rs::{random, Dtype};
 
 use mlx_gen::{
     default_seed, Capabilities, Error, GenerationOutput, GenerationRequest, Generator, Image,
-    LoadSpec, Modality, ModelDescriptor, Precision, Progress, Result, SizeFloor, WeightsSource,
+    LoadSpec, Modality, ModelDescriptor, Precision, Progress, Result, WeightsSource,
 };
 use mlx_gen_flux::T5TextEncoder;
 
@@ -69,43 +69,18 @@ pub fn descriptor() -> ModelDescriptor {
             supports_true_cfg: true,
             // Text-to-video only in the base preview (I2V = sc-11998, a follow-on).
             conditioning: Vec::new(),
-            supports_lora: false,
-            supports_lokr: false,
             // A single fixed flow-match Euler integrator; a selectable sampler/scheduler axis is not
             // wired for Mochi, so advertising one would be a false capability.
             samplers: Vec::new(),
-            schedulers: Vec::new(),
-            supported_guidance_methods: Vec::new(),
             // Width/height must be divisible by SIZE_MULTIPLE (VAE 8× spatial × DiT patch 2). 480p target = 848×480.
             min_size: 16,
             max_size: 1280,
             max_count: 1,
-            // Not a distilled fixed-schedule model: any step count the shared sanity caps
-            // admit is renderable (sc-19502).
-            supported_steps: Vec::new(),
             mac_only: true,
             // Quant tiers are pre-quantized per-tier checkpoints (epic 1788 / A6 sc-11990), selected by
             // pointing `WeightsSource` at the tier dir — NOT on-the-fly requant. So no on-the-fly levels.
             supported_quants: &[],
-            component_precision_floors: &[],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
-            supports_sequential_offload: false,
-            unconditionally_engages_staged_residency: false,
-            supports_preview: false,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
+            ..Default::default()
         },
     }
 }

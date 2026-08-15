@@ -956,6 +956,7 @@ class CrossBackendGeometryTests(unittest.TestCase):
         self.gate = load_gate_module()
         self.gate.CROSS_BACKEND_GEOMETRY_EXEMPT_FAMILIES = {}
         self.gate.CROSS_BACKEND_GEOMETRY_EXEMPTIONS = {}
+        self.gate.CROSS_BACKEND_GEOMETRY_NO_SHARED_CONSTANTS = {}
         self.gate.CROSS_BACKEND_FIXTURE_FAMILIES = {
             "demo": "the synthetic pair commits one byte-identical golden"
         }
@@ -1151,6 +1152,175 @@ class CrossBackendGeometryTests(unittest.TestCase):
                 }
             )
         )
+
+    def test_a_cast_is_stripped_from_code_but_never_from_a_string(self) -> None:
+        """`as` is a keyword outside a literal and the word "as" inside one.
+
+        Both spellings below are live in the tree this PR now sweeps — `boogu`'s `SYSTEM_PROMPT_T2I`
+        ends "…the instructions are as follows." and `sensenova`'s `SYSTEM_MESSAGE_FOR_GEN` says
+        "as input" — so before this, two backends whose prose differed only after an " as " compared
+        equal."""
+        self.assertEqual(self.gate._normalize_const_value("VAE_RATIO as u32"), "VAE_RATIO")
+        self.assertNotEqual(
+            self.gate._normalize_const_value('"The instructions are as follows."'),
+            self.gate._normalize_const_value('"The instructions are."'),
+        )
+        self.assertEqual(
+            self.gate._normalize_const_value('"Use the image as input."'),
+            '"Use the image as input."',
+        )
+
+    def test_a_digit_separator_inside_a_string_is_not_a_digit_separator(self) -> None:
+        """HF-style repo ids are exactly where the digit rule bit: the lookbehind only stops a match
+        *starting* mid-identifier, and inside a string a digit run legitimately follows `/` or `-`.
+        The two pairs below are the shape the tree is full of."""
+        self.assertNotEqual(
+            self.gate._normalize_const_value('"model/2_3"'),
+            self.gate._normalize_const_value('"model/23"'),
+        )
+        self.assertNotEqual(
+            self.gate._normalize_const_value('"SceneWorks/wan-2_2"'),
+            self.gate._normalize_const_value('"SceneWorks/wan-22"'),
+        )
+        # ...while a real numeric literal in the code around them still normalizes.
+        self.assertEqual(self.gate._normalize_const_value("&[32_000, 1_024]"), "&[32000,1024]")
+
+    def test_whitespace_inside_a_string_is_content_not_layout(self) -> None:
+        """The pre-existing space strip compounded the two rules above: `"euler a"` is a sampler
+        name and `"eulera"` is not one, and `DEFAULT_SAMPLER` is a real cross-backend comparison in
+        this tree (`chroma` carries an exemption for it)."""
+        self.assertNotEqual(
+            self.gate._normalize_const_value('"euler a"'),
+            self.gate._normalize_const_value('"eulera"'),
+        )
+        self.assertEqual(self.gate._normalize_const_value("[2, 2, 4]"), "[2,2,4]")
+
+    def test_two_backends_whose_strings_differ_only_inside_a_literal_still_red(self) -> None:
+        """End to end, not just at the normalizer: the three rules above are only worth anything if
+        the divergence reaches the gate's own message."""
+        for candle_value, mlx_value in (
+            ('"do it as follows"', '"do it follows"'),
+            ('"SceneWorks/wan-2_2"', '"SceneWorks/wan-22"'),
+            ('"euler a"', '"eulera"'),
+        ):
+            with self.subTest(candle_value):
+                failure = self.check(
+                    **{
+                        "a/src/extra.rs": f"pub const PROSE: &str = {candle_value};\n",
+                        "b/src/extra.rs": f"pub const PROSE: &str = {mlx_value};\n",
+                    }
+                )
+                self.assertIsNotNone(failure)
+                self.assertIn("`PROSE` diverges", failure)
+
+    # --- clause: the parser reaches every *published* declaration ---------------------------------
+
+    def test_an_indented_pub_const_is_compared(self) -> None:
+        """`^pub const` was column-0-only, which left `bernini`'s nine `Defaults::*` guidance
+        scalars and minimax-h3's own `DitProjections::TENSOR_COUNT` unread on both sides at once."""
+        failure = self.check(
+            **{
+                "a/src/extra.rs": "impl Defaults {\n    pub const STEPS: usize = 40;\n}\n",
+                "b/src/extra.rs": "impl Defaults {\n    pub const STEPS: i32 = 20;\n}\n",
+            }
+        )
+        self.assertIsNotNone(failure)
+        self.assertIn("`STEPS` diverges", failure)
+
+    def test_a_pub_crate_const_is_compared(self) -> None:
+        """`qwen-image` and `z-image` declare their whole memory-strategy surface `pub(crate)` —
+        decode tiles, overlaps, attention chunk and the rung-4 window ladder."""
+        failure = self.check(
+            **{
+                "a/src/extra.rs": "pub(crate) const DECODE_OVERLAP: u32 = 64;\n",
+                "b/src/extra.rs": "pub(crate) const DECODE_OVERLAP: u32 = 128;\n",
+            }
+        )
+        self.assertIsNotNone(failure)
+        self.assertIn("`DECODE_OVERLAP` diverges", failure)
+
+    def test_every_visibility_spelling_is_reached(self) -> None:
+        """`pub(super)` and `pub(in path)` are the same declaration to a reader; a parser that
+        accepts two of the four spellings is a coverage claim nothing checks."""
+        for visibility in ("pub", "pub(crate)", "pub(super)", "pub(in crate::config)"):
+            with self.subTest(visibility):
+                failure = self.check(
+                    **{
+                        "a/src/extra.rs": f"    {visibility} const EDGE: u32 = 512;\n",
+                        "b/src/extra.rs": f"    {visibility} const EDGE: u32 = 256;\n",
+                    }
+                )
+                self.assertIsNotNone(failure)
+                self.assertIn("`EDGE` diverges", failure)
+
+    def test_a_private_const_is_deliberately_not_compared(self) -> None:
+        """The stated restriction, asserted rather than only written down. Two crates giving an
+        unexported module constant the same name have a name collision, not one published geometry
+        declared twice — `boogu`'s `IMG` is a token id on one side and an unrelated 999 on the
+        other. Extending here is sc-19696, and it has 45 divergences to triage first."""
+        self.assertIsNone(
+            self.check(
+                **{
+                    "a/src/extra.rs": "const IMG: u32 = 151655;\n",
+                    "b/src/extra.rs": "const IMG: u32 = 999;\n",
+                }
+            )
+        )
+
+    def test_an_anonymous_compile_time_assertion_is_not_a_declaration(self) -> None:
+        """`const _: () = assert!(..)` is a check, not a name. Comparing two crates' unrelated
+        assertions as if they were one constant would be a permanent red with no subject."""
+        self.assertIsNone(
+            self.check(
+                **{
+                    "a/src/extra.rs": "pub const _: () = assert!(VAE_RATIO == 16);\n",
+                    "b/src/extra.rs": "pub const _: () = assert!(FACTORS.len() == 3);\n",
+                }
+            )
+        )
+
+    # --- clause: a family compared against nothing is a failure -----------------------------------
+
+    # Empty in `src`, which is the only place the shared-constant floor reads. The `tests/` fixture
+    # constants are deliberately LEFT IN PLACE: sc-19496's fixture requirement is keyed on
+    # `CROSS_BACKEND_FIXTURE_FAMILIES`, which the synthetic `demo` family is a member of, so nulling
+    # them here would make these three tests pass by tripping a second, unrelated clause instead of
+    # the one under test — and would leave the fixture clause unexercised in the scenario where a
+    # family shares no `src` constant at all.
+    EMPTY_PAIR = {
+        "a/src/lib.rs": "pub const ONLY_A: u32 = 1;\n",
+        "a/src/config.rs": None,
+        "b/src/lib.rs": "pub const ONLY_B: u32 = 1;\n",
+        "b/src/config.rs": None,
+    }
+
+    def test_a_family_sharing_no_constant_is_a_failure(self) -> None:
+        """The inert shape this gate exists to refuse. `joycaption` and `sam3` were in it — every
+        other clause green while the two crates were held to nothing — and so is any family the
+        parser stops reaching."""
+        self.gate.CROSS_BACKEND_GEOMETRY_REFERENCE = {}
+        failure = self.check(**dict(self.EMPTY_PAIR))
+        self.assertIsNotNone(failure)
+        self.assertIn("share no constant name, so the gate compared nothing", failure)
+
+    def test_a_recorded_empty_family_suppresses_that_failure(self) -> None:
+        self.gate.CROSS_BACKEND_GEOMETRY_REFERENCE = {}
+        self.gate.CROSS_BACKEND_GEOMETRY_NO_SHARED_CONSTANTS = {"demo": "nothing in common"}
+        self.assertIsNone(self.check(**dict(self.EMPTY_PAIR)))
+
+    def test_a_recorded_empty_family_that_now_shares_a_constant_is_caught(self) -> None:
+        """The half that keeps the record from rotting into a hole. A family listed there is
+        uncompared, so the listing has to expire the moment it stops being true."""
+        self.gate.CROSS_BACKEND_GEOMETRY_NO_SHARED_CONSTANTS = {"demo": "nothing in common"}
+        failure = self.check()
+        self.assertIsNotNone(failure)
+        self.assertIn("are now declared on both sides", failure)
+
+    def test_a_recorded_empty_family_that_does_not_exist_is_caught(self) -> None:
+        self.gate.CROSS_BACKEND_GEOMETRY_NO_SHARED_CONSTANTS = {"ghost": "gone"}
+        failure = self.check()
+        self.assertIsNotNone(failure)
+        self.assertIn("drop the entry", failure)
 
     def test_an_index_into_an_array_constant_folds(self) -> None:
         """`LEGAL_FRAME_COUNTS[0] as f64 / FPS` is a real declaration in both MiniMax-H3 crates. A
@@ -1449,6 +1619,57 @@ class CrossBackendGeometryLiveTests(unittest.TestCase):
             self.assertIn(family, families, f"{family}/{constant}")
         for family in self.gate.CROSS_BACKEND_GEOMETRY_REFERENCE:
             self.assertIn(family, families)
+
+    def test_every_family_is_either_compared_or_recorded_as_uncompared(self) -> None:
+        """Derived from the gate's own predicate, with no count kept here: for each swept family the
+        two crates either share a constant name or the family is written down as sharing none. A
+        family in neither state is one the gate holds to nothing while printing OK."""
+        recorded = set(self.gate.CROSS_BACKEND_GEOMETRY_NO_SHARED_CONSTANTS)
+        uncompared = set()
+        for family, candle, mlx in self.gate._dual_backend_families(self.metadata):
+            shared = set(self.gate._crate_pub_consts(candle, "src")) & set(
+                self.gate._crate_pub_consts(mlx, "src")
+            )
+            if not shared:
+                uncompared.add(family)
+            self.assertEqual(
+                bool(shared),
+                family not in recorded,
+                f"{family}: {len(shared)} shared constants, recorded as empty: {family in recorded}",
+            )
+        self.assertEqual(uncompared, recorded)
+
+    def test_the_parser_reaches_indented_and_pub_crate_declarations_in_the_real_tree(self) -> None:
+        """The column-0 restriction cost real coverage rather than hypothetical coverage, so the
+        proof is taken off the shipped crates. `bernini`'s guidance defaults sit in an `impl` block
+        on both sides and minimax-h3 declares `TENSOR_COUNT` as an associated const; neither is at
+        column 0 in either crate."""
+        families = {
+            family: (candle, mlx)
+            for family, candle, mlx in self.gate._dual_backend_families(self.metadata)
+        }
+        for family, constant in (("bernini", "OMEGA_TXT"), ("minimax-h3", "TENSOR_COUNT")):
+            candle, mlx = families[family]
+            left = self.gate._crate_pub_consts(candle, "src")
+            right = self.gate._crate_pub_consts(mlx, "src")
+            self.assertIn(constant, left, family)
+            self.assertIn(constant, right, family)
+            # Reached *and* compared: a name the gate reads but resolves to nothing on one side
+            # would be back to comparing text against text.
+            self.assertEqual(
+                self.gate._canonical_const_values(left[constant], left),
+                self.gate._canonical_const_values(right[constant], right),
+                f"{family}.{constant}",
+            )
+            for source, crate in ((left, candle), (right, mlx)):
+                self.assertFalse(
+                    any(
+                        line.startswith(f"pub const {constant}")
+                        for path in (crate / "src").rglob("*.rs")
+                        for line in path.read_text(encoding="utf-8").split("\n")
+                    ),
+                    f"{family}.{constant} is at column 0 in {crate.name}, so this proves nothing",
+                )
 
     def test_every_byte_identical_fixture_family_declares_its_geometry(self) -> None:
         """The four families sc-19496 left behind, plus the one it fixed. Structural on both halves:

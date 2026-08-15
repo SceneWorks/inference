@@ -57,7 +57,7 @@ use candle_gen::gen_core::AdapterKind;
 use candle_gen::gen_core::{
     self, AdapterSpec, AudioTrack, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
     GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, PerComponentBytes,
-    Progress, Quant, SizeFloor, WeightsSource,
+    Progress, Quant, StepSupport, WeightsSource,
 };
 use candle_gen::{run_av_curated_sampler, AvLatents, CandleError, Result as CResult};
 
@@ -818,9 +818,6 @@ pub fn descriptor() -> ModelDescriptor {
         backend: "candle",
         modality: Modality::Video,
         capabilities: Capabilities {
-            supports_negative_prompt: false,
-            supports_guidance: false,
-            supports_true_cfg: false,
             conditioning: vec![
                 ConditioningKind::Reference,
                 ConditioningKind::Keyframe,
@@ -837,8 +834,6 @@ pub fn descriptor() -> ModelDescriptor {
                 candle_gen::curated_sampler_names(),
                 &["rectified-flow"],
             ),
-            schedulers: vec![],
-            supported_guidance_methods: vec![],
             min_size: SIZE_MULTIPLE,
             max_size: 1280,
             max_count: 1,
@@ -850,28 +845,9 @@ pub fn descriptor() -> ModelDescriptor {
             //
             // Derived from the σ table rather than written as `vec![8]`, so re-baking the schedule
             // moves the advertised surface with it instead of leaving a stale literal behind.
-            supported_steps: vec![NATIVE_STEPS],
-            mac_only: false,
+            supported_steps: StepSupport::Exact(vec![NATIVE_STEPS]),
             supported_quants: &[] as &[Quant],
-            component_precision_floors: &[],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
-            supports_sequential_offload: false,
-            unconditionally_engages_staged_residency: false,
-            supports_preview: false,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
+            ..Default::default()
         },
     }
 }

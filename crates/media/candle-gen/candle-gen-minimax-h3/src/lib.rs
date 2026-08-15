@@ -99,15 +99,22 @@
 //! rejects a memory-strategy registration whose `provider_id` has no matching generator, which is
 //! why the catalog line could not be added before (see [`register_providers`]).
 //!
-//! ## Not in this crate
+//! ## Both of the former gaps are now closed
 //!
-//! Ref2VA (sc-17157) — the `transformer_ref` partition, the omni-reference presentation and the
-//! audio VAE **encoder** — and the turbo LoRA seam. Both are default-denied in [`model::descriptor`]
-//! rather than silently ignored.
+//! Ref2VA **is** here as of sc-17157: [`mod@reference`] owns the caps and the ordered reference
+//! list, [`audio_vae_encoder`] the encode half of the audio VAE, and [`model::MiniMaxH3Task`] the
+//! `transformer` / `transformer_ref` selection.
+//!
+//! The turbo LoRA seam **is** here as of sc-18728: [`adapters`] is the candle twin of
+//! `mlx_gen_minimax_h3::adapters`, carrying the same key map, the same alpha precedence chain, and
+//! (sc-19443) the ComfyUI key-space conversion the MLX lane originally refused. It reaches every
+//! task's DiT through the one [`model::MiniMaxH3::load_task_dit`] seam, `ref2va` included.
 
+pub mod adapters;
 pub mod alias_free;
 pub mod audio_config;
 pub mod audio_vae;
+pub mod audio_vae_encoder;
 pub mod blocks;
 pub mod chunking;
 pub mod conditioning;
@@ -121,6 +128,7 @@ pub mod memory_strategy;
 pub mod model;
 pub mod nn;
 pub mod pipeline;
+pub mod reference;
 pub mod rope;
 pub mod spatial_tiling;
 pub mod tensor;
@@ -128,6 +136,11 @@ pub mod text_encoder;
 pub mod vae;
 pub mod vae_encoder;
 
+pub use adapters::{
+    adapter_target_paths, alpha_rank_fold, apply_minimax_h3_adapters, convert_comfyui_key_space,
+    is_comfyui_key_space, normalize_minimax_h3_key, resolve_alpha, resolve_rank,
+    MiniMaxH3LoraReport, BLOCK_TARGETS, DEFAULT_LORA_ALPHA,
+};
 pub use alias_free::{kaiser_sinc_filter1d, Activation1d, LowPassFilter1d, SnakeBeta, UpSample1d};
 pub use audio_config::{
     BigVganConfig, MiniMaxH3AudioVaeConfig, ACTIVATION_KERNEL_SIZE, ACTIVATION_RESAMPLE_RATIO,
@@ -135,11 +148,17 @@ pub use audio_config::{
     AUDIO_SAMPLE_RATE, AUDIO_TOKEN_RATE_HZ,
 };
 pub use audio_vae::{AmpBlock1, BigVgan, MiniMaxH3AudioVae};
+pub use audio_vae_encoder::{
+    adaptive_avg_pool_last_axis, AttnProjection, AudioDiagonalGaussian, CausalAttention,
+    DacEncoder, EncoderBlock, MiniMaxH3AudioVaeEncoder, ResidualUnit, WnConv1d, ATTN_PROJ_HEADS,
+    LAYER_NORM_EPS, MLP_RATIO,
+};
 pub use blocks::{blend, TransformerBlock};
 pub use chunking::{ChunkSpan, TemporalGeometry, TemporalPlan};
 pub use conditioning::{
-    build_condition_rows, encode_keyframe_condition, fp16_round_trip, keyframe_condition_rows,
-    scale_noise, validate_condition_arity, KeyframeNoise, KEYFRAME_ENCODE_SEED,
+    build_condition_rows, encode_keyframe_condition, encode_reference_condition, fp16_round_trip,
+    keyframe_condition_rows, reference_audio_rows, reference_clip_to_vae_pixels, scale_noise,
+    snap_reference_frames_down, validate_condition_arity, KeyframeNoise, KEYFRAME_ENCODE_SEED,
     KEYFRAME_NOISE_AUG_T,
 };
 pub use config::{
@@ -158,8 +177,8 @@ pub use denoise::{
 };
 pub use dit::{
     release_device_memory, AdaLnCache, AdaLnResidency, DitBlock, JointDit, KeyframeAnchor,
-    MiniMaxH3Dit, MiniMaxH3DitConfig, MmRope, TimestepSchedule, TokenRefiner, MODALITY_NUM,
-    PUBLISHED_DIT_TENSORS,
+    MiniMaxH3Dit, MiniMaxH3DitConfig, MmRope, ReferenceLatentGeometry, TimestepSchedule,
+    TokenRefiner, MODALITY_NUM, PUBLISHED_DIT_TENSORS,
 };
 pub use keyframe::{
     anchors_for, fit_keyframe, fit_keyframes, keyframe_to_vae_pixels, resolve_canvas_size,
@@ -170,14 +189,24 @@ pub use layout::{
     PUBLISHED_GATED_FFN_LAYOUT,
 };
 pub use model::{
-    descriptor, keyframe_anchors, MiniMaxH3, DEFAULT_STEPS, MAX_STEPS, OFFLOAD_POLICY,
+    descriptor, keyframe_anchors, MiniMaxH3, MiniMaxH3Task, BASE_DIT_PARTITION, DEFAULT_STEPS,
+    MAX_STEPS, OFFLOAD_POLICY, REFERENCE_DIT_PARTITION,
 };
 pub use pipeline::{
-    align_frames_for_duration, fit_audio_to_video, fl2va_layout, frames_to_images, initial_latents,
-    patchify_video_latents, prepend_condition_rows, render_latents, resolve_geometry,
+    align_frames_for_duration, audio_track_to_encoder_input, fit_audio_to_video, fl2va_layout,
+    frames_to_images, initial_latents, patchify_video_latents, prepend_condition_audio_rows,
+    prepend_condition_rows, ref2va_layout, render_latents, resolve_geometry,
     revert_pixel_normalization, t2va_layout, unpack_audio_rows, unpatchify_video_rows,
-    RenderedLatents, RequestGeometry, CANVAS_MAX_PIXELS, CANVAS_SHORT_EDGE, MAX_DURATION_SECONDS,
-    MIN_DURATION_SECONDS, PATCH_SIZE, PIXEL_MEAN, PIXEL_STD, SMALLEST_LEGAL_FRAMES, SPATIAL_STRIDE,
+    RenderedLatents, RequestGeometry, CANVAS_MAX_PIXELS, CANVAS_SHORT_EDGE, MAX_CANVAS_EDGE,
+    MAX_DURATION_SECONDS, MIN_DURATION_SECONDS, PATCH_SIZE, PIXEL_MEAN, PIXEL_STD,
+    SMALLEST_LEGAL_FRAMES, SPATIAL_STRIDE,
+};
+pub use reference::{
+    normalize_reference_clip, normalize_reference_image, sample_video_condition_frames,
+    AudioReference, Ref2VaReference, Ref2VaReferences, ReferenceCounts, ReferenceKind,
+    ReferencePresentation, VideoReference, MAX_AUDIO_REFERENCES, MAX_IMAGE_REFERENCES,
+    MAX_TOTAL_REFERENCES, MAX_VIDEO_REFERENCES, REFERENCE_IMAGE_SHORT_EDGE, VIDEO_SAMPLE_FPS,
+    VISION_TEMPORAL_PATCH,
 };
 pub use rope::{create_token_ids, Rope3d, RopeTables};
 pub use text_encoder::{

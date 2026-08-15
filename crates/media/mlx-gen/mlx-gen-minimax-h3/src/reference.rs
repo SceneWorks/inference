@@ -44,7 +44,11 @@
 //!
 //! # Rates are load-bearing and are not defaulted silently
 //!
-//! MiniMax-H3 resamples every reference onto its own 24 fps and onto the audio VAE's sample rate.
+//! MiniMax-H3 resamples every **video** reference onto its own 24 fps. It does **not** resample
+//! audio: this crate ships no resampler at all, so a soundtrack that is not already at the audio
+//! VAE's [`crate::audio_config::AUDIO_SAMPLE_RATE`] is **rejected** by [`Ref2VaReferences::new`],
+//! at the engine boundary and before any weight is read. The caller resamples.
+//!
 //! A reference built from frames whose real rate was lost is conditioned on **at the wrong speed,
 //! and nothing raises**. So [`VideoReference`] carries its `fps` and [`AudioReference`] its
 //! `sample_rate` as required data rather than as an optional hint with a plausible default.
@@ -58,6 +62,8 @@
 
 use mlx_gen::media::{AudioTrack, Image};
 use mlx_gen::{Error, Result};
+
+use crate::audio_config::AUDIO_SAMPLE_RATE;
 
 /// Image references a `ref2va` request may carry.
 pub const MAX_IMAGE_REFERENCES: usize = 9;
@@ -530,10 +536,20 @@ impl Ref2VaReferences {
                 "minimax-h3 ref2va: reference {index} declares zero audio channels"
             )));
         }
-        if audio.sample_rate == 0 {
+        // **The rate gate, at the engine boundary.** This crate has NO audio resampler: the encode
+        // path (`crate::pipeline::audio_track_to_encoder_input`) rejects anything that is not
+        // already at the audio VAE's rate. Checking only `sample_rate == 0` here meant a 44.1 kHz
+        // reference passed `Generator::validate` and died deep inside the pipeline, after the video
+        // VAE and the audio encoder had been mapped — the exact late failure this constructor
+        // exists to prevent. `sample_rate == 0` is subsumed: zero is not 32 000. Mirrors the candle
+        // twin's `check_audio`, and `tests/ref2va_cross_backend.rs` on that lane keeps the two
+        // ports' caps from drifting.
+        if audio.sample_rate != AUDIO_SAMPLE_RATE {
             return Err(Error::Msg(format!(
-                "minimax-h3 ref2va: reference {index} declares a zero sample rate; a soundtrack is \
-                 resampled onto the audio VAE's rate from the rate it carries"
+                "minimax-h3 ref2va: reference {index} carries a {} Hz soundtrack, but this engine \
+                 has no resampler — a reference soundtrack must already be at the audio VAE's \
+                 {AUDIO_SAMPLE_RATE} Hz. Resample it before sending it.",
+                audio.sample_rate
             )));
         }
         Ok(())
@@ -635,7 +651,7 @@ mod tests {
     fn track() -> AudioTrack {
         AudioTrack {
             samples: vec![0.0; 128],
-            sample_rate: 24_000,
+            sample_rate: AUDIO_SAMPLE_RATE,
             channels: 1,
             stems: Vec::new(),
         }
@@ -886,7 +902,7 @@ mod tests {
         let empty_wave = Ref2VaReference::Audio(AudioReference {
             audio: AudioTrack {
                 samples: Vec::new(),
-                sample_rate: 24_000,
+                sample_rate: AUDIO_SAMPLE_RATE,
                 channels: 1,
                 stems: Vec::new(),
             },
@@ -895,6 +911,54 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("empty waveform"), "{e}");
+    }
+
+    /// **A soundtrack at any rate but the audio VAE's is refused at the boundary, not at the
+    /// encoder.**
+    ///
+    /// This lane checked only `sample_rate == 0`, so a 44.1 kHz reference passed
+    /// `Ref2VaReferences::new` and died late in `crate::pipeline::audio_track_to_encoder_input`,
+    /// after two heavy components had been mapped. The candle twin closed that; this is the mirror,
+    /// and it names the rate so a refusal for some OTHER reason cannot pass as this one.
+    #[test]
+    fn a_soundtrack_that_is_not_at_the_vaes_rate_is_refused_by_the_constructor() {
+        let at = |rate: u32| AudioTrack {
+            samples: vec![0.0; 128],
+            sample_rate: rate,
+            channels: 1,
+            stems: Vec::new(),
+        };
+        // Control: the VAE's own rate is admitted through both carriers.
+        Ref2VaReferences::new(vec![
+            img_ref(),
+            Ref2VaReference::Audio(AudioReference {
+                audio: at(AUDIO_SAMPLE_RATE),
+            }),
+        ])
+        .expect("32 kHz is the rate the encoder reads");
+
+        for rate in [0u32, 16_000, 24_000, 44_100, 48_000] {
+            let standalone = Ref2VaReference::Audio(AudioReference { audio: at(rate) });
+            let e = Ref2VaReferences::new(vec![img_ref(), standalone])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                e.contains(&format!("{rate} Hz")) && e.contains("no resampler"),
+                "{rate}: {e}"
+            );
+
+            // ...and the same rate carried by a clip's own soundtrack, which reaches exactly the
+            // same encoder.
+            let sounded = Ref2VaReference::Video(VideoReference {
+                frames: vec![image(64, 64)],
+                fps: 24.0,
+                audio: Some(at(rate)),
+            });
+            let e = Ref2VaReferences::new(vec![sounded])
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("no resampler"), "{rate} on a clip: {e}");
+        }
     }
 
     /// `has_audio` is what orders the presentation, so it is pinned per variant rather than left

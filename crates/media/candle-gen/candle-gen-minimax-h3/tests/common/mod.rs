@@ -179,6 +179,24 @@ pub const AUDIO_FIXTURE: &str = concat!(
     "/tests/fixtures/audio_vae_decode.safetensors"
 );
 
+/// The committed audio-VAE **encode** fixture (sc-17157), produced by the MLX lane's
+/// `tools/dump_minimax_h3_audio_vae_encode.py` running the official
+/// `diffusers.AutoencoderKLMiniMaxH3Audio` — the only executable reference for this half, because
+/// the snapshot's own `FL2VA/audio_vae` bundle is inference-only and defines no `encode`.
+///
+/// **Copied byte-for-byte from the MLX lane**, which `cross_backend.rs` asserts: that shared-golden
+/// identity is the cross-backend agreement argument for the Ref2VA soundtrack path, since MLX and
+/// candle cannot coexist in one process.
+///
+/// Its geometry is deliberately *harder* than the shipped model's: `encoder_rates = (2, 5)` keeps
+/// an ODD stride (whose `padding = ceil(stride / 2)` is what makes the shipped chain land on
+/// exactly `samples / 800`), and `num_attention_heads = 2` puts the adaptive pool at a ragged
+/// 48 → 32 with **overlapping** windows rather than the shipped exact 256 → 32.
+pub const AUDIO_ENCODE_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/audio_vae_encode.safetensors"
+);
+
 /// The MLX lane's copy of the same two goldens. `cross_backend.rs` asserts this crate's copies are
 /// **byte-identical** to them: the cross-backend parity argument is that both ports are held to the
 /// same reference tensors, and two fixtures that had silently drifted apart would break that

@@ -12,7 +12,7 @@
 //! slices this v1 wires **txt2img + LoRA/LoKr**, including packed Q4/Q8 base tiers; ControlNet /
 //! IP-Adapter remain separate combinations.
 
-use candle_gen::gen_core::{Capabilities, Modality, ModelDescriptor, SizeFloor};
+use candle_gen::gen_core::{Capabilities, Modality, ModelDescriptor};
 
 pub const CHROMA1_HD_ID: &str = "chroma1_hd";
 pub const CHROMA1_BASE_ID: &str = "chroma1_base";
@@ -21,9 +21,10 @@ pub const CHROMA1_FLASH_ID: &str = "chroma1_flash";
 /// The base flow-match sampler name.
 ///
 /// It does **not** match the mlx descriptor's advertised sampler, which this doc comment claimed
-/// until sc-19496: `mlx-gen-chroma`'s `DEFAULT_SAMPLER` is `"euler"`. Both menus are built with
-/// `menu_with_aliases`, under which `flow_match` is a legacy alias falling back to euler (see the
-/// `samplers:` comment below), so the advertised *strings* differ while the integrator does not.
+/// until sc-19496: `mlx-gen-chroma`'s `DEFAULT_SAMPLER` is `"euler"`. Both menus carry `flow_match`
+/// as a legacy alias falling back to euler — candle via `menu_with_aliases` (the `samplers:` field
+/// below), mlx by pushing it onto `curated_sampler_names()` inline, which is why it never calls
+/// `menu_with_aliases` — so the advertised *strings* differ while the integrator does not.
 /// Which string is right against the released checkpoint is sc-19495; `check_cross_backend_geometry`
 /// carries an exemption naming that story rather than letting either backend's value be copied
 /// across to buy a green.
@@ -99,7 +100,6 @@ impl ChromaVariant {
             modality: Modality::Image,
             capabilities: Capabilities {
                 supports_negative_prompt: true,
-                supports_guidance: false,
                 supports_true_cfg: true,
                 // v1 = T2I only. ControlNet / IP-Adapter / img2img are later ports.
                 conditioning: vec![],
@@ -116,42 +116,19 @@ impl ChromaVariant {
                     candle_gen::curated_scheduler_names(),
                     &["linear"],
                 ),
-                supported_guidance_methods: vec![],
                 min_size: 256,
                 max_size: 2048,
                 max_count: 8,
-                // candle is the Windows/CUDA backend — NOT Mac-only (the MLX provider sets this true).
-                // Not a distilled fixed-schedule model: any step count the shared sanity caps
-                // admit is renderable (sc-19502).
-                supported_steps: Vec::new(),
-                mac_only: false,
-                supported_quants: &[],
-                component_precision_floors: &[],
-                supports_kv_cache: false,
                 // The static-shift / beta sigma schedule is applied inside the candle pipeline, so the
                 // worker needs no sigma-shift loader hint (matches the candle FLUX/Z-Image slices).
                 requires_sigma_shift: false,
-                supports_sequential_offload: false,
-                unconditionally_engages_staged_residency: false,
                 // Per-step latent previews (epic 16948, sc-16956): the one registered render lane all
                 // three variants share hands `crate::preview::hook` — the FLUX.1 seam, reused because
                 // Chroma ships a byte-identical VAE — to the shared flow driver. `candle-gen-catalog`'s
                 // `preview_advertising` guard derives this from the sources and fails if the flag and
                 // the wiring ever disagree.
                 supports_preview: true,
-                supports_prompt_enhancement: false,
-                supports_streaming: false,
-                supports_multi_speaker: false,
-                supports_conversation_history: false,
-                supports_conversation_session: false,
-                max_speakers: None,
-                // No audio surface (sc-12834): pure image/video model.
-                audio_sample_rates: vec![],
-                max_audio_duration_secs: None,
-                audio_voices: vec![],
-                audio_languages: vec![],
-                audio_edit_modes: vec![],
-                size_floor: SizeFloor::RangeChecked,
+                ..Default::default()
             },
         }
     }

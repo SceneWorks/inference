@@ -1554,7 +1554,12 @@ mod tests {
             .unwrap()
             .unwrap();
         let mut request = MemoryBehaviorFixture::new(context.clone()).request;
-        assert_eq!(request.frames, None);
+        // `frames` is carried across from the fixture geometry by `MemoryBehaviorFixture::new`
+        // (sc-19591), so the scope receives the calibrated clip length stated rather than left to
+        // `CandleRequestScopeCore`'s `default_frames`. `fps` has no geometry axis and still arrives
+        // unstated, which `validate_request` resolves to `DEFAULT_FPS`.
+        assert_eq!(request.frames, Some(context.geometry.frames));
+        assert_eq!(request.frames, Some(DEFAULT_FRAMES));
         assert_eq!(request.fps, None);
         scope.configure_request(&mut request).unwrap();
         assert!(request.memory.unwrap().tile_vae_decode);

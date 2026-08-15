@@ -2987,6 +2987,37 @@ jobs:
           run_one real_weight_decode_produces_a_plausible_video
           run_one real_weight_multi_chunk_decode_blends_the_seam
           run_one real_weight_audio_decode_produces_a_plausible_stereo_track
+      # sc-17151's tripwire, and the ONLY two of its arms this lane's bytes can run. A tripwire no
+      # job pulls is a tripwire for whoever remembers to run it, so the story's "fails if any phase
+      # regresses" acceptance needs a selection here and not only a `#[ignore]` string.
+      #
+      # WHY NOT THE te/dit ARMS. `--test staged_residency`'s `a_bounded_slab_handoff_leaves_nothing_
+      # behind` and `a_held_component_trips_both_handoff_gates` are cheap in MEMORY (60 tensors each)
+      # and not in DISK: `Weights::from_dir` opens the whole component directory, and this row's
+      # `download_files` is a deliberate 11.640 GB slice carrying NO `transformer/` shards and NO
+      # `text_encoder/` shards (only the TE index). They would fail at `from_dir`, before reaching a
+      # gate. Provisioning them is +124 GB on both Macs and is a separate decision.
+      #
+      # The two below drive the identical `phase()` helper and the identical predicates over the
+      # components the slice DOES carry whole — `vae/` (10.42 GB) and `audio_vae/` (0.605 GB) — so
+      # the clean arm is the regression gate and the control arm proves it can come back false.
+      # ~11 GB resident, under the parity gate below. Every OTHER arm of `staged_residency.rs`,
+      # `ref2va_checkpoint.rs` and `te_tier_generate_stages.rs` is OPERATOR-ONLY: it needs the full
+      # 196 GB snapshot and runs only where someone has one.
+      - name: Run MiniMax-H3 staged-residency tripwires
+        run: |
+          set -o pipefail
+          run_one() {
+            local name="$1" out
+            out="$(cargo test --locked --release -p mlx-gen-minimax-h3 --test staged_residency \
+              "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+            if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
+              echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
+              return 1
+            fi
+          }
+          run_one the_video_decoder_hands_off_cleanly
+          run_one a_held_decoder_trips_both_handoff_gates
       # LAST, and deliberately so. This is the only gate in either backend that can catch a LAYOUT
       # error against real weights — the sc-18740 class, where an FFN gate/value half-swap shipped
       # green because every self-generated number simply re-derived whatever the port did. It needs an
@@ -5608,6 +5639,12 @@ jobs:
           rem MiniMaxAI/MiniMax-H3 is a ~196 GB repo; the `minimax-h3` row carries a `download_files`
           rem allow-list so only the 11.640 GB the tests below read is fetched.
           python scripts/release/ensure_model_snapshot.py --model minimax-h3 --snapshot "%MINIMAX_H3_SNAPSHOT%" || exit /b 1
+          rem sc-19558 — the DiT component, on its OWN key so the shared row above stays 11.640 GB
+          rem for every lane that does not read it. 132.6 GB for both partitions on a cold box;
+          rem sc-18677 provisioned the full upstream snapshot on THIS runner, so here it verifies
+          rem rather than fetches. It is what makes the two DiT header gates below reachable at all —
+          rem they read headers only, and were unreachable purely because the bytes were in no row.
+          python scripts/release/ensure_model_snapshot.py --model minimax-h3-dit --snapshot "%MINIMAX_H3_SNAPSHOT%" || exit /b 1
       # Name-selected with `--exact` AFTER the `--` plus a run-count assertion, for the reasons the
       # `candle-mmaudio` job above spells out: `--exact` before the `--` is rejected by cargo and the
       # rejection is reported as exit 0, and without the count a rename yields "0 passed; N filtered
@@ -5621,6 +5658,11 @@ jobs:
           call :run_one declared_audio_tensor_names_match_the_published_checkpoint || exit /b 1
           call :run_one published_audio_configs_reproduce_the_declared_geometry || exit /b 1
           call :run_one stored_kaiser_filters_match_the_derivation_on_real_weights || exit /b 1
+          rem sc-19558 — the two DiT header gates. Header-only and device-free, so they cost the
+          rem materialize step above and nothing else; they were listed as NOT COVERED for exactly
+          rem one reason, that `transformer/` was in no row, and `minimax-h3-dit` is that row.
+          call :run_one declared_dit_tensor_names_match_the_published_checkpoint || exit /b 1
+          call :run_one the_adaln_projections_are_the_documented_twenty_six_gigabytes || exit /b 1
           exit /b 0
 
           :run_one

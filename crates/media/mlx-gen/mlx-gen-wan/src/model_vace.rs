@@ -29,7 +29,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{
     AdapterSpec, Capabilities, ConditioningKind, Error, GenerationOutput, GenerationRequest,
     Generator, Image, LoadPhase, LoadSpec, Modality, ModelDescriptor, MoeExpert, OffloadPolicy,
-    Precision, Progress, Quant, Result, SizeFloor, WeightsSource,
+    Precision, Progress, Quant, Result, WeightsSource,
 };
 use mlx_rs::ops::{add, concatenate_axis, multiply};
 use mlx_rs::{random, Array, Dtype};
@@ -286,7 +286,6 @@ pub fn descriptor_vace() -> ModelDescriptor {
             // mode); optional `Reference` images become leading conditioning frames.
             supports_negative_prompt: true,
             supports_guidance: true,
-            supports_true_cfg: false,
             conditioning: vec![ConditioningKind::ControlClip, ConditioningKind::Reference],
             // Q4/Q8 is wired (sc-3440, `spec.quantize` → `WanVaceTransformer::quantize`, mirroring the
             // base Wan slice sc-2682). LoRA/LoKr is wired (sc-3439): `spec.adapters` merge onto the
@@ -298,38 +297,17 @@ pub fn descriptor_vace() -> ModelDescriptor {
             // sc-7296: curated gen-core vocabulary (`uni_pc`/`dpmpp_2m`) routed to Wan's native solvers
             // + legacy aliases; VACE advertises native solvers only (no `run_flow_sampler` fold-ins).
             samplers: crate::model::wan_native_samplers(),
-            schedulers: Vec::new(),
-            supported_guidance_methods: vec![],
             min_size: 16,
             max_size: 1280,
             max_count: 1,
-            // Not a distilled fixed-schedule model: any step count the shared sanity caps
-            // admit is renderable (sc-19502).
-            supported_steps: Vec::new(),
             mac_only: true,
             supported_quants: &[Quant::Q4, Quant::Q8],
-            component_precision_floors: &[],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
             // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
             supports_sequential_offload: false,
             // The TE, scoped z16 VAE work, and VACE transformer are loaded/used/dropped as phases on
             // every request even though this provider exposes no selectable Sequential control.
             unconditionally_engages_staged_residency: true,
-            supports_preview: false,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
+            ..Default::default()
         },
     }
 }
