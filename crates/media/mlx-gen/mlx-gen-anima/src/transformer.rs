@@ -17,7 +17,8 @@ use mlx_rs::transforms::checkpoint;
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear, Adapter};
-use mlx_gen::nn::{apply_text_rope, gelu_exact, modulate, silu, timestep_sincos};
+use mlx_gen::nn::{gelu_exact, modulate, silu, timestep_sincos};
+use mlx_gen::qkv::{self, AttnPrepSpec, QkNormSpec, QkvSource, RopeSpec, RopeStyle, RopeTables};
 use mlx_gen::train::lora::LoraParams;
 use mlx_gen::weights::{join, Weights};
 use mlx_gen::Result;
@@ -198,40 +199,41 @@ impl Attention {
         rope: Option<(&Array, &Array)>,
         plan: mlx_gen::attention::AttentionPlan<'_>,
     ) -> Result<Array> {
-        let hsh = hidden.shape();
-        let (b, sq) = (hsh[0], hsh[1]);
         let kv_src = encoder.unwrap_or(hidden);
-        let sk = kv_src.shape()[1];
 
-        let q = self
-            .to_q
-            .forward(hidden)?
-            .reshape(&[b, sq, self.heads, self.head_dim])?;
-        let k = self
-            .to_k
-            .forward(kv_src)?
-            .reshape(&[b, sk, self.heads, self.head_dim])?;
-        let v = self
-            .to_v
-            .forward(kv_src)?
-            .reshape(&[b, sk, self.heads, self.head_dim])?;
-
-        // per-head q/k RMSNorm (over the head_dim).
-        let q = rms_norm(&q, &self.norm_q, ATTN_QK_NORM_EPS)?;
-        let k = rms_norm(&k, &self.norm_k, ATTN_QK_NORM_EPS)?;
-
-        let (q, k) = match rope {
-            Some((cos, sin)) => (
-                apply_text_rope(&q, cos, sin)?,
-                apply_text_rope(&k, cos, sin)?,
-            ),
-            None => (q, k),
-        };
-
-        // [b,s,h,hd] -> [b,h,s,hd]
-        let q = q.transpose_axes(&[0, 2, 1, 3])?;
-        let k = k.transpose_axes(&[0, 2, 1, 3])?;
-        let v = v.transpose_axes(&[0, 2, 1, 3])?;
+        // SC-18319 — the shared prologue. The DiT attention is **knob 3's reference case**: the
+        // SAME code path runs self-attention with RoPE and cross-attention with none, so "RoPE
+        // optional" is a per-call knob rather than a per-family one. `RopeStyle::None` skips the
+        // rotation outright (it is not an identity table, which would still cost two multiplies and
+        // an add over the whole q/k stream in all 28 blocks). The rest: separate q/k/v (knob 9),
+        // per-head RMSNorm over `head_dim` after the head split (knob 1), half-split `rotate_half`
+        // rotation over full-width `[1, S, head_dim]` tables (knob 2 — `nn::apply_text_rope`
+        // verbatim), token-major axes, one shared q/k table (knob 6 off — the conditioner is where
+        // the tables differ).
+        let spec = AttnPrepSpec::new(self.heads, self.head_dim)
+            .with_qk_norm(QkNormSpec::per_head(
+                &self.norm_q,
+                &self.norm_k,
+                ATTN_QK_NORM_EPS,
+            ))
+            .with_rope(match rope {
+                Some((cos, sin)) => RopeSpec {
+                    style: RopeStyle::RotateHalf,
+                    q: Some(RopeTables::new(cos, sin)),
+                    k: Some(RopeTables::new(cos, sin)),
+                    ..RopeSpec::default()
+                },
+                None => RopeSpec::default(),
+            });
+        let heads = qkv::prepare(
+            QkvSource::Separate {
+                q: &self.to_q.forward(hidden)?,
+                k: &self.to_k.forward(kv_src)?,
+                v: &self.to_v.forward(kv_src)?,
+            },
+            &spec,
+        )?;
+        let (q, k, v) = (heads.q, heads.k, heads.v);
         let o = if self.ckpt_sdpa {
             // sc-10576: checkpoint just the SDPA. q/k/v are the threaded inputs (grads to the QKV
             // projections — and their LoRA — flow back through them); only the f32 scale is captured.
@@ -249,10 +251,7 @@ impl Attention {
         } else {
             mlx_gen::attention::sdpa_budgeted_bhsd(&q, &k, &v, self.scale, None, plan)?
         };
-        let o = o
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[b, sq, self.heads * self.head_dim])?;
-        self.to_out.forward(&o)
+        self.to_out.forward(&qkv::merge_heads(&o)?)
     }
 }
 

@@ -5,13 +5,17 @@
 //! (`to_out.0` for image, `to_add_out` for text).
 
 use mlx_rs::error::Result as MlxResult;
-use mlx_rs::fast::{rms_norm, scaled_dot_product_attention};
-use mlx_rs::ops::{add, concatenate_axis, multiply, split, split_sections, subtract};
+use mlx_rs::fast::scaled_dot_product_attention;
+use mlx_rs::ops::split_sections;
 use mlx_rs::transforms::checkpoint;
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::attention::{sdpa_budgeted_bhsd, AttentionPlan};
+use mlx_gen::qkv::{
+    self, AttnPrepSpec, QkNormSpec, QkvSource, RopeDtype, RopeSpec, RopeStyle, RopeTables,
+    StreamOrder,
+};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
@@ -136,38 +140,46 @@ impl LensJointAttention {
         mask: Option<&Array>,
         attention: AttentionPlan<'_>,
     ) -> Result<(Array, Array)> {
-        let (b, img_seq) = (img.shape()[0], img.shape()[1]);
-        let txt_seq = txt.shape()[1];
+        let img_seq = img.shape()[1];
         let (h, hd) = (self.num_heads, self.head_dim);
 
-        // Fused QKV per stream → [B, seq, 3, heads, head_dim] → q/k/v each [B, seq, heads, head_dim].
-        let qkv = |lin: &AdaptableLinear, x: &Array, seq: i32| -> Result<(Array, Array, Array)> {
-            let t = lin.forward(x)?.reshape(&[b, seq, 3, h, hd])?;
-            let parts = split(&t, 3, 2)?; // 3 × [B, seq, 1, heads, head_dim]
-            let q = parts[0].reshape(&[b, seq, h, hd])?;
-            let k = parts[1].reshape(&[b, seq, h, hd])?;
-            let v = parts[2].reshape(&[b, seq, h, hd])?;
-            Ok((q, k, v))
-        };
-        let (img_q, img_k, img_v) = qkv(&self.img_qkv, img, img_seq)?;
-        let (txt_q, txt_k, txt_v) = qkv(&self.txt_qkv, txt, txt_seq)?;
-
-        // QK RMSNorm over head_dim.
-        let img_q = rms_norm(&img_q, &self.norm_q, RMS_EPS)?;
-        let img_k = rms_norm(&img_k, &self.norm_k, RMS_EPS)?;
-        let txt_q = rms_norm(&txt_q, &self.norm_added_q, RMS_EPS)?;
-        let txt_k = rms_norm(&txt_k, &self.norm_added_k, RMS_EPS)?;
-
-        // Per-stream interleaved-complex RoPE.
-        let img_q = apply_rope(&img_q, img_cos, img_sin)?;
-        let img_k = apply_rope(&img_k, img_cos, img_sin)?;
-        let txt_q = apply_rope(&txt_q, txt_cos, txt_sin)?;
-        let txt_k = apply_rope(&txt_k, txt_cos, txt_sin)?;
-
-        // Joint [img, txt] over the sequence axis, then [B, heads, seq, head_dim] for SDPA.
-        let q = concatenate_axis(&[&img_q, &txt_q], 1)?.transpose_axes(&[0, 2, 1, 3])?;
-        let k = concatenate_axis(&[&img_k, &txt_k], 1)?.transpose_axes(&[0, 2, 1, 3])?;
-        let v = concatenate_axis(&[&img_v, &txt_v], 1)?.transpose_axes(&[0, 2, 1, 3])?;
+        // SC-18319 — the shared prologue. Lens's knob selection: fused packed QKV (knob 9), per-head
+        // QK-RMSNorm after the head split (knob 1), adjacent-pair/interleaved-complex RoPE on both
+        // streams from per-stream tables (knobs 2, 5, 6), token-major rotation, and an `[img, txt]`
+        // join (knob 11) matching `_build_joint_attention_mask`, which orders image tokens first.
+        let stream =
+            |lin: &AdaptableLinear, x: &Array, nq: &Array, nk: &Array, cos: &Array, sin: &Array| {
+                let spec = AttnPrepSpec::new(h, hd)
+                    .with_qk_norm(QkNormSpec::per_head(nq, nk, RMS_EPS))
+                    .with_rope(RopeSpec {
+                        style: RopeStyle::AdjacentPair,
+                        q: Some(RopeTables::new(cos, sin)),
+                        k: Some(RopeTables::new(cos, sin)),
+                        // Knob 12 — the removed `apply_rope` ended in `.as_dtype(x.dtype())`, so
+                        // the f32 tables' promotion is undone and SDPA sees the stream's own dtype.
+                        dtype: RopeDtype::RestoreInput,
+                        ..RopeSpec::default()
+                    });
+                qkv::prepare(QkvSource::Packed(&lin.forward(x)?), &spec)
+            };
+        let img_heads = stream(
+            &self.img_qkv,
+            img,
+            &self.norm_q,
+            &self.norm_k,
+            img_cos,
+            img_sin,
+        )?;
+        let txt_heads = stream(
+            &self.txt_qkv,
+            txt,
+            &self.norm_added_q,
+            &self.norm_added_k,
+            txt_cos,
+            txt_sin,
+        )?;
+        let joint_qkv = StreamOrder::ImageFirst.join(&img_heads, &txt_heads)?;
+        let (q, k, v) = (joint_qkv.q, joint_qkv.k, joint_qkv.v);
 
         let o = if self.ckpt_sdpa {
             // sc-5170: checkpoint just the joint SDPA. q/k/v are the threaded inputs (grads to the
@@ -195,10 +207,7 @@ impl LensJointAttention {
         } else {
             sdpa_budgeted_bhsd(&q, &k, &v, self.scale, mask, attention)?
         };
-        let joint = img_seq + txt_seq;
-        let o = o
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[b, joint, h * hd])?;
+        let o = qkv::merge_heads(&o)?;
 
         // Split back at the image/text boundary (image first).
         let parts = split_sections(&o, &[img_seq], 1)?;
@@ -231,22 +240,6 @@ impl AdaptableHost for LensJointAttention {
     }
 }
 
-/// Interleaved complex RoPE: pairs `(x_2i, x_2i+1)` rotated by `(cos_i, sin_i)`, reproducing the
-/// reference `view_as_complex(...)·freqs_cis`. `x`: `[B, seq, heads, head_dim]`; `cos`/`sin`:
-/// `[seq, head_dim/2]` (f32). The rotation is computed in the promoted dtype and cast back to `x`'s
-/// dtype (`type_as(x)`).
-fn apply_rope(x: &Array, cos: &Array, sin: &Array) -> Result<Array> {
-    let sh = x.shape();
-    let (b, seq, heads, hd) = (sh[0], sh[1], sh[2], sh[3]);
-    let half = hd / 2;
-    let x5 = x.reshape(&[b, seq, heads, half, 2])?;
-    let parts = split(&x5, 2, 4)?; // even/odd lanes
-    let xr = parts[0].reshape(&[b, seq, heads, half])?;
-    let xi = parts[1].reshape(&[b, seq, heads, half])?;
-    let cos = cos.reshape(&[1, seq, 1, half])?;
-    let sin = sin.reshape(&[1, seq, 1, half])?;
-    let out_r = subtract(&multiply(&xr, &cos)?, &multiply(&xi, &sin)?)?;
-    let out_i = add(&multiply(&xr, &sin)?, &multiply(&xi, &cos)?)?;
-    let stacked = concatenate_axis(&[&out_r.expand_dims(4)?, &out_i.expand_dims(4)?], 4)?;
-    Ok(stacked.reshape(&[b, seq, heads, hd])?.as_dtype(x.dtype())?)
-}
+// The interleaved-complex RoPE that used to live here is now
+// `mlx_gen::qkv::apply_rope(.., RopeStyle::AdjacentPair, ..)` (SC-18319) — the identical
+// `(real, imag)·(cos, sin)` expression, routed through the shared compiled-glue `nn::rope_rotate`.

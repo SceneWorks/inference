@@ -22,6 +22,10 @@ use mlx_gen::nn::{gated, gelu_tanh, silu};
 /// [`CompileGlueGuard`] is the RAII form the production denoise binds so the toggle is restored on
 /// drop (F-007) instead of leaking the render thread's setting into later work.
 pub use mlx_gen::nn::{set_compile_glue, CompileGlueGuard};
+use mlx_gen::qkv::{
+    self, AttnPrepSpec, NormDtype, QkNormSpec, QkvSource, RopeDtype, RopeSpec, RopeStyle,
+    RopeTables, RotationAxes, StreamOrder,
+};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 use mlx_rs::fast::{layer_norm, rms_norm};
@@ -126,40 +130,49 @@ fn build_rope(ids: &Array, axes: [usize; 3]) -> Result<RopeTable> {
     Ok(RopeTable { cos, sin })
 }
 
-/// Apply RoPE to `x [B,H,S,hd]` (adjacent-pair / interleaved convention), in f32.
-fn apply_rope_one(x: &Array, rope: &RopeTable) -> Result<Array> {
-    let sh = x.shape();
-    let (b, heads, seq, hd) = (sh[0], sh[1], sh[2], sh[3]);
-    let half = hd / 2;
-    let x5 = x
-        .as_dtype(Dtype::Float32)?
-        .reshape(&[b, heads, seq, half, 2])?;
-    let p = mlx_rs::ops::split(&x5, 2, 4)?;
-    let real = p[0].reshape(&[b, heads, seq, half])?;
-    let imag = p[1].reshape(&[b, heads, seq, half])?;
-    let c = rope.cos.reshape(&[1, 1, seq, half])?;
-    let s = rope.sin.reshape(&[1, 1, seq, half])?;
-    // Shared complex rotation (F-014): identical math to the prior open-coded subtract/add, but routed
-    // through the FLUX op so it picks up the `compile_glue` fusion (`real*c − imag*s`, `imag*c + real*s`).
-    let (out0, out1) = mlx_gen::nn::rope_rotate(&real, &imag, &c, &s)?;
-    Ok(
-        concatenate_axis(&[&out0.expand_dims(4)?, &out1.expand_dims(4)?], 4)?
-            .reshape(&[b, heads, seq, hd])?,
-    )
+/// SC-18319 — Chroma's row of the shared knob table, in one place so the single-stream and joint
+/// attentions provably select the same policy.
+///
+/// `rope` is `Some` only for the single-stream blocks, which rotate per stream; the joint blocks
+/// pass `None` and rotate the **already-joined** sequence afterwards (knob 8's concat-then-RoPE arm,
+/// via [`rotate_joint`]).
+fn chroma_spec<'a>(
+    heads: i32,
+    head_dim: i32,
+    norm_q: &'a Array,
+    norm_k: &'a Array,
+    rope: Option<&'a RopeTable>,
+) -> AttnPrepSpec<'a> {
+    let spec = AttnPrepSpec::new(heads, head_dim)
+        .with_qk_norm(
+            QkNormSpec::per_head(norm_q, norm_k, QK_RMS_EPS).with_dtype(NormDtype::PromoteToF32),
+        )
+        .with_rotation_axes(RotationAxes::HeadMajor);
+    match rope {
+        Some(r) => spec.with_rope(RopeSpec {
+            style: RopeStyle::AdjacentPair,
+            q: Some(RopeTables::new(&r.cos, &r.sin)),
+            k: Some(RopeTables::new(&r.cos, &r.sin)),
+            // Knob 12 — the removed `apply_rope_one` promoted and did NOT cast back. Chroma's
+            // whole prologue already runs f32 (`NormDtype::PromoteToF32` above), so this is a
+            // no-op here — stated rather than defaulted.
+            dtype: RopeDtype::Promoted,
+            ..RopeSpec::default()
+        }),
+        None => spec,
+    }
 }
 
-/// Project `x [B,S,inner]` to heads `[B,H,S,hd]`, optionally RMS-normed (QK-norm) over `hd` (f32).
-fn proj_heads(x: &Array, lin: &Lin, heads: i32, hd: i32, norm: Option<&Array>) -> Result<Array> {
-    let b = x.shape()[0];
-    let s = x.shape()[1];
-    let y = lin
-        .forward(x)?
-        .reshape(&[b, s, heads, hd])?
-        .transpose_axes(&[0, 2, 1, 3])?;
-    match norm {
-        Some(w) => Ok(rms_norm(&y.as_dtype(Dtype::Float32)?, w, QK_RMS_EPS)?),
-        None => Ok(y.as_dtype(Dtype::Float32)?),
-    }
+/// Rotate an already-joined `[B, H, S, hd]` stream — the second half of knob 8's concat-then-RoPE.
+fn rotate_joint(x: &Array, rope: &RopeTable) -> Result<Array> {
+    qkv::apply_rope(
+        x,
+        RopeTables::new(&rope.cos, &rope.sin),
+        RopeStyle::AdjacentPair,
+        RotationAxes::HeadMajor,
+        None,
+        RopeDtype::Promoted,
+    )
 }
 
 /// Scaled-dot-product attention over `[B,H,S,hd]` → `[B,S,inner]`. `mask` is the additive `[B,1,S,S]`
@@ -326,19 +339,33 @@ impl DoubleAttn {
         mask: Option<&Array>,
         attention: AttentionPlan<'_>,
     ) -> Result<(Array, Array)> {
-        let (h, hd) = (self.heads, self.head_dim);
-        let q = proj_heads(hidden, &self.to_q, h, hd, Some(&self.norm_q))?;
-        let k = proj_heads(hidden, &self.to_k, h, hd, Some(&self.norm_k))?;
-        let v = proj_heads(hidden, &self.to_v, h, hd, None)?;
-        let eq = proj_heads(encoder, &self.add_q, h, hd, Some(&self.norm_added_q))?;
-        let ek = proj_heads(encoder, &self.add_k, h, hd, Some(&self.norm_added_k))?;
-        let ev = proj_heads(encoder, &self.add_v, h, hd, None)?;
-        let q = concatenate_axis(&[&eq, &q], 2)?;
-        let k = concatenate_axis(&[&ek, &k], 2)?;
-        let v = concatenate_axis(&[&ev, &v], 2)?;
-        let q = apply_rope_one(&q, rope)?;
-        let k = apply_rope_one(&k, rope)?;
-        let out = sdpa(&q, &k, &v, hd, mask, attention)?; // [B, S, inner]
+        let hd = self.head_dim;
+        // SC-18319 — **knob 8's concat-then-RoPE arm**, and the reason that knob exists. Chroma joins
+        // `[text, image]` FIRST (knob 11) and rotates the joint sequence with one table, where FLUX.1
+        // rotates each stream and then concatenates. Both are expressed as a call-order choice over
+        // the same two primitives: `prepare` with `RopeStyle::None`, then `join`, then `apply_rope`.
+        let spec = chroma_spec(self.heads, hd, &self.norm_q, &self.norm_k, None);
+        let img = qkv::prepare(
+            QkvSource::Separate {
+                q: &self.to_q.forward(hidden)?,
+                k: &self.to_k.forward(hidden)?,
+                v: &self.to_v.forward(hidden)?,
+            },
+            &spec,
+        )?;
+        let txt_spec = chroma_spec(self.heads, hd, &self.norm_added_q, &self.norm_added_k, None);
+        let txt = qkv::prepare(
+            QkvSource::Separate {
+                q: &self.add_q.forward(encoder)?,
+                k: &self.add_k.forward(encoder)?,
+                v: &self.add_v.forward(encoder)?,
+            },
+            &txt_spec,
+        )?;
+        let joint = StreamOrder::TextFirst.join(&img, &txt)?;
+        let q = rotate_joint(&joint.q, rope)?;
+        let k = rotate_joint(&joint.k, rope)?;
+        let out = sdpa(&q, &k, &joint.v, hd, mask, attention)?; // [B, S, inner]
         let st = encoder.shape()[1];
         let txt = seq_slice(&out, 0, st)?;
         let img = seq_slice(&out, st, hidden.shape()[1])?;
@@ -577,11 +604,24 @@ impl SingleAttn {
         mask: Option<&Array>,
         attention: AttentionPlan<'_>,
     ) -> Result<Array> {
-        let (h, hd) = (self.heads, self.head_dim);
-        let q = apply_rope_one(&proj_heads(x, &self.to_q, h, hd, Some(&self.norm_q))?, rope)?;
-        let k = apply_rope_one(&proj_heads(x, &self.to_k, h, hd, Some(&self.norm_k))?, rope)?;
-        let v = proj_heads(x, &self.to_v, h, hd, None)?;
-        sdpa(&q, &k, &v, hd, mask, attention)
+        // SC-18319 — the shared prologue. Chroma's knob selection: separate q/k/v (knob 9), per-head
+        // QK-RMSNorm computed in f32 with the whole stream (including `v`) promoted, adjacent-pair
+        // rotation (knob 2) applied head-major, and a shared q/k table (knob 6 off).
+        let heads = qkv::prepare(
+            QkvSource::Separate {
+                q: &self.to_q.forward(x)?,
+                k: &self.to_k.forward(x)?,
+                v: &self.to_v.forward(x)?,
+            },
+            &chroma_spec(
+                self.heads,
+                self.head_dim,
+                &self.norm_q,
+                &self.norm_k,
+                Some(rope),
+            ),
+        )?;
+        sdpa(&heads.q, &heads.k, &heads.v, self.head_dim, mask, attention)
     }
 
     fn quantize(&mut self, bits: i32) -> Result<()> {

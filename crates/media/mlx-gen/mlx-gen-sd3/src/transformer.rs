@@ -58,13 +58,16 @@
 //! forward feeds `quantized_matmul` f32 inputs.
 
 use mlx_rs::error::{Exception, Result as MlxResult};
-use mlx_rs::fast::{layer_norm, rms_norm, scaled_dot_product_attention};
-use mlx_rs::ops::{concatenate_axis, split};
+use mlx_rs::fast::{layer_norm, scaled_dot_product_attention};
+use mlx_rs::ops::split;
 use mlx_rs::transforms::checkpoint;
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear, Adapter};
 use mlx_gen::nn::{conv2d, gelu_tanh, modulate, silu, timestep_sincos};
+use mlx_gen::qkv::{
+    self, AttnPrepSpec, QkNormSpec, QkvHeads, QkvSource, RotationAxes, StreamOrder,
+};
 use mlx_gen::train::lora::LoraParams;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
@@ -113,19 +116,22 @@ fn process_qkv(
     norm_k: &Array,
     heads: i32,
     head_dim: i32,
-) -> Result<(Array, Array, Array)> {
-    let sh = x.shape();
-    let (b, s) = (sh[0], sh[1]);
-    let to_bhsd = |a: Array| -> Result<Array> {
-        Ok(a.reshape(&[b, s, heads, head_dim])?
-            .transpose_axes(&[0, 2, 1, 3])?)
-    };
-    let q = to_bhsd(q_w.forward(x)?)?;
-    let k = to_bhsd(k_w.forward(x)?)?;
-    let v = to_bhsd(v_w.forward(x)?)?;
-    let q = rms_norm(&q, norm_q, RMS_EPS)?;
-    let k = rms_norm(&k, norm_k, RMS_EPS)?;
-    Ok((q, k, v))
+) -> Result<QkvHeads> {
+    // SC-18319 — the shared prologue. SD3's knob selection is the sparsest in the tree: separate
+    // q/k/v (knob 9), per-head q/k RMSNorm over `head_dim` (knob 1), **no RoPE at all** (knob 7 —
+    // SD3 is position-embedded at the patch embedder, not in attention), head-major axes, and an
+    // `[img, txt]` join (knob 11) at the call site.
+    let spec = AttnPrepSpec::new(heads, head_dim)
+        .with_qk_norm(QkNormSpec::per_head(norm_q, norm_k, RMS_EPS))
+        .with_rotation_axes(RotationAxes::HeadMajor);
+    qkv::prepare(
+        QkvSource::Separate {
+            q: &q_w.forward(x)?,
+            k: &k_w.forward(x)?,
+            v: &v_w.forward(x)?,
+        },
+        &spec,
+    )
 }
 
 /// SDPA over `[B,H,S,D] → [B,S,H·D]` (no mask; full bidirectional attention over the joint sequence).
@@ -273,7 +279,7 @@ impl JointAttention {
         txt: &Array,
         plan: mlx_gen::attention::AttentionPlan<'_>,
     ) -> Result<(Array, Option<Array>)> {
-        let (iq, ik, iv) = process_qkv(
+        let image = process_qkv(
             img,
             &self.to_q,
             &self.to_k,
@@ -283,7 +289,7 @@ impl JointAttention {
             self.heads,
             self.head_dim,
         )?;
-        let (tq, tk, tv) = process_qkv(
+        let text = process_qkv(
             txt,
             &self.add_q,
             &self.add_k,
@@ -294,10 +300,15 @@ impl JointAttention {
             self.head_dim,
         )?;
         // [img, txt] order along the sequence (axis 2 in BHSD) — diffusers `cat([sample, context])`.
-        let q = concatenate_axis(&[&iq, &tq], 2)?;
-        let k = concatenate_axis(&[&ik, &tk], 2)?;
-        let v = concatenate_axis(&[&iv, &tv], 2)?;
-        let o = attention(&q, &k, &v, self.head_dim, self.sdpa_checkpoint, plan)?;
+        let joint = StreamOrder::ImageFirst.join(&image, &text)?;
+        let o = attention(
+            &joint.q,
+            &joint.k,
+            &joint.v,
+            self.head_dim,
+            self.sdpa_checkpoint,
+            plan,
+        )?;
 
         // The joint output is `[img ; txt]` concatenated along the sequence (axis 1). The two halves
         // are contiguous, so a single `split_axis` at the image/text boundary reproduces exactly the
@@ -423,7 +434,7 @@ impl SelfAttention {
 
     /// Image-stream self-attention over `x [B,S,H·D]` → `[B,S,H·D]`.
     fn forward(&self, x: &Array, plan: mlx_gen::attention::AttentionPlan<'_>) -> Result<Array> {
-        let (q, k, v) = process_qkv(
+        let h = process_qkv(
             x,
             &self.to_q,
             &self.to_k,
@@ -433,7 +444,7 @@ impl SelfAttention {
             self.heads,
             self.head_dim,
         )?;
-        let o = attention(&q, &k, &v, self.head_dim, self.sdpa_checkpoint, plan)?;
+        let o = attention(&h.q, &h.k, &h.v, self.head_dim, self.sdpa_checkpoint, plan)?;
         self.to_out.forward(&o)
     }
 }

@@ -15,7 +15,8 @@ use mlx_rs::transforms::checkpoint;
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
-use mlx_gen::nn::{apply_text_rope, gelu_exact, TextRope, TokenEmbedding};
+use mlx_gen::nn::{gelu_exact, TextRope, TokenEmbedding};
+use mlx_gen::qkv::{self, AttnPrepSpec, QkNormSpec, QkvSource, RopeSpec, RopeStyle, RopeTables};
 use mlx_gen::weights::{join, Weights};
 use mlx_gen::Result;
 
@@ -81,32 +82,32 @@ impl Attention {
         q_rope: Rope,
         k_rope: Rope,
     ) -> Result<Array> {
-        let hsh = hidden.shape();
-        let (b, sq) = (hsh[0], hsh[1]);
         let kv_src = encoder.unwrap_or(hidden);
-        let sk = kv_src.shape()[1];
 
-        let q = self
-            .q_proj
-            .forward(hidden)?
-            .reshape(&[b, sq, self.heads, self.head_dim])?;
-        let k = self
-            .k_proj
-            .forward(kv_src)?
-            .reshape(&[b, sk, self.heads, self.head_dim])?;
-        let v = self
-            .v_proj
-            .forward(kv_src)?
-            .reshape(&[b, sk, self.heads, self.head_dim])?;
-
-        let q = rms_norm(&q, &self.q_norm, self.eps)?;
-        let k = rms_norm(&k, &self.k_norm, self.eps)?;
-        let q = apply_text_rope(&q, q_rope.0, q_rope.1)?;
-        let k = apply_text_rope(&k, k_rope.0, k_rope.1)?;
-
-        let q = q.transpose_axes(&[0, 2, 1, 3])?;
-        let k = k.transpose_axes(&[0, 2, 1, 3])?;
-        let v = v.transpose_axes(&[0, 2, 1, 3])?;
+        // SC-18319 — the shared prologue. The conditioner is **knob 6's reference case**: `q_rope`
+        // and `k_rope` are genuinely different position tables (cross-attention positions the query
+        // on the hidden stream and the key on the encoder stream), which is why the primitive takes
+        // per-stream tables rather than one shared table plus a flag. The rest: separate q/k/v
+        // (knob 9), per-head RMSNorm over `head_dim` after the head split (knob 1), half-split
+        // `rotate_half` rotation over full-width `[1, S, head_dim]` tables (knob 2 — `apply_text_rope`
+        // verbatim), token-major axes, single stream (knob 11 does not apply).
+        let spec = AttnPrepSpec::new(self.heads, self.head_dim)
+            .with_qk_norm(QkNormSpec::per_head(&self.q_norm, &self.k_norm, self.eps))
+            .with_rope(RopeSpec {
+                style: RopeStyle::RotateHalf,
+                q: Some(RopeTables::new(q_rope.0, q_rope.1)),
+                k: Some(RopeTables::new(k_rope.0, k_rope.1)),
+                ..RopeSpec::default()
+            });
+        let heads = qkv::prepare(
+            QkvSource::Separate {
+                q: &self.q_proj.forward(hidden)?,
+                k: &self.k_proj.forward(kv_src)?,
+                v: &self.v_proj.forward(kv_src)?,
+            },
+            &spec,
+        )?;
+        let (q, k, v) = (heads.q, heads.k, heads.v);
         let o = if self.ckpt_sdpa {
             // sc-10576: checkpoint the SDPA (q/k/v threaded, scale captured) — recompute the seq²
             // attention in the backward instead of retaining it. Numerically identical.
@@ -122,10 +123,7 @@ impl Attention {
         } else {
             scaled_dot_product_attention(&q, &k, &v, self.scale, None, None)?
         };
-        let o = o
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[b, sq, self.heads * self.head_dim])?;
-        self.o_proj.forward(&o)
+        self.o_proj.forward(&qkv::merge_heads(&o)?)
     }
 }
 
