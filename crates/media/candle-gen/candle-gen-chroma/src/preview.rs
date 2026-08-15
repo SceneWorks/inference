@@ -101,6 +101,7 @@ mod tests {
             tmp.path(),
             &Device::Cpu,
             None,
+            Vec::new(),
         );
         let sigmas = pipe.sigmas(6);
         assert_eq!(sigmas.len(), 7);

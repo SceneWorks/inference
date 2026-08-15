@@ -140,6 +140,7 @@ fn controlnet_curated_is_coherent_and_distinct() {
     let model = KolorsControl::load(&KolorsControlPaths {
         kolors_base: base,
         controlnet: cn,
+        adapters: Vec::new(),
     })
     .expect("load KolorsControl");
     let pose = synthetic_image();
@@ -183,6 +184,7 @@ fn ip_adapter_curated_is_coherent_and_distinct() {
     let mut model = IpAdapterKolors::load(&IpAdapterKolorsPaths {
         kolors_base: base,
         ip_adapter: ip,
+        adapters: Vec::new(),
     })
     .expect("load IpAdapterKolors");
     let reference = synthetic_image();

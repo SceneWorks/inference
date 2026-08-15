@@ -502,9 +502,9 @@ fn collecting_sink() -> (PreviewSink, Arc<Mutex<Vec<PreviewFrame>>>) {
 /// shared constant. The change is strictly tightening: Euler 0.30 → 0.421, Sprint 0.30 → 0.635,
 /// `heun` unchanged.
 ///
-/// `max_r_first` genuinely is shared, and stays shared: both routes are txt2img-only, so every strip
-/// starts at the flow / SCM prior. It is deliberately loose because a tight `r_first` bound would read
-/// a fit's own warm intercept as if it were resemblance.
+/// `max_r_first` genuinely is shared, and stays shared: both measured preview lanes are txt2img cases,
+/// so every captured strip starts at the flow / SCM prior. It is deliberately loose because a tight
+/// `r_first` bound would read a fit's own warm intercept as if it were resemblance.
 struct Develops {
     /// Floor under the measured final-frame correlation with the finished render.
     min_r_last: f64,
@@ -516,7 +516,7 @@ struct Develops {
     max_distance_ratio: f64,
 }
 
-/// The shared "did not start as the render" ceiling. Both SANA routes are txt2img-only.
+/// The shared "did not start as the render" ceiling for these two measured txt2img preview cases.
 const MAX_R_FIRST: f64 = 0.75;
 
 /// `sana_1600m` txt2img, 12 steps at 1024², true CFG 4.5, native flow-Euler over the static shift-3.0

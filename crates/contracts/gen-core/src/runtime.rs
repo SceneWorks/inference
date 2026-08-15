@@ -793,7 +793,7 @@ impl LoadSpec {
         self
     }
 
-    /// Bind packaged decode-quality rows to the artifact and source closure actually being loaded.
+    /// Bind packaged decode-quality rows to the artifact actually being loaded.
     pub fn with_decode_quality_runtime_identity(
         mut self,
         identity: MemoryDecodeQualityRuntimeIdentity,
@@ -818,12 +818,14 @@ impl LoadSpec {
     fn route_and_family_bound_decode_geometry_policies(
         &self,
     ) -> crate::Result<Vec<MemoryDecodeGeometryPolicy>> {
-        self.decode_quality_runtime_identity.as_ref().ok_or_else(|| {
-            crate::Error::Unsupported(
-                "decode-quality policies require independently resolved artifact and implementation identity"
-                    .to_owned(),
-            )
-        })?;
+        self.decode_quality_runtime_identity
+            .as_ref()
+            .ok_or_else(|| {
+                crate::Error::Unsupported(
+                    "decode-quality policies require an independently resolved artifact identity"
+                        .to_owned(),
+                )
+            })?;
         let route = self.resolved_route.as_deref().ok_or_else(|| {
             crate::Error::Unsupported(
                 "decode-quality policies require an exact caller-resolved route".to_owned(),
@@ -863,22 +865,22 @@ impl LoadSpec {
         &self,
         policies: &[MemoryDecodeGeometryPolicy],
     ) -> crate::Result<()> {
-        let identity = self.decode_quality_runtime_identity.as_ref().ok_or_else(|| {
-            crate::Error::Unsupported(
-                "decode-quality policies require independently resolved artifact and implementation identity"
-                    .to_owned(),
-            )
-        })?;
-        if let Some(foreign) = policies.iter().find(|policy| {
-            policy.artifact != identity.artifact
-                || policy.implementation_fingerprint != identity.implementation_fingerprint
-        }) {
+        let identity = self
+            .decode_quality_runtime_identity
+            .as_ref()
+            .ok_or_else(|| {
+                crate::Error::Unsupported(
+                    "decode-quality policies require an independently resolved artifact identity"
+                        .to_owned(),
+                )
+            })?;
+        if let Some(foreign) = policies
+            .iter()
+            .find(|policy| policy.artifact != identity.artifact)
+        {
             return Err(crate::Error::Unsupported(format!(
-                "decode-quality policy artifact/source identity {:?}/{} cannot authorize loaded identity {:?}/{}",
-                foreign.artifact,
-                foreign.implementation_fingerprint,
-                identity.artifact,
-                identity.implementation_fingerprint,
+                "decode-quality policy artifact identity {:?} cannot authorize loaded identity {:?}",
+                foreign.artifact, identity.artifact,
             )));
         }
         Ok(())
@@ -1769,6 +1771,98 @@ impl std::fmt::Debug for PreviewSink {
     }
 }
 
+/// The request-local outcome of optional prompt enhancement.
+///
+/// This is deliberately a small, tensor-free fact rather than a log convention. Consumers use it
+/// to distinguish a prompt that was actually rewritten from a safe fallback and from the identity
+/// path where enhancement was not requested.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PromptEnhancementOutcome {
+    /// The provider produced and consumed a non-empty rewritten prompt.
+    Enhanced,
+    /// Enhancement was requested, but the provider safely consumed the original prompt instead.
+    Fallback,
+    /// Enhancement was not requested; the effective prompt is the original prompt byte-for-byte.
+    Absent,
+}
+
+/// Engine-owned prompt provenance emitted for one generation request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PromptEnhancementReport {
+    pub outcome: PromptEnhancementOutcome,
+    /// The user-authored prompt passed into the request. Consumers retain this for replay/editing.
+    pub original_prompt: String,
+    /// The exact prompt encoded by the diffusion/video model.
+    pub effective_prompt: String,
+    /// Stable, non-sensitive reason code for a fallback. `None` for enhanced/absent outcomes.
+    pub fallback_reason: Option<String>,
+}
+
+impl PromptEnhancementReport {
+    pub fn absent(prompt: impl Into<String>) -> Self {
+        let prompt = prompt.into();
+        Self {
+            outcome: PromptEnhancementOutcome::Absent,
+            original_prompt: prompt.clone(),
+            effective_prompt: prompt,
+            fallback_reason: None,
+        }
+    }
+
+    pub fn enhanced(
+        original_prompt: impl Into<String>,
+        effective_prompt: impl Into<String>,
+    ) -> Self {
+        Self {
+            outcome: PromptEnhancementOutcome::Enhanced,
+            original_prompt: original_prompt.into(),
+            effective_prompt: effective_prompt.into(),
+            fallback_reason: None,
+        }
+    }
+
+    pub fn fallback(prompt: impl Into<String>, reason: impl Into<String>) -> Self {
+        let prompt = prompt.into();
+        Self {
+            outcome: PromptEnhancementOutcome::Fallback,
+            original_prompt: prompt.clone(),
+            effective_prompt: prompt,
+            fallback_reason: Some(reason.into()),
+        }
+    }
+}
+
+/// Synchronous request-local sink for [`PromptEnhancementReport`].
+///
+/// Like [`PreviewSink`], the inert default is free and an active consumer should forward the fact
+/// promptly. Supporting providers emit exactly one report before encoding the effective prompt.
+#[derive(Clone, Default)]
+pub struct PromptEnhancementSink(Option<Arc<dyn Fn(PromptEnhancementReport) + Send + Sync>>);
+
+impl PromptEnhancementSink {
+    pub fn new(sink: impl Fn(PromptEnhancementReport) + Send + Sync + 'static) -> Self {
+        Self(Some(Arc::new(sink)))
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.0.is_some()
+    }
+
+    pub fn emit(&self, report: PromptEnhancementReport) {
+        if let Some(sink) = &self.0 {
+            sink(report);
+        }
+    }
+}
+
+impl std::fmt::Debug for PromptEnhancementSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("PromptEnhancementSink")
+            .field(&self.is_active())
+            .finish()
+    }
+}
+
 /// A progress event streamed to the caller during a long `generate` / `apply`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Progress {
@@ -2654,6 +2748,32 @@ mod tests {
         assert_eq!(
             format!("{:?}", PreviewSink::new(|_| {})),
             "PreviewSink(true)"
+        );
+    }
+
+    #[test]
+    fn prompt_enhancement_sink_reports_typed_outcomes_through_a_clone() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let sink = PromptEnhancementSink::new(move |report| {
+            recorder.lock().unwrap().push(report);
+        });
+        sink.clone()
+            .emit(PromptEnhancementReport::enhanced("a cat", "a detailed cat"));
+        sink.emit(PromptEnhancementReport::fallback("a dog", "empty_output"));
+        sink.emit(PromptEnhancementReport::absent("unchanged bytes\n"));
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                PromptEnhancementReport::enhanced("a cat", "a detailed cat"),
+                PromptEnhancementReport::fallback("a dog", "empty_output"),
+                PromptEnhancementReport::absent("unchanged bytes\n"),
+            ]
+        );
+        assert_eq!(
+            format!("{:?}", PromptEnhancementSink::default()),
+            "PromptEnhancementSink(false)"
         );
     }
 }

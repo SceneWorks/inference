@@ -34,6 +34,27 @@ pub mod preprocess;
 pub mod resize;
 pub mod rope;
 
+/// The single VAE implementation used by SCAIL-2.
+pub type ProviderVae = mlx_gen_wan::WanVae;
+/// SCAIL-2's provider-facing geometry, derived from its concrete VAE assignment.
+pub const VAE_TILING: mlx_gen::tiling::VaeTiling = ProviderVae::VAE_TILING;
+
+/// Resolve SCAIL-2 VAE geometry by registered generator id.
+pub fn vae_tiling(provider_id: &str) -> Option<mlx_gen::tiling::VaeTiling> {
+    (provider_id == pipeline::MODEL_ID).then_some(VAE_TILING)
+}
+
+/// Resolve SCAIL-2's provider-owned conservative VAE decode working-set peak.
+pub fn conservative_video_decode_memory_profile(
+    provider_id: &str,
+    width: u32,
+    height: u32,
+    frames: u32,
+) -> Option<mlx_gen::VideoDecodeMemoryProfile> {
+    vae_tiling(provider_id)?;
+    mlx_gen_wan::conservative_video_decode_memory_profile_for_vae(VAE_TILING, width, height, frames)
+}
+
 pub use clip::{ClipVisionConfig, ScailClip};
 pub use config::Scail2Config;
 pub use convert::{quantize_scail2_dit, quantize_scail2_transformer};
@@ -66,5 +87,26 @@ mod explicit_registry_tests {
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
         assert_eq!(explicit, ["scail2_14b"]);
+    }
+
+    #[test]
+    fn provider_id_is_bound_to_the_wan_z16_geometry() {
+        assert_eq!(super::VAE_TILING, super::ProviderVae::VAE_TILING);
+        assert_eq!(super::VAE_TILING, mlx_gen::tiling::VaeTiling::WAN);
+        assert_eq!(super::preprocess::TEMPORAL_STRIDE, 4);
+        assert_eq!(super::generate::DIM_ALIGN, 32);
+        assert_eq!(
+            super::vae_tiling(super::pipeline::MODEL_ID),
+            Some(super::VAE_TILING)
+        );
+        assert_eq!(
+            super::conservative_video_decode_memory_profile(super::pipeline::MODEL_ID, 64, 64, 9)
+                .map(|profile| (
+                    profile.working_set_bytes(),
+                    profile.resident_decoder_bytes_included()
+                )),
+            Some((322_633_728, 0))
+        );
+        assert_eq!(super::vae_tiling("not_scail2"), None);
     }
 }

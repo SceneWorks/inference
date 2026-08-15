@@ -182,6 +182,30 @@ impl CuratedSetup {
             prior,
         })
     }
+
+    /// Img2img sibling of [`Self::new`]: slice the resolved sigma schedule to the strength-selected
+    /// tail, then seed the deterministic VAE mean as `x0 + noise * sigma_start`.
+    pub(crate) fn new_img2img(
+        scheduler: Option<&str>,
+        steps: usize,
+        strength: f32,
+        noise: &Tensor,
+        init: &Tensor,
+    ) -> Result<Self> {
+        let sched = kolors_alpha_schedule()?;
+        let model_sampling = DiscreteModelSampling::sdxl(&sched);
+        let native = schedule_sigmas(Scheduler::Normal, &model_sampling, steps);
+        let full = candle_gen::resolve_schedule(scheduler, &model_sampling, steps, &native);
+        let effective = ((steps as f32 * strength.clamp(0.0, 1.0)) as usize).min(steps);
+        let start = full.len().saturating_sub(1).saturating_sub(effective);
+        let sigmas = full[start..].to_vec();
+        let prior = (init + (noise * sigmas[0] as f64)?)?;
+        Ok(Self {
+            model_sampling,
+            sigmas,
+            prior,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -202,6 +226,29 @@ mod tests {
         assert!(err.to_string().contains("kolors ip-adapter"), "{err}");
         assert!(reject_zero_steps("kolors control", 1).is_ok());
         assert!(reject_zero_steps("kolors ip-adapter", 30).is_ok());
+    }
+
+    #[test]
+    fn curated_img2img_uses_the_strength_tail_and_clean_zero_strength_init() {
+        let noise =
+            Tensor::ones((1, 4, 2, 2), candle_gen::candle_core::DType::F32, &cpu()).unwrap();
+        let init =
+            Tensor::zeros((1, 4, 2, 2), candle_gen::candle_core::DType::F32, &cpu()).unwrap();
+        let half = CuratedSetup::new_img2img(None, 10, 0.5, &noise, &init).unwrap();
+        assert_eq!(half.sigmas.len(), 6);
+        let half_prior = half.prior.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!(half_prior.iter().all(|value| *value == half.sigmas[0]));
+
+        let zero = CuratedSetup::new_img2img(None, 10, 0.0, &noise, &init).unwrap();
+        assert_eq!(zero.sigmas, vec![0.0]);
+        assert!(zero
+            .prior
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .all(|value| *value == 0.0));
     }
 
     #[test]

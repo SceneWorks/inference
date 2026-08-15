@@ -328,7 +328,8 @@ pub(crate) struct Pipeline {
     pid_spec: Option<PidWeights>,
     /// External ComfyUI component sources (epic 10451 Phase 2, sc-10668). `Some` ⇒ `load_components`
     /// builds the DiT/TE/VAE from the in-place ComfyUI files (DiT + VAE key-remapped in memory)
-    /// instead of a diffusers snapshot dir. Dense-only: no packed tier, no adapters, no PiD.
+    /// instead of a diffusers snapshot dir. Integer-packed sources and PiD are unavailable; adapters
+    /// select the existing adaptable dense DiT.
     comfyui: Option<std::sync::Arc<crate::comfyui::ComfyuiSources>>,
 }
 
@@ -492,7 +493,8 @@ impl Pipeline {
     /// and VAE are key-remapped from the ComfyUI single-file components in memory and the Qwen3 encoder
     /// loads verbatim, all at first [`load_components`](Self::load_components). `root` is set to the
     /// sources' `tokenizer_dir` so [`common::build_tokenizer`] finds `tokenizer/tokenizer.json`. Does no
-    /// weight I/O here. Dense-only (no packed tier / adapters / PiD).
+    /// weight I/O here. Integer-packed sources remain unavailable; adapters install additively on the
+    /// remapped dense DiT, and a PiD overlay follows the retained `pid_spec`.
     pub(crate) fn load_comfyui_with_text_encoder(
         sources: std::sync::Arc<crate::comfyui::ComfyuiSources>,
         text_encoder_source: Option<gen_core::ValidatedEncoderSource>,
@@ -513,6 +515,11 @@ impl Pipeline {
             pid_spec,
             comfyui: Some(sources),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn adapter_specs(&self) -> &[AdapterSpec] {
+        &self.adapters
     }
 
     /// Load only the tokenizer + Qwen3 text encoder. This is the first sequential-residency phase and
@@ -791,6 +798,9 @@ impl Pipeline {
         sources: &crate::comfyui::ComfyuiSources,
         use_accelerated_attn: bool,
     ) -> Result<Components> {
+        // The component loaders below are ComfyUI-aware (`load_transformer_cancelable` remaps the
+        // native keys and installs the ordered adapter stack additively; `load_text_encoder_component`
+        // reads the ComfyUI TE map), so this delegates rather than re-implementing the remap inline.
         sources.ensure_unchanged()?;
         let text = self.load_text_phase()?;
         let transformer = self.load_transformer(use_accelerated_attn, false)?;
@@ -1799,6 +1809,91 @@ mod tests {
             .expect("request-time parse must reject the replaced tokenizer")
             .to_string();
         assert!(error.contains("pinned weights"), "{error}");
+    }
+
+    /// sc-18477: the ComfyUI route must retain the caller's adapter stack in EXACT order with each
+    /// scale and kind intact. `load_transformer_cancelable` installs them additively in this order,
+    /// so a reordering, a dropped scale, or a coerced kind silently renders a different image.
+    #[test]
+    fn comfyui_pipeline_preserves_ordered_adapter_stack() {
+        use candle_gen::gen_core::{AdapterKind, PinnedWeightsFile};
+
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        gen_core_testkit::write_encoder_contract_tokenizer_fixture(root, crate::ENCODER_CONTRACT)
+            .unwrap();
+        let transformer = root.join("transformer.safetensors");
+        let text_encoder = root.join("text_encoder.safetensors");
+        let vae = root.join("vae.safetensors");
+        for path in [&transformer, &text_encoder, &vae] {
+            std::fs::write(path, b"comfyui fixture").unwrap();
+        }
+        let sources = std::sync::Arc::new(
+            crate::comfyui::ComfyuiSources::separate(
+                PinnedWeightsFile::pin(&transformer).unwrap(),
+                Some(PinnedWeightsFile::pin(&text_encoder).unwrap()),
+                PinnedWeightsFile::pin(&vae).unwrap(),
+                root.to_path_buf(),
+            )
+            .unwrap(),
+        );
+        let tokenizer_source = crate::ENCODER_CONTRACT.tokenizer_for_base(root).unwrap();
+        let adapters = vec![
+            AdapterSpec::new(PathBuf::from("first.safetensors"), 0.25, AdapterKind::Lora),
+            AdapterSpec::new(PathBuf::from("second.safetensors"), 0.75, AdapterKind::Lokr),
+        ];
+
+        let pipeline = Pipeline::load_comfyui_with_text_encoder(
+            sources,
+            None,
+            tokenizer_source,
+            &Device::Cpu,
+            DType::F32,
+            &adapters,
+            None,
+        );
+        assert_eq!(pipeline.adapter_specs().len(), 2);
+        assert_eq!(pipeline.adapter_specs()[0].path, adapters[0].path);
+        assert_eq!(pipeline.adapter_specs()[0].scale, 0.25);
+        assert_eq!(pipeline.adapter_specs()[0].kind, AdapterKind::Lora);
+        assert_eq!(pipeline.adapter_specs()[1].path, adapters[1].path);
+        assert_eq!(pipeline.adapter_specs()[1].scale, 0.75);
+        assert_eq!(pipeline.adapter_specs()[1].kind, AdapterKind::Lokr);
+    }
+
+    #[test]
+    fn registered_reference_pipeline_preserves_adapter_stack_for_identity_init() {
+        use candle_gen::gen_core::AdapterKind;
+
+        let adapters = vec![AdapterSpec::new(
+            PathBuf::from("identity-style.safetensors"),
+            0.65,
+            AdapterKind::Lora,
+        )];
+        let pipeline = Pipeline::load(
+            Path::new("snapshot"),
+            &Device::Cpu,
+            DType::F32,
+            &adapters,
+            None,
+        );
+        let request = GenerationRequest {
+            prompt: "same person in a new setting".into(),
+            conditioning: vec![Conditioning::Reference {
+                image: Image::default(),
+                strength: Some(0.7),
+            }],
+            ..Default::default()
+        };
+
+        let (_, strength) = resolve_reference(&request)
+            .expect("registered Reference conditioning must resolve")
+            .expect("identity init carries one reference");
+        assert_eq!(strength, Some(0.7));
+        assert_eq!(pipeline.adapter_specs().len(), 1);
+        assert_eq!(pipeline.adapter_specs()[0].path, adapters[0].path);
+        assert_eq!(pipeline.adapter_specs()[0].scale, 0.65);
+        assert_eq!(pipeline.adapter_specs()[0].kind, AdapterKind::Lora);
     }
 
     #[test]

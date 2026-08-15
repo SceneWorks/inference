@@ -66,6 +66,48 @@ pub mod vision;
 pub mod vit_guidance;
 pub mod vit_preprocess;
 
+/// The single VAE implementation used by both Bernini generator ids.
+pub type ProviderVae = candle_gen_wan::vae16::WanVae16;
+/// Bernini's provider-facing geometry, derived from its concrete VAE assignment.
+pub const VAE_TILING: candle_gen::gen_core::tiling::VaeTiling = ProviderVae::VAE_TILING;
+
+/// Runtime latent geometry for either Bernini route, derived from the assigned VAE.
+pub(crate) fn latent_dims(frames: u32, width: u32, height: u32) -> (usize, usize, usize) {
+    let temporal_scale = VAE_TILING.temporal_scale as u32;
+    let spatial_scale = VAE_TILING.spatial_scale as u32;
+    let t_lat = if VAE_TILING.causal_temporal {
+        (frames - 1) / temporal_scale + 1
+    } else {
+        frames.div_ceil(temporal_scale)
+    };
+    (
+        t_lat as usize,
+        (height / spatial_scale) as usize,
+        (width / spatial_scale) as usize,
+    )
+}
+
+/// Resolve Bernini VAE geometry by registered generator id.
+pub fn vae_tiling(provider_id: &str) -> Option<candle_gen::gen_core::tiling::VaeTiling> {
+    matches!(provider_id, pipeline::MODEL_ID | bernini::MODEL_ID).then_some(VAE_TILING)
+}
+
+/// Resolve Bernini's provider-owned conservative VAE decode working-set peak.
+pub fn conservative_video_decode_memory_profile(
+    provider_id: &str,
+    width: u32,
+    height: u32,
+    frames: u32,
+) -> Option<candle_gen::VideoDecodeMemoryProfile> {
+    vae_tiling(provider_id)?;
+    candle_gen::VideoDecodeMemoryProfile::new(
+        candle_gen_wan::conservative_video_decode_peak_bytes_for_vae(
+            VAE_TILING, width, height, frames,
+        )?,
+        0,
+    )
+}
+
 pub use assembly::{concat_with_zero_init, format_mllm_inputs_embeds, pad_and_truncate};
 pub use bernini::{denoise_bernini_wvitcfg, BVitExpert, Bernini};
 pub use clip_diff::{DiffLossFm, FlowMatchScheduler};
@@ -121,5 +163,25 @@ mod explicit_registry_tests {
             .collect();
 
         assert_eq!(explicit, ["bernini_renderer", "bernini"]);
+    }
+
+    #[test]
+    fn provider_ids_are_bound_to_the_causal_wan_z16_geometry() {
+        assert_eq!(super::VAE_TILING, super::ProviderVae::VAE_TILING);
+        assert_eq!(super::VAE_TILING.full_res_channels, 96);
+        assert_eq!(super::latent_dims(9, 80, 64), (3, 8, 10));
+        for id in [super::pipeline::MODEL_ID, super::bernini::MODEL_ID] {
+            let mapped = super::vae_tiling(id).unwrap();
+            assert!(mapped.causal_temporal);
+            assert_eq!(mapped, super::VAE_TILING);
+            assert_eq!(
+                super::conservative_video_decode_memory_profile(id, 64, 64, 9).map(|profile| (
+                    profile.working_set_bytes(),
+                    profile.resident_decoder_bytes_included(),
+                )),
+                Some((265_830_400, 0))
+            );
+        }
+        assert_eq!(super::vae_tiling("not_bernini"), None);
     }
 }

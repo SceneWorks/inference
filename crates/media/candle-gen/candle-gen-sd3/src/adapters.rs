@@ -45,7 +45,9 @@ use candle_gen::candle_core::{DType, Tensor};
 use candle_gen::gen_core::weightsmeta as wmeta;
 use candle_gen::gen_core::{AdapterKind, AdapterSpec};
 use candle_gen::quant::LokrFactors;
-use candle_gen::train::lora::{reconstruct_lokr_delta, reconstruct_lora_delta, LoraAdapterMeta};
+use candle_gen::train::lora::{
+    parse_lokr_metadata, reconstruct_lokr_delta, reconstruct_lora_delta, LoraAdapterMeta,
+};
 // The shared adapter-merge skeleton (sc-8998 / F-018): the format-parsing + merge-report primitives
 // this crate previously hand-copied. The SD3.5-specific native→diffusers map + fused-QKV row-slice
 // target machinery (the hard part) stays local below.
@@ -378,16 +380,10 @@ fn merge_lokr_file(
     table: &BTreeMap<String, String>,
     report: &mut MergeReport,
 ) -> Result<()> {
-    let rank = af
-        .meta
-        .get("rank")
-        .and_then(|s| s.parse::<f32>().ok())
-        .unwrap_or(1.0);
-    let alpha = af
-        .meta
-        .get("alpha")
-        .and_then(|s| s.parse::<f32>().ok())
-        .unwrap_or(rank);
+    let (rank, alpha) = parse_lokr_metadata(
+        af.meta.get("rank").map(String::as_str),
+        af.meta.get("alpha").map(String::as_str),
+    )?;
 
     let mut modules: BTreeMap<String, BTreeMap<&'static str, Tensor>> = BTreeMap::new();
     for (key, t) in &af.tensors {
@@ -443,6 +439,13 @@ pub fn merge_adapters(
     let mut report = MergeReport::default();
     for spec in specs {
         let af = read_adapter(&spec.path)?;
+        if spec.kind == AdapterKind::Lokr && !af.declares_lokr() {
+            return Err(CandleError::Msg(format!(
+                "sd3: adapter {} declared LoKr but does not declare networkType=lokr",
+                spec.path.display()
+            )));
+        }
+        let before = report.merged;
         match spec.kind {
             AdapterKind::Lokr => merge_lokr_file(map, &af, spec.scale, &table, &mut report)?,
             AdapterKind::Lora => {
@@ -456,6 +459,12 @@ pub fn merge_adapters(
                 }
                 merge_lora_file(map, &af, spec.scale, &table, &mut report)?;
             }
+        }
+        if report.merged == before {
+            return Err(CandleError::Msg(format!(
+                "sd3: selected adapter {} matched no SD3 projection",
+                spec.path.display()
+            )));
         }
     }
     if report.merged == 0 {
@@ -613,16 +622,10 @@ fn resolve_lokr_file(
     pending: &mut BTreeMap<String, Vec<PendingLokr>>,
     skipped_keys: &mut usize,
 ) -> Result<()> {
-    let rank = af
-        .meta
-        .get("rank")
-        .and_then(|s| s.parse::<f32>().ok())
-        .unwrap_or(1.0);
-    let alpha = af
-        .meta
-        .get("alpha")
-        .and_then(|s| s.parse::<f32>().ok())
-        .unwrap_or(rank);
+    let (rank, alpha) = parse_lokr_metadata(
+        af.meta.get("rank").map(String::as_str),
+        af.meta.get("alpha").map(String::as_str),
+    )?;
     let full = (alpha as f64 / rank as f64) * scale as f64;
     let mut modules: BTreeMap<String, BTreeMap<&'static str, Tensor>> = BTreeMap::new();
     for (key, t) in &af.tensors {
@@ -674,6 +677,16 @@ fn resolve_lokr_file(
 /// **fused-QKV LoKr** are rejected with a pointer to the dense tier. Like [`merge_adapters`], a non-empty
 /// spec set that matches **no** target errors (never renders unadapted).
 pub fn install_additive(dit: &mut Sd3Transformer, specs: &[AdapterSpec]) -> Result<AdditiveReport> {
+    if specs.len() > 1 {
+        let mut total = AdditiveReport::default();
+        for spec in specs {
+            let report = install_additive(dit, std::slice::from_ref(spec))?;
+            total.applied += report.applied;
+            total.skipped_targets.extend(report.skipped_targets);
+            total.skipped_keys += report.skipped_keys;
+        }
+        return Ok(total);
+    }
     let mut report = AdditiveReport::default();
 
     // The kohya-diffusers `flattened → dotted` table, built from the DiT's own projection paths (all
@@ -694,6 +707,21 @@ pub fn install_additive(dit: &mut Sd3Transformer, specs: &[AdapterSpec]) -> Resu
 
     for spec in specs {
         let af = read_adapter(&spec.path)?;
+        match (spec.kind, af.declares_lokr()) {
+            (AdapterKind::Lora, true) => {
+                return Err(CandleError::Msg(format!(
+                    "sd3: adapter {} declared LoRA but its metadata says networkType=lokr",
+                    spec.path.display()
+                )))
+            }
+            (AdapterKind::Lokr, false) => {
+                return Err(CandleError::Msg(format!(
+                    "sd3: adapter {} declared LoKr but does not declare networkType=lokr",
+                    spec.path.display()
+                )))
+            }
+            _ => {}
+        }
         if wmeta::keys_contain_loha(af.tensors.keys().map(String::as_str)) {
             return Err(CandleError::Msg(format!(
                 "sd3: a LoHa adapter cannot apply on a packed (q4/q8) tier — its Hadamard product has no \
@@ -714,7 +742,7 @@ pub fn install_additive(dit: &mut Sd3Transformer, specs: &[AdapterSpec]) -> Resu
                 spec.path.display()
             )));
         }
-        if spec.kind == AdapterKind::Lokr || af.declares_lokr() {
+        if spec.kind == AdapterKind::Lokr {
             resolve_lokr_file(
                 &af,
                 spec.scale,
@@ -878,6 +906,41 @@ mod tests {
             Tensor::zeros((4, 16, 2, 2), DType::BF16, &dev).unwrap(),
         );
         m
+    }
+
+    #[test]
+    fn dense_stack_rejects_a_later_zero_match_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let valid = tmp.path().join("valid.safetensors");
+        let missing = tmp.path().join("missing.safetensors");
+        for (file, target) in [
+            (&valid, "transformer_blocks.0.attn.to_q"),
+            (&missing, "transformer_blocks.99.attn.to_q"),
+        ] {
+            cst::save(
+                &HashMap::from([
+                    (
+                        format!("{target}.lora_A.weight"),
+                        t2(&[1.0, 0.0, 0.0, 0.0], 1, 4),
+                    ),
+                    (
+                        format!("{target}.lora_B.weight"),
+                        t2(&[1.0, 0.0, 0.0, 0.0], 4, 1),
+                    ),
+                ]),
+                file,
+            )
+            .unwrap();
+        }
+        let error = merge_adapters(
+            &mut base_map(),
+            &[
+                AdapterSpec::new(valid, 1.0, AdapterKind::Lora),
+                AdapterSpec::new(missing.clone(), 1.0, AdapterKind::Lora),
+            ],
+        )
+        .expect_err("a valid first file must not hide a later dense zero-match");
+        assert!(error.to_string().contains(&missing.display().to_string()));
     }
 
     /// The native `lora_sd3` names map to the diffusers port paths — including the fused `attn_qkv`
@@ -1136,7 +1199,7 @@ mod tests {
         let Err(e) = res else {
             panic!("text-encoder-only adapter must error (nothing merged)")
         };
-        assert!(e.to_string().contains("no adapter target modules matched"));
+        assert!(e.to_string().contains("matched no SD3 projection"));
     }
 
     /// **AC: scale-0 merge is byte-exact with the base.** A fused-QKV LoRA folded at `scale = 0` adds a

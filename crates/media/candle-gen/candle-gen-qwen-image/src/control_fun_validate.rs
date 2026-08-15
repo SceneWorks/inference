@@ -43,6 +43,7 @@ fn real_weight_fun_control() {
         qwen_base: env_path("QWEN_FUN_BASE"),
         text_encoder: None,
         controlnet: env_path("QWEN_FUN_NET"),
+        adapters: Vec::new(),
     };
     let hint = read_ppm(&env_path("QWEN_FUN_HINT"));
     println!(
@@ -76,6 +77,33 @@ fn real_weight_fun_control() {
         .expect("generate (control)");
     println!("[control] {:?}", t.elapsed());
     write_ppm(&out_dir.join("qwen_fun_control.ppm"), &out_ctrl);
+    if let Some(adapter) = std::env::var_os("QWEN_FUN_LORA") {
+        drop(model);
+        let adapted = QwenFunControl::load(&QwenFunControlPaths {
+            qwen_base: env_path("QWEN_FUN_BASE"),
+            text_encoder: None,
+            controlnet: env_path("QWEN_FUN_NET"),
+            adapters: vec![candle_gen::gen_core::AdapterSpec::new(
+                adapter.into(),
+                1.0,
+                candle_gen::gen_core::AdapterKind::Lora,
+            )],
+        })
+        .expect("load adapter-conditioned Qwen strict control");
+        let with_adapter = adapted
+            .generate(&base, &hint, &mut noop)
+            .expect("generate (control + LoRA)");
+        assert_eq!(
+            (with_adapter.width, with_adapter.height),
+            (out_ctrl.width, out_ctrl.height)
+        );
+        assert_ne!(
+            with_adapter.pixels, out_ctrl.pixels,
+            "selected Qwen control adapter must change output"
+        );
+        write_ppm(&out_dir.join("qwen_fun_control_lora.ppm"), &with_adapter);
+        return;
+    }
 
     // Without control (scale 0 → hints zeroed → plain txt2img at the same seed/prompt).
     let plain_req = QwenFunControlRequest {

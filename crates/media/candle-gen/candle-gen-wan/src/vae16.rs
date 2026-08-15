@@ -337,6 +337,17 @@ pub struct WanVae16 {
 }
 
 impl WanVae16 {
+    /// Geometry owned by the concrete causal z16 decoder.
+    ///
+    /// This deliberately differs from MLX's non-causal z16 temporal geometry while retaining the
+    /// same 96-channel full-resolution write bound.
+    pub const VAE_TILING: VaeTiling = VaeTiling {
+        spatial_scale: 8,
+        temporal_scale: 4,
+        causal_temporal: true,
+        full_res_channels: 96,
+    };
+
     /// Build a **decode-only** z16 VAE from a diffusers `vae/` snapshot (T2V — no I2V conditioning).
     pub fn new(cfg: &Vae16Config, vb: VarBuilder) -> Result<Self> {
         Self::build(cfg, vb, false)
@@ -476,8 +487,9 @@ impl WanVae16 {
     ///
     /// Shares the pure [`gen_core::tiling`](candle_gen::gen_core::tiling) geometry + the seam-free
     /// blend/stitch DRIVER ([`vae_tiling::decode_tiled`]) with the z48/LTX halves, but with the **z16**
-    /// geometry (`WAN_Z16`: ×8 spatial — not the z48's ×16 — ×4 **causal** temporal): each spatial tile
-    /// is decoded via the per-frame streaming `decode`, then trapezoidally blended into the full video.
+    /// geometry ([`Self::VAE_TILING`]: ×8 spatial — not the z48's ×16 — ×4 **causal** temporal): each
+    /// spatial tile is decoded via the per-frame streaming `decode`, then trapezoidally blended into
+    /// the full video.
     /// Because the z16 `MidAttn` is **global per-frame spatial attention**, a tile attends only within
     /// itself, so this is an *approximation* softened by the overlapping blend (seam-free ≈ PSNR ~35 dB,
     /// not bit-exact) — exactly the z48 tradeoff. Falls back to a single streaming `decode` when `cfg`
@@ -494,16 +506,16 @@ impl WanVae16 {
         cancel: &CancelFlag,
     ) -> CResult<Tensor> {
         // The tile/narrow/blend/slice-accumulate/normalize DRIVER is the shared
-        // `candle_gen::vae_tiling::decode_tiled`; what stays z16-specific is the `WAN_Z16` geometry and
-        // the per-frame-streaming `decode` closure. With a spatial-only `cfg`, `plan.t` is a single
-        // full-extent temporal tile, so each `decode` call streams the whole clip (temporal bound kept).
+        // `candle_gen::vae_tiling::decode_tiled`; what stays z16-specific is `Self::VAE_TILING` and the
+        // per-frame-streaming `decode` closure. With a spatial-only `cfg`, `plan.t` is a single full-
+        // extent temporal tile, so each `decode` call streams the whole clip (temporal bound kept).
         //
         // Each tile is decoded in the VAE's working dtype (bf16 on the A14B, sc-12818 — where the
         // per-tile im2col/conv activations, the decode's dominant transient, get the VRAM win), then
         // upcast to f32 so the shared seam-blend accumulates against its f32 trapezoidal mask (the
         // accumulator is small vs. the per-tile activations, so f32 there costs little and keeps the
         // stitch precise). A no-op cast on the f32 path.
-        vae_tiling::decode_tiled(WAN_Z16, "wan z16 vae", z, cfg, |tile| {
+        vae_tiling::decode_tiled(Self::VAE_TILING, "wan z16 vae", z, cfg, |tile| {
             Ok(self
                 .decode_with_cancel(tile, cancel)?
                 .to_dtype(DType::F32)?)
@@ -527,9 +539,9 @@ impl WanVae16 {
 
     pub fn decode_budgeted_with_cancel(&self, z: &Tensor, cancel: &CancelFlag) -> CResult<Tensor> {
         let (_b, _c, f, h, w) = z.dims5()?;
-        let out_f = 1 + (f as i32 - 1) * WAN_Z16.temporal_scale; // causal ×4
-        let out_h = h as i32 * WAN_Z16.spatial_scale; // ×8
-        let out_w = w as i32 * WAN_Z16.spatial_scale;
+        let out_f = 1 + (f as i32 - 1) * Self::VAE_TILING.temporal_scale; // causal ×4
+        let out_h = h as i32 * Self::VAE_TILING.spatial_scale; // ×8
+        let out_w = w as i32 * Self::VAE_TILING.spatial_scale;
         match auto_tiling_budgeted_wan_z16(out_h, out_w, out_f)? {
             Some(cfg) => self.decode_tiled_with_cancel(z, &cfg, cancel),
             None => self.decode_with_cancel(z, cancel),
@@ -649,13 +661,6 @@ impl WanVae16 {
 /// preset and is **non-causal** (`out_f = f·4`) — the candle decode is causal, so the plan's `out_f`
 /// must match `decode`'s frame count. Kept local (not a new `gen_core` preset) to keep this the z16's
 /// own path with zero blast radius on the shared contract.
-const WAN_Z16: VaeTiling = VaeTiling {
-    spatial_scale: 8,
-    temporal_scale: 4,
-    causal_temporal: true,
-    full_res_channels: 96,
-};
-
 const GIB_F64: f64 = 1024.0 * 1024.0 * 1024.0;
 /// Env override read by the shared [`vae_tiling::free_aware_safe_budget_gib`] resolver — the SAME
 /// deterministic injection point as the z48 tiler (only one Wan VAE runs per process), per sc-12758.
@@ -687,8 +692,8 @@ const WAN_Z16_VAE_DEFAULT_BUDGET_GIB: f64 = 16.0;
 // (over-predicting) side (ratios 1.14× / 1.14× / 1.86× for single / 512 / 256) so the selector never OKs
 // a tile / single-pass that OOMs. Over-prediction also serves the "fit as small as we can go" directive
 // (it errs toward smaller tiles). Re-run the sweep after a decoder or candle-allocator change.
-const WAN_Z16_VAE_ACCUM_BYTES_PER_VOXEL: f64 = 100.0;
-const WAN_Z16_VAE_FRAME_BYTES_PER_OUT_PX: f64 = 64_000.0;
+const WAN_Z16_VAE_ACCUM_BYTES_PER_VOXEL: u64 = 100;
+const WAN_Z16_VAE_FRAME_BYTES_PER_OUT_PX: u64 = 64_000;
 
 /// Candidate spatial tile sizes (output px, multiples of the z16 ×8 scale, overlap 64). Coarser at the
 /// top (fewer tiles = faster) down to a 192 px floor (past which per-tile decoder overhead amortizes
@@ -780,8 +785,24 @@ fn estimated_wan_z16_decode_peak_gib(
 ) -> f64 {
     let out_voxels = (out_f * out_h * out_w) as f64;
     let frame_px = (tile_h * tile_w) as f64;
-    (WAN_Z16_VAE_ACCUM_BYTES_PER_VOXEL * out_voxels + WAN_Z16_VAE_FRAME_BYTES_PER_OUT_PX * frame_px)
+    (WAN_Z16_VAE_ACCUM_BYTES_PER_VOXEL as f64 * out_voxels
+        + WAN_Z16_VAE_FRAME_BYTES_PER_OUT_PX as f64 * frame_px)
         / GIB_F64
+}
+
+/// Conservative single-pass causal z16 VAE decode working-set peak in bytes.
+///
+/// This is the full-output case of the calibrated streaming cost function consumed by the actual
+/// budget planner. It excludes DiT and text-encoder composition weights.
+pub fn conservative_video_decode_peak_bytes(width: u32, height: u32, frames: u32) -> Option<u64> {
+    let frame_pixels = u64::from(width).checked_mul(u64::from(height))?;
+    let output_voxels = frame_pixels.checked_mul(u64::from(frames))?;
+    if output_voxels == 0 {
+        return None;
+    }
+    WAN_Z16_VAE_ACCUM_BYTES_PER_VOXEL
+        .checked_mul(output_voxels)?
+        .checked_add(WAN_Z16_VAE_FRAME_BYTES_PER_OUT_PX.checked_mul(frame_pixels)?)
 }
 
 /// The safe peak-GiB budget for the z16 decode tiler — **free-aware** (sc-12734/sc-12758). The decode
@@ -829,7 +850,7 @@ fn plan_wan_z16_tiling(
     };
     let budget_plan = vae_tiling::plan_tiling(
         "wan z16 vae decode",
-        WAN_Z16,
+        WanVae16::VAE_TILING,
         height,
         width,
         out_frames,
@@ -846,6 +867,19 @@ fn plan_wan_z16_tiling(
 #[cfg(test)]
 mod budget_tests {
     use super::*;
+
+    #[test]
+    fn public_decode_peak_is_the_planners_full_output_case() {
+        assert_eq!(
+            conservative_video_decode_peak_bytes(64, 64, 9),
+            Some(265_830_400)
+        );
+        assert_eq!(conservative_video_decode_peak_bytes(64, 64, 0), None);
+        assert_eq!(
+            conservative_video_decode_peak_bytes(u32::MAX, u32::MAX, u32::MAX),
+            None
+        );
+    }
 
     #[test]
     fn wan_z16_tiling_single_pass_when_small() {

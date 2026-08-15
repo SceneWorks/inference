@@ -55,10 +55,13 @@ The harness deliberately does **not** edit the vendored source to run offline. T
 rebound from `scripts/reference/mmaudio_reference.py` instead, so the `diff -r` above stays empty:
 
 * `FeaturesUtils.__init__` would build the CLIP tower via
-  `create_model_from_pretrained('hf-hub:apple/DFN5B-CLIP-ViT-H-14-384')`. The harness constructs
-  `FeaturesUtils(enable_conditions=False)` and attaches a tower built from the explicit snapshot's
-  own `open_clip_config.json` + `open_clip_pytorch_model.bin`, then applies the reference's own
-  `patch_clip`.
+  `create_model_from_pretrained('hf-hub:apple/DFN5B-CLIP-ViT-H-14-384')`. That literal is a
+  historical upstream alias and remains untouched here so this tree stays byte-for-byte vendored;
+  the canonical repository is `apple/DFN5B-CLIP-ViT-H-14-378`. MMAudio nevertheless feeds 384px,
+  and patch 14 with stride 14 produces the same 27×27 grid at native 378px and at 384px. The harness
+  constructs `FeaturesUtils(enable_conditions=False)` and attaches a tower built from the explicit
+  canonical snapshot's own `open_clip_config.json` + `open_clip_pytorch_model.bin`, then applies the
+  reference's own `patch_clip`.
 * `AutoEncoderModule` would build the 44.1 kHz vocoder via
   `BigVGANv2.from_pretrained('nvidia/bigvgan_v2_44khz_128band_512x')`. The harness rebinds that
   classmethod to read the explicit snapshot directory, which upstream's `_from_pretrained` already

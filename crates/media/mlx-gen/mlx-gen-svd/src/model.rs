@@ -100,7 +100,9 @@ pub fn descriptor() -> ModelDescriptor {
             requires_sigma_shift: false,
             // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
             supports_sequential_offload: false,
+            unconditionally_engages_staged_residency: false,
             supports_preview: false,
+            supports_prompt_enhancement: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,

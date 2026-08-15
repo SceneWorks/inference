@@ -51,10 +51,362 @@ const NORM_EPS: f32 = 1e-24;
 /// vae22 fixed structure (dim_mult [1,2,4,4], 2 res-blocks/stage).
 const DIM_MULT_LEN: usize = 4;
 const NUM_RES_BLOCKS: usize = 2;
+const DIM_MULT: [usize; DIM_MULT_LEN] = [1, 2, 4, 4];
+const PRODUCTION_DEC_DIM: usize = 256;
+const PRODUCTION_ENC_DIM: usize = 160;
+const PRODUCTION_Z_DIM: usize = 48;
 /// Decoder temporal-upsample per stage (`upsample3d` vs `upsample2d`).
 const TEMPORAL_UPSAMPLE: [bool; 3] = [true, true, false];
 /// Encoder temporal-downsample per stage (`downsample3d` vs `downsample2d`).
 const TEMPORAL_DOWNSAMPLE: [bool; 3] = [false, true, true];
+
+/// One tensor consumed by the fixed Wan2.2 z48 VAE loader topology.
+///
+/// This is intentionally generated from the same stage widths/counts used by [`Wan22Vae`]'s
+/// constructors rather than maintained as a second flat checkpoint-key list. Header-only callers
+/// use it to prove a converted checkpoint is load-exact before publishing asset residency.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Wan22TensorSpec {
+    pub(crate) name: String,
+    pub(crate) shape: Vec<usize>,
+}
+
+/// The loader-owned decoder/encoder tensor topology for one Wan2.2 VAE width configuration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Wan22WeightSchema {
+    pub(crate) decoder: Vec<Wan22TensorSpec>,
+    pub(crate) encoder: Vec<Wan22TensorSpec>,
+}
+
+impl Wan22WeightSchema {
+    pub(crate) fn tensors(&self) -> impl Iterator<Item = &Wan22TensorSpec> {
+        self.decoder.iter().chain(self.encoder.iter())
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Wan22Topology {
+    dec_dim: usize,
+    enc_dim: usize,
+    z_dim: usize,
+}
+
+impl Wan22Topology {
+    fn from_i32(dec_dim: i32, enc_dim: i32, z_dim: i32) -> Result<Self> {
+        let positive = |label: &str, value: i32| {
+            usize::try_from(value)
+                .ok()
+                .filter(|&value| value > 0)
+                .ok_or_else(|| Error::Msg(format!("vae22: {label} must be positive, got {value}")))
+        };
+        Ok(Self {
+            dec_dim: positive("decoder width", dec_dim)?,
+            enc_dim: positive("encoder width", enc_dim)?,
+            z_dim: positive("latent width", z_dim)?,
+        })
+    }
+
+    fn production() -> Self {
+        Self {
+            dec_dim: PRODUCTION_DEC_DIM,
+            enc_dim: PRODUCTION_ENC_DIM,
+            z_dim: PRODUCTION_Z_DIM,
+        }
+    }
+
+    fn decoder_stage_dims(self) -> [usize; DIM_MULT_LEN + 1] {
+        [
+            self.dec_dim * DIM_MULT[DIM_MULT_LEN - 1],
+            self.dec_dim * DIM_MULT[3],
+            self.dec_dim * DIM_MULT[2],
+            self.dec_dim * DIM_MULT[1],
+            self.dec_dim * DIM_MULT[0],
+        ]
+    }
+
+    fn encoder_stage_dims(self) -> [usize; DIM_MULT_LEN + 1] {
+        [
+            self.enc_dim,
+            self.enc_dim * DIM_MULT[0],
+            self.enc_dim * DIM_MULT[1],
+            self.enc_dim * DIM_MULT[2],
+            self.enc_dim * DIM_MULT[3],
+        ]
+    }
+
+    fn schema(self) -> Wan22WeightSchema {
+        let mut decoder = Vec::new();
+        push_conv3d(&mut decoder, "conv2", self.z_dim, self.z_dim, 1, 1, 1);
+
+        let decoder_dims = self.decoder_stage_dims();
+        let decoder_middle = decoder_dims[0];
+        push_conv3d(
+            &mut decoder,
+            "decoder.conv1",
+            decoder_middle,
+            self.z_dim,
+            3,
+            3,
+            3,
+        );
+        push_residual(
+            &mut decoder,
+            "decoder.middle.0",
+            decoder_middle,
+            decoder_middle,
+        );
+        push_attention(&mut decoder, "decoder.middle.1", decoder_middle);
+        push_residual(
+            &mut decoder,
+            "decoder.middle.2",
+            decoder_middle,
+            decoder_middle,
+        );
+        for stage in 0..DIM_MULT_LEN {
+            let input = decoder_dims[stage];
+            let output = decoder_dims[stage + 1];
+            let prefix = format!("decoder.upsamples.{stage}");
+            for block in 0..=NUM_RES_BLOCKS {
+                push_residual(
+                    &mut decoder,
+                    &format!("{prefix}.upsamples.{block}"),
+                    if block == 0 { input } else { output },
+                    output,
+                );
+            }
+            if stage != DIM_MULT_LEN - 1 {
+                let resample = format!("{prefix}.upsamples.{}", NUM_RES_BLOCKS + 1);
+                if TEMPORAL_UPSAMPLE.get(stage).copied().unwrap_or(false) {
+                    push_conv3d(
+                        &mut decoder,
+                        &format!("{resample}.time_conv"),
+                        output * 2,
+                        output,
+                        3,
+                        1,
+                        1,
+                    );
+                }
+                push_conv2d(&mut decoder, &resample, "resample", output, output, 3, 3);
+            }
+        }
+        push_head(&mut decoder, "decoder.head", decoder_dims[DIM_MULT_LEN], 12);
+
+        // `convert_ti2v_5b` always emits the full encoder. The top-level `conv1` consumes the
+        // encoder head's 2*z moments after sampling; it is part of the encoder half even though its
+        // key is not under `encoder.*`.
+        let mut encoder = Vec::new();
+        push_conv3d(
+            &mut encoder,
+            "conv1",
+            self.z_dim * 2,
+            self.z_dim * 2,
+            1,
+            1,
+            1,
+        );
+        let encoder_dims = self.encoder_stage_dims();
+        push_conv3d(&mut encoder, "encoder.conv1", encoder_dims[0], 12, 3, 3, 3);
+        for stage in 0..DIM_MULT_LEN {
+            let input = encoder_dims[stage];
+            let output = encoder_dims[stage + 1];
+            let prefix = format!("encoder.downsamples.{stage}");
+            for block in 0..NUM_RES_BLOCKS {
+                push_residual(
+                    &mut encoder,
+                    &format!("{prefix}.downsamples.{block}"),
+                    if block == 0 { input } else { output },
+                    output,
+                );
+            }
+            if stage < DIM_MULT_LEN - 1 {
+                let resample = format!("{prefix}.downsamples.{NUM_RES_BLOCKS}");
+                push_conv2d(&mut encoder, &resample, "resample", output, output, 3, 3);
+                if TEMPORAL_DOWNSAMPLE.get(stage).copied().unwrap_or(false) {
+                    push_conv3d(
+                        &mut encoder,
+                        &format!("{resample}.time_conv"),
+                        output,
+                        output,
+                        3,
+                        1,
+                        1,
+                    );
+                }
+            }
+        }
+        let encoder_middle = encoder_dims[DIM_MULT_LEN];
+        push_residual(
+            &mut encoder,
+            "encoder.middle.0",
+            encoder_middle,
+            encoder_middle,
+        );
+        push_attention(&mut encoder, "encoder.middle.1", encoder_middle);
+        push_residual(
+            &mut encoder,
+            "encoder.middle.2",
+            encoder_middle,
+            encoder_middle,
+        );
+        push_head(&mut encoder, "encoder.head", encoder_middle, self.z_dim * 2);
+
+        Wan22WeightSchema { decoder, encoder }
+    }
+
+    fn validate_loaded_shapes(self, weights: &Weights, include_encoder: bool) -> Result<()> {
+        let schema = self.schema();
+        let specs = schema.decoder.iter().chain(
+            include_encoder
+                .then_some(schema.encoder.iter())
+                .into_iter()
+                .flatten(),
+        );
+        for spec in specs {
+            let value = weights.require(&spec.name)?;
+            let expected: Vec<i32> = spec
+                .shape
+                .iter()
+                .map(|&dimension| {
+                    i32::try_from(dimension).map_err(|_| {
+                        Error::Msg(format!(
+                            "vae22: tensor {} dimension {dimension} exceeds MLX i32 shape range",
+                            spec.name
+                        ))
+                    })
+                })
+                .collect::<Result<_>>()?;
+            if value.shape() != expected {
+                return Err(Error::Msg(format!(
+                    "vae22: tensor {} has shape {:?}, expected {:?}",
+                    spec.name,
+                    value.shape(),
+                    expected
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn push_tensor(tensors: &mut Vec<Wan22TensorSpec>, name: impl Into<String>, shape: &[usize]) {
+    tensors.push(Wan22TensorSpec {
+        name: name.into(),
+        shape: shape.to_vec(),
+    });
+}
+
+fn push_conv3d(
+    tensors: &mut Vec<Wan22TensorSpec>,
+    prefix: &str,
+    output: usize,
+    input: usize,
+    kt: usize,
+    kh: usize,
+    kw: usize,
+) {
+    push_tensor(
+        tensors,
+        format!("{prefix}.weight"),
+        &[output, kt, kh, kw, input],
+    );
+    push_tensor(tensors, format!("{prefix}.bias"), &[output]);
+}
+
+fn push_conv2d(
+    tensors: &mut Vec<Wan22TensorSpec>,
+    prefix: &str,
+    leaf: &str,
+    output: usize,
+    input: usize,
+    kh: usize,
+    kw: usize,
+) {
+    push_tensor(
+        tensors,
+        format!("{prefix}.{leaf}_weight"),
+        &[output, kh, kw, input],
+    );
+    push_tensor(tensors, format!("{prefix}.{leaf}_bias"), &[output]);
+}
+
+fn push_residual(tensors: &mut Vec<Wan22TensorSpec>, prefix: &str, input: usize, output: usize) {
+    push_tensor(
+        tensors,
+        format!("{prefix}.residual.layer_0.gamma"),
+        &[input],
+    );
+    push_conv3d(
+        tensors,
+        &format!("{prefix}.residual.layer_2"),
+        output,
+        input,
+        3,
+        3,
+        3,
+    );
+    push_tensor(
+        tensors,
+        format!("{prefix}.residual.layer_3.gamma"),
+        &[output],
+    );
+    push_conv3d(
+        tensors,
+        &format!("{prefix}.residual.layer_6"),
+        output,
+        output,
+        3,
+        3,
+        3,
+    );
+    if input != output {
+        push_conv3d(
+            tensors,
+            &format!("{prefix}.shortcut"),
+            output,
+            input,
+            1,
+            1,
+            1,
+        );
+    }
+}
+
+fn push_attention(tensors: &mut Vec<Wan22TensorSpec>, prefix: &str, channels: usize) {
+    push_tensor(tensors, format!("{prefix}.norm.gamma"), &[channels]);
+    push_tensor(
+        tensors,
+        format!("{prefix}.to_qkv_weight"),
+        &[channels * 3, 1, 1, channels],
+    );
+    push_tensor(tensors, format!("{prefix}.to_qkv_bias"), &[channels * 3]);
+    push_tensor(
+        tensors,
+        format!("{prefix}.proj_weight"),
+        &[channels, 1, 1, channels],
+    );
+    push_tensor(tensors, format!("{prefix}.proj_bias"), &[channels]);
+}
+
+fn push_head(tensors: &mut Vec<Wan22TensorSpec>, prefix: &str, input: usize, output: usize) {
+    push_tensor(tensors, format!("{prefix}.layer_0.gamma"), &[input]);
+    push_conv3d(
+        tensors,
+        &format!("{prefix}.layer_2"),
+        output,
+        input,
+        3,
+        3,
+        3,
+    );
+}
+
+/// Complete production schema emitted by [`crate::convert::convert_ti2v_5b`] and consumed by
+/// [`Wan22Vae::from_weights`]. Both decoder and encoder are required for that canonical converter
+/// identity even when a particular request is plain T2V.
+pub(crate) fn production_weight_schema() -> Wan22WeightSchema {
+    Wan22Topology::production().schema()
+}
 
 /// `x / max(‖x‖₂ over last axis, 1e-24) · √C · γ` — channel-L2 norm over the **last** axis (vae22's
 /// `RMS_norm`). `gamma` carries `C` elements and broadcasts on the last axis.
@@ -698,18 +1050,14 @@ struct Decoder3d {
 impl Decoder3d {
     /// `dec_dim` is the decoder base width (256 in production); the latent channel count rides on
     /// the `conv1` weight, so it isn't needed here.
-    fn from_weights(w: &Weights, dec_dim: i32) -> Result<Self> {
+    fn from_weights(w: &Weights, topology: Wan22Topology) -> Result<Self> {
         let p = "decoder";
-        // dims = [dec_dim*dim_mult[-1]] + [dec_dim*m for m in reversed([1,2,4,4])]
-        let dim_mult = [1, 2, 4, 4];
-        let mut dims = vec![dec_dim * dim_mult[DIM_MULT_LEN - 1]];
-        for &m in dim_mult.iter().rev() {
-            dims.push(dec_dim * m);
-        }
+        // The same widths generate the header-only schema used by memory admission.
+        let dims = topology.decoder_stage_dims();
         let mut upsamples = Vec::new();
         for i in 0..DIM_MULT_LEN {
-            let in_c = dims[i];
-            let out_c = dims[i + 1];
+            let in_c = dims[i] as i32;
+            let out_c = dims[i + 1] as i32;
             let temporal = TEMPORAL_UPSAMPLE.get(i).copied().unwrap_or(false);
             let up_flag = i != DIM_MULT_LEN - 1;
             upsamples.push(UpResBlock::from_weights(
@@ -759,19 +1107,15 @@ struct Encoder3d {
 
 impl Encoder3d {
     /// `enc_dim` is the encoder base width (160 in production), `z2` the head output (= z_dim·2).
-    fn from_weights(w: &Weights, enc_dim: i32) -> Result<Self> {
+    fn from_weights(w: &Weights, topology: Wan22Topology) -> Result<Self> {
         let p = "encoder";
-        let dim_mult = [1, 2, 4, 4];
-        // dims = [enc_dim*m for m in [1] + dim_mult] = [enc, enc, 2enc, 4enc, 4enc]
-        let mut dims = vec![enc_dim];
-        for &m in dim_mult.iter() {
-            dims.push(enc_dim * m);
-        }
+        // The same widths generate the header-only schema used by memory admission.
+        let dims = topology.encoder_stage_dims();
         let mut downsamples = Vec::new();
         let mut cache_slots = 1usize; // conv1
         for i in 0..DIM_MULT_LEN {
-            let in_c = dims[i];
-            let out_c = dims[i + 1];
+            let in_c = dims[i] as i32;
+            let out_c = dims[i + 1] as i32;
             let temporal = TEMPORAL_DOWNSAMPLE.get(i).copied().unwrap_or(false);
             let down_flag = i < DIM_MULT_LEN - 1;
             let stage = DownResBlock::from_weights(
@@ -908,10 +1252,13 @@ impl LatentDecoder for Wan22VideoDecoder<'_> {
 }
 
 impl Wan22Vae {
+    /// Geometry owned by the concrete causal z48 decoder.
+    pub const VAE_TILING: VaeTiling = VaeTiling::WAN22;
+
     /// Build from a weight map (`convert`-sanitized channels-last keys). Structure is fixed by the
     /// vae22 config; channel widths ride on the weights, so the same builder serves production (enc
-    /// 160 / dec 256) and the tiny parity fixture. The encoder is loaded only if its weights are
-    /// present (`encoder.conv1.weight`).
+    /// 160 / dec 256) and the tiny parity fixture. The encoder remains optional for decode-only
+    /// callers, but any top-level `conv1.*` or `encoder.*` leaf requires its complete topology.
     pub fn from_weights(w: &Weights) -> Result<Self> {
         Self::from_weights_dims(w, 256, 160, 48)
     }
@@ -919,18 +1266,26 @@ impl Wan22Vae {
     /// Build with explicit base widths + latent dim (the fixture uses tiny widths; `z_dim` stays 48
     /// in production so `VAE22_MEAN`/`STD` apply — a smaller `z_dim` fixture must inject its own).
     pub fn from_weights_dims(w: &Weights, dec_dim: i32, enc_dim: i32, z_dim: i32) -> Result<Self> {
+        let topology = Wan22Topology::from_i32(dec_dim, enc_dim, z_dim)?;
+        // Treat either the top-level encoder projection or any `encoder.*` leaf as the encoder
+        // discriminator. Once present, the complete encoder topology is required; a partially
+        // converted checkpoint must never build a deceptively decode-only VAE.
+        let has_encoder = w
+            .keys()
+            .any(|key| key == "conv1.weight" || key == "conv1.bias" || key.starts_with("encoder."));
+        topology.validate_loaded_shapes(w, has_encoder)?;
         let (mean, std) = Self::mean_std(w, z_dim)?;
-        let encoder = if w.get("encoder.conv1.weight").is_some() {
+        let encoder = if has_encoder {
             Some((
                 CausalConv3d22::from_weights(w, "conv1", 1, 0, 0, 0)?, // 1×1×1 pointwise
-                Encoder3d::from_weights(w, enc_dim)?,
+                Encoder3d::from_weights(w, topology)?,
             ))
         } else {
             None
         };
         Ok(Self {
             conv2: CausalConv3d22::from_weights(w, "conv2", 1, 0, 0, 0)?, // 1×1×1 pointwise
-            decoder: Decoder3d::from_weights(w, dec_dim)?,
+            decoder: Decoder3d::from_weights(w, topology)?,
             encoder,
             z_dim,
             mean,
@@ -1003,11 +1358,11 @@ impl Wan22Vae {
         let z = self.to_channels_last(latent_czthw)?; // [1,T,H,W,z]
         let sh = z.shape();
         let (f, h, w) = (sh[1], sh[2], sh[3]);
-        if !cfg.needs_tiling(VaeTiling::WAN22, f, h, w) {
+        if !cfg.needs_tiling(Self::VAE_TILING, f, h, w) {
             return self.decode_cl(&z);
         }
         let denorm = add(&multiply(&z, &self.std)?, &self.mean)?;
-        let plan = cfg.plan(VaeTiling::WAN22, f, h, w);
+        let plan = cfg.plan(Self::VAE_TILING, f, h, w);
 
         // Channels-last: channel axis last, tiled axes [1, 2, 3]. Per-tile decode adds the 2× spatial
         // unpatchify (vae22 upsamples 16× via decoder×8 + patch×2) before the clamp. The per-tile

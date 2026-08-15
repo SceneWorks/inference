@@ -51,6 +51,7 @@ fn real_weight_control() {
     let paths = Flux1ControlPaths {
         flux_base: env_path("FLUX1_CTRL_BASE"),
         control: env_path("FLUX1_CTRL_OVERLAY"),
+        adapters: Vec::new(),
     };
     let control_image = read_ppm(&env_path("FLUX1_CTRL_IMAGE"));
     println!(
@@ -99,6 +100,35 @@ fn real_weight_control() {
         .expect("generate (steered)");
     println!("[steer] {:?}", t.elapsed());
     write_ppm(&out_dir.join(format!("flux1_control_{kind}.ppm")), &steered);
+    if let Some(adapter) = std::env::var_os("FLUX1_CTRL_LORA") {
+        drop(model);
+        let adapted = Flux1DevControl::load(&Flux1ControlPaths {
+            flux_base: env_path("FLUX1_CTRL_BASE"),
+            control: env_path("FLUX1_CTRL_OVERLAY"),
+            adapters: vec![candle_gen::gen_core::AdapterSpec::new(
+                adapter.into(),
+                1.0,
+                candle_gen::gen_core::AdapterKind::Lora,
+            )],
+        })
+        .expect("load adapter-conditioned FLUX.1 control");
+        let with_adapter = adapted
+            .generate(&base, &control_image, &mut noop)
+            .expect("generate (control + LoRA)");
+        assert_eq!(
+            (with_adapter.width, with_adapter.height),
+            (steered.width, steered.height)
+        );
+        assert_ne!(
+            with_adapter.pixels, steered.pixels,
+            "selected FLUX.1 control adapter must change output"
+        );
+        write_ppm(
+            &out_dir.join(format!("flux1_control_{kind}_lora.ppm")),
+            &with_adapter,
+        );
+        return;
+    }
     assert_eq!((steered.width, steered.height), (1024, 1024));
     assert_eq!(steered.pixels.len(), 1024 * 1024 * 3, "full RGB8 buffer");
     // A coherent render is not a flat field (the VAE decode of pure noise / a dead forward would be).

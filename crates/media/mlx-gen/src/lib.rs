@@ -110,7 +110,8 @@ pub use gen_core::weightsmeta::{safetensors_dir_bytes, safetensors_path_bytes};
 pub use generator::{
     default_seed, ActivationMemoryAnchor, Capabilities, Conditioning, ConditioningKind,
     ControlClipRef, ControlKind, GenerationOutput, GenerationPhase, GenerationRequest, Generator,
-    KeyframeRef, Modality, ModelDescriptor, PhaseAdapter, ReplacementMode, SizeFloor, VideoClipRef,
+    KeyframeRef, Modality, ModelDescriptor, PhaseAdapter, ReplacementMode, SizeFloor,
+    StagedResidencyAvailability, VideoClipRef,
 };
 pub use media::{AudioTrack, Image};
 pub use registry::{
@@ -132,7 +133,7 @@ pub use sampler::{
     FlowMatchSampler, LcmSampler, LightningSampler, MlxAvLatentOps, MlxLatentOps, TcdSampler,
 };
 pub use scheduler::FlowMatchEuler;
-pub use tiling::{TilingConfig, VaeTiling};
+pub use tiling::{TilingConfig, VaeTiling, VideoDecodeMemoryProfile};
 pub use train::{
     LrSchedule, NetworkType, TrainOptimizer, Trainer, TrainerDescriptor, TrainingConfig,
     TrainingItem, TrainingOutput, TrainingProgress, TrainingRequest,

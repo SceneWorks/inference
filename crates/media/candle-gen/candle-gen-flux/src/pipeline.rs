@@ -67,7 +67,7 @@ use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::{Module, VarBuilder};
 use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::{self, GenerationRequest, Image, PidWeights, Progress};
+use candle_gen::gen_core::{self, AdapterSpec, GenerationRequest, Image, PidWeights, Progress};
 // Shared per-image batch seed (`base + index`) — one home in `candle-gen` (sc-9043 / F-059).
 use candle_gen::{CandleError, LatentDecoder, Result};
 use candle_gen_pid::{PidDecoder, PidEngine};
@@ -151,6 +151,7 @@ pub(crate) struct Pipeline {
     /// The `LoadSpec::pid` component captured at load (epic 7840 / sc-7853). The live residency path
     /// loads it into [`SeqHeavy`] only when the current request uses PiD. `None` ⇒ native VAE decode.
     pid_spec: Option<PidWeights>,
+    adapters: Vec<AdapterSpec>,
 }
 
 /// The loaded FLUX components, `Arc`-shared so reference backbones can retain and cheaply clone the
@@ -272,6 +273,7 @@ impl Pipeline {
         device: &Device,
         dtype: DType,
         pid_spec: Option<PidWeights>,
+        adapters: Vec<AdapterSpec>,
     ) -> Self {
         Self {
             variant,
@@ -279,6 +281,7 @@ impl Pipeline {
             device: device.clone(),
             dtype,
             pid_spec,
+            adapters,
         }
     }
 
@@ -351,7 +354,13 @@ impl Pipeline {
         // (S ≈ 16.9k joint tokens → `24·16.9k² ≈ 6.8e9 > i32::MAX`). The checkpoint layout is identical.
         let dit_vb =
             crate::flux1_load::dit_vb(&self.root, self.variant, self.dtype, &self.device, "flux")?;
-        let transformer = IpFlux::new(&flux_config(self.variant), dit_vb)?;
+        let mut transformer = IpFlux::new(&flux_config(self.variant), dit_vb)?;
+        candle_gen::quant::install_dotted_adapters(
+            "flux1 BFL",
+            &self.adapters,
+            &self.device,
+            |visitor| transformer.visit_adaptable_mut(visitor),
+        )?;
 
         // FLUX AutoEncoder (`ae.safetensors`) at the root.
         let (vae, _vae_vb) =
@@ -394,8 +403,14 @@ impl Pipeline {
         // FLUX.1's 19/38).
         let (num_double, num_single) = self.dit_block_counts()?;
         let dit_vb = self.component_vb("transformer")?;
-        let transformer =
+        let mut transformer =
             PackedFluxDit::new(&flux_config(self.variant), num_double, num_single, dit_vb)?;
+        candle_gen::quant::install_dotted_adapters(
+            "flux1 diffusers",
+            &self.adapters,
+            &self.device,
+            |visitor| transformer.visit_adaptable_mut(visitor),
+        )?;
 
         // Diffusers `AutoEncoderKL` (identical config to z-image's VAE — 16 latent ch, [128,256,512,512],
         // scaling 0.3611 / shift 0.1159). On q4/q8 the 8 packed mid-block attention projections dequantize
@@ -1091,6 +1106,11 @@ impl Pipeline {
         stream_transformer_blocks: bool,
         cancel: &gen_core::CancelFlag,
     ) -> Result<LoadedDit> {
+        if stream_transformer_blocks && !self.adapters.is_empty() {
+            return Err(CandleError::Msg(
+                "FLUX adapters require resident transformer blocks; disable block streaming".into(),
+            ));
+        }
         if diffusers {
             let (num_double, num_single) = self.dit_block_counts()?;
             if stream_transformer_blocks {
@@ -1145,12 +1165,19 @@ impl Pipeline {
                     self.component_vb("transformer")?,
                 )?));
             }
-            Ok(LoadedDit::Packed(PackedFluxDit::new(
+            let mut dit = PackedFluxDit::new(
                 &flux_config(self.variant),
                 num_double,
                 num_single,
                 self.component_vb("transformer")?,
-            )?))
+            )?;
+            candle_gen::quant::install_dotted_adapters(
+                "flux1 diffusers",
+                &self.adapters,
+                &self.device,
+                |visitor| dit.visit_adaptable_mut(visitor),
+            )?;
+            Ok(LoadedDit::Packed(dit))
         } else {
             let dit_vb = crate::flux1_load::dit_vb(
                 &self.root,
@@ -1160,11 +1187,17 @@ impl Pipeline {
                 "flux",
             )?;
             let config = flux_config(self.variant);
-            let dit = if stream_transformer_blocks {
+            let mut dit = if stream_transformer_blocks {
                 IpFlux::new_block_streamed(&config, dit_vb)?
             } else {
                 IpFlux::new(&config, dit_vb)?
             };
+            candle_gen::quant::install_dotted_adapters(
+                "flux1 BFL",
+                &self.adapters,
+                &self.device,
+                |visitor| dit.visit_adaptable_mut(visitor),
+            )?;
             Ok(LoadedDit::Stock(dit))
         }
     }
@@ -1629,8 +1662,22 @@ mod tests {
             gemma: gen_core::WeightsSource::Dir("/gemma".into()),
         };
         let root = Path::new("/nonexistent");
-        let with = Pipeline::load(Variant::Schnell, root, &Device::Cpu, DType::F32, Some(spec));
-        let without = Pipeline::load(Variant::Schnell, root, &Device::Cpu, DType::F32, None);
+        let with = Pipeline::load(
+            Variant::Schnell,
+            root,
+            &Device::Cpu,
+            DType::F32,
+            Some(spec),
+            Vec::new(),
+        );
+        let without = Pipeline::load(
+            Variant::Schnell,
+            root,
+            &Device::Cpu,
+            DType::F32,
+            None,
+            Vec::new(),
+        );
 
         // Opted in at load AND wanted by this request → load it.
         assert!(with.pid_to_load(true).is_some());
@@ -1668,7 +1715,14 @@ mod tests {
         )
         .map_err(|e| CandleError::Msg(e.to_string()))?;
 
-        let pipe = Pipeline::load(Variant::Schnell, &tmp, &Device::Cpu, DType::F32, None);
+        let pipe = Pipeline::load(
+            Variant::Schnell,
+            &tmp,
+            &Device::Cpu,
+            DType::F32,
+            None,
+            Vec::new(),
+        );
         assert!(
             pipe.component_is_packed("transformer")?,
             "`quantization` block ⇒ packed"
@@ -1722,7 +1776,14 @@ mod tests {
             &packed,
             r#"{ "num_layers": 19, "quantization": { "bits": 4, "group_size": 64 } }"#,
         )?;
-        let pipe = Pipeline::load(Variant::Dev, &packed, &Device::Cpu, DType::F32, None);
+        let pipe = Pipeline::load(
+            Variant::Dev,
+            &packed,
+            &Device::Cpu,
+            DType::F32,
+            None,
+            Vec::new(),
+        );
         assert!(
             pipe.uses_diffusers_layout()?,
             "packed q4/q8 must use the diffusers builders"
@@ -1733,7 +1794,14 @@ mod tests {
         // stock path and failed on a missing `flux1-dev.safetensors`.
         let bf16 = base.join("bf16");
         mk_transformer_config(&bf16, r#"{ "num_layers": 19, "num_single_layers": 38 }"#)?;
-        let pipe = Pipeline::load(Variant::Dev, &bf16, &Device::Cpu, DType::F32, None);
+        let pipe = Pipeline::load(
+            Variant::Dev,
+            &bf16,
+            &Device::Cpu,
+            DType::F32,
+            None,
+            Vec::new(),
+        );
         assert!(
             !pipe.has_bfl_dit_checkpoint(),
             "the bf16 diffusers tier has no root single-file checkpoint"
@@ -1749,7 +1817,14 @@ mod tests {
         std::fs::create_dir_all(&bfl).ok();
         std::fs::write(bfl.join(Variant::Dev.transformer_file()), b"")
             .map_err(|e| CandleError::Msg(e.to_string()))?;
-        let pipe = Pipeline::load(Variant::Dev, &bfl, &Device::Cpu, DType::F32, None);
+        let pipe = Pipeline::load(
+            Variant::Dev,
+            &bfl,
+            &Device::Cpu,
+            DType::F32,
+            None,
+            Vec::new(),
+        );
         assert!(
             !pipe.uses_diffusers_layout()?,
             "a BFL single-file snapshot must take the stock path"
@@ -1761,7 +1836,14 @@ mod tests {
         mk_transformer_config(&full, r#"{ "num_layers": 19, "num_single_layers": 38 }"#)?;
         std::fs::write(full.join(Variant::Dev.transformer_file()), b"")
             .map_err(|e| CandleError::Msg(e.to_string()))?;
-        let pipe = Pipeline::load(Variant::Dev, &full, &Device::Cpu, DType::F32, None);
+        let pipe = Pipeline::load(
+            Variant::Dev,
+            &full,
+            &Device::Cpu,
+            DType::F32,
+            None,
+            Vec::new(),
+        );
         assert!(
             !pipe.uses_diffusers_layout()?,
             "a full BFL snapshot (root checkpoint present) must stay stock even with diffusers subdirs"

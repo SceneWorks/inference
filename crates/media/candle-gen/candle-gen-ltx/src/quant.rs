@@ -60,6 +60,7 @@
 use candle_gen::candle_core::{DType, Result, Tensor};
 use candle_gen::candle_nn::{Embedding, Linear, Module, VarBuilder};
 use candle_gen::quant as shared;
+use candle_gen::quant::LokrFactors;
 use candle_gen::train::lora::LoraLinear;
 
 /// The LTX MLX tier's quant group size (read from `quantize_config.json`'s `quantization.group_size`;
@@ -100,6 +101,11 @@ impl QLinear {
     /// Attach a shared forward-time additive LoRA residual without changing the frozen base.
     pub(crate) fn push_additive_lora(&mut self, a: Tensor, b: Tensor, scale: f64) {
         self.0.push_additive_lora(a, b, scale);
+    }
+
+    /// Attach an allocation-free structured LoKr residual; valid on both dense and packed bases.
+    pub(crate) fn push_additive_lokr(&mut self, factors: LokrFactors) {
+        self.0.push_additive_lokr(factors);
     }
 
     /// Wrap this frozen projection in the shared training-time LoRA seam without changing its

@@ -38,8 +38,8 @@ use std::sync::Mutex;
 
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::{
-    self, GenerationOutput, GenerationRequest, Generator, LoadSpec, ModelDescriptor, PidWeights,
-    Progress, WeightsSource,
+    self, AdapterSpec, GenerationOutput, GenerationRequest, Generator, LoadSpec, ModelDescriptor,
+    PidWeights, Progress, WeightsSource,
 };
 
 pub use config::{ChromaVariant, CHROMA1_BASE_ID, CHROMA1_FLASH_ID, CHROMA1_HD_ID, SIZE_MULTIPLE};
@@ -73,6 +73,7 @@ pub struct ChromaGenerator {
     /// The `LoadSpec::pid` component captured at load (epic 7840 / sc-7853), threaded into the lazy
     /// component build so the PiD engine loads once alongside the base model. `None` when not opted in.
     pid_spec: Option<PidWeights>,
+    adapters: Vec<AdapterSpec>,
     components: Mutex<Option<Components>>,
 }
 
@@ -127,6 +128,7 @@ impl Generator for ChromaGenerator {
             &self.root,
             &self.device,
             self.pid_spec.clone(),
+            self.adapters.clone(),
         );
         let components = self.components(&pipe)?;
         let images = pipe.render(req, &components, on_progress)?;
@@ -160,11 +162,6 @@ fn load_variant(variant: ChromaVariant, spec: &LoadSpec) -> gen_core::Result<Box
             )));
         }
     };
-    if !spec.adapters.is_empty() {
-        return Err(gen_core::Error::Unsupported(format!(
-            "candle {id} does not support LoRA/LoKr yet — refusing to silently drop the adapters"
-        )));
-    }
     if spec.quantize.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
             "candle {id} does not support on-the-fly Q4/Q8 quantization yet"
@@ -185,6 +182,7 @@ fn load_variant(variant: ChromaVariant, spec: &LoadSpec) -> gen_core::Result<Box
         // any) so the lazy component build loads the engine once. Unlike adapters/quant/control above,
         // it is not rejected — `None` simply keeps the byte-exact native-VAE path.
         pid_spec: spec.pid.clone(),
+        adapters: spec.adapters.clone(),
         components: Mutex::new(None),
     }))
 }
@@ -345,16 +343,13 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_unwired_surfaces_and_single_file() {
+    fn load_accepts_adapters_and_rejects_unwired_quant_and_single_file() {
         use candle_gen::gen_core::{AdapterKind, AdapterSpec, Quant};
         for load in [load_hd, load_base, load_flash] {
             let lora = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_adapters(vec![
                 AdapterSpec::new("/lora.safetensors".into(), 1.0, AdapterKind::Lora),
             ]);
-            assert!(matches!(
-                load(&lora).err().expect("err"),
-                gen_core::Error::Unsupported(_)
-            ));
+            assert!(load(&lora).is_ok());
 
             let quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q8);
             assert!(matches!(

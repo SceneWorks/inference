@@ -33,7 +33,7 @@
 //! is threaded from the caller (the packed `text_encoder/config.json`'s `quantization.group_size`, sc-9410).
 
 use candle_gen::candle_core::Result as CandleResult;
-use candle_gen::candle_core::{Device, Tensor, D};
+use candle_gen::candle_core::{DType, Device, Tensor, D};
 use candle_gen::candle_nn::{self as nn, Module, RmsNorm, VarBuilder};
 use candle_gen::quant::{QLinear, MLX_GROUP_SIZE};
 
@@ -147,8 +147,14 @@ impl ChatGlmModel {
         let hidden = self.cfg.hidden_size;
         let ids = Tensor::from_vec(tokens.input_ids.clone(), (1, s), &self.device)?;
         let mut h = self.embed.forward(&ids)?; // [1, s, hidden]
-        let mask = self.causal_padding_mask(&tokens.attention_mask, s)?;
-        let (cos, sin) = self.rope_tables(&tokens.position_ids)?;
+
+        // Position/mask data originates as f32 host values, but the training encoder is loaded at
+        // BF16. Keep generated conditioning in the live activation dtype: Candle deliberately does
+        // not promote mixed tensor arithmetic, so BF16 q/k times f32 RoPE (and BF16 scores + f32 mask)
+        // otherwise fail before the first training artifact is written.
+        let dtype = h.dtype();
+        let mask = self.causal_padding_mask(&tokens.attention_mask, s, dtype)?;
+        let (cos, sin) = self.rope_tables(&tokens.position_ids, dtype)?;
 
         // context = output of layer `num_layers - 2` (hidden_states[-2]); pooled source = final h.
         let context_idx = self.cfg.num_layers - 2;
@@ -246,7 +252,7 @@ impl ChatGlmModel {
 
     /// Rotary `(cos, sin)`, each `[1, seq, 1, rotary_dim/2]`, for the given absolute `positions` (one
     /// per sequence slot — Kolors' left-padded `position_ids`). θ = 10000, computed once.
-    fn rope_tables(&self, positions: &[i64]) -> CandleResult<(Tensor, Tensor)> {
+    fn rope_tables(&self, positions: &[i64], dtype: DType) -> CandleResult<(Tensor, Tensor)> {
         let half = self.cfg.rotary_dim / 2; // 32
         let rot = self.cfg.rotary_dim as f64; // 64
         let inv_freq: Vec<f32> = (0..half)
@@ -259,7 +265,7 @@ impl ChatGlmModel {
                 freqs.push(p as f32 * f);
             }
         }
-        let freqs = Tensor::from_vec(freqs, (1, seq, 1, half), &self.device)?;
+        let freqs = Tensor::from_vec(freqs, (1, seq, 1, half), &self.device)?.to_dtype(dtype)?;
         Ok((freqs.cos()?, freqs.sin()?))
     }
 
@@ -282,12 +288,17 @@ impl ChatGlmModel {
         Tensor::cat(&[&rotated, &x_pass], 3)
     }
 
-    /// Additive `[1, 1, s, s]` mask in f32 (B==1), mirroring the reference `get_masks`: a real query row
+    /// Additive `[1, 1, s, s]` mask in `dtype` (B==1), mirroring the reference `get_masks`: a real query row
     /// `i` attends key `j` iff causal (`j ≤ i`) and the key is not padding; a padding query row attends
     /// everything (so its hidden state is deterministic). Disallowed → a large finite negative.
-    fn causal_padding_mask(&self, attention_mask: &[u32], s: usize) -> CandleResult<Tensor> {
+    fn causal_padding_mask(
+        &self,
+        attention_mask: &[u32],
+        s: usize,
+        dtype: DType,
+    ) -> CandleResult<Tensor> {
         let data = causal_padding_data(attention_mask, 1, s);
-        Tensor::from_vec(data, (1, 1, s, s), &self.device)
+        Tensor::from_vec(data, (1, 1, s, s), &self.device)?.to_dtype(dtype)
     }
 }
 
@@ -566,6 +577,41 @@ mod tests {
         );
         std::fs::remove_file(&tmp_p).ok();
         std::fs::remove_file(&tmp_d).ok();
+    }
+
+    #[test]
+    fn generated_conditioning_matches_bf16_activation_dtype() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tiny_cfg();
+        let (vb, checkpoint) =
+            vb_from_map(&tmp, build_checkpoint(&cfg, false), "bf16_conditioning");
+        let model = ChatGlmModel::new_gs(cfg, vb, GS).unwrap();
+        let tokens = tiny_tokens(&cfg);
+
+        // Both helpers construct their values from f32 host data. The requested activation dtype
+        // must be applied before RoPE multiplication / mask addition, because Candle rejects mixed
+        // BF16/F32 tensor arithmetic rather than implicitly promoting it.
+        let (cos, sin) = model
+            .rope_tables(&tokens.position_ids, DType::BF16)
+            .unwrap();
+        let mask = model
+            .causal_padding_mask(&tokens.attention_mask, tokens.input_ids.len(), DType::BF16)
+            .unwrap();
+        assert_eq!(cos.dtype(), DType::BF16);
+        assert_eq!(sin.dtype(), DType::BF16);
+        assert_eq!(mask.dtype(), DType::BF16);
+
+        let activation = Tensor::ones(cos.shape(), DType::BF16, &Device::Cpu).unwrap();
+        assert_eq!(activation.broadcast_mul(&cos).unwrap().dtype(), DType::BF16);
+        let scores = Tensor::zeros(
+            (1, 1, tokens.input_ids.len(), tokens.input_ids.len()),
+            DType::BF16,
+            &Device::Cpu,
+        )
+        .unwrap();
+        assert_eq!(scores.broadcast_add(&mask).unwrap().dtype(), DType::BF16);
+
+        std::fs::remove_file(checkpoint).ok();
     }
 
     /// The packed ChatGLM3 encode matches the dense encode built from the SAME affine grid, within the

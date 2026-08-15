@@ -644,6 +644,7 @@ fn control_fun_preview_frames_evolve_toward_the_final_image() {
         qwen_base,
         text_encoder: None,
         controlnet,
+        adapters: Vec::new(),
     })
     .expect("load QwenFunControl");
 
