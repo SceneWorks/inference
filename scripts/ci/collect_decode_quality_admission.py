@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import importlib.util
 import json
 from collections import defaultdict
 from pathlib import Path
@@ -20,15 +19,6 @@ from typing import Any, Iterable
 
 MARKER = "DECODE_QUALITY_V2 "
 QUALITY_ABI = 2
-_FINGERPRINT_SCRIPT = Path(__file__).with_name("decode_quality_implementation_fingerprint.py")
-_FINGERPRINT_SPEC = importlib.util.spec_from_file_location(
-    "decode_quality_implementation_fingerprint", _FINGERPRINT_SCRIPT
-)
-if _FINGERPRINT_SPEC is None or _FINGERPRINT_SPEC.loader is None:
-    raise RuntimeError("cannot load decode-quality implementation fingerprint helper")
-_FINGERPRINT_MODULE = importlib.util.module_from_spec(_FINGERPRINT_SPEC)
-_FINGERPRINT_SPEC.loader.exec_module(_FINGERPRINT_MODULE)
-IMPLEMENTATION_FINGERPRINT = _FINGERPRINT_MODULE.embedded()
 REQUIRED_KEYS = {
     "family",
     "resolvedRoute",
@@ -122,10 +112,14 @@ def _validate_receipt(receipt: dict[str, Any]) -> None:
         and all(character in "0123456789abcdef" for character in implementation),
         "implementationFingerprint must be lowercase SHA-256",
     )
-    _require(
-        implementation == IMPLEMENTATION_FINGERPRINT,
-        "implementationFingerprint must match the collector's running inference source closure",
-    )
+    # Shape only. sc-19728 removed the comparison that stood here — originally against the constant
+    # embedded in gen-core, and it must not come back as a comparison against a freshly derived
+    # closure either. That would be the same over-broad currency gate wearing a different hat: the
+    # closure hashes `Cargo.lock`, the workflow file, and whole `src` trees, so it refuses any
+    # receipt not produced by a byte-identical tree. `--input-root` exists precisely to seal a
+    # corpus assembled from artifacts of *different* runs (the 69 shipped rows span three separate
+    # dispatches), and each cell's stamp is sealed into its own `productionEvidenceSha256`, so a
+    # heterogeneous corpus is a correctly recorded one, not a malformed one.
     _require(
         receipt["overlay"] is None
         or (

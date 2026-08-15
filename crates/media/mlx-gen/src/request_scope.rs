@@ -9,12 +9,26 @@ use crate::gen_core::{
     Error, GenerationMemory, GenerationRequest, LoadShape, MemoryDecodeArtifactIdentity,
     MemoryDecodeGeometryPolicy, MemoryDecodePolicyQuery, MemoryDecodeQualityDisposition,
     MemoryGeometry, MemoryPhase, MemoryProviderContract, MemoryRequestScope, MemoryRunContext,
-    MemoryRunOutcome, MemoryStrategy, Result, MEMORY_DECODE_QUALITY_IMPLEMENTATION_FINGERPRINT,
+    MemoryRunOutcome, MemoryStrategy, Result,
 };
 use std::cell::RefCell;
 
 type DecodeValidator = Box<dyn Fn(bool, u32, u32) -> Result<()> + 'static>;
 type CleanupAction = Box<dyn FnMut() -> Result<()> + 'static>;
+
+/// Whether a decode-quality row carries a well-formed forensic source stamp.
+///
+/// This is a shape check, not a currency check. sc-19728 removed the comparison against a constant
+/// compiled into the running build: the stamp records which source closure produced the
+/// measurement, and measurements stand until they are remeasured. What must still hold is that a
+/// row admitted into a request scope carries a real digest rather than an empty or malformed one,
+/// so the receipt a decode is authorized against is always traceable.
+fn is_quality_stamp(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct GeometryDecodeAuthorization {
@@ -22,7 +36,6 @@ struct GeometryDecodeAuthorization {
     geometry: MemoryGeometry,
     load_shape: LoadShape,
     artifact: MemoryDecodeArtifactIdentity,
-    implementation_fingerprint: String,
     use_pid: bool,
     tile_edge: u32,
     overlap: u32,
@@ -103,10 +116,10 @@ impl MlxRequestScopeConfig {
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
             || policy.artifact.variant.trim().is_empty()
             || policy.artifact.fingerprint.trim().is_empty()
-            || policy.implementation_fingerprint != MEMORY_DECODE_QUALITY_IMPLEMENTATION_FINGERPRINT
+            || !is_quality_stamp(&policy.implementation_fingerprint)
         {
             return Err(Error::Unsupported(format!(
-                "{}: decode-quality authorization has stale artifact/source identity",
+                "{}: decode-quality authorization has an incomplete artifact/source identity",
                 self.provider_id
             )));
         }
@@ -135,7 +148,6 @@ impl MlxRequestScopeConfig {
             geometry: policy.geometry,
             load_shape: policy.load_shape,
             artifact: policy.artifact.clone(),
-            implementation_fingerprint: policy.implementation_fingerprint.clone(),
             use_pid: policy.use_pid,
             tile_edge: policy.tile_edge,
             overlap: policy.overlap,
@@ -218,8 +230,11 @@ pub fn validate_geometry_decode_authorization(
             || binding.artifact.revision.trim().is_empty()
             || binding.artifact.variant.trim().is_empty()
             || binding.artifact.fingerprint.trim().is_empty()
-            || binding.implementation_fingerprint
-                != MEMORY_DECODE_QUALITY_IMPLEMENTATION_FINGERPRINT
+            // No stamp check here. It used to compare against a build-local constant (sc-19728).
+            // The shape check lives at `authorize_geometry_decode` instead, which is the public
+            // API boundary a caller can hand an arbitrary policy to; this site reads a
+            // thread-local that only that call populates, so repeating it here would add a
+            // condition that cannot fail on any reachable path.
             || binding.use_pid != request.use_pid
             || binding.tile_edge != tile_edge
             || binding.overlap != overlap
@@ -469,6 +484,11 @@ mod tests {
     use std::cell::Cell;
     use std::rc::Rc;
 
+    /// An arbitrary well-formed source stamp. Any 64-hex value must now be admitted — the point of
+    /// sc-19728 is that this value is recorded, not matched — so the fixture deliberately does not
+    /// derive from anything in the running build.
+    const STAMP: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
     fn config(blocks: usize) -> MlxRequestScopeConfig {
         MlxRequestScopeConfig::new(
             "fixture",
@@ -520,7 +540,7 @@ mod tests {
                 variant: "q4".to_owned(),
                 fingerprint: format!("SceneWorks/fixture@{}:q4", "a".repeat(40)),
             },
-            implementation_fingerprint: MEMORY_DECODE_QUALITY_IMPLEMENTATION_FINGERPRINT.to_owned(),
+            implementation_fingerprint: STAMP.to_owned(),
             mode: MemoryMode::TextToImage,
             overlay: None,
             geometry,
@@ -575,8 +595,7 @@ mod tests {
         assert!(validate_geometry_decode_authorization("fixture", &request, 32, 4).is_err());
     }
 
-    #[test]
-    fn geometry_decode_authority_rejects_load_shape_and_source_identity_drift() {
+    fn tiled_decode_config() -> MlxRequestScopeConfig {
         let mut cfg = config(7);
         cfg.memory = Some(GenerationMemory {
             tile_vae_decode: true,
@@ -584,19 +603,78 @@ mod tests {
             decode_overlap: Some(4),
             ..Default::default()
         });
+        cfg
+    }
+
+    #[test]
+    fn geometry_decode_authority_rejects_load_shape_and_artifact_identity_drift() {
+        let mut cfg = tiled_decode_config();
         let policy = quality_policy(cfg.geometry);
 
         cfg.load_shape = LoadShape::DeferredMaterialization;
         assert!(cfg.authorize_geometry_decode(&policy).is_err());
         cfg.load_shape = LoadShape::EagerMaterialization;
 
-        let mut stale_source = policy.clone();
-        stale_source.implementation_fingerprint = "f".repeat(64);
-        assert!(cfg.authorize_geometry_decode(&stale_source).is_err());
-
         let mut stale_artifact = policy;
         stale_artifact.artifact.revision = "not-a-revision".to_owned();
         assert!(cfg.authorize_geometry_decode(&stale_artifact).is_err());
+    }
+
+    /// sc-19728: a row measured by a different source closure now authorizes a decode.
+    ///
+    /// This case used to live in the test above, asserting the opposite — a `"f".repeat(64)` stamp
+    /// was refused as "stale source identity". That refusal is the one this story removed, so the
+    /// assertion is inverted rather than deleted: it is the observable proof for
+    /// [`MlxRequestScopeConfig::authorize_geometry_decode`], and restoring the comparison against a
+    /// build-local constant turns it red.
+    #[test]
+    fn a_foreign_source_closure_stamp_no_longer_refuses_a_decode_authorization() {
+        for stamp in [
+            "800d06acf579a36e604d91955fd6a6852ec70bc39701f7a320f1fdd2bf5ff29d",
+            &"f".repeat(64),
+        ] {
+            let mut cfg = tiled_decode_config();
+            let mut policy = quality_policy(cfg.geometry);
+            policy.implementation_fingerprint = stamp.to_owned();
+            let policy = policy.seal();
+            let evidence = policy.production_evidence_sha256.clone();
+
+            cfg.authorize_geometry_decode(&policy)
+                .unwrap_or_else(|error| panic!("{stamp}: {error}"));
+
+            // The stamp is sealed into `production_evidence_sha256`, so authorizing against a
+            // differently-stamped row yields a different evidence digest. Asserting the digest
+            // therefore pins the stamp's traceability without the binding having to re-read it.
+            let mut scope = MlxRequestScopeCore::with_cleanup(cfg, MlxScopeCleanup::None);
+            let mut request = GenerationRequest {
+                width: 64,
+                height: 64,
+                count: 3,
+                ..Default::default()
+            };
+            scope.configure_request(&mut request).unwrap();
+            assert_eq!(
+                validate_geometry_decode_authorization("fixture", &request, 32, 4)
+                    .unwrap_or_else(|error| panic!("{stamp}: {error}")),
+                evidence
+            );
+            scope.finish(MemoryRunOutcome::Complete).unwrap();
+        }
+    }
+
+    /// The guard that survived at both authorization sites still discriminates on shape.
+    #[test]
+    fn a_malformed_source_closure_stamp_is_still_refused() {
+        for malformed in ["", &"a".repeat(63), &"A".repeat(64), &"g".repeat(64)] {
+            let mut cfg = tiled_decode_config();
+            let mut policy = quality_policy(cfg.geometry);
+            policy.implementation_fingerprint = malformed.to_owned();
+            let policy = policy.seal();
+            assert!(
+                cfg.authorize_geometry_decode(&policy).is_err(),
+                "{malformed:?} must not authorize a decode"
+            );
+        }
     }
 
     #[test]
