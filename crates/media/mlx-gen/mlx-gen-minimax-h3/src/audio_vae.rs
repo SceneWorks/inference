@@ -659,12 +659,30 @@ mod tests {
         // `g` must be [out, 1, 1].
         let g = Array::from_slice(&[1.0f32, 1.0], &[2]);
         assert!(fuse_weight_norm(&g, &v).is_err());
+        // The two below are asserted by MESSAGE (sc-19488): each input would fault downstream
+        // anyway with its guard deleted — leading dim 3 against 2 fails to broadcast, and a rank-2
+        // `v` makes `sum_axes(&[1, 2])` an out-of-range axis — so `is_err()` alone stays green
+        // without the guard. (The `[2]`-shaped `g` above is left as `is_err()` deliberately: it
+        // broadcasts CLEANLY into `[2, 1, 2]`, so removing that guard really does turn the call
+        // green and the bare probe discriminates.)
         let g = Array::from_slice(&[1.0f32, 1.0, 1.0], &[3, 1, 1]);
-        assert!(fuse_weight_norm(&g, &v).is_err());
+        let msg = fuse_weight_norm(&g, &v)
+            .expect_err("weight_g's leading dim must match weight_v's")
+            .to_string();
+        assert!(
+            msg.contains("minimax-h3 audio vae: weight_g"),
+            "the g/v shape guard must be what rejects this, not a broadcast fault: {msg}"
+        );
         // `v` must be rank 3.
         let v2 = Array::from_slice(&[1.0f32, 2.0], &[2, 1]);
         let g = Array::from_slice(&[1.0f32, 1.0], &[2, 1, 1]);
-        assert!(fuse_weight_norm(&g, &v2).is_err());
+        let msg = fuse_weight_norm(&g, &v2)
+            .expect_err("weight_v must be rank 3")
+            .to_string();
+        assert!(
+            msg.contains("minimax-h3 audio vae: weight_v must be rank 3"),
+            "the rank guard must be what rejects this, not the sum_axes below it: {msg}"
+        );
     }
 
     /// The declared name list must have the right cardinality and no duplicates — 914 tensors for

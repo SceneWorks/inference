@@ -18,7 +18,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{
     CancelFlag, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
     GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, Progress, Quant, Result,
-    SizeFloor, WeightsSource,
+    WeightsSource,
 };
 use mlx_gen_wan::config::WanModelConfig;
 use mlx_gen_wan::pipeline::{align_dim, decode_to_frames, frames_to_images, latent_shape};
@@ -50,7 +50,6 @@ pub fn descriptor() -> ModelDescriptor {
         capabilities: Capabilities {
             supports_negative_prompt: true,
             supports_guidance: true,
-            supports_true_cfg: false,
             // Source media: a single Reference (i2i) / MultiReference (r2v refs) / VideoClip (v2v/rv2v
             // source video). Text-only modes (t2i/t2v) need no conditioning.
             conditioning: vec![
@@ -60,21 +59,13 @@ pub fn descriptor() -> ModelDescriptor {
             ],
             // LoRA/quant are follow-ons (sc-5146); the renderer ships dense bf16.
             supports_lora: false,
-            supports_lokr: false,
             samplers: vec!["unipc"],
-            schedulers: Vec::new(),
-            supported_guidance_methods: vec![],
             min_size: 16,
             max_size: 1280,
             max_count: 1,
-            // Not a distilled fixed-schedule model: any step count the shared sanity caps
-            // admit is renderable (sc-19502).
-            supported_steps: Vec::new(),
             mac_only: true,
             supported_quants: &[Quant::Q4, Quant::Q8],
-            component_precision_floors: &[],
             supports_kv_cache: true,
-            requires_sigma_shift: false,
             // The renderer is structurally always-staged (epic 10834, sc-10840): `generate_impl` holds
             // NO component weights on the generator and loads per generate in phase order — UMT5-XXL T5
             // → drop → (source-VAE encoder for i2i/v2v/r2v) → drop → the two co-resident MoE experts +
@@ -85,20 +76,7 @@ pub fn descriptor() -> ModelDescriptor {
             // is unconditional physical staging rather than a selectable offload control.
             supports_sequential_offload: false,
             unconditionally_engages_staged_residency: true,
-            supports_preview: false,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
+            ..Default::default()
         },
     }
 }

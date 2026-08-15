@@ -306,8 +306,33 @@ mod tests {
     fn a_length_mismatch_is_rejected() {
         let rope = MmRope::new(2, 100.0).unwrap();
         let tables = rope.tables(&spread(&[4, 3]), Dtype::Float32).unwrap();
-        assert!(rope.apply(&spread(&[1, 7, 1, 12]), &tables).is_err());
-        assert!(rope.apply(&spread(&[1, 4, 1, 8]), &tables).is_err());
-        assert!(rope.tables(&spread(&[4, 2]), Dtype::Float32).is_err());
+        // Asserted by MESSAGE, not by `is_err()` (sc-19488). Each of these inputs would ALSO
+        // fault downstream if its guard were deleted — the reshape/slice below the guard rejects
+        // them on element count or axis range — so a bare `is_err()` stays green with the guard
+        // gone and tests nothing. Binding to each guard's own wording is what discriminates.
+        let msg = rope
+            .apply(&spread(&[1, 7, 1, 12]), &tables)
+            .expect_err("a 7-row sequence against 4-row tables must be refused")
+            .to_string();
+        assert!(
+            msg.contains("minimax-h3 mm-rope: rope tables cover"),
+            "the table-length guard must be what rejects this, not the reshape below it: {msg}"
+        );
+        let msg = rope
+            .apply(&spread(&[1, 4, 1, 8]), &tables)
+            .expect_err("rotary_dim 12 exceeds a head dim of 8")
+            .to_string();
+        assert!(
+            msg.contains("minimax-h3 mm-rope: rotary_dim"),
+            "the rotary-width guard must be what rejects this, not the slice below it: {msg}"
+        );
+        let msg = rope
+            .tables(&spread(&[4, 2]), Dtype::Float32)
+            .expect_err("position ids must be [seq_len, 3]")
+            .to_string();
+        assert!(
+            msg.contains("minimax-h3 mm-rope: expected position ids as"),
+            "the position-id shape guard must be what rejects this: {msg}"
+        );
     }
 }

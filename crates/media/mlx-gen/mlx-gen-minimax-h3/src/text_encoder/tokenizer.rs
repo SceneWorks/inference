@@ -666,4 +666,41 @@ mod tests {
             "no chat template on the grounded path either"
         );
     }
+
+    /// **`{:.1}` rounds half to EVEN, matching Python's `format`** — which is what makes a 2 fps
+    /// pair's mean render as `"<0.2 seconds>"` rather than `"<0.3 seconds>"`.
+    ///
+    /// [`MiniMaxH3Tokenizer::timestamp_label`]'s doc comment has named this test since sc-17149;
+    /// it did not exist, and sc-17157 added it on both lanes when the candle port copied the claim.
+    /// The exact-half cases are the whole point, and they are the only ones where half-to-even and
+    /// half-away-from-zero disagree. `0.25` is the value the first merged block of every video
+    /// reference actually carries (`(0.0 + 0.5) / 2`), so this is not a synthetic corner: a port
+    /// that formatted with half-away-from-zero mislabels the first block of every clip.
+    ///
+    /// Note `0.15` and `0.35` are NOT exact halves in binary — `0.15` is just below and `0.35` just
+    /// above — so their correct renderings are `0.1` and `0.3`, decided by the stored value rather
+    /// than by the tie rule. They are included because a port that "fixed" the tie rule by adding an
+    /// epsilon would break exactly these.
+    #[test]
+    fn the_timestamp_label_rounds_half_to_even_like_python() {
+        // Exact binary halves: ties go to the EVEN neighbour. Half-away-from-zero would have given
+        // 0.3 / 0.8 / 1.3, so each of these discriminates the two rules.
+        assert_eq!(
+            MiniMaxH3Tokenizer::timestamp_label(0.25),
+            "<0.2 seconds>",
+            "0.25 ties DOWN to the even 0.2 — the first block of every 2 fps clip"
+        );
+        assert_eq!(MiniMaxH3Tokenizer::timestamp_label(0.75), "<0.8 seconds>");
+        assert_eq!(MiniMaxH3Tokenizer::timestamp_label(1.25), "<1.2 seconds>");
+        assert_eq!(MiniMaxH3Tokenizer::timestamp_label(2.75), "<2.8 seconds>");
+
+        // Not exact halves: the stored double decides, not the tie rule.
+        assert_eq!(MiniMaxH3Tokenizer::timestamp_label(0.15), "<0.1 seconds>");
+        assert_eq!(MiniMaxH3Tokenizer::timestamp_label(0.35), "<0.3 seconds>");
+
+        // Whole and integral values keep their one decimal place.
+        assert_eq!(MiniMaxH3Tokenizer::timestamp_label(0.0), "<0.0 seconds>");
+        assert_eq!(MiniMaxH3Tokenizer::timestamp_label(1.0), "<1.0 seconds>");
+        assert_eq!(MiniMaxH3Tokenizer::timestamp_label(12.5), "<12.5 seconds>");
+    }
 }

@@ -2199,6 +2199,22 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                         "real_weight_decode_matches_the_official_diffusers_vae",
                     ),
                 ),
+                (
+                    # sc-17151's staged-residency tripwire, which lives in its own test binary
+                    # rather than in `real_weights.rs` -- binding it here is what stops the
+                    # selection from rotting the way the sc-18932 orphans did.
+                    #
+                    # ONLY these two of the file's arms are selected, and the omission is a DISK
+                    # fact rather than an oversight: every other arm opens `transformer/` or
+                    # `text_encoder/` through `Weights::from_dir`, and this row's `download_files`
+                    # carries no shards of either (the TE index only). These two run on `vae/` and
+                    # `audio_vae/`, which the slice carries whole.
+                    "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/staged_residency.rs",
+                    (
+                        "the_video_decoder_hands_off_cleanly",
+                        "a_held_decoder_trips_both_handoff_gates",
+                    ),
+                ),
             ),
             "candle-minimax-h3": (
                 (

@@ -772,7 +772,15 @@ mod tests {
     #[test]
     fn split_rejects_a_mismatched_leading_dim() {
         let fused = Array::from_slice(&[0.0f32; 10], &[10, 1]);
-        assert!(split_fused_qkv(&fused, 2, 2).is_err());
+        // Asserted by MESSAGE (sc-19488): delete the guard and `reshape(&[2, 3, 2, 1])` wants 12
+        // elements from this 10-element array, so it errors anyway and `is_err()` proves nothing.
+        let msg = split_fused_qkv(&fused, 2, 2)
+            .expect_err("a leading dim of 10 is not 3 x 2 x 2")
+            .to_string();
+        assert!(
+            msg.contains("minimax-h3 qkv split: expected leading dim"),
+            "the leading-dim guard must be what rejects this, not the reshape below it: {msg}"
+        );
     }
 
     #[test]
