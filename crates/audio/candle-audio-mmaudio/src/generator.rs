@@ -118,6 +118,9 @@ pub fn descriptor() -> ModelDescriptor {
             max_size: 0,
             // One clip per request (GenerationOutput::Audio carries a single track).
             max_count: 1,
+            // Not a distilled fixed-schedule model: any step count the shared sanity caps
+            // admit is renderable (sc-19502).
+            supported_steps: Vec::new(),
             mac_only: false,
             audio_sample_rates: vec![SAMPLE_RATE],
             max_audio_duration_secs: Some(MAX_DURATION_SECS),

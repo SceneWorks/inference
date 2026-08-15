@@ -1148,6 +1148,9 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             min_size: 16,
             max_size: 1280,
             max_count: 1,
+            // Not a distilled fixed-schedule model: any step count the shared sanity caps
+            // admit is renderable (sc-19502).
+            supported_steps: Vec::new(),
             mac_only: false,
             // Q4/Q8 packed MLX tiers (sc-10025): both dual-expert `WanTransformer` backbones load packed
             // via the shared packed-detect loaders; the tiers are pre-quantized (no on-the-fly quant).

@@ -151,6 +151,9 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             min_size: 256,
             max_size: 2080,
             max_count: 8,
+            // Not a distilled fixed-schedule model: any step count the shared sanity caps
+            // admit is renderable (sc-19502).
+            supported_steps: Vec::new(),
             mac_only: true,
             // Q4/Q8 quantize the gpt-oss encoder's MoE experts (sc-3172 — the ~38 GB / 20 B-param
             // bulk → ~12 GB) and the DiT's linears (sc-3175) at load.

@@ -1567,6 +1567,9 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             min_size: 256,
             max_size: 2080,
             max_count: 8,
+            // Not a distilled fixed-schedule model: any step count the shared sanity caps
+            // admit is renderable (sc-19502).
+            supported_steps: Vec::new(),
             mac_only: false,
             supported_quants: &[Quant::Q4, Quant::Q8],
             component_precision_floors: &[],

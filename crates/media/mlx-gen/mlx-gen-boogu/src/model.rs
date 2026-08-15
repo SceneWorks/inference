@@ -100,6 +100,9 @@ pub fn descriptor() -> ModelDescriptor {
             min_size: RES_MIN,
             max_size: RES_MAX,
             max_count: MAX_COUNT,
+            // Not a distilled fixed-schedule model: any step count the shared sanity caps
+            // admit is renderable (sc-19502).
+            supported_steps: Vec::new(),
             mac_only: true,
             // The turnkey ships pre-packed Q8 (default) + bf16; load-time quantize (Q4/Q8) over the
             // dense bf16 build is a no-op on an already-packed snapshot. The DiT + Qwen3-VL text
