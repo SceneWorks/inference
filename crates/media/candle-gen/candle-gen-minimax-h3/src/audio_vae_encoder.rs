@@ -91,8 +91,27 @@ use crate::nn::{layer_norm, linear};
 ///
 /// Pinned as a constant for the same reason [`crate::layout::PUBLISHED_GATED_FFN_LAYOUT`] is:
 /// changing the head count changes `head_dim`, which changes the attention scale *and* the
-/// adaptive pool's window layout, while every tensor shape stays identical.
+/// adaptive pool's window layout, while every tensor shape stays identical — and, unlike a shape
+/// mismatch, produces a runnable model with a wrong soundtrack conditioning.
+///
+/// **Bound to a published document, not to itself.**
+/// [`MiniMaxH3AudioVaeConfig::cross_check_diffusers_json`] compares this constant against
+/// `audio_vae/config.json`'s `num_attention_heads` and refuses a checkpoint that disagrees. That
+/// check runs weights-free over the published config text in `crate::audio_config`'s own tests and
+/// against the real snapshot's `audio_vae/config.json` in `tests/real_weights.rs`. Before that it
+/// was pinned only by `assert_eq!(ATTN_PROJ_HEADS, 8)` — a literal restating itself — while every
+/// executed test built the encoder at the fixture's 2 heads.
 pub const ATTN_PROJ_HEADS: usize = 8;
+
+/// **The dtype the encode half is always built at**, whatever the provider's own store dtype is.
+///
+/// diffusers pins this whole component with `_keep_in_fp32_modules = ["encoder", …, "mean_proj",
+/// "logs_proj"]` — the weight-normed convolutions and Snake activations degrade audibly under
+/// bf16 — while `MiniMaxH3`'s own `dtype` is `BF16`, matching the DiT's block store. The plausible
+/// regression is a tidy-up that replaces this with `self.dtype` at the one call site
+/// (`crate::model::MiniMaxH3::load_audio_encoder`), which would encode every reference soundtrack
+/// at the wrong precision with no diagnostic. That call site is source-scanned for exactly that.
+pub const ENCODER_DTYPE: DType = DType::F32;
 
 /// `eps` for every `nn.LayerNorm` in `pre_block` — torch's default, declared in no config file.
 pub const LAYER_NORM_EPS: f64 = 1e-5;

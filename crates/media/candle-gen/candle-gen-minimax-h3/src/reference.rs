@@ -9,8 +9,12 @@
 //! ```
 //!
 //! The candle twin of `mlx_gen_minimax_h3::reference`. Every rule here is a property of the
-//! **model**, not of a backend, so it is restated rather than re-derived — and the two modules'
-//! constants are asserted equal from a shared committed record in `tests/ref2va_cross_backend.rs`.
+//! **model**, not of a backend, so it is restated rather than re-derived — and
+//! `tests/ref2va_cross_backend.rs` reads the MLX module's own source — through `include_str!`, so
+//! it runs on a lane that cannot build MLX at all — and asserts every cap that HAS a twin equals
+//! it, because two lanes that drifted apart on a cap would each pass their own suite forever. The
+//! caps with NO twin are pinned by name in that same file rather than skipped; today that is
+//! [`MIN_REFERENCE_CLIP_FRAMES`] alone, which this port added and the MLX lane does not carry.
 //!
 //! # `ref2va` is the task that serves image-edit, and `fl2va` is not
 //!
@@ -48,7 +52,12 @@
 //!
 //! # Rates are load-bearing and are not defaulted silently
 //!
-//! MiniMax-H3 resamples every reference onto its own 24 fps and onto the audio VAE's sample rate.
+//! MiniMax-H3 resamples every video reference onto its own 24 fps ([`normalize_reference_clip`]).
+//! It does **not** resample audio: this crate ships no resampler at all, so a soundtrack that is
+//! not already at the audio VAE's [`crate::audio_config::AUDIO_SAMPLE_RATE`] is **rejected** by
+//! [`Ref2VaReferences::new`], at the engine boundary and before any weight is read. The caller
+//! resamples.
+//!
 //! A reference built from frames whose real rate was lost is conditioned on **at the wrong speed,
 //! and nothing raises**. So [`VideoReference`] carries its `fps` and the waveform its `sample_rate`
 //! as required data rather than as an optional hint with a plausible default.
@@ -60,6 +69,18 @@
 
 use candle_gen::gen_core::{AudioTrack, Image};
 use candle_gen::{CandleError, Result};
+
+use crate::audio_config::AUDIO_SAMPLE_RATE;
+
+/// **The shortest normalized reference clip the video VAE can encode on its own lattice**: one
+/// whole chunk, `17 · 1 + 5`.
+///
+/// [`crate::conditioning::snap_reference_frames_down`] floors at this count, and
+/// `crate::model::generate_ref2va` pairs it with `.min(frames.len())` so a clip is never over-read
+/// — which together mean a *shorter* clip reaches the encoder **off** the `17n + 5` lattice.
+/// [`normalize_reference_clip`] therefore refuses one. The window that mattered is 13..=21:
+/// [`sample_video_condition_frames`] already refuses anything under 13.
+pub const MIN_REFERENCE_CLIP_FRAMES: usize = 22;
 
 /// Image references a `ref2va` request may carry.
 pub const MAX_IMAGE_REFERENCES: usize = 9;
@@ -274,6 +295,21 @@ pub fn normalize_reference_clip(
             "minimax-h3 ref2va: resampling a {}-frame clip from {fps} onto {target_fps} fps left \
              no frames",
             frames.len()
+        )));
+    }
+    // 2b. **One whole VAE chunk, or nothing.** `crate::model::generate_ref2va` snaps the kept count
+    // DOWN to the `17n + 5` lattice and then takes `.min(frames.len())`, so a normalized clip
+    // between `sample_video_condition_frames`' own 13-frame minimum and 21 would reach the encoder
+    // OFF the lattice — a regime nothing in this crate specifies, tests or bounds. Refused here,
+    // where the caller can still be told, rather than composed into an untested encode.
+    if kept.len() < MIN_REFERENCE_CLIP_FRAMES {
+        return Err(CandleError::Msg(format!(
+            "minimax-h3 ref2va: a {}-frame clip at {fps} fps normalizes to {} frames at \
+             {target_fps} fps, below the {MIN_REFERENCE_CLIP_FRAMES}-frame floor — the video VAE \
+             encodes on a `17n + 5` lattice whose smallest chunk is \
+             {MIN_REFERENCE_CLIP_FRAMES} frames, and a shorter clip would be encoded off it",
+            frames.len(),
+            kept.len()
         )));
     }
     // 3. onto the canvas its OWN aspect ratio resolves to.
@@ -533,10 +569,18 @@ impl Ref2VaReferences {
                 "minimax-h3 ref2va: reference {index} declares zero audio channels"
             )));
         }
-        if audio.sample_rate == 0 {
+        // **The rate gate, at the engine boundary.** This crate has NO audio resampler: the encode
+        // path (`crate::pipeline::audio_track_to_encoder_input`) rejects anything that is not
+        // already at the audio VAE's rate. Checking it only there meant a 44.1 kHz reference passed
+        // `Generator::validate` and died deep inside `generate_ref2va`, after the video VAE and the
+        // audio encoder had been mapped — the exact late failure this constructor exists to
+        // prevent. `sample_rate == 0` is subsumed: zero is not 32 000.
+        if audio.sample_rate != AUDIO_SAMPLE_RATE {
             return Err(CandleError::Msg(format!(
-                "minimax-h3 ref2va: reference {index} declares a zero sample rate; a soundtrack is \
-                 resampled onto the audio VAE's rate from the rate it carries"
+                "minimax-h3 ref2va: reference {index} carries a {} Hz soundtrack, but this engine \
+                 has no resampler — a reference soundtrack must already be at the audio VAE's \
+                 {AUDIO_SAMPLE_RATE} Hz. Resample it before sending it.",
+                audio.sample_rate
             )));
         }
         Ok(())
@@ -638,7 +682,7 @@ mod tests {
     fn track() -> AudioTrack {
         AudioTrack {
             samples: vec![0.0; 128],
-            sample_rate: 24_000,
+            sample_rate: AUDIO_SAMPLE_RATE,
             channels: 1,
             stems: Vec::new(),
         }
@@ -680,33 +724,85 @@ mod tests {
     /// silently changes which frames the model sees (sc-17157).
     #[test]
     fn a_clip_is_resampled_from_the_rate_it_declares() {
-        let five: Vec<Image> = [10u8, 20, 30, 40, 50].iter().map(|m| tagged(*m)).collect();
+        // Long enough that every case below clears MIN_REFERENCE_CLIP_FRAMES — the resample and the
+        // lattice floor are separate gates and this test must exercise the first, not trip the
+        // second. The markers are the frame indices, so an expectation is a list of source frames.
+        let thirty: Vec<Image> = (0u8..30).map(tagged).collect();
 
         // 24 fps — the identity case.
         assert_eq!(
-            markers(&normalize_at(24.0, &five)),
-            vec![10, 20, 30, 40, 50]
+            markers(&normalize_at(24.0, &thirty)),
+            (0u8..30).collect::<Vec<_>>()
         );
 
-        // 30 fps — frames are DROPPED (ffmpeg `fps` slotting: 5 · 24/30 keeps 4). The third frame is
-        // the one that goes. Declaring this clip at 24 fps instead would have played it 25% fast
-        // with nothing raised — the exact defect the carrier's `fps` field exists to prevent.
-        assert_eq!(markers(&normalize_at(30.0, &five)), vec![10, 20, 40, 50]);
+        // 30 fps — frames are DROPPED (ffmpeg `fps` slotting: 30 · 24/30 keeps 24). Every fifth
+        // source frame goes, starting at index 2. Declaring this clip at 24 fps instead would have
+        // played it 25% fast with nothing raised — the exact defect the carrier's `fps` field
+        // exists to prevent.
+        assert_eq!(
+            markers(&normalize_at(30.0, &thirty)),
+            (0u8..30).filter(|i| i % 5 != 2).collect::<Vec<_>>()
+        );
 
         // 12 fps — frames are DUPLICATED, each held for two output slots.
-        let three: Vec<Image> = [10u8, 20, 30].iter().map(|m| tagged(*m)).collect();
+        let eleven: Vec<Image> = (0u8..11).map(tagged).collect();
         assert_eq!(
-            markers(&normalize_at(12.0, &three)),
-            vec![10, 10, 20, 20, 30, 30]
+            markers(&normalize_at(12.0, &eleven)),
+            (0u8..11).flat_map(|i| [i, i]).collect::<Vec<_>>()
         );
 
         // Nothing is blended: every output frame is one of the inputs, verbatim.
-        for f in normalize_at(30.0, &five) {
+        for f in normalize_at(30.0, &thirty) {
             assert!(
                 f.pixels.iter().all(|p| *p == f.pixels[0]),
                 "a resampled frame must be a held source frame, never an interpolation"
             );
         }
+    }
+
+    /// **A clip that normalizes below one whole VAE chunk is REFUSED**, not encoded off the
+    /// `17n + 5` lattice.
+    ///
+    /// `snap_reference_frames_down` floors at 22 and its caller pairs it with `.min(frames.len())`,
+    /// so a 13..=21-frame normalized clip would reach `reference_clip_to_vae_pixels` at a count the
+    /// VAE has no chunk for — a composition nothing in this crate specifies or tests. The window is
+    /// real: `sample_video_condition_frames` admits from 13 frames up.
+    ///
+    /// The boundary is asserted from both sides, because a gate written with `<=` would refuse
+    /// every legal one-chunk clip and the refusal half would still pass.
+    #[test]
+    fn a_clip_shorter_than_one_vae_chunk_is_refused() {
+        assert_eq!(MIN_REFERENCE_CLIP_FRAMES, 22);
+        let at_floor: Vec<Image> = (0u8..MIN_REFERENCE_CLIP_FRAMES as u8).map(tagged).collect();
+        assert_eq!(
+            markers(&normalize_at(24.0, &at_floor)).len(),
+            MIN_REFERENCE_CLIP_FRAMES,
+            "exactly one chunk must be ADMITTED"
+        );
+
+        for short in [1usize, 13, 21] {
+            let frames: Vec<Image> = (0..short as u8).map(tagged).collect();
+            let e = normalize_reference_clip(
+                &frames,
+                crate::denoise::MINIMAX_H3_FPS,
+                64,
+                crate::pipeline::SPATIAL_STRIDE as i32,
+                crate::pipeline::CANVAS_SHORT_EDGE as i32,
+                i64::from(crate::pipeline::CANVAS_MAX_PIXELS),
+                crate::denoise::MINIMAX_H3_FPS,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                e.contains(&format!("{MIN_REFERENCE_CLIP_FRAMES}-frame floor")),
+                "{short} frames: {e}"
+            );
+        }
+
+        // ...and the floor is on the NORMALIZED count, not the source count: 12 source frames at
+        // 12 fps double to 24 and are admitted, while 12 at 24 fps stay 12 and are not.
+        let twelve: Vec<Image> = (0u8..12).map(tagged).collect();
+        assert_eq!(markers(&normalize_at(12.0, &twelve)).len(), 24);
     }
 
     fn vid_ref(with_audio: bool) -> Ref2VaReference {
@@ -885,7 +981,7 @@ mod tests {
         let empty_wave = Ref2VaReference::Audio(AudioReference {
             audio: AudioTrack {
                 samples: Vec::new(),
-                sample_rate: 24_000,
+                sample_rate: AUDIO_SAMPLE_RATE,
                 channels: 1,
                 stems: Vec::new(),
             },
@@ -894,6 +990,54 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("empty waveform"), "{e}");
+    }
+
+    /// **A soundtrack at any rate but the audio VAE's is refused HERE**, at the engine boundary.
+    ///
+    /// There is no resampler in this crate — `pipeline::audio_track_to_encoder_input` rejects the
+    /// same thing — so before this check a 44.1 kHz reference passed `Generator::validate` and died
+    /// inside `generate_ref2va` *after* the video VAE and the audio encoder had been mapped. The
+    /// module docs claimed the soundtrack "is resampled onto the audio VAE's rate", which no code
+    /// anywhere did.
+    ///
+    /// Both carriers are covered: a standalone audio reference and a **clip's own** soundtrack.
+    #[test]
+    fn a_soundtrack_at_the_wrong_rate_is_refused_at_the_boundary() {
+        let at = |rate: u32| AudioTrack {
+            samples: vec![0.0; 128],
+            sample_rate: rate,
+            channels: 1,
+            stems: Vec::new(),
+        };
+        // Control: the VAE's own rate is admitted through both carriers.
+        Ref2VaReferences::new(vec![
+            img_ref(),
+            Ref2VaReference::Audio(AudioReference {
+                audio: at(AUDIO_SAMPLE_RATE),
+            }),
+        ])
+        .expect("32 kHz is the rate the encoder reads");
+
+        for rate in [0u32, 16_000, 24_000, 44_100, 48_000] {
+            let standalone = Ref2VaReference::Audio(AudioReference { audio: at(rate) });
+            let e = Ref2VaReferences::new(vec![img_ref(), standalone])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                e.contains(&format!("{rate} Hz")) && e.contains("no resampler"),
+                "{rate}: {e}"
+            );
+
+            // ...and the same rate carried by a clip's own soundtrack, which reaches exactly the
+            // same encoder.
+            let sounded = Ref2VaReference::Video(VideoReference {
+                frames: vec![image(64, 64)],
+                fps: 24.0,
+                audio: Some(at(rate)),
+            });
+            let e = Ref2VaReferences::new(vec![sounded]).unwrap_err().to_string();
+            assert!(e.contains("no resampler"), "{rate} on a clip: {e}");
+        }
     }
 
     /// `has_audio` is what orders the presentation, so it is pinned per variant rather than left
