@@ -4278,6 +4278,16 @@ jobs:
     env:
       SA3_SAME_L_CASE: standalone
       SA3_TEST_CUDA: "1"
+      # 80 IS CORRECT ON A BLACKWELL BOX, AND RAISING IT TO 120 IS A REGRESSION (sc-19545). This
+      # is the first of thirteen sites in this file; the full reasoning is on the same declaration
+      # in `ci.yml`. In one paragraph: `CUDA_COMPUTE_CAP` names the BOTTOM RUNG of an architecture
+      # ladder, not the hardware. It seeds one cudaforge `-gencode`, and
+      # `vendor/candle-kernels/build.rs` appends sm_90, sm_120 and `compute_120` PTX above it
+      # (sc-7544), so `libmoe.a` is a fatbin covering Ampere -> Blackwell from one binary. Setting
+      # this to the runner's own 120 deletes the Ampere rung and lifts the dense PTX floor with it.
+      # NOTHING ENFORCES THIS. sc-19545 verified all 15 sites (13 here, 2 in `ci.yml`) by hand and
+      # a drift guard was deliberately scoped out, so the value is load-bearing but unguarded: an
+      # edit here surfaces as black renders on customer GPUs, never as a red build.
       CUDA_COMPUTE_CAP: "80"
       CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
@@ -5746,12 +5756,19 @@ jobs:
       # while epic 17137 lives on `feature/sc-17137-minimax-h3` the entire job is dispatch-only.
       # Stated here so nobody waits on a Monday run that cannot fire.
       #
-      # THE COMPUTE CAP IS NOT A HAZARD FOR THIS NUMBER. `CUDA_COMPUTE_CAP: "80"` names Ampere on a
-      # Blackwell (sm_120) box, which is a known latent hazard for QUANTIZED matmuls returning
-      # zeros. This lane advertises `supported_quants: &[]` and the probe measures the DENSE bf16
-      # checkpoint, so it touches no quantized kernel. The probe's `DEGENERATE_STD_FLOOR` middle-
-      # frame check would fail an all-zeros render anyway. Retiring the cap mismatch itself is
-      # filed separately and is deliberately NOT done here.
+      # THE COMPUTE CAP IS NOT A HAZARD FOR THIS NUMBER, and sc-19545 has now established WHY --
+      # the earlier wording here ("a known latent hazard") was reasoning from the number's name and
+      # was wrong. `CUDA_COMPUTE_CAP: "80"` does not describe the hardware and is not supposed to:
+      # it is the bottom rung of the arch ladder, and `vendor/candle-kernels/build.rs` appends
+      # sm_90, sm_120 and `compute_120` PTX above it (sc-7544), so the Blackwell card IS covered.
+      # The silent-zeros class was retired then, not merely deferred.
+      #
+      # Two independent reasons this probe could not have hit it regardless: the lane advertises
+      # `supported_quants: &[]` and measures the DENSE bf16 checkpoint, so no quantized kernel is
+      # reachable; and the probe's `DEGENERATE_STD_FLOOR` middle-frame check would fail an
+      # all-zeros render anyway. sc-19545 closed the diagnosis but deliberately added no CI guard,
+      # so the general case is still covered only by `candle-gen/tests/cuda_quant_smoke.rs` -- which
+      # no workflow currently executes. See that file's header.
       - name: Require the FULL MiniMax-H3 snapshot before measuring
         if: inputs.minimax_h3_vram_probe
         shell: cmd
