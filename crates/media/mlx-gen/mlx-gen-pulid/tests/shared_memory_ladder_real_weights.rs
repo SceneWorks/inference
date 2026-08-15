@@ -90,6 +90,7 @@ fn ladder_preserves_identity_quality_and_reduces_request_peak() {
         }],
         ..Default::default()
     };
+    assert!(request.phases.is_none());
 
     // Like-for-like Resident request baseline, measured after load with the same Q4 identity stack.
     let mut resident_spec = optimized_spec.clone();
@@ -155,7 +156,8 @@ fn ladder_preserves_identity_quality_and_reduces_request_peak() {
                 mode: MemoryMode::ImageToImage,
                 reference_count: 1,
                 use_pid: false,
-                has_phases: true,
+                // PuLID is a single-phase request even when the load policy is Sequential.
+                has_phases: false,
                 overlay: Some("identity".into()),
             },
         )

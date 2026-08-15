@@ -10,12 +10,14 @@ use mlx_gen::gen_core::{
     MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemorySafetyDecision,
     MemoryStrategy, Result as CoreResult,
 };
-use mlx_gen::{LoadSpec, OffloadPolicy, WeightsSource};
+use mlx_gen::{LoadSpec, WeightsSource};
 use sha2::{Digest, Sha256};
 
 pub const MEMORY_CALIBRATION_FINGERPRINT: &str =
     "pulid-flux-dev-q4-mlx-shared-ladder-2026-08-04-v1";
-const STATIC_CALIBRATION: &str = "pulid-flux-static-registry-behavior-v1";
+/// Source-owned weights-free behavior identity. Version route/fixture semantics here without
+/// restamping the real-weight calibration above.
+const STATIC_CALIBRATION: &str = "pulid-flux-static-registry-behavior-v2";
 pub const ATTENTION_CHUNK_SIZE: u32 = mlx_gen_flux::memory_strategy::ATTENTION_CHUNK_SIZE;
 pub const DECODE_TILE_EDGES: &[u32] = mlx_gen_flux::memory_strategy::DECODE_TILE_EDGES;
 pub const DECODE_OVERLAP: u32 = mlx_gen_flux::memory_strategy::DECODE_OVERLAP;
@@ -226,9 +228,10 @@ pub fn safety_check(
         if context.mode != MemoryMode::ImageToImage
             || context.geometry.reference_count != 1
             || context.use_pid
+            || context.has_phases
             || context.overlay.as_deref() != Some("identity")
         {
-            return Err(CoreError::Unsupported("pulid_flux: memory route requires one identity reference, overlay=identity, and native VAE decode".into()));
+            return Err(CoreError::Unsupported("pulid_flux: memory route requires one identity reference, overlay=identity, native VAE decode, and no request phases".into()));
         }
         if contract
             .calibration
@@ -276,11 +279,13 @@ pub fn registered_fixture(
             mode: MemoryMode::ImageToImage,
             reference_count: 1,
             use_pid: false,
-            has_phases: spec.offload_policy == OffloadPolicy::Sequential,
+            has_phases: false,
             overlay: Some("identity".into()),
         },
     )?;
-    Ok(vec![MemoryBehaviorFixture::new(context)])
+    let mut fixture = MemoryBehaviorFixture::new(context);
+    fixture.request.prompt = "weights-free PuLID memory behavior".into();
+    Ok(vec![fixture])
 }
 
 pub fn registered_begin_request(
@@ -350,7 +355,7 @@ fn begin_with(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_gen::{IdentityWeights, LoadShape, Quant};
+    use mlx_gen::{IdentityWeights, LoadShape, OffloadPolicy, Quant};
 
     fn spec() -> LoadSpec {
         let mut spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
@@ -370,6 +375,14 @@ mod tests {
         let spec = spec();
         let contract = weights_free_contract(&spec).unwrap();
         assert_eq!(contract.provider_id, crate::pulid_flux::MODEL_ID);
+        assert_eq!(
+            contract.calibration.as_ref().unwrap().fingerprint,
+            "pulid-flux-static-registry-behavior-v2"
+        );
+        assert_eq!(
+            MEMORY_CALIBRATION_FINGERPRINT, "pulid-flux-dev-q4-mlx-shared-ladder-2026-08-04-v1",
+            "source-owned route correction must not restamp measured evidence"
+        );
         assert!(contract.conformance_errors().is_empty());
         for strategy in MemoryStrategy::ALL {
             assert!(matches!(
@@ -388,12 +401,100 @@ mod tests {
             safety_check(&spec, &contract, &fixture.context),
             MemorySafetyDecision::Accept
         );
-        let mut wrong = fixture.context;
+        assert!(!fixture.context.has_phases);
+        assert!(fixture.request.phases.is_none());
+        assert_eq!(fixture.request.width, fixture.context.geometry.width);
+        assert_eq!(fixture.request.height, fixture.context.geometry.height);
+        assert_eq!(fixture.request.count, fixture.context.geometry.batch);
+        assert_eq!(fixture.request.use_pid, fixture.context.use_pid);
+        assert!(matches!(
+            fixture.request.conditioning.as_slice(),
+            [mlx_gen::Conditioning::Reference { .. }]
+        ));
+        crate::pulid_flux::descriptor()
+            .capabilities
+            .validate_request(crate::pulid_flux::MODEL_ID, &fixture.request)
+            .unwrap();
+
+        let mut wrong = fixture.context.clone();
         wrong.overlay = None;
         assert!(matches!(
             safety_check(&spec, &contract, &wrong),
             MemorySafetyDecision::Reject { .. }
         ));
+
+        let mut phases = fixture.context;
+        phases.has_phases = true;
+        assert!(matches!(
+            safety_check(&spec, &contract, &phases),
+            MemorySafetyDecision::Reject { .. }
+        ));
+        assert!(registered_begin_request(&spec, &contract, &phases).is_err());
+    }
+
+    #[test]
+    fn registry_publishes_exact_twelve_surface_ladder() {
+        use mlx_gen::gen_core::{
+            LoadShape, MemoryContractSurfaceTier, MemoryStrategySupport, OffloadPolicy,
+        };
+        use std::collections::BTreeSet;
+
+        let registry = crate::provider_registry().unwrap();
+        let surfaces = registry.memory_contract_surfaces().unwrap();
+        assert_eq!(surfaces.len(), 12);
+        let selectors: BTreeSet<_> = surfaces
+            .iter()
+            .map(|surface| surface.selector.id())
+            .collect();
+        let expected: BTreeSet<_> = [
+            "bf16:resident:eager",
+            "bf16:resident:deferred",
+            "bf16:sequential:eager",
+            "bf16:sequential:deferred",
+            "q4:resident:eager",
+            "q4:resident:deferred",
+            "q4:sequential:eager",
+            "q4:sequential:deferred",
+            "q8:resident:eager",
+            "q8:resident:deferred",
+            "q8:sequential:eager",
+            "q8:sequential:deferred",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(selectors, expected);
+
+        let mut resident = 0;
+        let mut staged = 0;
+        let mut bounded_transformer = 0;
+        for surface in surfaces {
+            assert_eq!(surface.contract.provider_id, crate::pulid_flux::MODEL_ID);
+            assert!(matches!(
+                surface.resolved_artifact_tier(),
+                MemoryContractSurfaceTier::Bf16
+                    | MemoryContractSurfaceTier::Q4
+                    | MemoryContractSurfaceTier::Q8
+            ));
+            let sequential = surface.selector.offload_policy == OffloadPolicy::Sequential;
+            let deferred = surface.selector.load_shape == LoadShape::DeferredMaterialization;
+            let implemented = |strategy| {
+                surface.contract.capability(strategy).unwrap().support
+                    == MemoryStrategySupport::Implemented
+            };
+            resident += usize::from(implemented(MemoryStrategy::Resident));
+            staged += usize::from(implemented(MemoryStrategy::StagedResidency));
+            bounded_transformer +=
+                usize::from(implemented(MemoryStrategy::BoundedTransformerResidency));
+            assert!(implemented(MemoryStrategy::Resident));
+            assert_eq!(implemented(MemoryStrategy::StagedResidency), sequential);
+            assert_eq!(
+                implemented(MemoryStrategy::BoundedTransformerResidency),
+                sequential && deferred
+            );
+        }
+        assert_eq!(resident, 12);
+        assert_eq!(staged, 6);
+        assert_eq!(bounded_transformer, 3);
     }
 
     #[test]
