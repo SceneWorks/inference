@@ -36,6 +36,20 @@ impl Qwen3Mlp {
         Ok(())
     }
 
+    /// The packed width shared by all three projections, or `None` if any loaded dense or they
+    /// disagree.
+    pub fn packed_bits(&self) -> Option<i32> {
+        super::uniform_packed_bits([&self.gate, &self.up, &self.down])
+    }
+
+    /// Device bytes the three projections hold.
+    pub fn nbytes(&self) -> usize {
+        [&self.gate, &self.up, &self.down]
+            .into_iter()
+            .map(crate::quant::nbytes)
+            .sum()
+    }
+
     /// `x`: `[b, s, hidden]` → `[b, s, hidden]`.
     pub fn forward(&self, x: &Array) -> Result<Array> {
         let g = silu(&self.gate.forward_upcast(x)?)?;

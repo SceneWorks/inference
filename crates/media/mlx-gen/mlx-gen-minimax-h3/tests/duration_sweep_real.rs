@@ -36,6 +36,38 @@
 //! bound rather than a sample of a noisy distribution. Median and max are printed beside it and
 //! their ratio is the contention band; a wide band devalues the row, and the reader can see it.
 //!
+//! ## ⚠️ Seven wall-clock assertions live here, and sc-19505 did NOT fix them
+//!
+//! sc-19505 removed `Instant`-fed assertions from the sibling tests, and this file was originally
+//! reported as clean. It is not. Seven assertion conditions here are fed by
+//! `step_times.push(last.elapsed().as_secs_f64())`:
+//!
+//! | site | assertion | shape |
+//! |---|---|---|
+//! | `:424` | `pair[1].fastest_step() > pair[0].fastest_step()` | monotonicity across four renders |
+//! | `:455` | `step_growth > 1.0` | ratio of two elapsed values vs a constant |
+//! | `:459` | `exponent > 0.8` | log-ratio of the same |
+//! | `:514` | `p.fastest_step() > 0.5` | absolute duration constant |
+//! | `:523` | `band < 6.0` | slowest/fastest ratio vs a constant |
+//! | `:530` | `second_half < first_half * 3.0` | ratio of elapsed sums vs a constant |
+//! | `:610` | `p.fastest_step() > 0.5` | absolute duration constant |
+//!
+//! (Two further assertions, `:266` and `:509`, read the *count* of timed steps rather than any
+//! duration — they gate that the progress callback fired, and are not in this class.)
+//!
+//! They are **deferred to sc-19556**, not overlooked. The reasoning already at `:417` is why:
+//! `fastest_step` is a *hardware lower bound* (contention can only push a step slower), which is a
+//! genuinely better instrument than the wall-clock total it replaced — the same sweep produced
+//! 343 / 282 / 624 / 328 s totals with no relationship to duration at all. It is still a clock, so
+//! the class is unresolved, but the mitigation is real rather than nominal.
+//!
+//! The blocking reason is sc-19505's own AC3: **each replacement must be mutation-checked
+//! individually against the thing it guards.** All three owning tests are `#[ignore]`d behind the
+//! ~196 GB snapshot and Metal and cost ~50 minutes combined, so no replacement written here could
+//! be executed, let alone mutated. Rewriting them blind would manufacture exactly the false greens
+//! sc-19505 exists to remove. Whoever next holds the real-weight slot for this harness should take
+//! them, with a measured run in hand.
+//!
 //! # The tier axis (sc-17150)
 //!
 //! The q4/q8 tiers now exist and load. `model::load` no longer refuses `spec.quantize`: it

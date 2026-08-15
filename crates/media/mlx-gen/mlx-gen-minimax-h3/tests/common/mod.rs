@@ -328,6 +328,51 @@ pub fn assert_parity(got: &Array, want: &Array, tol: f32, what: &str) {
     );
 }
 
+/// **The materialization instrument** (sc-19452, shared by sc-19505). Whether MLX has already
+/// *materialized* this array — whether the compute that produces it has actually happened, rather
+/// than sitting in an unscheduled graph waiting for somebody to force it.
+///
+/// `_mlx_array_is_available` is mlx-c's accessor for `mlx::core::array::is_available()`: the status
+/// is `available`, or it is `evaluated` with the completion event signalled or absent. A
+/// **synchronous** `mlx_rs::transforms::eval` — the only kind this crate uses — attaches no event
+/// and marks its outputs `evaluated` before returning, so the reading is exact and clock-free. That
+/// is where the load-insensitivity comes from, and it is conditional: if a production `eval` here
+/// were ever switched to `async_eval`, this would become a race against the event signal and would
+/// have to `wait()` first. Anyone making that change has to revisit every caller of this function.
+///
+/// Two precision notes, because the obvious paraphrases are both wrong:
+///
+/// * it is **not** "`false` for anything an op returned". MLX short-circuits identity ops — a
+///   `reshape` to the same shape, a full-range `slice`, an `astype` to the same dtype — by
+///   returning the *input*, which keeps the input's status. A view defers no compute, so the
+///   reading stays semantically right, but the mechanism is not "every op yields unscheduled";
+/// * it is **not** a pure read. `is_available()` detaches the event and promotes the status on the
+///   shared descriptor, non-atomically. Harmless under this repo's forced `RUST_TEST_THREADS = 1`,
+///   but do not treat it as a race-free probe of an `Array` shared across threads.
+///
+/// mlx-rs exposes no safe wrapper, so the call goes through `mlx-sys` — the same binding crate
+/// `mlx_rs::Array` is built on, so [`Array::as_ptr`] hands back exactly the `mlx_array` this
+/// signature wants. Two obligations, not one: the handle must outlive the call, which the `&Array`
+/// borrow guarantees; and some mlx-rs op must already have run on this thread, because mlx-rs
+/// installs its error handler lazily inside its own wrappers and mlx-c's default handler is
+/// `exit(-1)` rather than a status return. Every caller must therefore read *after* it has built
+/// or loaded the arrays under test, which every current call site does.
+///
+/// # Why this lives here rather than in one test file
+///
+/// Two test binaries read it — `pipeline.rs` (sc-19452) and `joint_denoise.rs` (sc-19505) — and the
+/// preconditions above are subtle enough that a second copy of them would drift. `mod common;` is
+/// compiled into each binary, so there is one function and one set of caveats.
+pub fn is_materialized(array: &Array) -> bool {
+    let mut available = false;
+    let status = unsafe { mlx_sys::_mlx_array_is_available(&mut available, array.as_ptr()) };
+    assert_eq!(
+        status, 0,
+        "_mlx_array_is_available failed on a live array handle"
+    );
+    available
+}
+
 /// Standard deviation of a tensor — a golden whose expected output is ~constant proves nothing.
 pub fn std_dev(x: &Array) -> f32 {
     let x = x.as_dtype(mlx_rs::Dtype::Float32).unwrap();
@@ -335,6 +380,287 @@ pub fn std_dev(x: &Array) -> f32 {
     let centered = mlx_rs::ops::subtract(&x, Array::from_f32(mean)).unwrap();
     let var: f32 = centered.square().unwrap().mean(None).unwrap().item();
     var.sqrt()
+}
+
+// --- sc-19449: the AdaLN precompute / denoise phase pair ---------------------------------------
+
+/// Multiple of the **retained modulation table** that the precompute's own transient has to stay
+/// under — the denominator of assertion (g) in [`assert_adaln_phase_envelope`].
+///
+/// Integer arithmetic on purpose: these are byte counts in the tens of gigabytes, where an `f64`
+/// round-trip is avoidable noise in a message a reviewer has to trust.
+///
+/// Measured `precompute_transient / table` is **2.222x** on the synthetic f32 8-layer stack and
+/// **1.331x** on the real bf16 50-layer `transformer/`. `peak_precompute` is bit-stable run to run
+/// at both (`166_627_328 B` over four synthetic runs whose `peak_denoise` moved 37%), so `3` is
+/// 1.35x of headroom at the tighter of the two. This is the **only** empirical number left in the
+/// envelope — everything else follows from the identity documented on
+/// [`assert_adaln_phase_envelope`].
+pub const ADALN_TRANSIENT_TABLE_MULTIPLE: usize = 3;
+
+/// The fixed fraction of `released` that assertion (f) was stated against before sc-19449's
+/// review, as `num/den`. **Retired** — (f) is now stated against `released −
+/// denoise_working_set`, which is geometry-free where a fixed fraction is not.
+///
+/// Kept, and used only by `adaln_evict_memory.rs`'s arm 1b, which holds a denoise working set of
+/// half the eviction live and shows that the retired form goes red under it while the shipped form
+/// still closes. That is the design decision as an executing measurement rather than as a comment.
+pub const ADALN_RETIRED_GAP_NUM: usize = 3;
+/// Denominator of [`ADALN_RETIRED_GAP_NUM`].
+pub const ADALN_RETIRED_GAP_DEN: usize = 4;
+
+/// One AdaLN precompute-and-evict measurement: both phase peaks, and the residency either side of
+/// the evict. Every field is MLX **active** bytes.
+///
+/// # Why this is a shared type rather than assertions written twice
+///
+/// Until sc-19449, `tests/adaln_evict_memory.rs` and `tests/adaln_evict_real_weights.rs` each
+/// computed `peak_precompute`, printed it, and asserted **nothing** against it. Their (a)-(d) pin
+/// the post-evict drop against the *pre-evict resident* — a residency, not a phase peak — so the
+/// two tests positioned to measure the precompute/denoise relationship measured it and let it go.
+/// That is how `convert.rs` came to carry the claim that AdaLN precompute is free because "the
+/// precompute peak stays under the denoise peak … it holds, comfortably", which sc-18659
+/// retracted: the one in-repo measurement of the precompute side
+/// (`memory_strategy::ADALN_EVICTED_BYTES`, 64.56 → 38.70 GB active) says the precompute side sits
+/// *above* the residency that follows, i.e. the inequality ran the other way.
+///
+/// [`assert_adaln_phase_envelope`] now pins the pair, and both files call it, so the synthetic and
+/// the real-weight measurement cannot drift into pinning different things.
+pub struct AdaLnPhases<'a> {
+    /// Tier, denoise geometry and cache schedule this pair was taken at. The bounds below no
+    /// longer depend on any of the three (see [`assert_adaln_phase_envelope`]); the label is on
+    /// the record line so a reader can reproduce the measurement and so the record says what was
+    /// measured rather than leaving it to be guessed.
+    pub scale: &'a str,
+    /// Active bytes with every `adaln_proj` still resident, before `precompute_and_evict`.
+    pub active_before: usize,
+    /// Active bytes after the evict and the allocator drain.
+    pub active_after: usize,
+    /// High-water of the precompute+evict phase — peak reset immediately before it, read
+    /// immediately after.
+    pub peak_precompute: usize,
+    /// High-water of the phase that runs *after* the evict — peak reset again, then a real block
+    /// forward against the cached table.
+    pub peak_denoise: usize,
+    /// Projection bytes `precompute_and_evict` reported releasing.
+    pub released: usize,
+    /// Bytes of the modulation table the precompute retains in their place.
+    pub table: usize,
+}
+
+impl AdaLnPhases<'_> {
+    /// `peak_precompute − peak_denoise`, saturating. The quantity sc-19449 is about.
+    pub fn gap(&self) -> usize {
+        self.peak_precompute.saturating_sub(self.peak_denoise)
+    }
+
+    /// What the precompute phase adds on top of the residency it starts from.
+    pub fn precompute_transient(&self) -> usize {
+        self.peak_precompute.saturating_sub(self.active_before)
+    }
+
+    /// What the denoise phase adds on top of the residency it starts from — activations, the rope
+    /// tables, the gathered modulation. This is the term that moves with **geometry**, and it is
+    /// also the noisiest reading here: it moved 4.1 → 8.2 MB over four synthetic runs.
+    pub fn denoise_working_set(&self) -> usize {
+        self.peak_denoise.saturating_sub(self.active_after)
+    }
+
+    /// Active bytes the evict actually removed. Below `released` by the table the precompute
+    /// retained in the projections' place — the term assertion (f) reduces to.
+    pub fn freed(&self) -> usize {
+        self.active_before.saturating_sub(self.active_after)
+    }
+
+    fn x(&self, bytes: usize) -> f64 {
+        bytes as f64 / (self.released.max(1)) as f64
+    }
+
+    /// The single greppable record line. The label says what was measured; the two ratios the
+    /// bounds are stated against — `gap`/`released` and `transient`/`table` — are on it so a
+    /// future run at a new tier or schedule can be compared to this one without re-deriving.
+    pub fn record(&self) -> String {
+        format!(
+            "ADALN PHASE PAIR [{}]: peak_precompute {} B, peak_denoise {} B, gap {} B ({:.3}x \
+             released); precompute transient {} B ({:.3}x released, {:.3}x table), denoise \
+             working set {} B ({:.3}x); active {} -> {} B, released {} B, table {} B",
+            self.scale,
+            self.peak_precompute,
+            self.peak_denoise,
+            self.gap(),
+            self.x(self.gap()),
+            self.precompute_transient(),
+            self.x(self.precompute_transient()),
+            self.precompute_transient() as f64 / self.table.max(1) as f64,
+            self.denoise_working_set(),
+            self.x(self.denoise_working_set()),
+            self.active_before,
+            self.active_after,
+            self.released,
+            self.table,
+        )
+    }
+}
+
+/// Pin the AdaLN precompute/denoise phase relationship (sc-19449).
+///
+/// # The identity both bounds are stated against
+///
+/// `mlx_reset_peak_memory` sets the counter to **zero** — `MetalAllocator::reset_peak_memory` in
+/// `mlx/backend/metal/allocator.h` is `peak_memory_ = 0`, not `= active_memory_` — and the
+/// allocator raises it back to the then-current active on the very next `malloc`
+/// (`peak_memory_ = std::max(peak_memory_, active_memory_)` in `allocator.cpp`). Both read at the
+/// MLX revision this workspace pins. The precompute's first allocation therefore happens while
+/// every `adaln_proj` is still resident, so the precompute phase's high-water cannot be below the
+/// pre-evict residency — assertion (e). The denoise phase's window opens *after* the evict, so its
+/// high-water is the post-evict residency plus its own working set. Substituting the definitions
+/// of all four derived terms:
+///
+/// ```text
+/// gap = peak_precompute − peak_denoise
+///     = (active_before + precompute_transient) − (active_after + denoise_working_set)
+///     = freed + precompute_transient − denoise_working_set
+/// ```
+///
+/// That is an **identity**: it holds by the definitions of the terms, at every tier, every
+/// geometry and every schedule. sc-19449's review found the first cut of (f)/(g) stated as fixed
+/// fractions of `released` instead, which made both of them tier-, geometry- and schedule-bound —
+/// (f) had only 2.8% of margin at bf16 render geometry, and (g)'s `1/2` was 1.3x from red at q4.
+/// Both are now stated against the identity, which removes all three dependences by construction.
+/// The constants did not need tightening; the **denominators** were wrong.
+///
+/// # (f) `gap + denoise_working_set >= released`
+///
+/// Substituting the identity, (f) is exactly
+///
+/// ```text
+/// precompute_transient  >=  released − freed
+/// ```
+///
+/// — the precompute's own high-water covers the bytes it did **not** hand back, i.e. the table it
+/// retained in the projections' place. It holds by the ordering `precompute_and_evict` exists to
+/// guarantee: the table is materialized while every projection is still resident, and only then is
+/// anything dropped. Not vacuous — it is red for the lazy-eval trap this file's arm 2 demonstrates
+/// (nothing freed, no transient, `released` still reported), red for a peak read from the wrong
+/// side of the evict, and red for an over-reported `released`.
+///
+/// * **Geometry-free.** `denoise_working_set` enters `gap` through `peak_denoise` and enters the
+///   left-hand side directly, with opposite signs, so it cancels exactly. So does the run-to-run
+///   noise in `peak_denoise`, which is ±37% at synthetic scale and would otherwise have to be
+///   absorbed by slack. The measured margin is 4_030_464 B synthetic and 52_025_344 B real, and
+///   both are constant in the working set.
+/// * **Tier-free.** `released` and `freed` are both the projections' bytes at the tier they were
+///   loaded at and move together; the difference between them is the retained table, whose dtype
+///   is the *compute* dtype (`quant::compute_dtype` — bf16 off a packed tier's scales) rather than
+///   the tier's bit width.
+/// * **Schedule-free.** The schedule sets `modulation_rows`, which scales `table` and
+///   `precompute_transient` together; the margin is 0.32x-1.14x of `table` at the two measured
+///   points, i.e. it tracks the table rather than the eviction.
+///
+/// Written additively rather than as `gap >= released − denoise_working_set` so that neither side
+/// saturates: past the crossing at `denoise_working_set = released` the subtractive form would go
+/// quietly vacuous, where this one still requires the eviction to be accounted for.
+///
+/// # (g) `precompute_transient <= ADALN_TRANSIENT_TABLE_MULTIPLE · table`
+///
+/// The corrected form of the retracted claim: the precompute is **not** free — it pays for the
+/// full pre-evict residency, which (e) pins — but its own transient on top of that residency is a
+/// small multiple of the table it keeps, so the lever is net-positive at its own worst instant.
+///
+/// Against `table`, not against `released`, because the two scale in opposite directions:
+///
+/// * `table` grows linearly with `modulation_rows` — 51 rows for the 8-evaluation schedule these
+///   tests use, roughly 600 for a 100-step render — and so does `precompute_transient`;
+/// * `released` **falls** with the tier. q4 packs `adaln_proj` at 4 bits plus one f16 scale and
+///   bias per group of 64, so it drops from 26.02 GB to ≈7.3 GB (≈6.5 GB if the group metadata is
+///   not counted).
+///
+/// Combining them, a q4 render on a 600-row schedule puts `precompute_transient / released` at
+/// ≈0.35x (≈0.40x on the 4x model) against the retired `1/2` ceiling — 1.3x-1.4x of headroom on a
+/// bound that reads as 60x loose at the geometry it was measured at (0.008x real). Stated against
+/// `table`, the same quantity is 1.331x real and 2.222x synthetic at *any* tier and schedule.
+///
+/// # What is still empirical
+///
+/// Only (g)'s multiple. The identity is exact, (e) follows from the allocator's peak semantics and
+/// (f) from the precompute's ordering; `precompute_transient / table` is measured — 2.222x
+/// synthetic, 1.331x real — and is the projection-output intermediates on top of the table that is
+/// kept. Every record line reports it. A changed precompute ordering, or a first measurement at a
+/// tier or schedule not covered here, does not invalidate (e) or (f), but it does need that ratio
+/// read off the record line before [`ADALN_TRANSIENT_TABLE_MULTIPLE`] can be trusted at `3`.
+pub fn assert_adaln_phase_envelope(p: &AdaLnPhases<'_>) {
+    println!("  {}", p.record());
+
+    // (e) STAGE WINDOW. The precompute phase's high-water is at least the residency it began
+    //     with. This is what makes `peak_precompute` a *phase* reading at all: if the peak were
+    //     reset after the evict, or read from the wrong side of it, this is the assertion that
+    //     notices. Attributing a peak to the wrong stage is the error that produced two wrong
+    //     handoffs on this epic, and nothing here could see it before.
+    assert!(
+        p.peak_precompute >= p.active_before,
+        "the precompute phase peaked at {} B, BELOW the {} B that was resident when the phase \
+         opened — the peak was not read over the precompute window, so nothing here is a \
+         per-stage measurement",
+        p.peak_precompute,
+        p.active_before
+    );
+
+    // (f) THE IDENTITY CLOSES. `gap + denoise_working_set >= released`: the drop from the
+    //     precompute peak to the denoise peak, plus whatever the denoise phase added back,
+    //     accounts for the whole eviction. Reduces to `precompute_transient >= released − freed`,
+    //     i.e. the precompute's high-water covers the table it retained instead of releasing —
+    //     true by the ordering `precompute_and_evict` guarantees, at any tier, geometry or
+    //     schedule. It also carries the direction the retracted claim had backwards: below the
+    //     crossing, `gap` cannot be the eviction unless `peak_precompute > peak_denoise`.
+    //
+    //     NOT a fixed fraction of `released`. That was the first cut, and it made the bound
+    //     geometry- and tier-bound: 2.8% of margin at bf16 render geometry, and it would false-red
+    //     outright at q4. `adaln_evict_memory.rs`'s arm 1b measures both halves of that.
+    let covered = p.gap().saturating_add(p.denoise_working_set());
+    assert!(
+        covered >= p.released,
+        "the precompute peak {} B is only {} B above the denoise peak {} B; with the denoise \
+         phase's own working set of {} B that accounts for {} B of a {} B eviction. \
+         `gap = freed + precompute_transient − denoise_working_set` is an identity, so this can \
+         only fail if the precompute's transient ({} B) no longer covers what it kept rather than \
+         released ({} B) — the table was not materialized before the evict, the peak was read \
+         from the wrong side of it, or `released` is over-reported",
+        p.peak_precompute,
+        p.gap(),
+        p.peak_denoise,
+        p.denoise_working_set(),
+        covered,
+        p.released,
+        p.precompute_transient(),
+        p.released.saturating_sub(p.freed())
+    );
+
+    // (g) TRANSIENT CEILING. The corrected form of the retracted claim: the precompute is NOT
+    //     free — it pays for the full pre-evict residency, which (e) pins — but its own transient
+    //     is a small multiple of the table it keeps, so the lever is net-positive at its own worst
+    //     instant and the precompute stage is not a new process ceiling.
+    //
+    //     Against `table`, not against `released`. The retired `1/2 · released` read as 60x loose
+    //     (0.008x measured) and was not: `table` grows with the schedule's modulation rows while
+    //     `released` falls with the tier, so a q4 render on a 600-row schedule sits at ≈0.35x of
+    //     it. A tighter constant would have been wrong; a different denominator is right. Stated
+    //     against `table` the ratio is 1.331x real / 2.222x synthetic at any tier and schedule.
+    let ceiling = ADALN_TRANSIENT_TABLE_MULTIPLE * p.table;
+    assert!(
+        p.precompute_transient() <= ceiling,
+        "the precompute added {} B on top of the {} B it started from — {:.3}x the {} B \
+         modulation table it retains, wanted <= {}x ({} B). Its transient is no longer tracking \
+         the table it keeps, so the projection-output intermediates have grown and the evict is \
+         less clearly net-positive at the precompute instant. That is {:.3}x the {} B released",
+        p.precompute_transient(),
+        p.active_before,
+        p.precompute_transient() as f64 / p.table.max(1) as f64,
+        p.table,
+        ADALN_TRANSIENT_TABLE_MULTIPLE,
+        ceiling,
+        p.x(p.precompute_transient()),
+        p.released
+    );
 }
 
 /// The MiniMax-H3 snapshot root, from `MINIMAX_H3_SNAPSHOT`.

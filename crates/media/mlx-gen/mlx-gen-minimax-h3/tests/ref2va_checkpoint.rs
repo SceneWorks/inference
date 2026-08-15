@@ -421,6 +421,26 @@ fn a_snapshot_without_the_reference_partition_is_refused_at_load() {
         !message.contains(REFERENCE_DIT_PARTITION),
         "the reference partition is staged now; the refusal must have moved on: {message}"
     );
+    // The text encoder is the second **tiered** component (sc-19120), so like the two DiT
+    // partitions it is probed at its resolved location, ahead of the always-root shared ones.
+    assert!(
+        message.contains("text_encoder"),
+        "the next missing component is the text encoder: {message}"
+    );
+
+    // 3. …and staging that moves the refusal on again, to the first shared component. Two hops
+    //    rather than one, so what this pins is a chain and not a single lucky comparison.
+    let te = root.join("text_encoder");
+    std::fs::create_dir_all(&te).unwrap();
+    std::fs::write(te.join("config.json"), "{}").unwrap();
+    let message = match load(&spec) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("the remaining components are still missing"),
+    };
+    assert!(
+        !message.contains("text_encoder"),
+        "the text encoder is staged now; the refusal must have moved on: {message}"
+    );
     assert!(
         message.contains("vae"),
         "the next missing component is the video VAE: {message}"
