@@ -11,12 +11,15 @@
 //!
 //! The candle deviations from the mlx descriptor are the two backend-correct ones the SDXL / FLUX /
 //! Z-Image / Chroma candle slices already make: `backend = "candle"` and `mac_only = false`. This lane
-//! wires **txt2img + packed q4/q8 tiers** (sc-10819, epic 9083 — the `SceneWorks/kolors-mlx` tier is
-//! packed-detected from disk); LoRA/LoKr, ControlNet-pose, and IP-Adapter (all wired in the mlx
-//! provider) are NOT advertised here, and are rejected at load rather than silently dropped (the
-//! false-capability trap).
+//! wires **txt2img + single-reference img2img + packed q4/q8 tiers** (sc-10819, epic 9083 — the
+//! `SceneWorks/kolors-mlx` tier is packed-detected from disk). LoRA/LoKr are applied through the
+//! shared SDXL-family UNet adapter loader;
+//! ControlNet-pose and IP-Adapter stay on their existing bespoke Candle providers and are rejected
+//! by this registered generator rather than silently dropped (the false-capability trap).
 
-use candle_gen::gen_core::{Capabilities, Modality, ModelDescriptor, Quant, SizeFloor};
+use candle_gen::gen_core::{
+    Capabilities, ConditioningKind, Modality, ModelDescriptor, Quant, SizeFloor,
+};
 
 /// Registry id — matches the SceneWorks worker's `payload.model` for the Kolors family.
 pub const MODEL_ID: &str = "kolors";
@@ -34,10 +37,10 @@ pub const DEFAULT_SAMPLER: &str = "euler_discrete";
 pub const SIZE_MULTIPLE: u32 = 8;
 
 /// Kolors' identity + the surface this candle lane wires: real classifier-free guidance (negative
-/// prompt + CFG scale), txt2img, and packed **Q4/Q8** MLX-tier inference (sc-10819). No conditioning /
-/// LoRA is advertised — those remain the Python fallback's job until candle wires them, so the
-/// descriptor never promises a path `generate` can't serve. Two backend-correct deviations from
-/// `mlx-gen-kolors`: `backend = "candle"` and `mac_only = false`.
+/// prompt + CFG scale), txt2img, single-reference img2img, and packed **Q4/Q8** MLX-tier inference
+/// (sc-10819). User LoRA/LoKr applies at load; ControlNet-pose and IP-Adapter retain separate Candle
+/// providers, so this descriptor never promises a path `generate` cannot serve. Two backend-correct
+/// deviations from `mlx-gen-kolors`: `backend = "candle"` and `mac_only = false`.
 ///
 /// epic 7114 P4 (sc-7124): the native leading `euler_discrete` is the byte-exact DEFAULT, but the
 /// curated ε/DDPM sampler menu (euler / euler_ancestral / heun / dpmpp_2m / dpmpp_sde / uni_pc / lcm /
@@ -59,14 +62,12 @@ pub fn descriptor() -> ModelDescriptor {
             supports_negative_prompt: true,
             supports_guidance: true,
             supports_true_cfg: false,
-            // txt2img only in this slice — img2img (Reference) / ControlNet-pose (Control) / IP-Adapter
-            // land later (Phase 3, epic 5480). Advertising none means the shared `validate_request`
-            // rejects any conditioning, and the worker keeps those shapes on the Python path.
-            conditioning: vec![],
-            // LoRA/LoKr merge into the SDXL-family UNet at load in the mlx provider (sc-4733), but the
-            // candle merge is not wired in this slice — not advertised, rejected at load.
-            supports_lora: false,
-            supports_lokr: false,
+            // The registered generator accepts one Reference as a deterministic latent-init img2img.
+            // ControlNet-pose and IP-Adapter remain separate, already-wired bespoke providers.
+            conditioning: vec![ConditioningKind::Reference],
+            // LoRA/LoKr merge into the vendored SDXL-family UNet on dense and packed tiers.
+            supports_lora: true,
+            supports_lokr: true,
             // epic 7114 P4 (sc-7124): the native leading EulerDiscrete (`euler_discrete`) stays the
             // byte-exact DEFAULT (N1), but the curated ε/DDPM menu (euler / euler_ancestral / heun /
             // dpmpp_2m / dpmpp_sde / uni_pc / lcm / ddim) is ADDED over `DiscreteModelSampling`, plus the
@@ -97,11 +98,13 @@ pub fn descriptor() -> ModelDescriptor {
             supports_kv_cache: false,
             requires_sigma_shift: false,
             supports_sequential_offload: false,
+            unconditionally_engages_staged_residency: false,
             // Per-step latent previews (epic 16948, sc-16954): both lanes of this registered route
             // emit -- the curated driver lane and the native leading-Euler loop -- as do the
             // name-driven pose-control and IP-Adapter providers. Kolors adds no fit of its own; it
             // projects through `candle_gen_sdxl::preview` (one byte-identical VAE file).
             supports_preview: true,
+            supports_prompt_enhancement: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
@@ -168,7 +171,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn descriptor_advertises_only_wired_txt2img_surface() {
+    fn descriptor_advertises_txt2img_and_reference_img2img() {
         let d = descriptor();
         assert_eq!(d.id, "kolors");
         assert_eq!(d.family, "kolors");
@@ -177,11 +180,15 @@ mod tests {
         assert!(d.capabilities.supports_negative_prompt);
         assert!(d.capabilities.supports_guidance);
         assert!(!d.capabilities.supports_true_cfg);
+        assert!(d.capabilities.accepts(ConditioningKind::Reference));
         assert!(!d.capabilities.mac_only);
-        // txt2img: no conditioning / LoRA advertised on the candle lane.
-        assert!(d.capabilities.conditioning.is_empty());
-        assert!(!d.capabilities.supports_lora);
-        assert!(!d.capabilities.supports_lokr);
+        assert_eq!(
+            d.capabilities.conditioning,
+            vec![ConditioningKind::Reference]
+        );
+        // User adapter stacks remain outside this registered base/img2img lane.
+        assert!(d.capabilities.supports_lora);
+        assert!(d.capabilities.supports_lokr);
         // sc-10819: packed q4/q8 MLX-tier inference is wired end-to-end, so Q4/Q8 are advertised.
         assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
         // sc-7124: the curated ε/DDPM sampler menu + the native `euler_discrete` alias; the curated

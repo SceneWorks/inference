@@ -386,7 +386,7 @@ impl Krea2Transformer {
             .collect()
     }
 
-    /// Walk every adaptable projection, invoking `f(path, &mut AdaptLinear)` once each with the
+    /// Walk every adaptable projection, invoking `f(path, &mut QLinear)` once each with the
     /// projection's canonical DiT dotted path — the single-stream `transformer_blocks.{i}` attention +
     /// SwiGLU projections plus the `text_fusion.{layerwise,refiner}_blocks.{i}` ones (exactly
     /// `crate::adapters::merge_surface_keys`). The additive installer
@@ -398,7 +398,7 @@ impl Krea2Transformer {
     /// so they are NOT visited here. `text_fusion.projector` stays out of surface.
     pub fn visit_adaptable_mut(
         &mut self,
-        f: &mut dyn FnMut(&str, &mut candle_gen::quant::AdaptLinear) -> candle_gen::Result<()>,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> candle_gen::Result<()>,
     ) -> candle_gen::Result<()> {
         let TransformerBlocks::Resident(blocks) = &mut self.blocks else {
             return Err(candle_gen::CandleError::Msg(
@@ -420,7 +420,7 @@ impl Krea2Transformer {
     /// [`crate::adapters::install_additive`] pushes onto (the [`AdditiveDit`](crate::adapters::AdditiveDit)
     /// surface): the per-block attention + SwiGLU projections plus the `text_fusion` blocks (via the inner
     /// [`Self::visit_adaptable_mut`]) AND the front-end + final leaves (`img_in` / `time_embed.linear_1/2`
-    /// / `time_mod_proj` / `txt_in.linear_1/2` / `final_layer.linear`, dense-tier only via `as_adapt_mut`).
+    /// / `time_mod_proj` / `txt_in.linear_1/2` / `final_layer.linear`, including ConvRot residual hosts).
     /// After clearing,
     /// the forward is byte-identical to the un-adapted base; a subsequent `install_additive` of the next
     /// phase's subset makes that phase's adapter set authoritative regardless of what the prior phase (or
@@ -428,8 +428,8 @@ impl Krea2Transformer {
     /// toggle that a concurrency-safe multi-phase driver runs only on a job-local DiT — never the shared
     /// resident. The candle twin of mlx-gen-krea's `Krea2Transformer::clear_adapters`.
     pub fn clear_adapters(&mut self) -> candle_gen::Result<()> {
-        self.visit_adaptable_mut(&mut |_, a| {
-            a.clear_adapters();
+        self.visit_adaptable_mut(&mut |_, projection| {
+            projection.clear_adapters();
             Ok(())
         })?;
         for proj in [
@@ -441,8 +441,8 @@ impl Krea2Transformer {
             &mut self.txt_in_l2,
             &mut self.final_linear,
         ] {
-            if let Some(a) = proj.as_adapt_mut() {
-                a.clear_adapters();
+            if let Some(projection) = proj.as_additive_mut() {
+                projection.clear_adapters();
             }
         }
         Ok(())
@@ -744,9 +744,8 @@ impl Krea2Transformer {
 impl crate::adapters::AdditiveDit for Krea2Transformer {
     /// The txt2img adapter surface: per-block attention + SwiGLU FFN (via the inner
     /// [`Self::visit_adaptable_mut`]) PLUS the front-end + final leaves (sc-11720 wide surface). The
-    /// front-end `QLinear`s yield an [`AdaptLinear`](candle_gen::quant::AdaptLinear) only on a dense tier
-    /// (`as_adapt_mut`); on a packed tier they stay quantized and are simply skipped — user adapters
-    /// almost never target them, and the attention+FFN surface is unchanged.
+    /// Every shipping dense, MLX-packed, and INT8-ConvRot `QLinear` is residual-capable; bench-only
+    /// NVFP4/probed projections are never selected by the registered generator route.
     fn visit_additive(
         &mut self,
         f: &mut dyn FnMut(&str, &mut dyn crate::adapters::AdditiveProj) -> candle_gen::Result<()>,
@@ -761,8 +760,8 @@ impl crate::adapters::AdditiveDit for Krea2Transformer {
             ("txt_in.linear_2", &mut self.txt_in_l2),
             ("final_layer.linear", &mut self.final_linear),
         ] {
-            if let Some(a) = proj.as_adapt_mut() {
-                f(path, a)?;
+            if let Some(projection) = proj.as_additive_mut() {
+                f(path, projection)?;
             }
         }
         Ok(())

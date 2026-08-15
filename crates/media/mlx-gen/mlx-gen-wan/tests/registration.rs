@@ -9,9 +9,10 @@
 
 use std::path::PathBuf;
 
+use mlx_gen::gen_core::GenerationMemory;
 use mlx_gen::{
     AdapterKind, AdapterSpec, Conditioning, ConditioningKind, GenerationRequest, Image, LoadSpec,
-    Modality, Precision, Quant, ReplacementMode, WeightsSource,
+    Modality, OffloadPolicy, Precision, Quant, ReplacementMode, WeightsSource,
 };
 
 use mlx_gen_wan::{MODEL_ID, MODEL_ID_I2V_14B, MODEL_ID_T2V_14B, MODEL_ID_VACE, MODEL_ID_VACE_FUN};
@@ -167,9 +168,14 @@ fn wan_is_registered() {
 fn load_reads_config_and_wires_generate() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = temp_model_dir(&tmp, "load");
+    // This config-only fixture intentionally exercises the legacy loader without production assets;
+    // Sequential is outside SC-19236's calibrated Resident/Eager surface, so it keeps publishing no
+    // contract and defers the missing-weight error until generate as this test historically expects.
+    let load_spec = LoadSpec::new(WeightsSource::Dir(dir.clone()))
+        .with_offload_policy(OffloadPolicy::Sequential);
     let g = mlx_gen_wan::provider_registry()
         .unwrap()
-        .load(MODEL_ID, &LoadSpec::new(WeightsSource::Dir(dir.clone())))
+        .load(MODEL_ID, &load_spec)
         .expect("load should succeed (reads config.json)");
     assert_eq!(g.descriptor().id, MODEL_ID);
 
@@ -208,6 +214,38 @@ fn load_reads_config_and_wires_generate() {
 }
 
 #[test]
+fn bounded_decode_carrier_is_validated_before_stage_one_loads_weights() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = temp_model_dir(&tmp, "bounded-before-stage-one");
+    let load_spec =
+        LoadSpec::new(WeightsSource::Dir(dir)).with_offload_policy(OffloadPolicy::Sequential);
+    let generator = mlx_gen_wan::provider_registry()
+        .unwrap()
+        .load(MODEL_ID, &load_spec)
+        .unwrap();
+    let request = GenerationRequest {
+        prompt: "carrier ordering probe".into(),
+        width: 480,
+        height: 480,
+        frames: Some(1),
+        memory: Some(GenerationMemory {
+            tile_vae_decode: true,
+            decode_tile_edge: Some(447),
+            decode_overlap: Some(64),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let error = generator
+        .generate(&request, &mut |_| {})
+        .expect_err("invalid selected carrier must fail before the absent T5 weights are opened");
+    assert!(
+        error.to_string().contains("decode tile-edge cap 447"),
+        "expected the pre-Stage-1 carrier error, got: {error}"
+    );
+}
+
+#[test]
 fn dense_wan_ids_enforce_the_shared_frame_ceiling() {
     let tmp = tempfile::tempdir().unwrap();
     for (id, config, needs_reference) in [
@@ -216,9 +254,15 @@ fn dense_wan_ids_enforce_the_shared_frame_ceiling() {
         (MODEL_ID_I2V_14B, I2V_14B_CONFIG, true),
     ] {
         let dir = temp_model_dir_with(&tmp, &format!("{id}-frame-cap"), config);
+        let load_spec = if id == MODEL_ID {
+            LoadSpec::new(WeightsSource::Dir(dir.clone()))
+                .with_offload_policy(OffloadPolicy::Sequential)
+        } else {
+            LoadSpec::new(WeightsSource::Dir(dir.clone()))
+        };
         let g = mlx_gen_wan::provider_registry()
             .unwrap()
-            .load(id, &LoadSpec::new(WeightsSource::Dir(dir.clone())))
+            .load(id, &load_spec)
             .unwrap();
         let conditioning = if needs_reference {
             vec![Conditioning::Reference {

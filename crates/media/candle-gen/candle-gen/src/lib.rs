@@ -127,8 +127,8 @@ pub mod sampler;
 pub use sampler::{
     curated_sampler_names, curated_scheduler_names, menu_with_aliases, resolve_flow_schedule,
     resolve_schedule, run_av_curated_sampler, run_curated_sampler, run_flow_sampler,
-    run_scm_sampler, AvLatents, CandleAvLatentOps, CandleLatentOps, ScmScheduler,
-    SCM_DEFAULT_INTERMEDIATE_TIMESTEP, SCM_DEFAULT_MAX_TIMESTEP, SCM_SIGMA_DATA,
+    run_scm_sampler, run_scm_sampler_from, AvLatents, CandleAvLatentOps, CandleLatentOps,
+    ScmScheduler, SCM_DEFAULT_INTERMEDIATE_TIMESTEP, SCM_DEFAULT_MAX_TIMESTEP, SCM_SIGMA_DATA,
 };
 
 // Shared seed-derivation + launch-portable seeded-noise helpers (sc-7792 consolidation / F-059,
@@ -146,6 +146,7 @@ pub use seed::{
 // tile GEOMETRY stays in `gen_core::tiling`; this module owns the candle-side execution of a plan,
 // parameterized by each VAE's cost model + decode closure so the per-VAE numerics are unchanged.
 pub mod vae_tiling;
+pub use gen_core::tiling::VideoDecodeMemoryProfile;
 
 // Shared safetensors key→`Tensor` weight map (sc-9044 / F-060): the non-`VarBuilder` loader (float
 // dtype-coerce, hard duplicate-key policy, prefix-filtered header-only reads) that the SDXL IP-Adapter/
@@ -160,7 +161,7 @@ pub use weights::Weights;
 // Wan2.1 16-channel VAE, stored with native WAN-VAE keys. The rename lives here (the `weights` module's
 // F-060 posture) rather than duplicated in each pipeline crate's `comfyui` seam.
 pub mod comfyui_vae;
-pub use comfyui_vae::remap_vae_wan_to_diffusers;
+pub use comfyui_vae::{remap_vae_wan_mlx_to_diffusers, remap_vae_wan_to_diffusers};
 
 // Poison-tolerant locking + read-through helper for the shared generator/component caches (sc-9015 /
 // F-031; `cached` sc-7792): a panic while holding a cache `Mutex` (e.g. a CUDA OOM lifted to a panic

@@ -15,8 +15,9 @@
 //! the 20B MMDiT in **bf16** (its native checkpoint dtype) — ~74 GB resident, which fits the 96 GB
 //! Blackwell where an all-f32 load (~113 GB) would not.
 //!
-//! **First-slice surface:** txt2img only. The mlx provider's img2img / Edit / ControlNet / Lightning
-//! / LoRA / quantization surface is **deferred** and rejected. `backend = "candle"`, `mac_only = false`.
+//! **Inference surface:** txt2img, Edit/Lightning, strict control, and ComfyUI DiT sources share the
+//! same LoRA/LoKr-capable MMDiT loader, including packed additive residuals. On-the-fly quantization
+//! and unsupported request overlays still fail closed. `backend = "candle"`, `mac_only = false`.
 
 // Qwen-Image-Edit inference adapter merge (sc-6220, epic 5480): fold a LoRA/LoKr `.safetensors` delta
 // into the dense MMDiT weights at load — the Qwen-Image-Edit-2511-Lightning few-step distill, plus
@@ -173,6 +174,8 @@ struct Pipeline {
     device: Device,
     /// The `LoadSpec::pid` component (converted PiD checkpoint + gemma dir), if the caller opted in.
     pid_spec: Option<PidWeights>,
+    /// User-selected LoRA/LoKr stack applied to the Qwen MMDiT at component load.
+    adapters: Vec<gen_core::AdapterSpec>,
     /// An in-place ComfyUI Qwen-Image DiT single-file (epic 10451 Phase 2b, sc-10670). When set, the
     /// transformer is built from this file (prefix-strip + fp8→bf16, see [`comfyui`]) instead of the
     /// snapshot's `transformer/` dir; the text encoder / tokenizer still come from `root`. `None`
@@ -186,13 +189,19 @@ struct Pipeline {
 }
 
 impl Pipeline {
-    fn load(root: &Path, device: &Device, pid_spec: Option<PidWeights>) -> Self {
+    fn load(
+        root: &Path,
+        device: &Device,
+        pid_spec: Option<PidWeights>,
+        adapters: Vec<gen_core::AdapterSpec>,
+    ) -> Self {
         Self {
             te_cfg: TextEncoderConfig::qwen_image(),
             dit_cfg: TransformerConfig::qwen_image(),
             root: root.to_path_buf(),
             device: device.clone(),
             pid_spec,
+            adapters,
             comfyui_dit: None,
             comfyui_vae: None,
         }
@@ -207,6 +216,7 @@ impl Pipeline {
         device: &Device,
         comfyui_dit: PathBuf,
         comfyui_vae: Option<PathBuf>,
+        adapters: Vec<gen_core::AdapterSpec>,
     ) -> Self {
         Self {
             te_cfg: TextEncoderConfig::qwen_image(),
@@ -214,6 +224,7 @@ impl Pipeline {
             root: root.to_path_buf(),
             device: device.clone(),
             pid_spec: None,
+            adapters,
             comfyui_dit: Some(comfyui_dit),
             comfyui_vae,
         }
@@ -232,17 +243,6 @@ impl Pipeline {
         // above stays local (it names the expected Qwen-Image snapshot).
         let files = candle_gen::sorted_safetensors(&dir, "qwen-image")?;
         candle_gen::mmap_var_builder(&files, dtype, &self.device)
-    }
-
-    fn component_files(&self, sub: &str) -> CResult<Vec<PathBuf>> {
-        let dir = self.root.join(sub);
-        if !dir.is_dir() {
-            return Err(CandleError::Msg(format!(
-                "qwen-image snapshot is missing the {sub}/ dir (expected a Qwen-Image diffusers snapshot at {})",
-                self.root.display()
-            )));
-        }
-        candle_gen::sorted_safetensors(&dir, "qwen-image")
     }
 
     fn load_components(&self) -> CResult<Components> {
@@ -516,58 +516,31 @@ impl Pipeline {
                             dit_file.display()
                         ))
                     })?;
-                let dit_map = comfyui::remap_and_cast_comfyui_dit(dit_map, DIT_DTYPE)?;
+                let mut dit_map = comfyui::remap_and_cast_comfyui_dit(dit_map, DIT_DTYPE)?;
+                let additive = self.adapters.is_empty()
+                    || crate::adapters::adapters_additive_capable(&self.adapters)?;
+                if !self.adapters.is_empty() && !additive {
+                    crate::adapters::merge_adapters(&mut dit_map, &self.adapters)?;
+                }
                 let dit_vb = VarBuilder::from_tensors(dit_map, DIT_DTYPE, &self.device);
-                Ok(QwenTransformer::new_gs(
+                let mut dit = QwenTransformer::new_gs(
                     &self.dit_cfg,
                     dit_vb,
                     candle_gen::quant::MLX_GROUP_SIZE,
-                )?)
-            }
-            None => {
-                let dit_dir = self.root.join("transformer");
-                let gs = transformer_group_size(&dit_dir);
-                if !stream_transformer_blocks {
-                    return Ok(QwenTransformer::new_gs(
-                        &self.dit_cfg,
-                        self.component_vb("transformer", DIT_DTYPE)?,
-                        gs,
-                    )?);
+                )?;
+                if !self.adapters.is_empty() && additive {
+                    crate::adapters::install_additive(&mut dit, &self.adapters)?;
                 }
-                let packed = transformer_packed_config(&dit_dir);
-                if let Some(packed) = packed {
-                    use candle_gen::quant::PackedWeightSidecars;
-
-                    let files = self.component_files("transformer")?;
-                    let prepared = PackedWeightSidecars::open_and_prepare_prefix_cancelable(
-                        &files,
-                        &dit_dir,
-                        packed,
-                        &self.device,
-                        cancel,
-                        "transformer_blocks.",
-                    );
-                    if cancel.is_cancelled() {
-                        return Err(CandleError::Canceled);
-                    }
-                    let (source, sidecars) = prepared?;
-                    let sidecars = Arc::new(sidecars);
-                    let vb =
-                        VarBuilder::from_backend(Box::new(source), DIT_DTYPE, self.device.clone());
-                    Ok(QwenTransformer::new_block_streamed_with_sidecars_gs(
-                        &self.dit_cfg,
-                        vb,
-                        gs,
-                        sidecars,
-                    )?)
-                } else {
-                    Ok(QwenTransformer::new_block_streamed_gs(
-                        &self.dit_cfg,
-                        self.component_vb("transformer", DIT_DTYPE)?,
-                        gs,
-                    )?)
-                }
+                Ok(dit)
             }
+            None => crate::edit::load_transformer(
+                &self.root,
+                &self.adapters,
+                DIT_DTYPE,
+                &self.device,
+                stream_transformer_blocks,
+                cancel,
+            ),
         }
     }
 
@@ -823,7 +796,7 @@ fn resolve_steps(requested: Option<u32>) -> usize {
 }
 
 /// Qwen-Image txt2img descriptor — the surface sc-3696 wires: true-CFG txt2img with a negative
-/// prompt; no conditioning (img2img/Edit deferred), no LoRA/quant, no Lightning sampler.
+/// prompt; no conditioning (img2img/Edit deferred), with user LoRA/LoKr on the base MMDiT.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
         control_kinds: None,
@@ -837,8 +810,8 @@ pub fn descriptor() -> ModelDescriptor {
             supports_guidance: true,
             supports_true_cfg: true,
             conditioning: vec![],
-            supports_lora: false,
-            supports_lokr: false,
+            supports_lora: true,
+            supports_lokr: true,
             samplers: candle_gen::curated_sampler_names(),
             schedulers: candle_gen::menu_with_aliases(
                 candle_gen::curated_scheduler_names(),
@@ -854,9 +827,11 @@ pub fn descriptor() -> ModelDescriptor {
             supports_kv_cache: false,
             requires_sigma_shift: true,
             supports_sequential_offload: true,
+            unconditionally_engages_staged_residency: false,
             // Per-step latent previews: wired by sc-16952, advertised behind the source-verified
             // bidirectional guard sc-16951 added to `candle-gen-catalog`.
             supports_preview: true,
+            supports_prompt_enhancement: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
@@ -915,7 +890,7 @@ fn generator_from_pipeline(
 
 /// Construct a lazy candle Qwen-Image generator. `spec.weights` must be a [`WeightsSource::Dir`]
 /// pointing at a `Qwen/Qwen-Image` diffusers snapshot (`text_encoder/`, `transformer/`, `vae/`,
-/// `tokenizer/`). Adapters / quantization / control overlays are rejected (not wired).
+/// `tokenizer/`). Adapters use the same dense/packed installer as the Qwen Edit provider.
 pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),
@@ -927,11 +902,6 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
             ));
         }
     };
-    if !spec.adapters.is_empty() {
-        return Err(gen_core::Error::Unsupported(
-            "candle qwen_image does not support LoRA/LoKr yet".into(),
-        ));
-    }
     if spec.quantize.is_some() {
         return Err(gen_core::Error::Unsupported(
             "candle qwen_image does not support on-the-fly Q4/Q8 quantization yet".into(),
@@ -944,7 +914,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     }
     let loaded_quant = memory_strategy::snapshot_quant_tier(spec, MODEL_ID)?;
     let device = candle_gen::default_device()?;
-    let pipe = Pipeline::load(&root, &device, spec.pid.clone());
+    let pipe = Pipeline::load(&root, &device, spec.pid.clone(), spec.adapters.clone());
     #[cfg(any(feature = "cuda", test))]
     let memory_strategy = Some(memory_strategy::provider_contract(MODEL_ID, spec)?);
     #[cfg(not(any(feature = "cuda", test)))]
@@ -963,11 +933,13 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 /// remapped to the diffusers schema by [`comfyui::remap_vae_wan_to_diffusers`]); when `None` the VAE
 /// comes from `snapshot_dir`'s `vae/`. `snapshot_dir` is a resident Qwen-Image diffusers snapshot
 /// supplying the Qwen2.5-VL text encoder (still snapshot-sourced — it is scaled-fp8, sc-10671) and the
-/// tokenizer (and the VAE when `vae_file` is `None`). txt2img only; no adapters / control / PiD.
+/// tokenizer (and the VAE when `vae_file` is `None`). txt2img only; adapters apply to the remapped
+/// MMDiT, while control and PiD remain unavailable on this bespoke source path.
 pub fn load_from_comfyui_dit(
     transformer_file: impl Into<PathBuf>,
     snapshot_dir: impl Into<PathBuf>,
     vae_file: Option<PathBuf>,
+    adapters: Vec<gen_core::AdapterSpec>,
 ) -> gen_core::Result<Box<dyn Generator>> {
     let device = candle_gen::default_device()?;
     let pipe = Pipeline::load_comfyui(
@@ -975,6 +947,7 @@ pub fn load_from_comfyui_dit(
         &device,
         transformer_file.into(),
         vae_file,
+        adapters,
     );
     generator_from_pipeline(pipe, None, None)
 }
@@ -1083,8 +1056,8 @@ mod tests {
             gemma: WeightsSource::Dir("/gemma".into()),
         };
         let root = Path::new("/nonexistent");
-        let with = Pipeline::load(root, &Device::Cpu, Some(spec));
-        let without = Pipeline::load(root, &Device::Cpu, None);
+        let with = Pipeline::load(root, &Device::Cpu, Some(spec), Vec::new());
+        let without = Pipeline::load(root, &Device::Cpu, None, Vec::new());
 
         // Opted in at load AND wanted by this request → load it.
         assert!(with.pid_to_load(true).is_some());
@@ -1137,6 +1110,7 @@ mod tests {
             &Device::Cpu,
             dit.clone(),
             Some(vae.clone()),
+            Vec::new(),
         );
         let dit_error = pipe
             .load_transformer_seq()
@@ -1329,7 +1303,7 @@ mod tests {
         assert!(!d.capabilities.mac_only);
         assert!(d.capabilities.conditioning.is_empty());
         assert!(!d.capabilities.accepts(ConditioningKind::Reference));
-        assert!(!d.capabilities.supports_lora);
+        assert!(d.capabilities.supports_lora);
         // Unified curated sampler/scheduler menu (epic 7114 P4, sc-7123): the full curated sampler menu,
         // and the curated scheduler menu plus the legacy `flow_match_euler` alias (N3 fallback).
         assert_eq!(
@@ -1424,15 +1398,12 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_unwired_surfaces() {
+    fn load_accepts_adapters_and_rejects_unwired_quant() {
         use candle_gen::gen_core::{AdapterKind, AdapterSpec};
         let lora = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_adapters(vec![
             AdapterSpec::new("/lora.safetensors".into(), 1.0, AdapterKind::Lora),
         ]);
-        assert!(matches!(
-            load(&lora).err().expect("err"),
-            gen_core::Error::Unsupported(_)
-        ));
+        assert!(load(&lora).is_ok());
         let quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q8);
         assert!(matches!(
             load(&quant).err().expect("err"),
@@ -1484,7 +1455,7 @@ mod tests {
         let g = load(&spec).expect("a 2512-shaped snapshot dir must load like the base");
         assert_eq!(g.descriptor().id, MODEL_ID);
 
-        let pipe = Pipeline::load(&tmp, &Device::Cpu, None);
+        let pipe = Pipeline::load(&tmp, &Device::Cpu, None, Vec::new());
         assert!(
             pipe.root.join("tokenizer/tokenizer.json").is_file(),
             "loader must resolve the overlaid tokenizer.json under tokenizer/"

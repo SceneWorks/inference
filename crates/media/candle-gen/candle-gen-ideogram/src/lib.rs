@@ -35,9 +35,9 @@ use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{
-    self, Capabilities, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest,
-    Generator, LoadSpec, Modality, ModelDescriptor, PidWeights, Progress, Quant, SizeFloor,
-    WeightsSource,
+    self, AdapterSpec, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
+    GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, PidWeights, Progress, Quant,
+    SizeFloor, WeightsSource,
 };
 
 pub use adapters::TurboLoraReport;
@@ -60,6 +60,7 @@ pub struct Ideogram4Generator {
     /// The `LoadSpec::pid` component captured at load (epic 7840 / sc-7853), threaded into the lazy
     /// component build so the PiD engine loads once alongside the base model. `None` when not opted in.
     pid_spec: Option<PidWeights>,
+    adapters: Vec<AdapterSpec>,
     components: Mutex<Option<Arc<Components>>>,
 }
 
@@ -67,9 +68,19 @@ impl Ideogram4Generator {
     fn components(&self) -> gen_core::Result<Arc<Components>> {
         candle_gen::cached(&self.components, || {
             let components = if self.turbo {
-                pipeline::load_components_turbo(&self.root, &self.device, self.pid_spec.as_ref())?
+                pipeline::load_components_turbo(
+                    &self.root,
+                    &self.device,
+                    self.pid_spec.as_ref(),
+                    &self.adapters,
+                )?
             } else {
-                pipeline::load_components(&self.root, &self.device, self.pid_spec.as_ref())?
+                pipeline::load_components(
+                    &self.root,
+                    &self.device,
+                    self.pid_spec.as_ref(),
+                    &self.adapters,
+                )?
             };
             Ok(Arc::new(components))
         })
@@ -153,8 +164,8 @@ pub fn descriptor() -> ModelDescriptor {
             // Edit (sc-6303/6330 → candle sc-6598): one img2img/inpaint source Reference + optional
             // inpaint Mask. No control/pose/multi-reference. Works in both quality and turbo.
             conditioning: vec![ConditioningKind::Reference, ConditioningKind::Mask],
-            supports_lora: false,
-            supports_lokr: false,
+            supports_lora: true,
+            supports_lokr: true,
             samplers: vec![],
             schedulers: vec!["flow_match_euler"],
             supported_guidance_methods: vec![],
@@ -170,12 +181,14 @@ pub fn descriptor() -> ModelDescriptor {
             supports_kv_cache: false,
             requires_sigma_shift: false,
             supports_sequential_offload: false,
+            unconditionally_engages_staged_residency: false,
             // Per-step latent previews (epic 16948, sc-16955). Ideogram drives no shared sampler, so
             // its bespoke flow-match loop emits directly (`crate::preview`); the VAE it loads is the
             // FLUX.2 one tensor-for-tensor, so it reuses that fit rather than introducing one.
             // `candle-gen-catalog`'s guard derives this flag from the sources — including from a
             // bespoke crate's direct emission call — so it cannot run ahead of or behind the wiring.
             supports_preview: true,
+            supports_prompt_enhancement: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
@@ -216,16 +229,11 @@ fn build(
             )));
         }
     };
-    // User adapters / ControlNet+IP-Adapter overlays are not wired (the turbo LoRA is bundled in the
-    // snapshot and installed internally). img2img/Remix + mask inpaint edit is NOT a LoadSpec overlay —
+    // User LoRA/LoKr stacks are installed with the bundled TurboTime adapter (turbo) or on both CFG
+    // DiTs (quality). ControlNet+IP-Adapter overlays remain separate unsupported combinations.
+    // img2img/Remix + mask inpaint edit is NOT a LoadSpec overlay —
     // it arrives as per-request `Reference`/`Mask` conditioning (sc-6598), handled in the pipeline, so
     // it is unaffected by these load-time rejects.
-    if !spec.adapters.is_empty() {
-        return Err(gen_core::Error::Unsupported(format!(
-            "candle {} does not accept user LoRA/LoKr (the TurboTime LoRA is bundled)",
-            descriptor.id
-        )));
-    }
     // sc-9607: `spec.quantize` (Q4/Q8) is ACCEPTED and is a no-op. The per-tier turnkey is already
     // MLX-packed; `loader::linear_detect` builds each `QLinear` (shared `AdaptLinear`) with a packed
     // base straight from the packed parts (sc-9412), so the resolved q4/q8 subdir self-describes its
@@ -249,6 +257,7 @@ fn build(
         // any) so the lazy component build loads the engine once. Unlike control/IP above, it is not
         // rejected — `None` simply keeps the byte-exact native-VAE path.
         pid_spec: spec.pid.clone(),
+        adapters: spec.adapters.clone(),
         components: Mutex::new(None),
     }))
 }
@@ -484,16 +493,13 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_single_file_and_unwired_surfaces() {
+    fn load_accepts_adapters_and_rejects_single_file() {
         use candle_gen::gen_core::{AdapterKind, AdapterSpec};
         let file = LoadSpec::new(WeightsSource::File("/tmp/q.safetensors".into()));
         assert!(load(&file).is_err());
         let lora = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_adapters(vec![
             AdapterSpec::new("/lora.safetensors".into(), 1.0, AdapterKind::Lora),
         ]);
-        assert!(matches!(
-            load(&lora).err().expect("err"),
-            gen_core::Error::Unsupported(_)
-        ));
+        assert!(load(&lora).is_ok());
     }
 }

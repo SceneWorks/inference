@@ -63,9 +63,9 @@ use crate::config::{AudioVaeConfig, LtxConfig, LtxVaeConfig, SplitModel, Vocoder
 use crate::enhance::{self, EnhanceConfig, SampleParams};
 use crate::gemma::{GemmaConfig, GemmaModel, GemmaQuant};
 use crate::pipeline::{
-    decode_audio_track, decode_to_frames, generate_av_latents, generate_av_latents_iclora,
-    preprocess_conditioning_clip, preprocess_conditioning_image, StageClip, StageKeyframe,
-    STAGE1_SIGMAS, STAGE2_SIGMAS,
+    decode_audio_track, decode_to_frames_with_tiling, generate_av_latents,
+    generate_av_latents_iclora, preprocess_conditioning_clip, preprocess_conditioning_image,
+    StageClip, StageKeyframe, STAGE1_SIGMAS, STAGE2_SIGMAS,
 };
 use crate::positions::{compute_audio_frames, create_audio_position_grid, create_position_grid};
 use crate::text_encoder::LtxTextEncoder;
@@ -148,7 +148,9 @@ const TEMPORAL_SCALE: u32 = 8;
 /// audio buffers directly from the request, so an unbounded `frames` (e.g. a hostile `8_000_001`,
 /// which still satisfies `frames % 8 == 1`) would drive multi-hundred-GB allocations before any
 /// error. `1025` (= 1 + 8·128, ~40 s at 25 fps) is far above any realistic request.
-const MAX_FRAMES: u32 = 1025;
+pub(crate) const MAX_FRAMES: u32 = 1025;
+pub(crate) const MIN_SIZE: u32 = 64;
+pub(crate) const MAX_SIZE: u32 = 1280;
 /// VAE spatial compression (32×); stage-1 additionally halves resolution.
 const SPATIAL_SCALE: u32 = 32;
 /// The request width/height multiple `validate_request` enforces: `2 × SPATIAL_SCALE` (= 64).
@@ -260,15 +262,20 @@ pub fn descriptor() -> ModelDescriptor {
             schedulers: Vec::new(),
             // height/width must be divisible by SIZE_MULTIPLE (= 2×SPATIAL_SCALE; stage-1 runs at //2//32).
             supported_guidance_methods: vec![],
-            min_size: 64,
-            max_size: 1280,
+            min_size: MIN_SIZE,
+            max_size: MAX_SIZE,
             max_count: 1,
             mac_only: true,
             supports_kv_cache: false,
             requires_sigma_shift: false,
             // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
             supports_sequential_offload: false,
+            // sc-18816: every generate builds/evaluates/drops Gemma before materializing the AvDiT,
+            // then drops the AvDiT before VAE/audio decode. This is physical default behavior, not a
+            // selectable Sequential control and not an evidence-composition edge.
+            unconditionally_engages_staged_residency: true,
             supports_preview: false,
+            supports_prompt_enhancement: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
@@ -292,6 +299,9 @@ pub fn descriptor() -> ModelDescriptor {
 /// `--no-audio` (`req.video_mode == "no_audio"`).
 pub struct Ltx {
     descriptor: ModelDescriptor,
+    memory_strategy: Option<mlx_gen::gen_core::MemoryProviderContract>,
+    memory_tier: Option<mlx_gen::gen_core::MemoryNumericTier>,
+    memory_overlay: Option<String>,
     tokenizer: LtxTokenizer,
     // sc-10976 (epic 10975): the two GIANTS — the ~24 GB Gemma-3-12B text encoder and the AvDiT — are
     // NOT held resident. They are built on demand inside `generate` (load → use → drop), mirroring
@@ -487,6 +497,16 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
             )));
         }
     }
+    // SC-19109: bind the canonical dense-bf16 Gemma route to the same resolved split manifest,
+    // component paths and additive overlays the engine below will materialize. Quantized Gemma is a
+    // supported generator route but has no matching evidence identity yet, so it deliberately loads
+    // without a memory contract rather than borrowing the canonical route's measurements.
+    let loaded_memory =
+        crate::memory_strategy::contract_for_loaded(spec, &split, &gemma_dir, gemma_quant)?;
+    let (memory_strategy, memory_tier, memory_overlay) = match loaded_memory {
+        Some((contract, tier, overlay)) => (Some(contract), Some(tier), overlay),
+        None => (None, None, None),
+    };
 
     // The small components (each ≪ the TE / DiT) stay resident. The VAE *decoder* + audio VAE + vocoder
     // load here; the VAE *encoder* is still lazy on first I2V encode (F-048).
@@ -515,6 +535,9 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 
     Ok(Box::new(Ltx {
         descriptor: descriptor(),
+        memory_strategy,
+        memory_tier,
+        memory_overlay,
         tokenizer,
         root: root.clone(),
         config,
@@ -804,11 +827,18 @@ impl Ltx {
         // cache so the VAE + audio decode run in the freed footprint (the AvDiT is the denoise peak and
         // nothing downstream needs it). Mirrors Wan's scope-block release before the VAE decode.
         mlx_rs::transforms::eval([&video_latents, &audio_latents])?;
+        finish_calibration_phase(req, mlx_gen::gen_core::MemoryPhase::Denoise, || Ok(()))?;
         drop(transformer);
         mlx_rs::memory::clear_cache();
 
         on_progress(Progress::Decoding);
-        let frames = decode_to_frames(&self.vae, &video_latents, &req.cancel)?;
+        let selected_tiling = crate::memory_strategy::decode_tiling(req)?;
+        let frames = decode_to_frames_with_tiling(
+            &self.vae,
+            &video_latents,
+            &req.cancel,
+            selected_tiling.as_ref(),
+        )?;
         let images = frames_to_images(&frames)?;
         // Audio always denoised (it conditions the video); decode it unless `--no-audio`.
         let audio = if Self::no_audio(req) {
@@ -822,6 +852,7 @@ impl Ltx {
                 &req.cancel,
             )?)
         };
+        finish_calibration_phase(req, mlx_gen::gen_core::MemoryPhase::Decode, || Ok(()))?;
         Ok(GenerationOutput::Video {
             frames: images,
             fps: req.fps.unwrap_or(24),
@@ -899,10 +930,11 @@ impl Ltx {
     }
 
     /// Build the in-context conditioning clips ([`Conditioning::VideoClip`] — extend_clip /
-    /// video_bridge) as owned `(stage1_clip_latent, latent_frame_idx, strength)` tuples, each
+    /// video_bridge) as owned `(stage1_clip_latent, output_frame_offset, strength)` tuples, each
     /// VAE-encoded at **stage-1** (half-res) resolution into `(1, 128, cf, h1, w1)`. `frame_idx` is a
     /// latent frame index with negative-from-end indexing (`-1` = last latent frame), resolved against
-    /// the target latent-frame count `lf`. Video conditioning is stage-1 only (reference
+    /// the target latent-frame count `lf` and converted to the output-frame coordinate required by
+    /// the appended-token RoPE path. Video conditioning is stage-1 only (reference
     /// `ICLoraPipeline`), so no stage-2 encode.
     fn build_clips(&self, req: &GenerationRequest) -> Result<Vec<(Array, i32, f32)>> {
         let lf = Self::latent_dims(req).0 as i32;
@@ -931,7 +963,14 @@ impl Ltx {
             let video = preprocess_conditioning_clip(clip.frames, req.width / 2, req.height / 2)?;
             let latent = self.vae.encode(&video)?;
             latent.eval()?;
-            out.push((latent, idx, clip.strength));
+            out.push((
+                latent,
+                crate::conditioning::latent_frame_to_output_offset(
+                    idx,
+                    crate::positions::TEMPORAL_SCALE,
+                )?,
+                clip.strength,
+            ));
         }
         // replace_person: the masked control clip rides the same keyframe-append path. Build the
         // gray-neutralized control frames host-side (port of the worker's `_apply_replacement_mask`),
@@ -975,7 +1014,14 @@ impl Ltx {
             let video = preprocess_conditioning_clip(&masked, req.width / 2, req.height / 2)?;
             let latent = self.vae.encode(&video)?;
             latent.eval()?;
-            out.push((latent, idx, cc.masking_strength));
+            out.push((
+                latent,
+                crate::conditioning::latent_frame_to_output_offset(
+                    idx,
+                    crate::positions::TEMPORAL_SCALE,
+                )?,
+                cc.masking_strength,
+            ));
         }
         Ok(out)
     }
@@ -1087,7 +1133,7 @@ impl Ltx {
 /// shared capability floor ([`Capabilities::validate_request`] — size range, count, unsupported
 /// guidance/negative/true_cfg/sampler/scheduler, only advertised conditioning kinds) plus the LTX
 /// model-specific constraints: non-empty prompt, 64-aligned width/height (stage-1 runs at //2//32),
-/// and `num_frames = 1 + 8·k`.
+/// `num_frames = 1 + 8·k`, and all weight-free conditioning cardinality/shape/index constraints.
 pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> Result<()> {
     if req.prompt.is_empty() {
         return Err(Error::Msg("ltx_2_3: prompt must not be empty".into()));
@@ -1111,6 +1157,40 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
             )));
         }
     }
+    let latent_frames = Ltx::latent_dims(req).0 as i32;
+    let resolve_latent_index = |label: &str, idx: i32| -> Result<()> {
+        let resolved = if idx < 0 { latent_frames + idx } else { idx };
+        if resolved < 0 || resolved >= latent_frames {
+            return Err(Error::Msg(format!(
+                "ltx_2_3: {label} latent frame index {idx} out of bounds for {latent_frames} latent frames"
+            )));
+        }
+        Ok(())
+    };
+
+    // Apply-or-reject at the weight-free boundary. The render path consumes one Reference and one
+    // ControlClip; accepting more here would silently discard later entries after the ~24 GB staged
+    // text phase. Clip emptiness, mask parity, and target-grid bounds are equally request-only facts.
+    let reference_count = req
+        .conditioning
+        .iter()
+        .filter(|c| matches!(c, Conditioning::Reference { .. }))
+        .count();
+    if reference_count > 1 {
+        return Err(Error::Msg(
+            "ltx_2_3: multiple reference images are not supported (single-image I2V only)".into(),
+        ));
+    }
+    let control_clip_count = req
+        .conditioning
+        .iter()
+        .filter(|c| matches!(c, Conditioning::ControlClip { .. }))
+        .count();
+    if control_clip_count > 1 {
+        return Err(Error::Msg(
+            "ltx_2_3: at most one ControlClip can be applied per request".into(),
+        ));
+    }
     // F-054: range-validate every conditioning strength to [0, 1]. `strength > 1` → a negative denoise
     // mask (`1 − strength`) → negative per-token σ timesteps and extrapolating blends (silent garbage,
     // every stage "succeeds"); `< 0` (or NaN — `contains` is false for NaN) is likewise degenerate.
@@ -1133,11 +1213,49 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
             Conditioning::Reference {
                 strength: Some(s), ..
             } => check_strength("reference", *s)?,
-            Conditioning::Keyframe { strength, .. } => check_strength("keyframe", *strength)?,
-            Conditioning::VideoClip { strength, .. } => check_strength("video clip", *strength)?,
+            Conditioning::Keyframe {
+                frame_idx,
+                strength,
+                ..
+            } => {
+                resolve_latent_index("keyframe", *frame_idx)?;
+                check_strength("keyframe", *strength)?;
+            }
+            Conditioning::VideoClip {
+                frames,
+                frame_idx,
+                strength,
+            } => {
+                if frames.is_empty() {
+                    return Err(Error::Msg(
+                        "ltx_2_3: video conditioning clip is empty".into(),
+                    ));
+                }
+                resolve_latent_index("clip", *frame_idx)?;
+                check_strength("video clip", *strength)?;
+            }
             Conditioning::ControlClip {
-                masking_strength, ..
-            } => check_strength("control clip masking", *masking_strength)?,
+                frames,
+                mask,
+                masking_strength,
+                start_frame,
+                ..
+            } => {
+                if frames.is_empty() {
+                    return Err(Error::Msg(
+                        "ltx_2_3: replace_person control clip is empty".into(),
+                    ));
+                }
+                if frames.len() != mask.len() {
+                    return Err(Error::Msg(format!(
+                        "ltx_2_3: replace_person frame count {} != mask count {}",
+                        frames.len(),
+                        mask.len()
+                    )));
+                }
+                resolve_latent_index("replace_person", *start_frame)?;
+                check_strength("control clip masking", *masking_strength)?;
+            }
             _ => {}
         }
     }
@@ -1159,10 +1277,93 @@ pub(crate) fn frames_to_images(frames: &Array) -> Result<Vec<Image>> {
         .collect())
 }
 
-mlx_gen::impl_generator!(Ltx {
-    validate: |s, req| validate_request(&s.descriptor.capabilities, req),
-    generate: generate_impl,
-});
+/// Request-local calibration fault injection at a completed physical phase boundary.
+///
+/// The shared request floor accepts the hidden fault carrier only when a conformance harness pairs
+/// it with explicit authorization. Production requests leave it unset, so the hook is inert.
+/// Returning the completed value through
+/// this helper is deliberate: when the named fault fires, phase-local resources are dropped before
+/// the error reaches the caller, which is the cleanup behavior the harness measures with a warm
+/// follow-up request.
+fn finish_calibration_phase<T>(
+    req: &GenerationRequest,
+    phase: mlx_gen::gen_core::MemoryPhase,
+    work: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let value = work()?;
+    if req.memory.is_some_and(|memory| {
+        memory.calibration_fault_harness_authorized && memory.calibration_error_phase == Some(phase)
+    }) {
+        return Err(Error::Msg(format!(
+            "{MODEL_ID}: injected memory-strategy calibration error at {phase:?}"
+        )));
+    }
+    Ok(value)
+}
+
+// Hand-written rather than `impl_generator!`: SC-19109 makes the memory contract a property of the
+// loaded provider, not only a static registry row. The ordinary descriptor/validate/generate arms
+// are the same delegation the macro emitted.
+impl Generator for Ltx {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
+        validate_request(&self.descriptor.capabilities, req).map_err(Into::into)
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
+        self.memory_strategy.as_ref()
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::MemorySafetyDecision {
+        let (Some(contract), Some(tier)) = (self.memory_strategy.as_ref(), self.memory_tier) else {
+            return if context.selection.strategy == mlx_gen::gen_core::MemoryStrategy::Resident {
+                mlx_gen::gen_core::MemorySafetyDecision::Accept
+            } else {
+                mlx_gen::gen_core::MemorySafetyDecision::Reject {
+                    reason: "ltx_2_3 loaded route has no calibrated memory-strategy contract"
+                        .into(),
+                }
+            };
+        };
+        crate::memory_strategy::safety_check(
+            contract,
+            tier,
+            self.memory_overlay.as_deref(),
+            context,
+        )
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::Result<Option<Box<dyn mlx_gen::gen_core::MemoryRequestScope + '_>>>
+    {
+        let (Some(contract), Some(tier)) = (self.memory_strategy.as_ref(), self.memory_tier) else {
+            return Ok(None);
+        };
+        crate::memory_strategy::begin_request(
+            contract,
+            tier,
+            self.memory_overlay.as_deref(),
+            self.config.num_layers as usize,
+            context,
+        )
+    }
+}
 
 impl Ltx {
     /// The rich-`Result` body behind [`Generator::generate`]. Kept on the crate's own
@@ -1182,7 +1383,10 @@ impl Ltx {
         if req.cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
-        let (enhanced, video_ctx, audio_ctx) = self.stage_text_phase(req)?;
+        let (enhanced, video_ctx, audio_ctx) =
+            finish_calibration_phase(req, mlx_gen::gen_core::MemoryPhase::Conditioning, || {
+                self.stage_text_phase(req)
+            })?;
         // The TE is dropped; free the allocator cache so the DiT loads into the low-water footprint.
         mlx_rs::memory::clear_cache();
         let owned;
@@ -1242,6 +1446,187 @@ mlx_gen::register_generators! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn calibration_fault_is_request_local_and_phase_exact() {
+        use mlx_gen::gen_core::{GenerationMemory, MemoryPhase};
+
+        let plain = GenerationRequest::default();
+        for phase in [
+            MemoryPhase::Conditioning,
+            MemoryPhase::Denoise,
+            MemoryPhase::Decode,
+        ] {
+            assert_eq!(
+                finish_calibration_phase(&plain, phase, || Ok(17)).unwrap(),
+                17
+            );
+
+            let phase_without_authorization = GenerationRequest {
+                memory: Some(GenerationMemory {
+                    calibration_error_phase: Some(phase),
+                    calibration_fault_harness_authorized: false,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert_eq!(
+                finish_calibration_phase(&phase_without_authorization, phase, || Ok(19)).unwrap(),
+                19,
+                "the hidden phase carrier is inert without explicit harness authorization"
+            );
+
+            let authorization_without_phase = GenerationRequest {
+                memory: Some(GenerationMemory {
+                    calibration_error_phase: None,
+                    calibration_fault_harness_authorized: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert_eq!(
+                finish_calibration_phase(&authorization_without_phase, phase, || Ok(21)).unwrap(),
+                21,
+                "authorization alone must not invent a fault phase"
+            );
+
+            let mut memory = GenerationMemory::default();
+            memory.authorize_calibration_fault(phase);
+            let injected = GenerationRequest {
+                memory: Some(memory),
+                ..Default::default()
+            };
+            let error = finish_calibration_phase(&injected, phase, || Ok(17))
+                .expect_err("the selected physical phase must return a typed error")
+                .to_string();
+            assert!(error.contains(MODEL_ID), "got: {error}");
+            assert!(
+                error.contains("injected memory-strategy calibration error"),
+                "got: {error}"
+            );
+            assert!(error.contains(&format!("{phase:?}")), "got: {error}");
+
+            let other = if phase == MemoryPhase::Decode {
+                MemoryPhase::Denoise
+            } else {
+                MemoryPhase::Decode
+            };
+            assert_eq!(
+                finish_calibration_phase(&injected, other, || Ok(23)).unwrap(),
+                23,
+                "a request-local fault must not spill into another phase"
+            );
+        }
+    }
+
+    #[test]
+    fn calibration_fault_drops_completed_phase_state_before_warm_recovery() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        #[derive(Debug)]
+        struct DropWitness(Arc<AtomicUsize>);
+        impl Drop for DropWitness {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut memory = mlx_gen::gen_core::GenerationMemory::default();
+        memory.authorize_calibration_fault(mlx_gen::gen_core::MemoryPhase::Denoise);
+        let injected = GenerationRequest {
+            memory: Some(memory),
+            ..Default::default()
+        };
+        finish_calibration_phase(&injected, mlx_gen::gen_core::MemoryPhase::Denoise, || {
+            Ok(DropWitness(drops.clone()))
+        })
+        .expect_err("the injected request must fail after phase state exists");
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+        let warm = finish_calibration_phase(
+            &GenerationRequest::default(),
+            mlx_gen::gen_core::MemoryPhase::Denoise,
+            || Ok(DropWitness(drops.clone())),
+        )
+        .expect("an unmodified warm request must recover");
+        drop(warm);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn calibrated_scope_finishes_injected_error_and_a_fresh_scope_recovers() {
+        use mlx_gen::gen_core::{
+            LoadSpec, MemoryPhase, MemoryRunOutcome, MemoryStrategy, Quant, WeightsSource,
+        };
+
+        fn fixture() -> (
+            LoadSpec,
+            mlx_gen::gen_core::MemoryProviderContract,
+            mlx_gen::gen_core::MemoryBehaviorFixture,
+        ) {
+            let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent-ltx-fixture".into()))
+                .with_quant(Quant::Q8);
+            let contract = crate::memory_strategy::weights_free_memory_strategy_contract(&spec)
+                .expect("the provider-owned weights-free contract fixture");
+            let fixture = crate::memory_strategy::registered_valid_fixtures(
+                &spec,
+                &contract,
+                MemoryStrategy::StagedResidency,
+            )
+            .expect("the provider-owned behavior fixture")
+            .pop()
+            .expect("one staged-residency fixture");
+            (spec, contract, fixture)
+        }
+
+        let (spec, contract, fixture) = fixture();
+        let mut scope =
+            crate::memory_strategy::registered_begin_request(&spec, &contract, &fixture.context)
+                .unwrap()
+                .expect("the LTX provider must open a calibrated request scope");
+        let mut injected = fixture.request.clone();
+        scope.configure_request(&mut injected).unwrap();
+        injected
+            .memory
+            .as_mut()
+            .expect("the selected staged rung installs its request carrier")
+            .authorize_calibration_fault(MemoryPhase::Denoise);
+        scope.enter_phase(MemoryPhase::Conditioning).unwrap();
+        scope.leave_phase(MemoryPhase::Conditioning).unwrap();
+        scope.enter_phase(MemoryPhase::Denoise).unwrap();
+        let error = finish_calibration_phase(&injected, MemoryPhase::Denoise, || Ok(()))
+            .expect_err("the authorized provider fault must escape the physical boundary");
+        scope.leave_phase(MemoryPhase::Denoise).unwrap();
+        scope
+            .finish(MemoryRunOutcome::Error {
+                message: error.to_string(),
+            })
+            .expect("an injected provider error must complete scope cleanup");
+        assert!(
+            scope.finish(MemoryRunOutcome::Complete).is_err(),
+            "the error outcome must terminally finish the request scope"
+        );
+
+        let mut recovery =
+            crate::memory_strategy::registered_begin_request(&spec, &contract, &fixture.context)
+                .unwrap()
+                .expect("a fresh provider request scope must open after the injected error");
+        let mut recovered_request = fixture.request;
+        recovery.configure_request(&mut recovered_request).unwrap();
+        recovery.enter_phase(MemoryPhase::Conditioning).unwrap();
+        recovery.leave_phase(MemoryPhase::Conditioning).unwrap();
+        recovery.enter_phase(MemoryPhase::Denoise).unwrap();
+        finish_calibration_phase(&recovered_request, MemoryPhase::Denoise, || Ok(()))
+            .expect("the subsequent unmodified provider request must recover");
+        recovery.leave_phase(MemoryPhase::Denoise).unwrap();
+        recovery.enter_phase(MemoryPhase::Decode).unwrap();
+        finish_calibration_phase(&recovered_request, MemoryPhase::Decode, || Ok(()))
+            .expect("recovery must remain healthy through decode");
+        recovery.leave_phase(MemoryPhase::Decode).unwrap();
+        recovery.finish(MemoryRunOutcome::Complete).unwrap();
+    }
 
     #[test]
     fn replacement_mask_rejects_wrapping_u32_dimensions_without_panicking() {
@@ -1322,6 +1707,16 @@ mod tests {
         assert!(
             caps.schedulers.is_empty(),
             "LTX is sampler-only (no scheduler axis — the distilled schedule is baked)"
+        );
+    }
+
+    #[test]
+    fn descriptor_declares_unconditional_staging_without_selectable_sequential_control() {
+        let caps = descriptor().capabilities;
+        assert!(!caps.supports_sequential_offload);
+        assert_eq!(
+            caps.staged_residency_availability(),
+            mlx_gen::StagedResidencyAvailability::UnconditionallyEngaged
         );
     }
 
@@ -1512,7 +1907,7 @@ mod tests {
             }
         )
         .is_err());
-        // More than one `Reference` is rejected at resolve time (single-image I2V only).
+        // More than one `Reference` is rejected during weight-free preflight (single-image I2V only).
         let two = GenerationRequest {
             conditioning: vec![
                 Conditioning::Reference {
@@ -1520,15 +1915,107 @@ mod tests {
                     strength: None,
                 },
                 Conditioning::Reference {
-                    image: img,
+                    image: img.clone(),
                     strength: None,
                 },
             ],
-            ..base
+            ..base.clone()
         };
-        // resolve_reference needs an `Ltx`; assert the capability check passes but resolve errors is
-        // covered by the integration path — here just confirm the kinds are individually accepted.
-        assert!(validate_request(&caps, &two).is_ok());
+        let err = validate_request(&caps, &two).unwrap_err().to_string();
+        assert!(err.contains("multiple reference images"), "{err}");
+
+        // The render consumes `control_clip()` (the first match), so duplicates must fail rather
+        // than silently discard the second after text encoding.
+        let control = Conditioning::ControlClip {
+            frames: vec![img.clone()],
+            mask: vec![img],
+            masking_strength: 0.8,
+            start_frame: 0,
+            mode: mlx_gen::ReplacementMode::FaceOnly,
+        };
+        let err = validate_request(
+            &caps,
+            &GenerationRequest {
+                conditioning: vec![control.clone(), control],
+                ..base
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("at most one ControlClip"), "{err}");
+    }
+
+    #[test]
+    fn validate_request_rejects_late_conditioning_shape_errors_preflight() {
+        let caps = descriptor().capabilities;
+        let base = GenerationRequest {
+            prompt: "a".into(),
+            width: 512,
+            height: 512,
+            frames: Some(49), // seven latent frames: accepted indices -7..=6.
+            ..Default::default()
+        };
+        let img = Image {
+            width: 4,
+            height: 4,
+            pixels: vec![0u8; 4 * 4 * 3],
+        };
+        let rejects = |conditioning| {
+            validate_request(
+                &caps,
+                &GenerationRequest {
+                    conditioning,
+                    ..base.clone()
+                },
+            )
+            .unwrap_err()
+            .to_string()
+        };
+
+        let err = rejects(vec![Conditioning::Keyframe {
+            image: img.clone(),
+            frame_idx: 7,
+            strength: 1.0,
+        }]);
+        assert!(err.contains("keyframe latent frame index 7"), "{err}");
+
+        let err = rejects(vec![Conditioning::VideoClip {
+            frames: vec![],
+            frame_idx: 0,
+            strength: 1.0,
+        }]);
+        assert!(err.contains("video conditioning clip is empty"), "{err}");
+        let err = rejects(vec![Conditioning::VideoClip {
+            frames: vec![img.clone()],
+            frame_idx: -8,
+            strength: 1.0,
+        }]);
+        assert!(err.contains("clip latent frame index -8"), "{err}");
+
+        let err = rejects(vec![Conditioning::ControlClip {
+            frames: vec![],
+            mask: vec![],
+            masking_strength: 1.0,
+            start_frame: 0,
+            mode: mlx_gen::ReplacementMode::FaceOnly,
+        }]);
+        assert!(err.contains("control clip is empty"), "{err}");
+        let err = rejects(vec![Conditioning::ControlClip {
+            frames: vec![img.clone()],
+            mask: vec![],
+            masking_strength: 1.0,
+            start_frame: 0,
+            mode: mlx_gen::ReplacementMode::FaceOnly,
+        }]);
+        assert!(err.contains("frame count 1 != mask count 0"), "{err}");
+        let err = rejects(vec![Conditioning::ControlClip {
+            frames: vec![img.clone()],
+            mask: vec![img],
+            masking_strength: 1.0,
+            start_frame: 7,
+            mode: mlx_gen::ReplacementMode::FaceOnly,
+        }]);
+        assert!(err.contains("replace_person latent frame index 7"), "{err}");
     }
 
     #[test]

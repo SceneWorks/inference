@@ -744,6 +744,7 @@ fn load_packed_base_control(snapshot_env: &str, tier: &str) {
     ZImageControl::load(&ZImageControlPaths {
         snapshot,
         control,
+        adapters: Vec::new(),
         base: true,
     })
     .unwrap_or_else(|error| {
@@ -801,6 +802,7 @@ fn packed_base_control_q4_honors_control_cfg_warm_repeat_and_cleanup() {
     let model = ZImageControl::load(&ZImageControlPaths {
         snapshot,
         control,
+        adapters: Vec::new(),
         base: true,
     })
     .expect("load packed q4 base-control provider");

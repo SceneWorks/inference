@@ -532,7 +532,7 @@ fn load_dit_cancelable(
         Krea2Transformer::load(&dit_w, &cfg)?
     };
     if !adapters.is_empty() {
-        crate::adapters::install_additive(&mut dit, adapters, diff.merged)?;
+        crate::adapters::install_additive_with_diff(&mut dit, adapters, &diff.applied_by_spec)?;
     }
     Ok(dit)
 }
@@ -558,12 +558,13 @@ pub fn load_components_convrot(
     root: &Path,
     convrot_dit: &Path,
     device: &Device,
+    adapters: &[AdapterSpec],
 ) -> Result<Components> {
     // The floor probe needs a cuBLASLt handle to read the device's compute capability — so it KEEPS it
     // and hands it to the DiT weight set as the trunk's one shared handle (sc-12301 scope 5), instead of
     // building 32 MiB of workspace, reading two integers off it, and dropping it.
     let text = load_text(root, device)?;
-    let heavy = load_heavy_convrot(root, convrot_dit, device)?;
+    let heavy = load_heavy_convrot(root, convrot_dit, device, adapters)?;
     Ok(Components { text, heavy })
 }
 
@@ -578,6 +579,7 @@ pub(crate) fn load_heavy_convrot(
     root: &Path,
     convrot_dit: &Path,
     device: &Device,
+    adapters: &[AdapterSpec],
 ) -> Result<KreaHeavy> {
     // The floor probe needs a cuBLASLt handle to read the device's compute capability — so it KEEPS it
     // and hands it to the DiT weight set as the trunk's one shared handle (sc-12301 scope 5), instead of
@@ -589,7 +591,10 @@ pub(crate) fn load_heavy_convrot(
     // shares this ONE handle rather than building its own (the sc-12301 defect).
     let dit_w = Weights::from_convrot_file(convrot_dit, device, DIT_DTYPE)?.with_int8_context(int8);
     crate::convert::validate_transformer(&dit_w, &cfg)?;
-    let dit = Krea2Transformer::load(&dit_w, &cfg)?;
+    let mut dit = Krea2Transformer::load(&dit_w, &cfg)?;
+    if !adapters.is_empty() {
+        crate::adapters::install_additive(&mut dit, adapters, 0)?;
+    }
 
     let vae = load_vae(root, device)?;
 
@@ -610,32 +615,40 @@ pub(crate) fn load_heavy_convrot(
 /// Unlike [`load_components_convrot`], the DiT never uses Hadamard rotation or the sm_89 ConvRot floor.
 /// Plain int8 is descriptor-validated and dequantized per row; dense bf16 passes through. Fail-closed
 /// coverage/bijection + shape validation ([`crate::convert::validate_native_transformer`]) runs before the
-/// transformer assembles.
+/// transformer assembles. The selected adapter stack then uses the same canonical target surface and
+/// per-file apply-or-reject contract as the registered snapshot route.
 pub fn load_components_native(
     root: &Path,
     native_dit: &Path,
     device: &Device,
+    adapters: &[AdapterSpec],
 ) -> Result<Components> {
     let text = load_text(root, device)?;
-    let heavy = load_heavy_native(root, native_dit, device)?;
+    let heavy = load_heavy_native(root, native_dit, device, adapters)?;
     Ok(Components { text, heavy })
 }
 
 /// The heavy half of a native single-file load: the dense or dequantized DiT (from `native_dit`, read
-/// through the native→diffusers remap) + the Qwen-Image VAE (from `root`). No adapters/PiD (the
-/// out-of-registry single-file entrypoint bakes any LoRAs into the merge and does not thread overlays —
-/// mirroring the MLX S0b scope); those stay a follow-on with the worker wiring (S0c).
+/// through the native→diffusers remap) + the Qwen-Image VAE (from `root`). This out-of-registry native
+/// single-file entrypoint accepts job-local LoRA/LoKr/diff-patch adapters through the shared Krea
+/// installer. PiD remains absent; the registered dense, packed, and ConvRot routes attach it through
+/// their dedicated component loaders.
 pub(crate) fn load_heavy_native(
     root: &Path,
     native_dit: &Path,
     device: &Device,
+    adapters: &[AdapterSpec],
 ) -> Result<KreaHeavy> {
     let cfg = Krea2Config::from_snapshot(root)?;
     // `from_native_file`: native_keys ON, ConvRot OFF. Dense stores W directly; plain int8 reconstructs
     // W = codes * row_scale. Neither stores ConvRot's W·R, so neither may rotate.
-    let dit_w = Weights::from_native_file(native_dit, device, DIT_DTYPE)?;
+    let mut dit_w = Weights::from_native_file(native_dit, device, DIT_DTYPE)?;
     crate::convert::validate_native_transformer(&dit_w, &cfg)?;
-    let dit = Krea2Transformer::load(&dit_w, &cfg)?;
+    let diff = crate::adapters::fold_diff_patch(&mut dit_w, adapters)?;
+    let mut dit = Krea2Transformer::load(&dit_w, &cfg)?;
+    if !adapters.is_empty() {
+        crate::adapters::install_additive_with_diff(&mut dit, adapters, &diff.applied_by_spec)?;
+    }
 
     let vae = load_vae(root, device)?;
 
@@ -654,9 +667,10 @@ pub(crate) fn load_residency_heavy_convrot(
     root: &Path,
     convrot_dit: &Path,
     device: &Device,
+    adapters: &[AdapterSpec],
 ) -> Result<ResidencyHeavy> {
     Ok(ResidencyHeavy {
-        heavy: load_heavy_convrot(root, convrot_dit, device)?,
+        heavy: load_heavy_convrot(root, convrot_dit, device, adapters)?,
         vae_encoder: load_vae_encoder(root, device)?,
     })
 }

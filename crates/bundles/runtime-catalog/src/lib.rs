@@ -7,9 +7,12 @@
 pub use core_llm;
 pub use gen_core;
 pub use gen_core::memory_strategy;
+pub use gen_core::tiling::VideoDecodeMemoryProfile;
 
 use core_llm::{SnapshotPreparerRegistry, TextLlmRegistry};
-use gen_core::ProviderRegistry;
+use gen_core::{
+    ConditioningKind, Modality, ModelDescriptor, ProviderRegistry, Quant, TrainerDescriptor,
+};
 
 /// Failure to construct a supported runtime composition.
 #[derive(Debug)]
@@ -222,6 +225,13 @@ impl RuntimeCatalog {
                 .generators()
                 .map(|registration| (registration.descriptor)().id.to_string())
                 .collect(),
+            generator_capabilities: self
+                .media
+                .generators()
+                .map(|registration| {
+                    GeneratorCapabilitySnapshot::from_descriptor(&(registration.descriptor)())
+                })
+                .collect(),
             transform_ids: self
                 .media
                 .transforms()
@@ -231,6 +241,13 @@ impl RuntimeCatalog {
                 .media
                 .trainers()
                 .map(|registration| (registration.descriptor)().id.to_string())
+                .collect(),
+            trainer_capabilities: self
+                .media
+                .trainers()
+                .map(|registration| {
+                    TrainerCapabilitySnapshot::from_descriptor(&(registration.descriptor)())
+                })
                 .collect(),
             captioner_ids: self
                 .media
@@ -263,6 +280,14 @@ impl RuntimeCatalog {
                 .iter()
                 .flat_map(|audio| audio.registry.generators())
                 .map(|registration| (registration.descriptor)().id.to_string())
+                .collect(),
+            audio_generator_capabilities: self
+                .audio
+                .iter()
+                .flat_map(|audio| audio.registry.generators())
+                .map(|registration| {
+                    GeneratorCapabilitySnapshot::from_descriptor(&(registration.descriptor)())
+                })
                 .collect(),
             audio_voice_embedder_ids: self
                 .audio
@@ -521,6 +546,173 @@ impl RuntimeCatalog {
     }
 }
 
+/// The parity-relevant, weights-free capability surface of one registered generator.
+///
+/// This is deliberately derived from [`ModelDescriptor`] every time the runtime snapshot is built.
+/// Release tooling can therefore compare MLX and Candle catalogs without maintaining a second
+/// hand-written capability table, and any descriptor change is visible in the serialized snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GeneratorCapabilitySnapshot {
+    pub id: String,
+    pub family: String,
+    pub backend: String,
+    pub modality: String,
+    pub conditioning: Vec<String>,
+    pub supports_lora: bool,
+    pub supports_lokr: bool,
+    pub supported_quants: Vec<String>,
+    pub supports_preview: bool,
+    pub supports_prompt_enhancement: bool,
+    pub samplers: Vec<String>,
+    pub schedulers: Vec<String>,
+    pub supported_guidance_methods: Vec<String>,
+}
+
+impl GeneratorCapabilitySnapshot {
+    fn from_descriptor(descriptor: &ModelDescriptor) -> Self {
+        Self {
+            id: descriptor.id.to_string(),
+            family: descriptor.family.to_string(),
+            backend: descriptor.backend.to_string(),
+            modality: modality_name(descriptor.modality).to_string(),
+            conditioning: descriptor
+                .capabilities
+                .conditioning
+                .iter()
+                .copied()
+                .map(conditioning_name)
+                .map(str::to_string)
+                .collect(),
+            supports_lora: descriptor.capabilities.supports_lora,
+            supports_lokr: descriptor.capabilities.supports_lokr,
+            supported_quants: descriptor
+                .capabilities
+                .supported_quants
+                .iter()
+                .copied()
+                .map(quant_name)
+                .map(str::to_string)
+                .collect(),
+            supports_preview: descriptor.capabilities.supports_preview,
+            supports_prompt_enhancement: descriptor.capabilities.supports_prompt_enhancement,
+            samplers: descriptor
+                .capabilities
+                .samplers
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+            schedulers: descriptor
+                .capabilities
+                .schedulers
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+            supported_guidance_methods: descriptor
+                .capabilities
+                .supported_guidance_methods
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+        }
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.id,
+            "family": self.family,
+            "backend": self.backend,
+            "modality": self.modality,
+            "conditioning": self.conditioning,
+            "supports_lora": self.supports_lora,
+            "supports_lokr": self.supports_lokr,
+            "supported_quants": self.supported_quants,
+            "supports_preview": self.supports_preview,
+            "supports_prompt_enhancement": self.supports_prompt_enhancement,
+            "samplers": self.samplers,
+            "schedulers": self.schedulers,
+            "supported_guidance_methods": self.supported_guidance_methods,
+        })
+    }
+}
+
+fn modality_name(modality: Modality) -> &'static str {
+    match modality {
+        Modality::Image => "image",
+        Modality::Video => "video",
+        Modality::Both => "both",
+        Modality::Audio => "audio",
+    }
+}
+
+fn conditioning_name(conditioning: ConditioningKind) -> &'static str {
+    match conditioning {
+        ConditioningKind::Reference => "reference",
+        ConditioningKind::ReferenceAudio => "referenceAudio",
+        ConditioningKind::AudioEdit => "audioEdit",
+        ConditioningKind::AudioEditRegions => "audioEditRegions",
+        ConditioningKind::VoiceEmbedding => "voiceEmbedding",
+        ConditioningKind::MultiReference => "multiReference",
+        ConditioningKind::ReduxRefs => "reduxRefs",
+        ConditioningKind::Control => "control",
+        ConditioningKind::Depth => "depth",
+        ConditioningKind::Mask => "mask",
+        ConditioningKind::Keyframe => "keyframe",
+        ConditioningKind::VideoClip => "videoClip",
+        ConditioningKind::ControlClip => "controlClip",
+        ConditioningKind::VideoSync => "videoSync",
+        ConditioningKind::ConversationHistory => "conversationHistory",
+    }
+}
+
+fn quant_name(quant: Quant) -> &'static str {
+    match quant {
+        Quant::Q4 => "q4",
+        Quant::Q8 => "q8",
+        Quant::Nvfp4 => "nvfp4",
+    }
+}
+
+/// The complete weights-free capability surface of one registered trainer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrainerCapabilitySnapshot {
+    pub id: String,
+    pub family: String,
+    pub backend: String,
+    pub modality: String,
+    pub supports_lora: bool,
+    pub supports_lokr: bool,
+    pub supports_control: bool,
+    pub supports_full_finetune: bool,
+}
+
+impl TrainerCapabilitySnapshot {
+    fn from_descriptor(descriptor: &TrainerDescriptor) -> Self {
+        Self {
+            id: descriptor.id.to_string(),
+            family: descriptor.family.to_string(),
+            backend: descriptor.backend.to_string(),
+            modality: modality_name(descriptor.modality).to_string(),
+            supports_lora: descriptor.supports_lora,
+            supports_lokr: descriptor.supports_lokr,
+            supports_control: descriptor.supports_control,
+            supports_full_finetune: descriptor.supports_full_finetune,
+        }
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.id,
+            "family": self.family,
+            "backend": self.backend,
+            "modality": self.modality,
+            "supports_lora": self.supports_lora,
+            "supports_lokr": self.supports_lokr,
+            "supports_control": self.supports_control,
+            "supports_full_finetune": self.supports_full_finetune,
+        })
+    }
+}
+
 /// Stable, machine-readable provider inventory for release and product compatibility checks.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeCatalogSnapshot {
@@ -530,10 +722,14 @@ pub struct RuntimeCatalogSnapshot {
     pub backend: String,
     /// Generator ids, in stable catalog order — each a `load` key.
     pub generator_ids: Vec<String>,
+    /// Generator descriptor capabilities, in the same stable order as `generator_ids`.
+    pub generator_capabilities: Vec<GeneratorCapabilitySnapshot>,
     /// Standalone transform ids (empty at this release).
     pub transform_ids: Vec<String>,
     /// Trainer ids — each a `load_trainer` key.
     pub trainer_ids: Vec<String>,
+    /// Trainer descriptor capabilities, in the same stable order as `trainer_ids`.
+    pub trainer_capabilities: Vec<TrainerCapabilitySnapshot>,
     /// Captioner ids — each a `load_captioner` key.
     pub captioner_ids: Vec<String>,
     /// Image-embedder ids — each a `load_image_embedder` key.
@@ -550,6 +746,9 @@ pub struct RuntimeCatalogSnapshot {
     /// Audio generator ids, in stable catalog order — each a `load` key on the audio registry.
     /// Additive field — empty when the bundle declares no audio lane.
     pub audio_generator_ids: Vec<String>,
+    /// Audio generator descriptor capabilities, in the same stable order as
+    /// `audio_generator_ids`. Empty when the bundle declares no audio lane.
+    pub audio_generator_capabilities: Vec<GeneratorCapabilitySnapshot>,
     /// Audio voice-embedder ids (voice-cloning identity, sc-12844), in stable catalog order —
     /// each a `load_voice_embedder` key on the audio registry. Additive field (sc-12844) — empty
     /// when the bundle declares no audio lane or ships no voice embedder.
@@ -585,8 +784,10 @@ impl RuntimeCatalogSnapshot {
             "platform": self.platform,
             "backend": self.backend,
             "generator_ids": self.generator_ids,
+            "generator_capabilities": self.generator_capabilities.iter().map(GeneratorCapabilitySnapshot::to_json).collect::<Vec<_>>(),
             "transform_ids": self.transform_ids,
             "trainer_ids": self.trainer_ids,
+            "trainer_capabilities": self.trainer_capabilities.iter().map(TrainerCapabilitySnapshot::to_json).collect::<Vec<_>>(),
             "captioner_ids": self.captioner_ids,
             "image_embedder_ids": self.image_embedder_ids,
             "text_embedder_ids": self.text_embedder_ids,
@@ -594,6 +795,7 @@ impl RuntimeCatalogSnapshot {
             "snapshot_preparer_backends": self.snapshot_preparer_backends,
             "audio_backend": self.audio_backend,
             "audio_generator_ids": self.audio_generator_ids,
+            "audio_generator_capabilities": self.audio_generator_capabilities.iter().map(GeneratorCapabilitySnapshot::to_json).collect::<Vec<_>>(),
             "audio_voice_embedder_ids": self.audio_voice_embedder_ids,
             "audio_transform_ids": self.audio_transform_ids,
             "audio_transcriber_ids": self.audio_transcriber_ids,
@@ -606,6 +808,26 @@ impl RuntimeCatalogSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_profile_composes_decoder_residency_exactly_once() {
+        let profile = VideoDecodeMemoryProfile::new(1_000, 400).unwrap();
+        assert_eq!(VideoDecodeMemoryProfile::new(399, 400), None);
+        // Contract decoder below the calibrated resident floor preserves the uncovered excess.
+        assert_eq!(
+            profile.incremental_above_contract_decoder_bytes(250),
+            Some(750)
+        );
+        assert_eq!(profile.checked_composed_peak(1_250, 250), Some(2_000));
+        // Contract decoder above the floor is retained once; only non-resident decode work is added.
+        assert_eq!(
+            profile.incremental_above_contract_decoder_bytes(600),
+            Some(600)
+        );
+        assert_eq!(profile.checked_composed_peak(1_600, 600), Some(2_200));
+        assert_eq!(profile.checked_composed_peak(399, 400), None);
+        assert_eq!(profile.checked_composed_peak(u64::MAX, 600), None);
+    }
 
     fn candle_descriptor() -> core_llm::TextLlmDescriptor {
         core_llm::TextLlmDescriptor {
@@ -660,6 +882,92 @@ mod tests {
             max_count: 1,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn generator_capability_snapshot_tracks_descriptor_mutations() {
+        let descriptor = gen_core::ModelDescriptor {
+            control_kinds: None,
+            required_components: &[],
+            id: "parity-probe",
+            family: "test-image",
+            backend: "mlx",
+            modality: gen_core::Modality::Image,
+            capabilities: gen_core::Capabilities {
+                min_size: 64,
+                max_size: 2048,
+                max_count: 1,
+                conditioning: vec![
+                    gen_core::ConditioningKind::Reference,
+                    gen_core::ConditioningKind::Mask,
+                ],
+                supports_lora: true,
+                supports_lokr: true,
+                supported_quants: &[gen_core::Quant::Q4, gen_core::Quant::Q8],
+                supports_preview: true,
+                supports_prompt_enhancement: true,
+                samplers: vec!["euler"],
+                schedulers: vec!["simple"],
+                supported_guidance_methods: vec!["cfg"],
+                ..Default::default()
+            },
+        };
+
+        let snapshot = GeneratorCapabilitySnapshot::from_descriptor(&descriptor);
+        let json = snapshot.to_json();
+        assert_eq!(json["modality"], "image");
+        assert_eq!(
+            json["conditioning"],
+            serde_json::json!(["reference", "mask"])
+        );
+        assert_eq!(json["supported_quants"], serde_json::json!(["q4", "q8"]));
+        assert_eq!(json["supports_lora"], true);
+        assert_eq!(json["supports_lokr"], true);
+        assert_eq!(json["supports_preview"], true);
+        assert_eq!(json["supports_prompt_enhancement"], true);
+
+        let mut mutated = descriptor.clone();
+        mutated.capabilities.supports_preview = false;
+        assert_ne!(
+            GeneratorCapabilitySnapshot::from_descriptor(&descriptor).to_json(),
+            GeneratorCapabilitySnapshot::from_descriptor(&mutated).to_json(),
+            "a descriptor capability mutation must change the machine-readable snapshot"
+        );
+        mutated = descriptor.clone();
+        mutated.capabilities.supports_prompt_enhancement = false;
+        assert_ne!(
+            GeneratorCapabilitySnapshot::from_descriptor(&descriptor).to_json(),
+            GeneratorCapabilitySnapshot::from_descriptor(&mutated).to_json(),
+            "prompt-enhancement support must be anti-restamp protected"
+        );
+    }
+
+    #[test]
+    fn trainer_capability_snapshot_tracks_every_training_mode() {
+        let descriptor = gen_core::TrainerDescriptor {
+            id: "mage_flow_base",
+            family: "mage_flow",
+            backend: "mlx",
+            modality: gen_core::Modality::Image,
+            supports_lora: true,
+            supports_lokr: false,
+            supports_control: false,
+            supports_full_finetune: true,
+        };
+        let snapshot = TrainerCapabilitySnapshot::from_descriptor(&descriptor);
+        let json = snapshot.to_json();
+        assert_eq!(json["supports_lora"], true);
+        assert_eq!(json["supports_lokr"], false);
+        assert_eq!(json["supports_control"], false);
+        assert_eq!(json["supports_full_finetune"], true);
+
+        let mut mutated = descriptor;
+        mutated.supports_full_finetune = false;
+        assert_ne!(
+            TrainerCapabilitySnapshot::from_descriptor(&descriptor).to_json(),
+            TrainerCapabilitySnapshot::from_descriptor(&mutated).to_json(),
+            "a trainer descriptor mutation must change the machine-readable snapshot"
+        );
     }
 
     fn candle_audio_descriptor() -> gen_core::ModelDescriptor {
@@ -763,6 +1071,9 @@ mod tests {
         let snapshot = catalog.snapshot();
         assert_eq!(snapshot.audio_backend.as_deref(), Some("candle"));
         assert_eq!(snapshot.audio_generator_ids, ["stub-audio"]);
+        assert_eq!(snapshot.audio_generator_capabilities.len(), 1);
+        assert_eq!(snapshot.audio_generator_capabilities[0].id, "stub-audio");
+        assert_eq!(snapshot.audio_generator_capabilities[0].modality, "audio");
         assert_eq!(snapshot.audio_snapshot_preparer_backends, ["candle"]);
         assert_eq!(snapshot.snapshot_preparer_backends, ["mlx"]);
         assert_eq!(snapshot.to_json()["audio_backend"], "candle");
@@ -786,6 +1097,7 @@ mod tests {
         let snapshot = catalog.snapshot();
         assert_eq!(snapshot.audio_backend, None);
         assert!(snapshot.audio_generator_ids.is_empty());
+        assert!(snapshot.audio_generator_capabilities.is_empty());
         assert!(snapshot.audio_voice_embedder_ids.is_empty());
         assert!(snapshot.audio_transform_ids.is_empty());
         assert!(snapshot.audio_transcriber_ids.is_empty());

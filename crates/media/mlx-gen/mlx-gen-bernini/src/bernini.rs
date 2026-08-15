@@ -54,7 +54,7 @@ use mlx_gen::{
 use mlx_gen_wan::config::WanModelConfig;
 use mlx_gen_wan::pipeline::{align_dim, decode_to_frames, frames_to_images, latent_shape};
 use mlx_gen_wan::text_encoder::{load_tokenizer, Umt5Encoder};
-use mlx_gen_wan::{WanBlockStream, WanTransformer, WanVae};
+use mlx_gen_wan::{WanBlockStream, WanTransformer};
 
 use crate::assembly::{concat_with_zero_init, format_mllm_inputs_embeds};
 use crate::clip_diff::DiffLossFm;
@@ -78,6 +78,7 @@ use crate::vit_preprocess::{
     normalized_frame, pack_patches, preprocess_image, smart_resize, smart_video_nframes, FACTOR,
     IMAGE_MEAN, IMAGE_STD, MERGE_SIZE, PATCH_SIZE, TEMPORAL_PATCH_SIZE,
 };
+use crate::{decoded_output_geometry, ProviderVae, PROVIDER_VAE_STRIDE};
 
 pub const MODEL_ID: &str = "bernini";
 
@@ -303,14 +304,19 @@ fn vit_encode_video(planner: &BerniniPlanner, frames: &[RgbImage]) -> Result<(Ar
 }
 
 /// VAE-encode one image (`.mode()`, the Gaussian mean) → normalized `[16, T, H8, W8]`.
-fn vae_encode_image(vae: &WanVae, rgb: &RgbImage) -> Result<Array> {
+fn vae_encode_image(vae: &ProviderVae, rgb: &RgbImage) -> Result<Array> {
     let chw = vae_transform_image(rgb, VAE_MAX_SIZE, VAE_MIN_SIZE, VAE_STRIDE); // [3, H, W] in [-1,1]
     drop_batch(&image_vae_latent(vae, &chw)?)
 }
 
 /// VAE-encode a video clip (`.sample()`) → normalized `[16, T_lat, H8, W8]`. `eps` is generated for the
 /// latent shape so the encode is deterministic given the seed.
-fn vae_encode_video(vae: &WanVae, frames: &[RgbImage], z_dim: usize, key: &Array) -> Result<Array> {
+fn vae_encode_video(
+    vae: &ProviderVae,
+    frames: &[RgbImage],
+    z_dim: usize,
+    key: &Array,
+) -> Result<Array> {
     let mut chw_t = Vec::with_capacity(frames.len());
     for f in frames {
         let chw = vae_transform_image(f, VAE_MAX_SIZE, VAE_MIN_SIZE, VAE_STRIDE); // [3, H, W]
@@ -556,11 +562,14 @@ pub fn descriptor() -> ModelDescriptor {
             // dropping BOTH encoders (+ `clear_cache()`) before the experts, so peak unified memory is
             // already bounded to the dominant expert phase. The per-component footprint reports the two
             // experts as the DiT phase (the peak; the planner is a smaller, earlier, dropped phase), so
-            // the fit-gate's staged estimate is sound. `OffloadPolicy` is not consumed — there is no
-            // Resident-warm mode to toggle. The one thing NOT split is the two experts, which the
+            // fit-gate's staged estimate is sound. `OffloadPolicy` is not consumed — there is no
+            // Resident-warm mode to toggle, so this is unconditional physical staging rather than a
+            // selectable offload control. The one thing NOT split is the two experts, which the
             // MoE-by-timestep denoise loop holds co-resident (see the BLOCKERS note in the PR).
-            supports_sequential_offload: true,
+            supports_sequential_offload: false,
+            unconditionally_engages_staged_residency: true,
             supports_preview: false,
+            supports_prompt_enhancement: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
@@ -662,8 +671,8 @@ impl Bernini {
         // sc-12500 (F-040): `validate_impl` rejects any off-grid width/height, so the reference's
         // align-down is a no-op here — assert that instead of silently refitting the request
         // (1000×1000 used to render 992×992 with no diagnostic while candle errored).
-        let width = align_dim(req.width, cfg.patch_size.2, cfg.vae_stride.2);
-        let height = align_dim(req.height, cfg.patch_size.1, cfg.vae_stride.1);
+        let width = align_dim(req.width, cfg.patch_size.2, PROVIDER_VAE_STRIDE.2);
+        let height = align_dim(req.height, cfg.patch_size.1, PROVIDER_VAE_STRIDE.1);
         debug_assert_eq!(
             (width, height),
             (req.width, req.height),
@@ -704,7 +713,7 @@ impl Bernini {
         let (videos_pix, images_pix) = collect_conditioning(req);
         {
             let vae_w = Weights::from_file(self.root.join("vae.safetensors"))?;
-            let vae = WanVae::from_weights(&vae_w)?;
+            let vae = ProviderVae::from_weights(&vae_w)?;
             for (vi, clip) in videos_pix.iter().enumerate() {
                 let rgb: Vec<RgbImage> = clip.iter().map(to_rgb).collect::<Result<_>>()?;
                 let vit_frames = sample_vit_frames(&rgb);
@@ -891,7 +900,7 @@ impl Bernini {
 
         // --- Stage 3: load both experts, ViT-conditioned APG denoise ---
         let key = random::key(seed)?;
-        let lat = latent_shape(frames, height, width, cfg.vae_z_dim, cfg.vae_stride)?;
+        let lat = latent_shape(frames, height, width, cfg.vae_z_dim, PROVIDER_VAE_STRIDE)?;
         let init_noise = random::normal::<f32>(&lat[..], None, None, Some(&key))?;
 
         let base_g = VitGuidanceParams {
@@ -1022,7 +1031,7 @@ impl Bernini {
 
         // --- Stage 4: z16 VAE decode → image / video ---
         on_progress(Progress::Decoding);
-        let out_frames = lat[1] * cfg.vae_stride.0 as i32;
+        let (out_frames, out_height, out_width) = decoded_output_geometry(lat[1], lat[2], lat[3])?;
         // Ladder rung 2 (sc-15528): an explicit request geometry REPLACES the shipped `auto`
         // heuristic. Note what the A/B is here -- `auto` already tiles a large decode, so rung 2 is
         // "this tile edge" versus "the heuristic's tile edge", not "tiled" versus "untiled". A
@@ -1030,11 +1039,11 @@ impl Bernini {
         // never shipped.
         let tiling = match crate::memory_strategy::decode_tiling(req)? {
             Some(explicit) => Some(explicit),
-            None => TilingConfig::auto(height as i32, width as i32, out_frames),
+            None => TilingConfig::auto(out_height, out_width, out_frames),
         };
         let frames_u8 = {
             let w = Weights::from_file(self.root.join("vae.safetensors"))?;
-            let vae = WanVae::from_weights(&w)?;
+            let vae = ProviderVae::from_weights(&w)?;
             decode_to_frames(&vae, &latents, tiling.as_ref(), Some(&req.cancel))?
         };
         let images_out = frames_to_images(&frames_u8)?;
@@ -1153,16 +1162,18 @@ fn seeded_step_noise(
 mod tests {
     use super::*;
 
-    /// Component residency (epic 10834, sc-10840): Bernini advertises `supports_sequential_offload`
-    /// because it is structurally always-staged — `generate_impl` drops the planner and the T5 encoder
+    /// Component residency (epic 10834, sc-10840): Bernini is structurally always-staged —
+    /// `generate_impl` drops the planner and the T5 encoder
     /// (each + `clear_cache()`) before loading the two co-resident MoE experts, so peak unified memory
     /// is already bounded to the dominant expert phase (which the footprint reports as the DiT split).
     #[test]
-    fn advertises_sequential_offload() {
-        assert!(
-            descriptor().capabilities.supports_sequential_offload,
-            "bernini is always-staged (planner + T5 dropped before the experts); it must advertise \
-             supports_sequential_offload so the fit-gate consumes the staged footprint"
+    fn declares_unconditional_staged_residency_without_a_selectable_control() {
+        let capabilities = descriptor().capabilities;
+        assert!(!capabilities.supports_sequential_offload);
+        assert!(capabilities.unconditionally_engages_staged_residency);
+        assert_eq!(
+            capabilities.staged_residency_availability(),
+            mlx_gen::StagedResidencyAvailability::UnconditionallyEngaged,
         );
     }
 

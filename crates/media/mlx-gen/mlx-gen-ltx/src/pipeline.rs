@@ -26,7 +26,7 @@ use mlx_rs::{Array, Dtype};
 
 use mlx_gen::image::resize_lanczos_u8;
 use mlx_gen::media::AudioTrack;
-use mlx_gen::tiling::{budgeted_plan, TileCandidates, TilingBudgetError, TilingConfig, VaeTiling};
+use mlx_gen::tiling::{budgeted_plan, TileCandidates, TilingBudgetError, TilingConfig};
 use mlx_gen::{AvLatents, CancelFlag, Error, Image, Progress, Result};
 
 use crate::audio_vae::AudioDecoder;
@@ -155,17 +155,32 @@ pub fn renoise(latents: &Array, noise: &Array, noise_scale: f32) -> Result<Array
 /// a **catchable** error here instead of SIGKILLing the process inside a single-pass full-video decode.
 /// Small outputs select `None` → the original single-pass `decode` (byte-identical to before).
 pub fn decode_to_frames(vae: &LtxVideoVae, latents: &Array, cancel: &CancelFlag) -> Result<Array> {
+    decode_to_frames_with_tiling(vae, latents, cancel, None)
+}
+
+/// Decode with an explicitly admitted spatial tile when the shared memory ladder selected rung 2.
+/// `None` preserves the historical budget-driven auto selector byte-for-byte.
+pub(crate) fn decode_to_frames_with_tiling(
+    vae: &LtxVideoVae,
+    latents: &Array,
+    cancel: &CancelFlag,
+    selected_tiling: Option<&TilingConfig>,
+) -> Result<Array> {
     let sh = latents.shape(); // (B, 128, T_lat, H_lat, W_lat)
     let (t_lat, h_lat, w_lat) = (sh[2], sh[3], sh[4]);
-    let out_f = 1 + (t_lat - 1) * TEMPORAL_SCALE as i32;
-    let out_h = h_lat * SPATIAL_SCALE as i32;
-    let out_w = w_lat * SPATIAL_SCALE as i32;
+    let out_f = 1 + (t_lat - 1) * LtxVideoVae::VAE_TILING.temporal_scale;
+    let out_h = h_lat * LtxVideoVae::VAE_TILING.spatial_scale;
+    let out_w = w_lat * LtxVideoVae::VAE_TILING.spatial_scale;
     // F-051: honor a cancel issued after `Progress::Decoding` but before the (single-pass or tiled)
     // decode begins; the tiled path additionally checks per tile.
     if cancel.is_cancelled() {
         return Err(Error::Canceled);
     }
-    let decoded = match auto_tiling_budgeted_ltx(out_h, out_w, out_f)? {
+    let selected = match selected_tiling {
+        Some(config) => Some(*config),
+        None => auto_tiling_budgeted_ltx(out_h, out_w, out_f)?,
+    };
+    let decoded = match selected {
         Some(cfg) => vae.decode_tiled(latents, &cfg, cancel)?,
         None => vae.decode(latents)?,
     };
@@ -216,18 +231,18 @@ pub fn to_uint8_frames(video: &Array) -> Result<Array> {
 /// dominates small/mid decodes — omitting it would force a no-fixed model to over-predict the
 /// max-size decode by ~140 % and tile pathologically. Fit from `vae_decode_sweep.rs` (5 single-pass
 /// points, intercept ~2.5 GB; rounded **up** to 3.3 for headroom — the model must never under-predict).
-const LTX_VAE_FIXED_BYTES: f64 = 3.3e9;
+const LTX_VAE_FIXED_BYTES: u64 = 3_300_000_000;
 /// Per-output-voxel cost of the LTX decode's full-output f32 accumulators (`output` [1,3,F,H,W] +
 /// `weights` [1,1,F,H,W]) — paid by every tiled plan. Isolated from the single-pass slope minus the
 /// 1024²×25 @512-px tiled anchor (~36 B/voxel); rounded **up** to 40.
-const LTX_VAE_ACCUM_BYTES_PER_VOXEL: f64 = 40.0;
+const LTX_VAE_ACCUM_BYTES_PER_VOXEL: u64 = 40;
 /// Per-tile-output-voxel cost of the LTX decoder working set (×32 spatial / ×8 causal-temporal
 /// upsample). Fit from the same anchors at ~287 B/voxel; rounded **up** to 300. (Far lighter per
 /// voxel than the Wan VAEs — the heavy ×32 upsample runs on a tiny latent.)
-const LTX_VAE_TILE_BYTES_PER_OUT_VOXEL: f64 = 300.0;
+const LTX_VAE_TILE_BYTES_PER_OUT_VOXEL: u64 = 300;
 
 /// Candidate spatial tile sizes (output px, multiples of the LTX ×32 spatial scale, overlap 64).
-const LTX_VAE_SPATIAL_PX: [i32; 8] = [768, 640, 512, 448, 384, 320, 256, 192];
+pub(crate) const LTX_VAE_SPATIAL_PX: [i32; 8] = [768, 640, 512, 448, 384, 320, 256, 192];
 /// Candidate temporal tiles `(tile_frames, overlap_frames)` in output frames (the causal decoder maps
 /// `tile_frames/8` latent frames per tile).
 const LTX_VAE_TEMPORAL_FR: [(i32, i32); 4] = [(96, 24), (64, 16), (48, 16), (24, 8)];
@@ -247,10 +262,43 @@ fn estimated_ltx_decode_peak_gib(
     const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
     let out_voxels = (out_f * out_h * out_w) as f64;
     let tile_voxels = (tile_f * tile_h * tile_w) as f64;
-    (LTX_VAE_FIXED_BYTES
-        + LTX_VAE_ACCUM_BYTES_PER_VOXEL * out_voxels
-        + LTX_VAE_TILE_BYTES_PER_OUT_VOXEL * tile_voxels)
+    (LTX_VAE_FIXED_BYTES as f64
+        + LTX_VAE_ACCUM_BYTES_PER_VOXEL as f64 * out_voxels
+        + LTX_VAE_TILE_BYTES_PER_OUT_VOXEL as f64 * tile_voxels)
         / GIB
+}
+
+/// Conservative single-pass LTX VAE decode working-set peak in bytes.
+///
+/// This is the exact full-output case of the calibrated cost function used by
+/// [`auto_tiling_budgeted_ltx`]. It includes that model's fixed decoder/base-working-set floor and
+/// decode accumulators/activations, but no DiT or text-encoder composition weights.
+pub fn conservative_video_decode_peak_bytes(width: u32, height: u32, frames: u32) -> Option<u64> {
+    let voxels = u64::from(width)
+        .checked_mul(u64::from(height))?
+        .checked_mul(u64::from(frames))?;
+    if voxels == 0 {
+        return None;
+    }
+    let variable_per_voxel =
+        LTX_VAE_ACCUM_BYTES_PER_VOXEL.checked_add(LTX_VAE_TILE_BYTES_PER_OUT_VOXEL)?;
+    LTX_VAE_FIXED_BYTES.checked_add(variable_per_voxel.checked_mul(voxels)?)
+}
+
+/// Composable form of [`conservative_video_decode_peak_bytes`].
+///
+/// The calibrated fixed term mixes decoder residency with backend/runtime working set, so no
+/// decoder-only portion is source-grounded. It therefore remains entirely in `working_set_bytes`
+/// and `resident_decoder_bytes_included` is conservatively zero.
+pub fn conservative_video_decode_memory_profile(
+    width: u32,
+    height: u32,
+    frames: u32,
+) -> Option<mlx_gen::VideoDecodeMemoryProfile> {
+    mlx_gen::VideoDecodeMemoryProfile::new(
+        conservative_video_decode_peak_bytes(width, height, frames)?,
+        0,
+    )
 }
 
 /// **Memory-budgeted** tiling for the LTX VAE decode (sc-6894 F-004): routes the shared
@@ -265,6 +313,70 @@ pub fn auto_tiling_budgeted_ltx(
     const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
     let budget_gib = get_memory_limit() as f64 / GIB;
     plan_ltx_tiling(height, width, out_frames, budget_gib * 0.85)
+}
+
+/// Budget the exact spatial tile admitted by the shared memory contract while retaining LTX's
+/// shipped temporal candidate search. A spatial-only override is unsafe for long clips: it can erase
+/// the temporal bound selected by [`auto_tiling_budgeted_ltx`]. If the admitted edge cannot fit even
+/// with a production temporal tile, this fails before decode instead of silently choosing a smaller
+/// spatial parameter than the contract selected.
+pub(crate) fn selected_tiling_budgeted_ltx(
+    height: i32,
+    width: i32,
+    out_frames: i32,
+    tile_edge: i32,
+    overlap: i32,
+) -> Result<TilingConfig> {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let safe_gib = get_memory_limit() as f64 / GIB * 0.85;
+    plan_ltx_tiling_for_selected_spatial(height, width, out_frames, safe_gib, tile_edge, overlap)
+}
+
+fn plan_ltx_tiling_for_selected_spatial(
+    height: i32,
+    width: i32,
+    out_frames: i32,
+    safe_gib: f64,
+    tile_edge: i32,
+    overlap: i32,
+) -> Result<TilingConfig> {
+    let spatial = [tile_edge];
+    let candidates = TileCandidates {
+        spatial_px: &spatial,
+        spatial_overlap_px: overlap,
+        temporal: &LTX_VAE_TEMPORAL_FR,
+        temporal_overlap_policy: mlx_gen::tiling::TemporalOverlapPolicy::HalfTile,
+    };
+    let selected_edge = tile_edge as i64;
+    let plan = budgeted_plan(
+        LtxVideoVae::VAE_TILING,
+        height,
+        width,
+        out_frames,
+        safe_gib,
+        candidates,
+        |out_f, out_h, out_w, tile_f, tile_h, tile_w| {
+            // `budgeted_plan` always includes the full spatial extent as a no-spatial-tiling
+            // candidate. Make that candidate unaffordable when it exceeds the admitted edge, while
+            // preserving the zero-tile accumulator probe.
+            if tile_f != 0 && (tile_h > selected_edge || tile_w > selected_edge) {
+                f64::INFINITY
+            } else {
+                estimated_ltx_decode_peak_gib(out_f, out_h, out_w, tile_f, tile_h, tile_w)
+            }
+        },
+    )
+    .map_err(|error| ltx_decode_budget_error(width, height, out_frames, error))?;
+
+    let mut config = plan.unwrap_or_default();
+    // Even when the entire output is no larger than the selected edge, route through `decode_tiled`
+    // as requested. The resulting one-tile spatial plan is equivalent but keeps the selected carrier
+    // observable instead of silently falling back to the ordinary decode.
+    config.spatial = Some(mlx_gen::tiling::SpatialTiling {
+        tile_px: tile_edge,
+        overlap_px: overlap,
+    });
+    Ok(config)
 }
 
 /// Pure LTX tile selector behind [`auto_tiling_budgeted_ltx`] (the `safe_gib` ceiling is injected so it
@@ -283,7 +395,7 @@ fn plan_ltx_tiling(
         temporal_overlap_policy: mlx_gen::tiling::TemporalOverlapPolicy::HalfTile,
     };
     budgeted_plan(
-        VaeTiling::LTX,
+        LtxVideoVae::VAE_TILING,
         height,
         width,
         out_frames,
@@ -1021,6 +1133,8 @@ pub fn generate_av_latents(
 #[derive(Clone, Copy)]
 pub struct StageClip<'a> {
     pub stage1: &'a Array,
+    /// Output-frame coordinate consumed by the appended-token RoPE path. The legacy field name is
+    /// retained for source compatibility; request latent indices are converted before construction.
     pub frame_idx: i32,
     pub strength: f32,
 }
@@ -1320,6 +1434,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn selected_spatial_tile_keeps_the_budgeted_temporal_bound_for_long_clips() {
+        let safe = 25.0;
+        let cfg = plan_ltx_tiling_for_selected_spatial(512, 768, 1025, safe, 512, 64)
+            .expect("the admitted spatial edge plus a production temporal tile must fit");
+        let spatial = cfg
+            .spatial
+            .expect("selected spatial edge must remain explicit");
+        assert_eq!((spatial.tile_px, spatial.overlap_px), (512, 64));
+        assert!(
+            cfg.temporal.is_some(),
+            "the long clip must retain a temporal bound: {cfg:?}"
+        );
+        assert!(ltx_chosen_peak(&cfg, 512, 768, 1025) <= safe);
+    }
+
     /// **sc-15325 — the LTX temporal candidate grid can no longer starve the decoder.**
     ///
     /// `LTX_VAE_TEMPORAL_FR` holds `(48, 16)` and `(24, 8)`, which at the LTX VAE's `temporal_scale`
@@ -1349,7 +1479,7 @@ mod tests {
     #[test]
     fn ltx_tiling_never_selects_a_starved_temporal_tile() {
         use mlx_gen::tiling::{MIN_TEMPORAL_TILE_LATENT_FRAMES, MIN_TEMPORAL_TILE_LATENT_OVERLAP};
-        let scale = VaeTiling::LTX.temporal_scale;
+        let scale = LtxVideoVae::VAE_TILING.temporal_scale;
         for (w, h, f) in [
             (1280, 704, 121),
             (1280, 720, 121),
@@ -1380,6 +1510,18 @@ mod tests {
             plan_ltx_tiling(h, w, f, 12.0)
                 .unwrap_or_else(|e| panic!("{w}x{h}x{f} became infeasible at 12 GiB: {e}"));
         }
+    }
+
+    #[test]
+    fn public_decode_peak_is_the_planners_full_output_case() {
+        let profile = conservative_video_decode_memory_profile(64, 64, 9).unwrap();
+        assert_eq!(profile.working_set_bytes(), 3_312_533_760);
+        assert_eq!(profile.resident_decoder_bytes_included(), 0);
+        assert_eq!(conservative_video_decode_peak_bytes(0, 64, 9), None);
+        assert_eq!(
+            conservative_video_decode_peak_bytes(u32::MAX, u32::MAX, u32::MAX),
+            None
+        );
     }
 
     #[test]

@@ -35,7 +35,7 @@ use candle_gen::{CandleError, Result as CResult};
 
 use candle_gen_wan::config::{
     TextEncoderConfig, TransformerConfig, DEFAULT_FRAMES_14B, NEGATIVE_FALLBACK,
-    NUM_TRAIN_TIMESTEPS, VAE16_STRIDE_SPATIAL, VAE16_STRIDE_TEMPORAL,
+    NUM_TRAIN_TIMESTEPS,
 };
 use candle_gen_wan::pipeline::{create_noise, frames_to_images};
 use candle_gen_wan::scheduler::{flow_sigmas, FlowScheduler, Sampler};
@@ -46,6 +46,7 @@ use crate::config::{
 };
 use crate::forward::{guided_velocity, num_momentum_buffers, GuidanceParams, PackedForward};
 use crate::guidance::MomentumBuffer;
+use crate::latent_dims;
 use crate::preprocess::{encode_image, encode_videoclip};
 
 /// The experts run bf16 (the diffusers weights load as bf16, matching the 5B/14B regime); UMT5 + VAE f32.
@@ -82,9 +83,9 @@ pub fn descriptor() -> ModelDescriptor {
                 ConditioningKind::MultiReference,
                 ConditioningKind::VideoClip,
             ],
-            // LoRA/quant-adapter surface is a follow-on; the renderer ships dense bf16 / packed q4/q8.
-            supports_lora: false,
-            supports_lokr: false,
+            // User LoRA/LoKr stacks apply to both dense bf16 and packed q4/q8 renderer tiers.
+            supports_lora: true,
+            supports_lokr: true,
             // Curated `uni_pc` (sc-7296) → Wan's native UniPC; `euler` flow Euler. Legacy `unipc` alias.
             samplers: vec!["uni_pc", "euler", "unipc"],
             schedulers: Vec::new(),
@@ -98,7 +99,9 @@ pub fn descriptor() -> ModelDescriptor {
             supports_kv_cache: false,
             requires_sigma_shift: false,
             supports_sequential_offload: false,
+            unconditionally_engages_staged_residency: false,
             supports_preview: false,
+            supports_prompt_enhancement: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
@@ -122,6 +125,7 @@ pub struct BerniniRenderer {
     knobs: BerniniKnobs,
     root: PathBuf,
     device: Device,
+    adapters: Vec<candle_gen::gen_core::AdapterSpec>,
     components: Mutex<Option<Arc<RendererComponents>>>,
 }
 
@@ -132,6 +136,7 @@ impl BerniniRenderer {
                 &self.root,
                 &self.device,
                 MODEL_ID,
+                &self.adapters,
             )?))
         })
     }
@@ -255,9 +260,7 @@ impl BerniniRenderer {
 
         // --- Latent geometry (z16 strides). RoPE is now built per token-segment inside `PackedForward`
         // (each source + the target gets its own source-id-shifted table), so no shared cos/sin here. ---
-        let t_lat = ((frames - 1) / VAE16_STRIDE_TEMPORAL + 1) as usize;
-        let h_lat = (height / VAE16_STRIDE_SPATIAL) as usize;
-        let w_lat = (width / VAE16_STRIDE_SPATIAL) as usize;
+        let (t_lat, h_lat, w_lat) = latent_dims(frames, width, height);
         let dit_cfg = TransformerConfig::t2v_14b();
 
         let mut latents = create_noise(seed, Z_DIM, t_lat, h_lat, w_lat, &self.device)?;
@@ -406,6 +409,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         knobs,
         root,
         device,
+        adapters: spec.adapters.clone(),
         components: Mutex::new(None),
     }))
 }
@@ -481,6 +485,12 @@ mod tests {
     fn descriptor_surface() {
         let d = descriptor();
         assert_eq!(d.id, MODEL_ID);
+        assert!(!d.capabilities.supports_sequential_offload);
+        assert!(!d.capabilities.unconditionally_engages_staged_residency);
+        assert_eq!(
+            d.capabilities.staged_residency_availability(),
+            candle_gen::gen_core::StagedResidencyAvailability::Absent,
+        );
         assert!(d.capabilities.supports_guidance);
         assert!(d.capabilities.supports_negative_prompt);
         assert!(!d.capabilities.supports_true_cfg);

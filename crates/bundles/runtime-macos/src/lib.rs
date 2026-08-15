@@ -4,10 +4,53 @@
 pub use candle_audio_catalog::audio;
 #[cfg(feature = "media")]
 pub use mlx_gen_catalog::media;
+#[cfg(feature = "media")]
+pub use mlx_gen_catalog::{vae_tiling, vae_tiling_unmodelled_reason};
 pub use mlx_llm as llm;
 pub use runtime_catalog::{
     core_llm, gen_core, memory_strategy, RuntimeCatalog, RuntimeCatalogSnapshot,
+    VideoDecodeMemoryProfile,
 };
+
+#[cfg(feature = "media")]
+/// Resolve a provider-owned conservative VAE decode profile for contract-safe memory composition.
+pub fn conservative_video_decode_memory_profile(
+    provider_id: &str,
+    width: u32,
+    height: u32,
+    frames: u32,
+) -> Option<VideoDecodeMemoryProfile> {
+    mlx_gen_catalog::conservative_video_decode_memory_profile(provider_id, width, height, frames)
+}
+
+#[cfg(feature = "media")]
+/// Resolve the load-exact provider numeric tier used by calibrated video memory admission.
+pub fn resolved_video_memory_numeric_tier(
+    provider_id: &str,
+    spec: &gen_core::LoadSpec,
+) -> gen_core::Result<Option<gen_core::MemoryNumericTier>> {
+    mlx_gen_catalog::resolved_video_memory_numeric_tier(provider_id, spec)
+}
+
+#[cfg(feature = "media")]
+/// Resolve the provider-owned profile for the exact selected bounded-decode carrier.
+pub fn selected_video_decode_memory_profile(
+    provider_id: &str,
+    width: u32,
+    height: u32,
+    frames: u32,
+    tile_edge: u32,
+    overlap: u32,
+) -> gen_core::Result<Option<VideoDecodeMemoryProfile>> {
+    mlx_gen_catalog::selected_video_decode_memory_profile(
+        provider_id,
+        width,
+        height,
+        frames,
+        tile_edge,
+        overlap,
+    )
+}
 
 /// The MLX backend crates this platform owns, re-exported from the media catalog
 /// (available under the default `media` feature).
@@ -91,6 +134,46 @@ pub fn catalog() -> runtime_catalog::Result<RuntimeCatalog> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "media")]
+    #[test]
+    fn bundle_exposes_narrow_selected_video_memory_apis() {
+        let spec = super::gen_core::LoadSpec::new(super::gen_core::WeightsSource::Dir(
+            "/nonexistent".into(),
+        ));
+        assert_eq!(
+            super::resolved_video_memory_numeric_tier("unknown", &spec).unwrap(),
+            None
+        );
+        assert_eq!(
+            super::selected_video_decode_memory_profile("unknown", 480, 480, 1, 448, 64).unwrap(),
+            None
+        );
+    }
+
+    #[cfg(feature = "media")]
+    #[test]
+    fn bundle_exposes_engine_id_vae_geometry() {
+        let tiling: super::gen_core::tiling::VaeTiling =
+            super::vae_tiling("bernini").expect("modelled video id");
+        assert_eq!(tiling.full_res_channels, 96);
+        assert!(!tiling.causal_temporal);
+        assert_eq!(
+            super::conservative_video_decode_memory_profile("bernini", 64, 64, 9).map(|profile| (
+                profile.working_set_bytes(),
+                profile.resident_decoder_bytes_included(),
+            )),
+            Some((322_633_728, 0))
+        );
+
+        assert_eq!(super::vae_tiling("svd_xt"), None);
+        assert_eq!(
+            super::vae_tiling_unmodelled_reason("svd_xt"),
+            Some(super::providers::svd::VAE_TILING_UNMODELLED_REASON),
+            "the shipped MLX SVD route must remain explicitly unmodelled until its decoder has a \
+             load-bearing spatial planner"
+        );
+    }
+
     #[test]
     fn smoke_catalog_is_explicit_and_machine_readable() {
         let snapshot = super::catalog().unwrap().snapshot();

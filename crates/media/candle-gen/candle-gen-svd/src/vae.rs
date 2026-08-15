@@ -27,16 +27,6 @@ const EPS_SPATIAL: f64 = 1e-6;
 /// Temporal `TemporalResnetBlock` GroupNorm epsilon (the `SpatioTemporalResBlock` `temporal_eps`).
 const EPS_TEMPORAL: f64 = 1e-5;
 
-/// SVD's temporal VAE keeps the input frame count and upsamples spatially by 8. The penultimate up
-/// block materializes its 256-channel input after nearest-neighbor expansion and before the reducing
-/// convolution, so 256 is the conservative full-output-resolution write width.
-const SVD_VAE_TILING: VaeTiling = VaeTiling {
-    spatial_scale: 8,
-    temporal_scale: 1,
-    causal_temporal: false,
-    full_res_channels: 256,
-};
-
 const GIB_F64: f64 = 1024.0 * 1024.0 * 1024.0;
 const SVD_VAE_BUDGET_ENV: &str = "SVD_VAE_BUDGET_GIB";
 const SVD_VAE_BUDGET_SAFE_FRAC: f64 = 0.85;
@@ -85,7 +75,7 @@ fn plan_svd_tiling(
 ) -> Result<Option<TilingConfig>> {
     vae_tiling::plan_tiling(
         "svd temporal vae decode",
-        SVD_VAE_TILING,
+        SvdVae::VAE_TILING,
         height,
         width,
         frames,
@@ -616,6 +606,18 @@ pub struct SvdVae {
 }
 
 impl SvdVae {
+    /// Geometry owned by this concrete decoder and consumed by its budget planner and tiled driver.
+    ///
+    /// SVD keeps the input frame count and upsamples spatially by 8. The penultimate up block
+    /// materializes its 256-channel input after nearest-neighbor expansion and before the reducing
+    /// convolution, so 256 is the conservative full-output-resolution write width.
+    pub const VAE_TILING: VaeTiling = VaeTiling {
+        spatial_scale: 8,
+        temporal_scale: 1,
+        causal_temporal: false,
+        full_res_channels: 256,
+    };
+
     /// Build from a VarBuilder rooted at the `vae/` safetensors (keys `encoder.*`, `decoder.*`,
     /// `quant_conv.*`).
     pub fn new(cfg: &VaeConfig, vb: VarBuilder) -> Result<Self> {
@@ -684,8 +686,8 @@ impl SvdVae {
             .permute((0, 2, 1, 3, 4))?
             .contiguous()?;
         let cfg = auto_tiling_budgeted_svd(
-            (h * SVD_VAE_TILING.spatial_scale as usize) as i32,
-            (w * SVD_VAE_TILING.spatial_scale as usize) as i32,
+            (h * Self::VAE_TILING.spatial_scale as usize) as i32,
+            (w * Self::VAE_TILING.spatial_scale as usize) as i32,
             f as i32,
         )?;
 
@@ -708,7 +710,7 @@ impl SvdVae {
 
         let decoded = match cfg {
             Some(cfg) => vae_tiling::decode_tiled(
-                SVD_VAE_TILING,
+                Self::VAE_TILING,
                 "svd temporal vae",
                 &latent,
                 &cfg,
@@ -728,6 +730,36 @@ impl SvdVae {
 mod budget_tests {
     use super::*;
     use candle_gen::candle_core::Device;
+
+    #[test]
+    fn provider_tiling_is_load_bearing_at_both_shipped_geometries() {
+        assert_eq!(
+            SvdVae::VAE_TILING,
+            VaeTiling {
+                spatial_scale: 8,
+                temporal_scale: 1,
+                causal_temporal: false,
+                full_res_channels: 256,
+            }
+        );
+
+        for (width, height) in [(1024, 576), (576, 1024)] {
+            let cap = SvdVae::VAE_TILING.writable_frame_cap(height, width);
+            assert_eq!(cap, 14, "{width}x{height}");
+            assert!(
+                plan_svd_tiling(height, width, cap as i32, 1_000.0)
+                    .unwrap()
+                    .is_none(),
+                "{width}x{height} at the exact write cap must remain single-pass with ample memory"
+            );
+            assert!(
+                plan_svd_tiling(height, width, cap as i32 + 1, 1_000.0)
+                    .unwrap()
+                    .is_some(),
+                "{width}x{height} one frame over the write cap must tile even with ample memory"
+            );
+        }
+    }
 
     #[test]
     fn svd_plan_uses_chunk_frames_and_low_budget_selects_smaller_tiles() {
@@ -754,12 +786,47 @@ mod budget_tests {
     }
 
     #[test]
+    fn the_product_chunk_is_not_write_cap_tiled_or_accumulator_dominated() {
+        const PRODUCT_CHUNK: i64 = 8;
+        const WIDTH: i64 = 1024;
+        const HEIGHT: i64 = 576;
+        assert!(
+            PRODUCT_CHUNK <= SvdVae::VAE_TILING.writable_frame_cap(HEIGHT as i32, WIDTH as i32),
+            "SceneWorks' resolved 8-frame pass is below the 14-frame write cap"
+        );
+
+        let accumulator_gib =
+            SVD_VAE_ACCUM_BYTES_PER_VOXEL * (PRODUCT_CHUNK * WIDTH * HEIGHT) as f64 / GIB_F64;
+        let smallest_tile = i64::from(*SVD_VAE_SPATIAL_PX.last().unwrap());
+        let tile_activation_gib = SVD_VAE_FRAME_BYTES_PER_OUT_PX
+            * (PRODUCT_CHUNK * smallest_tile * smallest_tile) as f64
+            / GIB_F64;
+        assert!(
+            tile_activation_gib > accumulator_gib,
+            "even the smallest candidate's activation term ({tile_activation_gib:.3} GiB) must \
+             exceed the full-output accumulator ({accumulator_gib:.3} GiB); the accumulator is \
+             not a universal SVD phase floor"
+        );
+        assert_eq!(
+            estimated_svd_decode_peak_gib(
+                PRODUCT_CHUNK,
+                HEIGHT,
+                WIDTH,
+                PRODUCT_CHUNK,
+                smallest_tile,
+                smallest_tile,
+            ),
+            accumulator_gib + tile_activation_gib
+        );
+    }
+
+    #[test]
     fn svd_overlap_stitch_reconstructs_a_constant_field() {
         let dev = Device::Cpu;
         let latent = Tensor::full(0.25f32, (1, 4, 2, 16, 16), &dev).unwrap();
         let cfg = TilingConfig::spatial_only(64, 32);
         let out = vae_tiling::decode_tiled(
-            SVD_VAE_TILING,
+            SvdVae::VAE_TILING,
             "svd stitch test",
             &latent,
             &cfg,
@@ -802,7 +869,7 @@ mod budget_tests {
         };
         let expected = decode_nearest(&latent).unwrap();
         let actual = vae_tiling::decode_tiled(
-            SVD_VAE_TILING,
+            SvdVae::VAE_TILING,
             "svd position-dependent stitch test",
             &latent,
             &TilingConfig::spatial_only(64, 32),

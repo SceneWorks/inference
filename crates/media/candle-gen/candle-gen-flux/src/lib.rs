@@ -362,10 +362,10 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             // shared `validate_request` rejects any conditioning and the worker keeps those shapes on
             // the Python path.
             conditioning: vec![],
-            // LoRA/LoKr (mlx supports both) and Q4/Q8 quantization are deferred to a later slice; not
-            // advertised, and rejected at load rather than silently dropped.
-            supports_lora: false,
-            supports_lokr: false,
+            // LoRA/LoKr apply as residuals over dense or packed FLUX projections. Q4/Q8 tiers remain
+            // prepacked snapshot choices rather than on-the-fly quantization.
+            supports_lora: true,
+            supports_lokr: true,
             // Unified curated sampler/scheduler menu (epic 7114 P4, sc-7123): the denoise routes
             // through the shared driver, so the per-generation `sampler`/`scheduler` knob can select any
             // curated integrator/schedule. The DEFAULT (None/None) reproduces the native flow-match
@@ -383,12 +383,14 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             supports_kv_cache: false,
             requires_sigma_shift: false,
             supports_sequential_offload: true,
+            unconditionally_engages_staged_residency: false,
             // Per-step latent previews (epic 16948, sc-16956): the registered txt2img route hands
             // `crate::preview::hook` to the shared flow driver, projecting the unpacked 16-channel
             // latent through the reused epic-16624 fit. Both variants share one render lane, so both
             // advertise. `candle-gen-catalog`'s `preview_advertising` guard derives this from the
             // sources and fails if the flag and the wiring ever disagree.
             supports_preview: true,
+            supports_prompt_enhancement: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
@@ -432,11 +434,6 @@ fn load_variant(variant: Variant, spec: &LoadSpec) -> gen_core::Result<Box<dyn G
             )));
         }
     };
-    if !spec.adapters.is_empty() {
-        return Err(gen_core::Error::Unsupported(format!(
-            "candle {id} does not support LoRA/LoKr yet — refusing to silently drop the adapters"
-        )));
-    }
     if spec.quantize.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
             "candle {id} does not support on-the-fly Q4/Q8 quantization yet"
@@ -450,7 +447,14 @@ fn load_variant(variant: Variant, spec: &LoadSpec) -> gen_core::Result<Box<dyn G
     // FLUX is a bf16 model; load at bf16 regardless of the CPU-default dtype. The device is the
     // backend selected at compile time (CUDA on Windows, Metal/CPU on Mac).
     let device = candle_gen::default_device()?;
-    let pipe = Pipeline::load(variant, &root, &device, DType::BF16, spec.pid.clone());
+    let pipe = Pipeline::load(
+        variant,
+        &root,
+        &device,
+        DType::BF16,
+        spec.pid.clone(),
+        spec.adapters.clone(),
+    );
     let loaded_quant = memory_strategy::snapshot_quant_tier(spec, id)?;
     #[cfg(any(feature = "cuda", test))]
     let memory_strategy = Some(memory_strategy::provider_contract(id, spec)?);
@@ -638,8 +642,8 @@ mod tests {
             assert!(!d.capabilities.supports_true_cfg);
             assert!(!d.capabilities.mac_only);
             assert!(d.capabilities.conditioning.is_empty());
-            assert!(!d.capabilities.supports_lora);
-            assert!(!d.capabilities.supports_lokr);
+            assert!(d.capabilities.supports_lora);
+            assert!(d.capabilities.supports_lokr);
             assert!(d.capabilities.supported_quants.is_empty());
             assert_eq!(d.capabilities.min_size, 256);
             assert_eq!(d.capabilities.max_size, 2048);
@@ -751,9 +755,7 @@ mod tests {
             .is_ok());
     }
 
-    /// LoRA adapters / quantization / control overlays are rejected at load as typed `Unsupported`
-    /// (both variants), so the worker can fall back to Python rather than the backend silently
-    /// dropping them.
+    /// Adapters are accepted; unsupported quant/control overlays remain typed rejections.
     #[test]
     fn load_rejects_unwired_surfaces() {
         use candle_gen::gen_core::{AdapterKind, AdapterSpec, Quant};
@@ -761,10 +763,7 @@ mod tests {
             let lora = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_adapters(vec![
                 AdapterSpec::new("/lora.safetensors".into(), 1.0, AdapterKind::Lora),
             ]);
-            assert!(matches!(
-                load(&lora).err().expect("err"),
-                gen_core::Error::Unsupported(_)
-            ));
+            assert!(load(&lora).is_ok());
 
             let quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q8);
             assert!(matches!(

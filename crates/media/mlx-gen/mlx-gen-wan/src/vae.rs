@@ -523,6 +523,9 @@ pub struct WanVae {
 }
 
 impl WanVae {
+    /// Geometry owned by the concrete non-causal z16 decoder.
+    pub const VAE_TILING: VaeTiling = VaeTiling::WAN;
+
     /// Build from a weight map. Structure is fixed by the 2.1 config and channel sizes ride on the
     /// weights, so the same builder serves any `dim` (96 in production; tiny in the parity fixture).
     /// The encoder is loaded only if its weights are present.
@@ -576,12 +579,12 @@ impl WanVae {
     ) -> Result<Array> {
         let sh = z.shape();
         let (f, h, w) = (sh[2], sh[3], sh[4]);
-        if !cfg.needs_tiling(VaeTiling::WAN, f, h, w) {
+        if !cfg.needs_tiling(Self::VAE_TILING, f, h, w) {
             return self.decode(z);
         }
         // Denormalize once (matches the reference), then tile the denormalized latent.
         let denorm = add(&divide(z, &self.inv_std)?, &self.mean)?;
-        let plan = cfg.plan(VaeTiling::WAN, f, h, w);
+        let plan = cfg.plan(Self::VAE_TILING, f, h, w);
 
         // NCTHW: channel axis at 1, tiled axes [2, 3, 4]. Per-tile decode = conv2 → decoder → clamp.
         tile_decode_accumulate(&denorm, &plan, [2, 3, 4], cancel, |tile| {

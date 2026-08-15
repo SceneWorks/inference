@@ -9,14 +9,15 @@
 //! `candle_gen::run_av_curated_sampler` over the fixed `STAGE1_SIGMAS`
 //! schedule (epic 7114), so no per-crate scheduler module is needed.
 //!
-//! **txt2video+audio (sc-3698 / sc-5495):** [`LtxGenerator::generate`] runs Gemma-3-12B → video +
+//! **video+audio (sc-3698 / sc-5495):** [`LtxGenerator::generate`] runs Gemma-3-12B → video +
 //! audio text projections → connectors → the 48-layer dual-modal `AvDiT` (split
 //! 3-D RoPE, per-head gated attention, adaLN-single, bidirectional cross-modal attention) joint
 //! denoise → the temporal VAE decoder (frames) **plus** the `AudioDecoder`
 //! → `LtxVocoder` → a synchronized 48 kHz stereo `AudioTrack`. Registered under
-//! `"ltx_2_3_distilled"`; single-stage distilled denoise (no CFG). **Deferred** to follow-up stories:
-//! the 2-stage latent upsampler, I2V conditioning, prompt-enhance, IC-LoRA, and fp8/quant. Plain
-//! video-attention LoRA is supported on both dense and packed tiers.
+//! `"ltx_2_3_distilled"`; single-stage distilled denoise (no CFG). Reference I2V, FLF/keyframes,
+//! extend/bridge IC-LoRA clips, and masked replace-person controls share the VAE encoder and per-token
+//! timestep path. The 2-stage latent upsampler, prompt-enhance, and fp8/on-the-fly quant remain
+//! deferred. LTX AudioVideo projection adapters are supported on both dense and packed tiers.
 //!
 //! **Dtypes:** the DiT, connector, text projection, and Gemma encoder run **bf16** (the checkpoint's
 //! native dtype; 22B+12B does not fit f32 on a single 96 GB GPU); the VAE runs **f32**; attention and
@@ -31,6 +32,7 @@
 
 pub mod adapters;
 pub mod audio_vae;
+pub mod conditioning;
 pub mod config;
 pub mod connector;
 pub mod conv3d;
@@ -50,10 +52,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
+#[cfg(test)]
+use candle_gen::gen_core::AdapterKind;
 use candle_gen::gen_core::{
-    self, AdapterKind, AdapterSpec, AudioTrack, Capabilities, GenerationOutput, GenerationRequest,
-    Generator, Image, LoadSpec, Modality, ModelDescriptor, PerComponentBytes, Progress, Quant,
-    SizeFloor, WeightsSource,
+    self, AdapterSpec, AudioTrack, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
+    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, PerComponentBytes,
+    Progress, Quant, SizeFloor, WeightsSource,
 };
 use candle_gen::{run_av_curated_sampler, AvLatents, CandleError, Result as CResult};
 
@@ -65,10 +69,26 @@ use config::{
 use text_encoder::LtxTextEncoder;
 use transformer::AvDiT;
 use vae::LtxVideoVae;
+/// Provider-facing LTX geometry, derived from the decoder implementation.
+pub const VAE_TILING: candle_gen::gen_core::tiling::VaeTiling = LtxVideoVae::VAE_TILING;
 use vocoder::LtxVocoder;
 
 const DIT_DTYPE: DType = DType::BF16;
 const VAE_DTYPE: DType = DType::F32;
+
+#[cfg(test)]
+mod vae_tiling_assignment_tests {
+    #[test]
+    fn provider_id_resolves_to_the_concrete_decoder_geometry() {
+        assert_eq!(
+            super::VAE_TILING,
+            candle_gen::gen_core::tiling::VaeTiling::LTX
+        );
+        assert_eq!(super::VAE_TILING, super::LtxVideoVae::VAE_TILING);
+        assert_eq!(super::vae_tiling(super::MODEL_ID), Some(super::VAE_TILING));
+        assert_eq!(super::vae_tiling("ltx_2_3"), None);
+    }
+}
 /// The request width/height multiple `validate` enforces (= `config::SPATIAL_SCALE` = 32): candle's
 /// single-stage `ltx_2_3_distilled` renders on the 32× VAE grid. Exposed as the pinned-engine stride
 /// SceneWorks ties `requiresDimensionsMultipleOf` to (sc-12587); mirrors `wan::config::SIZE_MULTIPLE_14B`.
@@ -80,6 +100,7 @@ struct Components {
     te: Arc<LtxTextEncoder>,
     avdit: Arc<AvDiT>,
     vae: Arc<LtxVideoVae>,
+    vae_has_encoder: bool,
     /// Audio decode chain — `None` on the packed MLX tier path (sc-9545), which is **video-only**: the
     /// tier's audio-VAE + vocoder ship in a different key layout (channels-last convs, no `decoder.`/
     /// `vocoder.` prefix) that is a separate ingestion slice (follow-up), and the sc-9417 render AC is a
@@ -94,6 +115,19 @@ struct AudioChain {
     decoder: Arc<AudioDecoder>,
     vocoder: Arc<LtxVocoder>,
     sample_rate: u32,
+}
+
+struct EncodedKeyframe {
+    latent: Tensor,
+    frame_idx: usize,
+    strength: f32,
+}
+
+struct EncodedClip {
+    latent: Tensor,
+    /// Output-frame coordinate consumed by the appended-token RoPE path.
+    frame_offset: i32,
+    strength: f32,
 }
 
 struct Pipeline {
@@ -145,12 +179,16 @@ impl Pipeline {
         candle_gen::sorted_safetensors(dir, "ltx")
     }
 
-    fn load_components(&self, adapters: &[AdapterSpec]) -> CResult<Components> {
+    fn load_components(
+        &self,
+        adapters: &[AdapterSpec],
+        with_vae_encoder: bool,
+    ) -> CResult<Components> {
         // sc-9545: a packed MLX split-tier subdir (`.../q4` or `.../q8`) is ingested through the
         // remapping VarBuilders in `tier` so the sc-9417 packed-detect seam fires on the real tier
         // weights with no dense staging; the single-bundle dense checkpoint keeps the legacy path below.
         if let Some(paths) = tier::TierPaths::detect(&self.root, self.gemma_override.as_deref()) {
-            return self.load_components_tier(&paths, adapters);
+            return self.load_components_tier(&paths, adapters, with_vae_encoder);
         }
 
         let ltx_file = self.ltx_checkpoint()?;
@@ -175,7 +213,16 @@ impl Pipeline {
             &self.conn_cfg,
             &self.audio_conn_cfg,
         )?;
-        let vae = LtxVideoVae::new(vb_f32.pp("vae"), config::LATENT_CHANNELS, 4)?;
+        let vae = if with_vae_encoder {
+            LtxVideoVae::new_with_encoder(
+                vb_f32.pp("vae"),
+                vb_f32.pp("vae"),
+                config::LATENT_CHANNELS,
+                4,
+            )?
+        } else {
+            LtxVideoVae::new(vb_f32.pp("vae"), config::LATENT_CHANNELS, 4)?
+        };
         // The audio VAE decoder + vocoder run f32 (post-sampling quality islands).
         let audio_decoder = AudioDecoder::load(&vb_f32.pp("audio_vae"), &self.audio_vae_cfg)?;
         let vocoder = LtxVocoder::load(vb_f32, &self.device, &self.vocoder_cfg)?;
@@ -189,6 +236,7 @@ impl Pipeline {
             te: Arc::new(te),
             avdit: Arc::new(avdit),
             vae: Arc::new(vae),
+            vae_has_encoder: with_vae_encoder,
             audio: Some(AudioChain {
                 decoder: Arc::new(audio_decoder),
                 vocoder: Arc::new(vocoder),
@@ -209,6 +257,7 @@ impl Pipeline {
         &self,
         paths: &tier::TierPaths,
         adapters: &[AdapterSpec],
+        with_vae_encoder: bool,
     ) -> CResult<Components> {
         // Read + validate the tier's group_size (AC): errors loudly if a tier ever ships a group the
         // packed loaders don't repack at, rather than mis-aligning the MLX→GGML repack.
@@ -234,7 +283,16 @@ impl Pipeline {
             &self.conn_cfg,
             &self.audio_conn_cfg,
         )?;
-        let vae = LtxVideoVae::new(vae_vb.pp("vae"), config::LATENT_CHANNELS, 4)?;
+        let vae = if with_vae_encoder {
+            LtxVideoVae::new_with_encoder(
+                vae_vb.pp("vae"),
+                paths.vae_encoder_vb(VAE_DTYPE, &self.device)?.pp("vae"),
+                config::LATENT_CHANNELS,
+                4,
+            )?
+        } else {
+            LtxVideoVae::new(vae_vb.pp("vae"), config::LATENT_CHANNELS, 4)?
+        };
 
         let tok_path = paths.tokenizer_path();
         let tokenizer = tokenizers::Tokenizer::from_file(&tok_path)
@@ -244,6 +302,7 @@ impl Pipeline {
             te: Arc::new(te),
             avdit: Arc::new(avdit),
             vae: Arc::new(vae),
+            vae_has_encoder: with_vae_encoder,
             audio: None,
             tokenizer: Arc::new(tokenizer),
         })
@@ -270,6 +329,127 @@ impl Pipeline {
         Ok((input_ids, mask))
     }
 
+    fn latent_index(raw: i32, latent_frames: usize, label: &str) -> CResult<usize> {
+        let resolved = if raw < 0 {
+            latent_frames as i32 + raw
+        } else {
+            raw
+        };
+        if resolved < 0 || resolved >= latent_frames as i32 {
+            return Err(CandleError::Msg(format!(
+                "ltx: {label} latent frame index {raw} is out of bounds for {latent_frames} frames"
+            )));
+        }
+        Ok(resolved as usize)
+    }
+
+    fn encode_image(
+        &self,
+        vae: &LtxVideoVae,
+        image: &Image,
+        width: u32,
+        height: u32,
+    ) -> CResult<Tensor> {
+        let video =
+            conditioning::preprocess_conditioning_image(image, width, height, &self.device)?;
+        Ok(vae.encode(&video)?)
+    }
+
+    /// Resolve and VAE-encode replace-latent inputs: a `Reference` is I2V at frame zero; explicit
+    /// keyframes cover FLF and arbitrary latent-frame placement.
+    fn build_keyframes(
+        &self,
+        req: &GenerationRequest,
+        vae: &LtxVideoVae,
+        latent_frames: usize,
+    ) -> CResult<Vec<EncodedKeyframe>> {
+        let mut out = Vec::new();
+        let mut reference_seen = false;
+        for entry in &req.conditioning {
+            match entry {
+                Conditioning::Reference { image, strength } => {
+                    if reference_seen {
+                        return Err(CandleError::Msg(
+                            "ltx: multiple Reference images are not supported; use Keyframe entries"
+                                .into(),
+                        ));
+                    }
+                    reference_seen = true;
+                    out.push(EncodedKeyframe {
+                        latent: self.encode_image(vae, image, req.width, req.height)?,
+                        frame_idx: 0,
+                        strength: strength.or(req.strength).unwrap_or(1.0),
+                    });
+                }
+                Conditioning::Keyframe {
+                    image,
+                    frame_idx,
+                    strength,
+                } => out.push(EncodedKeyframe {
+                    latent: self.encode_image(vae, image, req.width, req.height)?,
+                    frame_idx: Self::latent_index(*frame_idx, latent_frames, "keyframe")?,
+                    strength: *strength,
+                }),
+                _ => {}
+            }
+        }
+        Ok(out)
+    }
+
+    /// Resolve and VAE-encode IC-LoRA clips for extend/bridge and masked replace-person control.
+    fn build_clips(
+        &self,
+        req: &GenerationRequest,
+        vae: &LtxVideoVae,
+        latent_frames: usize,
+    ) -> CResult<Vec<EncodedClip>> {
+        let mut out = Vec::new();
+        for clip in req.video_clips() {
+            let idx = Self::latent_index(clip.frame_idx, latent_frames, "clip")?;
+            let video = conditioning::preprocess_conditioning_clip(
+                clip.frames,
+                req.width,
+                req.height,
+                &self.device,
+            )?;
+            out.push(EncodedClip {
+                latent: vae.encode(&video)?,
+                frame_offset: conditioning::latent_frame_to_output_offset(idx)?,
+                strength: clip.strength,
+            });
+        }
+        if let Some(control) = req.control_clip() {
+            if control.frames.len() != control.mask.len() {
+                return Err(CandleError::Msg(format!(
+                    "ltx: replace-person frame count {} does not match mask count {}",
+                    control.frames.len(),
+                    control.mask.len()
+                )));
+            }
+            let idx = Self::latent_index(control.start_frame, latent_frames, "replace-person")?;
+            let masked = control
+                .frames
+                .iter()
+                .zip(control.mask)
+                .map(|(frame, mask)| {
+                    conditioning::apply_replacement_mask(frame, mask, control.masking_strength)
+                })
+                .collect::<candle_gen::candle_core::Result<Vec<_>>>()?;
+            let video = conditioning::preprocess_conditioning_clip(
+                &masked,
+                req.width,
+                req.height,
+                &self.device,
+            )?;
+            out.push(EncodedClip {
+                latent: vae.encode(&video)?,
+                frame_offset: conditioning::latent_frame_to_output_offset(idx)?,
+                strength: control.masking_strength,
+            });
+        }
+        Ok(out)
+    }
+
     fn render(
         &self,
         req: &GenerationRequest,
@@ -290,8 +470,24 @@ impl Pipeline {
         let video_grid = rope::create_position_grid(t_lat, h_lat, w_lat, fps as f32, &self.device)?;
         let audio_grid = rope::create_audio_position_grid(af, &self.device)?;
 
-        let vlat = pipeline::create_noise(seed, t_lat, h_lat, w_lat, &self.device)?;
-        let alat = pipeline::create_audio_noise(seed, af, &self.device)?;
+        let vnoise = pipeline::create_noise(seed, t_lat, h_lat, w_lat, &self.device)?;
+        let anoise = pipeline::create_audio_noise(seed, af, &self.device)?;
+
+        let keyframes = self.build_keyframes(req, &comps.vae, t_lat)?;
+        let clips = self.build_clips(req, &comps.vae, t_lat)?;
+        let conditioned = !keyframes.is_empty() || !clips.is_empty();
+        if conditioned
+            && !matches!(
+                req.sampler.as_deref(),
+                None | Some("euler") | Some("rectified-flow")
+            )
+        {
+            return Err(CandleError::Msg(
+                "ltx: image/keyframe/clip conditioning uses the native distilled Euler sampler; \
+                 choose `euler`/`rectified-flow` or leave sampler unset"
+                    .into(),
+            ));
+        }
 
         // Unified curated sampling over the JOINT video+audio streams (epic 7114 P4, sc-7125). LTX is
         // distilled rectified-flow with the fixed `STAGE1_SIGMAS` schedule, so per decision 3b it exposes
@@ -300,41 +496,85 @@ impl Pipeline {
         // FLOW `x0 = x − σ·v` recombine + euler == the native scheduler), the N1 no-op. Both streams are
         // velocity-prediction (`Sigma` convention); the AvDiT couples them via cross-modal attention each
         // forward, so the per-step model eval (flatten → AvDiT → unflatten) lives inside the closure.
-        let out = run_av_curated_sampler(
-            req.sampler.as_deref(),
-            &STAGE1_SIGMAS[..],
-            AvLatents {
-                video: vlat,
-                audio: alat,
-            },
-            seed,
-            &req.cancel,
-            on_progress,
-            |av, sigma| -> CResult<AvLatents> {
-                let vflat = pipeline::flatten_latent(&av.video)?;
-                let aflat = pipeline::flatten_audio_latent(&av.audio)?;
-                let (vvel, avel) = comps.avdit.forward(
-                    &vflat,
-                    &aflat,
-                    sigma as f64,
-                    &video_ctx,
-                    &audio_ctx,
-                    &video_grid,
-                    &audio_grid,
+        let (vlat, alat) = if conditioned {
+            let mut state = if keyframes.is_empty() {
+                conditioning::VideoTokenState::base(&vnoise, &video_grid)?
+            } else {
+                let zeros = Tensor::zeros_like(&vnoise)?;
+                let borrowed = keyframes
+                    .iter()
+                    .map(|keyframe| conditioning::Keyframe {
+                        latent: &keyframe.latent,
+                        frame_idx: keyframe.frame_idx,
+                        strength: keyframe.strength,
+                    })
+                    .collect::<Vec<_>>();
+                let i2v = conditioning::apply_keyframes(&zeros, &borrowed)?
+                    .noised(&vnoise, STAGE1_SIGMAS[0])?;
+                conditioning::VideoTokenState::from_i2v(&i2v, &video_grid)?
+            };
+            for clip in &clips {
+                state = conditioning::append_keyframe_clip(
+                    &state,
+                    &clip.latent,
+                    clip.frame_offset,
+                    clip.strength,
+                    fps as f32,
                 )?;
-                Ok(AvLatents {
-                    video: pipeline::unflatten_latent(
-                        &vvel.to_dtype(DType::F32)?,
-                        t_lat,
-                        h_lat,
-                        w_lat,
-                    )?,
-                    audio: pipeline::unflatten_audio_latent(&avel.to_dtype(DType::F32)?, af)?,
-                })
-            },
-        )?;
-        let vlat = out.video;
-        let alat = out.audio;
+            }
+            let (state, audio) = pipeline::denoise_av_conditioned(
+                &comps.avdit,
+                &state,
+                &anoise,
+                &video_ctx,
+                &audio_ctx,
+                af,
+                &audio_grid,
+                &STAGE1_SIGMAS,
+                &req.cancel,
+                on_progress,
+            )?;
+            let generated = state.latent.narrow(1, 0, state.target_tokens)?;
+            (
+                pipeline::unflatten_latent(&generated, t_lat, h_lat, w_lat)?,
+                audio,
+            )
+        } else {
+            let out = run_av_curated_sampler(
+                req.sampler.as_deref(),
+                &STAGE1_SIGMAS[..],
+                AvLatents {
+                    video: vnoise,
+                    audio: anoise,
+                },
+                seed,
+                &req.cancel,
+                on_progress,
+                |av, sigma| -> CResult<AvLatents> {
+                    let vflat = pipeline::flatten_latent(&av.video)?;
+                    let aflat = pipeline::flatten_audio_latent(&av.audio)?;
+                    let (vvel, avel) = comps.avdit.forward(
+                        &vflat,
+                        &aflat,
+                        sigma as f64,
+                        &video_ctx,
+                        &audio_ctx,
+                        &video_grid,
+                        &audio_grid,
+                    )?;
+                    Ok(AvLatents {
+                        video: pipeline::unflatten_latent(
+                            &vvel.to_dtype(DType::F32)?,
+                            t_lat,
+                            h_lat,
+                            w_lat,
+                        )?,
+                        audio: pipeline::unflatten_audio_latent(&avel.to_dtype(DType::F32)?, af)?,
+                    })
+                },
+            )?;
+            (out.video, out.audio)
+        };
 
         on_progress(Progress::Decoding);
         // sc-7076 — memory-bounded + catchable VAE decode (budgeted tiling), replacing the single-pass
@@ -368,13 +608,22 @@ pub struct LtxGenerator {
 }
 
 impl LtxGenerator {
-    fn components(&self, pipe: &Pipeline) -> gen_core::Result<Components> {
-        // `cached` recovers a poisoned lock (sc-9015) internally; `?` bridges the candle-side
-        // `load_components` error into `gen_core::Error`.
-        Ok(candle_gen::cached(&self.components, || {
-            pipe.load_components(&self.adapters)
-        })?)
+    #[allow(clippy::unnecessary_map_or)] // `Option::is_none_or` is newer than the repository MSRV.
+    fn components(&self, pipe: &Pipeline, with_vae_encoder: bool) -> gen_core::Result<Components> {
+        let mut slot = candle_gen::lock_recover(&self.components);
+        if slot.as_ref().map_or(true, |components| {
+            components.vae_has_encoder != with_vae_encoder
+        }) {
+            // Switching request modes must not retain both VAE variants at once.
+            *slot = None;
+            *slot = Some(pipe.load_components(&self.adapters, with_vae_encoder)?);
+        }
+        Ok(slot.as_ref().expect("component cache populated").clone())
     }
+}
+
+fn needs_ltx_vae_encoder(req: &GenerationRequest) -> bool {
+    !req.conditioning.is_empty()
 }
 
 impl Generator for LtxGenerator {
@@ -403,6 +652,72 @@ impl Generator for LtxGenerator {
                 )));
             }
         }
+        let check_strength = |label: &str, strength: f32| -> gen_core::Result<()> {
+            if !strength.is_finite() || !(0.0..=1.0).contains(&strength) {
+                return Err(gen_core::Error::Msg(format!(
+                    "ltx: {label} strength must be finite and in [0,1] (got {strength})"
+                )));
+            }
+            Ok(())
+        };
+        if let Some(strength) = req.strength {
+            check_strength("image", strength)?;
+        }
+        for entry in &req.conditioning {
+            match entry {
+                Conditioning::Reference {
+                    strength: Some(strength),
+                    ..
+                } => check_strength("reference", *strength)?,
+                Conditioning::Keyframe { strength, .. } => check_strength("keyframe", *strength)?,
+                Conditioning::VideoClip {
+                    frames, strength, ..
+                } => {
+                    check_strength("clip", *strength)?;
+                    if frames.is_empty() || (frames.len() - 1) % config::TEMPORAL_SCALE != 0 {
+                        return Err(gen_core::Error::Msg(format!(
+                            "ltx: conditioning clip frame count must equal 1 + k*{} (got {})",
+                            config::TEMPORAL_SCALE,
+                            frames.len()
+                        )));
+                    }
+                }
+                Conditioning::ControlClip {
+                    frames,
+                    mask,
+                    masking_strength,
+                    ..
+                } => {
+                    check_strength("replace-person masking", *masking_strength)?;
+                    if frames.len() != mask.len() {
+                        return Err(gen_core::Error::Msg(format!(
+                            "ltx: replace-person frame count {} does not match mask count {}",
+                            frames.len(),
+                            mask.len()
+                        )));
+                    }
+                    if frames.is_empty() || (frames.len() - 1) % config::TEMPORAL_SCALE != 0 {
+                        return Err(gen_core::Error::Msg(format!(
+                            "ltx: replace-person clip frame count must equal 1 + k*{} (got {})",
+                            config::TEMPORAL_SCALE,
+                            frames.len()
+                        )));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !req.conditioning.is_empty()
+            && !matches!(
+                req.sampler.as_deref(),
+                None | Some("euler") | Some("rectified-flow")
+            )
+        {
+            return Err(gen_core::Error::Unsupported(
+                "ltx conditioned video uses native distilled Euler; choose euler/rectified-flow or leave sampler unset"
+                    .into(),
+            ));
+        }
         // Bound the AvDiT denoise sequence length (F-131, sc-11234). The checks above bound only the
         // frame *shape*, never its magnitude, so a huge frame count (e.g. `frames: 2001`, which
         // satisfies `% 8 == 1`) at a large resolution produced ~400k latent tokens and OOM'd deep in
@@ -412,7 +727,51 @@ impl Generator for LtxGenerator {
         // default when `None`) and the already-validated (mult-of-32) width/height.
         let eff_frames = req.frames.unwrap_or(DEFAULT_FRAMES);
         let (t_lat, h_lat, w_lat) = pipeline::latent_dims(eff_frames, req.width, req.height);
-        let tokens = t_lat * h_lat * w_lat;
+        let resolve_idx = |raw: i32, label: &str| -> gen_core::Result<()> {
+            let resolved = if raw < 0 { t_lat as i32 + raw } else { raw };
+            if resolved < 0 || resolved >= t_lat as i32 {
+                return Err(gen_core::Error::Msg(format!(
+                    "ltx: {label} latent frame index {raw} is out of bounds for {t_lat} frames"
+                )));
+            }
+            Ok(())
+        };
+        let mut reference_count = 0usize;
+        let mut control_clip_count = 0usize;
+        let mut appended_frames = 0usize;
+        for entry in &req.conditioning {
+            match entry {
+                Conditioning::Reference { .. } => reference_count += 1,
+                Conditioning::Keyframe { frame_idx, .. } => resolve_idx(*frame_idx, "keyframe")?,
+                Conditioning::VideoClip {
+                    frames, frame_idx, ..
+                } => {
+                    resolve_idx(*frame_idx, "clip")?;
+                    appended_frames += (frames.len() - 1) / config::TEMPORAL_SCALE + 1;
+                }
+                Conditioning::ControlClip {
+                    frames,
+                    start_frame,
+                    ..
+                } => {
+                    control_clip_count += 1;
+                    resolve_idx(*start_frame, "replace-person")?;
+                    appended_frames += (frames.len() - 1) / config::TEMPORAL_SCALE + 1;
+                }
+                _ => {}
+            }
+        }
+        if reference_count > 1 {
+            return Err(gen_core::Error::Msg(
+                "ltx: multiple Reference images are not supported; use Keyframe entries".into(),
+            ));
+        }
+        if control_clip_count > 1 {
+            return Err(gen_core::Error::Msg(
+                "ltx: exactly one ControlClip can be applied per request".into(),
+            ));
+        }
+        let tokens = (t_lat + appended_frames) * h_lat * w_lat;
         let max_tokens = config::max_latent_tokens();
         if tokens > max_tokens {
             return Err(gen_core::Error::Msg(format!(
@@ -445,17 +804,18 @@ impl Generator for LtxGenerator {
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
         let pipe = Pipeline::load(&self.root, &self.device, self.gemma_override.clone());
-        let components = self.components(&pipe)?;
+        let components = self.components(&pipe, needs_ltx_vae_encoder(req))?;
         let (frames, fps, audio) = pipe.render(req, &components, on_progress)?;
         Ok(GenerationOutput::Video { frames, fps, audio })
     }
 }
 
-/// LTX-2.3 distilled txt2video descriptor — single-stage rectified-flow (no CFG / negative prompt;
-/// guidance is distilled in). The denoise step count is FIXED at [`NATIVE_STEPS`] (the baked
+/// LTX-2.3 distilled video descriptor — single-stage rectified-flow (no CFG / negative prompt;
+/// guidance is distilled in) with image/keyframe/IC-LoRA clip conditioning. The denoise step count is
+/// FIXED at [`NATIVE_STEPS`] (the baked
 /// `STAGE1_SIGMAS` schedule); an explicit non-native `req.steps` is rejected in `validate` rather than
 /// silently ignored (sc-9027 / F-043). Synchronized audio is produced (sc-5495, the joint video+audio
-/// streams); I2V / upsampler / IC-LoRA / quant remain deferred. Plain video-attention LoRA is
+/// streams); the upsampler and on-the-fly quant remain deferred. AudioVideo projection adapters are
 /// supported through the shared additive adapter core.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
@@ -469,9 +829,14 @@ pub fn descriptor() -> ModelDescriptor {
             supports_negative_prompt: false,
             supports_guidance: false,
             supports_true_cfg: false,
-            conditioning: vec![],
+            conditioning: vec![
+                ConditioningKind::Reference,
+                ConditioningKind::Keyframe,
+                ConditioningKind::VideoClip,
+                ConditioningKind::ControlClip,
+            ],
             supports_lora: true,
-            supports_lokr: false,
+            supports_lokr: true,
             // Unified curated SAMPLER menu (epic 7114 P4, sc-7125) over the joint video+audio streams +
             // the legacy `rectified-flow` alias (falls back to euler). Per decision 3b: sampler-only, NO
             // scheduler axis — LTX is distilled with the fixed `STAGE1_SIGMAS` schedule; `euler` is the
@@ -491,7 +856,9 @@ pub fn descriptor() -> ModelDescriptor {
             supports_kv_cache: false,
             requires_sigma_shift: false,
             supports_sequential_offload: false,
+            unconditionally_engages_staged_residency: false,
             supports_preview: false,
+            supports_prompt_enhancement: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,
@@ -612,9 +979,8 @@ fn spec_root(spec: &LoadSpec) -> PathBuf {
 ///  * **dense** — [`ltx_checkpoint_in`] picks ONE root file out of a snapshot that also ships
 ///    `fp8`/`mixed`/lora/upscaler siblings. Hosted `Lightricks/LTX-2.3` is ~146 GiB on disk against that
 ///    single-file load, so a directory sum refuses LTX on every GPU that exists.
-///  * **packed tier** — the load reads 3 files (`transformer` + `connector` + `vae_decoder`) while the
-///    tier dir also ships `vae_encoder` + `audio_vae` + `vocoder` + `upsampler`, which the T2V render
-///    never loads (see [`tier`]'s note).
+///  * **packed tier** — the load reads 4 files (`transformer` + `connector` + `vae_decoder` +
+///    `vae_encoder`); the encoder is required by every advertised video-conditioning lane.
 ///
 /// Mapping onto [`PerComponentBytes`]' three slots: `text_encoder` = the Gemma-3-12B encoder (a
 /// SEPARATE ~24 GB snapshot that is not under the weights root — omitting it would under-count by more
@@ -639,7 +1005,7 @@ pub(crate) fn component_footprint(spec: &LoadSpec) -> gen_core::Result<PerCompon
         return Ok(PerComponentBytes {
             text_encoder: gen_core::safetensors_path_bytes(&paths.gemma_dir),
             dit: tier_file("transformer.safetensors") + tier_file("connector.safetensors"),
-            vae: tier_file("vae_decoder.safetensors"),
+            vae: tier_file("vae_decoder.safetensors") + tier_file("vae_encoder.safetensors"),
         });
     }
     Ok(PerComponentBytes {
@@ -657,8 +1023,9 @@ pub(crate) fn component_footprint(spec: &LoadSpec) -> gen_core::Result<PerCompon
 /// Construct a lazy candle LTX-2.3 generator. `spec.weights` is an LTX-2.3 snapshot dir (the
 /// `ltx-2.3-22b-distilled.safetensors` checkpoint); the Gemma encoder is provisioned by the caller via
 /// the `LoadSpec::text_encoder` slot (or co-located at `<root>/text_encoder`) — no env / HF-cache scan
-/// (sc-13749). LoRA adapters apply to the canonical video attention surface; LoKr, on-the-fly
-/// quantization, and conditioning remain unsupported.
+/// (sc-13749). LoRA and stamped/third-party LoKr adapters apply to the AudioVideo projection surface;
+/// on-the-fly quantization remains unsupported. Request-side image/keyframe/clip conditioning uses the VAE
+/// encoder bundled in the dense checkpoint or the packed tier's `vae_encoder.safetensors`.
 pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),
@@ -671,16 +1038,6 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     // keys — its Gemma TE rides the typed `text_encoder` slot, and it has no uncensored/amoral enhancer
     // variant (the mlx-only `uncensored_enhancer`). Reject any component key up front as `Unsupported`.
     gen_core::reject_unknown_components(spec, &[], MODEL_ID)?;
-    if let Some(adapter) = spec
-        .adapters
-        .iter()
-        .find(|adapter| adapter.kind == AdapterKind::Lokr)
-    {
-        return Err(gen_core::Error::Unsupported(format!(
-            "candle ltx supports LoRA adapters but not LoKr; offending file: {}",
-            adapter.path.display()
-        )));
-    }
     if spec.quantize.is_some() {
         return Err(gen_core::Error::Unsupported(
             "candle ltx does not support on-the-fly Q4/Q8 quantization yet".into(),
@@ -688,7 +1045,8 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     }
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
         return Err(gen_core::Error::Unsupported(
-            "candle ltx does not support image / I2V conditioning yet (txt2video only)".into(),
+            "candle ltx video conditioning is request-side and does not consume ControlNet/IP-Adapter weight slots"
+                .into(),
         ));
     }
     // sc-8827/sc-13749: the Gemma encoder location rides the spec (`LoadSpec::text_encoder`); `None`
@@ -726,6 +1084,22 @@ pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core:
     register_providers(candle_gen::gen_core::ProviderRegistryBuilder::new()).build()
 }
 
+/// Resolve the load-bearing VAE geometry for a Candle LTX generator id.
+pub fn vae_tiling(provider_id: &str) -> Option<candle_gen::gen_core::tiling::VaeTiling> {
+    (provider_id == MODEL_ID).then_some(VAE_TILING)
+}
+
+/// Resolve the provider-owned conservative VAE decode working-set peak for an LTX generator id.
+pub fn conservative_video_decode_memory_profile(
+    provider_id: &str,
+    width: u32,
+    height: u32,
+    frames: u32,
+) -> Option<candle_gen::VideoDecodeMemoryProfile> {
+    vae_tiling(provider_id)?;
+    vae::conservative_video_decode_memory_profile(width, height, frames)
+}
+
 #[cfg(test)]
 mod explicit_registry_tests {
     #[test]
@@ -760,6 +1134,17 @@ mod tests {
         assert_eq!(g.descriptor().family, "ltx");
         assert_eq!(g.descriptor().backend, "candle");
         assert_eq!(g.descriptor().modality, Modality::Video);
+    }
+
+    #[test]
+    fn descriptor_does_not_claim_staged_residency() {
+        let caps = descriptor().capabilities;
+        assert!(!caps.unconditionally_engages_staged_residency);
+        assert!(!caps.supports_sequential_offload);
+        assert_eq!(
+            caps.staged_residency_availability(),
+            candle_gen::gen_core::StagedResidencyAvailability::Absent
+        );
     }
 
     #[test]
@@ -845,9 +1230,9 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_and_load_advertise_lora_but_reject_lokr() {
+    fn descriptor_and_lazy_load_advertise_lora_and_lokr() {
         assert!(descriptor().capabilities.supports_lora);
-        assert!(!descriptor().capabilities.supports_lokr);
+        assert!(descriptor().capabilities.supports_lokr);
 
         let lora = LoadSpec::new(WeightsSource::Dir("/nonexistent".into())).with_adapters(vec![
             AdapterSpec::new(
@@ -868,8 +1253,10 @@ mod tests {
                 AdapterKind::Lokr,
             ),
         ]);
-        let err = crate::load(&lokr).err().expect("LoKr must be rejected");
-        assert!(err.to_string().contains("LoKr"), "{err}");
+        assert!(
+            crate::load(&lokr).is_ok(),
+            "LTX load is lazy and must admit a stamped LoKr for component-time validation"
+        );
     }
 
     #[test]
@@ -913,12 +1300,175 @@ mod tests {
         assert!(!d.capabilities.supports_guidance);
         assert!(!d.capabilities.supports_negative_prompt);
         assert!(!d.capabilities.mac_only);
-        assert!(d.capabilities.conditioning.is_empty());
+        assert_eq!(
+            d.capabilities.conditioning,
+            [
+                ConditioningKind::Reference,
+                ConditioningKind::Keyframe,
+                ConditioningKind::VideoClip,
+                ConditioningKind::ControlClip,
+            ]
+        );
         // sc-7125: curated sampler menu + the legacy `rectified-flow` alias; NO scheduler axis (3b).
         assert!(d.capabilities.samplers.contains(&"rectified-flow"));
         assert!(d.capabilities.samplers.contains(&"euler"));
         assert!(d.capabilities.samplers.contains(&"dpmpp_2m"));
         assert!(d.capabilities.schedulers.is_empty());
+    }
+
+    #[test]
+    fn validate_admits_i2v_flf_extend_bridge_and_replace_person() {
+        let generator = crate::provider_registry()
+            .unwrap()
+            .load(
+                MODEL_ID,
+                &LoadSpec::new(WeightsSource::Dir("/nonexistent".into())),
+            )
+            .unwrap();
+        let image = Image {
+            width: 32,
+            height: 32,
+            pixels: vec![127; 32 * 32 * 3],
+        };
+        let mask = Image {
+            width: 32,
+            height: 32,
+            pixels: vec![255; 32 * 32 * 3],
+        };
+        let base = GenerationRequest {
+            prompt: "a person crosses the room".into(),
+            width: 704,
+            height: 480,
+            frames: Some(49),
+            ..Default::default()
+        };
+        for conditioning in [
+            vec![Conditioning::Reference {
+                image: image.clone(),
+                strength: Some(0.8),
+            }],
+            vec![
+                Conditioning::Keyframe {
+                    image: image.clone(),
+                    frame_idx: 0,
+                    strength: 1.0,
+                },
+                Conditioning::Keyframe {
+                    image: image.clone(),
+                    frame_idx: -1,
+                    strength: 1.0,
+                },
+            ],
+            vec![
+                Conditioning::VideoClip {
+                    frames: vec![image.clone()],
+                    frame_idx: 0,
+                    strength: 1.0,
+                },
+                Conditioning::VideoClip {
+                    frames: vec![image.clone()],
+                    frame_idx: -1,
+                    strength: 0.75,
+                },
+            ],
+            vec![Conditioning::ControlClip {
+                frames: vec![image.clone()],
+                mask: vec![mask.clone()],
+                masking_strength: 0.9,
+                start_frame: 0,
+                mode: gen_core::ReplacementMode::FaceOnly,
+            }],
+        ] {
+            assert!(generator
+                .validate(&GenerationRequest {
+                    conditioning,
+                    ..base.clone()
+                })
+                .is_ok());
+        }
+    }
+
+    #[test]
+    fn validate_rejects_malformed_conditioning_without_loading_weights() {
+        let generator = crate::provider_registry()
+            .unwrap()
+            .load(
+                MODEL_ID,
+                &LoadSpec::new(WeightsSource::Dir("/nonexistent".into())),
+            )
+            .unwrap();
+        let image = Image {
+            width: 32,
+            height: 32,
+            pixels: vec![127; 32 * 32 * 3],
+        };
+        let control = Conditioning::ControlClip {
+            frames: vec![image.clone()],
+            mask: vec![image.clone()],
+            masking_strength: 1.0,
+            start_frame: 0,
+            mode: gen_core::ReplacementMode::FaceOnly,
+        };
+        let base = GenerationRequest {
+            prompt: "x".into(),
+            width: 704,
+            height: 480,
+            frames: Some(49),
+            ..Default::default()
+        };
+        let cases = [
+            GenerationRequest {
+                conditioning: vec![Conditioning::Keyframe {
+                    image: image.clone(),
+                    frame_idx: 99,
+                    strength: 1.0,
+                }],
+                ..base.clone()
+            },
+            GenerationRequest {
+                conditioning: vec![Conditioning::VideoClip {
+                    frames: vec![image.clone(), image.clone()],
+                    frame_idx: 0,
+                    strength: 1.0,
+                }],
+                ..base.clone()
+            },
+            GenerationRequest {
+                conditioning: vec![control.clone(), control],
+                ..base.clone()
+            },
+            GenerationRequest {
+                sampler: Some("heun".into()),
+                conditioning: vec![Conditioning::Reference {
+                    image,
+                    strength: Some(1.0),
+                }],
+                ..base
+            },
+        ];
+        for request in cases {
+            assert!(
+                generator.validate(&request).is_err(),
+                "must reject {request:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn vae_encoder_is_not_retained_for_unconditioned_t2v() {
+        let base = GenerationRequest::default();
+        assert!(!needs_ltx_vae_encoder(&base));
+        assert!(needs_ltx_vae_encoder(&GenerationRequest {
+            conditioning: vec![Conditioning::Reference {
+                image: Image {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0; 3],
+                },
+                strength: Some(0.5),
+            }],
+            ..base
+        }));
     }
 
     #[test]
@@ -1121,11 +1671,10 @@ mod tests {
         assert_eq!(fp.text_encoder + fp.dit + fp.vae, 13_000);
     }
 
-    /// sc-12397 — the PACKED TIER layout: exactly the 3 files the T2V render loads, plus the sibling
-    /// Gemma. The tier dir also ships `vae_encoder` + `audio_vae` + `vocoder` + `upsampler`, which
-    /// `load_components_tier` never reads — summing the dir would over-count them.
+    /// sc-12397 — the PACKED TIER layout: the four files the video render loads, plus sibling Gemma.
+    /// The VAE encoder is part of the truthful footprint because advertised conditioning consumes it.
     #[test]
-    fn component_footprint_tier_sizes_the_three_loaded_files_plus_gemma() {
+    fn component_footprint_tier_sizes_conditioning_encoder_plus_gemma() {
         let snapshot_tmp = tempfile::tempdir().unwrap();
         let snapshot = snapshot_tmp.path().to_path_buf();
         let tier = snapshot.join("q4");
@@ -1136,7 +1685,7 @@ mod tests {
             ("transformer.safetensors", 5_000_u64), // loaded
             ("connector.safetensors", 700),         // loaded
             ("vae_decoder.safetensors", 300),       // loaded
-            ("vae_encoder.safetensors", 9_000),     // NOT loaded by the T2V render
+            ("vae_encoder.safetensors", 9_000),     // loaded for video conditioning
             ("audio_vae.safetensors", 8_000),       // NOT loaded
             ("vocoder.safetensors", 7_000),         // NOT loaded
             ("upsampler.safetensors", 6_000),       // NOT loaded
@@ -1158,10 +1707,9 @@ mod tests {
         let fp = component_footprint(&spec).expect("footprint");
 
         assert_eq!(fp.dit, 5_700, "transformer + connector");
-        assert_eq!(fp.vae, 300, "the DECODER only — the encoder is not loaded");
+        assert_eq!(fp.vae, 9_300, "decoder + conditioning encoder");
         assert_eq!(fp.text_encoder, 4_000, "the sibling gemma/ dir");
-        // 10_000 — where a dir sum would read 36_000 + gemma and refuse a card that runs this fine.
-        assert_eq!(fp.text_encoder + fp.dit + fp.vae, 10_000);
+        assert_eq!(fp.text_encoder + fp.dit + fp.vae, 19_000);
     }
 
     /// An unresolvable snapshot reports NO SIGNAL rather than erroring: the footprint is a pre-load

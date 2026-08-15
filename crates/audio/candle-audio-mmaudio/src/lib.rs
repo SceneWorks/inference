@@ -4,9 +4,11 @@
 //! (epic sc-12833, `docs/architecture/audio-backend-strategy.md`). This slice (**sc-13438**)
 //! establishes the crate and ports MMAudio's **Synchformer synchronization encoder** — the
 //! frame-aligned visual conditioner — natively onto the workspace's pinned candle revision.
-//! **sc-13437** adds the [`clip`] module: MMAudio's semantic conditioner, the **DFN5B-CLIP
-//! ViT-H/14-384** open_clip encoder (visual → 1024-d per-frame features; 77-token text tower →
-//! per-token last-hidden-state), parity-verified against `open_clip`. Later slices add the
+//! **sc-13437** adds the [`clip`] module: MMAudio's semantic conditioner, the canonical
+//! **DFN5B-CLIP ViT-H/14-378** open_clip checkpoint (visual → 1024-d per-frame features; 77-token
+//! text tower → per-token last-hidden-state), parity-verified against `open_clip`. MMAudio still
+//! feeds 384×384 frames; patch-14 convolution gives the same 27×27 grid at 378 and 384. Later
+//! slices add the
 //! flow-matching [`mmdit`] DiT (sc-13439), the [`vae`]/[`bigvgan`] output path (sc-13440), and the
 //! shipping [`generator`] that registers **`mmaudio_small_16k`** into `candle-audio-catalog`
 //! (sc-12843). **sc-13441** adds the 44.1 kHz quality-ceiling path: the `large_44k_v2` MM-DiT preset

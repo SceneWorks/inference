@@ -76,6 +76,51 @@ fn ltx_is_registered() {
     assert!(!d.capabilities.requires_sigma_shift);
 }
 
+/// The registry factory and loaded trait object must expose the same load-exact contract. This is
+/// deliberately weights-gated because constructing `Ltx` validates and materializes the real small
+/// resident components; the weights-free catalog fixture cannot prove the loaded-generator seam.
+#[test]
+#[ignore = "needs real LTX-2.3 split weights + Gemma snapshot"]
+fn loaded_generator_returns_the_registered_load_exact_memory_contract() {
+    let base = std::env::var_os("LTX_BASE_DIR")
+        .map(PathBuf::from)
+        .expect("set LTX_BASE_DIR to the real LTX split-weight directory");
+    let gemma = std::env::var_os("LTX_GEMMA_DIR")
+        .map(PathBuf::from)
+        .expect("set LTX_GEMMA_DIR to the real Gemma snapshot directory");
+    let mut spec = LoadSpec::new(WeightsSource::Dir(base));
+    spec.text_encoder = Some(WeightsSource::Dir(gemma));
+
+    let registry = mlx_gen_ltx::provider_registry().unwrap();
+    let registered = registry
+        .memory_strategy_contract(MODEL_ID, &spec)
+        .unwrap()
+        .expect("LTX must publish a registered contract");
+    let loaded = registry.load(MODEL_ID, &spec).unwrap();
+    assert_eq!(loaded.memory_strategy_contract(), Some(&registered));
+}
+
+/// Quantized Gemma remains a supported generator route, but the first LTX memory campaign is scoped
+/// to the canonical dense-bf16 encoder. Loading must continue to work while publishing no contract,
+/// so the worker fails open instead of reusing incompatible evidence.
+#[test]
+#[ignore = "needs real LTX-2.3 split weights + quantized Gemma snapshot"]
+fn loaded_quantized_gemma_generator_publishes_no_memory_contract() {
+    let base = std::env::var_os("LTX_BASE_DIR")
+        .map(PathBuf::from)
+        .expect("set LTX_BASE_DIR to the real LTX split-weight directory");
+    let gemma = std::env::var_os("LTX_QUANT_GEMMA_DIR")
+        .map(PathBuf::from)
+        .expect("set LTX_QUANT_GEMMA_DIR to a quantized Gemma snapshot directory");
+    let mut spec = LoadSpec::new(WeightsSource::Dir(base));
+    spec.text_encoder = Some(WeightsSource::Dir(gemma));
+
+    let registry = mlx_gen_ltx::provider_registry().unwrap();
+    assert!(registry.memory_strategy_contract(MODEL_ID, &spec).is_err());
+    let loaded = registry.load(MODEL_ID, &spec).unwrap();
+    assert_eq!(loaded.memory_strategy_contract(), None);
+}
+
 #[test]
 fn load_requires_full_model() {
     let tmp = tempfile::tempdir().unwrap();

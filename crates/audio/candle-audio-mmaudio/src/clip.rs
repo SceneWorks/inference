@@ -1,11 +1,12 @@
-//! MMAudio's **DFN5B-CLIP ViT-H/14-384** visual + text conditioner (sc-13437), ported natively onto
-//! the workspace's pinned candle revision from the **open_clip** checkpoint
-//! `apple/DFN5B-CLIP-ViT-H-14-384`.
+//! MMAudio's **DFN5B-CLIP ViT-H/14-378** visual + text conditioner (sc-13437), ported natively onto
+//! the workspace's pinned candle revision from the canonical **open_clip** checkpoint
+//! `apple/DFN5B-CLIP-ViT-H-14-378`.
 //!
 //! ## What MMAudio actually consumes (verified against `features_utils.py`)
 //!
-//! MMAudio builds this model from the open_clip `apple/DFN5B-CLIP-ViT-H-14-384` checkpoint (upstream
-//! `create_model_from_pretrained`) and conditions on two features:
+//! MMAudio's frozen upstream source names a historical `...-384` Hub alias, but that alias redirects
+//! to the canonical `apple/DFN5B-CLIP-ViT-H-14-378` checkpoint. The checkpoint's native config is
+//! 378 px; MMAudio deliberately supplies 384 px and conditions on two features:
 //!
 //! - **Visual** ([`DfnClipEncoder::encode_image`]): the *standard* open_clip
 //!   `encode_image(x, normalize=True)` — RGB frames resized to **384×384**, normalized with the
@@ -449,7 +450,7 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 /// The pinned CLIP BPE merge table, vendored verbatim from the pinned DFN5B repo's `merges.txt`
-/// (`apple/DFN5B-CLIP-ViT-H-14-384` @ [`CLIP_HUB_REVISION`]). This is the same merge list as
+/// (`apple/DFN5B-CLIP-ViT-H-14-378` @ [`CLIP_HUB_REVISION`]). This is the same merge list as
 /// open_clip's bundled `bpe_simple_vocab_16e6.txt.gz`; the encoder rebuilt from it reproduces the
 /// repo's `vocab.json` exactly (all 49408 ids) — asserted in tests.
 const CLIP_BPE_MERGES: &str = include_str!("dfn5b_clip_merges.txt");
@@ -771,17 +772,20 @@ use candle_audio::{AudioError, Result};
 /// registers nothing this slice.
 pub const MODEL_ID: &str = "dfn5b_clip_vit_h14_384";
 
-/// Hub pin: Apple's DFN5B-CLIP ViT-H/14-384 open_clip repo, immutable commit SHA (F-029).
-pub const CLIP_HUB_REPO: &str = "apple/DFN5B-CLIP-ViT-H-14-384";
+/// Hub pin: Apple's canonical DFN5B-CLIP ViT-H/14-378 open_clip repo, immutable commit SHA (F-029).
+///
+/// [`MODEL_ID`] intentionally retains its established `..._384` value: it is a stable component
+/// key, while `384` is also the input geometry MMAudio supplies to this 378-native checkpoint.
+pub const CLIP_HUB_REPO: &str = "apple/DFN5B-CLIP-ViT-H-14-378";
 pub const CLIP_HUB_REVISION: &str = "01b771ed0d1395ca5ffdd279897d665ebe00dfd2";
 /// The open_clip-format state dict (fused `in_proj`, `visual.*`/root text tower) MMAudio loads via
 /// `create_model_from_pretrained`. (The repo also ships an HF-`CLIPModel` `pytorch_model.bin`;
 /// we deliberately load the open_clip one to match what MMAudio uses.)
 pub const CLIP_WEIGHTS_PATH: &str = "open_clip_pytorch_model.bin";
 
-/// The schema-3 licence row for the pinned DFN5B-CLIP ViT-H/14-384 conditioner (sc-16663).
+/// The schema-3 licence row for the pinned DFN5B-CLIP ViT-H/14-378 conditioner (sc-16663).
 ///
-/// **Disclosure only.** `declared` is the identifier the `apple/DFN5B-CLIP-ViT-H-14-384` model card
+/// **Disclosure only.** `declared` is the identifier the `apple/DFN5B-CLIP-ViT-H-14-378` model card
 /// carries verbatim (`apple-amlr`), read on `retrieved`; it normalizes onto the
 /// `apple-mlr` family, whose text is the Apple Machine Learning Research Model License Agreement.
 ///
@@ -795,15 +799,15 @@ pub const CLIP_WEIGHTS_PATH: &str = "open_clip_pytorch_model.bin";
 pub const COMPONENT_LICENSE: candle_audio::gen_core::ComponentLicense =
     candle_audio::gen_core::ComponentLicense {
         component: MODEL_ID,
-        source_url: "https://huggingface.co/apple/DFN5B-CLIP-ViT-H-14-384",
+        source_url: "https://huggingface.co/apple/DFN5B-CLIP-ViT-H-14-378",
         gated: false,
         declared: "apple-amlr",
         family: "apple-mlr",
         attribution: Some(
-            "DFN5B-CLIP ViT-H/14-384 © Apple Inc. — Apple Machine Learning Research Model License \
+            "DFN5B-CLIP ViT-H/14-378 © Apple Inc. — Apple Machine Learning Research Model License \
              Agreement",
         ),
-        retrieved: "2026-08-02",
+        retrieved: "2026-08-13",
     };
 
 /// Load the encoder from an `open_clip_pytorch_model.bin` file path.
@@ -853,6 +857,8 @@ mod tests {
 
     #[test]
     fn hub_revision_is_a_full_commit_sha() {
+        assert_eq!(CLIP_HUB_REPO, "apple/DFN5B-CLIP-ViT-H-14-378");
+        assert_eq!(MODEL_ID, "dfn5b_clip_vit_h14_384");
         assert_eq!(CLIP_HUB_REVISION.len(), 40);
         assert!(CLIP_HUB_REVISION.chars().all(|c| c.is_ascii_hexdigit()));
     }
@@ -897,6 +903,11 @@ mod tests {
     #[test]
     fn grid_and_positions_match_reference() {
         assert_eq!(GRID, 27, "27x27 patch grid at 384 with k=stride=14");
+        assert_eq!(
+            378 / PATCH_SIZE,
+            GRID,
+            "the native 378px input is also 27x27"
+        );
         assert_eq!(NUM_PATCHES, 729);
         assert_eq!(
             NUM_POSITIONS, 730,

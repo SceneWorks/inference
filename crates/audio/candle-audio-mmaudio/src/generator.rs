@@ -88,7 +88,7 @@ pub const LANGUAGES: &[&str] = &["en"];
 /// The five named model components (epic 13657) `mmaudio_small_16k` requires, provisioned by the
 /// caller in [`LoadSpec::components`] and read at [`load`] via [`require_component`]. The composite
 /// assembles five checkpoints across two repos: `clip` (the DFN5B-CLIP ViT-H/14 conditioner, from
-/// `apple/DFN5B-CLIP-ViT-H-14-384`) and `synchformer` / `dit` / `vae` / `vocoder` (the Synchformer
+/// `apple/DFN5B-CLIP-ViT-H-14-378`) and `synchformer` / `dit` / `vae` / `vocoder` (the Synchformer
 /// visual encoder, the small_16k MM-DiT, the 16k mel-VAE, and the 16k BigVGAN vocoder, all from
 /// `hkchengrex/MMAudio`). Advertised weights-free on the descriptor so a consumer knows what to stage.
 pub const REQUIRED_COMPONENTS: &[&str] = &["clip", "synchformer", "dit", "vae", "vocoder"];
@@ -130,7 +130,9 @@ pub fn descriptor() -> ModelDescriptor {
             supports_kv_cache: false,
             requires_sigma_shift: false,
             supports_sequential_offload: false,
+            unconditionally_engages_staged_residency: false,
             supports_preview: false,
+            supports_prompt_enhancement: false,
             supports_streaming: false,
             supports_multi_speaker: false,
             supports_conversation_history: false,

@@ -24,7 +24,7 @@
       "id": "apple-mlr",
       "spdx_id": "LicenseRef-Apple-MLR",
       "name": "Apple Machine Learning Research Model License Agreement",
-      "text_url": "https://huggingface.co/apple/DFN5B-CLIP-ViT-H-14-384/raw/main/LICENSE",
+      "text_url": "https://huggingface.co/apple/DFN5B-CLIP-ViT-H-14-378/raw/main/LICENSE",
       "terms": [
         {
           "term": "non_commercial_weights"
@@ -554,12 +554,12 @@
     },
     {
       "component": "dfn5b_clip_vit_h14_384",
-      "source_url": "https://huggingface.co/apple/DFN5B-CLIP-ViT-H-14-384",
+      "source_url": "https://huggingface.co/apple/DFN5B-CLIP-ViT-H-14-378",
       "gated": false,
       "declared": "apple-amlr",
       "family": "apple-mlr",
-      "attribution": "DFN5B-CLIP ViT-H/14-384 © Apple Inc. — Apple Machine Learning Research Model License Agreement",
-      "retrieved": "2026-08-02"
+      "attribution": "DFN5B-CLIP ViT-H/14-378 © Apple Inc. — Apple Machine Learning Research Model License Agreement",
+      "retrieved": "2026-08-13"
     },
     {
       "component": "kokoro_82m",

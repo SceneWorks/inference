@@ -425,7 +425,7 @@ mod quant_fixture_tests {
 // ---------------------------------------------------------------------------------------------------
 
 pub use gpu_peak::{probe_gpu, used_mib, PeakSampler};
-pub use vram_probe::{VramProbe, VramReport};
+pub use vram_probe::{StableIdleConfig, VramProbe, VramReport};
 
 /// The driver memory-pool probe moved to [`crate::cuda_mempool`] in SC-15792 so it is compiled and
 /// linted by the CUDA lane (which enables `cuda` but not `testkit`) and so the rung-4 harnesses have
@@ -470,6 +470,8 @@ mod vram_probe {
     //! ```
 
     use super::gpu_peak::{probe_gpu, used_mib, PeakSampler};
+    use std::process::Command;
+    use std::time::Duration;
 
     /// MiB → GB (10⁹ bytes — the manifest's `minMemoryGb` is base-10 GB, matching the MLX footprint
     /// numbers). `1 MiB = 2²⁰ bytes`.
@@ -532,6 +534,114 @@ mod vram_probe {
         overall_peak_mib: u64,
     }
 
+    /// Stricter evidence configuration for WDDM runners whose otherwise-idle graphics residency is
+    /// non-zero. The ordinary [`VramProbe::assert_idle`] remains the right default for headless
+    /// lanes; this opt-in guard additionally proves repeated baseline stability and rejects a pure
+    /// compute process before allowing a device-level delta measurement.
+    #[derive(Clone, Copy, Debug)]
+    pub struct StableIdleConfig {
+        pub max_baseline_gb: f64,
+        pub sample_count: usize,
+        pub max_drift_mib: u64,
+        pub sample_interval_ms: u64,
+    }
+
+    impl StableIdleConfig {
+        pub const fn new(
+            max_baseline_gb: f64,
+            sample_count: usize,
+            max_drift_mib: u64,
+            sample_interval_ms: u64,
+        ) -> Self {
+            Self {
+                max_baseline_gb,
+                sample_count,
+                max_drift_mib,
+                sample_interval_ms,
+            }
+        }
+    }
+
+    fn pure_compute_pids(pmon: &str, expected_gpu: usize) -> Result<Vec<u32>, String> {
+        let mut pids = Vec::new();
+        for line in pmon.lines().map(str::trim) {
+            if line.is_empty()
+                || line.starts_with('#')
+                || line.eq_ignore_ascii_case("No running processes found")
+            {
+                continue;
+            }
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            if fields.len() < 3 {
+                return Err(format!("malformed nvidia-smi pmon row: {line}"));
+            }
+            let gpu = fields[0]
+                .parse::<usize>()
+                .map_err(|_| format!("malformed GPU ordinal in nvidia-smi pmon row: {line}"))?;
+            if gpu != expected_gpu {
+                return Err(format!(
+                    "nvidia-smi pmon returned physical GPU {gpu}, expected {expected_gpu}; refusing cross-device evidence"
+                ));
+            }
+            let pid = fields[1]
+                .parse::<u32>()
+                .map_err(|_| format!("malformed PID in nvidia-smi pmon row: {line}"))?;
+            match fields[2] {
+                "C" => pids.push(pid),
+                // WDDM desktop processes are reported as C+G even with zero SM/memory activity.
+                // Their fixed device-level residency is handled by the stable baseline below.
+                "C+G" | "G" => {}
+                kind => {
+                    return Err(format!(
+                        "unknown process type {kind:?} in nvidia-smi pmon row: {line}"
+                    ));
+                }
+            }
+        }
+        Ok(pids)
+    }
+
+    fn validated_stable_baseline(
+        samples: &[u64],
+        config: StableIdleConfig,
+        pure_compute_pids: &[u32],
+    ) -> Result<u64, String> {
+        if config.sample_count < 2 || samples.len() != config.sample_count {
+            return Err(format!(
+                "stable idle evidence needs exactly {} samples (at least 2), got {}",
+                config.sample_count,
+                samples.len()
+            ));
+        }
+        if !config.max_baseline_gb.is_finite() || config.max_baseline_gb <= 0.0 {
+            return Err("stable idle maximum baseline must be finite and positive".to_owned());
+        }
+        if !pure_compute_pids.is_empty() {
+            return Err(format!(
+                "pure compute processes {:?} are resident on the profiled GPU; the peak is contaminated",
+                pure_compute_pids
+            ));
+        }
+        let min = *samples.iter().min().expect("non-empty sample set");
+        let max = *samples.iter().max().expect("non-empty sample set");
+        if max.saturating_sub(min) > config.max_drift_mib {
+            return Err(format!(
+                "idle baseline drifted from {min} MiB to {max} MiB (allowed {} MiB); the peak is contaminated",
+                config.max_drift_mib
+            ));
+        }
+        if mib_to_gb(max) >= config.max_baseline_gb {
+            return Err(format!(
+                "stable idle baseline reached {:.1} GB (required < {:.1} GB); the peak is contaminated",
+                mib_to_gb(max),
+                config.max_baseline_gb
+            ));
+        }
+        // Subtract the lowest stable sample so the reported delta cannot be understated by a small
+        // downward fluctuation between the baseline window and the measured phase.
+        Ok(min)
+    }
+
     impl VramProbe {
         /// Record the idle baseline on the physical GPU that Candle's logical `cuda:0` renders on.
         /// This derives the ordinal from `CUDA_VISIBLE_DEVICES` via [`probe_gpu`] so a multi-GPU run
@@ -568,6 +678,54 @@ mod vram_probe {
                 baseline_gb < max_baseline_gb,
                 "sampled GPU was not idle (baseline {baseline_gb:.1} GB, required < {max_baseline_gb:.1} GB); the peak is contaminated"
             );
+            self
+        }
+
+        /// Prove an idle WDDM device with repeated samples and process evidence, then use the lowest
+        /// stable sample as the delta baseline. This is intentionally opt-in: existing headless
+        /// evidence lanes retain their stricter one-shot ceilings.
+        pub fn assert_stable_idle(mut self, config: StableIdleConfig) -> Self {
+            let mut samples = Vec::with_capacity(config.sample_count.max(1));
+            samples.push(self.baseline_mib);
+            for _ in 1..config.sample_count {
+                std::thread::sleep(Duration::from_millis(config.sample_interval_ms));
+                samples.push(used_mib(self.gpu).unwrap_or_else(|| {
+                    panic!(
+                        "cannot read repeated VRAM baseline for physical GPU {} with nvidia-smi",
+                        self.gpu
+                    )
+                }));
+            }
+
+            let gpu = self.gpu.to_string();
+            let nvidia_smi = crate::gpu::resolve_nvidia_smi().unwrap_or_else(|| {
+                panic!(
+                    "cannot resolve a trusted nvidia-smi executable for stable-idle process evidence"
+                )
+            });
+            let output = Command::new(nvidia_smi)
+                .args(["pmon", "-i", &gpu, "-c", "1", "-s", "um"])
+                .output()
+                .unwrap_or_else(|error| panic!("cannot run nvidia-smi pmon: {error}"));
+            assert!(
+                output.status.success(),
+                "nvidia-smi pmon failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let pmon = String::from_utf8(output.stdout)
+                .expect("nvidia-smi pmon output must be valid UTF-8");
+            let compute = pure_compute_pids(&pmon, self.gpu)
+                .unwrap_or_else(|error| panic!("untrustworthy GPU process evidence: {error}"));
+            let baseline = validated_stable_baseline(&samples, config, &compute)
+                .unwrap_or_else(|error| panic!("untrustworthy stable idle baseline: {error}"));
+            eprintln!(
+                "[[CUDA_STABLE_IDLE]] gpu={} samplesMiB={samples:?} maxDriftMiB={} maxBaselineGb={:.1} pureComputePids={compute:?}",
+                self.gpu, config.max_drift_mib, config.max_baseline_gb
+            );
+            self.baseline_mib = baseline;
+            self.load_peak_mib = baseline;
+            self.steady_mib = baseline;
+            self.overall_peak_mib = baseline;
             self
         }
 
@@ -682,6 +840,42 @@ mod vram_probe {
 
             assert_eq!(probe(200).assert_idle(1.0).baseline_mib, 200);
             assert!(std::panic::catch_unwind(|| probe(2_000).assert_idle(1.0)).is_err());
+        }
+
+        #[test]
+        fn stable_idle_evidence_rejects_drift_cap_and_compute_processes() {
+            let config = StableIdleConfig::new(2.0, 4, 64, 0);
+            assert_eq!(
+                validated_stable_baseline(&[1_552, 1_552, 1_553, 1_552], config, &[]).unwrap(),
+                1_552
+            );
+            assert!(
+                validated_stable_baseline(&[1_552, 1_552, 1_700, 1_552], config, &[])
+                    .unwrap_err()
+                    .contains("drifted")
+            );
+            assert!(validated_stable_baseline(&[1_950; 4], config, &[])
+                .unwrap_err()
+                .contains("required < 2.0 GB"));
+            assert!(validated_stable_baseline(&[1_552; 4], config, &[42])
+                .unwrap_err()
+                .contains("pure compute processes [42]"));
+        }
+
+        #[test]
+        fn pmon_process_evidence_rejects_compute_wrong_gpu_and_unknown_rows() {
+            let wddm = "# gpu pid type sm mem\n1 3732 C+G - -\n1 6032 G - -\n";
+            assert!(pure_compute_pids(wddm, 1).unwrap().is_empty());
+            assert_eq!(pure_compute_pids("1 420 C 0 0\n", 1).unwrap(), vec![420]);
+            assert!(pure_compute_pids("0 420 C 0 0\n", 1)
+                .unwrap_err()
+                .contains("expected 1"));
+            assert!(pure_compute_pids("1 420 ? 0 0\n", 1)
+                .unwrap_err()
+                .contains("unknown process type"));
+            assert!(pure_compute_pids("garbage\n", 1)
+                .unwrap_err()
+                .contains("malformed"));
         }
     }
 }

@@ -628,31 +628,58 @@ pub fn run_scm_sampler(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
     preview: Option<&PreviewHook<'_>>,
+    predict: impl FnMut(&Tensor, f32) -> Result<Tensor>,
+) -> Result<Tensor> {
+    let sd = scheduler.sigma_data as f64;
+    let latents = latents.affine(sd, 0.0)?;
+    run_scm_sampler_from(
+        scheduler,
+        0,
+        latents,
+        seed,
+        cancel,
+        on_progress,
+        preview,
+        predict,
+    )
+}
+
+/// Run an SCM/TrigFlow schedule tail from `start_step` over an already `sigma_data`-scaled latent.
+/// The caller renoises an encoded source to `scheduler.timesteps[start_step]`; starting at the clean
+/// endpoint runs no model steps and returns the source after undoing the scale.
+#[allow(clippy::too_many_arguments)] // mirrors the full SCM driver plus an explicit img2img start
+pub fn run_scm_sampler_from(
+    scheduler: &ScmScheduler,
+    start_step: usize,
+    latents: Tensor,
+    seed: u64,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: Option<&PreviewHook<'_>>,
     mut predict: impl FnMut(&Tensor, f32) -> Result<Tensor>,
 ) -> Result<Tensor> {
     let ops = CandleLatentOps;
     let sd = scheduler.sigma_data as f64;
     let n = scheduler.num_steps();
-    let total = n.max(1) as u32;
+    let start = start_step.min(n);
+    let total = (n - start).max(1) as u32;
     let single_step = scheduler.is_single_step();
     // Step-index keyed: this loop has no σ schedule for the sigma-keyed counter to search.
-    let previews = preview.map(|hook| (hook, PreviewCounter::with_steps(n)));
-
-    // diffusers: latents = latents * sigma_data (the SCM prior std-dev).
-    let mut latents = latents.affine(sd, 0.0)?;
+    let previews = preview.map(|hook| (hook, PreviewCounter::with_steps(n - start)));
+    let mut latents = latents;
     let mut denoised = latents.clone();
 
-    for i in 0..n {
+    for i in start..n {
         if cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
         on_progress(Progress::Step {
-            current: (i as u32 + 1).min(total),
+            current: (i - start) as u32 + 1,
             total,
         });
         // Best-effort preview of the running (σ_data-scaled) latent — see the doc note above.
         if let Some((hook, counter)) = &previews {
-            hook.emit_step(counter, i, &latents);
+            hook.emit_step(counter, i - start, &latents);
         }
 
         let s = scheduler.timesteps[i];
@@ -1468,6 +1495,56 @@ mod tests {
             v.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
         );
         assert!(hi - lo > 1e-6, "SCM latent is constant — graph degenerate");
+    }
+
+    #[test]
+    fn run_scm_sampler_from_executes_only_the_requested_tail() {
+        let scheduler = ScmScheduler::new(4);
+        let source = t(&[0.2, -0.4, 0.8, 1.0]);
+        let scaled = source.affine(scheduler.sigma_data as f64, 0.0).unwrap();
+        let mut forwards = 0;
+        let mut progress = Vec::new();
+        let out = run_scm_sampler_from(
+            &scheduler,
+            2,
+            scaled,
+            7,
+            &CancelFlag::default(),
+            &mut |p| progress.push(p),
+            None,
+            |x, _| {
+                forwards += 1;
+                Ok(x.zeros_like()?)
+            },
+        )
+        .unwrap();
+        assert_eq!(forwards, 2);
+        assert_eq!(progress.len(), 2);
+        assert!(out
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .all(|v| v.is_finite()));
+
+        let mut endpoint_forwards = 0;
+        let endpoint = run_scm_sampler_from(
+            &scheduler,
+            scheduler.num_steps(),
+            source.affine(scheduler.sigma_data as f64, 0.0).unwrap(),
+            7,
+            &CancelFlag::default(),
+            &mut |_| {},
+            None,
+            |x, _| {
+                endpoint_forwards += 1;
+                Ok(x.clone())
+            },
+        )
+        .unwrap();
+        assert_eq!(endpoint_forwards, 0);
+        assert_eq!(vec1(&endpoint), vec1(&source));
     }
 
     /// Single-step (num_steps = 1) takes exactly one forward and skips the renoise draw.

@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::{GenerationMemory, Image, PreviewSink, Progress};
+use candle_gen::gen_core::{AdapterSpec, GenerationMemory, Image, PreviewSink, Progress};
 use candle_gen::preview::PreviewHook;
 use candle_gen::weights::Weights;
 use candle_gen::{CandleError, Result};
@@ -60,6 +60,7 @@ pub struct IpAdapterFluxPaths {
     /// The CLIP ViT-L/14 image encoder (`openai/clip-vit-large-patch14`) — a dir (`model.safetensors`)
     /// or the file directly.
     pub image_encoder: PathBuf,
+    pub adapters: Vec<AdapterSpec>,
 }
 
 /// One FLUX IP-Adapter generation request.
@@ -189,7 +190,14 @@ impl IpAdapterFlux {
         let variant = detect_variant(&root)?;
 
         // CLIP-L + T5-XXL text encoders (shared FLUX.1 backbone load, sc-9003).
-        let backbone = FluxRefBackbone::load_with_memory(&root, variant, &device, dtype, memory)?;
+        let backbone = FluxRefBackbone::load_with_memory(
+            &root,
+            variant,
+            &device,
+            dtype,
+            memory,
+            paths.adapters.clone(),
+        )?;
 
         // The forked FLUX DiT (the IP seam) from the root BFL checkpoint — the genuine per-provider drift
         // (IpFlux, not the stock Flux), so the wrapper choice stays here over the shared mmap.

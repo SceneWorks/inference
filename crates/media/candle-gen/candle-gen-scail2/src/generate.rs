@@ -6,13 +6,13 @@
 //! and VAE-decode each segment back to pixels.
 //!
 //! Reuse map — the heavy components are `candle-gen-wan`'s (SCAIL-2 *is* Wan2.1-14B I2V): the z16
-//! [`WanVae16`] (encode/decode; its decode already streams one latent frame at a time = the
+//! [`ProviderVae`] (encode/decode; its decode already streams one latent frame at a time = the
 //! temporal-tiled decode the high-res fix needs), the [`Umt5Encoder`] text encoder, and the
 //! flow-matching [`FlowScheduler`] (UniPC). SCAIL-2's own pieces are the [`Scail2Dit`] forward, the
 //! open-CLIP [`ScailClip`] image encode, the 28-channel [`extract_and_compress_mask_to_latent`] mask
 //! build, and the [`interpolate`]/[`downsample_half`] resizes.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::runtime::CancelFlag;
@@ -23,23 +23,23 @@ use candle_gen_wan::config::TextEncoderConfig;
 use candle_gen_wan::pipeline::frames_to_images;
 use candle_gen_wan::scheduler::{FlowScheduler, Sampler};
 use candle_gen_wan::text_encoder::Umt5Encoder;
-use candle_gen_wan::vae16::WanVae16;
 
 use crate::clip::ScailClip;
 use crate::model::{Scail2Dit, Scail2Inputs};
 use crate::preprocess::{extract_and_compress_mask_to_latent, TEMPORAL_STRIDE};
 use crate::resize::{clip_preprocess, downsample_half, interpolate, Interp};
+use crate::ProviderVae;
 
 /// Inputs must be divisible by 32: the pose path halves spatially (→ ÷16) before the ÷8 VAE stride, and
 /// the 28-channel mask pools 8×, so both the full and half grids stay integer + even.
-pub(crate) const DIM_ALIGN: u32 = 32;
+pub(crate) const DIM_ALIGN: u32 = crate::VAE_TILING.spatial_scale as u32 * 4;
 
 /// The loaded SCAIL-2 components (resident in the [`crate::pipeline::Scail2`] generator's cache). All
 /// run f32 (the DiT's high-token-length NaN avoidance, and z16 VAE / UMT5 / CLIP are f32 anyway).
 pub struct Components {
     pub te: Umt5Encoder,
     pub dit: Scail2Dit,
-    pub vae: WanVae16,
+    pub vae: ProviderVae,
     pub clip: ScailClip,
     /// UMT5 tokenizer, loaded+parsed **once** at component load and reused across the pos/neg encodes
     /// (sc-8991 / F-011) instead of re-parsing `tokenizer.json` per generate call.
@@ -161,7 +161,7 @@ fn stack_masks(masks: &[Image], tw: usize, th: usize) -> CResult<Tensor> {
 }
 
 /// VAE-encode a `[3, T, H, W]` pixel clip (`[-1,1]`) → `[16, T_lat, H/8, W/8]` (drops the batch dim).
-fn vae_encode_cthw(vae: &WanVae16, cthw: &Tensor) -> CResult<Tensor> {
+fn vae_encode_cthw(vae: &ProviderVae, cthw: &Tensor) -> CResult<Tensor> {
     let (c, t, h, w) = cthw.dims4()?;
     let z = vae.encode(&cthw.reshape((1, c, t, h, w))?)?; // [1,16,T_lat,h,w]
     let (_, zc, zt, zh, zw) = z.dims5()?;
@@ -286,12 +286,16 @@ fn encode_text(
     Ok(embeds.reshape((l, d))?)
 }
 
-/// Build the SCAIL-2 UMT5 tokenizer from `root/tokenizer/tokenizer.json` **once** (sc-8991 / F-011), so
-/// the generator caches it on its `Components` and reuses it across generate calls rather than
-/// re-parsing per request. Byte-identical [`TokenizerConfig`] to the old per-generate load.
-pub fn build_tokenizer(root: &Path, te_cfg: &TextEncoderConfig) -> CResult<TextTokenizer> {
+/// Build the SCAIL-2 UMT5 tokenizer from an explicit `tokenizer.json` path **once** (sc-8991 /
+/// F-011). The legacy candle snapshot stores it under `tokenizer/tokenizer.json`; the shared
+/// `SceneWorks/scail2-mlx` tier stores the byte-identical tokenizer at the tier root. Keeping this
+/// path-shaped lets both layouts share one parser without copying the file.
+pub fn build_tokenizer_from_path(
+    tokenizer_path: PathBuf,
+    te_cfg: &TextEncoderConfig,
+) -> CResult<TextTokenizer> {
     TextTokenizer::from_file(
-        root.join("tokenizer/tokenizer.json"),
+        tokenizer_path,
         TokenizerConfig {
             max_length: te_cfg.max_length,
             pad_token_id: te_cfg.pad_token_id,
@@ -300,6 +304,11 @@ pub fn build_tokenizer(root: &Path, te_cfg: &TextEncoderConfig) -> CResult<TextT
         },
     )
     .map_err(|e| CandleError::Msg(format!("scail2: load tokenizer: {e}")))
+}
+
+/// Legacy component-directory wrapper retained for caller compatibility.
+pub fn build_tokenizer(root: &Path, te_cfg: &TextEncoderConfig) -> CResult<TextTokenizer> {
+    build_tokenizer_from_path(root.join("tokenizer/tokenizer.json"), te_cfg)
 }
 
 /// Run the full SCAIL-2 generation for `job` against the resident `comps`. `cancel` is polled each
