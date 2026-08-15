@@ -474,7 +474,22 @@ pub fn registered_fixture(
                 frames: FIXTURE_FRAMES,
                 reference_count,
             };
-            Ok(MemoryBehaviorFixture::new(context))
+            let mut fixture = MemoryBehaviorFixture::new(context);
+            // `MemoryBehaviorFixture::new` derives the request from `context.geometry` for width,
+            // height, batch and reference count, but **not** for `frames`, which falls through to
+            // `GenerationRequest::default()` and lands at `None` (== a single frame). That is
+            // invisible to every provider whose legal geometry includes one frame; this family is
+            // the first whose lattice excludes it, so the defaulted request gets re-graded against
+            // the 124-frame geometry admitted just above and refused as off-lattice — a
+            // self-inconsistent fixture failing its own provider. Restate the frame count so the
+            // request and the geometry it is meant to represent agree.
+            //
+            // Any future provider whose legal frame counts exclude 1 must do the same until the
+            // shared builder propagates `frames` itself. Deliberately not fixed there: that builder
+            // is a main-owned contract read by every provider on the ladder and needs its own
+            // reviewed PR, coordinated with the epics that own memory admission.
+            fixture.request.frames = Some(FIXTURE_FRAMES);
+            Ok(fixture)
         })
         .collect()
 }
