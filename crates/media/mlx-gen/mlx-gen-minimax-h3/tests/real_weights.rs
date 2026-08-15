@@ -22,7 +22,9 @@ use std::time::Instant;
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::weights::Weights;
-use mlx_gen_minimax_h3::spatial_tiling::{SpatialTiling, TilePlan};
+use mlx_gen_minimax_h3::spatial_tiling::{
+    SpatialTiling, TilePlan, TILE_SAMPLE_MIN_OVERLAP, TILE_SAMPLE_MIN_SIZE,
+};
 use mlx_gen_minimax_h3::{
     kaiser_sinc_filter1d, DitBlock, MiniMaxH3AudioVae, MiniMaxH3AudioVaeConfig, MiniMaxH3DitConfig,
     MiniMaxH3TeConfig, MiniMaxH3TextEncoder, MiniMaxH3Tokenizer, MiniMaxH3VaeConfig,
@@ -30,7 +32,7 @@ use mlx_gen_minimax_h3::{
     MINIMAX_ADDED_SPECIALS, VISION_PREFIX,
 };
 
-use common::{snapshot, std_dev};
+use common::{cosine, l2_norm, rel, snapshot, std_dev};
 
 /// Total tensors in the published `vae/` component.
 const PUBLISHED_VAE_TENSORS: usize = 703;
@@ -328,6 +330,555 @@ fn real_weight_multi_chunk_decode_blends_the_seam() {
     println!(
         "REAL-WEIGHT SMOKE: 12 tokens -> {:?} across 2 blended chunks (std {spread:.4})",
         video.shape()
+    );
+}
+
+// =============================================================================================
+// sc-19445 — the video VAE ENCODE half
+//
+// sc-17148 landed the MLX encoder with no real-weight gate at all: the only thing validating it
+// was `tests/fixtures/video_vae_encode.safetensors`, and **that fixture structurally cannot
+// express a level-indexing error.** Its geometry is
+//
+//     block_out_channels          (32, 32, 32, 64)
+//     spatial_downsample_factors  (1, 2, 2, 1)
+//     temporal_downsample_factors (1, 2, 2, 1)      <- IDENTICAL to the spatial list
+//     norm_num_groups             32 == the width at levels 0-2  <- instance norm on 3 of 4 levels
+//
+// against the shipped
+//
+//     block_out_channels          (128, 256, 256, 512, 512, 1024)
+//     spatial_downsample_factors  (2, 2, 2, 2, 1, 1)
+//     temporal_downsample_factors (1, 2, 2, 1, 1, 1)  <- DIFFERENT from the spatial list
+//     norm_num_groups             32 over 128..1024
+//
+// Three consequences, and each is a defect the fixture reports green:
+//
+//  * the toy's two factor lists agree, so `encoder_level_has_downsampler`'s product predicate,
+//    the spatial factor alone and the temporal factor alone are the SAME function on it. On the
+//    shipped config they disagree at levels 0 and 3. That is the mutation
+//    `real_weight_encode_matches_the_official_diffusers_vae` is demonstrated against below.
+//  * toy levels 1 and 2 are indistinguishable — same in/out width, same factors, same downsampler,
+//    same absence of `conv_shortcut` — so swapping the CONFIG level between them is bit-inert
+//    there and is a load failure on the shipped stack, where level 1 changes width and level 2
+//    does not.
+//  * `groups == channels` at levels 0-2 makes the frame-isolated GroupNorm an instance norm there.
+//    Only level 3 groups at all, and only 2 channels to a group against the shipped 4 to 32, so
+//    the grouping is very nearly unobservable at fixture scale.
+//
+// The two tests below are the two halves the fixture leaves open: the published *shapes* against a
+// table derived from the config, and the published *values* against an independent implementation.
+// =============================================================================================
+
+/// The bound `real_weight_encode_matches_the_official_diffusers_vae` gates on, **derived from this
+/// lane's own measured floor** rather than inherited from the decode lane or from candle.
+///
+/// Measured on `nax-macos` (Mac17,6, Metal) against
+/// `tools/dump_minimax_h3_video_vae_encode_real.py` @ snapshot `939557dc`, diffusers 0.40.0.dev0,
+/// all six (probe, moment) pairs:
+///
+/// ```text
+/// keyframe.mean  4.930e-4     keyframe.std  1.385e-3
+/// clip.mean      5.580e-4     clip.std      1.514e-3
+/// multiclip.mean 6.351e-4     multiclip.std 1.789e-3   <- the floor
+/// ```
+///
+/// so the floor is **1.789e-3** and this bound is ~5.6x it.
+///
+/// **It has to be measured here and cannot be borrowed.** MLX's reduced-precision Metal f32 matmul
+/// over the six-level 128..1024 conv stack sits two orders above candle's f32 CPU path for the
+/// identical comparison — `REAL_WEIGHT_ENCODE_TOL` is 2e-4 there — which is the same split the
+/// decode lane shows (~4.96e-3 on MLX against ~4.73e-6 on candle). Taking candle's 2e-4 would make
+/// this test fail on clean code; taking a round house value would state a convention in the voice
+/// of a derivation.
+///
+/// **The exposure sits on `std`, and predictably so.** `std` is `exp(0.5 · logvar)`, so an
+/// absolute wobble in `logvar` returns as a *relative* one here, magnified by the exponential.
+/// Every one of the three worst entries above is a `std`; every `mean` is ~3x tighter.
+///
+/// The headroom over 1.789e-3 covers a device change — `rw-mage` is on both Macs and only one of
+/// them has been measured — not a defect. Every defect class this epic has actually shipped is
+/// orders clear of it: the sc-18740 gate/value half-swap at 0.86-0.99, a symmetric downsampler pad
+/// at 1.8, a global GroupNorm at 1.6, a front pad at 6.9e-1, and an untiled encode at **9.430e-2**
+/// — that last one re-measured on this lane, below, as the discrimination check.
+///
+/// **WHAT 1e-2 DOES NOT BOUND.** Every class in that list is a LAYOUT or STRUCTURE defect, and each
+/// clears the bound by one to two orders; for those, 1e-2 is loose in the right direction. It is
+/// not a bound on SCALE or PRECISION defects at all. The metric is relative, so a uniform gain
+/// error anywhere up to ±1% sits under it by construction no matter what it does to the image —
+/// which is precisely the shape of the 2% scale drift this story demonstrates against (it fires at
+/// only 1.956e-2, ~2x the bound, while cosine reads exactly 1.0000000). Read 1e-2 as "the layout is
+/// right", never as "the numbers are right to 1%".
+const REAL_WEIGHT_ENCODE_TOL: f32 = 1e-2;
+
+/// `name -> shape` over the `vae/` shard headers, read without any weight I/O.
+///
+/// Shards are enumerated from the published `index.json` weight map rather than by globbing the
+/// directory: an AppleDouble `._`-prefixed sidecar matches `*.safetensors` and is not one.
+fn vae_shard_shapes(dir: &std::path::Path) -> std::collections::BTreeMap<String, Vec<i32>> {
+    let index = dir.join("diffusion_pytorch_model.safetensors.index.json");
+    let text = std::fs::read_to_string(&index)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", index.display()));
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let shards: std::collections::BTreeSet<String> = json
+        .get("weight_map")
+        .and_then(serde_json::Value::as_object)
+        .expect("index.json has a weight_map")
+        .values()
+        .filter_map(|v| v.as_str().map(str::to_owned))
+        .collect();
+    assert!(!shards.is_empty(), "the weight map names no shard");
+
+    let mut out = std::collections::BTreeMap::new();
+    for shard in &shards {
+        let path = dir.join(shard);
+        let mut f =
+            std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
+        let mut len = [0u8; 8];
+        std::io::Read::read_exact(&mut f, &mut len).expect("safetensors header length");
+        let mut header = vec![0u8; u64::from_le_bytes(len) as usize];
+        std::io::Read::read_exact(&mut f, &mut header).expect("safetensors header");
+        let header: serde_json::Value =
+            serde_json::from_slice(&header).expect("safetensors header json");
+        for (k, v) in header.as_object().expect("header object") {
+            if k == "__metadata__" {
+                continue;
+            }
+            let shape: Vec<i32> = v["shape"]
+                .as_array()
+                .expect("shape")
+                .iter()
+                .map(|d| d.as_i64().expect("dim") as i32)
+                .collect();
+            assert!(
+                out.insert(k.clone(), shape).is_none(),
+                "{k} appears in more than one shard"
+            );
+        }
+    }
+    out
+}
+
+/// **Every declared encoder tensor's SHAPE, derived from the config and checked against the
+/// published shard headers** — plus the level structure the toy fixture has no room to carry.
+///
+/// `declared_tensor_names_match_the_published_checkpoint` above is necessary and not sufficient: a
+/// port can name all 118 encode keys correctly and still read them at the wrong *level*, because
+/// `Weights` hands back whatever is stored under a name and neither the key-set proof nor the
+/// fixture can see a 512-wide conv where the checkpoint has 1024.
+///
+/// **The table is DERIVED, not transcribed.** Every expectation comes from
+/// `MiniMaxH3VaeConfig`'s own accessors — `encoder_level_in_channels`, `block_out_channels`,
+/// `encoder_level_has_downsampler` — so it is a statement about the port's geometry that the
+/// published bytes then judge. A table copied out of the headers would agree with them by
+/// construction and prove nothing.
+///
+/// Reads headers only: no weight I/O, no Metal.
+#[test]
+#[ignore = "needs a real MiniMax-H3 snapshot (MINIMAX_H3_SNAPSHOT); shard headers only, no weight I/O"]
+fn declared_encoder_shapes_match_the_published_checkpoint() {
+    let root = snapshot();
+    let dir = root.join("vae");
+    let cfg = MiniMaxH3VaeConfig::from_diffusers_json(
+        &std::fs::read_to_string(dir.join("config.json")).unwrap(),
+    )
+    .unwrap();
+    let shapes = vae_shard_shapes(&dir);
+    assert_eq!(
+        shapes.len(),
+        PUBLISHED_VAE_TENSORS,
+        "published vae/ tensor count changed"
+    );
+
+    // ---- the derived table -------------------------------------------------------------------
+    let mut want: std::collections::BTreeMap<String, Vec<i32>> = Default::default();
+    let c0 = cfg.block_out_channels[0];
+    want.insert(
+        "encoder.conv_in.weight".into(),
+        vec![c0, cfg.in_channels, 3, 3, 3],
+    );
+    want.insert("encoder.conv_in.bias".into(), vec![c0]);
+    for level in 0..cfg.num_encoder_levels() {
+        let out = cfg.block_out_channels[level];
+        for j in 0..cfg.layers_per_block {
+            let inp = if j == 0 {
+                cfg.encoder_level_in_channels(level)
+            } else {
+                out
+            };
+            let p = format!("encoder.down_blocks.{level}.resnets.{j}");
+            want.insert(format!("{p}.norm1.weight"), vec![inp]);
+            want.insert(format!("{p}.norm1.bias"), vec![inp]);
+            want.insert(format!("{p}.conv1.weight"), vec![out, inp, 3, 3, 3]);
+            want.insert(format!("{p}.conv1.bias"), vec![out]);
+            want.insert(format!("{p}.norm2.weight"), vec![out]);
+            want.insert(format!("{p}.norm2.bias"), vec![out]);
+            want.insert(format!("{p}.conv2.weight"), vec![out, out, 3, 3, 3]);
+            want.insert(format!("{p}.conv2.bias"), vec![out]);
+            // The residual projection exists exactly where the width changes — the same predicate
+            // `ResnetBlock3d::from_weights` uses to decide whether to load one.
+            if inp != out {
+                want.insert(format!("{p}.conv_shortcut.weight"), vec![out, inp, 1, 1, 1]);
+                want.insert(format!("{p}.conv_shortcut.bias"), vec![out]);
+            }
+        }
+        if cfg.encoder_level_has_downsampler(level) {
+            let p = format!("encoder.down_blocks.{level}.downsamplers.0.conv");
+            want.insert(format!("{p}.weight"), vec![out, out, 3, 3, 3]);
+            want.insert(format!("{p}.bias"), vec![out]);
+        }
+    }
+    let last = *cfg.block_out_channels.last().expect("at least one level");
+    want.insert("encoder.norm_out.weight".into(), vec![last]);
+    want.insert("encoder.norm_out.bias".into(), vec![last]);
+    // `conv_out` and `quant_conv` are twice the latent width: they carry mean AND logvar.
+    let params = 2 * cfg.latent_channels;
+    want.insert(
+        "encoder.conv_out.weight".into(),
+        vec![params, last, 3, 3, 3],
+    );
+    want.insert("encoder.conv_out.bias".into(), vec![params]);
+    want.insert("quant_conv.weight".into(), vec![params, params, 1, 1, 1]);
+    want.insert("quant_conv.bias".into(), vec![params]);
+
+    assert_eq!(
+        want.len(),
+        ENCODE_HALF_TENSORS,
+        "the derived table must cover all {ENCODE_HALF_TENSORS} encode tensors"
+    );
+    // …and it must describe exactly the tensors the loader declares, or the table is checking a
+    // different model than the one that runs.
+    let declared: std::collections::BTreeSet<String> = MiniMaxH3VideoVae::tensor_names(&cfg)
+        .into_iter()
+        .filter(|k| k.starts_with("encoder.") || k.starts_with("quant_conv."))
+        .collect();
+    assert_eq!(
+        want.keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        declared,
+        "the derived shape table and the declared encode key set name different tensors"
+    );
+
+    for (key, expected) in &want {
+        let got = shapes
+            .get(key)
+            .unwrap_or_else(|| panic!("the published vae/ has no `{key}`"));
+        assert_eq!(
+            got, expected,
+            "{key}: published shape vs the port's geometry"
+        );
+    }
+
+    // ---- the level structure the 4-level toy cannot carry ------------------------------------
+    // Asserted against the PUBLISHED index, not against the config that produced the table above,
+    // so this is an independent statement rather than a restatement of it.
+    let published: std::collections::BTreeSet<&String> = shapes.keys().collect();
+    let has = |k: &str| published.contains(&k.to_string());
+    let any = |needle: &str| published.iter().any(|k| k.contains(needle));
+
+    for level in 0..4 {
+        assert!(
+            has(&format!(
+                "encoder.down_blocks.{level}.downsamplers.0.conv.weight"
+            )),
+            "level {level} must carry a downsampler in the published checkpoint"
+        );
+    }
+    for level in [4, 5] {
+        assert!(
+            !any(&format!("down_blocks.{level}.downsamplers")),
+            "level {level} must carry NO downsampler; applying one where none exists is the \
+             sc-19445 defect class"
+        );
+    }
+    for level in [1, 3, 5] {
+        assert!(
+            has(&format!(
+                "encoder.down_blocks.{level}.resnets.0.conv_shortcut.weight"
+            )),
+            "level {level} changes width and must carry a residual projection"
+        );
+    }
+    for level in [0, 2, 4] {
+        assert!(
+            !any(&format!(
+                "encoder.down_blocks.{level}.resnets.0.conv_shortcut"
+            )),
+            "level {level} keeps its width and must carry no residual projection"
+        );
+    }
+    // The port's own predicates must agree with the checkpoint on both counts, per level. This is
+    // the half that turns the structural facts above into a gate on the LOADER rather than on the
+    // bytes: `encoder_level_has_downsampler` is what decides whether the forward pass strides.
+    for level in 0..cfg.num_encoder_levels() {
+        assert_eq!(
+            cfg.encoder_level_has_downsampler(level),
+            any(&format!("down_blocks.{level}.downsamplers")),
+            "level {level}: the port and the checkpoint disagree about a downsampler"
+        );
+        assert_eq!(
+            cfg.encoder_level_in_channels(level) != cfg.block_out_channels[level],
+            any(&format!(
+                "encoder.down_blocks.{level}.resnets.0.conv_shortcut"
+            )),
+            "level {level}: the port and the checkpoint disagree about a residual projection"
+        );
+    }
+
+    // Every 3x3x3 kernel really is 3x3x3 — a 1x3x3 would make the whole temporal-causality
+    // discussion vacuous — and `conv_shortcut` really is the pointwise 1x1x1.
+    let kernel = |k: &str| shapes[k][2..].to_vec();
+    assert_eq!(kernel("encoder.conv_in.weight"), vec![3, 3, 3]);
+    assert_eq!(
+        kernel("encoder.down_blocks.0.downsamplers.0.conv.weight"),
+        vec![3, 3, 3]
+    );
+    assert_eq!(
+        kernel("encoder.down_blocks.1.resnets.0.conv_shortcut.weight"),
+        vec![1, 1, 1]
+    );
+
+    println!(
+        "REAL-WEIGHT ENCODE SHAPE TABLE: all {} derived encode shapes match the published \
+         checkpoint; block_out_channels {:?}, spatial {:?}, temporal {:?}; downsamplers on levels \
+         {:?}, residual projections on levels {:?}",
+        want.len(),
+        cfg.block_out_channels,
+        cfg.spatial_downsample_factors,
+        cfg.temporal_downsample_factors,
+        (0..cfg.num_encoder_levels())
+            .filter(|l| cfg.encoder_level_has_downsampler(*l))
+            .collect::<Vec<_>>(),
+        (0..cfg.num_encoder_levels())
+            .filter(|l| cfg.encoder_level_in_channels(*l) != cfg.block_out_channels[*l])
+            .collect::<Vec<_>>(),
+    );
+}
+
+/// **The gate sc-17148 shipped without.** Encode the *same pixels* the official diffusers
+/// `AutoencoderKLMiniMaxH3` encoded, from the *same published bytes*, and compare numerically.
+///
+/// Why the committed fixture cannot do this job: see the section header above. The decisive one is
+/// that the toy's spatial and temporal factor lists are *the same list*, so a level predicate that
+/// reads the wrong one of them is the identity there and mis-strides the real stack.
+///
+/// Three probes, each reaching a path the other two leave dark (the generator derives all three
+/// from the shipped config and refuses to write a probe that would be inert):
+///
+/// | probe | frames | what only it reaches |
+/// |---|---|---|
+/// | `keyframe` | 1 | the single-frame short circuit, and the shipped 256/64 spatial tiling at 320 px |
+/// | `clip` | 17 | the temporal strides and the `token_drop` tail trim, untiled |
+/// | `multiclip` | 20 | the frame-repeat pad to a multiple of `clip_length`, and the clip-by-clip concatenation |
+///
+/// 20 rather than any other ragged count, because `token_drop` otherwise *hides* the pad: only the
+/// first `tokens_chunk_size - token_drop` latent frames of the final clip survive, and those reach
+/// back over clip-local pixels `0 ..= pad_reach` only. At 25 frames, repeating the FIRST frame
+/// instead of the last leaves the encode bit-identical — measured on this epic, not reasoned. The
+/// assertion below re-derives `pad_reach` from the shipped config so it cannot silently stop
+/// holding.
+///
+/// **Gated on relative max-abs-diff.** Not norm, not cosine, not a checksum: all three are printed
+/// beside it and none of them is asserted on, because all three were blind to real defects in this
+/// family seven times. sc-18740 shipped a functionally wrong VAE green at cosine 0.73-0.78 with
+/// norms 89 vs 85.
+///
+/// Generate the reference with `tools/dump_minimax_h3_video_vae_encode_real.py` (~5.7 MB,
+/// deliberately not committed) and point `MINIMAX_H3_VIDEO_VAE_ENCODE_REFERENCE` at it. Like every
+/// test in this file it **asserts** rather than skipping, so a missing reference cannot read as a
+/// pass.
+#[test]
+#[ignore = "needs a real MiniMax-H3 snapshot + a reference encode (MINIMAX_H3_VIDEO_VAE_ENCODE_REFERENCE); ~9.7 GiB resident"]
+fn real_weight_encode_matches_the_official_diffusers_vae() {
+    let root = snapshot();
+    let reference_path = std::env::var("MINIMAX_H3_VIDEO_VAE_ENCODE_REFERENCE").unwrap_or_default();
+    assert!(
+        !reference_path.is_empty(),
+        "MINIMAX_H3_VIDEO_VAE_ENCODE_REFERENCE must point at the output of \
+         tools/dump_minimax_h3_video_vae_encode_real.py. This test is #[ignore]d and asserts \
+         rather than skips so a missing reference cannot be mistaken for a pass."
+    );
+    let r = Weights::from_file(&reference_path)
+        .unwrap_or_else(|e| panic!("load {reference_path}: {e}"));
+    // layout.rs Rule 3: only a golden built from the CONVERTED checkpoint can validate a loader
+    // that reads the converted checkpoint. A golden dumped from the MiniMax source modules would
+    // share this loader's key names and disagree with the shipped bytes — sc-18740's mechanism.
+    assert_eq!(
+        r.metadata("provenance").unwrap_or_default(),
+        "converted-checkpoint",
+        "the reference must come from `AutoencoderKLMiniMaxH3`, not the MiniMax source modules"
+    );
+    assert_eq!(
+        r.metadata("reference").unwrap_or_default(),
+        "diffusers.AutoencoderKLMiniMaxH3"
+    );
+    assert_eq!(r.metadata("half").unwrap_or_default(), "encode");
+    // The reference must have run the SHIPPED tile geometry, or the keyframe comparison below is
+    // about some other tiling than the one production uses.
+    assert_eq!(
+        r.metadata("tile_sample_min_size").unwrap_or_default(),
+        TILE_SAMPLE_MIN_SIZE.to_string(),
+        "the reference tiled at a different size than this port does"
+    );
+    assert_eq!(
+        r.metadata("tile_sample_min_overlap").unwrap_or_default(),
+        TILE_SAMPLE_MIN_OVERLAP.to_string()
+    );
+
+    let dir = root.join("vae");
+    let mut w = Weights::from_dir(&dir).unwrap();
+    let cfg = MiniMaxH3VaeConfig::from_diffusers_json(
+        &std::fs::read_to_string(dir.join("config.json")).unwrap(),
+    )
+    .unwrap();
+    // f32 to keep the comparison about layout rather than about bf16 rounding. `vae/` is already
+    // F32 on disk (703 of 703 tensors, 9.70 GiB), so this is a no-op cast, not a doubling.
+    let t0 = Instant::now();
+    let vae = MiniMaxH3VideoVae::from_weights(&mut w, &cfg, Dtype::Float32).unwrap();
+    let load_ms = t0.elapsed().as_millis();
+    assert!(
+        vae.can_encode(),
+        "the published vae/ always ships the encode half"
+    );
+    // The real six-level stack, not the four-level toy this test exists to get past.
+    assert_eq!(cfg.num_encoder_levels(), 6);
+    assert_eq!(cfg.block_out_channels, vec![128, 256, 256, 512, 512, 1024]);
+    assert_ne!(
+        cfg.spatial_downsample_factors, cfg.temporal_downsample_factors,
+        "the shipped factor lists DIFFER; that difference is what makes a level-indexing error \
+         expressible here and inert on the fixture, so a config where they agreed would silently \
+         demote this test to a second copy of the fixture lane"
+    );
+
+    let mut worst = 0.0f32;
+    let mut worst_at = String::new();
+    for name in ["keyframe", "clip", "multiclip"] {
+        let pixels = r.require(&format!("in.{name}.pixels")).unwrap();
+        let posterior = vae.encode(pixels).expect("real-weight encode");
+
+        for (label, got) in [("mean", posterior.mean()), ("std", posterior.std())] {
+            let want = r.require(&format!("out.{name}.{label}")).unwrap();
+            let got = got.as_dtype(Dtype::Float32).unwrap();
+            assert_eq!(got.shape(), want.shape(), "{name}.{label}: posterior shape");
+
+            let (peak, mean_rel) = rel(&got, want);
+            let cos = cosine(&got, want);
+            let (n_got, n_want) = (l2_norm(&got), l2_norm(want));
+            println!(
+                "REAL-WEIGHT ENCODE PARITY {name}.{label} vs {} {}: rel-max-abs={peak:.3e} \
+                 rel-mean={mean_rel:.3e} cosine={cos:.7} ||port||={n_got:.4} \
+                 ||reference||={n_want:.4}",
+                r.metadata("reference").unwrap_or_default(),
+                r.metadata("reference_version").unwrap_or_default(),
+            );
+            // **The gate.** `cos` and the two norms above are printed and never asserted on: a
+            // gate/value half-swap holds cosine at 0.73-0.78 and moves the norm by 4%, and cosine
+            // is scale-invariant besides.
+            assert!(
+                peak < REAL_WEIGHT_ENCODE_TOL,
+                "the MLX encode of `{name}.{label}` diverges from the official diffusers VAE by \
+                 {peak:.3e} (bound {REAL_WEIGHT_ENCODE_TOL:.0e}). A mis-levelled downsampler, a \
+                 symmetric pad where the reference is asymmetric, a global rather than \
+                 frame-isolated GroupNorm, or an untiled encode all land here — note cosine \
+                 {cos:.7} and norms {n_got:.4} vs {n_want:.4}, which barely move."
+            );
+            if peak > worst {
+                worst = peak;
+                worst_at = format!("{name}.{label}");
+            }
+            assert!(
+                std_dev(want) > 1e-3,
+                "{name}.{label}: the reference posterior is ~constant and would gate nothing"
+            );
+        }
+    }
+
+    // ---- the shape facts the values alone cannot pin -----------------------------------------
+    // A keyframe is ONE latent frame: the `T == 1` short circuit is live on real weights, not only
+    // in the fixture. Padding a keyframe up to `clip_length` instead would yield `5 - token_drop`.
+    assert_eq!(
+        r.require("out.keyframe.mean").unwrap().shape()[2],
+        1,
+        "a keyframe must encode to exactly one latent frame"
+    );
+    assert!(r.require("out.clip.mean").unwrap().shape()[2] > 1);
+
+    // The multiclip probe has to actually be ragged, and its repeated frames have to be
+    // observable, or the two branches it exists to gate are never entered and it is a third copy
+    // of `clip`. Both facts are re-derived from the shipped config here rather than restated.
+    let frames = r.require("in.multiclip.pixels").unwrap().shape()[2];
+    let clip = cfg.clip_length;
+    assert_ne!(
+        frames % clip,
+        0,
+        "the multiclip probe is {frames} frames, a whole number of {clip}-frame clips; it never \
+         reaches the frame-repeat pad"
+    );
+    let clips = frames.div_euclid(clip) + 1;
+    assert!(
+        clips > 1,
+        "the multiclip probe pads to {clips} clip(s); it never reaches the concatenation"
+    );
+    let per_clip = clip.div_euclid(cfg.patch_size_t) + i32::from(clip % cfg.patch_size_t != 0);
+    let pad_reach = (per_clip - cfg.token_drop - 1) * cfg.patch_size_t;
+    let tail_real = frames % clip;
+    assert!(
+        tail_real <= pad_reach,
+        "the multiclip probe leaves {tail_real} real frames in its final clip, past the \
+         {pad_reach}-pixel reach of the latents that survive token_drop; every repeated frame \
+         would land inside the dropped tail and the probe could not tell a last-frame repeat from \
+         any other"
+    );
+    assert_eq!(
+        r.require("out.multiclip.mean").unwrap().shape()[2],
+        clips * per_clip - cfg.token_drop,
+        "a {frames}-frame encode is {clips} clips of {per_clip} latent frames less the {} dropped \
+         once at the tail",
+        cfg.token_drop
+    );
+
+    // ---- the discrimination check ------------------------------------------------------------
+    // **Can this comparison fail at all?** The keyframe probe is 320 px, above the shipped 256 px
+    // tile, so the reference genuinely tiled it. If an UNTILED encode of the same pixels agreed
+    // with the tiled one to within the bound, then agreeing with the reference would say nothing
+    // about whether this port tiles — the gate would be measurably inert while reporting green.
+    let keyframe = r.require("in.keyframe.pixels").unwrap();
+    assert!(
+        keyframe.shape()[3] > TILE_SAMPLE_MIN_SIZE,
+        "the keyframe probe is {} px and must exceed the {TILE_SAMPLE_MIN_SIZE} px tile",
+        keyframe.shape()[3]
+    );
+    let tiled = vae.encode_clip(keyframe).unwrap();
+    let untiled = vae.encode_clip_untiled(keyframe).unwrap();
+    assert_eq!(
+        tiled.shape(),
+        untiled.shape(),
+        "tiling must not change the latent SHAPE — a shape-blind gate would be the only one to \
+         notice if it did"
+    );
+    let (untiled_delta, _) = rel(&untiled, &tiled);
+    // Measured 9.430e-2 here: 9.4x the 1e-2 bound and 53x the 1.789e-3 floor. But the criterion
+    // asserted below is 5x the BOUND, i.e. 5.0e-2, so the margin this control actually runs on is
+    // **1.89x** — not the 9.4x the raw measurement suggests. Stated plainly because it is thin: a
+    // port that silently stopped tiling collapses this to ~0 and is a red, which is the point, but
+    // a device whose reductions halved the measurement would flake the control instead. If the
+    // second Mac lands materially below 9.4e-2, re-derive this criterion rather than loosening it.
+    assert!(
+        untiled_delta > 5.0 * REAL_WEIGHT_ENCODE_TOL,
+        "an untiled encode of a {} px canvas agrees with the tiled one to {untiled_delta:.3e}, \
+         within 5x the {REAL_WEIGHT_ENCODE_TOL:.0e} bound; the reference comparison above cannot \
+         be said to gate the tiling at all",
+        keyframe.shape()[3]
+    );
+
+    println!(
+        "REAL-WEIGHT ENCODE PARITY: worst rel-max-abs {worst:.3e} at {worst_at} over 6 (probe, \
+         moment) pairs, bound {REAL_WEIGHT_ENCODE_TOL:.0e}; untiled-vs-tiled keyframe control \
+         {untiled_delta:.3e} ({load_ms} ms to map + build {PUBLISHED_VAE_TENSORS} f32 tensors); \
+         {frames}-frame ragged probe -> {clips} clips of {per_clip} latent frames less \
+         {} dropped, pad_reach {pad_reach}",
+        cfg.token_drop
     );
 }
 
@@ -698,7 +1249,9 @@ fn te_layer_50_tap_is_exhaustive_and_the_tail_is_trimmable() {
     assert_eq!(visual, TE_VISION_TENSORS);
     assert_eq!(lm + visual + 1, PUBLISHED_TE_TENSORS, "+1 for lm_head");
 
-    // 4. The trim arithmetic, in bytes, against the index's own declared total.
+    // 4. The trim arithmetic, in bytes, derived ENTIRELY from `cfg`'s dims and checked against a
+    //    literal. It does NOT read `metadata.total_size` from the index (66714780128 at snapshot
+    //    939557dc) — nothing here cross-checks the config against the published byte count.
     let hidden = cfg.hidden_size as u64;
     let inter = cfg.intermediate_size as u64;
     let vocab = cfg.vocab_size as u64;
@@ -828,9 +1381,11 @@ fn real_tokenizer_resolves_the_minimax_special_tokens() {
 /// Generate the reference with `tools/dump_minimax_h3_te_real.py` (~220 KB, deliberately not
 /// committed) and point `MINIMAX_H3_TE_REFERENCE` at it. **Run this in its own process**: the
 /// conditioner is ~62 GB on the Python side and does not release inside a process on MPS, and this
-/// side holds ~51.5 GB for layers 0-49. Asserts rather than skips, like everything else here.
+/// side maps shards 1-12 whole — **58.568 GB**, of which the tap's own parameters (`embed_tokens`
+/// plus layers 0-49) are 50.316 GB. Both figures are byte sums over the published shard headers at
+/// snapshot `939557dc`. Asserts rather than skips, like everything else here.
 #[test]
-#[ignore = "needs a real MiniMax-H3 snapshot + a reference context (MINIMAX_H3_TE_REFERENCE); ~52 GB resident"]
+#[ignore = "needs a real MiniMax-H3 snapshot + a reference context (MINIMAX_H3_TE_REFERENCE); maps 58.6 GB"]
 fn real_weight_te_context_matches_the_official_conditioner() {
     let root = snapshot();
     let reference_path = std::env::var("MINIMAX_H3_TE_REFERENCE").unwrap_or_default();
@@ -868,8 +1423,12 @@ fn real_weight_te_context_matches_the_official_conditioner() {
     let cfg = MiniMaxH3TeConfig::qwen3_vl_32b();
     assert_eq!(cfg.select_hidden, 50);
 
-    // Only the shards layers 0-49 need. `Weights::from_dir` would map all 14 (66.7 GB); the tap
-    // reads 51.5 GB of them and shards 12-14 serve only the never-executed tail.
+    // Shards 1-12, 58.568 GB, rather than `Weights::from_dir`'s all 14 (66.715 GB). The range
+    // mirrors production's `TE_SHARDS` (`1..=12`, `src/text_encoder/mod.rs`) rather than deriving a
+    // minimum: layers 0-49 and `embed_tokens` in fact fit in shards 1-11 (53.692 GB), and shard 12
+    // holds only layers 53-58. `from_file` panics on a missing shard, so this is what goes red if
+    // the manifest row that feeds it ever stops fetching one of the twelve. Shards 13-14 hold only
+    // the never-executed tail, plus — in 14 — the vision tower `t2va` does not use.
     let t0 = Instant::now();
     let mut w = Weights::empty();
     for i in 1..=12 {

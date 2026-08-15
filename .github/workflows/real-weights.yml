@@ -2808,20 +2808,34 @@ jobs:
   # early, so an unset snapshot fails at exit 101 instead of printing `ok` in 0.00 s — which is why
   # this was invisible: there was never a vacuous green to notice, just silence.
   #
-  # MEASURED ON nax-macos 2026-08-13, release profile, warm weights: all nine invocations below
-  # total ~3.0 s of test time (the five header/config gates ~0.1 s, the three decodes 0.74 + 0.35 +
-  # 0.11 s, the parity gate 0.30 s). MLX mmaps and materializes per tensor, so "load the 9.7 GB VAE"
-  # is 22 ms. The `timeout-minutes` below is therefore ENTIRELY cold build (5m36s for the mlx-gen
-  # tree measured here) plus a possible 11.640 GB first transfer — not test time.
+  # MEASURED ON nax-macos, release profile, warm weights. Re-measured 2026-08-15 for sc-19445 /
+  # sc-19438, which took this lane from nine invocations to TWELVE: all twelve total ~9.4 s of test
+  # time (the six header/config gates ~1.9 s, the three decodes 1.02 + 0.63 + 0.24 s, the VAE
+  # decode parity 0.88 s, the VAE ENCODE parity 1.40 s, the conditioner parity 3.28 s — all six
+  # figures are `cargo test` reported TEST time, not step wall clock). MLX mmaps and materializes
+  # per tensor, so "load the 9.7 GB VAE" is 22 ms. The `timeout-minutes` below is therefore
+  # ENTIRELY cold build (5m36s for the mlx-gen tree measured here) plus a possible **70.21 GB**
+  # first transfer — the 11.638 GB `minimax-h3` slice plus the 58.568 GB `minimax-h3-text-encoder`
+  # one — not test time. That transfer is why the budget is 150 minutes rather than 60.
+  #
+  # Both slice figures are byte sums over this pinned revision's own files, taken 2026-08-15
+  # (`vae/` 10.4156 + `audio_vae/` 0.6054 + `FL2VA/audio_vae/` 0.6055 + `tokenizer/` 0.0115 + the TE
+  # index; and shards 1-12 of `text_encoder/` at 4.932 + 11 x 4.876). An earlier revision of this
+  # block said 63.1 GB, which reused 51.5 GB — a RESIDENCY figure (66.715 minus the 15.209 GB
+  # trimmable tail) — as if it were a transfer figure. It is 7.1 GB short; do not reintroduce it.
   #
   # TIME IS NOT THE ONLY BUDGET, and this block recorded only the time one. The largest memory
-  # consumer here is the LAST step, not the decodes — but by half what this comment used to claim,
-  # and the reason it used to claim it was a dtype error worth stating plainly. MEASURED from the
-  # published safetensors headers (snapshot 939557dc): **`vae/` ships F32 — all 703 tensors, 0 of
-  # them bf16, 9.7002 GiB / 10.4155 GB.** So the sc-18740 parity gate's `Dtype::Float32` — carried
-  # deliberately, to keep the comparison about layout rather than about bf16 rounding — is a NO-OP
-  # CAST holding ~9.70 GiB, NOT the ~19.4 GB that a "9.7 GB bf16 `vae/` materialized at f32" reading
-  # produces; there is no doubling because there is no bf16 to double. The bf16 component in this
+  # consumer here is the LAST step — which since sc-19438 is the CONDITIONER parity, which maps
+  # shards 1-12 of the dense Qwen3-VL-32B text encoder WHOLE (58.568 GB; the layer-0-49 tap's own
+  # parameters are 50.316 GB of that), not the ~9.70 GiB VAE parity
+  # that used to hold that title and is now second. Both figures below are still worth stating
+  # plainly, because the reason the VAE one used to be overstated was a dtype error. MEASURED from
+  # the published safetensors headers (snapshot 939557dc): **`vae/` ships F32 — all 703 tensors, 0
+  # of them bf16, 9.7002 GiB / 10.4155 GB.** The sc-18740 decode parity gate and the sc-19445
+  # encode parity gate both build at `Dtype::Float32` — the same cast on the same component, in
+  # both cases carried deliberately to keep the comparison about layout rather than about bf16
+  # rounding. That is a NO-OP CAST holding ~9.70 GiB, NOT the ~19.4 GB that a "9.7 GB bf16 `vae/`
+  # materialized at f32" reading produces; there is no doubling because there is no bf16 to double. The bf16 component in this
   # checkpoint is `transformer/` (626 of 638 tensors BF16, 61.73 GiB / 66.28 GB), which this lane
   # does not load. The two video decode smokes cast the OTHER way — `Dtype::Bfloat16` downcasts that
   # same F32 component — so they materialize about half the parity gate, out of the same ~10 GB of
@@ -2839,15 +2853,29 @@ jobs:
   #
   # `rw-mage` rather than a new label: a label no runner carries does not fail, it queues silently
   # until the run is cancelled (see this file's header), and `rw-mage` is registered on BOTH Macs.
-  # The 11.640 GB `minimax-h3` slice self-heals from the Hub on either box. The diffusers VAE
-  # reference does NOT — see the step that requires it.
+  # The 11.638 GB `minimax-h3` slice and the 58.568 GB `minimax-h3-text-encoder` one both self-heal
+  # from the Hub on either box. The three diffusers/conditioner reference artifacts do NOT — see
+  # the steps that require them.
   mlx-minimax-h3:
     name: MLX MiniMax-H3 real weights
-    # Selectable on its own so the 11.6 GB fetch does not require running the Mage-oracle job that
+    # Selectable on its own so the 70.21 GB fetch does not require running the Mage-oracle job that
     # shares the `media` profile — the same split `krea-realtime` gets, for the same reason.
     if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'media' || inputs.profile == 'minimax-h3'
     runs-on: [self-hosted, macOS, ARM64, rw-mage]
-    timeout-minutes: 60
+    # 60 -> 150 (sc-19438). The 60 was sized for an 11.638 GB first transfer plus nine gates; this
+    # lane now also materializes the 58.568 GB text-encoder row and runs two more, one of which maps
+    # twelve shards and forwards 50 layers. A COLD first run on the second Mac is the case this has
+    # to cover, and the transfer dominates it — the twelve gates together are ~9.4 s of test time
+    # (header block above) against 70.21 GB of bytes.
+    #
+    # 150 RE-CHECKED against 70.21 GB rather than the 63.1 GB it was first sized on: 150 minus the
+    # 5m36s measured cold build leaves ~144 min for the fetch, i.e. the lane survives any sustained
+    # Hub throughput above ~8.1 MB/s. The correction moved that required floor from ~7.3 to
+    # ~8.1 MB/s — an 11% tightening of a bound that was never close — which is why the number
+    # stands rather than rising. No cold fetch has ever been timed on either Mac, so that floor is
+    # the whole justification; if this lane does time out, record the first run's actual transfer
+    # rate here rather than reflex-bumping the budget.
+    timeout-minutes: 150
     env:
       # The snapshot ROOT — the directory holding `vae/`, not `vae/` itself. Every test in the family
       # joins its own component onto this (`vae/`, `audio_vae/`, `FL2VA/audio_vae/`, `tokenizer/`,
@@ -2860,16 +2888,49 @@ jobs:
       # deliberately refuses to regenerate it in Actions (that would need a pinned torch+diffusers
       # environment, and none of the four approved wheel locks is one), and it cannot self-heal.
       MINIMAX_H3_VIDEO_VAE_REFERENCE: ${{ vars.MINIMAX_H3_VIDEO_VAE_REFERENCE }}
+      # sc-19445 — the ENCODE half's equivalent: the `(pixels, posterior mean, posterior std)`
+      # triples `crates/media/mlx-gen/tools/dump_minimax_h3_video_vae_encode_real.py` writes from
+      # the same official class over the same `vae/`. ~5.7 MB. Same class, same provenance rule and
+      # the same inability to self-heal as the decode reference above; it is a SECOND artifact
+      # because the encode half is the half `load_decode_only` never selects, and it carried no
+      # real-weight gate at all between sc-17148 and sc-19445.
+      MINIMAX_H3_VIDEO_VAE_ENCODE_REFERENCE: ${{ vars.MINIMAX_H3_VIDEO_VAE_ENCODE_REFERENCE }}
+      # sc-19438 — the ~226 KB `(input_ids, context)` pair
+      # `crates/media/mlx-gen/tools/dump_minimax_h3_te_real.py` writes by running the OFFICIAL
+      # conditioner (`Qwen3VLForConditionalGeneration`, `hidden_states[50]`, `add_special_tokens=False`
+      # and no chat template) over the real `text_encoder/`.
+      #
+      # Produced against the DENSE published component, never against sc-19120's packed tier. The
+      # packed tier is this repository's own repack, so a golden built from it would share the
+      # repack's layout and could only prove the two agree with each other — layout.rs Rule 3, and
+      # the exact mechanism by which sc-18740 shipped green.
+      #
+      # THE PACKED TIER IS THEREFORE NOT COVERED BY ANY WORKFLOW. The chain that would cover it
+      # exists in source — `te_tier_real_weights.rs`'s `the_packed_context_tracks_the_dense_one`
+      # pins packed against dense, and the gate at the end of this job pins dense against the
+      # official conditioner — but the first link is executed by NO job in this file, so packed is
+      # covered only when someone runs it by hand. Wiring it needs the `minimax-h3-mlx-*` tier rows
+      # materialized on this runner, which this lane does not do.
+      MINIMAX_H3_TE_REFERENCE: ${{ vars.MINIMAX_H3_TE_REFERENCE }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       # Repository variables hold ONE value for every runner in a label pool, but the two
       # macOS boxes do not share a home directory. A `~/`-relative value is resolved here
       # against the home of whichever runner actually claimed this job; absolute values
       # pass through untouched, so variables can be flipped one at a time.
+      #
+      # THIS IS ALSO THE ANSWER FOR THE THREE OPERATOR ARTIFACTS, not just for the snapshot.
+      # `rw-mage` is registered on BOTH `nax-macos` and `nax-macos-2`, whose homes are
+      # `/Users/michael` and `/Users/MTrefry`, and `runs-on` label matching deliberately does not
+      # say which box claims a job — so a baked absolute `/Users/michael/...` value reds whichever
+      # box did not. Set each of the three artifact variables to a `~/`-relative value and place a
+      # copy at that location on both boxes. The require steps below still see an absolute path,
+      # because this step has already expanded it.
       - name: Resolve runner-local snapshot paths
         run: >-
           python3.12 scripts/release/resolve_snapshot_paths.py
           MINIMAX_H3_SNAPSHOT MINIMAX_H3_VIDEO_VAE_REFERENCE
+          MINIMAX_H3_VIDEO_VAE_ENCODE_REFERENCE MINIMAX_H3_TE_REFERENCE
       - name: Toolchain versions
         run: rustc --version && cargo --version
       # An unset repo variable would otherwise reach `ensure_model_snapshot.py` as an empty path and
@@ -2895,6 +2956,7 @@ jobs:
         run: >-
           scripts/ci/report_runner_disk_headroom.sh
           MINIMAX_H3_SNAPSHOT MINIMAX_H3_VIDEO_VAE_REFERENCE
+          MINIMAX_H3_VIDEO_VAE_ENCODE_REFERENCE MINIMAX_H3_TE_REFERENCE
       # Report-only, and it exists to RETIRE an unmeasured constant rather than leave it as a human
       # errand — the same job `Record the CUDA device inventory` does for the Windows lane below,
       # in the shape that step uses: a presence guard, `continue-on-error: true`, and no assertion
@@ -2937,13 +2999,23 @@ jobs:
               print("metal.recommendedMaxWorkingSetSize=<not captured — no default Metal device>")
           }
           SWIFT
-      # Fetches the 11.640 GB `download_files` slice of the 196 GB repository, never the whole thing;
+      # Fetches the 11.638 GB `download_files` slice of the 196 GB repository, never the whole thing;
       # see the `minimax-h3` row in release/real-weight-models.toml for the per-component breakdown
       # and for which two components are deliberately left out.
       - name: Materialize and verify immutable snapshot
         run: |
           python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model minimax-h3 --snapshot "$MINIMAX_H3_SNAPSHOT"
+      # sc-19438 — a SECOND key against the same repository, revision and directory, carrying the
+      # twelve shards production's `TE_SHARDS` maps (58.568 GB of the 66.715 GB component; the
+      # layer-50 tap itself only reaches into the first eleven). It is a separate row precisely so
+      # the Windows CUDA lane, which materializes `minimax-h3` by key and reads none of this, does
+      # not pay for it. See its note in release/real-weight-models.toml for why twelve rather than
+      # fourteen, and for the test that panics if any of the twelve is missing.
+      - name: Materialize and verify the text-encoder shards the layer-50 tap reads
+        run: >-
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py
+          --model minimax-h3-text-encoder --snapshot "$MINIMAX_H3_SNAPSHOT"
       # Name-selected with `--exact` AFTER the `--` plus a run-count assertion, never `--ignored` as a
       # blanket. `--exact` before the `--` is REJECTED by cargo, which reports the rejection as exit 0;
       # and with the flag accepted but no count assertion a rename yields "0 passed; N filtered out"
@@ -2964,6 +3036,12 @@ jobs:
             fi
           }
           run_one declared_tensor_names_match_the_published_checkpoint
+          # sc-19445. The key-set proof above cannot see a tensor read at the wrong LEVEL: the
+          # shipped encoder is six levels of 128..1024 with downsamplers on 0-3 only and residual
+          # projections on 1/3/5 only, and the committed fixture is a four-level 32-channel toy
+          # whose spatial and temporal factor lists are the SAME list. This derives every one of
+          # the 118 encode shapes from the config and judges them against the published headers.
+          run_one declared_encoder_shapes_match_the_published_checkpoint
           run_one declared_audio_tensor_names_match_the_published_checkpoint
           run_one published_audio_configs_reproduce_the_declared_geometry
           run_one te_layer_50_tap_is_exhaustive_and_the_tail_is_trimmable
@@ -2994,7 +3072,7 @@ jobs:
       # WHY NOT THE te/dit ARMS. `--test staged_residency`'s `a_bounded_slab_handoff_leaves_nothing_
       # behind` and `a_held_component_trips_both_handoff_gates` are cheap in MEMORY (60 tensors each)
       # and not in DISK: `Weights::from_dir` opens the whole component directory, and this row's
-      # `download_files` is a deliberate 11.640 GB slice carrying NO `transformer/` shards and NO
+      # `download_files` is a deliberate 11.638 GB slice carrying NO `transformer/` shards and NO
       # `text_encoder/` shards (only the TE index). They would fail at `from_dir`, before reaching a
       # gate. Provisioning them is +124 GB on both Macs and is a separate decision.
       #
@@ -3061,6 +3139,81 @@ jobs:
         run: |
           set -o pipefail
           name=real_weight_decode_matches_the_official_diffusers_vae
+          out="$(cargo test --locked --release -p mlx-gen-minimax-h3 --test real_weights \
+            "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+          if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
+            echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
+            exit 1
+          fi
+      # sc-19445 — the ENCODE half's layout gate, and the same fail-closed shape as the decode one
+      # above for the same reason: it needs an artifact this workflow cannot produce, so it must be
+      # possible to tell "the operator has not staged the file" from "the port is wrong".
+      #
+      #   MINIMAX_H3_SNAPSHOT=<root> python3 crates/media/mlx-gen/tools/dump_minimax_h3_video_vae_encode_real.py \
+      #     --out ~/minimax-h3-real-vae-encode-reference.safetensors
+      #
+      # then set the repository variable to `~/minimax-h3-real-vae-encode-reference.safetensors`
+      # and place a copy at that path on BOTH `rw-mage` boxes (see the resolve step's note).
+      - name: Require the operator-provisioned diffusers VAE ENCODE reference
+        run: |
+          if [[ -z "$MINIMAX_H3_VIDEO_VAE_ENCODE_REFERENCE" ]]; then
+            echo "Repository variable MINIMAX_H3_VIDEO_VAE_ENCODE_REFERENCE is unset; the sc-19445 encoder level-indexing gate cannot run and this lane refuses to report green without it" >&2
+            exit 1
+          fi
+          if [[ "$MINIMAX_H3_VIDEO_VAE_ENCODE_REFERENCE" != /* ]]; then
+            echo "MINIMAX_H3_VIDEO_VAE_ENCODE_REFERENCE must be an absolute path, got: $MINIMAX_H3_VIDEO_VAE_ENCODE_REFERENCE" >&2
+            exit 1
+          fi
+          if [[ ! -s "$MINIMAX_H3_VIDEO_VAE_ENCODE_REFERENCE" ]]; then
+            echo "MINIMAX_H3_VIDEO_VAE_ENCODE_REFERENCE names no non-empty file on this runner: $MINIMAX_H3_VIDEO_VAE_ENCODE_REFERENCE" >&2
+            exit 1
+          fi
+      # Loads the full 703-tensor `vae/` at f32 (~9.70 GiB — the component ships all-F32, so f32 is
+      # a no-op cast) and encodes the three probes the reference carries. Gated on relative
+      # max-abs-diff against a measured 1.789e-3 floor; the cosine and the two norms it prints
+      # beside that are deliberately NOT asserted on.
+      - name: Run MiniMax-H3 video VAE ENCODE parity against official diffusers
+        run: |
+          set -o pipefail
+          name=real_weight_encode_matches_the_official_diffusers_vae
+          out="$(cargo test --locked --release -p mlx-gen-minimax-h3 --test real_weights \
+            "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+          if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
+            echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
+            exit 1
+          fi
+      # sc-19438 — the conditioner gate. LAST, and it is this lane's true memory peak: ~52 GB
+      # resident for layers 0-49 of the dense Qwen3-VL-32B text encoder, against the ~9.70 GiB of
+      # the VAE steps above.
+      #
+      #   MINIMAX_H3_SNAPSHOT=<root> python3 crates/media/mlx-gen/tools/dump_minimax_h3_te_real.py \
+      #     --out ~/minimax-h3-real-te-reference.safetensors
+      #
+      # Run that on its own: the conditioner is ~62 GB on the torch side and does NOT release
+      # inside a process on MPS. The artifact itself is ~226 KB. Set the repository variable to
+      # `~/minimax-h3-real-te-reference.safetensors` and place a copy on both `rw-mage` boxes.
+      - name: Require the operator-provisioned conditioner reference
+        run: |
+          if [[ -z "$MINIMAX_H3_TE_REFERENCE" ]]; then
+            echo "Repository variable MINIMAX_H3_TE_REFERENCE is unset; the sc-18741 conditioner gate cannot run and this lane refuses to report green without it" >&2
+            exit 1
+          fi
+          if [[ "$MINIMAX_H3_TE_REFERENCE" != /* ]]; then
+            echo "MINIMAX_H3_TE_REFERENCE must be an absolute path, got: $MINIMAX_H3_TE_REFERENCE" >&2
+            exit 1
+          fi
+          if [[ ! -s "$MINIMAX_H3_TE_REFERENCE" ]]; then
+            echo "MINIMAX_H3_TE_REFERENCE names no non-empty file on this runner: $MINIMAX_H3_TE_REFERENCE" >&2
+            exit 1
+          fi
+      # Its own `cargo test` process, which is the point: the 58.568 GB of text-encoder shards this
+      # maps (shards 1-12 in full; the tap's own parameters are 50.316 GB of that) must not be
+      # resident alongside anything else, and a per-step process is what guarantees the previous
+      # step's VAE has been reaped.
+      - name: Run MiniMax-H3 conditioner parity against the official text encoder
+        run: |
+          set -o pipefail
+          name=real_weight_te_context_matches_the_official_conditioner
           out="$(cargo test --locked --release -p mlx-gen-minimax-h3 --test real_weights \
             "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
           if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
@@ -5637,7 +5790,7 @@ jobs:
           python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt
           set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
           rem MiniMaxAI/MiniMax-H3 is a ~196 GB repo; the `minimax-h3` row carries a `download_files`
-          rem allow-list so only the 11.640 GB the tests below read is fetched.
+          rem allow-list so only the 11.638 GB the tests below read is fetched.
           python scripts/release/ensure_model_snapshot.py --model minimax-h3 --snapshot "%MINIMAX_H3_SNAPSHOT%" || exit /b 1
           rem sc-19558 — the DiT component, on its OWN key so the shared row above stays 11.640 GB
           rem for every lane that does not read it. 132.6 GB for both partitions on a cold box;
