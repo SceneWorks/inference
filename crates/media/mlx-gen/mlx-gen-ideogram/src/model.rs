@@ -81,6 +81,9 @@ pub fn descriptor() -> ModelDescriptor {
             min_size: RES_MIN,
             max_size: RES_MAX,
             max_count: MAX_COUNT,
+            // Not a distilled fixed-schedule model: any step count the shared sanity caps
+            // admit is renderable (sc-19502).
+            supported_steps: Vec::new(),
             mac_only: true,
             // Load-time Q4/Q8 over the whole model (both DiTs + TE + VAE), sc-5989. Q8 default is
             // the worker's call; Q4 roughly halves the ~27 GB Q8 weights for smaller Macs.

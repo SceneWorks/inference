@@ -242,6 +242,9 @@ impl Sd3Variant {
                 min_size: 256,
                 max_size: 1440,
                 max_count: 8,
+                // Not a distilled fixed-schedule model: any step count the shared sanity caps
+                // admit is renderable (sc-19502).
+                supported_steps: Vec::new(),
                 mac_only: true,
                 supports_kv_cache: false,
                 // SD3.5 uses a STATIC flow-match shift of 3.0 (FlowMatchEulerDiscreteScheduler

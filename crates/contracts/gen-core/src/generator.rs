@@ -1833,6 +1833,38 @@ pub struct Capabilities {
     pub min_size: u32,
     pub max_size: u32,
     pub max_count: u32,
+    /// The **only** denoise step counts this model can render, or empty for "any count the sanity
+    /// caps admit" (sc-19502).
+    ///
+    /// ⚠️ **Opposite polarity to [`samplers`](Self::samplers) / [`audio_voices`](Self::audio_voices),
+    /// deliberately.** For those, empty means "no selectable surface, reject any explicit value".
+    /// Here empty means **no constraint** — every model that leaves it unset accepts whatever the
+    /// sanity caps admit, exactly as before this field existed. Inverting it would make a bare
+    /// `Default::default()` refuse every step count in the repo. A model opts *in* to being
+    /// constrained, it does not opt out.
+    ///
+    /// Non-empty ⇒ an explicit `req.steps` outside the set is rejected by the shared floor. `None`
+    /// on the request always passes: that is "use the model's baked default", not a step count
+    /// anyone chose.
+    ///
+    /// # Why this is on `Capabilities` rather than in each provider's `validate`
+    ///
+    /// Distilled models bake their σ waypoints into training, so the step count is not a knob at
+    /// all — LTX-2.3 runs a fixed 8-step stage-1 schedule (`STAGE1_SIGMAS`, 9 waypoints) and
+    /// cannot honor any other count without going out-of-distribution. That constraint was
+    /// previously written as an ad-hoc `if` inside ONE lane's `validate`, which produced the exact
+    /// failure this field exists to prevent: `candle-gen-ltx` rejected `steps: 30` while
+    /// `mlx-gen-ltx` never read `req.steps` at all and silently rendered its baked 8-step schedule
+    /// anyway. Same model, same manifest entry, two behaviours, and the silent lane is the worse
+    /// one — a user-facing control that quietly does nothing (the sc-11993 silent-coercion class).
+    ///
+    /// Hanging it on the advertised surface fixes both halves at once: the two lanes now share ONE
+    /// enforcement site instead of two hand-maintained copies that already drifted, and a
+    /// weights-free consumer holding a `Capabilities` can finally discover the constraint by
+    /// inspection rather than by dispatching a job and reading the failure — the same
+    /// discoverability argument [`size_floor`](Self::size_floor) makes for the size axis.
+    ///
+    pub supported_steps: Vec<u32>,
     pub mac_only: bool,
     /// How this model's size range is enforced — and therefore whether
     /// `min_size`/`max_size` are a bound a caller may rely on, plus any explicit-size grid the
@@ -2145,6 +2177,43 @@ impl Capabilities {
                 return Err(Error::Msg(format!(
                     "{id}: steps {steps} exceeds the sanity cap {MAX_STEPS}"
                 )));
+            }
+        }
+        // The advertised exact-step surface (sc-19502). Distinct from the sanity cap above: that one
+        // is a footgun guard every model shares, this one is a per-model declaration that the step
+        // count is not a knob at all. Empty ⇒ unconstrained, so this is inert for every model that
+        // does not opt in (see `Capabilities::supported_steps` for why the polarity is inverted
+        // relative to `samplers`).
+        //
+        // **Reject, never snap to the nearest legal count.** Quietly rewriting `steps: 30` to 8
+        // would deliver a render the caller did not ask for with no error and no signal — the
+        // silent-coercion class — and it is the precise defect this replaces: `mlx-gen-ltx` used to
+        // ignore `req.steps` outright and render its baked schedule regardless.
+        //
+        // Only an EXPLICIT count is judged. `None` means "the model picks", so there is nothing to
+        // refuse; that is what keeps the common path (omit `steps`, get the baked schedule) working
+        // and is why a distilled model is still usable without the caller knowing its magic number.
+        if !self.supported_steps.is_empty() {
+            if let Some(steps) = req.steps {
+                if !self.supported_steps.contains(&steps) {
+                    // Singular reads as the original per-provider message it replaces ("a fixed
+                    // 8-step schedule"), because one legal count is the case that actually ships;
+                    // the plural arm keeps the set readable rather than emitting "count(s)".
+                    let schedule = match self.supported_steps.as_slice() {
+                        [only] => format!("a fixed {only}-step schedule"),
+                        many => format!(
+                            "a fixed schedule ({} steps only)",
+                            many.iter()
+                                .map(u32::to_string)
+                                .collect::<Vec<_>>()
+                                .join(" or ")
+                        ),
+                    };
+                    return Err(Error::Msg(format!(
+                        "{id}: this distilled model runs {schedule} and cannot honor \
+                         steps={steps}; omit `steps` to use the baked schedule."
+                    )));
+                }
             }
         }
         if let Some(frames) = req.frames {
@@ -3282,6 +3351,108 @@ mod tests {
                 }
             )
             .is_ok());
+    }
+
+    /// sc-19502 — the exact-step surface refuses an off-schedule count, admits every count it
+    /// advertises, and admits `None`.
+    ///
+    /// The `None` half is the load-bearing one: it is what keeps "omit `steps`, get the baked
+    /// schedule" working, and inverting it would break every caller of a distilled model who does
+    /// not know its magic number.
+    #[test]
+    fn advertised_supported_steps_reject_every_off_schedule_count() {
+        let distilled = Capabilities {
+            supported_steps: vec![8],
+            ..caps()
+        };
+        let at = |steps: Option<u32>| {
+            distilled.validate_request(
+                "ltx_2_3",
+                &GenerationRequest {
+                    steps,
+                    ..base_req()
+                },
+            )
+        };
+
+        // Admitted: the advertised count, and "the model picks".
+        assert!(at(Some(8)).is_ok(), "the advertised count must be admitted");
+        assert!(
+            at(None).is_ok(),
+            "an omitted count must use the baked schedule, not be refused"
+        );
+
+        // Refused on BOTH sides of the advertised value — a floor-shaped guard would let 30 through,
+        // which is the precise half `limits.hardMinSteps` could not express (sc-19426).
+        for steps in [1, 4, 7, 9, 30] {
+            let err = at(Some(steps)).unwrap_err().to_string();
+            assert!(
+                err.contains("ltx_2_3")
+                    && err.contains(&format!("steps={steps}"))
+                    && err.contains("8"),
+                "the refusal must name the model, the request and the legal value: {err}"
+            );
+        }
+    }
+
+    /// sc-19502 — the polarity guard. Empty `supported_steps` is NO constraint, so every descriptor
+    /// that never opts in is byte-identical to before the field existed.
+    ///
+    /// Deliberately its own test rather than an assertion inside the one above: this is the
+    /// property that makes the field safe to add to a 128-descriptor repo, and if it regressed, a
+    /// bare `Default::default()` would refuse every step count in the workspace.
+    #[test]
+    fn an_unconstrained_model_admits_every_step_count_the_sanity_caps_admit() {
+        let c = caps();
+        assert!(
+            c.supported_steps.is_empty(),
+            "the default must be unconstrained"
+        );
+        for steps in [1, 2, 8, 30, MAX_STEPS] {
+            assert!(
+                c.validate_request(
+                    "m",
+                    &GenerationRequest {
+                        steps: Some(steps),
+                        ..base_req()
+                    }
+                )
+                .is_ok(),
+                "an undeclared model must still admit {steps} steps"
+            );
+        }
+    }
+
+    /// sc-19502 — a multi-value schedule is a SET, not a range: the gap between two advertised
+    /// counts is refused.
+    ///
+    /// Pins the shape choice. A future distilled model with two baked schedules can declare both
+    /// without the guard degrading into "anything between the smallest and largest".
+    #[test]
+    fn supported_steps_is_a_set_not_a_range() {
+        let two_schedules = Capabilities {
+            supported_steps: vec![4, 8],
+            ..caps()
+        };
+        let at = |steps: u32| {
+            two_schedules.validate_request(
+                "m",
+                &GenerationRequest {
+                    steps: Some(steps),
+                    ..base_req()
+                },
+            )
+        };
+        assert!(at(4).is_ok());
+        assert!(at(8).is_ok());
+        let gap = at(6)
+            .expect_err("6 sits between the two schedules and belongs to neither")
+            .to_string();
+        // The plural arm names every legal count, so the caller can pick one rather than guess.
+        assert!(
+            gap.contains("4 or 8") && gap.contains("steps=6"),
+            "the multi-schedule refusal must list the legal counts: {gap}"
+        );
     }
 
     #[test]
