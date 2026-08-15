@@ -564,6 +564,134 @@ mod tests {
     }
 
     #[test]
+    fn flux1_providers_publish_exact_declared_strategy_surfaces() {
+        use mlx_gen::gen_core::{LoadShape, MemoryStrategy, MemoryStrategySupport, OffloadPolicy};
+
+        let registry = super::provider_registry().unwrap();
+        let surfaces = registry.memory_contract_surfaces().unwrap();
+        for provider_id in ["flux1_schnell", "flux1_dev", "flux1_dev_control"] {
+            let provider: Vec<_> = surfaces
+                .iter()
+                .filter(|surface| surface.contract.provider_id == provider_id)
+                .collect();
+            assert_eq!(provider.len(), 12, "{provider_id}");
+
+            let count = |strategy| {
+                provider
+                    .iter()
+                    .filter(|surface| {
+                        surface
+                            .contract
+                            .capability(strategy)
+                            .expect("complete FLUX.1 ladder")
+                            .support
+                            == MemoryStrategySupport::Implemented
+                    })
+                    .count()
+            };
+            assert_eq!(count(MemoryStrategy::Resident), 12, "{provider_id}");
+            assert_eq!(count(MemoryStrategy::StagedResidency), 6, "{provider_id}");
+            let clean_base = provider_id != "flux1_dev_control";
+            assert_eq!(
+                count(MemoryStrategy::BoundedDecode),
+                if clean_base { 12 } else { 0 },
+                "{provider_id}"
+            );
+            assert_eq!(
+                count(MemoryStrategy::BoundedAttention),
+                if clean_base { 12 } else { 0 },
+                "{provider_id}"
+            );
+            assert_eq!(
+                count(MemoryStrategy::BoundedTransformerResidency),
+                if clean_base { 3 } else { 0 },
+                "{provider_id}"
+            );
+            assert!(provider.iter().all(|surface| {
+                !surface.composed
+                    && surface.contract.asset_facts == Default::default()
+                    && surface
+                        .contract
+                        .calibration
+                        .as_ref()
+                        .is_some_and(|identity| {
+                            identity.fingerprint.starts_with(
+                                mlx_gen_flux::memory_strategy::STATIC_BEHAVIOR_FINGERPRINT,
+                            )
+                        })
+            }));
+            assert!(provider.iter().all(|surface| {
+                let btr = surface
+                    .contract
+                    .capability(MemoryStrategy::BoundedTransformerResidency)
+                    .unwrap();
+                btr.support != MemoryStrategySupport::Implemented
+                    || (surface.selector.offload_policy == OffloadPolicy::Sequential
+                        && surface.selector.load_shape == LoadShape::DeferredMaterialization)
+            }));
+        }
+    }
+
+    #[test]
+    fn flux1_behavior_inventory_is_single_phase_and_executable() {
+        use mlx_gen::gen_core::{
+            LoadShape, MemoryContractSurfaceTier, MemoryMode, MemoryStrategy, OffloadPolicy,
+        };
+
+        let registry = super::provider_registry().unwrap();
+        let surfaces = registry.memory_contract_surfaces().unwrap();
+        for provider_id in ["flux1_schnell", "flux1_dev", "flux1_dev_control"] {
+            let surface = surfaces
+                .iter()
+                .find(|surface| {
+                    surface.contract.provider_id == provider_id
+                        && surface.resolved_artifact_tier() == MemoryContractSurfaceTier::Q4
+                        && surface.selector.offload_policy == OffloadPolicy::Sequential
+                        && surface.selector.load_shape == LoadShape::DeferredMaterialization
+                })
+                .unwrap_or_else(|| panic!("{provider_id} missing q4 sequential deferred surface"));
+            let strategy = if provider_id == "flux1_dev_control" {
+                MemoryStrategy::StagedResidency
+            } else {
+                MemoryStrategy::BoundedTransformerResidency
+            };
+            let behavior = registry
+                .memory_behavior_registrations()
+                .find(|registration| registration.provider_id == provider_id)
+                .unwrap();
+            let fixtures =
+                (behavior.valid_fixtures)(&surface.spec, &surface.contract, strategy).unwrap();
+            assert_eq!(fixtures.len(), 1, "{provider_id}");
+            let fixture = &fixtures[0];
+            assert!(!fixture.context.has_phases, "{provider_id}");
+            assert!(fixture.request.phases.is_none(), "{provider_id}");
+            assert!(!fixture.context.use_pid, "{provider_id}");
+            assert!(!fixture.request.use_pid, "{provider_id}");
+            if provider_id == "flux1_dev_control" {
+                assert_eq!(fixture.context.mode, MemoryMode::ImageToImage);
+                assert_eq!(fixture.context.geometry.reference_count, 1);
+                assert_eq!(fixture.context.overlay.as_deref(), Some("control"));
+                assert!(matches!(
+                    fixture.request.conditioning.as_slice(),
+                    [mlx_gen::Conditioning::Control { .. }]
+                ));
+            } else {
+                assert_eq!(fixture.context.mode, MemoryMode::TextToImage);
+                assert_eq!(fixture.context.geometry.reference_count, 0);
+                assert_eq!(fixture.context.overlay, None);
+                assert!(fixture.request.conditioning.is_empty());
+            }
+            let mut scope =
+                (behavior.begin_request)(&surface.spec, &surface.contract, &fixture.context)
+                    .unwrap()
+                    .expect("implemented FLUX.1 strategy must open a request scope");
+            let mut request = fixture.request.clone();
+            scope.configure_request(&mut request).unwrap();
+            assert!(request.memory.is_some(), "{provider_id}");
+        }
+    }
+
+    #[test]
     fn flux2_klein_behavior_inventory_is_exact_single_phase_and_executable() {
         use mlx_gen::gen_core::{
             LoadShape, MemoryContractSurfaceTier, MemoryMode, MemoryStrategy, OffloadPolicy,

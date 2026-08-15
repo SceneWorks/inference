@@ -141,6 +141,9 @@ pub(crate) struct FluxControlHeavyOwned {
 pub struct Flux1DevControl {
     descriptor: ModelDescriptor,
     residency: Residency<FluxTextOwned, FluxControlHeavyOwned>,
+    /// Loaded contract and exact axes used by the registered request-scope lifecycle.
+    memory_strategy: gen_core::MemoryProviderContract,
+    loaded_spec: LoadSpec,
 }
 
 /// FLUX.1-dev Fun-Controlnet-Union (sc-8238): load the dev snapshot + the Shakker control checkpoint and
@@ -169,6 +172,8 @@ pub fn load_dev_control(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         FLUX1_DEV_CONTROL_ID,
         "FLUX.1-dev-ControlNet-Union-Pro-2.0",
     )?;
+    let memory_strategy =
+        crate::memory_strategy::memory_strategy_contract(FLUX1_DEV_CONTROL_ID, spec)?;
     // F-181: a `Sequential` + `spec.quantize` load over a dense snapshot re-quantizes every generate.
     if let Some(q) = spec.quantize {
         if matches!(spec.offload_policy, OffloadPolicy::Sequential) {
@@ -179,6 +184,8 @@ pub fn load_dev_control(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     Ok(Box::new(Flux1DevControl {
         descriptor: descriptor_dev_control(),
         residency: build_control_residency(spec)?,
+        memory_strategy,
+        loaded_spec: spec.clone(),
     }))
 }
 
@@ -452,6 +459,29 @@ impl Generator for Flux1DevControl {
     ) -> gen_core::Result<GenerationOutput> {
         self.generate_impl(req, on_progress).map_err(Into::into)
     }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        Some(&self.memory_strategy)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        crate::memory_strategy::safety_check(&self.loaded_spec, &self.memory_strategy, context)
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        crate::memory_strategy::begin_request(
+            FLUX1_DEV_CONTROL_ID,
+            &self.loaded_spec,
+            &self.memory_strategy,
+            context,
+        )
+    }
 }
 
 // Explicit registration lets the platform catalog resolve `flux1_dev_control` by id. The
@@ -489,6 +519,60 @@ pub const DEV_CONTROL_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
 mod tests {
     use super::*;
     use mlx_gen::WeightsSource;
+
+    #[test]
+    fn loaded_control_generator_exposes_and_executes_its_registered_scope() {
+        let spec = missing_snapshot_spec(OffloadPolicy::Sequential);
+        let model = load_dev_control(&spec)
+            .expect("Sequential load must construct the loaded control generator");
+        let contract = model
+            .memory_strategy_contract()
+            .expect("loaded control generator must expose its exact contract");
+        let fixture_contract = crate::memory_strategy::weights_free_memory_strategy_contract(
+            FLUX1_DEV_CONTROL_ID,
+            &spec,
+        )
+        .unwrap();
+        let mut fixture = crate::memory_strategy::registered_valid_fixture(
+            &spec,
+            &fixture_contract,
+            gen_core::MemoryStrategy::StagedResidency,
+        )
+        .unwrap()
+        .remove(0);
+        assert_eq!(contract.provider_id, FLUX1_DEV_CONTROL_ID);
+        fixture.context.optimization_authority = gen_core::MemoryOptimizationAuthority::Estimated;
+        assert_eq!(
+            model.memory_strategy_safety_check(&fixture.context),
+            gen_core::MemorySafetyDecision::Accept
+        );
+        let mut scope = model
+            .begin_memory_strategy_request(&fixture.context)
+            .unwrap()
+            .expect("loaded control generator must open its registered request scope");
+        scope.configure_request(&mut fixture.request).unwrap();
+        assert!(fixture.request.memory.unwrap().stage_residency);
+
+        let mut pid_context = fixture.context;
+        pid_context.use_pid = true;
+        assert!(matches!(
+            model.memory_strategy_safety_check(&pid_context),
+            gen_core::MemorySafetyDecision::Reject { .. }
+        ));
+        assert!(model.begin_memory_strategy_request(&pid_context).is_err());
+    }
+
+    #[test]
+    fn production_control_load_rejects_the_same_unsupported_components_as_registry_admission() {
+        let mut spec = missing_snapshot_spec(OffloadPolicy::Sequential);
+        spec.extra_controls.push(WeightsSource::File(
+            "/nonexistent/extra-control.safetensors".into(),
+        ));
+        assert!(
+            crate::memory_strategy::memory_strategy_contract(FLUX1_DEV_CONTROL_ID, &spec).is_err()
+        );
+        assert!(load_dev_control(&spec).is_err());
+    }
 
     #[test]
     fn descriptor_is_flux1_dev_control() {

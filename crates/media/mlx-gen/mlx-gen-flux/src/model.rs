@@ -101,11 +101,12 @@ pub fn load_flux1(variant: FluxVariant, spec: &LoadSpec) -> Result<Flux1> {
         None => None,
     };
 
-    let memory_strategy = crate::memory_strategy::memory_strategy_contract_with_inventory(
-        variant.id(),
-        spec,
-        stream_inventory.as_ref(),
-    )?;
+    let memory_strategy =
+        crate::memory_strategy::validated_memory_strategy_contract_with_inventory(
+            variant.id(),
+            spec,
+            stream_inventory.as_ref(),
+        )?;
     let residency = build_residency(variant, spec, stream_inventory.clone())?;
     Ok(Flux1 {
         descriptor: descriptor_for(variant),
@@ -1125,6 +1126,66 @@ mod tests {
     use super::*;
     use crate::config::{FLUX1_DEV_ID, FLUX1_SCHNELL_ID};
     use std::cell::Cell;
+
+    #[test]
+    fn loaded_generator_accepts_native_and_pid_requests_when_pid_is_available() {
+        let spec = LoadSpec::new(WeightsSource::Dir(
+            "/nonexistent/flux1-loaded-pid-contract".into(),
+        ))
+        .with_offload_policy(OffloadPolicy::Sequential)
+        .with_pid(
+            WeightsSource::File("/nonexistent/pid.safetensors".into()),
+            WeightsSource::Dir("/nonexistent/gemma".into()),
+        );
+        let model = load_flux1(FluxVariant::Dev, &spec)
+            .expect("Sequential load must construct the loaded generator without touching weights");
+        let contract = model
+            .memory_strategy_contract()
+            .expect("loaded generator must expose its exact contract");
+        let fixture_contract =
+            crate::memory_strategy::weights_free_memory_strategy_contract(FLUX1_DEV_ID, &spec)
+                .unwrap();
+        let fixture = crate::memory_strategy::registered_valid_fixture(
+            &spec,
+            &fixture_contract,
+            gen_core::MemoryStrategy::StagedResidency,
+        )
+        .unwrap()
+        .remove(0);
+        assert_eq!(contract.provider_id, FLUX1_DEV_ID);
+
+        for use_pid in [false, true] {
+            let mut context = fixture.context.clone();
+            context.use_pid = use_pid;
+            context.optimization_authority = gen_core::MemoryOptimizationAuthority::Estimated;
+            assert_eq!(
+                model.memory_strategy_safety_check(&context),
+                gen_core::MemorySafetyDecision::Accept
+            );
+            let mut scope = model
+                .begin_memory_strategy_request(&context)
+                .unwrap()
+                .expect("loaded generator must open its registered request scope");
+            let mut request = fixture.request.clone();
+            request.use_pid = use_pid;
+            scope.configure_request(&mut request).unwrap();
+            assert!(request.memory.unwrap().stage_residency);
+        }
+    }
+
+    #[test]
+    fn production_load_rejects_the_same_unsupported_components_as_registry_admission() {
+        let mut spec = LoadSpec::new(WeightsSource::Dir(
+            "/nonexistent/flux1-invalid-component".into(),
+        ))
+        .with_offload_policy(OffloadPolicy::Sequential);
+        spec.components.insert(
+            "unexpected".into(),
+            WeightsSource::File("/nonexistent/unexpected.safetensors".into()),
+        );
+        assert!(crate::memory_strategy::memory_strategy_contract(FLUX1_DEV_ID, &spec).is_err());
+        assert!(load_flux1(FluxVariant::Dev, &spec).is_err());
+    }
 
     struct DecodeSpy {
         output: Array,
