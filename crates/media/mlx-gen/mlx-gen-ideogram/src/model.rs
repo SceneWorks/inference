@@ -14,8 +14,7 @@ use std::path::Path;
 use mlx_gen::{
     default_seed, AdapterKind, AdapterSpec, Capabilities, Conditioning, ConditioningKind, Error,
     GenerationOutput, GenerationRequest, Generator, Image, LatentDecoder, LoadSpec, Modality,
-    ModelDescriptor, OffloadPolicy, Precision, Progress, Quant, Residency, Result, SizeFloor,
-    WeightsSource,
+    ModelDescriptor, OffloadPolicy, Precision, Progress, Quant, Residency, Result, WeightsSource,
 };
 use mlx_gen_flux2::model::PID_BACKBONE;
 use mlx_gen_pid::{resolve_pid_decoder_at_sigma, PidEngine};
@@ -55,7 +54,6 @@ pub fn descriptor() -> ModelDescriptor {
             // prompt is not.
             supports_negative_prompt: false,
             supports_guidance: true,
-            supports_true_cfg: false,
             // Edit (sc-6303/6330): img2img / Remix via a source `Reference`, and mask inpaint via a
             // `Mask` (white = repaint) alongside the `Reference`. The prompt stays the model's native
             // JSON caption. No control/pose/multi-reference. Edit works in both quality and turbo.
@@ -76,42 +74,21 @@ pub fn descriptor() -> ModelDescriptor {
             // Advertising the curated menu would expose solvers that produce broken output — so the
             // native logit-normal Euler is its only valid sampler. See `pipeline::run_denoise`.
             samplers: Vec::new(),
-            schedulers: Vec::new(),
-            supported_guidance_methods: vec![],
             min_size: RES_MIN,
             max_size: RES_MAX,
             max_count: MAX_COUNT,
-            // Not a distilled fixed-schedule model: any step count the shared sanity caps
-            // admit is renderable (sc-19502).
-            supported_steps: Vec::new(),
             mac_only: true,
             // Load-time Q4/Q8 over the whole model (both DiTs + TE + VAE), sc-5989. Q8 default is
             // the worker's call; Q4 roughly halves the ~27 GB Q8 weights for smaller Macs.
             supported_quants: &[Quant::Q4, Quant::Q8],
-            component_precision_floors: &[],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
             // Wired onto the shared `Residency` seam (epic 10834, sc-10840); honors Sequential offload
             // (F-176). Under `Sequential` the Qwen3-VL text encoder is encoded, materialized, then
             // dropped before the two DiTs + VAE load — bounding peak unified memory to
             // `max(TE, DiTs+VAE)`. Ideogram Q4/Q8 quantize the whole model DENSE at load, so a
             // `Sequential` + `quantize` load re-quantizes each generate (F-181 advisory in `load`).
             supports_sequential_offload: true,
-            unconditionally_engages_staged_residency: false,
             supports_preview: true,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
+            ..Default::default()
         },
     }
 }

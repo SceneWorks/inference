@@ -37,7 +37,7 @@ use candle_audio::candle_core::Device;
 use candle_audio::gen_core::{
     self, AdapterSpec, AudioEditMode, AudioTrack, Capabilities, Conditioning, ConditioningKind,
     GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor,
-    OffloadPolicy, Precision, Progress, SizeFloor, WeightsSource,
+    OffloadPolicy, Precision, Progress, StepSupport, WeightsSource,
 };
 use sha2::{Digest, Sha256};
 
@@ -1033,7 +1033,6 @@ pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
         capabilities: Capabilities {
             supports_negative_prompt: true,
             supports_guidance: true,
-            supports_true_cfg: false,
             // Audio→audio restyle (sc-14547) and bounded source editing (sc-14548), on all six
             // checkpoints. Advertising a kind is what makes `Capabilities::validate_request_audio`
             // *stop* rejecting the variant; both are consumed identically by every id, because the
@@ -1058,21 +1057,16 @@ pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
             // `Unsupported`: no published Stable Audio 3 adapter is a Kronecker factorization, and
             // accepting one would mean guessing a decomposition this family does not have.
             supports_lora: true,
-            supports_lokr: false,
             samplers: vec!["pingpong", "euler", "rk4", "dpmpp"],
-            schedulers: vec![],
             supported_guidance_methods: vec!["cfg", "apg", "cfg_rescale"],
-            min_size: 0,
-            max_size: 0,
             max_count: 1,
-            // Not a distilled fixed-schedule model: any step count the shared sanity caps
-            // admit is renderable (sc-19502).
-            supported_steps: Vec::new(),
-            mac_only: false,
+            // The provider's 500-step model limit, advertised rather than hidden (sc-19559).
+            supported_steps: StepSupport::Range {
+                min: 1,
+                max: MAX_STEPS,
+            },
             audio_sample_rates: vec![SAMPLE_RATE],
             max_audio_duration_secs: Some(variant.max_duration_secs()),
-            audio_voices: vec![],
-            audio_languages: vec![],
             // sc-14548. Three modes, and `AudioEditMode::Cover` is deliberately **not** among them.
             //
             // Upstream Stable Audio 3 exposes three paths in total — text-to-audio, audio-to-audio
@@ -1095,20 +1089,7 @@ pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
                 AudioEditMode::Repaint,
                 AudioEditMode::Extend,
             ],
-            supported_quants: &[],
-            component_precision_floors: &[],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
-            supports_sequential_offload: false,
-            unconditionally_engages_staged_residency: false,
-            supports_preview: false,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            size_floor: SizeFloor::RangeChecked,
+            ..Default::default()
         },
     }
 }

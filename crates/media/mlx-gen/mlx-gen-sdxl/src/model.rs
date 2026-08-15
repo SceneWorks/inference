@@ -17,7 +17,7 @@ use mlx_gen::{
     Capabilities, Conditioning, ConditioningKind, DiffusionSampler, DiscreteModelSampling, Error,
     GenerationOutput, GenerationRequest, Generator, Image, LatentDecoder, LcmSampler,
     LightningSampler, LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision, Progress,
-    Quant, Residency, Result, Scheduler, SizeFloor, Solver, TcdSampler, WeightsSource,
+    Quant, Residency, Result, Scheduler, Solver, TcdSampler, WeightsSource,
 };
 use mlx_rs::ops::{add, concatenate_axis, multiply};
 use mlx_rs::Dtype;
@@ -140,7 +140,6 @@ pub fn descriptor() -> ModelDescriptor {
             // SDXL uses real classifier-free guidance: honors the negative prompt + a CFG scale.
             supports_negative_prompt: true,
             supports_guidance: true,
-            supports_true_cfg: false,
             // img2img Reference (sc-2638) + masked inpaint/outpaint (Mask, sc-3057) + tile-ControlNet
             // detail (Control, sc-3058 — requires a control checkpoint via LoadSpec::control). LoRA
             // (kohya `lora_unet_` + PEFT, sc-2639) and LoKr (sc-2640 — Rust is more capable than the
@@ -187,33 +186,14 @@ pub fn descriptor() -> ModelDescriptor {
             min_size: 512,
             max_size: 2048,
             max_count: 8,
-            // Not a distilled fixed-schedule model: any step count the shared sanity caps
-            // admit is renderable (sc-19502).
-            supported_steps: Vec::new(),
             mac_only: true,
             // On-the-fly Q4/Q8 over the U-Net + CLIP encoders + IdentityNet, conv_shortcut kept
             // dense (sc-2769 / sc-3329). Read by the worker capability advertisement (sc-3723).
             supported_quants: &[Quant::Q4, Quant::Q8],
-            component_precision_floors: &[],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
             // Wired onto the shared `Residency` seam (epic 10834); honors Sequential offload (F-176).
             supports_sequential_offload: true,
-            unconditionally_engages_staged_residency: false,
             supports_preview: true,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
+            ..Default::default()
         },
     }
 }

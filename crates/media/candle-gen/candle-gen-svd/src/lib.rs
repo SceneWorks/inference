@@ -40,7 +40,7 @@ use candle_gen::gen_core::runtime::LoadPhase;
 use candle_gen::gen_core::{
     self, Capabilities, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest,
     Generator, Image, LoadSpec, Modality, ModelDescriptor, OffloadPolicy, PerComponentBytes,
-    Progress, SizeFloor, WeightsSource,
+    Progress, StepSupport, WeightsSource,
 };
 use candle_gen::{check_cancel, run_three_stage_sequential, CandleError, Result as CResult};
 
@@ -262,45 +262,23 @@ pub fn descriptor() -> ModelDescriptor {
         backend: "candle",
         modality: Modality::Video,
         capabilities: Capabilities {
-            supports_negative_prompt: false,
             supports_guidance: true,
-            supports_true_cfg: false,
             conditioning: vec![ConditioningKind::Reference],
-            supports_lora: false,
-            supports_lokr: false,
             // Unified curated SAMPLER menu (epic 7114 P4, sc-7125, decision 3b: sampler-only, NO
             // scheduler axis — SVD keeps its native Karras EDM σ schedule). SVD is EDM v-prediction;
             // the default `euler` over `EdmModelSampling` reproduces the native v-pred Euler loop (N1).
             samplers: candle_gen::curated_sampler_names(),
-            schedulers: Vec::new(),
-            supported_guidance_methods: vec![],
             min_size: 256,
             max_size: 1024,
             max_count: 1,
-            // Not a distilled fixed-schedule model: any step count the shared sanity caps
-            // admit is renderable (sc-19502).
-            supported_steps: Vec::new(),
-            mac_only: false,
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
+            // SVD-XT's engine bound, advertised rather than hidden (sc-19559) — the candle twin
+            // of `mlx-gen-svd`'s declaration, from this lane's own `MAX_STEPS` (both 200).
+            supported_steps: StepSupport::Range {
+                min: 1,
+                max: MAX_STEPS,
+            },
             supports_sequential_offload: true,
-            unconditionally_engages_staged_residency: false,
-            supports_preview: false,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            supported_quants: &[],
-            component_precision_floors: &[],
-            size_floor: SizeFloor::RangeChecked,
+            ..Default::default()
         },
     }
 }
@@ -870,6 +848,47 @@ mod tests {
         assert!(
             d.capabilities.supports_sequential_offload,
             "svd_xt must advertise the staged conditioner → UNet → VAE lifecycle"
+        );
+    }
+
+    /// sc-19559 — the candle twin of `mlx-gen-svd`'s ceiling test. The bound both lanes have
+    /// always enforced privately is now readable off the descriptor and rejected by the SHARED
+    /// floor, so the two lanes refuse the same counts from the same declaration.
+    ///
+    /// Reading `ceiling()` alone would pass against a descriptor nothing enforces; asserting only
+    /// the refusal would pass against a bound that stays undiscoverable. Both are asserted.
+    #[test]
+    fn the_step_ceiling_is_advertised_and_enforced_by_the_shared_floor() {
+        let caps = descriptor().capabilities;
+        assert_eq!(
+            caps.supported_steps.ceiling(),
+            Some(MAX_STEPS),
+            "the descriptor must advertise the engine's own ceiling, weights-free"
+        );
+        assert_eq!(caps.supported_steps.floor(), Some(1));
+
+        let at = |steps: u32| {
+            caps.validate_request(
+                MODEL_ID,
+                &GenerationRequest {
+                    width: 512,
+                    height: 512,
+                    count: 1,
+                    steps: Some(steps),
+                    ..Default::default()
+                },
+            )
+        };
+        assert!(
+            at(MAX_STEPS).is_ok(),
+            "the advertised ceiling itself must be renderable"
+        );
+        let err = at(MAX_STEPS + 1)
+            .expect_err("the shared floor must refuse an over-ceiling count")
+            .to_string();
+        assert!(
+            err.contains(MODEL_ID) && err.contains(&format!("1..={MAX_STEPS}")),
+            "the refusal must name the model and the advertised range: {err}"
         );
     }
 

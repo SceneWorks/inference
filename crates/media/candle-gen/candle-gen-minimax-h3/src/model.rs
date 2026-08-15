@@ -88,7 +88,7 @@ use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::{
     reject_unknown_components, Capabilities, GenerationOutput, GenerationRequest, Generator,
     LoadSpec, MemoryProviderContract, Modality, ModelDescriptor, OffloadPolicy, Precision,
-    Progress, SizeFloor, WeightsSource,
+    Progress, SizeFloor, StepSupport, WeightsSource,
 };
 use candle_gen::gen_core::{ConditioningKind, Image};
 use candle_gen::{CandleError, Result};
@@ -327,6 +327,12 @@ pub fn descriptor() -> ModelDescriptor {
             // That declaration gates ladder ADMISSION; this bit describes the residency lifecycle.
             supports_sequential_offload: true,
             max_count: 1,
+            // The provider's step bound, advertised rather than hidden (sc-19559) — the candle
+            // twin of `mlx-gen-minimax-h3`'s declaration, from this lane's own `MAX_STEPS`.
+            supported_steps: StepSupport::Range {
+                min: 1,
+                max: MAX_STEPS,
+            },
             component_precision_floors: &[],
             samplers: Vec::new(),
             schedulers: Vec::new(),

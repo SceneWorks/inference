@@ -33,7 +33,7 @@ use std::sync::{Arc, Mutex};
 
 use candle_audio::gen_core::{
     self, AudioEditMode, AudioTrack, Capabilities, ConditioningKind, GenerationOutput,
-    GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, Progress, SizeFloor,
+    GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, Progress, StepSupport,
     WeightsSource,
 };
 use candle_audio::{AudioError, Result as AudioResult};
@@ -209,28 +209,21 @@ pub fn descriptor() -> ModelDescriptor {
             // negative-prompt / guidance surface is advertised (an explicit value is a typed
             // Unsupported / ignored, never a second forward).
             supports_negative_prompt: false,
-            supports_guidance: false,
-            supports_true_cfg: false,
             // Prompted source-audio editing (sc-12847): the SAME turbo weights natively serve
             // ACE-Step's audio-to-audio task modes, so the edit capability rides this existing
             // generator via a new conditioning kind rather than a distinct provider id.
             conditioning: vec![ConditioningKind::AudioEdit],
-            supports_lora: false,
-            supports_lokr: false,
-            samplers: vec![],
-            schedulers: vec![],
-            supported_guidance_methods: vec![],
             // Pure audio: no width/height. The descriptor sweep exempts Audio from the size floor
             // (sc-13314) and `validate_request_audio` skips the range, so these stay at the natural
             // unused 0 rather than a nominal placeholder bound.
             min_size: 0,
-            max_size: 0,
             // One clip per request (GenerationOutput::Audio carries a single track).
             max_count: 1,
-            // Not a distilled fixed-schedule model: any step count the shared sanity caps
-            // admit is renderable (sc-19502).
-            supported_steps: Vec::new(),
-            mac_only: false,
+            // The provider's 200-step ceiling, advertised rather than hidden (sc-19559).
+            supported_steps: StepSupport::Range {
+                min: 1,
+                max: MAX_STEPS,
+            },
             audio_sample_rates: vec![SAMPLE_RATE],
             max_audio_duration_secs: Some(MAX_DURATION_SECS),
             // No voice/speaker surface — music, not TTS.
@@ -248,20 +241,7 @@ pub fn descriptor() -> ModelDescriptor {
                 AudioEditMode::Extend,
                 AudioEditMode::Cover,
             ],
-            supported_quants: &[],
-            component_precision_floors: &[],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
-            supports_sequential_offload: false,
-            unconditionally_engages_staged_residency: false,
-            supports_preview: false,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            size_floor: SizeFloor::RangeChecked,
+            ..Default::default()
         },
     }
 }
