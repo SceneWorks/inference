@@ -1281,11 +1281,23 @@ fn transformer_window_sweep_and_streamed_output_identity() {
         );
     }
     // (b) And widening it buys time back. Measured 3654 -> 1318 ms/step (2.77x) at 1024² and
-    //     3355 -> 979 (3.43x) at 768²; run-to-run latency spread is ~4%, so a 0.75 ratio is a floor
-    //     noise cannot clear while still failing loudly if the re-open count stops tracking the
-    //     cadence at all (which is what a `BlockPlan` that ignored the window would look like).
+    //     3355 -> 979 (3.43x) at 768².
+    //
+    //     sc-19556: the floor moved from 0.75 to 0.95. The old comment justified 0.75 by a
+    //     "run-to-run latency spread is ~4%" figure, but that spread was measured on a QUIET
+    //     machine; this box routinely runs several agents at once, and `tight_ms` / `wide_ms` are
+    //     one sample each from renders minutes apart, so they need not even see the same load.
+    //     sc-19505 measured the same class of margin failing 53 of 380 runs under deliberate
+    //     contention. A margin that moves that much with the host cannot also resolve the code.
+    //
+    //     The memory half of this frontier is gated CLOCK-FREE just above — `(peak - tight_peak)
+    //     .abs() < tight_peak * 0.01` reads an allocator high-water, not a duration — and that is
+    //     the assertion carrying the flat-peak claim. This one keeps a duration because "widening
+    //     buys time back" is a published latency claim, but at a floor contention cannot clear: a
+    //     `BlockPlan` that ignored the window entirely lands at ~1.0, which still reds here, while
+    //     the measured 2.77-3.43x has enormous headroom and is REPORTED on the line below.
     assert!(
-        probing || wide_ms < tight_ms * 0.75,
+        probing || wide_ms < tight_ms * 0.95,
         "widening the cadence {tightest} -> {widest} did not buy time back ({tight_ms:.0} -> \
          {wide_ms:.0} ms/step). The domain is published as a time/memory frontier; if every cadence \
          costs the same, it is not one and only the tightest should ship"

@@ -789,7 +789,33 @@ fn nvfp4_quantize_activation_perf_krea_shapes() {
             ms_quant + ms_gemm,
             ms_fused + ms_gemm
         );
-        assert!(ms_quant.is_finite() && ms_quant > 0.0 && ms_gemm > 0.0 && ms_fused > 0.0);
+        // sc-19556: `ms_quant.is_finite() && ms_quant > 0.0 && ms_gemm > 0.0 && ms_fused > 0.0` was
+        // deleted. Every term is `Instant::elapsed() * 1000 / iters`, so all four could only fail on
+        // a non-monotonic clock — green for any implementation, including one whose kernels returned
+        // garbage, which is exactly what a `black_box`ed timing loop needs protecting from.
+        //
+        // This is a REPORTING benchmark and the table above is its deliverable, so what must still
+        // be gated is that the kernels it times actually computed something. `black_box` keeps the
+        // results from being optimized away but never looks at them, so until now nothing did.
+        let timed = lt.matmul_nvfp4_staged(&w_stg, &x_stg).unwrap();
+        let vals = timed
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert!(
+            vals.iter().all(|v| v.is_finite()),
+            "the timed FP4 GEMM produced NaN/Inf at M={m} K={k} N={n}"
+        );
+        let lo = vals.iter().copied().fold(f32::INFINITY, f32::min);
+        let hi = vals.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            hi > lo,
+            "the timed FP4 GEMM returned a constant buffer ({lo}) at M={m} K={k} N={n} — the \
+             kernels are fast because they computed nothing"
+        );
     }
     eprintln!(
         "[sc-12207/12078] pre-fix ref (sc-12110): 328.10 ms (K=6144) / 879.42 ms (K=16384). sc-12207 \

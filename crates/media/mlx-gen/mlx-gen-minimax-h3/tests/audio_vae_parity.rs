@@ -543,13 +543,39 @@ fn mis_packed_latents_are_rejected() {
     let f = fixture();
     let vae = vae();
     let z = f.require("in.stereo.z").unwrap();
+    // Each rejection names the guard that must produce it (sc-19488). All three inputs would fail
+    // downstream with their guard deleted — a transposed latent reshapes to the wrong fold, a
+    // rank-4 latent meets a rank-3 `transpose_axes`, and a B=2 latent reaches an interleave that
+    // reshapes on a batch it cannot represent — so `is_err()` alone is satisfied either way and the
+    // probe measures nothing.
     let transposed = z.transpose_axes(&[0, 2, 1, 3]).unwrap();
-    assert!(vae.decode_stereo(&transposed).is_err());
+    let msg = vae
+        .decode_stereo(&transposed)
+        .expect_err("a [B, latent_channels, output_channels, T] packing must be refused")
+        .to_string();
+    assert!(
+        msg.contains("decode_stereo: expected"),
+        "the decode_stereo packing guard must be what rejects this: {msg}"
+    );
     // The mono entry point rejects a stereo-ranked latent too.
-    assert!(vae.decode(z).is_err());
+    let msg = vae
+        .decode(z)
+        .expect_err("the mono entry point takes [B, C, T]")
+        .to_string();
+    assert!(
+        msg.contains("decode: expected"),
+        "the mono decode shape guard must be what rejects this, not the transpose below it: {msg}"
+    );
     // B > 1 cannot be interleaved into one track.
     let two = mlx_rs::ops::concatenate_axis(&[z, z], 0).unwrap();
-    assert!(vae.decode_audio_track(&two).is_err());
+    let msg = vae
+        .decode_audio_track(&two)
+        .expect_err("B > 1 cannot be interleaved into one track")
+        .to_string();
+    assert!(
+        msg.contains("expected batch size 1"),
+        "the batch guard must be what rejects this, not the interleave reshape: {msg}"
+    );
     assert!(
         vae.decode_stereo(&two).is_ok(),
         "but decode_stereo batches fine"

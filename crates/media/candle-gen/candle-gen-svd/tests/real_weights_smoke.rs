@@ -211,7 +211,13 @@ fn default_25_frame_profile_then_8_frame_control() {
         control_b.peaks.unet <= default_out.peaks.unet,
         "a reset 8-frame control cannot inherit the larger default run's UNet high-water"
     );
-    assert!(default_out.wall > Duration::ZERO && control_b.wall > Duration::ZERO);
+    // sc-19556: `default_out.wall > Duration::ZERO && control_b.wall > Duration::ZERO` was DELETED
+    // here rather than replaced. It could only fail on a non-monotonic clock, and everything it
+    // reached for — that both profiles genuinely ran every stage — is already asserted inside
+    // `run_profile`, for every profile it is called on and more strictly than a duration could:
+    // `renderer_loads == 2`, `peaks.conditioning > 0 && peaks.unet > 0 && peaks.decode > 0`, and
+    // `assert_frames(&frames, expected_frames, ..)`. `wall` stays on `ProfileOutput` because the
+    // `[[SVD_32GB]]` line reports it.
 }
 
 /// Error and mid-denoise cancellation must both leave the same generator healthy for a later job.

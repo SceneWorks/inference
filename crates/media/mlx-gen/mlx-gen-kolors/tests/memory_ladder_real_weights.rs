@@ -1094,10 +1094,30 @@ fn transformer_window_sweep_and_streamed_output_identity() {
          TRANSFORMER_WINDOW_SIZES' flat column and the phase-separation mechanism it rests on must \
          be re-derived before the domain is published again"
     );
+    // sc-19556. `speedup` is `tightest.wall / widest.wall` — one sample per arm, two renders apart,
+    // on a machine that routinely has several agents building at once. The bound was `> 1.5`, which
+    // also contradicted `Row`'s own doc: it says the wall clock "is therefore *reported* and bounded
+    // loosely, never asserted tightly", and 1.5 against a two-sample ratio is not loose.
+    //
+    // The memory half of this frontier is gated CLOCK-FREE, directly above: `spread < 1.0` reads
+    // `peak_gib`, an allocator high-water that does not move with host load. That is the assertion
+    // carrying the "every cadence bounds the peak identically" claim.
+    //
+    // The latency half is a genuine published claim, so it keeps a duration — but at a floor
+    // contention cannot plausibly clear rather than one tuned to the measured effect. A cadence that
+    // does nothing produces a ratio at 1.0; anything at or below that is the regression this names
+    // ("four spellings of one choice"). The measured effect is far above this floor, and it is
+    // REPORTED in the sweep line above, so a run that merely got slower is visible without being
+    // charged as a failure to whatever PR is in flight.
+    //
+    // A tighter bound needs an instrument this harness does not have: the mechanism is block
+    // RE-OPENS per step, and `Row` exposes only `peak_gib` / `pixels` / `wall`. Counting re-opens
+    // means instrumenting the shared mlx-gen block-plan seam and re-validating every ladder that
+    // reads it, on real weights — see sc-19556 for why that could not be validated from here.
     assert!(
-        speedup > 1.5,
-        "widening the cadence no longer buys time back ({speedup:.2}×) — the domain is a frontier \
-         only if it does, otherwise it is four spellings of one choice"
+        speedup > 1.05,
+        "widening the cadence bought back no time at all ({speedup:.2}×) — the domain is a \
+         frontier only if it does, otherwise it is four spellings of one choice"
     );
 }
 

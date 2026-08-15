@@ -92,9 +92,12 @@ fn bench_variant(dir: &str, device: &Device, v: &Variant) {
     }
     device.synchronize().unwrap();
     let t = Instant::now();
+    // Keep the LAST step's logits. The loop used to discard every result with `let _ =`, which left
+    // the decode half of this bench gated by nothing but its own clock (sc-19556).
+    let mut last_decode_logits = None;
     for _ in 0..DECODE_STEPS {
         let one = synth_ids(1, vocab, device);
-        let _ = model.decode_logits(&one, &mut cache, offset).unwrap();
+        last_decode_logits = Some(model.decode_logits(&one, &mut cache, offset).unwrap());
         offset += 1;
     }
     device.synchronize().unwrap();
@@ -104,9 +107,21 @@ fn bench_variant(dir: &str, device: &Device, v: &Variant) {
         "{:<12} prefill {:>9.1} tok/s   decode {:>8.1} tok/s",
         v.label, prefill_tps, decode_tps
     );
-    assert!(
-        prefill_tps > 0.0 && decode_tps > 0.0,
-        "{}: throughput must be positive",
+    // sc-19556: `prefill_tps > 0.0 && decode_tps > 0.0` was demoted to the report above. Both are
+    // `N / Instant::elapsed()`, so the condition could only fail on a non-monotonic clock — it was
+    // green for any implementation, including one that returned garbage.
+    //
+    // What this bench must still gate is that both halves actually produced usable output, which is
+    // observable directly and without a clock. Prefill is already covered by `assert_finite(&logits)`
+    // above; the decode half was covered by nothing, because it dropped every result. So it is
+    // gated the same way as prefill now, plus the cache offset, which is what makes the decode a
+    // continuation of the prefilled cache rather than DECODE_STEPS independent one-token forwards.
+    let decoded = last_decode_logits.expect("DECODE_STEPS must be > 0");
+    assert_finite(&decoded);
+    assert_eq!(
+        offset as usize,
+        PREFILL_TOKENS + WARMUP_DECODE_STEPS + DECODE_STEPS,
+        "{}: every decode step must advance the cache offset exactly once",
         v.label
     );
 }
