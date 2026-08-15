@@ -21,9 +21,10 @@ pub const CHROMA1_FLASH_ID: &str = "chroma1_flash";
 /// The base flow-match sampler name.
 ///
 /// It does **not** match the mlx descriptor's advertised sampler, which this doc comment claimed
-/// until sc-19496: `mlx-gen-chroma`'s `DEFAULT_SAMPLER` is `"euler"`. Both menus are built with
-/// `menu_with_aliases`, under which `flow_match` is a legacy alias falling back to euler (see the
-/// `samplers:` comment below), so the advertised *strings* differ while the integrator does not.
+/// until sc-19496: `mlx-gen-chroma`'s `DEFAULT_SAMPLER` is `"euler"`. Both menus carry `flow_match`
+/// as a legacy alias falling back to euler — candle via `menu_with_aliases` (the `samplers:` field
+/// below), mlx by pushing it onto `curated_sampler_names()` inline, which is why it never calls
+/// `menu_with_aliases` — so the advertised *strings* differ while the integrator does not.
 /// Which string is right against the released checkpoint is sc-19495; `check_cross_backend_geometry`
 /// carries an exemption naming that story rather than letting either backend's value be copied
 /// across to buy a green.

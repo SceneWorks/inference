@@ -211,12 +211,51 @@ PID_RUNG_TWO_MARKERS = (
 # agreement on the names both sides *do* declare is the checkable claim.
 CROSS_BACKEND_GEOMETRY_EXEMPT_FAMILIES: dict[str, str] = {}
 
+# A family whose two crates share *no* constant name is compared against nothing, and every other
+# clause below still passes — the exact inert shape this gate exists to refuse, one family at a time
+# and printing OK the whole way. So zero shared comparisons is a failure, and a family that genuinely
+# has none says so here, with a reason the gate can invalidate: listing a family that *does* share a
+# constant is itself a violation, so this table cannot outlive its subject either.
+#
+# Both entries are real, and both were reached by reading the crates rather than by finding the gate
+# inconvenient.
+CROSS_BACKEND_GEOMETRY_NO_SHARED_CONSTANTS: dict[str, str] = {
+    "joycaption": (
+        "`mlx-gen-joycaption` declares no constant at all, of any visibility: its whole surface is "
+        "`mlx_gen::register_captioner! { pub(crate) const REGISTRATION = descriptor => load }` "
+        "(`src/model.rs`), a macro that expands to the registration and reads the prompt menu out "
+        "of the shared `joycaption-prompts` crate. The candle side's eight constants are that menu "
+        "and its templates, which mlx consumes rather than redeclares — so there is one declaration "
+        "of this family's geometry, not two, and nothing for a cross-backend comparison to hold. If "
+        "the mlx crate ever declares its own copy, this entry goes stale and the gate says so."
+    ),
+    "sam3": (
+        "both crates declare their ~40 shared geometry names (`INPUT_SIZE`, `NUM_HEADS`, "
+        "`MEM_ATTN_LAYERS`, `ROPE_THETA`, `LN_EPS`, the tracker thresholds) as *private* module "
+        "`const`s, which `RUST_PUB_CONST` deliberately does not read — see its comment for why "
+        "visibility is the line. They are not invisible on purpose and they are not a divergence: "
+        "measured across the pair, every one of those ~40 names agrees today. Reading private "
+        "consts workspace-wide is sc-19696, which has to triage 45 other families' divergences "
+        "first. Until then this family is uncompared, and that is recorded here rather than "
+        "printed as OK."
+    ),
+}
+
 # Constants a family declares on both sides that genuinely differ. Each was read with its doc
 # comment before being listed; the reason is what that reading found. Nothing lands here for being
 # inconvenient — a divergence with no reason is a defect (sc-19419 was exactly one).
 #
-# The gate fails on a *stale* entry too: an exemption for a constant that no longer diverges, or for
-# a family that no longer exists, is removed by the gate rather than left to rot.
+# The gate fails on a *stale* entry too, wherever it can see one: an exemption for a family that no
+# longer exists, or for a constant no longer declared on both sides, always fails. An exemption for a
+# constant that "now agrees" can only fail where both sides canonicalize to the same form, which
+# excludes three entries below. `mage.ATTENTION_CHUNK_SIZE` is one: candle's value is the
+# cross-crate `gen_core::attention_budget::CONSTRAINED_ATTN_SCORES_BUDGET` (64 Mi today, at
+# `crates/contracts/gen-core/src/attention_budget.rs`), and `_const_numbers` resolves same-crate
+# names only — so changing that budget to mlx's 16 Mi would make this exemption stale with nothing
+# to notice. Both `wan` `*_VAE_TILING` entries are the other two: each side's value is an associated
+# const reached through its own provider type, and the qualifier is kept as text, so they compare
+# unequal by spelling whatever the geometry does. `wan.VAE_TILING` itself is now compared directly,
+# which covers the substance; the two re-exports are still text.
 CROSS_BACKEND_GEOMETRY_EXEMPTIONS: dict[tuple[str, str], str] = {
     ("catalog", "BESPOKE_UTILITY_CRATES"): (
         "each backend's own inventory of platform-owned crates, not a shared declaration: candle "
@@ -292,6 +331,24 @@ CROSS_BACKEND_GEOMETRY_EXEMPTIONS: dict[tuple[str, str], str] = {
         "so the sets of values differ: candle `qwen_image`; mlx also `qwen_image_control` and "
         "`qwen_image_edit`."
     ),
+    ("qwen-image", "TRANSFORMER_WINDOW_SIZES"): (
+        "each backend's own *published* rung-4 window ladder, not a checkpoint geometry. mlx "
+        "advertises `&[TRANSFORMER_WINDOW_SIZE]` = `&[1]` under a doc comment recording SC-16353: "
+        "1/2/4/8 plus an unbounded 60-block control were measured at 1024 across Q4/Q8/BF16 and only "
+        "window 1 materially lowered the denoise counter, so publishing more would advertise "
+        "candidates the Metal kernel does not distinguish. candle publishes the CUDA ladder "
+        "`&[1, 2, 4, 8, 15, 30]`, behind `#[cfg(any(feature = \"cuda\", test))]` and with no doc "
+        "comment of its own. A caller picks from whichever backend it is running on."
+    ),
+    ("wan", "VAE_TILING"): (
+        "the z48 halves agree (`VaeTiling::WAN22` on both); the z16 halves differ in "
+        "`causal_temporal`, and `candle-gen-wan/src/vae16.rs` says so in the doc comment directly "
+        "above the declaration: 'This deliberately differs from MLX's non-causal z16 temporal "
+        "geometry while retaining the same 96-channel full-resolution write bound.' candle spells "
+        "the z16 tiling inline with `causal_temporal: true`; mlx takes the shared "
+        "`VaeTiling::WAN`, whose own doc comment in `gen-core/src/tiling.rs` documents it as "
+        "non-causal (`T → T·4`). Same spatial scale, same temporal scale, same 96-channel bound."
+    ),
     ("wan", "WAN_Z16_VAE_TILING"): (
         "an associated const re-exported off each backend's own provider type "
         "(`wan14b::ProviderVae` vs `model::A14bProviderVae`), not a value either side spells out. "
@@ -301,9 +358,31 @@ CROSS_BACKEND_GEOMETRY_EXEMPTIONS: dict[tuple[str, str], str] = {
         "as WAN_Z16_VAE_TILING: `Ti2vProviderVae::VAE_TILING` reached through each backend's own "
         "module path."
     ),
+    ("z-image", "DECODE_OVERLAP"): (
+        "the same per-backend measured VAE tile overlap as `flux.DECODE_OVERLAP`: candle 128 on "
+        "CUDA, mlx 64 on Metal, both paired with the same 512 px `DECODE_TILE_EDGE`. mlx's doc "
+        "comment records that 64 is the only native overlap it advertises, so that moving the tile "
+        "ladder and the overlap at once cannot make a calibration row un-attributable; candle's 128 "
+        "carries no comment of its own. A measured operating point, not a value either backend "
+        "could read off the checkpoint."
+    ),
+    ("z-image", "DEFAULT_STEPS"): (
+        "different *sets*, because the two backends ship different variants — the same split the "
+        "`MODEL_ID` entry below describes. Both declare 4 for the guidance-distilled turbo "
+        "checkpoint; mlx additionally ships undistilled Base, whose `model_base.rs` declares 50 "
+        "under a doc comment citing the reference `ZImagePipeline` example "
+        "(`num_inference_steps=50`). candle has no Base port to declare a default for."
+    ),
     ("z-image", "MODEL_ID"): (
         "per-variant registry ids, one per module, and mlx ships two Fun-Controlnet-Union variants "
         "candle has no port of. Every one of these doc comments already says the ids coexist."
+    ),
+    ("z-image", "TRANSFORMER_WINDOW_SIZES"): (
+        "as `qwen-image.TRANSFORMER_WINDOW_SIZES`, and for the measurement recorded on this "
+        "family's own mlx declaration: window 1 reaches 2.072 GiB against a 2.247 GiB never-bounds "
+        "control, and the sweep found the window itself worth at most ~175 MiB of a ~2.8 GiB "
+        "saving, so mlx publishes `&[1]` — 'one candidate is the honest domain either way'. candle "
+        "publishes the CUDA ladder `&[1, 2, 4, 8, 15, 30]`."
     ),
 }
 
@@ -367,23 +446,52 @@ CROSS_BACKEND_FIXTURE_PREFIX = "SHARED_FIXTURE_"
 # `1e-5` and `0.00001`, or `0.858_090_34` and `0.85809034`, compare equal.
 CROSS_BACKEND_GEOMETRY_TOLERANCE = 1e-12
 
-# Top-level `pub const NAME: TYPE = VALUE;`. Values run to the first `;` and may span lines (the
-# 24-element `LATENTS_MEAN`), hence DOTALL and `[^;]*`. The type may itself contain a `;` — `[f64; 5]`
-# — so only the value is `;`-bounded; the type is merely `=`-bounded, which no Rust type contains.
-RUST_PUB_CONST = re.compile(r"^pub const (\w+)\s*:\s*([^=]+?)\s*=\s*([^;]*);\s*$", re.M | re.S)
+# A `const NAME: TYPE = VALUE;` declaration carrying a visibility modifier, at any indentation.
+#
+# Values run to the first `;` and may span lines (the 24-element `LATENTS_MEAN`), hence DOTALL and
+# `[^;]*`. The type may itself contain a `;` — `[f64; 5]` — so only the value is `;`-bounded; the type
+# is merely `=`-bounded, which no Rust type contains.
+#
+# The `^pub const` this replaced was column-0-only, which across the 33 swept families left 68
+# indented `pub const` and 257 `pub(crate) const` declarations unread — 24 of them declared under the
+# same name on *both* backends, and every one of those a cross-backend geometry or sampling default:
+# `bernini`'s nine `Defaults::{STEPS, NUM_FRAMES, OMEGA_*, ETA, MOMENTUM, NORM_THRESHOLD}`,
+# `sensenova`'s nine, `qwen-image`'s two, and one each in `ltx`, `krea`, `wan` and minimax-h3 itself
+# (`DitProjections::TENSOR_COUNT`). An associated const on a type is reached the same way, so
+# `WanVae16::VAE_TILING` is now compared as a value rather than only through the two `lib.rs`
+# re-exports that name it.
+#
+# A *private* `const` is deliberately still not read, and that restriction is a claim about what this
+# gate compares rather than a convenience: the premise is "one published geometry, declared twice",
+# and a bare `const` is not published — two crates that happen to give an unexported module constant
+# the same name have a name collision, not a shared declaration. `boogu`'s `IMG` (a token id in
+# candle's text encoder, an unrelated 999 in mlx's) is exactly that shape. Extending to private
+# consts adds 387 more shared names and 45 divergences that need per-item owner reads, several of
+# which look like real defects; that sweep is sc-19696, not this gate's silence.
+RUST_PUB_CONST = re.compile(
+    r"^[ \t]*pub(?:\s*\([^()]*\))?[ \t]+const (\w+)\s*:\s*([^=]+?)\s*=\s*([^;]*);[ \t]*$",
+    re.M | re.S,
+)
 
 # `VAE_RATIO as u32 * 2` and `AUDIO_TOKEN_RATE_HZ as i32` differ from their siblings only in the cast,
 # because the two backends spell the same number in different Rust types (`usize`/`i32`, `f64`/`f32`).
-# The cast carries no value, so it is removed before comparison.
+# The cast carries no value, so it is removed before comparison. Applied by
+# `_normalize_const_value` to code only — inside a string `as` is just a word, and stripping it made
+# `boogu`'s `SYSTEM_PROMPT_T2I` ("…the instructions are as follows.") and `sensenova`'s
+# `SYSTEM_MESSAGE_FOR_GEN` ("…as input") compare equal to prose that genuinely differs.
 RUST_CONST_CAST = re.compile(r"\bas\s+\w+")
 
-# A digit separator inside a *numeric literal*, and nothing else. The lookbehind-only form this
-# replaced (`(?<=\d)_(?=\d)`) also fired inside identifiers and string literals, because it never
-# looked at what the run of digits was part of: it rewrote `SD3_5_LARGE_ID` to `SD35_LARGE_ID`, which
-# then resolved against nothing and dropped `sd3`'s `MODEL_ID` to a false divergence, and it collapsed
-# the string `"ltx_2_3"` to `"ltx_23"`, which would have compared *equal* to a genuinely different
-# `"ltx_23"`. Anchoring the match on a digit that is not preceded by an identifier character keeps
-# `32_000` and `0.858_090_34` normalizing while leaving both of those alone.
+# A digit separator inside a numeric literal. Two things keep it there, and it needs both.
+#
+# The lookbehind stops it starting mid-identifier: the `(?<=\d)_(?=\d)` form this replaced rewrote
+# `SD3_5_LARGE_ID` to `SD35_LARGE_ID`, which then resolved against nothing and dropped `sd3`'s
+# `MODEL_ID` to a false divergence.
+#
+# `_normalize_const_value` running it over code only is the other half, and the lookbehind cannot do
+# that half's job: a digit run inside a string starts after `/` or `-` just as legitimately as after
+# a space, so `"model/2_3"` still collapsed to `"model/23"` and `"SceneWorks/wan-2_2"` to
+# `"SceneWorks/wan-22"` — HF-style repo ids are precisely where that bites, and comparing equal to a
+# genuinely different id is the same false green the `"ltx_2_3"` case was.
 RUST_NUMERIC_LITERAL = re.compile(r"(?<![A-Za-z0-9_])\d[\d_]*(?:\.\d[\d_]*)?")
 
 # `candle-gen-*` reaches the shared backend surface through `candle_gen::`, `mlx-gen-*` through
@@ -421,25 +529,28 @@ def fail(message: str) -> None:
     raise AssertionError(message)
 
 
-def strip_rust_comments(source: str, *, strip_literals: bool = False) -> str:
-    """Blank out Rust comments so a source-text policy check cannot be satisfied by a comment.
+def _rust_chunks(source: str) -> list[tuple[str, str]]:
+    """Split Rust source into ``("code" | "comment" | "literal", text)`` runs, in order.
 
-    Comments become runs of spaces (newlines preserved) rather than being deleted, so line and column
-    positions still line up with the original if a caller ever reports them.
+    One scanner, two callers. ``strip_rust_comments`` blanks the comment runs (and optionally the
+    literal ones); ``_normalize_const_value`` leaves the literal runs untouched while rewriting the
+    code around them. Sharing the walk is the point — a second, looser notion of "inside a string"
+    is how a normalizer ends up rewriting the contents of one (sc-19496 review).
 
-    String and character literals are honoured, because ``"// not a comment"`` and ``"/* nor this */"``
-    are real code — including raw strings (``r"..."``, ``r#"..."#``, ``br#"..."#``), whose whole purpose
-    is to contain otherwise-significant characters. When ``strip_literals`` is true, their spans are
-    blanked too, so a policy looking for call syntax cannot be satisfied by a diagnostic or test
-    fixture string. Block comments nest, as they do in Rust. ``'a`` lifetimes are distinguished from
-    ``'a'`` char literals.
+    Raw strings (``r"..."``, ``r#"..."#``, ``br#"..."#``) are literals, since containing otherwise-
+    significant characters is their whole purpose. Block comments nest, as they do in Rust. ``'a``
+    lifetimes are distinguished from ``'a'`` char literals.
     """
-    def emit_literal(literal: str) -> str:
-        if not strip_literals:
-            return literal
-        return "".join("\n" if char == "\n" else " " for char in literal)
+    chunks: list[tuple[str, str]] = []
 
-    out: list[str] = []
+    def emit(kind: str, text: str) -> None:
+        if not text:
+            return
+        if chunks and chunks[-1][0] == kind:
+            chunks[-1] = (kind, chunks[-1][1] + text)
+            return
+        chunks.append((kind, text))
+
     index = 0
     length = len(source)
     while index < length:
@@ -447,7 +558,7 @@ def strip_rust_comments(source: str, *, strip_literals: bool = False) -> str:
         if char == "/" and source.startswith("//", index):
             end = source.find("\n", index)
             end = length if end < 0 else end
-            out.append(" " * (end - index))
+            emit("comment", source[index:end])
             index = end
             continue
         if char == "/" and source.startswith("/*", index):
@@ -465,7 +576,7 @@ def strip_rust_comments(source: str, *, strip_literals: bool = False) -> str:
                         break
                     continue
                 end += 1
-            out.append("".join("\n" if c == "\n" else " " for c in source[index:end]))
+            emit("comment", source[index:end])
             index = end
             continue
         raw = _RAW_STRING_START.match(source, index)
@@ -473,7 +584,7 @@ def strip_rust_comments(source: str, *, strip_literals: bool = False) -> str:
             terminator = '"' + raw.group(1)
             end = source.find(terminator, raw.end())
             end = length if end < 0 else end + len(terminator)
-            out.append(emit_literal(source[index:end]))
+            emit("literal", source[index:end])
             index = end
             continue
         if char == '"':
@@ -486,7 +597,7 @@ def strip_rust_comments(source: str, *, strip_literals: bool = False) -> str:
                     end += 1
                     break
                 end += 1
-            out.append(emit_literal(source[index:end]))
+            emit("literal", source[index:end])
             index = end
             continue
         if char == "'":
@@ -494,21 +605,41 @@ def strip_rust_comments(source: str, *, strip_literals: bool = False) -> str:
             if source.startswith("'\\", index):
                 end = source.find("'", index + 2)
                 end = length if end < 0 else end + 1
-                out.append(emit_literal(source[index:end]))
+                emit("literal", source[index:end])
                 index = end
                 continue
             # `'a'` is a char literal; `'a` (no closing quote) is a lifetime, so emit just the tick and
             # let the identifier be scanned normally.
             if index + 2 < length and source[index + 2] == "'":
-                out.append(emit_literal(source[index : index + 3]))
+                emit("literal", source[index : index + 3])
                 index += 3
                 continue
-            out.append(char)
+            emit("code", char)
             index += 1
             continue
-        out.append(char)
+        emit("code", char)
         index += 1
-    return "".join(out)
+    return chunks
+
+
+def strip_rust_comments(source: str, *, strip_literals: bool = False) -> str:
+    """Blank out Rust comments so a source-text policy check cannot be satisfied by a comment.
+
+    Comments become runs of spaces (newlines preserved) rather than being deleted, so line and column
+    positions still line up with the original if a caller ever reports them.
+
+    String and character literals are honoured, because ``"// not a comment"`` and ``"/* nor this */"``
+    are real code. When ``strip_literals`` is true, their spans are blanked too, so a policy looking
+    for call syntax cannot be satisfied by a diagnostic or test fixture string.
+    """
+
+    def blank(text: str) -> str:
+        return "".join("\n" if char == "\n" else " " for char in text)
+
+    return "".join(
+        blank(text) if kind == "comment" or (kind == "literal" and strip_literals) else text
+        for kind, text in _rust_chunks(source)
+    )
 
 
 def cargo_metadata(offline: bool) -> dict:
@@ -1748,25 +1879,48 @@ def check_test_temp_dir_guards(root: Path) -> None:
 
 
 def _rust_const_declarations(source: str) -> dict[str, str]:
-    """Map every top-level ``pub const`` in a Rust source to its value text.
+    """Map every visibility-carrying ``const`` in a Rust source to its value text.
+
+    Module-level or associated, at any indentation, under any of `pub`, `pub(crate)`, `pub(super)`
+    or `pub(in path)`.
 
     Comment-stripped first, so a doc comment quoting a declaration — which these crates do
     constantly, since every constant carries its provenance in prose — cannot be mistaken for one.
+
+    ``const _: () = assert!(..);`` is a compile-time assertion rather than a named declaration, and
+    two crates asserting different things under the anonymous name would be compared as if they were
+    the same constant, so it is dropped.
     """
     stripped = strip_rust_comments(source)
     return {
         match.group(1): " ".join(match.group(3).split())
         for match in RUST_PUB_CONST.finditer(stripped)
+        if set(match.group(1)) != {"_"}
     }
 
 
 def _normalize_const_value(value: str) -> str:
-    """Strip what only spells a value (casts, digit separators, whitespace), never what it is."""
-    without_casts = RUST_CONST_CAST.sub("", value)
-    without_separators = RUST_NUMERIC_LITERAL.sub(
-        lambda match: match.group(0).replace("_", ""), without_casts
-    )
-    return without_separators.replace(" ", "")
+    """Strip what only spells a value (casts, digit separators, whitespace), never what it is.
+
+    Applied to the *code* around string and character literals and never inside one. Every rule here
+    is a claim about Rust syntax, and none of them holds inside a literal: `as` is a keyword outside
+    one and the word "as" inside one, `2_3` is a digit separator outside one and two characters of an
+    HF repo id inside one, and a space is layout outside one and content inside one. Run over the
+    whole text they collapse `"…the instructions are as follows."` to `"…theinstructionsare."`,
+    `"SceneWorks/wan-2_2"` to `"SceneWorks/wan-22"` and `"euler a"` to `"eulera"` — three ways for two
+    backends whose strings genuinely differ to compare equal. That is the same false-green class this
+    gate exists to refuse, and this PR is what makes it reachable: the normalizer used to see one
+    family's two files and now sees every declaration in 66 crates, 30 of which carry prose.
+    """
+    out: list[str] = []
+    for kind, text in _rust_chunks(value):
+        if kind == "literal":
+            out.append(text)
+            continue
+        text = RUST_CONST_CAST.sub("", text)
+        text = RUST_NUMERIC_LITERAL.sub(lambda match: match.group(0).replace("_", ""), text)
+        out.append(text.replace(" ", ""))
+    return "".join(out)
 
 
 def _arithmetic_value(node: ast.AST) -> float | None:
@@ -1917,7 +2071,7 @@ def _dual_backend_families(metadata: dict) -> list[tuple[str, Path, Path]]:
 def _crate_pub_consts(
     crate: Path, subdirectory: str, *, prefix: str | None = None
 ) -> dict[str, set[str]]:
-    """Every top-level ``pub const`` under ``crate/subdirectory``, name to distinct value texts.
+    """Every visibility-carrying ``const`` under ``crate/subdirectory``, name to distinct value texts.
 
     A name may be declared more than once in one crate — `MODEL_ID` is declared per variant module
     in several families — so the value is a *set*. Comparing sets rather than picking one keeps the
@@ -2023,11 +2177,21 @@ def check_cross_backend_geometry(metadata: dict, root: Path) -> None:
     1. **Every dual-backend family is compared.** The families come from `cargo metadata`, so the
        gate's coverage is the workspace's contents rather than a list someone remembered to update.
 
-    2. **The two crates agree on every constant they both declare.** Every ``pub const`` anywhere
-       under each crate's ``src/`` is compared by value, so `usize`/`i32` and `f64`/`f32` spellings
-       of the same number pass while a genuine difference reds. A divergence is either fixed or
-       carries a written reason in ``CROSS_BACKEND_GEOMETRY_EXEMPTIONS``; a reason that no longer
-       describes a divergence is itself a failure, so the exemptions cannot outlive their subject.
+    2. **The two crates agree on every constant they both declare.** Every ``const`` carrying a
+       visibility modifier — ``pub``, ``pub(crate)``, ``pub(super)``, ``pub(in path)`` — at any
+       indentation, module-level or associated on a type, anywhere under each crate's ``src/``, is
+       compared by value. So `usize`/`i32` and `f64`/`f32` spellings of the same number pass while a
+       genuine difference reds. A bare private ``const`` is *not* read; ``RUST_PUB_CONST``'s comment
+       says why, and what that leaves for sc-19696. A divergence is either fixed or carries a
+       written reason in ``CROSS_BACKEND_GEOMETRY_EXEMPTIONS``; a reason that no longer describes a
+       divergence is a failure wherever the gate can resolve both sides to a common form, so the
+       exemptions cannot outlive their subject where they are checkable at all — the table's own
+       comment names the three entries that are not.
+
+       A family that shares *no* constant name is compared against nothing while every other clause
+       passes, so that is a failure too, unless it is listed in
+       ``CROSS_BACKEND_GEOMETRY_NO_SHARED_CONSTANTS`` with a reason — and listing a family that does
+       share one is itself a failure.
 
     3. **Both agree with the reference.** Agreement alone would have been satisfiable by copying the
        wrong value across, which is precisely the move this gate must not reward: the defect it was
@@ -2039,11 +2203,11 @@ def check_cross_backend_geometry(metadata: dict, root: Path) -> None:
        byte-identical committed fixtures through hand-typed configs in ``tests/``; those numbers are
        declared as ``SHARED_FIXTURE_*`` constants and compared here, name set and values both.
 
-    Fail-closed throughout. A missing crate, a file that parses to zero constants, or a required
-    constant that will not resolve to a number is a failure, not a skip — a gate that quietly stops
-    comparing is worse than no gate, because it still reports green. What it does *not* do is prove
-    the two backends compute the same thing from these numbers; that is what the `cross_backend.rs`
-    fixture parity tests are for.
+    Fail-closed throughout. A missing crate, a family that yields zero shared constants, or a
+    required constant that will not resolve to a number is a failure, not a skip — a gate that
+    quietly stops comparing is worse than no gate, because it still reports green. What it does
+    *not* do is prove the two backends compute the same thing from these numbers; that is what the
+    `cross_backend.rs` fixture parity tests are for.
     """
     violations: list[str] = []
     families = _dual_backend_families(metadata)
@@ -2067,6 +2231,12 @@ def check_cross_backend_geometry(metadata: dict, root: Path) -> None:
                 f"`{family}`: `{constant}` carries a divergence exemption but `{family}` is not a "
                 "dual-backend family any more — drop the exemption"
             )
+    for family in sorted(CROSS_BACKEND_GEOMETRY_NO_SHARED_CONSTANTS):
+        if family not in known:
+            violations.append(
+                f"`{family}` is recorded as sharing no constant between its backends but is not a "
+                "dual-backend family any more — drop the entry"
+            )
 
     shared_exemptions: set[tuple[str, str]] = set()
 
@@ -2088,7 +2258,29 @@ def check_cross_backend_geometry(metadata: dict, root: Path) -> None:
         candle = sides[candle_relative]
         mlx = sides[mlx_relative]
 
-        for constant in sorted(set(candle) & set(mlx)):
+        # Clause 2's floor. Without it a family whose crates share no constant name runs the loop
+        # below zero times, reaches the reference and fixture clauses with nothing to say (both are
+        # keyed on families this gate pins), and lands in the OK line having compared nothing —
+        # which is what `joycaption` and `sam3` did, and what any future regression in
+        # `RUST_PUB_CONST` would silently do to every non-reference family at once.
+        shared = set(candle) & set(mlx)
+        recorded_as_empty = family in CROSS_BACKEND_GEOMETRY_NO_SHARED_CONSTANTS
+        if not shared and not recorded_as_empty:
+            violations.append(
+                f"{family}: {candle_relative} and {mlx_relative} share no constant name, so the "
+                "gate compared nothing for this family. Either the two backends really do declare "
+                "no common constant — record that in "
+                "`CROSS_BACKEND_GEOMETRY_NO_SHARED_CONSTANTS` with the reason — or the parser has "
+                "stopped reaching declarations it used to read"
+            )
+        if shared and recorded_as_empty:
+            violations.append(
+                f"{family}: is recorded as sharing no constant between its backends, but "
+                f"{len(shared)} are now declared on both sides ({', '.join(sorted(shared)[:5])}"
+                f"{', …' if len(shared) > 5 else ''}) — delete the entry so they are compared"
+            )
+
+        for constant in sorted(shared):
             left = _canonical_const_values(candle[constant], candle)
             right = _canonical_const_values(mlx[constant], mlx)
             exempted = (family, constant) in CROSS_BACKEND_GEOMETRY_EXEMPTIONS
