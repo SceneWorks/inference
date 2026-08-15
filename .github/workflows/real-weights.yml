@@ -2808,20 +2808,27 @@ jobs:
   # early, so an unset snapshot fails at exit 101 instead of printing `ok` in 0.00 s — which is why
   # this was invisible: there was never a vacuous green to notice, just silence.
   #
-  # MEASURED ON nax-macos 2026-08-13, release profile, warm weights: all nine invocations below
-  # total ~3.0 s of test time (the five header/config gates ~0.1 s, the three decodes 0.74 + 0.35 +
-  # 0.11 s, the parity gate 0.30 s). MLX mmaps and materializes per tensor, so "load the 9.7 GB VAE"
-  # is 22 ms. The `timeout-minutes` below is therefore ENTIRELY cold build (5m36s for the mlx-gen
-  # tree measured here) plus a possible 11.640 GB first transfer — not test time.
+  # MEASURED ON nax-macos, release profile, warm weights. Re-measured 2026-08-15 for sc-19445 /
+  # sc-19438, which took this lane from nine invocations to TWELVE: all twelve total ~9.4 s of test
+  # time (the six header/config gates ~1.9 s, the three decodes 1.02 + 0.63 + 0.24 s, the VAE
+  # decode parity 0.88 s, the VAE ENCODE parity 1.40 s, the conditioner parity 3.28 s). MLX mmaps
+  # and materializes per tensor, so "load the 9.7 GB VAE" is 22 ms. The `timeout-minutes` below is
+  # therefore ENTIRELY cold build (5m36s for the mlx-gen tree measured here) plus a possible
+  # 63.1 GB first transfer — the 11.640 GB `minimax-h3` slice plus the 51.5 GB
+  # `minimax-h3-text-encoder` one — not test time. That transfer is why the budget is 150 minutes
+  # rather than 60.
   #
   # TIME IS NOT THE ONLY BUDGET, and this block recorded only the time one. The largest memory
-  # consumer here is the LAST step, not the decodes — but by half what this comment used to claim,
-  # and the reason it used to claim it was a dtype error worth stating plainly. MEASURED from the
-  # published safetensors headers (snapshot 939557dc): **`vae/` ships F32 — all 703 tensors, 0 of
-  # them bf16, 9.7002 GiB / 10.4155 GB.** So the sc-18740 parity gate's `Dtype::Float32` — carried
-  # deliberately, to keep the comparison about layout rather than about bf16 rounding — is a NO-OP
-  # CAST holding ~9.70 GiB, NOT the ~19.4 GB that a "9.7 GB bf16 `vae/` materialized at f32" reading
-  # produces; there is no doubling because there is no bf16 to double. The bf16 component in this
+  # consumer here is the LAST step — which since sc-19438 is the CONDITIONER parity at ~52 GB
+  # resident for layers 0-49 of the dense Qwen3-VL-32B text encoder, not the ~9.70 GiB VAE parity
+  # that used to hold that title and is now second. Both figures below are still worth stating
+  # plainly, because the reason the VAE one used to be overstated was a dtype error. MEASURED from
+  # the published safetensors headers (snapshot 939557dc): **`vae/` ships F32 — all 703 tensors, 0
+  # of them bf16, 9.7002 GiB / 10.4155 GB.** The sc-18740 decode parity gate and the sc-19445
+  # encode parity gate both build at `Dtype::Float32` — the same cast on the same component, in
+  # both cases carried deliberately to keep the comparison about layout rather than about bf16
+  # rounding. That is a NO-OP CAST holding ~9.70 GiB, NOT the ~19.4 GB that a "9.7 GB bf16 `vae/`
+  # materialized at f32" reading produces; there is no doubling because there is no bf16 to double. The bf16 component in this
   # checkpoint is `transformer/` (626 of 638 tensors BF16, 61.73 GiB / 66.28 GB), which this lane
   # does not load. The two video decode smokes cast the OTHER way — `Dtype::Bfloat16` downcasts that
   # same F32 component — so they materialize about half the parity gate, out of the same ~10 GB of
