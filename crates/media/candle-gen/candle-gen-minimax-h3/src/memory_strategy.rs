@@ -4,12 +4,16 @@
 //! [`MemoryBackendRealization`], so the two backends are *allowed* to differ — and here they
 //! genuinely do, in three ways that are worth stating before the code:
 //!
-//! 1. **No fitted curve.** Candle has only the floor arm, so the formula is
-//!    [`MemoryFormulaKind::AssetBytesPlusHeadroom`] rather than MLX's phase envelope, and
-//!    [`MemoryProviderContract::calibration`] is `None`. A provider with no calibration identity
-//!    can run its resident path and can never claim a verified optimized fit — which is exactly
-//!    the truth here, and is enforced: `standard_memory_strategy_safety_check` refuses any
-//!    optimized selection when the identity is absent.
+//! 1. **No fitted curve.** [`MemoryProviderContract::calibration`] is `None`. A provider with no
+//!    calibration identity can run its resident path and can never claim a verified optimized fit —
+//!    which is exactly the truth here, and is enforced: `standard_memory_strategy_safety_check`
+//!    refuses any optimized selection when the identity is absent.
+//!
+//!    The formula is [`MemoryFormulaKind::ComponentPhaseEnvelope`] as of sc-18665, but over a single
+//!    phase and the single [`MemoryFormulaVariable::AssetBytes`] input — it is the floor arm plus
+//!    the AdaLN exclusion, not MLX's fitted five-variable envelope. The variant changed because it
+//!    is the *only* one that carries `resident_components`; the absent calibration identity, not the
+//!    formula shape, is what keeps every optimized selection failing closed.
 //! 2. **Staged residency is implemented but under-declared (sc-17156 / sc-18660).** MLX declares
 //!    [`MemoryStrategy::StagedResidency`] `Implemented`. This lane now *does the same thing* —
 //!    `MiniMaxH3::generate_impl` releases each heavy component before mapping the next, and the
@@ -41,9 +45,11 @@
 
 use candle_gen::gen_core::{
     safetensors_path_bytes, LoadShape, LoadSpec, MemoryAssetFacts, MemoryBackendRealization,
-    MemoryFormulaKind, MemoryLifecycleCapabilities, MemoryParameterRanges, MemoryProviderContract,
-    MemoryRunContext, MemorySafetyDecision, MemoryStrategy, MemoryStrategyCapability,
-    MemoryStrategySupport, MemoryWindowMaterialization, ResidentRequestMemory, WeightsSource,
+    MemoryComponentKind, MemoryComponentResidency, MemoryFormulaKind, MemoryFormulaVariable,
+    MemoryLifecycleCapabilities, MemoryParameterRanges, MemoryPhase, MemoryProviderContract,
+    MemoryResidentComponent, MemoryRunContext, MemorySafetyDecision, MemoryStrategy,
+    MemoryStrategyCapability, MemoryStrategySupport, MemoryWindowMaterialization,
+    ResidentRequestMemory, TransformerComponent, WeightsSource,
 };
 
 use crate::MODEL_ID;
@@ -68,9 +74,33 @@ pub const VIDEO_VAE_BYTES: u64 = 10_415_558_888;
 pub const AUDIO_VAE_BYTES: u64 = 605_429_340;
 
 /// Exact bytes the AdaLN precompute-and-evict drops, asserted against the loader in
-/// [`crate::dit::adaln`]. Declared here so both backends' contracts carry the same figure; sc-18665
-/// turns it into a typed resident-component exclusion the ladder can see.
+/// [`crate::dit::adaln`]. Declared here so both backends' contracts carry the same figure, and
+/// carried into the contract as a typed resident-component exclusion by the private `adaln_component`
+/// (sc-18665).
+///
+/// This is the **bf16** figure. The private `resolved_adaln_bytes` is what the contract declares.
 pub const ADALN_EVICTED_BYTES: u64 = 26_020_915_200;
+
+/// Bytes of the modulation table the precompute keeps in the projections' place, at the longest
+/// schedule this model admits.
+///
+/// `MODULATION_PARAMS · modulation_rows · hidden_size · num_layers` elements at the block dtype,
+/// with `modulation_rows` read off a real [`crate::MAX_STEPS`]-evaluation schedule rather than
+/// derived by hand — `the_retained_table_is_the_worst_case_over_the_admitted_schedule` pins that.
+///
+/// **The evict is not free, and this is the price.** The contract declares the *net* difference,
+/// because declaring the gross [`ADALN_EVICTED_BYTES`] claims a saving the runtime does not
+/// deliver. Identical to the MLX sibling's figure, and for the same reason the two DiT footprints
+/// are identical: this is a property of the checkpoint's schedule domain, not of a backend.
+///
+/// **It does NOT scale with a tier.** The table is the projections' *output*, so its element type
+/// is the block's compute dtype rather than any packed width. The resident side scales; this does
+/// not. See the private `resolved_adaln_bytes`.
+pub const ADALN_MODULATION_TABLE_MAX_BYTES: u64 = 3_870_720_000;
+
+/// Contract-stable identity of the evictable AdaLN sub-stack, so a consumer can find the
+/// declaration by name rather than by matching on bytes. Shared spelling with the MLX sibling.
+pub const ADALN_COMPONENT_ID: &str = "dit_adaln_proj_stack";
 
 /// The load shape this loader actually has, pinned rather than mirrored from the spec.
 ///
@@ -85,6 +115,9 @@ const DIT_COMPONENT: &str = "transformer";
 struct ComponentBytes {
     text_encoder: u64,
     dit: u64,
+    /// The AdaLN sub-stack's residency **on the DiT that was actually resolved** — see
+    /// [`resolved_adaln_bytes`].
+    adaln: u64,
     video_vae: u64,
     audio_vae: u64,
 }
@@ -99,9 +132,11 @@ impl ComponentBytes {
             Some(WeightsSource::Dir(staged)) => staged.clone(),
             _ => root.join(DIT_COMPONENT),
         };
+        let dit_bytes = safetensors_path_bytes(dit);
         Self {
             text_encoder: safetensors_path_bytes(root.join("text_encoder")),
-            dit: safetensors_path_bytes(dit),
+            dit: dit_bytes,
+            adaln: resolved_adaln_bytes(dit_bytes),
             video_vae: safetensors_path_bytes(root.join("vae")),
             audio_vae: safetensors_path_bytes(root.join("audio_vae")),
         }
@@ -116,6 +151,77 @@ impl ComponentBytes {
         self.text_encoder
             .saturating_add(self.dit)
             .saturating_add(self.decoder())
+    }
+}
+
+/// The AdaLN sub-stack's resident bytes on a DiT whose resolved footprint is `dit_bytes`.
+///
+/// [`ADALN_EVICTED_BYTES`] is a bf16 figure, and `ComponentBytes::resolve` already honours a staged
+/// `transformer` component. Declaring the flat 26.02 GB against a smaller staged DiT would declare a
+/// sub-stack larger than the stack containing it, which `conformance_errors` refuses and
+/// `Registry::memory_strategy_contract` turns into a hard error — a render that cannot resolve a
+/// contract at all. `a_staged_dit_component_is_charged_at_its_own_size` proves this lane really can
+/// resolve a smaller staged DiT, so the hazard is reachable here and not merely theoretical.
+///
+/// **Only the footprint leg, and that is a backend difference rather than an omission.** The MLX
+/// sibling takes `min(marker, footprint)`, where the marker leg reads a staged tier's own
+/// `config.json` `quantization.bits` and re-derives the stack at that width. This crate has **no
+/// packed tier at all** — `crate::dit` loads dense, there is no `quantize`/`packed_quant_bits`
+/// path — so there is no marker to read and no packed width to derive. If a packed candle tier ever
+/// lands, this is the function that owes it a marker leg, because the footprint leg is never exact:
+/// the dense f32 I/O heads and norms do not shrink with a tier, so a whole-DiT ratio over-declares
+/// the projections' own share, and an over-declared saving is the OOM direction.
+///
+/// Containment holds unconditionally: [`ADALN_EVICTED_BYTES`] is 39.3 % of [`DIT_BF16_BYTES`], so
+/// the scaled value is always strictly below `dit_bytes`.
+fn resolved_adaln_bytes(dit_bytes: u64) -> u64 {
+    if dit_bytes == 0 {
+        // Nothing was resolved, so there is no footprint to scale to and the declaration falls back
+        // to the architecture fact. `conformance_errors` skips sub-stack containment against zero
+        // asset facts for exactly this case.
+        return ADALN_EVICTED_BYTES;
+    }
+    // u128 because `ADALN_EVICTED_BYTES · DIT_BF16_BYTES` is ~1.7e21 and overflows u64.
+    (u128::from(ADALN_EVICTED_BYTES) * u128::from(dit_bytes) / u128::from(DIT_BF16_BYTES)) as u64
+}
+
+/// The AdaLN projection stack as a typed, evictable intra-transformer component (sc-18665).
+///
+/// The candle lane runs the same precompute-and-evict the MLX lane does — `crate::model` passes
+/// [`crate::dit::adaln::AdaLnResidency::PrecomputeAndEvict`] as a **literal**, and
+/// `AdaLnCache::precompute_and_evict` refuses `Resident` outright — so the exclusion is an
+/// unconditional property of this provider rather than a lever, and `bounded_by` is `None`.
+///
+/// Before this, the candle contract carried the full 26.02 GB over-charge: `transformer_bytes` is a
+/// single load-exact scalar, and [`MemoryFormulaKind::AssetBytesPlusHeadroom`] has nowhere to record
+/// that the projections do not survive into the denoise steady state.
+///
+/// * `kind` is [`MemoryComponentKind::TransformerSubStack`], not `Transformer`: these bytes are
+///   already inside `asset_facts.transformer_bytes`, and a whole-transformer kind would charge them
+///   twice. They are not auxiliary either, so `overlay_bytes` stays 0.
+/// * `retained_bytes` makes the declaration **net**. The precompute keeps a modulation table in the
+///   projections' place; declaring the gross figure claims a saving the runtime does not deliver.
+fn adaln_component(resident_bytes: u64) -> MemoryResidentComponent {
+    MemoryResidentComponent {
+        id: ADALN_COMPONENT_ID.to_owned(),
+        kind: MemoryComponentKind::TransformerSubStack(TransformerComponent::Dit),
+        resident_bytes,
+        bounded_by: None,
+        residency: MemoryComponentResidency::PrecomputedThenEvicted {
+            precomputed_in: MemoryPhase::Denoise,
+            retained_bytes: ADALN_MODULATION_TABLE_MAX_BYTES,
+            // Only tests that exist in THIS crate are named. The MLX sibling's evidence cites
+            // `tests/adaln_evict_real_weights.rs` and `common::assert_adaln_phase_envelope`
+            // (sc-19449); neither exists on this lane, and citing them here would be a claim about
+            // coverage this backend does not have.
+            evidence: "crate::dit::adaln::AdaLnCache::precompute_and_evict returns the bytes it \
+                       released and crate::dit::block::DitBlock::evict_adaln performs the drop; \
+                       tests/adaln_evict_memory.rs drives it under a counting global allocator, \
+                       and crate::dit::adaln's own cache_bytes_are_independent_of_resolution_and_\
+                       duration pins both the 26,020,915,200 B stack and the retained table's \
+                       shape"
+                .to_owned(),
+        },
     }
 }
 
@@ -211,9 +317,38 @@ fn build_contract(components: &ComponentBytes) -> MemoryProviderContract {
         // declared until its behavior seam exists, and a lifecycle block attached to a `Missing`
         // rung is a claim with no rung to hang on. The seam waits on a `calibration` identity, so
         // the rung and this block flip together when one lands.
-        lifecycle: MemoryLifecycleCapabilities::default(),
-        // The floor arm, and only the floor arm.
-        formula: MemoryFormulaKind::AssetBytesPlusHeadroom,
+        //
+        // `phases` is no longer empty, and it declares exactly ONE entry. sc-18665's exclusion is
+        // `PrecomputedThenEvicted { precomputed_in: Denoise }`, and `conformance_errors` requires
+        // that phase to be a declared lifecycle phase — so `Denoise` is the minimum the eviction
+        // needs, and declaring it is what ties the component's ordering back to `lifecycle` rather
+        // than inventing an axis for it. `Conditioning` and `Decode` stay undeclared: they belong to
+        // staged residency, which is still `Missing`, and declaring them would be exactly the false
+        // phase hook `no_lifecycle_phase_is_declared_without_an_implementation` refuses.
+        //
+        // Safe in both conformance directions: the forward rule fires only when StagedResidency is
+        // `Implemented`, and the converse fires only on `StructurallyNotApplicable`. Rung 1 here is
+        // `Missing`, which is neither. Every other hook stays false.
+        lifecycle: MemoryLifecycleCapabilities {
+            phases: vec![MemoryPhase::Denoise],
+            ..Default::default()
+        },
+        // sc-18665. **This is no longer `AssetBytesPlusHeadroom`, and the change is forced.**
+        // `ComponentPhaseEnvelope` is the only formula variant that carries `resident_components`,
+        // so it is the only shape in which the AdaLN exclusion can be declared at all — see that
+        // variant's own doc, which records the decision that the component axis exists as a formula
+        // shape "instead of a field on `MemoryAssetFacts`".
+        //
+        // It does NOT smuggle in a fitted curve. `variables` is `AssetBytes` alone — the same single
+        // input the floor arm had — `phases` carries only the phase the exclusion is ordered
+        // against, and `calibration` is still `None`, which is what actually fails every optimized
+        // selection closed at admission. A one-phase, one-variable envelope IS the floor arm, minus
+        // bytes the runtime provably does not hold through the denoise steady state.
+        formula: MemoryFormulaKind::ComponentPhaseEnvelope {
+            phases: vec![MemoryPhase::Denoise],
+            variables: vec![MemoryFormulaVariable::AssetBytes],
+            resident_components: vec![adaln_component(components.adaln)],
+        },
         // No fitted curve exists for this backend. `None` is the honest state, and it is load
         // bearing: it makes every optimized selection fail closed at admission.
         calibration: None,
@@ -241,6 +376,11 @@ pub fn weights_free_contract(
     Ok(build_contract(&ComponentBytes {
         text_encoder: 0,
         dit: 0,
+        // The declaration-only footprint resolves no DiT, so the sub-stack states the architecture's
+        // own bf16 figure. `fixture_contract_conforms_weights_free` requires the fixture and
+        // production formulas to be equally shaped, and gen-core skips sub-stack containment against
+        // zero asset facts for exactly this case.
+        adaln: ADALN_EVICTED_BYTES,
         video_vae: 0,
         audio_vae: 0,
     }))
@@ -1011,16 +1151,47 @@ mod tests {
     #[test]
     fn the_candle_declaration_differs_from_mlx_where_the_backends_differ() {
         let contract = declared();
-        // 1. No fitted curve: the floor arm only, and no calibration identity.
-        assert_eq!(contract.formula, MemoryFormulaKind::AssetBytesPlusHeadroom);
+        // 1. No fitted curve, and no calibration identity.
+        //
+        //    The formula is a component envelope as of sc-18665 rather than the floor arm, because
+        //    that is the ONLY variant carrying `resident_components` and therefore the only shape
+        //    the AdaLN exclusion can be declared in. That is not MLX's fitted envelope and this
+        //    asserts the difference rather than the variant name: one phase and the floor arm's
+        //    single `AssetBytes` input, against MLX's three phases and five variables.
+        let MemoryFormulaKind::ComponentPhaseEnvelope {
+            phases,
+            variables,
+            resident_components,
+        } = &contract.formula
+        else {
+            panic!(
+                "the AdaLN exclusion requires a component envelope, got {:?}",
+                contract.formula
+            );
+        };
+        assert_eq!(
+            variables,
+            &vec![MemoryFormulaVariable::AssetBytes],
+            "no fitted curve on this lane: the floor arm's single input, and nothing else"
+        );
+        assert_eq!(phases, &vec![MemoryPhase::Denoise]);
+        assert_eq!(resident_components.len(), 1);
+        assert_eq!(resident_components[0].id, ADALN_COMPONENT_ID);
         assert!(contract.calibration.is_none());
         // 2. Staged residency is IMPLEMENTED IN CODE as of sc-17156 but still declared `Missing`,
         //    because an implemented optimized rung needs a behavior seam this lane does not have
         //    yet, and that seam waits on a `calibration` identity (see
         //    `an_optimized_rung_here_is_blocked_by_the_missing_calibration_identity_not_the_seam`).
         //    Under-declaring is the safe direction — see `strategies`.
-        assert_eq!(contract.lifecycle, MemoryLifecycleCapabilities::default());
-        assert!(contract.lifecycle.phases.is_empty());
+        //
+        //    `lifecycle.phases` carries `Denoise` alone, which is the eviction's requirement and not
+        //    a staged-residency claim: `synchronized_phase_release` and all three mechanism hooks
+        //    stay false, and those are what a staged declaration would need.
+        assert_eq!(
+            contract.lifecycle.phases,
+            vec![MemoryPhase::Denoise],
+            "only the phase the AdaLN exclusion is ordered against"
+        );
         assert!(!contract.lifecycle.synchronized_phase_release);
         assert_eq!(
             contract
@@ -1050,29 +1221,171 @@ mod tests {
     }
 
     /// A phase hook declared without an implementation is the false declaration conformance cannot
-    /// catch. This pins the honest state: no phase is declared, because the rung they belong to is
-    /// not declared either — the behavior seam that would carry both waits on a `calibration`
-    /// identity this backend does not have.
+    /// catch. This pins which phases are declared and, for the one that is, what implements it.
     ///
-    /// The release primitive the phases WILL declare is exercised here anyway, so this test also
-    /// fails if it is removed while the declaration is pending.
+    /// `Denoise` is declared as of sc-18665 and **only** because the AdaLN exclusion is ordered
+    /// against it: `conformance_errors` requires a `PrecomputedThenEvicted` component's
+    /// `precomputed_in` to be a declared lifecycle phase. That eviction is implemented — the
+    /// literal in `crate::model` is unconditional — so the phase is backed by a mechanism, which is
+    /// the property this test exists to hold.
+    ///
+    /// `Conditioning` and `Decode` stay undeclared. They belong to staged residency, whose rung is
+    /// still `Missing`, and there is nothing else on this lane that needs them. Adding either would
+    /// be the false hook.
+    ///
+    /// The release primitive the remaining phases WILL declare is exercised here anyway, so this
+    /// test also fails if it is removed while that declaration is pending.
     #[test]
     fn no_lifecycle_phase_is_declared_without_an_implementation() {
         let contract = declared();
-        for phase in [
-            MemoryPhase::Conditioning,
-            MemoryPhase::Denoise,
-            MemoryPhase::Decode,
-        ] {
+        for phase in [MemoryPhase::Conditioning, MemoryPhase::Decode] {
             assert!(
                 !contract.lifecycle.phases.contains(&phase),
-                "{phase:?} must not be declared while StagedResidency is Missing"
+                "{phase:?} must not be declared while StagedResidency is Missing and nothing else \
+                 needs it"
             );
         }
+        // Declared, and tied to the thing that requires it rather than to a rung.
+        assert!(contract.lifecycle.phases.contains(&MemoryPhase::Denoise));
+        let component = &contract.resident_components()[0];
+        let MemoryComponentResidency::PrecomputedThenEvicted { precomputed_in, .. } =
+            &component.residency
+        else {
+            panic!("the AdaLN component declares an eviction");
+        };
+        assert_eq!(
+            precomputed_in,
+            &MemoryPhase::Denoise,
+            "Denoise is declared because the exclusion is precomputed there; if the exclusion moved \
+             phase, this phase list would have to move with it"
+        );
+        // Strip the component and the declared phase loses its justification — which is what makes
+        // the assertion above a statement about this lane rather than about a constant.
+        let mut stripped = declared();
+        stripped.formula = MemoryFormulaKind::AssetBytesPlusHeadroom;
+        assert!(stripped.resident_components().is_empty());
+
         crate::dit::release_device_memory(&candle_gen::candle_core::Device::Cpu)
             .expect("the phase-release primitive must exist and succeed");
+        assert!(!contract.lifecycle.synchronized_phase_release);
         assert!(!contract.lifecycle.decode_tiling);
         assert!(!contract.lifecycle.attention_chunking);
         assert!(!contract.lifecycle.transformer_window_materialization);
+    }
+
+    /// The candle AdaLN exclusion: net, tier-safe, and conformant on a resolved snapshot.
+    ///
+    /// The candle lane carried the full 26.02 GB over-charge until sc-18665 — `transformer_bytes`
+    /// is a single load-exact scalar and `AssetBytesPlusHeadroom` had nowhere to record that the
+    /// projections do not survive into the denoise steady state.
+    #[test]
+    fn the_candle_contract_declares_the_adaln_exclusion_net_and_scaled() {
+        let root = tempfile::tempdir().expect("tempdir");
+        sparse_snapshot(root.path(), &[("transformer", DIT_BF16_BYTES)]);
+        let contract =
+            contract_for(&LoadSpec::new(WeightsSource::Dir(root.path().into()))).expect("contract");
+        assert!(
+            contract.conformance_errors().is_empty(),
+            "{:?}",
+            contract.conformance_errors()
+        );
+
+        let net = ADALN_EVICTED_BYTES - ADALN_MODULATION_TABLE_MAX_BYTES;
+        assert_eq!(
+            contract.resident_components()[0].resident_bytes,
+            ADALN_EVICTED_BYTES
+        );
+        assert_eq!(contract.evicted_component_bytes(), net);
+        assert_eq!(
+            contract.asset_facts.transformer_bytes - contract.steady_state_transformer_bytes(),
+            net,
+            "the post-precompute charge is the load-exact one minus the NET exclusion"
+        );
+        // Declaring the gross figure would claim a saving the precompute does not deliver: it keeps
+        // a modulation table in the projections' place.
+        assert!(net < ADALN_EVICTED_BYTES);
+        // A sub-stack is not auxiliary — those bytes are already inside transformer_bytes.
+        assert_eq!(contract.auxiliary_resident_bytes(), 0);
+        assert_eq!(contract.asset_facts.overlay_bytes, 0);
+
+        // A staged, smaller DiT scales the sub-stack. Declaring the flat bf16 figure against it
+        // would declare a sub-stack larger than the stack containing it, which conformance refuses
+        // and the registry turns into a render that cannot resolve a contract at all.
+        let staged = tempfile::tempdir().expect("tempdir");
+        const Q4_BYTES: u64 = 18_779_970_678;
+        sparse_snapshot(staged.path(), &[("transformer", Q4_BYTES)]);
+        let tiered = contract_for(
+            &LoadSpec::new(WeightsSource::Dir(root.path().into())).with_component(
+                DIT_COMPONENT,
+                WeightsSource::Dir(staged.path().join(DIT_COMPONENT)),
+            ),
+        )
+        .expect("contract");
+        assert_eq!(tiered.asset_facts.transformer_bytes, Q4_BYTES);
+        assert_eq!(
+            tiered.resident_components()[0].resident_bytes,
+            7_372_786_768,
+            "the footprint leg: ADALN_EVICTED_BYTES scaled by the resolved DiT's share of the bf16 \
+             DiT. This lane has no packed tier and therefore no marker leg — see resolved_adaln_bytes"
+        );
+        assert!(
+            tiered.conformance_errors().is_empty(),
+            "{:?}",
+            tiered.conformance_errors()
+        );
+        assert!(
+            tiered.resident_components()[0].resident_bytes < tiered.asset_facts.transformer_bytes,
+            "a sub-stack cannot exceed the stack that contains it"
+        );
+        assert!(
+            ADALN_MODULATION_TABLE_MAX_BYTES < tiered.resident_components()[0].resident_bytes,
+            "and it must stay clear of the floor where the eviction would exclude nothing"
+        );
+    }
+
+    /// [`ADALN_MODULATION_TABLE_MAX_BYTES`] is read off a **real** worst-case schedule rather than
+    /// typed twice, so a schedule or config change moves it or reds here.
+    ///
+    /// The MLX sibling pins the identical figure from its own schedule types. That the two agree is
+    /// the point: the retained table is a property of the checkpoint's schedule domain, not of a
+    /// backend.
+    #[test]
+    fn the_retained_table_is_the_worst_case_over_the_admitted_schedule() {
+        let config = crate::dit::MiniMaxH3DitConfig::default();
+        // `num_inference_steps` counts the terminal sigma = 0, at which the model is never
+        // evaluated, so the longest admitted run is `MAX_STEPS + 1` inference steps.
+        let longest = crate::denoise::JointSchedule::new(crate::MAX_STEPS as usize + 1)
+            .expect("the longest admitted schedule");
+        assert_eq!(longest.num_evals(), crate::MAX_STEPS as usize);
+        let rows = crate::denoise::adaln_schedule(&longest)
+            .expect("adaln schedule")
+            .modulation_rows() as u64;
+        let widest = crate::dit::config::MODULATION_PARAMS as u64
+            * rows
+            * config.hidden_size as u64
+            * config.num_layers as u64
+            * 2;
+        assert_eq!(
+            widest, ADALN_MODULATION_TABLE_MAX_BYTES,
+            "the declared retained table must be the widest the admitted schedule can produce"
+        );
+
+        // …and it really is the worst case: a shorter schedule keeps strictly less.
+        let default = crate::denoise::JointSchedule::new(crate::DEFAULT_STEPS as usize + 1)
+            .expect("the default schedule");
+        let default_rows = crate::denoise::adaln_schedule(&default)
+            .expect("adaln schedule")
+            .modulation_rows() as u64;
+        assert!(
+            default_rows < rows,
+            "the default schedule's {default_rows} rows must sit below the admitted maximum's \
+             {rows}, or the declaration is not conservative"
+        );
+        // The gross figure is the shipped config's own projection bytes.
+        let out = config.adaln_out_features() as u64;
+        assert_eq!(
+            config.num_layers as u64 * (out * config.time_embed_dim as u64 + out) * 2,
+            ADALN_EVICTED_BYTES
+        );
     }
 }
