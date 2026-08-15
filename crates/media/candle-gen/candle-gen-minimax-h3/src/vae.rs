@@ -26,7 +26,7 @@ use crate::chunking::{TemporalGeometry, TemporalPlan};
 use crate::config::MiniMaxH3VaeConfig;
 use crate::decoder::ViT3dDecoder;
 use crate::nn::linear;
-use crate::spatial_tiling::{stitch_tiles, SpatialTiling, TilePlan};
+use crate::spatial_tiling::{BoundedStitch, SpatialTiling, TilePlan};
 use crate::vae_encoder::{DiagonalGaussian, VideoEncoder3d};
 
 /// Split a fused `to_qkv` tensor into the published checkpoint's `to_q`/`to_k`/`to_v`.
@@ -418,20 +418,26 @@ impl MiniMaxH3VideoVae {
         let cols = TilePlan::split(width, tile_width, overlap_width, ratio)?;
         let pixels = pixels.to_dtype(self.dtype)?;
 
-        let mut grid = Vec::with_capacity(rows.len());
-        for (i, &y) in rows.starts.iter().enumerate() {
-            let mut row = Vec::with_capacity(cols.len());
-            for (j, &x) in cols.starts.iter().enumerate() {
-                let tile = pixels.narrow(3, y, rows.lengths[i])?;
-                let tile = tile.narrow(4, x, cols.lengths[j])?.contiguous()?;
-                row.push(self.quant_conv(half, &half.encoder.forward(&tile)?)?);
-            }
-            grid.push(row);
-        }
         // The overlaps blend in LATENT units — the pixel overlaps are exact multiples of the
         // spatial compression ratio precisely so this division is exact.
         let latent = |o: &[usize]| o.iter().map(|v| v / ratio).collect::<Vec<usize>>();
-        stitch_tiles(&grid, &latent(&rows.overlaps), &latent(&cols.overlaps))
+        // Streamed through the same [`BoundedStitch`] the decode half uses, so the two halves of
+        // this pair do not drift apart — the failure sc-19008 already found on exactly this pair,
+        // where `encode_clip` hardcoded its tile constants while `decode_clip` read `self.tiling`.
+        let mut stitch = BoundedStitch::new(
+            rows.len(),
+            cols.len(),
+            &latent(&rows.overlaps),
+            &latent(&cols.overlaps),
+        )?;
+        for (i, &y) in rows.starts.iter().enumerate() {
+            for (j, &x) in cols.starts.iter().enumerate() {
+                let tile = pixels.narrow(3, y, rows.lengths[i])?;
+                let tile = tile.narrow(4, x, cols.lengths[j])?.contiguous()?;
+                stitch.push(self.quant_conv(half, &half.encoder.forward(&tile)?)?)?;
+            }
+        }
+        stitch.finish()
     }
 
     /// Encode normalized pixels `[B, 3, T, H, W]` into a posterior — the reference's `encode`.
@@ -569,17 +575,21 @@ impl MiniMaxH3VideoVae {
         let rows = TilePlan::split(s[3] * ratio, tile_height, overlap_height, ratio)?;
         let cols = TilePlan::split(s[4] * ratio, tile_width, overlap_width, ratio)?;
 
-        let mut grid = Vec::with_capacity(rows.len());
+        // **Rung 2 (sc-18660).** Tiles stream into a [`BoundedStitch`] rather than accumulating
+        // into a `rows x cols` grid. The tile *geometry* is pinned by output correctness
+        // (sc-18786) and cannot be a memory lever, so what rung 2 bounds is the number of decoded
+        // tiles held live: `O(cols)` strips instead of the whole grid. Bit-identical to the
+        // full-grid stitch, asserted at `max|Δ| == 0.0`.
+        let mut stitch =
+            BoundedStitch::new(rows.len(), cols.len(), &rows.overlaps, &cols.overlaps)?;
         for (i, &y) in rows.starts.iter().enumerate() {
-            let mut row = Vec::with_capacity(cols.len());
             for (j, &x) in cols.starts.iter().enumerate() {
                 let tile = z
                     .narrow(3, y / ratio, rows.lengths[i] / ratio)?
                     .narrow(4, x / ratio, cols.lengths[j] / ratio)?
                     .contiguous()?;
-                row.push(self.decode_clip_untiled(&tile)?);
+                stitch.push(self.decode_clip_untiled(&tile)?)?;
             }
-            grid.push(row);
         }
         // **The overlaps are used UNDIVIDED here.** The reference's `_encode_clip` divides them by
         // `spatial_compression_ratio` before stitching and `_decode_clip` does not: the plan is in
@@ -588,7 +598,7 @@ impl MiniMaxH3VideoVae {
         // 16× too little, so the stitched tensor comes out the wrong size: mutating the divide back
         // in at the 512×320 parity canvas returns [1, 3, 17, 752, 500] instead of
         // [1, 3, 17, 512, 320].
-        stitch_tiles(&grid, &rows.overlaps, &cols.overlaps)
+        stitch.finish()
     }
 
     /// `post_quant_conv` then the ViT decoder in ONE pass over the whole canvas.
