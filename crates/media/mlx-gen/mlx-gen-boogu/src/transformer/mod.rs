@@ -370,10 +370,16 @@ impl BooguTransformer {
     /// SC-18319 — whether **every** attention block currently holds one packed q/k/v matrix.
     ///
     /// The P6 matrix reads this as the *activation receipt* for the fused arm rather than inferring
-    /// it from a flag or from timing: a dense boogu reports `true`, and a Q4/Q8 boogu reports
-    /// `false` because the group-32 kv `out = 840` refuses the pack (see
+    /// it from a flag or from timing: a dense boogu **loaded under an opt-in** reports `true`, and a
+    /// Q4/Q8 boogu reports `false` because the group-32 kv `out = 840` refuses the pack (see
     /// `mlx_gen::qkv::NoFusion::OutFeaturesNotGroupAligned`). `false` after
     /// [`unfuse_qkv`](Self::unfuse_qkv) is the baseline arm having actually taken effect.
+    ///
+    /// Fusion is opt-in (`mlx_gen::qkv::set_fused_qkv` defaults to off), so a transformer loaded
+    /// without an explicit `FusedQkvGuard::set(true)` in scope reports `false` here for that reason
+    /// alone — `mlx_gen::qkv::NoFusion::Disabled` rather than the group-32 rule. The block's own
+    /// `FusedQkvProjection::refusal` is what distinguishes the two causes, and `transformer::block`'s
+    /// tests assert both.
     pub fn qkv_fusion_engaged(&self) -> bool {
         self.context_refiner.iter().all(|b| b.qkv_fusion_engaged())
             && self.noise_refiner.iter().all(|b| b.qkv_fusion_engaged())

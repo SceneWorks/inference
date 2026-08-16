@@ -8,7 +8,12 @@
 //!   `nn.rs`'s `compile_glue_helpers_are_bit_exact_and_modulate_dtype_policy` negative control. A
 //!   fusion that never engaged would pass a bit-exactness test trivially, so the toggle is proved to
 //!   change *which tensors are read*.
-//! * [`a_live_adapter_disables_fusion_and_is_never_dropped`] — the designed-against failure.
+//! * [`a_live_adapter_forces_the_split_backing_and_is_never_dropped`] — the designed-against failure.
+//! * [`fusion_is_opt_in_so_an_eligible_triple_is_split_by_default`] — the compiled-in default,
+//!   pinned. Fusion is opt-in, so **every** test here that means to exercise the fused arm holds a
+//!   [`FusedQkvGuard`] over the whole load (construction *and* every `quantize` / `cast_weights`,
+//!   both of which re-pack). A test that forgot would not fail quietly: each fused arm asserts
+//!   `fusion_engaged()` or `packed_shape()`, which observe the representation directly.
 
 use super::*;
 use mlx_rs::ops::array_eq;
@@ -804,6 +809,99 @@ fn fused_and_unfused_are_bit_exact_and_the_toggle_is_not_inert() {
     }
 }
 
+/// **The compiled-in default, pinned: fusion is OPT-IN** (Michael, 2026-08-16).
+///
+/// The decision this asserts is a reproducibility one, not a taste one: the fused arm's GEMM has a
+/// different `N`, MLX picks its Metal tile shape (hence accumulation order) from `(M, N, K)`, and
+/// off the self-hosted NAX build the two arms can land a few ULP apart — which a chaos sampler turns
+/// into a different image at the same seed. See [`set_fused_qkv`].
+///
+/// The assertion has to survive the obvious way of faking it — "it is not fused because it *cannot*
+/// be fused" — so the test carries its own **eligibility control**: the identical triple is built
+/// once *with* an explicit opt-in and shown to pack. Only then does the no-opt-in arm's split
+/// backing mean what it claims.
+///
+/// Three further arms, each of which would break if the default flipped back to on:
+///
+/// * the refusal **names the toggle** ([`NoFusion::Disabled`]) rather than a shape reason, so a
+///   future relaxation of the safety predicate cannot make this pass for the wrong reason;
+/// * the default survives the load path's *re-packs* — `quantize` calls
+///   [`FusedQkvProjection::repack`], which re-reads the toggle, so a default-off model does not
+///   quietly fuse itself the first time a tier is applied;
+/// * [`FusedQkvGuard`] restores the **default**, not `true`, on drop — which is what keeps every
+///   other test in this file from leaking an opt-in into this one.
+#[test]
+fn fusion_is_opt_in_so_an_eligible_triple_is_split_by_default() {
+    // The harness is single-threaded (`.cargo/config.toml` forces `RUST_TEST_THREADS=1`, so libtest
+    // runs every test on this one thread) and nothing in this crate calls `set_fused_qkv` outside a
+    // `FusedQkvGuard`. The value observed here is therefore the compiled-in default itself; if some
+    // future test leaks an opt-in, it fails HERE with a specific message instead of silently
+    // invalidating the claim below.
+    assert!(
+        !fused_qkv(),
+        "the compiled-in default must be OFF (and no test may leak an opt-in — use FusedQkvGuard, \
+         never a bare set_fused_qkv)"
+    );
+
+    // The eligibility control: this exact triple DOES pack when a caller opts in. Without it, the
+    // split backing below could be an unsafe-shape refusal wearing the default's clothes.
+    let eligible = {
+        let _g = FusedQkvGuard::set(true);
+        dense_triple(32, 64, 64, true)
+    };
+    assert!(
+        eligible.fusion_engaged(),
+        "the control triple must be fusable, or this test proves nothing: {:?}",
+        eligible.refusal()
+    );
+    assert_eq!(eligible.packed_shape(), Some(vec![192, 32]));
+    assert_eq!(eligible.refusal(), None);
+
+    // …and with NO opt-in anywhere, the same triple is split.
+    let by_default = dense_triple(32, 64, 64, true);
+    assert!(
+        !by_default.fusion_engaged(),
+        "fusion is opt-in: a triple built with no explicit set_fused_qkv(true) must stay split"
+    );
+    assert_eq!(by_default.packed_shape(), None);
+    assert_eq!(
+        by_default.refusal(),
+        Some(&NoFusion::Disabled),
+        "the refusal must name the toggle, not a shape reason"
+    );
+
+    // The default survives the load path's re-packs — `quantize` re-reads the toggle.
+    let mut quantized = dense_triple(128, 128, 64, true);
+    quantized.quantize(8, Some(64)).unwrap();
+    assert!(!quantized.fusion_engaged());
+    assert_eq!(
+        quantized.refusal(),
+        Some(&NoFusion::Disabled),
+        "quantizing must not silently opt a default-off model into fusion"
+    );
+
+    // Split is not "broken": the default arm still computes the model's output, and it is exactly
+    // the concatenation of the three separate forwards.
+    let x = seq(&[1, 3, 32], 0.013, 0.4);
+    let (q, k, v) = by_default.forward(&x).unwrap();
+    assert_eq!(q.shape(), [1, 3, 64]);
+    let reference = concatenate_axis(&[&q, &k, &v], 2).unwrap();
+    assert!(exact(&by_default.forward_packed(&x).unwrap(), &reference));
+
+    // The guard restores the DEFAULT on drop, which is the mechanism the isolation above relies on.
+    {
+        let _g = FusedQkvGuard::set(true);
+        assert!(
+            fused_qkv(),
+            "the guard must engage its opt-in for its scope"
+        );
+    }
+    assert!(
+        !fused_qkv(),
+        "the guard must restore the opt-in default (off), not leave the thread fused"
+    );
+}
+
 /// `forward_packed` (the single `[.., q+k+v]` array the primitive's [`QkvSource::Packed`] arm
 /// consumes) must be the concatenation of the three separate forwards, fused or not.
 #[test]
@@ -838,10 +936,12 @@ fn forward_packed_matches_the_concatenated_separate_forwards() {
 fn unfusing_recovers_the_three_bases_exactly() {
     let x = seq(&[1, 4, 128], 0.005, 0.35);
     for quant in [None, Some(4), Some(8)] {
-        let mut fused = {
-            let _g = FusedQkvGuard::set(true);
-            dense_triple(128, 128, 64, true)
-        };
+        // Fusion is opt-in, and the toggle is read at construction AND at every `repack` — which
+        // `quantize` (below) and the explicit `repack` at the end of this loop both run. The guard
+        // therefore spans the whole body, not just the constructor: scoping it to `dense_triple`
+        // alone would leave the later re-packs refusing with `NoFusion::Disabled`.
+        let _g = FusedQkvGuard::set(true);
+        let mut fused = dense_triple(128, 128, 64, true);
         if let Some(bits) = quant {
             fused.quantize(bits, Some(64)).unwrap();
         }
@@ -1686,11 +1786,20 @@ fn a_probe_does_not_unfuse_but_a_mutation_and_a_missing_forward_do() {
 
 /// A probe must report a live adapter honestly -- the second half of the question the probe surface
 /// exists to answer ("does this projection currently carry adapters?").
+///
+/// The fixture is asserted **packed on arrival** before anything touches it. Fusion is opt-in, so
+/// without that the "installing unfused it" assertion below would pass on a host that was never
+/// packed -- the exact false green this suite exists to avoid.
 #[test]
 fn a_probe_reports_adapter_state_without_touching_the_representation() {
     use crate::adapters::{AdaptableHost, Adapter};
 
     let mut host = probe_host(true, true);
+    assert_eq!(
+        host.block.attn.qkv.packed_shape(),
+        Some(vec![192, 64]),
+        "the fixture must start packed, or 'installing unfused it' proves nothing"
+    );
     // Installing goes through the mutation half, which unfuses (as it must).
     host.adaptable_mut(&["blocks", "0", "attn", "to_q"])
         .unwrap()
