@@ -218,9 +218,15 @@ pub const DECODE_TILE_EDGES_SWEPT: &[u32] = &[896, 768, 640, 512, 448, 384, 320,
 /// The rung-2 overlaps the sweep measured against every edge in [`DECODE_TILE_EDGES_SWEPT`].
 pub const DECODE_OVERLAPS_SWEPT: &[u32] = &[64, 128, 192, 256];
 
-/// **Rung 2 is `Missing` on SDXL/MLX, and that is a measurement.**
+/// **The route-blind rung-2 fallback is `Missing` on SDXL/MLX.**
 ///
-/// The mechanism is implemented and it works: [`Autoencoder::decode_tiled`](crate::vae::Autoencoder)
+/// The measurements below are the historical pre-SC-19753 evidence for refusing one unconditional
+/// tile domain across every route and output size. SC-19753 changed the decoder to preserve global
+/// GroupNorm statistics and packages new production-latent results as exact sealed route/geometry
+/// policies. Those rows can adopt rung 2 without weakening this fail-closed fallback; coordinates
+/// absent from the table still see [`DECODE_SUPPORT`] `Missing`.
+///
+/// The original mechanism was implemented and bounded memory: [`Autoencoder::decode_tiled`](crate::vae::Autoencoder)
 /// runs the globally-scoped decoder head (denormalize → `post_quant_conv` → `conv_in` → mid resnets →
 /// mid **self-attention**) once on the full latent and tiles only the full-resolution upsample tail,
 /// which is the same head/tail split `mlx_gen_qwen_image` uses. It bounds real memory: at 1024² bf16
@@ -312,10 +318,9 @@ pub const DECODE_OVERLAPS_SWEPT: &[u32] = &[64, 128, 192, 256];
 ///
 /// So the rung is withheld — but the reason is now stated correctly and each half is asserted by a
 /// test, and the prize is recorded with a number rather than dismissed: **−16.51% of the request
-/// peak for ~7% wall clock**, which is a better memory/latency trade than rung 4's. What would
-/// unlock it is a geometry-relative tile parameter (a fraction of the output rather than a pixel
-/// edge), or a decoder whose tail normalizes over the full extent. Both are contract-level changes,
-/// and neither is this story's.
+/// peak for ~7% wall clock**, which is a better memory/latency trade than rung 4's. SC-19753 supplies
+/// the previously missing full-extent normalization and exact geometry policy; the constant remains
+/// `Missing` only because a route-blind value cannot express that sealed identity.
 ///
 /// Publishing it as-is would be substituting quality for memory without saying so — the same refusal
 /// the catalog already makes for precision (tier integrity) and geometry (SC-15807).
@@ -836,14 +841,10 @@ fn contract_with_asset_facts(
 /// closes the path from "the code exists" to "a render silently used it".
 fn refuse_decode(provider_id: &str, edge: Option<u32>, overlap: Option<u32>) -> CoreError {
     CoreError::Unsupported(format!(
-        "{provider_id}: bounded decode is not selectable on this provider (rung 2 is declared \
-         Missing). The tiled decode was measured and withheld: its best geometry (edge \
-         {DECODE_TILE_EDGE} overlap 192) clears the 48/255 sibling bar at 1024² with 38/255, but the \
-         same edge drifts 64 at 1280², 120 at 1536² and 77 at 2048² — the upsample tail's GroupNorms \
-         normalize over each tile's own crop, so what bounds the drift is the tile's FRACTION of the \
-         output, and a fixed pixel edge cannot hold that across an advertised range up to 2048². \
-         Requested edge {edge:?} overlap {overlap:?}; see memory_strategy::DECODE_SUPPORT for the \
-         full sweep."
+        "{provider_id}: bounded decode is not selectable under the route-blind fallback (rung 2 is \
+         declared Missing). SC-19753 admits only exact sealed route/tier/mode/overlay/geometry \
+         quality rows; no applicable admitted row reached this fallback. Requested edge {edge:?} \
+         overlap {overlap:?}."
     ))
 }
 
@@ -1426,7 +1427,10 @@ mod tests {
             ..Default::default()
         };
         let err = decode_tiling(&tiled).expect_err("a bounded-decode request must be refused");
-        assert!(err.to_string().contains("38/255"), "got: {err}");
+        assert!(
+            err.to_string().contains("no applicable admitted row"),
+            "got: {err}"
+        );
 
         let chunked = GenerationRequest {
             memory: Some(GenerationMemory {

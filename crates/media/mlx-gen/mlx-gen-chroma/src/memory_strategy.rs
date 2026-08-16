@@ -27,6 +27,9 @@
 //! catalog route, tier, mode, overlay and output geometry by packaging a sealed production-latent
 //! quality policy. Coordinates absent from that table remain refused; an empty table preserves the
 //! default and the existing estimated-fit fallback.
+//! SC-19753 changes the decoder to preserve full-activation GroupNorm statistics and refreshes the
+//! packaged policy rows; the pre-SC-19753 drift figures below remain historical context for the
+//! route-blind fallback, not claims about the new layer-wise tiled arithmetic.
 //!
 //! Rung 4's saving is attributed rather than assumed: 4.5133 GiB measured against a 4.5125 GiB
 //! windowable block weight set read from the snapshot's own safetensors `data_offsets` — the whole
@@ -93,9 +96,9 @@ pub const DECODE_TILE_EDGES_SWEPT: &[u32] = &[960, 896, 832, 768, 640, 512, 384]
 /// Feather overlaps swept beside [`DECODE_TILE_EDGES_SWEPT`].
 pub const DECODE_OVERLAPS_SWEPT: &[u32] = &[64, 128, 192, 256];
 
-/// **Rung 2 is `Missing`, and the reason is a NARROW margin rather than a clear failure.**
+/// **The route-blind rung-2 fallback is `Missing`.**
 ///
-/// Measured on Chroma1-Base q4 at 1024² at the variant's real **28-step** schedule
+/// The following pre-SC-19753 history was measured on Chroma1-Base q4 at 1024² at the variant's real **28-step** schedule
 /// (`decode_tile_mechanism_sweep_on_the_production_latent`), against the exact untiled decode of the
 /// **production** latent — what the denoiser hands the decode phase, not a re-encoded finished image
 /// whose statistics have already been through the VAE round trip:
@@ -141,13 +144,9 @@ pub const DECODE_OVERLAPS_SWEPT: &[u32] = &[64, 128, 192, 256];
 /// clean rejection: on this evidence `max Δ` against a borrowed 48/255 threshold does not resolve
 /// this candidate in either direction.
 ///
-/// The rung therefore ships `Missing` **because nothing here supports admitting it**, and the
-/// withholding reason is recorded as an unresolved margin. Admitting it would need a quality
-/// methodology this epic has not agreed on — a perceptual metric, or a distributional bar derived
-/// for this family rather than borrowed from a sibling — and shipping it on a margin narrower than
-/// its own seed-to-seed noise would be exactly the inherited-verdict failure the epic exists to
-/// prevent. `the_rung_two_drift_margin_is_resampled_across_seeds` pins the verdict CLASS, so a move
-/// to a clean failure or to admissibility reddens rather than sitting stale.
+/// Those results explain why the route-blind constant stays fail-closed. SC-19753 does not promote
+/// the constant; it packages new exact production-latent geometry rows, leaving every absent or
+/// mismatched coordinate refused.
 pub const DECODE_SUPPORT: bool = false;
 /// The native VAE tile ladder this provider *would* publish, and the reference domain its checked
 /// [`mlx_gen_pid::DecodeRoutes`] is constructed from so the native and PiD domains stay provably

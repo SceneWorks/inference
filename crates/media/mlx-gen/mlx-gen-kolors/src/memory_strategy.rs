@@ -100,9 +100,15 @@ pub const DECODE_OVERLAPS_SWEPT: &[u32] = &[64, 128, 192, 256];
 /// exists for Kolors — which runs literally the same `sdxl-vae-fp16-fix` decoder.
 pub const DECODE_DRIFT_BAR: u32 = 48;
 
-/// **Rung 2 is `Missing` on Kolors/MLX, and that is a measurement taken on Kolors' own weights.**
+/// **The route-blind rung-2 fallback is `Missing` on Kolors/MLX.**
 ///
-/// The mechanism is implemented and it works. Kolors decodes through [`mlx_gen_sdxl::Autoencoder`] —
+/// The measurements below are the historical pre-SC-19753 evidence for refusing one unconditional
+/// tile domain across every output. SC-19753 changed the shared decoder to preserve global GroupNorm
+/// statistics and packages new production-latent results as exact sealed route/geometry policies.
+/// Those rows can adopt rung 2 without weakening this fail-closed fallback; coordinates absent from
+/// the table still see [`DECODE_SUPPORT`] `Missing`.
+///
+/// The original mechanism was implemented and bounded memory. Kolors decodes through [`mlx_gen_sdxl::Autoencoder`] —
 /// the same `sdxl-vae-fp16-fix` `AutoencoderKL` SDXL uses — so `decode_tiled` runs the globally-scoped
 /// head (denormalize → `post_quant_conv` → `conv_in` → mid resnets → mid **self-attention**) once on
 /// the full latent and tiles only the full-resolution upsample tail.
@@ -186,9 +192,8 @@ pub const DECODE_DRIFT_BAR: u32 = 48;
 /// misstated the best geometry (896 vs 768), the best overlap (192 vs 256), the prize (−16.51% vs
 /// −37.67%) and which output sizes clear.
 ///
-/// What would unlock it is a geometry-relative tile parameter (a fraction of the output rather than
-/// a pixel edge), or a decoder whose tail normalizes over the full extent. Both are contract-level
-/// changes, and neither is this story's — tracked as sc-17678.
+/// SC-19753 supplies the previously missing full-extent normalization and exact geometry policy. The
+/// constant remains `Missing` only because a route-blind value cannot express that sealed identity.
 pub const DECODE_SUPPORT: MemoryStrategySupport = MemoryStrategySupport::Missing;
 
 /// The attention chunk size the rung-3 sweep exercised.
@@ -1009,15 +1014,10 @@ fn contract_with_asset_facts(
 /// This closes the path from "the code exists" to "a render silently used it".
 fn refuse_decode(provider_id: &str, edge: Option<u32>, overlap: Option<u32>) -> CoreError {
     CoreError::Unsupported(format!(
-        "{provider_id}: bounded decode is not selectable on this provider (rung 2 is declared \
-         Missing). The tiled decode was measured and withheld — NOT because no geometry works: its \
-         best (edge {DECODE_TILE_EDGE} overlap {DECODE_OVERLAP}) clears the \
-         {DECODE_DRIFT_BAR}/255 sibling bar at 1024² with 38/255 and at 1280² with 26/255, and \
-         would have bought -37.67% of the request peak for +10% wall clock. It fails at 1536² \
-         (69/255) and 2048² (53/255), because the upsample tail's GroupNorms normalize over each \
-         tile's own crop — so what bounds the drift is the tile's FRACTION of the output, and a \
-         fixed pixel edge cannot hold that across an advertised range up to 2048². Requested edge \
-         {edge:?} overlap {overlap:?}; see memory_strategy::DECODE_SUPPORT for the full sweep."
+        "{provider_id}: bounded decode is not selectable under the route-blind fallback (rung 2 is \
+         declared Missing). SC-19753 admits only exact sealed route/tier/mode/overlay/geometry \
+         quality rows; no applicable admitted row reached this fallback. Requested edge {edge:?} \
+         overlap {overlap:?}."
     ))
 }
 
@@ -2119,7 +2119,10 @@ mod tests {
             ..Default::default()
         };
         let err = decode_tiling(&tiled).expect_err("a bounded-decode request must be refused");
-        assert!(err.to_string().contains("38/255"), "got: {err}");
+        assert!(
+            err.to_string().contains("no applicable admitted row"),
+            "got: {err}"
+        );
 
         let chunked = GenerationRequest {
             memory: Some(GenerationMemory {
