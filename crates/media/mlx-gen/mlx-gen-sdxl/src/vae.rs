@@ -624,7 +624,7 @@ mod tests {
             tensors.insert(
                 format!("{prefix}.{name}.weight"),
                 add(
-                    &values(&[CHANNELS], phase + offset, 0.15),
+                    values(&[CHANNELS], phase + offset, 0.15),
                     Array::from_f32(1.0),
                 )
                 .unwrap(),
