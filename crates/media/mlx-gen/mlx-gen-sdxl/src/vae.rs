@@ -140,6 +140,40 @@ impl EncoderDecoderBlock2D {
         }
         Ok(x)
     }
+
+    fn forward_tiled_decode(
+        &self,
+        x: &Array,
+        tile_edge: i32,
+        upsampled_tile_edge: i32,
+        cancel: Option<&mlx_gen::CancelFlag>,
+    ) -> Result<Array> {
+        if self.downsample.is_some() {
+            return Err(mlx_gen::Error::Msg(
+                "SDXL tiled decode cannot run an encoder/downsample block".into(),
+            ));
+        }
+        let mut x = x.clone();
+        for resnet in &self.resnets {
+            x = resnet.forward_tiled_vae(&x, tile_edge, cancel)?;
+        }
+        if let Some((cw, cb)) = &self.upsample {
+            let up = upsample_nearest(&x, 2)?;
+            x = mlx_gen::vae_tiling::tiled_conv2d_3x3_nhwc(
+                &up,
+                cw,
+                Some(cb),
+                upsampled_tile_edge,
+                cancel,
+                |tile| Ok(tile.clone()),
+            )?;
+        }
+        Ok(x)
+    }
+
+    fn upsamples(&self) -> bool {
+        self.upsample.is_some()
+    }
 }
 
 /// The decoder (latent → image).
@@ -207,15 +241,10 @@ impl Decoder {
         self.mid_resnet1.forward(&x, None)
     }
 
-    /// The **spatially-local** half of the decode: the four `up_blocks` (×8 nearest+conv upsample)
-    /// and the `conv_norm_out` → `silu` → `conv_out` head. This is where the full-resolution
-    /// activations live, and it is what rung 2 tiles.
-    ///
-    /// It is *not* purely local: every `ResnetBlock2D` and the final `conv_norm_out` are GroupNorms
-    /// whose statistics are computed over the spatial extent they are handed. A tile therefore
-    /// normalizes against its own statistics rather than the image's, which is a real (bounded)
-    /// deviation and the reason the admitted tile ladder is a measurement rather than a preset —
-    /// see [`crate::memory_strategy::DECODE_SUPPORT`].
+    /// The dense upsample half of the decode: the four `up_blocks` (×8 nearest+conv upsample) and
+    /// `conv_norm_out` → `silu` → `conv_out`. This is where full-resolution activations live.
+    /// GroupNorms span the full image, so the bounded path uses [`Self::tail_tiled`] to retain those
+    /// global statistics and tile each 3×3 convolution layer instead of tiling this whole tail.
     fn tail(&self, x: &Array) -> Result<Array> {
         let mut x = x.clone();
         for ub in &self.up_blocks {
@@ -223,6 +252,57 @@ impl Decoder {
         }
         let x = group_norm(&x, &self.norm_out_w, &self.norm_out_b, GN_GROUPS, GN_EPS)?;
         conv2d(&silu(&x)?, &self.conv_out_w, Some(&self.conv_out_b), 1, 1)
+    }
+
+    /// Layer-wise bounded tail with dense-image GroupNorm semantics (sc-19753).
+    fn tail_tiled(
+        &self,
+        x: &Array,
+        output_tile_edge: i32,
+        cancel: Option<&mlx_gen::CancelFlag>,
+    ) -> Result<Array> {
+        if cancel.is_some_and(mlx_gen::CancelFlag::is_cancelled) {
+            return Err(mlx_gen::Error::Canceled);
+        }
+        let tile_edge_at = |remaining_scale: i32| {
+            ((output_tile_edge + remaining_scale - 1) / remaining_scale).max(3)
+        };
+        let mut remaining_scale = self
+            .up_blocks
+            .iter()
+            .filter(|block| block.upsamples())
+            .fold(1_i32, |scale, _| scale.saturating_mul(2));
+        let mut x = x.clone();
+        for up in &self.up_blocks {
+            let current_edge = tile_edge_at(remaining_scale);
+            let next_scale = if up.upsamples() {
+                (remaining_scale / 2).max(1)
+            } else {
+                remaining_scale
+            };
+            x = up.forward_tiled_decode(&x, current_edge, tile_edge_at(next_scale), cancel)?;
+            remaining_scale = next_scale;
+        }
+        if remaining_scale != 1 {
+            return Err(mlx_gen::Error::Msg(format!(
+                "SDXL tiled VAE tail ended at remaining spatial scale {remaining_scale}, expected 1"
+            )));
+        }
+        let norm = mlx_gen::vae_tiling::GlobalGroupNorm::new(
+            &x,
+            &self.norm_out_w,
+            &self.norm_out_b,
+            GN_GROUPS,
+            GN_EPS,
+        )?;
+        mlx_gen::vae_tiling::tiled_conv2d_3x3_nhwc(
+            &x,
+            &self.conv_out_w,
+            Some(&self.conv_out_b),
+            output_tile_edge.max(3),
+            cancel,
+            |tile| silu(&norm.apply(tile)?),
+        )
     }
 }
 
@@ -331,11 +411,10 @@ impl Autoencoder {
     /// [`mlx_gen::vae_tiling::tiled_decode`] — this crate contributes only the head/tail split and
     /// the NHWC axis mapping.
     ///
-    /// **What is exact and what is not.** Denormalize, `post_quant_conv`, `conv_in`, the mid resnets
-    /// and the mid **attention** run once on the full latent (`Decoder::head`), so nothing globally
-    /// scoped is tiled. The tail's GroupNorms *are* tiled, and they normalize against per-tile
-    /// statistics — a bounded deviation from the untiled reference which is swept and published as
-    /// [`crate::memory_strategy::DECODE_SUPPORT`] rather than assumed away.
+    /// **Normalization semantics.** Denormalize, `post_quant_conv`, `conv_in`, the mid resnets and
+    /// mid **attention** run once on the full latent (`Decoder::head`). In the tail, every GroupNorm
+    /// reduces the full layer activation; only halo-expanded 3×3 convolution work tiles. This fixes
+    /// the per-crop normalization drift measured by sc-19753 without widening the quality bar.
     ///
     /// `cancel` is checked between tiles by the shared loop; decode is a dominant fraction of an SDXL
     /// render's wall clock and previously had no cancellation point at all.
@@ -358,24 +437,20 @@ impl Autoencoder {
         if !cfg.needs_tiling(VAE_TILING, 1, hl, wl) {
             return self.decode(latents);
         }
+        if cancel.is_some_and(mlx_gen::CancelFlag::is_cancelled) {
+            return Err(mlx_gen::Error::Canceled);
+        }
         let z = multiply(latents, scalar(1.0 / self.scaling_factor))?;
         let z = self.post_quant_proj.forward(&z)?;
-        // Head once on the whole latent, then a singleton temporal axis so the shared rank-5
-        // slice/pad/accumulate loop can address it: `[B, 1, Hl, Wl, C]`, tiled axes `[1, 2, 3]`.
+        // Head once on the whole latent. The tail tiles layer-by-layer so every GroupNorm keeps the
+        // dense image's statistics while each 3×3 convolution stays bounded by the selected edge.
         let head = self.decoder.head(&z)?;
-        let hs = head.shape();
-        let head = head.reshape(&[hs[0], 1, hs[1], hs[2], hs[3]])?;
-        let plan = cfg.plan(VAE_TILING, 1, hl, wl);
-        let out = mlx_gen::vae_tiling::tiled_decode(&head, &plan, [1, 2, 3], cancel, |tile| {
-            let ts = tile.shape();
-            let tail = self
-                .decoder
-                .tail(&tile.reshape(&[ts[0], ts[2], ts[3], ts[4]])?)?;
-            let os = tail.shape();
-            Ok(tail.reshape(&[os[0], 1, os[1], os[2], os[3]])?)
-        })?;
-        let os = out.shape();
-        Ok(out.reshape(&[os[0], os[2], os[3], os[4]])?)
+        let tile_edge = cfg
+            .spatial
+            .as_ref()
+            .ok_or_else(|| mlx_gen::Error::Msg("SDXL tiled decode requires spatial tiling".into()))?
+            .tile_px;
+        self.decoder.tail_tiled(&head, tile_edge, cancel)
     }
 
     /// Encode an image `[B, 3, ...]`-normalized NHWC `[B, H, W, 3]` → latent **mean** `[B, H/8, W/8,
@@ -505,5 +580,227 @@ mod decoder_seam_tests {
             rgb_nchw.reshape(&[-1]).unwrap().as_slice::<f32>(),
             expected_nchw
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+    use mlx_gen::tiling::TilingConfig;
+    use mlx_gen::{CancelFlag, Error};
+
+    const CHANNELS: i32 = 32;
+
+    fn values(shape: &[i32], phase: f32, scale: f32) -> Array {
+        let count = shape.iter().product::<i32>();
+        let values = (0..count)
+            .map(|i| ((i as f32 + phase) * 0.071).sin() * scale)
+            .collect::<Vec<_>>();
+        Array::from_slice(&values, shape)
+    }
+
+    fn insert_conv(
+        tensors: &mut HashMap<String, Array>,
+        prefix: &str,
+        input: i32,
+        output: i32,
+        kernel: i32,
+        phase: f32,
+    ) {
+        tensors.insert(
+            format!("{prefix}.weight"),
+            values(&[output, input, kernel, kernel], phase, 0.025),
+        );
+        tensors.insert(
+            format!("{prefix}.bias"),
+            values(&[output], phase + 3.0, 0.01),
+        );
+    }
+
+    fn insert_resnet(tensors: &mut HashMap<String, Array>, prefix: &str, phase: f32) {
+        for (name, offset) in [("norm1", 0.0), ("norm2", 1.0)] {
+            tensors.insert(
+                format!("{prefix}.{name}.weight"),
+                add(
+                    &values(&[CHANNELS], phase + offset, 0.15),
+                    Array::from_f32(1.0),
+                )
+                .unwrap(),
+            );
+            tensors.insert(
+                format!("{prefix}.{name}.bias"),
+                values(&[CHANNELS], phase + offset + 2.0, 0.05),
+            );
+        }
+        insert_conv(
+            tensors,
+            &format!("{prefix}.conv1"),
+            CHANNELS,
+            CHANNELS,
+            3,
+            phase + 4.0,
+        );
+        insert_conv(
+            tensors,
+            &format!("{prefix}.conv2"),
+            CHANNELS,
+            CHANNELS,
+            3,
+            phase + 5.0,
+        );
+    }
+
+    fn insert_attention(tensors: &mut HashMap<String, Array>, prefix: &str, phase: f32) {
+        tensors.insert(
+            format!("{prefix}.group_norm.weight"),
+            Array::ones::<f32>(&[CHANNELS]).unwrap(),
+        );
+        tensors.insert(
+            format!("{prefix}.group_norm.bias"),
+            values(&[CHANNELS], phase, 0.03),
+        );
+        for (index, name) in ["to_q", "to_k", "to_v", "to_out.0"].iter().enumerate() {
+            tensors.insert(
+                format!("{prefix}.{name}.weight"),
+                values(&[CHANNELS, CHANNELS], phase + index as f32 + 1.0, 0.02),
+            );
+            tensors.insert(
+                format!("{prefix}.{name}.bias"),
+                values(&[CHANNELS], phase + index as f32 + 5.0, 0.005),
+            );
+        }
+    }
+
+    fn insert_mid(tensors: &mut HashMap<String, Array>, prefix: &str, phase: f32) {
+        insert_resnet(tensors, &format!("{prefix}.resnets.0"), phase);
+        insert_attention(tensors, &format!("{prefix}.attentions.0"), phase + 10.0);
+        insert_resnet(tensors, &format!("{prefix}.resnets.1"), phase + 20.0);
+    }
+
+    fn fixture() -> (Weights, VaeConfig) {
+        let cfg = VaeConfig {
+            in_channels: 3,
+            out_channels: 3,
+            latent_channels_out: 8,
+            latent_channels_in: 4,
+            block_out_channels: vec![CHANNELS, CHANNELS],
+            layers_per_block: 1,
+            norm_num_groups: 32,
+            scaling_factor: 0.13025,
+        };
+        let mut tensors = HashMap::new();
+
+        insert_conv(&mut tensors, "decoder.conv_in", 4, CHANNELS, 3, 1.0);
+        insert_mid(&mut tensors, "decoder.mid_block", 10.0);
+        for block in 0..2 {
+            for resnet in 0..2 {
+                insert_resnet(
+                    &mut tensors,
+                    &format!("decoder.up_blocks.{block}.resnets.{resnet}"),
+                    40.0 + (block * 10 + resnet) as f32,
+                );
+            }
+        }
+        insert_conv(
+            &mut tensors,
+            "decoder.up_blocks.0.upsamplers.0.conv",
+            CHANNELS,
+            CHANNELS,
+            3,
+            70.0,
+        );
+        tensors.insert(
+            "decoder.conv_norm_out.weight".into(),
+            Array::ones::<f32>(&[CHANNELS]).unwrap(),
+        );
+        tensors.insert(
+            "decoder.conv_norm_out.bias".into(),
+            values(&[CHANNELS], 72.0, 0.04),
+        );
+        insert_conv(&mut tensors, "decoder.conv_out", CHANNELS, 3, 3, 74.0);
+
+        insert_conv(&mut tensors, "encoder.conv_in", 3, CHANNELS, 3, 80.0);
+        for block in 0..2 {
+            insert_resnet(
+                &mut tensors,
+                &format!("encoder.down_blocks.{block}.resnets.0"),
+                90.0 + block as f32 * 10.0,
+            );
+        }
+        insert_conv(
+            &mut tensors,
+            "encoder.down_blocks.0.downsamplers.0.conv",
+            CHANNELS,
+            CHANNELS,
+            3,
+            112.0,
+        );
+        insert_mid(&mut tensors, "encoder.mid_block", 120.0);
+        tensors.insert(
+            "encoder.conv_norm_out.weight".into(),
+            Array::ones::<f32>(&[CHANNELS]).unwrap(),
+        );
+        tensors.insert(
+            "encoder.conv_norm_out.bias".into(),
+            values(&[CHANNELS], 145.0, 0.04),
+        );
+        insert_conv(&mut tensors, "encoder.conv_out", CHANNELS, 8, 3, 150.0);
+        insert_conv(&mut tensors, "quant_conv", 8, 8, 1, 160.0);
+        insert_conv(&mut tensors, "post_quant_conv", 4, 4, 1, 170.0);
+
+        (Weights::from_map(tensors), cfg)
+    }
+
+    fn latent() -> Array {
+        let shape = [1, 8, 9, 4];
+        let count = shape.iter().product::<i32>();
+        let values = (0..count)
+            .map(|i| {
+                let y = (i / shape[3] / shape[2]) as f32;
+                let x = (i / shape[3] % shape[2]) as f32;
+                (i as f32 * 0.037).sin() + y * 0.11 - x * 0.07
+            })
+            .collect::<Vec<_>>();
+        Array::from_slice(&values, &shape)
+    }
+
+    /// This test crosses the public autoencoder seam. The synthetic input is deliberately
+    /// position-dependent so replacing global GroupNorm statistics with per-crop statistics makes
+    /// the assertion fail even though both paths retain the same shape.
+    #[test]
+    fn tiled_autoencoder_decode_tracks_dense_with_global_group_norm() {
+        let (weights, cfg) = fixture();
+        let vae = Autoencoder::from_weights(&weights, &cfg).unwrap();
+        let latent = latent();
+        let dense = vae.decode(&latent).unwrap();
+        let tiled = vae
+            .decode_tiled(&latent, &TilingConfig::spatial_only(8, 0), None)
+            .unwrap();
+        dense.eval().unwrap();
+        tiled.eval().unwrap();
+        assert_eq!(tiled.shape(), dense.shape());
+
+        let max_delta = dense
+            .as_slice::<f32>()
+            .iter()
+            .zip(tiled.as_slice::<f32>())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_delta < 3e-3,
+            "layer-wise tiled SDXL VAE diverged from dense decode: max|delta|={max_delta:.3e}"
+        );
+    }
+
+    #[test]
+    fn tiled_autoencoder_decode_honors_pretripped_cancel() {
+        let (weights, cfg) = fixture();
+        let vae = Autoencoder::from_weights(&weights, &cfg).unwrap();
+        let cancel = CancelFlag::new();
+        cancel.cancel();
+        let result = vae.decode_tiled(&latent(), &TilingConfig::spatial_only(8, 0), Some(&cancel));
+        assert!(matches!(result, Err(Error::Canceled)));
     }
 }

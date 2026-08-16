@@ -17,8 +17,176 @@
 use crate::array::scalar;
 use crate::tiling::{TilePlan, MAX_WRITABLE_ELEMS};
 use crate::{CancelFlag, Error, Result};
-use mlx_rs::ops::{add, divide, maximum, multiply, pad};
+use mlx_rs::ops::{add, concatenate_axis, divide, maximum, multiply, pad, rsqrt, subtract};
 use mlx_rs::Array;
+
+/// Global GroupNorm statistics for an NHWC activation.
+///
+/// Whole-tail VAE tiling is not normalization-correct: every tile computes GroupNorm against its
+/// own crop, while dense decode normalizes against the whole image. This context reduces the full
+/// activation once to per-batch/per-group mean and inverse standard deviation, then applies those
+/// same statistics to halo-expanded convolution tiles. Only the tiny statistics arrays are kept;
+/// the full normalized activation is never materialized.
+pub struct GlobalGroupNorm {
+    mean: Array,
+    inv_std: Array,
+    weight: Array,
+    bias: Array,
+    groups: i32,
+    channels: i32,
+}
+
+impl GlobalGroupNorm {
+    /// Capture dense GroupNorm statistics for an NHWC rank-4 activation.
+    pub fn new(x: &Array, weight: &Array, bias: &Array, groups: i32, eps: f32) -> Result<Self> {
+        let shape = x.shape();
+        if shape.len() != 4 {
+            return Err(Error::Msg(format!(
+                "global group norm expects NHWC rank 4, got {shape:?}"
+            )));
+        }
+        let (batch, height, width, channels) = (shape[0], shape[1], shape[2], shape[3]);
+        if groups <= 0 || channels % groups != 0 {
+            return Err(Error::Msg(format!(
+                "global group norm: channel count {channels} not divisible by groups {groups}"
+            )));
+        }
+        if weight.shape() != [channels] || bias.shape() != [channels] {
+            return Err(Error::Msg(format!(
+                "global group norm: affine shapes must both be [{channels}], got {:?} and {:?}",
+                weight.shape(),
+                bias.shape()
+            )));
+        }
+
+        let group_size = channels / groups;
+        let grouped = x
+            .reshape(&[batch, height, width, groups, group_size])?
+            .transpose_axes(&[0, 3, 1, 2, 4])?;
+        let mean = grouped.mean_axes(&[2, 3, 4], Some(true))?;
+        let variance = grouped.var_axes(&[2, 3, 4], Some(true), None)?;
+        let inv_std = rsqrt(&add(&variance, scalar(eps))?)?;
+        mean.eval()?;
+        inv_std.eval()?;
+
+        Ok(Self {
+            mean,
+            inv_std,
+            weight: weight.clone(),
+            bias: bias.clone(),
+            groups,
+            channels,
+        })
+    }
+
+    /// Normalize one NHWC crop with the full activation's statistics and affine parameters.
+    pub fn apply(&self, tile: &Array) -> Result<Array> {
+        let shape = tile.shape();
+        if shape.len() != 4 || shape[3] != self.channels {
+            return Err(Error::Msg(format!(
+                "global group norm crop must be NHWC with {} channels, got {shape:?}",
+                self.channels
+            )));
+        }
+        let (batch, height, width) = (shape[0], shape[1], shape[2]);
+        let group_size = self.channels / self.groups;
+        let grouped = tile
+            .reshape(&[batch, height, width, self.groups, group_size])?
+            .transpose_axes(&[0, 3, 1, 2, 4])?;
+        let normalized = multiply(&subtract(&grouped, &self.mean)?, &self.inv_std)?
+            .transpose_axes(&[0, 2, 3, 1, 4])?
+            .reshape(&[batch, height, width, self.channels])?;
+        Ok(add(&multiply(&normalized, &self.weight)?, &self.bias)?)
+    }
+}
+
+/// Apply one NHWC 3×3/pad-1 convolution with bounded spatial work and exact convolution halos.
+///
+/// The output is partitioned into non-overlapping cores. Each input crop expands by one pixel on
+/// every available side, `preprocess` runs on that halo-expanded crop (typically global-stat
+/// GroupNorm + SiLU), and the convolution's halo is cropped away before accumulation. Internal tile
+/// boundaries therefore never observe synthetic padding and never require a blend. `max_tile_edge`
+/// bounds the expanded convolution input, not merely the written core.
+pub fn tiled_conv2d_3x3_nhwc(
+    x: &Array,
+    weight: &Array,
+    bias: Option<&Array>,
+    max_tile_edge: i32,
+    cancel: Option<&CancelFlag>,
+    preprocess: impl Fn(&Array) -> Result<Array>,
+) -> Result<Array> {
+    let shape = x.shape();
+    if shape.len() != 4 {
+        return Err(Error::Msg(format!(
+            "tiled conv2d expects NHWC rank 4, got {shape:?}"
+        )));
+    }
+    let weight_shape = weight.shape();
+    if weight_shape.len() != 4 || weight_shape[1] != 3 || weight_shape[2] != 3 {
+        return Err(Error::Msg(format!(
+            "tiled conv2d expects [out,3,3,in] weights, got {weight_shape:?}"
+        )));
+    }
+    if max_tile_edge < 3 {
+        return Err(Error::Msg(format!(
+            "tiled conv2d needs max_tile_edge >= 3, got {max_tile_edge}"
+        )));
+    }
+    let (batch, height, width) = (shape[0], shape[1], shape[2]);
+    let out_channels = weight_shape[0];
+    if height <= max_tile_edge && width <= max_tile_edge {
+        if cancel.is_some_and(CancelFlag::is_cancelled) {
+            return Err(Error::Canceled);
+        }
+        return crate::nn::conv2d(&preprocess(x)?, weight, bias, 1, 1);
+    }
+
+    const HALO: i32 = 1;
+    let core_edge = max_tile_edge - 2 * HALO;
+    let mut rows = Vec::new();
+    let mut y0 = 0;
+    while y0 < height {
+        let y1 = (y0 + core_edge).min(height);
+        let input_y0 = (y0 - HALO).max(0);
+        let input_y1 = (y1 + HALO).min(height);
+        let mut cores = Vec::new();
+        let mut x0 = 0;
+        while x0 < width {
+            if cancel.is_some_and(CancelFlag::is_cancelled) {
+                return Err(Error::Canceled);
+            }
+            let x1 = (x0 + core_edge).min(width);
+            let input_x0 = (x0 - HALO).max(0);
+            let input_x1 = (x1 + HALO).min(width);
+
+            let tile = slice_axis(x, 1, input_y0, input_y1)?;
+            let tile = slice_axis(&tile, 2, input_x0, input_x1)?;
+            let tile = preprocess(&tile)?;
+            let convolved = crate::nn::conv2d(&tile, weight, bias, 1, 1)?;
+            let crop_y0 = y0 - input_y0;
+            let crop_x0 = x0 - input_x0;
+            let core = slice_axis(&convolved, 1, crop_y0, crop_y0 + (y1 - y0))?;
+            let core = slice_axis(&core, 2, crop_x0, crop_x0 + (x1 - x0))?;
+            core.eval()?;
+            cores.push(core);
+            x0 = x1;
+        }
+        let core_refs = cores.iter().collect::<Vec<_>>();
+        let row = concatenate_axis(&core_refs, 2)?;
+        row.eval()?;
+        rows.push(row);
+        y0 = y1;
+    }
+
+    if rows.is_empty() {
+        return Err(Error::Msg("tiled conv2d produced no tiles".into()));
+    }
+    let row_refs = rows.iter().collect::<Vec<_>>();
+    let output = concatenate_axis(&row_refs, 1)?;
+    output.eval()?;
+    debug_assert_eq!(output.shape(), &[batch, height, width, out_channels]);
+    crate::array::contiguous(&output)
+}
 
 /// Refuse — with a catchable error — building an over-[`MAX_WRITABLE_ELEMS`] array **from a host
 /// buffer via `from_slice`** (the one write path still `i32`-capped on this pin). `full_elems` is the
@@ -297,6 +465,72 @@ mod tests {
         assert!(
             max < 1e-4,
             "image tiled blend did not reconstruct: max|Δ|={max:.3e}"
+        );
+    }
+
+    /// sc-19753: layer-wise convolution tiling must use the dense activation's GroupNorm
+    /// statistics. A whole-tail tiled decoder instead normalizes every crop independently and is
+    /// exactly the bug this regression guards against. Position-dependent values make those local
+    /// statistics observably different; the halo/core convolution path must still track the dense
+    /// GroupNorm→SiLU→3×3 convolution.
+    #[test]
+    fn global_group_norm_tiled_conv_tracks_dense_layer() {
+        let (batch, height, width, channels, out_channels) = (1, 7, 9, 32, 3);
+        let values = (0..batch * height * width * channels)
+            .map(|i| {
+                let y = (i / channels / width) as f32;
+                let x = (i / channels % width) as f32;
+                (i as f32 * 0.071).sin() + y * 0.17 - x * 0.09
+            })
+            .collect::<Vec<_>>();
+        let x = Array::from_slice(&values, &[batch, height, width, channels]);
+        let norm_weight = Array::from_slice(
+            &(0..channels)
+                .map(|i| 0.7 + i as f32 * 0.013)
+                .collect::<Vec<_>>(),
+            &[channels],
+        );
+        let norm_bias = Array::from_slice(
+            &(0..channels)
+                .map(|i| (i as f32 * 0.31).cos() * 0.08)
+                .collect::<Vec<_>>(),
+            &[channels],
+        );
+        let conv_weight = Array::from_slice(
+            &(0..out_channels * 3 * 3 * channels)
+                .map(|i| (i as f32 * 0.037).sin() * 0.025)
+                .collect::<Vec<_>>(),
+            &[out_channels, 3, 3, channels],
+        );
+        let conv_bias = Array::from_slice(&[0.02f32, -0.03, 0.01], &[out_channels]);
+
+        let dense_norm = crate::nn::group_norm(&x, &norm_weight, &norm_bias, 4, 1e-5).unwrap();
+        let dense = crate::nn::conv2d(
+            &crate::nn::silu(&dense_norm).unwrap(),
+            &conv_weight,
+            Some(&conv_bias),
+            1,
+            1,
+        )
+        .unwrap();
+
+        let global = GlobalGroupNorm::new(&x, &norm_weight, &norm_bias, 4, 1e-5).unwrap();
+        let tiled = tiled_conv2d_3x3_nhwc(&x, &conv_weight, Some(&conv_bias), 5, None, |tile| {
+            crate::nn::silu(&global.apply(tile)?)
+        })
+        .unwrap();
+        dense.eval().unwrap();
+        tiled.eval().unwrap();
+        assert_eq!(tiled.shape(), dense.shape());
+        let max = tiled
+            .as_slice::<f32>()
+            .iter()
+            .zip(dense.as_slice::<f32>())
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max < 2e-4,
+            "global-stat tiled layer diverged from dense GroupNorm+conv: max|Δ|={max:.3e}"
         );
     }
 
