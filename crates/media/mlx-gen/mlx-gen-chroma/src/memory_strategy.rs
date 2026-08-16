@@ -19,7 +19,7 @@
 //! |---|---|---|---|
 //! | 0 resident | — | 28.0779 GiB | baseline |
 //! | 1 staged residency | shed T5-XXL before the DiT/VAE load, per request | **19.2065 GiB (−31.60%)** | Implemented |
-//! | 2 bounded decode | `Vae::decode_tiled` on the FLUX.1 16-ch AutoencoderKL | bounds the phase; **fails quality** | Missing, see [`DECODE_SUPPORT`] |
+//! | 2 bounded decode | `Vae::decode_tiled` on the FLUX.1 16-ch AutoencoderKL | bounds the phase; SC-19753 preserves full-image GroupNorm statistics | route-blind Missing; exact measured rows may be Implemented, see [`DECODE_SUPPORT`] |
 //! | 3 bounded attention | `sdpa_budgeted_bhsd` on both block stacks | bounds the phase; **not the binding one** | Missing, see [`ATTENTION_SUPPORT`] |
 //! | 4 bounded transformer residency | `run_windowed` over the two DiT sub-stacks | **14.6932 GiB (−23.50% on rung 1)** | Implemented |
 //!
@@ -27,6 +27,9 @@
 //! catalog route, tier, mode, overlay and output geometry by packaging a sealed production-latent
 //! quality policy. Coordinates absent from that table remain refused; an empty table preserves the
 //! default and the existing estimated-fit fallback.
+//! SC-19753 changes the decoder to preserve full-activation GroupNorm statistics and refreshes the
+//! packaged policy rows; the pre-SC-19753 drift figures below remain historical context for the
+//! route-blind fallback, not claims about the new layer-wise tiled arithmetic.
 //!
 //! Rung 4's saving is attributed rather than assumed: 4.5133 GiB measured against a 4.5125 GiB
 //! windowable block weight set read from the snapshot's own safetensors `data_offsets` — the whole
@@ -38,12 +41,10 @@
 //! Two verdicts here are the opposite of what the architecture suggests, and both were reached by
 //! measuring rather than by reasoning from the sibling families:
 //!
-//! * **Rung 2 is `Missing`, on a narrow margin.** Tiling the FLUX.1 VAE decode is a large saving on
-//!   this family (−11% to −72% of the decode phase). At the variant's real 28-step schedule the best
-//!   of 28 swept geometries drifts **53/255** against the untiled decode of the **production**
-//!   latent, ~10% over the 48/255 bar the closest sibling admits — and resampling that cell across
-//!   five production latents gives 28..82, a 2.9x spread that straddles the bar. Withheld as an
-//!   UNRESOLVED margin, not as a clean failure. See [`DECODE_SUPPORT`].
+//! * **The route-blind rung 2 is `Missing`.** Before SC-19753, tiling the whole FLUX.1 VAE tail saved
+//!   −11% to −72% of the decode phase but its per-crop GroupNorm model produced a 28..82/255 sample.
+//!   That historical result explains the fail-closed fallback. The current layer-wise decoder keeps
+//!   full-image statistics, and sealed exact-coordinate evidence may adopt it. See [`DECODE_SUPPORT`].
 //! * **Rung 3 is `Missing`.** MLX's fused attention kernel streams its scores, so query-row
 //!   chunking has no materialized score matrix to bound: measured **−0.001%** on the request peak.
 //!   See [`ATTENTION_SUPPORT`].
@@ -55,9 +56,8 @@
 //!   **−0.00%**. See [`TRANSFORMER_WINDOW_COMPONENT`].
 //!
 //! sc-16462 (inference PR #443) packs the T5/VAE auxiliaries. It changes the conditioning phase's
-//! weight, so every conditioning number here is re-derived when it lands — but it does not disturb
-//! either verdict, because rung 1 already removes that phase from the request peak and rung 2's
-//! rejection is a decoder-quality result that a narrower text encoder does not touch.
+//! weight, so every conditioning number here is re-derived when it lands, but it does not disturb
+//! the rung-3 or rung-4 verdicts; rung 2 is now governed by SC-19753's sealed coordinate evidence.
 
 use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
 use mlx_gen::attention::{AttentionBudget, AttentionPlan};
@@ -93,9 +93,9 @@ pub const DECODE_TILE_EDGES_SWEPT: &[u32] = &[960, 896, 832, 768, 640, 512, 384]
 /// Feather overlaps swept beside [`DECODE_TILE_EDGES_SWEPT`].
 pub const DECODE_OVERLAPS_SWEPT: &[u32] = &[64, 128, 192, 256];
 
-/// **Rung 2 is `Missing`, and the reason is a NARROW margin rather than a clear failure.**
+/// **The route-blind rung-2 fallback is `Missing`.**
 ///
-/// Measured on Chroma1-Base q4 at 1024² at the variant's real **28-step** schedule
+/// The following pre-SC-19753 history was measured on Chroma1-Base q4 at 1024² at the variant's real **28-step** schedule
 /// (`decode_tile_mechanism_sweep_on_the_production_latent`), against the exact untiled decode of the
 /// **production** latent — what the denoiser hands the decode phase, not a re-encoded finished image
 /// whose statistics have already been through the VAE round trip:
@@ -116,7 +116,7 @@ pub const DECODE_OVERLAPS_SWEPT: &[u32] = &[64, 128, 192, 256];
 /// drift `mlx_gen_z_image` *admits* into a shipped ladder on the same tiling machinery over the same
 /// `AutoencoderKL` type.
 ///
-/// ## Why this is withheld as UNRESOLVED rather than as a failure
+/// ## Historical pre-SC-19753 classification: UNRESOLVED rather than failure
 ///
 /// **A previous revision of this doc published 105–166/255, called it "more than double the bar",
 /// and built a mechanism argument on the drift being flat in the geometry. All of that was an
@@ -127,7 +127,7 @@ pub const DECODE_OVERLAPS_SWEPT: &[u32] = &[64, 128, 192, 256];
 ///
 /// **And 10% is far inside the statistic's own variance, which is measured rather than assumed.**
 /// `max Δ` is an extreme-order statistic over ~3.1M subpixels — a single outlier sets it — so
-/// `the_rung_two_drift_margin_is_resampled_across_seeds` re-takes the best cell across five
+/// the pre-SC-19753 version of `layerwise_decode_quality_is_resampled_across_seeds` re-took the best cell across five
 /// production latents:
 ///
 /// | seed | 1234 | 7 | 99 | 20260805 | 424242 |
@@ -141,13 +141,9 @@ pub const DECODE_OVERLAPS_SWEPT: &[u32] = &[64, 128, 192, 256];
 /// clean rejection: on this evidence `max Δ` against a borrowed 48/255 threshold does not resolve
 /// this candidate in either direction.
 ///
-/// The rung therefore ships `Missing` **because nothing here supports admitting it**, and the
-/// withholding reason is recorded as an unresolved margin. Admitting it would need a quality
-/// methodology this epic has not agreed on — a perceptual metric, or a distributional bar derived
-/// for this family rather than borrowed from a sibling — and shipping it on a margin narrower than
-/// its own seed-to-seed noise would be exactly the inherited-verdict failure the epic exists to
-/// prevent. `the_rung_two_drift_margin_is_resampled_across_seeds` pins the verdict CLASS, so a move
-/// to a clean failure or to admissibility reddens rather than sitting stale.
+/// Those results explain why the route-blind constant stays fail-closed. SC-19753 does not promote
+/// the constant; it packages new exact production-latent geometry rows, leaving every absent or
+/// mismatched coordinate refused.
 pub const DECODE_SUPPORT: bool = false;
 /// The native VAE tile ladder this provider *would* publish, and the reference domain its checked
 /// [`mlx_gen_pid::DecodeRoutes`] is constructed from so the native and PiD domains stay provably

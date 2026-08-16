@@ -719,9 +719,10 @@ pub(crate) fn resolve_request_rungs<'a>(
 /// The decode-time tiling policy for a request (sc-13571, GitHub #1658). `is_sequential` is the
 /// fit-gate's memory-constrained-Mac signal (`OffloadPolicy::Sequential`): under it the VAE decode is
 /// tiled to bound its ~14 GiB 1024² transient; a large-memory `Resident` machine decodes EXACTLY
-/// (untiled, `None`), except for a very large output that would spike past even a big Mac. 512 px is the
-/// parity sweet spot for this GroupNorm VAE — visually seam-free at 1024²/1280², where smaller tiles
-/// would drift the per-tile norm statistics.
+/// (untiled, `None`), except for a very large output that would spike past even a big Mac. The 512 px
+/// default is the calibrated policy point. Since SC-19753 every GroupNorm retains full-activation
+/// statistics and only halo-expanded convolution work tiles, so smaller edges no longer introduce
+/// per-crop normalization drift.
 pub(crate) fn decode_tiling(req: &GenerationRequest, is_sequential: bool) -> Option<TilingConfig> {
     // SC-15615: the shared selector's explicit bounded-decode signal (`GenerationMemory::tile_vae_decode`)
     // joins the two historical triggers. The ladder is cumulative — a selector that picks rung 3
