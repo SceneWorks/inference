@@ -968,7 +968,9 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                 )
                 self.assertIn("--expected-policy-count 1", collector_step)
                 self.assertIn("--expected-fixture-count 5", collector_step)
-        self.assertEqual(sum(expected_cells.values()), 69)
+        # The diagnostic branch retains the 69-cell contract by combining these 39
+        # dispatchable cells with the 30 already sealed SDXL/RealVisXL cells.
+        self.assertEqual(sum(expected_cells.values()) + 30, 69)
 
         mutations = {
             "Kolors landscape geometry": ("1280x768:576:48", "1280x720:576:48"),
