@@ -3,7 +3,9 @@
 //! (small decoder mirroring `Decoder.__call__`: conv_in → mid → 2 up-blocks → norm-out →
 //! SiLU → conv_out). Tol 1e-2 (Metal fp32 convs).
 
+use mlx_gen::tiling::TilingConfig;
 use mlx_gen::weights::Weights;
+use mlx_gen::{CancelFlag, Error};
 use mlx_gen_z_image::vae::{Decoder, Vae, VaeDecoderConfig};
 use mlx_rs::ops::{add, all_close, multiply};
 use mlx_rs::Array;
@@ -73,4 +75,49 @@ fn vae_decode_applies_scale_shift_and_frame_axis() {
             .item::<bool>(),
         "Vae::decode scale/shift/frame-axis wrapper is wrong"
     );
+}
+
+/// sc-19753: exercise the production `Vae::decode_tiled` seam, not only the shared convolution
+/// primitive. The fixture's position-dependent latent makes the old whole-tail/per-crop GroupNorm
+/// implementation diverge, while layer-wise global normalization tracks the dense decode.
+#[test]
+fn vae_tiled_decode_tracks_dense_with_global_group_norm() {
+    let w = Weights::from_file(FIXTURE).unwrap();
+    let vae = Vae::from_weights(&w, "", &small_cfg()).unwrap();
+    let latent = w.require("in.latent").unwrap();
+    let sh = latent.shape();
+    let latent5 = latent.reshape(&[sh[0], sh[1], 1, sh[2], sh[3]]).unwrap();
+
+    let dense = vae.decode(&latent5).unwrap();
+    let tiled = vae
+        .decode_tiled(&latent5, &TilingConfig::spatial_only(8, 0), None)
+        .unwrap();
+    dense.eval().unwrap();
+    tiled.eval().unwrap();
+    assert_eq!(tiled.shape(), dense.shape());
+
+    let max_delta = dense
+        .as_slice::<f32>()
+        .iter()
+        .zip(tiled.as_slice::<f32>())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f32, f32::max);
+    assert!(
+        max_delta < 2e-3,
+        "layer-wise tiled VAE diverged from dense decode: max|delta|={max_delta:.3e}"
+    );
+}
+
+#[test]
+fn vae_tiled_decode_honors_pretripped_cancel() {
+    let w = Weights::from_file(FIXTURE).unwrap();
+    let vae = Vae::from_weights(&w, "", &small_cfg()).unwrap();
+    let latent = w.require("in.latent").unwrap();
+    let sh = latent.shape();
+    let latent5 = latent.reshape(&[sh[0], sh[1], 1, sh[2], sh[3]]).unwrap();
+    let cancel = CancelFlag::new();
+    cancel.cancel();
+
+    let result = vae.decode_tiled(&latent5, &TilingConfig::spatial_only(8, 0), Some(&cancel));
+    assert!(matches!(result, Err(Error::Canceled)));
 }

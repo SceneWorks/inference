@@ -3,9 +3,10 @@
 
 use mlx_rs::Array;
 
-use mlx_gen::nn::{conv2d, group_norm};
+use mlx_gen::nn::{conv2d, group_norm, silu};
+use mlx_gen::vae_tiling::{tiled_conv2d_3x3_nhwc, GlobalGroupNorm};
 use mlx_gen::weights::Weights;
-use mlx_gen::Result;
+use mlx_gen::{CancelFlag, Error, Result};
 
 const GN_GROUPS: i32 = 32;
 const GN_EPS: f32 = 1e-6;
@@ -28,6 +29,26 @@ impl ConvLayer {
         let x = x_nchw.transpose_axes(&[0, 2, 3, 1])?; // NHWC
         let h = conv2d(&x, &self.w, Some(&self.b), 1, 1)?;
         Ok(h.transpose_axes(&[0, 3, 1, 2])?) // NCHW
+    }
+
+    /// Final VAE `GroupNorm → SiLU → conv_out`, preserving full-image normalization while bounding
+    /// the 3×3 convolution (sc-19753).
+    pub fn forward_tiled_after_norm(
+        &self,
+        x_nchw: &Array,
+        norm: &ConvNormOut,
+        tile_edge: i32,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<Array> {
+        if cancel.is_some_and(CancelFlag::is_cancelled) {
+            return Err(Error::Canceled);
+        }
+        let x = x_nchw.transpose_axes(&[0, 2, 3, 1])?;
+        let global = GlobalGroupNorm::new(&x, &norm.weight, &norm.bias, GN_GROUPS, GN_EPS)?;
+        let h = tiled_conv2d_3x3_nhwc(&x, &self.w, Some(&self.b), tile_edge, cancel, |tile| {
+            silu(&global.apply(tile)?)
+        })?;
+        Ok(h.transpose_axes(&[0, 3, 1, 2])?)
     }
 }
 

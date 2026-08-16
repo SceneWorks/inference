@@ -11,7 +11,6 @@ use super::mid_block::UNetMidBlock;
 use super::up_decoder_block::UpDecoderBlock;
 use mlx_gen::nn::silu;
 use mlx_gen::tiling::{TilingConfig, VaeTiling};
-use mlx_gen::vae_tiling::tiled_decode;
 use mlx_gen::weights::Weights;
 use mlx_gen::{CancelFlag, Error, LatentDecoder, Result};
 
@@ -86,11 +85,11 @@ impl Decoder {
         self.mid_block.forward(&h)
     }
 
-    /// The **upsample tail**: `up_blocks → conv_norm_out → SiLU → conv_out`. Every op here is spatially
-    /// LOCAL (resnet convs, nearest-2× + conv upsamplers, GroupNorm, head conv), so it tiles seam-free
-    /// (overlap + trapezoidal blend absorbs the conv halo). This is where the ×8 decode memory spike
-    /// lives, so tiling it is what bounds the peak (sc-13571 / GitHub #1658). `head` is the pre-upsample
-    /// output at latent resolution.
+    /// The dense **upsample tail**: `up_blocks → conv_norm_out → SiLU → conv_out`. Convolutions are
+    /// spatially local, but GroupNorm is not: its statistics span the whole image. The bounded path
+    /// therefore uses [`Self::forward_upsample_tail_tiled`] to tile each convolution while retaining
+    /// full-image normalization statistics (sc-19753). `head` is the pre-upsample output at latent
+    /// resolution.
     pub fn forward_upsample_tail(&self, head: &Array) -> Result<Array> {
         let mut h = head.clone();
         for up in &self.up_blocks {
@@ -99,6 +98,48 @@ impl Decoder {
         h = self.conv_norm_out.forward(&h)?;
         h = silu(&h)?;
         self.conv_out.forward(&h)
+    }
+
+    /// Layer-wise bounded tail with full-image GroupNorm statistics (sc-19753).
+    pub fn forward_upsample_tail_tiled(
+        &self,
+        head: &Array,
+        output_tile_edge: i32,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<Array> {
+        if cancel.is_some_and(CancelFlag::is_cancelled) {
+            return Err(Error::Canceled);
+        }
+        let tile_edge_at = |remaining_scale: i32| {
+            ((output_tile_edge + remaining_scale - 1) / remaining_scale).max(3)
+        };
+        let mut remaining_scale = self
+            .up_blocks
+            .iter()
+            .filter(|block| block.upsamples())
+            .fold(1_i32, |scale, _| scale.saturating_mul(2));
+        let mut h = head.clone();
+        for up in &self.up_blocks {
+            let current_edge = tile_edge_at(remaining_scale);
+            let next_scale = if up.upsamples() {
+                (remaining_scale / 2).max(1)
+            } else {
+                remaining_scale
+            };
+            h = up.forward_tiled(&h, current_edge, tile_edge_at(next_scale), cancel)?;
+            remaining_scale = next_scale;
+        }
+        if remaining_scale != 1 {
+            return Err(Error::Msg(format!(
+                "z-image tiled VAE tail ended at remaining spatial scale {remaining_scale}, expected 1"
+            )));
+        }
+        self.conv_out.forward_tiled_after_norm(
+            &h,
+            &self.conv_norm_out,
+            output_tile_edge.max(3),
+            cancel,
+        )
     }
 }
 
@@ -251,16 +292,14 @@ impl Vae {
     }
 
     /// **Tiled** decode (sc-13571, GitHub #1658) for a memory-bounded large-image decode. The single-pass
-    /// [`decode`](Self::decode) materializes the whole ×8 output transient in one shot (~14 GiB at 1024²),
-    /// which OOMs / corrupts to a flat image on an 8 GB Mac. Here the denormalize + pre-upsample head
-    /// (global mid-block attention) run ONCE on the full latent, then only the spatially-local upsample
-    /// tail — where the ×8 spike lives — is split into overlapping tiles and trapezoidally blended, so the
-    /// decode peak scales with the tile size, not the full resolution. Reuses the shared sc-11747 facility
-    /// ([`tiled_decode`]) and the [`VaeTiling::QWEN_IMAGE`] geometry (this VAE is also spatial ×8 /
-    /// singleton-temporal). Falls back to the single-pass [`decode`](Self::decode) when `cfg` doesn't fire
-    /// for these dims (small image / large-memory machine → zero tiling overhead, exact output). No clamp
-    /// here (matching [`decode`](Self::decode); the `[-1,1]` clamp is applied later by `decoded_to_image`),
-    /// so the tiled output matches the untiled one to within the blend tolerance.
+    /// [`decode`](Self::decode) materializes the whole ×8 output convolution transient in one shot
+    /// (~14 GiB at 1024²), which OOMs / corrupts to a flat image on an 8 GB Mac. The denormalize +
+    /// pre-upsample head (global mid-block attention) run ONCE on the full latent. The upsample tail
+    /// then runs layer-by-layer: GroupNorm statistics reduce the full activation, and 3×3
+    /// convolutions consume halo-expanded tiles and write non-overlapping cores. This preserves the
+    /// dense normalization extent that whole-tail tiling lost while keeping convolution work bounded
+    /// by the selected edge (sc-19753). Falls back to [`decode`](Self::decode) when `cfg` does not
+    /// tile these dimensions. No clamp here, matching the dense path.
     ///
     /// Shared verbatim by every crate in the Flux1 / Z-Image latent space (Z-Image, FLUX.1, Boogu,
     /// Chroma), so all of them gain the memory-bounded decode.
@@ -280,21 +319,22 @@ impl Vae {
         if !cfg.needs_tiling(VaeTiling::QWEN_IMAGE, f, h, w) {
             return self.decode(latents);
         }
+        if cancel.is_some_and(CancelFlag::is_cancelled) {
+            return Err(Error::Canceled);
+        }
         // Head runs ONCE on the full latent (denormalize → conv_in → mid-block global attention),
         // identical to single-pass `decode` up to the up-blocks, so parity is exact here.
         let head4 = self.decode_pre_upsample(latents)?; // 4-D NCHW at latent res
-        let hs = head4.shape();
-        // Lift to 5-D NCTHW (singleton T) so the shared NCTHW `tiled_decode` (axes [2,3,4]) can slice it.
-        let head5 = head4.reshape(&[hs[0], hs[1], 1, hs[2], hs[3]])?;
-        let plan = cfg.plan(VaeTiling::QWEN_IMAGE, f, h, w);
-        tiled_decode(&head5, &plan, [2, 3, 4], cancel, |tile5| {
-            // tile5 [B,C,1,h,w] → squeeze T → local upsample tail (4-D) → restore T → [B,3,1,h·8,w·8].
-            let ts = tile5.shape();
-            let tile4 = tile5.reshape(&[ts[0], ts[1], ts[3], ts[4]])?;
-            let out4 = self.decoder.forward_upsample_tail(&tile4)?;
-            let os = out4.shape();
-            Ok(out4.reshape(&[os[0], os[1], 1, os[2], os[3]])?)
-        })
+        let tile_edge = cfg
+            .spatial
+            .as_ref()
+            .ok_or_else(|| Error::Msg("z-image tiled decode requires spatial tiling".into()))?
+            .tile_px;
+        let out4 = self
+            .decoder
+            .forward_upsample_tail_tiled(&head4, tile_edge, cancel)?;
+        let os = out4.shape();
+        Ok(out4.reshape(&[os[0], os[1], 1, os[2], os[3]])?)
     }
 
     pub fn decoder(&self) -> &Decoder {
