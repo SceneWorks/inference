@@ -403,16 +403,16 @@ impl Autoencoder {
         self.decoder.forward(&z)
     }
 
-    /// Ladder rung 2 — **bounded decode** (SC-15525): the same decode with the full-resolution
-    /// upsample tail run tile-by-tile and trapezoidally blended, bounding the decode's peak by one
-    /// tile's activations instead of the whole image's.
+    /// Ladder rung 2 — **bounded decode** (SC-15525): the same decode with each tail convolution
+    /// evaluated on halo-expanded tiles and assembled from non-overlapping output cores, bounding
+    /// convolution work without changing full-image GroupNorm statistics.
     ///
     /// `cfg` is the requested geometry; when it does not actually tile this latent
     /// ([`TilingConfig::needs_tiling`](mlx_gen::tiling::TilingConfig::needs_tiling)) the call falls through to the exact single-pass
     /// [`decode`](Self::decode) rather than assembling a one-tile plan, so a small render pays
-    /// nothing. The blend geometry is [`mlx_gen::tiling`] and the array loop is
-    /// [`mlx_gen::vae_tiling::tiled_decode`] — this crate contributes only the head/tail split and
-    /// the NHWC axis mapping.
+    /// nothing. `cfg.spatial.tile_px` bounds each convolution crop. The configured overlap remains
+    /// part of the public tiling contract and policy identity, but layer-wise halo/core arithmetic
+    /// does not blend overlapping whole-tail outputs.
     ///
     /// **Normalization semantics.** Denormalize, `post_quant_conv`, `conv_in`, the mid resnets and
     /// mid **attention** run once on the full latent (`Decoder::head`). In the tail, every GroupNorm
