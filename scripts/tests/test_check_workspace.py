@@ -948,12 +948,18 @@ class CrossBackendGeometryTests(unittest.TestCase):
     )
     FIXTURES = "pub const SHARED_FIXTURE_DIM: usize = 8;\n"
     FIXTURES_B = "pub const SHARED_FIXTURE_DIM: i32 = 8;\n"
+    # The premise the `SHARED_FIXTURE_*` requirement rests on: one committed file, same bytes on both
+    # sides. `_shares_a_fixture_file` re-derives it every run, so the synthetic pair has to have it.
+    GOLDEN = "shared golden bytes\n"
 
     def setUp(self) -> None:
         self.gate = load_gate_module()
         self.gate.CROSS_BACKEND_GEOMETRY_EXEMPT_FAMILIES = {}
         self.gate.CROSS_BACKEND_GEOMETRY_EXEMPTIONS = {}
         self.gate.CROSS_BACKEND_GEOMETRY_NO_SHARED_CONSTANTS = {}
+        self.gate.CROSS_BACKEND_FIXTURE_FAMILIES = {
+            "demo": "the synthetic pair commits one byte-identical golden"
+        }
         self.gate.CROSS_BACKEND_GEOMETRY_REFERENCE = {
             "demo": {
                 "SIZE_MULTIPLE": (32.0,),
@@ -972,9 +978,11 @@ class CrossBackendGeometryTests(unittest.TestCase):
             "a/src/lib.rs": self.LIB,
             "a/src/config.rs": self.CONFIG_A,
             "a/tests/common/mod.rs": self.FIXTURES,
+            "a/tests/fixtures/golden.bin": self.GOLDEN,
             "b/src/lib.rs": self.LIB,
             "b/src/config.rs": self.CONFIG_B,
             "b/tests/common/mod.rs": self.FIXTURES_B,
+            "b/tests/fixtures/golden.bin": self.GOLDEN,
         }
         drop_crate = overrides.pop("drop_crate", None)
         files.update(overrides)
@@ -1273,13 +1281,17 @@ class CrossBackendGeometryTests(unittest.TestCase):
 
     # --- clause: a family compared against nothing is a failure -----------------------------------
 
+    # Empty in `src`, which is the only place the shared-constant floor reads. The `tests/` fixture
+    # constants are deliberately LEFT IN PLACE: sc-19496's fixture requirement is keyed on
+    # `CROSS_BACKEND_FIXTURE_FAMILIES`, which the synthetic `demo` family is a member of, so nulling
+    # them here would make these three tests pass by tripping a second, unrelated clause instead of
+    # the one under test — and would leave the fixture clause unexercised in the scenario where a
+    # family shares no `src` constant at all.
     EMPTY_PAIR = {
         "a/src/lib.rs": "pub const ONLY_A: u32 = 1;\n",
         "a/src/config.rs": None,
-        "a/tests/common/mod.rs": None,
         "b/src/lib.rs": "pub const ONLY_B: u32 = 1;\n",
         "b/src/config.rs": None,
-        "b/tests/common/mod.rs": None,
     }
 
     def test_a_family_sharing_no_constant_is_a_failure(self) -> None:
@@ -1459,6 +1471,60 @@ class CrossBackendGeometryTests(unittest.TestCase):
         self.assertIsNotNone(failure)
         self.assertIn("declares no `SHARED_FIXTURE_*` constants under tests/", failure)
 
+    def test_the_fixture_requirement_covers_every_listed_family_not_only_pinned_ones(self) -> None:
+        """sc-19496 scoped the non-emptiness requirement to reference-pinned families, which left
+        `anima`, `bernini`, `krea` and `sana` — all four byte-identical-fixture families — free to
+        declare nothing. Dropping the reference block must not drop the requirement with it."""
+        self.gate.CROSS_BACKEND_GEOMETRY_REFERENCE = {}
+        failure = self.check(**{"a/tests/common/mod.rs": "// nothing shared here\n"})
+        self.assertIsNotNone(failure)
+        self.assertIn("declares no `SHARED_FIXTURE_*` constants under tests/", failure)
+
+    def test_a_family_outside_the_fixture_table_is_not_required_to_declare_anything(self) -> None:
+        """The requirement is a claim about *this* family's shared fixtures, so it must not fire on a
+        pair that shares none — otherwise it is a permanent red rather than a signal."""
+        self.gate.CROSS_BACKEND_FIXTURE_FAMILIES = {}
+        self.gate.CROSS_BACKEND_GEOMETRY_REFERENCE = {}
+        self.assertIsNone(
+            self.check(
+                **{
+                    "a/tests/common/mod.rs": "// nothing shared here\n",
+                    "b/tests/common/mod.rs": "// nothing shared here\n",
+                }
+            )
+        )
+
+    def test_the_fixture_table_entry_dies_with_the_sharing_that_justifies_it(self) -> None:
+        """The membership premise is re-derived, not trusted: once no same-named fixture file is
+        byte-identical, the recorded reason describes nothing and the entry has to go. Without this
+        the table is exactly the un-checked coverage claim this gate exists to refuse."""
+        failure = self.check(**{"b/tests/fixtures/golden.bin": "different bytes\n"})
+        self.assertIsNotNone(failure)
+        self.assertIn("no same-named file under their tests/fixtures/ is byte-identical", failure)
+
+    def test_a_same_named_file_alone_does_not_satisfy_the_premise(self) -> None:
+        """The check is on bytes, not names — a gate satisfied by a filename would pass two lanes
+        that had silently regenerated their goldens apart, which is the whole hazard."""
+        self.gate.CROSS_BACKEND_FIXTURE_FAMILIES = {"demo": "reason"}
+        failure = self.check(**{"a/tests/fixtures/golden.bin": "a\n", "b/tests/fixtures/golden.bin": "b\n"})
+        self.assertIsNotNone(failure)
+        self.assertIn("no same-named file under their tests/fixtures/ is byte-identical", failure)
+
+    def test_a_fixture_table_entry_for_a_vanished_family_is_caught(self) -> None:
+        self.gate.CROSS_BACKEND_FIXTURE_FAMILIES["ghost"] = "gone"
+        failure = self.check()
+        self.assertIsNotNone(failure)
+        self.assertIn("`ghost` is required to declare", failure)
+        self.assertIn("is not a dual-backend family any more", failure)
+
+    def test_a_reference_pin_without_a_fixture_table_entry_is_caught(self) -> None:
+        """A reference pin is the stronger claim; a family carrying one but missing from the fixture
+        table would quietly hold less fixture coverage than an unpinned family."""
+        self.gate.CROSS_BACKEND_FIXTURE_FAMILIES = {}
+        failure = self.check()
+        self.assertIsNotNone(failure)
+        self.assertIn("missing from CROSS_BACKEND_FIXTURE_FAMILIES", failure)
+
     # --- clause: coverage is the workspace, not a list --------------------------------------------
 
     def test_an_exempt_family_is_not_compared(self) -> None:
@@ -1604,6 +1670,71 @@ class CrossBackendGeometryLiveTests(unittest.TestCase):
                     ),
                     f"{family}.{constant} is at column 0 in {crate.name}, so this proves nothing",
                 )
+
+    def test_every_byte_identical_fixture_family_declares_its_geometry(self) -> None:
+        """The four families sc-19496 left behind, plus the one it fixed. Structural on both halves:
+        each listed family must really share fixture bytes, and must really declare matching
+        `SHARED_FIXTURE_*` constants — no maintained count, because a count is what goes stale."""
+        families = {
+            family: (candle, mlx)
+            for family, candle, mlx in self.gate._dual_backend_families(self.metadata)
+        }
+        self.assertEqual(
+            set(self.gate.CROSS_BACKEND_FIXTURE_FAMILIES),
+            {"anima", "bernini", "krea", "minimax-h3", "sana"},
+        )
+        # The table must be exactly the families that share fixture bytes — not a subset someone
+        # stopped extending. sc-19496 shipped covering one of the five; four dual-backend families
+        # committing byte-identical fixtures sat outside the requirement with nothing saying so.
+        # Derived here, so a sixth family that starts committing shared fixtures cannot escape.
+        sharing = {
+            family
+            for family, candle, mlx in self.gate._dual_backend_families(self.metadata)
+            if self.gate._shares_a_fixture_file(candle, mlx)
+        }
+        self.assertEqual(set(self.gate.CROSS_BACKEND_FIXTURE_FAMILIES), sharing)
+        prefix = self.gate.CROSS_BACKEND_FIXTURE_PREFIX
+        for family, reason in self.gate.CROSS_BACKEND_FIXTURE_FAMILIES.items():
+            self.assertIn(family, families, family)
+            self.assertTrue(reason.strip(), f"{family} carries no written reason")
+            candle, mlx = families[family]
+            self.assertTrue(
+                self.gate._shares_a_fixture_file(candle, mlx),
+                f"{family}: no byte-identical committed fixture, so the entry describes nothing",
+            )
+            left = self.gate._crate_pub_consts(candle, "tests", prefix=prefix)
+            right = self.gate._crate_pub_consts(mlx, "tests", prefix=prefix)
+            self.assertTrue(left, family)
+            self.assertTrue(right, family)
+            self.assertEqual(set(left), set(right), family)
+            for constant in left:
+                self.assertEqual(
+                    self.gate._canonical_const_values(left[constant], left),
+                    self.gate._canonical_const_values(right[constant], right),
+                    f"{family}/{constant}",
+                )
+
+    def test_the_krea_text_encoder_mrope_section_is_the_production_value_on_both_lanes(self) -> None:
+        """The one genuine divergence lifting krea's fixture configs exposed: the MLX lane declared a
+        reduced `[16, 0, 0]`, saturated to head_dim/2, where candle carried the shipped
+        `[24, 20, 20]`. Pinned to the production value rather than merely "equal", so converging them
+        onto the *wrong* number would still be red — the move this gate must never reward."""
+        families = {
+            family: (candle, mlx)
+            for family, candle, mlx in self.gate._dual_backend_families(self.metadata)
+        }
+        candle, mlx = families["krea"]
+        prefix = self.gate.CROSS_BACKEND_FIXTURE_PREFIX
+        for crate in (candle, mlx):
+            declarations = self.gate._crate_pub_consts(crate, "tests", prefix=prefix)
+            self.assertIn("SHARED_FIXTURE_TE_MROPE_SECTION", declarations, str(crate))
+            self.assertEqual(
+                self.gate._canonical_const_values(
+                    declarations["SHARED_FIXTURE_TE_MROPE_SECTION"], declarations
+                ),
+                {"number:(24.0, 20.0, 20.0)"},
+                str(crate),
+            )
 
     def test_the_minimax_h3_fixture_geometry_is_declared_on_both_sides(self) -> None:
         """The hand-maintained fixture configs sc-19496 was filed for. Asserted structurally — equal

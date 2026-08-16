@@ -289,31 +289,102 @@ fn prompt_weighting_is_parsed_out_and_plain_is_strict_noop() {
 //       --ignored bless_synthetic_dit_golden --nocapture
 // =================================================================================================
 
+// --- Cross-backend fixture geometry (sc-19496) ---------------------------------------------------
+//
+// Every golden JSON under `tests/fixtures/` here is byte-identical to the one ``candle-gen-anima`` commits
+// under the same name. For the synthetic DiT golden that identity is load-bearing in a way the
+// real-weights goldens' are not: the golden carries no geometry of its own beyond `shape`/`count`,
+// so BOTH lanes must construct the same tiny `DitConfig`, the same deterministic-LCG weights, and
+// the same inputs, or they are comparing two different models against one summary. Nothing could
+// see that: the two crates cannot import each other, because `mlx-gen-*` builds on macOS only.
+//
+// The numbers the two lanes must agree on are declared here as `SHARED_FIXTURE_*` constants and the
+// generator below builds from them. `check_cross_backend_geometry` in `scripts/check-workspace.py`
+// compares every `SHARED_FIXTURE_*` declaration under this crate's `tests/` against the candle crate's,
+// by name set and by value — so the comment claiming the synthetic weights are "bit-identical to
+// the candle lane's generator" now describes something enforced.
+
+/// Synthetic-DiT latent channels — 17 after the padding-mask concat (the 17-vs-16 regression surface).
+pub const SHARED_FIXTURE_SYNTH_IN_CHANNELS: usize = 16;
+/// Synthetic-DiT output channels.
+pub const SHARED_FIXTURE_SYNTH_OUT_CHANNELS: usize = 16;
+/// Synthetic-DiT attention heads.
+pub const SHARED_FIXTURE_SYNTH_NUM_ATTENTION_HEADS: usize = 2;
+/// Synthetic-DiT per-head width — hidden = 12; head_dim 6 splits cleanly for RoPE (dim_t/h/w = 2/2/2).
+pub const SHARED_FIXTURE_SYNTH_ATTENTION_HEAD_DIM: usize = 6;
+/// Synthetic-DiT depth.
+pub const SHARED_FIXTURE_SYNTH_NUM_LAYERS: usize = 2;
+/// Synthetic-DiT feed-forward expansion.
+pub const SHARED_FIXTURE_SYNTH_MLP_RATIO: f32 = 4.0;
+/// Synthetic-DiT cross-attention context (encoder) width.
+pub const SHARED_FIXTURE_SYNTH_TEXT_EMBED_DIM: usize = 8;
+/// Synthetic-DiT adaLN-LoRA rank.
+pub const SHARED_FIXTURE_SYNTH_ADALN_LORA_DIM: usize = 8;
+/// Synthetic-DiT post-patch max size — the production `(128, 120, 120)`, so the RoPE tables are real.
+pub const SHARED_FIXTURE_SYNTH_MAX_SIZE: (usize, usize, usize) = (128, 120, 120);
+/// Synthetic-DiT patch — the production `(1, 2, 2)`.
+pub const SHARED_FIXTURE_SYNTH_PATCH_SIZE: (usize, usize, usize) = (1, 2, 2);
+/// Synthetic-DiT NTK RoPE scale — the production `(1.0, 4.0, 4.0)`.
+pub const SHARED_FIXTURE_SYNTH_ROPE_SCALE: (f32, f32, f32) = (1.0, 4.0, 4.0);
+/// Synthetic-DiT padding-mask concat — the 17-channel patch input the trap test pins.
+pub const SHARED_FIXTURE_SYNTH_CONCAT_PADDING_MASK: bool = true;
+
+/// The NON-SQUARE synthetic latent `[1, 16, 1, 4, 6]` (post-patch grid 2x3, so an h/w RoPE swap moves
+/// the output).
+pub const SHARED_FIXTURE_SYNTH_LATENT_SHAPE: [usize; 5] = [1, 16, 1, 4, 6];
+/// The LCG seed the synthetic latent is filled from.
+pub const SHARED_FIXTURE_SYNTH_LATENT_SEED: u64 = 1;
+/// The synthetic encoder context `[1, 5, 8]`.
+pub const SHARED_FIXTURE_SYNTH_ENCODER_SHAPE: [usize; 3] = [1, 5, 8];
+/// The LCG seed the synthetic encoder context is filled from.
+pub const SHARED_FIXTURE_SYNTH_ENCODER_SEED: u64 = 2;
+/// The noise level the synthetic forward is evaluated at.
+pub const SHARED_FIXTURE_SYNTH_SIGMA: f32 = 0.7;
+
+/// FNV-1a offset basis — the per-tensor seed is FNV-1a of the FULL `net.`-prefixed key, so the two
+/// lanes' weight bytes only agree if this, the prime, and the key names all agree.
+pub const SHARED_FIXTURE_SYNTH_FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+/// FNV-1a 64-bit prime.
+pub const SHARED_FIXTURE_SYNTH_FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+/// LCG multiplier (the `lcg_fill` recurrence the real-weights tests also use).
+pub const SHARED_FIXTURE_SYNTH_LCG_MULTIPLIER: u64 = 1103515245;
+/// LCG increment.
+pub const SHARED_FIXTURE_SYNTH_LCG_INCREMENT: u64 = 12345;
+/// LCG state mask — 31 bits.
+pub const SHARED_FIXTURE_SYNTH_LCG_MASK: u64 = 0x7fff_ffff;
+/// LCG divisor mapping the 31-bit state onto `[-1, 1)`.
+pub const SHARED_FIXTURE_SYNTH_LCG_DIVISOR: f64 = 2147483647.0;
+/// Norm-weight init: `1 + NORM_INIT_SCALE * lcg`, so scales sit near 1.0.
+pub const SHARED_FIXTURE_SYNTH_NORM_INIT_SCALE: f32 = 0.1;
+/// Linear-weight init: `LINEAR_INIT_SCALE * lcg` — large enough that adaLN scale/shift/gate are O(1),
+/// small enough that the LayerNorm-gated two-layer forward stays finite.
+pub const SHARED_FIXTURE_SYNTH_LINEAR_INIT_SCALE: f32 = 0.3;
+
 /// A tiny Cosmos DiT config with the SAME structure as [`DitConfig::anima`] (17-ch concat, 3-axis NTK
 /// RoPE, adaLN-LoRA, patch `(1,2,2)`) but small dims, so the forward is cheap and the golden is tiny.
 fn synth_cfg() -> DitConfig {
     DitConfig {
-        in_channels: 16, // → 17 after the padding-mask concat (the 17-vs-16 regression surface)
-        out_channels: 16,
-        num_attention_heads: 2,
-        attention_head_dim: 6, // hidden = 12; head_dim 6 splits cleanly for the RoPE (dim_t/h/w = 2/2/2)
-        num_layers: 2,
-        mlp_ratio: 4.0,
-        text_embed_dim: 8, // cross-attn context (encoder) dim
-        adaln_lora_dim: 8,
-        max_size: (128, 120, 120),
-        patch_size: (1, 2, 2),
-        rope_scale: (1.0, 4.0, 4.0),
-        concat_padding_mask: true,
+        in_channels: SHARED_FIXTURE_SYNTH_IN_CHANNELS,
+        out_channels: SHARED_FIXTURE_SYNTH_OUT_CHANNELS,
+        num_attention_heads: SHARED_FIXTURE_SYNTH_NUM_ATTENTION_HEADS,
+        attention_head_dim: SHARED_FIXTURE_SYNTH_ATTENTION_HEAD_DIM,
+        num_layers: SHARED_FIXTURE_SYNTH_NUM_LAYERS,
+        mlp_ratio: SHARED_FIXTURE_SYNTH_MLP_RATIO,
+        text_embed_dim: SHARED_FIXTURE_SYNTH_TEXT_EMBED_DIM,
+        adaln_lora_dim: SHARED_FIXTURE_SYNTH_ADALN_LORA_DIM,
+        max_size: SHARED_FIXTURE_SYNTH_MAX_SIZE,
+        patch_size: SHARED_FIXTURE_SYNTH_PATCH_SIZE,
+        rope_scale: SHARED_FIXTURE_SYNTH_ROPE_SCALE,
+        concat_padding_mask: SHARED_FIXTURE_SYNTH_CONCAT_PADDING_MASK,
     }
 }
 
 /// FNV-1a of the key → a stable, order-independent, portable per-tensor seed.
 fn key_seed(key: &str) -> u64 {
-    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let mut h = SHARED_FIXTURE_SYNTH_FNV_OFFSET_BASIS;
     for b in key.as_bytes() {
         h ^= *b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        h = h.wrapping_mul(SHARED_FIXTURE_SYNTH_FNV_PRIME);
     }
     h
 }
@@ -321,11 +392,14 @@ fn key_seed(key: &str) -> u64 {
 /// Deterministic LCG in `[-1, 1)` — the same integer recurrence as the real-weights tests' `lcg_fill`,
 /// so weights reproduce bit-for-bit across machines and runs.
 fn synth_lcg(n: usize, seed: u64) -> Vec<f32> {
-    let mut s = seed & 0x7fff_ffff;
+    let mut s = seed & SHARED_FIXTURE_SYNTH_LCG_MASK;
     (0..n)
         .map(|_| {
-            s = (s.wrapping_mul(1103515245).wrapping_add(12345)) & 0x7fff_ffff;
-            (s as f64 / 2147483647.0 * 2.0 - 1.0) as f32
+            s = (s
+                .wrapping_mul(SHARED_FIXTURE_SYNTH_LCG_MULTIPLIER)
+                .wrapping_add(SHARED_FIXTURE_SYNTH_LCG_INCREMENT))
+                & SHARED_FIXTURE_SYNTH_LCG_MASK;
+            (s as f64 / SHARED_FIXTURE_SYNTH_LCG_DIVISOR * 2.0 - 1.0) as f32
         })
         .collect()
 }
@@ -338,9 +412,13 @@ fn synth_tensor(w: &mut Weights, key: &str, shape: &[i32]) {
     let n: usize = shape.iter().map(|&d| d as usize).product();
     let raw = synth_lcg(n, key_seed(key));
     let data: Vec<f32> = if key.ends_with("norm.weight") {
-        raw.iter().map(|&v| 1.0 + 0.1 * v).collect()
+        raw.iter()
+            .map(|&v| 1.0 + SHARED_FIXTURE_SYNTH_NORM_INIT_SCALE * v)
+            .collect()
     } else {
-        raw.iter().map(|&v| 0.3 * v).collect()
+        raw.iter()
+            .map(|&v| SHARED_FIXTURE_SYNTH_LINEAR_INIT_SCALE * v)
+            .collect()
     };
     w.insert(key, Array::from_slice(&data, shape));
 }
@@ -400,9 +478,19 @@ fn synth_weights(cfg: &DitConfig) -> Weights {
 /// The deterministic synthetic inputs: a NON-SQUARE latent `[1,16,1,4,6]` (post-patch grid 2×3 — so an
 /// h/w RoPE swap is detectable) + encoder `[1,5,8]` + `sigma=0.7`. Seeds match nothing licensed.
 fn synth_inputs() -> (Array, Array, Array) {
-    let latent = Array::from_slice(&synth_lcg(16 * 4 * 6, 1), &[1, 16, 1, 4, 6]);
-    let encoder = Array::from_slice(&synth_lcg(5 * 8, 2), &[1, 5, 8]);
-    let sigma = Array::from_slice(&[0.7f32], &[1]);
+    let lat = SHARED_FIXTURE_SYNTH_LATENT_SHAPE;
+    let enc = SHARED_FIXTURE_SYNTH_ENCODER_SHAPE;
+    let lat_i32: Vec<i32> = lat.iter().map(|&d| d as i32).collect();
+    let enc_i32: Vec<i32> = enc.iter().map(|&d| d as i32).collect();
+    let latent = Array::from_slice(
+        &synth_lcg(lat.iter().product(), SHARED_FIXTURE_SYNTH_LATENT_SEED),
+        &lat_i32,
+    );
+    let encoder = Array::from_slice(
+        &synth_lcg(enc.iter().product(), SHARED_FIXTURE_SYNTH_ENCODER_SEED),
+        &enc_i32,
+    );
+    let sigma = Array::from_slice(&[SHARED_FIXTURE_SYNTH_SIGMA], &[1]);
     (latent, encoder, sigma)
 }
 
@@ -597,7 +685,7 @@ fn bless_synthetic_dit_golden() {
                 "latent_seed": 1,
                 "encoder_shape": [1, 5, 8],
                 "encoder_seed": 2,
-                "sigma": 0.7,
+                "sigma": SHARED_FIXTURE_SYNTH_SIGMA,
                 "post_patch_grid": [1, 2, 3],
             },
             "regen_command": "ANIMA_BLESS_SYNTH=1 cargo test -p mlx-gen-anima --test parity_goldens -- \

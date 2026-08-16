@@ -11,17 +11,20 @@ use candle_gen::candle_core::{Device, Result, Tensor};
 use candle_gen_krea::loader::Weights;
 use candle_gen_krea::transformer::block::{SingleStreamBlock, TextFusionTransformer};
 use candle_gen_krea::transformer::rope::RopeTables;
-use candle_gen_krea::{Krea2Config, Krea2Transformer};
+use candle_gen_krea::Krea2Transformer;
+
+mod common;
+
+use common::{
+    tiny_dit_config, SHARED_FIXTURE_DIT_AXES_DIMS_ROPE, SHARED_FIXTURE_DIT_EPS,
+    SHARED_FIXTURE_DIT_HEADS, SHARED_FIXTURE_DIT_HEAD_DIM, SHARED_FIXTURE_DIT_HIDDEN,
+    SHARED_FIXTURE_DIT_KV_HEADS, SHARED_FIXTURE_DIT_NUM_LAYERWISE_TEXT_BLOCKS,
+    SHARED_FIXTURE_DIT_NUM_REFINER_TEXT_BLOCKS, SHARED_FIXTURE_DIT_ROPE_THETA,
+    SHARED_FIXTURE_DIT_TXT_HEADS, SHARED_FIXTURE_ROPE_CAP_LEN, SHARED_FIXTURE_ROPE_GRID_H,
+    SHARED_FIXTURE_ROPE_GRID_W,
+};
 
 const FIX: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/");
-
-// Tiny config shared by the dump script (`mmdit` derives axes [8,12,12] from head_dim 32).
-const HEADS: usize = 4;
-const KV: usize = 2;
-const HEAD_DIM: usize = 32;
-const HIDDEN: usize = 128;
-const TXT_HEADS: usize = 2;
-const EPS: f64 = 1e-5;
 
 fn load(name: &str) -> Weights {
     let path = format!("{FIX}{name}");
@@ -65,8 +68,19 @@ fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
 fn rope_matches_reference() -> Result<()> {
     let g = load("rope_golden.safetensors");
     // meta = [n_tok, ht, wt, ax0, ax1, ax2]; theta fixed at 1000 (see the dump).
-    let (cap, ht, wt) = (5usize, 4usize, 4usize);
-    let r = RopeTables::build_t2i(cap, ht, wt, [8, 12, 12], 1000.0, &Device::Cpu)?;
+    let (cap, ht, wt) = (
+        SHARED_FIXTURE_ROPE_CAP_LEN,
+        SHARED_FIXTURE_ROPE_GRID_H,
+        SHARED_FIXTURE_ROPE_GRID_W,
+    );
+    let r = RopeTables::build_t2i(
+        cap,
+        ht,
+        wt,
+        SHARED_FIXTURE_DIT_AXES_DIMS_ROPE,
+        SHARED_FIXTURE_DIT_ROPE_THETA as f64,
+        &Device::Cpu,
+    )?;
     let (cos, sin) = r.joint();
 
     let want_cos = g.get("cos")?;
@@ -84,7 +98,15 @@ fn rope_matches_reference() -> Result<()> {
 #[test]
 fn single_block_matches_reference() -> Result<()> {
     let w = load("single_block_golden.safetensors");
-    let blk = SingleStreamBlock::load(&w, "blk", HEADS, KV, HEAD_DIM, HIDDEN, EPS)?;
+    let blk = SingleStreamBlock::load(
+        &w,
+        "blk",
+        SHARED_FIXTURE_DIT_HEADS,
+        SHARED_FIXTURE_DIT_KV_HEADS,
+        SHARED_FIXTURE_DIT_HEAD_DIM,
+        SHARED_FIXTURE_DIT_HIDDEN,
+        SHARED_FIXTURE_DIT_EPS,
+    )?;
     let y = blk.forward(
         &w.get("in.x")?,
         &w.get("in.tvec")?,
@@ -111,7 +133,15 @@ fn single_block_matches_reference() -> Result<()> {
 #[test]
 fn text_fusion_matches_reference() -> Result<()> {
     let w = load("text_fusion_golden.safetensors");
-    let tf = TextFusionTransformer::load(&w, 2, 2, TXT_HEADS, TXT_HEADS, HEAD_DIM, EPS)?;
+    let tf = TextFusionTransformer::load(
+        &w,
+        SHARED_FIXTURE_DIT_NUM_LAYERWISE_TEXT_BLOCKS,
+        SHARED_FIXTURE_DIT_NUM_REFINER_TEXT_BLOCKS,
+        SHARED_FIXTURE_DIT_TXT_HEADS,
+        SHARED_FIXTURE_DIT_TXT_HEADS,
+        SHARED_FIXTURE_DIT_HEAD_DIM,
+        SHARED_FIXTURE_DIT_EPS,
+    )?;
     let y = tf.forward(&w.get("in.x")?)?;
     let want = w.get("out.y")?;
     assert_eq!(y.dims(), want.dims());
@@ -126,32 +156,6 @@ fn text_fusion_matches_reference() -> Result<()> {
         "text_fusion diverged beyond 2e-2 (cosine {c:.7})"
     );
     Ok(())
-}
-
-/// Tiny config matching `tools/dump_krea_dit_golden.py::dump_dit` (the SwiGLU inner dims are read from
-/// the weights, so `intermediate_size` is documentary).
-fn tiny_dit_config() -> Krea2Config {
-    Krea2Config {
-        in_channels: 16,
-        patch_size: 2,
-        hidden_size: 128,
-        num_attention_heads: 4,
-        num_kv_heads: 2,
-        attention_head_dim: 32,
-        num_layers: 2,
-        intermediate_size: 384,
-        norm_eps: 1e-5,
-        axes_dims_rope: [8, 12, 12],
-        rope_theta: 1000.0,
-        timestep_embed_dim: 64,
-        num_text_layers: 3,
-        num_layerwise_text_blocks: 2,
-        num_refiner_text_blocks: 2,
-        text_hidden_dim: 64,
-        text_intermediate_size: 256,
-        text_num_attention_heads: 2,
-        text_num_kv_heads: 2,
-    }
 }
 
 /// **Edit-forward integrated smoke** (epic 10871 / sc-10877, sc-10878) on the committed tiny DiT — no

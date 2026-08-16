@@ -441,6 +441,52 @@ CROSS_BACKEND_GEOMETRY_REFERENCE: dict[str, dict[str, tuple[float, ...]]] = {
 # same drift one step earlier.
 CROSS_BACKEND_FIXTURE_PREFIX = "SHARED_FIXTURE_"
 
+# MiniMax-H3 was not the only family in that shape — it was one of five. Every family below commits at
+# least one fixture file byte-identically on both sides AND hand-types the geometry it is loaded
+# through, so each carried the same silent-drift hole. The `SHARED_FIXTURE_*` treatment now applies to
+# all of them, and a family listed here whose crates declare no `SHARED_FIXTURE_*` constants at all is
+# a failure: that is what makes the requirement a gate rather than a convention someone remembered to
+# follow once.
+#
+# Membership is not taken on trust. `_shares_a_fixture_file` re-derives the premise — a same-named
+# file under both crates' `tests/fixtures/` with the same bytes — every run, so a family whose
+# fixtures stopped being shared cannot keep drawing a requirement that no longer describes it.
+#
+# What that check does NOT claim is that every same-named fixture file matches: `sana` commits a
+# `dcae_encode_golden.safetensors` on each side that differ, two independent diffusers dumps of the
+# encode reference. Each lane's `#[ignore]`d encode gate is sound against its own; they are simply not
+# one shared reference, and that is recorded here rather than gated, because nothing here can tell a
+# deliberate second dump from a drifted copy.
+#
+# `bernini` earns its place with the smallest surface of the five, and deliberately so: most of its
+# fixture geometry is carried in each golden's own safetensors `__metadata__` and read back by both
+# lanes, which needs no gate at all — one copy of a number cannot disagree with itself. Only what the
+# goldens do not record is declared as `SHARED_FIXTURE_*`.
+CROSS_BACKEND_FIXTURE_FAMILIES: dict[str, str] = {
+    "anima": (
+        "six committed golden JSONs, byte-identical on both sides. The synthetic-DiT golden records "
+        "only `shape`/`count`/moments, so the tiny `DitConfig`, the FNV-1a-of-key seeds, the LCG "
+        "recurrence and the synthetic inputs must agree or the two lanes summarise different models."
+    ),
+    "bernini": (
+        "ten byte-identical goldens. Most geometry rides each golden's `__metadata__` and is read by "
+        "both lanes; the assembly backbone shape, the ViT-guidance weights and the template task "
+        "matrix are the remainder both lanes hand-type."
+    ),
+    "krea": (
+        "six byte-identical fixtures, including `variant5_native_keys.txt`. Both lanes hand-type the "
+        "tiny `Krea2Config` and `KreaTeConfig` the DiT and TE goldens are loaded through."
+    ),
+    "minimax-h3": (
+        "five byte-identical safetensors goldens loaded through hand-typed video-VAE, audio-VAE and "
+        "DiT geometry — the family sc-19496 was written for."
+    ),
+    "sana": (
+        "`sana_transformer_golden` and `sana_sprint_trunk_golden`, byte-identical on both sides, both "
+        "loaded through a hand-typed tiny `SanaTransformerConfig`."
+    ),
+}
+
 # Relative max-abs-diff, never a norm, a cosine or a checksum — those went blind to real defects in
 # this family seven separate times. Effectively exact for source literals; its only job is to let
 # `1e-5` and `0.00001`, or `0.858_090_34` and `0.85809034`, compare equal.
@@ -2087,6 +2133,29 @@ def _crate_pub_consts(
     return declarations
 
 
+def _shares_a_fixture_file(candle_crate: Path, mlx_crate: Path) -> bool:
+    """Do the two crates commit at least one same-named fixture file with the same bytes?
+
+    This is the premise `CROSS_BACKEND_FIXTURE_FAMILIES` membership rests on, re-derived rather than
+    asserted: the reason a family's hand-typed geometry has to be compared at all is that both lanes
+    load the *same bytes* through it. A membership claim nothing re-checks is exactly the shape of
+    defect this gate exists for, so a family whose fixtures are no longer shared stops satisfying
+    its own entry and the entry has to go.
+
+    One shared file is enough to establish it, and no more is claimed: same-named files that differ
+    are outside what this can judge (see the `sana` note on the table).
+    """
+    for path in sorted((candle_crate / "tests" / "fixtures").rglob("*")):
+        if not path.is_file():
+            continue
+        sibling = mlx_crate / "tests" / "fixtures" / path.relative_to(
+            candle_crate / "tests" / "fixtures"
+        )
+        if sibling.is_file() and sibling.read_bytes() == path.read_bytes():
+            return True
+    return False
+
+
 def _single_valued(declarations: dict[str, set[str]]) -> dict[str, str]:
     """The subset a same-crate reference can resolve against — one declaration, one value."""
     return {name: next(iter(values)) for name, values in declarations.items() if len(values) == 1}
@@ -2199,9 +2268,18 @@ def check_cross_backend_geometry(metadata: dict, root: Path) -> None:
        claimed cross-backend coverage it could not have. So `CROSS_BACKEND_GEOMETRY_REFERENCE` holds
        values read out of the released checkpoint through diffusers, and both sides are held to them.
 
-    4. **The test fixtures' geometry agrees too** (sc-19496). The reference-pinned families load
-       byte-identical committed fixtures through hand-typed configs in ``tests/``; those numbers are
-       declared as ``SHARED_FIXTURE_*`` constants and compared here, name set and values both.
+    4. **The test fixtures' geometry agrees too** (sc-19496). Every family in
+       ``CROSS_BACKEND_FIXTURE_FAMILIES`` — `anima`, `bernini`, `krea`, `minimax-h3`, `sana` — commits
+       fixture files byte-identically on both sides and loads them through geometry each lane
+       hand-types, so a drift in either config leaves both lanes internally consistent and both parity
+       suites green while the two backends compare a tensor dumped at one shape against a model built
+       at another. Those numbers are declared as ``SHARED_FIXTURE_*`` constants and compared here,
+       name set and values both; declaring none at all is a failure. The membership premise is
+       re-derived per run by ``_shares_a_fixture_file`` rather than trusted, so an entry cannot outlive
+       the sharing that justifies it. This does **not** claim every same-named fixture file matches —
+       ``sana`` commits two genuinely different `dcae_encode_golden.safetensors` — nor does it reach
+       geometry a golden records in its own ``__metadata__`` and both lanes read back, which needs no
+       comparison because there is only one copy of the number.
 
     Fail-closed throughout. A missing crate, a family that yields zero shared constants, or a
     required constant that will not resolve to a number is a failure, not a skip — a gate that
@@ -2225,6 +2303,20 @@ def check_cross_backend_geometry(metadata: dict, root: Path) -> None:
                 f"`{family}` is pinned against a reference but is not a dual-backend family any "
                 "more — drop the reference block"
             )
+    for family in sorted(CROSS_BACKEND_FIXTURE_FAMILIES):
+        if family not in known:
+            violations.append(
+                f"`{family}` is required to declare `{CROSS_BACKEND_FIXTURE_PREFIX}*` fixture "
+                "geometry but is not a dual-backend family any more — drop the entry"
+            )
+    # A reference pin is a strictly stronger claim than shared fixtures, so a pinned family that is
+    # not also required to declare its fixture geometry would silently narrow this gate's reach.
+    for family in sorted(set(CROSS_BACKEND_GEOMETRY_REFERENCE) - set(CROSS_BACKEND_FIXTURE_FAMILIES)):
+        violations.append(
+            f"`{family}` is pinned against the diffusers reference but is missing from "
+            "CROSS_BACKEND_FIXTURE_FAMILIES, so its fixture geometry is not required to be declared "
+            "at all — add it with the reason its two crates share fixture bytes"
+        )
     for family, constant in sorted(CROSS_BACKEND_GEOMETRY_EXEMPTIONS):
         if family not in known:
             violations.append(
@@ -2341,14 +2433,22 @@ def check_cross_backend_geometry(metadata: dict, root: Path) -> None:
             candle_crate, "tests", prefix=CROSS_BACKEND_FIXTURE_PREFIX
         )
         mlx_fixtures = _crate_pub_consts(mlx_crate, "tests", prefix=CROSS_BACKEND_FIXTURE_PREFIX)
-        if family in CROSS_BACKEND_GEOMETRY_REFERENCE and not (candle_fixtures and mlx_fixtures):
-            violations.append(
-                f"{family}: is pinned against the reference and its two crates commit "
-                f"byte-identical fixtures, but "
-                f"{candle_relative if not candle_fixtures else mlx_relative} declares no "
-                f"`{CROSS_BACKEND_FIXTURE_PREFIX}*` constants under tests/. The fixture geometry is "
-                "hand-typed on both sides and nothing else compares it"
-            )
+        if family in CROSS_BACKEND_FIXTURE_FAMILIES:
+            if not _shares_a_fixture_file(candle_crate, mlx_crate):
+                violations.append(
+                    f"{family}: is required to declare `{CROSS_BACKEND_FIXTURE_PREFIX}*` fixture "
+                    f"geometry because {candle_relative} and {mlx_relative} commit the same fixture "
+                    "bytes, but no same-named file under their tests/fixtures/ is byte-identical any "
+                    f"more — the reason recorded in CROSS_BACKEND_FIXTURE_FAMILIES ("
+                    f"{CROSS_BACKEND_FIXTURE_FAMILIES[family]}) no longer describes them"
+                )
+            elif not (candle_fixtures and mlx_fixtures):
+                violations.append(
+                    f"{family}: its two crates commit byte-identical fixtures, but "
+                    f"{candle_relative if not candle_fixtures else mlx_relative} declares no "
+                    f"`{CROSS_BACKEND_FIXTURE_PREFIX}*` constants under tests/. The fixture geometry "
+                    "is hand-typed on both sides and nothing else compares it"
+                )
         for constant in sorted(set(candle_fixtures) - set(mlx_fixtures)):
             violations.append(
                 f"{family}: `{constant}` is declared in {candle_relative}/tests but not in "
