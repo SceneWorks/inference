@@ -61,8 +61,9 @@ fn diff(got: &[f32], exp: &[f32]) -> (f32, f64) {
 #[test]
 fn build_ti2v_mask_matches_reference() {
     let w = fixture();
-    // Fixture dims: z=16, t_lat=2, h_lat=w_lat=2, patch (1,2,2).
-    let (mask, tokens) = build_ti2v_mask(16, 2, 2, 2, (1, 2, 2));
+    // Fixture dims: z=16, t_lat=2, h_lat=w_lat=2, patch (1,2,2). The reference `build_i2v_mask` has
+    // no strength, so the parity pin is `strength = 1.0` — a full freeze (sc-19571).
+    let (mask, tokens) = build_ti2v_mask(&[(0, 1.0)], 16, 2, 2, 2, (1, 2, 2));
     let exp_mask = w.require("mask").unwrap();
     let exp_tokens = w.require("mask_tokens").unwrap();
     assert_eq!(mask.shape(), exp_mask.shape(), "mask shape");
@@ -143,5 +144,100 @@ fn wan_ti2v_mask_blend_matches_reference() {
     assert!(
         mean_rel < 2e-2,
         "ti2v latents diverged: mean_rel={mean_rel:.3e}"
+    );
+}
+
+/// sc-19571 — **the conditioning strength must change the render.**
+///
+/// The defect this closes accepted `imageConditioningStrength` / `lastFrameConditioningStrength`
+/// and built a hard `0/1` mask regardless, so every strength produced a bit-identical video. This
+/// runs the SAME fixture DiT, seed, contexts, noise and `z_img` through `denoise_ti2v` twice,
+/// changing **only** the strength the mask is built from, and gates on **relative max-abs-diff** —
+/// not a norm, cosine or checksum, all three of which have been blind to real defects in this
+/// family (they are aggregate/scale-invariant and a partially-pinned frame moves a bounded subset
+/// of the tensor).
+///
+/// Two directions, both asserted:
+///  * `strength = 1.0` reproduces the historical hard pin **bit-for-bit** (a partial-pin
+///    implementation that also perturbed the full pin would be a regression, not a fix);
+///  * `strength = 0.6` moves the latent well clear of the bf16 step-accumulation floor the
+///    reference gate above measures at `< 2e-2`.
+///
+/// Mutation guard: hard-code the `pins` strength to `1.0` inside `build_ti2v_mask` — i.e.
+/// re-introduce the exact defect — and `rel_max_abs` collapses to `0.0`, tripping the "must change"
+/// assertion while the identity assertion still passes.
+#[test]
+fn conditioning_strength_changes_the_ti2v_render() {
+    let w = fixture();
+    let cfg = tiny_cfg();
+    let dit = WanTransformer::from_weights(&w, &cfg).expect("build DiT");
+    let ctx_cond = dit.embed_text(w.require("ctx_cond").unwrap()).unwrap();
+    let ctx_uncond = dit.embed_text(w.require("ctx_uncond").unwrap()).unwrap();
+    let init_noise = w.require("init_noise").unwrap();
+    let z_img = w.require("z_img").unwrap();
+
+    // Everything below is held fixed except the pin strength.
+    let render = |strength: f32| -> Vec<f32> {
+        let (mask, mask_tokens) = build_ti2v_mask(&[(0, strength)], 16, 2, 2, 2, (1, 2, 2));
+        let init = ti2v_blend_init(z_img, &mask, init_noise).unwrap();
+        denoise_ti2v(
+            &dit,
+            SolverKind::Euler,
+            cfg.num_train_timesteps,
+            4,
+            5.0,
+            3.0,
+            &ctx_cond,
+            Some(&ctx_uncond),
+            &init,
+            z_img,
+            &mask,
+            &mask_tokens,
+            &mlx_gen::CancelFlag::default(),
+            &mut |_| {},
+        )
+        .expect("denoise_ti2v")
+        .as_slice::<f32>()
+        .to_vec()
+    };
+
+    /// `max|a−b| / max|b|` — the per-element worst case, normalized. A single frame that failed to
+    /// respond to the knob shows up here; it does not in a norm or a cosine.
+    fn rel_max_abs(a: &[f32], b: &[f32]) -> f32 {
+        let max_d = a
+            .iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max);
+        let scale = b.iter().map(|y| y.abs()).fold(0f32, f32::max).max(1e-9);
+        max_d / scale
+    }
+
+    let full = render(1.0);
+    // The full pin is unchanged by this story: same construction, byte-identical output.
+    assert_eq!(
+        full,
+        render(1.0),
+        "the render must be deterministic before anything else is concluded from it"
+    );
+
+    let partial = render(0.6);
+    let rel = rel_max_abs(&partial, &full);
+    println!("[ti2v strength 0.6 vs 1.0] rel_max_abs={rel:.3e}");
+    assert!(
+        rel > 0.1,
+        "conditioning strength must change the render — rel_max_abs={rel:.3e} (0.0 means the \
+         strength never reached the mask, which is sc-19571's defect; the bf16 step-accumulation \
+         floor this fixture measures against the reference is < 2e-2, so 0.1 is an order of \
+         magnitude clear of it)"
+    );
+
+    // …and the response is monotone in the knob rather than an on/off flip: a weaker pin departs
+    // from the full pin by MORE than a stronger one does.
+    let weaker = rel_max_abs(&render(0.2), &full);
+    println!("[ti2v strength 0.2 vs 1.0] rel_max_abs={weaker:.3e}");
+    assert!(
+        weaker > rel,
+        "a weaker pin must depart further from the full pin (0.2 → {weaker:.3e} vs 0.6 → {rel:.3e})"
     );
 }

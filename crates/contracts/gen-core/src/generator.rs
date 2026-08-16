@@ -1011,52 +1011,74 @@ impl GenerationRequest {
                 }
             }
         }
-        // Conditioning-carried floats the floor also owns (F-001): the Control-branch scale and the
-        // per-Reference img2img strength both flow into the same denoise/scheduler math.
+        // Conditioning-carried floats the floor also owns (F-001): every numeric a `Conditioning`
+        // variant carries flows into the same denoise / scheduler / mask math as the flat knobs.
+        //
+        // **This match is deliberately wildcard-free and guard-free** (sc-19571). It used to end in
+        // `_ => {}`, and that one arm is the whole reason the floor lagged the request surface: the
+        // exhaustive `Self { .. }` destructure above makes a new *field* break the build, but a new
+        // float-bearing `Conditioning` **variant** compiled clean and slipped straight past. Four
+        // did — `Keyframe.strength`, `VideoClip.strength`, `ControlClip.masking_strength` and every
+        // `ReduxRefs` per-ref strength — each of them a `1 − strength` denoise mask or a blend
+        // weight, i.e. exactly the math this method exists to protect. Guards are avoided for the
+        // same reason: `match` exhaustiveness ignores them, so a guarded arm re-opens the hole.
+        // Adding a variant now fails to compile here until its numerics are classified.
         for c in conditioning {
             match c {
-                Conditioning::Control { scale: Some(s), .. } if !s.is_finite() => {
-                    return Some(("conditioning.control.scale", *s));
+                Conditioning::Control { scale, .. } => {
+                    if let Some(s) = scale {
+                        if !s.is_finite() {
+                            return Some(("conditioning.control.scale", *s));
+                        }
+                    }
                 }
-                Conditioning::Reference {
-                    strength: Some(s), ..
-                } if !s.is_finite() => {
-                    return Some(("conditioning.reference.strength", *s));
+                Conditioning::Reference { strength, .. } => {
+                    if let Some(s) = strength {
+                        if !s.is_finite() {
+                            return Some(("conditioning.reference.strength", *s));
+                        }
+                    }
                 }
-                Conditioning::ReferenceAudio {
-                    strength: Some(s), ..
-                } if !s.is_finite() => {
-                    return Some(("conditioning.reference_audio.strength", *s));
+                Conditioning::ReferenceAudio { strength, .. } => {
+                    if let Some(s) = strength {
+                        if !s.is_finite() {
+                            return Some(("conditioning.reference_audio.strength", *s));
+                        }
+                    }
                 }
                 // A reference clip's declared rate (sc-17149). Not a cosmetic label: it is the
                 // divisor of the resample stride that picks which frames the model actually reads,
                 // so a NaN propagates into a frame-index computation rather than into denoise math
                 // — the same class of silent poisoning, one step earlier.
-                Conditioning::ReferenceVideo { fps, .. } if !fps.is_finite() => {
-                    return Some(("conditioning.reference_video.fps", *fps));
+                Conditioning::ReferenceVideo { fps, .. } => {
+                    if !fps.is_finite() {
+                        return Some(("conditioning.reference_video.fps", *fps));
+                    }
                 }
                 // The audio-edit strength and its region bounds all flow into the edit-window /
                 // blend math; a NaN would silently poison the region conversion or the strength
                 // gate (sc-12847).
                 Conditioning::AudioEdit {
-                    strength: Some(s), ..
-                } if !s.is_finite() => {
-                    return Some(("conditioning.audio_edit.strength", *s));
-                }
-                Conditioning::AudioEdit {
-                    region: Some(r), ..
-                } if !r.start_secs.is_finite() => {
-                    return Some(("conditioning.audio_edit.region.start_secs", r.start_secs));
-                }
-                Conditioning::AudioEdit {
-                    region:
-                        Some(TimeRegion {
-                            end_secs: Some(end),
-                            ..
-                        }),
-                    ..
-                } if !end.is_finite() => {
-                    return Some(("conditioning.audio_edit.region.end_secs", *end));
+                    strength, region, ..
+                } => {
+                    if let Some(s) = strength {
+                        if !s.is_finite() {
+                            return Some(("conditioning.audio_edit.strength", *s));
+                        }
+                    }
+                    if let Some(r) = region {
+                        if !r.start_secs.is_finite() {
+                            return Some((
+                                "conditioning.audio_edit.region.start_secs",
+                                r.start_secs,
+                            ));
+                        }
+                        if let Some(end) = r.end_secs {
+                            if !end.is_finite() {
+                                return Some(("conditioning.audio_edit.region.end_secs", end));
+                            }
+                        }
+                    }
                 }
                 // The multi-region carrier (sc-14549). Written as a **loop over every** region
                 // rather than as more `if`-guarded arms, and that difference is the whole point:
@@ -1091,12 +1113,61 @@ impl GenerationRequest {
                         }
                     }
                 }
-                Conditioning::VoiceEmbedding {
-                    strength: Some(s), ..
-                } if !s.is_finite() => {
-                    return Some(("conditioning.voice_embedding.strength", *s));
+                Conditioning::VoiceEmbedding { strength, .. } => {
+                    if let Some(s) = strength {
+                        if !s.is_finite() {
+                            return Some(("conditioning.voice_embedding.strength", *s));
+                        }
+                    }
                 }
-                _ => {}
+                // sc-19571 — the four that the old `_ => {}` swallowed.
+                //
+                // A keyframe's `strength` is a `1 − strength` denoise mask on the pinned latent
+                // frame AND the per-token diffusion timestep for that frame's tokens (Wan TI2V,
+                // LTX). A NaN there does not merely mis-weight a pin: it makes the whole masked
+                // frame's timestep NaN, which the denoise then multiplies into every step.
+                Conditioning::Keyframe { strength, .. } => {
+                    if !strength.is_finite() {
+                        return Some(("conditioning.keyframe.strength", *strength));
+                    }
+                }
+                // An in-context clip's `strength` is the same `1 − strength` mask on appended
+                // conditioning tokens (LTX IC-LoRA, krea-realtime v2v).
+                Conditioning::VideoClip { strength, .. } => {
+                    if !strength.is_finite() {
+                        return Some(("conditioning.video_clip.strength", *strength));
+                    }
+                }
+                // `masking_strength` gates BOTH the pixel-space neutralization of the person region
+                // and the mask-injection step count (`ceil(steps · masking_strength)`), so a NaN
+                // reaches an integer step count as well as a blend weight.
+                Conditioning::ControlClip {
+                    masking_strength, ..
+                } => {
+                    if !masking_strength.is_finite() {
+                        return Some((
+                            "conditioning.control_clip.masking_strength",
+                            *masking_strength,
+                        ));
+                    }
+                }
+                // Per-reference Redux weights. A **loop**, for the `AudioEditRegions` reason above:
+                // checking only `refs[0]` would compile and pass, and a NaN in ref two would flow
+                // into the conditioning blend unseen.
+                Conditioning::ReduxRefs { refs } => {
+                    for (_, strength) in refs {
+                        if !strength.is_finite() {
+                            return Some(("conditioning.redux_refs.strength", *strength));
+                        }
+                    }
+                }
+                // Float-free carriers: media and opaque labels only. Named rather than swallowed by
+                // a wildcard so that adding a numeric to any of them breaks this match.
+                Conditioning::MultiReference { images: _ } => {}
+                Conditioning::Depth { image: _ } => {}
+                Conditioning::Mask { image: _ } => {}
+                Conditioning::VideoSync { frames: _ } => {}
+                Conditioning::ConversationHistory { turns: _ } => {}
             }
         }
         // Multi-phase denoise floats (sc-13884): each phase's guidance and each phase-adapter weight
@@ -5386,6 +5457,96 @@ mod tests {
         assert!(ref_video_req(2, 30.0, None)
             .first_nonfinite_float()
             .is_none());
+    }
+
+    /// sc-19571 — the four conditioning floats the old `_ => {}` arm swallowed.
+    ///
+    /// Each of these is a `1 − strength` denoise mask or a blend weight, i.e. the same math the
+    /// floor already protected on `Reference` — they were missed only because the conditioning
+    /// `match` ended in a wildcard, so a new float-bearing variant compiled clean. The wildcard is
+    /// gone; this test is what proves the four arms that replaced it actually fire.
+    ///
+    /// Mutation guard: delete any ONE of the four arms and exactly one sub-assertion below goes
+    /// red — they are checked individually, not as a batch.
+    #[test]
+    fn keyframe_video_clip_control_clip_and_redux_floats_join_the_finiteness_floor() {
+        let with = |c: Conditioning| GenerationRequest {
+            prompt: "x".into(),
+            conditioning: vec![c],
+            ..Default::default()
+        };
+
+        let (field, value) = with(Conditioning::Keyframe {
+            image: img(8, 8),
+            frame_idx: 0,
+            strength: f32::NAN,
+        })
+        .first_nonfinite_float()
+        .expect("NaN keyframe strength must be caught");
+        assert_eq!(field, "conditioning.keyframe.strength");
+        assert!(value.is_nan());
+
+        let (field, value) = with(Conditioning::VideoClip {
+            frames: vec![img(8, 8)],
+            frame_idx: 0,
+            strength: f32::INFINITY,
+        })
+        .first_nonfinite_float()
+        .expect("infinite clip strength must be caught");
+        assert_eq!(field, "conditioning.video_clip.strength");
+        assert!(value.is_infinite());
+
+        let (field, value) = with(Conditioning::ControlClip {
+            frames: vec![img(8, 8)],
+            mask: vec![img(8, 8)],
+            masking_strength: f32::NAN,
+            start_frame: 0,
+            mode: ReplacementMode::FaceOnly,
+        })
+        .first_nonfinite_float()
+        .expect("NaN masking_strength must be caught");
+        assert_eq!(field, "conditioning.control_clip.masking_strength");
+        assert!(value.is_nan());
+
+        // The bad value sits in ref **two** — a guard that only reached `refs[0]` would compile and
+        // pass every other assertion here (the `AudioEditRegions` lesson, applied).
+        let (field, value) = with(Conditioning::ReduxRefs {
+            refs: vec![(img(8, 8), 0.5), (img(8, 8), f32::NAN)],
+        })
+        .first_nonfinite_float()
+        .expect("NaN in the SECOND redux ref must be caught");
+        assert_eq!(field, "conditioning.redux_refs.strength");
+        assert!(value.is_nan());
+
+        // Finite values on all four pass cleanly — the floor rejects non-finiteness, not the knob.
+        let clean = GenerationRequest {
+            prompt: "x".into(),
+            conditioning: vec![
+                Conditioning::Keyframe {
+                    image: img(8, 8),
+                    frame_idx: -1,
+                    strength: 0.25,
+                },
+                Conditioning::VideoClip {
+                    frames: vec![img(8, 8)],
+                    frame_idx: 0,
+                    strength: 0.75,
+                },
+                Conditioning::ControlClip {
+                    frames: vec![img(8, 8)],
+                    mask: vec![img(8, 8)],
+                    masking_strength: 0.5,
+                    start_frame: 0,
+                    mode: ReplacementMode::FaceOnly,
+                },
+                Conditioning::ReduxRefs {
+                    refs: vec![(img(8, 8), 0.5), (img(8, 8), 0.25)],
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(clean.first_nonfinite_float().is_none());
+        assert!(clean.ensure_finite_floats().is_ok());
     }
 
     /// sc-13884: the default request carries no phases (single-phase, byte-for-byte the pre-13884
