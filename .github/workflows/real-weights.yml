@@ -113,7 +113,7 @@ on:
         default: all
         # `audio` still runs every audio family. The `audio-*` entries are the per-family split
         # (sc-16981) — dispatch one provider family without taking the Metal runner for the rest.
-        options: [all, llm, llm-joycaption, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, sc-19753-z-decode-sweep, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base]
+        options: [all, llm, llm-joycaption, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, sc-19753-z-decode-sweep, sc-19753-disk-audit, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base]
       sceneworks_revision:
         description: Exact lowercase SceneWorks commit paired with memory-evidence-v1
         type: string
@@ -5938,3 +5938,18 @@ jobs:
           name: sc-19753-z-decode-sweep-${{ github.sha }}
           if-no-files-found: error
           path: ${{ runner.temp }}/sc-19753-z-decode-sweep.log
+
+  # Read-only SC-19753 diagnostic: quantify the alternate Metal host's actual free space before
+  # deciding whether any quality coordinates can safely share it. No cache or workspace is removed.
+  mlx-sc-19753-disk-audit:
+    name: SC-19753 alternate Metal disk audit
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'sc-19753-disk-audit'
+    runs-on: [self-hosted, macOS, ARM64, rw-chroma]
+    timeout-minutes: 5
+    steps:
+      - name: Report exact free bytes
+        run: |
+          set -euo pipefail
+          df -Pk "$RUNNER_TEMP"
+          available_kib="$(df -Pk "$RUNNER_TEMP" | awk 'NR == 2 { print $4 }')"
+          printf 'SC19753_AVAILABLE_KIB=%s\n' "$available_kib"
