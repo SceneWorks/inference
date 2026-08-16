@@ -826,7 +826,7 @@ jobs:
             ${{ runner.temp }}/decode-quality-v2-kolors-kolors-${{ matrix.candidate.geometry }}-policies.json
 
   mlx-decode-quality-sdxl:
-    name: Decode quality admission (${{ matrix.model.id }} ${{ matrix.candidate.geometry }})
+    name: Decode quality admission (${{ matrix.model.id }} ${{ matrix.candidate.geometry }} ${{ matrix.candidate.edge }})
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'decode-quality-sdxl'
     # SC-19753 diagnostic only; see the Kolors job's audited runner-selection rationale above.
     runs-on: [self-hosted, macOS, ARM64, "${{ inputs.decode_quality_sdxl_runner }}"]
@@ -836,27 +836,15 @@ jobs:
       max-parallel: 1
       matrix:
         model:
-          - id: illustrious_xl_v1
-            repository: SceneWorks/illustrious-xl-v1-mlx
-            source_revision: c5a92a902dd4e6ee99c2a57981ecf66209905dd1
-            steps: 30
-            guidance: 7.0
           - id: illustrious_xl_v2
             repository: SceneWorks/illustrious-xl-v2-mlx
             source_revision: 7c5c8b2bb75a8f38a7365e70bdf84d38d6204473
             steps: 30
             guidance: 7.0
         candidate:
-          - { geometry: "1024x1024", value: "1024x1024:896:192" }
-          - { geometry: "1152x896", value: "1152x896:768:160" }
-          - { geometry: "896x1152", value: "896x1152:768:160" }
-          - { geometry: "1216x832", value: "1216x832:704:160" }
-          - { geometry: "832x1216", value: "832x1216:704:160" }
-          - { geometry: "1344x768", value: "1344x768:640:128" }
-          - { geometry: "768x1344", value: "768x1344:640:128" }
-          - { geometry: "1280x1280", value: "1280x1280:1120:240" }
-          - { geometry: "1536x1536", value: "1536x1536:1344:288" }
-          - { geometry: "2048x2048", value: "2048x2048:1792:384" }
+          - { geometry: "1152x896", edge: "e800", value: "1152x896:800:160" }
+          - { geometry: "1152x896", edge: "e832", value: "1152x896:832:160" }
+          - { geometry: "1152x896", edge: "e896", value: "1152x896:896:160" }
     env:
       QUALITY_MODEL: ${{ matrix.model.id }}
       QUALITY_REPOSITORY: ${{ matrix.model.repository }}
@@ -925,7 +913,7 @@ jobs:
         if: always() && (inputs.decode_quality_sdxl_model == 'all' || inputs.decode_quality_sdxl_model == matrix.model.id)
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: decode-quality-v2-sdxl-${{ matrix.model.id }}-${{ matrix.candidate.geometry }}
+          name: decode-quality-v2-sdxl-${{ matrix.model.id }}-${{ matrix.candidate.geometry }}-${{ matrix.candidate.edge }}
           if-no-files-found: error
           path: |
             ${{ runner.temp }}/decode-quality-v2-sdxl-${{ matrix.model.id }}-${{ matrix.candidate.geometry }}.log

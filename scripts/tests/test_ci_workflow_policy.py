@@ -668,11 +668,18 @@ def decode_quality_candidate_rows(job: dict) -> tuple[list[str], list[str]]:
     candidates = job.get("strategy", {}).get("matrix", {}).get("candidate", [])
     rows: list[str] = []
     for candidate in candidates:
-        if not isinstance(candidate, dict) or set(candidate) != {"geometry", "value"}:
+        if not isinstance(candidate, dict) or set(candidate) not in (
+            {"geometry", "value"},
+            {"geometry", "edge", "value"},
+        ):
             errors.append(f"invalid candidate matrix row {candidate!r}")
             continue
         geometry, value = candidate["geometry"], candidate["value"]
-        if not isinstance(geometry, str) or not isinstance(value, str):
+        if (
+            not isinstance(geometry, str)
+            or not isinstance(value, str)
+            or ("edge" in candidate and not isinstance(candidate["edge"], str))
+        ):
             errors.append(f"candidate matrix row must use strings: {candidate!r}")
             continue
         if value.split(":", 1)[0] != geometry:
@@ -936,7 +943,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             "mlx-decode-quality-kolors": 7,
             # SC-19753 diagnostic branch: the first 30 cells are already sealed, so this
             # branch dispatches only the two remaining Illustrious families.
-            "mlx-decode-quality-sdxl": 20,
+            "mlx-decode-quality-sdxl": 3,
             "mlx-decode-quality-chroma": 12,
         }
         for job, cells in expected_cells.items():
@@ -968,14 +975,14 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                 )
                 self.assertIn("--expected-policy-count 1", collector_step)
                 self.assertIn("--expected-fixture-count 5", collector_step)
-        # The diagnostic branch retains the 69-cell contract by combining these 39
-        # dispatchable cells with the 30 already sealed SDXL/RealVisXL cells.
-        self.assertEqual(sum(expected_cells.values()) + 30, 69)
+        # This diagnostic branch now carries only the three edge probes for the worst
+        # remaining coordinate; the authoritative 69-cell set is already sealed separately.
+        self.assertEqual(sum(expected_cells.values()), 22)
 
         mutations = {
             "Kolors landscape geometry": ("1280x768:576:48", "1280x720:576:48"),
             "Kolors portrait geometry": ("768x1280:576:48", "720x1280:576:48"),
-            "SDXL geometry": ("1216x832:704:160", "1216x816:704:160"),
+            "SDXL geometry": ("1152x896:800:160", "1152x880:800:160"),
             "Chroma geometry": ("1280x720:576:192", "1280x722:576:192"),
             "zero geometry": ("768x768:576:48", "0x768:576:48"),
             "zero overlap": ("768x768:576:48", "768x768:576:0"),
