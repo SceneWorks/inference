@@ -40,6 +40,7 @@ use mlx_rs::ops::{add, multiply};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
+use mlx_gen::attention::BoundedAttention;
 use mlx_gen::nn::silu;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
@@ -346,6 +347,32 @@ impl DitBlock {
         rope: &MmRope,
         tables: &MmRopeTables,
     ) -> Result<Array> {
+        self.forward_bounded(
+            x,
+            modulation,
+            adaln_indices,
+            rope,
+            tables,
+            BoundedAttention::UNBOUNDED,
+        )
+    }
+
+    /// [`Self::forward`] under an explicit [`BoundedAttention`] — the rung-3 seam (sc-18661).
+    ///
+    /// The plan is threaded rather than read from a block-level field so that the *same* loaded stack
+    /// can run a bounded and an un-bounded arm back to back in one process, which is what
+    /// `tests/bounded_attention_real.rs` needs to compare peaks against a 17 GB DiT it can only
+    /// afford to load once.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_bounded(
+        &self,
+        x: &Array,
+        modulation: &AdaLnModulation,
+        adaln_indices: &Array,
+        rope: &MmRope,
+        tables: &MmRopeTables,
+        bounded: BoundedAttention<'_>,
+    ) -> Result<Array> {
         let s = x.shape();
         if s.len() != 3 {
             return Err(Error::Msg(format!(
@@ -367,7 +394,9 @@ impl DitBlock {
             &modulation.shift_msa,
             adaln_indices,
         )?;
-        let attn = self.attn.forward(&normed, Some((rope, tables)))?;
+        let attn = self
+            .attn
+            .forward_bounded(&normed, Some((rope, tables)), bounded)?;
         let gate = modulation.gate_msa.take_axis(adaln_indices, 0)?;
         let x = add(x, &multiply(&gate, &attn)?)?;
 
@@ -392,8 +421,33 @@ impl DitBlock {
         rope: &MmRope,
         tables: &MmRopeTables,
     ) -> Result<Array> {
+        self.forward_with_temb_bounded(
+            x,
+            temb,
+            adaln_indices,
+            rope,
+            tables,
+            BoundedAttention::UNBOUNDED,
+        )
+    }
+
+    /// [`Self::forward_with_temb`] under an explicit [`BoundedAttention`].
+    ///
+    /// The resident-AdaLN arm carries the plan too: a rung that reached only the precompute-and-evict
+    /// path would be selectable on a request the solver routes to the other one, and would then bound
+    /// nothing while the contract said it did.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_temb_bounded(
+        &self,
+        x: &Array,
+        temb: &Array,
+        adaln_indices: &Array,
+        rope: &MmRope,
+        tables: &MmRopeTables,
+        bounded: BoundedAttention<'_>,
+    ) -> Result<Array> {
         let modulation = self.modulation(temb)?;
-        self.forward(x, &modulation, adaln_indices, rope, tables)
+        self.forward_bounded(x, &modulation, adaln_indices, rope, tables, bounded)
     }
 }
 

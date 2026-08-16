@@ -6,11 +6,12 @@
 //! `transformer/`. Only `adaln_proj.linear`, the input/output projections and the timestep MLP
 //! carry biases.
 
-use mlx_rs::fast::{rms_norm, scaled_dot_product_attention};
+use mlx_rs::fast::rms_norm;
 use mlx_rs::ops::multiply;
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
+use mlx_gen::attention::{sdpa_bounded_bhsd, AttentionChunkAxis, BoundedAttention};
 use mlx_gen::nn::silu;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
@@ -18,6 +19,100 @@ use mlx_gen::{Error, Result};
 use crate::dit::config::MiniMaxH3DitConfig;
 use crate::dit::rope::{MmRope, MmRopeTables};
 use crate::layout::split_gate_value;
+
+/// **The rung-3 reachability probe** (sc-18661): what the last [`DitAttention::forward_bounded`] in
+/// this process actually executed.
+///
+/// Always compiled, unlike `mlx_gen::attention`'s crate-private `#[cfg(test)]` counter, because the
+/// claim it exists to settle is a *cross-crate* one: an integration test holding a real 50-block DiT
+/// has to be able to show that the bounded kernel ran **inside the real attention call**, not merely
+/// that a bounded kernel exists and that a contract declares a rung. Every equivalence and peak
+/// assertion in `tests/bounded_attention_real.rs` is vacuous without it — "chunked == unbounded" is
+/// trivially true when the chunking never engaged.
+///
+/// Two relaxed stores per attention call, against a fused Metal SDPA over up to 104 030 rows.
+/// `JointDit::forwards` is the same kind of always-on mechanism counter in this crate.
+pub mod attention_probe {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// `0` = nothing recorded, `1` = the un-chunked fused call, `n > 1` = `n` head chunks.
+    static LAST_HEAD_CHUNKS: AtomicUsize = AtomicUsize::new(0);
+    /// Query-row blocks the last call's *final* kernel invocation ran. `1` means the head axis alone
+    /// fit the budget, which is the bit-exact case.
+    static LAST_QUERY_CHUNKS: AtomicUsize = AtomicUsize::new(0);
+    /// Packed sequence length the last call attended over.
+    static LAST_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    /// Head chunks the last bounded attention call ran.
+    pub fn last_head_chunks() -> usize {
+        LAST_HEAD_CHUNKS.load(Ordering::Relaxed)
+    }
+
+    /// Query-row blocks the last bounded attention call's final kernel invocation ran.
+    pub fn last_query_chunks() -> usize {
+        LAST_QUERY_CHUNKS.load(Ordering::Relaxed)
+    }
+
+    /// Sequence length the last bounded attention call attended over.
+    pub fn last_seq() -> usize {
+        LAST_SEQ.load(Ordering::Relaxed)
+    }
+
+    /// Reset before a measured arm so a stale value cannot satisfy an assertion.
+    pub fn reset() {
+        LAST_HEAD_CHUNKS.store(0, Ordering::Relaxed);
+        LAST_QUERY_CHUNKS.store(0, Ordering::Relaxed);
+        LAST_SEQ.store(0, Ordering::Relaxed);
+    }
+
+    pub(super) fn record(head_chunks: usize, query_chunks: usize, seq: usize) {
+        LAST_HEAD_CHUNKS.store(head_chunks, Ordering::Relaxed);
+        LAST_QUERY_CHUNKS.store(query_chunks, Ordering::Relaxed);
+        LAST_SEQ.store(seq, Ordering::Relaxed);
+    }
+}
+
+/// The chunk counts a [`BoundedAttention`] implies at this call's live shape.
+///
+/// Derived from [`mlx_gen::gen_core::attention_budget`]'s own planner — the same calls the kernel
+/// makes — so the probe cannot report a plan the kernel did not execute. Self-attention here, so
+/// `Sk == Sq == seq`.
+///
+/// `pub` because `tests/bounded_attention_real.rs` asserts the *engagement premise* (that the shipped
+/// budget really does split at a given geometry) before it spends 40 minutes measuring peaks against
+/// it, and a premise re-derived in the test would be a second implementation.
+pub fn planned_attention_chunks(
+    bounded: BoundedAttention<'_>,
+    b: i32,
+    heads: i32,
+    seq: i32,
+) -> (usize, usize) {
+    let budget = bounded.plan.budget;
+    let (head_chunks, heads_in_chunk) = match bounded.axis {
+        AttentionChunkAxis::QueryRows => (1usize, heads),
+        AttentionChunkAxis::Heads => {
+            let plan = budget.head_chunks(
+                b.max(0) as u64,
+                heads.max(0) as u64,
+                seq.max(0) as u64,
+                seq.max(0) as u64,
+            );
+            if plan.chunks_heads() {
+                let per = (plan.heads_per_chunk().max(1) as i32).min(heads.max(1));
+                ((heads.max(1) as usize).div_ceil(per as usize), per)
+            } else {
+                (1usize, heads)
+            }
+        }
+    };
+    let block = budget.query_block(b, heads_in_chunk, seq, seq).max(1);
+    (head_chunks, (seq.max(1) as usize).div_ceil(block as usize))
+}
+
+fn record_planned_attention(bounded: BoundedAttention<'_>, b: i32, heads: i32, seq: i32) {
+    let (head_chunks, query_chunks) = planned_attention_chunks(bounded, b, heads, seq);
+    attention_probe::record(head_chunks, query_chunks, seq.max(0) as usize);
+}
 
 /// `y = x · Wᵀ` for a stored `[out, in]` weight — an `nn.Linear(..., bias=False)`.
 ///
@@ -170,7 +265,36 @@ impl DitAttention {
     }
 
     /// `rope` is `None` for the token refiner, which runs **without** any positional embedding.
+    ///
+    /// The un-bounded entry point, byte-identical to the pre-rung-3 forward: it is
+    /// [`Self::forward_bounded`] at [`BoundedAttention::UNBOUNDED`], whose fast path is a single
+    /// un-chunked `scaled_dot_product_attention` with the same scale, dtypes and k/v.
     pub fn forward(&self, x: &Array, rope: Option<(&MmRope, &MmRopeTables)>) -> Result<Array> {
+        self.forward_bounded(x, rope, BoundedAttention::UNBOUNDED)
+    }
+
+    /// [`Self::forward`] under an explicit [`BoundedAttention`] — the rung-3 seam (sc-18661).
+    ///
+    /// This is the **only** attention kernel call in the 50-block DiT stack and the 2-block token
+    /// refiner, so a bounded plan reaching here reaches every one of the family's 52 attention sites.
+    /// The preferred axis for this family is [`AttentionChunkAxis::Heads`]: 56 heads make the head
+    /// split alone worth 56x on the score domain while leaving the query GEMM's `M` untouched, and it
+    /// reconstructs the unbounded output **exactly** — measured at both ends of the frame lattice on
+    /// the real DiT (`tests/bounded_attention_real.rs`) and on the committed fixture
+    /// (`tests/bounded_attention.rs`). That holds while the budget admits one whole head; below it the
+    /// kernel falls back to query rows and inherits their weaker contract. See
+    /// [`AttentionChunkAxis`].
+    ///
+    /// The default is [`BoundedAttention::UNBOUNDED`], and rung 3 is declared
+    /// `StructurallyNotApplicable` for this provider on the MLX backend
+    /// (`crate::memory_strategy::RUNG3_MEASURED_PEAK_DELTAS`): the seam exists as the instrument that
+    /// verdict is re-measurable with, not as a lever a request can select.
+    pub fn forward_bounded(
+        &self,
+        x: &Array,
+        rope: Option<(&MmRope, &MmRopeTables)>,
+        bounded: BoundedAttention<'_>,
+    ) -> Result<Array> {
         let s = x.shape();
         if s.len() != 3 {
             return Err(Error::Msg(format!(
@@ -201,7 +325,11 @@ impl DitAttention {
         let kh = k.transpose_axes(&[0, 2, 1, 3])?;
         let vh = v.transpose_axes(&[0, 2, 1, 3])?;
         let scale = 1.0 / (d as f32).sqrt();
-        let out = scaled_dot_product_attention(&qh, &kh, &vh, scale, None, None)?;
+        // Record what this call is about to run BEFORE the kernel, from the shared planner rather
+        // than from local arithmetic — a probe that re-derived the boundaries could agree with itself
+        // while the kernel did something else.
+        record_planned_attention(bounded, b, h, seq);
+        let out = sdpa_bounded_bhsd(&qh, &kh, &vh, scale, None, bounded)?;
 
         let out = out
             .transpose_axes(&[0, 2, 1, 3])?
