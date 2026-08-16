@@ -140,6 +140,12 @@ on:
         required: false
         default: all
         options: [all, chroma1_base, chroma1_hd, chroma1_flash]
+      decode_quality_chroma_runner:
+        description: "SC-19753 diagnostic Chroma host label"
+        type: choice
+        required: false
+        default: real-weights
+        options: [real-weights, rw-chroma]
       # sc-15520 — the memory ladder in dispatchable pieces, for the same reason `krea_s18_rows`
       # exists: `rw-chroma` shares nax-macos-2 with `rw-krea`, `rw-audio` and `rw-llm` one at a
       # time, and the whole 16-test ladder at the 28-step production schedule is multi-hour per
@@ -928,7 +934,7 @@ jobs:
     name: Decode quality admission (${{ matrix.model.id }} ${{ matrix.candidate.geometry }})
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'decode-quality-chroma'
     # SC-19753 diagnostic only; see the Kolors job's runner-selection rationale above.
-    runs-on: [self-hosted, macOS, ARM64, nax, real-weights]
+    runs-on: [self-hosted, macOS, ARM64, "${{ inputs.decode_quality_chroma_runner }}"]
     timeout-minutes: 720
     strategy:
       fail-fast: false
