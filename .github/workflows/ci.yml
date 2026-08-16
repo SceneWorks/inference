@@ -439,6 +439,36 @@ jobs:
       # overlapping CI runs launch roughly 96 compilers and trigger Windows DLL-init failures.
       # Twelve jobs per listener leaves headroom for sccache, linkers, nvcc, and the runner itself.
       CARGO_BUILD_JOBS: "12"
+      # 80 IS CORRECT ON A BLACKWELL BOX, AND RAISING IT TO 120 IS A REGRESSION (sc-19545).
+      #
+      # This pool is `MICHAEL-TRX50`: 2x RTX PRO 6000, 97887 MiB each, driver 596.36. "80 is
+      # Ampere, the box is Blackwell" therefore reads as an obvious bug, and is not one.
+      # `CUDA_COMPUTE_CAP` names the BOTTOM RUNG of an architecture ladder, never the hardware. It
+      # seeds one cudaforge `-gencode`; `vendor/candle-kernels/build.rs` appends sm_90, sm_120 and
+      # `compute_120` PTX on top (sc-7544), so the shipped `libmoe.a` is a fatbin that runs Ampere
+      # -> Ada -> Hopper -> Blackwell from one binary. Set this to 120 and the bottom rung
+      # disappears: quantized models stop working on every pre-Blackwell customer GPU, and the
+      # dense PTX floor rises to `compute_120` so even dense models stop loading there.
+      #
+      # The hazard the number LOOKS like -- quantized matmuls silently returning zeros -- is real,
+      # was sc-7544, and is fixed. What must actually hold is that the runner's arch is served by
+      # SOME rung, which is a different claim from "the cap matches the GPU". Concretely, the
+      # ladder is sm_80 (this value) + sm_90 + sm_120 SASS + `compute_120` PTX, so this pool's
+      # cards are covered natively.
+      #
+      # KNOWN GAP, recorded so it is not rediscovered: **datacenter Blackwell sm_100 (B100/B200) is
+      # NOT covered** on the quant path. Major 10 is served neither by the sm_9x/sm_12x cubins
+      # (SASS is compatible only upward WITHIN one major) nor by the `compute_120` PTX floor (120 >
+      # 100). build.rs states this is deliberate. If such a card ever joins this pool, quantized
+      # matmuls return zeros silently -- add `code=sm_100` to build.rs, do NOT touch this value.
+      #
+      # sm_120 for the current cards is a SPEC fact, not a CI measurement: no lane has ever queried
+      # `compute_cap`, and nothing in this repository does. `nvidia-smi` here reports only the
+      # truncated model name and memory.
+      #
+      # NOTHING ENFORCES ANY OF THIS. sc-19545 verified it by hand and wrote it down; a drift guard
+      # was explicitly scoped out. If someone edits this value, the first symptom is black
+      # renders on customer GPUs, not a red build.
       CUDA_COMPUTE_CAP: "80"
       CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"

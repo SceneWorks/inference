@@ -94,7 +94,13 @@ STUB
 chmod +x "$stub_dir/nvcc"
 
 export PATH="$stub_dir:$PATH"
-export CUDA_COMPUTE_CAP="${CUDA_COMPUTE_CAP:-90}"
+# sc-19545: this was 90, which matched neither the 80 that all 15 CI sites declare nor anything in
+# the build. The value is INERT here -- the stub nvcc below discards its flags, and nothing is linked
+# or run -- so 90 broke nothing. It is aligned to 80 anyway because an unexplained third value is how
+# the next reader concludes the cap is arbitrary, which is the misreading that produced this story.
+# 80 is the packaging baseline: the bottom rung of the arch ladder in
+# `crates/media/candle-gen/vendor/candle-kernels/build.rs`, NOT a description of anyone's GPU.
+export CUDA_COMPUTE_CAP="${CUDA_COMPUTE_CAP:-80}"
 
 # See the cached-build-script-failure gotcha above.
 target_dir="${CARGO_TARGET_DIR:-$repo_root/target}"
