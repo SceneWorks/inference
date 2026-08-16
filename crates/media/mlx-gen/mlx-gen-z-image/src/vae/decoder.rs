@@ -322,9 +322,6 @@ impl Vae {
         if !cfg.needs_tiling(VaeTiling::QWEN_IMAGE, f, h, w) {
             return self.decode(latents);
         }
-        if cancel.is_some_and(CancelFlag::is_cancelled) {
-            return Err(Error::Canceled);
-        }
         // Head runs ONCE on the full latent (denormalize → conv_in → mid-block global attention),
         // identical to single-pass `decode` up to the up-blocks, so parity is exact here.
         let head4 = self.decode_pre_upsample(latents)?; // 4-D NCHW at latent res
