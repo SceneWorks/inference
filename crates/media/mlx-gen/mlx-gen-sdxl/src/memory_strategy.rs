@@ -233,7 +233,7 @@ pub const DECODE_OVERLAPS_SWEPT: &[u32] = &[64, 128, 192, 256];
 /// mid **self-attention**) once on the full latent and tiles only the full-resolution upsample tail,
 /// which is the same head/tail split `mlx_gen_qwen_image` uses. It bounds real memory: at 1024² bf16
 /// the isolated decode peak falls **14.360 → 11.237 GiB (−21.7%)** at edge 896, and the whole request
-/// falls by the margin `the_withheld_decode_geometry_is_priced_at_the_request_level` measures.
+/// falls by the margin `layerwise_decode_is_priced_at_the_request_level` measures.
 ///
 /// Both scopes are quoted because they answer different questions and an earlier revision of this
 /// file quoted a request-level figure no test in this crate produced. The mechanism sweep measures
@@ -292,7 +292,7 @@ pub const DECODE_OVERLAPS_SWEPT: &[u32] = &[64, 128, 192, 256];
 /// The 38/255 above is measured against a latent obtained by **re-encoding a finished image** — its
 /// statistics have already been through the VAE round trip. Decode what the denoiser actually hands
 /// the decode phase and the same geometry drifts **84/255**
-/// (`the_withheld_decode_geometry_is_priced_at_the_request_level`). The production latent is the one
+/// (the pre-SC-19753 form of `layerwise_decode_is_priced_at_the_request_level`). The production latent is the one
 /// a user would get, so the one output size where the candidate looked admissible does not survive
 /// contact with a production request. Nothing about the sweep was wrong — it is the right instrument
 /// for comparing geometries against each other, and the wrong one for deciding an absolute bar.

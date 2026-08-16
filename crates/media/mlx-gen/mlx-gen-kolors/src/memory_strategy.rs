@@ -118,7 +118,7 @@ pub const DECODE_DRIFT_BAR: u32 = 48;
 /// **It is also, by a wide margin, the biggest lever on this family's ladder.** At 1024² q4 it takes
 /// the whole staged request from **16.0412 → 9.9981 GiB (−37.67%)** for **+10% wall clock**
 /// (925 → 1018 ms/step) — against rung 4's −7.21% for +4.2× at the same tier and geometry
-/// (`the_withheld_decode_geometry_is_priced_at_the_request_level`). It is withheld anyway, and the
+/// (`layerwise_decode_is_priced_at_the_request_level`). The route-blind fallback remains withheld, and the
 /// size of the prize is exactly why the withholding argument had to be measured rather than
 /// asserted.
 ///

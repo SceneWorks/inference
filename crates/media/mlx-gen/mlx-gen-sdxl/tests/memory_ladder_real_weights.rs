@@ -682,14 +682,13 @@ fn layerwise_decode_clears_the_bar_across_the_advertised_output_range() {
     }
 }
 
-/// **What rung 2 would have bought at the REQUEST level, and what it costs on the latent a real
-/// render actually produces.** Both are numbers the mechanism sweep cannot supply.
+/// Request-level memory and quality for layer-wise decode on a production latent.
 ///
 /// [`decode_tile_mechanism_sweep`] measures the *isolated* decode — the right scope for a drift
 /// comparison, the wrong scope for the saving, because a selector admits against the whole request.
-/// `generate` cannot supply this row either (`memory_strategy::decode_tiling` refuses every
-/// bounded-decode request), so it is assembled from the same public entry points as the rung-3 row,
-/// under the same staged schedule, with the tiled decode substituted for the single-pass one.
+/// The route-blind harness has no sealed policy and therefore remains refused, so this row is
+/// assembled from the same public entry points under the same staged schedule, with the layer-wise
+/// decode substituted for the single-pass one.
 ///
 /// **The saving is real and it is the one this ladder claims**: 19.0032 → 15.8660 GiB, **−16.51%**,
 /// at 876 → 936 ms/step (tiling costs ~7% wall clock, not a multiple). An earlier revision published
@@ -700,7 +699,7 @@ fn layerwise_decode_clears_the_bar_across_the_advertised_output_range() {
 /// while clearing the 48/255 quality bar on the latent a user actually receives.
 #[test]
 #[ignore = "needs a real SDXL-family snapshot (see the module docs for the env vars)"]
-fn the_withheld_decode_geometry_is_priced_at_the_request_level() {
+fn layerwise_decode_is_priced_at_the_request_level() {
     let Some(dir) = tier_dir(REPRESENTATIVE, "bf16") else {
         panic!("SKIPPED-BY-ABSENCE: set {REPRESENTATIVE} to a snapshot root containing bf16/");
     };
