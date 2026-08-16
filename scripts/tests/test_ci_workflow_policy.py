@@ -934,7 +934,9 @@ class CiWorkflowPolicyTests(unittest.TestCase):
 
         expected_cells = {
             "mlx-decode-quality-kolors": 7,
-            "mlx-decode-quality-sdxl": 50,
+            # SC-19753 diagnostic branch: the first 30 cells are already sealed, so this
+            # branch dispatches only the two remaining Illustrious families.
+            "mlx-decode-quality-sdxl": 20,
             "mlx-decode-quality-chroma": 12,
         }
         for job, cells in expected_cells.items():
