@@ -836,17 +836,13 @@ jobs:
       max-parallel: 1
       matrix:
         model:
-          - id: illustrious_xl_v2
-            repository: SceneWorks/illustrious-xl-v2-mlx
-            source_revision: 7c5c8b2bb75a8f38a7365e70bdf84d38d6204473
+          - id: realvisxl
+            repository: SceneWorks/realvisxl-mlx
+            source_revision: e40202d63baef826c7df95a639a811698c1178d2
             steps: 30
             guidance: 7.0
         candidate:
-          - { geometry: "768x1344", edge: "e704", value: "768x1344:704:128" }
           - { geometry: "832x1216", edge: "e768", value: "832x1216:768:160" }
-          - { geometry: "896x1152", edge: "e832", value: "896x1152:832:160" }
-          - { geometry: "1216x832", edge: "e768", value: "1216x832:768:160" }
-          - { geometry: "2048x2048", edge: "e1856", value: "2048x2048:1856:384" }
     env:
       QUALITY_MODEL: ${{ matrix.model.id }}
       QUALITY_REPOSITORY: ${{ matrix.model.repository }}
