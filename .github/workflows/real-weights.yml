@@ -1216,7 +1216,7 @@ jobs:
             --resident "$MEMORY_EVIDENCE_LOG" \
             --sequential "$MEMORY_EVIDENCE_LOG" \
             --min-reduction-mib 512 \
-            --expected-fingerprint z-image-mlx-independent-materialization-v3 \
+            --expected-fingerprint z-image-mlx-independent-materialization-v4 \
             --expected-abi 3 \
             --expected-model-revision "$MEMORY_MODEL_REVISION" \
             --expected-model-inventory-sha256 "$MEMORY_MODEL_INVENTORY_SHA256" \

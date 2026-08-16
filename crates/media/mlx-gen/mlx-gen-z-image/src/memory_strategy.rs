@@ -169,56 +169,40 @@ pub const DECODE_OVERLAP: u32 = 64;
 /// Before this the contract advertised the single hardcoded 512, which is accurate but collides with
 /// SC-15508's *"a single-point pass cannot mark untested production parameters Verified"*.
 ///
-/// **The candidate set was measured, not inherited.** SC-15510's own note proposed adopting the
-/// current-pin-verified `768/640/512/448/384/320/256` ladder on the grounds that both families drive
-/// the same `mlx_gen::vae_tiling` machinery. That ladder is SceneWorks'
-/// `memory-mlx-adapter` probe sweep, and it was measured on the **Qwen** VAE — a different
-/// decoder. Sharing the tiling machinery does not transfer a candidate set any more than sharing a
-/// rung's name transfers its magnitude between backends; what transfers is the mechanism, and the
-/// numbers have to be re-measured on the decoder that will run them. Swept against the **exact
-/// untiled decode** on real q4 weights at 1024² (`tests/block_residency_real_weights.rs`):
+/// **The candidate set was measured, not inherited.** SC-19753 changed tiled decode so GroupNorm
+/// statistics are computed from the full activation and reused by each spatial tile. The complete
+/// native ladder was then re-swept against the **exact untiled decode** on the provisioned q4
+/// Z-Image snapshot at 1024² (`tests/block_residency_real_weights.rs`, Actions run 31918926833):
 ///
 /// | tile | decode peak | max Δ vs exact | mean Δ |
 /// |---:|---:|---:|---:|
-/// | untiled | 19.422 GiB | — | — |
-/// | 768 | 8.089 | 48 | 2.82 |
-/// | 640 | 5.795 | 41 | 2.42 |
-/// | **512** (default) | **4.363** | **46** | **2.09** |
-/// | 448 | 4.645 | 64 | 2.90 |
-/// | 384 | 3.896 | 72 | 3.01 |
-/// | 320 | 4.051 | 74 | 3.05 |
-/// | 256 | 3.157 | 83 | 3.34 |
+/// | untiled | 19.474 GiB | — | — |
+/// | 768 | 8.595 | 5 | 0.0242 |
+/// | 640 | 6.840 | 9 | 0.0265 |
+/// | **512** (default) | **6.129** | **15** | **0.0306** |
+/// | 448 | 5.376 | 10 | 0.0293 |
+/// | 384 | 4.708 | 13 | 0.0292 |
+/// | 320 | 4.548 | 12 | 0.0328 |
+/// | 256 | 4.457 | 13 | 0.0352 |
 ///
-/// Two things fall out, and both are why the ladder stops at 512:
-///
-/// 1. **Below 512 the image measurably degrades** — max Δ jumps 46 → 64 → 83 and mean Δ rises
-///    monotonically. That is the sc-13571 comment ("smaller tiles would drift the per-tile norm
-///    statistics") confirmed by measurement on this GroupNorm VAE. `GenerationMemory`'s levers are
-///    documented as *quality-preserving*; a tile that visibly seams is a quality trade, not a rung.
-/// 2. **And it buys nothing at the request level.** Every sub-512 tile leaves the request peak at
-///    4.898 GiB, because the denoise phase binds there — and the decode peak is not even monotone
-///    (4.645 at 448 is *worse* than 4.363 at 512). Paying image quality for no admission win is a
-///    strictly bad trade.
-///
-/// The separation is clean rather than marginal: the admitted set tops out at 48/255 and the rejected
-/// set starts at 64/255, a 33% gap, which is what the sweep's bound is set from.
+/// Every candidate is now well inside the product's 48/255 max-channel quality bar, and peak decode
+/// memory decreases monotonically as the tile narrows. The former sub-512 rejection was evidence of
+/// per-tile GroupNorm drift, not an inherent quality limit of those tile sizes; retaining it after the
+/// normalization fix would make the selector refuse measured, quality-preserving memory savings.
 ///
 /// 640 and 768 cost *more* decode memory than the default and are published anyway, because the
 /// ladder is a **domain**, not a recommendation: at a larger output a 512 px tile is many more
 /// forwards, and the selector — not this file — owns the peak-vs-latency choice. Selection is the
 /// worker's; this is the set it may choose from.
 ///
-/// Why widening mattered at all: decode is **tier-independent** — measured 4.363 GiB (q4) and
-/// 4.364 GiB (q8) at 1024², because after `shed_dit` only the ~150 MB VAE remains and the rest is the
-/// tiled-decode transient — and after rung 4 lands it becomes the *binding* phase on q4.
-pub const DECODE_TILE_EDGES: &[u32] = &[768, 640, 512];
+/// Decode remains tier-independent after `shed_dit`: only the VAE and tiled-decode transient remain.
+/// The historical default stays 512, so an unparameterized request does not change; the worker may
+/// select the newly verified narrower points when a tighter memory budget requires them.
+pub const DECODE_TILE_EDGES: &[u32] = &[768, 640, 512, 448, 384, 320, 256];
 
-/// Tile edges swept and **rejected** by measurement (see [`DECODE_TILE_EDGES`]), kept so the sweep can
-/// re-assert the exclusion rather than leaving it as a comment that drifts.
-///
-/// A future VAE change that made these seam-free would show up as this list failing its rejection
-/// check — which is the point. Silently dropping them would leave nothing to notice that with.
-pub const DECODE_TILE_EDGES_REJECTED: &[u32] = &[448, 384, 320, 256];
+/// Native tile edges currently rejected by measurement. SC-19753's full ladder re-sweep admitted all
+/// seven candidates; the named empty set keeps the domain split explicit for future calibration work.
+pub const DECODE_TILE_EDGES_REJECTED: &[u32] = &[];
 
 /// The **PiD overlay route's** decode tile-edge ladder (SC-15510), output pixels.
 ///
@@ -392,7 +376,7 @@ pub const ATTENTION_CHUNK_SIZE: u32 = mlx_gen::attention::CONSTRAINED_ATTN_SCORE
 /// execution structure change in a way that invalidates measurements taken against this provider.
 ///
 /// Load shape is a typed evidence-key axis; this content fingerprint remains shape-independent.
-pub const MEMORY_CALIBRATION_FINGERPRINT: &str = "z-image-mlx-independent-materialization-v3";
+pub const MEMORY_CALIBRATION_FINGERPRINT: &str = "z-image-mlx-independent-materialization-v4";
 
 /// This provider's two bounded-decode routes, reconciled by the shared
 /// [`DecodeRoutes`](mlx_gen_pid::DecodeRoutes) (SC-15775).
@@ -1483,10 +1467,10 @@ mod tests {
             .parameters
             .decode_tile_edges
             .contains(&DECODE_TILE_EDGE));
-        // The set is measured, not inherited (see `DECODE_TILE_EDGES`): the sub-512 edges Qwen ships
-        // were swept on real weights and rejected for seaming without buying a request-level saving.
-        assert_eq!(DECODE_TILE_EDGES, &[768, 640, 512]);
-        assert_eq!(DECODE_TILE_EDGES_REJECTED, &[448, 384, 320, 256]);
+        // The set is measured, not inherited (see `DECODE_TILE_EDGES`): SC-19753 re-swept the full
+        // ladder after tiled decode began preserving full-activation GroupNorm statistics.
+        assert_eq!(DECODE_TILE_EDGES, &[768, 640, 512, 448, 384, 320, 256]);
+        assert!(DECODE_TILE_EDGES_REJECTED.is_empty());
         // The two sets are disjoint, and a rejected edge is refused end to end — not merely absent
         // from a doc comment.
         for &rejected in DECODE_TILE_EDGES_REJECTED {
