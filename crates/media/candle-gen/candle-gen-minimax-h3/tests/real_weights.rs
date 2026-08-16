@@ -49,32 +49,51 @@ const VAE_ENCODE_TENSORS: usize = 118;
 /// **Derived from this arm's own measured floor, not inherited.** Both sides run f32 over the same
 /// published bytes, so this is a round-off comparison over a 12-resnet conv stack — but the
 /// reference is torch and this is candle, with different reduction orders in every convolution, so
-/// it cannot be held to the committed fixture suite's 1e-5 either. Measured worst across the three
-/// probes on the CPU lane:
+/// it cannot be held to the committed fixture suite's 1e-5 either.
 ///
-/// | probe | mean | std |
+/// **Measured on TWO devices** (sc-19455), three runs each, `--release`, f32 on both sides:
+///
+/// | probe | mean (CPU / Metal) | std (CPU / Metal) |
 /// |---|---|---|
-/// | `keyframe` (1 frame, tiled at 320 px) | 1.355e-5 | 5.690e-6 |
-/// | `clip` (17 frames, untiled) | 6.949e-6 | 1.137e-5 |
-/// | `multiclip` (20 frames, padded to 2 clips) | 4.899e-6 | **1.730e-5** |
+/// | `keyframe` (1 frame, tiled at 320 px) | 1.355e-5 / 1.787e-5 | 5.690e-6 / 4.243e-6 |
+/// | `clip` (17 frames, untiled) | 6.949e-6 / 6.412e-6 | 1.137e-5 / 1.309e-5 |
+/// | `multiclip` (20 frames, padded to 2 clips) | 4.899e-6 / 6.446e-6 | 1.730e-5 / **1.848e-5** |
 ///
-/// so the floor is **1.730e-5**, and this bound is ~11.6x it. That is deliberately looser than the
-/// ~7x [`TOL`] takes over the fixture lane's floor, for one stated reason: those numbers were
-/// measured **here, on the CPU lane**, and this arm also runs on the `--features cuda` Windows
-/// runner (sc-18677), whose reduction orders differ again and whose own floor has not been
-/// measured. The headroom covers a device change; it is not a claim about one.
+/// Each device is **bit-deterministic**: three runs apiece reproduced every figure to all four
+/// printed digits, so the within-device spread is zero and the only spread that exists is the
+/// between-device one. The floor over both is **1.848e-5**, and this bound is **10.8x** it.
 ///
-/// **The exposure sits on exactly the quantity that already sets the floor**: the worst entry in
-/// the table is a `std`, and `std` is `exp(0.5 * logvar)` (`vae_encoder.rs`), so an absolute wobble
-/// in `logvar` comes back as a *relative* one in `std`, magnified by the exponential — and a device
-/// change is what reorders the reductions in the conv stack feeding it. That is a reason to expect
-/// movement there first, not a measurement of it.
+/// **What a device change actually costs — measured, not hedged.** An earlier revision of this note
+/// justified the headroom by saying the figures were CPU-only while "this arm also runs on the
+/// `--features cuda` Windows runner (sc-18677)". Both halves needed correcting. The reach claim is
+/// **false**: no lane selects this test. The Windows CUDA job in `real-weights.yml` runs seven
+/// header gates, three decode smokes and the vram probe, and its own header lists this test as not
+/// covered, blocked on the `MINIMAX_H3_VIDEO_VAE_ENCODE_REFERENCE` operator artifact that has only
+/// ever been produced on `nax-macos`. The cost itself is now observed rather than reserved against:
+/// swapping CPU → Metal — a real backend change, different reduction orders in every convolution —
+/// moved the binding quantity by only **1.07x**, and no single probe by more than **1.32x**. So the
+/// bound clears the measured envelope of a device swap by ~8x, which is why it is left where
+/// sc-19008 put it rather than tightened. A per-device bound would be false precision at a 1.07x
+/// separation: one bound weakens neither device.
 ///
-/// What it is *not* is the 2e-2 house value it replaced (sc-19008 review): that sat 1155x above the
-/// measurement and so stated a convention in the voice of a derivation. The band between the two is
-/// not hypothetical — a 1e-3 relative drift injected into the encoder output measures 1.862e-3,
-/// which **passes** at 2e-2 and fails here. If the CUDA lane ever lands above this, the fix is to
-/// re-derive from a measurement taken there, not to restore a convention.
+/// **The `std`-amplification story is half right, and the wrong half was load-bearing.** `std` is
+/// `exp(0.5 * logvar)` (`vae_encoder.rs`), and against a *systematic* drift it really does amplify:
+/// a 1e-3 relative drift injected at `DiagonalGaussian::from_parameters` comes back as 1.000e-3 on
+/// every `mean` probe but **1.42e-3 … 1.87e-3** on the `std` probes, on both devices. The `std`
+/// probes do also set the floor — `multiclip.std` is the largest residual on CPU and on Metal
+/// alike. What does **not** hold is the inference drawn from those two facts, that `std` is
+/// therefore the quantity most likely to move under a device change. Measured, it is not: the two
+/// largest movers CPU → Metal are `keyframe.mean` and `multiclip.mean` (1.32x each), while
+/// `keyframe.std` *fell*, to 0.75x. A reduction-order change is incoherent round-off, not a
+/// coherent multiplicative drift in `logvar`, so it does not propagate through the exponential the
+/// way an injected drift does. Expect a device change to move the `mean` probes at least as much.
+///
+/// What this bound is *not* is the 2e-2 house value it replaced (sc-19008 review): that sat 1155x
+/// above the measurement and so stated a convention in the voice of a derivation. The band between
+/// the two is not hypothetical — the 1e-3 drift above measures 1.862e-3 (CPU) / 1.866e-3 (Metal) at
+/// its worst, trips this bound on **both** devices at the first probe it reaches, and **passes** at
+/// 2e-2. If a third device ever lands above this, the fix is to re-derive from a measurement taken
+/// there, not to restore a convention.
 ///
 /// Every defect class this epic has actually shipped is still orders clear either way: the sc-18740
 /// half-swap at 0.86-0.99, a symmetric downsampler pad at 1.8, a global GroupNorm at 1.6, an
