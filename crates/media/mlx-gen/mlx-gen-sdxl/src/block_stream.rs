@@ -204,11 +204,18 @@ impl SdxlBlockStream {
                 let mut per_path = Vec::new();
                 for path in paths {
                     let segs: Vec<&str> = path.split('.').collect();
-                    if let Some(target) = block.adaptable_mut(&segs) {
-                        let adapters = target.adapters();
-                        if !adapters.is_empty() {
-                            per_path.push((path.clone(), adapters.to_vec()));
-                        }
+                    // SC-18319 — a capture walks EVERY projection, so it resolves through the PROBE
+                    // half and takes the `&mut` only where something is actually installed.
+                    if block
+                        .adaptable_facts(&segs)
+                        .is_some_and(|f| f.adapter_count > 0)
+                    {
+                        let adapters = block
+                            .adaptable_mut(&segs)
+                            .expect("resolved through the probe above")
+                            .adapters()
+                            .to_vec();
+                        per_path.push((path.clone(), adapters));
                     }
                 }
                 BlockAdapters { per_path }

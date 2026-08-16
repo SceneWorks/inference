@@ -1050,11 +1050,92 @@ impl AdaptableConv2d {
     }
 }
 
+/// A read-only snapshot of one adaptable projection — **everything the probe half of the
+/// adapter-resolution surface can answer**, carried by value.
+///
+/// This type is the whole point of [`AdaptableHost::adaptable_facts`] (SC-18319). Before it existed,
+/// the only way to ask "is there a projection here, how big is it, is it packed, does it already
+/// carry an adapter?" was to take a `&mut AdaptableLinear` through
+/// [`adaptable_mut`](AdaptableHost::adaptable_mut) — and once a family's `to_q`/`to_k`/`to_v` live
+/// behind a [`FusedQkvProjection`](crate::qkv::FusedQkvProjection), *handing out that `&mut` is
+/// exactly what unfuses the block*. A mere scan (the LoRA/LyCORIS/BFL installers' pass 1, a
+/// `.diff`-patch existence check, a trainer's target-shape read) would then dismantle the fusion it
+/// just built, over every block, for nothing.
+///
+/// A probe therefore gets facts, never a handle: **mutation is not expressible through this type**,
+/// so a probe cannot install, clear, merge, quantize or unfuse anything, and a fused host is free to
+/// answer from its packed representation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinearFacts {
+    /// The logical `[out, in]` base shape — [`AdaptableLinear::base_shape`].
+    pub base_shape: Vec<i32>,
+    /// Whether the base is group-quantized (packed) rather than dense.
+    pub is_quantized: bool,
+    /// Whether **any** installed adapter is live (`scale != 0`). A disabled adapter reads `false`,
+    /// matching `apply_adapters` rule 1 and [`FusedQkvProjection`](crate::qkv::FusedQkvProjection)'s
+    /// pack predicate, which both treat "installed at scale 0" as "never installed".
+    pub has_live_adapters: bool,
+    /// How many adapters are on the stack **including disabled ones** — the "is there anything here
+    /// at all to read" question, which is what a capture/replay walk needs (anima's block stream) and
+    /// which [`has_live_adapters`](Self::has_live_adapters) deliberately does not answer.
+    pub adapter_count: usize,
+    /// The dense bias's shape, when the projection carries one.
+    pub bias_shape: Option<Vec<i32>>,
+}
+
+impl LinearFacts {
+    /// Snapshot a projection. The `&` receiver is the point: facts are readable without the `&mut`
+    /// that would unfuse a packed QKV triple.
+    pub fn of(lin: &AdaptableLinear) -> Self {
+        Self {
+            base_shape: lin.base_shape(),
+            is_quantized: lin.is_quantized(),
+            has_live_adapters: lin.adapters().iter().any(|a| !a.is_disabled()),
+            adapter_count: lin.adapters().len(),
+            bias_shape: lin.bias().map(|b| b.shape().to_vec()),
+        }
+    }
+}
+
 /// A module tree that can resolve a dotted parameter path (split into segments) to the
 /// [`AdaptableLinear`] living there, so an adapter can be installed onto it. This is the
 /// hand-written form of the macro the full adapter framework (sc-2343) will generate.
+///
+/// # Probe vs mutate (SC-18319)
+///
+/// The surface is deliberately split in two, and a caller must pick the half that matches its
+/// intent:
+///
+/// * [`adaptable_facts`](Self::adaptable_facts) — **the probe.** "Is there a projection at this
+///   path, and what is it like?" Returns [`LinearFacts`] by value.
+/// * [`adaptable_mut`](Self::adaptable_mut) — **the mutation.** "Give me the projection so I can
+///   change it." Returns `&mut AdaptableLinear`.
+///
+/// Only the mutation half may unfuse a [`FusedQkvProjection`](crate::qkv::FusedQkvProjection).
+/// **A host holding one MUST override `adaptable_facts`** for the paths that resolve into it, and
+/// answer from the packed representation
+/// ([`FusedQkvProjection::part_facts`](crate::qkv::FusedQkvProjection::part_facts)); the default
+/// below routes through `adaptable_mut`, which unfuses. Because the routing is a hand-written tree,
+/// every intermediate node on the way down to a fused leaf must forward `adaptable_facts` too — the
+/// default's `adaptable_mut` delegation would otherwise take over at the first node that forgot.
+/// Each adopting family pins this with a `probe_does_not_unfuse` test.
 pub trait AdaptableHost {
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear>;
+
+    /// **The probe half** — resolve a dotted path to a read-only [`LinearFacts`] snapshot, without
+    /// taking the `&mut AdaptableLinear` that unfuses a packed QKV triple. See the trait doc.
+    ///
+    /// The receiver is `&mut self` rather than `&self` only because the routing tree is: a host with
+    /// lazily-materialized blocks (anima's block stream) resolves a path by touching that tree. The
+    /// *return type* is what makes this half non-mutating — no handle escapes, so no probe can
+    /// install, merge, clear, quantize or unfuse anything.
+    ///
+    /// The default answers through [`adaptable_mut`](Self::adaptable_mut), which is correct for
+    /// every host whose projections are plain [`AdaptableLinear`]s and wrong for one holding a
+    /// [`FusedQkvProjection`](crate::qkv::FusedQkvProjection) — see the trait doc.
+    fn adaptable_facts(&mut self, path: &[&str]) -> Option<LinearFacts> {
+        self.adaptable_mut(path).map(|lin| LinearFacts::of(lin))
+    }
 
     /// Resolve a dotted path to the [`AdaptableConv2d`] living there, for conv-layer LoRA merging
     /// (sc-2919) — the conv analog of [`adaptable_mut`](Self::adaptable_mut). The default is empty:

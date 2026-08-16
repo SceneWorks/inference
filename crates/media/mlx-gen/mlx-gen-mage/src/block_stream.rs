@@ -59,10 +59,18 @@ impl MageBlockStream {
                 let mut captured = Vec::new();
                 for path in block.adaptable_paths() {
                     let segments = path.split('.').collect::<Vec<_>>();
-                    if let Some(target) = block.adaptable_mut(&segments) {
-                        if !target.adapters().is_empty() {
-                            captured.push((path, target.adapters().to_vec()));
-                        }
+                    // SC-18319 — walk every path through the PROBE half and take the `&mut` only for
+                    // the paths that actually hold something. This walk visits EVERY projection in
+                    // the block, so resolving it `&mut`-first would unfuse every
+                    // `FusedQkvProjection` in the stack during a capture that copies nothing.
+                    if block
+                        .adaptable_facts(&segments)
+                        .is_some_and(|f| f.adapter_count > 0)
+                    {
+                        let target = block
+                            .adaptable_mut(&segments)
+                            .expect("resolved through the probe above");
+                        captured.push((path, target.adapters().to_vec()));
                     }
                 }
                 BlockAdapters(captured)

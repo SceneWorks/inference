@@ -4,11 +4,14 @@
 //! `Ideogram4TransformerBlock`.
 
 use mlx_rs::fast::{rms_norm, scaled_dot_product_attention};
-use mlx_rs::ops::{add, concatenate_axis, multiply, split, tanh};
+use mlx_rs::ops::{add, multiply, split, tanh};
 use mlx_rs::Array;
 
 use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
 use mlx_gen::nn::silu;
+use mlx_gen::qkv::{
+    self, AttnPrepSpec, QkNormSpec, QkvSource, RopeSpec, RopeStyle, RopeTables, RotationAxes,
+};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
@@ -56,40 +59,29 @@ impl Ideogram4Attention {
         sin: &Array,
         mask: Option<&Array>,
     ) -> Result<Array> {
-        let sh = x.shape();
-        let (b, s) = (sh[0], sh[1]);
-
-        // qkv → [B, L, 3, H, hd] → q,k,v [B, L, H, hd]
-        let qkv = self
-            .qkv
-            .forward(x)?
-            .reshape(&[b, s, 3, self.num_heads, self.head_dim])?;
-        let parts = split(&qkv, 3, 2)?;
-        let q = parts[0].reshape(&[b, s, self.num_heads, self.head_dim])?;
-        let k = parts[1].reshape(&[b, s, self.num_heads, self.head_dim])?;
-        let v = parts[2].reshape(&[b, s, self.num_heads, self.head_dim])?;
-
-        // Per-head q/k RMSNorm over the head dim, before transpose + RoPE.
-        let q = rms_norm(&q, &self.norm_q, self.eps)?;
-        let k = rms_norm(&k, &self.norm_k, self.eps)?;
-
-        // [B,L,H,hd] → [B,H,L,hd]
-        let q = q.transpose_axes(&[0, 2, 1, 3])?;
-        let k = k.transpose_axes(&[0, 2, 1, 3])?;
-        let v = v.transpose_axes(&[0, 2, 1, 3])?;
-
-        let q = apply_rope(&q, cos, sin)?;
-        let k = apply_rope(&k, cos, sin)?;
+        // SC-18319 — the shared prologue. Ideogram's knob selection: fused packed QKV (knob 9),
+        // per-head q/k RMSNorm after the head split (knob 1), **half-split** `rotate_half` rotation
+        // over FULL-width `[B, L, head_dim]` tables (knob 2 — deliberately NOT the adjacent-pair
+        // convention Lens/Mage use), applied head-major (after the SDPA transpose), and a single
+        // stream (no join, so knob 11 does not apply).
+        let spec = AttnPrepSpec::new(self.num_heads, self.head_dim)
+            .with_qk_norm(QkNormSpec::per_head(&self.norm_q, &self.norm_k, self.eps))
+            .with_rope(RopeSpec {
+                style: RopeStyle::RotateHalf,
+                q: Some(RopeTables::new(cos, sin)),
+                k: Some(RopeTables::new(cos, sin)),
+                ..RopeSpec::default()
+            })
+            .with_rotation_axes(RotationAxes::HeadMajor);
+        let heads = qkv::prepare(QkvSource::Packed(&self.qkv.forward(x)?), &spec)?;
+        let (q, k, v) = (heads.q, heads.k, heads.v);
 
         let mask = mask.map(|m| m.as_dtype(q.dtype())).transpose()?;
         let sdpa_mask = mask
             .as_ref()
             .map(mlx_rs::fast::ScaledDotProductAttentionMask::from);
         let o = scaled_dot_product_attention(&q, &k, &v, self.scale, sdpa_mask, None)?;
-        let o =
-            o.transpose_axes(&[0, 2, 1, 3])?
-                .reshape(&[b, s, self.num_heads * self.head_dim])?;
-        self.o.forward(&o)
+        self.o.forward(&qkv::merge_heads(&o)?)
     }
 
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
@@ -113,14 +105,9 @@ impl AdaptableHost for Ideogram4Attention {
     }
 }
 
-/// HF half-split RoPE in `[B, H, L, hd]` layout: `cos`/`sin` `[B, L, hd]` → broadcast over heads.
-fn apply_rope(x: &Array, cos: &Array, sin: &Array) -> Result<Array> {
-    let cos = cos.expand_dims(1)?; // [B,1,L,hd]
-    let sin = sin.expand_dims(1)?;
-    let parts = split(x, 2, 3)?;
-    let rot = concatenate_axis(&[&parts[1].negative()?, &parts[0]], 3)?;
-    Ok(add(&multiply(x, &cos)?, &multiply(&rot, &sin)?)?)
-}
+// The HF half-split RoPE that used to live here is now
+// `mlx_gen::qkv::apply_rope(.., RopeStyle::RotateHalf, RotationAxes::HeadMajor, ..)` (SC-18319) —
+// the identical `x·cos + rotate_half(x)·sin` expression over a full-width table.
 
 // ── SwiGLU MLP ───────────────────────────────────────────────────────────────────────────
 pub struct Ideogram4Mlp {

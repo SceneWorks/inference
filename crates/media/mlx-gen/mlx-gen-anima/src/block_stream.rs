@@ -136,11 +136,20 @@ impl AnimaBlockStream {
                 let mut per_path = Vec::new();
                 for path in paths {
                     let segs: Vec<&str> = path.split('.').collect();
-                    if let Some(target) = block.adaptable_mut(&segs) {
-                        let adapters = target.adapters();
-                        if !adapters.is_empty() {
-                            per_path.push((path.clone(), adapters.to_vec()));
-                        }
+                    // SC-18319 — walk every path through the PROBE half and take the `&mut` only for
+                    // the paths that actually hold something. This walk visits EVERY projection in
+                    // the block, so resolving it `&mut`-first would unfuse every
+                    // `FusedQkvProjection` in the stack during a capture that copies nothing.
+                    if block
+                        .adaptable_facts(&segs)
+                        .is_some_and(|f| f.adapter_count > 0)
+                    {
+                        let adapters = block
+                            .adaptable_mut(&segs)
+                            .expect("resolved through the probe above")
+                            .adapters()
+                            .to_vec();
+                        per_path.push((path.clone(), adapters));
                     }
                 }
                 BlockAdapters { per_path }
