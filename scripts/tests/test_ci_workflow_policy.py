@@ -975,14 +975,14 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                 )
                 self.assertIn("--expected-policy-count 1", collector_step)
                 self.assertIn("--expected-fixture-count 5", collector_step)
-        # This diagnostic branch now carries only the three edge probes for the worst
-        # remaining coordinate; the authoritative 69-cell set is already sealed separately.
+        # This diagnostic branch carries a focused aligned-edge probe for one residual coordinate;
+        # the authoritative 69-cell set is assembled and sealed separately.
         self.assertEqual(sum(expected_cells.values()), 20)
 
         mutations = {
             "Kolors landscape geometry": ("1280x768:576:48", "1280x720:576:48"),
             "Kolors portrait geometry": ("768x1280:576:48", "720x1280:576:48"),
-            "SDXL geometry": ("832x1216:768:160", "816x1216:768:160"),
+            "SDXL geometry": ("1344x768:768:160", "1344x752:768:160"),
             "Chroma geometry": ("1280x720:576:192", "1280x722:576:192"),
             "zero geometry": ("768x768:576:48", "0x768:576:48"),
             "zero overlap": ("768x768:576:48", "768x768:576:0"),
