@@ -288,6 +288,9 @@ impl Decoder {
                 "SDXL tiled VAE tail ended at remaining spatial scale {remaining_scale}, expected 1"
             )));
         }
+        if cancel.is_some_and(mlx_gen::CancelFlag::is_cancelled) {
+            return Err(mlx_gen::Error::Canceled);
+        }
         let norm = mlx_gen::vae_tiling::GlobalGroupNorm::new(
             &x,
             &self.norm_out_w,
@@ -424,6 +427,9 @@ impl Autoencoder {
         cfg: &mlx_gen::tiling::TilingConfig,
         cancel: Option<&mlx_gen::CancelFlag>,
     ) -> Result<Array> {
+        if cancel.is_some_and(mlx_gen::CancelFlag::is_cancelled) {
+            return Err(mlx_gen::Error::Canceled);
+        }
         let sh = latents.shape();
         if sh.len() != 4 {
             return Err(mlx_gen::Error::Msg(format!(
@@ -433,9 +439,6 @@ impl Autoencoder {
         let (hl, wl) = (sh[1], sh[2]);
         if !cfg.needs_tiling(VAE_TILING, 1, hl, wl) {
             return self.decode(latents);
-        }
-        if cancel.is_some_and(mlx_gen::CancelFlag::is_cancelled) {
-            return Err(mlx_gen::Error::Canceled);
         }
         let z = multiply(latents, scalar(1.0 / self.scaling_factor))?;
         let z = self.post_quant_proj.forward(&z)?;
@@ -681,7 +684,13 @@ mod tests {
         let vae = Autoencoder::from_weights(&weights, &cfg).unwrap();
         let cancel = CancelFlag::new();
         cancel.cancel();
-        let result = vae.decode_tiled(&latent(), &TilingConfig::spatial_only(8, 0), Some(&cancel));
-        assert!(matches!(result, Err(Error::Canceled)));
+        let malformed = Array::from_slice(&[1.0_f32], &[1]);
+        for tiling in [
+            TilingConfig::spatial_only(8, 0),
+            TilingConfig::spatial_only(4096, 64),
+        ] {
+            let result = vae.decode_tiled(&malformed, &tiling, Some(&cancel));
+            assert!(matches!(result, Err(Error::Canceled)));
+        }
     }
 }

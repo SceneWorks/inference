@@ -309,6 +309,9 @@ impl Vae {
         cfg: &TilingConfig,
         cancel: Option<&CancelFlag>,
     ) -> Result<Array> {
+        if cancel.is_some_and(CancelFlag::is_cancelled) {
+            return Err(Error::Canceled);
+        }
         let sh = latents.shape();
         let (h, w) = if sh.len() == 5 {
             (sh[3], sh[4])
@@ -318,9 +321,6 @@ impl Vae {
         let f = 1; // still-image VAE: singleton temporal axis
         if !cfg.needs_tiling(VaeTiling::QWEN_IMAGE, f, h, w) {
             return self.decode(latents);
-        }
-        if cancel.is_some_and(CancelFlag::is_cancelled) {
-            return Err(Error::Canceled);
         }
         // Head runs ONCE on the full latent (denormalize → conv_in → mid-block global attention),
         // identical to single-pass `decode` up to the up-blocks, so parity is exact here.
