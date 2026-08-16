@@ -975,7 +975,9 @@ jobs:
         if: inputs.chroma_model == 'all' || inputs.chroma_model == matrix.model.id
         run: |
           available_kib="$(df -Pk "$RUNNER_TEMP" | awk 'NR == 2 { print $4 }')"
-          test "$available_kib" -ge 104857600
+          # Match the other SC-19753 quality lanes: the selected q4 snapshot and one
+          # production-latent comparison fit within this measured diagnostic floor.
+          test "$available_kib" -ge 41943040
       - name: Toolchain versions
         if: inputs.chroma_model == 'all' || inputs.chroma_model == matrix.model.id
         run: rustc --version && cargo --version && python3.12 --version
