@@ -133,7 +133,8 @@ impl LinearBias {
     /// Exposed for `tests/ref2va_checkpoint.rs` (sc-17157): `transformer/` and `transformer_ref/`
     /// are structurally identical and differ only in their **values**, so the only thing that can
     /// tell a `ref2va` load from a base one is a tensor read back off the loaded model.
-    /// `proj_in.bias` is the probe — float32, `[inner_dim]`, and different between the two.
+    /// `proj_in.bias` is the probe — float32, `[out_features]` (`hidden_size` = 5376 for
+    /// `proj_in`), and different between the two.
     pub fn bias(&self) -> &Tensor {
         &self.bias
     }

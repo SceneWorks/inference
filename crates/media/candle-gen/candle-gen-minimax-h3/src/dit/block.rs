@@ -241,7 +241,14 @@ fn gate_rows(gate: &Tensor, indices: &Tensor, rows: usize, dtype: DType) -> Resu
 /// The failure is reachable from ordinary caller arithmetic: `adaln_indices` is
 /// `timestep_indices · MODALITY_NUM + token_tags`, so a single stale timestep index or an
 /// out-of-range modality tag produces it.
-fn check_adaln_indices(indices: &Tensor, rows: usize) -> Result<()> {
+///
+/// **Called once per step by [`crate::dit::MiniMaxH3Dit::forward_packed`], not per block.** The
+/// check reads the indices back to the host — a blocking D2H transfer — and the same index tensor
+/// is gathered against the same-shaped table by all 50 blocks, so running it inside
+/// [`DitBlock::forward`] repeated that stall 50× per step for one answer. A direct
+/// [`DitBlock::forward`] caller (the parity tests) therefore does not get this typed error; on the
+/// CPU backend candle's own `index_select` bounds-check still fails, just opaquely.
+pub(crate) fn check_adaln_indices(indices: &Tensor, rows: usize) -> Result<()> {
     let idx = indices
         .to_dtype(DType::U32)?
         .flatten_all()?
@@ -401,7 +408,9 @@ impl DitBlock {
                 adaln_indices.dims()
             )));
         }
-        check_adaln_indices(adaln_indices, modulation.scale_msa.dims()[0])?;
+        // NOTE: no `check_adaln_indices` here — `forward_packed` runs it once per step, because
+        // the check is a blocking D2H readback and every block gathers with the same tensor
+        // against a same-shaped table. See its doc comment.
         let idx = adaln_indices.to_dtype(DType::U32)?;
         let rows = s[1];
 

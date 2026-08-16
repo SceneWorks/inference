@@ -1,0 +1,41 @@
+#!/bin/sh
+# Local pre-flight for pushes (sc-17137 review hygiene) — the two seconds-fast repository gates
+# that otherwise first fail ~15 minutes later in the PR's `workspace` CI job:
+#
+#   * `check_clock_assertions.py --check-baseline .` — the ratchet on wall-clock-dependent test
+#     assertions (`scripts/clock_assertions_baseline.txt`), matching ci.yml's "Ratchet
+#     wall-clock-dependent assertions" step exactly.
+#   * `check-workspace.py` — workspace membership, dependency-boundary and self-fetch invariants.
+#
+# Both are stdlib-only Python and finish in seconds; the hook deliberately runs NO builds and NO
+# tests. This is developer pre-flight tooling, not a CI gate — CI runs the same checks regardless.
+#
+# Install (once per clone):   git config core.hooksPath scripts/git-hooks
+# Skip (one push):            git push --no-verify
+set -eu
+
+repo="$(git rev-parse --show-toplevel)"
+cd "$repo"
+
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "pre-push: python3 is required for the repository pre-flight checks. Install it or push"
+  echo "with 'git push --no-verify'."
+  exit 1
+fi
+
+if ! python3 scripts/check_clock_assertions.py --check-baseline .; then
+  echo
+  echo "pre-push: the wall-clock-assertion ratchet failed (this is the ci.yml 'Ratchet"
+  echo "wall-clock-dependent assertions' step, arriving early). Fix the assertion, or — only with"
+  echo "a recorded justification — re-record the baseline:"
+  echo "  python3 scripts/check_clock_assertions.py --write-baseline"
+  exit 1
+fi
+
+if ! ./scripts/check-workspace.py; then
+  echo
+  echo "pre-push: scripts/check-workspace.py failed — a workspace membership or dependency"
+  echo "boundary invariant is broken. See the output above; this is the same check CI's"
+  echo "'workspace' job runs."
+  exit 1
+fi

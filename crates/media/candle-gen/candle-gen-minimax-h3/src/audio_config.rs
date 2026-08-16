@@ -182,7 +182,13 @@ impl BigVganConfig {
         self.upsample_rates.iter().product()
     }
 
-    fn validate(&self) -> Result<()> {
+    /// Reject a BigVGAN block the decoder cannot express — mismatched per-stage lists, an
+    /// un-halvable channel width, or a fractional transposed-conv padding.
+    ///
+    /// `pub(crate)` so the `from_weights` constructors can run it too: a config built by hand (or
+    /// mutated after parse) would otherwise reach the loaders unvalidated, where a
+    /// kernel/dilation length mismatch silently `zip`-truncates the resblock grid.
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.upsample_rates.len() != self.upsample_kernel_sizes.len() {
             return Err(CandleError::Msg(
                 "minimax-h3 audio vae: upsample_rates and upsample_kernel_sizes differ in length"
@@ -600,8 +606,21 @@ impl MiniMaxH3AudioVaeConfig {
         self.sample_rate as f32 / self.hop_length() as f32
     }
 
-    fn validate(&self) -> Result<()> {
+    /// Reject configs the decoder cannot express.
+    ///
+    /// `pub(crate)` so the `from_weights` constructors run it too — previously only
+    /// [`Self::from_source_files`] did, so a hand-built or post-parse-mutated config reached the
+    /// loaders unvalidated.
+    pub(crate) fn validate(&self) -> Result<()> {
         self.bigvgan.validate()?;
+        self.validate_shared()
+    }
+
+    /// The checks both halves depend on — everything in [`Self::validate`] except the BigVGAN
+    /// decoder block. The encode half runs this one: it never reads the decoder, and the committed
+    /// encode parity fixture deliberately carries a nonsense decoder block precisely because
+    /// nothing on that path consumes it.
+    pub(crate) fn validate_shared(&self) -> Result<()> {
         if self.latents_mean.len() != self.latent_channels
             || self.latents_std.len() != self.latent_channels
         {
@@ -612,9 +631,9 @@ impl MiniMaxH3AudioVaeConfig {
                 self.latent_channels
             )));
         }
-        if self.latents_std.iter().any(|s| *s <= 0.0) {
+        if self.latents_std.iter().any(|s| !s.is_finite() || *s <= 0.0) {
             return Err(CandleError::Msg(
-                "minimax-h3 audio vae: latents_std has a non-positive entry".into(),
+                "minimax-h3 audio vae: latents_std has a non-positive or non-finite entry".into(),
             ));
         }
         if self.output_channels == 0 {

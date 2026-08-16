@@ -336,6 +336,19 @@ impl MiniMaxH3VaeConfig {
                 self.latents_std.len()
             )));
         }
+        // Mirrors the audio config's guard: decode multiplies by `latents_std` and encode divides
+        // by it, so a zero produces a dead channel on one path and an inf/NaN on the other, and a
+        // non-finite entry poisons every frame with no shape symptom anywhere.
+        if let Some((i, &s)) = self
+            .latents_std
+            .iter()
+            .enumerate()
+            .find(|(_, s)| !s.is_finite() || **s <= 0.0)
+        {
+            return Err(CandleError::Msg(format!(
+                "minimax-h3 vae: latents_std[{i}] = {s} must be a positive finite number"
+            )));
+        }
         let rope = self.rope_apply_dim();
         if rope == 0 || !rope.is_multiple_of(6) {
             return Err(CandleError::Msg(format!(
@@ -580,6 +593,22 @@ mod tests {
         let mut cfg = MiniMaxH3VaeConfig::default();
         cfg.latents_mean.pop();
         assert!(cfg.validate().is_err());
+    }
+
+    /// A zero or non-finite `latents_std` entry is refused with a diagnostic naming the channel —
+    /// decode multiplies by it and encode divides by it, so the failure would otherwise be a dead
+    /// channel or a NaN-poisoned latent with no shape symptom.
+    #[test]
+    fn validate_rejects_degenerate_latent_std_entries() {
+        for bad in [0.0f32, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut cfg = MiniMaxH3VaeConfig::default();
+            cfg.latents_std[7] = bad;
+            let e = cfg
+                .validate()
+                .expect_err(&format!("latents_std entry {bad} must be rejected"))
+                .to_string();
+            assert!(e.contains("latents_std[7]"), "{e}");
+        }
     }
 
     #[test]

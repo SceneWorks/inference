@@ -299,7 +299,17 @@ impl MiniMaxH3Dit {
             packed.audio_indices,
         )?;
 
-        // 2. The stack.
+        // 2. The stack. The AdaLN index bounds-check runs ONCE here rather than per block: it is a
+        //    blocking D2H readback, and all 50 blocks gather with the same index tensor against
+        //    same-shaped tables, so the per-block placement repeated the stall 50× per step for
+        //    one answer.
+        let modulation_rows = match blocks {
+            BlockModulation::Cached(cache) => cache.modulation(0)?.scale_msa.dims()[0],
+            // One table row block per timestep row of `temb` — `AdaLnProjection::forward` rejects
+            // a non-rank-2 `temb` later, so a missing first dim here just defers to that error.
+            BlockModulation::Temb(temb) => temb.dims().first().copied().unwrap_or(0) * MODALITY_NUM,
+        };
+        crate::dit::block::check_adaln_indices(packed.adaln_indices, modulation_rows)?;
         for (layer, block) in self.blocks.iter().enumerate() {
             x = match blocks {
                 BlockModulation::Cached(cache) => block.forward(

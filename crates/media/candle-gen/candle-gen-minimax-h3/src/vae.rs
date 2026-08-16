@@ -661,13 +661,12 @@ impl MiniMaxH3VideoVae {
 
             for j in 0..split_count {
                 let (start, end) = plan.split_span(clip_frames, j);
-                // A split can legitimately be empty when `token_overlap` is 0 but `token_drop` is
-                // not (i.e. `token_drop` is a multiple of `tokens_chunk_size`): the chunk decodes
-                // to exactly `chunk_dec` frames, so split 1 has nothing left. The reference
-                // produces an empty tensor there and its blend degenerates to the next chunk; the
-                // plan already counts such a split as 0 frames via its `max(0, ..)`, so skipping
-                // keeps the tensor path and the plan in agreement. The shipped config never hits
-                // this (overlap 2), but a caller-supplied `token_drop` can.
+                // Defensive: an empty split cannot arise from a `TemporalGeometry::from_parts`
+                // geometry any more — a `token_drop` of a whole chunk (the one case that zeroed
+                // `token_overlap` with two splits) is now refused there — but `TemporalGeometry`'s
+                // fields are public, so a literal-built geometry could still produce one. The plan
+                // counts such a split as 0 frames via its `max(0, ..)`; skipping keeps the tensor
+                // path and the plan in agreement rather than narrowing to a negative length.
                 if start >= end {
                     continue;
                 }
