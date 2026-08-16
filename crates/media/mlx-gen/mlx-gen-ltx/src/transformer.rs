@@ -39,11 +39,15 @@ use mlx_rs::{Array, Dtype};
 use mlx_gen::train::lora::LoraParams;
 
 use mlx_gen::nn::{gelu_tanh, linear, quantized_matmul_with_bias};
+use mlx_gen::qkv::{
+    self, AttnPrepSpec, QkNormSpec, QkvSource, RopeDtype, RopeSpec, RopeStyle, RopeTables,
+    RotationAxes,
+};
 use mlx_gen::weights::{to_dtype, Weights};
 use mlx_gen::{Error, Result};
 
 use crate::config::LtxConfig;
-use crate::rope::{apply_split_rotary_emb, precompute_split_freqs_cis};
+use crate::rope::precompute_split_freqs_cis;
 
 /// adaLN-single sinusoidal timestep projection width (PixArt `Timesteps`).
 const TIME_PROJ_DIM: i32 = 256;
@@ -713,13 +717,9 @@ impl Attention {
         Ok(())
     }
 
-    /// `(B, S, inner)` → `(B, H, S, head_dim)`.
-    fn to_heads(&self, x: &Array) -> Result<Array> {
-        let sh = x.shape();
-        let (b, s) = (sh[0], sh[1]);
-        Ok(x.reshape(&[b, s, self.heads, self.dim_head])?
-            .transpose_axes(&[0, 2, 1, 3])?)
-    }
+    // The `(B, S, inner) → (B, H, S, head_dim)` head split that used to live here is now
+    // `qkv::prepare`'s stages 3 and 5 (SC-18319) — the identical `reshape → transpose_axes`, with
+    // the full-dim QK-norm placed before it and the rotation after it, exactly as below.
 
     /// `pe` rotates the query (and the key if `k_pe` is `None`); `k_pe` rotates the key separately
     /// (cross-modal: video-positioned q, audio-positioned k, or vice-versa). `pe == None` ⇒ no RoPE
@@ -733,18 +733,59 @@ impl Attention {
         k_pe: Option<(&Array, &Array)>,
     ) -> Result<Array> {
         let ctx = context.unwrap_or(x);
-        let q = fast_rms_norm(&self.to_q.forward(x)?, &self.q_norm, self.eps)?;
-        let k = fast_rms_norm(&self.to_k.forward(ctx)?, &self.k_norm, self.eps)?;
-        let v = self.to_v.forward(ctx)?;
 
-        let mut qh = self.to_heads(&q)?;
-        let mut kh = self.to_heads(&k)?;
-        let vh = self.to_heads(&v)?;
-        if let Some((cos, sin)) = pe {
-            qh = apply_split_rotary_emb(&qh, cos, sin)?;
-            let (kc, ks) = k_pe.unwrap_or((cos, sin));
-            kh = apply_split_rotary_emb(&kh, kc, ks)?;
-        }
+        // SC-18319 — the shared prologue. LTX is the family that forced two of the knobs to exist:
+        //
+        // * **knob 1's `FullDimPreSplit` arm** — `q_norm`/`k_norm` are RMSNorms over the whole
+        //   `heads · dim_head` projection, applied BEFORE the head split, not per-head after it.
+        //   Everything else in this tree except Wan normalizes per head, and the two reduce over
+        //   different widths, so this is not a placement detail.
+        // * **knob 6** — `k_pe` is an independent key position table (cross-modal attention
+        //   positions the query on the video stream and the key on the audio stream, or vice
+        //   versa); `k_pe == None` falls back to the query's table, exactly as before.
+        //
+        // Plus **knob 3** (`pe == None` ⇒ no rotation on either stream — text cross-attention) and
+        // **knob 2's `HalvesPaired` arm**, which is `rope::apply_split_rotary_emb` verbatim: the
+        // GPT-NeoX rotate-halves form over a **half**-width `[B, H, T, dim_head/2]` table through
+        // the shared `nn::rope_rotate`, computed in f32 and cast back.
+        //
+        // **Adapters.** LTX carries its LoRA on its OWN stack rather than the shared
+        // `AdaptableLinear` seam, so it is deliberately NOT routed through
+        // `qkv::FusedQkvProjection`: `to_q`/`to_k`/`to_v` stay three separate `forward` calls and
+        // every installed residual is applied exactly where it was before. The prologue below reads
+        // the three projection OUTPUTS, so it cannot observe — let alone drop — an adapter.
+        let spec = AttnPrepSpec::new(self.heads, self.dim_head)
+            .with_qk_norm(QkNormSpec::full_dim_pre_split(
+                &self.q_norm,
+                &self.k_norm,
+                self.eps,
+            ))
+            .with_rope(match pe {
+                Some((cos, sin)) => {
+                    let (kc, ks) = k_pe.unwrap_or((cos, sin));
+                    RopeSpec {
+                        style: RopeStyle::HalvesPaired,
+                        q: Some(RopeTables::new(cos, sin)),
+                        k: Some(RopeTables::new(kc, ks)),
+                        // Knob 12 — `rope::apply_split_rotary_emb` promotes the stream and the
+                        // tables to f32 and casts the RESULT back to the input dtype, so a bf16
+                        // DiT (production) keeps a bf16 SDPA.
+                        dtype: RopeDtype::RestoreInput,
+                        ..RopeSpec::default()
+                    }
+                }
+                None => RopeSpec::default(),
+            })
+            .with_rotation_axes(RotationAxes::HeadMajor);
+        let heads = qkv::prepare(
+            QkvSource::Separate {
+                q: &self.to_q.forward(x)?,
+                k: &self.to_k.forward(ctx)?,
+                v: &self.to_v.forward(ctx)?,
+            },
+            &spec,
+        )?;
+        let (qh, kh, vh) = (heads.q, heads.k, heads.v);
 
         // Match the reference's Python `1.0 / math.sqrt(dim_head)` (f64 → f32), not `d^-0.5` in f32.
         let scale = (1.0f64 / (self.dim_head as f64).sqrt()) as f32;

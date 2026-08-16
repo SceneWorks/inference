@@ -13,8 +13,7 @@
 //! `cos`/`sin` tables on the CPU in f32 (the reference builds the freqs in f32 on MPS) and slice the
 //! joint table into its text-only / image-only sub-ranges.
 
-use mlx_rs::ops::{add, concatenate_axis, multiply, split, subtract};
-use mlx_rs::{Array, Dtype};
+use mlx_rs::Array;
 
 use mlx_gen::Result;
 
@@ -190,30 +189,8 @@ fn axis1(x: &Array, start: i32, end: i32) -> Result<Array> {
     Ok(x.take_axis(Array::from_slice(&idx, &[end - start]), 1)?)
 }
 
-/// Apply the complex-interleaved rotary embedding to `x` in `[b, s, heads, head_dim]` layout.
-///
-/// `cos`/`sin` are `[1, s, head_dim/2]` (broadcast over heads). For each adjacent pair
-/// `(x[2k], x[2k+1])`:
-///   `out[2k]   = x[2k]·cos_k − x[2k+1]·sin_k`
-///   `out[2k+1] = x[2k]·sin_k + x[2k+1]·cos_k`
-/// Computed in f32 (the reference upcasts), then cast back to `x`'s dtype.
-pub fn apply_interleaved_rope(x: &Array, cos: &Array, sin: &Array) -> Result<Array> {
-    let dt = x.dtype();
-    let sh = x.shape();
-    let (b, s, h, hd) = (sh[0], sh[1], sh[2], sh[3]);
-    let half = hd / 2;
-
-    let cos = cos.as_dtype(Dtype::Float32)?.expand_dims(2)?; // [1, s, 1, half]
-    let sin = sin.as_dtype(Dtype::Float32)?.expand_dims(2)?;
-
-    let xr = x.as_dtype(Dtype::Float32)?.reshape(&[b, s, h, half, 2])?;
-    let parts = split(&xr, 2, 4)?; // 2 × [b, s, h, half, 1]
-    let xe = parts[0].reshape(&[b, s, h, half])?;
-    let xo = parts[1].reshape(&[b, s, h, half])?;
-
-    let out_e = subtract(&multiply(&xe, &cos)?, &multiply(&xo, &sin)?)?;
-    let out_o = add(&multiply(&xe, &sin)?, &multiply(&xo, &cos)?)?;
-
-    let out = concatenate_axis(&[&out_e.expand_dims(4)?, &out_o.expand_dims(4)?], 4)?;
-    Ok(out.reshape(&[b, s, h, hd])?.as_dtype(dt)?)
-}
+// The complex-interleaved rotation that used to live here is now
+// `mlx_gen::qkv::apply_rope(.., RopeStyle::AdjacentPair, RotationAxes::TokenMajor, .., compute_f32)`
+// (SC-18319) — the identical per-adjacent-pair `(x[2k]·cos − x[2k+1]·sin, x[2k]·sin + x[2k+1]·cos)`
+// expression, computed in f32 as the reference upcasts and cast back to `x`'s dtype. Only the
+// 3-axis table construction above is genuinely Boogu's.

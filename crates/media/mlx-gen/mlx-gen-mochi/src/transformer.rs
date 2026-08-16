@@ -34,6 +34,10 @@ use mlx_rs::ops::{
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::nn::{conv2d, quantized_matmul_with_bias, silu, timestep_sincos};
+use mlx_gen::qkv::{
+    self, AttnPrepSpec, NormDtype, QkNormSpec, QkvHeads, QkvSource, RopeDtype, RopeSpec, RopeStyle,
+    RopeTables, StreamOrder,
+};
 use mlx_gen::weights::{join, Weights};
 use mlx_gen::{Error, Result};
 
@@ -274,12 +278,10 @@ fn rms_weightless(x: &Array, eps: f32) -> Result<Array> {
     Ok(multiply(&xf, &rsqrt(&add(&ms, Array::from_f32(eps))?)?)?)
 }
 
-/// Weighted RMS norm over the last axis in f32 (`MochiRMSNorm(dim_head, eps, True)` — the per-head
-/// `qk_norm`). `weight` is `[head_dim]`, broadcast over the leading `[B, S, heads]`.
-fn rms_weighted(x: &Array, weight: &Array, eps: f32) -> Result<Array> {
-    let normed = rms_weightless(x, eps)?;
-    Ok(multiply(&normed, &weight.as_dtype(Dtype::Float32)?)?)
-}
+// The weighted RMS norm that used to live here (`MochiRMSNorm(dim_head, eps, True)` — the per-head
+// `qk_norm`) is now `mlx_gen::qkv::NormDtype::EagerF32` (SC-18319): the identical
+// `rms_weightless(x, eps) · weight.astype(f32)`, i.e. the EAGER f32 formulation rather than MLX's
+// fused `fast::rms_norm`, which is what Mochi's parity goldens were taken against.
 
 /// `emb.chunk(n, dim=1)` — split a `[B, n·d]` modulation vector into `n` `[B, d]` parts (order
 /// preserved). Used for the `(scale_msa, gate_msa, scale_mlp, gate_mlp)` unpacking.
@@ -387,11 +389,8 @@ impl MochiAttention {
         })
     }
 
-    /// Split `[B, S, inner]` → `[B, S, heads, head_dim]`.
-    fn to_heads(&self, x: &Array) -> Result<Array> {
-        let sh = x.shape();
-        Ok(x.reshape(&[sh[0], sh[1], self.num_heads as i32, self.head_dim as i32])?)
-    }
+    // The `[B, S, inner]` → `[B, S, heads, head_dim]` split that used to live here is now
+    // `qkv::prepare`'s stage 3 (SC-18319) — the identical reshape.
 
     /// Joint attention. `visual [B, Sv, inner]`, `text [B, St, pooled]`, and `joint_mask` is the
     /// prebuilt additive mask `[B, 1, 1, Sv+St]` shared by every transformer block.
@@ -407,38 +406,71 @@ impl MochiAttention {
         let sv = visual.shape()[1];
         let st = text.shape()[1];
 
-        // Visual q/k/v (+ per-head qk_norm) with RoPE on q/k.
-        let q = self.to_heads(&self.to_q.forward(visual)?)?;
-        let k = self.to_heads(&self.to_k.forward(visual)?)?;
-        let v = self.to_heads(&self.to_v.forward(visual)?)?;
-        let q = rope.apply(&rms_weighted(&q, &self.norm_q, QK_NORM_EPS)?)?;
-        let k = rope.apply(&rms_weighted(&k, &self.norm_k, QK_NORM_EPS)?)?;
+        // SC-18319 — the shared prologue, once per stream. Mochi's knob selection: separate q/k/v
+        // (knob 9); per-head qk_norm in the **eager** f32 formulation (knob 1 + `NormDtype::EagerF32`
+        // — `MochiRMSNorm(dim_head, eps, True)` is `RMSNorm(0, eps, False)` followed by a weight
+        // multiply, which is what the parity goldens were taken against, not MLX's fused
+        // `fast::rms_norm`); adjacent-pair rotation (knob 2) from **per-head** tables
+        // (`[seq, heads, head_dim/2]` — Mochi's `pos_frequencies` are per attention head) applied to
+        // the **visual stream only** (knob 5: the text stream is deliberately never rotated);
+        // token-major; and a `[visual, text]` join (knob 11).
+        let n_heads = self.num_heads as i32;
+        let head_dim = self.head_dim as i32;
+        let visual_spec = AttnPrepSpec::new(n_heads, head_dim)
+            .with_qk_norm(
+                QkNormSpec::per_head(&self.norm_q, &self.norm_k, QK_NORM_EPS)
+                    .with_dtype(NormDtype::EagerF32),
+            )
+            .with_rope(RopeSpec {
+                style: RopeStyle::AdjacentPair,
+                q: Some(RopeTables::new(&rope.cos, &rope.sin)),
+                k: Some(RopeTables::new(&rope.cos, &rope.sin)),
+                // Knob 12 — `rope::MochiRope::apply` promotes and does NOT cast back. The stream is
+                // already f32 here (the `EagerF32` QK-norm left it so), which makes this a no-op —
+                // but it is stated rather than defaulted.
+                dtype: RopeDtype::Promoted,
+                ..RopeSpec::default()
+            });
+        let vis_heads = qkv::prepare(
+            QkvSource::Separate {
+                q: &self.to_q.forward(visual)?,
+                k: &self.to_k.forward(visual)?,
+                v: &self.to_v.forward(visual)?,
+            },
+            &visual_spec,
+        )?;
+        let text_spec = AttnPrepSpec::new(n_heads, head_dim).with_qk_norm(
+            QkNormSpec::per_head(&self.norm_added_q, &self.norm_added_k, QK_NORM_EPS)
+                .with_dtype(NormDtype::EagerF32),
+        );
+        let txt_heads = qkv::prepare(
+            QkvSource::Separate {
+                q: &self.add_q.forward(text)?,
+                k: &self.add_k.forward(text)?,
+                v: &self.add_v.forward(text)?,
+            },
+            &text_spec,
+        )?;
 
-        // Text q/k/v (+ per-head qk_norm), no RoPE.
-        let eq = self.to_heads(&self.add_q.forward(text)?)?;
-        let ek = self.to_heads(&self.add_k.forward(text)?)?;
-        let ev = self.to_heads(&self.add_v.forward(text)?)?;
-        let eq = rms_weighted(&eq, &self.norm_added_q, QK_NORM_EPS)?;
-        let ek = rms_weighted(&ek, &self.norm_added_k, QK_NORM_EPS)?;
-
-        // → [B, heads, S, head_dim]; concat visual + text along the sequence axis. q/k left the f32
-        // RoPE/norm stream and v is at the compute dtype — cast all three (and the mask) to the compute
-        // dtype so the SDPA runs at bf16 in production (a no-op in the f32 parity path).
+        // q/k left the f32 RoPE/norm stream and v is at the compute dtype — cast all three (and the
+        // mask) to the compute dtype so the SDPA runs at bf16 in production (a no-op in the f32
+        // parity path).
         let cd = self.to_v.compute_dtype();
-        let t = |a: &Array| -> Result<Array> { Ok(a.transpose_axes(&[0, 2, 1, 3])?.as_dtype(cd)?) };
-        let full_q = concatenate_axis(&[&t(&q)?, &t(&eq)?], 2)?;
-        let full_k = concatenate_axis(&[&t(&k)?, &t(&ek)?], 2)?;
-        let full_v = concatenate_axis(&[&t(&v)?, &t(&ev)?], 2)?;
+        let cast = |s: QkvHeads| -> Result<QkvHeads> {
+            Ok(QkvHeads {
+                q: s.q.as_dtype(cd)?,
+                k: s.k.as_dtype(cd)?,
+                v: s.v.as_dtype(cd)?,
+            })
+        };
+        let joint = StreamOrder::ImageFirst.join(&cast(vis_heads)?, &cast(txt_heads)?)?;
 
         let scale = 1.0f32 / (self.head_dim as f32).sqrt();
-        let out = scaled_dot_product_attention(&full_q, &full_k, &full_v, scale, joint_mask, None)?;
+        let out =
+            scaled_dot_product_attention(&joint.q, &joint.k, &joint.v, scale, joint_mask, None)?;
 
         // → [B, Sv+St, inner]; split back to visual / text.
-        let out = out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[
-            out.shape()[0],
-            sv + st,
-            (self.num_heads * self.head_dim) as i32,
-        ])?;
+        let out = qkv::merge_heads(&out)?;
         let vis_idx = Array::from_slice(&(0..sv).collect::<Vec<i32>>(), &[sv]);
         let txt_idx = Array::from_slice(&(sv..sv + st).collect::<Vec<i32>>(), &[st]);
         let vis = out.take_axis(&vis_idx, 1)?;

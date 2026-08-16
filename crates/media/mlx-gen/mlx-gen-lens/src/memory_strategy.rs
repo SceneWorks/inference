@@ -11,7 +11,7 @@
 //! nothing but [`MemoryStrategy::Resident`]. The engine did not agree. `generate_memory_impl` gates
 //! staged residency, tiled decode and chunked attention on nothing at all — they are request levers
 //! available on every load — and gates the rung-4 block window purely on
-//! [`can_stream_text`]/[`can_stream_dit`]. So ten of the twelve `lens` registry surfaces and eleven
+//! `can_stream_text`/`can_stream_dit`. So ten of the twelve `lens` registry surfaces and eleven
 //! of the twelve `lens_turbo` surfaces carried an executable ladder that no consumer could ever
 //! select, because it was undeclared. That is the inverse of the usual defect: the mechanism was
 //! reachable, the declaration was not.

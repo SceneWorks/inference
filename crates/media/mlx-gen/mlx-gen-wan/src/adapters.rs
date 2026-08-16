@@ -1009,7 +1009,9 @@ fn install_thirdparty_delta(
     report: &mut WanLoraReport,
 ) -> Result<()> {
     let parts: Vec<&str> = path.split('.').collect();
-    let base_shape = match host.adaptable_mut(&parts) {
+    // SC-18319 — resolution here is shape/tier interrogation only (the install happens in `push_at`
+    // below), so it goes through the PROBE half of the host surface.
+    let base_shape = match host.adaptable_facts(&parts) {
         // Per-target packed-base guard (F-060, sc-10051). LoHa has no allocation-free deferred form —
         // every install materializes the full `[out,in]` bf16 delta. The LoKr additive installers
         // already refuse a materialization on a packed base per target; the LoHa installer did not, so
@@ -1017,8 +1019,8 @@ fn install_thirdparty_delta(
         // the same per-target refusal so a future direct caller cannot silently materialize the
         // ~28 GB/expert dense delta on a packed base (the OOM sc-10051 exists to prevent). Typed
         // `Error::Unsupported` bridges 1:1 to gen_core so the worker surfaces actionable guidance.
-        Some(lin) if lin.is_quantized() => return Err(loha_on_packed_target_error(&path)),
-        Some(lin) => lin.base_shape(),
+        Some(facts) if facts.is_quantized => return Err(loha_on_packed_target_error(&path)),
+        Some(facts) => facts.base_shape,
         None => {
             report.skipped.push(path);
             return Ok(());
