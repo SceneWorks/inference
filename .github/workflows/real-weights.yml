@@ -842,8 +842,7 @@ jobs:
             steps: 30
             guidance: 7.0
         candidate:
-          - { geometry: "1344x768", edge: "e672", value: "1344x768:672:128" }
-          - { geometry: "1344x768", edge: "e736", value: "1344x768:736:160" }
+          - { geometry: "2048x2048", edge: "e1824", value: "2048x2048:1824:384" }
     env:
       QUALITY_MODEL: ${{ matrix.model.id }}
       QUALITY_REPOSITORY: ${{ matrix.model.repository }}
