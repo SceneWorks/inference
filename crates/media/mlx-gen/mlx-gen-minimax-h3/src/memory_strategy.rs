@@ -71,20 +71,51 @@
 //! decode is a BigVGAN vocoder over a waveform, with no spatial grid to tile and a footprint 17×
 //! below the video VAE's.
 //!
-//! Rungs 3 and 4 are declared [`MemoryStrategySupport::Missing`] — honestly, because neither is
-//! built:
+//! # Rung 3 is measured-inapplicable on this backend (sc-18661)
 //!
-//! * **Rung 3 (`BoundedAttention`)** — sc-18661. Deliberately **not**
-//!   [`MemoryStrategySupport::StructurallyNotApplicable`], even though MLX's fused SDPA already
-//!   streams the scores: measured peak tracks `4·B·H·S·D` (5.966 GB measured against 5.965 GB
-//!   predicted at `S = 104_030`, where materializing the score tensor would add ~1,212 GB). That
-//!   is a strong argument that chunking bounds nothing *on this backend*, but sc-18661 owns
-//!   measuring and recording that verdict, and `StructurallyNotApplicable` additionally satisfies
-//!   prerequisite edges **vacuously** — a semantic that should not be introduced ahead of the
-//!   measurement. **Do not copy this MLX reasoning to candle**, which has no fused streaming SDPA.
-//! * **Rung 4 (`BoundedTransformerResidency`)** — sc-18662, and it is gated on
-//!   [`LoadShape::DeferredMaterialization`], which this loader does not implement (see
-//!   [`LOAD_SHAPE`]).
+//! [`MemoryStrategy::BoundedAttention`] is [`MemoryStrategySupport::StructurallyNotApplicable`],
+//! and the reason is a measurement rather than an argument. It was
+//! [`MemoryStrategySupport::Missing`] until sc-18661 built the mechanism and ran it; the verdict is
+//! what changed the declaration, not the other way round.
+//!
+//! **The rung optimizes a tensor this backend does not build.** MLX's fused
+//! `scaled_dot_product_attention` streams the scores: measured peak tracks the `4·B·H·S·D` q/k/v/out
+//! prediction exactly — 5.966 GB against 5.965 GB predicted at `S = 104_030`, where materializing
+//! `[B, H, S, S]` would add ~1,212 GB (`tests/sequence_cost_real.rs`, sc-17152). That is
+//! [`MemoryStrategySupport::StructurallyNotApplicable`]'s own definition: "the architecture lacks
+//! the component … the rung would optimize".
+//!
+//! **And the remaining mechanism was measured in-forward, where it could still have won.** On MLX
+//! the saving Z-Image gets from this rung is not score bounding at all — it is
+//! `AttentionBudget::eval_per_chunk` cutting the lazy graph, worth −1.7 % on Z-Image's denoise phase.
+//! That mechanism exists only inside a real forward, so `tests/bounded_attention_real.rs` runs it on
+//! the real 50-block q4 DiT across the frame lattice, on **both** chunk axes. Every arm costs peak:
+//! see [`RUNG3_MEASURED_PEAK_DELTAS`]. There is nothing left for the rung to recover here, because
+//! the denoise peak is the resident DiT plus a transient that chunking *adds* to.
+//!
+//! Three scoping notes the next reader needs:
+//!
+//! * **MLX-scoped.** The contract carries a [`MemoryBackendRealization`], and
+//!   `candle-gen-minimax-h3` has no fused streaming SDPA — it materializes its scores, where this
+//!   rung is worth −32 % (`gen_core::attention_budget`). **Do not copy this verdict to candle.**
+//! * **The mechanism is retained, not reverted.** [`crate::dit::model::MiniMaxH3Dit::forward_packed_bounded`]
+//!   and its block-level seam stay wired at `BoundedAttention::UNBOUNDED`, which is byte-identical to
+//!   the pre-rung forward, so no shipped render's numerics move. They are the instrument the verdict
+//!   was measured with, and a verdict that is per-tier and per-budget must stay re-measurable —
+//!   `tests/bounded_attention.rs` holds the seam reachable and the declaration honest.
+//! * **`StructurallyNotApplicable` satisfies prerequisite edges vacuously**
+//!   (`gen_core::memory_strategy`). Nothing in the shared graph names rung 3 as a prerequisite today,
+//!   and rung 4's sole prerequisite is a [`LoadShape`], so this introduces no vacuous edge. sc-18662
+//!   is what would first be affected, and it is declared against the load shape rather than against
+//!   this rung.
+//!
+//! # Rung 4 is still `Missing`
+//!
+//! **Rung 4 (`BoundedTransformerResidency`)** — sc-18662, gated on
+//! [`LoadShape::DeferredMaterialization`], which this loader does not implement (see
+//! [`LOAD_SHAPE`]). `Missing` and not `StructurallyNotApplicable`: the component the rung would
+//! optimize plainly exists here — a 50-block DiT and a transformer text encoder — so its absence is
+//! an unbuilt loader, not an architectural fact.
 //!
 //! # The AdaLN eviction is declared, and it is declared NET (sc-18665)
 //!
@@ -284,6 +315,43 @@ pub const DECODE_TILE_EDGE: u32 = crate::spatial_tiling::TILE_SAMPLE_MIN_SIZE as
 /// entry in a published range, so the domain cannot be widened to include it by accident.
 pub const DECODE_OVERLAP: u32 = crate::spatial_tiling::TILE_SAMPLE_MIN_OVERLAP as u32;
 
+// --- rung 3: the measured inapplicability -------------------------------------------------------
+
+/// **The rung-3 verdict's evidence, as data rather than prose** (sc-18661).
+///
+/// Denoise-phase MLX peak under each bounded attention configuration, as a fraction of the same
+/// geometry's unbounded peak, measured on the real 50-block `q4` DiT by
+/// `tests/bounded_attention_real.rs`. Positive means the rung **cost** peak.
+///
+/// Rows are `(frames, packed_seq_len, head-axis @ 64 Mi, query-row @ 64 Mi, head-axis one-head)`.
+/// Both ends of the `17n + 5` frame lattice are present because `frames` is an exact-match evidence
+/// key (`mlx_fit_gate.rs:1381`) and fitted-curve extrapolation scales by area only — a single
+/// duration cell may not stand in for another one.
+///
+/// The third column is the configuration whose budget is derived from the geometry (`B · Sq²`, one
+/// head per chunk with the query axis whole). It is measured because the shipped 64 Mi operating
+/// point is **Z-Image's**, and at 56 heads it stops being bit-exact above `Sq = 8192` — inside this
+/// family's legal duration range. Without that column the verdict would be about a budget rather
+/// than about the rung.
+/// Measured 2026-08-15 at 576x320 on the `SceneWorks/minimax-h3-mlx` `q4` transformer
+/// (`f22bc294`), two evaluations per arm, `tests/bounded_attention_real.rs`:
+///
+/// | frames | seq | unbounded | heads @ 64 Mi | query rows @ 64 Mi | heads @ one-head |
+/// |---:|---:|---:|---:|---:|---:|
+/// | 124 | 7 586 | 13.4894 GB | 13.5614 GB (+0.53 %) | 13.5640 GB (+0.55 %) | 13.5666 GB (+0.57 %) |
+/// | 345 | 20 022 | 16.4951 GB | 16.7053 GB (+1.27 %) | 16.7123 GB (+1.32 %) | 16.7194 GB (+1.36 %) |
+///
+/// **The cost grows with the sequence**, which is the direction that settles the verdict: the axis
+/// the rung exists to relieve is the one on which it gets worse. Wall-clock moves the same way at the
+/// shipped budget — +1.6 %/+15.6 % at 124 frames, +44.3 %/+71.7 % at 345.
+///
+/// Output agreement was **exactly zero** relative max-abs on all six bounded arms, so nothing here is
+/// a quality trade that memory could be bought with.
+pub const RUNG3_MEASURED_PEAK_DELTAS: [(i32, i32, f64, f64, f64); 2] = [
+    (124, 7_586, 0.005341, 0.005532, 0.005723),
+    (345, 20_022, 0.012740, 0.013168, 0.013596),
+];
+
 /// The audio VAE is out of scope for rung 2, declared rather than implied.
 ///
 /// It is 0.61 GB against the video VAE's 10.42 GB (17× smaller), and structurally has nothing to
@@ -461,6 +529,36 @@ fn resolved_adaln_bytes(dit_dir: &std::path::Path, dit_bytes: u64) -> u64 {
 /// directions are enforced by `validate_owned_parameter_domain`. Rungs 0 and 1 own no numeric
 /// parameters, so their ranges are legitimately empty; rungs 2, 3 and 4 own tile/chunk/window
 /// domains and cannot be flipped to `Implemented` without filling them in.
+/// Rung 3's inapplicability reason, built from [`RUNG3_MEASURED_PEAK_DELTAS`] rather than typed out.
+///
+/// A reason string is the *only* justification a `StructurallyNotApplicable` declaration carries, and
+/// `conformance_errors` refuses an empty one — but nothing stops a non-empty one from going stale
+/// against the measurement it claims to report. Deriving it from the same constant the tests assert
+/// against means a re-measurement that moves a number moves the declaration with it.
+fn rung3_inapplicability_reason() -> String {
+    let cells = RUNG3_MEASURED_PEAK_DELTAS
+        .iter()
+        .map(|(frames, seq, heads, rows, one_head)| {
+            format!(
+                "{frames}f/seq {seq}: {:+.2}% heads, {:+.2}% query rows, {:+.2}% one-head",
+                heads * 100.0,
+                rows * 100.0,
+                one_head * 100.0
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "MLX's fused SDPA streams the scores at this family's shape, so there is no materialized \
+         [B,H,S,S] tensor for rung 3 to bound: measured peak tracks the 4·B·H·S·D q/k/v/out \
+         prediction exactly (5.966 GB against 5.965 GB predicted at S=104030, where materializing \
+         the scores would add ~1212 GB). The remaining MLX mechanism — eval_per_chunk cutting the \
+         lazy graph, worth -1.7% on Z-Image's denoise phase — was measured in-forward on the real \
+         50-block q4 DiT on both chunk axes and COSTS denoise peak at every arm ({cells}). \
+         MLX-scoped: candle-gen-minimax-h3 materializes its scores and must measure its own verdict."
+    )
+}
+
 fn strategies() -> Vec<MemoryStrategyCapability> {
     MemoryStrategy::ALL
         .into_iter()
@@ -473,10 +571,17 @@ fn strategies() -> Vec<MemoryStrategyCapability> {
                 // `MiniMaxH3VideoVae::decode_clip`; the domain is one geometry, because the tile
                 // edge is an output-correctness input rather than a lever (module docs).
                 | MemoryStrategy::BoundedDecode => MemoryStrategySupport::Implemented,
-                // sc-18661 / sc-18662. See the module docs for why rung 3 is `Missing` and not
-                // `StructurallyNotApplicable` despite the fused-SDPA measurement.
-                MemoryStrategy::BoundedAttention
-                | MemoryStrategy::BoundedTransformerResidency => MemoryStrategySupport::Missing,
+                // sc-18661. Measured, not argued — see the module docs and
+                // `RUNG3_MEASURED_PEAK_DELTAS`. MLX-scoped: candle materializes its scores.
+                MemoryStrategy::BoundedAttention => {
+                    MemoryStrategySupport::StructurallyNotApplicable {
+                        reason: rung3_inapplicability_reason(),
+                    }
+                }
+                // sc-18662. `Missing`, not inapplicable: a 50-block DiT and a transformer text
+                // encoder are exactly the components this rung optimizes, so what is absent is the
+                // `LoadShape::DeferredMaterialization` loader, not the opportunity.
+                MemoryStrategy::BoundedTransformerResidency => MemoryStrategySupport::Missing,
             },
             parameters: match strategy {
                 MemoryStrategy::BoundedDecode => MemoryParameterRanges {
@@ -1366,17 +1471,33 @@ mod tests {
     fn unimplemented_rungs_are_refused_at_admission() {
         let spec = weightless_spec();
         let contract = declared();
-        // sc-18660 landed rung 2, so it is no longer in this list. Rungs 3 and 4 remain unbuilt —
-        // see the module docs for why rung 3 is `Missing` rather than `StructurallyNotApplicable`.
+        // sc-18660 landed rung 2, so it is no longer in this list. The two remaining rungs are
+        // unavailable for **different** reasons and the distinction is asserted rather than
+        // flattened: rung 3 is measured-inapplicable (sc-18661), rung 4 is simply unbuilt
+        // (sc-18662). Both must be refused identically at admission.
+        match support(&contract, MemoryStrategy::BoundedAttention) {
+            MemoryStrategySupport::StructurallyNotApplicable { reason } => {
+                assert_eq!(
+                    reason,
+                    rung3_inapplicability_reason(),
+                    "the declared reason must be the one derived from the measurement"
+                );
+                assert!(
+                    reason.contains("4·B·H·S·D") && reason.contains("MLX-scoped"),
+                    "the reason must carry the measured prediction and its backend scope: {reason}"
+                );
+            }
+            other => panic!("sc-18661 measured rung 3 inapplicable, got {other:?}"),
+        }
+        assert_eq!(
+            support(&contract, MemoryStrategy::BoundedTransformerResidency),
+            MemoryStrategySupport::Missing,
+            "rung 4 is unbuilt, not inapplicable — the components it optimizes are both present"
+        );
         for strategy in [
             MemoryStrategy::BoundedAttention,
             MemoryStrategy::BoundedTransformerResidency,
         ] {
-            assert_eq!(
-                support(&contract, strategy),
-                MemoryStrategySupport::Missing,
-                "{strategy:?} is not built yet"
-            );
             assert!(
                 contract
                     .validate_selection(&MemorySelection {

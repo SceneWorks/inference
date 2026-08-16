@@ -820,3 +820,126 @@ pub fn snapshot() -> PathBuf {
     );
     path
 }
+
+// --- sc-18661: rung-3 bounded-attention measurement receipts -------------------------------------
+
+/// One measured `(tier x duration)` cell of the rung-3 in-forward comparison.
+///
+/// Never a single number, and never one row: `frames` is an **exact-match** evidence key
+/// (`mlx_fit_gate.rs:1381`) and fitted-curve extrapolation scales by area only, so no measurement at
+/// one duration may stand in for another. The tier is carried on every cell rather than assumed from
+/// the run, because the harness is pointed at a staged DiT directory and the same binary measures
+/// whichever tier that directory holds.
+#[derive(Debug, Clone)]
+pub struct BoundedAttentionCell {
+    pub tier: String,
+    pub width: u32,
+    pub height: u32,
+    pub frames: i32,
+    pub seq: i32,
+    pub heads: i32,
+    pub unbounded_peak_bytes: u64,
+    pub head_chunked_peak_bytes: u64,
+    pub query_chunked_peak_bytes: u64,
+    /// The head axis at the **geometry-derived** budget: one head per chunk, query axis whole.
+    pub bit_exact_head_peak_bytes: u64,
+    /// That budget, in score elements — `B · Sq²`, i.e. exactly one head's score domain.
+    pub bit_exact_head_budget: u64,
+    pub head_chunks: usize,
+    /// Query-row blocks the 64 Mi **head** arm fell back to. `1` means the head split alone fit.
+    pub head_query_row_blocks: usize,
+    pub query_row_blocks: usize,
+    pub unbounded_fastest_eval_s: f64,
+    pub head_chunked_fastest_eval_s: f64,
+    pub query_chunked_fastest_eval_s: f64,
+    pub bit_exact_head_fastest_eval_s: f64,
+    pub head_relative_max_abs: f32,
+    pub query_relative_max_abs: f32,
+    pub bit_exact_head_relative_max_abs: f32,
+}
+
+impl BoundedAttentionCell {
+    fn to_json(&self) -> serde_json::Value {
+        let delta = |bounded: u64| bounded as f64 / self.unbounded_peak_bytes.max(1) as f64 - 1.0;
+        serde_json::json!({
+            "tier": self.tier,
+            "width": self.width,
+            "height": self.height,
+            "frames": self.frames,
+            "packed_seq_len": self.seq,
+            "attention_heads": self.heads,
+            "attention_chunk_size": mlx_gen::attention::CONSTRAINED_ATTN_SCORES_BUDGET,
+            "unbounded_peak_bytes": self.unbounded_peak_bytes,
+            "head_chunked_peak_bytes": self.head_chunked_peak_bytes,
+            "query_chunked_peak_bytes": self.query_chunked_peak_bytes,
+            "bit_exact_head_peak_bytes": self.bit_exact_head_peak_bytes,
+            "bit_exact_head_budget": self.bit_exact_head_budget,
+            "head_chunked_peak_delta": delta(self.head_chunked_peak_bytes),
+            "query_chunked_peak_delta": delta(self.query_chunked_peak_bytes),
+            "bit_exact_head_peak_delta": delta(self.bit_exact_head_peak_bytes),
+            "head_chunks": self.head_chunks,
+            "head_query_row_blocks": self.head_query_row_blocks,
+            "query_row_blocks": self.query_row_blocks,
+            "unbounded_fastest_eval_seconds": self.unbounded_fastest_eval_s,
+            "head_chunked_fastest_eval_seconds": self.head_chunked_fastest_eval_s,
+            "query_chunked_fastest_eval_seconds": self.query_chunked_fastest_eval_s,
+            "bit_exact_head_fastest_eval_seconds": self.bit_exact_head_fastest_eval_s,
+            "head_relative_max_abs": self.head_relative_max_abs,
+            "query_relative_max_abs": self.query_relative_max_abs,
+            "bit_exact_head_relative_max_abs": self.bit_exact_head_relative_max_abs,
+        })
+    }
+}
+
+/// Emit the rung-3 measurement receipt: to `MINIMAX_H3_EVIDENCE_OUT` when set, and always to stderr.
+///
+/// # Why this is not a `MEMORY_EVIDENCE_V1` line, stated rather than skipped
+///
+/// `MemoryRunOutcome::to_json_line` is the canonical receipt the SceneWorks side ingests into
+/// `docs/generated/memory-calibration-evidence.json`, and it **requires a positive
+/// `predicted_peak_bytes`** — a peak from the provider's fitted curve, checked against the observed
+/// one. MiniMax-H3 has no fitted curve yet: `synthesize_estimate_ladder` needs the calibration
+/// campaign that **sc-17153** owns, which is the last story of this chain, after this one. Minting a
+/// `MEMORY_EVIDENCE_V1` record here would mean inventing the prediction half, and a fabricated
+/// prediction validating against itself is precisely the kind of receipt the evidence gate exists to
+/// refuse.
+///
+/// So this emits the measured half in a self-describing, versioned form, with every axis
+/// `MemoryEvidenceKey` will need (tier, geometry, frames, strategy parameter) already on each cell,
+/// and sc-17153 pairs it with the prediction. That is a sequencing fact recorded in both stories, not
+/// an evidence gap discovered here.
+pub fn write_bounded_attention_evidence(cells: &[BoundedAttentionCell]) {
+    let document = serde_json::json!({
+        "schema": "MINIMAX_H3_RUNG3_MEASUREMENT_V1",
+        "story": "sc-18661",
+        "provider": "minimax-h3",
+        "backend": "mlx-metal",
+        "phase": "denoise",
+        "note": "Denoise-phase activation peak per attention plan, measured on a real 50-block DiT \
+                 with synthetic drive. Conditioning and decode are separate phases with their own \
+                 high-water marks and are deliberately outside the measured window.",
+        "cells": cells.iter().map(BoundedAttentionCell::to_json).collect::<Vec<_>>(),
+    });
+    let text = serde_json::to_string_pretty(&document).expect("serialize rung-3 receipt");
+    eprintln!("\nMINIMAX_H3_RUNG3_MEASUREMENT_V1\n{text}");
+    if let Ok(path) = std::env::var("MINIMAX_H3_EVIDENCE_OUT") {
+        if !path.trim().is_empty() {
+            std::fs::write(path.trim(), &text).expect("write rung-3 receipt");
+        }
+    }
+}
+
+/// A human-readable tier label for a staged DiT directory, from the tier's **own** `config.json`
+/// quantization marker — the same authority `crate::model::reconcile_tier` treats as decisive —
+/// rather than from the directory name, which a caller chooses freely.
+pub fn describe_dit_tier(dir: &std::path::Path) -> String {
+    match mlx_gen::quant::packed_quant_bits_at(dir) {
+        Ok(Some(bits)) => format!("q{bits}"),
+        Ok(None) => "bf16".to_owned(),
+        Err(error) => panic!(
+            "{}: cannot read the staged tier's quantization marker: {error}. An unlabelled tier \
+             would make every measured cell unattributable.",
+            dir.display()
+        ),
+    }
+}

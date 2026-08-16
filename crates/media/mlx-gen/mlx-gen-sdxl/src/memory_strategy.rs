@@ -375,7 +375,11 @@ pub const ATTENTION_CHUNK_SIZE: u32 = mlx_gen::attention::CONSTRAINED_ATTN_SCORE
 ///    `gen_core::attention_budget` carries a **second** axis for exactly this reason:
 ///    `AttentionBudget::head_chunks` narrows complete heads and *preserves bit identity*, and its
 ///    docs say outright that the two axes "share a score budget, but not a numerical contract" and
-///    must not be treated as interchangeable. `sdpa_budgeted_bhsd` never uses it. So the honest
+///    must not be treated as interchangeable. `sdpa_budgeted_bhsd` never uses it — but since
+///    sc-18661 `mlx_gen::attention::sdpa_head_budgeted_bhsd` does, and the prediction below is now
+///    measured rather than reasoned: at a budget admitting one whole head the head axis reconstructs
+///    the unbounded forward at **exactly** `0` relative max-abs, on four shapes including a
+///    production 56-head bf16 DiT. Adopting it here is still gated on reason 1. So the honest
 ///    statement is: **the query-row axis is not bit-exact on Metal, and SDXL is unusually exposed to
 ///    that** — it runs fp16 through a chaos-sensitive Euler-Ancestral schedule across 140 attention
 ///    sites. Measured at **one** step, where the sampler cannot amplify anything, the raw per-forward

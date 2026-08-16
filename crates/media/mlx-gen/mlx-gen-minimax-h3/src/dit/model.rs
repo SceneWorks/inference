@@ -38,8 +38,9 @@ use std::path::Path;
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
+use mlx_gen::attention::{AttentionBudget, AttentionChunkAxis, AttentionPlan, BoundedAttention};
 use mlx_gen::weights::Weights;
-use mlx_gen::{Error, Result};
+use mlx_gen::{CancelFlag, Error, Result};
 
 use crate::denoise::{JointStep, JointVelocity, PackedLayout};
 use crate::dit::adaln::{AdaLnCache, AdaLnResidency, TimestepSchedule};
@@ -187,6 +188,24 @@ impl MiniMaxH3Dit {
         blocks: BlockModulation<'_>,
         norm_out: &NormOutModulation,
     ) -> Result<(Array, Array)> {
+        self.forward_packed_bounded(packed, blocks, norm_out, BoundedAttention::UNBOUNDED)
+    }
+
+    /// [`Self::forward_packed`] under an explicit [`BoundedAttention`] — the rung-3 seam (sc-18661).
+    ///
+    /// The plan reaches all 50 blocks and nothing else. The **token refiner is deliberately not on
+    /// this path**, and that is arithmetic rather than an omission: it runs once per request over the
+    /// text rows alone, so its score domain is `B·H·Sq·Sk = 1·56·N²` for a prompt of `N` tokens, which
+    /// stays under [`mlx_gen::attention::CONSTRAINED_ATTN_SCORES_BUDGET`]'s 64 Mi for every prompt
+    /// below 1 090 tokens and is 0.4 % of one block's domain at the shipped 19 574-row sequence. A
+    /// bounded plan there would never engage; threading it would publish a lever with an empty domain.
+    pub fn forward_packed_bounded(
+        &self,
+        packed: &PackedForward<'_>,
+        blocks: BlockModulation<'_>,
+        norm_out: &NormOutModulation,
+        bounded: BoundedAttention<'_>,
+    ) -> Result<(Array, Array)> {
         // 1. Per-modality input projections. The two patch projections are float32 in the published
         //    checkpoint; the text stream sets the packed sequence's dtype, as in the reference.
         let stream = packed.text_rows.dtype();
@@ -212,19 +231,21 @@ impl MiniMaxH3Dit {
         // 2. The stack.
         for (layer, block) in self.blocks.iter().enumerate() {
             x = match blocks {
-                BlockModulation::Cached(cache) => block.forward(
+                BlockModulation::Cached(cache) => block.forward_bounded(
                     &x,
                     cache.modulation(layer)?,
                     packed.adaln_indices,
                     &self.rope,
                     packed.tables,
+                    bounded,
                 )?,
-                BlockModulation::Temb(temb) => block.forward_with_temb(
+                BlockModulation::Temb(temb) => block.forward_with_temb_bounded(
                     &x,
                     temb,
                     packed.adaln_indices,
                     &self.rope,
                     packed.tables,
+                    bounded,
                 )?,
             };
         }
@@ -405,6 +426,13 @@ pub struct JointDit {
     /// Bytes of `adaln_proj` weight released by the eviction, 0 when resident.
     released_bytes: usize,
     forwards: usize,
+    /// The rung-3 plan every step's block stack runs under (sc-18661).
+    ///
+    /// Stored decomposed rather than as a [`BoundedAttention`] because that type borrows the cancel
+    /// flag, and a self-referential borrow is not expressible on this struct. Reassembled per step.
+    attention_budget: AttentionBudget,
+    attention_axis: AttentionChunkAxis,
+    attention_cancel: Option<CancelFlag>,
 }
 
 impl JointDit {
@@ -503,7 +531,38 @@ impl JointDit {
             resident_adaln_indices,
             released_bytes,
             forwards: 0,
+            // Unbounded until a measured rung selects otherwise — the ladder's rule everywhere.
+            attention_budget: AttentionBudget::UNBOUNDED,
+            attention_axis: AttentionChunkAxis::Heads,
+            attention_cancel: None,
         })
+    }
+
+    /// Select the rung-3 bounded-attention plan for every subsequent step (sc-18661).
+    ///
+    /// [`AttentionBudget::UNBOUNDED`] restores the byte-identical un-chunked forward, so this is
+    /// reversible on a live model — which is what lets one loaded 50-block DiT serve both arms of a
+    /// peak comparison.
+    pub fn set_bounded_attention(&mut self, budget: AttentionBudget, axis: AttentionChunkAxis) {
+        self.attention_budget = budget;
+        self.attention_axis = axis;
+    }
+
+    /// Attach the request's cancel flag, checked **between attention chunks** — the only cancellation
+    /// point that exists inside a single DiT forward (`gen_core::attention_budget::AttentionPlan`).
+    ///
+    /// Inert on the unbounded path, which has no chunk boundary to check at.
+    pub fn set_attention_cancel(&mut self, cancel: CancelFlag) {
+        self.attention_cancel = Some(cancel);
+    }
+
+    /// The plan in force, as the block stack will see it.
+    pub fn bounded_attention(&self) -> BoundedAttention<'_> {
+        let plan = match &self.attention_cancel {
+            Some(cancel) => AttentionPlan::budgeted(self.attention_budget).with_cancel(cancel),
+            None => AttentionPlan::budgeted(self.attention_budget),
+        };
+        BoundedAttention::new(plan, self.attention_axis)
     }
 
     /// Bytes of `adaln_proj` weight the eviction released — 0 under
@@ -588,7 +647,8 @@ impl JointVelocity for JointDit {
                 ))
             }
         };
-        self.dit.forward_packed(&packed, blocks, &norm_out)
+        self.dit
+            .forward_packed_bounded(&packed, blocks, &norm_out, self.bounded_attention())
     }
 }
 
