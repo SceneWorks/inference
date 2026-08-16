@@ -9,7 +9,13 @@
 
 mod common;
 
-use common::{errors, flat_f32, Golden};
+use common::{
+    errors, flat_f32, Golden, SHARED_FIXTURE_ASSEMBLY_HEAD_DIM,
+    SHARED_FIXTURE_ASSEMBLY_INTERMEDIATE_SIZE, SHARED_FIXTURE_ASSEMBLY_MROPE_SECTION,
+    SHARED_FIXTURE_ASSEMBLY_NUM_HEADS, SHARED_FIXTURE_ASSEMBLY_NUM_KV_HEADS,
+    SHARED_FIXTURE_ASSEMBLY_NUM_LAYERS, SHARED_FIXTURE_ASSEMBLY_RMS_NORM_EPS,
+    SHARED_FIXTURE_ASSEMBLY_ROPE_THETA,
+};
 
 use candle_gen::candle_core::Device;
 use candle_gen_bernini::assembly::{concat_with_zero_init, format_mllm_inputs_embeds};
@@ -31,14 +37,14 @@ fn assembly_matches_reference() {
     // Minimal backbone (0 layers) — only the token embedding is exercised.
     let cfg = QwenVlTextConfig {
         hidden_size: hidden,
-        num_layers: 0,
-        num_heads: 2,
-        num_kv_heads: 1,
-        head_dim: 8,
-        intermediate_size: 32,
-        rms_norm_eps: 1e-6,
-        rope_theta: 1_000_000.0,
-        mrope_section: [1, 2, 1],
+        num_layers: SHARED_FIXTURE_ASSEMBLY_NUM_LAYERS,
+        num_heads: SHARED_FIXTURE_ASSEMBLY_NUM_HEADS,
+        num_kv_heads: SHARED_FIXTURE_ASSEMBLY_NUM_KV_HEADS,
+        head_dim: SHARED_FIXTURE_ASSEMBLY_HEAD_DIM,
+        intermediate_size: SHARED_FIXTURE_ASSEMBLY_INTERMEDIATE_SIZE,
+        rms_norm_eps: SHARED_FIXTURE_ASSEMBLY_RMS_NORM_EPS,
+        rope_theta: SHARED_FIXTURE_ASSEMBLY_ROPE_THETA,
+        mrope_section: SHARED_FIXTURE_ASSEMBLY_MROPE_SECTION,
     };
     let vb = g.var_builder(&dev);
     let backbone = Qwen25VlText::new(cfg, vb.pp("model")).expect("backbone");
@@ -102,14 +108,14 @@ fn planner_tensors_land_on_cuda_backbone() {
     // Zero-layer backbone: only `embed_tokens` / `norm` are read, so the token embedding is exercised.
     let cfg = QwenVlTextConfig {
         hidden_size: hidden,
-        num_layers: 0,
-        num_heads: 2,
-        num_kv_heads: 1,
-        head_dim: 8,
-        intermediate_size: 32,
-        rms_norm_eps: 1e-6,
-        rope_theta: 1_000_000.0,
-        mrope_section: [1, 2, 1],
+        num_layers: SHARED_FIXTURE_ASSEMBLY_NUM_LAYERS,
+        num_heads: SHARED_FIXTURE_ASSEMBLY_NUM_HEADS,
+        num_kv_heads: SHARED_FIXTURE_ASSEMBLY_NUM_KV_HEADS,
+        head_dim: SHARED_FIXTURE_ASSEMBLY_HEAD_DIM,
+        intermediate_size: SHARED_FIXTURE_ASSEMBLY_INTERMEDIATE_SIZE,
+        rms_norm_eps: SHARED_FIXTURE_ASSEMBLY_RMS_NORM_EPS,
+        rope_theta: SHARED_FIXTURE_ASSEMBLY_ROPE_THETA,
+        mrope_section: SHARED_FIXTURE_ASSEMBLY_MROPE_SECTION,
     };
     let mut w: HashMap<String, Tensor> = HashMap::new();
     w.insert(

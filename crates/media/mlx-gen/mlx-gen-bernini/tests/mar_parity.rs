@@ -63,31 +63,50 @@ fn stream(w: &Weights, name: &str) -> StreamState {
 fn mar_loop_matches_reference_f32() {
     let w = Weights::from_file(FIXTURE).expect("load fixture");
 
+    // Every number below is read from the golden's own `__metadata__`, as the candle lane's
+    // `mar_parity` does. This lane used to re-type all fifteen of them (sc-19496): the two lanes load
+    // BYTE-IDENTICAL `mar_golden.safetensors`, so a regenerated fixture moved candle's config and left
+    // this one asserting the old geometry — with both suites still green, because each lane is
+    // internally consistent. Sourcing both from the fixture's own bytes closes that without needing a
+    // gate: there is only one copy of the number.
+    let meta = |k: &str| {
+        w.metadata(k)
+            .unwrap_or_else(|| panic!("missing metadata {k}"))
+    };
+    let sec: Vec<usize> = meta("mrope_section")
+        .split(',')
+        .map(|s| s.parse::<usize>().unwrap())
+        .collect();
+    let i = |k: &str| meta(k).parse::<i32>().unwrap();
+    let u = |k: &str| meta(k).parse::<usize>().unwrap();
+    let f = |k: &str| meta(k).parse::<f32>().unwrap();
+
     // Tiny config — mirrors the dumper's structurally-faithful Qwen2.5-VL text decoder.
     let cfg = QwenVlTextConfig {
-        hidden_size: 16,
-        num_layers: 2,
-        num_heads: 2,
-        num_kv_heads: 1,
-        head_dim: 8,
-        intermediate_size: 32,
-        rms_norm_eps: 1e-6,
-        rope_theta: 1_000_000.0,
-        mrope_section: [1, 2, 1],
+        hidden_size: i("hidden"),
+        num_layers: i("layers"),
+        num_heads: i("heads"),
+        num_kv_heads: i("kv_heads"),
+        head_dim: i("head_dim"),
+        intermediate_size: i("intermediate"),
+        rms_norm_eps: f("eps"),
+        rope_theta: f("theta"),
+        mrope_section: [sec[0], sec[1], sec[2]],
         quantization: None,
     };
     let backbone = Qwen25VlText::from_weights(&w, cfg, "w.model").expect("backbone");
     let connector = MlpConnector::from_weights(&w, "conn").expect("connector");
-    let mut clip_diff = DiffLossFm::from_weights(&w, "net", 2, 16, 2.0).expect("clip_diff");
+    let mut clip_diff = DiffLossFm::from_weights(&w, "net", u("depth"), i("hidden"), f("shift"))
+        .expect("clip_diff");
 
     let mask_token = w.require("io.mask_token").unwrap().clone(); // [1, 1, H]
     let order = idx(&w, "io.order");
 
     let vit = VitCfg {
-        planning_step: 4,
-        vit_denoising_step: 2,
-        vit_txt_cfg: 1.4,
-        vit_img_cfg: 1.2,
+        planning_step: u("planning_step"),
+        vit_denoising_step: u("vit_denoising_step"),
+        vit_txt_cfg: f("vit_txt_cfg"),
+        vit_img_cfg: f("vit_img_cfg"),
     };
 
     // step_noise indexed by step; the skipped step-0 entry is a placeholder (never read).

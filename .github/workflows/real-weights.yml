@@ -5692,14 +5692,19 @@ jobs:
   # above rather than the errand that produces it. Read what it is and is not: it prints
   # `memory.total` for whichever box claims this job, and NOTHING compares that against the 95.59
   # GiB assumed here, so a shrunk or re-pointed pool yields the log line AND the OOM — it explains a
-  # failure after the fact, it does not prevent one. It has never fired, and a dispatch today still
-  # would not reach it: `Require operator-provided MiniMax-H3 snapshot` sits ABOVE it and exits 1
-  # when `CANDLE_MINIMAX_H3_SNAPSHOT` is unset, which it currently is (the variable does not exist
-  # on this repository). Dispatching this workflow on a non-default ref is otherwise routine — 176
-  # of the 204 `workflow_dispatch` runs on record used one, `feature/*` included, and `minimax-h3`
-  # is in this workflow's `profile` options — so the ref is NOT the obstacle, whatever an earlier
-  # note here said; the missing repository variable is. (The weekly `schedule` is a separate matter:
-  # that genuinely only fires from the default branch, so it cannot reach this lane until the epic
+  # failure after the fact, it does not prevent one. It has never fired — but the reason recorded
+  # here is now OUT OF DATE and the blocker it names is gone (sc-19455). This used to read that
+  # `Require operator-provided MiniMax-H3 snapshot` sits ABOVE it and exits 1 when
+  # `CANDLE_MINIMAX_H3_SNAPSHOT` is unset, "which it currently is (the variable does not exist on
+  # this repository)". It DOES exist: it was set 2026-08-15 to
+  # `E:\huggingface\hub\models--MiniMaxAI--MiniMax-H3\snapshots\939557dc319dd91227e30195a763f272ba7f8765`.
+  # So that step would now PASS, and a dispatch of this workflow at `profile: minimax-h3` on this
+  # ref would reach the inventory step. Dispatching on a non-default ref is likewise routine — 176
+  # of the 204 `workflow_dispatch` runs on record used one, `feature/*` included — so the ref was
+  # never the obstacle either. Neither is now: the step has simply not fired because no dispatch
+  # selecting this job has been made (checked across the 40 most recent runs of this workflow, in
+  # none of which does this job appear at all). (The weekly `schedule` is a separate matter: that
+  # genuinely only fires from the default branch, so it cannot reach this lane until the epic
   # merges.) The figures above come from jobs that DO exist on `main`, on the
   # same pool, which is the only reason a number exists to read at all.
   #

@@ -11,7 +11,11 @@ use std::path::Path;
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor};
 use candle_gen_krea::loader::Weights;
-use candle_gen_krea::{KreaTeConfig, KreaTextEncoder};
+use candle_gen_krea::KreaTextEncoder;
+
+mod common;
+
+use common::{tiny_te_config, SHARED_FIXTURE_TE_HIDDEN_SIZE};
 
 const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -44,28 +48,12 @@ fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
         .fold(0f32, f32::max)
 }
 
-/// Tiny config matching `tools/dump_krea_te_golden.py`.
-fn tiny_te_config() -> KreaTeConfig {
-    KreaTeConfig {
-        num_layers: 6,
-        num_heads: 4,
-        num_kv_heads: 2,
-        head_dim: 32,
-        rms_norm_eps: 1e-6,
-        rope_theta: 5_000_000.0,
-        select_hidden: vec![2, 4],
-        prefix_tokens: 3,
-        image_token_id: 151655,
-        mrope_section: [24, 20, 20],
-    }
-}
-
 #[test]
 fn te_matches_reference() -> Result<()> {
     let w = Weights::from_file(Path::new(FIXTURE), &Device::Cpu, DType::F32)
         .unwrap_or_else(|e| panic!("load te fixture: {e}"));
     let cfg = tiny_te_config();
-    let te = KreaTextEncoder::load(&w, "language_model", &cfg, 64)?;
+    let te = KreaTextEncoder::load(&w, "language_model", &cfg, SHARED_FIXTURE_TE_HIDDEN_SIZE)?;
 
     // The fixture's `in.attention_mask` is all-ones (no padding), so the candle causal-only forward
     // matches; `input_ids` keep their on-disk int dtype.
@@ -102,7 +90,7 @@ fn grounded_forward_splices_vision_through() -> Result<()> {
     // image placeholder. mrope_section is inert-safe at head_dim 32 (all freqs < the section bounds).
     let mut cfg = tiny_te_config();
     cfg.image_token_id = 0;
-    let te = KreaTextEncoder::load(&w, "language_model", &cfg, 64)?;
+    let te = KreaTextEncoder::load(&w, "language_model", &cfg, SHARED_FIXTURE_TE_HIDDEN_SIZE)?;
     let hidden = w.get("out.hiddens")?.dim(3)?; // the LM hidden width the vision embeds must match
 
     // input_ids: 4 text, then a 4-token `<|image_pad|>` block (a 2×2 merged grid → grid [1,4,4]), then
@@ -165,12 +153,23 @@ fn bf16_store_te_stays_within_parity() -> Result<()> {
     let w_f32 = Weights::from_file(Path::new(FIXTURE), &Device::Cpu, DType::F32)
         .unwrap_or_else(|e| panic!("load te fixture: {e}"));
     let input_ids = w_f32.get_raw("in.input_ids")?.to_dtype(DType::U32)?;
-    let ctx_f32 = KreaTextEncoder::load(&w_f32, "language_model", &cfg, 64)?.forward(&input_ids)?;
+    let ctx_f32 = KreaTextEncoder::load(
+        &w_f32,
+        "language_model",
+        &cfg,
+        SHARED_FIXTURE_TE_HIDDEN_SIZE,
+    )?
+    .forward(&input_ids)?;
 
     let w_bf16 = Weights::from_file(Path::new(FIXTURE), &Device::Cpu, DType::BF16)
         .unwrap_or_else(|e| panic!("load te fixture (bf16): {e}"));
-    let ctx_bf16 =
-        KreaTextEncoder::load(&w_bf16, "language_model", &cfg, 64)?.forward(&input_ids)?;
+    let ctx_bf16 = KreaTextEncoder::load(
+        &w_bf16,
+        "language_model",
+        &cfg,
+        SHARED_FIXTURE_TE_HIDDEN_SIZE,
+    )?
+    .forward(&input_ids)?;
     assert_eq!(
         ctx_bf16.dtype(),
         DType::F32,

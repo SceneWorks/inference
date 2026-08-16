@@ -6,7 +6,12 @@
 
 mod common;
 
-use common::{errors, flat_f32, Golden};
+use common::{
+    errors, flat_f32, Golden, SHARED_FIXTURE_VIT_GUIDANCE_APG_ETA,
+    SHARED_FIXTURE_VIT_GUIDANCE_APG_NORM_THRESHOLD, SHARED_FIXTURE_VIT_GUIDANCE_W_IMG,
+    SHARED_FIXTURE_VIT_GUIDANCE_W_TGT, SHARED_FIXTURE_VIT_GUIDANCE_W_TXT,
+    SHARED_FIXTURE_VIT_GUIDANCE_W_VID,
+};
 
 use candle_gen::candle_core::Device;
 use candle_gen_bernini::guidance::apg_delta;
@@ -23,11 +28,22 @@ fn vit_guidance_matches_reference() {
     let dev = Device::Cpu;
     let g = Golden::load("vit_guidance_golden");
     let t = |k: &str| g.tensor(k, &dev);
-    let (w_img, w_txt, w_tgt, w_vid) = (4.5f32, 4.0, 3.0, 1.25);
+    let (w_img, w_txt, w_tgt, w_vid) = (
+        SHARED_FIXTURE_VIT_GUIDANCE_W_IMG,
+        SHARED_FIXTURE_VIT_GUIDANCE_W_TXT,
+        SHARED_FIXTURE_VIT_GUIDANCE_W_TGT,
+        SHARED_FIXTURE_VIT_GUIDANCE_W_VID,
+    );
 
     // bare apg_delta (projection only): apg_delta(img - base, ref = img, 0.2, 1.0).
     let delta = (&t("io.img") - &t("io.base")).unwrap();
-    let apg = apg_delta(&delta, &t("io.img"), 0.2, 1.0).expect("apg_delta");
+    let apg = apg_delta(
+        &delta,
+        &t("io.img"),
+        SHARED_FIXTURE_VIT_GUIDANCE_APG_ETA,
+        SHARED_FIXTURE_VIT_GUIDANCE_APG_NORM_THRESHOLD,
+    )
+    .expect("apg_delta");
     check("apg_only", &flat_f32(&apg), &g.f32("out.apg_only"), 1e-5);
 
     // vae_txt_vit (plain) + vae_txt_vit_wapg (apg, ref = "to" pred).
