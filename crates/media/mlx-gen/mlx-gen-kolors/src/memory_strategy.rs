@@ -1239,7 +1239,8 @@ fn begin_with_cleanup(
     )?;
     config.load_shape = context.load_shape;
     mlx_gen::request_scope::authorize_selected_geometry_decode(&mut config, contract, context)?;
-    // Rungs 2 and 3 are `Missing`, so neither can be engaged and neither parameter is ever set.
+    // Rung 2 may be engaged only by the exact policy authorization above. Rung 3 remains `Missing`,
+    // so attention chunking is never set.
     config.attention_chunk_size = None;
     config.transformer_window = contract
         .engages(

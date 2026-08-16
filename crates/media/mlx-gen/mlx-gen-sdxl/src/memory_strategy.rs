@@ -165,10 +165,10 @@
 //!
 //! Each of these is a typed rejection rather than a silently narrowed execution:
 //!
-//! * **any** bounded-decode selection (`refuse_decode`, and again in `decode_tiling`) and **any**
-//!   bounded-attention selection (`attention_plan`) — rungs 2 and 3 are `Missing` here, and their
-//!   mechanisms are still present in the crate as the sweep's subject, so the path from "the code
-//!   exists" to "a render silently used it" is closed on both layers;
+//! * a bounded-decode selection without an exact admitted route/geometry policy (`refuse_decode`,
+//!   and again in `decode_tiling`) and **any** bounded-attention selection (`attention_plan`) — the
+//!   route-blind rung 2 fallback and rung 3 are `Missing`, so the path from "the code exists" to "a
+//!   render silently used it" remains closed while sealed SC-19753 rows can engage rung 2;
 //! * a transformer window **component** this family does not implement (`TextEncoder` / `Both`) —
 //!   never narrowed to `Dit`;
 //! * a transformer window **size** outside [`TRANSFORMER_WINDOW_SIZES`] (`validate_window`);
@@ -1049,7 +1049,8 @@ fn begin_with_cleanup(
     )?;
     config.load_shape = context.load_shape;
     mlx_gen::request_scope::authorize_selected_geometry_decode(&mut config, contract, context)?;
-    // Rungs 2 and 3 are `Missing`, so neither can be engaged and neither parameter is ever set.
+    // Rung 2 may be engaged only by the exact policy authorization above. Rung 3 remains `Missing`,
+    // so attention chunking is never set.
     config.attention_chunk_size = None;
     config.transformer_window = contract
         .engages(

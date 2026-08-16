@@ -32,7 +32,7 @@
 //! |---|---|---|
 //! | 1 | `rung_plan` ignores `memory.stage_residency`, falls back to the load-time default | `staged_residency_bounds_the_request_peak_and_preserves_output` |
 //! | 2 | the production refusal of the withheld rung removed | `the_withheld_rungs_are_refused_by_the_production_path` |
-//! | 2 quality | the resample loop restores whole-tail per-crop normalization | `layerwise_decode_quality_is_resampled_across_seeds` |
+//! | 2 quality | the layer-wise decoder stops using full-image GroupNorm statistics | `layerwise_decode_quality_is_resampled_across_seeds` |
 //! | 3 | the `sdpa` kernel discards the plan and always calls `AttentionPlan::UNBOUNDED` | `attention_chunking_is_measured_at_the_dit_seam` |
 //! | 4 | `finalize_block_stream` and `block_window` stubbed to no-ops — rung 4 declared and not executed | `transformer_window_sweep_and_streamed_output_identity` |
 //! | step-independence | [`measure`] scales the peak by the request's step count | `the_request_peak_is_step_independent` |
