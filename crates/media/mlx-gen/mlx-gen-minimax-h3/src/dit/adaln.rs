@@ -483,11 +483,30 @@ impl AdaLnCache {
             );
         }
 
-        // FORCE EVALUATION. Until this returns, every table above is an un-evaluated graph node
-        // holding a reference to its block's `adaln_proj.weight`, so dropping the projection would
-        // free nothing at all and the first denoise step would re-materialize all 26 GB. This is
-        // also the only point at which the precompute's cost is actually incurred — a timer that
-        // does not span this call reads ~0.
+        Self::from_layers(schedule, layers)
+    }
+
+    /// Seal a per-layer modulation table set into a cache, forcing evaluation and accounting bytes.
+    ///
+    /// Split out of [`Self::precompute`] for rung 4 (sc-18662): a
+    /// [`LoadShape::DeferredMaterialization`](mlx_gen::gen_core::LoadShape) load never holds the
+    /// 50-block stack, so it projects each window's tables inside
+    /// [`crate::block_stream::precompute_adaln_windowed`] and seals them here. Both paths therefore
+    /// produce a cache through one constructor rather than two, and the resident path's ordering
+    /// guarantee is stated once.
+    ///
+    /// **FORCE EVALUATION.** Until the `eval` below returns, every table is an un-evaluated graph
+    /// node holding a reference to its block's `adaln_proj.weight`, so dropping the projection would
+    /// free nothing at all and the first denoise step would re-materialize all 26 GB. It is also the
+    /// only point at which the precompute's cost is actually incurred — a timer that does not span
+    /// this call reads ~0. The windowed caller evals **per window** for the same reason and is not
+    /// excused by this call: by the time it reaches here its windows have already been released.
+    pub fn from_layers(schedule: TimestepSchedule, layers: Vec<AdaLnModulation>) -> Result<Self> {
+        if layers.is_empty() {
+            return Err(Error::Msg(
+                "minimax-h3 adaln cache: no modulation layers were projected".into(),
+            ));
+        }
         let flat: Vec<&Array> = layers.iter().flat_map(AdaLnModulation::tables).collect();
         mlx_rs::transforms::eval(flat)?;
 

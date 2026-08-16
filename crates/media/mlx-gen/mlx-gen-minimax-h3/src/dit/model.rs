@@ -39,8 +39,11 @@ use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::attention::{AttentionBudget, AttentionChunkAxis, AttentionPlan, BoundedAttention};
+use mlx_gen::block_residency::{run_windowed, BlockPlan};
 use mlx_gen::weights::Weights;
 use mlx_gen::{CancelFlag, Error, Result};
+
+use crate::block_stream::DitBlockStream;
 
 use crate::denoise::{JointStep, JointVelocity, PackedLayout};
 use crate::dit::adaln::{AdaLnCache, AdaLnResidency, TimestepSchedule};
@@ -59,7 +62,11 @@ pub struct MiniMaxH3Dit {
     cfg: MiniMaxH3DitConfig,
     projections: DitProjections,
     refiner: TokenRefiner,
+    /// Empty under [`LoadShape::DeferredMaterialization`] — the blocks live in `stream` instead.
     blocks: Vec<DitBlock>,
+    /// `Some` under a deferred load (sc-18662, rung 4). Mutually exclusive with a populated
+    /// `blocks`, which [`Self::assert_one_residency_mode`] holds.
+    stream: Option<DitBlockStream>,
     rope: MmRope,
     dtype: Dtype,
 }
@@ -81,9 +88,77 @@ impl MiniMaxH3Dit {
             projections,
             refiner,
             blocks,
+            stream: None,
             rope: MmRope::new(cfg.rope_freq_dim, cfg.rope_theta)?,
             dtype,
         })
+    }
+
+    /// Load **only** the 38 non-block tensors and describe the 600 block ones — rung 4's
+    /// [`LoadShape::DeferredMaterialization`] loader (sc-18662).
+    ///
+    /// The 17 input/output projections and the 21-tensor token refiner stay resident for the whole
+    /// request; see [`crate::block_stream`] for why windowing them would cost more than it bounds.
+    /// Everything under `transformer_blocks.` is left unread, so a `bf16` install that would map
+    /// 66.28 GB resident maps the projections and the refiner instead.
+    ///
+    /// The [`Weights`] map is dropped before returning. It is only lazily-mapped handles, but a
+    /// retained one would keep every block tensor reachable and make the first window's release
+    /// free nothing — the exact failure `run_windowed`'s contract names.
+    pub fn load_dir_deferred(dir: impl AsRef<Path>, dtype: Dtype) -> Result<Self> {
+        let dir = dir.as_ref();
+        let config_path = dir.join("config.json");
+        let text = std::fs::read_to_string(&config_path).map_err(|e| {
+            Error::Msg(format!(
+                "minimax-h3 dit: reading {}: {e}",
+                config_path.display()
+            ))
+        })?;
+        let cfg = MiniMaxH3DitConfig::from_diffusers_json(&text)?;
+        cfg.validate()?;
+        let stream = DitBlockStream::new(dir, dtype, cfg.clone())?;
+
+        let (projections, refiner) = {
+            let mut w = Weights::from_dir(dir)?;
+            let projections = DitProjections::from_weights(&mut w, &cfg)?;
+            let refiner = TokenRefiner::from_weights(&mut w, "token_refiner", &cfg, dtype)?;
+            (projections, refiner)
+        };
+
+        Ok(Self {
+            cfg: cfg.clone(),
+            projections,
+            refiner,
+            blocks: Vec::new(),
+            stream: Some(stream),
+            rope: MmRope::new(cfg.rope_freq_dim, cfg.rope_theta)?,
+            dtype,
+        })
+    }
+
+    /// The block stream backing a deferred load, or `None` for a resident one.
+    pub fn stream(&self) -> Option<&DitBlockStream> {
+        self.stream.as_ref()
+    }
+
+    /// Whether this load defers block materialization.
+    pub fn is_deferred(&self) -> bool {
+        self.stream.is_some()
+    }
+
+    /// The two residency modes are mutually exclusive, and a load that satisfied both would bound
+    /// nothing while reporting that it did.
+    fn assert_one_residency_mode(&self) -> Result<()> {
+        match (&self.stream, self.blocks.is_empty()) {
+            (Some(_), true) | (None, false) => Ok(()),
+            (Some(_), false) => Err(Error::Msg(
+                "minimax-h3 dit: a deferred load is holding resident blocks; rung 4 would bound                  nothing"
+                    .into(),
+            )),
+            (None, true) => Err(Error::Msg(
+                "minimax-h3 dit: a resident load has no blocks and no stream".into(),
+            )),
+        }
     }
 
     /// Load `transformer/` (or `transformer_ref/`) from a snapshot root: its `config.json` and its
@@ -140,14 +215,28 @@ impl MiniMaxH3Dit {
         &self.projections
     }
 
-    /// Blocks loaded.
+    /// Blocks the forward will run — the resident stack's length, or the streamed stack's declared
+    /// depth. A deferred load runs all 50 without ever holding them.
     pub fn num_layers(&self) -> usize {
+        match &self.stream {
+            Some(stream) => stream.n_blocks(),
+            None => self.blocks.len(),
+        }
+    }
+
+    /// Blocks currently materialized. `0` under a deferred load, which is the residency claim.
+    pub fn resident_blocks(&self) -> usize {
         self.blocks.len()
     }
 
     /// Whether every block still holds its AdaLN projection.
+    ///
+    /// **`false` under a deferred load**, and that is the honest answer rather than a vacuous
+    /// `all()` over an empty stack: a streamed block is materialized body-only, so no block holds a
+    /// projection at any instant. `[].iter().all(..)` returns `true`, which would report a deferred
+    /// load as pre-eviction.
     pub fn holds_adaln(&self) -> bool {
-        self.blocks.iter().all(DitBlock::holds_adaln)
+        !self.blocks.is_empty() && self.blocks.iter().all(DitBlock::holds_adaln)
     }
 
     /// `context_embedder` then the token refiner — the text rows of the packed sequence.
@@ -206,6 +295,28 @@ impl MiniMaxH3Dit {
         norm_out: &NormOutModulation,
         bounded: BoundedAttention<'_>,
     ) -> Result<(Array, Array)> {
+        self.forward_packed_windowed(packed, blocks, norm_out, bounded, None)
+    }
+
+    /// [`Self::forward_packed_bounded`] over a **windowed** block schedule — rung 4 (sc-18662).
+    ///
+    /// `window` is `Some((plan, cancel))` under a deferred load and `None` under a resident one.
+    /// Identical arithmetic either way: the same `DitBlock::forward_bounded` on the same modulation
+    /// in the same order, with the only difference being when each block's weights exist. That is
+    /// what lets `tests/block_window.rs` compare the two arms against each other rather than against
+    /// a golden.
+    ///
+    /// Passing a plan to a resident load, or omitting one on a deferred load, is a typed error
+    /// rather than a silent fallback: both mean the caller believes a residency mode the model is
+    /// not in, and the wrong one bounds nothing while reporting that it does.
+    pub fn forward_packed_windowed(
+        &self,
+        packed: &PackedForward<'_>,
+        blocks: BlockModulation<'_>,
+        norm_out: &NormOutModulation,
+        bounded: BoundedAttention<'_>,
+        window: Option<(&BlockPlan, &CancelFlag)>,
+    ) -> Result<(Array, Array)> {
         // 1. Per-modality input projections. The two patch projections are float32 in the published
         //    checkpoint; the text stream sets the packed sequence's dtype, as in the reference.
         let stream = packed.text_rows.dtype();
@@ -229,26 +340,19 @@ impl MiniMaxH3Dit {
         )?;
 
         // 2. The stack.
-        for (layer, block) in self.blocks.iter().enumerate() {
-            x = match blocks {
-                BlockModulation::Cached(cache) => block.forward_bounded(
-                    &x,
-                    cache.modulation(layer)?,
-                    packed.adaln_indices,
-                    &self.rope,
-                    packed.tables,
-                    bounded,
-                )?,
-                BlockModulation::Temb(temb) => block.forward_with_temb_bounded(
-                    &x,
-                    temb,
-                    packed.adaln_indices,
-                    &self.rope,
-                    packed.tables,
-                    bounded,
-                )?,
-            };
-        }
+        x = match window {
+            None => {
+                self.assert_one_residency_mode()?;
+                let mut x = x;
+                for (layer, block) in self.blocks.iter().enumerate() {
+                    x = self.run_block(block, layer, x, packed, blocks, bounded)?;
+                }
+                x
+            }
+            Some((plan, cancel)) => {
+                self.run_windowed_stack(x, packed, blocks, bounded, plan, cancel)?
+            }
+        };
 
         // 3. The shared output norm, then the two heads over their own rows. Gathering before
         //    projecting is bit-identical to the reference's project-then-gather (both heads are
@@ -268,6 +372,111 @@ impl MiniMaxH3Dit {
             seq_len,
         )?)?;
         Ok((video_out, audio_out))
+    }
+}
+
+impl MiniMaxH3Dit {
+    /// One block of the stack, under either residency mode.
+    fn run_block(
+        &self,
+        block: &DitBlock,
+        layer: usize,
+        x: Array,
+        packed: &PackedForward<'_>,
+        blocks: BlockModulation<'_>,
+        bounded: BoundedAttention<'_>,
+    ) -> Result<Array> {
+        match blocks {
+            BlockModulation::Cached(cache) => block.forward_bounded(
+                &x,
+                cache.modulation(layer)?,
+                packed.adaln_indices,
+                &self.rope,
+                packed.tables,
+                bounded,
+            ),
+            BlockModulation::Temb(temb) => block.forward_with_temb_bounded(
+                &x,
+                temb,
+                packed.adaln_indices,
+                &self.rope,
+                packed.tables,
+                bounded,
+            ),
+        }
+    }
+
+    /// The 50 blocks over a bounded window, through the shared driver.
+    ///
+    /// [`BlockModulation::Temb`] is **refused** here, and that is the rung's shape rather than an
+    /// omission: the `Temb` arm calls `DitBlock::modulation`, which needs `adaln_proj`, and a window
+    /// that materialized `adaln_proj` would re-read 39.3 % of the DiT every step for a table the
+    /// precompute already holds (see [`crate::block_stream`]). A deferred load projects its
+    /// modulation once through `block_stream::precompute_adaln_windowed` and denoises from the
+    /// cache.
+    fn run_windowed_stack(
+        &self,
+        x: Array,
+        packed: &PackedForward<'_>,
+        blocks: BlockModulation<'_>,
+        bounded: BoundedAttention<'_>,
+        plan: &BlockPlan,
+        cancel: &CancelFlag,
+    ) -> Result<Array> {
+        let stream = self.stream.as_ref().ok_or_else(|| {
+            Error::Msg(
+                "minimax-h3 dit: a block window was supplied to a RESIDENT load. Load with                  `load_dir_deferred` for rung 4, or drop the window."
+                    .into(),
+            )
+        })?;
+        self.assert_one_residency_mode()?;
+        let BlockModulation::Cached(cache) = blocks else {
+            return Err(Error::Msg(
+                "minimax-h3 dit: a windowed stack needs the precomputed AdaLN cache; the resident                  `Temb` arm projects per block and would pull adaln_proj into every window"
+                    .into(),
+            ));
+        };
+        if plan.n_blocks() != stream.n_blocks() {
+            return Err(Error::Msg(format!(
+                "minimax-h3 dit: the block plan covers {} blocks, the streamed stack has {}",
+                plan.n_blocks(),
+                stream.n_blocks()
+            )));
+        }
+        if cache.num_layers() != stream.n_blocks() {
+            return Err(Error::Msg(format!(
+                "minimax-h3 dit: the AdaLN cache carries {} layers, the streamed stack has {}",
+                cache.num_layers(),
+                stream.n_blocks()
+            )));
+        }
+
+        run_windowed(
+            plan,
+            cancel,
+            x,
+            || stream.open(),
+            |mut hidden: Array, view: &mut Weights, range: std::ops::Range<usize>| {
+                for layer in range {
+                    let block = stream.materialize(view, layer)?;
+                    hidden = self.run_block(
+                        &block,
+                        layer,
+                        hidden,
+                        packed,
+                        BlockModulation::Cached(cache),
+                        bounded,
+                    )?;
+                    // The block drops per iteration rather than per window: at `window > 1` the
+                    // alternative holds every block of the window plus the activation.
+                }
+                Ok(hidden)
+            },
+            // LOAD-BEARING: MLX is lazy, so the carried activation still references this window's
+            // weights until it is forced. Measured elsewhere at 8.0 MiB with the guard against
+            // 238.4 MiB without, with correct output either way — silent, not loud.
+            |hidden: &Array| mlx_rs::transforms::eval([hidden]).map_err(Into::into),
+        )
     }
 }
 
@@ -433,6 +642,13 @@ pub struct JointDit {
     attention_budget: AttentionBudget,
     attention_axis: AttentionChunkAxis,
     attention_cancel: Option<CancelFlag>,
+    /// `Some` under rung 4 (sc-18662): the per-step block window the stack runs over. `None` is the
+    /// resident stack. Set by [`JointDit::new_windowed`] and never afterwards — a residency mode
+    /// that could change mid-request would leave half a render bounded.
+    block_window: Option<BlockPlan>,
+    /// The cancel flag `run_windowed` checks at every window boundary. Rung 4 is the *other* place
+    /// (with rung 3's chunk boundaries) a cancel can land inside a single DiT forward.
+    window_cancel: CancelFlag,
 }
 
 impl JointDit {
@@ -535,7 +751,92 @@ impl JointDit {
             attention_budget: AttentionBudget::UNBOUNDED,
             attention_axis: AttentionChunkAxis::Heads,
             attention_cancel: None,
+            block_window: None,
+            window_cancel: CancelFlag::default(),
         })
+    }
+
+    /// Build the velocity model over a **deferred** DiT with a bounded block window — rung 4
+    /// (sc-18662).
+    ///
+    /// The two differences from [`Self::new`] are both forced by the residency, not chosen:
+    ///
+    /// * the AdaLN modulation is projected through
+    ///   [`crate::block_stream::precompute_adaln_windowed`] rather than
+    ///   `AdaLnCache::precompute_and_evict`, because there is no resident stack to evict *from* —
+    ///   the deferred load never held the projections. `released_bytes` is therefore `0`, and that
+    ///   is the honest figure: reporting a release that did not happen is the over-declared-saving
+    ///   direction the contract refuses;
+    /// * [`AdaLnResidency::Resident`] is refused. Its whole shape is keeping `adaln_proj` loaded so
+    ///   a run-state-dependent sampler can project per step, which is precisely the residency rung 4
+    ///   removes.
+    pub fn new_windowed(
+        dit: MiniMaxH3Dit,
+        layout: PackedLayout,
+        context: &Array,
+        schedule: TimestepSchedule,
+        residency: AdaLnResidency,
+        window: usize,
+        cancel: CancelFlag,
+    ) -> Result<Self> {
+        if residency != AdaLnResidency::PrecomputeAndEvict {
+            return Err(Error::Msg(
+                "minimax-h3 dit: a windowed load cannot use AdaLnResidency::Resident — keeping                  adaln_proj loaded is exactly the residency rung 4 removes"
+                    .into(),
+            ));
+        }
+        let stream = dit
+            .stream()
+            .ok_or_else(|| {
+                Error::Msg(
+                    "minimax-h3 dit: JointDit::new_windowed needs a deferred load; use                      MiniMaxH3Dit::load_dir_deferred"
+                        .into(),
+                )
+            })?
+            .clone();
+        let plan = stream.plan(window)?;
+
+        let text_rows = dit.embed_context(context)?;
+        if text_rows.shape()[1] != layout.num_text_tokens() {
+            return Err(Error::Msg(format!(
+                "minimax-h3 dit: the context carries {} rows but the layout declares {} text rows",
+                text_rows.shape()[1],
+                layout.num_text_tokens()
+            )));
+        }
+        let tables = dit.rope.tables(layout.position_ids(), dit.dtype)?;
+
+        // One `temb` for both tables, captured rather than re-embedded — a second
+        // `embed_timesteps` call would be a second chance to bind the wrong timesteps.
+        let temb = dit.embed_timesteps(schedule.distinct_timesteps())?;
+        let cache = crate::block_stream::precompute_adaln_windowed(
+            &stream, &plan, &cancel, schedule, &temb,
+        )?;
+        let norm_out = dit.projections.norm_out.modulation(&temb)?;
+        mlx_rs::transforms::eval([&norm_out.shift, &norm_out.scale])?;
+
+        Ok(Self {
+            dit,
+            layout,
+            tables,
+            text_rows,
+            modulation: Modulation::Cached(Box::new(cache)),
+            norm_out_modulation: Some(norm_out),
+            resident_adaln_indices: None,
+            // Nothing was released, because nothing was ever resident.
+            released_bytes: 0,
+            forwards: 0,
+            attention_budget: AttentionBudget::UNBOUNDED,
+            attention_axis: AttentionChunkAxis::Heads,
+            attention_cancel: None,
+            block_window: Some(plan),
+            window_cancel: cancel,
+        })
+    }
+
+    /// The block window in force, or `None` on a resident stack.
+    pub fn block_window(&self) -> Option<&BlockPlan> {
+        self.block_window.as_ref()
     }
 
     /// Select the rung-3 bounded-attention plan for every subsequent step (sc-18661).
@@ -647,8 +948,15 @@ impl JointVelocity for JointDit {
                 ))
             }
         };
-        self.dit
-            .forward_packed_bounded(&packed, blocks, &norm_out, self.bounded_attention())
+        self.dit.forward_packed_windowed(
+            &packed,
+            blocks,
+            &norm_out,
+            self.bounded_attention(),
+            self.block_window
+                .as_ref()
+                .map(|plan| (plan, &self.window_cancel)),
+        )
     }
 }
 

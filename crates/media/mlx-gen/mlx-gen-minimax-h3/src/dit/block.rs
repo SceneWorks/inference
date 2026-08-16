@@ -144,7 +144,11 @@ impl AdaLnProjection {
         self.linear.is_quantized()
     }
 
-    fn from_weights(
+    /// `pub(crate)` for rung 4 (sc-18662): [`crate::block_stream::precompute_adaln_windowed`]
+    /// materializes projections one window at a time, which is a *different* call site from
+    /// [`DitBlock::from_weights`] and cannot go through it — a windowed precompute must load the
+    /// projection without the ten body tensors that would come with a whole block.
+    pub(crate) fn from_weights(
         w: &mut Weights,
         prefix: &str,
         cfg: &MiniMaxH3DitConfig,
@@ -260,19 +264,53 @@ impl DitBlock {
         cfg: &MiniMaxH3DitConfig,
         dtype: Dtype,
     ) -> Result<Self> {
+        let mut block = Self::from_weights_body_only(w, prefix, cfg, dtype)?;
+        block.adaln_proj = Some(AdaLnProjection::from_weights(
+            w,
+            &format!("{prefix}.adaln_proj.linear"),
+            cfg,
+            dtype,
+        )?);
+        Ok(block)
+    }
+
+    /// Load the **ten** body tensors of block `prefix` and none of the two `adaln_proj` ones — a
+    /// block that is already in the post-eviction state rather than one that reaches it (sc-18662).
+    ///
+    /// This is what rung 4's window materializes per denoise step. The distinction is the whole
+    /// point: `adaln_proj` is 39.3 % of the DiT's bytes and the precompute has already consumed it
+    /// once per *request*, so a window that re-read it would re-materialize 26.02 GB (bf16) across
+    /// each step for a table it already holds — 50x the work the rung exists to avoid, and invisible
+    /// to any correctness assertion because the output would be identical.
+    ///
+    /// [`Self::modulation`] and [`Self::forward_with_temb`] therefore return the same typed error on
+    /// a block built this way as on an evicted one, which is correct: they mean the same thing.
+    pub fn from_weights_body_only(
+        w: &mut Weights,
+        prefix: &str,
+        cfg: &MiniMaxH3DitConfig,
+        dtype: Dtype,
+    ) -> Result<Self> {
         cfg.validate()?;
         Ok(Self {
             norm1: RmsNorm::from_weights(w, &format!("{prefix}.norm1"), cfg.norm_eps, dtype)?,
             attn: DitAttention::from_weights(w, &format!("{prefix}.attn"), cfg, dtype)?,
             norm2: RmsNorm::from_weights(w, &format!("{prefix}.norm2"), cfg.norm_eps, dtype)?,
             ff: DitFeedForward::from_weights(w, &format!("{prefix}.ff"), dtype)?,
-            adaln_proj: Some(AdaLnProjection::from_weights(
-                w,
-                &format!("{prefix}.adaln_proj.linear"),
-                cfg,
-                dtype,
-            )?),
+            adaln_proj: None,
         })
+    }
+
+    /// The ten body tensor names — [`Self::names`] minus the `adaln_proj` pair.
+    ///
+    /// Derived by subtraction from the same two lists the loaders use, so a tensor added to either
+    /// side cannot fall out of this set silently.
+    pub fn body_names(prefix: &str) -> Vec<String> {
+        let adaln = AdaLnProjection::names(&format!("{prefix}.adaln_proj.linear"));
+        Self::names(prefix)
+            .into_iter()
+            .filter(|name| !adaln.contains(name))
+            .collect()
     }
 
     /// This block's AdaLN projection, or `None` once it has been evicted.
