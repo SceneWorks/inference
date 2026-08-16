@@ -41,6 +41,16 @@
 //! over the head axis, so the two axis orders are numerically identical — but keeping each family's
 //! *own* order means the migration is provably a no-op rather than "should be a no-op".
 //!
+//! ## Fusion is opt-in
+//!
+//! Knob 9's [`FusedQkvProjection`] is gated on [`set_fused_qkv`], which **defaults to `false`**
+//! (Michael, 2026-08-16). A family that adopted the fused projection therefore runs its three
+//! separate projections — bit-identically to its pre-P4 code — until a caller enables the toggle
+//! before loading weights. The reason is reproducibility: the fused and unfused arms differ in the
+//! GEMM's `N`, MLX selects its Metal tile shape from `(M, N, K)`, and off the self-hosted NAX build
+//! the two can land a few ULP apart, which a chaos sampler turns into a different image at the same
+//! seed. Nothing else in this module is gated — the prologue primitive always runs.
+//!
 //! ## What this module deliberately does NOT do
 //!
 //! * **It does not pack QK-norm scales.** `config/tier-integrity.jsonc` (SceneWorks) and its
@@ -837,10 +847,39 @@ impl StreamOrder {
 thread_local! {
     /// Request/thread-scoped, matching [`crate::nn::set_compile_glue`]'s scope (sc-18316): a render
     /// loop is synchronous, so a per-thread toggle cannot race a concurrent render.
-    static FUSED_QKV: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    ///
+    /// **Defaults to `false` — fusion is opt-in.** See [`set_fused_qkv`] for why.
+    static FUSED_QKV: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Enable/disable read-side QKV projection fusion on the current thread.
+/// **Fusion is off unless a caller turns it on** (Michael, 2026-08-16).
+///
+/// ## Why opt-in
+///
+/// The fused and the unfused arm are *algebraically* identical, and their **tensors** are equal
+/// byte-for-byte (see [`FusedQkvProjection`]). Their **outputs** are not equal on every host: MLX
+/// picks its Metal GEMM tile shape — and therefore its accumulation order — from `(M, N, K)`, and
+/// the two arms differ in `N` by construction (`3·out` versus `out`). Float addition is not
+/// associative, so off the self-hosted macOS 26.2 NAX build the projection can land a few ULP apart,
+/// and a chaos sampler turns a few ULP into a visibly different image at the same seed. That is a
+/// reproducibility regression, and the speedup it would buy is P6 output that does not exist yet, so
+/// defaulting on would trade a measured guarantee for an unmeasured one. When P6 has numbers, the
+/// decision to flip this constant is a one-line, deliberate edit with a test
+/// (`qkv/tests.rs`'s `fusion_is_opt_in_so_an_eligible_triple_is_split_by_default`) that must be
+/// changed alongside it.
+///
+/// ## How to opt in
+///
+/// Call this (or hold a [`FusedQkvGuard`], which restores the prior value on drop) **before the
+/// weights are loaded**, and keep it set across every [`FusedQkvProjection::repack`] the load path
+/// runs — `quantize` and `cast_weights` both re-pack, so a guard scoped to the constructor alone is
+/// not enough:
+///
+/// ```ignore
+/// let _fused = mlx_gen::qkv::FusedQkvGuard::set(true);
+/// let model = Family::from_weights(&weights, /* … */)?; // packs where the predicate allows
+/// ```
 ///
 /// The toggle is read when a [`FusedQkvProjection`] chooses its representation — at
 /// [`FusedQkvProjection::new`] and [`FusedQkvProjection::repack`] — **not** on every forward. That
@@ -848,18 +887,19 @@ thread_local! {
 /// both (see [`FusedQkvProjection`]), so "unfused" is a different object rather than a different
 /// branch over the same tensors. A benchmark A/B therefore sets the toggle before loading each arm,
 /// which is exactly what production does, and the fused-off baseline costs no extra slicing.
-///
-/// Production leaves this at its default (`true`).
 pub fn set_fused_qkv(on: bool) {
     FUSED_QKV.set(on);
 }
 
-/// Whether QKV projection fusion is currently enabled on this thread.
+/// Whether QKV projection fusion is currently enabled on this thread. `false` unless a caller opted
+/// in — see [`set_fused_qkv`].
 pub fn fused_qkv() -> bool {
     FUSED_QKV.get()
 }
 
-/// RAII guard restoring the prior [`fused_qkv`] value on drop — including on an early `?`.
+/// RAII guard restoring the prior [`fused_qkv`] value on drop — including on an early `?`. **This
+/// is the opt-in handle**: hold one across the whole load (construction *and* every `quantize` /
+/// `cast_weights`, each of which re-packs), not just across the constructor.
 #[must_use = "dropping the guard restores the prior fused-QKV setting"]
 pub struct FusedQkvGuard {
     prev: bool,
@@ -883,7 +923,10 @@ impl Drop for FusedQkvGuard {
 /// family that *expects* fusion can assert it, and so the Boogu case is legible.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NoFusion {
-    /// Fusion is switched off on this thread ([`set_fused_qkv`]) — the P6 baseline arm.
+    /// Fusion is switched off on this thread — the P6 baseline arm **and the default**, because
+    /// fusion is opt-in ([`set_fused_qkv`]). A projection that a caller expected to be packed and
+    /// finds reporting this reason did not hit an unsafe shape: nobody turned the toggle on before
+    /// the weights were loaded.
     Disabled,
     /// One or more of q/k/v carries a LoRA/LoKr adapter. **The designed-against failure is silently
     /// dropping it**, so fusion is refused instead — see [`FusedQkvProjection`].
@@ -967,7 +1010,20 @@ enum Backing {
 /// **Adapter- and quantization-aware fused QKV projection.**
 ///
 /// Three logically separate `to_q` / `to_k` / `to_v` projections presented as one call, backed by a
-/// single packed matrix when — and only when — that is provably safe.
+/// single packed matrix when — and only when — a caller has **opted in** and that is provably safe.
+///
+/// ## Opt-in (the default is split)
+///
+/// [`set_fused_qkv`] defaults to `false`, so a `FusedQkvProjection` built with no explicit opt-in
+/// holds the three separate bases and reports [`NoFusion::Disabled`]. Everything below — the packing
+/// predicate, the adapter guard, the effective-bits argument — describes what happens **once fusion
+/// is enabled**; with it off this type is a thin pass-through over three [`AdaptableLinear`]s and is
+/// bit-identical to the code each family open-coded before P4.
+///
+/// The default is off because the fused and unfused arms can differ by a few ULP on a host whose
+/// Metal GEMM kernel selection differs across the two output widths, and a chaos sampler cascades
+/// that into a visibly different image at the same seed — a reproducibility regression traded
+/// against a speedup P6 has not yet measured. [`set_fused_qkv`] carries the full argument.
 ///
 /// ## One representation, not two
 ///
@@ -1060,7 +1116,8 @@ impl std::fmt::Debug for FusedQkvProjection {
 }
 
 impl FusedQkvProjection {
-    /// Wrap three projections and attempt the pack immediately, honouring [`fused_qkv`].
+    /// Wrap three projections and attempt the pack immediately, honouring [`fused_qkv`] — which is
+    /// `false` unless the caller opted in, so this leaves the split backing by default.
     pub fn new(q: AdaptableLinear, k: AdaptableLinear, v: AdaptableLinear) -> Self {
         let mut me = Self {
             backing: Backing::Split(Box::new(SplitQkv { q, k, v })),
@@ -1242,10 +1299,11 @@ impl FusedQkvProjection {
 
     /// One `[.., q_out + k_out + v_out]` projection output, ready for [`QkvSource::Packed`].
     ///
-    /// Packed: one matmul. Split: three forwards concatenated. The two are **algebraically
-    /// identical** — the packed matrix is the row-wise concatenation of the three bases and a
-    /// matmul's output rows are independent — and they are bit-identical whenever MLX selects the
-    /// same Metal GEMM kernel for both output widths.
+    /// Packed: one matmul. Split: three forwards concatenated — **and split is what a caller gets
+    /// without an explicit [`set_fused_qkv(true)`](set_fused_qkv)**, because fusion is opt-in. The
+    /// two are **algebraically identical** — the packed matrix is the row-wise concatenation of the
+    /// three bases and a matmul's output rows are independent — and they are bit-identical whenever
+    /// MLX selects the same Metal GEMM kernel for both output widths.
     ///
     /// They are **not** bit-identical in general, and that is a property of the backend rather than
     /// of this type: MLX chooses its GEMM tile shape (and therefore its accumulation order) from
@@ -1255,6 +1313,10 @@ impl FusedQkvProjection {
     /// different kernel set and can land a few ULP apart. `qkv/tests.rs`'s `agree` helper is where
     /// that bound lives, and it is set far below what a *slicing* defect would produce, so a wrong
     /// row range still fails loudly.
+    ///
+    /// **That residual ULP divergence is exactly why the default is off**: it reaches the sampler,
+    /// and a chaos sampler turns it into a different image at the same seed. A caller that opts in
+    /// is accepting that trade for the geometries it has measured.
     ///
     /// The byte-level guarantee this feature actually rests on is one level down and is exact
     /// everywhere: the packed **tensors** are the concatenation of the parts' tensors, and

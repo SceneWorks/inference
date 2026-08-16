@@ -69,10 +69,13 @@ fn plus1(a: &Array) -> Result<Array> {
 /// Boogu is the tree's **production consumer of [`FusedQkvProjection`]**, and the family that proves
 /// both of its arms (SC-18319):
 ///
-/// * **Dense** — `to_q`/`to_k`/`to_v` all read the same `[b, s, hidden]` activation with the same
-///   `in_features`, so they pack into one `[q_out + kv_out + kv_out, hidden]` matrix and the block
-///   runs one matmul instead of three. Residency is unchanged: the packed matrix *replaces* the
-///   three bases rather than shadowing them.
+/// * **Dense, with fusion opted in** — `to_q`/`to_k`/`to_v` all read the same `[b, s, hidden]`
+///   activation with the same `in_features`, so they pack into one
+///   `[q_out + kv_out + kv_out, hidden]` matrix and the block runs one matmul instead of three.
+///   Residency is unchanged: the packed matrix *replaces* the three bases rather than shadowing
+///   them. Fusion is opt-in (`mlx_gen::qkv::set_fused_qkv` defaults to off), so a load with no
+///   `FusedQkvGuard::set(true)` in scope keeps the three projections — bit-identically to boogu's
+///   pre-P4 code.
 /// * **Quantized** — the pack is **refused**, with boogu's real numbers. `crate::quant::GROUP_SIZE`
 ///   is 32 (explicit and non-default, because the DiT hidden 3360 is not divisible by 64) and the kv
 ///   projections are `out = kv_heads · head_dim = 7 · 120 = 840`, with `840 % 32 = 8`. Concatenating
@@ -118,8 +121,13 @@ impl SelfAttention {
         })
     }
 
-    /// `true` when this block's q/k/v are backed by one packed matrix — dense boogu. Q4/Q8 boogu is
-    /// refused by the group-32 rule above, which the crate's tests assert at the real widths.
+    /// `true` when this block's q/k/v are backed by one packed matrix — dense boogu **with fusion
+    /// opted in**. Q4/Q8 boogu is refused by the group-32 rule above, which the crate's tests assert
+    /// at the real widths.
+    ///
+    /// `false` alone is ambiguous now that fusion is opt-in: it means either boogu's group-32
+    /// refusal or "nobody called `mlx_gen::qkv::set_fused_qkv(true)`". This module's tests
+    /// discriminate by reading `self.qkv.refusal()` directly.
     pub fn fusion_engaged(&self) -> bool {
         self.qkv.fusion_engaged()
     }
@@ -711,6 +719,12 @@ mod tests {
     /// pack into one matrix and the block runs one matmul instead of three. **Quantized**:
     /// `GROUP_SIZE = 32` and the kv `out = 7 · 120 = 840` with `840 % 32 = 8`, so the pack is
     /// refused rather than silently changing effective bits. Fusing must not move a single bit.
+    ///
+    /// Fusion is **opt-in** (`mlx_gen::qkv::set_fused_qkv` defaults to off), so this test holds a
+    /// guard across the whole build — otherwise every arm below would pass while exercising nothing,
+    /// and the quantized arm's refusal would be `Disabled` rather than the group-32 rule it exists
+    /// to prove. Both halves are asserted: the dense arm asserts it actually packed, and the
+    /// quantized arm asserts the refusal **by name**.
     #[test]
     fn self_attention_packs_while_dense_and_is_refused_once_quantized() {
         // The divisibility facts the decision rests on, asserted as arithmetic so a constant drift
@@ -728,11 +742,15 @@ mod tests {
             "the query projection alone would align — a triple packs or it does not"
         );
 
+        // The opt-in, held across construction AND the `quantize` re-pack below.
+        let _fused_qkv = mlx_gen::qkv::FusedQkvGuard::set(true);
+
         let hidden = 320;
         let mut fused = build(hidden);
         assert!(
             fused.fusion_engaged(),
-            "a dense boogu self-attention must pack its q/k/v into one matrix"
+            "a dense boogu self-attention must pack its q/k/v into one matrix: {:?}",
+            fused.qkv.refusal()
         );
 
         let s = 4;
@@ -744,8 +762,17 @@ mod tests {
         // Unfusing must not change a single bit — the packed matrix is the row-wise concatenation
         // of the three bases and a matmul's rows are independent.
         let mut split = build(hidden);
+        assert!(
+            split.fusion_engaged(),
+            "the baseline arm must START packed, or 'unfusing changed nothing' is vacuous"
+        );
         split.unfuse().expect("unfuse");
         assert!(!split.fusion_engaged(), "the baseline arm must be split");
+        assert_eq!(
+            split.qkv.refusal(),
+            Some(&mlx_gen::qkv::NoFusion::Unfused),
+            "split because it was unfused, not because nobody opted in"
+        );
         let split_out = split.forward(&x, &cos, &sin).expect("split forward");
         assert_eq!(packed_out.shape(), split_out.shape());
         assert!(
@@ -755,7 +782,8 @@ mod tests {
             "fusing boogu's q/k/v must be bit-exact"
         );
 
-        // Quantizing must REFUSE the pack on the misaligned kv output axis.
+        // Quantizing must REFUSE the pack on the misaligned kv output axis — and the toggle is
+        // still on, so the refusal cannot be `Disabled`.
         fused.quantize(8).expect("q8");
         assert!(
             !fused.fusion_engaged(),
@@ -763,6 +791,25 @@ mod tests {
              rather than papered over",
             KV_HEADS * HEAD_DIM,
             crate::quant::GROUP_SIZE
+        );
+        assert_eq!(
+            fused.qkv.refusal(),
+            Some(&mlx_gen::qkv::NoFusion::OutFeaturesNotGroupAligned {
+                out: KV_HEADS * HEAD_DIM,
+                group: crate::quant::GROUP_SIZE,
+            }),
+            "the refusal must be boogu's group-alignment rule, not the opt-in toggle"
+        );
+
+        // …and the by-construction claim is independent of the toggle: with fusion opted OUT the
+        // block is split too, for the other reason. Both arms of the refusal are reachable.
+        drop(_fused_qkv);
+        let off = build(hidden);
+        assert!(!off.fusion_engaged());
+        assert_eq!(
+            off.qkv.refusal(),
+            Some(&mlx_gen::qkv::NoFusion::Disabled),
+            "with no opt-in the block is split because fusion is off, and says so"
         );
     }
 }
