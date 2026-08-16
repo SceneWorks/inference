@@ -76,6 +76,24 @@ const VAE_ENCODE_TENSORS: usize = 118;
 /// sc-19008 put it rather than tightened. A per-device bound would be false precision at a 1.07x
 /// separation: one bound weakens neither device.
 ///
+/// ⚠️ **THE CUDA ARM IS UNMEASURED, AND THAT IS A DECISION RATHER THAN AN OVERSIGHT** (sc-19455).
+/// The two columns above are the only two devices this test has ever run on. CUDA is not among
+/// them, no lane executes this test at all, and **none is being added**: wiring one would put a
+/// real-weight comparison on every run of a lane, which is the cost the "no new gates" direction is
+/// deliberately removing (the same ruling stripped `cuda_quant_smoke`'s wiring in sc-19545). So the
+/// honest statement is the one recorded here — *nothing measures this on CUDA* — rather than a
+/// number implied by a bound that was never taken there. Do not read the 10.8x headroom as a CUDA
+/// claim; read it as a two-device measurement plus a 1.07x observed cost for one backend swap.
+///
+/// If that ever needs closing, it is small and it is not a research task: place the ~5.4 MB
+/// reference (`crates/media/mlx-gen/tools/dump_minimax_h3_video_vae_encode_real.py`, run against
+/// the snapshot on a box that has torch) on the Windows runner, point
+/// `MINIMAX_H3_VIDEO_VAE_ENCODE_REFERENCE` at it, and add one `call :run_one` line for this test to
+/// the existing `candle-minimax-h3` job. The snapshot side is already done — `vars`
+/// `CANDLE_MINIMAX_H3_SNAPSHOT` **does** exist (set 2026-08-15), so that job's own header comment
+/// claiming "the variable does not exist on this repository" is stale; the encode reference is the
+/// only genuine blocker left.
+///
 /// **The `std`-amplification story is half right, and the wrong half was load-bearing.** `std` is
 /// `exp(0.5 * logvar)` (`vae_encoder.rs`), and against a *systematic* drift it really does amplify:
 /// a 1e-3 relative drift injected at `DiagonalGaussian::from_parameters` comes back as 1.000e-3 on
