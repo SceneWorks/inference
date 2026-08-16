@@ -26,8 +26,16 @@ use crate::quant::lin;
 fn materialize_host_adapters(host: &mut impl AdaptableHost) -> Result<()> {
     for path in host.adaptable_paths() {
         let parts: Vec<&str> = path.split('.').collect();
-        if let Some(linear) = host.adaptable_mut(&parts) {
-            linear.materialize_adapters()?;
+        // SC-18319 — this walks EVERY projection, and `materialize_adapters` on an empty stack is a
+        // no-op, so the PROBE half decides and the `&mut` is taken only where there is a stack to
+        // evaluate. Resolving `&mut`-first would unfuse a whole model to evaluate nothing.
+        if host
+            .adaptable_facts(&parts)
+            .is_some_and(|f| f.adapter_count > 0)
+        {
+            host.adaptable_mut(&parts)
+                .expect("resolved through the probe above")
+                .materialize_adapters()?;
         }
     }
     Ok(())

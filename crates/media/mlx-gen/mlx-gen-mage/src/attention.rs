@@ -34,16 +34,21 @@
 //! for no numerical gain, and native-resolution packing (a 50k-token budget upstream) makes that
 //! worse quadratically.
 
-use mlx_rs::fast::rms_norm;
-use mlx_rs::ops::{concatenate_axis, split, split_sections, stack_axis};
+use mlx_rs::ops::{concatenate_axis, split_sections};
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear, LinearFacts};
 use mlx_gen::attention::{sdpa_budgeted_bhsd, AttentionPlan};
+use mlx_gen::qkv::{
+    self, AttnPrepSpec, FusedQkvProjection, QkNormSpec, QkvHeads, QkvPart, QkvSource, RopeDtype,
+    RopeSpec, RopeStyle, RopeTables, StreamOrder,
+};
 use mlx_gen::weights::Weights;
-use mlx_gen::{nn, Error, Result};
+use mlx_gen::{Error, Result};
 
-use crate::rope_embedder::{PackContext, RopeTable};
+use crate::rope_embedder::PackContext;
+#[cfg(test)]
+use crate::rope_embedder::RopeTable;
 use crate::transformer::Linear;
 
 /// The two token streams a dual-stream block carries, each `[1, tokens, dim]`.
@@ -62,13 +67,13 @@ pub struct DualStream {
 /// `Attention(query_dim=dim, added_kv_proj_dim=dim, …, processor=MageDoubleStreamAttnProcessor())`.
 #[derive(Debug, Clone)]
 pub struct MageJointAttention {
-    to_q: Linear,
-    to_k: Linear,
-    to_v: Linear,
+    /// SC-18319 P4: the image stream's `to_q`/`to_k`/`to_v` behind one adapter/quant-aware packed
+    /// matrix. All three read the SAME activation (`stream.img`), which is what makes them fusable;
+    /// the text triple below is a second, independent projection because it reads `stream.txt`.
+    img_qkv: FusedQkvProjection,
     to_out: Linear,
-    add_q_proj: Linear,
-    add_k_proj: Linear,
-    add_v_proj: Linear,
+    /// The text stream's `add_q_proj`/`add_k_proj`/`add_v_proj`, likewise packed.
+    txt_qkv: FusedQkvProjection,
     to_add_out: Linear,
     norm_q: Array,
     norm_k: Array,
@@ -82,35 +87,33 @@ pub struct MageJointAttention {
 
 impl MageJointAttention {
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
-        for linear in [
-            &mut self.to_q,
-            &mut self.to_k,
-            &mut self.to_v,
-            &mut self.to_out,
-            &mut self.add_q_proj,
-            &mut self.add_k_proj,
-            &mut self.add_v_proj,
-            &mut self.to_add_out,
-        ] {
+        // The fused projections unfuse, quantize each base and re-pack — the packed matrix is built
+        // from the bases, so it is not a view of them.
+        self.img_qkv.quantize(bits, None)?;
+        self.txt_qkv.quantize(bits, None)?;
+        for linear in [&mut self.to_out, &mut self.to_add_out] {
             linear.quantize(bits)?;
         }
         Ok(())
     }
 
+    /// Counts LOGICAL projections, still eight — a packed triple is one matrix but three
+    /// projections, and `part_facts` reports each one's tier without unfusing (SC-18319).
     pub(crate) fn quantized_linear_count(&self) -> usize {
-        [
-            &self.to_q,
-            &self.to_k,
-            &self.to_v,
-            &self.to_out,
-            &self.add_q_proj,
-            &self.add_k_proj,
-            &self.add_v_proj,
-            &self.to_add_out,
-        ]
-        .into_iter()
-        .filter(|linear| linear.is_quantized())
-        .count()
+        let fused = [&self.img_qkv, &self.txt_qkv]
+            .into_iter()
+            .flat_map(|proj| {
+                [QkvPart::Q, QkvPart::K, QkvPart::V]
+                    .into_iter()
+                    .map(move |part| proj.part_facts(part).is_quantized)
+            })
+            .filter(|q| *q)
+            .count();
+        fused
+            + [&self.to_out, &self.to_add_out]
+                .into_iter()
+                .filter(|linear| linear.is_quantized())
+                .count()
     }
 
     /// Load from `{prefix}.{to_q,to_k,to_v,to_out.0,add_q_proj,add_k_proj,add_v_proj,to_add_out}`
@@ -130,14 +133,18 @@ impl MageJointAttention {
         let norm = |name: &str| -> Result<Array> {
             Ok(w.require(&format!("{prefix}.{name}.weight"))?.clone())
         };
+        // The fused triples take the bare `AdaptableLinear` (`Linear`'s cached in/out/dtype are never
+        // read for q/k/v — only `forward` and the adapter handle are), so they load through the same
+        // `quant::lin` auto-detecting loader `Linear::from_weights` uses internally.
+        let raw = |name: &str| crate::quant::lin(w, &format!("{prefix}.{name}"), true);
         Ok(Self {
-            to_q: lin("to_q")?,
-            to_k: lin("to_k")?,
-            to_v: lin("to_v")?,
+            img_qkv: FusedQkvProjection::new(raw("to_q")?, raw("to_k")?, raw("to_v")?),
             to_out: lin("to_out.0")?,
-            add_q_proj: lin("add_q_proj")?,
-            add_k_proj: lin("add_k_proj")?,
-            add_v_proj: lin("add_v_proj")?,
+            txt_qkv: FusedQkvProjection::new(
+                raw("add_q_proj")?,
+                raw("add_k_proj")?,
+                raw("add_v_proj")?,
+            ),
             to_add_out: lin("to_add_out")?,
             norm_q: norm("norm_q")?,
             norm_k: norm("norm_k")?,
@@ -160,16 +167,9 @@ impl MageJointAttention {
     }
 
     pub fn cast_weights(&mut self, dtype: Dtype) -> Result<()> {
-        for lin in [
-            &mut self.to_q,
-            &mut self.to_k,
-            &mut self.to_v,
-            &mut self.to_out,
-            &mut self.add_q_proj,
-            &mut self.add_k_proj,
-            &mut self.add_v_proj,
-            &mut self.to_add_out,
-        ] {
+        self.img_qkv.cast_weights(dtype)?;
+        self.txt_qkv.cast_weights(dtype)?;
+        for lin in [&mut self.to_out, &mut self.to_add_out] {
             lin.cast_weights(dtype)?;
         }
         for norm in [
@@ -206,34 +206,41 @@ impl MageJointAttention {
         expect_packed(&stream.img, img_tokens, dim, "image")?;
         expect_packed(&stream.txt, txt_tokens, dim, "text")?;
 
-        // `[1, S, D]` → `[S, heads, head_dim]` (`unflatten(-1, (heads, -1))` then `flatten(0, 1)`).
-        let ishape = [img_tokens, self.heads, self.head_dim];
-        let img_q = self.to_q.forward(&stream.img)?.reshape(&ishape)?;
-        let img_k = self.to_k.forward(&stream.img)?.reshape(&ishape)?;
-        let img_v = self.to_v.forward(&stream.img)?.reshape(&ishape)?;
-        let tshape = [txt_tokens, self.heads, self.head_dim];
-        let txt_q = self.add_q_proj.forward(&stream.txt)?.reshape(&tshape)?;
-        let txt_k = self.add_k_proj.forward(&stream.txt)?.reshape(&tshape)?;
-        let txt_v = self.add_v_proj.forward(&stream.txt)?.reshape(&tshape)?;
-
-        // QK-RMSNorm on BOTH streams (`mage_layers.py:407-414`).
-        let img_q = rms_norm(&img_q, &self.norm_q, self.eps)?;
-        let img_k = rms_norm(&img_k, &self.norm_k, self.eps)?;
-        let txt_q = rms_norm(&txt_q, &self.norm_added_q, self.eps)?;
-        let txt_k = rms_norm(&txt_k, &self.norm_added_k, self.eps)?;
-
-        // msrope on the IMAGE q/k only — the text stream is deliberately unrotated
-        // (`apply_text_rotary_emb: false`; `mage_layers.py:420-422`).
-        let img_q = apply_rope(&img_q, ctx.rope())?;
-        let img_k = apply_rope(&img_k, ctx.rope())?;
-
-        let (img_out, txt_out) = self.joint_sdpa(
-            [&img_q, &img_k, &img_v],
-            [&txt_q, &txt_k, &txt_v],
-            ctx,
-            dim,
-            plan,
+        // SC-18319 — the shared prologue, once per stream. Mage's knob selection: separate q/k/v
+        // (knob 9), per-head QK-RMSNorm on BOTH streams (knob 1; `mage_layers.py:407-414`),
+        // adjacent-pair complex rotation computed in f32 (knob 2; `:15-21`), and — knob 5 —
+        // **msrope on the IMAGE q/k only**, the text stream deliberately unrotated
+        // (`apply_text_rotary_emb: false`; `:420-422`), which is a `RopeStyle::None` text spec
+        // rather than an identity table.
+        let rope = ctx.rope();
+        let img_spec = AttnPrepSpec::new(self.heads, self.head_dim)
+            .with_qk_norm(QkNormSpec::per_head(&self.norm_q, &self.norm_k, self.eps))
+            .with_rope(RopeSpec {
+                style: RopeStyle::AdjacentPair,
+                q: Some(RopeTables::new(&rope.cos, &rope.sin)),
+                k: Some(RopeTables::new(&rope.cos, &rope.sin)),
+                // Knob 12 — `x.float() … .type_as(x)` (`mage_layers.py:15-21`): the f32 promotion
+                // is undone before SDPA, so a bf16 stream stays bf16.
+                dtype: RopeDtype::RestoreInput,
+                ..RopeSpec::default()
+            });
+        // SC-18319 P4 — one matmul when the pack is engaged, three concatenated forwards when it is
+        // not. `prepare` splits the `[1, tokens, 3 * dim]` result at the offsets a `Separate` source
+        // would have carried, and a matmul's output rows are independent of one another, so the two
+        // arms are bit-identical.
+        let img = qkv::prepare(
+            QkvSource::Packed(&self.img_qkv.forward_packed(&stream.img)?),
+            &img_spec,
         )?;
+        let txt_spec = AttnPrepSpec::new(self.heads, self.head_dim).with_qk_norm(
+            QkNormSpec::per_head(&self.norm_added_q, &self.norm_added_k, self.eps),
+        );
+        let txt = qkv::prepare(
+            QkvSource::Packed(&self.txt_qkv.forward_packed(&stream.txt)?),
+            &txt_spec,
+        )?;
+
+        let (img_out, txt_out) = self.joint_sdpa(&img, &txt, ctx, dim, plan)?;
 
         Ok(DualStream {
             img: self.to_out.forward(&img_out)?,
@@ -243,10 +250,14 @@ impl MageJointAttention {
 
     /// One SDPA per packed segment over `[text, image]`, results gathered back into the two
     /// per-stream packed orders. Returns `([1, img_tokens, dim], [1, txt_tokens, dim])`.
+    ///
+    /// Both streams arrive in **BHSD** from [`qkv::prepare`], so the per-segment split is on the
+    /// token axis (2) and the join is [`StreamOrder::TextFirst`] — the scatter offsets at
+    /// `mage_layers.py:456-457` expressed as knob 11 rather than as a hand-rolled `cat`.
     fn joint_sdpa(
         &self,
-        img: [&Array; 3],
-        txt: [&Array; 3],
+        img: &QkvHeads,
+        txt: &QkvHeads,
         ctx: &PackContext,
         dim: i32,
         plan: AttentionPlan<'_>,
@@ -254,37 +265,34 @@ impl MageJointAttention {
         let segments = ctx.segments();
         let img_at = ctx.img_split_points();
         let txt_at = ctx.txt_split_points();
-        let img_q = split_sections(img[0], img_at, 0)?;
-        let img_k = split_sections(img[1], img_at, 0)?;
-        let img_v = split_sections(img[2], img_at, 0)?;
-        let txt_q = split_sections(txt[0], txt_at, 0)?;
-        let txt_k = split_sections(txt[1], txt_at, 0)?;
-        let txt_v = split_sections(txt[2], txt_at, 0)?;
+        let img_q = split_sections(&img.q, img_at, 2)?;
+        let img_k = split_sections(&img.k, img_at, 2)?;
+        let img_v = split_sections(&img.v, img_at, 2)?;
+        let txt_q = split_sections(&txt.q, txt_at, 2)?;
+        let txt_k = split_sections(&txt.k, txt_at, 2)?;
+        let txt_v = split_sections(&txt.v, txt_at, 2)?;
 
         let mut img_parts = Vec::with_capacity(segments);
         let mut txt_parts = Vec::with_capacity(segments);
         for s in 0..segments {
             let txt_len = ctx.layout().txt_lens()[s];
-            // Order `[text, image]` — the scatter offsets at `mage_layers.py:456-457`.
-            let joint = |t: &Array, i: &Array| -> Result<Array> {
-                let cat = concatenate_axis(&[t, i], 0)?;
-                let sh = cat.shape();
-                // `[L, heads, head_dim]` → `[1, heads, L, head_dim]` for SDPA.
-                Ok(cat
-                    .reshape(&[1, sh[0], sh[1], sh[2]])?
-                    .transpose_axes(&[0, 2, 1, 3])?)
-            };
-            let q = joint(&txt_q[s], &img_q[s])?;
-            let k = joint(&txt_k[s], &img_k[s])?;
-            let v = joint(&txt_v[s], &img_v[s])?;
+            let joint = StreamOrder::TextFirst.join(
+                &QkvHeads {
+                    q: img_q[s].clone(),
+                    k: img_k[s].clone(),
+                    v: img_v[s].clone(),
+                },
+                &QkvHeads {
+                    q: txt_q[s].clone(),
+                    k: txt_k[s].clone(),
+                    v: txt_v[s].clone(),
+                },
+            )?;
             // `causal=False`, no mask: per-sample isolation is the segmentation itself.
-            let out = sdpa_budgeted_bhsd(&q, &k, &v, self.scale, None, plan)?;
-            let sh = out.shape();
-            // `[1, heads, L, head_dim]` → `[L, heads · head_dim]` (`flatten(1, 2)`).
-            let out = out
-                .transpose_axes(&[0, 2, 1, 3])?
-                .reshape(&[sh[2], sh[1] * sh[3]])?;
-            let halves = split_sections(&out, &[txt_len], 0)?;
+            let out = sdpa_budgeted_bhsd(&joint.q, &joint.k, &joint.v, self.scale, None, plan)?;
+            // `[1, heads, L, head_dim]` → `[1, L, heads · head_dim]` (`flatten(1, 2)`).
+            let out = qkv::merge_heads(&out)?;
+            let halves = split_sections(&out, &[txt_len], 1)?;
             txt_parts.push(halves[0].clone());
             img_parts.push(halves[1].clone());
         }
@@ -297,7 +305,7 @@ impl MageJointAttention {
                     .expect("one segment must produce one attention part")
             } else {
                 let refs: Vec<&Array> = parts.iter().collect();
-                concatenate_axis(&refs, 0)?
+                concatenate_axis(&refs, 1)?
             };
             Ok(flat.reshape(&[1, tokens, dim])?)
         };
@@ -312,17 +320,36 @@ impl MageJointAttention {
 /// Diffusers names the image output `to_out.0` (an `nn.Sequential`, Linear at index 0) and the text
 /// output `to_add_out`; the six input projections are bare.
 impl AdaptableHost for MageJointAttention {
+    /// The MUTATION half: a q/k/v path resolves through [`FusedQkvProjection::part_mut`], which
+    /// unfuses first, so an adapter installed here can never be stranded behind a stale packed
+    /// matrix.
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
         match path {
-            ["to_q"] => Some(self.to_q.adaptable_mut()),
-            ["to_k"] => Some(self.to_k.adaptable_mut()),
-            ["to_v"] => Some(self.to_v.adaptable_mut()),
+            ["to_q"] => self.img_qkv.part_mut(QkvPart::Q).ok(),
+            ["to_k"] => self.img_qkv.part_mut(QkvPart::K).ok(),
+            ["to_v"] => self.img_qkv.part_mut(QkvPart::V).ok(),
             ["to_out", "0"] => Some(self.to_out.adaptable_mut()),
-            ["add_q_proj"] => Some(self.add_q_proj.adaptable_mut()),
-            ["add_k_proj"] => Some(self.add_k_proj.adaptable_mut()),
-            ["add_v_proj"] => Some(self.add_v_proj.adaptable_mut()),
+            ["add_q_proj"] => self.txt_qkv.part_mut(QkvPart::Q).ok(),
+            ["add_k_proj"] => self.txt_qkv.part_mut(QkvPart::K).ok(),
+            ["add_v_proj"] => self.txt_qkv.part_mut(QkvPart::V).ok(),
             ["to_add_out"] => Some(self.to_add_out.adaptable_mut()),
             _ => None,
+        }
+    }
+
+    /// The PROBE half (SC-18319): the six fused paths answer from
+    /// [`FusedQkvProjection::part_facts`], reading the packed representation instead of dismantling
+    /// it. This matters most for `block_stream.rs`'s adapter capture, which walks EVERY path in
+    /// every block.
+    fn adaptable_facts(&mut self, path: &[&str]) -> Option<LinearFacts> {
+        match path {
+            ["to_q"] => Some(self.img_qkv.part_facts(QkvPart::Q)),
+            ["to_k"] => Some(self.img_qkv.part_facts(QkvPart::K)),
+            ["to_v"] => Some(self.img_qkv.part_facts(QkvPart::V)),
+            ["add_q_proj"] => Some(self.txt_qkv.part_facts(QkvPart::Q)),
+            ["add_k_proj"] => Some(self.txt_qkv.part_facts(QkvPart::K)),
+            ["add_v_proj"] => Some(self.txt_qkv.part_facts(QkvPart::V)),
+            _ => self.adaptable_mut(path).map(|l| LinearFacts::of(l)),
         }
     }
 
@@ -353,34 +380,23 @@ fn expect_packed(x: &Array, tokens: i32, dim: i32, what: &str) -> Result<()> {
     Ok(())
 }
 
-/// `apply_rotary_emb_mageflow` (`mage_layers.py:15-21`): adjacent-pair complex rotation over
-/// `[tokens, heads, head_dim]`, computed in f32 (`x.float()`) and cast back to the input dtype
-/// (`.type_as(x)`).
+/// `apply_rotary_emb_mageflow` (`mage_layers.py:15-21`) is now
+/// `mlx_gen::qkv::apply_rope(.., RopeStyle::AdjacentPair, RotationAxes::TokenMajor, .., true)`
+/// (SC-18319) — the identical adjacent-pair complex rotation through `nn::rope_rotate`, computed in
+/// f32 (`x.float()`) and cast back to the input dtype (`.type_as(x)`), with the table broadcast one
+/// row per token across the heads (`freqs_cis.unsqueeze(1)`).
+///
+/// Test-only shim keeping this file's rotation-convention pins pointed at the shared kernel.
+#[cfg(test)]
 fn apply_rope(x: &Array, rope: &RopeTable) -> Result<Array> {
-    let sh = x.shape();
-    let (tokens, heads, head_dim) = (sh[0], sh[1], sh[2]);
-    let half = head_dim / 2;
-    if rope.cos.shape() != [tokens, half] {
-        return Err(Error::Msg(format!(
-            "mage_flow: msrope table is {:?} but the rotated stream is [{tokens}, {heads}, \
-             {head_dim}] (expected a [{tokens}, {half}] table)",
-            rope.cos.shape()
-        )));
-    }
-    let dtype = x.dtype();
-    let pairs = x
-        .as_dtype(Dtype::Float32)?
-        .reshape(&[tokens, heads, half, 2])?;
-    let parts = split(&pairs, 2, 3)?;
-    let real = parts[0].reshape(&[tokens, heads, half])?;
-    let imag = parts[1].reshape(&[tokens, heads, half])?;
-    // `freqs_cis.unsqueeze(1)` — one table row per token, broadcast across heads.
-    let cos = rope.cos.reshape(&[tokens, 1, half])?;
-    let sin = rope.sin.reshape(&[tokens, 1, half])?;
-    let (out_real, out_imag) = nn::rope_rotate(&real, &imag, &cos, &sin)?;
-    Ok(stack_axis(&[out_real, out_imag], 3)?
-        .reshape(&[tokens, heads, head_dim])?
-        .as_dtype(dtype)?)
+    qkv::apply_rope(
+        x,
+        RopeTables::new(&rope.cos, &rope.sin),
+        RopeStyle::AdjacentPair,
+        mlx_gen::qkv::RotationAxes::TokenMajor,
+        None,
+        RopeDtype::RestoreInput,
+    )
 }
 
 #[cfg(test)]
@@ -392,8 +408,9 @@ mod tests {
     /// rotation tests below meaningful.
     #[test]
     fn identity_rotation_is_a_no_op() {
+        // `[B=1, tokens=2, heads=3, head_dim=4]` — the token-major layout the shared prologue uses.
         let values: Vec<f32> = (0..2 * 3 * 4).map(|v| v as f32).collect();
-        let x = Array::from_slice(&values, &[2, 3, 4]);
+        let x = Array::from_slice(&values, &[1, 2, 3, 4]);
         let rope = RopeTable {
             cos: Array::from_slice(&[1.0f32; 4], &[2, 2]),
             sin: Array::from_slice(&[0.0f32; 4], &[2, 2]),
@@ -407,7 +424,7 @@ mod tests {
     /// pair lane 0 with lane 2 and yield `[−3, −4, 1, 2]`.
     #[test]
     fn rotation_pairs_adjacent_lanes_not_split_halves() {
-        let x = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
+        let x = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[1, 1, 1, 4]);
         let rope = RopeTable {
             cos: Array::from_slice(&[0.0f32, 0.0], &[1, 2]),
             sin: Array::from_slice(&[1.0f32, 1.0], &[1, 2]),
@@ -418,7 +435,7 @@ mod tests {
 
     #[test]
     fn rotation_rejects_a_table_of_the_wrong_length() {
-        let x = Array::from_slice(&[0.0f32; 8], &[2, 1, 4]);
+        let x = Array::from_slice(&[0.0f32; 8], &[1, 2, 1, 4]);
         let rope = RopeTable {
             cos: Array::from_slice(&[1.0f32; 2], &[1, 2]),
             sin: Array::from_slice(&[0.0f32; 2], &[1, 2]),

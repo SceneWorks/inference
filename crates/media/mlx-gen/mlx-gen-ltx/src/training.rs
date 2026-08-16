@@ -646,6 +646,9 @@ fn build_targets(
                 let save_path = format!("transformer_blocks.{i}.{attn}.{suf}");
                 let segs = resolve_segments(&save_path);
                 let seg_refs: Vec<&str> = segs.iter().map(String::as_str).collect();
+                // SC-18319 — LTX resolves through its OWN `LtxAdaptable` trait over its own
+                // `Linear`, not the shared `AdaptableHost`/`AdaptableLinear` surface, so there is no
+                // `FusedQkvProjection` behind this path and no probe/mutate split to honour.
                 let Some(lin) = dit.adaptable_mut(&seg_refs) else {
                     continue;
                 };
