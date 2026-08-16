@@ -982,7 +982,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         mutations = {
             "Kolors landscape geometry": ("1280x768:576:48", "1280x720:576:48"),
             "Kolors portrait geometry": ("768x1280:576:48", "720x1280:576:48"),
-            "SDXL geometry": ("2048x2048:1888:384", "2048x2016:1888:384"),
+            "SDXL geometry": ("2048x2048:1920:384", "2048x2016:1920:384"),
             "Chroma geometry": ("1280x720:576:192", "1280x722:576:192"),
             "zero geometry": ("768x768:576:48", "0x768:576:48"),
             "zero overlap": ("768x768:576:48", "768x768:576:0"),
