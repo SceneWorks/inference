@@ -17,7 +17,7 @@
 //! |---|---|---|
 //! | 0 Resident | Implemented | Warm [`Residency`](mlx_gen::Residency) pair — dual CLIP + (U-Net + control/IP/VAE/PiD) held across requests |
 //! | 1 Staged residency | Implemented (request-scoped) | `GenerationMemory::stage_residency` drives encode → **drop both CLIP encoders** → load heavy → denoise + decode |
-//! | 2 Bounded decode | **Missing** (measured — [`DECODE_SUPPORT`]) | [`Autoencoder::decode_tiled`](crate::vae::Autoencoder) exists and bounds the decode 14.360 → 11.237 GiB, but no fixed tile edge holds its quality across the advertised output range |
+//! | 2 Bounded decode | route-blind **Missing**; exact measured rows may be Implemented ([`DECODE_SUPPORT`]) | [`Autoencoder::decode_tiled`](crate::vae::Autoencoder) uses SC-19753 full-image GroupNorm statistics and sealed route/tier/mode/overlay/geometry admission; historical whole-tail memory was 14.360 → 11.237 GiB and must be recaptured for the new arithmetic |
 //! | 3 Bounded attention | **Missing** (measured — [`ATTENTION_SUPPORT`]) | [`mlx_gen::attention::sdpa_budgeted_bhsd`] reaches every site, moves the peak **0.00% at BOTH scopes** (the request and the U-Net seam), and its query-row axis is not bit-exact on Metal |
 //! | 4 Bounded transformer residency | Implemented (streamable loads) | [`mlx_gen::block_residency::run_windowed`] per `Transformer2D` — eleven sub-stacks, 70 blocks |
 //!
@@ -25,6 +25,8 @@
 //! catalog route, tier, mode, overlay and output geometry by packaging a sealed production-latent
 //! quality policy. Coordinates absent from that table remain refused; an empty table preserves the
 //! default and the existing estimated-fit fallback.
+//! The older range failures documented below predate SC-19753's layer-wise normalization and are
+//! retained as history, not as the current decoder's expected quality result.
 //!
 //! ## What this family actually buys, measured (`realvisxl`, Apple/Metal, 1024², 6 steps)
 //!
@@ -163,10 +165,10 @@
 //!
 //! Each of these is a typed rejection rather than a silently narrowed execution:
 //!
-//! * **any** bounded-decode selection (`refuse_decode`, and again in `decode_tiling`) and **any**
-//!   bounded-attention selection (`attention_plan`) — rungs 2 and 3 are `Missing` here, and their
-//!   mechanisms are still present in the crate as the sweep's subject, so the path from "the code
-//!   exists" to "a render silently used it" is closed on both layers;
+//! * a bounded-decode selection without an exact admitted route/geometry policy (`refuse_decode`,
+//!   and again in `decode_tiling`) and **any** bounded-attention selection (`attention_plan`) — the
+//!   route-blind rung 2 fallback and rung 3 are `Missing`, so the path from "the code exists" to "a
+//!   render silently used it" remains closed while sealed SC-19753 rows can engage rung 2;
 //! * a transformer window **component** this family does not implement (`TextEncoder` / `Both`) —
 //!   never narrowed to `Dit`;
 //! * a transformer window **size** outside [`TRANSFORMER_WINDOW_SIZES`] (`validate_window`);
@@ -218,21 +220,28 @@ pub const DECODE_TILE_EDGES_SWEPT: &[u32] = &[896, 768, 640, 512, 448, 384, 320,
 /// The rung-2 overlaps the sweep measured against every edge in [`DECODE_TILE_EDGES_SWEPT`].
 pub const DECODE_OVERLAPS_SWEPT: &[u32] = &[64, 128, 192, 256];
 
-/// **Rung 2 is `Missing` on SDXL/MLX, and that is a measurement.**
+/// **The route-blind rung-2 fallback is `Missing` on SDXL/MLX.**
 ///
-/// The mechanism is implemented and it works: [`Autoencoder::decode_tiled`](crate::vae::Autoencoder)
+/// The measurements below are the historical pre-SC-19753 evidence for refusing one unconditional
+/// tile domain across every route and output size. SC-19753 changed the decoder to preserve global
+/// GroupNorm statistics and packages new production-latent results as exact sealed route/geometry
+/// policies. Those rows can adopt rung 2 without weakening this fail-closed fallback; coordinates
+/// absent from the table still see [`DECODE_SUPPORT`] `Missing`.
+///
+/// The original mechanism was implemented and bounded memory: [`Autoencoder::decode_tiled`](crate::vae::Autoencoder)
 /// runs the globally-scoped decoder head (denormalize → `post_quant_conv` → `conv_in` → mid resnets →
 /// mid **self-attention**) once on the full latent and tiles only the full-resolution upsample tail,
 /// which is the same head/tail split `mlx_gen_qwen_image` uses. It bounds real memory: at 1024² bf16
 /// the isolated decode peak falls **14.360 → 11.237 GiB (−21.7%)** at edge 896, and the whole request
-/// falls by the margin `the_withheld_decode_geometry_is_priced_at_the_request_level` measures.
+/// falls by the margin `layerwise_decode_is_priced_at_the_request_level` measures.
 ///
 /// Both scopes are quoted because they answer different questions and an earlier revision of this
 /// file quoted a request-level figure no test in this crate produced. The mechanism sweep measures
 /// the decode in isolation — the right scope for the drift; the request row measures what a caller
 /// would actually have paid — the right scope for the saving.
 ///
-/// It is not published, because it does not preserve the output. Swept against the **exact untiled
+/// The rest of this section is historical pre-SC-19753 evidence for the retired whole-tail decoder;
+/// it is not a current quality claim. That decoder was not published because it did not preserve the output. Swept against the **exact untiled
 /// decode of the same latent** — a real 1024² render re-encoded through the same VAE — on
 /// `realvisxl` bf16 (`decode_tile_mechanism_sweep`):
 ///
@@ -265,12 +274,10 @@ pub const DECODE_OVERLAPS_SWEPT: &[u32] = &[64, 128, 192, 256];
 ///
 /// ## Why 38/255 is nevertheless not publishable — the bar, and the range
 ///
-/// **The bar is 48/255**, and it is inherited rather than invented: it is the worst drift a sibling
-/// MLX provider on this same shared tiling machinery *admits* into a shipped ladder
-/// (`mlx_gen_z_image::memory_strategy::DECODE_TILE_EDGES` tops out at 48 on its 768 px tile; its
-/// rejected set starts at 64). Z-Image's decoder is the same diffusers `AutoencoderKL` with the same
-/// spatial-extent GroupNorms and the same head/tail split, so it is the closest precedent that
-/// exists. By that bar the 1024² sweep datum **passes**: 38 < 48, buying a measured
+/// **The product bar remains 48/255.** Historically it came from Z's old
+/// 48-admitted/64-rejected split; Z now admits all measured edges with a much lower worst result, so
+/// that split is provenance rather than current domain evidence. By that bar the old 1024² sweep
+/// datum **passed**: 38 < 48, buying a measured
 /// **19.0032 → 15.8660 GiB (−16.51%)** request peak at only ~7% wall clock (876 → 936 ms/step). On
 /// the 1024² sweep alone this candidate should ship, and an earlier revision of this file was wrong
 /// to claim otherwise — it asserted SDXL was "past that wall at every tile size", which its own
@@ -283,7 +290,7 @@ pub const DECODE_OVERLAPS_SWEPT: &[u32] = &[64, 128, 192, 256];
 /// The 38/255 above is measured against a latent obtained by **re-encoding a finished image** — its
 /// statistics have already been through the VAE round trip. Decode what the denoiser actually hands
 /// the decode phase and the same geometry drifts **84/255**
-/// (`the_withheld_decode_geometry_is_priced_at_the_request_level`). The production latent is the one
+/// (the pre-SC-19753 form of `layerwise_decode_is_priced_at_the_request_level`). The production latent is the one
 /// a user would get, so the one output size where the candidate looked admissible does not survive
 /// contact with a production request. Nothing about the sweep was wrong — it is the right instrument
 /// for comparing geometries against each other, and the wrong one for deciding an absolute bar.
@@ -293,7 +300,7 @@ pub const DECODE_OVERLAPS_SWEPT: &[u32] = &[64, 128, 192, 256];
 /// `MemoryParameterRanges::decode_tile_edges` is an absolute pixel domain with no geometry axis, so
 /// publishing 896 publishes it at everything `crate::model::descriptor` advertises — and that is
 /// `max_size: 2048`. Re-swept across that range at the best overlap
-/// (`no_single_decode_tile_edge_clears_the_bar_across_the_advertised_output_range`):
+/// (the pre-SC-19753 form of `layerwise_decode_clears_the_bar_across_the_advertised_output_range`):
 ///
 /// | output | tiles | tile covers | max Δ | vs the 48/255 bar |
 /// |---:|---:|---:|---:|---|
@@ -312,10 +319,9 @@ pub const DECODE_OVERLAPS_SWEPT: &[u32] = &[64, 128, 192, 256];
 ///
 /// So the rung is withheld — but the reason is now stated correctly and each half is asserted by a
 /// test, and the prize is recorded with a number rather than dismissed: **−16.51% of the request
-/// peak for ~7% wall clock**, which is a better memory/latency trade than rung 4's. What would
-/// unlock it is a geometry-relative tile parameter (a fraction of the output rather than a pixel
-/// edge), or a decoder whose tail normalizes over the full extent. Both are contract-level changes,
-/// and neither is this story's.
+/// peak for ~7% wall clock**, which is a better memory/latency trade than rung 4's. SC-19753 supplies
+/// the previously missing full-extent normalization and exact geometry policy; the constant remains
+/// `Missing` only because a route-blind value cannot express that sealed identity.
 ///
 /// Publishing it as-is would be substituting quality for memory without saying so — the same refusal
 /// the catalog already makes for precision (tier integrity) and geometry (SC-15807).
@@ -836,14 +842,10 @@ fn contract_with_asset_facts(
 /// closes the path from "the code exists" to "a render silently used it".
 fn refuse_decode(provider_id: &str, edge: Option<u32>, overlap: Option<u32>) -> CoreError {
     CoreError::Unsupported(format!(
-        "{provider_id}: bounded decode is not selectable on this provider (rung 2 is declared \
-         Missing). The tiled decode was measured and withheld: its best geometry (edge \
-         {DECODE_TILE_EDGE} overlap 192) clears the 48/255 sibling bar at 1024² with 38/255, but the \
-         same edge drifts 64 at 1280², 120 at 1536² and 77 at 2048² — the upsample tail's GroupNorms \
-         normalize over each tile's own crop, so what bounds the drift is the tile's FRACTION of the \
-         output, and a fixed pixel edge cannot hold that across an advertised range up to 2048². \
-         Requested edge {edge:?} overlap {overlap:?}; see memory_strategy::DECODE_SUPPORT for the \
-         full sweep."
+        "{provider_id}: bounded decode is not selectable under the route-blind fallback (rung 2 is \
+         declared Missing). SC-19753 admits only exact sealed route/tier/mode/overlay/geometry \
+         quality rows; no applicable admitted row reached this fallback. Requested edge {edge:?} \
+         overlap {overlap:?}."
     ))
 }
 
@@ -1047,7 +1049,8 @@ fn begin_with_cleanup(
     )?;
     config.load_shape = context.load_shape;
     mlx_gen::request_scope::authorize_selected_geometry_decode(&mut config, contract, context)?;
-    // Rungs 2 and 3 are `Missing`, so neither can be engaged and neither parameter is ever set.
+    // Rung 2 may be engaged only by the exact policy authorization above. Rung 3 remains `Missing`,
+    // so attention chunking is never set.
     config.attention_chunk_size = None;
     config.transformer_window = contract
         .engages(
@@ -1426,7 +1429,10 @@ mod tests {
             ..Default::default()
         };
         let err = decode_tiling(&tiled).expect_err("a bounded-decode request must be refused");
-        assert!(err.to_string().contains("38/255"), "got: {err}");
+        assert!(
+            err.to_string().contains("no applicable admitted row"),
+            "got: {err}"
+        );
 
         let chunked = GenerationRequest {
             memory: Some(GenerationMemory {

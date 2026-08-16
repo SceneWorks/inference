@@ -1,4 +1,11 @@
-//! SC-15522 hardware-gated SD3.5-Large shared memory-ladder evidence.
+//! SC-15522 / SC-18606 hardware-gated SD3.5 shared memory-ladder evidence.
+//!
+//! `SD3_LADDER_SNAPSHOT` names the exact content-pinned SC-15522 Large BF16 snapshot and is the
+//! only one that binds the measured calibration fingerprint. SC-18606 made rung 4 reachable for
+//! Large-Turbo and Medium through the variant-generic structural admission, so
+//! `SD3_TURBO_LADDER_SNAPSHOT` and `SD3_MEDIUM_LADDER_SNAPSHOT` supply their evidence lanes. These
+//! tests are `#[ignore]`d and were NOT run in the SC-18606 code change; the epic's terminal
+//! evidence phase owns them.
 
 use std::path::PathBuf;
 
@@ -18,14 +25,24 @@ fn snapshot() -> PathBuf {
     )
 }
 
-fn spec(deferred: bool) -> LoadSpec {
-    LoadSpec::new(WeightsSource::Dir(snapshot()))
+/// The two SC-18606 lanes. Absent env var ⇒ that variant's evidence is simply not being collected
+/// on this host; the test says so out loud rather than passing silently.
+fn optional_snapshot(variable: &str) -> Option<PathBuf> {
+    std::env::var(variable).ok().map(PathBuf::from)
+}
+
+fn spec_at(root: &std::path::Path, deferred: bool) -> LoadSpec {
+    LoadSpec::new(WeightsSource::Dir(root.to_path_buf()))
         .with_offload_policy(OffloadPolicy::Sequential)
         .with_load_shape(if deferred {
             LoadShape::DeferredMaterialization
         } else {
             LoadShape::EagerMaterialization
         })
+}
+
+fn spec(deferred: bool) -> LoadSpec {
+    spec_at(&snapshot(), deferred)
 }
 
 fn size() -> u32 {
@@ -35,11 +52,15 @@ fn size() -> u32 {
         .unwrap_or(768)
 }
 
-fn request(memory: GenerationMemory) -> GenerationRequest {
+/// Per-variant sampling recipe. Large-Turbo is ADD-distilled with guidance baked in and advertises
+/// neither `supports_guidance` nor `supports_negative_prompt`, so sending either is a validation
+/// error rather than a memory finding — the trio cannot share one request literal.
+fn request_for(provider: &str, memory: GenerationMemory) -> GenerationRequest {
+    let turbo = provider == "sd3_5_large_turbo";
     GenerationRequest {
         prompt: "a red fox in a snowy forest, photograph".into(),
-        negative_prompt: Some("blurry, low quality".into()),
-        guidance: Some(3.5),
+        negative_prompt: (!turbo).then(|| "blurry, low quality".to_owned()),
+        guidance: (!turbo).then_some(if provider == "sd3_5_medium" { 5.0 } else { 3.5 }),
         width: size(),
         height: size(),
         steps: Some(1),
@@ -63,10 +84,14 @@ impl Run {
 }
 
 fn run(memory: GenerationMemory) -> Run {
+    run_provider("sd3_5_large", &snapshot(), memory)
+}
+
+fn run_provider(provider: &str, root: &std::path::Path, memory: GenerationMemory) -> Run {
     let generator = mlx_gen_sd3::provider_registry()
         .expect("SD3 registry")
-        .load("sd3_5_large", &spec(memory.stream_transformer_blocks))
-        .expect("load SD3.5 Large");
+        .load(provider, &spec_at(root, memory.stream_transformer_blocks))
+        .unwrap_or_else(|error| panic!("load {provider}: {error}"));
     clear_cache();
     reset_peak_memory();
     let mut conditioning = 0;
@@ -83,7 +108,7 @@ fn run(memory: GenerationMemory) -> Run {
         _ => {}
     };
     let output = generator
-        .generate(&request(memory), &mut progress)
+        .generate(&request_for(provider, memory), &mut progress)
         .expect("generate SD3.5 image");
     let decode = get_peak_memory();
     let image = match output {
@@ -308,5 +333,72 @@ fn full_shared_ladder_reduces_peak_and_preserves_output() {
         gib(full.peak()),
         decode_max,
         decode_mean,
+    );
+}
+
+/// SC-18606: the same resident-versus-selected evidence for the two variants that had no rung-4
+/// route before this story. Their contracts carry NO measured calibration — the structural
+/// admission is identity-pinned, not content-pinned — so the printed RESULT line records the
+/// admission and authority explicitly rather than implying Large's evidence covers them.
+#[test]
+#[ignore = "needs the SD3.5 Large-Turbo / Medium BF16 snapshots and Apple/Metal"]
+fn structurally_admitted_variants_reduce_peak_and_preserve_output() {
+    let lanes = [
+        ("sd3_5_large_turbo", "SD3_TURBO_LADDER_SNAPSHOT"),
+        ("sd3_5_medium", "SD3_MEDIUM_LADDER_SNAPSHOT"),
+    ];
+    let mut collected = 0;
+    for (provider, variable) in lanes {
+        let Some(root) = optional_snapshot(variable) else {
+            println!("RESULT status=skip provider={provider} reason={variable}-unset");
+            continue;
+        };
+        collected += 1;
+        let registry = mlx_gen_sd3::provider_registry().expect("SD3 registry");
+        let contract = registry
+            .memory_strategy_contract(provider, &spec_at(&root, true))
+            .expect("query contract")
+            .expect("memory contract");
+        for strategy in mlx_gen::gen_core::MemoryStrategy::ALL {
+            assert_eq!(
+                contract.capability(strategy).unwrap().support,
+                mlx_gen::gen_core::MemoryStrategySupport::Implemented,
+                "{provider} deferred route must implement {strategy:?}"
+            );
+        }
+        assert!(
+            contract.calibration.is_none(),
+            "{provider} must not claim measured calibration from a structural admission"
+        );
+
+        let staged = run_provider(
+            provider,
+            &root,
+            GenerationMemory {
+                stage_residency: true,
+                ..Default::default()
+            },
+        );
+        let full = run_provider(provider, &root, full_ladder());
+        let (max, mean) = delta(&staged.image, &full.image);
+        assert!(
+            max <= 64 && mean < 4.0,
+            "{provider} ladder changed the image: max={max} mean={mean}"
+        );
+        assert!(
+            full.peak() < staged.peak(),
+            "{provider} full ladder did not reduce peak: staged={} full={}",
+            staged.peak(),
+            full.peak()
+        );
+        println!(
+            "RESULT status=pass provider={provider} tier=bf16 admission=structural authority=estimated staged_peak_gib={:.3} full_peak_gib={:.3} max_delta={max} mean_delta={mean:.6}",
+            gib(staged.peak()),
+            gib(full.peak()),
+        );
+    }
+    assert!(
+        collected > 0,
+        "set SD3_TURBO_LADDER_SNAPSHOT and/or SD3_MEDIUM_LADDER_SNAPSHOT to collect this evidence"
     );
 }

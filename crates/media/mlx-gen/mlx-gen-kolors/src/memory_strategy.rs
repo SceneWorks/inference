@@ -25,7 +25,7 @@
 //! |---|---|---|
 //! | 0 Resident | Implemented | Warm [`Residency`](mlx_gen::Residency) pair — ChatGLM3-6B + (U-Net + control/IP/VAE/PiD) held across requests |
 //! | 1 Staged residency | Implemented (request-scoped) | `GenerationMemory::stage_residency` drives encode → **drop ChatGLM3-6B** → load heavy → denoise + decode |
-//! | 2 Bounded decode | **Missing** (measured — [`DECODE_SUPPORT`]) | [`Autoencoder::decode_tiled`](mlx_gen_sdxl::Autoencoder) bounds the request 16.041 → 9.998 GiB (−37.67%) and clears the drift bar at 1024²/1280², but fails it at 1536²/2048² and `decode_tile_edges` has no geometry axis |
+//! | 2 Bounded decode | route-blind **Missing**; exact measured rows may be Implemented ([`DECODE_SUPPORT`]) | [`Autoencoder::decode_tiled`](mlx_gen_sdxl::Autoencoder) uses SC-19753 full-image GroupNorm statistics and sealed route/tier/mode/overlay/geometry admission; historical whole-tail memory was 16.041 → 9.998 GiB and must be recaptured for the new arithmetic |
 //! | 3 Bounded attention | **Missing** (measured — [`ATTENTION_SUPPORT`]) | [`mlx_gen::attention::sdpa_budgeted_bhsd`] reaches every site, moves the peak **0.00% at BOTH scopes** — the request and the U-Net seam — and is not bit-exact on its query-row axis |
 //! | 4 Bounded transformer residency | Implemented (streamable loads), **two scopes** | [`mlx_gen::block_residency::run_windowed`] over the U-Net's eleven `Transformer2D` sub-stacks (70 blocks) **and** over ChatGLM3-6B's 28 `GlmBlock`s |
 //!
@@ -33,6 +33,8 @@
 //! catalog route, tier, mode, overlay and output geometry by packaging a sealed production-latent
 //! quality policy. Coordinates absent from that table remain refused; an empty table preserves the
 //! default and the existing estimated-fit fallback.
+//! The older range failures documented below predate SC-19753's layer-wise normalization and are
+//! retained as history, not as the current decoder's expected quality result.
 //!
 //!
 //! ## What this family actually buys, measured (q4 unless stated, Apple/Metal, 1024², 4 steps)
@@ -92,29 +94,35 @@ pub const DECODE_OVERLAPS_SWEPT: &[u32] = &[64, 128, 192, 256];
 
 /// The drift bar this family is judged against, in 8-bit levels out of 255.
 ///
-/// Inherited rather than invented: it is the worst drift a sibling MLX provider on this same shared
-/// tiling machinery *admits* into a shipped ladder
-/// (`mlx_gen_z_image::memory_strategy::DECODE_TILE_EDGES` tops out at 48 on its 768 px tile; its
-/// rejected set starts at 64). Z-Image's decoder is the same diffusers `AutoencoderKL` with the same
-/// spatial-extent GroupNorms and the same head/tail split, so it is the closest precedent that
-/// exists for Kolors — which runs literally the same `sdxl-vae-fp16-fix` decoder.
+/// SC-19753 retains 48/255 as the product decode-quality admission bar. Historically that threshold
+/// came from Z's old 48-admitted/64-rejected split; Z now admits all measured edges with a much lower
+/// worst result, so the split is provenance rather than current domain evidence.
 pub const DECODE_DRIFT_BAR: u32 = 48;
 
-/// **Rung 2 is `Missing` on Kolors/MLX, and that is a measurement taken on Kolors' own weights.**
+/// **The route-blind rung-2 fallback is `Missing` on Kolors/MLX.**
 ///
-/// The mechanism is implemented and it works. Kolors decodes through [`mlx_gen_sdxl::Autoencoder`] —
+/// The measurements below are the historical pre-SC-19753 evidence for refusing one unconditional
+/// tile domain across every output. SC-19753 changed the shared decoder to preserve global GroupNorm
+/// statistics and packages new production-latent results as exact sealed route/geometry policies.
+/// Those rows can adopt rung 2 without weakening this fail-closed fallback; coordinates absent from
+/// the table still see [`DECODE_SUPPORT`] `Missing`.
+///
+/// The original mechanism was implemented and bounded memory. Kolors decodes through [`mlx_gen_sdxl::Autoencoder`] —
 /// the same `sdxl-vae-fp16-fix` `AutoencoderKL` SDXL uses — so `decode_tiled` runs the globally-scoped
 /// head (denormalize → `post_quant_conv` → `conv_in` → mid resnets → mid **self-attention**) once on
 /// the full latent and tiles only the full-resolution upsample tail.
 ///
-/// **It is also, by a wide margin, the biggest lever on this family's ladder.** At 1024² q4 it takes
-/// the whole staged request from **16.0412 → 9.9981 GiB (−37.67%)** for **+10% wall clock**
-/// (925 → 1018 ms/step) — against rung 4's −7.21% for +4.2× at the same tier and geometry
-/// (`the_withheld_decode_geometry_is_priced_at_the_request_level`). It is withheld anyway, and the
-/// size of the prize is exactly why the withholding argument had to be measured rather than
-/// asserted.
+/// **Historical whole-tail memory result.** Before SC-19753, 1024² q4 moved the staged request from
+/// **16.0412 → 9.9981 GiB (−37.67%)** for **+10% wall clock** (925 → 1018 ms/step). The layer-wise
+/// decoder's executable test now promises only a greater-than-3% saving until current memory is
+/// recaptured. The route-blind fallback remains withheld; exact sealed rows control admission.
 ///
-/// ## The candidate is real, and at 1024² it CLEARS the bar
+/// ## Historical pre-SC-19753 evidence
+///
+/// The tables and mechanism analysis in this section describe the retired whole-tail decoder. They
+/// remain useful provenance for the route-blind fallback, but they are not current quality claims.
+///
+/// ### The candidate was real, and at 1024² it cleared the bar
 ///
 /// Swept against the **exact untiled decode of the same latent**, on the *production* latent — what
 /// the denoiser actually hands the decode phase, not a re-encoded finished image — at q4 1024²
@@ -142,13 +150,13 @@ pub const DECODE_DRIFT_BAR: u32 = 48;
 /// the production latent reads 44 at the same geometry. A user gets the production latent, so the
 /// absolute bar is judged on it.
 ///
-/// ## What withholds it: the datum is a property of the GEOMETRY, not of the tile edge
+/// ### What withheld it: the datum was a property of geometry, not tile edge
 ///
 /// `MemoryParameterRanges::decode_tile_edges` is an absolute pixel domain with no geometry axis, so
 /// publishing 768 publishes it at everything `crate::registry::descriptor` advertises — and that is
 /// `max_size: 2048`. Re-swept across that range at the same overlap, on a **rendered production
 /// latent at each output size**
-/// (`no_single_decode_tile_edge_clears_the_bar_across_the_advertised_output_range`):
+/// (the pre-SC-19753 form of `layerwise_decode_clears_the_bar_across_the_advertised_output_range`):
 ///
 /// | output | tile covers | max Δ | vs the 48/255 bar |
 /// |---:|---:|---:|---|
@@ -170,7 +178,7 @@ pub const DECODE_DRIFT_BAR: u32 = 48;
 /// against the rendered 38), and a rung admitted on the friendly instrument would be admitted on
 /// evidence no user ever sees.
 ///
-/// ## How this differs from SDXL, which shares the decoder
+/// ### How this differed from SDXL, which shares the decoder
 ///
 /// SDXL withholds rung 2 too, and it is worth being precise about where the two families agree,
 /// because the shared `AutoencoderKL` makes it tempting to inherit:
@@ -186,9 +194,8 @@ pub const DECODE_DRIFT_BAR: u32 = 48;
 /// misstated the best geometry (896 vs 768), the best overlap (192 vs 256), the prize (−16.51% vs
 /// −37.67%) and which output sizes clear.
 ///
-/// What would unlock it is a geometry-relative tile parameter (a fraction of the output rather than
-/// a pixel edge), or a decoder whose tail normalizes over the full extent. Both are contract-level
-/// changes, and neither is this story's — tracked as sc-17678.
+/// SC-19753 supplies the previously missing full-extent normalization and exact geometry policy. The
+/// constant remains `Missing` only because a route-blind value cannot express that sealed identity.
 pub const DECODE_SUPPORT: MemoryStrategySupport = MemoryStrategySupport::Missing;
 
 /// The attention chunk size the rung-3 sweep exercised.
@@ -1009,15 +1016,10 @@ fn contract_with_asset_facts(
 /// This closes the path from "the code exists" to "a render silently used it".
 fn refuse_decode(provider_id: &str, edge: Option<u32>, overlap: Option<u32>) -> CoreError {
     CoreError::Unsupported(format!(
-        "{provider_id}: bounded decode is not selectable on this provider (rung 2 is declared \
-         Missing). The tiled decode was measured and withheld — NOT because no geometry works: its \
-         best (edge {DECODE_TILE_EDGE} overlap {DECODE_OVERLAP}) clears the \
-         {DECODE_DRIFT_BAR}/255 sibling bar at 1024² with 38/255 and at 1280² with 26/255, and \
-         would have bought -37.67% of the request peak for +10% wall clock. It fails at 1536² \
-         (69/255) and 2048² (53/255), because the upsample tail's GroupNorms normalize over each \
-         tile's own crop — so what bounds the drift is the tile's FRACTION of the output, and a \
-         fixed pixel edge cannot hold that across an advertised range up to 2048². Requested edge \
-         {edge:?} overlap {overlap:?}; see memory_strategy::DECODE_SUPPORT for the full sweep."
+        "{provider_id}: bounded decode is not selectable under the route-blind fallback (rung 2 is \
+         declared Missing). SC-19753 admits only exact sealed route/tier/mode/overlay/geometry \
+         quality rows; no applicable admitted row reached this fallback. Requested edge {edge:?} \
+         overlap {overlap:?}."
     ))
 }
 
@@ -1237,7 +1239,8 @@ fn begin_with_cleanup(
     )?;
     config.load_shape = context.load_shape;
     mlx_gen::request_scope::authorize_selected_geometry_decode(&mut config, contract, context)?;
-    // Rungs 2 and 3 are `Missing`, so neither can be engaged and neither parameter is ever set.
+    // Rung 2 may be engaged only by the exact policy authorization above. Rung 3 remains `Missing`,
+    // so attention chunking is never set.
     config.attention_chunk_size = None;
     config.transformer_window = contract
         .engages(
@@ -2119,7 +2122,10 @@ mod tests {
             ..Default::default()
         };
         let err = decode_tiling(&tiled).expect_err("a bounded-decode request must be refused");
-        assert!(err.to_string().contains("38/255"), "got: {err}");
+        assert!(
+            err.to_string().contains("no applicable admitted row"),
+            "got: {err}"
+        );
 
         let chunked = GenerationRequest {
             memory: Some(GenerationMemory {

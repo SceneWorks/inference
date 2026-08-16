@@ -231,7 +231,11 @@ fn load_inner(spec: &LoadSpec, fast: bool) -> Result<Box<dyn Generator>> {
     };
     // Named-component contract (sc-13658/sc-13664): the fast variant reads the `distill_lora`
     // component; the base id reads none. Reject any unrecognized component key up front.
-    let known: &[&str] = if fast { &["distill_lora"] } else { &[] };
+    let known: &[&str] = if fast {
+        &[crate::memory_strategy::DISTILL_LORA_COMPONENT]
+    } else {
+        &[]
+    };
     reject_unknown_components(spec, known, id)?;
     // Resolve (and existence-check) the distill LoRA path for a dense-base fast tier *before* the heavy
     // config/weights I/O, so a missing LoRA fails fast at load with an actionable, `distill_lora`-named
@@ -242,7 +246,8 @@ fn load_inner(spec: &LoadSpec, fast: bool) -> Result<Box<dyn Generator>> {
     // universal requirement that broke the pre-merged tier).
     let distill_lora_path = if fast && !root.join(DISTILL_MERGED_MARKER).exists() {
         Some(resolve_distill_lora(
-            spec.components.get("distill_lora"),
+            spec.components
+                .get(crate::memory_strategy::DISTILL_LORA_COMPONENT),
             root,
         )?)
     } else {
@@ -312,7 +317,7 @@ fn load_inner(spec: &LoadSpec, fast: bool) -> Result<Box<dyn Generator>> {
         tokenizer,
         model,
         fast,
-        memory_strategy: crate::memory_strategy::memory_strategy_contract_with_artifact(
+        memory_strategy: crate::memory_strategy::validated_memory_strategy_contract_with_artifact(
             id,
             spec,
             pinned_artifact.as_ref(),
