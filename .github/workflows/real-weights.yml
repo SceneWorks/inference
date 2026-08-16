@@ -836,15 +836,16 @@ jobs:
       max-parallel: 1
       matrix:
         model:
-          - id: illustrious_xl_v1
-            repository: SceneWorks/illustrious-xl-v1-mlx
-            source_revision: c5a92a902dd4e6ee99c2a57981ecf66209905dd1
+          - id: illustrious_xl_v2
+            repository: SceneWorks/illustrious-xl-v2-mlx
+            source_revision: 7c5c8b2bb75a8f38a7365e70bdf84d38d6204473
             steps: 30
             guidance: 7.0
         candidate:
-          - { geometry: "1216x832", edge: "e768", value: "1216x832:768:160" }
+          - { geometry: "768x1344", edge: "e704", value: "768x1344:704:128" }
           - { geometry: "832x1216", edge: "e768", value: "832x1216:768:160" }
-          - { geometry: "1344x768", edge: "e704", value: "1344x768:704:128" }
+          - { geometry: "896x1152", edge: "e832", value: "896x1152:832:160" }
+          - { geometry: "1216x832", edge: "e768", value: "1216x832:768:160" }
           - { geometry: "2048x2048", edge: "e1856", value: "2048x2048:1856:384" }
     env:
       QUALITY_MODEL: ${{ matrix.model.id }}

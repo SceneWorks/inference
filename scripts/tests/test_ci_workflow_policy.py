@@ -943,7 +943,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             "mlx-decode-quality-kolors": 7,
             # SC-19753 diagnostic branch: the first 30 cells are already sealed, so this
             # branch dispatches only the two remaining Illustrious families.
-            "mlx-decode-quality-sdxl": 4,
+            "mlx-decode-quality-sdxl": 5,
             "mlx-decode-quality-chroma": 12,
         }
         for job, cells in expected_cells.items():
@@ -977,7 +977,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                 self.assertIn("--expected-fixture-count 5", collector_step)
         # This diagnostic branch now carries only the three edge probes for the worst
         # remaining coordinate; the authoritative 69-cell set is already sealed separately.
-        self.assertEqual(sum(expected_cells.values()), 23)
+        self.assertEqual(sum(expected_cells.values()), 24)
 
         mutations = {
             "Kolors landscape geometry": ("1280x768:576:48", "1280x720:576:48"),
