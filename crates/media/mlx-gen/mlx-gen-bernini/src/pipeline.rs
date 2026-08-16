@@ -110,6 +110,11 @@ pub struct BerniniRenderer {
     knobs: BerniniKnobs,
     root: PathBuf,
     quant: Option<Quant>,
+    /// The contract this LOAD publishes, and the spec it was built from (sc-18609). Both are needed
+    /// by the `Generator` memory hooks below: without them the loaded generator inherits the trait
+    /// defaults and the whole declared ladder is unreachable through the production route.
+    memory_strategy: mlx_gen::gen_core::MemoryProviderContract,
+    loaded_spec: LoadSpec,
 }
 
 /// Load the Bernini renderer from a converted MLX snapshot directory
@@ -133,12 +138,15 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         )));
     }
     let knobs = BerniniKnobs::from_dir(&root)?;
+    let memory_strategy = crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec)?;
     Ok(Box::new(BerniniRenderer {
         descriptor: descriptor(),
         config,
         knobs,
         root,
         quant: spec.quantize,
+        memory_strategy,
+        loaded_spec: spec.clone(),
     }))
 }
 
@@ -407,10 +415,61 @@ pub fn denoise_bernini_wvitcfg(
     Ok(latent)
 }
 
-mlx_gen::impl_generator!(BerniniRenderer {
-    validate: |s, req| s.validate_impl(req),
-    generate: generate_impl,
-});
+// Hand-written rather than `mlx_gen::impl_generator!` (sc-18609). That macro emits only
+// `descriptor`/`validate`/`generate`, so a provider using it inherits the `Generator` memory-strategy
+// defaults: contract `None`, a safety check that rejects EVERY optimized strategy, and a request
+// scope that returns `Ok(None)`. `memory_strategy.rs` has declared the full five-rung ladder since
+// sc-15528, but until this impl existed the production route reached none of it — the registry
+// declaration was real and the loaded generator was silent about it. Same reason chroma spells its
+// `Generator` out by hand (SC-15520).
+impl Generator for BerniniRenderer {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
+        self.validate_impl(req).map_err(Into::into)
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
+        Some(&self.memory_strategy)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::MemorySafetyDecision {
+        crate::memory_strategy::loaded_safety_check(
+            MODEL_ID,
+            &self.loaded_spec,
+            &self.memory_strategy,
+            context,
+            self.config.num_layers,
+        )
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::Result<Option<Box<dyn mlx_gen::gen_core::MemoryRequestScope + '_>>>
+    {
+        crate::memory_strategy::loaded_begin_request(
+            MODEL_ID,
+            &self.loaded_spec,
+            &self.memory_strategy,
+            context,
+            self.config.num_layers,
+        )
+    }
+}
 
 impl BerniniRenderer {
     fn validate_impl(&self, req: &GenerationRequest) -> Result<()> {

@@ -242,6 +242,249 @@ mod explicit_registry_tests {
         }
     }
 
+    /// A weights-free snapshot dir carrying only the dual-expert `config.json` both loaders read.
+    /// `num_layers` is an explicit override so a test can load a trunk shape the ladder does NOT
+    /// declare, which is what the depth guard exists for.
+    fn snapshot_dir(num_layers: Option<usize>) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = serde_json::json!({
+            "model_type": "t2v",
+            "dim": 5120,
+            "dual_model": true,
+        });
+        if let Some(num_layers) = num_layers {
+            config["num_layers"] = serde_json::json!(num_layers);
+        }
+        std::fs::write(dir.path().join("config.json"), config.to_string()).unwrap();
+        dir
+    }
+
+    fn deferred_spec(root: &std::path::Path) -> mlx_gen::LoadSpec {
+        mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(root.to_path_buf()))
+            .with_quant(mlx_gen::Quant::Q4)
+            .with_offload_policy(mlx_gen::OffloadPolicy::Sequential)
+            .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization)
+    }
+
+    type LoadFn = fn(&mlx_gen::LoadSpec) -> mlx_gen::Result<Box<dyn mlx_gen::Generator>>;
+
+    /// Both registered Bernini loaders, audited independently rather than one inheriting the other.
+    fn loaders() -> [(&'static str, LoadFn); 2] {
+        [
+            (
+                crate::memory_strategy::RENDERER_ID,
+                crate::pipeline::load as LoadFn,
+            ),
+            (
+                crate::memory_strategy::FULL_ID,
+                crate::bernini::load as LoadFn,
+            ),
+        ]
+    }
+
+    /// **SC-18609 — declaration is not reachability.**
+    ///
+    /// `memory_strategy.rs` has declared the full five-rung ladder since sc-15528, but both loaders
+    /// used `mlx_gen::impl_generator!`, which emits only `descriptor`/`validate`/`generate`. The
+    /// loaded generators therefore inherited the `Generator` memory defaults — contract `None`, a
+    /// safety check rejecting every optimized strategy, and `begin_memory_strategy_request` returning
+    /// `Ok(None)` — so the production route reached NONE of the declared rungs while registry
+    /// conformance walked a contract nothing loaded could serve.
+    ///
+    /// This walks the whole chain a real request takes and stops only where weights would be needed:
+    /// loaded contract → provider safety → request scope → `configure_request` → the very resolver
+    /// `generate_impl` calls to build its `BlockPlan`. A test that asserted only "the contract is
+    /// `Some`" would pass on a generator that still refused every window.
+    #[test]
+    fn loaded_generators_reach_every_declared_optimized_rung() {
+        use mlx_gen::gen_core::{
+            MemoryOptimizationAuthority, MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy,
+        };
+
+        let snapshot = snapshot_dir(None);
+        let spec = deferred_spec(snapshot.path());
+        let fixture_contract = |provider_id: &str| {
+            crate::memory_strategy::weights_free_memory_strategy_contract(provider_id, &spec)
+        };
+
+        for (provider_id, load) in loaders() {
+            let model = load(&spec).unwrap_or_else(|error| panic!("{provider_id}: {error}"));
+            let contract = model.memory_strategy_contract().unwrap_or_else(|| {
+                panic!("{provider_id}: a loaded generator must publish its declared contract")
+            });
+            assert_eq!(contract.provider_id, provider_id);
+
+            let declaration = fixture_contract(provider_id).unwrap();
+            for strategy in [
+                MemoryStrategy::StagedResidency,
+                MemoryStrategy::BoundedDecode,
+                MemoryStrategy::BoundedAttention,
+                MemoryStrategy::BoundedTransformerResidency,
+            ] {
+                let fixture =
+                    crate::memory_strategy::registered_valid_fixture(&spec, &declaration, strategy)
+                        .unwrap()
+                        .remove(0);
+                let mut context = fixture.context;
+                // The production contract mints no calibration identity until a real-weight record
+                // exists, so an optimized selection rides explicit estimate authority.
+                context.optimization_authority = MemoryOptimizationAuthority::Estimated;
+                assert_eq!(
+                    model.memory_strategy_safety_check(&context),
+                    MemorySafetyDecision::Accept,
+                    "{provider_id}: {strategy:?} is declared Implemented and must be admitted"
+                );
+
+                let mut scope = model
+                    .begin_memory_strategy_request(&context)
+                    .unwrap_or_else(|error| panic!("{provider_id} {strategy:?}: {error}"))
+                    .unwrap_or_else(|| {
+                        panic!("{provider_id}: {strategy:?} must open a request scope")
+                    });
+                let mut request = fixture.request.clone();
+                scope.configure_request(&mut request).unwrap();
+                let memory = request
+                    .memory
+                    .expect("the scope must configure request memory");
+
+                // The declared lever reached the request-side resolver `generate_impl` consumes,
+                // carrying the SELECTED parameter rather than the provider's default — a resolver
+                // that ignored the selection and fell back to its own default would still return
+                // `Some`, so the value is what makes this a reach proof.
+                let selected = context.selection.parameters;
+                match strategy {
+                    MemoryStrategy::StagedResidency => assert!(memory.stage_residency),
+                    MemoryStrategy::BoundedDecode => {
+                        assert_eq!(memory.decode_tile_edge, selected.decode_tile_edge);
+                        assert!(crate::memory_strategy::decode_tiling(&request)
+                            .unwrap()
+                            .is_some());
+                    }
+                    MemoryStrategy::BoundedAttention => {
+                        assert!(!crate::memory_strategy::attention_budget(&request).is_unbounded());
+                    }
+                    MemoryStrategy::BoundedTransformerResidency => {
+                        let cadence = selected
+                            .transformer_window_size
+                            .expect("the admitted selection names a cadence");
+                        assert!(
+                            crate::memory_strategy::TRANSFORMER_WINDOW_SIZES.contains(&cadence),
+                            "{provider_id}: {cadence} is outside the published domain"
+                        );
+                        assert_eq!(
+                            crate::memory_strategy::transformer_window_size(&request).unwrap(),
+                            Some(cadence as usize),
+                            "{provider_id}: the admitted window must reach the block-plan resolver"
+                        );
+                    }
+                    MemoryStrategy::Resident => unreachable!(),
+                }
+                // The configured request is still one this provider would run.
+                model.validate(&request).unwrap_or_else(|error| {
+                    panic!("{provider_id} {strategy:?}: configured request must validate: {error}")
+                });
+                scope.finish(MemoryRunOutcome::Complete).unwrap();
+            }
+        }
+    }
+
+    /// The declared rung-4 window domain and the 80-block index space are both derived from the
+    /// pinned 40-block Wan A14B expert, but a snapshot's `config.json` may set `num_layers` alongside
+    /// `dual_model`. Only a LOADED generator knows the real depth, so only it can refuse the
+    /// mismatch — and it must refuse rung 4 ONLY, leaving the rungs that never index the trunk alone.
+    #[test]
+    fn a_loaded_trunk_of_an_undeclared_depth_refuses_only_rung_four() {
+        use mlx_gen::gen_core::{
+            MemoryOptimizationAuthority, MemorySafetyDecision, MemoryStrategy,
+        };
+
+        let snapshot = snapshot_dir(Some(30));
+        let spec = deferred_spec(snapshot.path());
+        for (provider_id, load) in loaders() {
+            let model = load(&spec).expect("an undeclared trunk depth still loads and renders");
+            let declaration =
+                crate::memory_strategy::weights_free_memory_strategy_contract(provider_id, &spec)
+                    .unwrap();
+            let context = |strategy| {
+                let mut context =
+                    crate::memory_strategy::registered_valid_fixture(&spec, &declaration, strategy)
+                        .unwrap()
+                        .remove(0)
+                        .context;
+                context.optimization_authority = MemoryOptimizationAuthority::Estimated;
+                context
+            };
+
+            let windowed = context(MemoryStrategy::BoundedTransformerResidency);
+            let reason = match model.memory_strategy_safety_check(&windowed) {
+                MemorySafetyDecision::Reject { reason } => reason,
+                MemorySafetyDecision::Accept => panic!(
+                    "{provider_id}: a 30-block expert has no aligned window in the published domain"
+                ),
+            };
+            assert!(reason.contains("30"), "{reason}");
+            assert!(model.begin_memory_strategy_request(&windowed).is_err());
+
+            for unaffected in [
+                MemoryStrategy::StagedResidency,
+                MemoryStrategy::BoundedDecode,
+                MemoryStrategy::BoundedAttention,
+            ] {
+                assert_eq!(
+                    model.memory_strategy_safety_check(&context(unaffected)),
+                    MemorySafetyDecision::Accept,
+                    "{provider_id}: {unaffected:?} does not index the trunk"
+                );
+            }
+        }
+    }
+
+    /// The registered fixture has to be a request each variant would actually accept. Its geometry is
+    /// the shared 1024x1024 anchor, which is over the 14B **video** area cap — so the declared route
+    /// only survives its own geometry guard as the one-frame still-image lane, matching the
+    /// `MemoryMode::TextToImage` the fixture declares. Checked per variant: the renderer is
+    /// `Modality::Video` and the full pipeline is `Modality::Both`, so this is not one variant's
+    /// result assumed to hold for the other.
+    #[test]
+    fn every_registered_fixture_is_an_executable_request_on_its_own_variant() {
+        let snapshot = snapshot_dir(None);
+        let spec = deferred_spec(snapshot.path());
+        for (provider_id, descriptor) in [
+            (
+                crate::memory_strategy::RENDERER_ID,
+                crate::pipeline::descriptor as fn() -> mlx_gen::ModelDescriptor,
+            ),
+            (
+                crate::memory_strategy::FULL_ID,
+                crate::bernini::descriptor as fn() -> mlx_gen::ModelDescriptor,
+            ),
+        ] {
+            let descriptor = descriptor();
+            let declaration =
+                crate::memory_strategy::weights_free_memory_strategy_contract(provider_id, &spec)
+                    .unwrap();
+            for strategy in mlx_gen::gen_core::MemoryStrategy::ALL {
+                for fixture in
+                    crate::memory_strategy::registered_valid_fixture(&spec, &declaration, strategy)
+                        .unwrap()
+                {
+                    assert!(
+                        !fixture.context.has_phases,
+                        "{provider_id}: bernini reads no GenerationPhase"
+                    );
+                    assert!(fixture.request.phases.is_none(), "{provider_id}");
+                    assert_eq!(fixture.request.frames, Some(1), "{provider_id}");
+                    descriptor
+                        .capabilities
+                        .validate_request(descriptor.id, &fixture.request)
+                        .unwrap_or_else(|error| panic!("{provider_id} {strategy:?}: {error}"));
+                    crate::config::validate_bernini_geometry(descriptor.id, &fixture.request)
+                        .unwrap_or_else(|error| panic!("{provider_id} {strategy:?}: {error}"));
+                }
+            }
+        }
+    }
+
     /// The shared weights-free behavior oracle: every registered contract, safety check, fixture and
     /// request scope has to agree with the ladder each provider declares — including that a rung the
     /// contract calls `Missing` cannot be begun, and that an admitted scope's lifecycle hooks accept
