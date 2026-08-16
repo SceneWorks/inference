@@ -728,9 +728,9 @@ jobs:
   mlx-decode-quality-kolors:
     name: Decode quality admission (Kolors ${{ matrix.candidate.geometry }})
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'decode-quality-kolors'
-    # SC-19753 diagnostic only: select the provisioned high-headroom Metal host explicitly. The
-    # generic nax pool also contains a host whose task-local Z snapshot currently fills its disk.
-    runs-on: [self-hosted, macOS, ARM64, nax, real-weights]
+    # SC-19753 diagnostic only: the read-only audit recorded 95,137,236 KiB free on this host. Keep
+    # a 40 GiB pre-download floor while using its cached q4 snapshots in parallel with Chroma.
+    runs-on: [self-hosted, macOS, ARM64, rw-chroma]
     timeout-minutes: 720
     strategy:
       fail-fast: false
@@ -754,7 +754,7 @@ jobs:
       - name: Guard diagnostic download headroom
         run: |
           available_kib="$(df -Pk "$RUNNER_TEMP" | awk 'NR == 2 { print $4 }')"
-          test "$available_kib" -ge 104857600
+          test "$available_kib" -ge 41943040
       - name: Toolchain versions
         run: rustc --version && cargo --version && python3.12 --version
       - name: Materialize exact Kolors q4 snapshot
@@ -810,8 +810,8 @@ jobs:
   mlx-decode-quality-sdxl:
     name: Decode quality admission (${{ matrix.model.id }} ${{ matrix.candidate.geometry }})
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'decode-quality-sdxl'
-    # SC-19753 diagnostic only; see the Kolors job's runner-selection rationale above.
-    runs-on: [self-hosted, macOS, ARM64, nax, real-weights]
+    # SC-19753 diagnostic only; see the Kolors job's audited runner-selection rationale above.
+    runs-on: [self-hosted, macOS, ARM64, rw-chroma]
     timeout-minutes: 720
     strategy:
       fail-fast: false
@@ -869,7 +869,7 @@ jobs:
       - name: Guard diagnostic download headroom
         run: |
           available_kib="$(df -Pk "$RUNNER_TEMP" | awk 'NR == 2 { print $4 }')"
-          test "$available_kib" -ge 104857600
+          test "$available_kib" -ge 41943040
       - name: Toolchain versions
         run: rustc --version && cargo --version && python3.12 --version
       - name: Materialize exact SDXL-family q4 snapshot
