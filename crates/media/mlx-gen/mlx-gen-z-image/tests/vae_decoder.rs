@@ -155,12 +155,15 @@ fn vae_tiled_decode_tracks_dense_with_global_group_norm() {
 fn vae_tiled_decode_honors_pretripped_cancel() {
     let w = Weights::from_file(FIXTURE).unwrap();
     let vae = Vae::from_weights(&w, "", &small_cfg()).unwrap();
-    let latent = w.require("in.latent").unwrap();
-    let sh = latent.shape();
-    let latent5 = latent.reshape(&[sh[0], sh[1], 1, sh[2], sh[3]]).unwrap();
+    let malformed = Array::from_slice(&[1.0_f32], &[1]);
     let cancel = CancelFlag::new();
     cancel.cancel();
 
-    let result = vae.decode_tiled(&latent5, &TilingConfig::spatial_only(8, 0), Some(&cancel));
-    assert!(matches!(result, Err(Error::Canceled)));
+    for cfg in [
+        TilingConfig::spatial_only(8, 0),
+        TilingConfig::spatial_only(4096, 64),
+    ] {
+        let result = vae.decode_tiled(&malformed, &cfg, Some(&cancel));
+        assert!(matches!(result, Err(Error::Canceled)));
+    }
 }
