@@ -95,7 +95,12 @@ pub const PROVIDER_IDS: [&str; 2] = [RENDERER_ID, FULL_ID];
 ///
 /// Deliberately distinct from [`MEMORY_CALIBRATION_FINGERPRINT`]: this one describes *declaration*
 /// behaviour over a synthetic spec, and must never be mistaken for a measured production cell.
-const STATIC_CALIBRATION: &str = "bernini-mlx-registry-behavior-v1";
+///
+/// `-v2` (sc-18609): the registered route fixture changed shape — it now declares the single-phase,
+/// one-frame still-image route it actually executes instead of claiming `has_phases`. Versioning the
+/// *declaration* key rather than [`MEMORY_CALIBRATION_FINGERPRINT`] keeps the (still unminted)
+/// production identity from being restamped by a route correction.
+const STATIC_CALIBRATION: &str = "bernini-mlx-registry-behavior-v2";
 
 /// The production calibration identity, minted once a cell has real-weight evidence behind it.
 ///
@@ -171,6 +176,33 @@ pub fn trunk_blocks() -> usize {
     2 * expert_blocks()
 }
 
+/// Refuse rung 4 on a loaded snapshot whose expert depth is not the declared one (sc-18609).
+///
+/// The crate-private `expert_blocks` reads the pinned `wan22_t2v_14b` config, so every published cadence in
+/// [`TRANSFORMER_WINDOW_SIZES`] and the trunk depth handed to the shared request scope are derived
+/// from 40. A snapshot's `config.json` can nonetheless set `num_layers` alongside `dual_model`
+/// (`WanModelConfig::apply_overrides`), and both loaders accept whatever it says. Before this guard
+/// a 30-block dual snapshot would have been admitted against a divisors-of-40 domain and a declared
+/// 80-block index space: cadence 20 would put the low expert's first window at global block 60 while
+/// the real boundary is 30, i.e. a window spanning both experts. That is the declaration/reachability
+/// gap the epic forbids, so the rung refuses with a typed error instead of mis-aligning mid-denoise.
+///
+/// This gates only the optimized route. The load itself, and rungs 0-3, are unaffected — none of
+/// them index the trunk.
+pub fn check_loaded_expert_depth(provider_id: &str, loaded_expert_blocks: usize) -> CoreResult<()> {
+    if loaded_expert_blocks == expert_blocks() {
+        return Ok(());
+    }
+    Err(CoreError::Unsupported(format!(
+        "{provider_id}: bounded transformer residency is declared over a {}-block expert \
+         ({}-block trunk) and publishes the cadences {TRANSFORMER_WINDOW_SIZES:?}; this snapshot \
+         loads {loaded_expert_blocks} blocks per expert, so no published window is aligned to its \
+         expert boundary",
+        expert_blocks(),
+        trunk_blocks()
+    )))
+}
+
 /// Whether THIS load can execute rung 4.
 ///
 /// Two independent facts decide it, and only one of them is a [`LoadShape`]:
@@ -238,7 +270,12 @@ pub fn memory_strategy_contract(
 /// Declaration-equivalent contract used by weights-free registry conformance. Structure, parameter
 /// domains and prerequisites are identical; only the measured asset facts are absent, and the
 /// calibration identity is the static declaration key rather than a production one.
-pub(crate) fn weights_free_memory_strategy_contract(
+///
+/// `pub` (sc-18609) for the same reason FLUX.1 and PuLID export theirs: this is the only contract in
+/// the family that carries a calibration identity, and `standard_memory_behavior_context` refuses to
+/// build a run context without one. An out-of-crate evidence runner therefore cannot construct the
+/// declared route from `memory_strategy_contract` alone until a production cell is minted.
+pub fn weights_free_memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> CoreResult<MemoryProviderContract> {
@@ -448,6 +485,18 @@ pub(crate) fn safety_check(
                 contract.provider_id
             )));
         }
+        // sc-18609. `MemoryRunContext::has_phases` describes the request's multi-phase denoise
+        // (`GenerationRequest::phases`, epic 13879), which only the Krea MLX family reads — NOT this
+        // contract's `MemoryPhase` lifecycle, which is a different axis and is always present here.
+        // Nothing in this crate reads `req.phases`, so a phased admission would record evidence for a
+        // trajectory Bernini cannot run. Reject it rather than silently render the single-phase one.
+        if context.has_phases {
+            return Err(CoreError::Unsupported(format!(
+                "{}: bernini runs a single-phase denoise; the multi-phase request trajectory is not \
+                 implemented on this provider",
+                contract.provider_id
+            )));
+        }
         // sc-15839 review defect, unconstrained batch geometry. `max_count: 1` on both descriptors,
         // so a batched admission would record evidence for a route `validate` rejects anyway.
         if context.geometry.batch != 1 {
@@ -538,11 +587,24 @@ pub(crate) fn registered_valid_fixture(
             mode: MemoryMode::TextToImage,
             reference_count: 0,
             use_pid: false,
-            has_phases: true,
+            // Single-phase, deliberately (sc-18609). See the `has_phases` gate in `safety_check`:
+            // this axis is the request's multi-phase denoise trajectory, which Bernini does not
+            // read, not the contract's `MemoryPhase` lifecycle, which it always runs.
+            has_phases: false,
             overlay: None,
         },
     )?;
-    Ok(vec![MemoryBehaviorFixture::new(context)])
+    // The fixture request must be one this provider would actually accept, or the weights-free
+    // behavior oracle validates a route production `validate` rejects. `standard_memory_behavior_context`
+    // pins a 1024x1024, 1-frame geometry; `frames: Some(1)` is what makes that the STILL-IMAGE lane,
+    // whose carve-out in `validate_bernini_geometry` admits 1024^2. Left at the `None` default the
+    // same request is a video render at 1.05 Mpx, over the 14B video area cap — i.e. the declared
+    // route would not survive its own geometry guard. This matches the mode declared above.
+    let mut fixture = MemoryBehaviorFixture::new(context);
+    fixture.request.prompt = "weights-free bernini memory behavior".to_owned();
+    fixture.request.frames = Some(1);
+    fixture.request.phases = None;
+    Ok(vec![fixture])
 }
 
 pub(crate) fn registered_begin_request(
@@ -573,6 +635,46 @@ pub fn begin_request(
         context,
         mlx_gen::request_scope::MlxScopeCleanup::Device,
     )
+}
+
+/// Provider safety for a **loaded** generator (sc-18609).
+///
+/// Identical to the crate-private `safety_check` plus the one fact only a loaded generator has: the snapshot's real
+/// expert depth. See [`check_loaded_expert_depth`].
+pub fn loaded_safety_check(
+    provider_id: &str,
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    loaded_expert_blocks: usize,
+) -> MemorySafetyDecision {
+    if contract.engages(
+        context.selection.strategy,
+        MemoryStrategy::BoundedTransformerResidency,
+    ) {
+        if let Err(error) = check_loaded_expert_depth(provider_id, loaded_expert_blocks) {
+            return MemorySafetyDecision::Reject {
+                reason: error.to_string(),
+            };
+        }
+    }
+    safety_check(spec, contract, context)
+}
+
+/// Request scope for a **loaded** generator: [`begin_request`] behind [`loaded_safety_check`].
+pub fn loaded_begin_request(
+    provider_id: &'static str,
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    loaded_expert_blocks: usize,
+) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
+    if let MemorySafetyDecision::Reject { reason } =
+        loaded_safety_check(provider_id, spec, contract, context, loaded_expert_blocks)
+    {
+        return Err(CoreError::Unsupported(reason));
+    }
+    begin_request(provider_id, spec, contract, context)
 }
 
 fn begin_with_cleanup(
@@ -1010,6 +1112,175 @@ mod tests {
                 contract.resident_request_memory,
                 ResidentRequestMemory::PreserveLoadDefaults
             );
+        }
+    }
+
+    /// The exact declared surface both variants publish across the whole MLX registry-load matrix
+    /// (sc-18609) — 3 artifact tiers x 2 offload policies x 2 load shapes, per provider.
+    ///
+    /// The per-rung counts are the family's real shape, not a copy of a neighbour's: rungs 0-3 are
+    /// unconditional, and rung 4 rides the load shape ALONE. It is 6 rather than 3 per provider
+    /// because `structurally_streamable` does not consult `OffloadPolicy` — both descriptors advertise
+    /// `supports_sequential_offload: false` (the family is unconditionally staged, so the policy is
+    /// not a lever here), and gating rung 4 on a control the provider does not consume would declare a
+    /// dependency that does not exist.
+    #[test]
+    fn both_variants_publish_the_exact_declared_surface_ladder() {
+        use mlx_gen::gen_core::{LoadShape as Shape, MemoryContractSurfaceTier};
+        use std::collections::BTreeSet;
+
+        let registry = crate::provider_registry().unwrap();
+        let surfaces = registry.memory_contract_surfaces().unwrap();
+        assert_eq!(
+            surfaces.len(),
+            24,
+            "2 providers x 12 registry-load surfaces"
+        );
+
+        for provider_id in PROVIDER_IDS {
+            let provider: Vec<_> = surfaces
+                .iter()
+                .filter(|surface| surface.contract.provider_id == provider_id)
+                .collect();
+            assert_eq!(provider.len(), 12, "{provider_id}");
+            let selectors: BTreeSet<_> = provider
+                .iter()
+                .map(|surface| surface.selector.id())
+                .collect();
+            let expected: BTreeSet<_> = [
+                "bf16:resident:eager",
+                "bf16:resident:deferred",
+                "bf16:sequential:eager",
+                "bf16:sequential:deferred",
+                "q4:resident:eager",
+                "q4:resident:deferred",
+                "q4:sequential:eager",
+                "q4:sequential:deferred",
+                "q8:resident:eager",
+                "q8:resident:deferred",
+                "q8:sequential:eager",
+                "q8:sequential:deferred",
+            ]
+            .into_iter()
+            .collect();
+            assert_eq!(selectors, expected, "{provider_id}");
+
+            let count = |strategy| {
+                provider
+                    .iter()
+                    .filter(|surface| {
+                        surface
+                            .contract
+                            .capability(strategy)
+                            .expect("the complete bernini ladder")
+                            .support
+                            == MemoryStrategySupport::Implemented
+                    })
+                    .count()
+            };
+            assert_eq!(count(MemoryStrategy::Resident), 12, "{provider_id}");
+            assert_eq!(count(MemoryStrategy::StagedResidency), 12, "{provider_id}");
+            assert_eq!(count(MemoryStrategy::BoundedDecode), 12, "{provider_id}");
+            assert_eq!(count(MemoryStrategy::BoundedAttention), 12, "{provider_id}");
+            assert_eq!(
+                count(MemoryStrategy::BoundedTransformerResidency),
+                6,
+                "{provider_id}: rung 4 rides the load shape alone"
+            );
+
+            for surface in &provider {
+                assert!(!surface.composed, "{provider_id}");
+                assert!(
+                    matches!(
+                        surface.resolved_artifact_tier(),
+                        MemoryContractSurfaceTier::Bf16
+                            | MemoryContractSurfaceTier::Q4
+                            | MemoryContractSurfaceTier::Q8
+                    ),
+                    "{provider_id}: MLX facts omit NVFP4"
+                );
+                let windowed = surface
+                    .contract
+                    .capability(MemoryStrategy::BoundedTransformerResidency)
+                    .unwrap()
+                    .support
+                    == MemoryStrategySupport::Implemented;
+                assert_eq!(
+                    windowed,
+                    surface.selector.load_shape == Shape::DeferredMaterialization,
+                    "{provider_id} [{}]",
+                    surface.selector.id()
+                );
+                if windowed {
+                    assert_eq!(
+                        surface
+                            .contract
+                            .capability(MemoryStrategy::BoundedTransformerResidency)
+                            .unwrap()
+                            .parameters
+                            .transformer_window_sizes,
+                        TRANSFORMER_WINDOW_SIZES.to_vec(),
+                        "{provider_id}"
+                    );
+                }
+                assert!(
+                    surface
+                        .contract
+                        .calibration
+                        .as_ref()
+                        .is_some_and(|identity| identity.fingerprint == STATIC_CALIBRATION),
+                    "{provider_id}: a declaration surface carries the declaration key only"
+                );
+            }
+        }
+    }
+
+    /// A phased request trajectory is refused, not silently rendered single-phase. Nothing in this
+    /// crate reads `GenerationRequest::phases`, so admitting one would record evidence for a
+    /// trajectory Bernini cannot run.
+    #[test]
+    fn a_phased_request_trajectory_is_refused() {
+        for provider_id in PROVIDER_IDS {
+            let spec = spec(LoadShape::DeferredMaterialization);
+            let contract = contract(provider_id, LoadShape::DeferredMaterialization);
+            let mut context = registered_valid_fixture(
+                &spec,
+                &contract,
+                MemoryStrategy::BoundedTransformerResidency,
+            )
+            .unwrap()
+            .remove(0)
+            .context;
+            assert!(!context.has_phases);
+            assert_eq!(
+                safety_check(&spec, &contract, &context),
+                MemorySafetyDecision::Accept
+            );
+            context.has_phases = true;
+            assert!(matches!(
+                safety_check(&spec, &contract, &context),
+                MemorySafetyDecision::Reject { .. }
+            ));
+            assert!(
+                registered_begin_request(provider_id, &spec, &contract, &context).is_err(),
+                "{provider_id}"
+            );
+        }
+    }
+
+    /// The loaded-trunk-depth guard refuses exactly the depths whose experts no published cadence can
+    /// align to, and refuses nothing else. Mutated one depth at a time rather than as a set.
+    #[test]
+    fn the_loaded_trunk_depth_guard_admits_only_the_declared_expert() {
+        for provider_id in PROVIDER_IDS {
+            check_loaded_expert_depth(provider_id, expert_blocks())
+                .expect("the declared depth must be admitted");
+            for depth in [0_usize, 1, 20, 30, 39, 41, 80] {
+                let error = check_loaded_expert_depth(provider_id, depth)
+                    .expect_err("an undeclared expert depth must be refused")
+                    .to_string();
+                assert!(error.contains(&depth.to_string()), "{error}");
+            }
         }
     }
 
