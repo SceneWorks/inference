@@ -145,6 +145,69 @@ pub const fn calibration_fingerprint(policy: OffloadPolicy) -> &'static str {
     }
 }
 
+/// The two catalog ids this contract serves.
+///
+/// A contract minted for any other id is a declaration no route can reach — the exact defect class
+/// SC-18607 exists to close — so the id is authenticated rather than interpolated into the result.
+fn is_known_provider(provider_id: &str) -> bool {
+    matches!(provider_id, crate::MODEL_ID | crate::SPRINT_MODEL_ID)
+}
+
+/// **Fail closed on every load axis the loader itself refuses or silently discards (SC-18607).**
+///
+/// A memory contract is a claim about a load that can actually run. Before this gate the
+/// declaration was minted from the load shape alone, so three separate shapes got a full published
+/// ladder they could never execute:
+///
+/// 1. axes `crate::model::load_components` rejects outright — a non-`Bf16` precision override, a
+///    LoRA/LoKr adapter set, and a single-file source;
+/// 2. component slots SANA **never reads** — `control`, `extra_controls`, `ip_adapter`, `pid`,
+///    `identity`, `text_encoder` and named `components`. The loader resolves every component from
+///    the snapshot root, so a caller-provisioned overlay in one of those slots is discarded today;
+///    declaring a ladder over it advertises a composition nothing executes;
+/// 3. an unknown provider id.
+///
+/// `quantize` is deliberately NOT here: SANA's tiers are **packed-detected from disk**, so
+/// `LoadSpec::quantize` is advisory and every tier resolves the same declared ladder — see
+/// `the_declared_ladder_is_invariant_in_the_advisory_quantize_axis`.
+fn validate_load_contract(provider_id: &str, spec: &LoadSpec) -> CoreResult<()> {
+    if !is_known_provider(provider_id) {
+        return Err(CoreError::Unsupported(format!(
+            "unknown SANA provider {provider_id}"
+        )));
+    }
+    if !matches!(spec.weights, WeightsSource::Dir(_)) {
+        return Err(CoreError::Unsupported(format!(
+            "{provider_id}: SANA memory routes require a snapshot directory \
+             (transformer/ vae/ text_encoder/), not a single .safetensors file"
+        )));
+    }
+    if spec.precision != mlx_gen::Precision::Bf16 {
+        return Err(CoreError::Unsupported(format!(
+            "{provider_id}: only the default dense precision is wired (drop the precision override)"
+        )));
+    }
+    if !spec.adapters.is_empty() {
+        return Err(CoreError::Unsupported(format!(
+            "{provider_id}: LoRA/LoKr adapters are not supported"
+        )));
+    }
+    if spec.control.is_some()
+        || !spec.extra_controls.is_empty()
+        || spec.ip_adapter.is_some()
+        || spec.pid.is_some()
+        || spec.identity.is_some()
+        || spec.text_encoder.is_some()
+        || !spec.components.is_empty()
+    {
+        return Err(CoreError::Unsupported(format!(
+            "{provider_id}: SANA loads every component from the snapshot root; it has no control, \
+             IP-adapter, PiD, identity, external text-encoder or named-component slot"
+        )));
+    }
+    Ok(())
+}
+
 /// Whether THIS load can execute a rung-4 window. See the module doc — two independent load-time
 /// facts, and `OffloadPolicy` is not one of them.
 pub(crate) fn is_streamable(spec: &LoadSpec) -> bool {
@@ -192,6 +255,7 @@ pub fn memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> CoreResult<MemoryProviderContract> {
+    validate_load_contract(provider_id, spec)?;
     let components = crate::model::component_footprint(spec)?;
     contract_with_asset_facts(
         provider_id,
@@ -206,6 +270,7 @@ pub(crate) fn weights_free_memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> CoreResult<MemoryProviderContract> {
+    validate_load_contract(provider_id, spec)?;
     contract_with_asset_facts(provider_id, spec, 0, 0, 0)
 }
 
@@ -715,9 +780,18 @@ mod tests {
         ));
         assert!(!is_streamable(&adapted));
 
-        for unavailable in [eager, single_file, adapted] {
-            let contract =
-                weights_free_memory_strategy_contract(crate::MODEL_ID, &unavailable).unwrap();
+        // SC-18607: a single-file source and an adapter set are not "rung 4 unavailable" — they are
+        // loads SANA refuses outright, so the contract refuses to describe them AT ALL rather than
+        // publishing rungs 1-3 over a composition no route can execute.
+        for unloadable in [&single_file, &adapted] {
+            assert!(weights_free_memory_strategy_contract(crate::MODEL_ID, unloadable).is_err());
+            assert!(memory_strategy_contract(crate::SPRINT_MODEL_ID, unloadable).is_err());
+        }
+
+        // An EAGER directory load, by contrast, is a real declarable load — it simply cannot execute
+        // a window, so it keeps rungs 1-3 and drops rung 4.
+        {
+            let contract = weights_free_memory_strategy_contract(crate::MODEL_ID, &eager).unwrap();
             assert!(contract.conformance_errors().is_empty());
             assert_eq!(
                 contract
@@ -779,122 +853,269 @@ mod tests {
         assert!(variables.contains(&MemoryFormulaVariable::AttentionChunkSize));
     }
 
-    /// **Every published parameter is refused outside its domain, on the production layer.**
+    /// **Every published parameter is refused outside its domain, on the production layer — for BOTH
+    /// catalog entries.**
+    ///
+    /// SC-18607: the pair shares one provider module, and sharing code is explicitly not what makes
+    /// an entry covered. Sprint carried no domain-enforcement assertion of its own before this, so a
+    /// refusal keyed on the base id would have shipped Sprint an unenforced ladder.
     #[test]
     fn request_scoped_parameters_are_refused_outside_the_published_domain() {
-        let spec = streamable_spec(OffloadPolicy::Sequential);
-        let full = GenerationMemory {
-            stage_residency: true,
-            tile_vae_decode: true,
-            chunk_attention: true,
-            stream_transformer_blocks: true,
-            decode_tile_edge: Some(DECODE_TILE_EDGE as u32),
-            decode_overlap: Some(DECODE_OVERLAP as u32),
-            attention_chunk_size: Some(ATTENTION_CHUNK_SIZE),
-            transformer_window_size: Some(TRANSFORMER_WINDOW_SIZE),
-            transformer_window_component: Some(TransformerComponent::Dit),
-            ..Default::default()
-        };
-        // Rung 4 is withheld, so the fully published SELECTION is rungs 1-3.
-        let published = GenerationMemory {
-            stream_transformer_blocks: false,
-            transformer_window_size: None,
-            transformer_window_component: None,
-            ..full
-        };
-        validate_request_memory(crate::MODEL_ID, &spec, &published)
-            .expect("the fully published selection must be accepted");
-        // …and every rung-4 selection is refused by name, whatever its parameters.
-        for window in TRANSFORMER_WINDOW_SIZES {
-            let error = validate_request_memory(
-                crate::MODEL_ID,
-                &spec,
-                &GenerationMemory {
-                    transformer_window_size: Some(*window),
-                    ..full
-                },
-            )
-            .expect_err("a withheld rung must be refused");
-            assert!(
-                error.to_string().contains("WITHHELD"),
-                "the refusal must name the withdrawal, got: {error}"
-            );
-        }
-        // Every published value in every domain is reachable.
-        for edge in DECODE_TILE_EDGES {
-            let mut memory = published;
-            memory.decode_tile_edge = Some(*edge);
-            validate_request_memory(crate::MODEL_ID, &spec, &memory).unwrap();
-        }
-        for size in ATTENTION_CHUNK_SIZES {
-            let mut memory = published;
-            memory.attention_chunk_size = Some(*size);
-            validate_request_memory(crate::MODEL_ID, &spec, &memory).unwrap();
-        }
-        let mut refusals = Vec::new();
-        let mut check = |label: &str, memory: GenerationMemory| {
-            if validate_request_memory(crate::MODEL_ID, &spec, &memory).is_ok() {
-                refusals.push(label.to_owned());
-            }
-        };
-        for rejected in DECODE_TILE_EDGES_REJECTED {
-            check(
-                "decode edge",
-                GenerationMemory {
-                    decode_tile_edge: Some(*rejected),
-                    ..published
-                },
-            );
-        }
-        for rejected in ATTENTION_CHUNK_SIZES_REJECTED.iter().chain(&[0, 7, 999]) {
-            check(
-                "attention budget",
-                GenerationMemory {
-                    attention_chunk_size: Some(*rejected),
-                    ..published
-                },
-            );
-        }
-        for rejected in [0_u32, 3, 6, 7, 11, 20, 21] {
-            check(
-                "window cadence",
-                GenerationMemory {
-                    transformer_window_size: Some(rejected),
-                    ..full
-                },
-            );
-        }
-        for component in [
-            TransformerComponent::TextEncoder,
-            TransformerComponent::Both,
-        ] {
-            check(
-                "window component",
-                GenerationMemory {
-                    transformer_window_component: Some(component),
-                    ..full
-                },
-            );
-        }
-        check(
-            "rung 4 without rung 1",
-            GenerationMemory {
-                stage_residency: false,
+        for provider in [crate::MODEL_ID, crate::SPRINT_MODEL_ID] {
+            let spec = streamable_spec(OffloadPolicy::Sequential);
+            let full = GenerationMemory {
+                stage_residency: true,
+                tile_vae_decode: true,
+                chunk_attention: true,
+                stream_transformer_blocks: true,
+                decode_tile_edge: Some(DECODE_TILE_EDGE as u32),
+                decode_overlap: Some(DECODE_OVERLAP as u32),
+                attention_chunk_size: Some(ATTENTION_CHUNK_SIZE),
+                transformer_window_size: Some(TRANSFORMER_WINDOW_SIZE),
+                transformer_window_component: Some(TransformerComponent::Dit),
+                ..Default::default()
+            };
+            // Rung 4 is withheld, so the fully published SELECTION is rungs 1-3.
+            let published = GenerationMemory {
+                stream_transformer_blocks: false,
+                transformer_window_size: None,
+                transformer_window_component: None,
                 ..full
-            },
-        );
-        assert!(
-            refusals.is_empty(),
-            "these out-of-domain selections were silently admitted: {refusals:?}"
-        );
+            };
+            validate_request_memory(provider, &spec, &published)
+                .expect("the fully published selection must be accepted");
+            // …and every rung-4 selection is refused by name, whatever its parameters.
+            for window in TRANSFORMER_WINDOW_SIZES {
+                let error = validate_request_memory(
+                    provider,
+                    &spec,
+                    &GenerationMemory {
+                        transformer_window_size: Some(*window),
+                        ..full
+                    },
+                )
+                .expect_err("a withheld rung must be refused");
+                assert!(
+                    error.to_string().contains("WITHHELD"),
+                    "{provider}: the refusal must name the withdrawal, got: {error}"
+                );
+            }
+            // Every published value in every domain is reachable.
+            for edge in DECODE_TILE_EDGES {
+                let mut memory = published;
+                memory.decode_tile_edge = Some(*edge);
+                validate_request_memory(provider, &spec, &memory).unwrap();
+            }
+            for size in ATTENTION_CHUNK_SIZES {
+                let mut memory = published;
+                memory.attention_chunk_size = Some(*size);
+                validate_request_memory(provider, &spec, &memory).unwrap();
+            }
+            let mut refusals = Vec::new();
+            let mut check = |label: &str, memory: GenerationMemory| {
+                if validate_request_memory(provider, &spec, &memory).is_ok() {
+                    refusals.push(label.to_owned());
+                }
+            };
+            for rejected in DECODE_TILE_EDGES_REJECTED {
+                check(
+                    "decode edge",
+                    GenerationMemory {
+                        decode_tile_edge: Some(*rejected),
+                        ..published
+                    },
+                );
+            }
+            for rejected in ATTENTION_CHUNK_SIZES_REJECTED.iter().chain(&[0, 7, 999]) {
+                check(
+                    "attention budget",
+                    GenerationMemory {
+                        attention_chunk_size: Some(*rejected),
+                        ..published
+                    },
+                );
+            }
+            for rejected in [0_u32, 3, 6, 7, 11, 20, 21] {
+                check(
+                    "window cadence",
+                    GenerationMemory {
+                        transformer_window_size: Some(rejected),
+                        ..full
+                    },
+                );
+            }
+            for component in [
+                TransformerComponent::TextEncoder,
+                TransformerComponent::Both,
+            ] {
+                check(
+                    "window component",
+                    GenerationMemory {
+                        transformer_window_component: Some(component),
+                        ..full
+                    },
+                );
+            }
+            check(
+                "rung 4 without rung 1",
+                GenerationMemory {
+                    stage_residency: false,
+                    ..full
+                },
+            );
+            assert!(
+                refusals.is_empty(),
+                "{provider} silently admitted these out-of-domain selections: {refusals:?}"
+            );
 
-        // …and rung 4 is refused outright on a load that cannot stream it.
-        let mut eager = spec.clone();
-        eager.load_shape = LoadShape::EagerMaterialization;
-        assert!(validate_request_memory(crate::MODEL_ID, &eager, &full).is_err());
-        // …while a request that selects no rung is untouched by any of this.
-        validate_request_memory(crate::MODEL_ID, &eager, &GenerationMemory::default()).unwrap();
-        validate_request_memory(crate::MODEL_ID, &eager, &published).unwrap();
+            // …and rung 4 is refused outright on a load that cannot stream it.
+            let mut eager = spec.clone();
+            eager.load_shape = LoadShape::EagerMaterialization;
+            assert!(validate_request_memory(provider, &eager, &full).is_err());
+            // …while a request that selects no rung is untouched by any of this.
+            validate_request_memory(provider, &eager, &GenerationMemory::default()).unwrap();
+            validate_request_memory(provider, &eager, &published).unwrap();
+        }
+    }
+
+    /// **The declaration fails closed on every load axis the loader refuses or silently discards.**
+    ///
+    /// SC-18607's defect class is a ladder that is declared but that no route reaches. The loader
+    /// refuses a precision override, an adapter set and a single-file source, and it resolves every
+    /// component from the snapshot root — so a caller-provisioned control/PiD/identity/external-TE
+    /// slot is discarded rather than honoured. Before this gate every one of those shapes still got
+    /// the full published ladder from `weights_free_memory_strategy_contract`.
+    ///
+    /// Each axis is mutated **individually** against a known-good spec, so this proves each member
+    /// of the gate rather than the set.
+    #[test]
+    fn the_declaration_fails_closed_on_every_load_axis_the_loader_refuses() {
+        let good = streamable_spec(OffloadPolicy::Sequential);
+        weights_free_memory_strategy_contract(crate::MODEL_ID, &good)
+            .expect("the control spec must still be declarable");
+
+        let mut cases: Vec<(&str, LoadSpec)> = Vec::new();
+        cases.push((
+            "single-file source",
+            LoadSpec::new(WeightsSource::File("/nonexistent/sana.safetensors".into()))
+                .with_offload_policy(OffloadPolicy::Sequential)
+                .with_load_shape(LoadShape::DeferredMaterialization),
+        ));
+        let mut fp32 = good.clone();
+        fp32.precision = mlx_gen::Precision::Fp32;
+        cases.push(("precision override", fp32));
+        let mut adapted = good.clone();
+        adapted.adapters.push(mlx_gen::AdapterSpec::new(
+            "/nonexistent/lora.safetensors".into(),
+            1.0,
+            mlx_gen::AdapterKind::Lora,
+        ));
+        cases.push(("adapter", adapted));
+        let mut control = good.clone();
+        control.control = Some(WeightsSource::File(
+            "/nonexistent/control.safetensors".into(),
+        ));
+        cases.push(("control", control));
+        let mut extra_control = good.clone();
+        extra_control
+            .extra_controls
+            .push(WeightsSource::File("/nonexistent/extra.safetensors".into()));
+        cases.push(("extra control", extra_control));
+        let mut ip_adapter = good.clone();
+        ip_adapter.ip_adapter = Some(WeightsSource::Dir("/nonexistent/ip".into()));
+        cases.push(("ip adapter", ip_adapter));
+        cases.push((
+            "pid",
+            good.clone().with_pid(
+                WeightsSource::File("/nonexistent/pid.safetensors".into()),
+                WeightsSource::Dir("/nonexistent/gemma".into()),
+            ),
+        ));
+        let mut identity = good.clone();
+        identity.identity = Some(Default::default());
+        cases.push(("identity", identity));
+        let mut text_encoder = good.clone();
+        text_encoder.text_encoder = Some(WeightsSource::Dir("/nonexistent/external-text".into()));
+        cases.push(("external text encoder", text_encoder));
+        let mut component = good.clone();
+        component.components.insert(
+            "unexpected".to_owned(),
+            WeightsSource::File("/nonexistent/unexpected.safetensors".into()),
+        );
+        cases.push(("named component", component));
+
+        let mut admitted = Vec::new();
+        for (label, spec) in &cases {
+            for provider in [crate::MODEL_ID, crate::SPRINT_MODEL_ID] {
+                if weights_free_memory_strategy_contract(provider, spec).is_ok() {
+                    admitted.push(format!("{provider} weights-free {label}"));
+                }
+                if memory_strategy_contract(provider, spec).is_ok() {
+                    admitted.push(format!("{provider} production {label}"));
+                }
+            }
+        }
+        // An unknown id is the same class: a contract minted for a route the catalog does not serve.
+        for unknown in ["sana", "sana_1600m_turbo", "sana_sprint", ""] {
+            if weights_free_memory_strategy_contract(unknown, &good).is_ok() {
+                admitted.push(format!("unknown id '{unknown}'"));
+            }
+        }
+        assert!(
+            admitted.is_empty(),
+            "these unloadable shapes were still declared a ladder: {admitted:?}"
+        );
+    }
+
+    /// **The declared ladder is invariant in the advisory `quantize` axis — asserted, not assumed.**
+    ///
+    /// Sibling families register a selector-aware surface resolver because their `LoadSpec::quantize`
+    /// means "pack this dense source at load time", so the resolved artifact tier and the request are
+    /// genuinely different facts. SANA's tiers are **packed-detected from the on-disk `.scales`**
+    /// (sc-8489), so `quantize` never changes what is loaded or what is declared. Rather than import
+    /// another family's axis, that invariance is pinned here: if a future tier ever moves a rung, this
+    /// goes red and the resolver becomes the right answer.
+    #[test]
+    fn the_declared_ladder_is_invariant_in_the_advisory_quantize_axis() {
+        for provider in [crate::MODEL_ID, crate::SPRINT_MODEL_ID] {
+            for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
+                for shape in [
+                    LoadShape::EagerMaterialization,
+                    LoadShape::DeferredMaterialization,
+                ] {
+                    let base = LoadSpec::new(WeightsSource::Dir("/nonexistent/sana-tier".into()))
+                        .with_offload_policy(policy)
+                        .with_load_shape(shape);
+                    let dense = weights_free_memory_strategy_contract(provider, &base).unwrap();
+                    for quant in [mlx_gen::Quant::Q4, mlx_gen::Quant::Q8] {
+                        let mut packed = base.clone();
+                        packed.quantize = Some(quant);
+                        let contract =
+                            weights_free_memory_strategy_contract(provider, &packed).unwrap();
+                        for strategy in MemoryStrategy::ALL {
+                            assert_eq!(
+                                contract.capability(strategy),
+                                dense.capability(strategy),
+                                "{provider} {policy:?}/{shape:?} {quant:?} moved {strategy:?}"
+                            );
+                        }
+                        assert_eq!(contract.calibration, dense.calibration);
+                        assert_eq!(
+                            contract.lifecycle.transformer_window_materialization,
+                            dense.lifecycle.transformer_window_materialization
+                        );
+                        assert_eq!(
+                            contract.lifecycle.synchronized_phase_release,
+                            dense.lifecycle.synchronized_phase_release
+                        );
+                        assert_eq!(
+                            contract.resident_request_memory,
+                            dense.resident_request_memory
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// **The three sc-15839 defect classes, pre-checked against this provider.**
