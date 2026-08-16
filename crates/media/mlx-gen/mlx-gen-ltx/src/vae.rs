@@ -627,6 +627,33 @@ impl LtxVideoVae {
         }
         let plan = cfg.plan(Self::VAE_TILING, f, h, w);
 
+        Self::decode_tiled_plan(
+            latent,
+            &plan,
+            cancel,
+            |tile| self.decoder.decode(tile),
+            |output, weights| {
+                output.eval()?;
+                weights.eval()?;
+                Ok(())
+            },
+            mlx_rs::memory::clear_cache,
+        )
+    }
+
+    /// Execute the tiled assembly with an injected tile decoder and cache release.
+    ///
+    /// Keeping this weights-free seam lets the per-tile release order stay mutation-tested. The
+    /// callback runs after the tile-local arrays have dropped but while the two current full-output
+    /// accumulators remain live, so MLX returns only dead decoder/assembly buffers to the OS.
+    fn decode_tiled_plan(
+        latent: &Array,
+        plan: &mlx_gen::tiling::TilePlan,
+        cancel: &CancelFlag,
+        mut decode_tile: impl FnMut(&Array) -> Result<Array>,
+        mut materialize_accumulators: impl FnMut(&Array, &Array) -> Result<()>,
+        mut release_dead_buffers: impl FnMut(),
+    ) -> Result<Array> {
         // Full-size accumulators (the reference allocates these too); pad-and-add each tile in turn.
         // `output` carries the batch; `weights` stays `b=1` and broadcasts on the final divide.
         let mut output: Option<Array> = None; // [b, 3, out_f, out_h, out_w]
@@ -636,64 +663,85 @@ impl LtxVideoVae {
             for hh in &plan.h {
                 for ww in &plan.w {
                     if cancel.is_cancelled() {
+                        let had_accumulators = output.is_some() || weights.is_some();
+                        drop(output.take());
+                        drop(weights.take());
+                        if had_accumulators {
+                            release_dead_buffers();
+                        }
                         return Err(Error::Canceled);
                     }
-                    let tile = slice_axis(latent, 2, t.start, t.end)?;
-                    let tile = slice_axis(&tile, 3, hh.start, hh.end)?;
-                    let tile = slice_axis(&tile, 4, ww.start, ww.end)?;
-                    let dec = self.decoder.decode(&tile)?; // [b, 3, td, hd, wd]
+                    let tile_result = (|| -> Result<()> {
+                        let tile = slice_axis(latent, 2, t.start, t.end)?;
+                        let tile = slice_axis(&tile, 3, hh.start, hh.end)?;
+                        let tile = slice_axis(&tile, 4, ww.start, ww.end)?;
+                        let dec = decode_tile(&tile)?; // [b, 3, td, hd, wd]
 
-                    let ds = dec.shape();
+                        let ds = dec.shape();
 
-                    // sc-12748: the sc-12438 over-bound refusal is RETIRED here (as in the shared
-                    // `mlx_gen::vae_tiling::tiled_decode`). The `[b, 3, out_f, out_h, out_w]` output is
-                    // assembled with `pad`+`add`+`divide` and read back via `contiguous`'s `reshape`
-                    // (+`as_slice`) — all probe-verified int64-safe above `i32::MAX` on this pin (MLX
-                    // 0.32.0 #3524 conv + the sc-12746 pad/concat copy-gate patch;
-                    // `mlx-gen/tests/mlx_write_bound_probe.rs`). So a decode whose assembled RGB output
-                    // crosses the bound now RENDERS instead of erroring — validated on real LTX weights in
-                    // `vae_decode_sweep::over_bound_output_matches_below_bound_reference`. `from_slice`
-                    // remains i32-capped but this loop never takes it (`check_output_writable` is retained
-                    // as an uncalled latent tripwire for future code that would — sc-12926).
-                    let at = ds[2].min(t.out_stop - t.out_start);
-                    let ah = ds[3].min(hh.out_stop - hh.out_start);
-                    let aw = ds[4].min(ww.out_stop - ww.out_start);
+                        // sc-12748: the sc-12438 over-bound refusal is RETIRED here (as in the shared
+                        // `mlx_gen::vae_tiling::tiled_decode`). The `[b, 3, out_f, out_h, out_w]` output is
+                        // assembled with `pad`+`add`+`divide` and read back via `contiguous`'s `reshape`
+                        // (+`as_slice`) — all probe-verified int64-safe above `i32::MAX` on this pin (MLX
+                        // 0.32.0 #3524 conv + the sc-12746 pad/concat copy-gate patch;
+                        // `mlx-gen/tests/mlx_write_bound_probe.rs`). So a decode whose assembled RGB output
+                        // crosses the bound now RENDERS instead of erroring — validated on real LTX weights in
+                        // `vae_decode_sweep::over_bound_output_matches_below_bound_reference`. `from_slice`
+                        // remains i32-capped but this loop never takes it (`check_output_writable` is retained
+                        // as an uncalled latent tripwire for future code that would — sc-12926).
+                        let at = ds[2].min(t.out_stop - t.out_start);
+                        let ah = ds[3].min(hh.out_stop - hh.out_start);
+                        let aw = ds[4].min(ww.out_stop - ww.out_start);
 
-                    // 1-D masks → outer product [1, 1, at, ah, aw].
-                    let tm = Array::from_slice(&t.mask[..at as usize], &[1, 1, at, 1, 1]);
-                    let hm = Array::from_slice(&hh.mask[..ah as usize], &[1, 1, 1, ah, 1]);
-                    let wm = Array::from_slice(&ww.mask[..aw as usize], &[1, 1, 1, 1, aw]);
-                    let blend = multiply(&multiply(&tm, &hm)?, &wm)?;
+                        // 1-D masks → outer product [1, 1, at, ah, aw].
+                        let tm = Array::from_slice(&t.mask[..at as usize], &[1, 1, at, 1, 1]);
+                        let hm = Array::from_slice(&hh.mask[..ah as usize], &[1, 1, 1, ah, 1]);
+                        let wm = Array::from_slice(&ww.mask[..aw as usize], &[1, 1, 1, 1, aw]);
+                        let blend = multiply(&multiply(&tm, &hm)?, &wm)?;
 
-                    let dec = slice_axis(&dec, 2, 0, at)?;
-                    let dec = slice_axis(&dec, 3, 0, ah)?;
-                    let dec = slice_axis(&dec, 4, 0, aw)?;
-                    let weighted = multiply(&dec, &blend)?; // [b, 3, at, ah, aw]
+                        let dec = slice_axis(&dec, 2, 0, at)?;
+                        let dec = slice_axis(&dec, 3, 0, ah)?;
+                        let dec = slice_axis(&dec, 4, 0, aw)?;
+                        let weighted = multiply(&dec, &blend)?; // [b, 3, at, ah, aw]
 
-                    // Place at (out_start) offsets via zero-pad to the full output shape.
-                    let pads = [
-                        (0, 0),
-                        (0, 0),
-                        (t.out_start, plan.out_f - (t.out_start + at)),
-                        (hh.out_start, plan.out_h - (hh.out_start + ah)),
-                        (ww.out_start, plan.out_w - (ww.out_start + aw)),
-                    ];
-                    let weighted_full = pad(&weighted, &pads[..], None, None)?;
-                    let blend_full = pad(&blend, &pads[..], None, None)?;
+                        // Place at (out_start) offsets via zero-pad to the full output shape.
+                        let pads = [
+                            (0, 0),
+                            (0, 0),
+                            (t.out_start, plan.out_f - (t.out_start + at)),
+                            (hh.out_start, plan.out_h - (hh.out_start + ah)),
+                            (ww.out_start, plan.out_w - (ww.out_start + aw)),
+                        ];
+                        let weighted_full = pad(&weighted, &pads[..], None, None)?;
+                        let blend_full = pad(&blend, &pads[..], None, None)?;
 
-                    output = Some(match output {
-                        None => weighted_full,
-                        Some(acc) => add(&acc, &weighted_full)?,
-                    });
-                    weights = Some(match weights {
-                        None => blend_full,
-                        Some(acc) => add(&acc, &blend_full)?,
-                    });
-                    // Keep the lazy graph + peak memory bounded (mirrors the reference mx.eval).
-                    let out_ref = output.as_ref().unwrap();
-                    let w_ref = weights.as_ref().unwrap();
-                    out_ref.eval()?;
-                    w_ref.eval()?;
+                        output = Some(match output.take() {
+                            None => weighted_full,
+                            Some(acc) => add(&acc, &weighted_full)?,
+                        });
+                        weights = Some(match weights.take() {
+                            None => blend_full,
+                            Some(acc) => add(&acc, &blend_full)?,
+                        });
+                        // Keep the lazy graph + peak memory bounded (mirrors the reference mx.eval).
+                        materialize_accumulators(
+                            output.as_ref().unwrap(),
+                            weights.as_ref().unwrap(),
+                        )?;
+                        Ok(())
+                    })();
+                    // The inner scope has dropped every tile-local handle. On success, evict their
+                    // dead buffers while the current accumulators stay active. On failure, drop the
+                    // accumulators too so the same release leaves no tile-owned cache residue.
+                    match tile_result {
+                        Ok(()) => release_dead_buffers(),
+                        Err(error) => {
+                            drop(output.take());
+                            drop(weights.take());
+                            release_dead_buffers();
+                            return Err(error);
+                        }
+                    }
                 }
             }
         }
@@ -715,6 +763,191 @@ impl LtxVideoVae {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn synthetic_spatial_decode(tile: &Array) -> Result<Array> {
+        let up_h = Array::repeat_axis::<f32>(tile.clone(), 32, 3)?;
+        Ok(Array::repeat_axis::<f32>(up_h, 32, 4)?)
+    }
+
+    fn synthetic_tiled_case() -> (Array, mlx_gen::tiling::TilePlan) {
+        let shape = [1, 3, 1, 5, 5];
+        let count: i32 = shape.iter().product();
+        let values: Vec<f32> = (0..count).map(|value| value as f32 * 0.125).collect();
+        let latent = Array::from_slice(&values, &shape);
+        let config = TilingConfig {
+            spatial: Some(mlx_gen::tiling::SpatialTiling {
+                tile_px: 96,
+                overlap_px: 32,
+            }),
+            temporal: None,
+        };
+        assert!(config.needs_tiling(LtxVideoVae::VAE_TILING, 1, 5, 5));
+        let plan = config.plan(LtxVideoVae::VAE_TILING, 1, 5, 5);
+        (latent, plan)
+    }
+
+    #[test]
+    fn tiled_decode_releases_dead_buffers_once_per_tile_and_preserves_parity() {
+        let (latent, plan) = synthetic_tiled_case();
+        let expected = synthetic_spatial_decode(&latent).unwrap();
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let decode_events = std::rc::Rc::clone(&events);
+        let materialize_events = std::rc::Rc::clone(&events);
+        let release_events = std::rc::Rc::clone(&events);
+        let got = LtxVideoVae::decode_tiled_plan(
+            &latent,
+            &plan,
+            &CancelFlag::default(),
+            move |tile| {
+                decode_events.borrow_mut().push("decode");
+                synthetic_spatial_decode(tile)
+            },
+            move |output, weights| {
+                materialize_events.borrow_mut().push("materialize");
+                output.eval()?;
+                weights.eval()?;
+                Ok(())
+            },
+            move || release_events.borrow_mut().push("release"),
+        )
+        .unwrap();
+        got.eval().unwrap();
+        expected.eval().unwrap();
+
+        let tile_count = plan.t.len() * plan.h.len() * plan.w.len();
+        assert!(tile_count > 1, "fixture must exercise multiple releases");
+        assert_eq!(
+            events.borrow().as_slice(),
+            ["decode", "materialize", "release"].repeat(tile_count),
+            "every tile must materialize before release, and release before the next decode"
+        );
+        assert_eq!(got.shape(), expected.shape());
+        let max_delta = got
+            .as_slice::<f32>()
+            .iter()
+            .zip(expected.as_slice::<f32>())
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_delta < 1e-4,
+            "tiled blend parity drifted by {max_delta}"
+        );
+    }
+
+    #[test]
+    fn tiled_decode_cancel_and_error_keep_release_boundaries_exact() {
+        let (latent, plan) = synthetic_tiled_case();
+        let cancel = CancelFlag::new();
+        cancel.cancel();
+        let decodes = std::cell::Cell::new(0usize);
+        let releases = std::cell::Cell::new(0usize);
+        let canceled = LtxVideoVae::decode_tiled_plan(
+            &latent,
+            &plan,
+            &cancel,
+            |tile| {
+                decodes.set(decodes.get() + 1);
+                synthetic_spatial_decode(tile)
+            },
+            |output, weights| {
+                output.eval()?;
+                weights.eval()?;
+                Ok(())
+            },
+            || releases.set(releases.get() + 1),
+        );
+        assert!(matches!(canceled, Err(Error::Canceled)));
+        assert_eq!(decodes.get(), 0, "pre-tripped cancel runs no tile");
+        assert_eq!(releases.get(), 0, "no tile means no release callback");
+
+        let releases = std::cell::Cell::new(0usize);
+        let failed = LtxVideoVae::decode_tiled_plan(
+            &latent,
+            &plan,
+            &CancelFlag::default(),
+            |_tile| Err(Error::Msg("synthetic decoder failure".into())),
+            |_output, _weights| unreachable!("failed decode cannot produce accumulators"),
+            || releases.set(releases.get() + 1),
+        );
+        assert!(
+            matches!(failed, Err(Error::Msg(message)) if message == "synthetic decoder failure")
+        );
+        assert_eq!(
+            releases.get(),
+            1,
+            "the failed tile still releases buffers after its locals drop"
+        );
+
+        let cancel = CancelFlag::new();
+        let cancel_after_release = cancel.clone();
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let decode_events = std::rc::Rc::clone(&events);
+        let materialize_events = std::rc::Rc::clone(&events);
+        let release_events = std::rc::Rc::clone(&events);
+        let canceled = LtxVideoVae::decode_tiled_plan(
+            &latent,
+            &plan,
+            &cancel,
+            |tile| {
+                decode_events.borrow_mut().push("decode");
+                synthetic_spatial_decode(tile)
+            },
+            |output, weights| {
+                materialize_events.borrow_mut().push("materialize");
+                output.eval()?;
+                weights.eval()?;
+                Ok(())
+            },
+            || {
+                let mut events = release_events.borrow_mut();
+                events.push("release");
+                if events.iter().filter(|event| **event == "release").count() == 1 {
+                    cancel_after_release.cancel();
+                }
+            },
+        );
+        assert!(matches!(canceled, Err(Error::Canceled)));
+        assert_eq!(
+            events.borrow().as_slice(),
+            ["decode", "materialize", "release", "release"],
+            "one tile completes and releases before cancellation drops and releases its live accumulators"
+        );
+
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let decode_events = std::rc::Rc::clone(&events);
+        let materialize_events = std::rc::Rc::clone(&events);
+        let release_events = std::rc::Rc::clone(&events);
+        let decodes = std::cell::Cell::new(0usize);
+        let failed = LtxVideoVae::decode_tiled_plan(
+            &latent,
+            &plan,
+            &CancelFlag::default(),
+            |tile| {
+                decodes.set(decodes.get() + 1);
+                decode_events.borrow_mut().push("decode");
+                if decodes.get() == 2 {
+                    Err(Error::Msg("second synthetic decoder failure".into()))
+                } else {
+                    synthetic_spatial_decode(tile)
+                }
+            },
+            |output, weights| {
+                materialize_events.borrow_mut().push("materialize");
+                output.eval()?;
+                weights.eval()?;
+                Ok(())
+            },
+            || release_events.borrow_mut().push("release"),
+        );
+        assert!(
+            matches!(failed, Err(Error::Msg(message)) if message == "second synthetic decoder failure")
+        );
+        assert_eq!(
+            events.borrow().as_slice(),
+            ["decode", "materialize", "release", "decode", "release"],
+            "the failed tile skips materialization and gets only the one fail-closed cleanup release"
+        );
+    }
 
     #[test]
     fn pixel_norm_matches_closed_form() {

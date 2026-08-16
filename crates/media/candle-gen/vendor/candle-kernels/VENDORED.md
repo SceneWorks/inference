@@ -61,7 +61,21 @@ GPU there is no compatible cubin and no PTX to JIT, so the quant matmul **silent
 `sm_120` SASS plus `compute_120` PTX, so one binary runs natively Ampere → Ada → Hopper → Blackwell
 and JITs forward to newer archs.
 
-The regression is guarded by `candle-gen/tests/cuda_quant_smoke.rs` (runs in `scripts/check-cuda.ps1`).
+The regression is guarded by `candle-gen/tests/cuda_quant_smoke.rs` — but read that file's header
+before relying on it. **sc-19545 established that this test has never run in CI.** It was documented
+as running in `scripts/check-cuda.ps1`, which **no workflow invokes**; the only automated CUDA lane
+compiles it with `--no-run` and discards the binary, and the lane that would execute it
+(`ci.yml`'s `windows-cuda`) is `workflow_dispatch`-only. Step 5 below is therefore a genuinely
+manual step, not a formality — nothing else will catch a re-vendor that drops the `-gencode` block.
+
+Two related facts recorded by sc-19545, neither of them enforced by anything:
+
+* `CUDA_COMPUTE_CAP` must stay **80** at all 15 CI sites (13 in `real-weights.yml`, 2 in `ci.yml`).
+  It is the ladder's bottom rung, not a description of the hardware; raising it to the runner's own
+  120 deletes the sm_80 rung here and lifts the dense PTX floor to `compute_120`.
+* **Datacenter Blackwell sm_100 (B100/B200) is not covered** by the ladder below — major 10 is
+  served by neither the sm_9x/sm_12x cubins nor the `compute_120` PTX floor. Deliberate, per the
+  `build.rs` comment, but it means such a card would silently return zeros.
 
 ## MAINTENANCE — re-vendor on every candle pin bump
 

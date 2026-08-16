@@ -418,6 +418,10 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
     let references = request_references(req)?;
     MiniMaxH3Task::resolve(!req.keyframes().is_empty(), references.is_some())?;
 
+    // sc-19571 — the conditioning-strength refusal runs at the request boundary, not 20 minutes
+    // into a render, for the same reason every other gate above does.
+    reject_keyframe_strength(&req.keyframes())?;
+
     // The geometry gate itself — the same call `generate` makes, so `validate` and the render agree
     // by construction rather than by two copies of the lattice arithmetic.
     request_geometry(req).map(|_| ())
@@ -457,11 +461,41 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
 /// that knows only "the end of the clip" should not have to resolve the frame count first. Any
 /// other index is **rejected**: the model has exactly two anchor slots, and silently snapping a
 /// mid-clip index to the nearest end would condition on something the caller did not ask for.
+/// **Refuse a conditioning strength rather than ignore it** (sc-19571).
+///
+/// `Conditioning::Keyframe` carries a `strength` that its docs define as a `1 − strength` denoise
+/// mask, and SceneWorks exposes it as the first/last-frame conditioning sliders. MiniMax-H3 has no
+/// such mask: an anchor is mixed at the checkpoint's own trained-in
+/// [`KEYFRAME_NOISE_AUG`](crate::conditioning::KEYFRAME_NOISE_AUG_T) = `0.999` and its rows are told
+/// they sit at exactly that `t` (`PackedLayout::row_timesteps`). That number is a property of how
+/// the released model was trained, not a knob — `crate::conditioning`'s own docs say conditioning an
+/// anchor anywhere else is off-distribution — so there is nothing here a caller-supplied strength
+/// could weight without inventing a regime the checkpoint never saw.
+///
+/// The sc-19571 rule is that a control either works or is refused with a clear error, never
+/// silently dropped. This is the refusal, and it names the mechanism so the caller can tell the
+/// difference between "unsupported here" and "you typed it wrong".
+fn reject_keyframe_strength(keyframes: &[KeyframeRef<'_>]) -> Result<()> {
+    for kf in keyframes {
+        if kf.strength != 1.0 {
+            return Err(Error::Msg(format!(
+                "{MODEL_ID}: keyframe conditioning strength is not supported (got {}) — a \
+                 MiniMax-H3 anchor is held at the checkpoint's own trained-in noise augmentation \
+                 t = {}, with no denoise mask to weight; use strength 1.0",
+                kf.strength,
+                crate::conditioning::KEYFRAME_NOISE_AUG_T
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn keyframe_anchors(
     keyframes: &[KeyframeRef<'_>],
     num_frames: i32,
 ) -> Result<Vec<crate::dit::positions::KeyframeAnchor>> {
     use crate::dit::positions::KeyframeAnchor;
+    reject_keyframe_strength(keyframes)?;
     let mut first = None;
     let mut last = None;
     for kf in keyframes {
@@ -2197,6 +2231,46 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(e.contains("both keyframes and references"), "{e}");
+    }
+
+    /// sc-19571 — **refuse, do not ignore.** MiniMax-H3 anchors at the checkpoint's trained-in
+    /// `KEYFRAME_NOISE_AUG_T`, so `Keyframe.strength` has nothing to weight here; a request asking
+    /// for a partial pin must be told so rather than rendered as a full one. Gated in BOTH places a
+    /// request can arrive: `validate_request` (before the 53 GB text encoder maps) and
+    /// `keyframe_anchors` (the render's own path), so neither can be the only one carrying it.
+    ///
+    /// Mutation guard: delete the `reject_keyframe_strength` call in `validate_request` and the
+    /// first `unwrap_err` panics; delete the one in `keyframe_anchors` and the second does.
+    #[test]
+    fn a_keyframe_conditioning_strength_is_refused_not_ignored() {
+        let caps = descriptor().capabilities;
+        let kf = |strength: f32| Conditioning::Keyframe {
+            image: image(576, 320),
+            frame_idx: 0,
+            strength,
+        };
+        // A full pin — the only thing the checkpoint expresses — is admitted.
+        assert!(validate_request(&caps, &with(vec![kf(1.0)])).is_ok());
+
+        let e = validate_request(&caps, &with(vec![kf(0.6)]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("conditioning strength is not supported") && e.contains("0.999"),
+            "{e}"
+        );
+
+        // …and the render path refuses it independently of validate.
+        let img = image(576, 320);
+        let refs = [KeyframeRef {
+            image: &img,
+            frame_idx: 0,
+            strength: 0.6,
+        }];
+        let e = keyframe_anchors(&refs, 124).unwrap_err().to_string();
+        assert!(e.contains("conditioning strength is not supported"), "{e}");
+        // `keyframe_images` re-runs the same validation, so it cannot disagree.
+        assert!(keyframe_images(&refs, 124).is_err());
     }
 
     /// The reference list keeps **request order** across modalities — order is semantic for

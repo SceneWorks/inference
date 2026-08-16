@@ -1286,6 +1286,33 @@ fn finish_audio(
 /// Duration a request that names neither `frames` nor `duration` renders at — the lattice floor.
 const MIN_DEFAULT_SECONDS: f32 = 5.1667;
 
+/// **Refuse a conditioning strength rather than ignore it** (sc-19571).
+///
+/// `Conditioning::Keyframe` carries a `strength` that its docs define as a `1 − strength` denoise
+/// mask, and SceneWorks exposes it as the first/last-frame conditioning sliders. MiniMax-H3 has no
+/// such mask: an anchor is mixed at the checkpoint's own trained-in
+/// [`KEYFRAME_NOISE_AUG_T`](crate::conditioning::KEYFRAME_NOISE_AUG_T) = `0.999` and its rows are
+/// told they sit at exactly that `t`. That number is a property of how the released model was
+/// trained, not a knob, so there is nothing a caller-supplied strength could weight without
+/// inventing a regime the checkpoint never saw.
+///
+/// Byte-for-byte the same rule as the MLX lane's `reject_keyframe_strength` — a control that one
+/// backend refuses and the other silently drops is the divergence this epic keeps paying for.
+fn reject_keyframe_strength(keyframes: &[candle_gen::gen_core::KeyframeRef<'_>]) -> Result<()> {
+    for k in keyframes {
+        if k.strength != 1.0 {
+            return Err(CandleError::Msg(format!(
+                "{MODEL_ID}: keyframe conditioning strength is not supported (got {}) — a \
+                 MiniMax-H3 anchor is held at the checkpoint's own trained-in noise augmentation \
+                 t = {}, with no denoise mask to weight; use strength 1.0",
+                k.strength,
+                crate::conditioning::KEYFRAME_NOISE_AUG_T
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Which end of the clip each keyframe anchors, from the request's `frame_idx` values.
 ///
 /// `fl2va` has exactly two slots — the first frame and the last — and the anchors are **positional**
@@ -1295,6 +1322,7 @@ pub fn keyframe_anchors(
     keyframes: &[candle_gen::gen_core::KeyframeRef<'_>],
     num_frames: usize,
 ) -> Result<Vec<KeyframeAnchor>> {
+    reject_keyframe_strength(keyframes)?;
     let last = num_frames.saturating_sub(1);
     let mut out = Vec::with_capacity(keyframes.len());
     for k in keyframes {
@@ -1415,6 +1443,10 @@ impl Generator for MiniMaxH3 {
         // `transformer_ref/`, and this runs before a single weight is read. See
         // [`task_component_dirs`] for why that is not a `load`-time check.
         let (_, references) = self.resolve_task(req)?;
+
+        // sc-19571 — the conditioning-strength refusal runs at the request boundary, not deep
+        // inside a render that has already mapped the text encoder.
+        reject_keyframe_strength(&req.keyframes())?;
 
         // **The area budget runs HERE, not only inside `generate`** (sc-17152).
         //
@@ -3174,6 +3206,45 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("both keyframes anchor"), "{e}");
+    }
+
+    /// sc-19571 — **refuse, do not ignore.** MiniMax-H3 anchors at the checkpoint's trained-in
+    /// `KEYFRAME_NOISE_AUG_T`, so `Keyframe.strength` has nothing to weight here; a request that
+    /// asks for a partial pin must be told so rather than rendered as a full one. This gate lives in
+    /// `keyframe_anchors`, which BOTH `validate` and the render route through, so the two cannot
+    /// disagree.
+    ///
+    /// Mutation guard: delete the `reject_keyframe_strength` call at the top of `keyframe_anchors`
+    /// and the two `unwrap_err`s below panic while the full-pin assertions still pass.
+    #[test]
+    fn keyframe_anchors_refuse_a_conditioning_strength() {
+        let img = Image {
+            width: 32,
+            height: 32,
+            pixels: vec![0; 32 * 32 * 3],
+        };
+        let kf = |idx: i32, strength: f32| candle_gen::gen_core::KeyframeRef {
+            image: &img,
+            frame_idx: idx,
+            strength,
+        };
+        // A full pin — the only thing the checkpoint expresses — is admitted.
+        assert_eq!(
+            keyframe_anchors(&[kf(0, 1.0), kf(123, 1.0)], 124).unwrap(),
+            vec![KeyframeAnchor::First, KeyframeAnchor::Last]
+        );
+        // Anything else is refused, on either slot, with the mechanism named.
+        let e = keyframe_anchors(&[kf(0, 0.6)], 124)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("conditioning strength is not supported") && e.contains("0.999"),
+            "{e}"
+        );
+        let e = keyframe_anchors(&[kf(0, 1.0), kf(123, 0.2)], 124)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("conditioning strength is not supported"), "{e}");
     }
 
     /// The step bound is a real gate, not a comment: every step is a full 33 B forward.
