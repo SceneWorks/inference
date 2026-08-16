@@ -59,6 +59,11 @@
 //! ## What each rung is worth here (measured, Apple M5 Max, real `z_image_turbo`, 1024², 4 steps,
 //! staged residency, count 1 — `tests/block_residency_real_weights.rs`)
 //!
+//! **Historical pre-SC-19753 calibration.** The denoise-only rung-4 deltas below remain useful, but
+//! the request peaks and binding-phase claims include the retired whole-tail decoder. SC-19753's
+//! layer-wise decode materially changes them, so v4 five-rung evidence must replace those fields
+//! before they are treated as current admission data.
+//!
 //! Staged **denoise** peak, every hosted tier:
 //!
 //! | tier | rungs 1-3 (the SC-15615 top) | + rung 4 | cut | request peak | bound by |
@@ -77,7 +82,7 @@
 //! 3.191 windowed (+9%, against +4-8% unconstrained), and q8 under a 6 GiB cap lands at a 4.768 GiB
 //! request peak.
 //!
-//! **Both q4 and q8 fit an 8 GiB budget** on both host classes (4.363 / 5.087 GiB unconstrained,
+//! **In that historical capture, both q4 and q8 fit an 8 GiB budget** on both host classes (4.363 / 5.087 GiB unconstrained,
 //! 4.363 / 4.768 constrained, against 6.0 GiB usable after the generic gate's 2 GiB reserve). q8 was
 //! SC-15615's open question — it concluded only rung 4 could move it, and predicted the binding phase
 //! would become the Qwen text encoder. Both hold. **Disclosure:** measured on a 128 GB machine with
@@ -87,8 +92,8 @@
 //!
 //! **Rung 4 cuts the denoise phase by 61%** — 2.86 GiB, an order of magnitude more than rung 3's
 //! measured 0.245 GiB on this lane — and in doing so it **moves the binding phase off the denoise**.
-//! The q4 request peak is now the *decode* (4.363 GiB), which is why SC-15510's other half, the
-//! widened [`DECODE_TILE_EDGES`] ladder, is the lever that matters next. Rung 3's small saving is not
+//! In that capture the q4 request peak became the *decode* (4.363 GiB). The v4 recapture will replace
+//! that binding-phase result for the layer-wise decoder. Rung 3's small saving is not
 //! a defect: MLX's fused SDPA never materializes the `[B,H,Sq,Sk]` score tensor that Candle's
 //! `attention_basic` does, so the same knob buys a lazy-graph cut here and a bounded score matrix
 //! there (SC-15615 pins the mechanism with an inert never-chunks control).

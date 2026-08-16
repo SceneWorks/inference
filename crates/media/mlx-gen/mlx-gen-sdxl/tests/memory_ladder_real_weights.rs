@@ -690,9 +690,9 @@ fn layerwise_decode_clears_the_bar_across_the_advertised_output_range() {
 /// assembled from the same public entry points under the same staged schedule, with the layer-wise
 /// decode substituted for the single-pass one.
 ///
-/// **The saving is real and it is the one this ladder claims**: 19.0032 → 15.8660 GiB, **−16.51%**,
-/// at 876 → 936 ms/step (tiling costs ~7% wall clock, not a multiple). An earlier revision published
-/// that figure with no test behind it; this is the test.
+/// The retired whole-tail decoder measured 19.0032 → 15.8660 GiB (−16.51%) at 876 → 936 ms/step.
+/// Layer-wise arithmetic materially changes the peak, so this test now promises only the explicit
+/// greater-than-3% bound below until current memory is recaptured.
 ///
 /// Before SC-19753 the production latent exposed the per-crop GroupNorm defect more strongly than a
 /// re-encoded image. The same row now guards the repair: it must preserve the measured memory saving
@@ -745,12 +745,10 @@ fn layerwise_decode_is_priced_at_the_request_level() {
 
 /// The drift bar this family is judged against, in 8-bit levels out of 255.
 ///
-/// It is not invented here. It is the worst max-Δ that a **sibling MLX provider on the same shared
-/// tiling machinery** admits into a shipped ladder: `mlx_gen_z_image`'s `DECODE_TILE_EDGES` tops out
-/// at 48/255 (its 768 px tile), and its rejected set starts at 64. Z-Image's VAE is the same diffusers
-/// `AutoencoderKL` with the same spatial-extent GroupNorms and the same head/tail split, so it is the
-/// closest thing to a precedent that exists — using anything looser here would be inventing a bar to
-/// clear, and using anything tighter would be inventing one to fail.
+/// SC-19753 retains 48/255 as the product decode-quality admission bar across the 69 sealed
+/// coordinates. Historically it came from Z's old 48-admitted/64-rejected split; Z now admits all
+/// seven measured edges with a much lower worst result, so that split is provenance, not current
+/// Z-domain evidence.
 const SIBLING_DRIFT_BAR: u32 = 48;
 
 /// Historical overlap retained as the sealed policy identity; it no longer changes arithmetic.

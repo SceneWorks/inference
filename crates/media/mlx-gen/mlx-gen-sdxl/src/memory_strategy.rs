@@ -17,7 +17,7 @@
 //! |---|---|---|
 //! | 0 Resident | Implemented | Warm [`Residency`](mlx_gen::Residency) pair — dual CLIP + (U-Net + control/IP/VAE/PiD) held across requests |
 //! | 1 Staged residency | Implemented (request-scoped) | `GenerationMemory::stage_residency` drives encode → **drop both CLIP encoders** → load heavy → denoise + decode |
-//! | 2 Bounded decode | route-blind **Missing**; exact measured rows may be Implemented ([`DECODE_SUPPORT`]) | [`Autoencoder::decode_tiled`](crate::vae::Autoencoder) bounds the decode 14.360 → 11.237 GiB; SC-19753 preserves full-image GroupNorm statistics and admits only sealed route/tier/mode/overlay/geometry rows |
+//! | 2 Bounded decode | route-blind **Missing**; exact measured rows may be Implemented ([`DECODE_SUPPORT`]) | [`Autoencoder::decode_tiled`](crate::vae::Autoencoder) uses SC-19753 full-image GroupNorm statistics and sealed route/tier/mode/overlay/geometry admission; historical whole-tail memory was 14.360 → 11.237 GiB and must be recaptured for the new arithmetic |
 //! | 3 Bounded attention | **Missing** (measured — [`ATTENTION_SUPPORT`]) | [`mlx_gen::attention::sdpa_budgeted_bhsd`] reaches every site, moves the peak **0.00% at BOTH scopes** (the request and the U-Net seam), and its query-row axis is not bit-exact on Metal |
 //! | 4 Bounded transformer residency | Implemented (streamable loads) | [`mlx_gen::block_residency::run_windowed`] per `Transformer2D` — eleven sub-stacks, 70 blocks |
 //!
@@ -274,12 +274,10 @@ pub const DECODE_OVERLAPS_SWEPT: &[u32] = &[64, 128, 192, 256];
 ///
 /// ## Why 38/255 is nevertheless not publishable — the bar, and the range
 ///
-/// **The bar is 48/255**, and it is inherited rather than invented: it is the worst drift a sibling
-/// MLX provider on this same shared tiling machinery *admits* into a shipped ladder
-/// (`mlx_gen_z_image::memory_strategy::DECODE_TILE_EDGES` tops out at 48 on its 768 px tile; its
-/// rejected set starts at 64). Z-Image's decoder is the same diffusers `AutoencoderKL` with the same
-/// spatial-extent GroupNorms and the same head/tail split, so it is the closest precedent that
-/// exists. By that bar the 1024² sweep datum **passes**: 38 < 48, buying a measured
+/// **The product bar remains 48/255.** Historically it came from Z's old
+/// 48-admitted/64-rejected split; Z now admits all measured edges with a much lower worst result, so
+/// that split is provenance rather than current domain evidence. By that bar the old 1024² sweep
+/// datum **passed**: 38 < 48, buying a measured
 /// **19.0032 → 15.8660 GiB (−16.51%)** request peak at only ~7% wall clock (876 → 936 ms/step). On
 /// the 1024² sweep alone this candidate should ship, and an earlier revision of this file was wrong
 /// to claim otherwise — it asserted SDXL was "past that wall at every tile size", which its own

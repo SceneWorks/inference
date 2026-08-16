@@ -25,7 +25,7 @@
 //! |---|---|---|
 //! | 0 Resident | Implemented | Warm [`Residency`](mlx_gen::Residency) pair — ChatGLM3-6B + (U-Net + control/IP/VAE/PiD) held across requests |
 //! | 1 Staged residency | Implemented (request-scoped) | `GenerationMemory::stage_residency` drives encode → **drop ChatGLM3-6B** → load heavy → denoise + decode |
-//! | 2 Bounded decode | route-blind **Missing**; exact measured rows may be Implemented ([`DECODE_SUPPORT`]) | [`Autoencoder::decode_tiled`](mlx_gen_sdxl::Autoencoder) bounds the request 16.041 → 9.998 GiB (−37.67%); SC-19753 preserves full-image GroupNorm statistics and admits only sealed route/tier/mode/overlay/geometry rows |
+//! | 2 Bounded decode | route-blind **Missing**; exact measured rows may be Implemented ([`DECODE_SUPPORT`]) | [`Autoencoder::decode_tiled`](mlx_gen_sdxl::Autoencoder) uses SC-19753 full-image GroupNorm statistics and sealed route/tier/mode/overlay/geometry admission; historical whole-tail memory was 16.041 → 9.998 GiB and must be recaptured for the new arithmetic |
 //! | 3 Bounded attention | **Missing** (measured — [`ATTENTION_SUPPORT`]) | [`mlx_gen::attention::sdpa_budgeted_bhsd`] reaches every site, moves the peak **0.00% at BOTH scopes** — the request and the U-Net seam — and is not bit-exact on its query-row axis |
 //! | 4 Bounded transformer residency | Implemented (streamable loads), **two scopes** | [`mlx_gen::block_residency::run_windowed`] over the U-Net's eleven `Transformer2D` sub-stacks (70 blocks) **and** over ChatGLM3-6B's 28 `GlmBlock`s |
 //!
@@ -94,12 +94,9 @@ pub const DECODE_OVERLAPS_SWEPT: &[u32] = &[64, 128, 192, 256];
 
 /// The drift bar this family is judged against, in 8-bit levels out of 255.
 ///
-/// Inherited rather than invented: it is the worst drift a sibling MLX provider on this same shared
-/// tiling machinery *admits* into a shipped ladder
-/// (`mlx_gen_z_image::memory_strategy::DECODE_TILE_EDGES` tops out at 48 on its 768 px tile; its
-/// rejected set starts at 64). Z-Image's decoder is the same diffusers `AutoencoderKL` with the same
-/// spatial-extent GroupNorms and the same head/tail split, so it is the closest precedent that
-/// exists for Kolors — which runs literally the same `sdxl-vae-fp16-fix` decoder.
+/// SC-19753 retains 48/255 as the product decode-quality admission bar. Historically that threshold
+/// came from Z's old 48-admitted/64-rejected split; Z now admits all measured edges with a much lower
+/// worst result, so the split is provenance rather than current domain evidence.
 pub const DECODE_DRIFT_BAR: u32 = 48;
 
 /// **The route-blind rung-2 fallback is `Missing` on Kolors/MLX.**
@@ -115,12 +112,10 @@ pub const DECODE_DRIFT_BAR: u32 = 48;
 /// head (denormalize → `post_quant_conv` → `conv_in` → mid resnets → mid **self-attention**) once on
 /// the full latent and tiles only the full-resolution upsample tail.
 ///
-/// **It is also, by a wide margin, the biggest lever on this family's ladder.** At 1024² q4 it takes
-/// the whole staged request from **16.0412 → 9.9981 GiB (−37.67%)** for **+10% wall clock**
-/// (925 → 1018 ms/step) — against rung 4's −7.21% for +4.2× at the same tier and geometry
-/// (`layerwise_decode_is_priced_at_the_request_level`). The route-blind fallback remains withheld, and the
-/// size of the prize is exactly why the withholding argument had to be measured rather than
-/// asserted.
+/// **Historical whole-tail memory result.** Before SC-19753, 1024² q4 moved the staged request from
+/// **16.0412 → 9.9981 GiB (−37.67%)** for **+10% wall clock** (925 → 1018 ms/step). The layer-wise
+/// decoder's executable test now promises only a greater-than-3% saving until current memory is
+/// recaptured. The route-blind fallback remains withheld; exact sealed rows control admission.
 ///
 /// ## Historical pre-SC-19753 evidence
 ///

@@ -148,11 +148,10 @@ fn steps() -> u32 {
 
 /// The drift bar this family is judged against, in 8-bit levels out of 255.
 ///
-/// Not invented here: it is the worst max-Δ a **sibling MLX provider on the same shared tiling
-/// machinery over the same AutoencoderKL** admits into a shipped ladder — `mlx_gen_z_image`'s
-/// `DECODE_TILE_EDGES` tops out at 48/255 and its rejected set starts at 64. Chroma reuses that
-/// exact 16-channel FLUX.1 VAE (`mlx_gen_flux::load_vae`), so it is the closest precedent that
-/// exists; a looser bar would be invented to clear and a tighter one invented to fail.
+/// SC-19753 retains 48/255 as the product decode-quality admission bar across the sealed coordinate
+/// matrix. Historically it came from Z's old 48-admitted/64-rejected split; Z now admits every
+/// measured edge with a much lower worst result, so that split is provenance rather than current
+/// Z-domain evidence.
 const SIBLING_DRIFT_BAR: u32 = 48;
 
 /// One sealed policy coordinate resampled across seeds. Overlap remains part of policy identity but
