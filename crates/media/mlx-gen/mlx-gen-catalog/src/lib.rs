@@ -746,6 +746,144 @@ mod tests {
         }
     }
 
+    /// SC-18610: all six registered Mage-Flow routes publish the complete engine ladder, rung 4
+    /// included, on every shipped tier. Mage is request-scoped — it never reads
+    /// `LoadSpec::offload_policy` — so unlike the FLUX/Krea families its rung 4 is reachable under
+    /// both offload policies and is gated only by the deferred load shape.
+    #[test]
+    fn mage_routes_publish_the_full_rung_four_ladder_on_every_shipped_tier() {
+        use mlx_gen::gen_core::{
+            LoadShape, MemoryContractSurfaceTier, MemoryStrategy, MemoryStrategySupport,
+        };
+
+        let registry = super::provider_registry().unwrap();
+        let surfaces = registry.memory_contract_surfaces().unwrap();
+        for provider_id in mlx_gen_mage::model::MODEL_IDS {
+            let provider: Vec<_> = surfaces
+                .iter()
+                .filter(|surface| surface.contract.provider_id == provider_id)
+                .collect();
+            assert_eq!(provider.len(), 12, "{provider_id}");
+
+            let mut implemented = 0;
+            for surface in provider {
+                let expected = matches!(
+                    surface.resolved_artifact_tier(),
+                    MemoryContractSurfaceTier::Bf16
+                        | MemoryContractSurfaceTier::Q4
+                        | MemoryContractSurfaceTier::Q8
+                ) && surface.selector.load_shape
+                    == LoadShape::DeferredMaterialization;
+                assert_eq!(
+                    surface
+                        .contract
+                        .capability(MemoryStrategy::BoundedTransformerResidency)
+                        .expect("complete Mage ladder")
+                        .support,
+                    if expected {
+                        MemoryStrategySupport::Implemented
+                    } else {
+                        MemoryStrategySupport::Missing
+                    },
+                    "{provider_id}: {}",
+                    surface.selector.id()
+                );
+                for strategy in [
+                    MemoryStrategy::Resident,
+                    MemoryStrategy::StagedResidency,
+                    MemoryStrategy::BoundedDecode,
+                    MemoryStrategy::BoundedAttention,
+                ] {
+                    assert_eq!(
+                        surface.contract.capability(strategy).unwrap().support,
+                        MemoryStrategySupport::Implemented,
+                        "{provider_id}: {} {strategy:?}",
+                        surface.selector.id()
+                    );
+                }
+                implemented += usize::from(expected);
+                assert!(!surface.composed);
+                assert_eq!(surface.contract.asset_facts, Default::default());
+                assert_eq!(
+                    surface.contract.calibration.as_ref().unwrap().fingerprint,
+                    mlx_gen_mage::model::MEMORY_CALIBRATION_FINGERPRINT
+                );
+            }
+            assert_eq!(
+                implemented, 6,
+                "{provider_id} publishes rung 4 on three tiers under both offload policies"
+            );
+        }
+    }
+
+    /// Every Mage route's declared rung 4 is executable through its own registered behavior: the
+    /// scope opens and resolves into the request controls the pipeline reads. A route that only
+    /// declared the rung would fail here.
+    #[test]
+    fn mage_behavior_inventory_executes_rung_four_for_every_route() {
+        use mlx_gen::gen_core::{
+            LoadShape, MemoryContractSurfaceTier, MemoryMode, MemoryStrategy, OffloadPolicy,
+        };
+
+        let registry = super::provider_registry().unwrap();
+        let surfaces = registry.memory_contract_surfaces().unwrap();
+        for provider_id in mlx_gen_mage::model::MODEL_IDS {
+            let edit = provider_id.contains("_edit");
+            let surface = surfaces
+                .iter()
+                .find(|surface| {
+                    surface.contract.provider_id == provider_id
+                        && surface.resolved_artifact_tier() == MemoryContractSurfaceTier::Q4
+                        && surface.selector.offload_policy == OffloadPolicy::Sequential
+                        && surface.selector.load_shape == LoadShape::DeferredMaterialization
+                })
+                .unwrap_or_else(|| panic!("{provider_id} missing q4 sequential deferred surface"));
+            let behavior = registry
+                .memory_behavior_registrations()
+                .find(|registration| registration.provider_id == provider_id)
+                .unwrap_or_else(|| panic!("{provider_id} missing memory behavior"));
+            let mut fixtures = (behavior.valid_fixtures)(
+                &surface.spec,
+                &surface.contract,
+                MemoryStrategy::BoundedTransformerResidency,
+            )
+            .unwrap();
+            assert_eq!(fixtures.len(), 1, "{provider_id}");
+            let fixture = &mut fixtures[0];
+            assert_eq!(
+                fixture.context.mode,
+                if edit {
+                    MemoryMode::Edit
+                } else {
+                    MemoryMode::TextToImage
+                },
+                "{provider_id}"
+            );
+            assert_eq!(
+                fixture.context.geometry.reference_count,
+                u32::from(edit),
+                "{provider_id}"
+            );
+            assert!(!fixture.context.use_pid, "{provider_id}");
+            assert_eq!(fixture.context.overlay, None, "{provider_id}");
+            assert_eq!(
+                fixture.request.image_reference_count(),
+                u32::from(edit),
+                "{provider_id}"
+            );
+
+            let mut scope =
+                (behavior.begin_request)(&surface.spec, &surface.contract, &fixture.context)
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("{provider_id} rung 4 must open a request scope"));
+            scope.configure_request(&mut fixture.request).unwrap();
+            let memory = fixture.request.memory.expect("configured request memory");
+            assert!(memory.stream_transformer_blocks, "{provider_id}");
+            assert!(memory.stage_residency, "{provider_id}");
+            assert_eq!(memory.transformer_window_size, Some(1), "{provider_id}");
+        }
+    }
+
     #[test]
     fn krea_base_providers_publish_exact_prepacked_sequential_deferred_surfaces() {
         use mlx_gen::gen_core::{
