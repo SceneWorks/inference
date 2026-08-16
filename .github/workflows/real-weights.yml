@@ -728,7 +728,9 @@ jobs:
   mlx-decode-quality-kolors:
     name: Decode quality admission (Kolors ${{ matrix.candidate.geometry }})
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'decode-quality-kolors'
-    runs-on: [self-hosted, macOS, ARM64, nax]
+    # SC-19753 diagnostic only: select the provisioned high-headroom Metal host explicitly. The
+    # generic nax pool also contains a host whose task-local Z snapshot currently fills its disk.
+    runs-on: [self-hosted, macOS, ARM64, nax, signing]
     timeout-minutes: 720
     strategy:
       fail-fast: false
@@ -808,7 +810,8 @@ jobs:
   mlx-decode-quality-sdxl:
     name: Decode quality admission (${{ matrix.model.id }} ${{ matrix.candidate.geometry }})
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'decode-quality-sdxl'
-    runs-on: [self-hosted, macOS, ARM64, nax]
+    # SC-19753 diagnostic only; see the Kolors job's runner-selection rationale above.
+    runs-on: [self-hosted, macOS, ARM64, nax, signing]
     timeout-minutes: 720
     strategy:
       fail-fast: false
@@ -924,7 +927,8 @@ jobs:
   mlx-decode-quality-chroma:
     name: Decode quality admission (${{ matrix.model.id }} ${{ matrix.candidate.geometry }})
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'decode-quality-chroma'
-    runs-on: [self-hosted, macOS, ARM64, nax]
+    # SC-19753 diagnostic only; see the Kolors job's runner-selection rationale above.
+    runs-on: [self-hosted, macOS, ARM64, nax, signing]
     timeout-minutes: 720
     strategy:
       fail-fast: false
