@@ -1365,7 +1365,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("set -o pipefail", job)
         self.assertIn("verify_residency_ab.py", job)
         self.assertIn("--min-reduction-mib 512", job)
-        self.assertIn("--expected-fingerprint z-image-mlx-independent-materialization-v3", job)
+        self.assertIn("--expected-fingerprint z-image-mlx-independent-materialization-v4", job)
         self.assertIn("--expected-abi 3", job)
         # sc-18149: the lane pins the adjudicated tolerance contract from outside the harness.
         self.assertIn("--expected-parity tolerance:mean_abs_u8_subpixel:4.0", job)
