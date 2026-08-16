@@ -61,6 +61,7 @@ use mlx_gen::{CancelFlag, Error, Result};
 use crate::dit::adaln::{AdaLnCache, TimestepSchedule};
 use crate::dit::block::{AdaLnModulation, AdaLnProjection, DitBlock};
 use crate::dit::config::MiniMaxH3DitConfig;
+use crate::text_encoder::{MiniMaxH3TeConfig, Qwen3DecoderLayer};
 
 /// Reopenable description of a staged MiniMax-H3 DiT's block stack.
 ///
@@ -270,5 +271,91 @@ mod tests {
         assert!(!BlockPlan::new(cfg.num_layers as usize, 50)
             .unwrap()
             .is_bounded());
+    }
+}
+
+// ── The text-encoder arm (sc-18662, `TransformerComponent::Both`) ────────────────────────────────
+
+/// Reopenable description of a staged Qwen3-VL-32B condition encoder's decoder stack.
+///
+/// The DiT's twin, and deliberately a separate type rather than a generic over both: the two stacks
+/// differ in every detail a window touches — key prefix (`model.language_model.layers.{i}` against
+/// `transformer_blocks.{i}`), constructor arity, and which tensors a layer even has. A shared
+/// generic would abstract over four fields and hide the one thing worth reading, which is *what a
+/// window of this stack costs*.
+///
+/// **This arm is why rung 4 can be declared [`TransformerComponent::Both`]**
+/// (`gen_core::memory_strategy`). Declaring `Dit` alone would leave the conditioning phase — which
+/// was the model's binding stage until sc-19120's packed tiers, and is still the taller of the two
+/// at every tier — entirely untouched.
+#[derive(Clone, Debug)]
+pub struct TeBlockStream {
+    dir: PathBuf,
+    prefix: String,
+    cfg: MiniMaxH3TeConfig,
+    n_layers: usize,
+}
+
+impl TeBlockStream {
+    /// Describe the decoder stack staged at `dir` under `prefix`.
+    ///
+    /// `n_layers` is the **tapped** depth (`select_hidden`, 50 shipped), not the checkpoint's 64:
+    /// `MiniMaxH3TextEncoder` runs layers `0..select_hidden` and never touches the rest, so a window
+    /// schedule over 64 would re-materialize fourteen layers that contribute nothing.
+    pub fn new(dir: impl AsRef<Path>, prefix: &str, cfg: MiniMaxH3TeConfig) -> Result<Self> {
+        let dir = dir.as_ref();
+        if !dir.join("config.json").is_file() {
+            return Err(Error::Msg(format!(
+                "minimax-h3 te stream: {} has no config.json; a window cannot verify the tier it is \
+                 re-opening",
+                dir.display()
+            )));
+        }
+        let n_layers = cfg.out_layer()? + 1;
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            prefix: prefix.to_owned(),
+            cfg,
+            n_layers,
+        })
+    }
+
+    /// Tapped decoder layers — `select_hidden`, 50 shipped.
+    pub fn n_layers(&self) -> usize {
+        self.n_layers
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// A **fresh** lazily-mapped view. One per window, for the reason [`DitBlockStream::open`] gives.
+    pub fn open(&self) -> Result<Weights> {
+        Weights::from_dir(&self.dir).map_err(|error| {
+            Error::Msg(format!(
+                "minimax-h3 te stream: reopening {}: {error}",
+                self.dir.display()
+            ))
+        })
+    }
+
+    /// Reconstruct decoder layer `index` out of `view`, draining its source handles.
+    pub fn materialize(&self, view: &mut Weights, index: usize) -> Result<Qwen3DecoderLayer> {
+        let prefix = format!("{}.layers.{index}", self.prefix);
+        let layer = Qwen3DecoderLayer::from_weights(
+            view,
+            &prefix,
+            self.cfg.num_heads,
+            self.cfg.num_kv_heads,
+            self.cfg.head_dim,
+            self.cfg.rms_norm_eps,
+        )?;
+        view.remove_prefix(&format!("{prefix}."));
+        Ok(layer)
+    }
+
+    /// The block plan this stream runs at `window`.
+    pub fn plan(&self, window: usize) -> Result<BlockPlan> {
+        Ok(BlockPlan::new(self.n_layers, window)?)
     }
 }

@@ -109,13 +109,42 @@
 //!   is what would first be affected, and it is declared against the load shape rather than against
 //!   this rung.
 //!
-//! # Rung 4 is still `Missing`
+//! # Rung 4 is implemented on both transformers (sc-18662)
 //!
-//! **Rung 4 (`BoundedTransformerResidency`)** — sc-18662, gated on
-//! [`LoadShape::DeferredMaterialization`], which this loader does not implement (see
-//! [`LOAD_SHAPE`]). `Missing` and not `StructurallyNotApplicable`: the component the rung would
-//! optimize plainly exists here — a 50-block DiT and a transformer text encoder — so its absence is
-//! an unbuilt loader, not an architectural fact.
+//! [`MemoryStrategy::BoundedTransformerResidency`] is `Implemented` on a
+//! [`LoadShape::DeferredMaterialization`] load and `Missing` on a resident one — the rung's own
+//! shared prerequisite is that shape, so a resident load genuinely does not have it. Both loaders
+//! now exist ([`crate::dit::MiniMaxH3Dit::load_dir_deferred`],
+//! [`crate::text_encoder::MiniMaxH3TextEncoder::from_dir_deferred`]), so the contract honours the
+//! spec's shape rather than pinning one; see [`resolved_load_shape`].
+//!
+//! **Measured on both arms, separately, because `TransformerComponent::Both` is two claims**
+//! (`tests/block_window_real.rs`):
+//!
+//! | arm | tier | resident | window 1 | ratio |
+//! | --- | --- | ---: | ---: | ---: |
+//! | text encoder | bf16 | 53.07 GB | 5.81 GB | **9.13x** |
+//! | DiT | bf16 | 39.58 GB | 1.90 GB | **20.82x** |
+//! | DiT | q8 | 21.64 GB | 1.58 GB | **13.73x** |
+//! | DiT | q4 | 12.00 GB | 1.36 GB | **8.85x** |
+//!
+//! Output was **bit-identical** at every window on every arm and tier, so nothing is traded. Both
+//! resident figures reproduce this module's own stage constants from a different harness —
+//! [`CONDITIONING_STAGE_PEAK_BYTES`] and [`DENOISE_RESIDENT_BF16_BYTES`] — which is what makes them
+//! attributable to a component rather than to a process-wide mark.
+//!
+//! Three things that declaration decides deliberately:
+//!
+//! * **[`TransformerComponent::Both`], not `Dit`.** The conditioning stage is still the taller of
+//!   the two at every tier even after sc-19120's packed encoder, and declaring the DiT alone would
+//!   leave it with no lever at all. The TE arm is the larger absolute saving — 47.26 GB against the
+//!   DiT's 37.68 GB at bf16.
+//! * **A singleton window domain.** [`TRANSFORMER_WINDOW_SIZE`] is `1` because the parameter is
+//!   *measured inert* above it, not because 1 is a safe default. See that constant.
+//! * **Rung 4 does not depend on rung 3.** Its sole shared prerequisite is the load shape
+//!   (`BOUNDED_TRANSFORMER_RESIDENCY_REQUIRES`), not rung 1 and not rung 3 — so sc-18661's
+//!   `StructurallyNotApplicable` verdict, which satisfies prerequisite edges vacuously, introduces
+//!   no vacuous edge here.
 //!
 //! # The AdaLN eviction is declared, and it is declared NET (sc-18665)
 //!
@@ -323,7 +352,9 @@ pub const DECODE_OVERLAP: u32 = crate::spatial_tiling::TILE_SAMPLE_MIN_OVERLAP a
 /// geometry's unbounded peak, measured on the real 50-block `q4` DiT by
 /// `tests/bounded_attention_real.rs`. Positive means the rung **cost** peak.
 ///
-/// Rows are `(frames, packed_seq_len, head-axis @ 64 Mi, query-row @ 64 Mi, head-axis one-head)`.
+/// Rows are `(tier, frames, packed_seq_len, head-axis @ 64 Mi, query-row @ 64 Mi, head-axis
+/// one-head)` — **tier-keyed since the sweep was extended to all three** (the q4-only table it
+/// started as made the bf16/q8 verdict an argument rather than a measurement).
 /// Both ends of the `17n + 5` frame lattice are present because `frames` is an exact-match evidence
 /// key (`mlx_fit_gate.rs:1381`) and fitted-curve extrapolation scales by area only — a single
 /// duration cell may not stand in for another one.
@@ -347,10 +378,54 @@ pub const DECODE_OVERLAP: u32 = crate::spatial_tiling::TILE_SAMPLE_MIN_OVERLAP a
 ///
 /// Output agreement was **exactly zero** relative max-abs on all six bounded arms, so nothing here is
 /// a quality trade that memory could be bought with.
-pub const RUNG3_MEASURED_PEAK_DELTAS: [(i32, i32, f64, f64, f64); 2] = [
-    (124, 7_586, 0.005341, 0.005532, 0.005723),
-    (345, 20_022, 0.012740, 0.013168, 0.013596),
+pub const RUNG3_MEASURED_PEAK_DELTAS: [(&str, i32, i32, f64, f64, f64); 4] = [
+    ("q4", 124, 7_586, 0.005341, 0.005532, 0.005723),
+    ("q4", 345, 20_022, 0.012740, 0.013168, 0.013596),
+    ("q8", 124, 7_586, 0.003065, 0.003174, 0.003284),
+    ("q8", 345, 20_022, 0.007931, 0.008197, 0.008464),
 ];
+
+/// **`bf16` is measured but UNRESOLVED, and is deliberately absent from
+/// [`RUNG3_MEASURED_PEAK_DELTAS`] rather than recorded with a number.**
+///
+/// The q4 and q8 sweeps agree with each other and with the verdict: every bounded arm costs peak,
+/// the cost grows with sequence, and the magnitude shrinks as the tier's resident baseline grows
+/// (+0.53%/+1.27% at q4 against +0.31%/+0.79% at q8). Extrapolating that trend to bf16 predicts a
+/// small positive delta.
+///
+/// **It measured NEGATIVE.** At 124 frames the unbounded arm peaked at 42.3451 GB and all three
+/// bounded arms at 42.145-42.151 GB — a **-0.47%** delta, i.e. chunking appearing to *save* peak.
+/// That is the sign the verdict says cannot happen, so it is recorded here rather than declared
+/// either way.
+///
+/// Two readings, and this constant exists because they have not been separated:
+///
+/// * **an ordering artifact.** The three bounded arms agree with each other to 0.01% while the
+///   unbounded arm — which runs FIRST in the process — sits 0.47% above all of them. That is the
+///   shape of a first-arm allocator transient, and it is a known hazard on this exact comparison:
+///   `tests/sequence_cost_real.rs` documents the same harness reporting **+0.2% first-in-binary and
+///   +50.3% under a filter** for one pair of arms, and adds a warm-up arm for it. This harness
+///   reloads the 62 GB DiT per arm and clears the cache between them, which is stronger — but it has
+///   no unmeasured warm-up arm, and at bf16 the load is 3.7x the q4 one it was validated at.
+/// * **a real bf16 effect.** The dtype is the same on every tier's activations, but the *weights*
+///   are not, and the graph a dense DiT builds differs from a packed one's.
+///
+/// Resolving it needs a warm-up arm plus an arm-order permutation on this tier; until then the
+/// contract's inapplicability reason quotes q4 and q8 only, and `rung3_cells_for_tier("bf16")`
+/// returns empty so the real-weight harness fails loudly rather than validating against a guess.
+/// **The claim in PR #649 that q4 bounds the other tiers from above is contradicted at bf16/124f
+/// and must not be relied on.**
+pub const RUNG3_BF16_IS_UNRESOLVED: &str =
+    "bf16 measured -0.47% at 124 frames (42.3451 GB unbounded against 42.145-42.151 GB bounded);      unseparated first-arm allocator transient vs a real dense-tier effect";
+
+/// The rung-3 cells measured for one tier.
+pub fn rung3_cells_for_tier(tier: &str) -> Vec<(i32, i32, f64, f64, f64)> {
+    RUNG3_MEASURED_PEAK_DELTAS
+        .iter()
+        .filter(|(t, ..)| *t == tier)
+        .map(|(_, frames, seq, a, b, c)| (*frames, *seq, *a, *b, *c))
+        .collect()
+}
 
 /// The audio VAE is out of scope for rung 2, declared rather than implied.
 ///
@@ -361,14 +436,85 @@ pub const RUNG3_MEASURED_PEAK_DELTAS: [(i32, i32, f64, f64, f64); 2] = [
 /// boundary is greppable and testable rather than a sentence in a doc comment.
 pub const AUDIO_VAE_IS_OUT_OF_SCOPE_FOR_TILING: bool = true;
 
-/// The load shape this loader actually has today, pinned rather than mirrored from the spec.
+/// The load shape a **resident** load has, kept as the provider's default and its calibration
+/// identity's shape.
 ///
-/// [`LoadShape::DeferredMaterialization`] means *transformer blocks are materialized through a
-/// block schedule*. `MiniMaxH3Dit::load_dir` builds the whole 50-block stack, so this provider is
-/// [`LoadShape::EagerMaterialization`] no matter what a caller asks for. A `LoadShape` a provider
-/// does not implement may be answered by advertising the corresponding rung unavailable rather than
-/// by rejecting the load, which is what rung 4's `Missing` does. sc-18662 changes this.
+/// Until sc-18662 this was the only shape this provider had, because `MiniMaxH3Dit::load_dir` builds
+/// the whole 50-block stack no matter what a caller asks for. It is no longer: `load_dir_deferred`
+/// and `MiniMaxH3TextEncoder::from_dir_deferred` implement
+/// [`LoadShape::DeferredMaterialization`] for both transformers, so the contract now **honours the
+/// spec's shape** through [`resolved_load_shape`] instead of pinning one.
 pub const LOAD_SHAPE: LoadShape = LoadShape::EagerMaterialization;
+
+/// The load shape this contract is resolved at — the spec's, because both are now implemented.
+///
+/// The distinction from [`LOAD_SHAPE`] is the whole of sc-18662: a provider may only mirror a
+/// requested shape once it actually has a loader for it, and answering
+/// [`LoadShape::DeferredMaterialization`] without one is how a rung comes to be declared over
+/// nothing. Both loaders exist and `tests/block_window_real.rs` measures each.
+fn resolved_load_shape(spec: &LoadSpec) -> LoadShape {
+    spec.load_shape
+}
+
+// --- rung 4: the bounded transformer-residency domain -------------------------------------------
+
+/// The **only** transformer window size this provider admits: one block or layer at a time.
+///
+/// **The singleton is the finding, not a placeholder** — the same shape rung 2's
+/// [`DECODE_TILE_EDGE`] has, for its own separate reason.
+///
+/// `mlx_gen::block_residency::run_windowed`'s `apply` releases each block as soon as it is consumed
+/// rather than at the end of the window, so even a 50-block all-covering plan holds one block at a
+/// time and the plan's window never sets the residency. Measured on the real encoder across
+/// `[1, 5, 10, 50]`: a **1.09x** spread across the whole range, against **9.13x below resident** —
+/// the run-to-run noise (~1 GB) is larger than the spread across window sizes.
+///
+/// Publishing `[1, 5, 10, 50]` would advertise a lever whose other values do nothing, which is the
+/// inert-parameter defect this epic keeps refusing. SC-15448's rung-4 survey recorded the same
+/// window-inert-above-1 behaviour on another family; this reproduces it independently.
+pub const TRANSFORMER_WINDOW_SIZE: u32 = 1;
+
+/// **The TE arm** (sc-18662, AC3), measured on the real Qwen3-VL-32B tap by
+/// `tests/block_window_real.rs`: resident bytes, and the window-1 floor.
+///
+/// 53.07 GB -> 5.81 GB, a **9.13x** reduction and the single largest memory change this rung
+/// produces on this model. The resident figure independently reproduces
+/// [`CONDITIONING_STAGE_PEAK_BYTES`]'s 53.07 GB from a different harness, which is what makes it
+/// attributable to the encoder rather than to a process-wide mark.
+///
+/// Output was **bit-identical** (`0.000e0` relative max-abs) at every window size, so nothing is
+/// traded for it.
+pub const RUNG4_TE_RESIDENT_PEAK_BYTES: u64 = 53_074_721_216;
+/// The TE arm at [`TRANSFORMER_WINDOW_SIZE`]. See [`RUNG4_TE_RESIDENT_PEAK_BYTES`].
+pub const RUNG4_TE_WINDOWED_PEAK_BYTES: u64 = 5_814_845_376;
+
+/// **The DiT arm**, per tier: `(tier, resident_peak_bytes, window_1_peak_bytes)`.
+///
+/// Measured by `tests/block_window_real.rs` over the 50-block stack at `seq = 4096`, walking block
+/// bodies with no modulation and no rotary — the thinnest call that touches every one of a block's
+/// ten body tensors, so the ratio is weight residency rather than activation.
+///
+/// | tier | resident | window 1 | ratio |
+/// |---|---:|---:|---:|
+/// | `q4` | 12.00 GB | 1.36 GB | **8.85x** |
+/// | `q8` | 21.64 GB | 1.58 GB | **13.73x** |
+/// | `bf16` | 39.58 GB | 1.90 GB | **20.82x** |
+///
+/// The ratio scales with the tier — 8.85x / 13.73x / 20.82x across q4 / q8 / bf16 — because the
+/// *window* is the same activation-plus-one-block at every tier while the resident baseline is not.
+/// That is the rung behaving exactly as declared, and it is the **opposite** of rung 3's tier story
+/// on this model, where the transient the rung acts on is bf16 regardless of tier so the lower tier
+/// was the favourable one. The two rungs' tier arguments do not transfer to each other.
+///
+/// Both resident figures independently reproduce the provider's own stage constants from a different
+/// harness — [`DENOISE_RESIDENT_Q4_BYTES`]'s 11.63 GB and [`DENOISE_RESIDENT_BF16_BYTES`]'s 40.43 GB
+/// — which is what makes them attributable to the DiT rather than to a process-wide mark. Output was
+/// bit-identical at every window on every tier.
+pub const RUNG4_DIT_MEASURED_PEAKS: [(&str, u64, u64); 3] = [
+    ("q4", 12_002_937_856, 1_355_656_192),
+    ("q8", 21_636_046_848, 1_575_493_632),
+    ("bf16", 39_578_684_416, 1_901_221_376),
+];
 
 /// The stage-ordered lifecycle every MiniMax-H3 render runs.
 fn phases() -> Vec<MemoryPhase> {
@@ -538,9 +684,9 @@ fn resolved_adaln_bytes(dit_dir: &std::path::Path, dit_bytes: u64) -> u64 {
 fn rung3_inapplicability_reason() -> String {
     let cells = RUNG3_MEASURED_PEAK_DELTAS
         .iter()
-        .map(|(frames, seq, heads, rows, one_head)| {
+        .map(|(tier, frames, seq, heads, rows, one_head)| {
             format!(
-                "{frames}f/seq {seq}: {:+.2}% heads, {:+.2}% query rows, {:+.2}% one-head",
+                "{tier} {frames}f/seq {seq}: {:+.2}% heads, {:+.2}% query rows, {:+.2}% one-head",
                 heads * 100.0,
                 rows * 100.0,
                 one_head * 100.0
@@ -559,7 +705,7 @@ fn rung3_inapplicability_reason() -> String {
     )
 }
 
-fn strategies() -> Vec<MemoryStrategyCapability> {
+fn strategies(streamable: bool) -> Vec<MemoryStrategyCapability> {
     MemoryStrategy::ALL
         .into_iter()
         .map(|strategy| MemoryStrategyCapability {
@@ -578,9 +724,14 @@ fn strategies() -> Vec<MemoryStrategyCapability> {
                         reason: rung3_inapplicability_reason(),
                     }
                 }
-                // sc-18662. `Missing`, not inapplicable: a 50-block DiT and a transformer text
-                // encoder are exactly the components this rung optimizes, so what is absent is the
-                // `LoadShape::DeferredMaterialization` loader, not the opportunity.
+                // sc-18662. Implemented on a `LoadShape::DeferredMaterialization` load and
+                // `Missing` on a resident one — the rung's own shared prerequisite is that shape, so
+                // a resident load genuinely does not have it. Not `StructurallyNotApplicable`: a
+                // 50-block DiT and a 50-layer transformer encoder are exactly the components this
+                // rung optimizes, and both are measured to bound ~9x.
+                MemoryStrategy::BoundedTransformerResidency if streamable => {
+                    MemoryStrategySupport::Implemented
+                }
                 MemoryStrategy::BoundedTransformerResidency => MemoryStrategySupport::Missing,
             },
             parameters: match strategy {
@@ -589,6 +740,17 @@ fn strategies() -> Vec<MemoryStrategyCapability> {
                     decode_overlaps: vec![DECODE_OVERLAP],
                     ..Default::default()
                 },
+                // sc-18662. `Both`, and the second half is the point: declaring `Dit` alone would
+                // leave the conditioning phase — the taller of the two stages at every tier — with
+                // no lever at all, which is what AC3 refuses. Both arms are measured separately in
+                // `tests/block_window_real.rs`.
+                MemoryStrategy::BoundedTransformerResidency if streamable => {
+                    MemoryParameterRanges {
+                        transformer_window_sizes: vec![TRANSFORMER_WINDOW_SIZE],
+                        transformer_window_components: vec![TransformerComponent::Both],
+                        ..Default::default()
+                    }
+                }
                 // `validate_owned_parameter_domain` enforces this in BOTH directions: an
                 // implemented rung that does not own the decode parameters must publish none.
                 _ => MemoryParameterRanges::default(),
@@ -644,7 +806,8 @@ fn adaln_component(resident_bytes: u64) -> MemoryResidentComponent {
     }
 }
 
-fn build_contract(components: &ComponentBytes) -> MemoryProviderContract {
+fn build_contract(components: &ComponentBytes, load_shape: LoadShape) -> MemoryProviderContract {
+    let streamable = load_shape == LoadShape::DeferredMaterialization;
     MemoryProviderContract {
         provider_id: MODEL_ID.to_owned(),
         backend: MemoryBackendRealization::MlxMetal {
@@ -670,9 +833,9 @@ fn build_contract(components: &ComponentBytes) -> MemoryProviderContract {
             explicit_evaluation_and_synchronization: true,
             cache_eviction: true,
         },
-        strategies: strategies(),
+        strategies: strategies(streamable),
         pid_decode_routes: None,
-        load_shape: LOAD_SHAPE,
+        load_shape,
         // The shared graph is sufficient: rung 1 is selected explicitly and depends on nothing, and
         // no rung this provider implements adds a realization-specific edge. sc-18662 adds rung 4's.
         additional_prerequisites: Vec::new(),
@@ -699,7 +862,10 @@ fn build_contract(components: &ComponentBytes) -> MemoryProviderContract {
             // set — so the pair cannot drift apart.
             decode_tiling: true,
             attention_chunking: false,
-            transformer_window_materialization: false,
+            // sc-18662. `conformance_errors` requires this hook whenever rung 4 is `Implemented`
+            // and forbids it while the rung is `StructurallyNotApplicable`, so the pair cannot
+            // drift; here it tracks the resolved load shape for the same reason the rung does.
+            transformer_window_materialization: streamable,
         },
         // A phase envelope is *max over phases*, which is the whole point for this family: the
         // floor is `max(TE, DiT, VAE)`, never the sum, because the three are never co-resident.
@@ -731,9 +897,12 @@ fn build_contract(components: &ComponentBytes) -> MemoryProviderContract {
             ],
             resident_components: vec![adaln_component(components.adaln)],
         },
+        // The calibration identity carries the RESOLVED shape, not the resident default: a
+        // deferred load's peaks are a different curve from a resident load's, and an evidence
+        // record that named the wrong one would be matched against measurements of the other.
         calibration: Some(MemoryCalibrationIdentity::new(
             MEMORY_CALIBRATION_FINGERPRINT,
-            LOAD_SHAPE,
+            load_shape,
         )),
         asset_facts: MemoryAssetFacts {
             base_bytes: components.base(),
@@ -750,17 +919,21 @@ fn build_contract(components: &ComponentBytes) -> MemoryProviderContract {
 
 /// The production contract: asset facts read off the resolved snapshot.
 pub fn contract_for(spec: &LoadSpec) -> mlx_gen::gen_core::Result<MemoryProviderContract> {
-    Ok(build_contract(&ComponentBytes::resolve(spec)))
+    Ok(build_contract(
+        &ComponentBytes::resolve(spec),
+        resolved_load_shape(spec),
+    ))
 }
 
 /// The weights-free fixture contract: the identical route declaration with zero asset facts.
 ///
 /// Catalog conformance uses this when the snapshot is unavailable. It must **not** touch the
 /// filesystem, and it must not diverge from [`contract_for`] in anything but the byte counts.
-pub fn weights_free_contract(
-    _spec: &LoadSpec,
-) -> mlx_gen::gen_core::Result<MemoryProviderContract> {
-    Ok(build_contract(&ComponentBytes::weights_free()))
+pub fn weights_free_contract(spec: &LoadSpec) -> mlx_gen::gen_core::Result<MemoryProviderContract> {
+    Ok(build_contract(
+        &ComponentBytes::weights_free(),
+        resolved_load_shape(spec),
+    ))
 }
 
 /// The canvas the weights-free behavior fixtures admit: the shipped default, exactly at
@@ -946,7 +1119,7 @@ fn begin_request_with_cleanup(
     if let MemorySafetyDecision::Reject { reason } = safety_check(spec, contract, context) {
         return Err(CoreError::Unsupported(reason));
     }
-    let config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
+    let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
         MODEL_ID,
         context.geometry,
         contract.generation_memory(&context.selection),
@@ -956,6 +1129,23 @@ fn begin_request_with_cleanup(
         // and admission cannot disagree about what is legal.
         |_use_pid, edge, overlap| validate_decode_geometry(edge, overlap),
     )?;
+    // sc-18662. **Declaration is not enforcement.** Publishing `transformer_window_sizes` without
+    // this leaves `materialize_transformer_window` refusing every window the contract just
+    // advertised — the registry conformance walk drives the declared parameter through the scope and
+    // caught exactly that. Guarded by contract-aware `engages` rather than an ordinal compare, so a
+    // resident load (where rung 4 is `Missing`) never admits a window.
+    config.transformer_window = contract
+        .engages(
+            context.selection.strategy,
+            MemoryStrategy::BoundedTransformerResidency,
+        )
+        .then(|| {
+            context
+                .selection
+                .parameters
+                .transformer_window_size
+                .unwrap_or(TRANSFORMER_WINDOW_SIZE)
+        });
     Ok(Some(Box::new(
         mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(config, cleanup),
     )))
@@ -1489,15 +1679,17 @@ mod tests {
             }
             other => panic!("sc-18661 measured rung 3 inapplicable, got {other:?}"),
         }
+        // sc-18662 landed rung 4, so it is no longer refused on a DEFERRED contract — its refusal
+        // moved to the resident one, which `load_shape_follows_the_spec_because_both_loaders_now_exist`
+        // owns. Rung 3 is the only rung this contract still refuses, and it refuses it for a
+        // measured reason rather than an unbuilt one.
         assert_eq!(
             support(&contract, MemoryStrategy::BoundedTransformerResidency),
-            MemoryStrategySupport::Missing,
-            "rung 4 is unbuilt, not inapplicable — the components it optimizes are both present"
+            MemoryStrategySupport::Implemented,
+            "rung 4 is implemented on a DeferredMaterialization load (sc-18662)"
         );
-        for strategy in [
-            MemoryStrategy::BoundedAttention,
-            MemoryStrategy::BoundedTransformerResidency,
-        ] {
+        {
+            let strategy = MemoryStrategy::BoundedAttention;
             assert!(
                 contract
                     .validate_selection(&MemorySelection {
@@ -1545,7 +1737,10 @@ mod tests {
             },
             calibration_abi: mlx_gen::gen_core::MEMORY_CALIBRATION_ABI,
             calibration_fingerprint: MEMORY_CALIBRATION_FINGERPRINT.to_owned(),
-            load_shape: LOAD_SHAPE,
+            // sc-18662: the contract's shape now follows the spec, so a context pinned to
+            // `LOAD_SHAPE` would fail the calibration handshake on a deferred spec and make every
+            // geometry rejection below vacuous. Read it off the contract under test.
+            load_shape: contract.load_shape,
             mode: MemoryMode::TextToImage,
             has_reference: geometry.reference_count > 0,
             use_pid,
@@ -1688,10 +1883,18 @@ mod tests {
             ),
             (
                 "a calibration load shape that disagrees with the contract",
+                // sc-18662: flipped RELATIVE to the contract rather than pinned to one shape. The
+                // contract's shape now follows the spec, and a hardcoded
+                // `DeferredMaterialization` here silently became the agreeing value — an inert
+                // mutation that would have kept passing with the conformance rule deleted.
                 Box::new(|c| {
+                    let opposite = match c.load_shape {
+                        LoadShape::DeferredMaterialization => LoadShape::EagerMaterialization,
+                        _ => LoadShape::DeferredMaterialization,
+                    };
                     c.calibration = Some(MemoryCalibrationIdentity::new(
                         MEMORY_CALIBRATION_FINGERPRINT,
-                        LoadShape::DeferredMaterialization,
+                        opposite,
                     ));
                 }),
             ),
@@ -1745,6 +1948,20 @@ mod tests {
         let contract = declared();
         assert!(contract.conformance_errors().is_empty());
         for capability in &contract.strategies {
+            if capability.strategy == MemoryStrategy::BoundedTransformerResidency {
+                // sc-18662. Rung 4 owns the window domain on a deferred contract, and `declared()`
+                // is resolved at `DeferredMaterialization`.
+                assert_eq!(
+                    capability.parameters,
+                    MemoryParameterRanges {
+                        transformer_window_sizes: vec![TRANSFORMER_WINDOW_SIZE],
+                        transformer_window_components: vec![TransformerComponent::Both],
+                        ..Default::default()
+                    },
+                    "rung 4 publishes the measured singleton window and both component arms"
+                );
+                continue;
+            }
             if capability.strategy == MemoryStrategy::BoundedDecode {
                 assert_eq!(
                     capability.parameters,
@@ -2610,16 +2827,39 @@ mod tests {
     /// `DeferredMaterialization` and this provider still reports `EagerMaterialization`, because
     /// `MiniMaxH3Dit::load_dir` builds the whole block stack (sc-18662 changes that).
     #[test]
-    fn load_shape_is_pinned_to_the_loader_not_taken_from_the_spec() {
-        let spec = weightless_spec();
-        assert_eq!(spec.load_shape, LoadShape::DeferredMaterialization);
-        let contract = contract_for(&spec).expect("contract");
-        assert_eq!(contract.load_shape, LoadShape::EagerMaterialization);
+    fn load_shape_follows_the_spec_because_both_loaders_now_exist() {
+        // sc-18662 inverted this test's subject, deliberately. It used to assert that the contract
+        // PINNED `EagerMaterialization` whatever the spec asked, because `load_dir` was the only
+        // loader and answering otherwise would declare a shape the provider did not have. Both
+        // loaders exist now (`load_dir_deferred`, `MiniMaxH3TextEncoder::from_dir_deferred`), so the
+        // honest answer is the spec's — and the test that has to exist is that the two shapes give
+        // DIFFERENT contracts rather than one silently winning.
+        let deferred = contract_for(&weightless_spec()).expect("contract");
+        assert_eq!(deferred.load_shape, LoadShape::DeferredMaterialization);
         assert_eq!(
-            contract.calibration.as_ref().unwrap().load_shape,
-            LoadShape::EagerMaterialization,
-            "the calibration identity must carry the shape it was measured at"
+            deferred.calibration.as_ref().unwrap().load_shape,
+            LoadShape::DeferredMaterialization,
+            "the calibration identity must carry the shape it was resolved at, or an evidence \
+             record would be matched against measurements of the other residency"
         );
+        assert_eq!(
+            support(&deferred, MemoryStrategy::BoundedTransformerResidency),
+            MemoryStrategySupport::Implemented
+        );
+
+        let resident_spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
+            .with_load_shape(LoadShape::EagerMaterialization);
+        let resident = contract_for(&resident_spec).expect("contract");
+        assert_eq!(resident.load_shape, LoadShape::EagerMaterialization);
+        assert_eq!(resident.load_shape, LOAD_SHAPE);
+        assert_eq!(
+            support(&resident, MemoryStrategy::BoundedTransformerResidency),
+            MemoryStrategySupport::Missing,
+            "a resident load genuinely does not have rung 4's declared prerequisite"
+        );
+        assert!(!resident.lifecycle.transformer_window_materialization);
+        assert!(deferred.lifecycle.transformer_window_materialization);
+        let contract = deferred;
         // ...and the spec IS read: the asset facts come off it.
         let root = tempfile::tempdir().expect("tempdir");
         sparse_snapshot(root.path(), &[("vae", VIDEO_VAE_BYTES)]);
@@ -2632,14 +2872,41 @@ mod tests {
     /// The rung-4 precondition is unmet today, and that is why rung 4 is `Missing` rather than a
     /// declaration waiting on a flag.
     #[test]
-    fn rung_four_is_missing_because_its_load_shape_precondition_is_unmet() {
+    fn rung_four_publishes_both_component_arms_and_a_singleton_window() {
+        // sc-18662. The predecessor asserted rung 4 was `Missing` for want of a deferred loader.
         let contract = declared();
-        assert_eq!(contract.load_shape, LoadShape::EagerMaterialization);
-        assert!(!contract.lifecycle.transformer_window_materialization);
+        assert_eq!(contract.load_shape, LoadShape::DeferredMaterialization);
+        assert!(contract.lifecycle.transformer_window_materialization);
         assert_eq!(
             support(&contract, MemoryStrategy::BoundedTransformerResidency),
-            MemoryStrategySupport::Missing
+            MemoryStrategySupport::Implemented
         );
+        let ranges = &contract
+            .capability(MemoryStrategy::BoundedTransformerResidency)
+            .expect("rung 4")
+            .parameters;
+        // **`Both`, not `Dit`.** Declaring the DiT alone would leave the conditioning phase — the
+        // taller stage at every tier — with no lever, which is what AC3 refuses. The TE arm is
+        // measured separately: 53.07 -> 5.81 GB.
+        assert_eq!(
+            ranges.transformer_window_components,
+            vec![TransformerComponent::Both]
+        );
+        assert!(ranges.transformer_window_components[0].includes_dit());
+        assert!(ranges.transformer_window_components[0].includes_text_encoder());
+        // The window domain is a measured singleton, not a placeholder — see
+        // `TRANSFORMER_WINDOW_SIZE`.
+        assert_eq!(
+            ranges.transformer_window_sizes,
+            vec![TRANSFORMER_WINDOW_SIZE]
+        );
+        assert_eq!(TRANSFORMER_WINDOW_SIZE, 1);
+
+        // **The declared-versus-measured guard is deliberately NOT here.** A ratio between two
+        // `const`s is decided at compile time — clippy says so — and would prove nothing at run
+        // time, which is the false-green shape this epic keeps refusing. It lives in
+        // `tests/block_window_real.rs`, where the constants are checked against a fresh measurement
+        // on real weights and go red when they drift.
     }
 
     /// `Precision::Fp32` is a different numeric tier and must not be admitted against a bf16 load.

@@ -943,3 +943,92 @@ pub fn describe_dit_tier(dir: &std::path::Path) -> String {
         ),
     }
 }
+
+// --- sc-18662: rung-4 bounded-transformer-residency receipts and stack walks --------------------
+
+/// A bare walk of a **resident** DiT block stack, modulation-free.
+///
+/// Rung 4 bounds *weight* residency, so the walk is deliberately the thinnest thing that touches
+/// every block's tensors: `norm1 -> attn -> norm2 -> ff`, no AdaLN modulation and no rotary. Adding
+/// them would put a 3.87 GB modulation table and a rotary grid inside a measurement window that the
+/// window does not bound, diluting the ratio under test — and neither is a function of which blocks
+/// are materialized, which is the question.
+///
+/// The windowed twin is [`walk_windowed_blocks`] and it runs the identical per-block call, so the
+/// two arms differ in exactly one variable.
+pub fn walk_resident_blocks(
+    dit: &mlx_gen_minimax_h3::dit::MiniMaxH3Dit,
+    hidden: &Array,
+) -> mlx_gen::Result<Array> {
+    let mut h = hidden.clone();
+    for block in dit.blocks() {
+        h = block.forward_body(&h)?;
+    }
+    Ok(h)
+}
+
+/// [`walk_resident_blocks`] over a bounded window — one block materialized at a time at `window` 1.
+pub fn walk_windowed_blocks(
+    stream: &mlx_gen_minimax_h3::DitBlockStream,
+    plan: &mlx_gen::block_residency::BlockPlan,
+    hidden: &Array,
+) -> mlx_gen::Result<Array> {
+    mlx_gen::block_residency::run_windowed(
+        plan,
+        &mlx_gen::CancelFlag::default(),
+        hidden.clone(),
+        || stream.open(),
+        |mut h: Array, view: &mut Weights, range: std::ops::Range<usize>| {
+            for index in range {
+                let block = stream.materialize(view, index)?;
+                h = block.forward_body(&h)?;
+            }
+            Ok(h)
+        },
+        |h: &Array| mlx_rs::transforms::eval([h]).map_err(Into::into),
+    )
+}
+
+/// Emit a rung-4 measurement receipt: to `MINIMAX_H3_EVIDENCE_OUT` when set, always to stderr.
+///
+/// Same shape and the same sequencing caveat as [`write_bounded_attention_evidence`]: the measured
+/// half is emitted here in a versioned, self-describing form carrying every axis
+/// `MemoryEvidenceKey` needs, and sc-17153 pairs it with the fitted prediction that
+/// `MemoryRunOutcome` requires.
+///
+/// `cells` are `(window, peak_bytes, wall_seconds)`. **The wall figure is recorded but must not be
+/// asserted on**: this Mac is also the `nax-macos` runner and has been measured at load average
+/// 80-109, so a duration taken here is a sample of the fleet's contention, not of the rung. The peak
+/// is a per-process allocator high-water mark and does not read machine load at all.
+pub fn write_rung4_evidence(
+    component: &str,
+    tier: &str,
+    cells: &[(usize, u64, f64)],
+    resident_peak_bytes: u64,
+) {
+    let document = serde_json::json!({
+        "schema": "MINIMAX_H3_RUNG4_MEASUREMENT_V1",
+        "story": "sc-18662",
+        "provider": "minimax-h3",
+        "backend": "mlx-metal",
+        "component": component,
+        "tier": tier,
+        "resident_peak_bytes": resident_peak_bytes,
+        "wall_seconds_are_advisory": "measured on a machine that is also the nax-macos CI runner; \
+                                      no assertion reads them",
+        "cells": cells.iter().map(|(window, peak, wall)| serde_json::json!({
+            "transformer_window_size": window,
+            "peak_bytes": peak,
+            "peak_ratio_below_resident": resident_peak_bytes as f64 / (*peak).max(1) as f64,
+            "wall_seconds": wall,
+        })).collect::<Vec<_>>(),
+    });
+    let text = serde_json::to_string_pretty(&document).expect("serialize rung-4 receipt");
+    eprintln!("\nMINIMAX_H3_RUNG4_MEASUREMENT_V1\n{text}");
+    if let Ok(path) = std::env::var("MINIMAX_H3_EVIDENCE_OUT") {
+        if !path.trim().is_empty() {
+            let path = format!("{}.rung4-{component}-{tier}.json", path.trim());
+            std::fs::write(path, &text).expect("write rung-4 receipt");
+        }
+    }
+}

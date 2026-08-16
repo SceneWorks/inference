@@ -229,6 +229,14 @@ impl MiniMaxH3Dit {
         self.blocks.len()
     }
 
+    /// The materialized block stack — empty under a deferred load.
+    ///
+    /// Exposed for the rung-4 residency harness, which needs to walk the resident arm through the
+    /// **same** per-block call the windowed arm walks so the two differ in one variable only.
+    pub fn blocks(&self) -> &[DitBlock] {
+        &self.blocks
+    }
+
     /// Whether every block still holds its AdaLN projection.
     ///
     /// **`false` under a deferred load**, and that is the honest answer rather than a vacuous

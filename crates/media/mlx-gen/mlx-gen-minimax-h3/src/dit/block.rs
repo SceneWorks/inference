@@ -395,6 +395,22 @@ impl DitBlock {
         )
     }
 
+    /// The block **body** with no modulation and no rotary — `norm1 -> attn -> norm2 -> ff` with
+    /// plain residuals.
+    ///
+    /// Not a render path, and deliberately so: it is the thinnest call that touches every one of a
+    /// block's ten body tensors, which is what rung 4's residency measurement needs
+    /// (`tests/block_window_real.rs`). Driving the real modulated forward there would put the
+    /// 3.87 GB AdaLN table and a rotary grid inside the measurement window — neither of which the
+    /// window bounds, and both of which are constant across the arms being compared, so they would
+    /// dilute the very ratio under test.
+    pub fn forward_body(&self, x: &Array) -> Result<Array> {
+        let attn = self.attn.forward(&self.norm1.forward(x)?, None)?;
+        let x = add(x, &attn)?;
+        let ff = self.ff.forward(&self.norm2.forward(&x)?)?;
+        Ok(add(&x, &ff)?)
+    }
+
     /// [`Self::forward`] under an explicit [`BoundedAttention`] — the rung-3 seam (sc-18661).
     ///
     /// The plan is threaded rather than read from a block-level field so that the *same* loaded stack

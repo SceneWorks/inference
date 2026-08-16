@@ -30,7 +30,15 @@ use super::{embedding, join_key, MiniMaxH3TeConfig, Qwen3DecoderLayer, SPATIAL_M
 /// MiniMax-H3's Qwen3-VL-32B condition encoder.
 pub struct MiniMaxH3TextEncoder {
     embed_tokens: TokenEmbedding,
+    /// Empty under a deferred load (sc-18662, rung 4) — the layers live in `stream` instead.
     layers: Vec<Qwen3DecoderLayer>,
+    /// `Some` under [`LoadShape::DeferredMaterialization`](mlx_gen::gen_core::LoadShape). Mutually
+    /// exclusive with a populated `layers`.
+    stream: Option<crate::block_stream::TeBlockStream>,
+    /// The per-step block window. `None` runs the resident stack.
+    window: Option<mlx_gen::block_residency::BlockPlan>,
+    /// Checked at every window boundary — the only cancellation point inside one encoder forward.
+    window_cancel: mlx_gen::CancelFlag,
     rope: TextRope,
     /// 0-indexed decoder layer whose output is the context (`select_hidden - 1`).
     out_layer: usize,
@@ -74,6 +82,9 @@ impl MiniMaxH3TextEncoder {
         Ok(Self {
             embed_tokens: embedding(w, &join_key(prefix, "embed_tokens"))?,
             layers,
+            stream: None,
+            window: None,
+            window_cancel: mlx_gen::CancelFlag::default(),
             rope: TextRope::new(cfg.head_dim, cfg.rope_theta),
             out_layer,
             image_token_id: cfg.image_token_id,
@@ -84,10 +95,145 @@ impl MiniMaxH3TextEncoder {
         })
     }
 
+    /// **The rung-4 loader** (sc-18662): load only `embed_tokens` and defer the 50 decoder layers.
+    ///
+    /// `embed_tokens` stays resident because it is consumed **once**, before the stack runs, and a
+    /// window that re-read it would pay the token table per window for a tensor already spent. It is
+    /// the encoder's counterpart to the DiT's 17 I/O projections.
+    ///
+    /// The [`Weights`] map is dropped before returning: it is only lazily-mapped handles, but a
+    /// retained one keeps every layer tensor reachable and makes the first window's release free
+    /// nothing.
+    pub fn from_dir_deferred(
+        dir: impl AsRef<std::path::Path>,
+        prefix: &str,
+        cfg: &MiniMaxH3TeConfig,
+    ) -> Result<Self> {
+        let dir = dir.as_ref();
+        let out_layer = cfg.out_layer()?;
+        if out_layer as i32 >= cfg.num_layers {
+            return Err(Error::Msg(format!(
+                "minimax-h3 te: select_hidden {} needs layer {out_layer} but the encoder has {} \
+                 layers",
+                cfg.select_hidden, cfg.num_layers
+            )));
+        }
+        let stream = crate::block_stream::TeBlockStream::new(dir, prefix, cfg.clone())?;
+        let embed_tokens = {
+            let w = Weights::from_dir(dir)?;
+            embedding(&w, &join_key(prefix, "embed_tokens"))?
+        };
+        Ok(Self {
+            embed_tokens,
+            layers: Vec::new(),
+            stream: Some(stream),
+            window: None,
+            window_cancel: mlx_gen::CancelFlag::default(),
+            rope: TextRope::new(cfg.head_dim, cfg.rope_theta),
+            out_layer,
+            image_token_id: cfg.image_token_id,
+            video_token_id: cfg.video_token_id,
+            mrope_section: cfg.mrope_section,
+            head_dim: cfg.head_dim,
+            rope_theta: cfg.rope_theta,
+        })
+    }
+
+    /// Select the per-step block window for a deferred load. `window` blocks materialized at once;
+    /// `1` is the floor.
+    pub fn set_block_window(&mut self, window: usize, cancel: mlx_gen::CancelFlag) -> Result<()> {
+        let stream = self.stream.as_ref().ok_or_else(|| {
+            Error::Msg(
+                "minimax-h3 te: a block window was set on a RESIDENT encoder; load with \
+                 `from_dir_deferred` for rung 4"
+                    .into(),
+            )
+        })?;
+        self.window = Some(stream.plan(window)?);
+        self.window_cancel = cancel;
+        Ok(())
+    }
+
+    /// Whether this load defers layer materialization.
+    pub fn is_deferred(&self) -> bool {
+        self.stream.is_some()
+    }
+
+    /// Layers currently materialized. `0` under a deferred load — the residency claim.
+    pub fn resident_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// The block window in force, or `None` on a resident stack.
+    pub fn block_window(&self) -> Option<&mlx_gen::block_residency::BlockPlan> {
+        self.window.as_ref()
+    }
+
+    /// **The one decoder-stack walk**, under either residency mode.
+    ///
+    /// Both public forwards route through this rather than each growing its own windowed twin: the
+    /// grounded path differs only by a per-layer post-hook (the `deepstack` injection), which is what
+    /// `after` carries. A second loop would be a second chance for the two to disagree about the
+    /// residency, and the grounded path is the one a `ref2va` request takes — a rung reachable on
+    /// only `t2va` would be declared for routes it does not serve.
+    fn run_layers(
+        &self,
+        hidden: Array,
+        cos: &Array,
+        sin: &Array,
+        mask: &Array,
+        mut after: impl FnMut(usize, Array) -> Result<Array>,
+    ) -> Result<Array> {
+        match (&self.stream, &self.window) {
+            (None, None) => {
+                let mut hidden = hidden;
+                for (i, layer) in self.layers.iter().enumerate() {
+                    hidden = layer.forward(&hidden, cos, sin, mask)?;
+                    hidden = after(i, hidden)?;
+                }
+                Ok(hidden)
+            }
+            (Some(stream), Some(plan)) => mlx_gen::block_residency::run_windowed(
+                plan,
+                &self.window_cancel,
+                hidden,
+                || stream.open(),
+                |mut hidden: Array, view: &mut Weights, range: std::ops::Range<usize>| {
+                    for i in range {
+                        let layer = stream.materialize(view, i)?;
+                        hidden = layer.forward(&hidden, cos, sin, mask)?;
+                        hidden = after(i, hidden)?;
+                        // The layer drops per iteration, not per window: at `window > 1` the
+                        // alternative holds every layer of the window plus the activation.
+                    }
+                    Ok(hidden)
+                },
+                // LOAD-BEARING: MLX is lazy, so the carried activation still references this
+                // window's weights until it is forced.
+                |hidden: &Array| mlx_rs::transforms::eval([hidden]).map_err(Into::into),
+            ),
+            (Some(_), None) => Err(Error::Msg(
+                "minimax-h3 te: a deferred encoder has no block window; call `set_block_window` \
+                 before the forward, or load resident"
+                    .into(),
+            )),
+            (None, Some(_)) => Err(Error::Msg(
+                "minimax-h3 te: a resident encoder carries a block window; it would bound nothing"
+                    .into(),
+            )),
+        }
+    }
+
     /// How many decoder layers were actually loaded — `select_hidden`, not `num_layers`. Exposed so
     /// a caller (and the real-weight smoke) can prove the trim is real.
+    ///
+    /// Under a deferred load this is the **tapped depth the forward runs**, which is the question
+    /// every existing caller is asking; [`Self::resident_layers`] is the residency observable.
     pub fn num_loaded_layers(&self) -> usize {
-        self.layers.len()
+        match &self.stream {
+            Some(stream) => stream.n_layers(),
+            None => self.layers.len(),
+        }
     }
 
     /// Quantize the token table + every loaded projection in place. Norms stay dense.
@@ -185,11 +331,8 @@ impl MiniMaxH3TextEncoder {
         let (cos, sin) = self.rope.forward(s)?;
         let mask = build_mask(attention_mask, b, s)?;
 
-        let mut hidden = self.embed_tokens.forward(input_ids)?;
-        for layer in &self.layers {
-            hidden = layer.forward(&hidden, &cos, &sin, &mask)?;
-        }
-        Ok(hidden)
+        let hidden = self.embed_tokens.forward(input_ids)?;
+        self.run_layers(hidden, &cos, &sin, &mask, |_, h| Ok(h))
     }
 
     /// **Vision-grounded** conditioning (the fl2va / Ref2VA image path): run the encoder with each
@@ -296,17 +439,17 @@ impl MiniMaxH3TextEncoder {
         )?;
         let mask = build_mask(attention_mask, b, s)?;
 
-        for (i, layer) in self.layers.iter().enumerate() {
-            hidden = layer.forward(&hidden, &cos, &sin, &mask)?;
+        let hidden = self.run_layers(hidden, &cos, &sin, &mask, |i, mut h| {
             for (&(start, end), ds_img) in runs.iter().zip(deepstack) {
                 if i < ds_img.len() {
-                    let mid = slice_seq(&hidden, start, end)?;
+                    let mid = slice_seq(&h, start, end)?;
                     let inj = add(&mid, &ds_img[i].expand_dims(0)?.as_dtype(dt)?)?;
-                    hidden = replace_seq(&hidden, &inj, start, end)?;
+                    h = replace_seq(&h, &inj, start, end)?;
                 }
             }
-        }
-        let _ = self.out_layer; // the loop runs exactly `out_layer + 1` layers by construction
+            Ok(h)
+        })?;
+        let _ = self.out_layer; // the walk runs exactly `out_layer + 1` layers by construction
         Ok(hidden)
     }
 }
