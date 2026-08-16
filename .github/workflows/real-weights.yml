@@ -146,6 +146,18 @@ on:
         required: false
         default: real-weights
         options: [real-weights, rw-chroma]
+      decode_quality_sdxl_runner:
+        description: "SC-19753 diagnostic SDXL-family host label"
+        type: choice
+        required: false
+        default: rw-chroma
+        options: [real-weights, rw-chroma]
+      decode_quality_sdxl_model:
+        description: "SC-19753 diagnostic SDXL-family model subset"
+        type: choice
+        required: false
+        default: all
+        options: [all, sdxl, realvisxl, realvisxl_lightning, illustrious_xl_v1, illustrious_xl_v2]
       # sc-15520 — the memory ladder in dispatchable pieces, for the same reason `krea_s18_rows`
       # exists: `rw-chroma` shares nax-macos-2 with `rw-krea`, `rw-audio` and `rw-llm` one at a
       # time, and the whole 16-test ladder at the 28-step production schedule is multi-hour per
@@ -225,7 +237,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: inference-real-weights-${{ github.ref }}-${{ inputs.profile || 'schedule' }}-${{ inputs.chroma_model || 'all' }}-${{ inputs.decode_quality_chroma_runner || 'default' }}
+  group: inference-real-weights-${{ github.ref }}-${{ inputs.profile || 'schedule' }}-${{ inputs.chroma_model || 'all' }}-${{ inputs.decode_quality_chroma_runner || 'default' }}-${{ inputs.decode_quality_sdxl_model || 'all' }}-${{ inputs.decode_quality_sdxl_runner || 'default' }}
   cancel-in-progress: false
 
 # BUILD ARTIFACTS OUTSIDE THE DIRECTORY `actions/checkout` CLEANS.
@@ -817,7 +829,7 @@ jobs:
     name: Decode quality admission (${{ matrix.model.id }} ${{ matrix.candidate.geometry }})
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'decode-quality-sdxl'
     # SC-19753 diagnostic only; see the Kolors job's audited runner-selection rationale above.
-    runs-on: [self-hosted, macOS, ARM64, rw-chroma]
+    runs-on: [self-hosted, macOS, ARM64, "${{ inputs.decode_quality_sdxl_runner }}"]
     timeout-minutes: 720
     strategy:
       fail-fast: false
@@ -872,13 +884,17 @@ jobs:
       DECODE_QUALITY_CANDIDATES: ${{ matrix.candidate.value }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        if: inputs.decode_quality_sdxl_model == 'all' || inputs.decode_quality_sdxl_model == matrix.model.id
       - name: Guard diagnostic download headroom
+        if: inputs.decode_quality_sdxl_model == 'all' || inputs.decode_quality_sdxl_model == matrix.model.id
         run: |
           available_kib="$(df -Pk "$RUNNER_TEMP" | awk 'NR == 2 { print $4 }')"
           test "$available_kib" -ge 41943040
       - name: Toolchain versions
+        if: inputs.decode_quality_sdxl_model == 'all' || inputs.decode_quality_sdxl_model == matrix.model.id
         run: rustc --version && cargo --version && python3.12 --version
       - name: Materialize exact SDXL-family q4 snapshot
+        if: inputs.decode_quality_sdxl_model == 'all' || inputs.decode_quality_sdxl_model == matrix.model.id
         env:
           PYTHONPATH: ${{ runner.temp }}/huggingface-hub
           QUALITY_ROOT: ${{ runner.temp }}/decode-quality-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model.id }}-${{ matrix.candidate.geometry }}
@@ -903,6 +919,7 @@ jobs:
           test -d "$QUALITY_ROOT/q4/vae"
           echo "SDXL_QUALITY_ROOT=$QUALITY_ROOT" >> "$GITHUB_ENV"
       - name: Run production-latent quality admission
+        if: inputs.decode_quality_sdxl_model == 'all' || inputs.decode_quality_sdxl_model == matrix.model.id
         env:
           SDXL_QUALITY_ENTRY: ${{ env.QUALITY_MODEL }}
           DECODE_QUALITY_SOURCE_REVISION: ${{ env.QUALITY_SOURCE_REVISION }}
@@ -921,7 +938,7 @@ jobs:
             --input "$log" --expected-policy-count 1 --expected-fixture-count 5 \
             --output "$RUNNER_TEMP/decode-quality-v2-sdxl-$QUALITY_MODEL-${{ matrix.candidate.geometry }}-policies.json"
       - name: Upload semantic quality receipts
-        if: always()
+        if: always() && (inputs.decode_quality_sdxl_model == 'all' || inputs.decode_quality_sdxl_model == matrix.model.id)
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: decode-quality-v2-sdxl-${{ matrix.model.id }}-${{ matrix.candidate.geometry }}
