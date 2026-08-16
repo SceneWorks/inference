@@ -113,7 +113,7 @@ on:
         default: all
         # `audio` still runs every audio family. The `audio-*` entries are the per-family split
         # (sc-16981) — dispatch one provider family without taking the Metal runner for the rest.
-        options: [all, llm, llm-joycaption, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base]
+        options: [all, llm, llm-joycaption, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, sc-19753-z-decode-sweep, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base]
       sceneworks_revision:
         description: Exact lowercase SceneWorks commit paired with memory-evidence-v1
         type: string
@@ -5879,3 +5879,45 @@ jobs:
           type "%log%"
           findstr /C:"test result: ok. 1 passed" "%log%" >nul || (echo ::error::%~2 did not run exactly one passing test - a rename would make this step vacuously green & exit /b 1)
           exit /b 0
+
+  # SC-19753 measurement-only diagnostic. The shipping workflow does not keep this lane: it
+  # re-runs the existing Z-Image rung-2 sweep after global-stat GroupNorm changed the tiled VAE
+  # arithmetic, using the already provisioned immutable q4 re-host on the rw-mage runner.
+  mlx-z-decode-sweep-sc-19753:
+    name: SC-19753 Z-Image decode ladder re-sweep
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'sc-19753-z-decode-sweep'
+    runs-on: [self-hosted, macOS, ARM64, rw-mage]
+    timeout-minutes: 180
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/../cargo-target
+      ZIMAGE_TIER: q4
+      ZIMAGE_SIZE: 1024
+      ZIMAGE_STEPS: 4
+      ZIMAGE_MLX_REVISION: bb2bc9893b3c49ae96c813350775f791a2e8bc80
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Resolve the provisioned immutable q4 re-host
+        run: |
+          set -euo pipefail
+          snapshot="${HF_HOME:-$HOME/.cache/huggingface}/hub/models--SceneWorks--z-image-turbo-mlx/snapshots/$ZIMAGE_MLX_REVISION/q4"
+          test -d "$snapshot/transformer"
+          test -d "$snapshot/text_encoder"
+          test -d "$snapshot/vae"
+          printf 'MLX_GEN_%s=%s\n' 'ZIMAGE_SNAPSHOT' "$snapshot" >> "$GITHUB_ENV"
+      - name: Toolchain versions
+        run: rustc --version && cargo --version && python3.12 --version
+      - name: Re-sweep every native decode tile
+        run: |
+          set -o pipefail
+          cargo test --locked --release -p mlx-gen-z-image \
+            --test block_residency_real_weights \
+            every_declared_decode_candidate_runs_and_preserves_the_image \
+            -- --exact --ignored --test-threads=1 --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/sc-19753-z-decode-sweep.log"
+      - name: Upload the measurement log
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sc-19753-z-decode-sweep-${{ github.sha }}
+          if-no-files-found: error
+          path: ${{ runner.temp }}/sc-19753-z-decode-sweep.log
