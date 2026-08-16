@@ -1032,3 +1032,54 @@ pub fn write_rung4_evidence(
         }
     }
 }
+
+/// Emit the rung-4 **request-peak** receipt (sc-18662): the per-stage peaks of one end-to-end
+/// `generate` on the deferred path, with the streamed selection on the request.
+///
+/// Same shape and the same sequencing caveat as [`write_rung4_evidence`]: the measured half only —
+/// sc-17153 pairs it with the fitted prediction `MemoryRunOutcome` requires. The distinguishing
+/// axis is `request_peak_bytes`: the MAX over the render's stage peaks, which is the quantity the
+/// SceneWorks survey's `requestPeak` axis asks about and which no per-arm cell can stand in for.
+#[allow(clippy::too_many_arguments)]
+pub fn write_rung4_request_evidence(
+    dit_tier: &str,
+    te_tier: &str,
+    width: u32,
+    height: u32,
+    frames: u32,
+    steps: u32,
+    stages: &[(&'static str, usize, usize)],
+    request_peak_bytes: usize,
+) {
+    let document = serde_json::json!({
+        "schema": "MINIMAX_H3_RUNG4_REQUEST_MEASUREMENT_V1",
+        "story": "sc-18662",
+        "provider": "minimax-h3",
+        "backend": "mlx-metal",
+        "task": "t2va",
+        "transformer_window_size": 1,
+        "transformer_window_component": "both",
+        "dit_tier": dit_tier,
+        "te_tier": te_tier,
+        "width": width,
+        "height": height,
+        "frames": frames,
+        "steps": steps,
+        "request_peak_bytes": request_peak_bytes,
+        "wall_seconds_are_advisory": "measured on a machine that is also the nax-macos CI runner; \
+                                      no assertion reads them",
+        "stages": stages.iter().map(|(name, peak, held)| serde_json::json!({
+            "stage": name,
+            "peak_bytes": peak,
+            "active_plus_cache_at_close_bytes": held,
+        })).collect::<Vec<_>>(),
+    });
+    let text = serde_json::to_string_pretty(&document).expect("serialize rung-4 request receipt");
+    eprintln!("\nMINIMAX_H3_RUNG4_REQUEST_MEASUREMENT_V1\n{text}");
+    if let Ok(path) = std::env::var("MINIMAX_H3_EVIDENCE_OUT") {
+        if !path.trim().is_empty() {
+            let path = format!("{}.rung4-request-{dit_tier}-{frames}f.json", path.trim());
+            std::fs::write(path, &text).expect("write rung-4 request receipt");
+        }
+    }
+}

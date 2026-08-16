@@ -516,6 +516,25 @@ pub const RUNG4_DIT_MEASURED_PEAKS: [(&str, u64, u64); 3] = [
     ("bf16", 39_578_684_416, 1_901_221_376),
 ];
 
+/// **The rung-4 REQUEST peak** (sc-18662): the max over one whole streamed render's stage peaks,
+/// measured on the shipped `generate` by `tests/streamed_generate_real.rs` — q4 DiT tier, q4
+/// packed text encoder, 124 frames at 384x224, 4 steps, window 1, `TransformerComponent::Both`.
+///
+/// This is the number the per-arm cells above cannot stand in for: they measure each phase in its
+/// own process window, while the SceneWorks survey's `requestPeak` axis asks about the composition
+/// — and its own note says a static proxy will not do. The resident request's high-water is the
+/// conditioning stage's mark ([`CONDITIONING_STAGE_PEAK_BYTES`], 53.07 GB dense); the streamed
+/// request pins at the decode floor instead, because conditioning and denoise are both windowed
+/// and the VAE decode is untouched by this rung (rung 2 owns it).
+///
+/// Measured per stage: conditioning 0.78 GB, dit-load + adaln-precompute 2.03 GB, denoise
+/// 2.03 GB, decode **5.80 GB** — so the request is decode-bound, which is what the phase
+/// envelope's `max(TE, DiT, decode)` arithmetic predicted (5.77 GB) before the request ran.
+///
+/// Held to a ±25% band by the harness rather than to the byte — the peak counter carries ~1 GB of
+/// run-to-run spread on this machine.
+pub const RUNG4_REQUEST_PEAK_Q4_BYTES: u64 = 5_804_369_044;
+
 /// The stage-ordered lifecycle every MiniMax-H3 render runs.
 fn phases() -> Vec<MemoryPhase> {
     vec![

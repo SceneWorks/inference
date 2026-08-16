@@ -384,3 +384,67 @@ fn every_window_opens_an_independent_view() {
     );
     stream.materialize(&mut second, 0).unwrap();
 }
+
+/// **The TE arm is reachable in CI, and a window is invisible in the output** (sc-18662 AC4).
+///
+/// Until this test the text-encoder window had only real-weight coverage, which CI never runs —
+/// the arm's reachability rested on one `#[ignore]`d test. The fixture encoder is staged into a
+/// directory exactly the way a tier is, loaded through the same `from_dir_deferred` +
+/// `set_block_window` calls `model::build_te` makes for a streamed render, and compared against
+/// the resident `from_weights` load — bit-identically, because the windowed walk runs the same
+/// arithmetic and differs only in when a layer's weights exist.
+///
+/// Window sizes cover AC5's floor (1), a ragged tail (3 over 4 tapped layers), and the
+/// all-covering plan (4), so the boundary bookkeeping of `run_layers`' carried activation is
+/// exercised at every plan shape the scheduler can produce.
+#[test]
+fn the_windowed_te_matches_the_resident_one_on_the_fixture() {
+    use mlx_gen_minimax_h3::text_encoder::MiniMaxH3TextEncoder;
+
+    let staged = tempfile::tempdir().unwrap();
+    std::fs::copy(common::TE_FIXTURE, staged.path().join("model.safetensors")).unwrap();
+    // The tier marker `TeBlockStream::new` probes. Content is not read for the fixture prefix —
+    // the config is handed in directly, as `te_parity.rs` does.
+    std::fs::write(staged.path().join("config.json"), "{}").unwrap();
+    let cfg = common::te_fixture_config();
+
+    let w = Weights::from_file(common::TE_FIXTURE).unwrap();
+    let ids = w.get("in.input_ids").unwrap().clone();
+    let mask = w.get("in.attention_mask").unwrap().clone();
+
+    let resident = MiniMaxH3TextEncoder::from_weights(&w, "language_model", &cfg).unwrap();
+    assert!(!resident.is_deferred());
+    let reference = resident.forward(&ids, &mask).unwrap();
+
+    let tapped = cfg.select_hidden;
+    for window in [1usize, 3, tapped] {
+        let mut te =
+            MiniMaxH3TextEncoder::from_dir_deferred(staged.path(), "language_model", &cfg).unwrap();
+        assert!(te.is_deferred());
+        assert_eq!(
+            te.resident_layers(),
+            0,
+            "a deferred encoder must hold no layers — that is the residency claim"
+        );
+        assert_eq!(
+            te.num_loaded_layers(),
+            tapped,
+            "the deferred walk must run the tapped depth, not the checkpoint's num_layers"
+        );
+        te.set_block_window(window, mlx_gen::CancelFlag::default())
+            .unwrap();
+        let out = te.forward(&ids, &mask).unwrap();
+        assert_eq!(
+            max_abs(&reference, &out),
+            0.0,
+            "window {window} changed the context — the windowed walk must be bit-identical"
+        );
+    }
+
+    // The refusal `run_layers` types out: a deferred encoder without a window is a programming
+    // error and must not silently fall back to anything.
+    let deferred =
+        MiniMaxH3TextEncoder::from_dir_deferred(staged.path(), "language_model", &cfg).unwrap();
+    let err = deferred.forward(&ids, &mask).unwrap_err().to_string();
+    assert!(err.contains("set_block_window"), "{err}");
+}
