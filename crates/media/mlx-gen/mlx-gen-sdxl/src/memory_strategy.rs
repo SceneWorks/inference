@@ -17,7 +17,7 @@
 //! |---|---|---|
 //! | 0 Resident | Implemented | Warm [`Residency`](mlx_gen::Residency) pair — dual CLIP + (U-Net + control/IP/VAE/PiD) held across requests |
 //! | 1 Staged residency | Implemented (request-scoped) | `GenerationMemory::stage_residency` drives encode → **drop both CLIP encoders** → load heavy → denoise + decode |
-//! | 2 Bounded decode | **Missing** (measured — [`DECODE_SUPPORT`]) | [`Autoencoder::decode_tiled`](crate::vae::Autoencoder) exists and bounds the decode 14.360 → 11.237 GiB, but no fixed tile edge holds its quality across the advertised output range |
+//! | 2 Bounded decode | route-blind **Missing**; exact measured rows may be Implemented ([`DECODE_SUPPORT`]) | [`Autoencoder::decode_tiled`](crate::vae::Autoencoder) bounds the decode 14.360 → 11.237 GiB; SC-19753 preserves full-image GroupNorm statistics and admits only sealed route/tier/mode/overlay/geometry rows |
 //! | 3 Bounded attention | **Missing** (measured — [`ATTENTION_SUPPORT`]) | [`mlx_gen::attention::sdpa_budgeted_bhsd`] reaches every site, moves the peak **0.00% at BOTH scopes** (the request and the U-Net seam), and its query-row axis is not bit-exact on Metal |
 //! | 4 Bounded transformer residency | Implemented (streamable loads) | [`mlx_gen::block_residency::run_windowed`] per `Transformer2D` — eleven sub-stacks, 70 blocks |
 //!
@@ -25,6 +25,8 @@
 //! catalog route, tier, mode, overlay and output geometry by packaging a sealed production-latent
 //! quality policy. Coordinates absent from that table remain refused; an empty table preserves the
 //! default and the existing estimated-fit fallback.
+//! The older range failures documented below predate SC-19753's layer-wise normalization and are
+//! retained as history, not as the current decoder's expected quality result.
 //!
 //! ## What this family actually buys, measured (`realvisxl`, Apple/Metal, 1024², 6 steps)
 //!
@@ -238,7 +240,8 @@ pub const DECODE_OVERLAPS_SWEPT: &[u32] = &[64, 128, 192, 256];
 /// the decode in isolation — the right scope for the drift; the request row measures what a caller
 /// would actually have paid — the right scope for the saving.
 ///
-/// It is not published, because it does not preserve the output. Swept against the **exact untiled
+/// The rest of this section is historical pre-SC-19753 evidence for the retired whole-tail decoder;
+/// it is not a current quality claim. That decoder was not published because it did not preserve the output. Swept against the **exact untiled
 /// decode of the same latent** — a real 1024² render re-encoded through the same VAE — on
 /// `realvisxl` bf16 (`decode_tile_mechanism_sweep`):
 ///
@@ -299,7 +302,7 @@ pub const DECODE_OVERLAPS_SWEPT: &[u32] = &[64, 128, 192, 256];
 /// `MemoryParameterRanges::decode_tile_edges` is an absolute pixel domain with no geometry axis, so
 /// publishing 896 publishes it at everything `crate::model::descriptor` advertises — and that is
 /// `max_size: 2048`. Re-swept across that range at the best overlap
-/// (`no_single_decode_tile_edge_clears_the_bar_across_the_advertised_output_range`):
+/// (the pre-SC-19753 form of `layerwise_decode_clears_the_bar_across_the_advertised_output_range`):
 ///
 /// | output | tiles | tile covers | max Δ | vs the 48/255 bar |
 /// |---:|---:|---:|---:|---|

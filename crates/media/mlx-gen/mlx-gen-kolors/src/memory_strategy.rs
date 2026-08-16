@@ -25,7 +25,7 @@
 //! |---|---|---|
 //! | 0 Resident | Implemented | Warm [`Residency`](mlx_gen::Residency) pair — ChatGLM3-6B + (U-Net + control/IP/VAE/PiD) held across requests |
 //! | 1 Staged residency | Implemented (request-scoped) | `GenerationMemory::stage_residency` drives encode → **drop ChatGLM3-6B** → load heavy → denoise + decode |
-//! | 2 Bounded decode | **Missing** (measured — [`DECODE_SUPPORT`]) | [`Autoencoder::decode_tiled`](mlx_gen_sdxl::Autoencoder) bounds the request 16.041 → 9.998 GiB (−37.67%) and clears the drift bar at 1024²/1280², but fails it at 1536²/2048² and `decode_tile_edges` has no geometry axis |
+//! | 2 Bounded decode | route-blind **Missing**; exact measured rows may be Implemented ([`DECODE_SUPPORT`]) | [`Autoencoder::decode_tiled`](mlx_gen_sdxl::Autoencoder) bounds the request 16.041 → 9.998 GiB (−37.67%); SC-19753 preserves full-image GroupNorm statistics and admits only sealed route/tier/mode/overlay/geometry rows |
 //! | 3 Bounded attention | **Missing** (measured — [`ATTENTION_SUPPORT`]) | [`mlx_gen::attention::sdpa_budgeted_bhsd`] reaches every site, moves the peak **0.00% at BOTH scopes** — the request and the U-Net seam — and is not bit-exact on its query-row axis |
 //! | 4 Bounded transformer residency | Implemented (streamable loads), **two scopes** | [`mlx_gen::block_residency::run_windowed`] over the U-Net's eleven `Transformer2D` sub-stacks (70 blocks) **and** over ChatGLM3-6B's 28 `GlmBlock`s |
 //!
@@ -33,6 +33,8 @@
 //! catalog route, tier, mode, overlay and output geometry by packaging a sealed production-latent
 //! quality policy. Coordinates absent from that table remain refused; an empty table preserves the
 //! default and the existing estimated-fit fallback.
+//! The older range failures documented below predate SC-19753's layer-wise normalization and are
+//! retained as history, not as the current decoder's expected quality result.
 //!
 //!
 //! ## What this family actually buys, measured (q4 unless stated, Apple/Metal, 1024², 4 steps)
@@ -120,7 +122,12 @@ pub const DECODE_DRIFT_BAR: u32 = 48;
 /// size of the prize is exactly why the withholding argument had to be measured rather than
 /// asserted.
 ///
-/// ## The candidate is real, and at 1024² it CLEARS the bar
+/// ## Historical pre-SC-19753 evidence
+///
+/// The tables and mechanism analysis in this section describe the retired whole-tail decoder. They
+/// remain useful provenance for the route-blind fallback, but they are not current quality claims.
+///
+/// ### The candidate was real, and at 1024² it cleared the bar
 ///
 /// Swept against the **exact untiled decode of the same latent**, on the *production* latent — what
 /// the denoiser actually hands the decode phase, not a re-encoded finished image — at q4 1024²
@@ -148,13 +155,13 @@ pub const DECODE_DRIFT_BAR: u32 = 48;
 /// the production latent reads 44 at the same geometry. A user gets the production latent, so the
 /// absolute bar is judged on it.
 ///
-/// ## What withholds it: the datum is a property of the GEOMETRY, not of the tile edge
+/// ### What withheld it: the datum was a property of geometry, not tile edge
 ///
 /// `MemoryParameterRanges::decode_tile_edges` is an absolute pixel domain with no geometry axis, so
 /// publishing 768 publishes it at everything `crate::registry::descriptor` advertises — and that is
 /// `max_size: 2048`. Re-swept across that range at the same overlap, on a **rendered production
 /// latent at each output size**
-/// (`no_single_decode_tile_edge_clears_the_bar_across_the_advertised_output_range`):
+/// (the pre-SC-19753 form of `layerwise_decode_clears_the_bar_across_the_advertised_output_range`):
 ///
 /// | output | tile covers | max Δ | vs the 48/255 bar |
 /// |---:|---:|---:|---|
@@ -176,7 +183,7 @@ pub const DECODE_DRIFT_BAR: u32 = 48;
 /// against the rendered 38), and a rung admitted on the friendly instrument would be admitted on
 /// evidence no user ever sees.
 ///
-/// ## How this differs from SDXL, which shares the decoder
+/// ### How this differed from SDXL, which shares the decoder
 ///
 /// SDXL withholds rung 2 too, and it is worth being precise about where the two families agree,
 /// because the shared `AutoencoderKL` makes it tempting to inherit:

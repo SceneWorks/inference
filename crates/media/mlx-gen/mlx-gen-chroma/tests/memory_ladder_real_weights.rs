@@ -32,7 +32,7 @@
 //! |---|---|---|
 //! | 1 | `rung_plan` ignores `memory.stage_residency`, falls back to the load-time default | `staged_residency_bounds_the_request_peak_and_preserves_output` |
 //! | 2 | the production refusal of the withheld rung removed | `the_withheld_rungs_are_refused_by_the_production_path` |
-//! | 2 verdict | the resample loop decodes UNTILED, so every drift is 0 | `the_rung_two_drift_margin_is_resampled_across_seeds` |
+//! | 2 quality | the resample loop restores whole-tail per-crop normalization | `layerwise_decode_quality_is_resampled_across_seeds` |
 //! | 3 | the `sdpa` kernel discards the plan and always calls `AttentionPlan::UNBOUNDED` | `attention_chunking_is_measured_at_the_dit_seam` |
 //! | 4 | `finalize_block_stream` and `block_window` stubbed to no-ops — rung 4 declared and not executed | `transformer_window_sweep_and_streamed_output_identity` |
 //! | step-independence | [`measure`] scales the peak by the request's step count | `the_request_peak_is_step_independent` |
@@ -71,7 +71,7 @@
 
 #![allow(clippy::items_after_test_module)]
 
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use mlx_gen::gen_core::{
     GenerationMemory, GenerationOutput, GenerationRequest, MemoryStrategy, MemoryStrategySupport,
@@ -155,24 +155,10 @@ fn steps() -> u32 {
 /// exists; a looser bar would be invented to clear and a tighter one invented to fail.
 const SIBLING_DRIFT_BAR: u32 = 48;
 
-/// The best cell in [`decode_tile_mechanism_sweep_on_the_production_latent`] at the production
-/// schedule — where rung 2's verdict is closest and therefore where it is resampled.
-const BEST_SWEPT_EDGE: u32 = 832;
-/// The overlap paired with [`BEST_SWEPT_EDGE`].
-const BEST_SWEPT_OVERLAP: u32 = 256;
-
-/// The verdict class [`the_rung_two_drift_margin_is_resampled_across_seeds`] observed, and which
-/// `memory_strategy::DECODE_SUPPORT`'s doc states in prose.
-///
-/// * `FAILS` — every seed is over the bar. A clear rejection.
-/// * `UNRESOLVED` — the sample straddles the bar. The rung cannot be admitted (it fails on most
-///   images) *and* the rejection is not clean; the honest statement is that a margin this narrow is
-///   not decidable with a borrowed threshold on an extreme-order statistic. **This is what Chroma
-///   measured**: `[53, 82, 74, 63, 28]` at edge 832 / overlap 256, i.e. 4 of 5 seeds over the bar
-///   and one at 28 — a 2.9x spread on the same geometry, an order of magnitude wider than the 10%
-///   margin the single-image sweep appeared to establish.
-/// * `ADMISSIBLE` — every seed clears it. Would make `DECODE_SUPPORT = false` stale.
-const EXPECTED_RUNG2_VERDICT: &str = "UNRESOLVED";
+/// One sealed policy coordinate resampled across seeds. Overlap remains part of policy identity but
+/// no longer affects layer-wise decode arithmetic.
+const MEASURED_POLICY_EDGE: u32 = 832;
+const MEASURED_POLICY_OVERLAP: u32 = 256;
 
 fn entry_root(var: &str) -> Option<PathBuf> {
     std::env::var(var).ok().map(PathBuf::from)
@@ -873,7 +859,8 @@ fn the_window_component_scopes_are_measured_not_inherited() {
 /// Driving `Vae::decode_tiled` directly also reaches geometries the production resolver refuses,
 /// which is how a rejected candidate gets a NUMBER instead of an omission.
 ///
-/// The grid it prints is evidence for a human; what it *pins* is the cell the verdict cites.
+/// The grid remains evidence for a human, and SC-19753 pins every cell against the production bar
+/// plus byte-identical output across overlaps at each edge.
 #[test]
 #[ignore = "needs a real Chroma1 snapshot (see the module docs for the env vars)"]
 fn decode_tile_mechanism_sweep_on_the_production_latent() {
@@ -911,6 +898,7 @@ fn decode_tile_mechanism_sweep_on_the_production_latent() {
     );
 
     let mut best: Option<(u32, u32, u32, f64)> = None;
+    let mut overlap_outputs: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
     println!("| edge | overlap | tiles | isolated peak (GiB) | vs untiled | max Δ | mean Δ |");
     println!("|---:|---:|---:|---:|---:|---:|---:|");
     for overlap in &overlaps {
@@ -943,6 +931,18 @@ fn decode_tile_mechanism_sweep_on_the_production_latent() {
                 100.0 * (peak - untiled_peak) / untiled_peak,
                 mean_delta(&ref_px, &px),
             );
+            assert!(
+                drift <= SIBLING_DRIFT_BAR,
+                "layer-wise decode exceeds the {SIBLING_DRIFT_BAR}/255 bar at edge {edge} overlap {overlap}: {drift}"
+            );
+            if let Some(reference) = overlap_outputs.get(edge) {
+                assert_eq!(
+                    &px, reference,
+                    "overlap is policy identity only; edge {edge} changed output at overlap {overlap}"
+                );
+            } else {
+                overlap_outputs.insert(*edge, px.clone());
+            }
             if best.is_none_or(|(_, _, d, _)| drift < d) {
                 best = Some((*edge, *overlap, drift, peak));
             }
@@ -961,26 +961,13 @@ fn decode_tile_mechanism_sweep_on_the_production_latent() {
     {
         return;
     }
-    // The facts the published domain rests on, each asserted so either direction reddens.
-    if ms::DECODE_SUPPORT {
-        assert!(
-            best_drift <= SIBLING_DRIFT_BAR,
-            "the best swept geometry now drifts {best_drift}/255 at 1024² on the PRODUCTION latent, \
-             above the {SIBLING_DRIFT_BAR}/255 sibling bar — DECODE_SUPPORT records the opposite \
-             and must be re-derived"
-        );
-        assert!(
-            ms::DECODE_TILE_EDGES.contains(&best_edge) && best_overlap == ms::DECODE_OVERLAP,
-            "the published domain must contain the sweep's best cell (edge {best_edge} overlap \
-             {best_overlap}), else it is published against a candidate nobody would choose"
-        );
-    } else {
-        assert!(
-            best_drift > SIBLING_DRIFT_BAR,
-            "the best swept geometry now clears the {SIBLING_DRIFT_BAR}/255 bar ({best_drift}/255) \
-             — rung 2 is declared Missing on a superseded measurement and must be re-decided"
-        );
-    }
+    // The route-blind constant remains fail-closed; exact sealed policy rows adopt the measured
+    // coordinates. The arithmetic itself must now clear the shared production quality bar.
+    assert!(
+        best_drift <= SIBLING_DRIFT_BAR,
+        "the best swept geometry exceeds {SIBLING_DRIFT_BAR}/255: edge {best_edge} overlap \
+         {best_overlap} produced {best_drift}"
+    );
     assert!(
         best_peak < untiled_peak * 0.97,
         "the tiled decode no longer bounds the decode phase ({best_peak:.4} vs {untiled_peak:.4} \
@@ -990,10 +977,9 @@ fn decode_tile_mechanism_sweep_on_the_production_latent() {
 
 /// A **production** final latent: the denoiser's own output at the production schedule and sampler.
 ///
-/// Not a re-encoded finished image. The two are not interchangeable for a drift measurement — the
-/// re-encoded one has already been through the VAE round trip and its GroupNorm statistics are
-/// systematically friendlier to a tail tile, which is exactly how SDXL's rung-2 candidate looked
-/// admissible (38/255) until it was measured on the real thing (84/255).
+/// Not a re-encoded finished image. Under the retired whole-tail decoder the two instruments exposed
+/// different per-crop GroupNorm drift; the layer-wise regression continues to use the production
+/// latent because that is what exact-coordinate admission promises to users.
 #[track_caller]
 fn production_latent(dir: &std::path::Path, size: u32) -> mlx_rs::Array {
     let seed = 1234;
@@ -1022,32 +1008,18 @@ fn production_latent(dir: &std::path::Path, size: u32) -> mlx_rs::Array {
     out
 }
 
-/// **How much of the rung-2 margin is the statistic's own variance?**
+/// Resample one sealed Chroma coordinate across production latents.
 ///
-/// [`decode_tile_mechanism_sweep_on_the_production_latent`] puts the best swept geometry at
-/// **53/255** against a [`SIBLING_DRIFT_BAR`] of 48 — a 10% margin, where the earlier (invalid,
-/// 4-step) measurement had reported 105 and a 2x one. Those are different claims and only one of
-/// them can be settled by a single image.
-///
-/// `max Δ` is an **extreme-order statistic over ~3.1M subpixels**: one outlier sets it, and nothing
-/// in the sweep says how much it moves between latents. This resamples exactly that — the same cell,
-/// the same schedule, different seeds — and prints the distribution beside the bar. It is the same
-/// discipline [`identical_requests_reproduce_once_the_allocator_has_settled`] applies to the peak,
-/// applied to the quality statistic that actually decides this rung.
-///
-/// It asserts the **verdict**, not a figure: whatever `DECODE_SUPPORT` records has to survive the
-/// whole sample, so a rung declared Missing must fail the bar on every seed and a rung declared
-/// Implemented must clear it on every seed. A sample that straddles the bar reddens both ways —
-/// which is the correct outcome for a margin this narrow, and is the thing a single-image sweep
-/// cannot tell you.
+/// The pre-SC-19753 whole-tail decoder produced `[53, 82, 74, 63, 28]` here because each crop used
+/// different GroupNorm statistics. That historical `UNRESOLVED` class is now the defect signature:
+/// full-activation normalization must keep every seed within [`SIBLING_DRIFT_BAR`].
 #[test]
 #[ignore = "needs a real Chroma1 snapshot (see the module docs for the env vars)"]
-fn the_rung_two_drift_margin_is_resampled_across_seeds() {
+fn layerwise_decode_quality_is_resampled_across_seeds() {
     const SEEDS: [u64; 5] = [1234, 7, 99, 20260805, 424242];
     let dir = require_tier(representative_env(), DEFAULT_TIER);
     let size = 1024_u32;
-    // The best cell the sweep found, so the resampling is done where the verdict is closest.
-    let (edge, overlap) = (BEST_SWEPT_EDGE, BEST_SWEPT_OVERLAP);
+    let (edge, overlap) = (MEASURED_POLICY_EDGE, MEASURED_POLICY_OVERLAP);
     let vae = mlx_gen_chroma::loader::load_vae(&dir).expect("load vae");
     let cfg = mlx_gen::tiling::TilingConfig::spatial_only(edge as i32, overlap as i32);
 
@@ -1123,8 +1095,6 @@ fn the_rung_two_drift_margin_is_resampled_across_seeds() {
         SEEDS.len()
     );
 
-    // Three outcomes, not two, and the difference between the last two is the thing a single-image
-    // sweep cannot tell you — which is why the class is pinned rather than just the direction.
     let verdict = if hi <= SIBLING_DRIFT_BAR {
         "ADMISSIBLE"
     } else if lo > SIBLING_DRIFT_BAR {
@@ -1133,32 +1103,11 @@ fn the_rung_two_drift_margin_is_resampled_across_seeds() {
         "UNRESOLVED"
     };
     println!("[sc-15520 rung2 resample] verdict class: {verdict}");
-
-    if ms::DECODE_SUPPORT {
-        assert_eq!(
-            verdict, "ADMISSIBLE",
-            "rung 2 is declared Implemented, but the best swept geometry exceeds the \
-             {SIBLING_DRIFT_BAR}/255 bar on at least one seed ({drifts:?}) — a rung admitted on one \
-             image is admitted on a sample of one"
-        );
-    } else {
-        assert_ne!(
-            verdict, "ADMISSIBLE",
-            "rung 2 is declared Missing, but the best swept geometry clears the \
-             {SIBLING_DRIFT_BAR}/255 bar on EVERY seed ({drifts:?}) — the withholding is no longer \
-             supported by any of the sample and the rung must be re-decided"
-        );
-        // The class itself is the published claim: `DECODE_SUPPORT`'s doc says the rung is withheld
-        // on a narrow, unresolved margin rather than on a clear failure, or the reverse. A change
-        // between those two is a change to what this crate tells a reader, so it reddens here.
-        assert_eq!(
-            verdict, EXPECTED_RUNG2_VERDICT,
-            "the rung-2 drift sample moved from {EXPECTED_RUNG2_VERDICT} to {verdict} \
-             ({drifts:?}, range {lo}..{hi} against a {SIBLING_DRIFT_BAR}/255 bar). The verdict is \
-             still Missing either way, but `DECODE_SUPPORT`'s doc states WHICH, and that sentence \
-             is now wrong"
-        );
-    }
+    assert_eq!(
+        verdict, "ADMISSIBLE",
+        "layer-wise decode must clear {SIBLING_DRIFT_BAR}/255 on every production latent: \
+         {drifts:?} (range {lo}..{hi})"
+    );
 }
 
 /// **Rungs 2 and 3 are refused by the PRODUCTION path** wherever they are declared `Missing`, on

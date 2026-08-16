@@ -156,13 +156,11 @@ use mlx_gen::gen_core::{GenerationMemory, MemoryGeometry, MemoryRunOutcome};
 use mlx_gen::GenerationRequest;
 use mlx_gen::{Quant, WeightsSource};
 
-/// The **default** decode tile edge for the native VAE — the 512 px parity sweet spot for this
-/// GroupNorm VAE (sc-13571). A request that names no geometry decodes here, which is what keeps every
-/// pre-SC-15510 render byte-identical.
+/// The **default** decode tile edge for the native VAE — the calibrated 512 px policy point
+/// (sc-13571). SC-19753 preserves full-activation GroupNorm statistics at every admitted edge.
 pub const DECODE_TILE_EDGE: u32 = 512;
-/// The decode overlap paired with [`DECODE_TILE_EDGE`], and the only native overlap advertised: the
-/// tile ladder trades peak against seam risk on the edge, and moving both axes at once would make a
-/// calibration row un-attributable.
+/// The decode overlap paired with [`DECODE_TILE_EDGE`], and the only native overlap advertised.
+/// It remains part of policy identity, although layer-wise halo/core arithmetic does not blend it.
 pub const DECODE_OVERLAP: u32 = 64;
 
 /// The native VAE's production tile-edge ladder (SC-15510), output pixels, at [`DECODE_OVERLAP`].
