@@ -41,11 +41,11 @@
 //! decoder is a matmul stack. The bound is set from the number this lane actually measures, not
 //! copied from the sibling suite.
 //!
-//! On the **real** 118-tensor checkpoint the same comparison measures at worst **1.730e-5**
-//! (`real_weights.rs::real_weight_encode_matches_the_official_diffusers_vae`, bound
-//! `REAL_WEIGHT_ENCODE_TOL`, derived there from that arm's own floor) — a different bound because
-//! that comparison spans six levels and 1024-wide channels, not because a different standard
-//! applies.
+//! On the **real** 118-tensor checkpoint the same comparison measures at worst **1.730e-5** on the
+//! CPU and **1.848e-5** on Metal (`real_weights.rs::real_weight_encode_matches_the_official_diffusers_vae`,
+//! bound `REAL_WEIGHT_ENCODE_TOL`, derived there from that arm's own floor across both devices,
+//! sc-19455) — a different bound because that comparison spans six levels and 1024-wide channels,
+//! not because a different standard applies.
 //!
 //! **Every assertion is on the peak relative max-abs-diff.** Not norm, not cosine, not a checksum:
 //! sc-18740's gate/value half-swap sat at cosine 0.73-0.78 with output norms 89 → 85, and a
