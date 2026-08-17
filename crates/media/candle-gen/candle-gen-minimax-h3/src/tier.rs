@@ -61,19 +61,21 @@
 //! (sc-15154). Reading the declared group size and rejecting a mismatch by name turns that into one
 //! actionable line. The bit width needs no such check — it is *recovered* from the artifact, so a
 //! q4 and a q8 tier both load correctly without being told which they are.
+//!
+//! The group size is **imported under an alias**, exactly as [`crate::quant`] imports it, and is
+//! deliberately not re-exported as a crate-local `pub const`. A second declaration that drifted
+//! would derive an illegal width from a perfectly good artifact instead of failing cleanly — and
+//! `scripts/check-workspace.py`'s cross-backend geometry gate rejects the `pub const` form outright
+//! for that reason (it reads as this backend declaring its own geometry rather than consuming the
+//! shared one).
 
 use std::path::{Path, PathBuf};
 
-use candle_gen::quant::PackedConfig;
+use candle_gen::quant::{PackedConfig, MLX_GROUP_SIZE as GROUP_SIZE};
 use candle_gen::{CandleError, Result};
 
 use crate::model::{BASE_DIT_PARTITION, REFERENCE_DIT_PARTITION};
 use crate::MODEL_ID;
-
-/// The group size every published MiniMax-H3 tier packs at, imported from the shared constant the
-/// repack is written against rather than re-declared (see [`crate::quant`]'s note on why a second
-/// declaration is a hazard rather than a convenience).
-pub const GROUP_SIZE: usize = candle_gen::quant::MLX_GROUP_SIZE; // 64
 
 /// The staged-component id for the tiered DiT directory (sc-17150) — `mlx_gen_minimax_h3::model`'s
 /// `DIT_COMPONENT`.
@@ -425,6 +427,11 @@ mod tests {
     }
 
     /// **A missing tier dir is a typed error naming the tier and the path.**
+    ///
+    /// The message is asserted on the *absent-directory* wording specifically, not merely on "some
+    /// error mentioning q4". Both refusal branches in `require_component_dir` name the tier, the
+    /// component and the path, so a weaker assertion passes with the `is_dir` check deleted — the
+    /// mutation that survived this test's first draft.
     #[test]
     fn a_missing_tier_dir_names_the_tier_and_the_path() {
         let tmp = tempfile::tempdir().unwrap();
@@ -435,8 +442,8 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("q4"), "the message must name the tier: {msg}");
         assert!(
-            msg.contains("transformer"),
-            "the message must name the component: {msg}"
+            msg.contains("has no `transformer/` component at"),
+            "an ABSENT directory must be distinguished from a present-but-incomplete one: {msg}"
         );
         assert!(
             msg.contains(&tmp.path().display().to_string()),
