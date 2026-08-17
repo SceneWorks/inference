@@ -434,3 +434,101 @@ fn every_a14b_route_refuses_a_non_exact_plan_before_touching_weights() {
         }
     }
 }
+
+// -------------------------------------------------------------------------------------------------
+// Two properties below are asserted against the crate's own SOURCE, which needs justifying.
+//
+// Both are compile-time/structural facts that no runtime assertion can reach. "There is no production
+// constructor" is a statement about what a `not(test)` build contains — and a test, by construction,
+// is a `test` build, so it can never observe the thing it needs to check. "This route calls the
+// refusal" is a statement about a code path that requires real weights to execute, and the shared
+// floor refuses the request before the provider is ever entered, so even a weights-bearing test would
+// exercise the floor rather than the provider guard.
+//
+// The mutation pass is what forced the issue: both properties survived every behavioural mutation,
+// which is the honest signal that they were claimed but not gated. A source assertion is narrow and
+// slightly unusual, but it pins exactly the regression that matters and costs nothing to run.
+// -------------------------------------------------------------------------------------------------
+
+fn crate_source(relative: &str) -> String {
+    let path = format!("{}/{relative}", env!("CARGO_MANIFEST_DIR"));
+    std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {path}: {error}"))
+}
+
+#[test]
+fn neither_mechanism_has_a_production_constructor() {
+    // MAJOR 4: `TokenPruner` shipped with a `pub` keep-set constructor and a re-export, so a production
+    // build could assemble the mechanism by hand and run it with no plan at all — bypassing the contract
+    // entirely. Only `TrunkCache` had the second lock.
+    for (file, ty) in [
+        ("src/token_pruning.rs", "TokenPruner"),
+        ("src/feature_cache.rs", "TrunkCache"),
+    ] {
+        let source = crate_source(file);
+        let marker = "fn from_plan_for_test";
+        let at = source
+            .find(marker)
+            .unwrap_or_else(|| panic!("{file}: {ty} must have a from_plan_for_test constructor"));
+        let preceding = &source[..at];
+        assert!(
+            preceding.trim_end().ends_with("pub(crate)")
+                || preceding.trim_end().ends_with("pub(crate) "),
+            "{file}: {ty}'s plan constructor must be pub(crate)"
+        );
+        // The `#[cfg(test)]` must be on the constructor itself, i.e. within the few lines above it.
+        let window_start = preceding.len().saturating_sub(160);
+        assert!(
+            preceding[window_start..].contains("#[cfg(test)]"),
+            "{file}: {ty}'s plan constructor must be #[cfg(test)] — without it a production build can \
+             reach the uncharacterized mechanism"
+        );
+    }
+
+    // And the keep-set must not be re-exported: it is the piece a caller would need to assemble a
+    // pruned forward without going through `TokenPruner`.
+    let lib = crate_source("src/lib.rs");
+    assert!(
+        !lib.contains("pub use token_pruning::TokenKeepSet"),
+        "TokenKeepSet must not be re-exported — TokenPruner is the only reachable pruning surface"
+    );
+    assert!(
+        lib.contains("pub use token_pruning::TokenPruner"),
+        "TokenPruner is the surface the pub entry points take, so it must be exported"
+    );
+}
+
+#[test]
+fn every_unwired_denoise_route_has_a_refusal_call_site() {
+    // MINOR 5: the helper's doc asserted a guard on three routes, but the MoE routes had no call site at
+    // all — `Wan14b::generate_impl` never resolved a plan. The helper takes the route name as a string,
+    // so no test of the helper can distinguish "this route refuses" from "this string round-trips".
+    let model = crate_source("src/model.rs");
+    for route in [
+        "TI2V mask-blend",
+        "curated unified solver",
+        "MoE expert swap",
+    ] {
+        assert!(
+            model.contains(&format!("\"{route}\"")),
+            "the {route} route must pass its own name to refuse_unwired_approximation"
+        );
+    }
+    assert_eq!(
+        model.matches("refuse_unwired_approximation(").count(),
+        3,
+        "exactly the three unwired routes call the refusal — a fourth call site, or a missing one, \
+         means the guard's documented coverage has drifted from the code"
+    );
+    // The A14B refusal must sit before any weight is opened, which is what makes it a guard rather than
+    // a late error. `validate` is the first statement of `generate_impl`; the refusal is the second.
+    let a14b = model
+        .rfind("refuse_unwired_approximation(")
+        .expect("the MoE call site");
+    let validate_before = model[..a14b]
+        .rfind("self.validate(req)?;")
+        .expect("validate precedes the refusal");
+    assert!(
+        model[validate_before..a14b].lines().count() < 12,
+        "the MoE refusal must follow validate immediately, before any loading work"
+    );
+}
