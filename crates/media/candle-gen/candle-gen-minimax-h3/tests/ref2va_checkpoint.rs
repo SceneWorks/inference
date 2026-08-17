@@ -27,9 +27,9 @@
 //! ones, which run on every CI lane:
 //!
 //! * `the_task_mapping_is_not_a_constant` — the selection function itself;
-//! * `a_ref2va_request_without_the_reference_partition_is_refused` — the sc-19517 hosting gap fails
-//!   LOUD at the engine boundary rather than degrading to the base checkpoint, **and** does not take
-//!   `t2va` / `fl2va` down with it;
+//! * `a_ref2va_request_without_the_reference_partition_is_refused` — a base-only install (the normal
+//!   off-Mac shape) fails LOUD at the engine boundary rather than degrading to the base checkpoint,
+//!   **and** does not take `t2va` / `fl2va` down with it;
 //! * `every_dit_load_site_in_the_crate_is_driven_by_the_task` — a **whole-crate** source scan
 //!   proving there is nowhere in the render path for a hardcoded partition string to be;
 //! * `model.rs`'s own `a_reference_request_resolves_to_the_reference_partition` — the other end of
@@ -104,10 +104,15 @@ fn the_task_mapping_is_not_a_constant() {
 /// **A `ref2va` REQUEST against a snapshot carrying only `transformer/` is refused, naming the
 /// missing partition — and the other two tasks keep working.**
 ///
-/// This is the sc-19517 hosting gap made loud: `SceneWorks/minimax-h3-mlx` publishes no
-/// `q4/transformer_ref`, so a pure-`q4` install has exactly this shape. The failure mode being
-/// prevented is a `ref2va` request silently rendering off `transformer/` — which produces plausible
-/// video and is wrong.
+/// This is the **normal off-Mac install shape** made loud: every `transformer_ref` row in
+/// SceneWorks' manifest is `platforms: ["macos"]` and the off-Mac artifact set carries none until
+/// sc-17157 lands the reference port, so a candle install has exactly this shape by design (an
+/// interrupted download and a declined co-requisite reach it too). The failure mode being prevented
+/// is a `ref2va` request silently rendering off `transformer/` — which produces plausible video and
+/// is wrong.
+///
+/// (Not sc-19517: "the rehost publishes no `q4/transformer_ref`" is a retracted premise — sc-19573
+/// ships it with exact hosted bytes. The shape is real regardless; only its cause was misstated.)
 ///
 /// **The blast radius is asserted, not assumed.** Requiring the partition in `MiniMaxH3::load` — the
 /// obvious implementation — would fail provider construction outright on such a snapshot and take

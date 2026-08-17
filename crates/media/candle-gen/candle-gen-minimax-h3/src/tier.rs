@@ -244,7 +244,8 @@ impl MiniMaxH3TierPaths {
     }
 
     /// Require the `ref2va` partition for `tier` — called only when a request resolves to
-    /// [`MiniMaxH3Task::Ref2va`](crate::model::MiniMaxH3Task), never at load (sc-19517).
+    /// [`MiniMaxH3Task::Ref2va`](crate::model::MiniMaxH3Task), never at load — see the module docs
+    /// for why this lane probes lazily where MLX probes eagerly.
     pub fn require_reference_dit(&self, tier: Tier) -> Result<()> {
         require_component_dir(&self.reference_dit_dir, tier, REFERENCE_DIT_PARTITION)?;
         reconcile_tier(&self.reference_dit_dir, tier, REFERENCE_DIT_PARTITION)?;
@@ -621,7 +622,7 @@ mod tests {
         paths.require_dit(Tier::Q4).unwrap();
         paths.require_reference_dit(Tier::Q4).unwrap();
 
-        // A pure-q4 install with no reference partition (sc-19517) fails ONLY the reference probe.
+        // A base-only install (the normal off-Mac shape) fails ONLY the reference probe.
         let partial = tempfile::tempdir().unwrap();
         packed_component(partial.path(), "transformer", 4, 64);
         let paths = MiniMaxH3TierPaths::resolve(partial.path(), None, None);

@@ -124,7 +124,7 @@ pub const LOAD_SHAPE: LoadShape = LoadShape::EagerMaterialization;
 /// the **larger** of the two present: a render loads exactly one of them, so charging the larger is
 /// both a true bound for whichever task arrives and still "charged once", which is what
 /// [`DIT_BF16_BYTES`] means. An absent partition measures 0 and simply loses the max, so the
-/// base-only install of sc-19517 is charged exactly as it was.
+/// base-only install (the normal off-Mac shape) is charged exactly as it was.
 ///
 /// Named through `crate::model`'s own `pub const`s rather than restating the literals, so
 /// `tests/ref2va_checkpoint.rs`'s bare-literal ban has exactly one declaration site to exempt.
@@ -1108,7 +1108,7 @@ mod tests {
             c.asset_facts.transformer_bytes
         );
 
-        // Base partition alone is unchanged — sc-19517's pure-q4 install.
+        // Base partition alone is unchanged — the base-only (off-Mac) install shape.
         let only_base = tempfile::tempdir().expect("tempdir");
         sparse_snapshot(only_base.path(), &[(BASE_DIT_PARTITION, SMALL)]);
         let c = contract_for(&LoadSpec::new(WeightsSource::Dir(only_base.path().into())))
