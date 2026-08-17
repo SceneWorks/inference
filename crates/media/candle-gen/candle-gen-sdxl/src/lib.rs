@@ -116,9 +116,12 @@ pub use loaders::{
     load_sdxl_vae_encoder, load_vendored_unet_with_adapters,
 };
 
-// The SDXL VAE type the loader returns, re-exported so the `candle-gen-instantid` glue can hold one as
-// a field + pass it to `decode_image` without depending on candle-transformers directly.
-pub use candle_transformers::models::stable_diffusion::vae::AutoEncoderKL;
+// The SDXL VAE decode path (sc-19753). Ported natively rather than reusing candle-transformers'
+// `AutoEncoderKL`, whose decoder internals are private and therefore cannot host the layer-wise,
+// normalization-correct bounded decode. Re-exported so the `candle-gen-instantid` glue can hold one
+// as a field + pass it to `decode_image` without depending on candle-transformers directly.
+pub mod vae_decoder;
+pub use vae_decoder::SdxlVaeDecoder;
 
 // The vendored UNet itself, re-exported so the `candle-gen-instantid` glue can hold one + drive its
 // InstantID surface (install_ip_adapter / set_ip_context / forward_instantid via the denoise loop).

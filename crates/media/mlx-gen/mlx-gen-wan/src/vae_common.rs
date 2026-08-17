@@ -62,15 +62,23 @@ impl FeatCache {
 }
 
 /// The trapezoidally-blended tile-accumulate loop shared by both VAEs' `decode_tiled`. Slices each
-/// overlapping tile out of `denorm`, decodes it via the layout-specific `decode_tile` closure
-/// (conv2 → decoder → optional unpatchify → clamp), trapezoidally blends along the three tiled axes,
-/// and accumulates into the full output. `axes` are the `[t, h, w]` axis indices for the layout
-/// (`[2, 3, 4]` for NCTHW z16, `[1, 2, 3]` for channels-last z48).
+/// overlapping tile out of the tiled input, evaluates it via the layout-specific `decode_tile`
+/// closure, trapezoidally blends along the three tiled axes, and accumulates into the full output.
+/// `axes` are the `[t, h, w]` axis indices for the layout (`[2, 3, 4]` for NCTHW z16, `[1, 2, 3]`
+/// for channels-last z48).
 ///
 /// The slice/blend/pad/accumulate/normalize loop itself is the backend-shared
 /// [`mlx_gen::vae_tiling::tiled_decode`] (lifted there in sc-11747 so the Qwen-Image still-image VAE
-/// reuses the exact same seam-artifact-free implementation, not a per-crate copy); this thin wrapper
-/// keeps the wan call sites (`vae.rs`, `vae22.rs`) and their tests pointed at `crate::vae_common`.
+/// reuses the exact same implementation, not a per-crate copy); this thin wrapper keeps the wan call
+/// sites (`vae.rs`, `vae22.rs`) and their tests pointed at `crate::vae_common`.
+///
+/// **What "seam-free" does and does not mean here (sc-19753).** This loop's masks are a partition of
+/// unity, so it reconstructs a *tile-consistent* closure exactly — that is what its unit tests below
+/// pin, with a synthetic block-upsample decode. It says nothing about the closure: an op whose
+/// result depends on the whole spatial field (a GroupNorm, a global pool, or — as both wan decoders
+/// carry — a softmax attention over every `H·W` token) is **not** tile-consistent, and no blend
+/// width recovers it. Both callers therefore hoist their attention-bearing middle blocks into a
+/// dense head and pass only a spatially-local tail through here.
 pub(crate) fn tile_decode_accumulate(
     denorm: &Array,
     plan: &TilePlan,

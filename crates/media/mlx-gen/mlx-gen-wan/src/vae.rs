@@ -418,10 +418,34 @@ impl Decoder3d {
     }
 
     fn forward(&self, x: &Array) -> Result<Array> {
+        self.forward_upsample_tail(&self.forward_middle(x)?)
+    }
+
+    /// The **globally-scoped** half: `conv1` → the three middle blocks, all at latent resolution
+    /// (sc-19753).
+    ///
+    /// `middle.1` is an [`AttentionBlock`]: a single-head softmax self-attention over every `H·W`
+    /// spatial token of a frame ([`AttentionBlock::forward`]). Its result therefore depends on the
+    /// whole spatial grid, so a spatial tile that runs it attends only to its own crop's token set —
+    /// a *wrong decode*, not a blend artifact. The channel-L2 [`rms_norm_channels`] used throughout
+    /// this VAE really is per-position and tiling-invariant; the attention is the one op that is
+    /// not, and it is why this half must run whole.
+    ///
+    /// Cheap to run dense: it is entirely at latent resolution, orders of magnitude under the
+    /// `[B, 3, 4·T, 8·H, 8·W]` output the tiling exists to bound.
+    fn forward_middle(&self, x: &Array) -> Result<Array> {
         let mut x = self.conv1.forward(x, None)?;
         x = self.middle.0.forward(&x)?;
         x = self.middle.1.forward(&x)?;
-        x = self.middle.2.forward(&x)?;
+        self.middle.2.forward(&x)
+    }
+
+    /// The **spatially-local** half: the upsample stack (×8 spatial, ×4 temporal) and the
+    /// `RMS → SiLU → conv` head. Every op here is a convolution, a nearest upsample, or the
+    /// per-position channel-L2 norm, so evaluating it on a crop is exact up to the convolution
+    /// padding at the crop boundary — which is what the trapezoidal overlap blend absorbs.
+    fn forward_upsample_tail(&self, middle: &Array) -> Result<Array> {
+        let mut x = middle.clone();
         for layer in &self.upsamples {
             x = match layer {
                 UpLayer::Res(r) => r.forward(&x)?,
@@ -715,10 +739,27 @@ impl WanVae {
     /// `cfg` doesn't fire for these dims. The Wan z16 VAE is **non-causal** in time (`T → 4·T`) and
     /// upsamples 8× spatially — [`VaeTiling::WAN`].
     ///
-    /// Mirrors the reference `WanVAE.decode_tiled` (`models/wan/tiling.py`): **denormalize once** on
-    /// the full (small) latent, then tile the denormalized latent and run only conv2+decoder+clip per
-    /// tile. The full-size `output`/`weights` accumulators are filled tile-by-tile (pad-and-add) so
-    /// peak memory stays bounded by one tile's decode. Shared tiling geometry: [`mlx_gen::tiling`].
+    /// **Normalization semantics (sc-19753).** Denormalize, `conv2` and the decoder's middle blocks
+    /// — including its spatial self-attention — run **once** on the full latent
+    /// (`Decoder3d::forward_middle`); only the spatially-local upsample tail is tiled. The
+    /// reference `WanVAE.decode_tiled` (`models/wan/tiling.py`) hoists just the denormalize and runs
+    /// the *whole* decoder per tile, so every spatial tile's `middle.1` softmax attended only to its
+    /// own crop's tokens. This port deliberately diverges from the reference there: the earlier
+    /// clearance of this family was based on its channel-L2 norms being per-position, which is true,
+    /// but the middle attention is a spatial global reduction that the norms audit missed.
+    ///
+    /// The middle blocks are shape-preserving at latent resolution, so the tile plan is unchanged —
+    /// the same [`TilePlan`](mlx_gen::tiling::TilePlan) now partitions the middle feature map instead
+    /// of the latent. The
+    /// full-size `output`/`weights` accumulators are filled tile-by-tile (pad-and-add) so peak
+    /// memory stays bounded by one tile's tail.
+    ///
+    /// **Memory cost of the dense head.** The middle feature map is now materialized whole rather
+    /// than per tile: `dim·4` channels at *latent* resolution, so it scales with `T_lat·H/8·W/8`,
+    /// not with the output. It sits alongside the full-size output accumulator the tiling already
+    /// required and is a fraction of it. This is the same tradeoff sc-19753 took on every image VAE
+    /// — bounding convolution work rather than every activation is the price of keeping global
+    /// statistics global. Shared tiling geometry: [`mlx_gen::tiling`].
     pub fn decode_tiled(
         &self,
         z: &Array,
@@ -733,14 +774,16 @@ impl WanVae {
         if !cfg.needs_tiling(Self::VAE_TILING, f, h, w) {
             return self.decode(z);
         }
-        // Denormalize once (matches the reference), then tile the denormalized latent.
+        // Denormalize + conv2 + the attention-bearing middle blocks, once on the full latent.
         let denorm = add(&divide(z, &self.inv_std)?, &self.mean)?;
+        let middle = self
+            .decoder
+            .forward_middle(&self.conv2.forward(&denorm, None)?)?;
         let plan = cfg.plan(Self::VAE_TILING, f, h, w);
 
-        // NCTHW: channel axis at 1, tiled axes [2, 3, 4]. Per-tile decode = conv2 → decoder → clamp.
-        tile_decode_accumulate(&denorm, &plan, [2, 3, 4], cancel, |tile| {
-            let x = self.conv2.forward(tile, None)?;
-            let dec = self.decoder.forward(&x)?;
+        // NCTHW: channel axis at 1, tiled axes [2, 3, 4]. Per-tile work = upsample tail + clamp.
+        tile_decode_accumulate(&middle, &plan, [2, 3, 4], cancel, |tile| {
+            let dec = self.decoder.forward_upsample_tail(tile)?;
             Ok(minimum(&maximum(&dec, scalar(-1.0))?, scalar(1.0))?)
         })
     }

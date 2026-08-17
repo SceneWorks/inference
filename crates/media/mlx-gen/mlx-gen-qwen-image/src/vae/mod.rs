@@ -110,9 +110,18 @@ impl Decoder3D {
 
     /// The **upsample tail**: `up_blocks → norm_out → SiLU → conv_out`. Every op here is spatially LOCAL
     /// — resnet convs, nearest-2× + conv upsamplers, the per-position channel-L2 `norm_out`, and the head
-    /// conv — so it tiles seam-free (overlap + trapezoidal blend absorbs the conv halo). This is also
-    /// where the decode memory spike lives (the 8× spatial growth), so tiling it is what bounds the peak
-    /// (sc-11747). `x` is the pre-upsample head output at latent resolution.
+    /// conv — so it is **normalization-correct under tiling**: no statistic here is scoped to a tile, and
+    /// a tile's interior is bit-identical to the dense decode's (proved in
+    /// `tests/vae_tiling_normalization_proof.rs`, sc-19753). This is also where the decode memory spike
+    /// lives (the 8× spatial growth), so tiling it is what bounds the peak (sc-11747). `x` is the
+    /// pre-upsample head output at latent resolution.
+    ///
+    /// ⚠️ Tile-*safe* is not seam-*free*. The tail's receptive field is **98 output px** — each stage
+    /// contributes 6 (3 resnets × 2 `k=3` convs) at its own resolution, each upsample doubles the
+    /// accumulated radius and adds 1, `conv_out` adds 1 — which is **wider than the 64 px overlap**
+    /// `TilingConfig::auto` ships. The trapezoidal blend attenuates that conv halo; it does not remove
+    /// it, so a residual seam term is expected by design. What tiling this stage cannot introduce is a
+    /// per-tile *statistic*, which is the sc-19753 property and the one the tests pin.
     pub(super) fn forward_upsample_tail(&self, x: &Array) -> Result<Array> {
         let mut x = x.clone();
         for block in &self.up_blocks {
@@ -186,7 +195,10 @@ impl QwenVae {
     /// geometry lives in [`mlx_gen::tiling`] and the Array loop in [`mlx_gen::vae_tiling`]. No clamp here
     /// (the single-pass [`decode`](Self::decode) doesn't clamp either — the `[-1,1]` clamp is applied
     /// later by the engine's `decoded_to_image`), so the tiled output matches the untiled one to within
-    /// the blend tolerance.
+    /// the blend tolerance — the *conv-halo* seam term described on
+    /// `Decoder3D::forward_upsample_tail`, which the shipped 64 px overlap attenuates rather than
+    /// eliminates. It is never a per-tile normalization or attention term: that is the sc-19753
+    /// property, pinned by `tests/vae_tiling_normalization_proof.rs`.
     pub fn decode_tiled(
         &self,
         latents: &Array,

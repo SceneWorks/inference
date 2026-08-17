@@ -1083,11 +1083,29 @@ impl Decoder3d {
     }
 
     fn forward(&self, x: &Array) -> Result<Array> {
+        self.forward_upsample_tail(&self.forward_middle(x)?)
+    }
+
+    /// The **globally-scoped** half: `conv1` → the three middle blocks, at latent resolution
+    /// (sc-19753).
+    ///
+    /// `middle.1` is an [`AttentionBlock`] whose softmax spans every `H·W` spatial token of a frame
+    /// ([`AttentionBlock::forward`]), so a spatial tile that runs it attends only to its own crop.
+    /// The channel-L2 [`rms_norm_last`] used throughout this VAE reduces only the last (channel)
+    /// axis and is genuinely tiling-invariant; the attention is the op that is not.
+    fn forward_middle(&self, x: &Array) -> Result<Array> {
         let mut x = self.conv1.forward(x, None)?;
         x = self.middle.0.forward(&x)?;
         x = self.middle.1.forward(&x)?;
         x = self.middle.2.forward(&x)?;
         eval(&x)?;
+        Ok(x)
+    }
+
+    /// The **spatially-local** half: the `UpResBlock` stack and the `Head22` epilogue. Convolutions,
+    /// nearest upsample, channel-duplicating shortcuts and the per-position channel-L2 norm only.
+    fn forward_upsample_tail(&self, middle: &Array) -> Result<Array> {
+        let mut x = middle.clone();
         for up in &self.upsamples {
             x = up.forward(&x, true)?;
             eval(&x)?;
@@ -1342,10 +1360,21 @@ impl Wan22Vae {
         contiguous(&minimum(&maximum(&out, scalar(-1.0))?, scalar(1.0))?)
     }
 
-    /// Decode with **tiling** for memory-bounded large/long video. Splits the channels-last latent
-    /// `[1,T,H,W,z]` into overlapping tiles, decodes each (denorm + conv2 + decoder + unpatchify +
-    /// clamp), and trapezoidally blends. Falls back to single-pass [`Self::decode`] when `cfg` doesn't fire.
+    /// Decode with **tiling** for memory-bounded large/long video. Splits the channels-last middle
+    /// feature map into overlapping tiles, runs the upsample tail + unpatchify + clamp on each, and
+    /// trapezoidally blends. Falls back to single-pass [`Self::decode`] when `cfg` doesn't fire.
     /// vae22 upsamples 16× spatially, 4× temporally, **causally** ([`VaeTiling::WAN22`]).
+    ///
+    /// **Normalization semantics (sc-19753).** Denormalize, `conv2` and the decoder's middle blocks
+    /// — including the spatial self-attention — run **once** on the full latent
+    /// (`Decoder3d::forward_middle`); only the spatially-local tail is tiled. This previously ran
+    /// the whole decoder per tile, so every spatial tile's `middle.1` softmax attended over its own
+    /// crop's token set instead of the frame's. The middle blocks are shape-preserving at latent
+    /// resolution, so the tile plan is unchanged.
+    ///
+    /// **Memory cost of the dense head**, as for the z16 sibling: the middle feature map is
+    /// materialized whole, but at *latent* resolution and in `compute_dtype`, so it is a fraction of
+    /// the full-size output accumulator the tiling already required.
     pub fn decode_tiled(
         &self,
         latent_czthw: &Array,
@@ -1362,16 +1391,20 @@ impl Wan22Vae {
             return self.decode_cl(&z);
         }
         let denorm = add(&multiply(&z, &self.std)?, &self.mean)?;
+        // The attention-bearing middle blocks run once, in `compute_dtype`, on the full latent.
+        let middle = self.decoder.forward_middle(
+            &self
+                .conv2
+                .forward(&denorm.as_dtype(self.compute_dtype)?, None)?,
+        )?;
         let plan = cfg.plan(Self::VAE_TILING, f, h, w);
 
-        // Channels-last: channel axis last, tiled axes [1, 2, 3]. Per-tile decode adds the 2× spatial
+        // Channels-last: channel axis last, tiled axes [1, 2, 3]. Per-tile work adds the 2× spatial
         // unpatchify (vae22 upsamples 16× via decoder×8 + patch×2) before the clamp. The per-tile
         // body runs in `compute_dtype` (bf16 halves its activation peak, sc-5039); the f32 blend
         // accumulators are unchanged (the clamp scalars promote each tile back to f32).
-        tile_decode_accumulate(&denorm, &plan, [1, 2, 3], cancel, |tile| {
-            let tile = tile.as_dtype(self.compute_dtype)?;
-            let x = self.conv2.forward(&tile, None)?;
-            let dec = self.decoder.forward(&x)?;
+        tile_decode_accumulate(&middle, &plan, [1, 2, 3], cancel, |tile| {
+            let dec = self.decoder.forward_upsample_tail(tile)?;
             let dec = unpatchify(&dec, 2)?;
             Ok(minimum(&maximum(&dec, scalar(-1.0))?, scalar(1.0))?)
         })

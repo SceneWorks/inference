@@ -24,8 +24,8 @@
 //! `eps = eps_uncond + cfg·(eps_cond − eps_uncond)` — so the caller must batch `conditioning` /
 //! `pooled` / `time_ids` / the face tokens in that order.
 
+use crate::SdxlVaeDecoder;
 use candle_core::{DType, Device, IndexOp, Tensor};
-use candle_transformers::models::stable_diffusion::vae::AutoEncoderKL;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 
@@ -160,7 +160,7 @@ pub fn preprocess_control_image(
 /// (>512² output); ≤512² decodes are byte-identical to the prior monolithic path. `pid = None` is
 /// byte-identical to the pre-sc-8373 signature.
 pub fn decode_image(
-    vae: &AutoEncoderKL,
+    vae: &SdxlVaeDecoder,
     latents: &Tensor,
     pid: Option<&dyn LatentDecoder>,
     cancel: Option<&CancelFlag>,

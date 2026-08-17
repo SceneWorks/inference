@@ -38,8 +38,8 @@ use candle_gen_sdxl::weights::Weights;
 use candle_gen_sdxl::{
     decode_image, denoise_curated, denoise_ip_multi_control, load_instantid_unet,
     load_instantid_unet_with_adapters, load_sdxl_controlnet, load_sdxl_vae,
-    preprocess_control_image, seeded_prior, seeded_sigma_prior, text_time_ids, AutoEncoderKL,
-    ControlContext, ControlNet, Denoiser, EulerAncestralSampler, SdxlConditioner,
+    preprocess_control_image, seeded_prior, seeded_sigma_prior, text_time_ids, ControlContext,
+    ControlNet, Denoiser, EulerAncestralSampler, SdxlConditioner, SdxlVaeDecoder,
     UNet2DConditionModel, PID_BACKBONE,
 };
 
@@ -283,7 +283,7 @@ pub struct InstantId {
     /// The OpenPose ControlNet for pose mode (sc-3117), attached via [`with_openpose`](Self::with_openpose).
     openpose: Option<ControlNet>,
     resampler: Resampler,
-    vae: AutoEncoderKL,
+    vae: SdxlVaeDecoder,
     sampler: EulerAncestralSampler,
     /// SDXL ε-prediction α-cumprod schedule (`scaled_linear`), built once at load — the
     /// [`DiscreteModelSampling`] source for the curated unified-sampler path (epic 7114, sc-7297).

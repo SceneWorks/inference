@@ -42,7 +42,7 @@ use crate::sampler::EulerAncestralSampler;
 use crate::unet::UNet2DConditionModel;
 use crate::vision_encoder::{check_layer_count, ClipVisionEncoder, VisionConfig};
 use crate::weights::Weights;
-use crate::{conditioning::SdxlConditioner, AutoEncoderKL, PID_BACKBONE};
+use crate::{conditioning::SdxlConditioner, SdxlVaeDecoder, PID_BACKBONE};
 
 /// The IP-Adapter compute dtype — fp16, matching the production SDXL path (the VAE is the f16-stable
 /// `madebyollin/sdxl-vae-fp16-fix`; the CLIP image encoder runs at this dtype too).
@@ -167,7 +167,7 @@ pub struct IpAdapterSdxl {
     conditioner: SdxlConditioner,
     unet: UNet2DConditionModel,
     ip_encoder: IpImageEncoder,
-    vae: AutoEncoderKL,
+    vae: SdxlVaeDecoder,
     sampler: EulerAncestralSampler,
     /// Optional PiD super-resolving decoder (epic 7840, sc-8044), attached via [`with_pid`](Self::with_pid).
     /// Composes the SDXL VAE, so it loads the SAME `sdxl` student ([`PID_BACKBONE`]) as the registered

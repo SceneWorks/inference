@@ -214,9 +214,10 @@ const DECODE_TILE_ABOVE_PX: usize = 1536;
 ///  - **correctness** (sc-10023): above [`DECODE_TILE_ABOVE_PX`] a monolithic tail conv overflows
 ///    candle's im2col launch and must tile regardless of the caller — so this fires even when
 ///    `force_tile` is false;
-///  - **VRAM** (sc-11744): `force_tile` engages the seam-free tiled tail *below* the threshold to cap the
-///    end-of-render decode spike on a constrained card. It is a pure *speed* trade (no quality cost), so
-///    the default caller keeps it false and a card with headroom decodes monolithically at full speed.
+///  - **VRAM** (sc-11744): `force_tile` engages the tiled tail *below* the threshold to cap the
+///    end-of-render decode spike on a constrained card. The tiling is normalization-correct but not
+///    bit-exact (see [`QwenVae::decode_with`]), so the default caller keeps it false and a card with
+///    headroom decodes monolithically at full speed.
 fn should_tile_tail(out_px_max: usize, force_tile: bool) -> bool {
     force_tile || out_px_max > DECODE_TILE_ABOVE_PX
 }
@@ -314,10 +315,18 @@ impl QwenVae {
     /// im2col-overflow correctness gate, unchanged). `force_tile = true` runs the seam-free tiled tail
     /// even *below* the threshold: the tail's peak activation is the ~full-resolution upsampler conv, so
     /// tiling it caps the end-of-render VRAM spike that OOMs a constrained card at a resolution the
-    /// denoise loop itself fits (the Krea pose-ControlNet fit-ladder's cheapest rung — a *speed* cost,
-    /// **no quality cost**, since the `Self::tile_blend_tail` trapezoidal blend is attention-free and a
-    /// partition of unity over the overlap). The default caller keeps `force_tile = false` so nothing
-    /// tiles on a card with headroom.
+    /// denoise loop itself fits (the Krea pose-ControlNet fit-ladder's cheapest rung).
+    ///
+    /// What the head/tail split guarantees is that the tiling is **normalization-correct**: no global
+    /// statistic is ever computed per crop, because the only global op — [`Self::decode_mid`]'s
+    /// `mid_attn`, a softmax over all H·W tokens — runs once on the whole latent, and every op in
+    /// [`Self::decode_tail`] is spatially local (convs, nearest upsample, and `ChanNorm`, whose
+    /// reduction is over the channel axis). It is **not** bit-exact: each tile's padded convolutions
+    /// zero-pad at their own crop boundary, so the tiled result is a close *approximation* of the
+    /// single-pass decode. `tests/vae_tiled_decode_parity.rs` holds that as a PSNR floor (≥ 40 dB)
+    /// rather than an equality, and proves the split is load-bearing by measuring the same tiling
+    /// applied to the whole decoder. The default caller keeps `force_tile = false` so nothing tiles on
+    /// a card with headroom.
     pub fn decode_with(&self, latents: &Tensor, force_tile: bool) -> Result<Tensor> {
         let tile = force_tile.then_some((
             crate::memory_strategy::DECODE_TILE_EDGE,

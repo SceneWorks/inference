@@ -69,7 +69,7 @@ use candle_transformers::models::stable_diffusion::ddim::DDIMSchedulerConfig;
 use candle_transformers::models::stable_diffusion::schedulers::{Scheduler, SchedulerConfig};
 use candle_transformers::models::stable_diffusion::{self, clip, StableDiffusionConfig};
 
-use candle_transformers::models::stable_diffusion::vae::AutoEncoderKL;
+use crate::SdxlVaeDecoder;
 
 use crate::denoise::decode_image;
 use crate::loaders::load_sdxl_vae;
@@ -272,7 +272,7 @@ struct SamplePreview {
     prompts: Vec<String>,
     /// The f16-stable SDXL VAE decoder (`madebyollin/sdxl-vae-fp16-fix`), resident for the run so each
     /// preview decodes its final latent without a per-cadence reload.
-    vae: AutoEncoderKL,
+    vae: SdxlVaeDecoder,
 }
 
 /// Render one preview image (sc-8650) on the **in-training** UNet — adapters live as eager `Var`s, so
@@ -297,7 +297,7 @@ struct SamplePreview {
 #[allow(clippy::too_many_arguments)]
 fn render_one_preview(
     unet: &UNet2DConditionModel,
-    vae: &AutoEncoderKL,
+    vae: &SdxlVaeDecoder,
     cond: &Tensor,
     cfg: &TrainingConfig,
     lat_h: usize,
