@@ -27,9 +27,9 @@
 //! ones, which run on every CI lane:
 //!
 //! * `the_task_mapping_is_not_a_constant` — the selection function itself;
-//! * `a_ref2va_request_without_the_reference_partition_is_refused` — the sc-19517 hosting gap fails
-//!   LOUD at the engine boundary rather than degrading to the base checkpoint, **and** does not take
-//!   `t2va` / `fl2va` down with it;
+//! * `a_ref2va_request_without_the_reference_partition_is_refused` — a base-only install (the normal
+//!   off-Mac shape) fails LOUD at the engine boundary rather than degrading to the base checkpoint,
+//!   **and** does not take `t2va` / `fl2va` down with it;
 //! * `every_dit_load_site_in_the_crate_is_driven_by_the_task` — a **whole-crate** source scan
 //!   proving there is nowhere in the render path for a hardcoded partition string to be;
 //! * `model.rs`'s own `a_reference_request_resolves_to_the_reference_partition` — the other end of
@@ -104,10 +104,20 @@ fn the_task_mapping_is_not_a_constant() {
 /// **A `ref2va` REQUEST against a snapshot carrying only `transformer/` is refused, naming the
 /// missing partition — and the other two tasks keep working.**
 ///
-/// This is the sc-19517 hosting gap made loud: `SceneWorks/minimax-h3-mlx` publishes no
-/// `q4/transformer_ref`, so a pure-`q4` install has exactly this shape. The failure mode being
-/// prevented is a `ref2va` request silently rendering off `transformer/` — which produces plausible
-/// video and is wrong.
+/// This is the **ordinary off-Mac install shape** made loud: every `transformer_ref` row in
+/// SceneWorks' manifest is `platforms: ["macos"]` and the off-Mac artifact set carries none, so an
+/// off-Mac install has no catalog route to the partition (an interrupted download and a declined
+/// co-requisite reach the same shape). The failure mode being prevented is a `ref2va` request
+/// silently rendering off `transformer/` — which produces plausible video and is wrong.
+///
+/// That failure mode is **reachable**, which is why this matters: `ref2va` is ported on this lane
+/// (sc-17157, landed), and the provider advertises and admits all three reference conditioning
+/// kinds. The request arrives; only the weights are missing.
+///
+/// (Two retracted premises, recorded in `model.rs`: sc-19517's "the rehost publishes no
+/// `q4/transformer_ref`", and a later "default-denies `ref2va` until sc-17157" — sc-19573 ships the
+/// partition with exact hosted bytes, and sc-17157 has landed. The shape is real regardless; only
+/// those stated causes were wrong.)
 ///
 /// **The blast radius is asserted, not assumed.** Requiring the partition in `MiniMaxH3::load` — the
 /// obvious implementation — would fail provider construction outright on such a snapshot and take

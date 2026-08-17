@@ -111,7 +111,7 @@ impl LinearBias {
         in_features: usize,
         out_features: usize,
     ) -> Result<Self> {
-        crate::quant::guard_dense(w, prefix)?;
+        crate::quant::guard_dense(w, crate::quant::DIT, prefix)?;
         let weight = w.require(&format!("{prefix}.weight"))?;
         let bias = w.require(&format!("{prefix}.bias"))?;
         if weight.dims() != [out_features, in_features] {

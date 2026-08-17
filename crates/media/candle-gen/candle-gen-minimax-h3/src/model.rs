@@ -65,11 +65,52 @@
 //! # `transformer_ref` is required **per task**, not per snapshot
 //!
 //! The reference partition is checked when a request resolves to [`MiniMaxH3Task::Ref2va`], at the
-//! engine boundary and before any weight is read — not unconditionally in [`load`]. That is
-//! deliberate: `SceneWorks/minimax-h3-mlx` publishes no `q4/transformer_ref` (sc-19517), so a
-//! pure-`q4` install carries only the base partition, and requiring the reference one at `load`
-//! would take `t2va` and `fl2va` offline as well. A `ref2va` request against such a snapshot is
-//! refused loudly, naming the missing directory; the other two tasks keep working.
+//! engine boundary and before any weight is read — not unconditionally in [`load`]. The reason is
+//! **which artifacts an off-Mac install can actually obtain**, and it is stated below as three
+//! checkable facts about the catalog rather than as a claim about what any engine permits.
+//!
+//! The MLX lane's `load` opens `transformer/config.json` **and** `transformer_ref/config.json` on
+//! every load regardless of task. That is safe *there* because SceneWorks' `builtin.models.jsonc`
+//! ships `{q4,q8,bf16}/transformer_ref/*` as per-tier `coRequisite` rows — part of the minimum
+//! loadable set, not an optional Ref2VA extra. Off-Mac it would not be safe, because:
+//!
+//! 1. **every one of those `transformer_ref` rows is `platforms: ["macos"]`**;
+//! 2. the off-Mac artifact set sc-19558 defines (a raw upstream snapshot: `text_encoder`,
+//!    `transformer`, `vae`, `audio_vae`, plus the `FL2VA/audio_vae` config triple) **carries no
+//!    `transformer_ref` rows at all**; and
+//! 3. SceneWorks' `crates/sceneworks-worker/src/video_jobs/minimax_h3.rs` is
+//!    `#[cfg(target_os = "macos")]` end to end, so there is no off-Mac dispatch arm today.
+//!
+//! So an off-Mac install has no catalog route to the partition, and a base-only snapshot is the
+//! ordinary off-Mac shape rather than a damaged one (an interrupted download and a declined
+//! co-requisite reach it too). Probing at `load` would fail **every** off-Mac load, taking `t2va`
+//! and `fl2va` offline over a directory the catalog never offered.
+//!
+//! **This is exactly why the per-request refusal has to be loud.** `ref2va` is fully ported on this
+//! lane — sc-17157 landed it, and [`descriptor`] advertises all three reference
+//! [`ConditioningKind`]s, so [`Generator::validate`] genuinely admits such a request. The reference
+//! arm is therefore reachable through this crate's own API on a snapshot that cannot serve it, and
+//! the alternative to refusing is a `ref2va` request silently rendering off `transformer/` —
+//! plausible video, wrong checkpoint. The other two tasks keep working.
+//!
+//! > **Two retracted premises, recorded so neither is reintroduced.**
+//! >
+//! > 1. This decision was once justified as "`SceneWorks/minimax-h3-mlx` publishes no
+//! >    `q4/transformer_ref` (sc-19517)". False today: the sc-19573 manifest block ships
+//! >    `q4/transformer_ref/*` with an exact hosted byte count (18.78 GB) at revision `137ce668`,
+//! >    and the manifest flags the older reasoning as having come "from a premise the engine has
+//! >    never honoured".
+//! > 2. A first attempt at replacing it said the off-Mac rows are absent because "this provider
+//! >    default-denies `ref2va` at its conditioning allowlist until sc-17157 lands the port". Also
+//! >    false, and contradicted a few hundred lines below: sc-17157 **landed** (`32204c935`,
+//! >    2026-08-15), and this provider advertises and admits `ref2va`. The manifest comment that
+//! >    claim was paraphrased from predates the port and is itself stale, which is why the reasoning
+//! >    above rests only on where the rows are and what dispatch exists — both directly checkable —
+//! >    and asserts no mechanism. **Why the rows are still absent is a catalog question**, so
+//! >    confirm it with the catalog owner before adding them; do not infer it here.
+//! >
+//! > Both behaviours were and remain correct; only the stated causes were wrong. See [`crate::tier`]
+//! > for the full reconciliation.
 //!
 //! # The turbo LoRA seam IS here (sc-18728), and the declaration still gates nothing
 //!
@@ -156,11 +197,18 @@ const REQUIRED_COMPONENT_DIRS: [&str; 4] = ["text_encoder", BASE_DIT_PARTITION, 
 /// `ref2va` is a first-class task, so a snapshot missing `transformer_ref/` must fail **before any
 /// weight is read**, naming the path, rather than twenty minutes into a render when the reference
 /// arm finally reaches for it. The obvious implementation — put it in
-/// [`REQUIRED_COMPONENT_DIRS`] — is wrong, and its blast radius is larger than it looks:
-/// `SceneWorks/minimax-h3-mlx` publishes no `q4/transformer_ref` (sc-19517), so a pure-`q4` install
-/// carries **only** the base partition today. Requiring the reference one at `load` would fail
-/// provider construction outright and take `t2va` and `fl2va` offline with it, for a snapshot that
-/// serves both perfectly well.
+/// [`REQUIRED_COMPONENT_DIRS`] — is wrong, and its blast radius is larger than it looks: the
+/// `transformer_ref` rows SceneWorks' manifest ships are **all `platforms: ["macos"]`**, and the
+/// off-Mac artifact set carries none, so an off-Mac install has no catalog route to the partition and
+/// a base-only snapshot is the *ordinary* off-Mac shape rather than a broken one. Requiring the
+/// reference partition at `load` would fail provider construction outright and take `t2va` and
+/// `fl2va` offline with it, on every platform this lane serves, for a snapshot that serves both
+/// perfectly well.
+///
+/// (Two retracted premises are recorded in the module docs — the sc-19517 "not published" claim, and
+/// a later "default-denies `ref2va` until sc-17157" claim that is equally false since sc-17157
+/// landed. The conclusion rests on the manifest rows and the absent off-Mac dispatch arm, both
+/// checkable, and asserts no engine mechanism. See also [`crate::tier`].)
 ///
 /// So the check runs where the task is known: [`Generator::validate`], which
 /// [`MiniMaxH3::generate_impl`] calls first, and which runs before the geometry is resolved and long
@@ -447,8 +495,10 @@ impl MiniMaxH3 {
         for component in task_component_dirs(task) {
             require_component(&self.root, component).map_err(|e| {
                 CandleError::Msg(format!(
-                    "{e} — this is the {task:?} task's own checkpoint (sc-19517: a pure-q4 install \
-                     carries no `{REFERENCE_DIT_PARTITION}` today). The other tasks are unaffected."
+                    "{e} — this is the {task:?} task's own checkpoint, and it is not part of the \
+                     off-Mac artifact set: every `{REFERENCE_DIT_PARTITION}` row in the model \
+                     catalog is macOS-only, so this snapshot has no route to it. The other tasks are \
+                     unaffected."
                 ))
             })?;
         }
@@ -1523,8 +1573,9 @@ impl Generator for MiniMaxH3 {
 ///
 /// [`descriptor`] sets `supports_lokr` to `false` and `supported_quants` to `&[]`. **Those fields
 /// are declarations that gen-core reads on no path.** `Capabilities::validate_request` gates the
-/// conditioning allowlist (which is what actually default-denies the `ref2va` kinds) but never looks
-/// at `supports_lora` or `supported_quants`, and `ProviderRegistryBuilder` does not inspect a
+/// conditioning allowlist (which is what actually default-denies `VideoClip` — **not** the `ref2va`
+/// kinds, which [`descriptor`] advertises and `validate` admits since sc-17157 landed the port) but
+/// never looks at `supports_lora` or `supported_quants`, and `ProviderRegistryBuilder` does not inspect a
 /// `LoadSpec` either — so without the checks below, a spec carrying `quantize`, a LoKr adapter, or a
 /// per-pass / MoE adapter knob loaded clean and rendered with the caller's knob silently discarded.
 ///
@@ -2899,13 +2950,21 @@ mod tests {
 
     /// **`transformer_ref` is required of the `ref2va` REQUEST, not of the snapshot** (sc-17157).
     ///
-    /// The blast radius is the point. `SceneWorks/minimax-h3-mlx` publishes no `q4/transformer_ref`
-    /// (sc-19517), so a pure-`q4` install carries only the base partition today. Requiring the
-    /// reference partition in `load` would fail provider construction outright and take `t2va` and
-    /// `fl2va` offline with it — a whole model offline for a capability neither of them uses. So
-    /// this asserts both halves: such a snapshot **loads and serves the other two tasks**, and a
-    /// reference request against it is refused at the engine boundary, before a weight is read,
-    /// naming the missing directory.
+    /// The blast radius is the point. A base-only install is the *ordinary* off-Mac shape: every
+    /// `transformer_ref` row in SceneWorks' manifest is `platforms: ["macos"]` and the off-Mac
+    /// artifact set carries none, so such an install has no catalog route to the partition.
+    /// Requiring it in `load` would fail provider construction outright and take `t2va` and `fl2va`
+    /// offline with it — a whole model offline for a capability neither of them uses. So this asserts
+    /// both halves: such a snapshot **loads and serves the other two tasks**, and a reference request
+    /// against it is refused at the engine boundary, before a weight is read, naming the missing
+    /// directory.
+    ///
+    /// The refusal has to be loud precisely because `ref2va` **is** ported here (sc-17157, landed):
+    /// `descriptor` advertises all three reference kinds and `validate` admits them, so the arm is
+    /// reachable on a snapshot that cannot serve it.
+    ///
+    /// (Two retracted premises are recorded in the module docs: the sc-19517 "not published" claim,
+    /// and a later "default-denies `ref2va` until sc-17157" claim. Neither is asserted here.)
     #[test]
     fn a_ref2va_request_needs_the_reference_partition_but_the_other_tasks_do_not() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2943,7 +3002,20 @@ mod tests {
         };
         let path = root.join(REFERENCE_DIT_PARTITION).display().to_string();
         assert!(e.contains(&path), "the refusal must name the path: {e}");
-        assert!(e.contains("sc-19517"), "{e}");
+        // The refusal attributes the gap to the ARTIFACT fact — the catalog rows are macOS-only —
+        // and names the partition. Both negative assertions pin retracted premises OUT of
+        // user-facing text: sc-19517's "not published", and the later "until sc-17157 lands the
+        // port" (sc-17157 landed, and this provider advertises `ref2va`).
+        assert!(e.contains("macOS-only"), "{e}");
+        assert!(e.contains(REFERENCE_DIT_PARTITION), "{e}");
+        assert!(
+            !e.contains("sc-19517"),
+            "the retracted hosting premise must not reappear in user-facing text: {e}"
+        );
+        assert!(
+            !e.contains("sc-17157"),
+            "sc-17157 LANDED — a refusal must not describe the port as pending: {e}"
+        );
 
         // Control: stage the partition and the very same request is admitted.
         stage_component(&root, REFERENCE_DIT_PARTITION);

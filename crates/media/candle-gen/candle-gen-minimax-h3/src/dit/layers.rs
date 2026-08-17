@@ -149,7 +149,7 @@ pub struct LinearNoBias {
 impl LinearNoBias {
     /// Load `{prefix}` — **packed** when `{prefix}.scales` is present, else dense at `dtype`.
     pub fn from_weights(w: &Weights, prefix: &str, dtype: DType) -> Result<Self> {
-        let loaded = crate::quant::lin(w, prefix, false, dtype)?;
+        let loaded = crate::quant::lin(w, crate::quant::DIT, prefix, false, dtype)?;
         Ok(Self {
             inner: loaded.linear,
             base_bytes: loaded.base_bytes,

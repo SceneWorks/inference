@@ -134,6 +134,7 @@ pub mod rope;
 pub mod spatial_tiling;
 pub mod tensor;
 pub mod text_encoder;
+pub mod tier;
 pub mod vae;
 pub mod vae_encoder;
 
