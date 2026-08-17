@@ -2156,18 +2156,9 @@ mod tests {
     // LDM key remapper classifies nothing, and `split_ldm_checkpoint` returns its own typed
     // "missing the … component" error. That error arriving is the proof the staged phase loader
     // re-opened the pinned fused file; the resident-only refusal arriving instead is the defect.
-    fn unique_ldm_fixture_dir(tag: &str) -> std::path::PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "sdxl-ldm-{tag}-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).expect("create fixture dir");
-        dir
-    }
-
+    // Each test mints its fixture root with `tempfile::tempdir()` and holds the `TempDir` guard for
+    // its own duration: the guard IS the cleanup, including out of a panicking test (sc-17791).
+    //
     /// One structurally valid safetensors file with a single F32 tensor and no SDXL/LDM keys.
     ///
     /// Deliberately valid rather than garbage: the point is to reach `split_ldm_checkpoint`'s key
@@ -2196,8 +2187,8 @@ mod tests {
     /// The narrowest public reach into `ensure_rebuildable`: a resident-only owner refuses to evict.
     #[test]
     fn fused_ldm_resident_load_retains_its_reload_loaders() {
-        let dir = unique_ldm_fixture_dir("retains");
-        let spec = stub_fused_spec(&dir, OffloadPolicy::Resident);
+        let dir = tempfile::tempdir().expect("fixture root");
+        let spec = stub_fused_spec(dir.path(), OffloadPolicy::Resident);
         let pin = spec
             .weights_file_pin()
             .expect("pin the stub checkpoint")
@@ -2211,15 +2202,14 @@ mod tests {
             !evicted,
             "the warm pair is built on first use, so there is nothing to evict yet"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The whole point: a staged selection on a fused `Resident` instance reaches the real pinned
     /// phase loaders instead of being refused for having none.
     #[test]
     fn fused_ldm_staged_selection_reaches_the_real_pinned_phase_loaders() {
-        let dir = unique_ldm_fixture_dir("staged");
-        let spec = stub_fused_spec(&dir, OffloadPolicy::Resident);
+        let dir = tempfile::tempdir().expect("fixture root");
+        let spec = stub_fused_spec(dir.path(), OffloadPolicy::Resident);
         let pin = spec
             .weights_file_pin()
             .expect("pin the stub checkpoint")
@@ -2251,7 +2241,6 @@ mod tests {
             msg.contains("sdxl LDM checkpoint is missing the"),
             "the staged text phase must have re-split the pinned fused file: {msg}"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The reach half of the chain: every layer between a request and `generate` accepts a staged
@@ -2269,8 +2258,8 @@ mod tests {
             "the static descriptor publishes rung 1 as selectable for every SDXL route"
         );
 
-        let dir = unique_ldm_fixture_dir("declared");
-        let spec = stub_fused_spec(&dir, OffloadPolicy::Resident);
+        let dir = tempfile::tempdir().expect("fixture root");
+        let spec = stub_fused_spec(dir.path(), OffloadPolicy::Resident);
         let contract =
             crate::memory_strategy::weights_free_memory_strategy_contract(descriptor().id, &spec)
                 .expect("declaration-equivalent contract for a fused load");
@@ -2296,7 +2285,6 @@ mod tests {
                 },
             })
             .expect("admission accepts a staged selection on a fused load");
-        std::fs::remove_dir_all(&dir).ok();
     }
 }
 #[test]
