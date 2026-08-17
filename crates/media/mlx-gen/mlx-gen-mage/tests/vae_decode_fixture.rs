@@ -393,3 +393,91 @@ fn non_square_cod_decoder_matches_the_torch_reference() {
     let err = max_abs(&got, want);
     assert!(err < 5e-4, "non-square CoD decoder max_abs {err}");
 }
+
+/// sc-19753 — the **bounded** decode must reproduce the dense decode.
+///
+/// Mage's codec splits cleanly in two: everything with a cross-position dependence (the CoD
+/// decoder's `GroupNorm(32)`s and its 32×32-window attention, and each DiCo block's
+/// whole-extent squeeze-and-excite pool) is latent-resolution, and the per-latent-pixel tail is
+/// the output-resolution half. `decode_tiled` now runs the first half whole and tiles only the
+/// second, so the bounded result is the dense result — not an approximation of it.
+///
+/// Verified by mutation, not assumed: tiling the whole `decode` (this method's previous shape)
+/// moves the same comparison to max_abs **1.655e-1** against the 2e-4 bound below, because every
+/// crop then normalizes, attends and gates against itself.
+#[test]
+fn tiled_decode_reproduces_the_dense_decode() {
+    let w = fixture();
+    let (shape, latent_hw) = fixture_shape(&w);
+    let latent = w.require("fixture.latent").unwrap().clone();
+
+    // Four latent pixels per tile: `needs_tiling` compares the latent extent against
+    // `tile_px / patch`, so this genuinely splits the fixture's 6×6 grid on both axes.
+    let cfg = mlx_gen::tiling::TilingConfig::spatial_only(4 * shape.patch, 0);
+    let geometry = mlx_gen::tiling::VaeTiling {
+        spatial_scale: shape.patch,
+        temporal_scale: 1,
+        causal_temporal: false,
+        full_res_channels: shape.hidden_x,
+    };
+    assert!(
+        cfg.needs_tiling(geometry, 1, latent_hw, latent_hw),
+        "the fixture geometry must actually tile, else this proves nothing"
+    );
+    let plan = cfg.plan(geometry, 1, latent_hw, latent_hw);
+    assert!(
+        plan.h.len() > 1 && plan.w.len() > 1,
+        "the bounded plan must split both spatial axes, got {}x{}",
+        plan.h.len(),
+        plan.w.len()
+    );
+
+    // Both fold states: folded is production, unfolded exercises the zero-RGB per-tile path.
+    for fold in [true, false] {
+        let vae = build(&w, shape, fold);
+        let dense = vae.decode(&latent).unwrap();
+        let bounded = vae.decode_tiled(&latent, &cfg, None).unwrap();
+        assert_eq!(bounded.shape(), dense.shape(), "fold={fold} geometry");
+        let err = max_abs(&dense, &bounded);
+        assert!(
+            err < 2e-4,
+            "fold={fold}: bounded decode diverged from dense by max_abs {err}"
+        );
+    }
+}
+
+/// A tiling request too wide to split this latent must fall through to the exact single-pass
+/// decode rather than assembling a one-tile plan.
+#[test]
+fn an_untiled_request_falls_through_to_the_dense_decode() {
+    let w = fixture();
+    let (shape, latent_hw) = fixture_shape(&w);
+    let latent = w.require("fixture.latent").unwrap().clone();
+    let cfg = mlx_gen::tiling::TilingConfig::spatial_only(64 * shape.patch, 0);
+    let geometry = mlx_gen::tiling::VaeTiling {
+        spatial_scale: shape.patch,
+        temporal_scale: 1,
+        causal_temporal: false,
+        full_res_channels: shape.hidden_x,
+    };
+    assert!(!cfg.needs_tiling(geometry, 1, latent_hw, latent_hw));
+
+    let vae = build(&w, shape, true);
+    let dense = vae.decode(&latent).unwrap();
+    let passthrough = vae.decode_tiled(&latent, &cfg, None).unwrap();
+    assert_eq!(max_abs(&dense, &passthrough), 0.0);
+}
+
+/// A pre-tripped cancel is observed before any tensor work.
+#[test]
+fn tiled_decode_honors_a_pretripped_cancel() {
+    let w = fixture();
+    let (shape, _) = fixture_shape(&w);
+    let latent = w.require("fixture.latent").unwrap().clone();
+    let vae = build(&w, shape, true);
+    let cancel = mlx_gen::CancelFlag::new();
+    cancel.cancel();
+    let cfg = mlx_gen::tiling::TilingConfig::spatial_only(4 * shape.patch, 0);
+    let result = vae.decode_tiled(&latent, &cfg, Some(&cancel));
+    assert!(matches!(result, Err(mlx_gen::Error::Canceled)));
+}

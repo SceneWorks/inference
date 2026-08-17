@@ -26,7 +26,7 @@ use crate::loaders::{
 };
 use crate::sampler::EulerAncestralSampler;
 use crate::unet::{ControlNet, UNet2DConditionModel, VaeMomentsEncoder};
-use crate::{AutoEncoderKL, SIZE_MULTIPLE};
+use crate::{SdxlVaeDecoder, SIZE_MULTIPLE};
 
 const DTYPE: DType = DType::F16;
 
@@ -82,7 +82,7 @@ impl Default for SdxlDetailRequest {
 pub struct SdxlDetail {
     conditioner: SdxlConditioner,
     unet: UNet2DConditionModel,
-    vae: AutoEncoderKL,
+    vae: SdxlVaeDecoder,
     vae_encoder: VaeMomentsEncoder,
     controlnet: ControlNet,
     sampler: EulerAncestralSampler,

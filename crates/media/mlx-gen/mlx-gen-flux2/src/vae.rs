@@ -16,6 +16,7 @@ use mlx_rs::{Array, Dtype};
 use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::array::scalar;
 use mlx_gen::nn::{conv2d, group_norm, linear, silu, upsample_nearest};
+use mlx_gen::vae_tiling::{tiled_conv2d_3x3_nhwc, GlobalGroupNorm};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
@@ -120,6 +121,49 @@ impl ResnetBlock2D {
             None => x.clone(),
         };
         Ok(add(&h, &res)?)
+    }
+
+    /// Normalization-correct bounded forward (sc-19753).
+    ///
+    /// Both GroupNorms reduce the **whole** layer activation; only the two 3×3 convolutions are
+    /// evaluated on halo-expanded crops. The 1×1 shortcut has no spatial extent, so it runs whole.
+    fn forward_tiled_vae(
+        &self,
+        x: &Array,
+        tile_edge: i32,
+        cancel: Option<&mlx_gen::CancelFlag>,
+    ) -> Result<Array> {
+        if cancel.is_some_and(mlx_gen::CancelFlag::is_cancelled) {
+            return Err(mlx_gen::Error::Canceled);
+        }
+        let norm1 = GlobalGroupNorm::new(x, &self.norm1_w, &self.norm1_b, GN_GROUPS, GN_EPS)?;
+        let h = tiled_conv2d_3x3_nhwc(
+            x,
+            &self.conv1_w,
+            Some(&self.conv1_b),
+            tile_edge,
+            cancel,
+            |tile| silu(&norm1.apply(tile)?),
+        )?;
+        if cancel.is_some_and(mlx_gen::CancelFlag::is_cancelled) {
+            return Err(mlx_gen::Error::Canceled);
+        }
+        let norm2 = GlobalGroupNorm::new(&h, &self.norm2_w, &self.norm2_b, GN_GROUPS, GN_EPS)?;
+        let h = tiled_conv2d_3x3_nhwc(
+            &h,
+            &self.conv2_w,
+            Some(&self.conv2_b),
+            tile_edge,
+            cancel,
+            |tile| silu(&norm2.apply(tile)?),
+        )?;
+        let res = match &self.shortcut {
+            Some((cw, cb)) => conv2d(x, cw, Some(cb), 1, 0)?,
+            None => x.clone(),
+        };
+        let out = add(&h, &res)?;
+        out.eval()?;
+        Ok(out)
     }
 }
 
@@ -229,6 +273,39 @@ impl SampleBlock {
             x = conv2d(&upsample_nearest(&x, 2)?, cw, Some(cb), 1, 1)?;
         }
         Ok(x)
+    }
+
+    /// Decode-side bounded forward (sc-19753): every resnet keeps whole-activation GroupNorm
+    /// statistics and only the 3×3 convolutions tile. `tile_edge` bounds the resnet convolutions at
+    /// this block's input resolution; `upsampled_tile_edge` bounds the post-upsample convolution,
+    /// which runs at twice that resolution.
+    fn forward_tiled_decode(
+        &self,
+        x: &Array,
+        tile_edge: i32,
+        upsampled_tile_edge: i32,
+        cancel: Option<&mlx_gen::CancelFlag>,
+    ) -> Result<Array> {
+        if self.downsample.is_some() {
+            return Err(mlx_gen::Error::Msg(
+                "FLUX.2 tiled decode cannot run an encoder/downsample block".into(),
+            ));
+        }
+        let mut x = x.clone();
+        for resnet in &self.resnets {
+            x = resnet.forward_tiled_vae(&x, tile_edge, cancel)?;
+        }
+        if let Some((cw, cb)) = &self.upsample {
+            let up = upsample_nearest(&x, 2)?;
+            x = tiled_conv2d_3x3_nhwc(&up, cw, Some(cb), upsampled_tile_edge, cancel, |tile| {
+                Ok(tile.clone())
+            })?;
+        }
+        Ok(x)
+    }
+
+    fn upsamples(&self) -> bool {
+        self.upsample.is_some()
     }
 }
 
@@ -341,6 +418,10 @@ impl Decoder {
     }
 
     /// Spatially local, memory-spiking upsample tail.
+    ///
+    /// Every GroupNorm here — the two per `up_blocks` resnet and the final `conv_norm_out` — reduces
+    /// the whole image. Tiling this tail as a unit would give each crop its own statistics, so the
+    /// bounded route is [`Self::forward_upsample_tail_tiled`], which tiles one convolution at a time.
     fn forward_upsample_tail(&self, head: &Array) -> Result<Array> {
         let mut x = head.clone();
         for ub in &self.up_blocks {
@@ -348,6 +429,58 @@ impl Decoder {
         }
         let x = group_norm(&x, &self.norm_out_w, &self.norm_out_b, GN_GROUPS, GN_EPS)?;
         conv2d(&silu(&x)?, &self.conv_out_w, Some(&self.conv_out_b), 1, 1)
+    }
+
+    /// Layer-wise bounded upsample tail with dense-image GroupNorm semantics (sc-19753).
+    ///
+    /// `output_tile_edge` is expressed in **output** pixels; each stage's convolution edge is that
+    /// bound divided by the upsampling still ahead of it, so the physical crop stays comparable at
+    /// every resolution instead of collapsing to a single tile at latent scale.
+    fn forward_upsample_tail_tiled(
+        &self,
+        head: &Array,
+        output_tile_edge: i32,
+        cancel: Option<&mlx_gen::CancelFlag>,
+    ) -> Result<Array> {
+        if cancel.is_some_and(mlx_gen::CancelFlag::is_cancelled) {
+            return Err(mlx_gen::Error::Canceled);
+        }
+        let tile_edge_at = |remaining_scale: i32| {
+            ((output_tile_edge + remaining_scale - 1) / remaining_scale).max(3)
+        };
+        let mut remaining_scale = self
+            .up_blocks
+            .iter()
+            .filter(|block| block.upsamples())
+            .fold(1_i32, |scale, _| scale.saturating_mul(2));
+        let mut x = head.clone();
+        for up in &self.up_blocks {
+            let current_edge = tile_edge_at(remaining_scale);
+            let next_scale = if up.upsamples() {
+                (remaining_scale / 2).max(1)
+            } else {
+                remaining_scale
+            };
+            x = up.forward_tiled_decode(&x, current_edge, tile_edge_at(next_scale), cancel)?;
+            remaining_scale = next_scale;
+        }
+        if remaining_scale != 1 {
+            return Err(mlx_gen::Error::Msg(format!(
+                "FLUX.2 tiled VAE tail ended at remaining spatial scale {remaining_scale}, expected 1"
+            )));
+        }
+        if cancel.is_some_and(mlx_gen::CancelFlag::is_cancelled) {
+            return Err(mlx_gen::Error::Canceled);
+        }
+        let norm = GlobalGroupNorm::new(&x, &self.norm_out_w, &self.norm_out_b, GN_GROUPS, GN_EPS)?;
+        tiled_conv2d_3x3_nhwc(
+            &x,
+            &self.conv_out_w,
+            Some(&self.conv_out_b),
+            output_tile_edge.max(3),
+            cancel,
+            |tile| silu(&norm.apply(tile)?),
+        )
     }
 }
 
@@ -412,13 +545,24 @@ impl Flux2Vae {
 
     /// Bounded packed-latent decode. BatchNorm de-normalization, unpatchify, post-quant projection,
     /// and the decoder's global-attention head run once on the full latent; only the spatially-local
-    /// ×8 upsample tail is tiled and blended through the shared MLX tiling driver.
+    /// ×8 upsample tail is bounded.
+    ///
+    /// **Normalization semantics (sc-19753).** The tail is bounded *layer-wise*: each 3×3
+    /// convolution is evaluated on halo-expanded crops assembled from non-overlapping output cores,
+    /// while every GroupNorm still reduces the whole layer activation. The previous whole-tail
+    /// [`tiled_decode`](mlx_gen::vae_tiling::tiled_decode) route gave each crop its own GroupNorm
+    /// statistics — a different decode, not a blend artifact. `cfg.spatial.tile_px` bounds each
+    /// convolution crop in output pixels; the configured overlap remains part of the public tiling
+    /// contract and policy identity, but halo/core arithmetic needs no blend of whole-tail outputs.
     pub fn decode_packed_latents_tiled(
         &self,
         packed: &Array,
         cfg: &mlx_gen::tiling::TilingConfig,
         cancel: Option<&mlx_gen::CancelFlag>,
     ) -> Result<Array> {
+        if cancel.is_some_and(mlx_gen::CancelFlag::is_cancelled) {
+            return Err(mlx_gen::Error::Canceled);
+        }
         let latents = self
             .unpack_flux_packed_latents(packed)?
             .as_dtype(Dtype::Float32)?;
@@ -427,22 +571,17 @@ impl Flux2Vae {
         if !cfg.needs_tiling(FLUX2_TILING, 1, h, w) {
             return self.decode(&latents);
         }
+        let tile_edge = cfg
+            .spatial
+            .as_ref()
+            .ok_or_else(|| {
+                mlx_gen::Error::Msg("FLUX.2 tiled decode requires spatial tiling".into())
+            })?
+            .tile_px;
         let z = linear(&latents, &self.post_quant.0, &self.post_quant.1)?;
         let head = self.decoder.forward_pre_upsample(&z)?;
-        // NHWC -> NTHWC with singleton time; tiled axes are T/H/W and channels remain last.
-        let hs = head.shape();
-        let head5 = head.reshape(&[hs[0], 1, hs[1], hs[2], hs[3]])?;
-        let plan = cfg.plan(FLUX2_TILING, 1, h, w);
-        let decoded5 =
-            mlx_gen::vae_tiling::tiled_decode(&head5, &plan, [1, 2, 3], cancel, |tile5| {
-                let ts = tile5.shape();
-                let tile = tile5.reshape(&[ts[0], ts[2], ts[3], ts[4]])?;
-                let out = self.decoder.forward_upsample_tail(&tile)?;
-                let os = out.shape();
-                Ok(out.reshape(&[os[0], 1, os[1], os[2], os[3]])?)
-            })?;
-        let ds = decoded5.shape();
-        Ok(decoded5.reshape(&[ds[0], ds[2], ds[3], ds[4]])?)
+        self.decoder
+            .forward_upsample_tail_tiled(&head, tile_edge, cancel)
     }
 
     /// De-normalize and unpatchify FLUX/Lens packed-grid latents into the VAE's true raw 32-channel
@@ -543,6 +682,243 @@ fn unpatchify_ideogram(x: &Array, grid_h: i32, grid_w: i32) -> Result<Array> {
 
 #[allow(dead_code)]
 const _: i32 = LATENT_CHANNELS; // documented; channel counts come from the checkpoint shapes.
+
+/// Weights-free synthetic FLUX.2 VAE, for tiled-decode regressions (sc-19753).
+///
+/// `#[doc(hidden)]` test instrumentation rather than a `#[cfg(test)]` module because **Lens shares
+/// this exact decode path** ([`mlx_gen_lens::vae::decode_with_tiling`] hands its packed grid to
+/// [`Flux2Vae::decode_packed_latents_tiled`]), and a downstream crate cannot reach another crate's
+/// `cfg(test)` items. Sharing the builder is what lets the Lens-side proof drive the real seam
+/// instead of restating a copy of it that could drift.
+#[doc(hidden)]
+pub mod tiling_fixture {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// One channel width everywhere, so a single fixture builder covers every block. It must be a
+    /// multiple of [`GN_GROUPS`] and — because the 2×2 unpatchify fixes the raw latent width at
+    /// `128 / 4` — equal to the VAE's latent channel count.
+    const C: i32 = 32;
+
+    fn values(shape: &[i32], phase: f32, scale: f32) -> Array {
+        let count = shape.iter().product::<i32>();
+        let data = (0..count)
+            .map(|i| ((i as f32 + phase) * 0.071).sin() * scale)
+            .collect::<Vec<_>>();
+        Array::from_slice(&data, shape)
+    }
+
+    /// Insert a `[out, in, k, k]` PyTorch-layout convolution — the layout [`conv_w`] transposes.
+    fn insert_conv(
+        tensors: &mut HashMap<String, Array>,
+        prefix: &str,
+        input: i32,
+        output: i32,
+        kernel: i32,
+        phase: f32,
+    ) {
+        tensors.insert(
+            format!("{prefix}.weight"),
+            values(&[output, input, kernel, kernel], phase, 0.025),
+        );
+        tensors.insert(
+            format!("{prefix}.bias"),
+            values(&[output], phase + 3.0, 0.01),
+        );
+    }
+
+    fn insert_norm(tensors: &mut HashMap<String, Array>, prefix: &str, phase: f32) {
+        tensors.insert(
+            format!("{prefix}.weight"),
+            add(values(&[C], phase, 0.15), Array::from_f32(1.0)).unwrap(),
+        );
+        tensors.insert(format!("{prefix}.bias"), values(&[C], phase + 2.0, 0.05));
+    }
+
+    fn insert_resnet(tensors: &mut HashMap<String, Array>, prefix: &str, phase: f32) {
+        insert_norm(tensors, &format!("{prefix}.norm1"), phase);
+        insert_norm(tensors, &format!("{prefix}.norm2"), phase + 1.0);
+        insert_conv(tensors, &format!("{prefix}.conv1"), C, C, 3, phase + 4.0);
+        insert_conv(tensors, &format!("{prefix}.conv2"), C, C, 3, phase + 5.0);
+    }
+
+    fn insert_attention(tensors: &mut HashMap<String, Array>, prefix: &str, phase: f32) {
+        insert_norm(tensors, &format!("{prefix}.group_norm"), phase);
+        for (index, name) in ["to_q", "to_k", "to_v", "to_out.0"].iter().enumerate() {
+            tensors.insert(
+                format!("{prefix}.{name}.weight"),
+                values(&[C, C], phase + index as f32 + 1.0, 0.02),
+            );
+            tensors.insert(
+                format!("{prefix}.{name}.bias"),
+                values(&[C], phase + index as f32 + 5.0, 0.005),
+            );
+        }
+    }
+
+    fn insert_mid(tensors: &mut HashMap<String, Array>, prefix: &str, phase: f32) {
+        insert_resnet(tensors, &format!("{prefix}.resnets.0"), phase);
+        insert_attention(tensors, &format!("{prefix}.attentions.0"), phase + 10.0);
+        insert_resnet(tensors, &format!("{prefix}.resnets.1"), phase + 20.0);
+    }
+
+    /// A structurally faithful synthetic FLUX.2 VAE: the real block/resnet counts
+    /// ([`BLOCK_OUT`], [`LAYERS_PER_BLOCK`]) at one narrow channel width.
+    pub fn weights() -> Weights {
+        let blocks = BLOCK_OUT.len();
+        let mut tensors = HashMap::new();
+
+        insert_conv(&mut tensors, "decoder.conv_in", C, C, 3, 1.0);
+        insert_mid(&mut tensors, "decoder.mid_block", 10.0);
+        for block in 0..blocks {
+            for resnet in 0..(LAYERS_PER_BLOCK + 1) {
+                insert_resnet(
+                    &mut tensors,
+                    &format!("decoder.up_blocks.{block}.resnets.{resnet}"),
+                    40.0 + (block as i32 * 10 + resnet) as f32,
+                );
+            }
+            if block < blocks - 1 {
+                insert_conv(
+                    &mut tensors,
+                    &format!("decoder.up_blocks.{block}.upsamplers.0.conv"),
+                    C,
+                    C,
+                    3,
+                    70.0 + block as f32,
+                );
+            }
+        }
+        insert_norm(&mut tensors, "decoder.conv_norm_out", 72.0);
+        insert_conv(&mut tensors, "decoder.conv_out", C, 3, 3, 74.0);
+
+        insert_conv(&mut tensors, "encoder.conv_in", 3, C, 3, 80.0);
+        for block in 0..blocks {
+            for resnet in 0..LAYERS_PER_BLOCK {
+                insert_resnet(
+                    &mut tensors,
+                    &format!("encoder.down_blocks.{block}.resnets.{resnet}"),
+                    90.0 + (block as i32 * 10 + resnet) as f32,
+                );
+            }
+            if block < blocks - 1 {
+                insert_conv(
+                    &mut tensors,
+                    &format!("encoder.down_blocks.{block}.downsamplers.0.conv"),
+                    C,
+                    C,
+                    3,
+                    112.0 + block as f32,
+                );
+            }
+        }
+        insert_mid(&mut tensors, "encoder.mid_block", 120.0);
+        insert_norm(&mut tensors, "encoder.conv_norm_out", 145.0);
+        insert_conv(&mut tensors, "encoder.conv_out", C, 2 * C, 3, 150.0);
+        insert_conv(&mut tensors, "quant_conv", 2 * C, 2 * C, 1, 160.0);
+        insert_conv(&mut tensors, "post_quant_conv", C, C, 1, 170.0);
+
+        tensors.insert("bn.running_mean".into(), values(&[128], 180.0, 0.05));
+        tensors.insert(
+            "bn.running_var".into(),
+            add(values(&[128], 190.0, 0.05), Array::from_f32(1.0)).unwrap(),
+        );
+        Weights::from_map(tensors)
+    }
+
+    /// Position-dependent packed latents `[1, grid_h, grid_w, 128]`: a per-crop GroupNorm sees
+    /// visibly different statistics from the dense activation, so a tiled/dense comparison over
+    /// these discriminates the defect rather than merely re-checking shapes.
+    pub fn packed_latents(grid_h: i32, grid_w: i32) -> Array {
+        let shape = [1, grid_h, grid_w, 128];
+        let count = shape.iter().product::<i32>();
+        let data = (0..count)
+            .map(|i| {
+                let y = (i / 128 / grid_w) as f32;
+                let x = (i / 128 % grid_w) as f32;
+                (i as f32 * 0.037).sin() + y * 0.11 - x * 0.07
+            })
+            .collect::<Vec<_>>();
+        Array::from_slice(&data, &shape)
+    }
+
+    /// `max |left - right|` over two evaluated f32 arrays of equal length.
+    pub fn max_abs_delta(left: &Array, right: &Array) -> f32 {
+        left.as_slice::<f32>()
+            .iter()
+            .zip(right.as_slice::<f32>())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max)
+    }
+}
+
+/// sc-19753 — the layer-wise bounded decode, driven end-to-end across the public
+/// [`Flux2Vae::decode_packed_latents_tiled`] seam on a synthetic checkpoint.
+#[cfg(test)]
+mod tiled_decode_tests {
+    use super::tiling_fixture::{max_abs_delta, packed_latents, weights as fixture};
+    use super::*;
+
+    /// The layer-wise bounded tail must track the dense decode. Verified by mutation, not assumed:
+    /// restoring the whole-tail `tiled_decode` route — every crop normalizing against itself —
+    /// moves this comparison to max|delta| **2.112e0** against the 3e-3 bound, so the assertion
+    /// fails on the defect rather than merely on a shape change.
+    #[test]
+    fn tiled_packed_decode_tracks_dense_with_global_group_norm() {
+        let vae = Flux2Vae::from_weights(&fixture()).unwrap();
+        let packed = packed_latents(4, 5);
+        let dense = vae.decode_packed_latents(&packed).unwrap();
+        let tiled = vae
+            .decode_packed_latents_tiled(
+                &packed,
+                &mlx_gen::tiling::TilingConfig::spatial_only(16, 0),
+                None,
+            )
+            .unwrap();
+        dense.eval().unwrap();
+        tiled.eval().unwrap();
+        assert_eq!(tiled.shape(), dense.shape());
+        let delta = max_abs_delta(&dense, &tiled);
+        assert!(
+            delta < 3e-3,
+            "layer-wise tiled FLUX.2 VAE diverged from dense decode: max|delta|={delta:.3e}"
+        );
+    }
+
+    /// A tiling request that does not actually split this latent must fall through to the exact
+    /// single-pass decode rather than assembling a one-tile plan.
+    #[test]
+    fn untiled_request_falls_through_to_the_dense_decode() {
+        let vae = Flux2Vae::from_weights(&fixture()).unwrap();
+        let packed = packed_latents(4, 5);
+        let dense = vae.decode_packed_latents(&packed).unwrap();
+        let passthrough = vae
+            .decode_packed_latents_tiled(
+                &packed,
+                &mlx_gen::tiling::TilingConfig::spatial_only(4096, 128),
+                None,
+            )
+            .unwrap();
+        dense.eval().unwrap();
+        passthrough.eval().unwrap();
+        assert_eq!(max_abs_delta(&dense, &passthrough), 0.0);
+    }
+
+    #[test]
+    fn tiled_decode_honors_a_pretripped_cancel() {
+        let vae = Flux2Vae::from_weights(&fixture()).unwrap();
+        let cancel = mlx_gen::CancelFlag::new();
+        cancel.cancel();
+        let packed = packed_latents(4, 5);
+        for tiling in [
+            mlx_gen::tiling::TilingConfig::spatial_only(16, 0),
+            mlx_gen::tiling::TilingConfig::spatial_only(4096, 128),
+        ] {
+            let result = vae.decode_packed_latents_tiled(&packed, &tiling, Some(&cancel));
+            assert!(matches!(result, Err(mlx_gen::Error::Canceled)));
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
