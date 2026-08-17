@@ -5,7 +5,8 @@
 //! (`dit_parity` / `dit_real_parity`, which run with the default [`DitMemoryConfig::OFF`]) keeps
 //! covering correctness while production runs with the levers on. Two equivalence classes, asserted
 //! separately (measured on the tiny fixture, f32 compute):
-//!   * **`eval_per_block` is exactly bit-identical** (max|Δ| == 0) — it only forces materialization.
+//!   * **the graph-evaluation cadence is exactly bit-identical** (max|Δ| == 0) — it only forces
+//!     materialization.
 //!     This is the dominant memory lever, so the production memory win is bit-exact.
 //!   * **The sequence-chunking levers are numerically equivalent** (cosine ≥ 0.9999999, max|Δ| ~1e-3)
 //!     — MLX's Metal GEMM / SDPA kernels are tile-specialized by the row (M) dimension, so a
@@ -24,9 +25,17 @@
 
 use std::path::PathBuf;
 
+use mlx_gen::gen_core::{FfnChunk, GraphEvalCadence};
 use mlx_gen::weights::Weights;
 use mlx_gen_scail2::{Scail2Config, Scail2Dit, Scail2Inputs};
 use mlx_gen_wan::DitMemoryConfig;
+
+/// The tiny FFN chunk (< the tiny sequence length) that fires the multi-block + ragged-remainder
+/// paths, as a compile-time non-zero.
+const THREE: std::num::NonZeroU32 = match std::num::NonZeroU32::new(3) {
+    Some(rows) => rows,
+    None => unreachable!(),
+};
 use mlx_rs::{Array, Dtype};
 
 fn parity_dir() -> PathBuf {
@@ -65,7 +74,7 @@ fn compare(a: &Array, b: &Array) -> (f32, f32) {
 /// in f32 compute (the parity-gate dtype), across all four conditioning cases.
 ///
 /// Two equivalence classes, distinguished honestly:
-///   * **`eval_per_block` is exactly bit-identical** (max|Δ| == 0) — it only forces materialization,
+///   * **the graph-evaluation cadence is exactly bit-identical** (max|Δ| == 0) — it only forces materialization,
 ///     it never touches a value. This is the dominant memory lever, so the production memory win is
 ///     bit-exact.
 ///   * **The sequence-chunking levers (`ffn_seq_chunk` / `attn_query_chunk`) are numerically
@@ -97,7 +106,7 @@ fn chunking_matches_unchunked() {
         (
             "eval_only",
             DitMemoryConfig {
-                eval_per_block: true,
+                eval_cadence: Some(GraphEvalCadence::EVERY_BLOCK),
                 ..off
             },
             true,
@@ -105,7 +114,7 @@ fn chunking_matches_unchunked() {
         (
             "ffn_only",
             DitMemoryConfig {
-                ffn_seq_chunk: Some(3),
+                ffn_seq_chunk: Some(FfnChunk::from_nonzero(THREE)),
                 ..off
             },
             false,
@@ -121,8 +130,8 @@ fn chunking_matches_unchunked() {
         (
             "prod(ffn+eval)",
             DitMemoryConfig {
-                ffn_seq_chunk: Some(3),
-                eval_per_block: true,
+                ffn_seq_chunk: Some(FfnChunk::from_nonzero(THREE)),
+                eval_cadence: Some(GraphEvalCadence::EVERY_BLOCK),
                 ..off
             },
             false,
@@ -130,9 +139,9 @@ fn chunking_matches_unchunked() {
         (
             "all",
             DitMemoryConfig {
-                ffn_seq_chunk: Some(3),
+                ffn_seq_chunk: Some(FfnChunk::from_nonzero(THREE)),
                 attn_query_chunk: Some(3),
-                eval_per_block: true,
+                eval_cadence: Some(GraphEvalCadence::EVERY_BLOCK),
             },
             false,
         ),

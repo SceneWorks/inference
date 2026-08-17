@@ -16,7 +16,7 @@
 
 use candle_gen::candle_core::{Device, IndexOp, Tensor};
 use candle_gen::gen_core::sampling::{schedule_sigmas, DiscreteModelSampling, Scheduler};
-use candle_gen::gen_core::Image;
+use candle_gen::gen_core::{CfgBatching, GenerationRequest, Image};
 use candle_gen::{CandleError, LatentDecoder, Result};
 use candle_gen_pid::PidDecoder;
 use candle_transformers::models::stable_diffusion::vae::AutoEncoderKL;
@@ -121,6 +121,33 @@ pub(crate) fn to_image(img: &Tensor) -> Result<Image> {
     })
 }
 
+/// The CFG batching modes this lane implements (sc-18317) — the doubled `[uncond, cond]` batch, and
+/// nothing else. Published on the registered `kolors` descriptor's `Capabilities::execution`.
+pub(crate) const CFG_BATCHING_MODES: [CfgBatching; 1] = [CfgBatching::Batched];
+
+/// The mode one request runs: its explicit selection, or this lane's own convention when unset.
+///
+/// `None` ⇒ [`CfgBatching::Batched`], exactly what every Kolors candle denoise did before sc-18317,
+/// so an untouched request is byte-for-byte unaffected.
+pub(crate) fn resolve_cfg_batching(req: &GenerationRequest) -> CfgBatching {
+    req.memory
+        .and_then(|memory| memory.cfg_batching)
+        .unwrap_or(CfgBatching::Batched)
+}
+
+/// Fail closed on a batching mode this lane does not implement.
+fn require_batched_cfg(batching: CfgBatching) -> Result<()> {
+    if batching.is_batched() {
+        return Ok(());
+    }
+    Err(CandleError::Msg(format!(
+        "kolors: cfg_batching={} is not implemented — the ChatGLM3 conditioning and the vendored \
+         SDXL denoise run guidance as one [uncond, cond] batch. Select cfg_batching=batched, or \
+         leave memory.cfg_batching unset.",
+        batching.label()
+    )))
+}
+
 /// CFG-batch a prompt / negative pair into `(context, pooled, batch)` using the caller's ChatGLM3
 /// `encode` closure. The two Kolors bespoke providers ([`crate::control`] / [`crate::ip_provider`])
 /// and txt2img all share this exact structure — encode the positive prompt, and under CFG encode the
@@ -130,15 +157,24 @@ pub(crate) fn to_image(img: &Tensor) -> Result<Image> {
 /// The ChatGLM3 encode itself stays at the call site (as `encode`) so each site keeps its exact
 /// tokenizer/encoder plumbing — txt2img threads `Components`, the two providers borrow `&self` fields.
 /// This helper owns ONLY the CFG concat convention, which was identical across the three.
+///
+/// `batching` is the request's resolved [`CfgBatching`] mode (sc-18317). This lane implements
+/// [`CfgBatching::Batched`] only — the `cat` above IS the guided path, and the vendored SDXL UNet
+/// downstream chunks one forward's output into its uncond/cond halves. A `Sequential` mode is refused
+/// here rather than quietly batched, which matters most for the two **unregistered** bespoke
+/// providers ([`crate::control`] / [`crate::ip_provider`]): they are driven directly by the worker and
+/// have no `Capabilities` surface, so this guard is the only refusal they get.
 pub(crate) fn cfg_batch_context<F>(
     prompt: &str,
     negative: &str,
     use_guide: bool,
+    batching: CfgBatching,
     mut encode: F,
 ) -> Result<(Tensor, Tensor, usize)>
 where
     F: FnMut(&str) -> Result<(Tensor, Tensor)>,
 {
+    require_batched_cfg(batching)?;
     let (pos_ctx, pos_pooled) = encode(prompt)?;
     if use_guide {
         let (neg_ctx, neg_pooled) = encode(negative)?;
@@ -296,7 +332,8 @@ mod tests {
         };
 
         // With guidance: batch == 2, uncond-first (neg row before pos row).
-        let (ctx, pooled, batch) = cfg_batch_context("pos", "neg", true, enc).unwrap();
+        let (ctx, pooled, batch) =
+            cfg_batch_context("pos", "neg", true, CfgBatching::Batched, enc).unwrap();
         assert_eq!(batch, 2);
         assert_eq!(ctx.dims(), &[2, 256, 4096]);
         assert_eq!(pooled.dims(), &[2, 4096]);
@@ -306,9 +343,81 @@ mod tests {
         assert_eq!(p[1][0], 1.0);
 
         // Without guidance: batch == 1, positive-only.
-        let (ctx1, _pooled1, batch1) = cfg_batch_context("pos", "neg", false, enc).unwrap();
+        let (ctx1, _pooled1, batch1) =
+            cfg_batch_context("pos", "neg", false, CfgBatching::Batched, enc).unwrap();
         assert_eq!(batch1, 1);
         assert_eq!(ctx1.dims(), &[1, 256, 4096]);
+    }
+
+    // --- sc-18317: the typed CFG-batching domain ------------------------------------------------
+
+    /// **Default preservation.** An unset selection resolves to this lane's own pre-story convention,
+    /// so every existing render is byte-for-byte unaffected.
+    #[test]
+    fn unset_cfg_batching_resolves_to_this_lanes_own_convention() {
+        let bare = GenerationRequest::default();
+        assert_eq!(resolve_cfg_batching(&bare), CfgBatching::Batched);
+        let ladder = GenerationRequest {
+            memory: Some(candle_gen::gen_core::GenerationMemory {
+                tile_vae_decode: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(resolve_cfg_batching(&ladder), CfgBatching::Batched);
+        for mode in CfgBatching::ALL {
+            let selected = GenerationRequest {
+                memory: Some(candle_gen::gen_core::GenerationMemory {
+                    cfg_batching: Some(mode),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert_eq!(resolve_cfg_batching(&selected), mode);
+        }
+    }
+
+    /// **Fail closed at the shared assembly**, which for the two unregistered bespoke providers is the
+    /// only refusal there is. The declared mode must still run, so the guard is specific.
+    #[test]
+    fn cfg_batch_context_refuses_an_unimplemented_mode() {
+        let d = cpu();
+        let enc = |_p: &str| -> Result<(Tensor, Tensor)> {
+            Ok((
+                Tensor::full(1.0f32, (1, 4, 8), &d)?,
+                Tensor::full(1.0f32, (1, 8), &d)?,
+            ))
+        };
+        let unimplemented = CfgBatching::Sequential;
+        assert!(!CFG_BATCHING_MODES.contains(&unimplemented));
+        let message = cfg_batch_context("pos", "neg", true, unimplemented, enc)
+            .expect_err("an unimplemented mode must be refused")
+            .to_string();
+        assert!(
+            message.contains("cfg_batching=sequential"),
+            "the refusal must name the rejected mode: {message}"
+        );
+        assert!(
+            message.contains("cfg_batching=batched"),
+            "the refusal must name the remedy: {message}"
+        );
+
+        // Even with guidance OFF (where no concat happens at all) the mode is still checked: a mode
+        // the lane cannot honour must not be admitted just because this request would not have used
+        // the batched path.
+        assert!(cfg_batch_context("pos", "neg", false, unimplemented, enc).is_err());
+    }
+
+    /// The registered descriptor's declared domain and this assembly's guard must be the same set.
+    #[test]
+    fn the_declared_cfg_domain_is_exactly_what_the_assembly_accepts() {
+        for mode in CfgBatching::ALL {
+            assert_eq!(
+                CFG_BATCHING_MODES.contains(&mode),
+                require_batched_cfg(mode).is_ok(),
+                "{mode:?}: declaration and consumption disagree"
+            );
+        }
     }
 
     #[test]

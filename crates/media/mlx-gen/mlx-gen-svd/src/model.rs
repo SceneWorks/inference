@@ -117,6 +117,7 @@ pub fn descriptor() -> ModelDescriptor {
             supported_quants: &[],
             component_precision_floors: &[],
             size_floor: SizeFloor::RangeChecked,
+            execution: Default::default(),
         },
     }
 }

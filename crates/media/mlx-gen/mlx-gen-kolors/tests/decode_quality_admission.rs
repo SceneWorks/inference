@@ -248,6 +248,7 @@ fn production_latent_quality_admission() {
                     &mut |_: Progress| {},
                     &PreviewSink::default(),
                     mlx_gen_sdxl::SdxlForwardPlan::UNBOUNDED,
+                    mlx_gen::gen_core::CfgBatching::Batched,
                 )
                 .expect("production denoise");
             latent.eval().expect("eval production latent");

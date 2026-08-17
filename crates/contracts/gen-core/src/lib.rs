@@ -19,6 +19,7 @@ pub mod caption;
 pub mod control;
 pub mod encoder_contract;
 pub mod error;
+pub mod execution_domains;
 pub mod face;
 pub mod generator;
 pub mod guidance;
@@ -71,6 +72,10 @@ pub use encoder_contract::{
     EncoderTokenizerDisposition, ValidatedEncoderSource, ValidatedTokenizerSource,
 };
 pub use error::{Error, Result};
+pub use execution_domains::{
+    CfgBatching, CfgBatchingDomain, ExecutionSurface, ExecutionValueDomain, FfnChunk,
+    GraphEvalCadence,
+};
 pub use face::{DetectedFace, FaceEmbedder, FaceEmbedderDescriptor};
 pub use generator::{
     default_seed, effective_component_quant, ActivationMemoryAnchor, AudioEditMode, AudioEditRef,

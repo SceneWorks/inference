@@ -1601,6 +1601,7 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             audio_languages: vec![],
             audio_edit_modes: vec![],
             size_floor: SizeFloor::RangeChecked,
+            execution: Default::default(),
         },
     }
 }

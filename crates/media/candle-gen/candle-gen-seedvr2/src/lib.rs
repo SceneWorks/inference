@@ -110,6 +110,7 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             supported_quants: &[Quant::Q4, Quant::Q8], // Linear-only DiT quant (sc-5927)
             component_precision_floors: &[],
             size_floor: SizeFloor::RangeChecked,
+            execution: Default::default(),
         },
     }
 }

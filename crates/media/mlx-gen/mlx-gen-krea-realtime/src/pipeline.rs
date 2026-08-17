@@ -166,6 +166,7 @@ pub fn descriptor() -> ModelDescriptor {
             // z16 VAE stride 8 × the Wan DiT's 2×2 latent patch: explicit dimensions must land
             // on a 16px grid or integer division would silently render a smaller clip.
             size_floor: SizeFloor::RangeCheckedOnGrid { multiple: 16 },
+            execution: Default::default(),
         },
     }
 }
