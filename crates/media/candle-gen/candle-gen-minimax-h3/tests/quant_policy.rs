@@ -21,8 +21,17 @@
 //! That makes this file a *one-directional* guard, and the direction is the safe one: it cannot
 //! notice the converter growing a new pack target, but it does prove that every tensor this lane
 //! reads either has a packed path or **refuses loudly**. A converter that packed something new would
-//! hit `guard_dense` at load rather than rendering garbage, which is the sc-14980 outcome that
-//! matters. The MLX-side test owns the other direction.
+//! hit a refusal at load rather than rendering garbage, which is the sc-14980 outcome that matters.
+//! The MLX-side test owns the other direction.
+//!
+//! # Scope: this crate's OWN loaders
+//!
+//! The DiT and the Qwen3 decoder half of the text encoder load through [`lin`] / [`embed`] /
+//! [`guard_dense`] here. The Qwen3-VL **vision tower** does not — it is
+//! `candle_gen_boogu::vision::VisionTower`, with its own packed detect and its own dense-by-policy
+//! refusals, tested at the tower in that crate. This file therefore covers the keys this crate
+//! actually routes, and says so rather than reaching across the boundary to assert a guard the
+//! production vision path never calls.
 //!
 //! # The sets, transcribed from `mlx_gen_minimax_h3::convert` (verified at `c7c215c25`)
 //!
@@ -33,7 +42,9 @@
 //!   `.final_norm`.
 //! * `TE_DENSE_BY_POLICY` — text encoder, suffix-matched, and it **wins** over the pack list:
 //!   `.input_layernorm`, `.post_attention_layernorm`, `.q_norm`, `.k_norm`, `.norm`, `.norm1`,
-//!   `.norm2`, `.pos_embed`, `.patch_embed.proj`.
+//!   `.norm2`, `.pos_embed`, `.patch_embed.proj`. The last four of those are **vision** keys, loaded
+//!   by `candle_gen_boogu::vision::VisionTower` and guarded there rather than here — see
+//!   [`TE_DENSE_KEYS`].
 //! * `TE_PACK_SUFFIXES` — text encoder, suffix-matched: the seven Qwen3 decoder projections
 //!   (`.self_attn.{q,k,v,o}_proj`, `.mlp.{gate,up,down}_proj`), `.embed_tokens`, and the four
 //!   Qwen3-VL vision entries `.attn.qkv`, `.attn.proj`, `.linear_fc1`, `.linear_fc2`.
@@ -156,23 +167,28 @@ const TE_PACKED_KEYS: &[&str] = &[
     "model.visual.deepstack_merger_list.0.linear_fc1",
 ];
 
-/// Every base `TE_DENSE_BY_POLICY` keeps dense in **every** tier.
+/// Every base `TE_DENSE_BY_POLICY` keeps dense in **every** tier **that this crate's own loaders
+/// read through [`guard_dense`]** — i.e. the Qwen3 decoder's norms.
 ///
-/// `.pos_embed` and `.patch_embed.proj` are the two the shared vision tower reads with a raw
-/// accessor, which is why they are NAMED in the dense list rather than merely unreached by the pack
-/// list — the sc-14980 guard the MLX side pins as
-/// `pos_embed_is_dense_by_policy_not_by_shape`.
+/// # The vision keys are deliberately NOT in this list
+///
+/// `.pos_embed`, `.patch_embed.proj` and the vision `norm*` are also `TE_DENSE_BY_POLICY` members,
+/// but this crate never calls `guard_dense` for them: they are loaded by
+/// `candle_gen_boogu::vision::VisionTower`, which owns its own refusal (`require_dense`) at each of
+/// the three sites. Asserting them here would prove a guard that production never reaches for those
+/// keys — a green test over a path that does not exist, which is worse than no test because it reads
+/// as coverage.
+///
+/// They are covered where they actually run, at the tower, by
+/// `candle-gen-boogu/src/vision/mod.rs`'s `packed_pos_embed_is_refused_rather_than_silently_cast_to_floats`,
+/// `packed_vision_norm_is_refused` and `packed_patch_embed_is_still_rejected` — all three driving
+/// `VisionTower::load` rather than a standalone helper.
 const TE_DENSE_KEYS: &[&str] = &[
     "model.language_model.layers.0.input_layernorm",
     "model.language_model.layers.0.post_attention_layernorm",
     "model.language_model.layers.0.self_attn.q_norm",
     "model.language_model.layers.0.self_attn.k_norm",
     "model.language_model.norm",
-    "model.visual.blocks.0.norm1",
-    "model.visual.blocks.0.norm2",
-    "model.visual.merger.norm",
-    "model.visual.pos_embed",
-    "model.visual.patch_embed.proj",
 ];
 
 /// The DiT's `DENSE_BY_POLICY` — matched exactly, and dense in every tier.

@@ -3038,8 +3038,14 @@ mod tests {
     /// staged path (not `root/transformer`, which is also present and dense), and `requested_tier()`
     /// must be `Q4`. A resolver that fell back to the root would produce a different path, and a
     /// mapping that dropped the request would produce `None`.
+    ///
+    /// **Resolution and reconcile only** — the name says so deliberately. The staged shards here are
+    /// empty stubs, so nothing is decoded and no packed tensor is built; what is proven is that the
+    /// request selects the tier, the on-disk marker is read, and a disagreeing tier is refused. The
+    /// packed *load* is proven where weights exist: `tests/quant_policy.rs` drives real MLX triples
+    /// through `crate::quant`, and the boogu tower tests drive the vision half.
     #[test]
-    fn a_q4_request_resolves_the_q4_tier_and_loads_packed() {
+    fn a_q4_request_resolves_and_reconciles_the_q4_tier() {
         let tmp = tempfile::tempdir().unwrap();
         // A complete flat DENSE snapshot, plus a packed q4 DiT staged elsewhere. The two disagree, so
         // whichever one the provider resolved is observable.

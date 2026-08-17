@@ -40,9 +40,16 @@
 //!   shape** even though it is a declared pack target. The per-tensor auto-detect handles this with
 //!   no special case: some projections land packed, others dense, in the same load.
 //! - **`patch_embed.proj`, `pos_embed` and every `norm` stay dense by converter *policy***
-//!   (`TE_DENSE_BY_POLICY`), in every tier. Their dense loads *and* their `.scales` refusal guards
-//!   are the sc-14980 protection and are deliberately left untouched — a `.scales` sibling on one of
-//!   those keys means the snapshot is not a shape this code can read, so it still fails loudly.
+//!   (`TE_DENSE_BY_POLICY`), in every tier, and each of the three is fronted by a `.scales` refusal
+//!   (`require_dense`) so a snapshot that violates that policy fails loudly instead of reading
+//!   codes as floats.
+//!
+//!   Only `patch_embed.proj` carried such a guard before this change. `pos_embed` and the norms were
+//!   bare [`Weights::get_f32`] calls — and `get_f32` is `load_native(..).to_dtype(F32)`, so a u32
+//!   code stream was **silently cast** to floats with no shape check able to notice. That is
+//!   precisely the sc-14980 Mage `pos_embed` failure, and teaching this tower to load packed tiers is
+//!   what turned packed vision input from exotic into ordinary. The guard is now one helper applied
+//!   at all three sites rather than one inline check at one of them.
 //!
 //! The projections are read with [`Weights::get_native`] on the packed path (an f32 cast would
 //! reinterpret the bit-packed nibbles) and asserted `U32`; everything on the dense path keeps using
@@ -110,9 +117,38 @@ impl VisionConfig {
 
 /// Affine LayerNorm over the last dim (eps 1e-6), built from a `Weights` `{prefix}.weight`/`.bias`.
 fn layer_norm(w: &Weights, prefix: &str) -> Result<LayerNorm> {
+    require_dense(
+        w,
+        prefix,
+        "a LayerNorm is a 1-D affine pair, not a projection",
+    )?;
     let weight = w.get_f32(&format!("{prefix}.weight"))?;
     let bias = w.get_f32(&format!("{prefix}.bias"))?;
     Ok(LayerNorm::new(weight, bias, LN_EPS))
+}
+
+/// Refuse a **packed** tensor at a loader that has no packed path (sc-14980).
+///
+/// The dense-by-policy keys — `patch_embed.proj`, `pos_embed` and every `norm` — are read with
+/// [`Weights::get_f32`], and that is exactly what makes an unguarded one dangerous: `get_f32` is
+/// `load_native(..).to_dtype(F32)`, so a u32 code stream is **silently cast** to floats. No shape
+/// check downstream can see it, the tower runs, and the output is quietly wrong. That is the
+/// sc-14980 Mage `pos_embed` failure, and packed vision input stopped being exotic the moment this
+/// tower learned to load a packed text-encoder tier.
+///
+/// Gated on `w.packed().is_some()` as well as the `.scales` sibling, so a *dense* component that
+/// merely happens to carry a similarly-named tensor is untouched — the marker is what makes the
+/// sibling mean "packed".
+fn require_dense(w: &Weights, base: &str, why: &str) -> Result<()> {
+    if w.packed().is_some() && w.contains(&format!("{base}.scales")) {
+        return Err(candle_gen::candle_core::Error::Msg(format!(
+            "boogu: `{base}` has a `.scales` sibling in a packed component, but it is loaded by a \
+             dense-only path — the MLX converter's `TE_DENSE_BY_POLICY` keeps `patch_embed.proj`, \
+             `pos_embed` and every norm dense in EVERY tier ({why}). Reading its u32 codes as floats \
+             is silent garbage (sc-14980), so this snapshot is refused rather than rendered."
+        )));
+    }
+    Ok(())
 }
 
 /// Load one vision projection — **packed** straight from the MLX triple when the component declares
@@ -311,19 +347,18 @@ impl VisionTower {
     ///
     /// The **projections** packed-detect per tensor (`vision_linear`); `patch_embed.proj`,
     /// `pos_embed` and the norms load dense unconditionally because the MLX converter's
-    /// `TE_DENSE_BY_POLICY` keeps them dense in *every* tier, and their `.scales` guards below stay in
-    /// place so a snapshot that violates that policy fails loudly rather than reading codes as floats.
+    /// `TE_DENSE_BY_POLICY` keeps them dense in *every* tier, and all three are fronted by
+    /// `require_dense` so a snapshot that violates that policy fails loudly rather than having its
+    /// codes silently cast to floats by [`Weights::get_f32`].
     pub fn load(w: &Weights, cfg: VisionConfig, prefix: &str) -> Result<Self> {
         // `patch_embed.proj` is dense in every tier by converter policy (`TE_DENSE_BY_POLICY`), and
         // this 5-D conv fold cannot read a packed code stream anyway — so a `.scales` sibling here is
         // a snapshot this loader must refuse, not a shape to support (sc-9410, Issue 1; sc-14980).
-        if w.packed().is_some() && w.contains(&format!("{prefix}.patch_embed.proj.scales")) {
-            return Err(candle_gen::candle_core::Error::Msg(format!(
-                "boogu: `{prefix}.patch_embed.proj` has a `.scales` sibling in a packed component — \
-                 the vision tower is bf16 in the hosted tiers; a packed vision tower is unsupported \
-                 by this dense conv fold (sc-9410)."
-            )));
-        }
+        require_dense(
+            w,
+            &format!("{prefix}.patch_embed.proj"),
+            "this 5-D conv fold cannot read a packed code stream anyway, sc-9410",
+        )?;
         // Fold the Conv3d patch-embed weight `[embed, in, t, ph, pw]` → `[embed, in·t·ph·pw]` so the
         // full-kernel conv runs as a per-patch matmul; keep its bias.
         let conv = w.get_f32(&format!("{prefix}.patch_embed.proj.weight"))?;
@@ -349,6 +384,14 @@ impl VisionTower {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
+
+        // The sc-14980 key itself. `get_f32` would cast a u32 code stream to floats without a word,
+        // and nothing downstream of here can tell the difference.
+        require_dense(
+            w,
+            &format!("{prefix}.pos_embed"),
+            "it is an interpolated position table, read densely and never projected",
+        )?;
 
         Ok(Self {
             patch_embed,
@@ -1001,6 +1044,115 @@ mod tests {
             msg.contains("patch_embed.proj"),
             "the refusal must name the offending key, got: {msg}"
         );
+        Ok(())
+    }
+
+    /// **A packed `pos_embed` is refused — the sc-14980 key itself.**
+    ///
+    /// This is the guard that did NOT exist until the packed-tier work landed, and its absence was
+    /// the dangerous kind: `pos_embed` is read with [`Weights::get_f32`], which is
+    /// `load_native(..).to_dtype(F32)`, so a u32 code stream was **silently cast** to floats. Nothing
+    /// downstream could notice — the shape is unchanged, the tower runs, the output is quietly wrong.
+    ///
+    /// Driven at the TOWER, i.e. the production path `VisionTower::load` really takes. A test against
+    /// a standalone guard helper would prove the helper works while production never called it, which
+    /// is exactly the gap this closes.
+    #[test]
+    fn packed_pos_embed_is_refused_rather_than_silently_cast_to_floats() -> Result<()> {
+        let p = TINY_PREFIX;
+        let mut map = tiny_dense_map();
+        let (wq, scales, biases, _grid) = q4_pack(TINY_HIDDEN, 32, 0);
+        // The FULL triple, including u32 codes over the dense `pos_embed.weight`, so this fixture is
+        // the real silent-cast shape rather than a bare marker.
+        map.insert(format!("{p}.pos_embed.weight"), wq);
+        map.insert(format!("{p}.pos_embed.scales"), scales);
+        map.insert(format!("{p}.pos_embed.biases"), biases);
+
+        let (_dir, w) = weights_from(&map, Some(G), DType::BF16);
+        let err = VisionTower::load(&w, tiny_cfg(), p)
+            .err()
+            .expect("a packed pos_embed must be refused, not read as floats");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("pos_embed"),
+            "the refusal must name the offending key, got: {msg}"
+        );
+        assert!(
+            msg.contains("sc-14980"),
+            "the refusal must cite the silent-garbage class it exists to prevent, got: {msg}"
+        );
+
+        // **The hazard is real, not hypothetical**: the same codes under `get_f32` come back as a
+        // plausible float tensor of the RIGHT SHAPE, with no error at all. That is what the guard
+        // above is standing in front of.
+        let silently_cast = w.get_f32(&format!("{p}.pos_embed.weight"))?;
+        assert_eq!(
+            silently_cast.dtype(),
+            DType::F32,
+            "get_f32 casts u32 codes to floats without complaint — the whole reason for the guard"
+        );
+        Ok(())
+    }
+
+    /// **A packed vision `norm` is refused**, at the tower.
+    ///
+    /// `layer_norm` is the shared loader behind every `norm1` / `norm2` / merger norm, so guarding it
+    /// there covers all of them at once. Same silent-cast exposure as `pos_embed`: a LayerNorm is a
+    /// 1-D affine pair read with `get_f32`, and `TE_DENSE_BY_POLICY` keeps norms dense in every tier.
+    #[test]
+    fn packed_vision_norm_is_refused() -> Result<()> {
+        let p = TINY_PREFIX;
+        let mut map = tiny_dense_map();
+        let (_wq, scales, biases, _grid) = q4_pack(TINY_HIDDEN, 32, 0);
+        map.insert(format!("{p}.blocks.0.norm1.scales"), scales);
+        map.insert(format!("{p}.blocks.0.norm1.biases"), biases);
+
+        let (_dir, w) = weights_from(&map, Some(G), DType::BF16);
+        let err = VisionTower::load(&w, tiny_cfg(), p)
+            .err()
+            .expect("a packed vision norm must be refused");
+        assert!(
+            err.to_string().contains("norm1"),
+            "the refusal must name the offending key, got: {err}"
+        );
+        Ok(())
+    }
+
+    /// The guards key off the component's **`quantization` marker**, not off the tensor name alone —
+    /// so an unmarked (genuinely dense) component is loaded even if it happens to carry a
+    /// `.scales`-suffixed tensor. Without this the three refusals above could pass by refusing
+    /// everything, and `require_dense` would disagree with `vision_linear`, whose packed detect is
+    /// gated on the same marker: one would refuse the component while the other read it dense.
+    ///
+    /// The fixture is the discriminating one — a `.scales` sibling on a dense-by-policy key in a
+    /// component with **no marker**. Dropping the `w.packed().is_some()` half of the condition reds
+    /// this and nothing else.
+    #[test]
+    fn the_dense_by_policy_guards_are_gated_on_the_marker_not_the_tensor_name() -> Result<()> {
+        let p = TINY_PREFIX;
+        let mut map = tiny_dense_map();
+        let (_wq, scales, biases, _grid) = q4_pack(TINY_HIDDEN, 32, 0);
+        map.insert(format!("{p}.pos_embed.scales"), scales);
+        map.insert(format!("{p}.pos_embed.biases"), biases);
+
+        // `None` ⇒ no `quantization` block is written, so the component is dense however its tensors
+        // happen to be named.
+        let (_dir, w) = weights_from(&map, None, DType::F32);
+        VisionTower::load(&w, tiny_cfg(), p).expect(
+            "an UNMARKED component is dense by definition — the guards must not fire on a stray \
+             `.scales` name, or they would disagree with vision_linear's own marker-gated detect",
+        );
+        Ok(())
+    }
+
+    /// A fully dense, unmarked component still loads with every guard in place — the control for the
+    /// three refusals above.
+    #[test]
+    fn the_dense_by_policy_guards_do_not_fire_on_a_dense_component() -> Result<()> {
+        let p = TINY_PREFIX;
+        let (_dir, w) = weights_from(&tiny_dense_map(), None, DType::F32);
+        VisionTower::load(&w, tiny_cfg(), p)
+            .expect("a dense component must load with every dense-by-policy guard in place");
         Ok(())
     }
 }
