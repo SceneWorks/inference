@@ -51,12 +51,13 @@
 //! surviving clone to prove the gate is not vacuous.
 
 use candle_gen::candle_core::{DType, Tensor};
+use candle_gen::quant::AdaptLinear;
 use candle_gen::{CandleError, Result, Weights};
 
 use crate::dit::config::{MiniMaxH3DitConfig, MODALITY_NUM, MODULATION_PARAMS};
 use crate::dit::layers::{DitAttention, DitFeedForward, LinearNoBias, RmsNorm};
 use crate::dit::rope::{MmRope, MmRopeTables};
-use crate::nn::{linear, silu};
+use crate::nn::silu;
 
 /// The six modulation vectors of one block, each `[num_timesteps · MODALITY_NUM, hidden_size]`.
 ///
@@ -107,10 +108,23 @@ impl AdaLnModulation {
 }
 
 /// `adaln_proj`: `time_embed_dim → 6 · MODALITY_NUM · hidden_size`.
+///
+/// # The second of the two loaders the tiers pack (sc-20267)
+///
+/// `adaln_proj.linear` is 39.2 % of the DiT (26.01 GB at bf16), so it is packed in every quantized
+/// tier — at its own width, because it is precomputed and evicted before step 0 (sc-17145) and
+/// therefore buys disk rather than denoise-resident memory. [`crate::quant::lin`] detects it on the
+/// `{prefix}.scales` sibling; a dense `bf16` tier takes the identical call unchanged.
 #[derive(Debug, Clone)]
 pub struct AdaLnProjection {
-    weight: Tensor,
-    bias: Tensor,
+    inner: AdaptLinear,
+    /// Device bytes the frozen base holds, recorded at load — a packed base has no dense weight to
+    /// measure afterwards. See [`crate::quant::TieredLinear`].
+    base_bytes: usize,
+    /// The dtype the projection computes in — the loader's compute dtype. Held explicitly because a
+    /// packed base has no dense weight to read it off, and the activation cast below is
+    /// load-bearing (see [`Self::forward`]).
+    compute_dtype: DType,
     hidden_size: usize,
 }
 
@@ -118,25 +132,31 @@ impl AdaLnProjection {
     /// The width of the timestep embedding this projection consumes — `time_embed_dim`, 2688
     /// shipped.
     ///
-    /// Read from the loaded tensor rather than from a config, so that
+    /// Read from the loaded projection rather than from a config, so that
     /// [`crate::dit::adaln::AdaLnCache`] validates a caller-supplied `temb` against the weights it
-    /// will actually be multiplied by.
+    /// will actually be multiplied by. On a packed base the shape is recovered from the `scales`,
+    /// so it is the loaded artifact's answer on every tier.
     pub fn time_embed_dim(&self) -> usize {
-        self.weight.dims()[1]
+        self.inner.in_features()
     }
 
     /// Columns emitted per timestep — `6 · MODALITY_NUM · hidden_size`, 96768 shipped.
     pub fn out_features(&self) -> usize {
-        self.weight.dims()[0]
+        self.inner.out_features()
     }
 
-    /// Device bytes this projection holds: weight + bias at their loaded dtype.
+    /// Device bytes this projection holds: the frozen base (packed blocks or dense weight) plus the
+    /// bias, which stays full-precision on either tier.
     ///
     /// The arithmetic the eviction lever is sized on — 50 × (96768·2688 + 96768) × 2 B =
-    /// **26_020_915_200 B (26.02 GB)** at bf16.
+    /// **26_020_915_200 B (26.02 GB)** at bf16, and correspondingly less on a packed tier.
     pub fn nbytes(&self) -> usize {
-        self.weight.elem_count() * self.weight.dtype().size_in_bytes()
-            + self.bias.elem_count() * self.bias.dtype().size_in_bytes()
+        self.base_bytes
+    }
+
+    /// Whether the base loaded from a **packed** (pre-quantized) tier.
+    pub fn is_packed(&self) -> bool {
+        self.inner.is_packed()
     }
 
     fn from_weights(
@@ -145,18 +165,19 @@ impl AdaLnProjection {
         cfg: &MiniMaxH3DitConfig,
         dtype: DType,
     ) -> Result<Self> {
-        let weight = w.require(&format!("{prefix}.weight"))?.to_dtype(dtype)?;
-        let bias = w.require(&format!("{prefix}.bias"))?.to_dtype(dtype)?;
-        let want = [cfg.adaln_out_features(), cfg.time_embed_dim];
-        if weight.dims() != want {
+        let loaded = crate::quant::lin(w, prefix, true, dtype)?;
+        let want = (cfg.adaln_out_features(), cfg.time_embed_dim);
+        let got = loaded.linear.base_shape();
+        if got != want {
             return Err(CandleError::Msg(format!(
-                "minimax-h3 dit {prefix}.weight: expected {want:?}, got {:?}",
-                weight.dims()
+                "minimax-h3 dit {prefix}.weight: expected [{}, {}], got [{}, {}]",
+                want.0, want.1, got.0, got.1
             )));
         }
         Ok(Self {
-            weight,
-            bias,
+            inner: loaded.linear,
+            base_bytes: loaded.base_bytes,
+            compute_dtype: dtype,
             hidden_size: cfg.hidden_size,
         })
     }
@@ -185,8 +206,8 @@ impl AdaLnProjection {
                 self.time_embed_dim()
             )));
         }
-        let activated = silu(temb)?.to_dtype(self.weight.dtype())?;
-        let projected = linear(&activated, &self.weight, &self.bias)?;
+        let activated = silu(temb)?.to_dtype(self.compute_dtype)?;
+        let projected = self.inner.forward_upcast(&activated)?;
 
         // `view(-1, 6·hidden)` BEFORE the chunk: modality becomes a row axis, not a column one.
         let rows = steps * MODALITY_NUM;
@@ -536,13 +557,22 @@ mod tests {
             ..MiniMaxH3DitConfig::default()
         };
         let out = cfg.adaln_out_features();
-        let w = Tensor::ones((out, 3), DType::F32, &dev).unwrap();
-        let b = Tensor::zeros(out, DType::F32, &dev).unwrap();
-        let proj = AdaLnProjection {
-            weight: w,
-            bias: b,
-            hidden_size: cfg.hidden_size,
-        };
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "adaln_proj.linear.weight".to_string(),
+            Tensor::ones((out, 3), DType::F32, &dev).unwrap(),
+        );
+        map.insert(
+            "adaln_proj.linear.bias".to_string(),
+            Tensor::zeros(out, DType::F32, &dev).unwrap(),
+        );
+        let proj = AdaLnProjection::from_weights(
+            &Weights::from_map(map),
+            "adaln_proj.linear",
+            &cfg,
+            DType::F32,
+        )
+        .unwrap();
         let temb = Tensor::ones((2, 3), DType::F32, &dev).unwrap();
         let m = proj.forward(&temb).unwrap();
         for (i, t) in m.tables().enumerate() {
@@ -560,5 +590,138 @@ mod tests {
         assert!(proj
             .forward(&Tensor::ones(3, DType::F32, &dev).unwrap())
             .is_err());
+    }
+
+    // ─── the packed tier (sc-20267) ─────────────────────────────────────────────────────────────
+
+    /// A tiny config whose AdaLN projection has a legal packed geometry — `time_embed_dim` must be
+    /// a multiple of the group size (64), which every shipped width is (2688 = 42 groups).
+    fn packable_cfg() -> MiniMaxH3DitConfig {
+        MiniMaxH3DitConfig {
+            hidden_size: 2,
+            time_embed_dim: 64,
+            ..MiniMaxH3DitConfig::default()
+        }
+    }
+
+    /// **The AdaLN projection detects a packed tier** through its real loader, keeps the base
+    /// quantized, and reports the shrunken residency the eviction lever is sized on.
+    #[test]
+    fn a_packed_adaln_projection_loads_quantized() {
+        let cfg = packable_cfg();
+        let (out, in_) = (cfg.adaln_out_features(), cfg.time_embed_dim);
+        let mut map = std::collections::HashMap::new();
+        crate::quant::testkit::insert_packed(&mut map, "adaln_proj.linear", out, in_, 31);
+        map.insert(
+            "adaln_proj.linear.bias".to_string(),
+            Tensor::zeros(out, DType::F32, &Device::Cpu).unwrap(),
+        );
+        let proj = AdaLnProjection::from_weights(
+            &Weights::from_map(map),
+            "adaln_proj.linear",
+            &cfg,
+            DType::F32,
+        )
+        .expect("packed load");
+        assert!(proj.is_packed(), "the `.scales` sibling must pack");
+        assert_eq!(proj.time_embed_dim(), in_, "recovered from the scales");
+        assert_eq!(proj.out_features(), out);
+        // The weight is Q4_1 blocks; only the bias stays dense f32.
+        assert_eq!(proj.nbytes(), (out * in_ / 32) * 20 + out * 4);
+        assert!(proj.nbytes() < out * in_ * 4);
+    }
+
+    /// **The packed AdaLN forward matches a dense reference of the same dequantized weights**, on
+    /// relative max-abs. Both sides run the identical `AdaLnProjection::forward`, so this measures
+    /// the packed path rather than the modulation split.
+    #[test]
+    fn the_packed_adaln_forward_matches_a_dense_reference() {
+        let cfg = packable_cfg();
+        let (out, in_) = (cfg.adaln_out_features(), cfg.time_embed_dim);
+        let dev = Device::Cpu;
+        let bias = Tensor::from_vec(
+            (0..out)
+                .map(|i| (i as f32 * 0.11).cos() * 0.3)
+                .collect::<Vec<_>>(),
+            out,
+            &dev,
+        )
+        .unwrap();
+
+        let mut packed_map = std::collections::HashMap::new();
+        let grid = crate::quant::testkit::insert_packed(
+            &mut packed_map,
+            "adaln_proj.linear",
+            out,
+            in_,
+            37,
+        );
+        packed_map.insert("adaln_proj.linear.bias".to_string(), bias.clone());
+        let packed = AdaLnProjection::from_weights(
+            &Weights::from_map(packed_map),
+            "adaln_proj.linear",
+            &cfg,
+            DType::F32,
+        )
+        .expect("packed load");
+
+        let mut dense_map = std::collections::HashMap::new();
+        dense_map.insert("adaln_proj.linear.weight".to_string(), grid);
+        dense_map.insert("adaln_proj.linear.bias".to_string(), bias);
+        let dense = AdaLnProjection::from_weights(
+            &Weights::from_map(dense_map),
+            "adaln_proj.linear",
+            &cfg,
+            DType::F32,
+        )
+        .expect("dense load");
+        assert!(
+            !dense.is_packed(),
+            "no `.scales` ⇒ the dense path, unchanged"
+        );
+
+        let temb = Tensor::from_vec(
+            (0..2 * in_)
+                .map(|i| (i as f32 * 0.23).sin())
+                .collect::<Vec<_>>(),
+            (2, in_),
+            &dev,
+        )
+        .unwrap();
+        let got = packed.forward(&temb).expect("packed modulation");
+        let want = dense.forward(&temb).expect("dense modulation");
+        for (i, (g, w)) in got.tables().zip(want.tables()).enumerate() {
+            let drift = crate::quant::testkit::rel_max_abs(g, w);
+            println!("[adaln] table {i} packed-vs-dense rel-max-abs = {drift:.3e}");
+            assert!(
+                drift < 5e-3,
+                "table {i}: the Q4_1 repack is lossless up to the f16 scale/bias cast; got \
+                 {drift:.3e}"
+            );
+        }
+    }
+
+    /// A packed projection whose recovered geometry disagrees with the config is refused by the
+    /// same shape check the dense path runs — the check reads the `AdaptLinear`'s shape, so it is
+    /// not silently skipped when there is no dense weight to measure.
+    #[test]
+    fn a_packed_adaln_of_the_wrong_shape_is_refused() {
+        let cfg = packable_cfg();
+        let mut map = std::collections::HashMap::new();
+        // Half the expected output width.
+        let out = cfg.adaln_out_features() / 2;
+        crate::quant::testkit::insert_packed(&mut map, "adaln_proj.linear", out, 64, 41);
+        map.insert(
+            "adaln_proj.linear.bias".to_string(),
+            Tensor::zeros(out, DType::F32, &Device::Cpu).unwrap(),
+        );
+        let err = AdaLnProjection::from_weights(
+            &Weights::from_map(map),
+            "adaln_proj.linear",
+            &cfg,
+            DType::F32,
+        )
+        .expect_err("a mis-shaped packed projection must be refused");
+        assert!(err.to_string().contains("expected"), "{err}");
     }
 }
