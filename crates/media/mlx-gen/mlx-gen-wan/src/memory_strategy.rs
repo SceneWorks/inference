@@ -138,6 +138,10 @@ impl Headers {
                 self.component, tensor.shape
             )));
         }
+        // FP8 posture: `is_float` excludes `F8_E4M3`. MLX Wan reads canonical BF16 storage (see
+        // `stored`/`materialized` below) through the plain `Weights::from_file` path, which rejects
+        // fp8 files outright — the fp8-decoding loader (`from_file_with_fp8`) is opt-in and this
+        // provider does not use it, so refusing fp8 here matches the loader it prices for.
         if require_float && !tensor.is_float() {
             return Err(gen_core::Error::Unsupported(format!(
                 "{MODEL_ID}: {} tensor {name} must be floating, got {:?}",

@@ -167,6 +167,11 @@ fn projected_dense_component_bytes(
         )));
     }
     headers.iter().try_fold(0_u64, |total, tensor| {
+        // FP8 posture: `is_float` excludes `F8_E4M3`, so a scaled-fp8 component is refused here
+        // rather than priced at `float_bytes`. That is deliberate — the calibrated route is the
+        // snapshot directory (`validate_contract_route`), whose loader casts float storage to the
+        // compute dtype; the ComfyUI scaled-fp8 seam in `crate::comfyui` dequantizes through its own
+        // `.scale_weight` companions and is a different, uncalibrated route.
         if !tensor.is_float() {
             return Err(gen_core::Error::Unsupported(format!(
                 "{MODEL_ID}: calibrated dense {component} tensor {} must use a floating source dtype; the loader would cast {:?} to its resident compute dtype",
@@ -237,6 +242,8 @@ fn validate_packed_triple(
             "{MODEL_ID}: packed transformer {base}.weight must be rank-2 U32 codes"
         )));
     }
+    // FP8 posture: an affine-packed grid's scales/biases are read as real floats, never as fp8
+    // codes, so `is_float`'s exclusion of `F8_E4M3` is the intended refusal here.
     if !scales.is_float()
         || !biases.is_float()
         || scales.shape.len() != 2
@@ -331,6 +338,9 @@ fn transformer_assets(root: &Path) -> gen_core::Result<(u64, Option<Quant>)> {
             )));
         }
         let bytes = tensors.values().try_fold(0_u64, |total, tensor| {
+            // FP8 posture: `is_float` excludes `F8_E4M3`, so a scaled-fp8 DiT is refused instead of
+            // being priced at the bf16 width its `.scale_weight` companions would only reach through
+            // the separate `crate::comfyui` dequant seam.
             if !tensor.is_float() {
                 return Err(gen_core::Error::Unsupported(format!(
                     "{MODEL_ID}: calibrated dense transformer tensor {} must use a floating source dtype; the loader would cast {:?} to bf16",
@@ -415,6 +425,8 @@ fn transformer_assets(root: &Path) -> gen_core::Result<(u64, Option<Quant>)> {
                 tensor.name
             )));
         }
+        // FP8 posture: `is_float` excludes `F8_E4M3`, so the only non-float storage a packed
+        // transformer may retain is the U32 code grid accounted above — a stray fp8 leaf is refused.
         if !tensor.is_float() {
             return Err(gen_core::Error::Unsupported(format!(
                 "{MODEL_ID}: packed transformer ordinary tensor {} must use a floating source dtype; only an exact packed triple may retain U32 codes",

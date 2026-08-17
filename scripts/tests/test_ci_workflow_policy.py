@@ -1017,13 +1017,19 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             for line in lines
             if WINDOWS_INTERPRETER in line and not line.lstrip().startswith("#")
         ]
-        self.assertEqual(len(windows_python_lines), 76)
-        self.assertEqual(workflow.count(f"uses: {WINDOWS_SETUP_ACTION}"), 11)
-        self.assertEqual(workflow.count(WINDOWS_UV_VERSION), 11)
-        self.assertEqual(workflow.count(WINDOWS_UV_CACHE), 11)
-        self.assertEqual(workflow.count(WINDOWS_UV_INSTALL), 11)
-        self.assertEqual(workflow.count(WINDOWS_UV_FIND), 11)
-        self.assertEqual(workflow.count(WINDOWS_PYTHON_EXPORT), 11)
+        # Shape, not population. `real_weight_windows_interpreter_errors` already enforces, per
+        # Windows job, exactly one pinned setup-uv at the reviewed version with the cache off, one
+        # managed CPython 3.12.10 install, one path resolution, one reviewed-Python export, their
+        # ordering, and `|| exit /b 1` on every pip install. The file-wide totals that used to sit
+        # here (`len(windows_python_lines) == 76` and six `workflow.count(...) == 11`) restated that
+        # per-job claim as a frozen corpus: they went RED whenever a Windows job was legitimately
+        # added or removed, while catching nothing the checker misses. Kept instead: non-vacuity, so
+        # the mutations below never run against an empty scan, and the mutation coverage itself,
+        # which is what proves the checker bites.
+        self.assertTrue(
+            windows_python_lines,
+            "no Windows reviewed-interpreter lines found; every mutation below would be vacuous",
+        )
         self.assertIn(
             f'{WINDOWS_INTERPRETER} -c "import sys; assert sys.version_info[:3] == (3, 12, 10), sys.version"',
             workflow,
@@ -1033,7 +1039,14 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             for line in windows_python_lines
             if f"{WINDOWS_INTERPRETER} -m pip install" in line
         ]
-        self.assertEqual(len(pip_installs), 11)
+        # Same posture: `len(pip_installs) == 11` was the Windows-job count in disguise. The
+        # per-install fail-fast shape below is the real claim; non-vacuity keeps it from passing on
+        # an empty list.
+        self.assertTrue(
+            pip_installs,
+            "no Windows reviewed-interpreter pip installs found; the fail-fast check below would "
+            "be vacuous",
+        )
         for install in pip_installs:
             self.assertRegex(install, r"\|\|\s+exit /b 1$")
         for replacement in ("python", "py", "py -3.14"):
@@ -1939,14 +1952,73 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                     )
 
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
-        self.assertEqual(workflow.count("--require-materialization-provenance"), 6)
-        mac_start = workflow.index("  mlx-request-memory-scope:")
-        windows_start = workflow.index("  candle-mage-memory-ladder:")
+
+        # Shape, not population. Two `count("--require-materialization-provenance") == 6` pins used
+        # to stand here: a second lane for an already-covered model turned them RED for no reason,
+        # while a *new* mirrored model whose snapshot call forgot the flag kept them green — the
+        # defect they exist to catch. Derive both sides from their sources of truth instead: the
+        # mirrored set comes from the manifest, and each snapshot invocation is checked on its own.
+        mirrored = {
+            key for key, model in models.items() if "materialization_repository" in model
+        }
         self.assertEqual(
-            workflow[mac_start:windows_start].count("--require-materialization-provenance"),
-            6,
+            mirrored,
+            set(expected),
+            "every mirror-materialized manifest model must be pinned by this test",
         )
-        self.assertNotIn("--require-materialization-provenance", workflow[windows_start:])
+
+        # Materialization is a macOS-lane job; the Windows lanes consume what it produced, which is
+        # why they call the same script without the flag. Classify by each job's own `runs-on`
+        # rather than by slicing the file at whichever job names happen to bound the lanes today.
+        provenance_flag = "--require-materialization-provenance"
+        macos_provenance_models: set[str] = set()
+        provenance_jobs: set[str] = set()
+        for job, lines in workflow_job_bodies(workflow).items():
+            runs_on = next((line for line in lines if line.startswith("    runs-on:")), "")
+            is_macos = "macos" in runs_on.lower()
+            # `\`-continued `run:` blocks put the flag on its own line; fold before matching.
+            body = re.sub(r"\\\n\s*", " ", "\n".join(lines))
+            for command in re.findall(
+                r"scripts/release/ensure_model_snapshot\.py[^\n]*", body
+            ):
+                model_flag = re.search(r"--model\s+(\S+)", command)
+                self.assertIsNotNone(
+                    model_flag, f"{job}: snapshot invocation names no model: {command!r}"
+                )
+                assert model_flag is not None
+                key = model_flag.group(1).strip('"')
+                if provenance_flag in command:
+                    provenance_jobs.add(job)
+                with self.subTest(job=job, model=key):
+                    if not is_macos:
+                        self.assertNotIn(
+                            provenance_flag,
+                            command,
+                            "only the macOS lane materializes; other lanes consume its output",
+                        )
+                    elif key in mirrored:
+                        if provenance_flag in command:
+                            macos_provenance_models.add(key)
+                        self.assertIn(
+                            provenance_flag,
+                            command,
+                            "every macOS use of a mirror-materialized model must verify provenance",
+                        )
+                    else:
+                        self.assertNotIn(
+                            provenance_flag,
+                            command,
+                            "provenance verification only applies to mirrored models",
+                        )
+        self.assertEqual(
+            macos_provenance_models,
+            mirrored,
+            "the macOS lane must provenance-verify exactly the mirror-materialized models",
+        )
+        self.assertTrue(
+            provenance_jobs,
+            "no job requires materialization provenance; the checks above would be vacuous",
+        )
 
     def test_residency_ab_is_operator_run_without_ci_model_dependencies(self) -> None:
         """The CUDA residency A/B stays operator-run — gated directly, not by variable name.

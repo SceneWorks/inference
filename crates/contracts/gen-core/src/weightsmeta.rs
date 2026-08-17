@@ -183,10 +183,17 @@ pub struct SafetensorsTensorHeader {
 impl SafetensorsTensorHeader {
     /// Whether Candle's shared `Weights` loader casts this source dtype to its requested float
     /// compute dtype. Integer and boolean tensors remain stored-width.
+    ///
+    /// `F8_E4M3` is deliberately **excluded**: `candle_gen::weights::coerce_float` only casts
+    /// `F16 | BF16 | F32 | F64`, so an fp8 payload stays at its stored width and needs an explicit,
+    /// route-owned dequantization contract (paired `weight_scale`/`scales` companions) before it can
+    /// be priced. Admission guards therefore fail closed on fp8 through this predicate; a route that
+    /// genuinely accepts fp8 declares it explicitly, the way
+    /// [`crate::encoder_contract`]'s ComfyUI fp8 policy does.
     pub fn is_float(&self) -> bool {
         matches!(
             self.dtype,
-            Dtype::F8_E4M3 | Dtype::F16 | Dtype::BF16 | Dtype::F32 | Dtype::F64
+            Dtype::F16 | Dtype::BF16 | Dtype::F32 | Dtype::F64
         )
     }
 
@@ -872,6 +879,59 @@ mod tests {
         drop(guard);
         assert!(!file.exists(), "fixture file survived: {}", file.display());
         assert!(!root.exists(), "fixture root survived: {}", root.display());
+    }
+
+    /// `is_float` answers exactly one question: does `candle_gen::weights::coerce_float` cast this
+    /// source dtype to the requested compute dtype? Every admission guard prices a "float" tensor at
+    /// the compute width and refuses everything else, so widening this set silently reprices — and
+    /// silently *admits* — checkpoints those guards were written to reject.
+    ///
+    /// `F8_E4M3` was widened in once (f9dfb4785) with no consumer and reverted here: fp8 stays at
+    /// stored width through `coerce_float`, so admitting it here would let an fp8 checkpoint through
+    /// a guard that then mis-prices it. Routes that really accept fp8 opt in explicitly (see
+    /// `encoder_contract`'s ComfyUI fp8 policy).
+    ///
+    /// The expectation is derived from an exhaustive dtype sweep rather than pinned as a count, so a
+    /// new safetensors dtype is classified deliberately instead of quietly inheriting `false`.
+    #[test]
+    fn is_float_admits_only_candle_cast_float_dtypes() {
+        const ALL_DTYPES: &[Dtype] = &[
+            Dtype::BOOL,
+            Dtype::U8,
+            Dtype::I8,
+            Dtype::F8_E5M2,
+            Dtype::F8_E4M3,
+            Dtype::I16,
+            Dtype::U16,
+            Dtype::F16,
+            Dtype::BF16,
+            Dtype::I32,
+            Dtype::U32,
+            Dtype::F32,
+            Dtype::F64,
+            Dtype::I64,
+            Dtype::U64,
+        ];
+
+        let admitted = ALL_DTYPES
+            .iter()
+            .copied()
+            .filter(|dtype| {
+                SafetensorsTensorHeader {
+                    name: "w".to_owned(),
+                    dtype: *dtype,
+                    shape: vec![1],
+                    data_bytes: dtype.size() as u64,
+                }
+                .is_float()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            admitted,
+            vec![Dtype::F16, Dtype::BF16, Dtype::F32, Dtype::F64],
+            "is_float must admit exactly the dtypes coerce_float casts"
+        );
     }
 
     #[test]

@@ -52,6 +52,14 @@
 # mlx-c stays 0.6.0 with the fft-FFTNorm patch carried forward (0.32.0's fft.h still declares FFTNorm
 # before the stream arg). Parity re-baseline vs 0.31.2 = 1-2 ULP f32 bug-fix drift only (sc-12744/sc-12747);
 # RNG + softmax bit-identical. Guarded by mlx-gen-qwen-image/tests/{bf16_matmul_sweep,sdpa_nax_repro}.
+# SHA 7151a9b2 = a858aaa1 + PR #26's three tier-3 Apple cross-build fixes, and is the rev pinned
+# below. Build/CI only: mlx-sys/build.rs adds `.blocklist_function("^(malloc|realloc)$")` so bindgen
+# stops emitting declarations for the SDK's libc allocators — they are not mlx-c API, and a nightly
+# build-std rustc rejects them on tier-3 Apple targets under
+# `suspicious_runtime_symbol_definitions` even though the ABI width matches — while
+# .github/workflows/cross-apple.yml asserts the emitted metallib triples and selects the completed
+# build output. No Rust API, MLX core, mlx-c, or patch content moved, so every lineage fact above
+# still describes the pinned rev and no parity re-baseline is implied.
 mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "7151a9b27921c6198fd8dfb493dee21db4dcdfcc" }
 # The mlx-sys C-binding layer (pmetal-mlx-sys), same git rev as mlx-rs's path dep so cargo unifies on
 # ONE build (two distinct sources would yield two `mlx_sys` crates → link/symbol drift). Added as a

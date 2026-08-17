@@ -3221,20 +3221,12 @@ mod preview_advertising {
     #[test]
     fn every_descriptorless_memory_route_has_one_machine_readable_waiver() {
         let waivers = super::BESPOKE_MEMORY_ROUTE_WAIVERS;
-        assert_eq!(waivers.len(), 1);
-        let waiver = waivers[0];
-        assert_eq!(waiver.provider_id, "pulid_flux");
-        assert_eq!(waiver.crate_name, "pulid");
-        assert!(super::BESPOKE_UTILITY_CRATES.contains(&waiver.crate_name));
-        assert_eq!(waiver.owner, "candle-gen-pulid");
-        for field in [
-            waiver.reason,
-            waiver.contract_path,
-            waiver.verification_path,
-        ] {
-            assert!(!field.trim().is_empty());
-        }
 
+        // Shape, not population. This used to open with `waivers.len() == 1` and then index
+        // `waivers[0]`, so a second legitimate waiver would go RED without any coverage having been
+        // lost. The load-bearing claim is the derived set below: the waiver table names exactly the
+        // descriptor-less crates the source scan finds emitting — and every row is then validated on
+        // its own terms, so a second waiver is checked rather than merely counted.
         let waived_crates = waivers
             .iter()
             .map(|waiver| format!("candle-gen-{}", waiver.crate_name))
@@ -3244,15 +3236,79 @@ mod preview_advertising {
             .filter(|provider| scan(provider.dir).emits())
             .map(|provider| provider.dir.to_owned())
             .collect::<BTreeSet<_>>();
-        assert_eq!(waived_crates, descriptorless_memory_crates);
+        assert_eq!(
+            waived_crates, descriptorless_memory_crates,
+            "the waiver table must name exactly the descriptor-less crates that emit"
+        );
+        assert_eq!(
+            waived_crates.len(),
+            waivers.len(),
+            "the waiver table must not repeat a crate"
+        );
+        // Non-vacuity: an empty scan would satisfy an empty-set equality while proving nothing.
+        assert!(
+            !waivers.is_empty(),
+            "at least one descriptor-less memory route is waived today; an empty table means the \
+             source scan resolved nothing"
+        );
 
         let registry = super::memory_contract_surface_registry().unwrap();
-        assert!(registry
-            .generators()
-            .all(|registration| !matches!((registration.descriptor)().id, "pulid" | "pulid_flux")));
-        assert!(registry
-            .memory_strategy_registrations()
-            .all(|registration| registration.provider_id != waiver.provider_id));
+        // `candle_gen_root()` is `crates/media/candle-gen`; the waiver paths are repo-relative.
+        let repo_root = candle_gen_root()
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .expect("crates/media/candle-gen sits three levels below the repo root")
+            .to_path_buf();
+        for waiver in waivers {
+            assert!(
+                super::BESPOKE_UTILITY_CRATES.contains(&waiver.crate_name),
+                "waived crate {:?} is not a declared descriptor-less utility crate",
+                waiver.crate_name
+            );
+            assert_eq!(
+                waiver.owner,
+                format!("candle-gen-{}", waiver.crate_name),
+                "a waiver's owner must be the crate that owns the route"
+            );
+            assert!(
+                !waiver.provider_id.trim().is_empty() && !waiver.reason.trim().is_empty(),
+                "waiver {:?} must name a route and a reason",
+                waiver.crate_name
+            );
+            // The evidence paths are the whole point of a machine-readable waiver: a moved or
+            // renamed contract silently turns the row into an unfalsifiable claim.
+            for path in [waiver.contract_path, waiver.verification_path] {
+                let expected_prefix = format!("crates/media/candle-gen/{}/src/", waiver.owner);
+                assert!(
+                    path.starts_with(&expected_prefix),
+                    "waiver {:?} cites {path:?}, which is outside its owning crate",
+                    waiver.crate_name
+                );
+                assert!(
+                    repo_root.join(path).is_file(),
+                    "waiver {:?} cites {path:?}, which does not exist",
+                    waiver.crate_name
+                );
+            }
+            // The waived route really is absent from both registries — that absence is what the
+            // waiver exists to document.
+            assert!(
+                registry.generators().all(|registration| {
+                    let id = (registration.descriptor)().id;
+                    id != waiver.provider_id && id != waiver.crate_name
+                }),
+                "waived route {:?} has a generator registration after all",
+                waiver.provider_id
+            );
+            assert!(
+                registry
+                    .memory_strategy_registrations()
+                    .all(|registration| registration.provider_id != waiver.provider_id),
+                "waived route {:?} has a memory-strategy registration after all",
+                waiver.provider_id
+            );
+        }
     }
 
     /// The carried-over no-go set stays outside advertising, by exact id, and stays out of the
@@ -4097,33 +4153,130 @@ mod tests {
 
     #[test]
     fn every_registered_memory_strategy_rejects_cross_route_decode_geometry() {
+        use std::collections::{BTreeMap, BTreeSet};
+
         let registry = super::provider_registry().unwrap();
         let contract_registry = super::memory_contract_surface_registry().unwrap();
         gen_core_testkit::memory_contract_surface_registry_conformance(&contract_registry);
-        // Candle Wan's TI2V-5B memory registration is `#[cfg(any(feature = "cuda", test))]`, so the
-        // CUDA catalog carries one provider the CPU catalog does not. It contributes six selectors,
-        // not twelve: TI2V-5B has no deferred block loader, so it witnesses only the eager half of
-        // the common Candle surface. Keep both arms rather than a `cfg!` sum — the CPU lane and the
-        // Windows CUDA lane each read exactly the total they can observe.
-        #[cfg(feature = "cuda")]
-        let (expected_registrations, expected_surfaces) = (24, 21 * 12 + 2 * 16 + 6);
-        #[cfg(not(feature = "cuda"))]
-        let (expected_registrations, expected_surfaces) = (23, 21 * 12 + 2 * 16);
-        assert_eq!(
-            contract_registry.memory_strategy_registrations().len(),
-            expected_registrations
-        );
         let surfaces = contract_registry.memory_contract_surfaces().unwrap();
-        assert_eq!(surfaces.len(), expected_surfaces);
-        assert_eq!(
-            surfaces
-                .iter()
-                .filter(|surface| surface.composed)
-                .map(|surface| surface.contract.provider_id.as_str())
-                .collect::<std::collections::BTreeSet<_>>()
-                .len(),
-            4,
+
+        // Shape, not population. The registration/surface/composed totals used to be pinned as
+        // hand-maintained numbers (`24`/`23`, `21 * 12 + 2 * 16 [+ 6]`, `4`), which any legitimate
+        // catalog growth re-trips while saying nothing about *which* provider moved — and which the
+        // CUDA arm could only express by restating the arithmetic. Every claim below is derived from
+        // the registries themselves, so it holds at any catalog size and still fails on the real
+        // defect: a provider whose witness set is orphaned, doubled, or silently narrowed.
+
+        // Coverage is exact in both directions: each memory-strategy registration either publishes
+        // optimized surfaces or is a resident-only witness, and nothing else reaches the inventory.
+        let strategy_ids = contract_registry
+            .memory_strategy_registrations()
+            .map(|registration| registration.provider_id)
+            .collect::<BTreeSet<_>>();
+        let resident_only_ids = contract_registry
+            .resident_only_memory_contract_registrations()
+            .map(|registration| registration.provider_id)
+            .collect::<BTreeSet<_>>();
+        assert!(
+            resident_only_ids.is_subset(&strategy_ids),
+            "resident-only witnesses without a memory-strategy registration: {:?}",
+            resident_only_ids
+                .difference(&strategy_ids)
+                .collect::<Vec<_>>()
         );
+        let surfaced_ids = surfaces
+            .iter()
+            .map(|surface| surface.contract.provider_id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            surfaced_ids,
+            strategy_ids
+                .difference(&resident_only_ids)
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            "optimized surfaces must cover exactly the non-resident-only memory registrations"
+        );
+
+        // What the old `21 * 12 + 2 * 16 + 6` arithmetic was really asserting, per provider: a
+        // witness set is a full rectangle over the residency/materialization axes for every tier it
+        // publishes (12 = 3 tiers x 2 policies x 2 shapes, 16 = 4 tiers x 4, and TI2V-5B's 6 =
+        // 3 tiers x 2 policies x its single eager shape). Stated as a rectangle it is derived, so it
+        // holds at any catalog size — and it is strictly stronger, because a provider that dropped
+        // one (policy, shape) cell only moved the old global sum by coincidence.
+        // `MemoryContractSurfaceSelector::id` is the stable `tier:policy:shape` encoding of the three
+        // axes, so splitting it recovers them without needing `Ord` on the runtime enums.
+        let axes = |id: &'static str| {
+            let mut parts = id.split(':');
+            let tier = parts.next().expect("selector ids start with a tier");
+            let policy = parts.next().expect("selector ids name a residency policy");
+            let shape = parts
+                .next()
+                .expect("selector ids name a materialization shape");
+            assert_eq!(parts.next(), None, "unexpected selector id shape: {id:?}");
+            (tier, policy, shape)
+        };
+        let mut published = BTreeMap::<&str, BTreeSet<_>>::new();
+        for surface in &surfaces {
+            published
+                .entry(surface.contract.provider_id.as_str())
+                .or_default()
+                .insert(axes(surface.selector.id()));
+        }
+        for (provider_id, selectors) in &published {
+            let tiers = selectors
+                .iter()
+                .map(|(tier, ..)| *tier)
+                .collect::<BTreeSet<_>>();
+            let policies = selectors
+                .iter()
+                .map(|(_, policy, _)| *policy)
+                .collect::<BTreeSet<_>>();
+            let shapes = selectors
+                .iter()
+                .map(|(.., shape)| *shape)
+                .collect::<BTreeSet<_>>();
+            let mut rectangle = BTreeSet::new();
+            for tier in &tiers {
+                for policy in &policies {
+                    for shape in &shapes {
+                        rectangle.insert((*tier, *policy, *shape));
+                    }
+                }
+            }
+            assert_eq!(
+                *selectors, rectangle,
+                "{provider_id} publishes a ragged witness set: every tier it declares must be \
+                 witnessed on every residency/materialization combination it supports"
+            );
+        }
+
+        // Composed routes are exactly the memory registrations with no standalone generator:
+        // `register_memory_strategy` rejects an unmatched id, so `register_composed_memory_strategy`
+        // is the only seam that admits one. Deriving the set that way asserts the `composed` flag
+        // agrees with the registration seam rather than pinning how many composed routes exist.
+        let generator_ids = contract_registry
+            .generators()
+            .map(|registration| (registration.descriptor)().id)
+            .collect::<BTreeSet<_>>();
+        let observed_composed = surfaces
+            .iter()
+            .filter(|surface| surface.composed)
+            .map(|surface| surface.contract.provider_id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            observed_composed,
+            surfaced_ids
+                .iter()
+                .copied()
+                .filter(|id| !generator_ids.contains(id))
+                .collect::<BTreeSet<_>>(),
+            "the composed flag must mark exactly the generator-less memory routes"
+        );
+        assert!(
+            !observed_composed.is_empty(),
+            "the Candle catalog publishes composed memory routes; none were observed"
+        );
+
         let spec = candle_gen::gen_core::LoadSpec::new(candle_gen::gen_core::WeightsSource::Dir(
             "/nonexistent".into(),
         ));

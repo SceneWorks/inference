@@ -45,7 +45,11 @@ mlx-gen-catalog = { path = "crates/media/mlx-gen/mlx-gen-catalog" }
 candle-gen-catalog = { path = "crates/media/candle-gen/candle-gen-catalog" }
 candle-audio-catalog = { path = "crates/audio/candle-audio-catalog" }
 
-# MLX fork pinned by commit SHA. rev a858aaa1 adds P3's exact phase-1 epilogues, complete
+# MLX fork pinned by commit SHA. The pinned rev is 7151a9b2 = a858aaa1 + three tier-3 Apple
+# cross-build fixes (mlx-sys bindgen stops binding the SDK's libc malloc/realloc, which nightly
+# build-std rejects under suspicious_runtime_symbol_definitions; the cross-apple workflow asserts the
+# emitted metallib triples and selects the completed build output). Rust API and MLX core are
+# unchanged from a858aaa1, which adds P3's exact phase-1 epilogues, complete
 # Metal, CUDA, and no-GPU backend definitions, and fail-closed Metal ABI/index/dispatch admission on top of the
 # collision-free retained compiler leases and safe TLS teardown while preserving MLX 0.32.0.
 # See mlx-gen/Cargo.toml for lineage.
