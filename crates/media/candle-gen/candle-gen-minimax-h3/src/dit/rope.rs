@@ -46,21 +46,36 @@
 //! difference, not an accident: `tests/cross_backend.rs` reports the rope tables' residual
 //! separately from the block's for exactly this reason.
 //!
-//! # The tables are f32 and the rotation runs at f32, whatever the stream dtype is
+//! # dtype convention: f32 tables, rotation at the STREAM dtype
 //!
-//! [`MmRope::tables`] takes no dtype: `cos`/`sin` are **always** f32, and [`MmRope::apply`] upcasts
-//! the rotated channels, rotates at f32, and narrows the result back to the activation's dtype. That
-//! is diffusers' convention (`apply_rotary_emb` upcasts the rotary to float32 regardless of the
-//! transformer's dtype) and it is not cosmetic: a bf16 table has 8 mantissa bits, so `cos θ` and
+//! Both halves are the reference's, read at `diffusers` 0.40.0.dev0 @ `7564fb01`:
+//!
+//! * **Tables at f32.** `MiniMaxH3RotaryPosEmbed.forward`
+//!   (`models/transformers/transformer_minimax_h3.py:93`) casts the ids with
+//!   `position_ids.to(torch.float32)` against a float32 `inv_freq` buffer, and `"rope"` is listed
+//!   in `MiniMaxH3Transformer3DModel._keep_in_fp32_modules` (`:448`), so `freqs.cos()` /
+//!   `freqs.sin()` are f32 whatever the transformer runs at. [`MmRope::tables`] therefore takes
+//!   **no dtype**.
+//! * **Rotation at the stream dtype.** `_apply_rotary_emb` then narrows them —
+//!   `cos = cos.to(hidden_states.dtype)` / `sin = sin.to(hidden_states.dtype)` (`:66-67`) —
+//!   *before* `hidden_states_rotary * cos + hidden_states_rotated * sin`. The multiply-add runs in
+//!   the activation's dtype, not f32.
+//!
+//! [`MmRope::apply`] narrows the same way, so that narrowing is the port being faithful rather than
+//! a missed upcast — the same convention [`crate::rope`] documents for the video VAE's decoder
+//! rotary, whose processor narrows explicitly too. Do **not** "fix" this into an f32 rotation: it
+//! would make this lane more precise than the model it ports, and it is invisible to the suite
+//! (every `tests/dit_parity.rs` / `tests/dit_io.rs` case runs an f32 stream, where the two
+//! conventions coincide), so nothing downstream would catch the divergence.
+//!
+//! The **tables** half is the one production used to get wrong: it built them at the stream dtype
+//! while every parity fixture built them at f32, so the suite exercised a numerically different
+//! rotary from the one that shipped, and `tests/cross_backend.rs` was blind because the MLX twin
+//! narrowed identically. That is not cosmetic — a bf16 table has 8 mantissa bits, so `cos θ` and
 //! `sin θ` quantize to steps of ~2⁻⁸ and the rotation angle acquires a per-row error of order 4e-3
-//! radians — applied to **every** q and k of every head of every block.
-//!
-//! The production path used to narrow the tables to the stream dtype while **every**
-//! `tests/dit_parity.rs` and `tests/dit_io.rs` case built them at f32, so the suite exercised a
-//! numerically different rotary from the one that shipped. `tests/cross_backend.rs` could not see it
-//! either: the MLX twin narrowed identically, so both lanes were wrong in the same direction and
-//! their residual stayed small. **Both lanes move together** — that is why the mlx twin changes in
-//! the same commit.
+//! radians, applied to **every** q and k of every head of every block. Both halves are pinned by
+//! this module's tests, and **both lanes move together** — the mlx twin carries the identical
+//! convention because the cross-backend gate compares them.
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::{CandleError, Result};
@@ -133,9 +148,10 @@ impl MmRope {
     /// which MPS has no dtype for). This reproduces the *values*, computing the angles in f64 on
     /// the host from the f32 coordinates, then materializing at f32.
     ///
-    /// There is deliberately **no dtype parameter**: diffusers upcasts the rotary to float32
-    /// whatever the transformer runs at, and [`Self::apply`] narrows back to the activation's dtype
-    /// after the rotation. See the module doc for what a bf16 table costs.
+    /// There is deliberately **no dtype parameter**: the reference keeps the tables float32
+    /// whatever the transformer runs at (`transformer_minimax_h3.py:93`, plus `"rope"` in
+    /// `_keep_in_fp32_modules` at `:448`), and [`Self::apply`] narrows them to the activation's
+    /// dtype at rotation time. See the module doc for what a bf16 table costs.
     pub fn tables(&self, position_ids: &Tensor) -> Result<MmRopeTables> {
         let shape = position_ids.dims();
         if shape.len() != 2 || shape[1] != 3 {
@@ -187,13 +203,15 @@ impl MmRope {
     }
 
     /// Rotate the leading `rotary_dim` channels of every head of `x`, shape `[B, S, H, D]`, **at
-    /// f32**, returning the result at `x`'s own dtype.
+    /// the stream dtype**.
     ///
     /// Channels beyond `rotary_dim` are concatenated back **untouched** — the partial-rotary path
     /// the shipped geometry always takes (96 of 128).
     ///
-    /// The upcast is diffusers' convention and applies whatever the stream dtype is; on an f32
-    /// stream it is a no-op. See the module doc.
+    /// The f32 tables are narrowed to `x`'s dtype *before* the multiply-add, reproducing
+    /// `_apply_rotary_emb`'s `cos.to(hidden_states.dtype)` / `sin.to(hidden_states.dtype)` at
+    /// `transformer_minimax_h3.py:66-67`; on an f32 stream the narrow is a no-op. That is a
+    /// reference-faithful narrow, not a missed upcast — see the module doc.
     pub fn apply(&self, x: &Tensor, tables: &MmRopeTables) -> Result<Tensor> {
         let shape = x.dims();
         if shape.len() != 4 {
@@ -216,20 +234,21 @@ impl MmRope {
         }
 
         // `[seq, rotary]` -> `[1, seq, 1, rotary]`, broadcasting over batch and heads. The tables
-        // are f32 and stay f32: the ACTIVATION is upcast to meet them, not the other way round.
-        let cos_t = tables.cos.reshape((1, seq, 1, rotary))?;
-        let sin_t = tables.sin.reshape((1, seq, 1, rotary))?;
-
+        // are f32; they are narrowed to the ACTIVATION's dtype here, before the multiply-add —
+        // reference-faithful (`cos.to(hidden_states.dtype)`, `transformer_minimax_h3.py:66-67`),
+        // NOT a missed upcast.
         let stream = x.dtype();
-        let head = x.narrow(3, 0, rotary)?.to_dtype(DType::F32)?;
+        let cos_t = tables.cos.to_dtype(stream)?.reshape((1, seq, 1, rotary))?;
+        let sin_t = tables.sin.to_dtype(stream)?.reshape((1, seq, 1, rotary))?;
+
+        let head = x.narrow(3, 0, rotary)?.contiguous()?;
         let half = rotary / 2;
         let x1 = head.narrow(3, 0, half)?;
         let x2 = head.narrow(3, half, rotary - half)?;
         let rotated = Tensor::cat(&[x2.neg()?, x1], 3)?;
         let out = head
             .broadcast_mul(&cos_t)?
-            .add(&rotated.broadcast_mul(&sin_t)?)?
-            .to_dtype(stream)?;
+            .add(&rotated.broadcast_mul(&sin_t)?)?;
 
         if rotary == d {
             return Ok(out.contiguous()?);
@@ -426,29 +445,53 @@ mod tests {
         Tensor::from_vec(vals, (seq, 3), &dev()).unwrap()
     }
 
-    /// **The tables are f32 and the rotation runs at f32**, whatever the stream dtype is — diffusers'
-    /// convention. `tables` has no dtype knob to narrow through, and a bf16 stream comes back bf16
-    /// having paid ONE rounding (the output narrowing) rather than two.
+    /// **Both halves of the dtype convention** — the same assertion [`crate::rope`]'s twin makes
+    /// for the video VAE's decoder rotary, and the same one the mlx lane makes here.
+    ///
+    /// `tables` has no dtype knob, so `cos`/`sin` are f32 whatever the ids carried
+    /// (`transformer_minimax_h3.py:93`, `:448`); `apply` then narrows them to the stream dtype
+    /// before the multiply-add (`:66-67`), so a bf16 stream rotates at bf16 and comes back bf16.
     #[test]
-    fn the_rotary_is_computed_and_applied_at_f32() {
+    fn tables_are_f32_and_the_rotation_runs_at_the_stream_dtype() {
         let rope = MmRope::new(16, 10_000.0).unwrap();
-        let tables = rope.tables(&grid(9)).unwrap();
+        let ids = grid(9);
+        let tables = rope.tables(&ids).unwrap();
         assert_eq!(tables.cos.dtype(), DType::F32, "cos must stay f32");
         assert_eq!(tables.sin.dtype(), DType::F32, "sin must stay f32");
+        // ...including from bf16 ids: the tables have no dtype to inherit.
+        let from_bf16 = rope.tables(&ids.to_dtype(DType::BF16).unwrap()).unwrap();
+        assert_eq!(from_bf16.cos.dtype(), DType::F32);
+        assert_eq!(from_bf16.sin.dtype(), DType::F32);
 
         let x = spread(&[1, 9, 2, 128]);
-        let reference = rope.apply(&x, &tables).unwrap();
-        assert_eq!(reference.dtype(), DType::F32, "an f32 stream stays f32");
+        assert_eq!(
+            rope.apply(&x, &tables).unwrap().dtype(),
+            DType::F32,
+            "an f32 stream stays f32"
+        );
 
-        let bf16 = rope
-            .apply(&x.to_dtype(DType::BF16).unwrap(), &tables)
+        let bf16 = x.to_dtype(DType::BF16).unwrap();
+        let shipped = rope.apply(&bf16, &tables).unwrap();
+        assert_eq!(
+            shipped.dtype(),
+            DType::BF16,
+            "the stream dtype is preserved"
+        );
+
+        // The measurement that makes the assertion above non-vacuous: rotating at f32 and
+        // narrowing AFTERWARDS is a different result, so which side of the multiply-add the
+        // narrowing falls on is load-bearing rather than cosmetic. `bf16` upcasts exactly, so this
+        // isolates the rotation dtype and nothing else.
+        let at_f32 = rope
+            .apply(&bf16.to_dtype(DType::F32).unwrap(), &tables)
+            .unwrap()
+            .to_dtype(DType::BF16)
             .unwrap();
-        assert_eq!(bf16.dtype(), DType::BF16, "the stream dtype is preserved");
-        let drift = rel_max_abs(&bf16, &reference);
-        println!("[rope] bf16 stream vs f32 reference rel-max-abs = {drift:.3e}");
+        let drift = rel_max_abs(&shipped, &at_f32);
+        println!("[mm-rope] narrow-before vs narrow-after rel-max-abs = {drift:.3e}");
         assert!(
-            drift < 1e-2,
-            "a bf16 stream must cost only its own rounding; got {drift:.3e}"
+            drift > 1e-4,
+            "narrowing before vs after the rotation must be distinguishable at bf16 ({drift:.3e})"
         );
     }
 
