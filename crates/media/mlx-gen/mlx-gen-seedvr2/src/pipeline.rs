@@ -748,43 +748,219 @@ impl Seedvr2Pipeline {
         let sh = processed.shape(); // (1,3,1,H,W)
         let (height, width) = (sh[3], sh[4]);
         let plan = video::plan_spatial_tiles(height, width, tile, overlap);
-        let n_tiles = plan.len();
-        // `plan_spatial_tiles` emits a product grid with x varying fastest, so a row of tiles closes
-        // every `row_len` entries. That lets the assembly below fold x into a row strip and only then
-        // fold the strip into the frame (sc-18320) — the full-frame accumulators are touched once per
-        // row instead of once per tile, and no weighted tile is ever padded to the full frame.
-        let row_len = plan
-            .first()
-            .map(|first| plan.iter().filter(|t| t.y0 == first.y0).count().max(1))
-            .unwrap_or(1);
         let ts = Array::from_f32(TIMESTEP);
-        let mut acc: Option<Array> = None; // (1,3,1,H,W)
-        let mut wsum: Option<Array> = None; // (1,1,1,H,W)
-        let mut row_acc: Option<Array> = None; // (1,3,1,th,W)
-        let mut row_wsum: Option<Array> = None; // (1,1,1,th,W)
-        for (tile_idx, t) in plan.iter().enumerate() {
-            // Per-tile cancel — the per-tile `eval` at the end of each iter (below) makes the
-            // prior tile's compute materialized, so this check is effective (sc-5551).
-            if cancel.is_cancelled() {
-                return Err(Error::Canceled);
-            }
+        fold_spatial_tiles(
+            &plan,
+            height,
+            width,
+            |t| {
+                // Per-tile cancel — the per-tile `eval` inside the fold materializes the prior tile's
+                // compute, so this check is effective (sc-5551).
+                if cancel.is_cancelled() {
+                    return Err(Error::Canceled);
+                }
+                let (th, tw) = (t.y1 - t.y0, t.x1 - t.x0);
+                let y_idx = Array::from_slice(&(t.y0..t.y1).collect::<Vec<i32>>(), &[th]);
+                let x_idx = Array::from_slice(&(t.x0..t.x1).collect::<Vec<i32>>(), &[tw]);
+                let tile_clip = processed.take_axis(y_idx, 3)?.take_axis(x_idx, 4)?; // (1,3,1,th,tw)
+
+                // full model path on the tile (one-step Euler), same noise key as the other tiles.
+                let latent = self.encode(&tile_clip)?;
+                let sh = latent.shape();
+                let key = random::key(seed)?;
+                let noise =
+                    random::normal::<f32>(&[1, 16, sh[2], sh[3], sh[4]], None, None, Some(&key))?
+                        .as_dtype(self.dtype)?;
+                let cond = Self::condition(&latent)?;
+                let latents = self.denoise(&noise, &cond, neg, &ts)?;
+                let decoded = self.decode_crop_5d(&latents, th, tw)?; // (1,3,1,th,tw)
+
+                // feather weight tapering on edges that abut a neighbor; placed at (y0,x0).
+                let wvec = video::feather_weight(
+                    th,
+                    tw,
+                    t.y0 > 0,
+                    t.y1 < height,
+                    t.x0 > 0,
+                    t.x1 < width,
+                    overlap,
+                );
+                let weight = Array::from_slice(&wvec, &[1, 1, 1, th, tw]).as_dtype(self.dtype)?;
+                Ok((multiply(&decoded, &weight)?, weight))
+            },
+            on_step,
+        )
+    }
+}
+
+/// Fold each tile's weighted decode into the full frame, **x axis first** (sc-18320).
+///
+/// `plan` is the product grid [`video::plan_spatial_tiles`] emits — x varies fastest — so a row of
+/// tiles closes every `row_len` entries. The assembly accumulates a row into a `(1, 3, 1, th, W)`
+/// strip and only then folds the strip into the frame, so each placement zero-pads **one** axis and
+/// the full-frame accumulators are written once per row instead of once per tile. The predecessor
+/// padded every weighted tile *and* its feather weight to the full frame, twice per tile.
+///
+/// `weighted_tile` returns that tile's `(weighted_decode, weight)` and owns the cancel check. Every
+/// live accumulator is evaluated once per tile — without that the whole tiled graph would materialize
+/// at once and the cancel check would observe nothing — and `on_step` then reports the completed tile
+/// (F-164).
+fn fold_spatial_tiles(
+    plan: &[video::SpatialTile],
+    height: i32,
+    width: i32,
+    mut weighted_tile: impl FnMut(&video::SpatialTile) -> Result<(Array, Array)>,
+    on_step: &mut dyn FnMut(usize, usize),
+) -> Result<Array> {
+    let n_tiles = plan.len();
+    let row_len = plan
+        .first()
+        .map(|first| plan.iter().filter(|t| t.y0 == first.y0).count().max(1))
+        .unwrap_or(1);
+    let mut acc: Option<Array> = None; // (1,3,1,H,W)
+    let mut wsum: Option<Array> = None; // (1,1,1,H,W)
+    let mut row_acc: Option<Array> = None; // (1,3,1,th,W)
+    let mut row_wsum: Option<Array> = None; // (1,1,1,th,W)
+    for (tile_idx, t) in plan.iter().enumerate() {
+        let (weighted, weight) = weighted_tile(t)?;
+        let (th, tw) = (t.y1 - t.y0, t.x1 - t.x0);
+        row_acc = Some(accumulate_along_axis(
+            row_acc.take(),
+            &weighted,
+            4,
+            t.x0,
+            tw,
+            width,
+        )?);
+        row_wsum = Some(accumulate_along_axis(
+            row_wsum.take(),
+            &weight,
+            4,
+            t.x0,
+            tw,
+            width,
+        )?);
+        if (tile_idx + 1) % row_len == 0 {
+            let strip = row_acc.take().expect("the row opened above");
+            let strip_weight = row_wsum.take().expect("the row opened above");
+            acc = Some(accumulate_along_axis(
+                acc.take(),
+                &strip,
+                3,
+                t.y0,
+                th,
+                height,
+            )?);
+            wsum = Some(accumulate_along_axis(
+                wsum.take(),
+                &strip_weight,
+                3,
+                t.y0,
+                th,
+                height,
+            )?);
+        }
+        // materialize so the just-processed tile's activations (and prior graph) are freed.
+        let live: Vec<&Array> = [
+            row_acc.as_ref(),
+            row_wsum.as_ref(),
+            acc.as_ref(),
+            wsum.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        eval(live)?;
+        on_step(tile_idx + 1, n_tiles);
+    }
+    let acc = acc.ok_or_else(|| Error::Msg("seedvr2 tiled upscale: plan had no tiles".into()))?;
+    let wsum = wsum.ok_or_else(|| Error::Msg("seedvr2 tiled upscale: plan had no tiles".into()))?;
+    Ok(divide(&acc, &wsum)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The **predecessor assembly**, verbatim: every weighted tile *and* its feather weight padded to
+    /// the full frame, added into two full-frame accumulators, divided once at the end. A copy, not a
+    /// refactor — grading the fold against a paraphrase of itself would prove nothing.
+    fn pad_to_full_reference(
+        plan: &[video::SpatialTile],
+        height: i32,
+        width: i32,
+        mut weighted_tile: impl FnMut(&video::SpatialTile) -> Result<(Array, Array)>,
+    ) -> Result<Array> {
+        let mut acc: Option<Array> = None;
+        let mut wsum: Option<Array> = None;
+        for t in plan {
+            let (weighted, weight) = weighted_tile(t)?;
+            let pad_spec = [
+                (0, 0),
+                (0, 0),
+                (0, 0),
+                (t.y0, height - t.y1),
+                (t.x0, width - t.x1),
+            ];
+            let wdec = mlx_rs::ops::pad(&weighted, &pad_spec[..], None, None)?;
+            let wpad = mlx_rs::ops::pad(&weight, &pad_spec[..], None, None)?;
+            acc = Some(match acc {
+                Some(a) => mlx_rs::ops::add(&a, &wdec)?,
+                None => wdec,
+            });
+            wsum = Some(match wsum {
+                Some(a) => mlx_rs::ops::add(&a, &wpad)?,
+                None => wpad,
+            });
+            eval([acc.as_ref().unwrap(), wsum.as_ref().unwrap()])?;
+        }
+        Ok(divide(acc.expect("≥1 tile"), wsum.expect("≥1 tile"))?)
+    }
+
+    /// sc-18320: the x-then-y fold must reproduce the pad-every-tile-to-the-full-frame assembly it
+    /// replaced, on a **ragged** multi-row grid, with the shipped feather weights and a
+    /// position-dependent per-tile "decode" that differs between neighbours (so the feather weights
+    /// and their accumulated normalizer are both load-bearing — a mis-placed tile, a dropped weight,
+    /// or a row closed at the wrong index cannot pass by reconstructing an identity).
+    #[test]
+    fn spatial_fold_matches_the_pad_to_full_assembly() {
+        let (height, width, tile, overlap) = (200, 296, 128, 32);
+        let plan = video::plan_spatial_tiles(height, width, tile, overlap);
+        let rows = plan.iter().filter(|t| t.x0 == 0).count();
+        let cols = plan.iter().filter(|t| t.y0 == 0).count();
+        assert!(
+            rows > 1 && cols > 1 && plan.len() == rows * cols,
+            "the fixture must be a genuine multi-row product grid, got {rows}×{cols} for {} tiles",
+            plan.len()
+        );
+        // `tile_axis` keeps every tile full-size and shifts the LAST one back to land on the edge, so
+        // the trailing row/column overlaps its neighbour by more than `overlap`. That irregular stride
+        // is the fixture's raggedness — a fold that assumed a uniform stride would place it wrong.
+        let last = plan.last().expect("a non-empty plan");
+        assert_eq!((last.y1, last.x1), (height, width), "the plan must cover");
+        assert!(
+            plan.iter()
+                .any(|t| t.y0 > 0 && t.y0 % (tile - overlap) != 0)
+                || plan
+                    .iter()
+                    .any(|t| t.x0 > 0 && t.x0 % (tile - overlap) != 0),
+            "the fixture must include a shifted-back edge tile"
+        );
+
+        // Position-dependent and tile-dependent: value varies with absolute (y, x) AND carries a
+        // per-tile offset, so overlapping tiles disagree exactly where the feather blends them.
+        let tile_fn = |t: &video::SpatialTile| -> Result<(Array, Array)> {
             let (th, tw) = (t.y1 - t.y0, t.x1 - t.x0);
-            let y_idx = Array::from_slice(&(t.y0..t.y1).collect::<Vec<i32>>(), &[th]);
-            let x_idx = Array::from_slice(&(t.x0..t.x1).collect::<Vec<i32>>(), &[tw]);
-            let tile_clip = processed.take_axis(y_idx, 3)?.take_axis(x_idx, 4)?; // (1,3,1,th,tw)
-
-            // full model path on the tile (one-step Euler), same noise key as the other tiles.
-            let latent = self.encode(&tile_clip)?;
-            let sh = latent.shape();
-            let key = random::key(seed)?;
-            let noise =
-                random::normal::<f32>(&[1, 16, sh[2], sh[3], sh[4]], None, None, Some(&key))?
-                    .as_dtype(self.dtype)?;
-            let cond = Self::condition(&latent)?;
-            let latents = self.denoise(&noise, &cond, neg, &ts)?;
-            let decoded = self.decode_crop_5d(&latents, th, tw)?; // (1,3,1,th,tw)
-
-            // feather weight tapering on edges that abut a neighbor; placed at (y0,x0).
+            let values: Vec<f32> = (0..3 * th * tw)
+                .map(|i| {
+                    let channel = i / (th * tw);
+                    let y = t.y0 + (i / tw % th);
+                    let x = t.x0 + (i % tw);
+                    ((y as f32) * 0.013 + (x as f32) * 0.007 + (channel as f32) * 0.11).sin()
+                        + (t.y0 + t.x0) as f32 * 1e-3
+                })
+                .collect();
+            let decoded = Array::from_slice(&values, &[1, 3, 1, th, tw]);
             let wvec = video::feather_weight(
                 th,
                 tw,
@@ -794,66 +970,91 @@ impl Seedvr2Pipeline {
                 t.x1 < width,
                 overlap,
             );
-            let weight = Array::from_slice(&wvec, &[1, 1, 1, th, tw]).as_dtype(self.dtype)?;
-            // Fold along x into the row strip; the placement pad spans the x axis only.
-            row_acc = Some(accumulate_along_axis(
-                row_acc.take(),
-                &multiply(&decoded, &weight)?,
-                4,
-                t.x0,
-                tw,
-                width,
-            )?);
-            row_wsum = Some(accumulate_along_axis(
-                row_wsum.take(),
-                &weight,
-                4,
-                t.x0,
-                tw,
-                width,
-            )?);
-            // Close the finished row into the frame along y.
-            if (tile_idx + 1) % row_len == 0 {
-                let strip = row_acc.take().expect("the row opened above");
-                let strip_weight = row_wsum.take().expect("the row opened above");
-                acc = Some(accumulate_along_axis(
-                    acc.take(),
-                    &strip,
-                    3,
-                    t.y0,
-                    th,
-                    height,
-                )?);
-                wsum = Some(accumulate_along_axis(
-                    wsum.take(),
-                    &strip_weight,
-                    3,
-                    t.y0,
-                    th,
-                    height,
-                )?);
-            }
-            // materialize so the just-processed tile's activations (and prior graph) are freed.
-            let live: Vec<&Array> = [
-                row_acc.as_ref(),
-                row_wsum.as_ref(),
-                acc.as_ref(),
-                wsum.as_ref(),
-            ]
-            .into_iter()
-            .flatten()
-            .collect();
-            eval(live)?;
-            // F-164: report this completed tile (1-based) against the tile count for liveness.
-            on_step(tile_idx + 1, n_tiles);
-        }
-        Ok(divide(acc.expect("≥1 tile"), wsum.expect("≥1 tile"))?)
-    }
-}
+            let weight = Array::from_slice(&wvec, &[1, 1, 1, th, tw]);
+            Ok((multiply(&decoded, &weight)?, weight))
+        };
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+        let reference = pad_to_full_reference(&plan, height, width, tile_fn).unwrap();
+        let mut steps = Vec::new();
+        let folded = fold_spatial_tiles(&plan, height, width, tile_fn, &mut |done, total| {
+            steps.push((done, total))
+        })
+        .unwrap();
+        reference.eval().unwrap();
+        folded.eval().unwrap();
+
+        assert_eq!(folded.shape(), &[1, 3, 1, height, width]);
+        assert_eq!(folded.shape(), reference.shape());
+        let max = folded
+            .as_slice::<f32>()
+            .iter()
+            .zip(reference.as_slice::<f32>())
+            .map(|(l, r)| (l - r).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max < 1e-5,
+            "the fold moved the assembled frame: max|Δ|={max:.3e}"
+        );
+        // F-164 liveness is unchanged: one report per tile, 1-based, against the tile count.
+        assert_eq!(
+            steps,
+            (1..=plan.len())
+                .map(|i| (i, plan.len()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// sc-18320: the fold closes a row exactly at the grid's row boundaries.
+    ///
+    /// `row_len` is derived from the plan (count of tiles sharing the first tile's `y0`) rather than
+    /// recomputed from geometry, so pin that derivation against what `plan_spatial_tiles` actually
+    /// emits: x varies fastest, and `(idx + 1) % row_len == 0` must hold exactly for the tiles that
+    /// end a row. Closing a row early would fold a partial strip into the frame at the wrong offset.
+    /// A **non-square** grid is load-bearing here — it is what separates a correct derivation from one
+    /// that counted rows instead of columns.
+    #[test]
+    fn spatial_fold_row_boundaries_match_the_plan_grid() {
+        let (height, width, tile, overlap) = (200, 296, 128, 32);
+        let plan = video::plan_spatial_tiles(height, width, tile, overlap);
+        let row_len = plan
+            .first()
+            .map(|first| plan.iter().filter(|t| t.y0 == first.y0).count().max(1))
+            .unwrap_or(1);
+        let rows = plan.iter().filter(|t| t.x0 == plan[0].x0).count();
+        assert_ne!(rows, row_len, "the grid must not be square");
+        assert_eq!(
+            rows * row_len,
+            plan.len(),
+            "the plan must be a product grid"
+        );
+        for (idx, t) in plan.iter().enumerate() {
+            assert_eq!(
+                (idx + 1) % row_len == 0,
+                t.x1 == width,
+                "tile {idx} at x[{}, {}) disagrees with the row boundary",
+                t.x0,
+                t.x1
+            );
+        }
+    }
+
+    /// sc-18320: a cancel raised by the tile closure aborts the fold rather than being swallowed by
+    /// the accumulation, and no progress is reported for the tile that never completed.
+    #[test]
+    fn spatial_fold_propagates_a_tile_failure_without_reporting_it() {
+        let (height, width) = (200, 296);
+        let plan = video::plan_spatial_tiles(height, width, 128, 32);
+        let mut steps = 0usize;
+        let result = fold_spatial_tiles(
+            &plan,
+            height,
+            width,
+            |_| Err(Error::Canceled),
+            &mut |_, _| steps += 1,
+        );
+        assert!(matches!(result, Err(Error::Canceled)));
+        assert_eq!(steps, 0);
+    }
 
     /// The raw checkpoint keys of one shared block's attention (stored once under `.all`), at the
     /// given shapes, in fp16 (the dtype the real file stores). Values are random so buffers are

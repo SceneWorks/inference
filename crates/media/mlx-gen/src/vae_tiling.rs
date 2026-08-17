@@ -427,7 +427,7 @@ pub fn tiled_decode(
 /// intermediate axis strips are smaller than the output by the ratio the untiled axes contribute.
 ///
 /// Re-association means the accumulated blend weight factorizes exactly
-/// (`Σ_{i,j,k} tm_i·hm_j·wm_k = (Σ_i tm_i)(Σ_j hm_j)(Σ_k wm_k)`), so [`AxisCoverage`] carries the
+/// (`Σ_{i,j,k} tm_i·hm_j·wm_k = (Σ_i tm_i)(Σ_j hm_j)(Σ_k wm_k)`), so the fold carries the
 /// normalizer as three 1-D host vectors and materializes it once at the end — replacing a second
 /// full-output-sized accumulator that took a `pad`+`add` of its own per tile.
 ///
@@ -874,11 +874,11 @@ mod tests {
         let cfg = TilingConfig {
             spatial: Some(SpatialTiling {
                 tile_px: 4 * vae.spatial_scale,
-                overlap_px: 1 * vae.spatial_scale,
+                overlap_px: vae.spatial_scale,
             }),
             temporal: Some(TemporalTiling {
                 tile_frames: 3 * vae.temporal_scale,
-                overlap_frames: 1 * vae.temporal_scale,
+                overlap_frames: vae.temporal_scale,
             }),
         };
         let (f, h, w) = (7, 9, 11);
@@ -982,7 +982,7 @@ mod tests {
             let zeroed = multiply(&up, scalar(0.0))?;
             add(&zeroed, scalar(stamp.get())).map_err(Into::into)
         };
-        let reference = pad_to_full_reference(&denorm, &plan, axes, &stamped).unwrap();
+        let reference = pad_to_full_reference(&denorm, &plan, axes, stamped).unwrap();
         stamp.set(0.0);
         let folded = tiled_decode(&denorm, &plan, axes, None, &stamped).unwrap();
         reference.eval().unwrap();
@@ -1213,6 +1213,208 @@ mod tests {
         assert!(
             message.contains("one written extent per axis tile"),
             "the refusal must name the separability contract: {message}"
+        );
+    }
+
+    /// sc-18320: the blend normalizer must carry **every** tiled axis.
+    ///
+    /// The shipped trapezoidal masks are a partition of unity, so each axis's coverage is ≈1 and a
+    /// normalizer missing a whole factor is invisible — the equivalence fixtures above cannot see it.
+    /// This plan deliberately breaks that: two overlapping tiles per axis with all-ones masks, so
+    /// coverage is `[1, 2, 2, 1]` on each of t, h and w and the normalizer is the only thing standing
+    /// between the accumulation and a 2×/4×/8× over-count. An identity decode must therefore
+    /// reconstruct the input exactly, and must match the pad-to-full accumulator's own normalization.
+    ///
+    /// Executed mutation: dropping any one of the three factors from
+    /// `AxisCoverage::normalizer` turns this RED (and only this) — 2× too large in the doubly-covered
+    /// band of that axis.
+    #[test]
+    fn fold_normalizer_carries_every_tiled_axis() {
+        let (extent, edge) = (4i32, 3i32);
+        let count: i32 = extent * extent * extent;
+        // Position-dependent: value = 100·t + 10·h + w, distinct at every coordinate.
+        let values: Vec<f32> = (0..count)
+            .map(|i| {
+                let t = i / (extent * extent);
+                let h = i / extent % extent;
+                let w = i % extent;
+                (t * 100 + h * 10 + w) as f32
+            })
+            .collect();
+        let denorm = Array::from_slice(&values, &[1, 1, extent, extent, extent]);
+        let overlapping = || {
+            vec![
+                AxisTile {
+                    start: 0,
+                    end: edge,
+                    out_start: 0,
+                    out_stop: edge,
+                    mask: vec![1.0; edge as usize],
+                },
+                AxisTile {
+                    start: extent - edge,
+                    end: extent,
+                    out_start: extent - edge,
+                    out_stop: extent,
+                    mask: vec![1.0; edge as usize],
+                },
+            ]
+        };
+        let plan = TilePlan {
+            t: overlapping(),
+            h: overlapping(),
+            w: overlapping(),
+            out_f: extent,
+            out_h: extent,
+            out_w: extent,
+        };
+
+        let folded =
+            tiled_decode(&denorm, &plan, [2, 3, 4], None, |tile| Ok(tile.clone())).unwrap();
+        let reference =
+            pad_to_full_reference(&denorm, &plan, [2, 3, 4], |tile| Ok(tile.clone())).unwrap();
+        folded.eval().unwrap();
+        reference.eval().unwrap();
+        assert_eq!(folded.shape(), denorm.shape());
+        let max_vs_input = folded
+            .as_slice::<f32>()
+            .iter()
+            .zip(denorm.as_slice::<f32>())
+            .map(|(l, r)| (l - r).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_vs_input < 1e-3,
+            "a coverage-normalized identity decode must reconstruct the input: max|Δ|={max_vs_input:.3e}"
+        );
+        let max_vs_reference = folded
+            .as_slice::<f32>()
+            .iter()
+            .zip(reference.as_slice::<f32>())
+            .map(|(l, r)| (l - r).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_vs_reference < 1e-3,
+            "the fold's normalizer diverged from the accumulated one: max|Δ|={max_vs_reference:.3e}"
+        );
+    }
+
+    /// sc-18320: coverage must count only the extent a tile actually **wrote**.
+    ///
+    /// `at`/`ah`/`aw` clamp to the decoder's real output when it is shorter than the plan's declared
+    /// span, and the blend then uses `mask[..extent]`. The coverage vector has to be summed over the
+    /// same prefix — counting the whole declared mask would normalize positions the tile never wrote
+    /// against a weight it never applied. Here the first w tile spans 2 latent columns but declares 3
+    /// output columns, so its written extent is 2 while its mask is 3 long, and output column 2 is
+    /// covered by the second tile alone.
+    ///
+    /// Executed mutation: summing `tile.mask` instead of `tile.mask[..extent]` halves column 2 and
+    /// turns this RED.
+    #[test]
+    fn fold_coverage_counts_only_the_written_extent() {
+        let values: Vec<f32> = (0..16).map(|i| (i + 1) as f32).collect();
+        let denorm = Array::from_slice(&values, &[1, 1, 2, 2, 4]);
+        let whole = AxisTile {
+            start: 0,
+            end: 2,
+            out_start: 0,
+            out_stop: 2,
+            mask: vec![1.0; 2],
+        };
+        let plan = TilePlan {
+            t: vec![whole.clone()],
+            h: vec![whole],
+            w: vec![
+                // Spans 2 latent columns but declares 3 output columns: written extent 2, mask 3.
+                AxisTile {
+                    start: 0,
+                    end: 2,
+                    out_start: 0,
+                    out_stop: 3,
+                    mask: vec![1.0; 3],
+                },
+                AxisTile {
+                    start: 1,
+                    end: 4,
+                    out_start: 1,
+                    out_stop: 4,
+                    mask: vec![1.0; 3],
+                },
+            ],
+            out_f: 2,
+            out_h: 2,
+            out_w: 4,
+        };
+
+        let folded =
+            tiled_decode(&denorm, &plan, [2, 3, 4], None, |tile| Ok(tile.clone())).unwrap();
+        let reference =
+            pad_to_full_reference(&denorm, &plan, [2, 3, 4], |tile| Ok(tile.clone())).unwrap();
+        folded.eval().unwrap();
+        reference.eval().unwrap();
+        assert_eq!(folded.shape(), &[1, 1, 2, 2, 4]);
+        let max = folded
+            .as_slice::<f32>()
+            .iter()
+            .zip(reference.as_slice::<f32>())
+            .map(|(l, r)| (l - r).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max < 1e-4,
+            "the truncated-extent blend diverged from the accumulated one: max|Δ|={max:.3e}"
+        );
+        // Column 2 is written by the second tile only, so it must come back at unit weight — the
+        // input value, not half of it.
+        let read = folded.as_slice::<f32>();
+        let input = denorm.as_slice::<f32>();
+        for row in 0..4usize {
+            assert!(
+                (read[row * 4 + 2] - input[row * 4 + 2]).abs() < 1e-4,
+                "singly-covered column 2 of row {row} was normalized against an unwritten weight: \
+                 got {}, want {}",
+                read[row * 4 + 2],
+                input[row * 4 + 2]
+            );
+        }
+    }
+
+    /// sc-18320: an axis tile that writes past the output extent is REFUSED before any placement.
+    /// Without the bounds check the coverage vector would be indexed out of range (a panic, not a
+    /// catchable error) or — with the check weakened to a clamp — silently normalized against a blend
+    /// the accumulation never performed.
+    #[test]
+    fn fold_refuses_an_axis_tile_that_writes_past_the_output() {
+        let vals: Vec<f32> = (0..16).map(|i| i as f32).collect();
+        let denorm = Array::from_slice(&vals, &[1, 1, 4, 2, 2]);
+        let unit = AxisTile {
+            start: 0,
+            end: 2,
+            out_start: 0,
+            out_stop: 2,
+            mask: vec![1.0; 2],
+        };
+        let plan = TilePlan {
+            // The temporal tile claims output [3, 7) of a 4-long axis.
+            t: vec![AxisTile {
+                start: 0,
+                end: 4,
+                out_start: 3,
+                out_stop: 7,
+                mask: vec![1.0; 4],
+            }],
+            h: vec![unit.clone()],
+            w: vec![unit],
+            out_f: 4,
+            out_h: 2,
+            out_w: 2,
+        };
+        let result = tiled_decode(&denorm, &plan, [2, 3, 4], None, |tile| Ok(tile.clone()));
+        let message = match result {
+            Err(Error::Msg(message)) => message,
+            other => panic!("expected a refusal, got {other:?}"),
+        };
+        assert!(
+            message.contains("outside the 4-long output axis"),
+            "the refusal must name the axis it overran: {message}"
         );
     }
 
