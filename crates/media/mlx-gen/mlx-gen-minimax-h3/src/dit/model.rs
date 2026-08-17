@@ -468,7 +468,7 @@ impl JointDit {
                 layout.num_text_tokens()
             )));
         }
-        let tables = dit.rope.tables(layout.position_ids(), dit.dtype)?;
+        let tables = dit.rope.tables(layout.position_ids())?;
 
         let (modulation, norm_out_modulation, resident_adaln_indices, released_bytes) =
             match residency {

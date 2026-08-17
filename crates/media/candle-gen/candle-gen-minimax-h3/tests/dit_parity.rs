@@ -111,9 +111,7 @@ fn mm_rope_tables_match_the_reference() {
         "the fixture must exercise the PARTIAL rotary path"
     );
 
-    let tables = rope
-        .tables(&f.tensor("layout.position_ids"), DType::F32)
-        .unwrap();
+    let tables = rope.tables(&f.tensor("layout.position_ids")).unwrap();
     assert_parity(&tables.cos, &f.tensor("out.rope_cos"), TOL, "rope cos");
     assert_parity(&tables.sin, &f.tensor("out.rope_sin"), TOL, "rope sin");
 }
@@ -131,14 +129,14 @@ fn permuting_the_rope_axes_breaks_parity() {
     let want = f.tensor("out.rope_sin");
 
     // Baseline agrees.
-    let (base, _) = rel(&rope.tables(&ids, DType::F32).unwrap().sin, &want);
+    let (base, _) = rel(&rope.tables(&ids).unwrap().sin, &want);
     assert!(base < TOL, "baseline rope must match first ({base:.3e})");
 
     // (t, h, w) -> (h, w, t) and (t, w, h): both are legal grids and neither is this model.
     for (label, order) in [("h,w,t", [1u32, 2, 0]), ("t,w,h", [0, 2, 1])] {
         let idx = Tensor::from_vec(order.to_vec(), (3,), &dev()).unwrap();
         let permuted = ids.index_select(&idx, 1).unwrap();
-        let got = rope.tables(&permuted, DType::F32).unwrap().sin;
+        let got = rope.tables(&permuted).unwrap().sin;
         let (peak, _) = rel(&got, &want);
         println!("  rope axes {label}: peak rel {peak:.3e}");
         assert!(
@@ -395,9 +393,7 @@ fn transformer_block_matches_the_reference() {
     let b = block(&w, &cfg, 0);
 
     let rope = rope_of(&cfg);
-    let tables = rope
-        .tables(&f.tensor("layout.position_ids"), DType::F32)
-        .unwrap();
+    let tables = rope.tables(&f.tensor("layout.position_ids")).unwrap();
     let got = b
         .forward_with_temb(
             &f.tensor("in.block.hidden"),
@@ -422,9 +418,7 @@ fn attention_matches_the_reference_with_and_without_the_rotary() {
         DitAttention::from_weights(&w, "transformer_blocks.0.attn", &cfg, DType::F32).unwrap();
 
     let rope = rope_of(&cfg);
-    let tables = rope
-        .tables(&f.tensor("layout.position_ids"), DType::F32)
-        .unwrap();
+    let tables = rope.tables(&f.tensor("layout.position_ids")).unwrap();
     let x = f.tensor("in.attn.hidden");
 
     let with_rope = attn.forward(&x, Some((&rope, &tables))).unwrap();
@@ -541,9 +535,7 @@ fn qk_norm_runs_per_head_before_the_rotary() {
     let attn =
         DitAttention::from_weights(&w, "transformer_blocks.0.attn", &cfg, DType::F32).unwrap();
     let rope = rope_of(&cfg);
-    let tables = rope
-        .tables(&f.tensor("layout.position_ids"), DType::F32)
-        .unwrap();
+    let tables = rope.tables(&f.tensor("layout.position_ids")).unwrap();
     let x = f.tensor("in.attn.hidden");
     let want = f.tensor("out.attn.hidden");
 
@@ -641,9 +633,7 @@ fn every_norm_epsilon_is_wired_through() {
     assert_eq!(cfg.final_norm_eps, 1e-5);
 
     let rope = rope_of(&cfg);
-    let tables = rope
-        .tables(&f.tensor("layout.position_ids"), DType::F32)
-        .unwrap();
+    let tables = rope.tables(&f.tensor("layout.position_ids")).unwrap();
     let attn_in = f.tensor("in.attn.hidden");
     let refiner_in = f.tensor("in.refiner.hidden");
     let block_in = f.tensor("in.block.hidden");
@@ -774,9 +764,7 @@ fn reading_the_ffn_halves_gate_first_breaks_parity() {
     let f = fixture();
     let cfg = dit_fixture_config();
     let rope = rope_of(&cfg);
-    let tables = rope
-        .tables(&f.tensor("layout.position_ids"), DType::F32)
-        .unwrap();
+    let tables = rope.tables(&f.tensor("layout.position_ids")).unwrap();
     let x = f.tensor("in.block.hidden");
     let temb = f.tensor("in.temb");
     let idx = f.indices("layout.adaln_indices");
@@ -951,9 +939,7 @@ fn the_wrong_qkv_transform_breaks_parity() {
     let cfg = dit_fixture_config();
     let (heads, head_dim) = (cfg.num_attention_heads, cfg.attention_head_dim);
     let rope = rope_of(&cfg);
-    let tables = rope
-        .tables(&f.tensor("layout.position_ids"), DType::F32)
-        .unwrap();
+    let tables = rope.tables(&f.tensor("layout.position_ids")).unwrap();
     let x = f.tensor("in.attn.hidden");
     let want = f.tensor("out.attn.hidden");
 
@@ -1007,9 +993,7 @@ fn the_modality_term_of_the_adaln_index_is_load_bearing() {
     let f = fixture();
     let cfg = dit_fixture_config();
     let rope = rope_of(&cfg);
-    let tables = rope
-        .tables(&f.tensor("layout.position_ids"), DType::F32)
-        .unwrap();
+    let tables = rope.tables(&f.tensor("layout.position_ids")).unwrap();
     let x = f.tensor("in.block.hidden");
     let temb = f.tensor("in.temb");
     let want = f.tensor("out.block.hidden");
@@ -1107,9 +1091,7 @@ fn every_block_weight_is_load_bearing() {
     let f = fixture();
     let cfg = dit_fixture_config();
     let rope = rope_of(&cfg);
-    let tables = rope
-        .tables(&f.tensor("layout.position_ids"), DType::F32)
-        .unwrap();
+    let tables = rope.tables(&f.tensor("layout.position_ids")).unwrap();
     let x = f.tensor("in.block.hidden");
     let temb = f.tensor("in.temb");
     let idx = f.indices("layout.adaln_indices");
@@ -1152,9 +1134,7 @@ fn parity_residuals_bound_the_mutation_floor() {
     let f = fixture();
     let cfg = dit_fixture_config();
     let rope = rope_of(&cfg);
-    let tables = rope
-        .tables(&f.tensor("layout.position_ids"), DType::F32)
-        .unwrap();
+    let tables = rope.tables(&f.tensor("layout.position_ids")).unwrap();
     let idx = f.indices("layout.adaln_indices");
     let temb = f.tensor("in.temb");
     let w = model_weights(&f);

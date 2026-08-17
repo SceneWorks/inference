@@ -395,10 +395,7 @@ fn one_forward(c: &MiniMaxH3DitConfig, blocks: &[DitBlock], cache: &AdaLnCache, 
     let rope = MmRope::new(c.rope_freq_dim, c.rope_theta).unwrap();
     let pos: Vec<f32> = (0..SEQ * 3).map(|i| (i % 7) as f32).collect();
     let tables = rope
-        .tables(
-            &Tensor::from_vec(pos, (SEQ, 3), device).unwrap(),
-            DType::F32,
-        )
+        .tables(&Tensor::from_vec(pos, (SEQ, 3), device).unwrap())
         .unwrap();
     let classes: Vec<u32> = (0..SEQ).map(|i| (i % 4) as u32).collect();
     let tags: Vec<u32> = (0..SEQ).map(|i| (i % MODALITY_NUM) as u32).collect();

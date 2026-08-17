@@ -100,7 +100,7 @@ fn a_bounded_plan_reaches_the_real_dit_attention_call() {
             .unwrap();
     let rope = rope_of(&cfg);
     let tables = rope
-        .tables(f.require("layout.position_ids").unwrap(), Dtype::Float32)
+        .tables(f.require("layout.position_ids").unwrap())
         .unwrap();
     let x = f.require("in.attn.hidden").unwrap();
     let seq = x.shape()[1];
@@ -220,7 +220,7 @@ fn a_bounded_plan_threads_the_whole_block_stack() {
         DitBlock::from_weights(&mut w, "transformer_blocks.0", &cfg, Dtype::Float32).unwrap();
     let rope = rope_of(&cfg);
     let tables = rope
-        .tables(f.require("layout.position_ids").unwrap(), Dtype::Float32)
+        .tables(f.require("layout.position_ids").unwrap())
         .unwrap();
     let x = f.require("in.block.hidden").unwrap();
     let temb = f.require("in.temb").unwrap();

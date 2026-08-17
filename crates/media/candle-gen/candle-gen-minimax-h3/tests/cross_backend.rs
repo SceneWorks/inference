@@ -666,7 +666,7 @@ fn dit_agrees_with_the_mlx_lane() {
 
     let rope = MmRope::new(cfg.rope_freq_dim, cfg.rope_theta).expect("rope");
     let tables = rope
-        .tables(&f.tensor("layout.position_ids"), DType::F32)
+        .tables(&f.tensor("layout.position_ids"))
         .expect("tables");
     report("dit.rope_cos", &tables.cos, &mut checked, &mut worst);
     report("dit.rope_sin", &tables.sin, &mut checked, &mut worst);
@@ -852,7 +852,7 @@ fn the_dit_cross_backend_floor_is_also_the_mlx_lanes() {
 
     let rope = MmRope::new(cfg.rope_freq_dim, cfg.rope_theta).expect("rope");
     let tables = rope
-        .tables(&f.tensor("layout.position_ids"), DType::F32)
+        .tables(&f.tensor("layout.position_ids"))
         .expect("tables");
     let block =
         DitBlock::from_weights(&w, "transformer_blocks.0", &cfg, DType::F32).expect("block");
@@ -920,7 +920,7 @@ fn a_dit_gated_ffn_half_swap_is_loud_against_the_mlx_record() {
 
     let rope = MmRope::new(cfg.rope_freq_dim, cfg.rope_theta).expect("rope");
     let tables = rope
-        .tables(&f.tensor("layout.position_ids"), DType::F32)
+        .tables(&f.tensor("layout.position_ids"))
         .expect("tables");
 
     let mut map = f.model_map(&["src.", "in.", "out.", "layout."]);

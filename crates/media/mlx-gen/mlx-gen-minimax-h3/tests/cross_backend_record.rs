@@ -273,7 +273,7 @@ fn record_mlx_decode_for_the_candle_cross_backend_gate() {
     };
     let position_ids = df.require("layout.position_ids").unwrap();
     let rope = MmRope::new(dcfg.rope_freq_dim, dcfg.rope_theta).unwrap();
-    let tables = rope.tables(position_ids, Dtype::Float32).unwrap();
+    let tables = rope.tables(position_ids).unwrap();
     record.push(("dit.rope_cos".into(), tables.cos.clone()));
     record.push(("dit.rope_sin".into(), tables.sin.clone()));
 

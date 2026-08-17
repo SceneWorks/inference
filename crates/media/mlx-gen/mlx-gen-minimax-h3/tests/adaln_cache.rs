@@ -169,7 +169,7 @@ fn run_cached(cfg: &MiniMaxH3DitConfig, schedule: TimestepSchedule) -> (Array, A
     let f = fixture();
     let rope = MmRope::new(cfg.rope_freq_dim, cfg.rope_theta).unwrap();
     let tables = rope
-        .tables(f.require("layout.position_ids").unwrap(), Dtype::Float32)
+        .tables(f.require("layout.position_ids").unwrap())
         .unwrap();
     let (classes, tags) = packed_rows();
     let seq = classes.len() as i32;
@@ -198,7 +198,7 @@ fn run_naive(cfg: &MiniMaxH3DitConfig, schedule: &TimestepSchedule) -> Array {
     let f = fixture();
     let rope = MmRope::new(cfg.rope_freq_dim, cfg.rope_theta).unwrap();
     let tables = rope
-        .tables(f.require("layout.position_ids").unwrap(), Dtype::Float32)
+        .tables(f.require("layout.position_ids").unwrap())
         .unwrap();
     let (classes, tags) = packed_rows();
     let seq = classes.len() as i32;
@@ -375,7 +375,7 @@ fn a_cache_from_another_schedule_is_stale_and_observably_wrong() {
     let f = fixture();
     let rope = MmRope::new(cfg.rope_freq_dim, cfg.rope_theta).unwrap();
     let tables = rope
-        .tables(f.require("layout.position_ids").unwrap(), Dtype::Float32)
+        .tables(f.require("layout.position_ids").unwrap())
         .unwrap();
     let (classes, tags) = packed_rows();
     let seq = classes.len() as i32;
@@ -421,7 +421,7 @@ fn a_step_off_by_one_in_the_remap_is_observable() {
     let f = fixture();
     let rope = MmRope::new(cfg.rope_freq_dim, cfg.rope_theta).unwrap();
     let tables = rope
-        .tables(f.require("layout.position_ids").unwrap(), Dtype::Float32)
+        .tables(f.require("layout.position_ids").unwrap())
         .unwrap();
     let (classes, tags) = packed_rows();
     let seq = classes.len() as i32;
@@ -458,7 +458,7 @@ fn skipping_the_local_to_global_remap_is_observable() {
     let f = fixture();
     let rope = MmRope::new(cfg.rope_freq_dim, cfg.rope_theta).unwrap();
     let tables = rope
-        .tables(f.require("layout.position_ids").unwrap(), Dtype::Float32)
+        .tables(f.require("layout.position_ids").unwrap())
         .unwrap();
     let (classes, tags) = packed_rows();
     let seq = classes.len() as i32;
@@ -620,7 +620,7 @@ fn an_evicted_block_still_runs_but_cannot_project() {
     let f = fixture();
     let rope = MmRope::new(cfg.rope_freq_dim, cfg.rope_theta).unwrap();
     let tables = rope
-        .tables(f.require("layout.position_ids").unwrap(), Dtype::Float32)
+        .tables(f.require("layout.position_ids").unwrap())
         .unwrap();
     let (classes, tags) = packed_rows();
     let seq = classes.len() as i32;

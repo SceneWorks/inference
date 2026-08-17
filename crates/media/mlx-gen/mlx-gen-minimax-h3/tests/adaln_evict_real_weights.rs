@@ -306,9 +306,7 @@ fn one_forward(cfg: &MiniMaxH3DitConfig, blocks: &[DitBlock], cache: &AdaLnCache
     const SEQ: i32 = 512;
     let rope = MmRope::new(cfg.rope_freq_dim, cfg.rope_theta).unwrap();
     let pos: Vec<f32> = (0..SEQ * 3).map(|i| (i % 13) as f32).collect();
-    let tables = rope
-        .tables(&Array::from_slice(&pos, &[SEQ, 3]), Dtype::Bfloat16)
-        .unwrap();
+    let tables = rope.tables(&Array::from_slice(&pos, &[SEQ, 3])).unwrap();
     let classes: Vec<i32> = (0..SEQ).map(|i| i % 4).collect();
     let tags: Vec<i32> = (0..SEQ).map(|i| i % MODALITY_NUM).collect();
     let idx = cache

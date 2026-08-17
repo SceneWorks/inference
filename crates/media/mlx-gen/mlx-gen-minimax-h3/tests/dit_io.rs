@@ -348,7 +348,7 @@ fn the_whole_model_reproduces_the_reference_velocity() {
     let text_rows = dit.embed_context(&context).expect("context rows");
     let tables = MmRope::new(cfg.rope_freq_dim, cfg.rope_theta)
         .unwrap()
-        .tables(&position_ids, Dtype::Float32)
+        .tables(&position_ids)
         .unwrap();
     let norm_out = dit
         .projections()
