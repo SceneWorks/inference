@@ -110,13 +110,27 @@ impl MiniMaxH3Dit {
     /// float32/bfloat16 top-level tensors), and the loader map is dropped before returning so that
     /// no storage-sharing clone outlives this call — the precondition
     /// [`AdaLnCache::precompute_and_evict`] needs.
+    /// **Flat-layout convenience.** A staged tier's partition is not under the snapshot root
+    /// (sc-20267 — `crate::tier` resolves it from the caller's component override), so the render path
+    /// goes through [`Self::load_from_dir`] with the directory it resolved. This wrapper is the
+    /// `root` + `partition` join for callers that genuinely hold a flat snapshot.
     pub fn load(
         root: impl AsRef<Path>,
         partition: &str,
         device: &Device,
         dtype: DType,
     ) -> Result<Self> {
-        let dir = root.as_ref().join(partition);
+        Self::load_from_dir(root.as_ref().join(partition), device, dtype)
+    }
+
+    /// Load a **resolved** DiT partition directory: its `config.json` and its shards.
+    ///
+    /// The tier-aware entry point. `dir` is whatever `crate::tier::MiniMaxH3TierPaths` resolved for
+    /// this partition, which on a split install is outside the snapshot root entirely. Whether the
+    /// weights inside are packed or dense is *not* a parameter — `crate::quant::lin` auto-detects it
+    /// per tensor from the `{base}.scales` sibling, so one loader serves every tier.
+    pub fn load_from_dir(dir: impl AsRef<Path>, device: &Device, dtype: DType) -> Result<Self> {
+        let dir = dir.as_ref();
         let config_path = dir.join("config.json");
         let text = std::fs::read_to_string(&config_path).map_err(|e| {
             CandleError::Msg(format!(
@@ -125,7 +139,7 @@ impl MiniMaxH3Dit {
             ))
         })?;
         let cfg = MiniMaxH3DitConfig::from_diffusers_json(&text)?;
-        let shards = candle_gen::loader::sorted_safetensors(&dir, "minimax-h3 dit")?;
+        let shards = candle_gen::loader::sorted_safetensors(dir, "minimax-h3 dit")?;
         let w = Weights::from_files(&shards, device, dtype)?;
         let model = Self::from_weights(&w, &cfg, device, dtype)?;
         // Drop the map here rather than at the call site: every tensor in it shares storage with

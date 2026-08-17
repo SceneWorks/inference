@@ -186,8 +186,21 @@ impl MiniMaxH3TeConfig {
     /// Parse `<root>/text_encoder/config.json`. Missing scalars fall back to
     /// [`Self::qwen3_vl_32b`]; `select_hidden` has no config home at all (see the module docs) and
     /// always comes from the constant.
+    ///
+    /// **Flat-snapshot convenience only.** A staged tier's text encoder is not under the snapshot
+    /// root (sc-20267 — `crate::tier` resolves it from the caller's component override), so the
+    /// render path goes through [`Self::from_component_dir`] with the resolved directory. This
+    /// wrapper survives for callers that genuinely hold a root.
     pub fn from_snapshot(root: impl AsRef<Path>) -> Result<Self> {
-        let path = root.as_ref().join("text_encoder").join("config.json");
+        Self::from_component_dir(root.as_ref().join("text_encoder"))
+    }
+
+    /// Parse a resolved `text_encoder/` component directory's `config.json`.
+    ///
+    /// The tier-aware entry point: the directory is whatever [`crate::tier::MiniMaxH3TierPaths`]
+    /// resolved, which on a split install is outside the snapshot root entirely.
+    pub fn from_component_dir(dir: impl AsRef<Path>) -> Result<Self> {
+        let path = dir.as_ref().join("config.json");
         let text = std::fs::read_to_string(&path).map_err(|e| {
             CandleError::Msg(format!("minimax-h3 te: read {}: {e}", path.display()))
         })?;
@@ -308,18 +321,42 @@ pub fn minimax_h3_vision_config() -> VisionConfig {
     }
 }
 
-/// Load the shared Qwen3-VL vision tower out of a snapshot's `text_encoder/` component.
+/// Load the shared Qwen3-VL vision tower out of a **resolved** `text_encoder/` component directory.
 ///
 /// The tower lives entirely in shard 14 (all 351 `model.visual.*` tensors), alongside the
 /// never-executed decoder tail — so a *directory* read that materialized everything would carry
 /// ~15 GB for nothing. `candle_gen_boogu::loader::Weights` mmaps headers and materializes only the
 /// tensors the tower asks for by name, so the prefix does the trim without a shard allowlist.
 ///
-/// Loaded **f32**, which is what boogu's tower requires (`Weights::get_f32` throughout): the tower
-/// is 0.9 GB, so widening it is a rounding error against the 53 GB conditioning stage.
-pub fn load_vision_tower(root: impl AsRef<Path>, device: &Device) -> Result<VisionTower> {
-    let dir = root.as_ref().join("text_encoder");
-    let w = candle_gen_boogu::loader::Weights::from_dir(&dir, device, DType::F32)?;
+/// # This takes the COMPONENT DIRECTORY, not the snapshot root (sc-20267)
+///
+/// It used to join `root/text_encoder` itself. A staged tier's text encoder is not under the
+/// snapshot root — [`crate::tier::MiniMaxH3TierPaths`] resolves it from the caller's component
+/// override — so joining the root would have loaded the vision tower from a *different tier* than
+/// the decoder projections beside it, or from a directory that does not exist at all on a split
+/// install. The caller passes the dir it resolved.
+///
+/// # Packed tiers are served (sc-20267)
+///
+/// `mlx_gen_minimax_h3::convert::TE_PACK_SUFFIXES` packs the tower's `.attn.qkv`, `.attn.proj`,
+/// `.linear_fc1` and `.linear_fc2` into every packed text-encoder tier, and the MLX lane loads them
+/// back packed. The shared `candle_gen_boogu::vision::VisionTower` now auto-detects the same
+/// `{base}.scales` triple, at the group size the tier's own `config.json` marker declares, so a `q4`
+/// or `q8` text encoder loads here without a dense transient. It used to refuse them outright, which
+/// is what made a packed TE tier unloadable on this lane.
+///
+/// `TE_DENSE_BY_POLICY` keeps `.pos_embed`, `.patch_embed.proj` and the vision LayerNorms dense in
+/// **every** tier, and the tower still reads those densely behind its own guards — the sc-14980
+/// protection, unchanged. The blocks' `mlp.linear_fc2` is a declared pack target that passes through
+/// dense **by shape** (its 4304 input is not group-aligned), so a real tier is a *mixed* tower; the
+/// per-tensor detect handles that without a special case.
+///
+/// The dense path still loads **f32**, which is what boogu's tower requires (`Weights::get_f32`
+/// throughout): the tower is 0.9 GB, so widening it is a rounding error against the 53 GB
+/// conditioning stage.
+pub fn load_vision_tower(te_dir: impl AsRef<Path>, device: &Device) -> Result<VisionTower> {
+    let dir = te_dir.as_ref();
+    let w = candle_gen_boogu::loader::Weights::from_dir(dir, device, DType::F32)?;
     Ok(VisionTower::load(
         &w,
         minimax_h3_vision_config(),

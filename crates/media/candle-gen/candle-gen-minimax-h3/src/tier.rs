@@ -3,9 +3,13 @@
 //!
 //! [`crate::quant`] answers "is *this tensor* packed?" from a `.scales` sibling. This module answers
 //! the question one level up: **which directories** does a given tier's DiT, reference DiT and text
-//! encoder come from, and does the tier the caller asked for match the tier actually on disk. It is
-//! inert until the `supported_quants` flip (PR 3 of sc-20267); nothing in [`crate::model`] calls it
-//! yet, and its whole surface is exercised by the unit tests below against tempdir fixtures.
+//! encoder come from, and does the tier the caller asked for match the tier actually on disk.
+//!
+//! **It is live as of PR 3 of sc-20267.** [`crate::model::MiniMaxH3::load`] resolves these paths once
+//! and holds them, and every component a render reads comes from them — the DiT, the reference DiT,
+//! the text-encoder shards, the TE config and the shared vision tower. The unit tests below still
+//! exercise the whole surface against tempdir fixtures; `crate::model`'s own tests drive it through
+//! the **request** path, which is what proves `spec.quantize` really reaches here.
 //!
 //! # The layout is NOT `root/{tier}/component`, and mirroring that is the point
 //!
@@ -146,7 +150,7 @@ pub const TEXT_ENCODER_COMPONENT: &str = "text_encoder";
 
 /// A published MiniMax-H3 weight tier.
 ///
-/// # ⚠️ PR 3 must not map an absent request onto [`Tier::Bf16`]
+/// # ⚠️ An absent request is NOT [`Tier::Bf16`] — and the flip honours that
 ///
 /// This enum can express only an *asserted* tier, and gen-core's `spec.quantize` is an
 /// `Option<Quant>` whose `None` means **"the caller asserted nothing"**. MLX honours that third
@@ -156,12 +160,21 @@ pub const TEXT_ENCODER_COMPONENT: &str = "text_encoder";
 /// [`MiniMaxH3TierPaths::require_dit`] refuses a packed tier under it (see
 /// `a_packed_component_under_a_bf16_request_is_refused`).
 ///
-/// So the `supported_quants` flip must map `spec.quantize` deliberately, **not** by defaulting
-/// `None` to `Bf16` — that would turn "I did not ask" into "I demand dense" and reject every packed
-/// install that loads fine on MLX today. Either add an `Unasserted` variant, or skip the reconcile
-/// entirely when `spec.quantize` is `None` and let the loaders auto-detect (which they already do —
-/// nothing downstream of here reads a tier). Deliberately not wired now: this PR ships the resolver
-/// inert, and picking the shape without the call site in front of you invites the wrong default.
+/// **Resolved in PR 3 (sc-20267) by the second of the two options this warning offered:** no
+/// `Unasserted` variant was added; instead `crate::model`'s `requested_tier` maps `None` to `None` and
+/// the reconcile is **skipped**, through [`MiniMaxH3TierPaths::require_dit_unasserted`]. The loaders
+/// auto-detect from `{base}.scales` regardless, so nothing downstream needs telling. Defaulting `None`
+/// to `Bf16` would have turned "I did not ask" into "I demand dense" and rejected every packed install
+/// that loads fine on MLX today — `crate::model`'s
+/// `an_unasserted_request_admits_a_packed_tier_rather_than_demanding_dense` is the test that holds it.
+///
+/// The group-size validation is deliberately **not** skipped with the reconcile: a mismatched group
+/// derives a legal-looking, wrong bit width instead of failing cleanly (sc-15154), so it is the one
+/// check that must run whether or not a tier was named.
+///
+/// [`Quant::Nvfp4`](candle_gen::gen_core::Quant::Nvfp4) has no mapping here at all and is refused by
+/// name in `crate::model::load`: it reports 4 bits, so mapping it to [`Tier::Q4`] would let it
+/// reconcile *cleanly* against a `q4` marker and render int4-affine under an NVFP4 request.
 ///
 /// The three the rehost publishes, and the complete set: `SceneWorks/minimax-h3-mlx` ships `q4`,
 /// `q8` and `bf16`.
@@ -245,18 +258,35 @@ impl MiniMaxH3TierPaths {
     /// Require the DiT partition for `tier`: the directory exists and carries a `config.json`, and
     /// its on-disk quantization marker agrees with `tier`.
     pub fn require_dit(&self, tier: Tier) -> Result<()> {
-        require_component_dir(&self.dit_dir, tier, DIT_COMPONENT)?;
-        reconcile_tier(&self.dit_dir, tier, DIT_COMPONENT)?;
-        validate_group_size(&self.dit_dir, DIT_COMPONENT)
+        require_partition(&self.dit_dir, Some(tier), DIT_COMPONENT)
+    }
+
+    /// Require the DiT partition when the caller asserted **no** tier — the `spec.quantize == None`
+    /// arm of the request mapping ([`crate::model`]'s `requested_tier`).
+    ///
+    /// The directory and its `config.json` are still required, and the declared group size is still
+    /// validated, but there is no requested tier to reconcile against. That is deliberate and it
+    /// mirrors MLX: `mlx_gen_minimax_h3::model::reconcile_tier` admits `(Some(_), None)` — a packed
+    /// tier under no assertion — because the loaders recover the tier from `{base}.scales` anyway.
+    /// Refusing here instead would reject every packed install that loads fine on MLX today.
+    ///
+    /// The group-size check is **not** skippable with the tier, and that asymmetry is the point: a
+    /// mismatched group size does not fail cleanly at all (sc-15154), so it is the one property that
+    /// must be checked whether or not the caller said which tier they staged.
+    pub fn require_dit_unasserted(&self) -> Result<()> {
+        require_partition(&self.dit_dir, None, DIT_COMPONENT)
     }
 
     /// Require the `ref2va` partition for `tier` — called only when a request resolves to
     /// [`MiniMaxH3Task::Ref2va`](crate::model::MiniMaxH3Task), never at load — see the module docs
     /// for why this lane probes lazily where MLX probes eagerly.
     pub fn require_reference_dit(&self, tier: Tier) -> Result<()> {
-        require_component_dir(&self.reference_dit_dir, tier, REFERENCE_DIT_PARTITION)?;
-        reconcile_tier(&self.reference_dit_dir, tier, REFERENCE_DIT_PARTITION)?;
-        validate_group_size(&self.reference_dit_dir, REFERENCE_DIT_PARTITION)
+        require_partition(&self.reference_dit_dir, Some(tier), REFERENCE_DIT_PARTITION)
+    }
+
+    /// [`Self::require_reference_dit`] under no asserted tier — see [`Self::require_dit_unasserted`].
+    pub fn require_reference_dit_unasserted(&self) -> Result<()> {
+        require_partition(&self.reference_dit_dir, None, REFERENCE_DIT_PARTITION)
     }
 
     /// Require the condition encoder: the directory exists and carries a `config.json`, and — if it
@@ -305,24 +335,44 @@ fn packed_config(dir: &Path) -> Result<Option<PackedConfig>> {
     Ok(PackedConfig::from_config(&json))
 }
 
+/// Require one DiT partition at an **optionally** asserted tier.
+///
+/// The single implementation behind [`MiniMaxH3TierPaths::require_dit`] /
+/// `require_dit_unasserted` and their `transformer_ref` twins. `tier` is `Option` here — and only
+/// here — because that is the shape `mlx_gen_minimax_h3::model::reconcile_tier` takes: the reconcile
+/// is what the third state switches off, while the directory probe and the group-size validation run
+/// either way.
+fn require_partition(dir: &Path, tier: Option<Tier>, component: &str) -> Result<()> {
+    require_component_dir(dir, tier, component)?;
+    if let Some(tier) = tier {
+        reconcile_tier(dir, tier, component)?;
+    }
+    validate_group_size(dir, component)
+}
+
 /// The directory exists and carries the `config.json` every component ships — the probe
-/// `mlx_gen_minimax_h3::model` runs, with the tier named so the message says which install is wrong.
-fn require_component_dir(dir: &Path, tier: Tier, component: &str) -> Result<()> {
+/// `mlx_gen_minimax_h3::model` runs, with the tier named (when one was asserted) so the message says
+/// which install is wrong.
+fn require_component_dir(dir: &Path, tier: Option<Tier>, component: &str) -> Result<()> {
+    // "the `q4` tier" when one was asserted, "the staged tier" when the caller asserted nothing —
+    // the message must not invent a tier name the caller never gave.
+    let which = tier.map_or_else(
+        || "the staged".to_owned(),
+        |t| format!("the `{}`", t.as_str()),
+    );
     if !dir.is_dir() {
         return Err(CandleError::Msg(format!(
-            "{MODEL_ID}: the `{}` tier has no `{component}/` component at {} — stage the tier's \
+            "{MODEL_ID}: {which} tier has no `{component}/` component at {} — stage the tier's \
              `{component}` directory as the '{component}' component, or point at a snapshot root \
              that holds `{component}/`",
-            tier.as_str(),
             dir.display()
         )));
     }
     let config = dir.join("config.json");
     if !config.is_file() {
         return Err(CandleError::Msg(format!(
-            "{MODEL_ID}: the `{}` tier's `{component}/` at {} has no config.json — an incomplete \
+            "{MODEL_ID}: {which} tier's `{component}/` at {} has no config.json — an incomplete \
              component directory loads clean and fails in the middle of the render",
-            tier.as_str(),
             dir.display()
         )));
     }

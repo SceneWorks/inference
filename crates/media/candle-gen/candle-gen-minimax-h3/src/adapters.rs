@@ -18,10 +18,18 @@
 //! * A fold mutates the base weight, so it cannot run on a packed base without dequantizing it —
 //!   which is precisely the tier the story says "is the one that matters". Residual-always is the
 //!   superset: it is the only form that works on a packed tier, and it is exact on a dense one.
-//! * This crate has **no tier loader at all** today — [`crate::model::descriptor`] advertises
-//!   `supported_quants: &[]` and `load` refuses `spec.quantize` — so a tier-selected branch would
-//!   have a dense arm that runs and a packed arm that nothing can reach. An unreachable branch is
-//!   not a capability; it is an untested claim.
+//! * When this was written the crate had **no tier loader at all**, so a tier-selected branch would
+//!   have had a dense arm that runs and a packed arm nothing could reach — an unreachable branch is
+//!   not a capability, it is an untested claim.
+//!
+//!   **That premise is now gone** (sc-20267): [`crate::model::descriptor`] advertises
+//!   `supported_quants: [Q4, Q8]` and `crate::tier` + `crate::quant` really do load a packed tier, so
+//!   the packed arm *is* reachable today. The conclusion is unchanged and the first reason is why:
+//!   residual-always is the superset, and it is the only form that works on a packed base at all. The
+//!   install is deliberately tier-**blind** — `crate::quant::lin` hands
+//!   [`crate::dit::layers::LinearNoBias`] a `candle_gen::quant::AdaptLinear` whose base may be packed
+//!   or dense, and the residual composes over either without asking which. So a tier-selected branch
+//!   would now be reachable *and* still pointless.
 //!
 //! # Key space: **diffusers**, plus a converted ComfyUI (sc-19443)
 //!

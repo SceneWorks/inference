@@ -181,7 +181,7 @@ use mlx_gen::gen_core::{
 };
 
 use crate::denoise::LEGAL_FRAME_COUNTS;
-use crate::model::{DIT_COMPONENT, MODEL_ID};
+use crate::model::{DIT_COMPONENT, MODEL_ID, TEXT_ENCODER_COMPONENT};
 use crate::pipeline::{CANVAS_MAX_PIXELS, SPATIAL_STRIDE};
 
 /// Calibration identity for this provider's measurements.
@@ -573,8 +573,23 @@ impl ComponentBytes {
             _ => root.join(DIT_COMPONENT),
         };
         let dit_bytes = safetensors_path_bytes(&dit);
+        // **The condition encoder honors its own staged override too** (sc-19120 / sc-20267). It did
+        // NOT before, and the omission was `DIT_COMPONENT`'s own bug one component over: sc-19120
+        // made the text encoder per-tier and staged **independently** of the DiT, so a split `q4`
+        // install stages [`TEXT_ENCODER_COMPONENT`] outside the snapshot and may carry no
+        // `root/text_encoder` at all. That measured 0 and published an 18.72 GB **under**-declaration
+        // of the largest single component this family loads — and an under-declared floor admits a
+        // render that then OOMs, which is the whole failure the ladder exists to prevent.
+        //
+        // `safetensors_path_bytes` returns 0 for an absent directory, so the flat-snapshot path is
+        // byte-identical. Found while porting this contract to the candle lane (sc-20267), where the
+        // same line had the same defect; fixed in both rather than recorded in one.
+        let text_encoder = match spec.components.get(TEXT_ENCODER_COMPONENT) {
+            Some(WeightsSource::Dir(staged)) => staged.clone(),
+            _ => root.join(TEXT_ENCODER_COMPONENT),
+        };
         Self {
-            text_encoder: safetensors_path_bytes(root.join("text_encoder")),
+            text_encoder: safetensors_path_bytes(text_encoder),
             dit: dit_bytes,
             adaln: resolved_adaln_bytes(&dit, dit_bytes),
             video_vae: safetensors_path_bytes(root.join("vae")),
@@ -2075,6 +2090,56 @@ mod tests {
             TEXT_ENCODER_BYTES + DIT_BF16_BYTES + VIDEO_VAE_BYTES + AUDIO_VAE_BYTES
         );
         assert!(contract.conformance_errors().is_empty());
+    }
+
+    /// **A staged text encoder is charged at its own size** (sc-19120 / sc-20267).
+    ///
+    /// The sibling of `a_staged_dit_component_is_charged_at_its_own_size`, one component over, and it
+    /// closes the same defect: `resolve` sized `root.join("text_encoder")` unconditionally, so a split
+    /// install — which sc-19120 made ordinary by publishing per-tier text encoders staged
+    /// **independently** of the DiT — was charged **zero** for the largest single component this
+    /// family loads. An under-declared floor admits a render that then OOMs.
+    ///
+    /// The unstaged control is what stops this being vacuous: the snapshot really does carry no
+    /// `text_encoder/`, so a resolver that ignored the override would report 0 here.
+    #[test]
+    fn a_staged_text_encoder_is_charged_at_its_own_size() {
+        // A split install: the root holds the DiT but no `text_encoder/` at all.
+        let root = tempfile::tempdir().expect("tempdir");
+        sparse_snapshot(root.path(), &[("transformer", DIT_BF16_BYTES)]);
+        let staged = tempfile::tempdir().expect("tempdir");
+        // The q4 text encoder's hosted size (`SceneWorks/minimax-h3-mlx` @ `137ce668`).
+        const TE_Q4_BYTES: u64 = 18_722_713_964;
+        sparse_snapshot(staged.path(), &[("text_encoder", TE_Q4_BYTES)]);
+
+        let unstaged =
+            contract_for(&LoadSpec::new(WeightsSource::Dir(root.path().into()))).expect("contract");
+        assert_eq!(
+            unstaged.asset_facts.conditioning_bytes, 0,
+            "the snapshot genuinely carries no text encoder, so the staged case below is not vacuous"
+        );
+
+        let contract = contract_for(
+            &LoadSpec::new(WeightsSource::Dir(root.path().into())).with_component(
+                TEXT_ENCODER_COMPONENT,
+                WeightsSource::Dir(staged.path().join(TEXT_ENCODER_COMPONENT)),
+            ),
+        )
+        .expect("contract");
+        assert_eq!(
+            contract.asset_facts.conditioning_bytes, TE_Q4_BYTES,
+            "a staged packed encoder must be charged, not measured as absent"
+        );
+        assert_eq!(
+            contract.asset_facts.base_bytes,
+            TE_Q4_BYTES + DIT_BF16_BYTES,
+            "and it must reach the floor the formula reads"
+        );
+        assert!(
+            contract.conformance_errors().is_empty(),
+            "{:?}",
+            contract.conformance_errors()
+        );
     }
 
     /// A tiered install stages the DiT elsewhere; the contract must charge the staged tier's bytes,

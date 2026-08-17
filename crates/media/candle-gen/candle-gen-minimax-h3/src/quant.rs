@@ -41,11 +41,22 @@
 //! * DiT — [`crate::dit::layers::LinearNoBias`] and [`crate::dit::block::AdaLnProjection`].
 //! * Text encoder (sc-20267) — the seven Qwen3 decoder projections behind `text_encoder`'s single
 //!   `Proj` loader, plus the token table through [`embed`].
+//! * Qwen3-VL **vision tower** — served, but **not through this module** (sc-20267). It is consumed
+//!   from `candle_gen_boogu::vision::VisionTower`, which carries its own `Weights`-fed detect over
+//!   boogu's `QLinear` seam: same `{base}.scales` auto-detect, at the group size the tier's
+//!   `config.json` marker declares. It used to *refuse* a packed tower outright, which is what made a
+//!   packed text-encoder tier unloadable on this lane; that refusal is gone from the four projections
+//!   `TE_PACK_SUFFIXES` names (`.attn.qkv`, `.attn.proj`, `.linear_fc1`, `.linear_fc2`) and survives on
+//!   `patch_embed.proj`, which is dense by policy in every tier.
 //!
-//! The Qwen3-VL **vision tower** is the one `TE_PACK_SUFFIXES` member this crate does not serve: it
-//! is consumed from `candle_gen_boogu::vision::VisionTower` through boogu's own loader, which
-//! already refuses a packed tower loudly. So it is fail-loud rather than silent, but the candle lane
-//! cannot yet load the vision shard of a packed text-encoder tier.
+//!   The tower is a *separate* seam rather than a call into this module because it is **shared** with
+//!   `candle-gen-mage` and `candle-gen-krea` and must stay f32 on its dense path — one `Weights` there
+//!   is shared between a bf16 language model and the f32 tower, so routing it through a store-dtype
+//!   loader would silently downgrade those consumers.
+//!
+//! One consequence worth stating: the blocks' `mlp.linear_fc2` is a declared pack target whose 4304
+//! input is **not** group-aligned, so the converter leaves it dense *by shape*. A real packed tier is
+//! therefore a **mixed** tower, and the per-tensor detect is what makes that a non-event.
 //!
 //! # The group size is IMPORTED, never re-declared here
 //!
