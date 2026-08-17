@@ -29,7 +29,32 @@
 //! is an MLX result. Nothing here assumes it transfers to candle/CUDA, and the widest single tensor
 //! this module writes is the SwiGLU projection `[1, S, 2·ffn_dim]` — `[1, S, 28672]` at the shipped
 //! geometry — not anything in the attention.
+//!
+//! # The SwiGLU intermediate is chunked for the same i32 reason as the attention
+//!
+//! That ceiling is now **guarded, not merely observed**. At the same ~104k rows the paragraph above
+//! derives (the 345-frame lattice ceiling on the 1344×768 canvas), `[1, 104000, 28672]` is ~2.98e9
+//! elements — past `i32::MAX` (2.147e9) in a single unchunked GEMM, which is exactly the corruption
+//! class `candle_gen::ATTN_SCORES_BUDGET` exists to prevent on the score tensor. Unlike the
+//! attention's ~6.1e11, this one is only ~1.4× over the limit: a **silent-corruption** ceiling
+//! rather than an out-of-memory one, which is why it went unguarded.
+//! [`DitFeedForward::forward`] therefore runs the projection over
+//! blocks of **token rows** through the same shared planner the attention path uses
+//! ([`candle_gen::attention::AttentionBudget::query_block_rows`], sc-15796) at the same 1e9 setting
+//! ([`FFN_INTERMEDIATE_BUDGET`]), so the two guards cannot plan different boundaries from the same
+//! declared budget.
+//!
+//! Every token's SwiGLU is independent of every other token's — no reduction crosses the token axis
+//! — so the split is mathematically exact. It is **not** bitwise exact: narrowing the token axis
+//! changes the GEMM's `M`, and candle's CPU `gemm` and cuBLAS may accumulate in a different order at
+//! a different `M`. `chunked_swiglu_matches_the_unchunked_projection` gates that on **relative
+//! max-abs**, the crate's established measure, and not on cosine — cosine cannot see a scale error.
+//! Do not build an exact-equality assertion on this path (sc-15943 is the sibling defect).
+//!
+//! Geometries whose intermediate already fits stay on the single un-chunked GEMM, byte-identical to
+//! the pre-guard forward.
 
+use candle_gen::attention::AttentionBudget;
 use candle_gen::candle_core::{DType, Tensor};
 use candle_gen::{CandleError, Result, Weights};
 
@@ -365,6 +390,36 @@ impl DitAttention {
     }
 }
 
+/// Max elements in one SwiGLU intermediate `[.., block, 2·ffn_dim]` before the token axis is
+/// chunked.
+///
+/// The **same 1e9 setting** as `candle_gen::ATTN_SCORES_BUDGET`, for the same reason: candle CUDA
+/// kernels index elements with i32, so a single tensor over `i32::MAX` (~2.147e9) silently corrupts
+/// its tail. 1e9 keeps each block well under that while leaving every geometry whose full
+/// intermediate is already `≤ 1e9` a single un-chunked GEMM — byte-identical to the pre-guard path.
+///
+/// This is a **correctness guard**, not a memory operating point; it is deliberately much larger
+/// than the memory rung's `CONSTRAINED_ATTN_SCORES_BUDGET` and is not published as a strategy
+/// parameter.
+pub const FFN_INTERMEDIATE_BUDGET: u64 = 1_000_000_000;
+
+/// The planned token-block length for a SwiGLU intermediate of `leading × seq × width` elements —
+/// `seq` itself when the whole intermediate already fits, otherwise a value in `1..seq`.
+///
+/// `leading` is the product of the dims **before** the token axis (`B`, i.e. 1 on every shipped
+/// path) and `width` is the projection's `out_features` (`2 · ffn_dim`), so `leading · width` is the
+/// element count contributed by ONE token row — the shared planner's `rows_per_query`.
+///
+/// **Pure delegation to [`AttentionBudget::query_block_rows`].** This must not apply arithmetic of
+/// its own, for the same reason `candle_gen::attention::query_block` must not: two guards computing
+/// their own boundaries from one declared budget is the divergence the shared planner exists to
+/// prevent. All arithmetic is `u64`/`usize` — the element counts this plans for are precisely the
+/// ones that do not fit in `i32`.
+pub fn ffn_token_block(leading: usize, width: usize, seq: usize, budget: AttentionBudget) -> usize {
+    let rows_per_token = (leading as u64).saturating_mul(width as u64);
+    budget.query_block_rows(rows_per_token, seq as u64) as usize
+}
+
 /// Bias-free SwiGLU feed-forward: `w2( silu(gate) · value )`.
 ///
 /// **The published `ff.net.0.proj` emits `[value | gate]`**, so the gate is the SECOND half — the
@@ -416,17 +471,85 @@ impl DitFeedForward {
         self.proj.nbytes() + self.out.nbytes()
     }
 
-    /// `w2( silu(gate) · value )`.
+    /// `w2( silu(gate) · value )`, over token blocks bounded by [`FFN_INTERMEDIATE_BUDGET`].
     ///
     /// The `[1, S, 2·ffn_dim]` intermediate this writes is the **widest single tensor in the whole
-    /// model** — `[1, 94000, 28672]` at a 15 s render — which is the element-count ceiling worth
-    /// watching on this lane rather than anything in the attention (sc-17152).
+    /// model** — `[1, 104000, 28672]` ≈ 2.98e9 elements at the lattice ceiling, past `i32::MAX` — which is
+    /// the element-count ceiling on this lane rather than anything in the attention (sc-17152). See
+    /// the module doc for why the token axis is the exact split and why the equivalence is
+    /// tolerance-level rather than bitwise.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.forward_budgeted(
+            x,
+            AttentionBudget::from_score_elements(FFN_INTERMEDIATE_BUDGET, false),
+        )
+    }
+
+    /// [`Self::forward`] at an explicit budget.
+    ///
+    /// Exposed so the equivalence test can drive the chunked path at a small geometry: asserting
+    /// *chunked == unchunked* is a false green if the chunking never engages, and the shipped
+    /// geometry's intermediate cannot be allocated in a test.
+    pub fn forward_budgeted(&self, x: &Tensor, budget: AttentionBudget) -> Result<Tensor> {
+        let dims = x.dims();
+        let rank = dims.len();
+        if rank < 2 {
+            // A rank-<2 activation has no token axis to split, so this is a span — record it, or
+            // the probe would report the *previous* call's count and every assertion keyed on it
+            // would read a stale value.
+            record_span_count(1);
+            return self.forward_span(x);
+        }
+        let axis = rank - 2;
+        let seq = dims[axis];
+        let leading: usize = dims[..axis].iter().product();
+        let width = self.proj.base_shape()?.0;
+        let block = ffn_token_block(leading, width, seq, budget);
+        if block >= seq {
+            record_span_count(1);
+            return self.forward_span(x);
+        }
+
+        let mut blocks = Vec::new();
+        let mut start = 0;
+        while start < seq {
+            let len = block.min(seq - start);
+            blocks.push(self.forward_span(&x.narrow(axis, start, len)?.contiguous()?)?);
+            start += len;
+        }
+        record_span_count(blocks.len());
+        Ok(Tensor::cat(&blocks, axis)?)
+    }
+
+    /// The un-chunked SwiGLU over whatever token span it is handed — the whole forward when the
+    /// intermediate fits, one block when it does not.
+    fn forward_span(&self, x: &Tensor) -> Result<Tensor> {
         let h = self.proj.forward(x)?;
         let (gate, value) = split_gate_value(&h)?;
         self.out.forward(&(silu(&gate)?.mul(&value)?))
     }
 }
+
+/// Test-only observation of how many token spans the last [`DitFeedForward::forward_budgeted`] call
+/// actually ran.
+///
+/// Without this every equivalence assertion below is a **false green**: they compare *chunked ==
+/// unchunked*, which is trivially true when the chunking never engages — so the whole suite would
+/// keep passing with the lever deleted, or with the loop sizing its blocks from arithmetic of its
+/// own instead of the shared planner. Compiled out entirely in release. `RUST_TEST_THREADS=1` is
+/// forced repo-wide (`.cargo/config.toml`), so a process-global counter is safe. Mirrors
+/// `candle_gen::attention::chunk_probe`.
+#[cfg(test)]
+static LAST_SPAN_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn record_span_count(n: usize) {
+    LAST_SPAN_COUNT.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn record_span_count(_n: usize) {}
 
 /// Affine RMSNorm as a loadable block-level norm (`norm1` / `norm2` / `final_norm` /
 /// `norm_out.norm`).
@@ -453,5 +576,212 @@ impl RmsNorm {
     /// The one tensor name this norm consumes.
     pub fn names(prefix: &str) -> [String; 1] {
         [format!("{prefix}.weight")]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_gen::candle_core::Device;
+
+    /// Deterministic spread values — a fixed pseudo-random fixture, so the equivalence measurement
+    /// is reproducible run to run.
+    fn spread(shape: &[usize], phase: f32) -> Tensor {
+        let n: usize = shape.iter().product();
+        let vals: Vec<f32> = (0..n)
+            .map(|i| ((i as f32 * 0.37) + phase).sin() * 0.9)
+            .collect();
+        Tensor::from_vec(vals, shape, &Device::Cpu).expect("fixture tensor")
+    }
+
+    fn linear(shape: (usize, usize), phase: f32) -> LinearNoBias {
+        LinearNoBias {
+            weight: spread(&[shape.0, shape.1], phase),
+            adapters: Vec::new(),
+        }
+    }
+
+    /// A tiny bias-free SwiGLU: `proj` is `[2·ffn, hidden]`, `out` is `[hidden, ffn]`.
+    fn tiny_ff(hidden: usize, ffn: usize) -> DitFeedForward {
+        DitFeedForward {
+            proj: linear((2 * ffn, hidden), 0.0),
+            out: linear((hidden, ffn), 1.3),
+        }
+    }
+
+    /// Token spans the last [`DitFeedForward::forward_budgeted`] ran — `1` is the un-chunked path.
+    fn spans_run() -> usize {
+        LAST_SPAN_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// **Relative max-abs-diff** — `max|a-b| / max|b|`, the crate's established measure (the same
+    /// one `tests/turbo_lora.rs` and `tests/dit_parity.rs` gate on). Deliberately not cosine:
+    /// cosine is blind to a uniform scale error, which is precisely what a truncated chunk tail
+    /// would look like.
+    fn rel_max_abs(a: &Tensor, b: &Tensor) -> f32 {
+        assert_eq!(a.dims(), b.dims(), "shape");
+        let max_abs = |t: &Tensor| -> f32 {
+            t.abs()
+                .expect("abs")
+                .flatten_all()
+                .expect("flat")
+                .max(0)
+                .expect("max")
+                .to_vec0::<f32>()
+                .expect("scalar")
+        };
+        let d = max_abs(&(a - b).expect("difference"));
+        let scale = max_abs(b);
+        if scale == 0.0 {
+            d
+        } else {
+            d / scale
+        }
+    }
+
+    /// Chunking the token axis is *mathematically* exact — no reduction crosses tokens — but not
+    /// bitwise, because narrowing the axis changes the GEMM's `M`. Gate it on relative max-abs.
+    ///
+    /// [`spans_run`] is what keeps this from being a false green: without it the test passes
+    /// trivially with the chunking deleted, since both sides would then run the same single GEMM.
+    #[test]
+    fn chunked_swiglu_matches_the_unchunked_projection() {
+        let (hidden, ffn, seq) = (8usize, 6usize, 37usize);
+        let ff = tiny_ff(hidden, ffn);
+        let x = spread(&[1, seq, hidden], 0.7);
+
+        // rows_per_token = 1 · 2·ffn = 12, so a 40-element budget plans 3-token blocks.
+        let bounded = AttentionBudget::from_score_elements(40, false);
+        let block = ffn_token_block(1, 2 * ffn, seq, bounded);
+        assert!(
+            block < seq && block > 0,
+            "the chunking must actually engage, got block {block} for seq {seq}"
+        );
+        assert_eq!(block, 3, "40 / (1 · 12) = 3 token rows per block");
+
+        let want = ff.forward(&x).expect("unchunked forward");
+        assert_eq!(spans_run(), 1, "the default budget must not chunk 37 × 12");
+        let got = ff.forward_budgeted(&x, bounded).expect("chunked forward");
+        assert_eq!(
+            spans_run(),
+            seq.div_ceil(block),
+            "the forward must actually run the planned number of spans"
+        );
+        assert_eq!(
+            got.dims(),
+            want.dims(),
+            "the chunked forward must recompose"
+        );
+
+        let drift = rel_max_abs(&got, &want);
+        println!("[swiglu] chunked vs unchunked rel-max-abs = {drift:.3e}");
+        assert!(
+            drift < 1e-5,
+            "chunked SwiGLU must agree with the single-pass projection to 1e-5; got {drift:.3e}"
+        );
+
+        // A ragged tail (37 = 12·3 + 1) is covered: a boundary that dropped the remainder would
+        // change the shape, and one that double-counted it would move the values.
+        let uneven = ff
+            .forward_budgeted(&x, AttentionBudget::from_score_elements(12 * 5, false))
+            .expect("ragged chunked forward");
+        assert_eq!(
+            spans_run(),
+            8,
+            "37 = 5·7 + 2 — eight spans, the last ragged"
+        );
+        assert!(rel_max_abs(&uneven, &want) < 1e-5, "ragged tail");
+    }
+
+    /// The default budget leaves a small geometry on the single un-chunked GEMM, so nothing that
+    /// already fits changes at all.
+    #[test]
+    fn a_geometry_that_fits_stays_on_the_unchunked_path() {
+        let (hidden, ffn, seq) = (8usize, 6usize, 37usize);
+        assert_eq!(
+            ffn_token_block(
+                1,
+                2 * ffn,
+                seq,
+                AttentionBudget::from_score_elements(FFN_INTERMEDIATE_BUDGET, false)
+            ),
+            seq,
+            "a 37 × 12 intermediate is nine orders under the budget"
+        );
+        let ff = tiny_ff(hidden, ffn);
+        let x = spread(&[1, seq, hidden], 0.7);
+        let a = ff.forward(&x).expect("forward");
+        let b = ff.forward_span(&x).expect("span");
+        assert_eq!(rel_max_abs(&a, &b), 0.0, "byte-identical to the bare span");
+    }
+
+    /// **The shipped ceiling, as arithmetic.** `[1, 104000, 28672]` is ~2.98e9 elements — over
+    /// `i32::MAX` — and this proves the plan splits it into blocks that each stay under the budget,
+    /// cover the sequence exactly once, and never exceed `i32::MAX`. Pure `usize`/`u64`: allocating
+    /// the tensor would need ~11.9 GB at f32, and the point is the plan, not the bytes.
+    ///
+    /// `SEQ` is the module doc's ~104k packed rows at the 345-frame lattice ceiling (102,816 video
+    /// + 1,150 audio + the text rows), rounded down — the plan only gets *more* chunked above it.
+    #[test]
+    fn the_shipped_ffn_intermediate_is_planned_below_i32_max() {
+        const SEQ: usize = 104_000;
+        const WIDTH: usize = 28_672; // 2 · ffn_dim
+        let unchunked = SEQ as u64 * WIDTH as u64;
+        assert!(
+            unchunked > i32::MAX as u64,
+            "the premise: one unchunked GEMM writes {unchunked} elements, over i32::MAX"
+        );
+
+        let budget = AttentionBudget::from_score_elements(FFN_INTERMEDIATE_BUDGET, false);
+        let block = ffn_token_block(1, WIDTH, SEQ, budget);
+        assert!(block > 0 && block < SEQ, "the plan must chunk, got {block}");
+        assert!(
+            block as u64 * WIDTH as u64 <= FFN_INTERMEDIATE_BUDGET,
+            "each block must fit the declared budget"
+        );
+        assert!(
+            block as u64 * WIDTH as u64 <= i32::MAX as u64,
+            "each block must be i32-indexable"
+        );
+
+        // The loop `forward_budgeted` runs, in the same order, over the same arithmetic.
+        let mut covered = 0usize;
+        let mut chunks = 0usize;
+        let mut start = 0usize;
+        while start < SEQ {
+            let len = block.min(SEQ - start);
+            covered += len;
+            chunks += 1;
+            start += len;
+        }
+        assert_eq!(covered, SEQ, "the blocks must tile the sequence exactly");
+        assert_eq!(chunks, SEQ.div_ceil(block), "no stray or missing block");
+        assert!(chunks > 1, "the shipped geometry is genuinely chunked");
+    }
+
+    /// Rank-1 activations have no token axis to chunk; the plan must not divide by, or narrow, an
+    /// axis that is not there.
+    #[test]
+    fn a_rank_one_activation_takes_the_span_path() {
+        let ff = tiny_ff(8, 6);
+        // Poison the probe first: the rank-<2 branch returns before the planner runs, so if it did
+        // not record its own span count the reader below would report this stale value and every
+        // assertion keyed on the probe after a rank-1 call would be reading the previous forward.
+        let wide = spread(&[6, 8], 0.3);
+        ff.forward_budgeted(&wide, AttentionBudget::from_score_elements(1, false))
+            .expect("chunked forward");
+        assert!(spans_run() > 1, "the poisoning call must have chunked");
+
+        let x = spread(&[8], 0.2);
+        let got = ff
+            .forward_budgeted(&x, AttentionBudget::from_score_elements(1, false))
+            .expect("rank-1 forward");
+        assert_eq!(got.dims(), &[8]);
+        assert_eq!(
+            spans_run(),
+            1,
+            "the rank-<2 branch is one span and records it"
+        );
+        assert_eq!(ffn_token_block(1, 12, 0, AttentionBudget::UNBOUNDED), 0);
     }
 }

@@ -188,9 +188,7 @@ fn one_forward(c: &MiniMaxH3DitConfig, blocks: &[DitBlock], cache: &AdaLnCache) 
     const SEQ: i32 = 48;
     let rope = mlx_gen_minimax_h3::MmRope::new(c.rope_freq_dim, c.rope_theta).unwrap();
     let pos: Vec<f32> = (0..SEQ * 3).map(|i| (i % 7) as f32).collect();
-    let tables = rope
-        .tables(&Array::from_slice(&pos, &[SEQ, 3]), Dtype::Float32)
-        .unwrap();
+    let tables = rope.tables(&Array::from_slice(&pos, &[SEQ, 3])).unwrap();
     // Row classes 0..3 and modality tags 0..2, cycling — a stand-in packed sequence.
     let classes: Vec<i32> = (0..SEQ).map(|i| i % 4).collect();
     let tags: Vec<i32> = (0..SEQ).map(|i| i % MODALITY_NUM).collect();

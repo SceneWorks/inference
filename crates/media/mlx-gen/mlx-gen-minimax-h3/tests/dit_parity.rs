@@ -110,7 +110,7 @@ fn mm_rope_tables_match_the_reference() {
     );
 
     let tables = rope
-        .tables(f.require("layout.position_ids").unwrap(), Dtype::Float32)
+        .tables(f.require("layout.position_ids").unwrap())
         .unwrap();
     assert_parity(
         &tables.cos,
@@ -139,14 +139,14 @@ fn permuting_the_rope_axes_breaks_parity() {
     let want = f.require("out.rope_sin").unwrap();
 
     // Baseline agrees.
-    let (base, _) = rel(&rope.tables(ids, Dtype::Float32).unwrap().sin, want);
+    let (base, _) = rel(&rope.tables(ids).unwrap().sin, want);
     assert!(base < TOL, "baseline rope must match first ({base:.3e})");
 
     // (t, h, w) -> (h, w, t) and (t, w, h): both are legal grids and neither is this model.
     for (label, order) in [("h,w,t", [1i32, 2, 0]), ("t,w,h", [0, 2, 1])] {
         let idx = Array::from_slice(&order, &[3]);
         let permuted = ids.take_axis(&idx, 1).unwrap();
-        let got = rope.tables(&permuted, Dtype::Float32).unwrap().sin;
+        let got = rope.tables(&permuted).unwrap().sin;
         let (peak, _) = rel(&got, want);
         println!("  rope axes {label}: peak rel {peak:.3e}");
         assert!(
@@ -413,7 +413,7 @@ fn transformer_block_matches_the_reference() {
 
     let rope = rope_of(&cfg);
     let tables = rope
-        .tables(f.require("layout.position_ids").unwrap(), Dtype::Float32)
+        .tables(f.require("layout.position_ids").unwrap())
         .unwrap();
     let got = b
         .forward_with_temb(
@@ -446,7 +446,7 @@ fn attention_matches_the_reference_with_and_without_the_rotary() {
 
     let rope = rope_of(&cfg);
     let tables = rope
-        .tables(f.require("layout.position_ids").unwrap(), Dtype::Float32)
+        .tables(f.require("layout.position_ids").unwrap())
         .unwrap();
     let x = f.require("in.attn.hidden").unwrap();
 
@@ -589,7 +589,7 @@ fn qk_norm_runs_per_head_before_the_rotary() {
             .unwrap();
     let rope = rope_of(&cfg);
     let tables = rope
-        .tables(f.require("layout.position_ids").unwrap(), Dtype::Float32)
+        .tables(f.require("layout.position_ids").unwrap())
         .unwrap();
     let x = f.require("in.attn.hidden").unwrap();
     let want = f.require("out.attn.hidden").unwrap();
@@ -701,7 +701,7 @@ fn every_norm_epsilon_is_wired_through() {
 
     let rope = rope_of(&cfg);
     let tables = rope
-        .tables(f.require("layout.position_ids").unwrap(), Dtype::Float32)
+        .tables(f.require("layout.position_ids").unwrap())
         .unwrap();
     let attn_in = f.require("in.attn.hidden").unwrap();
     let refiner_in = f.require("in.refiner.hidden").unwrap();
@@ -840,7 +840,7 @@ fn reading_the_ffn_halves_gate_first_breaks_parity() {
     let cfg = dit_fixture_config();
     let rope = rope_of(&cfg);
     let tables = rope
-        .tables(f.require("layout.position_ids").unwrap(), Dtype::Float32)
+        .tables(f.require("layout.position_ids").unwrap())
         .unwrap();
     let x = f.require("in.block.hidden").unwrap();
     let temb = f.require("in.temb").unwrap();
@@ -983,7 +983,7 @@ fn the_wrong_qkv_transform_breaks_parity() {
     let (heads, head_dim) = (cfg.num_attention_heads, cfg.attention_head_dim);
     let rope = rope_of(&cfg);
     let tables = rope
-        .tables(f.require("layout.position_ids").unwrap(), Dtype::Float32)
+        .tables(f.require("layout.position_ids").unwrap())
         .unwrap();
     let x = f.require("in.attn.hidden").unwrap();
     let want = f.require("out.attn.hidden").unwrap();
@@ -1036,7 +1036,7 @@ fn the_modality_term_of_the_adaln_index_is_load_bearing() {
     let cfg = dit_fixture_config();
     let rope = rope_of(&cfg);
     let tables = rope
-        .tables(f.require("layout.position_ids").unwrap(), Dtype::Float32)
+        .tables(f.require("layout.position_ids").unwrap())
         .unwrap();
     let x = f.require("in.block.hidden").unwrap();
     let temb = f.require("in.temb").unwrap();
@@ -1145,7 +1145,7 @@ fn every_block_weight_is_load_bearing() {
     let cfg = dit_fixture_config();
     let rope = rope_of(&cfg);
     let tables = rope
-        .tables(f.require("layout.position_ids").unwrap(), Dtype::Float32)
+        .tables(f.require("layout.position_ids").unwrap())
         .unwrap();
     let x = f.require("in.block.hidden").unwrap();
     let temb = f.require("in.temb").unwrap();
@@ -1196,7 +1196,7 @@ fn parity_residuals_bound_the_mutation_floor() {
     let cfg = dit_fixture_config();
     let rope = rope_of(&cfg);
     let ids = f.require("layout.position_ids").unwrap();
-    let tables = rope.tables(ids, Dtype::Float32).unwrap();
+    let tables = rope.tables(ids).unwrap();
     let idx = indices(&f, "layout.adaln_indices");
     let temb = f.require("in.temb").unwrap();
 

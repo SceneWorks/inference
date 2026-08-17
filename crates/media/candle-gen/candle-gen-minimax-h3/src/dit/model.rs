@@ -512,7 +512,7 @@ impl JointDit {
                 layout.num_text_tokens()
             )));
         }
-        let tables = dit.rope.tables(layout.position_ids(), dit.dtype)?;
+        let tables = dit.rope.tables(layout.position_ids())?;
         let device = dit.device.clone();
 
         let (modulation, norm_out_modulation, resident_adaln, resident_ts, released_bytes) =

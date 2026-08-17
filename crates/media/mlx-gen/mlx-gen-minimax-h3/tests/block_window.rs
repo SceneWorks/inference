@@ -161,7 +161,7 @@ fn windowed_and_resident_stacks_agree() {
 
     let rope = MmRope::new(cfg.rope_freq_dim, cfg.rope_theta).unwrap();
     let tables = rope
-        .tables(f.require("layout.position_ids").unwrap(), Dtype::Float32)
+        .tables(f.require("layout.position_ids").unwrap())
         .unwrap();
     let x = f.require("in.block.hidden").unwrap();
     let temb = f.require("in.temb").unwrap();

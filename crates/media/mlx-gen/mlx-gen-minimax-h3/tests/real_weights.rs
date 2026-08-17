@@ -1725,7 +1725,7 @@ fn real_weight_dit_block_runs_one_forward() {
         .collect();
     let position_ids = Array::from_slice(&ids, &[seq, 3]);
     let rope = MmRope::new(cfg.rope_freq_dim, cfg.rope_theta).unwrap();
-    let tables = rope.tables(&position_ids, Dtype::Bfloat16).unwrap();
+    let tables = rope.tables(&position_ids).unwrap();
     assert_eq!(tables.cos.shape(), &[seq, 96]);
 
     let tags: Vec<i32> = (0..seq)

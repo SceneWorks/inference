@@ -35,6 +35,37 @@
 //!
 //! The per-modality coordinate conventions live in [`super::positions`]; the rotary itself is
 //! modality-blind and simply consumes `[seq_len, 3]`.
+//!
+//! # dtype convention: f32 tables, rotation at the STREAM dtype
+//!
+//! Both halves are the reference's, read at `diffusers` 0.40.0.dev0 @ `7564fb01`:
+//!
+//! * **Tables at f32.** `MiniMaxH3RotaryPosEmbed.forward`
+//!   (`models/transformers/transformer_minimax_h3.py:93`) casts the ids with
+//!   `position_ids.to(torch.float32)` against a float32 `inv_freq` buffer, and `"rope"` is listed
+//!   in `MiniMaxH3Transformer3DModel._keep_in_fp32_modules` (`:448`), so `freqs.cos()` /
+//!   `freqs.sin()` are f32 whatever the transformer runs at. [`MmRope::tables`] therefore takes
+//!   **no dtype**.
+//! * **Rotation at the stream dtype.** `_apply_rotary_emb` then narrows them —
+//!   `cos = cos.to(hidden_states.dtype)` / `sin = sin.to(hidden_states.dtype)` (`:66-67`) —
+//!   *before* `hidden_states_rotary * cos + hidden_states_rotated * sin`. The multiply-add runs in
+//!   the activation's dtype, not f32.
+//!
+//! [`MmRope::apply`] narrows the same way, so that narrowing is the port being faithful rather than
+//! a missed upcast — the same convention [`crate::rope`] documents for the video VAE's decoder
+//! rotary, whose processor narrows explicitly too. Do **not** "fix" this into an f32 rotation: it
+//! would make this lane more precise than the model it ports, and it is invisible to the suite
+//! (every `tests/dit_parity.rs` / `tests/dit_io.rs` case runs an f32 stream, where the two
+//! conventions coincide), so nothing downstream would catch the divergence.
+//!
+//! The **tables** half is the one production used to get wrong: it built them at the stream dtype
+//! while every parity fixture built them at f32. `tests/cross_backend_record.rs` was blind to it,
+//! because the candle twin narrowed identically — both lanes were wrong in the same direction, so
+//! their residual stayed small. That is not cosmetic: a bf16 table has 8 mantissa bits, so `cos θ`
+//! and `sin θ` quantize to steps of ~2⁻⁸ and the rotation angle acquires a per-row error of order
+//! 4e-3 radians, applied to **every** q and k of every head of every block. Both halves are pinned
+//! by this module's tests, and **both lanes move together** — that is why the candle twin carries
+//! the identical convention.
 
 use mlx_rs::ops::{concatenate_axis, cos, multiply, negative, sin};
 use mlx_rs::{Array, Dtype};
@@ -49,9 +80,9 @@ use crate::tensor::slice_axis;
 /// interleaves three modalities with unrelated coordinate schemes.
 #[derive(Debug, Clone)]
 pub struct MmRopeTables {
-    /// `[seq_len, rotary_dim]`.
+    /// `[seq_len, rotary_dim]`, **always f32** — see the module doc.
     pub cos: Array,
-    /// `[seq_len, rotary_dim]`.
+    /// `[seq_len, rotary_dim]`, **always f32** — see the module doc.
     pub sin: Array,
 }
 
@@ -88,12 +119,17 @@ impl MmRope {
         6 * self.freq_dim()
     }
 
-    /// Build `(cos, sin)` for `position_ids` of shape `[seq_len, 3]`.
+    /// Build `(cos, sin)` for `position_ids` of shape `[seq_len, 3]`, **at f32**.
     ///
     /// The reference casts the positions to float32 before multiplying (they are built in float64,
     /// which MPS has no dtype for), so the angles are always computed in f32 regardless of the
-    /// block stack's precision; `dtype` is what the tables are cast to on the way out.
-    pub fn tables(&self, position_ids: &Array, dtype: Dtype) -> Result<MmRopeTables> {
+    /// block stack's precision — and the tables now **stay** f32.
+    ///
+    /// There is deliberately **no dtype parameter**: the reference keeps the tables float32
+    /// whatever the transformer runs at (`transformer_minimax_h3.py:93`, plus `"rope"` in
+    /// `_keep_in_fp32_modules` at `:448`), and [`Self::apply`] narrows them to the activation's
+    /// dtype at rotation time. See the module doc for what a bf16 table costs.
+    pub fn tables(&self, position_ids: &Array) -> Result<MmRopeTables> {
         let shape = position_ids.shape();
         if shape.len() != 2 || shape[1] != 3 {
             return Err(Error::Msg(format!(
@@ -114,15 +150,21 @@ impl MmRope {
         let freqs = concatenate_axis(&[freqs.clone(), freqs], -1)?;
 
         Ok(MmRopeTables {
-            cos: cos(&freqs)?.as_dtype(dtype)?,
-            sin: sin(&freqs)?.as_dtype(dtype)?,
+            cos: cos(&freqs)?,
+            sin: sin(&freqs)?,
         })
     }
 
-    /// Rotate the leading `rotary_dim` channels of every head of `x`, shape `[B, S, H, D]`.
+    /// Rotate the leading `rotary_dim` channels of every head of `x`, shape `[B, S, H, D]`, **at
+    /// the stream dtype**.
     ///
     /// Channels beyond `rotary_dim` are concatenated back **untouched** — the partial-rotary path
     /// the shipped geometry always takes (96 of 128).
+    ///
+    /// The f32 tables are narrowed to `x`'s dtype *before* the multiply-add, reproducing
+    /// `_apply_rotary_emb`'s `cos.to(hidden_states.dtype)` / `sin.to(hidden_states.dtype)` at
+    /// `transformer_minimax_h3.py:66-67`; on an f32 stream the narrow is a no-op. That is a
+    /// reference-faithful narrow, not a missed upcast — see the module doc.
     pub fn apply(&self, x: &Array, tables: &MmRopeTables) -> Result<Array> {
         let shape = x.shape();
         if shape.len() != 4 {
@@ -144,15 +186,13 @@ impl MmRope {
             )));
         }
 
-        // `[seq, rotary]` -> `[1, seq, 1, rotary]`, broadcasting over batch and heads.
-        let cos_t = tables
-            .cos
-            .as_dtype(x.dtype())?
-            .reshape(&[1, seq, 1, rotary])?;
-        let sin_t = tables
-            .sin
-            .as_dtype(x.dtype())?
-            .reshape(&[1, seq, 1, rotary])?;
+        // `[seq, rotary]` -> `[1, seq, 1, rotary]`, broadcasting over batch and heads. The tables
+        // are f32; they are narrowed to the ACTIVATION's dtype here, before the multiply-add —
+        // reference-faithful (`cos.to(hidden_states.dtype)`, `transformer_minimax_h3.py:66-67`),
+        // NOT a missed upcast.
+        let stream = x.dtype();
+        let cos_t = tables.cos.as_dtype(stream)?.reshape(&[1, seq, 1, rotary])?;
+        let sin_t = tables.sin.as_dtype(stream)?.reshape(&[1, seq, 1, rotary])?;
 
         let head = slice_axis(x, 3, 0, rotary)?;
         let half = rotary / 2;
@@ -191,7 +231,7 @@ mod tests {
 
         // inv_freq[0] = 1, inv_freq[F-1] = theta^(-(F-1)/F).
         let ids = Array::from_slice(&[1.0f32, 0.0, 0.0], &[1, 3]);
-        let t = rope.tables(&ids, Dtype::Float32).unwrap();
+        let t = rope.tables(&ids).unwrap();
         let c: Vec<f32> = t.cos.as_slice::<f32>().to_vec();
         assert!((c[0] - 1.0f32.cos()).abs() < 1e-6, "inv_freq[0] must be 1");
         let last = 10_000f32.powf(-15.0 / 16.0);
@@ -210,7 +250,7 @@ mod tests {
         let rope = MmRope::new(f, 100.0).unwrap();
         // Three rows, each with a single non-zero axis: t=1, h=1, w=1.
         let ids = Array::from_slice(&[1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], &[3, 3]);
-        let tables = rope.tables(&ids, Dtype::Float32).unwrap();
+        let tables = rope.tables(&ids).unwrap();
         assert_eq!(tables.cos.shape(), &[3, 6 * f]);
         let sin_v: Vec<f32> = tables.sin.as_slice::<f32>().to_vec();
         let row = |r: usize| &sin_v[r * (6 * f) as usize..(r + 1) * (6 * f) as usize];
@@ -250,7 +290,7 @@ mod tests {
     fn angles_carry_no_two_pi_factor() {
         let rope = MmRope::new(1, 100.0).unwrap();
         let ids = Array::from_slice(&[1.0f32, 0.0, 0.0], &[1, 3]);
-        let t = rope.tables(&ids, Dtype::Float32).unwrap();
+        let t = rope.tables(&ids).unwrap();
         let c: Vec<f32> = t.cos.as_slice::<f32>().to_vec();
         assert!(
             (c[0] - 1.0f32.cos()).abs() < 1e-6,
@@ -268,7 +308,7 @@ mod tests {
     fn partial_rotary_leaves_the_tail_untouched() {
         let rope = MmRope::new(2, 100.0).unwrap(); // rotary_dim 12
         let ids = spread(&[5, 3]);
-        let tables = rope.tables(&ids, Dtype::Float32).unwrap();
+        let tables = rope.tables(&ids).unwrap();
         let x = spread(&[1, 5, 2, 16]);
         let out = rope.apply(&x, &tables).unwrap();
         assert_eq!(out.shape(), x.shape());
@@ -290,7 +330,7 @@ mod tests {
     fn rotation_preserves_the_rotated_norm() {
         let rope = MmRope::new(2, 100.0).unwrap();
         let ids = spread(&[6, 3]);
-        let tables = rope.tables(&ids, Dtype::Float32).unwrap();
+        let tables = rope.tables(&ids).unwrap();
         let x = spread(&[1, 6, 1, 12]);
         let out = rope.apply(&x, &tables).unwrap();
         let a: f32 = x.square().unwrap().sum(None).unwrap().item();
@@ -305,7 +345,7 @@ mod tests {
     #[test]
     fn a_length_mismatch_is_rejected() {
         let rope = MmRope::new(2, 100.0).unwrap();
-        let tables = rope.tables(&spread(&[4, 3]), Dtype::Float32).unwrap();
+        let tables = rope.tables(&spread(&[4, 3])).unwrap();
         // Asserted by MESSAGE, not by `is_err()` (sc-19488). Each of these inputs would ALSO
         // fault downstream if its guard were deleted — the reshape/slice below the guard rejects
         // them on element count or axis range — so a bare `is_err()` stays green with the guard
@@ -327,12 +367,123 @@ mod tests {
             "the rotary-width guard must be what rejects this, not the slice below it: {msg}"
         );
         let msg = rope
-            .tables(&spread(&[4, 2]), Dtype::Float32)
+            .tables(&spread(&[4, 2]))
             .expect_err("position ids must be [seq_len, 3]")
             .to_string();
         assert!(
             msg.contains("minimax-h3 mm-rope: expected position ids as"),
             "the position-id shape guard must be what rejects this: {msg}"
+        );
+    }
+
+    /// **Relative max-abs-diff** — `max|a-b| / max|b|`, the measure the candle twin gates on.
+    fn rel_max_abs(a: &Array, b: &Array) -> f32 {
+        let a = a.as_dtype(Dtype::Float32).unwrap();
+        let b = b.as_dtype(Dtype::Float32).unwrap();
+        let m = |t: &Array| -> f32 {
+            mlx_rs::ops::abs(t)
+                .unwrap()
+                .max(None)
+                .unwrap()
+                .item::<f32>()
+        };
+        let d = m(&mlx_rs::ops::subtract(&a, &b).unwrap());
+        let s = m(&b);
+        if s == 0.0 {
+            d
+        } else {
+            d / s
+        }
+    }
+
+    /// A `[seq, 3]` grid of raw `(t, h, w)` coordinates in the range the shipped packing actually
+    /// produces, so the angles are large enough for the mantissa to matter.
+    fn grid(seq: i32) -> Array {
+        let vals: Vec<f32> = (0..seq * 3).map(|i| ((i * 7) % 61) as f32).collect();
+        Array::from_slice(&vals, &[seq, 3])
+    }
+
+    /// **Both halves of the dtype convention** — the same assertion [`crate::rope`]'s twin makes
+    /// for the video VAE's decoder rotary, and the same one the candle lane makes here.
+    ///
+    /// `tables` has no dtype knob, so `cos`/`sin` are f32 whatever the ids carried
+    /// (`transformer_minimax_h3.py:93`, `:448`); `apply` then narrows them to the stream dtype
+    /// before the multiply-add (`:66-67`), so a bf16 stream rotates at bf16 and comes back bf16.
+    #[test]
+    fn tables_are_f32_and_the_rotation_runs_at_the_stream_dtype() {
+        let rope = MmRope::new(16, 10_000.0).unwrap();
+        let ids = grid(9);
+        let tables = rope.tables(&ids).unwrap();
+        assert_eq!(tables.cos.dtype(), Dtype::Float32, "cos must stay f32");
+        assert_eq!(tables.sin.dtype(), Dtype::Float32, "sin must stay f32");
+        // ...including from bf16 ids: the tables have no dtype to inherit.
+        let from_bf16 = rope
+            .tables(&ids.as_dtype(Dtype::Bfloat16).unwrap())
+            .unwrap();
+        assert_eq!(from_bf16.cos.dtype(), Dtype::Float32);
+        assert_eq!(from_bf16.sin.dtype(), Dtype::Float32);
+
+        let x = spread(&[1, 9, 2, 128]);
+        assert_eq!(
+            rope.apply(&x, &tables).unwrap().dtype(),
+            Dtype::Float32,
+            "an f32 stream stays f32"
+        );
+
+        let bf16 = x.as_dtype(Dtype::Bfloat16).unwrap();
+        let shipped = rope.apply(&bf16, &tables).unwrap();
+        assert_eq!(
+            shipped.dtype(),
+            Dtype::Bfloat16,
+            "the stream dtype is preserved"
+        );
+
+        // The measurement that makes the assertion above non-vacuous: rotating at f32 and
+        // narrowing AFTERWARDS is a different result, so which side of the multiply-add the
+        // narrowing falls on is load-bearing rather than cosmetic. `bf16` upcasts exactly, so this
+        // isolates the rotation dtype and nothing else.
+        let at_f32 = rope
+            .apply(&bf16.as_dtype(Dtype::Float32).unwrap(), &tables)
+            .unwrap()
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+        let drift = rel_max_abs(&shipped, &at_f32);
+        println!("[mm-rope] narrow-before vs narrow-after rel-max-abs = {drift:.3e}");
+        assert!(
+            drift > 1e-4,
+            "narrowing before vs after the rotation must be distinguishable at bf16 ({drift:.3e})"
+        );
+    }
+
+    /// **Why the f32 tables matter** — the mutation this test exists to keep out. Rounding the
+    /// tables to bf16 (the pre-fix production path) moves the rotated result by orders of magnitude
+    /// more than `dit_parity`'s gate. `tests/cross_backend_record.rs` could never see it, because
+    /// the candle twin narrowed identically; this is the measurement that shows the assertion above
+    /// is not vacuous.
+    #[test]
+    fn narrowing_the_tables_to_bf16_would_move_every_rotated_row() {
+        let rope = MmRope::new(16, 10_000.0).unwrap();
+        let tables = rope.tables(&grid(9)).unwrap();
+        let round_trip = |a: &Array| {
+            a.as_dtype(Dtype::Bfloat16)
+                .unwrap()
+                .as_dtype(Dtype::Float32)
+                .unwrap()
+        };
+        let narrowed = MmRopeTables {
+            cos: round_trip(&tables.cos),
+            sin: round_trip(&tables.sin),
+        };
+
+        let x = spread(&[1, 9, 2, 128]);
+        let good = rope.apply(&x, &tables).unwrap();
+        let bad = rope.apply(&x, &narrowed).unwrap();
+        let drift = rel_max_abs(&bad, &good);
+        println!("[rope] bf16 TABLES vs f32 tables rel-max-abs = {drift:.3e}");
+        assert!(
+            drift > 1e-3,
+            "a bf16 rope table must be measurably different, else this fix is cosmetic; got \
+             {drift:.3e}"
         );
     }
 }
