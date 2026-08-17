@@ -455,43 +455,146 @@ fn crate_source(relative: &str) -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {path}: {error}"))
 }
 
-/// A crate source file with every comment line removed.
+/// A crate source file with **every** comment removed — `//` to end of line *and* `/* … */` spans,
+/// nested ones included — with string, char and raw-string literals left intact.
 ///
-/// Load-bearing, and the reason is a bug this very gate shipped with: the first revision scanned the
-/// 160 characters before `fn from_plan_for_test` for the text `#[cfg(test)]`, and `TokenPruner`'s own
-/// doc comment says "`#[cfg(test)]`, mirroring …" 127 characters back. Deleting the real attribute left
-/// the doc match inside the window, so the gate passed and the mutation it exists to kill survived — on
-/// the exact type it was written for. Prose about an attribute must never be able to satisfy an
-/// assertion about the attribute.
+/// Both halves are load-bearing, and each closed a hole this gate shipped with.
+///
+/// The line-comment stripping exists because the first revision scanned the 160 characters before
+/// `fn from_plan_for_test` for the text `#[cfg(test)]`, and `TokenPruner`'s own doc comment says
+/// "`#[cfg(test)]`, mirroring …" 127 characters back: deleting the real attribute left the doc match
+/// inside the window, so the gate passed and the mutation it exists to kill survived — on the exact
+/// type it was written for.
+///
+/// The block-comment stripping closes the same class through the other syntax: commenting a guard out
+/// with `/* … */` while preserving its text would leave every occurrence-count assertion satisfied. No
+/// `/* … */` appears in the four scanned files today, so this is prevention rather than repair — but
+/// "prose about code cannot satisfy an assertion about code" has to hold for both comment forms or it
+/// does not hold at all.
 fn crate_code(relative: &str) -> String {
-    crate_source(relative)
-        .lines()
-        .filter(|line| {
-            let trimmed = line.trim_start();
-            !(trimmed.starts_with("///") || trimmed.starts_with("//!") || trimmed.starts_with("//"))
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    strip_comments(&crate_source(relative))
 }
 
-/// The region of `source` belonging to the **last** `impl <ty> {` block, up to the next top-level
-/// `impl`/`fn` or the end of file.
+/// Remove Rust comments from `source`, preserving literals.
 ///
-/// Deliberately not `rfind` over the whole file for a call site: that silently assumes one impl is
-/// textually last, so reordering impls retargets the check at unrelated code. Scoping to a named block
-/// and asserting *ordering within it* is the property that a real regression must violate.
-fn last_impl_block<'a>(source: &'a str, header: &str) -> &'a str {
-    let start = source
-        .rfind(header)
-        .unwrap_or_else(|| panic!("no `{header}` block in this file"));
-    let rest = &source[start + header.len()..];
-    let end = rest
-        .match_indices("\nimpl ")
-        .map(|(at, _)| at)
-        .chain(rest.match_indices("\nfn ").map(|(at, _)| at))
-        .min()
-        .unwrap_or(rest.len());
-    &rest[..end]
+/// Literal-aware on purpose: a `//` inside a string is not a comment, and blindly stripping it would
+/// corrupt the very `"MoE expert swap"`-style route names another gate matches on.
+fn strip_comments(source: &str) -> String {
+    let bytes: Vec<char> = source.chars().collect();
+    let mut out = String::with_capacity(source.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i];
+        let next = bytes.get(i + 1).copied();
+
+        // Line comment: drop through to (but keep) the newline, so line structure survives.
+        if c == '/' && next == Some('/') {
+            while i < bytes.len() && bytes[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        // Block comment, honouring Rust's nesting.
+        if c == '/' && next == Some('*') {
+            let mut depth = 1usize;
+            i += 2;
+            while i < bytes.len() && depth > 0 {
+                if bytes[i] == '/' && bytes.get(i + 1) == Some(&'*') {
+                    depth += 1;
+                    i += 2;
+                } else if bytes[i] == '*' && bytes.get(i + 1) == Some(&'/') {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    // Keep newlines so a commented-out block does not join its neighbours.
+                    if bytes[i] == '\n' {
+                        out.push('\n');
+                    }
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        // Raw string: `r`, any number of `#`, then `"` — no escapes, closed by `"` + the same `#`s.
+        // Only when the `r` does not continue an identifier (otherwise it is just a letter).
+        if c == 'r' && !identifier_char_before(&bytes, i) {
+            let mut hashes = 0usize;
+            let mut j = i + 1;
+            while bytes.get(j) == Some(&'#') {
+                hashes += 1;
+                j += 1;
+            }
+            if bytes.get(j) == Some(&'"') {
+                let closing: String = std::iter::once('"')
+                    .chain(std::iter::repeat_n('#', hashes))
+                    .collect();
+                out.extend(&bytes[i..=j]);
+                i = j + 1;
+                let tail: String = bytes[i..].iter().collect();
+                let end = tail.find(&closing).map_or(bytes.len(), |at| {
+                    i + tail[..at + closing.len()].chars().count()
+                });
+                out.extend(&bytes[i..end.min(bytes.len())]);
+                i = end;
+                continue;
+            }
+        }
+        // Ordinary string or char literal: copy verbatim, respecting escapes.
+        if c == '"' || c == '\'' {
+            out.push(c);
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == '\\' {
+                    out.push(bytes[i]);
+                    if let Some(escaped) = bytes.get(i + 1) {
+                        out.push(*escaped);
+                    }
+                    i += 2;
+                    continue;
+                }
+                out.push(bytes[i]);
+                let closed = bytes[i] == c;
+                i += 1;
+                if closed {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+fn identifier_char_before(chars: &[char], at: usize) -> bool {
+    at > 0 && (chars[at - 1].is_alphanumeric() || chars[at - 1] == '_')
+}
+
+/// `code` with every run of whitespace collapsed to a single space.
+///
+/// What the adjacency assertions match against, so they pin **token** order rather than layout. A blank
+/// line between `#[cfg(test)]` and its signature is legal and rustfmt-preserved
+/// (`blank_lines_upper_bound = 1`); matching raw text would have reddened on it, and hard-coding
+/// `\n    ` would additionally have reddened whenever an item's nesting depth changed — both spurious
+/// reds costing a full CI cycle to discover.
+fn squeezed(code: &str) -> String {
+    code.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Every region introduced by a column-0 `header`, each ending at its column-0 closing brace.
+///
+/// Returns *all* of them rather than the last: `model.rs` has **two** `impl Wan14b {` blocks (split by a
+/// top-level fn between them), so an `rfind` was correct only by the accident that `generate_impl` sits
+/// in the later one. Reordering the impls would have silently retargeted the gate at unrelated code.
+fn top_level_blocks<'a>(code: &'a str, header: &str) -> Vec<&'a str> {
+    code.match_indices(header)
+        .map(|(start, _)| {
+            let rest = &code[start + header.len()..];
+            let end = rest.find("\n}").map_or(rest.len(), |at| at + 2);
+            &rest[..end]
+        })
+        .collect()
 }
 
 #[test]
@@ -500,10 +603,10 @@ fn neither_mechanism_has_a_production_constructor() {
     // build could assemble the mechanism by hand and run it with no plan at all — bypassing the contract
     // entirely. Only `TrunkCache` had the second lock.
     //
-    // Asserted as one CONTIGUOUS token sequence over comment-stripped code, so nothing between the
-    // attribute and the signature — a doc line, another attribute, a stray `pub` alias — can satisfy it.
-    // Adjacency is the smallest thing a real regression has to break: relaxing the visibility, dropping
-    // the `cfg`, or slipping anything in between all move these tokens apart.
+    // Asserted as an adjacent TOKEN sequence over comment-stripped, whitespace-normalised code, so
+    // neither prose about the attribute nor a change of layout can decide the outcome. Token adjacency
+    // is the smallest thing a real regression must break: relaxing the visibility, dropping the `cfg`,
+    // or interposing another item all separate these tokens.
     for (file, ty) in [
         ("src/token_pruning.rs", "TokenPruner"),
         ("src/feature_cache.rs", "TrunkCache"),
@@ -514,7 +617,7 @@ fn neither_mechanism_has_a_production_constructor() {
             "{file}: {ty} must have a from_plan_for_test constructor"
         );
         assert!(
-            code.contains("#[cfg(test)]\n    pub(crate) fn from_plan_for_test"),
+            squeezed(&code).contains("#[cfg(test)] pub(crate) fn from_plan_for_test"),
             "{file}: {ty}'s plan constructor must be exactly `#[cfg(test)] pub(crate)`, with nothing \
              between the two — without that a production build can reach the uncharacterized mechanism"
         );
@@ -563,14 +666,23 @@ fn every_unwired_denoise_route_has_a_refusal_call_site() {
     );
 
     // The A14B refusal must run BEFORE any loading work, which is what makes it a guard rather than a
-    // late error. Asserted as an ordering inside `Wan14b`'s own `generate_impl` — not as a line distance
-    // from a `rfind` over the whole file, which assumed that impl was textually last and left about
-    // three lines of headroom before an added comment would have reddened it.
-    let wan14b = last_impl_block(&model, "impl Wan14b {");
-    let generate = wan14b
+    // late error. Scoped to whichever `impl Wan14b` block actually holds `generate_impl` — there are two
+    // such blocks, so "the last one" was correct only by accident — and asserted as an ORDERING plus a
+    // named-operation check, not as a line distance.
+    let wan14b: Vec<&str> = top_level_blocks(&model, "impl Wan14b {")
+        .into_iter()
+        .filter(|block| block.contains("fn generate_impl("))
+        .collect();
+    assert_eq!(
+        wan14b.len(),
+        1,
+        "exactly one `impl Wan14b` block must define `generate_impl` — {} do, so this gate would be \
+         scoped to the wrong code",
+        wan14b.len()
+    );
+    let body = &wan14b[0][wan14b[0]
         .find("fn generate_impl(")
-        .expect("Wan14b must have a generate_impl");
-    let body = &wan14b[generate..];
+        .expect("filtered on this")..];
     let validate = body
         .find("self.validate(req)?;")
         .expect("Wan14b::generate_impl must validate");
@@ -595,32 +707,46 @@ fn every_unwired_denoise_route_has_a_refusal_call_site() {
 
 #[test]
 fn every_mechanism_bridge_refuses_a_policy_inert_over_the_trajectory() {
-    // MINOR 2 of cycle 2: `refuse_inert_over_trajectory` has a direct test with discriminating controls,
-    // but nothing pinned that the bridges still CALL it — the same compile-time-fact class as the two
-    // gates above, and the cheapest to cover, since deleting a call cannot fail any behavioural test.
+    // Cycle-2 MINOR: `refuse_inert_over_trajectory` has a direct test with discriminating controls, but
+    // nothing pinned that the bridges still CALL it — the same compile-time-fact class as the two gates
+    // above, and the cheapest to cover, since deleting a call cannot fail any behavioural test.
     //
     // Four bridges: `trunk_cache` and `token_pruner`, each in a `cfg(test)` and a `cfg(not(test))`
-    // definition. The call must be the FIRST statement of each — the guard has to run before the
-    // mechanism is constructed, not after — which contiguity expresses exactly.
+    // definition. The property is **guard before construction**, asserted per bridge body — not literal
+    // adjacency to the opening brace, which would have reddened on a benign `let _ = steps;` or a
+    // `debug_assert!` above the guard while the guard still did its job.
     let model = crate_code("src/model.rs");
-    assert_eq!(
-        model
-            .matches("{\n    refuse_inert_over_trajectory(id, plan, steps)?;")
-            .count(),
-        4,
-        "each of the four mechanism bridges (trunk_cache and token_pruner, cfg(test) and \
-         cfg(not(test))) must open with the inert-policy refusal"
-    );
-    for bridge in ["fn trunk_cache(", "fn token_pruner("] {
-        assert_eq!(
-            model.matches(bridge).count(),
-            2,
-            "{bridge} must have exactly its cfg(test) and cfg(not(test)) definitions — a third would \
-             not be covered by the count above"
-        );
-    }
     assert!(
         model.contains("fn refuse_inert_over_trajectory("),
         "the guard the bridges call must be defined here"
     );
+
+    let mut bridges = 0usize;
+    for signature in ["fn trunk_cache(", "fn token_pruner("] {
+        let bodies = top_level_blocks(&model, signature);
+        assert_eq!(
+            bodies.len(),
+            2,
+            "{signature} must have exactly its cfg(test) and cfg(not(test)) definitions"
+        );
+        for body in bodies {
+            bridges += 1;
+            let guard = body
+                .find("refuse_inert_over_trajectory(")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{signature}: every bridge must refuse a policy inert over the trajectory"
+                    )
+                });
+            // Where the bridge constructs a mechanism, the guard must already have run: a guard after
+            // construction has let the uncharacterized path be built before deciding it was refusable.
+            if let Some(construction) = body.find("from_plan_for_test") {
+                assert!(
+                    guard < construction,
+                    "{signature}: the inert-policy guard must run BEFORE the mechanism is constructed"
+                );
+            }
+        }
+    }
+    assert_eq!(bridges, 4, "all four mechanism bridges must be covered");
 }
