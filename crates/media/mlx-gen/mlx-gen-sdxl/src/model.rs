@@ -433,55 +433,16 @@ pub fn load_from_ldm_file(spec: &LoadSpec, tokenizer_root: &Path) -> Result<Box<
             "sdxl: precision override is not wired; the dense path runs fp16".into(),
         ));
     }
-    let residency = match spec.offload_policy {
-        OffloadPolicy::Resident => {
-            let (text, heavy) = spec.read_prepared_files_unchanged(|| {
-                file_pin.read_unchanged(|file| {
-                    let crate::ldm::LdmComponents {
-                        unet,
-                        clip_l,
-                        clip_bigg,
-                        vae,
-                    } = crate::ldm::split_ldm_checkpoint(file)?;
-                    let text = build_ldm_text(clip_l, clip_bigg, spec.quantize)?;
-                    let heavy = build_ldm_heavy(spec, unet, vae, true)?;
-                    Ok::<_, Error>((text, heavy))
-                })
-            })?;
-            Residency::resident(text, heavy)
-        }
-        OffloadPolicy::Sequential => {
-            let text_file = file_pin.clone();
-            let heavy_file = file_pin.clone();
-            let text_quant = spec.quantize;
-            let heavy_spec = spec.clone();
-            Residency::sequential(
-                move || {
-                    text_file.read_unchanged(|file| {
-                        let crate::ldm::LdmComponents {
-                            clip_l, clip_bigg, ..
-                        } = crate::ldm::split_ldm_checkpoint(file)?;
-                        build_ldm_text(clip_l, clip_bigg, text_quant)
-                    })
-                },
-                move |load_pid| {
-                    heavy_spec.read_prepared_files_unchanged(|| {
-                        heavy_file.read_unchanged(|file| {
-                            let crate::ldm::LdmComponents { unet, vae, .. } =
-                                crate::ldm::split_ldm_checkpoint(file)?;
-                            build_ldm_heavy(&heavy_spec, unet, vae, load_pid)
-                        })
-                    })
-                },
-            )
-        }
-    };
+    let residency = build_ldm_residency(spec, &file_pin)?;
     let cfg = DiffusionConfig::sdxl_base();
     let alpha_schedule =
         AlphaSchedule::scaled_linear(cfg.num_train_steps, cfg.beta_start, cfg.beta_end);
-    // A fused LDM/A1111 checkpoint is split in memory, so no component has a re-openable source and
-    // `memory_strategy::streamable` reports `false` for its `WeightsSource::File` — rung 4 is
-    // declared Missing for this load rather than silently executing resident.
+    // A fused LDM/A1111 checkpoint has no re-openable **per-component** source — every component is
+    // cut out of one file by `ldm::split_ldm_checkpoint` — so `memory_strategy::streamable` reports
+    // `false` for its `WeightsSource::File` and rung 4 is declared Missing for this load rather than
+    // silently executing resident. Rung 1 is a different question and is genuinely executable here:
+    // the fused *file* is re-openable through the retained pin, which is what
+    // [`build_ldm_residency`] keeps for both phase loaders (sc-18317).
     // The public helper retains the same prepared identity guarantee as registry dispatch: contract
     // projection reopens the fused header and tokenizer loading opens staged files, so complete both
     // under the retained source + full prepared-file guards before exposing the generator.
@@ -505,6 +466,84 @@ pub fn load_from_ldm_file(spec: &LoadSpec, tokenizer_root: &Path) -> Result<Box<
         control_count: spec.control.is_some() as usize + spec.extra_controls.len(),
         residency,
     }))
+}
+
+/// The fused-LDM policy→[`Residency`] dispatch, mirroring [`build_residency`]'s single-seam shape
+/// for the imported-checkpoint route (sc-18317).
+///
+/// **Every arm retains the pin and keeps reload loaders.** Before sc-18317 the `Resident` arm read
+/// the fused file once through a valid pin, dropped both, and built `Residency::resident` — a
+/// non-rebuildable owner whose loaders return errors. That made rung 1 a *declared but unexecutable*
+/// capability on this route: the descriptor publishes `supports_sequential_offload` (so
+/// `staged_residency_availability()` is `Selectable`), the contract builder declares
+/// `StagedResidency` `Implemented` (it derives only `load_shape` and rung 4 from the spec), rung 1
+/// declares no prerequisite for `validate_selection` to refuse, and the shared
+/// `Capabilities::validate_request` floor does not inspect `stage_residency` at all. A staged
+/// selection was therefore admitted everywhere and then refused inside `generate` by
+/// `Residency::ensure_rebuildable` — the epic's core defect class.
+///
+/// Nothing here is new machinery: the `Sequential` arm has always re-split the fused checkpoint
+/// through this same pin on every generate, and `PinnedWeightsFile::read_unchanged` documents
+/// repeated reopen as its intended use ("keep this same pin for every lazy or sequential reopen").
+/// The nearest neighbour agrees — `mlx-gen-z-image`'s fused ComfyUI `Checkpoint` source builds a
+/// request-scoped residency whose per-phase loaders re-split one pinned file. So the `Resident` arm
+/// now routes through [`Residency::from_policy_with_resident`], which keeps a **distinct warm
+/// aggregate**: the warm pair is still built by ONE fused read (byte-identical composition to the
+/// pre-sc-18317 eager build, `load_pid = true` for the reusable PiD superset), while the two staged
+/// phase loaders re-split the file per phase exactly as `Sequential` does.
+///
+/// One behavioural delta, and it is deliberate: under `Resident` the warm pair is now built on first
+/// use instead of at load. Structural validity of the checkpoint is still proven at load — the
+/// contract projection reads and classifies every tensor header through the pin
+/// (`model::fused_ldm_component_footprint`) and rejects a file missing a text encoder, U-Net or VAE
+/// — and `load` is only ever reached from the job that then calls `generate`, so a tensor-level
+/// failure surfaces in the same job either way. `Sequential` on this route already deferred
+/// everything.
+pub(crate) fn build_ldm_residency(
+    spec: &LoadSpec,
+    file_pin: &mlx_gen::gen_core::PinnedWeightsFile,
+) -> Result<Residency<(ClipTextEncoder, ClipTextEncoder), SdxlHeavyOwned>> {
+    let warm_file = file_pin.clone();
+    let warm_spec = spec.clone();
+    let text_file = file_pin.clone();
+    let text_quant = spec.quantize;
+    let heavy_file = file_pin.clone();
+    let heavy_spec = spec.clone();
+    Residency::from_policy_with_resident(
+        spec.offload_policy,
+        move || {
+            warm_spec.read_prepared_files_unchanged(|| {
+                warm_file.read_unchanged(|file| {
+                    let crate::ldm::LdmComponents {
+                        unet,
+                        clip_l,
+                        clip_bigg,
+                        vae,
+                    } = crate::ldm::split_ldm_checkpoint(file)?;
+                    let text = build_ldm_text(clip_l, clip_bigg, warm_spec.quantize)?;
+                    let heavy = build_ldm_heavy(&warm_spec, unet, vae, true)?;
+                    Ok::<_, Error>((text, heavy))
+                })
+            })
+        },
+        move || {
+            text_file.read_unchanged(|file| {
+                let crate::ldm::LdmComponents {
+                    clip_l, clip_bigg, ..
+                } = crate::ldm::split_ldm_checkpoint(file)?;
+                build_ldm_text(clip_l, clip_bigg, text_quant)
+            })
+        },
+        move |load_pid| {
+            heavy_spec.read_prepared_files_unchanged(|| {
+                heavy_file.read_unchanged(|file| {
+                    let crate::ldm::LdmComponents { unet, vae, .. } =
+                        crate::ldm::split_ldm_checkpoint(file)?;
+                    build_ldm_heavy(&heavy_spec, unet, vae, load_pid)
+                })
+            })
+        },
+    )
 }
 
 fn build_ldm_text(
@@ -2100,6 +2139,164 @@ mod tests {
             !msg.contains("single .safetensors file") && !msg.contains("precision override"),
             "expected an eager-load failure, not the up-front guard: {msg}"
         );
+    }
+
+    // ── sc-18317: the fused-LDM route's rung-1 capability is EXECUTABLE, not merely declared.
+    //
+    // The defect these cover: `load_from_ldm_file` under `OffloadPolicy::Resident` used to obtain a
+    // valid file pin, read through it once, drop it, and build `Residency::resident` — whose loaders
+    // return errors and whose `rebuildable` flag is `false`. Nothing upstream refused a staged
+    // selection on that instance (the descriptor publishes `Selectable`, the contract declares rung 1
+    // `Implemented`, rung 1 has no prerequisite for `validate_selection` to check, and the shared
+    // `Capabilities::validate_request` floor never inspects `stage_residency`), so the composition was
+    // admitted everywhere and then refused inside `generate` by `Residency::ensure_rebuildable`.
+    //
+    // These run weight-free. A real fused SDXL checkpoint is ~7 GB, so the fixture is a structurally
+    // valid safetensors carrying one SDXL-irrelevant tensor: `Weights::from_file` opens it, the shared
+    // LDM key remapper classifies nothing, and `split_ldm_checkpoint` returns its own typed
+    // "missing the … component" error. That error arriving is the proof the staged phase loader
+    // re-opened the pinned fused file; the resident-only refusal arriving instead is the defect.
+    fn unique_ldm_fixture_dir(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "sdxl-ldm-{tag}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("create fixture dir");
+        dir
+    }
+
+    /// One structurally valid safetensors file with a single F32 tensor and no SDXL/LDM keys.
+    ///
+    /// Deliberately valid rather than garbage: the point is to reach `split_ldm_checkpoint`'s key
+    /// classification through the pin, not to probe the safetensors reader's malformed-input path.
+    fn write_stub_fused_checkpoint(dir: &Path) -> std::path::PathBuf {
+        let path = dir.join("stub-fused.safetensors");
+        let mut header =
+            br#"{"not_an_sdxl_tensor":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}}"#.to_vec();
+        // Pad to an 8-byte boundary so the payload starts aligned, as the format expects.
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(&header);
+        bytes.extend_from_slice(&1.0f32.to_le_bytes());
+        bytes.extend_from_slice(&2.0f32.to_le_bytes());
+        std::fs::write(&path, bytes).expect("write stub fused checkpoint");
+        path
+    }
+
+    fn stub_fused_spec(dir: &Path, policy: OffloadPolicy) -> LoadSpec {
+        LoadSpec::new(WeightsSource::File(write_stub_fused_checkpoint(dir)))
+            .with_offload_policy(policy)
+    }
+
+    /// The narrowest public reach into `ensure_rebuildable`: a resident-only owner refuses to evict.
+    #[test]
+    fn fused_ldm_resident_load_retains_its_reload_loaders() {
+        let dir = unique_ldm_fixture_dir("retains");
+        let spec = stub_fused_spec(&dir, OffloadPolicy::Resident);
+        let pin = spec
+            .weights_file_pin()
+            .expect("pin the stub checkpoint")
+            .expect("a File source resolves to a pin");
+        let residency = build_ldm_residency(&spec, &pin)
+            .expect("the fused Resident arm must build a residency");
+        let evicted = residency
+            .evict_warm()
+            .expect("a fused Resident load must retain reload loaders");
+        assert!(
+            !evicted,
+            "the warm pair is built on first use, so there is nothing to evict yet"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The whole point: a staged selection on a fused `Resident` instance reaches the real pinned
+    /// phase loaders instead of being refused for having none.
+    #[test]
+    fn fused_ldm_staged_selection_reaches_the_real_pinned_phase_loaders() {
+        let dir = unique_ldm_fixture_dir("staged");
+        let spec = stub_fused_spec(&dir, OffloadPolicy::Resident);
+        let pin = spec
+            .weights_file_pin()
+            .expect("pin the stub checkpoint")
+            .expect("a File source resolves to a pin");
+        let residency = build_ldm_residency(&spec, &pin)
+            .expect("the fused Resident arm must build a residency");
+        let cancel = mlx_gen::CancelFlag::new();
+        let err = residency
+            .run_request_scoped(
+                // The selection admission accepts today and used to refuse here.
+                true,
+                // Rung 4 is `Missing` on a fused file; `generate` always passes `false`.
+                false,
+                &cancel,
+                false,
+                &mut |_| {},
+                |_text: &(ClipTextEncoder, ClipTextEncoder)| Ok::<(), Error>(()),
+                |_| Ok(()),
+                |_heavy: &SdxlHeavyOwned, (), _: &mut dyn FnMut(Progress)| Ok::<(), Error>(()),
+            )
+            .expect_err("the stub checkpoint carries no SDXL tensors, so the text phase must fail");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("no reload loaders"),
+            "a staged selection must reach the pinned phase loaders, not the resident-only \
+             refusal: {msg}"
+        );
+        assert!(
+            msg.contains("sdxl LDM checkpoint is missing the"),
+            "the staged text phase must have re-split the pinned fused file: {msg}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The reach half of the chain: every layer between a request and `generate` accepts a staged
+    /// selection on a fused `Resident` load, which is exactly why the instance has to back it.
+    #[test]
+    fn fused_ldm_staged_residency_is_declared_and_admitted_on_every_layer() {
+        use mlx_gen::gen_core::{
+            MemoryNumericTier, MemorySelection, MemoryStrategy, MemoryStrategySupport,
+            StagedResidencyAvailability,
+        };
+
+        assert_eq!(
+            descriptor().capabilities.staged_residency_availability(),
+            StagedResidencyAvailability::Selectable,
+            "the static descriptor publishes rung 1 as selectable for every SDXL route"
+        );
+
+        let dir = unique_ldm_fixture_dir("declared");
+        let spec = stub_fused_spec(&dir, OffloadPolicy::Resident);
+        let contract =
+            crate::memory_strategy::weights_free_memory_strategy_contract(descriptor().id, &spec)
+                .expect("declaration-equivalent contract for a fused load");
+        assert_eq!(
+            contract
+                .capability(MemoryStrategy::StagedResidency)
+                .map(|capability| &capability.support),
+            Some(&MemoryStrategySupport::Implemented),
+            "rung 1 is declared Implemented on a fused File + Resident load"
+        );
+        assert!(
+            !crate::memory_strategy::streamable(&spec),
+            "rung 4 stays Missing on a fused file — only rung 1 is at issue here"
+        );
+        contract
+            .validate_selection(&MemorySelection {
+                strategy: MemoryStrategy::StagedResidency,
+                parameters: Default::default(),
+                tier: MemoryNumericTier {
+                    precision: Precision::Bf16,
+                    quant: None,
+                    component_precision_floors: &[],
+                },
+            })
+            .expect("admission accepts a staged selection on a fused load");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 #[test]
