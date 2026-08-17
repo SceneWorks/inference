@@ -174,6 +174,7 @@ pub mod alias_free;
 pub mod audio_config;
 pub mod audio_vae;
 pub mod audio_vae_encoder;
+pub mod block_stream;
 pub mod blocks;
 pub mod chunking;
 pub mod conditioning;
@@ -210,6 +211,7 @@ pub use audio_config::{
 };
 pub use audio_vae::MiniMaxH3AudioVae;
 pub use audio_vae_encoder::{AudioDiagonalGaussian, MiniMaxH3AudioVaeEncoder};
+pub use block_stream::{precompute_adaln_windowed, DitBlockStream};
 pub use chunking::{ChunkSpan, TemporalGeometry, TemporalPlan};
 pub use conditioning::{
     build_condition_rows, encode_keyframe_condition, fp16_round_trip, keyframe_condition_rows,
