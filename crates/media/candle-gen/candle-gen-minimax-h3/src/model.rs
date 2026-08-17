@@ -138,7 +138,7 @@ use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::{
     reject_unknown_components, Capabilities, GenerationOutput, GenerationRequest, Generator,
     LoadSpec, MemoryProviderContract, Modality, ModelDescriptor, OffloadPolicy, Precision,
-    Progress, SizeFloor, StepSupport, WeightsSource,
+    Progress, Quant, SizeFloor, StepSupport, WeightsSource,
 };
 use candle_gen::gen_core::{AdapterSpec, ConditioningKind, Image};
 use candle_gen::{CandleError, Result};
@@ -185,19 +185,47 @@ pub const BASE_DIT_PARTITION: &str = "transformer";
 /// The DiT partition a `ref2va` render denoises from.
 pub const REFERENCE_DIT_PARTITION: &str = "transformer_ref";
 
-/// The component directories **every** task reads, in phase order.
+/// The component directories **every** task reads that are **tier-agnostic**, so they always resolve
+/// against the snapshot root.
+///
+/// `text_encoder` and [`BASE_DIT_PARTITION`] used to be here too. They are not any more (sc-20267):
+/// both are tiered and both may be staged *outside* the root as component overrides, so requiring
+/// them against the root would fail every split-tier install. They are required against the dirs
+/// [`crate::tier::MiniMaxH3TierPaths`] resolved instead — see [`MiniMaxH3::load`]. The check itself is
+/// unchanged; only the directory it runs on is.
 ///
 /// [`REFERENCE_DIT_PARTITION`] is deliberately **not** here — see [`task_component_dirs`].
-const REQUIRED_COMPONENT_DIRS: [&str; 4] = ["text_encoder", BASE_DIT_PARTITION, "vae", "audio_vae"];
+const TIER_AGNOSTIC_COMPONENT_DIRS: [&str; 2] = ["vae", "audio_vae"];
 
-/// The component directories a given task reads, on top of [`REQUIRED_COMPONENT_DIRS`].
+/// Every component directory a flat (untiered) snapshot must carry — the four
+/// [`MiniMaxH3::load`] ends up requiring when nothing is staged, since an unstaged tier resolves to
+/// `root/transformer` and `root/text_encoder`.
+///
+/// Retained as the **flat-layout** statement of the requirement: it is what a snapshot needs to hold
+/// to load with no component overrides, which is what the load-refusal tests drive and what the
+/// staging helpers build. The load path itself iterates
+/// [`TIER_AGNOSTIC_COMPONENT_DIRS`] plus the two resolved tier dirs, so a staged tier is not held to
+/// the root.
+///
+/// `#[cfg(test)]` because that is now its only consumer — production reads the resolved dirs. It stays
+/// as one declaration of the flat-layout set rather than four literals repeated across the tests.
+#[cfg(test)]
+const REQUIRED_COMPONENT_DIRS: [&str; 4] = [
+    crate::tier::TEXT_ENCODER_COMPONENT,
+    BASE_DIT_PARTITION,
+    "vae",
+    "audio_vae",
+];
+
+/// The component directories a given task reads, on top of [`TIER_AGNOSTIC_COMPONENT_DIRS`] and the
+/// two tiered components.
 ///
 /// # Why the reference partition is task-gated rather than load-gated
 ///
 /// `ref2va` is a first-class task, so a snapshot missing `transformer_ref/` must fail **before any
 /// weight is read**, naming the path, rather than twenty minutes into a render when the reference
 /// arm finally reaches for it. The obvious implementation — put it in
-/// [`REQUIRED_COMPONENT_DIRS`] — is wrong, and its blast radius is larger than it looks: the
+/// [`TIER_AGNOSTIC_COMPONENT_DIRS`] — is wrong, and its blast radius is larger than it looks: the
 /// `transformer_ref` rows SceneWorks' manifest ships are **all `platforms: ["macos"]`**, and the
 /// off-Mac artifact set carries none, so an off-Mac install has no catalog route to the partition and
 /// a base-only snapshot is the *ordinary* off-Mac shape rather than a broken one. Requiring the
@@ -221,13 +249,71 @@ fn task_component_dirs(task: MiniMaxH3Task) -> &'static [&'static str] {
     }
 }
 
+/// The caller's staged override for `component`, if it is a directory.
+///
+/// A single *file* is not a component directory, so it falls back to `None` and lets the resolver
+/// produce the actionable "missing `<component>/config.json`" error against the root —
+/// `mlx_gen_minimax_h3::model`'s `resolve_dit_dir` makes the identical choice for the identical
+/// reason.
+fn staged_component_dir<'a>(spec: &'a LoadSpec, component: &str) -> Option<&'a Path> {
+    match spec.components.get(component) {
+        Some(WeightsSource::Dir(p)) => Some(p.as_path()),
+        _ => None,
+    }
+}
+
+/// Map `spec.quantize` onto the tier this load will **assert**.
+///
+/// # `None` must NOT become [`crate::tier::Tier::Bf16`]
+///
+/// `spec.quantize` is an `Option<Quant>` whose `None` means *"the caller asserted nothing"*, and that
+/// is a genuine third state. MLX honours it: `mlx_gen_minimax_h3::model::reconcile_tier` admits a
+/// packed tier under `(Some(_), None)` and only refuses a *dense* component under an explicit
+/// request. [`crate::tier::Tier::Bf16`] is not that state — it is a positive assertion of denseness,
+/// and `require_dit` refuses a packed tier under it. So `None` maps to `None` here and the reconcile
+/// is skipped entirely; the loaders auto-detect the tier from `{base}.scales` regardless, so nothing
+/// downstream needs to be told. Defaulting `None` to `Bf16` would turn "I did not ask" into "I demand
+/// dense" and reject every packed install that loads fine on MLX today — the trap PR 2 of sc-20267
+/// left a warning about on the [`crate::tier::Tier`] enum.
+///
+/// # `Nvfp4` is refused rather than mapped
+///
+/// [`Quant::Nvfp4`] reports `bits() == 4`, so mapping it to [`crate::tier::Tier::Q4`] would let an
+/// NVFP4 request reconcile *cleanly* against a `q4` marker and render the int4-affine tier while the
+/// caller believed they had selected NVFP4. That is the silent-numerics-swap epic 11037's SC#5
+/// forbids, so it is a typed refusal at the registry boundary instead. This model publishes no NVFP4
+/// tier — `mlx_gen_minimax_h3::convert` packs MLX affine `q4`/`q8` only — so there is nothing to
+/// route it to.
+fn requested_tier(spec: &LoadSpec) -> candle_gen::gen_core::Result<Option<crate::tier::Tier>> {
+    match spec.quantize {
+        None => Ok(None),
+        Some(Quant::Q4) => Ok(Some(crate::tier::Tier::Q4)),
+        Some(Quant::Q8) => Ok(Some(crate::tier::Tier::Q8)),
+        Some(q @ Quant::Nvfp4) => Err(candle_gen::gen_core::Error::Unsupported(format!(
+            "{MODEL_ID}: spec.quantize={q:?} is not a published MiniMax-H3 tier. This family ships \
+             MLX affine `q4` and `q8` only (packed offline by the MLX lane's `convert`); NVFP4 is a \
+             distinct tier with different numerics (E2M1 elements over FP8 block scales), and \
+             because it also reports 4 bits it would otherwise reconcile silently against a `q4` \
+             marker and render int4-affine under an NVFP4 request. Request `Q4` or `Q8`."
+        ))),
+    }
+}
+
 /// A component directory is present **and carries at least one `.safetensors` shard**.
 ///
 /// `is_dir()` alone was the gate here, and it admitted an empty or shard-less `transformer_ref/` —
 /// which is exactly the mid-render failure the load-time check exists to eliminate. A snapshot whose
 /// download was interrupted leaves precisely that shape behind.
 fn require_component(root: &Path, component: &str) -> Result<()> {
-    let dir = root.join(component);
+    require_component_shards(&root.join(component), component)
+}
+
+/// [`require_component`] against an **already-resolved** directory.
+///
+/// The tiered components are staged outside the snapshot root, so the check cannot be expressed as
+/// `root.join(component)` for them. Identical check, identical messages — only the path arithmetic
+/// moves to the caller.
+fn require_component_shards(dir: &Path, component: &str) -> Result<()> {
     if !dir.is_dir() {
         return Err(CandleError::Msg(format!(
             "{MODEL_ID}: the snapshot has no `{component}/` component at {}",
@@ -369,10 +455,21 @@ pub fn descriptor() -> ModelDescriptor {
             // operation, so `load` refuses `AdapterKind::Lokr` and the installer refuses a file
             // carrying `lokr_*` factors regardless of how it was declared.
             supports_lokr: false,
-            // The pre-quantized tiers are packed offline by the MLX lane's `convert`; this lane has
-            // no tier loader of its own yet, so it advertises none rather than accepting a
-            // `spec.quantize` it would ignore.
-            supported_quants: &[],
+            // **The tier loader is ported** (sc-20267): the pre-quantized tiers are packed offline
+            // by the MLX lane's `convert`, and this lane now *reads* them. `crate::tier` resolves
+            // the per-tier component directories and reconciles the request against the on-disk
+            // `quantization` marker; `crate::quant` builds each packed Linear straight from the MLX
+            // affine triple, so a `q4` DiT loads at its own footprint with no dense bf16 transient.
+            //
+            // **`Nvfp4` is deliberately absent, and that is not an oversight.** It is a distinct
+            // creative-choice tier (epic 11037, sc-11042 Option A) with different numerics — E2M1
+            // elements over FP8 block scales, not an int4 affine pack — and `Quant::Nvfp4.bits()`
+            // reports `4`, so admitting it would let an NVFP4 request reconcile cleanly against a
+            // `q4` marker and render the wrong tier silently. `load` refuses it by name.
+            //
+            // Like `supports_lora`, this is a declaration gen-core reads on no path; the enforcement
+            // is `crate::tier`'s reconcile plus the `Nvfp4` refusal in [`load`].
+            supported_quants: &[Quant::Q4, Quant::Q8],
             // **The discovery signal, and it is true here.** gen-core makes
             // `OffloadPolicy::Sequential` advisory, so an unwired engine silently stays resident and
             // the fallback is invisible from outside; this bit is what a consumer reads to know
@@ -425,6 +522,20 @@ pub fn descriptor() -> ModelDescriptor {
 pub struct MiniMaxH3 {
     descriptor: ModelDescriptor,
     root: PathBuf,
+    /// The per-tier component directories this load reads (sc-20267) — resolved once from the
+    /// caller's staged component overrides, so every later render reads the same tier.
+    ///
+    /// Held **beside** `root` rather than replacing it: the VAEs, tokenizer and `FL2VA/` are
+    /// tier-agnostic and still resolve against the root, which is exactly what
+    /// [`crate::tier::MiniMaxH3TierPaths::shared_root`] records.
+    tiers: crate::tier::MiniMaxH3TierPaths,
+    /// The tier the caller **asserted**, or `None` when `spec.quantize` was absent.
+    ///
+    /// `None` is a third state, not a synonym for [`crate::tier::Tier::Bf16`]: it means the caller
+    /// asserted nothing, so the reconcile is skipped and the loaders auto-detect from `.scales`.
+    /// Mapping it onto `Bf16` would turn "I did not ask" into "I demand dense" and reject every
+    /// packed install that loads fine on MLX today — see [`requested_tier`].
+    tier: Option<crate::tier::Tier>,
     device: Device,
     dtype: DType,
     offload: OffloadPolicy,
@@ -437,6 +548,14 @@ pub struct MiniMaxH3 {
 
 impl MiniMaxH3 {
     /// Validate the snapshot and record the paths a render will read.
+    ///
+    /// # The tier is resolved here, once (sc-20267)
+    ///
+    /// The DiT and text encoder come from the caller's staged component overrides when present, so
+    /// they are **not** necessarily under `root`. The tier-agnostic components — the two VAEs, the
+    /// tokenizer, `FL2VA/` — always are. Resolving once and holding
+    /// [`crate::tier::MiniMaxH3TierPaths`] is what keeps a later render from re-deriving a different
+    /// answer, which is how the DiT and the vision tower beside it could end up on different tiers.
     pub fn load(spec: &LoadSpec) -> Result<Self> {
         reject_unknown_components(spec, &[], MODEL_ID)?;
         let root = match &spec.weights {
@@ -446,13 +565,41 @@ impl MiniMaxH3 {
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| p.clone()),
         };
-        for component in REQUIRED_COMPONENT_DIRS {
+        // The one mapping, shared with the registry entry point. `requested_tier` reports its refusal
+        // as the contract-load-bearing `gen_core::Error::Unsupported`, which `CandleError` has no
+        // variant for — so on this path (which returns `CandleError`) the type is flattened to `Msg`.
+        // That is not a weaker check, only a weaker error *type*: [`load`] runs the same mapping first
+        // and is where a registry caller gets the typed refusal.
+        let tier = requested_tier(spec).map_err(|e| CandleError::Msg(e.to_string()))?;
+        let tiers = crate::tier::MiniMaxH3TierPaths::resolve(
+            &root,
+            staged_component_dir(spec, crate::tier::DIT_COMPONENT),
+            staged_component_dir(spec, crate::tier::TEXT_ENCODER_COMPONENT),
+        );
+        // The tier-agnostic components, against the root — unchanged.
+        for component in TIER_AGNOSTIC_COMPONENT_DIRS {
             require_component(&root, component)?;
         }
+        // The two tiered components, against the dirs that were actually resolved. `require_dit`
+        // additionally reconciles the on-disk `quantization` marker against an asserted tier and
+        // validates the declared group size; the shard probe is this crate's own, and catches the
+        // interrupted-download shape a `config.json`-only check would pass.
+        require_component_shards(&tiers.dit_dir, BASE_DIT_PARTITION)?;
+        require_component_shards(&tiers.text_encoder_dir, crate::tier::TEXT_ENCODER_COMPONENT)?;
+        match tier {
+            Some(t) => tiers.require_dit(t)?,
+            // Nothing was asserted, so there is no tier to reconcile against — but the group size
+            // is still validated, because a component packed at a group this engine does not read
+            // derives a legal-looking, wrong bit width rather than failing cleanly (sc-15154).
+            None => tiers.require_dit_unasserted()?,
+        }
+        tiers.require_text_encoder()?;
         let device = candle_gen::default_device()?;
         Ok(Self {
             descriptor: descriptor(),
             root,
+            tiers,
+            tier,
             device,
             // The DiT ships mixed f32/bf16 top-level tensors; bf16 is the block store, matching the
             // published checkpoint rather than widening it.
@@ -473,8 +620,28 @@ impl MiniMaxH3 {
     }
 
     /// The snapshot root a render reads from.
+    ///
+    /// The **tier-agnostic** components resolve against this: the two VAEs, the tokenizer and
+    /// `FL2VA/`. The DiT and text encoder do not — see [`Self::tier_paths`].
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The per-tier component directories this load resolved (sc-20267).
+    ///
+    /// `pub` because the property "the DiT and the vision tower beside it came from the *same* staged
+    /// tier" is not assertable from outside the crate otherwise, and a source scan that the call sites
+    /// *look* right is not evidence — `tests/tier_resolution.rs` reads these back off a loaded
+    /// provider.
+    pub fn tier_paths(&self) -> &crate::tier::MiniMaxH3TierPaths {
+        &self.tiers
+    }
+
+    /// The tier the caller asserted through `spec.quantize`, or `None` when they asserted nothing.
+    ///
+    /// `None` is **not** [`crate::tier::Tier::Bf16`] — see `requested_tier`.
+    pub fn requested_tier(&self) -> Option<crate::tier::Tier> {
+        self.tier
     }
 
     /// **The single place a request becomes a checkpoint choice.**
@@ -493,7 +660,17 @@ impl MiniMaxH3 {
         let references = request_references(req)?;
         let task = MiniMaxH3Task::resolve(!req.keyframes().is_empty(), references.is_some())?;
         for component in task_component_dirs(task) {
-            require_component(&self.root, component).map_err(|e| {
+            debug_assert_eq!(
+                *component, REFERENCE_DIT_PARTITION,
+                "the only task-gated component is the reference partition; a new one needs its own \
+                 resolution rule rather than the sibling rule below"
+            );
+            // The reference partition is the resolved DiT dir's **SIBLING**, not `root/transformer_ref`
+            // (sc-20267): a split tier install stages `transformer` outside the snapshot and has no
+            // `root/transformer_ref` at all, so resolving against the root would report a missing
+            // directory while the correct one sat next to the staged DiT.
+            let dir = &self.tiers.reference_dit_dir;
+            require_component_shards(dir, component).map_err(|e| {
                 CandleError::Msg(format!(
                     "{e} — this is the {task:?} task's own checkpoint, and it is not part of the \
                      off-Mac artifact set: every `{REFERENCE_DIT_PARTITION}` row in the model \
@@ -501,6 +678,13 @@ impl MiniMaxH3 {
                      unaffected."
                 ))
             })?;
+            // ...and it must be the SAME tier as the base partition. `crate::convert` packs
+            // `transformer/` and `transformer_ref/` alike, so a mismatch here is a broken install
+            // rather than a legal mixed one.
+            match self.tier {
+                Some(t) => self.tiers.require_reference_dit(t)?,
+                None => self.tiers.require_reference_dit_unasserted()?,
+            }
         }
         Ok((task, references))
     }
@@ -513,6 +697,26 @@ impl MiniMaxH3 {
     /// The adapter specs this provider was loaded with.
     pub fn adapters(&self) -> &[AdapterSpec] {
         &self.adapters
+    }
+
+    /// The **resolved directory** for one DiT partition (sc-20267).
+    ///
+    /// `transformer` is the staged tier dir (else `root/transformer`); `transformer_ref` is that
+    /// dir's SIBLING, never `root/transformer_ref` — see [`crate::tier`] on why the sibling rule
+    /// serves both the flat and the split-tier layout. Any other name is a programming error rather
+    /// than a bad install: [`MiniMaxH3Task::partition`] is the only producer of this argument and it
+    /// returns one of the two constants.
+    fn partition_dir(&self, partition: &str) -> Result<&Path> {
+        if partition == BASE_DIT_PARTITION {
+            Ok(&self.tiers.dit_dir)
+        } else if partition == REFERENCE_DIT_PARTITION {
+            Ok(&self.tiers.reference_dit_dir)
+        } else {
+            Err(CandleError::Msg(format!(
+                "{MODEL_ID}: `{partition}` is not a DiT partition of this model — the two are \
+                 `{BASE_DIT_PARTITION}` and `{REFERENCE_DIT_PARTITION}`"
+            )))
+        }
     }
 
     /// **The single render seam that maps a DiT partition and folds the staged adapters onto it**
@@ -534,8 +738,12 @@ impl MiniMaxH3 {
     /// scan asserting the call site *looks* right is not evidence that it folds anything —
     /// `tests/turbo_lora.rs::the_render_seam_folds_the_staged_adapter_onto_the_dit` calls this and
     /// reads the residual back off the returned model.
+    ///
+    /// The partition is mapped to its **resolved tier directory** through [`Self::partition_dir`],
+    /// so a staged tier's DiT is denoised from rather than the root's.
     pub fn load_task_dit(&self, partition: &str) -> Result<MiniMaxH3Dit> {
-        let mut dit = MiniMaxH3Dit::load(&self.root, partition, &self.device, self.dtype)?;
+        let mut dit =
+            MiniMaxH3Dit::load_from_dir(self.partition_dir(partition)?, &self.device, self.dtype)?;
         if !self.adapters.is_empty() {
             crate::adapters::apply_minimax_h3_adapters(&mut dit, &self.adapters)?;
         }
@@ -569,9 +777,9 @@ impl MiniMaxH3 {
     fn encode_prompt(&self, prompt: &str) -> Result<candle_gen::candle_core::Tensor> {
         let tok = MiniMaxH3Tokenizer::from_snapshot(&self.root)?;
         let (ids, mask) = tok.encode_prompt(prompt, &self.device)?;
-        let cfg = MiniMaxH3TeConfig::from_snapshot(&self.root)?;
+        let cfg = MiniMaxH3TeConfig::from_component_dir(&self.tiers.text_encoder_dir)?;
         let shards = candle_gen::loader::sorted_safetensors(
-            &self.root.join("text_encoder"),
+            &self.tiers.text_encoder_dir,
             "minimax-h3 te",
         )?;
         let prefixes = lm_prefixes(LM_PREFIX, &cfg);
@@ -605,16 +813,16 @@ impl MiniMaxH3 {
         keyframes: &[&Image],
     ) -> Result<(candle_gen::candle_core::Tensor, Vec<u32>)> {
         let tok = MiniMaxH3Tokenizer::from_snapshot(&self.root)?;
-        let cfg = MiniMaxH3TeConfig::from_snapshot(&self.root)?;
+        let cfg = MiniMaxH3TeConfig::from_component_dir(&self.tiers.text_encoder_dir)?;
 
-        let vision = load_vision_tower(&self.root, &self.device)?;
+        let vision = load_vision_tower(&self.tiers.text_encoder_dir, &self.device)?;
         let grounded = crate::text_encoder::run_vision(&vision, keyframes, &self.device)?;
         drop(vision);
         crate::dit::release_device_memory(&self.device)?;
 
         let (ids, mask, tags) = tok.encode_fl2va(prompt, &grounded.counts, &self.device)?;
         let shards = candle_gen::loader::sorted_safetensors(
-            &self.root.join("text_encoder"),
+            &self.tiers.text_encoder_dir,
             "minimax-h3 te",
         )?;
         let prefixes = lm_prefixes(LM_PREFIX, &cfg);
@@ -1140,7 +1348,7 @@ impl MiniMaxH3 {
         };
 
         let tok = MiniMaxH3Tokenizer::from_snapshot(&self.root)?;
-        let cfg = MiniMaxH3TeConfig::from_snapshot(&self.root)?;
+        let cfg = MiniMaxH3TeConfig::from_component_dir(&self.tiers.text_encoder_dir)?;
 
         // The tower's sources, in **sequence order** — the order the pad runs appear in, which is
         // what `forward_with_references` consumes them in.
@@ -1175,7 +1383,7 @@ impl MiniMaxH3 {
             )));
         }
 
-        let vision = load_vision_tower(&self.root, &self.device)?;
+        let vision = load_vision_tower(&self.tiers.text_encoder_dir, &self.device)?;
         let grounded = crate::text_encoder::run_vision(&vision, &sources, &self.device)?;
         drop(vision);
         crate::dit::release_device_memory(&self.device)?;
@@ -1207,7 +1415,7 @@ impl MiniMaxH3 {
 
         let (ids, mask, tags) = tok.encode_ref2va(prompt, &presentation, &self.device)?;
         let shards = candle_gen::loader::sorted_safetensors(
-            &self.root.join("text_encoder"),
+            &self.tiers.text_encoder_dir,
             "minimax-h3 te",
         )?;
         let prefixes = lm_prefixes(LM_PREFIX, &cfg);
@@ -1632,13 +1840,11 @@ pub fn load(spec: &LoadSpec) -> candle_gen::gen_core::Result<Box<dyn Generator>>
             )));
         }
     }
-    if let Some(q) = spec.quantize {
-        return Err(candle_gen::gen_core::Error::Unsupported(format!(
-            "{MODEL_ID}: spec.quantize={q:?} is not supported on the candle lane — the pre-quantized \
-             tiers are packed offline by the MLX lane's `convert` and this lane has no tier loader, \
-             so a tier request is refused rather than silently rendered dense."
-        )));
-    }
+    // `spec.quantize` is no longer refused wholesale (sc-20267): `Q4` and `Q8` are served by
+    // `crate::tier` + `crate::quant`. What survives is the ONE tier this family does not publish —
+    // `requested_tier` refuses `Nvfp4` by name, and it is run *here* as well as inside
+    // `MiniMaxH3::load` because this is the boundary that carries the typed `Error::Unsupported`.
+    requested_tier(spec)?;
     reject_unread_slots(spec)?;
     Ok(Box::new(MiniMaxH3::load(spec)?))
 }
