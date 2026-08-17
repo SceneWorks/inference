@@ -31,8 +31,13 @@ use crate::{Error, Result};
 
 const EXACT_EPILOGUE_FALLBACK_REASON: &str = "unsupported_dtype_shape_or_dispatch";
 
-fn exact_epilogues_requested() -> bool {
-    crate::diagnostics::toggle_requested(crate::diagnostics::EXACT_EPILOGUES)
+/// Whether the P3 exact epilogues run for this call. **On by default in production** (sc-18318): this
+/// resolves the [`crate::capability::PipelineCapability::ExactEpilogues`] switch, not a
+/// benchmark-only request. The composed expression is reached only when a benchmark variant omits the
+/// toggle, an explicit [`crate::capability::CapabilityOptOut`] is installed, or the native operation
+/// rejects the concrete dtype/shape/dispatch (which reports a per-operation Fallback receipt).
+fn exact_epilogues_enabled() -> bool {
+    crate::capability::enabled(crate::capability::PipelineCapability::ExactEpilogues)
 }
 
 fn record_exact_epilogue_applied(operation: &'static str) {
@@ -308,10 +313,18 @@ impl RetainedSlice {
     }
 }
 
-/// Whether the active diagnostic request selected retained compilation.
+/// Whether retained compilation runs for this call — the predicate every retained call site in this
+/// workspace guards on.
+///
+/// **On by default in production** (sc-18316). This resolves the
+/// [`crate::capability::PipelineCapability::RetainedCompilation`] switch: it is `true` unless a
+/// benchmark variant omits the toggle or an explicit [`crate::capability::CapabilityOptOut`] is
+/// installed. The name predates the promotion — it once meant "a diagnostic scope named this toggle",
+/// which is precisely why every production render used to take the discarded-handle arm — and is kept
+/// only so the family crates' call sites stay untouched.
 #[doc(hidden)]
 pub fn retained_compilation_requested() -> bool {
-    crate::diagnostics::toggle_requested(crate::diagnostics::RETAINED_COMPILATION)
+    crate::capability::enabled(crate::capability::PipelineCapability::RetainedCompilation)
 }
 
 /// Prime MLX's compiler-cache TLS and its native lifetime token before accessing Rust TLS that owns
@@ -475,6 +488,28 @@ fn with_retained_compile_glue<T>(
         let mut slot = slot.borrow_mut();
         f(slot.get_or_insert_with(RetainedCompileGlue::new))
     })
+}
+
+/// Release this thread's retained handles for the shared `nn` layer.
+///
+/// **Not a per-request hook.** Reuse across requests is the entire point of retained compilation
+/// (sc-18316), so a request scope must not call this on `finish` — doing so restores the per-call
+/// re-trace the story removed. It exists for a worker thread that is shutting down or deliberately
+/// trimming, and for the parity suites that need a cold handle. Each family crate owns its own
+/// handles; this releases only the shared inventory.
+///
+/// Safe to call between glue calls but not from inside one: the handles are borrowed for the duration
+/// of a single synchronous call, which is why no reachable path can re-enter here mid-call.
+pub fn release_retained_compile_glue() {
+    RETAINED_COMPILE_GLUE.with(|slot| *slot.borrow_mut() = None);
+}
+
+/// Whether this thread currently owns retained handles for the shared `nn` layer.
+///
+/// Used by the reachability proofs: a production render that took the retained arm leaves this
+/// `true`, while one that took the one-shot arm cannot.
+pub fn retained_compile_glue_installed() -> bool {
+    RETAINED_COMPILE_GLUE.with(|slot| slot.borrow().is_some())
 }
 
 /// Exercise every retained handle owned by the shared `nn` layer once for the release memory audit.
@@ -779,7 +814,7 @@ pub fn quantized_matmul_with_bias(
     bits: i32,
 ) -> Result<Array> {
     if let Some(output_bias) = output_bias {
-        if exact_epilogues_requested() {
+        if exact_epilogues_enabled() {
             match quantized_matmul_bias_op(
                 x,
                 w,
@@ -810,7 +845,7 @@ pub fn quantized_matmul_with_bias(
 
 /// SiLU / swish activation: `x · sigmoid(x)`.
 pub fn silu(x: &Array) -> Result<Array> {
-    if exact_epilogues_requested() {
+    if exact_epilogues_enabled() {
         match silu_exact(x) {
             Ok(y) => {
                 record_exact_epilogue_applied(crate::diagnostics::EXACT_SILU);
@@ -839,7 +874,7 @@ pub fn silu(x: &Array) -> Result<Array> {
 /// Shared across the family crates' tanh-approx FFNs (Wan today; Qwen/FLUX/FLUX.2/Z-Image as their
 /// forwards move f32→bf16, sc-2718–2721). `x³` via integer-exponent `power`, as MLX does.
 pub fn gelu_tanh(x: &Array) -> Result<Array> {
-    if exact_epilogues_requested() {
+    if exact_epilogues_enabled() {
         match gelu_tanh_exact(x) {
             Ok(y) => {
                 record_exact_epilogue_applied(crate::diagnostics::EXACT_GELU_TANH);
@@ -922,7 +957,7 @@ pub fn conv2d_general(
     groups: i32,
 ) -> Result<Array> {
     if let Some(b) = b {
-        if exact_epilogues_requested() {
+        if exact_epilogues_enabled() {
             match conv_general_bias(
                 x,
                 w,
@@ -962,7 +997,7 @@ pub fn conv3d(
     padding: (i32, i32, i32),
 ) -> Result<Array> {
     if let Some(b) = b {
-        if exact_epilogues_requested() {
+        if exact_epilogues_enabled() {
             match conv_general_bias(
                 x,
                 w,
@@ -1019,8 +1054,22 @@ pub fn group_norm(
     }
     let group_size = dims / num_groups;
 
-    if exact_epilogues_requested() {
-        match group_norm_affine(x, weight, bias, num_groups, eps) {
+    if exact_epilogues_enabled() {
+        // sc-18316: the native epilogue reads `x` as if it were row-contiguous. Handed a strided
+        // view it silently returns wrong values — no error, no fallback receipt. The standard VAE
+        // pattern `x_nchw.transpose_axes(&[0, 2, 3, 1])` is exactly such a view, and it corrupted the
+        // Z-Image mid-block attention by 1.4e-1 against a fork golden the composed path tracks to
+        // 3.2e-4 (`mlx-gen-z-image/tests/vae_submodules.rs::vae_attention_matches_fork`, and
+        // `channel_strided_group_norm_is_exact` below).
+        //
+        // This cannot be guarded by inspecting `x.strides()`: an unscheduled array carries only
+        // *provisional* contiguity metadata, which is precisely how the native dispatcher is misled
+        // in the first place. Normalize the layout instead and let MLX decide at evaluation time
+        // whether a copy is required. On an already-contiguous input this is two metadata-only
+        // reshapes; on a strided one it is the same materialization the composed path's first
+        // `reshape` performs anyway, so the fused path is never the more expensive of the two.
+        let contiguous_x = crate::array::contiguous(x)?;
+        match group_norm_affine(&contiguous_x, weight, bias, num_groups, eps) {
             Ok(y) => {
                 record_exact_epilogue_applied(crate::diagnostics::EXACT_GROUP_NORM_AFFINE);
                 return Ok(y);
@@ -1340,6 +1389,21 @@ mod tests {
         patterned(shape, cosine).as_dtype(dtype).unwrap()
     }
 
+    /// Evaluate `f` on the **pre-promotion** path: composed epilogues and one-shot compilation.
+    ///
+    /// sc-18316/sc-18318 made both capabilities default-on, so an unguarded call is no longer the
+    /// unoptimized arm. Every parity baseline in this module has to opt out explicitly, otherwise it
+    /// compares the fused path against itself and asserts nothing.
+    fn composed_baseline<T>(f: impl FnOnce() -> T) -> T {
+        let _epilogues = crate::capability::CapabilityOptOut::install(
+            crate::capability::PipelineCapability::ExactEpilogues,
+        );
+        let _retained = crate::capability::CapabilityOptOut::install(
+            crate::capability::PipelineCapability::RetainedCompilation,
+        );
+        f()
+    }
+
     #[test]
     fn p3_nax_runtime_is_available_when_required() {
         if std::env::var_os("SCENEWORKS_REQUIRE_NAX").is_none() {
@@ -1498,14 +1562,32 @@ mod tests {
         let gate = Array::from_slice(&[0.5f32, 0.25, -0.5, 2.0], &[1, 1, 4]);
         let y = Array::from_slice(&[2.0f32, 2.0, 2.0, 2.0], &[1, 1, 4]);
 
-        // Capture the exact one-shot outputs first. Reset the trace probes afterward so the
-        // assertions below count only retained-handle traces, not these reference calls.
-        let oneshot_gated = gated(&x, &gate, &y).unwrap();
-        let oneshot_rope = rope_rotate(&x, &gate, &y, &x).unwrap();
-        let oneshot_modulate_matching = modulate(&x, &gate, &y, true).unwrap();
-        let oneshot_modulate_f32 = modulate(&x, &gate, &y, false).unwrap();
-        let oneshot_gelu_exact = gelu_exact(&x).unwrap();
-        let oneshot_gelu_quick = gelu_quick(&x).unwrap();
+        // Capture the exact one-shot outputs first. sc-18316 promoted retention to a production
+        // default, so the one-shot arm is now reachable only through an explicit opt-out; without it
+        // these reference calls would themselves build the retained handles the assertions below
+        // measure. Release the handles and reset the trace probes afterward so those assertions count
+        // only retained-handle traces, not these reference calls.
+        let (
+            oneshot_gated,
+            oneshot_rope,
+            oneshot_modulate_matching,
+            oneshot_modulate_f32,
+            oneshot_gelu_exact,
+            oneshot_gelu_quick,
+        ) = {
+            let _opt_out = crate::capability::CapabilityOptOut::install(
+                crate::capability::PipelineCapability::RetainedCompilation,
+            );
+            (
+                gated(&x, &gate, &y).unwrap(),
+                rope_rotate(&x, &gate, &y, &x).unwrap(),
+                modulate(&x, &gate, &y, true).unwrap(),
+                modulate(&x, &gate, &y, false).unwrap(),
+                gelu_exact(&x).unwrap(),
+                gelu_quick(&x).unwrap(),
+            )
+        };
+        release_retained_compile_glue();
         for count in &COMPILE_TRACE_COUNTS {
             count.store(0, Ordering::Relaxed);
         }
@@ -1853,8 +1935,14 @@ mod tests {
         assert!(d < 5e-2, "bf16 gelu_tanh diverged from f32 truth: {d}");
     }
 
+    /// Both ways of turning P3 **off** restore the composed operation and stay silent.
+    ///
+    /// sc-18318 inverted this test's original premise: the *default* path is now the fused one, so
+    /// what needs proving is that the two off-switches — a toggle-free benchmark variant and an
+    /// explicit [`crate::capability::CapabilityOptOut`] — genuinely reinstate the pre-promotion
+    /// composed expression (bit-identically) and emit no P3 receipts while doing it.
     #[test]
-    fn p3_default_path_preserves_every_composed_operation_without_receipts() {
+    fn p3_off_switches_restore_every_composed_operation_without_receipts() {
         let activation = patterned(&[3, 17, 65], false);
         let x2 = patterned(&[1, 8, 8, 16], false);
         let w2 = patterned(&[16, 3, 3, 16], true);
@@ -1887,7 +1975,16 @@ mod tests {
         )
         .unwrap();
 
-        let scope = diagnostics::begin_request("p3-default-full-surface", "test").unwrap();
+        // A toggle-free benchmark variant forces the capability off for its scope; the opt-out does
+        // the same for a path that cannot run it. Both must land on the identical composed values.
+        let opt_out_silu = {
+            let _opt_out = crate::capability::CapabilityOptOut::install(
+                crate::capability::PipelineCapability::ExactEpilogues,
+            );
+            silu(&activation).unwrap()
+        };
+
+        let scope = diagnostics::begin_request("p3-off-full-surface", "test").unwrap();
         let actual_silu = silu(&activation).unwrap();
         let actual_gelu = gelu_tanh(&activation).unwrap();
         let actual_conv2 = conv2d_general(&x2, &w2, Some(&b2), (1, 1), (1, 1), (1, 1), 1).unwrap();
@@ -1904,6 +2001,11 @@ mod tests {
         )
         .unwrap();
         let report = scope.finish();
+        assert_bit_exact(
+            &opt_out_silu,
+            &actual_silu,
+            "opt-out versus toggle-free silu",
+        );
 
         for (actual, expected, operation) in [
             (&actual_silu, &expected_silu, diagnostics::EXACT_SILU),
@@ -1940,8 +2042,8 @@ mod tests {
             let contiguous = typed_patterned(&[3, 17, 65], dtype, false);
             let noncontiguous = contiguous.transpose_axes(&[1, 0, 2]).unwrap();
             for (layout, x) in [("contiguous", contiguous), ("noncontiguous", noncontiguous)] {
-                let eager_silu = silu(&x).unwrap();
-                let eager_gelu = gelu_tanh(&x).unwrap();
+                let eager_silu = composed_baseline(|| silu(&x).unwrap());
+                let eager_gelu = composed_baseline(|| gelu_tanh(&x).unwrap());
                 let scope = diagnostics::begin_request_with_toggles(
                     "p3-exact-activation",
                     "test",
@@ -2003,7 +2105,9 @@ mod tests {
                 }
                 let w = typed_patterned(weight_shape, dtype, true);
                 let b = typed_patterned(&[weight_shape[0]], dtype, false);
-                let eager = conv2d_general(&x, &w, Some(&b), (1, 1), (1, 1), (1, 1), 1).unwrap();
+                let eager = composed_baseline(|| {
+                    conv2d_general(&x, &w, Some(&b), (1, 1), (1, 1), (1, 1), 1).unwrap()
+                });
                 let scope = diagnostics::begin_request_with_toggles(
                     "p3-exact-conv2d",
                     "test",
@@ -2031,7 +2135,8 @@ mod tests {
             let x3 = typed_patterned(&[2, 3, 5, 7, 16], dtype, false);
             let w3 = typed_patterned(&[16, 3, 3, 3, 16], dtype, true);
             let b3 = typed_patterned(&[16], dtype, false);
-            let eager3 = conv3d(&x3, &w3, Some(&b3), (1, 1, 1), (1, 1, 1)).unwrap();
+            let eager3 =
+                composed_baseline(|| conv3d(&x3, &w3, Some(&b3), (1, 1, 1), (1, 1, 1)).unwrap());
             let scope = diagnostics::begin_request_with_toggles(
                 "p3-exact-conv3d",
                 "test",
@@ -2076,7 +2181,7 @@ mod tests {
                         typed_patterned(&[channels], dtype, false),
                     )
                 };
-                let eager = group_norm(&x, &weight, &bias, 8, 1e-5).unwrap();
+                let eager = composed_baseline(|| group_norm(&x, &weight, &bias, 8, 1e-5).unwrap());
                 let scope = diagnostics::begin_request_with_toggles(
                     "p3-exact-group-norm",
                     "test",
@@ -2116,30 +2221,37 @@ mod tests {
         let qmm_bias = patterned(&[1024], false);
         let (qmm_wq, qmm_scales, qmm_biases) = quantize(&qmm_w, 64, 4).unwrap();
 
-        let eager_silu = silu(&activation).unwrap();
-        let eager_gelu = gelu_tanh(&activation).unwrap();
-        let eager_conv2 = conv2d_general(
-            &conv2_x,
-            &conv2_w,
-            Some(&conv2_b),
-            (1, 1),
-            (1, 1),
-            (1, 1),
-            2,
-        )
-        .unwrap();
-        let eager_conv3 = conv3d(&conv3_x, &conv3_w, Some(&conv3_b), (1, 1, 1), (1, 1, 1)).unwrap();
-        let eager_group_norm = group_norm(&gn_x, &gn_w, &gn_b, 8, 1e-5).unwrap();
-        let eager_qmm = quantized_matmul_with_bias(
-            &qmm_x,
-            &qmm_wq,
-            &qmm_scales,
-            &qmm_biases,
-            Some(&qmm_bias),
-            64,
-            4,
-        )
-        .unwrap();
+        let eager_silu = composed_baseline(|| silu(&activation).unwrap());
+        let eager_gelu = composed_baseline(|| gelu_tanh(&activation).unwrap());
+        let eager_conv2 = composed_baseline(|| {
+            conv2d_general(
+                &conv2_x,
+                &conv2_w,
+                Some(&conv2_b),
+                (1, 1),
+                (1, 1),
+                (1, 1),
+                2,
+            )
+            .unwrap()
+        });
+        let eager_conv3 = composed_baseline(|| {
+            conv3d(&conv3_x, &conv3_w, Some(&conv3_b), (1, 1, 1), (1, 1, 1)).unwrap()
+        });
+        let eager_group_norm =
+            composed_baseline(|| group_norm(&gn_x, &gn_w, &gn_b, 8, 1e-5).unwrap());
+        let eager_qmm = composed_baseline(|| {
+            quantized_matmul_with_bias(
+                &qmm_x,
+                &qmm_wq,
+                &qmm_scales,
+                &qmm_biases,
+                Some(&qmm_bias),
+                64,
+                4,
+            )
+            .unwrap()
+        });
 
         let scope =
             diagnostics::begin_request_with_toggles("p3-all-fallback", "test", &[EXACT_EPILOGUES])
@@ -2235,16 +2347,18 @@ mod tests {
             for bits in [4, 8] {
                 for group_size in [32, 64, 128] {
                     let (wq, scales, biases) = quantize(&w, group_size, bits).unwrap();
-                    let eager = quantized_matmul_with_bias(
-                        &x,
-                        &wq,
-                        &scales,
-                        &biases,
-                        Some(&output_bias),
-                        group_size,
-                        bits,
-                    )
-                    .unwrap();
+                    let eager = composed_baseline(|| {
+                        quantized_matmul_with_bias(
+                            &x,
+                            &wq,
+                            &scales,
+                            &biases,
+                            Some(&output_bias),
+                            group_size,
+                            bits,
+                        )
+                        .unwrap()
+                    });
                     cases.push(Case {
                         context: format!("standard {dtype:?} Q{bits} gs{group_size}"),
                         x: x.clone(),
@@ -2278,16 +2392,18 @@ mod tests {
             for bits in [4, 8] {
                 for group_size in [32, 64, 128] {
                     let (wq, scales, biases) = quantize(&w, group_size, bits).unwrap();
-                    let eager = quantized_matmul_with_bias(
-                        &x,
-                        &wq,
-                        &scales,
-                        &biases,
-                        Some(&output_bias),
-                        group_size,
-                        bits,
-                    )
-                    .unwrap();
+                    let eager = composed_baseline(|| {
+                        quantized_matmul_with_bias(
+                            &x,
+                            &wq,
+                            &scales,
+                            &biases,
+                            Some(&output_bias),
+                            group_size,
+                            bits,
+                        )
+                        .unwrap()
+                    });
                     cases.push(Case {
                         context: format!("odd {dtype:?} Q{bits} gs{group_size}"),
                         x: x.clone(),
@@ -2325,16 +2441,18 @@ mod tests {
             for bits in [4, 8] {
                 for group_size in [32, 64, 128] {
                     let (wq, scales, biases) = quantize(&w, group_size, bits).unwrap();
-                    let eager = quantized_matmul_with_bias(
-                        &x,
-                        &wq,
-                        &scales,
-                        &biases,
-                        Some(&output_bias),
-                        group_size,
-                        bits,
-                    )
-                    .unwrap();
+                    let eager = composed_baseline(|| {
+                        quantized_matmul_with_bias(
+                            &x,
+                            &wq,
+                            &scales,
+                            &biases,
+                            Some(&output_bias),
+                            group_size,
+                            bits,
+                        )
+                        .unwrap()
+                    });
                     cases.push(Case {
                         context: format!("batch {dtype:?} Q{bits} gs{group_size}"),
                         x: x.clone(),
@@ -2362,16 +2480,18 @@ mod tests {
             let output_bias = small_output_bias_f32.as_dtype(dtype).unwrap();
             for bits in [4, 8] {
                 let (wq, scales, biases) = quantize(&w, 64, bits).unwrap();
-                let eager = quantized_matmul_with_bias(
-                    &x,
-                    &wq,
-                    &scales,
-                    &biases,
-                    Some(&output_bias),
-                    64,
-                    bits,
-                )
-                .unwrap();
+                let eager = composed_baseline(|| {
+                    quantized_matmul_with_bias(
+                        &x,
+                        &wq,
+                        &scales,
+                        &biases,
+                        Some(&output_bias),
+                        64,
+                        bits,
+                    )
+                    .unwrap()
+                });
                 fallback_cases.push(Case {
                     context: format!("small {dtype:?} Q{bits} gs64"),
                     x: x.clone(),
@@ -2437,6 +2557,97 @@ mod tests {
         assert_exact_toggle(&report, ToggleDisposition::Applied);
     }
 
+    /// The P3 layout class the original suite never covered: a **channel-strided** activation.
+    ///
+    /// Every "noncontiguous" case in the tests above either transposes only axes the operation
+    /// reduces over or leaves the channel axis innermost. `x_nchw.transpose_axes(&[0, 2, 3, 1])` —
+    /// the standard VAE NCHW→NHWC view, channel stride `H·W` — is the layout a kernel that reads its
+    /// input as row-contiguous gets wrong, and it was entirely untested. It is where
+    /// `group_norm_affine` silently corrupted the Z-Image mid-block attention while reporting
+    /// `Applied`.
+    ///
+    /// **Scope, stated precisely.** This covers the layout for all six operations, and the other
+    /// five are bit-exact on it with no help — which is why the contiguity normalization in
+    /// [`group_norm`] is confined to GroupNorm. It is *not* the discriminating test for that
+    /// normalization: the corruption needs the strided view to survive unmaterialized through a
+    /// larger graph (in `VaeAttention::forward` the same view feeds both the norm and the residual),
+    /// and a focused call like this one materializes it first, so this passes either way. The
+    /// mutation-discriminating guard is the golden-fixture parity test
+    /// `mlx-gen-z-image/tests/vae_submodules.rs::vae_attention_matches_fork`, which fails by 1.4e-1
+    /// the moment the normalization is removed. That scheduling dependence is also why the same
+    /// defect surfaced in `mlx-gen-mochi`'s decode only under a loaded parallel test lane.
+    #[test]
+    fn channel_strided_group_norm_is_exact() {
+        for dtype in [Dtype::Float32, Dtype::Float16, Dtype::Bfloat16] {
+            // NCHW → NHWC, the layout every VAE hands its normalizations.
+            let nchw = typed_patterned(&[2, 32, 5, 7], dtype, false);
+            let x = nchw.transpose_axes(&[0, 2, 3, 1]).unwrap();
+            let weight = typed_patterned(&[32], dtype, true);
+            let bias = typed_patterned(&[32], dtype, false);
+
+            let composed = composed_baseline(|| group_norm(&x, &weight, &bias, 8, 1e-5).unwrap());
+            let scope = diagnostics::begin_request_with_toggles(
+                "p3-channel-strided-group-norm",
+                "test",
+                &[EXACT_EPILOGUES],
+            )
+            .unwrap();
+            let exact = group_norm(&x, &weight, &bias, 8, 1e-5).unwrap();
+            let report = scope.finish();
+
+            assert_bit_exact(
+                &exact,
+                &composed,
+                &format!("channel-strided group_norm {dtype:?}"),
+            );
+            assert_exact_receipt(
+                &report,
+                diagnostics::EXACT_GROUP_NORM_AFFINE,
+                ToggleDisposition::Applied,
+                None,
+                1,
+            );
+
+            // Elementwise and convolution epilogues over the same channel-strided view.
+            let activation_composed =
+                composed_baseline(|| (silu(&x).unwrap(), gelu_tanh(&x).unwrap()));
+            assert_bit_exact(
+                &silu(&x).unwrap(),
+                &activation_composed.0,
+                &format!("channel-strided silu {dtype:?}"),
+            );
+            assert_bit_exact(
+                &gelu_tanh(&x).unwrap(),
+                &activation_composed.1,
+                &format!("channel-strided gelu_tanh {dtype:?}"),
+            );
+
+            let conv_w = typed_patterned(&[8, 3, 3, 32], dtype, true);
+            let conv_b = typed_patterned(&[8], dtype, false);
+            let conv_composed = composed_baseline(|| {
+                conv2d_general(&x, &conv_w, Some(&conv_b), (1, 1), (1, 1), (1, 1), 1).unwrap()
+            });
+            assert_bit_exact(
+                &conv2d_general(&x, &conv_w, Some(&conv_b), (1, 1), (1, 1), (1, 1), 1).unwrap(),
+                &conv_composed,
+                &format!("channel-strided conv2d {dtype:?}"),
+            );
+
+            // NCTHW → NDHWC, the video counterpart (mlx-gen-mochi's causal Conv3d decoder).
+            let ncthw = typed_patterned(&[1, 32, 3, 5, 7], dtype, false);
+            let x3 = ncthw.transpose_axes(&[0, 2, 3, 4, 1]).unwrap();
+            let w3 = typed_patterned(&[8, 1, 3, 3, 32], dtype, true);
+            let b3 = typed_patterned(&[8], dtype, false);
+            let conv3_composed =
+                composed_baseline(|| conv3d(&x3, &w3, Some(&b3), (1, 1, 1), (0, 0, 0)).unwrap());
+            assert_bit_exact(
+                &conv3d(&x3, &w3, Some(&b3), (1, 1, 1), (0, 0, 0)).unwrap(),
+                &conv3_composed,
+                &format!("channel-strided conv3d {dtype:?}"),
+            );
+        }
+    }
+
     #[test]
     fn conv3d_1x1x1_sums_input_channels_with_bias() {
         // NDHWC: a single voxel with 2 input channels [1, 2].
@@ -2447,5 +2658,232 @@ mod tests {
         let y = conv3d(&x, &w, Some(&bias), (1, 1, 1), (0, 0, 0)).unwrap();
         assert_eq!(y.shape(), &[1, 1, 1, 1, 1]);
         assert_eq!(y.item::<f32>(), 13.0); // 1 + 2 + bias 10
+    }
+
+    /// sc-18316 reachability, proven with **no diagnostic scope at all** — production conditions.
+    ///
+    /// The shipped-but-unreachable defect was that `retained_compilation_requested()` consulted a
+    /// benchmark toggle, so every production render fell to `compile(f, true)(args)`: a fresh handle
+    /// traced and leased *per call*, on every block of every step. That arm is directly observable
+    /// here — it retraces the graph function once per call and leaves no retained handle — so this
+    /// asserts the counts rather than asserting that a toggle can be flipped.
+    #[test]
+    fn production_default_reaches_the_retained_arm_with_no_diagnostic_scope() {
+        use crate::capability::{CapabilityOptOut, PipelineCapability};
+        use std::sync::atomic::Ordering;
+
+        const CALLS: usize = 4;
+        let x = patterned(&[2, 3, 8], false);
+        let gate = patterned(&[2, 3, 8], true);
+        let y = patterned(&[2, 3, 8], false);
+        let reset = || {
+            release_retained_compile_glue();
+            for count in &COMPILE_TRACE_COUNTS {
+                count.store(0, Ordering::Relaxed);
+            }
+        };
+        let traces = |index: usize| COMPILE_TRACE_COUNTS[index].load(Ordering::Relaxed);
+
+        // The production denoise loops bind exactly this guard and install no diagnostic scope.
+        let _glue = CompileGlueGuard::enable();
+
+        // Pre-promotion arm, reachable now only through an explicit opt-out.
+        reset();
+        let mut one_shot = Vec::new();
+        {
+            let _opt_out = CapabilityOptOut::install(PipelineCapability::RetainedCompilation);
+            for _ in 0..CALLS {
+                one_shot.push(gated(&x, &gate, &y).unwrap());
+                one_shot.push(gelu_exact(&x).unwrap());
+            }
+        }
+        assert_eq!(
+            (traces(TRACE_GATED), traces(TRACE_GELU_EXACT)),
+            (CALLS, CALLS),
+            "the one-shot arm re-traces every call — this is the cost sc-18316 removes"
+        );
+        assert!(
+            !retained_compile_glue_installed(),
+            "the one-shot arm must not build a retained handle"
+        );
+
+        // Production default: no scope, no opt-out.
+        reset();
+        let mut retained = Vec::new();
+        for _ in 0..CALLS {
+            retained.push(gated(&x, &gate, &y).unwrap());
+            retained.push(gelu_exact(&x).unwrap());
+        }
+        assert_eq!(
+            (traces(TRACE_GATED), traces(TRACE_GELU_EXACT)),
+            (1, 1),
+            "a production render must trace each retained graph once, not once per call"
+        );
+        assert!(
+            retained_compile_glue_installed(),
+            "a production render must leave the retained handles installed for reuse"
+        );
+
+        // Numeric safety: retention is pure compiled-graph reuse, so every output is bit-identical.
+        for (index, (retained, one_shot)) in retained.iter().zip(&one_shot).enumerate() {
+            assert_bit_exact(retained, one_shot, &format!("retained call {index}"));
+        }
+
+        reset();
+        drop(_glue);
+    }
+
+    /// The same reachability, read off the receipts a production render emits.
+    ///
+    /// An observation scope records without overriding, so the dispositions below are the ones
+    /// production produces: `RetainedMiss` once per signature, then `RetainedHit`, and **zero**
+    /// `OneShot` or fallback records anywhere in the request.
+    #[test]
+    fn an_observed_production_request_reports_only_retained_dispositions() {
+        use crate::diagnostics::CompileDisposition;
+
+        release_retained_compile_glue();
+        let x = patterned(&[1, 4, 16], false);
+        let gate = patterned(&[1, 4, 16], true);
+        let y = patterned(&[1, 4, 16], false);
+
+        let _glue = CompileGlueGuard::enable();
+        let scope = diagnostics::begin_observed_request("nn-production-reach", "test").unwrap();
+        for _ in 0..2 {
+            gated(&x, &gate, &y).unwrap().eval().unwrap();
+            modulate(&x, &gate, &y, true).unwrap().eval().unwrap();
+            rope_rotate(&x, &gate, &y, &x).unwrap();
+            gelu_exact(&x).unwrap().eval().unwrap();
+            gelu_quick(&x).unwrap().eval().unwrap();
+        }
+        let report = scope.finish();
+        drop(_glue);
+
+        for site in [
+            SITE_GATED,
+            SITE_MODULATE,
+            SITE_ROPE_ROTATE,
+            SITE_GELU_EXACT,
+            SITE_GELU_QUICK,
+        ] {
+            for disposition in [
+                CompileDisposition::RetainedMiss,
+                CompileDisposition::RetainedHit,
+            ] {
+                assert!(
+                    report.counters.iter().any(|counter| matches!(
+                        counter,
+                        DiagnosticCounter::Compile {
+                            site: recorded,
+                            disposition: recorded_disposition,
+                            count: 1,
+                        } if *recorded == site && *recorded_disposition == disposition
+                    )),
+                    "a production request must report one {disposition:?} for {site}"
+                );
+            }
+        }
+        assert!(
+            !report.counters.iter().any(|counter| matches!(
+                counter,
+                DiagnosticCounter::Compile {
+                    disposition: CompileDisposition::OneShot,
+                    ..
+                } | DiagnosticCounter::Fallback { .. }
+            )),
+            "a production request must not reach the one-shot or eager arm"
+        );
+        assert!(report.counters.iter().any(|counter| matches!(
+            counter,
+            DiagnosticCounter::Toggle {
+                toggle: crate::diagnostics::RETAINED_COMPILATION,
+                disposition: ToggleDisposition::Applied,
+                count: 10,
+            }
+        )));
+
+        release_retained_compile_glue();
+    }
+
+    /// sc-18318 reachability plus numeric safety over the whole P3 operation inventory.
+    ///
+    /// Every operation is driven twice under production conditions — once with the capability at its
+    /// default and once through an explicit opt-out that restores the composed expression — and the
+    /// two must be bit-identical. The observed receipts then prove the default run really took the
+    /// native epilogue: had it taken the composed arm, `Applied` would be absent and the derived
+    /// terminal receipt would read `Unavailable`.
+    #[test]
+    fn production_default_reaches_the_exact_epilogues_bit_exactly() {
+        use crate::capability::{CapabilityOptOut, PipelineCapability};
+
+        let activation = patterned(&[3, 17, 65], false);
+        let x2 = patterned(&[1, 8, 8, 16], false);
+        let w2 = patterned(&[16, 3, 3, 16], true);
+        let b2 = patterned(&[16], false);
+        let x3 = patterned(&[1, 4, 4, 4, 16], false);
+        let w3 = patterned(&[16, 3, 3, 3, 16], true);
+        let b3 = patterned(&[16], false);
+        let gn_x = patterned(&[2, 3, 5, 32], false);
+        let gn_w = patterned(&[32], true);
+        let gn_b = patterned(&[32], false);
+        let qmm_x = patterned(&[32, 64], false);
+        let qmm_w = patterned(&[128, 64], true);
+        let qmm_bias = patterned(&[128], false);
+        let (qmm_wq, qmm_scales, qmm_biases) = quantize(&qmm_w, 64, 4).unwrap();
+
+        let surface = || {
+            vec![
+                silu(&activation).unwrap(),
+                gelu_tanh(&activation).unwrap(),
+                conv2d_general(&x2, &w2, Some(&b2), (1, 1), (1, 1), (1, 1), 1).unwrap(),
+                conv3d(&x3, &w3, Some(&b3), (1, 1, 1), (1, 1, 1)).unwrap(),
+                group_norm(&gn_x, &gn_w, &gn_b, 8, 1e-5).unwrap(),
+                quantized_matmul_with_bias(
+                    &qmm_x,
+                    &qmm_wq,
+                    &qmm_scales,
+                    &qmm_biases,
+                    Some(&qmm_bias),
+                    64,
+                    4,
+                )
+                .unwrap(),
+            ]
+        };
+
+        let composed = {
+            let _opt_out = CapabilityOptOut::install(PipelineCapability::ExactEpilogues);
+            assert!(!exact_epilogues_enabled());
+            surface()
+        };
+
+        assert!(
+            exact_epilogues_enabled(),
+            "the P3 epilogues must be on by default in a production render"
+        );
+        let scope = diagnostics::begin_observed_request("nn-p3-production-reach", "test").unwrap();
+        let fused = surface();
+        let report = scope.finish();
+
+        for (fused, composed, operation) in [
+            (&fused[0], &composed[0], diagnostics::EXACT_SILU),
+            (&fused[1], &composed[1], diagnostics::EXACT_GELU_TANH),
+            (&fused[2], &composed[2], diagnostics::EXACT_CONV2D_BIAS),
+            (&fused[3], &composed[3], diagnostics::EXACT_CONV3D_BIAS),
+            (
+                &fused[4],
+                &composed[4],
+                diagnostics::EXACT_GROUP_NORM_AFFINE,
+            ),
+            (
+                &fused[5],
+                &composed[5],
+                diagnostics::EXACT_QUANTIZED_MATMUL_BIAS,
+            ),
+        ] {
+            assert_bit_exact(fused, composed, operation);
+            assert_exact_receipt(&report, operation, ToggleDisposition::Applied, None, 1);
+        }
+        assert_exact_toggle(&report, ToggleDisposition::Applied);
     }
 }
