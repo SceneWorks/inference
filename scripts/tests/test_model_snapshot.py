@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.release.ensure_model_snapshot import ensure_snapshot, hf_cache_root
+from scripts.release.ensure_model_snapshot import ensure_snapshot, hf_cache_location
 from scripts.release.verify_model_snapshot import (
     MARKER,
     snapshot_inventory,
@@ -263,20 +263,24 @@ class CacheResidentSnapshotTests(unittest.TestCase):
         (snapshot / "config.json").write_text("{}", encoding="utf-8")
         (snapshot / "weights/model.safetensors").write_bytes(b"fixture")
 
-    def test_recovers_the_hub_root_from_only_the_repo_layout(self) -> None:
+    def test_splits_the_hub_layout_into_root_repo_and_revision(self) -> None:
         self.assertEqual(
-            hf_cache_root(Path("/c/hub/models--org--name/snapshots/deadbeef")),
-            Path("/c/hub"),
+            hf_cache_location(Path("/c/hub/models--org--name/snapshots/deadbeef")),
+            (Path("/c/hub"), "models--org--name", "deadbeef"),
         )
         # `HF_HUB_CACHE` need not be called `hub`; the models--*/snapshots pair is the marker.
         self.assertEqual(
-            hf_cache_root(Path("/mnt/w/models--org--name/snapshots/deadbeef")),
-            Path("/mnt/w"),
+            hf_cache_location(Path("/mnt/w/models--org--name/snapshots/deadbeef")),
+            (Path("/mnt/w"), "models--org--name", "deadbeef"),
         )
-        self.assertIsNone(hf_cache_root(Path("/opt/models/minimax-h3/snapshots/deadbeef")))
-        self.assertIsNone(hf_cache_root(Path("/c/hub/models--org--name/blobs/deadbeef")))
+        self.assertIsNone(hf_cache_location(Path("/opt/models/minimax-h3/snapshots/deadbeef")))
+        self.assertIsNone(hf_cache_location(Path("/c/hub/models--org--name/blobs/deadbeef")))
         # The cache's own `snapshots/` directory names no revision, so it is not a snapshot.
-        self.assertIsNone(hf_cache_root(Path("/c/hub/models--org--name/snapshots")))
+        self.assertIsNone(hf_cache_location(Path("/c/hub/models--org--name/snapshots")))
+        # Anchored at the tail: a path BELOW a snapshot directory is not one.
+        self.assertIsNone(
+            hf_cache_location(Path("/c/hub/models--org--name/snapshots/deadbeef/vae"))
+        )
 
     def test_complete_cache_resident_snapshot_is_accepted_without_downloading(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -355,6 +359,45 @@ class CacheResidentSnapshotTests(unittest.TestCase):
             self.assertTrue(ensure_snapshot(model, snapshot, download))
             self.assertEqual(calls[0]["allow_patterns"], model["download_files"])
             self.assertIs(calls[0]["token"], True)
+
+    def test_cache_path_naming_the_wrong_repository_refuses_before_fetching(self) -> None:
+        # `cache_dir` sends the fetch to `models--example--test-model/` under this same root, so
+        # healing would fill a SIBLING of the requested path -- multi-GB, then a failed verify.
+        with tempfile.TemporaryDirectory() as temporary:
+            snapshot = (
+                Path(temporary)
+                / "hub"
+                / "models--other--model"
+                / "snapshots"
+                / MODEL["revision"]
+            )
+            snapshot.mkdir(parents=True)
+            calls = []
+            with self.assertRaises(RuntimeError) as raised:
+                ensure_snapshot(MODEL, snapshot, lambda **kwargs: calls.append(kwargs))
+            message = str(raised.exception)
+            self.assertEqual(calls, [])
+            self.assertIn("wrong repository/revision", message)
+            self.assertIn(f"models--example--test-model/snapshots/{MODEL['revision']}", message)
+            self.assertIn(f"models--other--model/snapshots/{MODEL['revision']}", message)
+
+    def test_absent_cache_path_naming_the_wrong_revision_refuses_before_fetching(self) -> None:
+        # The directory does not exist, so `ensure_snapshot`'s marker/name revision check is
+        # skipped entirely -- this precondition is the only thing standing in front of the fetch.
+        with tempfile.TemporaryDirectory() as temporary:
+            drifted = "b" * 40
+            snapshot = (
+                Path(temporary) / "hub" / "models--example--test-model" / "snapshots" / drifted
+            )
+            calls = []
+            with self.assertRaises(RuntimeError) as raised:
+                ensure_snapshot(MODEL, snapshot, lambda **kwargs: calls.append(kwargs))
+            message = str(raised.exception)
+            self.assertEqual(calls, [])
+            self.assertFalse(snapshot.exists())
+            self.assertIn("wrong repository/revision", message)
+            self.assertIn(f"snapshots/{MODEL['revision']}", message)
+            self.assertIn(f"snapshots/{drifted}", message)
 
     def test_cache_heal_that_does_not_satisfy_the_pin_still_refuses(self) -> None:
         # The backstop: the cache-correct fetch ran and the snapshot is STILL short, so there is

@@ -17,8 +17,8 @@ else:
 Download = Callable[..., Any]
 
 
-def hf_cache_root(snapshot: Path) -> Path | None:
-    """Return the hub-cache root owning this path, or None for a plain materialize directory.
+def hf_cache_location(snapshot: Path) -> tuple[Path, str, str] | None:
+    """Split a hub-cache path into `(root, repo_directory, revision_directory)`, else None.
 
     A hub cache lays a repo out as `<root>/models--<org>--<name>/{blobs,refs,snapshots}`, so the
     root is simply the grandparent of the `snapshots/<revision>` directory. Recovering it is what
@@ -31,17 +31,20 @@ def hf_cache_root(snapshot: Path) -> Path | None:
     copy it to `local_dir`, which is the same file: `shutil.SameFileError`. Anything that did not
     collide would land outside the cache's own bookkeeping.
 
-    The `models--<org>--<name>/snapshots/<revision>` pair is the whole test; a `hub/` ancestor is
-    NOT required, because `HF_HUB_CACHE` can put that layout under any directory name.
+    The two NAME segments come back with the root because the caller has to check them: the hub
+    derives both from the repo id and the revision, so a path whose `models--*` or terminal
+    segment disagrees with the manifest is a mispointed variable, and healing it would fetch into
+    a sibling directory rather than this one.
+
+    Anchored at the TAIL, not at any `snapshots` component: the path a lane hands over IS the
+    snapshot directory, so the layout has to be its last three segments. A `hub/` ancestor is NOT
+    required, because `HF_HUB_CACHE` can put that layout under any directory name.
     """
     parts = snapshot.parts
-    for index, part in enumerate(parts):
-        if part != "snapshots" or index < 1 or index + 1 >= len(parts):
-            continue
-        if parts[index - 1].startswith("models--"):
-            # `Path(*parts[:0])` is `.`, the right root for a cache named relative to the cwd.
-            return Path(*parts[: index - 1])
-    return None
+    if len(parts) < 3 or parts[-2] != "snapshots" or not parts[-3].startswith("models--"):
+        return None
+    # `Path(*parts[:0])` is `.`, the right root for a cache named relative to the cwd.
+    return Path(*parts[:-3]), parts[-3], parts[-1]
 
 
 def _download_kwargs(model: dict) -> dict:
@@ -70,13 +73,35 @@ def _download_kwargs(model: dict) -> dict:
     return kwargs
 
 
-def _heal_in_cache(model: dict, snapshot: Path, cache_root: Path, download: Download) -> bool:
+def _heal_in_cache(
+    model: dict, snapshot: Path, location: tuple[Path, str, str], download: Download
+) -> bool:
     """Materialize a cache-resident snapshot through the cache itself, then re-verify.
 
-    The refusal below is a BACKSTOP, not the ordinary path: it fires only when the cache-correct
-    fetch has already run and the pin is still unsatisfied, so it can no longer be repaired by
-    telling the operator to run the fetch by hand.
+    The FIRST refusal is a precondition, checked before a byte moves. The hub derives both name
+    segments deterministically -- `models--<org>--<name>` from the repo id, and the terminal
+    directory from the resolved revision -- so a path whose segments disagree with the manifest
+    row is a mispointed variable. Healing it would still succeed: `cache_dir` sends the fetch to
+    the repo's OWN directory under this root, filling a sibling of the path the lane asked for,
+    which then fails verification after a multi-GB download. Refusing up front costs nothing and
+    names the discrepancy instead of reporting it as a missing-files shortfall.
+
+    The refusals AFTER the download are backstops, not the ordinary path: they fire only when the
+    cache-correct fetch has already run, so the problem can no longer be repaired by telling the
+    operator to run that fetch by hand.
     """
+    cache_root, repo_directory, revision_directory = location
+    expected_repo_directory = "models--" + model["repository"].replace("/", "--")
+    if repo_directory != expected_repo_directory or revision_directory != model["revision"]:
+        raise RuntimeError(
+            f"{model['key']} snapshot variable points into the Hugging Face cache at "
+            f"{cache_root} at the wrong repository/revision: expected "
+            f"{expected_repo_directory}/snapshots/{model['revision']}, path says "
+            f"{repo_directory}/snapshots/{revision_directory} ({snapshot}). Refusing to fetch -- "
+            f"materializing {model['repository']}@{model['revision']} through this cache would "
+            "fill that repo's own sibling directory and leave this path exactly as wrong as it "
+            "is. Correct the lane's snapshot variable."
+        )
     print(
         f"materializing {model['repository']}@{model['revision']} through the Hugging Face "
         f"cache at {cache_root} (cache_dir, no local_dir)",
@@ -130,9 +155,9 @@ def ensure_snapshot(model: dict, snapshot: Path, download: Download) -> bool:
     # fetched. A cache-resident target is materialized through the cache; only a plain directory
     # takes `local_dir`, which is what exploded on the Windows CUDA box when it was aimed at
     # `<cache>/hub/models--*/snapshots/<revision>`.
-    cache_root = hf_cache_root(snapshot)
-    if cache_root is not None:
-        return _heal_in_cache(model, snapshot, cache_root, download)
+    location = hf_cache_location(snapshot)
+    if location is not None:
+        return _heal_in_cache(model, snapshot, location, download)
 
     snapshot.parent.mkdir(parents=True, exist_ok=True)
     print(
