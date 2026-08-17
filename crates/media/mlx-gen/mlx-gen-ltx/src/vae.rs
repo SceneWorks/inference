@@ -949,6 +949,234 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------------------------------------
+    // sc-19753 — the LTX decoder's tiling is normalization-correct BY CONSTRUCTION; proof below.
+    //
+    // The sc-19753 rule is that globally-scoped ops (GroupNorm, spatial-softmax attention,
+    // squeeze-and-excite / global pools) must run once on the whole latent and only spatially-local
+    // work may be tiled. `LtxVideoVae::decode_tiled` tiles the WHOLE decoder — which is safe only
+    // because this decoder has no globally-scoped op at all: it contains no attention (grep the
+    // decoder half of this file), and its only normalization is [`pixel_norm`], whose reduction is
+    // `sum_axes(x·x, &[1], true)` — the CHANNEL axis alone, per (b, t, h, w) position. Everything
+    // else is convs, depth-to-space, unpatchify, SiLU and residual adds, all spatially local.
+    //
+    // These tests prove that rather than asserting it, each with its executed mutation control.
+    // ------------------------------------------------------------------------------------------
+
+    /// `a[:, :, :, :, 0..width]` — a left-hand spatial crop on the W axis.
+    fn crop_w(a: &Array, width: i32) -> Array {
+        contiguous(&slice_axis(a, 4, 0, width).unwrap()).unwrap()
+    }
+
+    fn max_abs_delta(left: &Array, right: &Array) -> f32 {
+        left.as_slice::<f32>()
+            .iter()
+            .zip(right.as_slice::<f32>())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max)
+    }
+
+    /// A position-dependent NCTHW tensor whose *amplitude* grows across W, so a spatial reduction
+    /// taken over a left-hand crop is visibly different from one taken over the whole tensor (a
+    /// merely additive ramp barely moves a mean-square, and would make the controls below toothless).
+    fn ramped(shape: [i32; 5]) -> Array {
+        let (h, w) = (shape[3], shape[4]);
+        let count: i32 = shape.iter().product();
+        let data = (0..count)
+            .map(|i| {
+                let y = (i / w % h) as f32;
+                let x = (i % w) as f32;
+                (((i as f32) * 0.071).sin() + y * 0.31) * (1.0 + 0.6 * x)
+            })
+            .collect::<Vec<_>>();
+        Array::from_slice(&data, &shape)
+    }
+
+    /// The **mutation control** used throughout: [`pixel_norm`] with its channel-axis reduction
+    /// replaced by a GroupNorm-shaped reduction over (C, H, W). Everything else is identical.
+    fn spatially_normalized(x: &Array, eps: f32) -> Result<Array> {
+        let sumsq = mean_axes(&multiply(x, x)?, &[1, 3, 4], true)?;
+        let denom = add(&sumsq, scalar(eps))?.sqrt()?;
+        Ok(divide(x, &denom)?)
+    }
+
+    /// **`pixel_norm` commutes with spatial cropping; a spatial reduction does not.** This is the
+    /// whole sc-19753 argument for LTX in one assertion: the decoder's only normalization is a
+    /// per-position channel reduction, so a tile normalizes exactly as the dense decode would.
+    ///
+    /// Measured on `[1, 6, 3, 7, 11]` cropped to `W = 0..5`: the real `pixel_norm` commutes to
+    /// **0.0** (bit-exact), while the executed control — the identical op with a GroupNorm-shaped
+    /// (C, H, W) reduction — breaks commutation by **1.485e0**. Without the control the 0.0 would be
+    /// satisfied by any implementation; with it, the assertion has teeth.
+    #[test]
+    fn pixel_norm_commutes_with_cropping_but_a_spatial_reduction_does_not() {
+        let x = ramped([1, 6, 3, 7, 11]);
+
+        let cropped_dense = crop_w(&pixel_norm(&x, DEC_NORM_EPS).unwrap(), 5);
+        let norm_of_crop = pixel_norm(&crop_w(&x, 5), DEC_NORM_EPS).unwrap();
+        cropped_dense.eval().unwrap();
+        norm_of_crop.eval().unwrap();
+        assert_eq!(cropped_dense.shape(), norm_of_crop.shape());
+        assert_eq!(
+            max_abs_delta(&cropped_dense, &norm_of_crop),
+            0.0,
+            "pixel_norm reduces the channel axis only, so it must commute with spatial cropping"
+        );
+
+        let cropped_mutant = crop_w(&spatially_normalized(&x, DEC_NORM_EPS).unwrap(), 5);
+        let mutant_of_crop = spatially_normalized(&crop_w(&x, 5), DEC_NORM_EPS).unwrap();
+        cropped_mutant.eval().unwrap();
+        mutant_of_crop.eval().unwrap();
+        let broken = max_abs_delta(&cropped_mutant, &mutant_of_crop);
+        println!("pixel_norm commutation = 0.0; spatial-reduction control = {broken:.3e}");
+        assert!(
+            broken > 1e-1,
+            "the spatial-reduction control must break commutation, got max|Δ|={broken:.3e} — the \
+             assertion above would then be proving nothing"
+        );
+    }
+
+    /// **The real `DecResBlock` is spatially local**: decoding a crop reproduces the dense result
+    /// exactly outside the crop's conv halo (two `k=3` convs ⇒ radius 2 columns), so a tile's
+    /// interior is bit-identical to the dense decode's. Driven on the shipped block, not a stand-in.
+    ///
+    /// The **executed mutation control** rebuilds the same block with `pixel_norm` swapped for the
+    /// GroupNorm-shaped reduction and nothing else changed: its halo interior then moves by
+    /// **2.791e0** against the real block's **0.0**. That is what distinguishes "the port's
+    /// normalization is per-position" from "the port merely happens to agree here".
+    #[test]
+    fn dec_res_block_is_spatially_local_but_a_spatially_normalized_variant_is_not() {
+        use std::collections::HashMap;
+
+        const CH: i32 = 4;
+        const CROP: i32 = 7;
+        /// Two `k=3` convs ⇒ each output column depends on ±2 input columns.
+        const HALO: i32 = 2;
+
+        let mut tensors = HashMap::new();
+        for (index, name) in ["conv1", "conv2"].iter().enumerate() {
+            let count = CH * 3 * 3 * 3 * CH;
+            let w = (0..count)
+                .map(|i| ((i + index as i32 * 37) as f32 * 0.053).sin() * 0.11)
+                .collect::<Vec<_>>();
+            tensors.insert(
+                format!("b.{name}.conv.weight"),
+                Array::from_slice(&w, &[CH, 3, 3, 3, CH]),
+            );
+            tensors.insert(
+                format!("b.{name}.conv.bias"),
+                Array::from_slice(
+                    &(0..CH)
+                        .map(|i| (i as f32 * 0.7 + index as f32).cos() * 0.02)
+                        .collect::<Vec<_>>(),
+                    &[CH],
+                ),
+            );
+        }
+        let block = DecResBlock::from_weights(&Weights::from_map(tensors), "b").unwrap();
+        let x = ramped([1, CH, 3, 9, 13]);
+
+        // The real block: the crop's halo interior is bit-identical to the dense result.
+        let dense = block.forward(&x).unwrap();
+        let of_crop = block.forward(&crop_w(&x, CROP)).unwrap();
+        let dense_window = crop_w(&dense, CROP - HALO);
+        let crop_window = crop_w(&of_crop, CROP - HALO);
+        dense_window.eval().unwrap();
+        crop_window.eval().unwrap();
+        assert_eq!(crop_window.shape(), dense_window.shape());
+        let local = max_abs_delta(&dense_window, &crop_window);
+
+        // The control: the identical block with a spatial reduction is no longer crop-local.
+        let mutated = |input: &Array| -> Result<Array> {
+            let h = silu(&spatially_normalized(input, DEC_NORM_EPS)?)?;
+            let h = block.conv1.forward(&h, false)?;
+            let h = silu(&spatially_normalized(&h, DEC_NORM_EPS)?)?;
+            let h = block.conv2.forward(&h, false)?;
+            Ok(add(&h, input)?)
+        };
+        let mutant_dense = crop_w(&mutated(&x).unwrap(), CROP - HALO);
+        let mutant_crop = crop_w(&mutated(&crop_w(&x, CROP)).unwrap(), CROP - HALO);
+        mutant_dense.eval().unwrap();
+        mutant_crop.eval().unwrap();
+        let mutated_delta = max_abs_delta(&mutant_dense, &mutant_crop);
+
+        println!(
+            "DecResBlock crop-locality = {local:.3e}; spatial-norm control = {mutated_delta:.3e}"
+        );
+        assert_eq!(
+            local, 0.0,
+            "the shipped DecResBlock must be exactly crop-local outside its conv halo"
+        );
+        assert!(
+            mutated_delta > 1e-1,
+            "the spatial-reduction control must destroy crop-locality, got \
+             max|Δ|={mutated_delta:.3e}"
+        );
+    }
+
+    /// **The real tiling driver reassembles a per-position-normalizing decoder exactly.** Runs
+    /// [`LtxVideoVae::decode_tiled_plan`] — the same slice → decode → trapezoidal-blend →
+    /// pad-accumulate loop `decode_tiled` uses — over a tile decoder that applies the shipped
+    /// [`pixel_norm`] and then the ×32 spatial expansion, and compares against the dense equivalent.
+    ///
+    /// Measured: the `pixel_norm` decoder reassembles to max|Δ| = **2.384e-7** across a genuinely
+    /// split plan (f32 blend round-off; the blend is a convex combination of identical per-position
+    /// values), while the executed control (the same driver, same plan, same blend, with the
+    /// GroupNorm-shaped reduction substituted) diverges by **2.021e-1** — six orders of magnitude
+    /// larger. The plan is asserted to split, so neither number is measured against an untiled
+    /// fall-through.
+    ///
+    /// **Executed mutation** (the real [`pixel_norm`] widened to a (C, H, W) reduction): the exact
+    /// route degrades 2.384e-7 → **2.021e-1** and this test goes RED.
+    #[test]
+    fn tiled_assembly_is_exact_for_a_pixel_norm_decoder_and_wrong_for_a_spatial_one() {
+        let (latent, plan) = synthetic_tiled_case();
+        let tiles = plan.t.len() * plan.h.len() * plan.w.len();
+        assert!(
+            tiles > 1,
+            "the plan must genuinely split, got {tiles} tile(s)"
+        );
+
+        let run = |normalize: &dyn Fn(&Array) -> Result<Array>| -> (Array, Array) {
+            let dense = synthetic_spatial_decode(&normalize(&latent).unwrap()).unwrap();
+            let tiled = LtxVideoVae::decode_tiled_plan(
+                &latent,
+                &plan,
+                &CancelFlag::default(),
+                |tile| synthetic_spatial_decode(&normalize(tile).unwrap()),
+                |output, weights| {
+                    output.eval()?;
+                    weights.eval()?;
+                    Ok(())
+                },
+                || {},
+            )
+            .unwrap();
+            dense.eval().unwrap();
+            tiled.eval().unwrap();
+            (dense, tiled)
+        };
+
+        let (dense, tiled) = run(&|x| pixel_norm(x, DEC_NORM_EPS));
+        assert_eq!(tiled.shape(), dense.shape());
+        let exact = max_abs_delta(&dense, &tiled);
+
+        let (mutant_dense, mutant_tiled) = run(&|x| spatially_normalized(x, DEC_NORM_EPS));
+        let broken = max_abs_delta(&mutant_dense, &mutant_tiled);
+
+        println!("tiled pixel_norm assembly = {exact:.3e}; spatial-norm control = {broken:.3e}");
+        assert!(
+            exact < 1e-5,
+            "a per-position normalization must reassemble exactly under tiling, got \
+             max|Δ|={exact:.3e}"
+        );
+        assert!(
+            broken > 1e-1,
+            "the spatial-reduction control must break tiled reassembly, got max|Δ|={broken:.3e} — \
+             the bound above would then be proving nothing"
+        );
+    }
+
     #[test]
     fn pixel_norm_matches_closed_form() {
         // 2 channels, single cell: mean(x²) = (1+4)/2 = 2.5 → denom = √(2.5 + eps).

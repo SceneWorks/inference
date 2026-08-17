@@ -402,9 +402,9 @@ fn non_square_cod_decoder_matches_the_torch_reference() {
 /// the output-resolution half. `decode_tiled` now runs the first half whole and tiles only the
 /// second, so the bounded result is the dense result — not an approximation of it.
 ///
-/// Verified by mutation, not assumed: tiling the whole `decode` (this method's previous shape)
-/// moves the same comparison to max_abs **1.655e-1** against the 2e-4 bound below, because every
-/// crop then normalizes, attends and gates against itself.
+/// The 2e-4 tolerance below is meaningful because
+/// `per_crop_whole_decode_tiling_is_observably_wrong` executes the retired shape on this same
+/// fixture and lands orders of magnitude outside it.
 #[test]
 fn tiled_decode_reproduces_the_dense_decode() {
     let w = fixture();
@@ -480,4 +480,43 @@ fn tiled_decode_honors_a_pretripped_cancel() {
     let cfg = mlx_gen::tiling::TilingConfig::spatial_only(4 * shape.patch, 0);
     let result = vae.decode_tiled(&latent, &cfg, Some(&cancel));
     assert!(matches!(result, Err(mlx_gen::Error::Canceled)));
+}
+
+/// The **executed** defect control for `tiled_decode_reproduces_the_dense_decode` (sc-19753).
+///
+/// Runs the retired shape — tile the *whole* `decode`, i.e. decode each latent crop independently
+/// and stitch — and asserts it is observably different from the dense decode. Every crop then gets
+/// its own CoD `GroupNorm(32)` statistics, its own re-cut 32×32 attention windows, and its own
+/// whole-extent squeeze-and-excite gates in each DiCo block.
+///
+/// Without this the bounded-vs-dense tolerance would be a bound any implementation satisfies.
+#[test]
+fn per_crop_whole_decode_tiling_is_observably_wrong() {
+    let w = fixture();
+    let (shape, latent_hw) = fixture_shape(&w);
+    let latent = w.require("fixture.latent").unwrap().clone();
+    let vae = build(&w, shape, true);
+
+    let dense = vae.decode(&latent).unwrap();
+
+    // Two independent latent crops along W, decoded separately and concatenated — the arithmetic
+    // the previous `decode_tiled` performed per tile.
+    let split = latent_hw / 2;
+    let take = |start: i32, len: i32| {
+        let idx = (start..start + len).collect::<Vec<i32>>();
+        latent
+            .take_axis(Array::from_slice(&idx, &[len]), 3)
+            .unwrap()
+    };
+    let left = vae.decode(&take(0, split)).unwrap();
+    let right = vae.decode(&take(split, latent_hw - split)).unwrap();
+    let per_crop = mlx_rs::ops::concatenate_axis(&[&left, &right], 3).unwrap();
+    assert_eq!(per_crop.shape(), dense.shape());
+
+    let err = max_abs(&dense, &per_crop);
+    assert!(
+        err > 1e-2,
+        "per-crop whole-decode tiling must be observably different from the dense decode, else the \
+         bounded-decode tolerance proves nothing: max_abs {err}"
+    );
 }

@@ -134,41 +134,86 @@ fn native_dense_decode_matches_the_stock_autoencoder_kl() {
     }
 }
 
-/// The layer-wise bounded decode must track the dense decode.
+/// The layer-wise bounded decode must track the dense decode, at f32 **and** at the f16 the
+/// production fp16-fix VAE actually loads at.
 ///
-/// Mutation-discriminating rather than merely shape-checking: the shared primitive's own
-/// `global_stat_tiled_conv_tracks_the_dense_layer` (candle-gen) proves per-crop normalization is
-/// observably different from the dense layer, and this drives the same machinery through the whole
-/// decoder on a position-dependent latent.
+/// f16 is the load-bearing case for [`GlobalGroupNorm`]'s dtype dance: candle's `GroupNorm`
+/// computes its statistics in f32 for half-precision inputs and casts back before the affine, and
+/// only the tiled path exercises the ported reimplementation of that. A port that normalized
+/// entirely in the input dtype would pass every f32 row here and drift in production.
+///
+/// The companion `per_tile_normalization_is_observably_wrong` executes the defect on this same
+/// decoder, so the bounds below are known to discriminate rather than assumed to.
 #[test]
 fn bounded_decode_tracks_the_dense_decode() {
     let device = Device::Cpu;
-    let dtype = DType::F32;
-    let tensors = checkpoint(dtype, &device);
-    let native = SdxlVaeDecoder::new(
-        VarBuilder::from_tensors(tensors, dtype, &device),
-        3,
-        &config(),
-    )
-    .unwrap();
+    for (dtype, bound) in [(DType::F32, 2e-5_f32), (DType::F16, 6e-3)] {
+        let tensors = checkpoint(dtype, &device);
+        let native = SdxlVaeDecoder::new(
+            VarBuilder::from_tensors(tensors, dtype, &device),
+            3,
+            &config(),
+        )
+        .unwrap();
 
-    let z = latent(6, 7, dtype, &device);
-    let dense = native.decode(&z).unwrap();
-    let (_, _, out_h, out_w) = dense.dims4().unwrap();
-    // One upsampling block ⇒ ×2. A 6-pixel output edge genuinely splits a 12×14 output.
-    let edge = 6usize;
-    assert!(
-        out_h > edge && out_w > edge,
-        "the bounded request must actually split the {out_h}x{out_w} output"
-    );
+        let z = latent(6, 7, dtype, &device);
+        let dense = native.decode(&z).unwrap();
+        let (_, _, out_h, out_w) = dense.dims4().unwrap();
+        // One upsampling block ⇒ ×2. A 6-pixel output edge genuinely splits a 12×14 output.
+        let edge = 6usize;
+        assert!(
+            out_h > edge && out_w > edge,
+            "the bounded request must actually split the {out_h}x{out_w} output"
+        );
 
-    let bounded = native.decode_tiled(&z, edge, None).unwrap();
-    assert_eq!(bounded.dims(), dense.dims());
-    let delta = max_abs(&bounded, &dense);
-    assert!(
-        delta < 2e-5,
-        "layer-wise bounded SDXL decode diverged from dense: max|delta|={delta:.3e}"
-    );
+        let bounded = native.decode_tiled(&z, edge, None).unwrap();
+        assert_eq!(bounded.dims(), dense.dims(), "{dtype:?} geometry");
+        let delta = max_abs(&bounded, &dense);
+        assert!(
+            delta < bound,
+            "{dtype:?}: layer-wise bounded SDXL decode diverged from dense: max|delta|={delta:.3e}"
+        );
+    }
+}
+
+/// The **executed** defect control for the bound above (sc-19753).
+///
+/// Reproduces the per-tile normalization this story removed — decode each latent crop
+/// independently and stitch — and asserts it is observably different from the dense decode. That is
+/// what makes `bounded_decode_tracks_the_dense_decode`'s tolerance meaningful: without this, a
+/// bound that any implementation satisfies would look like a passing guard.
+///
+/// It also runs at both dtypes, because a bound loose enough for f16 is the easiest one to satisfy
+/// accidentally.
+#[test]
+fn per_tile_normalization_is_observably_wrong() {
+    let device = Device::Cpu;
+    for dtype in [DType::F32, DType::F16] {
+        let tensors = checkpoint(dtype, &device);
+        let native = SdxlVaeDecoder::new(
+            VarBuilder::from_tensors(tensors, dtype, &device),
+            3,
+            &config(),
+        )
+        .unwrap();
+
+        let z = latent(6, 7, dtype, &device);
+        let dense = native.decode(&z).unwrap();
+
+        // The retired shape: decode each latent half on its own and concatenate. Each half's
+        // GroupNorms see only their own crop and the mid block attends only to their own tokens.
+        let left = native.decode(&z.narrow(3, 0, 3).unwrap()).unwrap();
+        let right = native.decode(&z.narrow(3, 3, 4).unwrap()).unwrap();
+        let per_tile = candle_gen::candle_core::Tensor::cat(&[left, right], 3).unwrap();
+        assert_eq!(per_tile.dims(), dense.dims());
+
+        let delta = max_abs(&per_tile, &dense);
+        assert!(
+            delta > 1e-2,
+            "{dtype:?}: per-crop normalization must be observably different from the dense decode, \
+             else the bounded-decode tolerance proves nothing: max|delta|={delta:.3e}"
+        );
+    }
 }
 
 /// An edge wide enough to hold the whole output takes the single-tile fall-through inside every

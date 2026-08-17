@@ -269,6 +269,16 @@ fn decode_to_image_with_tiling(
 /// point: no visible artifact at 1:1, the memory floor intact, and the sweep table at
 /// `DECODE_TILING_MEAN_ABS_U8` (tests/memory_ladder_real_weights.rs) records the measured menu
 /// for any future quality-first move.
+///
+/// **sc-19753 — that sweep measured a superseded mechanism.** Every row above was captured while
+/// [`decode_tiled`] tiled the *whole* decoder, so each tile's nine `EfficientVit` blocks aggregated
+/// their ReLU-linear attention over that tile's tokens instead of the image. That is why widening
+/// the overlap to 96 px only floored at meanD ~3.0 instead of converging: overlap width cannot fix
+/// a per-tile global reduction. The attention now runs once in the dense head and only the
+/// attention-free tail tiles, so the residual these numbers describe is expected to be
+/// substantially smaller. **The recorded values are accepted ceilings, not targets** — they are
+/// left untouched here (a better result still passes) and re-capturing them is a measurement
+/// campaign, not part of this fix.
 pub const DECODE_TILE_EDGE: i32 = 192;
 pub const DECODE_OVERLAP: i32 = 48;
 
@@ -385,35 +395,52 @@ pub(crate) fn resolved_rung_plan(
     Ok(crate::transformer::SanaForwardPlan { attention, window })
 }
 
-const DC_AE_TILING: VaeTiling = VaeTiling {
-    spatial_scale: 32,
-    temporal_scale: 1,
-    causal_temporal: false,
-    full_res_channels: 3,
-};
-
 /// Decode one NCHW DC-AE latent through the shared 5-D tiled-VAE seam. SANA's decoder emits NHWC,
-/// so a dummy temporal axis keeps the latent and decoded tile spatial axes aligned for blending.
+/// so a dummy temporal axis keeps the head-feature and decoded tile spatial axes aligned.
+///
+/// **Normalization semantics (sc-19753).** Only the decoder's shallow, attention-free
+/// [`DcAeDecoder::decode_tail`] is tiled. The deep `EfficientVit` stages run once on the whole
+/// latent via [`DcAeDecoder::decode_head`], because their ReLU-linear attention contracts over
+/// **every** `H·W` token — evaluating one on a crop aggregates over that crop instead of the image,
+/// the same defect class as a per-tile GroupNorm. This route previously tiled the *entire* decoder,
+/// putting nine such attention blocks inside the per-tile closure.
+///
+/// The tile plan is therefore keyed on the **tail's** ×8 upsample rather than the whole decoder's
+/// ×32: the tiles now partition the head feature map, which is already ×4 the latent.
+///
+/// The candle sibling (`candle_gen_sana::DcAeDecoder::decode_with`) has had this split since
+/// sc-11804; the MLX lane is the one that had not been converted.
 fn decode_tiled(
     decoder: &DcAeDecoder,
     latent: &Array,
     tiling: &TilingConfig,
     cancel: &CancelFlag,
 ) -> Result<Array> {
-    let shape = latent.shape();
-    let (height, width) = (shape[2], shape[3]);
-    let plan = tiling.plan(DC_AE_TILING, 1, height, width);
-    let denorm =
-        latent
-            .transpose_axes(&[0, 2, 3, 1])?
-            .reshape(&[1, 1, height, width, LATENT_CHANNELS])?;
-    let out = mlx_gen::vae_tiling::tiled_decode(&denorm, &plan, [1, 2, 3], Some(cancel), |tile| {
+    if cancel.is_cancelled() {
+        return Err(Error::Canceled);
+    }
+    // A config with no attention-free shallow run has no tileable tail at all.
+    if decoder.num_tail_stages() == 0 {
+        return decoder.decode(latent, cancel);
+    }
+    let head = decoder.decode_head(latent)?; // NHWC, at the tail's input resolution
+    let shape = head.shape();
+    let (height, width, channels) = (shape[1], shape[2], shape[3]);
+    let vae = VaeTiling {
+        spatial_scale: decoder.tail_scale(),
+        temporal_scale: 1,
+        causal_temporal: false,
+        full_res_channels: 3,
+    };
+    if !tiling.needs_tiling(vae, 1, height, width) {
+        return decoder.decode_tail(&head);
+    }
+    let plan = tiling.plan(vae, 1, height, width);
+    let lifted = head.reshape(&[1, 1, height, width, channels])?;
+    let out = mlx_gen::vae_tiling::tiled_decode(&lifted, &plan, [1, 2, 3], Some(cancel), |tile| {
         let shape = tile.shape();
-        let (height, width) = (shape[2], shape[3]);
-        let tile = tile
-            .reshape(&[1, height, width, LATENT_CHANNELS])?
-            .transpose_axes(&[0, 3, 1, 2])?;
-        let decoded = decoder.decode(&tile, cancel)?;
+        let tile = tile.reshape(&[1, shape[2], shape[3], shape[4]])?;
+        let decoded = decoder.decode_tail(&tile)?;
         let shape = decoded.shape();
         Ok(decoded.reshape(&[1, 1, shape[1], shape[2], shape[3]])?)
     })?;

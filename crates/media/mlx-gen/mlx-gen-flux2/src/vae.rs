@@ -859,10 +859,55 @@ mod tiled_decode_tests {
     use super::tiling_fixture::{max_abs_delta, packed_latents, weights as fixture};
     use super::*;
 
-    /// The layer-wise bounded tail must track the dense decode. Verified by mutation, not assumed:
-    /// restoring the whole-tail `tiled_decode` route — every crop normalizing against itself —
-    /// moves this comparison to max|delta| **2.112e0** against the 3e-3 bound, so the assertion
-    /// fails on the defect rather than merely on a shape change.
+    /// The **executed** defect control for the bound below (sc-19753).
+    ///
+    /// Runs the upsample tail on two halves of the same head activation and stitches them, which is
+    /// exactly what the retired whole-tail `tiled_decode` route did: each crop's `GroupNorm`s reduce
+    /// only their own crop. Asserting that this is observably different from the dense tail is what
+    /// makes the 3e-3 tolerance below a real guard rather than one any implementation satisfies.
+    ///
+    /// Deliberately isolates the *tail*: the head runs once and is shared, so the divergence
+    /// measured here is normalization alone, not the mid block's global attention.
+    #[test]
+    fn per_crop_tail_normalization_is_observably_wrong() {
+        let vae = Flux2Vae::from_weights(&fixture()).unwrap();
+        let packed = packed_latents(4, 5);
+        let latents = vae
+            .unpack_flux_packed_latents(&packed)
+            .unwrap()
+            .as_dtype(Dtype::Float32)
+            .unwrap();
+        let z = linear(&latents, &vae.post_quant.0, &vae.post_quant.1).unwrap();
+        let head = vae.decoder.forward_pre_upsample(&z).unwrap();
+
+        let dense = vae.decoder.forward_upsample_tail(&head).unwrap();
+        let width = head.shape()[2];
+        let split = width / 2;
+        let take = |start: i32, len: i32| {
+            let idx = (start..start + len).collect::<Vec<i32>>();
+            head.take_axis(Array::from_slice(&idx, &[len]), 2).unwrap()
+        };
+        let left = vae.decoder.forward_upsample_tail(&take(0, split)).unwrap();
+        let right = vae
+            .decoder
+            .forward_upsample_tail(&take(split, width - split))
+            .unwrap();
+        let per_crop = mlx_rs::ops::concatenate_axis(&[&left, &right], 2).unwrap();
+
+        dense.eval().unwrap();
+        per_crop.eval().unwrap();
+        assert_eq!(per_crop.shape(), dense.shape());
+        let delta = max_abs_delta(&dense, &per_crop);
+        assert!(
+            delta > 1e-2,
+            "per-crop tail normalization must be observably different from the dense tail, else the \
+             bounded-decode tolerance proves nothing: max|delta|={delta:.3e}"
+        );
+    }
+
+    /// The layer-wise bounded tail must track the dense decode. The tolerance is meaningful because
+    /// `per_crop_tail_normalization_is_observably_wrong` executes the defect on this same fixture
+    /// and lands orders of magnitude outside this bound.
     #[test]
     fn tiled_packed_decode_tracks_dense_with_global_group_norm() {
         let vae = Flux2Vae::from_weights(&fixture()).unwrap();

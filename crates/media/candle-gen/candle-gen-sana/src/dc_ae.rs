@@ -599,10 +599,18 @@ impl DcAeDecoder {
     /// field (the source of a naive-tiling seam) — and tiles only the shallow, attention-free
     /// upsampling **tail** (`ResBlock`s + `norm_out` + `conv_out`, purely conv/upsample-local) with a
     /// trapezoidal seam blend. The tail carries the f32 activation peak (its convs run at the full
-    /// output resolution), so tiling it is what caps the OOM; it is a pure *speed* trade with **no
-    /// quality cost** (the `Self::tile_blend_tail` masks are a partition of unity over the overlap).
-    /// If the config has no attention-free shallow tail (`num_tail_stages == 0`) this is always the
-    /// single-pass decode.
+    /// output resolution), so tiling it is what caps the OOM.
+    ///
+    /// What the split guarantees is that the tiling is **normalization-correct**: no global statistic
+    /// is ever computed per crop, because the only global op (the head's ReLU-linear attention, which
+    /// normalizes over every H·W token) runs once on the whole field. It is **not** bit-exact — each
+    /// tile's padded convolutions zero-pad at their own crop boundary, so the tiled result is a close
+    /// *approximation* of the single-pass decode. `tiled_tail_matches_single_pass_cpu` and
+    /// `head_tail_split_is_load_bearing_vs_whole_decoder_tiling` hold that as a PSNR floor (≥ 40 dB;
+    /// measured 63-74 dB at the tiny CPU config) rather than an equality, and
+    /// `decoder_tail_is_crop_decomposable_but_the_head_is_not` is the proof that only the tail may be
+    /// tiled at all. If the config has no attention-free shallow tail (`num_tail_stages == 0`) this is
+    /// always the single-pass decode.
     pub fn decode_with(&self, latent: &Tensor, force_tile: bool) -> Result<Tensor> {
         let head = self.decode_head(latent)?;
         if force_tile && self.num_tail_stages() > 0 {
@@ -753,6 +761,13 @@ impl DcAeDecoder {
             weights.ok_or_else(|| Error::Msg("dc-ae tail tiling produced no tiles".into()))?;
         // Floor the divisor to avoid a divide-by-zero at any coverage gap (the plan guarantees > 0),
         // broadcasting the [1,1,H,W] weight over the channel axis.
+        //
+        // sc-19753 note: at every geometry this decoder actually ships, the per-axis trapezoidal
+        // masks already sum to exactly 1 everywhere, so this divide is a **measured no-op** — it
+        // currently guards nothing. It is retained deliberately: it is the invariant that makes the
+        // blend a partition of unity rather than an assumption about it, and it is what would keep
+        // the output correct if a future plan ever produced a ragged edge whose masks did not sum
+        // to unity. Do not "optimize" it away without first proving that case unreachable.
         output.broadcast_div(&weights.clamp(1e-8f32, f32::MAX)?)
     }
 
@@ -857,8 +872,15 @@ mod tests {
             s = s
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
-            // top bits → [-1, 1)
-            let u = ((s >> 33) as f64) / ((1u64 << 31) as f64) - 1.0;
+            // Top 31 bits → [-1, 1).
+            //
+            // sc-19753: this divided by `1 << 31` and so produced `[-1, 0)` — the shift already
+            // leaves 31 bits, so the quotient was `[0, 1)`, not `[0, 2)`. Every value this helper
+            // returned was negative, which made `det(..).relu()` **identically zero**: the
+            // `linear_attention_matches_reference` fixture below fed all-zero `φ(q)`/`φ(k)`, so
+            // DC-AE's attention was inert in every test that used it. Halving the divisor restores
+            // the documented range.
+            let u = ((s >> 33) as f64) / ((1u64 << 30) as f64) - 1.0;
             v.push(u as f32);
         }
         Tensor::from_vec(v, shape, dev).unwrap()
@@ -950,6 +972,12 @@ mod tests {
         // The O(N) associative kernel must equal the explicit O(N²) softmax-free ReLU attention
         // (materializing the [N,N] score matrix) — an independent computation path proving the
         // numerator/denominator split algebra of the "shared hard primitive".
+        //
+        // sc-19753: this assertion was **vacuous** until the `det` range bug above was fixed.
+        // `det` returned only negative values, so `det(..).relu()` was identically zero and both
+        // sides of the comparison were zero tensors regardless of what `relu_linear_attention`
+        // computed. With `det` corrected it discriminates: perturbing `q` by 0.01 inside the kernel
+        // takes max|Δ| from ~1e-7 to 1.25e13.
         let dev = Device::Cpu;
         let (b, g, hd, n) = (1usize, 2usize, 3usize, 5usize);
         let q = det(&[b, g, hd, n], 21, &dev).relu().unwrap(); // φ(q) ≥ 0
@@ -1182,6 +1210,286 @@ mod tests {
             psnr >= 40.0,
             "tiled tail must be seam-free vs single-pass; PSNR={psnr:.2} dB (< 40)"
         );
+    }
+
+    /// sc-19753 — the **mechanism** proof that the DC-AE head/tail boundary is drawn in the only
+    /// place it can be: the tail is crop-decomposable and the head is not.
+    ///
+    /// This is the sharp form of the `LOCAL_ONLY` audit verdict, and it is a *binary* property rather
+    /// than a tolerance, so it cannot be satisfied accidentally:
+    ///  - **Tail** — every op is spatially local (convs, the `UpBlock` upsample, and `Trms2d`, whose
+    ///    `mean_keepdim(1)` reduces the channel axis). So decoding a *crop* of the head map reproduces
+    ///    the full decode **bit-exactly** everywhere outside the crop's own zero-pad boundary. Tiling
+    ///    it is therefore normalization-correct by construction.
+    ///  - **Head** — the `EfficientVit` stage's ReLU-linear attention normalizes over *every* H·W
+    ///    token, so a crop perturbs the result at **every** position, including the one farthest from
+    ///    the crop boundary. There is no safe interior, which is exactly why it may never be tiled.
+    ///
+    /// Both arms crop to the same 32-of-48 columns and are compared over the same 24-column interior,
+    /// leaving an identical 8-head-pixel margin from the crop edge — so the two verdicts differ by the
+    /// operators involved, not by how generously each was measured.
+    ///
+    /// Measured on this fixture (48² latent, CPU f32):
+    ///  - tail interior residual: **0.00e0** (bit-exact; divergence begins only ~1.5 head-px from the
+    ///    crop edge)
+    ///  - head interior residual: **3.814697e-6**, uniform from column 0 — small but structurally
+    ///    nonzero
+    ///
+    /// Mutation-discrimination (measured, not assumed), each guard mutated alone:
+    ///  - Move the `EfficientVit` stage from head into tail (`decode_head`'s `self.stages[tail..]` →
+    ///    `self.stages[tail + 1..]` with `decode_tail`'s `self.stages[..tail]` →
+    ///    `self.stages[..tail + 1]` — i.e. "tile the attention"): the tail interior residual becomes
+    ///    **2.861023e-6** and the bit-exactness guard fires.
+    ///  - Make the global op local — `relu_linear_attention`'s final
+    ///    `num.broadcast_div(&(den + eps)?)` → `Ok(v.clone())`: the head interior residual becomes
+    ///    **0.00e0** and the "no safe interior" guard fires.
+    #[test]
+    fn decoder_tail_is_crop_decomposable_but_the_head_is_not() {
+        let dev = Device::Cpu;
+        let cfg = DcAeConfig::tiny_test();
+        let w = synthetic_weights(&cfg, true, false, &dev);
+        let dec = DcAeDecoder::from_weights(&w, cfg.clone()).unwrap();
+        assert_eq!(
+            dec.num_tail_stages(),
+            3,
+            "3 leading Res stages are the tail"
+        );
+        assert_eq!(
+            cfg.block_types[dec.num_tail_stages()],
+            BlockType::EfficientVit,
+            "the head must carry attention, else this proof compares nothing"
+        );
+
+        let latent = signed(&[1, cfg.latent_channels as usize, 48, 48], 77, &dev);
+        let head = dec.decode_head(&latent).unwrap();
+
+        // Crop 32 of 48 columns; judge only the first 24, i.e. 8 head-px clear of the crop edge.
+        const CROP: usize = 32;
+        const INTERIOR: usize = 24;
+        let scale = dec.tail_scale();
+
+        // Tail: local ⇒ the interior must be bit-exact under cropping.
+        let tail_full = dec.decode_tail(&head).unwrap();
+        let tail_crop = dec
+            .decode_tail(&head.narrow(3, 0, CROP).unwrap().contiguous().unwrap())
+            .unwrap();
+        let tail_residual = max_abs(
+            &tail_full.narrow(3, 0, INTERIOR * scale).unwrap(),
+            &tail_crop.narrow(3, 0, INTERIOR * scale).unwrap(),
+        );
+        assert_eq!(
+            tail_residual, 0.0,
+            "the tail must be spatially local: decoding a crop has to reproduce the full decode \
+             bit-exactly away from the crop's own zero-pad edge, else tiling it is not \
+             normalization-correct; max|Δ|={tail_residual:.3e}"
+        );
+
+        // Head: global ⇒ no interior is safe, including the column farthest from the crop edge.
+        let head_crop = dec
+            .decode_head(&latent.narrow(3, 0, CROP).unwrap().contiguous().unwrap())
+            .unwrap();
+        let head_residual = max_abs(
+            &head.narrow(3, 0, INTERIOR).unwrap(),
+            &head_crop.narrow(3, 0, INTERIOR).unwrap(),
+        );
+        assert!(
+            head_residual > 0.0,
+            "the head's attention normalizes over every token, so cropping must perturb even the \
+             deepest interior — a head that survived cropping would mean this fixture never \
+             exercised the global op; max|Δ|={head_residual:.3e}"
+        );
+        let head_edge_column = max_abs(
+            &head.narrow(3, 0, 1).unwrap(),
+            &head_crop.narrow(3, 0, 1).unwrap(),
+        );
+        assert!(
+            head_edge_column > 0.0,
+            "column 0 is the farthest from the crop boundary; contamination there is what proves the \
+             divergence is the global reduction and not a padding artifact; max|Δ|={head_edge_column:.3e}"
+        );
+    }
+
+    /// sc-19753 — the **executed defect control**: tiling the *whole* decoder is observably worse than
+    /// the shipped head-whole/tail-tiled shape, measured against the same single-pass reference.
+    ///
+    /// `tiled_tail_matches_single_pass_cpu` shows the shipped tiling is seam-free, but a bound that
+    /// *any* tiling satisfies would prove nothing. So the second arm reproduces the naive shape this
+    /// story rejects — decode independent latent crops and stitch — where each crop's `EfficientVit`
+    /// attention normalizes over only its own tokens.
+    ///
+    /// The shipped arm runs the production entry point [`DcAeDecoder::decode_with`] rather than a
+    /// hand-composed head/tail pair, so the policy that decides *what* gets tiled is under test too.
+    /// An 80²-head is required for the production `spatial_only(512, 128)` gate to actually split.
+    ///
+    /// Measured on this fixture (80² latent, 640² output, CPU f32):
+    ///  - shipped (`decode_with(force_tile = true)`): **74.27 dB**
+    ///  - defect (whole-decoder quadrant crops, stitched): **32.31 dB** — a 41.96 dB gap, i.e. ~125×
+    ///    the RMS error, and below the ≥~34.75 dB "no measurable seam" bar this codebase uses.
+    ///
+    /// Mutation-discrimination (measured, not assumed): dropping the seam overlap — `decode_with`'s
+    /// `TilingConfig::spatial_only(512, 128)` → `spatial_only(512, 0)`, so abutting tiles each zero-pad
+    /// at their own edge with nothing to blend — collapses the shipped arm to **35.28 dB** and the gap
+    /// to **2.97 dB**, firing both the `>= 40.0` floor and the `>= 25.0` gap guard.
+    ///
+    /// Two notes on what this test deliberately does **not** claim. The *sharp* guard on head globality
+    /// is `decoder_tail_is_crop_decomposable_but_the_head_is_not` above: with overlap and blending,
+    /// tiling this fixture's attention costs only ~1-6 dB, so a blended-PSNR bound is **not** relied on
+    /// to catch it. And deleting the final `broadcast_div` by the accumulated weights was measured to
+    /// be a *no-op* here (74.2724 dB either way) — the trapezoidal masks really do sum to exactly 1.0
+    /// under full coverage, so that division normalizes nothing at these dims and is not a guard this
+    /// test can hold.
+    #[test]
+    fn head_tail_split_is_load_bearing_vs_whole_decoder_tiling() {
+        let dev = Device::Cpu;
+        let cfg = DcAeConfig::tiny_test();
+        let w = synthetic_weights(&cfg, true, false, &dev);
+        let dec = DcAeDecoder::from_weights(&w, cfg.clone()).unwrap();
+
+        let latent = signed(&[1, cfg.latent_channels as usize, 80, 80], 77, &dev);
+        let single = dec.decode(&latent).unwrap();
+
+        // Arm A — the shipped shape, through the production policy. Assert it genuinely splits, else
+        // this would be a single-pass decode compared against itself.
+        let vae = VaeTiling {
+            spatial_scale: dec.tail_scale() as i32,
+            temporal_scale: 1,
+            causal_temporal: false,
+            full_res_channels: 128,
+        };
+        assert!(
+            TilingConfig::spatial_only(512, 128).needs_tiling(vae, 1, 80, 80),
+            "the production gate must tile an 80²-head, else arm A never exercises tiling"
+        );
+        let shipped = dec.decode_with(&latent, true).unwrap();
+        assert_eq!(shipped.dims(), single.dims());
+        let shipped_psnr = psnr_db(&single, &shipped);
+
+        // Arm B — the defect: tile the WHOLE decoder. Each quadrant gets its own `decode_head`, so its
+        // linear attention normalizes over a quarter of the tokens.
+        let quadrant = |y: usize, x: usize| {
+            dec.decode(
+                &latent
+                    .narrow(2, y, 40)
+                    .unwrap()
+                    .narrow(3, x, 40)
+                    .unwrap()
+                    .contiguous()
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        let top = Tensor::cat(&[quadrant(0, 0), quadrant(0, 40)], 3).unwrap();
+        let bottom = Tensor::cat(&[quadrant(40, 0), quadrant(40, 40)], 3).unwrap();
+        let whole_tiled = Tensor::cat(&[top, bottom], 2).unwrap();
+        assert_eq!(whole_tiled.dims(), single.dims());
+        let defect_psnr = psnr_db(&single, &whole_tiled);
+
+        assert!(
+            shipped_psnr >= 40.0,
+            "head-whole/tail-tiled must stay seam-free vs single-pass; PSNR={shipped_psnr:.2} dB"
+        );
+        assert!(
+            defect_psnr < 34.75,
+            "whole-decoder tiling must fall below the codebase's no-measurable-seam bar, else the \
+             floor above proves nothing; PSNR={defect_psnr:.2} dB"
+        );
+        assert!(
+            shipped_psnr - defect_psnr >= 25.0,
+            "the head/tail split must buy a large margin over whole-decoder tiling; \
+             shipped={shipped_psnr:.2} dB defect={defect_psnr:.2} dB"
+        );
+    }
+
+    /// sc-19753 — the operator-level companion to the two decoder proofs above: the tail's only
+    /// normalization reduces over the *channel* axis and so commutes exactly with a spatial crop,
+    /// whereas the head's ReLU-linear attention reduces over *tokens* and does not.
+    ///
+    /// Measured on this fixture (CPU f32):
+    ///  - `Trms2d` crop-commutation residual: **0.00e0** (bit-exact — `mean_keepdim(1)` has no
+    ///    spatial extent)
+    ///  - `relu_linear_attention` crop-commutation residual: **1.610912e-1** max|Δ| on the *retained*
+    ///    tokens, i.e. cropping moves positions the crop still contains
+    ///
+    /// Mutation-discrimination (measured, not assumed), each guard mutated alone:
+    ///  - `Trms2d::forward`'s `mean_keepdim(1)` → `mean_keepdim(3)` (reduce over W instead of C):
+    ///    the crop residual becomes **1.023968e0** and the `== 0.0` guard fires.
+    ///  - `relu_linear_attention`'s final `num.broadcast_div(&(den + eps)?)` → `Ok(v.clone())`
+    ///    (a purely position-local op): the residual becomes **0.00e0** and the `> 1e-2` guard fires.
+    #[test]
+    fn tail_norm_is_crop_invariant_while_head_attention_is_not() {
+        let dev = Device::Cpu;
+        let cfg = DcAeConfig::tiny_test();
+        let w = synthetic_weights(&cfg, true, false, &dev);
+
+        // The tail's only norm, loaded through the real path so a changed reduction axis is visible.
+        let norm = Trms2d::load(&w, "decoder.norm_out", cfg.norm_eps).unwrap();
+        let c = cfg.block_out_channels[0] as usize;
+        let x = signed(&[1, c, 12, 12], 91, &dev);
+        let whole = norm.forward(&x).unwrap();
+        let cropped = norm.forward(&x.narrow(3, 0, 6).unwrap()).unwrap();
+        let norm_residual = max_abs(&whole.narrow(3, 0, 6).unwrap(), &cropped);
+        assert_eq!(
+            norm_residual, 0.0,
+            "a channel-axis reduction must commute with a spatial crop bit-exactly, else the tail is \
+             not spatially local and may not be tiled; max|Δ|={norm_residual:.3e}"
+        );
+
+        // The head's global op, on the same crop question. `q`/`k` arrive ReLU'd (the block does that
+        // before calling in); `[B, groups, head_dim, N]` with N = the token count.
+        let (b, g, hd, n) = (1usize, 2usize, 4usize, 16usize);
+        let q = signed(&[b, g, hd, n], 11, &dev).relu().unwrap();
+        let k = signed(&[b, g, hd, n], 12, &dev).relu().unwrap();
+        let v = signed(&[b, g, hd, n], 13, &dev);
+        let attn_whole = relu_linear_attention(&q, &k, &v, cfg.attn_eps as f64).unwrap();
+        let half = n / 2;
+        let crop = |t: &Tensor| t.narrow(3, 0, half).unwrap().contiguous().unwrap();
+        let attn_cropped =
+            relu_linear_attention(&crop(&q), &crop(&k), &crop(&v), cfg.attn_eps as f64).unwrap();
+        let attn_residual = max_abs(&crop(&attn_whole), &attn_cropped);
+        assert!(
+            attn_residual > 1e-2,
+            "the head's token-axis reduction must NOT commute with a crop — that is why it may never \
+             be tiled; max|Δ|={attn_residual:.3e}"
+        );
+    }
+
+    /// Deterministic **signed**, position-dependent values for the three sc-19753 proofs above.
+    ///
+    /// The module's older [`det`] helper cannot be used here: its `(s >> 33) as f64 / 2^31 - 1` maps a
+    /// 31-bit value onto `[-1, 0)`, so it is strictly negative despite its doc saying `[-1, 1)`. Fed to
+    /// the DC-AE head that zeroes `relu(q)`/`relu(k)` outright, leaving the global attention inert and
+    /// every control above comparing nothing. The spatial ramp is deliberate too: it makes a crop's
+    /// global statistics differ from the whole field's, which is the property under test.
+    fn signed(shape: &[usize], seed: u64, dev: &Device) -> Tensor {
+        let n: usize = shape.iter().product();
+        let w = (*shape.last().unwrap_or(&1)).max(1);
+        let h = if shape.len() >= 2 {
+            shape[shape.len() - 2].max(1)
+        } else {
+            1
+        };
+        let v = (0..n)
+            .map(|i| {
+                let y = (i / w % h) as f32;
+                let x = (i % w) as f32;
+                ((i as f32 + seed as f32 * 7919.0) * 0.037).sin() + y * 0.035 - x * 0.055
+            })
+            .collect::<Vec<f32>>();
+        Tensor::from_vec(v, shape, dev).unwrap()
+    }
+
+    /// max|a − b| as f32, for the crop-commutation residuals above.
+    fn max_abs(a: &Tensor, b: &Tensor) -> f32 {
+        (a.contiguous().unwrap() - b.contiguous().unwrap())
+            .unwrap()
+            .abs()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap()
     }
 
     #[test]

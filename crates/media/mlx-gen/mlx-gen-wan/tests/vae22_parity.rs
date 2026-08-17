@@ -226,3 +226,112 @@ fn vae22_encode_matches_reference() {
         "encode diverged: mean_rel={mean_rel:.3e} max|Δ|={max_abs:.3e}"
     );
 }
+
+/// sc-19753 — the z48 bounded decode keeps the decoder's **middle-block attention** whole.
+///
+/// `Decoder3d::middle.1` is a per-frame softmax self-attention over every `H·W` spatial token, and
+/// `decode_tiled` used to run the whole decoder per tile, so each spatial tile attended only to its
+/// own crop's token set. It now runs `forward_middle` once on the full latent and tiles only the
+/// spatially-local upsample tail. The channel-L2 `rms_norm_last` in this VAE reduces only the last
+/// axis and was never the hazard — the attention was, and the earlier clearance of this family
+/// looked at the norms alone.
+///
+/// This is also the first tiled-decode coverage vae22 has had at all; the z16 sibling's gate lives
+/// in `tiling_parity.rs`.
+///
+/// A **relative** claim, matching the z16 gate: on a tiny random-weight fixture there is no learned
+/// smoothness, so each tile's causal convolutions zero-padding at their crop boundary dominates the
+/// absolute error for any tiling policy. Both sides here carry that identical conv seam; only the
+/// retired side additionally aggregates attention per crop.
+#[test]
+fn vae22_bounded_decode_is_closer_to_dense_than_whole_decoder_tiling() {
+    use mlx_gen::tiling::{SpatialTiling, TilingConfig};
+
+    let w = fixture();
+    let vae = vae(&w);
+    let dec_in = w.require("dec_in").expect("dec_in"); // [48, T, H, W]
+
+    // Spatial-only tiling: the attention is per-frame, so temporal tiling never splits its tokens.
+    // vae22 upsamples ×16 spatially and the fixture latent is 2x2 cells, so a 16-px tile is one
+    // latent cell: two tiles per spatial axis. That is the sharpest possible statement of the
+    // defect — a per-tile softmax would attend over a single token.
+    let cfg = TilingConfig {
+        spatial: Some(SpatialTiling {
+            tile_px: 16,
+            overlap_px: 0,
+        }),
+        temporal: None,
+    };
+    let sh = dec_in.shape();
+    assert!(
+        cfg.needs_tiling(Wan22Vae::VAE_TILING, sh[1], sh[2], sh[3]),
+        "the fixture geometry must actually tile"
+    );
+    let probe = cfg.plan(Wan22Vae::VAE_TILING, sh[1], sh[2], sh[3]);
+    assert!(
+        probe.h.len() > 1 && probe.w.len() > 1,
+        "both spatial axes must split, got {}x{}",
+        probe.h.len(),
+        probe.w.len()
+    );
+
+    let dense = vae.decode(dec_in).expect("single-pass decode");
+    let bounded = vae
+        .decode_tiled(dec_in, &cfg, None)
+        .expect("bounded decode");
+    assert_eq!(bounded.shape(), dense.shape());
+
+    // The retired route: tile the *whole* decoder. Denormalization is a per-channel affine, so
+    // denormalizing inside each tile (what `decode` does) reconstructs it exactly from public API.
+    let plan = cfg.plan(Wan22Vae::VAE_TILING, sh[1], sh[2], sh[3]);
+    let czthw_to_tile = dec_in.reshape(&[1, sh[0], sh[1], sh[2], sh[3]]).unwrap();
+    let legacy =
+        mlx_gen::vae_tiling::tiled_decode(&czthw_to_tile, &plan, [2, 3, 4], None, |tile| {
+            let ts = tile.shape();
+            let out = vae.decode(&tile.reshape(&[ts[1], ts[2], ts[3], ts[4]])?)?;
+            let os = out.shape();
+            Ok(out.reshape(&[os[0], os[1], os[2], os[3], os[4]])?)
+        });
+
+    let (_, bounded_rel) = diff(bounded.as_slice::<f32>(), dense.as_slice::<f32>());
+    match legacy {
+        Ok(legacy) => {
+            let (_, legacy_rel) = diff(legacy.as_slice::<f32>(), dense.as_slice::<f32>());
+            println!("[vae22 vs dense] legacy={legacy_rel:.3e} bounded={bounded_rel:.3e}");
+            assert!(
+                bounded_rel < legacy_rel * 0.75,
+                "keeping the middle-block attention whole must materially reduce the divergence \
+                 from a dense decode: bounded={bounded_rel:.3e} vs legacy={legacy_rel:.3e}"
+            );
+        }
+        Err(e) => panic!("legacy-shape reconstruction failed: {e}"),
+    }
+}
+
+/// The z48 head/tail split must be an exact decomposition — a bounded decode that does not actually
+/// tile must equal the single-pass decode.
+#[test]
+fn vae22_untiled_request_falls_through_to_the_dense_decode() {
+    use mlx_gen::tiling::{SpatialTiling, TilingConfig};
+
+    let w = fixture();
+    let vae = vae(&w);
+    let dec_in = w.require("dec_in").expect("dec_in");
+    let cfg = TilingConfig {
+        spatial: Some(SpatialTiling {
+            tile_px: 8192,
+            overlap_px: 256,
+        }),
+        temporal: None,
+    };
+    let sh = dec_in.shape();
+    assert!(!cfg.needs_tiling(Wan22Vae::VAE_TILING, sh[1], sh[2], sh[3]));
+
+    let dense = vae.decode(dec_in).expect("decode");
+    let passthrough = vae.decode_tiled(dec_in, &cfg, None).expect("decode_tiled");
+    let (max_abs, _) = diff(passthrough.as_slice::<f32>(), dense.as_slice::<f32>());
+    assert_eq!(
+        max_abs, 0.0,
+        "a non-firing request must be the exact decode"
+    );
+}

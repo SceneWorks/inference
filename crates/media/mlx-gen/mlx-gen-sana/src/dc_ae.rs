@@ -452,10 +452,72 @@ impl DcAeDecoder {
         if cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
+        self.decode_tail(&self.decode_head(latent_nchw)?)
+    }
+
+    /// Number of shallow (high-resolution) decoder stages that are attention-free
+    /// [`BlockType::Res`] stages — the tileable **tail** (sc-19753).
+    ///
+    /// The stored stage order is shallow→deep and the SANA-1.0 autoencoder is `[R,R,R,E,E,E]`, so
+    /// this counts the leading `Res` run (3). The deep `EfficientVit` stages are the **head**:
+    /// their ReLU-linear attention contracts over **every** `H·W` token
+    /// ([`LinearAttn::forward`]'s `matmul(v, kᵀ)` and `sum_axes(&k, &[3])`), so evaluating one on a
+    /// crop aggregates over that crop instead of the image — the same defect class as a per-tile
+    /// GroupNorm. Robust to any shallow-`Res` / deep-`EfficientVit` split (the DC-AE family
+    /// invariant); a config with no leading `Res` run yields 0 and forces a single-pass decode.
+    ///
+    /// Mirrors `candle_gen_sana::DcAeDecoder::num_tail_stages`, which the candle sibling has had
+    /// since sc-11804; the MLX lane is what tiled the whole decoder.
+    pub fn num_tail_stages(&self) -> usize {
+        self.cfg
+            .block_types
+            .iter()
+            .take_while(|&&t| t == BlockType::Res)
+            .count()
+    }
+
+    /// The tail's latent→pixel upsample factor (`2^{tail stages that upsample}`) — the tile plan's
+    /// spatial scale once the head has already run. For the shipped `[R,R,R,…]` tail this is ×8,
+    /// **not** the ×32 of the whole decoder.
+    pub fn tail_scale(&self) -> i32 {
+        let tail = self.num_tail_stages();
+        let ups = self.stages[..tail]
+            .iter()
+            .filter(|s| s.upsample.is_some())
+            .count();
+        1i32 << ups
+    }
+
+    /// The **head**: `conv_in` + the deepest-stage channel shortcut, then the deep `EfficientVit`
+    /// stages down to — but not including — the shallow `Res` tail. Input is the NCHW latent;
+    /// output is the tail's NHWC input feature map.
+    ///
+    /// Must run once on the whole latent: this is where every global-token-sum attention lives.
+    pub fn decode_head(&self, latent_nchw: &Array) -> Result<Array> {
         let latent = latent_nchw.transpose_axes(&[0, 2, 3, 1])?.as_dtype(F32)?; // → NHWC
         let shortcut = repeat_interleave_last(&latent, self.in_shortcut_repeats)?;
         let mut h = add(&self.conv_in.forward(&latent)?, &shortcut)?;
-        for stage in self.stages.iter().rev() {
+        let tail = self.num_tail_stages();
+        for stage in self.stages[tail..].iter().rev() {
+            if let Some(up) = &stage.upsample {
+                h = up.forward(&h)?;
+            }
+            for block in &stage.blocks {
+                h = block.forward(&h)?;
+            }
+        }
+        Ok(h)
+    }
+
+    /// The **tail**: the shallow `Res` stages (each a ×2 upsample plus `ResBlock`s) then
+    /// `norm_out → ReLU → conv_out`. Purely spatially local — convolutions, nearest upsample, and
+    /// a `rms_norm` that reduces only the **channel** axis at each position — so evaluating it on a
+    /// crop of the head feature map is exact up to convolution padding at the crop boundary, which
+    /// the trapezoidal overlap blend absorbs.
+    pub fn decode_tail(&self, head_nhwc: &Array) -> Result<Array> {
+        let mut h = head_nhwc.clone();
+        let tail = self.num_tail_stages();
+        for stage in self.stages[..tail].iter().rev() {
             if let Some(up) = &stage.upsample {
                 h = up.forward(&h)?;
             }
