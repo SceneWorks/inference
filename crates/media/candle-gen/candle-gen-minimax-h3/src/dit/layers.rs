@@ -494,6 +494,10 @@ impl DitFeedForward {
         let dims = x.dims();
         let rank = dims.len();
         if rank < 2 {
+            // A rank-<2 activation has no token axis to split, so this is a span — record it, or
+            // the probe would report the *previous* call's count and every assertion keyed on it
+            // would read a stale value.
+            record_span_count(1);
             return self.forward_span(x);
         }
         let axis = rank - 2;
@@ -760,11 +764,24 @@ mod tests {
     #[test]
     fn a_rank_one_activation_takes_the_span_path() {
         let ff = tiny_ff(8, 6);
+        // Poison the probe first: the rank-<2 branch returns before the planner runs, so if it did
+        // not record its own span count the reader below would report this stale value and every
+        // assertion keyed on the probe after a rank-1 call would be reading the previous forward.
+        let wide = spread(&[6, 8], 0.3);
+        ff.forward_budgeted(&wide, AttentionBudget::from_score_elements(1, false))
+            .expect("chunked forward");
+        assert!(spans_run() > 1, "the poisoning call must have chunked");
+
         let x = spread(&[8], 0.2);
         let got = ff
             .forward_budgeted(&x, AttentionBudget::from_score_elements(1, false))
             .expect("rank-1 forward");
         assert_eq!(got.dims(), &[8]);
+        assert_eq!(
+            spans_run(),
+            1,
+            "the rank-<2 branch is one span and records it"
+        );
         assert_eq!(ffn_token_block(1, 12, 0, AttentionBudget::UNBOUNDED), 0);
     }
 }

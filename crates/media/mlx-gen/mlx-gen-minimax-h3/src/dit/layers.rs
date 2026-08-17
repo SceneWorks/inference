@@ -5,6 +5,17 @@
 //! tensor index corroborates: no `.bias` exists under `attn.` or `ff.` anywhere in
 //! `transformer/`. Only `adaln_proj.linear`, the input/output projections and the timestep MLP
 //! carry biases.
+//!
+//! # The SwiGLU is deliberately un-chunked here, unlike the candle twin
+//!
+//! candle's `candle_gen_minimax_h3::dit::layers::DitFeedForward`
+//! splits the `[1, S, 2·ffn_dim]` SwiGLU intermediate into token blocks because candle's CUDA
+//! kernels index elements with **i32**, and at the 345-frame lattice ceiling that tensor is ~2.98e9
+//! elements — past `i32::MAX`, and silently corrupting rather than failing. MLX does not share that
+//! indexing limit (sc-17152 probed `matmul` above `i32::MAX` on MLX and found it exact), and
+//! sc-17152 additionally measured chunking on this lane at **+50.3 % peak and ~3× wall**, so
+//! [`DitFeedForward::forward`] runs the projection in one call. The asymmetry is a backend fact,
+//! not a missing port: do not mirror the candle chunking here.
 
 use mlx_rs::fast::rms_norm;
 use mlx_rs::ops::multiply;

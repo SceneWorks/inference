@@ -14,6 +14,29 @@
 //! The tables are built on the host in **f64** and materialized as f32, exactly as the MLX lane
 //! does, so the two backends' `cos`/`sin` agree to f32 round-off rather than to whichever
 //! transcendental each accelerator ships.
+//!
+//! # dtype convention: f32 tables, rotation at the STREAM dtype
+//!
+//! This is deliberately **not** the [`crate::dit::rope`] convention, and the difference is the
+//! reference's, not ours. Checked against `diffusers` 0.40.0.dev0 @ `7564fb01`:
+//!
+//! * **Tables at f32.** `MiniMaxH3VideoViTDecoder3d.forward`
+//!   (`models/autoencoders/autoencoder_kl_minimax_h3.py:461`) builds its position grid with an
+//!   explicit `dtype=torch.float32`, and `MiniMaxH3VideoRotaryPosEmbed.__init__` (line 290)
+//!   registers `inv_freq` float32, so `angles.cos()` / `angles.sin()` (line 294-296) are f32
+//!   whatever the decoder runs at. [`Rope3d::tables`] therefore takes no dtype.
+//! * **Rotation at the stream dtype.** `MiniMaxH3VideoAttnProcessor.__call__` then narrows them —
+//!   `cos = cos.to(query.dtype)` / `sin = sin.to(query.dtype)`
+//!   (`autoencoder_kl_minimax_h3.py:319-320`) — *before* `query_rotary * cos + query_rotated * sin`
+//!   (line 328). The multiply-add runs in the activation's dtype, not f32.
+//!
+//! So the narrowing in [`Rope3d::apply`] is the port being faithful, not a missed upcast. The DiT's
+//! MM-RoPE was moved to a full-f32 rotation because its own reference
+//! (`_apply_rotary_emb`) is reached from a bf16 packed stream; this rotary's reference module is a
+//! different one and narrows explicitly, and the VAE additionally pins the whole decoder in fp32
+//! (`_keep_in_fp32_modules = ["encoder", "decoder", ...]`,
+//! `autoencoder_kl_minimax_h3.py:532`), so the narrow is a no-op on the shipped recipe. Do not
+//! "fix" this to match [`crate::dit::rope`]; it would be a different model.
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::{CandleError, Result};
@@ -121,6 +144,11 @@ impl Rope3d {
     ///
     /// When `apply_dim < D` only the leading `apply_dim` dims rotate and the tail is concatenated
     /// back untouched — the partial-rotary path this model always takes.
+    ///
+    /// The f32 tables are **narrowed to `t`'s dtype and the rotation runs there**, mirroring
+    /// `MiniMaxH3VideoAttnProcessor.__call__` (`autoencoder_kl_minimax_h3.py:319-320`, 328). See
+    /// the module doc — this is the opposite of [`crate::dit::rope::MmRope::apply`] on purpose,
+    /// because the two rotaries port different reference modules.
     pub fn apply(&self, t: &Tensor, tables: &RopeTables) -> Result<Tensor> {
         let shape = t.dims();
         if shape.len() != 4 {
@@ -135,6 +163,8 @@ impl Rope3d {
                 self.apply_dim
             )));
         }
+        // Reference-faithful narrow, NOT a missed upcast: `cos.to(query.dtype)` at
+        // `autoencoder_kl_minimax_h3.py:319-320`.
         let cos_t = tables.cos.to_dtype(t.dtype())?;
         let sin_t = tables.sin.to_dtype(t.dtype())?;
 
@@ -243,6 +273,49 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0, f32::max);
         assert!(moved > 1e-2, "the rotary did nothing ({moved:.3e})");
+    }
+
+    /// The dtype convention this rotary ports: **f32 tables, rotation at the STREAM dtype**.
+    ///
+    /// `MiniMaxH3VideoRotaryPosEmbed` builds its angles from a `dtype=torch.float32` grid and a
+    /// float32 `inv_freq` buffer, and `MiniMaxH3VideoAttnProcessor` then narrows with
+    /// `cos.to(query.dtype)` *before* the multiply-add
+    /// (`autoencoder_kl_minimax_h3.py:461`, `:290`, `:319-320`, `:328`). Both halves are pinned
+    /// here so the narrow is not "fixed" into a [`crate::dit::rope`]-style f32 rotation — that
+    /// rotary ports a different reference module.
+    #[test]
+    fn tables_are_f32_and_the_rotation_runs_at_the_stream_dtype() {
+        let rope = Rope3d::new(12, 100.0).unwrap();
+        let ids = create_token_ids(2, 2, 2, &Device::Cpu).unwrap();
+        let tables = rope.tables(&ids).unwrap();
+        assert_eq!(tables.cos.dtype(), DType::F32);
+        assert_eq!(tables.sin.dtype(), DType::F32);
+
+        let t = spread(&[1, 8, 1, 12]).to_dtype(DType::BF16).unwrap();
+        let shipped = rope.apply(&t, &tables).unwrap();
+        assert_eq!(shipped.dtype(), DType::BF16);
+
+        // The measurement that makes the assertion above non-vacuous: rotating at f32 and
+        // narrowing afterwards (the DiT MM-RoPE convention) is a *different* result, so the
+        // choice of convention is load-bearing rather than cosmetic.
+        let at_f32 = rope
+            .apply(&t.to_dtype(DType::F32).unwrap(), &tables)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let a = flat(&shipped.to_dtype(DType::F32).unwrap());
+        let b = flat(&at_f32.to_dtype(DType::F32).unwrap());
+        let num = a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        let den = b.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        assert!(
+            num / den > 1e-4,
+            "narrowing before vs after the rotation must be distinguishable at bf16 ({:.3e})",
+            num / den
+        );
     }
 
     #[test]
