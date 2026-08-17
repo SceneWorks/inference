@@ -11,9 +11,11 @@
 //!
 //! The obvious resolver — join the tier name onto the snapshot root — would be wrong, and it would
 //! disagree with the MLX lane on the one thing the two lanes must agree about. `SceneWorks/minimax-h3-mlx`
-//! publishes self-contained tier dirs (`q4/transformer`, `q4/transformer_ref`, `q4/text_encoder`),
-//! but **neither backend ever constructs those paths**. The tier dir is *staged* by the caller as a
-//! component override, and the engine resolves against the override:
+//! does publish self-contained tier dirs — SceneWorks' `builtin.models.jsonc` ships
+//! `{q4,q8,bf16}/transformer/*`, `{q4,q8,bf16}/transformer_ref/*` and `{q4,q8}/text_encoder/*` at
+//! revision `137ce668`, with exact hosted byte counts — but **neither backend ever constructs those
+//! paths**. The tier dir is *staged* by the caller as a component override, and the engine resolves
+//! against the override:
 //!
 //! | component | resolution | tier-dependent |
 //! |---|---|---|
@@ -31,13 +33,54 @@
 //!   resolving against the root would look in a directory that does not exist while the correct one
 //!   sat next to the staged DiT. On a flat snapshot `dit_dir == root/transformer`, whose sibling is
 //!   exactly `root/transformer_ref`, so the one rule serves both layouts.
-//! * **The text encoder's tier is independent of the DiT's** (sc-19120). The shipped manifest pairs
-//!   one dense TE with all three DiT tiers, so [`MiniMaxH3TierPaths::require_dit`] takes a [`Tier`]
-//!   and asserts it against the staged DiT, while [`MiniMaxH3TierPaths::require_text_encoder`]
-//!   deliberately takes **none** — it validates only the group size. Coupling them would break every
-//!   existing install the moment a `q4` DiT was requested.
+//! * **The engine does not couple the text encoder's tier to the DiT's** (sc-19120), so
+//!   [`MiniMaxH3TierPaths::require_dit`] takes a [`Tier`] and asserts it against the staged DiT
+//!   while [`MiniMaxH3TierPaths::require_text_encoder`] deliberately takes **none** — it validates
+//!   only the group size. That mirrors `mlx_gen_minimax_h3::model`, whose `reconcile_text_encoder`
+//!   pointedly omits the `spec.quantize` comparison its `reconcile_tier` makes.
+//!
+//!   Note the *rationale* that decision was originally written under — "the manifest pairs one dense
+//!   TE with all three DiT tiers" — no longer describes the manifest: sc-19120 added per-tier TE
+//!   rows, so `builtin.models.jsonc` now ships `q4/text_encoder` and `q8/text_encoder` from the
+//!   rehost and the `bf16` TE from upstream `MiniMaxAI/MiniMax-H3`, variant-scoped so
+//!   `resolve_co_requisites_for_tier` picks exactly one per tier. The *decision* survives the
+//!   correction on a better reason: the TE's tier is recoverable from its own `{base}.scales`
+//!   ([`crate::quant::lin`] auto-detects it), the three rows do not all come from the same repo, and
+//!   installs predating sc-19120 carry a dense TE beside a packed DiT. Asserting a pairing the
+//!   loader can simply observe would reject those installs for no gain.
 //! * **The VAEs and tokenizer are tier-agnostic siblings** resolved against the upstream root, so a
 //!   `q4` install holds one packed DiT and one packed TE with no second copy of anything else.
+//!
+//! # The reference partition is probed LAZILY here and EAGERLY on MLX
+//!
+//! This is the one place the two lanes deliberately disagree, so it is stated in full rather than
+//! left to be rediscovered.
+//!
+//! `mlx_gen_minimax_h3::model::load` opens `transformer/config.json` **and**
+//! `transformer_ref/config.json` on **every** load regardless of task, and fails the whole load if
+//! either is missing. That is safe on macOS because the manifest guarantees the sibling is there:
+//! `builtin.models.jsonc` ships `{q4,q8,bf16}/transformer_ref/*` as **per-tier `coRequisite` rows**
+//! (18.78 GB at q4, 35.30 at q8, 66.28 at bf16), with the manifest recording that these bytes "are
+//! not an optional Ref2VA extra, they are part of the minimum loadable set".
+//!
+//! This lane probes it only when a request resolves to `ref2va`
+//! ([`crate::model::task_component_dirs`](crate::model)), and the reason is **not** the one the
+//! surrounding prose used to give. The retired claim was "`SceneWorks/minimax-h3-mlx` publishes no
+//! `q4/transformer_ref` (sc-19517)". That premise is **retracted**: the sc-19573 manifest block
+//! ships `q4/transformer_ref/*` with an exact hosted byte count, and the manifest itself flags the
+//! older reasoning as having come "from a premise the engine has never honoured".
+//!
+//! The real reason is the *platform* split, and it is verifiable in the same file: those
+//! `transformer_ref` rows are all `"platforms": ["macos"]`, and the off-Mac (candle) artifact set
+//! sc-19558 defines carries **no `transformer_ref` rows at all** — deliberately, because this
+//! provider default-denies `ref2va` at its conditioning allowlist until sc-17157 lands the port, so
+//! an off-Mac row "would advertise weights for a mode the only off-Mac engine refuses". An
+//! every-load probe here would therefore fail **every** candle load on exactly the platforms this
+//! lane serves, for a partition no candle request can currently reach.
+//!
+//! **The trigger to close the divergence:** when sc-17157 lands the `transformer_ref` port and the
+//! manifest gains off-Mac `transformer_ref` rows in the same change, this should move to MLX's
+//! every-load probe. Until then the lazy probe is the only one that can succeed.
 //!
 //! # The tier is an ASSERTION about what is staged, never an instruction
 //!
@@ -61,6 +104,15 @@
 //! (sc-15154). Reading the declared group size and rejecting a mismatch by name turns that into one
 //! actionable line. The bit width needs no such check — it is *recovered* from the artifact, so a
 //! q4 and a q8 tier both load correctly without being told which they are.
+//!
+//! **This lane validates the group size on more components than MLX does, deliberately.** MLX runs
+//! the check only on the text encoder (`reconcile_text_encoder`); its `reconcile_tier` compares bit
+//! widths and never reads `group_size`, so a DiT tier packed at 32 reaches its loaders unchallenged.
+//! [`MiniMaxH3TierPaths::require_dit`] and [`MiniMaxH3TierPaths::require_reference_dit`] validate it
+//! too. That is a departure in the safe direction — it can only reject an artifact that would have
+//! decoded to garbage — and it costs nothing on a well-formed tier, since every published H3 tier
+//! packs at 64. It is recorded here rather than silently tightened so a future reader comparing the
+//! two lanes finds an intent rather than an inconsistency.
 //!
 //! The group size is **imported under an alias**, exactly as [`crate::quant`] imports it, and is
 //! deliberately not re-exported as a crate-local `pub const`. A second declaration that drifted
@@ -86,6 +138,23 @@ pub const DIT_COMPONENT: &str = BASE_DIT_PARTITION;
 pub const TEXT_ENCODER_COMPONENT: &str = "text_encoder";
 
 /// A published MiniMax-H3 weight tier.
+///
+/// # ⚠️ PR 3 must not map an absent request onto [`Tier::Bf16`]
+///
+/// This enum can express only an *asserted* tier, and gen-core's `spec.quantize` is an
+/// `Option<Quant>` whose `None` means **"the caller asserted nothing"**. MLX honours that third
+/// state: its `reconcile_tier` admits a packed tier under `(Some(_), None)` and only refuses a
+/// *dense* component under an explicit request. The nearest thing here, [`Tier::Bf16`], is not that
+/// state — it is a positive assertion of denseness, so
+/// [`MiniMaxH3TierPaths::require_dit`] refuses a packed tier under it (see
+/// `a_packed_component_under_a_bf16_request_is_refused`).
+///
+/// So the `supported_quants` flip must map `spec.quantize` deliberately, **not** by defaulting
+/// `None` to `Bf16` — that would turn "I did not ask" into "I demand dense" and reject every packed
+/// install that loads fine on MLX today. Either add an `Unasserted` variant, or skip the reconcile
+/// entirely when `spec.quantize` is `None` and let the loaders auto-detect (which they already do —
+/// nothing downstream of here reads a tier). Deliberately not wired now: this PR ships the resolver
+/// inert, and picking the shape without the call site in front of you invites the wrong default.
 ///
 /// The three the rehost publishes, and the complete set: `SceneWorks/minimax-h3-mlx` ships `q4`,
 /// `q8` and `bf16`.
@@ -127,13 +196,13 @@ pub struct MiniMaxH3TierPaths {
     pub dit_dir: PathBuf,
     /// The `ref2va` DiT partition — always [`Self::dit_dir`]'s **sibling**, never `root`-relative.
     ///
-    /// Resolved unconditionally but required only of a `ref2va` request: `SceneWorks/minimax-h3-mlx`
-    /// publishes no `q4/transformer_ref` (sc-19517), so a pure-`q4` install carries only the base
-    /// partition and requiring this at load would take `t2va` and `fl2va` offline with it. See
-    /// [`crate::model::task_component_dirs`](crate::model).
+    /// Resolved unconditionally, but [`MiniMaxH3TierPaths::require_reference_dit`] is called only
+    /// when a request resolves to `ref2va`. **This is a deliberate divergence from the MLX lane, and
+    /// it is conditional — see the module docs' "the reference partition is probed lazily here and
+    /// eagerly on MLX" section for the verified reason and the trigger to close it.**
     pub reference_dit_dir: PathBuf,
-    /// The condition encoder — the staged tier dir, else `root/text_encoder`. Tiered independently
-    /// of the DiT (sc-19120).
+    /// The condition encoder — the staged tier dir, else `root/text_encoder`. Its tier is
+    /// auto-detected rather than asserted (sc-19120); see the module docs.
     pub text_encoder_dir: PathBuf,
     /// Where the **tier-agnostic** components live: `vae/`, `audio_vae/`, `tokenizer/`, `FL2VA/`.
     /// Always the upstream snapshot root.

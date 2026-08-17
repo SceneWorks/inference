@@ -165,7 +165,7 @@ impl AdaLnProjection {
         cfg: &MiniMaxH3DitConfig,
         dtype: DType,
     ) -> Result<Self> {
-        let loaded = crate::quant::lin(w, prefix, true, dtype)?;
+        let loaded = crate::quant::lin(w, crate::quant::DIT, prefix, true, dtype)?;
         let want = (cfg.adaln_out_features(), cfg.time_embed_dim);
         let got = loaded.linear.base_shape();
         if got != want {

@@ -25,16 +25,27 @@
 //! coercion is lossless at bf16 and a widening at f32. The repack rounds them to `f16` inside the
 //! `Q4_1` block regardless.
 //!
-//! # Only two loaders route through here, and that is a correctness property
+//! # Which loaders route through here, and that split is a correctness property
 //!
-//! `mlx_gen_minimax_h3::convert::DENSE_BY_POLICY` leaves the float32 I/O heads, `context_embedder`,
-//! `norm_out.linear` and every norm dense **in every tier**. That dense set is exactly what
-//! [`crate::dit::heads`] reads with a raw `Weights::require`, so those loaders must *not* gain a
-//! packed path: a `require` that met a packed tensor would load u32 codes where a float is expected
-//! (sc-14980's Mage `pos_embed` failure). [`guard_dense`] makes that a loud, attributable load
-//! error instead. The two loaders that do pack — [`crate::dit::layers::LinearNoBias`] and
-//! [`crate::dit::block::AdaLnProjection`] — are the complete set, and they are the same two the MLX
-//! lane packs.
+//! The converter's two dense-by-policy sets leave a specific set of tensors dense **in every tier**:
+//! `mlx_gen_minimax_h3::convert::DENSE_BY_POLICY` (the DiT's float32 I/O heads, `context_embedder`,
+//! `norm_out.linear` and every norm) and `TE_DENSE_BY_POLICY` (the text encoder's Qwen3 decoder
+//! norms, the vision LayerNorms, `pos_embed` and `patch_embed.proj`). Those sets are exactly what
+//! [`crate::dit::heads`] and [`crate::text_encoder`]'s norm loads read with a raw `Weights::require`,
+//! so those loaders must *not* gain a packed path: a `require` that met a packed tensor would load
+//! u32 codes where a float is expected (sc-14980's Mage `pos_embed` failure). [`guard_dense`] makes
+//! that a loud, attributable load error instead.
+//!
+//! The loaders that **do** pack are the complete set the MLX lane packs, on both components:
+//!
+//! * DiT — [`crate::dit::layers::LinearNoBias`] and [`crate::dit::block::AdaLnProjection`].
+//! * Text encoder (sc-20267) — the seven Qwen3 decoder projections behind `text_encoder`'s single
+//!   `Proj` loader, plus the token table through [`embed`].
+//!
+//! The Qwen3-VL **vision tower** is the one `TE_PACK_SUFFIXES` member this crate does not serve: it
+//! is consumed from `candle_gen_boogu::vision::VisionTower` through boogu's own loader, which
+//! already refuses a packed tower loudly. So it is fail-loud rather than silent, but the candle lane
+//! cannot yet load the vision shard of a packed text-encoder tier.
 //!
 //! # The group size is IMPORTED, never re-declared here
 //!
@@ -81,22 +92,39 @@ fn quant_bytes(dtype: GgmlDType, out: usize, in_features: usize) -> usize {
     (out * in_features / dtype.block_size()) * dtype.type_size()
 }
 
+/// Component label for the DiT's load errors — [`crate::dit`].
+pub const DIT: &str = "dit";
+
+/// Component label for the condition encoder's load errors — [`crate::text_encoder`].
+pub const TEXT_ENCODER: &str = "te";
+
 /// Refuse a **packed** tensor at a loader that has no packed path (sc-14980).
 ///
-/// The dense-by-policy set ([`crate::dit::heads`]) is read with a raw `Weights::require`, which
-/// hands back the u32 code stream with no complaint at all: the shape check downstream may or may
-/// not catch it, and nothing in the message would say *why*. This names the offending `.scales` key
-/// and says the tensor is packed, so a tier that ever packed a head fails at load rather than
-/// rendering garbage.
-pub fn guard_dense(w: &Weights, base: &str) -> Result<()> {
+/// The dense-by-policy sets — [`crate::dit::heads`] on the DiT, the four norms in
+/// [`crate::text_encoder`] — are read with a raw `Weights::require`, which hands back the u32 code
+/// stream with no complaint at all: the shape check downstream may or may not catch it, and nothing
+/// in the message would say *why*. This names the offending `.scales` key and says the tensor is
+/// packed, so a tier that ever packed one fails at load rather than rendering garbage.
+///
+/// `component` is [`DIT`] or [`TEXT_ENCODER`]. It is a parameter rather than a constant in the
+/// format string because both components route through this one guard, and a text-encoder norm
+/// refused under a message that says `dit` — and that recites the DiT's dense-by-policy set — sends
+/// the reader to the wrong converter list.
+pub fn guard_dense(w: &Weights, component: &str, base: &str) -> Result<()> {
     let scales = format!("{base}.scales");
     if w.contains(&scales) {
+        let policy = if component == TEXT_ENCODER {
+            "`TE_DENSE_BY_POLICY` keeps the Qwen3 decoder norms, the vision LayerNorms, `pos_embed` \
+             and `patch_embed.proj` dense in every tier"
+        } else {
+            "`DENSE_BY_POLICY` keeps the float32 I/O heads, `context_embedder`, `norm_out.linear` \
+             and every norm dense in every tier"
+        };
         return Err(CandleError::Msg(format!(
-            "minimax-h3 dit {base}: `{scales}` is present — this weight is MLX-PACKED, but {base} \
-             is loaded by a dense-only path (the tiers keep the float32 I/O heads, \
-             `context_embedder`, `norm_out.linear` and every norm dense by policy). Reading its \
-             u32 codes as a float is silent garbage (sc-14980). A tier that packs this tensor must \
-             add a real packed path here first."
+            "minimax-h3 {component} {base}: `{scales}` is present — this weight is MLX-PACKED, but \
+             {base} is loaded by a dense-only path ({policy}). Reading its u32 codes as a float is \
+             silent garbage (sc-14980). A tier that packs this tensor must add a real packed path \
+             here first."
         )));
     }
     Ok(())
@@ -114,7 +142,15 @@ pub fn guard_dense(w: &Weights, base: &str) -> Result<()> {
 /// The logical `[out, in]` is recovered from the **scales** shape `[out, in/group]`, never from the
 /// packed code column count: Q4 and Q8 pack a different number of codes per u32 word, so the codes
 /// cannot answer the question and the scales can.
-pub fn lin(w: &Weights, base: &str, bias: bool, dtype: DType) -> Result<TieredLinear> {
+///
+/// `component` is [`DIT`] or [`TEXT_ENCODER`] — see [`guard_dense`] for why it is a parameter.
+pub fn lin(
+    w: &Weights,
+    component: &str,
+    base: &str,
+    bias: bool,
+    dtype: DType,
+) -> Result<TieredLinear> {
     let weight_key = format!("{base}.weight");
     let scales_key = format!("{base}.scales");
     let bias_key = format!("{base}.bias");
@@ -123,7 +159,7 @@ pub fn lin(w: &Weights, base: &str, bias: bool, dtype: DType) -> Result<TieredLi
         let wq = w.require(&weight_key)?;
         if wq.dtype() != DType::U32 {
             return Err(CandleError::Msg(format!(
-                "minimax-h3 dit {base}: `{scales_key}` marks this weight packed, but \
+                "minimax-h3 {component} {base}: `{scales_key}` marks this weight packed, but \
                  `{weight_key}` loaded as {:?} rather than U32 — the packed code stream must reach \
                  the repack at its native width, and a float cast has already destroyed it",
                 wq.dtype()
@@ -144,7 +180,7 @@ pub fn lin(w: &Weights, base: &str, bias: bool, dtype: DType) -> Result<TieredLi
             QLinear::from_packed_gs(&wq, &scales, &biases, dense_bias, GROUP_SIZE, &device)?;
         let quant_dtype = packed.quant_dtype().ok_or_else(|| {
             CandleError::Msg(format!(
-                "minimax-h3 dit {base}: the packed repack produced a dense projection"
+                "minimax-h3 {component} {base}: the packed repack produced a dense projection"
             ))
         })?;
         return Ok(TieredLinear {
@@ -358,7 +394,7 @@ mod tests {
         let mut map = HashMap::new();
         insert_packed(&mut map, "p", 32, 128, 3);
         let w = Weights::from_map(map);
-        let loaded = lin(&w, "p", false, DType::F32).expect("packed load");
+        let loaded = lin(&w, DIT, "p", false, DType::F32).expect("packed load");
         assert!(loaded.linear.is_packed(), "the `.scales` sibling must pack");
         assert_eq!(loaded.linear.base_shape(), (32, 128), "[out, in] recovered");
         assert_eq!(
@@ -384,11 +420,12 @@ mod tests {
         let mut map = HashMap::new();
         let grid = insert_packed(&mut map, "p", out, in_, 5);
         let w = Weights::from_map(map);
-        let packed = lin(&w, "p", false, DType::F32).expect("packed load");
+        let packed = lin(&w, DIT, "p", false, DType::F32).expect("packed load");
 
         let mut dense_map = HashMap::new();
         dense_map.insert("p.weight".to_string(), grid);
-        let dense = lin(&Weights::from_map(dense_map), "p", false, DType::F32).expect("dense load");
+        let dense =
+            lin(&Weights::from_map(dense_map), DIT, "p", false, DType::F32).expect("dense load");
         assert!(!dense.linear.is_packed(), "no `.scales` ⇒ dense");
 
         let x = Tensor::from_vec(
@@ -416,10 +453,19 @@ mod tests {
         let mut map = HashMap::new();
         insert_packed(&mut map, "proj_in", 32, 128, 1);
         let w = Weights::from_map(map);
-        let err = guard_dense(&w, "proj_in").expect_err("a packed head must be refused");
+        let err = guard_dense(&w, DIT, "proj_in").expect_err("a packed head must be refused");
         let msg = err.to_string();
         assert!(msg.contains("proj_in.scales"), "{msg}");
         assert!(msg.contains("MLX-PACKED"), "{msg}");
+        // The COMPONENT is attributed, and the message recites the DiT's policy list rather than
+        // the text encoder's — the two share this guard, so a mislabelled refusal sends the reader
+        // to the wrong converter constant.
+        assert!(msg.contains("minimax-h3 dit proj_in"), "{msg}");
+        assert!(msg.contains("DENSE_BY_POLICY"), "{msg}");
+        assert!(
+            !msg.contains("TE_DENSE_BY_POLICY"),
+            "a DiT refusal must not cite the text encoder's list: {msg}"
+        );
 
         // A dense weight set passes the same guard untouched.
         let mut dense = HashMap::new();
@@ -427,7 +473,7 @@ mod tests {
             "proj_in.weight".to_string(),
             Tensor::zeros((4, 4), DType::F32, &Device::Cpu).unwrap(),
         );
-        guard_dense(&Weights::from_map(dense), "proj_in").expect("a dense head must pass");
+        guard_dense(&Weights::from_map(dense), DIT, "proj_in").expect("a dense head must pass");
     }
 
     /// A `.scales` sibling whose `.weight` is NOT a u32 code stream is a typed load error, not a
@@ -441,7 +487,7 @@ mod tests {
             "p.weight".to_string(),
             Tensor::zeros((32, 16), DType::F32, &Device::Cpu).unwrap(),
         );
-        let err = lin(&Weights::from_map(map), "p", false, DType::F32)
+        let err = lin(&Weights::from_map(map), DIT, "p", false, DType::F32)
             .expect_err("a float weight under a packed marker must be refused");
         assert!(err.to_string().contains("rather than U32"), "{err}");
     }

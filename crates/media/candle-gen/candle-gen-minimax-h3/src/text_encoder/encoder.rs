@@ -75,7 +75,7 @@ struct Proj {
 impl Proj {
     /// Load `{key}` — **packed** when `{key}.scales` is present, else dense at `dtype`.
     fn load(w: &Weights, key: &str, dtype: DType) -> Result<Self> {
-        let loaded = crate::quant::lin(w, key, false, dtype)?;
+        let loaded = crate::quant::lin(w, crate::quant::TEXT_ENCODER, key, false, dtype)?;
         Ok(Self {
             inner: loaded.linear,
             base_bytes: loaded.base_bytes,
@@ -133,8 +133,8 @@ impl Qwen3Attention {
         // they are dense in every tier and read here with a raw `require` + `to_dtype`. That cast is
         // the unguarded surface: handed u32 codes it produces floats from a bit pattern and reports
         // nothing (sc-14980). `guard_dense` makes a tier that ever packed them a loud load error.
-        crate::quant::guard_dense(w, &format!("{prefix}.q_norm"))?;
-        crate::quant::guard_dense(w, &format!("{prefix}.k_norm"))?;
+        crate::quant::guard_dense(w, crate::quant::TEXT_ENCODER, &format!("{prefix}.q_norm"))?;
+        crate::quant::guard_dense(w, crate::quant::TEXT_ENCODER, &format!("{prefix}.k_norm"))?;
         let q_norm = w
             .require(&format!("{prefix}.q_norm.weight"))?
             .to_dtype(DType::F32)?;
@@ -250,8 +250,16 @@ impl Qwen3DecoderLayer {
     fn load(w: &Weights, prefix: &str, cfg: &MiniMaxH3TeConfig, dtype: DType) -> Result<Self> {
         // Both layer norms are `TE_DENSE_BY_POLICY` entries read through a raw `require` — guarded
         // for the same reason the q/k norms above are.
-        crate::quant::guard_dense(w, &format!("{prefix}.input_layernorm"))?;
-        crate::quant::guard_dense(w, &format!("{prefix}.post_attention_layernorm"))?;
+        crate::quant::guard_dense(
+            w,
+            crate::quant::TEXT_ENCODER,
+            &format!("{prefix}.input_layernorm"),
+        )?;
+        crate::quant::guard_dense(
+            w,
+            crate::quant::TEXT_ENCODER,
+            &format!("{prefix}.post_attention_layernorm"),
+        )?;
         Ok(Self {
             // f32 norm weights, for the same reason the q/k norms are f32.
             input_ln: w
@@ -1003,6 +1011,11 @@ mod tests {
             };
             assert!(msg.contains(dense_key), "{msg}");
             assert!(msg.contains("MLX-PACKED"), "{msg}");
+            // Attributed to the TEXT ENCODER, citing its policy list — not the DiT's. The two
+            // components share `guard_dense`, so this is the assertion that keeps a TE refusal from
+            // pointing the reader at `DENSE_BY_POLICY`.
+            assert!(msg.contains(&format!("minimax-h3 te {dense_key}")), "{msg}");
+            assert!(msg.contains("TE_DENSE_BY_POLICY"), "{msg}");
         }
     }
 
