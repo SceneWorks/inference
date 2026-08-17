@@ -434,6 +434,23 @@ pub fn build_vace_control(video_latents: &Tensor, mask_latents: &Tensor) -> Resu
     Tensor::cat(&[video_latents, mask_latents], 1)
 }
 
+/// The per-vace-layer `control_hidden_states_scale` a request resolves to, with
+/// `ControlClip.masking_strength` folded in (sc-20261).
+///
+/// VACE exposes exactly ONE conditioning scale for the whole hint stack (diffusers
+/// `conditioning_scale`), so the requested masking strength weights the mask/video control by
+/// multiplying that scale rather than thresholding a soft mask away inside
+/// [`prepare_video_latents`]. `masking_strength = 1.0` (the contract default) leaves the scale
+/// byte-identical to `req.control_scale`, so a default request renders exactly as before.
+///
+/// Shared by BOTH candle VACE routes — `wan_vace` (`model_vace.rs`) and `wan2_2_vace_fun_14b`
+/// (`model_vace_fun.rs`) — so the single- and dual-expert lanes cannot drift on the same knob. It
+/// lived in `model_vace_fun.rs` until sc-20261 lifted it here to honor the field on the
+/// single-expert route too.
+pub(crate) fn weighted_control_scale(control_scale: Option<f32>, masking_strength: f32) -> f32 {
+    control_scale.unwrap_or(1.0) * masking_strength
+}
+
 /// VACE CFG denoise loop — mirrors the candle base Wan denoise (`FlowScheduler` per step), but each step
 /// runs [`WanVaceTransformer::forward_cached`] with the constant 96-ch control + per-vace-layer
 /// `scales`, classifier-free-guided against the (optional) unconditional context. The control latent is

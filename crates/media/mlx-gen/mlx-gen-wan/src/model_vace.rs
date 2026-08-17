@@ -46,7 +46,7 @@ use crate::scheduler::{make_scheduler, SolverKind, WanScheduler};
 use crate::text_encoder::encode_text_staged_for_tier;
 use crate::vace::{
     build_vace_control, denoise_vace, denoise_vace_moe, denoise_vace_range, prepare_masks,
-    prepare_video_latents, WanVaceTransformer,
+    prepare_video_latents, weighted_control_scale, WanVaceTransformer,
 };
 
 /// Concrete z16 VAE assigned to both VACE routes.
@@ -200,7 +200,17 @@ fn vace_prep(
     let (t_total, h_lat, w_lat) = (csh[1], csh[2], csh[3]);
     // Per-vace-layer control_hidden_states_scale (diffusers `conditioning_scale`), broadcast from
     // the request (sc-3441). `None` ⇒ the diffusers default 1.0.
-    let scales = vec![req.control_scale.unwrap_or(1.0); config.vace_layers.len()];
+    //
+    // sc-20261: `clip.masking_strength` is folded in here. VACE exposes ONE conditioning scale for
+    // the whole hint stack, so the requested masking strength weights the mask/video control by
+    // multiplying it — the mechanism the candle lane's dual-expert VACE-Fun route already used,
+    // now shared by both MLX routes because they both run this `vace_prep`. `masking_strength =
+    // 1.0` (the contract default) is the identity, so a default request is byte-identical to
+    // pre-sc-20261. The `[0,1]` range this depends on is enforced in `validate_vace_clip`.
+    let scales = vec![
+        weighted_control_scale(req.control_scale, clip.masking_strength);
+        config.vace_layers.len()
+    ];
 
     // Seeded init noise [z16, T_lat(+num_ref), h, w].
     let key = random::key(seed)?;
@@ -961,6 +971,28 @@ fn validate_vace_clip(
              replace_person / pose-depth control / extend-bridge)"
         ))
     })?;
+    // sc-20261 — `masking_strength` and `start_frame` were silently dropped on BOTH MLX VACE routes.
+    // The candle lane's dual-expert sibling (`candle-gen-wan/src/model_vace_fun.rs`) already honored
+    // the first and refused the second; these are that sibling's checks verbatim. MLX has no
+    // separate `model_vace_fun.rs` — `WanVace` and `WanVaceFun` share this validator and `vace_prep`
+    // — so wiring it here converges all four VACE providers on one answer.
+    //
+    // The range is load-bearing, not cosmetic: `masking_strength` now multiplies the per-vace-layer
+    // conditioning scale (`weighted_control_scale`), so a negative or >1 value would invert or
+    // over-drive every hint injection instead of weighting it.
+    if !clip.masking_strength.is_finite() || !(0.0..=1.0).contains(&clip.masking_strength) {
+        return Err(Error::Msg(format!(
+            "{id}: masking_strength must be finite and in [0,1] (got {})",
+            clip.masking_strength
+        )));
+    }
+    if clip.start_frame != 0 {
+        return Err(Error::Unsupported(format!(
+            "{id} currently applies ControlClip only at start_frame=0"
+        )));
+    }
+    // `mode` is already realized in the worker-rasterized control mask; all replacement modes
+    // therefore use the same VACE mask path here (the sibling's rule, unchanged).
     if clip.frames.len() != clip.mask.len() {
         return Err(Error::Msg(format!(
             "{id}: control frames ({}) and mask frames ({}) length mismatch",
@@ -1228,6 +1260,128 @@ mod tests {
         let err = validate_vace_clip(&descriptor_vace_fun(), MODEL_ID_VACE_FUN, &cfg, &req)
             .expect_err("dual-expert: 1029 frames must be rejected");
         assert!(err.to_string().contains("exceeds the maximum 1025"));
+    }
+
+    /// A `clip_request` with one ControlClip field overridden — the sc-20261 knobs.
+    fn clip_request_with(
+        masking_strength: f32,
+        start_frame: i32,
+        mode: ReplacementMode,
+    ) -> GenerationRequest {
+        let mut req = clip_request(5, 64, 64, 0);
+        if let Conditioning::ControlClip {
+            masking_strength: ms,
+            start_frame: sf,
+            mode: m,
+            ..
+        } = &mut req.conditioning[0]
+        {
+            *ms = masking_strength;
+            *sf = start_frame;
+            *m = mode;
+        }
+        req
+    }
+
+    /// sc-20261 — `masking_strength` is no longer silently dropped: `vace_prep` resolves the
+    /// per-vace-layer conditioning scale through [`weighted_control_scale`], the same seam and the
+    /// same arithmetic as the candle lane.
+    ///
+    /// The seam assertions use a **non-default** strength on purpose. `masking_strength = 1.0` is
+    /// the identity for this mechanism, so an assert at the default would also pass against the old
+    /// silently-dropping `req.control_scale.unwrap_or(1.0)` — a false green.
+    #[test]
+    fn masking_strength_weights_the_control_scale() {
+        assert!((weighted_control_scale(Some(0.5), 0.4) - 0.2).abs() < f32::EPSILON);
+        assert!((weighted_control_scale(None, 0.25) - 0.25).abs() < f32::EPSILON);
+        // The pre-sc-20261 expression was `control_scale.unwrap_or(1.0)` alone; a non-default
+        // strength must move the resolved scale off it, or the knob is still inert.
+        assert_ne!(weighted_control_scale(Some(0.5), 0.4), 0.5);
+        assert_ne!(weighted_control_scale(None, 0.25), 1.0);
+        // The contract default is the identity, so a default request renders byte-identically.
+        assert_eq!(weighted_control_scale(Some(0.75), 1.0), 0.75);
+        assert_eq!(weighted_control_scale(None, 1.0), 1.0);
+
+        // The range the seam depends on is enforced at validate rather than left to poison the
+        // hint stack, on BOTH routes (they share this validator).
+        let cfg = test_config();
+        for (descriptor, id) in [
+            (descriptor_vace(), MODEL_ID_VACE),
+            (descriptor_vace_fun(), MODEL_ID_VACE_FUN),
+        ] {
+            let v = |ms: f32| {
+                validate_vace_clip(
+                    &descriptor,
+                    id,
+                    &cfg,
+                    &clip_request_with(ms, 0, ReplacementMode::FaceOnly),
+                )
+            };
+            // Non-default but in-range strengths are HONORED, not refused.
+            assert!(v(0.4).is_ok(), "{id}: 0.4 must validate");
+            assert!(v(0.0).is_ok(), "{id}: 0.0 must validate");
+            for invalid in [-0.01, 1.01, f32::NAN, f32::INFINITY] {
+                let err = v(invalid).expect_err("out-of-range masking_strength must be rejected");
+                assert!(
+                    err.to_string().contains("masking_strength"),
+                    "{id} names the field: {err}"
+                );
+            }
+        }
+    }
+
+    /// sc-20261 — `start_frame` was silently dropped on both MLX VACE routes while the candle
+    /// sibling refused it. Mirror the sibling: non-zero is the typed `Unsupported`, `0` validates.
+    #[test]
+    fn validate_refuses_non_zero_start_frame_like_the_sibling() {
+        let cfg = test_config();
+        for (descriptor, id) in [
+            (descriptor_vace(), MODEL_ID_VACE),
+            (descriptor_vace_fun(), MODEL_ID_VACE_FUN),
+        ] {
+            assert!(validate_vace_clip(
+                &descriptor,
+                id,
+                &cfg,
+                &clip_request_with(1.0, 0, ReplacementMode::FaceOnly)
+            )
+            .is_ok());
+            let err = validate_vace_clip(
+                &descriptor,
+                id,
+                &cfg,
+                &clip_request_with(1.0, 1, ReplacementMode::FaceOnly),
+            )
+            .expect_err("start_frame != 0 must be refused");
+            assert!(
+                matches!(err, Error::Unsupported(_)),
+                "{id}: typed Unsupported, got {err:?}"
+            );
+            assert!(
+                err.to_string().contains("start_frame"),
+                "{id} names it: {err}"
+            );
+        }
+    }
+
+    /// sc-20261 — `mode` is realized in the worker-rasterized mask, so every replacement mode keeps
+    /// taking the same VACE mask path (the sibling's documented rule). Not a refusal.
+    #[test]
+    fn every_replacement_mode_still_validates() {
+        let cfg = test_config();
+        for mode in [
+            ReplacementMode::FaceOnly,
+            ReplacementMode::FullPersonKeepOutfit,
+            ReplacementMode::FullPersonReplaceOutfit,
+        ] {
+            assert!(validate_vace_clip(
+                &descriptor_vace(),
+                MODEL_ID_VACE,
+                &cfg,
+                &clip_request_with(1.0, 0, mode)
+            )
+            .is_ok());
+        }
     }
 
     /// sc-12607 — VACE renders on the 14B family's `patch(2)·VAE_S(8)` = 16-px grid; candle rejects an

@@ -25,7 +25,7 @@ use crate::scheduler::{FlowScheduler, Sampler};
 use crate::text_encoder::Umt5Encoder;
 use crate::vace::{
     build_vace_control, crossing_index, denoise_vace_range, prepare_masks, prepare_video_latents,
-    WanVaceTransformer,
+    weighted_control_scale, WanVaceTransformer,
 };
 use crate::vae16::WanVae16;
 use crate::wan14b::staged_expert_swap;
@@ -71,10 +71,6 @@ fn expert_schedule_crossing(steps: usize, sampler: Sampler, shift: f64) -> gen_c
         )));
     }
     Ok(crossing)
-}
-
-fn weighted_control_scale(control_scale: Option<f32>, masking_strength: f32) -> f32 {
-    control_scale.unwrap_or(1.0) * masking_strength
 }
 
 #[derive(Clone)]
