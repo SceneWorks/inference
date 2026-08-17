@@ -56,12 +56,13 @@
 
 use candle_gen::attention::AttentionBudget;
 use candle_gen::candle_core::{DType, Tensor};
+use candle_gen::quant::AdaptLinear;
 use candle_gen::{CandleError, Result, Weights};
 
 use crate::dit::config::MiniMaxH3DitConfig;
 use crate::dit::rope::{MmRope, MmRopeTables};
 use crate::layout::split_gate_value;
-use crate::nn::{linear_nb, rms_weighted, sdpa, silu};
+use crate::nn::{rms_weighted, sdpa, silu};
 
 /// A **forward-time additive LoRA residual** attached to a [`LinearNoBias`] (sc-18728).
 ///
@@ -74,6 +75,15 @@ use crate::nn::{linear_nb, rms_weighted, sdpa, silu};
 /// **The base weight is never mutated.** That is the candle twin of the MLX lane's decision
 /// (`mlx_gen_minimax_h3::adapters` installs over `AdaptableLinear` and never merges), and it is what
 /// makes the fold strength independent of the quant tier: a merge would have to dequantize.
+///
+/// # This is a RECORD of what was installed, not the mechanism (sc-20267)
+///
+/// The residual arithmetic now lives in the shared [`candle_gen::quant::AdaptLinear`], which
+/// [`LinearNoBias`] wraps so a LoRA composes over a **packed** base as well as a dense one. That
+/// seam holds its adapters privately and exposes no per-residual accessor, so the same factors are
+/// retained here — `Tensor` is `Arc`-backed, so the retention costs pointers, not weights — to keep
+/// the installed dtype / shapes / strength inspectable. `tests/turbo_lora.rs` reads exactly those
+/// three, and they are the only thing that can see a stray widening cast in the install.
 #[derive(Debug, Clone)]
 pub struct LoraResidual {
     /// `[in, rank]` — `downᵀ`, at the factor's loaded dtype.
@@ -108,63 +118,77 @@ impl LoraResidual {
     }
 }
 
-/// `y = x · w` for a `[k, n]` factor and an `[.., k]` activation, folding every leading dim into the
-/// GEMM's `M`.
-///
-/// **Never `broadcast_matmul`.** candle materializes a broadcast rhs through `.contiguous()`, so a
-/// 2-D factor against a `[N, S, k]` activation is physically copied `N` times; the shared
-/// `candle_gen::quant::adapt` seam carries the measurement that made that pathological (a 5.4 GB
-/// copy per leg). Flattening is mathematically identical and issues one large-`M` GEMM.
-fn apply_factor(x: &Tensor, w: &Tensor) -> Result<Tensor> {
-    let dims = x.dims().to_vec();
-    let k = *dims.last().expect("apply_factor: x has no axes");
-    let rows = x.elem_count() / k;
-    let n = w.dim(1)?;
-    let mut out_dims = dims;
-    *out_dims.last_mut().expect("apply_factor: x has no axes") = n;
-    Ok(x.reshape((rows, k))?
-        .contiguous()?
-        .matmul(w)?
-        .reshape(out_dims)?)
-}
-
 /// `y = x · Wᵀ` for a stored `[out, in]` weight — an `nn.Linear(..., bias=False)` — plus any
 /// [`LoraResidual`] stacked onto it.
+///
+/// # The base is the shared [`AdaptLinear`], so it may be DENSE **or PACKED** (sc-20267)
+///
+/// This is one of exactly two loaders the MLX tiers pack (the other is
+/// [`crate::dit::block::AdaLnProjection`]); [`crate::quant::lin`] detects the `{prefix}.scales`
+/// sibling and builds the quantized base straight from the MLX triple with no dense transient. The
+/// residual mechanism is the shared `candle_gen::quant::adapt` seam rather than a third hand-rolled
+/// copy, which is what makes a LoRA compose over a packed base: the base weight is never mutated,
+/// so there is nothing to dequantize.
+///
+/// The forward is [`AdaptLinear::forward_upcast`], not `forward`: the base is stored at the
+/// loader's dtype and must be upcast to the activation's per call — the same contract
+/// [`crate::nn::linear_nb`] held. It is inert (an `Arc` clone, no copy) when the two already match,
+/// which is every shipped path.
 #[derive(Debug, Clone)]
 pub struct LinearNoBias {
-    weight: Tensor,
-    /// Forward-time additive residuals, applied in push order. Empty on every un-adapted render, in
-    /// which case [`Self::forward`] is byte-identical to the bare `linear_nb`.
+    inner: AdaptLinear,
+    /// Device bytes the frozen base holds, recorded at load — a packed base has no dense weight to
+    /// measure afterwards. See [`crate::quant::TieredLinear`].
+    base_bytes: usize,
+    /// Record of the forward-time residuals installed on `inner`, in push order, for the
+    /// dtype/shape/strength introspection the shared seam does not expose. Empty on every
+    /// un-adapted render, in which case [`Self::forward`] is byte-identical to the bare base.
     adapters: Vec<LoraResidual>,
 }
 
 impl LinearNoBias {
-    /// Load `{prefix}.weight` at `dtype`.
+    /// Load `{prefix}` — **packed** when `{prefix}.scales` is present, else dense at `dtype`.
     pub fn from_weights(w: &Weights, prefix: &str, dtype: DType) -> Result<Self> {
+        let loaded = crate::quant::lin(w, prefix, false, dtype)?;
         Ok(Self {
-            weight: w.require(&format!("{prefix}.weight"))?.to_dtype(dtype)?,
+            inner: loaded.linear,
+            base_bytes: loaded.base_bytes,
             adapters: Vec::new(),
         })
     }
 
     /// `y = x · Wᵀ` over the last axis of `x`, plus every attached residual.
     ///
-    /// The residual runs at `x`'s dtype — matching [`linear_nb`], which upcasts the base weight the
-    /// same way — and is narrowed to the host output dtype before the add, exactly as MLX's
+    /// The residual runs at `x`'s dtype — matching the base, which is upcast the same way — and is
+    /// narrowed to the host output dtype before the add, exactly as MLX's
     /// `AdaptableLinear::apply_adapters` does. A zero-scale residual is skipped entirely, so a
     /// disabled adapter is byte-identical to the bare base.
+    ///
+    /// # Why the activation is flattened here rather than handed straight to [`AdaptLinear`]
+    ///
+    /// This preserves [`crate::nn::linear_nb`]'s rank contract exactly, which the shared seam does
+    /// not have: [`AdaptLinear`]'s dense base is a `candle_nn::Linear`, whose forward special-cases
+    /// ranks 2–4 and falls through to a same-rank `matmul` otherwise — so a **rank-1** activation
+    /// (`[in]`) fails with `shape mismatch in matmul`, and `linear_nb` accepted it.
+    /// `DitFeedForward::forward_budgeted` has an explicit rank-<2 arm, so that is a reachable input
+    /// on this crate's own seam, not a hypothetical.
+    ///
+    /// Folding every leading dim into the GEMM's `M` is additionally the *same* single large-`M`
+    /// GEMM `linear_nb` issued, rather than the batched broadcast `Linear` would run — so the
+    /// un-adapted forward keeps its previous shape as well as its previous result, and the residual
+    /// legs see the flattened 2-D activation the hand-rolled `apply_factor` used to build for them.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let mut y = linear_nb(x, &self.weight)?;
-        let yd = y.dtype();
-        let xd = x.dtype();
-        for ad in &self.adapters {
-            if ad.scale == 0.0 {
-                continue;
-            }
-            let r = apply_factor(&apply_factor(x, &ad.a.to_dtype(xd)?)?, &ad.b.to_dtype(xd)?)?;
-            y = (y + (r * ad.scale)?.to_dtype(yd)?)?;
-        }
-        Ok(y)
+        let dims = x.dims().to_vec();
+        let in_features = *dims.last().expect("LinearNoBias::forward: x has no axes");
+        let rows = x.elem_count() / in_features;
+        let y = self
+            .inner
+            .forward_upcast(&x.reshape((rows, in_features))?)?;
+        let mut out_dims = dims;
+        *out_dims
+            .last_mut()
+            .expect("LinearNoBias::forward: x has no axes") = self.inner.out_features();
+        Ok(y.reshape(out_dims)?)
     }
 
     /// Attach a forward-time LoRA residual. `a` is `[in, rank]`, `b` is `[rank, out]` with
@@ -172,8 +196,10 @@ impl LinearNoBias {
     ///
     /// Shape-checked against the projection's own `[out, in]`: a factor pair that would broadcast
     /// into the wrong contraction is refused here rather than producing a runnable, wrong model.
+    /// The shape is read off the [`AdaptLinear`], which recovers it from the packed `scales` on a
+    /// quantized base — so the check holds on every tier, not just the dense one.
     pub fn push_lora(&mut self, a: Tensor, b: Tensor, scale: f64) -> Result<()> {
-        let (out, inn) = (self.weight.dim(0)?, self.weight.dim(1)?);
+        let (out, inn) = self.inner.base_shape();
         if a.rank() != 2 || b.rank() != 2 {
             return Err(CandleError::Msg(format!(
                 "minimax-h3 adapter: LoRA factors must be 2-D, got a={:?} b={:?}",
@@ -191,12 +217,14 @@ impl LinearNoBias {
                 b.dims()
             )));
         }
+        self.inner.push_lora(a.clone(), b.clone(), scale);
         self.adapters.push(LoraResidual { a, b, scale });
         Ok(())
     }
 
     /// Drop every attached residual, reverting to the bare base.
     pub fn clear_adapters(&mut self) {
+        self.inner.clear_adapters();
         self.adapters.clear();
     }
 
@@ -210,25 +238,34 @@ impl LinearNoBias {
         !self.adapters.is_empty()
     }
 
-    /// The projection's logical `(out_features, in_features)`.
+    /// Whether the base loaded from a **packed** (pre-quantized) tier.
+    pub fn is_packed(&self) -> bool {
+        self.inner.is_packed()
+    }
+
+    /// The projection's logical `(out_features, in_features)` — recoverable from a packed base,
+    /// where no dense weight exists to measure.
     pub fn base_shape(&self) -> Result<(usize, usize)> {
-        Ok((self.weight.dim(0)?, self.weight.dim(1)?))
+        Ok(self.inner.base_shape())
     }
 
     /// Device bytes this projection holds — the frozen base plus every attached residual factor.
     pub fn nbytes(&self) -> usize {
-        let base = self.weight.elem_count() * self.weight.dtype().size_in_bytes();
-        base + self
-            .adapters
-            .iter()
-            .map(|ad| {
-                ad.a.elem_count() * ad.a.dtype().size_in_bytes()
-                    + ad.b.elem_count() * ad.b.dtype().size_in_bytes()
-            })
-            .sum::<usize>()
+        self.base_bytes
+            + self
+                .adapters
+                .iter()
+                .map(|ad| {
+                    ad.a.elem_count() * ad.a.dtype().size_in_bytes()
+                        + ad.b.elem_count() * ad.b.dtype().size_in_bytes()
+                })
+                .sum::<usize>()
     }
 
     /// The one tensor name this projection consumes.
+    ///
+    /// The **dense** spelling: a packed tier additionally carries `{prefix}.scales` /
+    /// `{prefix}.biases` under the same base, which [`crate::quant::lin`] finds by construction.
     pub fn names(prefix: &str) -> [String; 1] {
         [format!("{prefix}.weight")]
     }
@@ -595,10 +632,9 @@ mod tests {
     }
 
     fn linear(shape: (usize, usize), phase: f32) -> LinearNoBias {
-        LinearNoBias {
-            weight: spread(&[shape.0, shape.1], phase),
-            adapters: Vec::new(),
-        }
+        let mut map = std::collections::HashMap::new();
+        map.insert("p.weight".to_string(), spread(&[shape.0, shape.1], phase));
+        LinearNoBias::from_weights(&Weights::from_map(map), "p", DType::F32).expect("dense fixture")
     }
 
     /// A tiny bias-free SwiGLU: `proj` is `[2·ffn, hidden]`, `out` is `[hidden, ffn]`.
@@ -783,5 +819,135 @@ mod tests {
             "the rank-<2 branch is one span and records it"
         );
         assert_eq!(ffn_token_block(1, 12, 0, AttentionBudget::UNBOUNDED), 0);
+    }
+
+    // ─── the packed tier (sc-20267) ─────────────────────────────────────────────────────────────
+
+    /// **The detect fires through the real loader**, on the real key spelling — a `.scales` sibling
+    /// under `{prefix}` makes `LinearNoBias` load its base quantized, with no dense weight
+    /// materialized, and the same call on a dense key set is unchanged.
+    #[test]
+    fn a_packed_prefix_loads_the_projection_quantized() {
+        let (out, in_) = (32usize, 128usize);
+        let mut map = std::collections::HashMap::new();
+        crate::quant::testkit::insert_packed(&mut map, "attn.to_q", out, in_, 11);
+        let packed = LinearNoBias::from_weights(&Weights::from_map(map), "attn.to_q", DType::F32)
+            .expect("packed load");
+        assert!(packed.is_packed(), "the `.scales` sibling must pack");
+        assert_eq!(packed.base_shape().unwrap(), (out, in_));
+        // The resident base is the Q4_1 block stream, not a dense f32 weight.
+        assert!(
+            packed.nbytes() < out * in_ * 4,
+            "a packed base must not cost a dense weight: {} vs {}",
+            packed.nbytes(),
+            out * in_ * 4
+        );
+
+        let dense = linear((out, in_), 0.4);
+        assert!(
+            !dense.is_packed(),
+            "no `.scales` ⇒ the dense path, unchanged"
+        );
+        assert_eq!(dense.nbytes(), out * in_ * 4);
+    }
+
+    /// **The packed forward matches a dense reference of the same dequantized weights**, gated on
+    /// relative max-abs (never cosine — cosine cannot see a mis-decoded group scale).
+    ///
+    /// The reference is the affine grid `scale·q + bias` the tier's producer quantized, loaded
+    /// through the *same* `LinearNoBias::from_weights` on a dense key set. So this measures the
+    /// packed **path**, not quantization error.
+    #[test]
+    fn the_packed_forward_matches_a_dense_reference() {
+        let (out, in_) = (32usize, 128usize);
+        let mut map = std::collections::HashMap::new();
+        let grid = crate::quant::testkit::insert_packed(&mut map, "ff.net.2", out, in_, 17);
+        let packed = LinearNoBias::from_weights(&Weights::from_map(map), "ff.net.2", DType::F32)
+            .expect("packed load");
+
+        let mut dense_map = std::collections::HashMap::new();
+        dense_map.insert("ff.net.2.weight".to_string(), grid);
+        let dense =
+            LinearNoBias::from_weights(&Weights::from_map(dense_map), "ff.net.2", DType::F32)
+                .expect("dense load");
+
+        // Rank 3, so the leading-dim handling is exercised as it is in the real block.
+        let x = spread(&[1, 5, in_], 0.9);
+        let got = packed.forward(&x).expect("packed forward");
+        let want = dense.forward(&x).expect("dense forward");
+        assert_eq!(got.dims(), want.dims());
+        let drift = rel_max_abs(&got, &want);
+        println!("[linear] packed vs dense-reference rel-max-abs = {drift:.3e}");
+        assert!(
+            drift < 5e-3,
+            "the Q4_1 repack is lossless up to the f16 scale/bias cast; got {drift:.3e}"
+        );
+    }
+
+    /// **A LoRA composes over a PACKED base** — the property the shared `AdaptLinear` adoption
+    /// buys, and the one the hand-rolled residual could never have: the base stays quantized while
+    /// the residual rides unmerged, and its contribution equals the same residual measured over the
+    /// dense reference.
+    #[test]
+    fn a_lora_rides_a_packed_base_unmerged() {
+        let (out, in_, rank) = (32usize, 128usize, 4usize);
+        let mut map = std::collections::HashMap::new();
+        let grid = crate::quant::testkit::insert_packed(&mut map, "attn.to_v", out, in_, 23);
+        let mut packed =
+            LinearNoBias::from_weights(&Weights::from_map(map), "attn.to_v", DType::F32)
+                .expect("packed load");
+        let mut dense_map = std::collections::HashMap::new();
+        dense_map.insert("attn.to_v.weight".to_string(), grid);
+        let mut dense =
+            LinearNoBias::from_weights(&Weights::from_map(dense_map), "attn.to_v", DType::F32)
+                .expect("dense load");
+
+        let a = spread(&[in_, rank], 0.2);
+        let b = spread(&[rank, out], 1.1);
+        let x = spread(&[1, 5, in_], 0.9);
+        let packed_base = packed.forward(&x).expect("bare packed");
+        let dense_base = dense.forward(&x).expect("bare dense");
+
+        packed.push_lora(a.clone(), b.clone(), 0.75).expect("push");
+        dense.push_lora(a, b, 0.75).expect("push");
+        assert!(
+            packed.is_packed(),
+            "the install must NOT dequantize the base"
+        );
+        assert!(packed.is_adapted());
+
+        let packed_residual = (packed.forward(&x).unwrap() - packed_base.clone()).unwrap();
+        let dense_residual = (dense.forward(&x).unwrap() - dense_base).unwrap();
+        let drift = rel_max_abs(&packed_residual, &dense_residual);
+        println!("[linear] packed-vs-dense LoRA residual rel-max-abs = {drift:.3e}");
+        assert!(
+            drift < 1e-5,
+            "the residual is computed from the ACTIVATION and the factors only, so it must be \
+             identical on either base; got {drift:.3e}"
+        );
+
+        // Clearing reverts to the bare packed base exactly.
+        packed.clear_adapters();
+        assert!(!packed.is_adapted());
+        assert_eq!(
+            rel_max_abs(&packed.forward(&x).unwrap(), &packed_base),
+            0.0,
+            "clear_adapters must restore the bare base bit-for-bit"
+        );
+    }
+
+    /// A factor pair that does not compose is refused on a **packed** base too — the shape check
+    /// reads the `AdaptLinear`'s recovered `[out, in]`, which exists with no dense weight.
+    #[test]
+    fn a_mismatched_factor_is_refused_on_a_packed_base() {
+        let mut map = std::collections::HashMap::new();
+        crate::quant::testkit::insert_packed(&mut map, "attn.to_k", 32, 128, 29);
+        let mut packed =
+            LinearNoBias::from_weights(&Weights::from_map(map), "attn.to_k", DType::F32)
+                .expect("packed load");
+        let err = packed
+            .push_lora(spread(&[64, 4], 0.1), spread(&[4, 32], 0.2), 1.0)
+            .expect_err("a [64, rank] factor must not compose onto a [32, 128] projection");
+        assert!(err.to_string().contains("do not compose"), "{err}");
     }
 }

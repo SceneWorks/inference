@@ -89,12 +89,29 @@ impl LinearBias {
     ///
     /// The dtype is deliberately not a parameter: these tensors are the mixed-precision half of the
     /// checkpoint (see the module docs), so the bytes on disk are the contract.
+    ///
+    /// # This loader stays DENSE on every tier, deliberately (sc-20267)
+    ///
+    /// `mlx_gen_minimax_h3::convert::DENSE_BY_POLICY` leaves the float32 I/O heads,
+    /// `context_embedder` and `norm_out.linear` dense in **every** published tier, and this raw
+    /// `Weights::require` is exactly why it must: `require` hands back whatever tensor is at the
+    /// key, so a packed `{prefix}.weight` would arrive as a stream of u32 codes where a float is
+    /// expected and be multiplied as garbage — the sc-14980 Mage `pos_embed` failure, which
+    /// produced **no load error at all**. Adding a packed path here is therefore not an
+    /// improvement; it is the thing the converter's dense set exists to make unnecessary. The two
+    /// loaders that DO pack are [`crate::dit::layers::LinearNoBias`] and
+    /// [`crate::dit::block::AdaLnProjection`], and they are the complete set.
+    ///
+    /// [`crate::quant::guard_dense`] turns that class into a loud, attributable load error rather
+    /// than leaving it to the shape check below (which happens to catch a Q4 pack, since `[out,
+    /// in/8] != [out, in]`, but says nothing about *why*).
     pub fn from_weights(
         w: &Weights,
         prefix: &str,
         in_features: usize,
         out_features: usize,
     ) -> Result<Self> {
+        crate::quant::guard_dense(w, prefix)?;
         let weight = w.require(&format!("{prefix}.weight"))?;
         let bias = w.require(&format!("{prefix}.bias"))?;
         if weight.dims() != [out_features, in_features] {
@@ -683,5 +700,62 @@ mod tests {
         assert!(n
             .modulation(&Tensor::ones(3, DType::F32, &dev).unwrap())
             .is_err());
+    }
+
+    // ─── the head set stays dense on every tier (sc-20267) ──────────────────────────────────────
+
+    /// **A packed head tensor is REJECTED loudly, not loaded as garbage.**
+    ///
+    /// This is the sc-14980 class: `Weights::require` returns whatever tensor is at the key, and a
+    /// packed `{prefix}.weight` is a stream of u32 codes. Mage's `pos_embed` took exactly that path
+    /// and produced no load error at all. The fixture is a real synthetic packed triple under a real
+    /// head key (`proj_in`), and the assertion is on the *typed* failure — it must name the offending
+    /// `.scales` key and say the tensor is packed, so the operator is told which artifact is wrong
+    /// rather than being handed a shape mismatch to decode.
+    #[test]
+    fn a_packed_head_tensor_is_refused_rather_than_loaded_as_codes() {
+        let (in_features, out_features) = (64usize, 32usize);
+        let mut map = HashMap::new();
+        crate::quant::testkit::insert_packed(&mut map, "proj_in", out_features, in_features, 43);
+        map.insert(
+            "proj_in.bias".to_string(),
+            Tensor::zeros(out_features, DType::F32, &Device::Cpu).unwrap(),
+        );
+        let err = LinearBias::from_weights(
+            &Weights::from_map(map),
+            "proj_in",
+            in_features,
+            out_features,
+        )
+        .expect_err("a packed head must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("proj_in.scales"),
+            "must name the artifact: {msg}"
+        );
+        assert!(msg.contains("MLX-PACKED"), "must say WHY: {msg}");
+        assert!(
+            msg.contains("sc-14980"),
+            "must cite the failure class: {msg}"
+        );
+
+        // Control: the identical call over a DENSE head loads unchanged, so the guard is not simply
+        // refusing everything.
+        let mut dense = HashMap::new();
+        dense.insert(
+            "proj_in.weight".to_string(),
+            Tensor::zeros((out_features, in_features), DType::F32, &Device::Cpu).unwrap(),
+        );
+        dense.insert(
+            "proj_in.bias".to_string(),
+            Tensor::zeros(out_features, DType::F32, &Device::Cpu).unwrap(),
+        );
+        LinearBias::from_weights(
+            &Weights::from_map(dense),
+            "proj_in",
+            in_features,
+            out_features,
+        )
+        .expect("a dense head must still load");
     }
 }
